@@ -98,7 +98,7 @@ Notes:
 - **SubscriberRegistration wrapping_pubkey Vec<u8> not [u8; 32] (MEDIUM):** broadcast.rs:70-71. Spec says X25519PublicKey (32 bytes). Runtime check only in register_subscriber, not verify_signature. Pattern: Vec<u8> for known-fixed-size fields.
 - **RECURRING PATTERN UPDATE:** Bulk replacement missing call sites is now the #2 recurring pattern. Found in: #347 (hpke_sealed_key), #311 (BridgeDidResolver in tool paths). Always grep for ALL call sites when replacing a type/function across the codebase.
 
-### Known Bug Patterns (Mar 2026 — fix/audit-remaining-findings branch review)
+### Known Bug Patterns (Mar 2026 — fix/audit-remaining-findings branch review, pass 1)
 - **FIXED: regenerate_and_distribute_sender_key is a no-op for joiner (LOW):** join_from_welcome in crypto.rs now extracts member DIDs from MLS group roster and populates self.members before returning. regenerate_and_distribute_sender_key reads from the now-populated map. Called in PyO3 and NAPI testing bridges immediately after join_from_welcome.
 - **FIXED: WASM canonical_template_name missing old HandleRegistry names (LOW):** context.rs:3011-3014. Now maps "scp:template/handle-registry" | "HandleRegistry" | "scp:template/discovery-context" | "DiscoveryContext" => "HandleRegistry". Both old and new names aliased correctly.
 - **FIXED: import_context TOCTOU:** manager.rs:2264-2281. Re-checks replaceability under lock before insert. try_read_state() returning None → reject is conservative/correct.
@@ -106,6 +106,15 @@ Notes:
 - **FIXED: WASM wildcard capability match:** wasm_conformance.rs. self.action == "*" on granting side now matches any required action within the same resource.
 - **FIXED: Zeroizing removed from checkpoint signatures:** correct (signatures are public values, not secrets).
 - **FIXED: RequiredSignal Eq removed:** f64 in ThresholdRequirement prevents Eq — correct compilation fix.
+
+### Known Bug Patterns (Mar 2026 — fix/audit-remaining-findings branch review, pass 2)
+- **FIXED: parse_template_id missing backward compat + URI form:** All 4 bridges now accept all 4 alias forms: "scp:template/handle-registry", "HandleRegistry", "scp:template/discovery-context", "DiscoveryContext". PyO3 VALID_TEMPLATE_IDS also updated. build_core_context_params updated too.
+- **FIXED: PyO3 VALID_TEMPLATE_IDS missing HandleRegistry:** Now includes all 4 alias forms.
+- **RECURRING PATTERN:** Renames applied comprehensively to WASM but minimally to other bridges. Always grep all 4 bridges when renaming enum variants/string constants.
+
+### Known Bug Patterns (Mar 2026 — fix/audit-remaining-findings branch review, pass 3)
+- **Kotlin fromJsonObject crashes on Active RevocationStatus (MEDIUM):** Identity.kt:335. `obj["revocation_status"]?.jsonObject` throws IllegalArgumentException when revocation_status is the string "Active" (common case). kotlinx.serialization `.jsonObject` throws on non-JsonObject elements; `?.` only protects against null. Fix: use `obj["revocation_status"]?.let { if (it is JsonObject) it else null }` or check `is JsonObject` before calling `.jsonObject`. Latent bug — bridge functions throw not-implemented currently. No test for fromJsonObject parsing.
+- **RECURRING PATTERN:** `?.jsonObject` in kotlinx.serialization is NOT a safe accessor for possibly-primitive JSON values. Always use `is JsonObject` check or `jsonObjectOrNull` before `.jsonObject`.
 
 ### Known Bug Patterns (Mar 2026 — Phase 5 Step 2, #386-389 FFI bridge rewrite review)
 - **PyO3 py_context_close silently swallows errors (HIGH):** context.rs:1026. `let _ = close_result;` discards ContextManager close errors, creating split-brain between FFI state (cleaned up) and ContextManager state (still active). Pattern: fire-and-forget on fallible operation where caller assumes cleanup succeeded.

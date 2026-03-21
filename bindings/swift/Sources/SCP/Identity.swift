@@ -549,7 +549,7 @@ public enum RevocationStatus: Sendable, Equatable {
     case revoked(revokedAt: Int, reason: String? = nil)
 
     /// The status string: `"active"` or `"revoked"`. Internal — use pattern matching.
-    internal var status: String {
+    var status: String {
         switch self {
         case .active:
             return "active"

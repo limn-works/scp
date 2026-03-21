@@ -6,6 +6,7 @@ import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertNotEquals
 import kotlin.test.assertNull
+import kotlin.test.assertTrue
 
 /**
  * Tests for the [IdentityAttestation] data class and
@@ -140,6 +141,69 @@ class IdentityAttestationTest {
         assertEquals("abc123", renewed.id)
         assertEquals(1_800_000_000.0, renewed.verifiedAt)
         assertEquals("42", renewed.platformId)
+    }
+
+    @Test
+    fun `fromJson parses Active revocation status string`() {
+        val json = """
+            {
+                "id": "abc123",
+                "platform": "github.com",
+                "platform_handle": "alice",
+                "verification_method": "did:dht:z6Mk...#active",
+                "verified_at": 1700000000.0,
+                "revocation_status": "Active"
+            }
+        """.trimIndent()
+        val att = IdentityAttestation.fromJson(json)
+        assertEquals("abc123", att.id)
+        assertEquals("github.com", att.platform)
+        assertEquals("alice", att.platformHandle)
+        assertEquals("did:dht:z6Mk...#active", att.verificationMethod)
+        assertEquals(1_700_000_000.0, att.verifiedAt)
+        assertTrue(att.revocationStatus is RevocationStatus.Active)
+        assertNull(att.platformId)
+    }
+
+    @Test
+    fun `fromJson parses Revoked revocation status object`() {
+        val json = """
+            {
+                "id": "def456",
+                "platform": "x.com",
+                "platform_handle": "bob",
+                "verification_method": "did:dht:z6Mk...#agent",
+                "verified_at": 1700000000.0,
+                "revocation_status": {
+                    "Revoked": {
+                        "revoked_at": 1700000100,
+                        "reason": "compromised"
+                    }
+                },
+                "platform_id": "12345"
+            }
+        """.trimIndent()
+        val att = IdentityAttestation.fromJson(json)
+        assertEquals("def456", att.id)
+        val revoked = att.revocationStatus as RevocationStatus.Revoked
+        assertEquals(1_700_000_100L, revoked.revokedAt)
+        assertEquals("compromised", revoked.reason)
+        assertEquals("12345", att.platformId)
+    }
+
+    @Test
+    fun `fromJson parses missing revocation status as Active`() {
+        val json = """
+            {
+                "id": "ghi789",
+                "platform": "linkedin.com",
+                "platform_handle": "charlie",
+                "verification_method": "did:dht:z6Mk...#active",
+                "verified_at": 1700000000.0
+            }
+        """.trimIndent()
+        val att = IdentityAttestation.fromJson(json)
+        assertTrue(att.revocationStatus is RevocationStatus.Active)
     }
 
     @Test

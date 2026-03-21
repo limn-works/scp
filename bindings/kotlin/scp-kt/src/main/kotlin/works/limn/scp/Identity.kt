@@ -332,15 +332,17 @@ data class IdentityAttestation(
     internal companion object {
         /** Parse an [IdentityAttestation] from a bridge JSON object. */
         fun fromJsonObject(obj: JsonObject): IdentityAttestation {
-            val rsObj = obj["revocation_status"]?.jsonObject
-            val revocationStatus = if (rsObj != null && rsObj.containsKey("Revoked")) {
-                val revoked = rsObj["Revoked"]!!.jsonObject
-                RevocationStatus.Revoked(
-                    revokedAt = revoked["revoked_at"]!!.jsonPrimitive.long,
-                    reason = revoked["reason"]?.jsonPrimitive?.content,
-                )
-            } else {
-                RevocationStatus.Active
+            val rsElement = obj["revocation_status"]
+            val revocationStatus = when {
+                rsElement == null -> RevocationStatus.Active
+                rsElement is JsonObject && rsElement.containsKey("Revoked") -> {
+                    val revoked = rsElement["Revoked"]!!.jsonObject
+                    RevocationStatus.Revoked(
+                        revokedAt = revoked["revoked_at"]!!.jsonPrimitive.long,
+                        reason = revoked["reason"]?.jsonPrimitive?.content,
+                    )
+                }
+                else -> RevocationStatus.Active
             }
             return IdentityAttestation(
                 id = obj["id"]!!.jsonPrimitive.content,
