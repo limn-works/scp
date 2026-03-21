@@ -43,9 +43,8 @@ pub mod resolution;
 pub mod resolver;
 
 pub use attestation::{
-    AttestationPlatform, IdentityLinkPlatform, KeyCustodyModel, Platform, PlatformAttestation,
-    ScpIdentityLinkService, ScpKeyCustodyAttestation, ServiceRevocationStatus,
-    UnknownPlatformError,
+    AttestationPlatform, IdentityLinkPlatform, IdentityLinkServiceEntry, KeyCustodyModel, Platform,
+    PlatformAttestation, ScpKeyCustodyAttestation, ServiceRevocationStatus, UnknownPlatformError,
 };
 pub use cache::{DidCache, DidResolutionResult, Staleness};
 pub use dht::{
@@ -380,15 +379,6 @@ pub enum IdentityError {
     #[error("too many retired agent keys: found {count}, maximum is {max}")]
     TooManyRetiredAgentKeys {
         /// The number of retired agent keys found.
-        count: usize,
-        /// The maximum allowed.
-        max: usize,
-    },
-
-    /// Too many identity link attestations in the DID document (§3.5.3).
-    #[error("too many identity link attestations: {count} exceeds maximum of {max}")]
-    TooManyIdentityLinkAttestations {
-        /// The number of attestations that would exist after the add.
         count: usize,
         /// The maximum allowed.
         max: usize,

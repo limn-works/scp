@@ -242,11 +242,8 @@ impl ScpKeyCustodyAttestation {
 }
 
 // ---------------------------------------------------------------------------
-// Identity Link Attestation Service Entry (spec §3.5.3)
+// Identity Link Platform Registry (spec §3.5.1)
 // ---------------------------------------------------------------------------
-
-/// The service type string for identity link attestation entries.
-const IDENTITY_LINK_SERVICE_TYPE: &str = "ScpIdentityLinkAttestation";
 
 /// Platform identifier for identity link attestations (spec §3.5.1).
 ///
@@ -416,40 +413,119 @@ impl FromStr for IdentityLinkPlatform {
     }
 }
 
-/// Identity link attestation published as a DID document service entry (spec §3.5.3).
+// ---------------------------------------------------------------------------
+// Identity Link Attestation Service Entry (§3.5.3)
+// ---------------------------------------------------------------------------
+
+/// The service type string for identity link attestation entries.
+const IDENTITY_LINK_ATTESTATION_SERVICE_TYPE: &str = "ScpIdentityLinkAttestation";
+
+/// An identity link attestation service entry in a DID document (§3.5.3).
 ///
-/// Represents a self-signed claim that the DID owner controls a specific
-/// external platform identity. Published as a service entry in the DID
-/// document for discovery — any party resolving the document can enumerate
-/// the owner's identity links.
+/// This is the minimal service entry format — the full `IdentityLinkAttestation`
+/// is stored separately (in the identity's attestation store via relay or DHT).
+/// The service entry only records the platform, index, and attestation ID for
+/// discovery purposes.
 ///
-/// Follows the same pattern as [`ScpKeyCustodyAttestation`]: the struct is
-/// serialized as JSON in the `serviceEndpoint` field.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ScpIdentityLinkService {
-    /// Deterministic attestation ID (hex-encoded SHA-256, per §3.5.2).
+/// Fragment format: `attestation-<platform>--<index>` (e.g.,
+/// `attestation-github.com--0`). The double-dash separates the platform from
+/// the zero-based index to disambiguate multiple attestations for the same
+/// platform (e.g., multiple Mastodon instances).
+///
+/// The `serviceEndpoint` contains only the hex-encoded attestation ID (§3.5.2).
+impl IdentityLinkServiceEntry {
+    /// Creates a DID document service entry for an identity link attestation.
+    ///
+    /// # Arguments
+    ///
+    /// * `did` - The DID string that owns this attestation (used for service ID).
+    /// * `platform` - Platform identifier from the provider registry (§3.5.1).
+    /// * `attestation_id` - Hex-encoded deterministic attestation ID (§3.5.2).
+    /// * `index` - Zero-based index among attestation entries for this platform.
+    #[must_use]
+    pub fn to_service_entry(
+        did: &str,
+        platform: &str,
+        attestation_id: &str,
+        index: usize,
+    ) -> Service {
+        Service {
+            id: format!("{did}#attestation-{platform}--{index}"),
+            service_type: IDENTITY_LINK_ATTESTATION_SERVICE_TYPE.to_owned(),
+            service_endpoint: attestation_id.to_owned(),
+        }
+    }
+
+    /// Parses an identity link attestation service entry from a DID document
+    /// service entry.
+    ///
+    /// Extracts the attestation ID from the `serviceEndpoint` and the platform
+    /// and index from the fragment.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`IdentityError::DocumentDeserializationError`] if the service
+    /// type does not match or the fragment cannot be parsed.
+    pub fn from_service_entry(entry: &Service) -> Result<Self, IdentityError> {
+        if entry.service_type != IDENTITY_LINK_ATTESTATION_SERVICE_TYPE {
+            return Err(IdentityError::DocumentDeserializationError(format!(
+                "expected service type '{}', got '{}'",
+                IDENTITY_LINK_ATTESTATION_SERVICE_TYPE, entry.service_type
+            )));
+        }
+
+        // Parse fragment: "...#attestation-<platform>--<index>"
+        let fragment = entry
+            .id
+            .rsplit_once('#')
+            .map(|(_, frag)| frag)
+            .ok_or_else(|| {
+                IdentityError::DocumentDeserializationError("service id has no fragment".to_owned())
+            })?;
+
+        let rest = fragment.strip_prefix("attestation-").ok_or_else(|| {
+            IdentityError::DocumentDeserializationError(format!(
+                "fragment does not start with 'attestation-': {fragment}"
+            ))
+        })?;
+
+        // Split on the double-dash separator (last occurrence to handle platforms
+        // that contain dashes, though current platform values don't).
+        let (platform, index_str) = rest.rsplit_once("--").ok_or_else(|| {
+            IdentityError::DocumentDeserializationError(format!(
+                "fragment missing '--' separator: {fragment}"
+            ))
+        })?;
+
+        let index = index_str.parse::<usize>().map_err(|e| {
+            IdentityError::DocumentDeserializationError(format!(
+                "invalid index in fragment '{fragment}': {e}"
+            ))
+        })?;
+
+        Ok(Self {
+            platform: platform.to_owned(),
+            attestation_id: entry.service_endpoint.clone(),
+            index,
+        })
+    }
+}
+
+/// Parsed identity link attestation service entry data.
+///
+/// Contains the platform, attestation ID, and index extracted from a DID
+/// document service entry. This is the minimal information needed for
+/// discovery — the full attestation must be fetched separately.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IdentityLinkServiceEntry {
+    /// Platform identifier from the provider registry (§3.5.1).
+    pub platform: String,
+
+    /// Hex-encoded deterministic attestation ID (§3.5.2).
     pub attestation_id: String,
 
-    /// Platform identifier from the provider registry (§3.5.1).
-    pub platform: IdentityLinkPlatform,
-
-    /// Handle on the platform (e.g., `"@alice"`, `"alice123"`).
-    pub platform_handle: String,
-
-    /// Platform-specific immutable user ID (e.g., Twitter user ID, OIDC sub).
-    /// `None` when the platform does not provide a stable ID.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub platform_id: Option<String>,
-
-    /// The DID verification method fragment that signed the attestation
-    /// (e.g., `"#active"` or `"#agent"`).
-    pub verification_method: String,
-
-    /// Unix timestamp (seconds) when the attestation was last verified.
-    pub verified_at: u64,
-
-    /// Revocation status: `"active"` or `"revoked"`.
-    pub revocation_status: ServiceRevocationStatus,
+    /// Zero-based index among attestation entries for this platform.
+    pub index: usize,
 }
 
 /// Revocation status for identity link service entries.
@@ -480,88 +556,6 @@ impl ServiceRevocationStatus {
 impl std::fmt::Display for ServiceRevocationStatus {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(self.as_str())
-    }
-}
-
-impl ScpIdentityLinkService {
-    /// Revocation status value for an active attestation.
-    pub const STATUS_ACTIVE: &'static str = "active";
-
-    /// Revocation status value for a revoked attestation.
-    pub const STATUS_REVOKED: &'static str = "revoked";
-
-    /// Creates a DID document service entry for this identity link attestation
-    /// (spec §3.5.3).
-    ///
-    /// The `serviceEndpoint` contains the hex-encoded attestation ID only (not
-    /// a JSON blob). The service `id` uses the fragment format
-    /// `attestation-<platform>--<index>` (double dash, zero-based numeric index)
-    /// per spec §3.5.3.
-    ///
-    /// # Arguments
-    ///
-    /// * `did` - The DID string that owns this attestation (used for service ID).
-    /// * `index` - Zero-based index among attestation service entries of the same
-    ///   platform type. The caller (typically [`DidDocument::set_identity_link_attestation`])
-    ///   computes this by counting existing same-platform entries.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`IdentityError::DocumentSerializationError`] if the
-    /// `attestation_id` contains non-hex characters.
-    pub fn to_service_entry(&self, did: &str, index: usize) -> Result<Service, IdentityError> {
-        // Validate attestation_id is hex-only before using it in the endpoint.
-        if !self.attestation_id.chars().all(|c| c.is_ascii_hexdigit()) {
-            return Err(IdentityError::DocumentSerializationError(format!(
-                "attestation_id must be hex-encoded, got '{}'",
-                self.attestation_id
-            )));
-        }
-
-        Ok(Service {
-            id: format!("{did}#attestation-{}--{index}", self.platform.as_str()),
-            service_type: IDENTITY_LINK_SERVICE_TYPE.to_owned(),
-            service_endpoint: self.attestation_id.clone(),
-        })
-    }
-
-    /// Extracts the attestation ID from a DID document service entry (spec §3.5.3).
-    ///
-    /// The `serviceEndpoint` is the hex-encoded attestation ID string. This method
-    /// returns only the attestation ID -- the caller must look up the full
-    /// `IdentityLinkAttestation` from the identity's attestation store via relay
-    /// or DHT using this ID.
-    ///
-    /// # Arguments
-    ///
-    /// * `entry` - A service entry with `type: "ScpIdentityLinkAttestation"`.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`IdentityError::DocumentDeserializationError`] if the service
-    /// type does not match or the endpoint is not a valid hex string.
-    pub fn from_service_entry(entry: &Service) -> Result<String, IdentityError> {
-        if entry.service_type != IDENTITY_LINK_SERVICE_TYPE {
-            return Err(IdentityError::DocumentDeserializationError(format!(
-                "expected service type '{}', got '{}'",
-                IDENTITY_LINK_SERVICE_TYPE, entry.service_type
-            )));
-        }
-
-        // Validate that the endpoint is a hex string (attestation ID).
-        let endpoint = entry.service_endpoint.trim();
-        if endpoint.is_empty() {
-            return Err(IdentityError::DocumentDeserializationError(
-                "service endpoint (attestation_id) is empty".to_owned(),
-            ));
-        }
-        if !endpoint.chars().all(|c| c.is_ascii_hexdigit()) {
-            return Err(IdentityError::DocumentDeserializationError(format!(
-                "service endpoint must be a hex-encoded attestation ID, got '{endpoint}'"
-            )));
-        }
-
-        Ok(endpoint.to_owned())
     }
 }
 
@@ -1001,175 +995,137 @@ mod tests {
         assert_eq!(IdentityLinkPlatform::all().len(), 16);
     }
 
-    // ===================================================================
-    // ScpIdentityLinkService tests
-    // ===================================================================
-
-    fn test_link_service() -> ScpIdentityLinkService {
-        ScpIdentityLinkService {
-            attestation_id: "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789"
-                .to_owned(),
-            platform: IdentityLinkPlatform::Github,
-            platform_handle: "@alice".to_owned(),
-            platform_id: Some("12345678".to_owned()),
-            verification_method: "#active".to_owned(),
-            verified_at: 1_700_000_000,
-            revocation_status: ServiceRevocationStatus::Active,
-        }
-    }
+    // --- Identity link attestation service entry tests (§3.5.3) ---
 
     #[test]
-    fn identity_link_service_entry_format() {
-        let original = test_link_service();
-        let service = original.to_service_entry(test_did(), 0).unwrap();
+    fn identity_link_to_service_entry_format() {
+        let entry =
+            IdentityLinkServiceEntry::to_service_entry(test_did(), "github.com", "abc123def456", 0);
 
-        assert_eq!(service.service_type, "ScpIdentityLinkAttestation");
-        // Fragment uses double-dash and zero-based index per §3.5.3.
         assert_eq!(
-            service.id,
+            entry.id,
             format!("{}#attestation-github.com--0", test_did())
         );
-        // Endpoint is just the attestation ID, not JSON.
-        assert_eq!(service.service_endpoint, original.attestation_id);
+        assert_eq!(entry.service_type, "ScpIdentityLinkAttestation");
+        assert_eq!(entry.service_endpoint, "abc123def456");
     }
 
     #[test]
-    fn identity_link_service_from_entry_returns_attestation_id() {
-        let original = test_link_service();
-        let service = original.to_service_entry(test_did(), 0).unwrap();
+    fn identity_link_to_service_entry_with_nonzero_index() {
+        let entry = IdentityLinkServiceEntry::to_service_entry(
+            test_did(),
+            "mastodon:mastodon.social",
+            "deadbeef",
+            3,
+        );
 
-        let id = ScpIdentityLinkService::from_service_entry(&service).unwrap();
-        assert_eq!(id, original.attestation_id);
+        assert_eq!(
+            entry.id,
+            format!("{}#attestation-mastodon:mastodon.social--3", test_did())
+        );
+        assert_eq!(entry.service_endpoint, "deadbeef");
     }
 
     #[test]
-    fn identity_link_service_index_in_fragment() {
-        let original = test_link_service();
-        let s0 = original.to_service_entry(test_did(), 0).unwrap();
-        let s1 = original.to_service_entry(test_did(), 1).unwrap();
-        let s5 = original.to_service_entry(test_did(), 5).unwrap();
+    fn identity_link_roundtrip_through_service_entry() {
+        let entry =
+            IdentityLinkServiceEntry::to_service_entry(test_did(), "github.com", "abc123", 0);
 
-        assert!(s0.id.ends_with("#attestation-github.com--0"));
-        assert!(s1.id.ends_with("#attestation-github.com--1"));
-        assert!(s5.id.ends_with("#attestation-github.com--5"));
+        let parsed = IdentityLinkServiceEntry::from_service_entry(&entry).unwrap();
+        assert_eq!(parsed.platform, "github.com");
+        assert_eq!(parsed.attestation_id, "abc123");
+        assert_eq!(parsed.index, 0);
     }
 
     #[test]
-    fn identity_link_service_each_platform() {
-        for (i, &platform) in IdentityLinkPlatform::all().iter().enumerate() {
-            let service_entry = ScpIdentityLinkService {
-                attestation_id: "abcdef0123456789".to_owned(),
-                platform,
-                platform_handle: "testuser".to_owned(),
-                platform_id: None,
-                verification_method: "#active".to_owned(),
-                verified_at: 1_700_000_000,
-                revocation_status: ServiceRevocationStatus::Active,
-            };
-
-            let service = service_entry.to_service_entry(test_did(), i).unwrap();
-            assert!(
-                service
-                    .id
-                    .contains(&format!("attestation-{}--", platform.as_str())),
-                "service ID should contain platform with double-dash: {platform:?}"
+    fn identity_link_roundtrip_multiple_indices() {
+        for idx in 0..5 {
+            let entry = IdentityLinkServiceEntry::to_service_entry(
+                test_did(),
+                "x.com",
+                &format!("attest-{idx}"),
+                idx,
             );
 
-            // Endpoint should be the attestation ID.
-            assert_eq!(service.service_endpoint, "abcdef0123456789");
-
-            // from_service_entry should return the attestation ID.
-            let id = ScpIdentityLinkService::from_service_entry(&service).unwrap();
-            assert_eq!(id, "abcdef0123456789");
+            let parsed = IdentityLinkServiceEntry::from_service_entry(&entry).unwrap();
+            assert_eq!(parsed.platform, "x.com");
+            assert_eq!(parsed.attestation_id, format!("attest-{idx}"));
+            assert_eq!(parsed.index, idx);
         }
     }
 
     #[test]
-    fn identity_link_service_rejects_wrong_type() {
-        let service = Service {
-            id: format!("{}#custody-attestation", test_did()),
-            service_type: "ScpKeyCustodyAttestation".to_owned(),
-            service_endpoint: "abcdef01".to_owned(),
-        };
-
-        let result = ScpIdentityLinkService::from_service_entry(&service);
-        assert!(result.is_err());
-        let err = result.unwrap_err();
-        assert!(
-            err.to_string().contains("expected service type"),
-            "error should mention expected type, got: {err}"
-        );
-    }
-
-    #[test]
-    fn identity_link_service_rejects_non_hex_endpoint() {
+    fn identity_link_from_service_entry_rejects_wrong_type() {
         let service = Service {
             id: format!("{}#attestation-github.com--0", test_did()),
-            service_type: IDENTITY_LINK_SERVICE_TYPE.to_owned(),
-            service_endpoint: "not-valid-hex!@#$".to_owned(),
+            service_type: "WrongType".to_owned(),
+            service_endpoint: "abc123".to_owned(),
         };
 
-        let result = ScpIdentityLinkService::from_service_entry(&service);
+        let result = IdentityLinkServiceEntry::from_service_entry(&service);
         assert!(result.is_err());
-        let err = result.unwrap_err();
         assert!(
-            err.to_string().contains("hex-encoded attestation ID"),
-            "error should mention hex requirement, got: {err}"
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("expected service type")
         );
     }
 
     #[test]
-    fn identity_link_service_rejects_empty_endpoint() {
+    fn identity_link_from_service_entry_rejects_missing_fragment() {
         let service = Service {
-            id: format!("{}#attestation-github.com--0", test_did()),
-            service_type: IDENTITY_LINK_SERVICE_TYPE.to_owned(),
-            service_endpoint: String::new(),
+            id: "no-fragment-here".to_owned(),
+            service_type: "ScpIdentityLinkAttestation".to_owned(),
+            service_endpoint: "abc123".to_owned(),
         };
 
-        let result = ScpIdentityLinkService::from_service_entry(&service);
+        let result = IdentityLinkServiceEntry::from_service_entry(&service);
         assert!(result.is_err());
-        let err = result.unwrap_err();
-        assert!(
-            err.to_string().contains("empty"),
-            "error should mention empty, got: {err}"
+        assert!(result.unwrap_err().to_string().contains("no fragment"));
+    }
+
+    #[test]
+    fn identity_link_from_service_entry_rejects_missing_double_dash() {
+        let service = Service {
+            id: format!("{}#attestation-github.com-0", test_did()),
+            service_type: "ScpIdentityLinkAttestation".to_owned(),
+            service_endpoint: "abc123".to_owned(),
+        };
+
+        let result = IdentityLinkServiceEntry::from_service_entry(&service);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("--"));
+    }
+
+    #[test]
+    fn identity_link_from_service_entry_rejects_invalid_index() {
+        let service = Service {
+            id: format!("{}#attestation-github.com--notanumber", test_did()),
+            service_type: "ScpIdentityLinkAttestation".to_owned(),
+            service_endpoint: "abc123".to_owned(),
+        };
+
+        let result = IdentityLinkServiceEntry::from_service_entry(&service);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("invalid index"));
+    }
+
+    #[test]
+    fn identity_link_service_endpoint_is_just_attestation_id() {
+        // Verify that the endpoint is the bare attestation ID, not a JSON blob.
+        let entry = IdentityLinkServiceEntry::to_service_entry(
+            test_did(),
+            "github.com",
+            "deadbeefcafe0123",
+            0,
         );
-    }
 
-    #[test]
-    fn identity_link_service_serde_json_roundtrip() {
-        let original = test_link_service();
-        let json = serde_json::to_string(&original).unwrap();
-        let parsed: ScpIdentityLinkService = serde_json::from_str(&json).unwrap();
-        assert_eq!(original, parsed);
-    }
-
-    #[test]
-    fn identity_link_service_status_constants() {
-        assert_eq!(ScpIdentityLinkService::STATUS_ACTIVE, "active");
-        assert_eq!(ScpIdentityLinkService::STATUS_REVOKED, "revoked");
-    }
-
-    #[test]
-    fn identity_link_service_non_hex_attestation_id_rejected() {
-        // Non-hex attestation IDs (including multi-byte UTF-8) must be rejected
-        // by the hex validation in `to_service_entry`.
-        let original = ScpIdentityLinkService {
-            attestation_id: "\u{1F600}\u{1F601}\u{1F602}\u{1F603}\u{1F604}\u{1F605}\u{1F606}\u{1F607}\u{1F608}\u{1F609}".to_owned(),
-            platform: IdentityLinkPlatform::Github,
-            platform_handle: "@alice".to_owned(),
-            platform_id: None,
-            verification_method: "#active".to_owned(),
-            verified_at: 1_700_000_000,
-            revocation_status: ServiceRevocationStatus::Active,
-        };
-
-        let result = original.to_service_entry(test_did(), 0);
-        assert!(result.is_err());
-        let err = result.unwrap_err();
+        assert_eq!(entry.service_endpoint, "deadbeefcafe0123");
+        // Should NOT start with '{' (not JSON).
         assert!(
-            err.to_string()
-                .contains("attestation_id must be hex-encoded"),
-            "error should mention hex requirement, got: {err}"
+            !entry.service_endpoint.starts_with('{'),
+            "endpoint should be bare attestation ID, not JSON"
         );
     }
 }
