@@ -2401,9 +2401,8 @@ const UNIFFI_CUSTODY_REGISTRY_CAP: usize = 10_000;
 #[cfg(feature = "allow_in_memory_custody")]
 const UNIFFI_LINK_ATTESTATION_REGISTRY_CAP: usize = 10_000;
 
-/// Maximum number of attestations per DID in the identity link attestation registry.
 #[cfg(feature = "allow_in_memory_custody")]
-const UNIFFI_LINK_ATTESTATION_PER_DID_CAP: usize = 1_000;
+use scp_ffi_common::validate::MAX_IDENTITY_LINK_ATTESTATIONS_PER_DID;
 
 /// Global registry of identity link attestations, keyed by DID string.
 fn identity_link_attestation_registry()
@@ -2611,11 +2610,11 @@ async fn identity_create_link_attestation_impl(
         let len = registry.len();
         match registry.entry(did_str) {
             dashmap::mapref::entry::Entry::Occupied(mut occ) => {
-                if occ.get().len() >= UNIFFI_LINK_ATTESTATION_PER_DID_CAP {
+                if occ.get().len() >= MAX_IDENTITY_LINK_ATTESTATIONS_PER_DID {
                     return Err(ScpError::Identity {
                         msg: format!(
                             "DID has reached the per-identity attestation limit \
-                             ({UNIFFI_LINK_ATTESTATION_PER_DID_CAP}) — cannot store additional attestations"
+                             ({MAX_IDENTITY_LINK_ATTESTATIONS_PER_DID}) — cannot store additional attestations"
                         ),
                         code: "SCP-VALID-7403".to_owned(),
                     });
