@@ -278,18 +278,15 @@ export class Node implements AsyncDisposable {
    *
    * When `identity` is provided, the node uses the pre-existing identity
    * instead of generating a fresh one. When omitted, the node creates or
-   * reloads a persistent identity via `FileKeyCustody`. The passphrase
-   * for key derivation is resolved as:
-   * 1. The explicit `passphrase` parameter, if provided.
-   * 2. The `SCP_KEY_PASSPHRASE` environment variable, if set.
-   * 3. Returns an error if neither is available.
+   * reloads a persistent identity via `FileKeyCustody`. The `passphrase`
+   * parameter is required in this mode.
    *
    * No passphrase is required when `identity` is provided.
    *
    * @param dataDir - Directory for persistent storage.
    * @param identity - Optional identity object with a `.did` property.
-   * @param passphrase - Passphrase for Argon2id key derivation. Falls back
-   *   to `SCP_KEY_PASSPHRASE` env var when omitted.
+   * @param passphrase - Passphrase for Argon2id key derivation. Required when
+   *   identity is omitted.
    */
   static async startLocal(
     dataDir: string,

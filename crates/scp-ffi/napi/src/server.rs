@@ -53,15 +53,15 @@ fn node_err(e: NodeError) -> NapiError {
 ///
 /// Best-effort: logs a warning if the relay connection fails rather than
 /// blocking node startup.
-async fn auto_wire_context_manager(did: &str, relay_url: &str, bridge_token: &str) {
+async fn auto_wire_context_manager(did: &str, relay_url: &str, bridge_token: Zeroizing<String>) {
     let sourced = scp_transport::relay::connection::SourcedRelayUrl {
         url: relay_url.to_owned(),
         source: scp_transport::relay::connection::RelayUrlSource::Explicit,
     };
-    let token = Zeroizing::new(bridge_token.to_owned());
+    let token2 = bridge_token.clone();
     match scp_transport::native::NativeRelayAdapter::connect_sourced_with_bearer(
         &sourced,
-        Some(token),
+        Some(bridge_token),
     )
     .await
     {
@@ -73,7 +73,6 @@ async fn auto_wire_context_manager(did: &str, relay_url: &str, bridge_token: &st
             // a separate `transportConnect` call. This requires a second
             // WebSocket connection because NativeRelayAdapter is not Clone
             // and the first was consumed by RelayTransportProvider.
-            let token2 = Zeroizing::new(bridge_token.to_owned());
             match scp_transport::native::NativeRelayAdapter::connect_sourced_with_bearer(
                 &sourced,
                 Some(token2),
@@ -604,7 +603,7 @@ pub async fn node_start_in_memory(identity_did: Option<String>) -> napi::Result<
     let did = node.identity().did().to_owned();
     let relay_url = format!("ws://127.0.0.1:{}/scp/v1", node.relay().bound_addr().port());
     let bridge_token = node.bridge_token_hex();
-    auto_wire_context_manager(&did, &relay_url, &bridge_token).await;
+    auto_wire_context_manager(&did, &relay_url, bridge_token).await;
 
     increment_handle_count();
     Ok(NapiNodeHandle {
@@ -620,10 +619,8 @@ pub async fn node_start_in_memory(identity_did: Option<String>) -> napi::Result<
 /// When `identityDid` is provided, the node uses the pre-existing identity
 /// from the identity registry instead of generating a fresh one. When
 /// `identityDid` is `null`, the node creates or reloads a persistent
-/// identity via `FileKeyCustody`. The passphrase is resolved as:
-/// 1. The explicit `passphrase` parameter, if provided.
-/// 2. The `SCP_KEY_PASSPHRASE` environment variable, if set.
-/// 3. Returns an error if neither is available.
+/// identity via `FileKeyCustody`. The `passphrase` parameter is required
+/// in this mode.
 ///
 /// ```js
 /// const node = await nodeStartLocal("/tmp/my-node", null, "my-secret");
@@ -663,7 +660,7 @@ pub async fn node_start_local(
     let did = node.identity().did().to_owned();
     let relay_url = format!("ws://127.0.0.1:{}/scp/v1", node.relay().bound_addr().port());
     let bridge_token = node.bridge_token_hex();
-    auto_wire_context_manager(&did, &relay_url, &bridge_token).await;
+    auto_wire_context_manager(&did, &relay_url, bridge_token).await;
 
     increment_handle_count();
     Ok(NapiNodeHandle {
