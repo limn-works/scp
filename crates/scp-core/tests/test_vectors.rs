@@ -938,7 +938,7 @@ fn vector_24_25_sender_and_access_info_differ() {
 fn vector_26_identity_link_attestation() {
     use scp_core::identity::attestation::{
         ATTESTATION_TYPE_IDENTITY_LINK, AttestationClaim, AttestationEvidence,
-        AttestationRevocation, IdentityLinkAttestation, VerificationMethod,
+        IdentityLinkAttestation, VerificationMethod,
     };
     use scp_core::trust::attestation::RevocationStatus;
     use std::borrow::Cow;
@@ -961,7 +961,6 @@ fn vector_26_identity_link_attestation() {
             verified_at: 1_700_000_000,
             verifier_did: None,
         },
-        revocation: AttestationRevocation::new("/revocations".to_string()),
         revocation_status: RevocationStatus::Active,
         signature: Vec::new(),
     };

@@ -7043,8 +7043,7 @@ mod wasm_mirror_attestation {
 fn wasm_attestation_canonical_bytes_match_core() {
     use scp_core::crypto::canonical::{CanonicalField, canonical_hash};
     use scp_core::identity::attestation::{
-        AttestationClaim, AttestationEvidence, AttestationRevocation, IdentityLinkAttestation,
-        VerificationMethod,
+        AttestationClaim, AttestationEvidence, IdentityLinkAttestation, VerificationMethod,
     };
     use scp_core::trust::attestation::RevocationStatus;
 
@@ -7067,7 +7066,6 @@ fn wasm_attestation_canonical_bytes_match_core() {
             verified_at: issued_at,
             verifier_did: None,
         },
-        revocation: AttestationRevocation::new("/revocations".to_string()),
         revocation_status: RevocationStatus::Active,
         signature: vec![0u8; 64],
     };
@@ -7166,7 +7164,7 @@ fn assert_attestation_proof_conformance(
     wasm_method_str: &str,
 ) {
     use scp_core::identity::attestation::{
-        AttestationClaim, AttestationEvidence, AttestationRevocation, IdentityLinkAttestation,
+        AttestationClaim, AttestationEvidence, IdentityLinkAttestation,
     };
     use scp_core::trust::attestation::RevocationStatus;
 
@@ -7187,7 +7185,6 @@ fn assert_attestation_proof_conformance(
             verified_at: issued_at,
             verifier_did: None,
         },
-        revocation: AttestationRevocation::new("/revocations".to_string()),
         revocation_status: RevocationStatus::Active,
         signature: vec![0u8; 64],
     };

@@ -388,39 +388,6 @@ impl AttestationEvidence {
 }
 
 // ---------------------------------------------------------------------------
-// AttestationRevocation (§3.5.1)
-// ---------------------------------------------------------------------------
-
-/// Revocation metadata for an identity link attestation (§3.5.1).
-///
-/// Specifies how verifiers check whether this attestation has been revoked.
-/// The canonical method is `"did_document"` — verifiers resolve the issuer's
-/// DID document and check the `AttestationRevocations` service endpoint
-/// (§18.2.2) for the attestation's ID.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct AttestationRevocation {
-    /// Revocation check method. Currently always `"did_document"`.
-    pub method: Cow<'static, str>,
-
-    /// DID document service endpoint path for revocation status.
-    pub endpoint: String,
-}
-
-impl AttestationRevocation {
-    /// The canonical revocation method value.
-    pub const DID_DOCUMENT: &'static str = "did_document";
-
-    /// Creates a new revocation entry with the canonical method.
-    #[must_use]
-    pub const fn new(endpoint: String) -> Self {
-        Self {
-            method: Cow::Borrowed(Self::DID_DOCUMENT),
-            endpoint,
-        }
-    }
-}
-
-// ---------------------------------------------------------------------------
 // IdentityLinkAttestation (§3.5.1)
 // ---------------------------------------------------------------------------
 
@@ -468,9 +435,6 @@ pub struct IdentityLinkAttestation {
 
     /// Evidence supporting the claim.
     pub evidence: AttestationEvidence,
-
-    /// Revocation metadata.
-    pub revocation: AttestationRevocation,
 
     /// Revocation status: `Active` or `Revoked` (§7.4.1). Included in
     /// the signed scope to prevent replay of revoked attestations.
@@ -758,7 +722,6 @@ mod tests {
                 verified_at: 1_700_000_000,
                 verifier_did: None,
             },
-            revocation: AttestationRevocation::new("/revocations".to_owned()),
             revocation_status: crate::trust::attestation::RevocationStatus::Active,
             signature: vec![0xAA; 64],
         }
@@ -1183,7 +1146,6 @@ mod tests {
                 verified_at: 1_700_000_000_000,
                 verifier_did: None,
             },
-            revocation: AttestationRevocation::new("/revocations".to_owned()),
             revocation_status: crate::trust::attestation::RevocationStatus::Active,
             signature: Vec::new(), // placeholder — will be replaced
         };
@@ -1360,7 +1322,6 @@ mod tests {
                 verified_at: 1_700_000_000_000,
                 verifier_did: None,
             },
-            revocation: AttestationRevocation::new("/revocations".to_owned()),
             revocation_status: crate::trust::attestation::RevocationStatus::Active,
             signature: Vec::new(),
         };

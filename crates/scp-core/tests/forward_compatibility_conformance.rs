@@ -768,8 +768,7 @@ mod sender_key_types {
 mod attestation_types {
     use super::*;
     use scp_core::identity::attestation::{
-        AttestationClaim, AttestationEvidence, AttestationRevocation, IdentityLinkAttestation,
-        VerificationMethod,
+        AttestationClaim, AttestationEvidence, IdentityLinkAttestation, VerificationMethod,
     };
 
     /// §13.9 item 3: `AttestationClaim` MUST ignore unknown fields (JSON).
@@ -876,7 +875,6 @@ mod attestation_types {
                 verified_at: 1_700_000_000,
                 verifier_did: None,
             },
-            revocation: AttestationRevocation::new("/revocations".to_string()),
             revocation_status: scp_core::trust::attestation::RevocationStatus::Active,
             signature: vec![0xAA; 64],
         };
@@ -911,7 +909,6 @@ mod attestation_types {
                 verified_at: 1_700_000_000,
                 verifier_did: None,
             },
-            revocation: AttestationRevocation::new("/revocations".to_string()),
             revocation_status: scp_core::trust::attestation::RevocationStatus::Active,
             signature: vec![0xAA; 64],
         };

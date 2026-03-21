@@ -2463,7 +2463,7 @@ async fn identity_create_link_attestation_impl(
 
     use scp_core::identity::attestation::{
         ATTESTATION_TYPE_IDENTITY_LINK, AttestationClaim, AttestationEvidence,
-        AttestationRevocation, IdentityLinkAttestation, VerificationMethod,
+        IdentityLinkAttestation, VerificationMethod,
     };
     use scp_core::trust::attestation::RevocationStatus;
     use scp_identity::DID;
@@ -2529,7 +2529,6 @@ async fn identity_create_link_attestation_impl(
             verified_at: now_secs,
             verifier_did: None,
         },
-        revocation: AttestationRevocation::new("/revocations".to_owned()),
         revocation_status: RevocationStatus::Active,
         signature: Vec::new(),
     };
