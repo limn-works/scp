@@ -517,7 +517,7 @@ Canonical hash input:
   || BE32(18)  || "did:dht:z6MkIssuer"        (4 + 18 = 22 bytes — issuer)
   || BE32(18)  || "did:dht:z6MkIssuer"        (4 + 18 = 22 bytes — subject)
   || BE64(1700000000)                          (8 bytes — issued_at)
-  || BE32(32)  || SHA-256(0x00)                (4 + 32 = 36 bytes — absent expires_at sentinel)
+  || SHA-256(0x00)                              (32 bytes, raw — no length prefix — absent expires_at sentinel)
   || BE32(N_c) || msgpack(claim)               (4 + N_c bytes — claim as MessagePack)
   || BE32(N_e) || msgpack(evidence)            (4 + N_e bytes — evidence as MessagePack)
   || BE32(N_r) || msgpack(revocation_status)    (4 + N_r bytes — revocation_status as MessagePack)
@@ -608,9 +608,8 @@ Canonical hash input:
 
 Total: 22 + 22 + 14 + 19 + 8 = 85 bytes
 
-// Hash must be recomputed from reference implementation
 Expected SHA-256:
-  (recompute from reference implementation — input changed from "x"/"@alice" to "google.com"/"alice@gmail.com")
+  0x97eedd3adfbd0dc8ee901c9f2baf57c151ddf81e3cf49e7ae3b559f4cd2176e0
 ```
 
 ## 25.17 Verification Procedure

@@ -1124,8 +1124,8 @@ fn vector_29_attestation_id() {
     println!("=== Vector 29: Attestation ID ===");
 
     let issuer: DID = "did:dht:z6MkIssuer".into();
-    let platform = "x";
-    let platform_handle = "@alice";
+    let platform = "google.com";
+    let platform_handle = "alice@gmail.com";
     let issued_at: u64 = 1_700_000_000;
 
     // Use the actual IdentityLinkAttestation::compute_id implementation.
@@ -1136,7 +1136,7 @@ fn vector_29_attestation_id() {
     // §25.16 Vector 29: assert exact spec hex value.
     assert_eq!(
         attestation_id,
-        "3b7567f7331372b900e4cf9f764708cebf88df9173cb626e2984fb31ee1bcf4c"
+        "97eedd3adfbd0dc8ee901c9f2baf57c151ddf81e3cf49e7ae3b559f4cd2176e0"
     );
 
     // Also verify via manual construction to confirm the implementation matches.
@@ -1153,8 +1153,8 @@ fn vector_29_attestation_id() {
 
     assert_eq!(
         buf.len(),
-        67,
-        "attestation ID input must be 67 bytes per §25.16"
+        85,
+        "attestation ID input must be 85 bytes per §25.16"
     );
 
     let manual_hash: [u8; 32] = Sha256::digest(&buf).into();
