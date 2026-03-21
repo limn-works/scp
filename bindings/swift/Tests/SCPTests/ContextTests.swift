@@ -128,7 +128,9 @@ struct ContextTests {
 
         let identity = Identity(noPointer: .init())
         let params = ContextParams(
+            mode: .encrypted,
             ceiling: ["messages:read", "messages:write"],
+            ceilingPolicy: .immutable,
             governance: .singleAdmin,
             memoryScope: .ephemeral,
             ttlSeconds: 3600,
@@ -136,7 +138,8 @@ struct ContextTests {
             minProtocolVersion: 0,
             maxChainDepth: nil,
             maxNestingDepth: nil,
-            sessionCap: nil
+            sessionCap: nil,
+            economicPolicy: nil
         )
 
         let context = try await Context.create(
@@ -179,7 +182,9 @@ struct ContextTests {
 
         let identity = Identity(noPointer: .init())
         let params = ContextParams(
+            mode: .encrypted,
             ceiling: [],
+            ceilingPolicy: .immutable,
             governance: .singleAdmin,
             memoryScope: .ephemeral,
             ttlSeconds: 0,
@@ -187,7 +192,8 @@ struct ContextTests {
             minProtocolVersion: 0,
             maxChainDepth: nil,
             maxNestingDepth: nil,
-            sessionCap: nil
+            sessionCap: nil,
+            economicPolicy: nil
         )
 
         await #expect(throws: ScpError.self) {

@@ -76,7 +76,9 @@ pub mod server;
 
 // Re-export all bridge public items so UniFFI can find them at the crate root.
 pub use bridge::{
+    CeilingPolicy,
     ContextHandle,
+    ContextMode,
     ContextParams,
     ContextState,
     CustodyMethod,
@@ -753,7 +755,9 @@ mod tests {
             .expect("identity_create failed");
 
         let params = bridge::ContextParams {
+            mode: bridge::ContextMode::Encrypted,
             ceiling: Vec::new(),
+            ceiling_policy: bridge::CeilingPolicy::Immutable,
             governance: bridge::GovernanceModel::SingleAdmin,
             memory_scope: bridge::MemoryScope::Ephemeral,
             ttl_seconds: 0,
@@ -762,6 +766,7 @@ mod tests {
             max_chain_depth: None,
             max_nesting_depth: None,
             session_cap: None,
+            economic_policy: None,
         };
 
         let handle = rt
@@ -810,7 +815,9 @@ mod tests {
             .expect("identity_create failed");
 
         let params = bridge::ContextParams {
+            mode: bridge::ContextMode::Encrypted,
             ceiling: Vec::new(),
+            ceiling_policy: bridge::CeilingPolicy::Immutable,
             governance: bridge::GovernanceModel::SingleAdmin,
             memory_scope: bridge::MemoryScope::Ephemeral,
             ttl_seconds: 0,
@@ -819,6 +826,7 @@ mod tests {
             max_chain_depth: None,
             max_nesting_depth: None,
             session_cap: None,
+            economic_policy: None,
         };
 
         let handle = rt

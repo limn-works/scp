@@ -19,7 +19,9 @@ struct BasicMessaging {
         // Alice creates a context.
         // ContextParams requires: ceiling, governance, memoryScope, ttlSeconds, promotable, minProtocolVersion
         let params = ContextParams(
+            mode: .encrypted,
             ceiling: ["messages:read", "messages:write", "member:invite"],
+            ceilingPolicy: .immutable,
             governance: .singleAdmin,
             memoryScope: .ephemeral,
             ttlSeconds: 3600,
@@ -27,7 +29,8 @@ struct BasicMessaging {
             minProtocolVersion: 0,
             maxChainDepth: nil,
             maxNestingDepth: nil,
-            sessionCap: nil
+            sessionCap: nil,
+            economicPolicy: nil
         )
         let handle = try await contextCreate(identity: alice, params: params)
         print("Context ID: \(handle.contextId())")

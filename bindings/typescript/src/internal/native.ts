@@ -865,14 +865,16 @@ export function createNativeBridge(): Bridge {
       handle: BridgeContextHandle,
       memberDid: string,
       capabilities: readonly string[],
+      proofs?: readonly string[],
     ): Promise<UcanToken> {
       const token = await (
         addon.ucanMint as (
           h: BridgeContextHandle,
           d: string,
           c: readonly string[],
+          p: readonly string[] | null,
         ) => Promise<UcanToken>
-      )(handle, memberDid, capabilities);
+      )(handle, memberDid, capabilities, proofs ?? null);
       return token;
     },
 

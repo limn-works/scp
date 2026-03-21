@@ -487,6 +487,19 @@ pub async fn context_create(
         .as_u64()
         .and_then(|v| u32::try_from(v).ok());
 
+    // Deserialize economic_policy JSON string to the core struct, if provided.
+    let core_economic_policy: Option<scp_core::economy::EconomicPolicy> = economic_policy
+        .as_deref()
+        .map(|ep_json| {
+            serde_json::from_str(ep_json).map_err(|e| {
+                NapiError::from(ScpNapiError::Validation {
+                    message: format!("invalid economicPolicy JSON: {e}"),
+                    code: "SCP-VALID-7000".to_owned(),
+                })
+            })
+        })
+        .transpose()?;
+
     let context_params = ContextParams {
         mode,
         ceiling: core_ceiling,
@@ -499,6 +512,7 @@ pub async fn context_create(
         max_chain_depth,
         max_nesting_depth,
         session_cap,
+        economic_policy: core_economic_policy,
         ..ContextParams::default()
     };
 

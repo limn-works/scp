@@ -28,7 +28,9 @@ struct ToolInvocation {
 
         // Create a context and register the tool
         let params = ContextParams(
+            mode: .encrypted,
             ceiling: ["messages:read", "messages:write", "tool:invoke:*", "tool:register"],
+            ceilingPolicy: .immutable,
             governance: .singleAdmin,
             memoryScope: .ephemeral,
             ttlSeconds: 3600,
@@ -36,7 +38,8 @@ struct ToolInvocation {
             minProtocolVersion: 0,
             maxChainDepth: nil,
             maxNestingDepth: nil,
-            sessionCap: nil
+            sessionCap: nil,
+            economicPolicy: nil
         )
         let handle = try await contextCreate(identity: identity, params: params)
 

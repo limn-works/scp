@@ -779,6 +779,32 @@ pub enum GovernanceModel {
     TokenVoting,
 }
 
+/// Context processing mode. Immutable after creation.
+///
+/// Determines the encryption strategy for the context.
+/// See spec §5.14.
+#[derive(Debug, Clone, uniffi::Enum)]
+pub enum ContextMode {
+    /// MLS-backed encryption with sender-side keys and full forward secrecy.
+    /// This is the default mode.
+    Encrypted,
+    /// Per-author AES-256-GCM broadcast keys. No MLS group is created.
+    /// Subscriber count is unlimited. See spec section 5.14.
+    Broadcast,
+}
+
+/// Ceiling mutability policy. Declared at creation, immutable thereafter.
+///
+/// See ADR-008 and spec §5.3.
+#[derive(Debug, Clone, uniffi::Enum)]
+pub enum CeilingPolicy {
+    /// Ceiling is fixed at creation. Any attempt to modify returns an error.
+    /// This is the default and the security-conservative choice.
+    Immutable,
+    /// Ceiling can be modified through the context's governance model.
+    Governed,
+}
+
 // ---------------------------------------------------------------------------
 // Records (pure data, passed by value)
 //
@@ -809,9 +835,15 @@ pub struct DIDDocument {
 /// See ADR-008 (Context Lifecycle) and spec §5 (Contexts).
 #[derive(Debug, Clone, uniffi::Record)]
 pub struct ContextParams {
+    /// Context processing mode — `Encrypted` (default) or `Broadcast`.
+    /// See spec §5.14.
+    pub mode: ContextMode,
     /// Capability ceiling — maximum capabilities any participant can hold.
     /// Empty list means no ceiling restriction.
     pub ceiling: Vec<String>,
+    /// Ceiling mutability policy — `Immutable` (default) or `Governed`.
+    /// See spec §5.3.
+    pub ceiling_policy: CeilingPolicy,
     /// Governance model for this context.
     pub governance: GovernanceModel,
     /// Memory scope governing key destruction on close.
@@ -833,6 +865,9 @@ pub struct ContextParams {
     /// Per-caller session cap (spec §6.2.1, ADR-043).
     /// `None` uses the protocol default (1000).
     pub session_cap: Option<u32>,
+    /// Optional economic policy as a JSON string (spec §19, ADR-033).
+    /// `None` means no economic policy (free context).
+    pub economic_policy: Option<String>,
 }
 
 /// A message received from an SCP context.
@@ -2385,7 +2420,7 @@ pub async fn context_create(
             let context_id = format!("ctx-{}", Uuid::new_v4());
 
             // Convert bridge ContextParams to scp-core ContextParams.
-            let core_params = bridge_params_to_core(&params);
+            let core_params = bridge_params_to_core(&params)?;
             // Retain a clone for the FFI handle — finalize_close needs the real
             // memory_scope to decide key destruction behavior.
             let retained_core_params = core_params.clone();
@@ -5637,9 +5672,18 @@ pub async fn ucan_mint(
     handle: Arc<ContextHandle>,
     member_did: String,
     capabilities: Vec<String>,
+    proofs: Option<Vec<String>>,
 ) -> Result<Arc<UcanToken>, ScpError> {
     validate_did(&member_did)?;
-    ucan_mint_impl(handle, member_did, capabilities).await
+    if let Some(ref tokens) = proofs {
+        for t in tokens {
+            validate_ucan_token(t).map_err(|e| ScpError::Validation {
+                msg: e.to_string(),
+                code: "SCP-VALID-7010".to_owned(),
+            })?;
+        }
+    }
+    ucan_mint_impl(handle, member_did, capabilities, proofs).await
 }
 
 /// Inner implementation of [`ucan_mint`], split out for cfg-gating clarity.
@@ -5648,6 +5692,7 @@ async fn ucan_mint_impl(
     handle: Arc<ContextHandle>,
     member_did: String,
     capabilities: Vec<String>,
+    proofs: Option<Vec<String>>,
 ) -> Result<Arc<UcanToken>, ScpError> {
     runtime()
         .spawn(async move {
@@ -5677,7 +5722,7 @@ async fn ucan_mint_impl(
                 capabilities: &capabilities,
                 lifetime_secs: 3600, // 1 hour default
                 not_before: None,
-                proofs: vec![],
+                proofs: proofs.unwrap_or_default(),
                 facts: None,
                 key_scope: None,
                 signing_key_id: None,
@@ -5721,6 +5766,7 @@ async fn ucan_mint_impl(
     _handle: Arc<ContextHandle>,
     _member_did: String,
     _capabilities: Vec<String>,
+    _proofs: Option<Vec<String>>,
 ) -> Result<Arc<UcanToken>, ScpError> {
     Err(ScpError::Permission {
         msg: "UCAN minting requires key custody — the in_memory custody path \
@@ -8216,10 +8262,22 @@ impl scp_core::crypto::ucan::validate::ProofResolver for NoOpProofResolver {
 // ---------------------------------------------------------------------------
 
 /// Converts bridge `ContextParams` to scp-core `ContextParams`.
-fn bridge_params_to_core(params: &ContextParams) -> scp_core::context::ContextParams {
+fn bridge_params_to_core(
+    params: &ContextParams,
+) -> Result<scp_core::context::ContextParams, ScpError> {
     use scp_core::context::params::{Capability, PromotionPolicy};
 
+    let mode = match params.mode {
+        ContextMode::Encrypted => scp_core::context::params::ContextMode::Encrypted,
+        ContextMode::Broadcast => scp_core::context::params::ContextMode::Broadcast,
+    };
+
     let ceiling: Vec<Capability> = params.ceiling.iter().map(Capability::new).collect();
+
+    let ceiling_policy = match params.ceiling_policy {
+        CeilingPolicy::Immutable => scp_core::context::params::CeilingPolicy::Immutable,
+        CeilingPolicy::Governed => scp_core::context::params::CeilingPolicy::Governed,
+    };
 
     let memory_scope = match params.memory_scope {
         MemoryScope::Ephemeral => scp_core::context::params::MemoryScope::Ephemeral,
@@ -8253,8 +8311,22 @@ fn bridge_params_to_core(params: &ContextParams) -> scp_core::context::ContextPa
         Some((major, minor))
     };
 
-    scp_core::context::ContextParams {
+    // Deserialize economic_policy JSON string to the core struct, if provided.
+    let economic_policy: Option<scp_core::economy::EconomicPolicy> = params
+        .economic_policy
+        .as_deref()
+        .map(|ep_json| {
+            serde_json::from_str(ep_json).map_err(|e| ScpError::Validation {
+                msg: format!("invalid economic_policy JSON: {e}"),
+                code: "SCP-VALID-7000".to_owned(),
+            })
+        })
+        .transpose()?;
+
+    Ok(scp_core::context::ContextParams {
+        mode,
         ceiling,
+        ceiling_policy,
         governance,
         memory_scope,
         ttl,
@@ -8263,8 +8335,9 @@ fn bridge_params_to_core(params: &ContextParams) -> scp_core::context::ContextPa
         max_chain_depth: params.max_chain_depth,
         max_nesting_depth: params.max_nesting_depth,
         session_cap: params.session_cap,
+        economic_policy,
         ..scp_core::context::ContextParams::default()
-    }
+    })
 }
 
 /// Parses a custody type string into a `CustodyMethod`.

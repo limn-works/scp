@@ -1261,6 +1261,7 @@ export function createWasmBridge(): Bridge {
       handle: BridgeContextHandle,
       memberDid: string,
       capabilities: readonly string[],
+      _proofs?: readonly string[],
     ): Promise<UcanToken> {
       const wasm = getWasm();
       const capabilitiesJson = JSON.stringify(capabilities);

@@ -69,6 +69,7 @@ struct MultiAgent {
 
         // Coordinator creates the context
         let params = ContextParams(
+            mode: .encrypted,
             ceiling: [
                 "messages:read",
                 "messages:write",
@@ -77,6 +78,7 @@ struct MultiAgent {
                 "member:remove",
                 "role:assign"
             ],
+            ceilingPolicy: .immutable,
             governance: .singleAdmin,
             memoryScope: .ephemeral,
             ttlSeconds: 3600,
@@ -84,7 +86,8 @@ struct MultiAgent {
             minProtocolVersion: 0,
             maxChainDepth: nil,
             maxNestingDepth: nil,
-            sessionCap: nil
+            sessionCap: nil,
+            economicPolicy: nil
         )
         let handle = try await contextCreate(identity: coordinator, params: params)
         print("Context created: \(handle.contextId())")

@@ -206,7 +206,7 @@ struct UcanTests {
             capabilities: ["scp:ctx:abc/messages:write"]
         )
 
-        let mockMint: UcanBridge.MintFn = { _, memberDid, capabilities in
+        let mockMint: UcanBridge.MintFn = { _, memberDid, capabilities, _ in
             #expect(memberDid == "did:dht:z6MkMember")
             #expect(capabilities.count == 1)
             return mockToken
@@ -265,7 +265,7 @@ struct UcanTests {
             expiry: nil,
             tokenId: "legacy-mint-token"
         )
-        let mockMint: UcanBridge.MintFn = { _, _, _ in mockToken }
+        let mockMint: UcanBridge.MintFn = { _, _, _, _ in mockToken }
 
         let result = try await mint(
             handle: handle,

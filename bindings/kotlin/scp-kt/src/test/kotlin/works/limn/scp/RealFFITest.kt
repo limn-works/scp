@@ -149,7 +149,9 @@ class RealFFITest {
     inner class ContextTests {
         private fun ephemeralParams(ceiling: List<String> = listOf("messages:read")): uniffi.scp.ContextParams =
             uniffi.scp.ContextParams(
+                mode = uniffi.scp.ContextMode.ENCRYPTED,
                 ceiling = ceiling,
+                ceilingPolicy = uniffi.scp.CeilingPolicy.IMMUTABLE,
                 governance = uniffi.scp.GovernanceModel.SINGLE_ADMIN,
                 memoryScope = uniffi.scp.MemoryScope.EPHEMERAL,
                 ttlSeconds = 0uL,
@@ -237,7 +239,9 @@ class RealFFITest {
     inner class MembershipTests {
         private fun ephemeralParams(): uniffi.scp.ContextParams =
             uniffi.scp.ContextParams(
+                mode = uniffi.scp.ContextMode.ENCRYPTED,
                 ceiling = listOf("messages:read"),
+                ceilingPolicy = uniffi.scp.CeilingPolicy.IMMUTABLE,
                 governance = uniffi.scp.GovernanceModel.SINGLE_ADMIN,
                 memoryScope = uniffi.scp.MemoryScope.EPHEMERAL,
                 ttlSeconds = 0uL,
@@ -299,7 +303,9 @@ class RealFFITest {
                 val alice = uniffi.scp.identityCreate("in_memory")
                 val params =
                     uniffi.scp.ContextParams(
+                        mode = uniffi.scp.ContextMode.ENCRYPTED,
                         ceiling = listOf("messages:read", "tool:invoke:*", "tool:register"),
+                        ceilingPolicy = uniffi.scp.CeilingPolicy.IMMUTABLE,
                         governance = uniffi.scp.GovernanceModel.SINGLE_ADMIN,
                         memoryScope = uniffi.scp.MemoryScope.EPHEMERAL,
                         ttlSeconds = 0uL,
@@ -337,7 +343,9 @@ class RealFFITest {
                 val bob = uniffi.scp.identityCreate("in_memory")
                 val params =
                     uniffi.scp.ContextParams(
+                        mode = uniffi.scp.ContextMode.ENCRYPTED,
                         ceiling = listOf("messages:read", "messages:write"),
+                        ceilingPolicy = uniffi.scp.CeilingPolicy.IMMUTABLE,
                         governance = uniffi.scp.GovernanceModel.SINGLE_ADMIN,
                         memoryScope = uniffi.scp.MemoryScope.EPHEMERAL,
                         ttlSeconds = 0uL,
@@ -345,7 +353,7 @@ class RealFFITest {
                         minProtocolVersion = 0u,
                     )
                 val handle = uniffi.scp.contextCreate(alice, params)
-                val token = uniffi.scp.ucanMint(handle, bob.did(), listOf("messages:read"))
+                val token = uniffi.scp.ucanMint(handle, bob.did(), listOf("messages:read"), null)
                 val tokenData = token.tokenData()
                 assertNotNull(tokenData, "Token data should be non-null")
             }
@@ -357,7 +365,9 @@ class RealFFITest {
                 val alice = uniffi.scp.identityCreate("in_memory")
                 val params =
                     uniffi.scp.ContextParams(
+                        mode = uniffi.scp.ContextMode.ENCRYPTED,
                         ceiling = listOf("messages:read"),
+                        ceilingPolicy = uniffi.scp.CeilingPolicy.IMMUTABLE,
                         governance = uniffi.scp.GovernanceModel.SINGLE_ADMIN,
                         memoryScope = uniffi.scp.MemoryScope.EPHEMERAL,
                         ttlSeconds = 0uL,
@@ -368,7 +378,7 @@ class RealFFITest {
 
                 // Mint a token so the UCAN state is fully initialised for this context.
                 val bob = uniffi.scp.identityCreate("in_memory")
-                val token = uniffi.scp.ucanMint(handle, bob.did(), listOf("messages:read"))
+                val token = uniffi.scp.ucanMint(handle, bob.did(), listOf("messages:read"), null)
                 assertNotNull(token.tokenData(), "Minted token should have data")
 
                 // Revoke a valid UCAN token. The revoker is the context creator.
@@ -393,7 +403,9 @@ class RealFFITest {
                 val alice = uniffi.scp.identityCreate("in_memory")
                 val params =
                     uniffi.scp.ContextParams(
+                        mode = uniffi.scp.ContextMode.ENCRYPTED,
                         ceiling = listOf("messages:read"),
+                        ceilingPolicy = uniffi.scp.CeilingPolicy.IMMUTABLE,
                         governance = uniffi.scp.GovernanceModel.SINGLE_ADMIN,
                         memoryScope = uniffi.scp.MemoryScope.EPHEMERAL,
                         ttlSeconds = 0uL,

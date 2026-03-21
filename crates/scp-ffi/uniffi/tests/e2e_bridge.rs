@@ -22,6 +22,8 @@
 
 use scp_ffi_uniffi::{
     // Types
+    CeilingPolicy,
+    ContextMode,
     ContextParams,
     GovernanceModel,
     MemoryScope,
@@ -86,6 +88,7 @@ use scp_ffi_uniffi::{
 /// Full capability set including context:close and role:assign for lifecycle tests.
 fn full_capability_params() -> ContextParams {
     ContextParams {
+        mode: ContextMode::Encrypted,
         ceiling: vec![
             "messages:read".to_owned(),
             "messages:write".to_owned(),
@@ -95,6 +98,7 @@ fn full_capability_params() -> ContextParams {
             "member:remove".to_owned(),
             "role:assign".to_owned(),
         ],
+        ceiling_policy: CeilingPolicy::Immutable,
         governance: GovernanceModel::SingleAdmin,
         memory_scope: MemoryScope::Ephemeral,
         ttl_seconds: 3600,
@@ -103,16 +107,19 @@ fn full_capability_params() -> ContextParams {
         max_chain_depth: None,
         max_nesting_depth: None,
         session_cap: None,
+        economic_policy: None,
     }
 }
 
 fn default_encrypted_params() -> ContextParams {
     ContextParams {
+        mode: ContextMode::Encrypted,
         ceiling: vec![
             "messages:read".to_owned(),
             "messages:write".to_owned(),
             "tool:invoke:*".to_owned(),
         ],
+        ceiling_policy: CeilingPolicy::Immutable,
         governance: GovernanceModel::SingleAdmin,
         memory_scope: MemoryScope::Ephemeral,
         ttl_seconds: 3600,
@@ -121,6 +128,7 @@ fn default_encrypted_params() -> ContextParams {
         max_chain_depth: None,
         max_nesting_depth: None,
         session_cap: None,
+        economic_policy: None,
     }
 }
 
@@ -458,6 +466,7 @@ async fn ucan_mint_and_revoke() {
         handle.clone(),
         bob.did(),
         vec!["messages:read".to_owned(), "messages:write".to_owned()],
+        None,
     )
     .await
     .unwrap();
@@ -766,7 +775,9 @@ async fn context_create_with_all_governance_models() {
         GovernanceModel::TokenVoting,
     ] {
         let params = ContextParams {
+            mode: ContextMode::Encrypted,
             ceiling: vec!["messages:read".to_owned()],
+            ceiling_policy: CeilingPolicy::Immutable,
             governance: model,
             memory_scope: MemoryScope::Ephemeral,
             ttl_seconds: 3600,
@@ -775,6 +786,7 @@ async fn context_create_with_all_governance_models() {
             max_chain_depth: None,
             max_nesting_depth: None,
             session_cap: None,
+            economic_policy: None,
         };
         let handle = context_create(identity.clone(), params).await.unwrap();
         assert_eq!(handle.state().unwrap(), "active");
@@ -791,7 +803,9 @@ async fn context_create_with_all_memory_scopes() {
         MemoryScope::Full,
     ] {
         let params = ContextParams {
+            mode: ContextMode::Encrypted,
             ceiling: vec!["messages:read".to_owned()],
+            ceiling_policy: CeilingPolicy::Immutable,
             governance: GovernanceModel::SingleAdmin,
             memory_scope: scope,
             ttl_seconds: 3600,
@@ -800,6 +814,7 @@ async fn context_create_with_all_memory_scopes() {
             max_chain_depth: None,
             max_nesting_depth: None,
             session_cap: None,
+            economic_policy: None,
         };
         let handle = context_create(identity.clone(), params).await.unwrap();
         assert_eq!(handle.state().unwrap(), "active");

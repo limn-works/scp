@@ -47,6 +47,7 @@ export async function validateUcan(ctx: Context, token: string, capability: stri
  * @param ctx - The context to mint the token for.
  * @param memberDid - The DID of the member receiving the token.
  * @param capabilities - Capability URIs to grant.
+ * @param proofs - Optional parent UCAN tokens to chain as proofs.
  * @returns The minted UCAN token with metadata.
  * @throws {UcanPermissionError} If minting fails.
  */
@@ -54,10 +55,11 @@ export async function mintUcan(
   ctx: Context,
   memberDid: string,
   capabilities: readonly string[],
+  proofs?: readonly string[],
 ): Promise<UcanToken> {
   try {
     const bridge = await getBridge();
-    return await bridge.ucanMint(ctx._handle, memberDid, capabilities);
+    return await bridge.ucanMint(ctx._handle, memberDid, capabilities, proofs);
   } catch (error) {
     throw mapBridgeError(error);
   }
