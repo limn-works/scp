@@ -153,7 +153,6 @@ pub use bridge::{
     governance_withdraw,
     // Free functions — identity
     identity_create,
-    identity_create_link_attestation,
     identity_create_with_custody,
     identity_execute_custody_migration,
     identity_execute_recovery,
@@ -205,7 +204,7 @@ pub use bridge::{
 };
 // Feature-gated re-exports — only available with allow_in_memory_custody.
 #[cfg(feature = "allow_in_memory_custody")]
-pub use bridge::scpid_sign;
+pub use bridge::{identity_create_link_attestation, identity_remove_link_attestation, scpid_sign};
 // Re-export shutdown function defined in this module.
 // (scp_shutdown is defined here and exported via #[uniffi::export] above.)
 

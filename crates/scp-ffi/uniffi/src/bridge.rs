@@ -2394,12 +2394,15 @@ async fn identity_verify_device_attestation_impl(
 // ---------------------------------------------------------------------------
 
 /// Maximum number of entries in the identity custody registry.
+#[cfg(feature = "allow_in_memory_custody")]
 const UNIFFI_CUSTODY_REGISTRY_CAP: usize = 10_000;
 
 /// Maximum number of DID entries in the identity link attestation registry.
+#[cfg(feature = "allow_in_memory_custody")]
 const UNIFFI_LINK_ATTESTATION_REGISTRY_CAP: usize = 10_000;
 
 /// Maximum number of attestations per DID in the identity link attestation registry.
+#[cfg(feature = "allow_in_memory_custody")]
 const UNIFFI_LINK_ATTESTATION_PER_DID_CAP: usize = 1_000;
 
 /// Global registry of identity link attestations, keyed by DID string.
@@ -2418,6 +2421,7 @@ fn identity_link_attestation_registry()
 /// created attestations, so that `identity_verify_link_attestation` can look
 /// up the issuer's public key without requiring the caller to pass the
 /// Identity object.
+#[cfg(feature = "allow_in_memory_custody")]
 fn identity_custody_registry()
 -> &'static dashmap::DashMap<String, (Arc<OpaqueInMemoryKeyCustody>, scp_platform::KeyHandle)> {
     static REGISTRY: std::sync::OnceLock<
@@ -2429,6 +2433,7 @@ fn identity_custody_registry()
 /// Creates an identity link attestation for an external platform identity.
 ///
 /// See spec §3.5.1, §3.5.2.
+#[cfg(feature = "allow_in_memory_custody")]
 #[uniffi::export]
 pub async fn identity_create_link_attestation(
     identity: Arc<Identity>,
@@ -2449,6 +2454,7 @@ pub async fn identity_create_link_attestation(
     .await
 }
 
+#[cfg(feature = "allow_in_memory_custody")]
 async fn identity_create_link_attestation_impl(
     identity: Arc<Identity>,
     platform: String,
@@ -2658,6 +2664,7 @@ pub fn identity_link_attestations(did: String) -> Result<String, ScpError> {
 /// DID is not in the identity custody registry or the attestation was not found.
 ///
 /// See spec §3.5.1.
+#[cfg(feature = "allow_in_memory_custody")]
 #[must_use]
 #[uniffi::export]
 pub fn identity_remove_link_attestation(did: String, attestation_id: String) -> bool {
