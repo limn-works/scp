@@ -12,9 +12,12 @@ categories = ["cryptography", "data-structures"]
 
 [dependencies]
 ed25519-dalek = { workspace = true }
+serde = { workspace = true }
 
 [dev-dependencies]
 rand = { workspace = true }
+serde_json = { workspace = true }
+rmp-serde = { workspace = true }
 
 [lints]
 workspace = true

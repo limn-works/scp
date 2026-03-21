@@ -15,12 +15,15 @@
 //!
 //! # Design Constraints
 //!
-//! - **Minimal dependencies.** Only `ed25519-dalek` beyond `std`. No protocol
-//!   knowledge, no transport, no platform traits.
+//! - **Minimal dependencies.** Only `ed25519-dalek` and `serde` beyond `std`.
+//!   No protocol knowledge, no transport, no platform traits.
 //! - **No async.** All functions are synchronous.
 //! - **Leaf crate.** Must never depend on any other SCP crate.
 //!
 //! See GitHub issue #233 and PR #199 (scp-event-log extraction) for context.
 
 pub mod crypto;
+pub mod identity;
 pub mod time;
+
+pub use identity::{DID, SigningKeyId};

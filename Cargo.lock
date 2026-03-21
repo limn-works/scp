@@ -5171,7 +5171,6 @@ dependencies = [
  "hex",
  "rand 0.8.5",
  "rmp-serde",
- "scp-identity",
  "scp-primitives",
  "serde",
  "serde_bytes",
@@ -5352,6 +5351,7 @@ dependencies = [
  "mainline",
  "reqwest",
  "scp-platform",
+ "scp-primitives",
  "serde",
  "serde_bytes",
  "serde_json",
@@ -5470,6 +5470,9 @@ version = "0.1.0-beta.1"
 dependencies = [
  "ed25519-dalek 2.2.0",
  "rand 0.8.5",
+ "rmp-serde",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]
