@@ -6685,3 +6685,292 @@ fn provenance_hash_chain_depth_u8_vs_u32() {
         );
     }
 }
+
+// ---------------------------------------------------------------------------
+// Identity link attestation canonical bytes conformance
+// ---------------------------------------------------------------------------
+
+/// Mirror structs matching the WASM bridge's `canonical_attestation` module.
+/// These reproduce the WASM's field declaration order exactly.
+mod wasm_mirror_attestation {
+    use serde::{Deserialize, Serialize};
+
+    #[derive(Serialize, Deserialize)]
+    pub struct Claim {
+        pub platform: String,
+        pub platform_handle: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub platform_id: Option<String>,
+        pub link_type: String,
+    }
+
+    #[derive(Serialize, Deserialize)]
+    pub struct Evidence {
+        pub method: String,
+        pub proof: String,
+        pub verified_at: u64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub verifier_did: Option<String>,
+    }
+
+    #[derive(Serialize, Deserialize)]
+    pub enum RevocationStatus {
+        Active,
+        Revoked {
+            revoked_at: u64,
+            reason: String,
+            #[serde(default = "default_revoked_by")]
+            revoked_by: String,
+        },
+    }
+
+    fn default_revoked_by() -> String {
+        "did:unknown:pre-migration".to_owned()
+    }
+}
+
+/// Verifies that scp-core's `IdentityLinkAttestation::canonical_signing_bytes`
+/// produces the same output as the WASM mirror construction.
+///
+/// This is the critical cross-implementation conformance test: if the WASM
+/// bridge and scp-core ever diverge in their canonical byte computation,
+/// attestation signatures created by one will fail verification in the other.
+#[test]
+fn wasm_attestation_canonical_bytes_match_core() {
+    use scp_core::crypto::canonical::{CanonicalField, canonical_hash};
+    use scp_core::identity::attestation::{
+        AttestationClaim, AttestationEvidence, IdentityLinkAttestation, VerificationMethod,
+    };
+    use scp_core::trust::attestation::RevocationStatus;
+
+    let issuer = "did:dht:z6MkTestAlice".to_string();
+    let issued_at = 1_700_000_000u64;
+    let proof_str = r#"{"type":"oauth_verified","provider":"github.com","subject_id":"12345","verified_at":1700000000}"#.to_string();
+
+    // Build a core IdentityLinkAttestation.
+    let core_attestation = IdentityLinkAttestation {
+        id: "deadbeef".to_string(),
+        attestation_type: "identity_link".into(),
+        issuer: issuer.clone().into(),
+        subject: issuer.clone().into(),
+        issued_at,
+        expires_at: None,
+        claim: AttestationClaim::new("github.com".to_string(), "alice".to_string(), None),
+        evidence: AttestationEvidence {
+            method: VerificationMethod::Oauth,
+            proof: proof_str.clone(),
+            verified_at: issued_at,
+            verifier_did: None,
+        },
+        revocation_status: RevocationStatus::Active,
+        signature: vec![0u8; 64],
+    };
+
+    let core_bytes = core_attestation
+        .canonical_signing_bytes()
+        .expect("core canonical bytes");
+
+    // Reproduce the WASM mirror construction.
+    let absent_sentinel: [u8; 32] = {
+        let mut h = Sha256::new();
+        h.update([0x00]);
+        h.finalize().into()
+    };
+
+    let wasm_claim = wasm_mirror_attestation::Claim {
+        platform: "github.com".to_string(),
+        platform_handle: "alice".to_string(),
+        platform_id: None,
+        link_type: "self_attestation".to_string(),
+    };
+    let wasm_evidence = wasm_mirror_attestation::Evidence {
+        method: "oauth".to_string(),
+        proof: proof_str,
+        verified_at: issued_at,
+        verifier_did: None,
+    };
+    let wasm_revocation = wasm_mirror_attestation::RevocationStatus::Active;
+
+    let claim_msgpack = rmp_serde::to_vec_named(&wasm_claim).expect("claim msgpack");
+    let evidence_msgpack = rmp_serde::to_vec_named(&wasm_evidence).expect("evidence msgpack");
+    let revocation_msgpack = rmp_serde::to_vec_named(&wasm_revocation).expect("revocation msgpack");
+
+    // WASM construction: SHA-256 with domain separator + fields
+    let mut h = Sha256::new();
+    h.update(b"SCP-IDENTITY-LINK-ATTESTATION-V1:");
+    for field in &[
+        b"deadbeef".to_vec(),
+        b"identity_link".to_vec(),
+        issuer.as_bytes().to_vec(),
+        issuer.as_bytes().to_vec(),
+    ] {
+        h.update(u32::try_from(field.len()).unwrap().to_be_bytes());
+        h.update(field);
+    }
+    h.update(issued_at.to_be_bytes());
+    // expires_at = None → absent sentinel
+    h.update(absent_sentinel);
+    for field in &[
+        claim_msgpack.clone(),
+        evidence_msgpack.clone(),
+        revocation_msgpack.clone(),
+    ] {
+        h.update(u32::try_from(field.len()).unwrap().to_be_bytes());
+        h.update(field);
+    }
+    let wasm_bytes: Vec<u8> = h.finalize().to_vec();
+
+    assert_eq!(
+        core_bytes,
+        wasm_bytes,
+        "scp-core canonical bytes must match WASM mirror construction.\n\
+         Core: {}\nWASM: {}",
+        hex::encode(&core_bytes),
+        hex::encode(&wasm_bytes),
+    );
+
+    // Also verify the scp-core canonical_hash function produces the same result.
+    let hash_fn_bytes = canonical_hash(
+        "SCP-IDENTITY-LINK-ATTESTATION-V1:",
+        &[
+            CanonicalField::VarBytes(b"deadbeef"),
+            CanonicalField::VarBytes(b"identity_link"),
+            CanonicalField::VarBytes(issuer.as_bytes()),
+            CanonicalField::VarBytes(issuer.as_bytes()),
+            CanonicalField::U64(issued_at),
+            CanonicalField::Absent,
+            CanonicalField::VarBytes(&claim_msgpack),
+            CanonicalField::VarBytes(&evidence_msgpack),
+            CanonicalField::VarBytes(&revocation_msgpack),
+        ],
+    );
+    assert_eq!(
+        core_bytes,
+        hash_fn_bytes.to_vec(),
+        "canonical_hash utility must match IdentityLinkAttestation::canonical_signing_bytes"
+    );
+}
+
+/// Helper: build core + WASM mirror attestations for a given proof variant and
+/// assert their canonical bytes match.
+#[allow(clippy::too_many_arguments)]
+fn assert_attestation_proof_conformance(
+    proof_str: &str,
+    core_method: scp_core::identity::attestation::VerificationMethod,
+    wasm_method_str: &str,
+) {
+    use scp_core::identity::attestation::{
+        AttestationClaim, AttestationEvidence, IdentityLinkAttestation,
+    };
+    use scp_core::trust::attestation::RevocationStatus;
+
+    let issuer = "did:dht:z6MkTestAlice".to_string();
+    let issued_at = 1_700_000_000u64;
+
+    let core_attestation = IdentityLinkAttestation {
+        id: "deadbeef".to_string(),
+        attestation_type: "identity_link".into(),
+        issuer: issuer.clone().into(),
+        subject: issuer.clone().into(),
+        issued_at,
+        expires_at: None,
+        claim: AttestationClaim::new("github.com".to_string(), "alice".to_string(), None),
+        evidence: AttestationEvidence {
+            method: core_method,
+            proof: proof_str.to_string(),
+            verified_at: issued_at,
+            verifier_did: None,
+        },
+        revocation_status: RevocationStatus::Active,
+        signature: vec![0u8; 64],
+    };
+
+    let core_bytes = core_attestation
+        .canonical_signing_bytes()
+        .expect("core canonical bytes");
+
+    let absent_sentinel: [u8; 32] = {
+        let mut h = Sha256::new();
+        h.update([0x00]);
+        h.finalize().into()
+    };
+
+    let wasm_claim = wasm_mirror_attestation::Claim {
+        platform: "github.com".to_string(),
+        platform_handle: "alice".to_string(),
+        platform_id: None,
+        link_type: "self_attestation".to_string(),
+    };
+    let wasm_evidence = wasm_mirror_attestation::Evidence {
+        method: wasm_method_str.to_string(),
+        proof: proof_str.to_string(),
+        verified_at: issued_at,
+        verifier_did: None,
+    };
+    let wasm_revocation = wasm_mirror_attestation::RevocationStatus::Active;
+
+    let claim_msgpack = rmp_serde::to_vec_named(&wasm_claim).expect("claim msgpack");
+    let evidence_msgpack = rmp_serde::to_vec_named(&wasm_evidence).expect("evidence msgpack");
+    let revocation_msgpack = rmp_serde::to_vec_named(&wasm_revocation).expect("revocation msgpack");
+
+    let mut h = Sha256::new();
+    h.update(b"SCP-IDENTITY-LINK-ATTESTATION-V1:");
+    for field in &[
+        b"deadbeef".to_vec(),
+        b"identity_link".to_vec(),
+        issuer.as_bytes().to_vec(),
+        issuer.as_bytes().to_vec(),
+    ] {
+        h.update(u32::try_from(field.len()).unwrap().to_be_bytes());
+        h.update(field);
+    }
+    h.update(issued_at.to_be_bytes());
+    h.update(absent_sentinel);
+    for field in &[claim_msgpack, evidence_msgpack, revocation_msgpack] {
+        h.update(u32::try_from(field.len()).unwrap().to_be_bytes());
+        h.update(field);
+    }
+    let wasm_bytes: Vec<u8> = h.finalize().to_vec();
+
+    assert_eq!(
+        core_bytes,
+        wasm_bytes,
+        "scp-core canonical bytes must match WASM mirror for {wasm_method_str}.\n\
+         Core: {}\nWASM: {}",
+        hex::encode(&core_bytes),
+        hex::encode(&wasm_bytes),
+    );
+}
+
+#[test]
+fn wasm_attestation_canonical_bytes_signed_post_verified() {
+    use scp_core::identity::attestation::VerificationMethod;
+
+    assert_attestation_proof_conformance(
+        r#"{"type":"signed_post_verified","post_url":"https://x.com/alice/status/123","nonce":"abc123","posted_at":1700000000}"#,
+        VerificationMethod::SignedPost,
+        "signed_post",
+    );
+}
+
+#[test]
+fn wasm_attestation_canonical_bytes_dns_record_verified() {
+    use scp_core::identity::attestation::VerificationMethod;
+
+    assert_attestation_proof_conformance(
+        r#"{"type":"dns_record_verified","domain":"example.com","record_name":"_scp-verify"}"#,
+        VerificationMethod::DnsRecord,
+        "dns_record",
+    );
+}
+
+#[test]
+fn wasm_attestation_canonical_bytes_challenge_response_verified() {
+    use scp_core::identity::attestation::VerificationMethod;
+
+    assert_attestation_proof_conformance(
+        r#"{"type":"challenge_response_verified","challenge":"random-challenge-value","response_signature":"deadbeefdeadbeef"}"#,
+        VerificationMethod::ChallengeResponse,
+        "challenge_response",
+    );
+}

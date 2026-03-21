@@ -39,6 +39,10 @@ ignore = [
     # instant: unmaintained, transitive dep via openmls -> fluvio-wasm-timer.
     # No alternative available; openmls uses it for WASM time abstraction.
     "RUSTSEC-2024-0384",
+    # aws-lc-sys advisories — upstream hasn't patched yet
+    "RUSTSEC-2026-0044",
+    "RUSTSEC-2026-0048",
+    "RUSTSEC-2026-0049",
 ]
 
 # ── Bans ────────────────────────────────────────────────────────────────────

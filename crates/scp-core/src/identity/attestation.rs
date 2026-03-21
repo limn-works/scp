@@ -56,8 +56,32 @@ pub const RENEWAL_INTERVAL_DNS_RECORD_DAYS: u32 = 180;
 /// No persistent proof exists; freshness of the interaction matters more.
 pub const RENEWAL_INTERVAL_CHALLENGE_RESPONSE_DAYS: u32 = 60;
 
-/// Milliseconds per day, for converting renewal intervals to timestamps.
-pub const MS_PER_DAY: u64 = 86_400_000;
+/// Seconds per day, for converting renewal intervals to timestamps.
+///
+/// All attestation timestamps use seconds (spec §3.5.1). Wire format,
+/// `verified_at`, `issued_at`, and expiry are all Unix seconds.
+pub const SECS_PER_DAY: u64 = 86_400;
+
+// ---------------------------------------------------------------------------
+// AttestationClass (§3.5.2)
+// ---------------------------------------------------------------------------
+
+/// Classification of verification methods by their proof model (§3.5.2).
+///
+/// Determines cache TTLs and verification strategy:
+/// - **Cryptographic** — backed by cryptographic verification (OAuth JWTs
+///   verified against JWKS, challenge-response signatures). Can be verified
+///   without re-fetching external resources. Cache TTL: 24h.
+/// - **Reference** — requires fetching an external resource to verify (signed
+///   posts, DNS records). Verification requires network access. Cache TTL: 1h.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AttestationClass {
+    /// Self-verifying via cryptographic proof (OAuth, challenge-response).
+    Cryptographic,
+    /// Requires fetching external resource to verify (signed post, DNS record).
+    Reference,
+}
 
 // ---------------------------------------------------------------------------
 // VerificationMethod (§3.5.2)
@@ -113,6 +137,27 @@ pub enum VerificationMethod {
     ChallengeResponse,
 }
 
+impl std::str::FromStr for VerificationMethod {
+    type Err = String;
+
+    /// Parses a wire-format string into a `VerificationMethod`.
+    ///
+    /// Accepted values: `"oauth"`, `"signed_post"`, `"dns_record"`,
+    /// `"challenge_response"`.
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "oauth" => Ok(Self::Oauth),
+            "signed_post" => Ok(Self::SignedPost),
+            "dns_record" => Ok(Self::DnsRecord),
+            "challenge_response" => Ok(Self::ChallengeResponse),
+            other => Err(format!(
+                "invalid verification method: {other}; expected 'oauth', \
+                 'signed_post', 'dns_record', or 'challenge_response'"
+            )),
+        }
+    }
+}
+
 impl VerificationMethod {
     /// Returns the recommended renewal interval in days for this method (§3.5.2).
     #[must_use]
@@ -125,10 +170,10 @@ impl VerificationMethod {
         }
     }
 
-    /// Returns the recommended renewal interval in milliseconds for this method.
+    /// Returns the recommended renewal interval in seconds for this method.
     #[must_use]
-    pub const fn renewal_interval_ms(self) -> u64 {
-        self.renewal_interval_days() as u64 * MS_PER_DAY
+    pub const fn renewal_interval_secs(self) -> u64 {
+        self.renewal_interval_days() as u64 * SECS_PER_DAY
     }
 
     /// Returns the wire-format string for this method (matches `evidence.method`).
@@ -140,6 +185,116 @@ impl VerificationMethod {
             Self::DnsRecord => "dns_record",
             Self::ChallengeResponse => "challenge_response",
         }
+    }
+
+    /// Returns the attestation class for this verification method (§7.4.1).
+    ///
+    /// - **Cryptographic** methods (OAuth, challenge-response) produce proofs
+    ///   backed by cryptographic verification (OAuth JWTs verified against JWKS,
+    ///   challenge-response signatures). Can be verified without re-fetching the
+    ///   original external resource.
+    /// - **Reference** methods (signed post, DNS record) require fetching or
+    ///   validating external platform data that may become unavailable.
+    #[must_use]
+    pub const fn attestation_class(self) -> AttestationClass {
+        match self {
+            Self::Oauth | Self::ChallengeResponse => AttestationClass::Cryptographic,
+            Self::SignedPost | Self::DnsRecord => AttestationClass::Reference,
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// AttestationProof (§3.5.2)
+// ---------------------------------------------------------------------------
+
+/// Typed proof data for an identity link attestation (§3.5.2).
+///
+/// Each variant corresponds to one [`VerificationMethod`] and carries only the
+/// fields relevant to that method. The `type` tag in the JSON/msgpack wire
+/// format discriminates variants using `snake_case` names.
+///
+/// # Variant–method correspondence
+///
+/// | Variant                      | VerificationMethod   |
+/// |------------------------------|----------------------|
+/// | `OauthVerified`              | `Oauth`              |
+/// | `SignedPostVerified`         | `SignedPost`         |
+/// | `DnsRecordVerified`          | `DnsRecord`          |
+/// | `ChallengeResponseVerified`  | `ChallengeResponse`  |
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum AttestationProof {
+    /// OAuth 2.0 verification proof (§3.5.2).
+    ///
+    /// Contains the provider name, the platform-specific subject ID returned
+    /// by the OAuth provider, and the verification timestamp (seconds).
+    OauthVerified {
+        /// OAuth provider identifier (e.g., `"github.com"`, `"google.com"`).
+        provider: String,
+        /// Platform-specific user/subject ID from the OAuth token.
+        subject_id: String,
+        /// Unix timestamp (seconds) when the OAuth verification occurred.
+        verified_at: u64,
+    },
+
+    /// Signed post verification proof (§3.5.2).
+    ///
+    /// The user posted a message containing their DID and a nonce on the
+    /// target platform. Verifiers fetch the post to confirm authorship.
+    SignedPostVerified {
+        /// Full URL of the post containing the DID and nonce.
+        post_url: String,
+        /// Random nonce included in the post to prevent replay.
+        nonce: String,
+        /// Unix timestamp (seconds) when the post was created.
+        posted_at: u64,
+    },
+
+    /// DNS TXT record verification proof (§3.5.2).
+    ///
+    /// The user added a TXT record at `_scp-verify.<domain>` containing
+    /// their DID. Verifiers perform a DNS lookup to confirm.
+    DnsRecordVerified {
+        /// Domain where the TXT record was placed.
+        domain: String,
+        /// DNS record name (e.g., `"_scp-verify"`).
+        record_name: String,
+    },
+
+    /// Challenge-response verification proof (§3.5.2).
+    ///
+    /// A verifier sent a challenge through the platform; the user signed it
+    /// with their SCP identity key.
+    ChallengeResponseVerified {
+        /// The challenge string sent by the verifier.
+        challenge: String,
+        /// Ed25519 signature over the challenge, hex-encoded.
+        response_signature: String,
+    },
+}
+
+impl AttestationProof {
+    /// Returns the [`VerificationMethod`] that this proof variant corresponds to.
+    ///
+    /// This is the inverse of the variant–method mapping: given a proof, you
+    /// can determine which verification method produced it.
+    #[must_use]
+    pub const fn expected_method(&self) -> VerificationMethod {
+        match self {
+            Self::OauthVerified { .. } => VerificationMethod::Oauth,
+            Self::SignedPostVerified { .. } => VerificationMethod::SignedPost,
+            Self::DnsRecordVerified { .. } => VerificationMethod::DnsRecord,
+            Self::ChallengeResponseVerified { .. } => VerificationMethod::ChallengeResponse,
+        }
+    }
+
+    /// Returns the [`AttestationClass`] for this proof type.
+    ///
+    /// Delegates to the corresponding [`VerificationMethod::attestation_class`].
+    #[must_use]
+    pub const fn attestation_class(&self) -> AttestationClass {
+        self.expected_method().attestation_class()
     }
 }
 
@@ -195,23 +350,23 @@ impl AttestationClaim {
 
 /// Evidence supporting an identity link attestation (§3.5.1).
 ///
-/// Contains the verification method, method-specific proof data, the
-/// timestamp of last verification, and an optional third-party verifier DID.
+/// Contains the verification method, proof data, the timestamp of
+/// last verification, and an optional third-party verifier DID.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AttestationEvidence {
     /// Verification method used to establish the link.
     pub method: VerificationMethod,
 
-    /// Method-specific proof data (§3.5.2).
+    /// Method-specific proof data as an OPAQUE STRING (spec §3.5.2).
     ///
-    /// Contents depend on `method`:
-    /// - OAuth: signed ID token (JWT) or signed provider assertion.
-    /// - Signed post: `{ "post_url", "nonce", "posted_at" }`.
-    /// - DNS record: `{ "domain", "record_name" }`.
-    /// - Challenge-response: `{ "challenge", "response_signature", "verifier_did" }`.
+    /// Verifiers MUST use this string as-is in signature scope — do not parse
+    /// and re-serialize. Three reasons:
+    /// 1. Forward compatibility — new methods without wire format changes
+    /// 2. Cross-implementation determinism — no serialization ambiguity
+    /// 3. No parsing requirement — verifiers only need Ed25519 signature check
     pub proof: String,
 
-    /// Unix timestamp (milliseconds) of last verification.
+    /// Unix timestamp (seconds) of last verification.
     pub verified_at: u64,
 
     /// DID of the third-party verifier, if the evidence was verified by
@@ -222,46 +377,13 @@ pub struct AttestationEvidence {
 
 impl AttestationEvidence {
     /// Returns whether this evidence has expired relative to the given
-    /// current timestamp, based on the verification method's renewal interval.
+    /// current timestamp (seconds), based on the verification method's renewal interval.
     ///
     /// An evidence record is considered expired when
-    /// `now_ms - verified_at > method.renewal_interval_ms()`.
+    /// `now_secs - verified_at > method.renewal_interval_secs()`.
     #[must_use]
-    pub const fn is_expired(&self, now_ms: u64) -> bool {
-        now_ms.saturating_sub(self.verified_at) > self.method.renewal_interval_ms()
-    }
-}
-
-// ---------------------------------------------------------------------------
-// AttestationRevocation (§3.5.1)
-// ---------------------------------------------------------------------------
-
-/// Revocation metadata for an identity link attestation (§3.5.1).
-///
-/// Specifies how verifiers check whether this attestation has been revoked.
-/// The canonical method is `"did_document"` — verifiers resolve the issuer's
-/// DID document and check the `AttestationRevocations` service endpoint
-/// (§18.2.2) for the attestation's ID.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct AttestationRevocation {
-    /// Revocation check method. Currently always `"did_document"`.
-    pub method: Cow<'static, str>,
-
-    /// DID document service endpoint path for revocation status.
-    pub endpoint: String,
-}
-
-impl AttestationRevocation {
-    /// The canonical revocation method value.
-    pub const DID_DOCUMENT: &'static str = "did_document";
-
-    /// Creates a new revocation entry with the canonical method.
-    #[must_use]
-    pub const fn new(endpoint: String) -> Self {
-        Self {
-            method: Cow::Borrowed(Self::DID_DOCUMENT),
-            endpoint,
-        }
+    pub const fn is_expired(&self, now_secs: u64) -> bool {
+        now_secs.saturating_sub(self.verified_at) > self.method.renewal_interval_secs()
     }
 }
 
@@ -301,10 +423,10 @@ pub struct IdentityLinkAttestation {
     /// Same as `issuer` for self-attestations.
     pub subject: DID,
 
-    /// Unix timestamp (milliseconds) when the attestation was created.
+    /// Unix timestamp (seconds) when the attestation was created.
     pub issued_at: u64,
 
-    /// Optional expiry timestamp (milliseconds). If absent, valid until revoked.
+    /// Optional expiry timestamp (seconds). If absent, valid until revoked.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub expires_at: Option<u64>,
 
@@ -314,8 +436,9 @@ pub struct IdentityLinkAttestation {
     /// Evidence supporting the claim.
     pub evidence: AttestationEvidence,
 
-    /// Revocation metadata.
-    pub revocation: AttestationRevocation,
+    /// Revocation status: `Active` or `Revoked` (§7.4.1). Included in
+    /// the signed scope to prevent replay of revoked attestations.
+    pub revocation_status: crate::trust::attestation::RevocationStatus,
 
     /// Ed25519 signature over the canonical `MessagePack` of all other fields.
     ///
@@ -334,24 +457,24 @@ impl IdentityLinkAttestation {
     /// Returns `false` if `expires_at` is `None` (no expiry set — valid
     /// until revoked).
     #[must_use]
-    pub fn is_time_expired(&self, now_ms: u64) -> bool {
-        self.expires_at.is_some_and(|exp| now_ms > exp)
+    pub fn is_time_expired(&self, now_secs: u64) -> bool {
+        self.expires_at.is_some_and(|exp| now_secs > exp)
     }
 
     /// Returns whether the evidence needs renewal based on the verification
     /// method's recommended interval (§3.5.2).
     #[must_use]
-    pub const fn needs_renewal(&self, now_ms: u64) -> bool {
-        self.evidence.is_expired(now_ms)
+    pub const fn needs_renewal(&self, now_secs: u64) -> bool {
+        self.evidence.is_expired(now_secs)
     }
 
-    /// Returns the renewal deadline (milliseconds) — the timestamp after
+    /// Returns the renewal deadline (seconds) — the timestamp after
     /// which this attestation's evidence is considered stale.
     #[must_use]
-    pub const fn renewal_deadline_ms(&self) -> u64 {
+    pub const fn renewal_deadline_secs(&self) -> u64 {
         self.evidence
             .verified_at
-            .saturating_add(self.evidence.method.renewal_interval_ms())
+            .saturating_add(self.evidence.method.renewal_interval_secs())
     }
 
     /// Computes the deterministic attestation ID from its components.
@@ -399,7 +522,7 @@ impl IdentityLinkAttestation {
     /// The canonical form uses domain separator `"SCP-IDENTITY-LINK-ATTESTATION-V1:"`
     /// with fields in a fixed order: `id`, `attestation_type`, `issuer`, `subject`,
     /// `issued_at`, `expires_at` (or absent sentinel), `claim` (`MessagePack`),
-    /// `evidence` (`MessagePack`), `revocation` (`MessagePack`).
+    /// `evidence` (`MessagePack`), `revocation_status` (`MessagePack`).
     ///
     /// # Arguments
     ///
@@ -420,12 +543,18 @@ impl IdentityLinkAttestation {
     ///
     /// The payload includes all fields except `signature`, serialized using the
     /// protocol's canonical hash construction (§9.5.1). Sub-structs (`claim`,
-    /// `evidence`, `revocation`) are serialized as `MessagePack` bytes and included
-    /// as variable-length fields.
+    /// `evidence`, `revocation_status`) are serialized as `MessagePack` bytes
+    /// and included as variable-length fields.
     ///
     /// This method is deterministic: identical attestation data always produces
     /// identical bytes, regardless of serde field ordering.
-    fn canonical_signing_bytes(&self) -> Result<Vec<u8>, AttestationSignatureError> {
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AttestationSignatureError::SerializationFailed`] if any
+    /// sub-struct (`claim`, `evidence`, `revocation_status`) cannot be serialized
+    /// to `MessagePack`.
+    pub fn canonical_signing_bytes(&self) -> Result<Vec<u8>, AttestationSignatureError> {
         use crate::crypto::canonical::{CanonicalField, canonical_hash};
 
         let claim_bytes = rmp_serde::to_vec_named(&self.claim).map_err(|e| {
@@ -438,11 +567,12 @@ impl IdentityLinkAttestation {
                 "evidence serialization failed: {e}"
             ))
         })?;
-        let revocation_bytes = rmp_serde::to_vec_named(&self.revocation).map_err(|e| {
-            AttestationSignatureError::SerializationFailed(format!(
-                "revocation serialization failed: {e}"
-            ))
-        })?;
+        let revocation_status_bytes =
+            rmp_serde::to_vec_named(&self.revocation_status).map_err(|e| {
+                AttestationSignatureError::SerializationFailed(format!(
+                    "revocation_status serialization failed: {e}"
+                ))
+            })?;
 
         Ok(canonical_hash(
             "SCP-IDENTITY-LINK-ATTESTATION-V1:",
@@ -456,7 +586,7 @@ impl IdentityLinkAttestation {
                     .map_or(CanonicalField::Absent, CanonicalField::U64),
                 CanonicalField::VarBytes(&claim_bytes),
                 CanonicalField::VarBytes(&evidence_bytes),
-                CanonicalField::VarBytes(&revocation_bytes),
+                CanonicalField::VarBytes(&revocation_status_bytes),
             ],
         )
         .to_vec())
@@ -470,6 +600,8 @@ impl IdentityLinkAttestation {
     /// - `issuer` equals `subject` (self-attestation).
     /// - `id` matches the computed deterministic ID.
     /// - `claim.link_type` is `"self_attestation"`.
+    /// - If revoked, `revoked_by` equals `issuer` (§7.4.1: only the issuer
+    ///   can revoke their own attestation).
     ///
     /// Returns a list of validation errors. Empty list means structurally valid.
     #[must_use]
@@ -506,6 +638,29 @@ impl IdentityLinkAttestation {
             errors.push(Cow::Owned(format!(
                 "link_type must be \"self_attestation\", got {:?}",
                 self.claim.link_type,
+            )));
+        }
+
+        // §7.4.1: only the issuer can revoke their own attestation.
+        // Defense in depth — signature verification prevents tampering, but
+        // structural validation catches malformed attestations early.
+        if let crate::trust::attestation::RevocationStatus::Revoked { revoked_by, .. } =
+            &self.revocation_status
+            && *revoked_by != self.issuer
+        {
+            errors.push(Cow::Owned(format!(
+                "revoked_by {} does not match issuer {}",
+                revoked_by, self.issuer,
+            )));
+        }
+
+        // expires_at, when present, must be after issued_at.
+        if let Some(expires_at) = self.expires_at
+            && expires_at <= self.issued_at
+        {
+            errors.push(Cow::Owned(format!(
+                "expires_at ({expires_at}) must be greater than issued_at ({})",
+                self.issued_at,
             )));
         }
 
@@ -547,7 +702,7 @@ mod tests {
         let issuer = did("did:dht:z6MkAlice");
         let platform = "github.com";
         let handle = "alice";
-        let issued_at = 1_700_000_000_000_u64;
+        let issued_at = 1_700_000_000_u64;
 
         IdentityLinkAttestation {
             id: IdentityLinkAttestation::compute_id(&issuer, platform, handle, issued_at),
@@ -563,12 +718,11 @@ mod tests {
             ),
             evidence: AttestationEvidence {
                 method: VerificationMethod::Oauth,
-                proof: r#"{"provider":"github.com","subject":"12345","issued_at":1700000000}"#
-                    .to_owned(),
-                verified_at: 1_700_000_000_000,
+                proof: r#"{"type":"oauth_verified","provider":"github.com","subject_id":"12345","verified_at":1700000000}"#.to_owned(),
+                verified_at: 1_700_000_000,
                 verifier_did: None,
             },
-            revocation: AttestationRevocation::new("/revocations".to_owned()),
+            revocation_status: crate::trust::attestation::RevocationStatus::Active,
             signature: vec![0xAA; 64],
         }
     }
@@ -589,14 +743,14 @@ mod tests {
     }
 
     #[test]
-    fn verification_method_renewal_ms() {
+    fn verification_method_renewal_secs() {
         assert_eq!(
-            VerificationMethod::Oauth.renewal_interval_ms(),
-            30 * MS_PER_DAY
+            VerificationMethod::Oauth.renewal_interval_secs(),
+            30 * SECS_PER_DAY
         );
         assert_eq!(
-            VerificationMethod::DnsRecord.renewal_interval_ms(),
-            180 * MS_PER_DAY
+            VerificationMethod::DnsRecord.renewal_interval_secs(),
+            180 * SECS_PER_DAY
         );
     }
 
@@ -669,12 +823,12 @@ mod tests {
     fn attestation_evidence_not_expired() {
         let evidence = AttestationEvidence {
             method: VerificationMethod::Oauth,
-            proof: "jwt-token".to_owned(),
-            verified_at: 1_700_000_000_000,
+            proof: r#"{"type":"oauth_verified","provider":"github.com","subject_id":"12345","verified_at":1700000000}"#.to_owned(),
+            verified_at: 1_700_000_000,
             verifier_did: None,
         };
         // 15 days later — within 30-day renewal
-        let now = 1_700_000_000_000 + 15 * MS_PER_DAY;
+        let now = 1_700_000_000 + 15 * SECS_PER_DAY;
         assert!(!evidence.is_expired(now));
     }
 
@@ -682,12 +836,12 @@ mod tests {
     fn attestation_evidence_expired() {
         let evidence = AttestationEvidence {
             method: VerificationMethod::Oauth,
-            proof: "jwt-token".to_owned(),
-            verified_at: 1_700_000_000_000,
+            proof: r#"{"type":"oauth_verified","provider":"github.com","subject_id":"12345","verified_at":1700000000}"#.to_owned(),
+            verified_at: 1_700_000_000,
             verifier_did: None,
         };
         // 31 days later — past 30-day renewal
-        let now = 1_700_000_000_000 + 31 * MS_PER_DAY;
+        let now = 1_700_000_000 + 31 * SECS_PER_DAY;
         assert!(evidence.is_expired(now));
     }
 
@@ -695,12 +849,12 @@ mod tests {
     fn attestation_evidence_exactly_at_boundary() {
         let evidence = AttestationEvidence {
             method: VerificationMethod::SignedPost,
-            proof: "post-data".to_owned(),
-            verified_at: 1_700_000_000_000,
+            proof: r#"{"type":"signed_post_verified","post_url":"https://x.com/alice/123","nonce":"abc123","posted_at":1700000000}"#.to_owned(),
+            verified_at: 1_700_000_000,
             verifier_did: None,
         };
         // Exactly at 90 days — not expired (boundary is >)
-        let now = 1_700_000_000_000 + 90 * MS_PER_DAY;
+        let now = 1_700_000_000 + 90 * SECS_PER_DAY;
         assert!(!evidence.is_expired(now));
     }
 
@@ -708,32 +862,13 @@ mod tests {
     fn attestation_evidence_serialization_roundtrip() {
         let evidence = AttestationEvidence {
             method: VerificationMethod::ChallengeResponse,
-            proof: r#"{"challenge":"abc","response_signature":"def","verifier_did":"did:dht:z6MkVerifier"}"#.to_owned(),
-            verified_at: 1_700_000_000_000,
+            proof: r#"{"type":"challenge_response_verified","challenge":"abc","response_signature":"def"}"#.to_owned(),
+            verified_at: 1_700_000_000,
             verifier_did: Some(did("did:dht:z6MkVerifier")),
         };
         let json = serde_json::to_string(&evidence).unwrap();
         let deserialized: AttestationEvidence = serde_json::from_str(&json).unwrap();
         assert_eq!(evidence, deserialized);
-    }
-
-    // -----------------------------------------------------------------------
-    // AttestationRevocation
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn attestation_revocation_construction() {
-        let rev = AttestationRevocation::new("/revocations/v1".to_owned());
-        assert_eq!(rev.method, "did_document");
-        assert_eq!(rev.endpoint, "/revocations/v1");
-    }
-
-    #[test]
-    fn attestation_revocation_serialization_roundtrip() {
-        let rev = AttestationRevocation::new("/attestation-revocations".to_owned());
-        let json = serde_json::to_string(&rev).unwrap();
-        let deserialized: AttestationRevocation = serde_json::from_str(&json).unwrap();
-        assert_eq!(rev, deserialized);
     }
 
     // -----------------------------------------------------------------------
@@ -804,6 +939,37 @@ mod tests {
     }
 
     #[test]
+    fn attestation_validate_structure_revoked_by_non_issuer() {
+        let mut attestation = make_attestation();
+        attestation.revocation_status = crate::trust::attestation::RevocationStatus::Revoked {
+            revoked_at: 1_700_000_100_000,
+            reason: String::new(),
+            revoked_by: did("did:dht:z6MkMallory"),
+        };
+        let errors = attestation.validate_structure();
+        assert!(
+            errors.iter().any(|e| e.contains("revoked_by")),
+            "expected revoked_by mismatch error, got: {errors:?}",
+        );
+    }
+
+    #[test]
+    fn attestation_validate_structure_revoked_by_issuer_ok() {
+        let mut attestation = make_attestation();
+        attestation.revocation_status = crate::trust::attestation::RevocationStatus::Revoked {
+            revoked_at: 1_700_000_100_000,
+            reason: String::new(),
+            revoked_by: attestation.issuer.clone(),
+        };
+        let errors = attestation.validate_structure();
+        // No revoked_by error — only issuer can revoke.
+        assert!(
+            !errors.iter().any(|e| e.contains("revoked_by")),
+            "unexpected revoked_by error: {errors:?}",
+        );
+    }
+
+    #[test]
     fn attestation_is_time_expired_no_expiry() {
         let attestation = make_attestation();
         assert!(!attestation.is_time_expired(u64::MAX));
@@ -812,22 +978,22 @@ mod tests {
     #[test]
     fn attestation_is_time_expired_before_expiry() {
         let mut attestation = make_attestation();
-        attestation.expires_at = Some(2_000_000_000_000);
-        assert!(!attestation.is_time_expired(1_999_999_999_999));
+        attestation.expires_at = Some(2_000_000_000);
+        assert!(!attestation.is_time_expired(1_999_999_999));
     }
 
     #[test]
     fn attestation_is_time_expired_after_expiry() {
         let mut attestation = make_attestation();
-        attestation.expires_at = Some(2_000_000_000_000);
-        assert!(attestation.is_time_expired(2_000_000_000_001));
+        attestation.expires_at = Some(2_000_000_000);
+        assert!(attestation.is_time_expired(2_000_000_001));
     }
 
     #[test]
     fn attestation_needs_renewal_fresh() {
         let attestation = make_attestation();
         // 5 days later — well within 30-day OAuth renewal
-        let now = attestation.evidence.verified_at + 5 * MS_PER_DAY;
+        let now = attestation.evidence.verified_at + 5 * SECS_PER_DAY;
         assert!(!attestation.needs_renewal(now));
     }
 
@@ -835,15 +1001,15 @@ mod tests {
     fn attestation_needs_renewal_stale() {
         let attestation = make_attestation();
         // 31 days later — past 30-day OAuth renewal
-        let now = attestation.evidence.verified_at + 31 * MS_PER_DAY;
+        let now = attestation.evidence.verified_at + 31 * SECS_PER_DAY;
         assert!(attestation.needs_renewal(now));
     }
 
     #[test]
-    fn attestation_renewal_deadline_ms() {
+    fn attestation_renewal_deadline_secs() {
         let attestation = make_attestation();
-        let expected = attestation.evidence.verified_at + 30 * MS_PER_DAY;
-        assert_eq!(attestation.renewal_deadline_ms(), expected);
+        let expected = attestation.evidence.verified_at + 30 * SECS_PER_DAY;
+        assert_eq!(attestation.renewal_deadline_secs(), expected);
     }
 
     #[test]
@@ -865,11 +1031,11 @@ mod tests {
     #[test]
     fn attestation_with_expiry_serialization() {
         let mut attestation = make_attestation();
-        attestation.expires_at = Some(1_800_000_000_000);
+        attestation.expires_at = Some(1_800_000_000);
         let json = serde_json::to_string(&attestation).unwrap();
-        assert!(json.contains("1800000000000"));
+        assert!(json.contains("1800000000"));
         let deserialized: IdentityLinkAttestation = serde_json::from_str(&json).unwrap();
-        assert_eq!(deserialized.expires_at, Some(1_800_000_000_000));
+        assert_eq!(deserialized.expires_at, Some(1_800_000_000));
     }
 
     #[test]
@@ -877,10 +1043,10 @@ mod tests {
         let mut attestation = make_attestation();
         attestation.evidence.method = VerificationMethod::DnsRecord;
         // 100 days — within 180-day DNS renewal
-        let now = attestation.evidence.verified_at + 100 * MS_PER_DAY;
+        let now = attestation.evidence.verified_at + 100 * SECS_PER_DAY;
         assert!(!attestation.needs_renewal(now));
         // 181 days — past renewal
-        let now = attestation.evidence.verified_at + 181 * MS_PER_DAY;
+        let now = attestation.evidence.verified_at + 181 * SECS_PER_DAY;
         assert!(attestation.needs_renewal(now));
     }
 
@@ -928,7 +1094,7 @@ mod tests {
     fn attestation_evidence_ignores_unknown_fields() {
         let evidence = AttestationEvidence {
             method: VerificationMethod::Oauth,
-            proof: "proof-data".to_owned(),
+            proof: r#"{"type":"oauth_verified","provider":"github.com","subject_id":"12345","verified_at":1700000000}"#.to_owned(),
             verified_at: 1_700_000_000_000,
             verifier_did: None,
         };
@@ -944,23 +1110,6 @@ mod tests {
         let decoded = result.unwrap();
         assert_eq!(decoded.method, VerificationMethod::Oauth);
         assert_eq!(decoded.verified_at, 1_700_000_000_000);
-    }
-
-    #[test]
-    fn attestation_revocation_ignores_unknown_fields() {
-        let revocation = AttestationRevocation::new("/revocations".to_owned());
-        let mut map: serde_json::Map<String, serde_json::Value> =
-            serde_json::from_value(serde_json::to_value(&revocation).unwrap()).unwrap();
-        map.insert("future_field".into(), "v2-data".into());
-        let result =
-            serde_json::from_value::<AttestationRevocation>(serde_json::Value::Object(map));
-        assert!(
-            result.is_ok(),
-            "wire-format types must ignore unknown fields per §13.5.1: {:?}",
-            result.unwrap_err()
-        );
-        let decoded = result.unwrap();
-        assert_eq!(decoded.endpoint, "/revocations");
     }
 
     // -----------------------------------------------------------------------
@@ -993,12 +1142,11 @@ mod tests {
             ),
             evidence: AttestationEvidence {
                 method: VerificationMethod::Oauth,
-                proof: r#"{"provider":"github.com","subject":"12345","issued_at":1700000000}"#
-                    .to_owned(),
+                proof: r#"{"type":"oauth_verified","provider":"github.com","subject_id":"12345","verified_at":1700000000}"#.to_owned(),
                 verified_at: 1_700_000_000_000,
                 verifier_did: None,
             },
-            revocation: AttestationRevocation::new("/revocations".to_owned()),
+            revocation_status: crate::trust::attestation::RevocationStatus::Active,
             signature: Vec::new(), // placeholder — will be replaced
         };
 
@@ -1081,13 +1229,21 @@ mod tests {
     }
 
     #[test]
-    fn verify_signature_tampered_revocation() {
+    fn verify_signature_tampered_revocation_status() {
         let sk = test_signing_key(0xAA);
         let mut attestation = make_signed_attestation(&sk);
-        attestation.revocation.endpoint = "/evil".to_owned();
+        // Tamper revocation_status from Active to Revoked — must invalidate
+        attestation.revocation_status = crate::trust::attestation::RevocationStatus::Revoked {
+            revoked_at: 1_700_000_000_000,
+            reason: "tampered".to_owned(),
+            revoked_by: attestation.issuer.clone(),
+        };
         let vk = sk.verifying_key();
         let result = attestation.verify_signature(vk.as_bytes());
-        assert!(result.is_err(), "should fail with tampered revocation");
+        assert!(
+            result.is_err(),
+            "should fail with tampered revocation_status"
+        );
     }
 
     #[test]
@@ -1162,13 +1318,11 @@ mod tests {
             claim: AttestationClaim::new(platform.to_owned(), handle.to_owned(), None),
             evidence: AttestationEvidence {
                 method: VerificationMethod::SignedPost,
-                proof:
-                    r#"{"post_url":"https://x.com/alice/123","nonce":"abc","posted_at":1700000000}"#
-                        .to_owned(),
+                proof: r#"{"type":"signed_post_verified","post_url":"https://x.com/alice/123","nonce":"abc","posted_at":1700000000}"#.to_owned(),
                 verified_at: 1_700_000_000_000,
                 verifier_did: None,
             },
-            revocation: AttestationRevocation::new("/revocations".to_owned()),
+            revocation_status: crate::trust::attestation::RevocationStatus::Active,
             signature: Vec::new(),
         };
 
@@ -1186,5 +1340,187 @@ mod tests {
         let bytes1 = attestation.canonical_signing_bytes().unwrap();
         let bytes2 = attestation.canonical_signing_bytes().unwrap();
         assert_eq!(bytes1, bytes2, "canonical bytes must be deterministic");
+    }
+
+    // -----------------------------------------------------------------------
+    // AttestationClass
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn attestation_class_from_verification_method() {
+        assert_eq!(
+            VerificationMethod::Oauth.attestation_class(),
+            AttestationClass::Cryptographic
+        );
+        assert_eq!(
+            VerificationMethod::ChallengeResponse.attestation_class(),
+            AttestationClass::Cryptographic
+        );
+        assert_eq!(
+            VerificationMethod::SignedPost.attestation_class(),
+            AttestationClass::Reference
+        );
+        assert_eq!(
+            VerificationMethod::DnsRecord.attestation_class(),
+            AttestationClass::Reference
+        );
+    }
+
+    #[test]
+    fn attestation_class_serialization_roundtrip() {
+        let classes = [AttestationClass::Cryptographic, AttestationClass::Reference];
+        for class in &classes {
+            let json = serde_json::to_string(class).unwrap();
+            let deserialized: AttestationClass = serde_json::from_str(&json).unwrap();
+            assert_eq!(class, &deserialized);
+        }
+    }
+
+    #[test]
+    fn attestation_class_serde_snake_case() {
+        assert_eq!(
+            serde_json::to_string(&AttestationClass::Cryptographic).unwrap(),
+            "\"cryptographic\""
+        );
+        assert_eq!(
+            serde_json::to_string(&AttestationClass::Reference).unwrap(),
+            "\"reference\""
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // AttestationProof (deprecated — kept for SDK-side parsing tests)
+    // -----------------------------------------------------------------------
+
+    #[allow(deprecated)]
+    #[test]
+    fn attestation_proof_expected_method() {
+        let oauth = AttestationProof::OauthVerified {
+            provider: "g".to_owned(),
+            subject_id: "1".to_owned(),
+            verified_at: 0,
+        };
+        assert_eq!(oauth.expected_method(), VerificationMethod::Oauth);
+
+        let signed_post = AttestationProof::SignedPostVerified {
+            post_url: "u".to_owned(),
+            nonce: "n".to_owned(),
+            posted_at: 0,
+        };
+        assert_eq!(
+            signed_post.expected_method(),
+            VerificationMethod::SignedPost
+        );
+
+        let dns = AttestationProof::DnsRecordVerified {
+            domain: "d".to_owned(),
+            record_name: "r".to_owned(),
+        };
+        assert_eq!(dns.expected_method(), VerificationMethod::DnsRecord);
+
+        let cr = AttestationProof::ChallengeResponseVerified {
+            challenge: "c".to_owned(),
+            response_signature: "s".to_owned(),
+        };
+        assert_eq!(cr.expected_method(), VerificationMethod::ChallengeResponse);
+    }
+
+    #[allow(deprecated)]
+    #[test]
+    fn attestation_proof_attestation_class() {
+        let oauth = AttestationProof::OauthVerified {
+            provider: "g".to_owned(),
+            subject_id: "1".to_owned(),
+            verified_at: 0,
+        };
+        assert_eq!(oauth.attestation_class(), AttestationClass::Cryptographic);
+
+        let dns = AttestationProof::DnsRecordVerified {
+            domain: "d".to_owned(),
+            record_name: "r".to_owned(),
+        };
+        assert_eq!(dns.attestation_class(), AttestationClass::Reference);
+    }
+
+    #[allow(deprecated)]
+    #[test]
+    fn attestation_proof_serialization_roundtrip_all_variants() {
+        let proofs = [
+            AttestationProof::OauthVerified {
+                provider: "github.com".to_owned(),
+                subject_id: "12345".to_owned(),
+                verified_at: 1_700_000_000,
+            },
+            AttestationProof::SignedPostVerified {
+                post_url: "https://x.com/alice/123".to_owned(),
+                nonce: "abc123".to_owned(),
+                posted_at: 1_700_000_000,
+            },
+            AttestationProof::DnsRecordVerified {
+                domain: "example.com".to_owned(),
+                record_name: "_scp-verify".to_owned(),
+            },
+            AttestationProof::ChallengeResponseVerified {
+                challenge: "random-challenge".to_owned(),
+                response_signature: "deadbeef".to_owned(),
+            },
+        ];
+
+        for proof in &proofs {
+            // JSON roundtrip
+            let json = serde_json::to_string(proof).unwrap();
+            let deserialized: AttestationProof = serde_json::from_str(&json).unwrap();
+            assert_eq!(proof, &deserialized, "JSON roundtrip failed for {proof:?}");
+
+            // MessagePack roundtrip
+            let bytes = rmp_serde::to_vec_named(proof).unwrap();
+            let deserialized: AttestationProof = rmp_serde::from_slice(&bytes).unwrap();
+            assert_eq!(
+                proof, &deserialized,
+                "MessagePack roundtrip failed for {proof:?}"
+            );
+        }
+    }
+
+    #[allow(deprecated)]
+    #[test]
+    fn attestation_proof_json_has_type_tag() {
+        let proof = AttestationProof::OauthVerified {
+            provider: "github.com".to_owned(),
+            subject_id: "12345".to_owned(),
+            verified_at: 1_700_000_000,
+        };
+        let json = serde_json::to_string(&proof).unwrap();
+        assert!(
+            json.contains("\"type\":\"oauth_verified\""),
+            "expected type tag in JSON: {json}"
+        );
+
+        let proof = AttestationProof::DnsRecordVerified {
+            domain: "example.com".to_owned(),
+            record_name: "_scp-verify".to_owned(),
+        };
+        let json = serde_json::to_string(&proof).unwrap();
+        assert!(
+            json.contains("\"type\":\"dns_record_verified\""),
+            "expected type tag in JSON: {json}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Proof is opaque string — no proof-method validation
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn validate_structure_does_not_check_proof_content() {
+        // Proof is an opaque string per §3.5.2. validate_structure does not
+        // inspect its content, even if it doesn't match the method.
+        let mut attestation = make_attestation();
+        attestation.evidence.proof = "arbitrary-non-json-string".to_owned();
+        let errors = attestation.validate_structure();
+        assert!(
+            !errors.iter().any(|e| e.contains("proof")),
+            "validate_structure must not inspect proof content: {errors:?}"
+        );
     }
 }

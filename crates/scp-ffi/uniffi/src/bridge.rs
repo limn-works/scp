@@ -10742,7 +10742,12 @@ pub fn bridge_register(
 
     // Bridge ID per spec §12.2.1: SHA-256(context_id || operator_did || platform || timestamp).
     let (bridge_id, now_secs) =
-        scp_ffi_common::generate_bridge_id(&context_id, &operator_did, &platform);
+        scp_ffi_common::generate_bridge_id(&context_id, &operator_did, &platform).map_err(|e| {
+            ScpError::Context {
+                msg: e.to_string(),
+                code: "SCP-CTX-2017".to_owned(),
+            }
+        })?;
     let request = scp_core::bridge::registration::BridgeRegistrationRequest {
         bridge_id: bridge_id.clone(),
         operator_did: operator_did.clone().into(),
@@ -10914,7 +10919,12 @@ pub async fn context_discover(query: String) -> Result<String, ScpError> {
                 code: "SCP-CTX-2020".to_owned(),
             })?;
 
-        let results = vec![discovery_result_to_json(&result)];
+        let results = vec![
+            discovery_result_to_json(&result).map_err(|e| ScpError::Context {
+                msg: e,
+                code: "SCP-CTX-2020".to_owned(),
+            })?,
+        ];
         serde_json::to_string(&results).map_err(|e| ScpError::Context {
             msg: format!("failed to serialize discovery results: {e}"),
             code: "SCP-CTX-2021".to_owned(),
@@ -10932,8 +10942,15 @@ pub async fn context_discover(query: String) -> Result<String, ScpError> {
                         code: "SCP-CTX-2022".to_owned(),
                     })?;
 
-                let json_results: Vec<serde_json::Value> =
-                    results.iter().map(discovery_result_to_json).collect();
+                let json_results: Vec<serde_json::Value> = results
+                    .iter()
+                    .map(|r| {
+                        discovery_result_to_json(r).map_err(|e| ScpError::Context {
+                            msg: e,
+                            code: "SCP-CTX-2022".to_owned(),
+                        })
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
                 serde_json::to_string(&json_results).map_err(|e| ScpError::Context {
                     msg: format!("failed to serialize discovery results: {e}"),
                     code: "SCP-CTX-2023".to_owned(),
@@ -12361,7 +12378,7 @@ mod tests {
             metadata_summary: None,
         };
 
-        let json = discovery_result_to_json(&result);
+        let json = discovery_result_to_json(&result).unwrap();
         assert_eq!(json["context_id"], "abc123");
         assert_eq!(json["discovery_source"], "dht_did_document");
         assert_eq!(json["mode"], "broadcast");
@@ -12386,7 +12403,7 @@ mod tests {
             metadata_summary: None,
         };
 
-        let json = discovery_result_to_json(&result);
+        let json = discovery_result_to_json(&result).unwrap();
         assert_eq!(json["trust_level"]["kind"], "DiscoveryContextVerified");
         assert_eq!(json["resolution_path"]["layer"], "DiscoveryContext");
         assert_eq!(json["resolution_path"]["source"], "discovery_context");
@@ -12405,7 +12422,7 @@ mod tests {
             metadata_summary: None,
         };
 
-        let json = discovery_result_to_json(&result);
+        let json = discovery_result_to_json(&result).unwrap();
         assert_eq!(json["trust_level"]["kind"], "DirectExchange");
         assert_eq!(json["resolution_path"]["layer"], "Domain");
         assert_eq!(json["resolution_path"]["source"], "context_uri");
@@ -12424,7 +12441,7 @@ mod tests {
             metadata_summary: Some("Example context".to_owned()),
         };
 
-        let json = discovery_result_to_json(&result);
+        let json = discovery_result_to_json(&result).unwrap();
         assert_eq!(json["trust_level"]["kind"], "DomainVerified");
         assert_eq!(json["resolution_path"]["layer"], "Domain");
         assert_eq!(json["resolution_path"]["source"], "well-known");

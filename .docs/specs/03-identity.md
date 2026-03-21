@@ -201,8 +201,7 @@ Identity attestations use the attestation envelope defined in §7.4.1, with iden
   },
   evidence: {
     method:         String,      // Verification method: "oauth", "signed_post", "dns_record", "challenge_response"
-    proof:          String,      // Method-specific proof data (see §3.5.0, §3.5.1)
-                                     // Verifiers MUST use this string as-is in signature scope — do not parse and re-serialize
+    proof:          String,           // Method-specific proof data (opaque — see below)
     verified_at:    u64,         // Unix timestamp (s) of last verification
     verifier_did:   Option<DID>, // DID of the verifier, if third-party verified (challenge_response only)
   },
@@ -211,7 +210,13 @@ Identity attestations use the attestation envelope defined in §7.4.1, with iden
 }
 ```
 
-**Signature scope:** The signature covers the §9.5.1 canonical hash of `(id, attestation_type, issuer, subject, issued_at, expires_at, claim, evidence, revocation_status)` using domain separator `"SCP-IDENTITY-LINK-ATTESTATION-V2:"`. String and DID fields use 4-byte BE length-prefixed encoding, `issued_at` uses 8-byte BE u64, `expires_at` uses the absent sentinel when not set, and sub-structures (`claim`, `evidence`, `revocation_status`) are individually serialized as MessagePack (sorted-key encoding) and included as variable-length byte fields. See §25.13 (Vector 26) for the exact construction.
+> **Proof opacity.** Verifiers MUST use the `proof` string as-is in the
+> signature scope — do not parse and re-serialize. This ensures:
+> (1) forward compatibility with new verification methods,
+> (2) cross-implementation canonical hash determinism,
+> (3) verifiers need not understand proof contents to verify signatures.
+
+**Signature scope:** The signature covers the §9.5.1 canonical hash of `(id, attestation_type, issuer, subject, issued_at, expires_at, claim, evidence, revocation_status)` using domain separator `"SCP-IDENTITY-LINK-ATTESTATION-V1:"`. String and DID fields use 4-byte BE length-prefixed encoding, `issued_at` uses 8-byte BE u64, `expires_at` uses the absent sentinel when not set, and sub-structures (`claim`, `evidence`, `revocation_status`) are individually serialized as MessagePack (sorted-key encoding) and included as variable-length byte fields. See §25.13 (Vector 26) for the exact construction.
 
 **Attestation ID construction:** The `id` field is a deterministic, hex-encoded SHA-256 hash derived from the attestation's identifying fields using the canonical hash construction (§9.5.1). The domain separator `"SCP-ATTESTATION-ID-V1:"` prevents cross-protocol collision, and 4-byte big-endian length prefixes on variable-length fields prevent field boundary ambiguity (e.g., platform `"ab"` + handle `"cd"` vs platform `"a"` + handle `"bcd"`).
 

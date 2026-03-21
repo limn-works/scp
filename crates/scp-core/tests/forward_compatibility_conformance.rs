@@ -768,8 +768,7 @@ mod sender_key_types {
 mod attestation_types {
     use super::*;
     use scp_core::identity::attestation::{
-        AttestationClaim, AttestationEvidence, AttestationRevocation, IdentityLinkAttestation,
-        VerificationMethod,
+        AttestationClaim, AttestationEvidence, IdentityLinkAttestation, VerificationMethod,
     };
 
     /// §13.9 item 3: `AttestationClaim` MUST ignore unknown fields (JSON).
@@ -820,7 +819,7 @@ mod attestation_types {
     fn evidence_ignores_unknown_fields_json() {
         let evidence = AttestationEvidence {
             method: VerificationMethod::Oauth,
-            proof: "token123".to_string(),
+            proof: r#"{"type":"oauth_verified","provider":"github.com","subject_id":"token123","verified_at":1700000000}"#.to_string(),
             verified_at: 1_700_000_000,
             verifier_did: None,
         };
@@ -834,7 +833,7 @@ mod attestation_types {
             result.unwrap_err()
         );
         let decoded = result.unwrap();
-        assert_eq!(decoded.proof, "token123");
+        assert_eq!(decoded.method, VerificationMethod::Oauth);
     }
 
     /// §13.9 item 3: `AttestationEvidence` MUST ignore unknown fields (msgpack).
@@ -842,7 +841,7 @@ mod attestation_types {
     fn evidence_ignores_unknown_fields_msgpack() {
         let evidence = AttestationEvidence {
             method: VerificationMethod::Oauth,
-            proof: "token123".to_string(),
+            proof: r#"{"type":"oauth_verified","provider":"github.com","subject_id":"token123","verified_at":1700000000}"#.to_string(),
             verified_at: 1_700_000_000,
             verifier_did: None,
         };
@@ -856,41 +855,7 @@ mod attestation_types {
             result.unwrap_err()
         );
         let decoded = result.unwrap();
-        assert_eq!(decoded.proof, "token123");
-    }
-
-    /// §13.9 item 3: `AttestationRevocation` MUST ignore unknown fields (JSON).
-    #[test]
-    fn revocation_ignores_unknown_fields_json() {
-        let rev = AttestationRevocation::new("#scp-revocations".to_string());
-        let json = serde_json::to_string(&rev).unwrap();
-        let with_extras = inject_unknown_json_fields(&json, &future_json_fields());
-
-        let result: Result<AttestationRevocation, _> = serde_json::from_str(&with_extras);
-        assert!(
-            result.is_ok(),
-            "AttestationRevocation must ignore unknown JSON fields, got: {:?}",
-            result.unwrap_err()
-        );
-        let decoded = result.unwrap();
-        assert_eq!(&*decoded.method, "did_document");
-    }
-
-    /// §13.9 item 3: `AttestationRevocation` MUST ignore unknown fields (msgpack).
-    #[test]
-    fn revocation_ignores_unknown_fields_msgpack() {
-        let rev = AttestationRevocation::new("#scp-revocations".to_string());
-        let bytes = rmp_serde::to_vec_named(&rev).unwrap();
-        let with_extras = inject_unknown_msgpack_fields(&bytes, &future_msgpack_fields());
-
-        let result: Result<AttestationRevocation, _> = rmp_serde::from_slice(&with_extras);
-        assert!(
-            result.is_ok(),
-            "AttestationRevocation must ignore unknown msgpack fields, got: {:?}",
-            result.unwrap_err()
-        );
-        let decoded = result.unwrap();
-        assert_eq!(&*decoded.method, "did_document");
+        assert_eq!(decoded.method, VerificationMethod::Oauth);
     }
 
     /// §13.9 item 3: `IdentityLinkAttestation` MUST ignore unknown fields (JSON).
@@ -906,11 +871,11 @@ mod attestation_types {
             claim: AttestationClaim::new("github.com".to_string(), "alice".to_string(), None),
             evidence: AttestationEvidence {
                 method: VerificationMethod::Oauth,
-                proof: "token".to_string(),
+                proof: r#"{"type":"oauth_verified","provider":"github.com","subject_id":"token","verified_at":1700000000}"#.to_string(),
                 verified_at: 1_700_000_000,
                 verifier_did: None,
             },
-            revocation: AttestationRevocation::new("#scp-revocations".to_string()),
+            revocation_status: scp_core::trust::attestation::RevocationStatus::Active,
             signature: vec![0xAA; 64],
         };
         let json = serde_json::to_string(&attestation).unwrap();
@@ -940,11 +905,11 @@ mod attestation_types {
             claim: AttestationClaim::new("github.com".to_string(), "alice".to_string(), None),
             evidence: AttestationEvidence {
                 method: VerificationMethod::Oauth,
-                proof: "token".to_string(),
+                proof: r#"{"type":"oauth_verified","provider":"github.com","subject_id":"token","verified_at":1700000000}"#.to_string(),
                 verified_at: 1_700_000_000,
                 verifier_did: None,
             },
-            revocation: AttestationRevocation::new("#scp-revocations".to_string()),
+            revocation_status: scp_core::trust::attestation::RevocationStatus::Active,
             signature: vec![0xAA; 64],
         };
         let bytes = rmp_serde::to_vec_named(&attestation).unwrap();

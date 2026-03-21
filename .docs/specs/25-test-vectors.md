@@ -488,11 +488,11 @@ Note: Both the sender key and access key info strings use 4-byte BE length-prefi
 
 ## 25.13 Attestation Signing Vectors (§3.5.2, §9.5.1)
 
-Domain: `"SCP-IDENTITY-LINK-ATTESTATION-V2:"`
+Domain: `"SCP-IDENTITY-LINK-ATTESTATION-V1:"`
 
 ### Vector 26: Identity Link Attestation Signature
 
-The signing payload uses the canonical hash construction from §9.5.1 with domain separator `"SCP-IDENTITY-LINK-ATTESTATION-V2:"`. Fields are serialized in a fixed order. Sub-structures (`claim`, `evidence`, `revocation_status`) are serialized as MessagePack (`rmp_serde::to_vec_named`, sorted-key encoding) and included as variable-length byte fields.
+The signing payload uses the canonical hash construction from §9.5.1 with domain separator `"SCP-IDENTITY-LINK-ATTESTATION-V1:"`. Fields are serialized in a fixed order. Sub-structures (`claim`, `evidence`, `revocation_status`) are serialized as MessagePack (`rmp_serde::to_vec_named`, sorted-key encoding) and included as variable-length byte fields.
 
 Note: this is the *signature* construction (used by `verify_signature`). The *attestation ID* uses a different domain separator (`"SCP-ATTESTATION-ID-V1:"`) and different fields — see `compute_id()` in `attestation.rs`.
 
@@ -511,13 +511,13 @@ Input:
   revocation_status: RevocationStatus::Active
 
 Canonical hash input:
-  "SCP-IDENTITY-LINK-ATTESTATION-V2:"         (33 bytes, no length prefix)
+  "SCP-IDENTITY-LINK-ATTESTATION-V1:"         (33 bytes, no length prefix)
   || BE32(7)   || "att-001"                    (4 + 7 = 11 bytes — id)
   || BE32(13)  || "identity_link"              (4 + 13 = 17 bytes — attestation_type)
   || BE32(18)  || "did:dht:z6MkIssuer"        (4 + 18 = 22 bytes — issuer)
   || BE32(18)  || "did:dht:z6MkIssuer"        (4 + 18 = 22 bytes — subject)
   || BE64(1700000000)                          (8 bytes — issued_at)
-  || BE32(32)  || SHA-256(0x00)                (4 + 32 = 36 bytes — absent expires_at sentinel)
+  || SHA-256(0x00)                              (32 bytes, raw — no length prefix — absent expires_at sentinel)
   || BE32(N_c) || msgpack(claim)               (4 + N_c bytes — claim as MessagePack)
   || BE32(N_e) || msgpack(evidence)            (4 + N_e bytes — evidence as MessagePack)
   || BE32(N_r) || msgpack(revocation_status)    (4 + N_r bytes — revocation_status as MessagePack)
@@ -608,9 +608,8 @@ Canonical hash input:
 
 Total: 22 + 22 + 14 + 19 + 8 = 85 bytes
 
-// Hash must be recomputed from reference implementation
 Expected SHA-256:
-  (recompute from reference implementation — input changed from "x"/"@alice" to "google.com"/"alice@gmail.com")
+  0x97eedd3adfbd0dc8ee901c9f2baf57c151ddf81e3cf49e7ae3b559f4cd2176e0
 ```
 
 ## 25.17 Verification Procedure

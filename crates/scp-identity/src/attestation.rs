@@ -22,6 +22,9 @@
 //!
 //! See ADR-039 §Enforcement Stack Layer 4 in `.docs/adrs/phase-1.md`.
 
+use std::fmt;
+use std::str::FromStr;
+
 use super::IdentityError;
 use super::document::Service;
 use serde::{Deserialize, Serialize};
@@ -235,6 +238,330 @@ impl ScpKeyCustodyAttestation {
                 "failed to parse custody attestation from service endpoint: {e}"
             ))
         })
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Identity Link Attestation Service Entry (spec §3.5.3)
+// ---------------------------------------------------------------------------
+
+/// The service type string for identity link attestation entries.
+const IDENTITY_LINK_SERVICE_TYPE: &str = "ScpIdentityLinkAttestation";
+
+/// Platform identifier for identity link attestations (spec §3.5.1).
+///
+/// Each variant corresponds to an entry in the closed provider registry.
+/// New providers are added by spec amendment only.
+///
+/// NOTE: The spec currently lists 7 platforms. This enum includes 16 as
+/// agreed in the attestation design discussion. A spec amendment adding
+/// the remaining 9 (linkedin.com, discord.com, reddit.com, bluesky.com,
+/// telegram.com, npm, pypi, steam, well-known) is pending.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum IdentityLinkPlatform {
+    /// GitHub (`github.com`). Class 2. Verification: `SignedPost` (profile bio).
+    #[serde(rename = "github.com")]
+    Github,
+    /// X / Twitter (`x.com`). Class 2. Verification: `SignedPost` (profile description).
+    #[serde(rename = "x.com")]
+    X,
+    /// Google (`google.com`). Class 1. Verification: `Oauth` (OIDC).
+    #[serde(rename = "google.com")]
+    Google,
+    /// Apple (`apple.com`). Class 1. Verification: `Oauth` (OIDC).
+    #[serde(rename = "apple.com")]
+    Apple,
+    /// Microsoft (`microsoft.com`). Class 1. Verification: `Oauth` (OIDC).
+    #[serde(rename = "microsoft.com")]
+    Microsoft,
+    /// Mastodon (`mastodon`). Class 2. Verification: `SignedPost` (profile bio).
+    ///
+    /// Mastodon is a federated platform with many instances. The spec says the
+    /// platform value should be `mastodon:<instance>` (e.g., `mastodon:mastodon.social`).
+    /// However, the enum variant serializes to just `"mastodon"` because enum
+    /// variants cannot carry instance-specific data.
+    ///
+    /// **Convention:** The `platform_handle` field should include the full Mastodon
+    /// address with instance (e.g., `@user@mastodon.social`). Verifiers should
+    /// extract the instance from the handle when needed. For attestations that
+    /// need instance-specific platform values, use the raw string `"mastodon:<instance>"`
+    /// directly instead of this enum variant.
+    #[serde(rename = "mastodon")]
+    Mastodon,
+    /// DNS (`dns`). Class 2. Verification: `DnsRecord` (`_scp-verify.<domain>`).
+    #[serde(rename = "dns")]
+    Dns,
+    /// `LinkedIn` (`linkedin.com`). Class 2. Verification: `SignedPost`.
+    #[serde(rename = "linkedin.com")]
+    Linkedin,
+    /// Discord (`discord.com`). Class 1. Verification: `Oauth`.
+    #[serde(rename = "discord.com")]
+    Discord,
+    /// Reddit (`reddit.com`). Class 2. Verification: `SignedPost`.
+    #[serde(rename = "reddit.com")]
+    Reddit,
+    /// Bluesky (`bluesky.com`). Class 2. Verification: `SignedPost`.
+    #[serde(rename = "bluesky.com")]
+    Bluesky,
+    /// Telegram (`telegram.com`). Class 2. Verification: `ChallengeResponse`.
+    #[serde(rename = "telegram.com")]
+    Telegram,
+    /// npm (`npm`). Class 2. Verification: `SignedPost` (package metadata).
+    #[serde(rename = "npm")]
+    Npm,
+    /// `PyPI` (`pypi`). Class 2. Verification: `SignedPost` (package metadata).
+    #[serde(rename = "pypi")]
+    Pypi,
+    /// Steam (`steam`). Class 2. Verification: `SignedPost` (profile).
+    #[serde(rename = "steam")]
+    Steam,
+    /// Well-known (`well-known`). Class 2. Verification: `DnsRecord`
+    /// (`/.well-known/scp-verify`).
+    #[serde(rename = "well-known")]
+    WellKnown,
+}
+
+/// All platform variants in registry order, for iteration.
+const ALL_PLATFORMS: [IdentityLinkPlatform; 16] = [
+    IdentityLinkPlatform::Github,
+    IdentityLinkPlatform::X,
+    IdentityLinkPlatform::Google,
+    IdentityLinkPlatform::Apple,
+    IdentityLinkPlatform::Microsoft,
+    IdentityLinkPlatform::Mastodon,
+    IdentityLinkPlatform::Dns,
+    IdentityLinkPlatform::Linkedin,
+    IdentityLinkPlatform::Discord,
+    IdentityLinkPlatform::Reddit,
+    IdentityLinkPlatform::Bluesky,
+    IdentityLinkPlatform::Telegram,
+    IdentityLinkPlatform::Npm,
+    IdentityLinkPlatform::Pypi,
+    IdentityLinkPlatform::Steam,
+    IdentityLinkPlatform::WellKnown,
+];
+
+impl IdentityLinkPlatform {
+    /// Returns the canonical wire-format string for this platform.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Github => "github.com",
+            Self::X => "x.com",
+            Self::Google => "google.com",
+            Self::Apple => "apple.com",
+            Self::Microsoft => "microsoft.com",
+            Self::Mastodon => "mastodon",
+            Self::Dns => "dns",
+            Self::Linkedin => "linkedin.com",
+            Self::Discord => "discord.com",
+            Self::Reddit => "reddit.com",
+            Self::Bluesky => "bluesky.com",
+            Self::Telegram => "telegram.com",
+            Self::Npm => "npm",
+            Self::Pypi => "pypi",
+            Self::Steam => "steam",
+            Self::WellKnown => "well-known",
+        }
+    }
+
+    /// Returns all platform variants in registry order.
+    #[must_use]
+    pub const fn all() -> &'static [Self; 16] {
+        &ALL_PLATFORMS
+    }
+}
+
+impl fmt::Display for IdentityLinkPlatform {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// Error returned when a string does not match any known platform.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnknownPlatformError(pub String);
+
+impl fmt::Display for UnknownPlatformError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "unknown identity link platform: '{}'", self.0)
+    }
+}
+
+impl std::error::Error for UnknownPlatformError {}
+
+impl FromStr for IdentityLinkPlatform {
+    type Err = UnknownPlatformError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "github.com" => Ok(Self::Github),
+            "x.com" => Ok(Self::X),
+            "google.com" => Ok(Self::Google),
+            "apple.com" => Ok(Self::Apple),
+            "microsoft.com" => Ok(Self::Microsoft),
+            "mastodon" => Ok(Self::Mastodon),
+            "dns" => Ok(Self::Dns),
+            "linkedin.com" => Ok(Self::Linkedin),
+            "discord.com" => Ok(Self::Discord),
+            "reddit.com" => Ok(Self::Reddit),
+            "bluesky.com" => Ok(Self::Bluesky),
+            "telegram.com" => Ok(Self::Telegram),
+            "npm" => Ok(Self::Npm),
+            "pypi" => Ok(Self::Pypi),
+            "steam" => Ok(Self::Steam),
+            "well-known" => Ok(Self::WellKnown),
+            other => Err(UnknownPlatformError(other.to_owned())),
+        }
+    }
+}
+
+/// Identity link attestation published as a DID document service entry (spec §3.5.3).
+///
+/// Represents a self-signed claim that the DID owner controls a specific
+/// external platform identity. Published as a service entry in the DID
+/// document for discovery — any party resolving the document can enumerate
+/// the owner's identity links.
+///
+/// Follows the same pattern as [`ScpKeyCustodyAttestation`]: the struct is
+/// serialized as JSON in the `serviceEndpoint` field.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ScpIdentityLinkService {
+    /// Deterministic attestation ID (hex-encoded SHA-256, per §3.5.2).
+    pub attestation_id: String,
+
+    /// Platform identifier from the provider registry (§3.5.1).
+    pub platform: IdentityLinkPlatform,
+
+    /// Handle on the platform (e.g., `"@alice"`, `"alice123"`).
+    pub platform_handle: String,
+
+    /// Platform-specific immutable user ID (e.g., Twitter user ID, OIDC sub).
+    /// `None` when the platform does not provide a stable ID.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub platform_id: Option<String>,
+
+    /// The DID verification method fragment that signed the attestation
+    /// (e.g., `"#active"` or `"#agent"`).
+    pub verification_method: String,
+
+    /// Unix timestamp (seconds) when the attestation was last verified.
+    pub verified_at: u64,
+
+    /// Revocation status: `"active"` or `"revoked"`.
+    pub revocation_status: ServiceRevocationStatus,
+}
+
+/// Revocation status for identity link service entries.
+///
+/// A typed enum replacing the raw `String` field. Serializes to
+/// lowercase `"active"` / `"revoked"` for wire compatibility with
+/// existing DID document service entries.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ServiceRevocationStatus {
+    /// The attestation is active (not revoked).
+    Active,
+    /// The attestation has been revoked.
+    Revoked,
+}
+
+impl ServiceRevocationStatus {
+    /// Returns the wire-format string for this status.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Active => "active",
+            Self::Revoked => "revoked",
+        }
+    }
+}
+
+impl std::fmt::Display for ServiceRevocationStatus {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl ScpIdentityLinkService {
+    /// Revocation status value for an active attestation.
+    pub const STATUS_ACTIVE: &'static str = "active";
+
+    /// Revocation status value for a revoked attestation.
+    pub const STATUS_REVOKED: &'static str = "revoked";
+
+    /// Creates a DID document service entry for this identity link attestation
+    /// (spec §3.5.3).
+    ///
+    /// The `serviceEndpoint` contains the hex-encoded attestation ID only (not
+    /// a JSON blob). The service `id` uses the fragment format
+    /// `attestation-<platform>--<index>` (double dash, zero-based numeric index)
+    /// per spec §3.5.3.
+    ///
+    /// # Arguments
+    ///
+    /// * `did` - The DID string that owns this attestation (used for service ID).
+    /// * `index` - Zero-based index among attestation service entries of the same
+    ///   platform type. The caller (typically [`DidDocument::set_identity_link_attestation`])
+    ///   computes this by counting existing same-platform entries.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`IdentityError::DocumentSerializationError`] if the
+    /// `attestation_id` contains non-hex characters.
+    pub fn to_service_entry(&self, did: &str, index: usize) -> Result<Service, IdentityError> {
+        // Validate attestation_id is hex-only before using it in the endpoint.
+        if !self.attestation_id.chars().all(|c| c.is_ascii_hexdigit()) {
+            return Err(IdentityError::DocumentSerializationError(format!(
+                "attestation_id must be hex-encoded, got '{}'",
+                self.attestation_id
+            )));
+        }
+
+        Ok(Service {
+            id: format!("{did}#attestation-{}--{index}", self.platform.as_str()),
+            service_type: IDENTITY_LINK_SERVICE_TYPE.to_owned(),
+            service_endpoint: self.attestation_id.clone(),
+        })
+    }
+
+    /// Extracts the attestation ID from a DID document service entry (spec §3.5.3).
+    ///
+    /// The `serviceEndpoint` is the hex-encoded attestation ID string. This method
+    /// returns only the attestation ID -- the caller must look up the full
+    /// `IdentityLinkAttestation` from the identity's attestation store via relay
+    /// or DHT using this ID.
+    ///
+    /// # Arguments
+    ///
+    /// * `entry` - A service entry with `type: "ScpIdentityLinkAttestation"`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`IdentityError::DocumentDeserializationError`] if the service
+    /// type does not match or the endpoint is not a valid hex string.
+    pub fn from_service_entry(entry: &Service) -> Result<String, IdentityError> {
+        if entry.service_type != IDENTITY_LINK_SERVICE_TYPE {
+            return Err(IdentityError::DocumentDeserializationError(format!(
+                "expected service type '{}', got '{}'",
+                IDENTITY_LINK_SERVICE_TYPE, entry.service_type
+            )));
+        }
+
+        // Validate that the endpoint is a hex string (attestation ID).
+        let endpoint = entry.service_endpoint.trim();
+        if endpoint.is_empty() {
+            return Err(IdentityError::DocumentDeserializationError(
+                "service endpoint (attestation_id) is empty".to_owned(),
+            ));
+        }
+        if !endpoint.chars().all(|c| c.is_ascii_hexdigit()) {
+            return Err(IdentityError::DocumentDeserializationError(format!(
+                "service endpoint must be a hex-encoded attestation ID, got '{endpoint}'"
+            )));
+        }
+
+        Ok(endpoint.to_owned())
     }
 }
 
@@ -601,5 +928,248 @@ mod tests {
         assert_eq!(attestation.platform, Platform::Ios);
         assert!(attestation.platform_attestation.is_none());
         assert_eq!(attestation.created_at, 1_700_000_000);
+    }
+
+    // ===================================================================
+    // IdentityLinkPlatform tests
+    // ===================================================================
+
+    #[test]
+    fn identity_link_platform_as_str_roundtrip_all() {
+        let expected: &[(&str, IdentityLinkPlatform)] = &[
+            ("github.com", IdentityLinkPlatform::Github),
+            ("x.com", IdentityLinkPlatform::X),
+            ("google.com", IdentityLinkPlatform::Google),
+            ("apple.com", IdentityLinkPlatform::Apple),
+            ("microsoft.com", IdentityLinkPlatform::Microsoft),
+            ("mastodon", IdentityLinkPlatform::Mastodon),
+            ("dns", IdentityLinkPlatform::Dns),
+            ("linkedin.com", IdentityLinkPlatform::Linkedin),
+            ("discord.com", IdentityLinkPlatform::Discord),
+            ("reddit.com", IdentityLinkPlatform::Reddit),
+            ("bluesky.com", IdentityLinkPlatform::Bluesky),
+            ("telegram.com", IdentityLinkPlatform::Telegram),
+            ("npm", IdentityLinkPlatform::Npm),
+            ("pypi", IdentityLinkPlatform::Pypi),
+            ("steam", IdentityLinkPlatform::Steam),
+            ("well-known", IdentityLinkPlatform::WellKnown),
+        ];
+
+        assert_eq!(
+            expected.len(),
+            16,
+            "must test all 16 platforms in the provider registry"
+        );
+
+        for &(s, variant) in expected {
+            assert_eq!(variant.as_str(), s, "as_str mismatch for {variant:?}");
+            let parsed: IdentityLinkPlatform = s.parse().unwrap();
+            assert_eq!(parsed, variant, "from_str mismatch for '{s}'");
+        }
+    }
+
+    #[test]
+    fn identity_link_platform_from_str_unknown() {
+        let err = "unknown-platform"
+            .parse::<IdentityLinkPlatform>()
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("unknown identity link platform"),
+            "error should mention unknown platform, got: {err}"
+        );
+    }
+
+    #[test]
+    fn identity_link_platform_display() {
+        assert_eq!(format!("{}", IdentityLinkPlatform::Github), "github.com");
+        assert_eq!(format!("{}", IdentityLinkPlatform::WellKnown), "well-known");
+    }
+
+    #[test]
+    fn identity_link_platform_serde_roundtrip_all() {
+        for &platform in IdentityLinkPlatform::all() {
+            let json = serde_json::to_string(&platform).unwrap();
+            let parsed: IdentityLinkPlatform = serde_json::from_str(&json).unwrap();
+            assert_eq!(platform, parsed, "serde roundtrip failed for {platform:?}");
+            // Verify the JSON value matches as_str.
+            assert_eq!(json, format!("\"{}\"", platform.as_str()));
+        }
+    }
+
+    #[test]
+    fn identity_link_platform_all_returns_16() {
+        assert_eq!(IdentityLinkPlatform::all().len(), 16);
+    }
+
+    // ===================================================================
+    // ScpIdentityLinkService tests
+    // ===================================================================
+
+    fn test_link_service() -> ScpIdentityLinkService {
+        ScpIdentityLinkService {
+            attestation_id: "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789"
+                .to_owned(),
+            platform: IdentityLinkPlatform::Github,
+            platform_handle: "@alice".to_owned(),
+            platform_id: Some("12345678".to_owned()),
+            verification_method: "#active".to_owned(),
+            verified_at: 1_700_000_000,
+            revocation_status: ServiceRevocationStatus::Active,
+        }
+    }
+
+    #[test]
+    fn identity_link_service_entry_format() {
+        let original = test_link_service();
+        let service = original.to_service_entry(test_did(), 0).unwrap();
+
+        assert_eq!(service.service_type, "ScpIdentityLinkAttestation");
+        // Fragment uses double-dash and zero-based index per §3.5.3.
+        assert_eq!(
+            service.id,
+            format!("{}#attestation-github.com--0", test_did())
+        );
+        // Endpoint is just the attestation ID, not JSON.
+        assert_eq!(service.service_endpoint, original.attestation_id);
+    }
+
+    #[test]
+    fn identity_link_service_from_entry_returns_attestation_id() {
+        let original = test_link_service();
+        let service = original.to_service_entry(test_did(), 0).unwrap();
+
+        let id = ScpIdentityLinkService::from_service_entry(&service).unwrap();
+        assert_eq!(id, original.attestation_id);
+    }
+
+    #[test]
+    fn identity_link_service_index_in_fragment() {
+        let original = test_link_service();
+        let s0 = original.to_service_entry(test_did(), 0).unwrap();
+        let s1 = original.to_service_entry(test_did(), 1).unwrap();
+        let s5 = original.to_service_entry(test_did(), 5).unwrap();
+
+        assert!(s0.id.ends_with("#attestation-github.com--0"));
+        assert!(s1.id.ends_with("#attestation-github.com--1"));
+        assert!(s5.id.ends_with("#attestation-github.com--5"));
+    }
+
+    #[test]
+    fn identity_link_service_each_platform() {
+        for (i, &platform) in IdentityLinkPlatform::all().iter().enumerate() {
+            let service_entry = ScpIdentityLinkService {
+                attestation_id: "abcdef0123456789".to_owned(),
+                platform,
+                platform_handle: "testuser".to_owned(),
+                platform_id: None,
+                verification_method: "#active".to_owned(),
+                verified_at: 1_700_000_000,
+                revocation_status: ServiceRevocationStatus::Active,
+            };
+
+            let service = service_entry.to_service_entry(test_did(), i).unwrap();
+            assert!(
+                service
+                    .id
+                    .contains(&format!("attestation-{}--", platform.as_str())),
+                "service ID should contain platform with double-dash: {platform:?}"
+            );
+
+            // Endpoint should be the attestation ID.
+            assert_eq!(service.service_endpoint, "abcdef0123456789");
+
+            // from_service_entry should return the attestation ID.
+            let id = ScpIdentityLinkService::from_service_entry(&service).unwrap();
+            assert_eq!(id, "abcdef0123456789");
+        }
+    }
+
+    #[test]
+    fn identity_link_service_rejects_wrong_type() {
+        let service = Service {
+            id: format!("{}#custody-attestation", test_did()),
+            service_type: "ScpKeyCustodyAttestation".to_owned(),
+            service_endpoint: "abcdef01".to_owned(),
+        };
+
+        let result = ScpIdentityLinkService::from_service_entry(&service);
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(
+            err.to_string().contains("expected service type"),
+            "error should mention expected type, got: {err}"
+        );
+    }
+
+    #[test]
+    fn identity_link_service_rejects_non_hex_endpoint() {
+        let service = Service {
+            id: format!("{}#attestation-github.com--0", test_did()),
+            service_type: IDENTITY_LINK_SERVICE_TYPE.to_owned(),
+            service_endpoint: "not-valid-hex!@#$".to_owned(),
+        };
+
+        let result = ScpIdentityLinkService::from_service_entry(&service);
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(
+            err.to_string().contains("hex-encoded attestation ID"),
+            "error should mention hex requirement, got: {err}"
+        );
+    }
+
+    #[test]
+    fn identity_link_service_rejects_empty_endpoint() {
+        let service = Service {
+            id: format!("{}#attestation-github.com--0", test_did()),
+            service_type: IDENTITY_LINK_SERVICE_TYPE.to_owned(),
+            service_endpoint: String::new(),
+        };
+
+        let result = ScpIdentityLinkService::from_service_entry(&service);
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(
+            err.to_string().contains("empty"),
+            "error should mention empty, got: {err}"
+        );
+    }
+
+    #[test]
+    fn identity_link_service_serde_json_roundtrip() {
+        let original = test_link_service();
+        let json = serde_json::to_string(&original).unwrap();
+        let parsed: ScpIdentityLinkService = serde_json::from_str(&json).unwrap();
+        assert_eq!(original, parsed);
+    }
+
+    #[test]
+    fn identity_link_service_status_constants() {
+        assert_eq!(ScpIdentityLinkService::STATUS_ACTIVE, "active");
+        assert_eq!(ScpIdentityLinkService::STATUS_REVOKED, "revoked");
+    }
+
+    #[test]
+    fn identity_link_service_non_hex_attestation_id_rejected() {
+        // Non-hex attestation IDs (including multi-byte UTF-8) must be rejected
+        // by the hex validation in `to_service_entry`.
+        let original = ScpIdentityLinkService {
+            attestation_id: "\u{1F600}\u{1F601}\u{1F602}\u{1F603}\u{1F604}\u{1F605}\u{1F606}\u{1F607}\u{1F608}\u{1F609}".to_owned(),
+            platform: IdentityLinkPlatform::Github,
+            platform_handle: "@alice".to_owned(),
+            platform_id: None,
+            verification_method: "#active".to_owned(),
+            verified_at: 1_700_000_000,
+            revocation_status: ServiceRevocationStatus::Active,
+        };
+
+        let result = original.to_service_entry(test_did(), 0);
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("attestation_id must be hex-encoded"),
+            "error should mention hex requirement, got: {err}"
+        );
     }
 }

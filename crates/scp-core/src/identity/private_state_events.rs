@@ -1113,13 +1113,11 @@ mod tests {
                     ),
                     evidence: super::super::attestation::AttestationEvidence {
                         method: super::super::attestation::VerificationMethod::Oauth,
-                        proof: "proof".to_owned(),
+                        proof: r#"{"type":"oauth_verified","provider":"github.com","subject_id":"12345","verified_at":1700000000}"#.to_owned(),
                         verified_at: 1_700_000_000_000,
                         verifier_did: None,
                     },
-                    revocation: super::super::attestation::AttestationRevocation::new(
-                        "/rev".to_owned(),
-                    ),
+                    revocation_status: crate::trust::attestation::RevocationStatus::Active,
                     signature: vec![0; 64],
                 }),
                 timestamp: 19000,

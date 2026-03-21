@@ -91,6 +91,15 @@ pub const MAX_TRANSPORT_MODE_LEN: usize = 64;
 /// Maximum length for a deploy ID (matches `scp-core::context::broadcast_content::MAX_DEPLOY_ID_BYTES`).
 pub const MAX_DEPLOY_ID_LEN: usize = 128;
 
+/// Maximum length for an attestation platform string (e.g., "github.com").
+pub const MAX_ATTESTATION_PLATFORM_LEN: usize = 256;
+
+/// Maximum length for an attestation platform handle (e.g., "@alice").
+pub const MAX_ATTESTATION_HANDLE_LEN: usize = 256;
+
+/// Maximum length for an attestation proof JSON string.
+pub const MAX_ATTESTATION_PROOF_LEN: usize = 65_536;
+
 // ---------------------------------------------------------------------------
 // String emptiness and length
 // ---------------------------------------------------------------------------
@@ -466,6 +475,34 @@ pub const fn json_value_type_name(v: &serde_json::Value) -> &'static str {
 }
 
 // ---------------------------------------------------------------------------
+// Attestation field validation
+// ---------------------------------------------------------------------------
+
+/// Validates the input fields for an identity link attestation creation.
+///
+/// Enforces size limits on `platform`, `handle`, and `proof` to prevent
+/// unbounded input sizes in all FFI bridges. Limits are defined by
+/// [`MAX_ATTESTATION_PLATFORM_LEN`], [`MAX_ATTESTATION_HANDLE_LEN`], and
+/// [`MAX_ATTESTATION_PROOF_LEN`].
+///
+/// # Errors
+///
+/// Returns [`ValidationError`] if any field is empty or exceeds its limit.
+pub fn validate_attestation_fields(
+    platform: &str,
+    handle: &str,
+    proof: &str,
+) -> Result<(), ValidationError> {
+    validate_non_empty(platform, "platform", MAX_ATTESTATION_PLATFORM_LEN)?;
+    reject_control_chars(platform, "platform")?;
+    validate_non_empty(handle, "handle", MAX_ATTESTATION_HANDLE_LEN)?;
+    reject_control_chars(handle, "handle")?;
+    validate_non_empty(proof, "proof", MAX_ATTESTATION_PROOF_LEN)?;
+    reject_control_chars(proof, "proof")?;
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -805,6 +842,71 @@ mod tests {
     fn empty_transport_mode_rejected() {
         let err = validate_transport_mode("").unwrap_err();
         assert!(err.message.contains("must not be empty"));
+    }
+
+    // -- Attestation fields --
+
+    #[test]
+    fn valid_attestation_fields() {
+        assert!(validate_attestation_fields("github.com", "@alice", r#"{"sig":"abc"}"#).is_ok());
+    }
+
+    #[test]
+    fn attestation_empty_platform_rejected() {
+        let err = validate_attestation_fields("", "@alice", "proof").unwrap_err();
+        assert!(err.message.contains("must not be empty"));
+    }
+
+    #[test]
+    fn attestation_empty_handle_rejected() {
+        let err = validate_attestation_fields("github.com", "", "proof").unwrap_err();
+        assert!(err.message.contains("must not be empty"));
+    }
+
+    #[test]
+    fn attestation_empty_proof_rejected() {
+        let err = validate_attestation_fields("github.com", "@alice", "").unwrap_err();
+        assert!(err.message.contains("must not be empty"));
+    }
+
+    #[test]
+    fn attestation_platform_control_chars_rejected() {
+        let err = validate_attestation_fields("git\nhub.com", "@alice", "proof").unwrap_err();
+        assert!(err.message.contains("control character"));
+    }
+
+    #[test]
+    fn attestation_handle_control_chars_rejected() {
+        let err = validate_attestation_fields("github.com", "@al\0ice", "proof").unwrap_err();
+        assert!(err.message.contains("control character"));
+    }
+
+    #[test]
+    fn attestation_proof_control_chars_rejected() {
+        let err =
+            validate_attestation_fields("github.com", "@alice", "proof\x1binject").unwrap_err();
+        assert!(err.message.contains("control character"));
+    }
+
+    #[test]
+    fn attestation_platform_too_long_rejected() {
+        let long = "a".repeat(MAX_ATTESTATION_PLATFORM_LEN + 1);
+        let err = validate_attestation_fields(&long, "@alice", "proof").unwrap_err();
+        assert!(err.message.contains("exceeds maximum length"));
+    }
+
+    #[test]
+    fn attestation_handle_too_long_rejected() {
+        let long = "a".repeat(MAX_ATTESTATION_HANDLE_LEN + 1);
+        let err = validate_attestation_fields("github.com", &long, "proof").unwrap_err();
+        assert!(err.message.contains("exceeds maximum length"));
+    }
+
+    #[test]
+    fn attestation_proof_too_long_rejected() {
+        let long = "a".repeat(MAX_ATTESTATION_PROOF_LEN + 1);
+        let err = validate_attestation_fields("github.com", "@alice", &long).unwrap_err();
+        assert!(err.message.contains("exceeds maximum length"));
     }
 
     // -- json_value_type_name --

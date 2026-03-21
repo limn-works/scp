@@ -211,7 +211,11 @@ fn discovery_result_to_dict<'py>(
     let now_secs = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
-        .unwrap_or(0);
+        .map_err(|_| {
+            pyo3::exceptions::PyRuntimeError::new_err(
+                "system clock is unavailable or before Unix epoch",
+            )
+        })?;
 
     let trust_level = PyDict::new(py);
     trust_level.set_item("kind", trust_level_kind)?;
@@ -1248,7 +1252,7 @@ mod tests {
             metadata_summary: None,
         };
 
-        let json = discovery_result_to_json(&result);
+        let json = discovery_result_to_json(&result).unwrap();
         assert_eq!(json["context_id"], "abc123");
         assert_eq!(json["discovery_source"], "dht_did_document");
         assert_eq!(json["mode"], "broadcast");
@@ -1273,7 +1277,7 @@ mod tests {
             metadata_summary: None,
         };
 
-        let json = discovery_result_to_json(&result);
+        let json = discovery_result_to_json(&result).unwrap();
         assert_eq!(json["trust_level"]["kind"], "DiscoveryContextVerified");
         assert_eq!(json["resolution_path"]["layer"], "DiscoveryContext");
         assert_eq!(json["resolution_path"]["source"], "discovery_context");
@@ -1292,7 +1296,7 @@ mod tests {
             metadata_summary: None,
         };
 
-        let json = discovery_result_to_json(&result);
+        let json = discovery_result_to_json(&result).unwrap();
         assert_eq!(json["trust_level"]["kind"], "DirectExchange");
         assert_eq!(json["resolution_path"]["layer"], "Domain");
         assert_eq!(json["resolution_path"]["source"], "context_uri");
@@ -1311,7 +1315,7 @@ mod tests {
             metadata_summary: Some("Example context".to_owned()),
         };
 
-        let json = discovery_result_to_json(&result);
+        let json = discovery_result_to_json(&result).unwrap();
         assert_eq!(json["trust_level"]["kind"], "DomainVerified");
         assert_eq!(json["resolution_path"]["layer"], "Domain");
         assert_eq!(json["resolution_path"]["source"], "well-known");

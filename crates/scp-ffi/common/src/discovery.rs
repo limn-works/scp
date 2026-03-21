@@ -62,15 +62,20 @@ pub const fn map_discovery_source(
 /// current wall-clock time (seconds since UNIX epoch).
 ///
 /// Used by the `PyO3` (test-only JSON path), NAPI, and `UniFFI` bridges.
-#[must_use]
-pub fn discovery_result_to_json(result: &ContextDiscoveryResult) -> serde_json::Value {
+///
+/// # Errors
+///
+/// Returns an error string if the system clock is before the Unix epoch.
+pub fn discovery_result_to_json(
+    result: &ContextDiscoveryResult,
+) -> Result<serde_json::Value, String> {
     let (source_str, trust_level_kind, resolution_layer, resolution_source, resolution_source_id) =
         map_discovery_source(&result.discovery_source);
 
     let now_secs = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
-        .unwrap_or(0);
+        .map_err(|_| "system clock is unavailable or before Unix epoch".to_owned())?;
 
     let mut obj = serde_json::json!({
         "context_id": result.context_id,
@@ -95,7 +100,7 @@ pub fn discovery_result_to_json(result: &ContextDiscoveryResult) -> serde_json::
         obj["discovery_context_id"] = serde_json::Value::String(context_id.clone());
     }
 
-    obj
+    Ok(obj)
 }
 
 #[cfg(test)]
@@ -163,7 +168,7 @@ mod tests {
     #[test]
     fn result_to_json_dht_source() {
         let result = make_result(ContextDiscoverySource::DhtDidDocument);
-        let json = discovery_result_to_json(&result);
+        let json = discovery_result_to_json(&result).unwrap();
 
         assert_eq!(json["context_id"], "test-ctx");
         assert_eq!(json["discovery_source"], "dht_did_document");
@@ -181,7 +186,7 @@ mod tests {
         let result = make_result(ContextDiscoverySource::DiscoveryContext {
             context_id: "disc-ctx-1".to_owned(),
         });
-        let json = discovery_result_to_json(&result);
+        let json = discovery_result_to_json(&result).unwrap();
 
         assert_eq!(json["trust_level"]["kind"], "DiscoveryContextVerified");
         assert_eq!(json["resolution_path"]["layer"], "DiscoveryContext");
@@ -193,7 +198,7 @@ mod tests {
     #[test]
     fn result_to_json_context_uri_source() {
         let result = make_result(ContextDiscoverySource::ContextUri);
-        let json = discovery_result_to_json(&result);
+        let json = discovery_result_to_json(&result).unwrap();
 
         assert_eq!(json["trust_level"]["kind"], "DirectExchange");
         assert_eq!(json["resolution_path"]["layer"], "Domain");
@@ -205,7 +210,7 @@ mod tests {
     #[test]
     fn result_to_json_well_known_source() {
         let result = make_result(ContextDiscoverySource::WellKnown);
-        let json = discovery_result_to_json(&result);
+        let json = discovery_result_to_json(&result).unwrap();
 
         assert_eq!(json["trust_level"]["kind"], "DomainVerified");
         assert_eq!(json["resolution_path"]["layer"], "Domain");

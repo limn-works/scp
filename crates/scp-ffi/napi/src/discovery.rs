@@ -189,7 +189,12 @@ pub async fn context_discover(query: String) -> napi::Result<String> {
             })
         })?;
 
-        let results = vec![discovery_result_to_json(&result)];
+        let results = vec![discovery_result_to_json(&result).map_err(|e| {
+            napi::Error::from(ScpNapiError::Context {
+                message: e,
+                code: "SCP-CTX-2020".to_owned(),
+            })
+        })?];
         serde_json::to_string(&results).map_err(|e| {
             napi::Error::from(ScpNapiError::Context {
                 message: format!("failed to serialize discovery results: {e}"),
@@ -207,8 +212,17 @@ pub async fn context_discover(query: String) -> napi::Result<String> {
                 })
             })?;
 
-        let json_results: Vec<serde_json::Value> =
-            results.iter().map(discovery_result_to_json).collect();
+        let json_results: Vec<serde_json::Value> = results
+            .iter()
+            .map(|r| {
+                discovery_result_to_json(r).map_err(|e| {
+                    napi::Error::from(ScpNapiError::Context {
+                        message: e,
+                        code: "SCP-CTX-2022".to_owned(),
+                    })
+                })
+            })
+            .collect::<napi::Result<Vec<_>>>()?;
         serde_json::to_string(&json_results).map_err(|e| {
             napi::Error::from(ScpNapiError::Context {
                 message: format!("failed to serialize discovery results: {e}"),
@@ -859,7 +873,7 @@ mod tests {
             metadata_summary: None,
         };
 
-        let json = discovery_result_to_json(&result);
+        let json = discovery_result_to_json(&result).unwrap();
         assert_eq!(json["context_id"], "abc123");
         assert_eq!(json["discovery_source"], "dht_did_document");
         assert_eq!(json["mode"], "broadcast");
@@ -884,7 +898,7 @@ mod tests {
             metadata_summary: None,
         };
 
-        let json = discovery_result_to_json(&result);
+        let json = discovery_result_to_json(&result).unwrap();
         assert_eq!(json["trust_level"]["kind"], "DiscoveryContextVerified");
         assert_eq!(json["resolution_path"]["layer"], "DiscoveryContext");
         assert_eq!(json["resolution_path"]["source"], "discovery_context");
