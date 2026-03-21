@@ -145,6 +145,7 @@ interface IdentityAdvancedBindings {
      * @param platformId Optional immutable platform user ID.
      * @return JSON string of the created attestation.
      */
+    @Suppress("LongParameterList")
     fun identityCreateLinkAttestation(
         identityHandle: Long,
         platform: String,
@@ -339,6 +340,7 @@ class IdentityAdvancedBridge internal constructor(
      * @param platformId Optional immutable platform user ID.
      * @return JSON string of the created attestation.
      */
+    @Suppress("LongParameterList")
     suspend fun createLinkAttestation(
         identityHandle: Long,
         platform: String,
