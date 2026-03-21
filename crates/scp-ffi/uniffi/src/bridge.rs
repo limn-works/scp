@@ -2418,7 +2418,6 @@ fn identity_link_attestation_registry()
 /// created attestations, so that `identity_verify_link_attestation` can look
 /// up the issuer's public key without requiring the caller to pass the
 /// Identity object.
-#[cfg(feature = "allow_in_memory_custody")]
 fn identity_custody_registry()
 -> &'static dashmap::DashMap<String, (Arc<OpaqueInMemoryKeyCustody>, scp_platform::KeyHandle)> {
     static REGISTRY: std::sync::OnceLock<
@@ -2450,7 +2449,6 @@ pub async fn identity_create_link_attestation(
     .await
 }
 
-#[cfg(feature = "allow_in_memory_custody")]
 async fn identity_create_link_attestation_impl(
     identity: Arc<Identity>,
     platform: String,
@@ -2639,24 +2637,6 @@ async fn identity_create_link_attestation_impl(
     })
 }
 
-#[cfg(not(feature = "allow_in_memory_custody"))]
-#[allow(clippy::unused_async)]
-async fn identity_create_link_attestation_impl(
-    _identity: Arc<Identity>,
-    _platform: String,
-    _handle: String,
-    _proof: String,
-    _verification_method: String,
-    _platform_id: Option<String>,
-) -> Result<String, ScpError> {
-    Err(ScpError::Identity {
-        msg: "identity link attestation requires in-memory custody — enable the \
-              \"allow_in_memory_custody\" feature"
-            .to_owned(),
-        code: "SCP-IDENT-1040".to_owned(),
-    })
-}
-
 /// Lists all identity link attestations for an identity.
 ///
 /// See spec §3.5.1.
@@ -2682,11 +2662,8 @@ pub fn identity_link_attestations(did: String) -> Result<String, ScpError> {
 #[uniffi::export]
 pub fn identity_remove_link_attestation(did: String, attestation_id: String) -> bool {
     // Verify the caller owns the DID by checking the identity custody registry.
-    #[cfg(feature = "allow_in_memory_custody")]
-    {
-        if !identity_custody_registry().contains_key(&did) {
-            return false;
-        }
+    if !identity_custody_registry().contains_key(&did) {
+        return false;
     }
 
     let Some(mut entry) = identity_link_attestation_registry().get_mut(&did) else {
@@ -2712,7 +2689,6 @@ pub async fn identity_verify_link_attestation(
     identity_verify_link_attestation_impl(attestation_json, issuer_public_key_hex).await
 }
 
-#[cfg(feature = "allow_in_memory_custody")]
 #[allow(clippy::unused_async)]
 async fn identity_verify_link_attestation_impl(
     attestation_json: String,
@@ -2748,20 +2724,6 @@ async fn identity_verify_link_attestation_impl(
             })?;
         Ok(attestation.verify_signature(&pub_bytes).is_ok())
     }
-}
-
-#[cfg(not(feature = "allow_in_memory_custody"))]
-#[allow(clippy::unused_async)]
-async fn identity_verify_link_attestation_impl(
-    _attestation_json: String,
-    _issuer_public_key_hex: Option<String>,
-) -> Result<bool, ScpError> {
-    Err(ScpError::Identity {
-        msg: "identity link attestation verification requires in-memory custody — enable the \
-              \"allow_in_memory_custody\" feature"
-            .to_owned(),
-        code: "SCP-IDENT-1044".to_owned(),
-    })
 }
 
 // ---------------------------------------------------------------------------

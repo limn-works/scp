@@ -1375,7 +1375,6 @@ pub async fn identity_verify_device_attestation(
 /// Creates an identity link attestation for an external platform identity.
 ///
 /// See spec §3.5.1, §3.5.2.
-#[cfg(feature = "allow_in_memory_custody")]
 #[napi(js_name = "identityCreateLinkAttestation")]
 #[allow(clippy::unused_async)]
 pub async fn identity_create_link_attestation(
@@ -1526,7 +1525,6 @@ pub async fn identity_create_link_attestation(
 /// Lists all identity link attestations for an identity.
 ///
 /// See spec §3.5.1.
-#[cfg(feature = "allow_in_memory_custody")]
 #[napi(js_name = "identityLinkAttestations")]
 pub fn identity_link_attestations(did: String) -> napi::Result<String> {
     crate::runtime::with_identity(&did, |entry| {
@@ -1545,7 +1543,6 @@ pub fn identity_link_attestations(did: String) -> napi::Result<String> {
 /// Returns `true` if the attestation was found and removed.
 ///
 /// See spec §3.5.1.
-#[cfg(feature = "allow_in_memory_custody")]
 #[napi(js_name = "identityRemoveLinkAttestation")]
 pub fn identity_remove_link_attestation(did: String, attestation_id: String) -> napi::Result<bool> {
     crate::runtime::with_identity_mut(&did, |entry| {
@@ -1565,7 +1562,6 @@ pub fn identity_remove_link_attestation(did: String, attestation_id: String) -> 
 /// the identity registry.
 ///
 /// See spec §3.5.1.
-#[cfg(feature = "allow_in_memory_custody")]
 #[napi(js_name = "identityVerifyLinkAttestation")]
 #[allow(clippy::unused_async)]
 pub async fn identity_verify_link_attestation(
