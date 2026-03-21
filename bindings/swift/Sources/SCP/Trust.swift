@@ -384,7 +384,7 @@ public func verifyChallengeResponse(
 ///
 /// - ADR-017 acceptance criterion 9
 /// - Spec section 7.3
-public nonisolated struct AggregatedTrustInput: @unchecked Sendable {
+public nonisolated struct AggregatedTrustInput {
     /// Verified attestations (Layer 3), as raw JSON-decoded objects.
     public let verifiedAttestations: [[String: Any]]
 
