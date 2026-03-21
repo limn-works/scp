@@ -498,6 +498,7 @@ pub fn validate_attestation_fields(
     validate_non_empty(handle, "handle", MAX_ATTESTATION_HANDLE_LEN)?;
     reject_control_chars(handle, "handle")?;
     validate_non_empty(proof, "proof", MAX_ATTESTATION_PROOF_LEN)?;
+    reject_control_chars(proof, "proof")?;
     Ok(())
 }
 
@@ -841,6 +842,71 @@ mod tests {
     fn empty_transport_mode_rejected() {
         let err = validate_transport_mode("").unwrap_err();
         assert!(err.message.contains("must not be empty"));
+    }
+
+    // -- Attestation fields --
+
+    #[test]
+    fn valid_attestation_fields() {
+        assert!(validate_attestation_fields("github.com", "@alice", r#"{"sig":"abc"}"#).is_ok());
+    }
+
+    #[test]
+    fn attestation_empty_platform_rejected() {
+        let err = validate_attestation_fields("", "@alice", "proof").unwrap_err();
+        assert!(err.message.contains("must not be empty"));
+    }
+
+    #[test]
+    fn attestation_empty_handle_rejected() {
+        let err = validate_attestation_fields("github.com", "", "proof").unwrap_err();
+        assert!(err.message.contains("must not be empty"));
+    }
+
+    #[test]
+    fn attestation_empty_proof_rejected() {
+        let err = validate_attestation_fields("github.com", "@alice", "").unwrap_err();
+        assert!(err.message.contains("must not be empty"));
+    }
+
+    #[test]
+    fn attestation_platform_control_chars_rejected() {
+        let err = validate_attestation_fields("git\nhub.com", "@alice", "proof").unwrap_err();
+        assert!(err.message.contains("control character"));
+    }
+
+    #[test]
+    fn attestation_handle_control_chars_rejected() {
+        let err = validate_attestation_fields("github.com", "@al\0ice", "proof").unwrap_err();
+        assert!(err.message.contains("control character"));
+    }
+
+    #[test]
+    fn attestation_proof_control_chars_rejected() {
+        let err =
+            validate_attestation_fields("github.com", "@alice", "proof\x1binject").unwrap_err();
+        assert!(err.message.contains("control character"));
+    }
+
+    #[test]
+    fn attestation_platform_too_long_rejected() {
+        let long = "a".repeat(MAX_ATTESTATION_PLATFORM_LEN + 1);
+        let err = validate_attestation_fields(&long, "@alice", "proof").unwrap_err();
+        assert!(err.message.contains("exceeds maximum length"));
+    }
+
+    #[test]
+    fn attestation_handle_too_long_rejected() {
+        let long = "a".repeat(MAX_ATTESTATION_HANDLE_LEN + 1);
+        let err = validate_attestation_fields("github.com", &long, "proof").unwrap_err();
+        assert!(err.message.contains("exceeds maximum length"));
+    }
+
+    #[test]
+    fn attestation_proof_too_long_rejected() {
+        let long = "a".repeat(MAX_ATTESTATION_PROOF_LEN + 1);
+        let err = validate_attestation_fields("github.com", "@alice", &long).unwrap_err();
+        assert!(err.message.contains("exceeds maximum length"));
     }
 
     // -- json_value_type_name --
