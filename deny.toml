@@ -43,6 +43,8 @@ ignore = [
     # Transitive dep via rustls/aws-sdk. Awaiting upstream aws-lc-sys patch release.
     "RUSTSEC-2026-0044",
     "RUSTSEC-2026-0048",
+    # rustls-webpki CRL distribution point logic — transitive dep via aws-smithy-http-client
+    # -> rustls 0.21 -> rustls-webpki 0.101.7. Fix requires >=0.103.10 but AWS SDK pins 0.101.x.
     "RUSTSEC-2026-0049",
 ]
 

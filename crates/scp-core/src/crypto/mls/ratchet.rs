@@ -193,16 +193,17 @@ pub fn propose_update_with_wrapping_key(
 
 /// Serializes an [`MlsMessageOut`] to bytes for transmission.
 ///
-/// Convenience function for converting Commit messages from [`propose_update`]
-/// into byte vectors suitable for transport.
+/// Convenience function for converting any MLS message (Commit, Welcome, etc.)
+/// from [`propose_update`] or [`add_member`](super::group::add_member) into
+/// byte vectors suitable for transport.
 ///
 /// # Errors
 ///
 /// Returns [`MlsError::CommitProcessingFailed`] if TLS serialization fails.
-pub fn serialize_commit(message: &MlsMessageOut) -> Result<Vec<u8>, MlsError> {
+pub fn serialize_mls_message(message: &MlsMessageOut) -> Result<Vec<u8>, MlsError> {
     message
         .tls_serialize_detached()
-        .map_err(|e| MlsError::CommitProcessingFailed(format!("serializing commit: {e}")))
+        .map_err(|e| MlsError::CommitProcessingFailed(format!("serializing MLS message: {e}")))
 }
 
 #[cfg(test)]
@@ -261,7 +262,7 @@ mod tests {
         let (mut alice_group, _bob_group) = setup_alice_bob();
 
         let commit = propose_update(&mut alice_group).unwrap();
-        let bytes = serialize_commit(&commit).unwrap();
+        let bytes = serialize_mls_message(&commit).unwrap();
 
         assert!(!bytes.is_empty(), "serialized commit should not be empty");
     }
@@ -276,7 +277,7 @@ mod tests {
 
         // Alice issues an update, producing a Commit.
         let commit = propose_update(&mut alice_group).unwrap();
-        let commit_bytes = serialize_commit(&commit).unwrap();
+        let commit_bytes = serialize_mls_message(&commit).unwrap();
 
         // Bob processes the Commit.
         process_commit(&mut bob_group, &commit_bytes, &mut grace_store).unwrap();
@@ -298,7 +299,7 @@ mod tests {
         let bob_old_epoch = bob_group.epoch().unwrap();
 
         let commit = propose_update(&mut alice_group).unwrap();
-        let commit_bytes = serialize_commit(&commit).unwrap();
+        let commit_bytes = serialize_mls_message(&commit).unwrap();
 
         process_commit(&mut bob_group, &commit_bytes, &mut grace_store).unwrap();
 
@@ -315,7 +316,7 @@ mod tests {
         let mut grace_store = EpochGraceStore::new();
 
         let commit = propose_update(&mut alice_group).unwrap();
-        let commit_bytes = serialize_commit(&commit).unwrap();
+        let commit_bytes = serialize_mls_message(&commit).unwrap();
 
         crate::crypto::mls::group::destroy_group(&mut bob_group).unwrap();
 
@@ -362,7 +363,7 @@ mod tests {
         // Perform 3 sequential updates.
         for i in 0u64..3 {
             let commit = propose_update(&mut alice_group).unwrap();
-            let commit_bytes = serialize_commit(&commit).unwrap();
+            let commit_bytes = serialize_mls_message(&commit).unwrap();
             process_commit(&mut bob_group, &commit_bytes, &mut grace_store).unwrap();
 
             assert_eq!(
@@ -410,7 +411,7 @@ mod tests {
 
         // Alice issues an update, advancing her group to epoch 2.
         let commit = propose_update(&mut alice_group).unwrap();
-        let commit_bytes = serialize_commit(&commit).unwrap();
+        let commit_bytes = serialize_mls_message(&commit).unwrap();
 
         // Alice processes Bob's old-epoch ciphertext AFTER advancing her own
         // epoch. With max_past_epochs=2, Alice retains epoch 1 message secrets
@@ -491,7 +492,7 @@ mod tests {
         // With max_past_epochs=2, at epoch 4 only epochs 2 and 3 are retained.
         for _ in 0..3 {
             let commit = propose_update(&mut alice_group).unwrap();
-            let commit_bytes = serialize_commit(&commit).unwrap();
+            let commit_bytes = serialize_mls_message(&commit).unwrap();
             process_commit(&mut bob_group, &commit_bytes, &mut grace_store).unwrap();
         }
 
@@ -527,7 +528,7 @@ mod tests {
         // retains epochs 1 and 2.
         for _ in 0..2 {
             let commit = propose_update(&mut alice_group).unwrap();
-            let commit_bytes = serialize_commit(&commit).unwrap();
+            let commit_bytes = serialize_mls_message(&commit).unwrap();
             process_commit(&mut bob_group, &commit_bytes, &mut grace_store).unwrap();
         }
 
@@ -563,7 +564,7 @@ mod tests {
         // Advance 3 times to fill and then exceed the grace store capacity.
         for _ in 0..3 {
             let commit = propose_update(&mut alice_group).unwrap();
-            let commit_bytes = serialize_commit(&commit).unwrap();
+            let commit_bytes = serialize_mls_message(&commit).unwrap();
             process_commit(&mut bob_group, &commit_bytes, &mut grace_store).unwrap();
         }
 

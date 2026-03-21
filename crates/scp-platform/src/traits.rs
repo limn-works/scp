@@ -614,8 +614,9 @@ pub fn x25519_agree_from_ed25519(
     let x25519_secret = x25519_dalek::StaticSecret::from(*scalar_bytes);
     let peer_key = x25519_dalek::PublicKey::from(*peer_x25519_public);
     let shared = x25519_secret.diffie_hellman(&peer_key);
-    // x25519-dalek v2 SharedSecret does NOT implement ZeroizeOnDrop.
-    // Manually copy to Zeroizing then extract.
+    // x25519-dalek v2 SharedSecret implements Zeroize + zeroize(drop) when the
+    // zeroize feature is enabled (which it is). Wrapping in Zeroizing is
+    // defense-in-depth — ensures zeroing even if the feature is ever removed.
     let shared_bytes = zeroize::Zeroizing::new(shared.to_bytes());
     SharedSecret::new(*shared_bytes)
 }
