@@ -214,12 +214,75 @@ async fn main() {
 
     tracing::info!(addr = %local_addr, "relay listening");
 
+    // Start Prometheus metrics HTTP server on a separate port (#1467).
+    let metrics_port = env_or("SCP_RELAY_METRICS_PORT", 9001u16);
+    let metrics_addr: SocketAddr = SocketAddr::from(([0, 0, 0, 0], metrics_port));
+    let metrics_handle = spawn_metrics_server(metrics_addr).await;
+
     // Wait for shutdown signal (SIGINT / SIGTERM).
     shutdown_signal().await;
 
     tracing::info!("shutdown signal received, stopping relay");
+    if let Some(h) = metrics_handle {
+        h.abort();
+    }
     handle.shutdown();
     tracing::info!("relay stopped");
+}
+
+// ---------------------------------------------------------------------------
+// Prometheus metrics (#1467)
+// ---------------------------------------------------------------------------
+
+/// Spawns a minimal axum HTTP server serving `/metrics` in Prometheus text
+/// format. Returns the task handle so the caller can abort on shutdown.
+///
+/// Uses `metrics-exporter-prometheus` as the global recorder. If the metrics
+/// port cannot be bound, a warning is logged and `None` is returned.
+async fn spawn_metrics_server(addr: SocketAddr) -> Option<tokio::task::JoinHandle<()>> {
+    use axum::response::IntoResponse;
+
+    let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+    let handle = recorder.handle();
+    let _ = metrics::set_global_recorder(recorder);
+
+    let app = axum::Router::new().route(
+        "/metrics",
+        axum::routing::get(move || {
+            let h = handle.clone();
+            async move {
+                let body = h.render();
+                (
+                    axum::http::StatusCode::OK,
+                    [(
+                        axum::http::header::CONTENT_TYPE,
+                        "text/plain; version=0.0.4",
+                    )],
+                    body,
+                )
+                    .into_response()
+            }
+        }),
+    );
+
+    let listener = match tokio::net::TcpListener::bind(addr).await {
+        Ok(l) => l,
+        Err(e) => {
+            tracing::warn!(
+                addr = %addr,
+                error = %e,
+                "failed to bind metrics server; metrics endpoint unavailable"
+            );
+            return None;
+        }
+    };
+
+    let bound_addr = listener.local_addr().unwrap_or(addr);
+    tracing::info!(addr = %bound_addr, "metrics server listening");
+
+    Some(tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    }))
 }
 
 /// Waits for either SIGINT (`ctrl_c`) or SIGTERM.

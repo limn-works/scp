@@ -640,6 +640,26 @@ pub trait ContextEventLogProvider: Send + Sync {
         // Default: initialize empty event log (no persistence).
         self.init_event_log(context_id)
     }
+
+    /// Prunes event log entries before a checkpoint boundary based on a
+    /// [`PruningPolicy`](crate::context::governance::PruningPolicy).
+    ///
+    /// Called after creating a governance checkpoint (#1474). The default
+    /// implementation is a no-op — providers that support pruning override
+    /// this method.
+    ///
+    /// # Returns
+    ///
+    /// The number of entries removed, or `None` if no log exists for the
+    /// context or the provider does not support pruning.
+    fn prune_before_checkpoint(
+        &self,
+        _context_id: &[u8; 32],
+        _checkpoint_event_count: u64,
+        _policy: &crate::context::governance::PruningPolicy,
+    ) -> Option<usize> {
+        None
+    }
 }
 
 // ---------------------------------------------------------------------------
