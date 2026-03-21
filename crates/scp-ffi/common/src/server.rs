@@ -19,6 +19,7 @@ use scp_node::NodeError;
 use scp_platform::testing::InMemoryStorage;
 use scp_transport::native::server::{RelayConfig, RelayError, RelayServer, ShutdownHandle};
 use scp_transport::native::storage::{BlobStorageBackend, StorageError};
+use zeroize::Zeroizing;
 
 // ---------------------------------------------------------------------------
 // NodeIdentity — pre-existing identity for node startup
@@ -338,10 +339,8 @@ pub async fn start_node_in_memory(
 ///
 /// When `identity` is `None`, the node creates or reloads a persistent
 /// identity via [`FileKeyCustody`](scp_platform::file::FileKeyCustody)
-/// backed by `<data_dir>/identity.key`. The passphrase is resolved as:
-/// 1. The explicit `passphrase` parameter, if `Some`.
-/// 2. The `SCP_KEY_PASSPHRASE` environment variable, if set.
-/// 3. Returns an error if neither is available.
+/// backed by `<data_dir>/identity.key`. The `passphrase` parameter is
+/// required in this mode — there is no environment variable fallback.
 ///
 /// On first run, a new DID is generated and persisted to storage. On
 /// subsequent runs, the same DID is reloaded from storage.
@@ -354,7 +353,7 @@ pub async fn start_node_in_memory(
 /// - The data directory cannot be created ([`ServerError::Io`])
 /// - The filesystem storage cannot be initialized ([`ServerError::Platform`])
 /// - The redb blob database cannot be opened ([`ServerError::Storage`])
-/// - No passphrase provided and `SCP_KEY_PASSPHRASE` unset when `identity` is `None` ([`ServerError::Io`])
+/// - No passphrase provided when `identity` is `None` ([`ServerError::Io`])
 /// - Relay binding, identity generation, or TLS fails ([`ServerError::Node`])
 pub async fn start_node_local(
     data_dir: &Path,
@@ -404,17 +403,12 @@ pub async fn start_node_local(
             .await?
     } else {
         // Persistent key custody — keys survive process restarts.
-        let passphrase = match passphrase {
-            Some(p) => p,
-            None => zeroize::Zeroizing::new(std::env::var("SCP_KEY_PASSPHRASE").map_err(
-                |_| {
-                    ServerError::Io(std::io::Error::new(
-                        std::io::ErrorKind::InvalidInput,
-                        "passphrase required for persistent node identity: pass explicitly or set SCP_KEY_PASSPHRASE",
-                    ))
-                },
-            )?),
-        };
+        let passphrase = passphrase.ok_or_else(|| {
+            ServerError::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "passphrase required for persistent node identity",
+            ))
+        })?;
         let key_path = data_dir.join("identity.key");
         let key_custody = Arc::new(scp_platform::file::FileKeyCustody::new(
             &key_path,
@@ -518,7 +512,7 @@ impl RunningNode {
     ///
     /// **Security:** This value is a secret. Do not log or expose it.
     #[must_use]
-    pub fn bridge_token_hex(&self) -> String {
+    pub fn bridge_token_hex(&self) -> Zeroizing<String> {
         match self {
             Self::InMemory(n) => n.bridge_token_hex(),
             Self::Filesystem(n) => n.bridge_token_hex(),

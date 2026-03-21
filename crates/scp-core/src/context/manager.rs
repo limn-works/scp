@@ -3060,11 +3060,14 @@ impl ContextManager {
         // Lock dropped before crypto/transport/event-log calls.
 
         // Phase 2 (no lock): Encrypt + send via transport.
-        // If either fails, return error — no phantom MessageSent in buffer
-        // and no membership-level sequence number burned.
-        let encrypted = if let Some(ref envelope) = broadcast_envelope {
-            // Broadcast: serialize envelope for transport.
-            envelope.encrypted_content.clone()
+        // If either fails, return error — no phantom MessageSent in buffer.
+        // Sequence number is burned on failure (gaps are harmless).
+        let encrypted = if let Some(envelope) = broadcast_envelope {
+            // Broadcast: serialize the full BroadcastEnvelope for transport.
+            // The relay stores the entire envelope so that the node's projection
+            // layer can reconstruct metadata without decrypting.
+            rmp_serde::to_vec_named(&envelope)
+                .map_err(|e| ContextError::CryptoFailed(format!("envelope serialization: {e}")))?
         } else {
             // Encrypted: sender key (ADR-007) -> inner envelope (ADR-002) ->
             // MLS (ADR-001) -> outer envelope.
@@ -3672,9 +3675,16 @@ impl ContextManager {
         };
         // Lock dropped.
 
+        // Serialize the full BroadcastEnvelope for transport. The relay stores
+        // the entire envelope (not just encrypted_content) so that the node's
+        // projection layer can reconstruct metadata (author_did, key_epoch, etc.)
+        // without decrypting.
+        let envelope_bytes = rmp_serde::to_vec_named(&envelope)
+            .map_err(|e| ContextError::CryptoFailed(format!("envelope serialization: {e}")))?;
+
         // Send via transport.
         self.transport
-            .send_message(&context_id_bytes, &envelope.encrypted_content)?;
+            .send_message(&context_id_bytes, &envelope_bytes)?;
 
         // Append event to persistent event log.
         self.event_log

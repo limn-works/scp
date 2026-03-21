@@ -374,8 +374,10 @@ impl<S: Storage> ApplicationNode<S> {
     ///
     /// **Security:** This value is a secret. Do not log or expose it.
     #[must_use]
-    pub fn bridge_token_hex(&self) -> String {
-        scp_transport::native::server::hex_encode_32(&self.state.bridge_secret)
+    pub fn bridge_token_hex(&self) -> Zeroizing<String> {
+        Zeroizing::new(scp_transport::native::server::hex_encode_32(
+            &self.state.bridge_secret,
+        ))
     }
 
     /// Returns the dev API bearer token if the dev API is enabled.
@@ -978,8 +980,19 @@ impl<S: Storage> ApplicationNode<S> {
         let mut path_sizes: HashMap<ContentPath, u64> = HashMap::new();
 
         for stored in &blobs {
+            // Unwrap OuterEnvelope (transport layer), then deserialize
+            // BroadcastEnvelope. Skip blobs that are not valid OuterEnvelopes.
+            let inner_bytes = match scp_core::envelope::OuterEnvelope::from_bytes(&stored.blob) {
+                Ok(outer) => outer.encrypted_blob,
+                Err(e) => {
+                    tracing::warn!(
+                        "failed to unwrap OuterEnvelope in commit_deploy, skipping blob: {e}"
+                    );
+                    continue;
+                }
+            };
             let envelope: scp_core::crypto::sender_keys::BroadcastEnvelope =
-                match rmp_serde::from_slice(&stored.blob) {
+                match rmp_serde::from_slice(&inner_bytes) {
                     Ok(env) => env,
                     Err(_) => continue,
                 };
@@ -4105,9 +4118,10 @@ mod tests {
         // Connect with the bridge token in the Authorization header (#225).
         let url = format!("ws://{addr}/");
         let mut request = url.into_client_request().unwrap();
-        request
-            .headers_mut()
-            .insert("Authorization", format!("Bearer {token}").parse().unwrap());
+        request.headers_mut().insert(
+            "Authorization",
+            format!("Bearer {}", token.as_str()).parse().unwrap(),
+        );
         let connect_result = tokio_tungstenite::connect_async(request).await;
 
         assert!(

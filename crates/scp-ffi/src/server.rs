@@ -60,18 +60,18 @@ fn auto_wire_context_manager(
     rt: &tokio::runtime::Runtime,
     did: &str,
     relay_url: &str,
-    bridge_token: &str,
+    bridge_token: Zeroizing<String>,
 ) {
     let sourced = SourcedRelayUrl {
         url: relay_url.to_owned(),
         source: RelayUrlSource::Explicit,
     };
-    let token = Zeroizing::new(bridge_token.to_owned());
     let did_owned = did.to_owned();
+    let token2 = bridge_token.clone();
     match py.allow_threads(|| {
         rt.block_on(NativeRelayAdapter::connect_sourced_with_bearer(
             &sourced,
-            Some(token),
+            Some(bridge_token),
         ))
     }) {
         Ok(adapter) => {
@@ -88,7 +88,6 @@ fn auto_wire_context_manager(
             // a separate `transport_connect` call. This requires a second
             // WebSocket connection because NativeRelayAdapter is not Clone
             // and the first was consumed by RelayTransportProvider.
-            let token2 = Zeroizing::new(bridge_token.to_owned());
             match py.allow_threads(|| {
                 rt.block_on(NativeRelayAdapter::connect_sourced_with_bearer(
                     &sourced,
@@ -596,7 +595,7 @@ pub fn py_node_start_in_memory(
     let did = node.identity().did().to_owned();
     let relay_url = format!("ws://127.0.0.1:{}/scp/v1", node.relay().bound_addr().port());
     let bridge_token = node.bridge_token_hex();
-    auto_wire_context_manager(py, rt, &did, &relay_url, &bridge_token);
+    auto_wire_context_manager(py, rt, &did, &relay_url, bridge_token);
 
     Ok(PyNodeHandle {
         inner: RunningNode::InMemory(node),
@@ -610,11 +609,7 @@ pub fn py_node_start_in_memory(
 ///
 /// When ``identity_did`` is ``None`` (the default), the node creates or
 /// reloads a persistent identity from ``<data_dir>/identity.key``. The
-/// passphrase is resolved as:
-///
-/// 1. The explicit ``passphrase`` parameter, if provided.
-/// 2. The ``SCP_KEY_PASSPHRASE`` environment variable, if set.
-/// 3. Returns an error if neither is available.
+/// ``passphrase`` parameter is required in this mode.
 ///
 /// When ``identity_did`` is provided, the node uses the pre-existing identity
 /// from the `PyO3` identity registry (populated by ``py_identity_create``).
@@ -651,7 +646,7 @@ pub fn py_node_start_local(
     let did = node.identity().did().to_owned();
     let relay_url = format!("ws://127.0.0.1:{}/scp/v1", node.relay().bound_addr().port());
     let bridge_token = node.bridge_token_hex();
-    auto_wire_context_manager(py, rt, &did, &relay_url, &bridge_token);
+    auto_wire_context_manager(py, rt, &did, &relay_url, bridge_token);
 
     Ok(PyNodeHandle {
         inner: RunningNode::Filesystem(node),

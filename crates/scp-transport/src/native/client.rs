@@ -269,10 +269,11 @@ impl NativeRelayClient {
             request.headers_mut().insert(
                 "Authorization",
                 format!("Bearer {}", token.as_str()).parse().map_err(
-                    |e: tokio_tungstenite::tungstenite::http::header::InvalidHeaderValue| {
-                        TransportError::ConnectionFailed(format!(
-                            "invalid bearer token header value: {e}"
-                        ))
+                    |_: tokio_tungstenite::tungstenite::http::header::InvalidHeaderValue| {
+                        TransportError::ConnectionFailed(
+                            "bearer token contains characters not valid in HTTP header values"
+                                .to_string(),
+                        )
                     },
                 )?,
             );

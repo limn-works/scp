@@ -194,12 +194,8 @@ class Node:
         When ``identity`` is provided, the node uses that pre-existing identity
         instead of generating one -- the same DID persists across node restarts
         (identity portability).  When ``None``, the node creates or reloads a
-        persistent identity via ``FileKeyCustody``.  The passphrase for key
-        derivation is resolved as:
-
-        1. The explicit ``passphrase`` parameter, if provided.
-        2. The ``SCP_KEY_PASSPHRASE`` environment variable, if set.
-        3. Returns an error if neither is available.
+        persistent identity via ``FileKeyCustody``.  The ``passphrase``
+        parameter is required in this mode.
 
         No passphrase is required when ``identity`` is provided.
 
@@ -212,8 +208,7 @@ class Node:
                 to use.  If provided, the node uses this identity instead of
                 generating a fresh one.
             passphrase: Passphrase for Argon2id key derivation (encrypts the
-                key file at rest).  Falls back to ``SCP_KEY_PASSPHRASE`` env
-                var when ``None``.
+                key file at rest).  Required when ``identity`` is ``None``.
         """
         did = identity.did if identity is not None else None
         handle = await asyncio.to_thread(_scp_core.py_node_start_local, data_dir, did, passphrase)
