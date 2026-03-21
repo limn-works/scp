@@ -521,13 +521,9 @@ pub fn validate_attestation_fields(
 /// Returns `Err` if the DID does not start with `did:dht:z`, z-base-32 decoding
 /// fails, or the decoded output is not exactly 32 bytes.
 pub fn extract_public_key_from_did(did: &str) -> Result<[u8; 32], ValidationError> {
-    let encoded = did
-        .strip_prefix("did:dht:z")
-        .ok_or_else(|| {
-            ValidationError::new(format!(
-                "expected 'did:dht:z...' prefix, got: {did}"
-            ))
-        })?;
+    let encoded = did.strip_prefix("did:dht:z").ok_or_else(|| {
+        ValidationError::new(format!("expected 'did:dht:z...' prefix, got: {did}"))
+    })?;
 
     let decoded = zbase32::decode(encoded).map_err(|e| {
         ValidationError::new(format!("z-base-32 decode failed for DID '{did}': {e}"))
@@ -971,10 +967,9 @@ mod tests {
     fn extract_key_from_valid_did_dht() {
         // Round-trip: encode known bytes, then extract them back.
         let key_bytes: [u8; 32] = [
-            0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08,
-            0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f, 0x10,
-            0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18,
-            0x19, 0x1a, 0x1b, 0x1c, 0x1d, 0x1e, 0x1f, 0x20,
+            0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e,
+            0x0f, 0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18, 0x19, 0x1a, 0x1b, 0x1c,
+            0x1d, 0x1e, 0x1f, 0x20,
         ];
         let encoded = zbase32::encode(&key_bytes);
         let did = format!("did:dht:z{encoded}");

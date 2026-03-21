@@ -2314,9 +2314,7 @@ fn resolve_attestation_public_key(
         match scp_ffi_common::validate::extract_public_key_from_did(issuer) {
             Ok(key) => Ok(Some(key)),
             Err(e) => Err(ScpWasmError::Identity {
-                message: format!(
-                    "failed to extract public key from issuer DID '{issuer}': {e}"
-                ),
+                message: format!("failed to extract public key from issuer DID '{issuer}': {e}"),
                 code: "SCP-IDENT-1044".to_owned(),
             }
             .into_js()

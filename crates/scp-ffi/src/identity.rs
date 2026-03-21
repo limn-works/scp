@@ -1488,13 +1488,12 @@ fn py_verify_identity_link_attestation(
             // never goes stale, unlike the active signing key stored in the
             // custody registry.
             let issuer_did: &str = &attestation.issuer;
-            let pub_bytes =
-                scp_ffi_common::validate::extract_public_key_from_did(issuer_did)
-                    .map_err(|e| {
-                        ScpPyError::identity(format!(
-                            "failed to extract public key from issuer DID '{issuer_did}': {e}"
-                        ))
-                    })?;
+            let pub_bytes = scp_ffi_common::validate::extract_public_key_from_did(issuer_did)
+                .map_err(|e| {
+                    ScpPyError::identity(format!(
+                        "failed to extract public key from issuer DID '{issuer_did}': {e}"
+                    ))
+                })?;
             Ok(attestation.verify_signature(&pub_bytes).is_ok())
         }
     })
