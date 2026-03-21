@@ -22,6 +22,7 @@
 pub mod broadcast;
 pub mod encrypt;
 pub mod key_protocol;
+pub mod key_protocol_verify;
 
 use std::collections::HashMap;
 
