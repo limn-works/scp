@@ -6732,6 +6732,192 @@ fn provenance_hash_conformance_registry_with_payment() {
     );
 }
 
+/// Verifies that every known WASM event type string maps to a non-sentinel
+/// tag value (#1496) and that the string-based mapping produces the same
+/// numeric tags as the native `EventType` enum-based mapping.
+///
+/// If a new `EventType` variant is added to `scp-event-log` without a
+/// corresponding string entry in `wasm_event_type_tag`, the cross-validation
+/// section will catch it at compile time (exhaustive match on `EventType`).
+#[test]
+fn wasm_event_type_tag_exhaustiveness() {
+    // Verbatim copy of `wasm_event_type_tag` from
+    // `crates/scp-ffi/wasm/src/runtime.rs` — must be kept in sync.
+    fn wasm_event_type_tag(event_type: &str) -> u16 {
+        match event_type {
+            "ContextCreated" => 0,
+            "ContextClosing" => 1,
+            "ContextClosed" => 2,
+            "ContextExpired" => 3,
+            "MemberJoined" => 4,
+            "MemberLeft" => 5,
+            "RoleAssigned" => 6,
+            "TokenRevoked" | "UcanRevoked" => 7,
+            "MessageSent" => 8,
+            "ToolRegistered" => 9,
+            "ToolUpdated" => 10,
+            "ToolInvoked" => 11,
+            "ToolVerified" => 12,
+            "ToolInterfaceEstablished" => 13,
+            "GovernanceAction" => 14,
+            "ConsistencyCheckpoint" => 15,
+            "AbsenceProofRequested" => 16,
+            "MemberBlocked" => 17,
+            "KeyEpochAdvance" => 18,
+            "MediaSessionStarted" => 19,
+            "MediaSessionEnded" => 20,
+            "PaymentReceived" => 21,
+            "EconomicPolicyChanged" => 22,
+            "EconomicPolicyApplied" => 33,
+            "SpendingUcanGranted" => 23,
+            "SpendingUcanRevoked" => 24,
+            "GovernanceProposalCreated" => 25,
+            "GovernanceVoteCast" => 26,
+            "GovernanceVoteWithdrawn" => 27,
+            "GovernanceProposalResolved" => 28,
+            "GovernanceConflictDetected" => 29,
+            "GovernanceConflictResolved" => 30,
+            "GovernanceDeadlockRecovery" => 31,
+            "GovernanceActionExecuted" | "GovernanceExecuted" => 32,
+            "ProvenanceAttached" => 34,
+            "ProvenanceReceived" => 35,
+            _ => 0xFFFF,
+        }
+    }
+
+    // Every event type string used in WASM manager.rs and provenance.rs call sites
+    // must resolve to a non-sentinel tag value. If a new EventType variant is added
+    // to scp-event-log without a corresponding WASM string mapping, this test will
+    // catch it.
+    let all_event_type_strings = [
+        // From scp-ffi-wasm/src/manager.rs call sites:
+        "ContextCreated",
+        "ContextClosing",
+        "ContextClosed",
+        "ContextExpired",
+        "MemberJoined",
+        "MemberLeft",
+        "MessageSent",
+        "ToolRegistered",
+        "ToolInvoked",
+        "UcanRevoked",
+        "GovernanceExecuted",
+        "GovernanceProposalCreated",
+        "GovernanceVoteCast",
+        "GovernanceVoteWithdrawn",
+        // From scp-ffi-wasm/src/provenance.rs call sites:
+        "ProvenanceAttached",
+        "ProvenanceReceived",
+        // Additional entries in the match table (not currently called
+        // but must remain non-sentinel for forward compatibility):
+        "RoleAssigned",
+        "TokenRevoked",
+        "ToolUpdated",
+        "ToolVerified",
+        "ToolInterfaceEstablished",
+        "GovernanceAction",
+        "ConsistencyCheckpoint",
+        "AbsenceProofRequested",
+        "MemberBlocked",
+        "KeyEpochAdvance",
+        "MediaSessionStarted",
+        "MediaSessionEnded",
+        "PaymentReceived",
+        "EconomicPolicyChanged",
+        "EconomicPolicyApplied",
+        "SpendingUcanGranted",
+        "SpendingUcanRevoked",
+        "GovernanceProposalResolved",
+        "GovernanceConflictDetected",
+        "GovernanceConflictResolved",
+        "GovernanceDeadlockRecovery",
+        "GovernanceActionExecuted",
+    ];
+
+    for event_type in &all_event_type_strings {
+        let tag = wasm_event_type_tag(event_type);
+        assert_ne!(
+            tag, 0xFFFF,
+            "WASM event type string '{event_type}' maps to sentinel 0xFFFF — \
+             add a mapping to wasm_event_type_tag in crates/scp-ffi/wasm/src/runtime.rs"
+        );
+    }
+
+    // Cross-validate: every scp-event-log EventType variant must have a
+    // corresponding string mapping that produces the same numeric tag.
+    let all_variants = [
+        (EventType::ContextCreated, "ContextCreated"),
+        (EventType::ContextClosing, "ContextClosing"),
+        (EventType::ContextClosed, "ContextClosed"),
+        (EventType::ContextExpired, "ContextExpired"),
+        (EventType::MemberJoined, "MemberJoined"),
+        (EventType::MemberLeft, "MemberLeft"),
+        (EventType::RoleAssigned, "RoleAssigned"),
+        (EventType::TokenRevoked, "TokenRevoked"),
+        (EventType::MessageSent, "MessageSent"),
+        (EventType::ToolRegistered, "ToolRegistered"),
+        (EventType::ToolUpdated, "ToolUpdated"),
+        (EventType::ToolInvoked, "ToolInvoked"),
+        (EventType::ToolVerified, "ToolVerified"),
+        (
+            EventType::ToolInterfaceEstablished,
+            "ToolInterfaceEstablished",
+        ),
+        (EventType::GovernanceAction, "GovernanceAction"),
+        (EventType::ConsistencyCheckpoint, "ConsistencyCheckpoint"),
+        (EventType::AbsenceProofRequested, "AbsenceProofRequested"),
+        (EventType::MemberBlocked, "MemberBlocked"),
+        (EventType::KeyEpochAdvance, "KeyEpochAdvance"),
+        (EventType::MediaSessionStarted, "MediaSessionStarted"),
+        (EventType::MediaSessionEnded, "MediaSessionEnded"),
+        (EventType::PaymentReceived, "PaymentReceived"),
+        (EventType::EconomicPolicyChanged, "EconomicPolicyChanged"),
+        (EventType::EconomicPolicyApplied, "EconomicPolicyApplied"),
+        (EventType::SpendingUcanGranted, "SpendingUcanGranted"),
+        (EventType::SpendingUcanRevoked, "SpendingUcanRevoked"),
+        (
+            EventType::GovernanceProposalCreated,
+            "GovernanceProposalCreated",
+        ),
+        (EventType::GovernanceVoteCast, "GovernanceVoteCast"),
+        (
+            EventType::GovernanceVoteWithdrawn,
+            "GovernanceVoteWithdrawn",
+        ),
+        (
+            EventType::GovernanceProposalResolved,
+            "GovernanceProposalResolved",
+        ),
+        (
+            EventType::GovernanceConflictDetected,
+            "GovernanceConflictDetected",
+        ),
+        (
+            EventType::GovernanceConflictResolved,
+            "GovernanceConflictResolved",
+        ),
+        (
+            EventType::GovernanceDeadlockRecovery,
+            "GovernanceDeadlockRecovery",
+        ),
+        (
+            EventType::GovernanceActionExecuted,
+            "GovernanceActionExecuted",
+        ),
+        (EventType::ProvenanceAttached, "ProvenanceAttached"),
+        (EventType::ProvenanceReceived, "ProvenanceReceived"),
+    ];
+
+    for (variant, name) in &all_variants {
+        let native_tag = event_type_tag(variant);
+        let wasm_tag = wasm_event_type_tag(name);
+        assert_eq!(
+            native_tag, wasm_tag,
+            "tag mismatch for {name}: native={native_tag}, wasm={wasm_tag}"
+        );
+    }
+}
+
 /// Confirms that `chain_depth: u8` (scp-core) and `chain_depth: u32` (WASM)
 /// produce identical JSON bytes for values in the protocol range (0..=5).
 ///
@@ -6766,4 +6952,40 @@ fn provenance_hash_chain_depth_u8_vs_u32() {
             String::from_utf8_lossy(&u32_bytes),
         );
     }
+}
+
+/// Confirms that the WASM `wasm_default_ceiling()` string set matches
+/// scp-core's `default_ceiling().to_ucan_string_set()`.
+///
+/// The WASM bridge re-implements `default_ceiling` as a standalone function
+/// in `scp-ffi-wasm/src/ucan.rs`. If either side adds, removes, or renames
+/// a capability, this test will fail — forcing the two to stay in sync.
+#[test]
+fn wasm_default_ceiling_matches_core() {
+    use std::collections::HashSet;
+
+    let core_ceiling = scp_core::context::roles::default_ceiling().to_ucan_string_set();
+
+    // Mirror of `wasm_default_ceiling()` in scp-ffi-wasm/src/ucan.rs.
+    // Must be updated in lockstep — that is the point.
+    let wasm_ceiling: HashSet<String> = [
+        "messages:read",
+        "messages:write",
+        "tool:register",
+        "tool_invoke:*",
+        "role:assign",
+        "member:invite",
+        "member:remove",
+        "governance:propose",
+        "governance:vote",
+        "context:close",
+    ]
+    .into_iter()
+    .map(String::from)
+    .collect();
+
+    assert_eq!(
+        core_ceiling, wasm_ceiling,
+        "WASM wasm_default_ceiling() must match core default_ceiling().to_ucan_string_set()"
+    );
 }

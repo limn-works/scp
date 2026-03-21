@@ -762,11 +762,10 @@ impl KeyCustody for FileKeyCustody {
                 .map_err(|e| PlatformError::CustodyError(e.to_string()))?;
             mac.update(&context_id);
             mac.update(b"scp-pseudonym");
-            let hmac_output = mac.finalize().into_bytes();
-
-            let mut seed = Zeroizing::new([0u8; 32]);
-            seed.copy_from_slice(&hmac_output[..32]);
-            let pseudonym_signing_key = SigningKey::from_bytes(&seed);
+            let hmac_bytes = Zeroizing::new(mac.finalize().into_bytes());
+            let mut hmac_output = Zeroizing::new([0u8; 32]);
+            hmac_output.copy_from_slice(&hmac_bytes[..32]);
+            let pseudonym_signing_key = SigningKey::from_bytes(&hmac_output);
             let pseudonym_verifying_key = pseudonym_signing_key.verifying_key();
 
             // Store derived key in memory (pseudonyms are software-managed).
@@ -803,11 +802,10 @@ impl KeyCustody for FileKeyCustody {
             mac.update(&context_id);
             mac.update(&pseudonym_epoch.to_be_bytes());
             mac.update(b"scp-pseudonym-v2");
-            let hmac_output = mac.finalize().into_bytes();
-
-            let mut seed = Zeroizing::new([0u8; 32]);
-            seed.copy_from_slice(&hmac_output[..32]);
-            let pseudonym_signing_key = SigningKey::from_bytes(&seed);
+            let hmac_bytes = Zeroizing::new(mac.finalize().into_bytes());
+            let mut hmac_output = Zeroizing::new([0u8; 32]);
+            hmac_output.copy_from_slice(&hmac_bytes[..32]);
+            let pseudonym_signing_key = SigningKey::from_bytes(&hmac_output);
             let pseudonym_verifying_key = pseudonym_signing_key.verifying_key();
 
             let pseudo_handle = self.next_handle();

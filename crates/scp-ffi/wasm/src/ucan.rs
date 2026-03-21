@@ -40,6 +40,29 @@ const MAX_CHAIN_DEPTH: usize = 32;
 /// Must match `scp-core::crypto::ucan::validate::DEFAULT_CLOCK_SKEW_TOLERANCE_SECS`.
 const CLOCK_SKEW_TOLERANCE_SECS: u64 = 300;
 
+/// Returns the default capability ceiling for UCAN validation when no
+/// explicit ceiling is configured. Mirrors
+/// `scp_core::context::roles::default_ceiling().to_ucan_string_set()`.
+///
+/// Must be kept in sync with `scp-core/src/context/roles.rs::default_ceiling()`.
+fn wasm_default_ceiling() -> HashSet<String> {
+    [
+        "messages:read",
+        "messages:write",
+        "tool:register",
+        "tool_invoke:*",
+        "role:assign",
+        "member:invite",
+        "member:remove",
+        "governance:propose",
+        "governance:vote",
+        "context:close",
+    ]
+    .into_iter()
+    .map(String::from)
+    .collect()
+}
+
 /// Category A resource types — the closed set of UCAN capability resource
 /// types that modify the DID document (ADR-039).
 ///
@@ -576,10 +599,17 @@ fn validate_ucan_full(params: &UcanValidationParams<'_>) -> Result<(), String> {
     }
 
     // Step 8: Capability ceiling check.
+    // When the ceiling is empty (user passed `[]`), apply the default ceiling
+    // instead of skipping enforcement entirely — matching the NAPI and UniFFI
+    // bridges (#1495, #1419).
+    let effective_ceiling = if ceiling.is_empty() {
+        &wasm_default_ceiling()
+    } else {
+        ceiling
+    };
     let cap_name = required_cap.capability_name();
-    if !ceiling.is_empty()
-        && !ceiling.contains(&cap_name)
-        && !ceiling.contains(&format!("{}:*", required_cap.resource))
+    if !effective_ceiling.contains(&cap_name)
+        && !effective_ceiling.contains(&format!("{}:*", required_cap.resource))
     {
         return Err(format!("capability outside ceiling: {cap_name}"));
     }
@@ -992,6 +1022,7 @@ pub fn ucan_mint(
     _context: &WasmContextHandle,
     _member_did: String,
     _capabilities_json: String,
+    _proofs_json: Option<String>,
 ) -> Promise {
     future_to_promise(async {
         Err(ScpWasmError::Permission {
@@ -1911,13 +1942,17 @@ mod tests {
 
         // Pipeline should pass Category A (step 6b) because #active is allowed.
         // It will fail later at nonce validation (step 9).
+        // The ceiling must include did_document:update, otherwise the default
+        // ceiling (which does NOT include Category A capabilities) rejects it
+        // at step 8 before reaching step 9.
+        let ceiling: HashSet<String> = std::iter::once("did_document:update".to_owned()).collect();
         let result = validate_ucan_full(&UcanValidationParams {
             token: &parsed,
             capability: &format!("scp:ctx:{context_id}/did_document:update"),
             context_id,
             expected_aud_did: &did,
             proof_tokens: None,
-            ceiling: &HashSet::new(),
+            ceiling: &ceiling,
             creator_did: &did,
             revoked_cids: &HashSet::new(),
         });
