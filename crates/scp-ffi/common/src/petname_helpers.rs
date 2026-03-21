@@ -699,7 +699,7 @@ mod tests {
         {
             let guard = petname_maps().lock().expect("lock");
             let pm = guard.get(owner).expect("should exist");
-            let resolved = pm.resolve_petname("bob").expect("resolve_petname");
+            let resolved = pm.resolve_petname("bob", &scp_primitives::SystemClock);
             assert!(!resolved.is_empty());
         }
 
@@ -728,7 +728,9 @@ mod tests {
                 target: HandleTarget::Identity { did: did.clone() },
                 metadata: None,
             };
-            let result = registry.register(&params, &did).expect("register");
+            let result = registry
+                .register(&params, &did, &scp_primitives::SystemClock)
+                .expect("register");
             assert_eq!(
                 result.status,
                 scp_core::discovery::handles::HandleRegisterStatus::Registered
@@ -776,7 +778,9 @@ mod tests {
                 target: HandleTarget::Identity { did: did.clone() },
                 metadata: None,
             };
-            registry.register(&params, &did).expect("register");
+            registry
+                .register(&params, &did, &scp_primitives::SystemClock)
+                .expect("register");
         }
 
         let querier = LocalHandleQuerier;
@@ -818,7 +822,9 @@ mod tests {
                 target: HandleTarget::Identity { did: did.clone() },
                 metadata: None,
             };
-            registry.register(&params, &did).expect("register");
+            registry
+                .register(&params, &did, &scp_primitives::SystemClock)
+                .expect("register");
         }
 
         let querier = LocalHandleQuerier;

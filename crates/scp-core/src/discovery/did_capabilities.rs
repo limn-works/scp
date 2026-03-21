@@ -18,6 +18,7 @@ use serde::{Deserialize, Serialize};
 use scp_identity::dht_client::DhtClient;
 use scp_identity::document::DidDocument;
 use scp_identity::{DidDht, DidMethod};
+use scp_primitives::Clock;
 
 use crate::trust::CapabilityUri;
 
@@ -78,6 +79,7 @@ pub struct CapabilityEntry {
 pub async fn resolve_capabilities<D: DhtClient + 'static>(
     did: &str,
     did_dht: &DidDht<D>,
+    clock: &dyn Clock,
 ) -> Result<CapabilityEntry, DiscoveryError> {
     // Step 1: Resolve the DID document.
     let document = did_dht
@@ -86,7 +88,7 @@ pub async fn resolve_capabilities<D: DhtClient + 'static>(
         .map_err(|e| DiscoveryError::DidResolutionFailed(e.to_string()))?;
 
     // Step 2: Extract capabilities from the document.
-    extract_capabilities(did, &document)
+    extract_capabilities(did, &document, clock)
 }
 
 /// Extracts capabilities from a resolved DID document.
@@ -96,6 +98,7 @@ pub async fn resolve_capabilities<D: DhtClient + 'static>(
 fn extract_capabilities(
     did: &str,
     document: &DidDocument,
+    clock: &dyn Clock,
 ) -> Result<CapabilityEntry, DiscoveryError> {
     let capability_services: Vec<_> = document
         .service
@@ -121,7 +124,7 @@ fn extract_capabilities(
     let mut seen = std::collections::HashSet::new();
     capabilities.retain(|cap| seen.insert(cap.clone()));
 
-    let now = crate::time::now_secs()?;
+    let now = clock.now_secs();
 
     Ok(CapabilityEntry {
         did: did.into(),
@@ -340,7 +343,7 @@ mod tests {
                     .to_owned(),
         });
 
-        let entry = extract_capabilities(did, &doc).unwrap();
+        let entry = extract_capabilities(did, &doc, &scp_primitives::SystemClock).unwrap();
         // rate-limit-compliance/v1 appears in both but should be deduplicated.
         assert_eq!(entry.capabilities.len(), 3);
         assert_eq!(
@@ -363,7 +366,7 @@ mod tests {
         let did = "did:dht:zTestDid";
         let doc = DidDocument::new(did, &[1u8; 32], &[2u8; 32], &[3u8; 32]);
 
-        let err = extract_capabilities(did, &doc).unwrap_err();
+        let err = extract_capabilities(did, &doc, &scp_primitives::SystemClock).unwrap_err();
         assert!(matches!(err, DiscoveryError::NoCapabilitiesService(_)));
     }
 
@@ -380,7 +383,7 @@ mod tests {
                     .to_owned(),
         });
 
-        let entry = extract_capabilities(did, &doc).unwrap();
+        let entry = extract_capabilities(did, &doc, &scp_primitives::SystemClock).unwrap();
         assert_eq!(entry.did, did);
         assert_eq!(entry.capabilities.len(), 2);
         assert_eq!(
@@ -413,7 +416,9 @@ mod tests {
         )
         .await;
 
-        let entry = resolve_capabilities(&did, &did_dht).await.unwrap();
+        let entry = resolve_capabilities(&did, &did_dht, &scp_primitives::SystemClock)
+            .await
+            .unwrap();
 
         assert_eq!(entry.did, did);
         assert_eq!(entry.capabilities.len(), 2);
@@ -438,7 +443,7 @@ mod tests {
         let (identity, document) = did_dht.create(&*custody).await.unwrap();
         did_dht.publish(&identity, &document).await.unwrap();
 
-        let err = resolve_capabilities(&identity.did, &did_dht)
+        let err = resolve_capabilities(&identity.did, &did_dht, &scp_primitives::SystemClock)
             .await
             .unwrap_err();
         assert!(matches!(err, DiscoveryError::NoCapabilitiesService(_)));
@@ -448,9 +453,13 @@ mod tests {
     async fn resolve_capabilities_invalid_did_returns_error() {
         let did_dht = DidDht::new();
 
-        let err = resolve_capabilities("did:dht:zInvalidDid", &did_dht)
-            .await
-            .unwrap_err();
+        let err = resolve_capabilities(
+            "did:dht:zInvalidDid",
+            &did_dht,
+            &scp_primitives::SystemClock,
+        )
+        .await
+        .unwrap_err();
         assert!(matches!(err, DiscoveryError::DidResolutionFailed(_)));
     }
 
@@ -554,7 +563,7 @@ mod tests {
             service_endpoint: "scp:capabilities:scp:system:relay-operation,scp:system:bridge-operation".to_owned(),
         });
 
-        let entry = extract_capabilities(did, &doc).unwrap();
+        let entry = extract_capabilities(did, &doc, &scp_primitives::SystemClock).unwrap();
         // relay-operation appears in both but should be deduplicated.
         assert_eq!(entry.capabilities.len(), 3);
         assert_eq!(entry.capabilities[0], cap("scp:system:relay-operation"));

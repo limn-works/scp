@@ -20,6 +20,7 @@ use std::collections::HashMap;
 use serde::{Deserialize, Serialize};
 
 use scp_identity::DID;
+use scp_primitives::Clock;
 
 use super::ContextId;
 use super::addressing::{
@@ -241,11 +242,8 @@ impl PetnameMap {
 }
 
 impl PetnameStore for PetnameMap {
-    fn resolve_petname(
-        &self,
-        name: &str,
-    ) -> Result<Vec<AddressResolution>, crate::time::ClockError> {
-        let now = crate::time::now_secs()?;
+    fn resolve_petname(&self, name: &str, clock: &dyn Clock) -> Vec<AddressResolution> {
+        let now = clock.now_secs();
 
         let mut results = Vec::new();
 
@@ -279,7 +277,7 @@ impl PetnameStore for PetnameMap {
             });
         }
 
-        Ok(results)
+        results
     }
 }
 
@@ -498,7 +496,7 @@ mod tests {
         let mut map = PetnameMap::new();
         map.set_petname(DID::from("did:dht:zAlice"), "alice".to_owned());
 
-        let results = map.resolve_petname("alice").unwrap();
+        let results = map.resolve_petname("alice", &scp_primitives::SystemClock);
         assert_eq!(results.len(), 1);
         assert!(matches!(
             &results[0],
@@ -515,7 +513,7 @@ mod tests {
         let mut map = PetnameMap::new();
         map.set_context_petname("ctx-recipes".to_owned(), "recipes".to_owned());
 
-        let results = map.resolve_petname("recipes").unwrap();
+        let results = map.resolve_petname("recipes", &scp_primitives::SystemClock);
         assert_eq!(results.len(), 1);
         assert!(matches!(
             &results[0],
@@ -533,14 +531,14 @@ mod tests {
         map.set_petname(DID::from("did:dht:zAlice"), "shared".to_owned());
         map.set_context_petname("ctx-shared".to_owned(), "shared".to_owned());
 
-        let results = map.resolve_petname("shared").unwrap();
+        let results = map.resolve_petname("shared", &scp_primitives::SystemClock);
         assert_eq!(results.len(), 2);
     }
 
     #[test]
     fn petname_store_resolve_empty_returns_empty() {
         let map = PetnameMap::new();
-        let results = map.resolve_petname("nonexistent").unwrap();
+        let results = map.resolve_petname("nonexistent", &scp_primitives::SystemClock);
         assert!(results.is_empty());
     }
 }

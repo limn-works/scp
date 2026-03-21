@@ -55,6 +55,7 @@ use crate::crypto::ucan::validate::{
 use crate::economy::budget::MemberBudgetTracker;
 use crate::economy::types::EconomicPolicy;
 use scp_identity::DID;
+use scp_primitives::Clock;
 use tracing::instrument;
 use zeroize::Zeroizing;
 
@@ -1099,6 +1100,7 @@ fn mint_governance_tokens(
     context_id: &str,
     creator_did: &DID,
     engine: &dyn GovernanceEngine,
+    clock: &dyn Clock,
 ) -> Vec<super::roles::UcanToken> {
     use super::roles::{Capability, UcanAttestation, UcanToken};
 
@@ -1126,7 +1128,7 @@ fn mint_governance_tokens(
             // static nonce (acceptable for governance tokens minted at creation
             // time — replay prevention is handled by the engine's proposal-ID
             // scheme).
-            let nonce = crate::crypto::ucan::nonce::generate_nonce(&scp_primitives::SystemClock);
+            let nonce = crate::crypto::ucan::nonce::generate_nonce(clock);
             tokens.push(UcanToken {
                 iss: creator_did.to_string(),
                 aud: voter.to_string(),
@@ -1175,6 +1177,7 @@ pub struct ContextManagerBuilder {
     event_log: Option<Box<dyn ContextEventLogProvider>>,
     persistence: Option<Box<dyn ContextPersistence>>,
     key_resolver: Option<KeyResolver>,
+    clock: Option<Arc<dyn Clock>>,
 }
 
 impl ContextManagerBuilder {
@@ -1187,6 +1190,7 @@ impl ContextManagerBuilder {
             event_log: None,
             persistence: None,
             key_resolver: None,
+            clock: None,
         }
     }
 
@@ -1235,6 +1239,15 @@ impl ContextManagerBuilder {
         self
     }
 
+    /// Sets the clock for time-dependent operations.
+    ///
+    /// If not called, defaults to [`scp_primitives::SystemClock`].
+    #[must_use]
+    pub fn clock(mut self, clock: Arc<dyn Clock>) -> Self {
+        self.clock = Some(clock);
+        self
+    }
+
     /// Auto-wires persistence and event log from a single `EncryptedStorage` impl.
     ///
     /// Constructs a [`ProtocolRepository`](crate::store::ProtocolRepository), then
@@ -1280,7 +1293,11 @@ impl ContextManagerBuilder {
             .key_resolver
             .unwrap_or_else(|| Arc::new(|_: &DID| None));
 
-        Ok(match self.persistence {
+        let clock = self
+            .clock
+            .unwrap_or_else(|| Arc::new(scp_primitives::SystemClock));
+
+        let mut manager = match self.persistence {
             Some(persistence) => ContextManager::with_persistence(
                 crypto,
                 transport,
@@ -1289,7 +1306,9 @@ impl ContextManagerBuilder {
                 key_resolver,
             ),
             None => ContextManager::new(crypto, transport, event_log, key_resolver),
-        })
+        };
+        manager.clock = clock;
+        Ok(manager)
     }
 }
 
@@ -1366,6 +1385,11 @@ pub struct ContextManager {
     /// vote signature verification (spec §5.9, ADR-031). Passed through to
     /// governance engines at creation and restoration time.
     key_resolver: KeyResolver,
+    /// Clock for time-dependent operations.
+    ///
+    /// Injected via constructors / builder to allow test clock injection.
+    /// Defaults to [`scp_primitives::SystemClock`].
+    clock: Arc<dyn Clock>,
 }
 
 // Nursery lint — false-positives on async functions holding tokio::sync::MutexGuard
@@ -1398,6 +1422,7 @@ impl ContextManager {
             local_dids: RwLock::new(HashSet::new()),
             contexts: Arc::new(Mutex::new(HashMap::new())),
             key_resolver,
+            clock: Arc::new(scp_primitives::SystemClock),
         }
     }
 
@@ -1431,6 +1456,7 @@ impl ContextManager {
             local_dids: RwLock::new(HashSet::new()),
             contexts: Arc::new(Mutex::new(HashMap::new())),
             key_resolver,
+            clock: Arc::new(scp_primitives::SystemClock),
         }
     }
 
@@ -1742,7 +1768,7 @@ impl ContextManager {
             ttl_extension: None,
             broadcast_context: broadcast_ctx,
             executed_proposals: {
-                let now = crate::time::now_secs().unwrap_or(0);
+                let now = self.clock.now_secs();
                 ctx_snapshot
                     .executed_proposals
                     .into_iter()
@@ -2160,6 +2186,7 @@ impl ContextManager {
             mls_state,
             exporter_did,
             super::export_import::ExportScope::Full,
+            &*self.clock,
         )
     }
 
@@ -2266,7 +2293,7 @@ impl ContextManager {
             ttl_extension: None,
             broadcast_context: None,
             executed_proposals: {
-                let now = crate::time::now_secs().unwrap_or(0);
+                let now = self.clock.now_secs();
                 export
                     .snapshot
                     .executed_proposals
@@ -2672,8 +2699,12 @@ impl ContextManager {
 
         // Mint GovernancePropose and GovernanceVote UCAN tokens for designated
         // voters per ADR-031 §6 and store them in role_state.
-        let governance_tokens =
-            mint_governance_tokens(context_id, creator_did, governance_engine.as_ref());
+        let governance_tokens = mint_governance_tokens(
+            context_id,
+            creator_did,
+            governance_engine.as_ref(),
+            &*self.clock,
+        );
 
         let mut role_state = role_state;
         for token in &governance_tokens {
@@ -3057,8 +3088,7 @@ impl ContextManager {
                         "signing key required for broadcast publish".to_owned(),
                     )
                 })?;
-                let timestamp = crate::time::now_millis()
-                    .map_err(|e| ContextError::CryptoFailed(format!("clock error: {e}")))?;
+                let timestamp = self.clock.now_millis();
 
                 // Compute signing payload and sign externally, matching the
                 // pattern used by publish_broadcast (custody-based signing).
@@ -3675,8 +3705,7 @@ impl ContextManager {
                 .as_mut()
                 .ok_or_else(|| ContextError::MembershipFailed("not a broadcast context".into()))?;
 
-            let timestamp = crate::time::now_millis()
-                .map_err(|e| ContextError::CryptoFailed(format!("clock error: {e}")))?;
+            let timestamp = self.clock.now_millis();
 
             // Compute the signing payload externally so we can sign via
             // key custody (async) while keeping seal_broadcast synchronous.
@@ -3966,7 +3995,7 @@ impl ContextManager {
                         "governance proposal has already been executed".into(),
                     ));
                 }
-                let now = crate::time::now_secs().unwrap_or(0);
+                let now = self.clock.now_secs();
                 // Evict entries older than the TTL before inserting.
                 ctx.executed_proposals
                     .retain(|_, ts| now.saturating_sub(*ts) < EXECUTED_PROPOSALS_TTL_SECS);
@@ -5591,8 +5620,7 @@ impl ContextManager {
 
             // M7: Instead of applying immediately, enter notification period.
             // Members are notified and may leave before the expansion takes effect.
-            let now = crate::time::now_secs()
-                .map_err(|e| ContextError::PermissionDenied(format!("clock error: {e}")))?;
+            let now = self.clock.now_secs();
             let effective_at = now + CEILING_CHANGE_NOTIFICATION_PERIOD_SECS;
             ctx.pending_ceiling_modification = Some(PendingCeilingModification {
                 new_capabilities: new_ceiling.to_vec(),
@@ -6054,8 +6082,7 @@ impl ContextManager {
                     with: format!("scp:ctx:{context_id}/{cap}"),
                     can: "invoke".to_owned(),
                 };
-                let nonce =
-                    crate::crypto::ucan::nonce::generate_nonce(&scp_primitives::SystemClock);
+                let nonce = crate::crypto::ucan::nonce::generate_nonce(&*self.clock);
                 let token = roles::UcanToken {
                     iss: creator_did.clone(),
                     aud: did.to_string(),
@@ -6374,11 +6401,11 @@ impl ContextManager {
                     };
                     // Only invalidate the loser — the winner remains eligible
                     // for normal execution.
-                    let now = crate::time::now_secs().unwrap_or(0);
+                    let now = self.clock.now_secs();
                     ctx.executed_proposals.insert(*loser, now);
                 }
                 super::governance::ConflictResolution::InvalidateBoth => {
-                    let now = crate::time::now_secs().unwrap_or(0);
+                    let now = self.clock.now_secs();
                     ctx.executed_proposals.insert(*proposal_a, now);
                     ctx.executed_proposals.insert(*proposal_b, now);
                 }
@@ -6847,8 +6874,7 @@ impl ContextManager {
             }
 
             // §19.3: Stage the change with a 24-hour notification period.
-            let now = crate::time::now_secs()
-                .map_err(|e| ContextError::PermissionDenied(format!("clock error: {e}")))?;
+            let now = self.clock.now_secs();
             let effective_at = now + ECONOMIC_POLICY_NOTIFICATION_PERIOD_SECS;
             ctx.pending_economic_policy_change = Some(PendingEconomicPolicyChange {
                 new_policy: policy.clone(),
@@ -15588,7 +15614,12 @@ mod tests {
         };
         let engine =
             build_governance_engine(config, vec![creator.clone()], noop_key_resolver()).unwrap();
-        let tokens = mint_governance_tokens("ctx-ucan-test", &creator, engine.as_ref());
+        let tokens = mint_governance_tokens(
+            "ctx-ucan-test",
+            &creator,
+            engine.as_ref(),
+            &scp_primitives::SystemClock,
+        );
 
         // 3 signers x 2 capabilities (GovernancePropose + GovernanceVote) = 6 tokens.
         assert_eq!(tokens.len(), 6);
@@ -15625,7 +15656,12 @@ mod tests {
     async fn governance_ucan_tokens_minted_for_single_admin() {
         let creator: DID = "did:key:creator1".into();
         let engine = Box::new(SingleAdminEngine::new(creator.clone(), noop_key_resolver()));
-        let tokens = mint_governance_tokens("ctx-sa-ucan", &creator, engine.as_ref());
+        let tokens = mint_governance_tokens(
+            "ctx-sa-ucan",
+            &creator,
+            engine.as_ref(),
+            &scp_primitives::SystemClock,
+        );
 
         // 1 voter x 2 capabilities = 2 tokens.
         assert_eq!(tokens.len(), 2);

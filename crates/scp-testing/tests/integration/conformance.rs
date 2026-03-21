@@ -1368,7 +1368,9 @@ fn conf_030_handle_registration_lookup() {
         target: HandleTarget::Identity { did: did.clone() },
         metadata: None,
     };
-    let result = registry.register(&params, &did).expect("register");
+    let result = registry
+        .register(&params, &did, &scp_primitives::SystemClock)
+        .expect("register");
     assert!(
         result.entry_id.is_some(),
         "registration must return entry_id"
@@ -1413,7 +1415,9 @@ fn conf_031_agent_capability_search() {
         target: HandleTarget::Identity { did: did.clone() },
         metadata: None,
     };
-    registry.register(&params, &did).expect("register");
+    registry
+        .register(&params, &did, &scp_primitives::SystemClock)
+        .expect("register");
 
     print_step(2, "Lookup finds agent");
     let result = registry.lookup(&HandleLookupParams {

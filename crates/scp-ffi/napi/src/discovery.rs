@@ -484,7 +484,11 @@ pub fn handle_register(
         .entry(discovery_context_id.clone())
         .or_insert_with(|| HandleRegistry::new(discovery_context_id));
     let result = registry
-        .register(&params, &DID::from(registrant_did.as_str()))
+        .register(
+            &params,
+            &DID::from(registrant_did.as_str()),
+            &scp_primitives::SystemClock,
+        )
         .map_err(|e| {
             napi::Error::from(ScpNapiError::Validation {
                 message: format!("clock error during handle registration: {e}"),
@@ -633,7 +637,11 @@ pub fn scope_register(
         .or_insert_with(|| scp_core::discovery::ScopeRegistry::new(scope_context_id));
 
     let result = registry
-        .register(&params, &DID::from(registrant_did.as_str()))
+        .register(
+            &params,
+            &DID::from(registrant_did.as_str()),
+            &scp_primitives::SystemClock,
+        )
         .map_err(|e| {
             napi::Error::from(ScpNapiError::Validation {
                 message: format!("scope registration failed: {e}"),
@@ -788,6 +796,7 @@ pub async fn address_resolve(
             &querier,
             &known_contexts,
             &known_domains,
+            &scp_primitives::SystemClock,
         )
         .await
         .map_err(|e| {

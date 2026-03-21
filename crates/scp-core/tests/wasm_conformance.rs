@@ -4567,6 +4567,7 @@ fn wasm_handle_register_lookup_matches_core() {
                 metadata: None,
             },
             &DID::from("did:dht:zAlice"),
+            &scp_primitives::SystemClock,
         )
         .unwrap();
 
@@ -4641,11 +4642,15 @@ fn wasm_handle_same_owner_reregister_returns_conflict() {
     };
 
     // First registration succeeds.
-    let result1 = registry.register(&params, &alice_did).unwrap();
+    let result1 = registry
+        .register(&params, &alice_did, &scp_primitives::SystemClock)
+        .unwrap();
     assert_eq!(result1.status, HandleRegisterStatus::Registered);
 
     // Same owner, same handle — core returns Conflict, not idempotent success.
-    let result2 = registry.register(&params, &alice_did).unwrap();
+    let result2 = registry
+        .register(&params, &alice_did, &scp_primitives::SystemClock)
+        .unwrap();
     assert_eq!(
         result2.status,
         HandleRegisterStatus::Conflict,

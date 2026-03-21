@@ -16,6 +16,7 @@ use std::collections::HashMap;
 use serde::{Deserialize, Serialize};
 
 use scp_identity::DID;
+use scp_primitives::Clock;
 
 use super::ContextId;
 use super::addressing::AddressingError;
@@ -433,6 +434,7 @@ impl ScopeRegistry {
         &mut self,
         params: &ScopeRegisterParams,
         registrant_did: &DID,
+        clock: &dyn Clock,
     ) -> Result<ScopeRegisterResult, ScopeRegistryError> {
         // Validate the scope name
         validate_scope_name(&params.name)?;
@@ -483,7 +485,7 @@ impl ScopeRegistry {
         }
 
         let normalized = params.name.to_lowercase();
-        let now = crate::time::now_secs()?;
+        let now = clock.now_secs();
 
         // Same-owner re-registration → atomic update (avoids TOCTOU race)
         if let Some(existing) = self.entries.get_mut(&normalized) {
@@ -872,7 +874,11 @@ mod tests {
         };
 
         let result = registry
-            .register(&params, &DID::from("did:dht:zAdmin"))
+            .register(
+                &params,
+                &DID::from("did:dht:zAdmin"),
+                &scp_primitives::SystemClock,
+            )
             .unwrap();
         assert_eq!(result.status, ScopeRegisterStatus::Registered);
         assert!(result.entry_id.is_some());
@@ -891,7 +897,9 @@ mod tests {
             metadata: None,
         };
 
-        let r1 = registry.register(&params, &admin_did).unwrap();
+        let r1 = registry
+            .register(&params, &admin_did, &scp_primitives::SystemClock)
+            .unwrap();
         assert_eq!(r1.status, ScopeRegisterStatus::Registered);
 
         let params2 = ScopeRegisterParams {
@@ -899,7 +907,9 @@ mod tests {
             target: make_target("ctx-evil"),
             metadata: None,
         };
-        let r2 = registry.register(&params2, &eve_did).unwrap();
+        let r2 = registry
+            .register(&params2, &eve_did, &scp_primitives::SystemClock)
+            .unwrap();
         assert_eq!(r2.status, ScopeRegisterStatus::Conflict);
         assert!(r2.entry_id.is_none());
         // Original entry unchanged
@@ -916,7 +926,9 @@ mod tests {
             target: make_target("ctx-cooking-v1"),
             metadata: None,
         };
-        let r1 = registry.register(&params, &admin_did).unwrap();
+        let r1 = registry
+            .register(&params, &admin_did, &scp_primitives::SystemClock)
+            .unwrap();
         assert_eq!(r1.status, ScopeRegisterStatus::Registered);
         let original_entry_id = r1.entry_id.unwrap();
 
@@ -928,7 +940,9 @@ mod tests {
                 tags: None,
             }),
         };
-        let r2 = registry.register(&params2, &admin_did).unwrap();
+        let r2 = registry
+            .register(&params2, &admin_did, &scp_primitives::SystemClock)
+            .unwrap();
         assert_eq!(r2.status, ScopeRegisterStatus::Updated);
         assert_eq!(r2.entry_id.as_deref(), Some(original_entry_id.as_str()));
 
@@ -960,7 +974,9 @@ mod tests {
             target: make_target("ctx-cooking"),
             metadata: None,
         };
-        registry.register(&params, &admin_did).unwrap();
+        registry
+            .register(&params, &admin_did, &scp_primitives::SystemClock)
+            .unwrap();
 
         // Try to register same name — should return Updated (same owner)
         let params2 = ScopeRegisterParams {
@@ -968,7 +984,9 @@ mod tests {
             target: make_target("ctx-cooking-v2"),
             metadata: None,
         };
-        let r = registry.register(&params2, &admin_did).unwrap();
+        let r = registry
+            .register(&params2, &admin_did, &scp_primitives::SystemClock)
+            .unwrap();
         assert_eq!(r.status, ScopeRegisterStatus::Updated);
     }
 
@@ -982,6 +1000,7 @@ mod tests {
                 metadata: None,
             },
             &DID::from("did:dht:zAdmin"),
+            &scp_primitives::SystemClock,
         );
         assert!(result.is_err());
     }
@@ -999,6 +1018,7 @@ mod tests {
                 metadata: None,
             },
             &DID::from("did:dht:zAdmin"),
+            &scp_primitives::SystemClock,
         );
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
@@ -1018,6 +1038,7 @@ mod tests {
                 metadata: None,
             },
             &DID::from("did:dht:zAdmin"),
+            &scp_primitives::SystemClock,
         );
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
@@ -1038,6 +1059,7 @@ mod tests {
                 metadata: None,
             },
             &DID::from("did:dht:zAdmin"),
+            &scp_primitives::SystemClock,
         );
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
@@ -1057,6 +1079,7 @@ mod tests {
                 metadata: None,
             },
             &DID::from("did:dht:zAdmin"),
+            &scp_primitives::SystemClock,
         );
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
@@ -1076,6 +1099,7 @@ mod tests {
                 metadata: None,
             },
             &DID::from("did:dht:zAdmin"),
+            &scp_primitives::SystemClock,
         );
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
@@ -1098,6 +1122,7 @@ mod tests {
                 metadata: None,
             },
             &DID::from("did:dht:zAdmin"),
+            &scp_primitives::SystemClock,
         );
         assert!(result.is_ok());
     }
@@ -1115,6 +1140,7 @@ mod tests {
                 metadata: None,
             },
             &DID::from("did:dht:zAdmin"),
+            &scp_primitives::SystemClock,
         );
         assert!(result.is_err());
     }
@@ -1132,6 +1158,7 @@ mod tests {
                 }),
             },
             &DID::from("did:dht:zAdmin"),
+            &scp_primitives::SystemClock,
         );
         assert!(result.is_err());
     }
@@ -1150,6 +1177,7 @@ mod tests {
                 }),
             },
             &DID::from("did:dht:zAdmin"),
+            &scp_primitives::SystemClock,
         );
         assert!(result.is_err());
     }
@@ -1167,6 +1195,7 @@ mod tests {
                 }),
             },
             &DID::from("did:dht:zAdmin"),
+            &scp_primitives::SystemClock,
         );
         assert!(result.is_err());
     }
@@ -1186,6 +1215,7 @@ mod tests {
                     metadata: None,
                 },
                 &admin_did,
+                &scp_primitives::SystemClock,
             )
             .unwrap();
 
@@ -1226,6 +1256,7 @@ mod tests {
                     metadata: None,
                 },
                 &admin_did,
+                &scp_primitives::SystemClock,
             )
             .unwrap();
 
@@ -1253,6 +1284,7 @@ mod tests {
                     metadata: None,
                 },
                 &admin_did,
+                &scp_primitives::SystemClock,
             )
             .unwrap();
 
@@ -1294,6 +1326,7 @@ mod tests {
                     metadata: None,
                 },
                 &admin_did,
+                &scp_primitives::SystemClock,
             )
             .unwrap();
 
@@ -1312,6 +1345,7 @@ mod tests {
                     metadata: None,
                 },
                 &bob_did,
+                &scp_primitives::SystemClock,
             )
             .unwrap();
         assert_eq!(result.status, ScopeRegisterStatus::Registered);
@@ -1331,6 +1365,7 @@ mod tests {
                     metadata: None,
                 },
                 &DID::from("did:dht:zAdmin"),
+                &scp_primitives::SystemClock,
             )
             .unwrap();
 
@@ -1342,6 +1377,7 @@ mod tests {
                     metadata: None,
                 },
                 &DID::from("did:dht:zAdmin"),
+                &scp_primitives::SystemClock,
             )
             .unwrap();
 
@@ -1379,6 +1415,7 @@ mod tests {
                 }),
             },
             &DID::from("did:dht:zAdmin"),
+            &scp_primitives::SystemClock,
         );
         assert!(result.is_ok());
     }
@@ -1397,6 +1434,7 @@ mod tests {
                 }),
             },
             &DID::from("did:dht:zAdmin"),
+            &scp_primitives::SystemClock,
         );
         assert!(result.is_ok());
     }
@@ -1414,6 +1452,7 @@ mod tests {
                 }),
             },
             &DID::from("did:dht:zAdmin"),
+            &scp_primitives::SystemClock,
         );
         assert!(result.is_ok());
     }

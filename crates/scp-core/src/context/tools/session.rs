@@ -25,6 +25,8 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
+use scp_primitives::Clock;
+
 use super::invoke::has_tool_invoke_capability;
 use super::registry::ToolRegistry;
 use super::schema::validate_value_against_schema;
@@ -210,6 +212,7 @@ pub async fn create_session(
     tool_id: &ToolId,
     source_context: &ContextId,
     ttl: Option<Duration>,
+    clock: &dyn Clock,
 ) -> Result<String, ToolError> {
     // Validate context is Active.
     let state = context.state().await;
@@ -242,7 +245,7 @@ pub async fn create_session(
     }
 
     let session_id = uuid::Uuid::new_v4().to_string();
-    let now_ms = crate::time::now_millis()?;
+    let now_ms = clock.now_millis();
 
     let session = ToolSession {
         session_id: session_id.clone(),
@@ -304,6 +307,7 @@ pub async fn invoke_session<F, Fut>(
     input: serde_json::Value,
     invoker_did: &DID,
     executor: F,
+    clock: &dyn Clock,
 ) -> Result<serde_json::Value, ToolError>
 where
     F: FnOnce(serde_json::Value, serde_json::Value) -> Fut,
@@ -325,7 +329,7 @@ where
         })?;
 
     // Check expiry.
-    let now_ms = crate::time::now_millis()?;
+    let now_ms = clock.now_millis();
     if session.is_expired(now_ms) {
         // Remove the expired session.
         store.remove(session_id);
@@ -643,6 +647,7 @@ mod tests {
             &"calculator".to_owned(),
             &"ctx-source".to_owned(),
             Some(Duration::from_secs(300)),
+            &scp_primitives::SystemClock,
         )
         .await;
 
@@ -678,6 +683,7 @@ mod tests {
             &"calculator".to_owned(),
             &"ctx-source".to_owned(),
             Some(Duration::from_secs(300)),
+            &scp_primitives::SystemClock,
         )
         .await;
 
@@ -703,6 +709,7 @@ mod tests {
             &"nonexistent-tool".to_owned(),
             &"ctx-source".to_owned(),
             Some(Duration::from_secs(300)),
+            &scp_primitives::SystemClock,
         )
         .await;
 
@@ -741,6 +748,7 @@ mod tests {
                 &"calculator".to_owned(),
                 &source_ctx,
                 Some(Duration::from_secs(300)),
+                &scp_primitives::SystemClock,
             )
             .await;
             assert!(
@@ -759,6 +767,7 @@ mod tests {
             &"calculator".to_owned(),
             &source_ctx,
             Some(Duration::from_secs(300)),
+            &scp_primitives::SystemClock,
         )
         .await;
 
@@ -808,6 +817,7 @@ mod tests {
                 &"calculator".to_owned(),
                 &"ctx-caller-a".to_owned(),
                 Some(Duration::from_secs(300)),
+                &scp_primitives::SystemClock,
             )
             .await
             .unwrap();
@@ -821,6 +831,7 @@ mod tests {
             &"calculator".to_owned(),
             &"ctx-caller-b".to_owned(),
             Some(Duration::from_secs(300)),
+            &scp_primitives::SystemClock,
         )
         .await;
 
@@ -862,6 +873,7 @@ mod tests {
             serde_json::json!({"a": 1, "b": 2}),
             &DID::from(creator_did),
             add_executor,
+            &scp_primitives::SystemClock,
         )
         .await;
 
@@ -954,6 +966,7 @@ mod tests {
             &"calculator".to_owned(),
             &"ctx-source".to_owned(),
             Some(Duration::from_secs(300)),
+            &scp_primitives::SystemClock,
         )
         .await
         .unwrap();
@@ -968,6 +981,7 @@ mod tests {
             serde_json::json!({"a": 1, "b": 2}),
             &DID::from(creator_did),
             add_executor,
+            &scp_primitives::SystemClock,
         )
         .await;
         assert!(
@@ -986,6 +1000,7 @@ mod tests {
             serde_json::json!({"a": 3, "b": 4}),
             &DID::from(member_did),
             add_executor,
+            &scp_primitives::SystemClock,
         )
         .await;
         assert!(result.is_err());
@@ -1017,6 +1032,7 @@ mod tests {
             serde_json::json!({"a": 1, "b": 2}),
             &DID::from(creator_did),
             add_executor,
+            &scp_primitives::SystemClock,
         )
         .await;
 
@@ -1046,6 +1062,7 @@ mod tests {
             &"calculator".to_owned(),
             &"ctx-source".to_owned(),
             Some(Duration::from_secs(300)),
+            &scp_primitives::SystemClock,
         )
         .await
         .unwrap();
@@ -1060,6 +1077,7 @@ mod tests {
             serde_json::json!({"a": 1, "b": 2}),
             &DID::from(creator_did),
             add_executor,
+            &scp_primitives::SystemClock,
         )
         .await
         .unwrap();
@@ -1079,6 +1097,7 @@ mod tests {
             serde_json::json!({"a": 10, "b": 20}),
             &DID::from(creator_did),
             add_executor,
+            &scp_primitives::SystemClock,
         )
         .await
         .unwrap();
@@ -1108,7 +1127,7 @@ mod tests {
             tool_id: "calculator".to_owned(),
             source_context: "ctx-source".to_owned(),
             state: serde_json::Value::Null,
-            created_at: crate::time::now_millis().unwrap(),
+            created_at: scp_primitives::SystemClock.now_millis(),
             ttl: Some(Duration::from_secs(300)),
             call_count: 0,
         });
@@ -1122,6 +1141,7 @@ mod tests {
             serde_json::json!({"a": 1, "b": 2}),
             &DID::from(creator_did),
             add_executor,
+            &scp_primitives::SystemClock,
         )
         .await;
 
@@ -1174,6 +1194,7 @@ mod tests {
             &"calculator".to_owned(),
             &"ctx-source".to_owned(),
             Some(Duration::from_secs(300)),
+            &scp_primitives::SystemClock,
         )
         .await
         .unwrap();
@@ -1192,6 +1213,7 @@ mod tests {
             serde_json::json!({"a": 1, "b": 2}),
             &DID::from(creator_did),
             failing_executor,
+            &scp_primitives::SystemClock,
         )
         .await;
 

@@ -21,6 +21,7 @@
 use std::collections::HashMap;
 use std::time::Duration;
 
+use scp_primitives::Clock;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
@@ -318,12 +319,13 @@ impl RateLimit {
     /// # Errors
     ///
     /// Returns [`crate::time::ClockError`] if the system clock is unavailable.
-    pub fn new(max_calls: u64, window: Duration) -> Result<Self, crate::time::ClockError> {
+    pub fn new(max_calls: u64, window: Duration, clock: &dyn Clock) -> Self {
         Self::with_burst(
             max_calls,
             window,
             DEFAULT_BURST_ALLOWANCE,
             Duration::from_secs(DEFAULT_BURST_WINDOW_SECS),
+            clock,
         )
     }
 
@@ -339,9 +341,10 @@ impl RateLimit {
         window: Duration,
         burst_allowance: u32,
         burst_window: Duration,
-    ) -> Result<Self, crate::time::ClockError> {
-        let now = crate::time::now_millis()?;
-        Ok(Self {
+        clock: &dyn Clock,
+    ) -> Self {
+        let now = clock.now_millis();
+        Self {
             max_calls,
             window,
             current_count: 0,
@@ -350,7 +353,7 @@ impl RateLimit {
             burst_window,
             burst_count: 0,
             burst_window_start: now,
-        })
+        }
     }
 
     /// Checks whether a call is permitted under the current rate limit.
@@ -367,8 +370,8 @@ impl RateLimit {
     ///
     /// Returns [`crate::time::ClockError`] if the system clock is unavailable.
     #[allow(clippy::cast_possible_truncation)]
-    fn check_and_increment(&mut self) -> Result<bool, crate::time::ClockError> {
-        let now = crate::time::now_millis()?;
+    fn check_and_increment(&mut self, clock: &dyn Clock) -> bool {
+        let now = clock.now_millis();
         // Window durations are always far below u64::MAX milliseconds.
         let window_ms = self.window.as_millis() as u64;
 
@@ -382,7 +385,7 @@ impl RateLimit {
 
         if self.current_count < self.max_calls {
             self.current_count += 1;
-            Ok(true)
+            true
         } else if self.burst_allowance > 0 {
             // Base limit exhausted — try burst allowance (spec §6.2.0.2).
             // The burst window is a deadline: all burst calls must occur within
@@ -400,17 +403,17 @@ impl RateLimit {
 
             // If the burst window has expired, burst is dead until base resets.
             if now.saturating_sub(self.burst_window_start) >= burst_window_ms {
-                return Ok(false);
+                return false;
             }
 
             if self.burst_count < self.burst_allowance {
                 self.burst_count += 1;
-                Ok(true)
+                true
             } else {
-                Ok(false)
+                false
             }
         } else {
-            Ok(false)
+            false
         }
     }
 
@@ -424,13 +427,13 @@ impl RateLimit {
     ///
     /// Returns [`crate::time::ClockError`] if the system clock is unavailable.
     #[allow(clippy::cast_possible_truncation)]
-    pub fn retry_after_secs(&self) -> Result<u64, crate::time::ClockError> {
-        let now = crate::time::now_millis()?;
+    pub fn retry_after_secs(&self, clock: &dyn Clock) -> u64 {
+        let now = clock.now_millis();
         let window_ms = self.window.as_millis() as u64;
         let elapsed = now.saturating_sub(self.window_start);
         let remaining_ms = window_ms.saturating_sub(elapsed);
         // Ceiling division: round up so callers never retry too early.
-        Ok(remaining_ms.div_ceil(1000))
+        remaining_ms.div_ceil(1000)
     }
 }
 
@@ -548,11 +551,8 @@ impl PerCallerRateLimit {
     ///
     /// Returns [`crate::time::ClockError`] if the system clock is unavailable.
     #[allow(clippy::cast_possible_truncation)]
-    pub fn check_and_increment(
-        &mut self,
-        caller_did: &DID,
-    ) -> Result<bool, crate::time::ClockError> {
-        let now = crate::time::now_millis()?;
+    pub fn check_and_increment(&mut self, caller_did: &DID, clock: &dyn Clock) -> bool {
+        let now = clock.now_millis();
         // Window durations are always far below u64::MAX milliseconds.
         let window_ms = self.window.as_millis() as u64;
 
@@ -561,7 +561,7 @@ impl PerCallerRateLimit {
             self.evict_expired(now);
             // After eviction, if still at capacity and this is a new caller, reject.
             if self.callers.len() >= MAX_TRACKED_CALLERS && !self.callers.contains_key(caller_did) {
-                return Ok(false);
+                return false;
             }
         }
 
@@ -585,7 +585,7 @@ impl PerCallerRateLimit {
 
         if state.count < self.max_calls_per_caller {
             state.count += 1;
-            Ok(true)
+            true
         } else if self.burst_allowance > 0 {
             // Base limit exhausted — try burst allowance (spec §6.2.0.2).
             // The burst window is a deadline: all burst calls must occur within
@@ -603,17 +603,17 @@ impl PerCallerRateLimit {
 
             // If the burst window has expired, burst is dead until base resets.
             if now.saturating_sub(state.burst_window_start) >= burst_window_ms {
-                return Ok(false);
+                return false;
             }
 
             if state.burst_count < self.burst_allowance {
                 state.burst_count += 1;
-                Ok(true)
+                true
             } else {
-                Ok(false)
+                false
             }
         } else {
-            Ok(false)
+            false
         }
     }
 
@@ -627,16 +627,16 @@ impl PerCallerRateLimit {
     ///
     /// Returns [`crate::time::ClockError`] if the system clock is unavailable.
     #[allow(clippy::cast_possible_truncation)]
-    pub fn retry_after_secs_for(&self, caller_did: &DID) -> Result<u64, crate::time::ClockError> {
-        let now = crate::time::now_millis()?;
+    pub fn retry_after_secs_for(&self, caller_did: &DID, clock: &dyn Clock) -> u64 {
+        let now = clock.now_millis();
         let window_ms = self.window.as_millis() as u64;
         let Some(state) = self.callers.get(caller_did) else {
-            return Ok(0);
+            return 0;
         };
         let elapsed = now.saturating_sub(state.window_start);
         let remaining_ms = window_ms.saturating_sub(elapsed);
         // Ceiling division: round up so callers never retry too early.
-        Ok(remaining_ms.div_ceil(1000))
+        remaining_ms.div_ceil(1000)
     }
 }
 
@@ -945,6 +945,7 @@ pub fn invoke_cross_context<F>(
     target_registry: &ToolRegistry,
     chain_depth: u8,
     executor: F,
+    clock: &dyn Clock,
 ) -> Result<
     (
         serde_json::Value,
@@ -985,11 +986,11 @@ where
     // 2. Check per-interface rate limit (spec §6.2.0.2).
     #[allow(clippy::cast_possible_truncation)]
     if let Some(ref mut rate_limit) = interface.rate_limit
-        && !rate_limit.check_and_increment()?
+        && !rate_limit.check_and_increment(clock)
     {
         // Window durations are always far below u64::MAX milliseconds.
         let window_ms = rate_limit.window.as_millis() as u64;
-        let retry_after_secs = rate_limit.retry_after_secs()?;
+        let retry_after_secs = rate_limit.retry_after_secs(clock);
         return Err(ToolError::InterfaceRateLimited {
             max_calls: rate_limit.max_calls,
             window_ms,
@@ -1000,10 +1001,10 @@ where
     // 3. Check per-caller rate limit independently (spec §6.2.0.2).
     #[allow(clippy::cast_possible_truncation)]
     if let Some(ref mut per_caller_rl) = interface.per_caller_rate_limit
-        && !per_caller_rl.check_and_increment(invoker_did)?
+        && !per_caller_rl.check_and_increment(invoker_did, clock)
     {
         let window_ms = per_caller_rl.window.as_millis() as u64;
-        let retry_after_secs = per_caller_rl.retry_after_secs_for(invoker_did)?;
+        let retry_after_secs = per_caller_rl.retry_after_secs_for(invoker_did, clock);
         return Err(ToolError::InterfaceRateLimited {
             max_calls: per_caller_rl.max_calls_per_caller,
             window_ms,
@@ -1328,7 +1329,7 @@ mod tests {
         let source_context = test_context("ctx-source");
         let registry = setup_registry_with_tool(&source_role_state, admin_did);
 
-        let rate_limit = RateLimit::new(10, Duration::from_secs(60)).unwrap();
+        let rate_limit = RateLimit::new(10, Duration::from_secs(60), &scp_primitives::SystemClock);
         let interface = expose_tool(
             &source_context,
             &"calculator".to_owned(),
@@ -1500,6 +1501,7 @@ mod tests {
             &target_registry,
             0,
             add_executor,
+            &scp_primitives::SystemClock,
         )
         .unwrap();
 
@@ -1556,6 +1558,7 @@ mod tests {
             &target_registry,
             0,
             add_executor,
+            &scp_primitives::SystemClock,
         );
 
         assert!(result.is_err());
@@ -1601,6 +1604,7 @@ mod tests {
             &target_registry,
             0,
             add_executor,
+            &scp_primitives::SystemClock,
         );
 
         assert!(result.is_err());
@@ -1646,6 +1650,7 @@ mod tests {
             &target_registry,
             0,
             add_executor,
+            &scp_primitives::SystemClock,
         );
 
         assert!(result.is_err());
@@ -1672,10 +1677,13 @@ mod tests {
             target_context: "ctx-target".to_owned(),
             tool_id: "calculator".to_owned(),
             // Zero burst to test base limit rejection.
-            rate_limit: Some(
-                RateLimit::with_burst(2, Duration::from_secs(3600), 0, Duration::from_secs(1))
-                    .unwrap(),
-            ),
+            rate_limit: Some(RateLimit::with_burst(
+                2,
+                Duration::from_secs(3600),
+                0,
+                Duration::from_secs(1),
+                &scp_primitives::SystemClock,
+            )),
             per_caller_rate_limit: None,
             approved_by_source: true,
             approved_by_target: true,
@@ -1695,6 +1703,7 @@ mod tests {
             &target_registry,
             0,
             add_executor,
+            &scp_primitives::SystemClock,
         );
         assert!(result1.is_ok(), "first call should succeed");
 
@@ -1708,6 +1717,7 @@ mod tests {
             &target_registry,
             0,
             add_executor,
+            &scp_primitives::SystemClock,
         );
         assert!(result2.is_ok(), "second call should succeed");
 
@@ -1721,6 +1731,7 @@ mod tests {
             &target_registry,
             0,
             add_executor,
+            &scp_primitives::SystemClock,
         );
         assert!(result3.is_err());
         let err = result3.unwrap_err();
@@ -1764,6 +1775,7 @@ mod tests {
             &target_registry,
             0,
             add_executor,
+            &scp_primitives::SystemClock,
         )
         .unwrap();
 
@@ -1828,6 +1840,7 @@ mod tests {
             &target_registry,
             0,
             add_executor,
+            &scp_primitives::SystemClock,
         );
 
         assert!(result.is_err());
@@ -1869,6 +1882,7 @@ mod tests {
             &target_registry,
             0,
             add_executor,
+            &scp_primitives::SystemClock,
         );
 
         assert!(result.is_err());
@@ -1897,7 +1911,7 @@ mod tests {
         };
 
         // Window should have expired, so this should succeed and reset.
-        assert!(rl.check_and_increment().unwrap());
+        assert!(rl.check_and_increment(&scp_primitives::SystemClock));
         assert_eq!(rl.current_count, 1);
     }
 
@@ -1932,7 +1946,11 @@ mod tests {
             source_context: "ctx-a".to_owned(),
             target_context: "ctx-b".to_owned(),
             tool_id: "tool-1".to_owned(),
-            rate_limit: Some(RateLimit::new(50, Duration::from_secs(120)).unwrap()),
+            rate_limit: Some(RateLimit::new(
+                50,
+                Duration::from_secs(120),
+                &scp_primitives::SystemClock,
+            )),
             per_caller_rate_limit: None,
             approved_by_source: true,
             approved_by_target: false,
@@ -2006,6 +2024,7 @@ mod tests {
             &target_registry,
             9,
             add_executor,
+            &scp_primitives::SystemClock,
         );
 
         assert!(result.is_err());
@@ -2052,6 +2071,7 @@ mod tests {
             &target_registry,
             8,
             add_executor,
+            &scp_primitives::SystemClock,
         );
 
         assert!(
@@ -2097,6 +2117,7 @@ mod tests {
             &target_registry,
             0,
             failing_executor,
+            &scp_primitives::SystemClock,
         );
 
         assert!(result.is_err());
@@ -2175,14 +2196,14 @@ mod tests {
         let bob: DID = "did:dht:z6MkBob".into();
 
         // Alice: 2 calls allowed
-        assert!(rl.check_and_increment(&alice).unwrap());
-        assert!(rl.check_and_increment(&alice).unwrap());
-        assert!(!rl.check_and_increment(&alice).unwrap());
+        assert!(rl.check_and_increment(&alice, &scp_primitives::SystemClock));
+        assert!(rl.check_and_increment(&alice, &scp_primitives::SystemClock));
+        assert!(!rl.check_and_increment(&alice, &scp_primitives::SystemClock));
 
         // Bob: still has 2 calls
-        assert!(rl.check_and_increment(&bob).unwrap());
-        assert!(rl.check_and_increment(&bob).unwrap());
-        assert!(!rl.check_and_increment(&bob).unwrap());
+        assert!(rl.check_and_increment(&bob, &scp_primitives::SystemClock));
+        assert!(rl.check_and_increment(&bob, &scp_primitives::SystemClock));
+        assert!(!rl.check_and_increment(&bob, &scp_primitives::SystemClock));
     }
 
     #[test]
@@ -2193,14 +2214,14 @@ mod tests {
             PerCallerRateLimit::with_burst(1, Duration::from_secs(3600), 0, Duration::from_secs(1));
         let alice: DID = "did:dht:z6MkAlice".into();
 
-        assert!(rl.check_and_increment(&alice).unwrap());
-        assert!(!rl.check_and_increment(&alice).unwrap());
+        assert!(rl.check_and_increment(&alice, &scp_primitives::SystemClock));
+        assert!(!rl.check_and_increment(&alice, &scp_primitives::SystemClock));
 
         // Set the window start far in the past to simulate window expiry.
         if let Some(state) = rl.callers.get_mut(&alice) {
             state.window_start = 0;
         }
-        assert!(rl.check_and_increment(&alice).unwrap());
+        assert!(rl.check_and_increment(&alice, &scp_primitives::SystemClock));
     }
 
     // -----------------------------------------------------------------------
@@ -2291,6 +2312,7 @@ mod tests {
             &target_registry,
             1,
             add_executor,
+            &scp_primitives::SystemClock,
         );
         assert!(result.is_ok());
 
@@ -2304,6 +2326,7 @@ mod tests {
             &target_registry,
             2,
             add_executor,
+            &scp_primitives::SystemClock,
         );
         assert!(result.is_err());
         let err = result.unwrap_err();
@@ -2339,24 +2362,29 @@ mod tests {
     #[test]
     fn rate_limit_burst_allows_calls_above_base_limit() {
         // Base limit: 2 calls, burst allowance: 5 within 1 second.
-        let mut rl =
-            RateLimit::with_burst(2, Duration::from_secs(3600), 5, Duration::from_secs(1)).unwrap();
+        let mut rl = RateLimit::with_burst(
+            2,
+            Duration::from_secs(3600),
+            5,
+            Duration::from_secs(1),
+            &scp_primitives::SystemClock,
+        );
 
         // First 2 calls: within base limit.
-        assert!(rl.check_and_increment().unwrap());
-        assert!(rl.check_and_increment().unwrap());
+        assert!(rl.check_and_increment(&scp_primitives::SystemClock));
+        assert!(rl.check_and_increment(&scp_primitives::SystemClock));
 
         // Next 5 calls: within burst allowance.
         for i in 0..5 {
             assert!(
-                rl.check_and_increment().unwrap(),
+                rl.check_and_increment(&scp_primitives::SystemClock),
                 "burst call {i} should succeed"
             );
         }
 
         // 8th call (6th above base): exceeds burst allowance.
         assert!(
-            !rl.check_and_increment().unwrap(),
+            !rl.check_and_increment(&scp_primitives::SystemClock),
             "call beyond burst allowance should fail"
         );
     }
@@ -2370,38 +2398,43 @@ mod tests {
             Duration::from_secs(3600),
             DEFAULT_BURST_ALLOWANCE,
             Duration::from_secs(DEFAULT_BURST_WINDOW_SECS),
-        )
-        .unwrap();
+            &scp_primitives::SystemClock,
+        );
 
         // Base call.
         assert!(
-            rl.check_and_increment().unwrap(),
+            rl.check_and_increment(&scp_primitives::SystemClock),
             "base call should succeed"
         );
 
         // 5 burst calls above the limit.
         for i in 0..5 {
             assert!(
-                rl.check_and_increment().unwrap(),
+                rl.check_and_increment(&scp_primitives::SystemClock),
                 "burst call {i} should succeed"
             );
         }
 
         // 6th call above the limit: must fail.
         assert!(
-            !rl.check_and_increment().unwrap(),
+            !rl.check_and_increment(&scp_primitives::SystemClock),
             "6th call above limit should fail"
         );
     }
 
     #[test]
     fn rate_limit_zero_burst_disables_burst() {
-        let mut rl =
-            RateLimit::with_burst(1, Duration::from_secs(3600), 0, Duration::from_secs(1)).unwrap();
+        let mut rl = RateLimit::with_burst(
+            1,
+            Duration::from_secs(3600),
+            0,
+            Duration::from_secs(1),
+            &scp_primitives::SystemClock,
+        );
 
-        assert!(rl.check_and_increment().unwrap());
+        assert!(rl.check_and_increment(&scp_primitives::SystemClock));
         // With zero burst, immediately fails after base limit.
-        assert!(!rl.check_and_increment().unwrap());
+        assert!(!rl.check_and_increment(&scp_primitives::SystemClock));
     }
 
     #[test]
@@ -2411,15 +2444,15 @@ mod tests {
             Duration::from_secs(60),
             100, // Above MAX_BURST_ALLOWANCE (50)
             Duration::from_secs(1),
-        )
-        .unwrap();
+            &scp_primitives::SystemClock,
+        );
 
         assert_eq!(rl.burst_allowance, MAX_BURST_ALLOWANCE);
     }
 
     #[test]
     fn rate_limit_new_has_default_burst() {
-        let rl = RateLimit::new(60, Duration::from_secs(60)).unwrap();
+        let rl = RateLimit::new(60, Duration::from_secs(60), &scp_primitives::SystemClock);
         assert_eq!(rl.burst_allowance, DEFAULT_BURST_ALLOWANCE);
         assert_eq!(
             rl.burst_window,
@@ -2435,19 +2468,19 @@ mod tests {
         let alice: DID = "did:dht:z6MkAlice".into();
 
         // Base: 2 calls.
-        assert!(rl.check_and_increment(&alice).unwrap());
-        assert!(rl.check_and_increment(&alice).unwrap());
+        assert!(rl.check_and_increment(&alice, &scp_primitives::SystemClock));
+        assert!(rl.check_and_increment(&alice, &scp_primitives::SystemClock));
 
         // Burst: 5 calls.
         for i in 0..5 {
             assert!(
-                rl.check_and_increment(&alice).unwrap(),
+                rl.check_and_increment(&alice, &scp_primitives::SystemClock),
                 "burst call {i} should succeed"
             );
         }
 
         // 6th above base: fails.
-        assert!(!rl.check_and_increment(&alice).unwrap());
+        assert!(!rl.check_and_increment(&alice, &scp_primitives::SystemClock));
     }
 
     #[test]
@@ -2458,16 +2491,16 @@ mod tests {
         let bob: DID = "did:dht:z6MkBob".into();
 
         // Alice exhausts base + burst.
-        assert!(rl.check_and_increment(&alice).unwrap()); // base
-        assert!(rl.check_and_increment(&alice).unwrap()); // burst 1
-        assert!(rl.check_and_increment(&alice).unwrap()); // burst 2
-        assert!(!rl.check_and_increment(&alice).unwrap()); // over
+        assert!(rl.check_and_increment(&alice, &scp_primitives::SystemClock)); // base
+        assert!(rl.check_and_increment(&alice, &scp_primitives::SystemClock)); // burst 1
+        assert!(rl.check_and_increment(&alice, &scp_primitives::SystemClock)); // burst 2
+        assert!(!rl.check_and_increment(&alice, &scp_primitives::SystemClock)); // over
 
         // Bob still has full base + burst.
-        assert!(rl.check_and_increment(&bob).unwrap());
-        assert!(rl.check_and_increment(&bob).unwrap());
-        assert!(rl.check_and_increment(&bob).unwrap());
-        assert!(!rl.check_and_increment(&bob).unwrap());
+        assert!(rl.check_and_increment(&bob, &scp_primitives::SystemClock));
+        assert!(rl.check_and_increment(&bob, &scp_primitives::SystemClock));
+        assert!(rl.check_and_increment(&bob, &scp_primitives::SystemClock));
+        assert!(!rl.check_and_increment(&bob, &scp_primitives::SystemClock));
     }
 
     #[test]
@@ -2504,10 +2537,13 @@ mod tests {
             source_context: "ctx-source".to_owned(),
             target_context: "ctx-target".to_owned(),
             tool_id: "calculator".to_owned(),
-            rate_limit: Some(
-                RateLimit::with_burst(2, Duration::from_secs(3600), 5, Duration::from_secs(1))
-                    .unwrap(),
-            ),
+            rate_limit: Some(RateLimit::with_burst(
+                2,
+                Duration::from_secs(3600),
+                5,
+                Duration::from_secs(1),
+                &scp_primitives::SystemClock,
+            )),
             per_caller_rate_limit: None,
             approved_by_source: true,
             approved_by_target: true,
@@ -2528,6 +2564,7 @@ mod tests {
                 &target_registry,
                 0,
                 add_executor,
+                &scp_primitives::SystemClock,
             );
             assert!(result.is_ok(), "base call {i} should succeed");
         }
@@ -2543,6 +2580,7 @@ mod tests {
                 &target_registry,
                 0,
                 add_executor,
+                &scp_primitives::SystemClock,
             );
             assert!(result.is_ok(), "burst call {i} should succeed");
         }
@@ -2557,6 +2595,7 @@ mod tests {
             &target_registry,
             0,
             add_executor,
+            &scp_primitives::SystemClock,
         );
         assert!(result.is_err());
         let err = result.unwrap_err();
@@ -2578,12 +2617,23 @@ mod tests {
         // causes the burst window to appear already expired.
         //
         // Setup: 2 base calls, 1-hour window, 5 burst calls, 1s burst window.
-        let mut rl =
-            RateLimit::with_burst(2, Duration::from_secs(3600), 5, Duration::from_secs(1)).unwrap();
+        let mut rl = RateLimit::with_burst(
+            2,
+            Duration::from_secs(3600),
+            5,
+            Duration::from_secs(1),
+            &scp_primitives::SystemClock,
+        );
 
         // Consume the 2 base calls.
-        assert!(rl.check_and_increment().unwrap(), "base call 1");
-        assert!(rl.check_and_increment().unwrap(), "base call 2");
+        assert!(
+            rl.check_and_increment(&scp_primitives::SystemClock),
+            "base call 1"
+        );
+        assert!(
+            rl.check_and_increment(&scp_primitives::SystemClock),
+            "base call 2"
+        );
 
         // Simulate being 30 seconds into the base window: push burst_window_start
         // 30s into the past to mimic the scenario where construction happened
@@ -2594,14 +2644,14 @@ mod tests {
         // burst_window_start to now, so all burst calls should succeed.
         for i in 1..=5 {
             assert!(
-                rl.check_and_increment().unwrap(),
+                rl.check_and_increment(&scp_primitives::SystemClock),
                 "burst call {i} should succeed — burst window lazily initialized"
             );
         }
 
         // 6th burst call should fail (burst allowance exhausted).
         assert!(
-            !rl.check_and_increment().unwrap(),
+            !rl.check_and_increment(&scp_primitives::SystemClock),
             "burst call 6 should fail — burst allowance exhausted"
         );
     }
@@ -2614,8 +2664,14 @@ mod tests {
         let alice: DID = "did:dht:z6MkAlice".into();
 
         // Consume the 2 base calls.
-        assert!(rl.check_and_increment(&alice).unwrap(), "base call 1");
-        assert!(rl.check_and_increment(&alice).unwrap(), "base call 2");
+        assert!(
+            rl.check_and_increment(&alice, &scp_primitives::SystemClock),
+            "base call 1"
+        );
+        assert!(
+            rl.check_and_increment(&alice, &scp_primitives::SystemClock),
+            "base call 2"
+        );
 
         // Simulate being 30 seconds into the base window.
         if let Some(state) = rl.callers.get_mut(&alice) {
@@ -2625,14 +2681,14 @@ mod tests {
         // With lazy initialization, all burst calls should succeed.
         for i in 1..=5 {
             assert!(
-                rl.check_and_increment(&alice).unwrap(),
+                rl.check_and_increment(&alice, &scp_primitives::SystemClock),
                 "burst call {i} should succeed — burst window lazily initialized"
             );
         }
 
         // 6th burst call should fail.
         assert!(
-            !rl.check_and_increment(&alice).unwrap(),
+            !rl.check_and_increment(&alice, &scp_primitives::SystemClock),
             "burst call 6 should fail — burst allowance exhausted"
         );
     }
@@ -2641,15 +2697,29 @@ mod tests {
     fn rate_limit_burst_not_renewed_after_burst_window_expires() {
         // Base limit: 2 calls within a 1-hour window.
         // Burst: 3 calls within a 1-second burst window.
-        let mut rl =
-            RateLimit::with_burst(2, Duration::from_secs(3600), 3, Duration::from_secs(1)).unwrap();
+        let mut rl = RateLimit::with_burst(
+            2,
+            Duration::from_secs(3600),
+            3,
+            Duration::from_secs(1),
+            &scp_primitives::SystemClock,
+        );
 
         // Consume the 2 base calls.
-        assert!(rl.check_and_increment().unwrap(), "base call 1");
-        assert!(rl.check_and_increment().unwrap(), "base call 2");
+        assert!(
+            rl.check_and_increment(&scp_primitives::SystemClock),
+            "base call 1"
+        );
+        assert!(
+            rl.check_and_increment(&scp_primitives::SystemClock),
+            "base call 2"
+        );
 
         // Use 1 of 3 burst calls (burst window starts now).
-        assert!(rl.check_and_increment().unwrap(), "burst call 1");
+        assert!(
+            rl.check_and_increment(&scp_primitives::SystemClock),
+            "burst call 1"
+        );
 
         // Simulate burst window expiry by pushing burst_window_start into the
         // past. The base window is still active (1-hour window).
@@ -2659,7 +2729,7 @@ mod tests {
         // until the base window resets. This verifies the burst window is a
         // deadline, not a renewable cycle.
         assert!(
-            !rl.check_and_increment().unwrap(),
+            !rl.check_and_increment(&scp_primitives::SystemClock),
             "burst must NOT renew after burst window expires within base window"
         );
     }
@@ -2673,11 +2743,20 @@ mod tests {
         let alice: DID = "did:dht:z6MkAlice".into();
 
         // Consume the 2 base calls.
-        assert!(rl.check_and_increment(&alice).unwrap(), "base call 1");
-        assert!(rl.check_and_increment(&alice).unwrap(), "base call 2");
+        assert!(
+            rl.check_and_increment(&alice, &scp_primitives::SystemClock),
+            "base call 1"
+        );
+        assert!(
+            rl.check_and_increment(&alice, &scp_primitives::SystemClock),
+            "base call 2"
+        );
 
         // Use 1 of 3 burst calls (burst window starts now).
-        assert!(rl.check_and_increment(&alice).unwrap(), "burst call 1");
+        assert!(
+            rl.check_and_increment(&alice, &scp_primitives::SystemClock),
+            "burst call 1"
+        );
 
         // Simulate burst window expiry by pushing burst_window_start into the
         // past. The base window is still active (1-hour window).
@@ -2688,7 +2767,7 @@ mod tests {
         // After burst window expires, NO more burst calls should be allowed
         // until the base window resets.
         assert!(
-            !rl.check_and_increment(&alice).unwrap(),
+            !rl.check_and_increment(&alice, &scp_primitives::SystemClock),
             "per-caller burst must NOT renew after burst window expires within base window"
         );
     }

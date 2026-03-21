@@ -10396,7 +10396,11 @@ pub fn handle_register(
         .entry(discovery_context_id.clone())
         .or_insert_with(|| scp_core::discovery::HandleRegistry::new(discovery_context_id));
     let result = registry
-        .register(&params, &scp_identity::DID::from(registrant_did.as_str()))
+        .register(
+            &params,
+            &scp_identity::DID::from(registrant_did.as_str()),
+            &scp_primitives::SystemClock,
+        )
         .map_err(|e| ScpError::Validation {
             msg: format!("clock error during handle registration: {e}"),
             code: "SCP-VALID-7121".to_owned(),
@@ -10536,7 +10540,11 @@ pub fn scope_register(
         .or_insert_with(|| scp_core::discovery::ScopeRegistry::new(scope_context_id));
 
     let result = registry
-        .register(&params, &scp_identity::DID::from(registrant_did.as_str()))
+        .register(
+            &params,
+            &scp_identity::DID::from(registrant_did.as_str()),
+            &scp_primitives::SystemClock,
+        )
         .map_err(|e| ScpError::Validation {
             msg: format!("scope registration failed: {e}"),
             code: "SCP-VALID-7131".to_owned(),
@@ -10674,6 +10682,7 @@ pub fn address_resolve(
                     &querier,
                     &known_contexts,
                     &known_domains,
+                    &scp_primitives::SystemClock,
                 )
                 .await
                 .map_err(|e| ScpError::Validation {

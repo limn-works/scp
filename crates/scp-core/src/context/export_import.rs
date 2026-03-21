@@ -9,6 +9,7 @@
 //!
 //! See GitHub issue #363.
 
+use scp_primitives::Clock;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use subtle::ConstantTimeEq;
@@ -322,10 +323,9 @@ pub fn create_export(
     mls_state: Vec<u8>,
     exporter_did: DID,
     scope: ExportScope,
+    clock: &dyn Clock,
 ) -> Result<ContextExport, ContextError> {
-    let exported_at = crate::time::now_secs().map_err(|e| {
-        ContextError::EventLogFailed(format!("failed to get current timestamp: {e}"))
-    })?;
+    let exported_at = clock.now_secs();
 
     match scope {
         ExportScope::Full => {
@@ -434,6 +434,7 @@ mod tests {
             Vec::new(),
             DID::from("did:key:exporter-1"),
             ExportScope::Full,
+            &scp_primitives::SystemClock,
         )
         .unwrap();
 
@@ -463,6 +464,7 @@ mod tests {
             vec![0xDE, 0xAD],
             DID::from("did:key:exporter-2"),
             ExportScope::Full,
+            &scp_primitives::SystemClock,
         )
         .unwrap();
 
@@ -493,6 +495,7 @@ mod tests {
             vec![1, 2, 3],
             DID::from("did:key:exporter-3"),
             ExportScope::Full,
+            &scp_primitives::SystemClock,
         )
         .unwrap();
 
@@ -581,6 +584,7 @@ mod tests {
             Vec::new(),
             DID::from("did:key:validator-1"),
             ExportScope::Full,
+            &scp_primitives::SystemClock,
         )
         .unwrap();
 
@@ -620,6 +624,7 @@ mod tests {
             Vec::new(),
             DID::from("did:key:validator-3"),
             ExportScope::Full,
+            &scp_primitives::SystemClock,
         )
         .unwrap();
 
@@ -678,6 +683,7 @@ mod tests {
             vec![1, 2, 3],
             DID::from("did:key:public-1"),
             ExportScope::Public,
+            &scp_primitives::SystemClock,
         )
         .unwrap();
 
@@ -702,6 +708,7 @@ mod tests {
             vec![0xFF],
             DID::from("did:key:full-1"),
             ExportScope::Full,
+            &scp_primitives::SystemClock,
         )
         .unwrap();
 
@@ -736,6 +743,7 @@ mod tests {
             Vec::new(),
             DID::from("did:key:pipeline-1"),
             ExportScope::Full,
+            &scp_primitives::SystemClock,
         )
         .unwrap();
 
@@ -764,6 +772,7 @@ mod tests {
             Vec::new(),
             DID::from("did:key:version-test"),
             ExportScope::Full,
+            &scp_primitives::SystemClock,
         )
         .unwrap();
         assert_eq!(export_v1.version, 1);
@@ -865,6 +874,7 @@ mod tests {
             Vec::new(),
             DID::from("did:key:prune-test"),
             ExportScope::Full,
+            &scp_primitives::SystemClock,
         )
         .unwrap();
 
