@@ -306,12 +306,21 @@ Verification procedure depends on the attestation class (§3.5.0).
 | `google.com` | 1 | 30 days | OIDC tokens expire; account may be revoked |
 | `apple.com` | 1 | 30 days | OIDC tokens expire; account may be revoked |
 | `microsoft.com` | 1 | 30 days | OIDC tokens expire; account may be revoked |
+| `linkedin.com` | 1 | 30 days | OIDC tokens expire; account may be revoked |
+| `discord.com` | 1 | 30 days | OIDC tokens expire; account may be revoked |
 | `github.com` | 2 | 90 days | Profile bio may be edited; account may be suspended |
 | `x.com` | 2 | 90 days | Profile description may be edited; account may be suspended |
+| `reddit.com` | 2 | 90 days | Profile bio may be edited; account may be suspended |
+| `bluesky.com` | 2 | 90 days | Profile description may be edited; account may be suspended |
 | `mastodon:<instance>` | 2 | 90 days | Profile bio may be edited; instance may be deactivated |
+| `npm` | 2 | 90 days | Profile page may be edited; account may be suspended |
+| `pypi` | 2 | 90 days | Profile page may be edited; account may be suspended |
+| `telegram.com` | 1 | 60 days | ChallengeResponse — no persistent proof; freshness matters |
+| `steam` | 1 | 60 days | ChallengeResponse — no persistent proof; freshness matters |
+| `well-known` | 2 | 180 days | HTTP endpoints are stable; domain ownership changes slowly |
 | `dns` | 2 | 180 days | DNS records are stable; domain ownership changes slowly |
 
-**ChallengeResponse renewal interval:** 60 days. ChallengeResponse attestations are not tied to a specific platform (§3.5.1), so they do not appear in the per-platform tables above. The 60-day interval reflects that no persistent proof exists — freshness of the cryptographic round trip is the only signal.
+**ChallengeResponse renewal interval:** 60 days. ChallengeResponse attestations not tied to a specific platform (§3.5.1) use this default. For platform-specific ChallengeResponse entries (Telegram, Steam), the renewal interval is listed in the table above.
 
 ### 3.5.5 Shadow Identity Claiming Protocol
 
