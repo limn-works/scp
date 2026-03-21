@@ -310,19 +310,31 @@ class AndroidKeyCustody internal constructor(
     /**
      * Derives a deterministic, context-scoped Ed25519 pseudonym keypair.
      *
-     * Algorithm (identical across all `KeyCustody` implementations per ADR-006):
-     *   1. Retrieve the public key material for [keyHandle] (uses public key as HMAC
-     *      key material for hardware-backed keys where private bytes are inaccessible).
-     *   2. Compute `seed = HMAC-SHA256(key_material, contextId || "scp-pseudonym")`.
-     *   3. Derive an Ed25519 keypair from the first 32 bytes of `seed` using
-     *      [FixedSecureRandom] as the entropy source for deterministic keygen.
-     *   4. Store the derived keypair in [softwareKeys] under a fresh UUID.
-     *   5. Return a [PseudonymKeyHandle] with [CustodyType.SOFTWARE].
+     * ## Algorithm (spec section 9.10.4A):
+     *
+     * **Software keys (API 26-32, [CustodyType.SOFTWARE]):**
+     *   1. Extract 32-byte private key bytes from the Bouncy Castle [Ed25519PrivateKeyParameters].
+     *   2. Derive `pseudonymSecret = HKDF-SHA256(ikm: privateKeyBytes, salt: "scp-pseudonym-secret-v1", info: "", len: 32)`.
+     *   3. Compute `seed = HMAC-SHA256(pseudonymSecret, contextId || "scp-pseudonym")`.
+     *   4. Derive an Ed25519 keypair from the first 32 bytes of `seed`.
+     *
+     * **Hardware keys (API 33+, [CustodyType.HARDWARE]):**
+     *   TEE keys are non-extractable — private key bytes never leave the Trusted Execution
+     *   Environment. Instead of HKDF, the pseudonym secret is derived by signing a fixed
+     *   domain-separated message inside the TEE:
+     *   1. `signatureBytes = TEE_sign("scp-pseudonym-secret-v1")` (Ed25519 is deterministic per RFC 8032).
+     *   2. `pseudonymSecret = SHA-256(signatureBytes)` (compress 64-byte signature to 32-byte secret).
+     *   3. `seed = HMAC-SHA256(pseudonymSecret, contextId || "scp-pseudonym")`.
+     *   4. Derive an Ed25519 keypair from the first 32 bytes of `seed`.
+     *
+     *   **Limitation:** Hardware-derived pseudonyms produce different values than Rust's
+     *   HKDF-based derivation for the same logical key, because the TEE key material is
+     *   not portable. This is acceptable because TEE keys are inherently non-portable and
+     *   cross-platform pseudonym identity requires portable key material.
      *
      * The derivation is deterministic: the same `keyHandle` + `contextId` pair always
-     * produces the same pseudonym public key (given the same underlying identity key
-     * material). However, each call creates a new UUID handle in [softwareKeys] —
-     * callers should manage handle lifecycle.
+     * produces the same pseudonym public key. Each call creates a new UUID handle in
+     * [softwareKeys] — callers should manage handle lifecycle.
      *
      * @param keyHandle Handle to the identity Ed25519 key (source for derivation).
      * @param contextId Raw context ID bytes.
@@ -342,12 +354,14 @@ class AndroidKeyCustody internal constructor(
             }
         }
 
-        // Use public key as HMAC key material — works for both hardware and software keys.
-        // For hardware-backed keys, private bytes are inaccessible (inside TEE).
-        val keyMaterial = publicKey(keyHandle)
+        // Derive pseudonym_secret: HKDF for software keys, TEE-sign for hardware keys.
+        // Both approaches prevent the membership enumeration oracle (#1494):
+        // only the key holder can compute pseudonyms.
+        val pseudonymSecret = derivePseudonymSecret(keyHandle)
 
         val mac = Mac.getInstance("HmacSHA256")
-        mac.init(SecretKeySpec(keyMaterial, "HmacSHA256"))
+        mac.init(SecretKeySpec(pseudonymSecret, "HmacSHA256"))
+        pseudonymSecret.fill(0) // zeroize after use
         mac.update(contextId)
         mac.update("scp-pseudonym".toByteArray(Charsets.UTF_8))
         val seed = mac.doFinal()
@@ -356,6 +370,7 @@ class AndroidKeyCustody internal constructor(
         val pseudonymKeypair = Ed25519KeyPairGenerator().apply {
             init(Ed25519KeyGenerationParameters(FixedSecureRandom(seed)))
         }.generateKeyPair()
+        seed.fill(0) // zeroize after use
 
         val pseudonymId = UUID.randomUUID().toString()
         softwareKeys[pseudonymId] = pseudonymKeypair
@@ -365,6 +380,61 @@ class AndroidKeyCustody internal constructor(
             id = pseudonymId,
             custodyType = CustodyType.SOFTWARE,
         )
+    }
+
+    /**
+     * Derives a 32-byte pseudonym secret from the identity key.
+     *
+     * For software keys: `HKDF-SHA256(ikm: privateKeyBytes, salt: "scp-pseudonym-secret-v1", info: "", len: 32)`
+     * — matches the Rust `derive_pseudonym_secret()` in `scp-platform/src/pseudonym.rs`.
+     *
+     * For hardware keys: `SHA-256(TEE_sign("scp-pseudonym-secret-v1"))` — deterministic
+     * because Ed25519 signing is deterministic (RFC 8032). The 64-byte signature is hashed
+     * to 32 bytes for use as an HMAC key.
+     */
+    private fun derivePseudonymSecret(keyHandle: KeyHandle): ByteArray {
+        val salt = "scp-pseudonym-secret-v1".toByteArray(Charsets.UTF_8)
+
+        if (keyHandle.custodyType == CustodyType.HARDWARE) {
+            // TEE path: sign the salt message deterministically, hash the result.
+            val signatureBytes = signWithKeystore(keyHandle, salt)
+            val digest = java.security.MessageDigest.getInstance("SHA-256")
+            return digest.digest(signatureBytes)
+        }
+
+        // Software path: extract private key bytes and apply HKDF-SHA256.
+        val keyPair = softwareKeys[keyHandle.id]
+            ?: throw ScpException("Key not found: ${keyHandle.id}", "SCP-CRYPTO-4001")
+
+        val privateParams = keyPair.private as Ed25519PrivateKeyParameters
+        val privateKeyBytes = privateParams.encoded
+        val secret = hkdfSha256(privateKeyBytes, salt, ByteArray(0), 32)
+        privateKeyBytes.fill(0) // zeroize private key material
+        return secret
+    }
+
+    /**
+     * HKDF-SHA256 (RFC 5869) extract-and-expand.
+     *
+     * Matches the Rust `hkdf::Hkdf::<Sha256>` used in
+     * `scp-platform/src/pseudonym.rs::derive_pseudonym_secret`.
+     */
+    private fun hkdfSha256(ikm: ByteArray, salt: ByteArray, info: ByteArray, length: Int): ByteArray {
+        // Extract: PRK = HMAC-SHA256(salt, IKM)
+        val extractMac = Mac.getInstance("HmacSHA256")
+        extractMac.init(SecretKeySpec(salt, "HmacSHA256"))
+        val prk = extractMac.doFinal(ikm)
+
+        // Expand: OKM = T(1) where T(1) = HMAC-SHA256(PRK, info || 0x01)
+        // For length <= 32 (one block), only one iteration is needed.
+        require(length <= 32) { "HKDF-SHA256 expand: length must be <= 32 for single-block output" }
+        val expandMac = Mac.getInstance("HmacSHA256")
+        expandMac.init(SecretKeySpec(prk, "HmacSHA256"))
+        prk.fill(0) // zeroize PRK
+        expandMac.update(info)
+        expandMac.update(byteArrayOf(0x01))
+        val okm = expandMac.doFinal()
+        return okm.copyOf(length)
     }
 
     /**

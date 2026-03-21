@@ -303,12 +303,13 @@
         /// The golden vector uses:
         /// - Identity key seed: 0x00...01 (31 zeros, then 0x01)
         /// - Context ID: "test" (4 bytes UTF-8)
-        /// - Algorithm: `HMAC-SHA256(public_key_bytes, context_id || "scp-pseudonym")`
+        /// - Algorithm: HKDF-SHA256 derives pseudonym_secret from private key,
+        ///   then HMAC-SHA256(pseudonym_secret, context_id || "scp-pseudonym")
         ///
         /// This test imports a known private key into the Keychain, derives the
         /// pseudonym, and compares the result against the reference algorithm
         /// computed locally.
-        @Test("derivePseudonym cross-platform golden vector (ADR-027)")
+        @Test("derivePseudonym cross-platform golden vector (spec section 9.10.4A)")
         func derivePseudonymGoldenVector() async throws {
             // Known identity key seed: 0x00...01 (31 zeros, then 0x01).
             var seedBytes = Data(repeating: 0, count: 32)
@@ -326,9 +327,15 @@
             )
 
             // Compute expected pseudonym using the reference algorithm directly:
-            // seed = HMAC-SHA256(public_key_bytes, context_id || "scp-pseudonym")
-            let hmacKey = SymmetricKey(data: publicKeyBytes)
-            var hmac = CryptoKit.HMAC<SHA256>(key: hmacKey)
+            // Step 1: pseudonym_secret = HKDF-SHA256(ikm: private_key, salt: "scp-pseudonym-secret-v1", info: "", len: 32)
+            let pseudonymSecret = HKDF<SHA256>.deriveKey(
+                inputKeyMaterial: SymmetricKey(data: seedBytes),
+                salt: Data("scp-pseudonym-secret-v1".utf8),
+                info: Data(),
+                outputByteCount: 32
+            )
+            // Step 2: seed = HMAC-SHA256(pseudonym_secret, context_id || "scp-pseudonym")
+            var hmac = CryptoKit.HMAC<SHA256>(key: pseudonymSecret)
             hmac.update(data: contextId)
             hmac.update(data: Data("scp-pseudonym".utf8))
             let expectedSeed = Data(hmac.finalize())
@@ -341,7 +348,7 @@
 
             #expect(
                 pseudonym.publicKey == expectedPublicKey,
-                "pseudonym public key must match reference HMAC-SHA256 algorithm output"
+                "pseudonym public key must match reference HKDF+HMAC-SHA256 algorithm output"
             )
 
             // Cleanup

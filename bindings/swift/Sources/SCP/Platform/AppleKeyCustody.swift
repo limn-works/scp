@@ -751,16 +751,20 @@ public extension AppleKeyCustody {
 
     /// Derives a deterministic, context-scoped Ed25519 pseudonym keypair.
     ///
-    /// ## Algorithm (ADR-006, ADR-027 amendment):
+    /// ## Algorithm (ADR-006, spec section 9.10.4A):
     /// 1. Retrieve the Ed25519 private key bytes for `keyHandle` from Keychain.
-    /// 2. Derive the Ed25519 public key from the private key.
-    /// 3. Compute `seed = HMAC-SHA256(public_key_bytes, contextId || "scp-pseudonym")`.
-    ///    **ADR-027: uses public key bytes as HMAC key** for cross-platform
-    ///    determinism with hardware TEE adapters (e.g., Android Keystore)
-    ///    that cannot export private key material.
+    /// 2. Derive `pseudonym_secret = HKDF-SHA256(ikm: private_key_bytes,
+    ///    salt: "scp-pseudonym-secret-v1", info: "", len: 32)`.
+    /// 3. Compute `seed = HMAC-SHA256(pseudonym_secret, contextId || "scp-pseudonym")`.
     /// 4. Derive an Ed25519 keypair from the first 32 bytes of `seed`.
     /// 5. Store the derived private key in Keychain under a deterministic handle.
     /// 6. Return a ``PseudonymResult`` with the 32-byte public key and the handle.
+    ///
+    /// **CRITICAL:** Using public key bytes as the HMAC key (pre-#1494) would
+    /// be a membership enumeration oracle — anyone who knows a member's public
+    /// key could compute their pseudonym for any context ID and check relay
+    /// subscriptions. The `pseudonym_secret` is derived from private key bytes
+    /// via HKDF-SHA-256, making it unknowable without the private key.
     ///
     /// The derivation is deterministic: the same `keyHandle` + `contextId`
     /// pair always produces the same pseudonym public key.
@@ -778,8 +782,8 @@ public extension AppleKeyCustody {
     ///   ``PlatformError/keychainError(_:)`` for Keychain failures,
     ///   ``PlatformError/custodyError(_:)`` for HMAC or keygen failures.
     ///
-    /// See ADR-025 Key custody, ADR-006 `derive_pseudonym`, ADR-027 amendment,
-    /// and `InMemoryKeyCustody.derive_pseudonym` in
+    /// See ADR-025 Key custody, ADR-006 `derive_pseudonym`, spec section
+    /// 9.10.4A, and `InMemoryKeyCustody.derive_pseudonym` in
     /// `scp-platform/src/testing/key_custody.rs` for the canonical Rust
     /// reference implementation.
     @concurrent
@@ -798,15 +802,18 @@ public extension AppleKeyCustody {
         defer { privateKeyBytes.resetBytes(in: 0 ..< privateKeyBytes.count) }
 
         do {
-            // ADR-027: use public key bytes as HMAC key for cross-platform
-            // determinism with hardware TEE adapters that cannot export
-            // private key material.
-            let identityKey = try Curve25519.Signing.PrivateKey(rawRepresentation: privateKeyBytes)
-            let publicKeyBytes = identityKey.publicKey.rawRepresentation
+            // Derive pseudonym_secret from private key via HKDF-SHA256 (spec
+            // section 9.10.4A). This prevents membership enumeration attacks:
+            // only the key holder can compute pseudonyms.
+            let pseudonymSecret = HKDF<SHA256>.deriveKey(
+                inputKeyMaterial: SymmetricKey(data: privateKeyBytes),
+                salt: Data("scp-pseudonym-secret-v1".utf8),
+                info: Data(),
+                outputByteCount: 32
+            )
 
-            // HMAC-SHA256(ed25519_public_key_bytes, contextId || "scp-pseudonym")
-            let hmacKey = SymmetricKey(data: publicKeyBytes)
-            var hmac = HMAC<SHA256>(key: hmacKey)
+            // HMAC-SHA256(pseudonym_secret, contextId || "scp-pseudonym")
+            var hmac = HMAC<SHA256>(key: pseudonymSecret)
             hmac.update(data: contextId)
             hmac.update(data: Data("scp-pseudonym".utf8))
             let seed = Data(hmac.finalize())
