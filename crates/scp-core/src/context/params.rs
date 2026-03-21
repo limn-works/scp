@@ -254,11 +254,14 @@ pub enum TemplateId {
     /// See spec section 19.10 and ADR-033.
     #[serde(rename = "scp:template/paid-broadcast")]
     PaidBroadcast,
-    /// Agent discovery template. Encrypted mode with messaging + tool invocation
-    /// ceiling, discoverable by default. Used to bootstrap agent discovery via
-    /// standardized tool schemas (ADR-020, §22).
-    #[serde(rename = "scp:template/discovery-context")]
-    DiscoveryContext,
+    /// Handle registry template. Encrypted mode with messaging + tool invocation
+    /// ceiling, discoverable by default. Used for human-readable addressing
+    /// and agent discovery via standardized tool schemas (ADR-020, §22).
+    #[serde(
+        rename = "scp:template/handle-registry",
+        alias = "scp:template/discovery-context"
+    )]
+    HandleRegistry,
 }
 
 // ---------------------------------------------------------------------------
@@ -1078,7 +1081,7 @@ mod tests {
             TemplateId::GatedBroadcast,
             TemplateId::PaidService,
             TemplateId::PaidBroadcast,
-            TemplateId::DiscoveryContext,
+            TemplateId::HandleRegistry,
         ];
         for (i, a) in variants.iter().enumerate() {
             for (j, b) in variants.iter().enumerate() {
@@ -1089,6 +1092,25 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn template_id_handle_registry_deserializes_from_old_name() {
+        // The HandleRegistry variant was originally serialized as
+        // "scp:template/discovery-context". The serde alias ensures
+        // existing stored data can still deserialize.
+        let json = r#""scp:template/discovery-context""#;
+        let deserialized: TemplateId = serde_json::from_str(json).unwrap();
+        assert_eq!(deserialized, TemplateId::HandleRegistry);
+
+        // Current canonical name also works.
+        let json = r#""scp:template/handle-registry""#;
+        let deserialized: TemplateId = serde_json::from_str(json).unwrap();
+        assert_eq!(deserialized, TemplateId::HandleRegistry);
+
+        // Serialization always uses the canonical name.
+        let serialized = serde_json::to_string(&TemplateId::HandleRegistry).unwrap();
+        assert_eq!(serialized, r#""scp:template/handle-registry""#);
     }
 
     #[test]

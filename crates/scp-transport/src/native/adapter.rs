@@ -34,6 +34,8 @@ use futures::Stream;
 use scp_core::envelope::OuterEnvelope;
 use tokio_util::sync::CancellationToken;
 
+use zeroize::Zeroizing;
+
 use super::client::{NativeRelayClient, SubscriptionMessage};
 use super::protocol::{ClientMessage, RelayMessage};
 use crate::cover_traffic::{
@@ -137,6 +139,34 @@ impl NativeRelayAdapter {
     pub async fn connect_sourced(sourced: &SourcedRelayUrl) -> Result<Self, TransportError> {
         validate_relay_url(&sourced.url, &sourced.source)?;
         let client = NativeRelayClient::connect(&sourced.url).await?;
+        Ok(Self {
+            client,
+            cover_traffic_cancel: CancellationToken::new(),
+        })
+    }
+
+    /// Creates a new adapter connected to a relay URL with provenance-based
+    /// transport security validation and an optional bearer token.
+    ///
+    /// Behaves identically to [`connect_sourced`](Self::connect_sourced) but
+    /// includes the bearer token as an `Authorization: Bearer <token>` header
+    /// in the WebSocket upgrade request when `Some`. This is required for
+    /// connecting to relay endpoints that enforce bridge token authentication
+    /// (e.g., `ApplicationNode` relays).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TransportError::ProtocolError`] if the URL scheme is not
+    /// permitted for the given source.
+    ///
+    /// Returns [`TransportError::ConnectionFailed`] if the connection cannot
+    /// be established (including authentication rejection).
+    pub async fn connect_sourced_with_bearer(
+        sourced: &SourcedRelayUrl,
+        bearer_token: Option<Zeroizing<String>>,
+    ) -> Result<Self, TransportError> {
+        validate_relay_url(&sourced.url, &sourced.source)?;
+        let client = NativeRelayClient::connect_with_bearer(&sourced.url, bearer_token).await?;
         Ok(Self {
             client,
             cover_traffic_cancel: CancellationToken::new(),

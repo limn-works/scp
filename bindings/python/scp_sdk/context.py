@@ -1657,7 +1657,7 @@ def template_get_params(template_id: str) -> dict[str, Any]:
         template_id: One of ``BilateralEphemeral``, ``BilateralPersistent``,
             ``Coordination``, ``GroupDiscussion``, ``PublicBroadcast``,
             ``GatedBroadcast``, ``scp:template/tool-interface``,
-            ``PaidService``, ``PaidBroadcast``, ``DiscoveryContext``.
+            ``PaidService``, ``PaidBroadcast``, ``HandleRegistry``.
 
     Returns:
         ContextParams as a dict.

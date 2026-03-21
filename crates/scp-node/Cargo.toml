@@ -56,6 +56,8 @@ tracing = { workspace = true }
 zeroize = { workspace = true }
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 x509-parser = "0.16"
+metrics = { workspace = true }
+metrics-exporter-prometheus = { workspace = true }
 
 [dev-dependencies]
 ed25519-dalek = { workspace = true }

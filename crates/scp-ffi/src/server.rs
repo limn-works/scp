@@ -43,11 +43,15 @@ fn node_err(e: NodeError) -> PyErr {
 /// Auto-wires the global [`ContextManager`] with relay transport after
 /// node startup.
 ///
-/// Connects to the node's local relay and initializes the `ContextManager`
-/// with `RelayTransportProvider` so that context operations (create, join,
-/// send) work immediately. If the `ContextManager` was already initialized
-/// (e.g., by a prior `configure_relay_transport` or `context_create` call),
-/// this is a no-op — the `OnceLock` ensures first-writer-wins semantics.
+/// Connects to the node's local relay (with bearer token authentication)
+/// and initializes the `ContextManager` with `RelayTransportProvider` so
+/// that context operations (create, join, send) work immediately. If the
+/// `ContextManager` was already initialized (e.g., by a prior
+/// `configure_relay_transport` or `context_create` call), this is a no-op
+/// — the `OnceLock` ensures first-writer-wins semantics.
+///
+/// The `bridge_token` is required because `ApplicationNode` relays enforce
+/// `Authorization: Bearer <token>` on all WebSocket connections.
 ///
 /// Best-effort: logs a warning if the relay connection fails rather than
 /// blocking node startup.
@@ -56,13 +60,20 @@ fn auto_wire_context_manager(
     rt: &tokio::runtime::Runtime,
     did: &str,
     relay_url: &str,
+    bridge_token: Zeroizing<String>,
 ) {
     let sourced = SourcedRelayUrl {
         url: relay_url.to_owned(),
         source: RelayUrlSource::Explicit,
     };
     let did_owned = did.to_owned();
-    match py.allow_threads(|| rt.block_on(NativeRelayAdapter::connect_sourced(&sourced))) {
+    let token2 = bridge_token.clone();
+    match py.allow_threads(|| {
+        rt.block_on(NativeRelayAdapter::connect_sourced_with_bearer(
+            &sourced,
+            Some(bridge_token),
+        ))
+    }) {
         Ok(adapter) => {
             let crypto = Box::new(scp_core::crypto::mls::provider::MlsCryptoProvider::new(
                 did_owned.clone(),
@@ -71,6 +82,31 @@ fn auto_wire_context_manager(
             let event_log: Box<dyn scp_core::context::builder::ContextEventLogProvider> =
                 Box::new(crate::runtime::NoOpEventLogProvider);
             crate::runtime::init_context_manager_with(crypto, transport, event_log, None);
+
+            // Also populate the RELAY_CONNECTION global so that broadcast
+            // publish, context subscribe, and discovery probing work without
+            // a separate `transport_connect` call. This requires a second
+            // WebSocket connection because NativeRelayAdapter is not Clone
+            // and the first was consumed by RelayTransportProvider.
+            match py.allow_threads(|| {
+                rt.block_on(NativeRelayAdapter::connect_sourced_with_bearer(
+                    &sourced,
+                    Some(token2),
+                ))
+            }) {
+                Ok(relay_adapter) => {
+                    let _ = crate::runtime::set_relay_connection(Arc::new(relay_adapter));
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        error = %e,
+                        relay_url = %relay_url,
+                        "auto_wire_context_manager: ContextManager wired but failed to \
+                         populate RELAY_CONNECTION — broadcast publish and discovery may \
+                         require a manual transport_connect call"
+                    );
+                }
+            }
         }
         Err(e) => {
             tracing::warn!(
@@ -551,9 +587,15 @@ pub fn py_node_start_in_memory(
 
     // Auto-wire the ContextManager with relay transport so that
     // context operations work immediately after node startup.
+    // Use the internal loopback URL (ws://127.0.0.1:{port}/scp/v1) instead of
+    // node.relay_url() which returns the advertised URL (wss://localhost/scp/v1)
+    // that requires TLS and lacks the actual bound port.
+    // The bridge token is required because ApplicationNode relays enforce
+    // Authorization: Bearer <token> on all WebSocket connections.
     let did = node.identity().did().to_owned();
-    let relay_url = node.relay_url().to_owned();
-    auto_wire_context_manager(py, rt, &did, &relay_url);
+    let relay_url = format!("ws://127.0.0.1:{}/scp/v1", node.relay().bound_addr().port());
+    let bridge_token = node.bridge_token_hex();
+    auto_wire_context_manager(py, rt, &did, &relay_url, bridge_token);
 
     Ok(PyNodeHandle {
         inner: RunningNode::InMemory(node),
@@ -567,11 +609,7 @@ pub fn py_node_start_in_memory(
 ///
 /// When ``identity_did`` is ``None`` (the default), the node creates or
 /// reloads a persistent identity from ``<data_dir>/identity.key``. The
-/// passphrase is resolved as:
-///
-/// 1. The explicit ``passphrase`` parameter, if provided.
-/// 2. The ``SCP_KEY_PASSPHRASE`` environment variable, if set.
-/// 3. Returns an error if neither is available.
+/// ``passphrase`` parameter is required in this mode.
 ///
 /// When ``identity_did`` is provided, the node uses the pre-existing identity
 /// from the `PyO3` identity registry (populated by ``py_identity_create``).
@@ -604,9 +642,11 @@ pub fn py_node_start_local(
 
     // Auto-wire the ContextManager with relay transport so that
     // context operations work immediately after node startup.
+    // Use the internal loopback URL — see comment in py_node_start_in_memory.
     let did = node.identity().did().to_owned();
-    let relay_url = node.relay_url().to_owned();
-    auto_wire_context_manager(py, rt, &did, &relay_url);
+    let relay_url = format!("ws://127.0.0.1:{}/scp/v1", node.relay().bound_addr().port());
+    let bridge_token = node.bridge_token_hex();
+    auto_wire_context_manager(py, rt, &did, &relay_url, bridge_token);
 
     Ok(PyNodeHandle {
         inner: RunningNode::Filesystem(node),
@@ -822,5 +862,41 @@ mod tests {
         assert!(result.is_err(), "double serve should fail");
 
         inner.shutdown();
+    }
+
+    /// Verifies that auto-wiring a node's relay populates the global
+    /// `RELAY_CONNECTION` so that broadcast publish, context subscribe,
+    /// and discovery probing work without a separate `transport_connect`.
+    #[test]
+    fn auto_wire_populates_relay_connection_global() {
+        use scp_transport::relay::connection::{RelayUrlSource, SourcedRelayUrl};
+
+        // Start a standalone relay to get a stable WebSocket endpoint.
+        let relay = rt().block_on(server::start_relay_in_memory()).unwrap();
+        let relay_url = relay.relay_url().to_owned();
+
+        // Connect to the relay and store in the global — mirrors what
+        // auto_wire_context_manager does after ContextManager init.
+        let sourced = SourcedRelayUrl {
+            url: relay_url,
+            source: RelayUrlSource::Explicit,
+        };
+        let adapter = rt()
+            .block_on(NativeRelayAdapter::connect_sourced(&sourced))
+            .expect("should connect to the relay");
+        crate::runtime::set_relay_connection(Arc::new(adapter))
+            .expect("should store adapter in global");
+
+        // Verify the global is populated.
+        let conn =
+            crate::runtime::get_relay_connection().expect("should read global without error");
+        assert!(
+            conn.is_some(),
+            "RELAY_CONNECTION should be populated after auto-wire"
+        );
+
+        // Clean up.
+        crate::runtime::clear_relay_connection().ok();
+        relay.shutdown();
     }
 }

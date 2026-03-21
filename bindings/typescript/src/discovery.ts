@@ -65,7 +65,7 @@ const VALID_TRUST_LEVEL_KINDS = new Set([
   "LocalPetname",
   "DomainVerified",
   "AttestationVerified",
-  "DiscoveryContextVerified",
+  "HandleRegistryVerified",
   "MultiLayerCorroborated",
 ]);
 

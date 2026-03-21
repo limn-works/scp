@@ -525,6 +525,62 @@ public func executeCustodyMigration(
     try await executeCustodyMigrationFn(did, target, contextIds)
 }
 
+// MARK: - RevocationStatus
+
+/// Revocation status for an identity attestation (§3.5).
+///
+/// Mirrors the Rust `RevocationStatus` enum:
+///
+/// - `Active` -> `.active`
+/// - `Revoked { revoked_at, reason }` -> `.revoked(revokedAt:reason:)`
+///
+/// ## Provenance
+///
+/// - Spec section 3.5 (Identity Link Attestations)
+public enum RevocationStatus: Sendable, Equatable {
+    /// The attestation is active and valid.
+    case active
+
+    /// The attestation has been revoked.
+    ///
+    /// - Parameters:
+    ///   - revokedAt: Unix timestamp (seconds) when the attestation was revoked.
+    ///   - reason: Optional human-readable revocation reason.
+    case revoked(revokedAt: Int, reason: String? = nil)
+
+    /// The status string: `"active"` or `"revoked"`. Internal — use pattern matching.
+    var status: String {
+        switch self {
+        case .active:
+            return "active"
+        case .revoked:
+            return "revoked"
+        }
+    }
+
+    /// Unix timestamp (seconds) when the attestation was revoked.
+    /// Returns `nil` for active attestations.
+    public var revokedAt: Int? {
+        switch self {
+        case .active:
+            return nil
+        case let .revoked(revokedAt, _):
+            return revokedAt
+        }
+    }
+
+    /// Optional human-readable revocation reason.
+    /// Returns `nil` for active attestations.
+    public var reason: String? {
+        switch self {
+        case .active:
+            return nil
+        case let .revoked(_, reason):
+            return reason
+        }
+    }
+}
+
 // MARK: - IdentityAttestation
 
 /// An identity link attestation binding a DID to an external platform (§3.5).
@@ -548,10 +604,10 @@ public struct IdentityAttestation: Sendable, Equatable {
     public let verificationMethod: String
 
     /// Unix timestamp (seconds) when the evidence was last verified.
-    public let verifiedAt: Double
+    public let verifiedAt: Int
 
-    /// Revocation status: `"active"`, `"revoked"`, or `"expired"`.
-    public let revocationStatus: String
+    /// Revocation status.
+    public let revocationStatus: RevocationStatus
 
     /// Optional platform-assigned unique identifier.
     public let platformId: String?
@@ -562,8 +618,8 @@ public struct IdentityAttestation: Sendable, Equatable {
         platform: String,
         platformHandle: String,
         verificationMethod: String,
-        verifiedAt: Double,
-        revocationStatus: String = "active",
+        verifiedAt: Int,
+        revocationStatus: RevocationStatus = .active,
         platformId: String? = nil
     ) {
         self.id = id
@@ -589,7 +645,7 @@ public struct IdentityAttestation: Sendable, Equatable {
         // Bridge function not yet available — throw not-implemented
         throw ScpError.Identity(
             msg: "Attestation verification is not yet available in the bridge",
-            code: "SCP-ATTEST-9005"
+            code: "SCP-ATTEST-9014"
         )
     }
 }
@@ -636,7 +692,7 @@ public enum IdentityAttestationBridge {
     public static let defaultCreate: CreateFn = { _, _, _, _, _ in
         throw ScpError.Identity(
             msg: "Identity link attestation creation is not yet available in the bridge",
-            code: "SCP-ATTEST-9001"
+            code: "SCP-ATTEST-9010"
         )
     }
 
@@ -644,7 +700,7 @@ public enum IdentityAttestationBridge {
     public static let defaultList: ListFn = { _ in
         throw ScpError.Identity(
             msg: "Identity link attestation listing is not yet available in the bridge",
-            code: "SCP-ATTEST-9002"
+            code: "SCP-ATTEST-9011"
         )
     }
 
@@ -652,7 +708,7 @@ public enum IdentityAttestationBridge {
     public static let defaultRemove: RemoveFn = { _, _ in
         throw ScpError.Identity(
             msg: "Identity link attestation removal is not yet available in the bridge",
-            code: "SCP-ATTEST-9003"
+            code: "SCP-ATTEST-9012"
         )
     }
 
@@ -660,7 +716,7 @@ public enum IdentityAttestationBridge {
     public static let defaultRenew: RenewFn = { _, _ in
         throw ScpError.Identity(
             msg: "Identity link attestation renewal is not yet available in the bridge",
-            code: "SCP-ATTEST-9004"
+            code: "SCP-ATTEST-9013"
         )
     }
 }

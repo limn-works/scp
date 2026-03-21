@@ -87,24 +87,27 @@ impl From<NodeError> for ScpError {
 /// Auto-wires the global [`ContextManager`] with relay transport after
 /// node startup.
 ///
-/// Connects to the node's local relay and initializes the `ContextManager`
-/// with `MlsCryptoProvider` and `RelayTransportProvider` so that context
-/// operations (create, join, send) work immediately. If the `ContextManager`
-/// was already initialized (e.g., by a prior `configure_relay_transport` or
-/// `context_create` call), this is a no-op — the `OnceLock` ensures
-/// first-writer-wins semantics.
+/// Connects to the node's local relay (with bearer token authentication)
+/// and initializes the `ContextManager` with `MlsCryptoProvider` and
+/// `RelayTransportProvider` so that context operations (create, join, send)
+/// work immediately. If the `ContextManager` was already initialized
+/// (e.g., by a prior `configure_relay_transport` or `context_create` call),
+/// this is a no-op — the `OnceLock` ensures first-writer-wins semantics.
+///
+/// The `bridge_token` is required because `ApplicationNode` relays enforce
+/// `Authorization: Bearer <token>` on all WebSocket connections.
 ///
 /// Also registers the node's DID as a local DID on the `ContextManager`
 /// for defense-in-depth.
 ///
 /// Best-effort: logs a warning if the relay connection fails rather than
 /// blocking node startup.
-async fn auto_wire_context_manager(did: &str, relay_url: &str) {
+async fn auto_wire_context_manager(did: &str, relay_url: &str, bridge_token: Zeroizing<String>) {
     let sourced = SourcedRelayUrl {
         url: relay_url.to_owned(),
         source: RelayUrlSource::Explicit,
     };
-    match NativeRelayAdapter::connect_sourced(&sourced).await {
+    match NativeRelayAdapter::connect_sourced_with_bearer(&sourced, Some(bridge_token)).await {
         Ok(adapter) => {
             crate::runtime::init_context_manager_with_relay_transport(did, adapter);
         }
@@ -615,9 +618,15 @@ pub async fn node_start_in_memory(
 
     // Auto-wire the ContextManager with relay transport so that
     // context operations work immediately after node startup.
+    // Use the internal loopback URL (ws://127.0.0.1:{port}/scp/v1) instead of
+    // node.relay_url() which returns the advertised URL (wss://localhost/scp/v1)
+    // that requires TLS and lacks the actual bound port.
+    // The bridge token is required because ApplicationNode relays enforce
+    // Authorization: Bearer <token> on all WebSocket connections.
     let did = node.identity().did().to_owned();
-    let relay_url = node.relay_url().to_owned();
-    auto_wire_context_manager(&did, &relay_url).await;
+    let relay_url = format!("ws://127.0.0.1:{}/scp/v1", node.relay().bound_addr().port());
+    let bridge_token = node.bridge_token_hex();
+    auto_wire_context_manager(&did, &relay_url, bridge_token).await;
 
     increment_handle_count();
     Ok(Arc::new(NodeHandle {
@@ -629,10 +638,7 @@ pub async fn node_start_in_memory(
 ///
 /// When `identity` is provided, the node uses the pre-existing identity.
 /// When `None`, the node creates or reloads a persistent identity via
-/// `FileKeyCustody`. The passphrase is resolved as:
-/// 1. The explicit `passphrase` parameter, if provided.
-/// 2. The `SCP_KEY_PASSPHRASE` environment variable, if set.
-/// 3. Returns an error if neither is available.
+/// `FileKeyCustody`. The `passphrase` parameter is required in this mode.
 ///
 /// Opens (or creates) persistent storage at `<data_dir>/storage/` and a redb
 /// blob database at `<data_dir>/blobs.redb`.
@@ -655,9 +661,11 @@ pub async fn node_start_local(
     .await?;
 
     // Auto-wire the ContextManager with relay transport.
+    // Use the internal loopback URL — see comment in node_start_in_memory.
     let did = node.identity().did().to_owned();
-    let relay_url = node.relay_url().to_owned();
-    auto_wire_context_manager(&did, &relay_url).await;
+    let relay_url = format!("ws://127.0.0.1:{}/scp/v1", node.relay().bound_addr().port());
+    let bridge_token = node.bridge_token_hex();
+    auto_wire_context_manager(&did, &relay_url, bridge_token).await;
 
     increment_handle_count();
     Ok(Arc::new(NodeHandle {

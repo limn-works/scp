@@ -67,7 +67,7 @@ pub enum ContextDiscoverySource {
     /// Discovered via `.well-known/scp` document.
     WellKnown,
     /// Discovered via the `agent_search` tool in a context with discovery tools.
-    DiscoveryContext {
+    HandleRegistry {
         /// The context ID.
         context_id: String,
     },
@@ -567,7 +567,7 @@ mod tests {
         let sources = vec![
             ContextDiscoverySource::DhtDidDocument,
             ContextDiscoverySource::WellKnown,
-            ContextDiscoverySource::DiscoveryContext {
+            ContextDiscoverySource::HandleRegistry {
                 context_id: "ctx-disc-1".to_owned(),
             },
             ContextDiscoverySource::ContextUri,

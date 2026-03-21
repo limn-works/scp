@@ -447,6 +447,122 @@ impl MerkleEventLogProvider {
         Some(remove_count)
     }
 
+    /// Prunes event log entries before a checkpoint boundary based on a
+    /// [`PruningPolicy`](crate::context::governance::PruningPolicy).
+    ///
+    /// Called after creating a governance checkpoint (#1474). If the policy
+    /// has time-based pruning configured, entries older than
+    /// `now - retention_secs` (clamped to 30-day minimum) and before the
+    /// checkpoint boundary (`checkpoint_event_count`) are removed.
+    ///
+    /// If only size-based pruning is configured, entries beyond
+    /// `max_event_count` are removed (keeping the most recent).
+    ///
+    /// Structural events (governance, membership) are retained
+    /// `structural_retention_multiplier / 10000` times longer than
+    /// operational events per ADR-030 §2c.
+    ///
+    /// # Returns
+    ///
+    /// The number of entries removed, or `None` if no log exists for
+    /// the context.
+    pub fn prune_before_checkpoint(
+        &self,
+        context_id: &[u8; 32],
+        checkpoint_event_count: u64,
+        policy: &crate::context::governance::PruningPolicy,
+    ) -> Option<usize> {
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        /// Minimum retention: 30 days (protocol floor per ADR-030 §2a).
+        const MIN_RETENTION_SECS: u64 = 2_592_000;
+
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+
+        let mut logs = self
+            .logs
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let log = logs.get_mut(context_id)?;
+
+        let total = log.entries.len();
+        if total == 0 {
+            return Some(0);
+        }
+
+        // Cannot prune beyond the checkpoint boundary (entries at or after
+        // the checkpoint are still live).
+        #[allow(clippy::cast_possible_truncation)]
+        let checkpoint_bound = (checkpoint_event_count as usize).min(total);
+
+        let mut prune_count = 0usize;
+
+        // Time-based and size-based pruning evaluate independently;
+        // we take the maximum of the two so that both policies are honored.
+        if let Some(ref time_policy) = policy.time_based {
+            let retention = time_policy.retention_secs.max(MIN_RETENTION_SECS);
+
+            let mut time_prune = 0usize;
+            for entry in log.entries.iter().take(checkpoint_bound) {
+                let is_structural = is_structural_event_name(&entry.event);
+                // Apply structural retention multiplier: structural events are
+                // retained longer. Uses integer arithmetic (basis points) to
+                // avoid f64 precision loss on u64 values.
+                let effective_retention = if is_structural {
+                    let multiplier_bp =
+                        u128::from(policy.event_type_retention.structural_retention_multiplier);
+                    #[allow(clippy::cast_possible_truncation)]
+                    let r = (u128::from(retention) * multiplier_bp / 10_000) as u64;
+                    r.max(retention)
+                } else {
+                    retention
+                };
+
+                if entry.timestamp < now.saturating_sub(effective_retention) {
+                    time_prune += 1;
+                } else {
+                    // Entries are ordered by time; once we find a
+                    // retained entry, all subsequent are also retained.
+                    break;
+                }
+            }
+            prune_count = prune_count.max(time_prune);
+        }
+
+        if let Some(ref size_policy) = policy.size_based {
+            // Size-based: keep at most `max_event_count` entries.
+            #[allow(clippy::cast_possible_truncation)]
+            let max_count = size_policy.max_event_count as usize;
+            if total > max_count {
+                let size_prune = (total - max_count).min(checkpoint_bound);
+                prune_count = prune_count.max(size_prune);
+            }
+        }
+
+        if prune_count == 0 {
+            return Some(0);
+        }
+
+        tracing::info!(
+            context_id = %hex::encode(context_id),
+            pruned = prune_count,
+            remaining = total - prune_count,
+            "pruned event log entries after checkpoint"
+        );
+
+        log.entries.drain(..prune_count);
+
+        // Persist the pruned state (bulk rewrite with renumbered keys).
+        let entries_snapshot = log.entries.clone();
+        drop(logs);
+        self.persist_entries_best_effort(context_id, &entries_snapshot);
+
+        Some(prune_count)
+    }
+
     /// Best-effort O(1) persistence of a single entry at a given sequence.
     ///
     /// Used by `append_event` to persist only the newly appended entry.
@@ -498,6 +614,34 @@ impl Default for MerkleEventLogProvider {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// Returns `true` if the event name represents a structural event
+/// (governance, membership) that should be retained longer than
+/// operational events per ADR-030 §2c.
+///
+/// Mirrors the `is_structural_event` function in `scp-event-log/src/pruning.rs`
+/// but operates on event name strings rather than `EventType` enum values.
+fn is_structural_event_name(event: &str) -> bool {
+    matches!(
+        event,
+        "ContextCreated"
+            | "MemberJoined"
+            | "MemberLeft"
+            | "RoleAssigned"
+            | "GovernanceAction"
+            | "GovernanceActionProposed"
+            | "GovernanceActionApproved"
+            | "GovernanceActionExecuted"
+            | "GovernanceActionRejected"
+            | "GovernanceActionWithdrawn"
+            | "ContextClosing"
+            | "ContextClosed"
+            | "ContextExpired"
+            | "MemberBlocked"
+            | "ConsistencyCheckpoint"
+            | "PruningPolicyModified"
+    )
 }
 
 // Nursery lint — false-positives on lock guards across block boundaries.
@@ -587,6 +731,16 @@ impl ContextEventLogProvider for MerkleEventLogProvider {
                 hex::encode(context_id)
             ))
         })
+    }
+
+    fn prune_before_checkpoint(
+        &self,
+        context_id: &[u8; 32],
+        checkpoint_event_count: u64,
+        policy: &crate::context::governance::PruningPolicy,
+    ) -> Option<usize> {
+        // Delegate to the concrete method on MerkleEventLogProvider.
+        Self::prune_before_checkpoint(self, context_id, checkpoint_event_count, policy)
     }
 }
 

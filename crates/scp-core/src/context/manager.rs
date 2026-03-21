@@ -1478,6 +1478,18 @@ impl ContextManager {
     /// low probability and acceptable for v1 -- the worst case is a
     /// single extra key-epoch replay on restart, which the pull-based
     /// key distribution protocol already handles idempotently.
+    /// Updates operational gauge metrics (active contexts, buffer occupancy).
+    ///
+    /// Called after mutations that change context count or buffer state.
+    /// Takes the contexts lock, so callers must NOT hold it. Best-effort:
+    /// if no metrics recorder is installed, these are no-ops (#1467).
+    async fn update_context_gauges(&self) {
+        let contexts = self.contexts.lock().await;
+        crate::metrics::set_active_contexts(contexts.len());
+        let total_buffered: usize = contexts.values().map(|c| c.receive_buffer.len()).sum();
+        crate::metrics::set_buffer_occupancy(total_buffered);
+    }
+
     fn persist_context_snapshot(&self, context_id: &str, mut snapshot: ContextSnapshot) {
         if let Some(ref persistence) = self.persistence {
             // Export MLS crypto state alongside the context snapshot (#645).
@@ -1499,6 +1511,7 @@ impl ContextManager {
             if let Err(e) = persistence.persist_context(context_id, &snapshot) {
                 // Best-effort persistence: log but don't fail the operation.
                 // In-memory state remains authoritative.
+                crate::metrics::record_persistence_failure();
                 let _ = e; // Suppress unused warning; tracing integration is TBD.
             }
         }
@@ -2292,14 +2305,33 @@ impl ContextManager {
         };
 
         // 7. Register the context.
-        //    Existence was already checked at step 2 — if the context was
-        //    replaceable its crypto state was cleaned up there. Here we just
-        //    remove the stale entry (if any) and insert the new one.
+        //    Re-check replaceability under the lock to close the TOCTOU gap
+        //    between step 2 (which dropped the lock for event log import) and
+        //    this insertion. A concurrent `create_context` or `import_context`
+        //    could have registered an Active context in the meantime.
         {
             let mut contexts = self.contexts.lock().await;
+            if let Some(existing) = contexts.get(&context_id) {
+                let is_replaceable = existing.handle.try_read_state().is_some_and(|s| {
+                    matches!(
+                        s,
+                        ContextState::Closing
+                            | ContextState::Closed
+                            | ContextState::Expired
+                            | ContextState::Tombstoned
+                    )
+                });
+                if !is_replaceable {
+                    return Err(ContextError::MembershipFailed(format!(
+                        "context '{context_id}' was concurrently registered during import"
+                    )));
+                }
+            }
             contexts.remove(&context_id);
             contexts.insert(context_id.clone(), per_context);
         }
+
+        self.update_context_gauges().await;
 
         // Start governance timeout task (ADR-031 §5).
         self.start_governance_timeout_task(&context_id).await;
@@ -2443,6 +2475,7 @@ impl ContextManager {
             contexts.insert(context_id.clone(), per_context);
         }
 
+        self.update_context_gauges().await;
         self.start_governance_timeout_task(&context_id).await;
         self.persist_context_and_broadcast(&context_id).await;
         if let Some(ttl_duration) = params.ttl {
@@ -3069,11 +3102,14 @@ impl ContextManager {
         // Lock dropped before crypto/transport/event-log calls.
 
         // Phase 2 (no lock): Encrypt + send via transport.
-        // If either fails, return error — no phantom MessageSent in buffer
-        // and no membership-level sequence number burned.
-        let encrypted = if let Some(ref envelope) = broadcast_envelope {
-            // Broadcast: serialize envelope for transport.
-            envelope.encrypted_content.clone()
+        // If either fails, return error — no phantom MessageSent in buffer.
+        // Sequence number is burned on failure (gaps are harmless).
+        let encrypted = if let Some(envelope) = broadcast_envelope {
+            // Broadcast: serialize the full BroadcastEnvelope for transport.
+            // The relay stores the entire envelope so that the node's projection
+            // layer can reconstruct metadata without decrypting.
+            rmp_serde::to_vec_named(&envelope)
+                .map_err(|e| ContextError::CryptoFailed(format!("envelope serialization: {e}")))?
         } else {
             // Encrypted: sender key (ADR-007) -> inner envelope (ADR-002) ->
             // MLS (ADR-001) -> outer envelope.
@@ -3081,12 +3117,19 @@ impl ContextManager {
             // incremented on key rotation). Sequence 0 — changing this requires
             // sending the sequence in the clear alongside the ciphertext so the
             // receiver can reconstruct the AAD.
-            self.crypto
-                .encrypt_message(&context_id_bytes, sender_did, payload, 0, 0)?
+            let encrypt_start = std::time::Instant::now();
+            let result =
+                self.crypto
+                    .encrypt_message(&context_id_bytes, sender_did, payload, 0, 0)?;
+            crate::metrics::record_encrypt_duration(encrypt_start.elapsed());
+            result
         };
 
         // Send via transport.
         self.transport.send_message(&context_id_bytes, &encrypted)?;
+
+        // Record message sent metric (#1467).
+        crate::metrics::record_message_sent();
 
         // Phase 3 (re-acquire lock): Re-check context active + membership,
         // assign sequence number NOW (post-transport), then push MessageSent
@@ -3178,9 +3221,11 @@ impl ContextManager {
         // #1422). This is safe because MLS already provides its own replay
         // protection via the ratchet tree; the sender key AAD is a
         // defense-in-depth layer that is currently inert.
+        let decrypt_start = std::time::Instant::now();
         let decrypted = self
             .crypto
             .decrypt_message(&context_id_bytes, encrypted_blob, 0, 0)?;
+        crate::metrics::record_decrypt_duration(decrypt_start.elapsed());
 
         // Commit/Proposal messages have no application payload — the MLS epoch
         // was advanced (Commit) or the proposal was cached (Proposal). Skip
@@ -3231,6 +3276,9 @@ impl ContextManager {
                 payload: plaintext.clone(),
             });
         }
+
+        // Record message received metric (#1467).
+        crate::metrics::record_message_received();
 
         // Append event to event log (best-effort, matches send_message).
         let _ = self
@@ -3681,9 +3729,16 @@ impl ContextManager {
         };
         // Lock dropped.
 
+        // Serialize the full BroadcastEnvelope for transport. The relay stores
+        // the entire envelope (not just encrypted_content) so that the node's
+        // projection layer can reconstruct metadata (author_did, key_epoch, etc.)
+        // without decrypting.
+        let envelope_bytes = rmp_serde::to_vec_named(&envelope)
+            .map_err(|e| ContextError::CryptoFailed(format!("envelope serialization: {e}")))?;
+
         // Send via transport.
         self.transport
-            .send_message(&context_id_bytes, &envelope.encrypted_content)?;
+            .send_message(&context_id_bytes, &envelope_bytes)?;
 
         // Append event to persistent event log.
         self.event_log
@@ -4007,27 +4062,29 @@ impl ContextManager {
         // Construct the structured GovernanceEvent::GovernanceActionExecuted
         // and emit it to both the Merkle event log and the receive buffer
         // (ADR-031 §8, PRD SCP-269/SCP-270).
+        let executed_event = GovernanceEvent::GovernanceActionExecuted {
+            proposal_id: proposal.proposal_id,
+            action: Box::new(proposal.action.clone()),
+            executor_did: proposal.proposer_did.clone(),
+            resulting_epoch,
+        };
+
+        // Append to Merkle event log using the standard governance event
+        // label path (same pattern as propose/approve/reject/withdraw).
+        let context_id_bytes = context_id_to_bytes(context_id);
+        self.event_log.append_context_event(
+            &context_id_bytes,
+            Self::governance_event_label(&executed_event),
+        )?;
+
+        // Single lock acquisition for all post-event-log state mutations
+        // (#1428 — eliminates TOCTOU window from multiple lock acquisitions).
         {
-            let executed_event = GovernanceEvent::GovernanceActionExecuted {
-                proposal_id: proposal.proposal_id,
-                action: Box::new(proposal.action.clone()),
-                executor_did: proposal.proposer_did.clone(),
-                resulting_epoch,
-            };
-
-            // Append to Merkle event log using the standard governance event
-            // label path (same pattern as propose/approve/reject/withdraw).
-            let context_id_bytes = context_id_to_bytes(context_id);
-            self.event_log.append_context_event(
-                &context_id_bytes,
-                Self::governance_event_label(&executed_event),
-            )?;
-
-            // Push to receive buffer so SDK consumers observe outcomes with
-            // rich context.
             let action_summary = proposal.action.variant_name().to_owned();
             let mut contexts = self.contexts.lock().await;
             if let Some(ctx) = contexts.get_mut(context_id) {
+                // 1. Push GovernanceActionExecuted to receive buffer so SDK
+                //    consumers observe outcomes with rich context.
                 ctx.receive_buffer
                     .push(ContextEvent::GovernanceActionExecuted {
                         proposal_id: proposal.proposal_id,
@@ -4035,15 +4092,11 @@ impl ContextManager {
                         executor_did: proposal.proposer_did.clone(),
                         resulting_epoch,
                     });
-            }
-        }
 
-        // Trigger checkpoint cosignature collection for multi-admin contexts
-        // (ADR-031 §9, issue #630). SingleAdmin contexts emit no event because
-        // they require no cosignatures (quorum is 0).
-        {
-            let mut contexts = self.contexts.lock().await;
-            if let Some(ctx) = contexts.get_mut(context_id) {
+                // 2. Trigger checkpoint cosignature collection for multi-admin
+                //    contexts (ADR-031 §9, issue #630). SingleAdmin contexts
+                //    emit no event because they require no cosignatures
+                //    (quorum is 0).
                 let (required_signers, minimum_count) =
                     ctx.governance_engine.checkpoint_cosignature_requirements();
                 if minimum_count > 0 {
@@ -4055,17 +4108,14 @@ impl ContextManager {
                             at_epoch: ctx.mls_epoch,
                         });
                 }
-            }
-        }
 
-        // Remove the executed proposal from approved_proposals so it no
-        // longer participates in conflict detection (ADR-031 §7).  Replay
-        // prevention is already handled by `executed_proposals`.
-        // Persist the updated context state afterwards.
-        {
-            let mut contexts = self.contexts.lock().await;
-            if let Some(ctx) = contexts.get_mut(context_id) {
+                // 3. Remove the executed proposal from approved_proposals so
+                //    it no longer participates in conflict detection
+                //    (ADR-031 §7). Replay prevention is already handled by
+                //    `executed_proposals`.
                 ctx.approved_proposals.remove(&proposal.proposal_id);
+
+                // 4. Persist the updated context state (best-effort).
                 if self.has_persistence() {
                     let snapshot = Self::snapshot_context(ctx);
                     drop(contexts);
@@ -7519,6 +7569,8 @@ impl ContextManager {
             }
         }
 
+        self.update_context_gauges().await;
+
         // Persist context state after close (best-effort).
         if self.has_persistence() {
             let contexts = self.contexts.lock().await;
@@ -8130,12 +8182,15 @@ impl ContextManager {
             CheckpointAttestationStatus::PartiallyAttested
         };
 
+        // Capture pruning policy before dropping the lock.
+        let pruning_policy = ctx.pruning_policy.clone();
+
         let created_at = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs();
 
-        Ok(ContextCheckpoint {
+        let checkpoint = ContextCheckpoint {
             checkpoint_seq,
             merkle_root,
             event_count,
@@ -8146,7 +8201,31 @@ impl ContextManager {
             creator_signature,
             cosignatures: Vec::new(),
             attestation_status,
-        })
+        };
+
+        // Drop the contexts lock before pruning to avoid holding it during
+        // potentially expensive I/O (persistence writes).
+        drop(contexts);
+
+        // Trigger event log pruning if a pruning policy is configured on the
+        // context (#1474). Best-effort: log but do not fail the checkpoint
+        // creation if pruning encounters an error.
+        if let Some(ref policy) = pruning_policy {
+            let context_id_bytes = context_id_to_bytes(context_id);
+            if self
+                .event_log
+                .prune_before_checkpoint(&context_id_bytes, event_count, policy)
+                .is_some_and(|pruned| pruned > 0)
+            {
+                tracing::info!(
+                    context_id = %context_id,
+                    checkpoint_seq = checkpoint_seq,
+                    "pruned event log entries after governance checkpoint"
+                );
+            }
+        }
+
+        Ok(checkpoint)
     }
 
     /// Adds a cosignature to an existing checkpoint and re-evaluates attestation status.

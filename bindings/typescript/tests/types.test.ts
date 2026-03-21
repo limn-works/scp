@@ -147,7 +147,7 @@ describe("type definitions", () => {
       { kind: "LocalPetname" },
       { kind: "DomainVerified" },
       { kind: "AttestationVerified" },
-      { kind: "DiscoveryContextVerified" },
+      { kind: "HandleRegistryVerified" },
     ];
     expect(levels).toHaveLength(5);
   });
@@ -168,12 +168,12 @@ describe("type definitions", () => {
 
   it("ResolutionPath has all required fields", () => {
     const path: ResolutionPath = {
-      layer: "DiscoveryContext",
+      layer: "HandleRegistry",
       source: "cooking-community",
       sourceId: "ctx-disc-1",
       resolvedAt: 1700000000,
     };
-    expect(path.layer).toBe("DiscoveryContext");
+    expect(path.layer).toBe("HandleRegistry");
     expect(path.source).toBe("cooking-community");
     expect(path.sourceId).toBe("ctx-disc-1");
     expect(path.resolvedAt).toBe(1700000000);
@@ -193,9 +193,9 @@ describe("type definitions", () => {
     const resolution: AddressResolution = {
       type: "Identity",
       did: "did:dht:z6MkAlice",
-      trustLevel: { kind: "DiscoveryContextVerified" },
+      trustLevel: { kind: "HandleRegistryVerified" },
       resolutionPath: {
-        layer: "DiscoveryContext",
+        layer: "HandleRegistry",
         source: "cooking-community",
         sourceId: "ctx-disc-1",
         resolvedAt: 1700000000,
@@ -204,8 +204,8 @@ describe("type definitions", () => {
     expect(resolution.type).toBe("Identity");
     if (resolution.type === "Identity") {
       expect(resolution.did).toBe("did:dht:z6MkAlice");
-      expect(resolution.trustLevel.kind).toBe("DiscoveryContextVerified");
-      expect(resolution.resolutionPath.layer).toBe("DiscoveryContext");
+      expect(resolution.trustLevel.kind).toBe("HandleRegistryVerified");
+      expect(resolution.resolutionPath.layer).toBe("HandleRegistry");
     }
   });
 
@@ -239,10 +239,10 @@ describe("type definitions", () => {
       contextId: "deadbeef",
       relayUrls: [],
       mode: null,
-      trustLevel: { kind: "DiscoveryContextVerified" },
+      trustLevel: { kind: "HandleRegistryVerified" },
       resolutionPath: {
-        layer: "DiscoveryContext",
-        source: "discovery_context",
+        layer: "HandleRegistry",
+        source: "handle_registry",
         sourceId: "disc-ctx-1",
         resolvedAt: 1700000000,
       },

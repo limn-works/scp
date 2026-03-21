@@ -340,7 +340,7 @@ export class Identity {
       if (!fn) {
         throw new IdentityError(
           "Identity link attestation creation is not yet available in the bridge",
-          "SCP-ATTEST-9001",
+          "SCP-ATTEST-9010",
         );
       }
       const json = await fn(
@@ -371,7 +371,7 @@ export class Identity {
       if (!fn) {
         throw new IdentityError(
           "Identity link attestation listing is not yet available in the bridge",
-          "SCP-ATTEST-9002",
+          "SCP-ATTEST-9011",
         );
       }
       const json = await fn(this.did);
@@ -398,7 +398,7 @@ export class Identity {
       if (!fn) {
         throw new IdentityError(
           "Identity link attestation removal is not yet available in the bridge",
-          "SCP-ATTEST-9003",
+          "SCP-ATTEST-9012",
         );
       }
       return await fn(this.did, attestationId);
@@ -423,7 +423,7 @@ export class Identity {
       if (!fn) {
         throw new IdentityError(
           "Identity link attestation renewal is not yet available in the bridge",
-          "SCP-ATTEST-9004",
+          "SCP-ATTEST-9013",
         );
       }
       const json = await fn(this.did, attestation.id);
@@ -431,6 +431,108 @@ export class Identity {
     } catch (error) {
       throw error instanceof IdentityError ? error : mapBridgeError(error);
     }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// RevocationStatus
+// ---------------------------------------------------------------------------
+
+/**
+ * Revocation status for an identity attestation (§3.5).
+ *
+ * Mirrors the Rust `RevocationStatus` enum:
+ *
+ * - `Active` -> `RevocationStatus({ status: "active" })`
+ * - `Revoked { revoked_at, reason }` ->
+ *   `RevocationStatus({ status: "revoked", revokedAt: ..., reason: ... })`
+ */
+export type RevocationStatusData =
+  | { readonly status: "active" }
+  | { readonly status: "revoked"; readonly revokedAt: number; readonly reason?: string };
+
+/**
+ * Revocation status for an identity attestation (§3.5).
+ *
+ * Immutable value object. Use `RevocationStatus.active()` or
+ * `RevocationStatus.revoked(revokedAt, reason?)` factory methods.
+ */
+export class RevocationStatus {
+  /** Status string: `"active"` or `"revoked"`. */
+  readonly status: "active" | "revoked";
+
+  /**
+   * Unix timestamp (seconds) when the attestation was revoked.
+   * Only present when `status === "revoked"`.
+   */
+  readonly revokedAt: number | undefined;
+
+  /**
+   * Optional human-readable revocation reason.
+   * Only present when `status === "revoked"`.
+   */
+  readonly reason: string | undefined;
+
+  private constructor(data: RevocationStatusData) {
+    this.status = data.status;
+    if (data.status === "revoked") {
+      this.revokedAt = data.revokedAt;
+      this.reason = data.reason;
+    } else {
+      this.revokedAt = undefined;
+      this.reason = undefined;
+    }
+  }
+
+  /** Creates an active revocation status. */
+  static active(): RevocationStatus {
+    return new RevocationStatus({ status: "active" });
+  }
+
+  /** Creates a revoked revocation status. */
+  static revoked(revokedAt: number, reason?: string): RevocationStatus {
+    const data: RevocationStatusData =
+      reason !== undefined
+        ? { status: "revoked", revokedAt, reason }
+        : { status: "revoked", revokedAt };
+    return new RevocationStatus(data);
+  }
+
+  /** @internal Convert to bridge-compatible representation. */
+  _toBridgeValue(): unknown {
+    if (this.status === "revoked") {
+      const revoked: Record<string, unknown> = {};
+      if (this.revokedAt !== undefined) {
+        revoked.revoked_at = this.revokedAt;
+      }
+      if (this.reason !== undefined) {
+        revoked.reason = this.reason;
+      }
+      return { Revoked: revoked };
+    }
+    return "Active";
+  }
+
+  /** @internal Parse from bridge JSON representation. */
+  static _fromBridgeValue(raw: unknown): RevocationStatus {
+    if (typeof raw === "object" && raw !== null && "Revoked" in raw) {
+      const revoked = (raw as Record<string, Record<string, unknown>>).Revoked;
+      const revokedAt = revoked?.revoked_at as number | undefined;
+      if (revokedAt === undefined) {
+        throw new Error("Bridge returned Revoked status without revoked_at timestamp");
+      }
+      return RevocationStatus.revoked(revokedAt, revoked?.reason as string | undefined);
+    }
+    if (typeof raw === "string") {
+      const lower = raw.toLowerCase();
+      if (lower === "active") {
+        return RevocationStatus.active();
+      }
+      if (lower === "revoked") {
+        throw new Error("Bridge returned bare 'revoked' string without revocation metadata");
+      }
+    }
+    throw new Error(`Unknown revocation status from bridge: ${String(raw)}`);
   }
 }
 
@@ -450,8 +552,8 @@ export interface IdentityAttestationData {
   readonly verificationMethod: string;
   /** Unix timestamp (seconds) when the evidence was last verified. */
   readonly verifiedAt: number;
-  /** Revocation status: `"active"`, `"revoked"`, or `"expired"`. */
-  readonly revocationStatus: string;
+  /** Revocation status. */
+  readonly revocationStatus: RevocationStatus;
   /** Optional platform-assigned unique identifier. */
   readonly platformId?: string | undefined;
 }
@@ -473,8 +575,8 @@ export class IdentityAttestation implements IdentityAttestationData {
   readonly verificationMethod: string;
   /** Unix timestamp (seconds) when the evidence was last verified. */
   readonly verifiedAt: number;
-  /** Revocation status: `"active"`, `"revoked"`, or `"expired"`. */
-  readonly revocationStatus: string;
+  /** Revocation status. */
+  readonly revocationStatus: RevocationStatus;
   /** Optional platform-assigned unique identifier. */
   readonly platformId?: string | undefined;
 
@@ -505,7 +607,7 @@ export class IdentityAttestation implements IdentityAttestationData {
       if (!fn) {
         throw new IdentityError(
           "Attestation verification is not yet available in the bridge",
-          "SCP-ATTEST-9005",
+          "SCP-ATTEST-9014",
         );
       }
       const resultJson = await fn(JSON.stringify(this._toBridgeRecord()));
@@ -524,7 +626,7 @@ export class IdentityAttestation implements IdentityAttestationData {
       platform_handle: this.platformHandle,
       verification_method: this.verificationMethod,
       verified_at: this.verifiedAt,
-      revocation_status: this.revocationStatus,
+      revocation_status: this.revocationStatus._toBridgeValue(),
     };
     if (this.platformId !== undefined) {
       rec.platform_id = this.platformId;
@@ -540,13 +642,17 @@ export class IdentityAttestation implements IdentityAttestationData {
 
   /** @internal */
   static _fromRecord(data: Record<string, unknown>): IdentityAttestation {
+    const rawRs = data.revocation_status ?? data.revocationStatus ?? "active";
+    const revocationStatus =
+      rawRs instanceof RevocationStatus ? rawRs : RevocationStatus._fromBridgeValue(rawRs);
+
     return new IdentityAttestation({
       id: data.id as string,
       platform: data.platform as string,
       platformHandle: (data.platform_handle ?? data.platformHandle) as string,
       verificationMethod: (data.verification_method ?? data.verificationMethod) as string,
       verifiedAt: (data.verified_at ?? data.verifiedAt) as number,
-      revocationStatus: ((data.revocation_status ?? data.revocationStatus) as string) || "active",
+      revocationStatus,
       platformId: (data.platform_id ?? data.platformId) as string | undefined,
     });
   }

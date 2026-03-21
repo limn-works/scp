@@ -34,8 +34,6 @@ use pyo3::types::PyDict;
 use scp_platform::traits::KeyCustody;
 use tokio::sync::mpsc;
 
-use zeroize::Zeroizing;
-
 use crate::validate;
 
 // ---------------------------------------------------------------------------
@@ -365,6 +363,10 @@ const VALID_TEMPLATE_IDS: &[&str] = &[
     "scp:template/tool-interface",
     "scp:template/paid-service",
     "scp:template/paid-broadcast",
+    "HandleRegistry",
+    "scp:template/handle-registry",
+    "DiscoveryContext",
+    "scp:template/discovery-context",
 ];
 
 impl PyContextParams {
@@ -1452,6 +1454,10 @@ fn build_core_context_params(py_params: &PyContextParams) -> scp_core::context::
         "scp:template/tool-interface" => Some(TemplateId::ToolInterfaceTemplate),
         "scp:template/paid-service" => Some(TemplateId::PaidService),
         "scp:template/paid-broadcast" => Some(TemplateId::PaidBroadcast),
+        "scp:template/handle-registry"
+        | "HandleRegistry"
+        | "scp:template/discovery-context"
+        | "DiscoveryContext" => Some(TemplateId::HandleRegistry),
         _ => None,
     });
 
@@ -2404,9 +2410,9 @@ fn py_create_governance_checkpoint(
     let merkle_root = parse_hex_32(merkle_root_hex, "merkle_root")?;
     let last_event_hash = parse_hex_32(last_event_hash_hex, "last_event_hash")?;
     let state_snapshot_hash = parse_hex_32(state_snapshot_hash_hex, "state_snapshot_hash")?;
-    let creator_signature = Zeroizing::new(hex::decode(creator_signature_hex).map_err(|e| {
+    let creator_signature = hex::decode(creator_signature_hex).map_err(|e| {
         PyValueError::new_err(format!("SCP-CTX-2062: invalid creator_signature hex: {e}"))
-    })?);
+    })?;
     let did = scp_identity::DID(creator_did.to_owned());
 
     rt.block_on(async move {
@@ -2419,7 +2425,7 @@ fn py_create_governance_checkpoint(
                 last_event_hash,
                 state_snapshot_hash,
                 &did,
-                (*creator_signature).clone(),
+                creator_signature,
             )
             .await
             .map_err(|e| {
@@ -2471,14 +2477,12 @@ fn py_add_checkpoint_cosignature(
             PyValueError::new_err(format!("SCP-CTX-2063: invalid checkpoint JSON: {e}"))
         })?;
 
-    let signature =
-        Zeroizing::new(hex::decode(signature_hex).map_err(|e| {
-            PyValueError::new_err(format!("SCP-CTX-2063: invalid signature hex: {e}"))
-        })?);
+    let signature = hex::decode(signature_hex)
+        .map_err(|e| PyValueError::new_err(format!("SCP-CTX-2063: invalid signature hex: {e}")))?;
 
     let cosignature = scp_core::context::governance::CosignedCheckpoint {
         signer_did: scp_identity::DID(signer_did.to_owned()),
-        signature: (*signature).clone(),
+        signature,
     };
 
     rt.block_on(async move {
@@ -3588,9 +3592,8 @@ pub fn py_metadata_record_to_json(
             crate::error::ScpPyError::validation(format!("invalid operational metadata JSON: {e}"))
         })?;
 
-    let signature = Zeroizing::new(hex::decode(&signature_hex).map_err(|e| {
-        crate::error::ScpPyError::validation(format!("invalid signature hex: {e}"))
-    })?);
+    let signature = hex::decode(&signature_hex)
+        .map_err(|e| crate::error::ScpPyError::validation(format!("invalid signature hex: {e}")))?;
     if signature.len() != 64 {
         return Err(crate::error::ScpPyError::validation(format!(
             "signature must be 64 bytes (got {})",
@@ -3606,7 +3609,7 @@ pub fn py_metadata_record_to_json(
         timestamp,
         structural,
         operational,
-        signature: (*signature).clone(),
+        signature,
     };
 
     serde_json::to_string(&record).map_err(|e| {
@@ -3677,7 +3680,7 @@ pub fn py_metadata_record_from_json(json_str: String) -> PyResult<String> {
 /// - `"scp:template/tool-interface"`
 /// - `"PaidService"`
 /// - `"PaidBroadcast"`
-/// - `"DiscoveryContext"`
+/// - `"HandleRegistry"`
 ///
 /// # Errors
 ///
@@ -3764,12 +3767,16 @@ fn parse_template_id(
         }
         "PaidService" => Ok(TemplateId::PaidService),
         "PaidBroadcast" => Ok(TemplateId::PaidBroadcast),
-        "DiscoveryContext" => Ok(TemplateId::DiscoveryContext),
+        "scp:template/handle-registry"
+        | "HandleRegistry"
+        | "scp:template/discovery-context"
+        | "DiscoveryContext" => Ok(TemplateId::HandleRegistry),
         _ => Err(crate::error::ScpPyError::validation(format!(
             "unknown template ID: {template_id:?} — valid values: BilateralEphemeral, \
              BilateralPersistent, Coordination, GroupDiscussion, PublicBroadcast, \
              GatedBroadcast, scp:template/tool-interface, PaidService, PaidBroadcast, \
-             DiscoveryContext"
+             HandleRegistry, scp:template/handle-registry, DiscoveryContext, \
+             scp:template/discovery-context"
         ))),
     }
 }

@@ -1121,7 +1121,7 @@ These events are appended to the identity private state event log (§3.7). They 
 |---------|-----|--------|-----------|
 | `DhtDidDocument` | `"dht_did_document"` | — | Found via `SCPBroadcastContext` service in publisher's DID doc. |
 | `WellKnown` | `"well_known"` | — | Found via `.well-known/scp` on a domain. |
-| `DiscoveryContext` | `"discovery_context"` | `context_id: String` | Found via search in a context with discovery tools. |
+| `HandleRegistry` | `"handle_registry"` | `context_id: String` | Found via search in a context with discovery tools. |
 | `ContextUri` | `"context_uri"` | — | Found via `scp://` URI. |
 
 **`BootstrapConfig`** — Client bootstrap discovery configuration. See §22.13 for the two-context bootstrap governance model.

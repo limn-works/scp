@@ -39,11 +39,10 @@ ignore = [
     # instant: unmaintained, transitive dep via openmls -> fluvio-wasm-timer.
     # No alternative available; openmls uses it for WASM time abstraction.
     "RUSTSEC-2024-0384",
-    # aws-lc-rs CN validation bypass — transitive via rustls. Awaiting upstream patch.
+    # aws-lc-sys: X.509 CN wildcard/unicode bypass, CRL distribution point logic errors.
+    # Transitive dep via rustls/aws-sdk. Awaiting upstream aws-lc-sys patch release.
     "RUSTSEC-2026-0044",
-    # aws-lc-rs CRL distribution point matching bypass — transitive via rustls.
     "RUSTSEC-2026-0048",
-    # aws-lc-rs CRL distribution point iteration bug — transitive via rustls.
     "RUSTSEC-2026-0049",
 ]
 

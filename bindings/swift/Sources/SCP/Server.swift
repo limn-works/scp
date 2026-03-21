@@ -275,10 +275,7 @@ public struct Node: Sendable {
     ///
     /// When `identity` is provided, the node uses the pre-existing identity.
     /// When `nil`, the node creates or reloads a persistent identity via
-    /// `FileKeyCustody`. The passphrase for key derivation is resolved as:
-    /// 1. The explicit `passphrase` parameter, if provided.
-    /// 2. The `SCP_KEY_PASSPHRASE` environment variable, if set.
-    /// 3. Returns an error if neither is available.
+    /// `FileKeyCustody`. The `passphrase` parameter is required in this mode.
     ///
     /// No passphrase is required when `identity` is provided.
     ///
@@ -288,8 +285,8 @@ public struct Node: Sendable {
     /// - Parameters:
     ///   - dataDir: Directory for persistent storage.
     ///   - identity: A pre-existing ``Identity`` to use, or `nil` to generate a fresh one.
-    ///   - passphrase: Passphrase for Argon2id key derivation. Falls back to
-    ///     `SCP_KEY_PASSPHRASE` env var when `nil`.
+    ///   - passphrase: Passphrase for Argon2id key derivation. Required when
+    ///     `identity` is `nil`.
     ///   - startFn: Bridge function override for testing.
     /// - Returns: A ``Node`` with ``relayUrl`` and ``did`` populated.
     /// - Throws: ``ScpError`` if startup fails.

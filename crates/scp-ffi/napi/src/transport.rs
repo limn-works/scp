@@ -49,7 +49,7 @@ fn relay_adapter_state() -> &'static RwLock<Option<Arc<NativeRelayAdapter>>> {
 /// # Errors
 ///
 /// Returns `ScpNapiError::Transport` if the lock is poisoned.
-fn set_relay_adapter(adapter: Arc<NativeRelayAdapter>) -> Result<(), ScpNapiError> {
+pub(crate) fn set_relay_adapter(adapter: Arc<NativeRelayAdapter>) -> Result<(), ScpNapiError> {
     *relay_adapter_state()
         .write()
         .map_err(|_| ScpNapiError::Transport {

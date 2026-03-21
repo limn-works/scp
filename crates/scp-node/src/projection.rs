@@ -48,6 +48,24 @@ use crate::error::ApiError;
 use crate::http::NodeState;
 
 // ---------------------------------------------------------------------------
+// OuterEnvelope unwrapping
+// ---------------------------------------------------------------------------
+
+/// Extracts the inner bytes from a stored blob wrapped in an `OuterEnvelope`.
+///
+/// Returns `None` if the blob is not a valid `OuterEnvelope` — the caller
+/// should skip it with a warning. No fallback to raw bytes.
+fn unwrap_outer_envelope(blob: &[u8]) -> Option<Vec<u8>> {
+    match scp_core::envelope::OuterEnvelope::from_bytes(blob) {
+        Ok(outer) => Some(outer.encrypted_blob),
+        Err(e) => {
+            tracing::warn!("failed to unwrap OuterEnvelope, skipping blob: {e}");
+            None
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Routing ID derivation
 // ---------------------------------------------------------------------------
 
@@ -1390,8 +1408,11 @@ fn decrypt_blobs(
     let mut latest_blob_id: Option<[u8; 32]> = None;
 
     for stored in blobs {
-        // Deserialize BroadcastEnvelope from MessagePack.
-        let envelope: BroadcastEnvelope = match rmp_serde::from_slice(&stored.blob) {
+        // Unwrap OuterEnvelope (transport layer), then deserialize BroadcastEnvelope.
+        let Some(inner_bytes) = unwrap_outer_envelope(&stored.blob) else {
+            continue;
+        };
+        let envelope: BroadcastEnvelope = match rmp_serde::from_slice(&inner_bytes) {
             Ok(env) => env,
             Err(e) => {
                 tracing::warn!(
@@ -1823,8 +1844,11 @@ pub async fn message_handler(
         }
     }
 
-    // Deserialize BroadcastEnvelope from MessagePack.
-    let envelope: BroadcastEnvelope = match rmp_serde::from_slice(&stored.blob) {
+    // Unwrap OuterEnvelope, then deserialize BroadcastEnvelope from MessagePack.
+    let Some(inner_bytes) = unwrap_outer_envelope(&stored.blob) else {
+        return ApiError::not_found("unknown blob_id").into_response();
+    };
+    let envelope: BroadcastEnvelope = match rmp_serde::from_slice(&inner_bytes) {
         Ok(env) => env,
         Err(e) => {
             tracing::warn!(
@@ -2088,8 +2112,11 @@ pub async fn site_handler(
         }
     };
 
-    // Deserialize BroadcastEnvelope.
-    let envelope: BroadcastEnvelope = match rmp_serde::from_slice(&stored.blob) {
+    // Unwrap OuterEnvelope, then deserialize BroadcastEnvelope.
+    let Some(inner_bytes) = unwrap_outer_envelope(&stored.blob) else {
+        return not_found_no_store();
+    };
+    let envelope: BroadcastEnvelope = match rmp_serde::from_slice(&inner_bytes) {
         Ok(env) => env,
         Err(e) => {
             tracing::warn!(
@@ -2324,6 +2351,15 @@ pub(crate) mod test_helpers {
         seal_broadcast(key, payload, &nonce, &params).unwrap()
     }
 
+    /// Wraps raw `BroadcastEnvelope` bytes in an `OuterEnvelope` for storage,
+    /// matching the format that transport produces.
+    pub fn wrap_in_outer_envelope(routing_id: [u8; 32], envelope_bytes: Vec<u8>) -> Vec<u8> {
+        let outer =
+            scp_core::envelope::create_outer_envelope(&routing_id, None, 3600, envelope_bytes)
+                .expect("test routing_id is 32 bytes");
+        outer.to_bytes().expect("OuterEnvelope serialization")
+    }
+
     /// Stores a `BroadcastContent` blob and returns its `blob_id`.
     pub async fn store_content_blob(
         storage: &InMemoryBlobStorage,
@@ -2333,7 +2369,8 @@ pub(crate) mod test_helpers {
     ) -> [u8; 32] {
         let serialized = serialize_broadcast_content(content).unwrap();
         let envelope = test_seal(key, &serialized);
-        let blob_bytes = rmp_serde::to_vec(&envelope).unwrap();
+        let envelope_bytes = rmp_serde::to_vec(&envelope).unwrap();
+        let blob_bytes = wrap_in_outer_envelope(routing_id, envelope_bytes);
         let blob_id = {
             let mut h = Sha256::new();
             h.update(&blob_bytes);
@@ -2444,7 +2481,8 @@ mod tests {
     fn decrypt_blobs_with_valid_envelope() {
         let key = generate_broadcast_key("did:dht:alice");
         let envelope = test_seal(&key, b"hello world");
-        let blob_bytes = rmp_serde::to_vec(&envelope).unwrap();
+        let envelope_bytes = rmp_serde::to_vec(&envelope).unwrap();
+        let blob_bytes = test_helpers::wrap_in_outer_envelope([0xAA; 32], envelope_bytes);
 
         let blob_id = {
             let mut hasher = Sha256::new();
@@ -2497,7 +2535,8 @@ mod tests {
     fn decrypt_blobs_skips_missing_epoch_key() {
         let key = generate_broadcast_key("did:dht:alice");
         let envelope = test_seal(&key, b"secret");
-        let blob_bytes = rmp_serde::to_vec(&envelope).unwrap();
+        let envelope_bytes = rmp_serde::to_vec(&envelope).unwrap();
+        let blob_bytes = test_helpers::wrap_in_outer_envelope([0xAA; 32], envelope_bytes);
 
         let stored = scp_transport::native::storage::StoredBlob {
             routing_id: [0xAA; 32],
@@ -2637,7 +2676,8 @@ mod tests {
 
         // Seal and store a broadcast message.
         let envelope = test_seal(&key, b"hello feed");
-        let blob_bytes = rmp_serde::to_vec(&envelope).unwrap();
+        let envelope_bytes = rmp_serde::to_vec(&envelope).unwrap();
+        let blob_bytes = test_helpers::wrap_in_outer_envelope(routing_id, envelope_bytes);
         let blob_id = {
             let mut h = Sha256::new();
             h.update(&blob_bytes);
@@ -2712,7 +2752,8 @@ mod tests {
         // Store 5 messages.
         for i in 0u8..5 {
             let envelope = test_seal(&key, &[i; 10]);
-            let blob_bytes = rmp_serde::to_vec(&envelope).unwrap();
+            let envelope_bytes = rmp_serde::to_vec(&envelope).unwrap();
+            let blob_bytes = test_helpers::wrap_in_outer_envelope(routing_id, envelope_bytes);
             let blob_id = {
                 let mut h = Sha256::new();
                 h.update(&blob_bytes);
@@ -2874,7 +2915,8 @@ mod tests {
 
         // Seal and store a broadcast message.
         let envelope = test_seal(&key, b"single message");
-        let blob_bytes = rmp_serde::to_vec(&envelope).unwrap();
+        let envelope_bytes = rmp_serde::to_vec(&envelope).unwrap();
+        let blob_bytes = test_helpers::wrap_in_outer_envelope(routing_id, envelope_bytes);
         let blob_id = {
             let mut h = Sha256::new();
             h.update(&blob_bytes);
@@ -2941,7 +2983,8 @@ mod tests {
         let storage = InMemoryBlobStorage::new();
 
         let envelope = test_seal(&key, b"cached msg");
-        let blob_bytes = rmp_serde::to_vec(&envelope).unwrap();
+        let envelope_bytes = rmp_serde::to_vec(&envelope).unwrap();
+        let blob_bytes = test_helpers::wrap_in_outer_envelope(routing_id, envelope_bytes);
         let blob_id = {
             let mut h = Sha256::new();
             h.update(&blob_bytes);
@@ -2988,7 +3031,8 @@ mod tests {
         let storage = InMemoryBlobStorage::new();
 
         let envelope = test_seal(&key, b"fresh msg");
-        let blob_bytes = rmp_serde::to_vec(&envelope).unwrap();
+        let envelope_bytes = rmp_serde::to_vec(&envelope).unwrap();
+        let blob_bytes = test_helpers::wrap_in_outer_envelope(routing_id, envelope_bytes);
         let blob_id = {
             let mut h = Sha256::new();
             h.update(&blob_bytes);
@@ -3239,7 +3283,8 @@ mod tests {
 
         // Seal and store a blob under routing_A.
         let envelope = test_seal(&key_a, b"belongs to context_a");
-        let blob_bytes = rmp_serde::to_vec(&envelope).unwrap();
+        let envelope_bytes = rmp_serde::to_vec(&envelope).unwrap();
+        let blob_bytes = test_helpers::wrap_in_outer_envelope(routing_id_a, envelope_bytes);
         let blob_id = {
             let mut h = Sha256::new();
             h.update(&blob_bytes);
@@ -3319,7 +3364,8 @@ mod tests {
         let mut blob_ids = Vec::new();
         for i in 0u8..3 {
             let envelope = test_seal(&key, &[i; 16]);
-            let blob_bytes = rmp_serde::to_vec(&envelope).unwrap();
+            let envelope_bytes = rmp_serde::to_vec(&envelope).unwrap();
+            let blob_bytes = test_helpers::wrap_in_outer_envelope(routing_id, envelope_bytes);
             let blob_id = {
                 let mut h = Sha256::new();
                 h.update(&blob_bytes);
@@ -3414,7 +3460,8 @@ mod tests {
 
         // Seal message_1 with epoch 0 key.
         let envelope_0 = test_seal(&key0, b"epoch zero message");
-        let blob_bytes_0 = rmp_serde::to_vec(&envelope_0).unwrap();
+        let envelope_0_bytes = rmp_serde::to_vec(&envelope_0).unwrap();
+        let blob_bytes_0 = test_helpers::wrap_in_outer_envelope(routing_id, envelope_0_bytes);
         let blob_id_0 = {
             let mut h = Sha256::new();
             h.update(&blob_bytes_0);
@@ -3428,7 +3475,8 @@ mod tests {
 
         // Seal message_2 with epoch 1 key.
         let envelope_1 = test_seal(&key1, b"epoch one message");
-        let blob_bytes_1 = rmp_serde::to_vec(&envelope_1).unwrap();
+        let envelope_1_bytes = rmp_serde::to_vec(&envelope_1).unwrap();
+        let blob_bytes_1 = test_helpers::wrap_in_outer_envelope(routing_id, envelope_1_bytes);
         let blob_id_1 = {
             let mut h = Sha256::new();
             h.update(&blob_bytes_1);
@@ -3504,7 +3552,8 @@ mod tests {
         if envelope.encrypted_content.len() > 13 {
             envelope.encrypted_content[13] ^= 0xFF;
         }
-        let blob_bytes = rmp_serde::to_vec(&envelope).unwrap();
+        let envelope_bytes = rmp_serde::to_vec(&envelope).unwrap();
+        let blob_bytes = test_helpers::wrap_in_outer_envelope(routing_id, envelope_bytes);
         let blob_id = {
             let mut h = Sha256::new();
             h.update(&blob_bytes);
@@ -3518,7 +3567,9 @@ mod tests {
 
         // Also store a valid message.
         let valid_envelope = test_seal(&key, b"valid message");
-        let valid_blob_bytes = rmp_serde::to_vec(&valid_envelope).unwrap();
+        let valid_envelope_bytes = rmp_serde::to_vec(&valid_envelope).unwrap();
+        let valid_blob_bytes =
+            test_helpers::wrap_in_outer_envelope(routing_id, valid_envelope_bytes);
         let valid_blob_id = {
             let mut h = Sha256::new();
             h.update(&valid_blob_bytes);
@@ -3657,7 +3708,8 @@ mod tests {
 
         // Store a blob encrypted at epoch 0 (the purged epoch).
         let envelope = test_seal(&key, b"old content");
-        let blob_bytes = rmp_serde::to_vec(&envelope).unwrap();
+        let envelope_bytes = rmp_serde::to_vec(&envelope).unwrap();
+        let blob_bytes = test_helpers::wrap_in_outer_envelope(routing_id, envelope_bytes);
         let blob_id = {
             let mut h = Sha256::new();
             h.update(&blob_bytes);
@@ -3713,7 +3765,8 @@ mod tests {
 
         // Store blob under routing_A.
         let envelope = test_seal(&key_a, b"secret of A");
-        let blob_bytes = rmp_serde::to_vec(&envelope).unwrap();
+        let envelope_bytes = rmp_serde::to_vec(&envelope).unwrap();
+        let blob_bytes = test_helpers::wrap_in_outer_envelope(routing_id_a, envelope_bytes);
         let blob_id = {
             let mut h = Sha256::new();
             h.update(&blob_bytes);
@@ -3832,7 +3885,8 @@ mod tests {
 
         // Store a message.
         let envelope = test_seal(&key, b"public content");
-        let blob_bytes = rmp_serde::to_vec(&envelope).unwrap();
+        let envelope_bytes = rmp_serde::to_vec(&envelope).unwrap();
+        let blob_bytes = test_helpers::wrap_in_outer_envelope(routing_id, envelope_bytes);
         let blob_id = {
             let mut h = Sha256::new();
             h.update(&blob_bytes);
@@ -3963,7 +4017,8 @@ mod tests {
         let storage = InMemoryBlobStorage::new();
 
         let envelope = test_seal(&key, b"secret content");
-        let blob_bytes = rmp_serde::to_vec(&envelope).unwrap();
+        let envelope_bytes = rmp_serde::to_vec(&envelope).unwrap();
+        let blob_bytes = test_helpers::wrap_in_outer_envelope(routing_id, envelope_bytes);
         let blob_id = {
             let mut h = Sha256::new();
             h.update(&blob_bytes);
@@ -4021,7 +4076,8 @@ mod tests {
         let storage = InMemoryBlobStorage::new();
 
         let envelope = test_seal(&key, b"gated content");
-        let blob_bytes = rmp_serde::to_vec(&envelope).unwrap();
+        let envelope_bytes = rmp_serde::to_vec(&envelope).unwrap();
+        let blob_bytes = test_helpers::wrap_in_outer_envelope(routing_id, envelope_bytes);
         let blob_id = {
             let mut h = Sha256::new();
             h.update(&blob_bytes);
@@ -4248,7 +4304,8 @@ mod tests {
 
         // Store alice's message (should be filtered from unauthenticated feed).
         let alice_env = test_seal(&alice_key, b"alice secret");
-        let alice_bytes = rmp_serde::to_vec(&alice_env).unwrap();
+        let alice_env_bytes = rmp_serde::to_vec(&alice_env).unwrap();
+        let alice_bytes = test_helpers::wrap_in_outer_envelope(routing_id, alice_env_bytes);
         let alice_blob_id = {
             let mut h = Sha256::new();
             h.update(&alice_bytes);
@@ -4262,7 +4319,8 @@ mod tests {
 
         // Store bob's message (should be visible without auth).
         let bob_env = test_seal(&bob_key, b"bob public");
-        let bob_bytes = rmp_serde::to_vec(&bob_env).unwrap();
+        let bob_env_bytes = rmp_serde::to_vec(&bob_env).unwrap();
+        let bob_bytes = test_helpers::wrap_in_outer_envelope(routing_id, bob_env_bytes);
         let bob_blob_id = {
             let mut h = Sha256::new();
             h.update(&bob_bytes);
@@ -4459,7 +4517,9 @@ mod tests {
 
         // Store a message from alice (who has a Gated override).
         let alice_envelope = test_seal(&alice_key, b"alice private content");
-        let alice_blob_bytes = rmp_serde::to_vec(&alice_envelope).unwrap();
+        let alice_envelope_bytes = rmp_serde::to_vec(&alice_envelope).unwrap();
+        let alice_blob_bytes =
+            test_helpers::wrap_in_outer_envelope(routing_id, alice_envelope_bytes);
         let alice_blob_id = {
             let mut h = Sha256::new();
             h.update(&alice_blob_bytes);
@@ -4473,7 +4533,8 @@ mod tests {
 
         // Store a message from bob (no override — default Public applies).
         let bob_envelope = test_seal(&bob_key, b"bob public content");
-        let bob_blob_bytes = rmp_serde::to_vec(&bob_envelope).unwrap();
+        let bob_envelope_bytes = rmp_serde::to_vec(&bob_envelope).unwrap();
+        let bob_blob_bytes = test_helpers::wrap_in_outer_envelope(routing_id, bob_envelope_bytes);
         let bob_blob_id = {
             let mut h = Sha256::new();
             h.update(&bob_blob_bytes);
@@ -4958,7 +5019,8 @@ mod tests {
 
         // Store a message so the feed isn't empty.
         let envelope = test_seal(&key, b"gated content");
-        let blob_bytes = rmp_serde::to_vec(&envelope).unwrap();
+        let envelope_bytes = rmp_serde::to_vec(&envelope).unwrap();
+        let blob_bytes = test_helpers::wrap_in_outer_envelope(routing_id, envelope_bytes);
         let blob_id = {
             let mut h = Sha256::new();
             h.update(&blob_bytes);
@@ -5015,7 +5077,8 @@ mod tests {
 
         let storage = InMemoryBlobStorage::new();
         let envelope = test_seal(&key, b"public content");
-        let blob_bytes = rmp_serde::to_vec(&envelope).unwrap();
+        let envelope_bytes = rmp_serde::to_vec(&envelope).unwrap();
+        let blob_bytes = test_helpers::wrap_in_outer_envelope(routing_id, envelope_bytes);
         let blob_id = {
             let mut h = Sha256::new();
             h.update(&blob_bytes);
@@ -5141,7 +5204,8 @@ mod tests {
 
         let storage = InMemoryBlobStorage::new();
         let envelope = test_seal(&key, b"some content");
-        let blob_bytes = rmp_serde::to_vec(&envelope).unwrap();
+        let envelope_bytes = rmp_serde::to_vec(&envelope).unwrap();
+        let blob_bytes = test_helpers::wrap_in_outer_envelope(routing_id, envelope_bytes);
         let blob_id = {
             let mut h = Sha256::new();
             h.update(&blob_bytes);
@@ -5336,7 +5400,8 @@ mod tests {
 
         let storage = InMemoryBlobStorage::new();
         let envelope = test_seal(&key, b"alice content");
-        let blob_bytes = rmp_serde::to_vec(&envelope).unwrap();
+        let envelope_bytes = rmp_serde::to_vec(&envelope).unwrap();
+        let blob_bytes = test_helpers::wrap_in_outer_envelope(routing_id, envelope_bytes);
         let blob_id = {
             let mut h = Sha256::new();
             h.update(&blob_bytes);
@@ -6395,7 +6460,8 @@ mod tests {
 
         // Store a legacy blob (raw bytes, no BroadcastContent magic).
         let envelope = test_seal(&key, b"just raw bytes");
-        let blob_bytes = rmp_serde::to_vec(&envelope).unwrap();
+        let envelope_bytes = rmp_serde::to_vec(&envelope).unwrap();
+        let blob_bytes = test_helpers::wrap_in_outer_envelope(routing_id, envelope_bytes);
         let blob_id = {
             let mut h = Sha256::new();
             h.update(&blob_bytes);

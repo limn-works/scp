@@ -237,6 +237,21 @@ impl FullStackNode {
             .decrypt_message(context_id, ciphertext, sender_did, epoch, sequence)
     }
 
+    /// Regenerates the local sender key and distributes it to all members.
+    ///
+    /// Call this after `join_from_welcome` so the joiner's sender key is
+    /// deposited in the `KeyExchange` for existing members to pick up.
+    ///
+    /// # Errors
+    ///
+    /// Propagates `ContextError` from the crypto provider.
+    pub fn regenerate_and_distribute_sender_key(
+        &self,
+        context_id: &[u8; 32],
+    ) -> Result<(), ContextError> {
+        self.crypto.regenerate_and_distribute_sender_key(context_id)
+    }
+
     /// Picks up any pending sender keys from the shared `KeyExchange`.
     ///
     /// Call this after another node has distributed its sender key so this
@@ -374,5 +389,14 @@ impl ContextEventLogProvider for ArcEventLogProvider {
     }
     fn restore_event_log(&self, id: &[u8; 32]) -> Result<(), ContextCreationError> {
         self.0.restore_event_log(id)
+    }
+    fn prune_before_checkpoint(
+        &self,
+        context_id: &[u8; 32],
+        checkpoint_event_count: u64,
+        policy: &scp_core::context::governance::PruningPolicy,
+    ) -> Option<usize> {
+        self.0
+            .prune_before_checkpoint(context_id, checkpoint_event_count, policy)
     }
 }

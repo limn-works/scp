@@ -31,11 +31,11 @@ pub const fn map_discovery_source(
         ContextDiscoverySource::WellKnown => {
             ("well_known", "DomainVerified", "Domain", "well-known", None)
         }
-        ContextDiscoverySource::DiscoveryContext { context_id } => (
-            "discovery_context",
-            "DiscoveryContextVerified",
-            "DiscoveryContext",
-            "discovery_context",
+        ContextDiscoverySource::HandleRegistry { context_id } => (
+            "handle_registry",
+            "HandleRegistryVerified",
+            "HandleRegistry",
+            "handle_registry",
             Some(context_id.as_str()),
         ),
         // §22.7: An scp:// URI is shared out-of-band, so the trust level is
@@ -91,7 +91,7 @@ pub fn discovery_result_to_json(result: &ContextDiscoveryResult) -> serde_json::
     });
 
     // Add discovery_context_id if applicable.
-    if let ContextDiscoverySource::DiscoveryContext { context_id } = &result.discovery_source {
+    if let ContextDiscoverySource::HandleRegistry { context_id } = &result.discovery_source {
         obj["discovery_context_id"] = serde_json::Value::String(context_id.clone());
     }
 
@@ -138,14 +138,14 @@ mod tests {
 
     #[test]
     fn map_discovery_context() {
-        let disc_source = ContextDiscoverySource::DiscoveryContext {
+        let disc_source = ContextDiscoverySource::HandleRegistry {
             context_id: "disc-1".to_owned(),
         };
         let (src, trust, layer, source, source_id) = map_discovery_source(&disc_source);
-        assert_eq!(src, "discovery_context");
-        assert_eq!(trust, "DiscoveryContextVerified");
-        assert_eq!(layer, "DiscoveryContext");
-        assert_eq!(source, "discovery_context");
+        assert_eq!(src, "handle_registry");
+        assert_eq!(trust, "HandleRegistryVerified");
+        assert_eq!(layer, "HandleRegistry");
+        assert_eq!(source, "handle_registry");
         assert_eq!(source_id, Some("disc-1"));
     }
 
@@ -178,14 +178,14 @@ mod tests {
 
     #[test]
     fn result_to_json_discovery_context_source() {
-        let result = make_result(ContextDiscoverySource::DiscoveryContext {
+        let result = make_result(ContextDiscoverySource::HandleRegistry {
             context_id: "disc-ctx-1".to_owned(),
         });
         let json = discovery_result_to_json(&result);
 
-        assert_eq!(json["trust_level"]["kind"], "DiscoveryContextVerified");
-        assert_eq!(json["resolution_path"]["layer"], "DiscoveryContext");
-        assert_eq!(json["resolution_path"]["source"], "discovery_context");
+        assert_eq!(json["trust_level"]["kind"], "HandleRegistryVerified");
+        assert_eq!(json["resolution_path"]["layer"], "HandleRegistry");
+        assert_eq!(json["resolution_path"]["source"], "handle_registry");
         assert_eq!(json["resolution_path"]["source_id"], "disc-ctx-1");
         assert_eq!(json["discovery_context_id"], "disc-ctx-1");
     }

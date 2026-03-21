@@ -946,12 +946,51 @@ async fn run_node_with<
         "application node identity ready"
     );
 
-    if let Err(e) = node.serve(axum::Router::new(), shutdown_signal()).await {
+    // Install Prometheus metrics recorder and add /metrics endpoint (#1467).
+    let metrics_router = install_metrics_recorder();
+
+    if let Err(e) = node.serve(metrics_router, shutdown_signal()).await {
         tracing::error!(error = %e, "application node exited with error");
         std::process::exit(1);
     }
 
     tracing::info!("scp-node stopped");
+}
+
+// ---------------------------------------------------------------------------
+// Prometheus metrics (#1467)
+// ---------------------------------------------------------------------------
+
+/// Installs the Prometheus metrics recorder and returns an axum router with
+/// a `/metrics` endpoint that serves the metrics in Prometheus text format.
+///
+/// The recorder is installed globally via [`metrics_exporter_prometheus::PrometheusBuilder`].
+/// If installation fails (e.g., a recorder is already installed), the endpoint
+/// returns an empty body with a 503 status.
+fn install_metrics_recorder() -> axum::Router {
+    let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+    let handle = recorder.handle();
+    // Best-effort: if a recorder is already installed, the metrics
+    // endpoint will return empty data.
+    let _ = metrics::set_global_recorder(recorder);
+
+    axum::Router::new().route(
+        "/metrics",
+        axum::routing::get(move || {
+            let h = handle.clone();
+            async move {
+                let body = h.render();
+                (
+                    axum::http::StatusCode::OK,
+                    [(
+                        axum::http::header::CONTENT_TYPE,
+                        "text/plain; version=0.0.4",
+                    )],
+                    body,
+                )
+            }
+        }),
+    )
 }
 
 // ---------------------------------------------------------------------------

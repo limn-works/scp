@@ -2077,8 +2077,8 @@ def py_node_start_local(
         data_dir: Directory for persistent storage.
         identity_did: Optional DID of a pre-existing identity.  If ``None``,
             the node creates or reloads a persistent identity.
-        passphrase: Passphrase for Argon2id key derivation.  Falls back to
-            ``SCP_KEY_PASSPHRASE`` env var when ``None``.
+        passphrase: Passphrase for Argon2id key derivation.  Required when
+            ``identity_did`` is ``None``.
     """
     ...
 
