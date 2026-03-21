@@ -454,7 +454,7 @@ export interface Bridge {
   identityRemoveLinkAttestation(did: string, attestationId: string): boolean;
   identityVerifyLinkAttestation(
     attestationJson: string,
-    issuerPublicKeyHex?: string | null,
+    issuerPublicKeyHex: string,
   ): Promise<boolean>;
 
   // Recovery and custody migration (#632, spec §9.12, §3.2.1)

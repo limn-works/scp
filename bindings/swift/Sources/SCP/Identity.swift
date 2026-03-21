@@ -648,7 +648,12 @@ public struct IdentityAttestation: Sendable, Equatable {
     ///
     /// Delegates to the bridge's trust verification function.
     ///
+    /// The issuer's public key cannot be reliably extracted from the DID string
+    /// because attestations are signed with `#active` or `#agent` keys
+    /// (spec section 3.5.2), not the `#0` identity key embedded in the DID.
+    ///
     /// - Parameters:
+    ///   - issuerPublicKeyHex: Hex-encoded Ed25519 public key of the issuer.
     ///   - verifyFn: Bridge function override for testing.
     /// - Returns: `true` if the attestation is valid.
     /// - Throws: ``ScpError`` if verification is not available.
@@ -657,9 +662,10 @@ public struct IdentityAttestation: Sendable, Equatable {
     ///
     /// - Spec section 3.5 (Identity Link Attestations)
     public func verify(
+        issuerPublicKeyHex: String,
         verifyFn: IdentityAttestationBridge.VerifyFn = IdentityAttestationBridge.defaultVerify
     ) async throws -> Bool {
-        try await verifyFn(self)
+        try await verifyFn(self, issuerPublicKeyHex)
     }
 }
 
@@ -731,8 +737,13 @@ public enum IdentityAttestationBridge {
     }
 
     /// Verify an attestation's signature and validity.
+    ///
+    /// The issuer's public key cannot be reliably extracted from the DID string
+    /// because attestations are signed with `#active` or `#agent` keys
+    /// (spec section 3.5.2), not the `#0` identity key embedded in the DID.
     public typealias VerifyFn = @Sendable (
-        _ attestation: IdentityAttestation
+        _ attestation: IdentityAttestation,
+        _ issuerPublicKeyHex: String
     ) async throws -> Bool
 
     /// Default verify function — delegates to UniFFI
@@ -741,7 +752,7 @@ public enum IdentityAttestationBridge {
     /// Uses ``IdentityAttestation/rawJson`` when available for exact
     /// roundtrip fidelity. Falls back to re-serializing the attestation
     /// if ``rawJson`` is `nil`.
-    public static let defaultVerify: VerifyFn = { attestation in
+    public static let defaultVerify: VerifyFn = { attestation, issuerPublicKeyHex in
         let json: String
         if let raw = attestation.rawJson {
             json = raw
@@ -750,7 +761,7 @@ public enum IdentityAttestationBridge {
         }
         return try await identityVerifyLinkAttestation(
             attestationJson: json,
-            issuerPublicKeyHex: nil
+            issuerPublicKeyHex: issuerPublicKeyHex
         )
     }
 }
@@ -1032,10 +1043,14 @@ func identityRemoveLinkAttestation(did _: String, attestationId _: String) -> Bo
 ///
 /// Verifies the Ed25519 signature on an identity link attestation.
 ///
+/// The issuer's public key cannot be reliably extracted from the DID string
+/// because attestations are signed with `#active` or `#agent` keys
+/// (spec section 3.5.2), not the `#0` identity key embedded in the DID.
+///
 /// - SeeAlso: ``IdentityAttestationBridge/defaultVerify``
 func identityVerifyLinkAttestation(
     attestationJson _: String,
-    issuerPublicKeyHex _: String?
+    issuerPublicKeyHex _: String
 ) async throws -> Bool {
     // Forward declaration — replaced by ScpBindings.swift on rebuild (#1453)
     throw ScpError.Identity(

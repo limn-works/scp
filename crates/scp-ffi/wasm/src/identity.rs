@@ -2281,46 +2281,26 @@ fn compute_attestation_canonical_bytes(
     Ok(h.finalize().to_vec())
 }
 
-/// Resolves the Ed25519 public key for attestation verification.
+/// Decodes a hex-encoded Ed25519 public key for attestation verification.
 ///
-/// If `issuer_public_key_hex` is provided, decodes and returns it. Otherwise
-/// extracts the Ed25519 identity key from the issuer's `did:dht:z...` string.
-fn resolve_attestation_public_key(
-    issuer: &str,
-    issuer_public_key_hex: Option<&str>,
-) -> Result<Option<[u8; 32]>, JsValue> {
-    if let Some(hex_key) = issuer_public_key_hex {
-        let decoded = hex::decode(hex_key).map_err(|e| -> JsValue {
-            ScpWasmError::Validation {
-                message: format!("invalid issuer_public_key_hex: {e}"),
-                code: "SCP-VALID-7032".to_owned(),
-            }
-            .into_js()
-            .into()
-        })?;
-        if decoded.len() != 32 {
-            return Ok(None);
+/// The issuer's public key cannot be reliably extracted from the DID string
+/// because attestations are signed with `#active` or `#agent` keys
+/// (spec §3.5.2), not the `#0` identity key embedded in the DID.
+fn decode_attestation_public_key(issuer_public_key_hex: &str) -> Result<Option<[u8; 32]>, JsValue> {
+    let decoded = hex::decode(issuer_public_key_hex).map_err(|e| -> JsValue {
+        ScpWasmError::Validation {
+            message: format!("invalid issuer_public_key_hex: {e}"),
+            code: "SCP-VALID-7032".to_owned(),
         }
-        let mut arr = [0u8; 32];
-        arr.copy_from_slice(&decoded);
-        Ok(Some(arr))
-    } else {
-        // Extract the public key directly from the issuer DID string.
-        // For did:dht:z... DIDs the Ed25519 identity key is embedded in the
-        // DID itself (z-base-32 encoded). This is rotation-safe: the identity
-        // key (#0) is the canonical attestation signing key per ADR-017 and
-        // never goes stale, unlike the active signing key stored in the
-        // custody registry.
-        match scp_ffi_common::validate::extract_public_key_from_did(issuer) {
-            Ok(key) => Ok(Some(key)),
-            Err(e) => Err(ScpWasmError::Identity {
-                message: format!("failed to extract public key from issuer DID '{issuer}': {e}"),
-                code: "SCP-IDENT-1044".to_owned(),
-            }
-            .into_js()
-            .into()),
-        }
+        .into_js()
+        .into()
+    })?;
+    if decoded.len() != 32 {
+        return Ok(None);
     }
+    let mut arr = [0u8; 32];
+    arr.copy_from_slice(&decoded);
+    Ok(Some(arr))
 }
 
 /// Verifies the Ed25519 signature on an identity link attestation JSON.
@@ -2331,14 +2311,15 @@ fn resolve_attestation_public_key(
 ///
 /// * `attestation_json` — JSON string of the attestation.
 /// * `issuer_public_key_hex` — Hex-encoded Ed25519 public key of the issuer.
-///   If provided, uses this key directly. If `null`/`undefined`, falls back to
-///   looking up the issuer's key from the WASM-local identity registry.
+///   The issuer's public key cannot be reliably extracted from the DID string
+///   because attestations are signed with `#active` or `#agent` keys
+///   (spec §3.5.2), not the `#0` identity key embedded in the DID.
 ///
 /// See spec §3.5.1.
 #[wasm_bindgen]
 pub fn identity_verify_link_attestation_signature(
     attestation_json: String,
-    issuer_public_key_hex: Option<String>,
+    issuer_public_key_hex: String,
 ) -> Promise {
     future_to_promise(async move {
         let attestation: serde_json::Value =
@@ -2413,9 +2394,7 @@ pub fn identity_verify_link_attestation_signature(
 
         let canonical = compute_attestation_canonical_bytes(&attestation)?;
 
-        let Some(pub_bytes) =
-            resolve_attestation_public_key(&issuer, issuer_public_key_hex.as_deref())?
-        else {
+        let Some(pub_bytes) = decode_attestation_public_key(&issuer_public_key_hex)? else {
             return Ok(JsValue::from_bool(false));
         };
 

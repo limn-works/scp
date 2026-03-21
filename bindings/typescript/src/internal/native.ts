@@ -1446,10 +1446,10 @@ export function createNativeBridge(): Bridge {
 
     async identityVerifyLinkAttestation(
       attestationJson: string,
-      issuerPublicKeyHex?: string | null,
+      issuerPublicKeyHex: string,
     ): Promise<boolean> {
       return await (
-        addon.identityVerifyLinkAttestation as (j: string, k?: string | null) => Promise<boolean>
+        addon.identityVerifyLinkAttestation as (j: string, k: string) => Promise<boolean>
       )(attestationJson, issuerPublicKeyHex);
     },
 

@@ -503,43 +503,6 @@ pub fn validate_attestation_fields(
 }
 
 // ---------------------------------------------------------------------------
-// DID public key extraction
-// ---------------------------------------------------------------------------
-
-/// Extracts the 32-byte Ed25519 public key from a `did:dht:z...` DID string.
-///
-/// Strips the `did:dht:z` prefix and z-base-32 decodes the remainder. This is
-/// the identity key (verification method `#0`), which is the canonical signing
-/// key for attestations per ADR-017.
-///
-/// This function mirrors [`scp_identity::extract_public_key`] but uses only the
-/// `z-base-32` crate — no `scp-identity` dependency — so it is available in all
-/// bridges including WASM (ADR-034).
-///
-/// # Errors
-///
-/// Returns `Err` if the DID does not start with `did:dht:z`, z-base-32 decoding
-/// fails, or the decoded output is not exactly 32 bytes.
-pub fn extract_public_key_from_did(did: &str) -> Result<[u8; 32], ValidationError> {
-    let encoded = did.strip_prefix("did:dht:z").ok_or_else(|| {
-        ValidationError::new(format!("expected 'did:dht:z...' prefix, got: {did}"))
-    })?;
-
-    let decoded = zbase32::decode(encoded).map_err(|e| {
-        ValidationError::new(format!("z-base-32 decode failed for DID '{did}': {e}"))
-    })?;
-
-    let key_bytes: [u8; 32] = decoded.try_into().map_err(|v: Vec<u8>| {
-        ValidationError::new(format!(
-            "expected 32-byte public key from DID '{did}', got {} bytes",
-            v.len()
-        ))
-    })?;
-
-    Ok(key_bytes)
-}
-
-// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -959,49 +922,5 @@ mod tests {
         assert_eq!(json_value_type_name(&serde_json::json!("hello")), "string");
         assert_eq!(json_value_type_name(&serde_json::json!([1, 2])), "array");
         assert_eq!(json_value_type_name(&serde_json::json!({"a": 1})), "object");
-    }
-
-    // -- extract_public_key_from_did --
-
-    #[test]
-    fn extract_key_from_valid_did_dht() {
-        // Round-trip: encode known bytes, then extract them back.
-        let key_bytes: [u8; 32] = [
-            0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e,
-            0x0f, 0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18, 0x19, 0x1a, 0x1b, 0x1c,
-            0x1d, 0x1e, 0x1f, 0x20,
-        ];
-        let encoded = zbase32::encode(&key_bytes);
-        let did = format!("did:dht:z{encoded}");
-        let extracted = extract_public_key_from_did(&did).unwrap();
-        assert_eq!(extracted, key_bytes);
-    }
-
-    #[test]
-    fn extract_key_wrong_prefix_rejected() {
-        let err = extract_public_key_from_did("did:key:z6Mk123").unwrap_err();
-        assert!(err.message.contains("did:dht:z"));
-    }
-
-    #[test]
-    fn extract_key_no_z_prefix_rejected() {
-        let err = extract_public_key_from_did("did:dht:abc").unwrap_err();
-        assert!(err.message.contains("did:dht:z"));
-    }
-
-    #[test]
-    fn extract_key_invalid_zbase32_rejected() {
-        let err = extract_public_key_from_did("did:dht:z!@#$%^&*").unwrap_err();
-        assert!(err.message.contains("z-base-32 decode failed"));
-    }
-
-    #[test]
-    fn extract_key_wrong_length_rejected() {
-        // Encode only 16 bytes — should fail with "expected 32-byte".
-        let short_bytes: [u8; 16] = [0x42; 16];
-        let encoded = zbase32::encode(&short_bytes);
-        let did = format!("did:dht:z{encoded}");
-        let err = extract_public_key_from_did(&did).unwrap_err();
-        assert!(err.message.contains("expected 32-byte"));
     }
 }

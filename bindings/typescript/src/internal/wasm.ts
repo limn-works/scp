@@ -270,7 +270,7 @@ interface WasmModule {
   identity_remove_link_attestation: (did: string, attestationId: string) => boolean;
   identity_verify_link_attestation_signature: (
     attestationJson: string,
-    issuerPublicKeyHex?: string | null,
+    issuerPublicKeyHex: string,
   ) => Promise<boolean>;
   // Recovery and custody migration (#632, spec §9.12, §3.2.1)
   identity_execute_recovery: (did: string, tier: string, contextIds: string[]) => string;
@@ -1746,7 +1746,7 @@ export function createWasmBridge(): Bridge {
 
     async identityVerifyLinkAttestation(
       attestationJson: string,
-      issuerPublicKeyHex?: string | null,
+      issuerPublicKeyHex: string,
     ): Promise<boolean> {
       const wasm = getWasm();
       return await wasm.identity_verify_link_attestation_signature(

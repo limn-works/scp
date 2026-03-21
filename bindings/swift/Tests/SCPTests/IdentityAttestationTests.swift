@@ -188,8 +188,11 @@ final class IdentityAttestationTests: XCTestCase {
             verificationMethod: "did:dht:z6Mk...#active",
             verifiedAt: 1_700_000_000
         )
-        let customVerify: IdentityAttestationBridge.VerifyFn = { _ in true }
-        let result = try await att.verify(verifyFn: customVerify)
+        let customVerify: IdentityAttestationBridge.VerifyFn = { _, _ in true }
+        let result = try await att.verify(
+            issuerPublicKeyHex: "deadbeef",
+            verifyFn: customVerify
+        )
         XCTAssertTrue(result)
     }
 
@@ -201,8 +204,11 @@ final class IdentityAttestationTests: XCTestCase {
             verificationMethod: "did:dht:z6Mk...#active",
             verifiedAt: 1_700_000_000
         )
-        let customVerify: IdentityAttestationBridge.VerifyFn = { _ in false }
-        let result = try await att.verify(verifyFn: customVerify)
+        let customVerify: IdentityAttestationBridge.VerifyFn = { _, _ in false }
+        let result = try await att.verify(
+            issuerPublicKeyHex: "deadbeef",
+            verifyFn: customVerify
+        )
         XCTAssertFalse(result)
     }
 

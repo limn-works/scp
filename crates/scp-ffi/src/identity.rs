@@ -1440,14 +1440,17 @@ fn py_remove_identity_link_attestation(
 
 /// Verifies the Ed25519 signature on an identity link attestation.
 ///
-/// Parses the attestation JSON string and verifies the signature. If
-/// `issuer_public_key_hex` is provided, uses that key directly. Otherwise
-/// falls back to looking up the issuer's key from the identity registry.
+/// Parses the attestation JSON string and verifies the signature using the
+/// provided issuer public key.
+///
+/// The issuer's public key cannot be reliably extracted from the DID string
+/// because attestations are signed with `#active` or `#agent` keys
+/// (spec §3.5.2), not the `#0` identity key embedded in the DID.
 ///
 /// # Arguments
 ///
 /// * `attestation_json` — JSON string of an `IdentityLinkAttestation`.
-/// * `issuer_public_key_hex` — Optional hex-encoded Ed25519 public key.
+/// * `issuer_public_key_hex` — Hex-encoded Ed25519 public key of the issuer.
 ///
 /// # Returns
 ///
@@ -1455,47 +1458,28 @@ fn py_remove_identity_link_attestation(
 ///
 /// # Errors
 ///
-/// Raises `IdentityError` if the JSON is malformed, the hex key is invalid,
-/// or the issuer's identity is not in the registry (when no key is provided).
+/// Raises `IdentityError` if the JSON is malformed or the hex key is invalid.
 ///
 /// See spec §3.5.1.
 #[pyfunction]
-#[pyo3(signature = (attestation_json, issuer_public_key_hex=None))]
+#[pyo3(name = "py_verify_identity_link_attestation")]
 fn py_verify_identity_link_attestation(
     py: Python<'_>,
     attestation_json: &str,
-    issuer_public_key_hex: Option<&str>,
+    issuer_public_key_hex: &str,
 ) -> PyResult<bool> {
     use scp_core::identity::attestation::IdentityLinkAttestation;
 
     let json_owned = attestation_json.to_owned();
-    let hex_key_owned = issuer_public_key_hex.map(ToOwned::to_owned);
+    let hex_key_owned = issuer_public_key_hex.to_owned();
 
     py.allow_threads(move || -> Result<bool, ScpPyError> {
         let attestation: IdentityLinkAttestation = serde_json::from_str(&json_owned)
             .map_err(|e| ScpPyError::identity(format!("failed to parse attestation JSON: {e}")))?;
 
-        if let Some(hex_key) = hex_key_owned {
-            // Caller provided the key directly — verify without registry lookup.
-            let pub_bytes = hex::decode(&hex_key)
-                .map_err(|e| ScpPyError::identity(format!("invalid issuer_public_key_hex: {e}")))?;
-            Ok(attestation.verify_signature(&pub_bytes).is_ok())
-        } else {
-            // Extract the public key directly from the issuer DID string.
-            // For did:dht:z... DIDs the Ed25519 identity key is embedded in the
-            // DID itself (z-base-32 encoded). This is rotation-safe: the identity
-            // key (#0) is the canonical attestation signing key per ADR-017 and
-            // never goes stale, unlike the active signing key stored in the
-            // custody registry.
-            let issuer_did: &str = &attestation.issuer;
-            let pub_bytes = scp_ffi_common::validate::extract_public_key_from_did(issuer_did)
-                .map_err(|e| {
-                    ScpPyError::identity(format!(
-                        "failed to extract public key from issuer DID '{issuer_did}': {e}"
-                    ))
-                })?;
-            Ok(attestation.verify_signature(&pub_bytes).is_ok())
-        }
+        let pub_bytes = hex::decode(&hex_key_owned)
+            .map_err(|e| ScpPyError::identity(format!("invalid issuer_public_key_hex: {e}")))?;
+        Ok(attestation.verify_signature(&pub_bytes).is_ok())
     })
     .map_err(PyErr::from)
 }

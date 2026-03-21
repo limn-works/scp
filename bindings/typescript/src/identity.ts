@@ -613,16 +613,21 @@ export class IdentityAttestation implements IdentityAttestationData {
   /**
    * Verifies this attestation's signature and validity.
    *
-   * Delegates to the bridge's `trust_verify_attestation` function.
+   * Delegates to the bridge's `identityVerifyLinkAttestation` function.
    *
+   * The issuer's public key cannot be reliably extracted from the DID string
+   * because attestations are signed with `#active` or `#agent` keys
+   * (spec section 3.5.2), not the `#0` identity key embedded in the DID.
+   *
+   * @param issuerPublicKeyHex - Hex-encoded Ed25519 public key of the issuer.
    * @returns `true` if the attestation is valid.
-   * @throws {IdentityError} If the bridge function is not available.
+   * @throws {IdentityError} If the bridge function is not available or raw JSON is missing.
    */
-  async verify(): Promise<boolean> {
+  async verify(issuerPublicKeyHex: string): Promise<boolean> {
     try {
       const bridge = await getBridge();
       const fn = (bridge as unknown as Record<string, unknown>).identityVerifyLinkAttestation as
-        | ((json: string, issuerPublicKeyHex?: string) => Promise<boolean>)
+        | ((json: string, issuerPublicKeyHex: string) => Promise<boolean>)
         | undefined;
       if (!fn) {
         throw new IdentityError(
@@ -641,7 +646,7 @@ export class IdentityAttestation implements IdentityAttestationData {
         );
       }
       const json = this._rawJson;
-      const result = await fn(json);
+      const result = await fn(json, issuerPublicKeyHex);
       return Boolean(result);
     } catch (error) {
       throw error instanceof IdentityError ? error : mapBridgeError(error);

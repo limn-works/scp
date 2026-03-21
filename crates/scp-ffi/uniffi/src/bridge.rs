@@ -2676,15 +2676,15 @@ pub fn identity_remove_link_attestation(did: String, attestation_id: String) -> 
 
 /// Verifies the Ed25519 signature on an identity link attestation.
 ///
-/// If `issuer_public_key_hex` is provided, uses that key directly for
-/// verification. Otherwise falls back to looking up the issuer's key from
-/// the identity custody registry.
+/// The issuer's public key cannot be reliably extracted from the DID string
+/// because attestations are signed with `#active` or `#agent` keys
+/// (spec §3.5.2), not the `#0` identity key embedded in the DID.
 ///
 /// See spec §3.5.1.
 #[uniffi::export]
 pub async fn identity_verify_link_attestation(
     attestation_json: String,
-    issuer_public_key_hex: Option<String>,
+    issuer_public_key_hex: String,
 ) -> Result<bool, ScpError> {
     identity_verify_link_attestation_impl(attestation_json, issuer_public_key_hex).await
 }
@@ -2692,7 +2692,7 @@ pub async fn identity_verify_link_attestation(
 #[allow(clippy::unused_async)]
 async fn identity_verify_link_attestation_impl(
     attestation_json: String,
-    issuer_public_key_hex: Option<String>,
+    issuer_public_key_hex: String,
 ) -> Result<bool, ScpError> {
     use scp_core::identity::attestation::IdentityLinkAttestation;
 
@@ -2702,28 +2702,11 @@ async fn identity_verify_link_attestation_impl(
             code: "SCP-IDENT-1044".to_owned(),
         })?;
 
-    if let Some(hex_key) = issuer_public_key_hex {
-        // Caller provided the key directly — verify without registry lookup.
-        let pub_bytes = hex::decode(&hex_key).map_err(|e| ScpError::Identity {
-            msg: format!("invalid issuer_public_key_hex: {e}"),
-            code: "SCP-IDENT-1044".to_owned(),
-        })?;
-        Ok(attestation.verify_signature(&pub_bytes).is_ok())
-    } else {
-        // Extract the public key directly from the issuer DID string.
-        // For did:dht:z... DIDs the Ed25519 identity key is embedded in the
-        // DID itself (z-base-32 encoded). This is rotation-safe: the identity
-        // key (#0) is the canonical attestation signing key per ADR-017 and
-        // never goes stale, unlike the active signing key stored in the
-        // custody registry.
-        let issuer_did = attestation.issuer.to_string();
-        let pub_bytes =
-            scp_identity::extract_public_key(&issuer_did).map_err(|e| ScpError::Identity {
-                msg: format!("failed to extract public key from issuer DID '{issuer_did}': {e}"),
-                code: "SCP-IDENT-1044".to_owned(),
-            })?;
-        Ok(attestation.verify_signature(&pub_bytes).is_ok())
-    }
+    let pub_bytes = hex::decode(&issuer_public_key_hex).map_err(|e| ScpError::Identity {
+        msg: format!("invalid issuer_public_key_hex: {e}"),
+        code: "SCP-IDENT-1044".to_owned(),
+    })?;
+    Ok(attestation.verify_signature(&pub_bytes).is_ok())
 }
 
 // ---------------------------------------------------------------------------
