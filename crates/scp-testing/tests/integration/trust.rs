@@ -164,9 +164,13 @@ fn make_signed_attestation(
     use scp_core::crypto::canonical::{CanonicalField, canonical_hash};
     use scp_core::trust::attestation_type_tag;
 
-    let claim_str = att.claim.to_string();
-    let evidence_bytes = att.evidence.as_ref().map(|e| rmp_serde::to_vec(e).unwrap());
+    let claim_bytes = rmp_serde::to_vec_named(&att.claim).unwrap();
+    let evidence_bytes = att
+        .evidence
+        .as_ref()
+        .map(|e| rmp_serde::to_vec_named(e).unwrap());
     let att_type_tag = attestation_type_tag(&att.attestation_type);
+    let revocation_bytes = rmp_serde::to_vec_named(&att.revocation_status).unwrap();
 
     let canonical = canonical_hash(
         "SCP-ATTESTATION-V1:",
@@ -175,12 +179,14 @@ fn make_signed_attestation(
             CanonicalField::U16(att_type_tag),
             CanonicalField::VarBytes(att.issuer.as_bytes()),
             CanonicalField::VarBytes(att.subject.as_bytes()),
-            CanonicalField::VarBytes(claim_str.as_bytes()),
+            CanonicalField::VarBytes(&claim_bytes),
             evidence_bytes
                 .as_deref()
                 .map_or(CanonicalField::Absent, CanonicalField::VarBytes),
             CanonicalField::U64(att.issued_at),
-            CanonicalField::U64(att.expires_at.unwrap_or(0)),
+            att.expires_at
+                .map_or(CanonicalField::Absent, CanonicalField::U64),
+            CanonicalField::VarBytes(&revocation_bytes),
         ],
     );
     let sig = sk.sign(&canonical);
@@ -349,10 +355,13 @@ async fn attestation_threshold() {
     assert!(result.met, "2-of-3 threshold should be met");
     assert_eq!(result.valid_count, 3);
 
-    // 4-of-3 threshold should NOT be met.
-    let strict_requirement = ThresholdRequirement::new(4, 3, 0.5);
+    // 4-of-5 threshold should NOT be met (only 3 attestors provided).
+    let strict_requirement = ThresholdRequirement::new(4, 5, 0.5);
     let result_strict = check_threshold_attestation(&att_type, &attestors, &strict_requirement);
-    assert!(!result_strict.met, "4-of-3 threshold should not be met");
+    assert!(
+        !result_strict.met,
+        "4-of-5 threshold should not be met with only 3 attestors"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -826,11 +835,11 @@ async fn sybil_resistance_evaluation() {
     let casual = ContextSybilPolicy::casual();
     let empty =
         IdentityDepthAssessment::new(did("did:dht:z6MkEmpty"), HashMap::new(), current_time);
-    assert!(evaluate_sybil_resistance(&empty, &casual, current_time).is_ok());
+    assert!(evaluate_sybil_resistance(&empty, &casual, current_time, None).is_ok());
 
     // Standard policy: fails with no signals (min_signal_breadth = 1).
     let standard = ContextSybilPolicy::standard();
-    let err = evaluate_sybil_resistance(&empty, &standard, current_time).unwrap_err();
+    let err = evaluate_sybil_resistance(&empty, &standard, current_time, None).unwrap_err();
     assert!(
         matches!(
             err,
@@ -850,11 +859,11 @@ async fn sybil_resistance_evaluation() {
         ),
     );
     let adequate = IdentityDepthAssessment::new(did("did:dht:z6MkAdequate"), signals, current_time);
-    assert!(evaluate_sybil_resistance(&adequate, &standard, current_time).is_ok());
+    assert!(evaluate_sybil_resistance(&adequate, &standard, current_time, None).is_ok());
 
     // High-trust policy: requires 3+ categories + specific signals.
     let high = ContextSybilPolicy::high_trust();
-    let err2 = evaluate_sybil_resistance(&adequate, &high, current_time).unwrap_err();
+    let err2 = evaluate_sybil_resistance(&adequate, &high, current_time, None).unwrap_err();
     assert!(
         matches!(
             err2,
@@ -868,7 +877,8 @@ async fn sybil_resistance_evaluation() {
         require_device_attestation: true,
         ..ContextSybilPolicy::casual()
     };
-    let err3 = evaluate_sybil_resistance(&adequate, &device_required, current_time).unwrap_err();
+    let err3 =
+        evaluate_sybil_resistance(&adequate, &device_required, current_time, None).unwrap_err();
     assert!(matches!(
         err3,
         scp_core::trust::sybil::SybilResistanceError::DeviceAttestationRequired

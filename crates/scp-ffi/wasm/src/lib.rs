@@ -94,6 +94,8 @@ pub mod identity;
 pub mod manager;
 /// Provenance metadata operations.
 pub mod provenance;
+/// Reference attestation verification via browser Fetch API (§3.5.2).
+pub mod reference_verify;
 /// WASM-local runtime registry (tool registry, event log, schema validation).
 pub mod runtime;
 /// SCPID authentication — challenge generation and signing (§3.11).

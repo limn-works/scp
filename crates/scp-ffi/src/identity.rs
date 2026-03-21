@@ -52,6 +52,9 @@ use crate::error::ScpPyError;
 use crate::runtime::IdentityEntry;
 use crate::validate;
 
+/// Maximum number of identity link attestations per DID in the `PyO3` bridge.
+const PYO3_LINK_ATTESTATION_PER_DID_CAP: usize = 1_000;
+
 /// Ensures the global production DID resolver is initialized.
 ///
 /// Creates a `DualLayerResolver` backed by `InMemoryDhtClient` and
@@ -503,6 +506,7 @@ fn py_identity_create(py: Python<'_>, custody: &str) -> PyResult<PyIdentity> {
                     identity,
                     custody: key_custody,
                     document,
+                    identity_link_attestations: Vec::new(),
                 },
             );
 
@@ -570,6 +574,7 @@ fn py_identity_create_with_agent_key(py: Python<'_>, custody: &str) -> PyResult<
                     identity,
                     custody: key_custody,
                     document,
+                    identity_link_attestations: Vec::new(),
                 },
             );
 
@@ -1073,6 +1078,12 @@ fn py_identity_migrate(py: Python<'_>, identity: &PyIdentity) -> PyResult<PyIden
             let new_did = new_identity.did.clone();
             let has_agent = new_document.has_agent_key();
 
+            // Preserve existing attestations from the old DID across migration.
+            let existing_attestations = crate::runtime::with_identity(&old_did, |e| {
+                Ok(e.identity_link_attestations.clone())
+            })
+            .unwrap_or_default();
+
             // Remove old identity and register the new one.
             crate::runtime::remove_identity(&old_did);
             crate::runtime::register_identity(
@@ -1081,6 +1092,7 @@ fn py_identity_migrate(py: Python<'_>, identity: &PyIdentity) -> PyResult<PyIden
                     identity: new_identity,
                     custody,
                     document: new_document,
+                    identity_link_attestations: existing_attestations,
                 },
             );
             Ok(PyIdentity {
@@ -1209,6 +1221,265 @@ fn py_identity_verify_device_attestation(
             })?;
 
         Ok(result)
+    })
+    .map_err(PyErr::from)
+}
+
+// ---------------------------------------------------------------------------
+// Identity link attestation bridge (§3.5.1, §3.5.2)
+// ---------------------------------------------------------------------------
+
+/// Creates an identity link attestation for an external platform identity.
+///
+/// Constructs an [`IdentityLinkAttestation`] with a real Ed25519 signature
+/// from the identity's active signing key. The attestation is stored in the
+/// identity registry for retrieval via `py_identity_link_attestations`.
+///
+/// # Arguments
+///
+/// * `did` — The DID string of the attesting identity.
+/// * `platform` — Platform identifier (e.g., `"github.com"`, `"x.com"`).
+/// * `handle` — Handle on the platform (e.g., `"@alice"`, `"alice123"`).
+/// * `proof` — Method-specific proof data (e.g., OAuth JWT, post URL).
+/// * `verification_method` — One of `"oauth"`, `"signed_post"`, `"dns_record"`,
+///   `"challenge_response"`.
+/// * `platform_id` — Optional platform-specific immutable user ID.
+///
+/// # Returns
+///
+/// JSON string of the created attestation.
+///
+/// # Errors
+///
+/// Raises `IdentityError` if the identity is not found, the verification method
+/// is invalid, or signing fails.
+///
+/// See spec §3.5.1, §3.5.2.
+#[pyfunction]
+#[pyo3(signature = (did, platform, handle, proof, verification_method, platform_id=None))]
+fn py_create_identity_link_attestation(
+    py: Python<'_>,
+    did: &str,
+    platform: &str,
+    handle: &str,
+    proof: &str,
+    verification_method: &str,
+    platform_id: Option<&str>,
+) -> PyResult<String> {
+    use std::borrow::Cow;
+
+    use scp_core::identity::attestation::{
+        ATTESTATION_TYPE_IDENTITY_LINK, AttestationClaim, AttestationEvidence,
+        IdentityLinkAttestation, VerificationMethod,
+    };
+    use scp_core::trust::attestation::RevocationStatus;
+    use scp_identity::DID;
+    use scp_platform::traits::KeyCustody;
+
+    validate::validate_did(did)?;
+    validate::validate_attestation_fields(platform, handle, proof)?;
+    let did_owned = did.to_owned();
+    let platform_owned = platform.to_owned();
+    let handle_owned = handle.to_owned();
+    let proof_owned = proof.to_owned();
+    let method_owned = verification_method.to_owned();
+    let platform_id_owned = platform_id.map(ToOwned::to_owned);
+    let rt = crate::runtime()?;
+
+    py.allow_threads(move || {
+        let method: VerificationMethod = method_owned.parse().map_err(ScpPyError::identity)?;
+
+        // Proof is an opaque string per §3.5.2 — pass through as-is.
+        // Do not parse and re-serialize.
+
+        // Phase 1: read custody + key handle (under DashMap lock, then drop).
+        let (custody, key_handle) = crate::runtime::with_identity(&did_owned, |entry| {
+            Ok((
+                Arc::clone(&entry.custody),
+                entry.identity.active_signing_key,
+            ))
+        })?;
+
+        let issuer = DID::from(did_owned.as_str());
+        let now_secs = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_err(|_| ScpPyError::identity("system clock is before UNIX epoch"))?
+            .as_secs();
+
+        let id =
+            IdentityLinkAttestation::compute_id(&issuer, &platform_owned, &handle_owned, now_secs);
+
+        // Build the attestation with a placeholder signature.
+        let mut attestation = IdentityLinkAttestation {
+            id,
+            attestation_type: Cow::Borrowed(ATTESTATION_TYPE_IDENTITY_LINK),
+            issuer: issuer.clone(),
+            subject: issuer,
+            issued_at: now_secs,
+            expires_at: None,
+            claim: AttestationClaim::new(platform_owned, handle_owned, platform_id_owned),
+            evidence: AttestationEvidence {
+                method,
+                proof: proof_owned,
+                verified_at: now_secs,
+                verifier_did: None,
+            },
+            revocation_status: RevocationStatus::Active,
+            signature: Vec::new(),
+        };
+
+        // Structural validation before signing.
+        let structure_errors = attestation.validate_structure();
+        if !structure_errors.is_empty() {
+            return Err(ScpPyError::identity(format!(
+                "attestation structure validation failed: {}",
+                structure_errors
+                    .iter()
+                    .map(AsRef::as_ref)
+                    .collect::<Vec<_>>()
+                    .join("; "),
+            )));
+        }
+
+        // Compute canonical bytes and sign with active signing key.
+        let canonical = attestation
+            .canonical_signing_bytes()
+            .map_err(|e| ScpPyError::identity(format!("attestation signing failed: {e}")))?;
+
+        // Phase 2: sign (no DashMap lock held — safe to block_on).
+        let sig = rt
+            .block_on(custody.sign(&key_handle, &canonical))
+            .map_err(|e| ScpPyError::identity(format!("Ed25519 signing failed: {e}")))?;
+        attestation.signature = sig.as_bytes().to_vec();
+
+        // Phase 3: re-acquire lock, verify key unchanged (TOCTOU guard), store.
+        crate::runtime::with_identity_mut(&did_owned, |entry| {
+            if entry.identity.active_signing_key != key_handle {
+                return Err(ScpPyError::identity(
+                    "active signing key was rotated during attestation creation — \
+                     please retry",
+                ));
+            }
+
+            if entry.identity_link_attestations.len() >= PYO3_LINK_ATTESTATION_PER_DID_CAP {
+                return Err(ScpPyError::validation(format!(
+                    "DID has reached the per-identity attestation limit \
+                     ({PYO3_LINK_ATTESTATION_PER_DID_CAP}) — cannot store additional attestations"
+                )));
+            }
+            entry.identity_link_attestations.push(attestation.clone());
+
+            // Return as JSON.
+            serde_json::to_string(&attestation)
+                .map_err(|e| ScpPyError::identity(format!("failed to serialize attestation: {e}")))
+        })
+    })
+    .map_err(PyErr::from)
+}
+
+/// Lists all identity link attestations for an identity.
+///
+/// Returns a JSON array of all stored attestations for the given DID.
+///
+/// # Arguments
+///
+/// * `did` — The DID string to list attestations for.
+///
+/// # Returns
+///
+/// JSON string containing an array of attestation objects.
+///
+/// See spec §3.5.1.
+#[pyfunction]
+fn py_identity_link_attestations(py: Python<'_>, did: &str) -> PyResult<String> {
+    validate::validate_did(did)?;
+    let did_owned = did.to_owned();
+
+    py.allow_threads(move || {
+        crate::runtime::with_identity(&did_owned, |entry| {
+            serde_json::to_string(&entry.identity_link_attestations)
+                .map_err(|e| ScpPyError::identity(format!("failed to serialize attestations: {e}")))
+        })
+    })
+    .map_err(PyErr::from)
+}
+
+/// Removes an identity link attestation by its ID.
+///
+/// # Arguments
+///
+/// * `did` — The DID string of the attesting identity.
+/// * `attestation_id` — The deterministic attestation ID to remove.
+///
+/// # Returns
+///
+/// `True` if the attestation was found and removed, `False` otherwise.
+///
+/// See spec §3.5.1.
+#[pyfunction]
+fn py_remove_identity_link_attestation(
+    py: Python<'_>,
+    did: &str,
+    attestation_id: &str,
+) -> PyResult<bool> {
+    validate::validate_did(did)?;
+    let did_owned = did.to_owned();
+    let id_owned = attestation_id.to_owned();
+
+    py.allow_threads(move || {
+        crate::runtime::with_identity_mut(&did_owned, |entry| {
+            let before = entry.identity_link_attestations.len();
+            entry
+                .identity_link_attestations
+                .retain(|a| a.id != id_owned);
+            Ok(entry.identity_link_attestations.len() < before)
+        })
+    })
+    .map_err(PyErr::from)
+}
+
+/// Verifies the Ed25519 signature on an identity link attestation.
+///
+/// Parses the attestation JSON string and verifies the signature using the
+/// provided issuer public key.
+///
+/// The issuer's public key cannot be reliably extracted from the DID string
+/// because attestations are signed with `#active` or `#agent` keys
+/// (spec §3.5.2), not the `#0` identity key embedded in the DID.
+///
+/// # Arguments
+///
+/// * `attestation_json` — JSON string of an `IdentityLinkAttestation`.
+/// * `issuer_public_key_hex` — Hex-encoded Ed25519 public key of the issuer.
+///
+/// # Returns
+///
+/// `True` if the signature is valid, `False` otherwise.
+///
+/// # Errors
+///
+/// Raises `IdentityError` if the JSON is malformed or the hex key is invalid.
+///
+/// See spec §3.5.1.
+#[pyfunction]
+#[pyo3(name = "py_verify_identity_link_attestation")]
+fn py_verify_identity_link_attestation(
+    py: Python<'_>,
+    attestation_json: &str,
+    issuer_public_key_hex: &str,
+) -> PyResult<bool> {
+    use scp_core::identity::attestation::IdentityLinkAttestation;
+
+    let json_owned = attestation_json.to_owned();
+    let hex_key_owned = issuer_public_key_hex.to_owned();
+
+    py.allow_threads(move || -> Result<bool, ScpPyError> {
+        let attestation: IdentityLinkAttestation = serde_json::from_str(&json_owned)
+            .map_err(|e| ScpPyError::identity(format!("failed to parse attestation JSON: {e}")))?;
+
+        let pub_bytes = hex::decode(&hex_key_owned)
+            .map_err(|e| ScpPyError::identity(format!("invalid issuer_public_key_hex: {e}")))?;
+        Ok(attestation.verify_signature(&pub_bytes).is_ok())
     })
     .map_err(PyErr::from)
 }
@@ -1486,6 +1757,11 @@ pub fn register_identity(m: &Bound<'_, PyModule>) -> PyResult<()> {
         m.add_function(wrap_pyfunction!(py_identity_attest_device, m)?)?;
         m.add_function(wrap_pyfunction!(py_identity_verify_device_attestation, m)?)?;
     }
+    // Identity link attestation (§3.5.1)
+    m.add_function(wrap_pyfunction!(py_create_identity_link_attestation, m)?)?;
+    m.add_function(wrap_pyfunction!(py_identity_link_attestations, m)?)?;
+    m.add_function(wrap_pyfunction!(py_remove_identity_link_attestation, m)?)?;
+    m.add_function(wrap_pyfunction!(py_verify_identity_link_attestation, m)?)?;
     Ok(())
 }
 

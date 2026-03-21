@@ -52,8 +52,6 @@ import works.limn.scp.EconomyBindings
 import works.limn.scp.EconomyBridge
 import works.limn.scp.IdentityAdvancedBindings
 import works.limn.scp.IdentityAdvancedBridge
-import works.limn.scp.IdentityAttestationBindings
-import works.limn.scp.IdentityAttestationBridge
 import works.limn.scp.InvitationBindings
 import works.limn.scp.MetadataBindings
 import works.limn.scp.MetadataBridge
@@ -1233,7 +1231,6 @@ data class ExtendedBindings(
     val discovery: DiscoveryBindings? = null,
     val bridgeConnector: BridgeConnectorBindings? = null,
     val identityAdvanced: IdentityAdvancedBindings? = null,
-    val identityAttestation: IdentityAttestationBindings? = null,
     val scpId: ScpIdBindings? = null,
     val trust: TrustBindings? = null,
     val metadata: MetadataBindings? = null,
@@ -1331,12 +1328,6 @@ class CoroutineBridge(
     val identityAdvanced: IdentityAdvancedBridge? =
         extendedBindings?.identityAdvanced?.let {
             IdentityAdvancedBridge(it, this)
-        }
-
-    /** Identity link attestation operations — FFI on IO. Null if bindings not provided. */
-    val identityAttestation: IdentityAttestationBridge? =
-        extendedBindings?.identityAttestation?.let {
-            IdentityAttestationBridge(it, this)
         }
 
     /** SCPID authentication operations — FFI on IO. Null if bindings not provided. */

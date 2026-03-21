@@ -162,8 +162,14 @@ pub trait TimestampProvider: Send + Sync {
 pub struct SystemTimestamp;
 
 impl TimestampProvider for SystemTimestamp {
+    #[allow(clippy::expect_used)]
     fn now_millis(&self) -> u64 {
-        scp_core::time::now_millis().unwrap_or(0)
+        // The TimestampProvider trait returns u64 (not Result), so we cannot
+        // propagate the error. A system clock before the Unix epoch is an
+        // unrecoverable environment failure — panicking is correct here, as
+        // silently returning 0 would produce provenance timestamps at epoch 0,
+        // bypassing freshness and ordering checks.
+        scp_core::time::now_millis().expect("system clock is unavailable or before Unix epoch")
     }
 }
 

@@ -20,6 +20,10 @@ import Foundation
 //   - identityMigrate(_ identity: Identity) async throws -> Identity
 //   - identityLoad(_ did: String) async throws -> Identity
 //   - identityResolve(_ did: String) async throws -> DidDocument
+//   - identityCreateLinkAttestation(identity:platform:handle:proof:verificationMethod:platformId:) async throws -> String
+//   - identityLinkAttestations(did:) throws -> String
+//   - identityRemoveLinkAttestation(did:attestationId:) -> Bool
+//   - identityVerifyLinkAttestation(attestationJson:issuerPublicKeyHex:) async throws -> Bool
 //
 // Tests should use Identity(noPointer: .init()) for mock instances.
 
@@ -604,7 +608,7 @@ public struct IdentityAttestation: Sendable, Equatable {
     public let verificationMethod: String
 
     /// Unix timestamp (seconds) when the evidence was last verified.
-    public let verifiedAt: Int
+    public let verifiedAt: UInt64
 
     /// Revocation status.
     public let revocationStatus: RevocationStatus
@@ -612,15 +616,23 @@ public struct IdentityAttestation: Sendable, Equatable {
     /// Optional platform-assigned unique identifier.
     public let platformId: String?
 
+    /// Raw JSON string from the bridge for roundtrip signature verification.
+    ///
+    /// `nil` for attestations constructed manually (not from the bridge).
+    /// Stored as a JSON string (not `[String: Any]`) to maintain `Sendable`
+    /// conformance.
+    public let rawJson: String?
+
     /// Creates an attestation from its component fields.
     public init(
         id: String,
         platform: String,
         platformHandle: String,
         verificationMethod: String,
-        verifiedAt: Int,
+        verifiedAt: UInt64,
         revocationStatus: RevocationStatus = .active,
-        platformId: String? = nil
+        platformId: String? = nil,
+        rawJson: String? = nil
     ) {
         self.id = id
         self.platform = platform
@@ -629,24 +641,31 @@ public struct IdentityAttestation: Sendable, Equatable {
         self.verifiedAt = verifiedAt
         self.revocationStatus = revocationStatus
         self.platformId = platformId
+        self.rawJson = rawJson
     }
 
     /// Verifies this attestation's signature and validity.
     ///
     /// Delegates to the bridge's trust verification function.
     ///
+    /// The issuer's public key cannot be reliably extracted from the DID string
+    /// because attestations are signed with `#active` or `#agent` keys
+    /// (spec section 3.5.2), not the `#0` identity key embedded in the DID.
+    ///
+    /// - Parameters:
+    ///   - issuerPublicKeyHex: Hex-encoded Ed25519 public key of the issuer.
+    ///   - verifyFn: Bridge function override for testing.
     /// - Returns: `true` if the attestation is valid.
     /// - Throws: ``ScpError`` if verification is not available.
     ///
     /// ## Provenance
     ///
     /// - Spec section 3.5 (Identity Link Attestations)
-    public func verify() async throws -> Bool {
-        // Bridge function not yet available — throw not-implemented
-        throw ScpError.Identity(
-            msg: "Attestation verification is not yet available in the bridge",
-            code: "SCP-ATTEST-9014"
-        )
+    public func verify(
+        issuerPublicKeyHex: String,
+        verifyFn: IdentityAttestationBridge.VerifyFn = IdentityAttestationBridge.defaultVerify
+    ) async throws -> Bool {
+        try await verifyFn(self, issuerPublicKeyHex)
     }
 }
 
@@ -654,9 +673,10 @@ public struct IdentityAttestation: Sendable, Equatable {
 
 /// Namespace for identity link attestation bridge function references.
 ///
-/// Bridge functions for attestation CRUD are not yet available in the
-/// UniFFI layer. These type aliases and defaults throw not-implemented
-/// errors until the Rust bridge is wired.
+/// Defaults delegate to UniFFI-generated free functions for attestation
+/// CRUD. The UniFFI bridge returns JSON strings that are parsed into
+/// ``IdentityAttestation`` values via the private ``AttestationWire``
+/// Codable type.
 ///
 /// ## Provenance
 ///
@@ -668,6 +688,7 @@ public enum IdentityAttestationBridge {
         _ platform: String,
         _ handle: String,
         _ proof: String,
+        _ verificationMethod: String,
         _ platformId: String?
     ) async throws -> IdentityAttestation
 
@@ -682,41 +703,214 @@ public enum IdentityAttestationBridge {
         _ attestationId: String
     ) async throws -> Bool
 
-    /// Renew an attestation.
-    public typealias RenewFn = @Sendable (
-        _ did: String,
-        _ attestationId: String
-    ) async throws -> IdentityAttestation
-
-    /// Default create function — not yet available.
-    public static let defaultCreate: CreateFn = { _, _, _, _, _ in
-        throw ScpError.Identity(
-            msg: "Identity link attestation creation is not yet available in the bridge",
-            code: "SCP-ATTEST-9010"
+    /// Default create function — delegates to UniFFI
+    /// ``identityCreateLinkAttestation(identity:platform:handle:proof:verificationMethod:platformId:)``.
+    ///
+    /// Loads the ``Identity`` from the DID string via ``identityLoad(did:)``,
+    /// then calls the UniFFI create function and parses the JSON result.
+    public static let defaultCreate: CreateFn = { did, platform, handle, proof, verificationMethod, platformId in
+        let identity = try await identityLoad(did: did)
+        let json = try await identityCreateLinkAttestation(
+            identity: identity,
+            platform: platform,
+            handle: handle,
+            proof: proof,
+            verificationMethod: verificationMethod,
+            platformId: platformId
         )
+        return try AttestationWire.parseAttestation(from: json)
     }
 
-    /// Default list function — not yet available.
-    public static let defaultList: ListFn = { _ in
-        throw ScpError.Identity(
-            msg: "Identity link attestation listing is not yet available in the bridge",
-            code: "SCP-ATTEST-9011"
-        )
+    /// Default list function — delegates to UniFFI
+    /// ``identityLinkAttestations(did:)``.
+    ///
+    /// Calls the UniFFI list function and parses the JSON array result.
+    public static let defaultList: ListFn = { did in
+        let json = try identityLinkAttestations(did: did)
+        return try AttestationWire.parseAttestations(from: json)
     }
 
-    /// Default remove function — not yet available.
-    public static let defaultRemove: RemoveFn = { _, _ in
-        throw ScpError.Identity(
-            msg: "Identity link attestation removal is not yet available in the bridge",
-            code: "SCP-ATTEST-9012"
-        )
+    /// Default remove function — delegates to UniFFI
+    /// ``identityRemoveLinkAttestation(did:attestationId:)``.
+    public static let defaultRemove: RemoveFn = { did, attestationId in
+        identityRemoveLinkAttestation(did: did, attestationId: attestationId)
     }
 
-    /// Default renew function — not yet available.
-    public static let defaultRenew: RenewFn = { _, _ in
-        throw ScpError.Identity(
-            msg: "Identity link attestation renewal is not yet available in the bridge",
-            code: "SCP-ATTEST-9013"
+    /// Verify an attestation's signature and validity.
+    ///
+    /// The issuer's public key cannot be reliably extracted from the DID string
+    /// because attestations are signed with `#active` or `#agent` keys
+    /// (spec section 3.5.2), not the `#0` identity key embedded in the DID.
+    public typealias VerifyFn = @Sendable (
+        _ attestation: IdentityAttestation,
+        _ issuerPublicKeyHex: String
+    ) async throws -> Bool
+
+    /// Default verify function — delegates to UniFFI
+    /// ``identityVerifyLinkAttestation(attestationJson:issuerPublicKeyHex:)``.
+    ///
+    /// Uses ``IdentityAttestation/rawJson`` when available for exact
+    /// roundtrip fidelity. Falls back to re-serializing the attestation
+    /// if ``rawJson`` is `nil`.
+    public static let defaultVerify: VerifyFn = { attestation, issuerPublicKeyHex in
+        let json: String
+        if let raw = attestation.rawJson {
+            json = raw
+        } else {
+            json = try AttestationWire.serializeAttestation(attestation)
+        }
+        return try await identityVerifyLinkAttestation(
+            attestationJson: json,
+            issuerPublicKeyHex: issuerPublicKeyHex
+        )
+    }
+}
+
+// MARK: - Attestation JSON Wire Format
+
+/// Private Codable claim matching Rust `AttestationClaim` JSON.
+private struct AttestationClaimWire: Codable {
+    let platform: String
+    let platformHandle: String
+    let platformId: String?
+    let linkType: String
+
+    enum CodingKeys: String, CodingKey {
+        case platform
+        case platformHandle = "platform_handle"
+        case platformId = "platform_id"
+        case linkType = "link_type"
+    }
+}
+
+/// Private Codable evidence matching Rust `AttestationEvidence` JSON.
+private struct AttestationEvidenceWire: Codable {
+    let method: String
+    let proof: String
+    let verifiedAt: UInt64
+    let verifierDid: String?
+
+    enum CodingKeys: String, CodingKey {
+        case method
+        case proof
+        case verifiedAt = "verified_at"
+        case verifierDid = "verifier_did"
+    }
+}
+
+/// Private Codable type matching the Rust `IdentityLinkAttestation` JSON
+/// wire format produced by `serde_json::to_string`. Used to translate
+/// between the UniFFI bridge's JSON strings and the public
+/// ``IdentityAttestation`` value type.
+///
+/// Properties use camelCase; `CodingKeys` map to Rust's snake_case JSON.
+private struct AttestationWire: Codable {
+    let id: String
+    let typeField: String
+    let issuer: String
+    let subject: String
+    let issuedAt: UInt64
+    let expiresAt: UInt64?
+    let claim: AttestationClaimWire
+    let evidence: AttestationEvidenceWire
+    let revocationStatus: String
+    let signature: [UInt8]?
+
+    enum CodingKeys: String, CodingKey {
+        case id
+        case typeField = "type"
+        case issuer
+        case subject
+        case issuedAt = "issued_at"
+        case expiresAt = "expires_at"
+        case claim
+        case evidence
+        case revocationStatus = "revocation_status"
+        case signature
+    }
+
+    /// Parses a single attestation from the bridge JSON string.
+    static func parseAttestation(from json: String) throws -> IdentityAttestation {
+        guard let data = json.data(using: .utf8) else {
+            throw ScpError.Identity(
+                msg: "attestation JSON is not valid UTF-8",
+                code: "SCP-ATTEST-9010"
+            )
+        }
+        let decoder = JSONDecoder()
+        let wire = try decoder.decode(AttestationWire.self, from: data)
+        return wire.toIdentityAttestation(rawJson: json)
+    }
+
+    /// Parses a JSON array of attestations from the bridge.
+    static func parseAttestations(from json: String) throws -> [IdentityAttestation] {
+        guard let data = json.data(using: .utf8) else {
+            throw ScpError.Identity(
+                msg: "attestation list JSON is not valid UTF-8",
+                code: "SCP-ATTEST-9011"
+            )
+        }
+        let decoder = JSONDecoder()
+        let wires = try decoder.decode([AttestationWire].self, from: data)
+        // Re-serialize each element individually to preserve per-attestation
+        // rawJson for roundtrip signature verification.
+        let encoder = JSONEncoder()
+        return try wires.map { wire in
+            let elementJson = try String(data: encoder.encode(wire), encoding: .utf8)
+            return wire.toIdentityAttestation(rawJson: elementJson)
+        }
+    }
+
+    /// Re-serializes an ``IdentityAttestation`` into the bridge JSON format.
+    ///
+    /// Used by the verify bridge when ``IdentityAttestation/rawJson`` is `nil`.
+    static func serializeAttestation(_ attestation: IdentityAttestation) throws -> String {
+        let wire = AttestationWire(
+            id: attestation.id,
+            typeField: "identity_link",
+            issuer: "", // Verification uses the issuer DID from the full wire format
+            subject: "",
+            issuedAt: attestation.verifiedAt,
+            expiresAt: nil,
+            claim: AttestationClaimWire(
+                platform: attestation.platform,
+                platformHandle: attestation.platformHandle,
+                platformId: attestation.platformId,
+                linkType: "self_attestation"
+            ),
+            evidence: AttestationEvidenceWire(
+                method: attestation.verificationMethod,
+                proof: "",
+                verifiedAt: attestation.verifiedAt,
+                verifierDid: nil
+            ),
+            revocationStatus: attestation.revocationStatus == .active ? "Active" : "Revoked",
+            signature: nil
+        )
+        let encoder = JSONEncoder()
+        guard let json = try String(data: encoder.encode(wire), encoding: .utf8) else {
+            throw ScpError.Identity(
+                msg: "failed to encode attestation as UTF-8 JSON",
+                code: "SCP-ATTEST-9012"
+            )
+        }
+        return json
+    }
+
+    /// Converts the wire format to the public ``IdentityAttestation`` type.
+    func toIdentityAttestation(rawJson: String?) -> IdentityAttestation {
+        let status: RevocationStatus = revocationStatus == "Active"
+            ? .active
+            : .revoked(revokedAt: Int(issuedAt), reason: nil)
+        return IdentityAttestation(
+            id: id,
+            platform: claim.platform,
+            platformHandle: claim.platformHandle,
+            verificationMethod: evidence.method,
+            verifiedAt: evidence.verifiedAt,
+            revocationStatus: status,
+            platformId: claim.platformId,
+            rawJson: rawJson
         )
     }
 }
@@ -730,6 +924,8 @@ public enum IdentityAttestationBridge {
 ///   - platform: Platform identifier (e.g., `"github.com"`).
 ///   - handle: Platform-specific handle or username.
 ///   - proof: Platform-specific proof of ownership.
+///   - verificationMethod: One of `"oauth"`, `"signed_post"`, `"dns_record"`,
+///     `"challenge_response"`. Defaults to `"oauth"`.
 ///   - platformId: Optional platform-assigned unique identifier.
 ///   - createFn: Bridge function override for testing.
 /// - Returns: The created ``IdentityAttestation``.
@@ -743,10 +939,11 @@ public func createIdentityAttestation(
     platform: String,
     handle: String,
     proof: String,
+    verificationMethod: String = "oauth",
     platformId: String? = nil,
     createFn: IdentityAttestationBridge.CreateFn = IdentityAttestationBridge.defaultCreate
 ) async throws -> IdentityAttestation {
-    try await createFn(did, platform, handle, proof, platformId)
+    try await createFn(did, platform, handle, proof, verificationMethod, platformId)
 }
 
 /// Lists all identity link attestations for an identity.
@@ -785,24 +982,4 @@ public func removeIdentityAttestation(
     removeFn: IdentityAttestationBridge.RemoveFn = IdentityAttestationBridge.defaultRemove
 ) async throws -> Bool {
     try await removeFn(did, attestationId)
-}
-
-/// Renews an identity link attestation with a fresh `verifiedAt`.
-///
-/// - Parameters:
-///   - did: The DID that owns the attestation.
-///   - attestationId: The attestation ID to renew.
-///   - renewFn: Bridge function override for testing.
-/// - Returns: A new ``IdentityAttestation`` with updated `verifiedAt`.
-/// - Throws: ``ScpError/Identity(msg:code:)`` if renewal fails.
-///
-/// ## Provenance
-///
-/// - Spec section 3.5 (Identity Link Attestations)
-public func renewIdentityAttestation(
-    did: String,
-    attestationId: String,
-    renewFn: IdentityAttestationBridge.RenewFn = IdentityAttestationBridge.defaultRenew
-) async throws -> IdentityAttestation {
-    try await renewFn(did, attestationId)
 }

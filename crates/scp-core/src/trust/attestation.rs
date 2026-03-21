@@ -24,12 +24,13 @@
 //!
 //! See ADR-017 in `.docs/adrs/phase-4.md`.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
 use crate::crypto::ed25519::verify_ed25519_signature;
+use crate::identity::attestation::AttestationClass;
 use scp_event_log::Ed25519Signature;
 use scp_identity::DID;
 use scp_identity::cache::Clock;
@@ -154,7 +155,7 @@ impl IdentityLinkClaim {
 // RevocationStatus
 // ---------------------------------------------------------------------------
 
-/// Revocation status of an attestation.
+/// Revocation status of an attestation (§7.4.1).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum RevocationStatus {
     /// The attestation is active and not revoked.
@@ -163,9 +164,31 @@ pub enum RevocationStatus {
     Revoked {
         /// Unix timestamp (seconds) when the revocation occurred.
         revoked_at: u64,
-        /// Optional reason for revocation.
-        reason: Option<String>,
+        /// Reason for revocation (empty string if no reason provided).
+        #[serde(default, deserialize_with = "deserialize_string_or_null")]
+        reason: String,
+        /// DID that performed the revocation. Must equal the attestation's
+        /// issuer — only the issuer can revoke their own attestation (§7.4.1).
+        #[serde(default = "default_revoked_by")]
+        revoked_by: DID,
     },
+}
+
+/// Deserializes a `String` field that may be `null` in JSON. Returns the string
+/// value when present, or an empty string for both missing keys and explicit
+/// `null` values. `#[serde(default)]` alone only handles missing keys — an
+/// explicit `"reason": null` would fail deserialization without this.
+fn deserialize_string_or_null<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Option::<String>::deserialize(deserializer).map(Option::unwrap_or_default)
+}
+
+/// Default `revoked_by` DID for pre-migration attestations that were serialized
+/// without the `revoked_by` field.
+fn default_revoked_by() -> DID {
+    DID::from("did:unknown:pre-migration")
 }
 
 // ---------------------------------------------------------------------------
@@ -203,28 +226,90 @@ pub enum FreshnessStatus {
 /// (`total_attestors`) must provide attestations of a given type, and the
 /// minimum independence score required among those attestors.
 ///
+/// All `f64` fields must be finite (not NaN or infinity). Value ranges are
+/// enforced: `independence_threshold` must be in \[0.0, 1.0\], penalty fields
+/// must be non-negative, and `required_count` must be <= `total_attestors`.
+/// Deserialization rejects invalid values via `TryFrom<ThresholdRequirementRaw>`.
+///
+/// Fields are private to prevent bypass of validation. Use [`ThresholdRequirement::new`]
+/// or [`ThresholdRequirement::try_new`] for construction, and accessor methods for reading.
+///
 /// See ADR-017 acceptance criterion 7.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(into = "ThresholdRequirementRaw")]
 pub struct ThresholdRequirement {
     /// The minimum number of valid attestations required (N).
-    pub required_count: u32,
+    required_count: u32,
     /// The total number of attestors in the set (M).
-    pub total_attestors: u32,
+    total_attestors: u32,
     /// Minimum independence score (0.0 to 1.0). Attestors with shared context
     /// memberships or mutual endorsements have reduced independence.
-    pub independence_threshold: f64,
+    independence_threshold: f64,
     /// Independence penalty per shared context membership between a pair of
     /// attestors. Default: 0.1. Capped at `shared_context_penalty_cap` total.
-    #[serde(default = "default_shared_context_penalty")]
-    pub shared_context_penalty: f64,
+    shared_context_penalty: f64,
     /// Maximum total penalty from shared context memberships for a single
     /// pair. Default: 0.5.
-    #[serde(default = "default_shared_context_penalty_cap")]
-    pub shared_context_penalty_cap: f64,
+    shared_context_penalty_cap: f64,
     /// Independence penalty per mutual endorsement direction (A endorsed B
     /// = one direction, B endorsed A = another). Default: 0.2.
+    mutual_endorsement_penalty: f64,
+}
+
+/// Raw deserialization helper for [`ThresholdRequirement`].
+///
+/// Carries `#[serde(default)]` annotations for backward-compatible
+/// deserialization, then validates f64 fields via `TryFrom`.
+#[derive(Deserialize, Serialize)]
+struct ThresholdRequirementRaw {
+    required_count: u32,
+    total_attestors: u32,
+    independence_threshold: f64,
+    #[serde(default = "default_shared_context_penalty")]
+    shared_context_penalty: f64,
+    #[serde(default = "default_shared_context_penalty_cap")]
+    shared_context_penalty_cap: f64,
     #[serde(default = "default_mutual_endorsement_penalty")]
-    pub mutual_endorsement_penalty: f64,
+    mutual_endorsement_penalty: f64,
+}
+
+impl From<ThresholdRequirement> for ThresholdRequirementRaw {
+    fn from(t: ThresholdRequirement) -> Self {
+        Self {
+            required_count: t.required_count,
+            total_attestors: t.total_attestors,
+            independence_threshold: t.independence_threshold,
+            shared_context_penalty: t.shared_context_penalty,
+            shared_context_penalty_cap: t.shared_context_penalty_cap,
+            mutual_endorsement_penalty: t.mutual_endorsement_penalty,
+        }
+    }
+}
+
+impl TryFrom<ThresholdRequirementRaw> for ThresholdRequirement {
+    type Error = String;
+
+    fn try_from(raw: ThresholdRequirementRaw) -> Result<Self, Self::Error> {
+        let t = Self {
+            required_count: raw.required_count,
+            total_attestors: raw.total_attestors,
+            independence_threshold: raw.independence_threshold,
+            shared_context_penalty: raw.shared_context_penalty,
+            shared_context_penalty_cap: raw.shared_context_penalty_cap,
+            mutual_endorsement_penalty: raw.mutual_endorsement_penalty,
+        };
+        t.validate().map(|()| t)
+    }
+}
+
+impl<'de> Deserialize<'de> for ThresholdRequirement {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let raw = ThresholdRequirementRaw::deserialize(deserializer)?;
+        Self::try_from(raw).map_err(serde::de::Error::custom)
+    }
 }
 
 const fn default_shared_context_penalty() -> f64 {
@@ -241,6 +326,20 @@ const fn default_mutual_endorsement_penalty() -> f64 {
 
 impl ThresholdRequirement {
     /// Creates a new `ThresholdRequirement` with default penalty values.
+    ///
+    /// # Safety (logical)
+    ///
+    /// **This constructor performs NO validation.** It is `const` for use in
+    /// static/const contexts (e.g., compile-time policy definitions). The caller
+    /// MUST ensure:
+    ///
+    /// - `required_count <= total_attestors`
+    /// - `independence_threshold` is in \[0.0, 1.0\] and finite
+    /// - All f64 penalty fields (using defaults here) are finite and non-negative
+    ///
+    /// Violating these invariants will cause incorrect threshold evaluation at
+    /// runtime. For runtime construction with validation, use
+    /// [`ThresholdRequirement::try_new`] instead.
     #[must_use]
     pub const fn new(
         required_count: u32,
@@ -255,6 +354,188 @@ impl ThresholdRequirement {
             shared_context_penalty_cap: default_shared_context_penalty_cap(),
             mutual_endorsement_penalty: default_mutual_endorsement_penalty(),
         }
+    }
+
+    /// Creates a new `ThresholdRequirement` with explicit penalty values.
+    ///
+    /// Like [`ThresholdRequirement::new`], this is `const` and does not
+    /// validate. For runtime construction with validation, use
+    /// [`ThresholdRequirement::try_new_with_penalties`].
+    ///
+    /// Prefer [`ThresholdRequirement::new`] + [`ThresholdRequirement::try_new`]
+    /// when default penalties suffice. This constructor is for advanced use
+    /// cases that need custom penalty tuning.
+    #[must_use]
+    pub const fn new_with_penalties(
+        required_count: u32,
+        total_attestors: u32,
+        independence_threshold: f64,
+        shared_context_penalty: f64,
+        shared_context_penalty_cap: f64,
+        mutual_endorsement_penalty: f64,
+    ) -> Self {
+        Self {
+            required_count,
+            total_attestors,
+            independence_threshold,
+            shared_context_penalty,
+            shared_context_penalty_cap,
+            mutual_endorsement_penalty,
+        }
+    }
+
+    /// Creates a new `ThresholdRequirement` with explicit penalty values and
+    /// validation.
+    ///
+    /// # Errors
+    ///
+    /// Returns a description of the invalid field if validation fails.
+    pub fn try_new_with_penalties(
+        required_count: u32,
+        total_attestors: u32,
+        independence_threshold: f64,
+        shared_context_penalty: f64,
+        shared_context_penalty_cap: f64,
+        mutual_endorsement_penalty: f64,
+    ) -> Result<Self, String> {
+        let t = Self::new_with_penalties(
+            required_count,
+            total_attestors,
+            independence_threshold,
+            shared_context_penalty,
+            shared_context_penalty_cap,
+            mutual_endorsement_penalty,
+        );
+        t.validate().map(|()| t)
+    }
+
+    /// Creates a new `ThresholdRequirement` with validation.
+    ///
+    /// Returns an error if any field violates its constraints: f64 fields must
+    /// be finite, `independence_threshold` must be in \[0.0, 1.0\], penalty
+    /// fields must be non-negative, and `required_count` must be <=
+    /// `total_attestors`.
+    ///
+    /// # Errors
+    ///
+    /// Returns a description of the invalid field if validation fails.
+    pub fn try_new(
+        required_count: u32,
+        total_attestors: u32,
+        independence_threshold: f64,
+    ) -> Result<Self, String> {
+        let t = Self::new(required_count, total_attestors, independence_threshold);
+        t.validate().map(|()| t)
+    }
+
+    /// Validates all field constraints.
+    ///
+    /// - All f64 fields must be finite (not NaN or infinity).
+    /// - `independence_threshold` must be in \[0.0, 1.0\].
+    /// - `shared_context_penalty`, `shared_context_penalty_cap`, and
+    ///   `mutual_endorsement_penalty` must be non-negative.
+    /// - `required_count` must be <= `total_attestors`.
+    ///
+    /// # Errors
+    ///
+    /// Returns a description of the first invalid field found.
+    pub fn validate(&self) -> Result<(), String> {
+        // Check finiteness first (catches NaN and infinity).
+        let fields: &[(&str, f64)] = &[
+            ("independence_threshold", self.independence_threshold),
+            ("shared_context_penalty", self.shared_context_penalty),
+            (
+                "shared_context_penalty_cap",
+                self.shared_context_penalty_cap,
+            ),
+            (
+                "mutual_endorsement_penalty",
+                self.mutual_endorsement_penalty,
+            ),
+        ];
+        for &(name, value) in fields {
+            if !value.is_finite() {
+                return Err(format!(
+                    "ThresholdRequirement::{name} must be finite, got {value}"
+                ));
+            }
+        }
+
+        // independence_threshold must be in [0.0, 1.0].
+        if !(0.0..=1.0).contains(&self.independence_threshold) {
+            return Err(format!(
+                "ThresholdRequirement::independence_threshold must be in [0.0, 1.0], got {}",
+                self.independence_threshold
+            ));
+        }
+
+        // Penalty fields must be non-negative.
+        if self.shared_context_penalty < 0.0 {
+            return Err(format!(
+                "ThresholdRequirement::shared_context_penalty must be non-negative, got {}",
+                self.shared_context_penalty
+            ));
+        }
+        if self.shared_context_penalty_cap < 0.0 {
+            return Err(format!(
+                "ThresholdRequirement::shared_context_penalty_cap must be non-negative, got {}",
+                self.shared_context_penalty_cap
+            ));
+        }
+        if self.mutual_endorsement_penalty < 0.0 {
+            return Err(format!(
+                "ThresholdRequirement::mutual_endorsement_penalty must be non-negative, got {}",
+                self.mutual_endorsement_penalty
+            ));
+        }
+
+        // required_count must be <= total_attestors.
+        if self.required_count > self.total_attestors {
+            return Err(format!(
+                "ThresholdRequirement::required_count ({}) must be <= total_attestors ({})",
+                self.required_count, self.total_attestors
+            ));
+        }
+
+        Ok(())
+    }
+
+    // --- Accessor methods ---
+
+    /// Returns the minimum number of valid attestations required (N).
+    #[must_use]
+    pub const fn required_count(&self) -> u32 {
+        self.required_count
+    }
+
+    /// Returns the total number of attestors in the set (M).
+    #[must_use]
+    pub const fn total_attestors(&self) -> u32 {
+        self.total_attestors
+    }
+
+    /// Returns the minimum independence score (0.0 to 1.0).
+    #[must_use]
+    pub const fn independence_threshold(&self) -> f64 {
+        self.independence_threshold
+    }
+
+    /// Returns the independence penalty per shared context membership.
+    #[must_use]
+    pub const fn shared_context_penalty(&self) -> f64 {
+        self.shared_context_penalty
+    }
+
+    /// Returns the maximum total penalty from shared context memberships.
+    #[must_use]
+    pub const fn shared_context_penalty_cap(&self) -> f64 {
+        self.shared_context_penalty_cap
+    }
+
+    /// Returns the independence penalty per mutual endorsement direction.
+    #[must_use]
+    pub const fn mutual_endorsement_penalty(&self) -> f64 {
+        self.mutual_endorsement_penalty
     }
 }
 
@@ -380,6 +661,185 @@ impl DidPublicKeyResolver for IdentityDidPublicKeyResolver {
 }
 
 // ---------------------------------------------------------------------------
+// AttestationRevocationChecker trait (§7.4.1)
+// ---------------------------------------------------------------------------
+
+/// Trait for checking attestation revocation status.
+///
+/// Implementations may check DID document service endpoints, local revocation
+/// lists, or external revocation services. The trait is object-safe and
+/// designed for injection into [`verify_attestation`].
+///
+/// See spec §7.4.1 (attestation verification).
+pub trait AttestationRevocationChecker {
+    /// Checks if the attestation with the given ID has been revoked by the issuer.
+    ///
+    /// Returns `Some(revoked_at)` with the revocation timestamp (seconds) if the
+    /// attestation has been revoked, or `None` if the attestation is still active.
+    fn check_revocation(&self, attestation_id: &str, issuer: &DID) -> Option<u64>;
+}
+
+/// No-op revocation checker that always returns `None` (not revoked).
+///
+/// Suitable for testing, offline verification, or contexts where external
+/// revocation checking is not available.
+pub struct NoOpRevocationChecker;
+
+impl AttestationRevocationChecker for NoOpRevocationChecker {
+    fn check_revocation(&self, _attestation_id: &str, _issuer: &DID) -> Option<u64> {
+        None
+    }
+}
+
+// ---------------------------------------------------------------------------
+// AttestationVerificationCache (§7.4.1)
+// ---------------------------------------------------------------------------
+
+/// TTL for cached Reference attestation verification results: 1 hour.
+///
+/// Reference attestations (signed post, DNS record) depend on external platform data
+/// that can change or disappear. Shorter TTL ensures freshness.
+pub const REFERENCE_TTL_SECS: u64 = 3600;
+
+/// TTL for cached Cryptographic attestation verification results: 24 hours.
+///
+/// Cryptographic attestations (OAuth, challenge-response) are self-verifiable
+/// and change infrequently. Longer TTL reduces redundant verification.
+pub const CRYPTOGRAPHIC_TTL_SECS: u64 = 86400;
+
+/// A cached attestation verification result.
+struct VerificationCacheEntry {
+    /// When the verification was performed (seconds since epoch).
+    verified_at: u64,
+    /// The class of the attestation, determining the TTL.
+    attestation_class: AttestationClass,
+    /// The cached verification result.
+    result: Result<(), TrustError>,
+}
+
+/// Cache for attestation verification results with class-based TTLs (§7.4.1).
+///
+/// Per-class TTLs: [`REFERENCE_TTL_SECS`] (1 hour) for Reference attestations,
+/// [`CRYPTOGRAPHIC_TTL_SECS`] (24 hours) for Cryptographic attestations.
+///
+/// This is a simple in-memory cache keyed by attestation ID. It does not
+/// persist across process restarts. For persistent caching, use
+/// [`super::aggregate::AttestationCache`] backed by a
+/// [`super::aggregate::TrustProtocolRepository`].
+pub struct AttestationVerificationCache {
+    entries: HashMap<String, VerificationCacheEntry>,
+    /// Maximum number of entries the cache can hold. When full, the oldest
+    /// entry (by `verified_at`) is evicted before inserting a new one.
+    max_capacity: usize,
+}
+
+/// Default maximum capacity for the attestation verification cache.
+const DEFAULT_CACHE_CAPACITY: usize = 10_000;
+
+impl AttestationVerificationCache {
+    /// Creates an empty verification cache with the default capacity (10000).
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            entries: HashMap::new(),
+            max_capacity: DEFAULT_CACHE_CAPACITY,
+        }
+    }
+
+    /// Creates an empty verification cache with the specified maximum capacity.
+    #[must_use]
+    pub fn with_capacity(max_capacity: usize) -> Self {
+        Self {
+            entries: HashMap::new(),
+            max_capacity,
+        }
+    }
+
+    /// Returns the TTL in seconds for the given attestation class.
+    #[must_use]
+    const fn ttl_for_class(class: AttestationClass) -> u64 {
+        match class {
+            AttestationClass::Reference => REFERENCE_TTL_SECS,
+            AttestationClass::Cryptographic => CRYPTOGRAPHIC_TTL_SECS,
+        }
+    }
+
+    /// Retrieves a cached verification result if the entry exists and has not
+    /// expired.
+    ///
+    /// Returns `None` if the entry is missing or expired.
+    #[must_use]
+    pub fn get(&self, attestation_id: &str, now: u64) -> Option<&Result<(), TrustError>> {
+        let entry = self.entries.get(attestation_id)?;
+        let ttl = Self::ttl_for_class(entry.attestation_class);
+        if now > entry.verified_at.saturating_add(ttl) {
+            return None;
+        }
+        Some(&entry.result)
+    }
+
+    /// Inserts a verification result into the cache.
+    ///
+    /// Overwrites any existing entry for the same attestation ID. If the
+    /// cache is at capacity and the key is new, evicts the oldest entry
+    /// (by `verified_at` timestamp) before inserting.
+    ///
+    /// # Performance
+    ///
+    /// Eviction scans all entries to find the oldest (`O(n)` where `n` is
+    /// the cache size). This is acceptable for the default capacity (10000)
+    /// and typical usage patterns where eviction is infrequent. For larger
+    /// caches, consider a `BTreeMap<(u64, String), _>` indexed by
+    /// `(verified_at, id)` for `O(log n)` eviction.
+    pub fn insert(
+        &mut self,
+        attestation_id: String,
+        class: AttestationClass,
+        result: Result<(), TrustError>,
+        now: u64,
+    ) {
+        // A cache with max_capacity == 0 is effectively disabled.
+        if self.max_capacity == 0 {
+            return;
+        }
+        // If this key already exists, overwriting won't increase count.
+        if !self.entries.contains_key(&attestation_id) && self.entries.len() >= self.max_capacity {
+            // Evict the oldest entry by verified_at.
+            if let Some(oldest_key) = self
+                .entries
+                .iter()
+                .min_by_key(|(_, v)| v.verified_at)
+                .map(|(k, _)| k.clone())
+            {
+                self.entries.remove(&oldest_key);
+            }
+        }
+        self.entries.insert(
+            attestation_id,
+            VerificationCacheEntry {
+                verified_at: now,
+                attestation_class: class,
+                result,
+            },
+        );
+    }
+
+    /// Removes all expired entries from the cache.
+    pub fn evict_expired(&mut self, now: u64) {
+        self.entries.retain(|_, entry| {
+            let ttl = Self::ttl_for_class(entry.attestation_class);
+            now <= entry.verified_at.saturating_add(ttl)
+        });
+    }
+}
+
+impl Default for AttestationVerificationCache {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+// ---------------------------------------------------------------------------
 // verify_attestation
 // ---------------------------------------------------------------------------
 
@@ -392,14 +852,21 @@ impl DidPublicKeyResolver for IdentityDidPublicKeyResolver {
 /// 2. **Evidence:** Validates that evidence is present when required by the
 ///    attestation type.
 /// 3. **Expiry:** Rejects if `expires_at < now`.
-/// 4. **Revocation:** Rejects if the attestation has been revoked.
+/// 4. **Revocation (field):** Rejects if the attestation's `revocation_status`
+///    field is `Revoked`.
+/// 5. **Revocation (external):** If a [`AttestationRevocationChecker`] is
+///    provided, queries it for external revocation signals. This is belt-and-
+///    suspenders with step 4: the field may be stale while the checker queries
+///    a live revocation service.
 ///
 /// # Errors
 ///
 /// Returns a specific [`TrustError`] variant for each failure mode:
 /// - [`TrustError::AttestationSignatureInvalid`] for signature failures
 /// - [`TrustError::AttestationExpired`] when past expiry
-/// - [`TrustError::AttestationRevoked`] when revoked
+/// - [`TrustError::AttestationRevocationInvalid`] when `revoked_by` does not
+///   match the issuer (§7.4.1)
+/// - [`TrustError::AttestationRevoked`] when revoked by the issuer (field or external)
 /// - [`TrustError::AttestationEvidenceInvalid`] when required evidence is
 ///   missing or invalid
 ///
@@ -408,6 +875,30 @@ pub fn verify_attestation(
     attestation: &Attestation,
     resolver: &impl DidPublicKeyResolver,
     clock: &impl Clock,
+) -> Result<(), TrustError> {
+    verify_attestation_with_revocation(attestation, resolver, clock, None)
+}
+
+/// Verifies an attestation with an optional external revocation checker.
+///
+/// This is the full-featured verification entry point. [`verify_attestation`]
+/// delegates here with `revocation_checker: None` for backward compatibility.
+///
+/// See [`verify_attestation`] for the verification steps and error semantics.
+///
+/// # Errors
+///
+/// Returns a specific [`TrustError`] variant for each failure mode:
+/// - [`TrustError::AttestationSignatureInvalid`] for signature failures
+/// - [`TrustError::AttestationExpired`] when past expiry
+/// - [`TrustError::AttestationRevoked`] when revoked (field or external checker)
+/// - [`TrustError::AttestationEvidenceInvalid`] when required evidence is
+///   missing or invalid
+pub fn verify_attestation_with_revocation(
+    attestation: &Attestation,
+    resolver: &impl DidPublicKeyResolver,
+    clock: &impl Clock,
+    revocation_checker: Option<&dyn AttestationRevocationChecker>,
 ) -> Result<(), TrustError> {
     // 1. Verify Ed25519 signature against issuer's public key.
     let public_key_bytes = resolver.resolve_public_key(&attestation.issuer)?;
@@ -433,11 +924,34 @@ pub fn verify_attestation(
         });
     }
 
-    // 4. Check revocation status.
-    if let RevocationStatus::Revoked { revoked_at, .. } = &attestation.revocation_status {
+    // 4. Check revocation status (field on the attestation itself).
+    if let RevocationStatus::Revoked {
+        revoked_at,
+        revoked_by,
+        ..
+    } = &attestation.revocation_status
+    {
+        // Per §7.4.1, only the issuer can revoke their own attestation.
+        if *revoked_by != attestation.issuer {
+            return Err(TrustError::AttestationRevocationInvalid {
+                attestation_id: attestation.id.clone(),
+                revoked_by: revoked_by.to_string(),
+                issuer: attestation.issuer.to_string(),
+            });
+        }
         return Err(TrustError::AttestationRevoked {
             attestation_id: attestation.id.clone(),
             revoked_at: *revoked_at,
+        });
+    }
+
+    // 5. Check external revocation (belt-and-suspenders with step 4).
+    if let Some(checker) = revocation_checker
+        && let Some(revoked_at) = checker.check_revocation(&attestation.id, &attestation.issuer)
+    {
+        return Err(TrustError::AttestationRevoked {
+            attestation_id: attestation.id.clone(),
+            revoked_at,
         });
     }
 
@@ -515,6 +1029,13 @@ pub fn check_threshold_attestation(
     attestors: &[AttestorInfo],
     requirement: &ThresholdRequirement,
 ) -> ThresholdResult {
+    // Defense-in-depth: validate requirement even though constructors enforce it.
+    debug_assert!(
+        requirement.validate().is_ok(),
+        "ThresholdRequirement invariants violated: {:?}",
+        requirement.validate()
+    );
+
     // Count valid attestations of the required type.
     let valid_attestors: Vec<&AttestorInfo> = attestors
         .iter()
@@ -530,20 +1051,20 @@ pub fn check_threshold_attestation(
     // Compute independence score among valid attestors.
     let independence_score = compute_independence_score(
         &valid_attestors,
-        requirement.shared_context_penalty,
-        requirement.shared_context_penalty_cap,
-        requirement.mutual_endorsement_penalty,
+        requirement.shared_context_penalty(),
+        requirement.shared_context_penalty_cap(),
+        requirement.mutual_endorsement_penalty(),
     );
 
-    let count_met = valid_count >= requirement.required_count;
-    let independence_met = independence_score >= requirement.independence_threshold;
+    let count_met = valid_count >= requirement.required_count();
+    let independence_met = independence_score >= requirement.independence_threshold();
 
     ThresholdResult {
         met: count_met && independence_met,
         valid_count,
-        required_count: requirement.required_count,
+        required_count: requirement.required_count(),
         independence_score,
-        independence_threshold: requirement.independence_threshold,
+        independence_threshold: requirement.independence_threshold(),
     }
 }
 
@@ -556,7 +1077,8 @@ pub fn check_threshold_attestation(
 /// ```text
 /// "SCP-ATTESTATION-V1:" || len(id) || id || attestation_type_tag_BE
 ///     || len(issuer) || issuer || len(subject) || subject
-///     || len(claim_json) || claim_json || issued_at_BE
+///     || len(claim_json) || claim_json || len(evidence_msgpack) || evidence_msgpack
+///     || issued_at_BE || expires_at_BE || len(revocation_status_msgpack) || revocation_status_msgpack
 /// ```
 ///
 /// Variable-length fields are prefixed with their length as a 4-byte
@@ -565,26 +1087,50 @@ pub fn check_threshold_attestation(
 /// numeric tag (u16 big-endian) instead of Debug formatting for
 /// cross-version determinism. `issued_at` uses big-endian encoding,
 /// consistent with all other canonical hash functions.
+///
+/// `revocation_status` is included in the signed scope so that an
+/// intermediary cannot flip Active↔Revoked without invalidating the
+/// signature.
 pub(crate) fn canonical_attestation_bytes(
     attestation: &Attestation,
 ) -> Result<Vec<u8>, TrustError> {
     use crate::crypto::canonical::{CanonicalField, canonical_hash};
 
-    // Serialize evidence as MessagePack bytes if present.
+    // Serialize evidence as MessagePack bytes (named/sorted keys) if present.
     let evidence_bytes = attestation
         .evidence
         .as_ref()
         .map(|e| {
-            rmp_serde::to_vec(e).map_err(|err| TrustError::InvalidEventData {
+            rmp_serde::to_vec_named(e).map_err(|err| TrustError::InvalidEventData {
                 sequence: 0,
                 reason: format!("evidence serialization failed: {err}"),
             })
         })
         .transpose()?;
 
+    // Serialize revocation_status as MessagePack bytes (named/sorted keys).
+    let revocation_bytes =
+        rmp_serde::to_vec_named(&attestation.revocation_status).map_err(|err| {
+            TrustError::InvalidEventData {
+                sequence: 0,
+                reason: format!("revocation_status serialization failed: {err}"),
+            }
+        })?;
+
     // Field order per §9.5.2: id, attestation_type, issuer, subject, claim,
-    // evidence, issued_at, expires_at.
-    let claim_bytes = attestation.claim.to_string();
+    // evidence, issued_at, expires_at, revocation_status.
+    //
+    // Serialize claim as MessagePack (named/sorted keys) for deterministic
+    // ordering. Using `serde_json::Value::to_string()` would produce JSON
+    // with non-deterministic key ordering. This matches
+    // `IdentityLinkAttestation::canonical_signing_bytes` which also uses
+    // `rmp_serde::to_vec_named`.
+    let claim_bytes = rmp_serde::to_vec_named(&attestation.claim).map_err(|err| {
+        TrustError::InvalidEventData {
+            sequence: 0,
+            reason: format!("claim serialization failed: {err}"),
+        }
+    })?;
     Ok(canonical_hash(
         "SCP-ATTESTATION-V1:",
         &[
@@ -592,12 +1138,15 @@ pub(crate) fn canonical_attestation_bytes(
             CanonicalField::U16(super::attestation_type_tag(&attestation.attestation_type)),
             CanonicalField::VarBytes(attestation.issuer.as_bytes()),
             CanonicalField::VarBytes(attestation.subject.as_bytes()),
-            CanonicalField::VarBytes(claim_bytes.as_bytes()),
+            CanonicalField::VarBytes(&claim_bytes),
             evidence_bytes
                 .as_deref()
                 .map_or(CanonicalField::Absent, CanonicalField::VarBytes),
             CanonicalField::U64(attestation.issued_at),
-            CanonicalField::U64(attestation.expires_at.unwrap_or(0)),
+            attestation
+                .expires_at
+                .map_or(CanonicalField::Absent, CanonicalField::U64),
+            CanonicalField::VarBytes(&revocation_bytes),
         ],
     )
     .to_vec())
@@ -771,7 +1320,7 @@ mod tests {
         (signing_key, verifying_key.to_bytes().to_vec())
     }
 
-    /// Creates and signs a test attestation.
+    /// Creates and signs a test attestation with `RevocationStatus::Active`.
     fn make_signed_attestation(
         signing_key: &SigningKey,
         attestation_type: AttestationType,
@@ -781,6 +1330,34 @@ mod tests {
         expires_at: Option<u64>,
         renewal_interval: Option<Duration>,
         evidence: Option<AttestationEvidence>,
+    ) -> Attestation {
+        make_signed_attestation_with_revocation(
+            signing_key,
+            attestation_type,
+            issuer,
+            subject,
+            issued_at,
+            expires_at,
+            renewal_interval,
+            evidence,
+            RevocationStatus::Active,
+        )
+    }
+
+    /// Creates and signs a test attestation with the given `RevocationStatus`.
+    ///
+    /// The signature is computed over the full canonical bytes including
+    /// `revocation_status`, matching the V2 canonical construction.
+    fn make_signed_attestation_with_revocation(
+        signing_key: &SigningKey,
+        attestation_type: AttestationType,
+        issuer: &str,
+        subject: &str,
+        issued_at: u64,
+        expires_at: Option<u64>,
+        renewal_interval: Option<Duration>,
+        evidence: Option<AttestationEvidence>,
+        revocation_status: RevocationStatus,
     ) -> Attestation {
         let mut attestation = Attestation {
             id: format!("att-{issued_at}"),
@@ -793,7 +1370,7 @@ mod tests {
             expires_at,
             renewal_interval,
             renewed_at: None,
-            revocation_status: RevocationStatus::Active,
+            revocation_status,
             signature: vec![],
         };
 
@@ -922,6 +1499,45 @@ mod tests {
         resolver.add_key("did:key:issuer", pubkey_bytes);
         let clock = TestClock::new(1000);
 
+        // Sign the attestation with RevocationStatus::Revoked already set.
+        // This models an issuer who signs the revocation envelope.
+        let attestation = make_signed_attestation_with_revocation(
+            &signing_key,
+            AttestationType::Endorsement,
+            "did:key:issuer",
+            "did:key:subject",
+            900,
+            Some(2000),
+            None,
+            None,
+            RevocationStatus::Revoked {
+                revoked_at: 950,
+                reason: "compromised".to_owned(),
+                revoked_by: "did:key:issuer".into(),
+            },
+        );
+
+        let result = verify_attestation(&attestation, &resolver, &clock);
+        assert!(result.is_err());
+        match result {
+            Err(TrustError::AttestationRevoked {
+                revoked_at: 950, ..
+            }) => {}
+            other => panic!("expected AttestationRevoked, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn verify_attestation_rejects_tampered_revocation_status() {
+        // An attestation signed as Active, then mutated to Revoked by an
+        // intermediary, must fail signature verification (not reach the
+        // revocation check). This proves revocation_status is in the
+        // signed scope.
+        let (signing_key, pubkey_bytes) = test_keypair();
+        let mut resolver = TestResolver::new();
+        resolver.add_key("did:key:issuer", pubkey_bytes);
+        let clock = TestClock::new(1000);
+
         let mut attestation = make_signed_attestation(
             &signing_key,
             AttestationType::Endorsement,
@@ -933,18 +1549,20 @@ mod tests {
             None,
         );
 
+        // Tamper: flip Active -> Revoked without re-signing.
         attestation.revocation_status = RevocationStatus::Revoked {
             revoked_at: 950,
-            reason: Some("compromised".to_owned()),
+            reason: "tampered".to_owned(),
+            revoked_by: "did:key:issuer".into(),
         };
 
         let result = verify_attestation(&attestation, &resolver, &clock);
         assert!(result.is_err());
         match result {
-            Err(TrustError::AttestationRevoked {
-                revoked_at: 950, ..
-            }) => {}
-            other => panic!("expected AttestationRevoked, got {other:?}"),
+            Err(TrustError::AttestationSignatureInvalid { .. }) => {}
+            other => panic!(
+                "expected AttestationSignatureInvalid (tampered revocation_status), got {other:?}"
+            ),
         }
     }
 
@@ -1595,5 +2213,613 @@ mod tests {
         // Valid prefix but garbage z-base-32
         let result = resolver.resolve_public_key("did:dht:z!@#$%^&*");
         assert!(result.is_err());
+    }
+
+    // -----------------------------------------------------------------------
+    // revocation_status in signed scope tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn canonical_bytes_differ_for_active_vs_revoked() {
+        let active = Attestation {
+            id: "att-1".to_owned(),
+            attestation_type: AttestationType::Endorsement,
+            issuer: "did:key:issuer".into(),
+            subject: "did:key:subject".into(),
+            claim: serde_json::json!({"test": true}),
+            evidence: None,
+            issued_at: 1000,
+            expires_at: Some(2000),
+            renewal_interval: None,
+            renewed_at: None,
+            revocation_status: RevocationStatus::Active,
+            signature: vec![],
+        };
+
+        let revoked = Attestation {
+            revocation_status: RevocationStatus::Revoked {
+                revoked_at: 1500,
+                reason: "compromised".to_owned(),
+                revoked_by: "did:key:issuer".into(),
+            },
+            ..active.clone()
+        };
+
+        let bytes_active = canonical_attestation_bytes(&active).unwrap();
+        let bytes_revoked = canonical_attestation_bytes(&revoked).unwrap();
+        assert_ne!(
+            bytes_active, bytes_revoked,
+            "revocation_status must be in the signed scope: Active and Revoked \
+             must produce different canonical bytes"
+        );
+    }
+
+    // --- ThresholdRequirement NaN / Infinity guard tests ---
+
+    #[test]
+    fn threshold_requirement_validate_rejects_nan_independence() {
+        let t = ThresholdRequirement::new(2, 3, f64::NAN);
+        let err = t.validate().unwrap_err();
+        assert!(
+            err.contains("independence_threshold"),
+            "error should name the field: {err}"
+        );
+    }
+
+    #[test]
+    fn threshold_requirement_validate_rejects_infinity() {
+        let t = ThresholdRequirement::new_with_penalties(2, 3, 0.5, f64::INFINITY, 0.5, 0.2);
+        let err = t.validate().unwrap_err();
+        assert!(
+            err.contains("shared_context_penalty"),
+            "error should name the field: {err}"
+        );
+    }
+
+    #[test]
+    fn threshold_requirement_validate_rejects_neg_infinity() {
+        let t = ThresholdRequirement::new_with_penalties(2, 3, 0.5, 0.1, 0.5, f64::NEG_INFINITY);
+        let err = t.validate().unwrap_err();
+        assert!(
+            err.contains("mutual_endorsement_penalty"),
+            "error should name the field: {err}"
+        );
+    }
+
+    #[test]
+    fn threshold_requirement_validate_accepts_finite_values() {
+        let t = ThresholdRequirement::new(2, 3, 0.5);
+        assert!(t.validate().is_ok());
+    }
+
+    #[test]
+    fn threshold_requirement_serde_roundtrip_finite() {
+        let t = ThresholdRequirement::new(2, 3, 0.5);
+        let json = serde_json::to_string(&t).unwrap();
+        let back: ThresholdRequirement = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, t);
+    }
+
+    #[test]
+    fn threshold_requirement_serde_backward_compat_defaults() {
+        // Deserialize without optional penalty fields — should use defaults.
+        let json = r#"{"required_count":2,"total_attestors":3,"independence_threshold":0.5}"#;
+        let t: ThresholdRequirement = serde_json::from_str(json).unwrap();
+        assert_eq!(t.required_count(), 2);
+        assert_eq!(t.total_attestors(), 3);
+        assert!((t.independence_threshold() - 0.5).abs() < f64::EPSILON);
+        assert!((t.shared_context_penalty() - 0.1).abs() < f64::EPSILON);
+        assert!((t.shared_context_penalty_cap() - 0.5).abs() < f64::EPSILON);
+        assert!((t.mutual_endorsement_penalty() - 0.2).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn threshold_requirement_serde_accepts_unknown_fields() {
+        // Wire-format types must tolerate unknown fields for forward
+        // compatibility — a newer sender may include fields this version
+        // doesn't know about yet.
+        let json = r#"{"required_count":2,"total_attestors":3,"independence_threshold":0.5,"evil_field":true}"#;
+        let result: Result<ThresholdRequirement, _> = serde_json::from_str(json);
+        assert!(
+            result.is_ok(),
+            "unknown fields must be accepted for forward compatibility: {result:?}"
+        );
+    }
+
+    // --- Value range validation tests ---
+
+    #[test]
+    fn threshold_requirement_rejects_independence_below_zero() {
+        let t = ThresholdRequirement::new(2, 3, -0.1);
+        let err = t.validate().unwrap_err();
+        assert!(
+            err.contains("independence_threshold"),
+            "error should mention independence_threshold: {err}"
+        );
+    }
+
+    #[test]
+    fn threshold_requirement_rejects_independence_above_one() {
+        let t = ThresholdRequirement::new(2, 3, 1.01);
+        let err = t.validate().unwrap_err();
+        assert!(
+            err.contains("independence_threshold"),
+            "error should mention independence_threshold: {err}"
+        );
+    }
+
+    #[test]
+    fn threshold_requirement_accepts_independence_boundary_values() {
+        // 0.0 and 1.0 are both valid boundary values.
+        assert!(ThresholdRequirement::new(2, 3, 0.0).validate().is_ok());
+        assert!(ThresholdRequirement::new(2, 3, 1.0).validate().is_ok());
+    }
+
+    #[test]
+    fn threshold_requirement_rejects_negative_shared_context_penalty() {
+        let t = ThresholdRequirement::new_with_penalties(2, 3, 0.5, -0.01, 0.5, 0.2);
+        let err = t.validate().unwrap_err();
+        assert!(
+            err.contains("shared_context_penalty"),
+            "error should mention shared_context_penalty: {err}"
+        );
+    }
+
+    #[test]
+    fn threshold_requirement_rejects_negative_shared_context_penalty_cap() {
+        let t = ThresholdRequirement::new_with_penalties(2, 3, 0.5, 0.1, -0.01, 0.2);
+        let err = t.validate().unwrap_err();
+        assert!(
+            err.contains("shared_context_penalty_cap"),
+            "error should mention shared_context_penalty_cap: {err}"
+        );
+    }
+
+    #[test]
+    fn threshold_requirement_rejects_negative_mutual_endorsement_penalty() {
+        let t = ThresholdRequirement::new_with_penalties(2, 3, 0.5, 0.1, 0.5, -0.01);
+        let err = t.validate().unwrap_err();
+        assert!(
+            err.contains("mutual_endorsement_penalty"),
+            "error should mention mutual_endorsement_penalty: {err}"
+        );
+    }
+
+    #[test]
+    fn threshold_requirement_rejects_required_count_exceeding_total() {
+        let t = ThresholdRequirement::new(5, 3, 0.5);
+        let err = t.validate().unwrap_err();
+        assert!(
+            err.contains("required_count"),
+            "error should mention required_count: {err}"
+        );
+    }
+
+    #[test]
+    fn threshold_requirement_accepts_required_count_equal_to_total() {
+        let t = ThresholdRequirement::new(3, 3, 0.5);
+        assert!(t.validate().is_ok());
+    }
+
+    #[test]
+    fn threshold_requirement_try_new_enforces_ranges() {
+        assert!(ThresholdRequirement::try_new(5, 3, 0.5).is_err());
+        assert!(ThresholdRequirement::try_new(2, 3, -0.1).is_err());
+        assert!(ThresholdRequirement::try_new(2, 3, 1.5).is_err());
+        assert!(ThresholdRequirement::try_new(2, 3, 0.5).is_ok());
+    }
+
+    #[test]
+    fn threshold_requirement_try_new_with_penalties_enforces_ranges() {
+        // Negative penalty.
+        assert!(ThresholdRequirement::try_new_with_penalties(2, 3, 0.5, -0.1, 0.5, 0.2).is_err());
+        // required_count > total_attestors.
+        assert!(ThresholdRequirement::try_new_with_penalties(5, 3, 0.5, 0.1, 0.5, 0.2).is_err());
+        // Valid.
+        assert!(ThresholdRequirement::try_new_with_penalties(2, 3, 0.5, 0.1, 0.5, 0.2).is_ok());
+    }
+
+    #[test]
+    fn threshold_requirement_serde_rejects_invalid_ranges() {
+        // independence_threshold > 1.0.
+        let json = r#"{"required_count":2,"total_attestors":3,"independence_threshold":1.5}"#;
+        assert!(serde_json::from_str::<ThresholdRequirement>(json).is_err());
+
+        // required_count > total_attestors.
+        let json = r#"{"required_count":5,"total_attestors":3,"independence_threshold":0.5}"#;
+        assert!(serde_json::from_str::<ThresholdRequirement>(json).is_err());
+
+        // Negative penalty.
+        let json = r#"{"required_count":2,"total_attestors":3,"independence_threshold":0.5,"shared_context_penalty":-0.1}"#;
+        assert!(serde_json::from_str::<ThresholdRequirement>(json).is_err());
+    }
+
+    // --- Accessor method tests ---
+
+    #[test]
+    fn threshold_requirement_accessor_methods() {
+        let t = ThresholdRequirement::new_with_penalties(2, 5, 0.7, 0.15, 0.6, 0.25);
+        assert_eq!(t.required_count(), 2);
+        assert_eq!(t.total_attestors(), 5);
+        assert!((t.independence_threshold() - 0.7).abs() < f64::EPSILON);
+        assert!((t.shared_context_penalty() - 0.15).abs() < f64::EPSILON);
+        assert!((t.shared_context_penalty_cap() - 0.6).abs() < f64::EPSILON);
+        assert!((t.mutual_endorsement_penalty() - 0.25).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn verify_attestation_rejects_revoked_by_non_issuer() {
+        let (signing_key, pubkey_bytes) = test_keypair();
+        let mut resolver = TestResolver::new();
+        resolver.add_key("did:key:issuer", pubkey_bytes);
+        let clock = TestClock::new(1000);
+
+        // Sign the attestation with revoked_by pointing to a non-issuer DID.
+        // The issuer signs this envelope (so the signature is valid), but the
+        // revoked_by field doesn't match the issuer -- this must be rejected.
+        let attestation = make_signed_attestation_with_revocation(
+            &signing_key,
+            AttestationType::Endorsement,
+            "did:key:issuer",
+            "did:key:subject",
+            900,
+            Some(2000),
+            None,
+            None,
+            RevocationStatus::Revoked {
+                revoked_at: 950,
+                reason: "unauthorized".to_owned(),
+                revoked_by: "did:key:attacker".into(),
+            },
+        );
+
+        let result = verify_attestation(&attestation, &resolver, &clock);
+        assert!(result.is_err());
+        match result {
+            Err(TrustError::AttestationRevocationInvalid {
+                revoked_by, issuer, ..
+            }) => {
+                assert_eq!(revoked_by, "did:key:attacker");
+                assert_eq!(issuer, "did:key:issuer");
+            }
+            other => panic!("expected AttestationRevocationInvalid, got {other:?}"),
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // AttestationRevocationChecker tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn noop_revocation_checker_returns_none() {
+        let checker = NoOpRevocationChecker;
+        let result = checker.check_revocation("att-1", &DID::from("did:key:issuer"));
+        assert!(result.is_none());
+    }
+
+    /// A test revocation checker that always reports a specific attestation as
+    /// revoked at a given timestamp.
+    struct AlwaysRevokedChecker {
+        revoked_at: u64,
+    }
+
+    impl AttestationRevocationChecker for AlwaysRevokedChecker {
+        fn check_revocation(&self, _attestation_id: &str, _issuer: &DID) -> Option<u64> {
+            Some(self.revoked_at)
+        }
+    }
+
+    /// A test revocation checker that only revokes a specific attestation ID.
+    struct SelectiveRevokedChecker {
+        target_id: String,
+        revoked_at: u64,
+    }
+
+    impl AttestationRevocationChecker for SelectiveRevokedChecker {
+        fn check_revocation(&self, attestation_id: &str, _issuer: &DID) -> Option<u64> {
+            if attestation_id == self.target_id {
+                Some(self.revoked_at)
+            } else {
+                None
+            }
+        }
+    }
+
+    #[test]
+    fn verify_attestation_with_revocation_checker_rejects_revoked() {
+        let (signing_key, pubkey_bytes) = test_keypair();
+        let mut resolver = TestResolver::new();
+        resolver.add_key("did:key:issuer", pubkey_bytes);
+        let clock = TestClock::new(1000);
+
+        let attestation = make_signed_attestation(
+            &signing_key,
+            AttestationType::Endorsement,
+            "did:key:issuer",
+            "did:key:subject",
+            900,
+            Some(2000),
+            None,
+            None,
+        );
+
+        let checker = AlwaysRevokedChecker { revoked_at: 999 };
+        let result =
+            verify_attestation_with_revocation(&attestation, &resolver, &clock, Some(&checker));
+        assert!(result.is_err());
+        match result {
+            Err(TrustError::AttestationRevoked {
+                revoked_at: 999, ..
+            }) => {}
+            other => panic!("expected AttestationRevoked, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn verify_attestation_with_noop_checker_succeeds() {
+        let (signing_key, pubkey_bytes) = test_keypair();
+        let mut resolver = TestResolver::new();
+        resolver.add_key("did:key:issuer", pubkey_bytes);
+        let clock = TestClock::new(1000);
+
+        let attestation = make_signed_attestation(
+            &signing_key,
+            AttestationType::Endorsement,
+            "did:key:issuer",
+            "did:key:subject",
+            900,
+            Some(2000),
+            None,
+            None,
+        );
+
+        let checker = NoOpRevocationChecker;
+        let result =
+            verify_attestation_with_revocation(&attestation, &resolver, &clock, Some(&checker));
+        assert!(result.is_ok(), "expected Ok, got {result:?}");
+    }
+
+    #[test]
+    fn verify_attestation_with_none_checker_succeeds() {
+        let (signing_key, pubkey_bytes) = test_keypair();
+        let mut resolver = TestResolver::new();
+        resolver.add_key("did:key:issuer", pubkey_bytes);
+        let clock = TestClock::new(1000);
+
+        let attestation = make_signed_attestation(
+            &signing_key,
+            AttestationType::Endorsement,
+            "did:key:issuer",
+            "did:key:subject",
+            900,
+            Some(2000),
+            None,
+            None,
+        );
+
+        let result = verify_attestation_with_revocation(&attestation, &resolver, &clock, None);
+        assert!(result.is_ok(), "expected Ok, got {result:?}");
+    }
+
+    #[test]
+    fn verify_attestation_field_revocation_takes_precedence_over_checker() {
+        // Even with a noop checker, a revoked field should fail.
+        // Must use make_signed_attestation_with_revocation so the signature
+        // covers the revocation_status (it's in the signed scope).
+        let (signing_key, pubkey_bytes) = test_keypair();
+        let mut resolver = TestResolver::new();
+        resolver.add_key("did:key:issuer", pubkey_bytes);
+        let clock = TestClock::new(1000);
+
+        let attestation = make_signed_attestation_with_revocation(
+            &signing_key,
+            AttestationType::Endorsement,
+            "did:key:issuer",
+            "did:key:subject",
+            900,
+            Some(2000),
+            None,
+            None,
+            RevocationStatus::Revoked {
+                revoked_at: 950,
+                reason: "compromised".to_owned(),
+                revoked_by: "did:key:issuer".into(),
+            },
+        );
+
+        let checker = NoOpRevocationChecker;
+        let result =
+            verify_attestation_with_revocation(&attestation, &resolver, &clock, Some(&checker));
+        assert!(result.is_err());
+        match result {
+            Err(TrustError::AttestationRevoked {
+                revoked_at: 950, ..
+            }) => {}
+            other => panic!("expected AttestationRevoked at 950, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn selective_revocation_checker_only_revokes_targeted_attestation() {
+        let (signing_key, pubkey_bytes) = test_keypair();
+        let mut resolver = TestResolver::new();
+        resolver.add_key("did:key:issuer", pubkey_bytes);
+        let clock = TestClock::new(1000);
+
+        let attestation = make_signed_attestation(
+            &signing_key,
+            AttestationType::Endorsement,
+            "did:key:issuer",
+            "did:key:subject",
+            900,
+            Some(2000),
+            None,
+            None,
+        );
+
+        // Checker targets a different attestation ID.
+        let checker = SelectiveRevokedChecker {
+            target_id: "some-other-att-id".to_owned(),
+            revoked_at: 999,
+        };
+        let result =
+            verify_attestation_with_revocation(&attestation, &resolver, &clock, Some(&checker));
+        assert!(
+            result.is_ok(),
+            "expected Ok for non-targeted attestation, got {result:?}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // AttestationVerificationCache tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn cache_new_is_empty() {
+        let cache = AttestationVerificationCache::new();
+        assert!(cache.get("att-1", 1000).is_none());
+    }
+
+    #[test]
+    fn cache_insert_and_get_success() {
+        let mut cache = AttestationVerificationCache::new();
+        cache.insert(
+            "att-1".to_owned(),
+            AttestationClass::Cryptographic,
+            Ok(()),
+            1000,
+        );
+
+        let result = cache.get("att-1", 1000);
+        assert!(result.is_some());
+        assert!(result.unwrap().is_ok());
+    }
+
+    #[test]
+    fn cache_insert_and_get_error() {
+        let mut cache = AttestationVerificationCache::new();
+        let err = TrustError::AttestationExpired {
+            attestation_id: "att-1".to_owned(),
+            expired_at: 900,
+        };
+        cache.insert(
+            "att-1".to_owned(),
+            AttestationClass::Reference,
+            Err(err),
+            1000,
+        );
+
+        let result = cache.get("att-1", 1000);
+        assert!(result.is_some());
+        assert!(result.unwrap().is_err());
+    }
+
+    #[test]
+    fn cache_reference_ttl_1_hour() {
+        let mut cache = AttestationVerificationCache::new();
+        cache.insert(
+            "att-ref".to_owned(),
+            AttestationClass::Reference,
+            Ok(()),
+            1000,
+        );
+
+        // Just within TTL (1000 + 3600 = 4600)
+        assert!(cache.get("att-ref", 4600).is_some());
+
+        // Past TTL
+        assert!(cache.get("att-ref", 4601).is_none());
+    }
+
+    #[test]
+    fn cache_cryptographic_ttl_24_hours() {
+        let mut cache = AttestationVerificationCache::new();
+        cache.insert(
+            "att-crypto".to_owned(),
+            AttestationClass::Cryptographic,
+            Ok(()),
+            1000,
+        );
+
+        // Just within TTL (1000 + 86400 = 87400)
+        assert!(cache.get("att-crypto", 87400).is_some());
+
+        // Past TTL
+        assert!(cache.get("att-crypto", 87401).is_none());
+    }
+
+    #[test]
+    fn cache_evict_expired_removes_stale_entries() {
+        let mut cache = AttestationVerificationCache::new();
+        cache.insert(
+            "att-ref".to_owned(),
+            AttestationClass::Reference,
+            Ok(()),
+            1000,
+        );
+        cache.insert(
+            "att-crypto".to_owned(),
+            AttestationClass::Cryptographic,
+            Ok(()),
+            1000,
+        );
+
+        // At 4601: Reference (TTL 3600) is expired, Cryptographic (TTL 86400) is not.
+        cache.evict_expired(4601);
+
+        assert!(
+            cache.get("att-ref", 1000).is_none(),
+            "expired reference should be evicted"
+        );
+        assert!(
+            cache.get("att-crypto", 1000).is_some(),
+            "non-expired cryptographic should remain"
+        );
+    }
+
+    #[test]
+    fn cache_overwrite_existing_entry() {
+        let mut cache = AttestationVerificationCache::new();
+        cache.insert(
+            "att-1".to_owned(),
+            AttestationClass::Reference,
+            Ok(()),
+            1000,
+        );
+
+        // Overwrite with an error result and different class.
+        let err = TrustError::AttestationRevoked {
+            attestation_id: "att-1".to_owned(),
+            revoked_at: 1500,
+        };
+        cache.insert(
+            "att-1".to_owned(),
+            AttestationClass::Cryptographic,
+            Err(err),
+            2000,
+        );
+
+        let result = cache.get("att-1", 2000);
+        assert!(result.is_some());
+        assert!(result.unwrap().is_err());
+
+        // New entry uses Cryptographic TTL (24h from 2000 = 88400)
+        assert!(cache.get("att-1", 88400).is_some());
+        assert!(cache.get("att-1", 88401).is_none());
+    }
+
+    #[test]
+    fn cache_default_trait() {
+        let cache = AttestationVerificationCache::default();
+        assert!(cache.get("anything", 0).is_none());
+    }
+
+    #[test]
+    fn cache_ttl_constants_match_spec() {
+        assert_eq!(REFERENCE_TTL_SECS, 3600, "Reference TTL should be 1 hour");
+        assert_eq!(
+            CRYPTOGRAPHIC_TTL_SECS, 86400,
+            "Cryptographic TTL should be 24 hours"
+        );
     }
 }

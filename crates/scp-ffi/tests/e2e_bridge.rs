@@ -87,6 +87,7 @@ fn create_test_identity() -> String {
             identity,
             custody,
             document,
+            identity_link_attestations: Vec::new(),
         },
     );
 

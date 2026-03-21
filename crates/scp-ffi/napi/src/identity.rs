@@ -52,6 +52,10 @@ use scp_platform::traits::KeyCustody;
 use crate::error::{ScpNapiError, validate_custody_type};
 use crate::{decrement_handle_count, increment_handle_count};
 
+/// Maximum number of identity link attestations per DID in the NAPI bridge.
+#[cfg(feature = "allow_in_memory_custody")]
+const NAPI_LINK_ATTESTATION_PER_DID_CAP: usize = 1_000;
+
 /// Ensures the global production DID resolver is initialized (idempotent). #311
 ///
 /// The `InMemoryDhtClient` created here is stored in a shared global so that
@@ -353,6 +357,12 @@ impl NapiIdentity {
         {
             let (scp_identity, custody, document) = self.extract_in_memory_state("rotateKey")?;
 
+            // Read attestations BEFORE async operation (entry guaranteed to exist).
+            let existing_attestations = crate::runtime::with_identity(&self.inner.did, |e| {
+                Ok(e.identity_link_attestations.clone())
+            })
+            .unwrap_or_default();
+
             let dht = make_dht_with_signer(&custody);
             let (new_identity, new_document) = dht
                 .rotate_active_key(&scp_identity, &document, &custody.0)
@@ -366,6 +376,7 @@ impl NapiIdentity {
                     identity: new_identity.clone(),
                     custody: Arc::clone(&custody),
                     document: new_document.clone(),
+                    identity_link_attestations: existing_attestations,
                 },
             );
 
@@ -413,6 +424,12 @@ impl NapiIdentity {
         {
             let (scp_identity, custody, document) = self.extract_in_memory_state("addAgentKey")?;
 
+            // Read attestations BEFORE async operation (entry guaranteed to exist).
+            let existing_attestations = crate::runtime::with_identity(&self.inner.did, |e| {
+                Ok(e.identity_link_attestations.clone())
+            })
+            .unwrap_or_default();
+
             let dht = make_dht_with_signer(&custody);
             let (new_identity, new_document) = dht
                 .add_agent_key(&scp_identity, &document, &custody.0)
@@ -427,6 +444,7 @@ impl NapiIdentity {
                     identity: new_identity.clone(),
                     custody: Arc::clone(&custody),
                     document: new_document.clone(),
+                    identity_link_attestations: existing_attestations,
                 },
             );
 
@@ -475,6 +493,12 @@ impl NapiIdentity {
             let (scp_identity, custody, document) =
                 self.extract_in_memory_state("rotateAgentKey")?;
 
+            // Read attestations BEFORE async operation (entry guaranteed to exist).
+            let existing_attestations = crate::runtime::with_identity(&self.inner.did, |e| {
+                Ok(e.identity_link_attestations.clone())
+            })
+            .unwrap_or_default();
+
             let dht = make_dht_with_signer(&custody);
             let (new_identity, new_document) = dht
                 .rotate_agent_key(&scp_identity, &document, &custody.0)
@@ -488,6 +512,7 @@ impl NapiIdentity {
                     identity: new_identity.clone(),
                     custody: Arc::clone(&custody),
                     document: new_document.clone(),
+                    identity_link_attestations: existing_attestations,
                 },
             );
 
@@ -536,6 +561,12 @@ impl NapiIdentity {
             let (scp_identity, custody, document) =
                 self.extract_in_memory_state("removeAgentKey")?;
 
+            // Read attestations BEFORE async operation (entry guaranteed to exist).
+            let existing_attestations = crate::runtime::with_identity(&self.inner.did, |e| {
+                Ok(e.identity_link_attestations.clone())
+            })
+            .unwrap_or_default();
+
             let dht = make_dht_with_signer(&custody);
             let (new_identity, new_document) = dht
                 .remove_agent_key(&scp_identity, &document)
@@ -549,6 +580,7 @@ impl NapiIdentity {
                     identity: new_identity.clone(),
                     custody: Arc::clone(&custody),
                     document: new_document.clone(),
+                    identity_link_attestations: existing_attestations,
                 },
             );
 
@@ -607,6 +639,12 @@ impl NapiIdentity {
         {
             let (scp_identity, custody, document) = self.extract_in_memory_state("migrate")?;
 
+            // Read attestations BEFORE async operation (entry guaranteed to exist now).
+            let existing_attestations = crate::runtime::with_identity(&self.inner.did, |e| {
+                Ok(e.identity_link_attestations.clone())
+            })
+            .unwrap_or_default();
+
             // Spec §9.12 (Compromise Recovery Protocol) requires using the
             // pre-rotation key from cold storage — the pre-rotation commitment
             // in the old DID document proves the legitimate owner is rotating,
@@ -655,6 +693,7 @@ impl NapiIdentity {
                     identity: new_identity.clone(),
                     custody: Arc::clone(&custody),
                     document: new_document.clone(),
+                    identity_link_attestations: existing_attestations,
                 },
             );
 
@@ -882,6 +921,7 @@ pub async fn identity_create(custody: String) -> napi::Result<NapiIdentity> {
                     identity: scp_identity.clone(),
                     custody: Arc::clone(&key_custody),
                     document: document.clone(),
+                    identity_link_attestations: Vec::new(),
                 },
             );
 
@@ -977,6 +1017,7 @@ pub async fn identity_create_with_agent_key(custody: String) -> napi::Result<Nap
                     identity: scp_identity.clone(),
                     custody: Arc::clone(&key_custody),
                     document: document.clone(),
+                    identity_link_attestations: Vec::new(),
                 },
             );
 
@@ -1326,6 +1367,228 @@ pub async fn identity_verify_device_attestation(
             code: "SCP-IDENT-1012".to_owned(),
         })
     })
+}
+
+// ---------------------------------------------------------------------------
+// Identity link attestation bridge (§3.5.1, §3.5.2)
+// ---------------------------------------------------------------------------
+
+/// Creates an identity link attestation for an external platform identity.
+///
+/// See spec §3.5.1, §3.5.2.
+#[cfg(feature = "allow_in_memory_custody")]
+#[napi(js_name = "identityCreateLinkAttestation")]
+#[allow(clippy::unused_async)]
+pub async fn identity_create_link_attestation(
+    did: String,
+    platform: String,
+    handle: String,
+    proof: String,
+    verification_method: String,
+    platform_id: Option<String>,
+) -> napi::Result<String> {
+    use std::borrow::Cow;
+
+    use scp_core::identity::attestation::{
+        ATTESTATION_TYPE_IDENTITY_LINK, AttestationClaim, AttestationEvidence,
+        IdentityLinkAttestation, VerificationMethod,
+    };
+    use scp_core::trust::attestation::RevocationStatus;
+    use scp_identity::DID;
+    use scp_platform::traits::KeyCustody;
+
+    // Validate attestation input field sizes.
+    scp_ffi_common::validate::validate_attestation_fields(&platform, &handle, &proof)
+        .map_err(|e| NapiError::from(ScpNapiError::from(e)))?;
+
+    let method: VerificationMethod = verification_method.parse().map_err(|e: String| {
+        NapiError::from(ScpNapiError::Identity {
+            message: e,
+            code: "SCP-IDENT-1040".to_owned(),
+        })
+    })?;
+
+    // Proof is an opaque string per §3.5.2 — pass through as-is.
+    // Do not parse and re-serialize.
+
+    // Phase 1: read custody + key handle (under DashMap lock, then drop).
+    let (custody, key_handle) = crate::runtime::with_identity(&did, |entry| {
+        Ok((
+            Arc::clone(&entry.custody),
+            entry.identity.active_signing_key,
+        ))
+    })?;
+
+    let issuer = DID::from(did.as_str());
+    let now_secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(|_| {
+            NapiError::from(ScpNapiError::Identity {
+                message: "system clock is before UNIX epoch".to_owned(),
+                code: "SCP-IDENT-1042".to_owned(),
+            })
+        })?
+        .as_secs();
+
+    let id = IdentityLinkAttestation::compute_id(&issuer, &platform, &handle, now_secs);
+
+    let mut attestation = IdentityLinkAttestation {
+        id,
+        attestation_type: Cow::Borrowed(ATTESTATION_TYPE_IDENTITY_LINK),
+        issuer: issuer.clone(),
+        subject: issuer,
+        issued_at: now_secs,
+        expires_at: None,
+        claim: AttestationClaim::new(platform, handle, platform_id),
+        evidence: AttestationEvidence {
+            method,
+            proof,
+            verified_at: now_secs,
+            verifier_did: None,
+        },
+        revocation_status: RevocationStatus::Active,
+        signature: Vec::new(),
+    };
+
+    // Structural validation before signing.
+    let structure_errors = attestation.validate_structure();
+    if !structure_errors.is_empty() {
+        return Err(NapiError::from(ScpNapiError::Identity {
+            message: format!(
+                "attestation structure validation failed: {}",
+                structure_errors
+                    .iter()
+                    .map(AsRef::as_ref)
+                    .collect::<Vec<_>>()
+                    .join("; "),
+            ),
+            code: "SCP-IDENT-1041".to_owned(),
+        }));
+    }
+
+    let canonical = attestation.canonical_signing_bytes().map_err(|e| {
+        NapiError::from(ScpNapiError::Identity {
+            message: format!("attestation signing failed: {e}"),
+            code: "SCP-IDENT-1041".to_owned(),
+        })
+    })?;
+
+    // Phase 2: sign (no DashMap lock held — safe to block_in_place).
+    let rt = tokio::runtime::Handle::try_current().map_err(|e| {
+        NapiError::from(ScpNapiError::Identity {
+            message: format!("no tokio runtime: {e}"),
+            code: "SCP-IDENT-1041".to_owned(),
+        })
+    })?;
+
+    let sig = tokio::task::block_in_place(|| rt.block_on(custody.0.sign(&key_handle, &canonical)))
+        .map_err(|e| {
+            NapiError::from(ScpNapiError::Identity {
+                message: format!("Ed25519 signing failed: {e}"),
+                code: "SCP-IDENT-1041".to_owned(),
+            })
+        })?;
+    attestation.signature = sig.as_bytes().to_vec();
+
+    // Phase 3: store attestation (re-acquire DashMap lock, TOCTOU guard).
+    crate::runtime::with_identity_mut(&did, |entry| {
+        // Verify the active signing key has not been rotated between Phase 1 and Phase 3.
+        if entry.identity.active_signing_key != key_handle {
+            return Err(ScpNapiError::Identity {
+                message: "active signing key was rotated during attestation creation — \
+                         please retry"
+                    .to_owned(),
+                code: "SCP-IDENT-1041".to_owned(),
+            });
+        }
+
+        if entry.identity_link_attestations.len() >= NAPI_LINK_ATTESTATION_PER_DID_CAP {
+            return Err(ScpNapiError::Identity {
+                message: format!(
+                    "DID has reached the per-identity attestation limit \
+                     ({NAPI_LINK_ATTESTATION_PER_DID_CAP}) — cannot store additional attestations"
+                ),
+                code: "SCP-VALID-7403".to_owned(),
+            });
+        }
+        entry.identity_link_attestations.push(attestation.clone());
+        Ok(())
+    })
+    .map_err(NapiError::from)?;
+
+    serde_json::to_string(&attestation).map_err(|e| {
+        NapiError::from(ScpNapiError::Identity {
+            message: format!("failed to serialize attestation: {e}"),
+            code: "SCP-IDENT-1042".to_owned(),
+        })
+    })
+}
+
+/// Lists all identity link attestations for an identity.
+///
+/// See spec §3.5.1.
+#[cfg(feature = "allow_in_memory_custody")]
+#[napi(js_name = "identityLinkAttestations")]
+pub fn identity_link_attestations(did: String) -> napi::Result<String> {
+    crate::runtime::with_identity(&did, |entry| {
+        serde_json::to_string(&entry.identity_link_attestations).map_err(|e| {
+            ScpNapiError::Identity {
+                message: format!("failed to serialize attestations: {e}"),
+                code: "SCP-IDENT-1043".to_owned(),
+            }
+        })
+    })
+    .map_err(NapiError::from)
+}
+
+/// Removes an identity link attestation by its ID.
+///
+/// Returns `true` if the attestation was found and removed.
+///
+/// See spec §3.5.1.
+#[cfg(feature = "allow_in_memory_custody")]
+#[napi(js_name = "identityRemoveLinkAttestation")]
+pub fn identity_remove_link_attestation(did: String, attestation_id: String) -> napi::Result<bool> {
+    crate::runtime::with_identity_mut(&did, |entry| {
+        let before = entry.identity_link_attestations.len();
+        entry
+            .identity_link_attestations
+            .retain(|a| a.id != attestation_id);
+        Ok(entry.identity_link_attestations.len() < before)
+    })
+    .map_err(NapiError::from)
+}
+
+/// Verifies the Ed25519 signature on an identity link attestation.
+///
+/// The issuer's public key cannot be reliably extracted from the DID string
+/// because attestations are signed with `#active` or `#agent` keys
+/// (spec §3.5.2), not the `#0` identity key embedded in the DID.
+///
+/// See spec §3.5.1.
+#[napi(js_name = "identityVerifyLinkAttestation")]
+#[allow(clippy::unused_async)]
+pub async fn identity_verify_link_attestation(
+    attestation_json: String,
+    issuer_public_key_hex: String,
+) -> napi::Result<bool> {
+    use scp_core::identity::attestation::IdentityLinkAttestation;
+
+    let attestation: IdentityLinkAttestation =
+        serde_json::from_str(&attestation_json).map_err(|e| {
+            NapiError::from(ScpNapiError::Identity {
+                message: format!("failed to parse attestation JSON: {e}"),
+                code: "SCP-IDENT-1044".to_owned(),
+            })
+        })?;
+
+    let pub_bytes = hex::decode(&issuer_public_key_hex).map_err(|e| {
+        NapiError::from(ScpNapiError::Identity {
+            message: format!("invalid issuer_public_key_hex: {e}"),
+            code: "SCP-IDENT-1044".to_owned(),
+        })
+    })?;
+    Ok(attestation.verify_signature(&pub_bytes).is_ok())
 }
 
 // ---------------------------------------------------------------------------
@@ -2006,6 +2269,7 @@ mod tests {
                     .expect("custody")
                     .clone(),
                 document: identity.inner.document.clone().expect("document"),
+                identity_link_attestations: Vec::new(),
             },
         );
 

@@ -30,7 +30,7 @@
 //! - [`DiscoveryResult`] -- Merged search results with provenance.
 //! - [`DiscoveryResultEntry`] -- A single result entry with relevance scoring.
 //! - [`RegistrationEntry`] -- A registered agent entry in a context with discovery tools.
-//! - [`DiscoveryBootstrap`] -- Default context configuration.
+//! - [`BootstrapContextEntry`] -- Bootstrap context with creator DID verification (§22.13.2).
 //! - [`DataProvenance`] -- Placeholder provenance metadata (replaced by SCP-070).
 //! - [`DiscoveryError`] -- Error type for discovery operations.
 //! - [`AddressResolver`] -- Multi-path address resolution (§22.8).
@@ -60,7 +60,8 @@ pub use addressing::{
     parse_address,
 };
 pub use bootstrap::{
-    BootstrapConfig, BootstrapContextEntry, BootstrapResolver, WellKnownBootstrapError,
+    BootstrapConfig, BootstrapContextEntry, BootstrapResolver, BootstrapVerificationError,
+    MAX_CUSTOM_CONTEXTS, WellKnownBootstrapError,
 };
 pub use context::{
     AgentDeregisterParams, AgentDeregisterResult, AgentRegisterParams, AgentRegisterResult,
@@ -201,23 +202,6 @@ pub struct RegistrationEntry {
 }
 
 // ---------------------------------------------------------------------------
-// DiscoveryBootstrap
-// ---------------------------------------------------------------------------
-
-/// Default context configuration for SDK bootstrap.
-///
-/// Analogous to DNS root servers: the SDK ships with configurable default
-/// bootstrap context IDs that are queried on first identity creation (opt-out).
-/// If defaults are unreachable, direct DID resolution still works.
-///
-/// See ADR-020 acceptance criterion 8.
-#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
-pub struct DiscoveryBootstrap {
-    /// Default bootstrap context IDs to query on bootstrap.
-    pub default_context_ids: Vec<ContextId>,
-}
-
-// ---------------------------------------------------------------------------
 // DiscoveryError
 // ---------------------------------------------------------------------------
 
@@ -304,20 +288,6 @@ mod tests {
         let deserialized: RegistrationEntry = serde_json::from_str(&json).unwrap();
 
         assert_eq!(entry, deserialized);
-    }
-
-    #[test]
-    fn discovery_bootstrap_default_has_no_contexts() {
-        let bootstrap = DiscoveryBootstrap::default();
-        assert!(bootstrap.default_context_ids.is_empty());
-    }
-
-    #[test]
-    fn discovery_bootstrap_with_contexts() {
-        let bootstrap = DiscoveryBootstrap {
-            default_context_ids: vec!["ctx-discovery-1".to_owned(), "ctx-discovery-2".to_owned()],
-        };
-        assert_eq!(bootstrap.default_context_ids.len(), 2);
     }
 
     #[test]

@@ -137,7 +137,7 @@ The class distinction is critical for trust evaluation (§7.5). Class 1 attestat
 
 ### 3.5.1 Provider Registry
 
-The following platforms are supported for identity link attestations. New providers are added by spec amendment only — the set is closed to prevent proliferation of unverifiable attestation targets.
+The following 16 platforms are supported for identity link attestations. New providers are added by spec amendment only — the set is closed to prevent proliferation of unverifiable attestation targets.
 
 | Platform | `platform` value | Class | Verification method | Proof location | Renewal interval |
 |----------|-----------------|-------|--------------------|----|-----------------|
@@ -146,17 +146,28 @@ The following platforms are supported for identity link attestations. New provid
 | Google | `google.com` | 1 (Cryptographic) | `Oauth` | SDK-signed OIDC claim | 30 days |
 | Apple | `apple.com` | 1 (Cryptographic) | `Oauth` | SDK-signed OIDC claim | 30 days |
 | Microsoft | `microsoft.com` | 1 (Cryptographic) | `Oauth` | SDK-signed OIDC claim | 30 days |
+| LinkedIn | `linkedin.com` | 1 (Cryptographic) | `Oauth` | SDK-signed OIDC claim | 30 days |
+| Discord | `discord.com` | 1 (Cryptographic) | `Oauth` | SDK-signed OIDC claim | 30 days |
+| Reddit | `reddit.com` | 2 (Reference) | `SignedPost` | Profile bio containing DID | 90 days |
+| Bluesky | `bluesky.com` | 2 (Reference) | `SignedPost` | Profile description containing DID | 90 days |
 | Mastodon | `mastodon:<instance>` | 2 (Reference) | `SignedPost` | Profile bio containing DID | 90 days |
+| Telegram | `telegram.com` | 1 (Cryptographic) | `ChallengeResponse` | Bot-verified round trip | 60 days |
+| npm | `npm` | 2 (Reference) | `SignedPost` | Profile page containing DID | 90 days |
+| PyPI | `pypi` | 2 (Reference) | `SignedPost` | Profile page containing DID | 90 days |
+| Steam | `steam` | 1 (Cryptographic) | `ChallengeResponse` | Bot-verified round trip | 60 days |
+| .well-known | `well-known` | 2 (Reference) | `DnsRecord` | `/.well-known/scp` endpoint containing DID | 180 days |
 | DNS | `dns` | 2 (Reference) | `DnsRecord` | TXT record at `_scp-verify.<domain>` | 180 days |
 
 **Platform value conventions:**
 
-- OIDC providers use their token issuer domain: `google.com`, `apple.com`, `microsoft.com`.
-- Social platforms use their primary domain: `github.com`, `x.com`.
+- OIDC providers use their token issuer domain: `google.com`, `apple.com`, `microsoft.com`, `linkedin.com`, `discord.com`.
+- Social platforms use their primary domain: `github.com`, `x.com`, `reddit.com`, `bluesky.com`, `telegram.com`.
 - Mastodon instances use the `mastodon:<instance>` format (e.g., `mastodon:mastodon.social`) because the Mastodon API endpoint varies by instance. The `platform_id` field SHOULD contain the Mastodon account URI (`@user@instance`).
+- Package registries use the bare registry name: `npm`, `pypi`. The `platform_handle` field contains the package author username.
+- `.well-known` uses the bare string `well-known`. The `platform_handle` field contains the domain name. The proof is an HTTP GET to `https://<domain>/.well-known/scp` which must return the DID string.
 - DNS uses the bare string `dns`. The `platform_handle` field contains the domain name.
 
-**`ChallengeResponse` verification method:** `ChallengeResponse` is listed as a Class 1 (Cryptographic) verification method in §3.5.0 but does not appear in the provider registry table above. This is intentional — `ChallengeResponse` is platform-agnostic. It is not tied to a specific provider; instead, it is a generic mechanism where any verifier (e.g., a context governance engine, a bridge connector, or another participant) challenges an agent to prove a capability or identity claim via a cryptographic round trip. Any context that wants to verify an agent's capabilities can use `ChallengeResponse` regardless of the platform. The `platform` field in the attestation claim is set to the verifier's choice (e.g., the context ID or verifier's domain), and the `evidence.verifier_did` field identifies the verifier that issued the challenge.
+**`ChallengeResponse` verification method:** `ChallengeResponse` is listed as a Class 1 (Cryptographic) verification method in §3.5.0. Some platforms in the registry above use it (Telegram, Steam) for bot-verified identity linking. Beyond those platform-specific entries, `ChallengeResponse` is also platform-agnostic — it is a generic mechanism where any verifier (e.g., a context governance engine, a bridge connector, or another participant) challenges an agent to prove a capability or identity claim via a cryptographic round trip. Any context that wants to verify an agent's capabilities can use `ChallengeResponse` regardless of the platform. The `platform` field in the attestation claim is set to the verifier's choice (e.g., the context ID or verifier's domain), and the `evidence.verifier_did` field identifies the verifier that issued the challenge.
 
 **`ChallengeResponse` creation flow:**
 1. A verifier sends a random 32-byte challenge to the subject.
@@ -201,8 +212,7 @@ Identity attestations use the attestation envelope defined in §7.4.1, with iden
   },
   evidence: {
     method:         String,      // Verification method: "oauth", "signed_post", "dns_record", "challenge_response"
-    proof:          String,      // Method-specific proof data (see §3.5.0, §3.5.1)
-                                     // Verifiers MUST use this string as-is in signature scope — do not parse and re-serialize
+    proof:          String,           // Method-specific proof data (opaque — see below)
     verified_at:    u64,         // Unix timestamp (s) of last verification
     verifier_did:   Option<DID>, // DID of the verifier, if third-party verified (challenge_response only)
   },
@@ -211,7 +221,13 @@ Identity attestations use the attestation envelope defined in §7.4.1, with iden
 }
 ```
 
-**Signature scope:** The signature covers the §9.5.1 canonical hash of `(id, attestation_type, issuer, subject, issued_at, expires_at, claim, evidence, revocation_status)` using domain separator `"SCP-IDENTITY-LINK-ATTESTATION-V2:"`. String and DID fields use 4-byte BE length-prefixed encoding, `issued_at` uses 8-byte BE u64, `expires_at` uses the absent sentinel when not set, and sub-structures (`claim`, `evidence`, `revocation_status`) are individually serialized as MessagePack (sorted-key encoding) and included as variable-length byte fields. See §25.13 (Vector 26) for the exact construction.
+> **Proof opacity.** Verifiers MUST use the `proof` string as-is in the
+> signature scope — do not parse and re-serialize. This ensures:
+> (1) forward compatibility with new verification methods,
+> (2) cross-implementation canonical hash determinism,
+> (3) verifiers need not understand proof contents to verify signatures.
+
+**Signature scope:** The signature covers the §9.5.1 canonical hash of `(id, attestation_type, issuer, subject, issued_at, expires_at, claim, evidence, revocation_status)` using domain separator `"SCP-IDENTITY-LINK-ATTESTATION-V1:"`. String and DID fields use 4-byte BE length-prefixed encoding, `issued_at` uses 8-byte BE u64, `expires_at` uses the absent sentinel when not set, and sub-structures (`claim`, `evidence`, `revocation_status`) are individually serialized as MessagePack (sorted-key encoding) and included as variable-length byte fields. See §25.13 (Vector 26) for the exact construction.
 
 **Attestation ID construction:** The `id` field is a deterministic, hex-encoded SHA-256 hash derived from the attestation's identifying fields using the canonical hash construction (§9.5.1). The domain separator `"SCP-ATTESTATION-ID-V1:"` prevents cross-protocol collision, and 4-byte big-endian length prefixes on variable-length fields prevent field boundary ambiguity (e.g., platform `"ab"` + handle `"cd"` vs platform `"a"` + handle `"bcd"`).
 
@@ -290,12 +306,21 @@ Verification procedure depends on the attestation class (§3.5.0).
 | `google.com` | 1 | 30 days | OIDC tokens expire; account may be revoked |
 | `apple.com` | 1 | 30 days | OIDC tokens expire; account may be revoked |
 | `microsoft.com` | 1 | 30 days | OIDC tokens expire; account may be revoked |
+| `linkedin.com` | 1 | 30 days | OIDC tokens expire; account may be revoked |
+| `discord.com` | 1 | 30 days | OIDC tokens expire; account may be revoked |
 | `github.com` | 2 | 90 days | Profile bio may be edited; account may be suspended |
 | `x.com` | 2 | 90 days | Profile description may be edited; account may be suspended |
+| `reddit.com` | 2 | 90 days | Profile bio may be edited; account may be suspended |
+| `bluesky.com` | 2 | 90 days | Profile description may be edited; account may be suspended |
 | `mastodon:<instance>` | 2 | 90 days | Profile bio may be edited; instance may be deactivated |
+| `npm` | 2 | 90 days | Profile page may be edited; account may be suspended |
+| `pypi` | 2 | 90 days | Profile page may be edited; account may be suspended |
+| `telegram.com` | 1 | 60 days | ChallengeResponse — no persistent proof; freshness matters |
+| `steam` | 1 | 60 days | ChallengeResponse — no persistent proof; freshness matters |
+| `well-known` | 2 | 180 days | HTTP endpoints are stable; domain ownership changes slowly |
 | `dns` | 2 | 180 days | DNS records are stable; domain ownership changes slowly |
 
-**ChallengeResponse renewal interval:** 60 days. ChallengeResponse attestations are not tied to a specific platform (§3.5.1), so they do not appear in the per-platform tables above. The 60-day interval reflects that no persistent proof exists — freshness of the cryptographic round trip is the only signal.
+**ChallengeResponse renewal interval:** 60 days. ChallengeResponse attestations not tied to a specific platform (§3.5.1) use this default. For platform-specific ChallengeResponse entries (Telegram, Steam), the renewal interval is listed in the table above.
 
 ### 3.5.5 Shadow Identity Claiming Protocol
 

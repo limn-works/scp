@@ -405,6 +405,28 @@ pub fn validate_transport_mode(mode: &str) -> Result<(), ScpPyError> {
 }
 
 // ---------------------------------------------------------------------------
+// Attestation field validation
+// ---------------------------------------------------------------------------
+
+/// Validates the input fields for an identity link attestation creation.
+///
+/// Delegates to [`scp_ffi_common::validate::validate_attestation_fields`] and
+/// converts errors to [`ScpPyError`].
+///
+/// # Errors
+///
+/// Returns [`ScpPyError::ValidationError`] if any field is empty or exceeds
+/// its limit.
+pub fn validate_attestation_fields(
+    platform: &str,
+    handle: &str,
+    proof: &str,
+) -> Result<(), ScpPyError> {
+    scp_ffi_common::validate::validate_attestation_fields(platform, handle, proof)
+        .map_err(|e| ScpPyError::validation(format!("attestation field validation failed: {e}")))
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 

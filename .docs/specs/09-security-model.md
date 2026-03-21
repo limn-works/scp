@@ -357,9 +357,10 @@ Note: `context_id` is not in the current signed hash (the request struct does no
 | 5 | `claim` | 4-byte BE length + UTF-8 bytes (compact JSON — see note) |
 | 6 | `evidence` | 4-byte BE length + raw bytes if present, or `SHA-256(0x00)` sentinel if absent |
 | 7 | `issued_at` | 8-byte BE u64 |
-| 8 | `expires_at` | 8-byte BE u64 (0 if no expiry) |
+| 8 | `expires_at` | 8-byte BE u64 if present, or `SHA-256(0x00)` sentinel if absent |
+| 9 | `revocation_status` | 4-byte BE length + MessagePack bytes of `RevocationStatus` enum |
 
-Note: the `claim` field uses compact JSON with no whitespace (equivalent to Python `json.dumps(separators=(',', ':'))`). JSON key ordering within claim objects is NOT guaranteed deterministic across implementations — claims with nested objects should use only flat key-value structures or pre-serialized byte strings. The `evidence` field, when present, is serialized as MessagePack bytes of the `AttestationEvidence` struct.
+Note: the `claim` field uses compact JSON with no whitespace (equivalent to Python `json.dumps(separators=(',', ':'))`). JSON key ordering within claim objects is NOT guaranteed deterministic across implementations — claims with nested objects should use only flat key-value structures or pre-serialized byte strings. The `evidence` field, when present, is serialized as MessagePack bytes of the `AttestationEvidence` struct. The `revocation_status` field is always present (never absent) — `Active` serializes as a distinct MessagePack value from `Revoked{...}`. Including `revocation_status` in the signed scope prevents an intermediary from flipping Active↔Revoked without invalidating the signature (§7.4.1).
 
 **ParticipationProfile** — domain: `"SCP-PARTICIPATION-PROFILE-V1:"`
 

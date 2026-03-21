@@ -479,7 +479,7 @@ fn parse_scp_uri(uri_str: &str) -> Result<String, String> {
     let now_secs = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
-        .unwrap_or(0);
+        .map_err(|_| "system clock is unavailable or before Unix epoch".to_owned())?;
 
     // Build a single ContextDiscoveryResult matching the NAPI bridge's
     // discovery_result_to_json output format, including trust_level and

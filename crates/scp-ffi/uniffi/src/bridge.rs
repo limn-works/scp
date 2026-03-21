@@ -2387,6 +2387,336 @@ async fn identity_verify_device_attestation_impl(
 }
 
 // ---------------------------------------------------------------------------
+// Free functions — identity link attestation (§3.5.1, §3.5.2)
+//
+// Uses a global DashMap to store attestations per DID. The Identity object
+// retains custody for signing; attestations are stored separately.
+// ---------------------------------------------------------------------------
+
+/// Maximum number of entries in the identity custody registry.
+#[cfg(feature = "allow_in_memory_custody")]
+const UNIFFI_CUSTODY_REGISTRY_CAP: usize = 10_000;
+
+/// Maximum number of DID entries in the identity link attestation registry.
+#[cfg(feature = "allow_in_memory_custody")]
+const UNIFFI_LINK_ATTESTATION_REGISTRY_CAP: usize = 10_000;
+
+/// Maximum number of attestations per DID in the identity link attestation registry.
+#[cfg(feature = "allow_in_memory_custody")]
+const UNIFFI_LINK_ATTESTATION_PER_DID_CAP: usize = 1_000;
+
+/// Global registry of identity link attestations, keyed by DID string.
+fn identity_link_attestation_registry()
+-> &'static dashmap::DashMap<String, Vec<scp_core::identity::attestation::IdentityLinkAttestation>>
+{
+    static REGISTRY: std::sync::OnceLock<
+        dashmap::DashMap<String, Vec<scp_core::identity::attestation::IdentityLinkAttestation>>,
+    > = std::sync::OnceLock::new();
+    REGISTRY.get_or_init(dashmap::DashMap::new)
+}
+
+/// Retained identity custody for attestation verification (keyed by DID).
+///
+/// Stores the custody and active signing key handle for identities that have
+/// created attestations, so that `identity_verify_link_attestation` can look
+/// up the issuer's public key without requiring the caller to pass the
+/// Identity object.
+#[cfg(feature = "allow_in_memory_custody")]
+fn identity_custody_registry()
+-> &'static dashmap::DashMap<String, (Arc<OpaqueInMemoryKeyCustody>, scp_platform::KeyHandle)> {
+    static REGISTRY: std::sync::OnceLock<
+        dashmap::DashMap<String, (Arc<OpaqueInMemoryKeyCustody>, scp_platform::KeyHandle)>,
+    > = std::sync::OnceLock::new();
+    REGISTRY.get_or_init(dashmap::DashMap::new)
+}
+
+/// Creates an identity link attestation for an external platform identity.
+///
+/// See spec §3.5.1, §3.5.2.
+#[cfg(feature = "allow_in_memory_custody")]
+#[uniffi::export]
+pub async fn identity_create_link_attestation(
+    identity: Arc<Identity>,
+    platform: String,
+    handle: String,
+    proof: String,
+    verification_method: String,
+    platform_id: Option<String>,
+) -> Result<String, ScpError> {
+    identity_create_link_attestation_impl(
+        identity,
+        platform,
+        handle,
+        proof,
+        verification_method,
+        platform_id,
+    )
+    .await
+}
+
+#[cfg(feature = "allow_in_memory_custody")]
+async fn identity_create_link_attestation_impl(
+    identity: Arc<Identity>,
+    platform: String,
+    handle: String,
+    proof: String,
+    verification_method: String,
+    platform_id: Option<String>,
+) -> Result<String, ScpError> {
+    use std::borrow::Cow;
+
+    use scp_core::identity::attestation::{
+        ATTESTATION_TYPE_IDENTITY_LINK, AttestationClaim, AttestationEvidence,
+        IdentityLinkAttestation, VerificationMethod,
+    };
+    use scp_core::trust::attestation::RevocationStatus;
+    use scp_identity::DID;
+    use scp_platform::traits::KeyCustody;
+
+    // Validate attestation input field sizes.
+    scp_ffi_common::validate::validate_attestation_fields(&platform, &handle, &proof).map_err(
+        |e| ScpError::Validation {
+            msg: format!("attestation field validation failed: {e}"),
+            code: "SCP-VALID-7037".to_owned(),
+        },
+    )?;
+
+    let method: VerificationMethod =
+        verification_method
+            .parse()
+            .map_err(|e: String| ScpError::Identity {
+                msg: e,
+                code: "SCP-IDENT-1040".to_owned(),
+            })?;
+
+    // Proof is an opaque string per §3.5.2 — pass through as-is.
+    // Do not parse and re-serialize.
+
+    let core_id = identity
+        .core_id
+        .as_ref()
+        .ok_or_else(|| ScpError::Identity {
+            msg: "identity link attestation requires retained identity state".to_owned(),
+            code: "SCP-IDENT-1040".to_owned(),
+        })?;
+    let custody = identity
+        .in_memory_custody
+        .as_ref()
+        .ok_or_else(|| ScpError::Identity {
+            msg: "identity link attestation requires in-memory custody".to_owned(),
+            code: "SCP-IDENT-1040".to_owned(),
+        })?;
+
+    let did_str = identity.did.clone();
+    let issuer = DID::from(did_str.as_str());
+    let now_secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(|_| ScpError::Identity {
+            msg: "system clock is before UNIX epoch".to_owned(),
+            code: "SCP-IDENT-1042".to_owned(),
+        })?
+        .as_secs();
+
+    let id = IdentityLinkAttestation::compute_id(&issuer, &platform, &handle, now_secs);
+
+    let mut attestation = IdentityLinkAttestation {
+        id,
+        attestation_type: Cow::Borrowed(ATTESTATION_TYPE_IDENTITY_LINK),
+        issuer: issuer.clone(),
+        subject: issuer,
+        issued_at: now_secs,
+        expires_at: None,
+        claim: AttestationClaim::new(platform, handle, platform_id),
+        evidence: AttestationEvidence {
+            method,
+            proof,
+            verified_at: now_secs,
+            verifier_did: None,
+        },
+        revocation_status: RevocationStatus::Active,
+        signature: Vec::new(),
+    };
+
+    // Structural validation before signing.
+    let structure_errors = attestation.validate_structure();
+    if !structure_errors.is_empty() {
+        return Err(ScpError::Identity {
+            msg: format!(
+                "attestation structure validation failed: {}",
+                structure_errors
+                    .iter()
+                    .map(AsRef::as_ref)
+                    .collect::<Vec<_>>()
+                    .join("; "),
+            ),
+            code: "SCP-IDENT-1041".to_owned(),
+        });
+    }
+
+    let canonical = attestation
+        .canonical_signing_bytes()
+        .map_err(|e| ScpError::Identity {
+            msg: format!("attestation signing failed: {e}"),
+            code: "SCP-IDENT-1041".to_owned(),
+        })?;
+
+    let active_key = core_id.active_signing_key;
+    let custody_clone = Arc::clone(custody);
+
+    let sig = runtime()
+        .spawn(async move { custody_clone.0.sign(&active_key, &canonical).await })
+        .await
+        .map_err(|e| ScpError::Identity {
+            msg: format!("tokio join error: {e}"),
+            code: "SCP-IDENT-1041".to_owned(),
+        })?
+        .map_err(|e| ScpError::Identity {
+            msg: format!("Ed25519 signing failed: {e}"),
+            code: "SCP-IDENT-1041".to_owned(),
+        })?;
+    attestation.signature = sig.as_bytes().to_vec();
+
+    // Store custody for later verification lookups.
+    // Use entry() API to avoid TOCTOU between contains_key and insert.
+    {
+        let registry = identity_custody_registry();
+        let len = registry.len();
+        match registry.entry(identity.did.clone()) {
+            dashmap::mapref::entry::Entry::Occupied(mut occ) => {
+                // Always update to the caller's current key. The UniFFI
+                // `Identity` is an immutable Arc snapshot — if the caller
+                // holds an Identity with key N, that is the key they used to
+                // sign.  After a legitimate key rotation the old key handle
+                // sits in the registry and the new one should replace it.
+                occ.insert((Arc::clone(custody), active_key));
+            }
+            dashmap::mapref::entry::Entry::Vacant(vac) => {
+                if len >= UNIFFI_CUSTODY_REGISTRY_CAP {
+                    return Err(ScpError::Identity {
+                        msg: format!(
+                            "custody registry has reached capacity \
+                             ({UNIFFI_CUSTODY_REGISTRY_CAP}) — cannot store additional entries"
+                        ),
+                        code: "SCP-VALID-7403".to_owned(),
+                    });
+                }
+                vac.insert((Arc::clone(custody), active_key));
+            }
+        }
+    }
+
+    // Use entry() API to avoid TOCTOU between contains_key and insert.
+    {
+        let registry = identity_link_attestation_registry();
+        let len = registry.len();
+        match registry.entry(did_str) {
+            dashmap::mapref::entry::Entry::Occupied(mut occ) => {
+                if occ.get().len() >= UNIFFI_LINK_ATTESTATION_PER_DID_CAP {
+                    return Err(ScpError::Identity {
+                        msg: format!(
+                            "DID has reached the per-identity attestation limit \
+                             ({UNIFFI_LINK_ATTESTATION_PER_DID_CAP}) — cannot store additional attestations"
+                        ),
+                        code: "SCP-VALID-7403".to_owned(),
+                    });
+                }
+                occ.get_mut().push(attestation.clone());
+            }
+            dashmap::mapref::entry::Entry::Vacant(vac) => {
+                if len >= UNIFFI_LINK_ATTESTATION_REGISTRY_CAP {
+                    return Err(ScpError::Identity {
+                        msg: format!(
+                            "link attestation registry has reached capacity \
+                             ({UNIFFI_LINK_ATTESTATION_REGISTRY_CAP}) — cannot store additional attestations"
+                        ),
+                        code: "SCP-VALID-7402".to_owned(),
+                    });
+                }
+                vac.insert(vec![attestation.clone()]);
+            }
+        }
+    }
+
+    serde_json::to_string(&attestation).map_err(|e| ScpError::Identity {
+        msg: format!("failed to serialize attestation: {e}"),
+        code: "SCP-IDENT-1042".to_owned(),
+    })
+}
+
+/// Lists all identity link attestations for an identity.
+///
+/// See spec §3.5.1.
+#[uniffi::export]
+pub fn identity_link_attestations(did: String) -> Result<String, ScpError> {
+    let attestations = identity_link_attestation_registry()
+        .get(&did)
+        .map(|v| v.value().clone())
+        .unwrap_or_default();
+    serde_json::to_string(&attestations).map_err(|e| ScpError::Identity {
+        msg: format!("failed to serialize attestations: {e}"),
+        code: "SCP-IDENT-1043".to_owned(),
+    })
+}
+
+/// Removes an identity link attestation by its ID.
+///
+/// Returns `true` if the attestation was found and removed, `false` if the
+/// DID is not in the identity custody registry or the attestation was not found.
+///
+/// See spec §3.5.1.
+#[cfg(feature = "allow_in_memory_custody")]
+#[must_use]
+#[uniffi::export]
+pub fn identity_remove_link_attestation(did: String, attestation_id: String) -> bool {
+    // Verify the caller owns the DID by checking the identity custody registry.
+    if !identity_custody_registry().contains_key(&did) {
+        return false;
+    }
+
+    let Some(mut entry) = identity_link_attestation_registry().get_mut(&did) else {
+        return false;
+    };
+    let before = entry.len();
+    entry.retain(|a| a.id != attestation_id);
+    entry.len() < before
+}
+
+/// Verifies the Ed25519 signature on an identity link attestation.
+///
+/// The issuer's public key cannot be reliably extracted from the DID string
+/// because attestations are signed with `#active` or `#agent` keys
+/// (spec §3.5.2), not the `#0` identity key embedded in the DID.
+///
+/// See spec §3.5.1.
+#[uniffi::export]
+pub async fn identity_verify_link_attestation(
+    attestation_json: String,
+    issuer_public_key_hex: String,
+) -> Result<bool, ScpError> {
+    identity_verify_link_attestation_impl(attestation_json, issuer_public_key_hex).await
+}
+
+#[allow(clippy::unused_async)]
+async fn identity_verify_link_attestation_impl(
+    attestation_json: String,
+    issuer_public_key_hex: String,
+) -> Result<bool, ScpError> {
+    use scp_core::identity::attestation::IdentityLinkAttestation;
+
+    let attestation: IdentityLinkAttestation =
+        serde_json::from_str(&attestation_json).map_err(|e| ScpError::Identity {
+            msg: format!("failed to parse attestation JSON: {e}"),
+            code: "SCP-IDENT-1044".to_owned(),
+        })?;
+
+    let pub_bytes = hex::decode(&issuer_public_key_hex).map_err(|e| ScpError::Identity {
+        msg: format!("invalid issuer_public_key_hex: {e}"),
+        code: "SCP-IDENT-1044".to_owned(),
+    })?;
+    Ok(attestation.verify_signature(&pub_bytes).is_ok())
+}
+
+// ---------------------------------------------------------------------------
 // Free functions — context lifecycle operations
 //
 // See ADR-021 acceptance criterion 3.
@@ -2712,7 +3042,10 @@ pub async fn context_close(
             // context's memory scope and initiate the appropriate destruction
             // path via CloseOrchestrator (#365).
             let memory_scope = core_handle.params().memory_scope;
-            let now = scp_core::time::now_secs().unwrap_or(0);
+            let now = scp_core::time::now_secs().map_err(|_| ScpError::Context {
+                msg: "system clock is unavailable or before Unix epoch".to_owned(),
+                code: "SCP-CTX-2017".to_owned(),
+            })?;
 
             let crypto_provider = crate::runtime::context_manager_crypto();
             let orchestrator = scp_core::context::close::CloseOrchestrator::new(crypto_provider);
@@ -6134,6 +6467,13 @@ pub async fn event_log_query(
                 .and_then(serde_json::Value::as_u64)
                 .map(|v| v as usize);
 
+            // Pre-compute timestamp for the fallback summary event outside the
+            // closure so we can propagate clock errors properly.
+            let fallback_now = scp_core::time::now_secs().map_err(|_| ScpError::Context {
+                msg: "system clock is unavailable or before Unix epoch".to_owned(),
+                code: "SCP-CTX-2024".to_owned(),
+            })?;
+
             // Query the event log from per-context UCAN state.
             let events = crate::runtime::with_ucan_state(&handle.context_id, |ucan_state| {
                 let event_count = scp_event_log::tree::event_count(&ucan_state.event_log);
@@ -6211,11 +6551,10 @@ pub async fn event_log_query(
                 }
 
                 // Fallback: return a summary event with Merkle root metadata.
-                let now = scp_core::time::now_secs().unwrap_or(0);
                 let summary = Event {
                     event_type: "LogSummary".to_owned(),
                     actor_did: String::new(),
-                    timestamp: now,
+                    timestamp: fallback_now,
                     payload_json: serde_json::json!({
                         "event_count": event_count,
                         "merkle_root": merkle_root_hex,
@@ -10500,6 +10839,7 @@ pub async fn identity_migrate(identity: Arc<Identity>) -> Result<Arc<Identity>, 
     #[cfg(feature = "allow_in_memory_custody")]
     let in_memory = identity.in_memory_custody.as_ref();
 
+    let old_did = identity.did.clone();
     let old_identity = core_id.clone();
     let old_document = core_document.clone();
     let custody_type = identity.custody_type.clone();
@@ -10538,6 +10878,7 @@ pub async fn identity_migrate(identity: Arc<Identity>) -> Result<Arc<Identity>, 
                     .await
                     .map_err(ScpError::from)?;
 
+                let new_did = new_identity.did.clone();
                 let has_agent = new_document.has_agent_key();
                 let handle = Arc::new(Identity {
                     did: new_identity.did.clone(),
@@ -10550,6 +10891,22 @@ pub async fn identity_migrate(identity: Arc<Identity>) -> Result<Arc<Identity>, 
                 });
                 increment_handle_count();
                 let _ = has_agent; // suppress unused warning
+
+                // Migrate attestation and custody registries from old DID to new DID.
+                {
+                    let registry = identity_link_attestation_registry();
+                    if let Some((_, attestations)) = registry.remove(&old_did) {
+                        registry.insert(new_did.clone(), attestations);
+                    }
+                }
+                #[cfg(feature = "allow_in_memory_custody")]
+                {
+                    let registry = identity_custody_registry();
+                    if let Some((_, entry)) = registry.remove(&old_did) {
+                        registry.insert(new_did, entry);
+                    }
+                }
+
                 return Ok(handle);
             }
 
@@ -10579,6 +10936,7 @@ pub async fn identity_migrate(identity: Arc<Identity>) -> Result<Arc<Identity>, 
                     .await
                     .map_err(ScpError::from)?;
 
+                let new_did = new_identity.did.clone();
                 let handle = Arc::new(Identity {
                     did: new_identity.did.clone(),
                     custody_type,
@@ -10589,6 +10947,22 @@ pub async fn identity_migrate(identity: Arc<Identity>) -> Result<Arc<Identity>, 
                     callback_custody: Some(Arc::clone(cc)),
                 });
                 increment_handle_count();
+
+                // Migrate attestation and custody registries from old DID to new DID.
+                {
+                    let registry = identity_link_attestation_registry();
+                    if let Some((_, attestations)) = registry.remove(&old_did) {
+                        registry.insert(new_did.clone(), attestations);
+                    }
+                }
+                #[cfg(feature = "allow_in_memory_custody")]
+                {
+                    let registry = identity_custody_registry();
+                    if let Some((_, entry)) = registry.remove(&old_did) {
+                        registry.insert(new_did, entry);
+                    }
+                }
+
                 return Ok(handle);
             }
 
@@ -10815,7 +11189,12 @@ pub fn bridge_register(
 
     // Bridge ID per spec §12.2.1: SHA-256(context_id || operator_did || platform || timestamp).
     let (bridge_id, now_secs) =
-        scp_ffi_common::generate_bridge_id(&context_id, &operator_did, &platform);
+        scp_ffi_common::generate_bridge_id(&context_id, &operator_did, &platform).map_err(|e| {
+            ScpError::Context {
+                msg: e.to_string(),
+                code: "SCP-CTX-2017".to_owned(),
+            }
+        })?;
     let request = scp_core::bridge::registration::BridgeRegistrationRequest {
         bridge_id: bridge_id.clone(),
         operator_did: operator_did.clone().into(),
@@ -10987,7 +11366,12 @@ pub async fn context_discover(query: String) -> Result<String, ScpError> {
                 code: "SCP-CTX-2020".to_owned(),
             })?;
 
-        let results = vec![discovery_result_to_json(&result)];
+        let results = vec![
+            discovery_result_to_json(&result).map_err(|e| ScpError::Context {
+                msg: e,
+                code: "SCP-CTX-2020".to_owned(),
+            })?,
+        ];
         serde_json::to_string(&results).map_err(|e| ScpError::Context {
             msg: format!("failed to serialize discovery results: {e}"),
             code: "SCP-CTX-2021".to_owned(),
@@ -11005,8 +11389,15 @@ pub async fn context_discover(query: String) -> Result<String, ScpError> {
                         code: "SCP-CTX-2022".to_owned(),
                     })?;
 
-                let json_results: Vec<serde_json::Value> =
-                    results.iter().map(discovery_result_to_json).collect();
+                let json_results: Vec<serde_json::Value> = results
+                    .iter()
+                    .map(|r| {
+                        discovery_result_to_json(r).map_err(|e| ScpError::Context {
+                            msg: e,
+                            code: "SCP-CTX-2022".to_owned(),
+                        })
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
                 serde_json::to_string(&json_results).map_err(|e| ScpError::Context {
                     msg: format!("failed to serialize discovery results: {e}"),
                     code: "SCP-CTX-2023".to_owned(),
@@ -12438,7 +12829,7 @@ mod tests {
             metadata_summary: None,
         };
 
-        let json = discovery_result_to_json(&result);
+        let json = discovery_result_to_json(&result).unwrap();
         assert_eq!(json["context_id"], "abc123");
         assert_eq!(json["discovery_source"], "dht_did_document");
         assert_eq!(json["mode"], "broadcast");
@@ -12463,7 +12854,7 @@ mod tests {
             metadata_summary: None,
         };
 
-        let json = discovery_result_to_json(&result);
+        let json = discovery_result_to_json(&result).unwrap();
         assert_eq!(json["trust_level"]["kind"], "HandleRegistryVerified");
         assert_eq!(json["resolution_path"]["layer"], "HandleRegistry");
         assert_eq!(json["resolution_path"]["source"], "handle_registry");
@@ -12482,7 +12873,7 @@ mod tests {
             metadata_summary: None,
         };
 
-        let json = discovery_result_to_json(&result);
+        let json = discovery_result_to_json(&result).unwrap();
         assert_eq!(json["trust_level"]["kind"], "DirectExchange");
         assert_eq!(json["resolution_path"]["layer"], "Domain");
         assert_eq!(json["resolution_path"]["source"], "context_uri");
@@ -12501,7 +12892,7 @@ mod tests {
             metadata_summary: Some("Example context".to_owned()),
         };
 
-        let json = discovery_result_to_json(&result);
+        let json = discovery_result_to_json(&result).unwrap();
         assert_eq!(json["trust_level"]["kind"], "DomainVerified");
         assert_eq!(json["resolution_path"]["layer"], "Domain");
         assert_eq!(json["resolution_path"]["source"], "well-known");

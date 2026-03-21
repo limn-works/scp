@@ -445,24 +445,47 @@ mod tests {
         let mut resolver = TestResolver::new();
         resolver.add_key("did:key:issuer", pubkey_bytes);
         let clock = TestClock::new(2000);
-        let mut attestation = make_signed_renewable_attestation(
-            &signing_key,
-            1000,
-            Some(5000),
-            Duration::from_secs(600),
-            None,
-        );
-        attestation.revocation_status = RevocationStatus::Revoked {
-            revoked_at: 1500,
-            reason: Some("revoked for test".to_owned()),
+        // Build an attestation that is signed WITH Revoked status so the
+        // signature is valid, and verify_attestation reaches the revocation
+        // check (not just the signature check).
+        let mut attestation = Attestation {
+            id: "att-renewable".to_owned(),
+            attestation_type: AttestationType::IdentityLink,
+            issuer: "did:key:issuer".into(),
+            subject: "did:key:subject".into(),
+            claim: serde_json::json!({"platform": "github"}),
+            evidence: None,
+            issued_at: 1000,
+            expires_at: Some(5000),
+            renewal_interval: Some(Duration::from_secs(600)),
+            renewed_at: None,
+            revocation_status: RevocationStatus::Revoked {
+                revoked_at: 1500,
+                reason: "revoked for test".to_owned(),
+                revoked_by: "did:key:issuer".into(),
+            },
+            signature: vec![],
         };
+        let canonical = canonical_attestation_bytes(&attestation).unwrap();
+        let sig = signing_key.sign(&canonical);
+        attestation.signature = sig.to_bytes().to_vec();
 
         let result = renew_attestation(&attestation, &resolver, &clock);
 
         assert!(result.is_err());
         match result {
-            Err(RenewalError::VerificationFailed { attestation_id, .. }) => {
+            Err(RenewalError::VerificationFailed {
+                attestation_id,
+                source,
+            }) => {
                 assert_eq!(attestation_id, "att-renewable");
+                // Verify the underlying error is specifically AttestationRevoked,
+                // not AttestationSignatureInvalid — proving we're testing the
+                // revocation rejection path, not the signature path.
+                assert!(
+                    matches!(source, TrustError::AttestationRevoked { .. }),
+                    "expected AttestationRevoked, got {source:?}",
+                );
             }
             other => panic!("expected VerificationFailed, got {other:?}"),
         }

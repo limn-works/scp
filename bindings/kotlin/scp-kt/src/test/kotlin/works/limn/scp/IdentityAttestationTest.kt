@@ -10,7 +10,7 @@ import kotlin.test.assertTrue
 
 /**
  * Tests for the [IdentityAttestation] data class and
- * [IdentityAttestationBindings] / [IdentityAttestationBridge] types.
+ * [IdentityAdvancedBindings] / [IdentityAdvancedBridge] attestation methods.
  *
  * Covers:
  * - Data class construction with defaults

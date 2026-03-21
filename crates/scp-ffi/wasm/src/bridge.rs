@@ -381,7 +381,13 @@ pub fn bridge_register(
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|d| d.as_secs())
-                .unwrap_or(0)
+                .map_err(|_| {
+                    ScpWasmError::Context {
+                        message: "system clock is unavailable or before Unix epoch".to_owned(),
+                        code: "SCP-CTX-2101".to_owned(),
+                    }
+                    .into_js()
+                })?
         }
     };
     let bridge_id = {

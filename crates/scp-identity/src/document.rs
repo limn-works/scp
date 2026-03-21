@@ -35,7 +35,7 @@
 //! See ADR-003 and ADR-039 in `.docs/adrs/phase-1.md`.
 
 use super::IdentityError;
-use super::attestation::ScpKeyCustodyAttestation;
+use super::attestation::{IdentityLinkServiceEntry, ScpKeyCustodyAttestation};
 use serde::{Deserialize, Serialize};
 
 /// Custom serde module for `[u8; 64]` fields.
@@ -200,6 +200,12 @@ const DEVICE_ATTESTATION_FRAGMENT: &str = "device-attestation";
 /// When rotating the `#agent` key, older retired keys beyond this limit are
 /// pruned to bound document size. Per ADR-039, this is set to 2.
 const MAX_RETIRED_AGENT_KEYS: usize = 2;
+
+/// The service type string for `ScpIdentityLinkAttestation` entries (§3.5.3).
+const IDENTITY_LINK_ATTESTATION_SERVICE_TYPE: &str = "ScpIdentityLinkAttestation";
+
+/// Maximum number of identity link attestation service entries per DID document (§3.5.3).
+const MAX_IDENTITY_LINK_ATTESTATIONS: usize = 10;
 
 impl DidDocument {
     /// Constructs a new DID Document for an SCP identity.
@@ -593,6 +599,115 @@ impl DidDocument {
         let service = attestation.to_service_entry(&self.id)?;
         self.service.push(service);
         Ok(())
+    }
+
+    // Identity link attestation service entries (§3.5.3)
+    // -----------------------------------------------------------------------
+
+    /// Returns all identity link attestation service entries in this DID document.
+    ///
+    /// Parses each service entry of type `ScpIdentityLinkAttestation` and returns
+    /// the platform, attestation ID, and index. Entries that fail to parse are
+    /// silently skipped (defensive — avoids rejecting the entire document for one
+    /// malformed entry).
+    #[must_use]
+    pub fn identity_link_attestations(&self) -> Vec<IdentityLinkServiceEntry> {
+        self.service
+            .iter()
+            .filter(|s| s.service_type == IDENTITY_LINK_ATTESTATION_SERVICE_TYPE)
+            .filter_map(|s| IdentityLinkServiceEntry::from_service_entry(s).ok())
+            .collect()
+    }
+
+    /// Sets or adds an identity link attestation service entry (§3.5.3).
+    ///
+    /// If an entry for the same platform and attestation ID already exists, it is
+    /// replaced. Otherwise a new entry is appended. The index is computed as the
+    /// next available index for the given platform among existing entries.
+    ///
+    /// # Arguments
+    ///
+    /// * `platform` - Platform identifier from the provider registry (§3.5.1).
+    /// * `attestation_id` - Hex-encoded deterministic attestation ID (§3.5.2).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`IdentityError::DocumentSerializationError`] if adding this entry
+    /// would exceed the maximum of 10 identity link attestation entries (§3.5.3).
+    pub fn set_identity_link_attestation(
+        &mut self,
+        platform: &str,
+        attestation_id: &str,
+    ) -> Result<(), IdentityError> {
+        // Check if an entry with this exact attestation_id already exists — replace it.
+        let existing_pos = self.service.iter().position(|s| {
+            s.service_type == IDENTITY_LINK_ATTESTATION_SERVICE_TYPE
+                && s.service_endpoint == attestation_id
+        });
+
+        if let Some(pos) = existing_pos {
+            // Parse the existing entry to preserve its index.
+            let existing = IdentityLinkServiceEntry::from_service_entry(&self.service[pos]).ok();
+            let index = existing.map_or(0, |e| e.index);
+            self.service[pos] = IdentityLinkServiceEntry::to_service_entry(
+                &self.id,
+                platform,
+                attestation_id,
+                index,
+            );
+            return Ok(());
+        }
+
+        // Count existing identity link entries to enforce the limit.
+        let current_count = self
+            .service
+            .iter()
+            .filter(|s| s.service_type == IDENTITY_LINK_ATTESTATION_SERVICE_TYPE)
+            .count();
+
+        if current_count >= MAX_IDENTITY_LINK_ATTESTATIONS {
+            return Err(IdentityError::DocumentSerializationError(format!(
+                "maximum of {MAX_IDENTITY_LINK_ATTESTATIONS} identity link attestation entries exceeded"
+            )));
+        }
+
+        // Compute the next index for this platform.
+        let index = self
+            .service
+            .iter()
+            .filter(|s| s.service_type == IDENTITY_LINK_ATTESTATION_SERVICE_TYPE)
+            .filter_map(|s| IdentityLinkServiceEntry::from_service_entry(s).ok())
+            .filter(|e| e.platform == platform)
+            .map(|e| e.index)
+            .max()
+            .map_or(0, |max_idx| max_idx + 1);
+
+        let entry =
+            IdentityLinkServiceEntry::to_service_entry(&self.id, platform, attestation_id, index);
+        self.service.push(entry);
+        Ok(())
+    }
+
+    /// Removes an identity link attestation service entry by attestation ID.
+    ///
+    /// Returns `true` if an entry was removed, `false` if no matching entry
+    /// was found.
+    pub fn remove_identity_link_attestation(&mut self, attestation_id: &str) -> bool {
+        let before = self.service.len();
+        self.service.retain(|s| {
+            !(s.service_type == IDENTITY_LINK_ATTESTATION_SERVICE_TYPE
+                && s.service_endpoint == attestation_id)
+        });
+        self.service.len() < before
+    }
+
+    /// Returns the number of identity link attestation service entries.
+    #[must_use]
+    pub fn identity_link_attestation_count(&self) -> usize {
+        self.service
+            .iter()
+            .filter(|s| s.service_type == IDENTITY_LINK_ATTESTATION_SERVICE_TYPE)
+            .count()
     }
 
     /// Returns the device attestation token from this DID document, if present.
@@ -2066,5 +2181,145 @@ mod tests {
 
         let result = doc.device_attestation_token();
         assert!(result.is_err());
+    }
+
+    // --- Identity link attestation DID document integration tests (§3.5.3) ---
+
+    #[test]
+    fn identity_link_empty_document_returns_empty_list() {
+        let doc = DidDocument::new("did:dht:zIdLink1", &[1u8; 32], &[2u8; 32], &[3u8; 32]);
+        assert!(doc.identity_link_attestations().is_empty());
+        assert_eq!(doc.identity_link_attestation_count(), 0);
+    }
+
+    #[test]
+    fn identity_link_set_and_get() {
+        let mut doc = DidDocument::new("did:dht:zIdLink2", &[1u8; 32], &[2u8; 32], &[3u8; 32]);
+
+        doc.set_identity_link_attestation("github.com", "abc123")
+            .unwrap();
+
+        let entries = doc.identity_link_attestations();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].platform, "github.com");
+        assert_eq!(entries[0].attestation_id, "abc123");
+        assert_eq!(entries[0].index, 0);
+    }
+
+    #[test]
+    fn identity_link_multiple_platforms() {
+        let mut doc = DidDocument::new("did:dht:zIdLink3", &[1u8; 32], &[2u8; 32], &[3u8; 32]);
+
+        doc.set_identity_link_attestation("github.com", "aaa")
+            .unwrap();
+        doc.set_identity_link_attestation("x.com", "bbb").unwrap();
+        doc.set_identity_link_attestation("google.com", "ccc")
+            .unwrap();
+
+        assert_eq!(doc.identity_link_attestation_count(), 3);
+        let entries = doc.identity_link_attestations();
+        assert_eq!(entries.len(), 3);
+    }
+
+    #[test]
+    fn identity_link_same_platform_increments_index() {
+        let mut doc = DidDocument::new("did:dht:zIdLink4", &[1u8; 32], &[2u8; 32], &[3u8; 32]);
+
+        doc.set_identity_link_attestation("mastodon:mastodon.social", "aaa")
+            .unwrap();
+        doc.set_identity_link_attestation("mastodon:mastodon.social", "bbb")
+            .unwrap();
+
+        let entries = doc.identity_link_attestations();
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].index, 0);
+        assert_eq!(entries[1].index, 1);
+    }
+
+    #[test]
+    fn identity_link_replace_same_attestation_id() {
+        let mut doc = DidDocument::new("did:dht:zIdLink5", &[1u8; 32], &[2u8; 32], &[3u8; 32]);
+
+        doc.set_identity_link_attestation("github.com", "abc123")
+            .unwrap();
+        // Setting the same attestation ID should replace, not add.
+        doc.set_identity_link_attestation("github.com", "abc123")
+            .unwrap();
+
+        assert_eq!(doc.identity_link_attestation_count(), 1);
+    }
+
+    #[test]
+    fn identity_link_remove() {
+        let mut doc = DidDocument::new("did:dht:zIdLink6", &[1u8; 32], &[2u8; 32], &[3u8; 32]);
+
+        doc.set_identity_link_attestation("github.com", "abc123")
+            .unwrap();
+        assert_eq!(doc.identity_link_attestation_count(), 1);
+
+        let removed = doc.remove_identity_link_attestation("abc123");
+        assert!(removed);
+        assert_eq!(doc.identity_link_attestation_count(), 0);
+    }
+
+    #[test]
+    fn identity_link_remove_nonexistent_returns_false() {
+        let mut doc = DidDocument::new("did:dht:zIdLink7", &[1u8; 32], &[2u8; 32], &[3u8; 32]);
+
+        let removed = doc.remove_identity_link_attestation("nonexistent");
+        assert!(!removed);
+    }
+
+    #[test]
+    fn identity_link_max_limit_enforced() {
+        let mut doc = DidDocument::new("did:dht:zIdLink8", &[1u8; 32], &[2u8; 32], &[3u8; 32]);
+
+        // Add 10 entries (the maximum).
+        for i in 0..10 {
+            doc.set_identity_link_attestation(&format!("platform-{i}.com"), &format!("attest-{i}"))
+                .unwrap();
+        }
+        assert_eq!(doc.identity_link_attestation_count(), 10);
+
+        // The 11th should fail.
+        let result = doc.set_identity_link_attestation("one-too-many.com", "attest-10");
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("maximum of 10"));
+    }
+
+    #[test]
+    fn identity_link_preserves_other_services() {
+        let mut doc = DidDocument::new("did:dht:zIdLink9", &[1u8; 32], &[2u8; 32], &[3u8; 32]);
+        doc.add_relay_service("wss://relay.example.com/scp/v1")
+            .unwrap();
+
+        doc.set_identity_link_attestation("github.com", "abc123")
+            .unwrap();
+
+        // Should have: PreRotationCommitment + SCPRelay + identity link.
+        assert_eq!(doc.service.len(), 3);
+        assert!(doc.pre_rotation_service().is_some());
+        assert_eq!(doc.relay_service_urls().len(), 1);
+        assert_eq!(doc.identity_link_attestation_count(), 1);
+    }
+
+    #[test]
+    fn identity_link_survives_json_roundtrip() {
+        let mut doc = DidDocument::new("did:dht:zIdLink10", &[1u8; 32], &[2u8; 32], &[3u8; 32]);
+
+        doc.set_identity_link_attestation("github.com", "abc123")
+            .unwrap();
+        doc.set_identity_link_attestation("x.com", "def456")
+            .unwrap();
+
+        let json = doc.to_json().unwrap();
+        let parsed = DidDocument::from_json(&json).unwrap();
+
+        let entries = parsed.identity_link_attestations();
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].platform, "github.com");
+        assert_eq!(entries[0].attestation_id, "abc123");
+        assert_eq!(entries[1].platform, "x.com");
+        assert_eq!(entries[1].attestation_id, "def456");
     }
 }

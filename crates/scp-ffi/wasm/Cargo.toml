@@ -19,7 +19,17 @@ testing = []
 wasm-bindgen = "0.2"
 wasm-bindgen-futures = "0.4"
 js-sys = "0.3"
-web-sys = { version = "0.3", features = ["console", "Window", "Crypto", "SubtleCrypto"] }
+web-sys = { version = "0.3", features = [
+    "console",
+    "Crypto",
+    "Headers",
+    "Request",
+    "RequestInit",
+    "RequestMode",
+    "Response",
+    "SubtleCrypto",
+    "Window",
+] }
 serde = { workspace = true }
 serde_json = { workspace = true }
 serde_json_canonicalizer = { workspace = true }

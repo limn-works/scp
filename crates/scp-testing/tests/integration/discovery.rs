@@ -394,7 +394,7 @@ async fn did_routing_id_deterministic() {
 }
 
 // ---------------------------------------------------------------------------
-// 16. bootstrap_config: with_defaults, add_custom_context, all_context_ids
+// 16. bootstrap_config: with_defaults, add_custom_context, all_contexts
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
@@ -406,34 +406,31 @@ async fn bootstrap_config() {
     assert!(default_config.should_auto_query());
     assert!(default_config.should_fallback());
 
-    // with_defaults.
+    // with_defaults using BootstrapContextEntry.
     let config = BootstrapConfig::with_defaults(vec![
-        BootstrapContextEntry {
-            context_id: "ctx-discovery-1".to_owned(),
-            expected_creator_did: DID("did:dht:z6MkOp1".to_owned()),
-        },
-        BootstrapContextEntry {
-            context_id: "ctx-discovery-2".to_owned(),
-            expected_creator_did: DID("did:dht:z6MkOp2".to_owned()),
-        },
-    ]);
+        BootstrapContextEntry::new("ctx-discovery-1".to_owned(), DID::from("did:dht:zCreator1")),
+        BootstrapContextEntry::new("ctx-discovery-2".to_owned(), DID::from("did:dht:zCreator2")),
+    ])
+    .unwrap();
     assert_eq!(config.default_contexts.len(), 2);
     assert!(config.custom_contexts.is_empty());
 
     // add_custom_context.
     let mut config = config;
-    config.add_custom_context(BootstrapContextEntry {
-        context_id: "ctx-custom-1".to_owned(),
-        expected_creator_did: DID("did:dht:z6MkC1".to_owned()),
-    });
+    config
+        .add_custom_context(BootstrapContextEntry::new(
+            "ctx-custom-1".to_owned(),
+            DID::from("did:dht:zCustom1"),
+        ))
+        .unwrap();
     assert_eq!(config.custom_contexts.len(), 1);
 
-    // all_context_ids combines defaults and custom.
-    let all = config.all_context_ids();
+    // all_contexts combines defaults and custom.
+    let all = config.all_contexts();
     assert_eq!(all.len(), 3);
-    assert_eq!(*all[0], "ctx-discovery-1");
-    assert_eq!(*all[1], "ctx-discovery-2");
-    assert_eq!(*all[2], "ctx-custom-1");
+    assert_eq!(all[0].context_id, "ctx-discovery-1");
+    assert_eq!(all[1].context_id, "ctx-discovery-2");
+    assert_eq!(all[2].context_id, "ctx-custom-1");
 }
 
 // ---------------------------------------------------------------------------

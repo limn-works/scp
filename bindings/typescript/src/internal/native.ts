@@ -1412,6 +1412,47 @@ export function createNativeBridge(): Bridge {
       )(did, tokenBase64);
     },
 
+    // Identity link attestation (§3.5.1)
+    async identityCreateLinkAttestation(
+      did: string,
+      platform: string,
+      handle: string,
+      proof: string,
+      verificationMethod: string,
+      platformId: string | null,
+    ): Promise<string> {
+      return await (
+        addon.identityCreateLinkAttestation as (
+          d: string,
+          p: string,
+          h: string,
+          pr: string,
+          vm: string,
+          pid: string | null,
+        ) => Promise<string>
+      )(did, platform, handle, proof, verificationMethod, platformId);
+    },
+
+    identityLinkAttestations(did: string): string {
+      return (addon.identityLinkAttestations as (d: string) => string)(did);
+    },
+
+    identityRemoveLinkAttestation(did: string, attestationId: string): boolean {
+      return (addon.identityRemoveLinkAttestation as (d: string, a: string) => boolean)(
+        did,
+        attestationId,
+      );
+    },
+
+    async identityVerifyLinkAttestation(
+      attestationJson: string,
+      issuerPublicKeyHex: string,
+    ): Promise<boolean> {
+      return await (
+        addon.identityVerifyLinkAttestation as (j: string, k: string) => Promise<boolean>
+      )(attestationJson, issuerPublicKeyHex);
+    },
+
     // Recovery and custody migration (#632, spec §9.12, §3.2.1)
     async identityExecuteRecovery(
       did: string,

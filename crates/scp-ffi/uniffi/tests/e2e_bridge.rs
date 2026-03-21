@@ -61,6 +61,9 @@ use scp_ffi_uniffi::{
     governance_execute,
     // Free functions — identity
     identity_create,
+    identity_create_link_attestation,
+    identity_link_attestations,
+    identity_migrate,
     // Free functions — local DID management
     is_local_did,
     provenance_attach,
@@ -222,6 +225,76 @@ async fn identity_agent_key_lifecycle() {
         !without_agent.has_agent_key(),
         "Should not have agent key after removal"
     );
+}
+
+#[tokio::test]
+async fn identity_migrate_preserves_attestations() {
+    let identity = identity_create("in_memory".to_owned()).await.unwrap();
+    let original_did = identity.did();
+
+    // Create an attestation on the original DID.
+    let proof_json = r#"{"type":"signed_post_verified","post_url":"https://x.com/alice/status/123","nonce":"abc123","posted_at":1700000200}"#;
+    let result = identity_create_link_attestation(
+        identity.clone(),
+        "x.com".to_owned(),
+        "@alice".to_owned(),
+        proof_json.to_owned(),
+        "signed_post".to_owned(),
+        None,
+    )
+    .await;
+
+    // The attestation should be created successfully.
+    let result: Result<String, _> = result;
+    assert!(
+        result.is_ok(),
+        "Attestation creation should succeed: {result:?}"
+    );
+
+    // Verify the attestation is listed under the original DID.
+    let before = identity_link_attestations(original_did.clone()).unwrap();
+    let before_vec: Vec<serde_json::Value> = serde_json::from_str(&before).unwrap();
+    assert_eq!(
+        before_vec.len(),
+        1,
+        "Should have 1 attestation before migration"
+    );
+
+    // Migrate the identity to a new DID.
+    // Like rotate_key, migration may fail with InMemoryDhtClient due to
+    // isolated DHT instances. Handle both outcomes.
+    let migrate_result: Result<std::sync::Arc<scp_ffi_uniffi::Identity>, _> =
+        identity_migrate(identity).await;
+    match migrate_result {
+        Ok(migrated) => {
+            let new_did: String = migrated.did();
+            assert_ne!(new_did, original_did, "Migration should produce a new DID");
+
+            // Attestations should have migrated to the new DID.
+            let after = identity_link_attestations(new_did).unwrap();
+            let after_vec: Vec<serde_json::Value> = serde_json::from_str(&after).unwrap();
+            assert_eq!(
+                after_vec.len(),
+                1,
+                "Attestation should be migrated to new DID"
+            );
+
+            // Old DID should have no attestations.
+            let old = identity_link_attestations(original_did).unwrap();
+            let old_vec: Vec<serde_json::Value> = serde_json::from_str(&old).unwrap();
+            assert!(
+                old_vec.is_empty(),
+                "Old DID should have no attestations after migration"
+            );
+        }
+        Err(e) => {
+            let msg: String = e.to_string();
+            assert!(
+                msg.contains("DHT") || msg.contains("resolve") || msg.contains("migration"),
+                "Migration failure should be DHT-related: {msg}"
+            );
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------

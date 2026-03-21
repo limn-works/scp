@@ -90,9 +90,11 @@ pub use admission::{
     AdmissionError, CapabilityRequirement, VerificationLevel, check_capability_requirements,
 };
 pub use attestation::{
-    Attestation, AttestationEvidence, AttestorInfo, DidPublicKeyResolver, FreshnessStatus,
-    IdentityDidPublicKeyResolver, RevocationStatus, ThresholdRequirement, ThresholdResult,
-    check_attestation_freshness, check_threshold_attestation, verify_attestation,
+    Attestation, AttestationEvidence, AttestationRevocationChecker, AttestationVerificationCache,
+    AttestorInfo, CRYPTOGRAPHIC_TTL_SECS, DidPublicKeyResolver, FreshnessStatus,
+    IdentityDidPublicKeyResolver, NoOpRevocationChecker, REFERENCE_TTL_SECS, RevocationStatus,
+    ThresholdRequirement, ThresholdResult, check_attestation_freshness,
+    check_threshold_attestation, verify_attestation, verify_attestation_with_revocation,
 };
 pub use capability_registry::{
     CapabilityRegistryError, RegistryEntry, is_known_protocol_capability,
@@ -149,7 +151,7 @@ pub type ToolId = String;
 // ---------------------------------------------------------------------------
 
 /// Errors produced by trust engine operations.
-#[derive(Debug, thiserror::Error)]
+#[derive(Debug, Clone, thiserror::Error)]
 pub enum TrustError {
     /// No events found for the specified subject DID in the event log.
     #[error("no events found for subject DID: {did}")]
@@ -196,6 +198,21 @@ pub enum TrustError {
         attestation_id: String,
         /// Unix timestamp (seconds) when the attestation was revoked.
         revoked_at: u64,
+    },
+
+    /// The attestation's `revoked_by` DID does not match the issuer.
+    ///
+    /// Per §7.4.1, only the issuer can revoke their own attestation.
+    #[error(
+        "attestation {attestation_id}: revoked_by '{revoked_by}' does not match issuer '{issuer}'"
+    )]
+    AttestationRevocationInvalid {
+        /// The attestation ID.
+        attestation_id: String,
+        /// The DID that claims to have revoked the attestation.
+        revoked_by: String,
+        /// The attestation's issuer DID.
+        issuer: String,
     },
 
     /// The attestation evidence is missing or invalid.
