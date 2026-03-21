@@ -1692,7 +1692,13 @@ mod wasm_ucan_mirror {
         }
 
         pub fn matches(&self, required: &Self) -> bool {
-            if self.resource != required.resource || self.action != required.action {
+            // Resource must always match exactly.
+            if self.resource != required.resource {
+                return false;
+            }
+            // Action: wildcard "*" on the granting side matches any required action.
+            // Otherwise, actions must match exactly.
+            if self.action != "*" && self.action != required.action {
                 return false;
             }
             match (&self.context_id, &required.context_id) {
@@ -4773,7 +4779,7 @@ fn wasm_trust_level_sorting_order() {
             "LocalPetname" => 4,
             "AttestationVerified" => 3,
             "DomainVerified" => 2,
-            "DiscoveryContextVerified" => 1,
+            "HandleRegistryVerified" => 1,
             _ => 0,
         }
     }
@@ -4783,8 +4789,8 @@ fn wasm_trust_level_sorting_order() {
     assert!(trust_level_rank("MultiLayerCorroborated") > trust_level_rank("LocalPetname"));
     assert!(trust_level_rank("LocalPetname") > trust_level_rank("AttestationVerified"));
     assert!(trust_level_rank("AttestationVerified") > trust_level_rank("DomainVerified"));
-    assert!(trust_level_rank("DomainVerified") > trust_level_rank("DiscoveryContextVerified"));
-    assert!(trust_level_rank("DiscoveryContextVerified") > trust_level_rank("Unknown"));
+    assert!(trust_level_rank("DomainVerified") > trust_level_rank("HandleRegistryVerified"));
+    assert!(trust_level_rank("HandleRegistryVerified") > trust_level_rank("Unknown"));
 }
 
 // ===========================================================================
@@ -5585,6 +5591,82 @@ fn wasm_core_category_a_unknown_kid_rejected() {
             .unwrap_err()
             .contains("unrecognized signing key ID"),
         "Error must mention unrecognized kid: {result:?}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// CapabilityUri wildcard action conformance
+// ---------------------------------------------------------------------------
+
+#[test]
+fn wasm_conformance_capability_uri_wildcard_grants_specific() {
+    let granted = wasm_ucan_mirror::CapabilityUri {
+        context_id: Some("ctx-1".to_owned()),
+        resource: "tool_invoke".to_owned(),
+        action: "*".to_owned(),
+    };
+    let required = wasm_ucan_mirror::CapabilityUri {
+        context_id: Some("ctx-1".to_owned()),
+        resource: "tool_invoke".to_owned(),
+        action: "calculator".to_owned(),
+    };
+    assert!(
+        granted.matches(&required),
+        "wildcard action '*' should match specific action 'calculator'"
+    );
+}
+
+#[test]
+fn wasm_conformance_capability_uri_wildcard_does_not_cross_resources() {
+    let granted = wasm_ucan_mirror::CapabilityUri {
+        context_id: Some("ctx-1".to_owned()),
+        resource: "tool_invoke".to_owned(),
+        action: "*".to_owned(),
+    };
+    let required = wasm_ucan_mirror::CapabilityUri {
+        context_id: Some("ctx-1".to_owned()),
+        resource: "messages".to_owned(),
+        action: "write".to_owned(),
+    };
+    assert!(
+        !granted.matches(&required),
+        "wildcard on tool_invoke must not match messages resource"
+    );
+}
+
+#[test]
+fn wasm_conformance_capability_uri_specific_does_not_satisfy_wildcard() {
+    let granted = wasm_ucan_mirror::CapabilityUri {
+        context_id: Some("ctx-1".to_owned()),
+        resource: "tool_invoke".to_owned(),
+        action: "calculator".to_owned(),
+    };
+    let required = wasm_ucan_mirror::CapabilityUri {
+        context_id: Some("ctx-1".to_owned()),
+        resource: "tool_invoke".to_owned(),
+        action: "*".to_owned(),
+    };
+    assert!(
+        !granted.matches(&required),
+        "specific grant must not satisfy wildcard requirement"
+    );
+}
+
+#[test]
+fn wasm_conformance_capability_uri_wildcard_context_plus_wildcard_action() {
+    let granted = wasm_ucan_mirror::CapabilityUri {
+        context_id: None, // wildcard context
+        resource: "tool_invoke".to_owned(),
+        action: "*".to_owned(),
+    };
+    let required = wasm_ucan_mirror::CapabilityUri {
+        context_id: Some("ctx-42".to_owned()),
+        resource: "tool_invoke".to_owned(),
+        action: "calculator".to_owned(),
+    };
+    assert!(
+        granted.matches(&required),
+        "wildcard context + wildcard action should match any specific context+action"
     );
 }
 

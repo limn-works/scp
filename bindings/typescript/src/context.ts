@@ -1731,7 +1731,7 @@ export function metadataRecordFromJson(jsonStr: string): MetadataRecord {
  * @param templateId - One of: `BilateralEphemeral`, `BilateralPersistent`,
  *   `Coordination`, `GroupDiscussion`, `PublicBroadcast`, `GatedBroadcast`,
  *   `scp:template/tool-interface`, `PaidService`, `PaidBroadcast`,
- *   `DiscoveryContext`.
+ *   `HandleRegistry`.
  * @returns ContextParams object.
  */
 export function templateGetParams(templateId: string): ContextParams {

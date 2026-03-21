@@ -43,23 +43,23 @@ describe("DiscoveryResult type (§22.2.1)", () => {
     expect(result.resolutionPath.resolvedAt).toBe(1700000000);
   });
 
-  it("accepts DiscoveryContextVerified trust level for context source", () => {
+  it("accepts HandleRegistryVerified trust level for context source", () => {
     const result: DiscoveryResult = {
       contextId: "ctx456",
       relayUrls: ["wss://relay.example.com"],
       publisherDid: "did:dht:zTest",
-      discoverySource: "discovery_context",
+      discoverySource: "handle_registry",
       mode: null,
       metadataSummary: null,
-      trustLevel: { kind: "DiscoveryContextVerified" },
+      trustLevel: { kind: "HandleRegistryVerified" },
       resolutionPath: {
-        layer: "DiscoveryContext",
-        source: "discovery_context",
+        layer: "HandleRegistry",
+        source: "handle_registry",
         sourceId: "disc-ctx-1",
         resolvedAt: 1700000000,
       },
     };
-    expect(result.trustLevel.kind).toBe("DiscoveryContextVerified");
+    expect(result.trustLevel.kind).toBe("HandleRegistryVerified");
     expect(result.resolutionPath.sourceId).toBe("disc-ctx-1");
   });
 
@@ -132,7 +132,7 @@ describe("AddressResolution discriminated union", () => {
       { kind: "LocalPetname" },
       { kind: "DomainVerified" },
       { kind: "AttestationVerified" },
-      { kind: "DiscoveryContextVerified" },
+      { kind: "HandleRegistryVerified" },
     ];
     for (const level of levels) {
       const resolution: AddressResolution = {
@@ -179,7 +179,7 @@ describe("AddressResolution discriminated union", () => {
   it("all ResolutionLayer values are assignable (5 per §22.11.3)", () => {
     const layers: ResolutionPath["layer"][] = [
       "Petname",
-      "DiscoveryContext",
+      "HandleRegistry",
       "Attestation",
       "Domain",
       "MultiLayerCorroborated",

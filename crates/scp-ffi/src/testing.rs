@@ -21,14 +21,25 @@ use scp_testing::fullstack::{FullStackNetwork, FullStackNode};
 // Shared network
 // ---------------------------------------------------------------------------
 
-/// Returns the shared `FullStackNetwork` instance.
+/// Guards the shared `FullStackNetwork` instance.
+///
+/// Uses `Mutex<Option<...>>` instead of `OnceLock` so tests can reset
+/// the network between runs (preventing cross-test state leakage).
+static NETWORK: std::sync::Mutex<Option<FullStackNetwork>> = std::sync::Mutex::new(None);
+
+/// Returns the result of calling `f` with the shared `FullStackNetwork`.
 ///
 /// All nodes created via `py_fullstack_create_node` share the same
 /// `KeyExchange` so Welcome messages and sender keys can be exchanged.
-fn shared_network() -> &'static FullStackNetwork {
-    use std::sync::OnceLock;
-    static NETWORK: OnceLock<FullStackNetwork> = OnceLock::new();
-    NETWORK.get_or_init(FullStackNetwork::new)
+fn with_network<F, R>(f: F) -> R
+where
+    F: FnOnce(&FullStackNetwork) -> R,
+{
+    let mut guard = NETWORK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let network = guard.get_or_insert_with(FullStackNetwork::new);
+    f(network)
 }
 
 /// Returns a permissive key resolver that always returns `None`.
@@ -70,12 +81,24 @@ impl PyFullStackNode {
 #[must_use]
 #[pyfunction]
 pub fn py_fullstack_create_node(did: String) -> PyFullStackNode {
-    let network = shared_network();
-    let node = network.create_node(&did, permissive_key_resolver());
-    PyFullStackNode {
-        inner: node,
-        handles: Mutex::new(HashMap::new()),
-    }
+    with_network(|network| {
+        let node = network.create_node(&did, permissive_key_resolver());
+        PyFullStackNode {
+            inner: node,
+            handles: Mutex::new(HashMap::new()),
+        }
+    })
+}
+
+/// Resets the shared `FullStackNetwork`, dropping all nodes and state.
+///
+/// Call between test suites to prevent cross-test state leakage.
+#[pyfunction]
+pub fn py_fullstack_reset_network() {
+    let mut guard = NETWORK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    *guard = None;
 }
 
 /// Creates an encrypted context owned by the given node.
@@ -201,6 +224,17 @@ pub fn py_fullstack_join_from_welcome(node: &PyFullStackNode, context_id: String
         pyo3::exceptions::PyRuntimeError::new_err(format!("failed to join from Welcome: {e}"))
     })?;
 
+    // Step 2b: Regenerate the joiner's sender key and distribute it to
+    // existing members. The key from create_context was for the throwaway
+    // MLS group and is now stale.
+    node.inner
+        .regenerate_and_distribute_sender_key(&ctx_bytes)
+        .map_err(|e| {
+            pyo3::exceptions::PyRuntimeError::new_err(format!(
+                "failed to distribute joiner sender key: {e}"
+            ))
+        })?;
+
     // Step 3: Store the handle.
     {
         let mut handles = node
@@ -296,6 +330,12 @@ pub fn py_fullstack_send_message<'py>(
             "no ciphertext captured after send",
         ));
     }
+    if sent.len() > 1 {
+        return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
+            "expected 1 ciphertext after send, got {} — send_message should produce exactly one",
+            sent.len()
+        )));
+    }
 
     Ok(PyBytes::new(py, &sent[0].1))
 }
@@ -364,5 +404,6 @@ pub fn register_testing(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(py_fullstack_send_message, m)?)?;
     m.add_function(wrap_pyfunction!(py_fullstack_decrypt_message, m)?)?;
     m.add_function(wrap_pyfunction!(py_fullstack_remove_member, m)?)?;
+    m.add_function(wrap_pyfunction!(py_fullstack_reset_network, m)?)?;
     Ok(())
 }

@@ -204,7 +204,7 @@ pub enum FreshnessStatus {
 /// minimum independence score required among those attestors.
 ///
 /// See ADR-017 acceptance criterion 7.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ThresholdRequirement {
     /// The minimum number of valid attestations required (N).
     pub required_count: u32,

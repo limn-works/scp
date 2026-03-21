@@ -211,7 +211,7 @@ public enum ScpId {
                 code: "SCP-IDENT-1038"
             )
         }
-        let ttlSeconds = UInt64(ttl)
+        let ttlSeconds = UInt64(ttl.rounded(.up))
         let json = try challengeFn(audience, ttlSeconds)
         let wire = try JSONDecoder().decode(ChallengeWire.self, from: Data(json.utf8))
         return ScpIdChallenge(

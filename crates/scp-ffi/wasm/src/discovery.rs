@@ -1774,9 +1774,9 @@ fn entry_to_resolution(
             Some(serde_json::json!({
                 "type": "Identity",
                 "did": did,
-                "trust_level": {"kind": "DiscoveryContextVerified"},
+                "trust_level": {"kind": "HandleRegistryVerified"},
                 "resolution_path": {
-                    "layer": "DiscoveryContext",
+                    "layer": "HandleRegistry",
                     "source": "local_registry",
                     "source_id": ctx_id,
                     "resolved_at": now,
@@ -1794,9 +1794,9 @@ fn entry_to_resolution(
                 "context_id": cid,
                 "relay_urls": relay_urls,
                 "mode": null,
-                "trust_level": {"kind": "DiscoveryContextVerified"},
+                "trust_level": {"kind": "HandleRegistryVerified"},
                 "resolution_path": {
-                    "layer": "DiscoveryContext",
+                    "layer": "HandleRegistry",
                     "source": "local_registry",
                     "source_id": ctx_id,
                     "resolved_at": now,
@@ -1815,7 +1815,7 @@ fn trust_level_rank(kind: &str) -> u8 {
         "LocalPetname" => 4,
         "AttestationVerified" => 3,
         "DomainVerified" => 2,
-        "DiscoveryContextVerified" => 1,
+        "HandleRegistryVerified" => 1,
         _ => 0,
     }
 }

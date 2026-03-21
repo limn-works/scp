@@ -153,8 +153,8 @@ pub fn trust_level_to_json(trust_level: &TrustLevel) -> serde_json::Value {
         }),
         TrustLevel::DomainVerified => serde_json::json!({"kind": "DomainVerified"}),
         TrustLevel::AttestationVerified => serde_json::json!({"kind": "AttestationVerified"}),
-        TrustLevel::DiscoveryContextVerified => {
-            serde_json::json!({"kind": "DiscoveryContextVerified"})
+        TrustLevel::HandleRegistryVerified => {
+            serde_json::json!({"kind": "HandleRegistryVerified"})
         }
     }
 }
@@ -164,7 +164,7 @@ pub fn trust_level_to_json(trust_level: &TrustLevel) -> serde_json::Value {
 pub fn resolution_path_to_json(path: &ResolutionPath) -> serde_json::Value {
     let layer = match path.layer {
         ResolutionLayer::Petname => "Petname",
-        ResolutionLayer::DiscoveryContext => "DiscoveryContext",
+        ResolutionLayer::HandleRegistry => "HandleRegistry",
         ResolutionLayer::Attestation => "Attestation",
         ResolutionLayer::Domain => "Domain",
         ResolutionLayer::MultiLayerCorroborated => "MultiLayerCorroborated",
@@ -263,12 +263,12 @@ pub fn handle_entry_to_resolution(
     now: u64,
 ) -> AddressResolution {
     let resolution_path = ResolutionPath {
-        layer: ResolutionLayer::DiscoveryContext,
+        layer: ResolutionLayer::HandleRegistry,
         source: "local_registry".to_owned(),
         source_id: Some(context_id.to_owned()),
         resolved_at: now,
     };
-    let trust_level = TrustLevel::DiscoveryContextVerified;
+    let trust_level = TrustLevel::HandleRegistryVerified;
 
     match &entry.target {
         HandleTarget::Identity { did } => AddressResolution::Identity {
@@ -413,9 +413,9 @@ mod tests {
             context_id: "ctx-abc".to_owned(),
             relay_urls: vec!["wss://relay.example.com".to_owned()],
             mode: Some("open".to_owned()),
-            trust_level: TrustLevel::DiscoveryContextVerified,
+            trust_level: TrustLevel::HandleRegistryVerified,
             resolution_path: ResolutionPath {
-                layer: ResolutionLayer::DiscoveryContext,
+                layer: ResolutionLayer::HandleRegistry,
                 source: "handle_registry".to_owned(),
                 source_id: Some("ctx-abc".to_owned()),
                 resolved_at: 2_000_000,
@@ -426,8 +426,8 @@ mod tests {
         assert_eq!(json["context_id"], "ctx-abc");
         assert_eq!(json["relay_urls"][0], "wss://relay.example.com");
         assert_eq!(json["mode"], "open");
-        assert_eq!(json["trust_level"]["kind"], "DiscoveryContextVerified");
-        assert_eq!(json["resolution_path"]["layer"], "DiscoveryContext");
+        assert_eq!(json["trust_level"]["kind"], "HandleRegistryVerified");
+        assert_eq!(json["resolution_path"]["layer"], "HandleRegistry");
         assert_eq!(json["resolution_path"]["source_id"], "ctx-abc");
     }
 
@@ -454,8 +454,8 @@ mod tests {
             "AttestationVerified"
         );
         assert_eq!(
-            trust_level_to_json(&TrustLevel::DiscoveryContextVerified)["kind"],
-            "DiscoveryContextVerified"
+            trust_level_to_json(&TrustLevel::HandleRegistryVerified)["kind"],
+            "HandleRegistryVerified"
         );
     }
 
@@ -491,7 +491,7 @@ mod tests {
     fn resolution_path_to_json_all_layers() {
         let layers = [
             (ResolutionLayer::Petname, "Petname"),
-            (ResolutionLayer::DiscoveryContext, "DiscoveryContext"),
+            (ResolutionLayer::HandleRegistry, "HandleRegistry"),
             (ResolutionLayer::Attestation, "Attestation"),
             (ResolutionLayer::Domain, "Domain"),
             (
@@ -628,10 +628,10 @@ mod tests {
                 resolution_path,
             } => {
                 assert_eq!(did.to_string(), "did:dht:zalice");
-                assert!(matches!(trust_level, TrustLevel::DiscoveryContextVerified));
+                assert!(matches!(trust_level, TrustLevel::HandleRegistryVerified));
                 assert!(matches!(
                     resolution_path.layer,
-                    ResolutionLayer::DiscoveryContext
+                    ResolutionLayer::HandleRegistry
                 ));
                 assert_eq!(resolution_path.source, "local_registry");
                 assert_eq!(resolution_path.source_id.as_deref(), Some("ctx-test"));
@@ -666,7 +666,7 @@ mod tests {
                 assert_eq!(context_id, "ctx-target");
                 assert_eq!(relay_urls, vec!["wss://relay.example.com"]);
                 assert!(mode.is_none());
-                assert!(matches!(trust_level, TrustLevel::DiscoveryContextVerified));
+                assert!(matches!(trust_level, TrustLevel::HandleRegistryVerified));
                 assert_eq!(resolution_path.source_id.as_deref(), Some("ctx-src"));
                 assert_eq!(resolution_path.resolved_at, 1234);
             }

@@ -164,6 +164,16 @@
 - Error codes 2070-2075: clean, no collisions
 - Pattern: WASM reimplementations of scp-core validators consistently miss defensive checks that the core version has. Always diff WASM vs core line-by-line when reimplementing.
 
+### fix/audit-remaining-findings (2026-03-20)
+- Zeroizing removal from signature bytes (NAPI/PyO3/WASM context.rs): CORRECT -- signatures are public values, not secrets. No security regression.
+- RevocationStatus type safety (TypeScript/Swift/Kotlin): CORRECT. TypeScript _fromBridgeValue handles Rust enum variants {"Revoked":{revoked_at,reason}} and "Active" string. Edge case: bare "revoked" string throws (correct, prevents silent data loss). No active/revoked confusion path.
+- Attestation CRUD in Swift/Kotlin/TypeScript: all 4 ops (create/list/remove/renew) guarded with "not yet available" errors + SCP-ATTEST-9001..9005 codes. Bridge function check in TS uses runtime property lookup (correct pattern).
+- BootstrapConfig: DiscoveryContext -> HandleRegistry rename + BootstrapContextEntry adds expected_creator_did field. Docs clearly state callers MUST verify post-join (NOT enforced in resolver itself -- acceptable, documented).
+- WASM manager.rs: maxChainDepth clamped to 32, sessionCap clamped to 10_000. Defense-in-depth good.
+- Context import TOCTOU gap: re-check under lock at step 7. Correct fix.
+- RUSTSEC-2026-0044/0048/0049 (aws-lc-sys): suppressed as transitive, awaiting upstream. Appropriate.
+- MEDIUM REMAINING: BootstrapConfig bootstrap resolver doesn't enforce expected_creator_did -- intentional but documentation-only guarantee. If callers skip post-join verification, Sybil attack vector remains.
+
 ### P0 Audit Batch 1 Review (2026-03-19) -- fix/audit-batch-1-p0-blockers
 - FIXES VERIFIED: #1418 (WASM event tags), #1419 (ceiling escalation), #1420 (phantom events), #1431 (pseudonym oracle), #1470 (atomic writes)
 - REMAINING HIGH: SqliteKeyCustody pseudonym oracle (same as #1431 but unfixed)

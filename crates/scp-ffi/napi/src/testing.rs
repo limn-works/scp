@@ -23,14 +23,25 @@ use crate::error::ScpNapiError;
 // Shared network
 // ---------------------------------------------------------------------------
 
-/// Returns the shared `FullStackNetwork` instance.
+/// Guards the shared `FullStackNetwork` instance.
+///
+/// Uses `Mutex<Option<...>>` instead of `OnceLock` so tests can reset
+/// the network between runs (preventing cross-test state leakage).
+static NETWORK: std::sync::Mutex<Option<FullStackNetwork>> = std::sync::Mutex::new(None);
+
+/// Returns a reference-counted handle to the shared `FullStackNetwork`.
 ///
 /// All nodes created via `fullstack_create_node` share the same `KeyExchange`
 /// so Welcome messages and sender keys can be exchanged between them.
-fn shared_network() -> &'static FullStackNetwork {
-    use std::sync::OnceLock;
-    static NETWORK: OnceLock<FullStackNetwork> = OnceLock::new();
-    NETWORK.get_or_init(FullStackNetwork::new)
+fn with_network<F, R>(f: F) -> R
+where
+    F: FnOnce(&FullStackNetwork) -> R,
+{
+    let mut guard = NETWORK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let network = guard.get_or_insert_with(FullStackNetwork::new);
+    f(network)
 }
 
 /// Returns a permissive key resolver that always returns `None`.
@@ -78,12 +89,24 @@ impl NapiFullStackNode {
 #[must_use]
 #[napi]
 pub fn fullstack_create_node(did: String) -> NapiFullStackNode {
-    let network = shared_network();
-    let node = network.create_node(&did, permissive_key_resolver());
-    NapiFullStackNode {
-        inner: node,
-        handles: Mutex::new(HashMap::new()),
-    }
+    with_network(|network| {
+        let node = network.create_node(&did, permissive_key_resolver());
+        NapiFullStackNode {
+            inner: node,
+            handles: Mutex::new(HashMap::new()),
+        }
+    })
+}
+
+/// Resets the shared `FullStackNetwork`, dropping all nodes and state.
+///
+/// Call between test suites to prevent cross-test state leakage.
+#[napi]
+pub fn fullstack_reset_network() {
+    let mut guard = NETWORK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    *guard = None;
 }
 
 /// Creates an encrypted context owned by the given node.
@@ -239,6 +262,18 @@ pub fn fullstack_join_from_welcome(
         })
     })?;
 
+    // Step 2b: Regenerate the joiner's sender key and distribute it to
+    // existing members. The key from create_context was for the throwaway
+    // MLS group and is now stale.
+    node.inner
+        .regenerate_and_distribute_sender_key(&ctx_bytes)
+        .map_err(|e| {
+            napi::Error::from(ScpNapiError::Crypto {
+                message: format!("failed to distribute joiner sender key: {e}"),
+                code: "SCP-CRYPTO-4060".to_owned(),
+            })
+        })?;
+
     // Step 3: Store the handle so subsequent operations can retrieve it.
     {
         let mut handles = node
@@ -348,6 +383,15 @@ pub fn fullstack_send_message(
         return Err(napi::Error::from(ScpNapiError::Crypto {
             message: "no ciphertext captured after send".to_owned(),
             code: "SCP-CRYPTO-4053".to_owned(),
+        }));
+    }
+    if sent.len() > 1 {
+        return Err(napi::Error::from(ScpNapiError::Crypto {
+            message: format!(
+                "expected 1 ciphertext after send, got {} — send_message should produce exactly one",
+                sent.len()
+            ),
+            code: "SCP-CRYPTO-4055".to_owned(),
         }));
     }
 

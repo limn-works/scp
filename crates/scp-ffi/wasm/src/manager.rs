@@ -1859,7 +1859,8 @@ impl WasmContextManager {
             .get("maxChainDepth")
             .and_then(serde_json::Value::as_u64)
             .and_then(|v| u8::try_from(v).ok())
-            .unwrap_or(crate::provenance::DEFAULT_MAX_CHAIN_DEPTH);
+            .unwrap_or(crate::provenance::DEFAULT_MAX_CHAIN_DEPTH)
+            .min(32);
         if chain_depth > max_chain_depth {
             return Err(ScpWasmError::Tool {
                 message: format!(
@@ -1958,7 +1959,8 @@ impl WasmContextManager {
             .get("sessionCap")
             .and_then(serde_json::Value::as_u64)
             .and_then(|v| usize::try_from(v).ok())
-            .unwrap_or(WASM_SESSION_CAP_PER_CALLER);
+            .unwrap_or(WASM_SESSION_CAP_PER_CALLER)
+            .min(10_000);
         let current = ctx
             .sessions
             .values()

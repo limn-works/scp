@@ -590,7 +590,7 @@ export type TrustLevel =
   | { readonly kind: "LocalPetname" }
   | { readonly kind: "DomainVerified" }
   | { readonly kind: "AttestationVerified" }
-  | { readonly kind: "DiscoveryContextVerified" }
+  | { readonly kind: "HandleRegistryVerified" }
   | { readonly kind: "MultiLayerCorroborated"; readonly sources: readonly ResolutionPath[] };
 
 /**
@@ -602,7 +602,7 @@ export type TrustLevel =
  */
 export type ResolutionLayer =
   | "Petname"
-  | "DiscoveryContext"
+  | "HandleRegistry"
   | "Attestation"
   | "Domain"
   | "MultiLayerCorroborated";
@@ -620,7 +620,7 @@ export interface ResolutionPath {
   readonly layer: ResolutionLayer;
   /** Human-readable source identifier (context name, domain, platform). */
   readonly source: string;
-  /** Context ID (hex), present only for the `DiscoveryContext` layer. */
+  /** Context ID (hex), present only for the `HandleRegistry` layer. */
   readonly sourceId: string | null;
   /** Unix timestamp (seconds) when resolution occurred. */
   readonly resolvedAt: number;

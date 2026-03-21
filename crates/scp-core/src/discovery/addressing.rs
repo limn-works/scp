@@ -116,7 +116,7 @@ pub enum TrustLevel {
     /// Cryptographically signed, platform-dependent verification.
     AttestationVerified,
     /// Community-governed, context controls binding.
-    DiscoveryContextVerified,
+    HandleRegistryVerified,
 }
 
 impl TrustLevel {
@@ -133,7 +133,7 @@ impl TrustLevel {
             Self::MultiLayerCorroborated { .. } => 4,
             Self::DomainVerified => 3,
             Self::AttestationVerified => 2,
-            Self::DiscoveryContextVerified => 1,
+            Self::HandleRegistryVerified => 1,
         }
     }
 }
@@ -154,7 +154,7 @@ pub struct ResolutionPath {
     pub layer: ResolutionLayer,
     /// Human-readable source identifier (context name, domain, platform).
     pub source: String,
-    /// Context ID (hex), present only for the `DiscoveryContext` layer.
+    /// Context ID (hex), present only for the `HandleRegistry` layer.
     pub source_id: Option<String>,
     /// Unix timestamp (seconds) when resolution occurred.
     pub resolved_at: u64,
@@ -166,7 +166,7 @@ pub enum ResolutionLayer {
     /// Resolved via local petname lookup.
     Petname,
     /// Resolved via context handle lookup.
-    DiscoveryContext,
+    HandleRegistry,
     /// Resolved via attestation-backed handle reverse-lookup.
     Attestation,
     /// Resolved via domain `.well-known/scp` handles map.
@@ -831,7 +831,7 @@ fn shortest_ttl_for_results(results: &[AddressResolution]) -> Duration {
         let ttl = match result.resolution_path().layer {
             ResolutionLayer::Petname => PETNAME_CACHE_TTL,
             ResolutionLayer::Domain => DOMAIN_HANDLE_CACHE_TTL,
-            ResolutionLayer::DiscoveryContext | ResolutionLayer::MultiLayerCorroborated => {
+            ResolutionLayer::HandleRegistry | ResolutionLayer::MultiLayerCorroborated => {
                 DISCOVERY_HANDLE_CACHE_TTL
             }
             ResolutionLayer::Attestation => ATTESTATION_HANDLE_CACHE_TTL,
@@ -1017,7 +1017,7 @@ mod tests {
         );
         assert!(
             TrustLevel::AttestationVerified.default_rank()
-                > TrustLevel::DiscoveryContextVerified.default_rank()
+                > TrustLevel::HandleRegistryVerified.default_rank()
         );
     }
 
@@ -1070,9 +1070,9 @@ mod tests {
     fn address_resolution_identity_accessors() {
         let resolution = AddressResolution::Identity {
             did: DID::from("did:dht:zAlice"),
-            trust_level: TrustLevel::DiscoveryContextVerified,
+            trust_level: TrustLevel::HandleRegistryVerified,
             resolution_path: ResolutionPath {
-                layer: ResolutionLayer::DiscoveryContext,
+                layer: ResolutionLayer::HandleRegistry,
                 source: "cooking-community".to_owned(),
                 source_id: Some("ctx-001".to_owned()),
                 resolved_at: 1_700_000_000,
@@ -1081,11 +1081,11 @@ mod tests {
 
         assert_eq!(
             *resolution.trust_level(),
-            TrustLevel::DiscoveryContextVerified
+            TrustLevel::HandleRegistryVerified
         );
         assert_eq!(
             resolution.resolution_path().layer,
-            ResolutionLayer::DiscoveryContext
+            ResolutionLayer::HandleRegistry
         );
     }
 
@@ -1115,9 +1115,9 @@ mod tests {
         let results = vec![
             AddressResolution::Identity {
                 did: DID::from("did:dht:zAlice"),
-                trust_level: TrustLevel::DiscoveryContextVerified,
+                trust_level: TrustLevel::HandleRegistryVerified,
                 resolution_path: ResolutionPath {
-                    layer: ResolutionLayer::DiscoveryContext,
+                    layer: ResolutionLayer::HandleRegistry,
                     source: "cooking".to_owned(),
                     source_id: Some("ctx-1".to_owned()),
                     resolved_at: 1_700_000_000,
@@ -1151,9 +1151,9 @@ mod tests {
     fn corroborate_results_leaves_single_path_unchanged() {
         let results = vec![AddressResolution::Identity {
             did: DID::from("did:dht:zAlice"),
-            trust_level: TrustLevel::DiscoveryContextVerified,
+            trust_level: TrustLevel::HandleRegistryVerified,
             resolution_path: ResolutionPath {
-                layer: ResolutionLayer::DiscoveryContext,
+                layer: ResolutionLayer::HandleRegistry,
                 source: "cooking".to_owned(),
                 source_id: Some("ctx-1".to_owned()),
                 resolved_at: 1_700_000_000,
@@ -1164,7 +1164,7 @@ mod tests {
         assert_eq!(corroborated.len(), 1);
         assert_eq!(
             *corroborated[0].trust_level(),
-            TrustLevel::DiscoveryContextVerified
+            TrustLevel::HandleRegistryVerified
         );
     }
 
@@ -1237,9 +1237,9 @@ mod tests {
                 .or_default()
                 .push(AddressResolution::Identity {
                     did: DID::from(did),
-                    trust_level: TrustLevel::DiscoveryContextVerified,
+                    trust_level: TrustLevel::HandleRegistryVerified,
                     resolution_path: ResolutionPath {
-                        layer: ResolutionLayer::DiscoveryContext,
+                        layer: ResolutionLayer::HandleRegistry,
                         source: scope_name.to_owned(),
                         source_id: Some(context_id.to_owned()),
                         resolved_at: 1_700_000_000,
@@ -1335,7 +1335,7 @@ mod tests {
         assert_eq!(results.len(), 1);
         assert!(matches!(
             &results[0],
-            AddressResolution::Identity { did, trust_level: TrustLevel::DiscoveryContextVerified, .. }
+            AddressResolution::Identity { did, trust_level: TrustLevel::HandleRegistryVerified, .. }
             if did == "did:dht:zAlice"
         ));
     }

@@ -498,7 +498,7 @@ pub fn template_params(template_id: &TemplateId) -> ContextParams {
         // Context: encrypted mode with messaging + tool invocation
         // ceiling. Discoverable by default so it can be found via DHT. Used
         // to bootstrap agent discovery via standardized tool schemas (ADR-020).
-        TemplateId::DiscoveryContext => ContextParams {
+        TemplateId::HandleRegistry => ContextParams {
             mode: ContextMode::Encrypted,
             ceiling: messaging_tool_invoke_ban_ceiling(),
             ceiling_policy: CeilingPolicy::Immutable,
@@ -508,7 +508,7 @@ pub fn template_params(template_id: &TemplateId) -> ContextParams {
             ttl: None,
             memory_scope: MemoryScope::Full,
             governance: GovernanceModel::SingleAdmin,
-            template_id: Some(TemplateId::DiscoveryContext),
+            template_id: Some(TemplateId::HandleRegistry),
             economic_policy: None,
             metadata_visibility: MetadataVisibilityPolicy::default(),
             projection_policy: None,
@@ -568,7 +568,7 @@ const fn ttl_policy(template_id: TemplateId) -> TtlPolicy {
         | TemplateId::ToolInterfaceTemplate
         | TemplateId::PaidService
         | TemplateId::PaidBroadcast
-        | TemplateId::DiscoveryContext => TtlPolicy::Optional,
+        | TemplateId::HandleRegistry => TtlPolicy::Optional,
     }
 }
 
@@ -1308,7 +1308,7 @@ mod tests {
             TemplateId::ToolInterfaceTemplate,
             TemplateId::PaidService,
             TemplateId::PaidBroadcast,
-            TemplateId::DiscoveryContext,
+            TemplateId::HandleRegistry,
         ];
         for variant in &variants {
             let params = template_params(variant);
@@ -1400,7 +1400,7 @@ mod tests {
             ContextMode::Encrypted
         );
         assert_eq!(
-            template_params(&TemplateId::DiscoveryContext).mode,
+            template_params(&TemplateId::HandleRegistry).mode,
             ContextMode::Encrypted
         );
     }
@@ -1445,7 +1445,7 @@ mod tests {
             TemplateId::ToolInterfaceTemplate,
             TemplateId::PaidService,
             TemplateId::PaidBroadcast,
-            TemplateId::DiscoveryContext,
+            TemplateId::HandleRegistry,
         ];
         for variant in &variants {
             let from_method = ContextParams::from_template(*variant);
@@ -1947,7 +1947,7 @@ mod tests {
             TemplateId::GroupDiscussion,
             TemplateId::ToolInterfaceTemplate,
             TemplateId::PaidService,
-            TemplateId::DiscoveryContext,
+            TemplateId::HandleRegistry,
         ];
         for tid in &encrypted_templates {
             let params = template_params(tid);
@@ -2073,7 +2073,7 @@ mod tests {
             TemplateId::GroupDiscussion,
             TemplateId::ToolInterfaceTemplate,
             TemplateId::PaidService,
-            TemplateId::DiscoveryContext,
+            TemplateId::HandleRegistry,
         ];
         for tid in &encrypted_templates {
             let params = template_params(tid);

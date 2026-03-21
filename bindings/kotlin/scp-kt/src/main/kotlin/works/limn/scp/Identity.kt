@@ -10,6 +10,13 @@
 
 package works.limn.scp
 
+import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.JsonObject
+import kotlinx.serialization.json.jsonArray
+import kotlinx.serialization.json.jsonObject
+import kotlinx.serialization.json.jsonPrimitive
+import kotlinx.serialization.json.long
+import kotlinx.serialization.json.longOrNull
 import works.limn.scp.bridge.BridgeException
 import works.limn.scp.bridge.CoroutineBridge
 
@@ -262,6 +269,39 @@ class IdentityAdvancedBridge internal constructor(
 // ---------------------------------------------------------------------------
 
 /**
+ * Revocation status for an identity attestation (§3.5).
+ *
+ * Mirrors the Rust `RevocationStatus` enum:
+ *
+ * - `Active` -> [RevocationStatus.Active]
+ * - `Revoked { revoked_at, reason }` -> [RevocationStatus.Revoked]
+ *
+ * Provenance: §3.5 (Identity Link Attestations)
+ */
+sealed class RevocationStatus {
+    /** The status string: `"active"` or `"revoked"`. Internal — use pattern matching. */
+    internal abstract val status: String
+
+    /** The attestation is active and valid. */
+    data object Active : RevocationStatus() {
+        override val status: String = "active"
+    }
+
+    /**
+     * The attestation has been revoked.
+     *
+     * @property revokedAt Unix timestamp (seconds) when revoked (integer precision).
+     * @property reason Optional human-readable revocation reason.
+     */
+    data class Revoked(
+        val revokedAt: Long,
+        val reason: String? = null,
+    ) : RevocationStatus() {
+        override val status: String = "revoked"
+    }
+}
+
+/**
  * An identity link attestation binding a DID to an external platform (§3.5).
  *
  * Represents a cryptographically signed claim that the DID owner also
@@ -277,7 +317,7 @@ class IdentityAdvancedBridge internal constructor(
  * @property platformHandle Platform handle or username.
  * @property verificationMethod DID verification method that signed this attestation.
  * @property verifiedAt Unix timestamp (seconds) when the evidence was last verified.
- * @property revocationStatus Revocation status: `"active"`, `"revoked"`, or `"expired"`.
+ * @property revocationStatus Revocation status.
  * @property platformId Optional platform-assigned unique identifier.
  */
 data class IdentityAttestation(
@@ -285,10 +325,45 @@ data class IdentityAttestation(
     val platform: String,
     val platformHandle: String,
     val verificationMethod: String,
-    val verifiedAt: Double,
-    val revocationStatus: String = "active",
+    val verifiedAt: Long,
+    val revocationStatus: RevocationStatus = RevocationStatus.Active,
     val platformId: String? = null,
-)
+) {
+    internal companion object {
+        /** Parse an [IdentityAttestation] from a bridge JSON object. */
+        fun fromJsonObject(obj: JsonObject): IdentityAttestation {
+            val rsElement = obj["revocation_status"]
+            val revocationStatus = when {
+                rsElement == null -> RevocationStatus.Active
+                rsElement is JsonObject && rsElement.containsKey("Revoked") -> {
+                    val revoked = rsElement["Revoked"]!!.jsonObject
+                    RevocationStatus.Revoked(
+                        revokedAt = revoked["revoked_at"]!!.jsonPrimitive.long,
+                        reason = revoked["reason"]?.jsonPrimitive?.content,
+                    )
+                }
+                else -> RevocationStatus.Active
+            }
+            return IdentityAttestation(
+                id = obj["id"]!!.jsonPrimitive.content,
+                platform = obj["platform"]!!.jsonPrimitive.content,
+                platformHandle = obj["platform_handle"]!!.jsonPrimitive.content,
+                verificationMethod = obj["verification_method"]!!.jsonPrimitive.content,
+                verifiedAt = obj["verified_at"]!!.jsonPrimitive.content.toLong(),
+                revocationStatus = revocationStatus,
+                platformId = obj["platform_id"]?.jsonPrimitive?.content,
+            )
+        }
+
+        /** Parse an [IdentityAttestation] from a bridge JSON string. */
+        fun fromJson(json: String): IdentityAttestation =
+            fromJsonObject(Json.parseToJsonElement(json).jsonObject)
+
+        /** Parse a list of [IdentityAttestation] from a bridge JSON array string. */
+        fun listFromJson(json: String): List<IdentityAttestation> =
+            Json.parseToJsonElement(json).jsonArray.map { fromJsonObject(it.jsonObject) }
+    }
+}
 
 /**
  * Native binding functions for identity link attestation operations.
@@ -380,7 +455,7 @@ class IdentityAttestationBridge internal constructor(
      * @param handle Platform-specific handle.
      * @param proof Platform-specific proof of ownership.
      * @param platformId Optional platform-assigned unique identifier.
-     * @return JSON string with the created attestation.
+     * @return The created [IdentityAttestation].
      */
     suspend fun createAttestation(
         did: String,
@@ -388,19 +463,23 @@ class IdentityAttestationBridge internal constructor(
         handle: String,
         proof: String,
         platformId: String? = null,
-    ): String =
-        bridge.ffiCall {
+    ): IdentityAttestation {
+        val json = bridge.ffiCall {
             bindings.identityCreateAttestation(did, platform, handle, proof, platformId)
         }
+        return IdentityAttestation.fromJson(json)
+    }
 
     /**
      * Lists all identity link attestations for a DID.
      *
      * @param did The DID to list attestations for.
-     * @return JSON array string of attestation objects.
+     * @return List of [IdentityAttestation] objects.
      */
-    suspend fun listAttestations(did: String): String =
-        bridge.ffiCall { bindings.identityListAttestations(did) }
+    suspend fun listAttestations(did: String): List<IdentityAttestation> {
+        val json = bridge.ffiCall { bindings.identityListAttestations(did) }
+        return IdentityAttestation.listFromJson(json)
+    }
 
     /**
      * Removes an identity link attestation by ID.
@@ -422,13 +501,15 @@ class IdentityAttestationBridge internal constructor(
      *
      * @param did The DID that owns the attestation.
      * @param attestationId The attestation ID to renew.
-     * @return JSON string with the renewed attestation.
+     * @return The renewed [IdentityAttestation].
      */
     suspend fun renewAttestation(
         did: String,
         attestationId: String,
-    ): String =
-        bridge.ffiCall {
+    ): IdentityAttestation {
+        val json = bridge.ffiCall {
             bindings.identityRenewAttestation(did, attestationId)
         }
+        return IdentityAttestation.fromJson(json)
+    }
 }

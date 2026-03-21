@@ -2268,11 +2268,28 @@ impl ContextManager {
         };
 
         // 7. Register the context.
-        //    Existence was already checked at step 2 — if the context was
-        //    replaceable its crypto state was cleaned up there. Here we just
-        //    remove the stale entry (if any) and insert the new one.
+        //    Re-check replaceability under the lock to close the TOCTOU gap
+        //    between step 2 (which dropped the lock for event log import) and
+        //    this insertion. A concurrent `create_context` or `import_context`
+        //    could have registered an Active context in the meantime.
         {
             let mut contexts = self.contexts.lock().await;
+            if let Some(existing) = contexts.get(&context_id) {
+                let is_replaceable = existing.handle.try_read_state().is_some_and(|s| {
+                    matches!(
+                        s,
+                        ContextState::Closing
+                            | ContextState::Closed
+                            | ContextState::Expired
+                            | ContextState::Tombstoned
+                    )
+                });
+                if !is_replaceable {
+                    return Err(ContextError::MembershipFailed(format!(
+                        "context '{context_id}' was concurrently registered during import"
+                    )));
+                }
+            }
             contexts.remove(&context_id);
             contexts.insert(context_id.clone(), per_context);
         }

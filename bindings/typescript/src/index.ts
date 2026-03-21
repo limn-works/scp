@@ -40,7 +40,7 @@ export { scpidChallenge, scpidSign, scpidVerify } from "./auth";
 // ---------------------------------------------------------------------------
 
 export type { CustodyType, IdentityAttestationData } from "./identity";
-export { Identity, IdentityAttestation } from "./identity";
+export { Identity, IdentityAttestation, RevocationStatus } from "./identity";
 
 // ---------------------------------------------------------------------------
 // Context
