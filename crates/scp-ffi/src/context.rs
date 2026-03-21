@@ -1164,14 +1164,13 @@ fn py_context_close(handle: &PyContextHandle, identity_did: &str) -> PyResult<()
         });
         // Propagate errors unless the context was already removed from
         // ContextManager (idempotent — e.g. all members left). The
-        // "not registered" error is safe to ignore.
-        if let Err(ref e) = close_result {
-            let msg = e.to_string();
-            if !msg.contains("not registered") && !msg.contains("context not found") {
-                return Err(PyRuntimeError::new_err(format!(
-                    "ContextManager close_context failed: {e}"
-                )));
-            }
+        // ContextNotRegistered error is safe to ignore.
+        if let Err(ref e) = close_result
+            && !matches!(e, scp_core::context::ContextError::ContextNotRegistered(_))
+        {
+            return Err(PyRuntimeError::new_err(format!(
+                "ContextManager close_context failed: {e}"
+            )));
         }
     }
 
@@ -1238,43 +1237,6 @@ fn py_context_send(
     let context_id = handle.context_id.clone();
     let identity_did_owned = identity_did.to_owned();
     let rt = crate::runtime()?;
-
-    // Create a real inner envelope using the retained KeyCustody for signing.
-    // This validates that the identity's active signing key can produce a
-    // valid Ed25519 signature over the message. See SCP-214 criterion 6.
-    crate::runtime::with_identity(&identity_did_owned, |entry| {
-        let now_ms = scp_core::time::now_millis()
-            .map_err(|e| crate::error::ScpPyError::context(format!("{e}")))?;
-
-        let inner_result = rt.block_on(async {
-            let params = scp_core::envelope::InnerEnvelopeParams {
-                version: scp_core::envelope::inner::SCP_INNER_ENVELOPE_VERSION,
-                context_id: &context_id,
-                sender_did: &identity_did_owned,
-                epoch: 0,
-                generation: 0,
-                sequence: 0,
-                timestamp: now_ms,
-                message_type: scp_core::envelope::MessageType::Content,
-                payload: &payload_bytes,
-                provenance: None,
-                signing_key_id: scp_identity::SigningKeyId::Active,
-            };
-            scp_core::envelope::create_inner_envelope(
-                &params,
-                entry.custody.as_ref(),
-                &entry.identity.active_signing_key,
-            )
-            .await
-        });
-
-        inner_result.map_err(|e| {
-            crate::error::ScpPyError::context(format!("inner envelope creation failed: {e}"))
-        })?;
-
-        Ok(())
-    })
-    .map_err(|e: crate::error::ScpPyError| -> PyErr { e.into() })?;
 
     // Delegate to ContextManager for message delivery through the transport.
     let context_id_for_drain = context_id.clone();

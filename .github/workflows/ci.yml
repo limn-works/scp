@@ -159,6 +159,10 @@ jobs:
           # XCFramework, Android .aar) MUST NOT enable this feature.
           # See GitHub issue #88.
           cargo nextest run --workspace --features scp-ffi-uniffi/allow_in_memory_custody,scp-ffi/allow_in_memory_custody,scp-ffi-napi/allow_in_memory_custody,scp-core/testing
+          # Test scp-transport with optional features that aren't enabled by
+          # --workspace (combined includes rusqlite + scp-platform; local-cache
+          # enables caching logic).
+          cargo test -p scp-transport --features combined,local-cache
 
   rust-doc:
     needs: changes

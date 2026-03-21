@@ -387,6 +387,12 @@ pub enum ContextError {
     #[error("creation failed: {0}")]
     CreationFailed(String),
 
+    /// An operation was attempted on a context that is not registered with
+    /// the [`ContextManager`]. This typically means the context was never
+    /// created, was already closed, or the ID is incorrect.
+    #[error("context not registered: {0}")]
+    ContextNotRegistered(String),
+
     /// The local SDK's protocol version does not meet the context's minimum
     /// protocol version requirement (spec §13.4).
     ///

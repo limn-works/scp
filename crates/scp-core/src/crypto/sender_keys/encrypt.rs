@@ -52,6 +52,7 @@ pub fn encrypt_sender_layer(
     epoch: u64,
     sequence: u64,
 ) -> Result<Vec<u8>, SenderKeyError> {
+    let _span = tracing::info_span!("encrypt_sender_layer", context_id, epoch, sequence).entered();
     let cipher = Aes256Gcm::new_from_slice(sender_key.as_bytes())
         .map_err(|e| SenderKeyError::EncryptionFailed(e.to_string()))?;
 
@@ -98,6 +99,7 @@ pub fn decrypt_sender_layer(
     epoch: u64,
     sequence: u64,
 ) -> Result<Vec<u8>, SenderKeyError> {
+    let _span = tracing::info_span!("decrypt_sender_layer", context_id, epoch, sequence).entered();
     if ciphertext.len() < NONCE_SIZE {
         return Err(SenderKeyError::CiphertextTooShort {
             actual: ciphertext.len(),

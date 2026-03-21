@@ -7053,7 +7053,7 @@ pub async fn finalize_close(handle: Arc<ContextHandle>) -> Result<(), ScpError> 
 ///
 /// # Errors
 ///
-/// Returns `ScpError::Context` (SCP-CTX-2062) if checkpoint creation fails.
+/// Returns `ScpError::Context` (SCP-CTX-2066) if checkpoint creation fails.
 #[uniffi::export]
 #[allow(clippy::too_many_arguments)]
 pub async fn create_governance_checkpoint(
@@ -7075,7 +7075,7 @@ pub async fn create_governance_checkpoint(
         Zeroizing::new(
             hex::decode(&creator_signature_hex).map_err(|e| ScpError::Validation {
                 msg: format!("invalid creator_signature hex: {e}"),
-                code: "SCP-CTX-2062".to_owned(),
+                code: "SCP-CTX-2066".to_owned(),
             })?,
         );
     let did = scp_identity::DID(creator_did);
@@ -7099,13 +7099,13 @@ pub async fn create_governance_checkpoint(
 
             serde_json::to_string(&checkpoint).map_err(|e| ScpError::Context {
                 msg: format!("serialization failed: {e}"),
-                code: "SCP-CTX-2062".to_owned(),
+                code: "SCP-CTX-2066".to_owned(),
             })
         })
         .await
         .map_err(|e| ScpError::Context {
             msg: format!("tokio task join error during create_governance_checkpoint: {e}"),
-            code: "SCP-CTX-2062".to_owned(),
+            code: "SCP-CTX-2066".to_owned(),
         })?
 }
 
@@ -7239,11 +7239,11 @@ pub async fn restore_all_contexts() -> Result<String, ScpError> {
 fn parse_uniffi_hex_32(hex_str: &str, field_name: &str) -> Result<[u8; 32], ScpError> {
     let bytes = hex::decode(hex_str).map_err(|e| ScpError::Validation {
         msg: format!("invalid {field_name} hex: {e}"),
-        code: "SCP-CTX-2062".to_owned(),
+        code: "SCP-CTX-2066".to_owned(),
     })?;
     bytes.try_into().map_err(|v: Vec<u8>| ScpError::Validation {
         msg: format!("{field_name} must be 32 bytes, got {}", v.len()),
-        code: "SCP-CTX-2062".to_owned(),
+        code: "SCP-CTX-2066".to_owned(),
     })
 }
 
@@ -9058,7 +9058,7 @@ fn uniffi_append_provenance_event(
     .unwrap_or_else(|| {
         Err(ScpError::Context {
             msg: format!("context '{context_id}' not found in UCAN state registry"),
-            code: "SCP-CTX-2061".to_owned(),
+            code: "SCP-CTX-2066".to_owned(),
         })
     })
 }

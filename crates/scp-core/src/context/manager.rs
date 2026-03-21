@@ -55,6 +55,7 @@ use crate::crypto::ucan::validate::{
 use crate::economy::budget::MemberBudgetTracker;
 use crate::economy::types::EconomicPolicy;
 use scp_identity::DID;
+use tracing::instrument;
 use zeroize::Zeroizing;
 
 // ---------------------------------------------------------------------------
@@ -78,6 +79,13 @@ const MAX_THRESHOLD_SIGNERS: usize = 64;
 ///
 /// Spec §5.3.2: "A mandatory notification period of 72 hours begins."
 const CEILING_CHANGE_NOTIFICATION_PERIOD_SECS: u64 = 259_200; // 72 hours
+
+/// TTL for `executed_proposals` entries in seconds (14 days).
+///
+/// Entries older than this are evicted on each insert to prevent unbounded
+/// growth. 14 days is generous — governance proposals are typically resolved
+/// within hours, so a 14-day window provides ample replay protection.
+const EXECUTED_PROPOSALS_TTL_SECS: u64 = 14 * 24 * 60 * 60; // 14 days
 
 // ---------------------------------------------------------------------------
 // Welcome event helper
@@ -623,9 +631,11 @@ struct PerContextState {
     /// `None` for `ContextMode::Encrypted`. Broadcast contexts do not use MLS;
     /// they use per-author AES-256-GCM keys managed by [`BroadcastContext`].
     broadcast_context: Option<BroadcastContext>,
-    /// Proposal IDs that have already been executed. Prevents replay of
-    /// approved governance proposals (defense-in-depth).
-    executed_proposals: HashSet<ProposalId>,
+    /// Proposal IDs that have already been executed, mapped to the unix
+    /// timestamp (seconds) when they were marked executed. Prevents replay of
+    /// approved governance proposals (defense-in-depth). Entries older than
+    /// [`EXECUTED_PROPOSALS_TTL_SECS`] are evicted on each insert.
+    executed_proposals: HashMap<ProposalId, u64>,
     /// Dynamically registered tools (beyond initial `ContextParams.tools`).
     registered_tools: Vec<ToolRegistration>,
     /// Members whose write access has been governance-revoked (ADR-031).
@@ -1586,7 +1596,7 @@ impl ContextManager {
             context_params: ctx.handle.params().clone(),
             membership: ctx.membership.clone(),
             role_state: ctx.role_state.clone(),
-            executed_proposals: ctx.executed_proposals.clone(),
+            executed_proposals: ctx.executed_proposals.keys().copied().collect(),
             ttl_remaining_secs,
             registered_tools: ctx.registered_tools.clone(),
             write_revoked_members: ctx.write_revoked_members.clone(),
@@ -1675,6 +1685,7 @@ impl ContextManager {
     ///
     /// Returns [`ContextError::PersistenceFailed`] if no persisted state
     /// exists. Returns [`ContextError::MembershipFailed`] if the context
+    #[instrument(skip_all, fields(context_id))]
     pub async fn restore_context(
         &self,
         context_id: &str,
@@ -1731,7 +1742,14 @@ impl ContextManager {
             ttl_timer: TtlTimer::new(),
             ttl_extension: None,
             broadcast_context: broadcast_ctx,
-            executed_proposals: ctx_snapshot.executed_proposals,
+            executed_proposals: {
+                let now = crate::time::now_secs().unwrap_or(0);
+                ctx_snapshot
+                    .executed_proposals
+                    .into_iter()
+                    .map(|id| (id, now))
+                    .collect()
+            },
             registered_tools: ctx_snapshot.registered_tools,
             write_revoked_members: ctx_snapshot.write_revoked_members,
             read_revoked_members: ctx_snapshot.read_revoked_members,
@@ -1798,6 +1816,7 @@ impl ContextManager {
     /// processing the key request.
     ///
     /// Registering the same DID multiple times is idempotent.
+    #[instrument(skip_all)]
     pub async fn register_local_did(&self, did: DID) {
         self.local_dids.write().await.insert(did);
     }
@@ -1805,6 +1824,7 @@ impl ContextManager {
     /// Returns `true` if the given DID is registered as locally controlled.
     ///
     /// This is a read-only query useful for diagnostics and testing.
+    #[instrument(skip_all)]
     pub async fn is_local_did(&self, did: &DID) -> bool {
         self.local_dids.read().await.contains(did)
     }
@@ -1824,12 +1844,13 @@ impl ContextManager {
     ///
     /// # Errors
     ///
-    /// - [`ContextError::MembershipFailed`] if the context is not registered
+    /// - [`ContextError::ContextNotRegistered`] if the context is not registered
     ///   or is not a broadcast context.
     /// - [`ContextError::PermissionDenied`] if `author_did` is not locally
     ///   controlled.
     /// - [`ContextError::MemberNotFound`] if `author_did` is not a registered
     ///   author in the broadcast context.
+    #[instrument(skip_all, fields(context_id))]
     pub async fn get_broadcast_key_for_local_author(
         &self,
         context_id: &str,
@@ -1845,7 +1866,7 @@ impl ContextManager {
         let contexts = self.contexts.lock().await;
         let ctx = contexts
             .get(context_id)
-            .ok_or_else(|| ContextError::MembershipFailed("context not registered".into()))?;
+            .ok_or_else(|| ContextError::ContextNotRegistered(context_id.to_owned()))?;
 
         let bc = ctx
             .broadcast_context
@@ -1871,6 +1892,7 @@ impl ContextManager {
     ///
     /// Returns `false` if the context is not registered or does not need
     /// reconnection.
+    #[instrument(skip_all, fields(context_id))]
     pub async fn context_needs_reconnect(&self, context_id: &str) -> bool {
         self.contexts
             .lock()
@@ -1888,6 +1910,7 @@ impl ContextManager {
     ///
     /// Returns `true` if the flag was cleared, `false` if the context
     /// is not registered.
+    #[instrument(skip_all, fields(context_id))]
     pub async fn clear_needs_reconnect(&self, context_id: &str) -> bool {
         if let Some(ctx) = self.contexts.lock().await.get_mut(context_id) {
             ctx.needs_reconnect = false;
@@ -1905,6 +1928,7 @@ impl ContextManager {
     /// a relay WebSocket connection is re-established. For each returned
     /// context ID, the SDK initiates the reconnection protocol via
     /// [`execute_reconnection`](Self::execute_reconnection).
+    #[instrument(skip_all)]
     pub async fn contexts_needing_reconnect(&self) -> Vec<String> {
         self.contexts
             .lock()
@@ -1948,6 +1972,7 @@ impl ContextManager {
     ///
     /// `None` if no contexts need reconnection. Otherwise returns the
     /// coordinator and the list of context IDs that will be reconnected.
+    #[instrument(skip_all)]
     pub async fn prepare_reconnection(
         &self,
         member_did: scp_identity::DID,
@@ -1992,6 +2017,7 @@ impl ContextManager {
     ///
     /// `None` if no contexts need reconnection. Otherwise returns the
     /// [`ReconnectionReport`](crate::sync::hours_offline::ReconnectionReport).
+    #[instrument(skip_all)]
     pub async fn execute_reconnection<D: crate::sync::hours_offline::SyncPhaseDriver>(
         &self,
         member_did: scp_identity::DID,
@@ -2035,6 +2061,7 @@ impl ContextManager {
     ///
     /// Returns [`ContextError::PersistenceFailed`] if listing persisted
     /// contexts fails (no persistence provider configured, or list call fails).
+    #[instrument(skip_all)]
     pub async fn restore_all_contexts(&self) -> Result<Vec<String>, ContextError> {
         let Some(ref persistence) = self.persistence else {
             return Err(ContextError::PersistenceFailed(
@@ -2102,6 +2129,7 @@ impl ContextManager {
     ///
     /// Returns [`ContextError`] if the context does not exist or event log
     /// export fails.
+    #[instrument(skip_all, fields(context_id))]
     pub async fn export_context(
         &self,
         context_id: &str,
@@ -2154,6 +2182,7 @@ impl ContextManager {
     ///
     /// Returns [`ContextError`] if validation fails (unsupported version,
     /// Merkle mismatch, tampered events) or the context already exists.
+    #[instrument(skip_all)]
     #[allow(clippy::too_many_lines)] // Reimport guard adds 10 lines to an already-100-line function.
     pub async fn import_context(
         &self,
@@ -2237,7 +2266,15 @@ impl ContextManager {
             ttl_timer: TtlTimer::new(),
             ttl_extension: None,
             broadcast_context: None,
-            executed_proposals: export.snapshot.executed_proposals,
+            executed_proposals: {
+                let now = crate::time::now_secs().unwrap_or(0);
+                export
+                    .snapshot
+                    .executed_proposals
+                    .into_iter()
+                    .map(|id| (id, now))
+                    .collect()
+            },
             registered_tools: export.snapshot.registered_tools,
             write_revoked_members: export.snapshot.write_revoked_members,
             read_revoked_members: export.snapshot.read_revoked_members,
@@ -2346,6 +2383,7 @@ impl ContextManager {
     /// persists.
     ///
     /// See ADR-008 acceptance criterion 2.
+    #[instrument(skip_all, fields(context_id = %context_id))]
     pub async fn create_context(
         &self,
         context_id: String,
@@ -2400,7 +2438,7 @@ impl ContextManager {
             ttl_timer: TtlTimer::new(),
             ttl_extension: None,
             broadcast_context,
-            executed_proposals: HashSet::new(),
+            executed_proposals: HashMap::new(),
             registered_tools: Vec::new(),
             write_revoked_members: HashSet::new(),
             read_revoked_members: HashSet::new(),
@@ -2506,6 +2544,7 @@ impl ContextManager {
     /// - The `GovernanceModelConfig` is inconsistent with `params.governance`.
     /// - The config has invalid parameters (e.g., threshold > `signers.len()`).
     /// - Any builder validation or execution step fails.
+    #[instrument(skip_all, fields(context_id = %context_id))]
     pub async fn create_context_with_governance(
         &self,
         context_id: String,
@@ -2660,7 +2699,7 @@ impl ContextManager {
             ttl_timer: TtlTimer::new(),
             ttl_extension: None,
             broadcast_context,
-            executed_proposals: HashSet::new(),
+            executed_proposals: HashMap::new(),
             registered_tools: Vec::new(),
             write_revoked_members: HashSet::new(),
             read_revoked_members: HashSet::new(),
@@ -2701,6 +2740,7 @@ impl ContextManager {
     /// Returns [`ContextError`] if:
     /// - The context is not in `Active` state.
     /// - The key package is invalid.
+    #[instrument(skip_all, fields(context_id = handle.context_id()))]
     pub async fn join_context(
         &self,
         handle: &ContextHandle,
@@ -2719,7 +2759,7 @@ impl ContextManager {
             let contexts = self.contexts.lock().await;
             let ctx = contexts
                 .get(&context_id)
-                .ok_or_else(|| ContextError::MembershipFailed("context not registered".into()))?;
+                .ok_or_else(|| ContextError::ContextNotRegistered(context_id.clone()))?;
             ctx.handle
                 .params()
                 .check_version_compatibility(crate::envelope::SCP_PROTOCOL_VERSION)?;
@@ -2768,7 +2808,7 @@ impl ContextManager {
             let mut contexts = self.contexts.lock().await;
             let ctx = contexts
                 .get_mut(&context_id)
-                .ok_or_else(|| ContextError::MembershipFailed("context not registered".into()))?;
+                .ok_or_else(|| ContextError::ContextNotRegistered(context_id.clone()))?;
 
             // State check inside lock -- eliminates TOCTOU race.
             require_active(&ctx.handle)?;
@@ -2847,6 +2887,7 @@ impl ContextManager {
     /// - The context is not in `Active` state.
     /// - The caller is neither the member being removed nor holds `MemberRemove`.
     /// - The member is not found.
+    #[instrument(skip_all, fields(context_id = handle.context_id()))]
     pub async fn leave_context(
         &self,
         handle: &ContextHandle,
@@ -2861,7 +2902,7 @@ impl ContextManager {
             let contexts = self.contexts.lock().await;
             let ctx = contexts
                 .get(&context_id)
-                .ok_or_else(|| ContextError::MembershipFailed("context not registered".into()))?;
+                .ok_or_else(|| ContextError::ContextNotRegistered(context_id.clone()))?;
             ctx.broadcast_context.is_some()
         };
 
@@ -2871,7 +2912,7 @@ impl ContextManager {
             let contexts = self.contexts.lock().await;
             let ctx = contexts
                 .get(&context_id)
-                .ok_or_else(|| ContextError::MembershipFailed("context not registered".into()))?;
+                .ok_or_else(|| ContextError::ContextNotRegistered(context_id.clone()))?;
             if !ctx
                 .role_state
                 .member_has_capability(caller_did, &Capability::MemberRemove)
@@ -2895,7 +2936,7 @@ impl ContextManager {
             let mut contexts = self.contexts.lock().await;
             let ctx = contexts
                 .get_mut(&context_id)
-                .ok_or_else(|| ContextError::MembershipFailed("context not registered".into()))?;
+                .ok_or_else(|| ContextError::ContextNotRegistered(context_id.clone()))?;
 
             // State check inside lock -- eliminates TOCTOU race.
             require_active(&ctx.handle)?;
@@ -2972,6 +3013,7 @@ impl ContextManager {
     /// Returns [`ContextError`] if:
     /// - The context is not in `Active` state.
     /// - The sender lacks `messages:write` capability.
+    #[instrument(skip_all, fields(context_id = handle.context_id()))]
     pub async fn send_message(
         &self,
         handle: &ContextHandle,
@@ -2997,7 +3039,7 @@ impl ContextManager {
             let mut contexts = self.contexts.lock().await;
             let ctx = contexts
                 .get_mut(&context_id)
-                .ok_or_else(|| ContextError::MembershipFailed("context not registered".into()))?;
+                .ok_or_else(|| ContextError::ContextNotRegistered(context_id.clone()))?;
 
             // State check inside lock -- eliminates TOCTOU race.
             require_active(&ctx.handle)?;
@@ -3143,6 +3185,7 @@ impl ContextManager {
     /// Returns [`ContextError`] if:
     /// - The context is not registered or not in `Active` state.
     /// - Decryption fails (MLS or sender key layer).
+    #[instrument(skip_all, fields(context_id))]
     pub async fn deliver_incoming(
         &self,
         context_id: &str,
@@ -3158,7 +3201,7 @@ impl ContextManager {
             let contexts = self.contexts.lock().await;
             let ctx = contexts
                 .get(context_id)
-                .ok_or_else(|| ContextError::MembershipFailed("context not registered".into()))?;
+                .ok_or_else(|| ContextError::ContextNotRegistered(context_id.to_owned()))?;
             require_active(&ctx.handle)?;
         }
 
@@ -3199,7 +3242,7 @@ impl ContextManager {
             let mut contexts = self.contexts.lock().await;
             let ctx = contexts
                 .get_mut(context_id)
-                .ok_or_else(|| ContextError::MembershipFailed("context not registered".into()))?;
+                .ok_or_else(|| ContextError::ContextNotRegistered(context_id.to_owned()))?;
 
             // Re-check active state: context may have been closed/left during decrypt.
             require_active(&ctx.handle)?;
@@ -3248,6 +3291,7 @@ impl ContextManager {
     /// Returns the current member count for a context.
     ///
     /// Returns `None` if the context is not registered with this manager.
+    #[instrument(skip_all, fields(context_id))]
     pub async fn member_count(&self, context_id: &str) -> Option<usize> {
         self.contexts
             .lock()
@@ -3257,6 +3301,7 @@ impl ContextManager {
     }
 
     /// Returns `true` if the given DID is a member of the specified context.
+    #[instrument(skip_all, fields(context_id))]
     pub async fn is_member(&self, context_id: &str, did: &str) -> bool {
         self.contexts
             .lock()
@@ -3266,6 +3311,7 @@ impl ContextManager {
     }
 
     /// Returns all member DIDs for a context.
+    #[instrument(skip_all, fields(context_id))]
     pub async fn member_dids(&self, context_id: &str) -> Vec<String> {
         self.contexts
             .lock()
@@ -3281,6 +3327,7 @@ impl ContextManager {
     }
 
     /// Returns the role assignment for a specific member in a context.
+    #[instrument(skip_all, fields(context_id))]
     pub async fn member_role(&self, context_id: &str, did: &str) -> Option<RoleAssignment> {
         self.contexts
             .lock()
@@ -3295,6 +3342,7 @@ impl ContextManager {
     /// Used by FFI bridges to read context-configured limits (e.g.
     /// `session_cap`, `max_chain_depth`, `max_nesting_depth`) instead of
     /// hardcoding protocol defaults.
+    #[instrument(skip_all, fields(context_id))]
     pub async fn context_params(&self, context_id: &str) -> Option<ContextParams> {
         self.contexts
             .lock()
@@ -3308,6 +3356,7 @@ impl ContextManager {
     ///
     /// Used by FFI bridges to re-sync their local role state copy after
     /// governance actions that modify roles/capabilities.
+    #[instrument(skip_all, fields(context_id))]
     pub async fn get_role_state(&self, context_id: &str) -> Option<ContextRoleState> {
         self.contexts
             .lock()
@@ -3319,6 +3368,7 @@ impl ContextManager {
     /// Drains all events from the receive buffer for a context.
     ///
     /// Returns an empty `Vec` if the context is not registered.
+    #[instrument(skip_all, fields(context_id))]
     pub async fn drain_events(&self, context_id: &str) -> Vec<ContextEvent> {
         self.contexts
             .lock()
@@ -3379,6 +3429,7 @@ impl ContextManager {
     /// [`VersionCompatibility`]: crate::envelope::VersionCompatibility
     /// [`DegradedMode`]: crate::envelope::VersionCompatibility::DegradedMode
     /// [`drain_events`]: Self::drain_events
+    #[instrument(skip_all, fields(context_id))]
     pub async fn report_degraded_mode(
         &self,
         context_id: &str,
@@ -3422,6 +3473,7 @@ impl ContextManager {
     /// - [`ContextError::MembershipFailed`] if the context is not a broadcast
     ///   context or the subscriber is already registered.
     /// - [`ContextError::PermissionDenied`] if the context is gated and no
+    #[instrument(skip_all, fields(context_id))]
     pub async fn subscribe_broadcast<D, N, R, P, S>(
         &self,
         context_id: &str,
@@ -3443,7 +3495,7 @@ impl ContextManager {
             let mut contexts = self.contexts.lock().await;
             let ctx = contexts
                 .get_mut(context_id)
-                .ok_or_else(|| ContextError::MembershipFailed("context not registered".into()))?;
+                .ok_or_else(|| ContextError::ContextNotRegistered(context_id.to_owned()))?;
 
             require_active(&ctx.handle)?;
 
@@ -3513,6 +3565,7 @@ impl ContextManager {
     /// - [`ContextError::ContextNotActive`] if the context is not `Active`.
     /// - [`ContextError::MembershipFailed`] if the context is not a broadcast
     ///   context.
+    #[instrument(skip_all, fields(context_id))]
     pub async fn unsubscribe_broadcast(
         &self,
         context_id: &str,
@@ -3525,7 +3578,7 @@ impl ContextManager {
             let mut contexts = self.contexts.lock().await;
             let ctx = contexts
                 .get_mut(context_id)
-                .ok_or_else(|| ContextError::MembershipFailed("context not registered".into()))?;
+                .ok_or_else(|| ContextError::ContextNotRegistered(context_id.to_owned()))?;
 
             require_active(&ctx.handle)?;
 
@@ -3592,6 +3645,7 @@ impl ContextManager {
     /// - [`ContextError::ContextNotActive`] if the context is not `Active`.
     /// - [`ContextError::MembershipFailed`] if the context is not broadcast.
     /// - [`ContextError::PermissionDenied`] if the sender is not an author.
+    #[instrument(skip_all, fields(context_id))]
     pub async fn publish_broadcast(
         &self,
         context_id: &str,
@@ -3606,7 +3660,7 @@ impl ContextManager {
             let mut contexts = self.contexts.lock().await;
             let ctx = contexts
                 .get_mut(context_id)
-                .ok_or_else(|| ContextError::MembershipFailed("context not registered".into()))?;
+                .ok_or_else(|| ContextError::ContextNotRegistered(context_id.to_owned()))?;
 
             require_active(&ctx.handle)?;
 
@@ -3705,6 +3759,7 @@ impl ContextManager {
     /// - [`ContextError::MembershipFailed`] if the context is not broadcast.
     /// - [`ContextError::PermissionDenied`] if the sender is not an author.
     /// - `ContextError::InvalidInput` if serialization fails.
+    #[instrument(skip_all, fields(context_id))]
     pub async fn publish_broadcast_content(
         &self,
         context_id: &str,
@@ -3739,6 +3794,7 @@ impl ContextManager {
     /// - [`ContextError::ContextNotActive`] if the context is not `Active`.
     /// - [`ContextError::MembershipFailed`] if the context is not broadcast.
     /// - [`ContextError::MemberNotFound`] if the author is not registered.
+    #[instrument(skip_all, fields(context_id))]
     pub async fn block_broadcast_subscriber(
         &self,
         context_id: &str,
@@ -3751,7 +3807,7 @@ impl ContextManager {
             let mut contexts = self.contexts.lock().await;
             let ctx = contexts
                 .get_mut(context_id)
-                .ok_or_else(|| ContextError::MembershipFailed("context not registered".into()))?;
+                .ok_or_else(|| ContextError::ContextNotRegistered(context_id.to_owned()))?;
 
             require_active(&ctx.handle)?;
 
@@ -3801,11 +3857,12 @@ impl ContextManager {
     ///
     /// # Errors
     ///
-    /// - [`ContextError::MembershipFailed`] if the context is not registered
+    /// - [`ContextError::ContextNotRegistered`] if the context is not registered
     ///   or is not a broadcast context.
     /// - [`ContextError::ContextNotActive`] if the context is not `Active`.
     /// - [`ContextError::MemberNotFound`] if the author DID is not registered.
     /// - [`ContextError::InvalidState`] if the subscriber is not blocked.
+    #[instrument(skip_all, fields(context_id))]
     pub async fn unblock_broadcast_subscriber(
         &self,
         context_id: &str,
@@ -3818,7 +3875,7 @@ impl ContextManager {
             let mut contexts = self.contexts.lock().await;
             let ctx = contexts
                 .get_mut(context_id)
-                .ok_or_else(|| ContextError::MembershipFailed("context not registered".into()))?;
+                .ok_or_else(|| ContextError::ContextNotRegistered(context_id.to_owned()))?;
 
             require_active(&ctx.handle)?;
 
@@ -3877,6 +3934,7 @@ impl ContextManager {
     /// - [`ContextError::ContextNotActive`] if the context is not `Active`.
     /// - [`ContextError::MembershipFailed`] if the context is not a broadcast
     ///   context (for `BlockAuthor`, `RevokeReadAccess`, `RestoreReadAccess`).
+    #[instrument(skip_all, fields(context_id))]
     pub async fn execute_governance_action(
         &self,
         context_id: &str,
@@ -3904,16 +3962,18 @@ impl ContextManager {
         {
             let mut contexts = self.contexts.lock().await;
             if let Some(ctx) = contexts.get_mut(context_id) {
-                if ctx.executed_proposals.contains(&proposal.proposal_id) {
+                if ctx.executed_proposals.contains_key(&proposal.proposal_id) {
                     return Err(ContextError::PermissionDenied(
                         "governance proposal has already been executed".into(),
                     ));
                 }
-                ctx.executed_proposals.insert(proposal.proposal_id);
+                let now = crate::time::now_secs().unwrap_or(0);
+                // Evict entries older than the TTL before inserting.
+                ctx.executed_proposals
+                    .retain(|_, ts| now.saturating_sub(*ts) < EXECUTED_PROPOSALS_TTL_SECS);
+                ctx.executed_proposals.insert(proposal.proposal_id, now);
             } else {
-                return Err(ContextError::MembershipFailed(
-                    "context not registered".into(),
-                ));
+                return Err(ContextError::ContextNotRegistered(context_id.to_owned()));
             }
         }
 
@@ -4469,6 +4529,7 @@ impl ContextManager {
     /// - [`ContextError::ContextNotActive`] if the context is not `Active`.
     /// - [`ContextError::GovernanceFailed`] if the proposer lacks authority or
     ///   the action is invalid.
+    #[instrument(skip_all, fields(context_id))]
     pub async fn propose_governance_action(
         &self,
         context_id: &str,
@@ -4506,7 +4567,7 @@ impl ContextManager {
             let mut contexts = self.contexts.lock().await;
             let ctx = contexts
                 .get_mut(context_id)
-                .ok_or_else(|| ContextError::MembershipFailed("context not registered".into()))?;
+                .ok_or_else(|| ContextError::ContextNotRegistered(context_id.to_owned()))?;
 
             // CancelContextMigration is allowed during MigratingOut (§5.11A);
             // all other actions require Active state.
@@ -4650,6 +4711,7 @@ impl ContextManager {
     /// - [`ContextError::ContextNotActive`] if the context is not `Active`.
     /// - [`ContextError::GovernanceFailed`] if the voter is not eligible,
     ///   already voted, or the proposal is not pending.
+    #[instrument(skip_all, fields(context_id))]
     pub async fn vote_on_proposal(
         &self,
         context_id: &str,
@@ -4662,7 +4724,7 @@ impl ContextManager {
             let mut contexts = self.contexts.lock().await;
             let ctx = contexts
                 .get_mut(context_id)
-                .ok_or_else(|| ContextError::MembershipFailed("context not registered".into()))?;
+                .ok_or_else(|| ContextError::ContextNotRegistered(context_id.to_owned()))?;
 
             require_active(&ctx.handle)?;
 
@@ -4767,8 +4829,9 @@ impl ContextManager {
     ///
     /// # Errors
     ///
-    /// - [`ContextError::MembershipFailed`] if the context is not registered.
+    /// - [`ContextError::ContextNotRegistered`] if the context is not registered.
     /// - [`ContextError::GovernanceFailed`] if the proposal is not found.
+    #[instrument(skip_all, fields(context_id))]
     pub async fn get_proposal(
         &self,
         context_id: &str,
@@ -4777,7 +4840,7 @@ impl ContextManager {
         let contexts = self.contexts.lock().await;
         let ctx = contexts
             .get(context_id)
-            .ok_or_else(|| ContextError::MembershipFailed("context not registered".into()))?;
+            .ok_or_else(|| ContextError::ContextNotRegistered(context_id.to_owned()))?;
 
         ctx.governance_engine
             .get_proposal(proposal_id)
@@ -4798,7 +4861,8 @@ impl ContextManager {
     ///
     /// # Errors
     ///
-    /// - [`ContextError::MembershipFailed`] if the context is not registered.
+    /// - [`ContextError::ContextNotRegistered`] if the context is not registered.
+    #[instrument(skip_all, fields(context_id))]
     pub async fn list_proposals(
         &self,
         context_id: &str,
@@ -4806,7 +4870,7 @@ impl ContextManager {
         let contexts = self.contexts.lock().await;
         let ctx = contexts
             .get(context_id)
-            .ok_or_else(|| ContextError::MembershipFailed("context not registered".into()))?;
+            .ok_or_else(|| ContextError::ContextNotRegistered(context_id.to_owned()))?;
 
         Ok(ctx.governance_engine.list_proposals())
     }
@@ -4831,9 +4895,10 @@ impl ContextManager {
     /// # Errors
     ///
     /// - [`ContextError::ContextNotActive`] if the context is not `Active`.
-    /// - [`ContextError::MembershipFailed`] if the context is not registered.
+    /// - [`ContextError::ContextNotRegistered`] if the context is not registered.
     /// - [`ContextError::PermissionDenied`] if the proposer lacks
     ///   `GovernancePropose` capability.
+    #[instrument(skip_all, fields(context_id))]
     pub async fn propose_governance_action_checked(
         &self,
         context_id: &str,
@@ -4846,7 +4911,7 @@ impl ContextManager {
             let contexts = self.contexts.lock().await;
             let ctx = contexts
                 .get(context_id)
-                .ok_or_else(|| ContextError::MembershipFailed("context not registered".into()))?;
+                .ok_or_else(|| ContextError::ContextNotRegistered(context_id.to_owned()))?;
 
             if !ctx
                 .role_state
@@ -4880,9 +4945,10 @@ impl ContextManager {
     /// # Errors
     ///
     /// - [`ContextError::ContextNotActive`] if the context is not `Active`.
-    /// - [`ContextError::MembershipFailed`] if the context is not registered.
+    /// - [`ContextError::ContextNotRegistered`] if the context is not registered.
     /// - [`ContextError::PermissionDenied`] if the voter lacks `GovernanceVote`
     ///   capability or the engine rejects the vote.
+    #[instrument(skip_all, fields(context_id))]
     pub async fn approve_governance_proposal(
         &self,
         context_id: &str,
@@ -4895,7 +4961,7 @@ impl ContextManager {
             let contexts = self.contexts.lock().await;
             let ctx = contexts
                 .get(context_id)
-                .ok_or_else(|| ContextError::MembershipFailed("context not registered".into()))?;
+                .ok_or_else(|| ContextError::ContextNotRegistered(context_id.to_owned()))?;
 
             if !ctx
                 .role_state
@@ -4924,9 +4990,10 @@ impl ContextManager {
     /// # Errors
     ///
     /// - [`ContextError::ContextNotActive`] if the context is not `Active`.
-    /// - [`ContextError::MembershipFailed`] if the context is not registered.
+    /// - [`ContextError::ContextNotRegistered`] if the context is not registered.
     /// - [`ContextError::PermissionDenied`] if the voter lacks `GovernanceVote`
     ///   capability or the engine rejects the vote.
+    #[instrument(skip_all, fields(context_id))]
     pub async fn reject_governance_proposal(
         &self,
         context_id: &str,
@@ -4939,7 +5006,7 @@ impl ContextManager {
             let contexts = self.contexts.lock().await;
             let ctx = contexts
                 .get(context_id)
-                .ok_or_else(|| ContextError::MembershipFailed("context not registered".into()))?;
+                .ok_or_else(|| ContextError::ContextNotRegistered(context_id.to_owned()))?;
 
             if !ctx
                 .role_state
@@ -4968,9 +5035,10 @@ impl ContextManager {
     /// # Errors
     ///
     /// - [`ContextError::ContextNotActive`] if the context is not `Active`.
-    /// - [`ContextError::MembershipFailed`] if the context is not registered.
+    /// - [`ContextError::ContextNotRegistered`] if the context is not registered.
     /// - [`ContextError::PermissionDenied`] if the engine rejects the
     ///   withdrawal (proposal not found, voter hasn't voted, etc.).
+    #[instrument(skip_all, fields(context_id))]
     pub async fn withdraw_governance_vote(
         &self,
         context_id: &str,
@@ -4981,7 +5049,7 @@ impl ContextManager {
             let mut contexts = self.contexts.lock().await;
             let ctx = contexts
                 .get_mut(context_id)
-                .ok_or_else(|| ContextError::MembershipFailed("context not registered".into()))?;
+                .ok_or_else(|| ContextError::ContextNotRegistered(context_id.to_owned()))?;
             require_active(&ctx.handle)?;
 
             let gov_ctx = Self::build_governance_context(ctx);
@@ -5056,7 +5124,7 @@ impl ContextManager {
             let mut contexts = self.contexts.lock().await;
             let ctx = contexts
                 .get_mut(context_id)
-                .ok_or_else(|| ContextError::MembershipFailed("context not registered".into()))?;
+                .ok_or_else(|| ContextError::ContextNotRegistered(context_id.to_owned()))?;
             require_active(&ctx.handle)?;
 
             // Gate: ceiling must include MemberBan (§5.3, ADR-031).
@@ -5178,7 +5246,7 @@ impl ContextManager {
             let mut contexts = self.contexts.lock().await;
             let ctx = contexts
                 .get_mut(context_id)
-                .ok_or_else(|| ContextError::MembershipFailed("context not registered".into()))?;
+                .ok_or_else(|| ContextError::ContextNotRegistered(context_id.to_owned()))?;
             require_active(&ctx.handle)?;
 
             // Gate: ceiling must include MemberBan (§5.3, ADR-031).
@@ -5269,7 +5337,7 @@ impl ContextManager {
             let mut contexts = self.contexts.lock().await;
             let ctx = contexts
                 .get_mut(context_id)
-                .ok_or_else(|| ContextError::MembershipFailed("context not registered".into()))?;
+                .ok_or_else(|| ContextError::ContextNotRegistered(context_id.to_owned()))?;
             require_active(&ctx.handle)?;
 
             // Crypto: add to MLS group under lock to prevent partial-failure
@@ -5330,7 +5398,7 @@ impl ContextManager {
             let mut contexts = self.contexts.lock().await;
             let ctx = contexts
                 .get_mut(context_id)
-                .ok_or_else(|| ContextError::MembershipFailed("context not registered".into()))?;
+                .ok_or_else(|| ContextError::ContextNotRegistered(context_id.to_owned()))?;
             require_active(&ctx.handle)?;
 
             if !ctx.membership.contains(did) {
@@ -5380,7 +5448,7 @@ impl ContextManager {
             let mut contexts = self.contexts.lock().await;
             let ctx = contexts
                 .get_mut(context_id)
-                .ok_or_else(|| ContextError::MembershipFailed("context not registered".into()))?;
+                .ok_or_else(|| ContextError::ContextNotRegistered(context_id.to_owned()))?;
             require_active(&ctx.handle)?;
 
             if !ctx.membership.contains(did) {
@@ -5429,7 +5497,7 @@ impl ContextManager {
             let mut contexts = self.contexts.lock().await;
             let ctx = contexts
                 .get_mut(context_id)
-                .ok_or_else(|| ContextError::MembershipFailed("context not registered".into()))?;
+                .ok_or_else(|| ContextError::ContextNotRegistered(context_id.to_owned()))?;
             require_active(&ctx.handle)?;
 
             // Gate: ceiling must include ToolRegister (§5.3, #339).
@@ -5472,7 +5540,7 @@ impl ContextManager {
             let mut contexts = self.contexts.lock().await;
             let ctx = contexts
                 .get_mut(context_id)
-                .ok_or_else(|| ContextError::MembershipFailed("context not registered".into()))?;
+                .ok_or_else(|| ContextError::ContextNotRegistered(context_id.to_owned()))?;
             require_active(&ctx.handle)?;
 
             ctx.registered_tools.retain(|t| t.tool_id != tool_id);
@@ -5503,7 +5571,7 @@ impl ContextManager {
             let mut contexts = self.contexts.lock().await;
             let ctx = contexts
                 .get_mut(context_id)
-                .ok_or_else(|| ContextError::MembershipFailed("context not registered".into()))?;
+                .ok_or_else(|| ContextError::ContextNotRegistered(context_id.to_owned()))?;
             require_active(&ctx.handle)?;
 
             if !matches!(
@@ -5570,6 +5638,7 @@ impl ContextManager {
     /// # Errors
     ///
     /// Returns `ContextError` if the context is not found or is not active.
+    #[instrument(skip_all, fields(context_id))]
     pub async fn apply_pending_ceiling_modification(
         &self,
         context_id: &str,
@@ -5581,7 +5650,7 @@ impl ContextManager {
             let mut contexts = self.contexts.lock().await;
             let ctx = contexts
                 .get_mut(context_id)
-                .ok_or_else(|| ContextError::MembershipFailed("context not registered".into()))?;
+                .ok_or_else(|| ContextError::ContextNotRegistered(context_id.to_owned()))?;
             require_active(&ctx.handle)?;
 
             let pending = match &ctx.pending_ceiling_modification {
@@ -5627,7 +5696,7 @@ impl ContextManager {
             let contexts = self.contexts.lock().await;
             let ctx = contexts
                 .get(context_id)
-                .ok_or_else(|| ContextError::MembershipFailed("context not registered".into()))?;
+                .ok_or_else(|| ContextError::ContextNotRegistered(context_id.to_owned()))?;
             require_active(&ctx.handle)?;
             ctx.handle.clone()
         };
@@ -5645,7 +5714,7 @@ impl ContextManager {
             let mut contexts = self.contexts.lock().await;
             let ctx = contexts
                 .get_mut(context_id)
-                .ok_or_else(|| ContextError::MembershipFailed("context not registered".into()))?;
+                .ok_or_else(|| ContextError::ContextNotRegistered(context_id.to_owned()))?;
 
             // Cancel TTL timer and governance timeout task if active.
             ctx.ttl_timer.cancel();
@@ -5684,7 +5753,7 @@ impl ContextManager {
             let mut contexts = self.contexts.lock().await;
             let ctx = contexts
                 .get_mut(context_id)
-                .ok_or_else(|| ContextError::MembershipFailed("context not registered".into()))?;
+                .ok_or_else(|| ContextError::ContextNotRegistered(context_id.to_owned()))?;
             require_active(&ctx.handle)?;
 
             // Unanimity check: TTL extension requires consent from ALL
@@ -5790,7 +5859,7 @@ impl ContextManager {
             let mut contexts = self.contexts.lock().await;
             let ctx = contexts
                 .get_mut(context_id)
-                .ok_or_else(|| ContextError::MembershipFailed("context not registered".into()))?;
+                .ok_or_else(|| ContextError::ContextNotRegistered(context_id.to_owned()))?;
             require_active(&ctx.handle)?;
 
             if !ctx.membership.contains(new_admin) {
@@ -5851,7 +5920,7 @@ impl ContextManager {
             let contexts = self.contexts.lock().await;
             let ctx = contexts
                 .get(context_id)
-                .ok_or_else(|| ContextError::MembershipFailed("context not registered".into()))?;
+                .ok_or_else(|| ContextError::ContextNotRegistered(context_id.to_owned()))?;
             require_active(&ctx.handle)?;
 
             // Gate: ceiling must include ChildContextCreate (§5.3, §5.13, #339).
@@ -5926,7 +5995,7 @@ impl ContextManager {
             let mut contexts = self.contexts.lock().await;
             let ctx = contexts
                 .get_mut(context_id)
-                .ok_or_else(|| ContextError::MembershipFailed("context not registered".into()))?;
+                .ok_or_else(|| ContextError::ContextNotRegistered(context_id.to_owned()))?;
             require_active(&ctx.handle)?;
 
             ctx.pruning_policy = Some(new_policy.clone());
@@ -5959,7 +6028,7 @@ impl ContextManager {
             let mut contexts = self.contexts.lock().await;
             let ctx = contexts
                 .get_mut(context_id)
-                .ok_or_else(|| ContextError::MembershipFailed("context not registered".into()))?;
+                .ok_or_else(|| ContextError::ContextNotRegistered(context_id.to_owned()))?;
             require_active(&ctx.handle)?;
 
             if !ctx.membership.contains(did) {
@@ -6035,7 +6104,7 @@ impl ContextManager {
             let mut contexts = self.contexts.lock().await;
             let ctx = contexts
                 .get_mut(context_id)
-                .ok_or_else(|| ContextError::MembershipFailed("context not registered".into()))?;
+                .ok_or_else(|| ContextError::ContextNotRegistered(context_id.to_owned()))?;
             require_active(&ctx.handle)?;
 
             let before = ctx.threshold_signers.len();
@@ -6103,7 +6172,7 @@ impl ContextManager {
             let mut contexts = self.contexts.lock().await;
             let ctx = contexts
                 .get_mut(context_id)
-                .ok_or_else(|| ContextError::MembershipFailed("context not registered".into()))?;
+                .ok_or_else(|| ContextError::ContextNotRegistered(context_id.to_owned()))?;
             require_active(&ctx.handle)?;
 
             let signer_count = u32::try_from(ctx.threshold_signers.len()).unwrap_or(u32::MAX);
@@ -6143,7 +6212,7 @@ impl ContextManager {
             let mut contexts = self.contexts.lock().await;
             let ctx = contexts
                 .get_mut(context_id)
-                .ok_or_else(|| ContextError::MembershipFailed("context not registered".into()))?;
+                .ok_or_else(|| ContextError::ContextNotRegistered(context_id.to_owned()))?;
             require_active(&ctx.handle)?;
 
             // Gate: ceiling must include ToolInterface (§5.3, §6.2, #339).
@@ -6186,7 +6255,7 @@ impl ContextManager {
             let contexts = self.contexts.lock().await;
             let ctx = contexts
                 .get(context_id)
-                .ok_or_else(|| ContextError::MembershipFailed("context not registered".into()))?;
+                .ok_or_else(|| ContextError::ContextNotRegistered(context_id.to_owned()))?;
             require_active(&ctx.handle)?;
 
             if !ctx.membership.contains(did) {
@@ -6231,7 +6300,7 @@ impl ContextManager {
             let mut contexts = self.contexts.lock().await;
             let ctx = contexts
                 .get_mut(context_id)
-                .ok_or_else(|| ContextError::MembershipFailed("context not registered".into()))?;
+                .ok_or_else(|| ContextError::ContextNotRegistered(context_id.to_owned()))?;
             require_active(&ctx.handle)?;
 
             // Gate: context must be in governance freeze state to resolve
@@ -6306,11 +6375,13 @@ impl ContextManager {
                     };
                     // Only invalidate the loser — the winner remains eligible
                     // for normal execution.
-                    ctx.executed_proposals.insert(*loser);
+                    let now = crate::time::now_secs().unwrap_or(0);
+                    ctx.executed_proposals.insert(*loser, now);
                 }
                 super::governance::ConflictResolution::InvalidateBoth => {
-                    ctx.executed_proposals.insert(*proposal_a);
-                    ctx.executed_proposals.insert(*proposal_b);
+                    let now = crate::time::now_secs().unwrap_or(0);
+                    ctx.executed_proposals.insert(*proposal_a, now);
+                    ctx.executed_proposals.insert(*proposal_b, now);
                 }
             }
 
@@ -6354,7 +6425,7 @@ impl ContextManager {
             let mut contexts = self.contexts.lock().await;
             let ctx = contexts
                 .get_mut(context_id)
-                .ok_or_else(|| ContextError::MembershipFailed("context not registered".into()))?;
+                .ok_or_else(|| ContextError::ContextNotRegistered(context_id.to_owned()))?;
             require_active(&ctx.handle)?;
 
             if !matches!(
@@ -6430,7 +6501,7 @@ impl ContextManager {
             let mut contexts = self.contexts.lock().await;
             let ctx = contexts
                 .get_mut(context_id)
-                .ok_or_else(|| ContextError::MembershipFailed("context not registered".into()))?;
+                .ok_or_else(|| ContextError::ContextNotRegistered(context_id.to_owned()))?;
             require_active(&ctx.handle)?;
 
             if !ctx.role_state.ceiling.contains(&Capability::MemberBan) {
@@ -6526,7 +6597,7 @@ impl ContextManager {
             let mut contexts = self.contexts.lock().await;
             let ctx = contexts
                 .get_mut(context_id)
-                .ok_or_else(|| ContextError::MembershipFailed("context not registered".into()))?;
+                .ok_or_else(|| ContextError::ContextNotRegistered(context_id.to_owned()))?;
             require_active(&ctx.handle)?;
 
             if !ctx.role_state.ceiling.contains(&Capability::MemberBan) {
@@ -6590,7 +6661,7 @@ impl ContextManager {
             let mut contexts = self.contexts.lock().await;
             let ctx = contexts
                 .get_mut(context_id)
-                .ok_or_else(|| ContextError::MembershipFailed("context not registered".into()))?;
+                .ok_or_else(|| ContextError::ContextNotRegistered(context_id.to_owned()))?;
             require_active(&ctx.handle)?;
 
             let bc_snap = if let Some(ref mut bc) = ctx.broadcast_context {
@@ -6658,7 +6729,7 @@ impl ContextManager {
             let mut contexts = self.contexts.lock().await;
             let ctx = contexts
                 .get_mut(context_id)
-                .ok_or_else(|| ContextError::MembershipFailed("context not registered".into()))?;
+                .ok_or_else(|| ContextError::ContextNotRegistered(context_id.to_owned()))?;
             require_active(&ctx.handle)?;
 
             // Save state for rollback — the loop below mutates ctx in-place,
@@ -6743,7 +6814,7 @@ impl ContextManager {
     ///
     /// - [`ContextError::PermissionDenied`] if the existing policy is locked
     ///   or an economic policy change is already pending.
-    /// - [`ContextError::MembershipFailed`] if the context is not registered.
+    /// - [`ContextError::ContextNotRegistered`] if the context is not registered.
     /// - [`ContextError::ContextNotActive`] if the context is not active.
     async fn execute_set_economic_policy(
         &self,
@@ -6757,7 +6828,7 @@ impl ContextManager {
             let mut contexts = self.contexts.lock().await;
             let ctx = contexts
                 .get_mut(context_id)
-                .ok_or_else(|| ContextError::MembershipFailed("context not registered".into()))?;
+                .ok_or_else(|| ContextError::ContextNotRegistered(context_id.to_owned()))?;
             require_active(&ctx.handle)?;
 
             // Check if existing policy is locked.
@@ -6819,6 +6890,7 @@ impl ContextManager {
     /// # Errors
     ///
     /// Returns `ContextError` if the context is not found or is not active.
+    #[instrument(skip_all, fields(context_id))]
     pub async fn apply_pending_economic_policy_change(
         &self,
         context_id: &str,
@@ -6830,7 +6902,7 @@ impl ContextManager {
             let mut contexts = self.contexts.lock().await;
             let ctx = contexts
                 .get_mut(context_id)
-                .ok_or_else(|| ContextError::MembershipFailed("context not registered".into()))?;
+                .ok_or_else(|| ContextError::ContextNotRegistered(context_id.to_owned()))?;
             require_active(&ctx.handle)?;
 
             let pending = match &ctx.pending_economic_policy_change {
@@ -6870,7 +6942,7 @@ impl ContextManager {
     ///
     /// # Errors
     ///
-    /// - [`ContextError::MembershipFailed`] if the context is not registered
+    /// - [`ContextError::ContextNotRegistered`] if the context is not registered
     ///   or the spender is not a member.
     /// - [`ContextError::ContextNotActive`] if the context is not active.
     async fn execute_approve_spend(
@@ -6887,7 +6959,7 @@ impl ContextManager {
             let mut contexts = self.contexts.lock().await;
             let ctx = contexts
                 .get_mut(context_id)
-                .ok_or_else(|| ContextError::MembershipFailed("context not registered".into()))?;
+                .ok_or_else(|| ContextError::ContextNotRegistered(context_id.to_owned()))?;
             require_active(&ctx.handle)?;
 
             // Verify the spender is a member of the context.
@@ -6925,7 +6997,7 @@ impl ContextManager {
     ///
     /// - [`ContextError::PermissionDenied`] if no economic policy is set or
     ///   the policy is already locked.
-    /// - [`ContextError::MembershipFailed`] if the context is not registered.
+    /// - [`ContextError::ContextNotRegistered`] if the context is not registered.
     /// - [`ContextError::ContextNotActive`] if the context is not active.
     async fn execute_lock_economic_policy(
         &self,
@@ -6938,7 +7010,7 @@ impl ContextManager {
             let mut contexts = self.contexts.lock().await;
             let ctx = contexts
                 .get_mut(context_id)
-                .ok_or_else(|| ContextError::MembershipFailed("context not registered".into()))?;
+                .ok_or_else(|| ContextError::ContextNotRegistered(context_id.to_owned()))?;
             require_active(&ctx.handle)?;
 
             match &mut ctx.economic_policy {
@@ -6984,7 +7056,7 @@ impl ContextManager {
     ///
     /// # Errors
     ///
-    /// - [`ContextError::MembershipFailed`] if the context is not registered.
+    /// - [`ContextError::ContextNotRegistered`] if the context is not registered.
     /// - [`ContextError::ContextNotActive`] if the context is not active.
     /// - [`ContextError::InvalidTransition`] if the state transition fails.
     async fn execute_propose_context_migration(
@@ -7032,7 +7104,7 @@ impl ContextManager {
             let mut contexts = self.contexts.lock().await;
             let ctx = contexts
                 .get_mut(context_id)
-                .ok_or_else(|| ContextError::MembershipFailed("context not registered".into()))?;
+                .ok_or_else(|| ContextError::ContextNotRegistered(context_id.to_owned()))?;
             require_active(&ctx.handle)?;
 
             // Check no migration is already in progress.
@@ -7141,7 +7213,7 @@ impl ContextManager {
     ///
     /// # Errors
     ///
-    /// - [`ContextError::MembershipFailed`] if the context is not registered.
+    /// - [`ContextError::ContextNotRegistered`] if the context is not registered.
     /// - [`ContextError::PermissionDenied`] if the context is not migrating.
     /// - [`ContextError::InvalidTransition`] if the state transition fails.
     async fn execute_cancel_context_migration(
@@ -7158,7 +7230,7 @@ impl ContextManager {
             let mut contexts = self.contexts.lock().await;
             let ctx = contexts
                 .get_mut(context_id)
-                .ok_or_else(|| ContextError::MembershipFailed("context not registered".into()))?;
+                .ok_or_else(|| ContextError::ContextNotRegistered(context_id.to_owned()))?;
 
             // Must be in MigratingOut state.
             let state = ctx
@@ -7223,9 +7295,10 @@ impl ContextManager {
     ///
     /// # Errors
     ///
-    /// - [`ContextError::MembershipFailed`] if the context is not registered.
+    /// - [`ContextError::ContextNotRegistered`] if the context is not registered.
     /// - [`ContextError::PermissionDenied`] if the context is not migrating
     ///   or the grace period has not expired.
+    #[instrument(skip_all, fields(context_id))]
     pub async fn tombstone_migrated_context(&self, context_id: &str) -> Result<(), ContextError> {
         let context_id_bytes = context_id_to_bytes(context_id);
 
@@ -7241,7 +7314,7 @@ impl ContextManager {
             let mut contexts = self.contexts.lock().await;
             let ctx = contexts
                 .get_mut(context_id)
-                .ok_or_else(|| ContextError::MembershipFailed("context not registered".into()))?;
+                .ok_or_else(|| ContextError::ContextNotRegistered(context_id.to_owned()))?;
 
             let state = ctx
                 .handle
@@ -7319,6 +7392,7 @@ impl ContextManager {
     /// Returns the migration state for a context, if any.
     ///
     /// Returns `None` if the context is not registered or not migrating.
+    #[instrument(skip_all, fields(context_id))]
     pub async fn migration_state(&self, context_id: &str) -> Option<MigrationState> {
         let contexts = self.contexts.lock().await;
         contexts
@@ -7347,6 +7421,7 @@ impl ContextManager {
     /// registered as a locally controlled DID.
     ///
     /// Returns [`ContextError::MembershipFailed`] if the context is not
+    #[instrument(skip_all, fields(context_id))]
     pub async fn handle_broadcast_key_request(
         &self,
         context_id: &str,
@@ -7365,7 +7440,7 @@ impl ContextManager {
         let contexts = self.contexts.lock().await;
         let ctx = contexts
             .get(context_id)
-            .ok_or_else(|| ContextError::MembershipFailed("context not registered".into()))?;
+            .ok_or_else(|| ContextError::ContextNotRegistered(context_id.to_owned()))?;
 
         let bc = ctx
             .broadcast_context
@@ -7378,6 +7453,7 @@ impl ContextManager {
     /// Returns the number of subscribers in a broadcast context.
     ///
     /// Returns `None` if the context is not registered or not broadcast.
+    #[instrument(skip_all, fields(context_id))]
     pub async fn broadcast_subscriber_count(&self, context_id: &str) -> Option<usize> {
         self.contexts.lock().await.get(context_id).and_then(|ctx| {
             ctx.broadcast_context
@@ -7387,6 +7463,7 @@ impl ContextManager {
     }
 
     /// Returns `true` if the given DID is a subscriber in a broadcast context.
+    #[instrument(skip_all, fields(context_id))]
     pub async fn is_broadcast_subscriber(&self, context_id: &str, did: &str) -> bool {
         self.contexts
             .lock()
@@ -7403,6 +7480,7 @@ impl ContextManager {
     /// Returns the admission policy for a broadcast context.
     ///
     /// Returns `None` if the context is not registered or not broadcast.
+    #[instrument(skip_all, fields(context_id))]
     pub async fn broadcast_admission(&self, context_id: &str) -> Option<BroadcastAdmission> {
         self.contexts.lock().await.get(context_id).and_then(|ctx| {
             ctx.broadcast_context
@@ -7436,6 +7514,7 @@ impl ContextManager {
     /// `Active`. Returns [`ContextError::PermissionDenied`] if the context
     /// uses a multi-admin governance model (use governance proposal path
     /// instead) or if the initiator lacks `ContextClose` capability.
+    #[instrument(skip_all, fields(context_id = handle.context_id()))]
     pub async fn close_context(
         &self,
         handle: &ContextHandle,
@@ -7450,7 +7529,7 @@ impl ContextManager {
             let contexts = self.contexts.lock().await;
             let ctx = contexts
                 .get(&context_id)
-                .ok_or_else(|| ContextError::MembershipFailed("context not registered".into()))?;
+                .ok_or_else(|| ContextError::ContextNotRegistered(context_id.clone()))?;
 
             // State check inside lock -- eliminates TOCTOU race.
             require_active(&ctx.handle)?;
@@ -7517,6 +7596,7 @@ impl ContextManager {
     ///
     /// Returns [`ContextError`] if the context is not in `Closing` state
     /// or if destruction operations fail.
+    #[instrument(skip_all, fields(context_id = handle.context_id()))]
     pub async fn finalize_close(&self, handle: &ContextHandle) -> Result<(), ContextError> {
         let context_id = handle.context_id().to_owned();
 
@@ -7548,6 +7628,7 @@ impl ContextManager {
     ///
     /// Returns [`ContextError::ContextNotActive`] if the context is not
     /// in `Active` state.
+    #[instrument(skip_all, fields(context_id = handle.context_id()))]
     pub async fn handle_ttl_expiry(&self, handle: &ContextHandle) -> Result<(), ContextError> {
         let context_id = handle.context_id().to_owned();
 
@@ -7618,6 +7699,7 @@ impl ContextManager {
     ///
     /// Returns [`ContextError::MembershipFailed`] if the context is not
     /// registered. Returns [`ContextError::MemberNotFound`] if the member
+    #[instrument(skip_all, fields(context_id))]
     pub async fn propose_ttl_extension(
         &self,
         context_id: &str,
@@ -7628,7 +7710,7 @@ impl ContextManager {
         let mut contexts = self.contexts.lock().await;
         let ctx = contexts
             .get_mut(context_id)
-            .ok_or_else(|| ContextError::MembershipFailed("context not registered".into()))?;
+            .ok_or_else(|| ContextError::ContextNotRegistered(context_id.to_owned()))?;
 
         if !ctx.membership.contains(member_did) {
             return Err(ContextError::MemberNotFound(member_did.to_string()));
@@ -7658,6 +7740,7 @@ impl ContextManager {
     ///
     /// Cancels the old timer and spawns a new one with the given duration.
     /// Clears the extension proposal state.
+    #[instrument(skip_all, fields(context_id))]
     pub async fn reset_ttl_timer(
         &self,
         context_id: &str,
@@ -8070,8 +8153,9 @@ impl ContextManager {
     /// # Errors
     ///
     /// - [`ContextError::ContextNotActive`] if the context is not `Active`.
-    /// - [`ContextError::MembershipFailed`] if the context is not registered.
+    /// - [`ContextError::ContextNotRegistered`] if the context is not registered.
     #[allow(clippy::too_many_arguments)]
+    #[instrument(skip_all, fields(context_id))]
     pub async fn create_governance_checkpoint(
         &self,
         context_id: &str,
@@ -8088,7 +8172,7 @@ impl ContextManager {
         let contexts = self.contexts.lock().await;
         let ctx = contexts
             .get(context_id)
-            .ok_or_else(|| ContextError::MembershipFailed("context not registered".into()))?;
+            .ok_or_else(|| ContextError::ContextNotRegistered(context_id.to_owned()))?;
         require_active(&ctx.handle)?;
 
         let (_, min_count) = ctx.governance_engine.checkpoint_cosignature_requirements();
@@ -8151,8 +8235,9 @@ impl ContextManager {
     ///
     /// # Errors
     ///
-    /// - [`ContextError::MembershipFailed`] if the context is not registered.
+    /// - [`ContextError::ContextNotRegistered`] if the context is not registered.
     /// - [`ContextError::GovernanceFailed`] if the cosignature validation fails.
+    #[instrument(skip_all, fields(context_id))]
     pub async fn add_checkpoint_cosignature(
         &self,
         context_id: &str,
@@ -8164,7 +8249,7 @@ impl ContextManager {
         let contexts = self.contexts.lock().await;
         let ctx = contexts
             .get(context_id)
-            .ok_or_else(|| ContextError::MembershipFailed("context not registered".into()))?;
+            .ok_or_else(|| ContextError::ContextNotRegistered(context_id.to_owned()))?;
 
         // Validate with a candidate vector first — only mutate checkpoint
         // after validation passes to avoid leaving corrupt state on error.
@@ -8356,9 +8441,10 @@ impl ContextManager {
     ///
     /// # Errors
     ///
-    /// - [`ContextError::MembershipFailed`] if the context is not registered.
+    /// - [`ContextError::ContextNotRegistered`] if the context is not registered.
     /// - [`ContextError::ContextNotActive`] if the context is not `Active`.
     /// - [`ContextError::CryptoFailed`] if the MLS update/commit fails.
+    #[instrument(skip_all, fields(context_id))]
     pub async fn recovery_advance_epoch(&self, context_id: &str) -> Result<u64, ContextError> {
         let context_id_bytes = context_id_to_bytes(context_id);
 
@@ -8367,7 +8453,7 @@ impl ContextManager {
             let contexts = self.contexts.lock().await;
             let ctx = contexts
                 .get(context_id)
-                .ok_or_else(|| ContextError::MembershipFailed("context not registered".into()))?;
+                .ok_or_else(|| ContextError::ContextNotRegistered(context_id.to_owned()))?;
             require_active(&ctx.handle)?;
         }
 
@@ -8380,7 +8466,7 @@ impl ContextManager {
             let mut contexts = self.contexts.lock().await;
             let ctx = contexts
                 .get_mut(context_id)
-                .ok_or_else(|| ContextError::MembershipFailed("context not registered".into()))?;
+                .ok_or_else(|| ContextError::ContextNotRegistered(context_id.to_owned()))?;
             // Re-validate after the crypto op to close the TOCTOU window between
             // the active check in step 1 and the counter increment here. A
             // concurrent close_context could have transitioned the handle while
@@ -8433,6 +8519,7 @@ impl ContextManager {
     /// # Errors
     ///
     /// Returns [`ContextError::TransportFailed`] if the message cannot be sent.
+    #[instrument(skip_all, fields(context_id))]
     pub async fn recovery_send_notification(
         &self,
         context_id: &str,
@@ -8478,6 +8565,7 @@ impl ContextManager {
     ///
     /// Returns [`ContextError::TransportFailed`] if no shared context is found
     /// or the message cannot be sent.
+    #[instrument(skip_all, fields(context_id))]
     pub async fn recovery_notify_contact(
         &self,
         recovering_did: &str,
@@ -9704,10 +9792,8 @@ mod tests {
             .await;
         assert!(result.is_err());
         match result.unwrap_err() {
-            ContextError::MembershipFailed(msg) => {
-                assert!(msg.contains("not registered"));
-            }
-            other => panic!("expected MembershipFailed, got: {other:?}"),
+            ContextError::ContextNotRegistered(_) => {}
+            other => panic!("expected ContextNotRegistered, got: {other:?}"),
         }
     }
 
@@ -13042,7 +13128,7 @@ mod tests {
         let contexts = manager.contexts.lock().await;
         let ctx = contexts.get("replay-ctx").unwrap();
         assert!(
-            ctx.executed_proposals.contains(&proposal_id),
+            ctx.executed_proposals.contains_key(&proposal_id),
             "executed_proposals should be preserved across restart"
         );
     }
@@ -13962,7 +14048,7 @@ mod tests {
 
     /// #234: DID validation runs before context lookup. When a non-local DID
     /// is used AND the context doesn't exist, the result is `PermissionDenied`
-    /// (not `MembershipFailed` or "context not registered"). This documents
+    /// (not `ContextNotRegistered`). This documents
     /// the intentional fail-closed ordering: unauthenticated callers cannot
     /// probe for context existence.
     #[tokio::test]
@@ -15904,7 +15990,7 @@ mod tests {
         assert!(result.is_err());
         assert!(matches!(
             result.unwrap_err(),
-            ContextError::MembershipFailed(_)
+            ContextError::ContextNotRegistered(_)
         ));
     }
 
@@ -19452,8 +19538,8 @@ mod tests {
         );
 
         // Both proposals should be in executed_proposals (invalidated).
-        assert!(ctx.executed_proposals.contains(&proposal_a_id));
-        assert!(ctx.executed_proposals.contains(&proposal_b_id));
+        assert!(ctx.executed_proposals.contains_key(&proposal_a_id));
+        assert!(ctx.executed_proposals.contains_key(&proposal_b_id));
     }
 
     /// Helper: creates an approved `CancelContextMigration` governance
@@ -20061,8 +20147,8 @@ mod tests {
 
         assert!(result.is_err(), "should reject unknown context");
         assert!(
-            matches!(result.unwrap_err(), ContextError::MembershipFailed(_)),
-            "error should be MembershipFailed"
+            matches!(result.unwrap_err(), ContextError::ContextNotRegistered(_)),
+            "error should be ContextNotRegistered"
         );
     }
 
