@@ -629,34 +629,16 @@ pub struct IdentityDidPublicKeyResolver;
 
 impl DidPublicKeyResolver for IdentityDidPublicKeyResolver {
     fn resolve_public_key(&self, did: &str) -> Result<Vec<u8>, TrustError> {
-        // did:dht:z... — extract the 32-byte Ed25519 public key from the
-        // z-base-32-encoded suffix.
-        if did.starts_with("did:dht:z") {
-            let key = crate::identity::extract_public_key_from_did(did).map_err(|e| {
-                TrustError::AttestationSignatureInvalid {
-                    attestation_id: String::new(),
-                    reason: format!("failed to extract public key from DID {did}: {e}"),
-                }
-            })?;
-            return Ok(key.to_vec());
-        }
-
-        // did:key:{hex} — testing format only (see issue #128).
-        #[cfg(test)]
-        if did.starts_with("did:key:") {
-            let hex_str = did.strip_prefix("did:key:").unwrap_or_default();
-            let key_bytes =
-                hex::decode(hex_str).map_err(|e| TrustError::AttestationSignatureInvalid {
-                    attestation_id: String::new(),
-                    reason: format!("failed to decode did:key hex for {did}: {e}"),
-                })?;
-            return Ok(key_bytes);
-        }
-
-        Err(TrustError::AttestationSignatureInvalid {
-            attestation_id: String::new(),
-            reason: format!("unsupported DID method for public key resolution: {did}"),
-        })
+        // Delegates to the canonical implementation in scp-primitives which
+        // supports did:dht:z (production) and did:key:{hex} (testing only,
+        // gated behind #[cfg(test)] / feature = "testing"). See issue #128.
+        let key = scp_primitives::extract_public_key_from_did(did).map_err(|e| {
+            TrustError::AttestationSignatureInvalid {
+                attestation_id: String::new(),
+                reason: format!("failed to extract public key from DID {did}: {e}"),
+            }
+        })?;
+        Ok(key.to_vec())
     }
 }
 

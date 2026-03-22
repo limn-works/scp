@@ -15,7 +15,7 @@ categories = ["cryptography", "data-structures"]
 # test_helpers module. Only for integration tests that run outside
 # `#[cfg(test)]`. Production builds must never enable this feature.
 # See issue #128.
-testing = ["dep:rand"]
+testing = ["dep:rand", "scp-primitives/testing"]
 
 [dependencies]
 scp-primitives = { path = "../scp-primitives", version = "=0.1.0-beta.1" }

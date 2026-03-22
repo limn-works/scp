@@ -15,8 +15,8 @@
 //!
 //! # Design Constraints
 //!
-//! - **Minimal dependencies.** Only `ed25519-dalek` and `serde` beyond `std`.
-//!   No protocol knowledge, no transport, no platform traits.
+//! - **Minimal dependencies.** Only `ed25519-dalek`, `serde`, and `z-base-32`
+//!   beyond `std`. No protocol knowledge, no transport, no platform traits.
 //! - **No async.** All functions are synchronous.
 //! - **Leaf crate.** Must never depend on any other SCP crate.
 //!
@@ -26,7 +26,7 @@ pub mod crypto;
 pub mod identity;
 pub mod time;
 
-pub use identity::{DID, SigningKeyId};
+pub use identity::{DID, SigningKeyId, extract_public_key_from_did};
 
 // Re-export Clock types at the crate root for convenience.
 pub use time::{Clock, SystemClock, TestClock};

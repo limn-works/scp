@@ -20,6 +20,7 @@ use subtle::ConstantTimeEq;
 
 use super::{Event, EventLog, EventLogError, EventType};
 use crate::crypto::verify_ed25519_signature;
+use scp_primitives::extract_public_key_from_did;
 
 /// The genesis sentinel hash used as `prev_hash` for the first event.
 ///
@@ -426,38 +427,6 @@ pub(crate) const fn event_type_tag(event_type: &EventType) -> u16 {
         EventType::ProvenanceAttached => 34,
         EventType::ProvenanceReceived => 35,
     }
-}
-
-/// Extracts the Ed25519 public key bytes from a DID string.
-///
-/// Supports `did:dht:z<z-base-32>` format (production). The `did:key:<hex>`
-/// test convenience format is only accepted when compiled with `#[cfg(test)]`
-/// or the `testing` feature to prevent non-standard DID acceptance in release
-/// builds. See: <https://github.com/limn-works/scp/issues/128>
-fn extract_public_key_from_did(did: &str) -> Result<[u8; 32], String> {
-    // Support did:dht:z<z-base-32> format.
-    if let Some(suffix) = did.strip_prefix("did:dht:z") {
-        let decoded = zbase32::decode(suffix)
-            .map_err(|_| format!("z-base-32 decode failed for DID: {did}"))?;
-        let bytes: [u8; 32] = decoded
-            .try_into()
-            .map_err(|v: Vec<u8>| format!("DID public key must be 32 bytes, got {}", v.len()))?;
-        return Ok(bytes);
-    }
-
-    // did:key:{hex} is a non-standard test convenience. Gated behind the
-    // `testing` feature (or #[cfg(test)]) to prevent acceptance in release
-    // builds. See: https://github.com/limn-works/scp/issues/128
-    #[cfg(any(test, feature = "testing"))]
-    if let Some(hex_str) = did.strip_prefix("did:key:") {
-        let decoded = hex::decode(hex_str).map_err(|e| format!("hex decode error: {e}"))?;
-        let bytes: [u8; 32] = decoded
-            .try_into()
-            .map_err(|v: Vec<u8>| format!("DID public key must be 32 bytes, got {}", v.len()))?;
-        return Ok(bytes);
-    }
-
-    Err(format!("unsupported DID format: {did}"))
 }
 
 /// Incrementally updates the interior tree after a single leaf append.
