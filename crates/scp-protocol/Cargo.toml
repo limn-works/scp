@@ -42,11 +42,6 @@ z-base-32 = { workspace = true }
 default = []
 # Makes InMemoryNonceTracker public for cross-crate test use.
 testing = []
-# Enables test modules that reference scp-runtime async types (mint, store,
-# create_inner_envelope). These tests cannot compile in scp-protocol alone
-# because scp-runtime is not a dependency. They run only when compiled
-# through scp-core's unified namespace.
-_runtime_tests = []
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 getrandom = { version = "0.2", features = ["js"] }

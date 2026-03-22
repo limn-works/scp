@@ -103,6 +103,14 @@ required-features = ["testing"]
 name = "content_access_integration"
 required-features = ["testing"]
 
+[[test]]
+name = "ucan_validate_integration"
+required-features = ["testing"]
+
+[[test]]
+name = "envelope_validation_integration"
+required-features = ["testing"]
+
 [[example]]
 name = "identity"
 
