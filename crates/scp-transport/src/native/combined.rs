@@ -583,7 +583,7 @@ mod tests {
     fn test_clock(start: u64) -> (ClockFn, Arc<AtomicU64>) {
         let time = Arc::new(AtomicU64::new(start));
         let time_clone = Arc::clone(&time);
-        let clock: ClockFn = Arc::new(move || Ok(time_clone.load(Ordering::Relaxed)));
+        let clock: ClockFn = Arc::new(move || time_clone.load(Ordering::Relaxed));
         (clock, time)
     }
 

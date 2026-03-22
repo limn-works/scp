@@ -163,9 +163,7 @@ pub trait TimestampProvider: Send + Sync {
 pub struct SystemTimestamp;
 
 impl TimestampProvider for SystemTimestamp {
-    #[allow(clippy::expect_used)]
     fn now_millis(&self) -> u64 {
-        // The TimestampProvider trait returns u64 (not Result), so we cannot
         scp_primitives::SystemClock.now_millis()
     }
 }
