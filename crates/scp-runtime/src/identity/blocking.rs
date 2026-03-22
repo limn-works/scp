@@ -32,10 +32,10 @@ use serde::{Deserialize, Serialize};
 use scp_identity::DID;
 use scp_platform::traits::{KeyCustody, KeyHandle};
 
-use crate::crypto::sender_keys::{
-    RotateForBlockParams, RotateForBlockResult, SenderKeyError, rotate_sender_key_for_block,
-    send_block_notification,
+use crate::crypto::sender_keys::key_protocol::{
+    rotate_sender_key_for_block, send_block_notification,
 };
+use crate::crypto::sender_keys::{RotateForBlockParams, RotateForBlockResult, SenderKeyError};
 use crate::identity::SigningKeyId;
 use crate::identity::block_list::{BlockListEvent, BlockListState};
 use scp_primitives::Clock;

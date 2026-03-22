@@ -27,7 +27,7 @@ use std::collections::{HashMap, HashSet};
 
 use serde::{Deserialize, Serialize};
 
-use scp_identity::DID;
+use scp_primitives::DID;
 
 // ---------------------------------------------------------------------------
 // BlockListEvent

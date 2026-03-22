@@ -29,7 +29,7 @@ use super::{
     KeyResolver, ProposalId, ProposalStatus, RejectionReason, VoteType, compute_proposal_id,
     sign_vote, verify_vote,
 };
-use scp_identity::DID;
+use scp_primitives::DID;
 
 // ---------------------------------------------------------------------------
 // ThresholdEngine

@@ -12,7 +12,7 @@
 
 use std::time::Duration;
 
-use scp_identity::DID;
+use scp_primitives::DID;
 use serde::{Deserialize, Serialize};
 
 use crate::bridge::BridgeMode;

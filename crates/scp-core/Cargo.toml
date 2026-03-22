@@ -14,7 +14,6 @@ scp-runtime = { path = "../scp-runtime", version = "=0.1.0-beta.1" }
 [features]
 testing = ["scp-runtime/testing"]
 allow_unencrypted_storage = ["scp-runtime/allow_unencrypted_storage"]
-allow_in_memory_custody = ["scp-runtime/allow_in_memory_custody"]
 
 [dev-dependencies]
 serde_json = { workspace = true }

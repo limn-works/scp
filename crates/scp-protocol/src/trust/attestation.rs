@@ -32,8 +32,8 @@ use serde::{Deserialize, Serialize};
 use crate::crypto::ed25519::verify_ed25519_signature;
 use crate::identity::attestation::AttestationClass;
 use scp_event_log::Ed25519Signature;
-use scp_identity::DID;
 use scp_primitives::Clock;
+use scp_primitives::DID;
 
 use super::{AttestationType, TrustError};
 
@@ -632,7 +632,7 @@ impl DidPublicKeyResolver for IdentityDidPublicKeyResolver {
         // did:dht:z... — extract the 32-byte Ed25519 public key from the
         // z-base-32-encoded suffix.
         if did.starts_with("did:dht:z") {
-            let key = scp_identity::extract_public_key(did).map_err(|e| {
+            let key = crate::identity::extract_public_key_from_did(did).map_err(|e| {
                 TrustError::AttestationSignatureInvalid {
                     attestation_id: String::new(),
                     reason: format!("failed to extract public key from DID {did}: {e}"),
@@ -1281,7 +1281,7 @@ mod tests {
 
     use super::*;
     use ed25519_dalek::{Signer, SigningKey};
-    use scp_identity::cache::TestClock;
+    use scp_primitives::TestClock;
 
     /// A test resolver that maps DIDs to public key bytes.
     struct TestResolver {

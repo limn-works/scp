@@ -31,7 +31,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use scp_identity::DID;
+use scp_primitives::DID;
 
 use super::{
     GovernanceAction, GovernanceContext, GovernanceError, GovernanceProposal, ProposalStatus,
@@ -71,7 +71,7 @@ pub enum MlsImpact {
 /// ```rust
 /// use scp_core::context::governance::mls_integration::{classify_action, MlsImpact};
 /// use scp_core::context::governance::GovernanceAction;
-/// use scp_identity::DID;
+/// use scp_primitives::DID;
 ///
 /// let add = GovernanceAction::AddMember {
 ///     did: DID::from("did:dht:z6MkTest"),
@@ -498,7 +498,7 @@ mod tests {
         GovernanceAction, GovernanceProposal, ProposalStatus, RevocationScope, VoteType, sign_vote,
     };
     use crate::context::params::{Capability, ContextParams, ToolRegistration};
-    use scp_identity::DID;
+    use scp_primitives::DID;
 
     fn alice() -> DID {
         DID::from("did:dht:z6MkAlice")

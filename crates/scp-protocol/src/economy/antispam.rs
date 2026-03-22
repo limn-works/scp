@@ -24,7 +24,7 @@
 use std::collections::HashMap;
 use std::sync::Mutex;
 
-use scp_identity::DID;
+use scp_primitives::DID;
 
 use super::types::Amount;
 

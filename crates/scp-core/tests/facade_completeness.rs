@@ -3,12 +3,12 @@
 //! not wired through the facade, this test fails to compile.
 
 // Protocol types (from scp-protocol)
-use scp_core::trust::TrustError;
-use scp_core::crypto::ucan::UcanError;
-use scp_core::crypto::sender_keys::SenderKey;
-use scp_core::envelope::EnvelopeError;
 use scp_core::bridge::BridgeMode;
+use scp_core::crypto::sender_keys::SenderKey;
+use scp_core::crypto::ucan::UcanError;
+use scp_core::envelope::EnvelopeError;
 use scp_core::provenance::DataProvenance;
+use scp_core::trust::TrustError;
 
 // Runtime types (from scp-runtime)
 use scp_core::crypto::mls::MlsCryptoProvider;

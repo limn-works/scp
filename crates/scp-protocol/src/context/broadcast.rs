@@ -26,7 +26,7 @@ use crate::crypto::ucan::capability::CapabilityUri;
 use crate::crypto::ucan::validate::{
     DidResolver, NonceTracker, ProofResolver, RevocationChecker, ValidationContext, validate_ucan,
 };
-use scp_identity::DID;
+use scp_primitives::DID;
 
 // ---------------------------------------------------------------------------
 // BroadcastAdmission
@@ -576,10 +576,7 @@ impl BroadcastContext {
     ///
     /// Returns [`ContextError::MemberNotFound`] if the author DID is not
     /// registered.
-    pub(crate) fn block_author(
-        &mut self,
-        author_did: &str,
-    ) -> Result<AuthorBlockResult, ContextError> {
+    pub fn block_author(&mut self, author_did: &str) -> Result<AuthorBlockResult, ContextError> {
         let author_state = self.authors.remove(author_did).ok_or_else(|| {
             ContextError::MemberNotFound(format!("author not found: {author_did}"))
         })?;

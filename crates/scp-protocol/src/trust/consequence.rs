@@ -15,7 +15,7 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 
 use scp_event_log::{Event, EventType};
-use scp_identity::DID;
+use scp_primitives::DID;
 
 // ---------------------------------------------------------------------------
 // ConsequenceTrigger

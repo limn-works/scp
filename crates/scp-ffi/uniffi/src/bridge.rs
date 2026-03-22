@@ -4181,7 +4181,7 @@ pub async fn tool_interface_expose(
             let registry = handle.tool_registry.lock().await;
 
             let interface = scp_core::context::tools::interface::expose_tool(
-                &context_handle,
+                context_handle.context_id(),
                 &tool_id,
                 &target_context_id,
                 &role_state,
@@ -4269,7 +4269,7 @@ pub async fn tool_interface_accept(
             );
 
             scp_core::context::tools::interface::accept_tool_interface(
-                &context_handle,
+                context_handle.context_id(),
                 &mut interface,
                 &role_state,
                 &handle.creator_did,

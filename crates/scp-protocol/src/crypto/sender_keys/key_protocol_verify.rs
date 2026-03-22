@@ -70,7 +70,7 @@ const HPKE_INFO_PREFIX: &[u8] = b"scp-sender-key-v1";
 pub const GRACE_PERIOD_SECS: u64 = 30;
 
 /// Size of the cryptographic nonce embedded in sender key requests (bytes).
-pub(crate) const REQUEST_NONCE_SIZE: usize = 16;
+pub const REQUEST_NONCE_SIZE: usize = 16;
 
 /// Duration in seconds for which a seen nonce is remembered to prevent replay.
 const NONCE_EXPIRY_SECS: u64 = 300; // 5 minutes
@@ -696,7 +696,7 @@ impl NonceDedup {
 // HPKE context binding helpers (§9.16.2)
 // ---------------------------------------------------------------------------
 
-pub(super) fn build_hpke_info(context_id: &str, sender_did: &str, epoch: u64) -> Vec<u8> {
+pub fn build_hpke_info(context_id: &str, sender_did: &str, epoch: u64) -> Vec<u8> {
     let ctx_bytes = context_id.as_bytes();
     let did_bytes = sender_did.as_bytes();
     // 4-byte BE length prefix per variable-length field prevents boundary-shift collisions.
@@ -715,7 +715,7 @@ pub(super) fn build_hpke_info(context_id: &str, sender_did: &str, epoch: u64) ->
     info
 }
 
-pub(super) fn build_hpke_aad(context_id: &str, sender_did: &str, epoch: u64) -> Vec<u8> {
+pub fn build_hpke_aad(context_id: &str, sender_did: &str, epoch: u64) -> Vec<u8> {
     let ctx_bytes = context_id.as_bytes();
     let did_bytes = sender_did.as_bytes();
     // 4-byte BE length prefix per variable-length field prevents boundary-shift collisions.
@@ -877,7 +877,7 @@ pub fn aes128gcm_decrypt(
 /// Variable-length fields are prefixed with their length as a 4-byte
 /// big-endian u32 to prevent field-boundary ambiguity. The domain separator
 /// prevents cross-protocol hash confusion.
-pub(super) fn compute_epoch_advance_hash(
+pub fn compute_epoch_advance_hash(
     context_id: &str,
     sender_did: &str,
     epoch: u64,
@@ -907,7 +907,7 @@ pub(super) fn compute_epoch_advance_hash(
 /// big-endian u32 to prevent field-boundary ambiguity. The domain separator
 /// prevents cross-protocol hash confusion. `nonce` is fixed-size
 /// (`REQUEST_NONCE_SIZE`) and needs no prefix.
-pub(super) fn compute_request_hash(
+pub fn compute_request_hash(
     requester_did: &str,
     sender_did: &str,
     epoch: u64,
@@ -940,7 +940,7 @@ pub(super) fn compute_request_hash(
 /// big-endian u32 to prevent field-boundary ambiguity. The domain separator
 /// prevents cross-protocol hash confusion.
 #[allow(clippy::similar_names)] // blocker_did/blocked_did are domain terms
-pub(super) fn compute_block_notification_hash(
+pub fn compute_block_notification_hash(
     context_id: &str,
     blocker_did: &str,
     blocked_did: &str,

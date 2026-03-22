@@ -28,7 +28,6 @@ use sha2::{Digest, Sha256};
 use super::lifecycle::{ToolStatus, sha256_json};
 use super::registry::{ToolRegistration, ToolRegistry};
 use super::{DID, ToolError, ToolId, has_admin_role};
-use crate::context::ContextHandle;
 use crate::context::roles::ContextRoleState;
 use crate::provenance::attach::effective_max_chain_depth;
 
@@ -709,7 +708,7 @@ pub struct CrossContextToolEvent {
 /// Returns [`ToolError::ToolNotFound`] if the tool is not in the registry.
 #[allow(clippy::too_many_arguments)]
 pub fn expose_tool(
-    context: &ContextHandle,
+    context_id: &str,
     tool_id: &ToolId,
     to_context: &ContextId,
     role_state: &ContextRoleState,
@@ -734,7 +733,7 @@ pub fn expose_tool(
 
     let default_window = Duration::from_secs(DEFAULT_WINDOW_SECONDS);
     Ok(ToolInterface {
-        source_context: context.context_id().to_owned(),
+        source_context: context_id.to_owned(),
         target_context: to_context.to_owned(),
         tool_id: tool_id.to_owned(),
         rate_limit,
@@ -838,7 +837,7 @@ pub fn revoke_tool_interface(
 /// Returns [`ToolError::InterfaceContextMismatch`] if the interface's target
 /// context does not match the provided context handle.
 pub fn accept_tool_interface(
-    context: &ContextHandle,
+    context_id: &str,
     interface: &mut ToolInterface,
     role_state: &ContextRoleState,
     admin_did: &str,
@@ -852,10 +851,10 @@ pub fn accept_tool_interface(
     }
 
     // Verify the interface targets this context.
-    if interface.target_context != context.context_id() {
+    if interface.target_context != context_id {
         return Err(ToolError::InterfaceContextMismatch {
             expected: interface.target_context.clone(),
-            actual: context.context_id().to_owned(),
+            actual: context_id.to_owned(),
         });
     }
 
@@ -913,7 +912,8 @@ pub fn accept_tool_interface(
 /// required capability in the source context.
 #[allow(clippy::too_many_arguments)]
 pub fn invoke_cross_context<F>(
-    source_context: &ContextHandle,
+    source_context_id: &str,
+    source_max_chain_depth: Option<u8>,
     interface: &mut ToolInterface,
     input: &serde_json::Value,
     invoker_did: &DID,
@@ -935,7 +935,7 @@ where
 {
     // 0. Enforce chain depth limit from the source context's configured max
     // (spec §24.4). Falls back to DEFAULT_MAX_CHAIN_DEPTH (8) when unconfigured (ADR-043).
-    let max_depth = effective_max_chain_depth(source_context.params().max_chain_depth);
+    let max_depth = effective_max_chain_depth(source_max_chain_depth);
     if chain_depth > max_depth {
         return Err(ToolError::ChainDepthExceeded {
             depth: chain_depth,
@@ -952,10 +952,10 @@ where
     }
 
     // Verify the source context matches the interface.
-    if interface.source_context != source_context.context_id() {
+    if interface.source_context != source_context_id {
         return Err(ToolError::InterfaceContextMismatch {
             expected: interface.source_context.clone(),
-            actual: source_context.context_id().to_owned(),
+            actual: source_context_id.to_owned(),
         });
     }
 
@@ -1008,11 +1008,7 @@ where
     }
 
     // 5. Source context governance: invoker must have tool invoke capability.
-    if !super::invoke::has_tool_invoke_capability(
-        source_role_state,
-        invoker_did,
-        &interface.tool_id,
-    ) {
+    if !super::has_tool_invoke_capability(source_role_state, invoker_did, &interface.tool_id) {
         return Err(ToolError::InterfaceInvokerNotAuthorized {
             did: invoker_did.to_string(),
             tool_id: interface.tool_id.clone(),
@@ -1151,9 +1147,9 @@ mod tests {
         state
     }
 
-    /// Creates a context handle (in Creating state).
-    fn test_context(context_id: &str) -> ContextHandle {
-        ContextHandle::new(context_id.to_owned(), ContextParams::default())
+    /// Returns a test context ID string.
+    fn test_context_id(context_id: &str) -> String {
+        context_id.to_owned()
     }
 
     /// Creates a valid tool registration and registers it in a fresh registry.
@@ -1213,7 +1209,7 @@ mod tests {
     fn expose_tool_creates_interface_with_source_approved() {
         let admin_did = "did:dht:z6MkAdmin";
         let source_role_state = test_role_state("ctx-source", admin_did);
-        let source_context = test_context("ctx-source");
+        let source_context = test_context_id("ctx-source");
         let registry = setup_registry_with_tool(&source_role_state, admin_did);
 
         let interface = expose_tool(
@@ -1250,7 +1246,7 @@ mod tests {
         let member_did = "did:dht:z6MkMember";
         let source_role_state =
             test_role_state_with_non_admin_member("ctx-source", admin_did, member_did);
-        let source_context = test_context("ctx-source");
+        let source_context = test_context_id("ctx-source");
         let registry = setup_registry_with_tool(&source_role_state, admin_did);
 
         let result = expose_tool(
@@ -1280,7 +1276,7 @@ mod tests {
     fn expose_tool_rejects_nonexistent_tool() {
         let admin_did = "did:dht:z6MkAdmin";
         let source_role_state = test_role_state("ctx-source", admin_did);
-        let source_context = test_context("ctx-source");
+        let source_context = test_context_id("ctx-source");
         let registry = ToolRegistry::new(); // Empty registry
 
         let result = expose_tool(
@@ -1309,7 +1305,7 @@ mod tests {
     fn expose_tool_includes_rate_limit_when_provided() {
         let admin_did = "did:dht:z6MkAdmin";
         let source_role_state = test_role_state("ctx-source", admin_did);
-        let source_context = test_context("ctx-source");
+        let source_context = test_context_id("ctx-source");
         let registry = setup_registry_with_tool(&source_role_state, admin_did);
 
         let rate_limit = RateLimit::new(10, Duration::from_secs(60), &scp_primitives::SystemClock);
@@ -1344,7 +1340,7 @@ mod tests {
     fn accept_tool_interface_sets_approved_by_target() {
         let admin_did = "did:dht:z6MkAdmin";
         let target_role_state = test_role_state("ctx-target", admin_did);
-        let target_context = test_context("ctx-target");
+        let target_context = test_context_id("ctx-target");
 
         let mut interface = ToolInterface {
             source_context: "ctx-source".to_owned(),
@@ -1383,7 +1379,7 @@ mod tests {
         let member_did = "did:dht:z6MkMember";
         let target_role_state =
             test_role_state_with_non_admin_member("ctx-target", admin_did, member_did);
-        let target_context = test_context("ctx-target");
+        let target_context = test_context_id("ctx-target");
 
         let mut interface = ToolInterface {
             source_context: "ctx-source".to_owned(),
@@ -1421,7 +1417,7 @@ mod tests {
     fn accept_tool_interface_rejects_context_mismatch() {
         let admin_did = "did:dht:z6MkAdmin";
         let target_role_state = test_role_state("ctx-wrong", admin_did);
-        let target_context = test_context("ctx-wrong");
+        let target_context = test_context_id("ctx-wrong");
 
         let mut interface = ToolInterface {
             source_context: "ctx-source".to_owned(),
@@ -1458,7 +1454,7 @@ mod tests {
     fn invoke_cross_context_succeeds_with_full_approval() {
         let admin_did = "did:dht:z6MkAdmin";
         let source_role_state = test_role_state("ctx-source", admin_did);
-        let source_context = test_context("ctx-source");
+        let source_context = test_context_id("ctx-source");
         let target_role_state = test_role_state("ctx-target", admin_did);
         let target_registry = setup_registry_with_tool(&target_role_state, admin_did);
 
@@ -1477,6 +1473,7 @@ mod tests {
         let input = serde_json::json!({"a": 3, "b": 4});
         let (output, source_event, target_event) = invoke_cross_context(
             &source_context,
+            None,
             &mut interface,
             &input,
             &DID::from(admin_did),
@@ -1516,7 +1513,7 @@ mod tests {
     fn invoke_cross_context_fails_when_only_source_approved() {
         let admin_did = "did:dht:z6MkAdmin";
         let source_role_state = test_role_state("ctx-source", admin_did);
-        let source_context = test_context("ctx-source");
+        let source_context = test_context_id("ctx-source");
         let target_role_state = test_role_state("ctx-target", admin_did);
         let target_registry = setup_registry_with_tool(&target_role_state, admin_did);
 
@@ -1534,6 +1531,7 @@ mod tests {
 
         let result = invoke_cross_context(
             &source_context,
+            None,
             &mut interface,
             &serde_json::json!({"a": 1, "b": 2}),
             &DID::from(admin_did),
@@ -1562,7 +1560,7 @@ mod tests {
     fn invoke_cross_context_fails_when_only_target_approved() {
         let admin_did = "did:dht:z6MkAdmin";
         let source_role_state = test_role_state("ctx-source", admin_did);
-        let source_context = test_context("ctx-source");
+        let source_context = test_context_id("ctx-source");
         let target_role_state = test_role_state("ctx-target", admin_did);
         let target_registry = setup_registry_with_tool(&target_role_state, admin_did);
 
@@ -1580,6 +1578,7 @@ mod tests {
 
         let result = invoke_cross_context(
             &source_context,
+            None,
             &mut interface,
             &serde_json::json!({"a": 1, "b": 2}),
             &DID::from(admin_did),
@@ -1608,7 +1607,7 @@ mod tests {
     fn invoke_cross_context_fails_when_neither_side_approved() {
         let admin_did = "did:dht:z6MkAdmin";
         let source_role_state = test_role_state("ctx-source", admin_did);
-        let source_context = test_context("ctx-source");
+        let source_context = test_context_id("ctx-source");
         let target_role_state = test_role_state("ctx-target", admin_did);
         let target_registry = setup_registry_with_tool(&target_role_state, admin_did);
 
@@ -1626,6 +1625,7 @@ mod tests {
 
         let result = invoke_cross_context(
             &source_context,
+            None,
             &mut interface,
             &serde_json::json!({"a": 1, "b": 2}),
             &DID::from(admin_did),
@@ -1651,7 +1651,7 @@ mod tests {
     fn invoke_cross_context_rate_limiting_rejects_beyond_limit() {
         let admin_did = "did:dht:z6MkAdmin";
         let source_role_state = test_role_state("ctx-source", admin_did);
-        let source_context = test_context("ctx-source");
+        let source_context = test_context_id("ctx-source");
         let target_role_state = test_role_state("ctx-target", admin_did);
         let target_registry = setup_registry_with_tool(&target_role_state, admin_did);
 
@@ -1679,6 +1679,7 @@ mod tests {
         // First call: should succeed.
         let result1 = invoke_cross_context(
             &source_context,
+            None,
             &mut interface,
             &input,
             &DID::from(admin_did),
@@ -1693,6 +1694,7 @@ mod tests {
         // Second call: should succeed (at limit).
         let result2 = invoke_cross_context(
             &source_context,
+            None,
             &mut interface,
             &input,
             &DID::from(admin_did),
@@ -1707,6 +1709,7 @@ mod tests {
         // Third call: should be rejected (over limit).
         let result3 = invoke_cross_context(
             &source_context,
+            None,
             &mut interface,
             &input,
             &DID::from(admin_did),
@@ -1732,7 +1735,7 @@ mod tests {
     fn invoke_cross_context_both_event_logs_record_provenance() {
         let admin_did = "did:dht:z6MkAdmin";
         let source_role_state = test_role_state("ctx-source", admin_did);
-        let source_context = test_context("ctx-source");
+        let source_context = test_context_id("ctx-source");
         let target_role_state = test_role_state("ctx-target", admin_did);
         let target_registry = setup_registry_with_tool(&target_role_state, admin_did);
 
@@ -1751,6 +1754,7 @@ mod tests {
         let input = serde_json::json!({"a": 10, "b": 20});
         let (output, source_event, target_event) = invoke_cross_context(
             &source_context,
+            None,
             &mut interface,
             &input,
             &DID::from(admin_did),
@@ -1798,7 +1802,7 @@ mod tests {
         let member_did = "did:dht:z6MkMember";
         let source_role_state =
             test_role_state_with_non_admin_member("ctx-source", admin_did, member_did);
-        let source_context = test_context("ctx-source");
+        let source_context = test_context_id("ctx-source");
         let target_role_state = test_role_state("ctx-target", admin_did);
         let target_registry = setup_registry_with_tool(&target_role_state, admin_did);
 
@@ -1816,6 +1820,7 @@ mod tests {
 
         let result = invoke_cross_context(
             &source_context,
+            None,
             &mut interface,
             &serde_json::json!({"a": 1, "b": 2}),
             &DID::from(member_did),
@@ -1841,7 +1846,7 @@ mod tests {
     fn invoke_cross_context_rejects_when_tool_not_in_target_registry() {
         let admin_did = "did:dht:z6MkAdmin";
         let source_role_state = test_role_state("ctx-source", admin_did);
-        let source_context = test_context("ctx-source");
+        let source_context = test_context_id("ctx-source");
         let target_registry = ToolRegistry::new(); // Empty target registry
 
         let mut interface = ToolInterface {
@@ -1858,6 +1863,7 @@ mod tests {
 
         let result = invoke_cross_context(
             &source_context,
+            None,
             &mut interface,
             &serde_json::json!({"a": 1, "b": 2}),
             &DID::from(admin_did),
@@ -1981,7 +1987,7 @@ mod tests {
     fn invoke_cross_context_rejects_chain_depth_exceeding_max() {
         let admin_did = "did:dht:z6MkAdmin";
         let source_role_state = test_role_state("ctx-source", admin_did);
-        let source_context = test_context("ctx-source");
+        let source_context = test_context_id("ctx-source");
         let target_role_state = test_role_state("ctx-target", admin_did);
         let target_registry = setup_registry_with_tool(&target_role_state, admin_did);
 
@@ -2000,6 +2006,7 @@ mod tests {
         // Chain depth 9 exceeds DEFAULT_MAX_CHAIN_DEPTH (8).
         let result = invoke_cross_context(
             &source_context,
+            None,
             &mut interface,
             &serde_json::json!({"a": 1, "b": 2}),
             &DID::from(admin_did),
@@ -2028,7 +2035,7 @@ mod tests {
     fn invoke_cross_context_allows_chain_depth_at_max() {
         let admin_did = "did:dht:z6MkAdmin";
         let source_role_state = test_role_state("ctx-source", admin_did);
-        let source_context = test_context("ctx-source");
+        let source_context = test_context_id("ctx-source");
         let target_role_state = test_role_state("ctx-target", admin_did);
         let target_registry = setup_registry_with_tool(&target_role_state, admin_did);
 
@@ -2047,6 +2054,7 @@ mod tests {
         // Chain depth 8 == DEFAULT_MAX_CHAIN_DEPTH, should succeed.
         let result = invoke_cross_context(
             &source_context,
+            None,
             &mut interface,
             &serde_json::json!({"a": 1, "b": 2}),
             &DID::from(admin_did),
@@ -2071,7 +2079,7 @@ mod tests {
     fn invoke_cross_context_executor_failure_propagates() {
         let admin_did = "did:dht:z6MkAdmin";
         let source_role_state = test_role_state("ctx-source", admin_did);
-        let source_context = test_context("ctx-source");
+        let source_context = test_context_id("ctx-source");
         let target_role_state = test_role_state("ctx-target", admin_did);
         let target_registry = setup_registry_with_tool(&target_role_state, admin_did);
 
@@ -2093,6 +2101,7 @@ mod tests {
 
         let result = invoke_cross_context(
             &source_context,
+            None,
             &mut interface,
             &serde_json::json!({"a": 1, "b": 2}),
             &DID::from(admin_did),
@@ -2264,12 +2273,9 @@ mod tests {
     fn invoke_cross_context_uses_context_configured_chain_depth() {
         let admin_did = "did:dht:z6MkAdmin";
         let source_role_state = test_role_state("ctx-source", admin_did);
-        // Create a context with max_chain_depth = 1.
-        let params = ContextParams {
-            max_chain_depth: Some(1),
-            ..ContextParams::default()
-        };
-        let source_context = ContextHandle::new("ctx-source".to_owned(), params);
+        // Context with max_chain_depth = 1.
+        let source_context = "ctx-source".to_owned();
+        let source_max_chain_depth = Some(1u8);
         let target_role_state = test_role_state("ctx-target", admin_did);
         let target_registry = setup_registry_with_tool(&target_role_state, admin_did);
 
@@ -2288,6 +2294,7 @@ mod tests {
         // Depth 1 should succeed (at limit).
         let result = invoke_cross_context(
             &source_context,
+            source_max_chain_depth,
             &mut interface,
             &serde_json::json!({"a": 1, "b": 2}),
             &DID::from(admin_did),
@@ -2302,6 +2309,7 @@ mod tests {
         // Depth 2 should fail (exceeds configured max of 1).
         let result = invoke_cross_context(
             &source_context,
+            source_max_chain_depth,
             &mut interface,
             &serde_json::json!({"a": 1, "b": 2}),
             &DID::from(admin_did),
@@ -2511,7 +2519,7 @@ mod tests {
     fn invoke_cross_context_burst_allows_calls_above_limit() {
         let admin_did = "did:dht:z6MkAdmin";
         let source_role_state = test_role_state("ctx-source", admin_did);
-        let source_context = test_context("ctx-source");
+        let source_context = test_context_id("ctx-source");
         let target_role_state = test_role_state("ctx-target", admin_did);
         let target_registry = setup_registry_with_tool(&target_role_state, admin_did);
 
@@ -2540,6 +2548,7 @@ mod tests {
         for i in 0..2 {
             let result = invoke_cross_context(
                 &source_context,
+                None,
                 &mut interface,
                 &input,
                 &DID::from(admin_did),
@@ -2556,6 +2565,7 @@ mod tests {
         for i in 0..5 {
             let result = invoke_cross_context(
                 &source_context,
+                None,
                 &mut interface,
                 &input,
                 &DID::from(admin_did),
@@ -2571,6 +2581,7 @@ mod tests {
         // 8th call: exceeds burst allowance.
         let result = invoke_cross_context(
             &source_context,
+            None,
             &mut interface,
             &input,
             &DID::from(admin_did),

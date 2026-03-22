@@ -36,6 +36,7 @@ unicode-normalization = { workspace = true }
 jsonschema = { version = "0.28", default-features = false }
 metrics = { workspace = true }
 lru = { workspace = true }
+z-base-32 = { workspace = true }
 
 [dev-dependencies]
 serde_json = { workspace = true }

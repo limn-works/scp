@@ -431,9 +431,7 @@ pub const fn validate_inner_version(
 
 /// Computes `SHA-256(serialize(provenance))` if present, or `SHA-256(0x00)` if
 /// absent. Returns a fixed-size 32-byte array (SHA-256 output).
-pub(crate) fn compute_provenance_hash(
-    provenance: Option<&Provenance>,
-) -> Result<[u8; 32], EnvelopeError> {
+pub fn compute_provenance_hash(provenance: Option<&Provenance>) -> Result<[u8; 32], EnvelopeError> {
     match provenance {
         Some(p) => {
             let serialized = rmp_serde::to_vec(p)
@@ -468,7 +466,7 @@ pub(crate) fn compute_provenance_hash(
 ///         || len(provenance_hash) || provenance_hash
 ///         || len(signing_key_id) || signing_key_id)
 /// ```
-pub(crate) fn compute_canonical_hash(
+pub fn compute_canonical_hash(
     params: &InnerEnvelopeParams<'_>,
     payload_hash: &[u8; 32],
     provenance_hash: &[u8; 32],

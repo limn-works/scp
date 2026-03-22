@@ -887,7 +887,7 @@ impl ContextRoleState {
     /// Called when a member has both read and write access revoked. The member
     /// remains in the context but cannot influence governance decisions about
     /// content they cannot see.
-    pub fn revoke_governance_capabilities(&mut self, member_did: &scp_identity::DID) {
+    pub fn revoke_governance_capabilities(&mut self, member_did: &scp_primitives::DID) {
         let did_str = member_did.as_ref();
         if let Some(caps) = self.member_capabilities.get_mut(did_str) {
             caps.remove(&Capability::GovernanceVote);
@@ -901,7 +901,7 @@ impl ContextRoleState {
     /// Called when a presence-only member has read or write access restored,
     /// taking them out of presence-only state. Only restores capabilities
     /// that exist in the member's role definition AND the context ceiling.
-    pub fn restore_governance_capabilities(&mut self, member_did: &scp_identity::DID) {
+    pub fn restore_governance_capabilities(&mut self, member_did: &scp_primitives::DID) {
         let did_str = member_did.as_ref();
         // Look up the member's current role to see which capabilities they
         // should have. Only restore governance capabilities that are in the

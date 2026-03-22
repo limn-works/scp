@@ -11,11 +11,12 @@ use sha2::{Digest, Sha256};
 
 use scp_platform::traits::{KeyCustody, KeyHandle};
 
-use super::{
-    EnvelopeError, InnerEnvelope, InnerEnvelopeParams, SCP_INNER_ENVELOPE_VERSION,
-    compute_canonical_hash, compute_provenance_hash,
-};
+use super::{InnerEnvelope, InnerEnvelopeParams, SCP_INNER_ENVELOPE_VERSION};
+use crate::envelope::EnvelopeError;
+
+// These functions are in the inner envelope module.
 use crate::envelope::padding::pad_to_bucket;
+use scp_protocol::envelope::inner::{compute_canonical_hash, compute_provenance_hash};
 
 // ---------------------------------------------------------------------------
 // Construction

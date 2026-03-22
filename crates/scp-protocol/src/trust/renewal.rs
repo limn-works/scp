@@ -188,7 +188,7 @@ mod tests {
     use super::*;
     use crate::trust::AttestationType;
     use crate::trust::attestation::{RevocationStatus, canonical_attestation_bytes};
-    use scp_identity::cache::TestClock;
+    use scp_primitives::TestClock;
 
     struct TestResolver {
         keys: HashMap<String, Vec<u8>>,

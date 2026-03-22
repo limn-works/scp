@@ -17,8 +17,8 @@ use serde_json::Value;
 
 use super::{ToolError, ToolId, ToolRegistry, ToolVerificationResult, VectorResult};
 use crate::trust::challenge::{ChallengeType, ChallengeVerification, VerificationMethod};
-use scp_identity::DID;
 use scp_primitives::Clock;
+use scp_primitives::DID;
 
 // ---------------------------------------------------------------------------
 // Schema compatibility checking

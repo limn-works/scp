@@ -6,6 +6,7 @@
 
 pub mod broadcast;
 pub mod broadcast_content;
+pub mod builder;
 pub mod close;
 pub mod governance;
 pub mod invitation;
@@ -14,6 +15,7 @@ pub mod memory_scope;
 pub mod metadata;
 pub mod nesting;
 pub mod params;
+pub mod policy;
 pub mod promotion;
 pub mod roles;
 pub mod state_machine;
@@ -22,6 +24,32 @@ pub mod tools;
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+
+// Re-exports for backward compatibility — downstream code uses `crate::context::X`.
+pub use broadcast_content::{BroadcastContent, BroadcastContentError};
+pub use governance::{
+    CheckpointAttestationStatus, ConflictResolution, CosignedCheckpoint, GovernanceAction,
+    GovernanceContext, GovernanceEngine, GovernanceError, GovernanceEvent, GovernanceModelConfig,
+    GovernanceProposal, GovernanceReconfigAction, KeyResolver, ProposalId, ProposalStatus,
+    RejectionReason, RevocationScope, SignedVote, VoteType, actions_conflict, compute_proposal_id,
+    sign_vote, verify_proposal_votes, verify_vote,
+};
+pub use membership::{MemberInfo, MembershipState};
+pub use params::{
+    BridgeCapability, BridgeDirectionality, BridgeMetadata, Capability, CeilingPolicy, ContextMode,
+    ContextParams, FieldVisibility, GovernanceModel, MemoryScope, MetadataVisibilityPolicy,
+    MigrationSource, ProjectionOverride, ProjectionPolicy, ProjectionRule, PromotionPolicy,
+    PublicMetadata, RoleDefinition, RuntimeMetadata, TemplateId, ToolRegistration,
+    decode_protocol_version, encode_protocol_version,
+};
+pub use roles::{
+    CapabilityCeiling, ContextRoleState, RoleAssignment, RoleError, UcanAttestation, UcanToken,
+    assign_role, builtin_admin, builtin_author, builtin_broadcast_roles, builtin_member,
+    builtin_moderator, builtin_observer, builtin_roles, builtin_subscriber, check_ceiling,
+    validate_role_definition,
+};
+pub use state_machine::transition;
+pub use templates::{TemplateError, template_params, validate_against_template};
 
 /// Converts a `context_id` string to a deterministic 32-byte array using SHA-256.
 ///

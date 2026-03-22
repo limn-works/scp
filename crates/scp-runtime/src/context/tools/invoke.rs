@@ -15,12 +15,12 @@ use std::future::Future;
 use std::hash::BuildHasher;
 use std::time::Duration;
 
+use super::ToolId;
 use super::lifecycle::{
     DEFAULT_TIMEOUT_MS, MAX_TIMEOUT_MS, ToolInvokedEvent, ToolStatus, sha256_json,
 };
 use super::registry::ToolRegistry;
 use super::schema::validate_value_against_schema;
-use super::{DID, ToolId};
 use crate::context::roles::{Capability, ContextRoleState};
 use crate::context::{ContextHandle, ContextState};
 use crate::crypto::ucan::UcanError;
@@ -29,6 +29,7 @@ use crate::crypto::ucan::validate::{
     DidResolver, NonceTracker, ProofResolver, RevocationChecker, ValidationContext, parse_ucan,
     validate_ucan,
 };
+use scp_primitives::DID;
 
 // ---------------------------------------------------------------------------
 // InvocationError

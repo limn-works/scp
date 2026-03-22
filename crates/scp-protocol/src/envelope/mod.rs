@@ -9,6 +9,11 @@ pub mod outer;
 pub mod padding;
 pub mod validation;
 
+// Re-exports for backward compatibility.
+pub use inner::{InnerEnvelope, InnerEnvelopeParams, MessageType, Provenance};
+pub use outer::{OuterEnvelope, create_outer_envelope};
+pub use padding::BUCKET_SIZES;
+
 /// SCP protocol version for wire structures (§13.2).
 ///
 /// Encoded as `(major << 8) | minor`. SCP/1.0 = `0x0100` (decimal 256).

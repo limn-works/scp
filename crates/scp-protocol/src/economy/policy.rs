@@ -430,7 +430,7 @@ mod tests {
         Coefficient, PricingFormula, PricingMetric, PricingVariable, SubscriptionCost,
         SubscriptionPeriod,
     };
-    use scp_identity::DID;
+    use scp_primitives::DID;
 
     // --- Helpers ---
 

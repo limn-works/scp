@@ -370,7 +370,7 @@ mod tests {
     use std::sync::Arc;
 
     use super::*;
-    use scp_identity::cache::TestClock;
+    use scp_primitives::TestClock;
 
     /// Base timestamp for tests: 2024-01-01 00:00:00 UTC in seconds.
     const BASE_SECS: u64 = 1_704_067_200;

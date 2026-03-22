@@ -7,11 +7,12 @@
 
 use sha2::{Digest, Sha256};
 
-use super::{EnvelopeError, OuterEnvelope, create_outer_envelope};
+use super::{OuterEnvelope, create_outer_envelope};
 use crate::crypto::mls::encrypt::{decrypt_with_sender_key, encrypt, serialize_ciphertext};
 use crate::crypto::mls::group::ScpMlsGroup;
 use crate::crypto::sender_keys::SenderKey;
 use crate::crypto::sender_keys::encrypt::{decrypt_sender_layer, encrypt_sender_layer};
+use crate::envelope::EnvelopeError;
 use crate::envelope::inner::{InnerEnvelope, verify_inner_signature};
 use crate::envelope::padding::strip_padding;
 

@@ -24,7 +24,7 @@ use std::time::{Duration, Instant};
 use crate::context::params::ContextParams;
 use crate::context::policy::{AutoAcceptPolicy, RateLimit, TrustRequirement, auto_accept_allowed};
 use crate::context::templates::validate_against_template;
-use scp_identity::DID;
+use scp_primitives::DID;
 
 // ---------------------------------------------------------------------------
 // InvitationError
@@ -318,7 +318,7 @@ mod tests {
     use crate::context::params::{Capability, ContextMode, ContextParams, TemplateId};
     use crate::context::policy::{AutoAcceptPolicy, RateLimit, TrustRequirement};
     use crate::economy::{Amount, CostSchedule, CurrencyCode, EconomicPolicy};
-    use scp_identity::DID;
+    use scp_primitives::DID;
     use std::time::Duration;
 
     // --- Test TrustOracle implementation ---

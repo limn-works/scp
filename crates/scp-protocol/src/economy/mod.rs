@@ -9,3 +9,6 @@ pub mod estimate;
 pub mod policy;
 pub mod pricing;
 pub mod types;
+
+// Re-exports for backward compatibility.
+pub use types::{Amount, CurrencyCode, EconomicPolicy, PaidActionType};

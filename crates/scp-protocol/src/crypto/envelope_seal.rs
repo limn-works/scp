@@ -8,7 +8,9 @@ use sha2::{Digest, Sha256};
 use x25519_dalek::{EphemeralSecret, PublicKey as X25519Pub};
 use zeroize::Zeroizing;
 
-use super::sender_keys::key_protocol::{aes128gcm_decrypt, aes128gcm_encrypt, hkdf_derive_key};
+use super::sender_keys::key_protocol_verify::{
+    aes128gcm_decrypt, aes128gcm_encrypt, hkdf_derive_key,
+};
 
 /// Errors from envelope seal/open operations.
 #[derive(Debug, thiserror::Error)]

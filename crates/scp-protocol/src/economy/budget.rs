@@ -9,7 +9,7 @@
 
 use std::collections::HashMap;
 
-use scp_identity::DID;
+use scp_primitives::DID;
 use serde::{Deserialize, Serialize};
 
 use super::types::Amount;

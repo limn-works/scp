@@ -10,7 +10,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use scp_identity::DID;
+use scp_primitives::DID;
 
 // ---------------------------------------------------------------------------
 // Amount

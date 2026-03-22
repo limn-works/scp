@@ -11,7 +11,7 @@ pub mod shadow;
 
 use serde::{Deserialize, Serialize};
 
-use scp_identity::DID;
+use scp_primitives::DID;
 
 // ---------------------------------------------------------------------------
 // Type aliases

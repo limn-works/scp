@@ -23,7 +23,7 @@ use scp_primitives::Clock;
 
 use crate::economy::types::Amount;
 use crate::provenance::DataProvenance;
-use scp_identity::DID;
+use scp_primitives::DID;
 
 /// Type alias for tool invocation provenance.
 ///

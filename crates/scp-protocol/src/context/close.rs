@@ -33,7 +33,7 @@ use super::memory_scope::{
     BlobId, ContextId, KeyDestructionLevel, KeyDestructionOrchestrator, KeyDestructionResult,
 };
 use super::{ContextError, MemoryScope};
-use scp_identity::DID;
+use scp_primitives::DID;
 
 // ---------------------------------------------------------------------------
 // IncompleteVerificationPolicy

@@ -15,11 +15,26 @@ pub mod participation;
 pub mod renewal;
 pub mod sybil;
 
+// Re-exports for backward compatibility.
+pub use attestation::{
+    Attestation, AttestationEvidence, DidPublicKeyResolver, IdentityDidPublicKeyResolver,
+    RevocationStatus, verify_attestation, verify_attestation_with_revocation,
+};
+pub use capability_uri::{CapabilityUri, CapabilityUriError};
+pub use challenge::{
+    ChallengeRequest, ChallengeResponse, ChallengeSigner, ChallengeType, ChallengeVerification,
+    issue_challenge, verify_challenge_response,
+};
+pub use custody_violation::{CustodyViolationError, ScpCustodyViolationAttestation};
+pub use participation::{
+    ParticipationProfile, ParticipationRecord, RequireParticipation, compute_participation_record,
+};
+
 use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
 
-use scp_identity::DID;
+use scp_primitives::DID;
 
 // ---------------------------------------------------------------------------
 // Type aliases

@@ -29,8 +29,8 @@ use std::hash::BuildHasher;
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 
-use scp_identity::SigningKeyId;
 use scp_primitives::Clock;
+use scp_primitives::SigningKeyId;
 
 use super::capability::{CapabilityUri, check_capability_match, verify_ceiling_compliance};
 use super::revoke::compute_revocation_cid;

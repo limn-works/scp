@@ -27,16 +27,18 @@ pub mod economy;
 pub mod envelope;
 pub mod event_log;
 pub mod identity;
-pub(crate) mod jcs;
 pub mod metrics;
 pub mod provenance;
-pub mod serde_util;
 pub mod store;
 pub mod sync;
-pub mod time;
 pub mod trust;
-pub mod uri;
 pub mod well_known;
+
+// Re-export modules that moved to scp-protocol for backward compatibility.
+pub use scp_protocol::jcs;
+pub use scp_protocol::serde_util;
+pub use scp_protocol::time;
+pub use scp_protocol::uri;
 
 // Re-export the MLS module's primary types at the crate level for convenience.
 pub use crypto::mls;

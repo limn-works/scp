@@ -974,7 +974,7 @@ pub async fn tool_interface_expose(
         );
 
         let interface = scp_core::context::tools::interface::expose_tool(
-            &context_handle,
+            context_handle.context_id(),
             &tool_id,
             &target_context_id,
             &rt.role_state,
@@ -1039,7 +1039,7 @@ pub async fn tool_interface_accept(
         );
 
         scp_core::context::tools::interface::accept_tool_interface(
-            &context_handle,
+            context_handle.context_id(),
             &mut interface,
             &rt.role_state,
             &rt.creator_did,

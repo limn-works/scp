@@ -30,18 +30,39 @@
 pub mod app_sandbox;
 pub mod builder;
 pub mod export_import;
+pub mod governance;
 pub mod manager;
 pub mod policy;
 pub mod providers;
 pub mod standing;
 pub mod ttl;
 
+// Re-export pure modules from scp-protocol for backward compatibility.
+pub use scp_protocol::context::broadcast;
+pub use scp_protocol::context::broadcast_content;
+pub use scp_protocol::context::close;
+pub use scp_protocol::context::invitation;
+pub use scp_protocol::context::membership;
+pub use scp_protocol::context::memory_scope;
+pub use scp_protocol::context::metadata;
+pub use scp_protocol::context::nesting;
+pub use scp_protocol::context::params;
+pub use scp_protocol::context::promotion;
+pub use scp_protocol::context::roles;
+pub use scp_protocol::context::state_machine;
+pub use scp_protocol::context::templates;
+pub mod tools;
+
+// Re-export key types from scp-protocol::context at this level.
+pub use scp_protocol::context::{
+    CapabilityCeiling, ContextError, ContextMode, ContextParams, ContextRoleState, ContextState,
+    MemoryScope, TemplateId, context_id_bytes, transition,
+};
+
 use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 use tokio::sync::RwLock;
-
-// Async submodule re-exports remain here. Pure types are in scp-protocol.
 
 // ---------------------------------------------------------------------------
 // ContextInner

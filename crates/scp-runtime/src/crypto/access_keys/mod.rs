@@ -5,3 +5,7 @@
 
 pub mod lifecycle;
 pub mod wire;
+
+// Re-export pure types from scp-protocol.
+pub use scp_protocol::crypto::access_keys::wrapping;
+pub use scp_protocol::crypto::access_keys::*;

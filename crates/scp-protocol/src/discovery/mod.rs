@@ -4,6 +4,7 @@
 //! Async modules (addressing, search, did_capabilities, bootstrap, dht_context)
 //! stay in scp-runtime.
 
+pub mod addressing;
 pub mod context;
 pub mod handles;
 pub mod petnames;
@@ -14,7 +15,7 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
-use scp_identity::DID;
+use scp_primitives::DID;
 
 // ---------------------------------------------------------------------------
 // Type aliases

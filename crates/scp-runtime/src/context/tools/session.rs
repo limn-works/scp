@@ -30,7 +30,8 @@ use scp_primitives::Clock;
 use super::invoke::has_tool_invoke_capability;
 use super::registry::ToolRegistry;
 use super::schema::validate_value_against_schema;
-use super::{DID, ToolError, ToolId};
+use super::{ToolError, ToolId};
+use scp_primitives::DID;
 
 /// Default maximum concurrent sessions per calling context (spec §6.2.1, ADR-043).
 ///

@@ -15,8 +15,8 @@ use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
 
-use scp_identity::DID;
 use scp_primitives::Clock;
+use scp_primitives::DID;
 
 use super::ContextId;
 use super::addressing::AddressingError;

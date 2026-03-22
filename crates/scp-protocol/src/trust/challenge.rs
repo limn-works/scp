@@ -30,8 +30,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::crypto::ed25519::verify_ed25519_signature;
 use scp_event_log::Ed25519Signature;
-use scp_identity::DID;
 use scp_primitives::Clock;
+use scp_primitives::DID;
 
 use super::TrustError;
 use super::attestation::DidPublicKeyResolver;
@@ -759,7 +759,7 @@ mod tests {
     use ed25519_dalek::{Signer, SigningKey};
 
     use super::*;
-    use scp_identity::cache::TestClock;
+    use scp_primitives::TestClock;
 
     // -----------------------------------------------------------------------
     // Test helpers

@@ -55,7 +55,7 @@ pub struct RevocationResult {
 /// `u64::MAX` and cannot be incremented.
 pub fn revoke_access_key(current_key: &AccessKey) -> Result<RevocationResult, AccessKeyError> {
     let new_epoch = current_key
-        .epoch
+        .epoch()
         .checked_add(1)
         .ok_or(AccessKeyError::EpochOverflow)?;
 
@@ -86,9 +86,13 @@ pub fn revoke_access_key(current_key: &AccessKey) -> Result<RevocationResult, Ac
 /// * `epoch` — The epoch for the new key (from [`RevocationResult::new_epoch`]).
 #[must_use]
 pub fn restore_access_key(context_id: &str, member_did: &str, epoch: u64) -> AccessKey {
-    let mut key = generate_access_key(context_id, member_did);
-    key.epoch = epoch;
-    key
+    let base_key = generate_access_key(context_id, member_did);
+    AccessKey::from_parts(
+        *base_key.as_bytes(),
+        context_id.to_owned(),
+        member_did.to_owned(),
+        epoch,
+    )
 }
 
 // ---------------------------------------------------------------------------

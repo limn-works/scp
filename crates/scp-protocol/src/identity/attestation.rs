@@ -24,7 +24,7 @@
 
 use std::borrow::Cow;
 
-use scp_identity::DID;
+use scp_primitives::DID;
 use serde::{Deserialize, Serialize};
 
 use crate::crypto::ed25519::verify_ed25519_signature;

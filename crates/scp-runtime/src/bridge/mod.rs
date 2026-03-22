@@ -5,3 +5,6 @@
 
 pub mod credentials;
 pub mod oauth;
+
+// Re-export pure modules from scp-protocol.
+pub use scp_protocol::bridge::*;
