@@ -38,7 +38,7 @@ use crate::crypto::sender_keys::{
 };
 use crate::identity::SigningKeyId;
 use crate::identity::block_list::{BlockListEvent, BlockListState};
-use scp_primitives::time;
+use scp_primitives::Clock;
 
 // ---------------------------------------------------------------------------
 // BlockOrchestrationError
@@ -46,17 +46,13 @@ use scp_primitives::time;
 
 /// Errors produced by blocking orchestration operations.
 ///
-/// Wraps underlying sender key and clock errors, adding orchestration-level
+/// Wraps underlying sender key errors, adding orchestration-level
 /// failure modes (context enumeration failures, access key deletion).
 #[derive(Debug, thiserror::Error)]
 pub enum BlockOrchestrationError {
     /// Sender key rotation (Layer 1) failed.
     #[error("sender key rotation failed: {0}")]
     SenderKeyRotation(#[from] SenderKeyError),
-
-    /// The system clock is unavailable.
-    #[error("clock error: {0}")]
-    ClockError(#[from] time::ClockError),
 
     /// The blocker is not a member of the specified context.
     #[error("blocker {blocker} is not a member of context {context_id}")]
@@ -268,15 +264,14 @@ pub struct BlockInContextParams<'a> {
 ///
 /// Returns [`BlockOrchestrationError::SenderKeyRotation`] if sender key
 /// rotation or block notification signing fails.
-/// Returns [`BlockOrchestrationError::ClockError`] if the system clock
-/// is unavailable.
 pub async fn block_did_in_context<S: BuildHasher + Send + Sync>(
     key_custody: &impl KeyCustody,
     signing_key: &KeyHandle,
     params: &BlockInContextParams<'_>,
     block_list: &mut HashSet<String, S>,
+    clock: &dyn Clock,
 ) -> Result<BlockInContextResult, BlockOrchestrationError> {
-    let timestamp = time::now_millis()?;
+    let timestamp = clock.now_millis();
 
     // Layer 1: Rotate sender key excluding the target.
     // This also adds the target to the block_list (ordering invariant).
@@ -298,6 +293,7 @@ pub async fn block_did_in_context<S: BuildHasher + Send + Sync>(
         params.blocker_did,
         params.target_did,
         params.signer_key_ref,
+        clock,
     )
     .await?;
 
@@ -370,8 +366,6 @@ pub async fn block_did_in_context<S: BuildHasher + Send + Sync>(
 /// They are recorded in `pending_contexts`. The global block list event
 /// is always recorded.
 ///
-/// Returns [`BlockOrchestrationError::ClockError`] if the system clock
-/// is unavailable.
 #[allow(clippy::implicit_hasher)]
 pub async fn block_did_global(
     key_custody: &impl KeyCustody,
@@ -380,8 +374,9 @@ pub async fn block_did_global(
     block_list_state: &BlockListState,
     per_context_block_lists: &mut std::collections::HashMap<String, HashSet<String>>,
     per_context_epochs: &std::collections::HashMap<String, u64>,
+    clock: &dyn Clock,
 ) -> Result<GlobalBlockResult, BlockOrchestrationError> {
-    let timestamp = time::now_millis()?;
+    let timestamp = clock.now_millis();
 
     // Record global block event in identity private state.
     let block_list_event = BlockListEvent::BlockDID {
@@ -415,7 +410,14 @@ pub async fn block_did_global(
             current_epoch,
             signer_key_ref: params.signer_key_ref,
         };
-        match block_did_in_context(key_custody, signing_key, &ctx_params, context_block_list).await
+        match block_did_in_context(
+            key_custody,
+            signing_key,
+            &ctx_params,
+            context_block_list,
+            clock,
+        )
+        .await
         {
             Ok(result) => {
                 context_results.push(result);
@@ -486,15 +488,14 @@ pub struct ReceivedBlockParams<'a> {
 ///
 /// Returns [`BlockOrchestrationError::SenderKeyRotation`] if sender key
 /// rotation fails.
-/// Returns [`BlockOrchestrationError::ClockError`] if the system clock
-/// is unavailable.
 pub async fn process_received_block_notification<S: BuildHasher + Send + Sync>(
     key_custody: &impl KeyCustody,
     signing_key: &KeyHandle,
     params: &ReceivedBlockParams<'_>,
     block_list: &mut HashSet<String, S>,
+    clock: &dyn Clock,
 ) -> Result<ReceivedBlockResult, BlockOrchestrationError> {
-    let timestamp = time::now_millis()?;
+    let timestamp = clock.now_millis();
 
     // Step 1: Rotate the target's sender key excluding the blocker.
     let rotate_params = RotateForBlockParams {
@@ -611,7 +612,8 @@ mod tests {
             current_epoch: 0,
             signer_key_ref: SigningKeyId::Active,
         };
-        let result = block_did_in_context(&custody, &key, &params, &mut block_list)
+        let clock = scp_primitives::SystemClock;
+        let result = block_did_in_context(&custody, &key, &params, &mut block_list, &clock)
             .await
             .expect("block should succeed");
 
@@ -653,7 +655,8 @@ mod tests {
             current_epoch: 5,
             signer_key_ref: SigningKeyId::Active,
         };
-        let result = block_did_in_context(&custody, &key, &params, &mut block_list)
+        let clock = scp_primitives::SystemClock;
+        let result = block_did_in_context(&custody, &key, &params, &mut block_list, &clock)
             .await
             .unwrap();
 
@@ -674,7 +677,8 @@ mod tests {
             current_epoch: 0,
             signer_key_ref: SigningKeyId::Agent,
         };
-        let result = block_did_in_context(&custody, &key, &params, &mut block_list).await;
+        let clock = scp_primitives::SystemClock;
+        let result = block_did_in_context(&custody, &key, &params, &mut block_list, &clock).await;
 
         assert!(result.is_ok());
     }
@@ -700,6 +704,7 @@ mod tests {
             shared_context_ids: &shared_contexts,
             signer_key_ref: SigningKeyId::Active,
         };
+        let clock = scp_primitives::SystemClock;
         let result = block_did_global(
             &custody,
             &key,
@@ -707,6 +712,7 @@ mod tests {
             &block_list_state,
             &mut per_context_block_lists,
             &per_context_epochs,
+            &clock,
         )
         .await
         .expect("global block should succeed");
@@ -765,6 +771,7 @@ mod tests {
             shared_context_ids: &shared_contexts,
             signer_key_ref: SigningKeyId::Active,
         };
+        let clock = scp_primitives::SystemClock;
         let result = block_did_global(
             &custody,
             &key,
@@ -772,6 +779,7 @@ mod tests {
             &block_list_state,
             &mut per_context_block_lists,
             &per_context_epochs,
+            &clock,
         )
         .await
         .unwrap();
@@ -794,6 +802,7 @@ mod tests {
             shared_context_ids: &[],
             signer_key_ref: SigningKeyId::Active,
         };
+        let clock = scp_primitives::SystemClock;
         let result = block_did_global(
             &custody,
             &key,
@@ -801,6 +810,7 @@ mod tests {
             &block_list_state,
             &mut per_context_block_lists,
             &per_context_epochs,
+            &clock,
         )
         .await
         .unwrap();
@@ -845,6 +855,7 @@ mod tests {
             shared_context_ids: &shared_contexts,
             signer_key_ref: SigningKeyId::Active,
         };
+        let clock = scp_primitives::SystemClock;
         let result = block_did_global(
             &custody,
             &key,
@@ -852,6 +863,7 @@ mod tests {
             &block_list_state,
             &mut per_context_block_lists,
             &per_context_epochs,
+            &clock,
         )
         .await
         .unwrap();
@@ -877,9 +889,11 @@ mod tests {
             current_epoch: 0,
             signer_key_ref: SigningKeyId::Active,
         };
-        let result = process_received_block_notification(&custody, &key, &params, &mut block_list)
-            .await
-            .unwrap();
+        let clock = scp_primitives::SystemClock;
+        let result =
+            process_received_block_notification(&custody, &key, &params, &mut block_list, &clock)
+                .await
+                .unwrap();
 
         // Target's sender key was rotated.
         assert_eq!(result.rotation_result.new_epoch, 1);

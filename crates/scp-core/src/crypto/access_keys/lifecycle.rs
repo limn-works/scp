@@ -556,6 +556,7 @@ mod tests {
             initiator_did: &str,
             target_did: &str,
         ) -> (BlockNotification, Vec<u8>) {
+            let clock = scp_primitives::SystemClock;
             let msg = send_block_notification(
                 custody,
                 key,
@@ -563,6 +564,7 @@ mod tests {
                 initiator_did,
                 target_did,
                 SigningKeyId::Active,
+                &clock,
             )
             .await
             .expect("send_block_notification should succeed");

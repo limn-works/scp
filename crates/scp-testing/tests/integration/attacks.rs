@@ -457,6 +457,7 @@ async fn block_notification_stale_timestamp() {
     let custody = InMemoryKeyCustody::new();
     let signing_key = custody.generate_keypair(KeyType::Ed25519).await.unwrap();
 
+    let clock = scp_primitives::SystemClock;
     let msg = scp_core::crypto::sender_keys::send_block_notification(
         &custody,
         &signing_key,
@@ -464,6 +465,7 @@ async fn block_notification_stale_timestamp() {
         "did:dht:alice",
         "did:dht:dave",
         SigningKeyId::Active,
+        &clock,
     )
     .await
     .unwrap();
@@ -1351,12 +1353,14 @@ async fn sender_key_request_blocked_did_denied() {
     let sender_key = generate_sender_key();
 
     // Create a request.
+    let clock = scp_primitives::SystemClock;
     let request_result = request_sender_key(
         &requester_custody,
         &requester_key,
         requester_did,
         sender_did,
         1,
+        &clock,
     )
     .await
     .unwrap();

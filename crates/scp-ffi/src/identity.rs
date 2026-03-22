@@ -46,6 +46,7 @@ use scp_platform::file::FileKeyCustody;
 use scp_platform::testing::InMemoryKeyCustody;
 use scp_platform::testing::InMemoryStorage;
 use scp_platform::traits::{KeyCustody, Storage};
+use scp_primitives::Clock;
 
 use crate::custody::FfiKeyCustody;
 use crate::error::ScpPyError;
@@ -1043,8 +1044,7 @@ fn py_identity_migrate(py: Python<'_>, identity: &PyIdentity) -> PyResult<PyIden
                 .await
                 .map_err(|e| ScpPyError::identity(format!("key generation failed: {e}")))?;
 
-            let rotated_at = scp_primitives::time::now_secs()
-                .map_err(|e| ScpPyError::identity(format!("{e}")))?;
+            let rotated_at = scp_primitives::SystemClock.now_secs();
 
             let old_identity = ScpIdentity {
                 identity_key: old_identity_key,
@@ -1543,8 +1543,7 @@ fn py_identity_execute_recovery(
         };
 
         // Build key rotation outcome (step 1 is pre-completed by caller).
-        let now_ms = scp_primitives::time::now_millis()
-            .map_err(|e| ScpPyError::identity(format!("clock error: {e}")))?;
+        let now_ms = scp_primitives::SystemClock.now_millis();
         let key_rotation = match compromise_tier {
             CompromiseTier::Agent => agent_key_rotation_outcome(&did_val, now_ms),
             CompromiseTier::ActiveSigning => active_key_rotation_outcome(&did_val, now_ms),
@@ -1608,6 +1607,7 @@ fn py_identity_execute_recovery(
             &contacts,
             None,
             &backend,
+            &scp_primitives::SystemClock,
         )).map_err(|e| ScpPyError::identity(format!("recovery failed: {e}")))?;
 
         // Serialize to JSON and return — the Python layer converts to dict.
@@ -1709,7 +1709,7 @@ fn py_identity_execute_custody_migration(
             CustodyMigrationOrchestrator::new(did_val, migration_target, context_ids);
         let backend = NotConfiguredMigrationBackend;
 
-        let result = rt.block_on(orchestrator.execute(&backend)).map_err(|e| {
+        let result = rt.block_on(orchestrator.execute(&backend, &scp_primitives::SystemClock)).map_err(|e| {
             ScpPyError::identity(format!("custody migration failed: {e}"))
         })?;
 

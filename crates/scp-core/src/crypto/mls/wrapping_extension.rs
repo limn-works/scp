@@ -457,10 +457,17 @@ mod tests {
         let bob_pubkey = custody.public_key(&bob_signing).await.unwrap();
 
         // Bob creates a request with an ephemeral wrapping key.
-        let request_result =
-            request_sender_key(&custody, &bob_signing, "did:dht:bob", "did:dht:alice", 1)
-                .await
-                .unwrap();
+        let clock = scp_primitives::SystemClock;
+        let request_result = request_sender_key(
+            &custody,
+            &bob_signing,
+            "did:dht:bob",
+            "did:dht:alice",
+            1,
+            &clock,
+        )
+        .await
+        .unwrap();
 
         let request: crate::crypto::sender_keys::SenderKeyRequest =
             rmp_serde::from_slice(&request_result.request_message).unwrap();
@@ -528,10 +535,17 @@ mod tests {
         let bob_signing = custody.generate_keypair(KeyType::Ed25519).await.unwrap();
         let bob_pubkey = custody.public_key(&bob_signing).await.unwrap();
 
-        let request_result =
-            request_sender_key(&custody, &bob_signing, "did:dht:bob", "did:dht:alice", 1)
-                .await
-                .unwrap();
+        let clock = scp_primitives::SystemClock;
+        let request_result = request_sender_key(
+            &custody,
+            &bob_signing,
+            "did:dht:bob",
+            "did:dht:alice",
+            1,
+            &clock,
+        )
+        .await
+        .unwrap();
 
         let mut request: crate::crypto::sender_keys::SenderKeyRequest =
             rmp_serde::from_slice(&request_result.request_message).unwrap();

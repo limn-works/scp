@@ -104,6 +104,7 @@ pub async fn request_sender_key(
     requester_did: &str,
     sender_did: &str,
     epoch: u64,
+    clock: &dyn scp_primitives::Clock,
 ) -> Result<SenderKeyRequestResult, SenderKeyError> {
     // Generate fresh X25519 wrapping keypair.
     let wrapping_key_handle = key_custody
@@ -119,7 +120,7 @@ pub async fn request_sender_key(
     // Generate cryptographic nonce and timestamp for replay protection.
     let mut nonce = [0u8; REQUEST_NONCE_SIZE];
     OsRng.fill_bytes(&mut nonce);
-    let timestamp = scp_primitives::time::now_secs()?;
+    let timestamp = clock.now_secs();
 
     // Sign the request (including nonce and timestamp).
     let hash = compute_request_hash(
@@ -378,8 +379,9 @@ pub async fn send_block_notification(
     blocker_did: &str,
     blocked_did: &str,
     signing_key_id: SigningKeyId,
+    clock: &dyn scp_primitives::Clock,
 ) -> Result<Vec<u8>, SenderKeyError> {
-    let timestamp = current_timestamp_ms()?;
+    let timestamp = clock.now_millis();
 
     let hash = compute_block_notification_hash(
         context_id,
@@ -480,6 +482,7 @@ mod tests {
 
     use scp_platform::testing::InMemoryKeyCustody;
     use scp_platform::traits::{KeyCustody, KeyType};
+    use scp_primitives::Clock;
 
     use super::super::key_protocol_verify::{
         BLOCK_NOTIFICATION_FRESHNESS_MS, REQUEST_FRESHNESS_SECS,
@@ -701,12 +704,14 @@ mod tests {
         let sender_key_bytes = *sender_key.as_bytes();
 
         // Bob creates a request for Alice's key.
+        let clock = scp_primitives::SystemClock;
         let request_result = request_sender_key(
             &bob_custody,
             &bob_signing_key,
             "did:dht:bob",
             "did:dht:alice",
             1,
+            &clock,
         )
         .await
         .unwrap();
@@ -765,9 +770,17 @@ mod tests {
         let (custody, signing_key) = setup().await;
         let pubkey = custody.public_key(&signing_key).await.unwrap();
 
-        let result = request_sender_key(&custody, &signing_key, "did:dht:bob", "did:dht:alice", 3)
-            .await
-            .unwrap();
+        let clock = scp_primitives::SystemClock;
+        let result = request_sender_key(
+            &custody,
+            &signing_key,
+            "did:dht:bob",
+            "did:dht:alice",
+            3,
+            &clock,
+        )
+        .await
+        .unwrap();
 
         let request: SenderKeyRequest = rmp_serde::from_slice(&result.request_message).unwrap();
 
@@ -782,9 +795,17 @@ mod tests {
         let other_key = custody.generate_keypair(KeyType::Ed25519).await.unwrap();
         let wrong_pubkey = custody.public_key(&other_key).await.unwrap();
 
-        let result = request_sender_key(&custody, &signing_key, "did:dht:bob", "did:dht:alice", 3)
-            .await
-            .unwrap();
+        let clock = scp_primitives::SystemClock;
+        let result = request_sender_key(
+            &custody,
+            &signing_key,
+            "did:dht:bob",
+            "did:dht:alice",
+            3,
+            &clock,
+        )
+        .await
+        .unwrap();
 
         let request: SenderKeyRequest = rmp_serde::from_slice(&result.request_message).unwrap();
 
@@ -808,12 +829,14 @@ mod tests {
         let sender_key = generate_sender_key();
 
         // Bob creates a request.
+        let clock = scp_primitives::SystemClock;
         let request_result = request_sender_key(
             &bob_custody,
             &bob_signing_key,
             "did:dht:bob",
             "did:dht:alice",
             1,
+            &clock,
         )
         .await
         .unwrap();
@@ -860,12 +883,14 @@ mod tests {
 
         let sender_key = generate_sender_key();
 
+        let clock = scp_primitives::SystemClock;
         let request_result = request_sender_key(
             &bob_custody,
             &bob_signing_key,
             "did:dht:bob",
             "did:dht:alice",
             1,
+            &clock,
         )
         .await
         .unwrap();
@@ -917,12 +942,14 @@ mod tests {
         let sender_key = generate_sender_key();
 
         // Sybil identity creates a request.
+        let clock = scp_primitives::SystemClock;
         let request_result = request_sender_key(
             &sybil_custody,
             &sybil_signing_key,
             "did:dht:sybil",
             "did:dht:alice",
             1,
+            &clock,
         )
         .await
         .unwrap();
@@ -971,12 +998,14 @@ mod tests {
 
         let sender_key = generate_sender_key();
 
+        let clock = scp_primitives::SystemClock;
         let request_result = request_sender_key(
             &bob_custody,
             &bob_signing_key,
             "did:dht:bob",
             "did:dht:alice",
             1,
+            &clock,
         )
         .await
         .unwrap();
@@ -1033,12 +1062,14 @@ mod tests {
         let sender_key = generate_sender_key();
 
         // Sybil identity requests the key.
+        let clock = scp_primitives::SystemClock;
         let request_result = request_sender_key(
             &sybil_custody,
             &sybil_signing_key,
             "did:dht:dave-alt",
             "did:dht:alice",
             1,
+            &clock,
         )
         .await
         .unwrap();
@@ -1092,6 +1123,7 @@ mod tests {
         let (custody, signing_key) = setup().await;
         let pubkey = custody.public_key(&signing_key).await.unwrap();
 
+        let clock = scp_primitives::SystemClock;
         let message = send_block_notification(
             &custody,
             &signing_key,
@@ -1099,6 +1131,7 @@ mod tests {
             "did:dht:alice",
             "did:dht:dave",
             SigningKeyId::Active,
+            &clock,
         )
         .await
         .unwrap();
@@ -1119,6 +1152,7 @@ mod tests {
         let (custody, signing_key) = setup().await;
         let pubkey = custody.public_key(&signing_key).await.unwrap();
 
+        let clock = scp_primitives::SystemClock;
         let message = send_block_notification(
             &custody,
             &signing_key,
@@ -1126,6 +1160,7 @@ mod tests {
             "did:dht:alice",
             "did:dht:dave",
             SigningKeyId::Active,
+            &clock,
         )
         .await
         .unwrap();
@@ -1142,6 +1177,7 @@ mod tests {
         let other_key = custody.generate_keypair(KeyType::Ed25519).await.unwrap();
         let wrong_pubkey = custody.public_key(&other_key).await.unwrap();
 
+        let clock = scp_primitives::SystemClock;
         let message = send_block_notification(
             &custody,
             &signing_key,
@@ -1149,6 +1185,7 @@ mod tests {
             "did:dht:alice",
             "did:dht:dave",
             SigningKeyId::Active,
+            &clock,
         )
         .await
         .unwrap();
@@ -1285,12 +1322,14 @@ mod tests {
         .unwrap();
 
         // Dave tries to request the new key.
+        let clock = scp_primitives::SystemClock;
         let request_result = request_sender_key(
             &dave_custody,
             &dave_signing_key,
             "did:dht:dave",
             "did:dht:alice",
             rotate_result.new_epoch,
+            &clock,
         )
         .await
         .unwrap();
@@ -1359,6 +1398,7 @@ mod tests {
     #[tokio::test]
     async fn fresh_block_notification_passes_freshness_check() {
         let (custody, signing_key) = setup().await;
+        let clock = scp_primitives::SystemClock;
         let msg = send_block_notification(
             &custody,
             &signing_key,
@@ -1366,12 +1406,13 @@ mod tests {
             "did:dht:alice",
             "did:dht:dave",
             SigningKeyId::Active,
+            &clock,
         )
         .await
         .unwrap();
 
         let notification: BlockNotification = rmp_serde::from_slice(&msg).unwrap();
-        let now_ms = current_timestamp_ms().unwrap();
+        let now_ms = clock.now_millis();
         let result = validate_block_notification_freshness(&notification, now_ms);
         assert!(
             result.is_ok(),
@@ -1382,6 +1423,7 @@ mod tests {
     #[tokio::test]
     async fn stale_block_notification_rejected() {
         let (custody, signing_key) = setup().await;
+        let clock = scp_primitives::SystemClock;
         let msg = send_block_notification(
             &custody,
             &signing_key,
@@ -1389,6 +1431,7 @@ mod tests {
             "did:dht:alice",
             "did:dht:dave",
             SigningKeyId::Active,
+            &clock,
         )
         .await
         .unwrap();
@@ -1406,6 +1449,7 @@ mod tests {
     #[tokio::test]
     async fn future_timestamp_block_notification_rejected() {
         let (custody, signing_key) = setup().await;
+        let clock = scp_primitives::SystemClock;
         let msg = send_block_notification(
             &custody,
             &signing_key,
@@ -1413,6 +1457,7 @@ mod tests {
             "did:dht:alice",
             "did:dht:dave",
             SigningKeyId::Active,
+            &clock,
         )
         .await
         .unwrap();
@@ -1450,6 +1495,7 @@ mod tests {
 
         let sender_key = generate_sender_key();
         let block_list: HashSet<String> = HashSet::new();
+        let clock = scp_primitives::SystemClock;
 
         let result = request_sender_key(
             &requester_custody,
@@ -1457,6 +1503,7 @@ mod tests {
             "did:dht:requester",
             "did:dht:alice",
             1,
+            &clock,
         )
         .await
         .unwrap();
@@ -1499,12 +1546,14 @@ mod tests {
         let (bob_custody, bob_signing_key, bob_pubkey, sender_key) =
             setup_request_test_fixtures().await;
 
+        let clock = scp_primitives::SystemClock;
         let request_result = request_sender_key(
             &bob_custody,
             &bob_signing_key,
             "did:dht:bob",
             "did:dht:alice",
             1,
+            &clock,
         )
         .await
         .unwrap();
@@ -1543,12 +1592,14 @@ mod tests {
         let (bob_custody, bob_signing_key, bob_pubkey, sender_key) =
             setup_request_test_fixtures().await;
 
+        let clock = scp_primitives::SystemClock;
         let request_result = request_sender_key(
             &bob_custody,
             &bob_signing_key,
             "did:dht:bob",
             "did:dht:alice",
             1,
+            &clock,
         )
         .await
         .unwrap();

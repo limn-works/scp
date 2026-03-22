@@ -200,12 +200,7 @@ pub fn py_bridge_register(
 
     // Bridge ID per spec §12.2.1: SHA-256(context_id || operator_did || platform || timestamp).
     let (bridge_id, now_secs) =
-        scp_ffi_common::generate_bridge_id(context_id, operator_did, platform).map_err(|e| {
-            ScpPyError::ContextError {
-                message: e.to_string(),
-                code: "SCP-CTX-2017".to_owned(),
-            }
-        })?;
+        scp_ffi_common::generate_bridge_id(context_id, operator_did, platform);
     let request = BridgeRegistrationRequest {
         bridge_id: bridge_id.clone(),
         operator_did: operator_did.into(),

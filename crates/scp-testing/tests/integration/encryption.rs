@@ -384,12 +384,14 @@ async fn sender_key_request_response() {
     let sender_key = generate_sender_key();
 
     // Requester creates a request.
+    let clock = scp_primitives::SystemClock;
     let request_result = request_sender_key(
         &requester_custody,
         &requester_sign_key,
         requester_did,
         sender_did,
         1, // epoch
+        &clock,
     )
     .await
     .unwrap();
@@ -492,6 +494,7 @@ async fn block_notification_roundtrip() {
     let blocked_did = "did:dht:z6MkBlocked";
 
     // Send a block notification.
+    let clock = scp_primitives::SystemClock;
     let notification_bytes = send_block_notification(
         &custody,
         &blocker_key,
@@ -499,6 +502,7 @@ async fn block_notification_roundtrip() {
         blocker_did,
         blocked_did,
         SigningKeyId::Active,
+        &clock,
     )
     .await
     .unwrap();

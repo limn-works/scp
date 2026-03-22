@@ -37,6 +37,7 @@ use scp_identity::InMemoryDhtClient;
 #[cfg(not(any(test, feature = "allow_in_memory_custody")))]
 use scp_identity::PkarrDhtClient;
 use scp_identity::resolver::{DualLayerResolver, NoOpRelayQuerier};
+use scp_primitives::Clock;
 
 /// DHT client type alias: production builds use [`PkarrDhtClient`] for real
 /// Mainline DHT resolution; test and `allow_in_memory_custody` builds use
@@ -3041,10 +3042,7 @@ pub async fn context_close(
             // context's memory scope and initiate the appropriate destruction
             // path via CloseOrchestrator (#365).
             let memory_scope = core_handle.params().memory_scope;
-            let now = scp_primitives::time::now_secs().map_err(|_| ScpError::Context {
-                msg: "system clock is unavailable or before Unix epoch".to_owned(),
-                code: "SCP-CTX-2017".to_owned(),
-            })?;
+            let now = scp_primitives::SystemClock.now_secs();
 
             let crypto_provider = crate::runtime::context_manager_crypto();
             let orchestrator = scp_core::context::close::CloseOrchestrator::new(crypto_provider);
@@ -3164,10 +3162,7 @@ pub async fn context_send(
             if let Some(core_id) = identity.core_id.as_ref() {
                 let context_id = handle.context_id.clone();
                 let sender_did_str = identity.did.clone();
-                let now_ms = scp_primitives::time::now_millis().map_err(|e| ScpError::Crypto {
-                    msg: format!("clock error: {e}"),
-                    code: "SCP-CRYPTO-4000".to_owned(),
-                })?;
+                let now_ms = scp_primitives::SystemClock.now_millis();
 
                 let params = scp_core::envelope::InnerEnvelopeParams {
                     version: scp_core::envelope::inner::SCP_INNER_ENVELOPE_VERSION,
@@ -3911,10 +3906,7 @@ pub async fn tool_session_create(
             }
 
             let session_id = Uuid::new_v4().to_string();
-            let now_ms = scp_primitives::time::now_millis().map_err(|e| ScpError::Tool {
-                msg: format!("clock error: {e}"),
-                code: "SCP-TOOL-6016".to_owned(),
-            })?;
+            let now_ms = scp_primitives::SystemClock.now_millis();
 
             let session = scp_core::context::tools::ToolSession {
                 session_id: session_id.clone(),
@@ -4007,10 +3999,7 @@ pub async fn tool_session_invoke(
             })?;
 
             // Check expiry.
-            let now_ms = scp_primitives::time::now_millis().map_err(|e| ScpError::Tool {
-                msg: format!("clock error: {e}"),
-                code: "SCP-TOOL-6016".to_owned(),
-            })?;
+            let now_ms = scp_primitives::SystemClock.now_millis();
             if session.is_expired(now_ms) {
                 store.remove(&session_id);
                 return Err(ScpError::Tool {
@@ -4342,10 +4331,7 @@ pub async fn tool_interface_revoke(
                     code: "SCP-VALID-7042".to_owned(),
                 })?;
 
-            let now_ms = scp_primitives::time::now_millis().map_err(|e| ScpError::Tool {
-                msg: format!("clock error: {e}"),
-                code: "SCP-TOOL-6034".to_owned(),
-            })?;
+            let now_ms = scp_primitives::SystemClock.now_millis();
 
             let event = scp_core::context::tools::interface::revoke_tool_interface(
                 interface_id,
@@ -6478,10 +6464,7 @@ pub async fn event_log_query(
 
             // Pre-compute timestamp for the fallback summary event outside the
             // closure so we can propagate clock errors properly.
-            let fallback_now = scp_primitives::time::now_secs().map_err(|_| ScpError::Context {
-                msg: "system clock is unavailable or before Unix epoch".to_owned(),
-                code: "SCP-CTX-2024".to_owned(),
-            })?;
+            let fallback_now = scp_primitives::SystemClock.now_secs();
 
             // Query the event log from per-context UCAN state.
             let events = crate::runtime::with_ucan_state(&handle.context_id, |ucan_state| {
@@ -10874,11 +10857,7 @@ pub async fn identity_migrate(identity: Arc<Identity>) -> Result<Arc<Identity>, 
                             code: "SCP-IDENT-1009".to_owned(),
                         })?;
 
-                let rotated_at =
-                    scp_primitives::time::now_secs().map_err(|e| ScpError::Identity {
-                        msg: format!("failed to get current time: {e}"),
-                        code: "SCP-IDENT-1009".to_owned(),
-                    })?;
+                let rotated_at = scp_primitives::SystemClock.now_secs();
 
                 let dht = DidDht::new();
                 let (new_identity, new_document, _rotation_event) = dht
@@ -10933,11 +10912,7 @@ pub async fn identity_migrate(identity: Arc<Identity>) -> Result<Arc<Identity>, 
                         code: "SCP-IDENT-1009".to_owned(),
                     })?;
 
-                let rotated_at =
-                    scp_primitives::time::now_secs().map_err(|e| ScpError::Identity {
-                        msg: format!("failed to get current time: {e}"),
-                        code: "SCP-IDENT-1009".to_owned(),
-                    })?;
+                let rotated_at = scp_primitives::SystemClock.now_secs();
 
                 let dht = DidDht::new();
                 let (new_identity, new_document, _rotation_event) = dht
@@ -11204,12 +11179,7 @@ pub fn bridge_register(
 
     // Bridge ID per spec §12.2.1: SHA-256(context_id || operator_did || platform || timestamp).
     let (bridge_id, now_secs) =
-        scp_ffi_common::generate_bridge_id(&context_id, &operator_did, &platform).map_err(|e| {
-            ScpError::Context {
-                msg: e.to_string(),
-                code: "SCP-CTX-2017".to_owned(),
-            }
-        })?;
+        scp_ffi_common::generate_bridge_id(&context_id, &operator_did, &platform);
     let request = scp_core::bridge::registration::BridgeRegistrationRequest {
         bridge_id: bridge_id.clone(),
         operator_did: operator_did.clone().into(),
@@ -11676,10 +11646,7 @@ pub fn identity_execute_recovery(
         }
     };
 
-    let now_ms = scp_primitives::time::now_millis().map_err(|e| ScpError::Identity {
-        msg: format!("clock error: {e}"),
-        code: "SCP-IDENT-1021".to_owned(),
-    })?;
+    let now_ms = scp_primitives::SystemClock.now_millis();
 
     let key_rotation = match compromise_tier {
         CompromiseTier::Agent => agent_key_rotation_outcome(&did_val, now_ms),
@@ -11741,6 +11708,7 @@ pub fn identity_execute_recovery(
             &contacts,
             None,
             &backend,
+            &scp_primitives::SystemClock,
         ))
         .map_err(|e| ScpError::Identity {
             msg: format!("recovery failed: {e}"),
@@ -11844,7 +11812,7 @@ pub fn identity_execute_custody_migration(
     let rt = crate::runtime();
 
     let result = rt
-        .block_on(orchestrator.execute(&backend))
+        .block_on(orchestrator.execute(&backend, &scp_primitives::SystemClock))
         .map_err(|e| ScpError::Identity {
             msg: format!("custody migration failed: {e}"),
             code: "SCP-IDENT-1025".to_owned(),

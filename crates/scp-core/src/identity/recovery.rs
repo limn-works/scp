@@ -30,7 +30,7 @@ use serde::{Deserialize, Serialize};
 use scp_identity::DID;
 
 use crate::context::manager::ContextManager;
-use scp_primitives::time;
+use scp_primitives::Clock;
 
 // ---------------------------------------------------------------------------
 // CompromiseTier — which key was compromised
@@ -159,10 +159,6 @@ pub enum RecoveryError {
     /// This is fatal — cannot proceed without new key material.
     #[error("key rotation failed (step 1): {0}")]
     KeyRotationFailed(String),
-
-    /// The system clock is unavailable.
-    #[error("clock error: {0}")]
-    ClockError(#[from] time::ClockError),
 
     /// The compromise tier requires an agent key but none exists.
     #[error("agent key not found in identity")]
@@ -475,7 +471,6 @@ impl CompromiseRecoveryOrchestrator {
     ///
     /// # Errors
     ///
-    /// Returns [`RecoveryError::ClockError`] if the system clock is unavailable.
     /// Per-context failures are recorded in `RecoveryResult::failed_contexts`,
     /// NOT as errors from this method.
     #[allow(clippy::unused_async)] // async by design: SDK integration layer adds await points
@@ -487,8 +482,9 @@ impl CompromiseRecoveryOrchestrator {
         contact_dids: &HashSet<DID>,
         psk_params: Option<&PskRotationParams>,
         backend: &dyn RecoveryBackend,
+        clock: &dyn Clock,
     ) -> Result<RecoveryResult, RecoveryError> {
-        let initiated_at = time::now_millis()?;
+        let initiated_at = clock.now_millis();
 
         let mut completed_contexts = Vec::new();
         let mut failed_contexts = Vec::new();
@@ -566,7 +562,7 @@ impl CompromiseRecoveryOrchestrator {
             }
         };
 
-        let completed_at = time::now_millis()?;
+        let completed_at = clock.now_millis();
 
         Ok(RecoveryResult {
             tier,
@@ -1402,6 +1398,7 @@ mod tests {
                 &contacts,
                 None,
                 &backend,
+                &scp_primitives::SystemClock,
             )
             .await
             .unwrap();
@@ -1439,6 +1436,7 @@ mod tests {
                 &contacts,
                 Some(&psk_params),
                 &backend,
+                &scp_primitives::SystemClock,
             )
             .await
             .unwrap();
@@ -1470,6 +1468,7 @@ mod tests {
                 &contacts,
                 Some(&psk_params),
                 &backend,
+                &scp_primitives::SystemClock,
             )
             .await
             .unwrap();
@@ -1495,6 +1494,7 @@ mod tests {
                 &contacts,
                 None,
                 &backend,
+                &scp_primitives::SystemClock,
             )
             .await
             .unwrap();
@@ -1521,6 +1521,7 @@ mod tests {
                 &contacts,
                 None,
                 &backend,
+                &scp_primitives::SystemClock,
             )
             .await
             .unwrap();
@@ -1550,6 +1551,7 @@ mod tests {
                 &contacts,
                 Some(&psk_params),
                 &backend,
+                &scp_primitives::SystemClock,
             )
             .await
             .unwrap();
@@ -1583,6 +1585,7 @@ mod tests {
                 &contacts,
                 Some(&psk_params),
                 &backend,
+                &scp_primitives::SystemClock,
             )
             .await
             .unwrap();
@@ -1606,6 +1609,7 @@ mod tests {
                 &contacts,
                 None,
                 &backend,
+                &scp_primitives::SystemClock,
             )
             .await
             .unwrap();
@@ -1685,7 +1689,14 @@ mod tests {
             let orch = CompromiseRecoveryOrchestrator::new(alice.clone(), contexts.clone());
             let kr = agent_key_rotation_outcome(&alice, 1000);
             let result = orch
-                .execute_recovery(CompromiseTier::Agent, &kr, &contacts, None, &backend)
+                .execute_recovery(
+                    CompromiseTier::Agent,
+                    &kr,
+                    &contacts,
+                    None,
+                    &backend,
+                    &scp_primitives::SystemClock,
+                )
                 .await
                 .unwrap();
 
@@ -1706,6 +1717,7 @@ mod tests {
                     &contacts,
                     Some(&psk_params),
                     &backend,
+                    &scp_primitives::SystemClock,
                 )
                 .await
                 .unwrap();
@@ -1726,6 +1738,7 @@ mod tests {
                     &contacts,
                     Some(&psk_params),
                     &backend,
+                    &scp_primitives::SystemClock,
                 )
                 .await
                 .unwrap();
@@ -2120,6 +2133,7 @@ mod tests {
                 &contacts,
                 None,
                 &backend,
+                &scp_primitives::SystemClock,
             )
             .await
             .unwrap();
@@ -2159,6 +2173,7 @@ mod tests {
                 &contacts,
                 Some(&psk_params),
                 &backend,
+                &scp_primitives::SystemClock,
             )
             .await
             .unwrap();
@@ -2197,6 +2212,7 @@ mod tests {
                 &contacts,
                 Some(&psk_params),
                 &backend,
+                &scp_primitives::SystemClock,
             )
             .await
             .unwrap();
@@ -2237,6 +2253,7 @@ mod tests {
                 &contacts,
                 None,
                 &backend,
+                &scp_primitives::SystemClock,
             )
             .await
             .unwrap();

@@ -6,6 +6,7 @@
 //!
 //! See spec section 19.2.6 and ADR-033 acceptance criteria #4.
 
+use scp_primitives::Clock;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
@@ -174,12 +175,8 @@ fn deterministic_id(counter: u64) -> [u8; 32] {
 
 /// Returns the current unix timestamp in seconds.
 ///
-/// # Errors
-///
-/// Returns [`PaymentError::AdapterError`] if the system clock is unavailable.
-fn now_secs() -> Result<u64, PaymentError> {
-    scp_primitives::time::now_secs()
-        .map_err(|e| PaymentError::AdapterError(format!("clock error: {e}")))
+fn now_secs() -> u64 {
+    scp_primitives::SystemClock.now_secs()
 }
 
 // ---------------------------------------------------------------------------
@@ -267,7 +264,7 @@ impl PaymentAdapter for TestAdapter {
         );
 
         drop(ledger);
-        let ts = now_secs()?;
+        let ts = now_secs();
 
         Ok(PaymentAuthorization {
             auth_id,
@@ -334,7 +331,7 @@ impl PaymentAdapter for TestAdapter {
             context_id: None,
             adapter_id: "test".to_owned(),
             adapter_proof,
-            timestamp: now_secs()?,
+            timestamp: now_secs(),
             signature: Vec::new(), // Test adapter: no real signature.
         };
 
@@ -417,7 +414,7 @@ impl PaymentAdapter for TestAdapter {
             adapter_id: "test".to_owned(),
             verified_amount: receipt.amount,
             verified_currency: receipt.currency,
-            verification_timestamp: now_secs()?,
+            verification_timestamp: now_secs(),
         })
     }
 

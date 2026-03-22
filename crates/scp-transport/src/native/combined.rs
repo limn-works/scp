@@ -7,6 +7,7 @@
 //!
 //! See SCP-PERSIST-063 and spec section 17.1 (deployment patterns).
 
+use scp_primitives::Clock;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
@@ -23,17 +24,14 @@ use super::storage::{BlobStorage, StorageError, StoredBlob};
 
 /// A clock function that returns the current Unix timestamp in seconds.
 ///
-/// The default ([`system_clock`]) delegates to [`scp_primitives::time::now_secs`].
+/// The default ([`system_clock`]) delegates to [`scp_primitives::SystemClock`].
 /// Tests inject a deterministic clock via [`CombinedNodeStorage::open_with_clock`].
-pub type ClockFn = Arc<dyn Fn() -> Result<u64, StorageError> + Send + Sync>;
+pub type ClockFn = Arc<dyn Fn() -> u64 + Send + Sync>;
 
 /// Returns a [`ClockFn`] backed by the real system clock.
 #[must_use]
 pub fn system_clock() -> ClockFn {
-    Arc::new(|| {
-        scp_primitives::time::now_secs()
-            .map_err(|e| StorageError::Internal(format!("clock error: {e}")))
-    })
+    Arc::new(|| scp_primitives::SystemClock.now_secs())
 }
 
 // ---------------------------------------------------------------------------
@@ -407,7 +405,7 @@ impl BlobStorage for CombinedNodeStorage {
         blob_ttl: u32,
         blob: Vec<u8>,
     ) -> Result<StoredBlob, StorageError> {
-        let stored_at = (self.clock)()?;
+        let stored_at = (self.clock)();
         let expires_at = stored_at.saturating_add(u64::from(blob_ttl));
 
         let hint_bytes: Option<Vec<u8>> = recipient_hint.map(|h| h.to_vec());
@@ -440,7 +438,7 @@ impl BlobStorage for CombinedNodeStorage {
     }
 
     async fn get(&self, blob_id: &[u8; 32]) -> Result<Option<StoredBlob>, StorageError> {
-        let now = (self.clock)()?;
+        let now = (self.clock)();
         let conn = self.lock_conn()?;
         let mut stmt = conn
             .prepare_cached(
@@ -483,7 +481,7 @@ impl BlobStorage for CombinedNodeStorage {
         since: Option<u64>,
         limit: u32,
     ) -> Result<Vec<StoredBlob>, StorageError> {
-        let now = (self.clock)()?;
+        let now = (self.clock)();
         let conn = self.lock_conn()?;
 
         let since_ts = since.unwrap_or(0);
@@ -545,7 +543,7 @@ impl BlobStorage for CombinedNodeStorage {
     }
 
     async fn purge_expired(&self) -> Result<usize, StorageError> {
-        let now = (self.clock)()?;
+        let now = (self.clock)();
         let conn = self.lock_conn()?;
         let purged = conn
             .execute(

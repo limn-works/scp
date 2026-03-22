@@ -35,6 +35,8 @@
 use sha2::{Digest, Sha256};
 use subtle::ConstantTimeEq;
 
+use scp_primitives::Clock;
+
 use super::{ContextId, DID, Ed25519Signature, EventLog, EventLogError, EventLogSigner};
 use crate::proof::{self, Direction, InclusionProof, ProofStep};
 use crate::tree;
@@ -897,7 +899,7 @@ pub async fn generate_checkpoint(
     epoch: u64,
     signer: &(impl EventLogSigner + ?Sized),
 ) -> Result<ConsistencyCheckpoint, EventLogError> {
-    let timestamp = current_timestamp()?;
+    let timestamp = current_timestamp();
     generate_checkpoint_at(log, sender_did, epoch, timestamp, signer).await
 }
 
@@ -1161,14 +1163,9 @@ fn compute_checkpoint_canonical_hash(
     hasher.finalize().to_vec()
 }
 
-/// Returns the current Unix timestamp in seconds.
-///
-/// # Errors
-///
-/// Returns [`EventLogError::ClockError`] (via [`crate::time::ClockError`])
-/// if the system clock is before the Unix epoch.
-fn current_timestamp() -> Result<u64, crate::time::ClockError> {
-    scp_primitives::time::now_secs()
+/// Returns the current Unix timestamp in seconds using [`scp_primitives::SystemClock`].
+fn current_timestamp() -> u64 {
+    scp_primitives::SystemClock.now_secs()
 }
 
 // ---------------------------------------------------------------------------

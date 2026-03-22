@@ -21,6 +21,7 @@ use rustls::server::ResolvesServerCert;
 use rustls::sign::CertifiedKey;
 use scp_core::store::ProtocolRepository;
 use scp_platform::traits::Storage;
+use scp_primitives::Clock;
 use tokio::sync::RwLock;
 use zeroize::Zeroizing;
 
@@ -156,9 +157,8 @@ impl CertificateData {
     /// Returns [`TlsError::Certificate`] if the expiry cannot be determined.
     pub fn needs_renewal(&self) -> Result<bool, TlsError> {
         let expiry = self.expiry_timestamp()?;
-        let now = scp_primitives::time::now_secs()
-            .map_err(|e| TlsError::Certificate(format!("{e}")))?
-            .cast_signed();
+        #[allow(clippy::cast_possible_wrap)] // Unix timestamp won't exceed i64::MAX for centuries
+        let now = scp_primitives::SystemClock.now_secs() as i64;
 
         let threshold = RENEWAL_THRESHOLD_DAYS * 24 * 60 * 60;
         Ok(expiry - now < threshold)

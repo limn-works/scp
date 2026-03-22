@@ -25,6 +25,7 @@ use scp_core::discovery::handles::{
 };
 use scp_core::discovery::petnames::PetnameMap;
 use scp_core::discovery::scope::ScopeRegistry;
+use scp_primitives::Clock;
 
 // ---------------------------------------------------------------------------
 // Global singletons
@@ -321,12 +322,7 @@ impl HandleQuerier for LocalHandleQuerier {
             type_filter: filter,
         });
 
-        // Clock failure means we cannot produce valid resolved_at timestamps.
-        // Return empty results rather than silently using epoch 0, which would
-        // bypass freshness checks downstream.
-        let Ok(now) = scp_primitives::time::now_secs() else {
-            return Vec::new();
-        };
+        let now = scp_primitives::SystemClock.now_secs();
 
         result
             .results

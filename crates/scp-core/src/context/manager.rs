@@ -811,24 +811,10 @@ fn restore_grace_store_from_snapshot(
             // store. Entries that expired during downtime are returned in
             // the `expired` vec — the caller should destroy any cached
             // key material for those epochs.
-            match grace_store.restore_from_entries(&snapshot.grace_entries) {
-                Ok(_expired) => {
-                    // Expired epochs' key material is already gone (OpenMLS
-                    // manages key lifecycle internally). The grace store now
-                    // reflects the surviving entries.
-                }
-                Err(clock_err) => {
-                    // Clock error during restore — fall back to empty grace
-                    // store (conservative: forward secrecy over recovery).
-                    tracing::warn!(
-                        context_id = %context_id,
-                        error = %clock_err,
-                        "clock error during grace store restore; \
-                         discarding all grace entries (forward secrecy prioritized)"
-                    );
-                    grace_store = crate::crypto::mls::epoch_grace::EpochGraceStore::new();
-                }
-            }
+            // Expired epochs' key material is already gone (OpenMLS
+            // manages key lifecycle internally). The grace store now
+            // reflects the surviving entries.
+            let _expired = grace_store.restore_from_entries(&snapshot.grace_entries);
         }
     }
 
@@ -1614,7 +1600,7 @@ impl ContextManager {
         // treat the missing entries as expired (conservative: forward secrecy
         // prioritized over message recovery, per §23.11 inconsistent state
         // fallback).
-        let grace_entries = ctx.grace_store.to_grace_entries().unwrap_or_default();
+        let grace_entries = ctx.grace_store.to_grace_entries();
         ContextSnapshot {
             context_id: ctx.handle.context_id().to_owned(),
             state,

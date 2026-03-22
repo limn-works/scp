@@ -32,7 +32,7 @@ use serde::{Deserialize, Serialize};
 
 use scp_identity::DID;
 
-use scp_primitives::time;
+use scp_primitives::Clock;
 
 // Re-use CustodyType from scp-platform to avoid duplication.
 // CustodyType is already defined in scp_platform::traits but scp-core doesn't
@@ -159,10 +159,6 @@ pub enum CustodyMigrationError {
     /// harmless."
     #[error("old key destruction failed (step 5): {0}")]
     DestructionFailed(String),
-
-    /// The system clock is unavailable.
-    #[error("clock error: {0}")]
-    ClockError(#[from] time::ClockError),
 
     /// The new active public key is invalid (wrong length).
     #[error("invalid new active public key: expected 32 bytes, got {0}")]
@@ -336,7 +332,7 @@ pub trait CustodyMigrationBackend {
 ///     CustodyMigrationTarget::Hardware,
 ///     vec!["ctx-1".into(), "ctx-2".into()],
 /// );
-/// let result = orchestrator.execute(&backend).await?;
+/// let result = orchestrator.execute(&backend, &clock).await?;
 /// ```
 ///
 /// See spec §3.2.1 (Key Custody Migration Protocol).
@@ -395,8 +391,9 @@ impl CustodyMigrationOrchestrator {
     pub async fn execute(
         &self,
         backend: &dyn CustodyMigrationBackend,
+        clock: &dyn Clock,
     ) -> Result<CustodyMigrationResult, CustodyMigrationError> {
-        let initiated_at = time::now_millis()?;
+        let initiated_at = clock.now_millis();
 
         // Step 1: Generate new key in target custody provider.
         let new_pubkey = backend
@@ -449,7 +446,7 @@ impl CustodyMigrationOrchestrator {
             }
         };
 
-        let completed_at = time::now_millis()?;
+        let completed_at = clock.now_millis();
 
         Ok(CustodyMigrationResult {
             did: self.did.clone(),
@@ -814,7 +811,10 @@ mod tests {
 
         let backend = MockMigrationBackend::new();
 
-        let result = orch.execute(&backend).await.unwrap();
+        let result = orch
+            .execute(&backend, &scp_primitives::SystemClock)
+            .await
+            .unwrap();
 
         assert_eq!(result.did, did("did:dht:alice"));
         assert_eq!(result.target, CustodyMigrationTarget::Hardware);
@@ -838,7 +838,10 @@ mod tests {
         );
 
         let backend = MockMigrationBackend::new();
-        let result = orch.execute(&backend).await.unwrap();
+        let result = orch
+            .execute(&backend, &scp_primitives::SystemClock)
+            .await
+            .unwrap();
 
         assert!(result.updated_contexts.is_empty());
         assert!(result.failed_contexts.is_empty());
@@ -859,7 +862,10 @@ mod tests {
             ..MockMigrationBackend::new()
         };
 
-        let err = orch.execute(&backend).await.unwrap_err();
+        let err = orch
+            .execute(&backend, &scp_primitives::SystemClock)
+            .await
+            .unwrap_err();
         assert!(matches!(err, CustodyMigrationError::KeyGenerationFailed(_)));
         assert!(err.to_string().contains("HSM initialization failed"));
     }
@@ -877,7 +883,10 @@ mod tests {
             ..MockMigrationBackend::new()
         };
 
-        let err = orch.execute(&backend).await.unwrap_err();
+        let err = orch
+            .execute(&backend, &scp_primitives::SystemClock)
+            .await
+            .unwrap_err();
         assert!(matches!(err, CustodyMigrationError::InvalidPublicKey(16)));
     }
 
@@ -894,7 +903,10 @@ mod tests {
             ..MockMigrationBackend::new()
         };
 
-        let err = orch.execute(&backend).await.unwrap_err();
+        let err = orch
+            .execute(&backend, &scp_primitives::SystemClock)
+            .await
+            .unwrap_err();
         assert!(matches!(err, CustodyMigrationError::AuthorizationFailed(_)));
         assert!(err.to_string().contains("biometric verification failed"));
     }
@@ -912,7 +924,10 @@ mod tests {
             ..MockMigrationBackend::new()
         };
 
-        let err = orch.execute(&backend).await.unwrap_err();
+        let err = orch
+            .execute(&backend, &scp_primitives::SystemClock)
+            .await
+            .unwrap_err();
         assert!(matches!(err, CustodyMigrationError::RotationFailed(_)));
     }
 
@@ -929,7 +944,10 @@ mod tests {
             ..MockMigrationBackend::new()
         };
 
-        let result = orch.execute(&backend).await.unwrap();
+        let result = orch
+            .execute(&backend, &scp_primitives::SystemClock)
+            .await
+            .unwrap();
 
         assert_eq!(result.updated_contexts, vec!["ctx-1", "ctx-3"]);
         assert_eq!(result.failed_contexts, vec!["ctx-2"]);
@@ -953,7 +971,10 @@ mod tests {
         };
 
         // Step 4 failure is non-fatal — result is returned, not error.
-        let result = orch.execute(&backend).await.unwrap();
+        let result = orch
+            .execute(&backend, &scp_primitives::SystemClock)
+            .await
+            .unwrap();
         assert!(!result.ucans_reissued);
         assert!(result.did_document_rotated);
         assert!(result.old_key_destroyed);
@@ -979,7 +1000,10 @@ mod tests {
         };
 
         // Step 5 failure is non-fatal per spec §3.2.1.
-        let result = orch.execute(&backend).await.unwrap();
+        let result = orch
+            .execute(&backend, &scp_primitives::SystemClock)
+            .await
+            .unwrap();
         assert!(!result.old_key_destroyed);
         assert!(result.ucans_reissued);
         assert!(result.did_document_rotated);
@@ -1005,7 +1029,10 @@ mod tests {
             ..MockMigrationBackend::new()
         };
 
-        let result = orch.execute(&backend).await.unwrap();
+        let result = orch
+            .execute(&backend, &scp_primitives::SystemClock)
+            .await
+            .unwrap();
         assert!(!result.ucans_reissued);
         assert!(!result.old_key_destroyed);
         assert!(result.failure_reason.is_some());
@@ -1035,7 +1062,10 @@ mod tests {
             );
 
             let backend = MockMigrationBackend::new();
-            let result = orch.execute(&backend).await.unwrap();
+            let result = orch
+                .execute(&backend, &scp_primitives::SystemClock)
+                .await
+                .unwrap();
 
             assert_eq!(result.target, target);
             assert!(result.key_generated);

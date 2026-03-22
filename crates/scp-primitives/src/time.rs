@@ -1,13 +1,12 @@
 //! Clock utilities with proper error handling.
 //!
-//! Provides [`now_secs`] and [`now_millis`] as drop-in replacements for the
-//! `SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_*()` pattern that
-//! silently falls back to epoch 0 on clock errors. A UCAN minted with
-//! timestamp 0 could appear to never expire — this is a security issue.
+//! The public API is the [`Clock`] trait with two implementations:
+//! - [`SystemClock`] — production clock backed by [`SystemTime`].
+//! - [`TestClock`] — deterministic clock with manual time control.
 //!
-//! All production code should use these functions instead of inlining
-//! `SystemTime::now()` calls. The error type [`ClockError`] deliberately hides
-//! raw system error details to avoid leaking internal state.
+//! The free functions `now_secs()` / `now_millis()` and `ClockError` are
+//! private implementation details of `SystemClock`. All production code
+//! should use `&dyn Clock` or `SystemClock` directly.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -25,7 +24,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 /// The error message is intentionally generic to avoid exposing raw system
 /// error details.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ClockError;
+struct ClockError;
 
 impl std::fmt::Display for ClockError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -44,7 +43,7 @@ impl std::error::Error for ClockError {}
 /// # Errors
 ///
 /// Returns [`ClockError`] if the system clock is before the Unix epoch.
-pub fn now_secs() -> Result<u64, ClockError> {
+fn now_secs() -> Result<u64, ClockError> {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())
@@ -59,7 +58,7 @@ pub fn now_secs() -> Result<u64, ClockError> {
 /// # Errors
 ///
 /// Returns [`ClockError`] if the system clock is before the Unix epoch.
-pub fn now_millis() -> Result<u64, ClockError> {
+fn now_millis() -> Result<u64, ClockError> {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| {
@@ -76,8 +75,7 @@ pub fn now_millis() -> Result<u64, ClockError> {
 
 /// Trait for obtaining the current time. Implementations must be thread-safe.
 ///
-/// Unlike the fallible [`now_secs`] / [`now_millis`] functions, the trait
-/// methods are infallible.  A system clock before the Unix epoch is an
+/// A system clock before the Unix epoch is an
 /// unrecoverable environment failure; implementations should panic rather
 /// than silently return 0 (which would bypass UCAN expiry and nonce
 /// freshness checks).
