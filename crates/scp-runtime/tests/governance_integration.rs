@@ -33,22 +33,22 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use ed25519_dalek::Signer;
 
-use scp_core::context::builder::{
-    ContextCreationError, ContextCryptoProvider, ContextEventLogProvider, ContextTransportProvider,
-};
-use scp_core::context::governance::majority::MajorityVoteEngine;
-use scp_core::context::governance::multisig::ThresholdEngine;
-use scp_core::context::governance::timeout::{DeadlockCondition, DeadlockDetectionState};
-use scp_core::context::governance::unanimity::UnanimityEngine;
-use scp_core::context::governance::{
+use scp_identity::DID;
+use scp_protocol::context::builder::{ContextCreationError, ContextCryptoProvider};
+use scp_protocol::context::governance::majority::MajorityVoteEngine;
+use scp_protocol::context::governance::multisig::ThresholdEngine;
+use scp_protocol::context::governance::unanimity::UnanimityEngine;
+use scp_protocol::context::governance::{
     CheckpointAttestationStatus, CosignedCheckpoint, GovernanceAction, GovernanceContext,
     GovernanceEngine, GovernanceEvent, KeyResolver, ProposalStatus, RevocationScope,
     SingleAdminEngine, VoteType, actions_conflict, sign_vote,
 };
-use scp_core::context::manager::{GovernanceActionResult, ProposalOutcome};
-use scp_core::context::params::{Capability, ContextParams, GovernanceModel};
-use scp_core::context::{ContextError, ContextManager, ContextState};
-use scp_identity::DID;
+use scp_protocol::context::params::{Capability, ContextParams, GovernanceModel};
+use scp_protocol::context::{ContextError, ContextState};
+use scp_runtime::context::builder::{ContextEventLogProvider, ContextTransportProvider};
+use scp_runtime::context::governance::timeout::{DeadlockCondition, DeadlockDetectionState};
+use scp_runtime::context::manager::ContextManager;
+use scp_runtime::context::manager::{GovernanceActionResult, ProposalOutcome};
 
 // ---------------------------------------------------------------------------
 // Mock providers
@@ -107,8 +107,8 @@ impl ContextCryptoProvider for MockCrypto {
         _id: &[u8; 32],
         _member_did: &str,
         _key_package_bytes: Option<&[u8]>,
-    ) -> Result<scp_core::context::AddMemberOutput, ContextError> {
-        Ok(scp_core::context::AddMemberOutput::default())
+    ) -> Result<scp_protocol::context::builder::AddMemberOutput, ContextError> {
+        Ok(scp_protocol::context::builder::AddMemberOutput::default())
     }
     fn remove_member(&self, _id: &[u8; 32], _member_did: &str) -> Result<(), ContextError> {
         Ok(())
@@ -780,7 +780,7 @@ async fn ac8_all_governance_event_types() {
     assert!(matches!(event, GovernanceEvent::ProposalResolved { .. }));
 
     // DeadlockRecovery
-    use scp_core::context::governance::{DeadlockJustification, GovernanceReconfigAction};
+    use scp_protocol::context::governance::{DeadlockJustification, GovernanceReconfigAction};
     let event = GovernanceEvent::DeadlockRecovery {
         justification: DeadlockJustification {
             unavailable_dids: vec![carol()],
@@ -1293,7 +1293,7 @@ async fn ac11_extend_ttl_requires_unanimity_in_threshold() {
 
 #[tokio::test]
 async fn ac12_promote_context_requires_unanimity_in_majority() {
-    use scp_core::context::params::PromotionPolicy;
+    use scp_protocol::context::params::PromotionPolicy;
     let manager = new_manager();
     let ctx_id = "ctx-promote-unanimity";
     let params = ContextParams {
@@ -1507,7 +1507,7 @@ fn ac13_actions_conflict_mutual_removal() {
 
 #[test]
 fn ac14_threshold_deadlock_insufficient_active_signers() {
-    use scp_core::context::governance::timeout::detect_deadlock;
+    use scp_runtime::context::governance::timeout::detect_deadlock;
 
     let signers = vec![alice(), bob(), carol()];
     let engine = ThresholdEngine::new(signers, 2, 300, mock_key_resolver()).unwrap();
@@ -1544,7 +1544,7 @@ fn ac14_threshold_deadlock_insufficient_active_signers() {
 
 #[test]
 fn ac14_no_deadlock_when_sufficient_signers() {
-    use scp_core::context::governance::timeout::detect_deadlock;
+    use scp_runtime::context::governance::timeout::detect_deadlock;
 
     let signers = vec![alice(), bob(), carol()];
     let engine = ThresholdEngine::new(signers, 2, 300, mock_key_resolver()).unwrap();
@@ -1568,7 +1568,7 @@ fn ac14_no_deadlock_when_sufficient_signers() {
 
 #[test]
 fn ac14_majority_deadlock_unresponsive_voters() {
-    use scp_core::context::governance::timeout::detect_deadlock;
+    use scp_runtime::context::governance::timeout::detect_deadlock;
 
     let voters = vec![alice(), bob(), carol(), dave()];
     let engine = MajorityVoteEngine::new(voters, 300, 7500, mock_key_resolver()).unwrap();
@@ -1605,7 +1605,7 @@ fn ac14_majority_deadlock_unresponsive_voters() {
 
 #[test]
 fn ac14_unanimity_deadlock_voter_offline_7_days() {
-    use scp_core::context::governance::timeout::detect_deadlock;
+    use scp_runtime::context::governance::timeout::detect_deadlock;
 
     let voters = vec![alice(), bob(), carol()];
     let engine = UnanimityEngine::new(voters, 300, mock_key_resolver()).unwrap();
@@ -1647,7 +1647,7 @@ fn ac14_unanimity_deadlock_voter_offline_7_days() {
 
 #[test]
 fn ac14_single_admin_never_deadlocks() {
-    use scp_core::context::governance::timeout::detect_deadlock;
+    use scp_runtime::context::governance::timeout::detect_deadlock;
 
     let engine = SingleAdminEngine::new(alice(), mock_key_resolver());
     let ctx = GovernanceContext {
@@ -1970,7 +1970,7 @@ fn sign_vote_round_trip_verification() {
 
     // Verify with the matching verifying key.
     let vk = sk.verifying_key();
-    scp_core::context::governance::verify_vote(&proposal_id, &vote, &vk).unwrap();
+    scp_protocol::context::governance::verify_vote(&proposal_id, &vote, &vk).unwrap();
 }
 
 // =========================================================================
@@ -2015,7 +2015,7 @@ fn ac13_no_conflict_unrelated_actions() {
 
 #[test]
 fn ac14_deadlock_justification_from_conditions() {
-    use scp_core::context::governance::timeout::detect_deadlock;
+    use scp_runtime::context::governance::timeout::detect_deadlock;
 
     let signers = vec![alice(), bob(), carol()];
     let engine = ThresholdEngine::new(signers, 2, 300, mock_key_resolver()).unwrap();
@@ -2034,7 +2034,7 @@ fn ac14_deadlock_justification_from_conditions() {
 
     // Build justification from the conditions.
     let justification =
-        scp_core::context::governance::timeout::build_justification(&conditions, 1_000_000);
+        scp_runtime::context::governance::timeout::build_justification(&conditions, 1_000_000);
     assert!(justification.unavailable_dids.contains(&bob()));
     assert!(justification.unavailable_dids.contains(&carol()));
     assert_eq!(justification.detected_at, 1_000_000);

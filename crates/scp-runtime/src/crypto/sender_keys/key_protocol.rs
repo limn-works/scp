@@ -223,6 +223,7 @@ pub async fn request_sender_key(
 /// provided and the requester is not a member.
 /// Returns [`SenderKeyError::VerificationFailed`] if the request signature
 /// is invalid or malformed. Returns other variants for HPKE failures.
+#[allow(clippy::unused_async)] // API contract: callers expect async; may need await in future
 pub async fn handle_sender_key_request<S: BuildHasher + Sync>(
     request: &SenderKeyRequest,
     requester_public_key: &[u8],
@@ -484,10 +485,10 @@ mod tests {
     use scp_platform::traits::{KeyCustody, KeyType};
     use scp_primitives::Clock;
 
-    use super::super::key_protocol_verify::{
+    use super::*;
+    use scp_protocol::crypto::sender_keys::key_protocol_verify::{
         BLOCK_NOTIFICATION_FRESHNESS_MS, REQUEST_FRESHNESS_SECS,
     };
-    use super::*;
 
     /// Creates a test custody and an Ed25519 signing key.
     async fn setup() -> (InMemoryKeyCustody, KeyHandle) {

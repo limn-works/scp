@@ -1092,7 +1092,6 @@ mod tests {
     use std::collections::HashSet;
 
     use super::*;
-    use crate::context::ContextParams;
     use crate::context::roles::{Capability, CapabilityCeiling, ContextRoleState};
     use crate::context::tools::registry::{ToolRegistry, ToolSchema, register_tool};
 

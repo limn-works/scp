@@ -1,7 +1,7 @@
 //! Context lifecycle types for SCP.
 //!
-//! Pure protocol types: ContextState, ContextError, context_id_bytes, and
-//! submodule declarations for moved modules. Async types (ContextHandle,
+//! Pure protocol types: `ContextState`, `ContextError`, `context_id_bytes`, and
+//! submodule declarations for moved modules. Async types (`ContextHandle`,
 //! builder, manager, providers, ttl, etc.) remain in scp-runtime.
 
 pub mod broadcast;
@@ -26,6 +26,9 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 // Re-exports for backward compatibility — downstream code uses `crate::context::X`.
+pub use broadcast::{
+    AuthorState, BroadcastAdmission, BroadcastContext, BroadcastContextSnapshot, KeyRequestDecision,
+};
 pub use broadcast_content::{BroadcastContent, BroadcastContentError};
 pub use governance::{
     CheckpointAttestationStatus, ConflictResolution, CosignedCheckpoint, GovernanceAction,
@@ -35,6 +38,7 @@ pub use governance::{
     sign_vote, verify_proposal_votes, verify_vote,
 };
 pub use membership::{MemberInfo, MembershipState};
+pub use nesting::{compute_ceiling_intersection, validate_child_ttl, validate_nesting_depth};
 pub use params::{
     BridgeCapability, BridgeDirectionality, BridgeMetadata, Capability, CeilingPolicy, ContextMode,
     ContextParams, FieldVisibility, GovernanceModel, MemoryScope, MetadataVisibilityPolicy,
@@ -242,7 +246,7 @@ pub enum ContextError {
     /// error variant (authorization failure, cost insufficient, adapter error,
     /// etc.) rather than type-erasing to a string.
     ///
-    /// NOTE: This variant embeds IntegrationError from the economy module.
+    /// NOTE: This variant embeds `IntegrationError` from the economy module.
     /// Cross-crate type resolution is deferred to compilation fix phase.
     ///
     /// See spec section 19.2.2.

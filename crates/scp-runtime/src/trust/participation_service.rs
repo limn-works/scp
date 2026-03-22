@@ -1,4 +1,4 @@
-//! ParticipationStatements DID Document Service Endpoint functions (SCP-BA-006).
+//! `ParticipationStatements` DID Document Service Endpoint functions (SCP-BA-006).
 //!
 //! These functions operate on `scp_identity::document::DidDocument` and are
 //! located in scp-runtime (not scp-protocol) to avoid pulling scp-identity

@@ -19,33 +19,33 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use scp_core::context::builder::{
-    ContextCreationError, ContextCryptoProvider, ContextEventLogProvider, ContextTransportProvider,
-};
-use scp_core::context::governance::{
-    GovernanceAction, KeyResolver, ProposalStatus, RevocationScope,
-};
-use scp_core::context::manager::ProposalOutcome;
-use scp_core::context::params::{Capability, ContextParams, GovernanceModel};
-use scp_core::context::{ContextError, ContextHandle, ContextManager};
-use scp_core::crypto::access_keys::lifecycle::{
-    handle_block_as_blocked_party, handle_block_as_blocker, restore_access_key, revoke_access_key,
-    revoke_read_access, revoke_write_access,
-};
-use scp_core::crypto::access_keys::wrapping::{Recipient, unwrap_content, wrap_content};
-use scp_core::crypto::access_keys::{AccessKeyStore, ContentAccessState, generate_access_key};
-use scp_core::crypto::sender_keys::{
-    BlockNotification, SenderKeyStore, generate_sender_key, send_block_notification,
-};
-use scp_core::identity::SigningKeyId;
-use scp_core::identity::block_list::{BlockListEvent, BlockListState};
-use scp_core::identity::blocking::{
-    BlockInContextParams, GlobalBlockParams, block_did_global, block_did_in_context,
-    is_block_effective,
-};
 use scp_identity::DID;
 use scp_platform::testing::InMemoryKeyCustody;
 use scp_platform::traits::{KeyCustody, KeyType};
+use scp_protocol::context::ContextError;
+use scp_protocol::context::builder::{ContextCreationError, ContextCryptoProvider};
+use scp_protocol::context::governance::{
+    GovernanceAction, KeyResolver, ProposalStatus, RevocationScope,
+};
+use scp_protocol::context::params::{Capability, ContextParams, GovernanceModel};
+use scp_protocol::crypto::access_keys::wrapping::{Recipient, unwrap_content, wrap_content};
+use scp_protocol::crypto::access_keys::{AccessKeyStore, ContentAccessState, generate_access_key};
+use scp_protocol::crypto::sender_keys::{BlockNotification, SenderKeyStore, generate_sender_key};
+use scp_protocol::identity::SigningKeyId;
+use scp_protocol::identity::block_list::{BlockListEvent, BlockListState};
+use scp_runtime::context::ContextHandle;
+use scp_runtime::context::builder::{ContextEventLogProvider, ContextTransportProvider};
+use scp_runtime::context::manager::ContextManager;
+use scp_runtime::context::manager::ProposalOutcome;
+use scp_runtime::crypto::access_keys::lifecycle::{
+    handle_block_as_blocked_party, handle_block_as_blocker, restore_access_key, revoke_access_key,
+    revoke_read_access, revoke_write_access,
+};
+use scp_runtime::crypto::sender_keys::key_protocol::send_block_notification;
+use scp_runtime::identity::blocking::{
+    BlockInContextParams, GlobalBlockParams, block_did_global, block_did_in_context,
+    is_block_effective,
+};
 
 // ---------------------------------------------------------------------------
 // DID string constants
@@ -134,8 +134,8 @@ impl ContextCryptoProvider for MockCrypto {
         _id: &[u8; 32],
         _member_did: &str,
         _key_package_bytes: Option<&[u8]>,
-    ) -> Result<scp_core::context::AddMemberOutput, ContextError> {
-        Ok(scp_core::context::AddMemberOutput::default())
+    ) -> Result<scp_protocol::context::builder::AddMemberOutput, ContextError> {
+        Ok(scp_protocol::context::builder::AddMemberOutput::default())
     }
     fn remove_member(&self, _id: &[u8; 32], _member_did: &str) -> Result<(), ContextError> {
         Ok(())
@@ -849,7 +849,7 @@ async fn tier3_governance_revoke_write_access_broadcast() {
     let has_restored = events.iter().any(|e| {
         matches!(
             e,
-            scp_core::context::membership::ContextEvent::WriteAccessRestored { did }
+            scp_protocol::context::membership::ContextEvent::WriteAccessRestored { did }
             if *did == author_did()
         )
     });
@@ -1437,7 +1437,7 @@ fn wrapping_excludes_blocked_member_even_with_cached_key() {
     assert!(
         matches!(
             dave_attempt,
-            Err(scp_core::crypto::access_keys::AccessKeyError::NotRecipient)
+            Err(scp_protocol::crypto::access_keys::AccessKeyError::NotRecipient)
         ),
         "Dave should get NotRecipient even with cached key: {dave_attempt:?}"
     );

@@ -26,16 +26,16 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use scp_core::context::builder::{
-    ContextCreationError, ContextCryptoProvider, ContextEventLogProvider, ContextTransportProvider,
-};
-use scp_core::context::governance::{
+use scp_identity::DID;
+use scp_protocol::context::ContextError;
+use scp_protocol::context::builder::{ContextCreationError, ContextCryptoProvider};
+use scp_protocol::context::governance::{
     GovernanceAction, GovernanceEvent, KeyResolver, ProposalStatus, RevocationScope,
 };
-use scp_core::context::manager::{GovernanceActionResult, ProposalOutcome};
-use scp_core::context::params::{Capability, ContextParams, GovernanceModel};
-use scp_core::context::{ContextError, ContextManager};
-use scp_identity::DID;
+use scp_protocol::context::params::{Capability, ContextParams, GovernanceModel};
+use scp_runtime::context::builder::{ContextEventLogProvider, ContextTransportProvider};
+use scp_runtime::context::manager::ContextManager;
+use scp_runtime::context::manager::{GovernanceActionResult, ProposalOutcome};
 
 // ---------------------------------------------------------------------------
 // Mock providers (same pattern as governance_integration.rs)
@@ -90,8 +90,8 @@ impl ContextCryptoProvider for MockCrypto {
         _id: &[u8; 32],
         _member_did: &str,
         _key_package_bytes: Option<&[u8]>,
-    ) -> Result<scp_core::context::AddMemberOutput, ContextError> {
-        Ok(scp_core::context::AddMemberOutput::default())
+    ) -> Result<scp_protocol::context::builder::AddMemberOutput, ContextError> {
+        Ok(scp_protocol::context::builder::AddMemberOutput::default())
     }
     fn remove_member(&self, _id: &[u8; 32], _member_did: &str) -> Result<(), ContextError> {
         Ok(())
@@ -353,7 +353,7 @@ async fn revoke_read_access_full_via_threshold_governance() {
     let has_read_revoked = events.iter().any(|e| {
         matches!(
             e,
-            scp_core::context::membership::ContextEvent::ReadAccessRevoked { did }
+            scp_protocol::context::membership::ContextEvent::ReadAccessRevoked { did }
                 if *did == dave()
         )
     });
@@ -399,7 +399,7 @@ async fn restore_read_access_forward_only() {
     let has_restored = events.iter().any(|e| {
         matches!(
             e,
-            scp_core::context::membership::ContextEvent::ReadAccessRestored { did }
+            scp_protocol::context::membership::ContextEvent::ReadAccessRestored { did }
                 if *did == dave()
         )
     });
@@ -418,7 +418,7 @@ async fn restore_read_access_forward_only() {
     let has_key_restored = events.iter().any(|e| {
         matches!(
             e,
-            scp_core::context::membership::ContextEvent::AccessKeyRestored { did, .. }
+            scp_protocol::context::membership::ContextEvent::AccessKeyRestored { did, .. }
                 if *did == dave()
         )
     });
@@ -453,7 +453,7 @@ async fn revoke_write_access_full_blocks_publishing() {
     let has_write_revoked = events.iter().any(|e| {
         matches!(
             e,
-            scp_core::context::membership::ContextEvent::WriteAccessRevoked { did }
+            scp_protocol::context::membership::ContextEvent::WriteAccessRevoked { did }
                 if *did == dave()
         )
     });
@@ -469,7 +469,7 @@ async fn revoke_write_access_full_blocks_publishing() {
     );
 
     // Verify Dave cannot publish messages.
-    let handle = scp_core::context::ContextHandle::new(
+    let handle = scp_runtime::context::ContextHandle::new(
         ctx_id.to_owned(),
         ContextParams {
             ceiling: governance_ceiling(),
@@ -516,7 +516,7 @@ async fn revoke_write_access_future_only() {
     assert_eq!(outcome.status, ProposalStatus::Approved);
 
     // Verify Dave cannot publish future messages.
-    let handle = scp_core::context::ContextHandle::new(
+    let handle = scp_runtime::context::ContextHandle::new(
         ctx_id.to_owned(),
         ContextParams {
             ceiling: governance_ceiling(),
@@ -572,7 +572,7 @@ async fn restore_write_access_forward_only() {
     let has_restored = events.iter().any(|e| {
         matches!(
             e,
-            scp_core::context::membership::ContextEvent::WriteAccessRestored { did }
+            scp_protocol::context::membership::ContextEvent::WriteAccessRestored { did }
                 if *did == dave()
         )
     });
@@ -584,7 +584,7 @@ async fn restore_write_access_forward_only() {
     // Dave should be able to send messages again.
     // (Forward-only: previously suppressed content remains suppressed,
     // but new messages are allowed.)
-    let handle = scp_core::context::ContextHandle::new(
+    let handle = scp_runtime::context::ContextHandle::new(
         ctx_id.to_owned(),
         ContextParams {
             ceiling: governance_ceiling(),
@@ -625,7 +625,7 @@ async fn rotate_content_keys_via_threshold_governance() {
     let has_rotated = events.iter().any(|e| {
         matches!(
             e,
-            scp_core::context::membership::ContextEvent::ContentKeysRotated { .. }
+            scp_protocol::context::membership::ContextEvent::ContentKeysRotated { .. }
         )
     });
     assert!(has_rotated, "ContentKeysRotated event should be emitted");
@@ -1203,7 +1203,7 @@ async fn full_content_access_lifecycle() {
     );
 
     // Verify Dave cannot write.
-    let handle = scp_core::context::ContextHandle::new(
+    let handle = scp_runtime::context::ContextHandle::new(
         ctx_id.to_owned(),
         ContextParams {
             ceiling: governance_ceiling(),

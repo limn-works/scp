@@ -260,9 +260,8 @@ mod seal_open_tests {
     use super::*;
     use crate::crypto::mls::credential::ScpCredential;
     use crate::crypto::mls::group::{add_member, create_group, generate_key_package, join_group};
-    use crate::envelope::inner::{
-        InnerEnvelopeParams, MessageType, Provenance, create_inner_envelope,
-    };
+    use crate::envelope::inner::sign::create_inner_envelope;
+    use crate::envelope::inner::{InnerEnvelopeParams, MessageType, Provenance};
     use scp_protocol::crypto::sender_keys::generate_sender_key;
     use scp_protocol::envelope::padding::strip_padding;
     use scp_protocol::identity::SigningKeyId;

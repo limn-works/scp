@@ -423,8 +423,8 @@ mod tests {
     }
 
     /// Helper: create a registration entry for context querier responses.
-    fn make_reg_entry(did: &str, caps: &[&str]) -> super::super::RegistrationEntry {
-        super::super::RegistrationEntry {
+    fn make_reg_entry(did: &str, caps: &[&str]) -> scp_protocol::discovery::RegistrationEntry {
+        scp_protocol::discovery::RegistrationEntry {
             did: did.into(),
             capabilities: caps.iter().map(|c| (*c).to_owned()).collect(),
             metadata: serde_json::json!({}),

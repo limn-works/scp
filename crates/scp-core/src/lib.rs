@@ -6,7 +6,7 @@
 //!
 //! MAINTENANCE: When adding a public module to scp-protocol or scp-runtime,
 //! add the corresponding re-export here. The CI check and structural test
-//! in tests/facade_completeness.rs will catch omissions.
+//! in `tests/facade_completeness.rs` will catch omissions.
 
 // --- Modules that exist ONLY in scp-protocol (no conflict) ---
 pub use scp_protocol::jcs;
@@ -32,6 +32,10 @@ pub mod crypto {
     pub mod sender_keys {
         pub use scp_protocol::crypto::sender_keys::*;
         pub use scp_runtime::crypto::sender_keys::key_protocol;
+        pub use scp_runtime::crypto::sender_keys::key_protocol::{
+            handle_sender_key_request, open_sender_key_response, publish_sender_key_epoch_advance,
+            request_sender_key, send_block_notification,
+        };
     }
     pub mod access_keys {
         pub use scp_protocol::crypto::access_keys::*;
@@ -56,6 +60,9 @@ pub mod context {
     pub use scp_runtime::context::providers;
     pub use scp_runtime::context::standing;
     pub use scp_runtime::context::ttl;
+    pub use scp_runtime::context::ttl::{
+        ExtensionConsentMode, TtlExtensionProposal, check_ttl, consent_mode_for_member_count,
+    };
     // Key runtime types re-exported at this level.
     pub use scp_protocol::context::builder::{
         AddMemberOutput, ContextCreationError, ContextCryptoProvider,
@@ -155,15 +162,16 @@ pub mod economy {
 pub mod discovery {
     pub use scp_protocol::discovery::*;
     // Re-export all items from each submodule at this level.
+    // Note: handles::* and petnames::* items are already re-exported
+    // from scp_protocol::discovery via pub use statements in mod.rs.
     pub use scp_protocol::discovery::context::*;
-    pub use scp_protocol::discovery::handles::*;
-    pub use scp_protocol::discovery::petnames::*;
     pub use scp_protocol::discovery::push::*;
     pub use scp_protocol::discovery::scope::*;
     // Async modules from scp-runtime.
     pub use scp_runtime::discovery::addressing;
     pub use scp_runtime::discovery::addressing::*;
     pub use scp_runtime::discovery::bootstrap;
+    pub use scp_runtime::discovery::bootstrap::*;
     pub use scp_runtime::discovery::dht_context;
     pub use scp_runtime::discovery::dht_context::*;
     pub use scp_runtime::discovery::did_capabilities;
@@ -173,6 +181,7 @@ pub mod discovery {
 pub mod envelope {
     pub use scp_protocol::envelope::*;
     pub use scp_runtime::envelope::pseudonym;
+    pub use scp_runtime::envelope::pseudonym::derive_pseudonym;
     pub mod inner {
         pub use scp_protocol::envelope::inner::*;
         pub use scp_runtime::envelope::inner::sign;
@@ -181,8 +190,10 @@ pub mod envelope {
     pub mod outer {
         pub use scp_protocol::envelope::outer::*;
         pub use scp_runtime::envelope::outer::ops;
+        pub use scp_runtime::envelope::outer::ops::{open_envelope, seal_envelope};
     }
     pub use scp_runtime::envelope::inner::sign::create_inner_envelope;
+    pub use scp_runtime::envelope::outer::ops::seal_envelope;
 }
 
 pub mod sync {

@@ -19,14 +19,14 @@
 use ed25519_dalek::{Signer, Verifier};
 use sha2::{Digest, Sha256};
 
-use scp_core::context::tools::interface::InterfaceOffer;
-use scp_core::crypto::canonical::{CanonicalField, canonical_hash, canonical_hash_bytes};
-use scp_core::crypto::key_continuity::{
+use scp_identity::DID;
+use scp_protocol::context::tools::interface::InterfaceOffer;
+use scp_protocol::crypto::canonical::{CanonicalField, canonical_hash, canonical_hash_bytes};
+use scp_protocol::crypto::key_continuity::{
     KeyContinuityParty, compute_key_continuity_fingerprint, fingerprint_to_decimal,
 };
-use scp_core::envelope::padding::{BUCKET_SIZES, pad_to_bucket, strip_padding};
-use scp_core::identity::attestation::IdentityLinkAttestation;
-use scp_identity::DID;
+use scp_protocol::envelope::padding::{BUCKET_SIZES, pad_to_bucket, strip_padding};
+use scp_protocol::identity::attestation::IdentityLinkAttestation;
 
 // ---------------------------------------------------------------------------
 // §25.2 Reference Key Material (RFC 8032 §7.1)
@@ -936,11 +936,11 @@ fn vector_24_25_sender_and_access_info_differ() {
 
 #[test]
 fn vector_26_identity_link_attestation() {
-    use scp_core::identity::attestation::{
+    use scp_protocol::identity::attestation::{
         ATTESTATION_TYPE_IDENTITY_LINK, AttestationClaim, AttestationEvidence,
         IdentityLinkAttestation, VerificationMethod,
     };
-    use scp_core::trust::attestation::RevocationStatus;
+    use scp_protocol::trust::attestation::RevocationStatus;
     use std::borrow::Cow;
 
     println!("=== Vector 26: Identity Link Attestation Signature (V1) ===");

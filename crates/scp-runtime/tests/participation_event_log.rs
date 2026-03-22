@@ -22,12 +22,12 @@
 
 use sha2::{Digest, Sha256};
 
-use scp_core::trust::compute_participation_record;
 use scp_event_log::checkpoint::ConsistencyCheckpoint;
 use scp_event_log::pruning::{PruningConfig, prune_before_checkpoint};
 use scp_event_log::test_helpers::{TestSigner, did_from_pubkey, sign_event, test_keypair};
 use scp_event_log::tree::{self, GENESIS_PREV_HASH};
 use scp_event_log::{Event, EventLog, EventType};
+use scp_protocol::trust::compute_participation_record;
 
 // ---------------------------------------------------------------------------
 // Local test helpers

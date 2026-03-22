@@ -6,7 +6,7 @@
 //! pseudonym-based `routing_id`, an optional `recipient_hint`, a `blob_ttl`,
 //! and an opaque `encrypted_blob`.
 //!
-//! The async `ops` module (seal_envelope, open_envelope) stays in scp-runtime.
+//! The async `ops` module (`seal_envelope`, `open_envelope`) stays in scp-runtime.
 //!
 //! See ADR-002 in `.docs/adrs/phase-1.md` for the full outer envelope design.
 

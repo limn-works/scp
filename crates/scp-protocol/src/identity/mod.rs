@@ -1,7 +1,7 @@
 //! Identity types and utilities for SCP — pure protocol types.
 //!
 //! Pure module re-exports. Async modules (blocking, recovery,
-//! custody_migration, scpid) stay in scp-runtime.
+//! `custody_migration`, scpid) stay in scp-runtime.
 
 pub mod attestation;
 pub mod block_list;
@@ -20,6 +20,11 @@ pub use scp_primitives::SigningKeyId;
 /// This is a local re-implementation of `scp_identity::extract_public_key` to
 /// avoid pulling in the full scp-identity crate (and its tokio dependency)
 /// into scp-protocol.
+///
+/// # Errors
+///
+/// Returns an error string if the DID does not start with `did:dht:z`,
+/// if z-base-32 decoding fails, or if the decoded key is not exactly 32 bytes.
 pub fn extract_public_key_from_did(did_string: &str) -> Result<[u8; 32], String> {
     let encoded = did_string
         .strip_prefix("did:dht:z")

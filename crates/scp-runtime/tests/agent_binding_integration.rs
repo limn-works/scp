@@ -24,20 +24,21 @@
 
 use ed25519_dalek::Signer;
 
-use scp_core::crypto::mls::credential::ScpCredential;
-use scp_core::crypto::ucan::mint::{MintParams, mint_ucan};
-use scp_core::envelope::inner::{
-    InnerEnvelopeParams, MessageType, Provenance, create_inner_envelope, verify_inner_signature,
-};
-use scp_core::trust::{
-    ActionCategory, CounterAttestation, CustodyViolationType, ScpCustodyViolationAttestation,
-    classify_action, enforce_category_a,
-};
 use scp_identity::attestation::{KeyCustodyModel, Platform, ScpKeyCustodyAttestation};
 use scp_identity::document::DidDocument;
 use scp_identity::{DID, SigningKeyId};
 use scp_platform::testing::InMemoryKeyCustody;
 use scp_platform::traits::{KeyCustody, KeyType};
+use scp_protocol::envelope::inner::{
+    InnerEnvelopeParams, MessageType, Provenance, verify_inner_signature,
+};
+use scp_protocol::trust::{
+    ActionCategory, CounterAttestation, CustodyViolationType, ScpCustodyViolationAttestation,
+    classify_action, enforce_category_a,
+};
+use scp_runtime::crypto::mls::credential::ScpCredential;
+use scp_runtime::crypto::ucan::mint::{MintParams, mint_ucan};
+use scp_runtime::envelope::inner::sign::create_inner_envelope;
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -279,7 +280,7 @@ async fn test_agent_binding_full_flow() {
 
     let payload = b"Hello from agent!";
     let params = InnerEnvelopeParams {
-        version: scp_core::envelope::inner::SCP_INNER_ENVELOPE_VERSION,
+        version: scp_protocol::envelope::inner::SCP_INNER_ENVELOPE_VERSION,
         context_id: "ctx:test-context-001",
         sender_did: &did,
         epoch: 1,

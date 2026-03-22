@@ -48,7 +48,7 @@ const MAX_EXPIRY_SECS: u64 = 24 * 60 * 60;
 pub const DEFAULT_CLOCK_SKEW_TOLERANCE_SECS: u64 = 5 * 60;
 
 /// Nonce freshness tolerance: 5 minutes in milliseconds (spec section 9.14).
-#[cfg(test)]
+#[cfg(all(test, feature = "_runtime_tests"))]
 const NONCE_FRESHNESS_TOLERANCE_MS: u128 = 5 * 60 * 1000;
 
 /// Maximum delegation chain depth to prevent infinite loops.
@@ -208,13 +208,13 @@ impl DidResolver for InMemoryDidResolver {
 /// per-context scoping, capacity limits, and automatic pruning.
 ///
 /// See ADR-016 acceptance criterion 6.
-#[cfg(test)]
-pub(crate) struct InMemoryNonceTracker {
+#[cfg(any(test, feature = "testing"))]
+pub struct InMemoryNonceTracker {
     /// Map of nonce -> (`first_seen_timestamp_secs`, `token_expiry_secs`).
     seen: std::collections::HashMap<String, (u64, u64)>,
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "testing"))]
 impl InMemoryNonceTracker {
     /// Creates a new empty nonce tracker.
     #[must_use]
@@ -225,16 +225,18 @@ impl InMemoryNonceTracker {
     }
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "testing"))]
 impl Default for InMemoryNonceTracker {
     fn default() -> Self {
         Self::new()
     }
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "testing"))]
 impl NonceTracker for InMemoryNonceTracker {
     fn check_and_record(&mut self, nonce: &str, token_expiry: u64) -> Result<(), UcanError> {
+        /// 5 minutes in milliseconds — mirrors `nonce::NONCE_FRESHNESS_TOLERANCE_MS`.
+        const NONCE_FRESHNESS_TOLERANCE_MS: u128 = 5 * 60 * 1000;
         // Validate nonce format: {unix_millis}-{32_hex_chars}
         let (ts_part, hex_part) = nonce.split_once('-').ok_or_else(|| {
             UcanError::NonceFormatInvalid(format!("missing '-' separator in nonce: {nonce}"))
@@ -582,7 +584,7 @@ where
 /// # Errors
 ///
 /// Returns a specific [`UcanError`] variant indicating which step failed.
-#[cfg(test)]
+#[cfg(all(test, feature = "_runtime_tests"))]
 pub(crate) fn validate_ucan_stateless<D, S>(
     token: &UcanToken,
     required_capability: &CapabilityUri,
@@ -1079,7 +1081,7 @@ fn verify_expiry(
     Ok(())
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "_runtime_tests"))]
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
     use super::*;

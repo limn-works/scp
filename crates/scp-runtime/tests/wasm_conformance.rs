@@ -24,10 +24,10 @@
 use ed25519_dalek::Signer;
 use sha2::{Digest, Sha256};
 
-use scp_core::context::tools::schema;
 use scp_event_log::proof as core_proof;
 use scp_event_log::tree as core_tree;
 use scp_event_log::{Event, EventLog, EventPayload, EventType};
+use scp_protocol::context::tools::schema;
 
 // ===========================================================================
 // WASM algorithm mirror (verbatim from scp-ffi-wasm/src/runtime.rs)
@@ -2615,7 +2615,7 @@ fn root_token_no_proofs_passes() {
 
 #[test]
 fn wasm_circular_delegation_error_matches_core_format() {
-    use scp_core::crypto::ucan::UcanError;
+    use scp_protocol::crypto::ucan::UcanError;
 
     let core_err =
         UcanError::CircularDelegation("issuer 'did:key:abc' appears multiple times".to_owned());
@@ -3149,7 +3149,7 @@ fn wasm_and_core_revocation_cid_match_golden_value() {
         "eyJhbGciOiJFZERTQSJ9.eyJpc3MiOiJkaWQ6ZGh0Ono2TWtHb2xkZW5UZXN0In0.dGVzdC1zaWc";
 
     // --- Core computation ---
-    let core_cid = scp_core::crypto::ucan::revoke::compute_revocation_cid(GOLDEN_TOKEN);
+    let core_cid = scp_protocol::crypto::ucan::revoke::compute_revocation_cid(GOLDEN_TOKEN);
 
     // --- WASM mirror computation ---
     let wasm_cid = wasm_ucan_mirror::compute_revocation_cid(GOLDEN_TOKEN);
@@ -3181,8 +3181,8 @@ fn wasm_and_core_revocation_cid_different_tokens() {
     let token_a = "eyJhbGciOiJFZERTQSJ9.eyJpc3MiOiJhbGljZSJ9.c2lnLWE";
     let token_b = "eyJhbGciOiJFZERTQSJ9.eyJpc3MiOiJib2IifQ.c2lnLWI";
 
-    let core_a = scp_core::crypto::ucan::revoke::compute_revocation_cid(token_a);
-    let core_b = scp_core::crypto::ucan::revoke::compute_revocation_cid(token_b);
+    let core_a = scp_protocol::crypto::ucan::revoke::compute_revocation_cid(token_a);
+    let core_b = scp_protocol::crypto::ucan::revoke::compute_revocation_cid(token_b);
     let wasm_a = wasm_ucan_mirror::compute_revocation_cid(token_a);
     let wasm_b = wasm_ucan_mirror::compute_revocation_cid(token_b);
 
@@ -3236,7 +3236,7 @@ fn wasm_and_core_revocation_cid_match_after_jwt_roundtrip() {
 
     // Both implementations hash the raw JWT string directly.
     let wasm_cid = wasm_ucan_mirror::compute_revocation_cid(&jwt);
-    let core_cid = scp_core::crypto::ucan::revoke::compute_revocation_cid(&jwt);
+    let core_cid = scp_protocol::crypto::ucan::revoke::compute_revocation_cid(&jwt);
 
     assert_eq!(
         core_cid, wasm_cid,
@@ -3269,7 +3269,7 @@ fn validate_nonce_both(
     token_expiry: u64,
 ) -> (
     Result<(), String>,
-    Result<(), scp_core::crypto::ucan::UcanError>,
+    Result<(), scp_protocol::crypto::ucan::UcanError>,
 ) {
     use scp_identity::cache::TestClock;
     use std::sync::Arc;
@@ -3282,7 +3282,7 @@ fn validate_nonce_both(
     // scp-core: validate via NonceTracker::check_and_record.
     let clock = Arc::new(TestClock::new(now_secs));
     let mut tracker =
-        scp_core::crypto::ucan::nonce::NonceTracker::new("ctx-conformance".to_owned(), clock);
+        scp_protocol::crypto::ucan::nonce::NonceTracker::new("ctx-conformance".to_owned(), clock);
     let core_result = tracker.check_and_record(nonce, token_expiry);
 
     (wasm_result, core_result)
@@ -3531,7 +3531,7 @@ fn nonce_replay_rejected_by_core_tracker() {
     // scp-core: first use succeeds, second fails.
     let clock = Arc::new(TestClock::new(now_secs));
     let mut tracker =
-        scp_core::crypto::ucan::nonce::NonceTracker::new("ctx-replay".to_owned(), clock);
+        scp_protocol::crypto::ucan::nonce::NonceTracker::new("ctx-replay".to_owned(), clock);
     let first = tracker.check_and_record(&nonce, now_secs + 3600);
     assert!(
         first.is_ok(),
@@ -3661,12 +3661,12 @@ const WASM_SCP_PROTOCOL_VERSION: u16 = 0x0100;
 #[test]
 fn scp_protocol_version_wasm_matches_core() {
     assert_eq!(
-        scp_core::envelope::SCP_PROTOCOL_VERSION,
+        scp_protocol::envelope::SCP_PROTOCOL_VERSION,
         WASM_SCP_PROTOCOL_VERSION,
         "WASM bridge SCP_PROTOCOL_VERSION (0x{:04X}) differs from scp-core (0x{:04X}) — \
          update crates/scp-ffi/wasm/src/manager.rs to match",
         WASM_SCP_PROTOCOL_VERSION,
-        scp_core::envelope::SCP_PROTOCOL_VERSION,
+        scp_protocol::envelope::SCP_PROTOCOL_VERSION,
     );
 }
 
@@ -3678,8 +3678,8 @@ fn protocol_version_decode_encode_wasm_matches_core() {
     let wasm_major = (WASM_SCP_PROTOCOL_VERSION >> 8) as u8;
     let wasm_minor = (WASM_SCP_PROTOCOL_VERSION & 0xFF) as u8;
 
-    let (core_major, core_minor) = scp_core::context::params::decode_protocol_version(
-        scp_core::envelope::SCP_PROTOCOL_VERSION,
+    let (core_major, core_minor) = scp_protocol::context::params::decode_protocol_version(
+        scp_protocol::envelope::SCP_PROTOCOL_VERSION,
     );
 
     assert_eq!(
@@ -3690,7 +3690,8 @@ fn protocol_version_decode_encode_wasm_matches_core() {
 
     // WASM encode: ((major as u16) << 8) | (minor as u16)
     let wasm_encoded = (u16::from(wasm_major) << 8) | u16::from(wasm_minor);
-    let core_encoded = scp_core::context::params::encode_protocol_version(core_major, core_minor);
+    let core_encoded =
+        scp_protocol::context::params::encode_protocol_version(core_major, core_minor);
 
     assert_eq!(
         wasm_encoded, core_encoded,
@@ -4210,7 +4211,7 @@ fn wasm_petname_set_resolve_matches_core() {
     use wasm_petname_mirror::WasmPetnameMap;
 
     // Core PetnameMap
-    let mut core = scp_core::discovery::PetnameMap::default();
+    let mut core = scp_protocol::discovery::PetnameMap::default();
     core.set_petname(DID::from("did:dht:zAlice"), "alice".to_owned());
     core.set_petname(DID::from("did:dht:zBob"), "bob".to_owned());
 
@@ -4256,7 +4257,7 @@ fn wasm_petname_remove_matches_core() {
     use scp_identity::DID;
     use wasm_petname_mirror::WasmPetnameMap;
 
-    let mut core = scp_core::discovery::PetnameMap::default();
+    let mut core = scp_protocol::discovery::PetnameMap::default();
     core.set_petname(DID::from("did:dht:zAlice"), "alice".to_owned());
     core.remove_petname(&DID::from("did:dht:zAlice"));
 
@@ -4282,7 +4283,7 @@ fn wasm_petname_remove_matches_core() {
 fn wasm_petname_context_matches_core() {
     use wasm_petname_mirror::WasmPetnameMap;
 
-    let mut core = scp_core::discovery::PetnameMap::default();
+    let mut core = scp_protocol::discovery::PetnameMap::default();
     core.set_context_petname("ctx-work".to_owned(), "work".to_owned());
 
     let mut wasm = WasmPetnameMap::new();
@@ -4315,8 +4316,8 @@ fn wasm_petname_context_matches_core() {
 
 #[test]
 fn wasm_petname_event_emission_matches_core() {
-    use scp_core::discovery::{PetnameEvent, PetnameMap};
     use scp_identity::DID;
+    use scp_protocol::discovery::{PetnameEvent, PetnameMap};
     use wasm_petname_mirror::{WasmPetnameEvent, WasmPetnameMap};
 
     // Core: apply events via apply_event
@@ -4377,8 +4378,8 @@ fn wasm_petname_event_emission_matches_core() {
 
 #[test]
 fn wasm_petname_event_serde_matches_core() {
-    use scp_core::discovery::PetnameEvent;
     use scp_identity::DID;
+    use scp_protocol::discovery::PetnameEvent;
     use wasm_petname_mirror::WasmPetnameEvent;
 
     // SetPetname
@@ -4448,7 +4449,7 @@ fn wasm_petname_count_matches_core() {
     use scp_identity::DID;
     use wasm_petname_mirror::WasmPetnameMap;
 
-    let mut core = scp_core::discovery::PetnameMap::default();
+    let mut core = scp_protocol::discovery::PetnameMap::default();
     let mut wasm = WasmPetnameMap::new();
 
     // Empty
@@ -4549,11 +4550,11 @@ fn wasm_petname_convenience_methods_emit_events() {
 
 #[test]
 fn wasm_handle_register_lookup_matches_core() {
-    use scp_core::discovery::{
+    use scp_identity::DID;
+    use scp_protocol::discovery::{
         HandleDeregisterParams, HandleLookupParams, HandleRegisterParams, HandleRegistry,
         HandleTarget, HandleTypeFilter,
     };
-    use scp_identity::DID;
 
     // Core
     let mut core_registry = HandleRegistry::new("ctx-test".to_owned());
@@ -4585,7 +4586,7 @@ fn wasm_handle_register_lookup_matches_core() {
     assert!(
         matches!(
             core_result.status,
-            scp_core::discovery::HandleRegisterStatus::Registered
+            scp_protocol::discovery::HandleRegisterStatus::Registered
         ),
         "core handle register should succeed"
     );
@@ -4623,10 +4624,10 @@ fn wasm_handle_register_lookup_matches_core() {
 /// the handle exists, regardless of who owns it. The WASM bridge must match.
 #[test]
 fn wasm_handle_same_owner_reregister_returns_conflict() {
-    use scp_core::discovery::{
+    use scp_identity::DID;
+    use scp_protocol::discovery::{
         HandleRegisterParams, HandleRegisterStatus, HandleRegistry, HandleTarget,
     };
-    use scp_identity::DID;
 
     let mut registry = HandleRegistry::new("ctx-test".to_owned());
     let alice_did = DID::from("did:dht:zAlice");
@@ -4664,7 +4665,8 @@ fn wasm_handle_same_owner_reregister_returns_conflict() {
 #[test]
 fn wasm_discovery_handle_parsing_matches_core() {
     // Core's parse_address handles "alice@cooking-community"
-    let core_parsed = scp_core::discovery::parse_address("alice@cooking-community").unwrap();
+    let core_parsed =
+        scp_runtime::discovery::addressing::parse_address("alice@cooking-community").unwrap();
 
     // Verify the WASM algorithm: normalize, split on '@', classify scope.
     let address = "alice@cooking-community";
@@ -4674,7 +4676,10 @@ fn wasm_discovery_handle_parsing_matches_core() {
     let wasm_scope = &normalized[at_pos + 1..];
 
     match &core_parsed {
-        scp_core::discovery::ParsedAddress::DiscoveryHandle { local_part, scope } => {
+        scp_runtime::discovery::addressing::ParsedAddress::DiscoveryHandle {
+            local_part,
+            scope,
+        } => {
             assert_eq!(local_part, wasm_local, "local_part mismatch");
             assert_eq!(scope, wasm_scope, "scope mismatch");
             // WASM type tag must be PascalCase "DiscoveryHandle"
@@ -4689,7 +4694,8 @@ fn wasm_discovery_handle_parsing_matches_core() {
 
 #[test]
 fn wasm_domain_handle_parsing_matches_core() {
-    let core_parsed = scp_core::discovery::parse_address("alice@example.com").unwrap();
+    let core_parsed =
+        scp_runtime::discovery::addressing::parse_address("alice@example.com").unwrap();
 
     let address = "alice@example.com";
     let normalized = address.trim().to_lowercase();
@@ -4698,7 +4704,7 @@ fn wasm_domain_handle_parsing_matches_core() {
     let wasm_domain = &normalized[at_pos + 1..];
 
     match &core_parsed {
-        scp_core::discovery::ParsedAddress::DomainHandle { local_part, domain } => {
+        scp_runtime::discovery::addressing::ParsedAddress::DomainHandle { local_part, domain } => {
             assert_eq!(local_part, wasm_local, "local_part mismatch");
             assert_eq!(domain, wasm_domain, "domain mismatch");
             // WASM type tag must be PascalCase "DomainHandle", field is "domain" not "scope"
@@ -4710,7 +4716,7 @@ fn wasm_domain_handle_parsing_matches_core() {
 
 #[test]
 fn wasm_attestation_handle_parsing_matches_core() {
-    let core_parsed = scp_core::discovery::parse_address("@alice_cooks").unwrap();
+    let core_parsed = scp_runtime::discovery::addressing::parse_address("@alice_cooks").unwrap();
 
     // WASM algorithm: strip leading '@', return handle
     let address = "@alice_cooks";
@@ -4718,7 +4724,10 @@ fn wasm_attestation_handle_parsing_matches_core() {
     let rest = normalized.strip_prefix('@').unwrap();
 
     match &core_parsed {
-        scp_core::discovery::ParsedAddress::AttestationHandle { handle, platform } => {
+        scp_runtime::discovery::addressing::ParsedAddress::AttestationHandle {
+            handle,
+            platform,
+        } => {
             assert_eq!(handle, rest, "handle mismatch");
             assert!(platform.is_none(), "no platform qualifier");
         }
@@ -4728,7 +4737,7 @@ fn wasm_attestation_handle_parsing_matches_core() {
 
 #[test]
 fn wasm_attestation_handle_with_platform_matches_core() {
-    let core_parsed = scp_core::discovery::parse_address("@alice_cooks:x").unwrap();
+    let core_parsed = scp_runtime::discovery::addressing::parse_address("@alice_cooks:x").unwrap();
 
     // WASM algorithm: strip '@', split on ':'
     let address = "@alice_cooks:x";
@@ -4739,7 +4748,10 @@ fn wasm_attestation_handle_with_platform_matches_core() {
     let wasm_platform = &rest[colon_pos + 1..];
 
     match &core_parsed {
-        scp_core::discovery::ParsedAddress::AttestationHandle { handle, platform } => {
+        scp_runtime::discovery::addressing::ParsedAddress::AttestationHandle {
+            handle,
+            platform,
+        } => {
             assert_eq!(handle, wasm_handle, "handle mismatch");
             assert_eq!(
                 platform.as_deref(),
@@ -4753,14 +4765,14 @@ fn wasm_attestation_handle_with_platform_matches_core() {
 
 #[test]
 fn wasm_unscoped_address_matches_core() {
-    let core_parsed = scp_core::discovery::parse_address("alice").unwrap();
+    let core_parsed = scp_runtime::discovery::addressing::parse_address("alice").unwrap();
 
     // WASM algorithm: no '@' prefix, no '@' separator → Unscoped
     let address = "alice";
     let normalized = address.trim().to_lowercase();
 
     match &core_parsed {
-        scp_core::discovery::ParsedAddress::Unscoped { name } => {
+        scp_runtime::discovery::addressing::ParsedAddress::Unscoped { name } => {
             assert_eq!(name, &normalized, "name mismatch");
         }
         other => panic!("expected Unscoped, got {other:?}"),
@@ -5407,7 +5419,7 @@ fn wasm_core_extract_key_scope_non_string() {
 #[test]
 fn wasm_core_category_a_resources_match() {
     // Verify the WASM mirror's CATEGORY_A_RESOURCES matches scp-core's
-    use scp_core::trust::custody_violation::{ActionCategory, classify_action};
+    use scp_protocol::trust::custody_violation::{ActionCategory, classify_action};
     for resource in wasm_ucan_mirror::CATEGORY_A_RESOURCES {
         assert_eq!(
             classify_action(resource),
@@ -5420,7 +5432,7 @@ fn wasm_core_category_a_resources_match() {
 #[test]
 fn core_wasm_category_a_resources_match() {
     // Reverse direction: verify every core CATEGORY_A_RESOURCE exists in WASM's list
-    use scp_core::trust::custody_violation::category_a_resources;
+    use scp_protocol::trust::custody_violation::category_a_resources;
     for resource in category_a_resources() {
         assert!(
             wasm_ucan_mirror::CATEGORY_A_RESOURCES.contains(resource),
@@ -6021,7 +6033,7 @@ mod wasm_broadcast_mirror {
     pub const BROADCAST_CONTENT_VERSION: u8 = 1;
     const MAX_BODY_BYTES: usize = 10 * 1024 * 1024;
 
-    /// WASM-local `ContentMetadata` matching `scp_core::context::ContentMetadata`.
+    /// WASM-local `ContentMetadata` matching `scp_protocol::context::ContentMetadata`.
     #[derive(serde::Serialize)]
     pub struct WasmContentMetadata<'a> {
         pub path: Option<&'a str>,
@@ -6032,7 +6044,7 @@ mod wasm_broadcast_mirror {
         pub immutable: bool,
     }
 
-    /// WASM-local `BroadcastContent` matching `scp_core::context::BroadcastContent`.
+    /// WASM-local `BroadcastContent` matching `scp_protocol::context::BroadcastContent`.
     #[derive(serde::Serialize)]
     pub struct WasmBroadcastContent<'a> {
         pub version: u8,
@@ -6203,7 +6215,7 @@ mod wasm_broadcast_mirror {
 /// Cross-validates scp-core and WASM mirror serialization of `BroadcastContent`.
 #[test]
 fn broadcast_content_wire_format_matches_wasm() {
-    use scp_core::context::broadcast_content::{
+    use scp_protocol::context::broadcast_content::{
         BROADCAST_CONTENT_VERSION, BroadcastContent, ContentMetadata, ContentPath, MimeType,
         deserialize_broadcast_content, serialize_broadcast_content,
     };
@@ -6256,7 +6268,7 @@ fn broadcast_content_wire_format_matches_wasm() {
 
     for tc in &test_cases {
         // Compute etag as SHA-256 hex of body (matches compute_etag).
-        let etag = scp_core::context::broadcast_content::compute_etag(tc.body);
+        let etag = scp_protocol::context::broadcast_content::compute_etag(tc.body);
 
         // Serialize via scp-core (ContentPath::new normalizes NFD → NFC).
         let content_path = ContentPath::new(tc.path).unwrap();
@@ -6329,7 +6341,7 @@ fn broadcast_content_wire_format_matches_wasm() {
 /// Cross-validates scp-core and WASM mirror content path validation.
 #[test]
 fn broadcast_content_path_validation_matches_wasm() {
-    use scp_core::context::broadcast_content::ContentPath;
+    use scp_protocol::context::broadcast_content::ContentPath;
 
     // Valid paths: both must accept.
     let valid_paths = [
@@ -6387,7 +6399,7 @@ fn broadcast_content_path_validation_matches_wasm() {
 /// Cross-validates scp-core and WASM mirror MIME type validation.
 #[test]
 fn broadcast_mime_type_validation_matches_wasm() {
-    use scp_core::context::broadcast_content::MimeType;
+    use scp_protocol::context::broadcast_content::MimeType;
 
     // Valid MIME types.
     let valid_types = [
@@ -6512,9 +6524,9 @@ mod wasm_provenance_mirror {
 /// hash — as `CanonicalProvenance` (WASM bridge) given identical inputs.
 #[test]
 fn provenance_hash_conformance_shared_context() {
-    use scp_core::context::MemoryScope;
-    use scp_core::provenance::{DataProvenance, DiscoveryMethod, SourceType};
     use scp_identity::DID;
+    use scp_protocol::context::MemoryScope;
+    use scp_protocol::provenance::{DataProvenance, DiscoveryMethod, SourceType};
     use std::time::Duration;
 
     let provenance = DataProvenance {
@@ -6590,8 +6602,8 @@ fn provenance_hash_conformance_shared_context() {
 /// no purpose, no chain path — exercises the null/empty paths.
 #[test]
 fn provenance_hash_conformance_out_of_band() {
-    use scp_core::context::MemoryScope;
-    use scp_core::provenance::{DataProvenance, DiscoveryMethod, SourceType};
+    use scp_protocol::context::MemoryScope;
+    use scp_protocol::provenance::{DataProvenance, DiscoveryMethod, SourceType};
     use std::time::Duration;
 
     let provenance = DataProvenance {
@@ -6660,10 +6672,10 @@ fn provenance_hash_conformance_out_of_band() {
 /// populated — exercises all non-null optional paths.
 #[test]
 fn provenance_hash_conformance_registry_with_payment() {
-    use scp_core::context::MemoryScope;
-    use scp_core::economy::types::Amount;
-    use scp_core::provenance::{DataProvenance, DiscoveryMethod, SourceType};
     use scp_identity::DID;
+    use scp_protocol::context::MemoryScope;
+    use scp_protocol::economy::types::Amount;
+    use scp_protocol::provenance::{DataProvenance, DiscoveryMethod, SourceType};
     use std::time::Duration;
 
     let receipt_id: [u8; 32] = [0xab; 32];
@@ -6963,7 +6975,7 @@ fn provenance_hash_chain_depth_u8_vs_u32() {
 fn wasm_default_ceiling_matches_core() {
     use std::collections::HashSet;
 
-    let core_ceiling = scp_core::context::roles::default_ceiling().to_ucan_string_set();
+    let core_ceiling = scp_protocol::context::roles::default_ceiling().to_ucan_string_set();
 
     // Mirror of `wasm_default_ceiling()` in scp-ffi-wasm/src/ucan.rs.
     // Must be updated in lockstep — that is the point.
@@ -7040,11 +7052,11 @@ mod wasm_mirror_attestation {
 /// attestation signatures created by one will fail verification in the other.
 #[test]
 fn wasm_attestation_canonical_bytes_match_core() {
-    use scp_core::crypto::canonical::{CanonicalField, canonical_hash};
-    use scp_core::identity::attestation::{
+    use scp_protocol::crypto::canonical::{CanonicalField, canonical_hash};
+    use scp_protocol::identity::attestation::{
         AttestationClaim, AttestationEvidence, IdentityLinkAttestation, VerificationMethod,
     };
-    use scp_core::trust::attestation::RevocationStatus;
+    use scp_protocol::trust::attestation::RevocationStatus;
 
     let issuer = "did:dht:z6MkTestAlice".to_string();
     let issued_at = 1_700_000_000u64;
@@ -7159,13 +7171,13 @@ fn wasm_attestation_canonical_bytes_match_core() {
 #[allow(clippy::too_many_arguments)]
 fn assert_attestation_proof_conformance(
     proof_str: &str,
-    core_method: scp_core::identity::attestation::VerificationMethod,
+    core_method: scp_protocol::identity::attestation::VerificationMethod,
     wasm_method_str: &str,
 ) {
-    use scp_core::identity::attestation::{
+    use scp_protocol::identity::attestation::{
         AttestationClaim, AttestationEvidence, IdentityLinkAttestation,
     };
-    use scp_core::trust::attestation::RevocationStatus;
+    use scp_protocol::trust::attestation::RevocationStatus;
 
     let issuer = "did:dht:z6MkTestAlice".to_string();
     let issued_at = 1_700_000_000u64;
@@ -7247,7 +7259,7 @@ fn assert_attestation_proof_conformance(
 
 #[test]
 fn wasm_attestation_canonical_bytes_signed_post_verified() {
-    use scp_core::identity::attestation::VerificationMethod;
+    use scp_protocol::identity::attestation::VerificationMethod;
 
     assert_attestation_proof_conformance(
         r#"{"type":"signed_post_verified","post_url":"https://x.com/alice/status/123","nonce":"abc123","posted_at":1700000000}"#,
@@ -7258,7 +7270,7 @@ fn wasm_attestation_canonical_bytes_signed_post_verified() {
 
 #[test]
 fn wasm_attestation_canonical_bytes_dns_record_verified() {
-    use scp_core::identity::attestation::VerificationMethod;
+    use scp_protocol::identity::attestation::VerificationMethod;
 
     assert_attestation_proof_conformance(
         r#"{"type":"dns_record_verified","domain":"example.com","record_name":"_scp-verify"}"#,
@@ -7269,7 +7281,7 @@ fn wasm_attestation_canonical_bytes_dns_record_verified() {
 
 #[test]
 fn wasm_attestation_canonical_bytes_challenge_response_verified() {
-    use scp_core::identity::attestation::VerificationMethod;
+    use scp_protocol::identity::attestation::VerificationMethod;
 
     assert_attestation_proof_conformance(
         r#"{"type":"challenge_response_verified","challenge":"random-challenge-value","response_signature":"deadbeefdeadbeef"}"#,

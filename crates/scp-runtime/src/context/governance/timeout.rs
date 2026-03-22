@@ -722,7 +722,7 @@ mod tests {
             matches!(
                 &resolved.status,
                 ProposalStatus::Rejected {
-                    reason: super::super::RejectionReason::InsufficientParticipation
+                    reason: scp_protocol::context::governance::RejectionReason::InsufficientParticipation
                 }
             ),
             "expected InsufficientParticipation, got {:?}",

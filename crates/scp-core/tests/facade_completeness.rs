@@ -12,7 +12,6 @@ use scp_core::trust::TrustError;
 
 // Runtime types (from scp-runtime)
 use scp_core::crypto::mls::MlsCryptoProvider;
-use scp_core::store::ProtocolRepository;
 
 #[test]
 fn facade_exposes_protocol_types() {
@@ -22,6 +21,7 @@ fn facade_exposes_protocol_types() {
     let _ = std::any::type_name::<SenderKey>();
     let _ = std::any::type_name::<EnvelopeError>();
     let _ = std::any::type_name::<BridgeMode>();
+    let _ = std::any::type_name::<DataProvenance>();
 }
 
 #[test]

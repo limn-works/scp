@@ -1,6 +1,6 @@
 //! Addressing types for SCP discovery — pure protocol types.
 //!
-//! Sync type definitions extracted from scp-runtime::discovery::addressing.
+//! Sync type definitions extracted from `scp-runtime::discovery::addressing`.
 //! Async resolution logic remains in scp-runtime.
 
 use serde::{Deserialize, Serialize};

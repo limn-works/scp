@@ -189,7 +189,7 @@ fn extract_public_key_from_did(did: &str) -> Result<[u8; 32], String> {
     // did:key:{hex} is a non-standard test convenience. Gated behind the
     // `testing` feature (or #[cfg(test)]) to prevent acceptance in release
     // builds. See: https://github.com/limn-works/scp/issues/128
-    #[cfg(any(test, feature = "testing"))]
+    #[cfg(test)]
     if let Some(hex_str) = did.strip_prefix("did:key:") {
         let decoded = hex::decode(hex_str).map_err(|e| format!("hex decode error: {e}"))?;
         let bytes: [u8; 32] = decoded

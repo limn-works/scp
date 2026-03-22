@@ -32,30 +32,32 @@
 
 use std::time::Duration;
 
-use scp_core::crypto::ucan::spending::{
-    BudgetTracker, SpendingCapability, SpendingError, validate_spending_ucan,
-};
-use scp_core::crypto::ucan::{Attenuation, UcanHeader, UcanPayload, UcanToken};
-use scp_core::economy::adapter::{
-    AdapterCapabilities, PaymentAdapter, PaymentAuthorization, PaymentError, PaymentMetadata,
-    PaymentReceipt, RefundConfirmation, VerificationResult,
-};
-use scp_core::economy::antispam::{EscalationConfig, EscalationThreshold, SenderVelocityTracker};
-use scp_core::economy::policy::{
-    ObservableMetrics, auto_accept_blocked_by_economics, check_policy_lock, evaluate_cost,
-    policy_requires_payment, validate_policy_change,
-};
-use scp_core::economy::receipt::{ReceiptFilter, payment_history};
-use scp_core::economy::types::{
-    Amount, Coefficient, CostSchedule, CurrencyCode, EconomicPolicy, PaidActionType,
-    PricingFormula, PricingMetric, PricingVariable,
-};
-use scp_core::well_known::{RelayConfig, RelayEconomicConfig, WellKnownScp};
 use scp_event_log::proof::{prove_inclusion, verify_inclusion};
 use scp_event_log::tree;
 use scp_event_log::{Event, EventLog, EventPayload, EventType};
 use scp_identity::DID;
 use scp_primitives::Clock;
+use scp_protocol::crypto::ucan::spending::{
+    BudgetTracker, SpendingCapability, SpendingError, validate_spending_ucan,
+};
+use scp_protocol::crypto::ucan::{Attenuation, UcanHeader, UcanPayload, UcanToken};
+use scp_protocol::economy::antispam::{
+    EscalationConfig, EscalationThreshold, SenderVelocityTracker,
+};
+use scp_protocol::economy::policy::{
+    ObservableMetrics, auto_accept_blocked_by_economics, check_policy_lock, evaluate_cost,
+    policy_requires_payment, validate_policy_change,
+};
+use scp_protocol::economy::types::{
+    Amount, Coefficient, CostSchedule, CurrencyCode, EconomicPolicy, PaidActionType,
+    PricingFormula, PricingMetric, PricingVariable,
+};
+use scp_runtime::economy::adapter::{
+    AdapterCapabilities, PaymentAdapter, PaymentAuthorization, PaymentError, PaymentMetadata,
+    PaymentReceipt, RefundConfirmation, VerificationResult,
+};
+use scp_runtime::economy::receipt::{ReceiptFilter, payment_history};
+use scp_runtime::well_known::{RelayConfig, RelayEconomicConfig, WellKnownScp};
 
 // ===========================================================================
 // Test adapter -- in-memory, no real money, for integration tests
@@ -273,9 +275,9 @@ fn make_spending_ucan(cap: &SpendingCapability, scope_uri: &str) -> UcanToken {
 /// Creates a spending capability with test parameters.
 fn test_spending_capability() -> SpendingCapability {
     SpendingCapability {
-        max_per_action: scp_core::crypto::ucan::spending::Amount(1000),
-        max_total: scp_core::crypto::ucan::spending::Amount(10_000),
-        currency: scp_core::crypto::ucan::spending::CurrencyCode::from_code("USD").unwrap(),
+        max_per_action: scp_protocol::crypto::ucan::spending::Amount(1000),
+        max_total: scp_protocol::crypto::ucan::spending::Amount(10_000),
+        currency: scp_protocol::crypto::ucan::spending::CurrencyCode::from_code("USD").unwrap(),
         time_window: Duration::from_secs(86_400),
         allowed_adapters: vec!["test".to_owned()],
     }
@@ -526,7 +528,7 @@ fn invariant_1_relay_economic_config_visible_in_wellknown() {
 /// `SpendingCapabilityRequired` error.
 #[test]
 fn invariant_2_paid_action_without_spending_ucan_rejected() {
-    use scp_core::crypto::ucan::spending::check_and_composition;
+    use scp_protocol::crypto::ucan::spending::check_and_composition;
 
     let now = scp_primitives::SystemClock.now_secs();
 
@@ -551,7 +553,7 @@ fn invariant_2_paid_action_without_spending_ucan_rejected() {
     };
 
     // Action cost is 10 (non-zero), but no spending UCAN provided.
-    let cost = scp_core::crypto::ucan::spending::Amount(10);
+    let cost = scp_protocol::crypto::ucan::spending::Amount(10);
     let result = check_and_composition(
         Some(&action_ucan),
         None, // No spending UCAN
@@ -569,7 +571,7 @@ fn invariant_2_paid_action_without_spending_ucan_rejected() {
 /// Invariant 2: Grant spending UCAN, attempt paid action -- AND-composition passes.
 #[test]
 fn invariant_2_paid_action_with_spending_ucan_succeeds() {
-    use scp_core::crypto::ucan::spending::check_and_composition;
+    use scp_protocol::crypto::ucan::spending::check_and_composition;
 
     let now = scp_primitives::SystemClock.now_secs();
 
@@ -596,7 +598,7 @@ fn invariant_2_paid_action_with_spending_ucan_succeeds() {
     };
 
     // Check AND composition with valid spending UCAN.
-    let cost = scp_core::crypto::ucan::spending::Amount(10);
+    let cost = scp_protocol::crypto::ucan::spending::Amount(10);
     let result = check_and_composition(
         Some(&action_ucan),
         Some(&spending_ucan),
@@ -654,9 +656,9 @@ async fn invariant_2_authorize_capture_after_spending_check() {
 /// Invariant 2: No action UCAN at all is rejected (even for free actions).
 #[test]
 fn invariant_2_no_action_ucan_rejected() {
-    use scp_core::crypto::ucan::spending::check_and_composition;
+    use scp_protocol::crypto::ucan::spending::check_and_composition;
 
-    let cost = scp_core::crypto::ucan::spending::Amount(0);
+    let cost = scp_protocol::crypto::ucan::spending::Amount(0);
     let result = check_and_composition(
         None, // No action UCAN
         None, // No spending UCAN
@@ -702,7 +704,7 @@ fn invariant_3_no_economic_policy_all_actions_free() {
 /// Invariant 3: `estimate_cost` returns 0 when no economic policy.
 #[test]
 fn invariant_3_estimate_cost_zero_without_policy() {
-    use scp_core::economy::estimate::estimate_cost;
+    use scp_protocol::economy::estimate::estimate_cost;
 
     let metrics = default_metrics();
 
@@ -1698,11 +1700,11 @@ fn integration_budget_tracker_limits() {
     let cap = test_spending_capability();
     let mut tracker = BudgetTracker::new(cap);
     let now_secs = 1_000_000u64;
-    let currency = scp_core::crypto::ucan::spending::CurrencyCode::from_code("USD").unwrap();
+    let currency = scp_protocol::crypto::ucan::spending::CurrencyCode::from_code("USD").unwrap();
 
     // Record some spending within limits.
     let result = tracker.check_and_record(
-        scp_core::crypto::ucan::spending::Amount(100),
+        scp_protocol::crypto::ucan::spending::Amount(100),
         currency,
         now_secs,
         "test",
@@ -1711,7 +1713,7 @@ fn integration_budget_tracker_limits() {
 
     // Record more spending within limits.
     let result = tracker.check_and_record(
-        scp_core::crypto::ucan::spending::Amount(500),
+        scp_protocol::crypto::ucan::spending::Amount(500),
         currency,
         now_secs,
         "test",
@@ -1720,7 +1722,7 @@ fn integration_budget_tracker_limits() {
 
     // Check current total.
     let total = tracker.current_total(now_secs);
-    assert_eq!(total, scp_core::crypto::ucan::spending::Amount(600));
+    assert_eq!(total, scp_protocol::crypto::ucan::spending::Amount(600));
 }
 
 /// Budget tracker rejects spending that exceeds per-action limit.
@@ -1729,11 +1731,11 @@ fn integration_budget_tracker_per_action_limit() {
     let cap = test_spending_capability(); // max_per_action = 1000
     let mut tracker = BudgetTracker::new(cap);
     let now_secs = 1_000_000u64;
-    let currency = scp_core::crypto::ucan::spending::CurrencyCode::from_code("USD").unwrap();
+    let currency = scp_protocol::crypto::ucan::spending::CurrencyCode::from_code("USD").unwrap();
 
     // Exceeds max_per_action (1000).
     let result = tracker.check_and_record(
-        scp_core::crypto::ucan::spending::Amount(1001),
+        scp_protocol::crypto::ucan::spending::Amount(1001),
         currency,
         now_secs,
         "test",

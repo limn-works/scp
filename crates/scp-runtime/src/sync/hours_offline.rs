@@ -2158,7 +2158,7 @@ mod tests {
         let now = sim.current_time();
 
         // Classify offline tier.
-        let tier = super::super::classify_offline_duration(last_contact, now);
+        let tier = scp_protocol::sync::classify_offline_duration(last_contact, now);
         assert_eq!(tier, OfflineTier::Short);
 
         // Retrieve buffered messages.

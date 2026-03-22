@@ -1,6 +1,6 @@
 //! Bridge connector protocol for SCP — pure protocol types.
 //!
-//! BridgeMode, BridgeConnector, ShadowIdentity types.
+//! `BridgeMode`, `BridgeConnector`, `ShadowIdentity` types.
 //! Async modules (oauth, credentials) stay in scp-runtime.
 
 pub mod claiming;

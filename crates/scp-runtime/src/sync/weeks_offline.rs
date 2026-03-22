@@ -1302,8 +1302,8 @@ impl<T: ResetTransport> ReJoinExecutor for RelayBackedReJoinExecutor<T> {
     clippy::match_wildcard_for_single_variants
 )]
 mod tests {
-    use super::super::SyncPolicy;
     use super::*;
+    use scp_protocol::sync::SyncPolicy;
 
     // -----------------------------------------------------------------------
     // Constants

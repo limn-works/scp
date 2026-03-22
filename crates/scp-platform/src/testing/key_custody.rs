@@ -369,9 +369,9 @@ impl KeyCustody for InMemoryKeyCustody {
                 .map_err(|e| PlatformError::CustodyError(e.to_string()))?;
             mac.update(&context_id);
             mac.update(b"scp-pseudonym");
-            let hmac_bytes = Zeroizing::new(mac.finalize().into_bytes());
+            let hmac_vec = Zeroizing::new(mac.finalize().into_bytes().to_vec());
             let mut hmac_output = Zeroizing::new([0u8; 32]);
-            hmac_output.copy_from_slice(&hmac_bytes[..32]);
+            hmac_output.copy_from_slice(&hmac_vec[..32]);
 
             // Derive Ed25519 keypair from first 32 bytes of HMAC output.
             let pseudonym_signing_key = SigningKey::from_bytes(&hmac_output);
@@ -426,9 +426,9 @@ impl KeyCustody for InMemoryKeyCustody {
             mac.update(&context_id);
             mac.update(&pseudonym_epoch.to_be_bytes());
             mac.update(b"scp-pseudonym-v2");
-            let hmac_bytes = Zeroizing::new(mac.finalize().into_bytes());
+            let hmac_vec = Zeroizing::new(mac.finalize().into_bytes().to_vec());
             let mut hmac_output = Zeroizing::new([0u8; 32]);
-            hmac_output.copy_from_slice(&hmac_bytes[..32]);
+            hmac_output.copy_from_slice(&hmac_vec[..32]);
 
             // Derive Ed25519 keypair from first 32 bytes of HMAC output.
             let pseudonym_signing_key = SigningKey::from_bytes(&hmac_output);

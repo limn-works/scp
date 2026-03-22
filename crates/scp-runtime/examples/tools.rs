@@ -6,12 +6,15 @@
 //! Usage:
 //!   `cargo run -p scp-core --features testing --example tools`
 
-use scp_core::context::roles::{Capability, CapabilityCeiling, ContextRoleState};
-use scp_core::context::tools::{
-    ToolRegistration, ToolRegistry, ToolSchema, ToolStatus, invoke_tool, register_tool,
-};
-use scp_core::context::{ContextHandle, ContextParams, ContextState};
 use scp_identity::DID;
+use scp_protocol::context::roles::{Capability, CapabilityCeiling, ContextRoleState};
+use scp_protocol::context::tools::lifecycle::ToolStatus;
+use scp_protocol::context::tools::registry::{
+    ToolRegistration, ToolRegistry, ToolSchema, register_tool,
+};
+use scp_protocol::context::{ContextParams, ContextState};
+use scp_runtime::context::ContextHandle;
+use scp_runtime::context::tools::invoke::invoke_tool;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {

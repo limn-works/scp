@@ -1,7 +1,7 @@
 //! Auto-accept policy types and pure evaluation functions for SCP context invitations.
 //!
 //! Pure sync types and constraint checks. Storage-dependent async functions
-//! remain in scp-runtime::context::policy.
+//! remain in `scp-runtime::context::policy`.
 
 use std::time::Duration;
 

@@ -249,7 +249,7 @@ pub fn validate_received_envelope(
 // Tests
 // ---------------------------------------------------------------------------
 
-#[cfg(test)]
+#[cfg(all(test, feature = "_runtime_tests"))]
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
     use scp_platform::testing::InMemoryKeyCustody;

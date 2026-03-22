@@ -264,7 +264,7 @@ fn future_json_fields() -> Vec<(&'static str, serde_json::Value)> {
 
 mod outer_envelope {
     use super::*;
-    use scp_core::envelope::outer::{
+    use scp_protocol::envelope::outer::{
         OuterEnvelope, SCP_OUTER_ENVELOPE_VERSION, create_outer_envelope,
     };
 
@@ -337,7 +337,7 @@ mod outer_envelope {
 
 mod inner_envelope {
     use super::*;
-    use scp_core::envelope::inner::InnerEnvelope;
+    use scp_protocol::envelope::inner::InnerEnvelope;
 
     /// §13.5.1: `InnerEnvelope` MUST preserve unknown fields for
     /// forward-compatible roundtripping.
@@ -352,7 +352,7 @@ mod inner_envelope {
             generation: 0,
             sequence: 1,
             timestamp: 1_700_000_000,
-            message_type: scp_core::envelope::inner::MessageType::Content,
+            message_type: scp_protocol::envelope::inner::MessageType::Content,
             payload_hash: [0xAA; 32],
             payload: vec![0x01, 0x02],
             provenance: None,
@@ -404,7 +404,7 @@ mod inner_envelope {
             generation: 0,
             sequence: 1,
             timestamp: 1_700_000_000,
-            message_type: scp_core::envelope::inner::MessageType::Content,
+            message_type: scp_protocol::envelope::inner::MessageType::Content,
             payload_hash: [0xAA; 32],
             payload: vec![0x01, 0x02],
             provenance: None,
@@ -445,7 +445,7 @@ mod inner_envelope {
             generation: 0,
             sequence: 1,
             timestamp: 1_700_000_000,
-            message_type: scp_core::envelope::inner::MessageType::Content,
+            message_type: scp_protocol::envelope::inner::MessageType::Content,
             payload_hash: [0xAA; 32],
             payload: vec![0x01, 0x02],
             provenance: None,
@@ -522,7 +522,7 @@ mod inner_envelope {
             generation: 0,
             sequence: 1,
             timestamp: 1_700_000_000,
-            message_type: scp_core::envelope::inner::MessageType::Content,
+            message_type: scp_protocol::envelope::inner::MessageType::Content,
             payload_hash: [0xAA; 32],
             payload: vec![0x01, 0x02],
             provenance: None,
@@ -583,7 +583,7 @@ mod inner_envelope {
 
 mod chunk_envelope {
     use super::*;
-    use scp_core::envelope::chunk::ChunkEnvelope;
+    use scp_protocol::envelope::chunk::ChunkEnvelope;
 
     /// §13.5.1, §13.9 item 3: `ChunkEnvelope` MUST ignore unknown fields.
     #[test]
@@ -619,7 +619,7 @@ mod chunk_envelope {
 
 mod broadcast_envelope {
     use super::*;
-    use scp_core::crypto::sender_keys::broadcast::BroadcastEnvelope;
+    use scp_protocol::crypto::sender_keys::broadcast::BroadcastEnvelope;
 
     /// §13.5.1, §13.9 item 3: `BroadcastEnvelope` MUST ignore unknown fields.
     #[test]
@@ -658,7 +658,7 @@ mod broadcast_envelope {
 
 mod sender_key_types {
     use super::*;
-    use scp_core::crypto::sender_keys::key_protocol::{
+    use scp_runtime::crypto::sender_keys::key_protocol::{
         BlockNotification, SenderKeyEpochAdvance, SenderKeyRequest, SenderKeyResponse,
     };
 
@@ -767,7 +767,7 @@ mod sender_key_types {
 
 mod attestation_types {
     use super::*;
-    use scp_core::identity::attestation::{
+    use scp_protocol::identity::attestation::{
         AttestationClaim, AttestationEvidence, IdentityLinkAttestation, VerificationMethod,
     };
 
@@ -875,7 +875,7 @@ mod attestation_types {
                 verified_at: 1_700_000_000,
                 verifier_did: None,
             },
-            revocation_status: scp_core::trust::attestation::RevocationStatus::Active,
+            revocation_status: scp_protocol::trust::attestation::RevocationStatus::Active,
             signature: vec![0xAA; 64],
         };
         let json = serde_json::to_string(&attestation).unwrap();
@@ -909,7 +909,7 @@ mod attestation_types {
                 verified_at: 1_700_000_000,
                 verifier_did: None,
             },
-            revocation_status: scp_core::trust::attestation::RevocationStatus::Active,
+            revocation_status: scp_protocol::trust::attestation::RevocationStatus::Active,
             signature: vec![0xAA; 64],
         };
         let bytes = rmp_serde::to_vec_named(&attestation).unwrap();
@@ -932,7 +932,7 @@ mod attestation_types {
 
 mod context_params {
     use super::*;
-    use scp_core::context::params::ContextParams;
+    use scp_protocol::context::params::ContextParams;
 
     /// §13.5.1: `ContextParams` is explicitly named as a type that MUST ignore
     /// unknown fields. Verify msgpack deserialization with extra fields succeeds.
@@ -982,7 +982,7 @@ mod context_params {
 
 mod access_key_types {
     use super::*;
-    use scp_core::crypto::access_keys::wire::{AccessKeyRequest, AccessKeyResponse};
+    use scp_runtime::crypto::access_keys::wire::{AccessKeyRequest, AccessKeyResponse};
 
     /// §13.9 item 3: `AccessKeyRequest` MUST ignore unknown fields.
     #[test]

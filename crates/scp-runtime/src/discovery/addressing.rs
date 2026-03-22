@@ -18,7 +18,6 @@ use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 
-use scp_identity::DID;
 use scp_primitives::Clock;
 
 use scp_protocol::discovery::ContextId;
@@ -31,8 +30,6 @@ pub use scp_protocol::discovery::addressing::{
 // ---------------------------------------------------------------------------
 // Constants
 // ---------------------------------------------------------------------------
-
-/// Maximum length of the local-part of an address.
 
 /// Default TTL for domain handle cache entries (1 hour per §22.8.4).
 pub const DOMAIN_HANDLE_CACHE_TTL: Duration = Duration::from_secs(3600);
@@ -627,6 +624,7 @@ fn shortest_ttl_for_results(results: &[AddressResolution]) -> Duration {
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
     use super::*;
+    use scp_identity::DID;
 
     // -- Address parsing tests -----------------------------------------------
 

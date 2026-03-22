@@ -431,6 +431,11 @@ pub const fn validate_inner_version(
 
 /// Computes `SHA-256(serialize(provenance))` if present, or `SHA-256(0x00)` if
 /// absent. Returns a fixed-size 32-byte array (SHA-256 output).
+///
+/// # Errors
+///
+/// Returns [`EnvelopeError::SerializationFailed`] if `MessagePack` serialization
+/// of the provenance struct fails.
 pub fn compute_provenance_hash(provenance: Option<&Provenance>) -> Result<[u8; 32], EnvelopeError> {
     match provenance {
         Some(p) => {
@@ -466,6 +471,7 @@ pub fn compute_provenance_hash(provenance: Option<&Provenance>) -> Result<[u8; 3
 ///         || len(provenance_hash) || provenance_hash
 ///         || len(signing_key_id) || signing_key_id)
 /// ```
+#[must_use]
 pub fn compute_canonical_hash(
     params: &InnerEnvelopeParams<'_>,
     payload_hash: &[u8; 32],

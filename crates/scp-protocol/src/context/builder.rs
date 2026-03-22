@@ -2,7 +2,7 @@
 //!
 //! Pure sync trait definition and associated error types. The async builder
 //! implementation (`create_context`, `CreateContextPhases`) remains in
-//! scp-runtime::context::builder.
+//! `scp-runtime::context::builder`.
 
 use super::ContextError;
 

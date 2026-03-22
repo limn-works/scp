@@ -17,8 +17,7 @@ use scp_primitives::DID;
 // Type aliases (match codebase pattern)
 // ---------------------------------------------------------------------------
 
-/// A context identifier string.
-pub type ContextId = String;
+pub use super::ContextId;
 
 /// An Ed25519 signature (64 bytes).
 pub type Ed25519Signature = Vec<u8>;

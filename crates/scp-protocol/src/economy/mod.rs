@@ -11,4 +11,7 @@ pub mod pricing;
 pub mod types;
 
 // Re-exports for backward compatibility.
-pub use types::{Amount, CurrencyCode, EconomicPolicy, PaidActionType};
+pub use types::{
+    Amount, Coefficient, CostSchedule, CurrencyCode, EconomicPolicy, PaidActionType,
+    PricingFormula, PricingMetric, PricingVariable, SubscriptionCost, SubscriptionPeriod,
+};

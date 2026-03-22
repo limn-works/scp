@@ -106,6 +106,7 @@ pub type ProposalId = [u8; 32];
 /// canonical hashing in the protocol: handle tool signing (§22), app
 /// declarations (§8), DID documents (§18), and
 /// `ParentGovernanceConfig::content_hash()` in nesting.rs. See §9.5.2.
+#[must_use]
 pub fn compute_proposal_id(
     context_id: &str,
     proposer_did: &DID,

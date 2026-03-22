@@ -1,7 +1,7 @@
 //! Tool-interface discovery for SCP — pure protocol types.
 //!
-//! DiscoveryError and pure module declarations.
-//! Async modules (addressing, search, did_capabilities, bootstrap, dht_context)
+//! `DiscoveryError` and pure module declarations.
+//! Async modules (addressing, search, `did_capabilities`, bootstrap, `dht_context`)
 //! stay in scp-runtime.
 
 pub mod addressing;
@@ -16,6 +16,14 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 
 use scp_primitives::DID;
+
+// Re-exports for backward compatibility.
+pub use addressing::HandleTarget;
+pub use handles::{
+    HandleDeregisterParams, HandleDeregisterResult, HandleLookupParams, HandleLookupResult,
+    HandleMetadata, HandleRegisterParams, HandleRegisterStatus, HandleRegistry, HandleTypeFilter,
+};
+pub use petnames::{PetnameEvent, PetnameMap};
 
 // ---------------------------------------------------------------------------
 // Type aliases

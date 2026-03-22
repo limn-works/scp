@@ -12,10 +12,11 @@
 
 use std::sync::Arc;
 
-use scp_core::context::governance::KeyResolver;
-use scp_core::context::manager::ContextManager;
-use scp_core::context::{Capability, ContextMode, ContextParams, KeyPackage};
 use scp_identity::DID;
+use scp_protocol::context::governance::KeyResolver;
+use scp_protocol::context::membership::KeyPackage;
+use scp_protocol::context::{Capability, ContextMode, ContextParams};
+use scp_runtime::context::manager::ContextManager;
 
 mod support;
 

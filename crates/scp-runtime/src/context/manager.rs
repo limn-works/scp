@@ -13754,7 +13754,7 @@ mod tests {
     #[tokio::test]
     async fn execute_reconnection_wires_flag_to_protocol() {
         use crate::sync::hours_offline::{BufferedMessage, EpochCatchUpState, SyncPhaseDriver};
-        use crate::sync::{SyncError, SyncEvent, SyncPolicy};
+        use scp_protocol::sync::{SyncError, SyncEvent, SyncPolicy};
 
         // Minimal SyncPhaseDriver that succeeds on all phases.
         struct NoOpDriver;
@@ -13774,7 +13774,7 @@ mod tests {
                 _: &SyncPolicy,
             ) -> Result<EpochCatchUpState, SyncError> {
                 let mut s = EpochCatchUpState::new(id.to_owned(), l, t);
-                s.status = crate::sync::CatchUpStatus::Complete;
+                s.status = scp_protocol::sync::CatchUpStatus::Complete;
                 Ok(s)
             }
             async fn event_log_sync(&self, _: &str) -> Result<(u64, Vec<SyncEvent>), SyncError> {
@@ -13856,7 +13856,7 @@ mod tests {
     #[tokio::test]
     async fn execute_reconnection_clears_flag_on_context_gone() {
         use crate::sync::hours_offline::{BufferedMessage, EpochCatchUpState, SyncPhaseDriver};
-        use crate::sync::{SyncError, SyncEvent, SyncPolicy};
+        use scp_protocol::sync::{SyncError, SyncEvent, SyncPolicy};
 
         /// Driver whose `relay_catch_up` returns `SyncError::ContextGone`,
         /// causing the coordinator to produce `SyncOutcome::ContextGone`.
@@ -13879,7 +13879,7 @@ mod tests {
                 _: &SyncPolicy,
             ) -> Result<EpochCatchUpState, SyncError> {
                 let mut s = EpochCatchUpState::new(id.to_owned(), l, t);
-                s.status = crate::sync::CatchUpStatus::Complete;
+                s.status = scp_protocol::sync::CatchUpStatus::Complete;
                 Ok(s)
             }
             async fn event_log_sync(&self, _: &str) -> Result<(u64, Vec<SyncEvent>), SyncError> {
@@ -14312,7 +14312,7 @@ mod tests {
 
     #[test]
     fn governance_model_serde_roundtrip_all_variants() {
-        use super::scp_protocol::context::params::GovernanceModel;
+        use scp_protocol::context::params::GovernanceModel;
 
         let alice: DID = "did:dht:z6MkAlice".into();
         let bob: DID = "did:dht:z6MkBob".into();
@@ -14341,7 +14341,7 @@ mod tests {
 
     #[test]
     fn governance_model_in_context_params_roundtrip() {
-        use super::scp_protocol::context::params::GovernanceModel;
+        use scp_protocol::context::params::GovernanceModel;
 
         let params = ContextParams {
             governance: GovernanceModel::Threshold {
@@ -14362,7 +14362,7 @@ mod tests {
 
     #[test]
     fn public_metadata_exposes_all_governance_variants() {
-        use super::scp_protocol::context::params::{GovernanceModel, RuntimeMetadata};
+        use scp_protocol::context::params::{GovernanceModel, RuntimeMetadata};
 
         let params = ContextParams {
             governance: GovernanceModel::Majority {
@@ -14390,7 +14390,7 @@ mod tests {
         );
 
         let params = ContextParams {
-            governance: super::scp_protocol::context::params::GovernanceModel::Threshold {
+            governance: scp_protocol::context::params::GovernanceModel::Threshold {
                 threshold: 5,
                 signers: vec!["did:dht:z6MkAlice".into(), "did:dht:z6MkBob".into()],
             },
@@ -14418,7 +14418,7 @@ mod tests {
         );
 
         let params = ContextParams {
-            governance: super::scp_protocol::context::params::GovernanceModel::Threshold {
+            governance: scp_protocol::context::params::GovernanceModel::Threshold {
                 threshold: 0,
                 signers: vec!["did:dht:z6MkAlice".into()],
             },
@@ -14446,7 +14446,7 @@ mod tests {
         );
 
         let params = ContextParams {
-            governance: super::scp_protocol::context::params::GovernanceModel::Majority {
+            governance: scp_protocol::context::params::GovernanceModel::Majority {
                 eligible_voters: vec![],
             },
             ..ContextParams::default()
@@ -14476,7 +14476,7 @@ mod tests {
         );
 
         let params = ContextParams {
-            governance: super::scp_protocol::context::params::GovernanceModel::Unanimity {
+            governance: scp_protocol::context::params::GovernanceModel::Unanimity {
                 eligible_voters: vec![],
             },
             ..ContextParams::default()
@@ -14594,7 +14594,7 @@ mod tests {
         let key_b = signing_key_for_did(&bob);
 
         let params = ContextParams {
-            governance: super::scp_protocol::context::params::GovernanceModel::Threshold {
+            governance: scp_protocol::context::params::GovernanceModel::Threshold {
                 threshold: 2,
                 signers: vec![alice.clone(), bob.clone(), carol.clone()],
             },
@@ -14669,7 +14669,7 @@ mod tests {
         let key_b = signing_key_for_did(&bob);
 
         let params = ContextParams {
-            governance: super::scp_protocol::context::params::GovernanceModel::Majority {
+            governance: scp_protocol::context::params::GovernanceModel::Majority {
                 eligible_voters: vec![alice.clone(), bob.clone(), carol.clone()],
             },
             ..ContextParams::default()
@@ -14734,7 +14734,7 @@ mod tests {
         let key_c = signing_key_for_did(&carol);
 
         let params = ContextParams {
-            governance: super::scp_protocol::context::params::GovernanceModel::Unanimity {
+            governance: scp_protocol::context::params::GovernanceModel::Unanimity {
                 eligible_voters: vec![alice.clone(), bob.clone(), carol.clone()],
             },
             ..ContextParams::default()
@@ -14820,7 +14820,7 @@ mod tests {
         let key_e = signing_key_for_did(&eve);
 
         let params = ContextParams {
-            governance: super::scp_protocol::context::params::GovernanceModel::Threshold {
+            governance: scp_protocol::context::params::GovernanceModel::Threshold {
                 threshold: 2,
                 signers: vec![alice.clone(), bob.clone()],
             },
@@ -14860,7 +14860,7 @@ mod tests {
         use scp_protocol::context::roles::{ContextRoleState, default_ceiling};
 
         let params = ContextParams {
-            governance: super::scp_protocol::context::params::GovernanceModel::Threshold {
+            governance: scp_protocol::context::params::GovernanceModel::Threshold {
                 threshold: 2,
                 signers: vec![
                     "did:dht:z6MkAlice".into(),
@@ -15196,7 +15196,7 @@ mod tests {
             setup_context_with_ceiling(vec![Capability::MessagesRead, Capability::MessagesWrite])
                 .await;
 
-        let reg = super::scp_protocol::context::params::ToolRegistration {
+        let reg = scp_protocol::context::params::ToolRegistration {
             tool_id: "test".to_owned(),
             name: "test".to_owned(),
             description: "test".to_owned(),
@@ -15240,7 +15240,7 @@ mod tests {
         ])
         .await;
 
-        let reg = super::scp_protocol::context::params::ToolRegistration {
+        let reg = scp_protocol::context::params::ToolRegistration {
             tool_id: "test".to_owned(),
             name: "test".to_owned(),
             description: "test".to_owned(),
@@ -18331,8 +18331,8 @@ mod tests {
         let key_a = signing_key_for_did(&alice);
 
         let params = ContextParams {
-            governance: super::scp_protocol::context::params::GovernanceModel::SingleAdmin,
-            ceiling_policy: super::scp_protocol::context::params::CeilingPolicy::Governed,
+            governance: scp_protocol::context::params::GovernanceModel::SingleAdmin,
+            ceiling_policy: scp_protocol::context::params::CeilingPolicy::Governed,
             ceiling: vec![Capability::MessagesRead, Capability::MessagesWrite],
             ..ContextParams::default()
         };
@@ -18391,8 +18391,8 @@ mod tests {
         let key_a = signing_key_for_did(&alice);
 
         let params = ContextParams {
-            governance: super::scp_protocol::context::params::GovernanceModel::SingleAdmin,
-            ceiling_policy: super::scp_protocol::context::params::CeilingPolicy::Governed,
+            governance: scp_protocol::context::params::GovernanceModel::SingleAdmin,
+            ceiling_policy: scp_protocol::context::params::CeilingPolicy::Governed,
             ceiling: vec![Capability::MessagesRead, Capability::MessagesWrite],
             ..ContextParams::default()
         };
@@ -18471,8 +18471,8 @@ mod tests {
         let key_a = signing_key_for_did(&alice);
 
         let params = ContextParams {
-            governance: super::scp_protocol::context::params::GovernanceModel::SingleAdmin,
-            ceiling_policy: super::scp_protocol::context::params::CeilingPolicy::Governed,
+            governance: scp_protocol::context::params::GovernanceModel::SingleAdmin,
+            ceiling_policy: scp_protocol::context::params::CeilingPolicy::Governed,
             ceiling: vec![Capability::MessagesRead, Capability::MessagesWrite],
             ..ContextParams::default()
         };
@@ -18625,7 +18625,7 @@ mod tests {
         let key_a = signing_key_for_did(&alice);
 
         let params = ContextParams {
-            governance: super::scp_protocol::context::params::GovernanceModel::SingleAdmin,
+            governance: scp_protocol::context::params::GovernanceModel::SingleAdmin,
             ..ContextParams::default()
         };
 
@@ -18691,7 +18691,7 @@ mod tests {
         let key_a = signing_key_for_did(&alice);
 
         let params = ContextParams {
-            governance: super::scp_protocol::context::params::GovernanceModel::SingleAdmin,
+            governance: scp_protocol::context::params::GovernanceModel::SingleAdmin,
             ..ContextParams::default()
         };
 
@@ -18777,7 +18777,7 @@ mod tests {
         let key_a = signing_key_for_did(&alice);
 
         let params = ContextParams {
-            governance: super::scp_protocol::context::params::GovernanceModel::SingleAdmin,
+            governance: scp_protocol::context::params::GovernanceModel::SingleAdmin,
             ..ContextParams::default()
         };
 
@@ -18845,7 +18845,7 @@ mod tests {
         let key_a = signing_key_for_did(&alice);
 
         let params = ContextParams {
-            governance: super::scp_protocol::context::params::GovernanceModel::SingleAdmin,
+            governance: scp_protocol::context::params::GovernanceModel::SingleAdmin,
             ..ContextParams::default()
         };
 

@@ -1,6 +1,6 @@
 //! SCP envelope wire format — pure protocol types.
 //!
-//! SCP_PROTOCOL_VERSION, EnvelopeError, VersionCompatibility.
+//! `SCP_PROTOCOL_VERSION`, `EnvelopeError`, `VersionCompatibility`.
 //! Async modules (pseudonym, inner/sign, outer/ops) stay in scp-runtime.
 
 pub mod chunk;
@@ -12,7 +12,8 @@ pub mod validation;
 // Re-exports for backward compatibility.
 pub use inner::{InnerEnvelope, InnerEnvelopeParams, MessageType, Provenance};
 pub use outer::{OuterEnvelope, create_outer_envelope};
-pub use padding::BUCKET_SIZES;
+pub use padding::{BUCKET_SIZES, pad_to_bucket, strip_padding};
+pub use validation::SequenceTracker;
 
 /// SCP protocol version for wire structures (§13.2).
 ///
@@ -76,6 +77,11 @@ impl VersionCompatibility {
 }
 
 /// Checks whether a wire version is compatible with the local protocol version.
+///
+/// # Errors
+///
+/// Returns [`EnvelopeError::UnsupportedVersion`] if the wire major version
+/// does not match the local major version.
 pub const fn check_version_compatibility(
     wire_version: u16,
 ) -> Result<VersionCompatibility, EnvelopeError> {

@@ -8,10 +8,9 @@
 
 #![allow(dead_code)]
 
-use scp_core::context::builder::{
-    ContextCryptoProvider, ContextEventLogProvider, ContextTransportProvider,
-};
-use scp_core::context::{ContextCreationError, ContextError, ContextParams};
+use scp_protocol::context::builder::{ContextCreationError, ContextCryptoProvider};
+use scp_protocol::context::{ContextError, ContextParams};
+use scp_runtime::context::builder::{ContextEventLogProvider, ContextTransportProvider};
 
 /// Mock crypto provider — all operations succeed with dummy data.
 pub struct MockCrypto;
@@ -58,8 +57,8 @@ impl ContextCryptoProvider for MockCrypto {
         _id: &[u8; 32],
         _member_did: &str,
         _key_package_bytes: Option<&[u8]>,
-    ) -> Result<scp_core::context::AddMemberOutput, ContextError> {
-        Ok(scp_core::context::AddMemberOutput::default())
+    ) -> Result<scp_protocol::context::builder::AddMemberOutput, ContextError> {
+        Ok(scp_protocol::context::builder::AddMemberOutput::default())
     }
     fn remove_member(&self, _id: &[u8; 32], _member_did: &str) -> Result<(), ContextError> {
         Ok(())

@@ -18,14 +18,9 @@
 //! See `.docs/standards/sdk-common.md` section "Auto-Accept Policies" and
 //! "Auto-accept persistence".
 
-use std::time::Duration;
-
-use serde::{Deserialize, Serialize};
-
 use scp_identity::DID;
 use scp_platform::PlatformError;
 use scp_platform::traits::Storage;
-use scp_protocol::context::params::{Capability, ContextParams, TemplateId};
 
 // ---------------------------------------------------------------------------
 // Storage key convention
@@ -133,9 +128,11 @@ pub async fn delete_auto_accept_policy(
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
+    use std::time::Duration;
+
     use super::*;
     use scp_platform::testing::InMemoryStorage;
-    use scp_protocol::context::params::ContextParams;
+    use scp_protocol::context::params::{Capability, ContextParams, TemplateId};
     use scp_protocol::economy::{Amount, CostSchedule, CurrencyCode, EconomicPolicy};
 
     // --- CRUD roundtrip ---

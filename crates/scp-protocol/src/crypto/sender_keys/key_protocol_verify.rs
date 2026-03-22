@@ -76,14 +76,14 @@ pub const REQUEST_NONCE_SIZE: usize = 16;
 const NONCE_EXPIRY_SECS: u64 = 300; // 5 minutes
 
 /// Maximum age in milliseconds for a block notification to be considered fresh.
-pub(super) const BLOCK_NOTIFICATION_FRESHNESS_MS: u64 = 30_000; // 30 seconds
+pub const BLOCK_NOTIFICATION_FRESHNESS_MS: u64 = 30_000; // 30 seconds
 
 /// Maximum age in seconds for a sender key request to be considered fresh.
 ///
 /// Matches `NONCE_EXPIRY_SECS` so timestamp freshness and nonce dedup windows
 /// are aligned: a request that survived nonce replay should also survive the
 /// freshness check, and vice versa.
-pub(super) const REQUEST_FRESHNESS_SECS: u64 = NONCE_EXPIRY_SECS;
+pub const REQUEST_FRESHNESS_SECS: u64 = NONCE_EXPIRY_SECS;
 
 /// Maximum number of nonces tracked by [`NonceDedup`] to prevent memory exhaustion.
 const NONCE_DEDUP_CAPACITY: usize = 10_000;
@@ -696,6 +696,7 @@ impl NonceDedup {
 // HPKE context binding helpers (§9.16.2)
 // ---------------------------------------------------------------------------
 
+#[must_use]
 pub fn build_hpke_info(context_id: &str, sender_did: &str, epoch: u64) -> Vec<u8> {
     let ctx_bytes = context_id.as_bytes();
     let did_bytes = sender_did.as_bytes();
@@ -715,6 +716,7 @@ pub fn build_hpke_info(context_id: &str, sender_did: &str, epoch: u64) -> Vec<u8
     info
 }
 
+#[must_use]
 pub fn build_hpke_aad(context_id: &str, sender_did: &str, epoch: u64) -> Vec<u8> {
     let ctx_bytes = context_id.as_bytes();
     let did_bytes = sender_did.as_bytes();
@@ -877,6 +879,7 @@ pub fn aes128gcm_decrypt(
 /// Variable-length fields are prefixed with their length as a 4-byte
 /// big-endian u32 to prevent field-boundary ambiguity. The domain separator
 /// prevents cross-protocol hash confusion.
+#[must_use]
 pub fn compute_epoch_advance_hash(
     context_id: &str,
     sender_did: &str,
@@ -907,6 +910,7 @@ pub fn compute_epoch_advance_hash(
 /// big-endian u32 to prevent field-boundary ambiguity. The domain separator
 /// prevents cross-protocol hash confusion. `nonce` is fixed-size
 /// (`REQUEST_NONCE_SIZE`) and needs no prefix.
+#[must_use]
 pub fn compute_request_hash(
     requester_did: &str,
     sender_did: &str,
@@ -932,13 +936,16 @@ pub fn compute_request_hash(
     .to_vec()
 }
 
-/// Computes `SHA-256("SCP-BLOCK-NOTIFICATION-V1:" || len(context_id) || context_id
+/// Computes the block notification hash for sender key blocking.
+///
+/// `SHA-256("SCP-BLOCK-NOTIFICATION-V1:" || len(context_id) || context_id
 ///   || len(blocker_did) || blocker_did || len(blocked_did) || blocked_did
 ///   || len(signing_key_id) || signing_key_id || timestamp_BE)`.
 ///
 /// Variable-length fields are prefixed with their length as a 4-byte
 /// big-endian u32 to prevent field-boundary ambiguity. The domain separator
 /// prevents cross-protocol hash confusion.
+#[must_use]
 #[allow(clippy::similar_names)] // blocker_did/blocked_did are domain terms
 pub fn compute_block_notification_hash(
     context_id: &str,

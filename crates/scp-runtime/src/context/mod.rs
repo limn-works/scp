@@ -41,14 +41,11 @@ pub mod tools;
 
 use std::sync::Arc;
 
-use serde::{Deserialize, Serialize};
 use tokio::sync::RwLock;
 
 use scp_protocol::context::params;
-use scp_protocol::context::roles::CapabilityCeiling;
 use scp_protocol::context::{
-    ContextError, ContextMode, ContextParams, ContextState, MemoryScope, TemplateId,
-    context_id_bytes, transition,
+    ContextError, ContextParams, ContextState, context_id_bytes, transition,
 };
 
 // ---------------------------------------------------------------------------
@@ -79,7 +76,8 @@ struct ContextInner {
 /// # Examples
 ///
 /// ```
-/// use scp_core::context::{ContextHandle, ContextParams, ContextState};
+/// use scp_runtime::context::ContextHandle;
+/// use scp_protocol::context::{ContextParams, ContextState};
 ///
 /// let handle = ContextHandle::new("ctx-001".to_owned(), ContextParams::default());
 /// ```
@@ -186,6 +184,7 @@ const fn _assert_send_sync() {
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
     use super::*;
+    use scp_protocol::context::ContextMode;
 
     #[tokio::test]
     async fn context_handle_starts_in_creating_state() {

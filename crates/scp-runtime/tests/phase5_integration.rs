@@ -27,23 +27,23 @@ use std::time::Duration;
 use ed25519_dalek::Signer;
 use sha2::{Digest, Sha256};
 
-use scp_core::bridge::claiming::{ClaimRequest, claim_shadow};
-use scp_core::bridge::provenance::{
-    BridgeTrustLevel, evaluate_bridge_trust_level, mark_bridge_provenance,
-};
-use scp_core::bridge::registration::{
-    BridgeRegistrationRequest, BridgeRegistry, approve_registration, register_bridge,
-};
-use scp_core::bridge::shadow::{CreateShadowParams, ShadowRegistry, create_shadow};
-use scp_core::bridge::{BridgeMode, BridgeStatus, ShadowProvenanceStatus};
-use scp_core::context::MemoryScope;
-use scp_core::crypto::sender_keys::SenderKeyStore;
-use scp_core::provenance::{DataProvenance, DiscoveryMethod, SourceType};
-use scp_core::trust::attestation::{AttestationEvidence, RevocationStatus};
-use scp_core::trust::{Attestation, AttestationType};
 use scp_event_log::tree::{self, GENESIS_PREV_HASH};
 use scp_event_log::{Event, EventLog, EventPayload, EventType};
 use scp_identity::DID;
+use scp_protocol::bridge::claiming::{ClaimRequest, claim_shadow};
+use scp_protocol::bridge::provenance::{
+    BridgeTrustLevel, evaluate_bridge_trust_level, mark_bridge_provenance,
+};
+use scp_protocol::bridge::registration::{
+    BridgeRegistrationRequest, BridgeRegistry, approve_registration, register_bridge,
+};
+use scp_protocol::bridge::shadow::{CreateShadowParams, ShadowRegistry, create_shadow};
+use scp_protocol::bridge::{BridgeMode, BridgeStatus, ShadowProvenanceStatus};
+use scp_protocol::context::MemoryScope;
+use scp_protocol::crypto::sender_keys::SenderKeyStore;
+use scp_protocol::provenance::{DataProvenance, DiscoveryMethod, SourceType};
+use scp_protocol::trust::attestation::{AttestationEvidence, RevocationStatus};
+use scp_protocol::trust::{Attestation, AttestationType};
 
 use scp_media::keys::export_media_keys;
 use scp_media::session::{
@@ -55,9 +55,9 @@ use scp_media::signaling::{
     serialize_signaling, verify_sender_attribution,
 };
 
-use scp_core::context::params::Capability as ParamCapability;
-use scp_core::crypto::mls::credential::ScpCredential;
-use scp_core::crypto::mls::group::{add_member, create_group, generate_key_package, join_group};
+use scp_protocol::context::params::Capability as ParamCapability;
+use scp_runtime::crypto::mls::credential::ScpCredential;
+use scp_runtime::crypto::mls::group::{add_member, create_group, generate_key_package, join_group};
 
 use scp_platform::testing::{
     InMemoryDeviceAttestation, InMemoryKeyCustody, InMemoryPush, InMemoryStorage,
@@ -207,7 +207,7 @@ fn compute_claim_hash(request: &ClaimRequest) -> Vec<u8> {
 /// Computes the canonical attestation bytes for signing (matches the
 /// `pub(crate) canonical_attestation_bytes` in `trust/attestation.rs`).
 fn compute_attestation_canonical_bytes(attestation: &Attestation) -> Vec<u8> {
-    use scp_core::crypto::canonical::{CanonicalField, canonical_hash};
+    use scp_protocol::crypto::canonical::{CanonicalField, canonical_hash};
 
     let evidence_bytes = attestation.evidence.as_ref().map(|e| {
         rmp_serde::to_vec_named(e).expect("AttestationEvidence serialization is infallible")
@@ -221,7 +221,7 @@ fn compute_attestation_canonical_bytes(attestation: &Attestation) -> Vec<u8> {
         "SCP-ATTESTATION-V1:",
         &[
             CanonicalField::VarBytes(attestation.id.as_bytes()),
-            CanonicalField::U16(scp_core::trust::attestation_type_tag(
+            CanonicalField::U16(scp_protocol::trust::attestation_type_tag(
                 &attestation.attestation_type,
             )),
             CanonicalField::VarBytes(attestation.issuer.as_bytes()),
@@ -331,7 +331,7 @@ fn bridge_registration_shadow_creation_provenance_and_claiming() {
         webhook_url: None,
         platform_key: None,
         max_shadows: 10_000,
-        metadata: scp_core::bridge::registration::BridgeRegistrationMetadata::default(),
+        metadata: scp_protocol::bridge::registration::BridgeRegistrationMetadata::default(),
     };
 
     let reg_event = register_bridge(&mut bridge_registry, registration_request)
@@ -798,7 +798,7 @@ fn cross_adr_bridge_provenance_carries_correct_metadata() {
     let (operator_vk, _operator_sk) = test_keypair();
     let operator_did = did_from_pubkey(&operator_vk);
 
-    let connector = scp_core::bridge::BridgeConnector {
+    let connector = scp_protocol::bridge::BridgeConnector {
         bridge_id: "bridge-cross-001".to_owned(),
         operator_did: operator_did.clone(),
         platform: "slack".to_owned(),
@@ -808,7 +808,7 @@ fn cross_adr_bridge_provenance_carries_correct_metadata() {
         registered_at: 1_700_000_000,
     };
 
-    let shadow = scp_core::bridge::ShadowIdentity {
+    let shadow = scp_protocol::bridge::ShadowIdentity {
         shadow_id: "shadow-cross-001".to_owned(),
         platform_handle: "@bob".to_owned(),
         bridge_id: "bridge-cross-001".to_owned(),

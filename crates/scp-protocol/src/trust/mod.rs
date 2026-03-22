@@ -25,9 +25,18 @@ pub use challenge::{
     ChallengeRequest, ChallengeResponse, ChallengeSigner, ChallengeType, ChallengeVerification,
     issue_challenge, verify_challenge_response,
 };
-pub use custody_violation::{CustodyViolationError, ScpCustodyViolationAttestation};
+pub use custody_violation::{
+    ActionCategory, CounterAttestation, CustodyViolationError, CustodyViolationType,
+    ScpCustodyViolationAttestation, classify_action, enforce_category_a,
+};
 pub use participation::{
-    ParticipationProfile, ParticipationRecord, RequireParticipation, compute_participation_record,
+    ParticipationFact, ParticipationInput, ParticipationProfile, ParticipationRecord,
+    ParticipationThreshold, RequireParticipation, compute_participation_record,
+    produce_participation_profile,
+};
+pub use sybil::{
+    EarnedCapacityLevel, FreshnessWeight, IdentityDepthAssessment, TrustSignal,
+    TrustSignalCategory, evaluate_earned_capacity,
 };
 
 use std::collections::HashMap;

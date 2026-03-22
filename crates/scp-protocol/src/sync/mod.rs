@@ -1196,10 +1196,10 @@ mod tests {
                 sender_did: DID::from("did:key:carol"),
                 consistent: true,
             },
-            SyncEvent::QueueOverflow(crate::store::queue::QueueOverflowInfo {
+            SyncEvent::QueueOverflow(QueueOverflowInfo {
                 context_id: "ctx-4".to_owned(),
                 messages_dropped: 5,
-                overflow_kind: crate::store::queue::OverflowKind::PerContext,
+                overflow_kind: OverflowKind::PerContext,
             }),
         ];
         for event in &events {
@@ -1227,10 +1227,10 @@ mod tests {
         };
         assert!(cp.to_string().contains("INCONSISTENT"));
 
-        let overflow = SyncEvent::QueueOverflow(crate::store::queue::QueueOverflowInfo {
+        let overflow = SyncEvent::QueueOverflow(QueueOverflowInfo {
             context_id: "ctx-1".to_owned(),
             messages_dropped: 3,
-            overflow_kind: crate::store::queue::OverflowKind::Global,
+            overflow_kind: OverflowKind::Global,
         });
         assert!(overflow.to_string().contains("QueueOverflow"));
         assert!(overflow.to_string().contains('3'));

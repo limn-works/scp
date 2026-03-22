@@ -27,22 +27,23 @@ use ed25519_dalek::Signer;
 use sha2::{Digest, Sha256};
 use tokio::sync::mpsc;
 
-use scp_core::context::roles::{
-    Capability, CapabilityCeiling, ContextRoleState, RoleDefinition, RoleError, assign_role,
-};
-use scp_core::context::tools::invoke::{has_tool_invoke_capability, invoke_tool};
-use scp_core::context::tools::lifecycle::ToolStatus;
-use scp_core::context::tools::registry::{
-    ToolRegistration, ToolRegistry, ToolSchema, register_tool,
-};
-use scp_core::context::{ContextHandle, ContextParams, ContextState, MemoryScope};
-use scp_core::event_log::KeyCustodySigner;
 use scp_event_log::checkpoint::{CheckpointComparison, compare_checkpoint, generate_checkpoint};
 use scp_event_log::tree::{self, GENESIS_PREV_HASH};
 use scp_event_log::{Event, EventLog, EventPayload, EventType};
 use scp_identity::DID;
 use scp_platform::testing::InMemoryKeyCustody;
 use scp_platform::traits::{KeyCustody, KeyType};
+use scp_protocol::context::roles::{
+    Capability, CapabilityCeiling, ContextRoleState, RoleDefinition, RoleError, assign_role,
+};
+use scp_protocol::context::tools::lifecycle::ToolStatus;
+use scp_protocol::context::tools::registry::{
+    ToolRegistration, ToolRegistry, ToolSchema, register_tool,
+};
+use scp_protocol::context::{ContextParams, ContextState, MemoryScope};
+use scp_runtime::context::ContextHandle;
+use scp_runtime::context::tools::invoke::{has_tool_invoke_capability, invoke_tool};
+use scp_runtime::event_log::KeyCustodySigner;
 
 // ---------------------------------------------------------------------------
 // Helpers

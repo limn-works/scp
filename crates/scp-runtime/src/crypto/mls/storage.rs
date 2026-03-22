@@ -1041,7 +1041,7 @@ pub type InMemoryMlsProvider = openmls_rust_crypto::OpenMlsRustCrypto;
 /// # Example
 ///
 /// ```rust,ignore
-/// let provider = scp_core::crypto::mls::storage::new_provider();
+/// let provider = scp_runtime::crypto::mls::storage::new_provider();
 /// ```
 #[must_use]
 pub fn new_provider() -> InMemoryMlsProvider {

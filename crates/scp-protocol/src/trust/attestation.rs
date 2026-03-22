@@ -642,7 +642,7 @@ impl DidPublicKeyResolver for IdentityDidPublicKeyResolver {
         }
 
         // did:key:{hex} — testing format only (see issue #128).
-        #[cfg(any(test, feature = "testing"))]
+        #[cfg(test)]
         if did.starts_with("did:key:") {
             let hex_str = did.strip_prefix("did:key:").unwrap_or_default();
             let key_bytes =
