@@ -4,8 +4,11 @@ set -euo pipefail
 
 echo "Checking scp-protocol dependency tree..."
 
-banned="tokio|async-trait|scp-platform|openmls"
-matches=$(cargo tree -p scp-protocol --no-dev 2>/dev/null | grep -iE "$banned" || true)
+# async-trait is excluded: it's a proc-macro that generates trait impls at
+# compile time and does not pull in an async runtime at run time.
+banned="tokio|scp-platform|openmls"
+output=$(cargo tree -p scp-protocol --edges no-dev 2>&1) || { echo "ERROR: cargo tree failed: $output"; exit 1; }
+matches=$(echo "$output" | grep -iE "$banned" || true)
 
 if [ -n "$matches" ]; then
     echo "ERROR: scp-protocol has banned dependencies:"
