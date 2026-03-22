@@ -16,11 +16,7 @@
 //!
 //! # Modules
 //!
-//! - [`sign`] — Async inner envelope creation (calls `KeyCustody::sign`).
-
-pub mod sign;
-
-pub use sign::create_inner_envelope;
+//! The async `sign` module stays in scp-runtime.
 
 use std::collections::HashMap;
 

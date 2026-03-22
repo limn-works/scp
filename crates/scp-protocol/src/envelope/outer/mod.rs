@@ -6,20 +6,9 @@
 //! pseudonym-based `routing_id`, an optional `recipient_hint`, a `blob_ttl`,
 //! and an opaque `encrypted_blob`.
 //!
-//! # High-level operations
-//!
-//! - [`seal_envelope`] — The primary send-path function. Serializes an inner
-//!   envelope, encrypts via MLS, and wraps in an outer envelope.
-//! - [`open_envelope`] — The primary receive-path function. Decrypts the outer
-//!   envelope's blob via MLS, deserializes and verifies the inner envelope.
-//!   The sender's Ed25519 public key is resolved internally from the MLS group
-//!   state (SCP-177).
+//! The async `ops` module (seal_envelope, open_envelope) stays in scp-runtime.
 //!
 //! See ADR-002 in `.docs/adrs/phase-1.md` for the full outer envelope design.
-
-pub mod ops;
-
-pub use ops::{open_envelope, seal_envelope};
 
 use std::collections::HashMap;
 
