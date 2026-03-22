@@ -428,7 +428,6 @@ impl ScopeRegistry {
     ///
     /// # Errors
     ///
-    /// Returns [`crate::time::ClockError`] if the system clock is unavailable.
     /// Returns [`AddressingError`] if the scope name is invalid.
     pub fn register(
         &mut self,
