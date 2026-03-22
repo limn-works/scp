@@ -162,7 +162,146 @@ If did:dht governance at DIF collapses entirely, or if a future did:dht spec rev
 
 ---
 
-## 11.3 What No Existing Standard Covers
+## 11.3 GNUnet
+
+**GNUnet** (gnunet.org) is a framework for secure peer-to-peer networking, under active development since 2001. It is the longest-running decentralized protocol project that prioritizes anonymity and censorship resistance as architectural fundamentals. The comparison with SCP is instructive precisely because the two protocols start from opposite premises — GNUnet minimizes identity to protect participants; SCP maximizes verifiable identity to establish trust — but converge on shared principles of infrastructure distrust and transport independence.
+
+### 11.3.1 Architectural Overview
+
+GNUnet is a full network stack — an overlay network that replaces conventional transport with its own layers:
+
+| Layer | GNUnet Subsystem | Function |
+|-------|-----------------|----------|
+| **Transport** | Communicators (TCP, UDP, HTTP/3, UNIX) | Physical connectivity, per-communicator encryption |
+| **CORE** | CAKE (CORE Authenticated Key Exchange) | Link-layer peer authentication and encryption |
+| **CADET** | Confidential Ad-hoc Decentralized End-to-End Transport | Multi-hop encrypted tunnels, channel multiplexing |
+| **Application** | GNS, FS, MESSENGER, etc. | Naming, file sharing, messaging |
+
+Each layer has independent encryption. Transport communicators use Elligator DHKEM + AES-GCM (UDP) or AES-CTR + HMAC-SHA512 (TCP). CORE uses CAKE (KEM-based, inspired by DTLS 1.3/KEMTLS) with XChaCha20-Poly1305. CADET uses ECDHE over Curve25519 with dual AES-256 + Twofish encryption — a defense-in-depth choice against single-cipher compromise.
+
+This triple-layer encryption is GNUnet's most distinctive architectural choice and also its most significant divergence from SCP's model.
+
+### 11.3.2 Identity Model: The Opposite Premise
+
+GNUnet's identity model is built around **anonymity as a fundamental right**:
+
+- **Egos** are standalone Ed25519 or ECDSA keypairs. Users may have many, with no protocol-level linkage between them.
+- **GNS (GNU Name System)** provides censorship-resistant naming where each "zone" is controlled by a private key with no hierarchical authority. Record labels are derived via HKDF, making different records within a zone cryptographically unlinkable. Zone enumeration is prevented by construction.
+- **Petname system** — names are non-unique and locally assigned (Alice's "bob" is unrelated to Carol's "bob"). No global namespace, no universal resolution.
+- **Revocation** requires Argon2id proof-of-work (~4–5 days of compute for 32 unique proofs), preventing revocation flooding.
+- **did:gns** — a DID method mapping DIDs to GNS zones (`did:gns:<Base32-encoded-public-zone-key>`), with DID Documents stored as GNS resource records.
+
+**The contrast with SCP is fundamental:**
+
+| Dimension | GNUnet | SCP |
+|-----------|--------|-----|
+| **Design goal** | Anonymity — knowing who is the threat | Accountability — verifiable provenance is the feature |
+| **Identity** | Disposable egos, no cross-context linkage by design | Persistent DIDs, attestation chains to human accountability |
+| **Naming** | Petnames (local, non-unique, no authority) | DID documents (global, self-certifying, dual-layer resolution) |
+| **Provenance** | Anti-goal (enables surveillance) | Protocol tenet (absence of provenance is a signal) |
+| **Agent model** | No concept of AI agents as participants | Agents are first-class, same rules as humans, UCAN-bounded |
+
+Both are internally consistent. GNUnet is correct that identity enables surveillance in adversarial state contexts. SCP is correct that verifiable identity is prerequisite for trust in collaborative and agentic contexts. They optimize for different threat models.
+
+### 11.3.3 R5N DHT
+
+GNUnet's DHT, R5N (Randomized Recursive Routing for Restricted-Route Networks), differs from standard Kademlia in ways relevant to censorship resistance:
+
+- **Hybrid routing:** The first `log₂(N)` hops (where N is estimated network size) use **random peer selection**, then switch to XOR-distance-based closest-peer routing. The random walk phase escapes local minima in fragmented topologies — a problem that purely greedy Kademlia routing cannot solve.
+- **Path recording:** When enabled, each hop appends an EdDSA signature over predecessor/successor keys and block hash. The combined put-path + get-path provides a verifiable route audit trail. Invalid signatures trigger path truncation.
+- **On-path validation:** Application-specific block validators run at each hop. Expired or malformed data is discarded in transit, preventing DHT pollution.
+- **Loop prevention:** 1024-bit Bloom filter (k=16) tracks visited peers per query, with capacity for ~200 entries before significant false-positive rates.
+- **Censorship resistance:** Randomized initial routing + repeated queries contacting different network subsets yields ~80% retrieval success even with 50% compromised nodes in small-world topologies.
+- **IETF standardization:** draft-schanzen-r5n-01.
+
+**Comparison with Mainline DHT (used by did:dht):** Mainline uses purely greedy Kademlia routing — simpler, faster, but with no path recording, no on-path validation, and no structural censorship resistance. R5N's random walk phase and path validation are meaningful improvements for adversarial environments. SCP's dual-layer resolution (§3.10) — Mainline DHT + SCP relays — mitigates some of these risks through redundancy rather than routing-level resistance.
+
+### 11.3.4 NAT Traversal: GNUnet's Infrastructure-Free Approach
+
+GNUnet's NAT traversal is the most directly relevant subsystem for SCP. It achieves connectivity without any STUN/TURN infrastructure:
+
+**UPnP/NAT-PMP.** Standard port mapping on supporting routers. Same approach as SCP Tier 1 (§10.12.2).
+
+**Autonomous NAT traversal (pwnat).** Published by Mueller, Evans, and Grothoff (2010). Exploits ICMP Echo Request/Reply to trick NATs into accepting connections:
+
+1. Peer behind NAT sends ICMP Echo Request to a non-existent IP
+2. NAT creates a mapping expecting an ICMP Echo Reply
+3. Connecting peer sends a crafted ICMP packet matching the expected reply format
+4. NAT allows the "response" through, establishing initial contact
+5. Data channel established over UDP
+
+**Limitations (significant):** Works only when one peer is NATed (virtually never works when both are). Does not work with symmetric NATs. Requires SUID privileges for raw ICMP sockets. Blocked by most corporate firewalls. Impractical for production deployment.
+
+**Probabilistic burst traversal (NGI Assure funded, 2021–2024).** The most novel technique:
+
+1. Peers exchange external IP + port via GNUnet's Distance Vector backchannel (an already-established relay path)
+2. Both peers simultaneously transmit connection attempts across **multiple ports** using raw sockets (TCP SYN or UDP datagrams)
+3. Statistical probability produces a port collision — both attempts arrive simultaneously, creating a successful connection
+
+This eliminates third-party infrastructure entirely. The backchannel coordination is the key enabler — without an existing communication path (however indirect), peers cannot synchronize the burst.
+
+**Integrated relaying (Distance Vector).** When all direct connection attempts fail, GNUnet routes through intermediate peers using Distance Vector routing. Any GNUnet peer can act as a relay. DV discovers paths via "learn messages" and maintains both unidirectional (circle) and bidirectional (inverse) paths. Relaying is a native transport property, not a separate service.
+
+**Comparison with SCP's reachability tiers (§10.12):**
+
+| Tier | SCP | GNUnet Equivalent |
+|------|-----|-------------------|
+| **1 — Port mapping** | UPnP-IGD / NAT-PMP/PCP | UPnP (same) |
+| **2 — Hole punching** | Multi-STUN probing + hole punch coordination | Probabilistic burst (no STUN) |
+| **3 — Relay** | Bridge relay (BRIDGE_REGISTER + BRIDGE_DATA) | Distance Vector through intermediate peers |
+| **4 — Domain TLS** | Domain-based TLS fallback | N/A (no domain concept) |
+
+SCP's 4-tier strategy is more structured and production-oriented. GNUnet's probabilistic burst is more ambitious in eliminating infrastructure dependency. The key insight from GNUnet is that **backchannel-coordinated simultaneous connection attempts** can replace STUN for symmetric NAT scenarios — the backchannel being any existing communication path (in SCP's case, the relay itself).
+
+### 11.3.5 Transport Architecture
+
+GNUnet's transport evolved from monolithic plugins to separate **communicator** processes (Transport-NG):
+
+- Each communicator (TCP, UDP, HTTP/3, UNIX, libp2p) runs as an independent process
+- Failure isolation: one communicator crash does not affect others
+- Standardized queue management with MTU, network type, and reliability declarations
+- URL-like addressing with scope awareness (LAN addresses don't leak to WAN)
+- Bidirectional flow control with back-pressure
+
+**Comparison with SCP's transport adapter trait (ADR-005):** Both abstract over transport mechanisms. SCP's `TransportAdapter` is a Rust trait with five methods (send, subscribe, unsubscribe, query, delete) — simpler and more focused than GNUnet's communicator protocol, which handles queue management, back-pressure, and path selection. SCP's model is deliberately thinner: transport is a dumb pipe, and all intelligence (encryption, governance, membership) lives above the transport layer.
+
+GNUnet's communicator model offers one lesson SCP has already partially adopted: transport mechanism independence should be structural, not aspirational. SCP's 17 adapter types (§10.5) realize this.
+
+### 11.3.6 What SCP Borrows Conceptually
+
+- **Infrastructure distrust.** Both protocols treat all infrastructure as potentially adversarial. GNUnet encrypts at every layer because any hop might be compromised. SCP encrypts at the message layer (MLS) and treats relays as untrusted dumb pipes. Different mechanisms, same principle.
+- **Relay as native transport.** GNUnet's DV routing makes relaying an inherent transport property. SCP's Tier 3 bridge relay serves the same function — when direct connection fails, relay forwarding is a seamless fallback, not an external service.
+- **NAT as first-class problem.** Both protocols treat NAT traversal as a core protocol concern, not an application-layer afterthought. GNUnet's multiple traversal mechanisms and SCP's 4-tier reachability strategy both reflect this.
+- **DHT for peer discovery.** Both use DHT-based discovery (R5N vs Mainline) as a decentralized alternative to centralized registries.
+
+### 11.3.7 Why SCP Does Not Adopt GNUnet's Approach
+
+**Overlay coupling.** GNUnet IS the network — it replaces conventional transport with its own stack. SCP's transport independence tenet (§10.5) requires running on top of existing transports. Coupling to GNUnet's overlay would make SCP a GNUnet application rather than a transport-independent protocol.
+
+**Triple-layer encryption.** GNUnet encrypts at transport, CORE, and CADET layers because intermediate peers are untrusted routing nodes that handle plaintext routing metadata. SCP's relay model is simpler: relays see only pseudonym-addressed encrypted blobs (§9.10.2). One encryption layer (MLS) plus a sender-side key layer (§9.16) is sufficient when relays perform no routing decisions beyond subscription matching.
+
+**Anonymity vs accountability.** GNUnet's architecture is optimized for a world where state actors surveil communication and identity itself is dangerous. SCP's architecture is optimized for a world where AI agents act autonomously and verifiable provenance is necessary for trust. These are different futures; both are plausible.
+
+**Maturity.** GNUnet has been in development for 25+ years and remains explicitly experimental ("significant bugs and critical design flaws" per project documentation). No production deployments at scale. SCP cannot depend on experimental infrastructure for core protocol functions.
+
+### 11.3.8 Open Questions
+
+GNUnet's **probabilistic burst NAT traversal** technique — backchannel-coordinated simultaneous multi-port connection attempts — could improve SCP's Tier 2 coverage for symmetric NATs without introducing STUN/TURN infrastructure dependency. See discussion #1380 for ongoing evaluation.
+
+R5N's **randomized routing** and **path recording** offer censorship resistance properties that standard Mainline DHT lacks. If state-level DID resolution suppression becomes a practical threat, R5N's techniques could inform a more resilient resolution fallback alongside SCP's existing dual-layer approach (§3.10).
+
+### 11.3.9 References
+
+- Polot & Grothoff, "CADET: Confidential Ad-hoc Decentralized End-to-End Transport," Med-Hoc-Net 2014
+- Evans & Grothoff, "R5N: Randomized Recursive Routing for Restricted-Route Networks," NSS 2011
+- Mueller, Evans & Grothoff, "Autonomous NAT Traversal," 2010
+- Grothoff, "The GNUnet System," Habilitation thesis, Inria
+- IETF draft-schanzen-r5n-01 (R5N specification)
+- LSD-0001 (GNS specification), LSD-0005 (did:gns), LSD-0007 (Communicators), LSD-0012 (CAKE)
+
+---
+
+## 11.4 What No Existing Standard Covers
 
 Agents as first-class protocol participants with formalized trust semantics, one-agent-per-person-per-context constraints, context-bound agents that cannot cross at the protocol level, trust as identity + capability pairs applied to autonomous agents, non-fungible cross-platform identity attestations with shadow identity claiming, protocol-level bridge connectors with provenance-tracked content attribution, and all of this framed as infrastructure for generated/ephemeral apps.
 
