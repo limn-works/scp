@@ -156,7 +156,7 @@ impl CertificateData {
     /// Returns [`TlsError::Certificate`] if the expiry cannot be determined.
     pub fn needs_renewal(&self) -> Result<bool, TlsError> {
         let expiry = self.expiry_timestamp()?;
-        let now = scp_core::time::now_secs()
+        let now = scp_primitives::time::now_secs()
             .map_err(|e| TlsError::Certificate(format!("{e}")))?
             .cast_signed();
 
@@ -883,6 +883,7 @@ pub fn generate_self_signed(domain: &str) -> Result<CertificateData, TlsError> {
 mod tests {
     use super::*;
     use scp_platform::testing::InMemoryStorage;
+    use scp_primitives::Clock;
 
     // -- Self-signed generation --
 
@@ -914,7 +915,7 @@ mod tests {
     fn expiry_timestamp_is_in_future() {
         let cert = generate_self_signed("test.example.com").unwrap();
         let expiry = cert.expiry_timestamp().unwrap();
-        let now = scp_core::time::now_secs().expect("clock unavailable in test") as i64;
+        let now = scp_primitives::SystemClock.now_secs() as i64;
         assert!(expiry > now, "self-signed cert should expire in the future");
     }
 

@@ -999,7 +999,7 @@ pub(super) fn verify_ed25519_signature(
 /// Returns [`SenderKeyError::ClockError`] (via [`crate::time::ClockError`])
 /// if the system clock is before the Unix epoch.
 pub(super) fn current_timestamp_ms() -> Result<u64, crate::time::ClockError> {
-    crate::time::now_millis()
+    scp_primitives::time::now_millis()
 }
 
 // ---------------------------------------------------------------------------

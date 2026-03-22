@@ -923,7 +923,7 @@ pub fn py_tool_session_create(
         }
 
         let session_id = uuid::Uuid::new_v4().to_string();
-        let now_ms = scp_core::time::now_millis()
+        let now_ms = scp_primitives::time::now_millis()
             .map_err(|e| ScpPyError::context(format!("clock error: {e}")))?;
 
         let session = scp_core::context::tools::ToolSession {
@@ -1021,7 +1021,7 @@ pub fn py_tool_session_invoke(
             .ok_or_else(|| ScpPyError::context(format!("session '{session_id}' not found")))?;
 
         // Check expiry.
-        let now_ms = scp_core::time::now_millis()
+        let now_ms = scp_primitives::time::now_millis()
             .map_err(|e| ScpPyError::context(format!("clock error: {e}")))?;
         if session.is_expired(now_ms) {
             rt.session_store.remove(session_id);
@@ -1288,7 +1288,7 @@ pub fn py_tool_interface_revoke(context_id: &str, interface_id_hex: &str) -> PyR
             }
         })?;
 
-    let now_ms = scp_core::time::now_millis().map_err(|e| ScpPyError::ContextError {
+    let now_ms = scp_primitives::time::now_millis().map_err(|e| ScpPyError::ContextError {
         message: format!("clock error: {e}"),
         code: "SCP-TOOL-6034".to_owned(),
     })?;

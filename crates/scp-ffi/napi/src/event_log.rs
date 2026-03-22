@@ -170,7 +170,7 @@ pub async fn event_log_query(
 
     // Unix timestamp seconds fit in f64 mantissa for centuries.
     #[allow(clippy::cast_precision_loss)]
-    let timestamp = scp_core::time::now_secs()
+    let timestamp = scp_primitives::time::now_secs()
         .map_err(|e| ScpNapiError::Context {
             message: format!("{e}"),
             code: "SCP-CTX-2023".to_owned(),

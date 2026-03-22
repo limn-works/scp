@@ -39,7 +39,7 @@ pub type ClockFn = Arc<dyn Fn() -> u64 + Send + Sync>;
 #[must_use]
 pub fn system_clock() -> ClockFn {
     Arc::new(|| {
-        scp_core::time::now_secs().unwrap_or_else(|e| {
+        scp_primitives::time::now_secs().unwrap_or_else(|e| {
             // A system clock before the Unix epoch is an unrecoverable
             // environment failure. Silently returning 0 would bypass TTL
             // checks, allowing expired blobs to persist indefinitely.

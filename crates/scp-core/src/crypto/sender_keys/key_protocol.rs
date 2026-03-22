@@ -119,7 +119,7 @@ pub async fn request_sender_key(
     // Generate cryptographic nonce and timestamp for replay protection.
     let mut nonce = [0u8; REQUEST_NONCE_SIZE];
     OsRng.fill_bytes(&mut nonce);
-    let timestamp = crate::time::now_secs()?;
+    let timestamp = scp_primitives::time::now_secs()?;
 
     // Sign the request (including nonce and timestamp).
     let hash = compute_request_hash(

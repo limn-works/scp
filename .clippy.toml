@@ -8,3 +8,16 @@ cognitive-complexity-threshold = 25
 # Increased from 800000 to 900000 after broadcast content tests (SCP-287)
 # added ~68 new test functions to scp-core.
 stack-size-threshold = 900000
+
+# ----- Disallowed methods -----
+# scp-core intentionally does NOT re-export now_secs/now_millis from
+# scp_primitives::time.  Protocol-bound modules must use &dyn Clock.
+# These entries guard against accidental re-introduction of the re-export.
+
+[[disallowed-methods]]
+path = "scp_core::time::now_secs"
+reason = "Use &dyn Clock instead — see Clock trait in scp-primitives/src/time.rs"
+
+[[disallowed-methods]]
+path = "scp_core::time::now_millis"
+reason = "Use &dyn Clock instead — see Clock trait in scp-primitives/src/time.rs"

@@ -1365,7 +1365,7 @@ impl MergedStream {
         }
         self.last_suppression_check = now;
 
-        let Ok(now_ms) = scp_core::time::now_millis() else {
+        let Ok(now_ms) = scp_primitives::time::now_millis() else {
             // Clock unavailable — skip suppression check this cycle.
             return;
         };
@@ -1432,7 +1432,7 @@ impl Stream for MergedStream {
 
                         if let (Ok(mut tracker), Ok(now_ms)) = (
                             this.suppression_tracker.lock(),
-                            scp_core::time::now_millis(),
+                            scp_primitives::time::now_millis(),
                         ) {
                             tracker.record_delivery(blob_id, adapter_idx, now_ms);
                         }
@@ -2347,7 +2347,8 @@ mod tests {
         // We can't peek directly into the LRU, but we can verify via check_suppressions:
         // 2 out of 2 relays delivered => no warning.
         drop(tracker);
-        let now_ms = scp_core::time::now_millis().expect("clock unavailable in test") + 31_000; // simulate 31 seconds later
+        let now_ms =
+            scp_primitives::time::now_millis().expect("clock unavailable in test") + 31_000; // simulate 31 seconds later
         let warnings = manager
             .suppression_tracker
             .lock()
@@ -2414,7 +2415,8 @@ mod tests {
         // The suppression tracker should have 1 delivery from adapter 0 only.
         // With 4 total relays, threshold = ceil(4/2) = 2. Only 1 delivered
         // => 1 < 2 => warning should be emitted.
-        let now_ms = scp_core::time::now_millis().expect("clock unavailable in test") + 31_000;
+        let now_ms =
+            scp_primitives::time::now_millis().expect("clock unavailable in test") + 31_000;
         let warnings = manager
             .suppression_tracker
             .lock()

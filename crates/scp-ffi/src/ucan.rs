@@ -596,6 +596,7 @@ mod tests {
         DidResolver, NonceTracker as NonceTrackerTrait, ProofResolver, RevocationChecker,
     };
     use scp_ffi_common::BridgeDidResolver;
+    use scp_primitives::Clock;
 
     // -----------------------------------------------------------------------
     // BridgeDidResolver
@@ -714,7 +715,7 @@ mod tests {
         let mut tracker =
             scp_core::crypto::ucan::nonce::NonceTracker::new("ctx-test".to_owned(), SystemClock);
 
-        let now_millis = scp_core::time::now_millis().expect("clock unavailable in test");
+        let now_millis = scp_primitives::SystemClock.now_millis();
         let now_secs = now_millis / 1000;
         let nonce = format!("{now_millis}-aabbccdd11223344aabbccdd11223344");
         let expiry = now_secs + 3600;

@@ -324,7 +324,7 @@ impl HandleQuerier for LocalHandleQuerier {
         // Clock failure means we cannot produce valid resolved_at timestamps.
         // Return empty results rather than silently using epoch 0, which would
         // bypass freshness checks downstream.
-        let Ok(now) = scp_core::time::now_secs() else {
+        let Ok(now) = scp_primitives::time::now_secs() else {
             return Vec::new();
         };
 
