@@ -252,7 +252,7 @@ impl NonceTracker for InMemoryNonceTracker {
         }
 
         // Freshness check: timestamp within now +/- 5 minutes.
-        let now_millis = u128::from(crate::time::now_millis()?);
+        let now_millis = u128::from(scp_primitives::SystemClock.now_millis());
 
         if nonce_millis + NONCE_FRESHNESS_TOLERANCE_MS < now_millis {
             return Err(UcanError::NonceTooOld(nonce.to_owned()));
@@ -2818,16 +2818,6 @@ mod tests {
         assert!(
             matches!(result, Err(UcanError::TokenExpired)),
             "near-epoch token (exp=1) must be rejected: {result:?}"
-        );
-    }
-
-    /// Verify that `ClockError` displays correctly.
-    #[test]
-    fn clock_error_display() {
-        let err = UcanError::ClockError("system clock before Unix epoch: test".to_owned());
-        assert_eq!(
-            err.to_string(),
-            "system clock error: system clock before Unix epoch: test"
         );
     }
 

@@ -315,10 +315,6 @@ impl RateLimit {
     ///
     /// Uses default burst allowance (5 calls within 1 second, spec §6.2.0.2).
     /// Initializes `current_count` to 0 and `window_start` to the current time.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`crate::time::ClockError`] if the system clock is unavailable.
     pub fn new(max_calls: u64, window: Duration, clock: &dyn Clock) -> Self {
         Self::with_burst(
             max_calls,
@@ -332,10 +328,6 @@ impl RateLimit {
     /// Creates a new rate limit with custom burst parameters.
     ///
     /// `burst_allowance` is clamped to [`MAX_BURST_ALLOWANCE`] (50).
-    ///
-    /// # Errors
-    ///
-    /// Returns [`crate::time::ClockError`] if the system clock is unavailable.
     pub fn with_burst(
         max_calls: u64,
         window: Duration,
@@ -365,10 +357,6 @@ impl RateLimit {
     /// When the base rate limit is exhausted, burst allowance is checked:
     /// up to `burst_allowance` additional calls are permitted if they occur
     /// within `burst_window` of the first burst call (spec §6.2.0.2).
-    ///
-    /// # Errors
-    ///
-    /// Returns [`crate::time::ClockError`] if the system clock is unavailable.
     #[allow(clippy::cast_possible_truncation)]
     fn check_and_increment(&mut self, clock: &dyn Clock) -> bool {
         let now = clock.now_millis();
@@ -422,10 +410,6 @@ impl RateLimit {
     /// This is the `Retry-After` value per spec §6.2.0.2: the time a caller
     /// must wait before the next call will be accepted. The value is rounded
     /// up so callers never retry too early.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`crate::time::ClockError`] if the system clock is unavailable.
     #[allow(clippy::cast_possible_truncation)]
     pub fn retry_after_secs(&self, clock: &dyn Clock) -> u64 {
         let now = clock.now_millis();
@@ -546,10 +530,6 @@ impl PerCallerRateLimit {
     /// Returns `true` if the call is permitted, `false` if the caller has
     /// exceeded their individual limit (including burst) or the caller map
     /// is at capacity.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`crate::time::ClockError`] if the system clock is unavailable.
     #[allow(clippy::cast_possible_truncation)]
     pub fn check_and_increment(&mut self, caller_did: &DID, clock: &dyn Clock) -> bool {
         let now = clock.now_millis();
@@ -622,10 +602,6 @@ impl PerCallerRateLimit {
     /// This is the `Retry-After` value per spec §6.2.0.2. Returns 0 if the
     /// caller has no tracked state (i.e., has never called). The value is
     /// rounded up so callers never retry too early.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`crate::time::ClockError`] if the system clock is unavailable.
     #[allow(clippy::cast_possible_truncation)]
     pub fn retry_after_secs_for(&self, caller_did: &DID, clock: &dyn Clock) -> u64 {
         let now = clock.now_millis();

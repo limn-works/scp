@@ -218,31 +218,28 @@ impl HandleRegistry {
     /// holds this handle, or `OwnershipMismatch` if the registrant does not
     /// own the target identity DID.
     ///
-    /// # Errors
-    ///
-    /// Returns [`crate::time::ClockError`] if the system clock is unavailable.
     pub fn register(
         &mut self,
         params: &HandleRegisterParams,
         registrant_did: &DID,
         clock: &dyn Clock,
-    ) -> Result<HandleRegisterResult, crate::time::ClockError> {
+    ) -> HandleRegisterResult {
         if let HandleTarget::Identity { ref did } = params.target
             && did != registrant_did
         {
-            return Ok(HandleRegisterResult {
+            return HandleRegisterResult {
                 status: HandleRegisterStatus::OwnershipMismatch,
                 entry_id: None,
-            });
+            };
         }
 
         let normalized = params.handle.to_lowercase();
 
         if self.entries.contains_key(&normalized) {
-            return Ok(HandleRegisterResult {
+            return HandleRegisterResult {
                 status: HandleRegisterStatus::Conflict,
                 entry_id: None,
-            });
+            };
         }
 
         let entry_id = format!("handle-{}", self.next_entry_id);
@@ -261,10 +258,10 @@ impl HandleRegistry {
 
         self.entries.insert(normalized, entry);
 
-        Ok(HandleRegisterResult {
+        HandleRegisterResult {
             status: HandleRegisterStatus::Registered,
             entry_id: Some(entry_id),
-        })
+        }
     }
 
     /// Looks up a handle.
@@ -375,13 +372,11 @@ mod tests {
             metadata: None,
         };
 
-        let result = registry
-            .register(
-                &params,
-                &DID::from("did:dht:zAlice"),
-                &scp_primitives::SystemClock,
-            )
-            .unwrap();
+        let result = registry.register(
+            &params,
+            &DID::from("did:dht:zAlice"),
+            &scp_primitives::SystemClock,
+        );
         assert_eq!(result.status, HandleRegisterStatus::Registered);
         assert!(result.entry_id.is_some());
     }
@@ -404,14 +399,10 @@ mod tests {
             metadata: None,
         };
 
-        let result1 = registry
-            .register(&params_alice, &alice_did, &scp_primitives::SystemClock)
-            .unwrap();
+        let result1 = registry.register(&params_alice, &alice_did, &scp_primitives::SystemClock);
         assert_eq!(result1.status, HandleRegisterStatus::Registered);
 
-        let result2 = registry
-            .register(&params_bob, &bob_did, &scp_primitives::SystemClock)
-            .unwrap();
+        let result2 = registry.register(&params_bob, &bob_did, &scp_primitives::SystemClock);
         assert_eq!(result2.status, HandleRegisterStatus::Conflict);
     }
 
@@ -432,12 +423,8 @@ mod tests {
             metadata: None,
         };
 
-        registry
-            .register(&params1, &alice_did, &scp_primitives::SystemClock)
-            .unwrap();
-        let result = registry
-            .register(&params2, &bob_did, &scp_primitives::SystemClock)
-            .unwrap();
+        registry.register(&params1, &alice_did, &scp_primitives::SystemClock);
+        let result = registry.register(&params2, &bob_did, &scp_primitives::SystemClock);
         assert_eq!(result.status, HandleRegisterStatus::Conflict);
     }
 
@@ -450,13 +437,11 @@ mod tests {
             metadata: None,
         };
 
-        let result = registry
-            .register(
-                &params,
-                &DID::from("did:dht:zEve"),
-                &scp_primitives::SystemClock,
-            )
-            .unwrap();
+        let result = registry.register(
+            &params,
+            &DID::from("did:dht:zEve"),
+            &scp_primitives::SystemClock,
+        );
         assert_eq!(result.status, HandleRegisterStatus::OwnershipMismatch);
         assert!(result.entry_id.is_none());
         assert!(registry.is_empty());
@@ -474,13 +459,11 @@ mod tests {
             }),
         };
 
-        let result = registry
-            .register(
-                &params,
-                &DID::from("did:dht:zAdmin"),
-                &scp_primitives::SystemClock,
-            )
-            .unwrap();
+        let result = registry.register(
+            &params,
+            &DID::from("did:dht:zAdmin"),
+            &scp_primitives::SystemClock,
+        );
         assert_eq!(result.status, HandleRegisterStatus::Registered);
     }
 
@@ -494,13 +477,11 @@ mod tests {
             target: make_identity_target("did:dht:zAlice"),
             metadata: None,
         };
-        registry
-            .register(
-                &params,
-                &DID::from("did:dht:zAlice"),
-                &scp_primitives::SystemClock,
-            )
-            .unwrap();
+        registry.register(
+            &params,
+            &DID::from("did:dht:zAlice"),
+            &scp_primitives::SystemClock,
+        );
 
         let lookup = registry.lookup(&HandleLookupParams {
             handle: "alice".to_owned(),
@@ -536,13 +517,11 @@ mod tests {
             target: make_context_target("a1b2c3"),
             metadata: None,
         };
-        registry
-            .register(
-                &params,
-                &DID::from("did:dht:zAdmin"),
-                &scp_primitives::SystemClock,
-            )
-            .unwrap();
+        registry.register(
+            &params,
+            &DID::from("did:dht:zAdmin"),
+            &scp_primitives::SystemClock,
+        );
 
         let lookup = registry.lookup(&HandleLookupParams {
             handle: "recipes".to_owned(),
@@ -562,13 +541,11 @@ mod tests {
             target: make_context_target("a1b2c3"),
             metadata: None,
         };
-        registry
-            .register(
-                &params,
-                &DID::from("did:dht:zAdmin"),
-                &scp_primitives::SystemClock,
-            )
-            .unwrap();
+        registry.register(
+            &params,
+            &DID::from("did:dht:zAdmin"),
+            &scp_primitives::SystemClock,
+        );
 
         let lookup = registry.lookup(&HandleLookupParams {
             handle: "recipes".to_owned(),
@@ -590,9 +567,7 @@ mod tests {
             target: make_identity_target("did:dht:zAlice"),
             metadata: None,
         };
-        registry
-            .register(&params, &alice_did, &scp_primitives::SystemClock)
-            .unwrap();
+        registry.register(&params, &alice_did, &scp_primitives::SystemClock);
 
         let result = registry.deregister(&HandleDeregisterParams {
             handle: "alice".to_owned(),
@@ -614,9 +589,7 @@ mod tests {
             target: make_identity_target("did:dht:zAlice"),
             metadata: None,
         };
-        registry
-            .register(&params, &alice_did, &scp_primitives::SystemClock)
-            .unwrap();
+        registry.register(&params, &alice_did, &scp_primitives::SystemClock);
 
         let result = registry.deregister(&HandleDeregisterParams {
             handle: "alice".to_owned(),
@@ -675,29 +648,25 @@ mod tests {
     fn register_generates_unique_entry_ids() {
         let mut registry = HandleRegistry::new("ctx-cooking".to_owned());
 
-        let r1 = registry
-            .register(
-                &HandleRegisterParams {
-                    handle: "alice".to_owned(),
-                    target: make_identity_target("did:dht:zAlice"),
-                    metadata: None,
-                },
-                &DID::from("did:dht:zAlice"),
-                &scp_primitives::SystemClock,
-            )
-            .unwrap();
+        let r1 = registry.register(
+            &HandleRegisterParams {
+                handle: "alice".to_owned(),
+                target: make_identity_target("did:dht:zAlice"),
+                metadata: None,
+            },
+            &DID::from("did:dht:zAlice"),
+            &scp_primitives::SystemClock,
+        );
 
-        let r2 = registry
-            .register(
-                &HandleRegisterParams {
-                    handle: "bob".to_owned(),
-                    target: make_identity_target("did:dht:zBob"),
-                    metadata: None,
-                },
-                &DID::from("did:dht:zBob"),
-                &scp_primitives::SystemClock,
-            )
-            .unwrap();
+        let r2 = registry.register(
+            &HandleRegisterParams {
+                handle: "bob".to_owned(),
+                target: make_identity_target("did:dht:zBob"),
+                metadata: None,
+            },
+            &DID::from("did:dht:zBob"),
+            &scp_primitives::SystemClock,
+        );
 
         assert_ne!(r1.entry_id, r2.entry_id);
     }
@@ -715,9 +684,7 @@ mod tests {
             target: make_identity_target("did:dht:zAlice"),
             metadata: None,
         };
-        registry
-            .register(&params, &alice_did, &scp_primitives::SystemClock)
-            .unwrap();
+        registry.register(&params, &alice_did, &scp_primitives::SystemClock);
 
         registry.deregister(&HandleDeregisterParams {
             handle: "alice".to_owned(),
@@ -729,9 +696,7 @@ mod tests {
             target: make_identity_target("did:dht:zBob"),
             metadata: None,
         };
-        let result = registry
-            .register(&params2, &bob_did, &scp_primitives::SystemClock)
-            .unwrap();
+        let result = registry.register(&params2, &bob_did, &scp_primitives::SystemClock);
         assert_eq!(result.status, HandleRegisterStatus::Registered);
     }
 }

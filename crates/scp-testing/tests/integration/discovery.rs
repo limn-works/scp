@@ -222,9 +222,7 @@ async fn handle_registry_crud() {
         },
         metadata: None,
     };
-    let result = registry
-        .register(&params, &alice_did, &scp_primitives::SystemClock)
-        .unwrap();
+    let result = registry.register(&params, &alice_did, &scp_primitives::SystemClock);
     assert_eq!(
         result.status,
         scp_core::discovery::HandleRegisterStatus::Registered
@@ -266,9 +264,7 @@ async fn handle_registry_conflict() {
         },
         metadata: None,
     };
-    registry
-        .register(&params_alice, &alice_did, &scp_primitives::SystemClock)
-        .unwrap();
+    registry.register(&params_alice, &alice_did, &scp_primitives::SystemClock);
 
     // Bob tries to register the same handle.
     let params_bob = HandleRegisterParams {
@@ -278,9 +274,7 @@ async fn handle_registry_conflict() {
         },
         metadata: None,
     };
-    let result = registry
-        .register(&params_bob, &bob_did, &scp_primitives::SystemClock)
-        .unwrap();
+    let result = registry.register(&params_bob, &bob_did, &scp_primitives::SystemClock);
     assert_eq!(
         result.status,
         scp_core::discovery::HandleRegisterStatus::Conflict
@@ -631,19 +625,17 @@ fn scope_registry_isolation_from_handle_registry() {
         )
         .unwrap();
 
-    handle_registry
-        .register(
-            &HandleRegisterParams {
-                handle: "cooking".to_owned(),
-                target: HandleTarget::Identity {
-                    did: admin_did.clone(),
-                },
-                metadata: None,
+    handle_registry.register(
+        &HandleRegisterParams {
+            handle: "cooking".to_owned(),
+            target: HandleTarget::Identity {
+                did: admin_did.clone(),
             },
-            &admin_did,
-            &scp_primitives::SystemClock,
-        )
-        .unwrap();
+            metadata: None,
+        },
+        &admin_did,
+        &scp_primitives::SystemClock,
+    );
 
     // Both registries have one entry — independent
     assert_eq!(scope_registry.len(), 1);

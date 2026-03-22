@@ -10398,16 +10398,11 @@ pub fn handle_register(
     let registry = guard
         .entry(discovery_context_id.clone())
         .or_insert_with(|| scp_core::discovery::HandleRegistry::new(discovery_context_id));
-    let result = registry
-        .register(
-            &params,
-            &scp_identity::DID::from(registrant_did.as_str()),
-            &scp_primitives::SystemClock,
-        )
-        .map_err(|e| ScpError::Validation {
-            msg: format!("clock error during handle registration: {e}"),
-            code: "SCP-VALID-7121".to_owned(),
-        })?;
+    let result = registry.register(
+        &params,
+        &scp_identity::DID::from(registrant_did.as_str()),
+        &scp_primitives::SystemClock,
+    );
     serde_json::to_string(&result).map_err(|e| ScpError::Validation {
         msg: format!("failed to serialize handle register result: {e}"),
         code: "SCP-VALID-7122".to_owned(),

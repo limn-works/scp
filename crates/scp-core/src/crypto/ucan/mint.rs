@@ -232,7 +232,6 @@ pub struct MintParams<'a> {
 ///
 /// # Errors
 ///
-/// Returns [`UcanError::ClockError`] if the system clock is before the Unix epoch.
 /// Returns [`UcanError::ExpiryTooFar`] if `lifetime_secs` exceeds 24 hours.
 /// Returns [`UcanError::MalformedToken`] if serialization or signing fails.
 ///
@@ -473,7 +472,6 @@ pub struct DelegateParams<'a> {
 /// `parent_token.payload.aud`.
 /// Returns [`UcanError::AttenuationViolation`] if any capability in
 /// `attenuated_capabilities` is not granted by the parent token.
-/// Returns [`UcanError::ClockError`] if the system clock is before the Unix epoch.
 /// Returns [`UcanError::ExpiryTooFar`] if `lifetime_secs` exceeds 24 hours.
 /// Returns [`UcanError::MalformedToken`] if serialization or signing fails.
 ///

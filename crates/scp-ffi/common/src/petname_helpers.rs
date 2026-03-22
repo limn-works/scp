@@ -728,9 +728,7 @@ mod tests {
                 target: HandleTarget::Identity { did: did.clone() },
                 metadata: None,
             };
-            let result = registry
-                .register(&params, &did, &scp_primitives::SystemClock)
-                .expect("register");
+            let result = registry.register(&params, &did, &scp_primitives::SystemClock);
             assert_eq!(
                 result.status,
                 scp_core::discovery::handles::HandleRegisterStatus::Registered
@@ -778,9 +776,7 @@ mod tests {
                 target: HandleTarget::Identity { did: did.clone() },
                 metadata: None,
             };
-            registry
-                .register(&params, &did, &scp_primitives::SystemClock)
-                .expect("register");
+            registry.register(&params, &did, &scp_primitives::SystemClock);
         }
 
         let querier = LocalHandleQuerier;
@@ -822,9 +818,7 @@ mod tests {
                 target: HandleTarget::Identity { did: did.clone() },
                 metadata: None,
             };
-            registry
-                .register(&params, &did, &scp_primitives::SystemClock)
-                .expect("register");
+            registry.register(&params, &did, &scp_primitives::SystemClock);
         }
 
         let querier = LocalHandleQuerier;

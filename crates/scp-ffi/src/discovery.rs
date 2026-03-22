@@ -677,16 +677,11 @@ pub fn py_handle_register(
         .entry(discovery_context_id.to_owned())
         .or_insert_with(|| HandleRegistry::new(discovery_context_id.to_owned()));
 
-    let result = registry
-        .register(
-            &params,
-            &DID::from(registrant_did),
-            &scp_primitives::SystemClock,
-        )
-        .map_err(|e| ScpPyError::ValidationError {
-            message: format!("clock error during handle registration: {e}"),
-            code: "SCP-VALID-7121".to_owned(),
-        })?;
+    let result = registry.register(
+        &params,
+        &DID::from(registrant_did),
+        &scp_primitives::SystemClock,
+    );
 
     serde_json::to_string(&result).map_err(|e| {
         ScpPyError::ValidationError {
