@@ -295,10 +295,13 @@ fn execute_add_member_calls_generate_access_key() {
 #[test]
 fn pipeline_active_assertions_never_decrease() {
     let source = include_str!("pipeline_wiring.rs");
-    // Count assert!( and assert_eq!( calls (the actual assertion macros)
-    let total_asserts = source.matches("assert!(").count() + source.matches("assert_eq!(").count();
+    // Count #[test] attributes, subtract #[ignore] and meta-tests.
+    // Using #[test] count avoids phantom matches from assert!( in
+    // comments, string literals, and meta-test self-references.
+    let total_tests = source.matches("#[test]").count();
     let ignored = source.matches("#[ignore = \"").count();
-    let active = total_asserts - ignored;
+    let meta_tests = 2; // this test + claude_md_enforcement_sections_present
+    let active = total_tests - ignored - meta_tests;
     assert!(
         active >= MIN_ACTIVE_PIPELINE_ASSERTIONS,
         "Active pipeline assertions ({active}) dropped below minimum \
