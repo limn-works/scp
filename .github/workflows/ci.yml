@@ -92,6 +92,19 @@ jobs:
           PR_BODY: ${{ github.event.pull_request.body }}
         run: bash scripts/check-cross-layer.sh
 
+  # ── SDK coverage ─────────────────────────────────────────────────────
+  sdk-coverage:
+    needs: check-draft
+    name: SDK capability matrix
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install tree-sitter tree-sitter-python tree-sitter-typescript tree-sitter-kotlin tree-sitter-swift
+      - run: python3.12 scripts/check-sdk-coverage.py
+
   # ── Rust ────────────────────────────────────────────────────────────
   rust-fmt:
     needs: changes
@@ -456,6 +469,7 @@ jobs:
     needs:
       - error-codes
       - cross-layer
+      - sdk-coverage
       - rust-fmt
       - rust-clippy
       - rust-test
@@ -476,6 +490,7 @@ jobs:
           results=( \
             "${{ needs.error-codes.result }}" \
             "${{ needs.cross-layer.result }}" \
+            "${{ needs.sdk-coverage.result }}" \
             "${{ needs.rust-fmt.result }}" \
             "${{ needs.rust-clippy.result }}" \
             "${{ needs.rust-test.result }}" \
