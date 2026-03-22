@@ -27,3 +27,6 @@ pub mod identity;
 pub mod time;
 
 pub use identity::{DID, SigningKeyId};
+
+// Re-export Clock types at the crate root for convenience.
+pub use time::{Clock, SystemClock, TestClock};

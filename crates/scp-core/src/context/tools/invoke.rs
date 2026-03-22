@@ -466,7 +466,14 @@ mod tests {
 
     /// Creates a `ContextRoleState` with a creator that has admin (all) capabilities.
     fn test_role_state(creator_did: &str) -> ContextRoleState {
-        ContextRoleState::new("ctx-test", creator_did, test_ceiling(), vec![]).unwrap()
+        ContextRoleState::new(
+            "ctx-test",
+            creator_did,
+            test_ceiling(),
+            vec![],
+            &scp_primitives::SystemClock,
+        )
+        .unwrap()
     }
 
     /// Creates a `ContextRoleState` with an additional member that has limited
@@ -1076,7 +1083,9 @@ mod tests {
             signing_key_id: None,
             ceiling: None,
         };
-        let token = mint_ucan(&params, &custody).await.unwrap();
+        let token = mint_ucan(&params, &custody, &scp_primitives::SystemClock)
+            .await
+            .unwrap();
 
         // Build validation context.
         let resolver = InMemoryDidResolver {
@@ -1102,6 +1111,7 @@ mod tests {
             context_creator_did: &issuer_did,
             presenting_agent_did: "did:dht:z6MkMember",
             clock_skew_tolerance_secs: DEFAULT_CLOCK_SKEW_TOLERANCE_SECS,
+            clock: &scp_primitives::SystemClock,
         };
 
         // validate_tool_invocation_ucan expects tool_invoke:calculator,

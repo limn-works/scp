@@ -33,6 +33,7 @@ tokio = { workspace = true }
 thiserror = { workspace = true }
 scp-core = { path = "../../scp-core" }
 scp-media = { path = "../../scp-media" }
+scp-primitives = { path = "../../scp-primitives" }
 scp-identity = { path = "../../scp-identity", features = ["production-dht"] }
 scp-event-log = { path = "../../scp-event-log" }
 scp-ffi-common = { path = "../common" }

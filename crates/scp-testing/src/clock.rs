@@ -275,6 +275,33 @@ impl Clock for SimulatedClock {
 }
 
 // ---------------------------------------------------------------------------
+// scp_primitives::Clock compatibility
+// ---------------------------------------------------------------------------
+
+/// `SimulatedClock` implements `scp_primitives::Clock` so it can be used
+/// wherever protocol code expects `&dyn scp_primitives::Clock`.
+impl scp_primitives::Clock for SimulatedClock {
+    fn now_secs(&self) -> u64 {
+        Clock::now_secs(self)
+    }
+
+    fn now_millis(&self) -> u64 {
+        Clock::now_millis(self)
+    }
+}
+
+/// `SystemClock` implements `scp_primitives::Clock` for completeness.
+impl scp_primitives::Clock for SystemClock {
+    fn now_secs(&self) -> u64 {
+        Clock::now_secs(self)
+    }
+
+    fn now_millis(&self) -> u64 {
+        Clock::now_millis(self)
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 

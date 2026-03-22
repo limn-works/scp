@@ -1037,7 +1037,9 @@ async fn conf_023_ucan_issuance() {
         signing_key_id: None,
         ceiling: None,
     };
-    let token = mint_ucan(&params, &custody).await.expect("mint_ucan");
+    let token = mint_ucan(&params, &custody, &scp_primitives::SystemClock)
+        .await
+        .expect("mint_ucan");
 
     print_step(2, "Verify UCAN header fields");
     assert_eq!(token.header.alg, "EdDSA");
@@ -1099,6 +1101,7 @@ async fn conf_024_ucan_delegation_chain() {
             ceiling: None,
         },
         &custody,
+        &scp_primitives::SystemClock,
     )
     .await
     .expect("mint root UCAN A→B");
@@ -1123,6 +1126,7 @@ async fn conf_024_ucan_delegation_chain() {
             ceiling: None,
         },
         &custody,
+        &scp_primitives::SystemClock,
     )
     .await
     .expect("mint delegated UCAN B→C");
@@ -1173,6 +1177,7 @@ async fn conf_025_ucan_revocation() {
             ceiling: None,
         },
         &custody,
+        &scp_primitives::SystemClock,
     )
     .await
     .expect("mint UCAN");
@@ -1363,7 +1368,7 @@ fn conf_030_handle_registration_lookup() {
         target: HandleTarget::Identity { did: did.clone() },
         metadata: None,
     };
-    let result = registry.register(&params, &did).expect("register");
+    let result = registry.register(&params, &did, &scp_primitives::SystemClock);
     assert!(
         result.entry_id.is_some(),
         "registration must return entry_id"
@@ -1408,7 +1413,7 @@ fn conf_031_agent_capability_search() {
         target: HandleTarget::Identity { did: did.clone() },
         metadata: None,
     };
-    registry.register(&params, &did).expect("register");
+    registry.register(&params, &did, &scp_primitives::SystemClock);
 
     print_step(2, "Lookup finds agent");
     let result = registry.lookup(&HandleLookupParams {

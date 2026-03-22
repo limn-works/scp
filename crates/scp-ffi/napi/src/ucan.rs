@@ -272,6 +272,7 @@ pub async fn ucan_validate(
             context_creator_did: &rt.creator_did,
             presenting_agent_did: agent_did,
             clock_skew_tolerance_secs: DEFAULT_CLOCK_SKEW_TOLERANCE_SECS,
+            clock: &scp_primitives::SystemClock,
         };
 
         // Execute the full 11-step validation pipeline.
@@ -389,12 +390,14 @@ pub async fn ucan_mint(
         // Sign the token using the real InMemoryKeyCustody via scp-core.
         // napi-rs async functions already run on the tokio runtime, so we
         // can await directly without spawning a separate task.
-        let token = mint_ucan(&params, &custody.0).await.map_err(|e| {
-            napi::Error::from(ScpNapiError::Permission {
-                message: format!("UCAN minting failed: {e}"),
-                code: "SCP-PERM-3023".to_owned(),
-            })
-        })?;
+        let token = mint_ucan(&params, &custody.0, &scp_primitives::SystemClock)
+            .await
+            .map_err(|e| {
+                napi::Error::from(ScpNapiError::Permission {
+                    message: format!("UCAN minting failed: {e}"),
+                    code: "SCP-PERM-3023".to_owned(),
+                })
+            })?;
 
         let data = NapiUcanTokenData {
         token_id: token.payload.nnc.clone(),
@@ -573,7 +576,9 @@ pub async fn ucan_delegate(
             // `tokio::task::block_in_place` to avoid nesting block_on calls.
             let rt_handle = tokio::runtime::Handle::current();
             let result = tokio::task::block_in_place(|| {
-                rt_handle.block_on(async { delegate_ucan(&params, &entry.custody.0).await })
+                rt_handle.block_on(async {
+                    delegate_ucan(&params, &entry.custody.0, &scp_primitives::SystemClock).await
+                })
             });
 
             result.map_err(ScpNapiError::from)

@@ -9,6 +9,8 @@
 
 use std::collections::HashMap;
 
+use scp_primitives::Clock;
+
 use super::{
     AgentSearchParams, AgentSearchResult, ContextId, DID, DataProvenance, DiscoveryError,
     DiscoveryQuery, DiscoveryResult, DiscoveryResultEntry,
@@ -94,6 +96,7 @@ pub async fn unified_search<C: ContactCache, Q: ContextQuerier>(
     known_contexts: &[ContextId],
     cache: &C,
     querier: &Q,
+    clock: &dyn Clock,
 ) -> Result<DiscoveryResult, DiscoveryError> {
     // Step 1: Search local contact cache (instant).
     let local_entries = cache.search_local(query);
@@ -108,7 +111,7 @@ pub async fn unified_search<C: ContactCache, Q: ContextQuerier>(
 
     for (context_id, result) in remote_results {
         queried_sources.push(context_id.clone());
-        let now = crate::time::now_secs()?;
+        let now = clock.now_secs();
 
         for agent_entry in result.entries {
             all_entries.push(DiscoveryResultEntry {
@@ -682,7 +685,9 @@ mod tests {
             min_history: None,
         };
 
-        let result = unified_search(&query, &[], &cache, &querier).await.unwrap();
+        let result = unified_search(&query, &[], &cache, &querier, &scp_primitives::SystemClock)
+            .await
+            .unwrap();
 
         assert_eq!(result.entries.len(), 1);
         assert_eq!(result.entries[0].did, "did:dht:zAlice");
@@ -708,9 +713,15 @@ mod tests {
             min_history: None,
         };
 
-        let result = unified_search(&query, &["ctx-discovery-1".to_owned()], &cache, &querier)
-            .await
-            .unwrap();
+        let result = unified_search(
+            &query,
+            &["ctx-discovery-1".to_owned()],
+            &cache,
+            &querier,
+            &scp_primitives::SystemClock,
+        )
+        .await
+        .unwrap();
 
         assert_eq!(result.entries.len(), 1);
         assert_eq!(result.entries[0].did, "did:dht:zBob");
@@ -733,9 +744,15 @@ mod tests {
 
         let query = DiscoveryQuery::default();
 
-        let result = unified_search(&query, &["ctx-discovery-1".to_owned()], &cache, &querier)
-            .await
-            .unwrap();
+        let result = unified_search(
+            &query,
+            &["ctx-discovery-1".to_owned()],
+            &cache,
+            &querier,
+            &scp_primitives::SystemClock,
+        )
+        .await
+        .unwrap();
 
         assert_eq!(result.entries.len(), 2);
         let dids: Vec<&str> = result.entries.iter().map(|e| e.did.as_ref()).collect();
@@ -767,9 +784,15 @@ mod tests {
             min_history: None,
         };
 
-        let result = unified_search(&query, &["ctx-discovery-1".to_owned()], &cache, &querier)
-            .await
-            .unwrap();
+        let result = unified_search(
+            &query,
+            &["ctx-discovery-1".to_owned()],
+            &cache,
+            &querier,
+            &scp_primitives::SystemClock,
+        )
+        .await
+        .unwrap();
 
         // Should have only one entry for Alice (deduplicated).
         assert_eq!(result.entries.len(), 1);
@@ -802,6 +825,7 @@ mod tests {
             &["ctx-good".to_owned(), "ctx-bad".to_owned()],
             &cache,
             &querier,
+            &scp_primitives::SystemClock,
         )
         .await
         .unwrap();
@@ -823,7 +847,9 @@ mod tests {
 
         let query = DiscoveryQuery::default();
 
-        let result = unified_search(&query, &[], &cache, &querier).await.unwrap();
+        let result = unified_search(&query, &[], &cache, &querier, &scp_primitives::SystemClock)
+            .await
+            .unwrap();
 
         assert_eq!(result.entries.len(), 2);
     }
@@ -839,7 +865,9 @@ mod tests {
             min_history: None,
         };
 
-        let result = unified_search(&query, &[], &cache, &querier).await.unwrap();
+        let result = unified_search(&query, &[], &cache, &querier, &scp_primitives::SystemClock)
+            .await
+            .unwrap();
 
         assert!(result.entries.is_empty());
         assert!(result.sources.is_empty());
@@ -872,6 +900,7 @@ mod tests {
             &["ctx-1".to_owned(), "ctx-2".to_owned()],
             &cache,
             &querier,
+            &scp_primitives::SystemClock,
         )
         .await
         .unwrap();
@@ -898,7 +927,9 @@ mod tests {
             min_history: None,
         };
 
-        let result = unified_search(&query, &[], &cache, &querier).await.unwrap();
+        let result = unified_search(&query, &[], &cache, &querier, &scp_primitives::SystemClock)
+            .await
+            .unwrap();
 
         assert_eq!(result.entries.len(), 2);
         // Full match should rank higher.
@@ -922,9 +953,15 @@ mod tests {
 
         let query = DiscoveryQuery::default();
 
-        let result = unified_search(&query, &["ctx-1".to_owned()], &cache, &querier)
-            .await
-            .unwrap();
+        let result = unified_search(
+            &query,
+            &["ctx-1".to_owned()],
+            &cache,
+            &querier,
+            &scp_primitives::SystemClock,
+        )
+        .await
+        .unwrap();
 
         let local = result
             .entries

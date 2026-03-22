@@ -33,7 +33,7 @@ use crate::crypto::ed25519::verify_ed25519_signature;
 use crate::identity::attestation::AttestationClass;
 use scp_event_log::Ed25519Signature;
 use scp_identity::DID;
-use scp_identity::cache::Clock;
+use scp_primitives::Clock;
 
 use super::{AttestationType, TrustError};
 
@@ -873,8 +873,8 @@ impl Default for AttestationVerificationCache {
 /// See ADR-017 acceptance criteria 3-7.
 pub fn verify_attestation(
     attestation: &Attestation,
-    resolver: &impl DidPublicKeyResolver,
-    clock: &impl Clock,
+    resolver: &(impl DidPublicKeyResolver + ?Sized),
+    clock: &(impl Clock + ?Sized),
 ) -> Result<(), TrustError> {
     verify_attestation_with_revocation(attestation, resolver, clock, None)
 }
@@ -896,8 +896,8 @@ pub fn verify_attestation(
 ///   missing or invalid
 pub fn verify_attestation_with_revocation(
     attestation: &Attestation,
-    resolver: &impl DidPublicKeyResolver,
-    clock: &impl Clock,
+    resolver: &(impl DidPublicKeyResolver + ?Sized),
+    clock: &(impl Clock + ?Sized),
     revocation_checker: Option<&dyn AttestationRevocationChecker>,
 ) -> Result<(), TrustError> {
     // 1. Verify Ed25519 signature against issuer's public key.
@@ -914,7 +914,7 @@ pub fn verify_attestation_with_revocation(
     validate_evidence(attestation)?;
 
     // 3. Check expiry.
-    let now = clock.now();
+    let now = clock.now_secs();
     if let Some(expires_at) = attestation.expires_at
         && expires_at < now
     {
@@ -974,7 +974,7 @@ pub fn check_attestation_freshness(
     attestation: &Attestation,
     clock: &impl Clock,
 ) -> FreshnessStatus {
-    let now = clock.now();
+    let now = clock.now_secs();
 
     // Check expiry first.
     if let Some(expires_at) = attestation.expires_at

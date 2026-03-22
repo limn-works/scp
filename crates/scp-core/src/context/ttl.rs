@@ -51,7 +51,7 @@ use super::params::GovernanceModel;
 use super::roles::{self, ContextRoleState};
 use super::{ContextError, ContextHandle, ContextState, MemoryScope};
 use scp_identity::DID;
-use scp_identity::cache::Clock;
+use scp_primitives::Clock;
 
 // ---------------------------------------------------------------------------
 // context_id_to_bytes helper (mirrors manager.rs)
@@ -305,7 +305,7 @@ impl TtlEnforcer {
             self.created_at,
             self.ttl_policy,
             self.extended_until,
-            clock.now(),
+            clock.now_secs(),
         );
         if result.is_err() {
             self.expired = true;
@@ -351,7 +351,7 @@ impl TtlEnforcer {
             return Err(TtlError::NoTtlPolicy);
         }
         self.extended_until = Some(new_deadline);
-        if new_deadline > clock.now() {
+        if new_deadline > clock.now_secs() {
             self.expired = false;
         }
         Ok(())
@@ -367,7 +367,7 @@ impl TtlEnforcer {
                 let deadline = self
                     .extended_until
                     .unwrap_or_else(|| self.created_at.saturating_add(duration.as_secs()));
-                let now = clock.now();
+                let now = clock.now_secs();
                 if now >= deadline {
                     Some(0)
                 } else {
@@ -964,6 +964,8 @@ pub struct TtlTimer {
     pub(crate) deadline_unix_secs: Option<u64>,
     /// Optional callback invoked when TTL expiry fails after all retries.
     pub(crate) on_error: Option<TtlExpiryFailureCallback>,
+    /// Clock used for deadline computation.
+    pub(crate) clock: Arc<dyn Clock>,
 }
 
 impl TtlTimer {
@@ -975,6 +977,19 @@ impl TtlTimer {
             cancel: Arc::new(Notify::new()),
             deadline_unix_secs: None,
             on_error: None,
+            clock: Arc::new(scp_primitives::time::SystemClock),
+        }
+    }
+
+    /// Creates a new `TtlTimer` with a specific clock.
+    #[must_use]
+    pub fn with_clock(clock: Arc<dyn Clock>) -> Self {
+        Self {
+            task: None,
+            cancel: Arc::new(Notify::new()),
+            deadline_unix_secs: None,
+            on_error: None,
+            clock,
         }
     }
 
@@ -989,6 +1004,7 @@ impl TtlTimer {
             cancel: Arc::new(Notify::new()),
             deadline_unix_secs: None,
             on_error: Some(on_error),
+            clock: Arc::new(scp_primitives::time::SystemClock),
         }
     }
 
@@ -1022,10 +1038,7 @@ impl TtlTimer {
         event_log: Arc<dyn ContextEventLogProvider>,
     ) {
         // Record absolute deadline for persistence snapshots.
-        let now_secs = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
+        let now_secs = self.clock.now_secs();
         self.deadline_unix_secs = Some(now_secs.saturating_add(duration.as_secs()));
 
         let cancel = self.cancel.clone();
@@ -1078,10 +1091,7 @@ impl TtlTimer {
             return None;
         }
         let deadline = self.deadline_unix_secs?;
-        let now_secs = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
+        let now_secs = self.clock.now_secs();
         Some(deadline.saturating_sub(now_secs))
     }
 }
@@ -1370,7 +1380,14 @@ mod tests {
             Capability::ContextClose,
             Capability::RoleAssign,
         ]);
-        ContextRoleState::new(context_id, creator_did, ceiling, vec![]).unwrap()
+        ContextRoleState::new(
+            context_id,
+            creator_did,
+            ceiling,
+            vec![],
+            &scp_primitives::SystemClock,
+        )
+        .unwrap()
     }
 
     fn role_state_without_close_capability(
@@ -1378,7 +1395,14 @@ mod tests {
         creator_did: &str,
     ) -> ContextRoleState {
         let ceiling = CapabilityCeiling::new([Capability::MessagesRead, Capability::MessagesWrite]);
-        ContextRoleState::new(context_id, creator_did, ceiling, vec![]).unwrap()
+        ContextRoleState::new(
+            context_id,
+            creator_did,
+            ceiling,
+            vec![],
+            &scp_primitives::SystemClock,
+        )
+        .unwrap()
     }
 
     fn active_handle(context_id: &str, memory_scope: MemoryScope) -> ContextHandle {
@@ -2105,7 +2129,7 @@ mod tests {
         proposal.record_consent("did:key:alice".into());
         proposal.record_consent("did:key:bob".into());
         assert!(proposal.is_approved());
-        let new_deadline = proposal.compute_new_deadline(clock.now());
+        let new_deadline = proposal.compute_new_deadline(clock.now_secs());
         enforcer.apply_extension(new_deadline, &clock).unwrap();
         clock.set(5000);
         assert!(enforcer.check(&clock).is_ok());
@@ -2126,7 +2150,7 @@ mod tests {
         proposal.record_consent("did:key:admin".into());
         assert!(proposal.is_approved());
         enforcer
-            .apply_extension(proposal.compute_new_deadline(clock.now()), &clock)
+            .apply_extension(proposal.compute_new_deadline(clock.now_secs()), &clock)
             .unwrap();
         clock.set(5000);
         assert!(enforcer.check(&clock).is_ok());

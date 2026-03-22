@@ -108,7 +108,9 @@ mod tests {
             ceiling: None,
         };
 
-        let token = mint_ucan(&params, &custody).await.unwrap();
+        let token = mint_ucan(&params, &custody, &scp_primitives::SystemClock)
+            .await
+            .unwrap();
 
         // The token was minted successfully (step 5b is enforced at validation
         // time, not mint time). Verify the facts contain the key_scope claim.
@@ -158,7 +160,7 @@ mod tests {
 
         // mint_ucan rejects self-delegation without key_scope at mint time
         // (ADR-039 enforcement).
-        let result = mint_ucan(&params, &custody).await;
+        let result = mint_ucan(&params, &custody, &scp_primitives::SystemClock).await;
         assert!(
             result.is_err(),
             "self-delegation (iss == aud) without key_scope must be rejected"
@@ -208,7 +210,9 @@ mod tests {
             ceiling: None,
         };
 
-        let token = mint_ucan(&params, &custody_agent).await.unwrap();
+        let token = mint_ucan(&params, &custody_agent, &scp_primitives::SystemClock)
+            .await
+            .unwrap();
 
         // Validate: the root issuer (agent_did) != context creator (human_did).
         let resolver = InMemoryDidResolver {
@@ -236,6 +240,7 @@ mod tests {
             context_creator_did: &human_did,
             presenting_agent_did: &human_did,
             clock_skew_tolerance_secs: DEFAULT_CLOCK_SKEW_TOLERANCE_SECS,
+            clock: &scp_primitives::SystemClock,
         };
 
         let result = crate::crypto::ucan::validate::validate_ucan(&token, &required_cap, &mut ctx);

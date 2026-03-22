@@ -14,7 +14,6 @@
 //! See ADR-003 in `.docs/adrs/phase-1.md` for the full design.
 
 use std::collections::HashMap;
-use std::sync::Arc;
 
 use tokio::sync::Mutex;
 
@@ -78,75 +77,10 @@ struct CacheEntry {
     active: bool,
 }
 
-/// Provides a time source for the cache, enabling deterministic testing.
-///
-/// Production code uses [`SystemClock`]. Tests use [`TestClock`] to control
-/// time progression without waiting for real time to pass.
-pub trait Clock: Send + Sync {
-    /// Returns the current time as a Unix timestamp in seconds.
-    fn now(&self) -> u64;
-}
-
-/// Clock implementation that uses the real system clock.
-#[derive(Debug, Clone, Default)]
-pub struct SystemClock;
-
-impl Clock for SystemClock {
-    #[allow(clippy::expect_used)]
-    fn now(&self) -> u64 {
-        // The Clock trait returns u64 (not Result), so we cannot propagate the
-        // error. A system clock before the Unix epoch is an unrecoverable
-        // environment failure — panicking is the correct behaviour here, as
-        // silently returning 0 would bypass UCAN expiry and nonce freshness
-        // checks.
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("system clock is unavailable or before Unix epoch")
-            .as_secs()
-    }
-}
-
-/// Clock implementation for tests that allows manual time control.
-#[derive(Debug)]
-pub struct TestClock {
-    now: std::sync::atomic::AtomicU64,
-}
-
-impl TestClock {
-    /// Creates a new test clock starting at the given Unix timestamp.
-    #[must_use]
-    pub const fn new(start: u64) -> Self {
-        Self {
-            now: std::sync::atomic::AtomicU64::new(start),
-        }
-    }
-
-    /// Advances the clock by the given number of seconds.
-    pub fn advance(&self, secs: u64) {
-        self.now
-            .fetch_add(secs, std::sync::atomic::Ordering::Relaxed);
-    }
-
-    /// Sets the clock to a specific timestamp.
-    pub fn set(&self, timestamp: u64) {
-        self.now
-            .store(timestamp, std::sync::atomic::Ordering::Relaxed);
-    }
-}
-
-impl Clock for TestClock {
-    fn now(&self) -> u64 {
-        self.now.load(std::sync::atomic::Ordering::Relaxed)
-    }
-}
-
-/// Blanket implementation for `Arc<T>` so clocks can be shared between the
-/// cache and test code that needs to advance time.
-impl<T: Clock> Clock for Arc<T> {
-    fn now(&self) -> u64 {
-        (**self).now()
-    }
-}
+// Re-export the canonical Clock types from scp-primitives so that existing
+// `use scp_identity::cache::{Clock, SystemClock, TestClock}` imports continue
+// to compile (soft migration).
+pub use scp_primitives::time::{Clock, SystemClock, TestClock};
 
 /// TTL-based cache for resolved DID documents.
 ///
@@ -208,7 +142,7 @@ impl<C: Clock> DidCache<C> {
         let entry = entries.get(did)?.clone();
         drop(entries);
 
-        let now = self.clock.now();
+        let now = self.clock.now_secs();
         let age = now.saturating_sub(entry.last_verified);
 
         // Check TTL: if the entry has exceeded its refresh interval, it should
@@ -252,7 +186,7 @@ impl<C: Clock> DidCache<C> {
     /// to set a DID as an active contact.
     pub async fn insert(&self, did: &str, document: DidDocument, sequence: u64) {
         let mut entries = self.entries.lock().await;
-        let now = self.clock.now();
+        let now = self.clock.now_secs();
 
         // If entry exists with a higher sequence, reject the update. If the
         // sequence matches, refresh `last_verified` (the document was just
@@ -308,7 +242,7 @@ impl<C: Clock> DidCache<C> {
             return true;
         };
 
-        let age = self.clock.now().saturating_sub(entry.last_verified);
+        let age = self.clock.now_secs().saturating_sub(entry.last_verified);
         let ttl = if entry.active {
             ACTIVE_REFRESH_SECS
         } else {
@@ -348,6 +282,8 @@ impl<C: Clock> DidCache<C> {
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
+    use std::sync::Arc;
+
     use super::*;
 
     fn make_document(did: &str) -> DidDocument {

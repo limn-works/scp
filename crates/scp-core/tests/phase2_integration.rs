@@ -359,9 +359,14 @@ async fn phase2_end_to_end_integration() {
     assert_eq!(context.state().await, ContextState::Active);
 
     // Initialize role state with Alice as admin.
-    let mut role_state =
-        ContextRoleState::new(context_id, alice_did.to_string(), ceiling.clone(), vec![])
-            .expect("role state creation");
+    let mut role_state = ContextRoleState::new(
+        context_id,
+        alice_did.to_string(),
+        ceiling.clone(),
+        vec![],
+        &scp_primitives::SystemClock,
+    )
+    .expect("role state creation");
 
     // Register the calculator tool.
     let mut tool_registry = ToolRegistry::new();
@@ -486,8 +491,14 @@ async fn phase2_end_to_end_integration() {
     //         messages:read, messages:write, tool_invoke_all.
     // -----------------------------------------------------------------------
 
-    let bob_tokens = assign_role(&mut role_state, &bob_did, "member", &alice_did)
-        .expect("assign member role to Bob");
+    let bob_tokens = assign_role(
+        &mut role_state,
+        &bob_did,
+        "member",
+        &alice_did,
+        &scp_primitives::SystemClock,
+    )
+    .expect("assign member role to Bob");
 
     // Verify Bob received UCAN tokens for the member capabilities.
     assert!(
@@ -637,7 +648,13 @@ async fn phase2_end_to_end_integration() {
     // -----------------------------------------------------------------------
 
     // Bob tries to assign the "observer" role to himself.
-    let role_assign_result = assign_role(&mut role_state, &bob_did, "observer", &bob_did);
+    let role_assign_result = assign_role(
+        &mut role_state,
+        &bob_did,
+        "observer",
+        &bob_did,
+        &scp_primitives::SystemClock,
+    );
 
     assert!(
         role_assign_result.is_err(),

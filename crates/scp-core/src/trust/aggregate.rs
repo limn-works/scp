@@ -23,7 +23,7 @@
 use std::collections::HashMap;
 
 use scp_event_log::Event;
-use scp_identity::cache::Clock;
+use scp_primitives::Clock;
 
 use super::attestation::{
     Attestation, AttestorInfo, DidPublicKeyResolver, FreshnessStatus, ThresholdRequirement,
@@ -209,7 +209,7 @@ impl<S: TrustProtocolRepository> AttestationCache<S> {
         let cached = self
             .store
             .get_cached_attestations(context_id, subject_did)?;
-        let now = clock.now();
+        let now = clock.now_secs();
         let mut result = Vec::new();
 
         for entry in cached {
@@ -253,7 +253,7 @@ impl<S: TrustProtocolRepository> AttestationCache<S> {
 
         let entry = CachedAttestation {
             attestation: attestation.clone(),
-            verified_at: clock.now(),
+            verified_at: clock.now_secs(),
             ttl_secs: self.ttl_secs,
         };
         self.store.store_cached_attestation(context_id, entry)?;
@@ -345,7 +345,7 @@ where
         ctx.subject_did,
         ctx.context_id,
         ctx.merkle_root,
-        ctx.clock.now(),
+        ctx.clock.now_secs(),
     )?;
 
     // 2. Collect and verify attestations from cache.

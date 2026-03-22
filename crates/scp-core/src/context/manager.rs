@@ -55,6 +55,7 @@ use crate::crypto::ucan::validate::{
 use crate::economy::budget::MemberBudgetTracker;
 use crate::economy::types::EconomicPolicy;
 use scp_identity::DID;
+use scp_primitives::Clock;
 use tracing::instrument;
 use zeroize::Zeroizing;
 
@@ -1099,6 +1100,7 @@ fn mint_governance_tokens(
     context_id: &str,
     creator_did: &DID,
     engine: &dyn GovernanceEngine,
+    clock: &dyn Clock,
 ) -> Vec<super::roles::UcanToken> {
     use super::roles::{Capability, UcanAttestation, UcanToken};
 
@@ -1126,8 +1128,7 @@ fn mint_governance_tokens(
             // static nonce (acceptable for governance tokens minted at creation
             // time — replay prevention is handled by the engine's proposal-ID
             // scheme).
-            let nonce = crate::crypto::ucan::nonce::generate_nonce()
-                .unwrap_or_else(|_| "gov-init-0".to_owned());
+            let nonce = crate::crypto::ucan::nonce::generate_nonce(clock);
             tokens.push(UcanToken {
                 iss: creator_did.to_string(),
                 aud: voter.to_string(),
@@ -1176,6 +1177,7 @@ pub struct ContextManagerBuilder {
     event_log: Option<Box<dyn ContextEventLogProvider>>,
     persistence: Option<Box<dyn ContextPersistence>>,
     key_resolver: Option<KeyResolver>,
+    clock: Option<Arc<dyn Clock>>,
 }
 
 impl ContextManagerBuilder {
@@ -1188,6 +1190,7 @@ impl ContextManagerBuilder {
             event_log: None,
             persistence: None,
             key_resolver: None,
+            clock: None,
         }
     }
 
@@ -1236,6 +1239,15 @@ impl ContextManagerBuilder {
         self
     }
 
+    /// Sets the clock for time-dependent operations.
+    ///
+    /// If not called, defaults to [`scp_primitives::SystemClock`].
+    #[must_use]
+    pub fn clock(mut self, clock: Arc<dyn Clock>) -> Self {
+        self.clock = Some(clock);
+        self
+    }
+
     /// Auto-wires persistence and event log from a single `EncryptedStorage` impl.
     ///
     /// Constructs a [`ProtocolRepository`](crate::store::ProtocolRepository), then
@@ -1281,7 +1293,11 @@ impl ContextManagerBuilder {
             .key_resolver
             .unwrap_or_else(|| Arc::new(|_: &DID| None));
 
-        Ok(match self.persistence {
+        let clock = self
+            .clock
+            .unwrap_or_else(|| Arc::new(scp_primitives::SystemClock));
+
+        let mut manager = match self.persistence {
             Some(persistence) => ContextManager::with_persistence(
                 crypto,
                 transport,
@@ -1290,7 +1306,9 @@ impl ContextManagerBuilder {
                 key_resolver,
             ),
             None => ContextManager::new(crypto, transport, event_log, key_resolver),
-        })
+        };
+        manager.clock = clock;
+        Ok(manager)
     }
 }
 
@@ -1367,6 +1385,11 @@ pub struct ContextManager {
     /// vote signature verification (spec §5.9, ADR-031). Passed through to
     /// governance engines at creation and restoration time.
     key_resolver: KeyResolver,
+    /// Clock for time-dependent operations.
+    ///
+    /// Injected via constructors / builder to allow test clock injection.
+    /// Defaults to [`scp_primitives::SystemClock`].
+    clock: Arc<dyn Clock>,
 }
 
 // Nursery lint — false-positives on async functions holding tokio::sync::MutexGuard
@@ -1399,6 +1422,7 @@ impl ContextManager {
             local_dids: RwLock::new(HashSet::new()),
             contexts: Arc::new(Mutex::new(HashMap::new())),
             key_resolver,
+            clock: Arc::new(scp_primitives::SystemClock),
         }
     }
 
@@ -1432,6 +1456,7 @@ impl ContextManager {
             local_dids: RwLock::new(HashSet::new()),
             contexts: Arc::new(Mutex::new(HashMap::new())),
             key_resolver,
+            clock: Arc::new(scp_primitives::SystemClock),
         }
     }
 
@@ -1739,11 +1764,11 @@ impl ContextManager {
             membership: ctx_snapshot.membership,
             role_state: ctx_snapshot.role_state,
             receive_buffer: ReceiveBuffer::new(),
-            ttl_timer: TtlTimer::new(),
+            ttl_timer: TtlTimer::with_clock(Arc::clone(&self.clock)),
             ttl_extension: None,
             broadcast_context: broadcast_ctx,
             executed_proposals: {
-                let now = crate::time::now_secs().unwrap_or(0);
+                let now = self.clock.now_secs();
                 ctx_snapshot
                     .executed_proposals
                     .into_iter()
@@ -2161,6 +2186,7 @@ impl ContextManager {
             mls_state,
             exporter_did,
             super::export_import::ExportScope::Full,
+            &*self.clock,
         )
     }
 
@@ -2263,11 +2289,11 @@ impl ContextManager {
             membership: export.snapshot.membership,
             role_state: export.snapshot.role_state,
             receive_buffer: ReceiveBuffer::new(),
-            ttl_timer: TtlTimer::new(),
+            ttl_timer: TtlTimer::with_clock(Arc::clone(&self.clock)),
             ttl_extension: None,
             broadcast_context: None,
             executed_proposals: {
-                let now = crate::time::now_secs().unwrap_or(0);
+                let now = self.clock.now_secs();
                 export
                     .snapshot
                     .executed_proposals
@@ -2410,8 +2436,9 @@ impl ContextManager {
         .await?;
 
         let ceiling = CapabilityCeiling::new(params.ceiling.iter().cloned());
-        let role_state = ContextRoleState::new(&context_id, &*creator_did, ceiling, vec![])
-            .map_err(|e| ContextCreationError::CreationFailed(e.to_string()))?;
+        let role_state =
+            ContextRoleState::new(&context_id, &*creator_did, ceiling, vec![], &*self.clock)
+                .map_err(|e| ContextCreationError::CreationFailed(e.to_string()))?;
         let mut membership = MembershipState::new();
         let creator_tokens = role_state
             .assignments
@@ -2435,7 +2462,7 @@ impl ContextManager {
             membership,
             role_state,
             receive_buffer: ReceiveBuffer::new(),
-            ttl_timer: TtlTimer::new(),
+            ttl_timer: TtlTimer::with_clock(Arc::clone(&self.clock)),
             ttl_extension: None,
             broadcast_context,
             executed_proposals: HashMap::new(),
@@ -2573,8 +2600,9 @@ impl ContextManager {
         let ceiling = CapabilityCeiling::new(params.ceiling.iter().cloned());
 
         // Initialize role state with the creator as admin.
-        let role_state = ContextRoleState::new(&context_id, &*creator_did, ceiling, vec![])
-            .map_err(|e| ContextCreationError::CreationFailed(e.to_string()))?;
+        let role_state =
+            ContextRoleState::new(&context_id, &*creator_did, ceiling, vec![], &*self.clock)
+                .map_err(|e| ContextCreationError::CreationFailed(e.to_string()))?;
 
         // Initialize membership with the creator.
         let mut membership = MembershipState::new();
@@ -2673,8 +2701,12 @@ impl ContextManager {
 
         // Mint GovernancePropose and GovernanceVote UCAN tokens for designated
         // voters per ADR-031 §6 and store them in role_state.
-        let governance_tokens =
-            mint_governance_tokens(context_id, creator_did, governance_engine.as_ref());
+        let governance_tokens = mint_governance_tokens(
+            context_id,
+            creator_did,
+            governance_engine.as_ref(),
+            &*self.clock,
+        );
 
         let mut role_state = role_state;
         for token in &governance_tokens {
@@ -2696,7 +2728,7 @@ impl ContextManager {
             membership,
             role_state,
             receive_buffer: ReceiveBuffer::new(),
-            ttl_timer: TtlTimer::new(),
+            ttl_timer: TtlTimer::with_clock(Arc::clone(&self.clock)),
             ttl_extension: None,
             broadcast_context,
             executed_proposals: HashMap::new(),
@@ -2827,9 +2859,14 @@ impl ContextManager {
 
             // Assign default "member" role.
             let creator_did = ctx.role_state.creator_did.clone();
-            let tokens =
-                roles::assign_role(&mut ctx.role_state, &member_did, "member", &creator_did)
-                    .map_err(|e| ContextError::MembershipFailed(e.to_string()))?;
+            let tokens = roles::assign_role(
+                &mut ctx.role_state,
+                &member_did,
+                "member",
+                &creator_did,
+                &*self.clock,
+            )
+            .map_err(|e| ContextError::MembershipFailed(e.to_string()))?;
 
             // Add to membership tracking.
             ctx.membership
@@ -3058,8 +3095,7 @@ impl ContextManager {
                         "signing key required for broadcast publish".to_owned(),
                     )
                 })?;
-                let timestamp = crate::time::now_millis()
-                    .map_err(|e| ContextError::CryptoFailed(format!("clock error: {e}")))?;
+                let timestamp = self.clock.now_millis();
 
                 // Compute signing payload and sign externally, matching the
                 // pattern used by publish_broadcast (custody-based signing).
@@ -3676,8 +3712,7 @@ impl ContextManager {
                 .as_mut()
                 .ok_or_else(|| ContextError::MembershipFailed("not a broadcast context".into()))?;
 
-            let timestamp = crate::time::now_millis()
-                .map_err(|e| ContextError::CryptoFailed(format!("clock error: {e}")))?;
+            let timestamp = self.clock.now_millis();
 
             // Compute the signing payload externally so we can sign via
             // key custody (async) while keeping seal_broadcast synchronous.
@@ -3967,7 +4002,7 @@ impl ContextManager {
                         "governance proposal has already been executed".into(),
                     ));
                 }
-                let now = crate::time::now_secs().unwrap_or(0);
+                let now = self.clock.now_secs();
                 // Evict entries older than the TTL before inserting.
                 ctx.executed_proposals
                     .retain(|_, ts| now.saturating_sub(*ts) < EXECUTED_PROPOSALS_TTL_SECS);
@@ -4036,10 +4071,7 @@ impl ContextManager {
                 // auditable link between the governance proposal and the MLS
                 // epoch transition.
                 if let Some(operation) = mls_op {
-                    let timestamp = std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .unwrap_or_default()
-                        .as_secs();
+                    let timestamp = self.clock.now_secs();
                     // Best-effort: log but do not fail if recording fails
                     // (epoch_after > epoch_before is guaranteed by saturating_add).
                     let _ = ctx.epoch_coordinator.record_coordination(
@@ -4463,7 +4495,7 @@ impl ContextManager {
 
     /// Builds a [`GovernanceContext`] snapshot for the governance engine from
     /// the current per-context state.
-    fn build_governance_context(ctx: &PerContextState) -> GovernanceContext {
+    fn build_governance_context(ctx: &PerContextState, clock: &dyn Clock) -> GovernanceContext {
         let members: Vec<(DID, String)> = ctx
             .membership
             .members()
@@ -4480,10 +4512,7 @@ impl ContextManager {
             members,
             admin_dids,
             current_epoch: Some(ctx.mls_epoch),
-            now: std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_secs(),
+            now: clock.now_secs(),
         }
     }
 
@@ -4608,7 +4637,7 @@ impl ContextManager {
                 ));
             }
 
-            let gov_ctx = Self::build_governance_context(ctx);
+            let gov_ctx = Self::build_governance_context(ctx, &*self.clock);
 
             let (proposal, events) = ctx
                 .governance_engine
@@ -4738,7 +4767,7 @@ impl ContextManager {
                 ));
             }
 
-            let gov_ctx = Self::build_governance_context(ctx);
+            let gov_ctx = Self::build_governance_context(ctx, &*self.clock);
 
             let (status, events) = if approve {
                 ctx.governance_engine
@@ -5052,7 +5081,7 @@ impl ContextManager {
                 .ok_or_else(|| ContextError::ContextNotRegistered(context_id.to_owned()))?;
             require_active(&ctx.handle)?;
 
-            let gov_ctx = Self::build_governance_context(ctx);
+            let gov_ctx = Self::build_governance_context(ctx, &*self.clock);
             ctx.governance_engine
                 .withdraw_vote(proposal_id, voter_did, &gov_ctx)
                 .map_err(|e| ContextError::PermissionDenied(e.to_string()))?
@@ -5350,8 +5379,9 @@ impl ContextManager {
             // Add to role state.
             ctx.role_state.members.insert(did.to_string());
             let creator_did = ctx.role_state.creator_did.clone();
-            let tokens = roles::assign_role(&mut ctx.role_state, did, role, &creator_did)
-                .map_err(|e| ContextError::MembershipFailed(e.to_string()))?;
+            let tokens =
+                roles::assign_role(&mut ctx.role_state, did, role, &creator_did, &*self.clock)
+                    .map_err(|e| ContextError::MembershipFailed(e.to_string()))?;
 
             // Add to membership tracking.
             ctx.membership
@@ -5458,8 +5488,14 @@ impl ContextManager {
             // Re-assign via the role engine (validates role exists, updates
             // assignments and member_capabilities).
             let creator_did = ctx.role_state.creator_did.clone();
-            let tokens = roles::assign_role(&mut ctx.role_state, did, new_role, &creator_did)
-                .map_err(|e| ContextError::MembershipFailed(e.to_string()))?;
+            let tokens = roles::assign_role(
+                &mut ctx.role_state,
+                did,
+                new_role,
+                &creator_did,
+                &*self.clock,
+            )
+            .map_err(|e| ContextError::MembershipFailed(e.to_string()))?;
 
             // Update membership tracking with new role.
             if let Some(info) = ctx.membership.get_mut(did) {
@@ -5592,8 +5628,7 @@ impl ContextManager {
 
             // M7: Instead of applying immediately, enter notification period.
             // Members are notified and may leave before the expansion takes effect.
-            let now = crate::time::now_secs()
-                .map_err(|e| ContextError::PermissionDenied(format!("clock error: {e}")))?;
+            let now = self.clock.now_secs();
             let effective_at = now + CEILING_CHANGE_NOTIFICATION_PERIOD_SECS;
             ctx.pending_ceiling_modification = Some(PendingCeilingModification {
                 new_capabilities: new_ceiling.to_vec(),
@@ -5798,10 +5833,7 @@ impl ContextManager {
             // for the replacement timer task.
             let remaining_secs = ctx.ttl_timer.deadline_unix_secs.as_mut().map(|deadline| {
                 *deadline = deadline.saturating_add(additional_secs);
-                let now = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map(|d| d.as_secs())
-                    .unwrap_or(0);
+                let now = self.clock.now_secs();
                 deadline.saturating_sub(now)
             });
 
@@ -5877,15 +5909,27 @@ impl ContextManager {
                 .map(|(did, _)| did.clone())
                 .collect();
             for admin_did in &current_admins {
-                roles::assign_role(&mut ctx.role_state, admin_did, "member", &creator_did)
-                    .map_err(|e| ContextError::MembershipFailed(e.to_string()))?;
+                roles::assign_role(
+                    &mut ctx.role_state,
+                    admin_did,
+                    "member",
+                    &creator_did,
+                    &*self.clock,
+                )
+                .map_err(|e| ContextError::MembershipFailed(e.to_string()))?;
                 if let Some(info) = ctx.membership.get_mut(admin_did) {
                     "member".clone_into(&mut info.role_name);
                 }
             }
             // Promote new admin.
-            let tokens = roles::assign_role(&mut ctx.role_state, new_admin, "admin", &creator_did)
-                .map_err(|e| ContextError::MembershipFailed(e.to_string()))?;
+            let tokens = roles::assign_role(
+                &mut ctx.role_state,
+                new_admin,
+                "admin",
+                &creator_did,
+                &*self.clock,
+            )
+            .map_err(|e| ContextError::MembershipFailed(e.to_string()))?;
             if let Some(info) = ctx.membership.get_mut(new_admin) {
                 "admin".clone_into(&mut info.role_name);
                 info.tokens = tokens;
@@ -6055,8 +6099,7 @@ impl ContextManager {
                     with: format!("scp:ctx:{context_id}/{cap}"),
                     can: "invoke".to_owned(),
                 };
-                let nonce = crate::crypto::ucan::nonce::generate_nonce()
-                    .unwrap_or_else(|_| "gov-signer-add-0".to_owned());
+                let nonce = crate::crypto::ucan::nonce::generate_nonce(&*self.clock);
                 let token = roles::UcanToken {
                     iss: creator_did.clone(),
                     aud: did.to_string(),
@@ -6375,11 +6418,11 @@ impl ContextManager {
                     };
                     // Only invalidate the loser — the winner remains eligible
                     // for normal execution.
-                    let now = crate::time::now_secs().unwrap_or(0);
+                    let now = self.clock.now_secs();
                     ctx.executed_proposals.insert(*loser, now);
                 }
                 super::governance::ConflictResolution::InvalidateBoth => {
-                    let now = crate::time::now_secs().unwrap_or(0);
+                    let now = self.clock.now_secs();
                     ctx.executed_proposals.insert(*proposal_a, now);
                     ctx.executed_proposals.insert(*proposal_b, now);
                 }
@@ -6848,8 +6891,7 @@ impl ContextManager {
             }
 
             // §19.3: Stage the change with a 24-hour notification period.
-            let now = crate::time::now_secs()
-                .map_err(|e| ContextError::PermissionDenied(format!("clock error: {e}")))?;
+            let now = self.clock.now_secs();
             let effective_at = now + ECONOMIC_POLICY_NOTIFICATION_PERIOD_SECS;
             ctx.pending_economic_policy_change = Some(PendingEconomicPolicyChange {
                 new_policy: policy.clone(),
@@ -7081,10 +7123,7 @@ impl ContextManager {
             hex::encode(hasher.finalize())
         };
 
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
+        let now = self.clock.now_secs();
         let grace_period_end = now.saturating_add(grace_period_secs);
 
         // Prepare destination params with migration_source metadata
@@ -7302,10 +7341,7 @@ impl ContextManager {
     pub async fn tombstone_migrated_context(&self, context_id: &str) -> Result<(), ContextError> {
         let context_id_bytes = context_id_to_bytes(context_id);
 
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
+        let now = self.clock.now_secs();
 
         // State transition and mutation happen under the same lock to prevent
         // a race where migration_state is cleared but the transition to
@@ -7938,6 +7974,7 @@ impl ContextManager {
     /// cancelled via [`GovernanceTimeoutTask::cancel()`].
     async fn start_governance_timeout_task(&self, context_id: &str) {
         let contexts = Arc::clone(&self.contexts);
+        let clock = Arc::clone(&self.clock);
         let ctx_id = context_id.to_owned();
 
         let mut contexts_guard = self.contexts.lock().await;
@@ -7947,8 +7984,10 @@ impl ContextManager {
 
         ctx.governance_timeout_task.start({
             let ctx_id = ctx_id.clone();
+            let clock = Arc::clone(&clock);
             move || {
                 let contexts = Arc::clone(&contexts);
+                let clock = Arc::clone(&clock);
                 let ctx_id = ctx_id.clone();
                 async move {
                     // Phase 1: Acquire lock, snapshot data, process proposals,
@@ -7966,7 +8005,7 @@ impl ContextManager {
                             return false; // No longer active — stop the loop.
                         }
 
-                        let gov_ctx = Self::build_governance_context(ctx);
+                        let gov_ctx = Self::build_governance_context(ctx, &*clock);
                         // Detect departed members since last tick.
                         let current_members: HashSet<DID> =
                             ctx.membership.members().map(|m| m.did.clone()).collect();
@@ -8070,8 +8109,7 @@ impl ContextManager {
         attestation: &crate::trust::Attestation,
     ) -> Result<(), ContextError> {
         let resolver = crate::trust::IdentityDidPublicKeyResolver;
-        let clock = scp_identity::cache::SystemClock;
-        crate::trust::verify_attestation(attestation, &resolver, &clock).map_err(|e| {
+        crate::trust::verify_attestation(attestation, &resolver, &*self.clock).map_err(|e| {
             ContextError::PermissionDenied(format!("attestation verification failed: {e}"))
         })
     }
@@ -8126,12 +8164,11 @@ impl ContextManager {
         context_id: Option<String>,
     ) -> Result<crate::trust::ChallengeVerification, ContextError> {
         let resolver = crate::trust::IdentityDidPublicKeyResolver;
-        let clock = scp_identity::cache::SystemClock;
         crate::trust::verify_challenge_response(
             request,
             response,
             &resolver,
-            &clock,
+            &*self.clock,
             verifier_signer,
             context_id,
         )
@@ -8167,8 +8204,6 @@ impl ContextManager {
         creator_did: &DID,
         creator_signature: Vec<u8>,
     ) -> Result<ContextCheckpoint, ContextError> {
-        use std::time::{SystemTime, UNIX_EPOCH};
-
         let contexts = self.contexts.lock().await;
         let ctx = contexts
             .get(context_id)
@@ -8185,10 +8220,7 @@ impl ContextManager {
         // Capture pruning policy before dropping the lock.
         let pruning_policy = ctx.pruning_policy.clone();
 
-        let created_at = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
+        let created_at = self.clock.now_secs();
 
         let checkpoint = ContextCheckpoint {
             checkpoint_seq,
@@ -8293,13 +8325,9 @@ impl ContextManager {
         new_proposal: &GovernanceProposal,
     ) -> Vec<GovernanceEvent> {
         use super::governance::{GovernanceEvent, actions_conflict};
-        use std::time::{SystemTime, UNIX_EPOCH};
 
         let mut events = Vec::new();
-        let current_timestamp = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
+        let current_timestamp = self.clock.now_secs();
 
         // Check for conflicts with existing approved proposals
         let mut conflicts = Vec::new();
@@ -8383,14 +8411,10 @@ impl ContextManager {
     #[allow(clippy::unused_self)] // method for API consistency within ContextManager
     fn check_and_resolve_expired_freezes(&self, ctx: &mut PerContextState) -> Vec<GovernanceEvent> {
         use super::governance::GovernanceEvent;
-        use std::time::{SystemTime, UNIX_EPOCH};
 
         const FREEZE_TIMEOUT_SECONDS: u64 = 48 * 60 * 60; // 48 hours
 
-        let current_timestamp = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
+        let current_timestamp = self.clock.now_secs();
 
         if let Some((proposal_a, proposal_b, freeze_start)) = ctx.governance_freeze
             && current_timestamp.saturating_sub(freeze_start) >= FREEZE_TIMEOUT_SECONDS
@@ -9339,6 +9363,7 @@ mod tests {
                 "did:key:observer",
                 "observer",
                 "did:key:creator",
+                &scp_primitives::SystemClock,
             )
             .unwrap();
             // Update the membership tracking to reflect the new role.
@@ -12915,6 +12940,7 @@ mod tests {
 
     /// SCP-PERSIST-024: persist-drop-restore roundtrip verifies all fields.
     #[tokio::test]
+    #[allow(clippy::too_many_lines)]
     async fn persist_drop_restore_roundtrip() {
         use crate::context::roles::{ContextRoleState, default_ceiling};
 
@@ -12951,8 +12977,14 @@ mod tests {
 
         // Seed the mock persistence with a full snapshot.
         let ceiling = default_ceiling();
-        let role_state =
-            ContextRoleState::new("persist-ctx", "did:key:creator", ceiling, vec![]).unwrap();
+        let role_state = ContextRoleState::new(
+            "persist-ctx",
+            "did:key:creator",
+            ceiling,
+            vec![],
+            &scp_primitives::SystemClock,
+        )
+        .unwrap();
         let mut membership = MembershipState::new();
         membership.add_member("did:key:creator".into(), "admin".into(), vec![]);
         let mut executed = HashSet::new();
@@ -13053,8 +13085,14 @@ mod tests {
         };
 
         let ceiling = default_ceiling();
-        let role_state =
-            ContextRoleState::new("replay-ctx", "did:key:alice", ceiling, vec![]).unwrap();
+        let role_state = ContextRoleState::new(
+            "replay-ctx",
+            "did:key:alice",
+            ceiling,
+            vec![],
+            &scp_primitives::SystemClock,
+        )
+        .unwrap();
         let mut membership = MembershipState::new();
         membership.add_member("did:key:alice".into(), "admin".into(), vec![]);
 
@@ -13151,8 +13189,14 @@ mod tests {
         };
 
         let ceiling = default_ceiling();
-        let role_state =
-            ContextRoleState::new("ttl-ctx", "did:key:creator", ceiling, vec![]).unwrap();
+        let role_state = ContextRoleState::new(
+            "ttl-ctx",
+            "did:key:creator",
+            ceiling,
+            vec![],
+            &scp_primitives::SystemClock,
+        )
+        .unwrap();
         let mut membership = MembershipState::new();
         membership.add_member("did:key:creator".into(), "admin".into(), vec![]);
 
@@ -13223,8 +13267,14 @@ mod tests {
         for ctx_name in ["ctx-a", "ctx-b"] {
             let params = ContextParams::default();
             let ceiling = default_ceiling();
-            let role_state =
-                ContextRoleState::new(ctx_name, "did:key:creator", ceiling, vec![]).unwrap();
+            let role_state = ContextRoleState::new(
+                ctx_name,
+                "did:key:creator",
+                ceiling,
+                vec![],
+                &scp_primitives::SystemClock,
+            )
+            .unwrap();
             let mut membership = MembershipState::new();
             membership.add_member("did:key:creator".into(), "admin".into(), vec![]);
 
@@ -13295,8 +13345,14 @@ mod tests {
         };
 
         let ceiling = default_ceiling();
-        let role_state =
-            ContextRoleState::new("dup-ctx", "did:key:author1", ceiling, vec![]).unwrap();
+        let role_state = ContextRoleState::new(
+            "dup-ctx",
+            "did:key:author1",
+            ceiling,
+            vec![],
+            &scp_primitives::SystemClock,
+        )
+        .unwrap();
         let membership = MembershipState::new();
 
         let snapshot = super::ContextSnapshot {
@@ -13383,8 +13439,14 @@ mod tests {
         };
 
         let ceiling = default_ceiling();
-        let role_state =
-            ContextRoleState::new("grace-incon-ctx", "did:key:author1", ceiling, vec![]).unwrap();
+        let role_state = ContextRoleState::new(
+            "grace-incon-ctx",
+            "did:key:author1",
+            ceiling,
+            vec![],
+            &scp_primitives::SystemClock,
+        )
+        .unwrap();
         let membership = MembershipState::new();
 
         // Grace entry referencing epoch 5, but MLS epoch is only 3.
@@ -13478,8 +13540,14 @@ mod tests {
         };
 
         let ceiling = default_ceiling();
-        let role_state =
-            ContextRoleState::new("grace-ok-ctx", "did:key:author1", ceiling, vec![]).unwrap();
+        let role_state = ContextRoleState::new(
+            "grace-ok-ctx",
+            "did:key:author1",
+            ceiling,
+            vec![],
+            &scp_primitives::SystemClock,
+        )
+        .unwrap();
         let membership = MembershipState::new();
 
         // Grace entry epoch 2, MLS epoch 3 → consistent (epoch <= mls_epoch).
@@ -13570,7 +13638,14 @@ mod tests {
     ) -> super::ContextSnapshot {
         use crate::context::roles::{ContextRoleState, default_ceiling};
         let ceiling = default_ceiling();
-        let role_state = ContextRoleState::new(ctx_id, "did:key:a1", ceiling, vec![]).unwrap();
+        let role_state = ContextRoleState::new(
+            ctx_id,
+            "did:key:a1",
+            ceiling,
+            vec![],
+            &scp_primitives::SystemClock,
+        )
+        .unwrap();
         let grace = bad_grace_epoch
             .map(|e| {
                 vec![crate::crypto::mls::epoch_grace::GraceEntry {
@@ -14794,9 +14869,14 @@ mod tests {
             ..ContextParams::default()
         };
 
-        let role_state =
-            ContextRoleState::new("ctx-snap", "did:dht:z6MkAlice", default_ceiling(), vec![])
-                .unwrap();
+        let role_state = ContextRoleState::new(
+            "ctx-snap",
+            "did:dht:z6MkAlice",
+            default_ceiling(),
+            vec![],
+            &scp_primitives::SystemClock,
+        )
+        .unwrap();
 
         let snapshot = super::ContextSnapshot {
             context_id: "ctx-snap".to_owned(),
@@ -15589,7 +15669,12 @@ mod tests {
         };
         let engine =
             build_governance_engine(config, vec![creator.clone()], noop_key_resolver()).unwrap();
-        let tokens = mint_governance_tokens("ctx-ucan-test", &creator, engine.as_ref());
+        let tokens = mint_governance_tokens(
+            "ctx-ucan-test",
+            &creator,
+            engine.as_ref(),
+            &scp_primitives::SystemClock,
+        );
 
         // 3 signers x 2 capabilities (GovernancePropose + GovernanceVote) = 6 tokens.
         assert_eq!(tokens.len(), 6);
@@ -15626,7 +15711,12 @@ mod tests {
     async fn governance_ucan_tokens_minted_for_single_admin() {
         let creator: DID = "did:key:creator1".into();
         let engine = Box::new(SingleAdminEngine::new(creator.clone(), noop_key_resolver()));
-        let tokens = mint_governance_tokens("ctx-sa-ucan", &creator, engine.as_ref());
+        let tokens = mint_governance_tokens(
+            "ctx-sa-ucan",
+            &creator,
+            engine.as_ref(),
+            &scp_primitives::SystemClock,
+        );
 
         // 1 voter x 2 capabilities = 2 tokens.
         assert_eq!(tokens.len(), 2);

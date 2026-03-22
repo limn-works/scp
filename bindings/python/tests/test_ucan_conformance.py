@@ -589,11 +589,11 @@ class TestPrefixCountsMatchExpected:
         """UcanError should have exactly the expected number of #[error] attrs."""
         ucan_source = _RUST_UCAN_MOD.read_text()
         error_count = len(_ERROR_ATTR_RE.findall(ucan_source))
-        # 29 variants as of the current codebase.
+        # 28 variants as of the current codebase.
         # If this fails, a variant was added or removed — update both
         # this count AND the Python prefix tuples in trust.py.
-        assert error_count == 29, (
-            f"Expected 29 UcanError variants, found {error_count}. "
+        assert error_count == 28, (
+            f"Expected 28 UcanError variants, found {error_count}. "
             f"If a variant was added, add the corresponding prefix to "
             f"trust.py and update this count. If removed, clean up "
             f"trust.py and update this count."

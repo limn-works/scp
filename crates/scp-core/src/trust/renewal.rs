@@ -28,7 +28,7 @@ use std::time::Duration;
 
 use super::TrustError;
 use super::attestation::{Attestation, DidPublicKeyResolver, verify_attestation};
-use scp_identity::cache::Clock;
+use scp_primitives::Clock;
 
 // ---------------------------------------------------------------------------
 // RenewalError
@@ -101,7 +101,7 @@ pub fn renew_attestation(
         });
     }
 
-    let now = clock.now();
+    let now = clock.now_secs();
 
     if let Some(expires_at) = attestation.expires_at
         && now >= expires_at
@@ -167,7 +167,7 @@ impl<C: Clock> RenewalChecker for DefaultRenewalChecker<C> {
         };
 
         let base_time = attestation.renewed_at.unwrap_or(attestation.issued_at);
-        let now = self.clock.now();
+        let now = self.clock.now_secs();
         let elapsed = Duration::from_secs(now.saturating_sub(base_time));
         elapsed >= interval
     }

@@ -19,9 +19,9 @@ use scp_core::crypto::ucan::validate::{
 use scp_core::trust::TrustError;
 use scp_core::trust::attestation::DidPublicKeyResolver;
 use scp_identity::IdentityError;
-use scp_identity::cache::Clock;
 use scp_identity::decode_multibase_key;
 use scp_identity::resolver::ResolvedDidDocument;
+use scp_primitives::Clock;
 
 // ---------------------------------------------------------------------------
 // BridgeDidResolver

@@ -9,6 +9,7 @@
 //!
 //! See GitHub issue #363.
 
+use scp_primitives::Clock;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use subtle::ConstantTimeEq;
@@ -268,8 +269,14 @@ fn strip_snapshot_for_public(snapshot: &ContextSnapshot) -> ContextSnapshot {
     // Build a minimal role state with only the default ceiling.
     // Use the snapshot's context_id and an empty creator DID.
     let ceiling = default_ceiling();
-    let role_state = ContextRoleState::new(&snapshot.context_id, "", ceiling, Vec::new())
-        .unwrap_or_else(|_| snapshot.role_state.clone());
+    let role_state = ContextRoleState::new(
+        &snapshot.context_id,
+        "",
+        ceiling,
+        Vec::new(),
+        &scp_primitives::SystemClock,
+    )
+    .unwrap_or_else(|_| snapshot.role_state.clone());
 
     ContextSnapshot {
         context_id: snapshot.context_id.clone(),
@@ -322,10 +329,9 @@ pub fn create_export(
     mls_state: Vec<u8>,
     exporter_did: DID,
     scope: ExportScope,
+    clock: &dyn Clock,
 ) -> Result<ContextExport, ContextError> {
-    let exported_at = crate::time::now_secs().map_err(|e| {
-        ContextError::EventLogFailed(format!("failed to get current timestamp: {e}"))
-    })?;
+    let exported_at = clock.now_secs();
 
     match scope {
         ExportScope::Full => {
@@ -376,8 +382,14 @@ mod tests {
     /// Helper to build a test snapshot.
     fn test_snapshot(context_id: &str) -> ContextSnapshot {
         let ceiling = default_ceiling();
-        let role_state =
-            ContextRoleState::new(context_id, "did:key:test-creator", ceiling, vec![]).unwrap();
+        let role_state = ContextRoleState::new(
+            context_id,
+            "did:key:test-creator",
+            ceiling,
+            vec![],
+            &scp_primitives::SystemClock,
+        )
+        .unwrap();
 
         ContextSnapshot {
             context_id: context_id.to_owned(),
@@ -434,6 +446,7 @@ mod tests {
             Vec::new(),
             DID::from("did:key:exporter-1"),
             ExportScope::Full,
+            &scp_primitives::SystemClock,
         )
         .unwrap();
 
@@ -463,6 +476,7 @@ mod tests {
             vec![0xDE, 0xAD],
             DID::from("did:key:exporter-2"),
             ExportScope::Full,
+            &scp_primitives::SystemClock,
         )
         .unwrap();
 
@@ -493,6 +507,7 @@ mod tests {
             vec![1, 2, 3],
             DID::from("did:key:exporter-3"),
             ExportScope::Full,
+            &scp_primitives::SystemClock,
         )
         .unwrap();
 
@@ -581,6 +596,7 @@ mod tests {
             Vec::new(),
             DID::from("did:key:validator-1"),
             ExportScope::Full,
+            &scp_primitives::SystemClock,
         )
         .unwrap();
 
@@ -620,6 +636,7 @@ mod tests {
             Vec::new(),
             DID::from("did:key:validator-3"),
             ExportScope::Full,
+            &scp_primitives::SystemClock,
         )
         .unwrap();
 
@@ -678,6 +695,7 @@ mod tests {
             vec![1, 2, 3],
             DID::from("did:key:public-1"),
             ExportScope::Public,
+            &scp_primitives::SystemClock,
         )
         .unwrap();
 
@@ -702,6 +720,7 @@ mod tests {
             vec![0xFF],
             DID::from("did:key:full-1"),
             ExportScope::Full,
+            &scp_primitives::SystemClock,
         )
         .unwrap();
 
@@ -736,6 +755,7 @@ mod tests {
             Vec::new(),
             DID::from("did:key:pipeline-1"),
             ExportScope::Full,
+            &scp_primitives::SystemClock,
         )
         .unwrap();
 
@@ -764,6 +784,7 @@ mod tests {
             Vec::new(),
             DID::from("did:key:version-test"),
             ExportScope::Full,
+            &scp_primitives::SystemClock,
         )
         .unwrap();
         assert_eq!(export_v1.version, 1);
@@ -865,6 +886,7 @@ mod tests {
             Vec::new(),
             DID::from("did:key:prune-test"),
             ExportScope::Full,
+            &scp_primitives::SystemClock,
         )
         .unwrap();
 

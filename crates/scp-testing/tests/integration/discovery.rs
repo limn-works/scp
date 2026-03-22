@@ -222,7 +222,7 @@ async fn handle_registry_crud() {
         },
         metadata: None,
     };
-    let result = registry.register(&params, &alice_did).unwrap();
+    let result = registry.register(&params, &alice_did, &scp_primitives::SystemClock);
     assert_eq!(
         result.status,
         scp_core::discovery::HandleRegisterStatus::Registered
@@ -264,7 +264,7 @@ async fn handle_registry_conflict() {
         },
         metadata: None,
     };
-    registry.register(&params_alice, &alice_did).unwrap();
+    registry.register(&params_alice, &alice_did, &scp_primitives::SystemClock);
 
     // Bob tries to register the same handle.
     let params_bob = HandleRegisterParams {
@@ -274,7 +274,7 @@ async fn handle_registry_conflict() {
         },
         metadata: None,
     };
-    let result = registry.register(&params_bob, &bob_did).unwrap();
+    let result = registry.register(&params_bob, &bob_did, &scp_primitives::SystemClock);
     assert_eq!(
         result.status,
         scp_core::discovery::HandleRegisterStatus::Conflict
@@ -564,7 +564,9 @@ fn scope_registry_crud() {
         },
         metadata: None,
     };
-    let result = registry.register(&params, &admin_did).unwrap();
+    let result = registry
+        .register(&params, &admin_did, &scp_primitives::SystemClock)
+        .unwrap();
     assert_eq!(result.status, ScopeRegisterStatus::Registered);
     assert!(result.entry_id.is_some());
 
@@ -619,21 +621,21 @@ fn scope_registry_isolation_from_handle_registry() {
                 metadata: None,
             },
             &admin_did,
+            &scp_primitives::SystemClock,
         )
         .unwrap();
 
-    handle_registry
-        .register(
-            &HandleRegisterParams {
-                handle: "cooking".to_owned(),
-                target: HandleTarget::Identity {
-                    did: admin_did.clone(),
-                },
-                metadata: None,
+    handle_registry.register(
+        &HandleRegisterParams {
+            handle: "cooking".to_owned(),
+            target: HandleTarget::Identity {
+                did: admin_did.clone(),
             },
-            &admin_did,
-        )
-        .unwrap();
+            metadata: None,
+        },
+        &admin_did,
+        &scp_primitives::SystemClock,
+    );
 
     // Both registries have one entry — independent
     assert_eq!(scope_registry.len(), 1);
@@ -677,6 +679,7 @@ fn scope_same_owner_update_is_atomic() {
                 metadata: None,
             },
             &admin_did,
+            &scp_primitives::SystemClock,
         )
         .unwrap();
     assert_eq!(r1.status, ScopeRegisterStatus::Registered);
@@ -693,6 +696,7 @@ fn scope_same_owner_update_is_atomic() {
                 metadata: None,
             },
             &admin_did,
+            &scp_primitives::SystemClock,
         )
         .unwrap();
     assert_eq!(r2.status, ScopeRegisterStatus::Updated);
@@ -723,6 +727,7 @@ fn scope_different_owner_conflict() {
                 metadata: None,
             },
             &DID::from("did:dht:zAdmin"),
+            &scp_primitives::SystemClock,
         )
         .unwrap();
 
@@ -737,6 +742,7 @@ fn scope_different_owner_conflict() {
                 metadata: None,
             },
             &DID::from("did:dht:zEve"),
+            &scp_primitives::SystemClock,
         )
         .unwrap();
     assert_eq!(conflict.status, ScopeRegisterStatus::Conflict);

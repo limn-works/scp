@@ -28,8 +28,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Capability::MessagesRead,
         Capability::MessagesWrite,
     ]);
-    let role_state = ContextRoleState::new("tool-demo", &*creator, ceiling, vec![])
-        .map_err(|e| e.to_string())?;
+    let role_state = ContextRoleState::new(
+        "tool-demo",
+        &*creator,
+        ceiling,
+        vec![],
+        &scp_primitives::SystemClock,
+    )
+    .map_err(|e| e.to_string())?;
 
     // 3. Create a tool registry and register a calculator tool.
     let mut registry = ToolRegistry::new();

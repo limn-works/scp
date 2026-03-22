@@ -222,19 +222,6 @@ pub enum UcanError {
     /// Capability URI parsing failed.
     #[error("invalid capability URI: {0}")]
     InvalidCapabilityUri(String),
-
-    /// System clock returned an error (e.g., time before Unix epoch).
-    ///
-    /// This is a hard failure — defaulting to epoch 0 would bypass all
-    /// `nbf`/`exp` checks.
-    #[error("system clock error: {0}")]
-    ClockError(String),
-}
-
-impl From<crate::time::ClockError> for UcanError {
-    fn from(err: crate::time::ClockError) -> Self {
-        Self::ClockError(err.to_string())
-    }
 }
 
 // ---------------------------------------------------------------------------

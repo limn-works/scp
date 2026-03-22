@@ -677,12 +677,11 @@ pub fn py_handle_register(
         .entry(discovery_context_id.to_owned())
         .or_insert_with(|| HandleRegistry::new(discovery_context_id.to_owned()));
 
-    let result = registry
-        .register(&params, &DID::from(registrant_did))
-        .map_err(|e| ScpPyError::ValidationError {
-            message: format!("clock error during handle registration: {e}"),
-            code: "SCP-VALID-7121".to_owned(),
-        })?;
+    let result = registry.register(
+        &params,
+        &DID::from(registrant_did),
+        &scp_primitives::SystemClock,
+    );
 
     serde_json::to_string(&result).map_err(|e| {
         ScpPyError::ValidationError {
@@ -894,7 +893,11 @@ pub fn py_scope_register(
         .or_insert_with(|| scp_core::discovery::ScopeRegistry::new(scope_context_id.to_owned()));
 
     let result = registry
-        .register(&params, &DID::from(registrant_did))
+        .register(
+            &params,
+            &DID::from(registrant_did),
+            &scp_primitives::SystemClock,
+        )
         .map_err(|e| ScpPyError::ValidationError {
             message: format!("scope registration failed: {e}"),
             code: "SCP-VALID-7131".to_owned(),
@@ -1101,6 +1104,7 @@ pub fn py_address_resolve(
                 &querier,
                 &known_contexts,
                 &known_domains,
+                &scp_primitives::SystemClock,
             )
             .await
             .map_err(|e| ScpPyError::ValidationError {

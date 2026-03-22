@@ -681,6 +681,7 @@ impl ContextProvider for FfiBridgeProvider {
                     presenting_agent_did: &self.agent_did,
                     clock_skew_tolerance_secs:
                         scp_core::crypto::ucan::validate::DEFAULT_CLOCK_SKEW_TOLERANCE_SECS,
+                    clock: &scp_primitives::SystemClock,
                 };
 
                 scp_core::context::tools::validate_tool_invocation_ucan(

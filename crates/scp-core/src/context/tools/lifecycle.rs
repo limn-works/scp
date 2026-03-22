@@ -19,6 +19,8 @@
 
 use serde::{Deserialize, Serialize};
 
+use scp_primitives::Clock;
+
 use crate::economy::types::Amount;
 use crate::provenance::DataProvenance;
 use scp_identity::DID;
@@ -88,8 +90,9 @@ impl ToolRequest {
         tool_id: String,
         invoker_did: DID,
         input: serde_json::Value,
-    ) -> Result<Self, crate::time::ClockError> {
-        Ok(Self {
+        clock: &dyn Clock,
+    ) -> Self {
+        Self {
             request_id: uuid::Uuid::new_v4().to_string(),
             tool_id,
             invoker_did,
@@ -97,8 +100,8 @@ impl ToolRequest {
             timeout_ms: DEFAULT_TIMEOUT_MS,
             session_id: None,
             chain_depth: 0,
-            timestamp: crate::time::now_millis()?,
-        })
+            timestamp: clock.now_millis(),
+        }
     }
 
     /// Clamps the timeout to the given context maximum, respecting the hard
@@ -327,8 +330,8 @@ mod tests {
             "tool-1".to_owned(),
             "did:dht:z6MkInvoker".into(),
             serde_json::json!({"x": 1}),
-        )
-        .unwrap();
+            &scp_primitives::SystemClock,
+        );
         // UUID v4 format: 8-4-4-4-12 hex digits.
         assert_eq!(request.request_id.len(), 36);
         assert!(request.request_id.contains('-'));
@@ -344,8 +347,8 @@ mod tests {
             "tool-1".to_owned(),
             "did:dht:z6MkInvoker".into(),
             serde_json::json!({}),
-        )
-        .unwrap();
+            &scp_primitives::SystemClock,
+        );
         request.timeout_ms = 10_000;
         request.clamp_timeout(60_000);
         assert_eq!(request.timeout_ms, 10_000);
@@ -357,8 +360,8 @@ mod tests {
             "tool-1".to_owned(),
             "did:dht:z6MkInvoker".into(),
             serde_json::json!({}),
-        )
-        .unwrap();
+            &scp_primitives::SystemClock,
+        );
         request.timeout_ms = 120_000;
         request.clamp_timeout(60_000);
         assert_eq!(request.timeout_ms, 60_000);
@@ -370,8 +373,8 @@ mod tests {
             "tool-1".to_owned(),
             "did:dht:z6MkInvoker".into(),
             serde_json::json!({}),
-        )
-        .unwrap();
+            &scp_primitives::SystemClock,
+        );
         request.timeout_ms = 600_000;
         // Context max is above protocol max -- should clamp to protocol max.
         request.clamp_timeout(999_999);

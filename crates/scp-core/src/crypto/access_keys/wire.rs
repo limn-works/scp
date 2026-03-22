@@ -25,6 +25,7 @@ use x25519_dalek::{EphemeralSecret, PublicKey as X25519Pub};
 use zeroize::Zeroizing;
 
 use scp_platform::traits::{KeyCustody, KeyHandle, KeyType};
+use scp_primitives::Clock;
 
 use super::{AccessKey, AccessKeyError};
 
@@ -148,6 +149,7 @@ pub async fn request_access_key(
     signing_key: &KeyHandle,
     requester_did: &str,
     context_id: &str,
+    clock: &dyn Clock,
 ) -> Result<AccessKeyRequestResult, AccessKeyError> {
     // Generate fresh X25519 wrapping keypair.
     let wrapping_key_handle = key_custody
@@ -160,7 +162,7 @@ pub async fn request_access_key(
         .await
         .map_err(|e| AccessKeyError::KeyCustodyError(e.to_string()))?;
 
-    let timestamp = crate::time::now_secs()?;
+    let timestamp = clock.now_secs();
 
     // Generate cryptographic nonce for replay protection.
     let mut nonce = [0u8; ACCESS_KEY_NONCE_SIZE];

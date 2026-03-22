@@ -141,7 +141,6 @@ _EXPIRY_PREFIXES: tuple[str, ...] = (
     "token not yet valid",
     "invalid time range:",
     "expiry too far in the future:",
-    "system clock error:",
 )
 
 

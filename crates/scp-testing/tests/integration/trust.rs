@@ -61,8 +61,12 @@ fn sk_for(seed: u8) -> SigningKey {
 struct FixedClock(u64);
 
 impl scp_identity::cache::Clock for FixedClock {
-    fn now(&self) -> u64 {
+    fn now_secs(&self) -> u64 {
         self.0
+    }
+
+    fn now_millis(&self) -> u64 {
+        self.0 * 1000
     }
 }
 

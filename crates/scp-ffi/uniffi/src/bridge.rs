@@ -3406,6 +3406,7 @@ pub async fn tool_register(
                 &handle.creator_did,
                 ceiling,
                 vec![],
+                &scp_primitives::SystemClock,
             )
             .map_err(|e| ScpError::Tool {
                 msg: format!("failed to create role state: {e}"),
@@ -3629,6 +3630,7 @@ fn validate_tool_ucan_uniffi(
             context_creator_did: &ucan_state.creator_did,
             presenting_agent_did: identity_did,
             clock_skew_tolerance_secs: DEFAULT_CLOCK_SKEW_TOLERANCE_SECS,
+            clock: &scp_primitives::SystemClock,
         };
 
         validate_tool_invocation_ucan(ucan_token, &handle.context_id, tool_id, &mut ctx).map_err(
@@ -4175,6 +4177,7 @@ pub async fn tool_interface_expose(
                 &handle.creator_did,
                 ceiling,
                 vec![],
+                &scp_primitives::SystemClock,
             )
             .map_err(|e| ScpError::Tool {
                 msg: format!("failed to create role state: {e}"),
@@ -4264,6 +4267,7 @@ pub async fn tool_interface_accept(
                 &handle.creator_did,
                 ceiling,
                 vec![],
+                &scp_primitives::SystemClock,
             )
             .map_err(|e| ScpError::Tool {
                 msg: format!("failed to create role state: {e}"),
@@ -5009,6 +5013,7 @@ impl scp_mcp::server::ContextProvider for McpUniFfiBridgeProvider {
                     presenting_agent_did: &agent_did,
                     clock_skew_tolerance_secs:
                         scp_core::crypto::ucan::validate::DEFAULT_CLOCK_SKEW_TOLERANCE_SECS,
+                    clock: &scp_primitives::SystemClock,
                 };
 
                 scp_core::context::tools::validate_tool_invocation_ucan(
@@ -5939,6 +5944,7 @@ pub async fn ucan_validate(
                         context_creator_did: &ucan_state.creator_did,
                         presenting_agent_did: agent_did,
                         clock_skew_tolerance_secs: DEFAULT_CLOCK_SKEW_TOLERANCE_SECS,
+                        clock: &scp_primitives::SystemClock,
                     };
 
                     validate_ucan(&parsed_token, &required_cap, &mut ctx).map_err(|e| {
@@ -6067,9 +6073,13 @@ async fn ucan_mint_impl(
                 }),
             };
 
-            let token = scp_core::crypto::ucan::mint::mint_ucan(&params, &custody.0)
-                .await
-                .map_err(ScpError::from)?;
+            let token = scp_core::crypto::ucan::mint::mint_ucan(
+                &params,
+                &custody.0,
+                &scp_primitives::SystemClock,
+            )
+            .await
+            .map_err(ScpError::from)?;
 
             let data = UcanTokenData {
                 token_id: token.payload.nnc.clone(),
@@ -6347,7 +6357,7 @@ async fn ucan_delegate_impl(
                 ceiling,
             };
 
-            let token = delegate_ucan(&params, &custody.0)
+            let token = delegate_ucan(&params, &custody.0, &scp_primitives::SystemClock)
                 .await
                 .map_err(ScpError::from)?;
 
@@ -10388,12 +10398,11 @@ pub fn handle_register(
     let registry = guard
         .entry(discovery_context_id.clone())
         .or_insert_with(|| scp_core::discovery::HandleRegistry::new(discovery_context_id));
-    let result = registry
-        .register(&params, &scp_identity::DID::from(registrant_did.as_str()))
-        .map_err(|e| ScpError::Validation {
-            msg: format!("clock error during handle registration: {e}"),
-            code: "SCP-VALID-7121".to_owned(),
-        })?;
+    let result = registry.register(
+        &params,
+        &scp_identity::DID::from(registrant_did.as_str()),
+        &scp_primitives::SystemClock,
+    );
     serde_json::to_string(&result).map_err(|e| ScpError::Validation {
         msg: format!("failed to serialize handle register result: {e}"),
         code: "SCP-VALID-7122".to_owned(),
@@ -10529,7 +10538,11 @@ pub fn scope_register(
         .or_insert_with(|| scp_core::discovery::ScopeRegistry::new(scope_context_id));
 
     let result = registry
-        .register(&params, &scp_identity::DID::from(registrant_did.as_str()))
+        .register(
+            &params,
+            &scp_identity::DID::from(registrant_did.as_str()),
+            &scp_primitives::SystemClock,
+        )
         .map_err(|e| ScpError::Validation {
             msg: format!("scope registration failed: {e}"),
             code: "SCP-VALID-7131".to_owned(),
@@ -10667,6 +10680,7 @@ pub fn address_resolve(
                     &querier,
                     &known_contexts,
                     &known_domains,
+                    &scp_primitives::SystemClock,
                 )
                 .await
                 .map_err(|e| ScpError::Validation {

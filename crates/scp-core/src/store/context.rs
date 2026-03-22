@@ -1712,6 +1712,7 @@ mod tests {
             "did:dht:z6MkCreator",
             crate::context::roles::CapabilityCeiling::new(std::iter::empty()),
             vec![],
+            &scp_primitives::SystemClock,
         )
         .unwrap();
 

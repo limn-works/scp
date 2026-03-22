@@ -19,6 +19,7 @@ use std::time::{Duration, Instant};
 use serde::{Deserialize, Serialize};
 
 use scp_identity::DID;
+use scp_primitives::Clock;
 
 use super::ContextId;
 
@@ -318,10 +319,6 @@ pub enum AddressingError {
         /// Error description.
         message: String,
     },
-
-    /// The system clock is unavailable or before the Unix epoch.
-    #[error("clock error: {0}")]
-    ClockError(#[from] crate::time::ClockError),
 }
 
 // ---------------------------------------------------------------------------
@@ -595,6 +592,7 @@ impl AddressResolver {
         handle_querier: &H,
         known_contexts: &HashMap<String, ContextId>,
         known_domains: &[&str],
+        clock: &dyn Clock,
     ) -> Result<Vec<AddressResolution>, AddressingError>
     where
         P: PetnameStore,
@@ -640,7 +638,7 @@ impl AddressResolver {
             }
             ParsedAddress::Unscoped { name } => {
                 // §22.8.2: Check petnames first (instant, no network).
-                let petname_results = petname_store.resolve_petname(&name)?;
+                let petname_results = petname_store.resolve_petname(&name, clock);
                 if !petname_results.is_empty() {
                     results.extend(petname_results);
                     self.cache
@@ -682,7 +680,7 @@ impl AddressResolver {
 
         // Deduplicate by DID: if multiple paths found the same DID, promote to
         // MultiLayerCorroborated per §22.8.2 step 4c.
-        results = corroborate_results(results)?;
+        results = corroborate_results(results, clock);
 
         // Cache the results with the shortest applicable TTL.
         let ttl = shortest_ttl_for_results(&results);
@@ -711,14 +709,7 @@ pub trait PetnameStore {
     ///
     /// Returns matching entries instantly (no network I/O). Returns an empty
     /// vec if no petname matches.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`crate::time::ClockError`] if the system clock is unavailable.
-    fn resolve_petname(
-        &self,
-        name: &str,
-    ) -> Result<Vec<AddressResolution>, crate::time::ClockError>;
+    fn resolve_petname(&self, name: &str, clock: &dyn Clock) -> Vec<AddressResolution>;
 }
 
 /// Trait for querying remote handle resolution layers.
@@ -761,7 +752,8 @@ pub trait HandleQuerier {
 /// those results to `MultiLayerCorroborated` per §22.8.2 step 4c.
 fn corroborate_results(
     results: Vec<AddressResolution>,
-) -> Result<Vec<AddressResolution>, crate::time::ClockError> {
+    clock: &dyn Clock,
+) -> Vec<AddressResolution> {
     let mut by_did: HashMap<String, Vec<AddressResolution>> = HashMap::new();
     let mut non_identity: Vec<AddressResolution> = Vec::new();
 
@@ -786,7 +778,7 @@ fn corroborate_results(
                 .map(|e| e.resolution_path().clone())
                 .collect();
             if let Some(AddressResolution::Identity { did, .. }) = entries.into_iter().next() {
-                let now = crate::time::now_secs()?;
+                let now = clock.now_secs();
                 output.push(AddressResolution::Identity {
                     did,
                     trust_level: TrustLevel::MultiLayerCorroborated {
@@ -814,7 +806,7 @@ fn corroborate_results(
             .cmp(&a.trust_level().default_rank())
     });
 
-    Ok(output)
+    output
 }
 
 /// Determines the shortest TTL to use for a set of resolution results.
@@ -1135,7 +1127,7 @@ mod tests {
             },
         ];
 
-        let corroborated = corroborate_results(results).unwrap();
+        let corroborated = corroborate_results(results, &scp_primitives::SystemClock);
         assert_eq!(corroborated.len(), 1);
         assert!(matches!(
             corroborated[0].trust_level(),
@@ -1160,7 +1152,7 @@ mod tests {
             },
         }];
 
-        let corroborated = corroborate_results(results).unwrap();
+        let corroborated = corroborate_results(results, &scp_primitives::SystemClock);
         assert_eq!(corroborated.len(), 1);
         assert_eq!(
             *corroborated[0].trust_level(),
@@ -1200,11 +1192,8 @@ mod tests {
     }
 
     impl PetnameStore for TestPetnameStore {
-        fn resolve_petname(
-            &self,
-            name: &str,
-        ) -> Result<Vec<AddressResolution>, crate::time::ClockError> {
-            Ok(self.petnames.get(name).cloned().unwrap_or_default())
+        fn resolve_petname(&self, name: &str, _clock: &dyn Clock) -> Vec<AddressResolution> {
+            self.petnames.get(name).cloned().unwrap_or_default()
         }
     }
 
@@ -1328,7 +1317,14 @@ mod tests {
 
         let mut resolver = AddressResolver::new();
         let results = resolver
-            .resolve("alice@cooking-community", &petnames, &querier, &known, &[])
+            .resolve(
+                "alice@cooking-community",
+                &petnames,
+                &querier,
+                &known,
+                &[],
+                &scp_primitives::SystemClock,
+            )
             .await
             .unwrap();
 
@@ -1350,7 +1346,14 @@ mod tests {
 
         let mut resolver = AddressResolver::new();
         let results = resolver
-            .resolve("alice@example.com", &petnames, &querier, &known, &[])
+            .resolve(
+                "alice@example.com",
+                &petnames,
+                &querier,
+                &known,
+                &[],
+                &scp_primitives::SystemClock,
+            )
             .await
             .unwrap();
 
@@ -1373,7 +1376,14 @@ mod tests {
 
         let mut resolver = AddressResolver::new();
         let results = resolver
-            .resolve("alice@x.com", &petnames, &querier, &known, &[])
+            .resolve(
+                "alice@x.com",
+                &petnames,
+                &querier,
+                &known,
+                &[],
+                &scp_primitives::SystemClock,
+            )
             .await
             .unwrap();
 
@@ -1395,7 +1405,14 @@ mod tests {
 
         let mut resolver = AddressResolver::new();
         let results = resolver
-            .resolve("@alice_cooks", &petnames, &querier, &known, &[])
+            .resolve(
+                "@alice_cooks",
+                &petnames,
+                &querier,
+                &known,
+                &[],
+                &scp_primitives::SystemClock,
+            )
             .await
             .unwrap();
 
@@ -1419,7 +1436,14 @@ mod tests {
 
         let mut resolver = AddressResolver::new();
         let results = resolver
-            .resolve("alice", &petnames, &querier, &known, &[])
+            .resolve(
+                "alice",
+                &petnames,
+                &querier,
+                &known,
+                &[],
+                &scp_primitives::SystemClock,
+            )
             .await
             .unwrap();
 
@@ -1449,7 +1473,14 @@ mod tests {
 
         let mut resolver = AddressResolver::new();
         let results = resolver
-            .resolve("alice", &petnames, &querier, &known, &[])
+            .resolve(
+                "alice",
+                &petnames,
+                &querier,
+                &known,
+                &[],
+                &scp_primitives::SystemClock,
+            )
             .await
             .unwrap();
 
@@ -1471,7 +1502,14 @@ mod tests {
 
         let mut resolver = AddressResolver::new();
         let results = resolver
-            .resolve("alice", &petnames, &querier, &known, &["example.com"])
+            .resolve(
+                "alice",
+                &petnames,
+                &querier,
+                &known,
+                &["example.com"],
+                &scp_primitives::SystemClock,
+            )
             .await
             .unwrap();
 
@@ -1491,7 +1529,14 @@ mod tests {
 
         let mut resolver = AddressResolver::new();
         let result = resolver
-            .resolve("nonexistent@nowhere", &petnames, &querier, &known, &[])
+            .resolve(
+                "nonexistent@nowhere",
+                &petnames,
+                &querier,
+                &known,
+                &[],
+                &scp_primitives::SystemClock,
+            )
             .await;
 
         assert!(matches!(result, Err(AddressingError::NotFound(_))));
@@ -1515,13 +1560,27 @@ mod tests {
 
         // First resolve populates cache.
         let results1 = resolver
-            .resolve("alice@cooking-community", &petnames, &querier, &known, &[])
+            .resolve(
+                "alice@cooking-community",
+                &petnames,
+                &querier,
+                &known,
+                &[],
+                &scp_primitives::SystemClock,
+            )
             .await
             .unwrap();
 
         // Second resolve should hit cache.
         let results2 = resolver
-            .resolve("alice@cooking-community", &petnames, &querier, &known, &[])
+            .resolve(
+                "alice@cooking-community",
+                &petnames,
+                &querier,
+                &known,
+                &[],
+                &scp_primitives::SystemClock,
+            )
             .await
             .unwrap();
 
