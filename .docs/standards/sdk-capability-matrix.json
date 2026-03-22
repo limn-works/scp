@@ -1,0 +1,263 @@
+{
+  "schema_version": "1.0",
+  "capabilities": [
+    {
+      "domain": "Identity",
+      "operations": [
+        {"name": "create", "python": true, "typescript": true, "kotlin": true, "swift": true},
+        {"name": "load", "python": true, "typescript": true, "kotlin": true, "swift": true},
+        {"name": "resolve", "python": true, "typescript": true, "kotlin": true, "swift": true},
+        {"name": "rotate_key", "python": true, "typescript": true, "kotlin": false, "swift": false,
+         "exemptions": {"kotlin": "UniFFI bridge does not export rotate_key", "swift": "UniFFI bridge does not export rotate_key"}},
+        {"name": "create_with_agent_key", "python": true, "typescript": true, "kotlin": true, "swift": true},
+        {"name": "add_agent_key", "python": true, "typescript": true, "kotlin": true, "swift": true},
+        {"name": "rotate_agent_key", "python": true, "typescript": true, "kotlin": true, "swift": true},
+        {"name": "remove_agent_key", "python": true, "typescript": true, "kotlin": true, "swift": true},
+        {"name": "migrate", "python": true, "typescript": true, "kotlin": true, "swift": true},
+        {"name": "attest_device", "python": true, "typescript": true, "kotlin": true, "swift": true},
+        {"name": "verify_device_attestation", "python": true, "typescript": true, "kotlin": true, "swift": true},
+        {"name": "execute_recovery", "python": true, "typescript": true, "kotlin": true, "swift": true},
+        {"name": "execute_custody_migration", "python": true, "typescript": true, "kotlin": true, "swift": true},
+        {"name": "create_attestation", "python": true, "typescript": true, "kotlin": true, "swift": true},
+        {"name": "list_attestations", "python": true, "typescript": true, "kotlin": true, "swift": true},
+        {"name": "remove_attestation", "python": true, "typescript": true, "kotlin": true, "swift": true},
+        {"name": "renew_attestation", "python": true, "typescript": false, "kotlin": false, "swift": false,
+         "exemptions": {"typescript": "NAPI bridge does not export renew_attestation", "kotlin": "UniFFI bridge does not export renew_attestation", "swift": "UniFFI bridge does not export renew_attestation"}},
+        {"name": "verify_attestation", "python": false, "typescript": false, "kotlin": true, "swift": false,
+         "exemptions": {"python": "bridge does not export verify_link_attestation", "typescript": "bridge does not export verify_link_attestation", "swift": "UniFFI bridge does not export verify_link_attestation"}}
+      ]
+    },
+    {
+      "domain": "Context",
+      "operations": [
+        {"name": "create", "python": true, "typescript": true, "kotlin": true, "swift": true},
+        {"name": "join", "python": true, "typescript": true, "kotlin": true, "swift": true},
+        {"name": "leave", "python": true, "typescript": true, "kotlin": true, "swift": true},
+        {"name": "close", "python": true, "typescript": true, "kotlin": true, "swift": true},
+        {"name": "send", "python": true, "typescript": true, "kotlin": true, "swift": true},
+        {"name": "receive", "python": true, "typescript": true, "kotlin": true, "swift": false,
+         "exemptions": {"swift": "subscribe/receive not yet wired as public API on Context actor"}},
+        {"name": "set_economic_policy", "python": true, "typescript": true, "kotlin": true, "swift": true},
+        {"name": "get_economic_policy", "python": true, "typescript": true, "kotlin": true, "swift": true},
+        {"name": "validate_params", "python": true, "typescript": true, "kotlin": true, "swift": true},
+        {"name": "validate_admission", "python": true, "typescript": true, "kotlin": true, "swift": true},
+        {"name": "evaluate_invitation", "python": true, "typescript": true, "kotlin": true, "swift": true},
+        {"name": "validate_capability_declaration", "python": true, "typescript": true, "kotlin": false, "swift": true,
+         "exemptions": {"kotlin": "SDK does not expose validateCapabilityDeclaration wrapper"}},
+        {"name": "metadata_record_serialize", "python": true, "typescript": true, "kotlin": true, "swift": true},
+        {"name": "metadata_record_deserialize", "python": true, "typescript": true, "kotlin": true, "swift": true},
+        {"name": "template_get_params", "python": true, "typescript": true, "kotlin": true, "swift": true},
+        {"name": "validate_against_template", "python": true, "typescript": true, "kotlin": true, "swift": true},
+        {"name": "import_context", "python": false, "typescript": false, "kotlin": false, "swift": true,
+         "exemptions": {"python": "not exported in Python SDK", "typescript": "not exported in TypeScript SDK", "kotlin": "not exported in Kotlin SDK"}},
+        {"name": "restore_context", "python": true, "typescript": true, "kotlin": true, "swift": true},
+        {"name": "restore_all_contexts", "python": true, "typescript": true, "kotlin": true, "swift": true}
+      ]
+    },
+    {
+      "domain": "Messaging",
+      "operations": [
+        {"name": "send_message", "python": true, "typescript": true, "kotlin": true, "swift": true},
+        {"name": "subscribe", "python": true, "typescript": true, "kotlin": true, "swift": false,
+         "exemptions": {"swift": "subscribe not yet exposed as public API on Context actor"}},
+        {"name": "broadcast_subscribe", "python": true, "typescript": true, "kotlin": true, "swift": true},
+        {"name": "broadcast_publish", "python": true, "typescript": true, "kotlin": true, "swift": true},
+        {"name": "broadcast_publish_asset", "python": true, "typescript": true, "kotlin": true, "swift": true},
+        {"name": "broadcast_publish_assets", "python": true, "typescript": true, "kotlin": true, "swift": true},
+        {"name": "broadcast_block_subscriber", "python": true, "typescript": true, "kotlin": true, "swift": true},
+        {"name": "broadcast_unblock_subscriber", "python": true, "typescript": true, "kotlin": true, "swift": true},
+        {"name": "broadcast_handle_key_request", "python": true, "typescript": true, "kotlin": true, "swift": true},
+        {"name": "validate_broadcast_key", "python": true, "typescript": true, "kotlin": true, "swift": true}
+      ]
+    },
+    {
+      "domain": "Tools",
+      "operations": [
+        {"name": "register", "python": true, "typescript": true, "kotlin": true, "swift": true},
+        {"name": "invoke", "python": true, "typescript": true, "kotlin": true, "swift": true},
+        {"name": "verify", "python": true, "typescript": true, "kotlin": true, "swift": true},
+        {"name": "invoke_cross_context", "python": true, "typescript": true, "kotlin": true, "swift": true},
+        {"name": "session_create", "python": true, "typescript": true, "kotlin": true, "swift": true},
+        {"name": "session_invoke", "python": true, "typescript": true, "kotlin": true, "swift": true},
+        {"name": "session_close", "python": true, "typescript": true, "kotlin": true, "swift": true},
+        {"name": "interface_expose", "python": true, "typescript": true, "kotlin": true, "swift": true},
+        {"name": "interface_accept", "python": true, "typescript": true, "kotlin": true, "swift": true},
+        {"name": "interface_revoke", "python": true, "typescript": true, "kotlin": true, "swift": true}
+      ]
+    },
+    {
+      "domain": "Trust",
+      "operations": [
+        {"name": "evaluate_trust", "python": true, "typescript": true, "kotlin": false, "swift": true,
+         "exemptions": {"kotlin": "SDK does not expose evaluate_trust wrapper, only aggregate_trust_input"}},
+        {"name": "aggregate_trust_input", "python": true, "typescript": true, "kotlin": true, "swift": true},
+        {"name": "verify_participation_requirements", "python": true, "typescript": true, "kotlin": true, "swift": true}
+      ]
+    },
+    {
+      "domain": "Governance",
+      "operations": [
+        {"name": "execute_action", "python": true, "typescript": true, "kotlin": true, "swift": true},
+        {"name": "propose_action", "python": true, "typescript": true, "kotlin": true, "swift": true},
+        {"name": "approve_proposal", "python": true, "typescript": true, "kotlin": true, "swift": true},
+        {"name": "reject_proposal", "python": true, "typescript": true, "kotlin": true, "swift": true},
+        {"name": "withdraw_vote", "python": true, "typescript": true, "kotlin": true, "swift": true},
+        {"name": "get_proposal", "python": true, "typescript": true, "kotlin": true, "swift": true},
+        {"name": "list_proposals", "python": true, "typescript": true, "kotlin": true, "swift": true},
+        {"name": "apply_pending_ceiling_modification", "python": true, "typescript": true, "kotlin": true, "swift": true},
+        {"name": "finalize_close", "python": true, "typescript": true, "kotlin": true, "swift": true},
+        {"name": "create_governance_checkpoint", "python": true, "typescript": true, "kotlin": true, "swift": true},
+        {"name": "add_checkpoint_cosignature", "python": true, "typescript": true, "kotlin": true, "swift": true},
+        {"name": "propose_ttl_extension", "python": true, "typescript": true, "kotlin": false, "swift": true,
+         "exemptions": {"kotlin": "no SDK convenience wrapper for TTL extension"}},
+        {"name": "handle_ttl_expiry", "python": true, "typescript": true, "kotlin": false, "swift": true,
+         "exemptions": {"kotlin": "no SDK convenience wrapper for TTL expiry"}},
+        {"name": "member_count", "python": true, "typescript": true, "kotlin": true, "swift": true},
+        {"name": "is_member", "python": true, "typescript": true, "kotlin": true, "swift": true},
+        {"name": "member_role", "python": true, "typescript": true, "kotlin": true, "swift": true}
+      ]
+    },
+    {
+      "domain": "EventLog",
+      "operations": [
+        {"name": "query", "python": true, "typescript": true, "kotlin": true, "swift": true},
+        {"name": "verify", "python": true, "typescript": true, "kotlin": true, "swift": true},
+        {"name": "checkpoint", "python": true, "typescript": true, "kotlin": true, "swift": true},
+        {"name": "signed_checkpoint", "python": true, "typescript": true, "kotlin": true, "swift": true}
+      ]
+    },
+    {
+      "domain": "Transport",
+      "operations": [
+        {"name": "connect", "python": true, "typescript": true, "kotlin": true, "swift": true},
+        {"name": "status", "python": true, "typescript": true, "kotlin": true, "swift": true},
+        {"name": "disconnect", "python": false, "typescript": false, "kotlin": true, "swift": true,
+         "exemptions": {"python": "no explicit disconnect wrapper exposed", "typescript": "no explicit disconnect wrapper exposed"}}
+      ]
+    },
+    {
+      "domain": "Media",
+      "operations": [
+        {"name": "check_capability", "python": true, "typescript": true, "kotlin": true, "swift": true},
+        {"name": "initiate_session", "python": true, "typescript": true, "kotlin": true, "swift": true},
+        {"name": "activate_session", "python": true, "typescript": true, "kotlin": true, "swift": true},
+        {"name": "join_session", "python": true, "typescript": true, "kotlin": true, "swift": true},
+        {"name": "end_session", "python": true, "typescript": true, "kotlin": true, "swift": true},
+        {"name": "create_offer", "python": true, "typescript": true, "kotlin": true, "swift": true},
+        {"name": "create_answer", "python": true, "typescript": true, "kotlin": true, "swift": true},
+        {"name": "create_ice_candidate", "python": true, "typescript": true, "kotlin": true, "swift": true},
+        {"name": "create_session_end", "python": true, "typescript": true, "kotlin": true, "swift": true},
+        {"name": "send_signaling", "python": true, "typescript": true, "kotlin": true, "swift": true},
+        {"name": "verify_sender_attribution", "python": true, "typescript": true, "kotlin": true, "swift": true}
+      ]
+    },
+    {
+      "domain": "Discovery",
+      "operations": [
+        {"name": "parse_address", "python": true, "typescript": true, "kotlin": true, "swift": true},
+        {"name": "create_query", "python": true, "typescript": true, "kotlin": true, "swift": true},
+        {"name": "normalize_address", "python": true, "typescript": true, "kotlin": true, "swift": true},
+        {"name": "discover", "python": true, "typescript": true, "kotlin": true, "swift": true},
+        {"name": "address_resolve", "python": true, "typescript": true, "kotlin": true, "swift": true},
+        {"name": "petname_set", "python": true, "typescript": true, "kotlin": true, "swift": true},
+        {"name": "petname_remove", "python": true, "typescript": true, "kotlin": true, "swift": true},
+        {"name": "petname_set_context", "python": true, "typescript": true, "kotlin": true, "swift": true},
+        {"name": "petname_remove_context", "python": true, "typescript": true, "kotlin": true, "swift": true},
+        {"name": "petname_resolve_did", "python": true, "typescript": true, "kotlin": true, "swift": true},
+        {"name": "petname_resolve_context", "python": true, "typescript": true, "kotlin": true, "swift": true},
+        {"name": "petname_get_for_did", "python": true, "typescript": true, "kotlin": true, "swift": true},
+        {"name": "petname_get_for_context", "python": true, "typescript": true, "kotlin": true, "swift": true},
+        {"name": "handle_register", "python": true, "typescript": true, "kotlin": true, "swift": true},
+        {"name": "handle_lookup", "python": true, "typescript": true, "kotlin": true, "swift": true},
+        {"name": "handle_deregister", "python": true, "typescript": true, "kotlin": true, "swift": true},
+        {"name": "scope_register", "python": true, "typescript": true, "kotlin": true, "swift": true},
+        {"name": "scope_lookup", "python": true, "typescript": true, "kotlin": true, "swift": true},
+        {"name": "scope_deregister", "python": true, "typescript": true, "kotlin": true, "swift": true}
+      ]
+    },
+    {
+      "domain": "UCAN",
+      "operations": [
+        {"name": "validate", "python": true, "typescript": true, "kotlin": true, "swift": true},
+        {"name": "mint", "python": true, "typescript": true, "kotlin": true, "swift": true},
+        {"name": "revoke", "python": true, "typescript": true, "kotlin": true, "swift": true},
+        {"name": "delegate", "python": true, "typescript": true, "kotlin": true, "swift": true}
+      ]
+    },
+    {
+      "domain": "Economy",
+      "operations": [
+        {"name": "estimate_cost", "python": true, "typescript": true, "kotlin": true, "swift": true},
+        {"name": "policy_requires_payment", "python": true, "typescript": true, "kotlin": true, "swift": true},
+        {"name": "auto_accept_blocked", "python": true, "typescript": true, "kotlin": true, "swift": true},
+        {"name": "check_policy_lock", "python": true, "typescript": true, "kotlin": true, "swift": true},
+        {"name": "validate_policy_change", "python": true, "typescript": true, "kotlin": true, "swift": true},
+        {"name": "evaluate_formula", "python": true, "typescript": true, "kotlin": true, "swift": true},
+        {"name": "adjust_relay_price", "python": true, "typescript": true, "kotlin": true, "swift": true},
+        {"name": "budget_remaining", "python": true, "typescript": true, "kotlin": true, "swift": true},
+        {"name": "budget_grant", "python": true, "typescript": true, "kotlin": true, "swift": true},
+        {"name": "budget_record_spend", "python": true, "typescript": true, "kotlin": true, "swift": true},
+        {"name": "antispam_record", "python": true, "typescript": true, "kotlin": true, "swift": true},
+        {"name": "antispam_velocity", "python": true, "typescript": true, "kotlin": true, "swift": true},
+        {"name": "antispam_escalated_cost", "python": true, "typescript": true, "kotlin": true, "swift": true}
+      ]
+    },
+    {
+      "domain": "Sync",
+      "operations": [
+        {"name": "classify_offline", "python": true, "typescript": true, "kotlin": true, "swift": true},
+        {"name": "get_policy", "python": true, "typescript": true, "kotlin": true, "swift": true}
+      ]
+    },
+    {
+      "domain": "Provenance",
+      "operations": [
+        {"name": "evaluate_quality", "python": true, "typescript": true, "kotlin": true, "swift": true},
+        {"name": "attach", "python": true, "typescript": true, "kotlin": true, "swift": true},
+        {"name": "check_chain_depth", "python": true, "typescript": true, "kotlin": true, "swift": true}
+      ]
+    },
+    {
+      "domain": "MCP",
+      "operations": [
+        {"name": "serve", "python": true, "typescript": true, "kotlin": false, "swift": true,
+         "exemptions": {"kotlin": "MCP module not implemented in Kotlin SDK"}},
+        {"name": "connect_client", "python": true, "typescript": true, "kotlin": false, "swift": true,
+         "exemptions": {"kotlin": "MCP module not implemented in Kotlin SDK"}},
+        {"name": "register_tool_handler", "python": true, "typescript": false, "kotlin": false, "swift": false,
+         "exemptions": {"typescript": "register_tool_handler not exposed in TypeScript SDK", "kotlin": "MCP module not implemented in Kotlin SDK", "swift": "register_tool_handler not exposed in Swift SDK"}}
+      ]
+    },
+    {
+      "domain": "Bridge",
+      "operations": [
+        {"name": "register", "python": true, "typescript": true, "kotlin": true, "swift": true},
+        {"name": "evaluate_trust", "python": true, "typescript": true, "kotlin": true, "swift": true},
+        {"name": "create_shadow", "python": true, "typescript": true, "kotlin": true, "swift": true}
+      ]
+    },
+    {
+      "domain": "Server",
+      "operations": [
+        {"name": "relay_start_in_memory", "python": true, "typescript": true, "kotlin": true, "swift": true},
+        {"name": "relay_start_local", "python": true, "typescript": true, "kotlin": true, "swift": true},
+        {"name": "relay_shutdown", "python": true, "typescript": true, "kotlin": true, "swift": true},
+        {"name": "node_start_in_memory", "python": true, "typescript": true, "kotlin": true, "swift": true},
+        {"name": "node_start_local", "python": true, "typescript": true, "kotlin": true, "swift": true},
+        {"name": "node_shutdown", "python": true, "typescript": true, "kotlin": true, "swift": true},
+        {"name": "node_enable_site_projection", "python": true, "typescript": true, "kotlin": true, "swift": true},
+        {"name": "node_commit_deploy", "python": true, "typescript": true, "kotlin": true, "swift": true},
+        {"name": "node_rollback_deploy", "python": true, "typescript": true, "kotlin": true, "swift": true},
+        {"name": "node_disable_site_projection", "python": true, "typescript": true, "kotlin": true, "swift": true}
+      ]
+    },
+    {
+      "domain": "Auth",
+      "operations": [
+        {"name": "scpid_challenge", "python": true, "typescript": true, "kotlin": true, "swift": true},
+        {"name": "scpid_sign", "python": true, "typescript": true, "kotlin": true, "swift": true},
+        {"name": "scpid_verify", "python": true, "typescript": true, "kotlin": true, "swift": true}
+      ]
+    }
+  ]
+}
