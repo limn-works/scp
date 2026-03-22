@@ -23,7 +23,7 @@ use super::storage::{BlobStorage, StorageError, StoredBlob};
 
 /// A clock function that returns the current Unix timestamp in seconds.
 ///
-/// The default ([`system_clock`]) delegates to [`scp_core::time::now_secs`].
+/// The default ([`system_clock`]) delegates to [`scp_primitives::time::now_secs`].
 /// Tests inject a deterministic clock via [`CombinedNodeStorage::open_with_clock`].
 pub type ClockFn = Arc<dyn Fn() -> Result<u64, StorageError> + Send + Sync>;
 
@@ -31,7 +31,8 @@ pub type ClockFn = Arc<dyn Fn() -> Result<u64, StorageError> + Send + Sync>;
 #[must_use]
 pub fn system_clock() -> ClockFn {
     Arc::new(|| {
-        scp_core::time::now_secs().map_err(|e| StorageError::Internal(format!("clock error: {e}")))
+        scp_primitives::time::now_secs()
+            .map_err(|e| StorageError::Internal(format!("clock error: {e}")))
     })
 }
 

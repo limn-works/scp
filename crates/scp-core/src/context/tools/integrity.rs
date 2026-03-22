@@ -16,7 +16,6 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use super::{ToolError, ToolId, ToolRegistry, ToolVerificationResult, VectorResult};
-use crate::time;
 use crate::trust::challenge::{ChallengeType, ChallengeVerification, VerificationMethod};
 use scp_identity::DID;
 
@@ -156,7 +155,7 @@ where
     let passed_count = vector_results.iter().filter(|r| r.passed).count();
     let integrity_ok = passed_count == vector_results.len();
 
-    let now = time::now_secs()?;
+    let now = scp_primitives::time::now_secs()?;
 
     let challenge_id = format!("tool-integrity-{tool_id}-{now}");
 
@@ -267,7 +266,7 @@ impl VerificationScheduler {
         tool_id: &str,
         interval_secs: u64,
     ) -> Result<&ToolVerificationSchedule, ToolError> {
-        let now = time::now_secs()?;
+        let now = scp_primitives::time::now_secs()?;
         let schedule = ToolVerificationSchedule {
             tool_id: tool_id.to_owned(),
             interval_secs,
@@ -312,7 +311,7 @@ impl VerificationScheduler {
     ///
     /// Returns [`ToolError::ClockError`] if the system clock is unavailable.
     pub fn tools_due_now(&self) -> Result<Vec<ToolId>, ToolError> {
-        let now = time::now_secs()?;
+        let now = scp_primitives::time::now_secs()?;
         Ok(self.tools_due_at(now))
     }
 
@@ -352,6 +351,7 @@ impl VerificationScheduler {
 mod tests {
     use super::*;
     use crate::context::tools::registry::{TestVector, ToolRegistration, ToolSchema};
+    use scp_primitives::Clock;
     use serde_json::json;
 
     fn make_registry(tool_id: &str, test_vectors: Vec<TestVector>) -> ToolRegistry {
@@ -585,7 +585,7 @@ mod tests {
         let mut scheduler = VerificationScheduler::new();
         scheduler.schedule_tool_verification("tool-b", 600).unwrap();
 
-        let now = time::now_secs().unwrap();
+        let now = scp_primitives::SystemClock.now_secs();
         scheduler.record_verification("tool-b", now);
 
         let schedule = scheduler.get_schedule("tool-b").unwrap();
@@ -631,7 +631,7 @@ mod tests {
         let due = scheduler.tools_due_now().unwrap();
         assert_eq!(due.len(), 3);
 
-        let now = time::now_secs().unwrap();
+        let now = scp_primitives::SystemClock.now_secs();
         scheduler.record_verification("t1", now);
         scheduler.record_verification("t2", now);
 

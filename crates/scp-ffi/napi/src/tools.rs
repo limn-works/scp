@@ -722,7 +722,7 @@ pub async fn tool_session_create(
         }
 
         let session_id = uuid::Uuid::new_v4().to_string();
-        let now_ms = scp_core::time::now_millis().map_err(|e| ScpNapiError::Tool {
+        let now_ms = scp_primitives::time::now_millis().map_err(|e| ScpNapiError::Tool {
             message: format!("clock error: {e}"),
             code: "SCP-TOOL-6016".to_owned(),
         })?;
@@ -818,7 +818,7 @@ pub async fn tool_session_invoke(
             })?;
 
         // Check expiry.
-        let now_ms = scp_core::time::now_millis().map_err(|e| ScpNapiError::Tool {
+        let now_ms = scp_primitives::time::now_millis().map_err(|e| ScpNapiError::Tool {
             message: format!("clock error: {e}"),
             code: "SCP-TOOL-6016".to_owned(),
         })?;
@@ -1096,7 +1096,7 @@ pub async fn tool_interface_revoke(
             })
         })?;
 
-    let now_ms = scp_core::time::now_millis().map_err(|e| {
+    let now_ms = scp_primitives::time::now_millis().map_err(|e| {
         napi::Error::from(ScpNapiError::Tool {
             message: format!("clock error: {e}"),
             code: "SCP-TOOL-6034".to_owned(),

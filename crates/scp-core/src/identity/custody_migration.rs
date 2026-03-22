@@ -32,7 +32,7 @@ use serde::{Deserialize, Serialize};
 
 use scp_identity::DID;
 
-use crate::time;
+use scp_primitives::time;
 
 // Re-use CustodyType from scp-platform to avoid duplication.
 // CustodyType is already defined in scp_platform::traits but scp-core doesn't

@@ -320,7 +320,7 @@ pub fn py_event_log_query(
         actor_did: String::new(),
         #[allow(clippy::cast_precision_loss)] // Unix timestamp seconds fit in f64 mantissa for centuries.
         timestamp: {
-            scp_core::time::now_secs()
+            scp_primitives::time::now_secs()
                 .map_err(|e| ScpPyError::context(format!("{e}")))? as f64
         },
         payload,

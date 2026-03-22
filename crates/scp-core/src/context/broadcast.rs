@@ -1534,6 +1534,7 @@ mod tests {
         InMemoryProofResolver, InMemoryRevocationChecker,
     };
     use crate::crypto::ucan::{Attenuation, UcanHeader, UcanPayload};
+    use scp_primitives::Clock;
     use std::collections::HashMap as StdHashMap;
 
     // AAD constants for sender-layer encrypt/decrypt in broadcast tests.
@@ -1623,8 +1624,8 @@ mod tests {
         use base64::engine::general_purpose::URL_SAFE_NO_PAD;
         use ed25519_dalek::Signer;
 
-        let now_secs = crate::time::now_secs().expect("clock unavailable in test");
-        let now_millis = crate::time::now_millis().expect("clock unavailable in test");
+        let now_secs = scp_primitives::SystemClock.now_secs();
+        let now_millis = scp_primitives::SystemClock.now_millis();
 
         let header = UcanHeader::new();
         let payload = UcanPayload {
@@ -1903,8 +1904,8 @@ mod tests {
             use base64::engine::general_purpose::URL_SAFE_NO_PAD;
             use ed25519_dalek::Signer;
 
-            let now_secs = crate::time::now_secs().expect("clock unavailable in test");
-            let now_millis = crate::time::now_millis().expect("clock unavailable in test");
+            let now_secs = scp_primitives::SystemClock.now_secs();
+            let now_millis = scp_primitives::SystemClock.now_millis();
 
             let header = UcanHeader::new();
             let payload = UcanPayload {
@@ -2480,8 +2481,8 @@ mod tests {
             use base64::engine::general_purpose::URL_SAFE_NO_PAD;
             use ed25519_dalek::Signer;
 
-            let now_secs = crate::time::now_secs().expect("clock unavailable in test");
-            let now_millis = crate::time::now_millis().expect("clock unavailable in test");
+            let now_secs = scp_primitives::SystemClock.now_secs();
+            let now_millis = scp_primitives::SystemClock.now_millis();
 
             let header = UcanHeader::new();
             let payload = UcanPayload {
@@ -2552,8 +2553,8 @@ mod tests {
             use base64::Engine;
             use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 
-            let now_secs = crate::time::now_secs().expect("clock unavailable in test");
-            let now_millis = crate::time::now_millis().expect("clock unavailable in test");
+            let now_secs = scp_primitives::SystemClock.now_secs();
+            let now_millis = scp_primitives::SystemClock.now_millis();
 
             let header = UcanHeader::new();
             let payload = UcanPayload {
@@ -4407,8 +4408,8 @@ mod tests {
             use base64::engine::general_purpose::URL_SAFE_NO_PAD;
             use ed25519_dalek::Signer as _;
 
-            let now_secs = crate::time::now_secs().expect("clock unavailable");
-            let now_millis = crate::time::now_millis().expect("clock unavailable");
+            let now_secs = scp_primitives::SystemClock.now_secs();
+            let now_millis = scp_primitives::SystemClock.now_millis();
 
             let header = UcanHeader::new();
             let payload = UcanPayload {

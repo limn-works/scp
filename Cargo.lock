@@ -5372,6 +5372,7 @@ version = "0.1.0-beta.1"
 dependencies = [
  "axum",
  "scp-core",
+ "scp-primitives",
  "serde",
  "serde_json",
  "subtle",
@@ -5424,6 +5425,7 @@ dependencies = [
  "scp-core",
  "scp-identity",
  "scp-platform",
+ "scp-primitives",
  "scp-transport",
  "serde",
  "serde_json",
@@ -5566,6 +5568,7 @@ dependencies = [
  "scp-core",
  "scp-identity",
  "scp-platform",
+ "scp-primitives",
  "scp-testing",
  "serde",
  "serde_bytes",

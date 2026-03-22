@@ -1043,8 +1043,8 @@ fn py_identity_migrate(py: Python<'_>, identity: &PyIdentity) -> PyResult<PyIden
                 .await
                 .map_err(|e| ScpPyError::identity(format!("key generation failed: {e}")))?;
 
-            let rotated_at =
-                scp_core::time::now_secs().map_err(|e| ScpPyError::identity(format!("{e}")))?;
+            let rotated_at = scp_primitives::time::now_secs()
+                .map_err(|e| ScpPyError::identity(format!("{e}")))?;
 
             let old_identity = ScpIdentity {
                 identity_key: old_identity_key,
@@ -1543,7 +1543,7 @@ fn py_identity_execute_recovery(
         };
 
         // Build key rotation outcome (step 1 is pre-completed by caller).
-        let now_ms = scp_core::time::now_millis()
+        let now_ms = scp_primitives::time::now_millis()
             .map_err(|e| ScpPyError::identity(format!("clock error: {e}")))?;
         let key_rotation = match compromise_tier {
             CompromiseTier::Agent => agent_key_rotation_outcome(&did_val, now_ms),

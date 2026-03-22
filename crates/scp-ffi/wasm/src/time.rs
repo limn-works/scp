@@ -43,7 +43,7 @@ pub fn now_ms() -> f64 {
 /// with integer arithmetic to match scp-core's `NonceTracker`.
 ///
 /// **ADR-034 behavior difference from NAPI:** The NAPI bridge (via
-/// `scp_core::time::now_secs()`) propagates errors on negative timestamps.
+/// `scp_primitives::time::now_secs()`) propagates errors on negative timestamps.
 /// The WASM bridge silently clamps negative `Date.now()` to 0. This is
 /// intentional per ADR-034 constraints — WASM cannot depend on scp-core,
 /// and `Date.now()` returning a negative value in a browser indicates clock

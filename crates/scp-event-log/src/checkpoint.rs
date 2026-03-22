@@ -1168,7 +1168,7 @@ fn compute_checkpoint_canonical_hash(
 /// Returns [`EventLogError::ClockError`] (via [`crate::time::ClockError`])
 /// if the system clock is before the Unix epoch.
 fn current_timestamp() -> Result<u64, crate::time::ClockError> {
-    crate::time::now_secs()
+    scp_primitives::time::now_secs()
 }
 
 // ---------------------------------------------------------------------------

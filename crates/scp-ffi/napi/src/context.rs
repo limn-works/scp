@@ -741,7 +741,7 @@ pub async fn context_send(
     if let (Some(custody), Some(signing_key)) = (&handle.in_memory_custody, handle.signing_key) {
         let context_id = handle.context_id.clone();
         let sender_did_str = identity_did.clone();
-        let now_ms = scp_core::time::now_millis().map_err(|e| {
+        let now_ms = scp_primitives::time::now_millis().map_err(|e| {
             NapiError::from(ScpNapiError::Crypto {
                 message: format!("clock error: {e}"),
                 code: "SCP-CRYPTO-4000".to_owned(),
@@ -953,7 +953,7 @@ pub fn context_subscribe(
                         Ok(Some((plaintext, sender_did))) => {
                             sequence_counter += 1.0;
                             #[allow(clippy::cast_precision_loss)]
-                            let ts = scp_core::time::now_secs().map_or(0.0, |s| s as f64);
+                            let ts = scp_primitives::time::now_secs().map_or(0.0, |s| s as f64);
                             let msg = NapiMessage {
                                 sender_did,
                                 payload: plaintext,
@@ -1832,7 +1832,7 @@ pub async fn context_execute_governance_action(
         rand::rngs::OsRng.fill_bytes(&mut proposal_id);
     }
 
-    let now = scp_core::time::now_secs().map_err(|e| {
+    let now = scp_primitives::time::now_secs().map_err(|e| {
         napi::Error::from_reason(format!(
             "system clock unavailable — cannot create governance proposal: {e}"
         ))

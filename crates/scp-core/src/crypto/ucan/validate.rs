@@ -1086,6 +1086,7 @@ mod tests {
     use crate::crypto::ucan::mint::{MintParams, compute_cid, mint_ucan};
     use scp_platform::testing::InMemoryKeyCustody;
     use scp_platform::traits::{KeyCustody, KeyType};
+    use scp_primitives::Clock;
 
     // -----------------------------------------------------------------------
     // Test helpers
@@ -2267,7 +2268,7 @@ mod tests {
 
     #[test]
     fn verify_expiry_rejects_token_with_exp_beyond_24h() {
-        let now = crate::time::now_secs().unwrap();
+        let now = scp_primitives::SystemClock.now_secs();
         let token = UcanToken {
             header: UcanHeader::new(),
             payload: UcanPayload {
@@ -2315,7 +2316,7 @@ mod tests {
 
     #[test]
     fn verify_expiry_rejects_not_yet_valid() {
-        let now = crate::time::now_secs().unwrap();
+        let now = scp_primitives::SystemClock.now_secs();
         let token = UcanToken {
             header: UcanHeader::new(),
             payload: UcanPayload {
@@ -2338,7 +2339,7 @@ mod tests {
 
     #[test]
     fn verify_expiry_accepts_valid_token() {
-        let now = crate::time::now_secs().unwrap();
+        let now = scp_primitives::SystemClock.now_secs();
         let token = UcanToken {
             header: UcanHeader::new(),
             payload: UcanPayload {
@@ -2360,7 +2361,7 @@ mod tests {
 
     #[test]
     fn verify_expiry_rejects_nbf_greater_than_exp() {
-        let now = crate::time::now_secs().unwrap();
+        let now = scp_primitives::SystemClock.now_secs();
         let token = UcanToken {
             header: UcanHeader::new(),
             payload: UcanPayload {
@@ -2386,7 +2387,7 @@ mod tests {
 
     #[test]
     fn verify_expiry_rejects_nbf_equal_to_exp() {
-        let now = crate::time::now_secs().unwrap();
+        let now = scp_primitives::SystemClock.now_secs();
         let exp_time = now + 3600;
         let token = UcanToken {
             header: UcanHeader::new(),
@@ -2413,7 +2414,7 @@ mod tests {
 
     #[test]
     fn verify_expiry_accepts_nbf_less_than_exp() {
-        let now = crate::time::now_secs().unwrap();
+        let now = scp_primitives::SystemClock.now_secs();
         let token = UcanToken {
             header: UcanHeader::new(),
             payload: UcanPayload {
@@ -2443,10 +2444,10 @@ mod tests {
     #[test]
     fn nonce_tracker_rejects_reused_nonce() {
         let mut tracker = InMemoryNonceTracker::new();
-        let now_millis = crate::time::now_millis().expect("clock unavailable in test");
+        let now_millis = scp_primitives::SystemClock.now_millis();
 
         let nonce = format!("{now_millis}-aabbccdd11223344aabbccdd11223344");
-        let expiry = crate::time::now_secs().unwrap() + 3600;
+        let expiry = scp_primitives::SystemClock.now_secs() + 3600;
 
         assert!(tracker.check_and_record(&nonce, expiry).is_ok());
         let result = tracker.check_and_record(&nonce, expiry);
@@ -2459,7 +2460,7 @@ mod tests {
     #[test]
     fn nonce_tracker_rejects_malformed_nonce() {
         let mut tracker = InMemoryNonceTracker::new();
-        let expiry = crate::time::now_secs().unwrap() + 3600;
+        let expiry = scp_primitives::SystemClock.now_secs() + 3600;
 
         // No separator.
         let result = tracker.check_and_record("nohyphen", expiry);
@@ -2471,7 +2472,7 @@ mod tests {
         assert!(matches!(result, Err(UcanError::NonceFormatInvalid(_))));
 
         // Hex suffix too short.
-        let now_millis = crate::time::now_millis().expect("clock unavailable in test");
+        let now_millis = scp_primitives::SystemClock.now_millis();
         let result = tracker.check_and_record(&format!("{now_millis}-aabb"), expiry);
         assert!(matches!(result, Err(UcanError::NonceFormatInvalid(_))));
     }
@@ -2741,11 +2742,11 @@ mod tests {
     // Clock error / epoch-0 bypass prevention (SCP-173)
     // -----------------------------------------------------------------------
 
-    /// Verify that `crate::time::now_secs()` returns `Ok` on a normal system
+    /// Verify that `scp_primitives::time::now_secs()` returns `Ok` on a normal system
     /// (Result signature works correctly after the `unwrap_or_default()` removal).
     #[test]
     fn now_secs_returns_ok_on_normal_system() {
-        let result = crate::time::now_secs();
+        let result = scp_primitives::time::now_secs();
         assert!(
             result.is_ok(),
             "now_secs() should succeed on a normal system"
@@ -3038,7 +3039,7 @@ mod tests {
 
         // Manually build a self-delegation root token (iss == aud, no key_scope)
         // bypassing mint_ucan which would now reject this.
-        let now = crate::time::now_secs().unwrap();
+        let now = scp_primitives::SystemClock.now_secs();
         let root_header = UcanHeader::new();
         let root_payload = UcanPayload {
             iss: did_a.clone(),
@@ -3140,7 +3141,7 @@ mod tests {
             payload: UcanPayload {
                 iss: "did:dht:z6MkA".into(),
                 aud: "did:dht:z6MkB".into(),
-                exp: crate::time::now_secs().unwrap() + 3600,
+                exp: scp_primitives::SystemClock.now_secs() + 3600,
                 nbf: None,
                 nnc: "1234567890000-aabbccdd11223344aabbccdd11223344".to_owned(),
                 att: vec![],
@@ -3196,7 +3197,7 @@ mod tests {
     /// 5-minute tolerance (300 seconds).
     #[test]
     fn verify_expiry_tolerates_recently_expired_token() {
-        let now = crate::time::now_secs().unwrap();
+        let now = scp_primitives::SystemClock.now_secs();
         let token = UcanToken {
             header: UcanHeader::new(),
             payload: UcanPayload {
@@ -3233,7 +3234,7 @@ mod tests {
     /// default 5-minute tolerance.
     #[test]
     fn verify_expiry_rejects_token_expired_beyond_tolerance() {
-        let now = crate::time::now_secs().unwrap();
+        let now = scp_primitives::SystemClock.now_secs();
         let token = UcanToken {
             header: UcanHeader::new(),
             payload: UcanPayload {
@@ -3264,7 +3265,7 @@ mod tests {
     /// default 5-minute tolerance.
     #[test]
     fn verify_expiry_tolerates_slightly_future_nbf() {
-        let now = crate::time::now_secs().unwrap();
+        let now = scp_primitives::SystemClock.now_secs();
         let token = UcanToken {
             header: UcanHeader::new(),
             payload: UcanPayload {
@@ -3301,7 +3302,7 @@ mod tests {
     /// the default 5-minute tolerance.
     #[test]
     fn verify_expiry_rejects_nbf_beyond_tolerance() {
-        let now = crate::time::now_secs().unwrap();
+        let now = scp_primitives::SystemClock.now_secs();
         let token = UcanToken {
             header: UcanHeader::new(),
             payload: UcanPayload {
@@ -3332,7 +3333,7 @@ mod tests {
     /// exactly at the 24h limit is valid; tolerance doesn't extend this bound.
     #[test]
     fn verify_expiry_too_far_ignores_tolerance() {
-        let now = crate::time::now_secs().unwrap();
+        let now = scp_primitives::SystemClock.now_secs();
         let token = UcanToken {
             header: UcanHeader::new(),
             payload: UcanPayload {
@@ -3363,7 +3364,7 @@ mod tests {
     /// tolerance. It is a structural token error, not a clock drift issue.
     #[test]
     fn verify_expiry_invalid_time_range_ignores_tolerance() {
-        let now = crate::time::now_secs().unwrap();
+        let now = scp_primitives::SystemClock.now_secs();
         let token = UcanToken {
             header: UcanHeader::new(),
             payload: UcanPayload {
@@ -3395,7 +3396,7 @@ mod tests {
     /// it's expired.
     #[test]
     fn verify_expiry_boundary_expired_at_exact_tolerance() {
-        let now = crate::time::now_secs().unwrap();
+        let now = scp_primitives::SystemClock.now_secs();
         let tolerance = 60u64;
         let token = UcanToken {
             header: UcanHeader::new(),
@@ -3440,7 +3441,7 @@ mod tests {
         // invalid token manually to verify the validation layer independently.
         let (custody, key_handle, issuer_did, pk_bytes) = setup_identity().await;
 
-        let now = crate::time::now_secs().unwrap();
+        let now = scp_primitives::SystemClock.now_secs();
         let header = UcanHeader::new();
         let payload = UcanPayload {
             iss: issuer_did.clone(),
@@ -4011,7 +4012,7 @@ mod tests {
         let (custody_creator, key_creator, creator_did, pk_creator) = setup_identity().await;
         let (_custody_agent, _key_agent, agent_did, _pk_agent) = setup_identity().await;
 
-        let now = crate::time::now_secs().unwrap();
+        let now = scp_primitives::SystemClock.now_secs();
         let caps = vec!["messages:write".to_owned()];
 
         // Manually construct a parent token where iss==aud and no key_scope.
@@ -4168,7 +4169,7 @@ mod tests {
             setup_identity().await;
         let (_custody_agent, _key_agent, agent_did, _pk_agent) = setup_identity().await;
 
-        let now = crate::time::now_secs().unwrap();
+        let now = scp_primitives::SystemClock.now_secs();
         let caps = vec!["messages:write".to_owned()];
 
         // Parent: creator -> delegator, with a key_scope/kid mismatch.
@@ -4281,7 +4282,7 @@ mod tests {
             setup_identity().await;
         let (_custody_agent, _key_agent, agent_did, _pk_agent) = setup_identity().await;
 
-        let now = crate::time::now_secs().unwrap();
+        let now = scp_primitives::SystemClock.now_secs();
 
         // Parent: creator -> delegator, with valid key_scope="#active" and
         // kid="#active" (matching).

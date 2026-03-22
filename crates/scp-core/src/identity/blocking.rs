@@ -38,7 +38,7 @@ use crate::crypto::sender_keys::{
 };
 use crate::identity::SigningKeyId;
 use crate::identity::block_list::{BlockListEvent, BlockListState};
-use crate::time;
+use scp_primitives::time;
 
 // ---------------------------------------------------------------------------
 // BlockOrchestrationError

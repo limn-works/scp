@@ -927,8 +927,8 @@ fn py_context_create(identity_did: &str, params: &Bound<'_, PyDict>) -> PyResult
             }
         };
 
-        let last_seen =
-            scp_core::time::now_secs().map_err(|e| PyRuntimeError::new_err(format!("{e}")))?;
+        let last_seen = scp_primitives::time::now_secs()
+            .map_err(|e| PyRuntimeError::new_err(format!("{e}")))?;
 
         let known = crate::runtime::KnownContext {
             routing_id,
@@ -1311,7 +1311,7 @@ fn drain_and_deliver(context_id: &str) {
                 ..
             } => {
                 #[allow(clippy::cast_precision_loss)]
-                let ts = scp_core::time::now_secs().map_or(0.0, |s| s as f64);
+                let ts = scp_primitives::time::now_secs().map_or(0.0, |s| s as f64);
                 (sender_did.to_string(), payload, ts)
             }
             scp_core::context::membership::ContextEvent::MemberJoined {
@@ -1319,7 +1319,7 @@ fn drain_and_deliver(context_id: &str) {
                 role_name,
             } => {
                 #[allow(clippy::cast_precision_loss)]
-                let ts = scp_core::time::now_secs().map_or(0.0, |s| s as f64);
+                let ts = scp_primitives::time::now_secs().map_or(0.0, |s| s as f64);
                 (
                     "scp:system".to_owned(),
                     format!("member_joined:{member_did}:{role_name}").into_bytes(),
@@ -1328,7 +1328,7 @@ fn drain_and_deliver(context_id: &str) {
             }
             scp_core::context::membership::ContextEvent::MemberLeft { member_did } => {
                 #[allow(clippy::cast_precision_loss)]
-                let ts = scp_core::time::now_secs().map_or(0.0, |s| s as f64);
+                let ts = scp_primitives::time::now_secs().map_or(0.0, |s| s as f64);
                 (
                     "scp:system".to_owned(),
                     format!("member_left:{member_did}").into_bytes(),
@@ -1337,7 +1337,7 @@ fn drain_and_deliver(context_id: &str) {
             }
             scp_core::context::membership::ContextEvent::SystemClose { initiator_did } => {
                 #[allow(clippy::cast_precision_loss)]
-                let ts = scp_core::time::now_secs().map_or(0.0, |s| s as f64);
+                let ts = scp_primitives::time::now_secs().map_or(0.0, |s| s as f64);
                 (
                     "scp:system".to_owned(),
                     format!("system_close:{initiator_did}").into_bytes(),
@@ -1346,7 +1346,7 @@ fn drain_and_deliver(context_id: &str) {
             }
             other => {
                 #[allow(clippy::cast_precision_loss)]
-                let ts = scp_core::time::now_secs().map_or(0.0, |s| s as f64);
+                let ts = scp_primitives::time::now_secs().map_or(0.0, |s| s as f64);
                 (
                     "scp:system".to_owned(),
                     format!("{other:?}").into_bytes(),

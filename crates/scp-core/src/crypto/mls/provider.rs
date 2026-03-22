@@ -722,7 +722,7 @@ impl ContextCryptoProvider for MlsCryptoProvider {
             rmp_serde::from_slice(request_bytes)
                 .map_err(|e| ContextError::CryptoFailed(format!("request deserialization: {e}")))?;
 
-        let now_secs = crate::time::now_secs()
+        let now_secs = scp_primitives::time::now_secs()
             .map_err(|e| ContextError::CryptoFailed(format!("clock error: {e}")))?;
 
         let mut contexts = self

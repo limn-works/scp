@@ -178,7 +178,8 @@ fn deterministic_id(counter: u64) -> [u8; 32] {
 ///
 /// Returns [`PaymentError::AdapterError`] if the system clock is unavailable.
 fn now_secs() -> Result<u64, PaymentError> {
-    scp_core::time::now_secs().map_err(|e| PaymentError::AdapterError(format!("clock error: {e}")))
+    scp_primitives::time::now_secs()
+        .map_err(|e| PaymentError::AdapterError(format!("clock error: {e}")))
 }
 
 // ---------------------------------------------------------------------------

@@ -30,7 +30,7 @@ use serde::{Deserialize, Serialize};
 use scp_identity::DID;
 
 use crate::context::manager::ContextManager;
-use crate::time;
+use scp_primitives::time;
 
 // ---------------------------------------------------------------------------
 // CompromiseTier — which key was compromised

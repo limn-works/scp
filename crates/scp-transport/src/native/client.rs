@@ -445,7 +445,7 @@ impl NativeRelayClient {
 
                     // Plausibility check: warn if relay timestamp deviates
                     // significantly from local wall-clock time.
-                    if let Ok(local_now) = scp_core::time::now_secs() {
+                    if let Ok(local_now) = scp_primitives::time::now_secs() {
                         let deviation = local_now.abs_diff(*stored_at);
                         if deviation > RELAY_TIMESTAMP_DEVIATION_THRESHOLD_SECS {
                             tracing::warn!(
@@ -506,7 +506,7 @@ impl NativeRelayClient {
                         break;
                     }
 
-                    let Ok(ts) = scp_core::time::now_secs() else {
+                    let Ok(ts) = scp_primitives::time::now_secs() else {
                         // Clock unavailable — skip this ping cycle.
                         continue;
                     };
@@ -850,7 +850,7 @@ impl NativeRelayClient {
                         // manipulation) to compute the reconnect window.
                         let since = last_local_receive.and_then(|instant| {
                             let elapsed = instant.elapsed();
-                            let now_unix = scp_core::time::now_secs().ok()?;
+                            let now_unix = scp_primitives::time::now_secs().ok()?;
                             Some(
                                 now_unix
                                     .saturating_sub(elapsed.as_secs())

@@ -663,7 +663,7 @@ impl NapiIdentity {
                     })
                 })?;
 
-            let rotated_at = scp_core::time::now_secs().map_err(|e| {
+            let rotated_at = scp_primitives::time::now_secs().map_err(|e| {
                 NapiError::from(ScpNapiError::Identity {
                     message: format!("failed to get current time: {e}"),
                     code: "SCP-IDENT-1009".to_owned(),
@@ -1632,7 +1632,7 @@ pub fn identity_execute_recovery(
         }
     };
 
-    let now_ms = scp_core::time::now_millis().map_err(|e| {
+    let now_ms = scp_primitives::time::now_millis().map_err(|e| {
         NapiError::from(ScpNapiError::Identity {
             message: format!("clock error: {e}"),
             code: "SCP-IDENT-1021".to_owned(),
