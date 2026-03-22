@@ -28,13 +28,13 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
-use super::{
+use crate::store::queue::DEFAULT_QUEUE_TTL_SECS;
+use scp_identity::DID;
+use scp_protocol::crypto::canonical::{CanonicalField, canonical_hash};
+use scp_protocol::sync::{
     CatchUpStatus, ContextId, Ed25519Signature, OfflineTier, SyncError, SyncEvent, SyncOutcome,
     SyncPolicy,
 };
-use crate::crypto::canonical::{CanonicalField, canonical_hash};
-use crate::store::queue::DEFAULT_QUEUE_TTL_SECS;
-use scp_identity::DID;
 
 // ---------------------------------------------------------------------------
 // SyncPhaseDriver (trait)

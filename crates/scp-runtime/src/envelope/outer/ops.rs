@@ -10,11 +10,11 @@ use sha2::{Digest, Sha256};
 use super::{OuterEnvelope, create_outer_envelope};
 use crate::crypto::mls::encrypt::{decrypt_with_sender_key, encrypt, serialize_ciphertext};
 use crate::crypto::mls::group::ScpMlsGroup;
-use crate::crypto::sender_keys::SenderKey;
-use crate::crypto::sender_keys::encrypt::{decrypt_sender_layer, encrypt_sender_layer};
-use crate::envelope::EnvelopeError;
 use crate::envelope::inner::{InnerEnvelope, verify_inner_signature};
-use crate::envelope::padding::strip_padding;
+use scp_protocol::crypto::sender_keys::SenderKey;
+use scp_protocol::crypto::sender_keys::encrypt::{decrypt_sender_layer, encrypt_sender_layer};
+use scp_protocol::envelope::EnvelopeError;
+use scp_protocol::envelope::padding::strip_padding;
 
 // ---------------------------------------------------------------------------
 // High-level send / receive path
@@ -260,12 +260,12 @@ mod seal_open_tests {
     use super::*;
     use crate::crypto::mls::credential::ScpCredential;
     use crate::crypto::mls::group::{add_member, create_group, generate_key_package, join_group};
-    use crate::crypto::sender_keys::generate_sender_key;
     use crate::envelope::inner::{
         InnerEnvelopeParams, MessageType, Provenance, create_inner_envelope,
     };
-    use crate::envelope::padding::strip_padding;
-    use crate::identity::SigningKeyId;
+    use scp_protocol::crypto::sender_keys::generate_sender_key;
+    use scp_protocol::envelope::padding::strip_padding;
+    use scp_protocol::identity::SigningKeyId;
 
     #[allow(clippy::unwrap_used)]
     fn test_credential(name: &str) -> ScpCredential {
@@ -1023,7 +1023,7 @@ mod seal_open_tests {
         use crate::crypto::mls::encrypt::{
             encrypt as mls_encrypt, serialize_ciphertext as mls_serialize,
         };
-        use crate::crypto::sender_keys::encrypt::encrypt_sender_layer;
+        use scp_protocol::crypto::sender_keys::encrypt::encrypt_sender_layer;
 
         let (mut alice_group, mut bob_group) = setup_mls_groups();
         let inner = create_test_inner(&alice_group, b"tamper target", None).await;

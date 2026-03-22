@@ -158,10 +158,6 @@ pub enum AccessKeyError {
     #[error("replayed access key request: nonce already seen")]
     ReplayedNonce,
 
-    /// The system clock is unavailable or before the Unix epoch.
-    #[error("clock error: {0}")]
-    ClockError(#[from] crate::time::ClockError),
-
     /// AES-256-GCM encryption failed.
     #[error("content encryption failed: {0}")]
     EncryptionFailed(String),

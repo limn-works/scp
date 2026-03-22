@@ -12,11 +12,11 @@ use sha2::{Digest, Sha256};
 use scp_platform::traits::{KeyCustody, KeyHandle};
 
 use super::{InnerEnvelope, InnerEnvelopeParams, SCP_INNER_ENVELOPE_VERSION};
-use crate::envelope::EnvelopeError;
+use scp_protocol::envelope::EnvelopeError;
 
 // These functions are in the inner envelope module.
-use crate::envelope::padding::pad_to_bucket;
 use scp_protocol::envelope::inner::{compute_canonical_hash, compute_provenance_hash};
+use scp_protocol::envelope::padding::pad_to_bucket;
 
 // ---------------------------------------------------------------------------
 // Construction
@@ -104,8 +104,8 @@ mod tests {
         MessageType, Provenance, enforce_inner_envelope_category_a, validate_inner_version,
         verify_inner_signature,
     };
-    use crate::envelope::padding::strip_padding;
-    use crate::identity::SigningKeyId;
+    use scp_protocol::envelope::padding::strip_padding;
+    use scp_protocol::identity::SigningKeyId;
 
     async fn setup() -> (InMemoryKeyCustody, KeyHandle) {
         let custody = InMemoryKeyCustody::new();
@@ -1240,24 +1240,24 @@ mod tests {
         #[derive(serde::Serialize)]
         struct ExtendedInnerEnvelope {
             version: u16,
-            #[serde(with = "crate::serde_util::serde_bounded_string")]
+            #[serde(with = "scp_protocol::serde_util::serde_bounded_string")]
             context_id: String,
-            #[serde(with = "crate::serde_util::serde_bounded_string")]
+            #[serde(with = "scp_protocol::serde_util::serde_bounded_string")]
             sender_did: String,
             epoch: u64,
             generation: u64,
             sequence: u64,
             timestamp: u64,
             message_type: MessageType,
-            #[serde(with = "crate::serde_util::serde_hash_32")]
+            #[serde(with = "scp_protocol::serde_util::serde_hash_32")]
             payload_hash: [u8; 32],
-            #[serde(with = "crate::serde_util::serde_bounded_bytes")]
+            #[serde(with = "scp_protocol::serde_util::serde_bounded_bytes")]
             payload: Vec<u8>,
             provenance: Option<Provenance>,
-            #[serde(with = "crate::serde_util::serde_hash_32")]
+            #[serde(with = "scp_protocol::serde_util::serde_hash_32")]
             provenance_hash: [u8; 32],
             signing_key_id: SigningKeyId,
-            #[serde(with = "crate::serde_util::serde_signature_64")]
+            #[serde(with = "scp_protocol::serde_util::serde_signature_64")]
             signature: [u8; 64],
             /// Field unknown to the current `InnerEnvelope` definition.
             v2_sender_trust_score: rmpv::Value,

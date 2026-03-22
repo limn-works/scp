@@ -34,10 +34,10 @@ use scp_primitives::Clock;
 
 use std::collections::HashSet;
 
-use super::capability::{CapabilityUri, verify_ceiling_compliance};
-use super::nonce::generate_nonce;
-use super::{Attenuation, UcanError, UcanHeader, UcanPayload, UcanToken};
-use crate::identity::SigningKeyId;
+use scp_protocol::crypto::ucan::capability::{CapabilityUri, verify_ceiling_compliance};
+use scp_protocol::crypto::ucan::nonce::generate_nonce;
+use scp_protocol::crypto::ucan::{Attenuation, UcanError, UcanHeader, UcanPayload, UcanToken};
+use scp_protocol::identity::SigningKeyId;
 
 /// Maximum token lifetime: 24 hours in seconds (spec section 9.5).
 const MAX_EXPIRY_SECS: u64 = 24 * 60 * 60;
@@ -261,7 +261,7 @@ pub async fn mint_ucan(
         .capabilities
         .iter()
         .map(|cap| {
-            let capability = crate::context::roles::Capability::new(cap);
+            let capability = scp_protocol::context::roles::Capability::new(cap);
             let (resource, action) = capability.ucan_resource_action();
             (resource.into_owned(), action.into_owned())
         })
@@ -274,7 +274,7 @@ pub async fn mint_ucan(
     let effective_ceiling = params
         .ceiling
         .clone()
-        .unwrap_or_else(|| crate::context::roles::default_ceiling().to_ucan_string_set());
+        .unwrap_or_else(|| scp_protocol::context::roles::default_ceiling().to_ucan_string_set());
     {
         let cap_uris: Vec<CapabilityUri> = parsed_caps
             .iter()
@@ -538,7 +538,7 @@ pub async fn delegate_ucan(
     let effective_ceiling = params
         .ceiling
         .clone()
-        .unwrap_or_else(|| crate::context::roles::default_ceiling().to_ucan_string_set());
+        .unwrap_or_else(|| scp_protocol::context::roles::default_ceiling().to_ucan_string_set());
     verify_attestation_ceiling_compliance(params.attenuated_capabilities, &effective_ceiling)?;
 
     // Step 3: Enforce 24-hour maximum expiry.

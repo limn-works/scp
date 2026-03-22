@@ -20,8 +20,8 @@ use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
 
-use crate::economy::types::{Amount, CurrencyCode, PaymentAdapterRef};
 use scp_identity::DidMethod;
+use scp_protocol::economy::types::{Amount, CurrencyCode, PaymentAdapterRef};
 
 /// The `.well-known/scp` JSON document.
 ///

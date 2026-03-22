@@ -16,7 +16,7 @@
 use scp_identity::DID;
 use scp_platform::traits::Storage;
 
-use crate::crypto::tofu::TofuRecord;
+use scp_protocol::crypto::tofu::TofuRecord;
 
 use super::{ProtocolRepository, StoreError};
 
@@ -82,8 +82,8 @@ impl<S: Storage> ProtocolRepository<S> {
 mod tests {
     use scp_platform::testing::InMemoryStorage;
 
-    use crate::crypto::tofu::{ObservedKeys, create_tofu_record};
     use crate::store::ProtocolRepository;
+    use scp_protocol::crypto::tofu::{ObservedKeys, create_tofu_record};
 
     fn test_did() -> scp_identity::DID {
         scp_identity::DID::from("did:dht:z6MkTofuTest")

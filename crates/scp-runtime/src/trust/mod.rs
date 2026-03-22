@@ -8,6 +8,3 @@ pub mod participation_service;
 
 // Async submodule re-exports remain here. Pure types are in scp-protocol.
 pub use crate::store::trust::ProtocolRepositoryTrustBridge;
-
-// Re-export pure modules from scp-protocol.
-pub use scp_protocol::trust::*;

@@ -764,7 +764,7 @@ impl ProductionRecoveryBackend {
     /// `execute_recovery` is async).
     fn block_on_async<F, T>(future: F) -> Result<T, RecoveryStepError>
     where
-        F: std::future::Future<Output = Result<T, crate::context::ContextError>>,
+        F: std::future::Future<Output = Result<T, scp_protocol::context::ContextError>>,
     {
         tokio::task::block_in_place(|| {
             let handle = tokio::runtime::Handle::current();
@@ -851,7 +851,7 @@ impl RecoveryBackend for ProductionRecoveryBackend {
         // compromised key scopes as Revoked. Then distribute the revocation
         // via a recovery notification so other members update their local
         // revocation lists.
-        use crate::crypto::ucan::revoke::RevocationList;
+        use scp_protocol::crypto::ucan::revoke::RevocationList;
 
         let scopes = key_rotation.rotated_key_scopes.join(",");
 
@@ -1815,12 +1815,10 @@ mod tests {
 
     /// Helper to create a minimal `ContextManager` for testing.
     fn test_context_manager() -> Arc<ContextManager> {
-        use crate::context::builder::{
-            ContextCreationError, ContextCryptoProvider, ContextEventLogProvider,
-            ContextTransportProvider,
-        };
+        use crate::context::builder::{ContextEventLogProvider, ContextTransportProvider};
         use crate::context::providers::event_log::EventLogEntry;
-        use crate::context::{ContextError, ContextParams};
+        use scp_protocol::context::builder::{ContextCreationError, ContextCryptoProvider};
+        use scp_protocol::context::{ContextError, ContextParams};
 
         struct TestCrypto;
         impl ContextCryptoProvider for TestCrypto {
@@ -1850,8 +1848,8 @@ mod tests {
                 _: &[u8; 32],
                 _: &str,
                 _: Option<&[u8]>,
-            ) -> Result<crate::context::builder::AddMemberOutput, ContextError> {
-                Ok(crate::context::builder::AddMemberOutput::default())
+            ) -> Result<scp_protocol::context::builder::AddMemberOutput, ContextError> {
+                Ok(scp_protocol::context::builder::AddMemberOutput::default())
             }
             fn remove_member(&self, _: &[u8; 32], _: &str) -> Result<(), ContextError> {
                 Ok(())
@@ -1933,10 +1931,10 @@ mod tests {
         creator_did: &DID,
         additional_members: &[&DID],
     ) {
-        use crate::context::ContextParams;
-        use crate::context::membership::KeyPackage;
-        use crate::context::params::{ContextMode, GovernanceModel};
-        use crate::context::roles::Capability;
+        use scp_protocol::context::ContextParams;
+        use scp_protocol::context::membership::KeyPackage;
+        use scp_protocol::context::params::{ContextMode, GovernanceModel};
+        use scp_protocol::context::roles::Capability;
 
         let params = ContextParams {
             mode: ContextMode::Encrypted,

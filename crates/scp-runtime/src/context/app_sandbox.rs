@@ -32,8 +32,8 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use super::ContextHandle;
-use super::roles::Capability;
 use scp_identity::DID;
+use scp_protocol::context::roles::Capability;
 
 // ---------------------------------------------------------------------------
 // SandboxError
@@ -878,10 +878,10 @@ pub fn format_unbind_event(event: &AppUnbindEvent) -> String {
 
 /// Produces RFC 8785 (JCS) canonical JSON bytes from a `serde_json::Value`.
 ///
-/// Delegates to [`crate::jcs::to_vec`] which uses `serde_json_canonicalizer`
+/// Delegates to [`scp_protocol::jcs::to_vec`] which uses `serde_json_canonicalizer`
 /// for true RFC 8785 compliance (key sorting, number formatting, escaping).
 fn canonical_json_bytes(value: &serde_json::Value) -> Result<Vec<u8>, SandboxError> {
-    crate::jcs::to_vec(value).map_err(SandboxError::SerializationFailed)
+    scp_protocol::jcs::to_vec(value).map_err(SandboxError::SerializationFailed)
 }
 
 // ---------------------------------------------------------------------------
@@ -1008,9 +1008,9 @@ pub fn declaration_content_hash(
 )]
 mod tests {
     use super::*;
-    use crate::context::ContextParams;
     use ed25519_dalek::SigningKey;
     use rand::rngs::OsRng;
+    use scp_protocol::context::ContextParams;
 
     /// Creates a test signing key and its corresponding did:key DID.
     fn test_keypair() -> (SigningKey, DID) {

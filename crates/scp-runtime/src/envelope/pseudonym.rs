@@ -31,7 +31,7 @@
 
 use scp_platform::traits::{KeyCustody, KeyHandle, PseudonymKeypair};
 
-use super::EnvelopeError;
+use scp_protocol::envelope::EnvelopeError;
 
 /// Derives a deterministic, context-scoped pseudonym keypair (v1, non-rotatable).
 ///

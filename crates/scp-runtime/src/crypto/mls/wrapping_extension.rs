@@ -4,7 +4,7 @@
 //! used exclusively for HPKE wrapping of sender key distributions (§9.16.1,
 //! §9.16.2). The public key is published as an MLS `LeafNode` extension named
 //! `scp_wrapping_key` so that other members can read it from the MLS tree
-//! when processing [`SenderKeyRequest`](crate::crypto::sender_keys::SenderKeyRequest)
+//! when processing [`SenderKeyRequest`](scp_protocol::crypto::sender_keys::SenderKeyRequest)
 //! messages.
 //!
 //! # Extension Type ID
@@ -437,13 +437,13 @@ mod tests {
     /// wrapping key -> requester decrypts successfully.
     #[tokio::test]
     async fn sender_key_request_response_with_wrapping_key() {
-        use crate::crypto::sender_keys::generate_sender_key;
         use crate::crypto::sender_keys::key_protocol::{
             HandleRequestParams, NonceDedup, handle_sender_key_request, open_sender_key_response,
             request_sender_key,
         };
         use scp_platform::testing::InMemoryKeyCustody;
         use scp_platform::traits::{KeyCustody, KeyType};
+        use scp_protocol::crypto::sender_keys::generate_sender_key;
         use std::collections::HashSet;
 
         let custody = InMemoryKeyCustody::new();
@@ -469,7 +469,7 @@ mod tests {
         .await
         .unwrap();
 
-        let request: crate::crypto::sender_keys::SenderKeyRequest =
+        let request: scp_protocol::crypto::sender_keys::SenderKeyRequest =
             rmp_serde::from_slice(&request_result.request_message).unwrap();
 
         // Alice handles the request.
@@ -493,7 +493,7 @@ mod tests {
         .unwrap()
         .expect("Alice should respond to non-blocked Bob");
 
-        let response: crate::crypto::sender_keys::SenderKeyResponse =
+        let response: scp_protocol::crypto::sender_keys::SenderKeyResponse =
             rmp_serde::from_slice(&response_bytes).unwrap();
 
         // Bob decrypts the response using his ephemeral wrapping key handle.
@@ -518,13 +518,13 @@ mod tests {
     /// tampering with the wrapping key causes signature verification failure.
     #[tokio::test]
     async fn tampered_wrapping_key_prevents_decryption() {
-        use crate::crypto::sender_keys::generate_sender_key;
         use crate::crypto::sender_keys::key_protocol::{
             HandleRequestParams, NonceDedup, generate_wrapping_keypair, handle_sender_key_request,
             request_sender_key,
         };
         use scp_platform::testing::InMemoryKeyCustody;
         use scp_platform::traits::{KeyCustody, KeyType};
+        use scp_protocol::crypto::sender_keys::generate_sender_key;
         use std::collections::HashSet;
 
         let custody = InMemoryKeyCustody::new();
@@ -547,7 +547,7 @@ mod tests {
         .await
         .unwrap();
 
-        let mut request: crate::crypto::sender_keys::SenderKeyRequest =
+        let mut request: scp_protocol::crypto::sender_keys::SenderKeyRequest =
             rmp_serde::from_slice(&request_result.request_message).unwrap();
 
         // Tamper: replace Bob's wrapping pubkey with a random key.

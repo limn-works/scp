@@ -4,6 +4,3 @@
 //! the async `timeout` module.
 
 pub mod timeout;
-
-// Re-export everything from scp-protocol::context::governance.
-pub use scp_protocol::context::governance::*;

@@ -21,9 +21,9 @@ use std::sync::Arc;
 use scp_platform::traits::Storage;
 
 use super::{ProtocolRepository, StoreError, sanitize_key_component};
-use crate::trust::TrustError;
-use crate::trust::aggregate::{CachedAttestation, TrustProtocolRepository};
-use crate::trust::challenge::ChallengeVerification;
+use scp_protocol::trust::TrustError;
+use scp_protocol::trust::aggregate::{CachedAttestation, TrustProtocolRepository};
+use scp_protocol::trust::challenge::ChallengeVerification;
 
 // ---------------------------------------------------------------------------
 // Key helpers
@@ -347,9 +347,9 @@ impl<S: Storage + 'static> TrustProtocolRepository for ProtocolRepositoryTrustBr
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
     use super::*;
-    use crate::trust::attestation::RevocationStatus;
-    use crate::trust::challenge::{ChallengeType, VerificationMethod};
-    use crate::trust::{Attestation, AttestationType};
+    use scp_protocol::trust::attestation::RevocationStatus;
+    use scp_protocol::trust::challenge::{ChallengeType, VerificationMethod};
+    use scp_protocol::trust::{Attestation, AttestationType};
 
     fn make_attestation(id: &str, subject: &str) -> Attestation {
         Attestation {

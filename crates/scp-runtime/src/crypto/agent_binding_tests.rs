@@ -20,10 +20,12 @@ mod tests {
     use scp_platform::testing::InMemoryKeyCustody;
     use scp_platform::traits::{KeyCustody, KeyType};
 
-    use crate::crypto::key_continuity::{KeyContinuityParty, compute_key_continuity_fingerprint};
-    use crate::crypto::ucan::UcanError;
     use crate::crypto::ucan::mint::{MintParams, mint_ucan};
-    use crate::crypto::ucan::validate::{
+    use scp_protocol::crypto::key_continuity::{
+        KeyContinuityParty, compute_key_continuity_fingerprint,
+    };
+    use scp_protocol::crypto::ucan::UcanError;
+    use scp_protocol::crypto::ucan::validate::{
         DEFAULT_CLOCK_SKEW_TOLERANCE_SECS, InMemoryDidResolver, InMemoryRevocationChecker,
         ValidationContext,
     };
@@ -221,15 +223,16 @@ mod tests {
                 .collect(),
             kid_keys: std::collections::HashMap::new(),
         };
-        let mut nonce_tracker = crate::crypto::ucan::validate::InMemoryNonceTracker::new();
+        let mut nonce_tracker = scp_protocol::crypto::ucan::validate::InMemoryNonceTracker::new();
         let revocation_checker = InMemoryRevocationChecker::new();
-        let proof_resolver = crate::crypto::ucan::validate::InMemoryProofResolver::new();
+        let proof_resolver = scp_protocol::crypto::ucan::validate::InMemoryProofResolver::new();
         let ceiling: HashSet<String> = ["messages:write".to_owned(), "messages:read".to_owned()]
             .into_iter()
             .collect();
 
-        let required_cap =
-            crate::crypto::ucan::capability::CapabilityUri::new("ctx-test", "messages", "write");
+        let required_cap = scp_protocol::crypto::ucan::capability::CapabilityUri::new(
+            "ctx-test", "messages", "write",
+        );
 
         let mut ctx = ValidationContext {
             did_resolver: &resolver,
@@ -243,7 +246,8 @@ mod tests {
             clock: &scp_primitives::SystemClock,
         };
 
-        let result = crate::crypto::ucan::validate::validate_ucan(&token, &required_cap, &mut ctx);
+        let result =
+            scp_protocol::crypto::ucan::validate::validate_ucan(&token, &required_cap, &mut ctx);
 
         // Must fail: root issuer is agent_did, not the context creator human_did.
         assert!(
@@ -316,11 +320,11 @@ mod tests {
 
     #[test]
     fn one_did_cannot_cast_two_governance_votes() {
-        use crate::context::governance::majority::MajorityVoteEngine;
-        use crate::context::governance::{
+        use scp_identity::DID;
+        use scp_protocol::context::governance::majority::MajorityVoteEngine;
+        use scp_protocol::context::governance::{
             GovernanceAction, GovernanceContext, GovernanceEngine, GovernanceError,
         };
-        use scp_identity::DID;
 
         let admin_did = DID::from("did:dht:z6MkAdmin");
         let voter_did = DID::from("did:dht:z6MkVoter");

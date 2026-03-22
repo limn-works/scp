@@ -27,7 +27,7 @@ use zeroize::Zeroizing;
 use scp_platform::traits::{KeyCustody, KeyHandle, KeyType};
 use scp_primitives::Clock;
 
-use super::{AccessKey, AccessKeyError};
+use scp_protocol::crypto::access_keys::{AccessKey, AccessKeyError};
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -280,7 +280,7 @@ pub fn handle_access_key_request(
     requester_public_key: &[u8],
     access_key: &AccessKey,
     now_secs: u64,
-    nonce_dedup: &mut crate::crypto::sender_keys::NonceDedup,
+    nonce_dedup: &mut scp_protocol::crypto::sender_keys::NonceDedup,
 ) -> Result<Vec<u8>, AccessKeyError> {
     // Verify the request signature.
     let valid = verify_access_key_request(request, requester_public_key)?;
@@ -573,7 +573,7 @@ fn compute_request_hash(
     timestamp: u64,
     wrapping_pubkey: &[u8],
 ) -> Vec<u8> {
-    use crate::crypto::canonical::{CanonicalField, canonical_hash};
+    use scp_protocol::crypto::canonical::{CanonicalField, canonical_hash};
 
     canonical_hash(
         "SCP-ACCESS-KEY-REQUEST-V1:",
@@ -598,7 +598,7 @@ fn verify_ed25519_signature(
     message: &[u8],
     signature: &[u8],
 ) -> Result<bool, AccessKeyError> {
-    match crate::crypto::ed25519::verify_ed25519_signature(public_key, message, signature) {
+    match scp_protocol::crypto::ed25519::verify_ed25519_signature(public_key, message, signature) {
         Ok(()) => Ok(true),
         Err(reason) => {
             if reason.starts_with("signature verification failed") {
@@ -618,8 +618,8 @@ fn verify_ed25519_signature(
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
-    use crate::crypto::access_keys::generate_access_key;
-    use crate::crypto::sender_keys::NonceDedup;
+    use scp_protocol::crypto::access_keys::generate_access_key;
+    use scp_protocol::crypto::sender_keys::NonceDedup;
 
     // -----------------------------------------------------------------------
     // Wire type serialization tests

@@ -671,7 +671,7 @@ impl<S: Storage> ProtocolRepository<S> {
 
     /// Stores the full broadcast context state for persistence across restarts.
     ///
-    /// Serializes the [`crate::context::broadcast::BroadcastContextSnapshot`] under
+    /// Serializes the [`scp_protocol::context::broadcast::BroadcastContextSnapshot`] under
     /// `context/{context_id}/broadcast_state`. The snapshot contains the
     /// admission policy, subscriber roster, and per-author key state
     /// (including key material, epochs, and block lists).
@@ -688,7 +688,7 @@ impl<S: Storage> ProtocolRepository<S> {
     pub async fn store_broadcast_state(
         &self,
         context_id: &str,
-        snapshot: &crate::context::broadcast::BroadcastContextSnapshot,
+        snapshot: &scp_protocol::context::broadcast::BroadcastContextSnapshot,
     ) -> Result<(), StoreError> {
         let key = broadcast_state_key(context_id)?;
         // Uses store_value_zeroize to clear serialized key material from memory.
@@ -701,7 +701,7 @@ impl<S: Storage> ProtocolRepository<S> {
     /// context (either the context is not broadcast, or it has not been
     /// persisted yet). The caller should reconstruct a `BroadcastContext`
     /// from the returned snapshot using
-    /// [`crate::context::broadcast::BroadcastContext::from_snapshot`].
+    /// [`scp_protocol::context::broadcast::BroadcastContext::from_snapshot`].
     ///
     /// See spec section 5.14 and §17.3.
     ///
@@ -712,7 +712,8 @@ impl<S: Storage> ProtocolRepository<S> {
     pub async fn load_broadcast_state(
         &self,
         context_id: &str,
-    ) -> Result<Option<crate::context::broadcast::BroadcastContextSnapshot>, StoreError> {
+    ) -> Result<Option<scp_protocol::context::broadcast::BroadcastContextSnapshot>, StoreError>
+    {
         let key = broadcast_state_key(context_id)?;
         self.load_value(&key).await
     }
@@ -775,7 +776,7 @@ impl<S: Storage> ProtocolRepository<S> {
     pub async fn store_ephemeral_metadata(
         &self,
         context_id: &str,
-        metadata: &crate::context::memory_scope::EphemeralContextMetadata,
+        metadata: &scp_protocol::context::memory_scope::EphemeralContextMetadata,
     ) -> Result<(), StoreError> {
         let key = ephemeral_metadata_key(context_id)?;
         self.store_value(&key, metadata).await
@@ -793,7 +794,8 @@ impl<S: Storage> ProtocolRepository<S> {
     pub async fn load_ephemeral_metadata(
         &self,
         context_id: &str,
-    ) -> Result<Option<crate::context::memory_scope::EphemeralContextMetadata>, StoreError> {
+    ) -> Result<Option<scp_protocol::context::memory_scope::EphemeralContextMetadata>, StoreError>
+    {
         let key = ephemeral_metadata_key(context_id)?;
         self.load_value(&key).await
     }
@@ -965,7 +967,7 @@ impl<S: Storage + 'static> crate::context::manager::ContextPersistence
     fn persist_broadcast(
         &self,
         context_id: &str,
-        snapshot: &crate::context::broadcast::BroadcastContextSnapshot,
+        snapshot: &scp_protocol::context::broadcast::BroadcastContextSnapshot,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let store = self.store.clone();
         let ctx_id = context_id.to_owned();
@@ -981,7 +983,7 @@ impl<S: Storage + 'static> crate::context::manager::ContextPersistence
         &self,
         context_id: &str,
     ) -> Result<
-        Option<crate::context::broadcast::BroadcastContextSnapshot>,
+        Option<scp_protocol::context::broadcast::BroadcastContextSnapshot>,
         Box<dyn std::error::Error + Send + Sync>,
     > {
         let store = self.store.clone();
@@ -1543,11 +1545,11 @@ mod tests {
     // Broadcast state persistence
     // -------------------------------------------------------------------
 
-    fn make_broadcast_snapshot() -> crate::context::broadcast::BroadcastContextSnapshot {
-        use crate::context::broadcast::{
+    fn make_broadcast_snapshot() -> scp_protocol::context::broadcast::BroadcastContextSnapshot {
+        use scp_protocol::context::broadcast::{
             AuthorStateSnapshot, BroadcastAdmission, BroadcastContextSnapshot, SubscriberRecord,
         };
-        use crate::crypto::sender_keys::generate_sender_key;
+        use scp_protocol::crypto::sender_keys::generate_sender_key;
 
         let mut subscribers = std::collections::HashMap::new();
         subscribers.insert(
@@ -1607,7 +1609,7 @@ mod tests {
         assert_eq!(loaded.context_id, "ctx-broadcast-1");
         assert_eq!(
             loaded.admission,
-            crate::context::broadcast::BroadcastAdmission::Open
+            scp_protocol::context::broadcast::BroadcastAdmission::Open
         );
         assert_eq!(loaded.subscribers.len(), 2);
         assert!(loaded.subscribers.contains_key("did:dht:z6MkSub1"));
@@ -1627,7 +1629,7 @@ mod tests {
 
     #[tokio::test]
     async fn store_broadcast_state_overwrites_previous() {
-        use crate::context::broadcast::BroadcastAdmission;
+        use scp_protocol::context::broadcast::BroadcastAdmission;
 
         let store = make_store();
         let snapshot1 = make_broadcast_snapshot();
@@ -1642,7 +1644,7 @@ mod tests {
         snapshot2.admission = BroadcastAdmission::Gated;
         snapshot2.subscribers.insert(
             "did:dht:z6MkSub3".to_owned(),
-            crate::context::broadcast::SubscriberRecord {
+            scp_protocol::context::broadcast::SubscriberRecord {
                 subscriber_did: "did:dht:z6MkSub3".to_owned(),
                 registered_at: 1_700_000_200,
                 has_ucan: true,
@@ -1700,9 +1702,9 @@ mod tests {
     }
 
     fn make_context_snapshot() -> crate::context::manager::ContextSnapshot {
-        use crate::context::membership::MembershipState;
-        use crate::context::roles::ContextRoleState;
-        use crate::context::{ContextParams, ContextState};
+        use scp_protocol::context::membership::MembershipState;
+        use scp_protocol::context::roles::ContextRoleState;
+        use scp_protocol::context::{ContextParams, ContextState};
 
         let mut membership = MembershipState::new();
         membership.add_member("did:dht:z6MkCreator".into(), "admin".into(), vec![]);
@@ -1710,7 +1712,7 @@ mod tests {
         let role_state = ContextRoleState::new(
             "ctx-snap-1",
             "did:dht:z6MkCreator",
-            crate::context::roles::CapabilityCeiling::new(std::iter::empty()),
+            scp_protocol::context::roles::CapabilityCeiling::new(std::iter::empty()),
             vec![],
             &scp_primitives::SystemClock,
         )
@@ -1734,7 +1736,7 @@ mod tests {
             pruning_policy: None,
             governance_model_config: None,
             economic_policy: None,
-            budget_tracker: crate::economy::budget::MemberBudgetTracker::new(),
+            budget_tracker: scp_protocol::economy::budget::MemberBudgetTracker::new(),
             approved_proposals: std::collections::HashMap::new(),
             governance_freeze: None,
             pending_ceiling_modification: None,
@@ -1762,7 +1764,7 @@ mod tests {
         assert!(loaded.is_some());
         let loaded = loaded.unwrap();
         assert_eq!(loaded.context_id, "ctx-snap-1");
-        assert_eq!(loaded.state, crate::context::ContextState::Active);
+        assert_eq!(loaded.state, scp_protocol::context::ContextState::Active);
         assert_eq!(loaded.ttl_remaining_secs, Some(300));
         assert!(loaded.membership.contains("did:dht:z6MkCreator"));
     }
@@ -1809,7 +1811,7 @@ mod tests {
         assert!(loaded.is_some());
         let loaded = loaded.unwrap();
         assert_eq!(loaded.context_id, "ctx-snap-1");
-        assert_eq!(loaded.state, crate::context::ContextState::Active);
+        assert_eq!(loaded.state, scp_protocol::context::ContextState::Active);
         assert_eq!(loaded.ttl_remaining_secs, Some(300));
     }
 

@@ -361,7 +361,7 @@ mod tests {
         AdapterCapabilities, PaymentAuthorization, PaymentError, PaymentMetadata, PaymentReceipt,
         RefundConfirmation, VerificationResult,
     };
-    use crate::economy::types::{Amount, CurrencyCode};
+    use scp_protocol::economy::types::{Amount, CurrencyCode};
 
     // -------------------------------------------------------------------
     // InMemoryCredentialStore — test-only implementation

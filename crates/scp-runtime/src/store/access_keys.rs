@@ -17,7 +17,7 @@
 use scp_platform::traits::Storage;
 use sha2::{Digest, Sha256};
 
-use crate::crypto::access_keys::AccessKey;
+use scp_protocol::crypto::access_keys::AccessKey;
 
 use super::{ProtocolRepository, StoreError, sanitize_key_component};
 
@@ -152,7 +152,7 @@ impl<S: Storage> ProtocolRepository<S> {
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
-    use crate::crypto::access_keys::generate_access_key;
+    use scp_protocol::crypto::access_keys::generate_access_key;
 
     fn make_store() -> ProtocolRepository<scp_platform::testing::InMemoryStorage> {
         ProtocolRepository::new_for_testing(scp_platform::testing::InMemoryStorage::new())

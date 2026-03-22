@@ -21,9 +21,8 @@ use serde::{Deserialize, Serialize};
 use scp_identity::DID;
 use scp_primitives::Clock;
 
-use super::ContextId;
+use scp_protocol::discovery::ContextId;
 
-// Import pure types from scp-protocol.
 pub use scp_protocol::discovery::addressing::{
     AddressResolution, AddressingError, HandleTarget, MAX_LOCAL_PART_LENGTH, PetnameStore,
     ResolutionLayer, ResolutionPath, TrustLevel,

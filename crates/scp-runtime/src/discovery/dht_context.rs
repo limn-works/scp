@@ -29,7 +29,7 @@ use scp_identity::DID;
 use scp_identity::dht_client::DhtClient;
 use scp_identity::{DidDht, DidMethod};
 
-use super::DiscoveryError;
+use scp_protocol::discovery::DiscoveryError;
 
 // ---------------------------------------------------------------------------
 // ContextDiscoveryResult
@@ -201,13 +201,16 @@ pub fn unpublish_context_from_did_document(
 ///
 /// See §18.4.
 pub fn resolve_context_uri(uri_str: &str) -> Result<ContextDiscoveryResult, DiscoveryError> {
-    let uri: crate::uri::ScpUri = uri_str.parse().map_err(|e: crate::uri::ScpUriError| {
-        DiscoveryError::InvalidCapabilities(format!("invalid scp:// URI: {e}"))
-    })?;
+    let uri: scp_protocol::uri::ScpUri =
+        uri_str
+            .parse()
+            .map_err(|e: scp_protocol::uri::ScpUriError| {
+                DiscoveryError::InvalidCapabilities(format!("invalid scp:// URI: {e}"))
+            })?;
 
     let mode = uri.mode().map(|m| match m {
-        crate::context::ContextMode::Encrypted => "encrypted".to_owned(),
-        crate::context::ContextMode::Broadcast => "broadcast".to_owned(),
+        scp_protocol::context::ContextMode::Encrypted => "encrypted".to_owned(),
+        scp_protocol::context::ContextMode::Broadcast => "broadcast".to_owned(),
     });
 
     Ok(ContextDiscoveryResult {

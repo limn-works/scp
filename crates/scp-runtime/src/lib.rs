@@ -34,11 +34,5 @@ pub mod sync;
 pub mod trust;
 pub mod well_known;
 
-// Re-export modules that moved to scp-protocol for backward compatibility.
-pub use scp_protocol::jcs;
-pub use scp_protocol::serde_util;
-pub use scp_protocol::time;
-pub use scp_protocol::uri;
-
 // Re-export the MLS module's primary types at the crate level for convenience.
 pub use crypto::mls;

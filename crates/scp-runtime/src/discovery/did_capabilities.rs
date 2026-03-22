@@ -20,9 +20,10 @@ use scp_identity::document::DidDocument;
 use scp_identity::{DidDht, DidMethod};
 use scp_primitives::Clock;
 
-use crate::trust::CapabilityUri;
+use scp_protocol::trust::CapabilityUri;
 
-use super::{DID, DiscoveryError};
+use scp_primitives::DID;
+use scp_protocol::discovery::DiscoveryError;
 
 /// The service type string for `SCPCapabilities` entries in DID documents.
 const SCP_CAPABILITIES_SERVICE_TYPE: &str = "SCPCapabilities";
@@ -526,7 +527,7 @@ mod tests {
         assert_eq!(caps[1], cap("scp:system:bridge-operation"));
         assert!(
             caps.iter()
-                .all(crate::trust::capability_uri::CapabilityUri::is_system)
+                .all(scp_protocol::trust::capability_uri::CapabilityUri::is_system)
         );
     }
 

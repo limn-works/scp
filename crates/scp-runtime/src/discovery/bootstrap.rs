@@ -21,7 +21,7 @@ use serde::{Deserialize, Serialize};
 use crate::well_known::{WellKnownScp, WellKnownValidationError};
 use scp_identity::DidMethod;
 
-use super::{ContextId, DiscoveryError};
+use scp_protocol::discovery::{ContextId, DiscoveryError};
 
 // ---------------------------------------------------------------------------
 // BootstrapContextEntry

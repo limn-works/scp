@@ -45,22 +45,24 @@ use std::time::Duration;
 use tokio::sync::Notify;
 use tokio::task::JoinHandle;
 
-use super::builder::{ContextCryptoProvider, ContextEventLogProvider, ContextTransportProvider};
-use super::membership::ContextEvent;
-use super::params::GovernanceModel;
-use super::roles::{self, ContextRoleState};
-use super::{ContextError, ContextHandle, ContextState, MemoryScope};
+use super::ContextHandle;
+use super::builder::{ContextEventLogProvider, ContextTransportProvider};
 use scp_identity::DID;
 use scp_primitives::Clock;
+use scp_protocol::context::builder::ContextCryptoProvider;
+use scp_protocol::context::membership::ContextEvent;
+use scp_protocol::context::params::GovernanceModel;
+use scp_protocol::context::roles::{self, ContextRoleState};
+use scp_protocol::context::{ContextError, ContextState, MemoryScope};
 
 // ---------------------------------------------------------------------------
 // context_id_to_bytes helper (mirrors manager.rs)
 // ---------------------------------------------------------------------------
 
 /// Uses the canonical SHA-256 context ID byte derivation.
-/// Delegates to [`super::context_id_bytes`] to match builder.rs.
+/// Delegates to [`scp_protocol::context::context_id_bytes`] to match builder.rs.
 fn context_id_to_bytes(context_id: &str) -> [u8; 32] {
-    super::context_id_bytes(context_id)
+    scp_protocol::context::context_id_bytes(context_id)
 }
 
 // ---------------------------------------------------------------------------
@@ -1234,13 +1236,11 @@ mod tests {
     use std::time::Duration;
 
     use super::*;
-    use crate::context::builder::{
-        ContextCreationError, ContextCryptoProvider, ContextEventLogProvider,
-        ContextTransportProvider,
-    };
-    use crate::context::params::ContextParams;
-    use crate::context::roles::{Capability, CapabilityCeiling, ContextRoleState};
+    use crate::context::builder::{ContextEventLogProvider, ContextTransportProvider};
     use scp_identity::cache::TestClock;
+    use scp_protocol::context::builder::{ContextCreationError, ContextCryptoProvider};
+    use scp_protocol::context::params::ContextParams;
+    use scp_protocol::context::roles::{Capability, CapabilityCeiling, ContextRoleState};
 
     #[derive(Default)]
     struct MockCrypto {
@@ -1281,8 +1281,8 @@ mod tests {
             _context_id: &[u8; 32],
             _member_did: &str,
             _key_package_bytes: Option<&[u8]>,
-        ) -> Result<crate::context::builder::AddMemberOutput, ContextError> {
-            Ok(crate::context::builder::AddMemberOutput::default())
+        ) -> Result<scp_protocol::context::builder::AddMemberOutput, ContextError> {
+            Ok(scp_protocol::context::builder::AddMemberOutput::default())
         }
         fn remove_member(
             &self,
@@ -2438,8 +2438,8 @@ mod tests {
             _context_id: &[u8; 32],
             _member_did: &str,
             _key_package_bytes: Option<&[u8]>,
-        ) -> Result<crate::context::builder::AddMemberOutput, ContextError> {
-            Ok(crate::context::builder::AddMemberOutput::default())
+        ) -> Result<scp_protocol::context::builder::AddMemberOutput, ContextError> {
+            Ok(scp_protocol::context::builder::AddMemberOutput::default())
         }
         fn remove_member(
             &self,
@@ -2879,8 +2879,8 @@ mod tests {
             _context_id: &[u8; 32],
             _member_did: &str,
             _key_package_bytes: Option<&[u8]>,
-        ) -> Result<crate::context::builder::AddMemberOutput, ContextError> {
-            Ok(crate::context::builder::AddMemberOutput::default())
+        ) -> Result<scp_protocol::context::builder::AddMemberOutput, ContextError> {
+            Ok(scp_protocol::context::builder::AddMemberOutput::default())
         }
         fn remove_member(
             &self,

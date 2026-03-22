@@ -28,10 +28,10 @@ use serde::{Deserialize, Serialize};
 use scp_primitives::Clock;
 
 use super::invoke::has_tool_invoke_capability;
-use super::registry::ToolRegistry;
-use super::schema::validate_value_against_schema;
-use super::{ToolError, ToolId};
 use scp_primitives::DID;
+use scp_protocol::context::tools::registry::ToolRegistry;
+use scp_protocol::context::tools::schema::validate_value_against_schema;
+use scp_protocol::context::tools::{ToolError, ToolId};
 
 /// Default maximum concurrent sessions per calling context (spec §6.2.1, ADR-043).
 ///
@@ -42,8 +42,9 @@ pub const DEFAULT_SESSION_CAP_PER_CALLER: u32 = 1000;
 
 /// Context identifier type alias.
 pub type ContextId = String;
-use crate::context::roles::ContextRoleState;
-use crate::context::{ContextHandle, ContextState};
+use crate::context::ContextHandle;
+use scp_protocol::context::ContextState;
+use scp_protocol::context::roles::ContextRoleState;
 
 // ---------------------------------------------------------------------------
 // ToolSession
@@ -394,9 +395,9 @@ mod tests {
     use std::collections::HashSet;
 
     use super::*;
-    use crate::context::ContextParams;
-    use crate::context::roles::{Capability, CapabilityCeiling, ContextRoleState};
-    use crate::context::tools::registry::{ToolRegistration, ToolSchema, register_tool};
+    use scp_protocol::context::ContextParams;
+    use scp_protocol::context::roles::{Capability, CapabilityCeiling, ContextRoleState};
+    use scp_protocol::context::tools::registry::{ToolRegistration, ToolSchema, register_tool};
 
     // -----------------------------------------------------------------------
     // Test helpers

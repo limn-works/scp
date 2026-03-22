@@ -14,8 +14,8 @@
 use std::collections::HashMap;
 use std::sync::Mutex;
 
-use crate::context::broadcast::BroadcastContextSnapshot;
 use crate::context::manager::{ContextPersistence, ContextSnapshot};
+use scp_protocol::context::broadcast::BroadcastContextSnapshot;
 
 // Re-export the canonical implementation.
 pub use crate::store::context::ProtocolRepositoryContextBridge;
@@ -152,10 +152,10 @@ mod tests {
     use super::*;
     use std::collections::HashSet;
 
-    use crate::context::ContextState;
-    use crate::context::membership::MembershipState;
-    use crate::context::params::ContextParams;
-    use crate::context::roles::{ContextRoleState, default_ceiling};
+    use scp_protocol::context::ContextState;
+    use scp_protocol::context::membership::MembershipState;
+    use scp_protocol::context::params::ContextParams;
+    use scp_protocol::context::roles::{ContextRoleState, default_ceiling};
 
     fn test_snapshot(context_id: &str) -> ContextSnapshot {
         let role_state = ContextRoleState::new(
@@ -185,7 +185,7 @@ mod tests {
             pruning_policy: None,
             governance_model_config: None,
             economic_policy: None,
-            budget_tracker: crate::economy::budget::MemberBudgetTracker::new(),
+            budget_tracker: scp_protocol::economy::budget::MemberBudgetTracker::new(),
             approved_proposals: std::collections::HashMap::new(),
             governance_freeze: None,
             pending_ceiling_modification: None,

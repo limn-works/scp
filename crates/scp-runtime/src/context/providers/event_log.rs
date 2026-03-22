@@ -40,7 +40,8 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use subtle::ConstantTimeEq;
 
-use crate::context::builder::{ContextCreationError, ContextEventLogProvider};
+use crate::context::builder::ContextEventLogProvider;
+use scp_protocol::context::builder::ContextCreationError;
 
 /// A single entry in a Merkle-chained event log.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -448,7 +449,7 @@ impl MerkleEventLogProvider {
     }
 
     /// Prunes event log entries before a checkpoint boundary based on a
-    /// [`PruningPolicy`](crate::context::governance::PruningPolicy).
+    /// [`PruningPolicy`](scp_protocol::context::governance::PruningPolicy).
     ///
     /// Called after creating a governance checkpoint (#1474). If the policy
     /// has time-based pruning configured, entries older than
@@ -470,7 +471,7 @@ impl MerkleEventLogProvider {
         &self,
         context_id: &[u8; 32],
         checkpoint_event_count: u64,
-        policy: &crate::context::governance::PruningPolicy,
+        policy: &scp_protocol::context::governance::PruningPolicy,
     ) -> Option<usize> {
         use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -700,33 +701,33 @@ impl ContextEventLogProvider for MerkleEventLogProvider {
     fn event_log_entries(
         &self,
         context_id: &[u8; 32],
-    ) -> Result<Option<Vec<EventLogEntry>>, crate::context::ContextError> {
+    ) -> Result<Option<Vec<EventLogEntry>>, scp_protocol::context::ContextError> {
         Ok(self.entries(context_id))
     }
 
     fn export_event_log_data(
         &self,
         context_id: &[u8; 32],
-    ) -> Result<Vec<u8>, crate::context::ContextError> {
+    ) -> Result<Vec<u8>, scp_protocol::context::ContextError> {
         self.export_event_log_entries(context_id)
-            .map_err(|e| crate::context::ContextError::EventLogFailed(e.to_string()))
+            .map_err(|e| scp_protocol::context::ContextError::EventLogFailed(e.to_string()))
     }
 
     fn import_event_log_data(
         &self,
         context_id: &[u8; 32],
         data: &[u8],
-    ) -> Result<(), crate::context::ContextError> {
+    ) -> Result<(), scp_protocol::context::ContextError> {
         self.import_event_log_entries(context_id, data)
-            .map_err(|e| crate::context::ContextError::EventLogFailed(e.to_string()))
+            .map_err(|e| scp_protocol::context::ContextError::EventLogFailed(e.to_string()))
     }
 
     fn event_log_merkle_root(
         &self,
         context_id: &[u8; 32],
-    ) -> Result<[u8; 32], crate::context::ContextError> {
+    ) -> Result<[u8; 32], scp_protocol::context::ContextError> {
         self.merkle_root(context_id).ok_or_else(|| {
-            crate::context::ContextError::EventLogFailed(format!(
+            scp_protocol::context::ContextError::EventLogFailed(format!(
                 "no event log for context {}",
                 hex::encode(context_id)
             ))
@@ -737,7 +738,7 @@ impl ContextEventLogProvider for MerkleEventLogProvider {
         &self,
         context_id: &[u8; 32],
         checkpoint_event_count: u64,
-        policy: &crate::context::governance::PruningPolicy,
+        policy: &scp_protocol::context::governance::PruningPolicy,
     ) -> Option<usize> {
         // Delegate to the concrete method on MerkleEventLogProvider.
         Self::prune_before_checkpoint(self, context_id, checkpoint_event_count, policy)

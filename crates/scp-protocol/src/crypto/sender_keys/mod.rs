@@ -201,10 +201,6 @@ pub enum SenderKeyError {
         actual: u64,
     },
 
-    /// The system clock is unavailable or before the Unix epoch.
-    #[error("clock error: {0}")]
-    ClockError(#[from] crate::time::ClockError),
-
     /// The requester is not a member of the context.
     ///
     /// Returned by [`key_protocol::handle_sender_key_request`] when

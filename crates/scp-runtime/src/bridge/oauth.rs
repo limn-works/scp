@@ -37,8 +37,8 @@ use rand::rngs::OsRng;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use super::BridgeMode;
 use super::credentials::{BridgeCredentialStore, CredentialError, CredentialType};
+use scp_protocol::bridge::BridgeMode;
 
 // ---------------------------------------------------------------------------
 // Constants

@@ -20,12 +20,12 @@ use rand::RngCore;
 use serde::{Deserialize, Serialize};
 use subtle::ConstantTimeEq;
 
-use crate::crypto::canonical::{CanonicalField, canonical_hash};
-use crate::crypto::ed25519::verify_ed25519_signature;
-use crate::identity::SigningKeyId;
 use scp_identity::decode_multibase_key;
 use scp_identity::resolver::DidResolver;
 use scp_platform::traits::{KeyCustody, KeyHandle};
+use scp_protocol::crypto::canonical::{CanonicalField, canonical_hash};
+use scp_protocol::crypto::ed25519::verify_ed25519_signature;
+use scp_protocol::identity::SigningKeyId;
 
 // ---------------------------------------------------------------------------
 // Protocol-field deserialization validator
@@ -548,7 +548,7 @@ pub async fn scpid_verify(
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
     use super::*;
-    use crate::crypto::canonical::{CanonicalField, canonical_hash};
+    use scp_protocol::crypto::canonical::{CanonicalField, canonical_hash};
 
     #[test]
     fn test_challenge_generation() {

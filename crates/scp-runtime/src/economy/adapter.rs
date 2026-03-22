@@ -16,7 +16,7 @@ use serde::{Deserialize, Serialize};
 
 use scp_identity::DID;
 
-use super::types::{Amount, CurrencyCode, PaidActionType};
+use scp_protocol::economy::types::{Amount, CurrencyCode, PaidActionType};
 
 // ---------------------------------------------------------------------------
 // ContextId (local alias)

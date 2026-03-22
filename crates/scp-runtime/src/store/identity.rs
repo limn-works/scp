@@ -16,7 +16,7 @@ use serde::{Deserialize, Serialize};
 
 use scp_identity::DID;
 
-use crate::identity::block_list::{BlockListEvent, BlockListState};
+use scp_protocol::identity::block_list::{BlockListEvent, BlockListState};
 
 use super::{ProtocolRepository, StoreError};
 

@@ -14,10 +14,10 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use subtle::ConstantTimeEq;
 
-use super::ContextError;
 use super::manager::ContextSnapshot;
 use crate::store::StoredValue;
 use scp_identity::DID;
+use scp_protocol::context::ContextError;
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -262,8 +262,8 @@ pub fn validate_export_for_import(export: &ContextExport) -> Result<(), ContextE
 /// `context_id`, state, `context_params`, and empty/default values for
 /// membership, `role_state`, and governance fields.
 fn strip_snapshot_for_public(snapshot: &ContextSnapshot) -> ContextSnapshot {
-    use super::membership::MembershipState;
-    use super::roles::{ContextRoleState, default_ceiling};
+    use scp_protocol::context::membership::MembershipState;
+    use scp_protocol::context::roles::{ContextRoleState, default_ceiling};
     use std::collections::{HashMap, HashSet};
 
     // Build a minimal role state with only the default ceiling.
@@ -296,7 +296,7 @@ fn strip_snapshot_for_public(snapshot: &ContextSnapshot) -> ContextSnapshot {
         pruning_policy: None,
         governance_model_config: None,
         economic_policy: snapshot.economic_policy.clone(),
-        budget_tracker: crate::economy::budget::MemberBudgetTracker::new(),
+        budget_tracker: scp_protocol::economy::budget::MemberBudgetTracker::new(),
         approved_proposals: HashMap::new(),
         governance_freeze: None,
         pending_ceiling_modification: None,
@@ -371,12 +371,12 @@ pub fn create_export(
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
     use super::*;
-    use crate::context::ContextState;
     use crate::context::builder::ContextEventLogProvider;
-    use crate::context::membership::MembershipState;
-    use crate::context::params::ContextParams;
     use crate::context::providers::event_log::MerkleEventLogProvider;
-    use crate::context::roles::{ContextRoleState, default_ceiling};
+    use scp_protocol::context::ContextState;
+    use scp_protocol::context::membership::MembershipState;
+    use scp_protocol::context::params::ContextParams;
+    use scp_protocol::context::roles::{ContextRoleState, default_ceiling};
     use std::collections::{HashMap, HashSet};
 
     /// Helper to build a test snapshot.
@@ -407,7 +407,7 @@ mod tests {
             pruning_policy: None,
             governance_model_config: None,
             economic_policy: None,
-            budget_tracker: crate::economy::budget::MemberBudgetTracker::new(),
+            budget_tracker: scp_protocol::economy::budget::MemberBudgetTracker::new(),
             read_revoked_members: HashSet::new(),
             read_exclusion_list: HashSet::new(),
             approved_proposals: HashMap::new(),
@@ -463,7 +463,7 @@ mod tests {
 
     #[test]
     fn roundtrip_export_with_events() {
-        let ctx_id_bytes = crate::context::context_id_bytes("ctx-roundtrip-2");
+        let ctx_id_bytes = scp_protocol::context::context_id_bytes("ctx-roundtrip-2");
         let event_log_data = create_event_log_data(
             &ctx_id_bytes,
             &["ContextCreated", "MemberJoined", "MessageSent"],
@@ -494,7 +494,7 @@ mod tests {
 
     #[test]
     fn roundtrip_preserves_all_fields() {
-        let ctx_id_bytes = crate::context::context_id_bytes("ctx-roundtrip-3");
+        let ctx_id_bytes = scp_protocol::context::context_id_bytes("ctx-roundtrip-3");
         let event_log_data = create_event_log_data(&ctx_id_bytes, &["E1", "E2", "E3", "E4", "E5"]);
 
         let mut snapshot = test_snapshot("ctx-roundtrip-3");
@@ -532,7 +532,7 @@ mod tests {
 
     #[test]
     fn verify_merkle_chain_valid_entries() {
-        let ctx_id_bytes = crate::context::context_id_bytes("ctx-merkle-1");
+        let ctx_id_bytes = scp_protocol::context::context_id_bytes("ctx-merkle-1");
         let data = create_event_log_data(
             &ctx_id_bytes,
             &["ContextCreated", "MemberJoined", "MessageSent"],
@@ -544,7 +544,7 @@ mod tests {
 
     #[test]
     fn verify_merkle_chain_detects_tampered_hash() {
-        let ctx_id_bytes = crate::context::context_id_bytes("ctx-merkle-2");
+        let ctx_id_bytes = scp_protocol::context::context_id_bytes("ctx-merkle-2");
         let provider = MerkleEventLogProvider::new();
         provider.init_event_log(&ctx_id_bytes).unwrap();
         provider.append_event(&ctx_id_bytes, "Event1").unwrap();
@@ -563,7 +563,7 @@ mod tests {
 
     #[test]
     fn verify_merkle_chain_detects_removed_entry() {
-        let ctx_id_bytes = crate::context::context_id_bytes("ctx-merkle-3");
+        let ctx_id_bytes = scp_protocol::context::context_id_bytes("ctx-merkle-3");
         let provider = MerkleEventLogProvider::new();
         provider.init_event_log(&ctx_id_bytes).unwrap();
         provider.append_event(&ctx_id_bytes, "Event1").unwrap();
@@ -585,7 +585,7 @@ mod tests {
 
     #[test]
     fn validate_export_succeeds_for_valid_export() {
-        let ctx_id_bytes = crate::context::context_id_bytes("ctx-validate-1");
+        let ctx_id_bytes = scp_protocol::context::context_id_bytes("ctx-validate-1");
         let event_log_data =
             create_event_log_data(&ctx_id_bytes, &["ContextCreated", "MemberJoined"]);
 
@@ -625,7 +625,7 @@ mod tests {
 
     #[test]
     fn validate_export_rejects_merkle_root_mismatch() {
-        let ctx_id_bytes = crate::context::context_id_bytes("ctx-validate-3");
+        let ctx_id_bytes = scp_protocol::context::context_id_bytes("ctx-validate-3");
         let event_log_data =
             create_event_log_data(&ctx_id_bytes, &["ContextCreated", "MemberJoined"]);
 
@@ -651,7 +651,7 @@ mod tests {
 
     #[test]
     fn validate_export_rejects_tampered_event_log() {
-        let ctx_id_bytes = crate::context::context_id_bytes("ctx-validate-4");
+        let ctx_id_bytes = scp_protocol::context::context_id_bytes("ctx-validate-4");
         let provider = MerkleEventLogProvider::new();
         provider.init_event_log(&ctx_id_bytes).unwrap();
         provider.append_event(&ctx_id_bytes, "Event1").unwrap();
@@ -710,7 +710,7 @@ mod tests {
 
     #[test]
     fn full_export_includes_all_data() {
-        let ctx_id_bytes = crate::context::context_id_bytes("ctx-full-1");
+        let ctx_id_bytes = scp_protocol::context::context_id_bytes("ctx-full-1");
         let event_log_data = create_event_log_data(&ctx_id_bytes, &["ContextCreated"]);
 
         let snapshot = test_snapshot("ctx-full-1");
@@ -736,7 +736,7 @@ mod tests {
 
     #[test]
     fn full_export_import_pipeline() {
-        let ctx_id_bytes = crate::context::context_id_bytes("ctx-pipeline-1");
+        let ctx_id_bytes = scp_protocol::context::context_id_bytes("ctx-pipeline-1");
         let event_log_data = create_event_log_data(
             &ctx_id_bytes,
             &[
@@ -810,7 +810,7 @@ mod tests {
 
     #[test]
     fn event_log_export_import_roundtrip() {
-        let ctx_id_bytes = crate::context::context_id_bytes("ctx-el-roundtrip");
+        let ctx_id_bytes = scp_protocol::context::context_id_bytes("ctx-el-roundtrip");
         let provider = MerkleEventLogProvider::new();
         provider.init_event_log(&ctx_id_bytes).unwrap();
         provider.append_event(&ctx_id_bytes, "Event1").unwrap();
@@ -852,7 +852,7 @@ mod tests {
 
     #[test]
     fn pruned_event_log_export_import_roundtrip() {
-        let ctx_id_bytes = crate::context::context_id_bytes("ctx-prune-roundtrip");
+        let ctx_id_bytes = scp_protocol::context::context_id_bytes("ctx-prune-roundtrip");
         let provider = MerkleEventLogProvider::new();
         provider.init_event_log(&ctx_id_bytes).unwrap();
         for i in 0..10 {

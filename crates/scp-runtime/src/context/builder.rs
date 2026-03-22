@@ -11,10 +11,10 @@
 //! traits ([`ContextCryptoProvider`], [`ContextTransportProvider`],
 //! [`ContextEventLogProvider`]) so the builder is fully testable with mocks.
 
-use super::templates::validate_against_template;
-use super::{ContextError, ContextHandle, ContextMode, ContextParams, ContextState};
+use super::ContextHandle;
+use scp_protocol::context::templates::validate_against_template;
+use scp_protocol::context::{ContextError, ContextMode, ContextParams, ContextState};
 
-// Type definitions that moved to scp-protocol.
 pub use scp_protocol::context::builder::{
     AddMemberOutput, ContextCreationError, ContextCryptoProvider,
 };
@@ -218,7 +218,7 @@ pub trait ContextEventLogProvider: Send + Sync {
     }
 
     /// Prunes event log entries before a checkpoint boundary based on a
-    /// [`PruningPolicy`](crate::context::governance::PruningPolicy).
+    /// [`PruningPolicy`](scp_protocol::context::governance::PruningPolicy).
     ///
     /// Called after creating a governance checkpoint (#1474). The default
     /// implementation is a no-op — providers that support pruning override
@@ -232,7 +232,7 @@ pub trait ContextEventLogProvider: Send + Sync {
         &self,
         _context_id: &[u8; 32],
         _checkpoint_event_count: u64,
-        _policy: &crate::context::governance::PruningPolicy,
+        _policy: &scp_protocol::context::governance::PruningPolicy,
     ) -> Option<usize> {
         None
     }
@@ -260,7 +260,7 @@ impl ContextTransportProvider for LocalTransportProvider {
     fn publish_context(
         &self,
         _context_id: &[u8; 32],
-        _params: &super::ContextParams,
+        _params: &ContextParams,
     ) -> Result<(), ContextCreationError> {
         Ok(())
     }
@@ -273,7 +273,7 @@ impl ContextTransportProvider for LocalTransportProvider {
         &self,
         _context_id: &[u8; 32],
         _encrypted_payload: &[u8],
-    ) -> Result<(), super::ContextError> {
+    ) -> Result<(), ContextError> {
         Ok(())
     }
 }
@@ -488,8 +488,13 @@ fn validate_params(params: &ContextParams) -> Result<(), ContextCreationError> {
     // Validate memory scope is permitted for the context mode (§5.11).
     // Broadcast contexts only support MemoryScope::Full — Ephemeral and
     // Summary require MLS group state destruction which broadcast mode lacks.
-    super::memory_scope::validate_memory_scope_for_broadcast(params.mode, params.memory_scope)
-        .map_err(|e| ContextCreationError::CreationFailed(e.to_string()))?;
+    scp_protocol::context::memory_scope::validate_memory_scope_for_broadcast(
+        params.mode,
+        params.memory_scope,
+    )
+    .map_err(|e: scp_protocol::context::ContextError| {
+        ContextCreationError::CreationFailed(e.to_string())
+    })?;
 
     // If a template is specified, validate all params match the template
     // definition exactly.
@@ -933,7 +938,7 @@ mod tests {
 
         let params = ContextParams {
             mode: ContextMode::Broadcast,
-            memory_scope: crate::context::MemoryScope::Full,
+            memory_scope: scp_protocol::context::MemoryScope::Full,
             ..ContextParams::default()
         };
 
@@ -1086,7 +1091,7 @@ mod tests {
 
         let params = ContextParams {
             mode: ContextMode::Broadcast,
-            memory_scope: crate::context::MemoryScope::Full,
+            memory_scope: scp_protocol::context::MemoryScope::Full,
             ..ContextParams::default()
         };
 
@@ -1290,7 +1295,7 @@ mod tests {
 
         let params = ContextParams {
             mode: ContextMode::Broadcast,
-            memory_scope: crate::context::MemoryScope::Full,
+            memory_scope: scp_protocol::context::MemoryScope::Full,
             ..ContextParams::default()
         };
 
@@ -1387,8 +1392,8 @@ mod tests {
     async fn create_context_rejects_mismatched_template_params() {
         use std::time::Duration;
 
-        use crate::context::params::{MemoryScope, TemplateId};
-        use crate::context::templates::template_params;
+        use scp_protocol::context::params::{MemoryScope, TemplateId};
+        use scp_protocol::context::templates::template_params;
 
         let crypto = MockCryptoProvider::default();
         let transport = MockTransportProvider::connected();
@@ -1425,8 +1430,8 @@ mod tests {
 
     #[tokio::test]
     async fn create_context_rejects_template_missing_required_ttl() {
-        use crate::context::params::TemplateId;
-        use crate::context::templates::template_params;
+        use scp_protocol::context::params::TemplateId;
+        use scp_protocol::context::templates::template_params;
 
         let crypto = MockCryptoProvider::default();
         let transport = MockTransportProvider::connected();
@@ -1459,8 +1464,8 @@ mod tests {
     async fn create_context_accepts_valid_template_params() {
         use std::time::Duration;
 
-        use crate::context::params::TemplateId;
-        use crate::context::templates::template_params;
+        use scp_protocol::context::params::TemplateId;
+        use scp_protocol::context::templates::template_params;
 
         let crypto = MockCryptoProvider::default();
         let transport = MockTransportProvider::connected();
@@ -1489,8 +1494,8 @@ mod tests {
     async fn create_context_rejects_wrong_mode_for_template() {
         use std::time::Duration;
 
-        use crate::context::params::TemplateId;
-        use crate::context::templates::template_params;
+        use scp_protocol::context::params::TemplateId;
+        use scp_protocol::context::templates::template_params;
 
         let crypto = MockCryptoProvider::default();
         let transport = MockTransportProvider::connected();
@@ -1559,7 +1564,7 @@ mod tests {
 
         let params = ContextParams {
             mode: ContextMode::Broadcast,
-            memory_scope: crate::context::MemoryScope::Ephemeral,
+            memory_scope: scp_protocol::context::MemoryScope::Ephemeral,
             ..ContextParams::default()
         };
 
@@ -1581,7 +1586,7 @@ mod tests {
 
         let params = ContextParams {
             mode: ContextMode::Broadcast,
-            memory_scope: crate::context::MemoryScope::Summary,
+            memory_scope: scp_protocol::context::MemoryScope::Summary,
             ..ContextParams::default()
         };
 
@@ -1603,7 +1608,7 @@ mod tests {
 
         let params = ContextParams {
             mode: ContextMode::Broadcast,
-            memory_scope: crate::context::MemoryScope::Full,
+            memory_scope: scp_protocol::context::MemoryScope::Full,
             ..ContextParams::default()
         };
 
@@ -1627,7 +1632,7 @@ mod tests {
 
         let params = ContextParams {
             mode: ContextMode::Encrypted,
-            memory_scope: crate::context::MemoryScope::Ephemeral,
+            memory_scope: scp_protocol::context::MemoryScope::Ephemeral,
             ..ContextParams::default()
         };
 

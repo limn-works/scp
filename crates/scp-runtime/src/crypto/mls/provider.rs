@@ -15,7 +15,7 @@
 //!
 //! See ADR-001 for the MLS wrapper design and ADR-007 for sender keys.
 //!
-//! [`ContextCryptoProvider`]: crate::context::builder::ContextCryptoProvider
+//! [`ContextCryptoProvider`]: scp_protocol::context::builder::ContextCryptoProvider
 //! [`ContextManager`]: crate::context::manager::ContextManager
 
 use std::collections::HashMap;
@@ -33,9 +33,9 @@ use zeroize::{Zeroize, Zeroizing};
 use super::credential::ScpCredential;
 use super::encrypt::{DecryptedContent, decrypt_with_sender_did, encrypt, serialize_ciphertext};
 use super::group::{self, SCP_CIPHERSUITE, ScpMlsGroup};
-use crate::context::ContextError;
-use crate::context::builder::{ContextCreationError, ContextCryptoProvider};
-use crate::crypto::sender_keys::{
+use scp_protocol::context::ContextError;
+use scp_protocol::context::builder::{ContextCreationError, ContextCryptoProvider};
+use scp_protocol::crypto::sender_keys::{
     NonceDedup, SenderKey, SenderKeyDistributionMessage, SenderKeyResponse, SenderKeyStore,
     generate_sender_key, generate_wrapping_keypair,
 };
@@ -436,7 +436,7 @@ impl ContextCryptoProvider for MlsCryptoProvider {
         context_id: &[u8; 32],
         member_did: &str,
         key_package_bytes: Option<&[u8]>,
-    ) -> Result<crate::context::builder::AddMemberOutput, ContextError> {
+    ) -> Result<scp_protocol::context::builder::AddMemberOutput, ContextError> {
         use tls_codec::Serialize as TlsSerializeTrait;
 
         let bytes = key_package_bytes.ok_or_else(|| {
@@ -491,7 +491,7 @@ impl ContextCryptoProvider for MlsCryptoProvider {
                 state.member_wrapping_keys.insert(member_did_owned, wk);
             }
 
-            Ok(crate::context::builder::AddMemberOutput {
+            Ok(scp_protocol::context::builder::AddMemberOutput {
                 welcome_bytes,
                 commit_bytes,
             })
@@ -719,7 +719,7 @@ impl ContextCryptoProvider for MlsCryptoProvider {
         let ctx_id_hex = hex::encode(context_id);
 
         // Deserialize the request.
-        let request: crate::crypto::sender_keys::SenderKeyRequest =
+        let request: scp_protocol::crypto::sender_keys::SenderKeyRequest =
             rmp_serde::from_slice(request_bytes)
                 .map_err(|e| ContextError::CryptoFailed(format!("request deserialization: {e}")))?;
 
@@ -734,9 +734,11 @@ impl ContextCryptoProvider for MlsCryptoProvider {
         })?;
 
         // Verify the request signature.
-        let valid =
-            crate::crypto::sender_keys::verify_sender_key_request(&request, requester_public_key)
-                .map_err(|e| ContextError::CryptoFailed(format!("signature verification: {e}")))?;
+        let valid = scp_protocol::crypto::sender_keys::verify_sender_key_request(
+            &request,
+            requester_public_key,
+        )
+        .map_err(|e| ContextError::CryptoFailed(format!("signature verification: {e}")))?;
         if !valid {
             return Err(ContextError::CryptoFailed(
                 "sender key request signature verification failed".to_string(),
@@ -744,8 +746,10 @@ impl ContextCryptoProvider for MlsCryptoProvider {
         }
 
         // Timestamp freshness.
-        crate::crypto::sender_keys::validate_sender_key_request_freshness(&request, now_secs)
-            .map_err(|e| ContextError::CryptoFailed(format!("freshness check: {e}")))?;
+        scp_protocol::crypto::sender_keys::validate_sender_key_request_freshness(
+            &request, now_secs,
+        )
+        .map_err(|e| ContextError::CryptoFailed(format!("freshness check: {e}")))?;
 
         // Nonce replay protection.
         if state.nonce_dedup.is_replayed(&request.nonce, now_secs) {
@@ -797,15 +801,16 @@ impl ContextCryptoProvider for MlsCryptoProvider {
         self.with_context(context_id, |state| {
             let ctx_str = hex::encode(context_id);
             // Step 1: Encrypt payload with sender key (AES-256-GCM, ADR-007).
-            let sender_encrypted = crate::crypto::sender_keys::encrypt::encrypt_sender_layer(
-                &state.sender_key,
-                payload,
-                &ctx_str,
-                &self.local_did,
-                epoch,
-                sequence,
-            )
-            .map_err(|e| ContextError::CryptoFailed(e.to_string()))?;
+            let sender_encrypted =
+                scp_protocol::crypto::sender_keys::encrypt::encrypt_sender_layer(
+                    &state.sender_key,
+                    payload,
+                    &ctx_str,
+                    &self.local_did,
+                    epoch,
+                    sequence,
+                )
+                .map_err(|e| ContextError::CryptoFailed(e.to_string()))?;
 
             // Step 2: Encrypt via MLS application message (ADR-001).
             let mls_message = encrypt(&mut state.mls_group, &sender_encrypted)
@@ -851,7 +856,7 @@ impl ContextCryptoProvider for MlsCryptoProvider {
                         })?;
 
                     // Step 3: Sender key decrypt (AES-256-GCM, ADR-007).
-                    let plaintext = crate::crypto::sender_keys::decrypt_sender_layer(
+                    let plaintext = scp_protocol::crypto::sender_keys::decrypt_sender_layer(
                         &sender_key,
                         &mls_decrypted,
                         &ctx_str,
@@ -1719,11 +1724,12 @@ mod tests {
             "serialized message should be non-empty"
         );
 
-        let msg =
-            crate::crypto::sender_keys::SenderKeyDistributionMessage::from_bytes(&pending[0].1)
-                .unwrap();
+        let msg = scp_protocol::crypto::sender_keys::SenderKeyDistributionMessage::from_bytes(
+            &pending[0].1,
+        )
+        .unwrap();
         match msg {
-            crate::crypto::sender_keys::SenderKeyDistributionMessage::KeyResponse(resp) => {
+            scp_protocol::crypto::sender_keys::SenderKeyDistributionMessage::KeyResponse(resp) => {
                 assert_eq!(resp.sender_did, TEST_DID);
                 assert_eq!(resp.epoch, 0);
             }

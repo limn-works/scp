@@ -33,9 +33,9 @@ use std::sync::Mutex;
 
 use serde::{Deserialize, Serialize};
 
-use super::{ContextId, Ed25519Signature, SyncError, SyncOutcome};
-use crate::crypto::canonical::{CanonicalField, canonical_hash};
 use scp_identity::DID;
+use scp_protocol::crypto::canonical::{CanonicalField, canonical_hash};
+use scp_protocol::sync::{ContextId, Ed25519Signature, SyncError, SyncOutcome};
 
 /// Safely compare a `u64` against a `usize` without truncation.
 ///
@@ -64,14 +64,14 @@ pub const MAX_EPOCH_DRIFT: u64 = 1_000;
 
 /// Maximum offline duration in seconds before forced re-join is required.
 ///
-/// Equals [`super::TIER_2_THRESHOLD_SECS`] (7 days). Any offline duration
+/// Equals [`scp_protocol::sync::TIER_2_THRESHOLD_SECS`] (7 days). Any offline duration
 /// exceeding this triggers Tier 3 recovery. Defined separately for clarity
 /// and to allow governance-configurable overrides.
 ///
 /// For policy-aware code, use `SyncPolicy::tier_2_threshold_secs` instead.
 ///
 /// See ADR-029 section 4 trigger condition 1.
-pub const MAX_OFFLINE_DURATION_SECS: u64 = super::TIER_2_THRESHOLD_SECS;
+pub const MAX_OFFLINE_DURATION_SECS: u64 = scp_protocol::sync::TIER_2_THRESHOLD_SECS;
 
 /// Timeout for waiting for a Welcome message after publishing a
 /// [`ResetRequest`], in seconds.
@@ -2082,7 +2082,7 @@ mod tests {
 
     #[test]
     fn canonical_hash_uses_correct_domain_separator() {
-        use crate::crypto::canonical::{CanonicalField as CF, canonical_hash as ch};
+        use scp_protocol::crypto::canonical::{CanonicalField as CF, canonical_hash as ch};
 
         let request = ResetRequest {
             context_id: "ctx-1".to_owned(),

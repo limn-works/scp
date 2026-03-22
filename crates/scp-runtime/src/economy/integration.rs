@@ -20,9 +20,9 @@ use serde::{Deserialize, Serialize};
 use super::adapter::{
     ContextId, PaymentAdapter, PaymentAuthorization, PaymentError, PaymentMetadata, PaymentReceipt,
 };
-use super::policy::{ObservableMetrics, evaluate_cost, verify_cost_sufficiency};
-use super::types::{Amount, EconomicPolicy, PaidActionType};
 use scp_identity::DID;
+use scp_protocol::economy::policy::{ObservableMetrics, evaluate_cost, verify_cost_sufficiency};
+use scp_protocol::economy::types::{Amount, EconomicPolicy, PaidActionType};
 
 // ---------------------------------------------------------------------------
 // IntegrationError
@@ -48,7 +48,7 @@ pub enum IntegrationError {
         /// Payer's authorized amount.
         provided: Amount,
         /// Receiver's observed metric values at evaluation time.
-        metric_snapshot: Vec<(super::types::PricingMetric, u64)>,
+        metric_snapshot: Vec<(scp_protocol::economy::types::PricingMetric, u64)>,
     },
     /// Step 5: Receiving side authorization verification failed -- the
     /// authorization could not be verified by the adapter (forged, expired,
@@ -363,7 +363,7 @@ mod tests {
     use crate::economy::adapter::{
         AdapterCapabilities, PaymentMetadata, RefundConfirmation, VerificationResult,
     };
-    use crate::economy::types::{CostSchedule, CurrencyCode};
+    use scp_protocol::economy::types::{CostSchedule, CurrencyCode};
 
     // -----------------------------------------------------------------------
     // TestAdapter -- in-memory ledger for testing

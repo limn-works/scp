@@ -38,7 +38,7 @@ use tokio::task::JoinHandle;
 
 use scp_identity::DID;
 
-use super::{
+use scp_protocol::context::governance::{
     DeadlockJustification, GovernanceContext, GovernanceEngine, GovernanceEvent,
     GovernanceModelConfig,
 };
@@ -548,10 +548,10 @@ mod tests {
     use std::sync::Arc;
 
     use super::*;
-    use crate::context::governance::majority::MajorityVoteEngine;
-    use crate::context::governance::multisig::ThresholdEngine;
-    use crate::context::governance::unanimity::UnanimityEngine;
-    use crate::context::governance::{
+    use scp_protocol::context::governance::majority::MajorityVoteEngine;
+    use scp_protocol::context::governance::multisig::ThresholdEngine;
+    use scp_protocol::context::governance::unanimity::UnanimityEngine;
+    use scp_protocol::context::governance::{
         GovernanceAction, GovernanceEngine, KeyResolver, ProposalStatus, SingleAdminEngine,
     };
 

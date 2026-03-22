@@ -20,10 +20,12 @@ use std::sync::Arc;
 
 use tokio::sync::Mutex;
 
-use super::builder::{ContextCryptoProvider, ContextEventLogProvider, ContextTransportProvider};
-use super::templates::template_params;
-use super::{ContextError, ContextHandle, ContextState, TemplateId};
+use super::ContextHandle;
+use super::builder::{ContextEventLogProvider, ContextTransportProvider};
 use scp_identity::DID;
+use scp_protocol::context::builder::ContextCryptoProvider;
+use scp_protocol::context::templates::template_params;
+use scp_protocol::context::{ContextError, ContextState, TemplateId};
 
 // ---------------------------------------------------------------------------
 // StandingChannelError
@@ -211,7 +213,7 @@ impl StandingChannelManager {
             let state = handle.state().await;
             if state == ContextState::Active {
                 let context_id = handle.context_id();
-                let context_id_bytes = super::context_id_bytes(context_id);
+                let context_id_bytes = scp_protocol::context::context_id_bytes(context_id);
                 // Reconnect transport by publishing the context (re-subscribing
                 // to the relay for this context's messages).
                 self.transport
@@ -326,11 +328,9 @@ mod tests {
     use std::sync::atomic::{AtomicBool, Ordering};
 
     use super::*;
-    use crate::context::builder::{
-        ContextCreationError, ContextCryptoProvider, ContextEventLogProvider,
-        ContextTransportProvider,
-    };
-    use crate::context::{ContextParams, ContextState};
+    use crate::context::builder::{ContextEventLogProvider, ContextTransportProvider};
+    use scp_protocol::context::builder::{ContextCreationError, ContextCryptoProvider};
+    use scp_protocol::context::{ContextParams, ContextState};
 
     // -----------------------------------------------------------------------
     // Mock providers (mirrors manager.rs test mocks)
@@ -377,8 +377,8 @@ mod tests {
             _context_id: &[u8; 32],
             _member_did: &str,
             _key_package_bytes: Option<&[u8]>,
-        ) -> Result<crate::context::builder::AddMemberOutput, ContextError> {
-            Ok(crate::context::builder::AddMemberOutput::default())
+        ) -> Result<scp_protocol::context::builder::AddMemberOutput, ContextError> {
+            Ok(scp_protocol::context::builder::AddMemberOutput::default())
         }
 
         fn remove_member(

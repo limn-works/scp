@@ -39,11 +39,11 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use subtle::ConstantTimeEq;
 
-use super::{
+use scp_identity::DID;
+use scp_protocol::crypto::canonical::{CanonicalField, canonical_hash};
+use scp_protocol::sync::{
     ContextId, Ed25519Signature, EquivocationAlert, SyncError, SyncEvent, SyncOutcome, SyncPolicy,
 };
-use crate::crypto::canonical::{CanonicalField, canonical_hash};
-use scp_identity::DID;
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -53,10 +53,10 @@ use scp_identity::DID;
 ///
 /// If the MLS epoch gap exceeds this limit, the SDK switches to Welcome-based
 /// fast-forward instead of processing Commits sequentially. Value matches
-/// [`super::MAX_SEQUENTIAL_COMMITS`] from the parent module (ADR-029 section 3).
+/// [`scp_protocol::sync::MAX_SEQUENTIAL_COMMITS`] from the parent module (ADR-029 section 3).
 ///
 /// For policy-aware code, use [`SyncPolicy::max_sequential_commits`] instead.
-pub const MAX_EPOCH_GAP_FOR_SEQUENTIAL: u64 = super::MAX_SEQUENTIAL_COMMITS;
+pub const MAX_EPOCH_GAP_FOR_SEQUENTIAL: u64 = scp_protocol::sync::MAX_SEQUENTIAL_COMMITS;
 
 /// Domain separator for `ContextSnapshot` canonical hash (§9.18.2, §23.16.4).
 pub const CONTEXT_SNAPSHOT_DOMAIN_SEPARATOR: &str = "SCP-CONTEXT-SNAPSHOT-V1:";

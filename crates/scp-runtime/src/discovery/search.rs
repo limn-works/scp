@@ -11,9 +11,11 @@ use std::collections::HashMap;
 
 use scp_primitives::Clock;
 
-use super::{
-    AgentSearchParams, AgentSearchResult, ContextId, DID, DataProvenance, DiscoveryError,
-    DiscoveryQuery, DiscoveryResult, DiscoveryResultEntry,
+use scp_primitives::DID;
+use scp_protocol::discovery::context::{AgentSearchParams, AgentSearchResult};
+use scp_protocol::discovery::{
+    ContextId, DataProvenance, DiscoveryError, DiscoveryQuery, DiscoveryResult,
+    DiscoveryResultEntry,
 };
 
 // ---------------------------------------------------------------------------

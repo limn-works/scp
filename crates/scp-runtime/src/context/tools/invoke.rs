@@ -15,21 +15,22 @@ use std::future::Future;
 use std::hash::BuildHasher;
 use std::time::Duration;
 
-use super::ToolId;
-use super::lifecycle::{
+use crate::context::ContextHandle;
+use scp_primitives::DID;
+use scp_protocol::context::ContextState;
+use scp_protocol::context::roles::{Capability, ContextRoleState};
+use scp_protocol::context::tools::ToolId;
+use scp_protocol::context::tools::lifecycle::{
     DEFAULT_TIMEOUT_MS, MAX_TIMEOUT_MS, ToolInvokedEvent, ToolStatus, sha256_json,
 };
-use super::registry::ToolRegistry;
-use super::schema::validate_value_against_schema;
-use crate::context::roles::{Capability, ContextRoleState};
-use crate::context::{ContextHandle, ContextState};
-use crate::crypto::ucan::UcanError;
-use crate::crypto::ucan::capability::CapabilityUri;
-use crate::crypto::ucan::validate::{
+use scp_protocol::context::tools::registry::ToolRegistry;
+use scp_protocol::context::tools::schema::validate_value_against_schema;
+use scp_protocol::crypto::ucan::UcanError;
+use scp_protocol::crypto::ucan::capability::CapabilityUri;
+use scp_protocol::crypto::ucan::validate::{
     DidResolver, NonceTracker, ProofResolver, RevocationChecker, ValidationContext, parse_ucan,
     validate_ucan,
 };
-use scp_primitives::DID;
 
 // ---------------------------------------------------------------------------
 // InvocationError
@@ -445,9 +446,9 @@ mod tests {
     use std::collections::HashSet;
 
     use super::*;
-    use crate::context::ContextParams;
-    use crate::context::roles::{CapabilityCeiling, ContextRoleState};
-    use crate::context::tools::registry::{ToolRegistration, ToolSchema, register_tool};
+    use scp_protocol::context::ContextParams;
+    use scp_protocol::context::roles::{CapabilityCeiling, ContextRoleState};
+    use scp_protocol::context::tools::registry::{ToolRegistration, ToolSchema, register_tool};
 
     /// Creates a test capability ceiling with all capabilities.
     fn test_ceiling() -> CapabilityCeiling {
@@ -1054,12 +1055,12 @@ mod tests {
     #[tokio::test]
     async fn validate_tool_invocation_ucan_rejects_non_tool_capability() {
         use crate::crypto::ucan::mint::{MintParams, mint_ucan};
-        use crate::crypto::ucan::validate::{
+        use scp_platform::testing::InMemoryKeyCustody;
+        use scp_platform::traits::{KeyCustody, KeyType};
+        use scp_protocol::crypto::ucan::validate::{
             DEFAULT_CLOCK_SKEW_TOLERANCE_SECS, InMemoryDidResolver, InMemoryNonceTracker,
             InMemoryProofResolver, InMemoryRevocationChecker, ValidationContext,
         };
-        use scp_platform::testing::InMemoryKeyCustody;
-        use scp_platform::traits::{KeyCustody, KeyType};
 
         // Set up issuer identity.
         let custody = InMemoryKeyCustody::new();

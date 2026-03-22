@@ -15,20 +15,24 @@ use std::sync::Arc;
 use serde::{Deserialize, Serialize};
 use tokio::sync::{Mutex, RwLock};
 
-use super::broadcast::{
-    AuthorBlockResult, BlockResult, BroadcastAdmission, BroadcastContext, BroadcastContextSnapshot,
-    GovernanceBanResult, KeyRequestDecision, SubscriptionResult, UnsubscribeResult,
-};
-use super::broadcast_content::{BroadcastContent, serialize_broadcast_content};
+use super::ContextHandle;
 use super::builder::{
-    ContextCreationError, ContextCryptoProvider, ContextEventLogProvider, ContextTransportProvider,
-    create_context as builder_create_context,
+    ContextEventLogProvider, ContextTransportProvider, create_context as builder_create_context,
 };
 use super::governance::timeout::{
     DeadlockDetectionState, GovernanceTimeoutTask, collect_active_voters,
     process_pending_proposals, update_detection_state,
 };
-use super::governance::{
+use super::ttl::{self, CloseResult, TtlExtension, TtlTimer};
+use scp_identity::DID;
+use scp_primitives::Clock;
+use scp_protocol::context::broadcast::{
+    AuthorBlockResult, BlockResult, BroadcastAdmission, BroadcastContext, BroadcastContextSnapshot,
+    GovernanceBanResult, KeyRequestDecision, SubscriptionResult, UnsubscribeResult,
+};
+use scp_protocol::context::broadcast_content::{BroadcastContent, serialize_broadcast_content};
+use scp_protocol::context::builder::{ContextCreationError, ContextCryptoProvider};
+use scp_protocol::context::governance::{
     CheckpointAttestationStatus, ContextCheckpoint, CosignedCheckpoint, GovernanceAction,
     GovernanceContext, GovernanceEngine, GovernanceEvent, GovernanceModelConfig,
     GovernanceProposal, KeyResolver, ProposalId, ProposalStatus, PruningPolicy, RevocationScope,
@@ -40,22 +44,21 @@ use super::governance::{
     multisig::ThresholdEngine,
     unanimity::UnanimityEngine,
 };
-use super::membership::{ContextEvent, KeyPackage, MembershipState, ReceiveBuffer};
-use super::params::GovernanceModel;
-use super::params::{ContextMode, TemplateId, ToolRegistration};
-use super::roles::{self, Capability, CapabilityCeiling, ContextRoleState, RoleAssignment};
-use super::tools::interface::ToolInterface;
-use super::ttl::{self, CloseResult, TtlExtension, TtlTimer};
-use super::{ContextError, ContextHandle, ContextParams, ContextState};
-use crate::crypto::sender_keys::BroadcastEnvelope;
-use crate::crypto::ucan::UcanToken;
-use crate::crypto::ucan::validate::{
+use scp_protocol::context::membership::{ContextEvent, KeyPackage, MembershipState, ReceiveBuffer};
+use scp_protocol::context::params::GovernanceModel;
+use scp_protocol::context::params::{ContextMode, TemplateId, ToolRegistration};
+use scp_protocol::context::roles::{
+    self, Capability, CapabilityCeiling, ContextRoleState, RoleAssignment,
+};
+use scp_protocol::context::tools::interface::ToolInterface;
+use scp_protocol::context::{ContextError, ContextParams, ContextState};
+use scp_protocol::crypto::sender_keys::BroadcastEnvelope;
+use scp_protocol::crypto::ucan::UcanToken;
+use scp_protocol::crypto::ucan::validate::{
     DidResolver, NonceTracker, ProofResolver, RevocationChecker, ValidationContext,
 };
-use crate::economy::budget::MemberBudgetTracker;
-use crate::economy::types::EconomicPolicy;
-use scp_identity::DID;
-use scp_primitives::Clock;
+use scp_protocol::economy::budget::MemberBudgetTracker;
+use scp_protocol::economy::types::EconomicPolicy;
 use tracing::instrument;
 use zeroize::Zeroizing;
 
@@ -102,15 +105,17 @@ fn push_welcome_event(
     context_id: &str,
     creator_did: &DID,
     member_did: &DID,
-    add_output: crate::context::builder::AddMemberOutput,
+    add_output: scp_protocol::context::builder::AddMemberOutput,
 ) {
     if !add_output.welcome_bytes.is_empty() {
         buffer.push(ContextEvent::WelcomeGenerated {
             context_id: context_id.to_owned(),
             creator_did: creator_did.clone(),
             member_did: member_did.clone(),
-            welcome_bytes: super::membership::RedactedBytes(add_output.welcome_bytes),
-            commit_bytes: super::membership::RedactedBytes(add_output.commit_bytes),
+            welcome_bytes: scp_protocol::context::membership::RedactedBytes(
+                add_output.welcome_bytes,
+            ),
+            commit_bytes: scp_protocol::context::membership::RedactedBytes(add_output.commit_bytes),
         });
     }
 }
@@ -788,7 +793,7 @@ fn restore_grace_store_from_snapshot(
             //         triggers reconnection when message processing begins.
             // Step 4: Log the inconsistency for the application layer.
             needs_reconnect = true;
-            let inconsistency = crate::sync::SyncError::EpochGraceStoreInconsistency {
+            let inconsistency = scp_protocol::sync::SyncError::EpochGraceStoreInconsistency {
                 context_id: context_id.into(),
                 reason: format!(
                     "grace entry references epoch newer than persisted MLS epoch {}",
@@ -1087,8 +1092,8 @@ fn mint_governance_tokens(
     creator_did: &DID,
     engine: &dyn GovernanceEngine,
     clock: &dyn Clock,
-) -> Vec<super::roles::UcanToken> {
-    use super::roles::{Capability, UcanAttestation, UcanToken};
+) -> Vec<scp_protocol::context::roles::UcanToken> {
+    use scp_protocol::context::roles::{Capability, UcanAttestation, UcanToken};
 
     let config = engine.model_config();
     let voter_dids: Vec<DID> = match &config {
@@ -1114,7 +1119,7 @@ fn mint_governance_tokens(
             // static nonce (acceptable for governance tokens minted at creation
             // time — replay prevention is handled by the engine's proposal-ID
             // scheme).
-            let nonce = crate::crypto::ucan::nonce::generate_nonce(clock);
+            let nonce = scp_protocol::crypto::ucan::nonce::generate_nonce(clock);
             tokens.push(UcanToken {
                 iss: creator_did.to_string(),
                 aud: voter.to_string(),
@@ -2046,10 +2051,10 @@ impl ContextManager {
         for result in &report.contexts_synced {
             let cleared = matches!(
                 result.outcome,
-                crate::sync::SyncOutcome::FullyCaughtUp
-                    | crate::sync::SyncOutcome::FastForwarded { .. }
-                    | crate::sync::SyncOutcome::Reset
-                    | crate::sync::SyncOutcome::ContextGone
+                scp_protocol::sync::SyncOutcome::FullyCaughtUp
+                    | scp_protocol::sync::SyncOutcome::FastForwarded { .. }
+                    | scp_protocol::sync::SyncOutcome::Reset
+                    | scp_protocol::sync::SyncOutcome::ContextGone
             );
             if cleared {
                 self.clear_needs_reconnect(&result.context_id).await;
@@ -2146,7 +2151,7 @@ impl ContextManager {
         context_id: &str,
         exporter_did: DID,
     ) -> Result<super::export_import::ContextExport, ContextError> {
-        let ctx_id_bytes = super::context_id_bytes(context_id);
+        let ctx_id_bytes = scp_protocol::context::context_id_bytes(context_id);
 
         let snapshot = {
             let contexts = self.contexts.lock().await;
@@ -2204,7 +2209,7 @@ impl ContextManager {
         super::export_import::validate_export_for_import(&export)?;
 
         let context_id = export.snapshot.context_id.clone();
-        let ctx_id_bytes = super::context_id_bytes(&context_id);
+        let ctx_id_bytes = scp_protocol::context::context_id_bytes(&context_id);
 
         // 2. Check context existence BEFORE importing event log data.
         //    If the context is Active, we must reject early — otherwise the
@@ -2406,7 +2411,7 @@ impl ContextManager {
         // min_protocol_version it is setting. Without this check, an SDK 1.0
         // creator could set min_protocol_version: (2, 0), creating a context
         // nobody — including themselves — can join.
-        params.check_version_compatibility(crate::envelope::SCP_PROTOCOL_VERSION)?;
+        params.check_version_compatibility(scp_protocol::envelope::SCP_PROTOCOL_VERSION)?;
 
         // Validate governance model parameters before proceeding.
         validate_governance_model(&params.governance)?;
@@ -2567,7 +2572,7 @@ impl ContextManager {
     ) -> Result<ContextHandle, ContextCreationError> {
         // Defense-in-depth: verify that the creator's SDK version satisfies the
         // min_protocol_version it is setting (same check as create_context).
-        params.check_version_compatibility(crate::envelope::SCP_PROTOCOL_VERSION)?;
+        params.check_version_compatibility(scp_protocol::envelope::SCP_PROTOCOL_VERSION)?;
 
         // Validate consistency between GovernanceModel and GovernanceModelConfig.
         validate_governance_consistency(&params.governance, &governance_config)?;
@@ -2780,7 +2785,7 @@ impl ContextManager {
                 .ok_or_else(|| ContextError::ContextNotRegistered(context_id.clone()))?;
             ctx.handle
                 .params()
-                .check_version_compatibility(crate::envelope::SCP_PROTOCOL_VERSION)?;
+                .check_version_compatibility(scp_protocol::envelope::SCP_PROTOCOL_VERSION)?;
         }
 
         // Crypto operations -- no lock held, no TOCTOU concern for these
@@ -2838,7 +2843,7 @@ impl ContextManager {
             // TOCTOU window.
             ctx.handle
                 .params()
-                .check_version_compatibility(crate::envelope::SCP_PROTOCOL_VERSION)?;
+                .check_version_compatibility(scp_protocol::envelope::SCP_PROTOCOL_VERSION)?;
 
             // Add member to role state.
             ctx.role_state.members.insert(member_did.to_string());
@@ -3086,21 +3091,23 @@ impl ContextManager {
                 // Compute signing payload and sign externally, matching the
                 // pattern used by publish_broadcast (custody-based signing).
                 let meta = bc.publish_metadata(sender_did)?;
-                let nonce = crate::crypto::sender_keys::generate_broadcast_nonce();
-                let provenance_hash = crate::crypto::sender_keys::compute_provenance_hash(None)
-                    .map_err(|e| ContextError::CryptoFailed(e.to_string()))?;
-                let signing_payload = crate::crypto::sender_keys::build_broadcast_signing_payload(
-                    &crate::crypto::sender_keys::SigningPayloadFields {
-                        version: crate::envelope::SCP_PROTOCOL_VERSION,
-                        context_id: meta.context_id,
-                        author_did: meta.author_did,
-                        sequence: meta.next_sequence,
-                        key_epoch: meta.key_epoch,
-                        timestamp,
-                        nonce: &nonce,
-                        provenance_hash: &provenance_hash,
-                    },
-                );
+                let nonce = scp_protocol::crypto::sender_keys::generate_broadcast_nonce();
+                let provenance_hash =
+                    scp_protocol::crypto::sender_keys::compute_provenance_hash(None)
+                        .map_err(|e| ContextError::CryptoFailed(e.to_string()))?;
+                let signing_payload =
+                    scp_protocol::crypto::sender_keys::build_broadcast_signing_payload(
+                        &scp_protocol::crypto::sender_keys::SigningPayloadFields {
+                            version: scp_protocol::envelope::SCP_PROTOCOL_VERSION,
+                            context_id: meta.context_id,
+                            author_did: meta.author_did,
+                            sequence: meta.next_sequence,
+                            key_epoch: meta.key_epoch,
+                            timestamp,
+                            nonce: &nonce,
+                            provenance_hash: &provenance_hash,
+                        },
+                    );
                 let signature = ed25519_dalek::Signer::sign(sk, &signing_payload);
 
                 let envelope =
@@ -3448,22 +3455,23 @@ impl ContextManager {
     ///   support. At SCP/1.x there are no known feature flags; pass an empty
     ///   `Vec`.
     ///
-    /// [`VersionCompatibility`]: crate::envelope::VersionCompatibility
-    /// [`DegradedMode`]: crate::envelope::VersionCompatibility::DegradedMode
+    /// [`VersionCompatibility`]: scp_protocol::envelope::VersionCompatibility
+    /// [`DegradedMode`]: scp_protocol::envelope::VersionCompatibility::DegradedMode
     /// [`drain_events`]: Self::drain_events
     #[instrument(skip_all, fields(context_id))]
     pub async fn report_degraded_mode(
         &self,
         context_id: &str,
-        compat: crate::envelope::VersionCompatibility,
+        compat: scp_protocol::envelope::VersionCompatibility,
         unsupported_features: Vec<String>,
     ) {
-        if let crate::envelope::VersionCompatibility::DegradedMode {
+        if let scp_protocol::envelope::VersionCompatibility::DegradedMode {
             local_minor,
             remote_minor,
         } = compat
         {
-            let local_major = crate::envelope::version_major(crate::envelope::SCP_PROTOCOL_VERSION);
+            let local_major =
+                scp_protocol::envelope::version_major(scp_protocol::envelope::SCP_PROTOCOL_VERSION);
             let remote_major = local_major; // same major guaranteed by VersionCompatibility
             if let Some(ctx) = self.contexts.lock().await.get_mut(context_id) {
                 ctx.receive_buffer.push(ContextEvent::DegradedMode {
@@ -3526,7 +3534,7 @@ impl ContextManager {
             // Applies to ALL context modes including broadcast.
             ctx.handle
                 .params()
-                .check_version_compatibility(crate::envelope::SCP_PROTOCOL_VERSION)?;
+                .check_version_compatibility(scp_protocol::envelope::SCP_PROTOCOL_VERSION)?;
 
             let bc = ctx
                 .broadcast_context
@@ -3703,21 +3711,22 @@ impl ContextManager {
             // Compute the signing payload externally so we can sign via
             // key custody (async) while keeping seal_broadcast synchronous.
             let meta = bc.publish_metadata(author_did)?;
-            let nonce = crate::crypto::sender_keys::generate_broadcast_nonce();
-            let provenance_hash = crate::crypto::sender_keys::compute_provenance_hash(None)
+            let nonce = scp_protocol::crypto::sender_keys::generate_broadcast_nonce();
+            let provenance_hash = scp_protocol::crypto::sender_keys::compute_provenance_hash(None)
                 .map_err(|e| ContextError::CryptoFailed(e.to_string()))?;
-            let signing_payload = crate::crypto::sender_keys::build_broadcast_signing_payload(
-                &crate::crypto::sender_keys::SigningPayloadFields {
-                    version: crate::envelope::SCP_PROTOCOL_VERSION,
-                    context_id: meta.context_id,
-                    author_did: meta.author_did,
-                    sequence: meta.next_sequence,
-                    key_epoch: meta.key_epoch,
-                    timestamp,
-                    nonce: &nonce,
-                    provenance_hash: &provenance_hash,
-                },
-            );
+            let signing_payload =
+                scp_protocol::crypto::sender_keys::build_broadcast_signing_payload(
+                    &scp_protocol::crypto::sender_keys::SigningPayloadFields {
+                        version: scp_protocol::envelope::SCP_PROTOCOL_VERSION,
+                        context_id: meta.context_id,
+                        author_did: meta.author_did,
+                        sequence: meta.next_sequence,
+                        key_epoch: meta.key_epoch,
+                        timestamp,
+                        nonce: &nonce,
+                        provenance_hash: &provenance_hash,
+                    },
+                );
 
             // Sign via key custody (async).
             let platform_sig = custody
@@ -5598,7 +5607,7 @@ impl ContextManager {
 
             if !matches!(
                 ctx.handle.params().ceiling_policy,
-                super::params::CeilingPolicy::Governed
+                scp_protocol::context::params::CeilingPolicy::Governed
             ) {
                 return Err(ContextError::PermissionDenied(
                     "ceiling_policy is not Governed".to_owned(),
@@ -5765,7 +5774,7 @@ impl ContextManager {
         &self,
         context_id: &str,
         additional_secs: u64,
-        approvals: &[super::governance::SignedVote],
+        approvals: &[scp_protocol::context::governance::SignedVote],
         proposal_id: ProposalId,
     ) -> Result<(), ContextError> {
         let context_id_bytes = context_id_to_bytes(context_id);
@@ -6085,7 +6094,7 @@ impl ContextManager {
                     with: format!("scp:ctx:{context_id}/{cap}"),
                     can: "invoke".to_owned(),
                 };
-                let nonce = crate::crypto::ucan::nonce::generate_nonce(&*self.clock);
+                let nonce = scp_protocol::crypto::ucan::nonce::generate_nonce(&*self.clock);
                 let token = roles::UcanToken {
                     iss: creator_did.clone(),
                     aud: did.to_string(),
@@ -6320,7 +6329,7 @@ impl ContextManager {
         context_id: &str,
         proposal_a: &ProposalId,
         proposal_b: &ProposalId,
-        resolution: &super::governance::ConflictResolution,
+        resolution: &scp_protocol::context::governance::ConflictResolution,
         _proposal_id: ProposalId,
     ) -> Result<(), ContextError> {
         let context_id_bytes = context_id_to_bytes(context_id);
@@ -6375,7 +6384,7 @@ impl ContextManager {
             // Retrieve proposer DIDs for conflict validation.
             let proposer_a = &ctx.approved_proposals[proposal_a].0.proposer_did;
             let proposer_b = &ctx.approved_proposals[proposal_b].0.proposer_did;
-            if !crate::sync::conflict_resolution::actions_conflict(
+            if !scp_protocol::sync::conflict_resolution::actions_conflict(
                 act_a, proposer_a, act_b, proposer_b,
             ) {
                 return Err(ContextError::PermissionDenied(
@@ -6391,7 +6400,9 @@ impl ContextManager {
             // through normal `execute_governance_action`. For InvalidateBoth,
             // both are invalidated.
             match resolution {
-                super::governance::ConflictResolution::AcceptProposal { winner_id } => {
+                scp_protocol::context::governance::ConflictResolution::AcceptProposal {
+                    winner_id,
+                } => {
                     // Validate that winner_id is one of the two proposals.
                     let loser = if *winner_id == *proposal_a {
                         proposal_b
@@ -6407,7 +6418,7 @@ impl ContextManager {
                     let now = self.clock.now_secs();
                     ctx.executed_proposals.insert(*loser, now);
                 }
-                super::governance::ConflictResolution::InvalidateBoth => {
+                scp_protocol::context::governance::ConflictResolution::InvalidateBoth => {
                     let now = self.clock.now_secs();
                     ctx.executed_proposals.insert(*proposal_a, now);
                     ctx.executed_proposals.insert(*proposal_b, now);
@@ -6445,7 +6456,7 @@ impl ContextManager {
     async fn execute_promote_context(
         &self,
         context_id: &str,
-        approvals: &[super::governance::SignedVote],
+        approvals: &[scp_protocol::context::governance::SignedVote],
         _proposal_id: ProposalId,
     ) -> Result<(), ContextError> {
         let context_id_bytes = context_id_to_bytes(context_id);
@@ -6459,7 +6470,7 @@ impl ContextManager {
 
             if !matches!(
                 ctx.handle.params().promotion_policy,
-                super::params::PromotionPolicy::Promotable
+                scp_protocol::context::params::PromotionPolicy::Promotable
             ) {
                 return Err(ContextError::PermissionDenied(
                     "context promotion_policy is not Promotable".to_owned(),
@@ -6736,8 +6747,8 @@ impl ContextManager {
     async fn execute_reconfigure_governance(
         &self,
         context_id: &str,
-        changes: &[super::governance::GovernanceReconfigAction],
-        justification: &super::governance::DeadlockJustification,
+        changes: &[scp_protocol::context::governance::GovernanceReconfigAction],
+        justification: &scp_protocol::context::governance::DeadlockJustification,
         _proposal_id: ProposalId,
     ) -> Result<(), ContextError> {
         if changes.is_empty() {
@@ -6771,12 +6782,12 @@ impl ContextManager {
             let reconfigure_result: Result<(), ContextError> = (|| {
                 for change in changes {
                     match change {
-                        super::governance::GovernanceReconfigAction::RemoveInactiveSigner {
+                        scp_protocol::context::governance::GovernanceReconfigAction::RemoveInactiveSigner {
                             did,
                         } => {
                             ctx.threshold_signers.retain(|s| s != did);
                         }
-                        super::governance::GovernanceReconfigAction::ReduceThreshold {
+                        scp_protocol::context::governance::GovernanceReconfigAction::ReduceThreshold {
                             new_threshold,
                         } => {
                             let signer_count =
@@ -6977,7 +6988,7 @@ impl ContextManager {
         &self,
         context_id: &str,
         spender: &DID,
-        amount: crate::economy::types::Amount,
+        amount: scp_protocol::economy::types::Amount,
         purpose: &str,
         _proposal_id: ProposalId,
     ) -> Result<(), ContextError> {
@@ -7090,7 +7101,7 @@ impl ContextManager {
     async fn execute_propose_context_migration(
         &self,
         context_id: &str,
-        new_context_params: &super::params::ContextParams,
+        new_context_params: &scp_protocol::context::params::ContextParams,
         reason: &str,
         grace_period_secs: u64,
         auto_invite: bool,
@@ -7116,7 +7127,7 @@ impl ContextManager {
         // (§5.11A.2). The destination is a fully independent context with
         // its own ID, MLS group, event log, and key material.
         let mut dest_params = new_context_params.clone();
-        dest_params.migration_source = Some(super::params::MigrationSource {
+        dest_params.migration_source = Some(scp_protocol::context::params::MigrationSource {
             source_context_id: context_id.to_owned(),
             proposal_id,
         });
@@ -7987,7 +7998,10 @@ impl ContextManager {
                         // Use blocking async read — `try_read_state()` returns
                         // `None` on transient write-contention which would
                         // permanently stop this task.
-                        if !matches!(ctx.handle.state().await, super::ContextState::Active) {
+                        if !matches!(
+                            ctx.handle.state().await,
+                            scp_protocol::context::ContextState::Active
+                        ) {
                             return false; // No longer active — stop the loop.
                         }
 
@@ -8083,19 +8097,19 @@ impl ContextManager {
     /// Verifies an attestation chain (Layer 3) using the production DID
     /// public key resolver.
     ///
-    /// Delegates to [`crate::trust::verify_attestation`] with
-    /// [`crate::trust::IdentityDidPublicKeyResolver`] for key resolution.
+    /// Delegates to [`scp_protocol::trust::verify_attestation`] with
+    /// [`scp_protocol::trust::IdentityDidPublicKeyResolver`] for key resolution.
     ///
     /// # Errors
     ///
-    /// Returns [`ContextError`] wrapping the underlying [`crate::trust::TrustError`] if
+    /// Returns [`ContextError`] wrapping the underlying [`scp_protocol::trust::TrustError`] if
     /// signature verification, expiry checks, or revocation checks fail.
     pub fn verify_attestation(
         &self,
-        attestation: &crate::trust::Attestation,
+        attestation: &scp_protocol::trust::Attestation,
     ) -> Result<(), ContextError> {
-        let resolver = crate::trust::IdentityDidPublicKeyResolver;
-        crate::trust::verify_attestation(attestation, &resolver, &*self.clock).map_err(|e| {
+        let resolver = scp_protocol::trust::IdentityDidPublicKeyResolver;
+        scp_protocol::trust::verify_attestation(attestation, &resolver, &*self.clock).map_err(|e| {
             ContextError::PermissionDenied(format!("attestation verification failed: {e}"))
         })
     }
@@ -8103,7 +8117,7 @@ impl ContextManager {
     /// Issues a challenge request (Layer 3 — Challenge-Response) using the
     /// production DID resolver.
     ///
-    /// Delegates to [`crate::trust::issue_challenge`] to construct and sign
+    /// Delegates to [`scp_protocol::trust::issue_challenge`] to construct and sign
     /// a challenge request.
     ///
     /// # Errors
@@ -8114,13 +8128,13 @@ impl ContextManager {
         &self,
         challenger_did: &DID,
         subject_did: &DID,
-        challenge_type: crate::trust::ChallengeType,
+        challenge_type: scp_protocol::trust::ChallengeType,
         capability_uri: String,
         params: serde_json::Value,
         timeout: std::time::Duration,
-        signer: &impl crate::trust::ChallengeSigner,
-    ) -> Result<crate::trust::ChallengeRequest, ContextError> {
-        crate::trust::issue_challenge(
+        signer: &impl scp_protocol::trust::ChallengeSigner,
+    ) -> Result<scp_protocol::trust::ChallengeRequest, ContextError> {
+        scp_protocol::trust::issue_challenge(
             challenger_did.clone(),
             subject_did.clone(),
             challenge_type,
@@ -8135,22 +8149,22 @@ impl ContextManager {
     /// Verifies a challenge response (Layer 3 — Challenge-Response) using the
     /// production DID resolver.
     ///
-    /// Delegates to [`crate::trust::verify_challenge_response`] with
-    /// [`crate::trust::IdentityDidPublicKeyResolver`] for key resolution.
+    /// Delegates to [`scp_protocol::trust::verify_challenge_response`] with
+    /// [`scp_protocol::trust::IdentityDidPublicKeyResolver`] for key resolution.
     ///
     /// # Errors
     ///
-    /// Returns [`ContextError`] wrapping the underlying [`crate::trust::TrustError`] if
+    /// Returns [`ContextError`] wrapping the underlying [`scp_protocol::trust::TrustError`] if
     /// verification fails.
     pub fn verify_challenge_response(
         &self,
-        request: &crate::trust::ChallengeRequest,
-        response: &crate::trust::ChallengeResponse,
-        verifier_signer: &impl crate::trust::ChallengeSigner,
+        request: &scp_protocol::trust::ChallengeRequest,
+        response: &scp_protocol::trust::ChallengeResponse,
+        verifier_signer: &impl scp_protocol::trust::ChallengeSigner,
         context_id: Option<String>,
-    ) -> Result<crate::trust::ChallengeVerification, ContextError> {
-        let resolver = crate::trust::IdentityDidPublicKeyResolver;
-        crate::trust::verify_challenge_response(
+    ) -> Result<scp_protocol::trust::ChallengeVerification, ContextError> {
+        let resolver = scp_protocol::trust::IdentityDidPublicKeyResolver;
+        scp_protocol::trust::verify_challenge_response(
             request,
             response,
             &resolver,
@@ -8310,7 +8324,7 @@ impl ContextManager {
         ctx: &mut PerContextState,
         new_proposal: &GovernanceProposal,
     ) -> Vec<GovernanceEvent> {
-        use super::governance::{GovernanceEvent, actions_conflict};
+        use scp_protocol::context::governance::{GovernanceEvent, actions_conflict};
 
         let mut events = Vec::new();
         let current_timestamp = self.clock.now_secs();
@@ -8396,7 +8410,7 @@ impl ContextManager {
     /// A vector of governance events to emit (empty if no expired freezes)
     #[allow(clippy::unused_self)] // method for API consistency within ContextManager
     fn check_and_resolve_expired_freezes(&self, ctx: &mut PerContextState) -> Vec<GovernanceEvent> {
-        use super::governance::GovernanceEvent;
+        use scp_protocol::context::governance::GovernanceEvent;
 
         const FREEZE_TIMEOUT_SECONDS: u64 = 48 * 60 * 60; // 48 hours
 
@@ -8612,9 +8626,9 @@ impl ContextManager {
 // ---------------------------------------------------------------------------
 
 /// Uses the canonical SHA-256 context ID byte derivation.
-/// Delegates to [`super::context_id_bytes`] to match builder.rs.
+/// Delegates to [`scp_protocol::context::context_id_bytes`] to match builder.rs.
 fn context_id_to_bytes(context_id: &str) -> [u8; 32] {
-    super::context_id_bytes(context_id)
+    scp_protocol::context::context_id_bytes(context_id)
 }
 
 // Compile-time assertion that `ContextManager` is `Send + Sync`.
@@ -8644,8 +8658,8 @@ mod tests {
     use std::sync::atomic::{AtomicBool, Ordering};
 
     use super::*;
-    use crate::context::params::MemoryScope;
-    use crate::context::{ContextMode, ContextState};
+    use scp_protocol::context::params::MemoryScope;
+    use scp_protocol::context::{ContextMode, ContextState};
 
     // -----------------------------------------------------------------------
     // Key resolver helpers for tests
@@ -8778,12 +8792,12 @@ mod tests {
             _context_id: &[u8; 32],
             member_did: &str,
             _key_package_bytes: Option<&[u8]>,
-        ) -> Result<crate::context::builder::AddMemberOutput, ContextError> {
+        ) -> Result<scp_protocol::context::builder::AddMemberOutput, ContextError> {
             self.members_added
                 .lock()
                 .unwrap()
                 .push(member_did.to_owned());
-            Ok(crate::context::builder::AddMemberOutput::default())
+            Ok(scp_protocol::context::builder::AddMemberOutput::default())
         }
 
         fn remove_member(
@@ -8989,9 +9003,9 @@ mod tests {
 
         let params = ContextParams {
             ceiling: vec![
-                crate::context::params::Capability::new("messages:read"),
-                crate::context::params::Capability::new("messages:write"),
-                crate::context::params::Capability::new("role:assign"),
+                scp_protocol::context::params::Capability::new("messages:read"),
+                scp_protocol::context::params::Capability::new("messages:write"),
+                scp_protocol::context::params::Capability::new("role:assign"),
                 Capability::ToolRegister,
                 Capability::ToolInterface,
                 Capability::ChildContextCreate,
@@ -9042,7 +9056,7 @@ mod tests {
 
         let params = ContextParams {
             mode: ContextMode::Broadcast,
-            memory_scope: crate::context::MemoryScope::Full,
+            memory_scope: scp_protocol::context::MemoryScope::Full,
             ..ContextParams::default()
         };
 
@@ -9111,7 +9125,7 @@ mod tests {
 
         let params = ContextParams {
             mode: ContextMode::Broadcast,
-            memory_scope: crate::context::MemoryScope::Full,
+            memory_scope: scp_protocol::context::MemoryScope::Full,
             ..ContextParams::default()
         };
 
@@ -9323,10 +9337,10 @@ mod tests {
 
         let params = ContextParams {
             ceiling: vec![
-                crate::context::params::Capability::new("messages:read"),
-                crate::context::params::Capability::new("messages:write"),
-                crate::context::params::Capability::new("role:assign"),
-                crate::context::params::Capability::new("member:remove"),
+                scp_protocol::context::params::Capability::new("messages:read"),
+                scp_protocol::context::params::Capability::new("messages:write"),
+                scp_protocol::context::params::Capability::new("role:assign"),
+                scp_protocol::context::params::Capability::new("member:remove"),
             ],
             ..ContextParams::default()
         };
@@ -9544,8 +9558,8 @@ mod tests {
 
         let params = ContextParams {
             ceiling: vec![
-                crate::context::params::Capability::new("messages:read"),
-                crate::context::params::Capability::new("messages:write"),
+                scp_protocol::context::params::Capability::new("messages:read"),
+                scp_protocol::context::params::Capability::new("messages:write"),
             ],
             ..ContextParams::default()
         };
@@ -9658,8 +9672,8 @@ mod tests {
 
         let params = ContextParams {
             ceiling: vec![
-                crate::context::params::Capability::new("messages:read"),
-                crate::context::params::Capability::new("messages:write"),
+                scp_protocol::context::params::Capability::new("messages:read"),
+                scp_protocol::context::params::Capability::new("messages:write"),
             ],
             ..ContextParams::default()
         };
@@ -9881,9 +9895,9 @@ mod tests {
 
         let params = ContextParams {
             ceiling: vec![
-                crate::context::params::Capability::new("messages:read"),
-                crate::context::params::Capability::new("messages:write"),
-                crate::context::params::Capability::new("role:assign"),
+                scp_protocol::context::params::Capability::new("messages:read"),
+                scp_protocol::context::params::Capability::new("messages:write"),
+                scp_protocol::context::params::Capability::new("role:assign"),
             ],
             ..ContextParams::default()
         };
@@ -9946,9 +9960,9 @@ mod tests {
 
         let params = ContextParams {
             ceiling: vec![
-                crate::context::params::Capability::new("messages:read"),
-                crate::context::params::Capability::new("messages:write"),
-                crate::context::params::Capability::new("role:assign"),
+                scp_protocol::context::params::Capability::new("messages:read"),
+                scp_protocol::context::params::Capability::new("messages:write"),
+                scp_protocol::context::params::Capability::new("role:assign"),
             ],
             ..ContextParams::default()
         };
@@ -10007,11 +10021,11 @@ mod tests {
 
         let params = ContextParams {
             mode: ContextMode::Broadcast,
-            memory_scope: crate::context::MemoryScope::Full,
+            memory_scope: scp_protocol::context::MemoryScope::Full,
             ceiling: vec![
-                crate::context::params::Capability::new("messages:read"),
-                crate::context::params::Capability::new("messages:write"),
-                crate::context::params::Capability::new("role:assign"),
+                scp_protocol::context::params::Capability::new("messages:read"),
+                scp_protocol::context::params::Capability::new("messages:write"),
+                scp_protocol::context::params::Capability::new("role:assign"),
             ],
             ..ContextParams::default()
         };
@@ -10028,7 +10042,7 @@ mod tests {
     /// current author key epoch.
     #[tokio::test]
     async fn broadcast_subscribe_registers_and_returns_epoch() {
-        use crate::crypto::ucan::validate::{
+        use scp_protocol::crypto::ucan::validate::{
             InMemoryDidResolver, InMemoryNonceTracker, InMemoryProofResolver,
             InMemoryRevocationChecker,
         };
@@ -10077,7 +10091,7 @@ mod tests {
     /// SCP-227 AC2: open broadcast allows subscription without UCAN.
     #[tokio::test]
     async fn broadcast_open_subscribe_no_ucan_required() {
-        use crate::crypto::ucan::validate::{
+        use scp_protocol::crypto::ucan::validate::{
             InMemoryDidResolver, InMemoryNonceTracker, InMemoryProofResolver,
             InMemoryRevocationChecker,
         };
@@ -10113,7 +10127,7 @@ mod tests {
     /// SCP-227 AC4: `block_broadcast_author` revokes sender key.
     #[tokio::test]
     async fn broadcast_block_revokes_key() {
-        use crate::crypto::ucan::validate::{
+        use scp_protocol::crypto::ucan::validate::{
             InMemoryDidResolver, InMemoryNonceTracker, InMemoryProofResolver,
             InMemoryRevocationChecker,
         };
@@ -10183,10 +10197,10 @@ mod tests {
         // Subscribe the target.
         manager
             .subscribe_broadcast::<
-                crate::crypto::ucan::validate::InMemoryDidResolver,
-                crate::crypto::ucan::validate::InMemoryNonceTracker,
-                crate::crypto::ucan::validate::InMemoryRevocationChecker,
-                crate::crypto::ucan::validate::InMemoryProofResolver,
+                scp_protocol::crypto::ucan::validate::InMemoryDidResolver,
+                scp_protocol::crypto::ucan::validate::InMemoryNonceTracker,
+                scp_protocol::crypto::ucan::validate::InMemoryRevocationChecker,
+                scp_protocol::crypto::ucan::validate::InMemoryProofResolver,
                 std::hash::RandomState,
             >(
                 &ctx_id,
@@ -10249,7 +10263,7 @@ mod tests {
     /// subsequent key requests.
     #[tokio::test]
     async fn broadcast_unblock_restores_key_access() {
-        use crate::crypto::ucan::validate::{
+        use scp_protocol::crypto::ucan::validate::{
             InMemoryDidResolver, InMemoryNonceTracker, InMemoryProofResolver,
             InMemoryRevocationChecker,
         };
@@ -10334,7 +10348,7 @@ mod tests {
     /// §9.16.8: unblocking a non-blocked subscriber returns an error.
     #[tokio::test]
     async fn broadcast_unblock_not_blocked_returns_error() {
-        use crate::crypto::ucan::validate::{
+        use scp_protocol::crypto::ucan::validate::{
             InMemoryDidResolver, InMemoryNonceTracker, InMemoryProofResolver,
             InMemoryRevocationChecker,
         };
@@ -10378,7 +10392,7 @@ mod tests {
     /// to authors, `MessagesRead` open to subscribers.
     #[tokio::test]
     async fn broadcast_capabilities_enforced() {
-        use crate::crypto::ucan::validate::{
+        use scp_protocol::crypto::ucan::validate::{
             InMemoryDidResolver, InMemoryNonceTracker, InMemoryProofResolver,
             InMemoryRevocationChecker,
         };
@@ -10437,8 +10451,8 @@ mod tests {
     /// receive and can request keys for decryption.
     #[tokio::test]
     async fn broadcast_publish_3_subscribers_decrypt() {
-        use crate::crypto::sender_keys::open_broadcast;
-        use crate::crypto::ucan::validate::{
+        use scp_protocol::crypto::sender_keys::open_broadcast;
+        use scp_protocol::crypto::ucan::validate::{
             InMemoryDidResolver, InMemoryNonceTracker, InMemoryProofResolver,
             InMemoryRevocationChecker,
         };
@@ -10501,8 +10515,8 @@ mod tests {
                 } => {
                     assert_eq!(epoch, 0);
                     // Reconstruct broadcast key and decrypt.
-                    let broadcast_key = crate::crypto::sender_keys::BroadcastKey::from_parts(
-                        crate::crypto::sender_keys::SenderKey::from_bytes(*key_bytes),
+                    let broadcast_key = scp_protocol::crypto::sender_keys::BroadcastKey::from_parts(
+                        scp_protocol::crypto::sender_keys::SenderKey::from_bytes(*key_bytes),
                         epoch,
                         "did:key:author1".to_owned(),
                     );
@@ -10532,8 +10546,8 @@ mod tests {
     // fragment a sequential scenario that must be verified end-to-end.
     #[allow(clippy::too_many_lines)]
     async fn broadcast_blocked_subscriber_cannot_decrypt() {
-        use crate::crypto::sender_keys::open_broadcast;
-        use crate::crypto::ucan::validate::{
+        use scp_protocol::crypto::sender_keys::open_broadcast;
+        use scp_protocol::crypto::ucan::validate::{
             InMemoryDidResolver, InMemoryNonceTracker, InMemoryProofResolver,
             InMemoryRevocationChecker,
         };
@@ -10595,8 +10609,8 @@ mod tests {
         };
 
         // Verify bad-sub can decrypt the pre-block message.
-        let pre_block_broadcast_key = crate::crypto::sender_keys::BroadcastKey::from_parts(
-            crate::crypto::sender_keys::SenderKey::from_bytes(*pre_block_key_bytes),
+        let pre_block_broadcast_key = scp_protocol::crypto::sender_keys::BroadcastKey::from_parts(
+            scp_protocol::crypto::sender_keys::SenderKey::from_bytes(*pre_block_key_bytes),
             pre_block_epoch,
             "did:key:author1".to_owned(),
         );
@@ -10664,8 +10678,8 @@ mod tests {
                 key_bytes, epoch, ..
             } => {
                 assert_eq!(epoch, 1, "epoch should be 1 after rotation");
-                let new_key = crate::crypto::sender_keys::BroadcastKey::from_parts(
-                    crate::crypto::sender_keys::SenderKey::from_bytes(*key_bytes),
+                let new_key = scp_protocol::crypto::sender_keys::BroadcastKey::from_parts(
+                    scp_protocol::crypto::sender_keys::SenderKey::from_bytes(*key_bytes),
                     epoch,
                     "did:key:author1".to_owned(),
                 );
@@ -10682,7 +10696,7 @@ mod tests {
     /// SCP-227: non-author publish is rejected.
     #[tokio::test]
     async fn broadcast_non_author_publish_rejected() {
-        use crate::crypto::ucan::validate::{
+        use scp_protocol::crypto::ucan::validate::{
             InMemoryDidResolver, InMemoryNonceTracker, InMemoryProofResolver,
             InMemoryRevocationChecker,
         };
@@ -10757,7 +10771,7 @@ mod tests {
     /// SCP-227: `leave_context` on broadcast context cleans up subscriber.
     #[tokio::test]
     async fn broadcast_leave_context_unsubscribes() {
-        use crate::crypto::ucan::validate::{
+        use scp_protocol::crypto::ucan::validate::{
             InMemoryDidResolver, InMemoryNonceTracker, InMemoryProofResolver,
             InMemoryRevocationChecker,
         };
@@ -10815,12 +10829,12 @@ mod tests {
 
         let params = ContextParams {
             mode: ContextMode::Broadcast,
-            memory_scope: crate::context::MemoryScope::Full,
+            memory_scope: scp_protocol::context::MemoryScope::Full,
             ceiling: vec![
-                crate::context::params::Capability::new("messages:read"),
-                crate::context::params::Capability::new("messages:write"),
-                crate::context::params::Capability::new("role:assign"),
-                crate::context::params::Capability::new("context:close"),
+                scp_protocol::context::params::Capability::new("messages:read"),
+                scp_protocol::context::params::Capability::new("messages:write"),
+                scp_protocol::context::params::Capability::new("role:assign"),
+                scp_protocol::context::params::Capability::new("context:close"),
             ],
             ..ContextParams::default()
         };
@@ -10849,7 +10863,7 @@ mod tests {
     /// SCP-227: `unsubscribe_broadcast` removes subscriber and optionally rotates keys.
     #[tokio::test]
     async fn broadcast_unsubscribe_with_key_rotation() {
-        use crate::crypto::ucan::validate::{
+        use scp_protocol::crypto::ucan::validate::{
             InMemoryDidResolver, InMemoryNonceTracker, InMemoryProofResolver,
             InMemoryRevocationChecker,
         };
@@ -10906,7 +10920,7 @@ mod tests {
         context_id: &str,
         target_did: &DID,
     ) -> super::GovernanceProposal {
-        use crate::context::governance::{
+        use scp_protocol::context::governance::{
             GovernanceAction, GovernanceContext, GovernanceEngine, SingleAdminEngine,
         };
 
@@ -10959,11 +10973,11 @@ mod tests {
 
         let params = ContextParams {
             mode: ContextMode::Broadcast,
-            memory_scope: crate::context::MemoryScope::Full,
+            memory_scope: scp_protocol::context::MemoryScope::Full,
             ceiling: vec![
-                crate::context::params::Capability::new("messages:read"),
-                crate::context::params::Capability::new("messages:write"),
-                crate::context::params::Capability::new("role:assign"),
+                scp_protocol::context::params::Capability::new("messages:read"),
+                scp_protocol::context::params::Capability::new("messages:write"),
+                scp_protocol::context::params::Capability::new("role:assign"),
                 Capability::MemberBan,
             ],
             ..ContextParams::default()
@@ -10996,7 +11010,7 @@ mod tests {
     // would fragment a sequential scenario that must be verified end-to-end.
     #[allow(clippy::too_many_lines)]
     async fn broadcast_block_author_via_governance_revokes_publish() {
-        use crate::crypto::ucan::validate::{
+        use scp_protocol::crypto::ucan::validate::{
             InMemoryDidResolver, InMemoryNonceTracker, InMemoryProofResolver,
             InMemoryRevocationChecker,
         };
@@ -11124,7 +11138,7 @@ mod tests {
     /// Attempting to block an author with a non-approved proposal is rejected.
     #[tokio::test]
     async fn broadcast_block_author_rejects_pending_proposal() {
-        use crate::context::governance::{GovernanceProposal, ProposalStatus};
+        use scp_protocol::context::governance::{GovernanceProposal, ProposalStatus};
 
         let (manager, _handle, ctx_id) = setup_broadcast_context_two_authors().await;
 
@@ -11163,8 +11177,8 @@ mod tests {
     // fragment a sequential scenario that must be verified end-to-end.
     #[allow(clippy::too_many_lines)]
     async fn broadcast_blocked_author_messages_undecryptable() {
-        use crate::crypto::sender_keys::open_broadcast;
-        use crate::crypto::ucan::validate::{
+        use scp_protocol::crypto::sender_keys::open_broadcast;
+        use scp_protocol::crypto::ucan::validate::{
             InMemoryDidResolver, InMemoryNonceTracker, InMemoryProofResolver,
             InMemoryRevocationChecker,
         };
@@ -11238,8 +11252,8 @@ mod tests {
         };
 
         // Verify sub1 can decrypt Bob's pre-block message.
-        let bob_broadcast_key = crate::crypto::sender_keys::BroadcastKey::from_parts(
-            crate::crypto::sender_keys::SenderKey::from_bytes(*bob_pre_key),
+        let bob_broadcast_key = scp_protocol::crypto::sender_keys::BroadcastKey::from_parts(
+            scp_protocol::crypto::sender_keys::SenderKey::from_bytes(*bob_pre_key),
             bob_pre_epoch,
             "did:key:bob".to_owned(),
         );
@@ -11292,8 +11306,8 @@ mod tests {
             super::KeyRequestDecision::Grant {
                 key_bytes, epoch, ..
             } => {
-                let alice_key = crate::crypto::sender_keys::BroadcastKey::from_parts(
-                    crate::crypto::sender_keys::SenderKey::from_bytes(*key_bytes),
+                let alice_key = scp_protocol::crypto::sender_keys::BroadcastKey::from_parts(
+                    scp_protocol::crypto::sender_keys::SenderKey::from_bytes(*key_bytes),
                     epoch,
                     "did:key:alice".to_owned(),
                 );
@@ -11407,12 +11421,12 @@ mod tests {
 
         let params = ContextParams {
             mode: ContextMode::Broadcast,
-            memory_scope: crate::context::MemoryScope::Full,
+            memory_scope: scp_protocol::context::MemoryScope::Full,
             ceiling: vec![
-                crate::context::params::Capability::new("messages:read"),
-                crate::context::params::Capability::new("messages:write"),
-                crate::context::params::Capability::new("role:assign"),
-                crate::context::params::Capability::new("member:ban"),
+                scp_protocol::context::params::Capability::new("messages:read"),
+                scp_protocol::context::params::Capability::new("messages:write"),
+                scp_protocol::context::params::Capability::new("role:assign"),
+                scp_protocol::context::params::Capability::new("member:ban"),
             ],
             ..ContextParams::default()
         };
@@ -11424,7 +11438,7 @@ mod tests {
 
         // Subscribe sub1 directly via BroadcastContext.
         {
-            use crate::crypto::ucan::validate::{
+            use scp_protocol::crypto::ucan::validate::{
                 InMemoryDidResolver, InMemoryNonceTracker, InMemoryProofResolver,
                 InMemoryRevocationChecker,
             };
@@ -11460,7 +11474,9 @@ mod tests {
         target_did: &DID,
         action: super::GovernanceAction,
     ) -> super::GovernanceProposal {
-        use crate::context::governance::{GovernanceContext, GovernanceEngine, SingleAdminEngine};
+        use scp_protocol::context::governance::{
+            GovernanceContext, GovernanceEngine, SingleAdminEngine,
+        };
 
         let signing_key = ed25519_dalek::SigningKey::from_bytes(&[1u8; 32]);
         let vk = signing_key.verifying_key();
@@ -11587,7 +11603,7 @@ mod tests {
 
         // Subscribe sub1.
         {
-            use crate::crypto::ucan::validate::{
+            use scp_protocol::crypto::ucan::validate::{
                 InMemoryDidResolver, InMemoryNonceTracker, InMemoryProofResolver,
                 InMemoryRevocationChecker,
             };
@@ -12735,10 +12751,10 @@ mod tests {
 
         let params = ContextParams {
             mode: ContextMode::Encrypted,
-            memory_scope: crate::context::MemoryScope::Full,
+            memory_scope: scp_protocol::context::MemoryScope::Full,
             ceiling: vec![
-                crate::context::params::Capability::new("messages:read"),
-                crate::context::params::Capability::new("messages:write"),
+                scp_protocol::context::params::Capability::new("messages:read"),
+                scp_protocol::context::params::Capability::new("messages:write"),
             ],
             ..ContextParams::default()
         };
@@ -12872,10 +12888,10 @@ mod tests {
     fn test_broadcast_snapshot(context_id: &str) -> BroadcastContextSnapshot {
         use std::collections::HashSet;
 
-        use crate::context::broadcast::{
+        use scp_protocol::context::broadcast::{
             AuthorStateSnapshot, BroadcastAdmission, SubscriberRecord,
         };
-        use crate::crypto::sender_keys::generate_sender_key;
+        use scp_protocol::crypto::sender_keys::generate_sender_key;
 
         let mut authors = HashMap::new();
         authors.insert(
@@ -12928,7 +12944,7 @@ mod tests {
     #[tokio::test]
     #[allow(clippy::too_many_lines)]
     async fn persist_drop_restore_roundtrip() {
-        use crate::context::roles::{ContextRoleState, default_ceiling};
+        use scp_protocol::context::roles::{ContextRoleState, default_ceiling};
 
         let persistence = Arc::new(MockContextPersistence::default());
 
@@ -12943,11 +12959,11 @@ mod tests {
 
         let params = ContextParams {
             mode: ContextMode::Broadcast,
-            memory_scope: crate::context::MemoryScope::Full,
+            memory_scope: scp_protocol::context::MemoryScope::Full,
             ceiling: vec![
-                crate::context::params::Capability::new("messages:read"),
-                crate::context::params::Capability::new("messages:write"),
-                crate::context::params::Capability::new("role:assign"),
+                scp_protocol::context::params::Capability::new("messages:read"),
+                scp_protocol::context::params::Capability::new("messages:write"),
+                scp_protocol::context::params::Capability::new("role:assign"),
             ],
             ..ContextParams::default()
         };
@@ -12994,7 +13010,7 @@ mod tests {
             pruning_policy: None,
             governance_model_config: None,
             economic_policy: None,
-            budget_tracker: crate::economy::budget::MemberBudgetTracker::new(),
+            budget_tracker: scp_protocol::economy::budget::MemberBudgetTracker::new(),
             approved_proposals: HashMap::new(),
             governance_freeze: None,
             pending_ceiling_modification: None,
@@ -13055,17 +13071,17 @@ mod tests {
     /// SCP-PERSIST-025: `executed_proposals` preserved across restart.
     #[tokio::test]
     async fn restore_preserves_executed_proposals() {
-        use crate::context::roles::{ContextRoleState, default_ceiling};
+        use scp_protocol::context::roles::{ContextRoleState, default_ceiling};
 
         let persistence = Arc::new(MockContextPersistence::default());
 
         let params = ContextParams {
             mode: ContextMode::Broadcast,
-            memory_scope: crate::context::MemoryScope::Full,
+            memory_scope: scp_protocol::context::MemoryScope::Full,
             ceiling: vec![
-                crate::context::params::Capability::new("messages:read"),
-                crate::context::params::Capability::new("messages:write"),
-                crate::context::params::Capability::new("role:assign"),
+                scp_protocol::context::params::Capability::new("messages:read"),
+                scp_protocol::context::params::Capability::new("messages:write"),
+                scp_protocol::context::params::Capability::new("role:assign"),
             ],
             ..ContextParams::default()
         };
@@ -13105,7 +13121,7 @@ mod tests {
             pruning_policy: None,
             governance_model_config: None,
             economic_policy: None,
-            budget_tracker: crate::economy::budget::MemberBudgetTracker::new(),
+            budget_tracker: scp_protocol::economy::budget::MemberBudgetTracker::new(),
             approved_proposals: HashMap::new(),
             governance_freeze: None,
             pending_ceiling_modification: None,
@@ -13160,16 +13176,16 @@ mod tests {
     /// SCP-PERSIST-025: TTL timer re-spawned after restore with remaining TTL.
     #[tokio::test]
     async fn restore_respawns_ttl_timer() {
-        use crate::context::roles::{ContextRoleState, default_ceiling};
+        use scp_protocol::context::roles::{ContextRoleState, default_ceiling};
 
         let persistence = Arc::new(MockContextPersistence::default());
 
         let params = ContextParams {
             ttl: Some(std::time::Duration::from_secs(300)),
             ceiling: vec![
-                crate::context::params::Capability::new("messages:read"),
-                crate::context::params::Capability::new("messages:write"),
-                crate::context::params::Capability::new("role:assign"),
+                scp_protocol::context::params::Capability::new("messages:read"),
+                scp_protocol::context::params::Capability::new("messages:write"),
+                scp_protocol::context::params::Capability::new("role:assign"),
             ],
             ..ContextParams::default()
         };
@@ -13204,7 +13220,7 @@ mod tests {
             pruning_policy: None,
             governance_model_config: None,
             economic_policy: None,
-            budget_tracker: crate::economy::budget::MemberBudgetTracker::new(),
+            budget_tracker: scp_protocol::economy::budget::MemberBudgetTracker::new(),
             approved_proposals: HashMap::new(),
             governance_freeze: None,
             pending_ceiling_modification: None,
@@ -13246,7 +13262,7 @@ mod tests {
     /// SCP-PERSIST-025: `restore_all_contexts` lists and restores each.
     #[tokio::test]
     async fn restore_all_contexts_restores_persisted() {
-        use crate::context::roles::{ContextRoleState, default_ceiling};
+        use scp_protocol::context::roles::{ContextRoleState, default_ceiling};
 
         let persistence = Arc::new(MockContextPersistence::default());
 
@@ -13282,7 +13298,7 @@ mod tests {
                 pruning_policy: None,
                 governance_model_config: None,
                 economic_policy: None,
-                budget_tracker: crate::economy::budget::MemberBudgetTracker::new(),
+                budget_tracker: scp_protocol::economy::budget::MemberBudgetTracker::new(),
                 approved_proposals: HashMap::new(),
                 governance_freeze: None,
                 pending_ceiling_modification: None,
@@ -13320,13 +13336,13 @@ mod tests {
     /// `restore_context` rejects duplicate context registration.
     #[tokio::test]
     async fn restore_context_rejects_duplicate() {
-        use crate::context::roles::{ContextRoleState, default_ceiling};
+        use scp_protocol::context::roles::{ContextRoleState, default_ceiling};
 
         let persistence = Arc::new(MockContextPersistence::default());
 
         let params = ContextParams {
             mode: ContextMode::Broadcast,
-            memory_scope: crate::context::MemoryScope::Full,
+            memory_scope: scp_protocol::context::MemoryScope::Full,
             ..ContextParams::default()
         };
 
@@ -13359,7 +13375,7 @@ mod tests {
             pruning_policy: None,
             governance_model_config: None,
             economic_policy: None,
-            budget_tracker: crate::economy::budget::MemberBudgetTracker::new(),
+            budget_tracker: scp_protocol::economy::budget::MemberBudgetTracker::new(),
             approved_proposals: HashMap::new(),
             governance_freeze: None,
             pending_ceiling_modification: None,
@@ -13413,14 +13429,14 @@ mod tests {
     /// §23.11: Grace entry with epoch > MLS epoch triggers `needs_reconnect`.
     #[tokio::test]
     async fn restore_context_sets_needs_reconnect_on_grace_inconsistency() {
-        use crate::context::roles::{ContextRoleState, default_ceiling};
         use crate::crypto::mls::epoch_grace::GraceEntry;
+        use scp_protocol::context::roles::{ContextRoleState, default_ceiling};
 
         let persistence = Arc::new(MockContextPersistence::default());
 
         let params = ContextParams {
             mode: ContextMode::Broadcast,
-            memory_scope: crate::context::MemoryScope::Full,
+            memory_scope: scp_protocol::context::MemoryScope::Full,
             ..ContextParams::default()
         };
 
@@ -13455,7 +13471,7 @@ mod tests {
             pruning_policy: None,
             governance_model_config: None,
             economic_policy: None,
-            budget_tracker: crate::economy::budget::MemberBudgetTracker::new(),
+            budget_tracker: scp_protocol::economy::budget::MemberBudgetTracker::new(),
             approved_proposals: HashMap::new(),
             governance_freeze: None,
             pending_ceiling_modification: None,
@@ -13514,14 +13530,14 @@ mod tests {
     /// §23.11: Consistent grace entries do NOT set `needs_reconnect`.
     #[tokio::test]
     async fn restore_context_no_reconnect_when_grace_consistent() {
-        use crate::context::roles::{ContextRoleState, default_ceiling};
         use crate::crypto::mls::epoch_grace::GraceEntry;
+        use scp_protocol::context::roles::{ContextRoleState, default_ceiling};
 
         let persistence = Arc::new(MockContextPersistence::default());
 
         let params = ContextParams {
             mode: ContextMode::Broadcast,
-            memory_scope: crate::context::MemoryScope::Full,
+            memory_scope: scp_protocol::context::MemoryScope::Full,
             ..ContextParams::default()
         };
 
@@ -13561,7 +13577,7 @@ mod tests {
             pruning_policy: None,
             governance_model_config: None,
             economic_policy: None,
-            budget_tracker: crate::economy::budget::MemberBudgetTracker::new(),
+            budget_tracker: scp_protocol::economy::budget::MemberBudgetTracker::new(),
             approved_proposals: HashMap::new(),
             governance_freeze: None,
             pending_ceiling_modification: None,
@@ -13622,7 +13638,7 @@ mod tests {
         mls_epoch: u64,
         bad_grace_epoch: Option<u64>,
     ) -> super::ContextSnapshot {
-        use crate::context::roles::{ContextRoleState, default_ceiling};
+        use scp_protocol::context::roles::{ContextRoleState, default_ceiling};
         let ceiling = default_ceiling();
         let role_state = ContextRoleState::new(
             ctx_id,
@@ -13665,7 +13681,7 @@ mod tests {
             mls_epoch,
             grace_entries: grace,
             needs_reconnect: false,
-            budget_tracker: crate::economy::budget::MemberBudgetTracker::new(),
+            budget_tracker: scp_protocol::economy::budget::MemberBudgetTracker::new(),
             epoch_coordination_records: Vec::new(),
             mls_crypto_state: Vec::new(),
             migration_state: None,
@@ -13814,7 +13830,7 @@ mod tests {
         assert_eq!(report.contexts_synced.len(), 1);
         assert_eq!(
             report.contexts_synced[0].outcome,
-            crate::sync::SyncOutcome::FullyCaughtUp
+            scp_protocol::sync::SyncOutcome::FullyCaughtUp
         );
         assert!(report.contexts_synced[0].mls_update_issued);
         assert!(
@@ -13919,7 +13935,7 @@ mod tests {
         assert_eq!(report.contexts_synced.len(), 1);
         assert_eq!(
             report.contexts_synced[0].outcome,
-            crate::sync::SyncOutcome::ContextGone,
+            scp_protocol::sync::SyncOutcome::ContextGone,
         );
         assert!(
             !manager.context_needs_reconnect("ctx-gone").await,
@@ -13957,7 +13973,7 @@ mod tests {
     /// succeeds (positive case -- defense-in-depth validation passes).
     #[tokio::test]
     async fn handle_broadcast_key_request_succeeds_with_local_did() {
-        use crate::crypto::ucan::validate::{
+        use scp_protocol::crypto::ucan::validate::{
             InMemoryDidResolver, InMemoryNonceTracker, InMemoryProofResolver,
             InMemoryRevocationChecker,
         };
@@ -14004,7 +14020,7 @@ mod tests {
     /// rejects the request before reaching `BroadcastContext`).
     #[tokio::test]
     async fn handle_broadcast_key_request_rejects_non_local_did() {
-        use crate::crypto::ucan::validate::{
+        use scp_protocol::crypto::ucan::validate::{
             InMemoryDidResolver, InMemoryNonceTracker, InMemoryProofResolver,
             InMemoryRevocationChecker,
         };
@@ -14054,7 +14070,7 @@ mod tests {
     /// logic applies as before.
     #[tokio::test]
     async fn handle_broadcast_key_request_deny_does_not_leak_block_info() {
-        use crate::crypto::ucan::validate::{
+        use scp_protocol::crypto::ucan::validate::{
             InMemoryDidResolver, InMemoryNonceTracker, InMemoryProofResolver,
             InMemoryRevocationChecker,
         };
@@ -14145,7 +14161,7 @@ mod tests {
 
     /// Build a minimal valid [`ToolRegistration`] for bounds tests.
     fn test_tool_registration(id: &str) -> ToolRegistration {
-        use crate::context::tools::registry::{TestVector, ToolSchema};
+        use scp_protocol::context::tools::registry::{TestVector, ToolSchema};
         ToolRegistration {
             tool_id: id.to_owned(),
             name: id.to_owned(),
@@ -14296,7 +14312,7 @@ mod tests {
 
     #[test]
     fn governance_model_serde_roundtrip_all_variants() {
-        use super::super::params::GovernanceModel;
+        use super::scp_protocol::context::params::GovernanceModel;
 
         let alice: DID = "did:dht:z6MkAlice".into();
         let bob: DID = "did:dht:z6MkBob".into();
@@ -14325,7 +14341,7 @@ mod tests {
 
     #[test]
     fn governance_model_in_context_params_roundtrip() {
-        use super::super::params::GovernanceModel;
+        use super::scp_protocol::context::params::GovernanceModel;
 
         let params = ContextParams {
             governance: GovernanceModel::Threshold {
@@ -14346,7 +14362,7 @@ mod tests {
 
     #[test]
     fn public_metadata_exposes_all_governance_variants() {
-        use super::super::params::{GovernanceModel, RuntimeMetadata};
+        use super::scp_protocol::context::params::{GovernanceModel, RuntimeMetadata};
 
         let params = ContextParams {
             governance: GovernanceModel::Majority {
@@ -14374,7 +14390,7 @@ mod tests {
         );
 
         let params = ContextParams {
-            governance: super::super::params::GovernanceModel::Threshold {
+            governance: super::scp_protocol::context::params::GovernanceModel::Threshold {
                 threshold: 5,
                 signers: vec!["did:dht:z6MkAlice".into(), "did:dht:z6MkBob".into()],
             },
@@ -14402,7 +14418,7 @@ mod tests {
         );
 
         let params = ContextParams {
-            governance: super::super::params::GovernanceModel::Threshold {
+            governance: super::scp_protocol::context::params::GovernanceModel::Threshold {
                 threshold: 0,
                 signers: vec!["did:dht:z6MkAlice".into()],
             },
@@ -14430,7 +14446,7 @@ mod tests {
         );
 
         let params = ContextParams {
-            governance: super::super::params::GovernanceModel::Majority {
+            governance: super::scp_protocol::context::params::GovernanceModel::Majority {
                 eligible_voters: vec![],
             },
             ..ContextParams::default()
@@ -14460,7 +14476,7 @@ mod tests {
         );
 
         let params = ContextParams {
-            governance: super::super::params::GovernanceModel::Unanimity {
+            governance: super::scp_protocol::context::params::GovernanceModel::Unanimity {
                 eligible_voters: vec![],
             },
             ..ContextParams::default()
@@ -14486,7 +14502,7 @@ mod tests {
 
     #[tokio::test]
     async fn single_admin_propose_auto_executes() {
-        use super::super::governance::GovernanceAction;
+        use scp_protocol::context::governance::GovernanceAction;
 
         let manager = ContextManager::new(
             Box::new(MockCrypto::default()),
@@ -14536,7 +14552,7 @@ mod tests {
         assert!(
             matches!(
                 proposal.status,
-                super::super::governance::ProposalStatus::Approved
+                scp_protocol::context::governance::ProposalStatus::Approved
             ),
             "SingleAdmin proposal should be auto-approved"
         );
@@ -14562,7 +14578,7 @@ mod tests {
 
     #[tokio::test]
     async fn threshold_context_proposal_lifecycle() {
-        use super::super::governance::{GovernanceAction, ProposalStatus};
+        use scp_protocol::context::governance::{GovernanceAction, ProposalStatus};
 
         let manager = ContextManager::new(
             Box::new(MockCrypto::default()),
@@ -14578,7 +14594,7 @@ mod tests {
         let key_b = signing_key_for_did(&bob);
 
         let params = ContextParams {
-            governance: super::super::params::GovernanceModel::Threshold {
+            governance: super::scp_protocol::context::params::GovernanceModel::Threshold {
                 threshold: 2,
                 signers: vec![alice.clone(), bob.clone(), carol.clone()],
             },
@@ -14637,7 +14653,7 @@ mod tests {
 
     #[tokio::test]
     async fn majority_context_proposal_lifecycle() {
-        use super::super::governance::{GovernanceAction, ProposalStatus};
+        use scp_protocol::context::governance::{GovernanceAction, ProposalStatus};
 
         let manager = ContextManager::new(
             Box::new(MockCrypto::default()),
@@ -14653,7 +14669,7 @@ mod tests {
         let key_b = signing_key_for_did(&bob);
 
         let params = ContextParams {
-            governance: super::super::params::GovernanceModel::Majority {
+            governance: super::scp_protocol::context::params::GovernanceModel::Majority {
                 eligible_voters: vec![alice.clone(), bob.clone(), carol.clone()],
             },
             ..ContextParams::default()
@@ -14701,7 +14717,7 @@ mod tests {
 
     #[tokio::test]
     async fn unanimity_context_single_rejection_defeats_proposal() {
-        use super::super::governance::{GovernanceAction, ProposalStatus};
+        use scp_protocol::context::governance::{GovernanceAction, ProposalStatus};
 
         let manager = ContextManager::new(
             Box::new(MockCrypto::default()),
@@ -14718,7 +14734,7 @@ mod tests {
         let key_c = signing_key_for_did(&carol);
 
         let params = ContextParams {
-            governance: super::super::params::GovernanceModel::Unanimity {
+            governance: super::scp_protocol::context::params::GovernanceModel::Unanimity {
                 eligible_voters: vec![alice.clone(), bob.clone(), carol.clone()],
             },
             ..ContextParams::default()
@@ -14788,7 +14804,7 @@ mod tests {
 
     #[tokio::test]
     async fn non_eligible_voter_rejected() {
-        use super::super::governance::GovernanceAction;
+        use scp_protocol::context::governance::GovernanceAction;
 
         let manager = ContextManager::new(
             Box::new(MockCrypto::default()),
@@ -14804,7 +14820,7 @@ mod tests {
         let key_e = signing_key_for_did(&eve);
 
         let params = ContextParams {
-            governance: super::super::params::GovernanceModel::Threshold {
+            governance: super::scp_protocol::context::params::GovernanceModel::Threshold {
                 threshold: 2,
                 signers: vec![alice.clone(), bob.clone()],
             },
@@ -14841,10 +14857,10 @@ mod tests {
 
     #[test]
     fn governance_snapshot_serde_roundtrip() {
-        use crate::context::roles::{ContextRoleState, default_ceiling};
+        use scp_protocol::context::roles::{ContextRoleState, default_ceiling};
 
         let params = ContextParams {
-            governance: super::super::params::GovernanceModel::Threshold {
+            governance: super::scp_protocol::context::params::GovernanceModel::Threshold {
                 threshold: 2,
                 signers: vec![
                     "did:dht:z6MkAlice".into(),
@@ -14881,7 +14897,7 @@ mod tests {
             threshold_value: 0,
             pruning_policy: None,
             governance_model_config: Some(
-                super::super::governance::GovernanceModelConfig::Threshold {
+                scp_protocol::context::governance::GovernanceModelConfig::Threshold {
                     signers: vec![
                         "did:dht:z6MkAlice".into(),
                         "did:dht:z6MkBob".into(),
@@ -14892,7 +14908,7 @@ mod tests {
                 },
             ),
             economic_policy: None,
-            budget_tracker: crate::economy::budget::MemberBudgetTracker::new(),
+            budget_tracker: scp_protocol::economy::budget::MemberBudgetTracker::new(),
             approved_proposals: HashMap::new(),
             governance_freeze: None,
             pending_ceiling_modification: None,
@@ -14923,7 +14939,7 @@ mod tests {
     /// governance proposals with `PermissionDenied`.
     #[tokio::test]
     async fn promote_context_rejected_when_policy_is_no_promotion() {
-        use crate::context::governance::{GovernanceProposal, SignedVote, VoteType};
+        use scp_protocol::context::governance::{GovernanceProposal, SignedVote, VoteType};
 
         let (manager, _handle) = setup_active_context().await;
 
@@ -14973,8 +14989,8 @@ mod tests {
     /// memory scope transitions to `Full`.
     #[tokio::test]
     async fn promote_context_succeeds_when_policy_is_promotable() {
-        use crate::context::governance::{GovernanceProposal, SignedVote, VoteType};
-        use crate::context::params::{MemoryScope, PromotionPolicy};
+        use scp_protocol::context::governance::{GovernanceProposal, SignedVote, VoteType};
+        use scp_protocol::context::params::{MemoryScope, PromotionPolicy};
 
         let manager = ContextManager::new(
             Box::new(MockCrypto::default()),
@@ -14988,8 +15004,8 @@ mod tests {
             memory_scope: MemoryScope::Ephemeral,
             ttl: Some(std::time::Duration::from_secs(3600)),
             ceiling: vec![
-                crate::context::params::Capability::new("messages:read"),
-                crate::context::params::Capability::new("messages:write"),
+                scp_protocol::context::params::Capability::new("messages:read"),
+                scp_protocol::context::params::Capability::new("messages:write"),
             ],
             ..ContextParams::default()
         };
@@ -15055,8 +15071,8 @@ mod tests {
     /// the field is not mutated by the promotion itself.
     #[tokio::test]
     async fn promote_context_does_not_mutate_promotion_policy() {
-        use crate::context::governance::{GovernanceProposal, SignedVote, VoteType};
-        use crate::context::params::{MemoryScope, PromotionPolicy};
+        use scp_protocol::context::governance::{GovernanceProposal, SignedVote, VoteType};
+        use scp_protocol::context::params::{MemoryScope, PromotionPolicy};
 
         let manager = ContextManager::new(
             Box::new(MockCrypto::default()),
@@ -15068,7 +15084,9 @@ mod tests {
         let params = ContextParams {
             promotion_policy: PromotionPolicy::Promotable,
             memory_scope: MemoryScope::Ephemeral,
-            ceiling: vec![crate::context::params::Capability::new("messages:read")],
+            ceiling: vec![scp_protocol::context::params::Capability::new(
+                "messages:read",
+            )],
             ..ContextParams::default()
         };
 
@@ -15149,7 +15167,7 @@ mod tests {
         context_id: &str,
         action: GovernanceAction,
     ) -> super::GovernanceProposal {
-        use crate::context::governance::{SignedVote, VoteType};
+        use scp_protocol::context::governance::{SignedVote, VoteType};
         super::GovernanceProposal {
             proposal_id: [42u8; 32],
             context_id: context_id.into(),
@@ -15172,13 +15190,13 @@ mod tests {
     /// #339: `RegisterTool` is rejected when `ToolRegister` is not in ceiling.
     #[tokio::test]
     async fn register_tool_rejected_without_ceiling_capability() {
-        use crate::context::tools::registry::ToolSchema;
+        use scp_protocol::context::tools::registry::ToolSchema;
 
         let (manager, _handle, ctx_id) =
             setup_context_with_ceiling(vec![Capability::MessagesRead, Capability::MessagesWrite])
                 .await;
 
-        let reg = super::super::params::ToolRegistration {
+        let reg = super::scp_protocol::context::params::ToolRegistration {
             tool_id: "test".to_owned(),
             name: "test".to_owned(),
             description: "test".to_owned(),
@@ -15213,7 +15231,7 @@ mod tests {
     /// #339: `RegisterTool` succeeds when `ToolRegister` is in ceiling.
     #[tokio::test]
     async fn register_tool_succeeds_with_ceiling_capability() {
-        use crate::context::tools::registry::ToolSchema;
+        use scp_protocol::context::tools::registry::ToolSchema;
 
         let (manager, _handle, ctx_id) = setup_context_with_ceiling(vec![
             Capability::MessagesRead,
@@ -15222,7 +15240,7 @@ mod tests {
         ])
         .await;
 
-        let reg = super::super::params::ToolRegistration {
+        let reg = super::scp_protocol::context::params::ToolRegistration {
             tool_id: "test".to_owned(),
             name: "test".to_owned(),
             description: "test".to_owned(),
@@ -15766,12 +15784,12 @@ mod tests {
 
         let params = ContextParams {
             ceiling: vec![
-                crate::context::params::Capability::new("messages:read"),
-                crate::context::params::Capability::new("messages:write"),
-                crate::context::params::Capability::new("role:assign"),
-                crate::context::params::Capability::new("governance:propose"),
-                crate::context::params::Capability::new("governance:vote"),
-                crate::context::params::Capability::new("context:close"),
+                scp_protocol::context::params::Capability::new("messages:read"),
+                scp_protocol::context::params::Capability::new("messages:write"),
+                scp_protocol::context::params::Capability::new("role:assign"),
+                scp_protocol::context::params::Capability::new("governance:propose"),
+                scp_protocol::context::params::Capability::new("governance:vote"),
+                scp_protocol::context::params::Capability::new("context:close"),
             ],
             ..ContextParams::default()
         };
@@ -15922,10 +15940,10 @@ mod tests {
 
         let params = ContextParams {
             ceiling: vec![
-                crate::context::params::Capability::new("messages:read"),
-                crate::context::params::Capability::new("messages:write"),
-                crate::context::params::Capability::new("governance:propose"),
-                crate::context::params::Capability::new("governance:vote"),
+                scp_protocol::context::params::Capability::new("messages:read"),
+                scp_protocol::context::params::Capability::new("messages:write"),
+                scp_protocol::context::params::Capability::new("governance:propose"),
+                scp_protocol::context::params::Capability::new("governance:vote"),
             ],
             ..ContextParams::default()
         };
@@ -15969,11 +15987,11 @@ mod tests {
 
         let params = ContextParams {
             ceiling: vec![
-                crate::context::params::Capability::new("messages:read"),
-                crate::context::params::Capability::new("messages:write"),
-                crate::context::params::Capability::new("role:assign"),
-                crate::context::params::Capability::new("governance:propose"),
-                crate::context::params::Capability::new("governance:vote"),
+                scp_protocol::context::params::Capability::new("messages:read"),
+                scp_protocol::context::params::Capability::new("messages:write"),
+                scp_protocol::context::params::Capability::new("role:assign"),
+                scp_protocol::context::params::Capability::new("governance:propose"),
+                scp_protocol::context::params::Capability::new("governance:vote"),
             ],
             governance: GovernanceModel::Threshold {
                 threshold: 2,
@@ -16097,13 +16115,13 @@ mod tests {
     fn governance_params() -> ContextParams {
         ContextParams {
             ceiling: vec![
-                crate::context::params::Capability::new("messages:read"),
-                crate::context::params::Capability::new("messages:write"),
-                crate::context::params::Capability::new("role:assign"),
-                crate::context::params::Capability::new("governance:propose"),
-                crate::context::params::Capability::new("governance:vote"),
-                crate::context::params::Capability::new("member:ban"),
-                crate::context::params::Capability::new("context:close"),
+                scp_protocol::context::params::Capability::new("messages:read"),
+                scp_protocol::context::params::Capability::new("messages:write"),
+                scp_protocol::context::params::Capability::new("role:assign"),
+                scp_protocol::context::params::Capability::new("governance:propose"),
+                scp_protocol::context::params::Capability::new("governance:vote"),
+                scp_protocol::context::params::Capability::new("member:ban"),
+                scp_protocol::context::params::Capability::new("context:close"),
             ],
             ..ContextParams::default()
         }
@@ -16116,7 +16134,7 @@ mod tests {
         action: GovernanceAction,
         approver_dids: &[&str],
     ) -> GovernanceProposal {
-        use crate::context::governance::{SignedVote, VoteType};
+        use scp_protocol::context::governance::{SignedVote, VoteType};
         GovernanceProposal {
             proposal_id: pid,
             context_id: context_id.into(),
@@ -16149,7 +16167,7 @@ mod tests {
     /// per-action tests. This test verifies the dispatch returns typed results.
     #[tokio::test]
     async fn governance_dispatch_returns_typed_results() {
-        use crate::context::governance::{GovernanceProposal, SignedVote, VoteType};
+        use scp_protocol::context::governance::{GovernanceProposal, SignedVote, VoteType};
 
         let manager = ContextManager::new(
             Box::new(MockCrypto::default()),
@@ -16447,8 +16465,8 @@ mod tests {
     /// SCP-270 AC18: `PromoteContext` unanimity override.
     #[tokio::test]
     async fn promote_context_requires_unanimity() {
-        use crate::context::governance::{GovernanceProposal, SignedVote, VoteType};
-        use crate::context::params::{MemoryScope, PromotionPolicy};
+        use scp_protocol::context::governance::{GovernanceProposal, SignedVote, VoteType};
+        use scp_protocol::context::params::{MemoryScope, PromotionPolicy};
 
         let manager = ContextManager::new(
             Box::new(MockCrypto::default()),
@@ -16948,7 +16966,7 @@ mod tests {
             "revoked author should not publish"
         );
         {
-            use crate::crypto::ucan::validate::{
+            use scp_protocol::crypto::ucan::validate::{
                 InMemoryDidResolver, InMemoryNonceTracker, InMemoryProofResolver,
                 InMemoryRevocationChecker,
             };
@@ -17094,7 +17112,7 @@ mod tests {
     async fn cac009_layer_verification() {
         let (manager, _handle, ctx_id) = setup_broadcast_context_two_authors().await;
         {
-            use crate::crypto::ucan::validate::{
+            use scp_protocol::crypto::ucan::validate::{
                 InMemoryDidResolver, InMemoryNonceTracker, InMemoryProofResolver,
                 InMemoryRevocationChecker,
             };
@@ -17232,7 +17250,7 @@ mod tests {
             .await
             .unwrap();
         {
-            use crate::crypto::ucan::validate::{
+            use scp_protocol::crypto::ucan::validate::{
                 InMemoryDidResolver, InMemoryNonceTracker, InMemoryProofResolver,
                 InMemoryRevocationChecker,
             };
@@ -18065,7 +18083,7 @@ mod tests {
 
     #[tokio::test]
     async fn scp274_promote_context_unanimity_override_in_majority() {
-        use crate::context::params::{MemoryScope, PromotionPolicy};
+        use scp_protocol::context::params::{MemoryScope, PromotionPolicy};
         let creator: DID = "did:key:creator".into();
         let manager = ContextManager::new(
             Box::new(MockCrypto::default()),
@@ -18181,8 +18199,8 @@ mod tests {
             assert!(
                 events.iter().any(|e| matches!(
                     e,
-                    crate::context::governance::GovernanceEvent::ConflictDetected { .. }
-                        | crate::context::governance::GovernanceEvent::ConflictResolved { .. }
+                    scp_protocol::context::governance::GovernanceEvent::ConflictDetected { .. }
+                        | scp_protocol::context::governance::GovernanceEvent::ConflictResolved { .. }
                 )),
                 "conflict detected: {events:?}"
             );
@@ -18191,9 +18209,9 @@ mod tests {
 
     #[tokio::test]
     async fn scp274_deadlock_detection_threshold() {
-        use crate::context::governance::GovernanceContext;
-        use crate::context::governance::multisig::ThresholdEngine;
         use crate::context::governance::timeout::{DeadlockDetectionState, detect_deadlock};
+        use scp_protocol::context::governance::GovernanceContext;
+        use scp_protocol::context::governance::multisig::ThresholdEngine;
         let signer1: DID = "did:key:signer1".into();
         let signer2: DID = "did:key:signer2".into();
         let signer3: DID = "did:key:signer3".into();
@@ -18218,8 +18236,8 @@ mod tests {
 
     #[tokio::test]
     async fn scp274_checkpoint_cosignature_threshold() {
-        use crate::context::governance::GovernanceEngine;
-        use crate::context::governance::multisig::ThresholdEngine;
+        use scp_protocol::context::governance::GovernanceEngine;
+        use scp_protocol::context::governance::multisig::ThresholdEngine;
         let signer1: DID = "did:key:signer1".into();
         let signer2: DID = "did:key:signer2".into();
         let signing_key = ed25519_dalek::SigningKey::from_bytes(&[1u8; 32]);
@@ -18300,7 +18318,7 @@ mod tests {
 
     #[tokio::test]
     async fn execute_modify_ceiling_sets_pending_with_72h_period() {
-        use super::super::governance::GovernanceAction;
+        use scp_protocol::context::governance::GovernanceAction;
 
         let manager = ContextManager::new(
             Box::new(MockCrypto::default()),
@@ -18313,8 +18331,8 @@ mod tests {
         let key_a = signing_key_for_did(&alice);
 
         let params = ContextParams {
-            governance: super::super::params::GovernanceModel::SingleAdmin,
-            ceiling_policy: super::super::params::CeilingPolicy::Governed,
+            governance: super::scp_protocol::context::params::GovernanceModel::SingleAdmin,
+            ceiling_policy: super::scp_protocol::context::params::CeilingPolicy::Governed,
             ceiling: vec![Capability::MessagesRead, Capability::MessagesWrite],
             ..ContextParams::default()
         };
@@ -18360,7 +18378,7 @@ mod tests {
 
     #[tokio::test]
     async fn apply_pending_ceiling_modification_respects_notification_period() {
-        use super::super::governance::GovernanceAction;
+        use scp_protocol::context::governance::GovernanceAction;
 
         let manager = ContextManager::new(
             Box::new(MockCrypto::default()),
@@ -18373,8 +18391,8 @@ mod tests {
         let key_a = signing_key_for_did(&alice);
 
         let params = ContextParams {
-            governance: super::super::params::GovernanceModel::SingleAdmin,
-            ceiling_policy: super::super::params::CeilingPolicy::Governed,
+            governance: super::scp_protocol::context::params::GovernanceModel::SingleAdmin,
+            ceiling_policy: super::scp_protocol::context::params::CeilingPolicy::Governed,
             ceiling: vec![Capability::MessagesRead, Capability::MessagesWrite],
             ..ContextParams::default()
         };
@@ -18439,8 +18457,8 @@ mod tests {
 
     #[tokio::test]
     async fn execute_modify_ceiling_emits_ceiling_change_notification() {
-        use super::super::governance::GovernanceAction;
-        use crate::context::membership::ContextEvent;
+        use scp_protocol::context::governance::GovernanceAction;
+        use scp_protocol::context::membership::ContextEvent;
 
         let manager = ContextManager::new(
             Box::new(MockCrypto::default()),
@@ -18453,8 +18471,8 @@ mod tests {
         let key_a = signing_key_for_did(&alice);
 
         let params = ContextParams {
-            governance: super::super::params::GovernanceModel::SingleAdmin,
-            ceiling_policy: super::super::params::CeilingPolicy::Governed,
+            governance: super::scp_protocol::context::params::GovernanceModel::SingleAdmin,
+            ceiling_policy: super::scp_protocol::context::params::CeilingPolicy::Governed,
             ceiling: vec![Capability::MessagesRead, Capability::MessagesWrite],
             ..ContextParams::default()
         };
@@ -18510,10 +18528,10 @@ mod tests {
     fn pending_economic_policy_change_effective_at_equals_notified_at_plus_86400() {
         let notified_at = 1_000_000u64;
         let pending = PendingEconomicPolicyChange {
-            new_policy: crate::economy::types::EconomicPolicy {
+            new_policy: scp_protocol::economy::types::EconomicPolicy {
                 locked: false,
-                cost_schedule: crate::economy::types::CostSchedule {
-                    currency: crate::economy::types::CurrencyCode([85, 83, 68, 0]),
+                cost_schedule: scp_protocol::economy::types::CostSchedule {
+                    currency: scp_protocol::economy::types::CurrencyCode([85, 83, 68, 0]),
                     per_message: None,
                     per_tool_invoke: None,
                     per_join: None,
@@ -18539,10 +18557,10 @@ mod tests {
     fn pending_economic_policy_is_effective_false_before_period_expires() {
         let notified_at = 1_000_000u64;
         let pending = PendingEconomicPolicyChange {
-            new_policy: crate::economy::types::EconomicPolicy {
+            new_policy: scp_protocol::economy::types::EconomicPolicy {
                 locked: false,
-                cost_schedule: crate::economy::types::CostSchedule {
-                    currency: crate::economy::types::CurrencyCode([85, 83, 68, 0]),
+                cost_schedule: scp_protocol::economy::types::CostSchedule {
+                    currency: scp_protocol::economy::types::CurrencyCode([85, 83, 68, 0]),
                     per_message: None,
                     per_tool_invoke: None,
                     per_join: None,
@@ -18567,10 +18585,10 @@ mod tests {
     fn pending_economic_policy_is_effective_true_after_period_expires() {
         let notified_at = 1_000_000u64;
         let pending = PendingEconomicPolicyChange {
-            new_policy: crate::economy::types::EconomicPolicy {
+            new_policy: scp_protocol::economy::types::EconomicPolicy {
                 locked: false,
-                cost_schedule: crate::economy::types::CostSchedule {
-                    currency: crate::economy::types::CurrencyCode([85, 83, 68, 0]),
+                cost_schedule: scp_protocol::economy::types::CostSchedule {
+                    currency: scp_protocol::economy::types::CurrencyCode([85, 83, 68, 0]),
                     per_message: None,
                     per_tool_invoke: None,
                     per_join: None,
@@ -18593,8 +18611,8 @@ mod tests {
 
     #[tokio::test]
     async fn execute_set_economic_policy_stages_with_24h_delay() {
-        use super::super::governance::GovernanceAction;
-        use crate::economy::types::{CostSchedule, EconomicPolicy};
+        use scp_protocol::context::governance::GovernanceAction;
+        use scp_protocol::economy::types::{CostSchedule, EconomicPolicy};
 
         let manager = ContextManager::new(
             Box::new(MockCrypto::default()),
@@ -18607,7 +18625,7 @@ mod tests {
         let key_a = signing_key_for_did(&alice);
 
         let params = ContextParams {
-            governance: super::super::params::GovernanceModel::SingleAdmin,
+            governance: super::scp_protocol::context::params::GovernanceModel::SingleAdmin,
             ..ContextParams::default()
         };
 
@@ -18619,7 +18637,7 @@ mod tests {
         let policy = EconomicPolicy {
             locked: false,
             cost_schedule: CostSchedule {
-                currency: crate::economy::types::CurrencyCode([85, 83, 68, 0]),
+                currency: scp_protocol::economy::types::CurrencyCode([85, 83, 68, 0]),
                 per_message: None,
                 per_tool_invoke: None,
                 per_join: None,
@@ -18659,8 +18677,8 @@ mod tests {
 
     #[tokio::test]
     async fn apply_pending_economic_policy_change_respects_notification_period() {
-        use super::super::governance::GovernanceAction;
-        use crate::economy::types::{CostSchedule, EconomicPolicy};
+        use scp_protocol::context::governance::GovernanceAction;
+        use scp_protocol::economy::types::{CostSchedule, EconomicPolicy};
 
         let manager = ContextManager::new(
             Box::new(MockCrypto::default()),
@@ -18673,7 +18691,7 @@ mod tests {
         let key_a = signing_key_for_did(&alice);
 
         let params = ContextParams {
-            governance: super::super::params::GovernanceModel::SingleAdmin,
+            governance: super::scp_protocol::context::params::GovernanceModel::SingleAdmin,
             ..ContextParams::default()
         };
 
@@ -18685,7 +18703,7 @@ mod tests {
         let policy = EconomicPolicy {
             locked: false,
             cost_schedule: CostSchedule {
-                currency: crate::economy::types::CurrencyCode([85, 83, 68, 0]),
+                currency: scp_protocol::economy::types::CurrencyCode([85, 83, 68, 0]),
                 per_message: None,
                 per_tool_invoke: None,
                 per_join: None,
@@ -18744,9 +18762,9 @@ mod tests {
 
     #[tokio::test]
     async fn execute_set_economic_policy_emits_notification_event() {
-        use super::super::governance::GovernanceAction;
-        use crate::context::membership::ContextEvent;
-        use crate::economy::types::{CostSchedule, EconomicPolicy};
+        use scp_protocol::context::governance::GovernanceAction;
+        use scp_protocol::context::membership::ContextEvent;
+        use scp_protocol::economy::types::{CostSchedule, EconomicPolicy};
 
         let manager = ContextManager::new(
             Box::new(MockCrypto::default()),
@@ -18759,7 +18777,7 @@ mod tests {
         let key_a = signing_key_for_did(&alice);
 
         let params = ContextParams {
-            governance: super::super::params::GovernanceModel::SingleAdmin,
+            governance: super::scp_protocol::context::params::GovernanceModel::SingleAdmin,
             ..ContextParams::default()
         };
 
@@ -18771,7 +18789,7 @@ mod tests {
         let policy = EconomicPolicy {
             locked: false,
             cost_schedule: CostSchedule {
-                currency: crate::economy::types::CurrencyCode([85, 83, 68, 0]),
+                currency: scp_protocol::economy::types::CurrencyCode([85, 83, 68, 0]),
                 per_message: None,
                 per_tool_invoke: None,
                 per_join: None,
@@ -18813,8 +18831,8 @@ mod tests {
 
     #[tokio::test]
     async fn execute_set_economic_policy_rejects_when_already_pending() {
-        use super::super::governance::GovernanceAction;
-        use crate::economy::types::{CostSchedule, EconomicPolicy};
+        use scp_protocol::context::governance::GovernanceAction;
+        use scp_protocol::economy::types::{CostSchedule, EconomicPolicy};
 
         let manager = ContextManager::new(
             Box::new(MockCrypto::default()),
@@ -18827,7 +18845,7 @@ mod tests {
         let key_a = signing_key_for_did(&alice);
 
         let params = ContextParams {
-            governance: super::super::params::GovernanceModel::SingleAdmin,
+            governance: super::scp_protocol::context::params::GovernanceModel::SingleAdmin,
             ..ContextParams::default()
         };
 
@@ -18839,7 +18857,7 @@ mod tests {
         let policy = EconomicPolicy {
             locked: false,
             cost_schedule: CostSchedule {
-                currency: crate::economy::types::CurrencyCode([85, 83, 68, 0]),
+                currency: scp_protocol::economy::types::CurrencyCode([85, 83, 68, 0]),
                 per_message: None,
                 per_tool_invoke: None,
                 per_join: None,
@@ -19023,11 +19041,11 @@ mod tests {
         );
         let params = ContextParams {
             ceiling: vec![
-                crate::context::params::Capability::new("messages:read"),
-                crate::context::params::Capability::new("messages:write"),
-                crate::context::params::Capability::new("role:assign"),
-                crate::context::params::Capability::new("governance:propose"),
-                crate::context::params::Capability::new("governance:vote"),
+                scp_protocol::context::params::Capability::new("messages:read"),
+                scp_protocol::context::params::Capability::new("messages:write"),
+                scp_protocol::context::params::Capability::new("role:assign"),
+                scp_protocol::context::params::Capability::new("governance:propose"),
+                scp_protocol::context::params::Capability::new("governance:vote"),
             ],
             ..ContextParams::default()
         };
@@ -19071,7 +19089,7 @@ mod tests {
                 &admin,
                 GovernanceAction::ApproveSpend {
                     spender: spender.clone(),
-                    amount: crate::economy::types::Amount::new(5000),
+                    amount: scp_protocol::economy::types::Amount::new(5000),
                     purpose: "tool budget".to_owned(),
                 },
                 &sk,
@@ -19084,7 +19102,7 @@ mod tests {
             assert!(ctx.budget_tracker.has_budget(&spender));
             assert_eq!(
                 ctx.budget_tracker.remaining(&spender),
-                crate::economy::types::Amount::new(5000)
+                scp_protocol::economy::types::Amount::new(5000)
             );
         }
 
@@ -19095,7 +19113,7 @@ mod tests {
                 &admin,
                 GovernanceAction::ApproveSpend {
                     spender: spender.clone(),
-                    amount: crate::economy::types::Amount::new(3000),
+                    amount: scp_protocol::economy::types::Amount::new(3000),
                     purpose: "more budget".to_owned(),
                 },
                 &sk,
@@ -19107,7 +19125,7 @@ mod tests {
             let ctx = contexts.get("budget-ctx").unwrap();
             assert_eq!(
                 ctx.budget_tracker.limit(&spender),
-                crate::economy::types::Amount::new(8000)
+                scp_protocol::economy::types::Amount::new(8000)
             );
         }
     }
@@ -19125,10 +19143,10 @@ mod tests {
         );
         let params = ContextParams {
             ceiling: vec![
-                crate::context::params::Capability::new("messages:read"),
-                crate::context::params::Capability::new("messages:write"),
-                crate::context::params::Capability::new("governance:propose"),
-                crate::context::params::Capability::new("governance:vote"),
+                scp_protocol::context::params::Capability::new("messages:read"),
+                scp_protocol::context::params::Capability::new("messages:write"),
+                scp_protocol::context::params::Capability::new("governance:propose"),
+                scp_protocol::context::params::Capability::new("governance:vote"),
             ],
             ..ContextParams::default()
         };
@@ -19143,7 +19161,7 @@ mod tests {
                 &admin_did,
                 GovernanceAction::ApproveSpend {
                     spender: non_member,
-                    amount: crate::economy::types::Amount::new(1000),
+                    amount: scp_protocol::economy::types::Amount::new(1000),
                     purpose: "should fail".to_owned(),
                 },
                 &sk,
@@ -19168,7 +19186,7 @@ mod tests {
                 &admin,
                 GovernanceAction::ApproveSpend {
                     spender: spender.clone(),
-                    amount: crate::economy::types::Amount::new(2500),
+                    amount: scp_protocol::economy::types::Amount::new(2500),
                     purpose: "snapshot test".to_owned(),
                 },
                 &sk,
@@ -19182,7 +19200,7 @@ mod tests {
         assert!(snapshot.budget_tracker.has_budget(&spender));
         assert_eq!(
             snapshot.budget_tracker.remaining(&spender),
-            crate::economy::types::Amount::new(2500)
+            scp_protocol::economy::types::Amount::new(2500)
         );
 
         // Serde roundtrip.
@@ -19190,7 +19208,7 @@ mod tests {
         let restored: ContextSnapshot = serde_json::from_str(&json).unwrap();
         assert_eq!(
             restored.budget_tracker.remaining(&spender),
-            crate::economy::types::Amount::new(2500)
+            scp_protocol::economy::types::Amount::new(2500)
         );
     }
 
@@ -19207,7 +19225,9 @@ mod tests {
         context_id: &str,
         action: super::GovernanceAction,
     ) -> super::GovernanceProposal {
-        use crate::context::governance::{GovernanceContext, GovernanceEngine, SingleAdminEngine};
+        use scp_protocol::context::governance::{
+            GovernanceContext, GovernanceEngine, SingleAdminEngine,
+        };
 
         let signing_key = signing_key_for_did(admin_did);
         let resolver = mock_key_resolver();
@@ -19242,7 +19262,7 @@ mod tests {
         grace_period_secs: u64,
         auto_invite: bool,
     ) -> super::GovernanceProposal {
-        use crate::context::governance::{
+        use scp_protocol::context::governance::{
             GovernanceAction, GovernanceContext, GovernanceEngine, SingleAdminEngine,
         };
 
@@ -19325,7 +19345,7 @@ mod tests {
         let ctx = contexts.get("test-ctx").unwrap();
         let records = ctx.epoch_coordinator.records();
         assert_eq!(records.len(), 1);
-        if let crate::context::governance::mls_integration::MlsOperation::AddMember {
+        if let scp_protocol::context::governance::mls_integration::MlsOperation::AddMember {
             ref did,
             ref role,
         } = records[0].operation
@@ -19384,7 +19404,7 @@ mod tests {
         assert_eq!(records[0].epoch_after, 1);
         assert!(matches!(
             records[0].operation,
-            crate::context::governance::mls_integration::MlsOperation::AddMember { .. }
+            scp_protocol::context::governance::mls_integration::MlsOperation::AddMember { .. }
         ));
 
         // Verify second record: epoch 1 → 2 for RemoveMember.
@@ -19392,7 +19412,7 @@ mod tests {
         assert_eq!(records[1].epoch_after, 2);
         assert!(matches!(
             records[1].operation,
-            crate::context::governance::mls_integration::MlsOperation::RemoveMember { .. }
+            scp_protocol::context::governance::mls_integration::MlsOperation::RemoveMember { .. }
         ));
     }
 
@@ -19509,7 +19529,7 @@ mod tests {
     /// Issue #630 AC5: `ResolveConflict` requires governance freeze state.
     #[tokio::test]
     async fn mls_integration_resolve_conflict_requires_freeze() {
-        use crate::context::governance::ConflictResolution;
+        use scp_protocol::context::governance::ConflictResolution;
 
         let admin_did: DID = "did:key:creator".into();
         let (manager, _handle) = setup_active_context().await;
@@ -19536,7 +19556,7 @@ mod tests {
     /// Issue #630 AC5: `ResolveConflict` with governance freeze lifts freeze.
     #[tokio::test]
     async fn mls_integration_resolve_conflict_lifts_freeze() {
-        use crate::context::governance::ConflictResolution;
+        use scp_protocol::context::governance::ConflictResolution;
 
         let admin_did: DID = "did:key:creator".into();
         let other_did: DID = "did:key:other-admin".into();
@@ -19624,7 +19644,7 @@ mod tests {
         admin_did: &DID,
         context_id: &str,
     ) -> super::GovernanceProposal {
-        use crate::context::governance::{
+        use scp_protocol::context::governance::{
             GovernanceAction, GovernanceContext, GovernanceEngine, SingleAdminEngine,
         };
 
@@ -19902,7 +19922,7 @@ mod tests {
     async fn report_degraded_mode_emits_event() {
         let (manager, _handle) = setup_active_context().await;
 
-        let compat = crate::envelope::VersionCompatibility::DegradedMode {
+        let compat = scp_protocol::envelope::VersionCompatibility::DegradedMode {
             local_minor: 0,
             remote_minor: 3,
         };
@@ -19938,7 +19958,7 @@ mod tests {
         manager
             .report_degraded_mode(
                 "test-ctx",
-                crate::envelope::VersionCompatibility::Exact,
+                scp_protocol::envelope::VersionCompatibility::Exact,
                 vec![],
             )
             .await;
@@ -19955,7 +19975,7 @@ mod tests {
     async fn report_degraded_mode_noop_for_unknown_context() {
         let (manager, _handle) = setup_active_context().await;
 
-        let compat = crate::envelope::VersionCompatibility::DegradedMode {
+        let compat = scp_protocol::envelope::VersionCompatibility::DegradedMode {
             local_minor: 0,
             remote_minor: 2,
         };
@@ -19976,7 +19996,7 @@ mod tests {
         let (manager, _handle) = setup_active_context().await;
 
         for minor in 1..=3u8 {
-            let compat = crate::envelope::VersionCompatibility::DegradedMode {
+            let compat = scp_protocol::envelope::VersionCompatibility::DegradedMode {
                 local_minor: 0,
                 remote_minor: minor,
             };

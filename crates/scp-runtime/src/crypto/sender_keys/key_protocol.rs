@@ -9,7 +9,7 @@
 //! See ADR-007 in `.docs/adrs/phase-1.md` for the full protocol design
 //! and §5.14.8 for broadcast-mode blocking specifics.
 
-pub use super::key_protocol_verify::*;
+pub use scp_protocol::crypto::sender_keys::key_protocol_verify::*;
 
 use std::collections::HashSet;
 use std::hash::BuildHasher;
@@ -19,8 +19,8 @@ use rand::rngs::OsRng;
 
 use scp_platform::traits::{KeyCustody, KeyHandle, KeyType};
 
-use super::{SenderKey, SenderKeyError, generate_sender_key};
-use crate::identity::SigningKeyId;
+use scp_protocol::crypto::sender_keys::{SenderKey, SenderKeyError, generate_sender_key};
+use scp_protocol::identity::SigningKeyId;
 
 // ---------------------------------------------------------------------------
 // SenderKeyRequestResult — holds KeyHandle from scp-platform

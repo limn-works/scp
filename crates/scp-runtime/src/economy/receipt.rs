@@ -386,9 +386,9 @@ pub fn payment_history(events: &[Event], filter: Option<&ReceiptFilter>) -> Vec<
 )]
 mod tests {
     use super::*;
-    use crate::economy::types::{Amount, CurrencyCode, PaidActionType};
     use scp_event_log::{EventPayload, EventType};
     use scp_identity::DID;
+    use scp_protocol::economy::types::{Amount, CurrencyCode, PaidActionType};
 
     /// Creates a test `PaymentReceipt` with a configurable `receipt_id`.
     fn make_receipt_with_id(
@@ -653,8 +653,8 @@ mod tests {
 
     #[test]
     fn data_provenance_payment_fields_roundtrip() {
-        use crate::context::MemoryScope;
-        use crate::provenance::{DataProvenance, DiscoveryMethod, SourceType};
+        use scp_protocol::context::MemoryScope;
+        use scp_protocol::provenance::{DataProvenance, DiscoveryMethod, SourceType};
         use std::time::Duration;
 
         let provenance = DataProvenance {
@@ -686,8 +686,8 @@ mod tests {
 
     #[test]
     fn data_provenance_payment_fields_default_none() {
-        use crate::context::MemoryScope;
-        use crate::provenance::{DataProvenance, DiscoveryMethod, SourceType};
+        use scp_protocol::context::MemoryScope;
+        use scp_protocol::provenance::{DataProvenance, DiscoveryMethod, SourceType};
         use std::time::Duration;
 
         let provenance = DataProvenance {

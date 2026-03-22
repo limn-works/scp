@@ -14,8 +14,12 @@
 //!
 //! See spec §9.17.2 (steps 3-6), §9.16.7, §9.16.8, and ADR-038 §2.
 
-use super::{AccessKey, AccessKeyError, AccessKeyStore, ContentAccessState, generate_access_key};
-use crate::crypto::sender_keys::{BlockNotification, SenderKeyStore, verify_block_notification};
+use scp_protocol::crypto::access_keys::{
+    AccessKey, AccessKeyError, AccessKeyStore, ContentAccessState, generate_access_key,
+};
+use scp_protocol::crypto::sender_keys::{
+    BlockNotification, SenderKeyStore, verify_block_notification,
+};
 
 // ---------------------------------------------------------------------------
 // Revocation
@@ -535,12 +539,13 @@ mod tests {
 
     mod block_handler_tests {
         use super::*;
-        use crate::crypto::sender_keys::{
-            BlockNotification, SenderKeyStore, generate_sender_key, send_block_notification,
-        };
-        use crate::identity::SigningKeyId;
+        use crate::crypto::sender_keys::key_protocol::send_block_notification;
         use scp_platform::testing::InMemoryKeyCustody;
         use scp_platform::traits::{KeyCustody, KeyType};
+        use scp_protocol::crypto::sender_keys::{
+            BlockNotification, SenderKeyStore, generate_sender_key,
+        };
+        use scp_protocol::identity::SigningKeyId;
 
         /// Creates a custody + signing key for test use.
         async fn make_custody_and_key() -> (InMemoryKeyCustody, scp_platform::traits::KeyHandle) {

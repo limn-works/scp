@@ -22,10 +22,10 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
-use crate::context::params::{Capability, ContextParams, TemplateId};
 use scp_identity::DID;
 use scp_platform::PlatformError;
 use scp_platform::traits::Storage;
+use scp_protocol::context::params::{Capability, ContextParams, TemplateId};
 
 // ---------------------------------------------------------------------------
 // Storage key convention
@@ -38,7 +38,6 @@ fn storage_key(identity: &DID) -> String {
     format!("policy/{}/auto_accept", identity.0)
 }
 
-// Re-export pure types from scp-protocol::context::policy.
 pub use scp_protocol::context::policy::{
     AutoAcceptPolicy, RateLimit, TrustRequirement, auto_accept_allowed, has_tool_capabilities,
     requires_payment,
@@ -135,9 +134,9 @@ pub async fn delete_auto_accept_policy(
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
     use super::*;
-    use crate::context::params::ContextParams;
-    use crate::economy::{Amount, CostSchedule, CurrencyCode, EconomicPolicy};
     use scp_platform::testing::InMemoryStorage;
+    use scp_protocol::context::params::ContextParams;
+    use scp_protocol::economy::{Amount, CostSchedule, CurrencyCode, EconomicPolicy};
 
     // --- CRUD roundtrip ---
 
@@ -346,7 +345,7 @@ mod tests {
         // A context with no CostSchedule costs but a PricingFormula that may
         // produce non-zero costs must be detected as requiring payment.
         // Spec invariant §19.14#9.
-        use crate::economy::PricingFormula;
+        use scp_protocol::economy::PricingFormula;
         let params = ContextParams {
             ceiling: vec![Capability::MessagesRead, Capability::MessagesWrite],
             economic_policy: Some(EconomicPolicy {
