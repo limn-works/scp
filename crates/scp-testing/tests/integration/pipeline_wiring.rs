@@ -21,8 +21,8 @@
 // Source files embedded at compile time
 // ---------------------------------------------------------------------------
 
-const MANAGER_SRC: &str = include_str!("../../../../crates/scp-core/src/context/manager.rs");
-const PROVIDER_SRC: &str = include_str!("../../../../crates/scp-core/src/crypto/mls/provider.rs");
+const MANAGER_SRC: &str = include_str!("../../../../crates/scp-runtime/src/context/manager.rs");
+const PROVIDER_SRC: &str = include_str!("../../../../crates/scp-runtime/src/crypto/mls/provider.rs");
 
 // =========================================================================
 // RATCHET CONSTANTS — may only increase

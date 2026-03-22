@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
-# check-cross-layer.sh — CI gate ensuring new public functions in scp-core
-# (or scp-runtime after rename) have corresponding FFI bridge changes.
+# check-cross-layer.sh — CI gate ensuring new public functions in scp-protocol
+# or scp-runtime have corresponding FFI bridge changes.
 #
-# When a PR adds `pub fn` or `pub async fn` to crates/scp-core/src/ (or
-# crates/scp-runtime/src/), the same PR must also touch at least one file
+# When a PR adds `pub fn` or `pub async fn` to crates/scp-protocol/src/ or
+# crates/scp-runtime/src/, the same PR must also touch at least one file
 # in crates/scp-ffi/. This prevents protocol logic from being built without
 # bridge exports — the root cause of unwired code.
 #
@@ -44,7 +44,7 @@ fi
 # ---------------------------------------------------------------------------
 # Collect new public function lines from the diff
 # ---------------------------------------------------------------------------
-# We look at added lines (starting with +) in files under scp-core/src/ or
+# We look at added lines (starting with +) in files under scp-protocol/src/ or
 # scp-runtime/src/, excluding tests/, examples/, and pub(crate).
 
 NEW_PUB_FNS=()
@@ -53,12 +53,12 @@ NEW_PUB_FNS=()
 # --diff-filter=ACMR: only Added, Copied, Modified, Renamed files.
 # Use :(glob) prefix for recursive glob matching in git pathspecs.
 DIFF_OUTPUT=$(git diff "$DIFF_RANGE" --unified=0 --diff-filter=ACMR -- \
-    ':(glob)crates/scp-core/src/**/*.rs' \
+    ':(glob)crates/scp-protocol/src/**/*.rs' \
     ':(glob)crates/scp-runtime/src/**/*.rs' \
     2>/dev/null || true)
 
 if [[ -z "$DIFF_OUTPUT" ]]; then
-    echo "No changes to scp-core/src/ or scp-runtime/src/ detected."
+    echo "No changes to scp-protocol/src/ or scp-runtime/src/ detected."
     echo "PASSED: Cross-layer check not applicable."
     exit 0
 fi
@@ -139,7 +139,7 @@ done <<< "$DIFF_OUTPUT"
 # No new public functions — nothing to check
 # ---------------------------------------------------------------------------
 if [[ ${#NEW_PUB_FNS[@]} -eq 0 ]]; then
-    echo "No new public functions added to scp-core/scp-runtime."
+    echo "No new public functions added to scp-protocol/scp-runtime."
     echo "PASSED: Cross-layer check not applicable."
     exit 0
 fi
@@ -151,7 +151,7 @@ FFI_CHANGED=$(git diff "$DIFF_RANGE" --name-only --diff-filter=ACMR -- \
     'crates/scp-ffi/' 2>/dev/null || true)
 
 if [[ -n "$FFI_CHANGED" ]]; then
-    echo "Found ${#NEW_PUB_FNS[@]} new public function(s) in scp-core/scp-runtime."
+    echo "Found ${#NEW_PUB_FNS[@]} new public function(s) in scp-protocol/scp-runtime."
     echo "FFI bridge files also changed — cross-layer requirement satisfied."
     echo ""
     echo "New public functions:"
@@ -170,7 +170,7 @@ fi
 # New pub fns exist but no FFI changes — check for exemption
 # ---------------------------------------------------------------------------
 echo "" >&2
-echo "New public functions added to scp-core/scp-runtime WITHOUT FFI bridge changes:" >&2
+echo "New public functions added to scp-protocol/scp-runtime WITHOUT FFI bridge changes:" >&2
 echo "" >&2
 for fn in "${NEW_PUB_FNS[@]}"; do
     echo "  + $fn" >&2
@@ -193,7 +193,7 @@ if [[ "$PR_TEXT" == *"[cross-layer-exempt]"* ]]; then
     exit 0
 fi
 
-echo "New public functions added to scp-core without FFI bridge changes." >&2
+echo "New public functions added to scp-protocol/scp-runtime without FFI bridge changes." >&2
 echo "Either add bridge exports or mark the PR with [cross-layer-exempt] and a justification." >&2
 echo "" >&2
 echo "FAILED: Cross-layer check failed."
