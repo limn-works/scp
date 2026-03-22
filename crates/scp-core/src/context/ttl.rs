@@ -1370,7 +1370,14 @@ mod tests {
             Capability::ContextClose,
             Capability::RoleAssign,
         ]);
-        ContextRoleState::new(context_id, creator_did, ceiling, vec![]).unwrap()
+        ContextRoleState::new(
+            context_id,
+            creator_did,
+            ceiling,
+            vec![],
+            &scp_primitives::SystemClock,
+        )
+        .unwrap()
     }
 
     fn role_state_without_close_capability(
@@ -1378,7 +1385,14 @@ mod tests {
         creator_did: &str,
     ) -> ContextRoleState {
         let ceiling = CapabilityCeiling::new([Capability::MessagesRead, Capability::MessagesWrite]);
-        ContextRoleState::new(context_id, creator_did, ceiling, vec![]).unwrap()
+        ContextRoleState::new(
+            context_id,
+            creator_did,
+            ceiling,
+            vec![],
+            &scp_primitives::SystemClock,
+        )
+        .unwrap()
     }
 
     fn active_handle(context_id: &str, memory_scope: MemoryScope) -> ContextHandle {

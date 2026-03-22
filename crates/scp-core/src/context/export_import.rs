@@ -269,8 +269,14 @@ fn strip_snapshot_for_public(snapshot: &ContextSnapshot) -> ContextSnapshot {
     // Build a minimal role state with only the default ceiling.
     // Use the snapshot's context_id and an empty creator DID.
     let ceiling = default_ceiling();
-    let role_state = ContextRoleState::new(&snapshot.context_id, "", ceiling, Vec::new())
-        .unwrap_or_else(|_| snapshot.role_state.clone());
+    let role_state = ContextRoleState::new(
+        &snapshot.context_id,
+        "",
+        ceiling,
+        Vec::new(),
+        &scp_primitives::SystemClock,
+    )
+    .unwrap_or_else(|_| snapshot.role_state.clone());
 
     ContextSnapshot {
         context_id: snapshot.context_id.clone(),
@@ -376,8 +382,14 @@ mod tests {
     /// Helper to build a test snapshot.
     fn test_snapshot(context_id: &str) -> ContextSnapshot {
         let ceiling = default_ceiling();
-        let role_state =
-            ContextRoleState::new(context_id, "did:key:test-creator", ceiling, vec![]).unwrap();
+        let role_state = ContextRoleState::new(
+            context_id,
+            "did:key:test-creator",
+            ceiling,
+            vec![],
+            &scp_primitives::SystemClock,
+        )
+        .unwrap();
 
         ContextSnapshot {
             context_id: context_id.to_owned(),

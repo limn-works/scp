@@ -2436,8 +2436,9 @@ impl ContextManager {
         .await?;
 
         let ceiling = CapabilityCeiling::new(params.ceiling.iter().cloned());
-        let role_state = ContextRoleState::new(&context_id, &*creator_did, ceiling, vec![])
-            .map_err(|e| ContextCreationError::CreationFailed(e.to_string()))?;
+        let role_state =
+            ContextRoleState::new(&context_id, &*creator_did, ceiling, vec![], &*self.clock)
+                .map_err(|e| ContextCreationError::CreationFailed(e.to_string()))?;
         let mut membership = MembershipState::new();
         let creator_tokens = role_state
             .assignments
@@ -2599,8 +2600,9 @@ impl ContextManager {
         let ceiling = CapabilityCeiling::new(params.ceiling.iter().cloned());
 
         // Initialize role state with the creator as admin.
-        let role_state = ContextRoleState::new(&context_id, &*creator_did, ceiling, vec![])
-            .map_err(|e| ContextCreationError::CreationFailed(e.to_string()))?;
+        let role_state =
+            ContextRoleState::new(&context_id, &*creator_did, ceiling, vec![], &*self.clock)
+                .map_err(|e| ContextCreationError::CreationFailed(e.to_string()))?;
 
         // Initialize membership with the creator.
         let mut membership = MembershipState::new();
@@ -2857,9 +2859,14 @@ impl ContextManager {
 
             // Assign default "member" role.
             let creator_did = ctx.role_state.creator_did.clone();
-            let tokens =
-                roles::assign_role(&mut ctx.role_state, &member_did, "member", &creator_did)
-                    .map_err(|e| ContextError::MembershipFailed(e.to_string()))?;
+            let tokens = roles::assign_role(
+                &mut ctx.role_state,
+                &member_did,
+                "member",
+                &creator_did,
+                &*self.clock,
+            )
+            .map_err(|e| ContextError::MembershipFailed(e.to_string()))?;
 
             // Add to membership tracking.
             ctx.membership
@@ -5378,8 +5385,9 @@ impl ContextManager {
             // Add to role state.
             ctx.role_state.members.insert(did.to_string());
             let creator_did = ctx.role_state.creator_did.clone();
-            let tokens = roles::assign_role(&mut ctx.role_state, did, role, &creator_did)
-                .map_err(|e| ContextError::MembershipFailed(e.to_string()))?;
+            let tokens =
+                roles::assign_role(&mut ctx.role_state, did, role, &creator_did, &*self.clock)
+                    .map_err(|e| ContextError::MembershipFailed(e.to_string()))?;
 
             // Add to membership tracking.
             ctx.membership
@@ -5486,8 +5494,14 @@ impl ContextManager {
             // Re-assign via the role engine (validates role exists, updates
             // assignments and member_capabilities).
             let creator_did = ctx.role_state.creator_did.clone();
-            let tokens = roles::assign_role(&mut ctx.role_state, did, new_role, &creator_did)
-                .map_err(|e| ContextError::MembershipFailed(e.to_string()))?;
+            let tokens = roles::assign_role(
+                &mut ctx.role_state,
+                did,
+                new_role,
+                &creator_did,
+                &*self.clock,
+            )
+            .map_err(|e| ContextError::MembershipFailed(e.to_string()))?;
 
             // Update membership tracking with new role.
             if let Some(info) = ctx.membership.get_mut(did) {
@@ -5904,15 +5918,27 @@ impl ContextManager {
                 .map(|(did, _)| did.clone())
                 .collect();
             for admin_did in &current_admins {
-                roles::assign_role(&mut ctx.role_state, admin_did, "member", &creator_did)
-                    .map_err(|e| ContextError::MembershipFailed(e.to_string()))?;
+                roles::assign_role(
+                    &mut ctx.role_state,
+                    admin_did,
+                    "member",
+                    &creator_did,
+                    &*self.clock,
+                )
+                .map_err(|e| ContextError::MembershipFailed(e.to_string()))?;
                 if let Some(info) = ctx.membership.get_mut(admin_did) {
                     "member".clone_into(&mut info.role_name);
                 }
             }
             // Promote new admin.
-            let tokens = roles::assign_role(&mut ctx.role_state, new_admin, "admin", &creator_did)
-                .map_err(|e| ContextError::MembershipFailed(e.to_string()))?;
+            let tokens = roles::assign_role(
+                &mut ctx.role_state,
+                new_admin,
+                "admin",
+                &creator_did,
+                &*self.clock,
+            )
+            .map_err(|e| ContextError::MembershipFailed(e.to_string()))?;
             if let Some(info) = ctx.membership.get_mut(new_admin) {
                 "admin".clone_into(&mut info.role_name);
                 info.tokens = tokens;
@@ -9364,6 +9390,7 @@ mod tests {
                 "did:key:observer",
                 "observer",
                 "did:key:creator",
+                &scp_primitives::SystemClock,
             )
             .unwrap();
             // Update the membership tracking to reflect the new role.
@@ -12940,6 +12967,7 @@ mod tests {
 
     /// SCP-PERSIST-024: persist-drop-restore roundtrip verifies all fields.
     #[tokio::test]
+    #[allow(clippy::too_many_lines)]
     async fn persist_drop_restore_roundtrip() {
         use crate::context::roles::{ContextRoleState, default_ceiling};
 
@@ -12976,8 +13004,14 @@ mod tests {
 
         // Seed the mock persistence with a full snapshot.
         let ceiling = default_ceiling();
-        let role_state =
-            ContextRoleState::new("persist-ctx", "did:key:creator", ceiling, vec![]).unwrap();
+        let role_state = ContextRoleState::new(
+            "persist-ctx",
+            "did:key:creator",
+            ceiling,
+            vec![],
+            &scp_primitives::SystemClock,
+        )
+        .unwrap();
         let mut membership = MembershipState::new();
         membership.add_member("did:key:creator".into(), "admin".into(), vec![]);
         let mut executed = HashSet::new();
@@ -13078,8 +13112,14 @@ mod tests {
         };
 
         let ceiling = default_ceiling();
-        let role_state =
-            ContextRoleState::new("replay-ctx", "did:key:alice", ceiling, vec![]).unwrap();
+        let role_state = ContextRoleState::new(
+            "replay-ctx",
+            "did:key:alice",
+            ceiling,
+            vec![],
+            &scp_primitives::SystemClock,
+        )
+        .unwrap();
         let mut membership = MembershipState::new();
         membership.add_member("did:key:alice".into(), "admin".into(), vec![]);
 
@@ -13176,8 +13216,14 @@ mod tests {
         };
 
         let ceiling = default_ceiling();
-        let role_state =
-            ContextRoleState::new("ttl-ctx", "did:key:creator", ceiling, vec![]).unwrap();
+        let role_state = ContextRoleState::new(
+            "ttl-ctx",
+            "did:key:creator",
+            ceiling,
+            vec![],
+            &scp_primitives::SystemClock,
+        )
+        .unwrap();
         let mut membership = MembershipState::new();
         membership.add_member("did:key:creator".into(), "admin".into(), vec![]);
 
@@ -13248,8 +13294,14 @@ mod tests {
         for ctx_name in ["ctx-a", "ctx-b"] {
             let params = ContextParams::default();
             let ceiling = default_ceiling();
-            let role_state =
-                ContextRoleState::new(ctx_name, "did:key:creator", ceiling, vec![]).unwrap();
+            let role_state = ContextRoleState::new(
+                ctx_name,
+                "did:key:creator",
+                ceiling,
+                vec![],
+                &scp_primitives::SystemClock,
+            )
+            .unwrap();
             let mut membership = MembershipState::new();
             membership.add_member("did:key:creator".into(), "admin".into(), vec![]);
 
@@ -13320,8 +13372,14 @@ mod tests {
         };
 
         let ceiling = default_ceiling();
-        let role_state =
-            ContextRoleState::new("dup-ctx", "did:key:author1", ceiling, vec![]).unwrap();
+        let role_state = ContextRoleState::new(
+            "dup-ctx",
+            "did:key:author1",
+            ceiling,
+            vec![],
+            &scp_primitives::SystemClock,
+        )
+        .unwrap();
         let membership = MembershipState::new();
 
         let snapshot = super::ContextSnapshot {
@@ -13408,8 +13466,14 @@ mod tests {
         };
 
         let ceiling = default_ceiling();
-        let role_state =
-            ContextRoleState::new("grace-incon-ctx", "did:key:author1", ceiling, vec![]).unwrap();
+        let role_state = ContextRoleState::new(
+            "grace-incon-ctx",
+            "did:key:author1",
+            ceiling,
+            vec![],
+            &scp_primitives::SystemClock,
+        )
+        .unwrap();
         let membership = MembershipState::new();
 
         // Grace entry referencing epoch 5, but MLS epoch is only 3.
@@ -13503,8 +13567,14 @@ mod tests {
         };
 
         let ceiling = default_ceiling();
-        let role_state =
-            ContextRoleState::new("grace-ok-ctx", "did:key:author1", ceiling, vec![]).unwrap();
+        let role_state = ContextRoleState::new(
+            "grace-ok-ctx",
+            "did:key:author1",
+            ceiling,
+            vec![],
+            &scp_primitives::SystemClock,
+        )
+        .unwrap();
         let membership = MembershipState::new();
 
         // Grace entry epoch 2, MLS epoch 3 → consistent (epoch <= mls_epoch).
@@ -13595,7 +13665,14 @@ mod tests {
     ) -> super::ContextSnapshot {
         use crate::context::roles::{ContextRoleState, default_ceiling};
         let ceiling = default_ceiling();
-        let role_state = ContextRoleState::new(ctx_id, "did:key:a1", ceiling, vec![]).unwrap();
+        let role_state = ContextRoleState::new(
+            ctx_id,
+            "did:key:a1",
+            ceiling,
+            vec![],
+            &scp_primitives::SystemClock,
+        )
+        .unwrap();
         let grace = bad_grace_epoch
             .map(|e| {
                 vec![crate::crypto::mls::epoch_grace::GraceEntry {
@@ -14819,9 +14896,14 @@ mod tests {
             ..ContextParams::default()
         };
 
-        let role_state =
-            ContextRoleState::new("ctx-snap", "did:dht:z6MkAlice", default_ceiling(), vec![])
-                .unwrap();
+        let role_state = ContextRoleState::new(
+            "ctx-snap",
+            "did:dht:z6MkAlice",
+            default_ceiling(),
+            vec![],
+            &scp_primitives::SystemClock,
+        )
+        .unwrap();
 
         let snapshot = super::ContextSnapshot {
             context_id: "ctx-snap".to_owned(),

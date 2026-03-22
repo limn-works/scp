@@ -1213,15 +1213,36 @@ async fn application_layer_demo() {
         Capability::new("governance:vote"),
         Capability::new("context:close"),
     ]);
-    let mut role_state = ContextRoleState::new(ctx_id, alice.as_ref(), ceiling, vec![]).unwrap();
+    let mut role_state = ContextRoleState::new(
+        ctx_id,
+        alice.as_ref(),
+        ceiling,
+        vec![],
+        &scp_primitives::SystemClock,
+    )
+    .unwrap();
 
     // Add Bob and Charlie as members with "member" role (ToolInvokeAll capability).
     {
         use scp_core::context::roles::assign_role;
         role_state.members.insert(bob.as_ref().to_owned());
         role_state.members.insert(charlie.as_ref().to_owned());
-        assign_role(&mut role_state, bob.as_ref(), "member", alice.as_ref()).unwrap();
-        assign_role(&mut role_state, charlie.as_ref(), "member", alice.as_ref()).unwrap();
+        assign_role(
+            &mut role_state,
+            bob.as_ref(),
+            "member",
+            alice.as_ref(),
+            &scp_primitives::SystemClock,
+        )
+        .unwrap();
+        assign_role(
+            &mut role_state,
+            charlie.as_ref(),
+            "member",
+            alice.as_ref(),
+            &scp_primitives::SystemClock,
+        )
+        .unwrap();
     }
 
     let mut tool_registry = ToolRegistry::new();

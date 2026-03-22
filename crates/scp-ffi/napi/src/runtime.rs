@@ -747,6 +747,7 @@ pub fn ensure_registered(handle: &NapiContextHandle) -> Result<(), ScpNapiError>
         creator_did.clone(),
         default_ceiling(),
         Vec::new(),
+        &SystemClock,
     ) {
         Ok(rs) => rs,
         Err(e) => {
@@ -924,8 +925,14 @@ pub fn register_test_context(context_id: &str, creator_did: &str) {
         .collect::<HashSet<String>>();
 
     // Default ceiling + no custom roles: infallible in practice.
-    let role_state = ContextRoleState::new(context_id, creator_did, default_ceiling(), Vec::new())
-        .expect("ContextRoleState::new with default ceiling and no custom roles cannot fail");
+    let role_state = ContextRoleState::new(
+        context_id,
+        creator_did,
+        default_ceiling(),
+        Vec::new(),
+        &SystemClock,
+    )
+    .expect("ContextRoleState::new with default ceiling and no custom roles cannot fail");
 
     let state = UcanContextState {
         event_log: EventLog::new(context_id.to_owned()),

@@ -163,6 +163,7 @@ mod tests {
             "did:dht:z6MkTestCreator",
             default_ceiling(),
             Vec::new(),
+            &scp_primitives::SystemClock,
         )
         .unwrap();
 

@@ -37,6 +37,8 @@ use std::collections::{HashMap, HashSet};
 
 use serde::{Deserialize, Serialize};
 
+use scp_primitives::Clock;
+
 use super::ContextError;
 use crate::crypto::ucan::nonce::generate_nonce;
 
@@ -812,6 +814,7 @@ impl ContextRoleState {
         creator_did: impl Into<String>,
         ceiling: CapabilityCeiling,
         custom_roles: Vec<RoleDefinition>,
+        clock: &dyn Clock,
     ) -> Result<Self, RoleError> {
         let context_id = context_id.into();
         let creator_did = creator_did.into();
@@ -850,7 +853,7 @@ impl ContextRoleState {
             .cloned()
             .unwrap_or_else(|| builtin_admin(&ceiling));
 
-        let tokens = mint_role_tokens(&context_id, &creator_did, &creator_did, &admin_role);
+        let tokens = mint_role_tokens(&context_id, &creator_did, &creator_did, &admin_role, clock);
 
         let mut assignments = HashMap::new();
         let assignment = RoleAssignment {
@@ -958,6 +961,7 @@ pub fn assign_role(
     member_did: &str,
     role_name: &str,
     assigner_did: &str,
+    clock: &dyn Clock,
 ) -> Result<Vec<UcanToken>, RoleError> {
     // 1. Verify assigner has RoleAssign capability.
     if !state.member_has_capability(assigner_did, &Capability::RoleAssign) {
@@ -977,7 +981,13 @@ pub fn assign_role(
         .clone();
 
     // 4. Mint UCAN tokens for each capability in the role.
-    let tokens = mint_role_tokens(&state.context_id, &state.creator_did, member_did, &role_def);
+    let tokens = mint_role_tokens(
+        &state.context_id,
+        &state.creator_did,
+        member_did,
+        &role_def,
+        clock,
+    );
 
     // 5. Update state: replace any previous assignment.
     let assignment = RoleAssignment {
@@ -1121,6 +1131,7 @@ fn mint_role_tokens(
     creator_did: &str,
     member_did: &str,
     role: &RoleDefinition,
+    clock: &dyn Clock,
 ) -> Vec<UcanToken> {
     role.capabilities
         .iter()
@@ -1134,7 +1145,7 @@ fn mint_role_tokens(
                 iss: creator_did.to_owned(),
                 aud: member_did.to_owned(),
                 att: vec![att],
-                nnc: generate_nonce(&scp_primitives::SystemClock),
+                nnc: generate_nonce(clock),
             }
         })
         .collect()
@@ -1632,7 +1643,14 @@ mod tests {
     #[test]
     fn context_role_state_new_creates_with_builtins() {
         let ceiling = test_ceiling();
-        let state = ContextRoleState::new("ctx-1", "did:dht:creator", ceiling, vec![]).unwrap();
+        let state = ContextRoleState::new(
+            "ctx-1",
+            "did:dht:creator",
+            ceiling,
+            vec![],
+            &scp_primitives::SystemClock,
+        )
+        .unwrap();
 
         // Creator is a member.
         assert!(state.members.contains("did:dht:creator"));
@@ -1663,8 +1681,14 @@ mod tests {
         )
         .unwrap();
 
-        let state =
-            ContextRoleState::new("ctx-1", "did:dht:creator", ceiling, vec![custom]).unwrap();
+        let state = ContextRoleState::new(
+            "ctx-1",
+            "did:dht:creator",
+            ceiling,
+            vec![custom],
+            &scp_primitives::SystemClock,
+        )
+        .unwrap();
         assert!(state.role_definitions.contains_key("content-mod"));
         let mod_role = state.role_definitions.get("content-mod").unwrap();
         assert_eq!(mod_role.capabilities.len(), 3);
@@ -1678,15 +1702,27 @@ mod tests {
             HashSet::from([Capability::MessagesRead, Capability::RoleAssign]),
         );
 
-        let result = ContextRoleState::new("ctx-1", "did:dht:creator", ceiling, vec![bad_custom]);
+        let result = ContextRoleState::new(
+            "ctx-1",
+            "did:dht:creator",
+            ceiling,
+            vec![bad_custom],
+            &scp_primitives::SystemClock,
+        );
         assert!(result.is_err());
     }
 
     #[test]
     fn context_role_state_creator_has_all_ceiling_capabilities() {
         let ceiling = test_ceiling();
-        let state =
-            ContextRoleState::new("ctx-1", "did:dht:creator", ceiling.clone(), vec![]).unwrap();
+        let state = ContextRoleState::new(
+            "ctx-1",
+            "did:dht:creator",
+            ceiling.clone(),
+            vec![],
+            &scp_primitives::SystemClock,
+        )
+        .unwrap();
 
         for cap in &ceiling.capabilities {
             assert!(
@@ -1699,7 +1735,14 @@ mod tests {
     #[test]
     fn context_role_state_non_member_has_no_capabilities() {
         let ceiling = test_ceiling();
-        let state = ContextRoleState::new("ctx-1", "did:dht:creator", ceiling, vec![]).unwrap();
+        let state = ContextRoleState::new(
+            "ctx-1",
+            "did:dht:creator",
+            ceiling,
+            vec![],
+            &scp_primitives::SystemClock,
+        )
+        .unwrap();
 
         assert!(!state.member_has_capability("did:dht:nobody", &Capability::MessagesRead));
     }
@@ -1711,12 +1754,25 @@ mod tests {
     #[test]
     fn assign_role_succeeds_for_authorized_assigner() {
         let ceiling = test_ceiling();
-        let mut state = ContextRoleState::new("ctx-1", "did:dht:creator", ceiling, vec![]).unwrap();
+        let mut state = ContextRoleState::new(
+            "ctx-1",
+            "did:dht:creator",
+            ceiling,
+            vec![],
+            &scp_primitives::SystemClock,
+        )
+        .unwrap();
 
         // Add a member to the context.
         state.members.insert("did:dht:alice".to_owned());
 
-        let result = assign_role(&mut state, "did:dht:alice", "member", "did:dht:creator");
+        let result = assign_role(
+            &mut state,
+            "did:dht:alice",
+            "member",
+            "did:dht:creator",
+            &scp_primitives::SystemClock,
+        );
         assert!(result.is_ok());
 
         let tokens = result.unwrap();
@@ -1732,17 +1788,37 @@ mod tests {
     #[test]
     fn assign_role_fails_for_unauthorized_assigner() {
         let ceiling = test_ceiling();
-        let mut state = ContextRoleState::new("ctx-1", "did:dht:creator", ceiling, vec![]).unwrap();
+        let mut state = ContextRoleState::new(
+            "ctx-1",
+            "did:dht:creator",
+            ceiling,
+            vec![],
+            &scp_primitives::SystemClock,
+        )
+        .unwrap();
 
         // Add members.
         state.members.insert("did:dht:alice".to_owned());
         state.members.insert("did:dht:bob".to_owned());
 
         // Assign alice as member (no RoleAssign capability).
-        assign_role(&mut state, "did:dht:alice", "member", "did:dht:creator").unwrap();
+        assign_role(
+            &mut state,
+            "did:dht:alice",
+            "member",
+            "did:dht:creator",
+            &scp_primitives::SystemClock,
+        )
+        .unwrap();
 
         // Alice tries to assign bob -- should fail.
-        let result = assign_role(&mut state, "did:dht:bob", "member", "did:dht:alice");
+        let result = assign_role(
+            &mut state,
+            "did:dht:bob",
+            "member",
+            "did:dht:alice",
+            &scp_primitives::SystemClock,
+        );
         assert!(result.is_err());
         assert!(matches!(
             result.unwrap_err(),
@@ -1753,9 +1829,22 @@ mod tests {
     #[test]
     fn assign_role_fails_for_nonexistent_member() {
         let ceiling = test_ceiling();
-        let mut state = ContextRoleState::new("ctx-1", "did:dht:creator", ceiling, vec![]).unwrap();
+        let mut state = ContextRoleState::new(
+            "ctx-1",
+            "did:dht:creator",
+            ceiling,
+            vec![],
+            &scp_primitives::SystemClock,
+        )
+        .unwrap();
 
-        let result = assign_role(&mut state, "did:dht:nobody", "member", "did:dht:creator");
+        let result = assign_role(
+            &mut state,
+            "did:dht:nobody",
+            "member",
+            "did:dht:creator",
+            &scp_primitives::SystemClock,
+        );
         assert!(result.is_err());
         assert!(matches!(
             result.unwrap_err(),
@@ -1766,7 +1855,14 @@ mod tests {
     #[test]
     fn assign_role_fails_for_nonexistent_role() {
         let ceiling = test_ceiling();
-        let mut state = ContextRoleState::new("ctx-1", "did:dht:creator", ceiling, vec![]).unwrap();
+        let mut state = ContextRoleState::new(
+            "ctx-1",
+            "did:dht:creator",
+            ceiling,
+            vec![],
+            &scp_primitives::SystemClock,
+        )
+        .unwrap();
 
         state.members.insert("did:dht:alice".to_owned());
 
@@ -1775,6 +1871,7 @@ mod tests {
             "did:dht:alice",
             "nonexistent",
             "did:dht:creator",
+            &scp_primitives::SystemClock,
         );
         assert!(result.is_err());
         assert!(matches!(
@@ -1786,16 +1883,37 @@ mod tests {
     #[test]
     fn assign_role_replaces_previous_assignment() {
         let ceiling = test_ceiling();
-        let mut state = ContextRoleState::new("ctx-1", "did:dht:creator", ceiling, vec![]).unwrap();
+        let mut state = ContextRoleState::new(
+            "ctx-1",
+            "did:dht:creator",
+            ceiling,
+            vec![],
+            &scp_primitives::SystemClock,
+        )
+        .unwrap();
 
         state.members.insert("did:dht:alice".to_owned());
 
         // Assign as member first.
-        assign_role(&mut state, "did:dht:alice", "member", "did:dht:creator").unwrap();
+        assign_role(
+            &mut state,
+            "did:dht:alice",
+            "member",
+            "did:dht:creator",
+            &scp_primitives::SystemClock,
+        )
+        .unwrap();
         assert!(state.member_has_capability("did:dht:alice", &Capability::MessagesWrite));
 
         // Reassign as observer.
-        assign_role(&mut state, "did:dht:alice", "observer", "did:dht:creator").unwrap();
+        assign_role(
+            &mut state,
+            "did:dht:alice",
+            "observer",
+            "did:dht:creator",
+            &scp_primitives::SystemClock,
+        )
+        .unwrap();
         assert!(state.member_has_capability("did:dht:alice", &Capability::MessagesRead));
         assert!(!state.member_has_capability("did:dht:alice", &Capability::MessagesWrite));
 
@@ -1806,12 +1924,25 @@ mod tests {
     #[test]
     fn assign_role_mints_correct_token_format() {
         let ceiling = test_ceiling();
-        let mut state = ContextRoleState::new("ctx-1", "did:dht:creator", ceiling, vec![]).unwrap();
+        let mut state = ContextRoleState::new(
+            "ctx-1",
+            "did:dht:creator",
+            ceiling,
+            vec![],
+            &scp_primitives::SystemClock,
+        )
+        .unwrap();
 
         state.members.insert("did:dht:alice".to_owned());
 
-        let tokens =
-            assign_role(&mut state, "did:dht:alice", "observer", "did:dht:creator").unwrap();
+        let tokens = assign_role(
+            &mut state,
+            "did:dht:alice",
+            "observer",
+            "did:dht:creator",
+            &scp_primitives::SystemClock,
+        )
+        .unwrap();
 
         assert_eq!(tokens.len(), 1);
         let token = &tokens[0];
@@ -1828,12 +1959,25 @@ mod tests {
     #[test]
     fn assign_role_admin_grants_all_ceiling_capabilities() {
         let ceiling = test_ceiling();
-        let mut state =
-            ContextRoleState::new("ctx-1", "did:dht:creator", ceiling.clone(), vec![]).unwrap();
+        let mut state = ContextRoleState::new(
+            "ctx-1",
+            "did:dht:creator",
+            ceiling.clone(),
+            vec![],
+            &scp_primitives::SystemClock,
+        )
+        .unwrap();
 
         state.members.insert("did:dht:alice".to_owned());
 
-        let tokens = assign_role(&mut state, "did:dht:alice", "admin", "did:dht:creator").unwrap();
+        let tokens = assign_role(
+            &mut state,
+            "did:dht:alice",
+            "admin",
+            "did:dht:creator",
+            &scp_primitives::SystemClock,
+        )
+        .unwrap();
 
         // Admin gets all ceiling capabilities.
         assert_eq!(tokens.len(), ceiling.len());
@@ -1860,8 +2004,14 @@ mod tests {
         )
         .unwrap();
 
-        let mut state =
-            ContextRoleState::new("ctx-1", "did:dht:creator", ceiling, vec![custom]).unwrap();
+        let mut state = ContextRoleState::new(
+            "ctx-1",
+            "did:dht:creator",
+            ceiling,
+            vec![custom],
+            &scp_primitives::SystemClock,
+        )
+        .unwrap();
 
         state.members.insert("did:dht:alice".to_owned());
 
@@ -1870,6 +2020,7 @@ mod tests {
             "did:dht:alice",
             "content-mod",
             "did:dht:creator",
+            &scp_primitives::SystemClock,
         )
         .unwrap();
         assert_eq!(tokens.len(), 3);
@@ -2043,13 +2194,34 @@ mod tests {
     #[test]
     fn multiple_role_assignments_tracked_independently() {
         let ceiling = test_ceiling();
-        let mut state = ContextRoleState::new("ctx-1", "did:dht:creator", ceiling, vec![]).unwrap();
+        let mut state = ContextRoleState::new(
+            "ctx-1",
+            "did:dht:creator",
+            ceiling,
+            vec![],
+            &scp_primitives::SystemClock,
+        )
+        .unwrap();
 
         state.members.insert("did:dht:alice".to_owned());
         state.members.insert("did:dht:bob".to_owned());
 
-        assign_role(&mut state, "did:dht:alice", "member", "did:dht:creator").unwrap();
-        assign_role(&mut state, "did:dht:bob", "observer", "did:dht:creator").unwrap();
+        assign_role(
+            &mut state,
+            "did:dht:alice",
+            "member",
+            "did:dht:creator",
+            &scp_primitives::SystemClock,
+        )
+        .unwrap();
+        assign_role(
+            &mut state,
+            "did:dht:bob",
+            "observer",
+            "did:dht:creator",
+            &scp_primitives::SystemClock,
+        )
+        .unwrap();
 
         // Alice is member.
         assert!(state.member_has_capability("did:dht:alice", &Capability::MessagesWrite));
@@ -2077,8 +2249,14 @@ mod tests {
         )
         .unwrap();
 
-        let mut state =
-            ContextRoleState::new("ctx-1", "did:dht:creator", ceiling, vec![custom]).unwrap();
+        let mut state = ContextRoleState::new(
+            "ctx-1",
+            "did:dht:creator",
+            ceiling,
+            vec![custom],
+            &scp_primitives::SystemClock,
+        )
+        .unwrap();
 
         // Add a second member with a non-admin role.
         state.members.insert("did:dht:alice".to_owned());
@@ -2087,6 +2265,7 @@ mod tests {
             "did:dht:alice",
             "content-mod",
             "did:dht:creator",
+            &scp_primitives::SystemClock,
         )
         .unwrap();
 
@@ -2188,8 +2367,14 @@ mod tests {
         let ceiling = test_ceiling();
         let custom =
             RoleDefinition::new_unchecked("member", HashSet::from([Capability::MessagesRead]));
-        let err =
-            ContextRoleState::new("ctx-1", "did:dht:creator", ceiling, vec![custom]).unwrap_err();
+        let err = ContextRoleState::new(
+            "ctx-1",
+            "did:dht:creator",
+            ceiling,
+            vec![custom],
+            &scp_primitives::SystemClock,
+        )
+        .unwrap_err();
         assert!(
             matches!(&err, RoleError::InvalidRoleName(msg) if msg.contains("reserved")),
             "expected reserved name error, got: {err}"

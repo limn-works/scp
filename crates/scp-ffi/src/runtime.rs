@@ -554,8 +554,11 @@ pub fn register_ffi_state(
                     .map(|s| scp_core::context::roles::Capability::new(s).ucan_capability_name())
                     .collect::<HashSet<String>>()
             };
-            let role_state = ContextRoleState::new(context_id, creator_did, ceiling, vec![])
-                .map_err(|e| ScpPyError::context(format!("failed to create role state: {e}")))?;
+            let role_state =
+                ContextRoleState::new(context_id, creator_did, ceiling, vec![], &SystemClock)
+                    .map_err(|e| {
+                        ScpPyError::context(format!("failed to create role state: {e}"))
+                    })?;
             let revocation_list = RevocationList::new(context_id.to_owned());
             let nonce_tracker = NonceTracker::new(context_id.to_owned(), SystemClock);
 

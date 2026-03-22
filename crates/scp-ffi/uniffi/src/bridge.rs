@@ -3406,6 +3406,7 @@ pub async fn tool_register(
                 &handle.creator_did,
                 ceiling,
                 vec![],
+                &scp_primitives::SystemClock,
             )
             .map_err(|e| ScpError::Tool {
                 msg: format!("failed to create role state: {e}"),
@@ -4176,6 +4177,7 @@ pub async fn tool_interface_expose(
                 &handle.creator_did,
                 ceiling,
                 vec![],
+                &scp_primitives::SystemClock,
             )
             .map_err(|e| ScpError::Tool {
                 msg: format!("failed to create role state: {e}"),
@@ -4265,6 +4267,7 @@ pub async fn tool_interface_accept(
                 &handle.creator_did,
                 ceiling,
                 vec![],
+                &scp_primitives::SystemClock,
             )
             .map_err(|e| ScpError::Tool {
                 msg: format!("failed to create role state: {e}"),

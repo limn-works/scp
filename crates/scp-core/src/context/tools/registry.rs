@@ -651,7 +651,14 @@ mod tests {
 
     /// Creates a `ContextRoleState` with a creator that has admin (all) capabilities.
     fn test_role_state(creator_did: &str) -> ContextRoleState {
-        ContextRoleState::new("ctx-test", creator_did, test_ceiling(), vec![]).unwrap()
+        ContextRoleState::new(
+            "ctx-test",
+            creator_did,
+            test_ceiling(),
+            vec![],
+            &scp_primitives::SystemClock,
+        )
+        .unwrap()
     }
 
     /// Creates a `ContextRoleState` with an additional member that has limited
