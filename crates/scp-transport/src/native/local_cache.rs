@@ -23,8 +23,8 @@ use super::storage::{BlobStorage, StorageError, StoredBlob};
 /// Clock function type for timestamp injection (testing).
 ///
 /// Returns the current Unix timestamp in seconds. The default uses
-/// [`scp_primitives::time::now_secs`].
-type ClockFn = Arc<dyn Fn() -> Result<u64, StorageError> + Send + Sync>;
+/// [`scp_primitives::SystemClock`].
+type ClockFn = Arc<dyn Fn() -> u64 + Send + Sync>;
 
 /// Metadata tracked for each cached blob, used for eviction ordering.
 #[derive(Debug, Clone)]
@@ -94,10 +94,7 @@ impl<S: BlobStorage> LocalBlobCache<S> {
             inner,
             max_cache_size,
             entries: Arc::new(Mutex::new(Vec::new())),
-            clock: Arc::new(|| {
-                scp_primitives::time::now_secs()
-                    .map_err(|e| StorageError::Internal(format!("clock error: {e}")))
-            }),
+            clock: Arc::new(|| scp_primitives::SystemClock.now_secs()),
         }
     }
 
@@ -259,7 +256,7 @@ mod tests {
     fn controllable_clock(start: u64) -> (ClockFn, Arc<AtomicU64>) {
         let time = Arc::new(AtomicU64::new(start));
         let time_clone = Arc::clone(&time);
-        let clock: ClockFn = Arc::new(move || Ok(time_clone.load(Ordering::Relaxed)));
+        let clock: ClockFn = Arc::new(move || time_clone.load(Ordering::Relaxed));
         (clock, time)
     }
 

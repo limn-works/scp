@@ -23,10 +23,10 @@ fn make_local_cache() -> (LocalBlobCache<InMemoryBlobStorage>, Arc<AtomicU64>) {
     };
     let inner = InMemoryBlobStorage::with_clock(inner_clock);
 
-    // LocalBlobCache clock: returns Result<u64, StorageError>.
-    let cache_clock: Arc<dyn Fn() -> Result<u64, StorageError> + Send + Sync> = {
+    // LocalBlobCache clock: returns u64 directly.
+    let cache_clock: Arc<dyn Fn() -> u64 + Send + Sync> = {
         let c = clock.clone();
-        Arc::new(move || Ok(c.load(Ordering::Relaxed)))
+        Arc::new(move || c.load(Ordering::Relaxed))
     };
     let cache = LocalBlobCache::with_clock(inner, 1000, cache_clock);
 
