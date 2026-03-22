@@ -124,7 +124,14 @@ async fn compromise_tier_agent() {
     assert_eq!(kr.rotated_key_scopes, vec!["#agent"]);
 
     let result = orch
-        .execute_recovery(CompromiseTier::Agent, &kr, &HashSet::new(), None, &backend)
+        .execute_recovery(
+            CompromiseTier::Agent,
+            &kr,
+            &HashSet::new(),
+            None,
+            &backend,
+            &scp_primitives::SystemClock,
+        )
         .await
         .unwrap();
 
@@ -165,6 +172,7 @@ async fn compromise_tier_active_signing() {
             &contacts,
             Some(&psk_params),
             &backend,
+            &scp_primitives::SystemClock,
         )
         .await
         .unwrap();
@@ -206,6 +214,7 @@ async fn compromise_tier_identity_key() {
             &contacts,
             Some(&psk_params),
             &backend,
+            &scp_primitives::SystemClock,
         )
         .await
         .unwrap();
@@ -425,7 +434,14 @@ async fn recovery_result_completed_vs_failed() {
     };
 
     let result = orch
-        .execute_recovery(CompromiseTier::Agent, &kr, &HashSet::new(), None, &backend)
+        .execute_recovery(
+            CompromiseTier::Agent,
+            &kr,
+            &HashSet::new(),
+            None,
+            &backend,
+            &scp_primitives::SystemClock,
+        )
         .await
         .unwrap();
 
@@ -466,7 +482,14 @@ async fn recovery_result_with_rejoin_context() {
     };
 
     let result = orch
-        .execute_recovery(CompromiseTier::Agent, &kr, &HashSet::new(), None, &backend)
+        .execute_recovery(
+            CompromiseTier::Agent,
+            &kr,
+            &HashSet::new(),
+            None,
+            &backend,
+            &scp_primitives::SystemClock,
+        )
         .await
         .unwrap();
 
@@ -514,6 +537,7 @@ async fn psk_rotation_params() {
     let kr = active_key_rotation_outcome(&alice, 7000);
     let backend = MockBackend::new();
 
+    let clock = scp_primitives::SystemClock;
     let result = orch
         .execute_recovery(
             CompromiseTier::ActiveSigning,
@@ -521,6 +545,7 @@ async fn psk_rotation_params() {
             &HashSet::new(),
             None,
             &backend,
+            &clock,
         )
         .await
         .unwrap();
@@ -534,6 +559,7 @@ async fn psk_rotation_params() {
             &HashSet::new(),
             Some(&params_clean),
             &backend,
+            &clock,
         )
         .await
         .unwrap();
@@ -568,11 +594,6 @@ async fn recovery_error_variants() {
     let e5 = RecoveryError::CustodyError("keychain locked".to_owned());
     assert!(e5.to_string().contains("custody error"));
     assert!(e5.to_string().contains("keychain locked"));
-
-    // ClockError (via From<ClockError>).
-    let clock_err = scp_core::time::ClockError;
-    let e6 = RecoveryError::from(clock_err);
-    assert!(e6.to_string().contains("clock error"));
 
     // RecoveryStepError Display.
     let step_err = RecoveryStepError {
@@ -615,7 +636,14 @@ async fn recovery_with_contact_notification_failure() {
     };
 
     let result = orch
-        .execute_recovery(CompromiseTier::Agent, &kr, &contacts, None, &backend)
+        .execute_recovery(
+            CompromiseTier::Agent,
+            &kr,
+            &contacts,
+            None,
+            &backend,
+            &scp_primitives::SystemClock,
+        )
         .await
         .unwrap();
 
@@ -650,6 +678,7 @@ async fn recovery_with_psk_rotation_failure() {
             &HashSet::new(),
             Some(&psk_params),
             &backend,
+            &scp_primitives::SystemClock,
         )
         .await
         .unwrap();
@@ -713,7 +742,14 @@ async fn recovery_with_no_contexts() {
     let backend = MockBackend::new();
 
     let result = orch
-        .execute_recovery(CompromiseTier::Agent, &kr, &HashSet::new(), None, &backend)
+        .execute_recovery(
+            CompromiseTier::Agent,
+            &kr,
+            &HashSet::new(),
+            None,
+            &backend,
+            &scp_primitives::SystemClock,
+        )
         .await
         .unwrap();
 

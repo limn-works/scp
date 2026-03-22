@@ -24,6 +24,7 @@
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
 use scp_platform::traits::Storage;
+use scp_primitives::Clock;
 
 use crate::error::ScpPyError;
 use crate::types::{encode_hex, json_to_py_dict};
@@ -319,10 +320,7 @@ pub fn py_event_log_query(
         event_type: "LogSummary".to_owned(),
         actor_did: String::new(),
         #[allow(clippy::cast_precision_loss)] // Unix timestamp seconds fit in f64 mantissa for centuries.
-        timestamp: {
-            scp_primitives::time::now_secs()
-                .map_err(|e| ScpPyError::context(format!("{e}")))? as f64
-        },
+        timestamp: scp_primitives::SystemClock.now_secs() as f64,
         payload,
         sequence: event_count.saturating_sub(1),
     };

@@ -328,10 +328,6 @@ pub enum ToolError {
         /// Maximum allowed by inbound policy.
         max: u32,
     },
-
-    /// The system clock is unavailable or before the Unix epoch.
-    #[error("clock error: {0}")]
-    ClockError(#[from] crate::time::ClockError),
 }
 
 // ---------------------------------------------------------------------------

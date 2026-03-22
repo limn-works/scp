@@ -2,22 +2,8 @@
 //!
 //! Bridge ID per spec section 12.2.1: `SHA-256(context_id || operator_did || platform || timestamp)`.
 
+use scp_primitives::Clock;
 use sha2::{Digest, Sha256};
-
-/// The system clock is unavailable or before the Unix epoch.
-///
-/// A bridge ID with timestamp 0 would produce a deterministic hash that could
-/// collide with other registrations experiencing the same clock failure.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ClockError;
-
-impl std::fmt::Display for ClockError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("system clock is unavailable or before Unix epoch")
-    }
-}
-
-impl std::error::Error for ClockError {}
 
 /// Generates a bridge ID per spec section 12.2.1.
 ///
@@ -34,19 +20,9 @@ impl std::error::Error for ClockError {}
 ///
 /// Returns `(bridge_id_hex, timestamp_secs)` so callers can use the same
 /// timestamp for `BridgeRegistrationRequest::requested_at`.
-///
-/// # Errors
-///
-/// Returns [`ClockError`] if the system clock is before the Unix epoch.
-pub fn generate_bridge_id(
-    context_id: &str,
-    operator_did: &str,
-    platform: &str,
-) -> Result<(String, u64), ClockError> {
-    let now_secs = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .map_err(|_| ClockError)?;
+#[must_use]
+pub fn generate_bridge_id(context_id: &str, operator_did: &str, platform: &str) -> (String, u64) {
+    let now_secs = scp_primitives::SystemClock.now_secs();
 
     let mut hasher = Sha256::new();
     hasher.update(context_id.as_bytes());
@@ -54,7 +30,7 @@ pub fn generate_bridge_id(
     hasher.update(platform.as_bytes());
     hasher.update(now_secs.to_be_bytes());
 
-    Ok((hex::encode(hasher.finalize()), now_secs))
+    (hex::encode(hasher.finalize()), now_secs)
 }
 
 #[cfg(test)]
@@ -64,7 +40,7 @@ mod tests {
 
     #[test]
     fn bridge_id_format() {
-        let (id, ts) = generate_bridge_id("ctx-test", "did:key:operator", "discord").unwrap();
+        let (id, ts) = generate_bridge_id("ctx-test", "did:key:operator", "discord");
         // SHA-256 output is 64 hex chars.
         assert_eq!(id.len(), 64);
         assert!(id.chars().all(|c| c.is_ascii_hexdigit()));
@@ -76,8 +52,8 @@ mod tests {
         // Two calls with the same inputs in the same second produce the same ID.
         // (This is inherently racy if the test spans a second boundary, but
         // extremely unlikely in practice.)
-        let (id1, ts1) = generate_bridge_id("ctx-a", "did:key:op", "slack").unwrap();
-        let (id2, ts2) = generate_bridge_id("ctx-a", "did:key:op", "slack").unwrap();
+        let (id1, ts1) = generate_bridge_id("ctx-a", "did:key:op", "slack");
+        let (id2, ts2) = generate_bridge_id("ctx-a", "did:key:op", "slack");
         if ts1 == ts2 {
             assert_eq!(id1, id2);
         }
@@ -85,8 +61,8 @@ mod tests {
 
     #[test]
     fn bridge_id_different_for_different_inputs() {
-        let (id1, _) = generate_bridge_id("ctx-a", "did:key:op", "slack").unwrap();
-        let (id2, _) = generate_bridge_id("ctx-b", "did:key:op", "slack").unwrap();
+        let (id1, _) = generate_bridge_id("ctx-a", "did:key:op", "slack");
+        let (id2, _) = generate_bridge_id("ctx-b", "did:key:op", "slack");
         // Different context_id must produce different bridge_id (same second).
         assert_ne!(id1, id2);
     }
@@ -101,7 +77,7 @@ mod tests {
         let ctx = "ctx-test";
         let op = "did:key:operator";
         let plat = "discord";
-        let (id, ts) = generate_bridge_id(ctx, op, plat).unwrap();
+        let (id, ts) = generate_bridge_id(ctx, op, plat);
 
         let mut hasher = Sha256::new();
         hasher.update(ctx.as_bytes());

@@ -17,6 +17,7 @@
 
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
+use scp_primitives::Clock;
 
 use crate::error::ScpPyError;
 use crate::types::{json_to_py_dict, py_dict_to_json};
@@ -923,8 +924,7 @@ pub fn py_tool_session_create(
         }
 
         let session_id = uuid::Uuid::new_v4().to_string();
-        let now_ms = scp_primitives::time::now_millis()
-            .map_err(|e| ScpPyError::context(format!("clock error: {e}")))?;
+        let now_ms = scp_primitives::SystemClock.now_millis();
 
         let session = scp_core::context::tools::ToolSession {
             session_id: session_id.clone(),
@@ -1021,8 +1021,7 @@ pub fn py_tool_session_invoke(
             .ok_or_else(|| ScpPyError::context(format!("session '{session_id}' not found")))?;
 
         // Check expiry.
-        let now_ms = scp_primitives::time::now_millis()
-            .map_err(|e| ScpPyError::context(format!("clock error: {e}")))?;
+        let now_ms = scp_primitives::SystemClock.now_millis();
         if session.is_expired(now_ms) {
             rt.session_store.remove(session_id);
             return Err(ScpPyError::context(format!(
@@ -1288,10 +1287,7 @@ pub fn py_tool_interface_revoke(context_id: &str, interface_id_hex: &str) -> PyR
             }
         })?;
 
-    let now_ms = scp_primitives::time::now_millis().map_err(|e| ScpPyError::ContextError {
-        message: format!("clock error: {e}"),
-        code: "SCP-TOOL-6034".to_owned(),
-    })?;
+    let now_ms = scp_primitives::SystemClock.now_millis();
 
     let event = scp_core::context::tools::interface::revoke_tool_interface(
         interface_id,

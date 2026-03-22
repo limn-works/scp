@@ -12,6 +12,7 @@ use napi_derive::napi;
 use scp_ffi_common::validate::{
     validate_did, validate_tool_id, validate_tool_name, validate_ucan_token,
 };
+use scp_primitives::Clock;
 
 use crate::context::NapiContextHandle;
 use crate::error::ScpNapiError;
@@ -722,10 +723,7 @@ pub async fn tool_session_create(
         }
 
         let session_id = uuid::Uuid::new_v4().to_string();
-        let now_ms = scp_primitives::time::now_millis().map_err(|e| ScpNapiError::Tool {
-            message: format!("clock error: {e}"),
-            code: "SCP-TOOL-6016".to_owned(),
-        })?;
+        let now_ms = scp_primitives::SystemClock.now_millis();
 
         let session = scp_core::context::tools::ToolSession {
             session_id: session_id.clone(),
@@ -818,10 +816,7 @@ pub async fn tool_session_invoke(
             })?;
 
         // Check expiry.
-        let now_ms = scp_primitives::time::now_millis().map_err(|e| ScpNapiError::Tool {
-            message: format!("clock error: {e}"),
-            code: "SCP-TOOL-6016".to_owned(),
-        })?;
+        let now_ms = scp_primitives::SystemClock.now_millis();
         if session.is_expired(now_ms) {
             rt.session_store.remove(&session_id);
             return Err(ScpNapiError::Tool {
@@ -1096,12 +1091,7 @@ pub async fn tool_interface_revoke(
             })
         })?;
 
-    let now_ms = scp_primitives::time::now_millis().map_err(|e| {
-        napi::Error::from(ScpNapiError::Tool {
-            message: format!("clock error: {e}"),
-            code: "SCP-TOOL-6034".to_owned(),
-        })
-    })?;
+    let now_ms = scp_primitives::SystemClock.now_millis();
 
     let event = scp_core::context::tools::interface::revoke_tool_interface(
         interface_id,

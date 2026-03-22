@@ -17,6 +17,7 @@ use scp_core::context::manager::GovernanceActionResult;
 use scp_core::context::params::ContextMode;
 use scp_core::context::{ContextHandle, ContextParams, ContextState};
 use scp_identity::DID;
+use scp_primitives::Clock;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
@@ -741,12 +742,7 @@ pub async fn context_send(
     if let (Some(custody), Some(signing_key)) = (&handle.in_memory_custody, handle.signing_key) {
         let context_id = handle.context_id.clone();
         let sender_did_str = identity_did.clone();
-        let now_ms = scp_primitives::time::now_millis().map_err(|e| {
-            NapiError::from(ScpNapiError::Crypto {
-                message: format!("clock error: {e}"),
-                code: "SCP-CRYPTO-4000".to_owned(),
-            })
-        })?;
+        let now_ms = scp_primitives::SystemClock.now_millis();
 
         let params = scp_core::envelope::InnerEnvelopeParams {
             version: scp_core::envelope::inner::SCP_INNER_ENVELOPE_VERSION,
@@ -953,7 +949,7 @@ pub fn context_subscribe(
                         Ok(Some((plaintext, sender_did))) => {
                             sequence_counter += 1.0;
                             #[allow(clippy::cast_precision_loss)]
-                            let ts = scp_primitives::time::now_secs().map_or(0.0, |s| s as f64);
+                            let ts = scp_primitives::SystemClock.now_secs() as f64;
                             let msg = NapiMessage {
                                 sender_did,
                                 payload: plaintext,
@@ -1832,11 +1828,7 @@ pub async fn context_execute_governance_action(
         rand::rngs::OsRng.fill_bytes(&mut proposal_id);
     }
 
-    let now = scp_primitives::time::now_secs().map_err(|e| {
-        napi::Error::from_reason(format!(
-            "system clock unavailable — cannot create governance proposal: {e}"
-        ))
-    })?;
+    let now = scp_primitives::SystemClock.now_secs();
 
     // Currently all bridge governance actions are auto-approved (SingleAdmin).
     // Multi-party governance (Threshold/Majority/Unanimity) requires the

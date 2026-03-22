@@ -32,7 +32,7 @@ fn make_combined_blob_store() -> (CombinedNodeStorage, Arc<AtomicU64>) {
     let clock = Arc::new(AtomicU64::new(1_000_000));
     let clock_fn: ClockFn = {
         let c = clock.clone();
-        Arc::new(move || Ok(c.load(Ordering::Relaxed)))
+        Arc::new(move || c.load(Ordering::Relaxed))
     };
     let store = CombinedNodeStorage::open_with_clock(&dir_path, &key, clock_fn)
         .expect("CombinedNodeStorage::open_with_clock should succeed");

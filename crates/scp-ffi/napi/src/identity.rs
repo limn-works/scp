@@ -48,6 +48,7 @@ use scp_identity::{
 use scp_platform::testing::InMemoryKeyCustody;
 #[cfg(feature = "allow_in_memory_custody")]
 use scp_platform::traits::KeyCustody;
+use scp_primitives::Clock;
 
 use crate::error::{ScpNapiError, validate_custody_type};
 use crate::{decrement_handle_count, increment_handle_count};
@@ -663,12 +664,7 @@ impl NapiIdentity {
                     })
                 })?;
 
-            let rotated_at = scp_primitives::time::now_secs().map_err(|e| {
-                NapiError::from(ScpNapiError::Identity {
-                    message: format!("failed to get current time: {e}"),
-                    code: "SCP-IDENT-1009".to_owned(),
-                })
-            })?;
+            let rotated_at = scp_primitives::SystemClock.now_secs();
 
             let dht = make_dht_with_signer(&custody);
             let (new_identity, new_document, _rotation_event) = dht
@@ -1632,12 +1628,7 @@ pub fn identity_execute_recovery(
         }
     };
 
-    let now_ms = scp_primitives::time::now_millis().map_err(|e| {
-        NapiError::from(ScpNapiError::Identity {
-            message: format!("clock error: {e}"),
-            code: "SCP-IDENT-1021".to_owned(),
-        })
-    })?;
+    let now_ms = scp_primitives::SystemClock.now_millis();
 
     let key_rotation = match compromise_tier {
         CompromiseTier::Agent => agent_key_rotation_outcome(&did_val, now_ms),
@@ -1704,6 +1695,7 @@ pub fn identity_execute_recovery(
             &contacts,
             None,
             &backend,
+            &scp_primitives::SystemClock,
         ))
         .map_err(|e| {
             NapiError::from(ScpNapiError::Identity {
@@ -1817,7 +1809,7 @@ pub fn identity_execute_custody_migration(
     })?;
 
     let result = handle
-        .block_on(orchestrator.execute(&backend))
+        .block_on(orchestrator.execute(&backend, &scp_primitives::SystemClock))
         .map_err(|e| {
             NapiError::from(ScpNapiError::Identity {
                 message: format!("custody migration failed: {e}"),

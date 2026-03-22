@@ -278,12 +278,14 @@ async fn alice_bob_encrypted_message_via_relay() {
     // ---------------------------------------------------------------
     // Step 7: Bob requests and receives Alice's sender key (ADR-007)
     // ---------------------------------------------------------------
+    let clock = scp_primitives::SystemClock;
     let req_result = request_sender_key(
         &bob_custody,
         &bob_id.active_signing_key,
         &bob_id.did,
         &alice_id.did,
         1,
+        &clock,
     )
     .await
     .unwrap();

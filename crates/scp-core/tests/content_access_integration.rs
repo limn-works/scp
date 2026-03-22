@@ -356,9 +356,16 @@ async fn tier1_in_context_block_unblock_lifecycle() {
         current_epoch: 0,
         signer_key_ref: SigningKeyId::Active,
     };
-    let block_result = block_did_in_context(&custody, &signing_key, &block_params, &mut block_list)
-        .await
-        .expect("block should succeed");
+    let clock = scp_primitives::SystemClock;
+    let block_result = block_did_in_context(
+        &custody,
+        &signing_key,
+        &block_params,
+        &mut block_list,
+        &clock,
+    )
+    .await
+    .expect("block should succeed");
 
     // Verify Layer 1: Dave is in the block list.
     assert!(block_list.contains(DAVE));
@@ -603,6 +610,7 @@ async fn tier2_global_block_propagation() {
         shared_context_ids: &shared_contexts,
         signer_key_ref: SigningKeyId::Active,
     };
+    let clock = scp_primitives::SystemClock;
     let global_result = block_did_global(
         &custody,
         &signing_key,
@@ -610,6 +618,7 @@ async fn tier2_global_block_propagation() {
         &block_list_state,
         &mut per_context_block_lists,
         &per_context_epochs,
+        &clock,
     )
     .await
     .expect("global block should succeed");
@@ -887,10 +896,16 @@ async fn three_layer_enforcement_after_full_revocation() {
         current_epoch: 0,
         signer_key_ref: SigningKeyId::Active,
     };
-    let _block_result =
-        block_did_in_context(&custody, &signing_key, &block_params, &mut block_list)
-            .await
-            .unwrap();
+    let clock = scp_primitives::SystemClock;
+    let _block_result = block_did_in_context(
+        &custody,
+        &signing_key,
+        &block_params,
+        &mut block_list,
+        &clock,
+    )
+    .await
+    .unwrap();
 
     // Build block list state and check is_block_effective.
     let mut block_list_state = BlockListState::new();
@@ -921,6 +936,7 @@ async fn three_layer_enforcement_after_full_revocation() {
         ALICE,
         DAVE,
         SigningKeyId::Active,
+        &clock,
     )
     .await
     .unwrap();
@@ -1233,6 +1249,7 @@ async fn invalid_block_notification_no_destruction() {
     let (custody, signing_key) = make_custody_and_key().await;
 
     // Create a valid notification.
+    let clock = scp_primitives::SystemClock;
     let notification_bytes = send_block_notification(
         &custody,
         &signing_key,
@@ -1240,6 +1257,7 @@ async fn invalid_block_notification_no_destruction() {
         ALICE,
         DAVE,
         SigningKeyId::Active,
+        &clock,
     )
     .await
     .unwrap();

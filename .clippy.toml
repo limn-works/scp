@@ -10,14 +10,5 @@ cognitive-complexity-threshold = 25
 stack-size-threshold = 900000
 
 # ----- Disallowed methods -----
-# scp-core intentionally does NOT re-export now_secs/now_millis from
-# scp_primitives::time.  Protocol-bound modules must use &dyn Clock.
-# These entries guard against accidental re-introduction of the re-export.
-
-[[disallowed-methods]]
-path = "scp_core::time::now_secs"
-reason = "Use &dyn Clock instead — see Clock trait in scp-primitives/src/time.rs"
-
-[[disallowed-methods]]
-path = "scp_core::time::now_millis"
-reason = "Use &dyn Clock instead — see Clock trait in scp-primitives/src/time.rs"
+# now_secs/now_millis are private to scp-primitives — the compiler enforces
+# this directly. No clippy disallowed-methods entries needed.

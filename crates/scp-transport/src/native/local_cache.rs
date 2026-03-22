@@ -14,6 +14,7 @@
 //!
 //! See SCP-PERSIST-065.
 
+use scp_primitives::Clock;
 use std::sync::Arc;
 
 use tokio::sync::Mutex;

@@ -74,6 +74,7 @@ use scp_identity::cache::SystemClock;
 use scp_identity::{DidDocument, ScpIdentity};
 use scp_platform::encrypting_adapter::EncryptingAdapter;
 use scp_platform::testing::InMemoryStorage;
+use scp_primitives::Clock;
 use scp_transport::native::adapter::NativeRelayAdapter;
 use tokio::sync::mpsc;
 use zeroize::Zeroizing;
@@ -774,7 +775,7 @@ pub fn deliver_message(context_id: &str, message: PyMessage) -> Result<(), ScpPy
             let overflow_warning = PyMessage::new(
                 "scp:system".to_owned(),
                 b"BufferOverflow: oldest event dropped due to full receive buffer".to_vec(),
-                scp_primitives::time::now_secs().map_or(0.0, |s| s as f64),
+                scp_primitives::SystemClock.now_secs() as f64,
                 context_id.to_owned(),
             );
             let _ = tx.try_send(overflow_warning);

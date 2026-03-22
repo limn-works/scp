@@ -83,9 +83,6 @@ impl ToolRequest {
     ///
     /// Uses [`DEFAULT_TIMEOUT_MS`] as the default timeout and 0 as the default
     /// chain depth.
-    /// # Errors
-    ///
-    /// Returns [`crate::time::ClockError`] if the system clock is unavailable.
     pub fn new(
         tool_id: String,
         invoker_did: DID,

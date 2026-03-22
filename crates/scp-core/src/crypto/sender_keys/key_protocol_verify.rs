@@ -992,16 +992,6 @@ pub(super) fn verify_ed25519_signature(
     }
 }
 
-/// Returns the current Unix timestamp in milliseconds.
-///
-/// # Errors
-///
-/// Returns [`SenderKeyError::ClockError`] (via [`crate::time::ClockError`])
-/// if the system clock is before the Unix epoch.
-pub(super) fn current_timestamp_ms() -> Result<u64, crate::time::ClockError> {
-    scp_primitives::time::now_millis()
-}
-
 // ---------------------------------------------------------------------------
 // Bridge shadow sender key distribution (SCP-BCH-011, §12.6.1)
 // ---------------------------------------------------------------------------

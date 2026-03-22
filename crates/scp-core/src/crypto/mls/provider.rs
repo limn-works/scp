@@ -25,6 +25,7 @@ use openmls::prelude::*;
 use openmls_basic_credential::SignatureKeyPair;
 use openmls_traits::OpenMlsProvider;
 use scp_identity::SigningKeyId;
+use scp_primitives::Clock;
 use serde::{Deserialize, Serialize};
 use tls_codec::Deserialize as TlsDeserializeTrait;
 use zeroize::{Zeroize, Zeroizing};
@@ -722,8 +723,7 @@ impl ContextCryptoProvider for MlsCryptoProvider {
             rmp_serde::from_slice(request_bytes)
                 .map_err(|e| ContextError::CryptoFailed(format!("request deserialization: {e}")))?;
 
-        let now_secs = scp_primitives::time::now_secs()
-            .map_err(|e| ContextError::CryptoFailed(format!("clock error: {e}")))?;
+        let now_secs = scp_primitives::SystemClock.now_secs();
 
         let mut contexts = self
             .contexts

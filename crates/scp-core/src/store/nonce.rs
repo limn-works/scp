@@ -15,6 +15,7 @@
 //! See SCP-PERSIST-011.
 
 use scp_platform::traits::Storage;
+use scp_primitives::Clock;
 use serde::{Deserialize, Serialize};
 
 use super::{ProtocolRepository, StoreError};
@@ -138,7 +139,7 @@ impl<S: Storage> ProtocolRepository<S> {
         // storage read (last-prune timestamp) is negligible relative
         // to the two reads and one write that the nonce check already
         // performs. See spec section 17.3 on nonce pruning.
-        let now = scp_primitives::time::now_secs().unwrap_or(first_seen);
+        let now = scp_primitives::SystemClock.now_secs();
         self.maybe_prune_nonces(context_id, now).await?;
 
         let key = nonce_key(context_id, nonce_hash)?;

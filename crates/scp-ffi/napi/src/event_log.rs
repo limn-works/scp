@@ -8,6 +8,7 @@
 //! See ADR-011 (Event Log) and ADR-022 in `.docs/adrs/`.
 
 use napi_derive::napi;
+use scp_primitives::Clock;
 
 use crate::context::NapiContextHandle;
 use crate::error::ScpNapiError;
@@ -170,12 +171,7 @@ pub async fn event_log_query(
 
     // Unix timestamp seconds fit in f64 mantissa for centuries.
     #[allow(clippy::cast_precision_loss)]
-    let timestamp = scp_primitives::time::now_secs()
-        .map_err(|e| ScpNapiError::Context {
-            message: format!("{e}"),
-            code: "SCP-CTX-2023".to_owned(),
-        })
-        .map_err(napi::Error::from)? as f64;
+    let timestamp = scp_primitives::SystemClock.now_secs() as f64;
 
     let summary_event = NapiEvent {
         event_type: "LogSummary".to_owned(),

@@ -18,6 +18,7 @@ use serde_json::Value;
 use super::{ToolError, ToolId, ToolRegistry, ToolVerificationResult, VectorResult};
 use crate::trust::challenge::{ChallengeType, ChallengeVerification, VerificationMethod};
 use scp_identity::DID;
+use scp_primitives::Clock;
 
 // ---------------------------------------------------------------------------
 // Schema compatibility checking
@@ -111,11 +112,11 @@ pub struct SchemaVerificationResult {
 /// # Errors
 ///
 /// Returns [`ToolError::ToolNotFound`] if the tool is not in the registry.
-/// Returns [`ToolError::ClockError`] if the system clock is unavailable.
 pub fn verify_tool_integrity<F>(
     registry: &ToolRegistry,
     tool_id: &str,
     verifier_did: &DID,
+    clock: &dyn Clock,
     executor: F,
 ) -> Result<(ChallengeVerification, SchemaVerificationResult), ToolError>
 where
@@ -155,7 +156,7 @@ where
     let passed_count = vector_results.iter().filter(|r| r.passed).count();
     let integrity_ok = passed_count == vector_results.len();
 
-    let now = scp_primitives::time::now_secs()?;
+    let now = clock.now_secs();
 
     let challenge_id = format!("tool-integrity-{tool_id}-{now}");
 
@@ -258,27 +259,22 @@ impl VerificationScheduler {
     /// If the tool already has a schedule, it is replaced. The first
     /// verification is due immediately (at now).
     ///
-    /// # Errors
-    ///
-    /// Returns [`ToolError::ClockError`] if the system clock is unavailable.
     pub fn schedule_tool_verification(
         &mut self,
         tool_id: &str,
         interval_secs: u64,
-    ) -> Result<&ToolVerificationSchedule, ToolError> {
-        let now = scp_primitives::time::now_secs()?;
+        clock: &dyn Clock,
+    ) -> &ToolVerificationSchedule {
+        let now = clock.now_secs();
         let schedule = ToolVerificationSchedule {
             tool_id: tool_id.to_owned(),
             interval_secs,
             last_verified_at: None,
             next_verification_at: now,
         };
-        self.schedules.insert(tool_id.to_owned(), schedule);
-        self.schedules
-            .get(tool_id)
-            .ok_or_else(|| ToolError::ToolNotFound {
-                tool_id: tool_id.to_owned(),
-            })
+        let key = tool_id.to_owned();
+        self.schedules.insert(key.clone(), schedule);
+        &self.schedules[&key]
     }
 
     /// Removes the verification schedule for a tool.
@@ -306,13 +302,10 @@ impl VerificationScheduler {
     }
 
     /// Returns all tool IDs that are currently due for verification.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`ToolError::ClockError`] if the system clock is unavailable.
-    pub fn tools_due_now(&self) -> Result<Vec<ToolId>, ToolError> {
-        let now = scp_primitives::time::now_secs()?;
-        Ok(self.tools_due_at(now))
+    #[must_use]
+    pub fn tools_due_now(&self, clock: &dyn Clock) -> Vec<ToolId> {
+        let now = clock.now_secs();
+        self.tools_due_at(now)
     }
 
     /// Records that a tool was verified at the given timestamp, advancing
@@ -449,10 +442,12 @@ mod tests {
         let registry = make_registry("calc", vectors);
         let verifier = DID::from("did:dht:verifier");
 
+        let clock = scp_primitives::SystemClock;
         let (verification, result) = verify_tool_integrity(
             &registry,
             "calc",
             &verifier,
+            &clock,
             |_input| json!({"result": 99, "status": "done", "extra_field": true}),
         )
         .unwrap();
@@ -478,10 +473,12 @@ mod tests {
         let registry = make_registry("calc", vectors);
         let verifier = DID::from("did:dht:verifier");
 
+        let clock = scp_primitives::SystemClock;
         let (verification, result) = verify_tool_integrity(
             &registry,
             "calc",
             &verifier,
+            &clock,
             |_input| json!({"result": "not a number"}),
         )
         .unwrap();
@@ -504,8 +501,9 @@ mod tests {
         let registry = ToolRegistry::new();
         let verifier = DID::from("did:dht:verifier");
 
-        let err =
-            verify_tool_integrity(&registry, "missing", &verifier, |_| json!({})).unwrap_err();
+        let clock = scp_primitives::SystemClock;
+        let err = verify_tool_integrity(&registry, "missing", &verifier, &clock, |_| json!({}))
+            .unwrap_err();
 
         match err {
             ToolError::ToolNotFound { tool_id } => assert_eq!(tool_id, "missing"),
@@ -530,8 +528,10 @@ mod tests {
         let registry = make_registry("multi", vectors);
         let verifier = DID::from("did:dht:v");
 
+        let clock = scp_primitives::SystemClock;
         let (_, result) =
-            verify_tool_integrity(&registry, "multi", &verifier, |_| json!({"a": 1})).unwrap();
+            verify_tool_integrity(&registry, "multi", &verifier, &clock, |_| json!({"a": 1}))
+                .unwrap();
 
         assert!(result.integrity_ok);
     }
@@ -566,26 +566,28 @@ mod tests {
 
     #[test]
     fn schedule_and_check_due() {
+        let clock = scp_primitives::SystemClock;
         let mut scheduler = VerificationScheduler::new();
         assert!(scheduler.is_empty());
 
-        let schedule = scheduler.schedule_tool_verification("tool-a", 300).unwrap();
+        let schedule = scheduler.schedule_tool_verification("tool-a", 300, &clock);
         assert_eq!(schedule.tool_id, "tool-a");
         assert_eq!(schedule.interval_secs, 300);
         assert!(schedule.last_verified_at.is_none());
 
         assert_eq!(scheduler.len(), 1);
 
-        let due = scheduler.tools_due_now().unwrap();
+        let due = scheduler.tools_due_now(&clock);
         assert!(due.contains(&"tool-a".to_owned()));
     }
 
     #[test]
     fn record_verification_advances_schedule() {
+        let clock = scp_primitives::SystemClock;
         let mut scheduler = VerificationScheduler::new();
-        scheduler.schedule_tool_verification("tool-b", 600).unwrap();
+        scheduler.schedule_tool_verification("tool-b", 600, &clock);
 
-        let now = scp_primitives::SystemClock.now_secs();
+        let now = clock.now_secs();
         scheduler.record_verification("tool-b", now);
 
         let schedule = scheduler.get_schedule("tool-b").unwrap();
@@ -601,8 +603,9 @@ mod tests {
 
     #[test]
     fn unschedule_removes_entry() {
+        let clock = scp_primitives::SystemClock;
         let mut scheduler = VerificationScheduler::new();
-        scheduler.schedule_tool_verification("tool-c", 100).unwrap();
+        scheduler.schedule_tool_verification("tool-c", 100, &clock);
         assert_eq!(scheduler.len(), 1);
 
         assert!(scheduler.unschedule_tool_verification("tool-c"));
@@ -612,9 +615,10 @@ mod tests {
 
     #[test]
     fn reschedule_replaces_existing() {
+        let clock = scp_primitives::SystemClock;
         let mut scheduler = VerificationScheduler::new();
-        scheduler.schedule_tool_verification("tool-d", 100).unwrap();
-        scheduler.schedule_tool_verification("tool-d", 500).unwrap();
+        scheduler.schedule_tool_verification("tool-d", 100, &clock);
+        scheduler.schedule_tool_verification("tool-d", 500, &clock);
 
         assert_eq!(scheduler.len(), 1);
         let schedule = scheduler.get_schedule("tool-d").unwrap();
@@ -623,15 +627,16 @@ mod tests {
 
     #[test]
     fn multiple_tools_due() {
+        let clock = scp_primitives::SystemClock;
         let mut scheduler = VerificationScheduler::new();
-        scheduler.schedule_tool_verification("t1", 100).unwrap();
-        scheduler.schedule_tool_verification("t2", 200).unwrap();
-        scheduler.schedule_tool_verification("t3", 300).unwrap();
+        scheduler.schedule_tool_verification("t1", 100, &clock);
+        scheduler.schedule_tool_verification("t2", 200, &clock);
+        scheduler.schedule_tool_verification("t3", 300, &clock);
 
-        let due = scheduler.tools_due_now().unwrap();
+        let due = scheduler.tools_due_now(&clock);
         assert_eq!(due.len(), 3);
 
-        let now = scp_primitives::SystemClock.now_secs();
+        let now = clock.now_secs();
         scheduler.record_verification("t1", now);
         scheduler.record_verification("t2", now);
 

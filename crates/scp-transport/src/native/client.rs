@@ -24,6 +24,7 @@
 //! [`NativeRelayAdapter`]: super::adapter::NativeRelayAdapter
 //! [`TransportAdapter`]: crate::TransportAdapter
 
+use scp_primitives::Clock;
 use std::collections::HashMap;
 use std::num::NonZeroUsize;
 use std::sync::Arc;
@@ -445,7 +446,8 @@ impl NativeRelayClient {
 
                     // Plausibility check: warn if relay timestamp deviates
                     // significantly from local wall-clock time.
-                    if let Ok(local_now) = scp_primitives::time::now_secs() {
+                    {
+                        let local_now = scp_primitives::SystemClock.now_secs();
                         let deviation = local_now.abs_diff(*stored_at);
                         if deviation > RELAY_TIMESTAMP_DEVIATION_THRESHOLD_SECS {
                             tracing::warn!(
@@ -506,10 +508,7 @@ impl NativeRelayClient {
                         break;
                     }
 
-                    let Ok(ts) = scp_primitives::time::now_secs() else {
-                        // Clock unavailable — skip this ping cycle.
-                        continue;
-                    };
+                    let ts = scp_primitives::SystemClock.now_secs();
 
                     let ping = ClientMessage::Ping { ts };
                     if let Ok(bytes) = ping.to_bytes() {
@@ -848,14 +847,12 @@ impl NativeRelayClient {
                     for (routing_id, last_local_receive) in subs_snapshot {
                         // Use local receive time (immune to relay timestamp
                         // manipulation) to compute the reconnect window.
-                        let since = last_local_receive.and_then(|instant| {
+                        let since = last_local_receive.map(|instant| {
                             let elapsed = instant.elapsed();
-                            let now_unix = scp_primitives::time::now_secs().ok()?;
-                            Some(
-                                now_unix
-                                    .saturating_sub(elapsed.as_secs())
-                                    .saturating_sub(RECONNECT_OVERLAP.as_secs()),
-                            )
+                            let now_unix = scp_primitives::SystemClock.now_secs();
+                            now_unix
+                                .saturating_sub(elapsed.as_secs())
+                                .saturating_sub(RECONNECT_OVERLAP.as_secs())
                         });
 
                         let msg = ClientMessage::Subscribe {

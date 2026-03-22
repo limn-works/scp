@@ -12,6 +12,7 @@
 //!
 //! See ADR-015 in `.docs/adrs/phase-3.md` for the full design.
 
+use scp_primitives::Clock;
 use std::sync::atomic::{AtomicI64, Ordering};
 
 use serde::{Deserialize, Serialize};
@@ -162,15 +163,8 @@ pub trait TimestampProvider: Send + Sync {
 pub struct SystemTimestamp;
 
 impl TimestampProvider for SystemTimestamp {
-    #[allow(clippy::expect_used)]
     fn now_millis(&self) -> u64 {
-        // The TimestampProvider trait returns u64 (not Result), so we cannot
-        // propagate the error. A system clock before the Unix epoch is an
-        // unrecoverable environment failure — panicking is correct here, as
-        // silently returning 0 would produce provenance timestamps at epoch 0,
-        // bypassing freshness and ordering checks.
-        scp_primitives::time::now_millis()
-            .expect("system clock is unavailable or before Unix epoch")
+        scp_primitives::SystemClock.now_millis()
     }
 }
 

@@ -2742,19 +2742,11 @@ mod tests {
     // Clock error / epoch-0 bypass prevention (SCP-173)
     // -----------------------------------------------------------------------
 
-    /// Verify that `scp_primitives::time::now_secs()` returns `Ok` on a normal system
-    /// (Result signature works correctly after the `unwrap_or_default()` removal).
+    /// Verify that `scp_primitives::SystemClock.now_secs()` returns a valid timestamp.
     #[test]
-    fn now_secs_returns_ok_on_normal_system() {
-        let result = scp_primitives::time::now_secs();
-        assert!(
-            result.is_ok(),
-            "now_secs() should succeed on a normal system"
-        );
-        assert!(
-            result.unwrap() > 0,
-            "current time should be after Unix epoch"
-        );
+    fn now_secs_returns_valid_timestamp() {
+        let result = scp_primitives::SystemClock.now_secs();
+        assert!(result > 0, "current time should be after Unix epoch");
     }
 
     /// A UCAN with exp=0 and nbf=0 must be rejected. Before the clock-error

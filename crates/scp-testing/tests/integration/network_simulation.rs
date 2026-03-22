@@ -292,9 +292,17 @@ async fn end_to_end_network_demo() {
     println!();
 
     // Bob requests Alice's sender key via HPKE.
-    let req_result = request_sender_key(&bob_custody, &bob_sign_key, bob_did_str, alice_did_str, 1)
-        .await
-        .unwrap();
+    let clock = scp_primitives::SystemClock;
+    let req_result = request_sender_key(
+        &bob_custody,
+        &bob_sign_key,
+        bob_did_str,
+        alice_did_str,
+        1,
+        &clock,
+    )
+    .await
+    .unwrap();
 
     let sk_request: SenderKeyRequest = rmp_serde::from_slice(&req_result.request_message).unwrap();
     println!("  Bob created SenderKeyRequest");
