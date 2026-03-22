@@ -173,5 +173,9 @@ path = "tests/integration/sdk_usability.rs"
 name = "welcome_delivery"
 path = "tests/integration/welcome_delivery.rs"
 
+[[test]]
+name = "pipeline_wiring"
+path = "tests/integration/pipeline_wiring.rs"
+
 [lints]
 workspace = true

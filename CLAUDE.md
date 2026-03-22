@@ -86,6 +86,23 @@ Artifacts (`.docs/`) are durable and versioned — the system of record. Vestige
   - CI failures are never acceptable, whether you introduced them or not. Fix them properly before pushing.
 - **Never bypass branch protection rules** with `--force`, `--admin`, or any other mechanism. No exceptions, no matter how confident you are.
 
+**Integration checklist (MANDATORY for new protocol features):**
+Before executing any plan that adds protocol logic, verify:
+1. The function is called from a ContextManager method (not just exported)
+2. The ContextManager method is exported from all applicable FFI bridges
+3. Each bridge export has a corresponding SDK wrapper method
+4. A pipeline assertion exists in `pipeline_wiring.rs` for the new step
+5. The SDK capability matrix is updated
+If any cell is empty, the plan is incomplete — expand scope or file dependent issues first.
+
+**NEVER modify enforcement files to bypass failures.**
+Files: pipeline_wiring.rs, ffi_conformance.rs, sdk-capability-matrix.json,
+check-cross-layer.sh, bridge_ratchet_baseline.json, CLAUDE.md (enforcement sections).
+If a check fails, fix the code. The only legitimate modifications are:
+- Adding NEW assertions/operations (expanding coverage)
+- Removing #[ignore] when a wiring PR lands (promoting to enforced)
+Weakening, removing, or exempting existing assertions requires human approval.
+
 **Architecture:**
 - Protocol-first design; inject through initializers; no singletons
 - APIs: self-evident, one happy path
