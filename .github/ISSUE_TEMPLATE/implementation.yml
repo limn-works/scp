@@ -1,0 +1,57 @@
+name: Implementation
+description: Propose implementation work with integration verification
+title: "[IMPL] "
+labels: ["implementation"]
+body:
+  - type: textarea
+    id: summary
+    attributes:
+      label: Summary
+      description: What is being implemented and why?
+      placeholder: "Implement X to satisfy spec section Y."
+    validations:
+      required: true
+
+  - type: textarea
+    id: integration-points
+    attributes:
+      label: Integration Points
+      description: |
+        Fill in every row. Empty cells mean the plan is incomplete.
+      value: |
+        | Layer | Integration | Status |
+        |-------|-------------|--------|
+        | Called from | Which ContextManager method? | |
+        | Pipeline step | Which of the 14 send/receive steps? | |
+        | FFI bridges | PyO3 / UniFFI / NAPI / WASM | |
+        | SDK wrappers | Python / TypeScript / Kotlin / Swift | |
+        | Tests | What verifies the wiring? | |
+    validations:
+      required: true
+
+  - type: textarea
+    id: acceptance-criteria
+    attributes:
+      label: Acceptance Criteria
+      description: |
+        Machine-verifiable criteria. Each must be testable.
+      placeholder: |
+        - [ ] Function X is called from ContextManager::method_y
+        - [ ] All applicable FFI bridges export the method
+        - [ ] SDK wrappers exist for all supported languages
+        - [ ] pipeline_wiring.rs assertion exists and passes
+    validations:
+      required: true
+
+  - type: dropdown
+    id: priority
+    attributes:
+      label: Priority
+      description: Issue priority level
+      options:
+        - P0
+        - P1
+        - P2
+        - P3
+    validations:
+      required: true
