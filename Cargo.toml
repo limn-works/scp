@@ -5,6 +5,8 @@ members = [
     "crates/scp-platform",
     "crates/scp-identity",
     "crates/scp-event-log",
+    "crates/scp-protocol",
+    "crates/scp-runtime",
     "crates/scp-core",
     "crates/scp-transport",
     "crates/scp-testing",
