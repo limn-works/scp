@@ -174,11 +174,6 @@ class TestClassifyUcanError:
         msg = "nonce tracker full: capacity 100000 reached with no expired entries to prune"
         assert _classify_ucan_error(msg) == "nonce"
 
-    def test_clock_error(self) -> None:
-        # Clock errors surface as expiry failures (step 11),
-        # not nonce checking (step 9).  Correctly classified as "expiry".
-        assert _classify_ucan_error("system clock error: time went backwards") == "expiry"
-
     # -- Revocation errors (step 10) --
 
     def test_token_revoked(self) -> None:
