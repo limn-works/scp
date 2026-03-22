@@ -873,8 +873,8 @@ impl Default for AttestationVerificationCache {
 /// See ADR-017 acceptance criteria 3-7.
 pub fn verify_attestation(
     attestation: &Attestation,
-    resolver: &impl DidPublicKeyResolver,
-    clock: &impl Clock,
+    resolver: &(impl DidPublicKeyResolver + ?Sized),
+    clock: &(impl Clock + ?Sized),
 ) -> Result<(), TrustError> {
     verify_attestation_with_revocation(attestation, resolver, clock, None)
 }
@@ -896,8 +896,8 @@ pub fn verify_attestation(
 ///   missing or invalid
 pub fn verify_attestation_with_revocation(
     attestation: &Attestation,
-    resolver: &impl DidPublicKeyResolver,
-    clock: &impl Clock,
+    resolver: &(impl DidPublicKeyResolver + ?Sized),
+    clock: &(impl Clock + ?Sized),
     revocation_checker: Option<&dyn AttestationRevocationChecker>,
 ) -> Result<(), TrustError> {
     // 1. Verify Ed25519 signature against issuer's public key.

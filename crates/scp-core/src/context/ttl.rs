@@ -964,6 +964,8 @@ pub struct TtlTimer {
     pub(crate) deadline_unix_secs: Option<u64>,
     /// Optional callback invoked when TTL expiry fails after all retries.
     pub(crate) on_error: Option<TtlExpiryFailureCallback>,
+    /// Clock used for deadline computation.
+    pub(crate) clock: Arc<dyn Clock>,
 }
 
 impl TtlTimer {
@@ -975,6 +977,19 @@ impl TtlTimer {
             cancel: Arc::new(Notify::new()),
             deadline_unix_secs: None,
             on_error: None,
+            clock: Arc::new(scp_primitives::time::SystemClock),
+        }
+    }
+
+    /// Creates a new `TtlTimer` with a specific clock.
+    #[must_use]
+    pub fn with_clock(clock: Arc<dyn Clock>) -> Self {
+        Self {
+            task: None,
+            cancel: Arc::new(Notify::new()),
+            deadline_unix_secs: None,
+            on_error: None,
+            clock,
         }
     }
 
@@ -989,6 +1004,7 @@ impl TtlTimer {
             cancel: Arc::new(Notify::new()),
             deadline_unix_secs: None,
             on_error: Some(on_error),
+            clock: Arc::new(scp_primitives::time::SystemClock),
         }
     }
 
@@ -1022,10 +1038,7 @@ impl TtlTimer {
         event_log: Arc<dyn ContextEventLogProvider>,
     ) {
         // Record absolute deadline for persistence snapshots.
-        let now_secs = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
+        let now_secs = self.clock.now_secs();
         self.deadline_unix_secs = Some(now_secs.saturating_add(duration.as_secs()));
 
         let cancel = self.cancel.clone();
@@ -1078,10 +1091,7 @@ impl TtlTimer {
             return None;
         }
         let deadline = self.deadline_unix_secs?;
-        let now_secs = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
+        let now_secs = self.clock.now_secs();
         Some(deadline.saturating_sub(now_secs))
     }
 }

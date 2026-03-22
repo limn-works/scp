@@ -615,10 +615,6 @@ pub enum ScopeRegistryError {
     /// A validation constraint was violated (`relay_urls`, metadata bounds).
     #[error("validation error: {0}")]
     Validation(String),
-
-    /// The system clock is unavailable or before the Unix epoch.
-    #[error("clock error: {0}")]
-    ClockError(#[from] crate::time::ClockError),
 }
 
 // ---------------------------------------------------------------------------

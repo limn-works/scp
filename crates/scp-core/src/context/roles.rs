@@ -747,10 +747,6 @@ pub enum RoleError {
     /// A context lifecycle error occurred during role assignment.
     #[error("context error: {0}")]
     Context(#[from] ContextError),
-
-    /// The system clock is unavailable or before the Unix epoch.
-    #[error("clock error: {0}")]
-    ClockError(#[from] crate::time::ClockError),
 }
 
 // ---------------------------------------------------------------------------

@@ -632,9 +632,9 @@ pub fn issue_challenge(
 pub fn verify_challenge_response(
     request: &ChallengeRequest,
     response: &ChallengeResponse,
-    resolver: &impl DidPublicKeyResolver,
-    clock: &impl Clock,
-    verifier_signer: &impl ChallengeSigner,
+    resolver: &(impl DidPublicKeyResolver + ?Sized),
+    clock: &(impl Clock + ?Sized),
+    verifier_signer: &(impl ChallengeSigner + ?Sized),
     context_id: Option<String>,
 ) -> Result<ChallengeVerification, TrustError> {
     // 1. Challenge ID must match.

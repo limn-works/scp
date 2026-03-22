@@ -1764,7 +1764,7 @@ impl ContextManager {
             membership: ctx_snapshot.membership,
             role_state: ctx_snapshot.role_state,
             receive_buffer: ReceiveBuffer::new(),
-            ttl_timer: TtlTimer::new(),
+            ttl_timer: TtlTimer::with_clock(Arc::clone(&self.clock)),
             ttl_extension: None,
             broadcast_context: broadcast_ctx,
             executed_proposals: {
@@ -2289,7 +2289,7 @@ impl ContextManager {
             membership: export.snapshot.membership,
             role_state: export.snapshot.role_state,
             receive_buffer: ReceiveBuffer::new(),
-            ttl_timer: TtlTimer::new(),
+            ttl_timer: TtlTimer::with_clock(Arc::clone(&self.clock)),
             ttl_extension: None,
             broadcast_context: None,
             executed_proposals: {
@@ -2462,7 +2462,7 @@ impl ContextManager {
             membership,
             role_state,
             receive_buffer: ReceiveBuffer::new(),
-            ttl_timer: TtlTimer::new(),
+            ttl_timer: TtlTimer::with_clock(Arc::clone(&self.clock)),
             ttl_extension: None,
             broadcast_context,
             executed_proposals: HashMap::new(),
@@ -2728,7 +2728,7 @@ impl ContextManager {
             membership,
             role_state,
             receive_buffer: ReceiveBuffer::new(),
-            ttl_timer: TtlTimer::new(),
+            ttl_timer: TtlTimer::with_clock(Arc::clone(&self.clock)),
             ttl_extension: None,
             broadcast_context,
             executed_proposals: HashMap::new(),
@@ -4071,10 +4071,7 @@ impl ContextManager {
                 // auditable link between the governance proposal and the MLS
                 // epoch transition.
                 if let Some(operation) = mls_op {
-                    let timestamp = std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .unwrap_or_default()
-                        .as_secs();
+                    let timestamp = self.clock.now_secs();
                     // Best-effort: log but do not fail if recording fails
                     // (epoch_after > epoch_before is guaranteed by saturating_add).
                     let _ = ctx.epoch_coordinator.record_coordination(
@@ -4498,7 +4495,7 @@ impl ContextManager {
 
     /// Builds a [`GovernanceContext`] snapshot for the governance engine from
     /// the current per-context state.
-    fn build_governance_context(ctx: &PerContextState) -> GovernanceContext {
+    fn build_governance_context(ctx: &PerContextState, clock: &dyn Clock) -> GovernanceContext {
         let members: Vec<(DID, String)> = ctx
             .membership
             .members()
@@ -4515,10 +4512,7 @@ impl ContextManager {
             members,
             admin_dids,
             current_epoch: Some(ctx.mls_epoch),
-            now: std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_secs(),
+            now: clock.now_secs(),
         }
     }
 
@@ -4643,7 +4637,7 @@ impl ContextManager {
                 ));
             }
 
-            let gov_ctx = Self::build_governance_context(ctx);
+            let gov_ctx = Self::build_governance_context(ctx, &*self.clock);
 
             let (proposal, events) = ctx
                 .governance_engine
@@ -4773,7 +4767,7 @@ impl ContextManager {
                 ));
             }
 
-            let gov_ctx = Self::build_governance_context(ctx);
+            let gov_ctx = Self::build_governance_context(ctx, &*self.clock);
 
             let (status, events) = if approve {
                 ctx.governance_engine
@@ -5087,7 +5081,7 @@ impl ContextManager {
                 .ok_or_else(|| ContextError::ContextNotRegistered(context_id.to_owned()))?;
             require_active(&ctx.handle)?;
 
-            let gov_ctx = Self::build_governance_context(ctx);
+            let gov_ctx = Self::build_governance_context(ctx, &*self.clock);
             ctx.governance_engine
                 .withdraw_vote(proposal_id, voter_did, &gov_ctx)
                 .map_err(|e| ContextError::PermissionDenied(e.to_string()))?
@@ -5839,10 +5833,7 @@ impl ContextManager {
             // for the replacement timer task.
             let remaining_secs = ctx.ttl_timer.deadline_unix_secs.as_mut().map(|deadline| {
                 *deadline = deadline.saturating_add(additional_secs);
-                let now = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map(|d| d.as_secs())
-                    .unwrap_or(0);
+                let now = self.clock.now_secs();
                 deadline.saturating_sub(now)
             });
 
@@ -7132,10 +7123,7 @@ impl ContextManager {
             hex::encode(hasher.finalize())
         };
 
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
+        let now = self.clock.now_secs();
         let grace_period_end = now.saturating_add(grace_period_secs);
 
         // Prepare destination params with migration_source metadata
@@ -7353,10 +7341,7 @@ impl ContextManager {
     pub async fn tombstone_migrated_context(&self, context_id: &str) -> Result<(), ContextError> {
         let context_id_bytes = context_id_to_bytes(context_id);
 
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
+        let now = self.clock.now_secs();
 
         // State transition and mutation happen under the same lock to prevent
         // a race where migration_state is cleared but the transition to
@@ -7989,6 +7974,7 @@ impl ContextManager {
     /// cancelled via [`GovernanceTimeoutTask::cancel()`].
     async fn start_governance_timeout_task(&self, context_id: &str) {
         let contexts = Arc::clone(&self.contexts);
+        let clock = Arc::clone(&self.clock);
         let ctx_id = context_id.to_owned();
 
         let mut contexts_guard = self.contexts.lock().await;
@@ -7998,8 +7984,10 @@ impl ContextManager {
 
         ctx.governance_timeout_task.start({
             let ctx_id = ctx_id.clone();
+            let clock = Arc::clone(&clock);
             move || {
                 let contexts = Arc::clone(&contexts);
+                let clock = Arc::clone(&clock);
                 let ctx_id = ctx_id.clone();
                 async move {
                     // Phase 1: Acquire lock, snapshot data, process proposals,
@@ -8017,7 +8005,7 @@ impl ContextManager {
                             return false; // No longer active — stop the loop.
                         }
 
-                        let gov_ctx = Self::build_governance_context(ctx);
+                        let gov_ctx = Self::build_governance_context(ctx, &*clock);
                         // Detect departed members since last tick.
                         let current_members: HashSet<DID> =
                             ctx.membership.members().map(|m| m.did.clone()).collect();
@@ -8121,8 +8109,7 @@ impl ContextManager {
         attestation: &crate::trust::Attestation,
     ) -> Result<(), ContextError> {
         let resolver = crate::trust::IdentityDidPublicKeyResolver;
-        let clock = scp_identity::cache::SystemClock;
-        crate::trust::verify_attestation(attestation, &resolver, &clock).map_err(|e| {
+        crate::trust::verify_attestation(attestation, &resolver, &*self.clock).map_err(|e| {
             ContextError::PermissionDenied(format!("attestation verification failed: {e}"))
         })
     }
@@ -8177,12 +8164,11 @@ impl ContextManager {
         context_id: Option<String>,
     ) -> Result<crate::trust::ChallengeVerification, ContextError> {
         let resolver = crate::trust::IdentityDidPublicKeyResolver;
-        let clock = scp_identity::cache::SystemClock;
         crate::trust::verify_challenge_response(
             request,
             response,
             &resolver,
-            &clock,
+            &*self.clock,
             verifier_signer,
             context_id,
         )
@@ -8218,8 +8204,6 @@ impl ContextManager {
         creator_did: &DID,
         creator_signature: Vec<u8>,
     ) -> Result<ContextCheckpoint, ContextError> {
-        use std::time::{SystemTime, UNIX_EPOCH};
-
         let contexts = self.contexts.lock().await;
         let ctx = contexts
             .get(context_id)
@@ -8236,10 +8220,7 @@ impl ContextManager {
         // Capture pruning policy before dropping the lock.
         let pruning_policy = ctx.pruning_policy.clone();
 
-        let created_at = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
+        let created_at = self.clock.now_secs();
 
         let checkpoint = ContextCheckpoint {
             checkpoint_seq,
@@ -8344,13 +8325,9 @@ impl ContextManager {
         new_proposal: &GovernanceProposal,
     ) -> Vec<GovernanceEvent> {
         use super::governance::{GovernanceEvent, actions_conflict};
-        use std::time::{SystemTime, UNIX_EPOCH};
 
         let mut events = Vec::new();
-        let current_timestamp = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
+        let current_timestamp = self.clock.now_secs();
 
         // Check for conflicts with existing approved proposals
         let mut conflicts = Vec::new();
@@ -8434,14 +8411,10 @@ impl ContextManager {
     #[allow(clippy::unused_self)] // method for API consistency within ContextManager
     fn check_and_resolve_expired_freezes(&self, ctx: &mut PerContextState) -> Vec<GovernanceEvent> {
         use super::governance::GovernanceEvent;
-        use std::time::{SystemTime, UNIX_EPOCH};
 
         const FREEZE_TIMEOUT_SECONDS: u64 = 48 * 60 * 60; // 48 hours
 
-        let current_timestamp = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
+        let current_timestamp = self.clock.now_secs();
 
         if let Some((proposal_a, proposal_b, freeze_start)) = ctx.governance_freeze
             && current_timestamp.saturating_sub(freeze_start) >= FREEZE_TIMEOUT_SECONDS

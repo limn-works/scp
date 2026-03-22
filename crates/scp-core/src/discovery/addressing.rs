@@ -319,10 +319,6 @@ pub enum AddressingError {
         /// Error description.
         message: String,
     },
-
-    /// The system clock is unavailable or before the Unix epoch.
-    #[error("clock error: {0}")]
-    ClockError(#[from] crate::time::ClockError),
 }
 
 // ---------------------------------------------------------------------------
