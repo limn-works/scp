@@ -253,7 +253,137 @@ This eliminates third-party infrastructure entirely. The backchannel coordinatio
 
 SCP's 4-tier strategy is more structured and production-oriented. GNUnet's probabilistic burst is more ambitious in eliminating infrastructure dependency. The key insight from GNUnet is that **backchannel-coordinated simultaneous connection attempts** can replace STUN for symmetric NAT scenarios — the backchannel being any existing communication path (in SCP's case, the relay itself).
 
-### 11.3.5 Transport Architecture
+### 11.3.5 GNS (GNU Name System)
+
+GNS is GNUnet's censorship-resistant, decentralized naming system — a replacement for DNS that eliminates hierarchical authority and prevents zone enumeration by construction. Standardized as RFC 9498 (November 2023), it is the most formally specified component of the GNUnet ecosystem and the most directly comparable to SCP's DID-based identity resolution.
+
+**Core construction: Zone Key Derivation Function (ZKDF).** Each GNS zone is controlled by a single keypair (Ed25519 or ECDSA). The zone's public key serves as its identifier — analogous to how a did:dht DID string IS the public key. The critical innovation is per-label key blinding via ZKDF:
+
+1. For each record label (e.g., "www"), derive a blinding factor: `h = HKDF-SHA512(salt=label, ikm=zone_key)`
+2. Compute the derived key: `derived_key = h * zone_key` (elliptic curve point multiplication)
+3. DHT queries use `SHA-512(derived_key)` as the lookup key
+
+This means an observer who sees a DHT query for `SHA-512(derived_key)` cannot determine which zone or label it corresponds to without knowing both the zone key and the label. Two records in the same zone produce unrelated DHT keys. Zone enumeration — trivial in DNS via AXFR or NSEC walking — is computationally infeasible in GNS.
+
+**Record encryption at rest.** GNS records stored in the DHT are encrypted, not merely signed:
+
+| Zone key type | Record encryption | Key derivation |
+|---------------|-------------------|----------------|
+| **PKEY** (ECDSA) | AES-256-CTR | HKDF-SHA256 from ECDH(zone_private_key, derived_public_key) |
+| **EDKEY** (EdDSA) | XSalsa20-Poly1305 | HKDF-SHA512 from zone key + label |
+
+A DHT node storing GNS records sees only encrypted blobs keyed by opaque hashes. It cannot read the records, determine the zone they belong to, or enumerate other records in the zone. This is a stronger privacy property than any DID method provides — DID documents are readable by anyone who knows the DID string.
+
+**Petname system and Zooko's triangle.** GNS makes an explicit choice in Zooko's triangle — the observation that naming systems can provide at most two of three properties:
+
+| Property | DNS | GNS | ENS | did:dht (SCP) |
+|----------|-----|-----|-----|---------------|
+| **Secure** (not spoofable) | Weak (DNSSEC optional, CAs fallible) | Yes (ZKDF + self-certifying zones) | Yes (smart contract finality) | Yes (BEP44 self-certification) |
+| **Memorable** (human-readable) | Yes (example.com) | Yes (petnames: "Alice's blog") | Yes (vitalik.eth) | No (did:dht:z6Mk...) |
+| **Global** (unique, universal) | Yes (ICANN hierarchy) | No (petnames are local) | Yes (Ethereum global state) | Yes (DHT global key) |
+
+GNS chose secure + memorable, sacrificing global uniqueness. Names are meaningful only within a local trust context — Alice's "bob" is a petname she assigned and has no meaning to Carol. Hierarchical delegation (alice.bob.gnu means "look up 'alice' in the zone that 'bob' points to in the GNU zone") provides path-based navigation but not global resolution.
+
+SCP chose secure + global, sacrificing memorability. did:dht identifiers are cryptographic strings that no human will remember, but they resolve identically for every resolver worldwide. SCP compensates with display names in DID documents and context-level naming — but the identifiers themselves are opaque.
+
+ENS achieved all three by accepting the trade-off of requiring a blockchain (Ethereum) as global state — introducing infrastructure dependency that both GNS and SCP reject.
+
+**GNS2DNS / DNS2GNS interop.** GNS includes bidirectional DNS bridge records:
+
+- **GNS2DNS** records delegate a GNS label to a DNS name, allowing GNS zones to reference DNS infrastructure (`www.alice.gnu → www.example.com via DNS`)
+- **DNS2GNS** requires configuring a DNS nameserver to forward queries to a GNS resolver, enabling DNS clients to reach GNS zones
+
+This interoperability layer means GNS can gradually coexist with DNS rather than requiring wholesale replacement. SCP has no equivalent bridge — DID resolution and DNS resolution are entirely separate systems with no cross-protocol delegation mechanism.
+
+**Comparison: GNS vs SCP DID resolution**
+
+| Dimension | GNS (RFC 9498) | SCP DID (§3, §11.2) |
+|-----------|----------------|----------------------|
+| **Identifier** | Zone public key (Ed25519/ECDSA) | did:dht string (z-base-32 Ed25519) |
+| **Naming** | Petnames (local, memorable, non-global) | DID strings (global, unmemorable, unique) |
+| **Hierarchical delegation** | Yes (label.zone chains) | No (flat namespace) |
+| **Record privacy** | Encrypted at rest (ZKDF + AES/XSalsa20) | Plaintext DID documents (readable by anyone) |
+| **Zone enumeration** | Prevented by construction (ZKDF) | Trivial (DID documents are public) |
+| **DHT** | R5N (censorship-resistant routing) | Mainline (millions of nodes, simpler routing) |
+| **Revocation** | Argon2id proof-of-work (~4 days) | BEP44 sequence number + TTL expiry |
+| **Multi-key architecture** | No (one keypair per zone) | Yes (#0, #active, #agent, pre-rotation) |
+| **Capability delegation** | No | Yes (UCAN chains) |
+| **Attestation chains** | No | Yes (identity attestations to human accountability) |
+| **DNS interop** | Yes (GNS2DNS, DNS2GNS) | No |
+| **W3C DID compliance** | Via did:gns (LSD-0005) | Native (did:dht is a registered DID method) |
+| **Context-scoped identity** | No | Yes (pseudonym derivation per context, §9.10.2) |
+| **Standardization** | RFC 9498 (IETF) | did:dht spec (DIF) |
+
+**What GNS solves that SCP's DID layer does not:** Memorable naming through petnames and hierarchical delegation. Record encryption preventing observers from reading identity metadata. Zone enumeration prevention — no equivalent of crawling all DIDs in the DHT. DNS interoperability for gradual adoption. These are real gaps in SCP's identity model, accepted as trade-offs for global uniqueness, multi-key architecture, and W3C DID ecosystem compatibility.
+
+**What SCP's DID layer solves that GNS does not:** Multi-key verification methods with custody separation (identity key, human signing key, agent signing key, pre-rotation). UCAN capability delegation chains. Identity attestation linking agents to humans. Context-scoped pseudonyms preventing cross-context correlation. Dual-layer resolution (DHT + relay) with protocol-level healing. The massive Mainline DHT network (millions of nodes vs GNUnet's hundreds). These reflect SCP's accountability-first design vs GNS's privacy-first design.
+
+### 11.3.6 Protocol Translation (VPN/PT)
+
+GNUnet's VPN and Protocol Translation subsystem is the closest architectural parallel to SCP's transport adapter model. Both solve the same fundamental problem — bridging between heterogeneous protocol worlds — but at different layers: GNUnet at the IP layer, SCP at the message layer.
+
+**Three-component architecture:**
+
+| Component | Role |
+|-----------|------|
+| **gnunet-service-vpn** | Allocates virtual IP addresses from `10.x.x.x` / `fc00::/8` ranges, manages a TUN device, and routes packets between the local IP stack and GNUnet CADET tunnels |
+| **gnunet-service-dns** | Intercepts DNS queries via the TUN device, rewrites responses to point to virtual IPs assigned by the VPN service |
+| **gnunet-daemon-pt** | Protocol Translation daemon — connects to both VPN and DNS services, handles the actual DNS-ALG (Application Level Gateway) logic that transparently redirects application traffic into the overlay |
+
+**DNS-ALG mechanism.** The protocol translation operates transparently to applications:
+
+1. Application makes a DNS query (e.g., `example.com`)
+2. gnunet-service-dns intercepts the query via the TUN device
+3. gnunet-daemon-pt resolves the name (via GNS, DNS, or both) and determines whether the destination should be reached via the GNUnet overlay
+4. If yes: gnunet-service-vpn allocates a virtual IP (e.g., `10.0.0.42`) and the DNS response returns this virtual IP
+5. Application connects to `10.0.0.42` — the TUN device captures the traffic
+6. gnunet-service-vpn routes the packets through a CADET tunnel to the appropriate exit peer
+7. The exit peer forwards the traffic to the real destination on the conventional internet
+
+Applications require zero modification. Any program that uses DNS and TCP/UDP transparently routes through the GNUnet overlay. This is a capability SCP does not attempt — SCP operates at the application message layer and requires explicit integration.
+
+**Exit node architecture.** Any GNUnet peer can serve as an exit node by running gnunet-daemon-exit. Exit nodes:
+
+- Announce their services via the DHT (protocol type, port ranges)
+- Receive tunneled traffic via CADET and forward to the destination
+- Support both IPv4 and IPv6 forwarding
+- Can restrict which services they proxy (specific ports/protocols)
+
+This creates an organic relay network where any participant contributes forwarding capacity — similar to Tor's model but without the formal directory authority structure.
+
+**IPv4/IPv6 protocol translation.** The VPN service handles protocol translation at the IP boundary:
+
+- IPv4 applications can reach IPv6-only destinations (and vice versa) through GNUnet's virtual address allocation
+- The TUN device abstracts the actual protocol family — applications see whichever protocol they expect, regardless of the remote end
+- This solves a practical connectivity problem that most overlay networks (including SCP) do not address
+
+**GNS VPN records.** GNS integrates with the VPN subsystem through VPN resource records that define named tunnels:
+
+- A GNS VPN record contains: peer identity (Ed25519 key), protocol (TCP/UDP), service name or port
+- Resolving a GNS name with a VPN record automatically establishes a CADET tunnel to the specified peer
+- This unifies naming and transport — looking up a name implicitly provisions the connectivity, without the application needing to know about the overlay
+
+**Communicator process isolation.** GNUnet's Transport-NG architecture (discussed in §11.3.7) runs each transport mechanism as an independent communicator process. This provides fault isolation — a crash in the TCP communicator does not affect UDP connectivity. The lesson for protocol design: transport mechanisms should be independently deployable and independently recoverable. SCP's adapter trait achieves mechanism independence at the interface level but not at the process level — all adapters run in the same process.
+
+**Comparison: GNUnet VPN/PT vs SCP Transport Adapters**
+
+| Dimension | GNUnet VPN/PT | SCP Transport Adapters (§10.5) |
+|-----------|---------------|-------------------------------|
+| **Abstraction layer** | IP (packets via TUN device) | Messages (trait with send/subscribe/query) |
+| **Application modification** | None required (transparent DNS-ALG) | Required (must use SCP SDK) |
+| **Protocol bridging** | IP-layer: IPv4 ↔ IPv6, clearnet ↔ overlay | Message-layer: relay ↔ Matrix ↔ Nostr ↔ libp2p ↔ ... (17 adapters) |
+| **Exit/relay model** | Any peer can be exit node (DHT-announced) | Dedicated relay servers (untrusted, store-and-forward) |
+| **Naming integration** | GNS VPN records unify naming + transport | Separate concerns: DID resolution independent of transport |
+| **Fault isolation** | Per-communicator process isolation | In-process (trait implementations share process) |
+| **Encryption** | CADET tunnel encryption (ECDHE + AES-256 + Twofish) | MLS group encryption (application-layer) |
+| **Scope** | Full network stack replacement | Message delivery only |
+| **DNS interop** | Native (DNS-ALG, GNS2DNS) | None |
+
+**The key architectural parallel:** Both GNUnet VPN/PT and SCP's adapter model solve "how do you bridge between heterogeneous protocol worlds without coupling to any single one?" GNUnet answers at the IP layer — it intercepts all traffic transparently and tunnels it through the overlay, allowing any IP-speaking application to use GNUnet without modification. SCP answers at the message layer — it defines a transport-agnostic trait and implements adapters for each target protocol, requiring applications to use the SCP SDK but imposing no constraints on the underlying network.
+
+GNUnet's approach is more ambitious (zero application changes) but more invasive (requires TUN device, raw socket privileges, system-level DNS interception). SCP's approach is narrower (message delivery only) but more portable (no OS privileges, runs in browsers via WASM, works on mobile). The trade-off maps to the protocols' different scopes: GNUnet aims to be the entire network stack; SCP aims to be the interaction protocol that runs on top of any network stack.
+
+### 11.3.7 Transport Architecture
 
 GNUnet's transport evolved from monolithic plugins to separate **communicator** processes (Transport-NG):
 
@@ -267,14 +397,14 @@ GNUnet's transport evolved from monolithic plugins to separate **communicator** 
 
 GNUnet's communicator model offers one lesson SCP has already partially adopted: transport mechanism independence should be structural, not aspirational. SCP's 17 adapter types (§10.5) realize this.
 
-### 11.3.6 What SCP Borrows Conceptually
+### 11.3.8 What SCP Borrows Conceptually
 
 - **Infrastructure distrust.** Both protocols treat all infrastructure as potentially adversarial. GNUnet encrypts at every layer because any hop might be compromised. SCP encrypts at the message layer (MLS) and treats relays as untrusted dumb pipes. Different mechanisms, same principle.
 - **Relay as native transport.** GNUnet's DV routing makes relaying an inherent transport property. SCP's Tier 3 bridge relay serves the same function — when direct connection fails, relay forwarding is a seamless fallback, not an external service.
 - **NAT as first-class problem.** Both protocols treat NAT traversal as a core protocol concern, not an application-layer afterthought. GNUnet's multiple traversal mechanisms and SCP's 4-tier reachability strategy both reflect this.
 - **DHT for peer discovery.** Both use DHT-based discovery (R5N vs Mainline) as a decentralized alternative to centralized registries.
 
-### 11.3.7 Why SCP Does Not Adopt GNUnet's Approach
+### 11.3.9 Why SCP Does Not Adopt GNUnet's Approach
 
 **Overlay coupling.** GNUnet IS the network — it replaces conventional transport with its own stack. SCP's transport independence tenet (§10.5) requires running on top of existing transports. Coupling to GNUnet's overlay would make SCP a GNUnet application rather than a transport-independent protocol.
 
@@ -284,19 +414,21 @@ GNUnet's communicator model offers one lesson SCP has already partially adopted:
 
 **Maturity.** GNUnet has been in development for 25+ years and remains explicitly experimental ("significant bugs and critical design flaws" per project documentation). No production deployments at scale. SCP cannot depend on experimental infrastructure for core protocol functions.
 
-### 11.3.8 Open Questions
+### 11.3.10 Open Questions
 
 GNUnet's **probabilistic burst NAT traversal** technique — backchannel-coordinated simultaneous multi-port connection attempts — could improve SCP's Tier 2 coverage for symmetric NATs without introducing STUN/TURN infrastructure dependency. See discussion #1380 for ongoing evaluation.
 
 R5N's **randomized routing** and **path recording** offer censorship resistance properties that standard Mainline DHT lacks. If state-level DID resolution suppression becomes a practical threat, R5N's techniques could inform a more resilient resolution fallback alongside SCP's existing dual-layer approach (§3.10).
 
-### 11.3.9 References
+### 11.3.11 References
 
 - Polot & Grothoff, "CADET: Confidential Ad-hoc Decentralized End-to-End Transport," Med-Hoc-Net 2014
 - Evans & Grothoff, "R5N: Randomized Recursive Routing for Restricted-Route Networks," NSS 2011
 - Mueller, Evans & Grothoff, "Autonomous NAT Traversal," 2010
 - Grothoff, "The GNUnet System," Habilitation thesis, Inria
 - IETF draft-schanzen-r5n-01 (R5N specification)
+- Wachs, Schanzenbach & Grothoff, "A Censorship-Resistant, Privacy-Enhancing and Fully Decentralized Name System," CANS 2014
+- RFC 9498: The GNU Name System (GNS specification, IETF)
 - LSD-0001 (GNS specification), LSD-0005 (did:gns), LSD-0007 (Communicators), LSD-0012 (CAKE)
 
 ---
