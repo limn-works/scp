@@ -22,6 +22,22 @@
 
 **Holepunch** (github.com/holepunchto) builds open-source P2P infrastructure: Hyperswarm (DHT + UDP hole punching), Hypercore (append-only signed logs), Autobase (multi-writer via causal DAG linearization), Keet (production P2P encrypted chat), Pear (P2P app runtime on Bare, a minimal JS runtime). Keet is a shipping product — proof that zero-server P2P chat works at scale.
 
+### 11.1.0 Dat Protocol Origins
+
+The Dat Protocol (2013) is the direct ancestor of the Hypercore stack described in the subsections that follow. Understanding the evolution — and the governance dynamics that accompanied it — provides important context for SCP's design tenets.
+
+**Original motivation: scientific data sharing.** Max Ogden created Dat in August 2013 to solve a specific problem: how scientists collaborate on versioned datasets without centralized infrastructure. Early funding came from the Knight Foundation ($50k, March 2014) and the Sloan Foundation ($260k, July 2014; $640k, July 2015). Pilot projects included the Sloan Digital Sky Survey (astronomy), iRNA-Seq (bioinformatics), and Bionode (DNA sequencing). In May 2017, Code for Science and Society incorporated as a 501(c)(3) non-profit to steward the project, and the Moore Foundation awarded $200k for "Dat in the Lab" containerization research. The project was published in *Nature Scientific Data* (2018) as a peer-reviewed open research data tool — an unusual level of academic legitimacy for a P2P protocol.
+
+**Technical primitives.** Dat introduced several ideas that survived into Hypercore. Data archives were append-only logs signed with Ed25519 keypairs, verified via Merkle trees. The on-disk format, SLEEP (Syncable Ledger of Exact Events Protocol), used fixed-size entries with 32-byte headers — a compact representation that Hypercore later refined. Discovery keys — the hash of the archive's public key — allowed peers to find each other on the DHT without exposing the actual read key to the network, a privacy-by-default design. Dat DNS (DEP-0005) mapped human-readable domain names to cryptographic archive addresses via DNS TXT records or `/.well-known/dat` HTTPS endpoints, foreshadowing the kind of DNS-bridged discovery that SCP's DID resolution uses (§3.10).
+
+**The Beaker Browser and the user-writable web.** Paul Frazee's Beaker Browser (2016-2022) was Dat's most visible consumer application: an Electron-based browser that natively handled `dat://` URLs alongside `http://`. Any user could create a `dat://` website with one click, fork others' sites, and host content directly from their device — no server required. The vision was a user-writable web where publishing was as easy as browsing. Beaker reached version 1.0 in December 2020 (by then built on Hypercore Protocol rather than the original Dat wire format) before Paul Frazee archived the project in December 2022, citing maintainer burnout and the unsustainability of building a full browser-embedded P2P stack as a solo effort.
+
+**The evolution: Dat to Hypercore to Holepunch.** By 2020, the protocol had outgrown its command-line-tool origins. The core maintainers — led by Mathias Buus, who had been building Hypercore since 2016 — renamed the protocol layer from "Dat Protocol" to "Hypercore Protocol," creating a separate GitHub organization with an open RFC process. "Dat" persisted as a community label for the broader ecosystem (Cabal, Peermaps, Mapeo, Cobox). In 2022, Holepunch launched with funding from Tether and Bitfinex, with Mathias Buus leading development and Paolo Ardoino (Tether CEO) as Chief Strategy Officer. Modules migrated from the Hypercore Protocol GitHub organization to the Holepunch organization. Keet, the flagship P2P encrypted chat app, shipped as proof that the stack worked at production scale.
+
+**The community split.** The transition created a de facto fork in governance. The Dat Ecosystem (dat-ecosystem.org) continued as a self-organized community of independent P2P projects building on the shared technology — mostly self-funded, loosely coordinated, with no corporate patron. Holepunch became a commercially funded entity with a specific product roadmap (Keet, Pear runtime) and corporate stakeholders. The underlying open-source code remained available, but the locus of protocol development shifted to an organization with commercial interests. Community projects that depended on the stack found themselves downstream of decisions driven by product priorities rather than ecosystem needs.
+
+**Why this matters for SCP.** The Dat-to-Holepunch arc is a case study in protocol governance risk — specifically, what happens when a community protocol's core development gets commercialized. The technical artifacts survived the transition (Hypercore, Hyperswarm, the append-only log primitive), but the governance model changed fundamentally. SCP's "protocol requires no operator" tenet (§1) is partly informed by observing these dynamics: a protocol's long-term viability depends on the inability of any single entity — including its creators — to capture the development process. SCP achieves this through specification completeness (independent implementation from the spec alone), transport independence (no coupling to any single infrastructure), and self-contained identity resolution (no dependency on any organization's tooling or services — §11.2.4).
+
 ### 11.1.1 Structural Comparison: Hypercore vs SCP Event Logs
 
 Hypercore and SCP's event logs serve a structurally similar function: tamper-evident append-only history. The comparison is instructive because SCP took a well-understood primitive and embedded it in a richer security model.
@@ -433,7 +449,534 @@ R5N's **randomized routing** and **path recording** offer censorship resistance 
 
 ---
 
-## 11.4 What No Existing Standard Covers
+## 11.4 Freenet / Hyphanet
+
+**Freenet** (2000, Ian Clarke) is one of the oldest decentralized infrastructure projects, predating BitTorrent, Tor, and most modern P2P systems. Originally conceived in Clarke's 1999 University of Edinburgh thesis, Freenet is a censorship-resistant distributed data store where content is stored encrypted across participating nodes, retrieved by key, and persists based on demand rather than owner intent. In March 2023, the original Java codebase was spun off as **Hyphanet** under its existing maintainers, while Clarke's ground-up Rust rewrite (internally "Locutus," begun 2019) took the Freenet name as **Freenet 2023**. The comparison with SCP is instructive because both systems implement provider-blind encrypted storage, but optimize for fundamentally different threat models: Freenet for censorship resistance and publisher anonymity; SCP for governance, accountability, and provenance.
+
+### 11.4.1 Architecture
+
+Freenet operates as a distributed hashtable where participating nodes collectively pool storage to hold encrypted data blocks. Unlike Kademlia-based DHTs (used by BitTorrent, IPFS, GNUnet's R5N), Freenet does not use XOR-distance routing. Instead, each node is assigned a **location** — a floating-point value on a ring from 0.0 to 1.0 — and requests are routed greedily toward the node whose location is closest to the target key (also mapped to the 0.0–1.0 space).
+
+The network operates in two modes:
+
+- **Opennet.** Nodes connect to arbitrary peers discovered through the network. Topology optimization occurs via **path folding**: when a request succeeds, the requesting node may form a direct connection to the responding node, progressively organizing the network so that topologically close nodes hold nearby locations.
+- **Darknet (friend-to-friend).** Nodes connect only to manually-specified trusted peers. Because the social graph is fixed, topology optimization occurs via **location swapping**: nodes periodically exchange locations using the Metropolis–Hastings algorithm, minimizing the distance between connected peers. This creates a routable small-world network from an arbitrary trust graph — the key insight from Oskar Sandberg's work on distributed routing in small-world networks.
+
+Requests carry a **Hops-to-Live (HTL)** counter, starting at 18, decremented at each hop. Data is cached along the return path, with caching suppressed for the first 2–3 hops (HTL > 15–16) to prevent nodes from identifying their immediate neighbors' requests. Data blocks are fixed-size: 32 KB for content blocks (CHK), 1 KB for signed metadata blocks (SSK).
+
+### 11.4.2 Key Types
+
+Freenet's key system reflects its design as a content-addressed, publisher-anonymous data store:
+
+| Key Type | Full Name | Purpose | Mutability | Size | Integrity |
+|----------|-----------|---------|------------|------|-----------|
+| **CHK** | Content Hash Key | Static files | Immutable — hash of encrypted content IS the key | 32 KB blocks | SHA-256 self-verifying |
+| **SSK** | Signed Subspace Key | Updateable content | Mutable — owner holds signing keypair | 1 KB blocks | RSA-2048 signature + SHA-256 |
+| **USK** | Updatable Subspace Key | Versioned sites | SSK with version counter; clients probe for latest | 1 KB blocks | Inherits SSK verification |
+| **KSK** | Keyword Signed Key | Human-readable names | Mutable — key derived from passphrase | 1 KB blocks | Weak (anyone with passphrase can overwrite) |
+
+A CHK is `CHK@<SHA-256-hash>,<decryption-key>,<flags>`. The hash covers the encrypted content, so any node along the routing path can verify integrity by re-hashing — a hostile node altering data under a CHK is detected immediately. The decryption key is separate from the routing key: nodes route and cache content they cannot read.
+
+SSKs use an asymmetric keypair (RSA-2048 for signing, 256-bit symmetric for encryption). The public key hash serves as the routing key; only the private key holder can publish updates. Nodes verify signatures but cannot decrypt content (the symmetric key travels only in the URI, not in the routed data). USKs layer a version number atop SSKs, enabling clients to probe incrementally for the latest version — Freenet's mechanism for updateable content in an otherwise content-addressed system.
+
+### 11.4.3 Content Lifecycle — The Sharpest Contrast
+
+This is where Freenet and SCP diverge most fundamentally.
+
+**Freenet: demand-driven persistence, no deletion.**
+
+- Content persists based on popularity. Popular content is replicated across many nodes (each hop caches a copy); unpopular content gradually expires as nodes reclaim storage for more-requested data.
+- Once published, the publisher **cannot delete content**. There is no delete operation. The publisher's identity is unknown to the network. The only mechanism for content removal is collective disinterest — if nobody requests it, nodes eventually discard it to free space.
+- Content is not permanent in the absolute sense (the network's total storage is finite and least-requested data is evicted), but it is **uncontrollable** — the publisher has no lifecycle authority after insertion.
+
+**SCP: governed lifecycle, explicit deletion.**
+
+- Content lives within contexts (§5). Contexts have governance models (§5.9) that define who can publish, modify, and delete content.
+- Content deletion is a governed action. Context administrators can remove content. Members can be removed, and their access revoked — MLS group key rotation ensures removed members cannot read future messages (forward secrecy), and the sender-side key layer (§9.16) enables retroactive per-sender blocking.
+- Content access is cryptographically bounded. Without the MLS group key, content is unreadable. Membership revocation is immediate and cryptographic, not dependent on network-wide cooperation.
+
+| Dimension | Freenet / Hyphanet | SCP |
+|-----------|-------------------|-----|
+| Persistence model | Demand-driven; popular content lives, unpopular expires | Governed; explicit lifecycle within contexts |
+| Deletion | Impossible by publisher; only via collective disinterest | Governed action; admin-controlled with cryptographic enforcement |
+| Publisher control after insertion | None | Full, within governance rules |
+| Access revocation | Impossible — decryption key is in the URI | MLS key rotation + sender-side key denial (§9.16) |
+| Content discovery | Global — any node can request any key | Context-scoped — content exists within bounded, encrypted spaces |
+| Optimizes for | Censorship resistance | Accountability and governance |
+
+Freenet's model is coherent for its threat model: if content can be deleted by its publisher, a coerced publisher becomes a censorship vector. SCP's model is coherent for its threat model: if content cannot be governed, contexts become ungovernable. Neither is wrong — they address different problems.
+
+### 11.4.4 Identity and Anonymity
+
+Freenet provides **publisher anonymity** by design. When content is inserted, it propagates through multiple hops, each node caching a copy. After insertion completes, the publishing node can disconnect entirely — the content exists in the network without any traceable link to its origin. Retrievers are similarly anonymous: a node forwarding a request is indistinguishable (in theory) from the node that originated it, because the HTL counter has a probabilistic start (it may or may not decrement on the first hop).
+
+Freenet's identity system is minimal and optional:
+
+- **No protocol-level identity.** Nodes have cryptographic identities (for link-level encryption using JFki/Diffie-Hellman), but these are transport identities — they identify network participants, not content authors.
+- **Web of Trust (WoT) plugin.** An application-layer identity and reputation system built atop Freenet's storage. Identities are SSK keypairs. Trust is expressed as numeric scores propagated through a social graph, weighted by graph distance. WoT exists primarily as a **spam filter** — in an anonymous network where attackers cannot be blocked by address, trust scores determine whose content is downloaded and displayed. WoT is a plugin, not a protocol primitive.
+- **Darknet trust.** In darknet mode, connections themselves encode trust (you connect only to people you know), but this is network-level trust, not content-level identity.
+
+SCP's identity model is the architectural inverse:
+
+| Dimension | Freenet / Hyphanet | SCP |
+|-----------|-------------------|-----|
+| Identity layer | Optional plugin (WoT) | Protocol primitive (DID, §3) |
+| Anonymity | Publisher anonymous by default | Provenance everywhere (§24) — all non-private data carries verifiable origin |
+| Accountability | None by design — the point is untraceability | Human accountability tenet — every agent traces to a human DID through attestation chains |
+| Trust model | WoT: numeric scores, social graph distance, spam filtering | DID + UCAN capabilities + context governance + participation records (§3, §4, §5.3, §7) |
+| Key management | Single keypair per identity (WoT) | Multi-key architecture: identity key (#0), human signing (#active), pre-rotation, agent (#agent) (§3.9) |
+
+The fundamental divergence: Freenet treats identity as a threat to be minimized (identity enables censorship). SCP treats identity as infrastructure to be built on (identity enables governance, trust, and provenance).
+
+### 11.4.5 Routing
+
+Freenet's routing is distinctive among P2P systems. Where Kademlia (used by BitTorrent, IPFS) uses XOR-distance in a 160-bit keyspace with structured k-buckets, and GNUnet's R5N adds a random-walk prefix to handle NAT-restricted topologies, Freenet maps everything to a continuous 0.0–1.0 ring and routes greedily.
+
+**Darknet routing** is based on Kleinberg's small-world model. Sandberg (2006) showed that if a social network has small-world properties (most connections local, a few long-range), then the Metropolis–Hastings location-swapping algorithm can assign locations such that greedy routing achieves O(log^2 n) expected hops. The social graph's topology is fixed (users choose their friends); only the location assignments change. This is a simulated annealing process — nodes periodically propose location swaps to neighbors, accepting swaps that reduce total distance to neighbors (with probabilistic acceptance of worse swaps to escape local minima).
+
+**Opennet routing** uses path folding instead. When a request is answered, the requester may connect directly to the responder, folding the path. Over time, this organizes the network so that nearby locations cluster on nearby nodes. Path folding is less secure than location swapping (an attacker can selectively fold paths to position themselves near targets), but it works without pre-existing trust relationships.
+
+**Comparison with structured DHTs:**
+
+| Property | Kademlia (BitTorrent, IPFS) | R5N (GNUnet) | Freenet |
+|----------|-----------------------------|--------------|---------|
+| Keyspace | 160-bit, XOR distance | 256-bit, XOR distance | 0.0–1.0 ring, Euclidean distance |
+| Routing | Structured (k-buckets, iterative lookup) | Random-walk prefix + XOR routing | Greedy forwarding to nearest location |
+| Topology optimization | None (structure is the topology) | None (random walk handles NAT) | Location swapping (darknet) / path folding (opennet) |
+| NAT handling | Relay nodes, hole punching | Random-walk bypasses restricted routes | Darknet connections bypass NAT entirely (friend-to-friend) |
+| Hop count | O(log n) | O(log n) after random walk | O(log^2 n) theoretical; HTL max 18 in practice |
+| Caching | Nodes near key cache data | Path-based caching | Every hop caches (with HTL-based suppression near origin) |
+
+SCP does not implement its own routing algorithm. SCP's relay architecture (§10) is fundamentally different: relays are addressed directly (by URL), not discovered through a DHT. Content is routed by `routing_id` (SHA-256 of context ID), and relays store-and-forward encrypted blobs. SCP's transport independence (17 adapters, §10.5) means it can run atop Freenet, Kademlia, or any other routing substrate — but it does not depend on any of them.
+
+### 11.4.6 Storage Model — Provider-Blind Encrypted Storage
+
+Freenet's storage model has a striking structural parallel with SCP's relay model:
+
+**Freenet:** Every participating node contributes disk space to a shared data store. Content is stored encrypted — nodes cannot determine what they are storing. This provides **plausible deniability**: a node operator cannot be held responsible for content they provably cannot inspect. The data store is a fixed-size LRU cache; when full, the least-recently-requested data is evicted. Nodes have no say in what they store — data migrates toward nodes whose locations are near the data's key, driven entirely by request patterns.
+
+**SCP:** Relays store encrypted blobs they cannot read (§10). Relays are explicitly untrusted — they provide store-and-forward delivery but have no access to plaintext. MLS group keys (§9) are the access control mechanism, not relay-level permissions. Relays are, by design, "dumb pipes."
+
+| Dimension | Freenet Data Store | SCP Relay |
+|-----------|-------------------|-----------|
+| What is stored | Encrypted content blocks (32 KB CHK, 1 KB SSK) | Encrypted MLS messages and relay blobs (up to 256 KB) |
+| Who decides storage | Network demand (automatic caching) | Explicit publish by context members |
+| Storage duration | Demand-driven LRU; unpopular content expires | TTL-based (7 days for DID documents); context-governed for messages |
+| Provider can read content | No (encrypted with key not available to node) | No (MLS-encrypted; relay has no group key) |
+| Provider can identify content | Partially (key is visible; content is not) | Partially (routing_id is visible; content is not) |
+| Plausible deniability | Yes — design goal | Not a goal — relays are service providers, not anonymous participants |
+| Eviction policy | LRU — least requested data evicted first | Governance-controlled — context rules determine retention |
+
+The structural similarity — infrastructure that stores encrypted data it cannot read — is real. The motivation differs: Freenet encrypts for plausible deniability (protecting node operators from legal liability for stored content). SCP encrypts for access control (MLS group keys are membership; encryption is the authorization mechanism).
+
+### 11.4.7 What SCP Borrows Conceptually
+
+1. **Provider-blind storage.** The proof that distributed systems can operate reliably when storage providers cannot inspect what they store. Freenet demonstrated this at scale starting in 2000; SCP's relay model (§10) applies the same principle with different motivation (access control rather than deniability).
+
+2. **Content-addressed integrity verification.** CHKs — where the hash of the content IS the address — established that any intermediary can verify data integrity without being able to read the data. SCP uses content-addressed hashing for event log integrity (Merkle trees), DID document verification (BEP44 self-certification), and blob integrity in relay storage.
+
+3. **Distributed encrypted storage works at scale.** Freenet has operated continuously since 2000 with thousands of nodes, proving that encrypted distributed storage is not merely theoretical. This is an existence proof SCP relies on — not in architecture, but in confidence that the category of "provider-blind storage" is viable at scale.
+
+4. **Small-world self-organization.** Freenet's demonstration that a P2P network can self-organize into an efficient routing topology from arbitrary social graphs (via location swapping) informed the broader understanding of decentralized network design. SCP does not use small-world routing, but the principle that decentralized systems can achieve efficient structure without central coordination is foundational.
+
+### 11.4.8 Why SCP Diverges
+
+The divergences are not incremental — they reflect incompatible design axioms.
+
+**1. Content governance vs. content immortality.** Freenet's core promise is that published content cannot be censored or deleted. SCP's core promise is that content exists within governed contexts where lifecycle management, access revocation, and deletion are first-class operations. These are mutually exclusive design goals. A system that guarantees content cannot be deleted cannot also guarantee content can be governed. SCP chose governance.
+
+**2. Accountability vs. anonymity.** Freenet minimizes identity to maximize censorship resistance — if a publisher cannot be identified, they cannot be coerced. SCP maximizes identity to enable trust — every participant has a verifiable DID, every agent traces to a human through attestation chains, every action carries provenance. Freenet's WoT plugin adds optional identity; SCP's DID layer is mandatory infrastructure. The protocol tenets are incompatible: "provenance everywhere" cannot coexist with "publisher anonymity by default."
+
+**3. Bounded contexts vs. global datastore.** Freenet is a global, flat keyspace — any node can request any key. There is no concept of access boundaries, membership, or scope. SCP's security boundary is the context (§5): a bounded, encrypted, governed space where membership is enforced by MLS group keys. Content in a context is invisible to non-members — not because it is hidden in a global store, but because it does not exist outside the context's cryptographic boundary.
+
+**4. Transport independence vs. integrated network.** Freenet IS a network — its routing, storage, and retrieval are tightly coupled into a single P2P overlay. SCP is transport-agnostic (§10.5): 17 adapters, including WebSocket, HTTP, libp2p, Nostr, MQTT, and potentially Freenet itself. SCP could use Freenet as a transport adapter without depending on it. Freenet cannot use SCP as a transport layer — the coupling goes in one direction.
+
+**5. Async delivery vs. synchronous retrieval.** Freenet retrieval requires at least some path of online nodes between requester and data. SCP's relay architecture provides store-and-forward async delivery — messages are delivered even when recipients are offline, with three-tier degradation (§23). This is a fundamental architectural difference: Freenet is a retrieval system; SCP is a communication system.
+
+### 11.4.9 Freenet 2023 (formerly Locutus)
+
+In 2019, Ian Clarke began a ground-up rewrite of Freenet in Rust. Originally codenamed "Locutus," it was rebranded as Freenet in March 2023 when the original Java codebase was spun off as Hyphanet. Freenet 2023 is architecturally distinct from Hyphanet — backward compatibility was deemed impractical.
+
+**Key architectural changes:**
+
+- **Contract-based computation.** Freenet 2023 is a global key-value store where keys are WebAssembly contracts. Contracts define validity rules, modification permissions, and synchronization logic. This transforms Freenet from a "decentralized hard drive" (Hyphanet) into a "decentralized computer" (Freenet 2023). Contracts implement the `ContractInterface` trait, with state forming a **commutative monoid** — updates can be applied in any order and produce the same final state, achieving eventual consistency without consensus protocols or proof-of-work.
+- **Delegates for private state.** Delegates are local WebAssembly components that hold secrets and perform sensitive operations. Applications never see private keys directly — delegates sign and decrypt on behalf of the application. This separation of public state (contracts, replicated) and private state (delegates, local) is structurally parallel to SCP's separation of context state (encrypted, distributed via relays) and key custody (local, hardware-backed, §8).
+- **Subscription-based real-time updates.** Clients can subscribe to contracts and receive notifications when state changes. Subscription trees form automatically along routing paths, enabling real-time propagation. This is a departure from Hyphanet's request-response model and moves closer to SCP's relay subscription model (where clients subscribe to routing IDs for real-time message delivery).
+- **Synchronization via deltas.** Contracts define `summarize_state`, `get_state_delta`, and `update_state` functions. Peers exchange compact summaries, identify divergences, and transfer only deltas. This is analogous to SCP's MLS epoch-based synchronization, though SCP's approach is protocol-defined rather than application-defined.
+
+**Relevance to SCP's context model:** Freenet 2023's contracts share a conceptual surface area with SCP's contexts — both are bounded computational spaces with defined rules for state mutation. The differences are significant: SCP contexts have cryptographic membership (MLS), governance models (§5.9), capability-based authorization (UCAN, §4), and identity-bound participation. Freenet 2023 contracts have WebAssembly-defined validation logic but no built-in membership, governance, or identity primitives — these must be implemented per-contract by application developers.
+
+Freenet 2023's delegate model — where private keys are held locally and operations are performed through a message-passing interface — parallels SCP's key custody architecture (§8), where custody backends (Secure Enclave, Android Keystore, file-based) hold signing keys and perform operations on behalf of the protocol layer. Both systems recognize that private key material must never leave a trust boundary; they differ in how that boundary is defined (WebAssembly sandbox vs. hardware-backed custody).
+
+As of early 2026, Freenet 2023 has a working peer network, contract execution, and a demonstration chat application (River), but remains in active development with limited production deployment compared to Hyphanet's 25-year operational history.
+
+### 11.4.10 References
+
+1. Clarke, I. (1999). *A Distributed Decentralised Information Storage and Retrieval System.* Unpublished undergraduate thesis, Division of Informatics, University of Edinburgh.
+2. Clarke, I., Sandberg, O., Wiley, B., & Hong, T. W. (2001). Freenet: A Distributed Anonymous Information Storage and Retrieval System. In H. Federrath (Ed.), *Designing Privacy Enhancing Technologies*, Lecture Notes in Computer Science, vol. 2009, pp. 46–66. Springer.
+3. Clarke, I., Sandberg, O., Toseland, M., & Verendel, V. (2010). Private Communication Through a Network of Trusted Connections: The Dark Freenet. Manuscript, https://www.hyphanet.org/assets/papers/freenet-0.7.5-paper.pdf
+4. Sandberg, O. (2006). Distributed Routing in Small-World Networks. In *Proceedings of the 8th Workshop on Algorithm Engineering and Experiments (ALENEX)*, pp. 144–155. SIAM.
+5. Kleinberg, J. (2000). The Small-World Phenomenon: An Algorithmic Perspective. In *Proceedings of the 32nd ACM Symposium on Theory of Computing (STOC)*, pp. 163–170.
+6. Evans, N. S., & GauthierDickey, C. (2007). Routing in the Dark: Pitch Black. In *Proceedings of the 23rd Annual Computer Security Applications Conference (ACSAC)*, pp. 305–314.
+7. Freenet Project. (2026). Freenet Manual: Components. https://freenet.org/resources/manual/components/
+8. Hyphanet Project. (2026). Hyphanet Wiki: Security Summary. https://github.com/hyphanet/wiki/wiki/Security-summary
+
+---
+
+## 11.5 Tahoe-LAFS
+
+**Tahoe-LAFS** (Tahoe Least-Authority File Store) is an open-source, decentralized, cryptographically secure distributed file system created by Zooko Wilcox-O'Hearn and Brian Warner. Originally developed at allmydata.com (2006-2009) as a commercial backup service, it was released as open-source software and became the reference implementation of provider-independent, capability-secured storage. The foundational paper was presented at ACM StorageSS 2008 (Wilcox-O'Hearn & Warner, "Tahoe: the least-authority filesystem," Proceedings of the 4th ACM International Workshop on Storage Security and Survivability, 2008, pp. 21-26). Tahoe-LAFS is the most complete real-world application of object-capability security principles to distributed storage, and the intellectual ancestor of the capability-based authorization model that SCP inherits through UCAN.
+
+### 11.5.1 The Principle of Least Authority
+
+The "LAFS" in the name is literal: the system is designed around the principle of least authority (POLA) — every component has exactly the minimum power required for its function, enforced by cryptography rather than policy. Storage servers cannot read the data they store. Clients cannot modify data they have only read access to. Repairers can reconstruct missing shares without decrypting content. The system's security properties hold even if every storage server is adversarial.
+
+This is the same design principle that informs SCP's relay architecture. Both protocols begin from the premise that infrastructure operators should have no access to the data they handle:
+
+| Principle | Tahoe-LAFS | SCP |
+|-----------|------------|-----|
+| **Operator access to content** | None — servers store encrypted, erasure-coded shares | None — relays store encrypted MLS blobs |
+| **Enforcement mechanism** | Client-side encryption + capability URIs | MLS group keys + UCAN tokens |
+| **What operators see** | Opaque ciphertext shares indexed by storage index | Opaque ciphertext indexed by pseudonym-derived routing IDs (§9.10.2) |
+| **Can operators deny service?** | Yes (availability threat) | Yes (availability threat) |
+| **Can operators read content?** | No (encryption at client) | No (MLS encryption at sender) |
+| **Can operators modify content?** | Detectable (Merkle hash verification) | Detectable (MLS authenticated encryption) |
+| **Redundancy model** | k-of-n erasure coding across storage nodes | Multi-relay publishing for suppression resistance (§9.9.2) |
+
+The shared insight: the math enforces access control, not the infrastructure. Infrastructure is treated as an adversarial commodity. This is "provider-independent security" in Tahoe's terminology and "dumb-pipe relays" in SCP's.
+
+### 11.5.2 Capability Model
+
+The capability model is the centerpiece of Tahoe-LAFS and the most important comparison with SCP. In Tahoe, a capability (cap) is a cryptographic URI string that simultaneously provides both **location** (where to find the data on the grid) and **identification** (proof that the retrieved data is authentic). Possessing the cap IS the authorization — there is no access control list, no identity check, no server-side permission enforcement. The cap is an unforgeable bearer token.
+
+#### Capability Types
+
+Tahoe defines 13 capability types across two categories (filecaps and dircaps), organized in a derivation hierarchy where stronger capabilities can derive weaker ones (called "diminishing") but never the reverse:
+
+**Immutable files:**
+
+| Cap Type | URI Prefix | Contains | Grants |
+|----------|-----------|----------|--------|
+| Read-cap | `URI:CHK:` | 16-byte AES read key + SHA-256 hash of URI Extension Block | Decrypt and read file content |
+| Verify-cap | `URI:CHK-Verifier:` | Storage index + UEB hash (no read key) | Verify integrity of ciphertext shares without reading plaintext |
+| Literal | `URI:LIT:` | File content inline (files <= 55 bytes) | Read (content embedded in cap itself) |
+
+The read key is a 16-byte AES key. The storage index (the address used to locate shares on the grid) is derived by hashing the read key with SHA-256d and a single-purpose tag. This means: knowing the read key lets you derive the storage index (and thus locate + decrypt the file), but knowing the storage index does not let you derive the read key (and thus you can verify shares but not decrypt them). The one-way derivation chain is:
+
+```
+read_key → SHA-256d → storage_index → (locate shares, verify integrity)
+read_key → AES-CTR decrypt → plaintext
+```
+
+**Mutable files (SSK — from Freenet's "Sub-Space Keys"):**
+
+| Cap Type | URI Prefix | Contains | Grants |
+|----------|-----------|----------|--------|
+| Write-cap | `URI:SSK:` | 16-byte AES write key + verification key hash | Read + write (update file content) |
+| Read-cap | `URI:SSK-RO:` | 16-byte AES read key + verification key hash | Read (decrypt current version) |
+| Verify-cap | `URI:SSK-Verifier:` | Storage index + verification key hash | Verify integrity without reading |
+
+Mutable files add RSA-2048 for asymmetric signing. The derivation chain is:
+
+```
+RSA-2048 private key (signature key)
+  → hash + truncate to 16 bytes → write_key (encrypts the RSA private key in shares)
+    → hash + truncate to 16 bytes → read_key (encrypts/decrypts file content)
+      → hash + truncate to 16 bytes → storage_index (locates shares on grid)
+
+RSA-2048 public key (verification key)
+  → SHA-256 → verification_key_hash (included in all URIs for integrity binding)
+```
+
+Each derivation step is a one-way hash truncation. A write-cap holder can derive the read-cap and verify-cap. A read-cap holder can derive only the verify-cap. A verify-cap holder can verify share integrity but neither read nor write. The write key encrypts the RSA private key within shares; the read key encrypts the file content. This separation means the RSA private key (and thus write authority) is protected by a different symmetric key than the content itself.
+
+**Directories** mirror the file hierarchy: mutable directory write-cap (`URI:DIR2:`), read-cap (`URI:DIR2-RO:`), verify-cap (`URI:DIR2-Verifier:`), plus immutable variants. Directories are implemented as mutable files whose content is a serialized mapping of child names to child capabilities. Read-only access to a directory is transitively read-only — you cannot extract write-caps for children from a read-only directory cap.
+
+#### The Repaircap: Least Privilege in Action
+
+Tahoe's repair mechanism demonstrates the capability model's granularity. A repairer receives a cap that contains enough information to download shares, verify their integrity, reconstruct missing shares via erasure coding, and upload replacements — but cannot decrypt the file content. The repairer works entirely on ciphertext. This is the principle of least authority applied to infrastructure maintenance: the entity responsible for data durability has no access to data confidentiality.
+
+### 11.5.3 Capability Model Comparison: Tahoe-LAFS vs SCP UCAN
+
+Both Tahoe-LAFS and SCP use capability-based authorization where the bearer token (not an identity lookup) determines access. But the capability models differ fundamentally in structure, delegation, lifecycle, and scope.
+
+| Dimension | Tahoe-LAFS Capabilities | SCP UCAN Tokens |
+|-----------|------------------------|-----------------|
+| **Representation** | Cryptographic URI string (`URI:CHK:...`, `URI:SSK:...`) | Signed JWT (JSON Web Token with `ucv`, `iss`, `aud`, `att`, `exp` fields) |
+| **What it encodes** | Encryption key + content hash (location + identification) | Issuer DID + audience DID + capability set + expiration + proofs |
+| **Bearer semantics** | Pure bearer — anyone with the URI string has access | Audience-bound — only the `aud` DID can exercise the capability |
+| **Identity binding** | None — capabilities are anonymous | DID-bound — issuer and audience are cryptographically identified |
+| **Delegation** | None — you share the cap string, granting full access at that level | Native — `prf` (proof) field chains delegations; each link is a signed JWT |
+| **Attenuation** | One direction only: write → read → verify (diminishing) | Arbitrary: any capability subset, custom resources, narrower scope |
+| **Time-bounding** | None — caps are permanent while the data exists | Native — `exp` (expiration) and `nbf` (not-before) fields |
+| **Revocation** | Impossible — the cap is the key, and you cannot un-share a key | Revocation records (§7.3) checked at verification time |
+| **Scope** | Single file or directory | Context-scoped: `scp:ctx:{context_id}/{resource}:{action}` |
+| **Governance** | None — no concept of rules governing capability exercise | Full governance model: 28 action types, pluggable engines (§5.9) |
+| **Accountability** | None — caps are anonymous, no audit trail of who used them | Full — every action signed by a DID, recorded in event logs |
+| **Composability** | File-level only | Protocol-wide: identity + capability + context + governance |
+
+**The fundamental divergence:** Tahoe capabilities are static and anonymous. Once you have a read-cap, you have read access forever, and no one can tell who is reading. UCAN tokens are dynamic and identified. They expire, they can be revoked, they chain through identified delegators, and every exercise is attributable to a specific DID.
+
+This reflects the different problem domains. Tahoe secures data at rest — files on a grid. The threat model is the storage provider reading or modifying your files. Anonymity is a feature: the cap proves you are authorized without revealing who you are. SCP secures interaction — communication within governed contexts. The threat model includes unauthorized agents, capability escalation, and unattributable actions. Identity is a feature: the UCAN proves both that you are authorized AND who you are.
+
+Both inherit from the object-capability tradition (Dennis & Van Horn 1966, Mark Miller's E language, erights.org). The intellectual lineage runs: object-capability theory → Tahoe-LAFS (cryptographic capabilities for storage) → UCAN (cryptographic capabilities for authorization delegation) → SCP (capabilities embedded in a governance and identity framework). Tahoe proved that cryptographic capabilities work for decentralized access control without ACLs. UCAN added the delegation, attenuation, and identity-binding that real-world authorization requires. SCP embedded UCANs in a context-governed, MLS-encrypted interaction protocol.
+
+### 11.5.4 Provider-Independent Security
+
+Tahoe-LAFS coined the term "provider-independent security" to describe a property that goes beyond encryption:
+
+> "The service provider never has the ability to read or modify your data in the first place: never."
+
+This is not just "data is encrypted." It means:
+
+1. **Confidentiality** — the provider cannot read your data (AES encryption, key held only by client)
+2. **Integrity** — the provider cannot modify your data undetectably (Merkle hash trees, cap-embedded hashes)
+3. **Unforgeability** — the provider cannot create data that appears to be yours (RSA signatures for mutable files, content-hash binding for immutable files)
+
+The provider can deny service (refuse to store or serve shares). It cannot do anything else. All three properties derive from cryptographic constructions that the client performs independently of the server.
+
+SCP achieves the same three properties through different mechanisms:
+
+| Property | Tahoe-LAFS Mechanism | SCP Mechanism |
+|----------|---------------------|---------------|
+| **Confidentiality** | AES-128-CTR, key in client-held capability | MLS group key (AES-128-GCM), distributed via MLS key schedule |
+| **Integrity** | Merkle hash trees + SHA-256d, roots embedded in caps | MLS authenticated encryption (AEAD) + event log Merkle trees |
+| **Unforgeability** | RSA-2048 signatures (mutable files), content-hash binding (immutable) | Ed25519 signatures on MLS messages + UCAN chain verification |
+| **Relay/server access** | Sees encrypted shares + storage index | Sees encrypted blobs + pseudonym-derived routing IDs |
+| **Key management** | Embedded in capability URIs (no separate key distribution) | MLS key schedule (ratcheting, forward secrecy, post-compromise security) |
+
+The deepest parallel is the design philosophy: both protocols treat the infrastructure layer as an adversarial commodity service. Tahoe's storage servers are interchangeable, untrusted, and unaware of what they store. SCP's relays are interchangeable, untrusted, and unaware of what they forward. The client (Tahoe) or participant (SCP) performs all security-critical operations.
+
+Where SCP extends beyond Tahoe: MLS provides forward secrecy and post-compromise security — properties that Tahoe's static encryption keys cannot provide. Tahoe's AES key for a file is permanent; if it leaks, all past and future access to that file is compromised. MLS ratchets keys with each epoch, so compromise of a current key does not expose past messages, and removal of a compromised member restores confidentiality for future messages. This difference reflects storage (static) vs communication (evolving group membership).
+
+### 11.5.5 Erasure Coding and Redundancy
+
+Tahoe distributes each file across multiple storage nodes using erasure coding. The default parameters are:
+
+- **k = 3** — minimum shares needed to reconstruct the file
+- **N = 10** — total shares created
+- **H = 7** — minimum independent servers required for upload success ("servers of happiness")
+- **Expansion factor: 3.3x** — each file consumes 3.3x its plaintext size in storage
+
+The pipeline: plaintext → AES-CTR encryption → segmentation (128 KiB default) → erasure coding per segment → one block per segment per share → distribution across servers. Each share gets one block per segment, plus Merkle hash trees for verification.
+
+The erasure coding algorithm (zfec, based on Rizzo's FEC) means any k-of-N shares suffice for reconstruction. Up to (N - k) = 7 servers can fail simultaneously without data loss. The system can tolerate the loss of any 70% of its storage nodes.
+
+**Comparison with SCP's multi-relay architecture (§9.9.2):**
+
+| Dimension | Tahoe-LAFS Erasure Coding | SCP Multi-Relay Publishing |
+|-----------|--------------------------|---------------------------|
+| **Purpose** | Data durability — survive storage node failure | Message availability — survive relay failure or censorship |
+| **Mechanism** | k-of-N erasure coding (zfec) | Full message replication to multiple relays |
+| **Redundancy** | Encoded fragments — any k of N suffice | Full copies — any 1 of M relays suffice |
+| **Expansion cost** | 3.3x storage (tunable via k/N ratio) | Mx storage and bandwidth (M = number of relays) |
+| **Failure tolerance** | (N - k) simultaneous node failures | (M - 1) simultaneous relay failures |
+| **Reconstruction** | Client downloads k shares, decodes | Client reads from first available relay |
+| **Suppression resistance** | High — attacker must compromise >70% of nodes | High — attacker must compromise all relays (§9.9.2) |
+| **What's distributed** | Encoded ciphertext fragments | Complete encrypted messages |
+
+Tahoe's approach is more storage-efficient (3.3x vs Mx). SCP's approach is simpler (no erasure coding, no multi-share reconstruction). The difference reflects their domains: Tahoe must store large files durably for long periods, making encoding efficiency critical. SCP must deliver messages reliably in real time, making simplicity and latency critical. Erasure coding adds reconstruction latency; full replication provides instant availability from any relay.
+
+Tahoe's redundancy model offers one insight relevant to SCP: k-of-N encoding could improve SCP's relay-layer efficiency for large payloads (blob storage, file attachments). Instead of replicating a 100 MB file to 3 relays (300 MB total), erasure coding to 3-of-10 across 10 relays would use 330 MB but survive 7 relay failures instead of 2. This is an optimization opportunity, not a design necessity.
+
+### 11.5.6 Convergent Encryption
+
+Tahoe's convergent-key method computes the file's encryption key deterministically from its content:
+
+```
+encryption_key = SHA-256d(tag || encoding_params || convergence_secret || file_contents)[:16]
+```
+
+If two clients upload the same file with the same convergence secret, they produce the same ciphertext and the same capability URI. The file is stored once on the grid — deduplication without the server ever seeing the plaintext.
+
+The convergence secret is a per-client random value generated on first startup. By default, each client's files converge only with their own previous uploads. Sharing the convergence secret between clients enables cross-client deduplication but introduces two attacks:
+
+1. **Confirmation-of-a-file attack** — an adversary who knows both the convergence secret and a candidate plaintext can check whether that file exists on the grid (compute the expected cap, attempt download).
+2. **Learn-the-remaining-information attack** — if the adversary knows most of a file's content and the convergence secret, brute-forcing the remaining unknown bytes becomes an offline attack (no server interaction needed).
+
+Tahoe also offers a random-key method (non-convergent) for applications where deduplication is less important than privacy against these attacks.
+
+SCP has no equivalent of convergent encryption. MLS encryption keys are derived from the group key schedule, not from message content. Each message produces unique ciphertext even if the plaintext is identical. Deduplication is not a goal — in a communication protocol, message identity matters (the same text sent twice is two distinct messages with distinct timestamps and sequence numbers). Tahoe's convergent encryption is a storage optimization that is inapplicable to real-time communication.
+
+### 11.5.7 Mutable Files and Versioning
+
+Tahoe's immutable files are write-once: the capability is derived from the content, so changing the content changes the capability. Mutable files (SSK format) add updateability:
+
+- **RSA-2048 keypair** — the private key signs updates, the public key verifies them
+- **Sequence numbers** — 64-bit monotonic counter prevents rollback attacks
+- **Two formats:** SDMF (Small Distributed Mutable Files, single segment, entire file downloaded for any read) and MDMF (Medium Distributed Mutable Files, 128 KiB segments, partial reads/writes)
+- **Write coordination:** The "Prime Coordination Directive" warns that uncoordinated simultaneous writes can corrupt a file if competing versions exceed the erasure coding recovery threshold (S > N/k)
+- **Per-server write enablers:** `H(write_enabler_master + server_nodeid)` — each storage server gets a unique authorization token, preventing cross-server impersonation
+
+**Comparison with SCP event logs:**
+
+| Dimension | Tahoe Mutable Files | SCP Event Logs (§8) |
+|-----------|--------------------|--------------------|
+| **Mutability model** | Replace-in-place (latest version wins) | Append-only (events accumulate) |
+| **Signing** | RSA-2048 (single writer per file) | Ed25519 via MLS (multi-writer per context) |
+| **Multi-writer** | Discouraged — "Prime Coordination Directive" warns of corruption | Native — MLS group membership defines write authority |
+| **Versioning** | Sequence number (64-bit monotonic counter) | MLS epoch + generation + sequence triple |
+| **Conflict resolution** | Last-writer-wins (no CRDT, no merge) | Ordered by MLS epoch (no conflict — append-only) |
+| **Forward secrecy** | None — same RSA key for all versions | Yes — MLS key ratcheting per epoch |
+| **Rollback prevention** | Sequence number check | Merkle tree inclusion proofs |
+| **Write authorization** | Possession of write-cap (anonymous) | MLS membership + UCAN capability + governance check |
+
+Tahoe's mutable files are a storage primitive — they provide a single mutable slot with integrity and confidentiality. SCP's event logs are a richer structure: append-only (no destructive update), multi-writer with cryptographic membership enforcement, embedded in a governance framework that controls who can append what.
+
+### 11.5.8 Grid Architecture
+
+A Tahoe grid consists of three node types:
+
+1. **Introducer** — a coordination node that maintains the server roster. Servers announce themselves to the introducer; clients connect to receive the list of available servers. The introducer is a recoverable single point of failure: it is defined by a hostname and a private key, easily relocated. Once clients have the server roster, they maintain direct connections without the introducer.
+
+2. **Storage servers** — user-space processes that store shares (encrypted, erasure-coded fragments). Servers perform no cryptographic operations — no decryption, no signature verification, no erasure coding. They are deliberately simple: accept shares, serve shares, manage leases. This simplicity is a security feature — the server has no capability that could be exploited to compromise data.
+
+3. **Client nodes (gateways)** — the security-critical component. Clients perform all encryption, erasure coding, share distribution, Merkle tree computation, capability generation, and download reconstruction. Clients connect to every known server in a bi-clique topology. The client is the only component that handles plaintext or encryption keys.
+
+Server selection uses consistent permutation: `HASH(storage_index + nodeid)` sorts servers into a deterministic, per-file order, ensuring even distribution across the grid. Nodes communicate over TCP using Foolscap (the original protocol) or HTTPS (default since v1.19).
+
+**Comparison with SCP's architecture:**
+
+| Dimension | Tahoe-LAFS Grid | SCP Relay + Node Architecture |
+|-----------|----------------|------------------------------|
+| **Discovery** | Introducer (centralized roster) | DHT + relay layer + DID document service endpoints (§3.10, §18) |
+| **Infrastructure role** | Storage servers — store shares, serve shares, nothing else | Relays — receive blobs, deliver blobs, nothing else |
+| **Client role** | All crypto + erasure coding + share management | All crypto + MLS + governance + capability validation |
+| **Topology** | Bi-clique (every client → every server) | Subscription-based (participants subscribe to routing IDs on relays) |
+| **Protocol** | Foolscap / HTTPS | WebSocket (primary) + 17 transport adapters (§10.5) |
+| **Server intelligence** | Minimal — store/serve/lease | Minimal — receive/deliver/TTL |
+| **Single point of failure** | Introducer (recoverable) | None — DHT + multiple relays + relay fallback list (§18.5.1) |
+| **NAT traversal** | Requires Foolscap connection (bi-clique limited by NAT) | 4-tier reachability: port mapping, hole punching, bridge relay, domain TLS (§10.12) |
+
+Both architectures share the principle that infrastructure nodes (storage servers / relays) are deliberately stupid. All security-critical logic lives in the client. The main architectural difference is discovery: Tahoe uses a centralized introducer (simple, but a single point of failure); SCP uses decentralized multi-layer resolution (more complex, but no single point of failure).
+
+### 11.5.9 Zooko's Triangle
+
+Zooko Wilcox-O'Hearn, the co-creator of Tahoe-LAFS, is also the originator of Zooko's triangle (2001) — the conjecture that no single naming system can simultaneously achieve all three properties:
+
+1. **Secure** — names cannot be spoofed or hijacked
+2. **Human-meaningful** — names are memorable and readable
+3. **Decentralized** — names resolve without a central authority
+
+This is the same naming trilemma discussed in §11.3.5 (GNS). The connection between Tahoe-LAFS and Zooko's triangle is not merely biographical — the same person who identified the fundamental naming problem also built a system that sidesteps it entirely. Tahoe capabilities occupy the "secure + decentralized" edge: they are cryptographic strings that no human will memorize, but they are unforgeable and resolve without any authority. Tahoe does not attempt human-meaningful naming — it delegates that to the directory layer, where users create named hierarchies from capability-addressed files.
+
+SCP's DID approach makes the same trade-off: `did:dht:z6Mk...` strings are secure and globally unique but not human-meaningful. Like Tahoe, SCP compensates at the application layer (display names in DID documents, context-level naming). The parallel is exact: both systems choose cryptographic identifiers at the infrastructure layer and push human-readable naming to a higher layer.
+
+| System | Secure | Human-meaningful | Decentralized | Compensation |
+|--------|--------|-----------------|---------------|--------------|
+| **Tahoe-LAFS caps** | Yes (cryptographic) | No (opaque URIs) | Yes (no authority) | Directory hierarchy with named children |
+| **SCP DIDs** | Yes (self-certifying) | No (z-base-32 strings) | Yes (DHT-resolved) | Display names in DID documents, context naming |
+| **DNS** | Weak (DNSSEC optional) | Yes | No (ICANN hierarchy) | — |
+| **GNS** | Yes | Yes (petnames) | Yes (no authority) | Local only — not globally unique |
+| **ENS** | Yes | Yes | Partial (requires Ethereum) | Blockchain as global state |
+
+### 11.5.10 What SCP Borrows Conceptually
+
+Three ideas flow directly from Tahoe-LAFS into SCP's design:
+
+1. **Capability-based authorization without ACLs.** Tahoe proved that distributed systems can enforce access control using cryptographic bearer tokens rather than identity lookups or server-side permission lists. This is the foundation of SCP's UCAN model. The conceptual step from Tahoe caps to UCANs is: add identity binding (issuer/audience DIDs), add delegation chains (proof fields), add time-bounding (expiration), add revocation, add governance. But the core insight — the token IS the authorization, verified by cryptography not by asking a server — originates in this tradition.
+
+2. **Provider-independent security.** The principle that infrastructure operators should have zero access to the data they handle. Tahoe applied this to file storage (servers cannot read files). SCP applies it to message delivery (relays cannot read messages). Same principle, different scope. In both cases, the client/participant performs all encryption and the infrastructure handles only opaque ciphertext.
+
+3. **The math enforces access, not the infrastructure.** Tahoe's entire security model derives from the hardness of AES, SHA-256, and RSA — not from trusting servers to enforce permissions. SCP's security model derives from the hardness of AES-128-GCM (MLS AEAD), SHA-256 (Merkle trees, storage indices), and Ed25519 (signatures, DID binding) — not from trusting relays or governance servers. Both protocols are designed so that a fully adversarial infrastructure cannot compromise confidentiality or integrity. Only availability is at risk.
+
+The intellectual lineage: object-capability theory (Dennis & Van Horn 1966) → E language (Mark Miller 1997) → Tahoe-LAFS (Wilcox-O'Hearn & Warner 2007) → UCAN (Fission/Brooklyn Zelenka 2021) → SCP. Each step adds structure: E added language-level enforcement; Tahoe added cryptographic enforcement for distributed storage; UCAN added delegation, attenuation, and identity binding; SCP added governance, group encryption, and context isolation.
+
+### 11.5.11 Why SCP Diverges
+
+Despite the shared intellectual heritage, Tahoe-LAFS and SCP solve fundamentally different problems. The divergences are not deficiencies in either system — they reflect different domains.
+
+| Dimension | Tahoe-LAFS | SCP | Why Different |
+|-----------|------------|-----|---------------|
+| **Domain** | File storage (data at rest) | Communication (data in motion within governed contexts) | Storage is static; communication is dynamic with evolving group membership |
+| **Capability lifecycle** | Permanent — a cap grants access as long as the data exists | Time-bounded — UCANs expire, can be revoked, are governance-scoped | Communication requires temporal control; file access is typically permanent |
+| **Capability delegation** | None — share the URI string, that's it | Native — delegation chains with attenuation at each link | Communication requires scoped, auditable delegation; file sharing is simpler |
+| **Identity** | None — capabilities are anonymous bearer tokens | Core — every action traces to a DID, attestation chains to human accountability | Storage can be anonymous; communication in governed contexts requires accountability |
+| **Group communication** | None — Tahoe is single-user or share-the-cap | Native — MLS groups with add/remove/update, forward secrecy, post-compromise security | File storage does not require real-time group membership management |
+| **Governance** | None — no concept of rules, roles, or permissions beyond read/write/verify | 28 governance action types, pluggable engines, capability ceilings (§5.9) | File storage is ungoverned; collaborative communication requires governance |
+| **Forward secrecy** | None — static encryption keys per file | Yes — MLS key ratcheting per epoch | Static files do not benefit from key ratcheting; communication sessions do |
+| **Conflict resolution** | Last-writer-wins for mutable files | Append-only event logs — no conflict by construction | File replacement is a valid operation; message history is immutable |
+| **Transport** | Grid-specific (Foolscap/HTTPS between Tahoe nodes) | Transport-agnostic (17 adapters, §10.5) | File grids are a closed system; communication must bridge protocol worlds |
+| **Agent model** | No concept of AI agents | First-class — agents are UCAN-bounded participants with human accountability chains | 2007 design predates the agentic paradigm entirely |
+| **Provenance** | None beyond capability possession | Protocol-level — every action carries verifiable origin metadata (§24) | File access does not require provenance; agentic communication does |
+
+**The sharpest difference:** Tahoe capabilities are anonymous and permanent. This is correct for file storage — you want a link to a file to work forever, and you do not need to know who is reading it. SCP's UCAN tokens are identified and ephemeral. This is correct for communication — you need to know who is speaking, you need to bound how long a delegation lasts, and you need to revoke access when group membership changes.
+
+### 11.5.12 Least Authority, Zcash, and the Capability Lineage
+
+Zooko Wilcox-O'Hearn's trajectory after Tahoe-LAFS traces the evolution of capability thinking:
+
+- **2006-2009:** Co-created Tahoe-LAFS at allmydata.com with Brian Warner. Proved that cryptographic capabilities work for provider-independent distributed storage.
+- **2011:** Founded **Least Authority Enterprises** in Boulder, Colorado — a security consulting firm that performed audits for privacy and transparency projects (GlobalLeaks, Ethereum, and others). The company name is a direct reference to the principle of least authority that underpins Tahoe-LAFS.
+- **2016:** Co-founded **Zcash** (launched October 28, 2016) — a privacy-preserving cryptocurrency using zero-knowledge proofs (zk-SNARKs). Zcash applies the same principle at the transaction layer: the blockchain verifier never learns the transaction amounts or parties. Wilcox-O'Hearn served as CEO of the Electric Coin Company (Zcash's development organization) until December 2023.
+
+The thread connecting these projects: **cryptographic enforcement of minimal authority.** Tahoe-LAFS applies it to storage (the server cannot read your files). Zcash applies it to transactions (the network cannot see your payments). SCP applies it to communication (the relay cannot read your messages). The common denominator is that the infrastructure layer is denied authority over the data it processes, enforced by mathematics rather than policy.
+
+The direct intellectual lineage from Tahoe to UCAN runs through the broader object-capability community. Brooklyn Zelenka and the Fission team who created UCAN explicitly cite capability-based security principles. While UCAN was not derived from Tahoe-LAFS's code, it addresses the same fundamental question — "how do you authorize access in a decentralized system without a central authority?" — and arrives at the same answer: bearer tokens containing cryptographic material, where possession of the token is both necessary and sufficient for the authorized action.
+
+### 11.5.13 References
+
+- Wilcox-O'Hearn, Zooko & Warner, Brian. "Tahoe: the least-authority filesystem." *Proceedings of the 4th ACM International Workshop on Storage Security and Survivability (StorageSS '08)*, October 2008, pp. 21-26. doi:10.1145/1456469.1456474. Also: IACR Cryptology ePrint Archive, Paper 2012/524.
+- Tahoe-LAFS project documentation: https://tahoe-lafs.readthedocs.io/
+- Tahoe-LAFS source repository: https://github.com/tahoe-lafs/tahoe-lafs
+- Tahoe-LAFS capability specification: https://tahoe-lafs.org/trac/tahoe-lafs/wiki/Capabilities
+- Tahoe-LAFS file encoding specification: https://tahoe-lafs.readthedocs.io/en/latest/specifications/file-encoding.html
+- Tahoe-LAFS mutable file specification: https://tahoe-lafs.readthedocs.io/en/latest/specifications/mutable.html
+- Tahoe-LAFS architecture overview: https://tahoe-lafs.readthedocs.io/en/latest/architecture.html
+- Tahoe-LAFS convergence secret: https://tahoe-lafs.readthedocs.io/en/latest/convergence-secret.html
+- Wilcox-O'Hearn, Zooko. "Names: Distributed, Secure, Human-Readable: Choose Two." 2001. (Origin of Zooko's triangle.)
+- Miller, Mark S. "Robust Composition: Towards a Unified Approach to Access Control and Concurrency Control." PhD thesis, Johns Hopkins University, 2006. (Foundation of the object-capability model.)
+- Dennis, Jack B. & Van Horn, Earl C. "Programming Semantics for Multiprogrammed Computations." *Communications of the ACM* 9(3), March 1966, pp. 143-155. (Origin of capability-based security.)
+- UCAN specification: https://github.com/ucan-wg/spec
+
+---
+
+## 11.6 Cjdns / Yggdrasil
+
+Cjdns (2011, Caleb James DeLisle) and Yggdrasil (2018, Neil Alexander and Arceliar) are encrypted IPv6 overlay networks that share a foundational premise with SCP: your cryptographic key IS your identity. Both are network-layer protocols that replace traditional address allocation with public-key-derived addressing, creating mesh networks where every packet is encrypted and every address is self-certifying.
+
+### 11.6.1 Self-Certifying Addressing
+
+The core parallel with SCP is self-certifying identity. In cjdns, a node's IPv6 address is the first 16 bytes of SHA-512(SHA-512(Curve25519 public key)), constrained to the `fc00::/8` prefix (addresses whose double-hash does not start with `0xFC` are discarded, requiring brute-force key generation). In Yggdrasil, addresses fall within the `0200::/7` range (deprecated IETF space repurposed to avoid collisions with `fc00::/7`), derived from SHA-512 of the node's Ed25519 public key with a compression scheme that encodes the number of leading one-bits as a prefix byte.
+
+SCP's `did:dht:<z-base-32-Ed25519-public-key>` follows the same principle: the identifier IS the public key, no registration authority required, collision-resistant by construction. The difference is representational — cjdns and Yggdrasil encode keys as IPv6 addresses (lossy truncation), SCP encodes them as DID strings (lossless z-base-32). All three systems achieve the same property: verifying an identity requires only the identifier itself.
+
+### 11.6.2 Routing
+
+Cjdns and Yggdrasil take different approaches to the same problem — routing without centralized infrastructure:
+
+- **Cjdns** uses Kademlia-inspired DHT routing with an XOR distance metric over the address space. The switch layer routes packets via path-based labels (bit sequences consumed hop-by-hop) rather than destination addresses, enabling core routers to forward packets without routing table lookups. Routes are discovered through iterative "find node" queries and composed via label splicing.
+- **Yggdrasil** builds a cryptographically secured spanning tree (root = lowest Ed25519 public key), then uses tree distance as a metric for greedy routing. Packets are forwarded over whichever link brings them closer to the destination's tree coordinates, with off-tree shortcuts used opportunistically. This reduces to spanning tree routing in the worst case but performs efficiently on internet-like topologies.
+
+SCP takes neither approach. Routing is entirely delegated to transport adapters (§10.5) — the protocol has no routing layer of its own. An SCP relay could run over a cjdns or Yggdrasil mesh (using the overlay's globally-routable IPv6 addresses), over the public internet, over BLE, or over any combination. This is a deliberate architectural choice: SCP is application-layer infrastructure, not network-layer infrastructure.
+
+### 11.6.3 Encryption
+
+Both networks encrypt all traffic by default — a property SCP shares:
+
+- **Cjdns:** CryptoAuth protocol (Curve25519 key exchange, XSalsa20-Poly1305 authenticated encryption). Per-hop encryption means intermediate nodes cannot read transit traffic. End-to-end encryption between source and destination.
+- **Yggdrasil:** End-to-end encryption using NaCl/box primitives (Curve25519 + XSalsa20 + Poly1305), with session key ratcheting for forward secrecy (v0.4+). Ed25519 signatures secure the spanning tree construction.
+
+SCP encrypts at a different layer: MLS (RFC 9420) provides group encryption at the message level, with the sender-side key layer (§9.16) adding per-sender confidentiality control. Transport-level encryption is the adapter's concern — an adapter running over cjdns/Yggdrasil would inherit their network-layer encryption as an additional layer, but SCP's security model does not depend on it.
+
+### 11.6.4 What SCP Borrows
+
+**Self-certifying addresses as identity primitive.** The proof that public-key-derived addressing works at scale — cjdns's Hyperboria network operated with hundreds of globally-distributed nodes — validated the core assumption behind `did:dht`. If a mesh network can function with no address authority, a protocol can function with no identity authority.
+
+**Encrypted-by-default as the only mode.** Both cjdns and Yggdrasil made unencrypted communication impossible by construction. SCP follows the same principle with MLS: there is no plaintext mode. Encryption is not a feature to enable; it is the only way the protocol operates.
+
+### 11.6.5 Where SCP Diverges
+
+Cjdns and Yggdrasil are network-layer protocols — they replace IP routing with encrypted mesh routing. SCP is application-layer protocol infrastructure that runs on top of any transport, including theirs. The divergences follow from this:
+
+- **No governance.** Neither protocol has any concept of permissions, roles, capabilities, or governed interaction spaces. Any node that knows a destination address can send to it. SCP: contexts enforce membership, governance engines enforce rules, UCANs enforce capabilities (§5, §7).
+- **No group encryption.** Both provide point-to-point encrypted channels. Neither has multi-party group encryption with forward secrecy and post-compromise security. SCP: MLS groups are the fundamental communication primitive.
+- **Identity is an address, not a document.** A cjdns/Yggdrasil address proves key ownership. An SCP DID resolves to a document with multiple verification methods, attestation chains, service endpoints, and agent delegation — identity as a rich, evolving structure rather than a static hash (§3, §11.2).
+- **Transport substrate, not alternative.** SCP lists Yggdrasil/cjdns as Tier 2 transport adapters (§10.5). Their globally-routable encrypted IPv6 space could serve as infrastructure-independent transport for SCP relays — especially valuable in scenarios where conventional internet routing is unreliable or surveilled. The adapter mapping is thin: SCP relay connections use the mesh network's IPv6 addresses instead of public IPs, inheriting NAT traversal and encryption for free.
+
+---
+
+## 11.7 What No Existing Standard Covers
 
 Agents as first-class protocol participants with formalized trust semantics, one-agent-per-person-per-context constraints, context-bound agents that cannot cross at the protocol level, trust as identity + capability pairs applied to autonomous agents, non-fungible cross-platform identity attestations with shadow identity claiming, protocol-level bridge connectors with provenance-tracked content attribution, and all of this framed as infrastructure for generated/ephemeral apps.
 
