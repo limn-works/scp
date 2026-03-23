@@ -2269,6 +2269,19 @@ impl WasmContextManager {
         ))
     }
 
+    /// Returns the set of seen nonce keys for a context (for replay checking).
+    ///
+    /// Used by the extract-validate-writeback UCAN validation pattern to
+    /// pre-extract nonce state before calling `scp_protocol::validate_ucan`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the context is not found.
+    pub fn ucan_seen_nonce_keys(&self, context_id: &str) -> Result<HashSet<String>, ScpWasmError> {
+        let ctx = self.require_context(context_id)?;
+        Ok(ctx.seen_nonces.keys().cloned().collect())
+    }
+
     /// Records a nonce as seen (for replay prevention).
     ///
     /// Records a nonce for replay detection.
