@@ -1,0 +1,35 @@
+name: SDK Coverage Verification (LLM)
+
+on:
+  pull_request:
+    paths:
+      - 'bindings/**'
+      - '.docs/standards/sdk-capability-matrix.json'
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: write
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v5
+
+      - name: Run SDK coverage verifier
+        uses: anthropics/claude-code-action@v1
+        with:
+          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+          claude_args: '--model claude-sonnet-4-20250514 --allowedTools "Read,Grep,Glob"'
+          prompt: |
+            You are the SDK coverage verifier. Read .claude/agents/sdk-coverage-verifier.md for
+            your full instructions.
+
+            This PR modifies SDK code or the capability matrix. Verify that all `true` entries
+            in .docs/standards/sdk-capability-matrix.json are public, callable, delegate to the
+            correct bridge function, and are complete.
+
+            If only one SDK was modified, only verify that SDK. If the matrix changed, verify
+            all entries that were added or changed to `true`.
+
+            Post your findings as a PR review comment in the format specified in the agent definition.
