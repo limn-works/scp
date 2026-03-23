@@ -28,6 +28,7 @@ The following modules previously contained standalone WASM reimplementations. Af
 | Context templates | `scp_protocol::context::templates` | `template_params`, `ContentPath`, `MimeType`, `BroadcastContent`, `serialize_broadcast_content` |
 | Sync | `scp_protocol::sync` | `SyncPolicy`, `OfflineTier` |
 | Economy | `scp_protocol::economy` | `evaluate_formula`, `PricingFormula`, `ObservableMetrics` |
+| SCPID | `scp_protocol::identity::scpid` + `scp_protocol::crypto::canonical` | `ScpIdChallenge`, `ScpIdResponse`, `SCPID_PROTOCOL_VERSION`, `SCPID_DOMAIN_SEPARATOR`, `canonical_hash`, `CanonicalField` |
 
 ## What Stays WASM-Local (and why)
 
@@ -41,7 +42,7 @@ The following modules previously contained standalone WASM reimplementations. Af
 | `WasmCryptoState` | MLS + sender key orchestration (double encryption) |
 | `WasmGovernanceAction`, `WasmContextEvent` | Different serde format for JS (JSON, not MessagePack) |
 | Address parsing in `discovery.rs` | Interleaved with WASM-specific JS-facing logic |
-| `scpid.rs` | Depends on async verification in scp-runtime |
+| `scpid.rs` bridge glue | `#[wasm_bindgen]` functions, JS error mapping, WASM time/CSPRNG. Types and constants imported from `scp_protocol::identity::scpid`. |
 | `reference_verify.rs` | Uses browser Fetch API |
 | `WasmRateLimitTracker` | WASM-specific rate limit tracking using `js_sys::Date` |
 | `WasmNonceTracker` in `ucan.rs` | Implements `ValidationNonceTracker` trait with extract-validate-writeback pattern for `WasmContextManager` |
@@ -77,7 +78,7 @@ The following modules previously contained standalone WASM reimplementations. Af
 | `bridge.rs` | Bridge mode and shadow provenance | Local + `scp_protocol::bridge` |
 | `sync.rs` | Sync policy classification | Local + `scp_protocol::sync` |
 | `economy.rs` | Economy formula evaluation | Local + `scp_protocol::economy` |
-| `scpid.rs` | SCPID stateless DID auth | Local + `scp_primitives` |
+| `scpid.rs` | SCPID stateless DID auth | `scp_protocol::identity::scpid` + `scp_protocol::crypto::canonical` |
 
 ## MLS Encryption (`crypto/` module)
 

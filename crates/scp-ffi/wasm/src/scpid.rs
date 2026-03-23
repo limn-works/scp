@@ -1,9 +1,9 @@
 //! WASM bridge for SCPID authentication (§3.11).
 //!
-//! Re-implements SCPID challenge generation and signing locally because the
-//! WASM bridge cannot depend on `scp-core` (tokio multi-thread requirement,
-//! see ADR-034). The algorithms are pure crypto (SHA-256, Ed25519) with no
-//! network I/O, so they translate directly to WASM.
+//! Uses pure types from `scp_protocol::identity::scpid` and the canonical hash
+//! from `scp_protocol::crypto::canonical` — no local reimplementations needed.
+//! Only the WASM-specific bridge glue (`#[wasm_bindgen]` functions, JS error
+//! mapping, WASM time/CSPRNG) remains local.
 //!
 //! - `scpid_challenge` — Generate an SCPID challenge for a relying party.
 //! - `scpid_sign` — Sign an SCPID challenge with a registered identity's key.
@@ -16,61 +16,23 @@
 //! via the PyO3 or NAPI bridges, or in a native mobile app via the UniFFI
 //! bridge.
 //!
-//! See spec §3.11 and the `scp-core` `scpid` module for the canonical
-//! implementation.
+//! See spec §3.11 and the `scp-runtime` `scpid` module for the canonical
+//! async implementation.
 
-use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
+use scp_protocol::crypto::canonical::{CanonicalField, canonical_hash};
+use scp_protocol::identity::SigningKeyId;
+use scp_protocol::identity::scpid::{
+    SCPID_DOMAIN_SEPARATOR, SCPID_PROTOCOL_VERSION, ScpIdChallenge, ScpIdResponse,
+};
 use wasm_bindgen::prelude::*;
 
 use crate::error::ScpWasmError;
-
-// ---------------------------------------------------------------------------
-// Constants (must match scp-runtime/src/identity/scpid.rs)
-//
-// These are WASM-local copies because scp-runtime depends on tokio
-// (multi-thread) which is unavailable on wasm32-unknown-unknown. The
-// canonical definitions are in scp_runtime::identity::scpid — if those
-// change, these must be updated in lockstep.
-// ---------------------------------------------------------------------------
-
-/// Protocol version string for SCPID (§3.11.2).
-const SCPID_PROTOCOL_VERSION: &str = "scpid/1.0";
-
-/// Domain separator for SCPID signed content (§3.11.3, §9.18.2).
-const SCPID_DOMAIN_SEPARATOR: &str = "SCP-DID-AUTH-V1:";
 
 /// Maximum TTL in milliseconds (300 seconds per §3.11.2).
 const MAX_TTL_MS: u64 = 300_000;
 
 /// Maximum audience string length in bytes.
 const MAX_AUDIENCE_BYTES: usize = 2048;
-
-// ---------------------------------------------------------------------------
-// Wire types (mirror scp-core but without scp-core dependency)
-// ---------------------------------------------------------------------------
-
-/// SCPID challenge — local mirror of `scp_core::identity::ScpIdChallenge`.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct ScpIdChallenge {
-    protocol: String,
-    nonce: String, // hex-encoded on wire
-    audience: String,
-    issued_at: u64,
-    expires_at: u64,
-}
-
-/// SCPID response — local mirror of `scp_core::identity::ScpIdResponse`.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct ScpIdResponse {
-    protocol: String,
-    did: String,
-    signing_key_id: String,
-    nonce: String, // hex-encoded on wire
-    audience: String,
-    signed_at: u64,
-    signature: String, // hex-encoded on wire
-}
 
 // ---------------------------------------------------------------------------
 // Bridge functions
@@ -144,7 +106,7 @@ pub fn scpid_challenge(audience: String, ttl_seconds: u32) -> Result<String, JsE
 
     let challenge = ScpIdChallenge {
         protocol: SCPID_PROTOCOL_VERSION.to_owned(),
-        nonce: hex::encode(nonce),
+        nonce,
         audience,
         issued_at: now_ms,
         expires_at,
@@ -184,8 +146,9 @@ pub fn scpid_sign(
     challenge_json: String,
 ) -> Result<String, JsError> {
     // Validate signing_key_id.
-    let key_fragment = match signing_key_id.as_str() {
-        "#active" | "#agent" => signing_key_id.as_str(),
+    let (key_fragment, key_id) = match signing_key_id.as_str() {
+        "#active" => ("#active", SigningKeyId::Active),
+        "#agent" => ("#agent", SigningKeyId::Agent),
         other => {
             return Err(ScpWasmError::Validation {
                 message: format!(
@@ -197,7 +160,7 @@ pub fn scpid_sign(
         }
     };
 
-    // Parse the challenge JSON.
+    // Parse the challenge JSON (scp-protocol types handle hex serde automatically).
     let challenge: ScpIdChallenge = serde_json::from_str(&challenge_json).map_err(|e| {
         ScpWasmError::Validation {
             message: format!("invalid challenge JSON: {e}"),
@@ -217,24 +180,6 @@ pub fn scpid_sign(
         }
         .into_js());
     }
-
-    // Parse the nonce from hex.
-    let nonce_bytes: [u8; 32] = hex::decode(&challenge.nonce)
-        .map_err(|e| {
-            ScpWasmError::Validation {
-                message: format!("invalid nonce hex: {e}"),
-                code: "SCP-IDENT-1038".to_owned(),
-            }
-            .into_js()
-        })?
-        .try_into()
-        .map_err(|_| {
-            ScpWasmError::Validation {
-                message: "nonce must be exactly 32 bytes (64 hex chars)".to_owned(),
-                code: "SCP-IDENT-1038".to_owned(),
-            }
-            .into_js()
-        })?;
 
     // Check challenge expiry.
     let now_ms = crate::time::now_ms_u64();
@@ -257,35 +202,30 @@ pub fn scpid_sign(
 
     let signed_at = now_ms;
 
-    // Build canonical hash (§3.11.3):
-    //   SHA-256(
-    //       "SCP-DID-AUTH-V1:"
-    //       || BE32(len(did))           || did
-    //       || BE32(len(signing_key_id)) || signing_key_id
-    //       || nonce (32 bytes raw)
-    //       || BE32(len(audience))       || audience
-    //       || signed_at as u64 BE
-    //   )
-    let hash = scpid_canonical_hash(
-        &did,
-        key_fragment,
-        &nonce_bytes,
-        &challenge.audience,
-        signed_at,
+    // Build canonical hash (§3.11.3) using scp-protocol's canonical_hash.
+    let hash = canonical_hash(
+        SCPID_DOMAIN_SEPARATOR,
+        &[
+            CanonicalField::VarBytes(did.as_bytes()),
+            CanonicalField::VarBytes(key_fragment.as_bytes()),
+            CanonicalField::Fixed32(&challenge.nonce),
+            CanonicalField::VarBytes(challenge.audience.as_bytes()),
+            CanonicalField::U64(signed_at),
+        ],
     );
 
     // Sign the canonical hash via the identity helper.
-    let signature_bytes = crate::identity::sign_with_identity(&did, key_fragment, &hash)
+    let signature = crate::identity::sign_with_identity(&did, key_fragment, &hash)
         .map_err(ScpWasmError::into_js)?;
 
     let response = ScpIdResponse {
         protocol: SCPID_PROTOCOL_VERSION.to_owned(),
         did,
-        signing_key_id: key_fragment.to_owned(),
+        signing_key_id: key_id,
         nonce: challenge.nonce,
         audience: challenge.audience,
         signed_at,
-        signature: hex::encode(signature_bytes),
+        signature,
     };
 
     serde_json::to_string(&response).map_err(|e| {
@@ -295,52 +235,6 @@ pub fn scpid_sign(
         }
         .into_js()
     })
-}
-
-// ---------------------------------------------------------------------------
-// Internal helpers
-// ---------------------------------------------------------------------------
-
-/// Computes the canonical hash for SCPID signing per §3.11.3.
-///
-/// This is a WASM-local reimplementation of `scp_core::crypto::canonical::canonical_hash`
-/// with the SCPID-specific field ordering. Must produce identical output to the
-/// `scp-core` implementation for cross-bridge interoperability.
-#[allow(clippy::cast_possible_truncation)] // VarBytes uses u32 length prefix; all inputs are bounded
-fn scpid_canonical_hash(
-    did: &str,
-    signing_key_id: &str,
-    nonce: &[u8; 32],
-    audience: &str,
-    signed_at: u64,
-) -> [u8; 32] {
-    let mut hasher = Sha256::new();
-
-    // Domain separator.
-    hasher.update(SCPID_DOMAIN_SEPARATOR.as_bytes());
-
-    // VarBytes(did).
-    hasher.update((did.len() as u32).to_be_bytes());
-    hasher.update(did.as_bytes());
-
-    // VarBytes(signing_key_id).
-    hasher.update((signing_key_id.len() as u32).to_be_bytes());
-    hasher.update(signing_key_id.as_bytes());
-
-    // Fixed32(nonce).
-    hasher.update(nonce);
-
-    // VarBytes(audience).
-    hasher.update((audience.len() as u32).to_be_bytes());
-    hasher.update(audience.as_bytes());
-
-    // U64(signed_at).
-    hasher.update(signed_at.to_be_bytes());
-
-    let result = hasher.finalize();
-    let mut hash = [0u8; 32];
-    hash.copy_from_slice(&result);
-    hash
 }
 
 // ---------------------------------------------------------------------------
@@ -354,13 +248,16 @@ mod tests {
 
     #[test]
     fn canonical_hash_golden_vector() {
-        // Must match the golden vector in scp-core/src/identity/scpid.rs.
-        let hash = scpid_canonical_hash(
-            "did:dht:z6MkTest",
-            "#active",
-            &[0xAAu8; 32],
-            "https://example.com",
-            1_709_654_400_000,
+        // Must match the golden vector in scp-runtime/src/identity/scpid.rs.
+        let hash = canonical_hash(
+            SCPID_DOMAIN_SEPARATOR,
+            &[
+                CanonicalField::VarBytes(b"did:dht:z6MkTest"),
+                CanonicalField::VarBytes(b"#active"),
+                CanonicalField::Fixed32(&[0xAAu8; 32]),
+                CanonicalField::VarBytes(b"https://example.com"),
+                CanonicalField::U64(1_709_654_400_000),
+            ],
         );
         assert_eq!(
             hex::encode(hash),
