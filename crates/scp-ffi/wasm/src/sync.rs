@@ -247,11 +247,7 @@ mod tests {
         // now < last_relay_contact => saturating_sub => 0 => Short
         let duration = 1_000_000u64.saturating_sub(2_000_000);
         assert_eq!(
-            classify(
-                duration,
-                p.tier_1_threshold_secs,
-                p.tier_2_threshold_secs
-            ),
+            classify(duration, p.tier_1_threshold_secs, p.tier_2_threshold_secs),
             "short"
         );
     }

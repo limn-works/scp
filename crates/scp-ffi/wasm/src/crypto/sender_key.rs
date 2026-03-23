@@ -12,11 +12,11 @@ use super::error::WasmCryptoError;
 impl From<SenderKeyError> for WasmCryptoError {
     fn from(err: SenderKeyError) -> Self {
         match err {
-            SenderKeyError::AuthenticationFailed => WasmCryptoError::AuthenticationFailed,
+            SenderKeyError::AuthenticationFailed => Self::AuthenticationFailed,
             SenderKeyError::CiphertextTooShort { actual, minimum } => {
-                WasmCryptoError::CiphertextTooShort { actual, minimum }
+                Self::CiphertextTooShort { actual, minimum }
             }
-            other => WasmCryptoError::SenderKeyError(other.to_string()),
+            other => Self::SenderKeyError(other.to_string()),
         }
     }
 }

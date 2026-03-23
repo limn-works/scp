@@ -7,7 +7,7 @@
 //! See spec section 19 (Economic Governance) and ADR-033.
 
 use js_sys::Promise;
-use scp_protocol::economy::policy::{evaluate_formula, ObservableMetrics};
+use scp_protocol::economy::policy::{ObservableMetrics, evaluate_formula};
 use scp_protocol::economy::types::PricingFormula;
 use wasm_bindgen::prelude::*;
 use wasm_bindgen_futures::future_to_promise;
@@ -139,7 +139,7 @@ pub fn economy_estimate_cost(
                 let formula: PricingFormula = serde_json::from_value(f.clone()).ok()?;
                 let observable = metrics_from_json(&metrics);
                 // evaluate_formula returns Option<Amount>; None means overflow.
-                evaluate_formula(&formula, &observable).map(|amount| amount.value())
+                evaluate_formula(&formula, &observable).map(scp_protocol::economy::Amount::value)
             })
             .unwrap_or(0);
 

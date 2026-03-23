@@ -386,6 +386,7 @@ pub fn compute_event_canonical_hash(event: &Event) -> Vec<u8> {
 ///
 /// Used in canonical hash computation. The tag values are protocol constants
 /// and must never change.
+#[must_use]
 pub const fn event_type_tag(event_type: &EventType) -> u16 {
     match event_type {
         EventType::ContextCreated => 0,
