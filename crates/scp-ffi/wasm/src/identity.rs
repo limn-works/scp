@@ -125,7 +125,6 @@ mod canonical_attestation {
     // RevocationStatus imported from scp-protocol — canonical implementation.
     // Used instead of `serde_json::Value` for `revocation_status` serialization to
     // produce byte-identical msgpack output matching scp-core.
-
 }
 
 // ---------------------------------------------------------------------------

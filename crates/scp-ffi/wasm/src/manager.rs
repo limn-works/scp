@@ -33,7 +33,7 @@ use base64::Engine as _;
 use crate::error::ScpWasmError;
 use crate::runtime::{ToolRegistration, ToolRegistry, validate_value_against_schema};
 
-use scp_event_log::proof::{prove_absence, prove_inclusion, verify_inclusion, Direction};
+use scp_event_log::proof::{Direction, prove_absence, prove_inclusion, verify_inclusion};
 use scp_event_log::tree::{append_unsigned_event, event_count, root};
 use scp_event_log::{DID, Event, EventLog, EventPayload, EventType};
 
@@ -1433,7 +1433,11 @@ impl WasmContextManager {
             payload_base64: recorded_payload.clone(),
         });
 
-        ctx.append_log_event(EventType::MessageSent, sender_did, recorded_payload.as_bytes());
+        ctx.append_log_event(
+            EventType::MessageSent,
+            sender_did,
+            recorded_payload.as_bytes(),
+        );
 
         Ok(())
     }
@@ -1787,12 +1791,12 @@ impl WasmContextManager {
             })?;
 
         // Validate input against the tool's input schema.
-        validate_value_against_schema(input_json, &registration.schema.input_schema).map_err(|e| {
-            ScpWasmError::Tool {
+        validate_value_against_schema(input_json, &registration.schema.input_schema).map_err(
+            |e| ScpWasmError::Tool {
                 message: format!("input schema validation failed for tool '{tool_id}': {e}"),
                 code: "SCP-TOOL-6002".to_owned(),
-            }
-        })?;
+            },
+        )?;
 
         let output_schema = registration.schema.output_schema.clone();
 
@@ -1847,15 +1851,18 @@ impl WasmContextManager {
         // Verify test vectors by validating inputs against the input schema.
         let mut failures = Vec::new();
         for (i, tv) in registration.test_vectors.iter().enumerate() {
-            if let Err(e) = validate_value_against_schema(&tv.input, &registration.schema.input_schema) {
+            if let Err(e) =
+                validate_value_against_schema(&tv.input, &registration.schema.input_schema)
+            {
                 failures.push(format!(
                     "vector {i} ({0}): input validation failed: {e}",
                     tv.description
                 ));
             }
-            if let Err(e) =
-                validate_value_against_schema(&tv.expected_output, &registration.schema.output_schema)
-            {
+            if let Err(e) = validate_value_against_schema(
+                &tv.expected_output,
+                &registration.schema.output_schema,
+            ) {
                 failures.push(format!(
                     "vector {i} ({0}): output validation failed: {e}",
                     tv.description
@@ -2067,12 +2074,12 @@ impl WasmContextManager {
 
         // Validate input against tool's input schema if tool is registered.
         if let Some(registration) = ctx.tool_registry.get(&tool_id) {
-            validate_value_against_schema(input, &registration.schema.input_schema).map_err(|e| {
-                ScpWasmError::Tool {
+            validate_value_against_schema(input, &registration.schema.input_schema).map_err(
+                |e| ScpWasmError::Tool {
                     message: format!("input validation failed: {e}"),
                     code: "SCP-TOOL-6002".to_owned(),
-                }
-            })?;
+                },
+            )?;
         }
 
         // Execute via handler or echo mode.
@@ -3454,13 +3461,12 @@ impl WasmContextManager {
         let ctx = self.require_active_context_mut(context_id)?;
 
         let meets_quorum = {
-            let proposal =
-                ctx.pending_proposals
-                    .get_mut(proposal_id)
-                    .ok_or_else(|| ScpWasmError::Context {
-                        message: format!("proposal {proposal_id} not found"),
-                        code: "SCP-CTX-2042".to_owned(),
-                    })?;
+            let proposal = ctx.pending_proposals.get_mut(proposal_id).ok_or_else(|| {
+                ScpWasmError::Context {
+                    message: format!("proposal {proposal_id} not found"),
+                    code: "SCP-CTX-2042".to_owned(),
+                }
+            })?;
 
             if proposal.voting_deadline_ms <= now {
                 return Err(ScpWasmError::Context {
@@ -3485,7 +3491,11 @@ impl WasmContextManager {
             proposal.approvals.len() >= required
         };
 
-        ctx.append_log_event(EventType::GovernanceVoteCast, voter_did, proposal_id.as_bytes());
+        ctx.append_log_event(
+            EventType::GovernanceVoteCast,
+            voter_did,
+            proposal_id.as_bytes(),
+        );
 
         let pid = proposal_id.to_owned();
 
@@ -3547,13 +3557,12 @@ impl WasmContextManager {
         let ctx = self.require_active_context_mut(context_id)?;
 
         let remaining_possible_approvals = {
-            let proposal =
-                ctx.pending_proposals
-                    .get_mut(proposal_id)
-                    .ok_or_else(|| ScpWasmError::Context {
-                        message: format!("proposal {proposal_id} not found"),
-                        code: "SCP-CTX-2043".to_owned(),
-                    })?;
+            let proposal = ctx.pending_proposals.get_mut(proposal_id).ok_or_else(|| {
+                ScpWasmError::Context {
+                    message: format!("proposal {proposal_id} not found"),
+                    code: "SCP-CTX-2043".to_owned(),
+                }
+            })?;
 
             if proposal.voting_deadline_ms <= now {
                 return Err(ScpWasmError::Context {
@@ -3577,7 +3586,11 @@ impl WasmContextManager {
             total.saturating_sub(proposal.approvals.len() + proposal.rejections.len())
         };
 
-        ctx.append_log_event(EventType::GovernanceVoteCast, voter_did, proposal_id.as_bytes());
+        ctx.append_log_event(
+            EventType::GovernanceVoteCast,
+            voter_did,
+            proposal_id.as_bytes(),
+        );
 
         let can_still_reach_quorum = {
             let ctx2 = self.require_active_context_mut(context_id)?;
@@ -3846,7 +3859,11 @@ impl WasmContextManager {
             payload_base64: payload_base64.to_owned(),
         });
 
-        ctx.append_log_event(EventType::MessageSent, author_did, payload_base64.as_bytes());
+        ctx.append_log_event(
+            EventType::MessageSent,
+            author_did,
+            payload_base64.as_bytes(),
+        );
 
         Ok(())
     }

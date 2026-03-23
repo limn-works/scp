@@ -300,10 +300,9 @@ pub fn verify_participation_requirements(
 ) -> Result<bool, JsValue> {
     use ed25519_dalek::{Signature, VerifyingKey};
 
-    let profiles: Vec<ParticipationProfile> =
-        serde_json::from_str(&profile_json).map_err(|e| {
-            ScpWasmError::validation(&format!("failed to parse participation profiles JSON: {e}"))
-        })?;
+    let profiles: Vec<ParticipationProfile> = serde_json::from_str(&profile_json).map_err(|e| {
+        ScpWasmError::validation(&format!("failed to parse participation profiles JSON: {e}"))
+    })?;
 
     let requirements: Vec<RequireParticipation> = serde_json::from_str(&requirements_json)
         .map_err(|e| {
@@ -316,13 +315,12 @@ pub fn verify_participation_requirements(
     // hard failure regardless of which requirements use it. Matches
     // scp-core's verify_participation_requirements step 1.
     for profile in &profiles {
-        let verifying_key =
-            VerifyingKey::from_bytes(&profile.signer_public_key).map_err(|e| {
-                ScpWasmError::validation(&format!(
-                    "invalid signer public key for {}: {e}",
-                    &profile.subject_did
-                ))
-            })?;
+        let verifying_key = VerifyingKey::from_bytes(&profile.signer_public_key).map_err(|e| {
+            ScpWasmError::validation(&format!(
+                "invalid signer public key for {}: {e}",
+                &profile.subject_did
+            ))
+        })?;
 
         let signature = Signature::from_bytes(&profile.signature);
         let signable = profile.signable_bytes();

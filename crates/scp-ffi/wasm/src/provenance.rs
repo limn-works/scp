@@ -118,7 +118,7 @@ impl std::fmt::Display for MemoryScope {
 /// - 0 = `NoProvenance` — no protocol-level origin tracking
 fn compute_quality(
     has_provenance: bool,
-    source_type: &SourceType,
+    source_type: SourceType,
     context_state: ContextState,
     has_counterparties: bool,
 ) -> u32 {
@@ -228,7 +228,7 @@ pub fn evaluate_provenance_quality(
         ))
     })?;
 
-    Ok(compute_quality(has_provenance, &st, cs, has_counterparties))
+    Ok(compute_quality(has_provenance, st, cs, has_counterparties))
 }
 
 // ---------------------------------------------------------------------------
@@ -374,7 +374,7 @@ pub fn provenance_attach(
     // for hashing.
     let canonical_bytes = build_canonical_provenance_bytes(
         &source_context_id,
-        &st,
+        st,
         &counterparties,
         &ms,
         chain_depth,
@@ -658,7 +658,7 @@ struct CanonicalDuration {
 #[allow(clippy::too_many_arguments)] // mirrors DataProvenance field count
 fn build_canonical_provenance_bytes(
     source_context: &str,
-    source_type: &SourceType,
+    source_type: SourceType,
     counterparties: &[String],
     memory_scope: &MemoryScope,
     chain_depth: u32,
@@ -1380,18 +1380,18 @@ mod tests_native {
     fn compute_quality_with_lowercase_parsed_enums() {
         let st = parse_source_type("persistent").unwrap();
         let cs = ContextState::from_str("active").unwrap();
-        assert_eq!(compute_quality(true, &st, cs, true), 3);
+        assert_eq!(compute_quality(true, st, cs, true), 3);
 
         let st2 = parse_source_type("summary").unwrap();
         let cs2 = ContextState::from_str("closed_with_summary_verified").unwrap();
-        assert_eq!(compute_quality(true, &st2, cs2, true), 2);
+        assert_eq!(compute_quality(true, st2, cs2, true), 2);
 
         let st3 = parse_source_type("ephemeral").unwrap();
         let cs3 = ContextState::from_str("closed_ephemeral").unwrap();
-        assert_eq!(compute_quality(true, &st3, cs3, true), 1);
-        assert_eq!(compute_quality(true, &st3, cs3, false), 0);
+        assert_eq!(compute_quality(true, st3, cs3, true), 1);
+        assert_eq!(compute_quality(true, st3, cs3, false), 0);
 
         let cs4 = ContextState::from_str("unknown").unwrap();
-        assert_eq!(compute_quality(true, &st, cs4, true), 0);
+        assert_eq!(compute_quality(true, st, cs4, true), 0);
     }
 }

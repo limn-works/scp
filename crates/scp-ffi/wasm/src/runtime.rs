@@ -18,12 +18,10 @@
 use std::collections::HashMap;
 
 // Re-export tool types from scp-protocol for use by manager.rs, tools.rs, etc.
-pub use scp_protocol::context::tools::{
-    TestVector, ToolCost, ToolRegistration, ToolSchema,
-};
 pub use scp_protocol::context::tools::schema::{
     SchemaValidationError, validate_schema, validate_value_against_schema,
 };
+pub use scp_protocol::context::tools::{TestVector, ToolCost, ToolRegistration, ToolSchema};
 
 // ---------------------------------------------------------------------------
 // ToolRegistry — thin wrapper (scp-protocol's insert is pub(crate))

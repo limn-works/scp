@@ -187,7 +187,7 @@ fn parse_shadow_status(s: &str) -> Result<ShadowProvenanceStatus, ScpWasmError> 
     }
 }
 
-/// Returns the PascalCase string representation for a shadow provenance status.
+/// Returns the `PascalCase` string representation for a shadow provenance status.
 fn shadow_status_as_str(status: &ShadowProvenanceStatus) -> &'static str {
     match status {
         ShadowProvenanceStatus::Shadow => "Shadow",
