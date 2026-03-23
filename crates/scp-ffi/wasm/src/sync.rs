@@ -6,38 +6,15 @@
 //! - `sync_get_policy` — Get the default sync policy as JSON.
 //! - `sync_classify_offline_custom` — Classify offline duration with custom thresholds.
 //!
-//! # WASM constraints
-//!
-//! This bridge does NOT depend on `scp-core` (tokio multi-thread incompatible
-//! with `wasm32-unknown-unknown`). Offline tier classification is a pure
-//! arithmetic function re-implemented locally with algorithm-identical constants.
+//! Constants and classification logic are imported from `scp-protocol::sync`,
+//! ensuring WASM sync thresholds stay in lockstep with native.
 //!
 //! See ADR-029 in `.docs/adrs/phase-6.md`.
 
+use scp_protocol::sync::{OfflineTier, SyncPolicy};
 use wasm_bindgen::prelude::*;
 
 use crate::error::ScpWasmError;
-
-// ---------------------------------------------------------------------------
-// Constants (mirror scp-core::sync)
-// ---------------------------------------------------------------------------
-
-/// Tier 1 upper bound: 4 hours in seconds.
-const TIER_1_THRESHOLD_SECS: u64 = 14_400;
-/// Tier 2 upper bound: 7 days in seconds.
-const TIER_2_THRESHOLD_SECS: u64 = 604_800;
-/// Gap timeout for the reorder buffer: 30 seconds.
-const GAP_TIMEOUT_SECS: u64 = 30;
-/// Maximum number of messages held in the reorder buffer.
-const REORDER_BUFFER_CAPACITY: u64 = 100;
-/// Maximum number of sequential MLS Commits processed during epoch catch-up.
-const MAX_SEQUENTIAL_COMMITS: u64 = 100;
-/// Per-Commit processing timeout during epoch catch-up: 5 seconds.
-const COMMIT_PROCESS_TIMEOUT_SECS: u64 = 5;
-/// Timeout for sender key re-acquisition after missed rotations: 60 seconds.
-const SENDER_KEY_TIMEOUT_SECS: u64 = 60;
-/// Multi-device reconnection deduplication window: 30 seconds.
-const RECONNECTION_DEDUP_WINDOW_SECS: u64 = 30;
 
 // ---------------------------------------------------------------------------
 // Internal helpers
@@ -58,6 +35,15 @@ fn validate_non_negative_timestamp(value: f64, name: &str) -> Result<u64, ScpWas
     }
     #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
     Ok(value as u64)
+}
+
+/// Converts an [`OfflineTier`] to the lowercase string expected by JS consumers.
+fn tier_to_string(tier: OfflineTier) -> &'static str {
+    match tier {
+        OfflineTier::Short => "short",
+        OfflineTier::Extended => "extended",
+        OfflineTier::Long => "long",
+    }
 }
 
 /// Classifies offline duration using the given thresholds.
@@ -100,8 +86,8 @@ pub fn sync_classify_offline(last_relay_contact: f64, now: f64) -> Result<String
     let last = validate_non_negative_timestamp(last_relay_contact, "last_relay_contact")
         .map_err(ScpWasmError::into_js)?;
     let current = validate_non_negative_timestamp(now, "now").map_err(ScpWasmError::into_js)?;
-    let duration_secs = current.saturating_sub(last);
-    Ok(classify(duration_secs, TIER_1_THRESHOLD_SECS, TIER_2_THRESHOLD_SECS).to_owned())
+    let tier = SyncPolicy::default().classify_offline_duration(last, current);
+    Ok(tier_to_string(tier).to_owned())
 }
 
 // ---------------------------------------------------------------------------
@@ -122,15 +108,16 @@ pub fn sync_classify_offline(last_relay_contact: f64, now: f64) -> Result<String
 #[must_use]
 #[wasm_bindgen]
 pub fn sync_get_policy() -> String {
+    let p = SyncPolicy::default();
     serde_json::json!({
-        "tier_1_threshold_secs": TIER_1_THRESHOLD_SECS,
-        "tier_2_threshold_secs": TIER_2_THRESHOLD_SECS,
-        "gap_timeout_secs": GAP_TIMEOUT_SECS,
-        "reorder_buffer_capacity": REORDER_BUFFER_CAPACITY,
-        "max_sequential_commits": MAX_SEQUENTIAL_COMMITS,
-        "commit_process_timeout_secs": COMMIT_PROCESS_TIMEOUT_SECS,
-        "sender_key_timeout_secs": SENDER_KEY_TIMEOUT_SECS,
-        "reconnection_dedup_window_secs": RECONNECTION_DEDUP_WINDOW_SECS,
+        "tier_1_threshold_secs": p.tier_1_threshold_secs,
+        "tier_2_threshold_secs": p.tier_2_threshold_secs,
+        "gap_timeout_secs": p.gap_timeout.as_secs(),
+        "reorder_buffer_capacity": p.reorder_buffer_capacity,
+        "max_sequential_commits": p.max_sequential_commits,
+        "commit_process_timeout_secs": p.commit_process_timeout.as_secs(),
+        "sender_key_timeout_secs": p.sender_key_timeout.as_secs(),
+        "reconnection_dedup_window_secs": p.reconnection_dedup_window.as_secs(),
     })
     .to_string()
 }
@@ -195,50 +182,76 @@ mod tests {
 
     #[test]
     fn classify_short_zero_seconds() {
+        let p = SyncPolicy::default();
         assert_eq!(
-            classify(0, TIER_1_THRESHOLD_SECS, TIER_2_THRESHOLD_SECS),
+            classify(0, p.tier_1_threshold_secs, p.tier_2_threshold_secs),
             "short"
         );
     }
 
     #[test]
     fn classify_short_at_boundary() {
+        let p = SyncPolicy::default();
         assert_eq!(
-            classify(14_400, TIER_1_THRESHOLD_SECS, TIER_2_THRESHOLD_SECS),
+            classify(
+                p.tier_1_threshold_secs,
+                p.tier_1_threshold_secs,
+                p.tier_2_threshold_secs
+            ),
             "short"
         );
     }
 
     #[test]
     fn classify_extended_just_over() {
+        let p = SyncPolicy::default();
         assert_eq!(
-            classify(14_401, TIER_1_THRESHOLD_SECS, TIER_2_THRESHOLD_SECS),
+            classify(
+                p.tier_1_threshold_secs + 1,
+                p.tier_1_threshold_secs,
+                p.tier_2_threshold_secs
+            ),
             "extended"
         );
     }
 
     #[test]
     fn classify_extended_at_boundary() {
+        let p = SyncPolicy::default();
         assert_eq!(
-            classify(604_800, TIER_1_THRESHOLD_SECS, TIER_2_THRESHOLD_SECS),
+            classify(
+                p.tier_2_threshold_secs,
+                p.tier_1_threshold_secs,
+                p.tier_2_threshold_secs
+            ),
             "extended"
         );
     }
 
     #[test]
     fn classify_long_just_over() {
+        let p = SyncPolicy::default();
         assert_eq!(
-            classify(604_801, TIER_1_THRESHOLD_SECS, TIER_2_THRESHOLD_SECS),
+            classify(
+                p.tier_2_threshold_secs + 1,
+                p.tier_1_threshold_secs,
+                p.tier_2_threshold_secs
+            ),
             "long"
         );
     }
 
     #[test]
     fn classify_handles_clock_skew() {
+        let p = SyncPolicy::default();
         // now < last_relay_contact => saturating_sub => 0 => Short
         let duration = 1_000_000u64.saturating_sub(2_000_000);
         assert_eq!(
-            classify(duration, TIER_1_THRESHOLD_SECS, TIER_2_THRESHOLD_SECS),
+            classify(
+                duration,
+                p.tier_1_threshold_secs,
+                p.tier_2_threshold_secs
+            ),
             "short"
         );
     }
@@ -251,10 +264,30 @@ mod tests {
     #[test]
     fn policy_json_has_expected_fields() {
         let json: serde_json::Value = serde_json::from_str(&sync_get_policy()).unwrap();
-        assert_eq!(json["tier_1_threshold_secs"], 14_400);
-        assert_eq!(json["tier_2_threshold_secs"], 604_800);
-        assert_eq!(json["gap_timeout_secs"], 30);
-        assert_eq!(json["reorder_buffer_capacity"], 100);
+        let p = SyncPolicy::default();
+        assert_eq!(json["tier_1_threshold_secs"], p.tier_1_threshold_secs);
+        assert_eq!(json["tier_2_threshold_secs"], p.tier_2_threshold_secs);
+        assert_eq!(json["gap_timeout_secs"], p.gap_timeout.as_secs());
+        assert_eq!(json["reorder_buffer_capacity"], p.reorder_buffer_capacity);
+    }
+
+    // -----------------------------------------------------------------------
+    // tier_to_string — maps OfflineTier to lowercase JS strings
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn tier_to_string_short() {
+        assert_eq!(tier_to_string(OfflineTier::Short), "short");
+    }
+
+    #[test]
+    fn tier_to_string_extended() {
+        assert_eq!(tier_to_string(OfflineTier::Extended), "extended");
+    }
+
+    #[test]
+    fn tier_to_string_long() {
+        assert_eq!(tier_to_string(OfflineTier::Long), "long");
     }
 
     // -----------------------------------------------------------------------
