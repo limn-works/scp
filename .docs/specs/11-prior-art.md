@@ -28,7 +28,7 @@ The Dat Protocol (2013) is the direct ancestor of the Hypercore stack described 
 
 **Original motivation: scientific data sharing.** Max Ogden created Dat in August 2013 to solve how scientists collaborate on versioned datasets without centralized infrastructure. Funded by the Knight Foundation and Sloan Foundation (2014-2017), stewardship moved to Code for Science and Society (501(c)(3), incorporated May 2017). The project was published in *Scientific Data* (Nature portfolio, 2018) — an unusual level of academic legitimacy for a P2P protocol.
 
-**Technical primitives.** Dat introduced several ideas that survived into Hypercore. Data archives were append-only logs signed with Ed25519 keypairs, verified via Merkle trees. The on-disk format, SLEEP (Syncable Ledger of Exact Events Protocol), used fixed-size entries with 32-byte headers — a compact representation that Hypercore later refined. Discovery keys — the hash of the archive's public key — allowed peers to find each other on the DHT without exposing the actual read key to the network, a privacy-by-default design. Dat DNS (DEP-0005) mapped human-readable domain names to cryptographic archive addresses via DNS TXT records or `/.well-known/dat` HTTPS endpoints, foreshadowing the kind of DNS-bridged discovery that SCP's DID resolution uses (§3.10).
+**Technical primitives.** Dat introduced several ideas that survived into Hypercore. Data archives were append-only logs signed with Ed25519 keypairs, verified via Merkle trees. The on-disk format, SLEEP (Syncable Ledger of Exact Events Protocol), used fixed-size entries with 32-byte headers — a compact representation that Hypercore later refined. Discovery keys — BLAKE2b-256 keyed hashes (key=public key, message='HYPERCORE') — allowed peers to find each other on the DHT without exposing the actual read key to the network, a privacy-by-default design. Dat DNS (DEP-0005) mapped human-readable domain names to cryptographic archive addresses via DNS TXT records or `/.well-known/dat` HTTPS endpoints, foreshadowing the kind of DNS-bridged discovery that SCP's DID resolution uses (§3.10).
 
 **The Beaker Browser.** Paul Frazee's Beaker Browser (2016-2022) was Dat's most visible consumer application — an Electron-based browser natively handling `dat://` URLs, enabling one-click website creation and peer-to-peer hosting. Archived in December 2022 after concluding the pure P2P browser model lacked product-market fit; the maintainer moved to Bluesky. It demonstrated both the promise and the sustainability challenges of building a full browser-embedded P2P stack.
 
@@ -50,7 +50,7 @@ Hypercore and SCP's event logs serve a structurally similar function: tamper-evi
 | Signing | Ed25519, single writer per log | Ed25519, multi-writer per context (MLS-authenticated) |
 | Verification | Sparse — verify any entry without full history | Proof-of-inclusion and proof-of-absence |
 | Multi-writer | Autobase (app-layer DAG linearization over single-writer cores) | Native via MLS group membership — the group key proves write authority |
-| Encryption | None at log level; transport-level only (Noise XX + XChaCha20-Poly1305) | MLS + sender-side AES-256-GCM at log level |
+| Encryption | None at log level; transport-level only (Noise XX + ChaCha20-Poly1305) | MLS + sender-side AES-256-GCM at log level |
 | Governance | None — data structure has no concept of rules, roles, or permissions | Full governance model: 30 action types, pluggable governance engines (§5.9) |
 
 **The key distinction:** Hypercore is a data structure. SCP event logs are a data structure embedded in a governance and encryption context. Hypercore answers "who appended this?" (signature verification). SCP event logs answer "who appended this, were they authorized to, under what governance, in what role, with what capabilities, and is it encrypted to the right group?"
@@ -105,6 +105,18 @@ SCP chose MLS for three reasons: (1) O(log n) scaling makes large contexts viabl
 **Why not use Hyperswarm directly:** Transport independence tenet. Different trust model. SCP relay architecture enables async delivery, multi-relay suppression resistance (§9.9.2), bridge fallback. Coupling to Hyperswarm would make SCP a Hyperswarm application rather than a transport-independent protocol.
 
 **What SCP borrows conceptually:** DHT-integrated hole punching as a reachability primitive (§10.12.3). Proof that zero-server P2P works at production scale (Keet). The append-only authenticated log as a tamper-evident history primitive — though SCP embeds it in a fundamentally richer trust context.
+
+### 11.1.5 References
+
+1. Ogden, M., McKelvey, K., & Buus, M. (2018). Dat — Distributed Dataset Synchronization and Versioning. *Scientific Data* 5, 180221 (Nature portfolio).
+2. Dat Foundation. History. https://dat.foundation/about/history/
+3. DEP-0005: Dat DNS. https://www.datprotocol.com/deps/0005-dns/
+4. DEP-0009: SLEEP Headers. https://www.datprotocol.com/deps/0009-sleep-headers/
+5. DEP-0010: Wire Protocol. https://www.datprotocol.com/deps/0010-wire-protocol/
+6. Hypercore Protocol documentation: https://docs.holepunch.to/
+7. RFC 9420: The Messaging Layer Security (MLS) Protocol. https://www.rfc-editor.org/rfc/rfc9420.html
+8. Signal. "Technology Preview: Private Groups." https://signal.org/blog/private-groups/
+9. Matrix.org. Megolm specification. https://spec.matrix.org/v1.17/olm-megolm/megolm/
 
 ---
 
@@ -242,7 +254,7 @@ GNUnet's DHT, R5N (Randomized Recursive Routing for Restricted-Route Networks), 
 - **Path recording:** When enabled, each hop appends an EdDSA signature over predecessor/successor keys and block hash. The combined put-path + get-path provides a verifiable route audit trail. Invalid signatures trigger path truncation.
 - **On-path validation:** Application-specific block validators run at each hop. Expired or malformed data is discarded in transit, preventing DHT pollution.
 - **Loop prevention:** 1024-bit Bloom filter (k=16) tracks visited peers per query, with capacity for ~200 entries before significant false-positive rates.
-- **Censorship resistance:** Randomized initial routing + repeated queries contacting different network subsets yields high retrieval success rates even with significant fractions of compromised nodes (Evans & Grothoff 2011, simulation results vary by topology and attack model).
+- **Censorship resistance:** Randomized initial routing + repeated queries contacting different network subsets yields ~80-90% GET retrieval with 10% randomly-placed malicious peers in a 2025-node small-world topology (Evans & Grothoff 2011, Fig. 3).
 - **IETF standardization:** draft-schanzen-r5n-07.
 
 **Comparison with Mainline DHT (used by did:dht):** Mainline uses purely greedy Kademlia routing — simpler, faster, but with no path recording, no on-path validation, and no structural censorship resistance. R5N's random walk phase and path validation are meaningful improvements for adversarial environments. SCP's dual-layer resolution (§3.10) — Mainline DHT + SCP relays — mitigates some of these risks through redundancy rather than routing-level resistance.
@@ -400,7 +412,7 @@ GNUnet's communicator model offers one lesson SCP has already partially adopted:
 
 **Anonymity vs accountability.** GNUnet's architecture is optimized for a world where state actors surveil communication and identity itself is dangerous. SCP's architecture is optimized for a world where AI agents act autonomously and verifiable provenance is necessary for trust. These are different futures; both are plausible.
 
-**Maturity.** GNUnet has been in development for 25+ years and remains explicitly experimental ("significant bugs and critical design flaws" per project documentation). No production deployments at scale. SCP cannot depend on experimental infrastructure for core protocol functions.
+**Maturity.** GNUnet has been in development for 25+ years and remains explicitly experimental (known major design issues in the CORE subsystems per project documentation (GNUnet 0.24 release notes)). No production deployments at scale. SCP cannot depend on experimental infrastructure for core protocol functions.
 
 ### 11.3.10 Open Questions
 
@@ -411,13 +423,18 @@ R5N's **randomized routing** and **path recording** offer censorship resistance 
 ### 11.3.11 References
 
 - Polot & Grothoff, "CADET: Confidential Ad-hoc Decentralized End-to-End Transport," Med-Hoc-Net 2014
-- Evans & Grothoff, "R5N: Randomized Recursive Routing for Restricted-Route Networks," NSS 2011
+- Evans & Grothoff, "R5N: Randomized Recursive Routing for Restricted-Route Networks," NSS 2011. https://grothoff.org/christian/nss2011.pdf
 - Mueller, Evans, Grothoff & Kamkar, "Autonomous NAT Traversal," 2010
 - Grothoff, "The GNUnet System," Habilitation thesis, Université de Rennes 1
 - IETF draft-schanzen-r5n-07 (R5N specification)
 - Wachs, Schanzenbach & Grothoff, "A Censorship-Resistant, Privacy-Enhancing and Fully Decentralized Name System," CANS 2014
-- RFC 9498: The GNU Name System (GNS specification, IETF)
-- LSD-0001 (GNS specification), LSD-0005 (did:gns), LSD-0007 (Communicators), LSD-0012 (CAKE)
+- RFC 9498: The GNU Name System (GNS specification, IETF). https://www.rfc-editor.org/rfc/rfc9498.html
+- LSD-0001 (GNS specification): https://lsd.gnunet.org/lsd0001/
+- LSD-0004 (CADET): https://lsd.gnunet.org/lsd0004/
+- LSD-0005 (did:gns): https://lsd.gnunet.org/lsd0005/
+- LSD-0007 (Communicators): https://lsd.gnunet.org/lsd0007/
+- LSD-0012 (CAKE): https://lsd.gnunet.org/lsd0012/
+- GNUnet project (experimental status): https://www.gnunet.org/en/
 
 ---
 
@@ -434,7 +451,7 @@ The network operates in two modes:
 - **Opennet.** Nodes connect to arbitrary peers discovered through the network. Topology optimization occurs via **path folding**: when a request succeeds, the requesting node may form a direct connection to the responding node, progressively organizing the network so that topologically close nodes hold nearby locations.
 - **Darknet (friend-to-friend).** Nodes connect only to manually-specified trusted peers. Because the social graph is fixed, topology optimization occurs via **location swapping**: nodes periodically exchange locations using the Metropolis–Hastings algorithm, minimizing the distance between connected peers. This creates a routable small-world network from an arbitrary trust graph — the key insight from Oskar Sandberg's work on distributed routing in small-world networks.
 
-Requests carry a **Hops-to-Live (HTL)** counter, starting at 18, decremented at each hop. Data is cached along the return path, with caching suppressed near the origin to protect sender anonymity (the HTL counter may be probabilistically decremented on the first hops). Data blocks are fixed-size: 32 KB for content blocks (CHK), 1 KB for signed metadata blocks (SSK).
+Requests carry a **Hops-to-Live (HTL)** counter, starting at 18, decremented at each hop. Two distinct mechanisms protect sender anonymity: (a) at maximum HTL (18), there is a 50% chance of NOT decrementing the counter, providing plausible deniability — a node forwarding at HTL 18 might be the originator or might have received it at 18 from another node; (b) caching is suppressed until HTL drops to 16 (for requests) or 15 (for inserts), preventing the first few hops from storing data that could identify the sender's neighborhood. Data blocks are fixed-size: 32 KB for content blocks (CHK), 1 KB for signed metadata blocks (SSK).
 
 ### 11.4.2 Key Types
 
@@ -443,13 +460,13 @@ Freenet's key system reflects its design as a content-addressed, publisher-anony
 | Key Type | Full Name | Purpose | Mutability | Size | Integrity |
 |----------|-----------|---------|------------|------|-----------|
 | **CHK** | Content Hash Key | Static files | Immutable — hash of encrypted content IS the key | 32 KB blocks | SHA-256 self-verifying |
-| **SSK** | Signed Subspace Key | Updateable content | Mutable — owner holds signing keypair | 1 KB blocks | RSA-2048 signature + SHA-256 |
+| **SSK** | Signed Subspace Key | Updateable content | Mutable — owner holds signing keypair | 1 KB blocks | 2048-bit asymmetric key signature + SHA-256 |
 | **USK** | Updatable Subspace Key | Versioned sites | SSK with version counter; clients probe for latest | 1 KB blocks | Inherits SSK verification |
-| **KSK** | Keyword Signed Key | Human-readable names | Mutable — key derived from passphrase | 1 KB blocks | Weak (anyone with passphrase can overwrite) |
+| **KSK** | Keyword Signed Key | Human-readable names | Mutable — key derived from a keyword | 1 KB blocks | Weak (anyone with the keyword can overwrite) |
 
 A CHK is `CHK@<SHA-256-hash>,<decryption-key>,<flags>`. The hash covers the encrypted content, so any node along the routing path can verify integrity by re-hashing — a hostile node altering data under a CHK is detected immediately. The decryption key is separate from the routing key: nodes route and cache content they cannot read.
 
-SSKs use an asymmetric keypair (RSA-2048 for signing, 256-bit symmetric for encryption). The public key hash serves as the routing key; only the private key holder can publish updates. Nodes verify signatures but cannot decrypt content (the symmetric key travels only in the URI, not in the routed data). USKs layer a version number atop SSKs, enabling clients to probe incrementally for the latest version — Freenet's mechanism for updateable content in an otherwise content-addressed system.
+SSKs use a 2048-bit asymmetric keypair (for signing, 256-bit symmetric for encryption). The public key hash serves as the routing key; only the private key holder can publish updates. Nodes verify signatures but cannot decrypt content (the symmetric key travels only in the URI, not in the routed data). USKs layer a version number atop SSKs, enabling clients to probe incrementally for the latest version — Freenet's mechanism for updateable content in an otherwise content-addressed system.
 
 ### 11.4.3 Content Lifecycle — The Sharpest Contrast
 
@@ -485,7 +502,7 @@ Freenet provides **publisher anonymity** by design — content propagates throug
 The anonymity-vs-accountability trade-off follows the same pattern as GNUnet (§11.3.2), with Freenet-specific mechanisms:
 
 - **HTL-based plausible deniability.** A node forwarding a request is indistinguishable from the node that originated it because the HTL counter may or may not decrement on the first hop.
-- **No protocol-level identity.** Nodes have transport-level cryptographic identities (JFki/Diffie-Hellman for link encryption), but nothing that identifies content authors.
+- **No protocol-level identity.** Nodes have transport-level cryptographic identities (JFKi (Just Fast Keying, initiator variant) with ECDH for link encryption), but nothing that identifies content authors.
 - **Web of Trust (WoT) plugin.** An optional application-layer identity and reputation system atop Freenet's storage. Identities are SSK keypairs; trust is numeric scores propagated through a social graph, weighted by distance. WoT functions primarily as a **spam filter** — in an anonymous network, trust scores determine whose content is displayed.
 - **Darknet trust.** Friend-to-friend connections encode trust at the network level, but this is connectivity trust, not content-level identity.
 
@@ -573,14 +590,15 @@ As of early 2026, Freenet 2023 has a working peer network, contract execution, a
 
 ### 11.4.10 References
 
-1. Clarke, I. (1999). *A Distributed Decentralised Information Storage and Retrieval System.* Unpublished final-year thesis, Division of Informatics, University of Edinburgh.
+1. Clarke, I. (1999). *A Distributed Decentralised Information Storage and Retrieval System.* Unpublished undergraduate thesis, Division of Informatics, University of Edinburgh. https://www.hyphanet.org/assets/papers/ddisrs.pdf
 2. Clarke, I., Sandberg, O., Wiley, B., & Hong, T. W. (2001). Freenet: A Distributed Anonymous Information Storage and Retrieval System. In H. Federrath (Ed.), *Designing Privacy Enhancing Technologies*, Lecture Notes in Computer Science, vol. 2009, pp. 46–66. Springer.
-3. Clarke, I., Sandberg, O., Toseland, M., & Verendel, V. (2010). Private Communication Through a Network of Trusted Connections: The Dark Freenet. Manuscript, https://www.hyphanet.org/assets/papers/freenet-0.7.5-paper.pdf
-4. Sandberg, O. (2006). Distributed Routing in Small-World Networks. In *Proceedings of the 8th Workshop on Algorithm Engineering and Experiments (ALENEX)*, pp. 144–155. SIAM.
+3. Clarke, I., Sandberg, O., Toseland, M., & Verendel, V. (2010). Private Communication Through a Network of Trusted Connections: The Dark Freenet. Manuscript. https://www.hyphanet.org/assets/papers/freenet-0.7.5-paper.pdf
+4. Sandberg, O. (2006). Distributed Routing in Small-World Networks. In *Proceedings of the 8th Workshop on Algorithm Engineering and Experiments (ALENEX)*, pp. 144–155. SIAM. https://freenetproject.org/assets/papers/swroute.pdf
 5. Kleinberg, J. (2000). The Small-World Phenomenon: An Algorithmic Perspective. In *Proceedings of the 32nd ACM Symposium on Theory of Computing (STOC)*, pp. 163–170.
 6. Evans, N. S., GauthierDickey, C., & Grothoff, C. (2007). Routing in the Dark: Pitch Black. In *Proceedings of the 23rd Annual Computer Security Applications Conference (ACSAC)*, pp. 305–314.
 7. Freenet Project. (2026). Freenet Manual: Components. https://freenet.org/resources/manual/components/
 8. Hyphanet Project. (2026). Hyphanet Wiki: Security Summary. https://github.com/hyphanet/wiki/wiki/Security-summary
+9. Hyphanet Wiki. https://github.com/hyphanet/wiki/wiki/
 
 ---
 
@@ -800,8 +818,8 @@ Zooko Wilcox-O'Hearn went on to found Least Authority Enterprises (2011, privacy
 
 ### 11.5.12 References
 
-- Wilcox-O'Hearn, Zooko & Warner, Brian. "Tahoe: the least-authority filesystem." *Proceedings of the 4th ACM International Workshop on Storage Security and Survivability (StorageSS '08)*, October 2008, pp. 21-26. doi:10.1145/1456469.1456474. Also: IACR Cryptology ePrint Archive, Paper 2012/524.
-- Tahoe-LAFS project documentation: https://tahoe-lafs.readthedocs.io/
+- Wilcox-O'Hearn, Zooko & Warner, Brian. "Tahoe: the least-authority filesystem." *Proceedings of the 4th ACM International Workshop on Storage Security and Survivability (StorageSS '08)*, October 2008, pp. 21-26. doi:10.1145/1456469.1456474. Also: IACR Cryptology ePrint Archive, Paper 2012/524. https://eprint.iacr.org/2012/524
+- Tahoe-LAFS project documentation: https://tahoe-lafs.readthedocs.io/en/latest/
 - Tahoe-LAFS source repository: https://github.com/tahoe-lafs/tahoe-lafs
 - Tahoe-LAFS capability specification: https://tahoe-lafs.org/trac/tahoe-lafs/wiki/Capabilities
 - Tahoe-LAFS file encoding specification: https://tahoe-lafs.readthedocs.io/en/latest/specifications/file-encoding.html
@@ -810,7 +828,10 @@ Zooko Wilcox-O'Hearn went on to found Least Authority Enterprises (2011, privacy
 - Tahoe-LAFS convergence secret: https://tahoe-lafs.readthedocs.io/en/latest/convergence-secret.html
 - Wilcox-O'Hearn, Zooko. "Names: Distributed, Secure, Human-Readable: Choose Two." 2001. (Origin of Zooko's triangle.)
 - Miller, Mark S. "Robust Composition: Towards a Unified Approach to Access Control and Concurrency Control." PhD thesis, Johns Hopkins University, 2006. (Foundation of the object-capability model.)
-- Dennis, Jack B. & Van Horn, Earl C. "Programming Semantics for Multiprogrammed Computations." *Communications of the ACM* 9(3), March 1966, pp. 143-155. (Origin of capability-based security.)
+- Dennis, Jack B. & Van Horn, Earl C. "Programming Semantics for Multiprogrammed Computations." *Communications of the ACM* 9(3), March 1966, pp. 143-155. (Origin of capability-based security.) https://dl.acm.org/doi/10.1145/365230.365252
+- Birgisson, A., Politz, J. G., Erlingsson, Ú., Taly, A., Vrable, M., & Lentczner, M. "Macaroons: Cookies with Contextual Caveats for Decentralized Authorization in the Cloud." *NDSS 2014*. https://research.google/pubs/macaroons-cookies-with-contextual-caveats-for-decentralized-authorization-in-the-cloud/
+- RFC 6749: The OAuth 2.0 Authorization Framework. https://datatracker.ietf.org/doc/html/rfc6749
+- RFC 9635: Grant Negotiation and Authorization Protocol (GNAP). https://www.rfc-editor.org/rfc/rfc9635.html
 - UCAN specification: https://github.com/ucan-wg/spec
 
 ---
@@ -821,7 +842,7 @@ Cjdns (2011, Caleb James DeLisle) and Yggdrasil (2017, Neil Alexander and Arceli
 
 ### 11.6.1 Self-Certifying Addressing
 
-The core parallel with SCP is self-certifying identity. In cjdns, a node's IPv6 address is the first 16 bytes of SHA-512(SHA-512(Curve25519 public key)), constrained to the `fc00::/8` prefix (addresses whose double-hash does not start with `0xFC` are discarded, requiring brute-force key generation). In Yggdrasil, addresses fall within the `0200::/7` range (deprecated IETF space repurposed to avoid collisions with `fc00::/7`), derived from SHA-512 of the node's Ed25519 public key with a compression scheme that encodes the number of leading one-bits as a prefix byte.
+The core parallel with SCP is self-certifying identity. In cjdns, a node's IPv6 address is the first 16 bytes of SHA-512(SHA-512(Curve25519 public key)), constrained to the `fc00::/8` prefix (addresses whose double-hash does not start with `0xFC` are discarded, requiring brute-force key generation). In Yggdrasil, addresses fall within the `0200::/7` range (deprecated IETF space repurposed to avoid collisions with `fc00::/7`), derived from SHA-512 of the node's public key (Curve25519 in v0.1-v0.3, Ed25519 since v0.4) with a compression scheme that encodes the number of leading one-bits as a prefix byte.
 
 SCP's `did:dht:<z-base-32-Ed25519-public-key>` follows the same principle: the identifier IS the public key, no registration authority required, collision-resistant by construction. The difference is representational — cjdns and Yggdrasil encode keys as IPv6 addresses (lossy truncation), SCP encodes them as DID strings (lossless z-base-32). All three systems achieve the same property: verifying an identity requires only the identifier itself.
 
@@ -857,6 +878,13 @@ Cjdns and Yggdrasil are network-layer protocols — they replace IP routing with
 - **No group encryption.** Both provide point-to-point encrypted channels. Neither has multi-party group encryption with forward secrecy and post-compromise security. SCP: MLS groups are the fundamental communication primitive.
 - **Identity is an address, not a document.** A cjdns/Yggdrasil address proves key ownership. An SCP DID resolves to a document with multiple verification methods, attestation chains, service endpoints, and agent delegation — identity as a rich, evolving structure rather than a static hash (§3, §11.2).
 - **Transport substrate, not alternative.** SCP lists Yggdrasil/cjdns as Tier 2 transport adapters (§10.5). Their globally-routable encrypted IPv6 space could serve as infrastructure-independent transport for SCP relays — especially valuable in scenarios where conventional internet routing is unreliable or surveilled. The adapter mapping is thin: SCP relay connections use the mesh network's IPv6 addresses instead of public IPs, inheriting NAT traversal and encryption for free.
+
+### 11.6.6 References
+
+- DeLisle, C. J. cjdns Whitepaper. https://github.com/cjdelisle/cjdns/blob/master/doc/Whitepaper.md
+- Alexander, N. & Sherwin, A. (Arceliar). Yggdrasil Whitepaper. https://github.com/Arceliar/yggdrasil-go/blob/master/doc/Whitepaper.md
+- Yggdrasil Network. "Addressing." 2018. https://yggdrasil-network.github.io/2018/07/28/addressing.html
+- Yggdrasil Network. "Preparing for v0.4." 2021. https://yggdrasil-network.github.io/2021/06/19/preparing-for-v0-4.html
 
 ---
 
