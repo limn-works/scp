@@ -78,31 +78,24 @@ impl std::fmt::Display for ContextState {
     }
 }
 
-/// Memory scope for provenance attachment.
-enum MemoryScope {
-    Full,
-    Summary,
-    Ephemeral,
-}
+use scp_protocol::context::params::MemoryScope;
 
-impl MemoryScope {
-    fn from_str(s: &str) -> Option<Self> {
-        match s {
-            "full" => Some(Self::Full),
-            "summary" => Some(Self::Summary),
-            "ephemeral" => Some(Self::Ephemeral),
-            _ => None,
-        }
+/// Parses a lowercase memory scope string from JS to the protocol type.
+fn parse_memory_scope(s: &str) -> Option<MemoryScope> {
+    match s {
+        "full" => Some(MemoryScope::Full),
+        "summary" => Some(MemoryScope::Summary),
+        "ephemeral" => Some(MemoryScope::Ephemeral),
+        _ => None,
     }
 }
 
-impl std::fmt::Display for MemoryScope {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Full => write!(f, "Full"),
-            Self::Summary => write!(f, "Summary"),
-            Self::Ephemeral => write!(f, "Ephemeral"),
-        }
+/// Returns the display string for a `MemoryScope` (PascalCase for JSON output).
+fn memory_scope_as_str(ms: &MemoryScope) -> &'static str {
+    match ms {
+        MemoryScope::Full => "Full",
+        MemoryScope::Summary => "Summary",
+        MemoryScope::Ephemeral => "Ephemeral",
     }
 }
 
@@ -311,7 +304,7 @@ pub fn provenance_attach(
         ))
     })?;
 
-    let ms = MemoryScope::from_str(&memory_scope).ok_or_else(|| {
+    let ms = parse_memory_scope(&memory_scope).ok_or_else(|| {
         JsError::new(&format!(
             "[SCP-VALID-7213] invalid memory_scope: '{memory_scope}'"
         ))
@@ -689,7 +682,7 @@ fn build_canonical_provenance_bytes(
         purpose,
         discovery_method,
         age: CanonicalDuration { secs: 0, nanos: 0 },
-        memory_scope: &memory_scope.to_string(),
+        memory_scope: memory_scope_as_str(memory_scope),
         chain_depth,
         chain_path,
         payment_amount: None,
@@ -1362,32 +1355,32 @@ mod tests_native {
     #[test]
     fn memory_scope_from_str_rejects_pascal_case() {
         // PascalCase must be rejected to match reference bridge (PyO3/NAPI)
-        assert!(MemoryScope::from_str("Full").is_none());
-        assert!(MemoryScope::from_str("Summary").is_none());
-        assert!(MemoryScope::from_str("Ephemeral").is_none());
+        assert!(parse_memory_scope("Full").is_none());
+        assert!(parse_memory_scope("Summary").is_none());
+        assert!(parse_memory_scope("Ephemeral").is_none());
     }
 
     #[test]
     fn memory_scope_from_str_lowercase() {
         assert!(matches!(
-            MemoryScope::from_str("full"),
+            parse_memory_scope("full"),
             Some(MemoryScope::Full)
         ));
         assert!(matches!(
-            MemoryScope::from_str("summary"),
+            parse_memory_scope("summary"),
             Some(MemoryScope::Summary)
         ));
         assert!(matches!(
-            MemoryScope::from_str("ephemeral"),
+            parse_memory_scope("ephemeral"),
             Some(MemoryScope::Ephemeral)
         ));
     }
 
     #[test]
     fn memory_scope_from_str_invalid() {
-        assert!(MemoryScope::from_str("FULL").is_none());
-        assert!(MemoryScope::from_str("invalid").is_none());
-        assert!(MemoryScope::from_str("").is_none());
+        assert!(parse_memory_scope("FULL").is_none());
+        assert!(parse_memory_scope("invalid").is_none());
+        assert!(parse_memory_scope("").is_none());
     }
 
     // -- compute_quality with lowercase-parsed enums --
