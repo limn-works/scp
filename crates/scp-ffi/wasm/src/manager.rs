@@ -4935,7 +4935,6 @@ mod tests {
         assert_eq!(json, json2, "roundtrip mismatch for {action:?}");
     }
 
-    use scp_protocol::context::governance::DeadlockJustification;
     use scp_protocol::context::roles::Capability;
     use scp_protocol::economy::types::Amount;
 
@@ -5152,7 +5151,7 @@ mod tests {
                 "justification": {
                     "unavailable_dids": [],
                     "missed_windows": [],
-                    "detected_at": 1700000000
+                    "detected_at": 1_700_000_000
                 }
             }
         }));
@@ -5229,7 +5228,7 @@ mod tests {
                     "template_id": null
                 },
                 "reason": "protocol upgrade",
-                "grace_period_secs": 604800,
+                "grace_period_secs": 604_800,
                 "auto_invite": true
             }
         }));
@@ -5247,8 +5246,8 @@ mod tests {
 
     /// Builds all 30 `GovernanceAction` variants for exhaustive testing.
     ///
-    /// Uses JSON deserialization to construct complex inner types (ContextParams,
-    /// ToolRegistration, etc.) rather than manual struct construction.
+    /// Uses JSON deserialization to construct complex inner types (`ContextParams`,
+    /// `ToolRegistration`, etc.) rather than manual struct construction.
     fn all_wasm_governance_actions() -> Vec<GovernanceAction> {
         let json_actions: Vec<serde_json::Value> = vec![
             serde_json::json!({"AddMember": {"did": "d", "role": "r"}}),
@@ -5320,11 +5319,11 @@ mod tests {
                     "ttl": null, "memory_scope": "Ephemeral", "governance": "SingleAdmin",
                     "template_id": null
                 },
-                "reason": "upgrade", "grace_period_secs": 604800, "auto_invite": true
+                "reason": "upgrade", "grace_period_secs": 604_800, "auto_invite": true
             }}),
             serde_json::json!("CancelContextMigration"),
         ];
-        json_actions.into_iter().map(|v| from_json(v)).collect()
+        json_actions.into_iter().map(from_json).collect()
     }
 
     #[test]
