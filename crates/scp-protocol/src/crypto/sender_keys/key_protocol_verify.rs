@@ -547,7 +547,7 @@ pub fn verify_block_notification(
 ///
 /// ```
 /// use std::collections::{HashMap, HashSet};
-/// use scp_core::crypto::sender_keys::key_protocol::expand_block_list;
+/// use scp_protocol::crypto::sender_keys::expand_block_list;
 ///
 /// let mut block_list = HashSet::new();
 /// block_list.insert("did:dht:dave".to_owned());

@@ -318,7 +318,7 @@ impl Capability {
     /// # Examples
     ///
     /// ```
-    /// use scp_core::context::roles::Capability;
+    /// use scp_protocol::context::roles::Capability;
     ///
     /// assert_eq!(Capability::ToolInvokeAll.ucan_capability_name(), "tool_invoke:*");
     /// assert_eq!(Capability::MessagesWrite.ucan_capability_name(), "messages:write");

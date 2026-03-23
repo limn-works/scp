@@ -69,8 +69,8 @@ pub enum MlsImpact {
 /// # Examples
 ///
 /// ```rust
-/// use scp_core::context::governance::mls_integration::{classify_action, MlsImpact};
-/// use scp_core::context::governance::GovernanceAction;
+/// use scp_protocol::context::governance::mls_integration::{classify_action, MlsImpact};
+/// use scp_protocol::context::governance::GovernanceAction;
 /// use scp_primitives::DID;
 ///
 /// let add = GovernanceAction::AddMember {

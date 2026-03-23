@@ -23,7 +23,7 @@
 //! # Examples
 //!
 //! ```
-//! use scp_core::crypto::ucan::{UcanToken, UcanHeader, UcanPayload, Attenuation};
+//! use scp_protocol::crypto::ucan::{UcanToken, UcanHeader, UcanPayload, Attenuation};
 //!
 //! let header = UcanHeader::new();
 //! assert_eq!(header.alg, "EdDSA");

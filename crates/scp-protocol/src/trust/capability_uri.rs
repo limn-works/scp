@@ -12,7 +12,7 @@
 //! # Examples
 //!
 //! ```
-//! use scp_core::trust::CapabilityUri;
+//! use scp_protocol::trust::CapabilityUri;
 //!
 //! // Protocol capability
 //! let uri: CapabilityUri = "scp:capability:prompt-injection-resistance/v1".parse().unwrap();

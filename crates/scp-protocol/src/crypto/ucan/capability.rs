@@ -20,7 +20,7 @@
 //! # Examples
 //!
 //! ```
-//! use scp_core::crypto::ucan::capability::CapabilityUri;
+//! use scp_protocol::crypto::ucan::capability::CapabilityUri;
 //!
 //! // Parse a specific context capability
 //! let uri: CapabilityUri = "scp:ctx:abc123/messages:write".parse().unwrap();

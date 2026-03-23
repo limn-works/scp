@@ -17,10 +17,10 @@
 //! # Examples
 //!
 //! ```
-//! use scp_core::trust::capability_registry::{
+//! use scp_protocol::trust::capability_registry::{
 //!     lookup_protocol_capability, is_known_protocol_capability, validate_capability_uri,
 //! };
-//! use scp_core::trust::CapabilityUri;
+//! use scp_protocol::trust::CapabilityUri;
 //!
 //! // Lookup a known protocol capability
 //! let entry = lookup_protocol_capability("scp:capability:prompt-injection-resistance/v1");
@@ -450,7 +450,7 @@ static SYSTEM_REGISTRY: LazyLock<HashMap<String, RegistryEntry>> = LazyLock::new
 /// # Examples
 ///
 /// ```
-/// use scp_core::trust::capability_registry::lookup_protocol_capability;
+/// use scp_protocol::trust::capability_registry::lookup_protocol_capability;
 ///
 /// let entry = lookup_protocol_capability("scp:capability:prompt-injection-resistance/v1");
 /// assert!(entry.is_some());
@@ -478,7 +478,7 @@ pub fn lookup_system_capability(uri: &str) -> Option<&'static RegistryEntry> {
 /// # Examples
 ///
 /// ```
-/// use scp_core::trust::capability_registry::is_known_protocol_capability;
+/// use scp_protocol::trust::capability_registry::is_known_protocol_capability;
 ///
 /// assert!(is_known_protocol_capability("scp:capability:schema-validation/v1"));
 /// assert!(!is_known_protocol_capability("scp:capability:nonexistent/v1"));
@@ -517,7 +517,7 @@ pub fn is_known_system_capability(uri: &str) -> bool {
 /// # Examples
 ///
 /// ```
-/// use scp_core::trust::capability_registry::validate_capability_uri;
+/// use scp_protocol::trust::capability_registry::validate_capability_uri;
 ///
 /// // Known protocol capability — accepted
 /// assert!(validate_capability_uri("scp:capability:prompt-injection-resistance/v1").is_ok());

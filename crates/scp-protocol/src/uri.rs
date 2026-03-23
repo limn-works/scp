@@ -19,7 +19,7 @@
 //! # Examples
 //!
 //! ```
-//! use scp_core::uri::ScpUri;
+//! use scp_protocol::uri::ScpUri;
 //!
 //! let uri: ScpUri = "scp://context/a1b2c3d4?relay=wss%3A%2F%2Frelay.example.com%2Fscp%2Fv1"
 //!     .parse()

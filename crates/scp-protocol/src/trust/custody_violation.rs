@@ -99,7 +99,7 @@ const CATEGORY_A_RESOURCES: &[&str] = &[
 /// # Examples
 ///
 /// ```
-/// use scp_core::trust::custody_violation::category_a_resources;
+/// use scp_protocol::trust::custody_violation::category_a_resources;
 ///
 /// let resources = category_a_resources();
 /// assert!(resources.contains(&"did_document"));
@@ -121,7 +121,7 @@ pub const fn category_a_resources() -> &'static [&'static str] {
 /// # Examples
 ///
 /// ```
-/// use scp_core::trust::custody_violation::{classify_action, ActionCategory};
+/// use scp_protocol::trust::custody_violation::{classify_action, ActionCategory};
 ///
 /// assert_eq!(classify_action("did_document"), ActionCategory::CategoryA);
 /// assert_eq!(classify_action("verification_method"), ActionCategory::CategoryA);

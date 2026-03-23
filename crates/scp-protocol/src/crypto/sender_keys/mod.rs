@@ -92,7 +92,7 @@ impl std::fmt::Debug for SenderKey {
 /// # Examples
 ///
 /// ```
-/// use scp_core::crypto::sender_keys::generate_sender_key;
+/// use scp_protocol::crypto::sender_keys::generate_sender_key;
 ///
 /// let key = generate_sender_key();
 /// assert_eq!(key.as_bytes().len(), 32);
