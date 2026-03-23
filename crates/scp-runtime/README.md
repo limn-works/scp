@@ -2,7 +2,7 @@
 
 Async runtime orchestration for [SCP](https://github.com/limn-works/scp) (Shared Context Protocol).
 
-Implements context lifecycle management (ContextManager), MLS group encryption (OpenMLS wrapper), UCAN minting, governance timeout enforcement, persistence bridges, tool invocation, and async identity operations. Depends on `scp-protocol` for pure sync types and `scp-platform` for platform abstraction traits.
+Implements context lifecycle management (`ContextManager`), MLS group encryption (`OpenMLS` wrapper), UCAN minting, governance timeout enforcement, persistence bridges, tool invocation, and async identity operations. Depends on `scp-protocol` for pure sync types and `scp-platform` for platform abstraction traits.
 
 ## Quick Start
 
@@ -139,12 +139,12 @@ Platform layer (scp-platform)
   Storage trait              async key-value store
   EncryptedStorage trait     sealed — use EncryptingAdapter<S> to wrap any Storage
 
-Core layer (scp-core)
+Runtime layer (scp-runtime)
   ProtocolRepository<S>           typed domain wrapper over Storage (100+ async methods)
   ProtocolRepositoryContextBridge<S>    sync bridge: ProtocolRepository → ContextPersistence trait
   ProtocolRepositoryEventLogBridge<S>   sync bridge: ProtocolRepository → EventLogPersistence trait
 
-Provider layer (scp-core::context)
+Provider layer (scp-runtime::context)
   ContextCryptoProvider      MLS group + sender key operations
   ContextTransportProvider   relay connectivity + message sending
   ContextEventLogProvider    event log init/append/read/export/import
