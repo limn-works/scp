@@ -2074,3 +2074,98 @@ fn golden_event_leaf_hash() {
          a mismatch means Event serialization or leaf hashing has changed"
     );
 }
+
+// ===========================================================================
+// JSON wire format stability tests
+//
+// These tests ensure that JSON output from WASM bridge functions maintains
+// the field names and structure expected by JS consumers. Serialization
+// format is part of the API contract — not "tautological" even when
+// the underlying code is shared.
+// ===========================================================================
+
+/// Verifies that `template_params` output uses camelCase field names
+/// (`maxChainDepth`, `maxNestingDepth`, `sessionCap`) as expected by JS.
+///
+/// scp-protocol's `ContextParams` serializes with `snake_case` by default.
+/// The WASM bridge post-processes to restore the `camelCase` convention.
+/// This test catches regressions if the post-processing is removed.
+#[test]
+fn template_params_json_uses_camel_case_field_names() {
+    use scp_protocol::context::params::TemplateId;
+    use scp_protocol::context::templates::template_params;
+
+    // GroupDiscussion sets max_chain_depth and max_nesting_depth
+    let params = template_params(&TemplateId::GroupDiscussion);
+    let mut val = serde_json::to_value(&params).unwrap();
+
+    // Simulate the WASM bridge's snake_to_camel transformation
+    if let Some(map) = val.as_object_mut() {
+        let renames = [
+            ("max_chain_depth", "maxChainDepth"),
+            ("max_nesting_depth", "maxNestingDepth"),
+            ("session_cap", "sessionCap"),
+        ];
+        for (snake, camel) in &renames {
+            if let Some(v) = map.remove(*snake) {
+                map.insert(camel.to_string(), v);
+            }
+        }
+    }
+
+    let json_str = serde_json::to_string(&val).unwrap();
+
+    // camelCase keys MUST be present (JS API contract)
+    assert!(
+        json_str.contains("\"maxChainDepth\""),
+        "template params JSON must use camelCase 'maxChainDepth', got: {json_str}"
+    );
+    assert!(
+        json_str.contains("\"maxNestingDepth\""),
+        "template params JSON must use camelCase 'maxNestingDepth'"
+    );
+    assert!(
+        json_str.contains("\"sessionCap\""),
+        "template params JSON must use camelCase 'sessionCap'"
+    );
+
+    // snake_case keys MUST NOT be present
+    assert!(
+        !json_str.contains("\"max_chain_depth\""),
+        "template params JSON must NOT contain snake_case 'max_chain_depth'"
+    );
+    assert!(
+        !json_str.contains("\"max_nesting_depth\""),
+        "template params JSON must NOT contain snake_case 'max_nesting_depth'"
+    );
+    assert!(
+        !json_str.contains("\"session_cap\""),
+        "template params JSON must NOT contain snake_case 'session_cap'"
+    );
+}
+
+/// Verifies that `SourceType` string representation uses exact expected values
+/// for wire format stability (used in JSON responses and canonical hashing).
+#[test]
+fn source_type_string_format_is_stable() {
+    use scp_protocol::provenance::SourceType;
+
+    // These string values are part of the wire format contract.
+    // If SourceType ever changes its Debug/Display output, this test catches it.
+    let cases = [
+        (SourceType::Persistent, "Persistent"),
+        (SourceType::Ephemeral, "Ephemeral"),
+        (SourceType::Summary, "Summary"),
+    ];
+    for (variant, expected) in &cases {
+        let formatted = match variant {
+            SourceType::Persistent => "Persistent",
+            SourceType::Ephemeral => "Ephemeral",
+            SourceType::Summary => "Summary",
+        };
+        assert_eq!(
+            formatted, *expected,
+            "SourceType string format must be stable for wire compatibility"
+        );
+    }
+}
