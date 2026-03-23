@@ -2005,13 +2005,13 @@ impl WasmRateLimitTracker {
 
     /// Records an auto-accept event at the current time.
     fn record_accept(&mut self) {
-        self.accepts_ms.push(js_sys::Date::now());
+        self.accepts_ms.push(crate::time::now_ms());
     }
 
     /// Checks whether an additional auto-accept is allowed under the given
     /// rate limit (`max_count` within `window_secs`). Prunes expired entries.
     fn is_allowed(&mut self, max_count: u32, window_secs: f64) -> bool {
-        let now_ms = js_sys::Date::now();
+        let now_ms = crate::time::now_ms();
         let window_ms = window_secs * 1000.0;
         self.accepts_ms.retain(|&t| (now_ms - t) < window_ms);
         self.accepts_ms.len() < max_count as usize

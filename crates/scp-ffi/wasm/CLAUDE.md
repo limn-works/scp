@@ -49,7 +49,7 @@ The following modules previously contained standalone WASM reimplementations. Af
 | Provenance hashing (`provenance.rs`) | WASM-local canonical byte construction (`CanonicalProvenance`) |
 | Attestation canonical bytes | WASM-local canonical signing byte construction |
 | Role capability checking (`manager.rs`) | `member_has_capability` with WASM-local ceiling intersection |
-| Governance proposal lifecycle (`manager.rs`) | `WasmProposal`, resolved proposal eviction, proposal JSON serialization |
+| Governance proposal lifecycle (`manager.rs`) | `GovernanceProposal` (from scp-protocol), resolved proposal eviction, proposal JSON serialization |
 
 ## Module Structure
 
