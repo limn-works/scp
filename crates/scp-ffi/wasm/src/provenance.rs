@@ -27,38 +27,18 @@ use zeroize::Zeroizing;
 // Constants (mirror scp-core::provenance::attach)
 // ---------------------------------------------------------------------------
 
-/// Default maximum chain depth (8 hops, ADR-043).
-pub(crate) const DEFAULT_MAX_CHAIN_DEPTH: u8 = 8;
+// Import from scp-protocol.
+use scp_protocol::provenance::SourceType;
+pub(crate) use scp_protocol::provenance::attach::DEFAULT_MAX_CHAIN_DEPTH;
 
-// ---------------------------------------------------------------------------
-// Local enums (mirror scp-core::provenance)
-// ---------------------------------------------------------------------------
-
-/// Source type for provenance quality evaluation.
-enum SourceType {
-    Persistent,
-    Ephemeral,
-    Summary,
-}
-
-impl SourceType {
-    fn from_str(s: &str) -> Option<Self> {
-        match s {
-            "persistent" => Some(Self::Persistent),
-            "ephemeral" => Some(Self::Ephemeral),
-            "summary" => Some(Self::Summary),
-            _ => None,
-        }
-    }
-}
-
-impl std::fmt::Display for SourceType {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Persistent => write!(f, "Persistent"),
-            Self::Ephemeral => write!(f, "Ephemeral"),
-            Self::Summary => write!(f, "Summary"),
-        }
+/// Parses a lowercase source type string from the JS JSON API to the
+/// canonical `SourceType` enum from scp-protocol.
+fn parse_source_type(s: &str) -> Option<SourceType> {
+    match s {
+        "persistent" => Some(SourceType::Persistent),
+        "ephemeral" => Some(SourceType::Ephemeral),
+        "summary" => Some(SourceType::Summary),
+        _ => None,
     }
 }
 
@@ -242,7 +222,7 @@ pub fn evaluate_provenance_quality(
 
     let has_provenance = source_context.is_some();
 
-    let st = SourceType::from_str(&source_type).ok_or_else(|| {
+    let st = parse_source_type(&source_type).ok_or_else(|| {
         JsError::new(&format!(
             "[SCP-VALID-7201] invalid source_type: '{source_type}'"
         ))
@@ -324,7 +304,7 @@ pub fn provenance_attach(
         ));
     }
 
-    let st = SourceType::from_str(&source_type).ok_or_else(|| {
+    let st = parse_source_type(&source_type).ok_or_else(|| {
         JsError::new(&format!(
             "[SCP-VALID-7212] invalid source_type: '{source_type}'"
         ))
@@ -373,7 +353,7 @@ pub fn provenance_attach(
     // The field must be present for structural parity with the NAPI bridge.
     let result = serde_json::json!({
         "source_context": source_context_id,
-        "source_type": st.to_string(),
+        "source_type": format!("{st:?}"),
         "counterparties": counterparties,
         "memory_scope": ms.to_string(),
         "chain_depth": chain_depth,
@@ -688,7 +668,7 @@ fn build_canonical_provenance_bytes(
 ) -> Vec<u8> {
     let canonical = CanonicalProvenance {
         source_context,
-        source_type: &source_type.to_string(),
+        source_type: &format!("{source_type:?}"),
         counterparties,
         purpose,
         discovery_method,
@@ -1290,32 +1270,32 @@ mod tests_native {
     #[test]
     fn source_type_from_str_rejects_pascal_case() {
         // PascalCase must be rejected to match reference bridge (PyO3/NAPI)
-        assert!(SourceType::from_str("Persistent").is_none());
-        assert!(SourceType::from_str("Ephemeral").is_none());
-        assert!(SourceType::from_str("Summary").is_none());
+        assert!(parse_source_type("Persistent").is_none());
+        assert!(parse_source_type("Ephemeral").is_none());
+        assert!(parse_source_type("Summary").is_none());
     }
 
     #[test]
     fn source_type_from_str_lowercase() {
         assert!(matches!(
-            SourceType::from_str("persistent"),
+            parse_source_type("persistent"),
             Some(SourceType::Persistent)
         ));
         assert!(matches!(
-            SourceType::from_str("ephemeral"),
+            parse_source_type("ephemeral"),
             Some(SourceType::Ephemeral)
         ));
         assert!(matches!(
-            SourceType::from_str("summary"),
+            parse_source_type("summary"),
             Some(SourceType::Summary)
         ));
     }
 
     #[test]
     fn source_type_from_str_invalid() {
-        assert!(SourceType::from_str("PERSISTENT").is_none());
-        assert!(SourceType::from_str("invalid").is_none());
-        assert!(SourceType::from_str("").is_none());
+        assert!(parse_source_type("PERSISTENT").is_none());
+        assert!(parse_source_type("invalid").is_none());
+        assert!(parse_source_type("").is_none());
     }
 
     // -- ContextState --
@@ -1398,15 +1378,15 @@ mod tests_native {
 
     #[test]
     fn compute_quality_with_lowercase_parsed_enums() {
-        let st = SourceType::from_str("persistent").unwrap();
+        let st = parse_source_type("persistent").unwrap();
         let cs = ContextState::from_str("active").unwrap();
         assert_eq!(compute_quality(true, &st, cs, true), 3);
 
-        let st2 = SourceType::from_str("summary").unwrap();
+        let st2 = parse_source_type("summary").unwrap();
         let cs2 = ContextState::from_str("closed_with_summary_verified").unwrap();
         assert_eq!(compute_quality(true, &st2, cs2, true), 2);
 
-        let st3 = SourceType::from_str("ephemeral").unwrap();
+        let st3 = parse_source_type("ephemeral").unwrap();
         let cs3 = ContextState::from_str("closed_ephemeral").unwrap();
         assert_eq!(compute_quality(true, &st3, cs3, true), 1);
         assert_eq!(compute_quality(true, &st3, cs3, false), 0);
