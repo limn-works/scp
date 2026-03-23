@@ -40,7 +40,7 @@ The following modules previously contained standalone WASM reimplementations. Af
 | `WasmContextManager` state management (`manager.rs`) | `thread_local` `RefCell`, single-threaded — no `Mutex`/`DashMap` |
 | `custody.rs` / `storage.rs` JS callback injection | ADR-022: WebCrypto and OPFS/IndexedDB injection points |
 | `WasmCryptoState` | MLS + sender key orchestration (double encryption) |
-| `WasmGovernanceAction`, `WasmContextEvent` | Different serde format for JS (JSON, not MessagePack) |
+| Governance dispatch methods (`manager.rs`) | DID↔String conversion at protocol boundary, JSON serialization of typed params |
 | Address parsing in `discovery.rs` | Interleaved with WASM-specific JS-facing logic |
 | `scpid.rs` bridge glue | `#[wasm_bindgen]` functions, JS error mapping, WASM time/CSPRNG. Types and constants imported from `scp_protocol::identity::scpid`. |
 | `reference_verify.rs` | Uses browser Fetch API |

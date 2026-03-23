@@ -20,7 +20,8 @@ use scp_protocol::context::templates::{
 };
 
 use crate::error::ScpWasmError;
-use crate::manager::{WasmGovernanceAction, with_manager};
+use crate::manager::with_manager;
+use scp_protocol::context::governance::GovernanceAction;
 
 // ---------------------------------------------------------------------------
 // JsMessageCallback — JS-injected message stream callback
@@ -609,7 +610,7 @@ pub fn context_drain_events(handle: &WasmContextHandle) -> String {
 /// * `handle` — The context handle.
 /// * `initiator_did` — DID of the member requesting the governance action.
 /// * `proposal_id` — Unique proposal ID for replay protection.
-/// * `action_json` — JSON-encoded governance action (see `WasmGovernanceAction`).
+/// * `action_json` — JSON-encoded governance action (see `GovernanceAction`).
 ///
 /// # Returns
 ///
@@ -627,7 +628,7 @@ pub fn context_execute_governance(
     let context_id = handle.context_id();
 
     future_to_promise(async move {
-        let action: WasmGovernanceAction = serde_json::from_str(&action_json).map_err(|e| {
+        let action: GovernanceAction = serde_json::from_str(&action_json).map_err(|e| {
             ScpWasmError::Validation {
                 message: format!("action_json is not valid: {e}"),
                 code: "SCP-VALID-7000".to_owned(),
@@ -686,14 +687,13 @@ pub fn context_governance_propose(
     let context_id = handle.context_id();
 
     future_to_promise(async move {
-        let action: crate::manager::WasmGovernanceAction = serde_json::from_str(&action_json)
-            .map_err(|e| {
-                ScpWasmError::Validation {
-                    message: format!("action_json is not valid: {e}"),
-                    code: "SCP-CTX-2040".to_owned(),
-                }
-                .into_js()
-            })?;
+        let action: GovernanceAction = serde_json::from_str(&action_json).map_err(|e| {
+            ScpWasmError::Validation {
+                message: format!("action_json is not valid: {e}"),
+                code: "SCP-CTX-2040".to_owned(),
+            }
+            .into_js()
+        })?;
 
         let result = with_manager(|mgr| {
             mgr.propose_governance_action(&context_id, &proposer_did, &proposal_id, &action)

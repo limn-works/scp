@@ -219,7 +219,7 @@ impl Default for MembershipState {
 /// Used for `WelcomeGenerated` fields (`welcome_bytes`, `commit_bytes`) which
 /// contain MLS keying material (tree secrets, epoch keys). Printing these via
 /// `Debug` in log or panic output would leak cryptographic secrets.
-#[derive(Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq, serde::Serialize)]
 pub struct RedactedBytes(pub Vec<u8>);
 
 impl std::fmt::Debug for RedactedBytes {
@@ -233,7 +233,7 @@ impl std::fmt::Debug for RedactedBytes {
 // ---------------------------------------------------------------------------
 
 /// Events produced by context operations, buffered for the receive stream.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub enum ContextEvent {
     /// A member joined the context.
     MemberJoined {
