@@ -48,7 +48,7 @@ pub enum MessageType {
     /// Sender key distribution sub-protocol message (§9.16).
     ///
     /// The payload is a MessagePack-serialized
-    /// [`SenderKeyDistributionMessage`](crate::crypto::sender_keys::key_protocol::SenderKeyDistributionMessage)
+    /// [`SenderKeyDistributionMessage`](crate::crypto::sender_keys::SenderKeyDistributionMessage)
     /// carrying epoch advances, key requests, key responses, or block
     /// notifications. This discriminator allows the transport layer to route
     /// sender key protocol messages through the existing envelope pipeline
@@ -449,7 +449,7 @@ pub fn compute_provenance_hash(provenance: Option<&Provenance>) -> Result<[u8; 3
 
 /// Computes the canonical hash over all critical envelope fields.
 ///
-/// A domain separator ([`DOMAIN_SEPARATOR`]) is prepended to prevent
+/// A domain separator (`"SCP-INNER-ENVELOPE-V1:"`) is prepended to prevent
 /// cross-protocol signature confusion when the same Ed25519 key is reused
 /// across different signing contexts.
 ///

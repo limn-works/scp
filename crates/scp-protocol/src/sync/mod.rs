@@ -6,11 +6,11 @@
 //! three-tier offline/sync strategy defined in ADR-029:
 //!
 //! - **Tier 1 (Short offline, < 4 hours):** Relay buffering and sequential MLS
-//!   catch-up. See [`hours_offline`].
+//!   catch-up. See `hours_offline` (in `scp-runtime`).
 //! - **Tier 2 (Extended offline, 4 hours to 7 days):** State snapshot comparison
-//!   and delta sync with selective epoch reconstruction. See [`days_offline`].
+//!   and delta sync with selective epoch reconstruction. See `days_offline` (in `scp-runtime`).
 //! - **Tier 3 (Long offline, > 7 days):** Forced re-join via MLS group state
-//!   reset. See [`weeks_offline`].
+//!   reset. See `weeks_offline` (in `scp-runtime`).
 //!
 //! All tiers use the Merkle event log (ADR-011) as the authoritative state
 //! reconciliation mechanism and the relay's store-and-forward capability
@@ -21,13 +21,13 @@
 //! - [`conflict_resolution`] — Offline conflict resolution for concurrent
 //!   governance changes: metadata first-writer-wins, governance Merkle-ordered
 //!   resolution, deadlock detection, and context fork (SCP-124).
-//! - [`hours_offline`] — Tier 1 hours-scale offline recovery: relay message
+//! - `hours_offline` (in `scp-runtime`) — Tier 1 hours-scale offline recovery: relay message
 //!   buffer retrieval, MLS epoch catch-up, automatic Update issuance, reorder
 //!   buffering, and `KeyPackage` pre-publication for offline member addition.
-//! - [`days_offline`] — Tier 2 days-scale offline recovery: state snapshot
+//! - `days_offline` (in `scp-runtime`) — Tier 2 days-scale offline recovery: state snapshot
 //!   capture, delta computation and application, MLS group rebuild via
 //!   Welcome-based fast-forward, and multi-device divergence detection.
-//! - [`weeks_offline`] — Tier 3 weeks-scale offline recovery: forced re-join
+//! - `weeks_offline` (in `scp-runtime`) — Tier 3 weeks-scale offline recovery: forced re-join
 //!   with MLS group state reset, state preservation, in-flight message
 //!   handling, and bilateral context recovery (SCP-123).
 //!

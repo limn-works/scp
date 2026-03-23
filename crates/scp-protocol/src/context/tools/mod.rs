@@ -14,7 +14,7 @@
 //! - [`registry`] -- Tool registration storage, `register_tool`, `update_tool`,
 //!   `verify_tool`.
 //! - [`schema`] -- JSON Schema validation helpers and MCP compatibility.
-//! - [`invoke`] -- Tool invocation with full execution lifecycle:
+//! - `invoke` (in `scp-runtime`) -- Tool invocation with full execution lifecycle:
 //!   capability checking, schema validation, timeout, cancellation.
 //! - [`lifecycle`] -- Request/response types, status codes, error codes,
 //!   cancellation, and event log integration for tool invocations.

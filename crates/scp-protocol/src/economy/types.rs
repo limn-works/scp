@@ -254,7 +254,7 @@ pub type PaymentAdapterRef = String;
 
 /// Action type for which a payment is made.
 ///
-/// Used in [`PaymentReceipt`](super::adapter::PaymentReceipt) and cost
+/// Used in `PaymentReceipt` and cost
 /// estimation to identify the category of paid action.
 ///
 /// See spec section 19.1.1.

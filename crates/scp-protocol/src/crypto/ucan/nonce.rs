@@ -20,7 +20,7 @@
 //! # Persistence
 //!
 //! The tracker state can be serialized to and deserialized from bytes for
-//! crash recovery via the [`Storage`](scp_platform::traits::Storage) trait.
+//! crash recovery via the `Storage` trait (in `scp-platform`).
 //!
 //! See ADR-016 acceptance criterion 6 in `.docs/adrs/phase-3.md`.
 

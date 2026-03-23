@@ -5,10 +5,8 @@
 //! sender key protocol: constants, wire types, HPKE helpers, hash helpers,
 //! signature verification, nonce deduplication, and block list expansion.
 //!
-//! Async signing operations that depend on [`KeyCustody`] remain in
-//! [`super::key_protocol`].
-//!
-//! [`KeyCustody`]: scp_platform::traits::KeyCustody
+//! Async signing operations that depend on `KeyCustody` remain in
+//! `key_protocol` (in `scp-runtime`).
 
 use std::collections::{HashMap, HashSet};
 use std::hash::BuildHasher;
@@ -273,7 +271,7 @@ impl SenderKeyDistributionMessage {
     }
 }
 
-/// Result of [`super::key_protocol::rotate_sender_key_for_block`], containing the new key,
+/// Result of `key_protocol::rotate_sender_key_for_block` (in `scp-runtime`), containing the new key,
 /// updated epoch, and the serialized epoch advance notification.
 #[derive(Debug)]
 pub struct RotateForBlockResult {
@@ -285,7 +283,7 @@ pub struct RotateForBlockResult {
     pub epoch_advance_message: Vec<u8>,
 }
 
-/// Parameters for [`super::key_protocol::handle_sender_key_request`].
+/// Parameters for `key_protocol::handle_sender_key_request` (in `scp-runtime`).
 ///
 /// Groups the responder-side context that does not vary per request,
 /// avoiding `clippy::too_many_arguments`.
@@ -308,7 +306,7 @@ pub struct HandleRequestParams<'a, S: BuildHasher = std::collections::hash_map::
     pub now_secs: u64,
 }
 
-/// Parameters for [`super::key_protocol::rotate_sender_key_for_block`].
+/// Parameters for `key_protocol::rotate_sender_key_for_block` (in `scp-runtime`).
 ///
 /// Groups the non-cryptographic parameters that describe the rotation
 /// context, avoiding the excessive argument count that would otherwise
@@ -591,12 +589,10 @@ where
 /// key bytes.
 ///
 /// This is the non-custody variant of
-/// [`super::key_protocol::open_sender_key_response`] for use when the
+/// `key_protocol::open_sender_key_response` (in `scp-runtime`) for use when the
 /// wrapping secret key is held in software (e.g., in
-/// [`MlsCryptoProvider`](crate::crypto::mls::MlsCryptoProvider)) rather
-/// than inside a [`KeyCustody`] boundary.
-///
-/// [`KeyCustody`]: scp_platform::traits::KeyCustody
+/// `MlsCryptoProvider`) rather
+/// than inside a `KeyCustody` boundary.
 ///
 /// # Arguments
 ///

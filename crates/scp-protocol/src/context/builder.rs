@@ -194,7 +194,7 @@ pub trait ContextCryptoProvider: Send + Sync {
     ///
     /// Returns `(target_did, serialized_message)` pairs that should be
     /// delivered to the target members via transport. Each message is a
-    /// serialized [`crate::crypto::sender_keys::key_protocol::SenderKeyDistributionMessage::KeyResponse`] containing
+    /// serialized `SenderKeyDistributionMessage::KeyResponse` containing
     /// an HPKE-sealed sender key.
     ///
     /// The default implementation returns an empty vector (no pending
@@ -356,7 +356,7 @@ pub trait ContextCryptoProvider: Send + Sync {
     /// Restores per-context cryptographic state from a previously exported
     /// byte blob (produced by [`export_crypto_state`](Self::export_crypto_state)).
     ///
-    /// Called during [`crate::context::manager::ContextManager::restore_context`] to reinstate MLS
+    /// Called during `ContextManager::restore_context` to reinstate MLS
     /// groups and sender keys after a process restart. If `data` is empty,
     /// this is a no-op (the provider was never persisted or is a mock).
     ///

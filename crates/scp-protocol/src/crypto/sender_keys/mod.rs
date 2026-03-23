@@ -65,7 +65,7 @@ pub struct SenderKey([u8; 32]);
 impl SenderKey {
     /// Creates a sender key from raw 32-byte key material.
     ///
-    /// Used by [`key_protocol::open_sender_key_response`] to reconstruct a
+    /// Used by `key_protocol::open_sender_key_response` (in `scp-runtime`) to reconstruct a
     /// sender key from HPKE-decrypted bytes.
     #[must_use]
     pub const fn from_bytes(bytes: [u8; 32]) -> Self {
@@ -203,7 +203,7 @@ pub enum SenderKeyError {
 
     /// The requester is not a member of the context.
     ///
-    /// Returned by [`key_protocol::handle_sender_key_request`] when
+    /// Returned by `key_protocol::handle_sender_key_request` (in `scp-runtime`) when
     /// `context_members` is provided and the requester's DID is not in
     /// the membership set. This is the primary defense against Sybil
     /// block bypass (BLACK-006, §9.16.6): a Sybil DID that has not been

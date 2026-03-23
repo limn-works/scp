@@ -8,7 +8,7 @@
 //! The lifecycle when a membership-affecting proposal is approved:
 //!
 //! 1. Proposal approved (governance decision).
-//! 2. [`ContextManager`](super::super::manager::ContextManager) executes the
+//! 2. `ContextManager` executes the
 //!    membership change via MLS `add_member()`/`remove_member()`.
 //! 3. MLS Commit advances the epoch.
 //! 4. `GovernanceActionExecuted` event appended to event log.
@@ -128,7 +128,7 @@ pub const fn classify_action(action: &GovernanceAction) -> MlsImpact {
 /// An MLS operation that must be executed after a governance proposal is
 /// approved and the action affects membership.
 ///
-/// The [`ContextManager`](super::super::manager::ContextManager) consumes
+/// The `ContextManager` consumes
 /// these operations and translates them into concrete MLS API calls
 /// (`add_member`, `remove_member`) which produce Commits and advance the epoch.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -158,7 +158,7 @@ pub enum MlsOperation {
 /// `Ok(None)` for non-membership proposals. Returns an error if the proposal
 /// is not in `Approved` status.
 ///
-/// The caller ([`ContextManager`](super::super::manager::ContextManager)) is
+/// The caller (`ContextManager`) is
 /// responsible for executing the returned operation against the `ScpMlsGroup`.
 ///
 /// # Errors
@@ -219,7 +219,7 @@ pub fn generate_mls_operations(
 /// # Concurrency
 ///
 /// The coordinator is intentionally not `Arc<Mutex<_>>` -- it does not hold
-/// locks across async boundaries. The [`crate::context::manager::ContextManager`] serializes governance
+/// locks across async boundaries. The `ContextManager` serializes governance
 /// and MLS operations through its own lock, calling into the coordinator
 /// synchronously within that scope. This avoids deadlock between governance
 /// and MLS state machines.

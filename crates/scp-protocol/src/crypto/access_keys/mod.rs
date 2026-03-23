@@ -14,8 +14,8 @@
 //!
 //! # Modules
 //!
-//! - [`lifecycle`] — Key generation, rotation, revocation, and epoch management.
-//! - [`wire`] — Wire types for access key request/response protocol.
+//! - `lifecycle` (in `scp-runtime`) — Key generation, rotation, revocation, and epoch management.
+//! - `wire` (in `scp-runtime`) — Wire types for access key request/response protocol.
 
 pub mod wrapping;
 
@@ -58,7 +58,7 @@ pub struct AccessKey {
 impl AccessKey {
     /// Constructs an `AccessKey` from its component parts.
     ///
-    /// Used by [`wire::open_access_key_response`] to reconstruct an access
+    /// Used by `wire::open_access_key_response` to reconstruct an access
     /// key from HPKE-decrypted bytes and metadata.
     #[must_use]
     pub const fn from_parts(

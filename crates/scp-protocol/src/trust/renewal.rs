@@ -147,7 +147,7 @@ pub trait RenewalChecker {
 /// Compares elapsed time since the last renewal (or issuance, if never renewed)
 /// against the attestation's `renewal_interval`. Uses
 /// `renewed_at.unwrap_or(issued_at)` as the base time, matching the freshness
-/// pattern in [`check_attestation_freshness`](super::check_attestation_freshness).
+/// pattern in [`check_attestation_freshness`](super::attestation::check_attestation_freshness).
 pub struct DefaultRenewalChecker<C: Clock> {
     clock: C,
 }

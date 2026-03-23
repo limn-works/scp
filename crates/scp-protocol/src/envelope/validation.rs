@@ -9,7 +9,7 @@
 //!   monotonically increasing. Any regression is a replay.
 //!
 //! These checks run after MLS decryption and inner signature verification
-//! (i.e., after [`super::open_envelope`] succeeds), before delivering the
+//! (i.e., after `open_envelope` succeeds), before delivering the
 //! message to the application layer.
 
 use std::collections::HashMap;
@@ -220,7 +220,7 @@ impl SequenceTracker {
 /// inner envelope.
 ///
 /// This is the primary entry point for receive-path validation. Call after
-/// [`super::open_envelope`] succeeds and before delivering to the application
+/// `open_envelope` succeeds and before delivering to the application
 /// layer.
 ///
 /// # Arguments

@@ -32,7 +32,7 @@
 //! Per spec section 9.2.1, members can leave during a voting window as a form
 //! of veto. The governance engine does not prevent departure -- it only tracks
 //! votes. Departure handling (vote removal, quorum recalculation) is the
-//! responsibility of the [`ContextManager`](super::manager::ContextManager).
+//! responsibility of the `ContextManager`.
 //!
 //! # Pluggability
 //!
@@ -1002,7 +1002,7 @@ pub enum GovernanceModelConfig {
 /// Read-only context snapshot provided to the governance engine.
 ///
 /// The engine never mutates context state directly -- it returns decisions
-/// that the [`ContextManager`](super::manager::ContextManager) executes.
+/// that the `ContextManager` executes.
 #[derive(Debug, Clone)]
 pub struct GovernanceContext {
     /// The context identifier.
@@ -1206,7 +1206,7 @@ pub enum GovernanceEvent {
 /// The pluggable governance interface. All governance models implement this trait.
 ///
 /// The trait is object-safe to enable dynamic dispatch via `Box<dyn GovernanceEngine>`.
-/// The [`ContextManager`](super::manager::ContextManager) delegates all governance
+/// The `ContextManager` delegates all governance
 /// decisions to the engine.
 ///
 /// # Contract

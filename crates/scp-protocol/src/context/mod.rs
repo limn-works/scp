@@ -242,7 +242,7 @@ pub enum ContextError {
 
     /// An action-payment integration error occurred during a paid action.
     ///
-    /// Wraps [`crate::economy::IntegrationError`] to preserve the specific
+    /// Wraps `IntegrationError` to preserve the specific
     /// error variant (authorization failure, cost insufficient, adapter error,
     /// etc.) rather than type-erasing to a string.
     ///
@@ -255,7 +255,7 @@ pub enum ContextError {
 
     /// A persistence operation failed (store or load).
     ///
-    /// Returned when the [`ContextPersistence`] provider reports an error
+    /// Returned when the `ContextPersistence` provider reports an error
     /// during context or broadcast state persistence or restoration.
     #[error("persistence failed: {0}")]
     PersistenceFailed(String),
@@ -272,7 +272,7 @@ pub enum ContextError {
     CreationFailed(String),
 
     /// An operation was attempted on a context that is not registered with
-    /// the [`ContextManager`]. This typically means the context was never
+    /// the `ContextManager`. This typically means the context was never
     /// created, was already closed, or the ID is incorrect.
     #[error("context not registered: {0}")]
     ContextNotRegistered(String),
