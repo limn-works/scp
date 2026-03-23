@@ -1787,14 +1787,14 @@ impl WasmContextManager {
             })?;
 
         // Validate input against the tool's input schema.
-        validate_value_against_schema(input_json, &registration.input_schema).map_err(|e| {
+        validate_value_against_schema(input_json, &registration.schema.input_schema).map_err(|e| {
             ScpWasmError::Tool {
                 message: format!("input schema validation failed for tool '{tool_id}': {e}"),
                 code: "SCP-TOOL-6002".to_owned(),
             }
         })?;
 
-        let output_schema = registration.output_schema.clone();
+        let output_schema = registration.schema.output_schema.clone();
 
         // Dispatch to registered handler if available.
         let result = if let Some(handler) = ctx.tool_handlers.get(tool_id) {
@@ -1847,14 +1847,14 @@ impl WasmContextManager {
         // Verify test vectors by validating inputs against the input schema.
         let mut failures = Vec::new();
         for (i, tv) in registration.test_vectors.iter().enumerate() {
-            if let Err(e) = validate_value_against_schema(&tv.input, &registration.input_schema) {
+            if let Err(e) = validate_value_against_schema(&tv.input, &registration.schema.input_schema) {
                 failures.push(format!(
                     "vector {i} ({0}): input validation failed: {e}",
                     tv.description
                 ));
             }
             if let Err(e) =
-                validate_value_against_schema(&tv.expected_output, &registration.output_schema)
+                validate_value_against_schema(&tv.expected_output, &registration.schema.output_schema)
             {
                 failures.push(format!(
                     "vector {i} ({0}): output validation failed: {e}",
@@ -1919,14 +1919,14 @@ impl WasmContextManager {
                 code: "SCP-TOOL-6003".to_owned(),
             })?;
 
-        validate_value_against_schema(input, &registration.input_schema).map_err(|e| {
+        validate_value_against_schema(input, &registration.schema.input_schema).map_err(|e| {
             ScpWasmError::Tool {
                 message: format!("input validation failed: {e}"),
                 code: "SCP-TOOL-6002".to_owned(),
             }
         })?;
 
-        let output_schema = registration.output_schema.clone();
+        let output_schema = registration.schema.output_schema.clone();
 
         // Dispatch to handler or echo mode.
         let result = if let Some(handler) = target.tool_handlers.get(tool_id) {
@@ -2067,7 +2067,7 @@ impl WasmContextManager {
 
         // Validate input against tool's input schema if tool is registered.
         if let Some(registration) = ctx.tool_registry.get(&tool_id) {
-            validate_value_against_schema(input, &registration.input_schema).map_err(|e| {
+            validate_value_against_schema(input, &registration.schema.input_schema).map_err(|e| {
                 ScpWasmError::Tool {
                     message: format!("input validation failed: {e}"),
                     code: "SCP-TOOL-6002".to_owned(),
@@ -3213,11 +3213,13 @@ impl WasmContextManager {
             tool_id: tool_id.to_owned(),
             name: name.to_owned(),
             description: description.to_owned(),
-            input_schema: serde_json::json!({"type": "object"}),
-            output_schema: serde_json::json!({"type": "object"}),
+            schema: crate::runtime::ToolSchema {
+                input_schema: serde_json::json!({"type": "object"}),
+                output_schema: serde_json::json!({"type": "object"}),
+            },
             implementation_hash: [0u8; 32],
             test_vectors: Vec::new(),
-            operator_did: ctx.creator_did.clone(),
+            operator_did: DID::from(ctx.creator_did.clone()),
             cost: None,
             registered_at,
             signature: Vec::new(),

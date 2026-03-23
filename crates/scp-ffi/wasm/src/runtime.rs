@@ -1,26 +1,40 @@
-//! WASM-local algorithm implementations for tool registration and schema validation.
+//! WASM-local tool registry and re-exports from `scp-protocol`.
 //!
-//! This module contains the WASM-local implementations that the manager depends on:
-//! - `ToolRegistry` and `ToolRegistration` — tool registration storage
-//! - JSON Schema validation
+//! Tool registration types (`ToolRegistration`, `TestVector`, `ToolCost`,
+//! `ToolSchema`) and schema validation functions (`validate_schema`,
+//! `validate_value_against_schema`) are imported from `scp-protocol`.
+//!
+//! A thin `ToolRegistry` wrapper is kept locally because the `scp-protocol`
+//! version's `insert` method is `pub(crate)` and cannot be called from
+//! external crates.
 //!
 //! Event log, Merkle proofs, and event type tags are provided by `scp-event-log`.
 //!
-//! Context state management has been moved to
+//! Context state management lives in
 //! [`WasmContextManager`](crate::manager::WasmContextManager) per issue #389.
 //!
 //! See SCP-218 and ADR-022/ADR-034 in `.docs/adrs/phase-4.md`.
 
 use std::collections::HashMap;
 
+// Re-export tool types from scp-protocol for use by manager.rs, tools.rs, etc.
+pub use scp_protocol::context::tools::{
+    TestVector, ToolCost, ToolRegistration, ToolSchema,
+};
+pub use scp_protocol::context::tools::schema::{
+    SchemaValidationError, validate_schema, validate_value_against_schema,
+};
+
 // ---------------------------------------------------------------------------
-// ToolRegistry — tool registration storage (mirrors scp-core)
+// ToolRegistry — thin wrapper (scp-protocol's insert is pub(crate))
 // ---------------------------------------------------------------------------
 
 /// In-memory tool storage per context.
 ///
-/// Mirrors `scp_core::context::tools::ToolRegistry`. Stores tool registrations
-/// keyed by tool ID.
+/// Wraps `HashMap<String, ToolRegistration>` with duplicate-checking insert.
+/// Uses `ToolRegistration` from `scp-protocol`; only the registry wrapper is
+/// local because `scp_protocol::context::tools::ToolRegistry::insert` is
+/// `pub(crate)`.
 pub struct ToolRegistry {
     tools: HashMap<String, ToolRegistration>,
 }
@@ -74,126 +88,6 @@ impl ToolRegistry {
             .insert(registration.tool_id.clone(), registration);
         Ok(())
     }
-}
-
-/// Per-invocation cost metadata for a tool (spec §5.4.1, §19.3).
-///
-/// Mirrors `scp_core::context::tools::ToolCost`. Tool-level costs
-/// are additive with context costs.
-pub struct ToolCost {
-    /// Cost per invocation in the smallest currency unit.
-    pub amount: u64,
-    /// ISO 4217 or protocol-defined currency code.
-    pub currency: String,
-    /// The DID that receives tool invocation payments. May differ from the
-    /// context payee.
-    pub payee: String,
-    /// Optional pricing formula identifier for dynamic pricing (§19.4).
-    pub cost_formula: Option<String>,
-}
-
-/// A tool registration entry.
-///
-/// Mirrors `scp_core::context::tools::ToolRegistration`.
-pub struct ToolRegistration {
-    /// Unique tool identifier.
-    pub tool_id: String,
-    /// Human-readable tool name.
-    pub name: String,
-    /// Tool description.
-    pub description: String,
-    /// JSON Schema for input/output.
-    pub input_schema: serde_json::Value,
-    /// JSON Schema for output.
-    pub output_schema: serde_json::Value,
-    /// SHA-256 hash of the tool implementation. Used for integrity verification.
-    pub implementation_hash: [u8; 32],
-    /// Test vectors for verification.
-    pub test_vectors: Vec<TestVector>,
-    /// DID of the tool operator.
-    pub operator_did: String,
-    /// Optional per-invocation cost metadata (spec §5.4.1, §19.3).
-    pub cost: Option<ToolCost>,
-    /// Unix timestamp (seconds) when the tool was registered.
-    pub registered_at: u64,
-    /// Ed25519 signature over the canonical registration bytes.
-    pub signature: Vec<u8>,
-}
-
-/// A known input-output pair for tool verification.
-///
-/// Mirrors `scp_core::context::tools::TestVector`.
-#[derive(Debug)]
-pub struct TestVector {
-    /// Input value.
-    pub input: serde_json::Value,
-    /// Expected output value.
-    pub expected_output: serde_json::Value,
-    /// Human-readable description.
-    pub description: String,
-}
-
-// ---------------------------------------------------------------------------
-// EventLog + Merkle proof types are now provided by `scp-event-log`.
-// See `scp_event_log::{EventLog, Event, EventType, EventPayload}`,
-// `scp_event_log::tree::{append_unsigned_event, event_type_tag, root, event_count}`,
-// and `scp_event_log::proof::{prove_inclusion, prove_absence, verify_inclusion}`.
-// ---------------------------------------------------------------------------
-
-// ---------------------------------------------------------------------------
-// Schema validation (mirrors scp-core schema module)
-// ---------------------------------------------------------------------------
-
-/// Validates that a JSON value is a structurally valid JSON Schema.
-///
-/// # Errors
-///
-/// Returns an error if the schema is not a JSON object, is missing the
-/// `"type"` field, or has an unrecognized type value.
-#[allow(clippy::items_after_statements)]
-pub fn validate_schema(schema: &serde_json::Value) -> Result<(), String> {
-    let obj = schema
-        .as_object()
-        .ok_or_else(|| "schema must be a JSON object".to_owned())?;
-
-    let type_field = obj
-        .get("type")
-        .ok_or_else(|| "schema is missing the required \"type\" field".to_owned())?;
-
-    let type_str = type_field
-        .as_str()
-        .ok_or_else(|| "schema \"type\" field must be a string".to_owned())?;
-
-    const VALID_TYPES: &[&str] = &[
-        "object", "array", "string", "number", "integer", "boolean", "null",
-    ];
-
-    if !VALID_TYPES.contains(&type_str) {
-        return Err(format!("unrecognized JSON Schema type: \"{type_str}\""));
-    }
-
-    Ok(())
-}
-
-/// Validates a JSON value against a JSON Schema using the `jsonschema` crate.
-///
-/// # Errors
-///
-/// Returns an error if the schema is invalid or the value does not conform.
-pub fn validate_value_against_schema(
-    value: &serde_json::Value,
-    schema: &serde_json::Value,
-) -> Result<(), String> {
-    if !schema.is_object() {
-        return Err("schema is not a JSON object".to_owned());
-    }
-
-    let validator =
-        jsonschema::validator_for(schema).map_err(|e| format!("invalid schema: {e}"))?;
-
-    validator
-        .validate(value)
-        .map_err(|e| format!("schema validation failed: {e}"))
 }
 
 // ---------------------------------------------------------------------------

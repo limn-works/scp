@@ -258,7 +258,7 @@ fn parse_provenance_fields(def: &serde_json::Value) -> Result<ProvenanceFields, 
             Some(runtime::ToolCost {
                 amount,
                 currency,
-                payee,
+                payee: scp_event_log::DID::from(payee),
                 cost_formula,
             })
         }
@@ -384,11 +384,13 @@ pub fn tool_register(context: &WasmContextHandle, definition_json: String) -> Pr
             tool_id: tool_id.clone(),
             name,
             description,
-            input_schema,
-            output_schema,
+            schema: runtime::ToolSchema {
+                input_schema,
+                output_schema,
+            },
             implementation_hash,
             test_vectors,
-            operator_did,
+            operator_did: scp_event_log::DID::from(operator_did),
             cost,
             registered_at,
             signature,
