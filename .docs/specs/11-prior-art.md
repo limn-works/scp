@@ -26,13 +26,13 @@
 
 The Dat Protocol (2013) is the direct ancestor of the Hypercore stack described in the subsections that follow. Understanding the evolution — and the governance dynamics that accompanied it — provides important context for SCP's design tenets.
 
-**Original motivation: scientific data sharing.** Max Ogden created Dat in August 2013 to solve how scientists collaborate on versioned datasets without centralized infrastructure. Funded by the Knight Foundation and Sloan Foundation (2014-2015), stewardship moved to Code for Science and Society (501(c)(3), 2017). The project was published in *Nature Scientific Data* (2018) — an unusual level of academic legitimacy for a P2P protocol.
+**Original motivation: scientific data sharing.** Max Ogden created Dat in August 2013 to solve how scientists collaborate on versioned datasets without centralized infrastructure. Funded by the Knight Foundation and Sloan Foundation (2014-2017), stewardship moved to Code for Science and Society (501(c)(3), incorporated May 2017). The project was published in *Scientific Data* (Nature portfolio, 2018) — an unusual level of academic legitimacy for a P2P protocol.
 
 **Technical primitives.** Dat introduced several ideas that survived into Hypercore. Data archives were append-only logs signed with Ed25519 keypairs, verified via Merkle trees. The on-disk format, SLEEP (Syncable Ledger of Exact Events Protocol), used fixed-size entries with 32-byte headers — a compact representation that Hypercore later refined. Discovery keys — the hash of the archive's public key — allowed peers to find each other on the DHT without exposing the actual read key to the network, a privacy-by-default design. Dat DNS (DEP-0005) mapped human-readable domain names to cryptographic archive addresses via DNS TXT records or `/.well-known/dat` HTTPS endpoints, foreshadowing the kind of DNS-bridged discovery that SCP's DID resolution uses (§3.10).
 
-**The Beaker Browser.** Paul Frazee's Beaker Browser (2016-2022) was Dat's most visible consumer application — an Electron-based browser natively handling `dat://` URLs, enabling one-click website creation and peer-to-peer hosting. Archived in 2022 due to maintainer burnout, it demonstrated both the promise and the sustainability challenges of building a full browser-embedded P2P stack.
+**The Beaker Browser.** Paul Frazee's Beaker Browser (2016-2022) was Dat's most visible consumer application — an Electron-based browser natively handling `dat://` URLs, enabling one-click website creation and peer-to-peer hosting. Archived in December 2022 after concluding the pure P2P browser model lacked product-market fit; the maintainer moved to Bluesky. It demonstrated both the promise and the sustainability challenges of building a full browser-embedded P2P stack.
 
-**The evolution: Dat to Hypercore to Holepunch.** By 2020, the protocol had outgrown its command-line-tool origins. The core maintainers — led by Mathias Buus, who had been building Hypercore since 2016 — renamed the protocol layer from "Dat Protocol" to "Hypercore Protocol," creating a separate GitHub organization with an open RFC process. "Dat" persisted as a community label for the broader ecosystem (Cabal, Peermaps, Mapeo, Cobox). In 2022, Holepunch launched with funding from Tether and Bitfinex, with Mathias Buus leading development and Paolo Ardoino (Tether CEO) as Chief Strategy Officer. Modules migrated from the Hypercore Protocol GitHub organization to the Holepunch organization. Keet, the flagship P2P encrypted chat app, shipped as proof that the stack worked at production scale.
+**The evolution: Dat to Hypercore to Holepunch.** By 2020, the protocol had outgrown its command-line-tool origins. The core maintainers — led by Mathias Buus, who had been building Hypercore since 2016 — renamed the protocol layer from "Dat Protocol" to "Hypercore Protocol," creating a separate GitHub organization with an open RFC process. "Dat" persisted as a community label for the broader ecosystem (Cabal, Peermaps, Mapeo, Cobox). In 2022, Holepunch launched with funding from Tether and Bitfinex, with Mathias Buus leading development and Paolo Ardoino (then Tether CTO, later CEO) as Chief Strategy Officer. Modules migrated from the Hypercore Protocol GitHub organization to the Holepunch organization. Keet, the flagship P2P encrypted chat app, shipped as proof that the stack worked at production scale.
 
 **The community split.** The transition created a de facto fork in governance. The Dat Ecosystem (dat-ecosystem.org) continued as a self-organized community of independent P2P projects building on the shared technology — mostly self-funded, loosely coordinated, with no corporate patron. Holepunch became a commercially funded entity with a specific product roadmap (Keet, Pear runtime) and corporate stakeholders. The underlying open-source code remained available, but the locus of protocol development shifted to an organization with commercial interests. Community projects that depended on the stack found themselves downstream of decisions driven by product priorities rather than ecosystem needs.
 
@@ -195,7 +195,7 @@ If did:dht governance at DIF collapses entirely, or if a future did:dht spec rev
 
 ## 11.3 GNUnet
 
-**GNUnet** (gnunet.org) is a framework for secure peer-to-peer networking, under active development since 2001. It is the longest-running decentralized protocol project that prioritizes anonymity and censorship resistance as architectural fundamentals. The comparison with SCP is instructive precisely because the two protocols start from opposite premises — GNUnet minimizes identity to protect participants; SCP maximizes verifiable identity to establish trust — but converge on shared principles of infrastructure distrust and transport independence.
+**GNUnet** (gnunet.org) is a framework for secure peer-to-peer networking, under active development since 2001. It is one of the longest-running decentralized protocol projects that prioritizes anonymity and censorship resistance as architectural fundamentals. The comparison with SCP is instructive precisely because the two protocols start from opposite premises — GNUnet minimizes identity to protect participants; SCP maximizes verifiable identity to establish trust — but converge on shared principles of infrastructure distrust and transport independence.
 
 ### 11.3.1 Architectural Overview
 
@@ -243,7 +243,7 @@ GNUnet's DHT, R5N (Randomized Recursive Routing for Restricted-Route Networks), 
 - **On-path validation:** Application-specific block validators run at each hop. Expired or malformed data is discarded in transit, preventing DHT pollution.
 - **Loop prevention:** 1024-bit Bloom filter (k=16) tracks visited peers per query, with capacity for ~200 entries before significant false-positive rates.
 - **Censorship resistance:** Randomized initial routing + repeated queries contacting different network subsets yields high retrieval success rates even with significant fractions of compromised nodes (Evans & Grothoff 2011, simulation results vary by topology and attack model).
-- **IETF standardization:** draft-schanzen-r5n-01.
+- **IETF standardization:** draft-schanzen-r5n-07.
 
 **Comparison with Mainline DHT (used by did:dht):** Mainline uses purely greedy Kademlia routing — simpler, faster, but with no path recording, no on-path validation, and no structural censorship resistance. R5N's random walk phase and path validation are meaningful improvements for adversarial environments. SCP's dual-layer resolution (§3.10) — Mainline DHT + SCP relays — mitigates some of these risks through redundancy rather than routing-level resistance.
 
@@ -253,7 +253,7 @@ GNUnet's NAT traversal is the most directly relevant subsystem for SCP. It achie
 
 **UPnP/NAT-PMP.** Standard port mapping on supporting routers. Same approach as SCP Tier 1 (§10.12.2).
 
-**Autonomous NAT traversal (pwnat).** Published by Mueller, Evans, and Grothoff (2010). Exploits ICMP Echo Request/Reply to trick NATs into accepting connections:
+**Autonomous NAT traversal (pwnat).** Published by Mueller, Evans, Grothoff, and Kamkar (2010). Exploits ICMP Echo Request/Reply to trick NATs into accepting connections:
 
 1. Peer behind NAT sends ICMP Echo Request to a non-existent IP
 2. NAT creates a mapping expecting an ICMP Echo Reply
@@ -322,7 +322,7 @@ GNS chose secure + memorable, sacrificing global uniqueness. Names are meaningfu
 
 SCP chose secure + global, sacrificing memorability. did:dht identifiers are cryptographic strings that no human will remember, but they resolve identically for every resolver worldwide. SCP compensates with display names in DID documents and context-level naming — but the identifiers themselves are opaque.
 
-ENS achieved all three by accepting the trade-off of requiring a blockchain (Ethereum) as global state — introducing infrastructure dependency that both GNS and SCP reject.
+ENS arguably achieves all three by accepting the trade-off of requiring a blockchain (Ethereum) as global state — introducing infrastructure dependency that both GNS and SCP reject.
 
 **GNS2DNS / DNS2GNS interop.** GNS includes bidirectional DNS bridge records:
 
@@ -412,9 +412,9 @@ R5N's **randomized routing** and **path recording** offer censorship resistance 
 
 - Polot & Grothoff, "CADET: Confidential Ad-hoc Decentralized End-to-End Transport," Med-Hoc-Net 2014
 - Evans & Grothoff, "R5N: Randomized Recursive Routing for Restricted-Route Networks," NSS 2011
-- Mueller, Evans & Grothoff, "Autonomous NAT Traversal," 2010
-- Grothoff, "The GNUnet System," Habilitation thesis, Inria
-- IETF draft-schanzen-r5n-01 (R5N specification)
+- Mueller, Evans, Grothoff & Kamkar, "Autonomous NAT Traversal," 2010
+- Grothoff, "The GNUnet System," Habilitation thesis, Université de Rennes 1
+- IETF draft-schanzen-r5n-07 (R5N specification)
 - Wachs, Schanzenbach & Grothoff, "A Censorship-Resistant, Privacy-Enhancing and Fully Decentralized Name System," CANS 2014
 - RFC 9498: The GNU Name System (GNS specification, IETF)
 - LSD-0001 (GNS specification), LSD-0005 (did:gns), LSD-0007 (Communicators), LSD-0012 (CAKE)
@@ -423,7 +423,7 @@ R5N's **randomized routing** and **path recording** offer censorship resistance 
 
 ## 11.4 Freenet / Hyphanet
 
-**Freenet** (2000, Ian Clarke) is one of the oldest decentralized infrastructure projects, predating BitTorrent, Tor, and most modern P2P systems. Originally conceived in Clarke's 1999 University of Edinburgh thesis, Freenet is a censorship-resistant distributed data store where content is stored encrypted across participating nodes, retrieved by key, and persists based on demand rather than owner intent. In March 2023, the original Java codebase was spun off as **Hyphanet** under its existing maintainers, while Clarke's ground-up Rust rewrite (internally "Locutus," begun 2019) took the Freenet name as **Freenet 2023**. The comparison with SCP is instructive because both systems implement provider-blind encrypted storage, but optimize for fundamentally different threat models: Freenet for censorship resistance and publisher anonymity; SCP for governance, accountability, and provenance.
+**Freenet** (2000, Ian Clarke) is one of the oldest decentralized infrastructure projects, predating BitTorrent, Tor, and most modern P2P systems. Originally conceived in Clarke's 1999 University of Edinburgh thesis, Freenet is a censorship-resistant distributed data store where content is stored encrypted across participating nodes, retrieved by key, and persists based on demand rather than owner intent. In 2023, the original Java codebase was spun off as **Hyphanet** under its existing maintainers, while Clarke's ground-up Rust rewrite (internally "Locutus," begun 2019) took the Freenet name as **Freenet 2023**. The comparison with SCP is instructive because both systems implement provider-blind encrypted storage, but optimize for fundamentally different threat models: Freenet for censorship resistance and publisher anonymity; SCP for governance, accountability, and provenance.
 
 ### 11.4.1 Architecture
 
@@ -434,7 +434,7 @@ The network operates in two modes:
 - **Opennet.** Nodes connect to arbitrary peers discovered through the network. Topology optimization occurs via **path folding**: when a request succeeds, the requesting node may form a direct connection to the responding node, progressively organizing the network so that topologically close nodes hold nearby locations.
 - **Darknet (friend-to-friend).** Nodes connect only to manually-specified trusted peers. Because the social graph is fixed, topology optimization occurs via **location swapping**: nodes periodically exchange locations using the Metropolis–Hastings algorithm, minimizing the distance between connected peers. This creates a routable small-world network from an arbitrary trust graph — the key insight from Oskar Sandberg's work on distributed routing in small-world networks.
 
-Requests carry a **Hops-to-Live (HTL)** counter, starting at 18, decremented at each hop. Data is cached along the return path, with caching suppressed for the first 2–3 hops (HTL > 15–16) to prevent nodes from identifying their immediate neighbors' requests. Data blocks are fixed-size: 32 KB for content blocks (CHK), 1 KB for signed metadata blocks (SSK).
+Requests carry a **Hops-to-Live (HTL)** counter, starting at 18, decremented at each hop. Data is cached along the return path, with caching suppressed near the origin to protect sender anonymity (the HTL counter may be probabilistically decremented on the first hops). Data blocks are fixed-size: 32 KB for content blocks (CHK), 1 KB for signed metadata blocks (SSK).
 
 ### 11.4.2 Key Types
 
@@ -573,12 +573,12 @@ As of early 2026, Freenet 2023 has a working peer network, contract execution, a
 
 ### 11.4.10 References
 
-1. Clarke, I. (1999). *A Distributed Decentralised Information Storage and Retrieval System.* Unpublished undergraduate thesis, Division of Informatics, University of Edinburgh.
+1. Clarke, I. (1999). *A Distributed Decentralised Information Storage and Retrieval System.* Unpublished final-year thesis, Division of Informatics, University of Edinburgh.
 2. Clarke, I., Sandberg, O., Wiley, B., & Hong, T. W. (2001). Freenet: A Distributed Anonymous Information Storage and Retrieval System. In H. Federrath (Ed.), *Designing Privacy Enhancing Technologies*, Lecture Notes in Computer Science, vol. 2009, pp. 46–66. Springer.
 3. Clarke, I., Sandberg, O., Toseland, M., & Verendel, V. (2010). Private Communication Through a Network of Trusted Connections: The Dark Freenet. Manuscript, https://www.hyphanet.org/assets/papers/freenet-0.7.5-paper.pdf
 4. Sandberg, O. (2006). Distributed Routing in Small-World Networks. In *Proceedings of the 8th Workshop on Algorithm Engineering and Experiments (ALENEX)*, pp. 144–155. SIAM.
 5. Kleinberg, J. (2000). The Small-World Phenomenon: An Algorithmic Perspective. In *Proceedings of the 32nd ACM Symposium on Theory of Computing (STOC)*, pp. 163–170.
-6. Evans, N. S., & GauthierDickey, C. (2007). Routing in the Dark: Pitch Black. In *Proceedings of the 23rd Annual Computer Security Applications Conference (ACSAC)*, pp. 305–314.
+6. Evans, N. S., GauthierDickey, C., & Grothoff, C. (2007). Routing in the Dark: Pitch Black. In *Proceedings of the 23rd Annual Computer Security Applications Conference (ACSAC)*, pp. 305–314.
 7. Freenet Project. (2026). Freenet Manual: Components. https://freenet.org/resources/manual/components/
 8. Hyphanet Project. (2026). Hyphanet Wiki: Security Summary. https://github.com/hyphanet/wiki/wiki/Security-summary
 
@@ -796,7 +796,7 @@ Despite the shared intellectual heritage, Tahoe-LAFS and SCP solve fundamentally
 
 ### 11.5.11 Capability Lineage
 
-Zooko Wilcox-O'Hearn went on to found Least Authority Enterprises (2011, security auditing) and co-found Zcash (2016, zk-SNARK privacy-preserving cryptocurrency). The thread connecting Tahoe, Zcash, and SCP is **cryptographic enforcement of minimal authority** — denying the infrastructure layer authority over the data it processes, enforced by mathematics rather than policy. The intellectual lineage from Tahoe to UCAN runs through the object-capability community: Dennis & Van Horn (1966) established capability-based security; Mark Miller's E language (1997) added language-level enforcement; Tahoe proved cryptographic capabilities work for decentralized storage; UCAN (Fission/Brooklyn Zelenka 2021) added delegation, attenuation, and identity binding; SCP embedded UCANs in a governance and encryption framework.
+Zooko Wilcox-O'Hearn went on to found Least Authority Enterprises (2011, privacy technology and security consulting) and co-found Zcash (2016, zk-SNARK privacy-preserving cryptocurrency). The thread connecting Tahoe, Zcash, and SCP is **cryptographic enforcement of minimal authority** — denying the infrastructure layer authority over the data it processes, enforced by mathematics rather than policy. The intellectual lineage from Tahoe to UCAN runs through the object-capability community: Dennis & Van Horn (1966) established capability-based security; Mark Miller's E language (1997) added language-level enforcement; Tahoe proved cryptographic capabilities work for decentralized storage; UCAN (Fission/Brooklyn Zelenka 2021) added delegation, attenuation, and identity binding; SCP embedded UCANs in a governance and encryption framework.
 
 ### 11.5.12 References
 
@@ -817,7 +817,7 @@ Zooko Wilcox-O'Hearn went on to found Least Authority Enterprises (2011, securit
 
 ## 11.6 Cjdns / Yggdrasil
 
-Cjdns (2011, Caleb James DeLisle) and Yggdrasil (2018, Neil Alexander and Arceliar) are encrypted IPv6 overlay networks that share a foundational premise with SCP: your cryptographic key IS your identity. Both are network-layer protocols that replace traditional address allocation with public-key-derived addressing, creating mesh networks where every packet is encrypted and every address is self-certifying.
+Cjdns (2011, Caleb James DeLisle) and Yggdrasil (2017, Neil Alexander and Arceliar) are encrypted IPv6 overlay networks that share a foundational premise with SCP: your cryptographic key IS your identity. Both are network-layer protocols that replace traditional address allocation with public-key-derived addressing, creating mesh networks where every packet is encrypted and every address is self-certifying.
 
 ### 11.6.1 Self-Certifying Addressing
 
