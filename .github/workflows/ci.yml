@@ -105,6 +105,39 @@ jobs:
       - run: pip install tree-sitter tree-sitter-python tree-sitter-typescript tree-sitter-kotlin tree-sitter-swift
       - run: python3.12 scripts/check-sdk-coverage.py
 
+  # ── Protocol enforcement ─────────────────────────────────────────────
+  protocol-sync:
+    needs: check-draft
+    name: Protocol sync check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install tree-sitter tree-sitter-rust
+      - run: python3.12 scripts/check-protocol-sync.py
+
+  protocol-deps:
+    needs: check-draft
+    name: Protocol deps check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - run: bash scripts/check-protocol-deps.sh
+
+  wasm-protocol:
+    needs: check-draft
+    name: WASM / protocol
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+      - run: cargo check -p scp-protocol --target wasm32-unknown-unknown
+
   # ── Rust ────────────────────────────────────────────────────────────
   rust-fmt:
     needs: changes
@@ -470,6 +503,9 @@ jobs:
       - error-codes
       - cross-layer
       - sdk-coverage
+      - protocol-sync
+      - protocol-deps
+      - wasm-protocol
       - rust-fmt
       - rust-clippy
       - rust-test
@@ -491,6 +527,9 @@ jobs:
             "${{ needs.error-codes.result }}" \
             "${{ needs.cross-layer.result }}" \
             "${{ needs.sdk-coverage.result }}" \
+            "${{ needs.protocol-sync.result }}" \
+            "${{ needs.protocol-deps.result }}" \
+            "${{ needs.wasm-protocol.result }}" \
             "${{ needs.rust-fmt.result }}" \
             "${{ needs.rust-clippy.result }}" \
             "${{ needs.rust-test.result }}" \

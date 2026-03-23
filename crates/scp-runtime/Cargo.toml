@@ -1,0 +1,130 @@
+[package]
+name = "scp-runtime"
+version = "0.1.0-beta.1"
+description = "Core protocol implementation for SCP (Shared Context Protocol)"
+edition.workspace = true
+repository.workspace = true
+license.workspace = true
+homepage.workspace = true
+readme = "README.md"
+keywords = ["protocol", "context", "governance", "encryption"]
+categories = ["cryptography", "network-programming"]
+
+[features]
+# Enables non-standard did:key:{hex} DID format acceptance. Only for
+# integration tests that run outside `#[cfg(test)]`. Production builds
+# must never enable this feature. See issue #128.
+testing = ["allow_unencrypted_storage", "scp-protocol/testing"]
+# Gates `ProtocolRepository::new_for_testing()` — accepts any `Storage` backend
+# without the `EncryptedStorage` bound. Production `ProtocolRepository::new()`
+# requires `EncryptedStorage`. Follows the `allow_in_memory_custody` pattern
+# in scp-ffi. See issue #695.
+allow_unencrypted_storage = []
+
+[dependencies]
+openmls = { workspace = true }
+openmls_traits = { workspace = true }
+openmls_basic_credential = { workspace = true }
+openmls_rust_crypto = { workspace = true }
+openmls_memory_storage = { workspace = true }
+tokio = { workspace = true }
+serde = { workspace = true }
+thiserror = { workspace = true }
+rmp-serde = { workspace = true }
+rmpv = { workspace = true }
+scp-primitives = { path = "../scp-primitives", version = "=0.1.0-beta.1" }
+scp-protocol = { path = "../scp-protocol", version = "=0.1.0-beta.1" }
+scp-platform = { path = "../scp-platform", version = "=0.1.0-beta.1" }
+scp-identity = { path = "../scp-identity", version = "=0.1.0-beta.1" }
+scp-event-log = { path = "../scp-event-log", version = "=0.1.0-beta.1" }
+async-trait = { workspace = true }
+aes = { workspace = true }
+aes-gcm = { workspace = true }
+rand = { workspace = true }
+sha2 = { workspace = true }
+serde_bytes = { workspace = true }
+serde_json = { workspace = true }
+serde_json_canonicalizer = { workspace = true }
+z-base-32 = { workspace = true }
+ed25519-dalek = { workspace = true }
+hex = { workspace = true }
+x25519-dalek = { workspace = true }
+hkdf = { workspace = true }
+percent-encoding = { workspace = true }
+base64 = { workspace = true }
+bs58 = { workspace = true }
+uuid = { workspace = true }
+jsonschema = { workspace = true, features = ["resolve-http", "resolve-file"] }
+lru = { workspace = true }
+tracing = { workspace = true }
+zeroize = { workspace = true }
+subtle = { workspace = true }
+unicode-normalization = { workspace = true }
+metrics = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "test-util"] }
+scp-protocol = { path = "../scp-protocol", features = ["testing"] }
+scp-platform = { path = "../scp-platform", features = ["testing", "encrypting"] }
+scp-event-log = { path = "../scp-event-log", features = ["testing"] }
+openmls_basic_credential = { workspace = true, features = ["test-utils"] }
+proptest = "1"
+scp-media = { path = "../scp-media" }
+
+[[test]]
+name = "economy_integration"
+required-features = ["testing"]
+
+[[test]]
+name = "phase2_integration"
+required-features = ["testing"]
+
+[[test]]
+name = "phase5_integration"
+required-features = ["testing"]
+
+[[test]]
+name = "wasm_conformance"
+required-features = ["testing"]
+
+[[test]]
+name = "agent_binding_integration"
+required-features = ["testing"]
+
+[[test]]
+name = "participation_event_log"
+required-features = ["testing"]
+
+[[test]]
+name = "governance_integration"
+required-features = ["testing"]
+
+[[test]]
+name = "content_access_integration"
+required-features = ["testing"]
+
+[[test]]
+name = "ucan_validate_integration"
+required-features = ["testing"]
+
+[[test]]
+name = "envelope_validation_integration"
+required-features = ["testing"]
+
+[[example]]
+name = "identity"
+
+[[example]]
+name = "context"
+required-features = ["testing"]
+
+[[example]]
+name = "tools"
+required-features = ["testing"]
+
+[[example]]
+name = "messaging"
+required-features = ["testing"]
+
+[lints]
+workspace = true

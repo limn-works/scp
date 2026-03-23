@@ -86,6 +86,48 @@ impl std::borrow::Borrow<str> for DID {
 }
 
 // ---------------------------------------------------------------------------
+// DID public key extraction
+// ---------------------------------------------------------------------------
+
+/// Extracts the Ed25519 public key bytes from a DID string.
+///
+/// Supports `did:dht:z<z-base-32>` format (production). The `did:key:<hex>`
+/// test convenience format is only accepted when compiled with `#[cfg(test)]`
+/// or the `testing` feature to prevent non-standard DID acceptance in release
+/// builds. See: <https://github.com/limn-works/scp/issues/128>
+///
+/// # Errors
+///
+/// Returns an error string if the DID format is unsupported,
+/// if z-base-32/hex decoding fails, or if the decoded key is not exactly
+/// 32 bytes.
+pub fn extract_public_key_from_did(did: &str) -> Result<[u8; 32], String> {
+    // Support did:dht:z<z-base-32> format.
+    if let Some(suffix) = did.strip_prefix("did:dht:z") {
+        let decoded = zbase32::decode(suffix)
+            .map_err(|_| format!("z-base-32 decode failed for DID: {did}"))?;
+        let bytes: [u8; 32] = decoded
+            .try_into()
+            .map_err(|v: Vec<u8>| format!("DID public key must be 32 bytes, got {}", v.len()))?;
+        return Ok(bytes);
+    }
+
+    // did:key:{hex} is a non-standard test convenience. Gated behind the
+    // `testing` feature (or #[cfg(test)]) to prevent acceptance in release
+    // builds. See: https://github.com/limn-works/scp/issues/128
+    #[cfg(any(test, feature = "testing"))]
+    if let Some(hex_str) = did.strip_prefix("did:key:") {
+        let decoded = hex::decode(hex_str).map_err(|e| format!("hex decode error: {e}"))?;
+        let bytes: [u8; 32] = decoded
+            .try_into()
+            .map_err(|v: Vec<u8>| format!("DID public key must be 32 bytes, got {}", v.len()))?;
+        return Ok(bytes);
+    }
+
+    Err(format!("unsupported DID format: {did}"))
+}
+
+// ---------------------------------------------------------------------------
 // SigningKeyId (ADR-039)
 // ---------------------------------------------------------------------------
 
@@ -354,5 +396,73 @@ mod tests {
         let did = DID("did:dht:borrow".to_owned());
         let borrowed: &str = did.borrow();
         assert_eq!(borrowed, "did:dht:borrow");
+    }
+
+    // -----------------------------------------------------------------------
+    // extract_public_key_from_did tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn extract_public_key_from_valid_did_dht() {
+        // Roundtrip: encode a known 32-byte key as z-base-32, wrap in
+        // did:dht:z prefix, extract, compare.
+        let key: [u8; 32] = [
+            0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e,
+            0x0f, 0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18, 0x19, 0x1a, 0x1b, 0x1c,
+            0x1d, 0x1e, 0x1f, 0x20,
+        ];
+        let encoded = zbase32::encode(&key);
+        let did = format!("did:dht:z{encoded}");
+        let extracted = extract_public_key_from_did(&did).unwrap();
+        assert_eq!(extracted, key);
+    }
+
+    #[test]
+    fn extract_public_key_rejects_invalid_prefix() {
+        let result = extract_public_key_from_did("did:web:example.com");
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(
+            err.contains("unsupported DID format"),
+            "expected unsupported DID format error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn extract_public_key_rejects_invalid_zbase32() {
+        // 'l' is not valid z-base-32
+        let result = extract_public_key_from_did("did:dht:z!!!invalid!!!");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn extract_public_key_rejects_wrong_length() {
+        // Encode only 16 bytes (not 32)
+        let short_key: [u8; 16] = [0x42; 16];
+        let encoded = zbase32::encode(&short_key);
+        let did = format!("did:dht:z{encoded}");
+        let result = extract_public_key_from_did(&did);
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(
+            err.contains("32 bytes"),
+            "expected 32-byte length error, got: {err}"
+        );
+    }
+
+    // did:key:{hex} is only available under #[cfg(test)] or feature = "testing"
+    #[test]
+    fn extract_public_key_from_did_key_hex() {
+        let key: [u8; 32] = [0xAB; 32];
+        let hex_str = hex::encode(key);
+        let did = format!("did:key:{hex_str}");
+        let extracted = extract_public_key_from_did(&did).unwrap();
+        assert_eq!(extracted, key);
+    }
+
+    #[test]
+    fn extract_public_key_from_did_key_invalid_hex() {
+        let result = extract_public_key_from_did("did:key:not-valid-hex");
+        assert!(result.is_err());
     }
 }

@@ -1173,7 +1173,7 @@ pub fn py_tool_interface_expose(
         );
 
         let interface = scp_core::context::tools::interface::expose_tool(
-            &context_handle,
+            context_handle.context_id(),
             &tool_id.to_owned(),
             &target_context_id.to_owned(),
             &rt.role_state,
@@ -1231,7 +1231,7 @@ pub fn py_tool_interface_accept(context_id: &str, interface_json: &str) -> PyRes
         );
 
         scp_core::context::tools::interface::accept_tool_interface(
-            &context_handle,
+            context_handle.context_id(),
             &mut interface,
             &rt.role_state,
             &rt.creator_did,

@@ -250,19 +250,27 @@ SCP doesn't implement MCP, WebMCP, or UCP. It wraps them with identity, trust, a
 ```
 scp/
 ├── crates/
-│   ├── scp-core/              # Protocol engine — the heart
-│   │   ├── context/           # Context lifecycle, membership, roles, governance
-│   │   ├── identity/          # DID operations, key management
+│   ├── scp-protocol/          # Pure sync protocol types (no tokio, compiles for wasm32)
+│   │   ├── context/           # Context types, params, roles, governance, membership
+│   │   ├── identity/          # Block list, attestation types, private state
 │   │   ├── trust/             # 4-layer trust evaluation, behavioral records
-│   │   ├── discovery/         # Tool-interface discovery (§6.2.2)
-│   │   ├── crypto/            # MLS wrapper, UCAN wrapper, Merkle trees
+│   │   ├── discovery/         # Discovery types, scope, handles, petnames
+│   │   ├── crypto/            # UCAN, sender keys, access keys, canonical hashing
 │   │   ├── envelope/          # SCP envelope creation, parsing, validation
 │   │   ├── provenance/        # Data provenance tagging
-│   │   ├── event_log/         # Append-only verifiable log
-│   │   ├── store/             # ProtocolRepository — typed domain storage (§17.4)
 │   │   ├── bridge/            # Bridge connector protocol types (§12)
 │   │   ├── economy/           # Economic governance, pricing, spend auth (§19)
 │   │   └── sync/              # Offline/sync strategy (§23)
+│   │
+│   ├── scp-runtime/           # Async orchestration (ContextManager, MLS, providers)
+│   │   ├── context/           # ContextManager, builder, persistence bridges
+│   │   ├── crypto/            # MLS wrapper (OpenMLS), UCAN minting, key protocol
+│   │   ├── identity/          # SCPID, custody migration, recovery
+│   │   ├── store/             # ProtocolRepository — typed domain storage (§17.4)
+│   │   ├── event_log/         # Tiered storage, cold-tier provider
+│   │   └── ...                # envelope, discovery, bridge, economy async modules
+│   │
+│   ├── scp-core/              # Facade re-exporting scp-protocol + scp-runtime
 │   │
 │   ├── scp-identity/          # DID, DHT, document, key management
 │   │
@@ -568,13 +576,21 @@ State:
               └──────┬────────────────┘
                      │
                      ▼
-               scp-core ◄─────────── scp-mcp
-              ╱    │    ╲
-             ╱     │     ╲
-            ▼      ▼      ▼
-  scp-transport    │   scp-identity
-            │      │      │
-            ▼      ▼      ▼
+               scp-core (facade) ◄──── scp-mcp
+                     │
+              ┌──────┴──────┐
+              ▼              ▼
+         scp-runtime    scp-protocol
+              │              │
+              ├──► scp-protocol
+              ├──► scp-platform
+              ├──► scp-identity
+              │    scp-protocol ──► scp-primitives
+              │                 ──► scp-event-log
+              ▼
+  scp-transport    scp-identity
+            │            │
+            ▼            ▼
          scp-platform (traits)
               │
               ▼
@@ -604,7 +620,7 @@ State:
         ├──► scp-transport
         └──► scp-platform
 
-   Note: Bridge protocol types live in scp-core/bridge/,
+   Note: Bridge protocol types live in scp-protocol/bridge/,
    not in a separate scp-bridge crate.
 ```
 
@@ -646,11 +662,11 @@ Layer 0 ─ scp-primitives            Pure utility crate (time, encoding, hashin
            │                          DeviceAttestation, Push).
            │                          Zero SCP dependencies — leaf crates.
            │
-Layer 1 ─ scp-core                  Protocol engine. Contexts, identity, trust, discovery,
+Layer 1 ─ scp-protocol              Pure sync protocol types (no tokio, wasm32-compatible).
+           │  scp-runtime             Async orchestration (ContextManager, MLS, providers).
+           │  scp-core                Facade re-exporting scp-protocol + scp-runtime.
            │  scp-identity            DID, DHT, document, key management.
            │  scp-event-log           Merkle event log.
-           │                          crypto, event log, store, envelope, provenance,
-           │                          bridge, economy, sync.
            │                          Depend on scp-primitives and scp-platform.
            │
 Layer 2 ─ scp-transport             Transport abstraction + native relay adapter.
@@ -669,7 +685,7 @@ Layer 4 ─ scp-testing               Dev-dependency only. Network simulation ha
                                       Never imported by production code.
 ```
 
-**Completed extractions:** `scp-identity` and `scp-event-log` have been extracted from `scp-core` into standalone Layer 1 crates (issues #93, #94). `scp-primitives` was extracted as a Layer 0 leaf crate housing shared utilities (time, encoding, hashing) that previously lived in `scp-core` (issue #233).
+**Completed extractions:** `scp-identity` and `scp-event-log` have been extracted from `scp-core` into standalone Layer 1 crates (issues #93, #94). `scp-primitives` was extracted as a Layer 0 leaf crate housing shared utilities (time, encoding, hashing) that previously lived in `scp-core` (issue #233). `scp-protocol` (pure sync types) and `scp-runtime` (async orchestration) have been extracted from the original `scp-core`, which is now a thin facade re-exporting both (issue #1446).
 
 #### 2.5.2 Replaceable Subsystems
 
