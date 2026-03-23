@@ -280,9 +280,8 @@ fn parse_provenance_fields(def: &serde_json::Value) -> Result<ProvenanceFields, 
 ///
 /// Used for typed deserialization of `rate_limit_json` instead of generic
 /// `serde_json::Value`. Validates that the required fields (`max_calls`,
-/// `window_seconds`) are present and well-typed at parse time. Mirrors
-/// `scp_core::context::tools::interface::RateLimit` field layout without
-/// depending on scp-core (WASM constraint per ADR-034).
+/// `window_seconds`) are present and well-typed at parse time. Uses
+/// default burst constants from `scp_protocol::context::tools::interface`.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 struct WasmRateLimit {
     /// Maximum number of calls permitted within the time window.
@@ -297,12 +296,14 @@ struct WasmRateLimit {
     pub burst_window_seconds: u64,
 }
 
+/// Default burst allowance from scp-protocol (§6.2.0.2).
 const fn default_burst_allowance() -> u32 {
-    5
+    scp_protocol::context::tools::interface::DEFAULT_BURST_ALLOWANCE
 }
 
+/// Default burst window from scp-protocol (§6.2.0.2).
 const fn default_burst_window_secs() -> u64 {
-    1
+    scp_protocol::context::tools::interface::DEFAULT_BURST_WINDOW_SECS
 }
 
 // ---------------------------------------------------------------------------
