@@ -118,6 +118,9 @@ while IFS= read -r line; do
     # Match pub fn or pub async fn declarations
     if [[ "$content" =~ pub[[:space:]]+(async[[:space:]]+)?fn[[:space:]]+([a-zA-Z_][a-zA-Z0-9_]*) ]]; then
         fn_name="${BASH_REMATCH[2]}"
+        # Skip serde helper functions — these are pub for #[serde(with = "...")]
+        # but are not protocol operations that need FFI exports.
+        [[ "$fn_name" != "serialize" && "$fn_name" != "deserialize" ]] || continue
         NEW_PUB_FNS+=("${CURRENT_FILE}::${fn_name}")
         NEW_PUB_FN_NAMES+=("${fn_name}")
         NEW_PUB_FN_FILES+=("${CURRENT_FILE}")
