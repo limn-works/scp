@@ -1,8 +1,8 @@
-//! Shared mock providers for scp-core examples.
+//! Shared mock providers for scp-runtime examples.
 //!
 //! These are minimal no-op implementations of the three provider traits
 //! required by `ContextManager`. For real usage, see:
-//! - `scp-core::crypto::mls::provider` for production MLS crypto
+//! - `scp-runtime::crypto::mls::provider` for production MLS crypto
 //! - `scp-transport` for production relay transport
 //! - `scp-event-log` for production Merkle event log
 

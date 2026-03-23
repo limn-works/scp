@@ -4,7 +4,7 @@
 //! capabilities, and invoking the tool with input validation.
 //!
 //! Usage:
-//!   `cargo run -p scp-core --features testing --example tools`
+//!   `cargo run -p scp-runtime --features testing --example tools`
 
 use scp_identity::DID;
 use scp_protocol::context::roles::{Capability, CapabilityCeiling, ContextRoleState};
