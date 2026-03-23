@@ -13,9 +13,10 @@
 //! # WASM constraints
 //!
 //! This bridge does NOT depend on `scp-core` (tokio multi-thread incompatible
-//! with `wasm32-unknown-unknown`). Provenance operations are pure computation
-//! (chain depth arithmetic, quality tier evaluation, JSON construction)
-//! re-implemented locally with algorithm-identical logic.
+//! with `wasm32-unknown-unknown`). `SourceType` and `DEFAULT_MAX_CHAIN_DEPTH`
+//! are imported from `scp-protocol`. Provenance operations (chain depth
+//! arithmetic, quality tier evaluation, pseudonymization, JSON construction)
+//! remain WASM-local.
 //!
 //! See ADR-019 in `.docs/adrs/phase-4.md`.
 

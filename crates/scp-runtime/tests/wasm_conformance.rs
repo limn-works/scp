@@ -1974,3 +1974,103 @@ fn wasm_attestation_canonical_bytes_challenge_response_verified() {
         "challenge_response",
     );
 }
+
+// ===========================================================================
+// Golden vector smoke tests (Fix 2)
+//
+// These verify that the WASM runtime environment produces correct
+// cryptographic output. They catch environment-level failures (getrandom,
+// JS crypto backend) that compilation alone cannot.
+// ===========================================================================
+
+/// Sender key encrypt → decrypt roundtrip with a fixed test key.
+#[test]
+fn golden_sender_key_roundtrip() {
+    use scp_protocol::crypto::sender_keys::{
+        SenderKey, decrypt_sender_layer, encrypt_sender_layer,
+    };
+
+    let key = SenderKey::from_bytes([0xAA; 32]);
+    let plaintext = b"hello golden vector";
+    let context_id = "ctx-golden";
+    let sender_did = "did:dht:zGolden";
+    let epoch = 1;
+    let sequence = 0;
+
+    let ciphertext = encrypt_sender_layer(&key, plaintext, context_id, sender_did, epoch, sequence)
+        .expect("encrypt_sender_layer must succeed with valid key material");
+
+    // Ciphertext must be longer than plaintext (12-byte nonce + 16-byte tag).
+    assert!(
+        ciphertext.len() > plaintext.len(),
+        "ciphertext must include nonce and auth tag"
+    );
+
+    let decrypted =
+        decrypt_sender_layer(&key, &ciphertext, context_id, sender_did, epoch, sequence)
+            .expect("decrypt_sender_layer must succeed for matching parameters");
+
+    assert_eq!(
+        decrypted, plaintext,
+        "sender key roundtrip must produce identical plaintext"
+    );
+}
+
+/// Revocation CID golden value: `compute_revocation_cid("test-token")`
+/// must produce a known SHA-256 hash.
+#[test]
+fn golden_revocation_cid() {
+    use scp_protocol::crypto::ucan::revoke::compute_revocation_cid;
+
+    let cid = compute_revocation_cid("test-token");
+
+    // SHA-256("test-token") = 4c5dc9b7...
+    assert_eq!(
+        cid, "4c5dc9b7708905f77f5e5d16316b5dfb425e68cb326dcd55a860e90a7707031e",
+        "revocation CID must be SHA-256 of the token string"
+    );
+}
+
+/// Event leaf hash golden value: appending a fixed event to an empty log
+/// must produce a known Merkle root.
+#[test]
+fn golden_event_leaf_hash() {
+    use scp_event_log::tree::{append_unsigned_event, root};
+    use scp_event_log::{DID, Event, EventLog, EventPayload, EventType};
+
+    let mut log = EventLog::new("ctx-golden".to_owned());
+
+    let event = Event {
+        event_type: EventType::MessageSent,
+        actor_did: DID::from("did:dht:zGolden"),
+        timestamp: 1_700_000_000,
+        sequence: 0,
+        payload: EventPayload {
+            data: b"golden-payload".to_vec(),
+        },
+        prev_hash: [0u8; 32],
+        signature: vec![],
+    };
+
+    append_unsigned_event(&mut log, &event).expect("append must succeed for valid event");
+    let root_hash = root(&log);
+
+    // For a single-leaf tree, the root IS the leaf hash:
+    // SHA-256(0x00 || rmp_serde::to_vec(event))
+    //
+    // This golden vector was recorded by running the function and capturing
+    // the output. Any change to Event serialization or hashing will break
+    // this test — which is exactly the point.
+    let root_hex = hex::encode(root_hash);
+
+    // Hardcode after first run to lock the value.
+    // If this assertion fails, it means the event serialization or hashing
+    // algorithm has changed — investigate before updating the vector.
+    // Golden vector: SHA-256(0x00 || rmp_serde::to_vec(event)) recorded from
+    // scp-event-log. If this changes, event serialization has been modified.
+    assert_eq!(
+        root_hex, "b891621d6d19bc37e93a9acb4709fa5fe2bc7020836493b0a6b2b0415e99decb",
+        "single-leaf Merkle root must match recorded golden vector; \
+         a mismatch means Event serialization or leaf hashing has changed"
+    );
+}

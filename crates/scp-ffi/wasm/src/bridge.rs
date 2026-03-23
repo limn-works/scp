@@ -9,9 +9,10 @@
 //! # WASM constraints
 //!
 //! This bridge does NOT depend on `scp-core` (tokio multi-thread incompatible
-//! with `wasm32-unknown-unknown`). Bridge connector operations are
-//! re-implemented locally with algorithm-identical logic matching the
-//! PyO3/NAPI/UniFFI bridges — including governance DID validation and the
+//! with `wasm32-unknown-unknown`). Bridge types (`BridgeMode`,
+//! `ShadowProvenanceStatus`) are imported from `scp-protocol`. Bridge
+//! connector orchestration (registration, trust evaluation, shadow creation)
+//! remains WASM-local — including governance DID validation and the
 //! self-approval invariant (ADR-023).
 //!
 //! See spec section 12 (Bridge System) and ADR-023.

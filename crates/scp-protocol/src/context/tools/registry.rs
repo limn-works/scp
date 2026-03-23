@@ -222,7 +222,7 @@ impl ToolRegistry {
 
     /// Inserts a tool registration. Returns the previous registration if one
     /// existed for this tool ID.
-    pub(crate) fn insert(&mut self, registration: ToolRegistration) -> Option<ToolRegistration> {
+    pub fn insert(&mut self, registration: ToolRegistration) -> Option<ToolRegistration> {
         self.tools
             .insert(registration.tool_id.clone(), registration)
     }

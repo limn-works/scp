@@ -581,9 +581,10 @@ impl PerContextState {
         };
         // append_unsigned_event validates sequence + prev_hash. Since we
         // compute both from the current log state, this should never fail.
-        // If it does, silently drop (matching old WasmEventLog behavior which
-        // never returned errors from append_event).
-        let _ = append_unsigned_event(&mut self.event_log, &event);
+        // If it does, log the error to the browser console for diagnostics.
+        if let Err(e) = append_unsigned_event(&mut self.event_log, &event) {
+            web_sys::console::error_1(&format!("[SCP] event log append failed: {e}").into());
+        }
     }
 
     /// Returns `true` if the member has the given capability string.
@@ -854,12 +855,11 @@ impl Default for WasmContextManager {
 const MAX_BATCH_ASSETS: usize = 10_000;
 
 /// Maximum body size in bytes (10 MiB).
-/// Algorithm-identical to `scp_core::context::broadcast_content::MAX_BODY_BYTES`.
+/// Must match `scp_core::context::broadcast_content::MAX_BODY_BYTES`.
 const MAX_BODY_BYTES: usize = 10 * 1024 * 1024;
 
-/// Current broadcast content format version — must match
-/// `scp_protocol::context::broadcast_content::BROADCAST_CONTENT_VERSION`.
-const BROADCAST_CONTENT_VERSION: u8 = 1;
+// Imported from scp-protocol.
+use scp_protocol::context::broadcast_content::BROADCAST_CONTENT_VERSION;
 
 // ---------------------------------------------------------------------------
 // Content validation — delegates to scp-protocol broadcast_content types
@@ -867,10 +867,7 @@ const BROADCAST_CONTENT_VERSION: u8 = 1;
 
 /// Validates a content path for broadcast asset publishing (SCP-290).
 ///
-/// Algorithm-identical to `scp_core::context::broadcast_content::ContentPath::new`.
-/// Reimplemented locally per ADR-034. Applies NFC normalization before
-/// validation, matching scp-core's behavior.
-/// Validates and normalizes a content path using `scp_protocol::context::broadcast_content::ContentPath`.
+/// Delegates to `scp_protocol::context::broadcast_content::ContentPath::new`.
 fn validate_content_path_wasm(path: &str) -> Result<String, String> {
     use scp_protocol::context::broadcast_content::ContentPath;
     let cp = ContentPath::new(path).map_err(|e| e.to_string())?;
@@ -1489,12 +1486,12 @@ impl WasmContextManager {
         let ctx = self.require_active_context_mut(context_id)?;
 
         let tool_id = registration.tool_id.clone();
-        ctx.tool_registry
-            .insert(registration)
-            .map_err(|e| ScpWasmError::Tool {
+        crate::runtime::tool_registry_insert_unique(&mut ctx.tool_registry, registration).map_err(
+            |e| ScpWasmError::Tool {
                 message: e,
                 code: "SCP-TOOL-6001".to_owned(),
-            })?;
+            },
+        )?;
 
         let actor = ctx.creator_did.clone();
         ctx.append_log_event(EventType::ToolRegistered, &actor, tool_id.as_bytes());
@@ -3020,12 +3017,12 @@ impl WasmContextManager {
             registered_at,
             signature: Vec::new(),
         };
-        ctx.tool_registry
-            .insert(reg)
-            .map_err(|e| ScpWasmError::Tool {
+        crate::runtime::tool_registry_insert_unique(&mut ctx.tool_registry, reg).map_err(|e| {
+            ScpWasmError::Tool {
                 message: e,
                 code: "SCP-TOOL-6001".to_owned(),
-            })?;
+            }
+        })?;
         Ok(serde_json::json!({"action": "RegisterTool", "toolId": tool_id}))
     }
 
@@ -3679,14 +3676,14 @@ impl WasmContextManager {
         body: &[u8],
         deploy_id: Option<&str>,
     ) -> Result<(String, String, String), ScpWasmError> {
-        // Validate and NFC-normalize path (reimplemented per ADR-034).
+        // Validate and NFC-normalize path (delegates to scp-protocol ContentPath).
         let normalized_path =
             validate_content_path_wasm(path).map_err(|msg| ScpWasmError::Context {
                 message: format!("invalid path: {msg}"),
                 code: "SCP-CTX-2070".to_owned(),
             })?;
 
-        // Validate content_type (reimplemented per ADR-034).
+        // Validate content_type (delegates to scp-protocol MimeType).
         validate_mime_type_wasm(content_type).map_err(|msg| ScpWasmError::Context {
             message: format!("invalid content_type: {msg}"),
             code: "SCP-CTX-2071".to_owned(),

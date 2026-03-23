@@ -54,7 +54,7 @@ The following modules previously contained standalone WASM reimplementations. Af
 
 | Module | Responsibility | Dependency Source |
 |--------|---------------|-------------------|
-| `runtime.rs` | WASM-local runtime registry: `WasmContextRuntime`, `ToolRegistry`, `with_context` | Local + `scp_protocol::context::tools::schema` |
+| `runtime.rs` | Runtime helpers: re-exports `ToolRegistry` from scp-protocol, `tool_registry_insert_unique` wrapper, hex helpers | `scp_protocol::context::tools` |
 | `manager.rs` | `WasmContextManager`: context lifecycle, governance, broadcast, role checking, event log (via `scp_event_log::EventLog`) | Local + `scp_event_log` + `scp_protocol::context::broadcast_content` |
 | `context.rs` | Context lifecycle: create, join, leave, close, send, subscribe, export, import | Local + `scp_protocol::context::templates` |
 | `tools.rs` | Tool registration, invocation, verification | Local + `scp_protocol::context::tools` |

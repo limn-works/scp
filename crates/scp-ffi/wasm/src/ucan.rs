@@ -673,8 +673,8 @@ mod tests {
     // extract_key_scope — tests use scp-protocol types directly
     // -----------------------------------------------------------------------
 
-    /// Helper: extract key scope from a UcanPayload (mirrors
-    /// scp-protocol's extract_key_scope, which is private).
+    /// Helper: extract key scope from a `UcanPayload` (mirrors
+    /// scp-protocol's `extract_key_scope`, which is private).
     fn extract_key_scope(payload: &UcanPayload) -> Option<String> {
         payload
             .fct
@@ -1054,7 +1054,7 @@ mod tests {
     }
 
     /// Helper: run the full scp-protocol validation pipeline with pre-extracted
-    /// state (for tests that don't have a WasmContextManager).
+    /// state (for tests that don't have a `WasmContextManager`).
     fn validate_with_extracted_state(
         token: &UcanToken,
         capability: &str,

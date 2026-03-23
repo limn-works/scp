@@ -2043,9 +2043,10 @@ where
 // MetadataRecord inspection (§5.7.2, #615)
 // ---------------------------------------------------------------------------
 
-/// WASM-local `MetadataRecord` definition, algorithm-identical to scp-core's
+/// WASM-local `MetadataRecord` definition matching scp-core's
 /// `context::metadata::MetadataRecord`. Uses the same serde field names.
-/// See ADR-034 -- WASM cannot depend on scp-core.
+/// Remains WASM-local because the scp-core `MetadataRecord` depends on
+/// async context state not available in the WASM bridge.
 #[derive(serde::Serialize, serde::Deserialize)]
 struct WasmMetadataRecord {
     context_id: String,

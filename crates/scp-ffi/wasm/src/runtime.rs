@@ -1,12 +1,9 @@
-//! WASM-local tool registry and re-exports from `scp-protocol`.
+//! WASM-local runtime helpers and re-exports from `scp-protocol`.
 //!
 //! Tool registration types (`ToolRegistration`, `TestVector`, `ToolCost`,
-//! `ToolSchema`) and schema validation functions (`validate_schema`,
-//! `validate_value_against_schema`) are imported from `scp-protocol`.
-//!
-//! A thin `ToolRegistry` wrapper is kept locally because the `scp-protocol`
-//! version's `insert` method is `pub(crate)` and cannot be called from
-//! external crates.
+//! `ToolSchema`), `ToolRegistry`, and schema validation functions
+//! (`validate_schema`, `validate_value_against_schema`) are imported from
+//! `scp-protocol`.
 //!
 //! Event log, Merkle proofs, and event type tags are provided by `scp-event-log`.
 //!
@@ -15,77 +12,35 @@
 //!
 //! See SCP-218 and ADR-022/ADR-034 in `.docs/adrs/phase-4.md`.
 
-use std::collections::HashMap;
-
 // Re-export tool types from scp-protocol for use by manager.rs, tools.rs, etc.
 pub use scp_protocol::context::tools::schema::{
     SchemaValidationError, validate_schema, validate_value_against_schema,
 };
-pub use scp_protocol::context::tools::{TestVector, ToolCost, ToolRegistration, ToolSchema};
+pub use scp_protocol::context::tools::{
+    TestVector, ToolCost, ToolRegistration, ToolRegistry, ToolSchema,
+};
 
-// ---------------------------------------------------------------------------
-// ToolRegistry — thin wrapper (scp-protocol's insert is pub(crate))
-// ---------------------------------------------------------------------------
-
-/// In-memory tool storage per context.
+/// Inserts a tool registration with duplicate checking.
 ///
-/// Wraps `HashMap<String, ToolRegistration>` with duplicate-checking insert.
-/// Uses `ToolRegistration` from `scp-protocol`; only the registry wrapper is
-/// local because `scp_protocol::context::tools::ToolRegistry::insert` is
-/// `pub(crate)`.
-pub struct ToolRegistry {
-    tools: HashMap<String, ToolRegistration>,
-}
-
-impl Default for ToolRegistry {
-    fn default() -> Self {
-        Self::new()
+/// Unlike `ToolRegistry::insert` (which returns the previous registration),
+/// this returns an error if the tool ID is already registered — preserving
+/// the WASM bridge's "register once" semantics.
+///
+/// # Errors
+///
+/// Returns an error string if the tool ID is already registered.
+pub fn tool_registry_insert_unique(
+    registry: &mut ToolRegistry,
+    registration: ToolRegistration,
+) -> Result<(), String> {
+    if registry.contains(&registration.tool_id) {
+        return Err(format!(
+            "tool already registered: \"{}\"",
+            registration.tool_id
+        ));
     }
-}
-
-impl ToolRegistry {
-    /// Creates a new empty tool registry.
-    #[must_use]
-    pub fn new() -> Self {
-        Self {
-            tools: HashMap::new(),
-        }
-    }
-
-    /// Returns the registration for `tool_id`, or `None` if not found.
-    #[must_use]
-    pub fn get(&self, tool_id: &str) -> Option<&ToolRegistration> {
-        self.tools.get(tool_id)
-    }
-
-    /// Returns the number of registered tools.
-    #[must_use]
-    pub fn len(&self) -> usize {
-        self.tools.len()
-    }
-
-    /// Returns `true` if the registry is empty.
-    #[must_use]
-    pub fn is_empty(&self) -> bool {
-        self.tools.is_empty()
-    }
-
-    /// Inserts a tool registration.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the tool ID is already registered.
-    pub fn insert(&mut self, registration: ToolRegistration) -> Result<(), String> {
-        if self.tools.contains_key(&registration.tool_id) {
-            return Err(format!(
-                "tool already registered: \"{}\"",
-                registration.tool_id
-            ));
-        }
-        self.tools
-            .insert(registration.tool_id.clone(), registration);
-        Ok(())
-    }
+    registry.insert(registration);
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------

@@ -127,8 +127,8 @@ pub fn economy_estimate_cost(
                 .unwrap_or(0)
         };
 
-        // Evaluate formula if present — delegates to scp-protocol's typed
-        // evaluate_formula for algorithm-identical results with native.
+        // Evaluate formula if present — delegates to scp-protocol's
+        // evaluate_formula (shared implementation).
         let formula_cost = policy
             .get("pricing_formula")
             .and_then(|f| {
