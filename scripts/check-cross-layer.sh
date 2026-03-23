@@ -11,7 +11,7 @@
 #   - pub(crate) / pub(super) functions (not externally visible)
 #   - Functions in tests/ or examples/ directories
 #   - Functions inside #[cfg(test)] modules
-#   - PR body contains [cross-layer-exempt] with justification
+#   - Validated exemption markers in PR body (see below for types)
 #
 # Exit 0: no new pub fns, or all have matching FFI exports, or exempt
 # Exit 1: new pub fns without corresponding FFI exports
@@ -105,6 +105,11 @@ while IFS= read -r line; do
         fn_name="${BASH_REMATCH[2]}"
         NEW_PUB_FNS+=("${CURRENT_FILE}::${fn_name}")
         NEW_PUB_FN_NAMES+=("${fn_name}")
+        NEW_PUB_FN_FILES+=("${CURRENT_FILE}")
+        NEW_PUB_FN_KIND+=("fn")
+    # Match pub struct/enum/type/trait (type-only items, not callable)
+    elif [[ "$content" =~ pub[[:space:]]+(struct|enum|type|trait)[[:space:]]+([a-zA-Z_][a-zA-Z0-9_]*) ]]; then
+        : # Types don't need FFI exports — skip silently
     fi
 done <<< "$CORE_DIFF"
 
@@ -203,10 +208,15 @@ fi
 
 echo "For each unmatched function, either:" >&2
 echo "  1. Add the FFI bridge export in this PR" >&2
-echo "  2. Mark the PR with [cross-layer-exempt] and explain why" >&2
+echo "  2. Add a validated exemption marker in the PR body (see below)" >&2
+echo "" >&2
+echo "Valid exemption markers (one per line in PR body):" >&2
+echo "  [cross-layer: pub-crate-visibility] <function_name>  — pub for cross-module Rust access, not SDK surface" >&2
+echo "  [cross-layer: test-infrastructure] <function_name>   — test helpers, fixtures, mock types" >&2
+echo "  [cross-layer: internal-crypto] <function_name>       — crypto construction helpers" >&2
 echo "" >&2
 
-# Check for [cross-layer-exempt] in PR body
+# Load PR body
 PR_TEXT=""
 if [[ -n "${PR_BODY:-}" ]]; then
     PR_TEXT="$PR_BODY"
@@ -214,12 +224,57 @@ elif [[ -n "${PR_BODY_FILE:-}" && -f "${PR_BODY_FILE:-}" ]]; then
     PR_TEXT=$(cat "$PR_BODY_FILE")
 fi
 
-if [[ "$PR_TEXT" == *"[cross-layer-exempt]"* ]]; then
-    echo "WARNING: ${#UNMATCHED[@]} function(s) unmatched but PR is [cross-layer-exempt]." >&2
-    echo "" >&2
-    echo "PASSED (exempt): Cross-layer check bypassed via [cross-layer-exempt]."
+# Validate each exemption marker against the actual code
+STILL_UNMATCHED=()
+for i in "${!UNMATCHED[@]}"; do
+    fn_full="${UNMATCHED[$i]}"
+    # Extract function name (after ::)
+    fn_name="${fn_full##*::}"
+    # Extract file path (before ::)
+    fn_file="${fn_full%%::*}"
+    exempted=0
+
+    # [cross-layer: pub-crate-visibility] — function could be pub(crate) but needs cross-crate access
+    if echo "$PR_TEXT" | grep -q "\[cross-layer: pub-crate-visibility\].*${fn_name}"; then
+        echo "  EXEMPT (pub-crate-visibility): $fn_full" >&2
+        exempted=1
+    fi
+
+    # [cross-layer: test-infrastructure] — must be in a testing module or behind testing feature
+    if [[ $exempted -eq 0 ]] && echo "$PR_TEXT" | grep -q "\[cross-layer: test-infrastructure\].*${fn_name}"; then
+        if [[ "$fn_file" == *"/testing"* ]] || [[ "$fn_file" == *"/tests/"* ]] || grep -q "cfg.*feature.*testing" "$(git rev-parse --show-toplevel)/${fn_file}" 2>/dev/null; then
+            echo "  EXEMPT (test-infrastructure): $fn_full" >&2
+            exempted=1
+        else
+            echo "  INVALID EXEMPTION: $fn_full claimed test-infrastructure but file is not in a testing module" >&2
+        fi
+    fi
+
+    # [cross-layer: internal-crypto] — must be in crypto/ directory
+    if [[ $exempted -eq 0 ]] && echo "$PR_TEXT" | grep -q "\[cross-layer: internal-crypto\].*${fn_name}"; then
+        if [[ "$fn_file" == *"/crypto/"* ]]; then
+            echo "  EXEMPT (internal-crypto): $fn_full" >&2
+            exempted=1
+        else
+            echo "  INVALID EXEMPTION: $fn_full claimed internal-crypto but file is not in crypto/" >&2
+        fi
+    fi
+
+    if [[ $exempted -eq 0 ]]; then
+        STILL_UNMATCHED+=("$fn_full")
+    fi
+done
+
+echo "" >&2
+
+if [[ ${#STILL_UNMATCHED[@]} -eq 0 ]]; then
+    echo "All unmatched functions have valid exemptions."
+    echo "PASSED (exempt): Cross-layer check satisfied via validated exemptions."
     exit 0
 fi
 
-echo "FAILED: ${#UNMATCHED[@]} new public function(s) without FFI bridge exports."
+echo "FAILED: ${#STILL_UNMATCHED[@]} function(s) without FFI exports or valid exemptions:" >&2
+for fn in "${STILL_UNMATCHED[@]}"; do
+    echo "  ✗ $fn" >&2
+done
 exit 1
