@@ -696,6 +696,10 @@ impl NonceDedup {
 // HPKE context binding helpers (§9.16.2)
 // ---------------------------------------------------------------------------
 
+/// Builds the HPKE `info` parameter for sender-key ECIES encryption (spec §9.16.2).
+///
+/// Contains a fixed prefix, context ID, sender DID, and epoch — length-prefixed to
+/// prevent boundary-shift collisions.
 #[must_use]
 pub fn build_hpke_info(context_id: &str, sender_did: &str, epoch: u64) -> Vec<u8> {
     let ctx_bytes = context_id.as_bytes();
@@ -716,6 +720,10 @@ pub fn build_hpke_info(context_id: &str, sender_did: &str, epoch: u64) -> Vec<u8
     info
 }
 
+/// Builds the HPKE `aad` (additional authenticated data) for sender-key ECIES encryption (spec §9.16.2).
+///
+/// Contains context ID, sender DID, and epoch — length-prefixed to prevent
+/// boundary-shift collisions.
 #[must_use]
 pub fn build_hpke_aad(context_id: &str, sender_did: &str, epoch: u64) -> Vec<u8> {
     let ctx_bytes = context_id.as_bytes();

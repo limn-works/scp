@@ -1,9 +1,9 @@
 #![doc = include_str!("../README.md")]
 #![warn(missing_docs)]
-//! Core protocol implementation for SCP (Shared Context Protocol).
+//! Async runtime orchestration for SCP (Shared Context Protocol).
 //!
-//! `scp-core` contains the cryptographic and protocol logic that all SCP
-//! clients share:
+//! `scp-runtime` contains the async orchestration and stateful logic that all
+//! SCP clients share:
 //!
 //! - [`crypto::mls`] — MLS (Messaging Layer Security) group encryption wrapper.
 //!   Every SCP context maps to one MLS group. Provides create, add member,
@@ -11,9 +11,10 @@
 //!
 //! # Architecture
 //!
-//! `scp-core` depends on `scp-platform` for platform abstraction traits
-//! (key custody, storage). It does not depend on any transport layer — the
-//! core is purely about identity, crypto, and protocol logic.
+//! `scp-runtime` depends on `scp-protocol` for pure sync types and
+//! `scp-platform` for platform abstraction traits (key custody, storage).
+//! It does not depend on any transport layer — the runtime is purely about
+//! identity, crypto, and protocol logic.
 //!
 //! See `.docs/architecture.md` for the full crate layout and build phases.
 

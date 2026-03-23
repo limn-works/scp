@@ -210,7 +210,9 @@ The orchestrator never writes code. It manages execution, maintains plan alignme
 └── standards/       # Coding and workflow standards. NON-NEGOTIABLE
 
 crates/              # Rust workspace — the protocol core
-├── scp-core/        # Protocol logic (context, crypto, governance, trust, sync, etc.)
+├── scp-protocol/    # Pure sync protocol types (no tokio, compiles for wasm32)
+├── scp-runtime/     # Async orchestration (ContextManager, MLS, providers)
+├── scp-core/        # Facade re-exporting scp-protocol + scp-runtime
 ├── scp-ffi/         # FFI bridges — 4 targets, one codebase
 │   ├── src/         #   PyO3 (Python) — the REFERENCE bridge (100% coverage target)
 │   ├── uniffi/      #   UniFFI (Swift, Kotlin)

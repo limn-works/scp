@@ -62,6 +62,7 @@ pub struct AddMemberOutput {
     pub commit_bytes: Vec<u8>,
 }
 
+/// Trait for MLS-backed context crypto operations (create group, add/remove member, encrypt/decrypt).
 pub trait ContextCryptoProvider: Send + Sync {
     /// Validates that the creator's identity is valid and the signing key is
     /// accessible.
