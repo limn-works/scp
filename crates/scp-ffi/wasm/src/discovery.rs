@@ -327,8 +327,11 @@ pub fn discovery_create_query(
         min_history,
     };
 
-    serde_json::to_string(&query)
-        .map_err(|e| JsError::new(&format!("[SCP-VALID-7040] failed to serialize query: {e}")))
+    serde_json::to_string(&query).map_err(|e| {
+        JsError::new(&format!(
+            "[SCP-VALID-7128] failed to serialize discovery query: {e}"
+        ))
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -963,7 +966,7 @@ fn parse_handle_target(target: &serde_json::Value) -> Result<HandleTarget, JsErr
                 .get("did")
                 .and_then(serde_json::Value::as_str)
                 .ok_or_else(|| {
-                    JsError::new("[SCP-VALID-7126] identity target missing 'did' field")
+                    JsError::new("[SCP-VALID-7121] identity target missing 'did' field")
                 })?;
             Ok(HandleTarget::Identity {
                 did: scp_event_log::DID::from(did),
@@ -974,7 +977,7 @@ fn parse_handle_target(target: &serde_json::Value) -> Result<HandleTarget, JsErr
                 .get("context_id")
                 .and_then(serde_json::Value::as_str)
                 .ok_or_else(|| {
-                    JsError::new("[SCP-VALID-7126] context target missing 'context_id' field")
+                    JsError::new("[SCP-VALID-7122] context target missing 'context_id' field")
                 })?
                 .to_owned();
             let relay_urls: Vec<String> = target
@@ -993,10 +996,10 @@ fn parse_handle_target(target: &serde_json::Value) -> Result<HandleTarget, JsErr
             })
         }
         Some(other) => Err(JsError::new(&format!(
-            "[SCP-VALID-7126] unknown target type: '{other}'"
+            "[SCP-VALID-7123] unknown target type: '{other}'"
         ))),
         None => Err(JsError::new(
-            "[SCP-VALID-7126] target_json missing 'type' field",
+            "[SCP-VALID-7124] target_json missing 'type' field",
         )),
     }
 }
@@ -1052,14 +1055,14 @@ pub fn handle_register(
     tags_json: Option<String>,
 ) -> Result<String, JsError> {
     let target_value: serde_json::Value = serde_json::from_str(&target_json)
-        .map_err(|e| JsError::new(&format!("[SCP-VALID-7126] invalid target_json: {e}")))?;
+        .map_err(|e| JsError::new(&format!("[SCP-VALID-7125] invalid target_json: {e}")))?;
 
     let target = parse_handle_target(&target_value)?;
 
     let tags: Option<Vec<String>> = match tags_json.as_deref() {
         Some(s) => Some(
             serde_json::from_str(s)
-                .map_err(|e| JsError::new(&format!("[SCP-VALID-7126] invalid tags_json: {e}")))?,
+                .map_err(|e| JsError::new(&format!("[SCP-VALID-7127] invalid tags_json: {e}")))?,
         ),
         None => None,
     };

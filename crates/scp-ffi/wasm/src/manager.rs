@@ -2292,8 +2292,10 @@ impl WasmContextManager {
                 let ctx = self.require_active_context_mut(context_id)?;
                 // For Full scope in broadcast contexts, destroy the author's
                 // broadcast key (matching scp-core SCP-CAC-007).
-                if matches!(scope, scp_protocol::context::governance::RevocationScope::Full)
-                    && let Some(ref mut bc) = ctx.broadcast_context
+                if matches!(
+                    scope,
+                    scp_protocol::context::governance::RevocationScope::Full
+                ) && let Some(ref mut bc) = ctx.broadcast_context
                 {
                     let _ = bc.block_author(did_str);
                 }
