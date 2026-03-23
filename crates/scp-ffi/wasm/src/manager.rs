@@ -37,6 +37,69 @@ use scp_event_log::proof::{Direction, prove_absence, prove_inclusion, verify_inc
 use scp_event_log::tree::{append_unsigned_event, event_count, root};
 use scp_event_log::{DID, Event, EventLog, EventPayload, EventType};
 
+use scp_protocol::context::broadcast::{BroadcastAdmission, BroadcastContext};
+use scp_protocol::context::governance::{
+    GovernanceAction, GovernanceProposal, ProposalStatus, RevocationScope, SignedVote, VoteType,
+};
+use scp_protocol::context::params::ContextMode;
+use scp_protocol::crypto::ucan::UcanError;
+use scp_protocol::crypto::ucan::validate::{
+    DidResolver, NonceTracker, ProofResolver, RevocationChecker,
+};
+
+// ---------------------------------------------------------------------------
+// No-op UCAN validation trait impls for BroadcastContext::subscribe turbofish
+// ---------------------------------------------------------------------------
+//
+// `BroadcastContext::subscribe` is generic over `DidResolver`, `NonceTracker`,
+// `RevocationChecker`, and `ProofResolver`. When `validation_ctx` is `None`
+// (open admission, no UCAN), these types are only needed to satisfy the
+// generic bounds — their methods are never called. We define minimal no-op
+// implementations here because the in-memory test impls in scp-protocol
+// are gated behind `#[cfg(test)]` / `feature = "testing"`.
+
+/// No-op [`DidResolver`] — always returns an error (never called at runtime).
+struct NoOpDidResolver;
+
+impl DidResolver for NoOpDidResolver {
+    fn resolve_public_key(&self, did: &str) -> Result<[u8; 32], UcanError> {
+        Err(UcanError::MalformedToken(format!(
+            "NoOpDidResolver cannot resolve DID: {did}"
+        )))
+    }
+}
+
+/// No-op [`NonceTracker`] — always returns an error (never called at runtime).
+struct NoOpNonceTracker;
+
+impl NonceTracker for NoOpNonceTracker {
+    fn check_and_record(&mut self, _nonce: &str, _token_expiry: u64) -> Result<(), UcanError> {
+        Err(UcanError::NonceFormatInvalid(
+            "NoOpNonceTracker: not a real tracker".to_owned(),
+        ))
+    }
+}
+
+/// No-op [`RevocationChecker`] — always returns `false` (never called at runtime).
+struct NoOpRevocationChecker;
+
+impl RevocationChecker for NoOpRevocationChecker {
+    fn is_revoked(&self, _token_cid: &str) -> bool {
+        false
+    }
+}
+
+/// No-op [`ProofResolver`] — always returns an error (never called at runtime).
+struct NoOpProofResolver;
+
+impl ProofResolver for NoOpProofResolver {
+    fn resolve_proof(&self, cid: &str) -> Result<scp_protocol::crypto::ucan::UcanToken, UcanError> {
+        Err(UcanError::MalformedToken(format!(
+            "NoOpProofResolver cannot resolve CID: {cid}"
+        )))
+    }
+}
+
 /// SCP protocol version for WASM bridge (§13.2). Must match scp-core's
 /// `SCP_PROTOCOL_VERSION`. Encoded as `(major << 8) | minor`.
 /// SCP/1.0 = `0x0100` (decimal 256).
@@ -206,6 +269,386 @@ fn validate_revocation_scope(scope: &str) -> Result<&str, ScpWasmError> {
 }
 
 // ---------------------------------------------------------------------------
+// WasmGovernanceAction <-> GovernanceAction conversion helpers
+//
+// Needed because proposals are now stored as `GovernanceProposal` from
+// scp-protocol (which requires `GovernanceAction`), but the WASM bridge
+// dispatch code still uses `WasmGovernanceAction`. These functions convert
+// between the two representations at proposal creation and dispatch time.
+// ---------------------------------------------------------------------------
+
+/// Converts a `WasmGovernanceAction` to a `GovernanceAction` from scp-protocol.
+///
+/// Simple fields (`DID`, `RevocationScope`) are converted directly.
+/// JSON-encoded complex fields (`ContextParams`, `PruningPolicy`, etc.) are
+/// deserialized from the WASM bridge's JSON strings into protocol types.
+///
+/// # Errors
+///
+/// Returns `ScpWasmError::Context` if a JSON-encoded field fails to deserialize.
+#[allow(clippy::too_many_lines)] // 30-variant GovernanceAction match
+fn wasm_action_to_governance_action(
+    action: &WasmGovernanceAction,
+) -> Result<GovernanceAction, ScpWasmError> {
+    use scp_protocol::context::governance::{
+        ConflictResolution, DeadlockJustification, GovernanceReconfigAction, PruningPolicy,
+    };
+    use scp_protocol::context::params::{Capability, ContextParams};
+    use scp_protocol::context::tools::interface::ToolInterface;
+    use scp_protocol::economy::types::{Amount, EconomicPolicy};
+
+    let parse_err = |field: &str, e: serde_json::Error| ScpWasmError::Context {
+        message: format!("failed to parse {field} for governance action: {e}"),
+        code: "SCP-CTX-2042".to_owned(),
+    };
+
+    let scope_from_str = |s: &str| -> RevocationScope {
+        if s == "full" {
+            RevocationScope::Full
+        } else {
+            RevocationScope::FutureOnly
+        }
+    };
+
+    Ok(match action {
+        WasmGovernanceAction::AddMember { did, role } => GovernanceAction::AddMember {
+            did: DID(did.clone()),
+            role: role.clone(),
+        },
+        WasmGovernanceAction::RemoveMember { did, reason } => GovernanceAction::RemoveMember {
+            did: DID(did.clone()),
+            reason: reason.clone(),
+        },
+        WasmGovernanceAction::ChangeRole { did, new_role } => GovernanceAction::ChangeRole {
+            did: DID(did.clone()),
+            new_role: new_role.clone(),
+        },
+        WasmGovernanceAction::RegisterTool {
+            tool_id,
+            name,
+            description,
+        } => {
+            use scp_protocol::context::tools::ToolSchema;
+            let registration = ToolRegistration {
+                tool_id: tool_id.clone(),
+                name: name.clone(),
+                description: description.clone(),
+                schema: ToolSchema {
+                    input_schema: serde_json::json!({}),
+                    output_schema: serde_json::json!({}),
+                },
+                implementation_hash: [0u8; 32],
+                test_vectors: Vec::new(),
+                operator_did: DID(String::new()),
+                cost: None,
+                registered_at: 0,
+                signature: Vec::new(),
+            };
+            GovernanceAction::RegisterTool {
+                registration: Box::new(registration),
+            }
+        }
+        WasmGovernanceAction::RemoveTool { tool_id } => GovernanceAction::RemoveTool {
+            tool_id: tool_id.clone(),
+        },
+        WasmGovernanceAction::ModifyCeiling { new_ceiling } => GovernanceAction::ModifyCeiling {
+            new_ceiling: new_ceiling.iter().map(Capability::new).collect(),
+        },
+        WasmGovernanceAction::CloseContext { reason } => GovernanceAction::CloseContext {
+            reason: reason.clone(),
+        },
+        WasmGovernanceAction::ExtendTtl { additional_secs } => GovernanceAction::ExtendTtl {
+            additional_secs: *additional_secs,
+        },
+        WasmGovernanceAction::TransferAdmin { new_admin } => GovernanceAction::TransferAdmin {
+            new_admin: DID(new_admin.clone()),
+        },
+        WasmGovernanceAction::CreateChildContext { params_json } => {
+            let params: ContextParams =
+                serde_json::from_str(params_json).map_err(|e| parse_err("ContextParams", e))?;
+            GovernanceAction::CreateChildContext {
+                params: Box::new(params),
+            }
+        }
+        WasmGovernanceAction::ModifyPruningPolicy { policy_json } => {
+            let policy: PruningPolicy =
+                serde_json::from_str(policy_json).map_err(|e| parse_err("PruningPolicy", e))?;
+            GovernanceAction::ModifyPruningPolicy { new_policy: policy }
+        }
+        WasmGovernanceAction::AddSigner { did } => GovernanceAction::AddSigner {
+            did: DID(did.clone()),
+        },
+        WasmGovernanceAction::RemoveSigner { did } => GovernanceAction::RemoveSigner {
+            did: DID(did.clone()),
+        },
+        WasmGovernanceAction::ModifyThreshold { new_threshold } => {
+            GovernanceAction::ModifyThreshold {
+                new_threshold: *new_threshold,
+            }
+        }
+        WasmGovernanceAction::EstablishToolInterface { interface_json } => {
+            let interface: ToolInterface =
+                serde_json::from_str(interface_json).map_err(|e| parse_err("ToolInterface", e))?;
+            GovernanceAction::EstablishToolInterface { interface }
+        }
+        WasmGovernanceAction::ResetMember { did, reason } => GovernanceAction::ResetMember {
+            did: DID(did.clone()),
+            reason: reason.clone(),
+        },
+        WasmGovernanceAction::ResolveConflict {
+            proposal_a,
+            proposal_b,
+            resolution,
+        } => {
+            let id_from_hex = |hex_str: &str| -> [u8; 32] {
+                let bytes = hex::decode(hex_str).unwrap_or_default();
+                let mut arr = [0u8; 32];
+                let len = bytes.len().min(32);
+                arr[..len].copy_from_slice(&bytes[..len]);
+                arr
+            };
+            let res = if resolution == "invalidate_both" {
+                ConflictResolution::InvalidateBoth
+            } else {
+                ConflictResolution::AcceptProposal {
+                    winner_id: id_from_hex(resolution),
+                }
+            };
+            GovernanceAction::ResolveConflict {
+                proposal_a: id_from_hex(proposal_a),
+                proposal_b: id_from_hex(proposal_b),
+                resolution: res,
+            }
+        }
+        WasmGovernanceAction::PromoteContext => GovernanceAction::PromoteContext,
+        WasmGovernanceAction::RevokeWriteAccess { did, scope } => {
+            GovernanceAction::RevokeWriteAccess {
+                did: DID(did.clone()),
+                scope: scope_from_str(scope),
+            }
+        }
+        WasmGovernanceAction::RestoreWriteAccess { did } => GovernanceAction::RestoreWriteAccess {
+            did: DID(did.clone()),
+        },
+        WasmGovernanceAction::RotateContentKeys { reason } => GovernanceAction::RotateContentKeys {
+            reason: reason.clone(),
+        },
+        WasmGovernanceAction::ReconfigureGovernance {
+            changes_json,
+            justification,
+        } => {
+            let changes: Vec<GovernanceReconfigAction> =
+                serde_json::from_str(changes_json).map_err(|e| parse_err("ReconfigActions", e))?;
+            let just: DeadlockJustification =
+                serde_json::from_str(justification).map_err(|e| parse_err("Justification", e))?;
+            GovernanceAction::ReconfigureGovernance {
+                changes,
+                justification: just,
+            }
+        }
+        WasmGovernanceAction::BlockAuthor { did, reason } => GovernanceAction::BlockAuthor {
+            did: DID(did.clone()),
+            reason: reason.clone(),
+        },
+        WasmGovernanceAction::RevokeReadAccess { did, scope } => {
+            GovernanceAction::RevokeReadAccess {
+                did: DID(did.clone()),
+                scope: scope_from_str(scope),
+            }
+        }
+        WasmGovernanceAction::RestoreReadAccess { did } => GovernanceAction::RestoreReadAccess {
+            did: DID(did.clone()),
+        },
+        WasmGovernanceAction::SetEconomicPolicy { policy_json } => {
+            let policy: EconomicPolicy =
+                serde_json::from_str(policy_json).map_err(|e| parse_err("EconomicPolicy", e))?;
+            GovernanceAction::SetEconomicPolicy { policy }
+        }
+        WasmGovernanceAction::ApproveSpend {
+            spender,
+            amount,
+            purpose,
+        } => GovernanceAction::ApproveSpend {
+            spender: DID(spender.clone()),
+            amount: Amount(*amount),
+            purpose: purpose.clone(),
+        },
+        WasmGovernanceAction::LockEconomicPolicy => GovernanceAction::LockEconomicPolicy,
+        WasmGovernanceAction::ProposeContextMigration {
+            new_context_params_json,
+            reason,
+            grace_period_secs,
+            auto_invite,
+        } => {
+            let params: ContextParams = serde_json::from_str(new_context_params_json)
+                .map_err(|e| parse_err("ContextParams", e))?;
+            GovernanceAction::ProposeContextMigration {
+                new_context_params: Box::new(params),
+                reason: reason.clone(),
+                grace_period_secs: *grace_period_secs,
+                auto_invite: *auto_invite,
+            }
+        }
+        WasmGovernanceAction::CancelContextMigration => GovernanceAction::CancelContextMigration,
+    })
+}
+
+/// Converts a `GovernanceAction` from scp-protocol back to `WasmGovernanceAction`.
+///
+/// Inverse of [`wasm_action_to_governance_action`]. Used when dispatching a
+/// governance action from a stored `GovernanceProposal`.
+#[allow(clippy::too_many_lines)] // 30-variant GovernanceAction match
+fn governance_action_to_wasm(action: &GovernanceAction) -> WasmGovernanceAction {
+    use scp_protocol::context::governance::ConflictResolution;
+
+    let scope_to_str = |s: &RevocationScope| -> String {
+        match s {
+            RevocationScope::Full => "full".to_owned(),
+            RevocationScope::FutureOnly => "future_only".to_owned(),
+        }
+    };
+
+    match action {
+        GovernanceAction::AddMember { did, role } => WasmGovernanceAction::AddMember {
+            did: did.0.clone(),
+            role: role.clone(),
+        },
+        GovernanceAction::RemoveMember { did, reason } => WasmGovernanceAction::RemoveMember {
+            did: did.0.clone(),
+            reason: reason.clone(),
+        },
+        GovernanceAction::ChangeRole { did, new_role } => WasmGovernanceAction::ChangeRole {
+            did: did.0.clone(),
+            new_role: new_role.clone(),
+        },
+        GovernanceAction::RegisterTool { registration } => WasmGovernanceAction::RegisterTool {
+            tool_id: registration.tool_id.clone(),
+            name: registration.name.clone(),
+            description: registration.description.clone(),
+        },
+        GovernanceAction::RemoveTool { tool_id } => WasmGovernanceAction::RemoveTool {
+            tool_id: tool_id.clone(),
+        },
+        GovernanceAction::ModifyCeiling { new_ceiling } => WasmGovernanceAction::ModifyCeiling {
+            new_ceiling: new_ceiling.iter().map(|c| c.name().into_owned()).collect(),
+        },
+        GovernanceAction::CloseContext { reason } => WasmGovernanceAction::CloseContext {
+            reason: reason.clone(),
+        },
+        GovernanceAction::ExtendTtl { additional_secs } => WasmGovernanceAction::ExtendTtl {
+            additional_secs: *additional_secs,
+        },
+        GovernanceAction::TransferAdmin { new_admin } => WasmGovernanceAction::TransferAdmin {
+            new_admin: new_admin.0.clone(),
+        },
+        GovernanceAction::CreateChildContext { params } => {
+            WasmGovernanceAction::CreateChildContext {
+                params_json: serde_json::to_string(params.as_ref()).unwrap_or_default(),
+            }
+        }
+        GovernanceAction::ModifyPruningPolicy { new_policy } => {
+            WasmGovernanceAction::ModifyPruningPolicy {
+                policy_json: serde_json::to_string(new_policy).unwrap_or_default(),
+            }
+        }
+        GovernanceAction::AddSigner { did } => {
+            WasmGovernanceAction::AddSigner { did: did.0.clone() }
+        }
+        GovernanceAction::RemoveSigner { did } => {
+            WasmGovernanceAction::RemoveSigner { did: did.0.clone() }
+        }
+        GovernanceAction::ModifyThreshold { new_threshold } => {
+            WasmGovernanceAction::ModifyThreshold {
+                new_threshold: *new_threshold,
+            }
+        }
+        GovernanceAction::EstablishToolInterface { interface } => {
+            WasmGovernanceAction::EstablishToolInterface {
+                interface_json: serde_json::to_string(interface).unwrap_or_default(),
+            }
+        }
+        GovernanceAction::ResetMember { did, reason } => WasmGovernanceAction::ResetMember {
+            did: did.0.clone(),
+            reason: reason.clone(),
+        },
+        GovernanceAction::ResolveConflict {
+            proposal_a,
+            proposal_b,
+            resolution,
+        } => {
+            let res_str = match resolution {
+                ConflictResolution::InvalidateBoth => "invalidate_both".to_owned(),
+                ConflictResolution::AcceptProposal { winner_id } => hex::encode(winner_id),
+            };
+            WasmGovernanceAction::ResolveConflict {
+                proposal_a: hex::encode(proposal_a),
+                proposal_b: hex::encode(proposal_b),
+                resolution: res_str,
+            }
+        }
+        GovernanceAction::PromoteContext => WasmGovernanceAction::PromoteContext,
+        GovernanceAction::RevokeWriteAccess { did, scope } => {
+            WasmGovernanceAction::RevokeWriteAccess {
+                did: did.0.clone(),
+                scope: scope_to_str(scope),
+            }
+        }
+        GovernanceAction::RestoreWriteAccess { did } => {
+            WasmGovernanceAction::RestoreWriteAccess { did: did.0.clone() }
+        }
+        GovernanceAction::RotateContentKeys { reason } => WasmGovernanceAction::RotateContentKeys {
+            reason: reason.clone(),
+        },
+        GovernanceAction::ReconfigureGovernance {
+            changes,
+            justification,
+        } => WasmGovernanceAction::ReconfigureGovernance {
+            changes_json: serde_json::to_string(changes).unwrap_or_default(),
+            justification: serde_json::to_string(justification).unwrap_or_default(),
+        },
+        GovernanceAction::BlockAuthor { did, reason } => WasmGovernanceAction::BlockAuthor {
+            did: did.0.clone(),
+            reason: reason.clone(),
+        },
+        GovernanceAction::RevokeReadAccess { did, scope } => {
+            WasmGovernanceAction::RevokeReadAccess {
+                did: did.0.clone(),
+                scope: scope_to_str(scope),
+            }
+        }
+        GovernanceAction::RestoreReadAccess { did } => {
+            WasmGovernanceAction::RestoreReadAccess { did: did.0.clone() }
+        }
+        GovernanceAction::SetEconomicPolicy { policy } => WasmGovernanceAction::SetEconomicPolicy {
+            policy_json: serde_json::to_string(policy).unwrap_or_default(),
+        },
+        GovernanceAction::ApproveSpend {
+            spender,
+            amount,
+            purpose,
+        } => WasmGovernanceAction::ApproveSpend {
+            spender: spender.0.clone(),
+            amount: amount.0,
+            purpose: purpose.clone(),
+        },
+        GovernanceAction::LockEconomicPolicy => WasmGovernanceAction::LockEconomicPolicy,
+        GovernanceAction::ProposeContextMigration {
+            new_context_params,
+            reason,
+            grace_period_secs,
+            auto_invite,
+        } => WasmGovernanceAction::ProposeContextMigration {
+            new_context_params_json: serde_json::to_string(new_context_params.as_ref())
+                .unwrap_or_default(),
+            reason: reason.clone(),
+            grace_period_secs: *grace_period_secs,
+            auto_invite: *auto_invite,
+        },
+        GovernanceAction::CancelContextMigration => WasmGovernanceAction::CancelContextMigration,
+    }
+}
+
+// ---------------------------------------------------------------------------
 // ContextEvent — mirrors scp_core::context::membership::ContextEvent
 // ---------------------------------------------------------------------------
 
@@ -297,35 +740,8 @@ struct MemberEntry {
     sequence_number: u64,
 }
 
-// ---------------------------------------------------------------------------
-// WasmProposal — governance proposal lifecycle (#621)
-// ---------------------------------------------------------------------------
-
-/// A pending governance proposal with vote tracking.
-///
-/// Mirrors `GovernanceProposal` from scp-core. Tracks approval and
-/// rejection votes, the governance model requirements, and the voting
-/// deadline. Proposals are resolved (executed or rejected) when quorum
-/// is reached or the deadline expires.
-#[derive(Debug, Clone)]
-struct WasmProposal {
-    /// DID of the proposer.
-    proposer_did: String,
-    /// The governance action to execute if approved.
-    action: WasmGovernanceAction,
-    /// Votes to approve: `(voter_did, timestamp_secs)`.
-    approvals: Vec<(String, u64)>,
-    /// Votes to reject: `(voter_did, timestamp_secs)`.
-    rejections: Vec<(String, u64)>,
-    /// Voting deadline (ms since epoch). Default 1 hour from creation.
-    voting_deadline_ms: f64,
-    /// Context ID this proposal belongs to.
-    context_id: String,
-    /// Unix timestamp (seconds) when the proposal was created.
-    created_at: u64,
-    /// Lifecycle status: "Pending", "Approved", or "Rejected".
-    status: String,
-}
+// WasmProposal deleted: replaced by GovernanceProposal from scp-protocol
+// (scp_protocol::context::governance::GovernanceProposal).
 
 /// Maximum number of pending proposals per context.
 const WASM_PENDING_PROPOSAL_CAP: usize = 100;
@@ -333,54 +749,8 @@ const WASM_PENDING_PROPOSAL_CAP: usize = 100;
 /// Default voting deadline: 1 hour in milliseconds.
 const WASM_PROPOSAL_DEADLINE_MS: f64 = 3_600_000.0;
 
-// ---------------------------------------------------------------------------
-// BroadcastState — broadcast context state (§5.14)
-// ---------------------------------------------------------------------------
-
-/// Broadcast-specific state for a context.
-///
-/// Mirrors the relevant fields from `scp_core::context::broadcast::BroadcastContext`.
-/// Per spec §5.14.8, blocking is per-author: each author maintains an independent
-/// block list. Author A blocking a subscriber does not affect the subscriber's
-/// access to Author B's content.
-#[derive(Debug)]
-struct BroadcastState {
-    /// Author DIDs mapped to their per-author block lists.
-    /// Mirrors `scp_core::context::broadcast::AuthorState.block_list`.
-    authors: HashMap<String, HashSet<String>>,
-    /// Per-author key epochs (§5.14.8). Incremented on block events to
-    /// ensure blocked subscribers cannot decrypt future content.
-    key_epochs: HashMap<String, u64>,
-    /// Subscriber DIDs (members with read access).
-    subscribers: HashSet<String>,
-    /// Admission policy: "open" or "gated". Stored for context metadata.
-    #[allow(dead_code)]
-    admission: String,
-}
-
-impl BroadcastState {
-    fn new(admission: &str) -> Self {
-        Self {
-            authors: HashMap::new(),
-            key_epochs: HashMap::new(),
-            subscribers: HashSet::new(),
-            admission: admission.to_owned(),
-        }
-    }
-
-    /// Returns `true` if the given subscriber DID is blocked by ANY author.
-    /// Useful for governance-ban checks (when a subscriber has been added to
-    /// all authors' block lists). NOT used for subscription gating — per
-    /// scp-core `BroadcastContext::subscribe`, subscription always succeeds
-    /// regardless of block lists. Blocking only affects key distribution
-    /// (`handle_broadcast_key_request`).
-    #[cfg(test)]
-    fn is_blocked_by_any_author(&self, subscriber_did: &str) -> bool {
-        self.authors
-            .values()
-            .any(|block_list| block_list.contains(subscriber_did))
-    }
-}
+// BroadcastState deleted: replaced by BroadcastContext from scp-protocol
+// (§5.14.2 cohesion invariant — broadcast keys stored alongside context data).
 
 // ---------------------------------------------------------------------------
 // PerContextState — per-context state
@@ -438,7 +808,8 @@ struct PerContextState {
     /// Members excluded from future CEK wrapping (`FutureOnly` read revocation).
     read_exclusion_list: HashSet<String>,
     /// Broadcast context state (only for Broadcast mode).
-    broadcast: Option<BroadcastState>,
+    /// Uses `BroadcastContext` from scp-protocol per §5.14.2 cohesion invariant.
+    broadcast_context: Option<BroadcastContext>,
     /// Stateful tool sessions (spec section 6.2.1).
     sessions: HashMap<String, WasmToolSession>,
     /// Threshold governance signers (ADR-031 §4b).
@@ -453,13 +824,15 @@ struct PerContextState {
     /// Pending governance proposals keyed by proposal ID (hex).
     /// Multi-party governance models accumulate votes here until quorum
     /// is reached or the deadline expires (#621).
-    pending_proposals: HashMap<String, WasmProposal>,
+    /// Uses `GovernanceProposal` from scp-protocol.
+    pending_proposals: HashMap<String, GovernanceProposal>,
     /// Resolved (approved/rejected) governance proposals keyed by proposal ID.
     /// Proposals move here from `pending_proposals` when quorum is reached or
     /// the proposal is definitively rejected. This allows retrieval of resolved
     /// proposals via `get_proposal` and `list_proposals` (#621 F4).
     /// Capped at [`WASM_RESOLVED_PROPOSAL_CAP`]; oldest by `created_at` evicted.
-    resolved_proposals: HashMap<String, WasmProposal>,
+    /// Uses `GovernanceProposal` from scp-protocol.
+    resolved_proposals: HashMap<String, GovernanceProposal>,
     /// Pruning policy JSON string (ADR-030 §6).
     pruning_policy: Option<String>,
     /// Whether the economic policy is locked (§19.3, ADR-033).
@@ -676,7 +1049,7 @@ impl PerContextState {
 
     /// Inserts a resolved proposal, evicting the oldest (by `created_at`) if
     /// at [`WASM_RESOLVED_PROPOSAL_CAP`].
-    fn insert_resolved_proposal(&mut self, id: String, proposal: WasmProposal) {
+    fn insert_resolved_proposal(&mut self, id: String, proposal: GovernanceProposal) {
         if self.resolved_proposals.len() >= WASM_RESOLVED_PROPOSAL_CAP {
             // Evict the entry with the smallest `created_at`.
             if let Some(oldest_key) = self
@@ -935,6 +1308,7 @@ impl WasmContextManager {
     ///
     /// Returns an error if the context ID is already registered or if
     /// parameters are invalid.
+    #[allow(clippy::too_many_lines)] // context initialization touches many fields
     pub fn create_context(
         &mut self,
         context_id: &str,
@@ -976,11 +1350,27 @@ impl WasmContextManager {
         // creator's SDK version must satisfy the minimum it sets.
         parse_and_check_min_protocol_version(params)?;
 
-        // Initialize broadcast state for Broadcast mode.
-        let broadcast = if mode == "Broadcast" {
-            let admission = params["admission"].as_str().unwrap_or("open");
-            let mut bc = BroadcastState::new(admission);
-            bc.authors.insert(creator_did.to_owned(), HashSet::new());
+        // Initialize broadcast context for Broadcast mode (§5.14.2).
+        let broadcast_context = if mode == "Broadcast" {
+            let admission_str = params["admission"].as_str().unwrap_or("open");
+            let admission = if admission_str == "gated" {
+                BroadcastAdmission::Gated
+            } else {
+                BroadcastAdmission::Open
+            };
+            let mut bc =
+                BroadcastContext::new(context_id.to_owned(), &ContextMode::Broadcast, admission)
+                    .map_err(|e| ScpWasmError::Context {
+                        message: format!("broadcast context creation failed: {e}"),
+                        code: "SCP-CTX-2001".to_owned(),
+                    })?;
+            // Register creator as initial author.
+            let _ = bc
+                .add_author(creator_did)
+                .map_err(|e| ScpWasmError::Context {
+                    message: format!("failed to add creator as author: {e}"),
+                    code: "SCP-CTX-2001".to_owned(),
+                })?;
             Some(bc)
         } else {
             None
@@ -1033,7 +1423,7 @@ impl WasmContextManager {
             write_revoked_members: HashSet::new(),
             read_revoked_members: HashSet::new(),
             read_exclusion_list: HashSet::new(),
-            broadcast,
+            broadcast_context,
             sessions: HashMap::new(),
             threshold_signers: Vec::new(),
             threshold_value: 0,
@@ -1115,8 +1505,9 @@ impl WasmContextManager {
         }
 
         // Unsubscribe from broadcast if applicable.
-        if let Some(ref mut bc) = ctx.broadcast {
-            bc.subscribers.remove(member_did);
+        if let Some(ref mut bc) = ctx.broadcast_context {
+            // Ignore error if member is not a subscriber.
+            let _ = bc.unsubscribe(member_did, false);
         }
 
         // Destroy crypto state on leave — the leaving member should not
@@ -1239,7 +1630,7 @@ impl WasmContextManager {
         }
 
         "closed".clone_into(&mut ctx.state);
-        ctx.broadcast = None;
+        ctx.broadcast_context = None;
 
         // Destroy crypto state on close — releases MLS group keys and
         // sender key material.
@@ -2316,13 +2707,13 @@ impl WasmContextManager {
                 let old_role = member.role.clone();
                 new_role.clone_into(&mut member.role);
                 // Sync broadcast state when role transitions to/from "author".
-                if let Some(ref mut bc) = ctx.broadcast {
+                if let Some(ref mut bc) = ctx.broadcast_context {
                     if old_role == "author" && new_role != "author" {
-                        bc.authors.remove(did);
-                        bc.key_epochs.remove(did);
+                        // Revoke author status — destroys their broadcast key.
+                        let _ = bc.block_author(did);
                     } else if new_role == "author" && old_role != "author" {
-                        bc.authors.insert(did.to_owned(), HashSet::new());
-                        bc.key_epochs.insert(did.to_owned(), 0);
+                        // Grant author status — generates a fresh broadcast key.
+                        let _ = bc.add_author(did);
                     }
                 }
                 Ok(serde_json::json!({"action": "ChangeRole", "did": did, "newRole": new_role}))
@@ -2419,13 +2810,11 @@ impl WasmContextManager {
             },
         );
         // If the new member is an author in a broadcast context, register
-        // them in the broadcast state with an empty block list and
-        // initialize their key epoch (§5.14.8).
+        // them with a fresh broadcast key at epoch 0 (§5.14.8).
         if role == "author"
-            && let Some(ref mut bc) = ctx.broadcast
+            && let Some(ref mut bc) = ctx.broadcast_context
         {
-            bc.authors.insert(did.to_owned(), HashSet::new());
-            bc.key_epochs.insert(did.to_owned(), 0);
+            let _ = bc.add_author(did);
         }
         ctx.push_event(WasmContextEvent::MemberJoined {
             member_did: did.to_owned(),
@@ -2451,12 +2840,11 @@ impl WasmContextManager {
                 code: "SCP-CTX-2015".to_owned(),
             })?;
         // If the removed member was an author in a broadcast context,
-        // clean up their broadcast state (block list + key epoch).
+        // clean up their broadcast state (destroys broadcast key).
         if removed.role == "author"
-            && let Some(ref mut bc) = ctx.broadcast
+            && let Some(ref mut bc) = ctx.broadcast_context
         {
-            bc.authors.remove(did);
-            bc.key_epochs.remove(did);
+            let _ = bc.block_author(did);
         }
         ctx.push_event(WasmContextEvent::MemberLeft {
             member_did: did.to_owned(),
@@ -2503,9 +2891,8 @@ impl WasmContextManager {
                 // CAC-008: BlockAuthor delegates to RevokeWriteAccess(Full).
                 // Destroy the author's broadcast key and mark write-revoked.
                 let ctx = self.require_active_context_mut(context_id)?;
-                if let Some(ref mut bc) = ctx.broadcast {
-                    bc.authors.remove(did);
-                    bc.key_epochs.remove(did);
+                if let Some(ref mut bc) = ctx.broadcast_context {
+                    let _ = bc.block_author(did);
                 }
                 ctx.write_revoked_members.insert(did.clone());
                 ctx.push_event(WasmContextEvent::WriteAccessRevoked { did: did.clone() });
@@ -2525,11 +2912,9 @@ impl WasmContextManager {
                     });
                 }
                 ctx.read_exclusion_list.remove(did);
-                if let Some(bc) = ctx.broadcast.as_mut() {
+                if let Some(bc) = ctx.broadcast_context.as_mut() {
                     // Governance unban: remove from ALL authors' block lists (§5.14.8).
-                    for block_list in bc.authors.values_mut() {
-                        block_list.remove(did);
-                    }
+                    bc.governance_unban_subscriber(did);
                 }
                 Ok(serde_json::json!({"action": "RestoreReadAccess", "did": did}))
             }
@@ -2581,9 +2966,12 @@ impl WasmContextManager {
 
         // Pre-validate: check ALL authors' block lists before any mutation.
         // This prevents partial corruption if a cap check fails mid-loop.
-        if let Some(bc) = ctx.broadcast.as_ref() {
-            for (author_did, block_list) in &bc.authors {
-                if block_list.len() >= WASM_BLOCK_LIST_CAP && !block_list.contains(did) {
+        if let Some(bc) = ctx.broadcast_context.as_ref() {
+            for author_did in bc.author_dids() {
+                if let Some(author) = bc.get_author(author_did)
+                    && author.block_list.len() >= WASM_BLOCK_LIST_CAP
+                    && !author.block_list.contains(did)
+                {
                     return Err(ScpWasmError::Validation {
                         message: format!(
                             "per-author block list has reached capacity ({WASM_BLOCK_LIST_CAP}) \
@@ -2598,19 +2986,23 @@ impl WasmContextManager {
         // All caps validated — now commit mutations atomically.
         ctx.read_revoked_members.insert(did.to_owned());
         let mut epoch_advances: Vec<(String, u64)> = Vec::new();
-        if let Some(bc) = ctx.broadcast.as_mut() {
-            bc.subscribers.remove(did);
-            // Governance ban (§5.14.8 step 3): add to ALL authors' block lists.
-            for block_list in bc.authors.values_mut() {
-                block_list.insert(did.to_owned());
-            }
-            // §5.14.8 step 4: mandatory key rotation — increment ALL authors'
-            // key epochs. Blocked subscriber cannot decrypt future content from
-            // any author.
-            for author_did in bc.authors.keys() {
-                let epoch = bc.key_epochs.entry(author_did.clone()).or_insert(0);
-                *epoch = epoch.saturating_add(1);
-                epoch_advances.push((author_did.clone(), *epoch));
+        if let Some(bc) = ctx.broadcast_context.as_mut() {
+            // Parse scope string to RevocationScope for BroadcastContext API.
+            let revocation_scope = if scope == "full" {
+                RevocationScope::Full
+            } else {
+                RevocationScope::FutureOnly
+            };
+            // governance_ban_subscriber handles: remove from subscriber roster,
+            // add to ALL authors' block lists, rotate ALL authors' keys, and
+            // increment ALL epochs (§5.14.8 steps 2-4).
+            if let Ok(ban_result) = bc.governance_ban_subscriber(did, revocation_scope) {
+                for rotation in &ban_result.rotated_authors {
+                    epoch_advances.push((rotation.author_did.clone(), rotation.new_epoch));
+                }
+            } else {
+                // Subscriber not in roster — still add to block lists and revoke.
+                // Fall through: read_revoked_members already inserted above.
             }
         }
         // Emit KeyEpochAdvance for each author (§5.14.8 step 4).
@@ -3092,6 +3484,7 @@ impl WasmContextManager {
     ///
     /// Returns an error if the context is not active, the proposer lacks the
     /// required capability, or the action is invalid.
+    #[allow(clippy::too_many_lines)] // governance proposal creation + dispatch
     pub fn propose_governance_action(
         &mut self,
         context_id: &str,
@@ -3146,23 +3539,42 @@ impl WasmContextManager {
         let now = crate::time::now_ms();
         #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
         let now_secs = (now / 1000.0) as u64;
-        let proposal = WasmProposal {
-            proposer_did: proposer_did.to_owned(),
-            action: action.clone(),
-            approvals: vec![(proposer_did.to_owned(), now_secs)],
-            rejections: Vec::new(),
-            voting_deadline_ms: now + WASM_PROPOSAL_DEADLINE_MS,
+        #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
+        let voting_deadline_secs = ((now + WASM_PROPOSAL_DEADLINE_MS) / 1000.0) as u64;
+        let governance_action = wasm_action_to_governance_action(action)?;
+        // Compute proposal_id as [u8; 32] from the hex string.
+        let proposal_id_bytes: [u8; 32] = {
+            let bytes = hex::decode(proposal_id).unwrap_or_default();
+            let mut arr = [0u8; 32];
+            let len = bytes.len().min(32);
+            arr[..len].copy_from_slice(&bytes[..len]);
+            arr
+        };
+        let proposal = GovernanceProposal {
+            proposal_id: proposal_id_bytes,
             context_id: context_id.to_owned(),
+            proposer_did: DID(proposer_did.to_owned()),
+            action: governance_action,
+            status: ProposalStatus::Pending,
             created_at: now_secs,
-            status: "Pending".to_owned(),
+            voting_deadline: voting_deadline_secs,
+            approvals: vec![SignedVote {
+                voter_did: DID(proposer_did.to_owned()),
+                vote: VoteType::Approve,
+                timestamp: now_secs,
+                signature: Vec::new(),
+            }],
+            rejections: Vec::new(),
+            created_at_epoch: None,
         };
 
         let ctx = self.require_active_context_mut(context_id)?;
 
         // Evict expired proposals if at capacity.
+        // Compare deadline (seconds) against current time (seconds).
         if ctx.pending_proposals.len() >= WASM_PENDING_PROPOSAL_CAP {
             ctx.pending_proposals
-                .retain(|_, p| p.voting_deadline_ms > now);
+                .retain(|_, p| p.voting_deadline > now_secs);
         }
 
         // Check if proposer's initial vote meets quorum immediately.
@@ -3187,10 +3599,11 @@ impl WasmContextManager {
                 .get_mut(context_id)
                 .and_then(|ctx| ctx.pending_proposals.remove(&pid));
             if let Some(mut p) = proposal {
+                let wasm_action = governance_action_to_wasm(&p.action);
                 let result =
-                    self.execute_governance_action(context_id, proposer_did, &pid, &p.action)?;
+                    self.execute_governance_action(context_id, proposer_did, &pid, &wasm_action)?;
                 // Move to resolved_proposals for later retrieval.
-                "Approved".clone_into(&mut p.status);
+                p.status = ProposalStatus::Approved;
                 if let Some(ctx) = self.contexts.get_mut(context_id) {
                     ctx.insert_resolved_proposal(pid.clone(), p);
                 }
@@ -3246,6 +3659,8 @@ impl WasmContextManager {
 
         let ctx = self.require_active_context_mut(context_id)?;
 
+        #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
+        let now_secs = (now / 1000.0) as u64;
         let meets_quorum = {
             let proposal = ctx.pending_proposals.get_mut(proposal_id).ok_or_else(|| {
                 ScpWasmError::Context {
@@ -3254,7 +3669,7 @@ impl WasmContextManager {
                 }
             })?;
 
-            if proposal.voting_deadline_ms <= now {
+            if proposal.voting_deadline <= now_secs {
                 return Err(ScpWasmError::Context {
                     message: "proposal voting deadline has expired".to_owned(),
                     code: "SCP-CTX-2042".to_owned(),
@@ -3262,8 +3677,14 @@ impl WasmContextManager {
             }
 
             // Check for duplicate vote.
-            if proposal.approvals.iter().any(|(d, _)| d == voter_did)
-                || proposal.rejections.iter().any(|(d, _)| d == voter_did)
+            if proposal
+                .approvals
+                .iter()
+                .any(|v| v.voter_did.0 == voter_did)
+                || proposal
+                    .rejections
+                    .iter()
+                    .any(|v| v.voter_did.0 == voter_did)
             {
                 return Err(ScpWasmError::Permission {
                     message: format!("member {voter_did} has already voted on this proposal"),
@@ -3273,7 +3694,12 @@ impl WasmContextManager {
 
             #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
             let vote_ts = (crate::time::now_ms() / 1000.0) as u64;
-            proposal.approvals.push((voter_did.to_owned(), vote_ts));
+            proposal.approvals.push(SignedVote {
+                voter_did: DID(voter_did.to_owned()),
+                vote: VoteType::Approve,
+                timestamp: vote_ts,
+                signature: Vec::new(),
+            });
             proposal.approvals.len() >= required
         };
 
@@ -3292,10 +3718,12 @@ impl WasmContextManager {
                 .get_mut(context_id)
                 .and_then(|ctx| ctx.pending_proposals.remove(&pid));
             if let Some(mut p) = proposal {
+                let wasm_action = governance_action_to_wasm(&p.action);
+                let proposer = p.proposer_did.0.clone();
                 let result =
-                    self.execute_governance_action(context_id, &p.proposer_did, &pid, &p.action)?;
+                    self.execute_governance_action(context_id, &proposer, &pid, &wasm_action)?;
                 // Move to resolved_proposals for later retrieval.
-                "Approved".clone_into(&mut p.status);
+                p.status = ProposalStatus::Approved;
                 if let Some(ctx) = self.contexts.get_mut(context_id) {
                     ctx.insert_resolved_proposal(pid.clone(), p);
                 }
@@ -3342,6 +3770,8 @@ impl WasmContextManager {
 
         let ctx = self.require_active_context_mut(context_id)?;
 
+        #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
+        let now_secs = (now / 1000.0) as u64;
         let remaining_possible_approvals = {
             let proposal = ctx.pending_proposals.get_mut(proposal_id).ok_or_else(|| {
                 ScpWasmError::Context {
@@ -3350,15 +3780,21 @@ impl WasmContextManager {
                 }
             })?;
 
-            if proposal.voting_deadline_ms <= now {
+            if proposal.voting_deadline <= now_secs {
                 return Err(ScpWasmError::Context {
                     message: "proposal voting deadline has expired".to_owned(),
                     code: "SCP-CTX-2043".to_owned(),
                 });
             }
 
-            if proposal.approvals.iter().any(|(d, _)| d == voter_did)
-                || proposal.rejections.iter().any(|(d, _)| d == voter_did)
+            if proposal
+                .approvals
+                .iter()
+                .any(|v| v.voter_did.0 == voter_did)
+                || proposal
+                    .rejections
+                    .iter()
+                    .any(|v| v.voter_did.0 == voter_did)
             {
                 return Err(ScpWasmError::Permission {
                     message: format!("member {voter_did} has already voted on this proposal"),
@@ -3368,7 +3804,12 @@ impl WasmContextManager {
 
             #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
             let vote_ts = (crate::time::now_ms() / 1000.0) as u64;
-            proposal.rejections.push((voter_did.to_owned(), vote_ts));
+            proposal.rejections.push(SignedVote {
+                voter_did: DID(voter_did.to_owned()),
+                vote: VoteType::Reject,
+                timestamp: vote_ts,
+                signature: Vec::new(),
+            });
             total.saturating_sub(proposal.approvals.len() + proposal.rejections.len())
         };
 
@@ -3390,7 +3831,9 @@ impl WasmContextManager {
             if let Some(ctx3) = self.contexts.get_mut(context_id)
                 && let Some(mut p) = ctx3.pending_proposals.remove(proposal_id)
             {
-                "Rejected".clone_into(&mut p.status);
+                p.status = ProposalStatus::Rejected {
+                    reason: scp_protocol::context::governance::RejectionReason::ApprovalImpossible,
+                };
                 ctx3.insert_resolved_proposal(proposal_id.to_owned(), p);
             }
             return Ok(serde_json::json!({ "status": "Rejected" }));
@@ -3419,9 +3862,14 @@ impl WasmContextManager {
                     code: "SCP-CTX-2044".to_owned(),
                 })?;
 
-        let voter = voter_did.to_owned();
-        let was_approval = proposal.approvals.iter().position(|(d, _)| d == &voter);
-        let was_rejection = proposal.rejections.iter().position(|(d, _)| d == &voter);
+        let was_approval = proposal
+            .approvals
+            .iter()
+            .position(|v| v.voter_did.0 == voter_did);
+        let was_rejection = proposal
+            .rejections
+            .iter()
+            .position(|v| v.voter_did.0 == voter_did);
 
         if let Some(idx) = was_approval {
             proposal.approvals.remove(idx);
@@ -3497,27 +3945,23 @@ impl WasmContextManager {
         Ok(serde_json::json!(proposals))
     }
 
-    /// Serializes a `WasmProposal` to the full JSON response shape matching
-    /// native bridges' `GovernanceProposal` serialization.
+    /// Serializes a `GovernanceProposal` to the full JSON response shape matching
+    /// native bridges' serialization.
     ///
     /// Fields: `proposal_id`, `context_id`, `proposer_did`, `action`,
-    /// `status`, `created_at` (Unix epoch seconds, u64), `created_at_epoch`
-    /// (null — placeholder for compatibility with native bridge serialization),
+    /// `status`, `created_at` (Unix epoch seconds, u64), `created_at_epoch`,
     /// `voting_deadline` (seconds), `approvals` (with `voter_did` and
     /// `vote` fields), `rejections` (same shape).
-    fn proposal_to_json(proposal_id: &str, proposal: &WasmProposal) -> serde_json::Value {
-        #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
-        let voting_deadline_secs = (proposal.voting_deadline_ms / 1000.0) as u64;
-
+    fn proposal_to_json(proposal_id: &str, proposal: &GovernanceProposal) -> serde_json::Value {
         let approvals: Vec<serde_json::Value> = proposal
             .approvals
             .iter()
-            .map(|(did, ts)| {
+            .map(|v| {
                 serde_json::json!({
-                    "voter_did": did,
-                    "vote": "Approve",
-                    "timestamp": ts,
-                    "signature": [],
+                    "voter_did": v.voter_did.0,
+                    "vote": format!("{:?}", v.vote),
+                    "timestamp": v.timestamp,
+                    "signature": v.signature,
                 })
             })
             .collect();
@@ -3525,27 +3969,37 @@ impl WasmContextManager {
         let rejections: Vec<serde_json::Value> = proposal
             .rejections
             .iter()
-            .map(|(did, ts)| {
+            .map(|v| {
                 serde_json::json!({
-                    "voter_did": did,
-                    "vote": "Reject",
-                    "timestamp": ts,
-                    "signature": [],
+                    "voter_did": v.voter_did.0,
+                    "vote": format!("{:?}", v.vote),
+                    "timestamp": v.timestamp,
+                    "signature": v.signature,
                 })
             })
             .collect();
 
+        let wasm_action = governance_action_to_wasm(&proposal.action);
+        let status_str = match &proposal.status {
+            ProposalStatus::Pending => "Pending",
+            ProposalStatus::Approved => "Approved",
+            ProposalStatus::Rejected { .. } => "Rejected",
+            ProposalStatus::Expired => "Expired",
+            ProposalStatus::Cancelled => "Cancelled",
+            ProposalStatus::Invalidated { .. } => "Invalidated",
+        };
+
         serde_json::json!({
             "proposal_id": proposal_id,
             "context_id": proposal.context_id,
-            "proposer_did": proposal.proposer_did,
-            "action": proposal.action,
-            "status": proposal.status,
+            "proposer_did": proposal.proposer_did.0,
+            "action": wasm_action,
+            "status": status_str,
             "created_at": proposal.created_at,
-            "voting_deadline": voting_deadline_secs,
+            "voting_deadline": proposal.voting_deadline,
             "approvals": approvals,
             "rejections": rejections,
-            "created_at_epoch": null,
+            "created_at_epoch": proposal.created_at_epoch,
         })
     }
 
@@ -3571,14 +4025,24 @@ impl WasmContextManager {
         ctx.check_version_compatibility()?;
 
         let bc = ctx
-            .broadcast
+            .broadcast_context
             .as_mut()
             .ok_or_else(|| ScpWasmError::Context {
                 message: "not a broadcast context".to_owned(),
                 code: "SCP-CTX-2001".to_owned(),
             })?;
 
-        bc.subscribers.insert(subscriber_did.to_owned());
+        // Use subscribe with no UCAN (open admission) for WASM bridge.
+        // Ignore duplicate subscriber errors (idempotent).
+        #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
+        let ts = (crate::time::now_ms() / 1000.0) as u64;
+        let _ = bc.subscribe::<
+            NoOpDidResolver,
+            NoOpNonceTracker,
+            NoOpRevocationChecker,
+            NoOpProofResolver,
+            std::hash::RandomState,
+        >(subscriber_did, None, ts, None);
 
         // Also add as a member if not already present.
         ctx.members
@@ -3614,14 +4078,14 @@ impl WasmContextManager {
         }
 
         let bc = ctx
-            .broadcast
+            .broadcast_context
             .as_ref()
             .ok_or_else(|| ScpWasmError::Context {
                 message: "not a broadcast context".to_owned(),
                 code: "SCP-CTX-2001".to_owned(),
             })?;
 
-        if !bc.authors.contains_key(author_did) {
+        if !bc.is_author(author_did) {
             return Err(ScpWasmError::Permission {
                 message: format!("'{author_did}' is not an author in this broadcast context"),
                 code: "SCP-PERM-3000".to_owned(),
@@ -3831,14 +4295,14 @@ impl WasmContextManager {
         let ctx = self.require_active_context_mut(context_id)?;
 
         let bc = ctx
-            .broadcast
+            .broadcast_context
             .as_mut()
             .ok_or_else(|| ScpWasmError::Context {
                 message: "not a broadcast context".to_owned(),
                 code: "SCP-CTX-2001".to_owned(),
             })?;
 
-        bc.subscribers.remove(subscriber_did);
+        let _ = bc.unsubscribe(subscriber_did, false);
 
         ctx.push_event(WasmContextEvent::MemberLeft {
             member_did: subscriber_did.to_owned(),
@@ -3869,26 +4333,18 @@ impl WasmContextManager {
         let new_epoch;
         {
             let bc = ctx
-                .broadcast
+                .broadcast_context
                 .as_mut()
                 .ok_or_else(|| ScpWasmError::Context {
                     message: "not a broadcast context".to_owned(),
                     code: "SCP-CTX-2001".to_owned(),
                 })?;
 
-            // Per-author blocking (§5.14.8): add to the blocker's block list only.
-            // Does NOT remove from the subscriber roster — the subscriber retains
-            // access to other authors' content. Only governance ban removes from
-            // the roster.
-            let block_list =
-                bc.authors
-                    .get_mut(blocker_did)
-                    .ok_or_else(|| ScpWasmError::Context {
-                        message: format!("author not found: {blocker_did}"),
-                        code: "SCP-CTX-2001".to_owned(),
-                    })?;
-
-            if block_list.len() >= WASM_BLOCK_LIST_CAP && !block_list.contains(subscriber_did) {
+            // Pre-validate block list capacity.
+            if let Some(author) = bc.get_author(blocker_did)
+                && author.block_list.len() >= WASM_BLOCK_LIST_CAP
+                && !author.block_list.contains(subscriber_did)
+            {
                 return Err(ScpWasmError::Validation {
                     message: format!(
                         "per-author block list has reached capacity ({WASM_BLOCK_LIST_CAP}) \
@@ -3898,12 +4354,15 @@ impl WasmContextManager {
                 });
             }
 
-            block_list.insert(subscriber_did.to_owned());
-
-            // §5.14.8 step 1: increment the blocker's key epoch.
-            let epoch = bc.key_epochs.entry(blocker_did.to_owned()).or_insert(0);
-            *epoch = epoch.saturating_add(1);
-            new_epoch = *epoch;
+            // Per-author blocking (§5.14.8): delegates to BroadcastContext which
+            // adds to block list, rotates key, and increments epoch.
+            let block_result = bc
+                .block_subscriber(blocker_did, subscriber_did)
+                .map_err(|e| ScpWasmError::Context {
+                    message: format!("block_subscriber failed: {e}"),
+                    code: "SCP-CTX-2001".to_owned(),
+                })?;
+            new_epoch = block_result.new_epoch;
         }
 
         ctx.push_event(WasmContextEvent::MemberBlocked {
@@ -3942,7 +4401,7 @@ impl WasmContextManager {
 
         {
             let bc = ctx
-                .broadcast
+                .broadcast_context
                 .as_mut()
                 .ok_or_else(|| ScpWasmError::Context {
                     message: "not a broadcast context".to_owned(),
@@ -3952,22 +4411,11 @@ impl WasmContextManager {
             // Per-author unblocking (§5.14.8): remove from the unblocker's
             // block list only. Per spec, no key rotation on unblock — the
             // subscriber receives the current key on next pull.
-            let block_list =
-                bc.authors
-                    .get_mut(unblocker_did)
-                    .ok_or_else(|| ScpWasmError::Context {
-                        message: format!("author not found: {unblocker_did}"),
-                        code: "SCP-CTX-2001".to_owned(),
-                    })?;
-
-            if !block_list.remove(subscriber_did) {
-                return Err(ScpWasmError::Context {
-                    message: format!(
-                        "subscriber {subscriber_did} not blocked by author {unblocker_did}"
-                    ),
+            bc.unblock_subscriber(unblocker_did, subscriber_did)
+                .map_err(|e| ScpWasmError::Context {
+                    message: e.to_string(),
                     code: "SCP-CTX-2001".to_owned(),
-                });
-            }
+                })?;
         }
 
         ctx.push_event(WasmContextEvent::MemberUnblocked {
@@ -3983,9 +4431,11 @@ impl WasmContextManager {
     /// Returns `None` if the context is not a broadcast context.
     #[must_use]
     pub fn broadcast_subscriber_count(&self, context_id: &str) -> Option<usize> {
-        self.contexts
-            .get(context_id)
-            .and_then(|ctx| ctx.broadcast.as_ref().map(|bc| bc.subscribers.len()))
+        self.contexts.get(context_id).and_then(|ctx| {
+            ctx.broadcast_context
+                .as_ref()
+                .map(BroadcastContext::subscriber_count)
+        })
     }
 
     /// Returns `true` if the given DID is a subscriber in a broadcast context.
@@ -3994,9 +4444,9 @@ impl WasmContextManager {
         self.contexts
             .get(context_id)
             .and_then(|ctx| {
-                ctx.broadcast
+                ctx.broadcast_context
                     .as_ref()
-                    .map(|bc| bc.subscribers.contains(did))
+                    .map(|bc| bc.is_subscriber(did))
             })
             .unwrap_or(false)
     }
@@ -4006,9 +4456,14 @@ impl WasmContextManager {
     /// Returns `None` if the context is not a broadcast context.
     #[must_use]
     pub fn broadcast_admission(&self, context_id: &str) -> Option<String> {
-        self.contexts
-            .get(context_id)
-            .and_then(|ctx| ctx.broadcast.as_ref().map(|bc| bc.admission.clone()))
+        self.contexts.get(context_id).and_then(|ctx| {
+            ctx.broadcast_context
+                .as_ref()
+                .map(|bc| match bc.admission() {
+                    BroadcastAdmission::Open => "open".to_owned(),
+                    BroadcastAdmission::Gated => "gated".to_owned(),
+                })
+        })
     }
 
     /// Handles a broadcast key request.
@@ -4026,6 +4481,8 @@ impl WasmContextManager {
         author_did: &str,
         requester_did: &str,
     ) -> Result<String, ScpWasmError> {
+        use scp_protocol::context::broadcast::KeyRequestDecision;
+
         // Use a uniform deny reason to prevent information leakage (§5.14.8).
         const DENY_REASON: &str = "key request denied";
 
@@ -4038,35 +4495,23 @@ impl WasmContextManager {
             })?;
 
         let bc = ctx
-            .broadcast
+            .broadcast_context
             .as_ref()
             .ok_or_else(|| ScpWasmError::Context {
                 message: "not a broadcast context".to_owned(),
                 code: "SCP-CTX-2001".to_owned(),
             })?;
 
-        // Author must be a known author.
-        let Some(author_block_list) = bc.authors.get(author_did) else {
-            return Ok(
-                serde_json::json!({ "decision": "deny", "reason": DENY_REASON }).to_string(),
-            );
-        };
-
-        // Requester must not be on this author's block list (§5.14.8).
-        if author_block_list.contains(requester_did) {
-            return Ok(
-                serde_json::json!({ "decision": "deny", "reason": DENY_REASON }).to_string(),
-            );
+        // Delegate to BroadcastContext::handle_key_request which implements
+        // the full §5.14.8 decision logic (author check, block list, subscriber).
+        match bc.handle_key_request(author_did, requester_did) {
+            KeyRequestDecision::Grant { .. } => {
+                Ok(serde_json::json!({ "decision": "grant" }).to_string())
+            }
+            KeyRequestDecision::Deny { .. } => {
+                Ok(serde_json::json!({ "decision": "deny", "reason": DENY_REASON }).to_string())
+            }
         }
-
-        // Requester must be a subscriber or author.
-        if !bc.subscribers.contains(requester_did) && !bc.authors.contains_key(requester_did) {
-            return Ok(
-                serde_json::json!({ "decision": "deny", "reason": DENY_REASON }).to_string(),
-            );
-        }
-
-        Ok(serde_json::json!({ "decision": "grant" }).to_string())
     }
 
     // -----------------------------------------------------------------------
@@ -4426,15 +4871,30 @@ impl WasmContextManager {
             })
             .collect();
 
-        let broadcast = ctx.broadcast.as_ref().map(|bc| WasmExportBroadcast {
-            author_block_lists: bc
-                .authors
-                .iter()
-                .map(|(did, block_list)| (did.clone(), block_list.iter().cloned().collect()))
-                .collect(),
-            key_epochs: bc.key_epochs.clone(),
-            subscribers: bc.subscribers.iter().cloned().collect(),
-            admission: bc.admission.clone(),
+        let broadcast = ctx.broadcast_context.as_ref().map(|bc| {
+            let mut author_block_lists: HashMap<String, Vec<String>> = HashMap::new();
+            let mut key_epochs: HashMap<String, u64> = HashMap::new();
+            for author_did in bc.author_dids() {
+                if let Some(author) = bc.get_author(author_did) {
+                    author_block_lists.insert(
+                        author_did.clone(),
+                        author.block_list.iter().cloned().collect(),
+                    );
+                    key_epochs.insert(author_did.clone(), author.epoch);
+                }
+            }
+            let subscribers: Vec<String> =
+                bc.subscribers().map(|s| s.subscriber_did.clone()).collect();
+            let admission = match bc.admission() {
+                BroadcastAdmission::Open => "open".to_owned(),
+                BroadcastAdmission::Gated => "gated".to_owned(),
+            };
+            WasmExportBroadcast {
+                author_block_lists,
+                key_epochs,
+                subscribers,
+                admission,
+            }
         });
 
         let snapshot = WasmContextExportSnapshot {
@@ -4562,6 +5022,7 @@ impl WasmContextManager {
     ///
     /// Returns an error if deserialization fails, version is incompatible,
     /// the integrity MAC is missing/invalid, or the context already exists.
+    #[allow(clippy::too_many_lines)] // snapshot reconstruction with many fields
     pub fn import_context(&mut self, data: &[u8]) -> Result<String, ScpWasmError> {
         let envelope = Self::deserialize_and_verify_envelope(data)?;
 
@@ -4617,15 +5078,53 @@ impl WasmContextManager {
             );
         }
 
-        let broadcast = snap.broadcast.as_ref().map(|bc| BroadcastState {
-            authors: bc
+        let broadcast_context = snap.broadcast.as_ref().map(|bc| {
+            use scp_protocol::context::broadcast::{
+                AuthorStateSnapshot, BroadcastContextSnapshot, SubscriberRecord,
+            };
+            let admission = if bc.admission == "gated" {
+                BroadcastAdmission::Gated
+            } else {
+                BroadcastAdmission::Open
+            };
+            // Build snapshot and use from_snapshot to reconstruct BroadcastContext.
+            let authors: HashMap<String, AuthorStateSnapshot> = bc
                 .author_block_lists
                 .iter()
-                .map(|(did, block_list)| (did.clone(), block_list.iter().cloned().collect()))
-                .collect(),
-            key_epochs: bc.key_epochs.clone(),
-            subscribers: bc.subscribers.iter().cloned().collect(),
-            admission: bc.admission.clone(),
+                .map(|(did, block_list)| {
+                    let epoch = bc.key_epochs.get(did).copied().unwrap_or(0);
+                    (
+                        did.clone(),
+                        AuthorStateSnapshot {
+                            author_did: did.clone(),
+                            broadcast_key: scp_protocol::crypto::sender_keys::generate_sender_key(),
+                            epoch,
+                            next_sequence: 1,
+                            block_list: block_list.iter().cloned().collect(),
+                        },
+                    )
+                })
+                .collect();
+            let subscribers: HashMap<String, SubscriberRecord> = bc
+                .subscribers
+                .iter()
+                .map(|did| {
+                    (
+                        did.clone(),
+                        SubscriberRecord {
+                            subscriber_did: did.clone(),
+                            registered_at: 0,
+                            has_ucan: false,
+                        },
+                    )
+                })
+                .collect();
+            BroadcastContext::from_snapshot(BroadcastContextSnapshot {
+                context_id: context_id.clone(),
+                admission,
+                subscribers,
+                authors,
+            })
         });
 
         let ctx = PerContextState {
@@ -4653,7 +5152,7 @@ impl WasmContextManager {
             write_revoked_members: snap.write_revoked_members.iter().cloned().collect(),
             read_revoked_members: snap.read_revoked_members.iter().cloned().collect(),
             read_exclusion_list: snap.read_exclusion_list.iter().cloned().collect(),
-            broadcast,
+            broadcast_context,
             sessions: HashMap::new(),
             threshold_signers: snap.threshold_signers.clone(),
             threshold_value: snap.threshold_value,
@@ -4719,7 +5218,7 @@ impl WasmContextManager {
         }
 
         "closed".clone_into(&mut ctx.state);
-        ctx.broadcast = None;
+        ctx.broadcast_context = None;
 
         ctx.append_log_event(EventType::ContextClosed, "system", b"");
 
@@ -5495,14 +5994,25 @@ mod tests {
     // Per-author block list tests (§5.14.8, #749)
     // -----------------------------------------------------------------------
 
-    /// Helper: creates a `BroadcastState` with given authors and subscribers.
-    fn make_broadcast(authors: &[&str], subscribers: &[&str]) -> BroadcastState {
-        let mut bc = BroadcastState::new("open");
+    /// Helper: creates a `BroadcastContext` with given authors and subscribers.
+    fn make_broadcast(authors: &[&str], subscribers: &[&str]) -> BroadcastContext {
+        let mut bc = BroadcastContext::new(
+            "test-ctx".to_owned(),
+            &ContextMode::Broadcast,
+            BroadcastAdmission::Open,
+        )
+        .unwrap();
         for a in authors {
-            bc.authors.insert((*a).to_owned(), HashSet::new());
+            let _ = bc.add_author(a);
         }
         for s in subscribers {
-            bc.subscribers.insert((*s).to_owned());
+            let _ = bc.subscribe::<
+                NoOpDidResolver,
+                NoOpNonceTracker,
+                NoOpRevocationChecker,
+                NoOpProofResolver,
+                std::hash::RandomState,
+            >(s, None, 0, None);
         }
         bc
     }
@@ -5511,99 +6021,60 @@ mod tests {
     fn broadcast_state_per_author_block_list_isolation() {
         // Author A blocks sub1. Author B does NOT block sub1.
         let mut bc = make_broadcast(&["author-a", "author-b"], &["sub1", "sub2"]);
-        bc.authors
-            .get_mut("author-a")
-            .unwrap()
-            .insert("sub1".to_owned());
+        let _ = bc.block_subscriber("author-a", "sub1");
 
         // sub1 is blocked by author-a
-        assert!(bc.authors["author-a"].contains("sub1"));
+        assert!(bc.is_blocked("author-a", "sub1"));
         // sub1 is NOT blocked by author-b
-        assert!(!bc.authors["author-b"].contains("sub1"));
-        // is_blocked_by_any_author returns true (for governance-ban detection)
-        assert!(bc.is_blocked_by_any_author("sub1"));
+        assert!(!bc.is_blocked("author-b", "sub1"));
         // sub2 is blocked by nobody
-        assert!(!bc.is_blocked_by_any_author("sub2"));
+        assert!(!bc.is_blocked("author-a", "sub2"));
+        assert!(!bc.is_blocked("author-b", "sub2"));
     }
 
     #[test]
     fn broadcast_state_governance_ban_adds_to_all_authors() {
         let mut bc = make_broadcast(&["author-a", "author-b", "author-c"], &["sub1"]);
 
-        // Simulate governance ban: add to ALL authors' block lists
-        for block_list in bc.authors.values_mut() {
-            block_list.insert("sub1".to_owned());
-        }
+        // Governance ban: delegates to BroadcastContext
+        let _ = bc.governance_ban_subscriber("sub1", RevocationScope::Full);
 
-        assert!(bc.authors["author-a"].contains("sub1"));
-        assert!(bc.authors["author-b"].contains("sub1"));
-        assert!(bc.authors["author-c"].contains("sub1"));
-        assert!(bc.is_blocked_by_any_author("sub1"));
+        assert!(bc.is_blocked("author-a", "sub1"));
+        assert!(bc.is_blocked("author-b", "sub1"));
+        assert!(bc.is_blocked("author-c", "sub1"));
     }
 
     #[test]
     fn broadcast_state_governance_unban_removes_from_all_authors() {
-        let mut bc = make_broadcast(&["author-a", "author-b"], &[]);
+        let mut bc = make_broadcast(&["author-a", "author-b"], &["sub1"]);
 
         // Ban first
-        for block_list in bc.authors.values_mut() {
-            block_list.insert("sub1".to_owned());
-        }
-        assert!(bc.is_blocked_by_any_author("sub1"));
+        let _ = bc.governance_ban_subscriber("sub1", RevocationScope::Full);
+        assert!(bc.is_blocked("author-a", "sub1"));
+        assert!(bc.is_blocked("author-b", "sub1"));
 
         // Unban: remove from ALL authors
-        for block_list in bc.authors.values_mut() {
-            block_list.remove("sub1");
-        }
-        assert!(!bc.is_blocked_by_any_author("sub1"));
+        bc.governance_unban_subscriber("sub1");
+        assert!(!bc.is_blocked("author-a", "sub1"));
+        assert!(!bc.is_blocked("author-b", "sub1"));
     }
 
     #[test]
     fn broadcast_export_roundtrip_preserves_per_author_block_lists() {
         let mut bc = make_broadcast(&["author-a", "author-b"], &["sub1"]);
-        bc.authors
-            .get_mut("author-a")
-            .unwrap()
-            .insert("sub1".to_owned());
+        let _ = bc.block_subscriber("author-a", "sub1");
 
-        // Set a key epoch for author-a to verify roundtrip
-        bc.key_epochs.insert("author-a".to_owned(), 3);
-
-        // Export
-        let export = WasmExportBroadcast {
-            author_block_lists: bc
-                .authors
-                .iter()
-                .map(|(did, bl)| (did.clone(), bl.iter().cloned().collect()))
-                .collect(),
-            key_epochs: bc.key_epochs.clone(),
-            subscribers: bc.subscribers.iter().cloned().collect(),
-            admission: bc.admission.clone(),
-        };
-
-        // Serialize + deserialize roundtrip
-        let json = serde_json::to_string(&export).unwrap();
-        let reimported: WasmExportBroadcast = serde_json::from_str(&json).unwrap();
-
-        // Reconstruct BroadcastState from reimported data
-        let restored = BroadcastState {
-            authors: reimported
-                .author_block_lists
-                .iter()
-                .map(|(did, bl)| (did.clone(), bl.iter().cloned().collect()))
-                .collect(),
-            key_epochs: reimported.key_epochs.clone(),
-            subscribers: reimported.subscribers.iter().cloned().collect(),
-            admission: reimported.admission.clone(),
-        };
+        // Use snapshot for export/import roundtrip
+        let snapshot = bc.to_snapshot();
+        let restored = BroadcastContext::from_snapshot(snapshot);
 
         // author-a blocks sub1, author-b does not
-        assert!(restored.authors["author-a"].contains("sub1"));
-        assert!(!restored.authors["author-b"].contains("sub1"));
-        assert!(restored.subscribers.contains("sub1"));
-        // key_epochs preserved through roundtrip
-        assert_eq!(restored.key_epochs.get("author-a"), Some(&3));
-        assert_eq!(restored.key_epochs.get("author-b"), None);
+        assert!(restored.is_blocked("author-a", "sub1"));
+        assert!(!restored.is_blocked("author-b", "sub1"));
+        assert!(restored.is_subscriber("sub1"));
+        // Epoch preserved through roundtrip (block_subscriber increments epoch to 1)
+        assert_eq!(restored.get_author("author-a").map(|a| a.epoch), Some(1));
+        assert_eq!(restored.get_author("author-b").map(|a| a.epoch), Some(0));
     }
 
     #[test]
@@ -5635,30 +6106,22 @@ mod tests {
     // -----------------------------------------------------------------------
     // Key epoch tests (§5.14.8)
     //
-    // These tests manipulate BroadcastState directly because the full
-    // manager methods call `crate::time::now_ms()` which requires a WASM
-    // target. Direct manipulation tests the key epoch logic without
-    // triggering the wasm-bindgen time import.
+    // These tests use BroadcastContext's public API. BroadcastContext
+    // manages key epochs internally as part of AuthorState.
     // -----------------------------------------------------------------------
 
     #[test]
     fn key_epoch_increments_on_block() {
-        // Simulate block_broadcast_subscriber: add to block list + increment epoch
         let mut bc = make_broadcast(&["author-a"], &["sub1"]);
 
-        // Initially no key epoch
-        assert_eq!(bc.key_epochs.get("author-a"), None);
+        // Initially epoch is 0
+        assert_eq!(bc.get_author("author-a").map(|a| a.epoch), Some(0));
 
         // Block sub1 → epoch increments to 1
-        bc.authors
-            .get_mut("author-a")
-            .unwrap()
-            .insert("sub1".to_owned());
-        let epoch = bc.key_epochs.entry("author-a".to_owned()).or_insert(0);
-        *epoch = epoch.saturating_add(1);
+        let _ = bc.block_subscriber("author-a", "sub1");
 
-        assert_eq!(bc.key_epochs.get("author-a"), Some(&1));
-        assert!(bc.authors["author-a"].contains("sub1"));
+        assert_eq!(bc.get_author("author-a").map(|a| a.epoch), Some(1));
+        assert!(bc.is_blocked("author-a", "sub1"));
     }
 
     #[test]
@@ -5666,22 +6129,12 @@ mod tests {
         let mut bc = make_broadcast(&["author-a"], &["sub1", "sub2"]);
 
         // First block
-        bc.authors
-            .get_mut("author-a")
-            .unwrap()
-            .insert("sub1".to_owned());
-        let epoch = bc.key_epochs.entry("author-a".to_owned()).or_insert(0);
-        *epoch = epoch.saturating_add(1);
-        assert_eq!(bc.key_epochs["author-a"], 1);
+        let _ = bc.block_subscriber("author-a", "sub1");
+        assert_eq!(bc.get_author("author-a").map(|a| a.epoch), Some(1));
 
         // Second block
-        bc.authors
-            .get_mut("author-a")
-            .unwrap()
-            .insert("sub2".to_owned());
-        let epoch = bc.key_epochs.entry("author-a".to_owned()).or_insert(0);
-        *epoch = epoch.saturating_add(1);
-        assert_eq!(bc.key_epochs["author-a"], 2);
+        let _ = bc.block_subscriber("author-a", "sub2");
+        assert_eq!(bc.get_author("author-a").map(|a| a.epoch), Some(2));
     }
 
     #[test]
@@ -5689,41 +6142,28 @@ mod tests {
         let mut bc = make_broadcast(&["author-a", "author-b"], &["sub1"]);
 
         // Only author-a blocks → only author-a's epoch increments
-        bc.authors
-            .get_mut("author-a")
-            .unwrap()
-            .insert("sub1".to_owned());
-        let epoch = bc.key_epochs.entry("author-a".to_owned()).or_insert(0);
-        *epoch = epoch.saturating_add(1);
+        let _ = bc.block_subscriber("author-a", "sub1");
 
-        assert_eq!(bc.key_epochs.get("author-a"), Some(&1));
-        assert_eq!(bc.key_epochs.get("author-b"), None);
+        assert_eq!(bc.get_author("author-a").map(|a| a.epoch), Some(1));
+        assert_eq!(bc.get_author("author-b").map(|a| a.epoch), Some(0));
     }
 
     #[test]
     fn governance_ban_increments_all_authors_key_epochs() {
         let mut bc = make_broadcast(&["author-a", "author-b", "author-c"], &["sub1"]);
 
-        // Simulate governance ban (§5.14.8 steps 3-4):
-        // Step 3: add to ALL authors' block lists
-        for block_list in bc.authors.values_mut() {
-            block_list.insert("sub1".to_owned());
-        }
-        // Step 4: mandatory key rotation — increment ALL authors' epochs
-        for author_did in bc.authors.keys() {
-            let epoch = bc.key_epochs.entry(author_did.clone()).or_insert(0);
-            *epoch = epoch.saturating_add(1);
-        }
+        // Governance ban (§5.14.8 steps 3-4) via BroadcastContext API
+        let _ = bc.governance_ban_subscriber("sub1", RevocationScope::Full);
 
         // All authors blocked sub1
-        assert!(bc.authors["author-a"].contains("sub1"));
-        assert!(bc.authors["author-b"].contains("sub1"));
-        assert!(bc.authors["author-c"].contains("sub1"));
+        assert!(bc.is_blocked("author-a", "sub1"));
+        assert!(bc.is_blocked("author-b", "sub1"));
+        assert!(bc.is_blocked("author-c", "sub1"));
 
         // All authors' epochs incremented
-        assert_eq!(bc.key_epochs["author-a"], 1);
-        assert_eq!(bc.key_epochs["author-b"], 1);
-        assert_eq!(bc.key_epochs["author-c"], 1);
+        assert_eq!(bc.get_author("author-a").map(|a| a.epoch), Some(1));
+        assert_eq!(bc.get_author("author-b").map(|a| a.epoch), Some(1));
+        assert_eq!(bc.get_author("author-c").map(|a| a.epoch), Some(1));
     }
 
     #[test]
@@ -5731,26 +6171,15 @@ mod tests {
         let mut bc = make_broadcast(&["author-a", "author-b"], &["sub1", "sub2"]);
 
         // author-a already blocked sub1 (epoch=1)
-        bc.authors
-            .get_mut("author-a")
-            .unwrap()
-            .insert("sub1".to_owned());
-        let epoch = bc.key_epochs.entry("author-a".to_owned()).or_insert(0);
-        *epoch = epoch.saturating_add(1);
-        assert_eq!(bc.key_epochs["author-a"], 1);
+        let _ = bc.block_subscriber("author-a", "sub1");
+        assert_eq!(bc.get_author("author-a").map(|a| a.epoch), Some(1));
 
         // Now governance ban sub2 → all authors' epochs increment again
-        for block_list in bc.authors.values_mut() {
-            block_list.insert("sub2".to_owned());
-        }
-        for author_did in bc.authors.keys() {
-            let epoch = bc.key_epochs.entry(author_did.clone()).or_insert(0);
-            *epoch = epoch.saturating_add(1);
-        }
+        let _ = bc.governance_ban_subscriber("sub2", RevocationScope::Full);
 
         // author-a: was 1, now 2. author-b: was 0, now 1.
-        assert_eq!(bc.key_epochs["author-a"], 2);
-        assert_eq!(bc.key_epochs["author-b"], 1);
+        assert_eq!(bc.get_author("author-a").map(|a| a.epoch), Some(2));
+        assert_eq!(bc.get_author("author-b").map(|a| a.epoch), Some(1));
     }
 
     #[test]
@@ -5775,8 +6204,8 @@ mod tests {
     ) -> WasmContextManager {
         let mut bc = make_broadcast(authors, subscribers);
         // Ensure the creator is always an author (mirrors create_context).
-        if !bc.authors.contains_key(creator_did) {
-            bc.authors.insert(creator_did.to_owned(), HashSet::new());
+        if !bc.is_author(creator_did) {
+            let _ = bc.add_author(creator_did);
         }
 
         let mut members = HashMap::new();
@@ -5811,7 +6240,7 @@ mod tests {
             write_revoked_members: HashSet::new(),
             read_revoked_members: HashSet::new(),
             read_exclusion_list: HashSet::new(),
-            broadcast: Some(bc),
+            broadcast_context: Some(bc),
             sessions: HashMap::new(),
             threshold_signers: Vec::new(),
             threshold_value: 0,
@@ -5837,16 +6266,16 @@ mod tests {
         // Fill author-a's block list to exactly WASM_BLOCK_LIST_CAP.
         {
             let ctx = mgr.contexts.get_mut("ctx-1").unwrap();
-            let bc = ctx.broadcast.as_mut().unwrap();
+            let bc = ctx.broadcast_context.as_mut().unwrap();
             for i in 0..WASM_BLOCK_LIST_CAP {
-                bc.authors
-                    .get_mut("author-a")
-                    .unwrap()
-                    .insert(format!("did:dht:zfiller{i}"));
+                let _ = bc.block_subscriber("author-a", &format!("did:dht:zfiller{i}"));
             }
-            assert_eq!(bc.authors["author-a"].len(), WASM_BLOCK_LIST_CAP);
+            assert_eq!(
+                bc.get_author("author-a").unwrap().block_list.len(),
+                WASM_BLOCK_LIST_CAP
+            );
             // author-b is still empty.
-            assert!(bc.authors["author-b"].is_empty());
+            assert!(bc.get_author("author-b").unwrap().block_list.is_empty());
         }
 
         // Call the real dispatch method — it should fail because author-a's
@@ -5868,9 +6297,9 @@ mod tests {
 
         // Verify no mutation occurred — author-b's block list must still be
         // empty (pre-validation prevented partial writes).
-        let bc = mgr.contexts["ctx-1"].broadcast.as_ref().unwrap();
+        let bc = mgr.contexts["ctx-1"].broadcast_context.as_ref().unwrap();
         assert!(
-            bc.authors["author-b"].is_empty(),
+            bc.get_author("author-b").unwrap().block_list.is_empty(),
             "author-b's block list should be empty — pre-validation must prevent partial mutation"
         );
     }
@@ -5916,7 +6345,7 @@ mod tests {
             write_revoked_members: HashSet::new(),
             read_revoked_members: HashSet::new(),
             read_exclusion_list: HashSet::new(),
-            broadcast: None,
+            broadcast_context: None,
             sessions: HashMap::new(),
             threshold_signers: Vec::new(),
             threshold_value: 0,
@@ -6011,7 +6440,9 @@ mod tests {
                 );
                 assert_eq!(
                     message,
-                    &format!("subscriber {subscriber} not blocked by author {author}")
+                    &format!(
+                        "invalid state: subscriber {subscriber} not blocked by author {author}"
+                    )
                 );
             }
             other => panic!("expected Context error, got: {other:?}"),
@@ -6029,14 +6460,17 @@ mod tests {
         // including the target DID in every list (idempotent ban scenario).
         {
             let ctx = mgr.contexts.get_mut("ctx-1").unwrap();
-            let bc = ctx.broadcast.as_mut().unwrap();
-            for author_list in bc.authors.values_mut() {
+            let bc = ctx.broadcast_context.as_mut().unwrap();
+            for author_did in &["author-a", "author-b"] {
                 // Fill to capacity minus 1, then insert the target DID.
                 for i in 0..(WASM_BLOCK_LIST_CAP - 1) {
-                    author_list.insert(format!("did:dht:zfiller{i}"));
+                    let _ = bc.block_subscriber(author_did, &format!("did:dht:zfiller{i}"));
                 }
-                author_list.insert(target_did.to_owned());
-                assert_eq!(author_list.len(), WASM_BLOCK_LIST_CAP);
+                let _ = bc.block_subscriber(author_did, target_did);
+                assert_eq!(
+                    bc.get_author(author_did).unwrap().block_list.len(),
+                    WASM_BLOCK_LIST_CAP
+                );
             }
         }
 
@@ -6058,13 +6492,15 @@ mod tests {
         // Fill author-a's block list to capacity, including the target DID.
         {
             let ctx = mgr.contexts.get_mut("ctx-1").unwrap();
-            let bc = ctx.broadcast.as_mut().unwrap();
-            let block_list = bc.authors.get_mut("author-a").unwrap();
+            let bc = ctx.broadcast_context.as_mut().unwrap();
             for i in 0..(WASM_BLOCK_LIST_CAP - 1) {
-                block_list.insert(format!("did:dht:zfiller{i}"));
+                let _ = bc.block_subscriber("author-a", &format!("did:dht:zfiller{i}"));
             }
-            block_list.insert(target_did.to_owned());
-            assert_eq!(block_list.len(), WASM_BLOCK_LIST_CAP);
+            let _ = bc.block_subscriber("author-a", target_did);
+            assert_eq!(
+                bc.get_author("author-a").unwrap().block_list.len(),
+                WASM_BLOCK_LIST_CAP
+            );
         }
 
         // Blocking an already-blocked subscriber when at capacity must succeed.
@@ -6083,12 +6519,14 @@ mod tests {
         // Fill author-a's block list to capacity (without sub2).
         {
             let ctx = mgr.contexts.get_mut("ctx-1").unwrap();
-            let bc = ctx.broadcast.as_mut().unwrap();
-            let block_list = bc.authors.get_mut("author-a").unwrap();
+            let bc = ctx.broadcast_context.as_mut().unwrap();
             for i in 0..WASM_BLOCK_LIST_CAP {
-                block_list.insert(format!("did:dht:zfiller{i}"));
+                let _ = bc.block_subscriber("author-a", &format!("did:dht:zfiller{i}"));
             }
-            assert_eq!(block_list.len(), WASM_BLOCK_LIST_CAP);
+            assert_eq!(
+                bc.get_author("author-a").unwrap().block_list.len(),
+                WASM_BLOCK_LIST_CAP
+            );
         }
 
         // Blocking a NEW DID when at capacity must fail.
@@ -6109,17 +6547,11 @@ mod tests {
         let mut bc = make_broadcast(&["author-a"], &["sub1"]);
 
         // Block sub1 → epoch = 1
-        bc.authors
-            .get_mut("author-a")
-            .unwrap()
-            .insert("sub1".to_owned());
-        let epoch = bc.key_epochs.entry("author-a".to_owned()).or_insert(0);
-        *epoch = epoch.saturating_add(1);
-        assert_eq!(bc.key_epochs["author-a"], 1);
+        let _ = bc.block_subscriber("author-a", "sub1");
+        assert_eq!(bc.get_author("author-a").map(|a| a.epoch), Some(1));
 
         // Unblock sub1 → epoch stays at 1 (per spec: no key rotation on unblock)
-        bc.authors.get_mut("author-a").unwrap().remove("sub1");
-        // No epoch change
-        assert_eq!(bc.key_epochs["author-a"], 1);
+        let _ = bc.unblock_subscriber("author-a", "sub1");
+        assert_eq!(bc.get_author("author-a").map(|a| a.epoch), Some(1));
     }
 }

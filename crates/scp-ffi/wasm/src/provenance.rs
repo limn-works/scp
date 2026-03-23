@@ -90,8 +90,8 @@ fn parse_memory_scope(s: &str) -> Option<MemoryScope> {
     }
 }
 
-/// Returns the display string for a `MemoryScope` (PascalCase for JSON output).
-fn memory_scope_as_str(ms: &MemoryScope) -> &'static str {
+/// Returns the display string for a `MemoryScope` (`PascalCase` for JSON output).
+fn memory_scope_as_str(ms: MemoryScope) -> &'static str {
     match ms {
         MemoryScope::Full => "Full",
         MemoryScope::Summary => "Summary",
@@ -370,7 +370,7 @@ pub fn provenance_attach(
         &source_context_id,
         st,
         &counterparties,
-        &ms,
+        ms,
         chain_depth,
         &chain_path,
         &dm,
@@ -669,7 +669,7 @@ fn build_canonical_provenance_bytes(
     source_context: &str,
     source_type: SourceType,
     counterparties: &[String],
-    memory_scope: &MemoryScope,
+    memory_scope: MemoryScope,
     chain_depth: u32,
     chain_path: &serde_json::Value,
     discovery_method: &serde_json::Value,
