@@ -2139,7 +2139,7 @@ impl WasmContextManager {
             }
             GovernanceAction::RemoveTool { tool_id } => {
                 let ctx = self.require_active_context_mut(context_id)?;
-                if ctx.tool_registry.get(tool_id).is_none() {
+                if ctx.tool_registry.remove(tool_id).is_none() {
                     return Err(ScpWasmError::Tool {
                         message: format!("tool '{tool_id}' not found"),
                         code: "SCP-TOOL-6003".to_owned(),
@@ -2290,7 +2290,15 @@ impl WasmContextManager {
                 let did_str: &str = did;
                 let scope_str = format!("{scope:?}");
                 let ctx = self.require_active_context_mut(context_id)?;
+                // For Full scope in broadcast contexts, destroy the author's
+                // broadcast key (matching scp-core SCP-CAC-007).
+                if matches!(scope, scp_protocol::context::governance::RevocationScope::Full)
+                    && let Some(ref mut bc) = ctx.broadcast_context
+                {
+                    let _ = bc.block_author(did_str);
+                }
                 ctx.write_revoked_members.insert(did_str.to_owned());
+                ctx.push_event(ContextEvent::WriteAccessRevoked { did: did.clone() });
                 Ok(
                     serde_json::json!({"action": "RevokeWriteAccess", "did": did_str, "scope": scope_str}),
                 )

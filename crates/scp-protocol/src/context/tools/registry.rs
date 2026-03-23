@@ -226,6 +226,12 @@ impl ToolRegistry {
         self.tools
             .insert(registration.tool_id.clone(), registration)
     }
+
+    /// Removes a tool registration by ID. Returns the removed registration
+    /// if one existed, or `None` if the tool was not registered.
+    pub fn remove(&mut self, tool_id: &str) -> Option<ToolRegistration> {
+        self.tools.remove(tool_id)
+    }
 }
 
 // ---------------------------------------------------------------------------
