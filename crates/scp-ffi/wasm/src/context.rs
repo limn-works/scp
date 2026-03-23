@@ -2294,20 +2294,18 @@ fn validate_invitation_template(params: &serde_json::Value) -> Result<(), ScpWas
 
 /// Returns `true` if the ceiling array contains any tool-related capability.
 fn ceiling_has_tool_caps(ceiling: Option<&serde_json::Value>) -> bool {
+    use scp_protocol::context::params::Capability;
+
     ceiling
-        .and_then(serde_json::Value::as_array)
+        .and_then(|v| serde_json::from_value::<Vec<Capability>>(v.clone()).ok())
         .is_some_and(|caps| {
-            caps.iter().any(|c| {
-                // Check both string representations used in JSON:
-                // - Capability enum variants (ToolInvokeAll, ToolRegister, ToolInvoke(...))
-                // - Capability name format (tool_invoke:*, tool:register, tool_invoke:name)
-                let s = c.as_str().unwrap_or("");
-                s == "ToolInvokeAll"
-                    || s == "ToolRegister"
-                    || s.starts_with("ToolInvoke(")
-                    || s == "tool_invoke:*"
-                    || s == "tool:register"
-                    || s.starts_with("tool_invoke:")
+            caps.iter().any(|cap| {
+                matches!(
+                    cap,
+                    Capability::ToolInvokeAll
+                        | Capability::ToolInvoke(_)
+                        | Capability::ToolRegister
+                )
             })
         })
 }

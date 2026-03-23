@@ -257,7 +257,10 @@ pub fn trust_verify_response(challenge_json: String, response_json: String) -> P
 // ---------------------------------------------------------------------------
 
 // Participation types imported from scp-protocol — canonical implementations.
-use scp_protocol::trust::participation::{ParticipationProfile, RequireParticipation};
+use scp_protocol::trust::participation::{
+    ParticipationProfile, RequireParticipation,
+    verify_participation_requirements as protocol_verify,
+};
 
 /// Verifies participation profiles against admission requirements.
 ///
@@ -272,9 +275,9 @@ use scp_protocol::trust::participation::{ParticipationProfile, RequireParticipat
 /// Returns `true` if all requirements are satisfied. Throws an error with
 /// a diagnostic message if any requirement fails or if the JSON is malformed.
 ///
-/// Performs full Ed25519 signature verification on all profiles (matching
-/// `scp_core::trust::verify_participation_requirements`), followed by
-/// freshness, threshold, and `min_contexts` checks.
+/// Delegates to `scp_protocol::trust::participation::verify_participation_requirements`
+/// for full Ed25519 signature verification, freshness, threshold, and
+/// `min_contexts` checks.
 ///
 /// See §7.3.2.1.
 ///
@@ -298,8 +301,6 @@ pub fn verify_participation_requirements(
     profile_json: String,
     requirements_json: String,
 ) -> Result<bool, JsValue> {
-    use ed25519_dalek::{Signature, VerifyingKey};
-
     let profiles: Vec<ParticipationProfile> = serde_json::from_str(&profile_json).map_err(|e| {
         ScpWasmError::validation(&format!("failed to parse participation profiles JSON: {e}"))
     })?;
@@ -311,96 +312,11 @@ pub fn verify_participation_requirements(
             ))
         })?;
 
-    // Step 1: Verify all signatures up front. Any invalid signature is a
-    // hard failure regardless of which requirements use it. Matches
-    // scp-core's verify_participation_requirements step 1.
-    for profile in &profiles {
-        let verifying_key = VerifyingKey::from_bytes(&profile.signer_public_key).map_err(|e| {
-            ScpWasmError::validation(&format!(
-                "invalid signer public key for {}: {e}",
-                &profile.subject_did
-            ))
-        })?;
+    let current_time = crate::time::now_secs();
 
-        let signature = Signature::from_bytes(&profile.signature);
-        let signable = profile.signable_bytes();
-
-        verifying_key
-            .verify_strict(&signable, &signature)
-            .map_err(|e| {
-                ScpWasmError::validation(&format!(
-                    "participation profile signature verification failed for {}: {e}",
-                    &profile.subject_did
-                ))
-            })?;
-    }
-
-    // Step 2: Check each requirement independently.
-    // Current time in seconds since UNIX epoch (using js_sys::Date for WASM).
-    #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
-    let current_time = (js_sys::Date::now() / 1000.0) as u64;
-
-    for requirement in &requirements {
-        // Collect qualifying statements: fresh + threshold-satisfying.
-        // Mirrors scp-core's verify_participation_requirements step 2.
-        let mut distinct_signers = std::collections::HashSet::new();
-        let mut newest_updated_at: u64 = 0;
-        let mut any_fresh = false;
-
-        for profile in &profiles {
-            newest_updated_at = newest_updated_at.max(profile.updated_at);
-
-            // Freshness check.
-            let age = current_time.saturating_sub(profile.updated_at);
-            if age > requirement.max_age_secs {
-                continue;
-            }
-            any_fresh = true;
-
-            // Threshold check.
-            let value = requirement.fact.extract_value(profile);
-            if !requirement.threshold.is_satisfied(value) {
-                continue;
-            }
-
-            distinct_signers.insert(&profile.signer_public_key);
-        }
-
-        // If no statements were fresh enough, report staleness.
-        if !any_fresh && !profiles.is_empty() {
-            return Err(ScpWasmError::validation(&format!(
-                "participation admission verification failed: record too stale \
-                 (newest_updated_at={newest_updated_at}, current_time={current_time}, \
-                 max_age_secs={})",
-                requirement.max_age_secs
-            )));
-        }
-
-        // If no statements satisfied the threshold (but some were fresh),
-        // find the best value to report.
-        if distinct_signers.is_empty() {
-            let best_value = profiles
-                .iter()
-                .filter(|p| current_time.saturating_sub(p.updated_at) <= requirement.max_age_secs)
-                .map(|p| requirement.fact.extract_value(p))
-                .max()
-                .unwrap_or(0);
-
-            return Err(ScpWasmError::validation(&format!(
-                "participation admission verification failed: threshold not met (best value: {best_value})"
-            )));
-        }
-
-        // Check min_contexts.
-        #[allow(clippy::cast_possible_truncation)]
-        let found = distinct_signers.len() as u32;
-        if found < requirement.min_contexts {
-            return Err(ScpWasmError::validation(&format!(
-                "participation admission verification failed: need {} distinct source contexts, got {found}",
-                requirement.min_contexts,
-            )));
-        }
-    }
+    protocol_verify(current_time, &requirements, &profiles).map_err(|e| {
+        ScpWasmError::validation(&format!("participation admission verification failed: {e}"))
+    })?;
 
     Ok(true)
 }

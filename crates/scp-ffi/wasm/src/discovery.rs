@@ -261,6 +261,10 @@ pub fn discovery_normalize_address(address: String) -> String {
 /// Used to build structured discovery queries for the TypeScript wrapper to
 /// execute against the DHT or other discovery backends.
 ///
+/// Constructs a `scp_protocol::discovery::DiscoveryQuery` from the inputs
+/// and serializes it to JSON, ensuring the output format matches the
+/// canonical protocol type.
+///
 /// # Arguments
 ///
 /// - `capabilities_json` — Optional JSON array of capability filter strings.
@@ -289,7 +293,9 @@ pub fn discovery_create_query(
     keywords_json: Option<String>,
     min_history_secs: Option<f64>,
 ) -> Result<String, JsError> {
-    let capabilities: Option<Vec<String>> = match capabilities_json {
+    use scp_protocol::discovery::DiscoveryQuery;
+
+    let capability_filter: Option<Vec<String>> = match capabilities_json {
         Some(ref s) => Some(serde_json::from_str(s).map_err(|e| {
             JsError::new(&format!("[SCP-VALID-7040] invalid capabilities JSON: {e}"))
         })?),
@@ -311,17 +317,18 @@ pub fn discovery_create_query(
             ));
         }
         #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-        Some(v) => Some(v as u64),
+        Some(v) => Some(std::time::Duration::from_secs(v as u64)),
         None => None,
     };
 
-    let result = serde_json::json!({
-        "capability_filter": capabilities,
-        "keywords": keywords,
-        "min_history": min_history,
-    });
+    let query = DiscoveryQuery {
+        capability_filter,
+        keywords,
+        min_history,
+    };
 
-    Ok(result.to_string())
+    serde_json::to_string(&query)
+        .map_err(|e| JsError::new(&format!("[SCP-VALID-7040] failed to serialize query: {e}")))
 }
 
 // ---------------------------------------------------------------------------
@@ -935,38 +942,97 @@ pub fn petname_context_count(owner_did: String) -> Result<u32, JsError> {
 }
 
 // ---------------------------------------------------------------------------
-// Handle registry bridge (§22.3.1) — local reimplementation per ADR-034
+// Handle registry bridge (§22.3.1) — delegates to scp-protocol HandleRegistry
 // ---------------------------------------------------------------------------
 
-/// In-memory handle entry.
-#[derive(Clone, serde::Serialize)]
-struct WasmHandleEntry {
-    handle: String,
-    target: serde_json::Value,
-    owner_did: String,
-    registered_at: u64,
-    metadata: serde_json::Value,
-    entry_id: String,
-}
+use scp_protocol::discovery::HandleTarget;
+use scp_protocol::discovery::handles::{
+    HandleDeregisterParams, HandleEntry, HandleLookupParams, HandleMetadata, HandleRegisterParams,
+    HandleRegistry, HandleTypeFilter,
+};
 
-/// In-memory handle registry for one context.
-struct WasmHandleRegistry {
-    entries: HashMap<String, WasmHandleEntry>,
-    next_id: u64,
-}
-
-impl WasmHandleRegistry {
-    fn new() -> Self {
-        Self {
-            entries: HashMap::new(),
-            next_id: 1,
+/// Parses the JS-facing `target_json` format into a protocol `HandleTarget`.
+///
+/// The WASM bridge accepts `{"type":"identity","did":"..."}` or
+/// `{"type":"context","context_id":"...","relay_urls":[...]}` from JS callers.
+/// This converts to the canonical `HandleTarget` enum.
+fn parse_handle_target(target: &serde_json::Value) -> Result<HandleTarget, JsError> {
+    match target.get("type").and_then(serde_json::Value::as_str) {
+        Some("identity") => {
+            let did = target
+                .get("did")
+                .and_then(serde_json::Value::as_str)
+                .ok_or_else(|| {
+                    JsError::new("[SCP-VALID-7126] identity target missing 'did' field")
+                })?;
+            Ok(HandleTarget::Identity {
+                did: scp_event_log::DID::from(did),
+            })
         }
+        Some("context") => {
+            let context_id = target
+                .get("context_id")
+                .and_then(serde_json::Value::as_str)
+                .ok_or_else(|| {
+                    JsError::new("[SCP-VALID-7126] context target missing 'context_id' field")
+                })?
+                .to_owned();
+            let relay_urls: Vec<String> = target
+                .get("relay_urls")
+                .and_then(serde_json::Value::as_array)
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(serde_json::Value::as_str)
+                        .map(str::to_owned)
+                        .collect()
+                })
+                .unwrap_or_default();
+            Ok(HandleTarget::Context {
+                context_id,
+                relay_urls,
+            })
+        }
+        Some(other) => Err(JsError::new(&format!(
+            "[SCP-VALID-7126] unknown target type: '{other}'"
+        ))),
+        None => Err(JsError::new(
+            "[SCP-VALID-7126] target_json missing 'type' field",
+        )),
     }
 }
 
-fn wasm_handle_registries() -> &'static Mutex<HashMap<String, WasmHandleRegistry>> {
+/// Serializes a `HandleEntry` back to the JS-facing JSON format.
+///
+/// Converts the protocol's `HandleTarget` enum back to the flat
+/// `{"type":"identity","did":"..."}` format that the JS callers expect.
+fn handle_entry_to_js_value(entry: &HandleEntry) -> serde_json::Value {
+    let target = match &entry.target {
+        HandleTarget::Identity { did } => {
+            serde_json::json!({"type": "identity", "did": did.to_string()})
+        }
+        HandleTarget::Context {
+            context_id,
+            relay_urls,
+        } => {
+            serde_json::json!({"type": "context", "context_id": context_id, "relay_urls": relay_urls})
+        }
+    };
+    serde_json::json!({
+        "handle": entry.handle,
+        "target": target,
+        "owner_did": entry.owner_did.to_string(),
+        "registered_at": entry.registered_at,
+        "metadata": {
+            "description": entry.metadata.description,
+            "tags": entry.metadata.tags,
+        },
+        "entry_id": entry.entry_id,
+    })
+}
+
+fn wasm_handle_registries() -> &'static Mutex<HashMap<String, HandleRegistry>> {
     use std::sync::OnceLock;
-    static REGISTRIES: OnceLock<Mutex<HashMap<String, WasmHandleRegistry>>> = OnceLock::new();
+    static REGISTRIES: OnceLock<Mutex<HashMap<String, HandleRegistry>>> = OnceLock::new();
     REGISTRIES.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
@@ -985,21 +1051,10 @@ pub fn handle_register(
     description: Option<String>,
     tags_json: Option<String>,
 ) -> Result<String, JsError> {
-    let target: serde_json::Value = serde_json::from_str(&target_json)
+    let target_value: serde_json::Value = serde_json::from_str(&target_json)
         .map_err(|e| JsError::new(&format!("[SCP-VALID-7126] invalid target_json: {e}")))?;
 
-    // Ownership check for identity targets.
-    if target["type"].as_str() == Some("identity")
-        && target["did"]
-            .as_str()
-            .is_some_and(|target_did| target_did != registrant_did)
-    {
-        let result = serde_json::json!({"status": "ownership_mismatch", "entry_id": null});
-        return Ok(result.to_string());
-    }
-
-    let normalized = handle.to_lowercase();
-    let now = crate::time::now_secs();
+    let target = parse_handle_target(&target_value)?;
 
     let tags: Option<Vec<String>> = match tags_json.as_deref() {
         Some(s) => Some(
@@ -1009,36 +1064,29 @@ pub fn handle_register(
         None => None,
     };
 
-    let entry_id = {
+    let params = HandleRegisterParams {
+        handle,
+        target,
+        metadata: Some(HandleMetadata { description, tags }),
+    };
+
+    let did = scp_event_log::DID::from(registrant_did);
+    let clock = crate::time::WasmClock;
+
+    let register_result = {
         let mut guard = wasm_handle_registries()
             .lock()
             .map_err(|e| JsError::new(&format!("[SCP-VALID-7120] lock poisoned: {e}")))?;
         let registry = guard
-            .entry(discovery_context_id)
-            .or_insert_with(WasmHandleRegistry::new);
-
-        if registry.entries.contains_key(&normalized) {
-            let result = serde_json::json!({"status": "conflict", "entry_id": null});
-            return Ok(result.to_string());
-        }
-
-        let eid = format!("handle-{}", registry.next_id);
-        registry.next_id += 1;
-
-        let entry = WasmHandleEntry {
-            handle: normalized.clone(),
-            target,
-            owner_did: registrant_did,
-            registered_at: now,
-            metadata: serde_json::json!({"description": description, "tags": tags}),
-            entry_id: eid.clone(),
-        };
-
-        registry.entries.insert(normalized, entry);
-        eid
+            .entry(discovery_context_id.clone())
+            .or_insert_with(|| HandleRegistry::new(discovery_context_id));
+        registry.register(&params, &did, &clock)
     };
 
-    let result = serde_json::json!({"status": "registered", "entry_id": entry_id});
+    let result = serde_json::json!({
+        "status": register_result.status,
+        "entry_id": register_result.entry_id,
+    });
     Ok(result.to_string())
 }
 
@@ -1053,20 +1101,30 @@ pub fn handle_lookup(
     handle: String,
     type_filter: Option<String>,
 ) -> Result<String, JsError> {
-    let normalized = handle.to_lowercase();
+    let filter = match type_filter.as_deref() {
+        Some("identity") => Some(HandleTypeFilter::Identity),
+        Some("context") => Some(HandleTypeFilter::Context),
+        _ => None,
+    };
+
+    let params = HandleLookupParams {
+        handle,
+        type_filter: filter,
+    };
+
     let results: Vec<serde_json::Value> = wasm_handle_registries()
         .lock()
         .map_err(|e| JsError::new(&format!("[SCP-VALID-7120] lock poisoned: {e}")))?
         .get(&discovery_context_id)
-        .and_then(|registry| registry.entries.get(&normalized))
-        .filter(|entry| match type_filter.as_deref() {
-            Some("identity") => entry.target["type"].as_str() == Some("identity"),
-            Some("context") => entry.target["type"].as_str() == Some("context"),
-            _ => true,
+        .map(|registry| {
+            registry
+                .lookup(&params)
+                .results
+                .iter()
+                .map(handle_entry_to_js_value)
+                .collect()
         })
-        .map(|entry| serde_json::to_value(entry).unwrap_or_default())
-        .into_iter()
-        .collect();
+        .unwrap_or_default();
 
     let result = serde_json::json!({"results": results});
     Ok(result.to_string())
@@ -1083,23 +1141,16 @@ pub fn handle_deregister(
     handle: String,
     did: String,
 ) -> Result<String, JsError> {
-    let normalized = handle.to_lowercase();
+    let params = HandleDeregisterParams {
+        handle,
+        did: scp_event_log::DID::from(did),
+    };
+
     let removed = wasm_handle_registries()
         .lock()
         .map_err(|e| JsError::new(&format!("[SCP-VALID-7120] lock poisoned: {e}")))?
         .get_mut(&discovery_context_id)
-        .is_some_and(|registry| {
-            if registry
-                .entries
-                .get(&normalized)
-                .is_some_and(|entry| entry.owner_did == did)
-            {
-                registry.entries.remove(&normalized);
-                true
-            } else {
-                false
-            }
-        });
+        .is_some_and(|registry| registry.deregister(&params).removed);
 
     let result = serde_json::json!({"removed": removed});
     Ok(result.to_string())
@@ -1646,12 +1697,15 @@ fn resolve_via_handles(
         if scope.is_some_and(|s| scope_name != s) {
             continue;
         }
-        let resolution = guard
-            .get(ctx_id)
-            .and_then(|r| r.entries.get(local_part))
-            .and_then(|entry| entry_to_resolution(entry, ctx_id, now));
-        if let Some(r) = resolution {
-            results.push(r);
+        if let Some(registry) = guard.get(ctx_id) {
+            let lookup_params = HandleLookupParams {
+                handle: local_part.to_owned(),
+                type_filter: None,
+            };
+            let lookup_result = registry.lookup(&lookup_params);
+            for entry in &lookup_result.results {
+                results.push(entry_to_resolution(entry, ctx_id, now));
+            }
         }
     }
 
@@ -1661,48 +1715,35 @@ fn resolve_via_handles(
     Ok(results)
 }
 
-fn entry_to_resolution(
-    entry: &WasmHandleEntry,
-    ctx_id: &str,
-    now: u64,
-) -> Option<serde_json::Value> {
-    let target_type = entry.target["type"].as_str()?;
-    match target_type {
-        "identity" => {
-            let did = entry.target["did"].as_str().unwrap_or("");
-            Some(serde_json::json!({
-                "type": "Identity",
-                "did": did,
-                "trust_level": {"kind": "HandleRegistryVerified"},
-                "resolution_path": {
-                    "layer": "HandleRegistry",
-                    "source": "local_registry",
-                    "source_id": ctx_id,
-                    "resolved_at": now,
-                },
-            }))
-        }
-        "context" => {
-            let cid = entry.target["context_id"].as_str().unwrap_or("");
-            let relay_urls = entry.target["relay_urls"]
-                .as_array()
-                .map(|a| a.iter().filter_map(|v| v.as_str()).collect::<Vec<_>>())
-                .unwrap_or_default();
-            Some(serde_json::json!({
-                "type": "Context",
-                "context_id": cid,
-                "relay_urls": relay_urls,
-                "mode": null,
-                "trust_level": {"kind": "HandleRegistryVerified"},
-                "resolution_path": {
-                    "layer": "HandleRegistry",
-                    "source": "local_registry",
-                    "source_id": ctx_id,
-                    "resolved_at": now,
-                },
-            }))
-        }
-        _ => None,
+fn entry_to_resolution(entry: &HandleEntry, ctx_id: &str, now: u64) -> serde_json::Value {
+    match &entry.target {
+        HandleTarget::Identity { did } => serde_json::json!({
+            "type": "Identity",
+            "did": did.as_ref(),
+            "trust_level": {"kind": "HandleRegistryVerified"},
+            "resolution_path": {
+                "layer": "HandleRegistry",
+                "source": "local_registry",
+                "source_id": ctx_id,
+                "resolved_at": now,
+            },
+        }),
+        HandleTarget::Context {
+            context_id,
+            relay_urls,
+        } => serde_json::json!({
+            "type": "Context",
+            "context_id": context_id,
+            "relay_urls": relay_urls,
+            "mode": null,
+            "trust_level": {"kind": "HandleRegistryVerified"},
+            "resolution_path": {
+                "layer": "HandleRegistry",
+                "source": "local_registry",
+                "source_id": ctx_id,
+                "resolved_at": now,
+            },
+        }),
     }
 }
 
@@ -2148,21 +2189,29 @@ mod tests {
         assert_eq!(parsed["RemoveContextPetname"]["context_id"], "ctx-1");
     }
 
-    // -- WasmHandleRegistry unit tests ---------------------------------------
+    // -- HandleRegistry unit tests -----------------------------------------------
 
     #[test]
-    fn wasm_handle_registry_basic() {
-        let mut registry = WasmHandleRegistry::new();
-        let entry = WasmHandleEntry {
+    fn handle_registry_basic() {
+        use scp_protocol::time::TestClock;
+
+        let mut registry = HandleRegistry::new("test-ctx".to_owned());
+        let clock = TestClock::new(0);
+        let did = scp_event_log::DID::from("did:dht:zAlice");
+        let params = HandleRegisterParams {
             handle: "alice".to_owned(),
-            target: serde_json::json!({"type": "identity", "did": "did:dht:zAlice"}),
-            owner_did: "did:dht:zAlice".to_owned(),
-            registered_at: 0,
-            metadata: serde_json::json!({}),
-            entry_id: "handle-1".to_owned(),
+            target: HandleTarget::Identity { did: did.clone() },
+            metadata: None,
         };
-        registry.entries.insert("alice".to_owned(), entry);
-        assert!(registry.entries.contains_key("alice"));
+        let result = registry.register(&params, &did, &clock);
+        assert!(result.entry_id.is_some());
+
+        let lookup = registry.lookup(&HandleLookupParams {
+            handle: "alice".to_owned(),
+            type_filter: None,
+        });
+        assert_eq!(lookup.results.len(), 1);
+        assert_eq!(lookup.results[0].handle, "alice");
     }
 }
 

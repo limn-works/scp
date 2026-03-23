@@ -240,25 +240,7 @@ fn decode_hex(hex: &str) -> Result<Vec<u8>, String> {
     Ok(bytes)
 }
 
-// ---------------------------------------------------------------------------
-// Clock adapter for WASM (js_sys::Date::now)
-// ---------------------------------------------------------------------------
-
-/// WASM clock implementation that uses `js_sys::Date::now()`.
-///
-/// For native test targets, falls back to `SystemTime` to avoid requiring
-/// the WASM JS runtime.
-struct WasmClock;
-
-impl scp_protocol::time::Clock for WasmClock {
-    fn now_secs(&self) -> u64 {
-        crate::time::now_secs()
-    }
-
-    fn now_millis(&self) -> u64 {
-        crate::time::now_ms_u64()
-    }
-}
+use crate::time::WasmClock;
 
 // ---------------------------------------------------------------------------
 // WasmUcanToken

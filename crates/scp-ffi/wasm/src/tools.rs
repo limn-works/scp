@@ -273,37 +273,66 @@ fn parse_provenance_fields(def: &serde_json::Value) -> Result<ProvenanceFields, 
 }
 
 // ---------------------------------------------------------------------------
-// WasmRateLimit — typed deserialization for rate_limit_json (F9)
+// Rate limit parsing — constructs protocol RateLimit from JSON (F9)
 // ---------------------------------------------------------------------------
 
-/// Rate limit configuration for cross-context tool interfaces.
+use scp_protocol::context::tools::interface::RateLimit;
+
+/// Parses a rate limit JSON string into the protocol `RateLimit` type.
 ///
-/// Used for typed deserialization of `rate_limit_json` instead of generic
-/// `serde_json::Value`. Validates that the required fields (`max_calls`,
-/// `window_seconds`) are present and well-typed at parse time. Uses
-/// default burst constants from `scp_protocol::context::tools::interface`.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-struct WasmRateLimit {
-    /// Maximum number of calls permitted within the time window.
-    pub max_calls: u64,
-    /// Duration of the sliding time window in seconds.
-    pub window_seconds: u64,
-    /// Optional burst allowance (default: 5, max: 50 per §6.2.0.2).
-    #[serde(default = "default_burst_allowance")]
-    pub burst_allowance: u32,
-    /// Optional burst window in seconds (default: 1 per §6.2.0.2).
-    #[serde(default = "default_burst_window_secs")]
-    pub burst_window_seconds: u64,
+/// The JSON must contain `max_calls` (u64) and `window_seconds` (u64).
+/// Optional fields: `burst_allowance` (u32, default: 5 per §6.2.0.2),
+/// `burst_window_seconds` (u64, default: 1 per §6.2.0.2).
+///
+/// The `clock` parameter initializes the rate limiter's window start time.
+/// Bridge callers pass `WasmClock`; tests pass `TestClock`.
+fn parse_rate_limit_json_with_clock(
+    json: &str,
+    clock: &dyn scp_protocol::time::Clock,
+) -> Result<RateLimit, String> {
+    let value: serde_json::Value =
+        serde_json::from_str(json).map_err(|e| format!("invalid rate_limit_json: {e}"))?;
+
+    let max_calls = value
+        .get("max_calls")
+        .and_then(serde_json::Value::as_u64)
+        .ok_or("rate_limit_json missing or invalid 'max_calls' (u64)")?;
+
+    let window_seconds = value
+        .get("window_seconds")
+        .and_then(serde_json::Value::as_u64)
+        .ok_or("rate_limit_json missing or invalid 'window_seconds' (u64)")?;
+
+    let burst_allowance = value
+        .get("burst_allowance")
+        .and_then(serde_json::Value::as_u64)
+        .map_or(
+            scp_protocol::context::tools::interface::DEFAULT_BURST_ALLOWANCE,
+            |v| {
+                #[allow(clippy::cast_possible_truncation)]
+                {
+                    v as u32
+                }
+            },
+        );
+
+    let burst_window_seconds = value
+        .get("burst_window_seconds")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(scp_protocol::context::tools::interface::DEFAULT_BURST_WINDOW_SECS);
+
+    Ok(RateLimit::with_burst(
+        max_calls,
+        std::time::Duration::from_secs(window_seconds),
+        burst_allowance,
+        std::time::Duration::from_secs(burst_window_seconds),
+        clock,
+    ))
 }
 
-/// Default burst allowance from scp-protocol (§6.2.0.2).
-const fn default_burst_allowance() -> u32 {
-    scp_protocol::context::tools::interface::DEFAULT_BURST_ALLOWANCE
-}
-
-/// Default burst window from scp-protocol (§6.2.0.2).
-const fn default_burst_window_secs() -> u64 {
-    scp_protocol::context::tools::interface::DEFAULT_BURST_WINDOW_SECS
+/// Convenience wrapper for bridge code that uses `WasmClock`.
+fn parse_rate_limit_json(json: &str) -> Result<RateLimit, String> {
+    parse_rate_limit_json_with_clock(json, &crate::time::WasmClock)
 }
 
 // ---------------------------------------------------------------------------
@@ -780,12 +809,12 @@ pub fn tool_interface_expose(
             .into());
         }
 
-        // Parse optional rate limit into a validated struct (not generic JSON).
-        let rate_limit: Option<WasmRateLimit> = match rate_limit_json {
+        // Parse optional rate limit into the protocol RateLimit type.
+        let rate_limit: Option<RateLimit> = match rate_limit_json {
             Some(ref json) => {
-                let parsed: WasmRateLimit = serde_json::from_str(json).map_err(|e| {
+                let parsed = parse_rate_limit_json(json).map_err(|e| {
                     ScpWasmError::Validation {
-                        message: format!("invalid rate_limit_json: {e}"),
+                        message: e,
                         code: "SCP-VALID-7040".to_owned(),
                     }
                     .into_js()
@@ -1323,30 +1352,42 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // WasmRateLimit deserialization (F9)
+    // parse_rate_limit_json (F9 — protocol RateLimit)
     // -----------------------------------------------------------------------
 
-    #[test]
-    fn wasm_rate_limit_deserializes_valid() {
-        let json = r#"{"max_calls": 10, "window_seconds": 60}"#;
-        let rl: WasmRateLimit = serde_json::from_str(json).unwrap();
-        assert_eq!(rl.max_calls, 10);
-        assert_eq!(rl.window_seconds, 60);
-        assert_eq!(rl.burst_allowance, 5);
-        assert_eq!(rl.burst_window_seconds, 1);
+    fn test_clock() -> scp_protocol::time::TestClock {
+        scp_protocol::time::TestClock::new(0)
     }
 
     #[test]
-    fn wasm_rate_limit_rejects_missing_max_calls() {
+    fn rate_limit_parses_valid() {
+        let json = r#"{"max_calls": 10, "window_seconds": 60}"#;
+        let rl = parse_rate_limit_json_with_clock(json, &test_clock()).unwrap();
+        assert_eq!(rl.max_calls, 10);
+        assert_eq!(rl.window, std::time::Duration::from_secs(60));
+        assert_eq!(
+            rl.burst_allowance,
+            scp_protocol::context::tools::interface::DEFAULT_BURST_ALLOWANCE
+        );
+        assert_eq!(
+            rl.burst_window,
+            std::time::Duration::from_secs(
+                scp_protocol::context::tools::interface::DEFAULT_BURST_WINDOW_SECS
+            )
+        );
+    }
+
+    #[test]
+    fn rate_limit_rejects_missing_max_calls() {
         let json = r#"{"window_seconds": 60}"#;
-        let result: Result<WasmRateLimit, _> = serde_json::from_str(json);
+        let result = parse_rate_limit_json_with_clock(json, &test_clock());
         assert!(result.is_err(), "missing max_calls should fail");
     }
 
     #[test]
-    fn wasm_rate_limit_rejects_string_max_calls() {
+    fn rate_limit_rejects_string_max_calls() {
         let json = r#"{"max_calls": "ten", "window_seconds": 60}"#;
-        let result: Result<WasmRateLimit, _> = serde_json::from_str(json);
+        let result = parse_rate_limit_json_with_clock(json, &test_clock());
         assert!(result.is_err(), "string max_calls should fail");
     }
 
@@ -1549,9 +1590,9 @@ mod tests {
     #[test]
     fn consent_expose_with_rate_limit() {
         let rl_json = r#"{"max_calls": 20, "window_seconds": 120}"#;
-        let rl: WasmRateLimit = serde_json::from_str(rl_json).unwrap();
+        let rl = parse_rate_limit_json_with_clock(rl_json, &test_clock()).unwrap();
         assert_eq!(rl.max_calls, 20);
-        assert_eq!(rl.window_seconds, 120);
+        assert_eq!(rl.window, std::time::Duration::from_secs(120));
 
         // Serialized rate_limit should appear in the interface JSON.
         let interface = serde_json::json!({
@@ -1565,6 +1606,5 @@ mod tests {
 
         assert!(interface["rate_limit"].is_object());
         assert_eq!(interface["rate_limit"]["max_calls"], 20);
-        assert_eq!(interface["rate_limit"]["window_seconds"], 120);
     }
 }
