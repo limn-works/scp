@@ -42,8 +42,8 @@ from scp_sdk.trust import (
 # ---------------------------------------------------------------------------
 
 _REPO_ROOT = Path(__file__).resolve().parents[3]
-_RUST_UCAN_MOD = _REPO_ROOT / "crates" / "scp-core" / "src" / "crypto" / "ucan" / "mod.rs"
-_RUST_VALIDATE = _REPO_ROOT / "crates" / "scp-core" / "src" / "crypto" / "ucan" / "validate.rs"
+_RUST_UCAN_MOD = _REPO_ROOT / "crates" / "scp-protocol" / "src" / "crypto" / "ucan" / "mod.rs"
+_RUST_VALIDATE = _REPO_ROOT / "crates" / "scp-protocol" / "src" / "crypto" / "ucan" / "validate.rs"
 _RUST_RESOLVERS = _REPO_ROOT / "crates" / "scp-ffi" / "common" / "src" / "resolvers.rs"
 
 
