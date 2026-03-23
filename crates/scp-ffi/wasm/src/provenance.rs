@@ -354,7 +354,7 @@ pub fn provenance_attach(
     // The field must be present for structural parity with the NAPI bridge.
     let result = serde_json::json!({
         "source_context": source_context_id,
-        "source_type": format!("{st:?}"),
+        "source_type": source_type_as_str(st),
         "counterparties": counterparties,
         "memory_scope": ms.to_string(),
         "chain_depth": chain_depth,
@@ -654,6 +654,21 @@ struct CanonicalDuration {
     nanos: u32,
 }
 
+/// Returns the stable string representation of a [`SourceType`] for canonical
+/// hashing and wire output.
+///
+/// This uses an explicit match rather than `Debug` or `Display` formatting to
+/// guard against unintentional breakage if the upstream enum's `Debug` output
+/// changes (e.g., through `#[serde(rename)]` or variant renaming). The hash
+/// MUST be identical across all four bridges.
+fn source_type_as_str(st: SourceType) -> &'static str {
+    match st {
+        SourceType::Persistent => "Persistent",
+        SourceType::Ephemeral => "Ephemeral",
+        SourceType::Summary => "Summary",
+    }
+}
+
 /// Builds a canonical provenance struct for hashing that produces the same
 /// `serde_json::to_vec` output as `DataProvenance` in scp-core.
 #[allow(clippy::too_many_arguments)] // mirrors DataProvenance field count
@@ -669,7 +684,7 @@ fn build_canonical_provenance_bytes(
 ) -> Vec<u8> {
     let canonical = CanonicalProvenance {
         source_context,
-        source_type: &format!("{source_type:?}"),
+        source_type: source_type_as_str(source_type),
         counterparties,
         purpose,
         discovery_method,

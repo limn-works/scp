@@ -2271,9 +2271,13 @@ fn validate_invitation_template(params: &serde_json::Value) -> Result<(), ScpWas
         return Ok(());
     }
 
+    // Normalize camelCase to snake_case before deserialization into ContextParams.
+    let mut normalized = params.clone();
+    camel_to_snake_context_params(&mut normalized);
+
     // Parse the whole params as ContextParams, then delegate to the protocol.
     let ctx_params: scp_protocol::context::params::ContextParams =
-        serde_json::from_value(params.clone()).map_err(|_| {
+        serde_json::from_value(normalized).map_err(|_| {
             // If the params can't be parsed as ContextParams, it's not a valid
             // template — forward-compatible: skip validation for unknown shapes.
             ScpWasmError::Context {
@@ -2529,10 +2533,60 @@ fn check_auto_accept(
     Ok(None)
 }
 
+// ---------------------------------------------------------------------------
+// JSON field name normalization (snake_case <-> camelCase)
+// ---------------------------------------------------------------------------
+
+/// Renames `snake_case` `ContextParams` fields to camelCase for JS output.
+///
+/// The scp-protocol `ContextParams` struct serializes with `snake_case` field
+/// names (`max_chain_depth`, `max_nesting_depth`, `session_cap`). The WASM
+/// bridge API contract exposes these as camelCase to match JS conventions.
+fn snake_to_camel_context_params(val: &mut serde_json::Value) {
+    if let Some(map) = val.as_object_mut() {
+        let renames: &[(&str, &str)] = &[
+            ("max_chain_depth", "maxChainDepth"),
+            ("max_nesting_depth", "maxNestingDepth"),
+            ("session_cap", "sessionCap"),
+        ];
+        for &(snake, camel) in renames {
+            if let Some(v) = map.remove(snake) {
+                map.insert(camel.to_owned(), v);
+            }
+        }
+    }
+}
+
+/// Renames camelCase `ContextParams` fields to `snake_case` for deserialization
+/// into the scp-protocol `ContextParams` struct.
+///
+/// JS consumers may send `"maxChainDepth"` (camelCase) in params JSON. The
+/// scp-protocol `ContextParams` expects `"max_chain_depth"` (`snake_case`).
+/// This normalization avoids silent field drops during deserialization.
+fn camel_to_snake_context_params(val: &mut serde_json::Value) {
+    if let Some(map) = val.as_object_mut() {
+        let renames: &[(&str, &str)] = &[
+            ("maxChainDepth", "max_chain_depth"),
+            ("maxNestingDepth", "max_nesting_depth"),
+            ("sessionCap", "session_cap"),
+        ];
+        for &(camel, snake) in renames {
+            if let Some(v) = map.remove(camel) {
+                map.insert(snake.to_owned(), v);
+            }
+        }
+    }
+}
+
 /// Returns the canonical `ContextParams` for a given template ID as JSON.
 ///
 /// Delegates to `scp_protocol::context::templates::template_params` for the
 /// canonical definitions. No WASM-local reimplementation needed.
+///
+/// Post-processes JSON output to restore camelCase field names
+/// (`maxChainDepth`, `maxNestingDepth`, `sessionCap`) expected by JS consumers.
+/// The scp-protocol `ContextParams` struct serializes with `snake_case`, but
+/// the WASM bridge API contract uses camelCase for these fields.
 ///
 /// # Errors
 ///
@@ -2555,15 +2609,26 @@ pub fn template_get_params(template_id: String) -> Result<String, JsError> {
             .into_js()
         })?;
     let params = protocol_template_params(&tid);
-    serde_json::to_value(&params)
-        .and_then(|v| serde_json::to_string(&v))
-        .map_err(|e| {
-            ScpWasmError::Validation {
-                message: format!("failed to serialize template params: {e}"),
-                code: "SCP-VALID-7001".to_owned(),
-            }
-            .into_js()
-        })
+    let mut val = serde_json::to_value(&params).map_err(|e| {
+        ScpWasmError::Validation {
+            message: format!("failed to serialize template params: {e}"),
+            code: "SCP-VALID-7001".to_owned(),
+        }
+        .into_js()
+    })?;
+
+    // Restore camelCase field names expected by JS consumers. The scp-protocol
+    // ContextParams struct uses snake_case, but the WASM bridge has always
+    // exposed these three fields as camelCase.
+    snake_to_camel_context_params(&mut val);
+
+    serde_json::to_string(&val).map_err(|e| {
+        ScpWasmError::Validation {
+            message: format!("failed to serialize template params: {e}"),
+            code: "SCP-VALID-7001".to_owned(),
+        }
+        .into_js()
+    })
 }
 
 /// Validates that a `ContextParams` JSON matches its template definition.
@@ -2571,19 +2636,34 @@ pub fn template_get_params(template_id: String) -> Result<String, JsError> {
 /// Returns `null` on success, or a string error message on validation failure.
 /// Delegates to `scp_protocol::context::templates::validate_against_template`.
 ///
+/// Normalizes camelCase field names (`maxChainDepth`, `maxNestingDepth`,
+/// `sessionCap`) to `snake_case` before deserialization, so JS consumers can
+/// use either convention.
+///
 /// # Errors
 ///
 /// Returns `JsError` if the JSON is malformed.
 #[wasm_bindgen(js_name = "validateAgainstTemplate")]
 pub fn validate_against_template(params_json: String) -> Result<Option<String>, JsError> {
-    let params: scp_protocol::context::params::ContextParams = serde_json::from_str(&params_json)
-        .map_err(|e| {
+    let mut raw: serde_json::Value = serde_json::from_str(&params_json).map_err(|e| {
         ScpWasmError::Validation {
             message: format!("invalid ContextParams JSON: {e}"),
             code: "SCP-VALID-7001".to_owned(),
         }
         .into_js()
     })?;
+
+    // Normalize camelCase to snake_case before deserialization into ContextParams.
+    camel_to_snake_context_params(&mut raw);
+
+    let params: scp_protocol::context::params::ContextParams = serde_json::from_value(raw)
+        .map_err(|e| {
+            ScpWasmError::Validation {
+                message: format!("invalid ContextParams JSON: {e}"),
+                code: "SCP-VALID-7001".to_owned(),
+            }
+            .into_js()
+        })?;
 
     match protocol_validate_against_template(&params) {
         Ok(()) => Ok(None),
@@ -2649,19 +2729,34 @@ pub fn evaluate_invitation(
 /// Returns `null` on success, or a string error message on validation failure.
 /// Delegates to `scp_protocol::context::templates::validate_context_params`.
 ///
+/// Normalizes camelCase field names (`maxChainDepth`, `maxNestingDepth`,
+/// `sessionCap`) to `snake_case` before deserialization, so JS consumers can
+/// use either convention.
+///
 /// # Errors
 ///
 /// Returns `JsError` if the JSON is malformed.
 #[wasm_bindgen(js_name = "validateContextParams")]
 pub fn validate_context_params(params_json: String) -> Result<Option<String>, JsError> {
-    let params: scp_protocol::context::params::ContextParams = serde_json::from_str(&params_json)
-        .map_err(|e| {
+    let mut raw: serde_json::Value = serde_json::from_str(&params_json).map_err(|e| {
         ScpWasmError::Validation {
             message: format!("invalid ContextParams JSON: {e}"),
             code: "SCP-VALID-7001".to_owned(),
         }
         .into_js()
     })?;
+
+    // Normalize camelCase to snake_case before deserialization into ContextParams.
+    camel_to_snake_context_params(&mut raw);
+
+    let params: scp_protocol::context::params::ContextParams = serde_json::from_value(raw)
+        .map_err(|e| {
+            ScpWasmError::Validation {
+                message: format!("invalid ContextParams JSON: {e}"),
+                code: "SCP-VALID-7001".to_owned(),
+            }
+            .into_js()
+        })?;
 
     match protocol_validate_context_params(&params) {
         Ok(()) => Ok(None),

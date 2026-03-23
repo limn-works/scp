@@ -119,7 +119,11 @@ impl WasmNonceTracker {
 }
 
 /// Nonce freshness tolerance: 5 minutes in milliseconds (spec section 9.14).
-/// Matches native `NonceTracker::NONCE_FRESHNESS_TOLERANCE_MS`.
+///
+/// Duplicates `scp_protocol::crypto::ucan::nonce::NONCE_FRESHNESS_TOLERANCE_MS`
+/// and `scp_protocol::crypto::ucan::validate::NONCE_FRESHNESS_TOLERANCE_MS`
+/// (both `const`, not `pub`). If the upstream value changes, this must be
+/// updated in lockstep.
 const NONCE_FRESHNESS_TOLERANCE_MS: u64 = 5 * 60 * 1000;
 
 impl ValidationNonceTracker for WasmNonceTracker {
