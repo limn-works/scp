@@ -61,6 +61,8 @@ jobs:
             docs:
               - 'bindings/**'
               - 'crates/scp-core/src/**'
+              - 'crates/scp-protocol/src/**'
+              - 'crates/scp-runtime/src/**'
               - 'crates/scp-ffi/**'
 
   # ---- Rust (rustdoc) ----
