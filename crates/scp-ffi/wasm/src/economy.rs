@@ -1,147 +1,54 @@
 //! `wasm-bindgen` bridge for SCP economic governance operations.
 //!
 //! Exposes economic governance operations to JavaScript (browser target).
-//! Since this bridge does NOT depend on `scp-core` (tokio multi-thread
-//! incompatible with `wasm32-unknown-unknown`), pure functions that need
-//! scp-core types parse JSON and evaluate locally.
+//! Pricing formula evaluation delegates to `scp-protocol::economy::policy::evaluate_formula`
+//! to stay in lockstep with native implementations.
 //!
 //! See spec section 19 (Economic Governance) and ADR-033.
 
 use js_sys::Promise;
+use scp_protocol::economy::policy::{evaluate_formula, ObservableMetrics};
+use scp_protocol::economy::types::PricingFormula;
 use wasm_bindgen::prelude::*;
 use wasm_bindgen_futures::future_to_promise;
 
 use crate::error::ScpWasmError;
 
 // ---------------------------------------------------------------------------
-// Internal helpers — pricing formula evaluation (algorithm-identical to
-// scp-core policy::evaluate_formula)
+// Internal helpers — metrics JSON → ObservableMetrics conversion
 // ---------------------------------------------------------------------------
 
-/// Fixed-point scale for Coefficient (6 decimal places).
-const COEFFICIENT_SCALE: i64 = 1_000_000;
-
-/// Resolves a `PricingMetric` enum name to the corresponding metric value
-/// from the metrics JSON object. Returns 0 for unknown/missing metrics.
-fn resolve_metric(metric_name: &str, metrics: &serde_json::Value) -> u64 {
-    match metric_name {
-        "ContextMessageRate" => metrics
+/// Converts a JSON object of metric values into typed [`ObservableMetrics`].
+///
+/// Unrecognized or missing fields default to 0 (matching the previous
+/// WASM-local `resolve_metric` behavior).
+fn metrics_from_json(metrics: &serde_json::Value) -> ObservableMetrics {
+    ObservableMetrics {
+        context_message_rate: metrics
             .get("context_message_rate")
             .and_then(serde_json::Value::as_u64)
             .unwrap_or(0),
-        "MemberCount" => metrics
+        member_count: metrics
             .get("member_count")
             .and_then(serde_json::Value::as_u64)
             .unwrap_or(0),
-        "RelayQueueDepth" => metrics
+        relay_queue_depth: metrics
             .get("relay_queue_depth")
             .and_then(serde_json::Value::as_u64)
             .unwrap_or(0),
-        "TimeOfDay" => metrics
+        time_of_day: metrics
             .get("time_of_day")
             .and_then(serde_json::Value::as_u64)
             .unwrap_or(0),
-        "SenderVelocity" => metrics
+        sender_velocity: metrics
             .get("sender_velocity")
             .and_then(serde_json::Value::as_u64)
             .unwrap_or(0),
-        "StorageUsage" => metrics
+        storage_usage: metrics
             .get("storage_usage")
             .and_then(serde_json::Value::as_u64)
             .unwrap_or(0),
-        _ => 0,
     }
-}
-
-/// Evaluates a pricing formula JSON value against observable metrics.
-///
-/// Mirrors `scp_core::economy::policy::evaluate_formula` exactly:
-/// - Starts with `base_cost`
-/// - Iterates `variables` (Linear / Step)
-/// - Applies `floor` and `cap`
-///
-/// Returns 0 on overflow (saturating).
-fn evaluate_pricing_formula(formula: &serde_json::Value, metrics: &serde_json::Value) -> u64 {
-    let base_cost = formula
-        .get("base_cost")
-        .and_then(serde_json::Value::as_u64)
-        .unwrap_or(0);
-
-    let mut cost = base_cost;
-
-    if let Some(variables) = formula
-        .get("variables")
-        .and_then(serde_json::Value::as_array)
-    {
-        for var in variables {
-            if let Some(linear) = var.get("Linear") {
-                // Linear: cost += (coefficient * metric_value) / COEFFICIENT_SCALE
-                let metric_name = linear
-                    .get("metric")
-                    .and_then(serde_json::Value::as_str)
-                    .unwrap_or("");
-                let coefficient = linear
-                    .get("coefficient")
-                    .and_then(serde_json::Value::as_i64)
-                    .unwrap_or(0);
-                let metric_value = resolve_metric(metric_name, metrics);
-
-                // Checked multiply to detect overflow, matching scp-core
-                if i64::try_from(metric_value).is_ok()
-                    && let Some(product) = coefficient.checked_mul(metric_value.cast_signed())
-                {
-                    let delta = product / COEFFICIENT_SCALE;
-                    if delta >= 0 {
-                        cost = cost.saturating_add(delta.cast_unsigned());
-                    } else {
-                        cost = cost.saturating_sub(delta.unsigned_abs());
-                    }
-                }
-                // On overflow, skip this variable (scp-core returns None
-                // for the whole formula, but WASM saturates per-variable)
-            } else if let Some(step) = var.get("Step") {
-                // Step: cost += amount for each threshold the metric exceeds
-                let metric_name = step
-                    .get("metric")
-                    .and_then(serde_json::Value::as_str)
-                    .unwrap_or("");
-                let metric_value = resolve_metric(metric_name, metrics);
-
-                if let Some(thresholds) =
-                    step.get("thresholds").and_then(serde_json::Value::as_array)
-                {
-                    for threshold_pair in thresholds {
-                        // Thresholds serialize as [u64, u64] tuples
-                        if let Some(arr) = threshold_pair.as_array() {
-                            let threshold =
-                                arr.first().and_then(serde_json::Value::as_u64).unwrap_or(0);
-                            let additional =
-                                arr.get(1).and_then(serde_json::Value::as_u64).unwrap_or(0);
-                            if metric_value >= threshold {
-                                cost = cost.saturating_add(additional);
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    // Apply floor
-    if let Some(floor) = formula.get("floor").and_then(serde_json::Value::as_u64)
-        && cost < floor
-    {
-        cost = floor;
-    }
-
-    // Apply cap
-    if let Some(cap) = formula.get("cap").and_then(serde_json::Value::as_u64)
-        && cost > cap
-    {
-        cost = cap;
-    }
-
-    cost
 }
 
 // ---------------------------------------------------------------------------
@@ -220,16 +127,19 @@ pub fn economy_estimate_cost(
                 .unwrap_or(0)
         };
 
-        // Evaluate formula if present, including variable components against
-        // metrics. Algorithm-identical to scp-core evaluate_formula.
+        // Evaluate formula if present — delegates to scp-protocol's typed
+        // evaluate_formula for algorithm-identical results with native.
         let formula_cost = policy
             .get("pricing_formula")
             .and_then(|f| {
                 if f.is_null() {
-                    None
-                } else {
-                    Some(evaluate_pricing_formula(f, &metrics))
+                    return None;
                 }
+                // Deserialize the pricing formula JSON into the typed struct.
+                let formula: PricingFormula = serde_json::from_value(f.clone()).ok()?;
+                let observable = metrics_from_json(&metrics);
+                // evaluate_formula returns Option<Amount>; None means overflow.
+                evaluate_formula(&formula, &observable).map(|amount| amount.value())
             })
             .unwrap_or(0);
 
