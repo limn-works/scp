@@ -2575,14 +2575,14 @@ pub fn template_get_params(template_id: String) -> Result<String, JsError> {
 /// Returns `JsError` if the JSON is malformed.
 #[wasm_bindgen(js_name = "validateAgainstTemplate")]
 pub fn validate_against_template(params_json: String) -> Result<Option<String>, JsError> {
-    let params: scp_protocol::context::params::ContextParams =
-        serde_json::from_str(&params_json).map_err(|e| {
-            ScpWasmError::Validation {
-                message: format!("invalid ContextParams JSON: {e}"),
-                code: "SCP-VALID-7001".to_owned(),
-            }
-            .into_js()
-        })?;
+    let params: scp_protocol::context::params::ContextParams = serde_json::from_str(&params_json)
+        .map_err(|e| {
+        ScpWasmError::Validation {
+            message: format!("invalid ContextParams JSON: {e}"),
+            code: "SCP-VALID-7001".to_owned(),
+        }
+        .into_js()
+    })?;
 
     match protocol_validate_against_template(&params) {
         Ok(()) => Ok(None),
@@ -2653,14 +2653,14 @@ pub fn evaluate_invitation(
 /// Returns `JsError` if the JSON is malformed.
 #[wasm_bindgen(js_name = "validateContextParams")]
 pub fn validate_context_params(params_json: String) -> Result<Option<String>, JsError> {
-    let params: scp_protocol::context::params::ContextParams =
-        serde_json::from_str(&params_json).map_err(|e| {
-            ScpWasmError::Validation {
-                message: format!("invalid ContextParams JSON: {e}"),
-                code: "SCP-VALID-7001".to_owned(),
-            }
-            .into_js()
-        })?;
+    let params: scp_protocol::context::params::ContextParams = serde_json::from_str(&params_json)
+        .map_err(|e| {
+        ScpWasmError::Validation {
+            message: format!("invalid ContextParams JSON: {e}"),
+            code: "SCP-VALID-7001".to_owned(),
+        }
+        .into_js()
+    })?;
 
     match protocol_validate_context_params(&params) {
         Ok(()) => Ok(None),

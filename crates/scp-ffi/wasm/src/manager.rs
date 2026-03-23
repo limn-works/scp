@@ -884,7 +884,7 @@ fn validate_mime_type_wasm(value: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// Validates a deploy_id using `scp_protocol::context::broadcast_content::validate_deploy_id`.
+/// Validates a `deploy_id` using `scp_protocol::context::broadcast_content::validate_deploy_id`.
 fn validate_deploy_id_wasm(deploy_id: &str) -> Result<(), String> {
     scp_protocol::context::broadcast_content::validate_deploy_id(deploy_id)
         .map_err(|e| e.to_string())
