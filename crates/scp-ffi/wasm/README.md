@@ -21,13 +21,7 @@ changes an algorithm, this crate must be updated in lockstep. See ADR-034.
 DashMap needed. Access follows the same `with_context(id, closure)` pattern as
 the other bridges.
 
-**Dual storage for events**: The event log uses two layers:
-1. `WasmEventLog` in `runtime.rs` -- Merkle tree of leaf hashes for
-   cryptographic proofs (inclusion/absence).
-2. `EVENT_METADATA` in `event_log.rs` -- full event metadata (type, actor,
-   timestamp, payload) for filtered queries.
-
-Both are keyed by context ID and written atomically by `append_event()`.
+**Event log**: Each context owns an `scp_event_log::EventLog` instance (shared implementation, not a WASM reimplementation). Events are appended via `append_unsigned_event` and proofs generated via `prove_inclusion`/`prove_absence`.
 
 **JS callback injection**: Browser-native APIs (WebCrypto, OPFS, IndexedDB) are
 not available as Rust crates. `JsKeyCustody` and `JsStorage` are extern types

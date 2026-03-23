@@ -122,11 +122,7 @@ WASM is single-threaded. The context registry uses `thread_local! { static CONTE
 
 ## Event Log — Shared Implementation
 
-The event log uses `scp_event_log::EventLog` directly (no WASM reimplementation). Merkle proofs use `scp_event_log::proof::{prove_inclusion, prove_absence, verify_inclusion}`. Tree operations use `scp_event_log::tree::{append_unsigned_event, event_count, root}`.
-
-Event metadata storage (`EVENT_METADATA` in `event_log.rs`) remains WASM-local: `thread_local! { RefCell<HashMap<String, Vec<EventMetadata>>> }` stores full event metadata (type, actor, timestamp, payload, sequence) for queries with filtering.
-
-Both are keyed by context ID. `append_event()` writes to both atomically. `remove_event_metadata()` should be called on context close.
+The event log uses `scp_event_log::EventLog` directly (no WASM reimplementation). Merkle proofs use `scp_event_log::proof::{prove_inclusion, prove_absence, verify_inclusion}`. Tree operations use `scp_event_log::tree::{append_unsigned_event, event_count, root}`. Each `PerContextState` owns an `EventLog` instance keyed by context ID.
 
 ## Identity — WASM-Local Registry
 
@@ -156,4 +152,4 @@ cargo check --target wasm32-unknown-unknown -p scp-ffi-wasm
 - `js_sys::Date::now()` returns milliseconds since epoch as `f64` — divide by 1000.0 for seconds. Do not use `std::time::SystemTime` (not available on wasm32).
 - `rand_core = { version = "0.6", features = ["getrandom"] }` provides `OsRng` for Ed25519 key generation. Works via `getrandom` 0.2 with `js` feature -> `crypto.getRandomValues`. Must match `ed25519-dalek`'s `rand_core` 0.6 version.
 - `zbase32_encode` is duplicated in `identity.rs` and `ucan.rs`. Extract to shared module if a third consumer appears.
-- `event_log.rs` `EVENT_METADATA` is separate from `runtime.rs` `CONTEXT_REGISTRY` — both must be cleaned up on context close. Call `remove_event_metadata(context_id)` alongside `remove_context(context_id)`.
+- Context close must clean up `CONTEXT_REGISTRY` in `runtime.rs`. Call `remove_context(context_id)` to release the `WasmContextRuntime` entry.
