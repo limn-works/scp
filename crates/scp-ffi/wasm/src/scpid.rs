@@ -26,7 +26,12 @@ use wasm_bindgen::prelude::*;
 use crate::error::ScpWasmError;
 
 // ---------------------------------------------------------------------------
-// Constants (must match scp-core/src/identity/scpid.rs)
+// Constants (must match scp-runtime/src/identity/scpid.rs)
+//
+// These are WASM-local copies because scp-runtime depends on tokio
+// (multi-thread) which is unavailable on wasm32-unknown-unknown. The
+// canonical definitions are in scp_runtime::identity::scpid — if those
+// change, these must be updated in lockstep.
 // ---------------------------------------------------------------------------
 
 /// Protocol version string for SCPID (§3.11.2).
