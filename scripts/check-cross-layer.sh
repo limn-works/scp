@@ -1,20 +1,20 @@
 #!/usr/bin/env bash
 # check-cross-layer.sh — CI gate ensuring new public functions in scp-protocol
-# or scp-runtime have corresponding FFI bridge changes.
+# or scp-runtime have corresponding FFI bridge EXPORTS.
 #
-# When a PR adds `pub fn` or `pub async fn` to crates/scp-protocol/src/ or
-# crates/scp-runtime/src/, the same PR must also touch at least one file
-# in crates/scp-ffi/. This prevents protocol logic from being built without
-# bridge exports — the root cause of unwired code.
+# For each new `pub fn X` added to scp-protocol/scp-runtime, the script checks
+# that the SAME diff also adds a corresponding export in scp-ffi/ containing
+# the function name (or a known alias like `py_X`). Just touching an
+# unrelated FFI file is NOT sufficient.
 #
 # Exemptions:
-#   - pub(crate) functions (not externally visible)
+#   - pub(crate) / pub(super) functions (not externally visible)
 #   - Functions in tests/ or examples/ directories
 #   - Functions inside #[cfg(test)] modules
 #   - PR body contains [cross-layer-exempt] with justification
 #
-# Exit 0: no new pub fns, or FFI files touched, or exempt
-# Exit 1: new pub fns without FFI changes and no exemption
+# Exit 0: no new pub fns, or all have matching FFI exports, or exempt
+# Exit 1: new pub fns without corresponding FFI exports
 #
 # Usage:
 #   bash scripts/check-cross-layer.sh [diff-range]
@@ -42,22 +42,17 @@ else
 fi
 
 # ---------------------------------------------------------------------------
-# Collect new public function lines from the diff
+# Collect new public function names from scp-protocol/scp-runtime
 # ---------------------------------------------------------------------------
-# We look at added lines (starting with +) in files under scp-protocol/src/ or
-# scp-runtime/src/, excluding tests/, examples/, and pub(crate).
-
 NEW_PUB_FNS=()
+NEW_PUB_FN_NAMES=()
 
-# Get the unified diff for core/runtime source files only.
-# --diff-filter=ACMR: only Added, Copied, Modified, Renamed files.
-# Use :(glob) prefix for recursive glob matching in git pathspecs.
-DIFF_OUTPUT=$(git diff "$DIFF_RANGE" --unified=0 --diff-filter=ACMR -- \
+CORE_DIFF=$(git diff "$DIFF_RANGE" --unified=0 --diff-filter=ACMR -- \
     ':(glob)crates/scp-protocol/src/**/*.rs' \
     ':(glob)crates/scp-runtime/src/**/*.rs' \
     2>/dev/null || true)
 
-if [[ -z "$DIFF_OUTPUT" ]]; then
+if [[ -z "$CORE_DIFF" ]]; then
     echo "No changes to scp-protocol/src/ or scp-runtime/src/ detected."
     echo "PASSED: Cross-layer check not applicable."
     exit 0
@@ -67,14 +62,9 @@ CURRENT_FILE=""
 IN_CFG_TEST=0
 
 while IFS= read -r line; do
-    # Track which file we're in
-    if [[ "$line" =~ ^diff\ --git\ a/(.*) ]]; then
-        CURRENT_FILE="${BASH_REMATCH[1]}"
-        CURRENT_FILE="${CURRENT_FILE%% *}"
-        # Remove the b/ prefix from the second path
-        if [[ "$line" =~ b/(.*) ]]; then
-            CURRENT_FILE="${BASH_REMATCH[1]}"
-        fi
+    # Track which file we're in — parse both paths from git diff header
+    if [[ "$line" =~ ^diff\ --git\ a/([^\ ]+)\ b/(.+)$ ]]; then
+        CURRENT_FILE="${BASH_REMATCH[2]}"
         IN_CFG_TEST=0
         continue
     fi
@@ -84,56 +74,39 @@ while IFS= read -r line; do
         */tests/*|*/examples/*) continue ;;
     esac
 
-    # Hunk headers: only use cfg(test) literal in context to detect test modules.
-    # Git hunk headers show the nearest enclosing scope, which can be misleading
-    # (e.g., code appended after mod tests shows "mod tests" in the context).
-    # Only trust explicit #[cfg(test)] in the context, not bare "mod tests".
+    # Hunk headers: detect #[cfg(test)] in context
     if [[ "$line" =~ ^@@.*@@ ]]; then
         if [[ "$line" == *"cfg(test)"* ]]; then
             IN_CFG_TEST=1
         else
-            # New hunk not inside cfg(test) — reset
             IN_CFG_TEST=0
         fi
         continue
     fi
 
-    # Track #[cfg(test)] in added lines — everything after this in the
-    # current hunk is test code
+    # Track #[cfg(test)] in added lines
     if [[ "$line" == "+"*"#[cfg(test)]"* ]]; then
         IN_CFG_TEST=1
         continue
     fi
 
     # Only look at added lines
-    if [[ "$line" != "+"* ]]; then
-        continue
-    fi
+    [[ "$line" == "+"* ]] || continue
+    [[ $IN_CFG_TEST -eq 0 ]] || continue
 
-    # Skip if inside a #[cfg(test)] module
-    if [[ $IN_CFG_TEST -eq 1 ]]; then
-        continue
-    fi
-
-    # Strip the leading + for analysis
     content="${line:1}"
 
-    # Skip pub(crate) — not externally visible
-    if [[ "$content" == *"pub(crate)"* ]]; then
-        continue
-    fi
-
-    # Skip pub(super) — not externally visible
-    if [[ "$content" == *"pub(super)"* ]]; then
-        continue
-    fi
+    # Skip restricted visibility
+    [[ "$content" != *"pub(crate)"* ]] || continue
+    [[ "$content" != *"pub(super)"* ]] || continue
 
     # Match pub fn or pub async fn declarations
     if [[ "$content" =~ pub[[:space:]]+(async[[:space:]]+)?fn[[:space:]]+([a-zA-Z_][a-zA-Z0-9_]*) ]]; then
         fn_name="${BASH_REMATCH[2]}"
         NEW_PUB_FNS+=("${CURRENT_FILE}::${fn_name}")
+        NEW_PUB_FN_NAMES+=("${fn_name}")
     fi
-done <<< "$DIFF_OUTPUT"
+done <<< "$CORE_DIFF"
 
 # ---------------------------------------------------------------------------
 # No new public functions — nothing to check
@@ -145,36 +118,92 @@ if [[ ${#NEW_PUB_FNS[@]} -eq 0 ]]; then
 fi
 
 # ---------------------------------------------------------------------------
-# Check if FFI bridge files were also touched
+# Get the FFI diff (added lines only)
 # ---------------------------------------------------------------------------
-FFI_CHANGED=$(git diff "$DIFF_RANGE" --name-only --diff-filter=ACMR -- \
-    'crates/scp-ffi/' 2>/dev/null || true)
+FFI_DIFF=$(git diff "$DIFF_RANGE" --unified=0 --diff-filter=ACMR -- \
+    ':(glob)crates/scp-ffi/**/*.rs' \
+    2>/dev/null || true)
 
-if [[ -n "$FFI_CHANGED" ]]; then
+# Collect all added lines from FFI diff into one string for searching
+FFI_ADDED=""
+if [[ -n "$FFI_DIFF" ]]; then
+    FFI_ADDED=$(echo "$FFI_DIFF" | grep '^+' | grep -v '^+++' || true)
+fi
+
+# ---------------------------------------------------------------------------
+# For each new pub fn, check if the FFI diff contains a matching export
+# ---------------------------------------------------------------------------
+UNMATCHED=()
+
+for i in "${!NEW_PUB_FNS[@]}"; do
+    fn_name="${NEW_PUB_FN_NAMES[$i]}"
+    fn_full="${NEW_PUB_FNS[$i]}"
+
+    # Check for the function name or common FFI aliases in FFI added lines
+    # Patterns: exact name, py_ prefix (PyO3), snake_case, camelCase
+    found=0
+
+    if [[ -n "$FFI_ADDED" ]]; then
+        # Exact name match (word boundary — prevents "send" matching "send_message")
+        if echo "$FFI_ADDED" | grep -qw "$fn_name"; then
+            found=1
+        fi
+
+        # PyO3 py_ prefix
+        if [[ $found -eq 0 ]] && echo "$FFI_ADDED" | grep -qw "py_${fn_name}"; then
+            found=1
+        fi
+
+        # camelCase conversion: foo_bar_baz → fooBarBaz
+        # Use perl (not sed) — BSD sed on macOS doesn't support \U
+        camel=$(echo "$fn_name" | perl -pe 's/_([a-z])/uc($1)/ge')
+        if [[ $found -eq 0 ]] && echo "$FFI_ADDED" | grep -qw "$camel"; then
+            found=1
+        fi
+    fi
+
+    if [[ $found -eq 0 ]]; then
+        UNMATCHED+=("$fn_full")
+    fi
+done
+
+# ---------------------------------------------------------------------------
+# All matched — success
+# ---------------------------------------------------------------------------
+if [[ ${#UNMATCHED[@]} -eq 0 ]]; then
     echo "Found ${#NEW_PUB_FNS[@]} new public function(s) in scp-protocol/scp-runtime."
-    echo "FFI bridge files also changed — cross-layer requirement satisfied."
+    echo "All have corresponding FFI bridge exports."
     echo ""
-    echo "New public functions:"
+    echo "Matched functions:"
     for fn in "${NEW_PUB_FNS[@]}"; do
-        echo "  + $fn"
+        echo "  ✓ $fn"
     done
-    echo ""
-    echo "FFI files changed:"
-    echo "$FFI_CHANGED" | while IFS= read -r f; do echo "  ~ $f"; done
     echo ""
     echo "PASSED: Cross-layer check satisfied."
     exit 0
 fi
 
 # ---------------------------------------------------------------------------
-# New pub fns exist but no FFI changes — check for exemption
+# Some unmatched — check for exemption
 # ---------------------------------------------------------------------------
 echo "" >&2
-echo "New public functions added to scp-protocol/scp-runtime WITHOUT FFI bridge changes:" >&2
+echo "New public functions in scp-protocol/scp-runtime WITHOUT matching FFI bridge exports:" >&2
 echo "" >&2
-for fn in "${NEW_PUB_FNS[@]}"; do
-    echo "  + $fn" >&2
+for fn in "${UNMATCHED[@]}"; do
+    echo "  ✗ $fn" >&2
 done
+echo "" >&2
+
+# Show which functions DID match for context
+MATCHED_COUNT=$(( ${#NEW_PUB_FNS[@]} - ${#UNMATCHED[@]} ))
+if [[ $MATCHED_COUNT -gt 0 ]]; then
+    echo "($MATCHED_COUNT other function(s) matched FFI exports)" >&2
+    echo "" >&2
+fi
+
+echo "For each unmatched function, either:" >&2
+echo "  1. Add the FFI bridge export in this PR" >&2
+echo "  2. Mark the PR with [cross-layer-exempt] and explain why" >&2
 echo "" >&2
 
 # Check for [cross-layer-exempt] in PR body
@@ -186,15 +215,11 @@ elif [[ -n "${PR_BODY_FILE:-}" && -f "${PR_BODY_FILE:-}" ]]; then
 fi
 
 if [[ "$PR_TEXT" == *"[cross-layer-exempt]"* ]]; then
-    echo "WARNING: New public functions added without FFI bridge changes." >&2
-    echo "PR is marked [cross-layer-exempt] — proceeding with warning." >&2
+    echo "WARNING: ${#UNMATCHED[@]} function(s) unmatched but PR is [cross-layer-exempt]." >&2
     echo "" >&2
     echo "PASSED (exempt): Cross-layer check bypassed via [cross-layer-exempt]."
     exit 0
 fi
 
-echo "New public functions added to scp-protocol/scp-runtime without FFI bridge changes." >&2
-echo "Either add bridge exports or mark the PR with [cross-layer-exempt] and a justification." >&2
-echo "" >&2
-echo "FAILED: Cross-layer check failed."
+echo "FAILED: ${#UNMATCHED[@]} new public function(s) without FFI bridge exports."
 exit 1
