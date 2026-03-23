@@ -296,18 +296,100 @@ fn execute_add_member_calls_generate_access_key() {
 #[test]
 fn pipeline_active_assertions_never_decrease() {
     let source = include_str!("pipeline_wiring.rs");
-    // Count #[test] attributes, subtract #[ignore] and meta-tests.
-    // Using #[test] count avoids phantom matches from assert!( in
-    // comments, string literals, and meta-test self-references.
-    let total_tests = source.matches("#[test]").count();
+    // Count lines that are exactly `#[test]` (after trim) — this excludes
+    // #[test] appearing in comments, string literals, or this counting code.
+    let total_tests = source
+        .lines()
+        .filter(|line| line.trim() == "#[test]")
+        .count();
     let ignored = source.matches("#[ignore = \"").count();
-    let meta_tests = 2; // this test + claude_md_enforcement_sections_present
+    let meta_tests = 3; // this test + claude_md_enforcement_sections_present + no_stale_ignores
     let active = total_tests - ignored - meta_tests;
     assert!(
         active >= MIN_ACTIVE_PIPELINE_ASSERTIONS,
         "Active pipeline assertions ({active}) dropped below minimum \
          ({MIN_ACTIVE_PIPELINE_ASSERTIONS}). Do not weaken the test suite — \
          fix the code instead."
+    );
+}
+
+/// Detects stale `#[ignore]` attributes. If a wiring PR lands but forgets
+/// to remove the `#[ignore]`, this test catches it by running the same check
+/// the ignored test would run. A passing check = stale ignore = CI failure.
+#[test]
+fn no_stale_ignores() {
+    let mut stale = vec![];
+
+    // Envelope (#1534)
+    if fn_body_contains(PROVIDER_SRC, "encrypt_message", "seal_envelope")
+        || fn_body_contains(MANAGER_SRC, "send_message", "seal_envelope")
+    {
+        stale.push("encrypt_path_calls_seal_envelope (#1534)");
+    }
+    if fn_body_contains(PROVIDER_SRC, "decrypt_message", "open_envelope")
+        || fn_body_contains(MANAGER_SRC, "deliver_incoming", "open_envelope")
+    {
+        stale.push("decrypt_path_calls_open_envelope (#1534)");
+    }
+    if fn_body_contains(PROVIDER_SRC, "encrypt_message", "create_inner_envelope")
+        || fn_body_contains(MANAGER_SRC, "send_message", "create_inner_envelope")
+    {
+        stale.push("encrypt_path_calls_create_inner_envelope (#1534)");
+    }
+    if fn_body_contains(PROVIDER_SRC, "encrypt_message", "pad_to_bucket")
+        || fn_body_contains(MANAGER_SRC, "send_message", "pad_to_bucket")
+    {
+        stale.push("encrypt_path_calls_pad_to_bucket (#1534)");
+    }
+    if fn_body_contains(PROVIDER_SRC, "decrypt_message", "strip_padding")
+        || fn_body_contains(MANAGER_SRC, "deliver_incoming", "strip_padding")
+    {
+        stale.push("decrypt_path_calls_strip_padding (#1534)");
+    }
+
+    // Signature verification (#1547)
+    if fn_body_contains(PROVIDER_SRC, "decrypt_message", "verify_inner_signature")
+        || fn_body_contains(MANAGER_SRC, "deliver_incoming", "verify_inner_signature")
+    {
+        stale.push("decrypt_path_calls_verify_inner_signature (#1547)");
+    }
+
+    // Access keys (#1529)
+    if fn_body_contains(PROVIDER_SRC, "encrypt_message", "wrap_content")
+        || fn_body_contains(MANAGER_SRC, "send_message", "wrap_content")
+    {
+        stale.push("encrypt_path_calls_wrap_content (#1529)");
+    }
+    if fn_body_contains(PROVIDER_SRC, "decrypt_message", "unwrap_content")
+        || fn_body_contains(MANAGER_SRC, "deliver_incoming", "unwrap_content")
+    {
+        stale.push("decrypt_path_calls_unwrap_content (#1529)");
+    }
+    if fn_body_contains(MANAGER_SRC, "execute_add_member", "generate_access_key") {
+        stale.push("execute_add_member_calls_generate_access_key (#1529)");
+    }
+
+    // Provenance (#1536)
+    if fn_body_contains(PROVIDER_SRC, "encrypt_message", "attach_provenance")
+        || fn_body_contains(MANAGER_SRC, "send_message", "attach_provenance")
+    {
+        stale.push("encrypt_path_calls_attach_provenance (#1536)");
+    }
+
+    // Sender key rotation (#1541)
+    if fn_body_contains(
+        MANAGER_SRC,
+        "execute_remove_member",
+        "remove_member_sender_key",
+    ) {
+        stale.push("execute_remove_member_calls_remove_member_sender_key (#1541)");
+    }
+
+    assert!(
+        stale.is_empty(),
+        "Stale #[ignore] — these tests would pass but are still ignored. \
+         Remove the #[ignore] attribute and bump MIN_ACTIVE_PIPELINE_ASSERTIONS:\n  {}",
+        stale.join("\n  ")
     );
 }
 
