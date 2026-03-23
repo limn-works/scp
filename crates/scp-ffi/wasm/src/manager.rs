@@ -31,10 +31,11 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use base64::Engine as _;
 
 use crate::error::ScpWasmError;
-use crate::runtime::{
-    ToolRegistration, ToolRegistry, WasmEventLog, prove_absence, prove_inclusion,
-    validate_value_against_schema, verify_inclusion,
-};
+use crate::runtime::{ToolRegistration, ToolRegistry, validate_value_against_schema};
+
+use scp_event_log::proof::{prove_absence, prove_inclusion, verify_inclusion, Direction};
+use scp_event_log::tree::{append_unsigned_event, event_count, root};
+use scp_event_log::{DID, Event, EventLog, EventPayload, EventType};
 
 /// SCP protocol version for WASM bridge (§13.2). Must match scp-core's
 /// `SCP_PROTOCOL_VERSION`. Encoded as `(major << 8) | minor`.
@@ -415,8 +416,8 @@ struct PerContextState {
     tool_registry: ToolRegistry,
     /// Registered tool handlers keyed by tool ID.
     tool_handlers: ToolHandlerMap,
-    /// Event log (Merkle tree).
-    event_log: WasmEventLog,
+    /// Event log (Merkle tree) — canonical `scp-event-log` implementation.
+    event_log: EventLog,
     /// UCAN revocation set (token CIDs). Capped at [`WASM_REVOKED_TOKENS_CAP`].
     revoked_tokens: HashSet<String>,
     /// UCAN nonce replay tracker. Stores `(nonce, insertion_timestamp_ms)`.
@@ -548,6 +549,41 @@ impl PerContextState {
             self.event_buffer.pop_front();
         }
         self.event_buffer.push_back(event);
+    }
+
+    /// Appends a protocol event to the context's event log.
+    ///
+    /// Constructs a full [`Event`] with the correct sequence number and
+    /// `prev_hash` chain link, then delegates to
+    /// [`scp_event_log::tree::append_unsigned_event`]. The event carries an
+    /// empty signature (WASM bridge limitation — see `append_unsigned_event`
+    /// documentation for the security model).
+    ///
+    /// This helper replaces the old `WasmEventLog::append_event(tag, did, payload)`
+    /// API with the canonical scp-event-log implementation.
+    fn append_log_event(&mut self, event_type: EventType, actor_did: &str, payload: &[u8]) {
+        let sequence = event_count(&self.event_log);
+        let prev_hash = if self.event_log.leaves().is_empty() {
+            scp_event_log::tree::GENESIS_PREV_HASH
+        } else {
+            self.event_log.leaves()[self.event_log.leaves().len() - 1]
+        };
+        let event = Event {
+            event_type,
+            actor_did: DID::from(actor_did.to_owned()),
+            timestamp: crate::time::now_secs(),
+            sequence,
+            payload: EventPayload {
+                data: payload.to_vec(),
+            },
+            prev_hash,
+            signature: vec![],
+        };
+        // append_unsigned_event validates sequence + prev_hash. Since we
+        // compute both from the current log state, this should never fail.
+        // If it does, silently drop (matching old WasmEventLog behavior which
+        // never returned errors from append_event).
+        let _ = append_unsigned_event(&mut self.event_log, &event);
     }
 
     /// Returns `true` if the member has the given capability string.
@@ -1215,7 +1251,7 @@ impl WasmContextManager {
             economic_policy,
             tool_registry: ToolRegistry::new(),
             tool_handlers: HashMap::new(),
-            event_log: WasmEventLog::new(context_id.to_owned()),
+            event_log: EventLog::new(context_id.to_owned()),
             revoked_tokens: HashSet::new(),
             seen_nonces: HashMap::new(),
             members,
@@ -1242,11 +1278,7 @@ impl WasmContextManager {
         // Append ContextCreated event to event log.
         // Safe: we just inserted the context above, so the key is present.
         if let Some(ctx) = self.contexts.get_mut(context_id) {
-            ctx.event_log.append_event(
-                crate::runtime::wasm_event_type_tag("ContextCreated"),
-                creator_did,
-                b"",
-            );
+            ctx.append_log_event(EventType::ContextCreated, creator_did, b"");
         }
 
         Ok(())
@@ -1285,11 +1317,7 @@ impl WasmContextManager {
             role_name: "member".to_owned(),
         });
 
-        ctx.event_log.append_event(
-            crate::runtime::wasm_event_type_tag("MemberJoined"),
-            member_did,
-            b"",
-        );
+        ctx.append_log_event(EventType::MemberJoined, member_did, b"");
 
         Ok(())
     }
@@ -1329,11 +1357,7 @@ impl WasmContextManager {
             member_did: member_did.to_owned(),
         });
 
-        ctx.event_log.append_event(
-            crate::runtime::wasm_event_type_tag("MemberLeft"),
-            member_did,
-            b"",
-        );
+        ctx.append_log_event(EventType::MemberLeft, member_did, b"");
 
         // Auto-close if no members remain.
         if ctx.members.is_empty() {
@@ -1409,11 +1433,7 @@ impl WasmContextManager {
             payload_base64: recorded_payload.clone(),
         });
 
-        ctx.event_log.append_event(
-            crate::runtime::wasm_event_type_tag("MessageSent"),
-            sender_did,
-            recorded_payload.as_bytes(),
-        );
+        ctx.append_log_event(EventType::MessageSent, sender_did, recorded_payload.as_bytes());
 
         Ok(())
     }
@@ -1455,11 +1475,7 @@ impl WasmContextManager {
             initiator_did: initiator_did.to_owned(),
         });
 
-        ctx.event_log.append_event(
-            crate::runtime::wasm_event_type_tag("ContextClosing"),
-            initiator_did,
-            b"",
-        );
+        ctx.append_log_event(EventType::ContextClosing, initiator_did, b"");
 
         Ok(())
     }
@@ -1632,7 +1648,7 @@ impl WasmContextManager {
     pub fn event_log_leaf_count(&self, context_id: &str) -> Option<usize> {
         self.contexts
             .get(context_id)
-            .map(|ctx| ctx.event_log.leaf_count())
+            .map(|ctx| ctx.event_log.leaves().len())
     }
 
     /// Appends a provenance event to the event log for the given context.
@@ -1647,7 +1663,7 @@ impl WasmContextManager {
         &mut self,
         context_id: &str,
         actor_did: &str,
-        event_type_tag: u16,
+        event_type: EventType,
         prov_hash: &[u8],
     ) -> Result<(), ScpWasmError> {
         let ctx = self
@@ -1658,8 +1674,7 @@ impl WasmContextManager {
                 code: "SCP-CTX-2060".to_owned(),
             })?;
 
-        ctx.event_log
-            .append_event(event_type_tag, actor_did, prov_hash);
+        ctx.append_log_event(event_type, actor_did, prov_hash);
 
         Ok(())
     }
@@ -1702,11 +1717,7 @@ impl WasmContextManager {
             })?;
 
         let actor = ctx.creator_did.clone();
-        ctx.event_log.append_event(
-            crate::runtime::wasm_event_type_tag("ToolRegistered"),
-            &actor,
-            tool_id.as_bytes(),
-        );
+        ctx.append_log_event(EventType::ToolRegistered, &actor, tool_id.as_bytes());
 
         Ok(tool_id)
     }
@@ -1808,11 +1819,7 @@ impl WasmContextManager {
             })
         };
 
-        ctx.event_log.append_event(
-            crate::runtime::wasm_event_type_tag("ToolInvoked"),
-            identity_did,
-            tool_id.as_bytes(),
-        );
+        ctx.append_log_event(EventType::ToolInvoked, identity_did, tool_id.as_bytes());
 
         Ok(result)
     }
@@ -2154,8 +2161,9 @@ impl WasmContextManager {
     pub fn event_log_query(&self, context_id: &str) -> Result<(u64, String), ScpWasmError> {
         let ctx = self.require_context(context_id)?;
 
-        let count = ctx.event_log.event_count();
-        let root = crate::runtime::encode_hex(&ctx.event_log.root());
+        let count = event_count(&ctx.event_log);
+        let root_hash = root(&ctx.event_log);
+        let root = crate::runtime::encode_hex(&root_hash);
 
         Ok((count, root))
     }
@@ -2187,8 +2195,8 @@ impl WasmContextManager {
                 serde_json::json!({
                     "siblingHash": crate::runtime::encode_hex(&step.sibling_hash),
                     "direction": match step.direction {
-                        crate::runtime::Direction::Left => "left",
-                        crate::runtime::Direction::Right => "right",
+                        Direction::Left => "left",
+                        Direction::Right => "right",
                     },
                 })
             })
@@ -2338,11 +2346,7 @@ impl WasmContextManager {
 
         ctx.revoked_tokens.insert(token_cid.to_owned());
 
-        ctx.event_log.append_event(
-            crate::runtime::wasm_event_type_tag("UcanRevoked"),
-            revoker_did,
-            token_cid.as_bytes(),
-        );
+        ctx.append_log_event(EventType::TokenRevoked, revoker_did, token_cid.as_bytes());
 
         Ok(())
     }
@@ -2485,8 +2489,8 @@ impl WasmContextManager {
                 action_type,
                 proposal_id: proposal_id.to_owned(),
             });
-            ctx.event_log.append_event(
-                crate::runtime::wasm_event_type_tag("GovernanceExecuted"),
+            ctx.append_log_event(
+                EventType::GovernanceActionExecuted,
                 initiator_did,
                 proposal_id.as_bytes(),
             );
@@ -3375,8 +3379,8 @@ impl WasmContextManager {
             action_type: "ProposalCreated".to_owned(),
             proposal_id: pid.clone(),
         });
-        ctx.event_log.append_event(
-            crate::runtime::wasm_event_type_tag("GovernanceProposalCreated"),
+        ctx.append_log_event(
+            EventType::GovernanceProposalCreated,
             proposer_did,
             proposal_id.as_bytes(),
         );
@@ -3446,42 +3450,41 @@ impl WasmContextManager {
         };
 
         let ctx = self.require_active_context_mut(context_id)?;
-        let proposal =
-            ctx.pending_proposals
-                .get_mut(proposal_id)
-                .ok_or_else(|| ScpWasmError::Context {
-                    message: format!("proposal {proposal_id} not found"),
+
+        let meets_quorum = {
+            let proposal =
+                ctx.pending_proposals
+                    .get_mut(proposal_id)
+                    .ok_or_else(|| ScpWasmError::Context {
+                        message: format!("proposal {proposal_id} not found"),
+                        code: "SCP-CTX-2042".to_owned(),
+                    })?;
+
+            if proposal.voting_deadline_ms <= now {
+                return Err(ScpWasmError::Context {
+                    message: "proposal voting deadline has expired".to_owned(),
                     code: "SCP-CTX-2042".to_owned(),
-                })?;
+                });
+            }
 
-        if proposal.voting_deadline_ms <= now {
-            return Err(ScpWasmError::Context {
-                message: "proposal voting deadline has expired".to_owned(),
-                code: "SCP-CTX-2042".to_owned(),
-            });
-        }
+            // Check for duplicate vote.
+            if proposal.approvals.iter().any(|(d, _)| d == voter_did)
+                || proposal.rejections.iter().any(|(d, _)| d == voter_did)
+            {
+                return Err(ScpWasmError::Permission {
+                    message: format!("member {voter_did} has already voted on this proposal"),
+                    code: "SCP-CTX-2042".to_owned(),
+                });
+            }
 
-        // Check for duplicate vote.
-        if proposal.approvals.iter().any(|(d, _)| d == voter_did)
-            || proposal.rejections.iter().any(|(d, _)| d == voter_did)
-        {
-            return Err(ScpWasmError::Permission {
-                message: format!("member {voter_did} has already voted on this proposal"),
-                code: "SCP-CTX-2042".to_owned(),
-            });
-        }
+            #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
+            let vote_ts = (crate::time::now_ms() / 1000.0) as u64;
+            proposal.approvals.push((voter_did.to_owned(), vote_ts));
+            proposal.approvals.len() >= required
+        };
 
-        #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
-        let vote_ts = (crate::time::now_ms() / 1000.0) as u64;
-        proposal.approvals.push((voter_did.to_owned(), vote_ts));
+        ctx.append_log_event(EventType::GovernanceVoteCast, voter_did, proposal_id.as_bytes());
 
-        ctx.event_log.append_event(
-            crate::runtime::wasm_event_type_tag("GovernanceVoteCast"),
-            voter_did,
-            proposal_id.as_bytes(),
-        );
-
-        let meets_quorum = proposal.approvals.len() >= required;
         let pid = proposal_id.to_owned();
 
         if meets_quorum {
@@ -3540,43 +3543,40 @@ impl WasmContextManager {
         };
 
         let ctx = self.require_active_context_mut(context_id)?;
-        let proposal =
-            ctx.pending_proposals
-                .get_mut(proposal_id)
-                .ok_or_else(|| ScpWasmError::Context {
-                    message: format!("proposal {proposal_id} not found"),
+
+        let remaining_possible_approvals = {
+            let proposal =
+                ctx.pending_proposals
+                    .get_mut(proposal_id)
+                    .ok_or_else(|| ScpWasmError::Context {
+                        message: format!("proposal {proposal_id} not found"),
+                        code: "SCP-CTX-2043".to_owned(),
+                    })?;
+
+            if proposal.voting_deadline_ms <= now {
+                return Err(ScpWasmError::Context {
+                    message: "proposal voting deadline has expired".to_owned(),
                     code: "SCP-CTX-2043".to_owned(),
-                })?;
+                });
+            }
 
-        if proposal.voting_deadline_ms <= now {
-            return Err(ScpWasmError::Context {
-                message: "proposal voting deadline has expired".to_owned(),
-                code: "SCP-CTX-2043".to_owned(),
-            });
-        }
+            if proposal.approvals.iter().any(|(d, _)| d == voter_did)
+                || proposal.rejections.iter().any(|(d, _)| d == voter_did)
+            {
+                return Err(ScpWasmError::Permission {
+                    message: format!("member {voter_did} has already voted on this proposal"),
+                    code: "SCP-CTX-2043".to_owned(),
+                });
+            }
 
-        if proposal.approvals.iter().any(|(d, _)| d == voter_did)
-            || proposal.rejections.iter().any(|(d, _)| d == voter_did)
-        {
-            return Err(ScpWasmError::Permission {
-                message: format!("member {voter_did} has already voted on this proposal"),
-                code: "SCP-CTX-2043".to_owned(),
-            });
-        }
+            #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
+            let vote_ts = (crate::time::now_ms() / 1000.0) as u64;
+            proposal.rejections.push((voter_did.to_owned(), vote_ts));
+            total.saturating_sub(proposal.approvals.len() + proposal.rejections.len())
+        };
 
-        #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
-        let vote_ts = (crate::time::now_ms() / 1000.0) as u64;
-        proposal.rejections.push((voter_did.to_owned(), vote_ts));
+        ctx.append_log_event(EventType::GovernanceVoteCast, voter_did, proposal_id.as_bytes());
 
-        ctx.event_log.append_event(
-            crate::runtime::wasm_event_type_tag("GovernanceVoteCast"),
-            voter_did,
-            proposal_id.as_bytes(),
-        );
-
-        // Check if enough rejections to make approval impossible.
-        let remaining_possible_approvals =
-            total.saturating_sub(proposal.approvals.len() + proposal.rejections.len());
         let can_still_reach_quorum = {
             let ctx2 = self.require_active_context_mut(context_id)?;
             let (req, _) = Self::governance_quorum(ctx2);
@@ -3633,8 +3633,8 @@ impl WasmContextManager {
             });
         }
 
-        ctx.event_log.append_event(
-            crate::runtime::wasm_event_type_tag("GovernanceVoteWithdrawn"),
+        ctx.append_log_event(
+            EventType::GovernanceVoteWithdrawn,
             voter_did,
             proposal_id.as_bytes(),
         );
@@ -3844,11 +3844,7 @@ impl WasmContextManager {
             payload_base64: payload_base64.to_owned(),
         });
 
-        ctx.event_log.append_event(
-            crate::runtime::wasm_event_type_tag("MessageSent"),
-            author_did,
-            payload_base64.as_bytes(),
-        );
+        ctx.append_log_event(EventType::MessageSent, author_did, payload_base64.as_bytes());
 
         Ok(())
     }
@@ -4359,11 +4355,7 @@ impl WasmContextManager {
         "expired".clone_into(&mut ctx.state);
         ctx.push_event(WasmContextEvent::Expired);
 
-        ctx.event_log.append_event(
-            crate::runtime::wasm_event_type_tag("ContextExpired"),
-            "", // System event — no actor.
-            b"",
-        );
+        ctx.append_log_event(EventType::ContextExpired, "", b"");
 
         Ok(())
     }
@@ -4844,7 +4836,7 @@ impl WasmContextManager {
             economic_policy: snap.economic_policy.clone(),
             tool_registry: ToolRegistry::new(),
             tool_handlers: HashMap::new(),
-            event_log: WasmEventLog::new(context_id.clone()),
+            event_log: EventLog::new(context_id.clone()),
             revoked_tokens: snap.revoked_tokens.iter().cloned().collect(),
             seen_nonces: {
                 let now = crate::time::now_ms();
@@ -4924,11 +4916,7 @@ impl WasmContextManager {
         "closed".clone_into(&mut ctx.state);
         ctx.broadcast = None;
 
-        ctx.event_log.append_event(
-            crate::runtime::wasm_event_type_tag("ContextClosed"),
-            "system",
-            b"",
-        );
+        ctx.append_log_event(EventType::ContextClosed, "system", b"");
 
         Ok(())
     }
@@ -5181,9 +5169,8 @@ struct WasmExportBroadcast {
 // Helpers
 // ---------------------------------------------------------------------------
 
-// `compute_event_hash` replaced by `WasmEventLog::append_event` which uses
-// the canonical hash format matching native `compute_event_canonical_hash`.
-// See `crate::runtime::compute_canonical_event_hash`.
+// Event hashing delegated to `scp_event_log::tree::append_unsigned_event`
+// which uses the canonical hash format via `rmp_serde` serialization.
 
 // ---------------------------------------------------------------------------
 // Tests
@@ -5693,7 +5680,7 @@ mod tests {
 
     // The following tests validate integration behavior (create_context
     // validates minProtocolVersion, metadata surfaces it). They cannot run on
-    // native targets because WasmEventLog::append_event calls
+    // native targets because PerContextState::append_log_event calls
     // time::now_ms() which requires a WASM runtime. Coverage is provided by:
     // - The parse_and_check_* tests above (unit tests, no WASM runtime needed).
     // - The scp-core wasm_conformance tests (SCP_PROTOCOL_VERSION sync).
@@ -6010,7 +5997,7 @@ mod tests {
             economic_policy: None,
             tool_registry: ToolRegistry::new(),
             tool_handlers: HashMap::new(),
-            event_log: WasmEventLog::new(context_id.to_owned()),
+            event_log: EventLog::new(context_id.to_owned()),
             revoked_tokens: HashSet::new(),
             seen_nonces: HashMap::new(),
             members,
@@ -6115,7 +6102,7 @@ mod tests {
             economic_policy: None,
             tool_registry: ToolRegistry::new(),
             tool_handlers: HashMap::new(),
-            event_log: WasmEventLog::new(context_id.to_owned()),
+            event_log: EventLog::new(context_id.to_owned()),
             revoked_tokens: revoked,
             seen_nonces: HashMap::new(),
             members,

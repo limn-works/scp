@@ -411,7 +411,7 @@ pub fn provenance_attach(
         mgr.append_provenance_event(
             &source_context_id,
             &actor_did,
-            crate::runtime::wasm_event_type_tag("ProvenanceAttached"),
+            scp_event_log::EventType::ProvenanceAttached,
             &prov_hash,
         )
     });
@@ -421,7 +421,7 @@ pub fn provenance_attach(
         mgr.append_provenance_event(
             &target_context_id,
             &actor_did,
-            crate::runtime::wasm_event_type_tag("ProvenanceReceived"),
+            scp_event_log::EventType::ProvenanceReceived,
             &prov_hash,
         )
     });
