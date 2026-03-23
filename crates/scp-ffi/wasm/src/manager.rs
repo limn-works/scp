@@ -857,16 +857,12 @@ const MAX_BATCH_ASSETS: usize = 10_000;
 /// Algorithm-identical to `scp_core::context::broadcast_content::MAX_BODY_BYTES`.
 const MAX_BODY_BYTES: usize = 10 * 1024 * 1024;
 
-/// Magic byte prefix for structured broadcast content: ASCII "SCP".
-/// Algorithm-identical to `scp_core::context::broadcast_content::BROADCAST_CONTENT_MAGIC`.
-const BROADCAST_CONTENT_MAGIC: [u8; 3] = [0x53, 0x43, 0x50];
-
-/// Current broadcast content format version.
-/// Algorithm-identical to `scp_core::context::broadcast_content::BROADCAST_CONTENT_VERSION`.
+/// Current broadcast content format version — must match
+/// `scp_protocol::context::broadcast_content::BROADCAST_CONTENT_VERSION`.
 const BROADCAST_CONTENT_VERSION: u8 = 1;
 
 // ---------------------------------------------------------------------------
-// WASM-local content validation (ADR-034: cannot import from scp-core)
+// Content validation — delegates to scp-protocol broadcast_content types
 // ---------------------------------------------------------------------------
 
 /// Validates a content path for broadcast asset publishing (SCP-290).
@@ -874,237 +870,28 @@ const BROADCAST_CONTENT_VERSION: u8 = 1;
 /// Algorithm-identical to `scp_core::context::broadcast_content::ContentPath::new`.
 /// Reimplemented locally per ADR-034. Applies NFC normalization before
 /// validation, matching scp-core's behavior.
+/// Validates and normalizes a content path using `scp_protocol::context::broadcast_content::ContentPath`.
 fn validate_content_path_wasm(path: &str) -> Result<String, String> {
-    use unicode_normalization::UnicodeNormalization;
-    let normalized: String = path.nfc().collect();
-    validate_content_path_wasm_inner(&normalized)?;
-    Ok(normalized)
+    use scp_protocol::context::broadcast_content::ContentPath;
+    let cp = ContentPath::new(path).map_err(|e| e.to_string())?;
+    Ok(cp.as_str().to_owned())
 }
 
-/// Inner validation logic for content paths (post-NFC-normalization).
-fn validate_content_path_wasm_inner(path: &str) -> Result<(), String> {
-    // Must start with '/'
-    if !path.starts_with('/') {
-        return Err("path must start with '/'".to_owned());
-    }
-
-    // Max length
-    if path.len() > 1024 {
-        return Err(format!("path too long: {} bytes (max 1024)", path.len()));
-    }
-
-    // Reject backslashes
-    if path.contains('\\') {
-        return Err("backslashes not allowed".to_owned());
-    }
-
-    // Reject percent-encoded bytes
-    if path.contains('%') {
-        return Err("percent-encoded bytes not allowed".to_owned());
-    }
-
-    // Reject query strings
-    if path.contains('?') {
-        return Err("query strings not allowed".to_owned());
-    }
-
-    // Reject fragments
-    if path.contains('#') {
-        return Err("fragments not allowed".to_owned());
-    }
-
-    // Reject null bytes, control characters (U+0000-U+001F, U+007F)
-    for ch in path.chars() {
-        if ch == '\0' {
-            return Err("path must not contain null bytes".to_owned());
-        }
-        if ('\u{0000}'..='\u{001F}').contains(&ch) {
-            return Err(format!(
-                "control character U+{:04X} not allowed",
-                u32::from(ch),
-            ));
-        }
-        if ch == '\u{007F}' {
-            return Err("DEL (U+007F) not allowed".to_owned());
-        }
-    }
-
-    // Reject non-ASCII whitespace, control, and formatting characters.
-    // Matches scp-core's is_unicode_formatting + whitespace/control check.
-    for ch in path.chars() {
-        if !ch.is_ascii()
-            && (ch.is_whitespace() || ch.is_control() || is_unicode_formatting_wasm(ch))
-        {
-            return Err(format!(
-                "non-ASCII whitespace/formatting U+{:04X} not allowed",
-                u32::from(ch),
-            ));
-        }
-    }
-
-    // Reject double slashes
-    if path.contains("//") {
-        return Err("double slashes not allowed".to_owned());
-    }
-
-    // No trailing slash except root
-    if path.len() > 1 && path.ends_with('/') {
-        return Err("path must not end with '/' (except root)".to_owned());
-    }
-
-    // Reject '.' and '..' segments (skip leading empty from leading '/')
-    for segment in path.split('/').skip(1) {
-        if segment == "." {
-            return Err("'.' segments not allowed".to_owned());
-        }
-        if segment == ".." {
-            return Err("'..' segments not allowed (path traversal)".to_owned());
-        }
-    }
-
-    Ok(())
-}
-
-/// Returns `true` for Unicode formatting/invisible characters that must be
-/// rejected in content paths.
-///
-/// Algorithm-identical to `scp_core::context::broadcast_content::is_unicode_formatting`.
-/// Reimplemented locally per ADR-034.
-fn is_unicode_formatting_wasm(ch: char) -> bool {
-    let cp = u32::from(ch);
-    matches!(
-        cp,
-        // Zero-width chars (U+200B-U+200F): ZWSP, ZWNJ, ZWJ, LRM, RLM
-        0x200B..=0x200F
-        // Line/paragraph separators
-        | 0x2028..=0x2029
-        // Bidi embedding controls (LRE, RLE, PDF, LRO, RLO)
-        | 0x202A..=0x202E
-        // Medium mathematical space
-        | 0x205F
-        // Word joiner and invisible operators (U+2060-U+206F)
-        | 0x2060..=0x206F
-        // Ideographic space
-        | 0x3000
-        // BOM / ZWNBSP
-        | 0xFEFF
-        // Non-characters
-        | 0xFFFE..=0xFFFF
-    )
-}
-
-/// Validates a MIME type for broadcast asset publishing (SCP-290).
-///
-/// Algorithm-identical to `scp_core::context::broadcast_content::MimeType::new`.
-/// Reimplemented locally per ADR-034.
-///
-/// Enforces RFC 7230 tchar set plus alphanumeric.
-/// Rejects spaces, angle brackets, parentheses, non-ASCII, semicolons,
-/// CRLF, and control chars. Exactly one `/` separator.
+/// Validates a MIME type using `scp_protocol::context::broadcast_content::MimeType`.
 fn validate_mime_type_wasm(value: &str) -> Result<(), String> {
-    if value.is_empty() {
-        return Err("MIME type must not be empty".to_owned());
-    }
-
-    // Reject control characters (including \r, \n)
-    for ch in value.chars() {
-        if ch.is_control() {
-            return Err(format!(
-                "control character U+{:04X} not allowed",
-                u32::from(ch),
-            ));
-        }
-    }
-
-    // Reject parameters (`;`)
-    if value.contains(';') {
-        return Err("MIME type parameters (';') not allowed".to_owned());
-    }
-
-    // Must have exactly one '/'
-    let slash_count = value.chars().filter(|&c| c == '/').count();
-    if slash_count != 1 {
-        return Err("MIME type must be 'type/subtype' (exactly one '/')".to_owned());
-    }
-
-    // Both parts must be non-empty and consist of valid token characters.
-    let (type_part, subtype_part) = value
-        .split_once('/')
-        .ok_or_else(|| "MIME type must be 'type/subtype'".to_owned())?;
-
-    if type_part.is_empty() || subtype_part.is_empty() {
-        return Err("MIME type and subtype must both be non-empty".to_owned());
-    }
-
-    // RFC 7230 §3.2.6 tchar set: ALPHA / DIGIT / "!" / "#" / "$" / "&" /
-    // "'" / "*" / "+" / "-" / "." / "^" / "_" / "`" / "|" / "~"
-    // Note: "%" is intentionally excluded — it is not a tchar per RFC 7230,
-    // and allowing it would enable encoded-character injection.
-    let is_token_char = |c: char| c.is_ascii_alphanumeric() || "!#$&'*+-.^_`|~".contains(c);
-
-    if !type_part.chars().all(is_token_char) {
-        return Err("MIME type part contains invalid characters".to_owned());
-    }
-    if !subtype_part.chars().all(is_token_char) {
-        return Err("MIME subtype part contains invalid characters".to_owned());
-    }
-
+    use scp_protocol::context::broadcast_content::MimeType;
+    MimeType::new(value).map_err(|e| e.to_string())?;
     Ok(())
 }
 
-/// Validates a `deploy_id` for broadcast asset publishing (SCP-290).
-///
-/// Algorithm-identical to `scp_core::context::broadcast_content::validate_deploy_id`.
-/// Reimplemented locally per ADR-034.
+/// Validates a deploy_id using `scp_protocol::context::broadcast_content::validate_deploy_id`.
 fn validate_deploy_id_wasm(deploy_id: &str) -> Result<(), String> {
-    if deploy_id.is_empty() {
-        return Err("deploy_id must not be empty".to_owned());
-    }
-    if deploy_id.len() > 128 {
-        return Err(format!(
-            "deploy_id too long: {} bytes (max 128)",
-            deploy_id.len()
-        ));
-    }
-    for ch in deploy_id.chars() {
-        if !ch.is_ascii_alphanumeric() && ch != '-' && ch != '_' {
-            return Err(format!("invalid character '{ch}' in deploy_id"));
-        }
-    }
-    Ok(())
+    scp_protocol::context::broadcast_content::validate_deploy_id(deploy_id)
+        .map_err(|e| e.to_string())
 }
 
-// ---------------------------------------------------------------------------
-// WASM-local BroadcastContent serialization (ADR-034: cannot import from scp-core)
-// ---------------------------------------------------------------------------
-
-/// WASM-local `ContentMetadata` matching `scp_core::context::ContentMetadata`.
-/// Field names and `MessagePack` encoding must be identical.
-#[derive(serde::Serialize)]
-struct WasmContentMetadata<'a> {
-    path: Option<&'a str>,
-    content_type: Option<&'a str>,
-    deploy_id: Option<&'a str>,
-    etag: Option<&'a str>,
-    #[serde(default)]
-    immutable: bool,
-}
-
-/// WASM-local `BroadcastContent` matching `scp_core::context::BroadcastContent`.
-/// Field names and `MessagePack` encoding must be identical.
-#[derive(serde::Serialize)]
-struct WasmBroadcastContent<'a> {
-    version: u8,
-    metadata: WasmContentMetadata<'a>,
-    #[serde(with = "serde_bytes")]
-    body: &'a [u8],
-}
-
-/// Serializes broadcast content into the canonical wire format:
-/// `BROADCAST_CONTENT_MAGIC ++ version_u8 ++ rmp_serde::to_vec_named(content)`.
-///
-/// Algorithm-identical to `scp_core::context::broadcast_content::serialize_broadcast_content`.
-/// Reimplemented locally per ADR-034.
+/// Serializes broadcast content into the canonical wire format using
+/// `scp_protocol::context::broadcast_content::serialize_broadcast_content`.
 fn serialize_broadcast_content_wasm(
     path: &str,
     content_type: &str,
@@ -1112,34 +899,23 @@ fn serialize_broadcast_content_wasm(
     etag: &str,
     body: &[u8],
 ) -> Result<Vec<u8>, String> {
-    // Body size limit — reject oversized payloads before serialization.
-    if body.len() > MAX_BODY_BYTES {
-        return Err(format!(
-            "body too large: {} bytes (max {MAX_BODY_BYTES})",
-            body.len()
-        ));
-    }
-
-    let content = WasmBroadcastContent {
-        version: BROADCAST_CONTENT_VERSION,
-        metadata: WasmContentMetadata {
-            path: Some(path),
-            content_type: Some(content_type),
-            deploy_id,
-            etag: Some(etag),
-            immutable: false,
-        },
-        body,
+    use scp_protocol::context::broadcast_content::{
+        BroadcastContent, ContentMetadata, ContentPath, MimeType, serialize_broadcast_content,
     };
 
-    let msgpack = rmp_serde::to_vec_named(&content)
-        .map_err(|e| format!("MessagePack serialization failed: {e}"))?;
+    let content = BroadcastContent {
+        version: BROADCAST_CONTENT_VERSION,
+        metadata: ContentMetadata {
+            path: Some(ContentPath::new(path).map_err(|e| e.to_string())?),
+            content_type: Some(MimeType::new(content_type).map_err(|e| e.to_string())?),
+            deploy_id: deploy_id.map(str::to_owned),
+            etag: Some(etag.to_owned()),
+            immutable: false,
+        },
+        body: body.to_vec(),
+    };
 
-    let mut buf = Vec::with_capacity(4 + msgpack.len());
-    buf.extend_from_slice(&BROADCAST_CONTENT_MAGIC);
-    buf.push(BROADCAST_CONTENT_VERSION);
-    buf.extend_from_slice(&msgpack);
-    Ok(buf)
+    serialize_broadcast_content(&content).map_err(|e| e.to_string())
 }
 
 impl WasmContextManager {
