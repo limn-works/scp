@@ -312,6 +312,8 @@ fn strip_snapshot_for_public(snapshot: &ContextSnapshot) -> ContextSnapshot {
         needs_reconnect: false,
         mls_crypto_state: Vec::new(),
         migration_state: None,
+        // Access keys are sensitive material — not exported in public scope.
+        access_key_store: scp_protocol::crypto::access_keys::AccessKeyStore::new(),
     }
 }
 
@@ -420,6 +422,7 @@ mod tests {
             needs_reconnect: false,
             mls_crypto_state: Vec::new(),
             migration_state: None,
+            access_key_store: scp_protocol::crypto::access_keys::AccessKeyStore::new(),
         }
     }
 

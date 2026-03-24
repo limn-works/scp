@@ -171,11 +171,14 @@ impl ContextManager {
                 write_revoked_members: ctx_snapshot.write_revoked_members,
                 read_revoked_members: ctx_snapshot.read_revoked_members,
                 read_exclusion_list: ctx_snapshot.read_exclusion_list,
+                access_key_store: ctx_snapshot.access_key_store,
             },
             ttl: TtlState {
                 timer: TtlTimer::with_clock(Arc::clone(&self.clock)),
                 extension: None,
             },
+            sequence_tracker: scp_protocol::envelope::SequenceTracker::new(),
+            reorder_buffer: scp_protocol::envelope::ReorderBuffer::default(),
         };
 
         {
@@ -622,11 +625,14 @@ impl ContextManager {
                 write_revoked_members: export.snapshot.write_revoked_members,
                 read_revoked_members: export.snapshot.read_revoked_members,
                 read_exclusion_list: export.snapshot.read_exclusion_list,
+                access_key_store: export.snapshot.access_key_store,
             },
             ttl: TtlState {
                 timer: TtlTimer::with_clock(Arc::clone(&self.clock)),
                 extension: None,
             },
+            sequence_tracker: scp_protocol::envelope::SequenceTracker::new(),
+            reorder_buffer: scp_protocol::envelope::ReorderBuffer::default(),
         };
 
         // 7. Register the context.
@@ -756,6 +762,14 @@ impl ContextManager {
 
         let initial_members: HashSet<DID> = membership.members().map(|m| m.did.clone()).collect();
 
+        // Generate access key for the creator (§9.17.2 step 1).
+        let mut initial_access_key_store = scp_protocol::crypto::access_keys::AccessKeyStore::new();
+        let creator_access_key = scp_protocol::crypto::access_keys::generate_access_key(
+            &context_id,
+            creator_did.as_ref(),
+        );
+        initial_access_key_store.set(&context_id, creator_did.as_ref(), creator_access_key);
+
         let per_context = PerContextState {
             handle: handle.clone(),
             membership,
@@ -792,11 +806,14 @@ impl ContextManager {
                 write_revoked_members: HashSet::new(),
                 read_revoked_members: HashSet::new(),
                 read_exclusion_list: HashSet::new(),
+                access_key_store: initial_access_key_store,
             },
             ttl: TtlState {
                 timer: TtlTimer::with_clock(Arc::clone(&self.clock)),
                 extension: None,
             },
+            sequence_tracker: scp_protocol::envelope::SequenceTracker::new(),
+            reorder_buffer: scp_protocol::envelope::ReorderBuffer::default(),
         };
 
         {
@@ -1066,11 +1083,26 @@ impl ContextManager {
                 write_revoked_members: HashSet::new(),
                 read_revoked_members: HashSet::new(),
                 read_exclusion_list: HashSet::new(),
+                // Generate access key for the creator (§9.17.2 step 1),
+                // matching the pattern in create_context. Without this,
+                // the creator cannot send messages that wrap content for
+                // recipients or decrypt messages addressed to them.
+                access_key_store: {
+                    let mut store = scp_protocol::crypto::access_keys::AccessKeyStore::new();
+                    let creator_key = scp_protocol::crypto::access_keys::generate_access_key(
+                        context_id,
+                        creator_did.as_ref(),
+                    );
+                    store.set(context_id, creator_did.as_ref(), creator_key);
+                    store
+                },
             },
             ttl: TtlState {
                 timer: TtlTimer::with_clock(Arc::clone(&self.clock)),
                 extension: None,
             },
+            sequence_tracker: scp_protocol::envelope::SequenceTracker::new(),
+            reorder_buffer: scp_protocol::envelope::ReorderBuffer::default(),
         })
     }
 
@@ -1095,6 +1127,7 @@ impl ContextManager {
     ) -> Result<(), ContextError> {
         let context_id = handle.context_id().to_owned();
         let context_id_bytes = context_id_to_bytes(&context_id);
+        let routing_id = scp_protocol::context::context_routing_id(&context_id);
         let member_did = key_package.owner_did.clone();
 
         // Fast-fail: reject obviously incompatible versions before expensive
@@ -1135,7 +1168,7 @@ impl ContextManager {
                 message_len = message.len(),
                 "sending sender key distribution message"
             );
-            if let Err(e) = self.transport.send_message(&context_id_bytes, &message) {
+            if let Err(e) = self.transport.send_message(&routing_id, &message) {
                 tracing::warn!(
                     target_did = %target_did,
                     context_id = %context_id,
@@ -1186,6 +1219,16 @@ impl ContextManager {
             // Add to membership tracking.
             ctx.membership
                 .add_member(member_did.clone(), "member".into(), tokens);
+
+            // Generate access key for the new member (§9.17.2 step 2).
+            // The inviter stores the key so `send_message` can wrap content
+            // for this recipient. Key distribution to the joiner happens
+            // via the Welcome payload / out-of-band key exchange.
+            let member_access_key =
+                scp_protocol::crypto::access_keys::generate_access_key(&context_id, &member_did);
+            ctx.access
+                .access_key_store
+                .set(&context_id, &member_did, member_access_key);
 
             // Emit MemberJoined event to receive buffer.
             ctx.receive_buffer.push(ContextEvent::MemberJoined {
@@ -1315,6 +1358,11 @@ impl ContextManager {
             ctx.role_state
                 .member_capabilities
                 .remove(member_did.as_ref());
+
+            // Destroy the departing member's access key (§9.17.2, ADR-038).
+            ctx.access
+                .access_key_store
+                .remove(&context_id, member_did.as_ref());
 
             // Emit MemberLeft event to receive buffer.
             ctx.receive_buffer.push(ContextEvent::MemberLeft {

@@ -469,11 +469,13 @@ async fn concurrent_joins_and_sends_do_not_corrupt_state() {
     }
 
     // Spawn 5 concurrent send tasks from the creator.
+    let sk = signing_key_for_did(&"did:key:creator".into());
     for i in 0..5u8 {
         let mgr = std::sync::Arc::clone(&manager);
         let h = std::sync::Arc::clone(&handle);
+        let sk_clone = sk.clone();
         join_handles.push(tokio::spawn(async move {
-            mgr.send_message(&h, &"did:key:creator".into(), &[i], None)
+            mgr.send_message(&h, &"did:key:creator".into(), &[i], Some(&sk_clone), None)
                 .await
         }));
     }
@@ -750,6 +752,7 @@ async fn persist_drop_restore_roundtrip() {
         needs_reconnect: false,
         migration_state: None,
         mls_crypto_state: Vec::new(),
+        access_key_store: scp_protocol::crypto::access_keys::AccessKeyStore::new(),
     };
 
     let bc_snapshot = test_broadcast_snapshot("persist-ctx-2");
@@ -861,6 +864,7 @@ async fn restore_preserves_executed_proposals() {
         needs_reconnect: false,
         migration_state: None,
         mls_crypto_state: Vec::new(),
+        access_key_store: scp_protocol::crypto::access_keys::AccessKeyStore::new(),
     };
 
     persistence
@@ -960,6 +964,7 @@ async fn restore_respawns_ttl_timer() {
         needs_reconnect: false,
         migration_state: None,
         mls_crypto_state: Vec::new(),
+        access_key_store: scp_protocol::crypto::access_keys::AccessKeyStore::new(),
     };
 
     persistence.persist_context("ttl-ctx", &snapshot).unwrap();
@@ -1038,6 +1043,7 @@ async fn restore_all_contexts_restores_persisted() {
             needs_reconnect: false,
             migration_state: None,
             mls_crypto_state: Vec::new(),
+            access_key_store: scp_protocol::crypto::access_keys::AccessKeyStore::new(),
         };
         persistence.persist_context(ctx_name, &snapshot).unwrap();
     }
@@ -1115,6 +1121,7 @@ async fn restore_context_rejects_duplicate() {
         needs_reconnect: false,
         migration_state: None,
         mls_crypto_state: Vec::new(),
+        access_key_store: scp_protocol::crypto::access_keys::AccessKeyStore::new(),
     };
 
     let bc_snapshot = test_broadcast_snapshot("dup-ctx");
@@ -1214,6 +1221,7 @@ async fn restore_context_sets_needs_reconnect_on_grace_inconsistency() {
         needs_reconnect: false,
         migration_state: None,
         mls_crypto_state: Vec::new(),
+        access_key_store: scp_protocol::crypto::access_keys::AccessKeyStore::new(),
     };
 
     let bc_snapshot = test_broadcast_snapshot("grace-incon-ctx");
@@ -1320,6 +1328,7 @@ async fn restore_context_no_reconnect_when_grace_consistent() {
         needs_reconnect: false,
         migration_state: None,
         mls_crypto_state: Vec::new(),
+        access_key_store: scp_protocol::crypto::access_keys::AccessKeyStore::new(),
     };
 
     let bc_snapshot = test_broadcast_snapshot("grace-ok-ctx");
@@ -1414,6 +1423,7 @@ fn reconnect_test_snapshot(
         epoch_coordination_records: Vec::new(),
         mls_crypto_state: Vec::new(),
         migration_state: None,
+        access_key_store: scp_protocol::crypto::access_keys::AccessKeyStore::new(),
     }
 }
 

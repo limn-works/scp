@@ -856,6 +856,11 @@ pub fn py_tool_invoke_cross_context(
         Ok(output)
     })?;
 
+    // Provenance for cross-context tool invocations is now handled at the
+    // protocol level (scp-protocol::tools::invoke_cross_context). The bridge-
+    // level attach_cross_context_provenance was redundant and discarded its
+    // result, so it has been removed.
+
     json_to_py_dict(py, &output_json)
 }
 

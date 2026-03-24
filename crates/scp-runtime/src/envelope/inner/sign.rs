@@ -87,6 +87,71 @@ pub async fn create_inner_envelope(
     })
 }
 
+// ---------------------------------------------------------------------------
+// Sync variant: sign with raw Ed25519 key
+// ---------------------------------------------------------------------------
+
+/// Creates an inner envelope signed with a raw Ed25519 signing key.
+///
+/// Sync variant of [`create_inner_envelope`] for use in
+/// `ContextManager::send_message` where the signing key is available
+/// directly (not behind a `KeyCustody` abstraction).
+///
+/// # Processing order
+///
+/// 1. Compute `payload_hash = SHA-256(payload)`.
+/// 2. Compute `provenance_hash`.
+/// 3. Compute canonical hash.
+/// 4. Sign with the provided `signing_key`.
+/// 5. Pad payload to bucket boundary.
+/// 6. Return the complete inner envelope.
+///
+/// # Errors
+///
+/// Returns [`EnvelopeError::SerializationFailed`] if provenance serialization fails.
+/// Returns [`EnvelopeError::PayloadTooLarge`] if the payload exceeds the maximum
+/// bucket size.
+pub fn create_inner_envelope_raw(
+    params: &InnerEnvelopeParams<'_>,
+    signing_key: &ed25519_dalek::SigningKey,
+) -> Result<InnerEnvelope, EnvelopeError> {
+    // 1. Hash original plaintext.
+    let payload_hash: [u8; 32] = Sha256::digest(params.payload).into();
+
+    // 2. Hash provenance.
+    let provenance_hash: [u8; 32] = compute_provenance_hash(params.provenance.as_ref())?;
+
+    // 3. Compute canonical hash for signing.
+    let canonical_hash = compute_canonical_hash(params, &payload_hash, &provenance_hash);
+
+    // 4. Sign the canonical hash.
+    let signature = ed25519_dalek::Signer::sign(signing_key, &canonical_hash);
+
+    // 5. Pad payload to bucket boundary.
+    let padded_payload = pad_to_bucket(params.payload)?;
+
+    // 6. Build and return the envelope.
+    let sig_bytes: [u8; 64] = signature.to_bytes();
+
+    Ok(InnerEnvelope {
+        version: SCP_INNER_ENVELOPE_VERSION,
+        context_id: params.context_id.to_owned(),
+        sender_did: params.sender_did.to_owned(),
+        epoch: params.epoch,
+        generation: params.generation,
+        sequence: params.sequence,
+        timestamp: params.timestamp,
+        message_type: params.message_type,
+        payload_hash,
+        payload: padded_payload,
+        provenance: params.provenance.clone(),
+        provenance_hash,
+        signing_key_id: params.signing_key_id,
+        signature: sig_bytes,
+        extensions: HashMap::new(),
+    })
+}
+
 #[cfg(test)]
 #[allow(
     clippy::unwrap_used,

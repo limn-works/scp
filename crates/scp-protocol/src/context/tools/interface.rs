@@ -29,7 +29,8 @@ use super::lifecycle::{ToolStatus, sha256_json};
 use super::registry::{ToolRegistration, ToolRegistry};
 use super::{DID, ToolError, ToolId, has_admin_role};
 use crate::context::roles::ContextRoleState;
-use crate::provenance::attach::effective_max_chain_depth;
+use crate::provenance::DataProvenance;
+use crate::provenance::attach::{SourceContextInfo, attach_provenance, effective_max_chain_depth};
 
 // ---------------------------------------------------------------------------
 // ContextId
@@ -675,6 +676,12 @@ pub struct CrossContextToolEvent {
     pub input_hash: String,
     /// SHA-256 hash of the output (hex-encoded), if output was produced.
     pub output_hash: Option<String>,
+    /// Provenance metadata for this cross-context data flow (§7.7.1).
+    ///
+    /// Attached automatically by [`invoke_cross_context`] from the source
+    /// context's [`SourceContextInfo`]. Records origin, counterparties,
+    /// chain depth, and economic provenance.
+    pub provenance: Option<DataProvenance>,
 }
 
 // ---------------------------------------------------------------------------
@@ -922,6 +929,7 @@ pub fn invoke_cross_context<F>(
     chain_depth: u8,
     executor: F,
     clock: &dyn Clock,
+    source_context_info: &SourceContextInfo,
 ) -> Result<
     (
         serde_json::Value,
@@ -1037,11 +1045,54 @@ where
         }
     }
 
-    // 9. Build event payloads for both contexts.
+    // 9. Attach provenance (§7.7.1, §24.3).
+    let provenance =
+        build_invocation_provenance(source_context_info, &interface.target_context, chain_depth);
+
+    // 10. Build event payloads for both contexts.
     let (source_event, target_event) =
-        build_cross_context_events(interface, input, &output, invoker_did);
+        build_cross_context_events(interface, input, &output, invoker_did, &provenance);
 
     Ok((output, source_event, target_event))
+}
+
+/// Constructs [`DataProvenance`] for a cross-context tool invocation (§7.7.1).
+///
+/// When `chain_depth > 0`, synthesizes a minimal existing provenance record so
+/// [`attach_provenance`] correctly increments the chain depth and extends the
+/// chain path. On the first hop (`chain_depth == 0`), no existing provenance
+/// is passed and `chain_depth` starts at 0.
+fn build_invocation_provenance(
+    source_context_info: &SourceContextInfo,
+    target_context: &ContextId,
+    chain_depth: u8,
+) -> DataProvenance {
+    let existing = if chain_depth > 0 {
+        Some(DataProvenance {
+            source_context: source_context_info.context_id.clone(),
+            source_type: source_context_info.source_type,
+            counterparties: Vec::new(),
+            purpose: None,
+            discovery_method: source_context_info.discovery_method.clone(),
+            age: source_context_info.data_age,
+            memory_scope: source_context_info.memory_scope,
+            chain_depth: chain_depth.saturating_sub(1),
+            chain_path: None,
+            payment_amount: None,
+            payment_adapter: None,
+            payment_receipt_id: None,
+        })
+    } else {
+        None
+    };
+
+    attach_provenance(
+        source_context_info,
+        target_context,
+        existing.as_ref(),
+        None, // pseudonym key — applied upstream by the context manager
+        None, // payment info — not available at this layer
+    )
 }
 
 /// Builds matched event payloads for the source and target contexts of a
@@ -1051,6 +1102,7 @@ fn build_cross_context_events(
     input: &serde_json::Value,
     output: &serde_json::Value,
     invoker_did: &DID,
+    provenance: &DataProvenance,
 ) -> (CrossContextToolEvent, CrossContextToolEvent) {
     let request_id = uuid::Uuid::new_v4().to_string();
     let input_hash = sha256_json(input);
@@ -1065,6 +1117,7 @@ fn build_cross_context_events(
         status: ToolStatus::Success,
         input_hash: input_hash.clone(),
         output_hash: output_hash.clone(),
+        provenance: Some(provenance.clone()),
     };
 
     let target_event = CrossContextToolEvent {
@@ -1076,6 +1129,7 @@ fn build_cross_context_events(
         status: ToolStatus::Success,
         input_hash,
         output_hash,
+        provenance: Some(provenance.clone()),
     };
 
     (source_event, target_event)
@@ -1092,8 +1146,12 @@ mod tests {
     use std::collections::HashSet;
 
     use super::*;
+    use crate::context::MemoryScope;
     use crate::context::roles::{Capability, CapabilityCeiling, ContextRoleState};
     use crate::context::tools::registry::{ToolRegistry, ToolSchema, register_tool};
+    use crate::provenance::attach::SourceContextInfo;
+    use crate::provenance::evaluate::{SourceContextState, evaluate_quality};
+    use crate::provenance::{CounterpartyPolicy, DiscoveryMethod, SourceType};
 
     // -----------------------------------------------------------------------
     // Test helpers
@@ -1185,6 +1243,20 @@ mod tests {
         };
         register_tool(&mut registry, role_state, registration, registrant_did).unwrap();
         registry
+    }
+
+    /// Creates a test `SourceContextInfo` for a given context ID and member DID.
+    fn test_source_context_info(context_id: &str, member_did: &str) -> SourceContextInfo {
+        SourceContextInfo {
+            context_id: context_id.to_owned(),
+            source_type: SourceType::Persistent,
+            memory_scope: MemoryScope::Full,
+            members: vec![DID::from(member_did)],
+            discovery_method: DiscoveryMethod::OutOfBand,
+            data_age: Duration::from_secs(0),
+            purpose: Some("cross-context tool invocation".to_owned()),
+            counterparty_policy: CounterpartyPolicy::Full,
+        }
     }
 
     /// Simple synchronous executor that adds two numbers.
@@ -1481,6 +1553,7 @@ mod tests {
             0,
             add_executor,
             &scp_primitives::SystemClock,
+            &test_source_context_info("ctx-source", admin_did),
         )
         .unwrap();
 
@@ -1539,6 +1612,7 @@ mod tests {
             0,
             add_executor,
             &scp_primitives::SystemClock,
+            &test_source_context_info("ctx-source", admin_did),
         );
 
         assert!(result.is_err());
@@ -1586,6 +1660,7 @@ mod tests {
             0,
             add_executor,
             &scp_primitives::SystemClock,
+            &test_source_context_info("ctx-source", admin_did),
         );
 
         assert!(result.is_err());
@@ -1633,6 +1708,7 @@ mod tests {
             0,
             add_executor,
             &scp_primitives::SystemClock,
+            &test_source_context_info("ctx-source", admin_did),
         );
 
         assert!(result.is_err());
@@ -1687,6 +1763,7 @@ mod tests {
             0,
             add_executor,
             &scp_primitives::SystemClock,
+            &test_source_context_info("ctx-source", admin_did),
         );
         assert!(result1.is_ok(), "first call should succeed");
 
@@ -1702,6 +1779,7 @@ mod tests {
             0,
             add_executor,
             &scp_primitives::SystemClock,
+            &test_source_context_info("ctx-source", admin_did),
         );
         assert!(result2.is_ok(), "second call should succeed");
 
@@ -1717,6 +1795,7 @@ mod tests {
             0,
             add_executor,
             &scp_primitives::SystemClock,
+            &test_source_context_info("ctx-source", admin_did),
         );
         assert!(result3.is_err());
         let err = result3.unwrap_err();
@@ -1762,6 +1841,7 @@ mod tests {
             0,
             add_executor,
             &scp_primitives::SystemClock,
+            &test_source_context_info("ctx-source", admin_did),
         )
         .unwrap();
 
@@ -1828,6 +1908,7 @@ mod tests {
             0,
             add_executor,
             &scp_primitives::SystemClock,
+            &test_source_context_info("ctx-source", admin_did),
         );
 
         assert!(result.is_err());
@@ -1871,6 +1952,7 @@ mod tests {
             0,
             add_executor,
             &scp_primitives::SystemClock,
+            &test_source_context_info("ctx-source", admin_did),
         );
 
         assert!(result.is_err());
@@ -1970,6 +2052,7 @@ mod tests {
             status: ToolStatus::Success,
             input_hash: "abcd1234".to_owned(),
             output_hash: Some("efgh5678".to_owned()),
+            provenance: None,
         };
         let json = serde_json::to_string(&event).unwrap();
         let deserialized: CrossContextToolEvent = serde_json::from_str(&json).unwrap();
@@ -2014,6 +2097,7 @@ mod tests {
             9,
             add_executor,
             &scp_primitives::SystemClock,
+            &test_source_context_info("ctx-source", admin_did),
         );
 
         assert!(result.is_err());
@@ -2062,6 +2146,7 @@ mod tests {
             8,
             add_executor,
             &scp_primitives::SystemClock,
+            &test_source_context_info("ctx-source", admin_did),
         );
 
         assert!(
@@ -2109,6 +2194,7 @@ mod tests {
             0,
             failing_executor,
             &scp_primitives::SystemClock,
+            &test_source_context_info("ctx-source", admin_did),
         );
 
         assert!(result.is_err());
@@ -2302,6 +2388,7 @@ mod tests {
             1,
             add_executor,
             &scp_primitives::SystemClock,
+            &test_source_context_info("ctx-source", admin_did),
         );
         assert!(result.is_ok());
 
@@ -2317,6 +2404,7 @@ mod tests {
             2,
             add_executor,
             &scp_primitives::SystemClock,
+            &test_source_context_info("ctx-source", admin_did),
         );
         assert!(result.is_err());
         let err = result.unwrap_err();
@@ -2556,6 +2644,7 @@ mod tests {
                 0,
                 add_executor,
                 &scp_primitives::SystemClock,
+                &test_source_context_info("ctx-source", admin_did),
             );
             assert!(result.is_ok(), "base call {i} should succeed");
         }
@@ -2573,6 +2662,7 @@ mod tests {
                 0,
                 add_executor,
                 &scp_primitives::SystemClock,
+                &test_source_context_info("ctx-source", admin_did),
             );
             assert!(result.is_ok(), "burst call {i} should succeed");
         }
@@ -2589,6 +2679,7 @@ mod tests {
             0,
             add_executor,
             &scp_primitives::SystemClock,
+            &test_source_context_info("ctx-source", admin_did),
         );
         assert!(result.is_err());
         let err = result.unwrap_err();
@@ -2762,6 +2853,131 @@ mod tests {
         assert!(
             !rl.check_and_increment(&alice, &scp_primitives::SystemClock),
             "per-caller burst must NOT renew after burst window expires within base window"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // invoke_cross_context: provenance attachment (§7.7.1)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn invoke_cross_context_attaches_provenance_with_correct_source_context() {
+        let admin_did = "did:dht:z6MkAdmin";
+        let source_role_state = test_role_state("ctx-source", admin_did);
+        let source_context = test_context_id("ctx-source");
+        let target_role_state = test_role_state("ctx-target", admin_did);
+        let target_registry = setup_registry_with_tool(&target_role_state, admin_did);
+
+        let mut interface = ToolInterface {
+            source_context: "ctx-source".to_owned(),
+            target_context: "ctx-target".to_owned(),
+            tool_id: "calculator".to_owned(),
+            rate_limit: None,
+            per_caller_rate_limit: None,
+            approved_by_source: true,
+            approved_by_target: true,
+            outbound_policy: None,
+            inbound_policy: None,
+        };
+
+        let src_info = SourceContextInfo {
+            context_id: "ctx-source".to_owned(),
+            source_type: SourceType::Persistent,
+            memory_scope: MemoryScope::Full,
+            members: vec![DID::from(admin_did)],
+            discovery_method: DiscoveryMethod::OutOfBand,
+            data_age: Duration::from_secs(0),
+            purpose: Some("test invocation".to_owned()),
+            counterparty_policy: CounterpartyPolicy::Full,
+        };
+
+        let input = serde_json::json!({"a": 5, "b": 10});
+        let (_output, source_event, target_event) = invoke_cross_context(
+            &source_context,
+            None,
+            &mut interface,
+            &input,
+            &DID::from(admin_did),
+            &source_role_state,
+            &target_registry,
+            0,
+            add_executor,
+            &scp_primitives::SystemClock,
+            &src_info,
+        )
+        .unwrap();
+
+        // Both events carry provenance.
+        let prov = source_event.provenance.as_ref().unwrap();
+        assert_eq!(prov.source_context, "ctx-source");
+        assert_eq!(prov.source_type, SourceType::Persistent);
+        assert_eq!(prov.memory_scope, MemoryScope::Full);
+        assert_eq!(prov.chain_depth, 0);
+        assert!(prov.chain_path.is_none());
+        assert_eq!(prov.purpose, Some("test invocation".to_owned()));
+        // Counterparties include the admin DID (Full policy).
+        assert_eq!(prov.counterparties, vec![DID::from(admin_did)]);
+
+        // Target event carries the same provenance.
+        let target_prov = target_event.provenance.as_ref().unwrap();
+        assert_eq!(target_prov.source_context, "ctx-source");
+        assert_eq!(target_prov.chain_depth, 0);
+    }
+
+    #[test]
+    fn invoke_cross_context_provenance_evaluates_to_persistent_verifiable() {
+        let admin_did = "did:dht:z6MkAdmin";
+        let source_role_state = test_role_state("ctx-source", admin_did);
+        let source_context = test_context_id("ctx-source");
+        let target_role_state = test_role_state("ctx-target", admin_did);
+        let target_registry = setup_registry_with_tool(&target_role_state, admin_did);
+
+        let mut interface = ToolInterface {
+            source_context: "ctx-source".to_owned(),
+            target_context: "ctx-target".to_owned(),
+            tool_id: "calculator".to_owned(),
+            rate_limit: None,
+            per_caller_rate_limit: None,
+            approved_by_source: true,
+            approved_by_target: true,
+            outbound_policy: None,
+            inbound_policy: None,
+        };
+
+        let src_info = SourceContextInfo {
+            context_id: "ctx-source".to_owned(),
+            source_type: SourceType::Persistent,
+            memory_scope: MemoryScope::Full,
+            members: vec![DID::from(admin_did)],
+            discovery_method: DiscoveryMethod::OutOfBand,
+            data_age: Duration::from_secs(0),
+            purpose: None,
+            counterparty_policy: CounterpartyPolicy::Full,
+        };
+
+        let input = serde_json::json!({"a": 1, "b": 2});
+        let (_output, source_event, _target_event) = invoke_cross_context(
+            &source_context,
+            None,
+            &mut interface,
+            &input,
+            &DID::from(admin_did),
+            &source_role_state,
+            &target_registry,
+            0,
+            add_executor,
+            &scp_primitives::SystemClock,
+            &src_info,
+        )
+        .unwrap();
+
+        // Evaluate quality: persistent source, active context -> PersistentVerifiable.
+        let prov = source_event.provenance.as_ref().unwrap();
+        let quality = evaluate_quality(Some(prov), &SourceContextState::Active);
+        assert_eq!(
+            quality,
+            crate::provenance::ProvenanceQuality::PersistentVerifiable,
+            "persistent + active source should evaluate to PersistentVerifiable"
         );
     }
 }

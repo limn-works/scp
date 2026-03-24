@@ -922,15 +922,35 @@ impl scp_core::context::builder::ContextCryptoProvider for DemoCrypto {
     ) -> Result<(), scp_core::context::ContextError> {
         Ok(())
     }
-    fn encrypt_message(
+
+    fn seal(
         &self,
-        _: &[u8; 32],
-        _: &str,
-        payload: &[u8],
-        _: u64,
-        _: u64,
+        _context_id: &[u8; 32],
+        inner: &scp_core::envelope::inner::InnerEnvelope,
+        _routing_id: &[u8],
+        _blob_ttl: u32,
     ) -> Result<Vec<u8>, scp_core::context::ContextError> {
-        Ok(payload.to_vec())
+        // Mock: serialize inner envelope directly (no encryption).
+        rmp_serde::to_vec_named(inner)
+            .map_err(|e| scp_core::context::ContextError::CryptoFailed(format!("mock seal: {e}")))
+    }
+
+    fn open(
+        &self,
+        _context_id: &[u8; 32],
+        outer_bytes: &[u8],
+    ) -> Result<Option<scp_core::context::builder::OpenedEnvelope>, scp_core::context::ContextError>
+    {
+        // Mock: deserialize directly as InnerEnvelope (no decryption).
+        let inner: scp_core::envelope::inner::InnerEnvelope = rmp_serde::from_slice(outer_bytes)
+            .map_err(|e| {
+                scp_core::context::ContextError::CryptoFailed(format!("mock open: {e}"))
+            })?;
+        let sender_did = inner.sender_did.clone();
+        Ok(Some(scp_core::context::builder::OpenedEnvelope {
+            inner,
+            sender_did,
+        }))
     }
 }
 
@@ -1155,20 +1175,23 @@ async fn application_layer_demo() {
     let msg2 = b"Bob here. Received your message.";
     let msg3 = b"Charlie joining the conversation.";
 
+    let alice_sk = demo_signing_key(&alice);
     manager
-        .send_message(&handle, &alice, msg1, None)
+        .send_message(&handle, &alice, msg1, Some(&alice_sk), None)
         .await
         .unwrap();
     println!("  Alice sent:   \"{}\"", String::from_utf8_lossy(msg1));
 
+    let bob_sk = demo_signing_key(&bob);
     manager
-        .send_message(&handle, &bob, msg2, None)
+        .send_message(&handle, &bob, msg2, Some(&bob_sk), None)
         .await
         .unwrap();
     println!("  Bob sent:     \"{}\"", String::from_utf8_lossy(msg2));
 
+    let charlie_sk = demo_signing_key(&charlie);
     manager
-        .send_message(&handle, &charlie, msg3, None)
+        .send_message(&handle, &charlie, msg3, Some(&charlie_sk), None)
         .await
         .unwrap();
     println!("  Charlie sent: \"{}\"", String::from_utf8_lossy(msg3));

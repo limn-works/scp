@@ -5487,6 +5487,7 @@ dependencies = [
  "scp-transport",
  "serde_json",
  "sha2 0.10.9",
+ "subtle",
  "tempfile",
  "thiserror 2.0.18",
  "tls_codec",

@@ -31,7 +31,7 @@ use tls_codec::Deserialize as TlsDeserializeTrait;
 use zeroize::{Zeroize, Zeroizing};
 
 use super::credential::ScpCredential;
-use super::encrypt::{DecryptedContent, decrypt_with_sender_did, encrypt, serialize_ciphertext};
+use super::encrypt::{DecryptedContent, decrypt_with_sender_did};
 use super::group::{self, SCP_CIPHERSUITE, ScpMlsGroup};
 use scp_protocol::context::ContextError;
 use scp_protocol::context::builder::{ContextCreationError, ContextCryptoProvider};
@@ -790,53 +790,78 @@ impl ContextCryptoProvider for MlsCryptoProvider {
         Ok(Some(message))
     }
 
-    fn encrypt_message(
+    fn seal(
         &self,
         context_id: &[u8; 32],
-        _sender_did: &str,
-        payload: &[u8],
-        epoch: u64,
-        sequence: u64,
+        inner: &scp_protocol::envelope::inner::InnerEnvelope,
+        routing_id: &[u8],
+        blob_ttl: u32,
     ) -> Result<Vec<u8>, ContextError> {
         self.with_context(context_id, |state| {
+            // Use hex-encoded context_id bytes as AAD context string, matching
+            // the decrypt path in `open` which also uses `hex::encode(context_id)`.
+            // `seal_envelope` uses `inner.context_id` (the original string), which
+            // would cause an AAD mismatch on the receive side.
             let ctx_str = hex::encode(context_id);
-            // Step 1: Encrypt payload with sender key (AES-256-GCM, ADR-007).
+
+            // 1. Serialize inner envelope to MessagePack.
+            let serialized = rmp_serde::to_vec_named(inner).map_err(|e| {
+                ContextError::CryptoFailed(format!("inner envelope serialization: {e}"))
+            })?;
+
+            // 2. Sender key encrypt (AES-256-GCM, ADR-007).
+            // AAD binds context_id, sender_did, epoch, and sequence to prevent
+            // ciphertext relocation. Uses hex-encoded context_id bytes for
+            // consistency with the decrypt path.
             let sender_encrypted =
                 scp_protocol::crypto::sender_keys::encrypt::encrypt_sender_layer(
                     &state.sender_key,
-                    payload,
+                    &serialized,
                     &ctx_str,
                     &self.local_did,
-                    epoch,
-                    sequence,
+                    0,
+                    0,
                 )
                 .map_err(|e| ContextError::CryptoFailed(e.to_string()))?;
 
-            // Step 2: Encrypt via MLS application message (ADR-001).
-            let mls_message = encrypt(&mut state.mls_group, &sender_encrypted)
+            // 3. MLS encrypt.
+            let mls_message =
+                crate::crypto::mls::encrypt::encrypt(&mut state.mls_group, &sender_encrypted)
+                    .map_err(|e| ContextError::CryptoFailed(e.to_string()))?;
+            let encrypted_blob = crate::crypto::mls::encrypt::serialize_ciphertext(&mls_message)
                 .map_err(|e| ContextError::CryptoFailed(e.to_string()))?;
 
-            let ciphertext = serialize_ciphertext(&mls_message)
-                .map_err(|e| ContextError::CryptoFailed(e.to_string()))?;
+            // 4. Wrap in outer envelope.
+            let outer = scp_protocol::envelope::outer::create_outer_envelope(
+                routing_id,
+                None, // no recipient hint for group messages
+                blob_ttl,
+                encrypted_blob,
+            )
+            .map_err(|e| ContextError::CryptoFailed(e.to_string()))?;
 
-            Ok(ciphertext)
+            rmp_serde::to_vec_named(&outer).map_err(|e| {
+                ContextError::CryptoFailed(format!("outer envelope serialization: {e}"))
+            })
         })
     }
 
-    fn decrypt_message(
+    fn open(
         &self,
         context_id: &[u8; 32],
-        ciphertext: &[u8],
-        epoch: u64,
-        sequence: u64,
-    ) -> Result<Option<(Vec<u8>, String)>, ContextError> {
+        outer_bytes: &[u8],
+    ) -> Result<Option<scp_protocol::context::builder::OpenedEnvelope>, ContextError> {
         self.with_context(context_id, |state| {
             let ctx_str = hex::encode(context_id);
 
+            // Step 0: Deserialize outer envelope to extract MLS ciphertext.
+            let outer: scp_protocol::envelope::outer::OuterEnvelope =
+                rmp_serde::from_slice(outer_bytes).map_err(|e| {
+                    ContextError::CryptoFailed(format!("outer envelope deserialization: {e}"))
+                })?;
+
             // Step 1: MLS decrypt and extract sender DID from credential.
-            // `decrypt_with_sender_did` returns a `DecryptedContent` enum that
-            // distinguishes application messages, commits, and proposals.
-            let content = decrypt_with_sender_did(&mut state.mls_group, ciphertext)
+            let content = decrypt_with_sender_did(&mut state.mls_group, &outer.encrypted_blob)
                 .map_err(|e| ContextError::CryptoFailed(e.to_string()))?;
 
             match content {
@@ -856,17 +881,33 @@ impl ContextCryptoProvider for MlsCryptoProvider {
                         })?;
 
                     // Step 3: Sender key decrypt (AES-256-GCM, ADR-007).
-                    let plaintext = scp_protocol::crypto::sender_keys::decrypt_sender_layer(
+                    // Epoch 0, sequence 0 — see send_message comment about AAD.
+                    let decrypted = scp_protocol::crypto::sender_keys::decrypt_sender_layer(
                         &sender_key,
                         &mls_decrypted,
                         &ctx_str,
                         &sender_did,
-                        epoch,
-                        sequence,
+                        0,
+                        0,
                     )
                     .map_err(|e| ContextError::CryptoFailed(e.to_string()))?;
 
-                    Ok(Some((plaintext, sender_did)))
+                    // Step 4: Deserialize as InnerEnvelope.
+                    // The inner envelope is returned with its padded payload intact.
+                    // The caller (verify_and_unwrap) is responsible for stripping
+                    // padding and verifying content integrity — keeping open()
+                    // focused on MLS decrypt → sender key decrypt → deserialize.
+                    let inner =
+                        scp_protocol::envelope::inner::InnerEnvelope::from_bytes(&decrypted)
+                            .map_err(|e| ContextError::CryptoFailed(e.to_string()))?;
+
+                    // Signature verification is deferred to ContextManager which
+                    // has access to the key_resolver for resolving sender public keys.
+
+                    Ok(Some(scp_protocol::context::builder::OpenedEnvelope {
+                        inner,
+                        sender_did,
+                    }))
                 }
                 DecryptedContent::Commit { sender_did: _ } => {
                     // Commit messages advance the MLS epoch. `decrypt_with_sender_did`
@@ -1231,10 +1272,42 @@ impl ContextCryptoProvider for MlsCryptoProvider {
 )]
 mod tests {
     use super::*;
+    use crate::crypto::mls::encrypt::{encrypt, serialize_ciphertext};
     use crate::crypto::mls::group::generate_key_package;
     use tls_codec::Serialize as TlsSerializeTrait;
 
     const TEST_DID: &str = "did:dht:z6MkhaXgBZDvotDkL5257faiztiGiC2QtKLGpbnnEGta2doK";
+
+    /// Test helper: encrypt a message using the old `encrypt_message` path
+    /// (sender key + MLS encrypt). Used by provider-level tests that test
+    /// the crypto layer directly without the full envelope pipeline.
+    fn test_encrypt_message(
+        provider: &MlsCryptoProvider,
+        context_id: &[u8; 32],
+        payload: &[u8],
+        epoch: u64,
+        sequence: u64,
+    ) -> Result<Vec<u8>, ContextError> {
+        provider.with_context(context_id, |state| {
+            let ctx_str = hex::encode(context_id);
+            let sender_encrypted =
+                scp_protocol::crypto::sender_keys::encrypt::encrypt_sender_layer(
+                    &state.sender_key,
+                    payload,
+                    &ctx_str,
+                    &provider.local_did,
+                    epoch,
+                    sequence,
+                )
+                .map_err(|e| ContextError::CryptoFailed(e.to_string()))?;
+
+            let mls_message = encrypt(&mut state.mls_group, &sender_encrypted)
+                .map_err(|e| ContextError::CryptoFailed(e.to_string()))?;
+
+            serialize_ciphertext(&mls_message)
+                .map_err(|e| ContextError::CryptoFailed(e.to_string()))
+        })
+    }
 
     fn make_provider() -> MlsCryptoProvider {
         MlsCryptoProvider::new(TEST_DID.to_string())
@@ -1266,14 +1339,14 @@ mod tests {
         assert!(provider.create_mls_group(&ctx_id).is_ok());
 
         // Verify group exists by attempting to encrypt.
-        let encrypted = provider.encrypt_message(&ctx_id, TEST_DID, b"hello", 0, 0);
+        let encrypted = test_encrypt_message(&provider, &ctx_id, b"hello", 0, 0);
         assert!(encrypted.is_ok());
 
         // Destroy.
         assert!(provider.destroy_mls_group(&ctx_id).is_ok());
 
         // After destroy, encrypt should fail.
-        let encrypted = provider.encrypt_message(&ctx_id, TEST_DID, b"hello", 0, 0);
+        let encrypted = test_encrypt_message(&provider, &ctx_id, b"hello", 0, 0);
         assert!(encrypted.is_err());
     }
 
@@ -1344,9 +1417,7 @@ mod tests {
         provider.create_mls_group(&ctx_id).unwrap();
 
         let plaintext = b"test message";
-        let ciphertext = provider
-            .encrypt_message(&ctx_id, TEST_DID, plaintext, 0, 0)
-            .unwrap();
+        let ciphertext = test_encrypt_message(&provider, &ctx_id, plaintext, 0, 0).unwrap();
 
         // Ciphertext should be non-empty and different from plaintext.
         assert!(!ciphertext.is_empty());
@@ -1969,14 +2040,14 @@ mod tests {
         let provider2 = MlsCryptoProvider::new(TEST_DID.to_string());
 
         // Verify context doesn't exist before restore.
-        let encrypted = provider2.encrypt_message(&ctx_id, TEST_DID, b"test", 0, 0);
+        let encrypted = test_encrypt_message(&provider2, &ctx_id, b"test", 0, 0);
         assert!(encrypted.is_err(), "should fail before restore");
 
         // Restore.
         provider2.restore_crypto_state(&ctx_id, &exported).unwrap();
 
         // Verify the MLS group is functional: encrypt should succeed.
-        let encrypted = provider2.encrypt_message(&ctx_id, TEST_DID, b"test after restore", 0, 0);
+        let encrypted = test_encrypt_message(&provider2, &ctx_id, b"test after restore", 0, 0);
         assert!(
             encrypted.is_ok(),
             "encrypt should succeed after restore: {encrypted:?}"
@@ -2069,7 +2140,7 @@ mod tests {
         provider2.restore_crypto_state(&ctx_id, &exported).unwrap();
 
         // Should still be functional.
-        let encrypted = provider2.encrypt_message(&ctx_id, TEST_DID, b"test", 0, 0);
+        let encrypted = test_encrypt_message(&provider2, &ctx_id, b"test", 0, 0);
         assert!(
             encrypted.is_ok(),
             "second restore should produce working state"

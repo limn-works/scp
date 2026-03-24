@@ -75,16 +75,6 @@ impl ContextCryptoProvider for MockCrypto {
     ) -> Result<(), ContextError> {
         Ok(())
     }
-    fn encrypt_message(
-        &self,
-        _id: &[u8; 32],
-        _sender_did: &str,
-        _payload: &[u8],
-        _epoch: u64,
-        _sequence: u64,
-    ) -> Result<Vec<u8>, ContextError> {
-        Ok(vec![0xAA])
-    }
     fn add_member(
         &self,
         _id: &[u8; 32],
@@ -105,6 +95,18 @@ impl ContextCryptoProvider for MockCrypto {
         _member_did: &str,
     ) -> Result<(), ContextError> {
         Ok(())
+    }
+
+    fn seal(
+        &self,
+        _context_id: &[u8; 32],
+        inner: &scp_protocol::envelope::inner::InnerEnvelope,
+        _routing_id: &[u8],
+        _blob_ttl: u32,
+    ) -> Result<Vec<u8>, ContextError> {
+        // Mock: serialize inner envelope directly (no encryption).
+        rmp_serde::to_vec_named(inner)
+            .map_err(|e| ContextError::CryptoFailed(format!("mock seal: {e}")))
     }
 }
 
@@ -481,7 +483,13 @@ async fn revoke_write_access_full_blocks_publishing() {
         },
     );
     let send_result = manager
-        .send_message(&handle, &dave(), b"should fail", None)
+        .send_message(
+            &handle,
+            &dave(),
+            b"should fail",
+            Some(&signing_key_for_did(&dave())),
+            None,
+        )
         .await;
     assert!(
         send_result.is_err(),
@@ -528,7 +536,13 @@ async fn revoke_write_access_future_only() {
         },
     );
     let send_result = manager
-        .send_message(&handle, &dave(), b"future message", None)
+        .send_message(
+            &handle,
+            &dave(),
+            b"future message",
+            Some(&signing_key_for_did(&dave())),
+            None,
+        )
         .await;
     assert!(
         send_result.is_err(),
@@ -596,7 +610,13 @@ async fn restore_write_access_forward_only() {
         },
     );
     let send_result = manager
-        .send_message(&handle, &dave(), b"after restore", None)
+        .send_message(
+            &handle,
+            &dave(),
+            b"after restore",
+            Some(&signing_key_for_did(&dave())),
+            None,
+        )
         .await;
     assert!(
         send_result.is_ok(),
@@ -1215,7 +1235,13 @@ async fn full_content_access_lifecycle() {
         },
     );
     let send_result = manager
-        .send_message(&handle, &dave(), b"blocked", None)
+        .send_message(
+            &handle,
+            &dave(),
+            b"blocked",
+            Some(&signing_key_for_did(&dave())),
+            None,
+        )
         .await;
     assert!(send_result.is_err());
 
@@ -1233,7 +1259,13 @@ async fn full_content_access_lifecycle() {
 
     // Dave should now be able to write again.
     let send_result = manager
-        .send_message(&handle, &dave(), b"restored", None)
+        .send_message(
+            &handle,
+            &dave(),
+            b"restored",
+            Some(&signing_key_for_did(&dave())),
+            None,
+        )
         .await;
     assert!(
         send_result.is_ok(),

@@ -320,6 +320,7 @@ impl ContextManager {
         sender_did: &str,
         payload: &[u8],
         sequence: u64,
+        signing_key: &ed25519_dalek::SigningKey,
     ) -> Result<(), ContextError> {
         let context_id_bytes = context_id_to_bytes(context_id);
 
@@ -333,17 +334,39 @@ impl ContextManager {
                 .map_or(0, |ctx| ctx.epoch.mls_epoch)
         };
 
-        // Encrypt using the crypto provider.
-        let encrypted = self.crypto.encrypt_message(
-            &context_id_bytes,
+        // Construct a minimal inner envelope for the recovery notification.
+        // Recovery notifications bypass the full send_message pipeline but
+        // still go through the envelope crypto layer (seal).
+        let timestamp = self.clock.now_millis();
+        let params = scp_protocol::envelope::inner::InnerEnvelopeParams {
+            version: scp_protocol::envelope::SCP_PROTOCOL_VERSION,
+            context_id,
             sender_did,
-            payload,
-            current_epoch,
+            epoch: current_epoch,
+            generation: 0,
             sequence,
+            timestamp,
+            message_type: scp_protocol::envelope::inner::MessageType::Recovery,
+            payload,
+            provenance: None,
+            signing_key_id: scp_protocol::identity::SigningKeyId::Active,
+        };
+
+        let inner = crate::envelope::inner::sign::create_inner_envelope_raw(&params, signing_key)
+            .map_err(|e| ContextError::CryptoFailed(e.to_string()))?;
+
+        // Use domain-separated routing ID for relay routing, distinct from
+        // the raw context_id_bytes used for MLS crypto keying.
+        let routing_id = scp_protocol::context::context_routing_id(context_id);
+        let encrypted = self.crypto.seal(
+            &context_id_bytes,
+            &inner,
+            &routing_id,
+            300, // 5 minute blob TTL
         )?;
 
-        // Send via transport.
-        self.transport.send_message(&context_id_bytes, &encrypted)?;
+        // Send via transport using the domain-separated routing ID.
+        self.transport.send_message(&routing_id, &encrypted)?;
 
         Ok(())
     }
@@ -367,6 +390,7 @@ impl ContextManager {
         recovering_did: &str,
         contact_did: &str,
         payload: &[u8],
+        signing_key: &ed25519_dalek::SigningKey,
     ) -> Result<(), ContextError> {
         // Find a context where both the recovering DID and the contact DID
         // are members. The first matching context is used for delivery.
@@ -383,8 +407,14 @@ impl ContextManager {
         match shared_context_id {
             Some(context_id) => {
                 // Contact notifications use sequence=4 (step 5 in recovery).
-                self.recovery_send_notification(&context_id, recovering_did, payload, 4)
-                    .await
+                self.recovery_send_notification(
+                    &context_id,
+                    recovering_did,
+                    payload,
+                    4,
+                    signing_key,
+                )
+                .await
             }
             None => Err(ContextError::TransportFailed(format!(
                 "no shared context found between {recovering_did} and {contact_did}"

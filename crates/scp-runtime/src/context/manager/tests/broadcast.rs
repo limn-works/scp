@@ -358,6 +358,7 @@ async fn broadcast_capabilities_enforced() {
             &"did:key:author1".into(),
             b"hello broadcast",
             Some(&author_signing_key),
+            None,
         )
         .await;
     assert!(result.is_ok(), "author should be able to publish");
@@ -370,6 +371,7 @@ async fn broadcast_capabilities_enforced() {
             &"did:key:sub1".into(),
             b"unauthorized",
             Some(&sub_signing_key),
+            None,
         )
         .await;
     assert!(result.is_err(), "subscriber should not be able to publish");

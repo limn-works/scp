@@ -1305,16 +1305,6 @@ mod tests {
         ) -> Result<(), ContextError> {
             Ok(())
         }
-        fn encrypt_message(
-            &self,
-            _context_id: &[u8; 32],
-            _sender_did: &str,
-            payload: &[u8],
-            _epoch: u64,
-            _sequence: u64,
-        ) -> Result<Vec<u8>, ContextError> {
-            Ok(payload.to_vec())
-        }
     }
 
     #[derive(Default)]
@@ -2462,16 +2452,6 @@ mod tests {
         ) -> Result<(), ContextError> {
             Ok(())
         }
-        fn encrypt_message(
-            &self,
-            _context_id: &[u8; 32],
-            _sender_did: &str,
-            payload: &[u8],
-            _epoch: u64,
-            _sequence: u64,
-        ) -> Result<Vec<u8>, ContextError> {
-            Ok(payload.to_vec())
-        }
     }
 
     /// Mock event log that fails to append.
@@ -2902,16 +2882,6 @@ mod tests {
             _member_did: &str,
         ) -> Result<(), ContextError> {
             Ok(())
-        }
-        fn encrypt_message(
-            &self,
-            _context_id: &[u8; 32],
-            _sender_did: &str,
-            payload: &[u8],
-            _epoch: u64,
-            _sequence: u64,
-        ) -> Result<Vec<u8>, ContextError> {
-            Ok(payload.to_vec())
         }
     }
 

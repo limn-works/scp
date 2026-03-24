@@ -1,4 +1,5 @@
 use super::*;
+use scp_protocol::context::governance::{GovernanceAction, RevocationScope};
 
 // -----------------------------------------------------------------------
 // Send message tests
@@ -12,7 +13,7 @@ async fn send_message_rejects_when_context_not_active() {
     handle.transition_to(&ContextState::Closing).await.unwrap();
 
     let result = manager
-        .send_message(&handle, &"did:key:creator".into(), b"hello", None)
+        .send_message(&handle, &"did:key:creator".into(), b"hello", None, None)
         .await;
     assert!(result.is_err());
     assert!(matches!(
@@ -28,7 +29,7 @@ async fn send_message_validates_ucan_before_sending() {
 
     // Try to send as a non-member -- should be denied.
     let result = manager
-        .send_message(&handle, &"did:key:nonexistent".into(), b"hello", None)
+        .send_message(&handle, &"did:key:nonexistent".into(), b"hello", None, None)
         .await;
     assert!(result.is_err());
 
@@ -43,9 +44,16 @@ async fn send_message_validates_ucan_before_sending() {
 #[tokio::test]
 async fn send_message_success_encrypts_and_sends() {
     let (manager, handle) = setup_active_context().await;
+    let sk = signing_key_for_did(&"did:key:creator".into());
 
     let result = manager
-        .send_message(&handle, &"did:key:creator".into(), b"hello world", None)
+        .send_message(
+            &handle,
+            &"did:key:creator".into(),
+            b"hello world",
+            Some(&sk),
+            None,
+        )
         .await;
     assert!(result.is_ok());
 
@@ -72,10 +80,11 @@ async fn send_message_success_encrypts_and_sends() {
 #[tokio::test]
 async fn send_message_assigns_monotonic_sequence_numbers() {
     let (manager, handle) = setup_active_context().await;
+    let sk = signing_key_for_did(&"did:key:creator".into());
 
     for i in 1..=5u8 {
         manager
-            .send_message(&handle, &"did:key:creator".into(), &[i], None)
+            .send_message(&handle, &"did:key:creator".into(), &[i], Some(&sk), None)
             .await
             .unwrap();
     }
@@ -123,10 +132,18 @@ async fn send_message_transport_failure_no_phantom_event() {
         .await
         .unwrap();
 
+    let sk = signing_key_for_did(&"did:key:creator".into());
+
     // send_message should fail because FailingTransport.send_message
     // returns an error.
     let result = manager
-        .send_message(&handle, &"did:key:creator".into(), b"hello", None)
+        .send_message(
+            &handle,
+            &"did:key:creator".into(),
+            b"hello",
+            Some(&sk),
+            None,
+        )
         .await;
     assert!(
         result.is_err(),
@@ -144,11 +161,7 @@ async fn send_message_transport_failure_no_phantom_event() {
         "no MessageSent event should be emitted when transport fails (#1420)"
     );
 
-    // Verify sequence number was NOT burned: a subsequent successful send
-    // on a working transport should get sequence 1, not 2.
-    // We can't retry with a different transport on the same manager, but
-    // we CAN verify the internal state via the membership sequence counter.
-    // The membership sequence should still be 0 (never incremented).
+    // Verify sequence number was NOT burned.
     let contexts = manager.contexts.lock().await;
     let ctx = contexts.get("test-ctx-fail").unwrap();
     let member = ctx
@@ -163,14 +176,20 @@ async fn send_message_transport_failure_no_phantom_event() {
 }
 
 /// When transport succeeds, `MessageSent` event must be present in the
-/// receive buffer with the correct sequence number. Validates the positive
-/// path after the #1420 restructure and Phase 3 sequence assignment.
+/// receive buffer with the correct sequence number.
 #[tokio::test]
 async fn send_message_transport_success_emits_event() {
     let (manager, handle) = setup_active_context().await;
+    let sk = signing_key_for_did(&"did:key:creator".into());
 
     let result = manager
-        .send_message(&handle, &"did:key:creator".into(), b"positive-path", None)
+        .send_message(
+            &handle,
+            &"did:key:creator".into(),
+            b"positive-path",
+            Some(&sk),
+            None,
+        )
         .await;
     assert!(
         result.is_ok(),
@@ -207,149 +226,9 @@ async fn send_message_transport_success_emits_event() {
 // deliver_incoming tests
 // -----------------------------------------------------------------------
 
-/// Helper: build a manager whose `MockCrypto` supports `decrypt_message`,
-/// returning `(plaintext_passthrough, sender_did)`.
-async fn setup_active_context_with_decrypt(sender_did: &str) -> (ContextManager, ContextHandle) {
-    let crypto = MockCrypto {
-        decrypt_sender_did: Some(sender_did.to_owned()),
-        ..MockCrypto::default()
-    };
-
-    let manager = ContextManager::new(
-        Box::new(crypto),
-        Box::new(MockTransport::connected()),
-        Box::new(MockEventLog::default()),
-        noop_key_resolver(),
-    );
-
-    let params = ContextParams {
-        ceiling: vec![
-            scp_protocol::context::params::Capability::new("messages:read"),
-            scp_protocol::context::params::Capability::new("messages:write"),
-        ],
-        ..ContextParams::default()
-    };
-
-    let handle = manager
-        .create_context("test-ctx".into(), params, "did:key:creator".into())
-        .await
-        .unwrap();
-
-    (manager, handle)
-}
-
-#[tokio::test]
-async fn deliver_incoming_success_for_member() {
-    let (manager, _handle) = setup_active_context_with_decrypt("did:key:creator").await;
-
-    let result = manager
-        .deliver_incoming("test-ctx", b"encrypted-payload")
-        .await;
-    assert!(result.is_ok());
-
-    let (plaintext, sender) = result
-        .unwrap()
-        .expect("expected Some for application message");
-    assert_eq!(plaintext, b"encrypted-payload");
-    assert_eq!(sender, "did:key:creator");
-
-    // Verify MessageReceived event was emitted.
-    let events = manager.drain_events("test-ctx").await;
-    let recv_events: Vec<_> = events
-        .iter()
-        .filter(|e| matches!(e, ContextEvent::MessageReceived { .. }))
-        .collect();
-    assert_eq!(recv_events.len(), 1);
-}
-
-#[tokio::test]
-async fn deliver_incoming_rejects_non_member_sender() {
-    // Crypto mock claims "did:key:intruder" sent the message, but that
-    // DID is not a member of the context.
-    let (manager, _handle) = setup_active_context_with_decrypt("did:key:intruder").await;
-
-    let result = manager.deliver_incoming("test-ctx", b"evil-payload").await;
-    assert!(result.is_err());
-    match result.unwrap_err() {
-        ContextError::MemberNotFound(msg) => {
-            assert!(
-                msg.contains("did:key:intruder"),
-                "error should mention the sender DID"
-            );
-        }
-        other => panic!("expected MemberNotFound, got: {other:?}"),
-    }
-
-    // Verify no MessageReceived event was emitted.
-    let events = manager.drain_events("test-ctx").await;
-    assert!(
-        events
-            .iter()
-            .all(|e| !matches!(e, ContextEvent::MessageReceived { .. })),
-        "no MessageReceived event should be emitted for non-member sender"
-    );
-}
-
-#[tokio::test]
-async fn deliver_incoming_rejects_write_revoked_sender() {
-    let (manager, _handle) = setup_active_context_with_decrypt("did:key:creator").await;
-
-    // Revoke write access for the creator.
-    {
-        let mut contexts = manager.contexts.lock().await;
-        let ctx = contexts.get_mut("test-ctx").unwrap();
-        ctx.access
-            .write_revoked_members
-            .insert(DID("did:key:creator".to_owned()));
-    }
-
-    let result = manager
-        .deliver_incoming("test-ctx", b"revoked-payload")
-        .await;
-    assert!(result.is_err());
-    match result.unwrap_err() {
-        ContextError::PermissionDenied(msg) => {
-            assert!(msg.contains("revoked"), "error should mention revocation");
-        }
-        other => panic!("expected PermissionDenied, got: {other:?}"),
-    }
-}
-
-#[tokio::test]
-async fn deliver_incoming_rejects_sender_without_messages_write() {
-    let (manager, _handle) = setup_active_context_with_decrypt("did:key:creator").await;
-
-    // Remove messages:write capability from the creator.
-    {
-        let mut contexts = manager.contexts.lock().await;
-        let ctx = contexts.get_mut("test-ctx").unwrap();
-        if let Some(caps) = ctx
-            .role_state
-            .member_capabilities
-            .get_mut("did:key:creator")
-        {
-            caps.remove(&Capability::MessagesWrite);
-        }
-    }
-
-    let result = manager
-        .deliver_incoming("test-ctx", b"no-write-cap-payload")
-        .await;
-    assert!(result.is_err());
-    match result.unwrap_err() {
-        ContextError::PermissionDenied(msg) => {
-            assert!(
-                msg.contains("messages:write"),
-                "error should mention missing capability"
-            );
-        }
-        other => panic!("expected PermissionDenied, got: {other:?}"),
-    }
-}
-
 #[tokio::test]
 async fn deliver_incoming_rejects_inactive_context() {
-    let (manager, handle) = setup_active_context_with_decrypt("did:key:creator").await;
+    let (manager, handle) = setup_active_context().await;
 
     handle.transition_to(&ContextState::Closing).await.unwrap();
 
@@ -363,7 +242,7 @@ async fn deliver_incoming_rejects_inactive_context() {
 
 #[tokio::test]
 async fn deliver_incoming_rejects_unknown_context() {
-    let (manager, _handle) = setup_active_context_with_decrypt("did:key:creator").await;
+    let (manager, _handle) = setup_active_context().await;
 
     let result = manager
         .deliver_incoming("nonexistent-ctx", b"payload")
@@ -433,6 +312,404 @@ async fn report_degraded_mode_noop_for_exact() {
     );
 }
 
+// -----------------------------------------------------------------------
+// Helpers for integration tests (round-trip, replay, tamper, access key)
+// -----------------------------------------------------------------------
+
+/// Creates a two-member context (creator=Alice, member=Bob) with
+/// `mock_key_resolver` for real signature verification. Both members have
+/// access keys and `messages:write` capability.
+///
+/// Returns `(manager, handle, sent_buffer)` where `sent_buffer` is a
+/// shared handle to the transport's sent-messages buffer for inspecting
+/// encrypted bytes after `send_message`.
+async fn setup_two_member_verified_context() -> (
+    ContextManager,
+    ContextHandle,
+    Arc<std::sync::Mutex<Vec<Vec<u8>>>>,
+) {
+    let transport = MockTransport::connected();
+    let sent = transport.sent_messages_handle();
+
+    let manager = ContextManager::new(
+        Box::new(MockCrypto::default()),
+        Box::new(transport),
+        Box::new(MockEventLog::default()),
+        mock_key_resolver(),
+    );
+
+    let params = ContextParams {
+        ceiling: vec![
+            scp_protocol::context::params::Capability::new("messages:read"),
+            scp_protocol::context::params::Capability::new("messages:write"),
+            scp_protocol::context::params::Capability::new("role:assign"),
+            Capability::MemberBan,
+        ],
+        ..ContextParams::default()
+    };
+
+    // Register Alice as a local DID so deliver_incoming can find the local
+    // member in the context (Fix 1: #1534 review).
+    manager.register_local_did("did:key:alice".into()).await;
+
+    let handle = manager
+        .create_context("test-ctx".into(), params, "did:key:alice".into())
+        .await
+        .unwrap();
+
+    // Add Bob as a member with access key.
+    {
+        let mut contexts = manager.contexts.lock().await;
+        let ctx = contexts.get_mut("test-ctx").unwrap();
+        ctx.membership
+            .add_member("did:key:bob".into(), "member".into(), vec![]);
+        ctx.role_state.members.insert("did:key:bob".to_owned());
+
+        // Generate and store Bob's access key so send_message wraps for Bob
+        // and deliver_incoming can unwrap for Bob.
+        let bob_access_key =
+            scp_protocol::crypto::access_keys::generate_access_key("test-ctx", "did:key:bob");
+        ctx.access
+            .access_key_store
+            .set("test-ctx", "did:key:bob", bob_access_key);
+    }
+
+    (manager, handle, sent)
+}
+
+/// Returns the last message captured by a transport sent-messages buffer.
+fn last_sent(sent: &Arc<std::sync::Mutex<Vec<Vec<u8>>>>) -> Vec<u8> {
+    sent.lock()
+        .unwrap()
+        .last()
+        .cloned()
+        .expect("no messages sent via transport")
+}
+
+// -----------------------------------------------------------------------
+// Integration tests: send → deliver round-trip (#1529, #1546, #1547)
+// -----------------------------------------------------------------------
+
+/// Full pipeline round-trip: `send_message` → capture bytes → `deliver_incoming`.
+/// Exercises envelope construction, signing, access key wrapping, sealing,
+/// opening, signature verification, anti-replay, and unwrapping (#1529).
+#[tokio::test]
+async fn send_then_deliver_roundtrip() {
+    let (manager, handle, sent) = setup_two_member_verified_context().await;
+    let alice_did: DID = "did:key:alice".into();
+    let alice_sk = signing_key_for_did(&alice_did);
+
+    // Alice sends a message.
+    manager
+        .send_message(
+            &handle,
+            &alice_did,
+            b"hello from alice",
+            Some(&alice_sk),
+            None,
+        )
+        .await
+        .unwrap();
+
+    // Capture the encrypted bytes from transport.
+    let encrypted = last_sent(&sent);
+
+    // Drain events from the send so they don't interfere with receive assertions.
+    let _ = manager.drain_events("test-ctx").await;
+
+    // Deliver to the same manager (simulates receiving on the same node).
+    let result = manager
+        .deliver_incoming("test-ctx", &encrypted)
+        .await
+        .unwrap();
+
+    // Verify plaintext and sender DID.
+    let (plaintext, sender_did) = result.expect("should return Some for ApplicationMessage");
+    assert_eq!(plaintext, b"hello from alice");
+    assert_eq!(sender_did, "did:key:alice");
+
+    // Verify MessageReceived event was pushed to the receive buffer.
+    let events = manager.drain_events("test-ctx").await;
+    let recv_events: Vec<_> = events
+        .iter()
+        .filter(|e| matches!(e, ContextEvent::MessageReceived { .. }))
+        .collect();
+    assert_eq!(recv_events.len(), 1);
+    if let ContextEvent::MessageReceived {
+        sender_did: s,
+        payload: p,
+    } = &recv_events[0]
+    {
+        assert_eq!(s.as_ref(), "did:key:alice");
+        assert_eq!(p, b"hello from alice");
+    }
+}
+
+/// Anti-replay: delivering the same encrypted bytes twice must fail the
+/// second time with a sequence regression error (#1546).
+#[tokio::test]
+async fn deliver_incoming_rejects_replayed_message() {
+    let (manager, handle, sent) = setup_two_member_verified_context().await;
+    let alice_did: DID = "did:key:alice".into();
+    let alice_sk = signing_key_for_did(&alice_did);
+
+    // Alice sends.
+    manager
+        .send_message(&handle, &alice_did, b"first", Some(&alice_sk), None)
+        .await
+        .unwrap();
+
+    let encrypted = last_sent(&sent);
+    let _ = manager.drain_events("test-ctx").await;
+
+    // First delivery succeeds.
+    let first = manager.deliver_incoming("test-ctx", &encrypted).await;
+    assert!(first.is_ok(), "first delivery should succeed");
+
+    // Second delivery of the same bytes must fail (replay).
+    let second = manager.deliver_incoming("test-ctx", &encrypted).await;
+    assert!(second.is_err(), "replayed message must be rejected");
+
+    let err_msg = format!("{:?}", second.unwrap_err());
+    assert!(
+        err_msg.contains("SequenceRegression") || err_msg.contains("sequence"),
+        "error should indicate sequence regression, got: {err_msg}"
+    );
+}
+
+/// Tampered signature: flipping a byte in the inner envelope's signature
+/// causes `deliver_incoming` to reject the message (#1547).
+#[tokio::test]
+async fn deliver_incoming_rejects_tampered_signature() {
+    let (manager, handle, sent) = setup_two_member_verified_context().await;
+    let alice_did: DID = "did:key:alice".into();
+    let alice_sk = signing_key_for_did(&alice_did);
+
+    manager
+        .send_message(&handle, &alice_did, b"original", Some(&alice_sk), None)
+        .await
+        .unwrap();
+
+    let encrypted = last_sent(&sent);
+
+    // MockCrypto seal = rmp_serde::to_vec_named(inner), so the bytes are
+    // a serialized InnerEnvelope. Deserialize, tamper, re-serialize.
+    let mut inner: scp_protocol::envelope::inner::InnerEnvelope =
+        rmp_serde::from_slice(&encrypted).unwrap();
+    // Flip a byte in the signature to invalidate it.
+    if !inner.signature.is_empty() {
+        inner.signature[0] ^= 0xFF;
+    }
+    let tampered = rmp_serde::to_vec_named(&inner).unwrap();
+
+    // deliver_incoming should reject the tampered message.
+    let result = manager.deliver_incoming("test-ctx", &tampered).await;
+    assert!(result.is_err(), "tampered signature must be rejected");
+
+    let err_msg = format!("{:?}", result.unwrap_err());
+    assert!(
+        err_msg.contains("signature") || err_msg.contains("Crypto"),
+        "error should mention signature failure, got: {err_msg}"
+    );
+}
+
+/// Wrong signing key: message signed with a key that doesn't match the
+/// sender's DID causes signature verification to fail (#1547).
+#[tokio::test]
+async fn deliver_incoming_rejects_wrong_signing_key() {
+    let (manager, handle, sent) = setup_two_member_verified_context().await;
+    let alice_did: DID = "did:key:alice".into();
+
+    // Use a WRONG signing key (Bob's key, not Alice's).
+    let wrong_sk = signing_key_for_did(&"did:key:bob".into());
+
+    // Alice sends a message but signs with Bob's key. send_message will
+    // succeed (it doesn't verify the key matches the DID on the send side).
+    manager
+        .send_message(&handle, &alice_did, b"wrong-key-msg", Some(&wrong_sk), None)
+        .await
+        .unwrap();
+
+    let encrypted = last_sent(&sent);
+    let _ = manager.drain_events("test-ctx").await;
+
+    // deliver_incoming should reject: the signature was made with Bob's key
+    // but the envelope claims Alice as sender, and verify_inner_signature
+    // resolves Alice's public key.
+    let result = manager.deliver_incoming("test-ctx", &encrypted).await;
+    assert!(result.is_err(), "wrong signing key must be rejected");
+
+    let err_msg = format!("{:?}", result.unwrap_err());
+    assert!(
+        err_msg.contains("signature") || err_msg.contains("Crypto"),
+        "error should mention signature failure, got: {err_msg}"
+    );
+}
+
+/// After revoking a member's read access, their access key is removed and
+/// `deliver_incoming` fails with "no access key" (#1529).
+#[tokio::test]
+async fn revoked_member_cannot_decrypt_new_messages() {
+    let (manager, handle, sent) = setup_two_member_verified_context().await;
+    let alice_did: DID = "did:key:alice".into();
+    let alice_sk = signing_key_for_did(&alice_did);
+
+    // Revoke Bob's read access via governance.
+    let bob_did: DID = "did:key:bob".into();
+    let proposal = approved_governance_proposal(
+        &alice_did,
+        "test-ctx",
+        &bob_did,
+        GovernanceAction::RevokeReadAccess {
+            did: bob_did.clone(),
+            scope: RevocationScope::Full,
+        },
+    );
+    manager
+        .execute_governance_action("test-ctx", &proposal)
+        .await
+        .unwrap();
+
+    // revoke_read_access_internal now destroys the access key automatically
+    // (§9.17.2 step 3), so no manual removal is needed.
+
+    // Verify the access key was actually removed by the governance action.
+    {
+        let contexts = manager.contexts.lock().await;
+        let ctx = contexts.get("test-ctx").unwrap();
+        assert!(
+            !ctx.access
+                .access_key_store
+                .contains("test-ctx", "did:key:bob"),
+            "Bob's access key should have been removed by revoke_read_access_internal"
+        );
+    }
+
+    // Drain all events accumulated so far.
+    let _ = manager.drain_events("test-ctx").await;
+
+    // Alice sends a new message (only wrapped for Alice, not Bob).
+    manager
+        .send_message(
+            &handle,
+            &alice_did,
+            b"secret for alice only",
+            Some(&alice_sk),
+            None,
+        )
+        .await
+        .unwrap();
+
+    let encrypted = last_sent(&sent);
+
+    // Create a separate manager simulating Bob's device. Bob has the same
+    // context but only his own membership. His access key was revoked.
+    let bob_manager = ContextManager::new(
+        Box::new(MockCrypto::default()),
+        Box::new(MockTransport::connected()),
+        Box::new(MockEventLog::default()),
+        mock_key_resolver(),
+    );
+    bob_manager.register_local_did("did:key:bob".into()).await;
+
+    let bob_params = ContextParams {
+        ceiling: vec![
+            scp_protocol::context::params::Capability::new("messages:read"),
+            scp_protocol::context::params::Capability::new("messages:write"),
+            scp_protocol::context::params::Capability::new("role:assign"),
+            Capability::MemberBan,
+        ],
+        ..ContextParams::default()
+    };
+    let _bob_handle = bob_manager
+        .create_context("test-ctx".into(), bob_params, "did:key:bob".into())
+        .await
+        .unwrap();
+
+    // Add Alice as a member (so sender membership check passes) but remove
+    // Bob's access key — simulating post-revocation state.
+    {
+        let mut contexts = bob_manager.contexts.lock().await;
+        let ctx = contexts.get_mut("test-ctx").unwrap();
+        ctx.membership
+            .add_member("did:key:alice".into(), "admin".into(), vec![]);
+        ctx.role_state.members.insert("did:key:alice".to_owned());
+        // Bob's access key was revoked — remove it.
+        ctx.access
+            .access_key_store
+            .remove("test-ctx", "did:key:bob");
+    }
+
+    // Bob's deliver_incoming should fail because he has no access key.
+    let result = bob_manager.deliver_incoming("test-ctx", &encrypted).await;
+    assert!(
+        result.is_err(),
+        "revoked member must not be able to decrypt"
+    );
+
+    let err_msg = format!("{:?}", result.unwrap_err());
+    assert!(
+        err_msg.contains("no access key") || err_msg.contains("access key"),
+        "error should mention missing access key, got: {err_msg}"
+    );
+}
+
+/// `RotateContentKeys` governance action emits a `ContentKeysRotated` event
+/// and triggers key rotation (#1529).
+#[tokio::test]
+async fn rotate_content_keys_regenerates_access_keys() {
+    let (manager, _handle, _sent) = setup_two_member_verified_context().await;
+    let alice_did: DID = "did:key:alice".into();
+
+    // Record that we have access keys before rotation.
+    {
+        let contexts = manager.contexts.lock().await;
+        let ctx = contexts.get("test-ctx").unwrap();
+        let all_keys = ctx.access.access_key_store.get_all("test-ctx");
+        assert!(
+            all_keys.contains_key("did:key:alice"),
+            "Alice should have an access key"
+        );
+        assert!(
+            all_keys.contains_key("did:key:bob"),
+            "Bob should have an access key"
+        );
+    }
+
+    // Drain pre-existing events.
+    let _ = manager.drain_events("test-ctx").await;
+
+    // Execute RotateContentKeys governance action.
+    let bob_did: DID = "did:key:bob".into();
+    let proposal = approved_governance_proposal(
+        &alice_did,
+        "test-ctx",
+        &bob_did,
+        GovernanceAction::RotateContentKeys {
+            reason: Some("periodic rotation".to_owned()),
+        },
+    );
+    manager
+        .execute_governance_action("test-ctx", &proposal)
+        .await
+        .unwrap();
+
+    // Verify ContentKeysRotated event was emitted.
+    let events = manager.drain_events("test-ctx").await;
+    let rotate_events: Vec<_> = events
+        .iter()
+        .filter(|e| matches!(e, ContextEvent::ContentKeysRotated { .. }))
+        .collect();
+    assert_eq!(
+        rotate_events.len(),
+        1,
+        "exactly one ContentKeysRotated event should be emitted"
+    );
+    if let ContextEvent::ContentKeysRotated { reason } = &rotate_events[0] {
+        assert_eq!(reason.as_deref(), Some("periodic rotation"));
+    }
+}
+
 /// `report_degraded_mode` is a no-op for an unknown context.
 #[tokio::test]
 async fn report_degraded_mode_noop_for_unknown_context() {
@@ -474,4 +751,715 @@ async fn report_degraded_mode_accumulates() {
         .filter(|e| matches!(e, ContextEvent::DegradedMode { .. }))
         .collect();
     assert_eq!(degraded_events.len(), 3);
+}
+
+// -----------------------------------------------------------------------
+// Reorder buffer tests (§9.8.5)
+// -----------------------------------------------------------------------
+
+/// Out-of-order message (sequence 2 delivered before sequence 1) is buffered
+/// and returns `Ok(None)` (§9.8.5).
+#[tokio::test]
+#[allow(clippy::await_holding_lock)]
+async fn deliver_incoming_buffers_out_of_order_message() {
+    let (manager, handle, sent) = setup_two_member_verified_context().await;
+    let alice_did: DID = "did:key:alice".into();
+    let alice_sk = signing_key_for_did(&alice_did);
+
+    // Send two messages in order (seq 1, 2).
+    for msg in &[b"msg-1".as_slice(), b"msg-2".as_slice()] {
+        manager
+            .send_message(&handle, &alice_did, msg, Some(&alice_sk), None)
+            .await
+            .unwrap();
+    }
+
+    let sent_guard = sent.lock().unwrap();
+    let blob2 = sent_guard[1].clone();
+    drop(sent_guard);
+
+    let _ = manager.drain_events("test-ctx").await;
+
+    // Deliver sequence 2 first (out of order -- should be buffered).
+    let result = manager.deliver_incoming("test-ctx", &blob2).await;
+    assert!(
+        result.is_ok(),
+        "out-of-order message should not error: {:?}",
+        result.as_ref().err()
+    );
+    assert!(
+        result.unwrap().is_none(),
+        "out-of-order message should return None (buffered)"
+    );
+
+    // Verify the reorder buffer has the message.
+    let contexts = manager.contexts.lock().await;
+    let ctx = contexts.get("test-ctx").unwrap();
+    assert_eq!(
+        ctx.reorder_buffer
+            .buffered_count("test-ctx", "did:key:alice"),
+        1,
+        "one message should be buffered"
+    );
+}
+
+/// When the gap fills, both the gap-filling message and all consecutive
+/// buffered messages are delivered in order (§9.8.5).
+#[tokio::test]
+#[allow(clippy::await_holding_lock)]
+async fn deliver_incoming_gap_fill_delivers_buffered() {
+    let (manager, handle, sent) = setup_two_member_verified_context().await;
+    let alice_did: DID = "did:key:alice".into();
+    let alice_sk = signing_key_for_did(&alice_did);
+
+    // Send three messages in order.
+    for msg in &[
+        b"msg-1".as_slice(),
+        b"msg-2".as_slice(),
+        b"msg-3".as_slice(),
+    ] {
+        manager
+            .send_message(&handle, &alice_did, msg, Some(&alice_sk), None)
+            .await
+            .unwrap();
+    }
+
+    let sent_guard = sent.lock().unwrap();
+    let blob1 = sent_guard[0].clone();
+    let blob2 = sent_guard[1].clone();
+    let blob3 = sent_guard[2].clone();
+    drop(sent_guard);
+
+    let _ = manager.drain_events("test-ctx").await;
+
+    // Deliver out of order: 2, 3, then 1.
+    let result = manager.deliver_incoming("test-ctx", &blob2).await;
+    assert!(result.unwrap().is_none(), "seq 2 should be buffered");
+
+    let result = manager.deliver_incoming("test-ctx", &blob3).await;
+    assert!(result.unwrap().is_none(), "seq 3 should be buffered");
+
+    // No MessageReceived events yet (all buffered).
+    let events = manager.drain_events("test-ctx").await;
+    let recv_events: Vec<_> = events
+        .iter()
+        .filter(|e| matches!(e, ContextEvent::MessageReceived { .. }))
+        .collect();
+    assert!(
+        recv_events.is_empty(),
+        "no messages should be delivered while gap exists"
+    );
+
+    // Deliver sequence 1 -- fills the gap, delivers all three.
+    let result = manager.deliver_incoming("test-ctx", &blob1).await;
+    let (plaintext, sender) = result.unwrap().expect("seq 1 should be delivered");
+    assert_eq!(plaintext, b"msg-1");
+    assert_eq!(sender, "did:key:alice");
+
+    // All three messages should now be in the receive buffer in order.
+    let events = manager.drain_events("test-ctx").await;
+    let recv_events: Vec<_> = events
+        .into_iter()
+        .filter(|e| matches!(e, ContextEvent::MessageReceived { .. }))
+        .collect();
+    assert_eq!(
+        recv_events.len(),
+        3,
+        "all three messages should be delivered"
+    );
+
+    // Check order: msg-1, msg-2, msg-3.
+    let payloads: Vec<Vec<u8>> = recv_events
+        .iter()
+        .filter_map(|e| {
+            if let ContextEvent::MessageReceived { payload, .. } = e {
+                Some(payload.clone())
+            } else {
+                None
+            }
+        })
+        .collect();
+    assert_eq!(payloads[0], b"msg-1");
+    assert_eq!(payloads[1], b"msg-2");
+    assert_eq!(payloads[2], b"msg-3");
+
+    // Verify the reorder buffer is now empty.
+    let contexts = manager.contexts.lock().await;
+    let ctx = contexts.get("test-ctx").unwrap();
+    assert_eq!(
+        ctx.reorder_buffer.total_buffered(),
+        0,
+        "reorder buffer should be empty after gap fill"
+    );
+}
+
+/// Replayed message (same encrypted bytes delivered twice) is rejected
+/// even with the reorder buffer active (§9.8.2).
+#[tokio::test]
+async fn deliver_incoming_rejects_replay_with_reorder_buffer() {
+    let (manager, handle, sent) = setup_two_member_verified_context().await;
+    let alice_did: DID = "did:key:alice".into();
+    let alice_sk = signing_key_for_did(&alice_did);
+
+    manager
+        .send_message(&handle, &alice_did, b"msg-1", Some(&alice_sk), None)
+        .await
+        .unwrap();
+
+    let blob = last_sent(&sent);
+    let _ = manager.drain_events("test-ctx").await;
+
+    // First delivery succeeds.
+    let result = manager.deliver_incoming("test-ctx", &blob).await;
+    assert!(result.is_ok());
+
+    // Replay the same bytes -- must fail.
+    let result = manager.deliver_incoming("test-ctx", &blob).await;
+    assert!(result.is_err(), "replayed message must be rejected");
+    let err_msg = format!("{:?}", result.unwrap_err());
+    assert!(
+        err_msg.contains("SequenceRegression") || err_msg.contains("sequence"),
+        "error should indicate sequence issue, got: {err_msg}"
+    );
+}
+
+// -----------------------------------------------------------------------
+// ReorderBuffer unit tests (pure protocol-level)
+// -----------------------------------------------------------------------
+
+#[test]
+#[allow(clippy::cast_possible_truncation)]
+fn reorder_buffer_drain_consecutive() {
+    use scp_protocol::envelope::validation::{BufferedMessage, ReorderBuffer};
+
+    let mut buf = ReorderBuffer::default();
+    let inner = scp_protocol::envelope::inner::InnerEnvelope {
+        version: 0x0100,
+        context_id: "ctx".to_owned(),
+        sender_did: "did:key:a".to_owned(),
+        epoch: 0,
+        generation: 0,
+        sequence: 3,
+        timestamp: 100,
+        message_type: scp_protocol::envelope::inner::MessageType::Content,
+        payload: vec![],
+        signature: [0u8; 64],
+        payload_hash: [0u8; 32],
+        provenance_hash: [0u8; 32],
+        signing_key_id: scp_protocol::identity::SigningKeyId::Active,
+        provenance: None,
+        extensions: std::collections::HashMap::new(),
+    };
+
+    // Buffer messages at seq 3, 4, 5.
+    for seq in 3..=5 {
+        let mut msg_inner = inner.clone();
+        msg_inner.sequence = seq;
+        let msg = BufferedMessage {
+            inner: msg_inner,
+            sender_did: "did:key:a".to_owned(),
+            plaintext: vec![seq as u8],
+            received_at: 100,
+        };
+        buf.buffer(msg);
+    }
+
+    assert_eq!(buf.buffered_count("ctx", "did:key:a"), 3);
+
+    // Drain consecutive starting from seq 3.
+    let drained = buf.drain_consecutive("ctx", "did:key:a", 3);
+    assert_eq!(drained.len(), 3);
+    assert_eq!(drained[0].plaintext, vec![3]);
+    assert_eq!(drained[1].plaintext, vec![4]);
+    assert_eq!(drained[2].plaintext, vec![5]);
+    assert_eq!(buf.total_buffered(), 0);
+}
+
+#[test]
+#[allow(clippy::cast_possible_truncation)]
+fn reorder_buffer_drain_stops_at_gap() {
+    use scp_protocol::envelope::validation::{BufferedMessage, ReorderBuffer};
+
+    let mut buf = ReorderBuffer::default();
+    let inner = scp_protocol::envelope::inner::InnerEnvelope {
+        version: 0x0100,
+        context_id: "ctx".to_owned(),
+        sender_did: "did:key:a".to_owned(),
+        epoch: 0,
+        generation: 0,
+        sequence: 0,
+        timestamp: 100,
+        message_type: scp_protocol::envelope::inner::MessageType::Content,
+        payload: vec![],
+        signature: [0u8; 64],
+        payload_hash: [0u8; 32],
+        provenance_hash: [0u8; 32],
+        signing_key_id: scp_protocol::identity::SigningKeyId::Active,
+        provenance: None,
+        extensions: std::collections::HashMap::new(),
+    };
+
+    // Buffer messages at seq 3 and 5 (gap at 4).
+    for seq in [3, 5] {
+        let mut msg_inner = inner.clone();
+        msg_inner.sequence = seq;
+        let msg = BufferedMessage {
+            inner: msg_inner,
+            sender_did: "did:key:a".to_owned(),
+            plaintext: vec![seq as u8],
+            received_at: 100,
+        };
+        buf.buffer(msg);
+    }
+
+    // Drain from 3: should only get seq 3 (gap at 4).
+    let drained = buf.drain_consecutive("ctx", "did:key:a", 3);
+    assert_eq!(drained.len(), 1);
+    assert_eq!(drained[0].plaintext, vec![3]);
+    // Seq 5 should remain buffered.
+    assert_eq!(buf.buffered_count("ctx", "did:key:a"), 1);
+}
+
+#[test]
+#[allow(clippy::cast_possible_truncation)]
+fn reorder_buffer_overflow_force_delivers() {
+    use scp_protocol::envelope::validation::{BufferedMessage, GapCloseReason, ReorderBuffer};
+
+    // Buffer with max size 3.
+    let mut buf = ReorderBuffer::new(3, 30_000);
+    let inner = scp_protocol::envelope::inner::InnerEnvelope {
+        version: 0x0100,
+        context_id: "ctx".to_owned(),
+        sender_did: "did:key:a".to_owned(),
+        epoch: 0,
+        generation: 0,
+        sequence: 0,
+        timestamp: 100,
+        message_type: scp_protocol::envelope::inner::MessageType::Content,
+        payload: vec![],
+        signature: [0u8; 64],
+        payload_hash: [0u8; 32],
+        provenance_hash: [0u8; 32],
+        signing_key_id: scp_protocol::identity::SigningKeyId::Active,
+        provenance: None,
+        extensions: std::collections::HashMap::new(),
+    };
+
+    // Buffer 3 messages — no overflow yet.
+    for seq in 2..=4 {
+        let mut msg_inner = inner.clone();
+        msg_inner.sequence = seq;
+        let msg = BufferedMessage {
+            inner: msg_inner,
+            sender_did: "did:key:a".to_owned(),
+            plaintext: vec![seq as u8],
+            received_at: 100,
+        };
+        let result = buf.buffer(msg);
+        assert!(result.is_none(), "no overflow at count {seq}");
+    }
+
+    // 4th message triggers overflow.
+    let mut msg_inner = inner;
+    msg_inner.sequence = 5;
+    let msg = BufferedMessage {
+        inner: msg_inner,
+        sender_did: "did:key:a".to_owned(),
+        plaintext: vec![5],
+        received_at: 100,
+    };
+    let result = buf.buffer(msg);
+    assert!(result.is_some(), "4th message should trigger overflow");
+
+    let (gap_info, messages) = result.unwrap();
+    assert_eq!(gap_info.reason, GapCloseReason::BufferFull);
+    assert_eq!(
+        messages.len(),
+        4,
+        "all 4 buffered messages should be returned"
+    );
+    assert_eq!(
+        buf.total_buffered(),
+        0,
+        "buffer should be empty after overflow"
+    );
+}
+
+#[test]
+fn reorder_buffer_gap_timeout() {
+    use scp_protocol::envelope::validation::{
+        BufferedMessage, GapCloseReason, ReorderBuffer, SequenceTracker,
+    };
+
+    let mut buf = ReorderBuffer::new(100, 30_000); // 30s timeout
+    let tracker = SequenceTracker::new();
+    let inner = scp_protocol::envelope::inner::InnerEnvelope {
+        version: 0x0100,
+        context_id: "ctx".to_owned(),
+        sender_did: "did:key:a".to_owned(),
+        epoch: 0,
+        generation: 0,
+        sequence: 2,
+        timestamp: 100,
+        message_type: scp_protocol::envelope::inner::MessageType::Content,
+        payload: vec![],
+        signature: [0u8; 64],
+        payload_hash: [0u8; 32],
+        provenance_hash: [0u8; 32],
+        signing_key_id: scp_protocol::identity::SigningKeyId::Active,
+        provenance: None,
+        extensions: std::collections::HashMap::new(),
+    };
+
+    // Buffer a message at seq 2 with received_at = 1000.
+    let msg = BufferedMessage {
+        inner,
+        sender_did: "did:key:a".to_owned(),
+        plaintext: vec![2],
+        received_at: 1000,
+    };
+    buf.buffer(msg);
+
+    // At time 20_000 (20s later) — no timeout yet.
+    let timed_out = buf.drain_timed_out(20_000, &tracker);
+    assert!(timed_out.is_empty(), "should not timeout at 20s");
+
+    // At time 31_001 (30s + 1ms later) — should timeout.
+    let timed_out = buf.drain_timed_out(31_001, &tracker);
+    assert_eq!(timed_out.len(), 1, "should timeout at 31s");
+
+    let (gap_info, messages) = &timed_out[0];
+    assert_eq!(gap_info.reason, GapCloseReason::Timeout);
+    assert_eq!(messages.len(), 1);
+    assert_eq!(messages[0].plaintext, vec![2]);
+    assert_eq!(
+        buf.total_buffered(),
+        0,
+        "buffer should be empty after timeout"
+    );
+}
+
+/// `SequenceTracker::validate` returns Expected for in-order, Ahead for gaps.
+#[test]
+fn sequence_tracker_validate_returns_correct_check() {
+    use scp_protocol::envelope::validation::{SequenceCheck, SequenceTracker};
+
+    let mut tracker = SequenceTracker::new();
+    let inner = scp_protocol::envelope::inner::InnerEnvelope {
+        version: 0x0100,
+        context_id: "ctx".to_owned(),
+        sender_did: "did:key:a".to_owned(),
+        epoch: 0,
+        generation: 0,
+        sequence: 1,
+        timestamp: 100,
+        message_type: scp_protocol::envelope::inner::MessageType::Content,
+        payload: vec![],
+        signature: [0u8; 64],
+        payload_hash: [0u8; 32],
+        provenance_hash: [0u8; 32],
+        signing_key_id: scp_protocol::identity::SigningKeyId::Active,
+        provenance: None,
+        extensions: std::collections::HashMap::new(),
+    };
+
+    // First message (seq 1) should be Expected.
+    assert_eq!(tracker.validate(&inner).unwrap(), SequenceCheck::Expected);
+
+    // Advance tracker.
+    tracker.advance("ctx", "did:key:a", 1, 100);
+
+    // Seq 2 should be Expected.
+    let mut inner2 = inner.clone();
+    inner2.sequence = 2;
+    inner2.timestamp = 101;
+    assert_eq!(tracker.validate(&inner2).unwrap(), SequenceCheck::Expected);
+
+    // Seq 4 should be Ahead (gap at 3).
+    let mut inner4 = inner.clone();
+    inner4.sequence = 4;
+    inner4.timestamp = 102;
+    assert_eq!(
+        tracker.validate(&inner4).unwrap(),
+        SequenceCheck::Ahead { expected: 2 }
+    );
+
+    // Seq 1 should be SequenceRegression.
+    let mut inner_replay = inner;
+    inner_replay.sequence = 1;
+    inner_replay.timestamp = 103;
+    assert!(tracker.validate(&inner_replay).is_err());
+}
+
+// -----------------------------------------------------------------------
+// Outer envelope structure (#1534 criterion 7)
+// -----------------------------------------------------------------------
+
+/// Verifies that `send_message` produces an outer envelope with the correct
+/// `routing_id` (domain-separated derivation), non-zero `blob_ttl`, and
+/// non-empty `encrypted_blob`.
+///
+/// NOTE: With `MockCrypto`, `seal` serializes the `InnerEnvelope` directly
+/// (no real `OuterEnvelope` wrapping). This test verifies the `routing_id`
+/// derivation function used by `build_encrypted_envelope` matches the
+/// expected value.
+#[tokio::test]
+async fn send_message_routing_id_is_domain_separated() {
+    let context_id = "test-ctx";
+
+    // Verify context_routing_id is domain-separated from raw context_id_bytes.
+    let routing_id = scp_protocol::context::context_routing_id(context_id);
+    let raw = scp_protocol::context::context_id_bytes(context_id);
+    assert_ne!(
+        routing_id, raw,
+        "domain-separated routing_id must differ from raw context_id_bytes"
+    );
+
+    // Verify derive_routing_id delegates to context_routing_id.
+    let derived = super::super::messaging::derive_routing_id(context_id);
+    assert_eq!(
+        derived, routing_id,
+        "derive_routing_id must delegate to context_routing_id"
+    );
+}
+
+/// Verifies that `send_message` captures non-empty encrypted bytes via transport.
+#[tokio::test]
+async fn send_message_produces_non_empty_encrypted_blob() {
+    let (manager, handle, sent) = setup_two_member_verified_context().await;
+    let alice_did: DID = "did:key:alice".into();
+    let alice_sk = signing_key_for_did(&alice_did);
+
+    manager
+        .send_message(&handle, &alice_did, b"envelope-test", Some(&alice_sk), None)
+        .await
+        .unwrap();
+
+    let encrypted = last_sent(&sent);
+    assert!(
+        !encrypted.is_empty(),
+        "encrypted blob must be non-empty after send_message"
+    );
+}
+
+// -----------------------------------------------------------------------
+// Outer envelope structure tests (#1534-AC7)
+// -----------------------------------------------------------------------
+
+/// Verifies that `send_message` produces bytes that can be deserialized as
+/// an `InnerEnvelope` (mock format) and that the routing ID passed to
+/// transport matches the domain-separated `context_routing_id`.
+#[tokio::test]
+async fn send_message_produces_valid_outer_envelope() {
+    let transport = MockTransport::connected();
+    let sent_handle = transport.sent_messages_handle();
+    let routing_handle = transport.routing_ids_handle();
+
+    let manager = ContextManager::new(
+        Box::new(MockCrypto::default()),
+        Box::new(transport),
+        Box::new(MockEventLog::default()),
+        mock_key_resolver(),
+    );
+
+    let params = ContextParams {
+        ceiling: vec![
+            scp_protocol::context::params::Capability::new("messages:read"),
+            scp_protocol::context::params::Capability::new("messages:write"),
+        ],
+        ..ContextParams::default()
+    };
+
+    let handle = manager
+        .create_context("envelope-test-ctx".into(), params, "did:key:creator".into())
+        .await
+        .unwrap();
+
+    let sk = signing_key_for_did(&"did:key:creator".into());
+
+    manager
+        .send_message(
+            &handle,
+            &"did:key:creator".into(),
+            b"outer-envelope-test",
+            Some(&sk),
+            None,
+        )
+        .await
+        .unwrap();
+
+    // 1. Verify transport received exactly one message.
+    let sent = sent_handle.lock().unwrap();
+    assert_eq!(sent.len(), 1, "exactly one message should be sent");
+
+    // 2. Verify the bytes can be deserialized as InnerEnvelope (mock format).
+    //    MockCrypto::seal serializes InnerEnvelope directly via MessagePack.
+    let inner: scp_protocol::envelope::inner::InnerEnvelope = rmp_serde::from_slice(&sent[0])
+        .unwrap_or_else(|e| panic!("transport bytes should deserialize as InnerEnvelope: {e}"));
+    assert_eq!(
+        inner.sender_did, "did:key:creator",
+        "InnerEnvelope sender_did must match"
+    );
+    assert_eq!(
+        inner.context_id, "envelope-test-ctx",
+        "InnerEnvelope context_id must match"
+    );
+
+    // 3. Verify routing ID uses domain-separated derivation.
+    let routing_ids = routing_handle.lock().unwrap();
+    assert_eq!(routing_ids.len(), 1, "exactly one routing ID");
+    let expected_routing_id = scp_protocol::context::context_routing_id("envelope-test-ctx");
+    assert_eq!(
+        routing_ids[0], expected_routing_id,
+        "routing ID must use domain-separated context_routing_id, \
+         not raw context_id_bytes"
+    );
+
+    // 4. Verify routing ID is NOT the raw context_id_bytes.
+    let raw_bytes = scp_protocol::context::context_id_bytes("envelope-test-ctx");
+    assert_ne!(
+        routing_ids[0], raw_bytes,
+        "routing ID must differ from raw context_id_bytes"
+    );
+}
+
+// -----------------------------------------------------------------------
+// Cross-context tool invocation provenance (#1536 criteria 1, 5, 6)
+// -----------------------------------------------------------------------
+
+/// Verifies that `invoke_cross_context` attaches provenance with correct
+/// source context, tool name, and timestamp (#1536 criterion 5).
+#[tokio::test]
+async fn cross_context_tool_invocation_attaches_provenance() {
+    use scp_protocol::context::roles::{Capability, CapabilityCeiling, ContextRoleState};
+    use scp_protocol::context::tools::interface::{ToolInterface, invoke_cross_context};
+    use scp_protocol::context::tools::registry::ToolRegistry;
+    use scp_protocol::provenance::attach::{SourceContextInfo, attach_provenance};
+    use scp_protocol::provenance::{CounterpartyPolicy, DiscoveryMethod, SourceType};
+
+    let (src, tgt, tid) = ("source-ctx", "target-ctx", "test-tool");
+    let did: DID = "did:key:invoker".into();
+    let caps = [
+        Capability::MessagesRead,
+        Capability::MessagesWrite,
+        Capability::ToolRegister,
+        Capability::ToolInvokeAll,
+        Capability::RoleAssign,
+    ];
+    let ceiling = CapabilityCeiling::new(caps);
+    let role_state = ContextRoleState::new(
+        src,
+        did.as_ref(),
+        ceiling,
+        vec![],
+        &scp_primitives::SystemClock,
+    )
+    .unwrap();
+
+    // Use insert() directly to bypass schema specificity validation
+    // (this test is about provenance, not tool registration).
+    let mut registry = ToolRegistry::new();
+    registry.insert(test_tool_registration(tid));
+
+    let mut interface = ToolInterface {
+        tool_id: tid.to_owned(),
+        source_context: src.to_owned(),
+        target_context: tgt.to_owned(),
+        approved_by_source: true,
+        approved_by_target: true,
+        outbound_policy: None,
+        inbound_policy: None,
+        rate_limit: None,
+        per_caller_rate_limit: None,
+    };
+
+    let src_info = SourceContextInfo {
+        context_id: src.to_owned(),
+        source_type: SourceType::Persistent,
+        memory_scope: scp_protocol::context::MemoryScope::Full,
+        members: vec![did.clone()],
+        discovery_method: DiscoveryMethod::OutOfBand,
+        data_age: std::time::Duration::from_secs(0),
+        purpose: Some(format!("cross-context tool invocation: {tid}")),
+        counterparty_policy: CounterpartyPolicy::Full,
+    };
+
+    let result = invoke_cross_context(
+        src,
+        None,
+        &mut interface,
+        &serde_json::json!({"key": "value"}),
+        &did,
+        &role_state,
+        &registry,
+        0,
+        |_| Ok(serde_json::json!({"result": "ok"})),
+        &scp_primitives::SystemClock,
+        &src_info,
+    );
+
+    let (output, source_event, target_event) = result.unwrap();
+    assert_eq!(output["result"], "ok");
+    assert_eq!(source_event.source_context, src);
+    assert_eq!(source_event.target_context, tgt);
+    assert_eq!(target_event.source_context, src);
+    assert_eq!(source_event.tool_id, tid);
+
+    // Verify provenance can be independently constructed for the same flow.
+    let prov = attach_provenance(
+        &SourceContextInfo {
+            context_id: tgt.to_owned(),
+            source_type: SourceType::Persistent,
+            memory_scope: scp_protocol::context::MemoryScope::Full,
+            members: Vec::new(),
+            discovery_method: DiscoveryMethod::SharedContext(src.to_owned()),
+            data_age: std::time::Duration::from_secs(0),
+            purpose: Some(format!("cross-context tool invocation: {tid}")),
+            counterparty_policy: CounterpartyPolicy::Redacted,
+        },
+        &src.to_owned(),
+        None,
+        None,
+        None,
+    );
+    assert_eq!(prov.source_context, tgt);
+    assert_eq!(prov.chain_depth, 0);
+    assert!(prov.purpose.unwrap().contains(tid));
+}
+
+/// Verifies that `evaluate_quality` returns a non-zero quality score for
+/// cross-context data with provenance attached (#1536 criterion 6).
+#[tokio::test]
+async fn evaluate_provenance_quality_for_cross_context_data() {
+    use scp_protocol::provenance::attach::{SourceContextInfo, attach_provenance};
+    use scp_protocol::provenance::evaluate::{SourceContextState, evaluate_quality};
+    use scp_protocol::provenance::{
+        CounterpartyPolicy, DiscoveryMethod, ProvenanceQuality, SourceType,
+    };
+
+    let source_info = SourceContextInfo {
+        context_id: "target-ctx".to_owned(),
+        source_type: SourceType::Persistent,
+        memory_scope: scp_protocol::context::MemoryScope::Full,
+        members: vec!["did:key:member1".into()],
+        discovery_method: DiscoveryMethod::SharedContext("source-ctx".to_owned()),
+        data_age: std::time::Duration::from_secs(0),
+        purpose: Some("cross-context tool output".to_owned()),
+        counterparty_policy: CounterpartyPolicy::Full,
+    };
+
+    let provenance = attach_provenance(&source_info, &"source-ctx".to_owned(), None, None, None);
+
+    // Evaluate quality — persistent source with active state should yield
+    // PersistentVerifiable.
+    let quality = evaluate_quality(Some(&provenance), &SourceContextState::Active);
+    assert!(
+        quality > ProvenanceQuality::NoProvenance,
+        "cross-context data with provenance should have quality above NoProvenance, got {quality:?}"
+    );
+    assert_eq!(
+        quality,
+        ProvenanceQuality::PersistentVerifiable,
+        "persistent source with active context should be PersistentVerifiable"
+    );
 }

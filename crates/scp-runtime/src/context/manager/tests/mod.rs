@@ -89,9 +89,6 @@ pub(super) struct MockCrypto {
     /// Shared handle for test code to observe `advance_epoch` calls after
     /// the mock has been moved into the `ContextManager`.
     pub(super) epochs_advanced_shared: Arc<std::sync::Mutex<Vec<[u8; 32]>>>,
-    /// When `Some`, `decrypt_message` returns `(ciphertext, sender_did)`.
-    /// When `None`, the default trait impl (error) is used.
-    pub(super) decrypt_sender_did: Option<String>,
 }
 
 impl ContextCryptoProvider for MockCrypto {
@@ -183,37 +180,36 @@ impl ContextCryptoProvider for MockCrypto {
         Ok(())
     }
 
-    fn encrypt_message(
+    fn seal(
         &self,
         _context_id: &[u8; 32],
-        _sender_did: &str,
-        payload: &[u8],
-        _epoch: u64,
-        _sequence: u64,
+        inner: &scp_protocol::envelope::inner::InnerEnvelope,
+        _routing_id: &[u8],
+        _blob_ttl: u32,
     ) -> Result<Vec<u8>, ContextError> {
         self.messages_encrypted
             .lock()
             .unwrap()
-            .push(payload.to_vec());
-        // Mock: return payload as-is (no real encryption).
-        Ok(payload.to_vec())
+            .push(inner.payload.clone());
+        // Mock: serialize inner envelope directly (no encryption).
+        rmp_serde::to_vec_named(inner)
+            .map_err(|e| ContextError::CryptoFailed(format!("mock seal: {e}")))
     }
 
-    fn decrypt_message(
+    fn open(
         &self,
         _context_id: &[u8; 32],
-        ciphertext: &[u8],
-        _epoch: u64,
-        _sequence: u64,
-    ) -> Result<Option<(Vec<u8>, String)>, ContextError> {
-        self.decrypt_sender_did.as_ref().map_or_else(
-            || {
-                Err(ContextError::CryptoFailed(
-                    "decrypt_message not configured in mock".to_owned(),
-                ))
-            },
-            |did| Ok(Some((ciphertext.to_vec(), did.clone()))),
-        )
+        outer_bytes: &[u8],
+    ) -> Result<Option<scp_protocol::context::builder::OpenedEnvelope>, ContextError> {
+        // Mock: deserialize directly as InnerEnvelope (no decryption).
+        let inner: scp_protocol::envelope::inner::InnerEnvelope =
+            rmp_serde::from_slice(outer_bytes)
+                .map_err(|e| ContextError::CryptoFailed(format!("mock open: {e}")))?;
+        let sender_did = inner.sender_did.clone();
+        Ok(Some(scp_protocol::context::builder::OpenedEnvelope {
+            inner,
+            sender_did,
+        }))
     }
 
     fn advance_epoch(&self, context_id: &[u8; 32]) -> Result<(), ContextError> {
@@ -231,12 +227,26 @@ impl ContextCryptoProvider for MockCrypto {
     }
 }
 
-#[derive(Default)]
 pub(super) struct MockTransport {
     pub(super) connected: AtomicBool,
     pub(super) published: std::sync::Mutex<Vec<[u8; 32]>>,
     pub(super) deleted: std::sync::Mutex<Vec<[u8; 32]>>,
-    pub(super) messages_sent: std::sync::Mutex<Vec<Vec<u8>>>,
+    pub(super) messages_sent: Arc<std::sync::Mutex<Vec<Vec<u8>>>>,
+    /// Routing IDs passed to `send_message`. Each entry corresponds 1:1
+    /// with `messages_sent`.
+    pub(super) routing_ids_sent: Arc<std::sync::Mutex<Vec<[u8; 32]>>>,
+}
+
+impl Default for MockTransport {
+    fn default() -> Self {
+        Self {
+            connected: AtomicBool::new(false),
+            published: std::sync::Mutex::new(Vec::new()),
+            deleted: std::sync::Mutex::new(Vec::new()),
+            messages_sent: Arc::new(std::sync::Mutex::new(Vec::new())),
+            routing_ids_sent: Arc::new(std::sync::Mutex::new(Vec::new())),
+        }
+    }
 }
 
 impl MockTransport {
@@ -244,6 +254,18 @@ impl MockTransport {
         let t = Self::default();
         t.connected.store(true, Ordering::Relaxed);
         t
+    }
+
+    /// Returns a shared handle to the sent-messages buffer.
+    /// Clone before moving the transport into `ContextManager` to observe
+    /// transport output from test code.
+    pub(super) fn sent_messages_handle(&self) -> Arc<std::sync::Mutex<Vec<Vec<u8>>>> {
+        Arc::clone(&self.messages_sent)
+    }
+
+    /// Returns a shared handle to the routing IDs buffer.
+    pub(super) fn routing_ids_handle(&self) -> Arc<std::sync::Mutex<Vec<[u8; 32]>>> {
+        Arc::clone(&self.routing_ids_sent)
     }
 }
 
@@ -268,9 +290,10 @@ impl ContextTransportProvider for MockTransport {
 
     fn send_message(
         &self,
-        _context_id: &[u8; 32],
+        context_id: &[u8; 32],
         encrypted_payload: &[u8],
     ) -> Result<(), ContextError> {
+        self.routing_ids_sent.lock().unwrap().push(*context_id);
         self.messages_sent
             .lock()
             .unwrap()

@@ -202,6 +202,18 @@ impl MembershipState {
             info.sequence_number
         })
     }
+
+    /// Rolls back the last sequence number increment for the given sender.
+    ///
+    /// Called when `send_message` fails after sequence assignment (Phase 1)
+    /// but before successful transport delivery, so the sequence is not
+    /// permanently burned on failure. No-op if the sender is not a member
+    /// or the sequence is already at 0.
+    pub fn rollback_sequence_number(&mut self, sender_did: &str) {
+        if let Some(info) = self.members.get_mut(sender_did) {
+            info.sequence_number = info.sequence_number.saturating_sub(1);
+        }
+    }
 }
 
 impl Default for MembershipState {
@@ -536,6 +548,23 @@ pub enum ContextEvent {
     BufferOverflow {
         /// Number of events dropped since the last successful consumption.
         dropped_count: u64,
+    },
+    /// A sequence gap was detected and force-closed (§9.8.5, §9.9.2).
+    ///
+    /// Emitted when buffered out-of-order messages are force-delivered because
+    /// the gap persisted beyond the timeout (30 seconds) or the reorder buffer
+    /// reached its capacity (100 messages per sender). This is a suppression
+    /// alert: the missing sequence numbers may have been suppressed by an
+    /// adversarial relay.
+    SequenceGapDetected {
+        /// The sender whose messages had a gap.
+        sender_did: DID,
+        /// The expected sequence number (start of the gap).
+        expected_sequence: u64,
+        /// The first buffered sequence that was force-delivered.
+        first_delivered_sequence: u64,
+        /// Why the gap was force-closed.
+        reason: String,
     },
     /// A governance action execution has triggered checkpoint cosignature
     /// collection (ADR-031 §9, issue #630).

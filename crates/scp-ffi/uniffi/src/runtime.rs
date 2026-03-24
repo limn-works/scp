@@ -612,21 +612,6 @@ impl ContextCryptoProvider for FfiBridgeCrypto {
     ) -> Result<(), ContextError> {
         Ok(())
     }
-
-    fn encrypt_message(
-        &self,
-        _context_id: &[u8; 32],
-        _sender_did: &str,
-        _payload: &[u8],
-        _epoch: u64,
-        _sequence: u64,
-    ) -> Result<Vec<u8>, ContextError> {
-        Err(ContextError::CryptoFailed(
-            "FfiBridgeCrypto::encrypt_message is not a real implementation — \
-             wire a production crypto provider for MLS/sender-key encryption"
-                .to_owned(),
-        ))
-    }
 }
 
 // Transport provider: uses `scp_core::context::NotConfiguredTransportProvider`
