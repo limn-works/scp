@@ -227,6 +227,22 @@ info "gradle:  $(mise current gradle 2>/dev/null || echo 'not found')"
 info "rustc:   $(rustc --version 2>/dev/null || echo 'not found')"
 info "cargo:   $(cargo --version 2>/dev/null || echo 'not found')"
 
+# ---------------------------------------------------------------------------
+# Git hooks
+# ---------------------------------------------------------------------------
+echo ""
+bold "Git hooks:"
+if $CHECK_MODE; then
+  if [[ "$(git config core.hooksPath 2>/dev/null)" == "scripts/hooks" ]]; then
+    ok "core.hooksPath = scripts/hooks"
+  else
+    fail "core.hooksPath not set — run without --check to fix"
+  fi
+else
+  git config core.hooksPath scripts/hooks
+  ok "core.hooksPath set to scripts/hooks (pre-commit: lint + format)"
+fi
+
 echo ""
 bold "Environment setup:"
 info "Add to ~/.zshenv (ensures availability in all shells, including non-interactive):"
