@@ -102,6 +102,15 @@ while IFS= read -r line; do
         continue
     fi
 
+    # Track impl blocks in added lines — needed for new files where hunk
+    # headers lack scope context (e.g., @@ -0,0 +1,N @@ has no enclosing fn).
+    # Without this, methods in new files containing `impl Type { pub fn ... }`
+    # are incorrectly flagged as standalone pub fns needing FFI exports.
+    if [[ "$line" == "+"*"impl "* ]] && [[ "$line" != *"//"* ]]; then
+        IN_IMPL=1
+        continue
+    fi
+
     # Only look at added lines
     [[ "$line" == "+"* ]] || continue
     [[ $IN_CFG_TEST -eq 0 ]] || continue

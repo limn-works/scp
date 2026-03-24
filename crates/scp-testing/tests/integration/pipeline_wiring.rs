@@ -21,7 +21,18 @@
 // Source files embedded at compile time
 // ---------------------------------------------------------------------------
 
-const MANAGER_SRC: &str = include_str!("../../../../crates/scp-runtime/src/context/manager.rs");
+// Production submodules first so extract_fn_body finds real implementations
+// before test mocks in mod.rs (the parser returns the first match).
+const MANAGER_SRC: &str = concat!(
+    include_str!("../../../../crates/scp-runtime/src/context/manager/messaging.rs"),
+    include_str!("../../../../crates/scp-runtime/src/context/manager/broadcast.rs"),
+    include_str!("../../../../crates/scp-runtime/src/context/manager/governance.rs"),
+    include_str!("../../../../crates/scp-runtime/src/context/manager/lifecycle.rs"),
+    include_str!("../../../../crates/scp-runtime/src/context/manager/queries.rs"),
+    include_str!("../../../../crates/scp-runtime/src/context/manager/trust_recovery.rs"),
+    include_str!("../../../../crates/scp-runtime/src/context/manager/ttl_close.rs"),
+    include_str!("../../../../crates/scp-runtime/src/context/manager/mod.rs"),
+);
 const PROVIDER_SRC: &str =
     include_str!("../../../../crates/scp-runtime/src/crypto/mls/provider.rs");
 

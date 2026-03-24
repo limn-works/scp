@@ -46,6 +46,16 @@ ignore = [
     # rustls-webpki CRL distribution point logic — transitive dep via aws-smithy-http-client
     # -> rustls 0.21 -> rustls-webpki 0.101.7. Fix requires >=0.103.10 but AWS SDK pins 0.101.x.
     "RUSTSEC-2026-0049",
+    # libcrux-ed25519: all-zero key on catastrophic RNG failure. Transitive via
+    # openmls -> openmls_libcrux_crypto. Awaiting openmls upgrade.
+    "RUSTSEC-2026-0075",
+    # libcrux-poly1305: panic in standalone MAC. Transitive via openmls ->
+    # openmls_libcrux_crypto -> libcrux-aead. Standalone MAC not used by SCP;
+    # OpenMLS uses AEAD path which is unaffected. Awaiting openmls upgrade.
+    "RUSTSEC-2026-0073",
+    # libcrux-sha3: incorrect incremental SHAKE XOF output. Transitive via
+    # openmls -> openmls_libcrux_crypto. Awaiting openmls upgrade.
+    "RUSTSEC-2026-0074",
 ]
 
 # ── Bans ────────────────────────────────────────────────────────────────────
