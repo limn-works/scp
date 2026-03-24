@@ -273,6 +273,21 @@ fn encrypt_path_calls_attach_provenance() {
     );
 }
 
+// --- Anti-replay (#1546) ---
+
+#[test]
+#[ignore = "#1546 — sequence/replay check not yet wired into deliver_incoming"]
+fn deliver_incoming_calls_validate_received_envelope() {
+    assert!(
+        fn_body_contains(
+            MANAGER_SRC,
+            "deliver_incoming",
+            "validate_received_envelope"
+        ),
+        "deliver_incoming must call validate_received_envelope (anti-replay)"
+    );
+}
+
 // --- Governance / lifecycle ---
 
 #[test]
@@ -294,6 +309,62 @@ fn execute_add_member_calls_generate_access_key() {
     assert!(
         fn_body_contains(MANAGER_SRC, "execute_add_member", "generate_access_key"),
         "execute_add_member must call generate_access_key"
+    );
+}
+
+// --- Standing (#1530) ---
+
+#[test]
+#[ignore = "#1530 — standing score not yet consulted in governance proposals"]
+fn propose_governance_checks_standing() {
+    assert!(
+        fn_body_contains(
+            MANAGER_SRC,
+            "propose_governance_action_inner",
+            "check_standing"
+        ),
+        "propose_governance_action_inner must consult standing scores"
+    );
+}
+
+// --- Consequences (#1531) ---
+
+#[test]
+#[ignore = "#1531 — consequence evaluation not yet wired into governance dispatch"]
+fn governance_dispatch_calls_evaluate_consequences() {
+    assert!(
+        fn_body_contains(
+            MANAGER_SRC,
+            "finalize_governance_action",
+            "evaluate_consequence_rules"
+        ),
+        "finalize_governance_action must call evaluate_consequence_rules"
+    );
+}
+
+// --- Economy (#1537) ---
+
+#[test]
+#[ignore = "#1537 — economy enforcement not yet wired into governance"]
+fn governance_enforces_economic_policy() {
+    assert!(
+        fn_body_contains(
+            MANAGER_SRC,
+            "propose_governance_action_inner",
+            "evaluate_cost"
+        ) || fn_body_contains(MANAGER_SRC, "send_message", "evaluate_cost"),
+        "governance or send_message must call evaluate_cost for economic enforcement"
+    );
+}
+
+// --- Content key rotation (#1548) ---
+
+#[test]
+#[ignore = "#1548 — encrypted mode content key rotation is a no-op"]
+fn rotate_content_keys_calls_propose_update() {
+    assert!(
+        fn_body_contains(MANAGER_SRC, "execute_rotate_content_keys", "propose_update"),
+        "execute_rotate_content_keys must call propose_update for encrypted mode MLS rotation"
     );
 }
 
@@ -394,6 +465,48 @@ fn no_stale_ignores() {
         "remove_member_sender_key",
     ) {
         stale.push("execute_remove_member_calls_remove_member_sender_key (#1541)");
+    }
+
+    // Anti-replay (#1546)
+    if fn_body_contains(
+        MANAGER_SRC,
+        "deliver_incoming",
+        "validate_received_envelope",
+    ) {
+        stale.push("deliver_incoming_calls_validate_received_envelope (#1546)");
+    }
+
+    // Standing (#1530)
+    if fn_body_contains(
+        MANAGER_SRC,
+        "propose_governance_action_inner",
+        "check_standing",
+    ) {
+        stale.push("propose_governance_checks_standing (#1530)");
+    }
+
+    // Consequences (#1531)
+    if fn_body_contains(
+        MANAGER_SRC,
+        "finalize_governance_action",
+        "evaluate_consequence_rules",
+    ) {
+        stale.push("governance_dispatch_calls_evaluate_consequences (#1531)");
+    }
+
+    // Economy (#1537)
+    if fn_body_contains(
+        MANAGER_SRC,
+        "propose_governance_action_inner",
+        "evaluate_cost",
+    ) || fn_body_contains(MANAGER_SRC, "send_message", "evaluate_cost")
+    {
+        stale.push("governance_enforces_economic_policy (#1537)");
+    }
+
+    // Content key rotation (#1548)
+    if fn_body_contains(MANAGER_SRC, "execute_rotate_content_keys", "propose_update") {
+        stale.push("rotate_content_keys_calls_propose_update (#1548)");
     }
 
     assert!(
