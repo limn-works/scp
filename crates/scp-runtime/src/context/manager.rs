@@ -618,77 +618,49 @@ pub trait ContextPersistence: Send + Sync {
 // PerContextState -- internal per-context tracking
 // ---------------------------------------------------------------------------
 
-/// Internal state tracked by the manager for each context.
-struct PerContextState {
-    /// The context handle (retained for state checks and lifecycle operations).
-    handle: ContextHandle,
-    /// Member tracking.
-    membership: MembershipState,
-    /// Role state (ceiling, role definitions, assignments).
-    role_state: ContextRoleState,
-    /// Receive event buffer.
-    receive_buffer: ReceiveBuffer,
-    /// TTL timer management (SCP-021).
-    ttl_timer: TtlTimer,
-    /// Active TTL extension proposal, if any (SCP-021).
-    #[allow(dead_code)]
-    ttl_extension: Option<TtlExtension>,
-    /// Broadcast context state (SCP-227). `Some` for `ContextMode::Broadcast`,
-    /// `None` for `ContextMode::Encrypted`. Broadcast contexts do not use MLS;
-    /// they use per-author AES-256-GCM keys managed by [`BroadcastContext`].
-    broadcast_context: Option<BroadcastContext>,
+/// Governance-related per-context state.
+struct GovernanceState {
+    /// The governance engine for this context (ADR-031, spec §5.9).
+    governance_engine: Box<dyn GovernanceEngine>,
     /// Proposal IDs that have already been executed, mapped to the unix
     /// timestamp (seconds) when they were marked executed. Prevents replay of
     /// approved governance proposals (defense-in-depth). Entries older than
     /// [`EXECUTED_PROPOSALS_TTL_SECS`] are evicted on each insert.
     executed_proposals: HashMap<ProposalId, u64>,
-    /// Dynamically registered tools (beyond initial `ContextParams.tools`).
-    registered_tools: Vec<ToolRegistration>,
-    /// Members whose write access has been governance-revoked (ADR-031).
-    write_revoked_members: HashSet<DID>,
-    /// Members whose read access has been governance-revoked (§5.9, ADR-038).
-    read_revoked_members: HashSet<DID>,
-    /// Members excluded from future CEK wrapping (`FutureOnly` read revocation,
-    /// ADR-038, §9.17). Subset of or equal to `read_revoked_members`.
-    read_exclusion_list: HashSet<DID>,
-    /// Established cross-context tool interfaces (§6.2).
-    tool_interfaces: Vec<ToolInterface>,
-    /// Governance threshold signers (for `ThresholdApproval` model).
-    threshold_signers: Vec<DID>,
-    /// Governance threshold value (quorum requirement).
-    threshold_value: u32,
-    /// Pruning policy override (ADR-030 §6).
-    pruning_policy: Option<PruningPolicy>,
     /// Approved proposals pending execution, tracked for conflict detection (ADR-031 §7).
     /// Maps proposal ID to (proposal, `sequence_number`, timestamp).
     approved_proposals: HashMap<ProposalId, (GovernanceProposal, u64, u64)>,
     /// Governance freeze state due to simultaneous conflicts (ADR-031 §7).
     /// Contains the conflicting proposal IDs and freeze start timestamp.
     governance_freeze: Option<(ProposalId, ProposalId, u64)>,
-    /// The governance engine for this context (ADR-031, spec §5.9).
-    governance_engine: Box<dyn GovernanceEngine>,
+    /// Governance timeout task (SCP-271, ADR-031 §5).
+    governance_timeout_task: GovernanceTimeoutTask,
+    /// Per-context deadlock detection tracking (ADR-031 §10).
+    deadlock_detection_state: DeadlockDetectionState,
+    /// Governance threshold signers (for `ThresholdApproval` model).
+    threshold_signers: Vec<DID>,
+    /// Governance threshold value (quorum requirement).
+    threshold_value: u32,
+    /// Pending ceiling modification awaiting notification period (M7, §5.3.2).
+    pending_ceiling_modification: Option<PendingCeilingModification>,
+    /// Pending economic policy change awaiting notification period (§19.3).
+    pending_economic_policy_change: Option<PendingEconomicPolicyChange>,
+    /// Dynamically registered tools (beyond initial `ContextParams.tools`).
+    registered_tools: Vec<ToolRegistration>,
+    /// Established cross-context tool interfaces (§6.2).
+    tool_interfaces: Vec<ToolInterface>,
+    /// Pruning policy override (ADR-030 §6).
+    pruning_policy: Option<PruningPolicy>,
     /// Mutable economic policy (§19.3, ADR-033).
     economic_policy: Option<EconomicPolicy>,
     /// Per-member cumulative budget tracker for governance-approved spending
     /// (§19.5, ADR-033). Grants are recorded via `ApproveSpend` governance
     /// actions and tracked here. Persisted in [`ContextSnapshot`].
     budget_tracker: MemberBudgetTracker,
-    /// Governance timeout task (SCP-271, ADR-031 §5).
-    governance_timeout_task: GovernanceTimeoutTask,
-    /// Per-context deadlock detection tracking (ADR-031 §10).
-    deadlock_detection_state: DeadlockDetectionState,
-    /// Last known member set for departure detection in the timeout loop.
-    /// Compared each tick to the current member set to identify departures.
-    last_known_members: HashSet<DID>,
-    /// Members who have undergone a governance-triggered epoch reset
-    /// (`ResetMember`, ADR-029 Tier 3) since the last timeout tick.
-    /// Drained each tick and passed to `process_pending_proposals` so
-    /// their votes on pending proposals are invalidated (ADR-031 §5).
-    pending_epoch_resets: Vec<DID>,
-    /// Pending ceiling modification awaiting notification period (M7, §5.3.2).
-    pending_ceiling_modification: Option<PendingCeilingModification>,
-    /// Pending economic policy change awaiting notification period (§19.3).
-    pending_economic_policy_change: Option<PendingEconomicPolicyChange>,
+}
+
+/// MLS epoch and reconnection state.
+struct EpochState {
     /// Monotonic MLS epoch counter. Incremented each time a governance action
     /// triggers an MLS membership change (`AddMember`, `RemoveMember`,
     /// `RevokeReadAccess`, `ResetMember`). Used to populate
@@ -716,9 +688,61 @@ struct PerContextState {
     /// processing begins for this context and initiate the reconnection
     /// protocol if set.
     needs_reconnect: bool,
+}
+
+/// Write/read revocation and context migration state.
+struct AccessControlState {
+    /// Members whose write access has been governance-revoked (ADR-031).
+    write_revoked_members: HashSet<DID>,
+    /// Members whose read access has been governance-revoked (§5.9, ADR-038).
+    read_revoked_members: HashSet<DID>,
+    /// Members excluded from future CEK wrapping (`FutureOnly` read revocation,
+    /// ADR-038, §9.17). Subset of or equal to `read_revoked_members`.
+    read_exclusion_list: HashSet<DID>,
     /// Active migration state (§5.11A). `Some` when the context is in
     /// `MigratingOut` state. `None` otherwise.
     migration_state: Option<MigrationState>,
+}
+
+/// TTL timer and extension state.
+struct TtlState {
+    /// TTL timer management (SCP-021).
+    ttl_timer: TtlTimer,
+    /// Active TTL extension proposal, if any (SCP-021).
+    #[allow(dead_code)]
+    ttl_extension: Option<TtlExtension>,
+}
+
+/// Internal state tracked by the manager for each context.
+struct PerContextState {
+    /// The context handle (retained for state checks and lifecycle operations).
+    handle: ContextHandle,
+    /// Member tracking.
+    membership: MembershipState,
+    /// Role state (ceiling, role definitions, assignments).
+    role_state: ContextRoleState,
+    /// Receive event buffer.
+    receive_buffer: ReceiveBuffer,
+    /// Broadcast context state (SCP-227). `Some` for `ContextMode::Broadcast`,
+    /// `None` for `ContextMode::Encrypted`. Broadcast contexts do not use MLS;
+    /// they use per-author AES-256-GCM keys managed by [`BroadcastContext`].
+    broadcast_context: Option<BroadcastContext>,
+    /// Last known member set for departure detection in the timeout loop.
+    /// Compared each tick to the current member set to identify departures.
+    last_known_members: HashSet<DID>,
+    /// Members who have undergone a governance-triggered epoch reset
+    /// (`ResetMember`, ADR-029 Tier 3) since the last timeout tick.
+    /// Drained each tick and passed to `process_pending_proposals` so
+    /// their votes on pending proposals are invalidated (ADR-031 §5).
+    pending_epoch_resets: Vec<DID>,
+    /// Governance-related state (ADR-031).
+    governance: GovernanceState,
+    /// MLS epoch and reconnection state.
+    epoch: EpochState,
+    /// Write/read revocation and context migration state.
+    access: AccessControlState,
+    /// TTL timer and extension state (SCP-021).
+    ttl: TtlState,
 }
 
 /// Creates a governance engine from a [`GovernanceModel`] selector and
@@ -1599,44 +1623,44 @@ impl ContextManager {
     /// Must be called while the contexts mutex is held (snapshot under lock).
     fn snapshot_context(ctx: &PerContextState) -> ContextSnapshot {
         let state = ctx.handle.try_read_state().unwrap_or(ContextState::Active);
-        let ttl_remaining_secs = ctx.ttl_timer.remaining_secs();
+        let ttl_remaining_secs = ctx.ttl.ttl_timer.remaining_secs();
         // Capture grace entries for transactional persistence (§23.11).
         // On clock error, persist an empty vec — the recovery path will
         // treat the missing entries as expired (conservative: forward secrecy
         // prioritized over message recovery, per §23.11 inconsistent state
         // fallback).
-        let grace_entries = ctx.grace_store.to_grace_entries();
+        let grace_entries = ctx.epoch.grace_store.to_grace_entries();
         ContextSnapshot {
             context_id: ctx.handle.context_id().to_owned(),
             state,
             context_params: ctx.handle.params().clone(),
             membership: ctx.membership.clone(),
             role_state: ctx.role_state.clone(),
-            executed_proposals: ctx.executed_proposals.keys().copied().collect(),
+            executed_proposals: ctx.governance.executed_proposals.keys().copied().collect(),
             ttl_remaining_secs,
-            registered_tools: ctx.registered_tools.clone(),
-            write_revoked_members: ctx.write_revoked_members.clone(),
-            read_revoked_members: ctx.read_revoked_members.clone(),
-            read_exclusion_list: ctx.read_exclusion_list.clone(),
-            tool_interfaces: ctx.tool_interfaces.clone(),
-            threshold_signers: ctx.threshold_signers.clone(),
-            threshold_value: ctx.threshold_value,
-            pruning_policy: ctx.pruning_policy.clone(),
-            governance_model_config: Some(ctx.governance_engine.model_config()),
-            economic_policy: ctx.economic_policy.clone(),
-            budget_tracker: ctx.budget_tracker.clone(),
-            approved_proposals: ctx.approved_proposals.clone(),
-            governance_freeze: ctx.governance_freeze,
-            pending_ceiling_modification: ctx.pending_ceiling_modification.clone(),
-            pending_economic_policy_change: ctx.pending_economic_policy_change.clone(),
-            mls_epoch: ctx.mls_epoch,
-            epoch_coordination_records: ctx.epoch_coordinator.records().to_vec(),
+            registered_tools: ctx.governance.registered_tools.clone(),
+            write_revoked_members: ctx.access.write_revoked_members.clone(),
+            read_revoked_members: ctx.access.read_revoked_members.clone(),
+            read_exclusion_list: ctx.access.read_exclusion_list.clone(),
+            tool_interfaces: ctx.governance.tool_interfaces.clone(),
+            threshold_signers: ctx.governance.threshold_signers.clone(),
+            threshold_value: ctx.governance.threshold_value,
+            pruning_policy: ctx.governance.pruning_policy.clone(),
+            governance_model_config: Some(ctx.governance.governance_engine.model_config()),
+            economic_policy: ctx.governance.economic_policy.clone(),
+            budget_tracker: ctx.governance.budget_tracker.clone(),
+            approved_proposals: ctx.governance.approved_proposals.clone(),
+            governance_freeze: ctx.governance.governance_freeze,
+            pending_ceiling_modification: ctx.governance.pending_ceiling_modification.clone(),
+            pending_economic_policy_change: ctx.governance.pending_economic_policy_change.clone(),
+            mls_epoch: ctx.epoch.mls_epoch,
+            epoch_coordination_records: ctx.epoch.epoch_coordinator.records().to_vec(),
             grace_entries,
-            needs_reconnect: ctx.needs_reconnect,
+            needs_reconnect: ctx.epoch.needs_reconnect,
             // MLS crypto state is populated in `persist_context_snapshot`
             // where the crypto provider is available. Initialized empty here.
             mls_crypto_state: Vec::new(),
-            migration_state: ctx.migration_state.clone(),
+            migration_state: ctx.access.migration_state.clone(),
         }
     }
 
@@ -1755,44 +1779,52 @@ impl ContextManager {
             membership: ctx_snapshot.membership,
             role_state: ctx_snapshot.role_state,
             receive_buffer: ReceiveBuffer::new(),
-            ttl_timer: TtlTimer::with_clock(Arc::clone(&self.clock)),
-            ttl_extension: None,
             broadcast_context: broadcast_ctx,
-            executed_proposals: {
-                let now = self.clock.now_secs();
-                ctx_snapshot
-                    .executed_proposals
-                    .into_iter()
-                    .map(|id| (id, now))
-                    .collect()
-            },
-            registered_tools: ctx_snapshot.registered_tools,
-            write_revoked_members: ctx_snapshot.write_revoked_members,
-            read_revoked_members: ctx_snapshot.read_revoked_members,
-            read_exclusion_list: ctx_snapshot.read_exclusion_list,
-            tool_interfaces: ctx_snapshot.tool_interfaces,
-            threshold_signers: ctx_snapshot.threshold_signers,
-            threshold_value: ctx_snapshot.threshold_value,
-            pruning_policy: ctx_snapshot.pruning_policy,
-            approved_proposals: ctx_snapshot.approved_proposals,
-            governance_freeze: ctx_snapshot.governance_freeze,
-            governance_engine,
-            economic_policy: ctx_snapshot.economic_policy,
-            budget_tracker: ctx_snapshot.budget_tracker,
-            governance_timeout_task: GovernanceTimeoutTask::new(),
-            deadlock_detection_state: DeadlockDetectionState::default(),
             last_known_members: initial_members,
             pending_epoch_resets: Vec::new(),
-            pending_ceiling_modification: ctx_snapshot.pending_ceiling_modification,
-            pending_economic_policy_change: ctx_snapshot.pending_economic_policy_change,
-            mls_epoch: ctx_snapshot.mls_epoch,
-            epoch_coordinator: EpochCoordinator::from_records(
-                ctx_snapshot.epoch_coordination_records,
-                context_id,
-            ),
-            grace_store,
-            needs_reconnect,
-            migration_state: ctx_snapshot.migration_state,
+            governance: GovernanceState {
+                governance_engine,
+                executed_proposals: {
+                    let now = self.clock.now_secs();
+                    ctx_snapshot
+                        .executed_proposals
+                        .into_iter()
+                        .map(|id| (id, now))
+                        .collect()
+                },
+                approved_proposals: ctx_snapshot.approved_proposals,
+                governance_freeze: ctx_snapshot.governance_freeze,
+                governance_timeout_task: GovernanceTimeoutTask::new(),
+                deadlock_detection_state: DeadlockDetectionState::default(),
+                threshold_signers: ctx_snapshot.threshold_signers,
+                threshold_value: ctx_snapshot.threshold_value,
+                pending_ceiling_modification: ctx_snapshot.pending_ceiling_modification,
+                pending_economic_policy_change: ctx_snapshot.pending_economic_policy_change,
+                registered_tools: ctx_snapshot.registered_tools,
+                tool_interfaces: ctx_snapshot.tool_interfaces,
+                pruning_policy: ctx_snapshot.pruning_policy,
+                economic_policy: ctx_snapshot.economic_policy,
+                budget_tracker: ctx_snapshot.budget_tracker,
+            },
+            epoch: EpochState {
+                mls_epoch: ctx_snapshot.mls_epoch,
+                epoch_coordinator: EpochCoordinator::from_records(
+                    ctx_snapshot.epoch_coordination_records,
+                    context_id,
+                ),
+                grace_store,
+                needs_reconnect,
+            },
+            access: AccessControlState {
+                write_revoked_members: ctx_snapshot.write_revoked_members,
+                read_revoked_members: ctx_snapshot.read_revoked_members,
+                read_exclusion_list: ctx_snapshot.read_exclusion_list,
+                migration_state: ctx_snapshot.migration_state,
+            },
+            ttl: TtlState {
+                ttl_timer: TtlTimer::with_clock(Arc::clone(&self.clock)),
+                ttl_extension: None,
+            },
         };
 
         {
@@ -1914,7 +1946,7 @@ impl ContextManager {
             .lock()
             .await
             .get(context_id)
-            .is_some_and(|ctx| ctx.needs_reconnect)
+            .is_some_and(|ctx| ctx.epoch.needs_reconnect)
     }
 
     /// Clears the `needs_reconnect` flag for a context after the
@@ -1929,7 +1961,7 @@ impl ContextManager {
     #[instrument(skip_all, fields(context_id))]
     pub async fn clear_needs_reconnect(&self, context_id: &str) -> bool {
         if let Some(ctx) = self.contexts.lock().await.get_mut(context_id) {
-            ctx.needs_reconnect = false;
+            ctx.epoch.needs_reconnect = false;
             true
         } else {
             false
@@ -1950,7 +1982,7 @@ impl ContextManager {
             .lock()
             .await
             .iter()
-            .filter(|(_, ctx)| ctx.needs_reconnect)
+            .filter(|(_, ctx)| ctx.epoch.needs_reconnect)
             .map(|(id, _)| id.clone())
             .collect()
     }
@@ -2280,45 +2312,53 @@ impl ContextManager {
             membership: export.snapshot.membership,
             role_state: export.snapshot.role_state,
             receive_buffer: ReceiveBuffer::new(),
-            ttl_timer: TtlTimer::with_clock(Arc::clone(&self.clock)),
-            ttl_extension: None,
             broadcast_context: None,
-            executed_proposals: {
-                let now = self.clock.now_secs();
-                export
-                    .snapshot
-                    .executed_proposals
-                    .into_iter()
-                    .map(|id| (id, now))
-                    .collect()
-            },
-            registered_tools: export.snapshot.registered_tools,
-            write_revoked_members: export.snapshot.write_revoked_members,
-            read_revoked_members: export.snapshot.read_revoked_members,
-            read_exclusion_list: export.snapshot.read_exclusion_list,
-            tool_interfaces: export.snapshot.tool_interfaces,
-            threshold_signers: export.snapshot.threshold_signers,
-            threshold_value: export.snapshot.threshold_value,
-            pruning_policy: export.snapshot.pruning_policy,
-            approved_proposals: export.snapshot.approved_proposals,
-            governance_freeze: export.snapshot.governance_freeze,
-            governance_engine,
-            economic_policy: export.snapshot.economic_policy,
-            budget_tracker: export.snapshot.budget_tracker,
-            governance_timeout_task: GovernanceTimeoutTask::new(),
-            deadlock_detection_state: DeadlockDetectionState::default(),
             last_known_members: initial_members,
             pending_epoch_resets: Vec::new(),
-            pending_ceiling_modification: export.snapshot.pending_ceiling_modification,
-            pending_economic_policy_change: export.snapshot.pending_economic_policy_change,
-            mls_epoch: export.snapshot.mls_epoch,
-            epoch_coordinator: EpochCoordinator::from_records(
-                export.snapshot.epoch_coordination_records,
-                &context_id,
-            ),
-            grace_store: crate::crypto::mls::epoch_grace::EpochGraceStore::new(),
-            needs_reconnect: false,
-            migration_state: None,
+            governance: GovernanceState {
+                governance_engine,
+                executed_proposals: {
+                    let now = self.clock.now_secs();
+                    export
+                        .snapshot
+                        .executed_proposals
+                        .into_iter()
+                        .map(|id| (id, now))
+                        .collect()
+                },
+                approved_proposals: export.snapshot.approved_proposals,
+                governance_freeze: export.snapshot.governance_freeze,
+                governance_timeout_task: GovernanceTimeoutTask::new(),
+                deadlock_detection_state: DeadlockDetectionState::default(),
+                threshold_signers: export.snapshot.threshold_signers,
+                threshold_value: export.snapshot.threshold_value,
+                pending_ceiling_modification: export.snapshot.pending_ceiling_modification,
+                pending_economic_policy_change: export.snapshot.pending_economic_policy_change,
+                registered_tools: export.snapshot.registered_tools,
+                tool_interfaces: export.snapshot.tool_interfaces,
+                pruning_policy: export.snapshot.pruning_policy,
+                economic_policy: export.snapshot.economic_policy,
+                budget_tracker: export.snapshot.budget_tracker,
+            },
+            epoch: EpochState {
+                mls_epoch: export.snapshot.mls_epoch,
+                epoch_coordinator: EpochCoordinator::from_records(
+                    export.snapshot.epoch_coordination_records,
+                    &context_id,
+                ),
+                grace_store: crate::crypto::mls::epoch_grace::EpochGraceStore::new(),
+                needs_reconnect: false,
+            },
+            access: AccessControlState {
+                write_revoked_members: export.snapshot.write_revoked_members,
+                read_revoked_members: export.snapshot.read_revoked_members,
+                read_exclusion_list: export.snapshot.read_exclusion_list,
+                migration_state: None,
+            },
+            ttl: TtlState {
+                ttl_timer: TtlTimer::with_clock(Arc::clone(&self.clock)),
+                ttl_extension: None,
+            },
         };
 
         // 7. Register the context.
@@ -2453,34 +2493,42 @@ impl ContextManager {
             membership,
             role_state,
             receive_buffer: ReceiveBuffer::new(),
-            ttl_timer: TtlTimer::with_clock(Arc::clone(&self.clock)),
-            ttl_extension: None,
             broadcast_context,
-            executed_proposals: HashMap::new(),
-            registered_tools: Vec::new(),
-            write_revoked_members: HashSet::new(),
-            read_revoked_members: HashSet::new(),
-            read_exclusion_list: HashSet::new(),
-            tool_interfaces: Vec::new(),
-            threshold_signers: initial_threshold_signers,
-            threshold_value: initial_threshold_value,
-            pruning_policy: None,
-            approved_proposals: HashMap::new(),
-            governance_freeze: None,
-            governance_engine,
-            economic_policy: params.economic_policy.clone(),
-            budget_tracker: MemberBudgetTracker::new(),
-            governance_timeout_task: GovernanceTimeoutTask::new(),
-            deadlock_detection_state: DeadlockDetectionState::default(),
             last_known_members: initial_members,
             pending_epoch_resets: Vec::new(),
-            pending_ceiling_modification: None,
-            pending_economic_policy_change: None,
-            mls_epoch: 0,
-            epoch_coordinator: EpochCoordinator::new(),
-            grace_store: crate::crypto::mls::epoch_grace::EpochGraceStore::new(),
-            needs_reconnect: false,
-            migration_state: None,
+            governance: GovernanceState {
+                governance_engine,
+                executed_proposals: HashMap::new(),
+                approved_proposals: HashMap::new(),
+                governance_freeze: None,
+                governance_timeout_task: GovernanceTimeoutTask::new(),
+                deadlock_detection_state: DeadlockDetectionState::default(),
+                threshold_signers: initial_threshold_signers,
+                threshold_value: initial_threshold_value,
+                pending_ceiling_modification: None,
+                pending_economic_policy_change: None,
+                registered_tools: Vec::new(),
+                tool_interfaces: Vec::new(),
+                pruning_policy: None,
+                economic_policy: params.economic_policy.clone(),
+                budget_tracker: MemberBudgetTracker::new(),
+            },
+            epoch: EpochState {
+                mls_epoch: 0,
+                epoch_coordinator: EpochCoordinator::new(),
+                grace_store: crate::crypto::mls::epoch_grace::EpochGraceStore::new(),
+                needs_reconnect: false,
+            },
+            access: AccessControlState {
+                write_revoked_members: HashSet::new(),
+                read_revoked_members: HashSet::new(),
+                read_exclusion_list: HashSet::new(),
+                migration_state: None,
+            },
+            ttl: TtlState {
+                ttl_timer: TtlTimer::with_clock(Arc::clone(&self.clock)),
+                ttl_extension: None,
+            },
         };
 
         {
@@ -2719,34 +2767,42 @@ impl ContextManager {
             membership,
             role_state,
             receive_buffer: ReceiveBuffer::new(),
-            ttl_timer: TtlTimer::with_clock(Arc::clone(&self.clock)),
-            ttl_extension: None,
             broadcast_context,
-            executed_proposals: HashMap::new(),
-            registered_tools: Vec::new(),
-            write_revoked_members: HashSet::new(),
-            read_revoked_members: HashSet::new(),
-            read_exclusion_list: HashSet::new(),
-            tool_interfaces: Vec::new(),
-            threshold_signers: initial_threshold_signers,
-            threshold_value: initial_threshold_value,
-            pruning_policy: None,
-            approved_proposals: HashMap::new(),
-            governance_freeze: None,
-            governance_engine,
-            economic_policy: params.economic_policy.clone(),
-            budget_tracker: MemberBudgetTracker::new(),
-            governance_timeout_task: GovernanceTimeoutTask::new(),
-            deadlock_detection_state: DeadlockDetectionState::default(),
             last_known_members: HashSet::new(),
             pending_epoch_resets: Vec::new(),
-            pending_ceiling_modification: None,
-            pending_economic_policy_change: None,
-            mls_epoch: 0,
-            epoch_coordinator: EpochCoordinator::new(),
-            grace_store: crate::crypto::mls::epoch_grace::EpochGraceStore::new(),
-            needs_reconnect: false,
-            migration_state: None,
+            governance: GovernanceState {
+                governance_engine,
+                executed_proposals: HashMap::new(),
+                approved_proposals: HashMap::new(),
+                governance_freeze: None,
+                governance_timeout_task: GovernanceTimeoutTask::new(),
+                deadlock_detection_state: DeadlockDetectionState::default(),
+                threshold_signers: initial_threshold_signers,
+                threshold_value: initial_threshold_value,
+                pending_ceiling_modification: None,
+                pending_economic_policy_change: None,
+                registered_tools: Vec::new(),
+                tool_interfaces: Vec::new(),
+                pruning_policy: None,
+                economic_policy: params.economic_policy.clone(),
+                budget_tracker: MemberBudgetTracker::new(),
+            },
+            epoch: EpochState {
+                mls_epoch: 0,
+                epoch_coordinator: EpochCoordinator::new(),
+                grace_store: crate::crypto::mls::epoch_grace::EpochGraceStore::new(),
+                needs_reconnect: false,
+            },
+            access: AccessControlState {
+                write_revoked_members: HashSet::new(),
+                read_revoked_members: HashSet::new(),
+                read_exclusion_list: HashSet::new(),
+                migration_state: None,
+            },
+            ttl: TtlState {
+                ttl_timer: TtlTimer::with_clock(Arc::clone(&self.clock)),
+                ttl_extension: None,
+            },
         })
     }
 
@@ -3073,7 +3129,7 @@ impl ContextManager {
             require_active(&ctx.handle)?;
 
             // Governance-level write revocation check (§9.17, ADR-038).
-            if ctx.write_revoked_members.contains(sender_did) {
+            if ctx.access.write_revoked_members.contains(sender_did) {
                 return Err(ContextError::PermissionDenied(format!(
                     "write access has been revoked for {sender_did}"
                 )));
@@ -3283,7 +3339,7 @@ impl ContextManager {
                     "sender {sender_did} is not a member of this context"
                 )));
             }
-            if ctx.write_revoked_members.contains(&sender_did_obj) {
+            if ctx.access.write_revoked_members.contains(&sender_did_obj) {
                 return Err(ContextError::PermissionDenied(format!(
                     "write access has been revoked for {sender_did}"
                 )));
@@ -3695,7 +3751,7 @@ impl ContextManager {
             require_active(&ctx.handle)?;
 
             // Governance-level write revocation check (§9.17, ADR-038).
-            if ctx.write_revoked_members.contains(author_did) {
+            if ctx.access.write_revoked_members.contains(author_did) {
                 return Err(ContextError::PermissionDenied(format!(
                     "write access has been revoked for {author_did}"
                 )));
@@ -3992,16 +4048,23 @@ impl ContextManager {
         {
             let mut contexts = self.contexts.lock().await;
             if let Some(ctx) = contexts.get_mut(context_id) {
-                if ctx.executed_proposals.contains_key(&proposal.proposal_id) {
+                if ctx
+                    .governance
+                    .executed_proposals
+                    .contains_key(&proposal.proposal_id)
+                {
                     return Err(ContextError::PermissionDenied(
                         "governance proposal has already been executed".into(),
                     ));
                 }
                 let now = self.clock.now_secs();
                 // Evict entries older than the TTL before inserting.
-                ctx.executed_proposals
+                ctx.governance
+                    .executed_proposals
                     .retain(|_, ts| now.saturating_sub(*ts) < EXECUTED_PROPOSALS_TTL_SECS);
-                ctx.executed_proposals.insert(proposal.proposal_id, now);
+                ctx.governance
+                    .executed_proposals
+                    .insert(proposal.proposal_id, now);
             } else {
                 return Err(ContextError::ContextNotRegistered(context_id.to_owned()));
             }
@@ -4014,7 +4077,9 @@ impl ContextManager {
                 // proposal can be retried (e.g. after a transient crypto error).
                 let mut contexts = self.contexts.lock().await;
                 if let Some(ctx) = contexts.get_mut(context_id) {
-                    ctx.executed_proposals.remove(&proposal.proposal_id);
+                    ctx.governance
+                        .executed_proposals
+                        .remove(&proposal.proposal_id);
                 }
                 return Err(e);
             }
@@ -4054,12 +4119,12 @@ impl ContextManager {
 
             let mut contexts = self.contexts.lock().await;
             if let Some(ctx) = contexts.get_mut(context_id) {
-                let old_epoch = ctx.mls_epoch;
-                ctx.mls_epoch = old_epoch.saturating_add(1);
+                let old_epoch = ctx.epoch.mls_epoch;
+                ctx.epoch.mls_epoch = old_epoch.saturating_add(1);
                 // Place the old epoch into the grace window so in-flight
                 // messages encrypted under it can still be decrypted for
                 // up to 30 seconds (ADR-001 criterion 6, §23.11).
-                let _expired = ctx.grace_store.add_epoch(old_epoch);
+                let _expired = ctx.epoch.grace_store.add_epoch(old_epoch);
 
                 // Record the governance-MLS coordination for audit trail
                 // (ADR-031 §8, issue #630). The EpochCoordinator creates an
@@ -4069,16 +4134,16 @@ impl ContextManager {
                     let timestamp = self.clock.now_secs();
                     // Best-effort: log but do not fail if recording fails
                     // (epoch_after > epoch_before is guaranteed by saturating_add).
-                    let _ = ctx.epoch_coordinator.record_coordination(
+                    let _ = ctx.epoch.epoch_coordinator.record_coordination(
                         proposal.proposal_id,
                         old_epoch,
-                        ctx.mls_epoch,
+                        ctx.epoch.mls_epoch,
                         operation,
                         timestamp,
                     );
                 }
 
-                Some(ctx.mls_epoch)
+                Some(ctx.epoch.mls_epoch)
             } else {
                 None
             }
@@ -4124,15 +4189,17 @@ impl ContextManager {
                 //    contexts (ADR-031 §9, issue #630). SingleAdmin contexts
                 //    emit no event because they require no cosignatures
                 //    (quorum is 0).
-                let (required_signers, minimum_count) =
-                    ctx.governance_engine.checkpoint_cosignature_requirements();
+                let (required_signers, minimum_count) = ctx
+                    .governance
+                    .governance_engine
+                    .checkpoint_cosignature_requirements();
                 if minimum_count > 0 {
                     ctx.receive_buffer
                         .push(ContextEvent::CheckpointCosignatureRequired {
                             proposal_id: proposal.proposal_id,
                             required_signers,
                             minimum_count,
-                            at_epoch: ctx.mls_epoch,
+                            at_epoch: ctx.epoch.mls_epoch,
                         });
                 }
 
@@ -4140,7 +4207,9 @@ impl ContextManager {
                 //    it no longer participates in conflict detection
                 //    (ADR-031 §7). Replay prevention is already handled by
                 //    `executed_proposals`.
-                ctx.approved_proposals.remove(&proposal.proposal_id);
+                ctx.governance
+                    .approved_proposals
+                    .remove(&proposal.proposal_id);
 
                 // 4. Persist the updated context state (best-effort).
                 if self.has_persistence() {
@@ -4506,7 +4575,7 @@ impl ContextManager {
             context_id: ctx.handle.context_id().to_owned(),
             members,
             admin_dids,
-            current_epoch: Some(ctx.mls_epoch),
+            current_epoch: Some(ctx.epoch.mls_epoch),
             now: clock.now_secs(),
         }
     }
@@ -4603,8 +4672,8 @@ impl ContextManager {
 
             // Presence-only members (read + write revoked) lose
             // GovernancePropose capability (§5.9, ADR-038).
-            if ctx.read_revoked_members.contains(proposer_did)
-                && ctx.write_revoked_members.contains(proposer_did)
+            if ctx.access.read_revoked_members.contains(proposer_did)
+                && ctx.access.write_revoked_members.contains(proposer_did)
             {
                 return Err(ContextError::PermissionDenied(
                     "presence-only members cannot propose governance actions".into(),
@@ -4624,7 +4693,7 @@ impl ContextManager {
             }
 
             // SCP-272: Block new proposals (except ResolveConflict) while governance is frozen.
-            if ctx.governance_freeze.is_some()
+            if ctx.governance.governance_freeze.is_some()
                 && !matches!(action, GovernanceAction::ResolveConflict { .. })
             {
                 return Err(ContextError::GovernanceFailed(
@@ -4635,6 +4704,7 @@ impl ContextManager {
             let gov_ctx = Self::build_governance_context(ctx, &*self.clock);
 
             let (proposal, events) = ctx
+                .governance
                 .governance_engine
                 .propose(proposer_did, action, &gov_ctx, signing_key)
                 .map_err(|e| ContextError::GovernanceFailed(e.to_string()))?;
@@ -4652,7 +4722,7 @@ impl ContextManager {
                 matches!(e, GovernanceEvent::ConflictResolved { loser_id, .. } if *loser_id == proposal.proposal_id)
             });
 
-            let in_freeze = ctx.governance_freeze.is_some();
+            let in_freeze = ctx.governance.governance_freeze.is_some();
 
             (
                 proposal,
@@ -4754,8 +4824,8 @@ impl ContextManager {
 
             // Presence-only members (read + write revoked) lose
             // GovernanceVote capability (§5.9, ADR-038).
-            if ctx.read_revoked_members.contains(voter_did)
-                && ctx.write_revoked_members.contains(voter_did)
+            if ctx.access.read_revoked_members.contains(voter_did)
+                && ctx.access.write_revoked_members.contains(voter_did)
             {
                 return Err(ContextError::PermissionDenied(
                     "presence-only members cannot vote on governance proposals".into(),
@@ -4765,18 +4835,23 @@ impl ContextManager {
             let gov_ctx = Self::build_governance_context(ctx, &*self.clock);
 
             let (status, events) = if approve {
-                ctx.governance_engine
+                ctx.governance
+                    .governance_engine
                     .approve(proposal_id, voter_did, &gov_ctx, signing_key)
                     .map_err(|e| ContextError::GovernanceFailed(e.to_string()))?
             } else {
-                ctx.governance_engine
+                ctx.governance
+                    .governance_engine
                     .reject(proposal_id, voter_did, &gov_ctx, signing_key)
                     .map_err(|e| ContextError::GovernanceFailed(e.to_string()))?
             };
 
             // If the proposal just became Approved, grab a clone for conflict detection and execution.
             let proposal_for_execution = if status == ProposalStatus::Approved {
-                ctx.governance_engine.get_proposal(proposal_id).cloned()
+                ctx.governance
+                    .governance_engine
+                    .get_proposal(proposal_id)
+                    .cloned()
             } else {
                 None
             };
@@ -4827,7 +4902,7 @@ impl ContextManager {
                 let contexts = self.contexts.lock().await;
                 contexts
                     .get(context_id)
-                    .is_some_and(|ctx| ctx.governance_freeze.is_some())
+                    .is_some_and(|ctx| ctx.governance.governance_freeze.is_some())
             };
 
             if !in_freeze && !invalidated_by_conflict {
@@ -4866,7 +4941,8 @@ impl ContextManager {
             .get(context_id)
             .ok_or_else(|| ContextError::ContextNotRegistered(context_id.to_owned()))?;
 
-        ctx.governance_engine
+        ctx.governance
+            .governance_engine
             .get_proposal(proposal_id)
             .cloned()
             .ok_or_else(|| {
@@ -4896,7 +4972,7 @@ impl ContextManager {
             .get(context_id)
             .ok_or_else(|| ContextError::ContextNotRegistered(context_id.to_owned()))?;
 
-        Ok(ctx.governance_engine.list_proposals())
+        Ok(ctx.governance.governance_engine.list_proposals())
     }
 
     // -------------------------------------------------------------------
@@ -5077,7 +5153,8 @@ impl ContextManager {
             require_active(&ctx.handle)?;
 
             let gov_ctx = Self::build_governance_context(ctx, &*self.clock);
-            ctx.governance_engine
+            ctx.governance
+                .governance_engine
                 .withdraw_vote(proposal_id, voter_did, &gov_ctx)
                 .map_err(|e| ContextError::PermissionDenied(e.to_string()))?
         };
@@ -5166,7 +5243,7 @@ impl ContextManager {
 
             // Redundant operation handling (§5.9):
             // Already read-revoked → no-op that returns success.
-            if ctx.read_revoked_members.contains(did) {
+            if ctx.access.read_revoked_members.contains(did) {
                 return Ok(GovernanceBanResult {
                     banned_did: did.0.clone(),
                     rotated_authors: Vec::new(),
@@ -5176,14 +5253,14 @@ impl ContextManager {
 
             // Track read-revoked state. The member remains in the context
             // for governance/presence (membership/access decoupling §5.9).
-            ctx.read_revoked_members.insert(did.clone());
+            ctx.access.read_revoked_members.insert(did.clone());
             // FutureOnly also needs exclusion list tracking.
             // Full revocation implies exclusion from future content too.
-            ctx.read_exclusion_list.insert(did.clone());
+            ctx.access.read_exclusion_list.insert(did.clone());
 
             // Presence-only check: if both read AND write are revoked,
             // strip GovernanceVote and GovernancePropose capabilities (§5.9).
-            if ctx.write_revoked_members.contains(did) {
+            if ctx.access.write_revoked_members.contains(did) {
                 ctx.role_state.revoke_governance_capabilities(did);
             }
 
@@ -5282,21 +5359,21 @@ impl ContextManager {
 
             // Redundant operation handling (§5.9):
             // Restoring access that was never revoked → NothingToRestore.
-            if !ctx.read_revoked_members.contains(did) {
+            if !ctx.access.read_revoked_members.contains(did) {
                 return Err(ContextError::NothingToRestore(format!(
                     "read access was never revoked for {did}"
                 )));
             }
 
             // Clear read revocation state.
-            ctx.read_revoked_members.remove(did);
-            ctx.read_exclusion_list.remove(did);
+            ctx.access.read_revoked_members.remove(did);
+            ctx.access.read_exclusion_list.remove(did);
 
             // If the member was presence-only (both read + write revoked),
             // restoring read access means they're now write-revoked-only.
             // Restore governance capabilities only if write is NOT revoked
             // (i.e., they go back to full member state).
-            if !ctx.write_revoked_members.contains(did) {
+            if !ctx.access.write_revoked_members.contains(did) {
                 ctx.role_state.restore_governance_capabilities(did);
             }
 
@@ -5538,12 +5615,12 @@ impl ContextManager {
                 ));
             }
 
-            if ctx.registered_tools.len() >= MAX_REGISTERED_TOOLS {
+            if ctx.governance.registered_tools.len() >= MAX_REGISTERED_TOOLS {
                 return Err(ContextError::LimitExceeded(format!(
                     "registered tool limit of {MAX_REGISTERED_TOOLS} exceeded"
                 )));
             }
-            ctx.registered_tools.push(registration.clone());
+            ctx.governance.registered_tools.push(registration.clone());
             if self.has_persistence() {
                 Some(Self::snapshot_context(ctx))
             } else {
@@ -5574,7 +5651,9 @@ impl ContextManager {
                 .ok_or_else(|| ContextError::ContextNotRegistered(context_id.to_owned()))?;
             require_active(&ctx.handle)?;
 
-            ctx.registered_tools.retain(|t| t.tool_id != tool_id);
+            ctx.governance
+                .registered_tools
+                .retain(|t| t.tool_id != tool_id);
             if self.has_persistence() {
                 Some(Self::snapshot_context(ctx))
             } else {
@@ -5615,7 +5694,7 @@ impl ContextManager {
             }
 
             // Check for existing pending modification.
-            if ctx.pending_ceiling_modification.is_some() {
+            if ctx.governance.pending_ceiling_modification.is_some() {
                 return Err(ContextError::PermissionDenied(
                     "a ceiling modification is already pending notification period".to_owned(),
                 ));
@@ -5625,7 +5704,7 @@ impl ContextManager {
             // Members are notified and may leave before the expansion takes effect.
             let now = self.clock.now_secs();
             let effective_at = now + CEILING_CHANGE_NOTIFICATION_PERIOD_SECS;
-            ctx.pending_ceiling_modification = Some(PendingCeilingModification {
+            ctx.governance.pending_ceiling_modification = Some(PendingCeilingModification {
                 new_capabilities: new_ceiling.to_vec(),
                 notified_at: now,
                 effective_at,
@@ -5683,7 +5762,7 @@ impl ContextManager {
                 .ok_or_else(|| ContextError::ContextNotRegistered(context_id.to_owned()))?;
             require_active(&ctx.handle)?;
 
-            let pending = match &ctx.pending_ceiling_modification {
+            let pending = match &ctx.governance.pending_ceiling_modification {
                 Some(p) if p.is_effective(current_timestamp) => p.clone(),
                 _ => return Ok(false),
             };
@@ -5691,7 +5770,7 @@ impl ContextManager {
             // Apply the pending ceiling.
             ctx.role_state.ceiling =
                 CapabilityCeiling::new(pending.new_capabilities.iter().cloned());
-            ctx.pending_ceiling_modification = None;
+            ctx.governance.pending_ceiling_modification = None;
 
             let snap = if self.has_persistence() {
                 Some(Self::snapshot_context(ctx))
@@ -5747,8 +5826,8 @@ impl ContextManager {
                 .ok_or_else(|| ContextError::ContextNotRegistered(context_id.to_owned()))?;
 
             // Cancel TTL timer and governance timeout task if active.
-            ctx.ttl_timer.cancel();
-            ctx.governance_timeout_task.cancel();
+            ctx.ttl.ttl_timer.cancel();
+            ctx.governance.governance_timeout_task.cancel();
             // Drop broadcast context state -- keys are zeroed by Zeroize.
             ctx.broadcast_context = None;
 
@@ -5819,26 +5898,31 @@ impl ContextManager {
 
             // Cancel the existing TTL timer task so it does not fire at
             // the original deadline.
-            ctx.ttl_timer.cancel();
+            ctx.ttl.ttl_timer.cancel();
 
             // Capture old deadline before mutation for structured event.
-            let old_dl = ctx.ttl_timer.deadline_unix_secs.unwrap_or(0);
+            let old_dl = ctx.ttl.ttl_timer.deadline_unix_secs.unwrap_or(0);
 
             // Extend the TTL deadline and compute the remaining duration
             // for the replacement timer task.
-            let remaining_secs = ctx.ttl_timer.deadline_unix_secs.as_mut().map(|deadline| {
-                *deadline = deadline.saturating_add(additional_secs);
-                let now = self.clock.now_secs();
-                deadline.saturating_sub(now)
-            });
+            let remaining_secs = ctx
+                .ttl
+                .ttl_timer
+                .deadline_unix_secs
+                .as_mut()
+                .map(|deadline| {
+                    *deadline = deadline.saturating_add(additional_secs);
+                    let now = self.clock.now_secs();
+                    deadline.saturating_sub(now)
+                });
 
             // Capture new deadline after mutation.
-            let new_dl = ctx.ttl_timer.deadline_unix_secs.unwrap_or(0);
+            let new_dl = ctx.ttl.ttl_timer.deadline_unix_secs.unwrap_or(0);
 
             // Reset the cancel signal so the replacement timer task can be
             // cancelled independently of the old one.
-            ctx.ttl_timer.cancel = Arc::new(tokio::sync::Notify::new());
-            ctx.ttl_timer.task = None;
+            ctx.ttl.ttl_timer.cancel = Arc::new(tokio::sync::Notify::new());
+            ctx.ttl.ttl_timer.task = None;
 
             let h = ctx.handle.clone();
             let snap = if self.has_persistence() {
@@ -6037,7 +6121,7 @@ impl ContextManager {
                 .ok_or_else(|| ContextError::ContextNotRegistered(context_id.to_owned()))?;
             require_active(&ctx.handle)?;
 
-            ctx.pruning_policy = Some(new_policy.clone());
+            ctx.governance.pruning_policy = Some(new_policy.clone());
             if self.has_persistence() {
                 Some(Self::snapshot_context(ctx))
             } else {
@@ -6073,17 +6157,17 @@ impl ContextManager {
             if !ctx.membership.contains(did) {
                 return Err(ContextError::MemberNotFound(did.to_string()));
             }
-            if ctx.threshold_signers.contains(did) {
+            if ctx.governance.threshold_signers.contains(did) {
                 return Err(ContextError::PermissionDenied(format!(
                     "DID is already a signer: {did}"
                 )));
             }
-            if ctx.threshold_signers.len() >= MAX_THRESHOLD_SIGNERS {
+            if ctx.governance.threshold_signers.len() >= MAX_THRESHOLD_SIGNERS {
                 return Err(ContextError::LimitExceeded(format!(
                     "threshold signer limit of {MAX_THRESHOLD_SIGNERS} exceeded"
                 )));
             }
-            ctx.threshold_signers.push(did.clone());
+            ctx.governance.threshold_signers.push(did.clone());
 
             // ADR-031 §6: mint GovernanceVote + GovernancePropose UCANs
             // for the new signer so they can participate in governance.
@@ -6145,20 +6229,21 @@ impl ContextManager {
                 .ok_or_else(|| ContextError::ContextNotRegistered(context_id.to_owned()))?;
             require_active(&ctx.handle)?;
 
-            let before = ctx.threshold_signers.len();
-            ctx.threshold_signers.retain(|s| s != did);
-            if ctx.threshold_signers.len() == before {
+            let before = ctx.governance.threshold_signers.len();
+            ctx.governance.threshold_signers.retain(|s| s != did);
+            if ctx.governance.threshold_signers.len() == before {
                 return Err(ContextError::MemberNotFound(did.to_string()));
             }
             // ADR-031 §6: if removing would make threshold > signers.len(), reject.
-            if ctx.threshold_value > 0 {
-                let remaining = u32::try_from(ctx.threshold_signers.len()).unwrap_or(u32::MAX);
-                if ctx.threshold_value > remaining {
+            if ctx.governance.threshold_value > 0 {
+                let remaining =
+                    u32::try_from(ctx.governance.threshold_signers.len()).unwrap_or(u32::MAX);
+                if ctx.governance.threshold_value > remaining {
                     // Undo the removal before returning.
-                    ctx.threshold_signers.push(did.clone());
+                    ctx.governance.threshold_signers.push(did.clone());
                     return Err(ContextError::PermissionDenied(format!(
                         "removing signer would leave {remaining} signers < threshold {}",
-                        ctx.threshold_value
+                        ctx.governance.threshold_value
                     )));
                 }
             }
@@ -6213,13 +6298,14 @@ impl ContextManager {
                 .ok_or_else(|| ContextError::ContextNotRegistered(context_id.to_owned()))?;
             require_active(&ctx.handle)?;
 
-            let signer_count = u32::try_from(ctx.threshold_signers.len()).unwrap_or(u32::MAX);
+            let signer_count =
+                u32::try_from(ctx.governance.threshold_signers.len()).unwrap_or(u32::MAX);
             if new_threshold == 0 || new_threshold > signer_count {
                 return Err(ContextError::PermissionDenied(format!(
                     "threshold must be 1..={signer_count}, got {new_threshold}"
                 )));
             }
-            ctx.threshold_value = new_threshold;
+            ctx.governance.threshold_value = new_threshold;
             if self.has_persistence() {
                 Some(Self::snapshot_context(ctx))
             } else {
@@ -6260,12 +6346,12 @@ impl ContextManager {
                 ));
             }
 
-            if ctx.tool_interfaces.len() >= MAX_TOOL_INTERFACES {
+            if ctx.governance.tool_interfaces.len() >= MAX_TOOL_INTERFACES {
                 return Err(ContextError::LimitExceeded(format!(
                     "tool interface limit of {MAX_TOOL_INTERFACES} exceeded"
                 )));
             }
-            ctx.tool_interfaces.push(interface.clone());
+            ctx.governance.tool_interfaces.push(interface.clone());
             if self.has_persistence() {
                 Some(Self::snapshot_context(ctx))
             } else {
@@ -6347,7 +6433,7 @@ impl ContextManager {
             // Validate that the proposals being resolved match the ones that
             // caused the freeze — otherwise an admin could clear a freeze by
             // referencing arbitrary proposal IDs.
-            let (freeze_a, freeze_b, _) = ctx.governance_freeze.ok_or_else(|| {
+            let (freeze_a, freeze_b, _) = ctx.governance.governance_freeze.ok_or_else(|| {
                 ContextError::PermissionDenied(
                     "context is not in governance freeze state — no conflict to resolve".into(),
                 )
@@ -6365,10 +6451,12 @@ impl ContextManager {
             // proposals from the approved set or executed set to obtain
             // their actions for conflict verification.
             let action_a = ctx
+                .governance
                 .approved_proposals
                 .get(proposal_a)
                 .map(|(p, _, _)| &p.action);
             let action_b = ctx
+                .governance
                 .approved_proposals
                 .get(proposal_b)
                 .map(|(p, _, _)| &p.action);
@@ -6382,8 +6470,8 @@ impl ContextManager {
             };
 
             // Retrieve proposer DIDs for conflict validation.
-            let proposer_a = &ctx.approved_proposals[proposal_a].0.proposer_did;
-            let proposer_b = &ctx.approved_proposals[proposal_b].0.proposer_did;
+            let proposer_a = &ctx.governance.approved_proposals[proposal_a].0.proposer_did;
+            let proposer_b = &ctx.governance.approved_proposals[proposal_b].0.proposer_did;
             if !scp_protocol::sync::conflict_resolution::actions_conflict(
                 act_a, proposer_a, act_b, proposer_b,
             ) {
@@ -6416,17 +6504,17 @@ impl ContextManager {
                     // Only invalidate the loser — the winner remains eligible
                     // for normal execution.
                     let now = self.clock.now_secs();
-                    ctx.executed_proposals.insert(*loser, now);
+                    ctx.governance.executed_proposals.insert(*loser, now);
                 }
                 scp_protocol::context::governance::ConflictResolution::InvalidateBoth => {
                     let now = self.clock.now_secs();
-                    ctx.executed_proposals.insert(*proposal_a, now);
-                    ctx.executed_proposals.insert(*proposal_b, now);
+                    ctx.governance.executed_proposals.insert(*proposal_a, now);
+                    ctx.governance.executed_proposals.insert(*proposal_b, now);
                 }
             }
 
             // Clear governance freeze now that the conflict is resolved.
-            ctx.governance_freeze = None;
+            ctx.governance.governance_freeze = None;
 
             if self.has_persistence() {
                 Some(Self::snapshot_context(ctx))
@@ -6498,8 +6586,8 @@ impl ContextManager {
             // "On promotion: TTL is removed, memory scope transitions from
             // ephemeral to full, existing event log and key material are
             // preserved."
-            ctx.ttl_timer.cancel();
-            ctx.ttl_timer.deadline_unix_secs = None;
+            ctx.ttl.ttl_timer.cancel();
+            ctx.ttl.ttl_timer.deadline_unix_secs = None;
             ctx.handle.promote_memory_scope();
 
             if self.has_persistence() {
@@ -6555,17 +6643,17 @@ impl ContextManager {
 
             // Redundant operation handling (§5.9):
             // Already write-revoked → no-op that returns success.
-            if ctx.write_revoked_members.contains(did) {
+            if ctx.access.write_revoked_members.contains(did) {
                 return Ok(());
             }
 
             // Mark member as write-revoked. The member remains present but
             // their messages will be rejected by the send path.
-            ctx.write_revoked_members.insert(did.clone());
+            ctx.access.write_revoked_members.insert(did.clone());
 
             // Presence-only check: if both read AND write are revoked,
             // strip GovernanceVote and GovernancePropose capabilities (§5.9).
-            if ctx.read_revoked_members.contains(did) {
+            if ctx.access.read_revoked_members.contains(did) {
                 ctx.role_state.revoke_governance_capabilities(did);
             }
 
@@ -6648,17 +6736,17 @@ impl ContextManager {
 
             // Redundant operation handling (§5.9):
             // Restoring access that was never revoked → NothingToRestore.
-            if !ctx.write_revoked_members.contains(did) {
+            if !ctx.access.write_revoked_members.contains(did) {
                 return Err(ContextError::NothingToRestore(format!(
                     "write access was never revoked for {did}"
                 )));
             }
 
-            ctx.write_revoked_members.remove(did);
+            ctx.access.write_revoked_members.remove(did);
 
             // Restore governance capabilities if member is no longer
             // presence-only (i.e., read access is not also revoked).
-            if !ctx.read_revoked_members.contains(did) {
+            if !ctx.access.read_revoked_members.contains(did) {
                 ctx.role_state.restore_governance_capabilities(did);
             }
 
@@ -6775,8 +6863,8 @@ impl ContextManager {
             // Save state for rollback — the loop below mutates ctx in-place,
             // and any mid-loop or post-loop error must restore the original
             // state to prevent in-memory corruption.
-            let original_signers = ctx.threshold_signers.clone();
-            let original_threshold = ctx.threshold_value;
+            let original_signers = ctx.governance.threshold_signers.clone();
+            let original_threshold = ctx.governance.threshold_value;
 
             // Apply each reconfiguration action in order (ADR-031 §10).
             let reconfigure_result: Result<(), ContextError> = (|| {
@@ -6785,31 +6873,32 @@ impl ContextManager {
                         scp_protocol::context::governance::GovernanceReconfigAction::RemoveInactiveSigner {
                             did,
                         } => {
-                            ctx.threshold_signers.retain(|s| s != did);
+                            ctx.governance.threshold_signers.retain(|s| s != did);
                         }
                         scp_protocol::context::governance::GovernanceReconfigAction::ReduceThreshold {
                             new_threshold,
                         } => {
                             let signer_count =
-                                u32::try_from(ctx.threshold_signers.len()).unwrap_or(u32::MAX);
+                                u32::try_from(ctx.governance.threshold_signers.len()).unwrap_or(u32::MAX);
                             if *new_threshold == 0 || *new_threshold > signer_count {
                                 return Err(ContextError::PermissionDenied(format!(
                                     "reconfigured threshold must be 1..={signer_count}, got {new_threshold}"
                                 )));
                             }
-                            ctx.threshold_value = *new_threshold;
+                            ctx.governance.threshold_value = *new_threshold;
                         }
                     }
                 }
 
                 // Post-loop invariant: threshold must still be satisfiable after
                 // all removals and reductions (ADR-031 §10).
-                if ctx.threshold_value > 0 {
-                    let remaining = u32::try_from(ctx.threshold_signers.len()).unwrap_or(u32::MAX);
-                    if ctx.threshold_value > remaining {
+                if ctx.governance.threshold_value > 0 {
+                    let remaining =
+                        u32::try_from(ctx.governance.threshold_signers.len()).unwrap_or(u32::MAX);
+                    if ctx.governance.threshold_value > remaining {
                         return Err(ContextError::PermissionDenied(format!(
                             "reconfiguration left {remaining} signers < threshold {}",
-                            ctx.threshold_value,
+                            ctx.governance.threshold_value,
                         )));
                     }
                 }
@@ -6819,8 +6908,8 @@ impl ContextManager {
 
             if let Err(e) = reconfigure_result {
                 // Rollback: restore original state before returning error.
-                ctx.threshold_signers = original_signers;
-                ctx.threshold_value = original_threshold;
+                ctx.governance.threshold_signers = original_signers;
+                ctx.governance.threshold_value = original_threshold;
                 return Err(e);
             }
 
@@ -6872,7 +6961,7 @@ impl ContextManager {
             require_active(&ctx.handle)?;
 
             // Check if existing policy is locked.
-            if let Some(existing) = &ctx.economic_policy
+            if let Some(existing) = &ctx.governance.economic_policy
                 && existing.locked
             {
                 return Err(ContextError::PermissionDenied(
@@ -6881,7 +6970,7 @@ impl ContextManager {
             }
 
             // Reject if an economic policy change is already pending.
-            if ctx.pending_economic_policy_change.is_some() {
+            if ctx.governance.pending_economic_policy_change.is_some() {
                 return Err(ContextError::PermissionDenied(
                     "an economic policy change is already pending notification period".to_owned(),
                 ));
@@ -6890,7 +6979,7 @@ impl ContextManager {
             // §19.3: Stage the change with a 24-hour notification period.
             let now = self.clock.now_secs();
             let effective_at = now + ECONOMIC_POLICY_NOTIFICATION_PERIOD_SECS;
-            ctx.pending_economic_policy_change = Some(PendingEconomicPolicyChange {
+            ctx.governance.pending_economic_policy_change = Some(PendingEconomicPolicyChange {
                 new_policy: policy.clone(),
                 notified_at: now,
                 effective_at,
@@ -6944,14 +7033,14 @@ impl ContextManager {
                 .ok_or_else(|| ContextError::ContextNotRegistered(context_id.to_owned()))?;
             require_active(&ctx.handle)?;
 
-            let pending = match &ctx.pending_economic_policy_change {
+            let pending = match &ctx.governance.pending_economic_policy_change {
                 Some(p) if p.is_effective(current_timestamp) => p.clone(),
                 _ => return Ok(false),
             };
 
             // Apply the pending policy.
-            ctx.economic_policy = Some(pending.new_policy);
-            ctx.pending_economic_policy_change = None;
+            ctx.governance.economic_policy = Some(pending.new_policy);
+            ctx.governance.pending_economic_policy_change = None;
 
             let snap = if self.has_persistence() {
                 Some(Self::snapshot_context(ctx))
@@ -7007,7 +7096,7 @@ impl ContextManager {
             }
 
             // Grant the approved budget to the member's cumulative tracker.
-            ctx.budget_tracker.grant(spender, amount);
+            ctx.governance.budget_tracker.grant(spender, amount);
 
             if self.has_persistence() {
                 Some(Self::snapshot_context(ctx))
@@ -7052,7 +7141,7 @@ impl ContextManager {
                 .ok_or_else(|| ContextError::ContextNotRegistered(context_id.to_owned()))?;
             require_active(&ctx.handle)?;
 
-            match &mut ctx.economic_policy {
+            match &mut ctx.governance.economic_policy {
                 None => {
                     return Err(ContextError::PermissionDenied(
                         "cannot lock economic policy: no policy is set".to_owned(),
@@ -7144,7 +7233,7 @@ impl ContextManager {
             require_active(&ctx.handle)?;
 
             // Check no migration is already in progress.
-            if ctx.migration_state.is_some() {
+            if ctx.access.migration_state.is_some() {
                 return Err(ContextError::PermissionDenied(
                     "context migration is already in progress".to_owned(),
                 ));
@@ -7171,7 +7260,7 @@ impl ContextManager {
                     ContextError::PermissionDenied("cannot transition to MigratingOut".to_owned())
                 })?;
 
-            ctx.migration_state = Some(MigrationState {
+            ctx.access.migration_state = Some(MigrationState {
                 destination_context_id: destination_context_id.clone(),
                 reason: reason.to_owned(),
                 grace_period_end,
@@ -7220,7 +7309,7 @@ impl ContextManager {
             let mut contexts = self.contexts.lock().await;
             if let Some(ctx) = contexts.get_mut(context_id) {
                 let _ = ctx.handle.transition_to(&ContextState::Active).await;
-                ctx.migration_state = None;
+                ctx.access.migration_state = None;
                 // Remove only the migration events we pushed, preserving
                 // any events added by concurrent operations.
                 ctx.receive_buffer.truncate(buffer_len_before_migration);
@@ -7289,7 +7378,7 @@ impl ContextManager {
                     )
                 })?;
 
-            let migration = ctx.migration_state.take().ok_or_else(|| {
+            let migration = ctx.access.migration_state.take().ok_or_else(|| {
                 ContextError::PermissionDenied(
                     "no migration state found despite MigratingOut state".to_owned(),
                 )
@@ -7359,7 +7448,7 @@ impl ContextManager {
                 ));
             }
 
-            let migration = ctx.migration_state.as_ref().ok_or_else(|| {
+            let migration = ctx.access.migration_state.as_ref().ok_or_else(|| {
                 ContextError::PermissionDenied(
                     "no migration state found despite MigratingOut state".to_owned(),
                 )
@@ -7393,12 +7482,12 @@ impl ContextManager {
             });
 
             // Cancel TTL timer and governance timeout task.
-            ctx.ttl_timer.cancel();
-            ctx.governance_timeout_task.cancel();
+            ctx.ttl.ttl_timer.cancel();
+            ctx.governance.governance_timeout_task.cancel();
             // Drop broadcast context state.
             ctx.broadcast_context = None;
             // Clear migration state.
-            ctx.migration_state = None;
+            ctx.access.migration_state = None;
 
             let snapshot = if self.has_persistence() {
                 Some(Self::snapshot_context(ctx))
@@ -7430,7 +7519,7 @@ impl ContextManager {
         let contexts = self.contexts.lock().await;
         contexts
             .get(context_id)
-            .and_then(|ctx| ctx.migration_state.clone())
+            .and_then(|ctx| ctx.access.migration_state.clone())
     }
 
     /// Evaluates whether a subscriber's broadcast key request should be
@@ -7569,7 +7658,7 @@ impl ContextManager {
 
             // Gate: multi-admin models must use governance path.
             if !matches!(
-                ctx.governance_engine.model_config(),
+                ctx.governance.governance_engine.model_config(),
                 GovernanceModelConfig::SingleAdmin { .. }
             ) {
                 return Err(ContextError::PermissionDenied(
@@ -7592,8 +7681,8 @@ impl ContextManager {
         {
             let mut contexts = self.contexts.lock().await;
             if let Some(ctx) = contexts.get_mut(&context_id) {
-                ctx.ttl_timer.cancel();
-                ctx.governance_timeout_task.cancel();
+                ctx.ttl.ttl_timer.cancel();
+                ctx.governance.governance_timeout_task.cancel();
                 // Drop broadcast context state -- keys are zeroed by Zeroize.
                 ctx.broadcast_context = None;
                 ctx.receive_buffer.push(ContextEvent::SystemClose {
@@ -7681,7 +7770,7 @@ impl ContextManager {
         {
             let mut contexts = self.contexts.lock().await;
             if let Some(ctx) = contexts.get_mut(&context_id) {
-                ctx.governance_timeout_task.cancel();
+                ctx.governance.governance_timeout_task.cancel();
                 if result.is_complete() {
                     ctx.receive_buffer.push(ContextEvent::Expired);
                 } else {
@@ -7753,6 +7842,7 @@ impl ContextManager {
 
         // Initialize extension proposal if not already in progress.
         let extension = ctx
+            .ttl
             .ttl_extension
             .get_or_insert_with(|| TtlExtension::new(proposed_duration, member_count));
 
@@ -7784,8 +7874,8 @@ impl ContextManager {
         {
             let mut contexts = self.contexts.lock().await;
             if let Some(ctx) = contexts.get_mut(context_id) {
-                ctx.ttl_timer.cancel();
-                ctx.ttl_extension = None;
+                ctx.ttl.ttl_timer.cancel();
+                ctx.ttl.ttl_extension = None;
             }
         }
 
@@ -7833,7 +7923,7 @@ impl ContextManager {
             let Some(ctx) = contexts.get_mut(context_id) else {
                 return;
             };
-            ctx.ttl_timer.cancel.clone()
+            ctx.ttl.ttl_timer.cancel.clone()
         };
 
         // Clone Arc-wrapped providers so the spawned task can perform
@@ -7885,7 +7975,7 @@ impl ContextManager {
         let context_id_for_store = context_id.to_owned();
         let mut contexts = self.contexts.lock().await;
         if let Some(ctx) = contexts.get_mut(&context_id_for_store) {
-            ctx.ttl_timer.task = Some(task);
+            ctx.ttl.ttl_timer.task = Some(task);
         }
     }
 
@@ -7979,7 +8069,7 @@ impl ContextManager {
             return;
         };
 
-        ctx.governance_timeout_task.start({
+        ctx.governance.governance_timeout_task.start({
             let ctx_id = ctx_id.clone();
             let clock = Arc::clone(&clock);
             move || {
@@ -8020,17 +8110,18 @@ impl ContextManager {
                         // (ADR-031 §5: votes from reset members are invalidated).
                         let epoch_resets: Vec<DID> = std::mem::take(&mut ctx.pending_epoch_resets);
 
-                        let mls_epoch = ctx.mls_epoch;
+                        let mls_epoch = ctx.epoch.mls_epoch;
                         let recovery_in_progress =
-                            ctx.deadlock_detection_state.recovery_in_progress;
+                            ctx.governance.deadlock_detection_state.recovery_in_progress;
 
                         // Snapshot active voters BEFORE processing proposals so
                         // voters on about-to-resolve proposals are still visible.
-                        let active_voters = collect_active_voters(ctx.governance_engine.as_ref());
+                        let active_voters =
+                            collect_active_voters(ctx.governance.governance_engine.as_ref());
 
                         // Process pending proposals for timeout/departures/epoch resets.
                         let result = process_pending_proposals(
-                            ctx.governance_engine.as_mut(),
+                            ctx.governance.governance_engine.as_mut(),
                             &gov_ctx,
                             &departed,
                             &epoch_resets,
@@ -8039,17 +8130,17 @@ impl ContextManager {
                         // Update deadlock detection state before detecting
                         // deadlock so missed-window counters reflect this tick.
                         update_detection_state(
-                            &mut ctx.deadlock_detection_state,
-                            ctx.governance_engine.as_ref(),
+                            &mut ctx.governance.deadlock_detection_state,
+                            ctx.governance.governance_engine.as_ref(),
                             &gov_ctx,
                             &active_voters,
                         );
 
                         // Detect deadlock conditions (ADR-031 §10).
                         let conditions = super::governance::timeout::detect_deadlock(
-                            ctx.governance_engine.as_ref(),
+                            ctx.governance.governance_engine.as_ref(),
                             &gov_ctx,
-                            &ctx.deadlock_detection_state,
+                            &ctx.governance.deadlock_detection_state,
                         );
 
                         (result, conditions, mls_epoch, recovery_in_progress)
@@ -8077,9 +8168,10 @@ impl ContextManager {
                             // Reset recovery_in_progress when deadlock conditions
                             // clear so future deadlocks can be detected.
                             if conditions.is_empty() && recovery_in_progress {
-                                ctx.deadlock_detection_state.recovery_in_progress = false;
+                                ctx.governance.deadlock_detection_state.recovery_in_progress =
+                                    false;
                             } else if !conditions.is_empty() && !recovery_in_progress {
-                                ctx.deadlock_detection_state.recovery_in_progress = true;
+                                ctx.governance.deadlock_detection_state.recovery_in_progress = true;
                             }
                         }
                     }
@@ -8210,7 +8302,10 @@ impl ContextManager {
             .ok_or_else(|| ContextError::ContextNotRegistered(context_id.to_owned()))?;
         require_active(&ctx.handle)?;
 
-        let (_, min_count) = ctx.governance_engine.checkpoint_cosignature_requirements();
+        let (_, min_count) = ctx
+            .governance
+            .governance_engine
+            .checkpoint_cosignature_requirements();
         let attestation_status = if min_count == 0 {
             CheckpointAttestationStatus::FullyAttested
         } else {
@@ -8218,7 +8313,7 @@ impl ContextManager {
         };
 
         // Capture pruning policy before dropping the lock.
-        let pruning_policy = ctx.pruning_policy.clone();
+        let pruning_policy = ctx.governance.pruning_policy.clone();
 
         let created_at = self.clock.now_secs();
 
@@ -8296,6 +8391,7 @@ impl ContextManager {
         let checkpoint_hash: [u8; 32] = hasher.finalize().into();
 
         let status = ctx
+            .governance
             .governance_engine
             .validate_checkpoint_cosignatures(&candidate, &checkpoint_hash)
             .map_err(|e| ContextError::GovernanceFailed(e.to_string()))?;
@@ -8332,7 +8428,7 @@ impl ContextManager {
         // Check for conflicts with existing approved proposals
         let mut conflicts = Vec::new();
         for (existing_id, (existing_proposal, existing_seq, existing_timestamp)) in
-            &ctx.approved_proposals
+            &ctx.governance.approved_proposals
         {
             if actions_conflict(
                 &new_proposal.action,
@@ -8359,7 +8455,7 @@ impl ContextManager {
             match new_seq.cmp(&conflicting_seq) {
                 std::cmp::Ordering::Equal => {
                     // Simultaneous conflict - enter governance freeze
-                    ctx.governance_freeze =
+                    ctx.governance.governance_freeze =
                         Some((new_proposal.proposal_id, conflicting_id, current_timestamp));
                     events.push(GovernanceEvent::ConflictDetected {
                         proposal_a: new_proposal.proposal_id,
@@ -8368,7 +8464,7 @@ impl ContextManager {
                 }
                 std::cmp::Ordering::Less => {
                     // New proposal wins - invalidate the conflicting one
-                    ctx.approved_proposals.remove(&conflicting_id);
+                    ctx.governance.approved_proposals.remove(&conflicting_id);
                     events.push(GovernanceEvent::ConflictResolved {
                         winner_id: new_proposal.proposal_id,
                         loser_id: conflicting_id,
@@ -8388,7 +8484,7 @@ impl ContextManager {
 
         // Add the new proposal to approved proposals if not invalidated
         if !events.iter().any(|e| matches!(e, GovernanceEvent::ConflictResolved { loser_id, .. } if *loser_id == new_proposal.proposal_id)) {
-            ctx.approved_proposals.insert(
+            ctx.governance.approved_proposals.insert(
                 new_proposal.proposal_id,
                 (new_proposal.clone(), current_timestamp, current_timestamp)
             );
@@ -8416,13 +8512,13 @@ impl ContextManager {
 
         let current_timestamp = self.clock.now_secs();
 
-        if let Some((proposal_a, proposal_b, freeze_start)) = ctx.governance_freeze
+        if let Some((proposal_a, proposal_b, freeze_start)) = ctx.governance.governance_freeze
             && current_timestamp.saturating_sub(freeze_start) >= FREEZE_TIMEOUT_SECONDS
         {
             // Timeout reached - invalidate both proposals and lift freeze
-            ctx.approved_proposals.remove(&proposal_a);
-            ctx.approved_proposals.remove(&proposal_b);
-            ctx.governance_freeze = None;
+            ctx.governance.approved_proposals.remove(&proposal_a);
+            ctx.governance.approved_proposals.remove(&proposal_b);
+            ctx.governance.governance_freeze = None;
 
             // Both proposals were invalidated by timeout — emit one event
             // per invalidated proposal using the real proposal IDs so
@@ -8496,10 +8592,10 @@ impl ContextManager {
             // concurrent close_context could have transitioned the handle while
             // we awaited the MLS commit.
             require_active(&ctx.handle)?;
-            let old_epoch = ctx.mls_epoch;
-            ctx.mls_epoch = old_epoch.saturating_add(1);
-            let _expired = ctx.grace_store.add_epoch(old_epoch);
-            ctx.mls_epoch
+            let old_epoch = ctx.epoch.mls_epoch;
+            ctx.epoch.mls_epoch = old_epoch.saturating_add(1);
+            let _expired = ctx.epoch.grace_store.add_epoch(old_epoch);
+            ctx.epoch.mls_epoch
         };
 
         // 4. Emit epoch advancement event to event log. Event log failures
@@ -8558,7 +8654,9 @@ impl ContextManager {
         // receivers can validate the message against their local epoch state.
         let current_epoch = {
             let contexts = self.contexts.lock().await;
-            contexts.get(context_id).map_or(0, |ctx| ctx.mls_epoch)
+            contexts
+                .get(context_id)
+                .map_or(0, |ctx| ctx.epoch.mls_epoch)
         };
 
         // Encrypt using the crypto provider.
@@ -9746,7 +9844,8 @@ mod tests {
         {
             let mut contexts = manager.contexts.lock().await;
             let ctx = contexts.get_mut("test-ctx").unwrap();
-            ctx.write_revoked_members
+            ctx.access
+                .write_revoked_members
                 .insert(DID("did:key:creator".to_owned()));
         }
 
@@ -11824,8 +11923,16 @@ mod tests {
         // Verify bob is tracked as read-revoked.
         let contexts = manager.contexts.lock().await;
         let ctx = contexts.get(&ctx_id).unwrap();
-        assert!(ctx.read_revoked_members.contains(&DID::from("did:key:bob")));
-        assert!(ctx.read_exclusion_list.contains(&DID::from("did:key:bob")));
+        assert!(
+            ctx.access
+                .read_revoked_members
+                .contains(&DID::from("did:key:bob"))
+        );
+        assert!(
+            ctx.access
+                .read_exclusion_list
+                .contains(&DID::from("did:key:bob"))
+        );
         // Bob is still a member (membership/access decoupling).
         assert!(ctx.membership.contains("did:key:bob"));
     }
@@ -11938,8 +12045,16 @@ mod tests {
         // Bob should no longer be read-revoked.
         let contexts = manager.contexts.lock().await;
         let ctx = contexts.get(&ctx_id).unwrap();
-        assert!(!ctx.read_revoked_members.contains(&DID::from("did:key:bob")));
-        assert!(!ctx.read_exclusion_list.contains(&DID::from("did:key:bob")));
+        assert!(
+            !ctx.access
+                .read_revoked_members
+                .contains(&DID::from("did:key:bob"))
+        );
+        assert!(
+            !ctx.access
+                .read_exclusion_list
+                .contains(&DID::from("did:key:bob"))
+        );
         // Bob still a member.
         assert!(ctx.membership.contains("did:key:bob"));
     }
@@ -11975,7 +12090,8 @@ mod tests {
         let contexts = manager.contexts.lock().await;
         let ctx = contexts.get(&ctx_id).unwrap();
         assert!(
-            ctx.write_revoked_members
+            ctx.access
+                .write_revoked_members
                 .contains(&DID::from("did:key:alice"))
         );
         // Alice is still a member.
@@ -12015,7 +12131,8 @@ mod tests {
         let contexts = manager.contexts.lock().await;
         let ctx = contexts.get(&ctx_id).unwrap();
         assert!(
-            ctx.write_revoked_members
+            ctx.access
+                .write_revoked_members
                 .contains(&DID::from("did:key:alice"))
         );
         // In FutureOnly mode, broadcast author should still exist (key not destroyed).
@@ -12129,7 +12246,8 @@ mod tests {
             let contexts = manager.contexts.lock().await;
             let ctx = contexts.get(&ctx_id).unwrap();
             assert!(
-                !ctx.write_revoked_members
+                !ctx.access
+                    .write_revoked_members
                     .contains(&DID::from("did:key:bob"))
             );
         }
@@ -12379,9 +12497,14 @@ mod tests {
             ctx.membership.contains("did:key:bob"),
             "member should remain in context after both read and write revocation"
         );
-        assert!(ctx.read_revoked_members.contains(&DID::from("did:key:bob")));
         assert!(
-            ctx.write_revoked_members
+            ctx.access
+                .read_revoked_members
+                .contains(&DID::from("did:key:bob"))
+        );
+        assert!(
+            ctx.access
+                .write_revoked_members
                 .contains(&DID::from("did:key:bob"))
         );
     }
@@ -12421,7 +12544,8 @@ mod tests {
             let contexts = manager.contexts.lock().await;
             let ctx = contexts.get(&ctx_id).unwrap();
             assert!(
-                ctx.write_revoked_members
+                ctx.access
+                    .write_revoked_members
                     .contains(&DID("did:key:bob".into())),
                 "bob should be in write_revoked_members"
             );
@@ -12529,7 +12653,8 @@ mod tests {
             let contexts = manager.contexts.lock().await;
             let ctx = contexts.get(&ctx_id).unwrap();
             assert!(
-                !ctx.write_revoked_members
+                !ctx.access
+                    .write_revoked_members
                     .contains(&DID("did:key:bob".into())),
                 "bob should not be in write_revoked_members after restore"
             );
@@ -12619,11 +12744,13 @@ mod tests {
             let contexts = manager.contexts.lock().await;
             let ctx = contexts.get(&ctx_id).unwrap();
             assert!(
-                ctx.write_revoked_members
+                ctx.access
+                    .write_revoked_members
                     .contains(&DID("did:key:bob".into()))
             );
             assert!(
-                ctx.read_revoked_members
+                ctx.access
+                    .read_revoked_members
                     .contains(&DID("did:key:bob".into()))
             );
         }
@@ -13168,7 +13295,7 @@ mod tests {
         let contexts = manager.contexts.lock().await;
         let ctx = contexts.get("replay-ctx").unwrap();
         assert!(
-            ctx.executed_proposals.contains_key(&proposal_id),
+            ctx.governance.executed_proposals.contains_key(&proposal_id),
             "executed_proposals should be preserved across restart"
         );
     }
@@ -13254,7 +13381,7 @@ mod tests {
         let contexts = manager.contexts.lock().await;
         let ctx = contexts.get("ttl-ctx").unwrap();
         assert!(
-            ctx.ttl_timer.is_active(),
+            ctx.ttl.ttl_timer.is_active(),
             "TTL timer should be re-spawned after restore"
         );
     }
@@ -14644,7 +14771,8 @@ mod tests {
         let contexts = manager.contexts.lock().await;
         let ctx = contexts.get("ctx-threshold").unwrap();
         assert!(
-            ctx.registered_tools
+            ctx.governance
+                .registered_tools
                 .iter()
                 .any(|t| t.name == "threshold-tool"),
             "tool should have been registered after proposal approval"
@@ -15062,7 +15190,7 @@ mod tests {
 
         // TTL timer should be cancelled (deadline removed).
         assert!(
-            ctx.ttl_timer.deadline_unix_secs.is_none(),
+            ctx.ttl.ttl_timer.deadline_unix_secs.is_none(),
             "TTL deadline should be removed after promotion"
         );
     }
@@ -15406,7 +15534,7 @@ mod tests {
         // Verify the engine is accessible inside the per-context state.
         let contexts = manager.contexts.lock().await;
         let ctx = contexts.get("ctx-gov-sa").unwrap();
-        let config = ctx.governance_engine.model_config();
+        let config = ctx.governance.governance_engine.model_config();
         assert_eq!(
             config,
             GovernanceModelConfig::SingleAdmin { admin_did: creator }
@@ -15449,7 +15577,7 @@ mod tests {
         assert_eq!(handle.state().await, ContextState::Active);
         let contexts = manager.contexts.lock().await;
         let ctx = contexts.get("ctx-gov-thresh").unwrap();
-        assert_eq!(ctx.governance_engine.model_config(), config);
+        assert_eq!(ctx.governance.governance_engine.model_config(), config);
     }
 
     /// AC 6: `create_context_with_governance` constructs `MajorityVoteEngine`
@@ -15480,7 +15608,7 @@ mod tests {
         assert_eq!(handle.state().await, ContextState::Active);
         let contexts = manager.contexts.lock().await;
         let ctx = contexts.get("ctx-gov-maj").unwrap();
-        let model_config = ctx.governance_engine.model_config();
+        let model_config = ctx.governance.governance_engine.model_config();
         assert!(matches!(
             model_config,
             GovernanceModelConfig::Majority { .. }
@@ -15519,7 +15647,7 @@ mod tests {
         assert_eq!(handle.state().await, ContextState::Active);
         let contexts = manager.contexts.lock().await;
         let ctx = contexts.get("ctx-gov-unan").unwrap();
-        assert_eq!(ctx.governance_engine.model_config(), config);
+        assert_eq!(ctx.governance.governance_engine.model_config(), config);
     }
 
     /// AC 8/12: Invalid `GovernanceModelConfig` is rejected at creation time.
@@ -16788,7 +16916,8 @@ mod tests {
             let contexts = manager.contexts.lock().await;
             let ctx = contexts.get("cac009-enc").unwrap();
             assert!(
-                ctx.read_revoked_members
+                ctx.access
+                    .read_revoked_members
                     .contains(&DID("did:key:dave".into())),
                 "Dave should be read-revoked"
             );
@@ -16820,7 +16949,8 @@ mod tests {
             let contexts = manager.contexts.lock().await;
             let ctx = contexts.get("cac009-enc").unwrap();
             assert!(
-                !ctx.read_revoked_members
+                !ctx.access
+                    .read_revoked_members
                     .contains(&DID("did:key:dave".into()))
             );
         }
@@ -16888,6 +17018,7 @@ mod tests {
                     contexts
                         .get(*ctx_id)
                         .unwrap()
+                        .access
                         .read_revoked_members
                         .contains(&DID("did:key:eve".into())),
                     "Eve read-revoked in {ctx_id}"
@@ -16915,6 +17046,7 @@ mod tests {
                     !contexts
                         .get(*ctx_id)
                         .unwrap()
+                        .access
                         .read_revoked_members
                         .contains(&DID("did:key:eve".into())),
                     "Eve restored in {ctx_id}"
@@ -17048,11 +17180,13 @@ mod tests {
             let contexts = manager.contexts.lock().await;
             let ctx = contexts.get(&ctx_id).unwrap();
             assert!(
-                ctx.write_revoked_members
+                ctx.access
+                    .write_revoked_members
                     .contains(&DID("did:key:bob".into()))
             );
             assert!(
-                ctx.read_revoked_members
+                ctx.access
+                    .read_revoked_members
                     .contains(&DID("did:key:bob".into()))
             );
         }
@@ -17072,12 +17206,14 @@ mod tests {
             let contexts = manager.contexts.lock().await;
             let ctx = contexts.get(&ctx_id).unwrap();
             assert!(
-                !ctx.write_revoked_members
+                !ctx.access
+                    .write_revoked_members
                     .contains(&DID("did:key:bob".into())),
                 "write restored"
             );
             assert!(
-                ctx.read_revoked_members
+                ctx.access
+                    .read_revoked_members
                     .contains(&DID("did:key:bob".into())),
                 "read still revoked"
             );
@@ -17098,11 +17234,13 @@ mod tests {
             let contexts = manager.contexts.lock().await;
             let ctx = contexts.get(&ctx_id).unwrap();
             assert!(
-                !ctx.write_revoked_members
+                !ctx.access
+                    .write_revoked_members
                     .contains(&DID("did:key:bob".into()))
             );
             assert!(
-                !ctx.read_revoked_members
+                !ctx.access
+                    .read_revoked_members
                     .contains(&DID("did:key:bob".into()))
             );
         }
@@ -17138,6 +17276,7 @@ mod tests {
                 contexts
                     .get(&ctx_id)
                     .unwrap()
+                    .access
                     .write_revoked_members
                     .contains(&DID("did:key:bob".into())),
                 "Layer 3"
@@ -17346,12 +17485,14 @@ mod tests {
             let contexts = manager.contexts.lock().await;
             let ctx = contexts.get(&ctx_id).unwrap();
             assert!(
-                ctx.write_revoked_members
+                ctx.access
+                    .write_revoked_members
                     .contains(&DID("did:key:bob".into())),
                 "write-revoked"
             );
             assert!(
-                !ctx.read_revoked_members
+                !ctx.access
+                    .read_revoked_members
                     .contains(&DID("did:key:bob".into())),
                 "NOT read-revoked"
             );
@@ -18193,7 +18334,8 @@ mod tests {
                 .duration_since(UNIX_EPOCH)
                 .unwrap_or_default()
                 .as_secs();
-            ctx.approved_proposals
+            ctx.governance
+                .approved_proposals
                 .insert(proposal_a.proposal_id, (proposal_a.clone(), now, now));
             let events = manager.detect_and_handle_conflicts(ctx, &proposal_b);
             assert!(
@@ -18360,6 +18502,7 @@ mod tests {
         let contexts = manager.contexts.lock().await;
         let ctx = contexts.get("ctx-ceiling").unwrap();
         let pending = ctx
+            .governance
             .pending_ceiling_modification
             .as_ref()
             .expect("pending ceiling modification should exist");
@@ -18419,7 +18562,8 @@ mod tests {
         let notified_at = {
             let contexts = manager.contexts.lock().await;
             let ctx = contexts.get("ctx-apply").unwrap();
-            ctx.pending_ceiling_modification
+            ctx.governance
+                .pending_ceiling_modification
                 .as_ref()
                 .unwrap()
                 .notified_at
@@ -18446,7 +18590,7 @@ mod tests {
         let contexts = manager.contexts.lock().await;
         let ctx = contexts.get("ctx-apply").unwrap();
         assert!(
-            ctx.pending_ceiling_modification.is_none(),
+            ctx.governance.pending_ceiling_modification.is_none(),
             "pending modification should be cleared after apply"
         );
         assert!(
@@ -18660,6 +18804,7 @@ mod tests {
         let contexts = manager.contexts.lock().await;
         let ctx = contexts.get("ctx-econ-delay").unwrap();
         let pending = ctx
+            .governance
             .pending_economic_policy_change
             .as_ref()
             .expect("pending economic policy change should exist");
@@ -18670,7 +18815,7 @@ mod tests {
             "effective_at must be notified_at + 24h"
         );
         assert!(
-            ctx.economic_policy.is_none(),
+            ctx.governance.economic_policy.is_none(),
             "economic policy should not be applied yet (still in notification period)"
         );
     }
@@ -18726,7 +18871,8 @@ mod tests {
         let notified_at = {
             let contexts = manager.contexts.lock().await;
             let ctx = contexts.get("ctx-econ-apply").unwrap();
-            ctx.pending_economic_policy_change
+            ctx.governance
+                .pending_economic_policy_change
                 .as_ref()
                 .unwrap()
                 .notified_at
@@ -18750,11 +18896,11 @@ mod tests {
         let contexts = manager.contexts.lock().await;
         let ctx = contexts.get("ctx-econ-apply").unwrap();
         assert!(
-            ctx.pending_economic_policy_change.is_none(),
+            ctx.governance.pending_economic_policy_change.is_none(),
             "pending change should be cleared after apply"
         );
         assert_eq!(
-            ctx.economic_policy.as_ref(),
+            ctx.governance.economic_policy.as_ref(),
             Some(&policy),
             "economic policy should now be set after apply"
         );
@@ -19079,7 +19225,7 @@ mod tests {
         {
             let contexts = manager.contexts.lock().await;
             let ctx = contexts.get("budget-ctx").unwrap();
-            assert!(!ctx.budget_tracker.has_budget(&spender));
+            assert!(!ctx.governance.budget_tracker.has_budget(&spender));
         }
 
         // First grant: 5000.
@@ -19099,9 +19245,9 @@ mod tests {
         {
             let contexts = manager.contexts.lock().await;
             let ctx = contexts.get("budget-ctx").unwrap();
-            assert!(ctx.budget_tracker.has_budget(&spender));
+            assert!(ctx.governance.budget_tracker.has_budget(&spender));
             assert_eq!(
-                ctx.budget_tracker.remaining(&spender),
+                ctx.governance.budget_tracker.remaining(&spender),
                 scp_protocol::economy::types::Amount::new(5000)
             );
         }
@@ -19124,7 +19270,7 @@ mod tests {
             let contexts = manager.contexts.lock().await;
             let ctx = contexts.get("budget-ctx").unwrap();
             assert_eq!(
-                ctx.budget_tracker.limit(&spender),
+                ctx.governance.budget_tracker.limit(&spender),
                 scp_protocol::economy::types::Amount::new(8000)
             );
         }
@@ -19317,7 +19463,10 @@ mod tests {
         // Verify epoch was incremented (from 0 to 1).
         let contexts = manager.contexts.lock().await;
         let ctx = contexts.get("test-ctx").unwrap();
-        assert_eq!(ctx.mls_epoch, 1, "MLS epoch should advance after AddMember");
+        assert_eq!(
+            ctx.epoch.mls_epoch, 1,
+            "MLS epoch should advance after AddMember"
+        );
     }
 
     /// Issue #630 AC2: MLS commits generated and applied for `AddMember`.
@@ -19343,7 +19492,7 @@ mod tests {
         // proving that generate_mls_operations was called.
         let contexts = manager.contexts.lock().await;
         let ctx = contexts.get("test-ctx").unwrap();
-        let records = ctx.epoch_coordinator.records();
+        let records = ctx.epoch.epoch_coordinator.records();
         assert_eq!(records.len(), 1);
         if let scp_protocol::context::governance::mls_integration::MlsOperation::AddMember {
             ref did,
@@ -19393,13 +19542,13 @@ mod tests {
         let contexts = manager.contexts.lock().await;
         let ctx = contexts.get("test-ctx").unwrap();
         assert_eq!(
-            ctx.epoch_coordinator.record_count(),
+            ctx.epoch.epoch_coordinator.record_count(),
             2,
             "should have 2 coordination records after 2 MLS-affecting actions"
         );
 
         // Verify first record: epoch 0 → 1 for AddMember.
-        let records = ctx.epoch_coordinator.records();
+        let records = ctx.epoch.epoch_coordinator.records();
         assert_eq!(records[0].epoch_before, 0);
         assert_eq!(records[0].epoch_after, 1);
         assert!(matches!(
@@ -19449,12 +19598,12 @@ mod tests {
         let contexts = manager.contexts.lock().await;
         let ctx = contexts.get("test-ctx").unwrap();
         assert_eq!(
-            ctx.epoch_coordinator.record_count(),
+            ctx.epoch.epoch_coordinator.record_count(),
             1,
             "ChangeRole should not create a coordination record"
         );
         // Epoch should still be 1 (AddMember advanced 0→1, ChangeRole doesn't).
-        assert_eq!(ctx.mls_epoch, 1);
+        assert_eq!(ctx.epoch.mls_epoch, 1);
     }
 
     /// Issue #630 AC3: `EpochCoordinator` records survive snapshot roundtrip.
@@ -19604,10 +19753,12 @@ mod tests {
         {
             let mut contexts = manager.contexts.lock().await;
             let ctx = contexts.get_mut("test-ctx").unwrap();
-            ctx.governance_freeze = Some((proposal_a_id, proposal_b_id, 1000));
-            ctx.approved_proposals
+            ctx.governance.governance_freeze = Some((proposal_a_id, proposal_b_id, 1000));
+            ctx.governance
+                .approved_proposals
                 .insert(proposal_a_id, (conflict_proposal_a, 900, 2000));
-            ctx.approved_proposals
+            ctx.governance
+                .approved_proposals
                 .insert(proposal_b_id, (conflict_proposal_b, 900, 2000));
         }
 
@@ -19629,13 +19780,21 @@ mod tests {
         let contexts = manager.contexts.lock().await;
         let ctx = contexts.get("test-ctx").unwrap();
         assert!(
-            ctx.governance_freeze.is_none(),
+            ctx.governance.governance_freeze.is_none(),
             "governance freeze should be cleared after conflict resolution"
         );
 
         // Both proposals should be in executed_proposals (invalidated).
-        assert!(ctx.executed_proposals.contains_key(&proposal_a_id));
-        assert!(ctx.executed_proposals.contains_key(&proposal_b_id));
+        assert!(
+            ctx.governance
+                .executed_proposals
+                .contains_key(&proposal_a_id)
+        );
+        assert!(
+            ctx.governance
+                .executed_proposals
+                .contains_key(&proposal_b_id)
+        );
     }
 
     /// Helper: creates an approved `CancelContextMigration` governance
@@ -20108,7 +20267,7 @@ mod tests {
         let contexts = manager.contexts.lock().await;
         let ctx = contexts.get("recovery-fail-1").unwrap();
         assert_eq!(
-            ctx.mls_epoch, 0,
+            ctx.epoch.mls_epoch, 0,
             "epoch counter must not increment on crypto failure"
         );
     }
@@ -20146,7 +20305,7 @@ mod tests {
         let contexts = manager.contexts.lock().await;
         let ctx = contexts.get("recovery-inactive-1").unwrap();
         assert_eq!(
-            ctx.mls_epoch, 0,
+            ctx.epoch.mls_epoch, 0,
             "epoch must not change for inactive context"
         );
     }
