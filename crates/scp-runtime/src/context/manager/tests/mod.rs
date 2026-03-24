@@ -1,0 +1,675 @@
+use std::collections::HashSet;
+use std::sync::atomic::{AtomicBool, Ordering};
+
+use super::*;
+use scp_protocol::context::params::MemoryScope;
+use scp_protocol::context::{ContextMode, ContextState};
+
+mod broadcast;
+mod governance;
+mod lifecycle;
+mod messaging;
+mod queries;
+mod trust_recovery;
+
+// -----------------------------------------------------------------------
+// Key resolver helpers for tests
+// -----------------------------------------------------------------------
+
+/// No-op key resolver that always returns `None`. Suitable for tests
+/// that don't exercise governance vote signature verification.
+pub(super) fn noop_key_resolver() -> KeyResolver {
+    Arc::new(|_| None)
+}
+
+/// Derives a deterministic Ed25519 seed from a DID string.
+/// Used by both `mock_key_resolver` and `signing_key_for_did` to
+/// ensure signing keys and resolved verifying keys match.
+pub(super) fn did_to_seed(did: &DID) -> [u8; 32] {
+    let mut s = [0u8; 32];
+    let bytes = did.as_ref().as_bytes();
+    for (i, b) in bytes.iter().enumerate() {
+        s[i % 32] ^= *b;
+    }
+    s
+}
+
+/// Mock key resolver that returns a deterministic verifying key derived
+/// from the DID string. Suitable for governance proposal tests that
+/// need actual key resolution for vote verification.
+pub(super) fn mock_key_resolver() -> KeyResolver {
+    Arc::new(|did| {
+        let seed = did_to_seed(did);
+        Some(ed25519_dalek::SigningKey::from_bytes(&seed).verifying_key())
+    })
+}
+
+/// Returns the signing key that corresponds to what `mock_key_resolver`
+/// resolves for the given DID.
+pub(super) fn signing_key_for_did(did: &DID) -> ed25519_dalek::SigningKey {
+    ed25519_dalek::SigningKey::from_bytes(&did_to_seed(did))
+}
+
+/// Creates an [`InMemoryKeyCustody`] and imports an Ed25519 signing key
+/// from seed bytes, returning both the custody and the key handle.
+///
+/// Used by broadcast publish tests that need to pass custody + handle
+/// to [`ContextManager::publish_broadcast`].
+pub(super) async fn test_custody_from_seed(
+    seed: &[u8; 32],
+) -> (
+    scp_platform::testing::InMemoryKeyCustody,
+    scp_platform::KeyHandle,
+) {
+    let custody = scp_platform::testing::InMemoryKeyCustody::new();
+    let handle = custody.import_ed25519_key(seed).await;
+    (custody, handle)
+}
+
+// -----------------------------------------------------------------------
+// Reusable mock providers
+// -----------------------------------------------------------------------
+
+#[derive(Default)]
+pub(super) struct MockCrypto {
+    pub(super) fail_create_mls: AtomicBool,
+    pub(super) fail_validate_key_package: AtomicBool,
+    pub(super) fail_advance_epoch: AtomicBool,
+    pub(super) mls_created: std::sync::Mutex<Vec<[u8; 32]>>,
+    pub(super) sender_keys_created: std::sync::Mutex<Vec<[u8; 32]>>,
+    pub(super) broadcast_created: std::sync::Mutex<Vec<[u8; 32]>>,
+    pub(super) mls_destroyed: std::sync::Mutex<Vec<[u8; 32]>>,
+    pub(super) sender_keys_destroyed: std::sync::Mutex<Vec<[u8; 32]>>,
+    pub(super) members_added: std::sync::Mutex<Vec<String>>,
+    pub(super) members_removed: std::sync::Mutex<Vec<String>>,
+    pub(super) sender_keys_distributed: std::sync::Mutex<Vec<String>>,
+    pub(super) sender_keys_removed: std::sync::Mutex<Vec<String>>,
+    pub(super) messages_encrypted: std::sync::Mutex<Vec<Vec<u8>>>,
+    pub(super) epochs_advanced: std::sync::Mutex<Vec<[u8; 32]>>,
+    /// Shared handle for test code to observe `advance_epoch` calls after
+    /// the mock has been moved into the `ContextManager`.
+    pub(super) epochs_advanced_shared: Arc<std::sync::Mutex<Vec<[u8; 32]>>>,
+    /// When `Some`, `decrypt_message` returns `(ciphertext, sender_did)`.
+    /// When `None`, the default trait impl (error) is used.
+    pub(super) decrypt_sender_did: Option<String>,
+}
+
+impl ContextCryptoProvider for MockCrypto {
+    fn validate_creator_identity(&self) -> Result<(), ContextCreationError> {
+        Ok(())
+    }
+
+    fn create_mls_group(&self, id: &[u8; 32]) -> Result<(), ContextCreationError> {
+        if self.fail_create_mls.load(Ordering::Relaxed) {
+            return Err(ContextCreationError::CryptoFailed("mock failure".into()));
+        }
+        self.mls_created.lock().unwrap().push(*id);
+        Ok(())
+    }
+
+    fn generate_sender_key(&self, id: &[u8; 32]) -> Result<(), ContextCreationError> {
+        self.sender_keys_created.lock().unwrap().push(*id);
+        Ok(())
+    }
+
+    fn init_broadcast_key(&self, id: &[u8; 32]) -> Result<(), ContextCreationError> {
+        self.broadcast_created.lock().unwrap().push(*id);
+        Ok(())
+    }
+
+    fn destroy_mls_group(&self, id: &[u8; 32]) -> Result<(), ContextCreationError> {
+        self.mls_destroyed.lock().unwrap().push(*id);
+        Ok(())
+    }
+
+    fn destroy_sender_key(&self, id: &[u8; 32]) -> Result<(), ContextCreationError> {
+        self.sender_keys_destroyed.lock().unwrap().push(*id);
+        Ok(())
+    }
+
+    fn validate_key_package(
+        &self,
+        _owner_did: &str,
+        _key_package_bytes: Option<&[u8]>,
+    ) -> Result<(), ContextError> {
+        if self.fail_validate_key_package.load(Ordering::Relaxed) {
+            return Err(ContextError::InvalidKeyPackage("mock invalid".into()));
+        }
+        Ok(())
+    }
+
+    fn add_member(
+        &self,
+        _context_id: &[u8; 32],
+        member_did: &str,
+        _key_package_bytes: Option<&[u8]>,
+    ) -> Result<scp_protocol::context::builder::AddMemberOutput, ContextError> {
+        self.members_added
+            .lock()
+            .unwrap()
+            .push(member_did.to_owned());
+        Ok(scp_protocol::context::builder::AddMemberOutput::default())
+    }
+
+    fn remove_member(&self, _context_id: &[u8; 32], member_did: &str) -> Result<(), ContextError> {
+        self.members_removed
+            .lock()
+            .unwrap()
+            .push(member_did.to_owned());
+        Ok(())
+    }
+
+    fn distribute_sender_key(
+        &self,
+        _context_id: &[u8; 32],
+        member_did: &str,
+    ) -> Result<(), ContextError> {
+        self.sender_keys_distributed
+            .lock()
+            .unwrap()
+            .push(member_did.to_owned());
+        Ok(())
+    }
+
+    fn remove_member_sender_key(
+        &self,
+        _context_id: &[u8; 32],
+        member_did: &str,
+    ) -> Result<(), ContextError> {
+        self.sender_keys_removed
+            .lock()
+            .unwrap()
+            .push(member_did.to_owned());
+        Ok(())
+    }
+
+    fn encrypt_message(
+        &self,
+        _context_id: &[u8; 32],
+        _sender_did: &str,
+        payload: &[u8],
+        _epoch: u64,
+        _sequence: u64,
+    ) -> Result<Vec<u8>, ContextError> {
+        self.messages_encrypted
+            .lock()
+            .unwrap()
+            .push(payload.to_vec());
+        // Mock: return payload as-is (no real encryption).
+        Ok(payload.to_vec())
+    }
+
+    fn decrypt_message(
+        &self,
+        _context_id: &[u8; 32],
+        ciphertext: &[u8],
+        _epoch: u64,
+        _sequence: u64,
+    ) -> Result<Option<(Vec<u8>, String)>, ContextError> {
+        self.decrypt_sender_did.as_ref().map_or_else(
+            || {
+                Err(ContextError::CryptoFailed(
+                    "decrypt_message not configured in mock".to_owned(),
+                ))
+            },
+            |did| Ok(Some((ciphertext.to_vec(), did.clone()))),
+        )
+    }
+
+    fn advance_epoch(&self, context_id: &[u8; 32]) -> Result<(), ContextError> {
+        if self.fail_advance_epoch.load(Ordering::Relaxed) {
+            return Err(ContextError::CryptoFailed(
+                "mock advance_epoch failure".into(),
+            ));
+        }
+        self.epochs_advanced.lock().unwrap().push(*context_id);
+        self.epochs_advanced_shared
+            .lock()
+            .unwrap()
+            .push(*context_id);
+        Ok(())
+    }
+}
+
+#[derive(Default)]
+pub(super) struct MockTransport {
+    pub(super) connected: AtomicBool,
+    pub(super) published: std::sync::Mutex<Vec<[u8; 32]>>,
+    pub(super) deleted: std::sync::Mutex<Vec<[u8; 32]>>,
+    pub(super) messages_sent: std::sync::Mutex<Vec<Vec<u8>>>,
+}
+
+impl MockTransport {
+    pub(super) fn connected() -> Self {
+        let t = Self::default();
+        t.connected.store(true, Ordering::Relaxed);
+        t
+    }
+}
+
+impl ContextTransportProvider for MockTransport {
+    fn is_connected(&self) -> bool {
+        self.connected.load(Ordering::Relaxed)
+    }
+
+    fn publish_context(
+        &self,
+        id: &[u8; 32],
+        _params: &ContextParams,
+    ) -> Result<(), ContextCreationError> {
+        self.published.lock().unwrap().push(*id);
+        Ok(())
+    }
+
+    fn delete_published(&self, id: &[u8; 32]) -> Result<(), ContextCreationError> {
+        self.deleted.lock().unwrap().push(*id);
+        Ok(())
+    }
+
+    fn send_message(
+        &self,
+        _context_id: &[u8; 32],
+        encrypted_payload: &[u8],
+    ) -> Result<(), ContextError> {
+        self.messages_sent
+            .lock()
+            .unwrap()
+            .push(encrypted_payload.to_vec());
+        Ok(())
+    }
+}
+
+#[derive(Default)]
+pub(super) struct MockEventLog {
+    pub(super) inited: std::sync::Mutex<Vec<[u8; 32]>>,
+    pub(super) events: std::sync::Mutex<Vec<([u8; 32], String)>>,
+    pub(super) destroyed: std::sync::Mutex<Vec<[u8; 32]>>,
+}
+
+impl ContextEventLogProvider for MockEventLog {
+    fn init_event_log(&self, id: &[u8; 32]) -> Result<(), ContextCreationError> {
+        self.inited.lock().unwrap().push(*id);
+        Ok(())
+    }
+
+    fn append_event(&self, id: &[u8; 32], event: &str) -> Result<(), ContextCreationError> {
+        self.events.lock().unwrap().push((*id, event.to_owned()));
+        Ok(())
+    }
+
+    fn destroy_event_log(&self, id: &[u8; 32]) -> Result<(), ContextCreationError> {
+        self.destroyed.lock().unwrap().push(*id);
+        Ok(())
+    }
+}
+
+/// A transport mock that always fails on `send_message`.
+/// Used to test that phantom `MessageSent` events are not emitted
+/// when transport fails (#1420).
+pub(super) struct FailingTransport;
+
+impl ContextTransportProvider for FailingTransport {
+    fn is_connected(&self) -> bool {
+        true
+    }
+
+    fn publish_context(
+        &self,
+        _id: &[u8; 32],
+        _params: &ContextParams,
+    ) -> Result<(), ContextCreationError> {
+        Ok(())
+    }
+
+    fn delete_published(&self, _id: &[u8; 32]) -> Result<(), ContextCreationError> {
+        Ok(())
+    }
+
+    fn send_message(
+        &self,
+        _context_id: &[u8; 32],
+        _encrypted_payload: &[u8],
+    ) -> Result<(), ContextError> {
+        Err(ContextError::TransportFailed(
+            "mock transport failure".into(),
+        ))
+    }
+}
+
+// -----------------------------------------------------------------------
+// Helper: create a manager with default mocks and a registered context
+// -----------------------------------------------------------------------
+
+pub(super) async fn setup_active_context() -> (ContextManager, ContextHandle) {
+    let manager = ContextManager::new(
+        Box::new(MockCrypto::default()),
+        Box::new(MockTransport::connected()),
+        Box::new(MockEventLog::default()),
+        noop_key_resolver(),
+    );
+
+    let params = ContextParams {
+        ceiling: vec![
+            scp_protocol::context::params::Capability::new("messages:read"),
+            scp_protocol::context::params::Capability::new("messages:write"),
+            scp_protocol::context::params::Capability::new("role:assign"),
+            Capability::ToolRegister,
+            Capability::ToolInterface,
+            Capability::ChildContextCreate,
+            Capability::MemberBan,
+        ],
+        ..ContextParams::default()
+    };
+
+    let handle = manager
+        .create_context("test-ctx".into(), params, "did:key:creator".into())
+        .await
+        .unwrap();
+
+    (manager, handle)
+}
+
+// -----------------------------------------------------------------------
+// Shared helpers used across multiple test files
+// -----------------------------------------------------------------------
+
+/// Helper: creates an approved governance proposal for an arbitrary action
+/// using `SingleAdminEngine`. The admin is `admin_did`.
+pub(super) fn approved_governance_proposal(
+    admin_did: &DID,
+    context_id: &str,
+    target_did: &DID,
+    action: super::GovernanceAction,
+) -> super::GovernanceProposal {
+    use scp_protocol::context::governance::{
+        GovernanceContext, GovernanceEngine, SingleAdminEngine,
+    };
+
+    let signing_key = ed25519_dalek::SigningKey::from_bytes(&[1u8; 32]);
+    let vk = signing_key.verifying_key();
+    #[allow(clippy::type_complexity)]
+    let resolver: std::sync::Arc<
+        dyn Fn(&scp_identity::DID) -> Option<ed25519_dalek::VerifyingKey> + Send + Sync,
+    > = std::sync::Arc::new(move |_| Some(vk));
+    let mut engine = SingleAdminEngine::new(admin_did.clone(), resolver);
+    let gov_ctx = GovernanceContext {
+        context_id: context_id.to_owned(),
+        members: vec![
+            (admin_did.clone(), "admin".to_owned()),
+            (target_did.clone(), "subscriber".to_owned()),
+        ],
+        admin_dids: vec![admin_did.clone()],
+        current_epoch: None,
+        now: 1000,
+    };
+
+    let (proposal, _events) = engine
+        .propose(admin_did, action, &gov_ctx, &signing_key)
+        .unwrap();
+    assert!(matches!(proposal.status, super::ProposalStatus::Approved));
+    proposal
+}
+
+/// Helper to create a broadcast context with two authors (alice + bob).
+///
+/// Both authors are registered in the `BroadcastContext` (for publish
+/// capability) and in `MembershipState` (for sequence number tracking).
+/// Both author DIDs are registered as locally controlled (#234).
+pub(super) async fn setup_broadcast_context_two_authors() -> (ContextManager, ContextHandle, String)
+{
+    let manager = ContextManager::new(
+        Box::new(MockCrypto::default()),
+        Box::new(MockTransport::connected()),
+        Box::new(MockEventLog::default()),
+        noop_key_resolver(),
+    );
+
+    // Register both author DIDs as locally controlled (#234).
+    manager.register_local_did("did:key:alice".into()).await;
+    manager.register_local_did("did:key:bob".into()).await;
+
+    let params = ContextParams {
+        mode: ContextMode::Broadcast,
+        memory_scope: scp_protocol::context::MemoryScope::Full,
+        ceiling: vec![
+            scp_protocol::context::params::Capability::new("messages:read"),
+            scp_protocol::context::params::Capability::new("messages:write"),
+            scp_protocol::context::params::Capability::new("role:assign"),
+            Capability::MemberBan,
+        ],
+        ..ContextParams::default()
+    };
+
+    let handle = manager
+        .create_context("broadcast-2auth-ctx".into(), params, "did:key:alice".into())
+        .await
+        .unwrap();
+
+    // Add bob as a second author: both in BroadcastContext and membership.
+    {
+        let mut contexts = manager.contexts.lock().await;
+        let ctx = contexts.get_mut("broadcast-2auth-ctx").unwrap();
+        let bc = ctx.broadcast_context.as_mut().unwrap();
+        bc.add_author("did:key:bob").unwrap();
+        // Also add to membership tracking so sequence numbers work.
+        ctx.membership
+            .add_member("did:key:bob".into(), "author".into(), vec![]);
+    }
+
+    let ctx_id = "broadcast-2auth-ctx".to_owned();
+    (manager, handle, ctx_id)
+}
+
+/// Helper: creates a broadcast context with `MemberBan` in ceiling,
+/// admin (alice) and subscriber (sub1).
+pub(super) async fn setup_broadcast_with_member_ban() -> (ContextManager, String) {
+    let manager = ContextManager::new(
+        Box::new(MockCrypto::default()),
+        Box::new(MockTransport::connected()),
+        Box::new(MockEventLog::default()),
+        noop_key_resolver(),
+    );
+
+    manager.register_local_did("did:key:alice".into()).await;
+
+    let params = ContextParams {
+        mode: ContextMode::Broadcast,
+        memory_scope: scp_protocol::context::MemoryScope::Full,
+        ceiling: vec![
+            scp_protocol::context::params::Capability::new("messages:read"),
+            scp_protocol::context::params::Capability::new("messages:write"),
+            scp_protocol::context::params::Capability::new("role:assign"),
+            scp_protocol::context::params::Capability::new("member:ban"),
+        ],
+        ..ContextParams::default()
+    };
+
+    let _handle = manager
+        .create_context("broadcast-ban-ctx".into(), params, "did:key:alice".into())
+        .await
+        .unwrap();
+
+    // Subscribe sub1 directly via BroadcastContext.
+    {
+        use scp_protocol::crypto::ucan::validate::{
+            InMemoryDidResolver, InMemoryNonceTracker, InMemoryProofResolver,
+            InMemoryRevocationChecker,
+        };
+        use std::hash::RandomState;
+
+        manager
+            .subscribe_broadcast::<
+                InMemoryDidResolver,
+                InMemoryNonceTracker,
+                InMemoryRevocationChecker,
+                InMemoryProofResolver,
+                RandomState,
+            >(
+                "broadcast-ban-ctx",
+                &DID("did:key:sub1".into()),
+                None,
+                1000,
+                None,
+            )
+            .await
+            .unwrap();
+    }
+
+    let ctx_id = "broadcast-ban-ctx".to_owned();
+    (manager, ctx_id)
+}
+
+/// Helper: creates an encrypted context with `MemberBan` in ceiling,
+/// admin (alice) and member (bob).
+pub(super) async fn setup_encrypted_with_member_ban() -> (ContextManager, String) {
+    let manager = ContextManager::new(
+        Box::new(MockCrypto::default()),
+        Box::new(MockTransport::connected()),
+        Box::new(MockEventLog::default()),
+        noop_key_resolver(),
+    );
+
+    manager.register_local_did("did:key:alice".into()).await;
+    manager.register_local_did("did:key:bob".into()).await;
+
+    let params = ContextParams {
+        mode: ContextMode::Encrypted,
+        memory_scope: MemoryScope::Full,
+        ceiling: vec![
+            Capability::MessagesRead,
+            Capability::MessagesWrite,
+            Capability::RoleAssign,
+            Capability::MemberBan,
+        ],
+        ..ContextParams::default()
+    };
+
+    let _handle = manager
+        .create_context("enc-ban-ctx".into(), params, "did:key:alice".into())
+        .await
+        .unwrap();
+
+    // Add bob as a member.
+    {
+        let mut contexts = manager.contexts.lock().await;
+        let ctx = contexts.get_mut("enc-ban-ctx").unwrap();
+        ctx.membership
+            .add_member("did:key:bob".into(), "member".into(), vec![]);
+    }
+
+    (manager, "enc-ban-ctx".to_owned())
+}
+
+/// Helper: `ContextParams` with governance-compatible ceiling.
+pub(super) fn governance_params() -> ContextParams {
+    ContextParams {
+        ceiling: vec![
+            scp_protocol::context::params::Capability::new("messages:read"),
+            scp_protocol::context::params::Capability::new("messages:write"),
+            scp_protocol::context::params::Capability::new("role:assign"),
+            scp_protocol::context::params::Capability::new("governance:propose"),
+            scp_protocol::context::params::Capability::new("governance:vote"),
+            scp_protocol::context::params::Capability::new("member:ban"),
+            scp_protocol::context::params::Capability::new("context:close"),
+        ],
+        ..ContextParams::default()
+    }
+}
+
+/// Helper: create a `ToolRegistration` fixture.
+pub(super) fn test_tool_registration(id: &str) -> ToolRegistration {
+    use scp_protocol::context::tools::registry::{TestVector, ToolSchema};
+    ToolRegistration {
+        tool_id: id.to_owned(),
+        name: id.to_owned(),
+        description: "test tool".to_owned(),
+        schema: ToolSchema {
+            input_schema: serde_json::json!({"type": "object"}),
+            output_schema: serde_json::json!({"type": "object"}),
+        },
+        implementation_hash: [0u8; 32],
+        test_vectors: vec![TestVector {
+            input: serde_json::json!({}),
+            expected_output: serde_json::json!({}),
+            description: "noop".to_owned(),
+        }],
+        operator_did: "did:key:test-operator".into(),
+        cost: None,
+        registered_at: 0,
+        signature: Vec::new(),
+    }
+}
+
+/// Helper: creates a broadcast context with an author (author1),
+/// registers `did:key:author1` as a local DID.
+pub(super) async fn setup_broadcast_context() -> (ContextManager, ContextHandle, String) {
+    let manager = ContextManager::new(
+        Box::new(MockCrypto::default()),
+        Box::new(MockTransport::connected()),
+        Box::new(MockEventLog::default()),
+        noop_key_resolver(),
+    );
+
+    // Register the author DID as locally controlled (#234).
+    manager.register_local_did("did:key:author1".into()).await;
+
+    let params = ContextParams {
+        mode: ContextMode::Broadcast,
+        memory_scope: scp_protocol::context::MemoryScope::Full,
+        ceiling: vec![
+            scp_protocol::context::params::Capability::new("messages:read"),
+            scp_protocol::context::params::Capability::new("messages:write"),
+            scp_protocol::context::params::Capability::new("role:assign"),
+        ],
+        ..ContextParams::default()
+    };
+
+    let handle = manager
+        .create_context("broadcast-ctx".into(), params, "did:key:author1".into())
+        .await
+        .unwrap();
+
+    (manager, handle, "broadcast-ctx".into())
+}
+
+/// Helper: creates an approved `BlockAuthor` governance proposal using
+/// `SingleAdminEngine` (admin = `admin_did`). Returns the approved
+/// proposal that can be passed to `execute_governance_action()`.
+pub(super) fn approved_block_author_proposal(
+    admin_did: &DID,
+    context_id: &str,
+    target_did: &DID,
+) -> super::GovernanceProposal {
+    use scp_protocol::context::governance::{
+        GovernanceAction, GovernanceContext, GovernanceEngine, SingleAdminEngine,
+    };
+
+    let signing_key = ed25519_dalek::SigningKey::from_bytes(&[1u8; 32]);
+    let vk = signing_key.verifying_key();
+    #[allow(clippy::type_complexity)]
+    let resolver: std::sync::Arc<
+        dyn Fn(&scp_identity::DID) -> Option<ed25519_dalek::VerifyingKey> + Send + Sync,
+    > = std::sync::Arc::new(move |_| Some(vk));
+    let mut engine = SingleAdminEngine::new(admin_did.clone(), resolver);
+    let gov_ctx = GovernanceContext {
+        context_id: context_id.to_owned(),
+        members: vec![
+            (admin_did.clone(), "admin".to_owned()),
+            (target_did.clone(), "author".to_owned()),
+        ],
+        admin_dids: vec![admin_did.clone()],
+        current_epoch: None,
+        now: 1000,
+    };
+
+    let action = GovernanceAction::BlockAuthor {
+        did: target_did.clone(),
+        reason: Some("governance test".to_owned()),
+    };
+
+    let (proposal, _events) = engine
+        .propose(admin_did, action, &gov_ctx, &signing_key)
+        .unwrap();
+    assert!(matches!(proposal.status, super::ProposalStatus::Approved));
+    proposal
+}
