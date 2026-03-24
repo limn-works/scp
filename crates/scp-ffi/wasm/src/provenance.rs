@@ -13,9 +13,10 @@
 //! # WASM constraints
 //!
 //! This bridge does NOT depend on `scp-core` (tokio multi-thread incompatible
-//! with `wasm32-unknown-unknown`). Provenance operations are pure computation
-//! (chain depth arithmetic, quality tier evaluation, JSON construction)
-//! re-implemented locally with algorithm-identical logic.
+//! with `wasm32-unknown-unknown`). `SourceType` and `DEFAULT_MAX_CHAIN_DEPTH`
+//! are imported from `scp-protocol`. Provenance operations (chain depth
+//! arithmetic, quality tier evaluation, pseudonymization, JSON construction)
+//! remain WASM-local.
 //!
 //! See ADR-019 in `.docs/adrs/phase-4.md`.
 
@@ -27,38 +28,18 @@ use zeroize::Zeroizing;
 // Constants (mirror scp-core::provenance::attach)
 // ---------------------------------------------------------------------------
 
-/// Default maximum chain depth (8 hops, ADR-043).
-pub(crate) const DEFAULT_MAX_CHAIN_DEPTH: u8 = 8;
+// Import from scp-protocol.
+use scp_protocol::provenance::SourceType;
+pub(crate) use scp_protocol::provenance::attach::DEFAULT_MAX_CHAIN_DEPTH;
 
-// ---------------------------------------------------------------------------
-// Local enums (mirror scp-core::provenance)
-// ---------------------------------------------------------------------------
-
-/// Source type for provenance quality evaluation.
-enum SourceType {
-    Persistent,
-    Ephemeral,
-    Summary,
-}
-
-impl SourceType {
-    fn from_str(s: &str) -> Option<Self> {
-        match s {
-            "persistent" => Some(Self::Persistent),
-            "ephemeral" => Some(Self::Ephemeral),
-            "summary" => Some(Self::Summary),
-            _ => None,
-        }
-    }
-}
-
-impl std::fmt::Display for SourceType {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Persistent => write!(f, "Persistent"),
-            Self::Ephemeral => write!(f, "Ephemeral"),
-            Self::Summary => write!(f, "Summary"),
-        }
+/// Parses a lowercase source type string from the JS JSON API to the
+/// canonical `SourceType` enum from scp-protocol.
+fn parse_source_type(s: &str) -> Option<SourceType> {
+    match s {
+        "persistent" => Some(SourceType::Persistent),
+        "ephemeral" => Some(SourceType::Ephemeral),
+        "summary" => Some(SourceType::Summary),
+        _ => None,
     }
 }
 
@@ -97,31 +78,24 @@ impl std::fmt::Display for ContextState {
     }
 }
 
-/// Memory scope for provenance attachment.
-enum MemoryScope {
-    Full,
-    Summary,
-    Ephemeral,
-}
+use scp_protocol::context::params::MemoryScope;
 
-impl MemoryScope {
-    fn from_str(s: &str) -> Option<Self> {
-        match s {
-            "full" => Some(Self::Full),
-            "summary" => Some(Self::Summary),
-            "ephemeral" => Some(Self::Ephemeral),
-            _ => None,
-        }
+/// Parses a lowercase memory scope string from JS to the protocol type.
+fn parse_memory_scope(s: &str) -> Option<MemoryScope> {
+    match s {
+        "full" => Some(MemoryScope::Full),
+        "summary" => Some(MemoryScope::Summary),
+        "ephemeral" => Some(MemoryScope::Ephemeral),
+        _ => None,
     }
 }
 
-impl std::fmt::Display for MemoryScope {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Full => write!(f, "Full"),
-            Self::Summary => write!(f, "Summary"),
-            Self::Ephemeral => write!(f, "Ephemeral"),
-        }
+/// Returns the display string for a `MemoryScope` (`PascalCase` for JSON output).
+fn memory_scope_as_str(ms: MemoryScope) -> &'static str {
+    match ms {
+        MemoryScope::Full => "Full",
+        MemoryScope::Summary => "Summary",
+        MemoryScope::Ephemeral => "Ephemeral",
     }
 }
 
@@ -138,7 +112,7 @@ impl std::fmt::Display for MemoryScope {
 /// - 0 = `NoProvenance` — no protocol-level origin tracking
 fn compute_quality(
     has_provenance: bool,
-    source_type: &SourceType,
+    source_type: SourceType,
     context_state: ContextState,
     has_counterparties: bool,
 ) -> u32 {
@@ -242,13 +216,13 @@ pub fn evaluate_provenance_quality(
 
     let has_provenance = source_context.is_some();
 
-    let st = SourceType::from_str(&source_type).ok_or_else(|| {
+    let st = parse_source_type(&source_type).ok_or_else(|| {
         JsError::new(&format!(
             "[SCP-VALID-7201] invalid source_type: '{source_type}'"
         ))
     })?;
 
-    Ok(compute_quality(has_provenance, &st, cs, has_counterparties))
+    Ok(compute_quality(has_provenance, st, cs, has_counterparties))
 }
 
 // ---------------------------------------------------------------------------
@@ -324,13 +298,13 @@ pub fn provenance_attach(
         ));
     }
 
-    let st = SourceType::from_str(&source_type).ok_or_else(|| {
+    let st = parse_source_type(&source_type).ok_or_else(|| {
         JsError::new(&format!(
             "[SCP-VALID-7212] invalid source_type: '{source_type}'"
         ))
     })?;
 
-    let ms = MemoryScope::from_str(&memory_scope).ok_or_else(|| {
+    let ms = parse_memory_scope(&memory_scope).ok_or_else(|| {
         JsError::new(&format!(
             "[SCP-VALID-7213] invalid memory_scope: '{memory_scope}'"
         ))
@@ -373,7 +347,7 @@ pub fn provenance_attach(
     // The field must be present for structural parity with the NAPI bridge.
     let result = serde_json::json!({
         "source_context": source_context_id,
-        "source_type": st.to_string(),
+        "source_type": source_type_as_str(st),
         "counterparties": counterparties,
         "memory_scope": ms.to_string(),
         "chain_depth": chain_depth,
@@ -394,9 +368,9 @@ pub fn provenance_attach(
     // for hashing.
     let canonical_bytes = build_canonical_provenance_bytes(
         &source_context_id,
-        &st,
+        st,
         &counterparties,
-        &ms,
+        ms,
         chain_depth,
         &chain_path,
         &dm,
@@ -411,7 +385,7 @@ pub fn provenance_attach(
         mgr.append_provenance_event(
             &source_context_id,
             &actor_did,
-            crate::runtime::wasm_event_type_tag("ProvenanceAttached"),
+            scp_event_log::EventType::ProvenanceAttached,
             &prov_hash,
         )
     });
@@ -421,7 +395,7 @@ pub fn provenance_attach(
         mgr.append_provenance_event(
             &target_context_id,
             &actor_did,
-            crate::runtime::wasm_event_type_tag("ProvenanceReceived"),
+            scp_event_log::EventType::ProvenanceReceived,
             &prov_hash,
         )
     });
@@ -673,14 +647,29 @@ struct CanonicalDuration {
     nanos: u32,
 }
 
+/// Returns the stable string representation of a [`SourceType`] for canonical
+/// hashing and wire output.
+///
+/// This uses an explicit match rather than `Debug` or `Display` formatting to
+/// guard against unintentional breakage if the upstream enum's `Debug` output
+/// changes (e.g., through `#[serde(rename)]` or variant renaming). The hash
+/// MUST be identical across all four bridges.
+fn source_type_as_str(st: SourceType) -> &'static str {
+    match st {
+        SourceType::Persistent => "Persistent",
+        SourceType::Ephemeral => "Ephemeral",
+        SourceType::Summary => "Summary",
+    }
+}
+
 /// Builds a canonical provenance struct for hashing that produces the same
 /// `serde_json::to_vec` output as `DataProvenance` in scp-core.
 #[allow(clippy::too_many_arguments)] // mirrors DataProvenance field count
 fn build_canonical_provenance_bytes(
     source_context: &str,
-    source_type: &SourceType,
+    source_type: SourceType,
     counterparties: &[String],
-    memory_scope: &MemoryScope,
+    memory_scope: MemoryScope,
     chain_depth: u32,
     chain_path: &serde_json::Value,
     discovery_method: &serde_json::Value,
@@ -688,12 +677,12 @@ fn build_canonical_provenance_bytes(
 ) -> Vec<u8> {
     let canonical = CanonicalProvenance {
         source_context,
-        source_type: &source_type.to_string(),
+        source_type: source_type_as_str(source_type),
         counterparties,
         purpose,
         discovery_method,
         age: CanonicalDuration { secs: 0, nanos: 0 },
-        memory_scope: &memory_scope.to_string(),
+        memory_scope: memory_scope_as_str(memory_scope),
         chain_depth,
         chain_path,
         payment_amount: None,
@@ -1290,32 +1279,32 @@ mod tests_native {
     #[test]
     fn source_type_from_str_rejects_pascal_case() {
         // PascalCase must be rejected to match reference bridge (PyO3/NAPI)
-        assert!(SourceType::from_str("Persistent").is_none());
-        assert!(SourceType::from_str("Ephemeral").is_none());
-        assert!(SourceType::from_str("Summary").is_none());
+        assert!(parse_source_type("Persistent").is_none());
+        assert!(parse_source_type("Ephemeral").is_none());
+        assert!(parse_source_type("Summary").is_none());
     }
 
     #[test]
     fn source_type_from_str_lowercase() {
         assert!(matches!(
-            SourceType::from_str("persistent"),
+            parse_source_type("persistent"),
             Some(SourceType::Persistent)
         ));
         assert!(matches!(
-            SourceType::from_str("ephemeral"),
+            parse_source_type("ephemeral"),
             Some(SourceType::Ephemeral)
         ));
         assert!(matches!(
-            SourceType::from_str("summary"),
+            parse_source_type("summary"),
             Some(SourceType::Summary)
         ));
     }
 
     #[test]
     fn source_type_from_str_invalid() {
-        assert!(SourceType::from_str("PERSISTENT").is_none());
-        assert!(SourceType::from_str("invalid").is_none());
-        assert!(SourceType::from_str("").is_none());
+        assert!(parse_source_type("PERSISTENT").is_none());
+        assert!(parse_source_type("invalid").is_none());
+        assert!(parse_source_type("").is_none());
     }
 
     // -- ContextState --
@@ -1366,52 +1355,52 @@ mod tests_native {
     #[test]
     fn memory_scope_from_str_rejects_pascal_case() {
         // PascalCase must be rejected to match reference bridge (PyO3/NAPI)
-        assert!(MemoryScope::from_str("Full").is_none());
-        assert!(MemoryScope::from_str("Summary").is_none());
-        assert!(MemoryScope::from_str("Ephemeral").is_none());
+        assert!(parse_memory_scope("Full").is_none());
+        assert!(parse_memory_scope("Summary").is_none());
+        assert!(parse_memory_scope("Ephemeral").is_none());
     }
 
     #[test]
     fn memory_scope_from_str_lowercase() {
         assert!(matches!(
-            MemoryScope::from_str("full"),
+            parse_memory_scope("full"),
             Some(MemoryScope::Full)
         ));
         assert!(matches!(
-            MemoryScope::from_str("summary"),
+            parse_memory_scope("summary"),
             Some(MemoryScope::Summary)
         ));
         assert!(matches!(
-            MemoryScope::from_str("ephemeral"),
+            parse_memory_scope("ephemeral"),
             Some(MemoryScope::Ephemeral)
         ));
     }
 
     #[test]
     fn memory_scope_from_str_invalid() {
-        assert!(MemoryScope::from_str("FULL").is_none());
-        assert!(MemoryScope::from_str("invalid").is_none());
-        assert!(MemoryScope::from_str("").is_none());
+        assert!(parse_memory_scope("FULL").is_none());
+        assert!(parse_memory_scope("invalid").is_none());
+        assert!(parse_memory_scope("").is_none());
     }
 
     // -- compute_quality with lowercase-parsed enums --
 
     #[test]
     fn compute_quality_with_lowercase_parsed_enums() {
-        let st = SourceType::from_str("persistent").unwrap();
+        let st = parse_source_type("persistent").unwrap();
         let cs = ContextState::from_str("active").unwrap();
-        assert_eq!(compute_quality(true, &st, cs, true), 3);
+        assert_eq!(compute_quality(true, st, cs, true), 3);
 
-        let st2 = SourceType::from_str("summary").unwrap();
+        let st2 = parse_source_type("summary").unwrap();
         let cs2 = ContextState::from_str("closed_with_summary_verified").unwrap();
-        assert_eq!(compute_quality(true, &st2, cs2, true), 2);
+        assert_eq!(compute_quality(true, st2, cs2, true), 2);
 
-        let st3 = SourceType::from_str("ephemeral").unwrap();
+        let st3 = parse_source_type("ephemeral").unwrap();
         let cs3 = ContextState::from_str("closed_ephemeral").unwrap();
-        assert_eq!(compute_quality(true, &st3, cs3, true), 1);
-        assert_eq!(compute_quality(true, &st3, cs3, false), 0);
+        assert_eq!(compute_quality(true, st3, cs3, true), 1);
+        assert_eq!(compute_quality(true, st3, cs3, false), 0);
 
         let cs4 = ContextState::from_str("unknown").unwrap();
-        assert_eq!(compute_quality(true, &st, cs4, true), 0);
+        assert_eq!(compute_quality(true, st, cs4, true), 0);
     }
 }

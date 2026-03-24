@@ -122,36 +122,9 @@ mod canonical_attestation {
         },
     }
 
-    /// Mirrors `scp_core::trust::attestation::RevocationStatus` field declaration order:
-    /// `Active` | `Revoked { revoked_at, reason, revoked_by }`.
-    ///
-    /// Used instead of `serde_json::Value` for `revocation_status` serialization to
-    /// produce byte-identical msgpack output matching scp-core.
-    #[derive(Serialize, Deserialize)]
-    pub(super) enum RevocationStatus {
-        Active,
-        Revoked {
-            revoked_at: u64,
-            #[serde(default, deserialize_with = "deserialize_string_or_null")]
-            reason: String,
-            #[serde(default = "default_revoked_by")]
-            revoked_by: String,
-        },
-    }
-
-    /// Deserializes a `String` field that may be `null` in JSON.
-    fn deserialize_string_or_null<'de, D>(deserializer: D) -> Result<String, D::Error>
-    where
-        D: serde::Deserializer<'de>,
-    {
-        Option::<String>::deserialize(deserializer).map(Option::unwrap_or_default)
-    }
-
-    /// Default `revoked_by` DID for pre-migration attestations that were serialized
-    /// without the `revoked_by` field.
-    fn default_revoked_by() -> String {
-        "did:unknown:pre-migration".to_owned()
-    }
+    // RevocationStatus imported from scp-protocol — canonical implementation.
+    // Used instead of `serde_json::Value` for `revocation_status` serialization to
+    // produce byte-identical msgpack output matching scp-core.
 }
 
 // ---------------------------------------------------------------------------
@@ -2246,7 +2219,7 @@ fn compute_attestation_canonical_bytes(
             .ok_or_else(|| {
                 attestation_err("attestation missing required field 'revocation_status'".into())
             })?;
-    let revocation_status: canonical_attestation::RevocationStatus =
+    let revocation_status: scp_protocol::trust::attestation::RevocationStatus =
         serde_json::from_value(revocation_status_value).map_err(|e| {
             attestation_err(format!("revocation_status deserialization failed: {e}"))
         })?;

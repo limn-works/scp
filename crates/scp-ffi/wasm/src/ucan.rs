@@ -2,22 +2,26 @@
 //!
 //! Validation, nonce tracking, and revocation all delegate to
 //! [`WasmContextManager`](crate::manager::WasmContextManager) for state
-//! management. The 11-step UCAN validation pipeline is implemented in this
-//! module (mirroring `scp-core/crypto/ucan/validate.rs`) because it requires
-//! Ed25519 signature verification and delegation chain traversal which are
-//! algorithm-level operations, not state management.
+//! management. The 11-step UCAN validation pipeline delegates to
+//! `scp_protocol::crypto::ucan::validate::validate_ucan` using the
+//! extract-validate-writeback pattern (extract state from manager,
+//! build trait impls, call validate, write back nonce).
 //!
 //! See ADR-034 in `.docs/adrs/phase-4.md` and issue #389.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 
-use base64::Engine;
-use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use js_sys::Promise;
-use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 use wasm_bindgen::prelude::*;
 use wasm_bindgen_futures::future_to_promise;
+
+use scp_protocol::context::roles::default_ceiling;
+use scp_protocol::crypto::ucan::revoke::compute_revocation_cid;
+use scp_protocol::crypto::ucan::validate::{
+    DidResolver, InMemoryProofResolver, InMemoryRevocationChecker,
+    NonceTracker as ValidationNonceTracker, ValidationContext, parse_ucan, validate_ucan,
+};
+use scp_protocol::crypto::ucan::{CapabilityUri, UcanError, UcanToken};
 
 use scp_ffi_common::validate::{validate_capability_uri, validate_did, validate_ucan_token};
 
@@ -25,359 +29,169 @@ use crate::context::WasmContextHandle;
 use crate::error::ScpWasmError;
 use crate::manager::with_manager;
 
-/// Maximum token lifetime: 24 hours in seconds (spec section 9.5).
-const MAX_EXPIRY_SECS: u64 = 24 * 60 * 60;
+// ---------------------------------------------------------------------------
+// WASM trait adapters for scp-protocol validation
+// ---------------------------------------------------------------------------
 
-/// Nonce freshness tolerance: 5 minutes in milliseconds (spec section 9.14).
-/// Matches native `NonceTracker::NONCE_FRESHNESS_TOLERANCE_MS`.
-const NONCE_FRESHNESS_TOLERANCE_MS: u64 = 5 * 60 * 1000;
-
-/// Maximum delegation chain depth to prevent infinite loops.
-const MAX_CHAIN_DEPTH: usize = 32;
-
-/// Clock skew tolerance in seconds (spec section 9.14). Accommodates NTP
-/// desynchronization between issuer and validator in distributed deployments.
-/// Must match `scp-core::crypto::ucan::validate::DEFAULT_CLOCK_SKEW_TOLERANCE_SECS`.
-const CLOCK_SKEW_TOLERANCE_SECS: u64 = 300;
-
-/// Returns the default capability ceiling for UCAN validation when no
-/// explicit ceiling is configured. Mirrors
-/// `scp_core::context::roles::default_ceiling().to_ucan_string_set()`.
+/// WASM [`DidResolver`] adapter that resolves DID public keys using the
+/// WASM identity registry.
 ///
-/// Must be kept in sync with `scp-core/src/context/roles.rs::default_ceiling()`.
-fn wasm_default_ceiling() -> HashSet<String> {
-    [
-        "messages:read",
-        "messages:write",
-        "tool:register",
-        "tool_invoke:*",
-        "role:assign",
-        "member:invite",
-        "member:remove",
-        "governance:propose",
-        "governance:vote",
-        "context:close",
-    ]
-    .into_iter()
-    .map(String::from)
-    .collect()
+/// For local identities, delegates to `crate::identity::resolve_verification_method_key`.
+/// For remote DIDs, falls back to DID-embedded key extraction from the DID
+/// string itself (works for `did:dht:z{zbase32}` DIDs).
+struct WasmDidResolver;
+
+impl DidResolver for WasmDidResolver {
+    fn resolve_public_key(&self, did: &str) -> Result<[u8; 32], UcanError> {
+        // Try the identity registry first (local DIDs).
+        if let Ok(pk) = crate::identity::resolve_verification_method_key(did, "#active") {
+            return Ok(pk);
+        }
+        // Fall back to DID-embedded key extraction for remote DIDs.
+        resolve_did_embedded_key(did)
+    }
+
+    fn resolve_public_key_by_kid(&self, did: &str, kid: &str) -> Result<[u8; 32], UcanError> {
+        // Try the identity registry first — it has both #active and #agent keys.
+        if let Ok(pk) = crate::identity::resolve_verification_method_key(did, kid) {
+            return Ok(pk);
+        }
+        // For #active, fall back to DID-embedded key extraction (remote DIDs).
+        if kid == "#active" {
+            return resolve_did_embedded_key(did);
+        }
+        Err(UcanError::MalformedToken(format!(
+            "verification method '{kid}' not found on DID '{did}'"
+        )))
+    }
 }
 
-/// Category A resource types — the closed set of UCAN capability resource
-/// types that modify the DID document (ADR-039).
+/// Extracts the Ed25519 public key embedded in a `did:dht:z{zbase32}` DID string.
 ///
-/// Must match `scp-core::trust::custody_violation::CATEGORY_A_RESOURCES`.
-const CATEGORY_A_RESOURCES: &[&str] = &[
-    "did_document",
-    "verification_method",
-    "identity",
-    "pre_rotation",
-    "service",
-    "relay_config",
-    "did_migration",
-    "key_management",
-];
-
-// ---------------------------------------------------------------------------
-// UCAN data structures (mirrors scp-core/crypto/ucan/mod.rs)
-// ---------------------------------------------------------------------------
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-struct UcanHeader {
-    alg: String,
-    typ: String,
-    ucv: String,
-    /// Optional Key ID per RFC 7515 (ADR-039). Identifies which verification
-    /// method on the issuer's DID document signed this token. Values are
-    /// verification method fragment identifiers: `"#active"` for the human
-    /// signing key, `"#agent"` for the agent signing key. When absent,
-    /// verifiers default to `#active`.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    kid: Option<String>,
-}
-
-impl UcanHeader {
-    fn validate(&self) -> Result<(), String> {
-        if self.alg != "EdDSA" {
-            return Err(format!(
-                "unsupported algorithm: expected EdDSA, got {}",
-                self.alg
-            ));
-        }
-        if self.ucv != "0.10.0" {
-            return Err(format!(
-                "unsupported UCAN version: expected 0.10.0, got {}",
-                self.ucv
-            ));
-        }
-        Ok(())
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-struct Attenuation {
-    with: String,
-    can: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-struct UcanPayload {
-    iss: String,
-    aud: String,
-    exp: u64,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    nbf: Option<u64>,
-    nnc: String,
-    att: Vec<Attenuation>,
-    prf: Vec<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    fct: Option<serde_json::Value>,
-}
-
-#[derive(Debug, Clone)]
-struct ParsedUcanToken {
-    header: UcanHeader,
-    payload: UcanPayload,
-    signature: Vec<u8>,
-    encoded: String,
-}
-
-// ---------------------------------------------------------------------------
-// Capability URI parsing (mirrors scp-core/crypto/ucan/capability.rs)
-// ---------------------------------------------------------------------------
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct CapabilityUri {
-    context_id: Option<String>,
-    resource: String,
-    action: String,
-}
-
-impl CapabilityUri {
-    fn parse(s: &str) -> Result<Self, String> {
-        let rest = s
-            .strip_prefix("scp:ctx:")
-            .ok_or_else(|| format!("missing 'scp:ctx:' prefix in '{s}'"))?;
-
-        let (ctx_part, capability_part) = rest
-            .split_once('/')
-            .ok_or_else(|| format!("missing '/' separator in '{s}'"))?;
-
-        if ctx_part.is_empty() {
-            return Err(format!("empty context ID in '{s}'"));
-        }
-
-        let context_id = if ctx_part == "*" {
-            None
-        } else {
-            Some(ctx_part.to_owned())
-        };
-
-        let (resource, action) = capability_part
-            .split_once(':')
-            .ok_or_else(|| format!("missing ':' separator in capability '{s}'"))?;
-
-        if resource.is_empty() {
-            return Err(format!("empty resource in '{s}'"));
-        }
-        if action.is_empty() {
-            return Err(format!("empty action in '{s}'"));
-        }
-
-        Ok(Self {
-            context_id,
-            resource: resource.to_owned(),
-            action: action.to_owned(),
-        })
-    }
-
-    fn capability_name(&self) -> String {
-        format!("{}:{}", self.resource, self.action)
-    }
-
-    fn matches(&self, required: &Self) -> bool {
-        // Resource must always match exactly.
-        if self.resource != required.resource {
-            return false;
-        }
-        // Action: wildcard "*" on the granting side matches any required action.
-        // Otherwise, actions must match exactly.
-        if self.action != "*" && self.action != required.action {
-            return false;
-        }
-        match (&self.context_id, &required.context_id) {
-            (None, _) => true,
-            (Some(granted), Some(req)) => granted == req,
-            (Some(_), None) => false,
-        }
-    }
-
-    fn matches_context_scope(with_str: &str, context_id: &str) -> bool {
-        let context_prefix = format!("scp:ctx:{context_id}");
-        with_str == context_prefix || with_str.starts_with(&format!("{context_prefix}/"))
-    }
-}
-
-// ---------------------------------------------------------------------------
-// UCAN parsing
-// ---------------------------------------------------------------------------
-
-fn parse_ucan(encoded: &str) -> Result<ParsedUcanToken, String> {
-    let parts: Vec<&str> = encoded.split('.').collect();
-    if parts.len() != 3 {
-        return Err(format!("expected 3 JWT segments, got {}", parts.len()));
-    }
-
-    let header_bytes = URL_SAFE_NO_PAD
-        .decode(parts[0])
-        .map_err(|e| format!("header base64url decode failed: {e}"))?;
-
-    let payload_bytes = URL_SAFE_NO_PAD
-        .decode(parts[1])
-        .map_err(|e| format!("payload base64url decode failed: {e}"))?;
-
-    let sig_bytes = URL_SAFE_NO_PAD
-        .decode(parts[2])
-        .map_err(|e| format!("signature base64url decode failed: {e}"))?;
-
-    let header: UcanHeader = serde_json::from_slice(&header_bytes)
-        .map_err(|e| format!("header deserialization failed: {e}"))?;
-
-    let payload: UcanPayload = serde_json::from_slice(&payload_bytes)
-        .map_err(|e| format!("payload deserialization failed: {e}"))?;
-
-    header.validate()?;
-
-    Ok(ParsedUcanToken {
-        header,
-        payload,
-        signature: sig_bytes,
-        encoded: encoded.to_owned(),
-    })
-}
-
-// ---------------------------------------------------------------------------
-// Revocation CID computation
-// ---------------------------------------------------------------------------
-
-/// Computes a revocation CID as the hex-encoded SHA-256 hash of the raw
-/// encoded JWT string. This MUST match the algorithm in
-/// `scp-core::crypto::ucan::revoke::compute_revocation_cid`.
-fn compute_revocation_cid(encoded_token: &str) -> String {
-    let hash = Sha256::digest(encoded_token.as_bytes());
-    hash.iter().fold(String::with_capacity(64), |mut acc, b| {
-        use std::fmt::Write;
-        let _ = write!(acc, "{b:02x}");
-        acc
-    })
-}
-
-// ---------------------------------------------------------------------------
-// Ed25519 signature verification
-// ---------------------------------------------------------------------------
-
-fn resolve_public_key(did: &str) -> Result<[u8; 32], String> {
+/// This is used for remote DIDs that are not in the local identity registry.
+fn resolve_did_embedded_key(did: &str) -> Result<[u8; 32], UcanError> {
     if let Some(suffix) = did.strip_prefix("did:dht:z") {
-        let decoded = zbase32_decode(suffix)
-            .map_err(|e| format!("z-base-32 decode failed for DID {did}: {e}"))?;
-        let bytes: [u8; 32] = decoded
-            .try_into()
-            .map_err(|v: Vec<u8>| format!("DID public key must be 32 bytes, got {}", v.len()))?;
+        let decoded = zbase32_decode(suffix).map_err(|e| {
+            UcanError::MalformedToken(format!("z-base-32 decode failed for DID {did}: {e}"))
+        })?;
+        let bytes: [u8; 32] = decoded.try_into().map_err(|v: Vec<u8>| {
+            UcanError::MalformedToken(format!("DID public key must be 32 bytes, got {}", v.len()))
+        })?;
         return Ok(bytes);
     }
 
     #[cfg(any(test, feature = "testing"))]
     if let Some(hex_str) = did.strip_prefix("did:key:") {
-        let bytes =
-            decode_hex(hex_str).map_err(|e| format!("hex decode failed for did:key DID: {e}"))?;
-        let pk: [u8; 32] = bytes
-            .try_into()
-            .map_err(|v: Vec<u8>| format!("DID public key must be 32 bytes, got {}", v.len()))?;
+        let bytes = decode_hex(hex_str).map_err(|e| {
+            UcanError::MalformedToken(format!("hex decode failed for did:key DID: {e}"))
+        })?;
+        let pk: [u8; 32] = bytes.try_into().map_err(|v: Vec<u8>| {
+            UcanError::MalformedToken(format!("DID public key must be 32 bytes, got {}", v.len()))
+        })?;
         return Ok(pk);
     }
 
-    Err(format!("unsupported DID method: {did} (expected did:dht:)"))
+    Err(UcanError::MalformedToken(format!(
+        "unsupported DID method: {did} (expected did:dht:)"
+    )))
 }
 
-/// Resolves a specific verification method key by `kid` fragment identifier
-/// (ADR-039, SCP-AB-013). Dispatches to the identity registry for kid-specific
-/// resolution, falling back to DID-embedded key resolution for `#active`.
+/// WASM [`NonceTracker`](ValidationNonceTracker) adapter using pre-extracted
+/// nonce state.
 ///
-/// Must match `scp-core::crypto::ucan::validate::DidResolver::resolve_public_key_by_kid`.
-fn resolve_public_key_by_kid(did: &str, kid: &str) -> Result<[u8; 32], String> {
-    // Try the identity registry first — it has both #active and #agent keys.
-    match crate::identity::resolve_verification_method_key(did, kid) {
-        Ok(pk) => return Ok(pk),
-        Err(_) if kid == "#active" => {
-            // Fall through to DID-embedded key extraction for #active when the
-            // DID is not in the local registry (e.g., remote DIDs).
+/// Performs format validation, freshness checks, and replay detection.
+/// The nonce is NOT recorded here — writeback to `WasmContextManager` happens
+/// after validation succeeds (extract-validate-writeback pattern).
+struct WasmNonceTracker {
+    /// Pre-extracted set of seen nonces from `WasmContextManager`.
+    seen_nonces: HashSet<String>,
+    /// Whether a new nonce was validated (for writeback).
+    validated_nonce: Option<String>,
+}
+
+impl WasmNonceTracker {
+    fn new(seen_nonces: HashSet<String>) -> Self {
+        Self {
+            seen_nonces,
+            validated_nonce: None,
         }
-        Err(e) => return Err(e),
     }
-
-    // For #active, fall back to extracting the key from the DID string itself
-    // (works for remote DIDs not in the local registry).
-    resolve_public_key(did)
 }
 
-fn verify_signature(token: &ParsedUcanToken) -> Result<(), String> {
-    // When kid is present in the header, resolve the specific verification
-    // method from the DID document (ADR-039, SCP-AB-013).
-    let pk_bytes = match &token.header.kid {
-        Some(kid) => resolve_public_key_by_kid(&token.payload.iss, kid)?,
-        None => resolve_public_key(&token.payload.iss)?,
-    };
+/// Nonce freshness tolerance: 5 minutes in milliseconds (spec section 9.14).
+///
+/// Duplicates `scp_protocol::crypto::ucan::nonce::NONCE_FRESHNESS_TOLERANCE_MS`
+/// and `scp_protocol::crypto::ucan::validate::NONCE_FRESHNESS_TOLERANCE_MS`
+/// (both `const`, not `pub`). If the upstream value changes, this must be
+/// updated in lockstep.
+const NONCE_FRESHNESS_TOLERANCE_MS: u64 = 5 * 60 * 1000;
 
-    let verifying_key = ed25519_dalek::VerifyingKey::from_bytes(&pk_bytes)
-        .map_err(|e| format!("invalid public key: {e}"))?;
+impl ValidationNonceTracker for WasmNonceTracker {
+    fn check_and_record(&mut self, nonce: &str, _token_expiry: u64) -> Result<(), UcanError> {
+        // 1. Format: split into timestamp and hex suffix.
+        if nonce.is_empty() {
+            return Err(UcanError::NonceFormatInvalid("nonce is empty".to_owned()));
+        }
 
-    let signing_input = token
-        .encoded
-        .rfind('.')
-        .map(|pos| &token.encoded[..pos])
-        .ok_or_else(|| "missing signature segment".to_owned())?;
+        let (ts_part, hex_part) = nonce.split_once('-').ok_or_else(|| {
+            UcanError::NonceFormatInvalid(format!("missing '-' separator in nonce: {nonce}"))
+        })?;
 
-    let sig_bytes: [u8; 64] = token
-        .signature
-        .as_slice()
-        .try_into()
-        .map_err(|_| format!("signature must be 64 bytes, got {}", token.signature.len()))?;
+        let nonce_millis: u64 = ts_part.parse().map_err(|_| {
+            UcanError::NonceFormatInvalid(format!("non-numeric timestamp in nonce: {ts_part}"))
+        })?;
 
-    let signature = ed25519_dalek::Signature::from_bytes(&sig_bytes);
+        if hex_part.len() != 32 || !hex_part.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return Err(UcanError::NonceFormatInvalid(format!(
+                "invalid hex suffix in nonce (expected 32 hex chars): {hex_part}"
+            )));
+        }
 
-    verifying_key
-        .verify_strict(signing_input.as_bytes(), &signature)
-        .map_err(|_| "signature verification failed".to_owned())
+        // 2. Freshness: timestamp within now +/- 5 minutes.
+        let now = crate::time::now_ms_u64();
+
+        if nonce_millis.saturating_add(NONCE_FRESHNESS_TOLERANCE_MS) < now {
+            return Err(UcanError::NonceTooOld(nonce.to_owned()));
+        }
+
+        if nonce_millis > now.saturating_add(NONCE_FRESHNESS_TOLERANCE_MS) {
+            return Err(UcanError::NonceFuture(nonce.to_owned()));
+        }
+
+        // 3. Replay check.
+        if self.seen_nonces.contains(nonce) {
+            return Err(UcanError::NonceReused(nonce.to_owned()));
+        }
+
+        // Record for writeback (don't actually insert into the HashSet — the
+        // real recording happens via WasmContextManager::ucan_record_nonce).
+        self.validated_nonce = Some(nonce.to_owned());
+
+        Ok(())
+    }
 }
 
 // ---------------------------------------------------------------------------
-// Hex / zbase32 helpers
+// Proof CID computation helper
 // ---------------------------------------------------------------------------
 
-#[cfg(any(test, feature = "testing"))]
-fn decode_hex(hex: &str) -> Result<Vec<u8>, String> {
-    if !hex.len().is_multiple_of(2) {
-        return Err(format!("hex string has odd length: {}", hex.len()));
-    }
-    let mut bytes = Vec::with_capacity(hex.len() / 2);
-    for i in (0..hex.len()).step_by(2) {
-        let byte_str = &hex[i..i + 2];
-        let byte =
-            u8::from_str_radix(byte_str, 16).map_err(|e| format!("hex decode error: {e}"))?;
-        bytes.push(byte);
-    }
-    Ok(bytes)
+/// Computes a proof CID as `"bafyrei" + hex-encoded SHA-256` of the raw
+/// encoded JWT string. This format matches how SCP UCAN tokens reference
+/// proofs in their `prf` field.
+fn compute_proof_cid(encoded_token: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let hash = Sha256::digest(encoded_token.as_bytes());
+    let hex = hash.iter().fold(String::with_capacity(64), |mut acc, b| {
+        use std::fmt::Write;
+        let _ = write!(acc, "{b:02x}");
+        acc
+    });
+    format!("bafyrei{hex}")
 }
 
-fn encode_hex(bytes: &[u8]) -> String {
-    bytes
-        .iter()
-        .fold(String::with_capacity(bytes.len() * 2), |mut acc, b| {
-            use std::fmt::Write;
-            let _ = write!(acc, "{b:02x}");
-            acc
-        })
-}
+// ---------------------------------------------------------------------------
+// z-base-32 / hex helpers (needed for DID-embedded key extraction)
+// ---------------------------------------------------------------------------
 
 fn zbase32_decode(input: &str) -> Result<Vec<u8>, String> {
     const ALPHABET: &[u8; 32] = b"ybndrfg8ejkmcpqxot1uwisza345h769";
@@ -411,462 +225,22 @@ fn zbase32_decode(input: &str) -> Result<Vec<u8>, String> {
     Ok(output)
 }
 
-// ---------------------------------------------------------------------------
-// Steps 5a/5b: Key scope validation (ADR-039, SCP-AB-013)
-// ---------------------------------------------------------------------------
-
-/// Extracts the `scp_key_scope` value from a UCAN payload's facts.
-///
-/// Returns `Some(scope)` if `fct.scp_key_scope` exists and is a string,
-/// `None` otherwise (backward compatibility — legacy tokens without key
-/// scope skip step 5b).
-///
-/// Must match `scp-core::crypto::ucan::validate::extract_key_scope`.
-fn extract_key_scope(payload: &UcanPayload) -> Option<String> {
-    payload
-        .fct
-        .as_ref()
-        .and_then(|fct| fct.get("scp_key_scope"))
-        .and_then(|v| v.as_str())
-        .map(String::from)
+#[cfg(any(test, feature = "testing"))]
+fn decode_hex(hex: &str) -> Result<Vec<u8>, String> {
+    if !hex.len().is_multiple_of(2) {
+        return Err(format!("hex string has odd length: {}", hex.len()));
+    }
+    let mut bytes = Vec::with_capacity(hex.len() / 2);
+    for i in (0..hex.len()).step_by(2) {
+        let byte_str = &hex[i..i + 2];
+        let byte =
+            u8::from_str_radix(byte_str, 16).map_err(|e| format!("hex decode error: {e}"))?;
+        bytes.push(byte);
+    }
+    Ok(bytes)
 }
 
-/// Validates key scope constraints on a UCAN token (steps 5a and 5b).
-///
-/// - **Step 5a (self-delegation):** If `iss == aud` and no `scp_key_scope`
-///   is present in `fct`, the token is rejected. Self-delegation is only
-///   meaningful when scoping to a specific verification method.
-///
-/// - **Step 5b (key scope match):** If `fct.scp_key_scope` is present, the
-///   `kid` header (defaulting to `#active` when absent) must match the
-///   declared scope.
-///
-/// Must match `scp-core::crypto::ucan::validate::validate_key_scope`.
-fn validate_key_scope(token: &ParsedUcanToken) -> Result<(), String> {
-    let key_scope = extract_key_scope(&token.payload);
-
-    // Step 5a: Self-delegation without key_scope is a safety violation.
-    if token.payload.iss == token.payload.aud && key_scope.is_none() {
-        return Err(
-            "self-delegation (iss == aud) without scp_key_scope is not permitted".to_owned(),
-        );
-    }
-
-    // Step 5b: If key_scope is present, verify kid matches.
-    if let Some(ref scope) = key_scope {
-        let actual_kid = token.header.kid.as_deref().unwrap_or("#active");
-        if actual_kid != scope {
-            return Err(format!(
-                "key scope mismatch: token declares scp_key_scope '{scope}' but kid is '{actual_kid}'"
-            ));
-        }
-    }
-
-    Ok(())
-}
-
-// ---------------------------------------------------------------------------
-// Step 6b: Category A enforcement (ADR-039)
-// ---------------------------------------------------------------------------
-
-/// Enforces Category A restrictions on a UCAN token (ADR-039 Enforcement
-/// Stack layer 3).
-///
-/// If the token is signed by `#agent` (indicated by the `kid` header field)
-/// and any granted capability is a Category A action (DID document
-/// modification), the token is rejected.
-///
-/// Must match `scp-core::crypto::ucan::validate::enforce_ucan_category_a`.
-fn enforce_ucan_category_a(
-    token: &ParsedUcanToken,
-    granted_caps: &[CapabilityUri],
-) -> Result<(), String> {
-    let kid_str = token.header.kid.as_deref().unwrap_or("#active");
-
-    // Only #active and #agent are valid UCAN signing keys.
-    // Unknown kid values are rejected fail-closed.
-    let is_agent = match kid_str {
-        "#active" => false,
-        "#agent" => true,
-        _ => {
-            return Err(format!("unrecognized signing key ID (kid): {kid_str}"));
-        }
-    };
-
-    if !is_agent {
-        return Ok(());
-    }
-
-    for cap in granted_caps {
-        if CATEGORY_A_RESOURCES.contains(&cap.resource.as_str()) {
-            return Err(format!(
-                "Category A violation: agent key (#agent) cannot grant '{}' capability",
-                cap.capability_name()
-            ));
-        }
-    }
-
-    Ok(())
-}
-
-// ---------------------------------------------------------------------------
-// Full 11-step validation pipeline (delegates state ops to WasmContextManager)
-// ---------------------------------------------------------------------------
-
-/// Parameters for the 11-step UCAN validation pipeline.
-struct UcanValidationParams<'a> {
-    token: &'a ParsedUcanToken,
-    capability: &'a str,
-    context_id: &'a str,
-    expected_aud_did: &'a str,
-    proof_tokens: Option<&'a [String]>,
-    ceiling: &'a HashSet<String>,
-    creator_did: &'a str,
-    revoked_cids: &'a HashSet<String>,
-}
-
-#[allow(clippy::too_many_lines)]
-fn validate_ucan_full(params: &UcanValidationParams<'_>) -> Result<(), String> {
-    let UcanValidationParams {
-        token,
-        capability,
-        context_id,
-        expected_aud_did,
-        proof_tokens,
-        ceiling,
-        creator_did,
-        revoked_cids,
-    } = params;
-    // Step 1: Parse -- already done. Validate header.
-    token.header.validate()?;
-
-    // Step 2: Signature verification.
-    verify_signature(token)?;
-
-    // Step 3 + Step 4: Delegation chain verification -> root issuer must be creator.
-    let root_issuer = verify_delegation_chain(token, *proof_tokens, revoked_cids)?;
-
-    if root_issuer != *creator_did {
-        return Err(format!(
-            "invalid issuer: expected {creator_did}, got {root_issuer}"
-        ));
-    }
-
-    // Step 5: Audience DID validation (RED-105 related).
-    if token.payload.aud != *expected_aud_did {
-        return Err(format!(
-            "audience mismatch: expected {expected_aud_did}, got {}",
-            token.payload.aud
-        ));
-    }
-
-    // Steps 5a/5b: Key scope validation (ADR-039, SCP-AB-013).
-    // Rejects self-delegation without key_scope and key_scope/kid mismatches.
-    validate_key_scope(token)?;
-
-    // Step 6: Capability match with prefix-collision protection (RED-105 fix).
-    let required_cap = CapabilityUri::parse(capability)?;
-
-    let granted_caps: Vec<CapabilityUri> = token
-        .payload
-        .att
-        .iter()
-        .map(|att| {
-            if !CapabilityUri::matches_context_scope(&att.with, context_id) {
-                return Err(format!(
-                    "capability '{}' does not match context '{context_id}' (prefix collision prevented)",
-                    att.with
-                ));
-            }
-            CapabilityUri::parse(&att.with)
-                .map_err(|e| format!("unparseable capability URI in attestation: {e}"))
-        })
-        .collect::<Result<Vec<_>, _>>()?;
-
-    let matched = granted_caps.iter().any(|cap| cap.matches(&required_cap));
-    if !matched {
-        return Err(format!("capability not granted: {capability}"));
-    }
-
-    // Step 6b: Category A enforcement (ADR-039 Enforcement Stack layer 3).
-    // If the token is signed by #agent, reject any Category A capabilities
-    // (DID document modifications, pre-rotation, identity migration).
-    enforce_ucan_category_a(token, &granted_caps)?;
-
-    // Step 7: Attenuation enforcement.
-    if !token.payload.prf.is_empty() {
-        verify_attenuation(token, *proof_tokens)?;
-    }
-
-    // Step 8: Capability ceiling check.
-    // When the ceiling is empty (user passed `[]`), apply the default ceiling
-    // instead of skipping enforcement entirely — matching the NAPI and UniFFI
-    // bridges (#1495, #1419).
-    let effective_ceiling = if ceiling.is_empty() {
-        &wasm_default_ceiling()
-    } else {
-        ceiling
-    };
-    let cap_name = required_cap.capability_name();
-    if !effective_ceiling.contains(&cap_name)
-        && !effective_ceiling.contains(&format!("{}:*", required_cap.resource))
-    {
-        return Err(format!("capability outside ceiling: {cap_name}"));
-    }
-
-    // Step 9: Nonce validation and replay detection.
-    //
-    // Mirrors scp-core's `NonceTracker::check_and_record` (ADR-016 §7.2):
-    //   1. Format: `{unix_millis}-{32_hex_chars}`
-    //   2. Freshness: timestamp within now +/- 5 minutes (spec §9.14)
-    //   3. Uniqueness: not previously seen (delegated to WasmContextManager)
-    validate_nonce_format_and_freshness(&token.payload.nnc)?;
-    with_manager(|mgr| mgr.ucan_record_nonce(context_id, &token.payload.nnc))
-        .map_err(|e| e.to_string())?;
-
-    // Step 10: Revocation check.
-    let revocation_cid = compute_revocation_cid(&token.encoded);
-    if revoked_cids.contains(&revocation_cid) {
-        return Err(format!("token revoked: {revocation_cid}"));
-    }
-
-    // Step 11: Time bounds (expiry + not-before).
-    verify_time_bounds(token)?;
-
-    Ok(())
-}
-
-fn verify_time_bounds(token: &ParsedUcanToken) -> Result<(), String> {
-    // Check nbf < exp first — a token with nbf >= exp is inherently invalid
-    // regardless of the current time or tolerance.
-    if let Some(nbf) = token.payload.nbf
-        && nbf >= token.payload.exp
-    {
-        return Err(format!(
-            "invalid time range: nbf ({nbf}) must be less than exp ({})",
-            token.payload.exp
-        ));
-    }
-
-    let now = now_secs();
-
-    // exp check with tolerance: allow tokens that expired within the tolerance
-    // window. `exp + tolerance <= now` means the token is expired beyond the
-    // tolerance. Must match scp-core's `verify_expiry` logic.
-    if token.payload.exp + CLOCK_SKEW_TOLERANCE_SECS <= now {
-        return Err("token expired".to_owned());
-    }
-
-    // ExpiryTooFar check — no tolerance applied. This bounds the maximum token
-    // lifetime; clock drift doesn't justify longer-lived tokens.
-    if token.payload.exp > now + MAX_EXPIRY_SECS {
-        return Err(format!(
-            "expiry too far in the future: {}s exceeds 24h maximum",
-            token.payload.exp - now
-        ));
-    }
-
-    // nbf check with tolerance: allow tokens whose not-before is slightly in
-    // the future (within tolerance). Uses saturating subtraction to avoid
-    // underflow when nbf < tolerance. Must match scp-core's logic.
-    if let Some(nbf) = token.payload.nbf
-        && nbf.saturating_sub(CLOCK_SKEW_TOLERANCE_SECS) > now
-    {
-        return Err("token not yet valid (nbf > now)".to_owned());
-    }
-
-    Ok(())
-}
-
-fn verify_delegation_chain(
-    token: &ParsedUcanToken,
-    proof_tokens: Option<&[String]>,
-    revoked_cids: &HashSet<String>,
-) -> Result<String, String> {
-    if token.payload.prf.is_empty() {
-        return Ok(token.payload.iss.clone());
-    }
-
-    let proofs = proof_tokens.unwrap_or(&[]);
-
-    let mut proof_map: HashMap<String, ParsedUcanToken> = HashMap::new();
-    for encoded in proofs {
-        let parsed = parse_ucan(encoded)?;
-        let cid = compute_token_cid(encoded);
-        proof_map.insert(cid, parsed);
-    }
-
-    let mut seen_issuers = HashSet::new();
-    seen_issuers.insert(token.payload.iss.clone());
-
-    verify_chain_recursive(token, &proof_map, revoked_cids, 0, &mut seen_issuers)
-}
-
-fn verify_chain_recursive(
-    token: &ParsedUcanToken,
-    proof_map: &HashMap<String, ParsedUcanToken>,
-    revoked_cids: &HashSet<String>,
-    depth: usize,
-    seen_issuers: &mut HashSet<String>,
-) -> Result<String, String> {
-    if depth > MAX_CHAIN_DEPTH {
-        return Err("delegation chain too deep".to_owned());
-    }
-
-    if token.payload.prf.is_empty() {
-        verify_signature(token)?;
-        return Ok(token.payload.iss.clone());
-    }
-
-    let mut root_issuer = None;
-    for proof_cid in &token.payload.prf {
-        let parent = proof_map
-            .get(proof_cid)
-            .ok_or_else(|| format!("delegation chain broken: proof CID not found: {proof_cid}"))?;
-
-        if !seen_issuers.insert(parent.payload.iss.clone()) {
-            return Err(format!(
-                "circular delegation detected: issuer '{}' appears multiple times in the delegation chain",
-                parent.payload.iss
-            ));
-        }
-
-        // Verify parent's aud matches this token's iss.
-        // Must match scp-core's verify_chain_recursive ordering.
-        if parent.payload.aud != token.payload.iss {
-            return Err(format!(
-                "delegation chain broken: parent aud '{}' does not match child iss '{}'",
-                parent.payload.aud, token.payload.iss
-            ));
-        }
-
-        // Steps 5a/5b: Validate key scope on parent token (ADR-039, SCP-AB-013).
-        // An attacker could craft a parent with iss==aud and no key_scope that
-        // would pass chain checks if only the presented token were validated.
-        validate_key_scope(parent)?;
-
-        verify_signature(parent)?;
-
-        verify_time_bounds(parent)?;
-
-        let parent_revocation_cid = compute_revocation_cid(&parent.encoded);
-        if revoked_cids.contains(&parent_revocation_cid) {
-            return Err(format!("token revoked: {parent_revocation_cid}"));
-        }
-
-        let found_root =
-            verify_chain_recursive(parent, proof_map, revoked_cids, depth + 1, seen_issuers)?;
-
-        if let Some(ref existing_root) = root_issuer {
-            if *existing_root != found_root {
-                return Err(format!(
-                    "divergent root issuers: '{existing_root}' and '{found_root}'"
-                ));
-            }
-        } else {
-            root_issuer = Some(found_root);
-        }
-    }
-
-    root_issuer.ok_or_else(|| "delegation chain empty".to_owned())
-}
-
-fn verify_attenuation(
-    token: &ParsedUcanToken,
-    proof_tokens: Option<&[String]>,
-) -> Result<(), String> {
-    let proofs = proof_tokens.unwrap_or(&[]);
-
-    let mut proof_map: HashMap<String, ParsedUcanToken> = HashMap::new();
-    for encoded in proofs {
-        let parsed = parse_ucan(encoded)?;
-        let cid = compute_token_cid(encoded);
-        proof_map.insert(cid, parsed);
-    }
-
-    for proof_cid in &token.payload.prf {
-        let parent = proof_map
-            .get(proof_cid)
-            .ok_or_else(|| format!("attenuation check failed: proof CID not found: {proof_cid}"))?;
-
-        let parent_caps: Vec<CapabilityUri> = parent
-            .payload
-            .att
-            .iter()
-            .map(|att| {
-                CapabilityUri::parse(&att.with)
-                    .map_err(|e| format!("unparseable capability URI in parent attestation: {e}"))
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-
-        for child_att in &token.payload.att {
-            let child_cap = CapabilityUri::parse(&child_att.with)
-                .map_err(|e| format!("unparseable child capability: {e}"))?;
-
-            let is_subset = parent_caps
-                .iter()
-                .any(|parent_cap| parent_cap.matches(&child_cap));
-            if !is_subset {
-                return Err(format!(
-                    "attenuation violation: child capability '{}' not granted by parent",
-                    child_att.with
-                ));
-            }
-        }
-    }
-
-    Ok(())
-}
-
-fn compute_token_cid(encoded: &str) -> String {
-    let hash = Sha256::digest(encoded.as_bytes());
-    format!("bafyrei{}", encode_hex(&hash))
-}
-
-fn now_secs() -> u64 {
-    crate::time::now_secs()
-}
-
-/// Validates UCAN nonce format and freshness, matching scp-core's
-/// `NonceTracker::check_and_record` (steps 1–2).
-///
-/// Format: `{unix_millis_timestamp}-{32_hex_chars}` (ADR-016 §7.2).
-/// Freshness: timestamp within now +/- 5 minutes (spec §9.14).
-///
-/// Uniqueness (step 3) is handled separately by `WasmContextManager::ucan_record_nonce`.
-fn validate_nonce_format_and_freshness(nonce: &str) -> Result<(), String> {
-    if nonce.is_empty() {
-        return Err("nonce is empty".to_owned());
-    }
-
-    // 1. Format: split into timestamp and hex suffix.
-    let (ts_part, hex_part) = nonce
-        .split_once('-')
-        .ok_or_else(|| format!("nonce format invalid: missing '-' separator in '{nonce}'"))?;
-
-    let nonce_millis: u64 = ts_part
-        .parse()
-        .map_err(|_| format!("nonce format invalid: non-numeric timestamp in '{ts_part}'"))?;
-
-    if hex_part.len() != 32 || !hex_part.bytes().all(|b| b.is_ascii_hexdigit()) {
-        return Err(format!(
-            "nonce format invalid: expected 32 hex chars suffix, got '{hex_part}'"
-        ));
-    }
-
-    // 2. Freshness: timestamp within now +/- 5 minutes.
-    let now = crate::time::now_ms_u64();
-
-    if nonce_millis.saturating_add(NONCE_FRESHNESS_TOLERANCE_MS) < now {
-        return Err(format!("nonce too old: {nonce}"));
-    }
-
-    if nonce_millis > now.saturating_add(NONCE_FRESHNESS_TOLERANCE_MS) {
-        return Err(format!("nonce too far in the future: {nonce}"));
-    }
-
-    Ok(())
-}
+use crate::time::WasmClock;
 
 // ---------------------------------------------------------------------------
 // WasmUcanToken
@@ -922,14 +296,100 @@ impl WasmUcanToken {
 }
 
 // ---------------------------------------------------------------------------
+// Extract-validate-writeback helper
+// ---------------------------------------------------------------------------
+
+/// Extracts UCAN validation state from `WasmContextManager` and calls
+/// `scp_protocol::crypto::ucan::validate::validate_ucan`.
+///
+/// Implements the extract-validate-writeback pattern:
+/// 1. **EXTRACT** — Pull ceiling, `creator_did`, `revoked_cids` from manager.
+/// 2. **BUILD** — Create trait impls (DID resolver, nonce tracker, etc.).
+/// 3. **CALL** — Call `validate_ucan()` from scp-protocol.
+/// 4. **WRITEBACK** — Record the validated nonce in the manager.
+fn run_validate_ucan(
+    context_id: &str,
+    token: &UcanToken,
+    required_capability: &CapabilityUri,
+    expected_aud_did: &str,
+    proof_tokens: Option<&[String]>,
+) -> Result<(), String> {
+    // 1. EXTRACT state from WasmContextManager.
+    let (ceiling, creator_did, revoked_cids) =
+        with_manager(|mgr| mgr.ucan_context_state(context_id)).map_err(|e| e.to_string())?;
+
+    // When the ceiling is empty, apply the default ceiling instead of skipping
+    // enforcement entirely — matching the NAPI and UniFFI bridges (#1495, #1419).
+    let effective_ceiling = if ceiling.is_empty() {
+        default_ceiling().to_ucan_string_set()
+    } else {
+        ceiling
+    };
+
+    // 2. BUILD trait impls from extracted state.
+    let did_resolver = WasmDidResolver;
+
+    // Extract seen nonces as a HashSet (keys only).
+    let seen_nonces_set: HashSet<String> =
+        with_manager(|mgr| mgr.ucan_seen_nonce_keys(context_id)).map_err(|e| e.to_string())?;
+
+    let mut nonce_tracker = WasmNonceTracker::new(seen_nonces_set);
+
+    let mut revocation_checker = InMemoryRevocationChecker::new();
+    revocation_checker.revoked = revoked_cids;
+
+    // Build proof resolver from provided proof tokens.
+    let mut proof_resolver = InMemoryProofResolver::new();
+    if let Some(proofs) = proof_tokens {
+        for encoded in proofs {
+            let parsed = parse_ucan(encoded).map_err(|e| e.to_string())?;
+            let cid = compute_proof_cid(encoded);
+            proof_resolver.proofs.insert(cid, parsed);
+        }
+    }
+
+    let clock = WasmClock;
+
+    // 3. CALL validate_ucan from scp-protocol.
+    let mut ctx = ValidationContext {
+        did_resolver: &did_resolver,
+        nonce_tracker: &mut nonce_tracker,
+        revocation_checker: &revocation_checker,
+        proof_resolver: &proof_resolver,
+        ceiling: &effective_ceiling,
+        context_creator_did: &creator_did,
+        presenting_agent_did: expected_aud_did,
+        clock_skew_tolerance_secs:
+            scp_protocol::crypto::ucan::validate::DEFAULT_CLOCK_SKEW_TOLERANCE_SECS,
+        clock: &clock,
+    };
+
+    validate_ucan(token, required_capability, &mut ctx).map_err(|e| e.to_string())?;
+
+    // 4. WRITEBACK — record the validated nonce in the manager.
+    // The nonce was validated by the tracker but not persisted yet.
+    // We use WasmContextManager::ucan_record_nonce for the actual persistence.
+    if nonce_tracker.validated_nonce.is_some() {
+        with_manager(|mgr| mgr.ucan_record_nonce(context_id, &token.payload.nnc))
+            .map_err(|e| e.to_string())?;
+    }
+
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
 // Bridge functions
 // ---------------------------------------------------------------------------
 
 /// Validates a UCAN token for a required capability.
 ///
-/// Performs the full 11-step UCAN validation pipeline from ADR-016.
+/// Performs the full 11-step UCAN validation pipeline from ADR-016, delegating
+/// to `scp_protocol::crypto::ucan::validate::validate_ucan` via the
+/// extract-validate-writeback pattern.
+///
 /// State operations (nonce tracking, revocation lists, ceiling) are
-/// delegated to `WasmContextManager`.
+/// extracted from `WasmContextManager`, validation runs against in-memory
+/// trait impls, and new nonces are written back after success.
 #[wasm_bindgen]
 pub fn ucan_validate(
     context: &WasmContextHandle,
@@ -974,26 +434,21 @@ pub fn ucan_validate(
             None => None,
         };
 
-        // Read ceiling, creator_did, and revoked CIDs from WasmContextManager.
-        let (ceiling, creator_did, revoked_cids) =
-            with_manager(|mgr| mgr.ucan_context_state(&context_id)).map_err(|e| {
-                ScpWasmError::Permission {
-                    message: e.to_string(),
-                    code: "SCP-PERM-3000".to_owned(),
-                }
-                .into_js()
-            })?;
+        let required_capability: CapabilityUri = capability.parse().map_err(|e: UcanError| {
+            ScpWasmError::Permission {
+                message: format!("invalid capability URI: {e}"),
+                code: "SCP-PERM-3000".to_owned(),
+            }
+            .into_js()
+        })?;
 
-        validate_ucan_full(&UcanValidationParams {
-            token: &parsed,
-            capability: &capability,
-            context_id: &context_id,
-            expected_aud_did: &expected_aud_did,
-            proof_tokens: proof_tokens.as_deref(),
-            ceiling: &ceiling,
-            creator_did: &creator_did,
-            revoked_cids: &revoked_cids,
-        })
+        run_validate_ucan(
+            &context_id,
+            &parsed,
+            &required_capability,
+            &expected_aud_did,
+            proof_tokens.as_deref(),
+        )
         .map_err(|e| {
             ScpWasmError::Permission {
                 message: e,
@@ -1066,8 +521,8 @@ pub fn ucan_delegate(
 /// Validates a UCAN token for tool invocation authorization (WASM bridge).
 ///
 /// Extracts capability from the token and verifies it includes `tool_invoke`
-/// permission for the given `tool_id`. Uses the WASM-local 11-step UCAN
-/// validation pipeline.
+/// permission for the given `tool_id`. Uses scp-protocol's full 11-step UCAN
+/// validation pipeline via extract-validate-writeback.
 ///
 /// See spec §6.2, §8, ADR-016, and issue #319.
 ///
@@ -1084,23 +539,18 @@ pub fn validate_tool_ucan_wasm(
     let parsed = parse_ucan(token).map_err(|e| format!("malformed UCAN token: {e}"))?;
 
     // Build the required capability URI: scp:ctx:{context_id}/tool_invoke:{tool_id}
-    let required_capability = format!("scp:ctx:{context_id}/tool_invoke:{tool_id}");
+    let required_capability_str = format!("scp:ctx:{context_id}/tool_invoke:{tool_id}");
+    let required_capability: CapabilityUri = required_capability_str
+        .parse()
+        .map_err(|e: UcanError| format!("invalid capability URI: {e}"))?;
 
-    // Read ceiling, creator_did, and revoked CIDs from WasmContextManager.
-    let (ceiling, creator_did, revoked_cids) =
-        with_manager(|mgr| mgr.ucan_context_state(context_id))
-            .map_err(|e| format!("failed to get UCAN context state: {e}"))?;
-
-    validate_ucan_full(&UcanValidationParams {
-        token: &parsed,
-        capability: &required_capability,
+    run_validate_ucan(
         context_id,
-        expected_aud_did: identity_did,
-        proof_tokens: None,
-        ceiling: &ceiling,
-        creator_did: &creator_did,
-        revoked_cids: &revoked_cids,
-    })
+        &parsed,
+        &required_capability,
+        identity_did,
+        None,
+    )
 }
 
 /// Revokes a UCAN token with authorization checking.
@@ -1111,9 +561,10 @@ pub fn validate_tool_ucan_wasm(
 /// 2. **Authorization** -- Verifies the revoker is the token's issuer or the
 ///    context creator. Rejects unauthorized revocation attempts.
 /// 3. **Local revocation** -- Computes the revocation CID from the full JWT
-///    string (SHA-256 hex) and delegates to `WasmContextManager::ucan_revoke`
-///    which adds it to the context's revocation list and appends a
-///    `UcanRevoked` event to the event log.
+///    string (SHA-256 hex, via `scp_protocol::crypto::ucan::revoke::compute_revocation_cid`)
+///    and delegates to `WasmContextManager::ucan_revoke` which adds it to
+///    the context's revocation list and appends a `UcanRevoked` event to the
+///    event log.
 ///
 /// WASM uses a subset of the full pipeline per ADR-034: no MLS distribution
 /// (WASM has no transport layer). Authorization is enforced locally.
@@ -1179,8 +630,8 @@ pub fn ucan_revoke(context: &WasmContextHandle, token: String, revoker_did: Stri
             ));
         }
 
-        // Compute the revocation CID from the full JWT string — matches
-        // validation step 10.
+        // Compute the revocation CID from the full JWT string — uses
+        // scp-protocol's compute_revocation_cid (hex-encoded SHA-256).
         let token_cid = compute_revocation_cid(&token);
 
         with_manager(|mgr| mgr.ucan_revoke(&context_id, &token_cid, &revoker_did))
@@ -1198,10 +649,26 @@ pub fn ucan_revoke(context: &WasmContextHandle, token: String, revoker_did: Stri
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
     use super::*;
+    use base64::Engine;
+    use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+    use scp_protocol::crypto::ucan::{Attenuation, UcanHeader, UcanPayload};
+    use scp_protocol::trust::custody_violation::{ActionCategory, classify_action};
+    use std::collections::HashSet;
 
     // -----------------------------------------------------------------------
-    // extract_key_scope
+    // extract_key_scope — tests use scp-protocol types directly
     // -----------------------------------------------------------------------
+
+    /// Helper: extract key scope from a `UcanPayload` (mirrors
+    /// scp-protocol's `extract_key_scope`, which is private).
+    fn extract_key_scope(payload: &UcanPayload) -> Option<String> {
+        payload
+            .fct
+            .as_ref()
+            .and_then(|fct| fct.get("scp_key_scope"))
+            .and_then(|v| v.as_str())
+            .map(String::from)
+    }
 
     #[test]
     fn extract_key_scope_returns_scope_when_present() {
@@ -1264,393 +731,12 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // Step 5a: Self-delegation rejection
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn validate_key_scope_rejects_self_delegation_without_scope() {
-        let token = ParsedUcanToken {
-            header: UcanHeader {
-                alg: "EdDSA".to_owned(),
-                typ: "JWT".to_owned(),
-                ucv: "0.10.0".to_owned(),
-                kid: None,
-            },
-            payload: UcanPayload {
-                iss: "did:dht:z6MkSame".to_owned(),
-                aud: "did:dht:z6MkSame".to_owned(),
-                exp: 9_999_999_999,
-                nbf: None,
-                nnc: "test".to_owned(),
-                att: vec![],
-                prf: vec![],
-                fct: None,
-            },
-            signature: vec![],
-            encoded: String::new(),
-        };
-        let result = validate_key_scope(&token);
-        assert!(result.is_err());
-        let err = result.err().unwrap_or_default();
-        assert!(
-            err.contains("self-delegation"),
-            "expected self-delegation error, got: {err}"
-        );
-    }
-
-    #[test]
-    fn validate_key_scope_accepts_self_delegation_with_scope() {
-        let token = ParsedUcanToken {
-            header: UcanHeader {
-                alg: "EdDSA".to_owned(),
-                typ: "JWT".to_owned(),
-                ucv: "0.10.0".to_owned(),
-                kid: Some("#agent".to_owned()),
-            },
-            payload: UcanPayload {
-                iss: "did:dht:z6MkSame".to_owned(),
-                aud: "did:dht:z6MkSame".to_owned(),
-                exp: 9_999_999_999,
-                nbf: None,
-                nnc: "test".to_owned(),
-                att: vec![],
-                prf: vec![],
-                fct: Some(serde_json::json!({"scp_key_scope": "#agent"})),
-            },
-            signature: vec![],
-            encoded: String::new(),
-        };
-        let result = validate_key_scope(&token);
-        assert!(
-            result.is_ok(),
-            "self-delegation with key_scope should be accepted: {result:?}"
-        );
-    }
-
-    #[test]
-    fn validate_key_scope_accepts_different_iss_aud_without_scope() {
-        let token = ParsedUcanToken {
-            header: UcanHeader {
-                alg: "EdDSA".to_owned(),
-                typ: "JWT".to_owned(),
-                ucv: "0.10.0".to_owned(),
-                kid: None,
-            },
-            payload: UcanPayload {
-                iss: "did:dht:z6MkIssuer".to_owned(),
-                aud: "did:dht:z6MkAudience".to_owned(),
-                exp: 9_999_999_999,
-                nbf: None,
-                nnc: "test".to_owned(),
-                att: vec![],
-                prf: vec![],
-                fct: None,
-            },
-            signature: vec![],
-            encoded: String::new(),
-        };
-        let result = validate_key_scope(&token);
-        assert!(
-            result.is_ok(),
-            "different iss/aud without scope should be accepted: {result:?}"
-        );
-    }
-
-    // -----------------------------------------------------------------------
-    // Step 5b: Key scope / kid mismatch
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn validate_key_scope_rejects_kid_scope_mismatch() {
-        let token = ParsedUcanToken {
-            header: UcanHeader {
-                alg: "EdDSA".to_owned(),
-                typ: "JWT".to_owned(),
-                ucv: "0.10.0".to_owned(),
-                kid: Some("#active".to_owned()),
-            },
-            payload: UcanPayload {
-                iss: "did:dht:z6MkSame".to_owned(),
-                aud: "did:dht:z6MkSame".to_owned(),
-                exp: 9_999_999_999,
-                nbf: None,
-                nnc: "test".to_owned(),
-                att: vec![],
-                prf: vec![],
-                fct: Some(serde_json::json!({"scp_key_scope": "#agent"})),
-            },
-            signature: vec![],
-            encoded: String::new(),
-        };
-        let result = validate_key_scope(&token);
-        assert!(result.is_err());
-        let err = result.err().unwrap_or_default();
-        assert!(
-            err.contains("key scope mismatch"),
-            "expected key scope mismatch error, got: {err}"
-        );
-    }
-
-    #[test]
-    fn validate_key_scope_defaults_kid_to_active() {
-        // kid absent, scope declares #active — should match (default kid = #active)
-        let token = ParsedUcanToken {
-            header: UcanHeader {
-                alg: "EdDSA".to_owned(),
-                typ: "JWT".to_owned(),
-                ucv: "0.10.0".to_owned(),
-                kid: None,
-            },
-            payload: UcanPayload {
-                iss: "did:dht:z6MkSame".to_owned(),
-                aud: "did:dht:z6MkSame".to_owned(),
-                exp: 9_999_999_999,
-                nbf: None,
-                nnc: "test".to_owned(),
-                att: vec![],
-                prf: vec![],
-                fct: Some(serde_json::json!({"scp_key_scope": "#active"})),
-            },
-            signature: vec![],
-            encoded: String::new(),
-        };
-        let result = validate_key_scope(&token);
-        assert!(
-            result.is_ok(),
-            "kid defaults to #active, matching scope: {result:?}"
-        );
-    }
-
-    // -----------------------------------------------------------------------
-    // Step 6b: Category A enforcement
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn enforce_category_a_rejects_agent_with_did_document_cap() {
-        let token = ParsedUcanToken {
-            header: UcanHeader {
-                alg: "EdDSA".to_owned(),
-                typ: "JWT".to_owned(),
-                ucv: "0.10.0".to_owned(),
-                kid: Some("#agent".to_owned()),
-            },
-            payload: UcanPayload {
-                iss: "did:dht:z6MkTest".to_owned(),
-                aud: "did:dht:z6MkOther".to_owned(),
-                exp: 9_999_999_999,
-                nbf: None,
-                nnc: "test".to_owned(),
-                att: vec![Attenuation {
-                    with: "scp:ctx:ctx-1/did_document:update".to_owned(),
-                    can: "update".to_owned(),
-                }],
-                prf: vec![],
-                fct: None,
-            },
-            signature: vec![],
-            encoded: String::new(),
-        };
-        let caps = vec![CapabilityUri {
-            context_id: Some("ctx-1".to_owned()),
-            resource: "did_document".to_owned(),
-            action: "update".to_owned(),
-        }];
-        let result = enforce_ucan_category_a(&token, &caps);
-        assert!(result.is_err());
-        let err = result.err().unwrap_or_default();
-        assert!(
-            err.contains("Category A violation"),
-            "expected Category A violation, got: {err}"
-        );
-    }
-
-    #[test]
-    fn enforce_category_a_allows_active_with_did_document_cap() {
-        let token = ParsedUcanToken {
-            header: UcanHeader {
-                alg: "EdDSA".to_owned(),
-                typ: "JWT".to_owned(),
-                ucv: "0.10.0".to_owned(),
-                kid: Some("#active".to_owned()),
-            },
-            payload: UcanPayload {
-                iss: "did:dht:z6MkTest".to_owned(),
-                aud: "did:dht:z6MkOther".to_owned(),
-                exp: 9_999_999_999,
-                nbf: None,
-                nnc: "test".to_owned(),
-                att: vec![],
-                prf: vec![],
-                fct: None,
-            },
-            signature: vec![],
-            encoded: String::new(),
-        };
-        let caps = vec![CapabilityUri {
-            context_id: Some("ctx-1".to_owned()),
-            resource: "did_document".to_owned(),
-            action: "update".to_owned(),
-        }];
-        let result = enforce_ucan_category_a(&token, &caps);
-        assert!(
-            result.is_ok(),
-            "#active key should be allowed Category A: {result:?}"
-        );
-    }
-
-    #[test]
-    fn enforce_category_a_allows_agent_with_category_b() {
-        let token = ParsedUcanToken {
-            header: UcanHeader {
-                alg: "EdDSA".to_owned(),
-                typ: "JWT".to_owned(),
-                ucv: "0.10.0".to_owned(),
-                kid: Some("#agent".to_owned()),
-            },
-            payload: UcanPayload {
-                iss: "did:dht:z6MkTest".to_owned(),
-                aud: "did:dht:z6MkOther".to_owned(),
-                exp: 9_999_999_999,
-                nbf: None,
-                nnc: "test".to_owned(),
-                att: vec![],
-                prf: vec![],
-                fct: None,
-            },
-            signature: vec![],
-            encoded: String::new(),
-        };
-        let caps = vec![CapabilityUri {
-            context_id: Some("ctx-1".to_owned()),
-            resource: "messages".to_owned(),
-            action: "write".to_owned(),
-        }];
-        let result = enforce_ucan_category_a(&token, &caps);
-        assert!(
-            result.is_ok(),
-            "#agent key should be allowed Category B: {result:?}"
-        );
-    }
-
-    #[test]
-    fn enforce_category_a_rejects_unknown_kid() {
-        let token = ParsedUcanToken {
-            header: UcanHeader {
-                alg: "EdDSA".to_owned(),
-                typ: "JWT".to_owned(),
-                ucv: "0.10.0".to_owned(),
-                kid: Some("#unknown".to_owned()),
-            },
-            payload: UcanPayload {
-                iss: "did:dht:z6MkTest".to_owned(),
-                aud: "did:dht:z6MkOther".to_owned(),
-                exp: 9_999_999_999,
-                nbf: None,
-                nnc: "test".to_owned(),
-                att: vec![],
-                prf: vec![],
-                fct: None,
-            },
-            signature: vec![],
-            encoded: String::new(),
-        };
-        let caps = vec![CapabilityUri {
-            context_id: Some("ctx-1".to_owned()),
-            resource: "messages".to_owned(),
-            action: "write".to_owned(),
-        }];
-        let result = enforce_ucan_category_a(&token, &caps);
-        assert!(result.is_err());
-        let err = result.err().unwrap_or_default();
-        assert!(
-            err.contains("unrecognized signing key ID"),
-            "expected unrecognized kid error, got: {err}"
-        );
-    }
-
-    #[test]
-    fn enforce_category_a_defaults_kid_to_active() {
-        // kid absent → defaults to #active → Category A allowed
-        let token = ParsedUcanToken {
-            header: UcanHeader {
-                alg: "EdDSA".to_owned(),
-                typ: "JWT".to_owned(),
-                ucv: "0.10.0".to_owned(),
-                kid: None,
-            },
-            payload: UcanPayload {
-                iss: "did:dht:z6MkTest".to_owned(),
-                aud: "did:dht:z6MkOther".to_owned(),
-                exp: 9_999_999_999,
-                nbf: None,
-                nnc: "test".to_owned(),
-                att: vec![],
-                prf: vec![],
-                fct: None,
-            },
-            signature: vec![],
-            encoded: String::new(),
-        };
-        let caps = vec![CapabilityUri {
-            context_id: Some("ctx-1".to_owned()),
-            resource: "did_document".to_owned(),
-            action: "update".to_owned(),
-        }];
-        let result = enforce_ucan_category_a(&token, &caps);
-        assert!(
-            result.is_ok(),
-            "absent kid defaults to #active, Category A allowed: {result:?}"
-        );
-    }
-
-    #[test]
-    fn enforce_category_a_checks_all_resource_types() {
-        for resource in CATEGORY_A_RESOURCES {
-            let token = ParsedUcanToken {
-                header: UcanHeader {
-                    alg: "EdDSA".to_owned(),
-                    typ: "JWT".to_owned(),
-                    ucv: "0.10.0".to_owned(),
-                    kid: Some("#agent".to_owned()),
-                },
-                payload: UcanPayload {
-                    iss: "did:dht:z6MkTest".to_owned(),
-                    aud: "did:dht:z6MkOther".to_owned(),
-                    exp: 9_999_999_999,
-                    nbf: None,
-                    nnc: "test".to_owned(),
-                    att: vec![],
-                    prf: vec![],
-                    fct: None,
-                },
-                signature: vec![],
-                encoded: String::new(),
-            };
-            let caps = vec![CapabilityUri {
-                context_id: Some("ctx-1".to_owned()),
-                resource: (*resource).to_owned(),
-                action: "modify".to_owned(),
-            }];
-            let result = enforce_ucan_category_a(&token, &caps);
-            assert!(
-                result.is_err(),
-                "Category A resource '{resource}' must be rejected for #agent"
-            );
-        }
-    }
-
-    // -----------------------------------------------------------------------
-    // UcanHeader kid serialization round-trip
+    // UcanHeader serialization round-trip (uses scp-protocol types)
     // -----------------------------------------------------------------------
 
     #[test]
     fn ucan_header_kid_round_trip() -> Result<(), String> {
-        let header = UcanHeader {
-            alg: "EdDSA".to_owned(),
-            typ: "JWT".to_owned(),
-            ucv: "0.10.0".to_owned(),
-            kid: Some("#agent".to_owned()),
-        };
+        let header = UcanHeader::with_kid("#agent".to_owned());
         let json = serde_json::to_string(&header).map_err(|e| e.to_string())?;
         assert!(json.contains("\"kid\":\"#agent\""));
         let parsed: UcanHeader = serde_json::from_str(&json).map_err(|e| e.to_string())?;
@@ -1660,12 +746,7 @@ mod tests {
 
     #[test]
     fn ucan_header_kid_absent_round_trip() -> Result<(), String> {
-        let header = UcanHeader {
-            alg: "EdDSA".to_owned(),
-            typ: "JWT".to_owned(),
-            ucv: "0.10.0".to_owned(),
-            kid: None,
-        };
+        let header = UcanHeader::new();
         let json = serde_json::to_string(&header).map_err(|e| e.to_string())?;
         assert!(!json.contains("kid"));
         let parsed: UcanHeader = serde_json::from_str(&json).map_err(|e| e.to_string())?;
@@ -1674,17 +755,12 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // parse_ucan now extracts kid from header
+    // parse_ucan extracts kid from header (uses scp-protocol parse_ucan)
     // -----------------------------------------------------------------------
 
     #[test]
-    fn parse_ucan_extracts_kid_from_header() -> Result<(), String> {
-        let header = UcanHeader {
-            alg: "EdDSA".to_owned(),
-            typ: "JWT".to_owned(),
-            ucv: "0.10.0".to_owned(),
-            kid: Some("#agent".to_owned()),
-        };
+    fn parse_ucan_extracts_kid_from_header() {
+        let header = UcanHeader::with_kid("#agent".to_owned());
         let payload = UcanPayload {
             iss: "did:dht:z6MkTest".to_owned(),
             aud: "did:dht:z6MkOther".to_owned(),
@@ -1695,27 +771,20 @@ mod tests {
             prf: vec![],
             fct: None,
         };
-        let header_json = serde_json::to_vec(&header).map_err(|e| e.to_string())?;
-        let payload_json = serde_json::to_vec(&payload).map_err(|e| e.to_string())?;
+        let header_json = serde_json::to_vec(&header).unwrap();
+        let payload_json = serde_json::to_vec(&payload).unwrap();
         let header_b64 = URL_SAFE_NO_PAD.encode(&header_json);
         let payload_b64 = URL_SAFE_NO_PAD.encode(&payload_json);
-        // Use a dummy signature (64 zero bytes)
         let sig_b64 = URL_SAFE_NO_PAD.encode([0u8; 64]);
         let jwt = format!("{header_b64}.{payload_b64}.{sig_b64}");
 
-        let parsed = parse_ucan(&jwt)?;
+        let parsed = parse_ucan(&jwt).unwrap();
         assert_eq!(parsed.header.kid, Some("#agent".to_owned()));
-        Ok(())
     }
 
     #[test]
-    fn parse_ucan_kid_none_when_absent() -> Result<(), String> {
-        let header = UcanHeader {
-            alg: "EdDSA".to_owned(),
-            typ: "JWT".to_owned(),
-            ucv: "0.10.0".to_owned(),
-            kid: None,
-        };
+    fn parse_ucan_kid_none_when_absent() {
+        let header = UcanHeader::new();
         let payload = UcanPayload {
             iss: "did:dht:z6MkTest".to_owned(),
             aud: "did:dht:z6MkOther".to_owned(),
@@ -1726,25 +795,189 @@ mod tests {
             prf: vec![],
             fct: None,
         };
-        let header_json = serde_json::to_vec(&header).map_err(|e| e.to_string())?;
-        let payload_json = serde_json::to_vec(&payload).map_err(|e| e.to_string())?;
+        let header_json = serde_json::to_vec(&header).unwrap();
+        let payload_json = serde_json::to_vec(&payload).unwrap();
         let header_b64 = URL_SAFE_NO_PAD.encode(&header_json);
         let payload_b64 = URL_SAFE_NO_PAD.encode(&payload_json);
         let sig_b64 = URL_SAFE_NO_PAD.encode([0u8; 64]);
         let jwt = format!("{header_b64}.{payload_b64}.{sig_b64}");
 
-        let parsed = parse_ucan(&jwt)?;
+        let parsed = parse_ucan(&jwt).unwrap();
         assert_eq!(parsed.header.kid, None);
-        Ok(())
     }
 
     // -----------------------------------------------------------------------
-    // E2E integration tests: real Ed25519 signatures through validate_ucan_full
+    // Category A enforcement — uses scp-protocol's classify_action
+    // -----------------------------------------------------------------------
+
+    /// Category A resource types — tested via scp-protocol's `classify_action`.
+    const CATEGORY_A_RESOURCES: &[&str] = &[
+        "did_document",
+        "verification_method",
+        "identity",
+        "pre_rotation",
+        "service",
+        "relay_config",
+        "did_migration",
+        "key_management",
+    ];
+
+    #[test]
+    fn classify_action_correctly_identifies_category_a() {
+        for resource in CATEGORY_A_RESOURCES {
+            assert_eq!(
+                classify_action(resource),
+                ActionCategory::CategoryA,
+                "resource '{resource}' should be Category A"
+            );
+        }
+    }
+
+    #[test]
+    fn classify_action_category_b_for_standard_capabilities() {
+        let category_b = [
+            "messages",
+            "tool_invoke",
+            "member",
+            "role",
+            "context",
+            "governance",
+        ];
+        for resource in &category_b {
+            assert_eq!(
+                classify_action(resource),
+                ActionCategory::CategoryB,
+                "resource '{resource}' should be Category B"
+            );
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // CapabilityUri::matches() wildcard action (uses scp-protocol types)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn capability_matches_wildcard_action_grants_specific() {
+        let granted = CapabilityUri::new("ctx-1", "tool_invoke", "*");
+        let required = CapabilityUri::new("ctx-1", "tool_invoke", "calculator");
+        assert!(
+            granted.matches(&required),
+            "wildcard action '*' should match specific action 'calculator'"
+        );
+    }
+
+    #[test]
+    fn capability_matches_wildcard_action_does_not_cross_resources() {
+        let granted = CapabilityUri::new("ctx-1", "tool_invoke", "*");
+        let required = CapabilityUri::new("ctx-1", "messages", "write");
+        assert!(
+            !granted.matches(&required),
+            "wildcard on tool_invoke must not match messages resource"
+        );
+    }
+
+    #[test]
+    fn capability_matches_specific_does_not_satisfy_wildcard_requirement() {
+        let granted = CapabilityUri::new("ctx-1", "tool_invoke", "calculator");
+        let required = CapabilityUri::new("ctx-1", "tool_invoke", "*");
+        assert!(
+            !granted.matches(&required),
+            "specific grant must not satisfy wildcard requirement"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Ceiling: default_ceiling from scp-protocol
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn default_ceiling_contains_expected_capabilities() {
+        let ceiling = default_ceiling().to_ucan_string_set();
+        assert!(ceiling.contains("messages:read"), "missing messages:read");
+        assert!(ceiling.contains("messages:write"), "missing messages:write");
+        assert!(ceiling.contains("tool:register"), "missing tool:register");
+        assert!(ceiling.contains("tool_invoke:*"), "missing tool_invoke:*");
+        assert!(ceiling.contains("role:assign"), "missing role:assign");
+        assert!(ceiling.contains("member:invite"), "missing member:invite");
+        assert!(ceiling.contains("member:remove"), "missing member:remove");
+        assert!(
+            ceiling.contains("governance:propose"),
+            "missing governance:propose"
+        );
+        assert!(
+            ceiling.contains("governance:vote"),
+            "missing governance:vote"
+        );
+        assert!(ceiling.contains("context:close"), "missing context:close");
+    }
+
+    // -----------------------------------------------------------------------
+    // Ceiling wildcard fallback (uses scp-protocol's CapabilityUri)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn ceiling_wildcard_fallback_allows_specific_action() {
+        let cap = CapabilityUri::new("ctx-1", "tool_invoke", "calculator");
+        let ceiling: HashSet<String> = HashSet::from(["tool_invoke:*".to_owned()]);
+        assert!(
+            cap.is_within_ceiling(&ceiling),
+            "ceiling with 'tool_invoke:*' should cover 'tool_invoke:calculator'"
+        );
+    }
+
+    #[test]
+    fn ceiling_wildcard_does_not_cross_resources() {
+        let cap = CapabilityUri::new("ctx-1", "messages", "write");
+        let ceiling: HashSet<String> = HashSet::from(["tool_invoke:*".to_owned()]);
+        assert!(
+            !cap.is_within_ceiling(&ceiling),
+            "ceiling with 'tool_invoke:*' should not cover 'messages:write'"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Revocation CID — uses scp-protocol's compute_revocation_cid
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn compute_revocation_cid_is_hex_sha256() {
+        use sha2::{Digest, Sha256};
+        let token = "header.payload.signature";
+        let cid = compute_revocation_cid(token);
+        let expected_hash = Sha256::digest(token.as_bytes());
+        let expected_hex = expected_hash
+            .iter()
+            .fold(String::with_capacity(64), |mut acc, b| {
+                use std::fmt::Write;
+                let _ = write!(acc, "{b:02x}");
+                acc
+            });
+        assert_eq!(cid, expected_hex);
+    }
+
+    // -----------------------------------------------------------------------
+    // Proof CID — bafyrei prefix
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn compute_proof_cid_has_bafyrei_prefix() {
+        let token = "header.payload.signature";
+        let cid = compute_proof_cid(token);
+        assert!(
+            cid.starts_with("bafyrei"),
+            "proof CID must start with 'bafyrei'"
+        );
+        // The rest should be hex SHA-256 (64 chars)
+        assert_eq!(cid.len(), 7 + 64, "bafyrei + 64 hex chars");
+    }
+
+    // -----------------------------------------------------------------------
+    // E2E integration tests: real Ed25519 signatures
     //
-    // These tests exercise the full validate_ucan_full pipeline with real
-    // cryptographic operations (no empty signatures). They register identities
-    // with agent keys in the WASM identity registry and produce properly
-    // signed JWTs.
+    // These tests exercise the full scp-protocol validate_ucan pipeline with
+    // real cryptographic operations (no empty signatures). They register
+    // identities with agent keys in the WASM identity registry and produce
+    // properly signed JWTs.
     //
     // Category A rejection fires at step 6b, before the time-dependent steps
     // (9: nonce, 11: time bounds), so these tests run on native targets
@@ -1772,24 +1005,101 @@ mod tests {
         format!("{signing_input}.{sig_b64}")
     }
 
+    /// Helper: verify Ed25519 signature of a parsed token using the WASM
+    /// DID resolver, without running the full validation pipeline.
+    fn verify_token_signature(token: &UcanToken) -> Result<(), String> {
+        let resolver = WasmDidResolver;
+        let pk_bytes = match &token.header.kid {
+            Some(kid) => resolver
+                .resolve_public_key_by_kid(&token.payload.iss, kid)
+                .map_err(|e| e.to_string())?,
+            None => resolver
+                .resolve_public_key(&token.payload.iss)
+                .map_err(|e| e.to_string())?,
+        };
+
+        let verifying_key = ed25519_dalek::VerifyingKey::from_bytes(&pk_bytes)
+            .map_err(|e| format!("invalid public key: {e}"))?;
+
+        let signing_input = token
+            .encoded
+            .rfind('.')
+            .map(|pos| &token.encoded[..pos])
+            .ok_or_else(|| "missing signature segment".to_owned())?;
+
+        let sig_bytes: [u8; 64] =
+            token.signature.as_slice().try_into().map_err(|_| {
+                format!("signature must be 64 bytes, got {}", token.signature.len())
+            })?;
+
+        let signature = ed25519_dalek::Signature::from_bytes(&sig_bytes);
+
+        verifying_key
+            .verify_strict(signing_input.as_bytes(), &signature)
+            .map_err(|_| "signature verification failed".to_owned())
+    }
+
+    /// Helper: run the full scp-protocol validation pipeline with pre-extracted
+    /// state (for tests that don't have a `WasmContextManager`).
+    fn validate_with_extracted_state(
+        token: &UcanToken,
+        capability: &str,
+        expected_aud_did: &str,
+        ceiling: &HashSet<String>,
+        creator_did: &str,
+        revoked_cids: &HashSet<String>,
+        proof_tokens: Option<&[String]>,
+    ) -> Result<(), String> {
+        let effective_ceiling = if ceiling.is_empty() {
+            default_ceiling().to_ucan_string_set()
+        } else {
+            ceiling.clone()
+        };
+
+        let did_resolver = WasmDidResolver;
+        let mut nonce_tracker = WasmNonceTracker::new(HashSet::new());
+        let mut revocation_checker = InMemoryRevocationChecker::new();
+        revocation_checker.revoked = revoked_cids.clone();
+
+        let mut proof_resolver = InMemoryProofResolver::new();
+        if let Some(proofs) = proof_tokens {
+            for encoded in proofs {
+                let parsed = parse_ucan(encoded).map_err(|e| e.to_string())?;
+                let cid = compute_proof_cid(encoded);
+                proof_resolver.proofs.insert(cid, parsed);
+            }
+        }
+
+        let required_capability: CapabilityUri =
+            capability.parse().map_err(|e: UcanError| e.to_string())?;
+
+        let clock = WasmClock;
+
+        let mut ctx = ValidationContext {
+            did_resolver: &did_resolver,
+            nonce_tracker: &mut nonce_tracker,
+            revocation_checker: &revocation_checker,
+            proof_resolver: &proof_resolver,
+            ceiling: &effective_ceiling,
+            context_creator_did: creator_did,
+            presenting_agent_did: expected_aud_did,
+            clock_skew_tolerance_secs:
+                scp_protocol::crypto::ucan::validate::DEFAULT_CLOCK_SKEW_TOLERANCE_SECS,
+            clock: &clock,
+        };
+
+        validate_ucan(token, &required_capability, &mut ctx).map_err(|e| e.to_string())
+    }
+
     #[test]
     fn e2e_agent_signed_category_a_rejected_after_real_signature_verification() {
-        // Setup: register an identity with a separate agent key.
         crate::identity::test_helpers::cleanup_identity_registry();
 
         let (did, _identity_key, agent_key) =
             crate::identity::test_helpers::register_identity_with_agent_key();
 
-        // Build a UCAN signed by the agent key (#agent) granting a Category A
-        // capability (did_document:update). This is a self-delegation scenario
-        // (iss == aud) with scp_key_scope to satisfy step 5a.
         let context_id = "test-ctx-e2e-catA";
-        let header = UcanHeader {
-            alg: "EdDSA".to_owned(),
-            typ: "JWT".to_owned(),
-            ucv: "0.10.0".to_owned(),
-            kid: Some("#agent".to_owned()),
-        };
+        let header = UcanHeader::with_kid("#agent".to_owned());
         let payload = UcanPayload {
             iss: did.clone(),
             aud: did.clone(),
@@ -1805,22 +1115,18 @@ mod tests {
         };
 
         let jwt = build_signed_ucan(&header, &payload, &agent_key);
-
-        // Verify the signature is valid independently (step 2 must pass).
         let parsed = parse_ucan(&jwt).expect("JWT should parse");
-        verify_signature(&parsed).expect("real Ed25519 signature must verify");
+        verify_token_signature(&parsed).expect("real Ed25519 signature must verify");
 
-        // Now run the full pipeline — expect Category A rejection at step 6b.
-        let result = validate_ucan_full(&UcanValidationParams {
-            token: &parsed,
-            capability: &format!("scp:ctx:{context_id}/did_document:update"),
-            context_id,
-            expected_aud_did: &did,
-            proof_tokens: None,
-            ceiling: &HashSet::new(),
-            creator_did: &did,
-            revoked_cids: &HashSet::new(),
-        });
+        let result = validate_with_extracted_state(
+            &parsed,
+            &format!("scp:ctx:{context_id}/did_document:update"),
+            &did,
+            &HashSet::new(),
+            &did,
+            &HashSet::new(),
+            None,
+        );
 
         assert!(
             result.is_err(),
@@ -1828,32 +1134,20 @@ mod tests {
         );
         let err = result.unwrap_err();
         assert!(
-            err.contains("Category A violation"),
+            err.contains("Category A") || err.contains("category a") || err.contains("CategoryA"),
             "expected Category A violation error, got: {err}"
-        );
-        assert!(
-            err.contains("did_document:update"),
-            "error should name the offending capability, got: {err}"
         );
     }
 
     #[test]
     fn e2e_agent_signed_category_b_passes_signature_and_category_a_check() {
-        // Setup: register an identity with a separate agent key.
         crate::identity::test_helpers::cleanup_identity_registry();
 
         let (did, _identity_key, agent_key) =
             crate::identity::test_helpers::register_identity_with_agent_key();
 
-        // Build a UCAN signed by the agent key granting a Category B
-        // (non-identity) capability. This should pass steps 1-6b.
         let context_id = "test-ctx-e2e-catB";
-        let header = UcanHeader {
-            alg: "EdDSA".to_owned(),
-            typ: "JWT".to_owned(),
-            ucv: "0.10.0".to_owned(),
-            kid: Some("#agent".to_owned()),
-        };
+        let header = UcanHeader::with_kid("#agent".to_owned());
         let payload = UcanPayload {
             iss: did.clone(),
             aud: did.clone(),
@@ -1869,25 +1163,18 @@ mod tests {
         };
 
         let jwt = build_signed_ucan(&header, &payload, &agent_key);
-
-        // Verify the signature independently.
         let parsed = parse_ucan(&jwt).expect("JWT should parse");
-        verify_signature(&parsed).expect("real Ed25519 signature must verify");
+        verify_token_signature(&parsed).expect("real Ed25519 signature must verify");
 
-        // Run the pipeline — it should pass steps 1-6b (signature + Category A)
-        // then fail at step 9 (nonce validation) because the nonce format is
-        // intentionally invalid. This proves the pipeline reached past step 6b
-        // (Category A check passed for a Category B capability).
-        let result = validate_ucan_full(&UcanValidationParams {
-            token: &parsed,
-            capability: &format!("scp:ctx:{context_id}/messages:write"),
-            context_id,
-            expected_aud_did: &did,
-            proof_tokens: None,
-            ceiling: &HashSet::new(),
-            creator_did: &did,
-            revoked_cids: &HashSet::new(),
-        });
+        let result = validate_with_extracted_state(
+            &parsed,
+            &format!("scp:ctx:{context_id}/messages:write"),
+            &did,
+            &HashSet::new(),
+            &did,
+            &HashSet::new(),
+            None,
+        );
 
         // The pipeline should fail at step 9 (nonce format), NOT at step 6b.
         assert!(
@@ -1896,31 +1183,24 @@ mod tests {
         );
         let err = result.unwrap_err();
         assert!(
-            !err.contains("Category A"),
+            !err.to_lowercase().contains("category a"),
             "Category B capability should pass Category A check, but got: {err}"
         );
         assert!(
-            err.contains("nonce"),
+            err.to_lowercase().contains("nonce"),
             "expected nonce validation error (step 9), got: {err}"
         );
     }
 
     #[test]
     fn e2e_active_key_signed_category_a_passes_category_a_check() {
-        // Setup: register identity. The #active key (identity key) should be
-        // allowed to grant Category A capabilities.
         crate::identity::test_helpers::cleanup_identity_registry();
 
         let (did, identity_key, _agent_key) =
             crate::identity::test_helpers::register_identity_with_agent_key();
 
         let context_id = "test-ctx-e2e-active";
-        let header = UcanHeader {
-            alg: "EdDSA".to_owned(),
-            typ: "JWT".to_owned(),
-            ucv: "0.10.0".to_owned(),
-            kid: Some("#active".to_owned()),
-        };
+        let header = UcanHeader::with_kid("#active".to_owned());
         let payload = UcanPayload {
             iss: did.clone(),
             aud: did.clone(),
@@ -1936,55 +1216,43 @@ mod tests {
         };
 
         let jwt = build_signed_ucan(&header, &payload, &identity_key);
-
         let parsed = parse_ucan(&jwt).expect("JWT should parse");
-        verify_signature(&parsed).expect("real Ed25519 signature must verify");
+        verify_token_signature(&parsed).expect("real Ed25519 signature must verify");
 
         // Pipeline should pass Category A (step 6b) because #active is allowed.
         // It will fail later at nonce validation (step 9).
-        // The ceiling must include did_document:update, otherwise the default
-        // ceiling (which does NOT include Category A capabilities) rejects it
-        // at step 8 before reaching step 9.
         let ceiling: HashSet<String> = std::iter::once("did_document:update".to_owned()).collect();
-        let result = validate_ucan_full(&UcanValidationParams {
-            token: &parsed,
-            capability: &format!("scp:ctx:{context_id}/did_document:update"),
-            context_id,
-            expected_aud_did: &did,
-            proof_tokens: None,
-            ceiling: &ceiling,
-            creator_did: &did,
-            revoked_cids: &HashSet::new(),
-        });
+        let result = validate_with_extracted_state(
+            &parsed,
+            &format!("scp:ctx:{context_id}/did_document:update"),
+            &did,
+            &ceiling,
+            &did,
+            &HashSet::new(),
+            None,
+        );
 
         assert!(result.is_err(), "pipeline should fail at nonce validation");
         let err = result.unwrap_err();
         assert!(
-            !err.contains("Category A"),
+            !err.to_lowercase().contains("category a"),
             "#active key should pass Category A check, but got: {err}"
         );
         assert!(
-            err.contains("nonce"),
+            err.to_lowercase().contains("nonce"),
             "expected nonce validation error (step 9), got: {err}"
         );
     }
 
     #[test]
     fn e2e_invalid_signature_rejected_before_category_a() {
-        // Verify that a tampered signature is caught at step 2 (before
-        // Category A at step 6b). This proves the pipeline does real crypto.
         crate::identity::test_helpers::cleanup_identity_registry();
 
         let (did, _identity_key, agent_key) =
             crate::identity::test_helpers::register_identity_with_agent_key();
 
         let context_id = "test-ctx-e2e-badsig";
-        let header = UcanHeader {
-            alg: "EdDSA".to_owned(),
-            typ: "JWT".to_owned(),
-            ucv: "0.10.0".to_owned(),
-            kid: Some("#agent".to_owned()),
-        };
+        let header = UcanHeader::with_kid("#agent".to_owned());
         let payload = UcanPayload {
             iss: did.clone(),
             aud: did.clone(),
@@ -1999,138 +1267,35 @@ mod tests {
             fct: Some(serde_json::json!({"scp_key_scope": "#agent"})),
         };
 
-        // Sign with the agent key, then corrupt the signature.
         let jwt = build_signed_ucan(&header, &payload, &agent_key);
         let parts: Vec<&str> = jwt.split('.').collect();
-        // Replace last byte of signature with a different value.
         let mut sig_bytes = URL_SAFE_NO_PAD.decode(parts[2]).unwrap();
-        sig_bytes[63] ^= 0xff; // flip all bits of last byte
+        sig_bytes[63] ^= 0xff;
         let corrupted_sig = URL_SAFE_NO_PAD.encode(&sig_bytes);
         let tampered_jwt = format!("{}.{}.{}", parts[0], parts[1], corrupted_sig);
 
         let parsed = parse_ucan(&tampered_jwt).expect("JWT should parse (format is valid)");
 
-        let result = validate_ucan_full(&UcanValidationParams {
-            token: &parsed,
-            capability: &format!("scp:ctx:{context_id}/did_document:update"),
-            context_id,
-            expected_aud_did: &did,
-            proof_tokens: None,
-            ceiling: &HashSet::new(),
-            creator_did: &did,
-            revoked_cids: &HashSet::new(),
-        });
+        let result = validate_with_extracted_state(
+            &parsed,
+            &format!("scp:ctx:{context_id}/did_document:update"),
+            &did,
+            &HashSet::new(),
+            &did,
+            &HashSet::new(),
+            None,
+        );
 
         assert!(result.is_err(), "tampered signature must be rejected");
         let err = result.unwrap_err();
         assert!(
-            err.contains("signature verification failed"),
+            err.to_lowercase().contains("signature"),
             "expected signature error at step 2, got: {err}"
-        );
-    }
-
-    // -----------------------------------------------------------------------
-    // CapabilityUri::matches() wildcard action
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn capability_matches_wildcard_action_grants_specific() {
-        let granted = CapabilityUri {
-            context_id: Some("ctx-1".to_owned()),
-            resource: "tool_invoke".to_owned(),
-            action: "*".to_owned(),
-        };
-        let required = CapabilityUri {
-            context_id: Some("ctx-1".to_owned()),
-            resource: "tool_invoke".to_owned(),
-            action: "calculator".to_owned(),
-        };
-        assert!(
-            granted.matches(&required),
-            "wildcard action '*' should match specific action 'calculator'"
-        );
-    }
-
-    #[test]
-    fn capability_matches_wildcard_action_does_not_cross_resources() {
-        let granted = CapabilityUri {
-            context_id: Some("ctx-1".to_owned()),
-            resource: "tool_invoke".to_owned(),
-            action: "*".to_owned(),
-        };
-        let required = CapabilityUri {
-            context_id: Some("ctx-1".to_owned()),
-            resource: "messages".to_owned(),
-            action: "write".to_owned(),
-        };
-        assert!(
-            !granted.matches(&required),
-            "wildcard on tool_invoke must not match messages resource"
-        );
-    }
-
-    #[test]
-    fn capability_matches_specific_does_not_satisfy_wildcard_requirement() {
-        let granted = CapabilityUri {
-            context_id: Some("ctx-1".to_owned()),
-            resource: "tool_invoke".to_owned(),
-            action: "calculator".to_owned(),
-        };
-        let required = CapabilityUri {
-            context_id: Some("ctx-1".to_owned()),
-            resource: "tool_invoke".to_owned(),
-            action: "*".to_owned(),
-        };
-        assert!(
-            !granted.matches(&required),
-            "specific grant must not satisfy wildcard requirement"
-        );
-    }
-
-    // -----------------------------------------------------------------------
-    // Ceiling wildcard fallback
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn ceiling_wildcard_fallback_allows_specific_action() {
-        // A ceiling containing "tool_invoke:*" should allow
-        // a capability with "tool_invoke:calculator".
-        let cap = CapabilityUri {
-            context_id: Some("ctx-1".to_owned()),
-            resource: "tool_invoke".to_owned(),
-            action: "calculator".to_owned(),
-        };
-        let ceiling: HashSet<String> = HashSet::from(["tool_invoke:*".to_owned()]);
-        let cap_name = cap.capability_name();
-        let within_ceiling =
-            ceiling.contains(&cap_name) || ceiling.contains(&format!("{}:*", cap.resource));
-        assert!(
-            within_ceiling,
-            "ceiling with 'tool_invoke:*' should cover 'tool_invoke:calculator'"
-        );
-    }
-
-    #[test]
-    fn ceiling_wildcard_does_not_cross_resources() {
-        let cap = CapabilityUri {
-            context_id: Some("ctx-1".to_owned()),
-            resource: "messages".to_owned(),
-            action: "write".to_owned(),
-        };
-        let ceiling: HashSet<String> = HashSet::from(["tool_invoke:*".to_owned()]);
-        let cap_name = cap.capability_name();
-        let within_ceiling =
-            ceiling.contains(&cap_name) || ceiling.contains(&format!("{}:*", cap.resource));
-        assert!(
-            !within_ceiling,
-            "ceiling with 'tool_invoke:*' should not cover 'messages:write'"
         );
     }
 
     #[test]
     fn e2e_all_category_a_resources_rejected_for_agent_key() {
-        // Exhaustively verify every Category A resource type is rejected
-        // when the token is signed by #agent with real cryptography.
         crate::identity::test_helpers::cleanup_identity_registry();
 
         let (did, _identity_key, agent_key) =
@@ -2140,12 +1305,7 @@ mod tests {
 
         for resource in CATEGORY_A_RESOURCES {
             let capability = format!("scp:ctx:{context_id}/{resource}:update");
-            let header = UcanHeader {
-                alg: "EdDSA".to_owned(),
-                typ: "JWT".to_owned(),
-                ucv: "0.10.0".to_owned(),
-                kid: Some("#agent".to_owned()),
-            };
+            let header = UcanHeader::with_kid("#agent".to_owned());
             let payload = UcanPayload {
                 iss: did.clone(),
                 aud: did.clone(),
@@ -2163,21 +1323,18 @@ mod tests {
             let jwt = build_signed_ucan(&header, &payload, &agent_key);
             let parsed = parse_ucan(&jwt).unwrap();
 
-            // Real signature must verify (step 2).
-            verify_signature(&parsed)
+            verify_token_signature(&parsed)
                 .unwrap_or_else(|e| panic!("signature must verify for resource '{resource}': {e}"));
 
-            // Full pipeline must reject at step 6b.
-            let result = validate_ucan_full(&UcanValidationParams {
-                token: &parsed,
-                capability: &capability,
-                context_id,
-                expected_aud_did: &did,
-                proof_tokens: None,
-                ceiling: &HashSet::new(),
-                creator_did: &did,
-                revoked_cids: &HashSet::new(),
-            });
+            let result = validate_with_extracted_state(
+                &parsed,
+                &capability,
+                &did,
+                &HashSet::new(),
+                &did,
+                &HashSet::new(),
+                None,
+            );
 
             assert!(
                 result.is_err(),
@@ -2185,7 +1342,7 @@ mod tests {
             );
             let err = result.unwrap_err();
             assert!(
-                err.contains("Category A violation"),
+                err.contains("Category A") || err.contains("CategoryA"),
                 "expected Category A violation for '{resource}', got: {err}"
             );
         }

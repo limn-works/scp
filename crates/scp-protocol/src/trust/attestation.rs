@@ -1073,6 +1073,11 @@ pub fn check_threshold_attestation(
 /// `revocation_status` is included in the signed scope so that an
 /// intermediary cannot flip Active↔Revoked without invalidating the
 /// signature.
+///
+/// # Errors
+///
+/// Returns [`TrustError::InvalidEventData`] if evidence or revocation
+/// status serialization fails.
 pub(crate) fn canonical_attestation_bytes(
     attestation: &Attestation,
 ) -> Result<Vec<u8>, TrustError> {

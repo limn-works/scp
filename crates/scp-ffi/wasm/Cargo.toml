@@ -45,6 +45,8 @@ base64 = { workspace = true }
 jsonschema = { workspace = true }
 hex = { workspace = true }
 serde_bytes = { workspace = true }
+scp-protocol = { path = "../../scp-protocol", version = "=0.1.0-beta.1" }
+scp-event-log = { path = "../../scp-event-log", version = "=0.1.0-beta.1" }
 scp-ffi-common = { path = "../common", default-features = false }
 zeroize = { workspace = true }
 subtle = { workspace = true }

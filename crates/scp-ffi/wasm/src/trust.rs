@@ -256,119 +256,11 @@ pub fn trust_verify_response(challenge_json: String, response_json: String) -> P
 // verify_participation_requirements (SCP-BA-004)
 // ---------------------------------------------------------------------------
 
-/// Local re-implementation of `scp_core::trust::ParticipationFact` for WASM.
-///
-/// Matches the Rust serde representation exactly (unit enum variants).
-#[derive(serde::Deserialize)]
-enum WasmParticipationFact {
-    ParticipationDuration,
-    GovernanceActionsAgainst,
-    GovernanceActionsBy,
-    ToolInvocationCount,
-    ContextCreationCount,
-    RoleProgressionCount,
-    AttestationCount,
-}
-
-impl WasmParticipationFact {
-    fn extract_value(&self, profile: &WasmParticipationProfile) -> u64 {
-        match self {
-            Self::ParticipationDuration => profile.participation_duration_secs,
-            Self::GovernanceActionsAgainst => profile.governance_actions_against,
-            Self::GovernanceActionsBy => profile.governance_actions_by,
-            Self::ToolInvocationCount => profile.tool_invocation_count,
-            Self::ContextCreationCount => profile.context_creation_count,
-            Self::RoleProgressionCount => profile.role_progression_count,
-            Self::AttestationCount => profile.attestation_count,
-        }
-    }
-}
-
-/// Local re-implementation of `scp_core::trust::ParticipationThreshold` for WASM.
-///
-/// Matches the Rust serde representation (externally tagged enum with value).
-#[derive(serde::Deserialize)]
-enum WasmParticipationThreshold {
-    GreaterThan(u64),
-    LessThan(u64),
-    AtLeast(u64),
-    AtMost(u64),
-    Equals(u64),
-}
-
-impl WasmParticipationThreshold {
-    fn is_satisfied(&self, value: u64) -> bool {
-        match self {
-            Self::GreaterThan(threshold) => value > *threshold,
-            Self::LessThan(threshold) => value < *threshold,
-            Self::AtLeast(threshold) => value >= *threshold,
-            Self::AtMost(threshold) => value <= *threshold,
-            Self::Equals(threshold) => value == *threshold,
-        }
-    }
-}
-
-/// Local re-implementation of `scp_core::trust::RequireParticipation` for WASM.
-#[derive(serde::Deserialize)]
-struct WasmRequireParticipation {
-    fact: WasmParticipationFact,
-    threshold: WasmParticipationThreshold,
-    max_age_secs: u64,
-    min_contexts: u32,
-}
-
-/// Domain separator for participation profile signing (must match
-/// `scp_core::trust::participation::DOMAIN_PARTICIPATION_V1`).
-const DOMAIN_PARTICIPATION_V1: &[u8] = b"SCP-PARTICIPATION-V1:";
-
-/// Local re-implementation of `scp_core::trust::ParticipationProfile` for WASM.
-#[derive(serde::Deserialize)]
-struct WasmParticipationProfile {
-    subject_did: String,
-    participation_duration_secs: u64,
-    governance_actions_against: u64,
-    governance_actions_by: u64,
-    tool_invocation_count: u64,
-    context_creation_count: u64,
-    role_progression_count: u64,
-    attestation_count: u64,
-    updated_at: u64,
-    event_log_root: Vec<u8>,
-    signer_public_key: Vec<u8>,
-    signature: Vec<u8>,
-}
-
-impl WasmParticipationProfile {
-    /// Returns the deterministic signable bytes for this profile.
-    ///
-    /// Must be algorithm-identical to `scp_core::trust::ParticipationProfile::signable_bytes`.
-    /// See that function for the byte layout specification.
-    fn signable_bytes(&self) -> Vec<u8> {
-        let did_bytes = self.subject_did.as_bytes();
-        let capacity = DOMAIN_PARTICIPATION_V1.len() + 4 + did_bytes.len() + 64 + 64;
-        let mut buf = Vec::with_capacity(capacity);
-
-        buf.extend_from_slice(DOMAIN_PARTICIPATION_V1);
-
-        #[allow(clippy::cast_possible_truncation)]
-        buf.extend_from_slice(&(did_bytes.len() as u32).to_be_bytes());
-        buf.extend_from_slice(did_bytes);
-
-        buf.extend_from_slice(&self.participation_duration_secs.to_be_bytes());
-        buf.extend_from_slice(&self.governance_actions_against.to_be_bytes());
-        buf.extend_from_slice(&self.governance_actions_by.to_be_bytes());
-        buf.extend_from_slice(&self.tool_invocation_count.to_be_bytes());
-        buf.extend_from_slice(&self.context_creation_count.to_be_bytes());
-        buf.extend_from_slice(&self.role_progression_count.to_be_bytes());
-        buf.extend_from_slice(&self.attestation_count.to_be_bytes());
-        buf.extend_from_slice(&self.updated_at.to_be_bytes());
-
-        buf.extend_from_slice(&self.event_log_root);
-        buf.extend_from_slice(&self.signer_public_key);
-
-        buf
-    }
-}
+// Participation types imported from scp-protocol — canonical implementations.
+use scp_protocol::trust::participation::{
+    ParticipationProfile, RequireParticipation,
+    verify_participation_requirements as protocol_verify,
+};
 
 /// Verifies participation profiles against admission requirements.
 ///
@@ -383,9 +275,9 @@ impl WasmParticipationProfile {
 /// Returns `true` if all requirements are satisfied. Throws an error with
 /// a diagnostic message if any requirement fails or if the JSON is malformed.
 ///
-/// Performs full Ed25519 signature verification on all profiles (matching
-/// `scp_core::trust::verify_participation_requirements`), followed by
-/// freshness, threshold, and `min_contexts` checks.
+/// Delegates to `scp_protocol::trust::participation::verify_participation_requirements`
+/// for full Ed25519 signature verification, freshness, threshold, and
+/// `min_contexts` checks.
 ///
 /// See §7.3.2.1.
 ///
@@ -409,128 +301,22 @@ pub fn verify_participation_requirements(
     profile_json: String,
     requirements_json: String,
 ) -> Result<bool, JsValue> {
-    use ed25519_dalek::{Signature, VerifyingKey};
+    let profiles: Vec<ParticipationProfile> = serde_json::from_str(&profile_json).map_err(|e| {
+        ScpWasmError::validation(&format!("failed to parse participation profiles JSON: {e}"))
+    })?;
 
-    let profiles: Vec<WasmParticipationProfile> =
-        serde_json::from_str(&profile_json).map_err(|e| {
-            ScpWasmError::validation(&format!("failed to parse participation profiles JSON: {e}"))
-        })?;
-
-    let requirements: Vec<WasmRequireParticipation> = serde_json::from_str(&requirements_json)
+    let requirements: Vec<RequireParticipation> = serde_json::from_str(&requirements_json)
         .map_err(|e| {
             ScpWasmError::validation(&format!(
                 "failed to parse participation requirements JSON: {e}"
             ))
         })?;
 
-    // Step 1: Verify all signatures up front. Any invalid signature is a
-    // hard failure regardless of which requirements use it. Matches
-    // scp-core's verify_participation_requirements step 1.
-    for profile in &profiles {
-        let pk_bytes: [u8; 32] = profile
-            .signer_public_key
-            .as_slice()
-            .try_into()
-            .map_err(|_| {
-                ScpWasmError::validation(&format!(
-                    "signer_public_key must be 32 bytes, got {}",
-                    profile.signer_public_key.len()
-                ))
-            })?;
+    let current_time = crate::time::now_secs();
 
-        let verifying_key = VerifyingKey::from_bytes(&pk_bytes).map_err(|e| {
-            ScpWasmError::validation(&format!(
-                "invalid signer public key for {}: {e}",
-                &profile.subject_did
-            ))
-        })?;
-
-        let sig_bytes: [u8; 64] = profile.signature.as_slice().try_into().map_err(|_| {
-            ScpWasmError::validation(&format!(
-                "signature must be 64 bytes, got {}",
-                profile.signature.len()
-            ))
-        })?;
-
-        let signature = Signature::from_bytes(&sig_bytes);
-        let signable = profile.signable_bytes();
-
-        verifying_key
-            .verify_strict(&signable, &signature)
-            .map_err(|e| {
-                ScpWasmError::validation(&format!(
-                    "participation profile signature verification failed for {}: {e}",
-                    &profile.subject_did
-                ))
-            })?;
-    }
-
-    // Step 2: Check each requirement independently.
-    // Current time in seconds since UNIX epoch (using js_sys::Date for WASM).
-    #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
-    let current_time = (js_sys::Date::now() / 1000.0) as u64;
-
-    for requirement in &requirements {
-        // Collect qualifying statements: fresh + threshold-satisfying.
-        // Mirrors scp-core's verify_participation_requirements step 2.
-        let mut distinct_signers = std::collections::HashSet::new();
-        let mut newest_updated_at: u64 = 0;
-        let mut any_fresh = false;
-
-        for profile in &profiles {
-            newest_updated_at = newest_updated_at.max(profile.updated_at);
-
-            // Freshness check.
-            let age = current_time.saturating_sub(profile.updated_at);
-            if age > requirement.max_age_secs {
-                continue;
-            }
-            any_fresh = true;
-
-            // Threshold check.
-            let value = requirement.fact.extract_value(profile);
-            if !requirement.threshold.is_satisfied(value) {
-                continue;
-            }
-
-            distinct_signers.insert(&profile.signer_public_key);
-        }
-
-        // If no statements were fresh enough, report staleness.
-        if !any_fresh && !profiles.is_empty() {
-            return Err(ScpWasmError::validation(&format!(
-                "participation admission verification failed: record too stale \
-                 (newest_updated_at={newest_updated_at}, current_time={current_time}, \
-                 max_age_secs={})",
-                requirement.max_age_secs
-            )));
-        }
-
-        // If no statements satisfied the threshold (but some were fresh),
-        // find the best value to report.
-        if distinct_signers.is_empty() {
-            let best_value = profiles
-                .iter()
-                .filter(|p| current_time.saturating_sub(p.updated_at) <= requirement.max_age_secs)
-                .map(|p| requirement.fact.extract_value(p))
-                .max()
-                .unwrap_or(0);
-
-            return Err(ScpWasmError::validation(&format!(
-                "participation admission verification failed: threshold not met (best value: {best_value})"
-            )));
-        }
-
-        // Check min_contexts.
-        #[allow(clippy::cast_possible_truncation)]
-        let found = distinct_signers.len() as u32;
-        if found < requirement.min_contexts {
-            return Err(ScpWasmError::validation(&format!(
-                "participation admission verification failed: need {} distinct source contexts, got {found}",
-                requirement.min_contexts,
-            )));
-        }
-    }
+    protocol_verify(current_time, &requirements, &profiles).map_err(|e| {
+        ScpWasmError::validation(&format!("participation admission verification failed: {e}"))
+    })?;
 
     Ok(true)
 }

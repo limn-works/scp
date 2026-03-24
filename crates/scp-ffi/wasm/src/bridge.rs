@@ -9,9 +9,10 @@
 //! # WASM constraints
 //!
 //! This bridge does NOT depend on `scp-core` (tokio multi-thread incompatible
-//! with `wasm32-unknown-unknown`). Bridge connector operations are
-//! re-implemented locally with algorithm-identical logic matching the
-//! PyO3/NAPI/UniFFI bridges — including governance DID validation and the
+//! with `wasm32-unknown-unknown`). Bridge types (`BridgeMode`,
+//! `ShadowProvenanceStatus`) are imported from `scp-protocol`. Bridge
+//! connector orchestration (registration, trust evaluation, shadow creation)
+//! remains WASM-local — including governance DID validation and the
 //! self-approval invariant (ADR-023).
 //!
 //! See spec section 12 (Bridge System) and ADR-023.
@@ -144,76 +145,54 @@ impl WasmShadowIdentity {
 }
 
 // ---------------------------------------------------------------------------
-// Local enums and helpers (mirror scp-core::bridge)
+// Bridge types imported from scp-protocol
 // ---------------------------------------------------------------------------
 
-/// Bridge operating modes (spec §12).
-///
-/// Mirrors `scp_core::bridge::BridgeMode`. Four variants:
-/// - `relay` — relays messages between platforms
-/// - `puppet` — acts on behalf of external users
-/// - `api` — programmatic API bridge
-/// - `cooperative` — two-way bridge with mutual trust
-#[derive(Debug, Clone, Copy)]
-enum BridgeMode {
-    Relay,
-    Puppet,
-    Api,
-    Cooperative,
-}
+use scp_protocol::bridge::{BridgeMode, ShadowProvenanceStatus};
 
-impl BridgeMode {
-    fn from_str(s: &str) -> Result<Self, ScpWasmError> {
-        match s {
-            "relay" => Ok(Self::Relay),
-            "puppet" => Ok(Self::Puppet),
-            "api" => Ok(Self::Api),
-            "cooperative" => Ok(Self::Cooperative),
-            other => Err(ScpWasmError::Validation {
-                message: format!(
-                    "invalid bridge mode '{other}': expected 'relay', 'puppet', 'api', or 'cooperative'"
-                ),
-                code: "SCP-VALID-7050".to_owned(),
-            }),
-        }
-    }
-
-    fn as_str(self) -> &'static str {
-        match self {
-            Self::Relay => "relay",
-            Self::Puppet => "puppet",
-            Self::Api => "api",
-            Self::Cooperative => "cooperative",
-        }
+/// Parses a lowercase bridge mode string from the JS JSON API.
+fn parse_bridge_mode(s: &str) -> Result<BridgeMode, ScpWasmError> {
+    match s {
+        "relay" => Ok(BridgeMode::Relay),
+        "puppet" => Ok(BridgeMode::Puppet),
+        "api" => Ok(BridgeMode::Api),
+        "cooperative" => Ok(BridgeMode::Cooperative),
+        other => Err(ScpWasmError::Validation {
+            message: format!(
+                "invalid bridge mode '{other}': expected 'relay', 'puppet', 'api', or 'cooperative'"
+            ),
+            code: "SCP-VALID-7050".to_owned(),
+        }),
     }
 }
 
-/// Shadow provenance status (spec §12).
-///
-/// Mirrors `scp_core::bridge::ShadowProvenanceStatus`.
-#[derive(Debug, Clone, Copy)]
-enum ShadowProvenanceStatus {
-    Shadow,
-    Claimed,
+/// Returns the lowercase string representation for a bridge mode.
+fn bridge_mode_as_str(mode: &BridgeMode) -> &'static str {
+    match mode {
+        BridgeMode::Relay => "relay",
+        BridgeMode::Puppet => "puppet",
+        BridgeMode::Api => "api",
+        BridgeMode::Cooperative => "cooperative",
+    }
 }
 
-impl ShadowProvenanceStatus {
-    fn from_str(s: &str) -> Result<Self, ScpWasmError> {
-        match s {
-            "shadow" => Ok(Self::Shadow),
-            "claimed" => Ok(Self::Claimed),
-            other => Err(ScpWasmError::Validation {
-                message: format!("invalid shadow_status '{other}': expected 'shadow' or 'claimed'"),
-                code: "SCP-VALID-7051".to_owned(),
-            }),
-        }
+/// Parses a lowercase shadow provenance status string from the JS JSON API.
+fn parse_shadow_status(s: &str) -> Result<ShadowProvenanceStatus, ScpWasmError> {
+    match s {
+        "shadow" => Ok(ShadowProvenanceStatus::Shadow),
+        "claimed" => Ok(ShadowProvenanceStatus::Claimed),
+        other => Err(ScpWasmError::Validation {
+            message: format!("invalid shadow_status '{other}': expected 'shadow' or 'claimed'"),
+            code: "SCP-VALID-7051".to_owned(),
+        }),
     }
+}
 
-    fn as_str(self) -> &'static str {
-        match self {
-            Self::Shadow => "Shadow",
-            Self::Claimed => "Claimed",
-        }
+/// Returns the `PascalCase` string representation for a shadow provenance status.
+fn shadow_status_as_str(status: &ShadowProvenanceStatus) -> &'static str {
+    match status {
+        ShadowProvenanceStatus::Shadow => "Shadow",
+        ShadowProvenanceStatus::Claimed => "Claimed",
     }
 }
 
@@ -269,7 +248,7 @@ pub fn bridge_evaluate_trust(
 ) -> Result<u32, JsError> {
     // Validate shadow_status upfront (even if not used when !is_bridged),
     // matching the NAPI bridge which always validates the parameter.
-    let status = ShadowProvenanceStatus::from_str(&shadow_status).map_err(ScpWasmError::into_js)?;
+    let status = parse_shadow_status(&shadow_status).map_err(ScpWasmError::into_js)?;
 
     let level = if is_bridged {
         // Bridged identity — trust depends on shadow status.
@@ -366,7 +345,7 @@ pub fn bridge_register(
         .into_js());
     }
 
-    let bridge_mode = BridgeMode::from_str(&mode).map_err(ScpWasmError::into_js)?;
+    let bridge_mode = parse_bridge_mode(&mode).map_err(ScpWasmError::into_js)?;
 
     // Bridge ID per spec §12.2.1: SHA-256(context_id || operator_did || platform || timestamp).
     // Uses current timestamp for uniqueness. Hex-encoded for readability.
@@ -404,7 +383,7 @@ pub fn bridge_register(
         bridge_id,
         operator_did,
         platform,
-        mode: bridge_mode.as_str().to_owned(),
+        mode: bridge_mode_as_str(&bridge_mode).to_owned(),
         status: "active".to_owned(),
         context_id,
     })
@@ -464,7 +443,7 @@ pub fn bridge_create_shadow(
 
     // Validate bridge mode (ensures the mode string is valid even though
     // we don't use the parsed value for shadow creation logic).
-    let _mode = BridgeMode::from_str(&bridge_mode).map_err(ScpWasmError::into_js)?;
+    let _mode = parse_bridge_mode(&bridge_mode).map_err(ScpWasmError::into_js)?;
 
     // Default to "ctx-shadow" when context_id is None, matching the NAPI
     // bridge's `context_id.unwrap_or_else(|| "ctx-shadow".to_string())`.
@@ -481,7 +460,7 @@ pub fn bridge_create_shadow(
         bridge_id,
         context_id: ctx_id,
         attributed_role: "observer".to_owned(),
-        provenance_status: ShadowProvenanceStatus::Shadow.as_str().to_owned(),
+        provenance_status: shadow_status_as_str(&ShadowProvenanceStatus::Shadow).to_owned(),
     })
 }
 
@@ -504,27 +483,27 @@ mod tests {
             ("api", "api"),
             ("cooperative", "cooperative"),
         ] {
-            let mode = BridgeMode::from_str(s).unwrap();
-            assert_eq!(mode.as_str(), expected);
+            let mode = parse_bridge_mode(s).unwrap();
+            assert_eq!(bridge_mode_as_str(&mode), expected);
         }
     }
 
     #[test]
     fn bridge_mode_invalid() {
-        assert!(BridgeMode::from_str("invalid").is_err());
+        assert!(parse_bridge_mode("invalid").is_err());
     }
 
     #[test]
     fn shadow_status_roundtrip() {
-        let s = ShadowProvenanceStatus::from_str("shadow").unwrap();
-        assert_eq!(s.as_str(), "Shadow");
-        let c = ShadowProvenanceStatus::from_str("claimed").unwrap();
-        assert_eq!(c.as_str(), "Claimed");
+        let s = parse_shadow_status("shadow").unwrap();
+        assert_eq!(shadow_status_as_str(&s), "Shadow");
+        let c = parse_shadow_status("claimed").unwrap();
+        assert_eq!(shadow_status_as_str(&c), "Claimed");
     }
 
     #[test]
     fn shadow_status_invalid() {
-        assert!(ShadowProvenanceStatus::from_str("invalid").is_err());
+        assert!(parse_shadow_status("invalid").is_err());
     }
 
     #[test]

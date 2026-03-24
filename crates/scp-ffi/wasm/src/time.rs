@@ -72,3 +72,27 @@ pub fn now_ms_u64() -> u64 {
 pub fn now_secs() -> u64 {
     now_ms_u64() / 1000
 }
+
+// ---------------------------------------------------------------------------
+// WasmClock — Clock trait adapter for WASM
+// ---------------------------------------------------------------------------
+
+/// WASM clock implementation that uses the captured `Date.now()` reference.
+///
+/// Implements `scp_protocol::time::Clock` so that protocol functions requiring
+/// a clock (UCAN validation, handle registration, rate limiting) can use the
+/// hardened WASM time source.
+///
+/// For native test targets, the underlying `now_secs()` / `now_ms_u64()`
+/// functions fall back to `SystemTime` to avoid requiring the WASM JS runtime.
+pub(crate) struct WasmClock;
+
+impl scp_protocol::time::Clock for WasmClock {
+    fn now_secs(&self) -> u64 {
+        super::time::now_secs()
+    }
+
+    fn now_millis(&self) -> u64 {
+        super::time::now_ms_u64()
+    }
+}

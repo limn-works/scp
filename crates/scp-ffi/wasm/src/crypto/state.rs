@@ -112,14 +112,14 @@ impl WasmCryptoState {
             WasmCryptoError::SenderKeyError(format!("no sender key for DID '{sender_did}'"))
         })?;
 
-        decrypt_sender_layer(
+        Ok(decrypt_sender_layer(
             sender_key,
             &mls_decrypted,
             context_id,
             sender_did,
             epoch,
             sequence,
-        )
+        )?)
     }
 
     /// Destroys all crypto state (MLS group + sender keys).

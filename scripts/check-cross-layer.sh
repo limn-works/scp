@@ -60,12 +60,14 @@ fi
 
 CURRENT_FILE=""
 IN_CFG_TEST=0
+IN_IMPL=0
 
 while IFS= read -r line; do
     # Track which file we're in — parse both paths from git diff header
     if [[ "$line" =~ ^diff\ --git\ a/([^\ ]+)\ b/(.+)$ ]]; then
         CURRENT_FILE="${BASH_REMATCH[2]}"
         IN_CFG_TEST=0
+        IN_IMPL=0
         continue
     fi
 
@@ -74,12 +76,22 @@ while IFS= read -r line; do
         */tests/*|*/examples/*) continue ;;
     esac
 
-    # Hunk headers: detect #[cfg(test)] in context
+    # Hunk headers: detect #[cfg(test)] and impl blocks in context
+    # Git hunk headers show the enclosing scope after the second @@:
+    #   @@ -100,5 +100,7 @@ impl ToolRegistry {
     if [[ "$line" =~ ^@@.*@@ ]]; then
         if [[ "$line" == *"cfg(test)"* ]]; then
             IN_CFG_TEST=1
         else
             IN_CFG_TEST=0
+        fi
+        # Detect impl blocks — methods on types are internal API, not standalone
+        # protocol functions that need individual FFI exports. The type itself
+        # is consumed by bridges through existing FFI functions.
+        if [[ "$line" == *"impl "* ]]; then
+            IN_IMPL=1
+        else
+            IN_IMPL=0
         fi
         continue
     fi
@@ -93,6 +105,9 @@ while IFS= read -r line; do
     # Only look at added lines
     [[ "$line" == "+"* ]] || continue
     [[ $IN_CFG_TEST -eq 0 ]] || continue
+    # Skip methods inside impl blocks — they're consumed through the type,
+    # not as standalone FFI exports
+    [[ $IN_IMPL -eq 0 ]] || continue
 
     content="${line:1}"
 
@@ -103,6 +118,9 @@ while IFS= read -r line; do
     # Match pub fn or pub async fn declarations
     if [[ "$content" =~ pub[[:space:]]+(async[[:space:]]+)?fn[[:space:]]+([a-zA-Z_][a-zA-Z0-9_]*) ]]; then
         fn_name="${BASH_REMATCH[2]}"
+        # Skip serde helper functions — these are pub for #[serde(with = "...")]
+        # but are not protocol operations that need FFI exports.
+        [[ "$fn_name" != "serialize" && "$fn_name" != "deserialize" ]] || continue
         NEW_PUB_FNS+=("${CURRENT_FILE}::${fn_name}")
         NEW_PUB_FN_NAMES+=("${fn_name}")
         NEW_PUB_FN_FILES+=("${CURRENT_FILE}")
