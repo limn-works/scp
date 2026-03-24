@@ -588,7 +588,16 @@ pub fn context_member_role(handle: &WasmContextHandle, did: String) -> Option<St
 pub fn context_drain_events(handle: &WasmContextHandle) -> String {
     let context_id = handle.context_id();
     let events = with_manager(|mgr| Ok(mgr.drain_events(&context_id))).unwrap_or_default();
-    serde_json::to_string(&events).unwrap_or_else(|_| "[]".to_owned())
+    // Convert serde's externally-tagged PascalCase to JS-idiomatic camelCase.
+    // E.g. {"MemberJoined": {"member_did": "..."}} → {"type": "memberJoined", "member_did": "..."}
+    let mut json_events: Vec<serde_json::Value> = events
+        .iter()
+        .filter_map(|e| serde_json::to_value(e).ok())
+        .collect();
+    for event in &mut json_events {
+        serde_to_js_event(event);
+    }
+    serde_json::to_string(&json_events).unwrap_or_else(|_| "[]".to_owned())
 }
 
 // ---------------------------------------------------------------------------
@@ -628,7 +637,24 @@ pub fn context_execute_governance(
     let context_id = handle.context_id();
 
     future_to_promise(async move {
-        let action: GovernanceAction = serde_json::from_str(&action_json).map_err(|e| {
+        // Parse and convert JS-idiomatic camelCase to serde's externally-tagged format.
+        // E.g. {"type": "addMember", "did": "d", "role": "r"} → {"AddMember": {"did": "d", "role": "r"}}
+        let mut action_value: serde_json::Value =
+            serde_json::from_str(&action_json).map_err(|e| {
+                ScpWasmError::Validation {
+                    message: format!("action_json is not valid JSON: {e}"),
+                    code: "SCP-VALID-7000".to_owned(),
+                }
+                .into_js()
+            })?;
+        js_to_serde_governance_action(&mut action_value).map_err(|e| {
+            ScpWasmError::Validation {
+                message: format!("action_json is not valid: {e}"),
+                code: "SCP-VALID-7000".to_owned(),
+            }
+            .into_js()
+        })?;
+        let action: GovernanceAction = serde_json::from_value(action_value).map_err(|e| {
             ScpWasmError::Validation {
                 message: format!("action_json is not valid: {e}"),
                 code: "SCP-VALID-7000".to_owned(),
@@ -687,7 +713,23 @@ pub fn context_governance_propose(
     let context_id = handle.context_id();
 
     future_to_promise(async move {
-        let action: GovernanceAction = serde_json::from_str(&action_json).map_err(|e| {
+        // Parse and convert JS-idiomatic camelCase to serde's externally-tagged format.
+        let mut action_value: serde_json::Value =
+            serde_json::from_str(&action_json).map_err(|e| {
+                ScpWasmError::Validation {
+                    message: format!("action_json is not valid JSON: {e}"),
+                    code: "SCP-CTX-2040".to_owned(),
+                }
+                .into_js()
+            })?;
+        js_to_serde_governance_action(&mut action_value).map_err(|e| {
+            ScpWasmError::Validation {
+                message: format!("action_json is not valid: {e}"),
+                code: "SCP-CTX-2040".to_owned(),
+            }
+            .into_js()
+        })?;
+        let action: GovernanceAction = serde_json::from_value(action_value).map_err(|e| {
             ScpWasmError::Validation {
                 message: format!("action_json is not valid: {e}"),
                 code: "SCP-CTX-2040".to_owned(),
@@ -2532,6 +2574,104 @@ fn check_auto_accept(
 }
 
 // ---------------------------------------------------------------------------
+// JSON enum normalization (externally-tagged PascalCase <-> JS-idiomatic camelCase)
+// ---------------------------------------------------------------------------
+
+/// Converts JS-idiomatic governance action JSON to serde's externally-tagged format.
+///
+/// JS consumers send `{"type": "addMember", "did": "d", "role": "r"}`.
+/// serde's default format is `{"AddMember": {"did": "d", "role": "r"}}`.
+/// This conversion bridges the two at the FFI boundary without modifying
+/// the protocol types' serde attributes.
+fn js_to_serde_governance_action(value: &mut serde_json::Value) -> Result<(), String> {
+    let obj = value
+        .as_object_mut()
+        .ok_or_else(|| "expected JSON object".to_owned())?;
+    let variant = obj
+        .remove("type")
+        .and_then(|v| v.as_str().map(String::from))
+        .ok_or_else(|| "missing 'type' field".to_owned())?;
+    // Convert camelCase to PascalCase: "addMember" → "AddMember"
+    let pascal = camel_to_pascal(&variant);
+    if obj.is_empty() {
+        // Unit variant: serde expects a bare string like `"PromoteContext"`.
+        *value = serde_json::Value::String(pascal);
+    } else {
+        // Struct variant: remaining fields become the inner object.
+        let inner = serde_json::Value::Object(obj.clone());
+        obj.clear();
+        obj.insert(pascal, inner);
+    }
+    Ok(())
+}
+
+/// Converts serde's externally-tagged enum to JS-idiomatic format.
+///
+/// serde output: `{"MemberJoined": {"did": "..."}}` or `"Expired"` (unit variant).
+/// JS output:    `{"type": "memberJoined", "did": "..."}` or `{"type": "expired"}`.
+fn serde_to_js_event(value: &mut serde_json::Value) {
+    // Handle string values (unit variants serialized as bare strings).
+    if let Some(s) = value.as_str().map(String::from) {
+        let camel = pascal_to_camel(&s);
+        let mut map = serde_json::Map::new();
+        map.insert("type".to_owned(), serde_json::Value::String(camel));
+        *value = serde_json::Value::Object(map);
+        return;
+    }
+
+    if let Some(obj) = value.as_object_mut() {
+        // Externally-tagged: single-key object like {"MemberJoined": {...}}
+        if let Some((variant_name, inner)) = obj.iter().next().map(|(k, v)| (k.clone(), v.clone()))
+        {
+            let camel = pascal_to_camel(&variant_name);
+            obj.clear();
+            obj.insert("type".to_owned(), serde_json::Value::String(camel));
+            if let Some(inner_obj) = inner.as_object() {
+                for (k, v) in inner_obj {
+                    obj.insert(k.clone(), v.clone());
+                }
+            }
+        }
+    }
+}
+
+/// Converts `PascalCase` to `camelCase`: `"MemberJoined"` → `"memberJoined"`.
+///
+/// Only lowercases the first character. Multi-char uppercase prefixes
+/// (e.g., `"TTLExpired"`) become `"tTLExpired"` — this is intentional to
+/// preserve a simple, reversible mapping. Protocol variants use standard
+/// `PascalCase` with single uppercase initial.
+fn pascal_to_camel(s: &str) -> String {
+    let mut result = String::with_capacity(s.len());
+    for (i, ch) in s.chars().enumerate() {
+        if i == 0 {
+            result.extend(ch.to_lowercase());
+        } else {
+            result.push(ch);
+        }
+    }
+    result
+}
+
+/// Converts `camelCase` to `PascalCase`: `"addMember"` → `"AddMember"`.
+///
+/// Only uppercases the first character. This is the inverse of
+/// [`pascal_to_camel`].
+fn camel_to_pascal(s: &str) -> String {
+    let mut result = String::with_capacity(s.len());
+    let mut capitalize_next = true;
+    for ch in s.chars() {
+        if capitalize_next {
+            result.extend(ch.to_uppercase());
+            capitalize_next = false;
+        } else {
+            result.push(ch);
+        }
+    }
+    result
+}
+
+// ---------------------------------------------------------------------------
 // JSON field name normalization (snake_case <-> camelCase)
 // ---------------------------------------------------------------------------
 
@@ -2900,5 +3040,154 @@ mod tests {
             ),
             "expected SCP-VALID-7002 validation error"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // pascal_to_camel / camel_to_pascal conversion tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn pascal_to_camel_basic() {
+        assert_eq!(pascal_to_camel("AddMember"), "addMember");
+        assert_eq!(pascal_to_camel("MemberJoined"), "memberJoined");
+        assert_eq!(pascal_to_camel("Expired"), "expired");
+        assert_eq!(pascal_to_camel("A"), "a");
+        assert_eq!(pascal_to_camel(""), "");
+    }
+
+    #[test]
+    fn camel_to_pascal_basic() {
+        assert_eq!(camel_to_pascal("addMember"), "AddMember");
+        assert_eq!(camel_to_pascal("memberJoined"), "MemberJoined");
+        assert_eq!(camel_to_pascal("expired"), "Expired");
+        assert_eq!(camel_to_pascal("a"), "A");
+        assert_eq!(camel_to_pascal(""), "");
+    }
+
+    #[test]
+    fn pascal_camel_roundtrip() {
+        let variants = [
+            "AddMember",
+            "RemoveMember",
+            "ChangeRole",
+            "RegisterTool",
+            "RemoveTool",
+            "ModifyCeiling",
+            "CloseContext",
+            "ExtendTtl",
+            "PromoteContext",
+            "MemberJoined",
+            "MemberLeft",
+            "MessageSent",
+            "SystemClose",
+            "Expired",
+            "BufferOverflow",
+            "GovernanceActionExecuted",
+        ];
+        for v in &variants {
+            let camel = pascal_to_camel(v);
+            let back = camel_to_pascal(&camel);
+            assert_eq!(&back, v, "roundtrip failed for {v}");
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // js_to_serde_governance_action tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn js_to_serde_governance_action_add_member() {
+        let mut val =
+            serde_json::json!({"type": "addMember", "did": "did:dht:test", "role": "member"});
+        js_to_serde_governance_action(&mut val).unwrap();
+        assert_eq!(
+            val,
+            serde_json::json!({"AddMember": {"did": "did:dht:test", "role": "member"}})
+        );
+        // Verify it deserializes into the actual GovernanceAction type.
+        let action: GovernanceAction = serde_json::from_value(val).unwrap();
+        assert_eq!(action.variant_name(), "AddMember");
+    }
+
+    #[test]
+    fn js_to_serde_governance_action_unit_variant() {
+        let mut val = serde_json::json!({"type": "promoteContext"});
+        js_to_serde_governance_action(&mut val).unwrap();
+        // Unit variants in serde's externally-tagged format are bare strings.
+        assert_eq!(val, serde_json::json!("PromoteContext"));
+        let action: GovernanceAction = serde_json::from_value(val).unwrap();
+        assert_eq!(action.variant_name(), "PromoteContext");
+    }
+
+    #[test]
+    fn js_to_serde_governance_action_missing_type() {
+        let mut val = serde_json::json!({"did": "did:dht:test"});
+        let err = js_to_serde_governance_action(&mut val).unwrap_err();
+        assert!(err.contains("missing 'type' field"), "got: {err}");
+    }
+
+    #[test]
+    fn js_to_serde_governance_action_not_object() {
+        let mut val = serde_json::json!("notAnObject");
+        let err = js_to_serde_governance_action(&mut val).unwrap_err();
+        assert!(err.contains("expected JSON object"), "got: {err}");
+    }
+
+    // -----------------------------------------------------------------------
+    // serde_to_js_event tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn serde_to_js_event_struct_variant() {
+        let mut val = serde_json::json!({"MemberJoined": {"member_did": "did:dht:abc", "role_name": "member"}});
+        serde_to_js_event(&mut val);
+        assert_eq!(val["type"], "memberJoined");
+        assert_eq!(val["member_did"], "did:dht:abc");
+        assert_eq!(val["role_name"], "member");
+        assert!(
+            val.get("MemberJoined").is_none(),
+            "PascalCase key should be removed"
+        );
+    }
+
+    #[test]
+    fn serde_to_js_event_unit_variant() {
+        // Unit variants serialize as bare strings in serde's default format.
+        let mut val = serde_json::json!("Expired");
+        serde_to_js_event(&mut val);
+        assert_eq!(val, serde_json::json!({"type": "expired"}));
+    }
+
+    #[test]
+    fn serde_to_js_event_roundtrip_with_real_type() {
+        use scp_protocol::context::membership::ContextEvent;
+        let event = ContextEvent::MemberLeft {
+            member_did: "did:dht:left".into(),
+        };
+        let mut val = serde_json::to_value(&event).unwrap();
+        serde_to_js_event(&mut val);
+        assert_eq!(val["type"], "memberLeft");
+        assert_eq!(val["member_did"], "did:dht:left");
+    }
+
+    #[test]
+    fn serde_to_js_event_system_close() {
+        use scp_protocol::context::membership::ContextEvent;
+        let event = ContextEvent::SystemClose {
+            initiator_did: "did:dht:closer".into(),
+        };
+        let mut val = serde_json::to_value(&event).unwrap();
+        serde_to_js_event(&mut val);
+        assert_eq!(val["type"], "systemClose");
+        assert_eq!(val["initiator_did"], "did:dht:closer");
+    }
+
+    #[test]
+    fn serde_to_js_event_expired() {
+        use scp_protocol::context::membership::ContextEvent;
+        let event = ContextEvent::Expired;
+        let mut val = serde_json::to_value(&event).unwrap();
+        serde_to_js_event(&mut val);
+        assert_eq!(val, serde_json::json!({"type": "expired"}));
     }
 }

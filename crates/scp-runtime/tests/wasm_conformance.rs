@@ -2144,6 +2144,222 @@ fn template_params_json_uses_camel_case_field_names() {
     );
 }
 
+// ===========================================================================
+// GovernanceAction JS-idiomatic camelCase serialization conformance
+// ===========================================================================
+
+/// Verifies GovernanceAction deserializes from JS-idiomatic camelCase format.
+///
+/// JS consumers send `{"type": "addMember", "did": "d", "role": "r"}`.
+/// The WASM bridge converts to serde's externally-tagged format before
+/// deserializing: `{"AddMember": {"did": "d", "role": "r"}}`.
+#[test]
+fn governance_action_from_js_camel_case_format() {
+    use scp_protocol::context::governance::GovernanceAction;
+
+    // Helper: simulate the WASM bridge conversion (camelCase → PascalCase externally-tagged).
+    fn js_to_serde(value: &mut serde_json::Value) {
+        let obj = value.as_object_mut().unwrap();
+        let variant = obj
+            .remove("type")
+            .and_then(|v| v.as_str().map(String::from))
+            .unwrap();
+        // camelCase → PascalCase: uppercase first char
+        let pascal = {
+            let mut r = String::with_capacity(variant.len());
+            let mut first = true;
+            for ch in variant.chars() {
+                if first {
+                    r.extend(ch.to_uppercase());
+                    first = false;
+                } else {
+                    r.push(ch);
+                }
+            }
+            r
+        };
+        if obj.is_empty() {
+            // Unit variant: serde expects a bare string.
+            *value = serde_json::Value::String(pascal);
+        } else {
+            // Struct variant: wrap remaining fields.
+            let inner = serde_json::Value::Object(obj.clone());
+            obj.clear();
+            obj.insert(pascal, inner);
+        }
+    }
+
+    // Test struct variants with fields.
+    let test_cases: Vec<(serde_json::Value, &str)> = vec![
+        (
+            serde_json::json!({"type": "addMember", "did": "did:dht:z1", "role": "member"}),
+            "AddMember",
+        ),
+        (
+            serde_json::json!({"type": "removeMember", "did": "did:dht:z2", "reason": null}),
+            "RemoveMember",
+        ),
+        (
+            serde_json::json!({"type": "changeRole", "did": "did:dht:z3", "new_role": "admin"}),
+            "ChangeRole",
+        ),
+        (
+            serde_json::json!({"type": "closeContext", "reason": "done"}),
+            "CloseContext",
+        ),
+        (
+            serde_json::json!({"type": "extendTtl", "additional_secs": 3600}),
+            "ExtendTtl",
+        ),
+        (
+            serde_json::json!({"type": "transferAdmin", "new_admin": "did:dht:z4"}),
+            "TransferAdmin",
+        ),
+    ];
+
+    for (mut js_val, expected_variant) in test_cases {
+        js_to_serde(&mut js_val);
+        let action: GovernanceAction = serde_json::from_value(js_val.clone()).unwrap_or_else(|e| {
+            panic!("failed to deserialize {expected_variant}: {e} from {js_val}")
+        });
+        assert_eq!(
+            action.variant_name(),
+            expected_variant,
+            "variant mismatch for JS input"
+        );
+    }
+
+    // Unit variants: empty inner object.
+    let mut unit_val = serde_json::json!({"type": "promoteContext"});
+    js_to_serde(&mut unit_val);
+    let action: GovernanceAction = serde_json::from_value(unit_val).unwrap();
+    assert_eq!(action.variant_name(), "PromoteContext");
+
+    let mut lock_val = serde_json::json!({"type": "lockEconomicPolicy"});
+    js_to_serde(&mut lock_val);
+    let action: GovernanceAction = serde_json::from_value(lock_val).unwrap();
+    assert_eq!(action.variant_name(), "LockEconomicPolicy");
+
+    let mut cancel_val = serde_json::json!({"type": "cancelContextMigration"});
+    js_to_serde(&mut cancel_val);
+    let action: GovernanceAction = serde_json::from_value(cancel_val).unwrap();
+    assert_eq!(action.variant_name(), "CancelContextMigration");
+}
+
+/// Verifies ContextEvent serializes to JS-idiomatic camelCase format.
+///
+/// serde default: `{"MemberJoined": {"member_did": "..."}}` or `"Expired"`.
+/// JS-idiomatic:  `{"type": "memberJoined", "member_did": "..."}` or `{"type": "expired"}`.
+#[test]
+fn context_event_to_js_camel_case_format() {
+    use scp_protocol::context::membership::ContextEvent;
+
+    // Helper: simulate the WASM bridge conversion (externally-tagged → JS camelCase).
+    fn serde_to_js(value: &mut serde_json::Value) {
+        // Handle string values (unit variants).
+        if let Some(s) = value.as_str().map(String::from) {
+            let camel = {
+                let mut r = String::with_capacity(s.len());
+                for (i, ch) in s.chars().enumerate() {
+                    if i == 0 {
+                        r.extend(ch.to_lowercase());
+                    } else {
+                        r.push(ch);
+                    }
+                }
+                r
+            };
+            let mut map = serde_json::Map::new();
+            map.insert("type".to_owned(), serde_json::Value::String(camel));
+            *value = serde_json::Value::Object(map);
+            return;
+        }
+
+        if let Some(obj) = value.as_object_mut() {
+            if let Some((variant_name, inner)) =
+                obj.iter().next().map(|(k, v)| (k.clone(), v.clone()))
+            {
+                let camel = {
+                    let mut r = String::with_capacity(variant_name.len());
+                    for (i, ch) in variant_name.chars().enumerate() {
+                        if i == 0 {
+                            r.extend(ch.to_lowercase());
+                        } else {
+                            r.push(ch);
+                        }
+                    }
+                    r
+                };
+                obj.clear();
+                obj.insert("type".to_owned(), serde_json::Value::String(camel));
+                if let Some(inner_obj) = inner.as_object() {
+                    for (k, v) in inner_obj {
+                        obj.insert(k.clone(), v.clone());
+                    }
+                }
+            }
+        }
+    }
+
+    // Struct variants.
+    let event = ContextEvent::MemberJoined {
+        member_did: "did:dht:joined".into(),
+        role_name: "member".into(),
+    };
+    let mut val = serde_json::to_value(&event).unwrap();
+    serde_to_js(&mut val);
+    assert_eq!(val["type"], "memberJoined");
+    assert_eq!(val["member_did"], "did:dht:joined");
+    assert_eq!(val["role_name"], "member");
+    assert!(
+        val.get("MemberJoined").is_none(),
+        "PascalCase key must be removed"
+    );
+
+    let event = ContextEvent::MemberLeft {
+        member_did: "did:dht:left".into(),
+    };
+    let mut val = serde_json::to_value(&event).unwrap();
+    serde_to_js(&mut val);
+    assert_eq!(val["type"], "memberLeft");
+    assert_eq!(val["member_did"], "did:dht:left");
+
+    let event = ContextEvent::SystemClose {
+        initiator_did: "did:dht:closer".into(),
+    };
+    let mut val = serde_json::to_value(&event).unwrap();
+    serde_to_js(&mut val);
+    assert_eq!(val["type"], "systemClose");
+    assert_eq!(val["initiator_did"], "did:dht:closer");
+
+    // Unit variant.
+    let event = ContextEvent::Expired;
+    let mut val = serde_json::to_value(&event).unwrap();
+    serde_to_js(&mut val);
+    assert_eq!(val, serde_json::json!({"type": "expired"}));
+
+    // BufferOverflow with numeric field.
+    let event = ContextEvent::BufferOverflow { dropped_count: 5 };
+    let mut val = serde_json::to_value(&event).unwrap();
+    serde_to_js(&mut val);
+    assert_eq!(val["type"], "bufferOverflow");
+    assert_eq!(val["dropped_count"], 5);
+
+    // GovernanceActionExecuted with complex fields.
+    let event = ContextEvent::GovernanceActionExecuted {
+        proposal_id: [0u8; 32],
+        action_summary: "AddMember".into(),
+        executor_did: "did:dht:admin".into(),
+        resulting_epoch: Some(42),
+    };
+    let mut val = serde_json::to_value(&event).unwrap();
+    serde_to_js(&mut val);
+    assert_eq!(val["type"], "governanceActionExecuted");
+    assert_eq!(val["action_summary"], "AddMember");
+    assert_eq!(val["executor_did"], "did:dht:admin");
+    assert_eq!(val["resulting_epoch"], 42);
+}
+
 /// Verifies that `SourceType` string representation uses exact expected values
 /// for wire format stability (used in JSON responses and canonical hashing).
 #[test]
