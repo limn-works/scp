@@ -621,7 +621,7 @@ pub trait ContextPersistence: Send + Sync {
 /// Governance-related per-context state.
 struct GovernanceState {
     /// The governance engine for this context (ADR-031, spec §5.9).
-    governance_engine: Box<dyn GovernanceEngine>,
+    engine: Box<dyn GovernanceEngine>,
     /// Proposal IDs that have already been executed, mapped to the unix
     /// timestamp (seconds) when they were marked executed. Prevents replay of
     /// approved governance proposals (defense-in-depth). Entries older than
@@ -632,11 +632,11 @@ struct GovernanceState {
     approved_proposals: HashMap<ProposalId, (GovernanceProposal, u64, u64)>,
     /// Governance freeze state due to simultaneous conflicts (ADR-031 §7).
     /// Contains the conflicting proposal IDs and freeze start timestamp.
-    governance_freeze: Option<(ProposalId, ProposalId, u64)>,
+    freeze: Option<(ProposalId, ProposalId, u64)>,
     /// Governance timeout task (SCP-271, ADR-031 §5).
-    governance_timeout_task: GovernanceTimeoutTask,
+    timeout_task: GovernanceTimeoutTask,
     /// Per-context deadlock detection tracking (ADR-031 §10).
-    deadlock_detection_state: DeadlockDetectionState,
+    deadlock: DeadlockDetectionState,
     /// Governance threshold signers (for `ThresholdApproval` model).
     threshold_signers: Vec<DID>,
     /// Governance threshold value (quorum requirement).
@@ -657,6 +657,14 @@ struct GovernanceState {
     /// (§19.5, ADR-033). Grants are recorded via `ApproveSpend` governance
     /// actions and tracked here. Persisted in [`ContextSnapshot`].
     budget_tracker: MemberBudgetTracker,
+    /// Last known member set for departure detection in the timeout loop.
+    /// Compared each tick to the current member set to identify departures.
+    last_known_members: HashSet<DID>,
+    /// Members who have undergone a governance-triggered epoch reset
+    /// (`ResetMember`, ADR-029 Tier 3) since the last timeout tick.
+    /// Drained each tick and passed to `process_pending_proposals` so
+    /// their votes on pending proposals are invalidated (ADR-031 §5).
+    pending_epoch_resets: Vec<DID>,
 }
 
 /// MLS epoch and reconnection state.
@@ -672,7 +680,7 @@ struct EpochState {
     /// Records the auditable link between governance proposal approvals and
     /// resulting MLS epoch advances. Instantiated per context and updated
     /// after each membership-affecting governance action execution.
-    epoch_coordinator: EpochCoordinator,
+    coordinator: EpochCoordinator,
     /// Epoch grace window store (§23.11).
     ///
     /// Tracks which old epochs are still within their grace window after
@@ -699,18 +707,15 @@ struct AccessControlState {
     /// Members excluded from future CEK wrapping (`FutureOnly` read revocation,
     /// ADR-038, §9.17). Subset of or equal to `read_revoked_members`.
     read_exclusion_list: HashSet<DID>,
-    /// Active migration state (§5.11A). `Some` when the context is in
-    /// `MigratingOut` state. `None` otherwise.
-    migration_state: Option<MigrationState>,
 }
 
 /// TTL timer and extension state.
 struct TtlState {
     /// TTL timer management (SCP-021).
-    ttl_timer: TtlTimer,
+    timer: TtlTimer,
     /// Active TTL extension proposal, if any (SCP-021).
     #[allow(dead_code)]
-    ttl_extension: Option<TtlExtension>,
+    extension: Option<TtlExtension>,
 }
 
 /// Internal state tracked by the manager for each context.
@@ -727,19 +732,14 @@ struct PerContextState {
     /// `None` for `ContextMode::Encrypted`. Broadcast contexts do not use MLS;
     /// they use per-author AES-256-GCM keys managed by [`BroadcastContext`].
     broadcast_context: Option<BroadcastContext>,
-    /// Last known member set for departure detection in the timeout loop.
-    /// Compared each tick to the current member set to identify departures.
-    last_known_members: HashSet<DID>,
-    /// Members who have undergone a governance-triggered epoch reset
-    /// (`ResetMember`, ADR-029 Tier 3) since the last timeout tick.
-    /// Drained each tick and passed to `process_pending_proposals` so
-    /// their votes on pending proposals are invalidated (ADR-031 §5).
-    pending_epoch_resets: Vec<DID>,
+    /// Active migration state (§5.11A). `Some` when the context is in
+    /// `MigratingOut` state. `None` otherwise.
+    migration_state: Option<MigrationState>,
     /// Governance-related state (ADR-031).
     governance: GovernanceState,
     /// MLS epoch and reconnection state.
     epoch: EpochState,
-    /// Write/read revocation and context migration state.
+    /// Write/read revocation state.
     access: AccessControlState,
     /// TTL timer and extension state (SCP-021).
     ttl: TtlState,
@@ -1623,7 +1623,7 @@ impl ContextManager {
     /// Must be called while the contexts mutex is held (snapshot under lock).
     fn snapshot_context(ctx: &PerContextState) -> ContextSnapshot {
         let state = ctx.handle.try_read_state().unwrap_or(ContextState::Active);
-        let ttl_remaining_secs = ctx.ttl.ttl_timer.remaining_secs();
+        let ttl_remaining_secs = ctx.ttl.timer.remaining_secs();
         // Capture grace entries for transactional persistence (§23.11).
         // On clock error, persist an empty vec — the recovery path will
         // treat the missing entries as expired (conservative: forward secrecy
@@ -1646,21 +1646,21 @@ impl ContextManager {
             threshold_signers: ctx.governance.threshold_signers.clone(),
             threshold_value: ctx.governance.threshold_value,
             pruning_policy: ctx.governance.pruning_policy.clone(),
-            governance_model_config: Some(ctx.governance.governance_engine.model_config()),
+            governance_model_config: Some(ctx.governance.engine.model_config()),
             economic_policy: ctx.governance.economic_policy.clone(),
             budget_tracker: ctx.governance.budget_tracker.clone(),
             approved_proposals: ctx.governance.approved_proposals.clone(),
-            governance_freeze: ctx.governance.governance_freeze,
+            governance_freeze: ctx.governance.freeze,
             pending_ceiling_modification: ctx.governance.pending_ceiling_modification.clone(),
             pending_economic_policy_change: ctx.governance.pending_economic_policy_change.clone(),
             mls_epoch: ctx.epoch.mls_epoch,
-            epoch_coordination_records: ctx.epoch.epoch_coordinator.records().to_vec(),
+            epoch_coordination_records: ctx.epoch.coordinator.records().to_vec(),
             grace_entries,
             needs_reconnect: ctx.epoch.needs_reconnect,
             // MLS crypto state is populated in `persist_context_snapshot`
             // where the crypto provider is available. Initialized empty here.
             mls_crypto_state: Vec::new(),
-            migration_state: ctx.access.migration_state.clone(),
+            migration_state: ctx.migration_state.clone(),
         }
     }
 
@@ -1780,10 +1780,9 @@ impl ContextManager {
             role_state: ctx_snapshot.role_state,
             receive_buffer: ReceiveBuffer::new(),
             broadcast_context: broadcast_ctx,
-            last_known_members: initial_members,
-            pending_epoch_resets: Vec::new(),
+            migration_state: ctx_snapshot.migration_state,
             governance: GovernanceState {
-                governance_engine,
+                engine: governance_engine,
                 executed_proposals: {
                     let now = self.clock.now_secs();
                     ctx_snapshot
@@ -1793,9 +1792,9 @@ impl ContextManager {
                         .collect()
                 },
                 approved_proposals: ctx_snapshot.approved_proposals,
-                governance_freeze: ctx_snapshot.governance_freeze,
-                governance_timeout_task: GovernanceTimeoutTask::new(),
-                deadlock_detection_state: DeadlockDetectionState::default(),
+                freeze: ctx_snapshot.governance_freeze,
+                timeout_task: GovernanceTimeoutTask::new(),
+                deadlock: DeadlockDetectionState::default(),
                 threshold_signers: ctx_snapshot.threshold_signers,
                 threshold_value: ctx_snapshot.threshold_value,
                 pending_ceiling_modification: ctx_snapshot.pending_ceiling_modification,
@@ -1805,10 +1804,12 @@ impl ContextManager {
                 pruning_policy: ctx_snapshot.pruning_policy,
                 economic_policy: ctx_snapshot.economic_policy,
                 budget_tracker: ctx_snapshot.budget_tracker,
+                last_known_members: initial_members,
+                pending_epoch_resets: Vec::new(),
             },
             epoch: EpochState {
                 mls_epoch: ctx_snapshot.mls_epoch,
-                epoch_coordinator: EpochCoordinator::from_records(
+                coordinator: EpochCoordinator::from_records(
                     ctx_snapshot.epoch_coordination_records,
                     context_id,
                 ),
@@ -1819,11 +1820,10 @@ impl ContextManager {
                 write_revoked_members: ctx_snapshot.write_revoked_members,
                 read_revoked_members: ctx_snapshot.read_revoked_members,
                 read_exclusion_list: ctx_snapshot.read_exclusion_list,
-                migration_state: ctx_snapshot.migration_state,
             },
             ttl: TtlState {
-                ttl_timer: TtlTimer::with_clock(Arc::clone(&self.clock)),
-                ttl_extension: None,
+                timer: TtlTimer::with_clock(Arc::clone(&self.clock)),
+                extension: None,
             },
         };
 
@@ -2313,10 +2313,9 @@ impl ContextManager {
             role_state: export.snapshot.role_state,
             receive_buffer: ReceiveBuffer::new(),
             broadcast_context: None,
-            last_known_members: initial_members,
-            pending_epoch_resets: Vec::new(),
+            migration_state: None,
             governance: GovernanceState {
-                governance_engine,
+                engine: governance_engine,
                 executed_proposals: {
                     let now = self.clock.now_secs();
                     export
@@ -2327,9 +2326,9 @@ impl ContextManager {
                         .collect()
                 },
                 approved_proposals: export.snapshot.approved_proposals,
-                governance_freeze: export.snapshot.governance_freeze,
-                governance_timeout_task: GovernanceTimeoutTask::new(),
-                deadlock_detection_state: DeadlockDetectionState::default(),
+                freeze: export.snapshot.governance_freeze,
+                timeout_task: GovernanceTimeoutTask::new(),
+                deadlock: DeadlockDetectionState::default(),
                 threshold_signers: export.snapshot.threshold_signers,
                 threshold_value: export.snapshot.threshold_value,
                 pending_ceiling_modification: export.snapshot.pending_ceiling_modification,
@@ -2339,10 +2338,12 @@ impl ContextManager {
                 pruning_policy: export.snapshot.pruning_policy,
                 economic_policy: export.snapshot.economic_policy,
                 budget_tracker: export.snapshot.budget_tracker,
+                last_known_members: initial_members,
+                pending_epoch_resets: Vec::new(),
             },
             epoch: EpochState {
                 mls_epoch: export.snapshot.mls_epoch,
-                epoch_coordinator: EpochCoordinator::from_records(
+                coordinator: EpochCoordinator::from_records(
                     export.snapshot.epoch_coordination_records,
                     &context_id,
                 ),
@@ -2353,11 +2354,10 @@ impl ContextManager {
                 write_revoked_members: export.snapshot.write_revoked_members,
                 read_revoked_members: export.snapshot.read_revoked_members,
                 read_exclusion_list: export.snapshot.read_exclusion_list,
-                migration_state: None,
             },
             ttl: TtlState {
-                ttl_timer: TtlTimer::with_clock(Arc::clone(&self.clock)),
-                ttl_extension: None,
+                timer: TtlTimer::with_clock(Arc::clone(&self.clock)),
+                extension: None,
             },
         };
 
@@ -2494,15 +2494,14 @@ impl ContextManager {
             role_state,
             receive_buffer: ReceiveBuffer::new(),
             broadcast_context,
-            last_known_members: initial_members,
-            pending_epoch_resets: Vec::new(),
+            migration_state: None,
             governance: GovernanceState {
-                governance_engine,
+                engine: governance_engine,
                 executed_proposals: HashMap::new(),
                 approved_proposals: HashMap::new(),
-                governance_freeze: None,
-                governance_timeout_task: GovernanceTimeoutTask::new(),
-                deadlock_detection_state: DeadlockDetectionState::default(),
+                freeze: None,
+                timeout_task: GovernanceTimeoutTask::new(),
+                deadlock: DeadlockDetectionState::default(),
                 threshold_signers: initial_threshold_signers,
                 threshold_value: initial_threshold_value,
                 pending_ceiling_modification: None,
@@ -2512,10 +2511,12 @@ impl ContextManager {
                 pruning_policy: None,
                 economic_policy: params.economic_policy.clone(),
                 budget_tracker: MemberBudgetTracker::new(),
+                last_known_members: initial_members,
+                pending_epoch_resets: Vec::new(),
             },
             epoch: EpochState {
                 mls_epoch: 0,
-                epoch_coordinator: EpochCoordinator::new(),
+                coordinator: EpochCoordinator::new(),
                 grace_store: crate::crypto::mls::epoch_grace::EpochGraceStore::new(),
                 needs_reconnect: false,
             },
@@ -2523,11 +2524,10 @@ impl ContextManager {
                 write_revoked_members: HashSet::new(),
                 read_revoked_members: HashSet::new(),
                 read_exclusion_list: HashSet::new(),
-                migration_state: None,
             },
             ttl: TtlState {
-                ttl_timer: TtlTimer::with_clock(Arc::clone(&self.clock)),
-                ttl_extension: None,
+                timer: TtlTimer::with_clock(Arc::clone(&self.clock)),
+                extension: None,
             },
         };
 
@@ -2768,15 +2768,14 @@ impl ContextManager {
             role_state,
             receive_buffer: ReceiveBuffer::new(),
             broadcast_context,
-            last_known_members: HashSet::new(),
-            pending_epoch_resets: Vec::new(),
+            migration_state: None,
             governance: GovernanceState {
-                governance_engine,
+                engine: governance_engine,
                 executed_proposals: HashMap::new(),
                 approved_proposals: HashMap::new(),
-                governance_freeze: None,
-                governance_timeout_task: GovernanceTimeoutTask::new(),
-                deadlock_detection_state: DeadlockDetectionState::default(),
+                freeze: None,
+                timeout_task: GovernanceTimeoutTask::new(),
+                deadlock: DeadlockDetectionState::default(),
                 threshold_signers: initial_threshold_signers,
                 threshold_value: initial_threshold_value,
                 pending_ceiling_modification: None,
@@ -2786,10 +2785,12 @@ impl ContextManager {
                 pruning_policy: None,
                 economic_policy: params.economic_policy.clone(),
                 budget_tracker: MemberBudgetTracker::new(),
+                last_known_members: HashSet::new(),
+                pending_epoch_resets: Vec::new(),
             },
             epoch: EpochState {
                 mls_epoch: 0,
-                epoch_coordinator: EpochCoordinator::new(),
+                coordinator: EpochCoordinator::new(),
                 grace_store: crate::crypto::mls::epoch_grace::EpochGraceStore::new(),
                 needs_reconnect: false,
             },
@@ -2797,11 +2798,10 @@ impl ContextManager {
                 write_revoked_members: HashSet::new(),
                 read_revoked_members: HashSet::new(),
                 read_exclusion_list: HashSet::new(),
-                migration_state: None,
             },
             ttl: TtlState {
-                ttl_timer: TtlTimer::with_clock(Arc::clone(&self.clock)),
-                ttl_extension: None,
+                timer: TtlTimer::with_clock(Arc::clone(&self.clock)),
+                extension: None,
             },
         })
     }
@@ -4134,7 +4134,7 @@ impl ContextManager {
                     let timestamp = self.clock.now_secs();
                     // Best-effort: log but do not fail if recording fails
                     // (epoch_after > epoch_before is guaranteed by saturating_add).
-                    let _ = ctx.epoch.epoch_coordinator.record_coordination(
+                    let _ = ctx.epoch.coordinator.record_coordination(
                         proposal.proposal_id,
                         old_epoch,
                         ctx.epoch.mls_epoch,
@@ -4189,10 +4189,8 @@ impl ContextManager {
                 //    contexts (ADR-031 §9, issue #630). SingleAdmin contexts
                 //    emit no event because they require no cosignatures
                 //    (quorum is 0).
-                let (required_signers, minimum_count) = ctx
-                    .governance
-                    .governance_engine
-                    .checkpoint_cosignature_requirements();
+                let (required_signers, minimum_count) =
+                    ctx.governance.engine.checkpoint_cosignature_requirements();
                 if minimum_count > 0 {
                     ctx.receive_buffer
                         .push(ContextEvent::CheckpointCosignatureRequired {
@@ -4693,7 +4691,7 @@ impl ContextManager {
             }
 
             // SCP-272: Block new proposals (except ResolveConflict) while governance is frozen.
-            if ctx.governance.governance_freeze.is_some()
+            if ctx.governance.freeze.is_some()
                 && !matches!(action, GovernanceAction::ResolveConflict { .. })
             {
                 return Err(ContextError::GovernanceFailed(
@@ -4705,7 +4703,7 @@ impl ContextManager {
 
             let (proposal, events) = ctx
                 .governance
-                .governance_engine
+                .engine
                 .propose(proposer_did, action, &gov_ctx, signing_key)
                 .map_err(|e| ContextError::GovernanceFailed(e.to_string()))?;
 
@@ -4722,7 +4720,7 @@ impl ContextManager {
                 matches!(e, GovernanceEvent::ConflictResolved { loser_id, .. } if *loser_id == proposal.proposal_id)
             });
 
-            let in_freeze = ctx.governance.governance_freeze.is_some();
+            let in_freeze = ctx.governance.freeze.is_some();
 
             (
                 proposal,
@@ -4836,22 +4834,19 @@ impl ContextManager {
 
             let (status, events) = if approve {
                 ctx.governance
-                    .governance_engine
+                    .engine
                     .approve(proposal_id, voter_did, &gov_ctx, signing_key)
                     .map_err(|e| ContextError::GovernanceFailed(e.to_string()))?
             } else {
                 ctx.governance
-                    .governance_engine
+                    .engine
                     .reject(proposal_id, voter_did, &gov_ctx, signing_key)
                     .map_err(|e| ContextError::GovernanceFailed(e.to_string()))?
             };
 
             // If the proposal just became Approved, grab a clone for conflict detection and execution.
             let proposal_for_execution = if status == ProposalStatus::Approved {
-                ctx.governance
-                    .governance_engine
-                    .get_proposal(proposal_id)
-                    .cloned()
+                ctx.governance.engine.get_proposal(proposal_id).cloned()
             } else {
                 None
             };
@@ -4902,7 +4897,7 @@ impl ContextManager {
                 let contexts = self.contexts.lock().await;
                 contexts
                     .get(context_id)
-                    .is_some_and(|ctx| ctx.governance.governance_freeze.is_some())
+                    .is_some_and(|ctx| ctx.governance.freeze.is_some())
             };
 
             if !in_freeze && !invalidated_by_conflict {
@@ -4942,7 +4937,7 @@ impl ContextManager {
             .ok_or_else(|| ContextError::ContextNotRegistered(context_id.to_owned()))?;
 
         ctx.governance
-            .governance_engine
+            .engine
             .get_proposal(proposal_id)
             .cloned()
             .ok_or_else(|| {
@@ -4972,7 +4967,7 @@ impl ContextManager {
             .get(context_id)
             .ok_or_else(|| ContextError::ContextNotRegistered(context_id.to_owned()))?;
 
-        Ok(ctx.governance.governance_engine.list_proposals())
+        Ok(ctx.governance.engine.list_proposals())
     }
 
     // -------------------------------------------------------------------
@@ -5154,7 +5149,7 @@ impl ContextManager {
 
             let gov_ctx = Self::build_governance_context(ctx, &*self.clock);
             ctx.governance
-                .governance_engine
+                .engine
                 .withdraw_vote(proposal_id, voter_did, &gov_ctx)
                 .map_err(|e| ContextError::PermissionDenied(e.to_string()))?
         };
@@ -5826,8 +5821,8 @@ impl ContextManager {
                 .ok_or_else(|| ContextError::ContextNotRegistered(context_id.to_owned()))?;
 
             // Cancel TTL timer and governance timeout task if active.
-            ctx.ttl.ttl_timer.cancel();
-            ctx.governance.governance_timeout_task.cancel();
+            ctx.ttl.timer.cancel();
+            ctx.governance.timeout_task.cancel();
             // Drop broadcast context state -- keys are zeroed by Zeroize.
             ctx.broadcast_context = None;
 
@@ -5898,31 +5893,26 @@ impl ContextManager {
 
             // Cancel the existing TTL timer task so it does not fire at
             // the original deadline.
-            ctx.ttl.ttl_timer.cancel();
+            ctx.ttl.timer.cancel();
 
             // Capture old deadline before mutation for structured event.
-            let old_dl = ctx.ttl.ttl_timer.deadline_unix_secs.unwrap_or(0);
+            let old_dl = ctx.ttl.timer.deadline_unix_secs.unwrap_or(0);
 
             // Extend the TTL deadline and compute the remaining duration
             // for the replacement timer task.
-            let remaining_secs = ctx
-                .ttl
-                .ttl_timer
-                .deadline_unix_secs
-                .as_mut()
-                .map(|deadline| {
-                    *deadline = deadline.saturating_add(additional_secs);
-                    let now = self.clock.now_secs();
-                    deadline.saturating_sub(now)
-                });
+            let remaining_secs = ctx.ttl.timer.deadline_unix_secs.as_mut().map(|deadline| {
+                *deadline = deadline.saturating_add(additional_secs);
+                let now = self.clock.now_secs();
+                deadline.saturating_sub(now)
+            });
 
             // Capture new deadline after mutation.
-            let new_dl = ctx.ttl.ttl_timer.deadline_unix_secs.unwrap_or(0);
+            let new_dl = ctx.ttl.timer.deadline_unix_secs.unwrap_or(0);
 
             // Reset the cancel signal so the replacement timer task can be
             // cancelled independently of the old one.
-            ctx.ttl.ttl_timer.cancel = Arc::new(tokio::sync::Notify::new());
-            ctx.ttl.ttl_timer.task = None;
+            ctx.ttl.timer.cancel = Arc::new(tokio::sync::Notify::new());
+            ctx.ttl.timer.task = None;
 
             let h = ctx.handle.clone();
             let snap = if self.has_persistence() {
@@ -6403,7 +6393,7 @@ impl ContextManager {
         {
             let mut contexts = self.contexts.lock().await;
             if let Some(ctx) = contexts.get_mut(context_id) {
-                ctx.pending_epoch_resets.push(did.clone());
+                ctx.governance.pending_epoch_resets.push(did.clone());
             }
         }
 
@@ -6433,7 +6423,7 @@ impl ContextManager {
             // Validate that the proposals being resolved match the ones that
             // caused the freeze — otherwise an admin could clear a freeze by
             // referencing arbitrary proposal IDs.
-            let (freeze_a, freeze_b, _) = ctx.governance.governance_freeze.ok_or_else(|| {
+            let (freeze_a, freeze_b, _) = ctx.governance.freeze.ok_or_else(|| {
                 ContextError::PermissionDenied(
                     "context is not in governance freeze state — no conflict to resolve".into(),
                 )
@@ -6514,7 +6504,7 @@ impl ContextManager {
             }
 
             // Clear governance freeze now that the conflict is resolved.
-            ctx.governance.governance_freeze = None;
+            ctx.governance.freeze = None;
 
             if self.has_persistence() {
                 Some(Self::snapshot_context(ctx))
@@ -6586,8 +6576,8 @@ impl ContextManager {
             // "On promotion: TTL is removed, memory scope transitions from
             // ephemeral to full, existing event log and key material are
             // preserved."
-            ctx.ttl.ttl_timer.cancel();
-            ctx.ttl.ttl_timer.deadline_unix_secs = None;
+            ctx.ttl.timer.cancel();
+            ctx.ttl.timer.deadline_unix_secs = None;
             ctx.handle.promote_memory_scope();
 
             if self.has_persistence() {
@@ -7233,7 +7223,7 @@ impl ContextManager {
             require_active(&ctx.handle)?;
 
             // Check no migration is already in progress.
-            if ctx.access.migration_state.is_some() {
+            if ctx.migration_state.is_some() {
                 return Err(ContextError::PermissionDenied(
                     "context migration is already in progress".to_owned(),
                 ));
@@ -7260,7 +7250,7 @@ impl ContextManager {
                     ContextError::PermissionDenied("cannot transition to MigratingOut".to_owned())
                 })?;
 
-            ctx.access.migration_state = Some(MigrationState {
+            ctx.migration_state = Some(MigrationState {
                 destination_context_id: destination_context_id.clone(),
                 reason: reason.to_owned(),
                 grace_period_end,
@@ -7309,7 +7299,7 @@ impl ContextManager {
             let mut contexts = self.contexts.lock().await;
             if let Some(ctx) = contexts.get_mut(context_id) {
                 let _ = ctx.handle.transition_to(&ContextState::Active).await;
-                ctx.access.migration_state = None;
+                ctx.migration_state = None;
                 // Remove only the migration events we pushed, preserving
                 // any events added by concurrent operations.
                 ctx.receive_buffer.truncate(buffer_len_before_migration);
@@ -7378,7 +7368,7 @@ impl ContextManager {
                     )
                 })?;
 
-            let migration = ctx.access.migration_state.take().ok_or_else(|| {
+            let migration = ctx.migration_state.take().ok_or_else(|| {
                 ContextError::PermissionDenied(
                     "no migration state found despite MigratingOut state".to_owned(),
                 )
@@ -7448,7 +7438,7 @@ impl ContextManager {
                 ));
             }
 
-            let migration = ctx.access.migration_state.as_ref().ok_or_else(|| {
+            let migration = ctx.migration_state.as_ref().ok_or_else(|| {
                 ContextError::PermissionDenied(
                     "no migration state found despite MigratingOut state".to_owned(),
                 )
@@ -7482,12 +7472,12 @@ impl ContextManager {
             });
 
             // Cancel TTL timer and governance timeout task.
-            ctx.ttl.ttl_timer.cancel();
-            ctx.governance.governance_timeout_task.cancel();
+            ctx.ttl.timer.cancel();
+            ctx.governance.timeout_task.cancel();
             // Drop broadcast context state.
             ctx.broadcast_context = None;
             // Clear migration state.
-            ctx.access.migration_state = None;
+            ctx.migration_state = None;
 
             let snapshot = if self.has_persistence() {
                 Some(Self::snapshot_context(ctx))
@@ -7519,7 +7509,7 @@ impl ContextManager {
         let contexts = self.contexts.lock().await;
         contexts
             .get(context_id)
-            .and_then(|ctx| ctx.access.migration_state.clone())
+            .and_then(|ctx| ctx.migration_state.clone())
     }
 
     /// Evaluates whether a subscriber's broadcast key request should be
@@ -7658,7 +7648,7 @@ impl ContextManager {
 
             // Gate: multi-admin models must use governance path.
             if !matches!(
-                ctx.governance.governance_engine.model_config(),
+                ctx.governance.engine.model_config(),
                 GovernanceModelConfig::SingleAdmin { .. }
             ) {
                 return Err(ContextError::PermissionDenied(
@@ -7681,8 +7671,8 @@ impl ContextManager {
         {
             let mut contexts = self.contexts.lock().await;
             if let Some(ctx) = contexts.get_mut(&context_id) {
-                ctx.ttl.ttl_timer.cancel();
-                ctx.governance.governance_timeout_task.cancel();
+                ctx.ttl.timer.cancel();
+                ctx.governance.timeout_task.cancel();
                 // Drop broadcast context state -- keys are zeroed by Zeroize.
                 ctx.broadcast_context = None;
                 ctx.receive_buffer.push(ContextEvent::SystemClose {
@@ -7770,7 +7760,7 @@ impl ContextManager {
         {
             let mut contexts = self.contexts.lock().await;
             if let Some(ctx) = contexts.get_mut(&context_id) {
-                ctx.governance.governance_timeout_task.cancel();
+                ctx.governance.timeout_task.cancel();
                 if result.is_complete() {
                     ctx.receive_buffer.push(ContextEvent::Expired);
                 } else {
@@ -7843,7 +7833,7 @@ impl ContextManager {
         // Initialize extension proposal if not already in progress.
         let extension = ctx
             .ttl
-            .ttl_extension
+            .extension
             .get_or_insert_with(|| TtlExtension::new(proposed_duration, member_count));
 
         extension.add_consent(member_did.clone());
@@ -7874,8 +7864,8 @@ impl ContextManager {
         {
             let mut contexts = self.contexts.lock().await;
             if let Some(ctx) = contexts.get_mut(context_id) {
-                ctx.ttl.ttl_timer.cancel();
-                ctx.ttl.ttl_extension = None;
+                ctx.ttl.timer.cancel();
+                ctx.ttl.extension = None;
             }
         }
 
@@ -7923,7 +7913,7 @@ impl ContextManager {
             let Some(ctx) = contexts.get_mut(context_id) else {
                 return;
             };
-            ctx.ttl.ttl_timer.cancel.clone()
+            ctx.ttl.timer.cancel.clone()
         };
 
         // Clone Arc-wrapped providers so the spawned task can perform
@@ -7975,7 +7965,7 @@ impl ContextManager {
         let context_id_for_store = context_id.to_owned();
         let mut contexts = self.contexts.lock().await;
         if let Some(ctx) = contexts.get_mut(&context_id_for_store) {
-            ctx.ttl.ttl_timer.task = Some(task);
+            ctx.ttl.timer.task = Some(task);
         }
     }
 
@@ -8069,7 +8059,7 @@ impl ContextManager {
             return;
         };
 
-        ctx.governance.governance_timeout_task.start({
+        ctx.governance.timeout_task.start({
             let ctx_id = ctx_id.clone();
             let clock = Arc::clone(&clock);
             move || {
@@ -8100,28 +8090,28 @@ impl ContextManager {
                         let current_members: HashSet<DID> =
                             ctx.membership.members().map(|m| m.did.clone()).collect();
                         let departed: Vec<DID> = ctx
+                            .governance
                             .last_known_members
                             .difference(&current_members)
                             .cloned()
                             .collect();
-                        ctx.last_known_members = current_members;
+                        ctx.governance.last_known_members = current_members;
 
                         // Drain epoch-reset members accumulated since last tick
                         // (ADR-031 §5: votes from reset members are invalidated).
-                        let epoch_resets: Vec<DID> = std::mem::take(&mut ctx.pending_epoch_resets);
+                        let epoch_resets: Vec<DID> =
+                            std::mem::take(&mut ctx.governance.pending_epoch_resets);
 
                         let mls_epoch = ctx.epoch.mls_epoch;
-                        let recovery_in_progress =
-                            ctx.governance.deadlock_detection_state.recovery_in_progress;
+                        let recovery_in_progress = ctx.governance.deadlock.recovery_in_progress;
 
                         // Snapshot active voters BEFORE processing proposals so
                         // voters on about-to-resolve proposals are still visible.
-                        let active_voters =
-                            collect_active_voters(ctx.governance.governance_engine.as_ref());
+                        let active_voters = collect_active_voters(ctx.governance.engine.as_ref());
 
                         // Process pending proposals for timeout/departures/epoch resets.
                         let result = process_pending_proposals(
-                            ctx.governance.governance_engine.as_mut(),
+                            ctx.governance.engine.as_mut(),
                             &gov_ctx,
                             &departed,
                             &epoch_resets,
@@ -8130,17 +8120,17 @@ impl ContextManager {
                         // Update deadlock detection state before detecting
                         // deadlock so missed-window counters reflect this tick.
                         update_detection_state(
-                            &mut ctx.governance.deadlock_detection_state,
-                            ctx.governance.governance_engine.as_ref(),
+                            &mut ctx.governance.deadlock,
+                            ctx.governance.engine.as_ref(),
                             &gov_ctx,
                             &active_voters,
                         );
 
                         // Detect deadlock conditions (ADR-031 §10).
                         let conditions = super::governance::timeout::detect_deadlock(
-                            ctx.governance.governance_engine.as_ref(),
+                            ctx.governance.engine.as_ref(),
                             &gov_ctx,
-                            &ctx.governance.deadlock_detection_state,
+                            &ctx.governance.deadlock,
                         );
 
                         (result, conditions, mls_epoch, recovery_in_progress)
@@ -8168,10 +8158,9 @@ impl ContextManager {
                             // Reset recovery_in_progress when deadlock conditions
                             // clear so future deadlocks can be detected.
                             if conditions.is_empty() && recovery_in_progress {
-                                ctx.governance.deadlock_detection_state.recovery_in_progress =
-                                    false;
+                                ctx.governance.deadlock.recovery_in_progress = false;
                             } else if !conditions.is_empty() && !recovery_in_progress {
-                                ctx.governance.deadlock_detection_state.recovery_in_progress = true;
+                                ctx.governance.deadlock.recovery_in_progress = true;
                             }
                         }
                     }
@@ -8302,10 +8291,7 @@ impl ContextManager {
             .ok_or_else(|| ContextError::ContextNotRegistered(context_id.to_owned()))?;
         require_active(&ctx.handle)?;
 
-        let (_, min_count) = ctx
-            .governance
-            .governance_engine
-            .checkpoint_cosignature_requirements();
+        let (_, min_count) = ctx.governance.engine.checkpoint_cosignature_requirements();
         let attestation_status = if min_count == 0 {
             CheckpointAttestationStatus::FullyAttested
         } else {
@@ -8392,7 +8378,7 @@ impl ContextManager {
 
         let status = ctx
             .governance
-            .governance_engine
+            .engine
             .validate_checkpoint_cosignatures(&candidate, &checkpoint_hash)
             .map_err(|e| ContextError::GovernanceFailed(e.to_string()))?;
 
@@ -8455,7 +8441,7 @@ impl ContextManager {
             match new_seq.cmp(&conflicting_seq) {
                 std::cmp::Ordering::Equal => {
                     // Simultaneous conflict - enter governance freeze
-                    ctx.governance.governance_freeze =
+                    ctx.governance.freeze =
                         Some((new_proposal.proposal_id, conflicting_id, current_timestamp));
                     events.push(GovernanceEvent::ConflictDetected {
                         proposal_a: new_proposal.proposal_id,
@@ -8512,13 +8498,13 @@ impl ContextManager {
 
         let current_timestamp = self.clock.now_secs();
 
-        if let Some((proposal_a, proposal_b, freeze_start)) = ctx.governance.governance_freeze
+        if let Some((proposal_a, proposal_b, freeze_start)) = ctx.governance.freeze
             && current_timestamp.saturating_sub(freeze_start) >= FREEZE_TIMEOUT_SECONDS
         {
             // Timeout reached - invalidate both proposals and lift freeze
             ctx.governance.approved_proposals.remove(&proposal_a);
             ctx.governance.approved_proposals.remove(&proposal_b);
-            ctx.governance.governance_freeze = None;
+            ctx.governance.freeze = None;
 
             // Both proposals were invalidated by timeout — emit one event
             // per invalidated proposal using the real proposal IDs so
@@ -13381,7 +13367,7 @@ mod tests {
         let contexts = manager.contexts.lock().await;
         let ctx = contexts.get("ttl-ctx").unwrap();
         assert!(
-            ctx.ttl.ttl_timer.is_active(),
+            ctx.ttl.timer.is_active(),
             "TTL timer should be re-spawned after restore"
         );
     }
@@ -15190,7 +15176,7 @@ mod tests {
 
         // TTL timer should be cancelled (deadline removed).
         assert!(
-            ctx.ttl.ttl_timer.deadline_unix_secs.is_none(),
+            ctx.ttl.timer.deadline_unix_secs.is_none(),
             "TTL deadline should be removed after promotion"
         );
     }
@@ -15534,7 +15520,7 @@ mod tests {
         // Verify the engine is accessible inside the per-context state.
         let contexts = manager.contexts.lock().await;
         let ctx = contexts.get("ctx-gov-sa").unwrap();
-        let config = ctx.governance.governance_engine.model_config();
+        let config = ctx.governance.engine.model_config();
         assert_eq!(
             config,
             GovernanceModelConfig::SingleAdmin { admin_did: creator }
@@ -15577,7 +15563,7 @@ mod tests {
         assert_eq!(handle.state().await, ContextState::Active);
         let contexts = manager.contexts.lock().await;
         let ctx = contexts.get("ctx-gov-thresh").unwrap();
-        assert_eq!(ctx.governance.governance_engine.model_config(), config);
+        assert_eq!(ctx.governance.engine.model_config(), config);
     }
 
     /// AC 6: `create_context_with_governance` constructs `MajorityVoteEngine`
@@ -15608,7 +15594,7 @@ mod tests {
         assert_eq!(handle.state().await, ContextState::Active);
         let contexts = manager.contexts.lock().await;
         let ctx = contexts.get("ctx-gov-maj").unwrap();
-        let model_config = ctx.governance.governance_engine.model_config();
+        let model_config = ctx.governance.engine.model_config();
         assert!(matches!(
             model_config,
             GovernanceModelConfig::Majority { .. }
@@ -15647,7 +15633,7 @@ mod tests {
         assert_eq!(handle.state().await, ContextState::Active);
         let contexts = manager.contexts.lock().await;
         let ctx = contexts.get("ctx-gov-unan").unwrap();
-        assert_eq!(ctx.governance.governance_engine.model_config(), config);
+        assert_eq!(ctx.governance.engine.model_config(), config);
     }
 
     /// AC 8/12: Invalid `GovernanceModelConfig` is rejected at creation time.
@@ -19492,7 +19478,7 @@ mod tests {
         // proving that generate_mls_operations was called.
         let contexts = manager.contexts.lock().await;
         let ctx = contexts.get("test-ctx").unwrap();
-        let records = ctx.epoch.epoch_coordinator.records();
+        let records = ctx.epoch.coordinator.records();
         assert_eq!(records.len(), 1);
         if let scp_protocol::context::governance::mls_integration::MlsOperation::AddMember {
             ref did,
@@ -19542,13 +19528,13 @@ mod tests {
         let contexts = manager.contexts.lock().await;
         let ctx = contexts.get("test-ctx").unwrap();
         assert_eq!(
-            ctx.epoch.epoch_coordinator.record_count(),
+            ctx.epoch.coordinator.record_count(),
             2,
             "should have 2 coordination records after 2 MLS-affecting actions"
         );
 
         // Verify first record: epoch 0 → 1 for AddMember.
-        let records = ctx.epoch.epoch_coordinator.records();
+        let records = ctx.epoch.coordinator.records();
         assert_eq!(records[0].epoch_before, 0);
         assert_eq!(records[0].epoch_after, 1);
         assert!(matches!(
@@ -19598,7 +19584,7 @@ mod tests {
         let contexts = manager.contexts.lock().await;
         let ctx = contexts.get("test-ctx").unwrap();
         assert_eq!(
-            ctx.epoch.epoch_coordinator.record_count(),
+            ctx.epoch.coordinator.record_count(),
             1,
             "ChangeRole should not create a coordination record"
         );
@@ -19753,7 +19739,7 @@ mod tests {
         {
             let mut contexts = manager.contexts.lock().await;
             let ctx = contexts.get_mut("test-ctx").unwrap();
-            ctx.governance.governance_freeze = Some((proposal_a_id, proposal_b_id, 1000));
+            ctx.governance.freeze = Some((proposal_a_id, proposal_b_id, 1000));
             ctx.governance
                 .approved_proposals
                 .insert(proposal_a_id, (conflict_proposal_a, 900, 2000));
@@ -19780,7 +19766,7 @@ mod tests {
         let contexts = manager.contexts.lock().await;
         let ctx = contexts.get("test-ctx").unwrap();
         assert!(
-            ctx.governance.governance_freeze.is_none(),
+            ctx.governance.freeze.is_none(),
             "governance freeze should be cleared after conflict resolution"
         );
 
