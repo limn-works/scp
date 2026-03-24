@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# Pre-commit hook: lint + format for all languages (parallel).
-# Only checks languages with staged changes.
+# Pre-commit hook: auto-fix format, then lint (parallel).
+# Auto-formats staged files and re-stages them. Lint errors block the commit.
 set -euo pipefail
 
 STAGED=$(git diff --cached --name-only --diff-filter=ACM)
@@ -22,16 +22,41 @@ for f in $STAGED; do
   esac
 done
 
+# ── Auto-format (best-effort — failures don't block other languages) ──
+
+if $HAS_RUST; then
+  echo "▸ Rust: auto-format"
+  cargo fmt --all 2>/dev/null || true
+  git add -u -- '*.rs' 2>/dev/null || true
+fi
+
+if $HAS_PYTHON; then
+  echo "▸ Python: auto-format + auto-fix"
+  python3.12 -m ruff format bindings/python/ 2>/dev/null || true
+  python3.12 -m ruff check --fix bindings/python/ 2>/dev/null || true
+  git add -u -- 'bindings/python/*.py' 2>/dev/null || true
+fi
+
+if $HAS_TS; then
+  echo "▸ TypeScript: auto-format"
+  (cd bindings/typescript && bun run format 2>/dev/null) || true
+  git add -u -- 'bindings/typescript/*.ts' 2>/dev/null || true
+fi
+
+if $HAS_SWIFT; then
+  echo "▸ Swift: auto-format"
+  (cd bindings/swift && swiftformat . 2>/dev/null) || true
+  git add -u -- 'bindings/swift/*.swift' 2>/dev/null || true
+fi
+
+# ── Lint (parallel — read-only checks that block on failure) ──
+
 TMPDIR=$(mktemp -d)
 trap 'rm -rf "$TMPDIR"' EXIT
 
-# Each language block writes to its own result file.
-# Exit code 0 = pass, non-zero = fail.
-
 if $HAS_RUST; then
   (
-    echo "▸ Rust: fmt + clippy + WASM + protocol enforcement"
-    cargo fmt --all -- --check 2>&1 || { echo "  ✗ cargo fmt failed. Run: cargo fmt --all"; exit 1; }
+    echo "▸ Rust: clippy + WASM + protocol enforcement"
     cargo clippy --workspace --all-targets \
       --features scp-ffi-uniffi/allow_in_memory_custody,scp-ffi/allow_in_memory_custody,scp-ffi-napi/allow_in_memory_custody,scp-core/testing,scp-runtime/testing \
       -- -D warnings 2>&1 || { echo "  ✗ clippy failed"; exit 1; }
@@ -43,8 +68,7 @@ fi
 
 if $HAS_PYTHON; then
   (
-    echo "▸ Python: ruff format + check"
-    python3.12 -m ruff format --check bindings/python/ 2>&1 || { echo "  ✗ ruff format failed. Run: python3.12 -m ruff format bindings/python/"; exit 1; }
+    echo "▸ Python: ruff check"
     python3.12 -m ruff check bindings/python/ 2>&1 || { echo "  ✗ ruff check failed"; exit 1; }
   ) > "$TMPDIR/python.log" 2>&1 && touch "$TMPDIR/python.ok" &
 fi
@@ -69,17 +93,14 @@ fi
 
 if $HAS_SWIFT; then
   (
-    echo "▸ Swift: swiftlint + swiftformat"
+    echo "▸ Swift: swiftlint"
     cd bindings/swift
     swiftlint --strict 2>&1 || { echo "  ✗ swiftlint failed"; exit 1; }
-    swiftformat --lint . 2>&1 || { echo "  ✗ swiftformat failed"; exit 1; }
   ) > "$TMPDIR/swift.log" 2>&1 && touch "$TMPDIR/swift.ok" &
 fi
 
-# Wait for all background jobs
 wait
 
-# Check results and print failures
 FAILED=false
 for lang in rust python ts kotlin swift; do
   if [ -f "$TMPDIR/$lang.log" ] && [ ! -f "$TMPDIR/$lang.ok" ]; then
@@ -90,7 +111,7 @@ done
 
 if $FAILED; then
   echo ""
-  echo "Pre-commit checks failed. Fix the issues above."
+  echo "Pre-commit checks failed. Fix the lint issues above."
   echo "To bypass (NOT recommended): git commit --no-verify"
   exit 1
 fi
