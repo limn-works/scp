@@ -3095,6 +3095,7 @@ mod tests {
     // js_to_serde_governance_action tests
     // -----------------------------------------------------------------------
 
+    #[allow(clippy::unwrap_used)]
     #[test]
     fn js_to_serde_governance_action_add_member() {
         let mut val =
@@ -3109,6 +3110,7 @@ mod tests {
         assert_eq!(action.variant_name(), "AddMember");
     }
 
+    #[allow(clippy::unwrap_used)]
     #[test]
     fn js_to_serde_governance_action_unit_variant() {
         let mut val = serde_json::json!({"type": "promoteContext"});
@@ -3119,6 +3121,7 @@ mod tests {
         assert_eq!(action.variant_name(), "PromoteContext");
     }
 
+    #[allow(clippy::unwrap_used)]
     #[test]
     fn js_to_serde_governance_action_missing_type() {
         let mut val = serde_json::json!({"did": "did:dht:test"});
@@ -3126,6 +3129,7 @@ mod tests {
         assert!(err.contains("missing 'type' field"), "got: {err}");
     }
 
+    #[allow(clippy::unwrap_used)]
     #[test]
     fn js_to_serde_governance_action_not_object() {
         let mut val = serde_json::json!("notAnObject");
@@ -3158,6 +3162,7 @@ mod tests {
         assert_eq!(val, serde_json::json!({"type": "expired"}));
     }
 
+    #[allow(clippy::unwrap_used)]
     #[test]
     fn serde_to_js_event_roundtrip_with_real_type() {
         use scp_protocol::context::membership::ContextEvent;
@@ -3170,6 +3175,7 @@ mod tests {
         assert_eq!(val["member_did"], "did:dht:left");
     }
 
+    #[allow(clippy::unwrap_used)]
     #[test]
     fn serde_to_js_event_system_close() {
         use scp_protocol::context::membership::ContextEvent;
@@ -3182,6 +3188,7 @@ mod tests {
         assert_eq!(val["initiator_did"], "did:dht:closer");
     }
 
+    #[allow(clippy::unwrap_used)]
     #[test]
     fn serde_to_js_event_expired() {
         use scp_protocol::context::membership::ContextEvent;

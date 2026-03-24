@@ -2104,7 +2104,7 @@ fn template_params_json_uses_camel_case_field_names() {
 // GovernanceAction JS-idiomatic camelCase serialization conformance
 // ===========================================================================
 
-/// Verifies GovernanceAction deserializes from JS-idiomatic camelCase format.
+/// Verifies `GovernanceAction` deserializes from JS-idiomatic camelCase format.
 ///
 /// JS consumers send `{"type": "addMember", "did": "d", "role": "r"}`.
 /// The WASM bridge converts to serde's externally-tagged format before
@@ -2202,7 +2202,7 @@ fn governance_action_from_js_camel_case_format() {
     assert_eq!(action.variant_name(), "CancelContextMigration");
 }
 
-/// Verifies ContextEvent serializes to JS-idiomatic camelCase format.
+/// Verifies `ContextEvent` serializes to JS-idiomatic camelCase format.
 ///
 /// serde default: `{"MemberJoined": {"member_did": "..."}}` or `"Expired"`.
 /// JS-idiomatic:  `{"type": "memberJoined", "member_did": "..."}` or `{"type": "expired"}`.
@@ -2231,27 +2231,26 @@ fn context_event_to_js_camel_case_format() {
             return;
         }
 
-        if let Some(obj) = value.as_object_mut() {
-            if let Some((variant_name, inner)) =
+        if let Some(obj) = value.as_object_mut()
+            && let Some((variant_name, inner)) =
                 obj.iter().next().map(|(k, v)| (k.clone(), v.clone()))
-            {
-                let camel = {
-                    let mut r = String::with_capacity(variant_name.len());
-                    for (i, ch) in variant_name.chars().enumerate() {
-                        if i == 0 {
-                            r.extend(ch.to_lowercase());
-                        } else {
-                            r.push(ch);
-                        }
+        {
+            let camel = {
+                let mut r = String::with_capacity(variant_name.len());
+                for (i, ch) in variant_name.chars().enumerate() {
+                    if i == 0 {
+                        r.extend(ch.to_lowercase());
+                    } else {
+                        r.push(ch);
                     }
-                    r
-                };
-                obj.clear();
-                obj.insert("type".to_owned(), serde_json::Value::String(camel));
-                if let Some(inner_obj) = inner.as_object() {
-                    for (k, v) in inner_obj {
-                        obj.insert(k.clone(), v.clone());
-                    }
+                }
+                r
+            };
+            obj.clear();
+            obj.insert("type".to_owned(), serde_json::Value::String(camel));
+            if let Some(inner_obj) = inner.as_object() {
+                for (k, v) in inner_obj {
+                    obj.insert(k.clone(), v.clone());
                 }
             }
         }
