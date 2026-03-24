@@ -683,7 +683,7 @@ impl ContextManager {
 
     /// Creates a new SCP context with the two-phase commit pattern.
     ///
-    /// Delegates to [`super::builder::create_context`] which validates all
+    /// Delegates to [`crate::context::builder::create_context`] which validates all
     /// preconditions (Phase 1), then executes creation steps with ordered
     /// rollback on failure (Phase 2).
     ///

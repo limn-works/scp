@@ -3824,4 +3824,22 @@ impl ContextManager {
 
         Vec::new()
     }
+
+    /// Returns the event-log label string for a [`GovernanceEvent`] variant.
+    ///
+    /// Used when appending governance events to the Merkle event log. Each
+    /// variant maps to a deterministic string label so event consumers can
+    /// filter by type without deserializing the full event.
+    const fn governance_event_label(event: &GovernanceEvent) -> &'static str {
+        match event {
+            GovernanceEvent::ProposalCreated { .. } => "GovernanceProposalCreated",
+            GovernanceEvent::VoteCast { .. } => "GovernanceVoteCast",
+            GovernanceEvent::VoteWithdrawn { .. } => "GovernanceVoteWithdrawn",
+            GovernanceEvent::ProposalResolved { .. } => "GovernanceProposalResolved",
+            GovernanceEvent::DeadlockRecovery { .. } => "GovernanceDeadlockRecovery",
+            GovernanceEvent::ConflictDetected { .. } => "GovernanceConflictDetected",
+            GovernanceEvent::ConflictResolved { .. } => "GovernanceConflictResolved",
+            GovernanceEvent::GovernanceActionExecuted { .. } => "GovernanceActionExecuted",
+        }
+    }
 }
