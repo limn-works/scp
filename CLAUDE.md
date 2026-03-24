@@ -183,6 +183,22 @@ The orchestrator never writes code. It manages execution, maintains plan alignme
 - Validate that agent output aligns with the plan and referenced issues.
 - Keep context lean — delegate, don't accumulate.
 
+**Orchestrator verification protocol (MANDATORY after every agent merge):**
+- Verify against the PUSHED REMOTE branch (`git show origin/branch:file`), never the local working directory. Local state may be on a different branch.
+- For type deletions: `grep -c "struct TypeName" <file>` must return 0.
+- For imports: `grep -c "scp_protocol::module" <file>` must return >0.
+- Run the exact CI clippy command with ALL features before pushing: `cargo clippy --workspace --all-targets --features scp-ffi-uniffi/allow_in_memory_custody,scp-ffi/allow_in_memory_custody,scp-ffi-napi/allow_in_memory_custody,scp-core/testing,scp-runtime/testing -- -D warnings`
+- If a cherry-pick resolves to "nothing to commit," the changes DID NOT LAND. Investigate.
+- Never say "done" without showing verification output.
+
+**Agent execution rules (MANDATORY):**
+- Every agent prompt must specify which branch to start from. Include: "Verify with `git log --oneline -3` that you see [expected commits]. If not, STOP."
+- Never checkout migration/feature branches on the main worktree. All branch work happens in worktrees. Main worktree stays on main.
+- When the plan says "delete X and import Y," agents MUST delete X and import Y. No excuses. "Different serde format," "different field types," "architectural mismatch" are NOT valid reasons to keep local reimplementations when there are zero consumers. The only valid reason is a compiler-level mechanical restriction.
+- When an agent hits friction (type is `pub(crate)`, missing derive, missing method), fix the impediment — don't work around it by keeping the reimplementation.
+- Don't manually edit code to fix clippy warnings. Use `cargo clippy --fix` or dispatch an agent.
+- Parallel coding agents that touch the same files WILL conflict. Run them sequentially, not in parallel.
+
 ## Scope discipline
 
 **When asked to verify, audit, or review "everything," enumerate the full scope FIRST:**
