@@ -2981,6 +2981,7 @@ pub fn evaluate_invitation(
             spending.as_ref(),
             &oracle,
             tracker,
+            &scp_core::time::SystemClock,
         )
     });
 

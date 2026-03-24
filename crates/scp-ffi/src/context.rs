@@ -3528,6 +3528,7 @@ pub fn py_evaluate_invitation(
             spending.as_ref(),
             &oracle,
             tracker,
+            &scp_core::time::SystemClock,
         )
     });
 

@@ -19,11 +19,12 @@
 //! See `.docs/standards/sdk-common.md` section "Invitation evaluation" and
 //! `.docs/specs/19-economic-governance.md` section 19.3.
 
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use crate::context::params::ContextParams;
 use crate::context::policy::{AutoAcceptPolicy, RateLimit, TrustRequirement, auto_accept_allowed};
 use crate::context::templates::validate_against_template;
+use crate::time::Clock;
 use scp_primitives::DID;
 
 // ---------------------------------------------------------------------------
@@ -124,10 +125,14 @@ pub trait TrustOracle {
 /// Each instance tracks accepts for a single identity (the local identity
 /// receiving invitations). The rate limit is global across all peers, not
 /// per-peer.
+///
+/// Timestamps are stored as seconds since the Unix epoch (`u64`), obtained
+/// from an injected [`Clock`]. This avoids `std::time::Instant`, which
+/// panics on `wasm32-unknown-unknown`.
 #[derive(Debug)]
 pub struct RateLimitTracker {
-    /// Timestamps of recent auto-accept events, per inviter DID.
-    accepts: Vec<Instant>,
+    /// Timestamps of recent auto-accept events (seconds since epoch).
+    accepts: Vec<u64>,
 }
 
 impl RateLimitTracker {
@@ -140,41 +145,24 @@ impl RateLimitTracker {
     }
 
     /// Records an auto-accept event at the current time.
-    pub fn record_accept(&mut self) {
-        self.accepts.push(Instant::now());
-    }
-
-    /// Records an auto-accept event at a specific instant (for testing).
-    pub fn record_accept_at(&mut self, at: Instant) {
-        self.accepts.push(at);
+    pub fn record_accept(&mut self, clock: &dyn Clock) {
+        self.accepts.push(clock.now_secs());
     }
 
     /// Checks whether an additional auto-accept is allowed under the given
     /// rate limit. Prunes expired entries.
     #[must_use]
-    pub fn is_allowed(&mut self, limit: &RateLimit) -> bool {
-        let now = Instant::now();
-        self.prune_expired(now, limit.window);
-        self.accepts.len() < limit.max_count as usize
-    }
-
-    /// Checks whether an additional auto-accept is allowed at a specific
-    /// instant (for testing).
-    #[must_use]
-    pub fn is_allowed_at(&mut self, limit: &RateLimit, now: Instant) -> bool {
+    pub fn is_allowed(&mut self, limit: &RateLimit, clock: &dyn Clock) -> bool {
+        let now = clock.now_secs();
         self.prune_expired(now, limit.window);
         self.accepts.len() < limit.max_count as usize
     }
 
     /// Removes entries older than `window` before `now`.
-    fn prune_expired(&mut self, now: Instant, window: Duration) {
-        self.accepts.retain(|&t| {
-            // Retain entries within the window. Instant subtraction can panic
-            // if `now < t` (should not happen in practice), so use
-            // checked_duration_since to be safe.
-            now.checked_duration_since(t)
-                .is_none_or(|elapsed| elapsed < window)
-        });
+    fn prune_expired(&mut self, now_secs: u64, window: Duration) {
+        let window_secs = window.as_secs();
+        self.accepts
+            .retain(|&t| now_secs.saturating_sub(t) < window_secs);
     }
 }
 
@@ -220,6 +208,7 @@ pub fn evaluate_invitation(
     spending_ctx: Option<&SpendingContext>,
     trust_oracle: &impl TrustOracle,
     rate_tracker: &mut RateLimitTracker,
+    clock: &dyn Clock,
 ) -> Result<EvaluationDecision, InvitationError> {
     // Step 1: Template check.
     // If the invitation includes a template ID, validate that the context
@@ -291,10 +280,10 @@ pub fn evaluate_invitation(
                     let rate_ok = policy
                         .rate_limit
                         .as_ref()
-                        .is_none_or(|limit| rate_tracker.is_allowed(limit));
+                        .is_none_or(|limit| rate_tracker.is_allowed(limit, clock));
 
                     if rate_ok {
-                        rate_tracker.record_accept();
+                        rate_tracker.record_accept(clock);
                         return Ok(EvaluationDecision::AutoAccept);
                     }
                 }
@@ -318,6 +307,7 @@ mod tests {
     use crate::context::params::{Capability, ContextMode, ContextParams, TemplateId};
     use crate::context::policy::{AutoAcceptPolicy, RateLimit, TrustRequirement};
     use crate::economy::{Amount, CostSchedule, CurrencyCode, EconomicPolicy};
+    use crate::time::{SystemClock, TestClock};
     use scp_primitives::DID;
     use std::time::Duration;
 
@@ -391,6 +381,7 @@ mod tests {
             None,
             &AlwaysTrust(true),
             &mut tracker,
+            &SystemClock,
         );
         assert!(result.is_ok());
     }
@@ -409,6 +400,7 @@ mod tests {
             None,
             &AlwaysTrust(true),
             &mut tracker,
+            &SystemClock,
         );
         assert!(result.is_err());
         let err = result.unwrap_err();
@@ -432,6 +424,7 @@ mod tests {
             None,
             &AlwaysTrust(true),
             &mut tracker,
+            &SystemClock,
         );
         assert!(matches!(result, Err(InvitationError::TemplateSpoofing(_))));
     }
@@ -451,6 +444,7 @@ mod tests {
             None,
             &AlwaysTrust(true),
             &mut tracker,
+            &SystemClock,
         );
         assert_eq!(result.unwrap(), EvaluationDecision::PromptAgent);
     }
@@ -487,6 +481,7 @@ mod tests {
             None, // No spending context provided
             &AlwaysTrust(true),
             &mut tracker,
+            &SystemClock,
         );
         assert!(matches!(result, Err(InvitationError::SpendingUcanRequired)));
     }
@@ -524,6 +519,7 @@ mod tests {
             Some(&spending),
             &AlwaysTrust(true),
             &mut tracker,
+            &SystemClock,
         );
         assert!(matches!(result, Err(InvitationError::SpendingUcanRequired)));
     }
@@ -561,6 +557,7 @@ mod tests {
             Some(&spending),
             &AlwaysTrust(true),
             &mut tracker,
+            &SystemClock,
         );
         assert!(matches!(
             result,
@@ -601,6 +598,7 @@ mod tests {
             Some(&spending),
             &AlwaysTrust(true),
             &mut tracker,
+            &SystemClock,
         );
         assert!(matches!(
             result,
@@ -658,6 +656,7 @@ mod tests {
             Some(&spending),
             &AlwaysTrust(true),
             &mut tracker,
+            &SystemClock,
         );
         // Paid context = always prompt, never auto-accept.
         assert_eq!(result.unwrap(), EvaluationDecision::PromptAgent);
@@ -680,6 +679,7 @@ mod tests {
             None,
             &AlwaysTrust(true),
             &mut tracker,
+            &SystemClock,
         );
         assert_eq!(result.unwrap(), EvaluationDecision::AutoAccept);
     }
@@ -698,6 +698,7 @@ mod tests {
             None,
             &AlwaysTrust(true),
             &mut tracker,
+            &SystemClock,
         );
         assert_eq!(result.unwrap(), EvaluationDecision::PromptAgent);
     }
@@ -715,6 +716,7 @@ mod tests {
             None,
             &AlwaysTrust(false), // Trust not satisfied
             &mut tracker,
+            &SystemClock,
         );
         assert_eq!(result.unwrap(), EvaluationDecision::PromptAgent);
     }
@@ -734,8 +736,15 @@ mod tests {
         let mut tracker = RateLimitTracker::new();
 
         // Bob invites, but only Alice is in the explicit list.
-        let result =
-            evaluate_invitation(&params, &bob(), Some(&policy), None, &oracle, &mut tracker);
+        let result = evaluate_invitation(
+            &params,
+            &bob(),
+            Some(&policy),
+            None,
+            &oracle,
+            &mut tracker,
+            &SystemClock,
+        );
         assert_eq!(result.unwrap(), EvaluationDecision::PromptAgent);
 
         // Alice invites -- should auto-accept.
@@ -746,6 +755,7 @@ mod tests {
             None,
             &oracle,
             &mut tracker,
+            &SystemClock,
         );
         assert_eq!(result.unwrap(), EvaluationDecision::AutoAccept);
     }
@@ -768,6 +778,7 @@ mod tests {
             None,
             &AlwaysTrust(true),
             &mut tracker,
+            &SystemClock,
         );
         assert_eq!(result.unwrap(), EvaluationDecision::PromptAgent);
     }
@@ -790,6 +801,7 @@ mod tests {
             None,
             &AlwaysTrust(true),
             &mut tracker,
+            &SystemClock,
         );
         assert_eq!(result.unwrap(), EvaluationDecision::AutoAccept);
     }
@@ -812,6 +824,7 @@ mod tests {
             None,
             &AlwaysTrust(true),
             &mut tracker,
+            &SystemClock,
         );
         assert_eq!(result.unwrap(), EvaluationDecision::AutoAccept);
     }
@@ -838,6 +851,7 @@ mod tests {
             None,
             &AlwaysTrust(true),
             &mut tracker,
+            &SystemClock,
         );
         assert_eq!(r1.unwrap(), EvaluationDecision::AutoAccept);
 
@@ -848,6 +862,7 @@ mod tests {
             None,
             &AlwaysTrust(true),
             &mut tracker,
+            &SystemClock,
         );
         assert_eq!(r2.unwrap(), EvaluationDecision::AutoAccept);
 
@@ -859,6 +874,7 @@ mod tests {
             None,
             &AlwaysTrust(true),
             &mut tracker,
+            &SystemClock,
         );
         assert_eq!(r3.unwrap(), EvaluationDecision::PromptAgent);
     }
@@ -871,20 +887,24 @@ mod tests {
             window: Duration::from_secs(10),
         };
 
-        let t0 = Instant::now();
+        let clock = TestClock::new(1000);
 
         // Record two accepts.
-        tracker.record_accept_at(t0);
-        tracker.record_accept_at(t0 + Duration::from_secs(1));
+        tracker.record_accept(&clock);
+        clock.advance(1);
+        tracker.record_accept(&clock);
 
         // At t0+5, still within window: not allowed (2/2 used).
-        assert!(!tracker.is_allowed_at(&limit, t0 + Duration::from_secs(5)));
+        clock.set(1005);
+        assert!(!tracker.is_allowed(&limit, &clock));
 
         // At t0+11, first entry expired: allowed (1/2 used).
-        assert!(tracker.is_allowed_at(&limit, t0 + Duration::from_secs(11)));
+        clock.set(1011);
+        assert!(tracker.is_allowed(&limit, &clock));
 
         // At t0+12, both entries expired: allowed (0/2 used).
-        assert!(tracker.is_allowed_at(&limit, t0 + Duration::from_secs(12)));
+        clock.set(1012);
+        assert!(tracker.is_allowed(&limit, &clock));
     }
 
     // -----------------------------------------------------------------------
@@ -903,6 +923,7 @@ mod tests {
             None,
             &AlwaysTrust(true),
             &mut tracker,
+            &SystemClock,
         );
         assert_eq!(result.unwrap(), EvaluationDecision::PromptAgent);
     }
@@ -924,6 +945,7 @@ mod tests {
             None,
             &AlwaysTrust(true),
             &mut tracker,
+            &SystemClock,
         );
         assert_eq!(result.unwrap(), EvaluationDecision::PromptAgent);
     }
@@ -953,6 +975,7 @@ mod tests {
             None,
             &AlwaysTrust(true),
             &mut tracker,
+            &SystemClock,
         );
         // Tool capabilities block auto-accept; falls through to PromptAgent.
         assert_eq!(result.unwrap(), EvaluationDecision::PromptAgent);
@@ -991,6 +1014,7 @@ mod tests {
             None,
             &AlwaysTrust(true),
             &mut tracker,
+            &SystemClock,
         );
         // Should be TemplateSpoofing, not an economic error.
         assert!(matches!(result, Err(InvitationError::TemplateSpoofing(_))));
@@ -1031,6 +1055,7 @@ mod tests {
             Some(&spending),
             &AlwaysTrust(true),
             &mut tracker,
+            &SystemClock,
         );
         // Paid context always prompts agent.
         assert_eq!(result.unwrap(), EvaluationDecision::PromptAgent);
@@ -1044,14 +1069,14 @@ mod tests {
     fn rate_limit_tracker_new_is_empty() {
         let mut tracker = RateLimitTracker::new();
         let limit = RateLimit::per_hour(5);
-        assert!(tracker.is_allowed(&limit));
+        assert!(tracker.is_allowed(&limit, &SystemClock));
     }
 
     #[test]
     fn rate_limit_tracker_default_is_empty() {
         let mut tracker = RateLimitTracker::default();
         let limit = RateLimit::per_hour(5);
-        assert!(tracker.is_allowed(&limit));
+        assert!(tracker.is_allowed(&limit, &SystemClock));
     }
 
     #[test]
@@ -1061,7 +1086,7 @@ mod tests {
             max_count: 0,
             window: Duration::from_secs(3600),
         };
-        assert!(!tracker.is_allowed(&limit));
+        assert!(!tracker.is_allowed(&limit, &SystemClock));
     }
 
     // -----------------------------------------------------------------------
@@ -1095,6 +1120,7 @@ mod tests {
             None,
             &AlwaysTrust(true),
             &mut tracker,
+            &SystemClock,
         );
         assert_eq!(result.unwrap(), EvaluationDecision::AutoAccept);
     }
