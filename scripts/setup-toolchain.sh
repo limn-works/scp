@@ -243,12 +243,22 @@ else
   ok "core.hooksPath set to scripts/hooks (pre-commit: lint + format)"
 fi
 
+# ---------------------------------------------------------------------------
+# Shell environment
+# ---------------------------------------------------------------------------
 echo ""
-bold "Environment setup:"
-info "Add to ~/.zshenv (ensures availability in all shells, including non-interactive):"
-info ""
-info "  eval \"\$(mise activate zsh --shims)\""
-info ""
+bold "Shell environment:"
+MISE_LINE='eval "$(mise activate zsh --shims)"'
+if grep -qF 'mise activate' ~/.zshenv 2>/dev/null; then
+  ok "mise activate already in ~/.zshenv"
+elif $CHECK_MODE; then
+  fail "mise activate not in ~/.zshenv — run without --check to fix"
+else
+  echo "" >> ~/.zshenv
+  echo '# mise — managed toolchain versions (added by scripts/setup-toolchain.sh)' >> ~/.zshenv
+  echo "$MISE_LINE" >> ~/.zshenv
+  ok "Added mise activate to ~/.zshenv"
+fi
 
 if [[ "$ERRORS" -gt 0 ]]; then
   exit 1
