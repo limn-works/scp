@@ -40,7 +40,8 @@ pub enum TrustRequirement {
 pub struct RateLimit {
     /// Maximum number of auto-accepts allowed within `window`.
     pub max_count: u32,
-    /// Rolling window duration.
+    /// Rolling window duration. Effective resolution is one second;
+    /// sub-second components are truncated during rate limit evaluation.
     pub window: Duration,
 }
 

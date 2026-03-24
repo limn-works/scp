@@ -44,7 +44,6 @@ The following modules previously contained standalone WASM reimplementations. Af
 | Address parsing in `discovery.rs` | Interleaved with WASM-specific JS-facing logic |
 | `scpid.rs` bridge glue | `#[wasm_bindgen]` functions, JS error mapping, WASM time/CSPRNG. Types and constants imported from `scp_protocol::identity::scpid`. |
 | `reference_verify.rs` | Uses browser Fetch API |
-| `WasmRateLimitTracker` | WASM-specific rate limit tracking using `js_sys::Date` |
 | `WasmNonceTracker` in `ucan.rs` | Implements `ValidationNonceTracker` trait with extract-validate-writeback pattern for `WasmContextManager` |
 | Provenance hashing (`provenance.rs`) | WASM-local canonical byte construction (`CanonicalProvenance`) |
 | Attestation canonical bytes | WASM-local canonical signing byte construction |

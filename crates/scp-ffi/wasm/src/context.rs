@@ -2022,47 +2022,12 @@ fn validate_min_protocol_version(params: &serde_json::Value) -> Result<(), ScpWa
 // ---------------------------------------------------------------------------
 
 // ---------------------------------------------------------------------------
-// WASM-local rate limit tracker (B1 — #614)
+// Rate limit tracker registry (B1 — #614)
 // ---------------------------------------------------------------------------
-
-/// WASM-local rate limit tracker for invitation auto-accept.
-///
-/// Mirrors `scp_core::context::invitation::RateLimitTracker` behavior using
-/// `js_sys::Date::now()` timestamps (milliseconds since epoch) instead of
-/// `std::time::Instant` (unavailable on `wasm32-unknown-unknown`).
-///
-/// Stored per-identity-DID in a `thread_local` `HashMap`.
-struct WasmRateLimitTracker {
-    /// Timestamps of auto-accept events in milliseconds since epoch.
-    accepts_ms: Vec<f64>,
-}
-
-impl WasmRateLimitTracker {
-    /// Creates a new empty tracker.
-    const fn new() -> Self {
-        Self {
-            accepts_ms: Vec::new(),
-        }
-    }
-
-    /// Records an auto-accept event at the current time.
-    fn record_accept(&mut self) {
-        self.accepts_ms.push(crate::time::now_ms());
-    }
-
-    /// Checks whether an additional auto-accept is allowed under the given
-    /// rate limit (`max_count` within `window_secs`). Prunes expired entries.
-    fn is_allowed(&mut self, max_count: u32, window_secs: f64) -> bool {
-        let now_ms = crate::time::now_ms();
-        let window_ms = window_secs * 1000.0;
-        self.accepts_ms.retain(|&t| (now_ms - t) < window_ms);
-        self.accepts_ms.len() < max_count as usize
-    }
-}
 
 thread_local! {
     /// Per-identity-DID rate limit trackers for invitation auto-accept.
-    static RATE_LIMIT_TRACKERS: std::cell::RefCell<std::collections::HashMap<String, WasmRateLimitTracker>>
+    static RATE_LIMIT_TRACKERS: std::cell::RefCell<std::collections::HashMap<String, scp_protocol::context::invitation::RateLimitTracker>>
         = std::cell::RefCell::new(std::collections::HashMap::new());
 }
 
@@ -2070,13 +2035,13 @@ thread_local! {
 /// given identity DID, creating one if it does not exist.
 fn with_rate_limit_tracker<F, T>(identity_did: &str, f: F) -> T
 where
-    F: FnOnce(&mut WasmRateLimitTracker) -> T,
+    F: FnOnce(&mut scp_protocol::context::invitation::RateLimitTracker) -> T,
 {
     RATE_LIMIT_TRACKERS.with(|trackers| {
         let mut map = trackers.borrow_mut();
         let tracker = map
             .entry(identity_did.to_owned())
-            .or_insert_with(WasmRateLimitTracker::new);
+            .or_insert_with(scp_protocol::context::invitation::RateLimitTracker::new);
         f(tracker)
     })
 }
@@ -2556,16 +2521,22 @@ fn check_auto_accept(
             .and_then(|rl| rl.get("window"))
             .and_then(serde_json::Value::as_f64),
     ) {
-        (Some(max_count), Some(window_secs)) => {
+        (Some(max_count), Some(window_secs)) if window_secs.is_finite() && window_secs >= 0.0 => {
             let max = u32::try_from(max_count).unwrap_or(u32::MAX);
-            with_rate_limit_tracker(identity_did, |tracker| tracker.is_allowed(max, window_secs))
+            let limit = scp_protocol::context::policy::RateLimit {
+                max_count: max,
+                window: std::time::Duration::from_secs_f64(window_secs),
+            };
+            with_rate_limit_tracker(identity_did, |tracker| {
+                tracker.is_allowed(&limit, &crate::time::WasmClock)
+            })
         }
         _ => true,
     };
 
     if rate_ok {
         with_rate_limit_tracker(identity_did, |tracker| {
-            tracker.record_accept();
+            tracker.record_accept(&crate::time::WasmClock);
         });
         return Ok(Some("auto_accept"));
     }
