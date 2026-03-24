@@ -2022,7 +2022,7 @@ fn validate_min_protocol_version(params: &serde_json::Value) -> Result<(), ScpWa
 // ---------------------------------------------------------------------------
 
 // ---------------------------------------------------------------------------
-// WASM-local rate limit tracker (B1 — #614)
+// Rate limit tracker registry (B1 — #614)
 // ---------------------------------------------------------------------------
 
 thread_local! {
@@ -2521,7 +2521,7 @@ fn check_auto_accept(
             .and_then(|rl| rl.get("window"))
             .and_then(serde_json::Value::as_f64),
     ) {
-        (Some(max_count), Some(window_secs)) => {
+        (Some(max_count), Some(window_secs)) if window_secs.is_finite() && window_secs >= 0.0 => {
             let max = u32::try_from(max_count).unwrap_or(u32::MAX);
             let limit = scp_protocol::context::policy::RateLimit {
                 max_count: max,
