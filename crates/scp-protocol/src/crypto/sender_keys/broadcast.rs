@@ -154,7 +154,7 @@ pub struct BroadcastKeyEpochAdvance {
 /// Tampering with any of these fields causes AEAD tag verification to fail on
 /// decryption. See issue #228, #396.
 ///
-/// The `signature` field is an Ed25519 signature over the canonical hash
+/// The `signature` field is an `Ed25519` signature over the canonical hash
 /// `SHA-256("SCP-BROADCAST-ENVELOPE-V1:" || version || len(context_id) || context_id || len(author_did) || author_did || sequence || key_epoch || timestamp || nonce || provenance_hash)`.
 /// The nonce is included to prevent content substitution by broadcast key
 /// holders. The `provenance_hash` binds provenance metadata to the signature.
@@ -183,7 +183,7 @@ pub struct BroadcastEnvelope {
     pub key_epoch: u64,
     /// Optional provenance metadata for cross-context data flows (§7.7.1).
     pub provenance: Option<crate::provenance::DataProvenance>,
-    /// Ed25519 signature over `canonical_hash("SCP-BROADCAST-ENVELOPE-V1:", ...)`
+    /// `Ed25519` signature over `canonical_hash("SCP-BROADCAST-ENVELOPE-V1:", ...)`
     /// with fields: `version`, `context_id`, `author_did`, `sequence`,
     /// `key_epoch`, `timestamp`, `nonce`, `provenance_hash`.
     #[serde(with = "crate::serde_util::serde_signature_64")]
@@ -338,7 +338,7 @@ pub struct SealBroadcastParams<'a> {
     pub timestamp: u64,
     /// Optional provenance metadata (§7.7.1).
     pub provenance: Option<crate::provenance::DataProvenance>,
-    /// Pre-computed Ed25519 signature over the canonical signing payload.
+    /// Pre-computed `Ed25519` signature over the canonical signing payload.
     ///
     /// Callers must compute this externally via [`build_broadcast_signing_payload`]
     /// and their key custody provider. This design keeps `seal_broadcast`
@@ -352,6 +352,13 @@ pub struct SealBroadcastParams<'a> {
 /// This mirrors [`compute_provenance_hash`](crate::envelope::inner) and uses
 /// the same serialization format (`MessagePack` via `rmp_serde::to_vec`) to ensure
 /// cross-envelope consistency.
+///
+/// **Note on serialization format**: Uses `MessagePack` because this hash is
+/// covered by the broadcast `Ed25519` signature and verified within a single
+/// broadcast context — no cross-implementation parity needed. FFI bridges
+/// use canonical JSON (`serde_json::to_vec`) for provenance hashing that
+/// crosses implementation boundaries. See the doc comment on
+/// [`crate::envelope::inner::compute_provenance_hash`] for the full rationale.
 ///
 /// Public so callers can compute the provenance hash externally for use in
 /// [`SigningPayloadFields::provenance_hash`] when constructing the signing
@@ -457,7 +464,7 @@ pub fn build_broadcast_signing_payload(fields: &SigningPayloadFields<'_>) -> [u8
 /// preventing attribution forgery and context/sequence confusion. See issue
 /// #228, #396.
 ///
-/// The `params.signature` field must be a pre-computed Ed25519 signature
+/// The `params.signature` field must be a pre-computed `Ed25519` signature
 /// over the canonical signing payload (see [`build_broadcast_signing_payload`]).
 /// The signature is verified BEFORE decryption in [`open_broadcast`] to reject
 /// forgeries early (issue #352).
@@ -579,10 +586,10 @@ fn decrypt_envelope(
 }
 
 /// Decrypts a [`BroadcastEnvelope`] using the author's broadcast key, with
-/// Ed25519 signature verification.
+/// `Ed25519` signature verification.
 ///
 /// Verification order (issue #352):
-/// 1. Verify Ed25519 signature over canonical metadata BEFORE decryption.
+/// 1. Verify `Ed25519` signature over canonical metadata BEFORE decryption.
 /// 2. Check epoch match.
 /// 3. Decrypt AES-256-GCM with AAD binding.
 ///
@@ -593,11 +600,11 @@ fn decrypt_envelope(
 ///
 /// * `key` — The author's broadcast key at the epoch specified in the envelope.
 /// * `envelope` — The sealed broadcast envelope to decrypt.
-/// * `verifying_key` — The author's Ed25519 verifying key for signature check.
+/// * `verifying_key` — The author's `Ed25519` verifying key for signature check.
 ///
 /// # Errors
 ///
-/// - [`SenderKeyError::VerificationFailed`] if the Ed25519 signature is invalid.
+/// - [`SenderKeyError::VerificationFailed`] if the `Ed25519` signature is invalid.
 /// - [`SenderKeyError::EpochMismatch`] if the key epoch does not match the envelope epoch.
 /// - [`SenderKeyError::CiphertextTooShort`] if the encrypted content is too short.
 /// - [`SenderKeyError::AuthenticationFailed`] if the AEAD tag verification fails
@@ -645,7 +652,7 @@ pub fn open_broadcast(
 ///
 /// **Security note:** Only use when the caller is already trusted (holds the
 /// broadcast key). Peer-to-peer consumers MUST use [`open_broadcast`] which
-/// verifies the Ed25519 signature before decryption.
+/// verifies the `Ed25519` signature before decryption.
 ///
 /// # Errors
 ///
@@ -1326,7 +1333,7 @@ mod tests {
 
     #[test]
     fn seal_open_with_signature_verification() {
-        // Full roundtrip with Ed25519 signature verification via open_broadcast.
+        // Full roundtrip with `Ed25519` signature verification via open_broadcast.
         let key = generate_broadcast_key("did:dht:alice");
         let sk = test_signing_key();
         let vk = sk.verifying_key();
@@ -1423,7 +1430,7 @@ mod tests {
         // during deserialization to prevent OOM from untrusted input (#347).
         //
         // We construct a valid-shaped envelope with 1 MiB of encrypted_content,
-        // serialize it to MessagePack (which is the wire format), then verify
+        // serialize it to `MessagePack` (which is the wire format), then verify
         // that deserialization fails with the bounded-bytes error.
         use crate::serde_util::BOUNDED_BYTES_MAX;
 

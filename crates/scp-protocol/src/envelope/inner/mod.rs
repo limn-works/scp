@@ -3,7 +3,7 @@
 //! The inner envelope is the authenticated payload visible only to group
 //! members after MLS decryption. It carries the sender's DID, sequence
 //! numbers, timestamp, the padded payload, provenance metadata, and an
-//! Ed25519 signature over a hash of all critical fields.
+//! `Ed25519` signature over a hash of all critical fields.
 //!
 //! **Processing order:** hash original plaintext -> hash provenance -> sign
 //! (covering both hashes) -> pad payload to bucket boundary.
@@ -47,7 +47,7 @@ pub enum MessageType {
 
     /// Sender key distribution sub-protocol message (§9.16).
     ///
-    /// The payload is a MessagePack-serialized
+    /// The payload is a `MessagePack`-serialized
     /// [`SenderKeyDistributionMessage`](crate::crypto::sender_keys::SenderKeyDistributionMessage)
     /// carrying epoch advances, key requests, key responses, or block
     /// notifications. This discriminator allows the transport layer to route
@@ -109,7 +109,7 @@ const fn default_inner_version() -> u16 {
 /// The authenticated inner envelope visible only to MLS group members.
 ///
 /// Carries the sender's DID, sequence numbers, timestamp, padded payload,
-/// provenance metadata, and an Ed25519 signature over a canonical hash of
+/// provenance metadata, and an `Ed25519` signature over a canonical hash of
 /// all critical fields (spec §13.2.1).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct InnerEnvelope {
@@ -178,7 +178,7 @@ pub struct InnerEnvelope {
     #[serde(default)]
     pub signing_key_id: SigningKeyId,
 
-    /// Ed25519 signature over the canonical hash of all critical fields.
+    /// `Ed25519` signature over the canonical hash of all critical fields.
     #[serde(with = "crate::serde_util::serde_signature_64")]
     pub signature: [u8; 64],
 
@@ -273,7 +273,7 @@ pub struct InnerEnvelopeParams<'a> {
 // Verification
 // ---------------------------------------------------------------------------
 
-/// Verifies the Ed25519 inner signature of an envelope against a sender's
+/// Verifies the `Ed25519` inner signature of an envelope against a sender's
 /// public key.
 ///
 /// Recomputes the canonical hash from the envelope's fields (using the stored
@@ -432,10 +432,22 @@ pub const fn validate_inner_version(
 /// Computes `SHA-256(serialize(provenance))` if present, or `SHA-256(0x00)` if
 /// absent. Returns a fixed-size 32-byte array (SHA-256 output).
 ///
+/// **Serialization format**: This function uses `MessagePack` (`rmp_serde::to_vec`)
+/// because it operates on the inner envelope path where the hash is covered by
+/// the `Ed25519` signature and verified within a single MLS group — no
+/// cross-implementation parity is needed.
+///
+/// **This is NOT the same as FFI bridge provenance hashing.** The FFI bridges
+/// (`PyO3`, NAPI, `UniFFI`, WASM) use `serde_json::to_vec` (canonical JSON) for
+/// provenance hashing because that hash crosses implementation boundaries
+/// (Rust ↔ Python ↔ TypeScript ↔ Swift ↔ Kotlin). The protocol rule is:
+/// **cross-implementation canonical hashing uses JSON (RFC 8785); `MessagePack`
+/// is for wire format only.** See `.docs/specs/05-contexts.md` §5.14 and
+/// `.docs/specs/25-test-vectors.md`.
+///
 /// # Errors
 ///
-/// Returns [`EnvelopeError::SerializationFailed`] if `MessagePack` serialization
-/// of the provenance struct fails.
+/// Returns [`EnvelopeError::SerializationFailed`] if serialization fails.
 pub fn compute_provenance_hash(provenance: Option<&Provenance>) -> Result<[u8; 32], EnvelopeError> {
     match provenance {
         Some(p) => {
@@ -450,7 +462,7 @@ pub fn compute_provenance_hash(provenance: Option<&Provenance>) -> Result<[u8; 3
 /// Computes the canonical hash over all critical envelope fields.
 ///
 /// A domain separator (`"SCP-INNER-ENVELOPE-V1:"`) is prepended to prevent
-/// cross-protocol signature confusion when the same Ed25519 key is reused
+/// cross-protocol signature confusion when the same `Ed25519` key is reused
 /// across different signing contexts.
 ///
 /// Variable-length fields (`context_id`, `sender_did`) are prefixed with
