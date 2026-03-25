@@ -1,47 +1,39 @@
 {
   "name": "batch2-1531-consequence-evaluation",
   "description": "#1531: Wire evaluate_consequence_rules into finalize_governance_action — governance must trigger consequence evaluation",
-  "created": "2026-03-25T12:00:00Z",
+  "created": "2026-03-25T14:00:00Z",
   "gates": [
     {
-      "name": "CALL: evaluate_consequence_rules called in governance.rs (direct function call)",
-      "check": "/Users/alec/.claude/plugins/cache/alecmarcus/odyssey/0.3.0/bin/check-ast crates/scp-runtime/src/context/manager/governance.rs '(call_expression function: (identifier) @fn (#eq? @fn \"evaluate_consequence_rules\"))' --min 1"
+      "name": "CALL: evaluate_consequence_rules called in governance.rs",
+      "check": "/Users/alec/.claude/plugins/cache/alecmarcus/odyssey/0.5.1/bin/check-ast crates/scp-runtime/src/context/manager/governance.rs '(call_expression function: (identifier) @fn (#eq? @fn \"evaluate_consequence_rules\"))' --min 1"
     },
     {
-      "name": "CALL-ALT: OR evaluate_consequence_rules called as scoped/method call",
-      "check": "/Users/alec/.claude/plugins/cache/alecmarcus/odyssey/0.3.0/bin/check-ast crates/scp-runtime/src/context/manager/governance.rs '(call_expression function: (identifier) @fn (#eq? @fn \"evaluate_consequence_rules\"))' --min 1 || /Users/alec/.claude/plugins/cache/alecmarcus/odyssey/0.3.0/bin/check-ast crates/scp-runtime/src/context/manager/governance.rs '(call_expression function: (scoped_identifier name: (identifier) @fn (#eq? @fn \"evaluate_consequence_rules\")))' --min 1 || /Users/alec/.claude/plugins/cache/alecmarcus/odyssey/0.3.0/bin/check-ast crates/scp-runtime/src/context/manager/governance.rs '(call_expression function: (field_expression field: (field_identifier) @method (#eq? @method \"evaluate_consequence_rules\")))' --min 1"
-    },
-    {
-      "name": "IMPORT: ConsequenceRule type referenced in governance.rs (imported, not reimplemented)",
-      "check": "/Users/alec/.claude/plugins/cache/alecmarcus/odyssey/0.3.0/bin/check-ast crates/scp-runtime/src/context/manager/governance.rs '((identifier) @id (#eq? @id \"ConsequenceRule\"))' --min 1"
+      "name": "IMPORT: ConsequenceRule type referenced in governance.rs",
+      "check": "/Users/alec/.claude/plugins/cache/alecmarcus/odyssey/0.5.1/bin/check-ast crates/scp-runtime/src/context/manager/governance.rs '((identifier) @id (#eq? @id \"ConsequenceRule\"))' --min 1"
     },
     {
       "name": "IMPORT: TriggeredConsequence type referenced in governance.rs",
-      "check": "/Users/alec/.claude/plugins/cache/alecmarcus/odyssey/0.3.0/bin/check-ast crates/scp-runtime/src/context/manager/governance.rs '((identifier) @id (#eq? @id \"TriggeredConsequence\"))' --min 1"
-    },
-    {
-      "name": "NO-DISCARD: evaluate_consequence_rules result not silently discarded",
-      "check": "/Users/alec/.claude/plugins/cache/alecmarcus/odyssey/0.3.0/bin/check-ast crates/scp-runtime/src/context/manager/governance.rs '(let_declaration value: (call_expression function: (identifier) @fn (#eq? @fn \"evaluate_consequence_rules\")))' --zero"
+      "check": "/Users/alec/.claude/plugins/cache/alecmarcus/odyssey/0.5.1/bin/check-ast crates/scp-runtime/src/context/manager/governance.rs '((identifier) @id (#eq? @id \"TriggeredConsequence\"))' --min 1"
     },
     {
       "name": "PIPELINE: #[ignore] for #1531 is removed",
-      "check": "/Users/alec/.claude/plugins/cache/alecmarcus/odyssey/0.3.0/bin/check-ast crates/scp-testing/tests/integration/pipeline_wiring.rs '(attribute_item (attribute (identifier) @attr value: (string_literal (string_content) @val (#match? @val \"#1531\")) (#eq? @attr \"ignore\")))' --zero"
+      "check": "/Users/alec/.claude/plugins/cache/alecmarcus/odyssey/0.5.1/bin/check-ast crates/scp-testing/tests/integration/pipeline_wiring.rs '(attribute_item (attribute (identifier) @attr value: (string_literal (string_content) @val (#match? @val \"#1531\")) (#eq? @attr \"ignore\")))' --zero"
     },
     {
-      "name": "PIPELINE-FN: pipeline test function exists and is active",
-      "check": "/Users/alec/.claude/plugins/cache/alecmarcus/odyssey/0.3.0/bin/check-ast crates/scp-testing/tests/integration/pipeline_wiring.rs '(function_item name: (identifier) @fn (#eq? @fn \"governance_dispatch_calls_evaluate_consequences\"))' --min 1"
+      "name": "PIPELINE-FN: pipeline test function is active",
+      "check": "/Users/alec/.claude/plugins/cache/alecmarcus/odyssey/0.5.1/bin/check-ast crates/scp-testing/tests/integration/pipeline_wiring.rs '(function_item name: (identifier) @fn (#eq? @fn \"governance_dispatch_calls_evaluate_consequences\"))' --min 1"
     },
     {
       "name": "TEST-POSITIVE: governance test has consequence evaluation test",
-      "check": "/Users/alec/.claude/plugins/cache/alecmarcus/odyssey/0.3.0/bin/check-ast crates/scp-runtime/src/context/manager/tests/governance.rs '(function_item name: (identifier) @fn (#match? @fn \"consequence\"))' --min 1"
+      "check": "/Users/alec/.claude/plugins/cache/alecmarcus/odyssey/0.5.1/bin/check-ast crates/scp-runtime/src/context/manager/tests/governance.rs '(function_item name: (identifier) @fn (#match? @fn \"consequence\"))' --min 1"
     },
     {
       "name": "TEST-HAS-ASSERT: consequence test contains assertion",
-      "check": "/Users/alec/.claude/plugins/cache/alecmarcus/odyssey/0.3.0/bin/check-ast crates/scp-runtime/src/context/manager/tests/governance.rs '(function_item name: (identifier) @fn body: (block (expression_statement (macro_invocation macro: (identifier) @mac (#match? @mac \"assert\")))) (#match? @fn \"consequence\"))' --min 1"
+      "check": "/Users/alec/.claude/plugins/cache/alecmarcus/odyssey/0.5.1/bin/check-ast crates/scp-runtime/src/context/manager/tests/governance.rs '(function_item name: (identifier) @fn body: (block (expression_statement (macro_invocation macro: (identifier) @mac (#match? @mac \"assert\")))) (#match? @fn \"consequence\"))' --min 1"
     },
     {
-      "name": "EVENT: ContextEvent variant for consequence actions exists or is referenced",
-      "check": "/Users/alec/.claude/plugins/cache/alecmarcus/odyssey/0.3.0/bin/check-ast crates/scp-runtime/src/context/manager/governance.rs '((identifier) @id (#match? @id \"Consequence|consequence_triggered|ConsequenceApplied\"))' --min 1"
+      "name": "EVENT: Consequence-related identifier referenced in governance.rs",
+      "check": "/Users/alec/.claude/plugins/cache/alecmarcus/odyssey/0.5.1/bin/check-ast crates/scp-runtime/src/context/manager/governance.rs '((identifier) @id (#match? @id \"Consequence|consequence_triggered|ConsequenceApplied\"))' --min 1"
     }
   ]
 }
