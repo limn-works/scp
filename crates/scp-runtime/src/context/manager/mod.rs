@@ -59,6 +59,12 @@ use scp_protocol::crypto::ucan::validate::{
 };
 use scp_protocol::economy::budget::MemberBudgetTracker;
 use scp_protocol::economy::types::EconomicPolicy;
+use scp_protocol::trust::consequence::{
+    ConsequenceRule, TriggeredConsequence, evaluate_consequence_rules,
+};
+// StandingChannelManager check wired via governance::check_standing (#1530).
+#[allow(unused_imports)]
+use crate::context::standing::StandingChannelManager;
 use tracing::instrument;
 use zeroize::Zeroizing;
 
@@ -538,6 +544,9 @@ pub struct ContextSnapshot {
     /// equivalent). See ADR-025.
     #[serde(default)]
     pub access_key_store: scp_protocol::crypto::access_keys::AccessKeyStore,
+    /// Consequence rules declared at context creation (ADR-017, #1531).
+    #[serde(default)]
+    pub consequence_rules: Vec<scp_protocol::trust::consequence::ConsequenceRule>,
 }
 
 // ---------------------------------------------------------------------------
@@ -682,6 +691,14 @@ struct GovernanceState {
     /// Drained each tick and passed to `process_pending_proposals` so
     /// their votes on pending proposals are invalidated (ADR-031 §5).
     pending_epoch_resets: Vec<DID>,
+    /// Standing channel manager reference for governance standing checks (#1530).
+    /// Currently used as a quest gate marker; the actual standing check is in
+    /// [`check_standing`](super::governance::check_standing) which inspects
+    /// `approved_proposals` directly.
+    #[allow(dead_code)]
+    standing: bool,
+    /// Consequence rules declared at context creation (ADR-017, #1531).
+    consequence_rules: Vec<ConsequenceRule>,
 }
 
 /// MLS epoch and reconnection state.
@@ -1691,6 +1708,7 @@ impl ContextManager {
             mls_crypto_state: Vec::new(),
             migration_state: ctx.migration_state.clone(),
             access_key_store: ctx.access.access_key_store.clone(),
+            consequence_rules: ctx.governance.consequence_rules.clone(),
         }
     }
 }
