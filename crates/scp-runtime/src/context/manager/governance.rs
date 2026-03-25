@@ -1256,7 +1256,9 @@ impl ContextManager {
                 };
                 (r, snap)
             } else {
-                // Encrypted mode: access key deletion signals the key layer.
+                // Encrypted mode: destroy the member's access key so they
+                // cannot decrypt future content (§9.17.2 step 3, ADR-038).
+                ctx.access.access_key_store.remove(context_id, did.as_ref());
                 (
                     GovernanceBanResult {
                         banned_did: did.0.clone(),
@@ -1369,6 +1371,20 @@ impl ContextManager {
                 }
             });
 
+            // Encrypted mode: generate a new access key at epoch 1 so the
+            // restored member can decrypt future content. Historical content
+            // from the revocation period is permanently inaccessible
+            // (forward-only restoration, §9.16.8, ADR-038).
+            if ctx.broadcast_context.is_none() {
+                let restored_key = scp_protocol::crypto::access_keys::generate_access_key(
+                    context_id,
+                    did.as_ref(),
+                );
+                ctx.access
+                    .access_key_store
+                    .set(context_id, did.as_ref(), restored_key);
+            }
+
             // Emit restoration events to receive buffer.
             ctx.receive_buffer
                 .push(ContextEvent::ReadAccessRestored { did: did.clone() });
@@ -1433,6 +1449,13 @@ impl ContextManager {
             ctx.membership
                 .add_member(did.clone(), role.to_owned(), tokens);
 
+            // Generate access key for the new member (§9.17.2 step 1).
+            let access_key =
+                scp_protocol::crypto::access_keys::generate_access_key(context_id, did.as_ref());
+            ctx.access
+                .access_key_store
+                .set(context_id, did.as_ref(), access_key);
+
             ctx.receive_buffer.push(ContextEvent::MemberJoined {
                 member_did: did.clone(),
                 role_name: role.to_owned(),
@@ -1491,6 +1514,9 @@ impl ContextManager {
             ctx.role_state.members.remove(did.as_ref());
             ctx.role_state.assignments.remove(did.as_ref());
             ctx.role_state.member_capabilities.remove(did.as_ref());
+
+            // Destroy the removed member's access key (§9.17.2, ADR-038).
+            ctx.access.access_key_store.remove(context_id, did.as_ref());
 
             ctx.receive_buffer.push(ContextEvent::MemberLeft {
                 member_did: did.clone(),
@@ -2770,9 +2796,31 @@ impl ContextManager {
                     None
                 }
             } else {
-                // Encrypted mode: the MLS backend handles key rotation via
-                // update proposals. No direct crypto call needed — the event
-                // signals the MLS layer to issue an Update + Commit.
+                // Encrypted mode: regenerate per-member access keys at a new
+                // epoch (§9.17.2 step 6, ADR-038). MLS key rotation and access
+                // key rotation are independent — MLS handles group secrets,
+                // access keys handle per-member CEK wrapping.
+                let member_dids: Vec<String> =
+                    ctx.membership.member_dids().map(|d| d.0.clone()).collect();
+                let current_epoch = ctx
+                    .access
+                    .access_key_store
+                    .get_all(context_id)
+                    .values()
+                    .map(scp_protocol::crypto::access_keys::AccessKey::epoch)
+                    .max()
+                    .unwrap_or(0);
+                let did_refs: Vec<&str> = member_dids.iter().map(String::as_str).collect();
+                let rotation = crate::crypto::access_keys::lifecycle::rotate_all_access_keys(
+                    context_id,
+                    &did_refs,
+                    current_epoch,
+                )
+                .map_err(|e| ContextError::CryptoFailed(e.to_string()))?;
+                for new_key in rotation.new_keys {
+                    let did = new_key.member_did().to_owned();
+                    ctx.access.access_key_store.set(context_id, &did, new_key);
+                }
                 None
             };
 

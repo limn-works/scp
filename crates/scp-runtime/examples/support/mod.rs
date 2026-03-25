@@ -8,9 +8,21 @@
 
 #![allow(dead_code)]
 
+use scp_identity::DID;
 use scp_protocol::context::builder::{ContextCreationError, ContextCryptoProvider};
 use scp_protocol::context::{ContextError, ContextParams};
 use scp_runtime::context::builder::{ContextEventLogProvider, ContextTransportProvider};
+
+/// Derives a deterministic signing key from a DID string for example use.
+pub fn signing_key_for(did: &DID) -> ed25519_dalek::SigningKey {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    did.as_ref().hash(&mut hasher);
+    let h = hasher.finish();
+    let mut seed = [0u8; 32];
+    seed[..8].copy_from_slice(&h.to_le_bytes());
+    ed25519_dalek::SigningKey::from_bytes(&seed)
+}
 
 /// Mock crypto provider — all operations succeed with dummy data.
 pub struct MockCrypto;
@@ -41,17 +53,6 @@ impl ContextCryptoProvider for MockCrypto {
     ) -> Result<(), ContextError> {
         Ok(())
     }
-    fn encrypt_message(
-        &self,
-        _id: &[u8; 32],
-        _sender_did: &str,
-        payload: &[u8],
-        _epoch: u64,
-        _sequence: u64,
-    ) -> Result<Vec<u8>, ContextError> {
-        // Return payload as-is (no real encryption in mock).
-        Ok(payload.to_vec())
-    }
     fn add_member(
         &self,
         _id: &[u8; 32],
@@ -72,6 +73,34 @@ impl ContextCryptoProvider for MockCrypto {
         _member_did: &str,
     ) -> Result<(), ContextError> {
         Ok(())
+    }
+
+    fn seal(
+        &self,
+        _context_id: &[u8; 32],
+        inner: &scp_protocol::envelope::inner::InnerEnvelope,
+        _routing_id: &[u8],
+        _blob_ttl: u32,
+    ) -> Result<Vec<u8>, ContextError> {
+        // Mock: serialize inner envelope directly (no encryption).
+        rmp_serde::to_vec_named(inner)
+            .map_err(|e| ContextError::CryptoFailed(format!("mock seal: {e}")))
+    }
+
+    fn open(
+        &self,
+        _context_id: &[u8; 32],
+        outer_bytes: &[u8],
+    ) -> Result<Option<scp_protocol::context::builder::OpenedEnvelope>, ContextError> {
+        // Mock: deserialize directly as InnerEnvelope (no decryption).
+        let inner: scp_protocol::envelope::inner::InnerEnvelope =
+            rmp_serde::from_slice(outer_bytes)
+                .map_err(|e| ContextError::CryptoFailed(format!("mock open: {e}")))?;
+        let sender_did = inner.sender_did.clone();
+        Ok(Some(scp_protocol::context::builder::OpenedEnvelope {
+            inner,
+            sender_did,
+        }))
     }
 }
 

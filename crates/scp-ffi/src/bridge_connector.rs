@@ -724,6 +724,18 @@ pub fn py_bridge_open_shadow_envelope(
     );
     let sender_key = SenderKey::from_bytes(*key_bytes);
 
+    // Evaluate bridge provenance trust level before decryption (§12.5).
+    // This ensures all inbound bridge operations have their provenance
+    // validated — matching the outbound path where seal_shadow_envelope
+    // attaches provenance via mark_bridge_provenance.
+    let trust_level = evaluate_trust_level(Some(&envelope.bridge_provenance), false);
+    if trust_level == scp_core::bridge::provenance::BridgeTrustLevel::ShadowBridged {
+        tracing::warn!(
+            trust_level = ?trust_level,
+            "opening shadow envelope with lowest trust tier (ShadowBridged)"
+        );
+    }
+
     Ok(open_shadow_envelope(
         &envelope,
         &sender_key,

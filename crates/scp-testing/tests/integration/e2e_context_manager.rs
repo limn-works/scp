@@ -118,21 +118,37 @@ impl ContextCryptoProvider for MockCrypto {
     ) -> Result<(), ContextError> {
         Ok(())
     }
-    fn encrypt_message(
+
+    fn seal(
         &self,
-        _ctx_id: &[u8; 32],
-        _sender_did: &str,
-        payload: &[u8],
-        _epoch: u64,
-        _sequence: u64,
+        _context_id: &[u8; 32],
+        inner: &scp_core::envelope::inner::InnerEnvelope,
+        _routing_id: &[u8],
+        _blob_ttl: u32,
     ) -> Result<Vec<u8>, ContextError> {
         self.messages_encrypted
             .lock()
             .unwrap()
-            .push(payload.to_vec());
-        // Mock encryption: return payload as-is (tests verify round-trip logic,
-        // not the crypto primitives which have their own unit tests).
-        Ok(payload.to_vec())
+            .push(inner.payload.clone());
+        // Mock: serialize inner envelope directly (no encryption).
+        rmp_serde::to_vec_named(inner)
+            .map_err(|e| ContextError::CryptoFailed(format!("mock seal: {e}")))
+    }
+
+    fn open(
+        &self,
+        _context_id: &[u8; 32],
+        outer_bytes: &[u8],
+    ) -> Result<Option<scp_core::context::builder::OpenedEnvelope>, ContextError> {
+        // Mock: deserialize directly as InnerEnvelope (no decryption).
+        let inner: scp_core::envelope::inner::InnerEnvelope =
+            rmp_serde::from_slice(outer_bytes)
+                .map_err(|e| ContextError::CryptoFailed(format!("mock open: {e}")))?;
+        let sender_did = inner.sender_did.clone();
+        Ok(Some(scp_core::context::builder::OpenedEnvelope {
+            inner,
+            sender_did,
+        }))
     }
 }
 
@@ -431,8 +447,9 @@ async fn e2e_message_round_trip_encrypted() {
 
     // Step 3: Alice sends an encrypted message.
     let original_msg = b"Hello Bob, this is a secret message from Alice!";
+    let alice_sk = signing_key_for(&alice_did);
     manager
-        .send_message(&handle, &alice_did, original_msg, None)
+        .send_message(&handle, &alice_did, original_msg, Some(&alice_sk), None)
         .await
         .unwrap();
 
@@ -709,8 +726,9 @@ async fn e2e_persistence_drop_and_restore() {
         assert_eq!(manager.member_count(ctx_id).await, Some(2));
 
         // Send a message to advance sequence numbers.
+        let admin_sk = signing_key_for(&admin_did);
         manager
-            .send_message(&handle, &admin_did, b"pre-restart message", None)
+            .send_message(&handle, &admin_did, b"pre-restart message", Some(&admin_sk), None)
             .await
             .unwrap();
     }
@@ -1027,8 +1045,9 @@ async fn e2e_full_lifecycle_create_join_send_leave_close() {
     assert_eq!(manager.member_count(ctx_id).await, Some(2));
 
     // Send message.
+    let admin_sk = signing_key_for(&admin_did);
     manager
-        .send_message(&handle, &admin_did, b"lifecycle test message", None)
+        .send_message(&handle, &admin_did, b"lifecycle test message", Some(&admin_sk), None)
         .await
         .unwrap();
 
@@ -1127,8 +1146,9 @@ async fn e2e_multi_bridge_api_surface_verification() {
     assert_eq!(bob_role.role_name, "member");
 
     // send_message
+    let alice_sk = signing_key_for(&alice);
     manager
-        .send_message(&enc_handle, &alice, b"bridge test", None)
+        .send_message(&enc_handle, &alice, b"bridge test", Some(&alice_sk), None)
         .await
         .unwrap();
 

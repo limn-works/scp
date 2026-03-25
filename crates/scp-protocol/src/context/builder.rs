@@ -5,6 +5,24 @@
 //! `scp-runtime::context::builder`.
 
 use super::ContextError;
+use crate::envelope::inner::InnerEnvelope;
+
+// ---------------------------------------------------------------------------
+// OpenedEnvelope — result of successfully opening a received envelope
+// ---------------------------------------------------------------------------
+
+/// Result of successfully opening and verifying a received envelope.
+///
+/// Returned by [`ContextCryptoProvider::open`] for application messages.
+/// Contains the deserialized inner envelope (with all integrity checks
+/// passed) and the sender's DID extracted from MLS credentials.
+#[derive(Debug, Clone)]
+pub struct OpenedEnvelope {
+    /// The verified inner envelope with all integrity checks passed.
+    pub inner: InnerEnvelope,
+    /// The sender's DID extracted from MLS credentials.
+    pub sender_did: String,
+}
 
 // ---------------------------------------------------------------------------
 // ContextCreationError
@@ -262,53 +280,73 @@ pub trait ContextCryptoProvider: Send + Sync {
         ))
     }
 
-    /// Encrypts a payload with sender key (ADR-007), wraps in inner envelope
-    /// (ADR-002), encrypts with MLS (ADR-001), wraps in outer envelope.
+    /// Seals an inner envelope for transport: serializes, sender-key encrypts,
+    /// MLS encrypts, wraps in outer envelope.
     ///
-    /// `epoch` and `sequence` are bound as Additional Authenticated Data
-    /// (AAD) in the sender-key AES-256-GCM layer to prevent ciphertext
-    /// relocation across contexts, epochs, and sequence positions.
+    /// This is the primary send-path crypto operation. The caller constructs
+    /// the `InnerEnvelope` (including signing); this method handles all
+    /// encryption layers.
+    ///
+    /// The default implementation returns an error. Production providers
+    /// (`MlsCryptoProvider`) override this with the full envelope pipeline.
     ///
     /// # Errors
     ///
     /// Returns [`ContextError::CryptoFailed`] if any encryption step fails.
-    fn encrypt_message(
+    fn seal(
         &self,
-        context_id: &[u8; 32],
-        sender_did: &str,
-        payload: &[u8],
-        epoch: u64,
-        sequence: u64,
-    ) -> Result<Vec<u8>, ContextError>;
+        _context_id: &[u8; 32],
+        _inner: &InnerEnvelope,
+        _routing_id: &[u8],
+        _blob_ttl: u32,
+    ) -> Result<Vec<u8>, ContextError> {
+        Err(ContextError::CryptoFailed(
+            "seal not supported by this provider".to_string(),
+        ))
+    }
 
-    /// Decrypts a message received from transport: MLS decrypt (ADR-001),
-    /// extract sender DID from the MLS credential, then sender key decrypt
-    /// (ADR-007).
+    /// Opens a received envelope: MLS decrypts, sender-key decrypts,
+    /// deserializes, verifies membership + padding + integrity check.
     ///
-    /// Returns `Ok(Some((plaintext, sender_did)))` for application messages,
-    /// or `Ok(None)` when the MLS message was a Commit or Proposal (processed
-    /// successfully but containing no application payload).
+    /// Returns `Some(OpenedEnvelope)` for application messages, `None` for
+    /// MLS Commit/Proposal messages (no application payload).
     ///
-    /// `epoch` and `sequence` are the sender-key AAD values. For standard
-    /// sender keys these are `(0, 0)` matching the encrypt path.
+    /// Signature verification is NOT performed here — the caller
+    /// (`ContextManager`) handles it via `key_resolver` after `open` returns.
     ///
     /// The default implementation returns an error. Production providers
-    /// (`MlsCryptoProvider`) and E2E test providers override this.
+    /// (`MlsCryptoProvider`) override this with the full receive pipeline.
     ///
     /// # Errors
     ///
-    /// Returns [`ContextError::CryptoFailed`] if MLS decryption, credential
-    /// extraction, or sender key decryption fails.
-    fn decrypt_message(
+    /// Returns [`ContextError::CryptoFailed`] if MLS decryption, sender key
+    /// decryption, deserialization, padding strip, or integrity check fails.
+    fn open(
         &self,
         _context_id: &[u8; 32],
-        _ciphertext: &[u8],
-        _epoch: u64,
-        _sequence: u64,
-    ) -> Result<Option<(Vec<u8>, String)>, ContextError> {
+        _outer_bytes: &[u8],
+    ) -> Result<Option<OpenedEnvelope>, ContextError> {
         Err(ContextError::CryptoFailed(
-            "decrypt_message not supported by this provider".to_string(),
+            "open not supported by this provider".to_string(),
         ))
+    }
+
+    /// Deposits a content access key for a member.
+    ///
+    /// Called by `ContextManager` after generating an access key for a member
+    /// during `create_context` (for the creator) or `join_context` (for new
+    /// members). The crypto provider may forward this key to the member
+    /// through an out-of-band channel (e.g., `KeyExchange` in tests).
+    ///
+    /// The default implementation is a no-op. Test providers that need to
+    /// share access keys between separate crypto instances should override.
+    fn deposit_access_key(
+        &self,
+        _context_id: &str,
+        _member_did: &str,
+        _key: &crate::crypto::access_keys::AccessKey,
+    ) {
+        // No-op by default.
     }
 
     // -- Recovery operations (§9.12) -----------------------------------------

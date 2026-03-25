@@ -529,6 +529,15 @@ pub struct ContextSnapshot {
     /// can survive process restarts during the grace period.
     #[serde(default)]
     pub migration_state: Option<MigrationState>,
+    /// Per-member access key store for content encryption key wrapping
+    /// (ADR-038, §9.17). Persisted so access keys survive process restarts
+    /// and can be used to wrap/unwrap content after recovery.
+    ///
+    /// **Security invariant**: Contains raw AES-256 key material. The
+    /// persistence layer MUST encrypt at rest (via `EncryptingAdapter` or
+    /// equivalent). See ADR-025.
+    #[serde(default)]
+    pub access_key_store: scp_protocol::crypto::access_keys::AccessKeyStore,
 }
 
 // ---------------------------------------------------------------------------
@@ -715,6 +724,10 @@ struct AccessControlState {
     /// Members excluded from future CEK wrapping (`FutureOnly` read revocation,
     /// ADR-038, §9.17). Subset of or equal to `read_revoked_members`.
     read_exclusion_list: HashSet<DID>,
+    /// Per-member access key store for content encryption key wrapping
+    /// (ADR-038, §9.17). Keys are generated when members join and used
+    /// by `wrap_content`/`unwrap_content` in the message pipeline.
+    access_key_store: scp_protocol::crypto::access_keys::AccessKeyStore,
 }
 
 /// TTL timer and extension state.
@@ -751,6 +764,14 @@ struct PerContextState {
     access: AccessControlState,
     /// TTL timer and extension state (SCP-021).
     ttl: TtlState,
+    /// Per-sender sequence tracker for anti-replay protection (§9.8.2).
+    /// Validates that per-sender sequence numbers and timestamps are
+    /// monotonically increasing within this context.
+    sequence_tracker: scp_protocol::envelope::SequenceTracker,
+    /// Per-sender reorder buffer for out-of-order message delivery (§9.8.5).
+    /// Buffers messages arriving ahead of their expected sequence number and
+    /// delivers them when the gap fills or a 30-second timeout expires.
+    reorder_buffer: scp_protocol::envelope::ReorderBuffer,
 }
 
 /// Creates a governance engine from a [`GovernanceModel`] selector and
@@ -1669,6 +1690,7 @@ impl ContextManager {
             // where the crypto provider is available. Initialized empty here.
             mls_crypto_state: Vec::new(),
             migration_state: ctx.migration_state.clone(),
+            access_key_store: ctx.access.access_key_store.clone(),
         }
     }
 }

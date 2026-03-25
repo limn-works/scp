@@ -69,14 +69,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     assert_eq!(members.len(), 2);
 
     // 5. Alice sends a message.
+    let alice_sk = support::signing_key_for(&alice);
     manager
-        .send_message(&handle, &alice, b"Hello Bob!", None)
+        .send_message(&handle, &alice, b"Hello Bob!", Some(&alice_sk), None)
         .await?;
     println!("\nAlice: Hello Bob!");
 
     // 6. Bob sends a reply.
+    let bob_sk = support::signing_key_for(&bob);
     manager
-        .send_message(&handle, &bob, b"Hi Alice!", None)
+        .send_message(&handle, &bob, b"Hi Alice!", Some(&bob_sk), None)
         .await?;
     println!("Bob: Hi Alice!");
 

@@ -16,7 +16,7 @@ sync = ["scp-platform/sync"]
 combined = ["scp-transport/combined"]
 
 [dependencies]
-scp-core = { path = "../scp-core", features = ["allow_unencrypted_storage"] }
+scp-core = { path = "../scp-core", features = ["allow_unencrypted_storage", "testing"] }
 scp-identity = { path = "../scp-identity", features = ["testing"] }
 scp-platform = { path = "../scp-platform", features = ["testing"] }
 scp-primitives = { path = "../scp-primitives" }
@@ -28,6 +28,7 @@ openmls = { workspace = true }
 openmls_basic_credential = { workspace = true }
 openmls_rust_crypto = { workspace = true }
 sha2 = { workspace = true }
+subtle = { workspace = true }
 rand = { workspace = true }
 thiserror = { workspace = true }
 bytes = "1"

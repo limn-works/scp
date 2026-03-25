@@ -3206,6 +3206,12 @@ pub async fn context_send(
                 }
             }
 
+            // Resolve the signing key from the handle's retained custody so the
+            // ContextManager can produce a valid inner envelope signature. Passing
+            // None would cause the encrypted send path to fail with "signing key
+            // required".
+            let resolved_signing_key = resolve_uniffi_signing_key(&handle).await.ok();
+
             // Delegate to the shared ContextManager for message delivery
             // through the transport provider.
             let manager = crate::runtime::context_manager()?;
@@ -3219,7 +3225,13 @@ pub async fn context_send(
 
             let sender_did: scp_identity::DID = identity.did.clone().into();
             manager
-                .send_message(&core_handle, &sender_did, &payload, None)
+                .send_message(
+                    &core_handle,
+                    &sender_did,
+                    &payload,
+                    resolved_signing_key.as_ref(),
+                    None,
+                )
                 .await
                 .map_err(ScpError::from)?;
 
@@ -8415,6 +8427,76 @@ pub async fn context_drain_events(handle: Arc<ContextHandle>) -> Vec<String> {
         .into_iter()
         .map(|e| format!("{e:?}"))
         .collect()
+}
+
+// ---------------------------------------------------------------------------
+// Free functions — access key lifecycle (#1529)
+// ---------------------------------------------------------------------------
+
+/// Generates and stores a per-member access key for explicit lifecycle
+/// management.
+///
+/// Delegates to [`ContextManager::generate_context_access_key`].
+///
+/// # Errors
+///
+/// Returns `ScpError::Context` if the context is not registered, the
+/// member is not found, or the caller lacks admin capability.
+#[uniffi::export]
+pub async fn access_key_generate(
+    context_id: String,
+    member_did: String,
+    caller_did: String,
+) -> Result<(), ScpError> {
+    let manager = crate::runtime::context_manager_expect();
+    manager
+        .generate_context_access_key(&context_id, &member_did, &caller_did)
+        .await
+        .map_err(ScpError::from)
+}
+
+/// Revokes (removes) a member's access key from the context's access key
+/// store.
+///
+/// Delegates to [`ContextManager::revoke_context_access_key`].
+///
+/// # Errors
+///
+/// Returns `ScpError::Context` if the context is not registered, no
+/// access key exists for the member, or the caller lacks admin capability.
+#[uniffi::export]
+pub async fn access_key_revoke(
+    context_id: String,
+    member_did: String,
+    caller_did: String,
+) -> Result<(), ScpError> {
+    let manager = crate::runtime::context_manager_expect();
+    manager
+        .revoke_context_access_key(&context_id, &member_did, &caller_did)
+        .await
+        .map_err(ScpError::from)
+}
+
+/// Restores a member's access key by generating a new key at the next
+/// epoch.
+///
+/// Delegates to [`ContextManager::restore_context_access_key`].
+///
+/// # Errors
+///
+/// Returns `ScpError::Context` if the context is not registered, the
+/// member is not found, or the caller lacks admin capability.
+#[uniffi::export]
+pub async fn access_key_restore(
+    context_id: String,
+    member_did: String,
+    caller_did: String,
+) -> Result<(), ScpError> {
+    let manager = crate::runtime::context_manager_expect();
+    manager
+        .restore_context_access_key(&context_id, &member_did, &caller_did)
+        .await
+        .map_err(ScpError::from)
 }
 
 // ---------------------------------------------------------------------------

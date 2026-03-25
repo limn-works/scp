@@ -219,10 +219,12 @@ pub fn py_fullstack_join_from_welcome(node: &PyFullStackNode, context_id: String
         })?;
 
     // Step 2: Replace the throwaway MLS group with the Welcome-derived one
-    // and pick up the adder's sender keys from the exchange.
-    node.inner.join_from_welcome(&ctx_bytes).map_err(|e| {
-        pyo3::exceptions::PyRuntimeError::new_err(format!("failed to join from Welcome: {e}"))
-    })?;
+    // and pick up the adder's sender keys and access key from the exchange.
+    node.inner
+        .join_from_welcome(&context_id, &ctx_bytes)
+        .map_err(|e| {
+            pyo3::exceptions::PyRuntimeError::new_err(format!("failed to join from Welcome: {e}"))
+        })?;
 
     // Step 2b: Regenerate the joiner's sender key and distribute it to
     // existing members. The key from create_context was for the throwaway
@@ -234,6 +236,15 @@ pub fn py_fullstack_join_from_welcome(node: &PyFullStackNode, context_id: String
                 "failed to distribute joiner sender key: {e}"
             ))
         })?;
+
+    // Step 2c: Sync all members' access keys into the ContextManager's
+    // PerContextState so that send_message wraps content for all recipients.
+    // join_from_welcome already populates E2eCryptoProvider's local store;
+    // this step ensures the ContextManager also has them.
+    rt.block_on(
+        node.inner
+            .sync_access_keys_to_manager(&context_id, &ctx_bytes),
+    );
 
     // Step 3: Store the handle.
     {
@@ -352,7 +363,7 @@ pub fn py_fullstack_decrypt_message<'py>(
     let ctx_bytes = context_id_bytes(&context_id);
     let plaintext = node
         .inner
-        .decrypt_message(&ctx_bytes, ciphertext, &sender_did, 0, 0)
+        .decrypt_message(&context_id, &ctx_bytes, ciphertext, &sender_did)
         .map_err(|e| {
             pyo3::exceptions::PyRuntimeError::new_err(format!("failed to decrypt message: {e}"))
         })?;

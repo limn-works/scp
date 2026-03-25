@@ -119,16 +119,6 @@ impl ContextCryptoProvider for MockCrypto {
     ) -> Result<(), ContextError> {
         Ok(())
     }
-    fn encrypt_message(
-        &self,
-        _id: &[u8; 32],
-        _sender_did: &str,
-        _payload: &[u8],
-        _epoch: u64,
-        _sequence: u64,
-    ) -> Result<Vec<u8>, ContextError> {
-        Ok(vec![0xAA])
-    }
     fn add_member(
         &self,
         _id: &[u8; 32],
@@ -149,6 +139,18 @@ impl ContextCryptoProvider for MockCrypto {
         _member_did: &str,
     ) -> Result<(), ContextError> {
         Ok(())
+    }
+
+    fn seal(
+        &self,
+        _context_id: &[u8; 32],
+        inner: &scp_protocol::envelope::inner::InnerEnvelope,
+        _routing_id: &[u8],
+        _blob_ttl: u32,
+    ) -> Result<Vec<u8>, ContextError> {
+        // Mock: serialize inner envelope directly (no encryption).
+        rmp_serde::to_vec_named(inner)
+            .map_err(|e| ContextError::CryptoFailed(format!("mock seal: {e}")))
     }
 }
 
@@ -815,7 +817,13 @@ async fn tier3_governance_revoke_write_access_broadcast() {
     // Verify Author cannot publish (write access revoked).
     let handle = ContextHandle::new(ctx_id.to_owned(), params.clone());
     let send_result = manager
-        .send_message(&handle, &author_did(), b"blocked message", None)
+        .send_message(
+            &handle,
+            &author_did(),
+            b"blocked message",
+            Some(&signing_key_for_did(&author_did())),
+            None,
+        )
         .await;
     assert!(
         send_result.is_err(),
@@ -860,7 +868,13 @@ async fn tier3_governance_revoke_write_access_broadcast() {
 
     // Author can send again.
     let send_result = manager
-        .send_message(&handle, &author_did(), b"restored message", None)
+        .send_message(
+            &handle,
+            &author_did(),
+            b"restored message",
+            Some(&signing_key_for_did(&author_did())),
+            None,
+        )
         .await;
     assert!(
         send_result.is_ok(),
@@ -1506,7 +1520,13 @@ async fn governance_tier_stacking_via_context_manager() {
     // Dave cannot write.
     let handle = ContextHandle::new(ctx_id.to_owned(), params.clone());
     let send = manager
-        .send_message(&handle, &dave(), b"should fail", None)
+        .send_message(
+            &handle,
+            &dave(),
+            b"should fail",
+            Some(&signing_key_for_did(&dave())),
+            None,
+        )
         .await;
     assert!(send.is_err(), "Dave should not be able to write (Tier 3)");
 
@@ -1527,7 +1547,13 @@ async fn governance_tier_stacking_via_context_manager() {
 
     // Dave STILL cannot write (governance Tier 3 still active).
     let send2 = manager
-        .send_message(&handle, &dave(), b"still blocked", None)
+        .send_message(
+            &handle,
+            &dave(),
+            b"still blocked",
+            Some(&signing_key_for_did(&dave())),
+            None,
+        )
         .await;
     assert!(
         send2.is_err(),
@@ -1543,7 +1569,13 @@ async fn governance_tier_stacking_via_context_manager() {
 
     // Dave CAN write now (both tiers reversed).
     let send3 = manager
-        .send_message(&handle, &dave(), b"success", None)
+        .send_message(
+            &handle,
+            &dave(),
+            b"success",
+            Some(&signing_key_for_did(&dave())),
+            None,
+        )
         .await;
     assert!(
         send3.is_ok(),

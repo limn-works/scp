@@ -16,7 +16,7 @@ use scp_protocol::context::templates::validate_against_template;
 use scp_protocol::context::{ContextError, ContextMode, ContextParams, ContextState};
 
 pub use scp_protocol::context::builder::{
-    AddMemberOutput, ContextCreationError, ContextCryptoProvider,
+    AddMemberOutput, ContextCreationError, ContextCryptoProvider, OpenedEnvelope,
 };
 
 /// Provides transport operations needed during context creation.
@@ -785,17 +785,6 @@ mod tests {
             _member_did: &str,
         ) -> Result<(), ContextError> {
             Ok(())
-        }
-
-        fn encrypt_message(
-            &self,
-            _context_id: &[u8; 32],
-            _sender_did: &str,
-            payload: &[u8],
-            _epoch: u64,
-            _sequence: u64,
-        ) -> Result<Vec<u8>, ContextError> {
-            Ok(payload.to_vec())
         }
     }
 

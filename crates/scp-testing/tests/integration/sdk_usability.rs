@@ -506,7 +506,7 @@ async fn context_manager_creates_usable_context() {
 
     // Bob joins.
     let ctx_bytes = context_id_bytes(ctx_id);
-    bob.join_from_welcome(&ctx_bytes).unwrap();
+    bob.join_from_welcome(ctx_id, &ctx_bytes).unwrap();
     println!("  Bob joined from Welcome");
 
     // Alice sends a message.
@@ -530,7 +530,7 @@ async fn context_manager_creates_usable_context() {
 
     // Bob decrypts.
     let decrypted = bob
-        .decrypt_message(&ctx_bytes, &sent[0].1, "did:dht:z6MkAliceUsability", 0, 0)
+        .decrypt_message(ctx_id, &ctx_bytes, &sent[0].1, "did:dht:z6MkAliceUsability")
         .unwrap();
     assert_eq!(
         decrypted.as_slice(),

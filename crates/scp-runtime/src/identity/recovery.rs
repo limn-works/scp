@@ -721,6 +721,7 @@ fn wrap_psk_for_device(psk: &[u8; 32], device_pk: &[u8; 32]) -> Option<Vec<u8>> 
 /// ```rust,ignore
 /// let backend = ProductionRecoveryBackend::new(
 ///     context_manager.clone(),
+///     post_rotation_signing_key,
 /// );
 /// ```
 ///
@@ -739,6 +740,12 @@ fn wrap_psk_for_device(psk: &[u8; 32], device_pk: &[u8; 32]) -> Option<Vec<u8>> 
 pub struct ProductionRecoveryBackend {
     /// The context manager that owns crypto, transport, and event log providers.
     manager: Arc<ContextManager>,
+    /// The signing key for the recovering identity (post-rotation).
+    ///
+    /// Recovery notifications must be signed by the real key so receivers can
+    /// verify them against the sender's public key. An ephemeral key would
+    /// produce signatures that don't match.
+    signing_key: ed25519_dalek::SigningKey,
 }
 
 impl ProductionRecoveryBackend {
@@ -749,9 +756,15 @@ impl ProductionRecoveryBackend {
     /// * `manager` — The context manager for the local node. Must be shared
     ///   via `Arc` because the orchestrator may run concurrently with other
     ///   context operations.
+    /// * `signing_key` — The post-rotation signing key for the recovering
+    ///   identity. Recovery notifications are signed with this key so
+    ///   receivers can verify them against the sender's public key.
     #[must_use]
-    pub const fn new(manager: Arc<ContextManager>) -> Self {
-        Self { manager }
+    pub const fn new(manager: Arc<ContextManager>, signing_key: ed25519_dalek::SigningKey) -> Self {
+        Self {
+            manager,
+            signing_key,
+        }
     }
 
     /// Bridges a synchronous trait method call to an async `ContextManager`
@@ -805,6 +818,7 @@ impl RecoveryBackend for ProductionRecoveryBackend {
                                 key_rotation.did_after.as_ref(),
                                 &payload_bytes,
                                 0, // sequence 0: MLS epoch-advance notification
+                                &self.signing_key,
                             ));
                         // Notification failure is non-fatal — the epoch was
                         // already advanced, which is the critical security step.
@@ -880,6 +894,7 @@ impl RecoveryBackend for ProductionRecoveryBackend {
             key_rotation.did_after.as_ref(),
             &revocation_payload,
             1, // sequence 1: UCAN revocation notification
+            &self.signing_key,
         ));
         match result {
             Ok(()) => Ok(()),
@@ -927,6 +942,7 @@ impl RecoveryBackend for ProductionRecoveryBackend {
             sender_did,
             payload.as_bytes(),
             2, // sequence 2: key-package rotation notification
+            &self.signing_key,
         ));
         match result {
             Ok(()) => Ok(()),
@@ -997,7 +1013,7 @@ impl RecoveryBackend for ProductionRecoveryBackend {
             // a suitable channel, then sends the notification through it.
             let send_result = Self::block_on_async(async {
                 self.manager
-                    .recovery_notify_contact(did_str, contact_did_str, &payload)
+                    .recovery_notify_contact(did_str, contact_did_str, &payload, &self.signing_key)
                     .await
             });
 
@@ -1096,6 +1112,7 @@ impl RecoveryBackend for ProductionRecoveryBackend {
             "system",
             &payload,
             3, // sequence 3: PSK rotation notification
+            &self.signing_key,
         ));
 
         result.is_ok()
@@ -1113,6 +1130,11 @@ mod tests {
 
     fn did(s: &str) -> DID {
         DID::from(s)
+    }
+
+    /// Returns a deterministic test signing key for `ProductionRecoveryBackend`.
+    fn test_signing_key() -> ed25519_dalek::SigningKey {
+        ed25519_dalek::SigningKey::from_bytes(&[42u8; 32])
     }
 
     // -----------------------------------------------------------------------
@@ -1860,15 +1882,16 @@ mod tests {
             fn remove_member_sender_key(&self, _: &[u8; 32], _: &str) -> Result<(), ContextError> {
                 Ok(())
             }
-            fn encrypt_message(
+            fn seal(
                 &self,
-                _: &[u8; 32],
-                _: &str,
-                payload: &[u8],
-                _: u64,
-                _: u64,
+                _context_id: &[u8; 32],
+                inner: &scp_protocol::envelope::inner::InnerEnvelope,
+                _routing_id: &[u8],
+                _blob_ttl: u32,
             ) -> Result<Vec<u8>, ContextError> {
-                Ok(payload.to_vec())
+                // Test-only: serialize inner envelope directly (no encryption).
+                rmp_serde::to_vec_named(inner)
+                    .map_err(|e| ContextError::CryptoFailed(format!("test seal: {e}")))
             }
         }
 
@@ -1972,7 +1995,7 @@ mod tests {
 
         setup_context(&manager, context_id, &alice).await;
 
-        let backend = ProductionRecoveryBackend::new(manager);
+        let backend = ProductionRecoveryBackend::new(manager, test_signing_key());
         let key_rotation = agent_key_rotation_outcome(&alice, 1000);
 
         let result = backend.mls_update(context_id, &key_rotation);
@@ -1982,7 +2005,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn production_backend_mls_update_unknown_context_fails() {
         let manager = test_context_manager();
-        let backend = ProductionRecoveryBackend::new(manager);
+        let backend = ProductionRecoveryBackend::new(manager, test_signing_key());
         let alice = did("did:dht:alice");
         let key_rotation = agent_key_rotation_outcome(&alice, 1000);
 
@@ -1999,7 +2022,7 @@ mod tests {
 
         setup_context(&manager, context_id, &alice).await;
 
-        let backend = ProductionRecoveryBackend::new(manager);
+        let backend = ProductionRecoveryBackend::new(manager, test_signing_key());
         let key_rotation = agent_key_rotation_outcome(&alice, 1000);
 
         let result = backend.revoke_ucans(context_id, &key_rotation);
@@ -2014,7 +2037,7 @@ mod tests {
 
         setup_context(&manager, context_id, &alice).await;
 
-        let backend = ProductionRecoveryBackend::new(manager);
+        let backend = ProductionRecoveryBackend::new(manager, test_signing_key());
         let key_rotation = agent_key_rotation_outcome(&alice, 1000);
 
         let result = backend.rotate_key_packages(context_id, &key_rotation);
@@ -2036,7 +2059,7 @@ mod tests {
         // recovering DID and each contact.
         setup_context_with_members(&manager, "ctx-shared", &alice, &[&bob, &carol]).await;
 
-        let backend = ProductionRecoveryBackend::new(manager);
+        let backend = ProductionRecoveryBackend::new(manager, test_signing_key());
         let key_rotation = agent_key_rotation_outcome(&alice, 1000);
         let contacts = HashSet::from([bob, carol]);
 
@@ -2048,7 +2071,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn production_backend_notify_contacts_empty_set() {
         let manager = test_context_manager();
-        let backend = ProductionRecoveryBackend::new(manager);
+        let backend = ProductionRecoveryBackend::new(manager, test_signing_key());
         let alice = did("did:dht:alice");
         let key_rotation = agent_key_rotation_outcome(&alice, 1000);
         let contacts = HashSet::new();
@@ -2065,7 +2088,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn production_backend_rotate_psk_succeeds() {
         let manager = test_context_manager();
-        let backend = ProductionRecoveryBackend::new(manager);
+        let backend = ProductionRecoveryBackend::new(manager, test_signing_key());
 
         let params = PskRotationParams {
             enrolled_device_pubkeys: vec![vec![1u8; 32], vec![2u8; 32]],
@@ -2079,7 +2102,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn production_backend_rotate_psk_excludes_compromised_device() {
         let manager = test_context_manager();
-        let backend = ProductionRecoveryBackend::new(manager);
+        let backend = ProductionRecoveryBackend::new(manager, test_signing_key());
 
         let params = PskRotationParams {
             enrolled_device_pubkeys: vec![vec![1u8; 32], vec![2u8; 32], vec![3u8; 32]],
@@ -2096,7 +2119,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn production_backend_rotate_psk_fails_no_eligible_devices() {
         let manager = test_context_manager();
-        let backend = ProductionRecoveryBackend::new(manager);
+        let backend = ProductionRecoveryBackend::new(manager, test_signing_key());
 
         // All devices compromised.
         let params = PskRotationParams {
@@ -2119,7 +2142,7 @@ mod tests {
         // notification can find a shared context.
         setup_context_with_members(&manager, context_id, &alice, &[&bob]).await;
 
-        let backend = ProductionRecoveryBackend::new(manager);
+        let backend = ProductionRecoveryBackend::new(manager, test_signing_key());
         let orch = CompromiseRecoveryOrchestrator::new(alice.clone(), vec![context_id.to_owned()]);
         let key_rotation = agent_key_rotation_outcome(&alice, 1000);
         let contacts = HashSet::from([bob]);
@@ -2155,7 +2178,7 @@ mod tests {
         // notification can find a shared context.
         setup_context_with_members(&manager, context_id, &alice, &[&bob]).await;
 
-        let backend = ProductionRecoveryBackend::new(manager);
+        let backend = ProductionRecoveryBackend::new(manager, test_signing_key());
         let orch = CompromiseRecoveryOrchestrator::new(alice.clone(), vec![context_id.to_owned()]);
         let key_rotation = active_key_rotation_outcome(&alice, 2000);
         let contacts = HashSet::from([bob]);
@@ -2194,7 +2217,7 @@ mod tests {
         // contact notification can find shared contexts.
         setup_context_with_members(&manager, context_id, &alice, &[&bob, &carol]).await;
 
-        let backend = ProductionRecoveryBackend::new(manager);
+        let backend = ProductionRecoveryBackend::new(manager, test_signing_key());
         let orch = CompromiseRecoveryOrchestrator::new(alice.clone(), vec![context_id.to_owned()]);
         let key_rotation = identity_key_rotation_outcome(&alice, did("did:dht:alice-new"), 3000);
         let contacts = HashSet::from([bob, carol]);
@@ -2232,7 +2255,7 @@ mod tests {
         setup_context(&manager, "ctx-ok-1", &alice).await;
         setup_context(&manager, "ctx-ok-2", &alice).await;
 
-        let backend = ProductionRecoveryBackend::new(manager);
+        let backend = ProductionRecoveryBackend::new(manager, test_signing_key());
         let orch = CompromiseRecoveryOrchestrator::new(
             alice.clone(),
             vec![

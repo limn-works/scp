@@ -11,6 +11,7 @@ use std::collections::HashMap;
 use openmls::prelude::MlsMessageOut;
 use openmls_basic_credential::SignatureKeyPair;
 use openmls_rust_crypto::OpenMlsRustCrypto;
+use scp_core::crypto::access_keys::AccessKey;
 use scp_core::crypto::sender_keys::SenderKey;
 
 /// A Welcome message + the joiner's MLS signer and provider, captured when
@@ -41,6 +42,12 @@ pub struct KeyExchange {
     /// When Alice adds Carol, she deposits the Commit for Bob to process
     /// so Bob's MLS group advances to the same epoch.
     pending_commits: HashMap<([u8; 32], String), Vec<Vec<u8>>>,
+    /// Access keys deposited for joiners:
+    /// `(context_id_str, target_joiner_did) -> Vec<(member_did, AccessKey)>`.
+    /// When Alice adds Bob, she deposits ALL existing members' access keys
+    /// (including Bob's and her own) here so Bob can retrieve them during
+    /// `join_from_welcome`. Using a Vec allows multiple keys per joiner.
+    access_keys: HashMap<(String, String), Vec<(String, AccessKey)>>,
 }
 
 impl KeyExchange {
@@ -51,6 +58,7 @@ impl KeyExchange {
             welcomes: HashMap::new(),
             sender_keys: HashMap::new(),
             pending_commits: HashMap::new(),
+            access_keys: HashMap::new(),
         }
     }
 
@@ -118,6 +126,38 @@ impl KeyExchange {
     pub fn take_commits(&mut self, context_id: &[u8; 32], member_did: &str) -> Vec<Vec<u8>> {
         self.pending_commits
             .remove(&(*context_id, member_did.to_owned()))
+            .unwrap_or_default()
+    }
+
+    /// Deposits an access key for a joiner to retrieve during `join_from_welcome`.
+    ///
+    /// The key is associated with `target_joiner_did` -- the DID of the member
+    /// who will pick it up. `member_did` identifies WHOSE access key this is.
+    /// Call once per existing member when adding a new joiner.
+    pub fn deposit_access_key(
+        &mut self,
+        context_id: &str,
+        target_joiner_did: &str,
+        member_did: &str,
+        key: AccessKey,
+    ) {
+        self.access_keys
+            .entry((context_id.to_owned(), target_joiner_did.to_owned()))
+            .or_default()
+            .push((member_did.to_owned(), key));
+    }
+
+    /// Takes (removes) all access keys deposited for the given joiner.
+    ///
+    /// Returns `(member_did, AccessKey)` pairs. Returns an empty Vec if
+    /// no keys have been deposited for this joiner.
+    pub fn take_access_keys(
+        &mut self,
+        context_id: &str,
+        joiner_did: &str,
+    ) -> Vec<(String, AccessKey)> {
+        self.access_keys
+            .remove(&(context_id.to_owned(), joiner_did.to_owned()))
             .unwrap_or_default()
     }
 

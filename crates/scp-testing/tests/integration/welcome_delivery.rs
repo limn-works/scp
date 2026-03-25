@@ -88,24 +88,38 @@ fn cross_process_welcome_delivery() {
             .unwrap();
     }
 
-    // Alice encrypts a message.
+    // Alice seals a message through the full envelope pipeline.
+    // Construct a minimal inner envelope for testing.
     let plaintext = b"Hello from Alice!";
-    let ciphertext = alice_crypto
-        .encrypt_message(&context_id, alice_did, plaintext, 0, 0)
+    let sk = ed25519_dalek::SigningKey::from_bytes(&[42u8; 32]);
+    let params = scp_core::envelope::inner::InnerEnvelopeParams {
+        version: scp_core::envelope::SCP_PROTOCOL_VERSION,
+        context_id: &hex::encode(context_id),
+        sender_did: alice_did,
+        epoch: 0,
+        generation: 0,
+        sequence: 1,
+        timestamp: 1_700_000_000,
+        message_type: scp_core::envelope::inner::MessageType::Content,
+        payload: plaintext,
+        provenance: None,
+        signing_key_id: scp_identity::SigningKeyId::Active,
+    };
+    let inner = scp_core::envelope::inner::sign::create_inner_envelope_raw(&params, &sk).unwrap();
+    let routing_id = scp_core::context::context_routing_id(&hex::encode(context_id));
+    let sealed = alice_crypto
+        .seal(&context_id, &inner, &routing_id, 300)
         .unwrap();
 
-    // Bob decrypts Alice's message — proves the full pipeline works:
-    // MLS Welcome join + sender key distribution + encrypt + decrypt.
-    let decrypted = bob_crypto
-        .decrypt_message(&context_id, &ciphertext, 0, 0)
-        .unwrap();
+    // Bob opens Alice's message — proves the full pipeline works:
+    // MLS Welcome join + sender key distribution + seal + open.
+    let opened = bob_crypto.open(&context_id, &sealed).unwrap();
     assert!(
-        decrypted.is_some(),
-        "decrypted must be Some for application message"
+        opened.is_some(),
+        "opened must be Some for application message"
     );
-    let (msg, sender) = decrypted.unwrap();
-    assert_eq!(msg, plaintext);
-    assert_eq!(sender, alice_did);
+    let envelope = opened.unwrap();
+    assert_eq!(envelope.sender_did, alice_did);
 }
 
 // ---------------------------------------------------------------------------

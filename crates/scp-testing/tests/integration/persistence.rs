@@ -1055,15 +1055,33 @@ mod mock_providers {
         ) -> Result<(), ContextError> {
             Ok(())
         }
-        fn encrypt_message(
+
+        fn seal(
             &self,
-            _ctx_id: &[u8; 32],
-            _sender_did: &str,
-            _payload: &[u8],
-            _epoch: u64,
-            _sequence: u64,
+            _context_id: &[u8; 32],
+            inner: &scp_core::envelope::inner::InnerEnvelope,
+            _routing_id: &[u8],
+            _blob_ttl: u32,
         ) -> Result<Vec<u8>, ContextError> {
-            Ok(vec![])
+            // Mock: serialize inner envelope directly (no encryption).
+            rmp_serde::to_vec_named(inner)
+                .map_err(|e| ContextError::CryptoFailed(format!("mock seal: {e}")))
+        }
+
+        fn open(
+            &self,
+            _context_id: &[u8; 32],
+            outer_bytes: &[u8],
+        ) -> Result<Option<scp_core::context::builder::OpenedEnvelope>, ContextError> {
+            // Mock: deserialize directly as InnerEnvelope (no decryption).
+            let inner: scp_core::envelope::inner::InnerEnvelope =
+                rmp_serde::from_slice(outer_bytes)
+                    .map_err(|e| ContextError::CryptoFailed(format!("mock open: {e}")))?;
+            let sender_did = inner.sender_did.clone();
+            Ok(Some(scp_core::context::builder::OpenedEnvelope {
+                inner,
+                sender_did,
+            }))
         }
     }
 

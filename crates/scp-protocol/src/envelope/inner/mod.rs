@@ -54,6 +54,14 @@ pub enum MessageType {
     /// sender key protocol messages through the existing envelope pipeline
     /// without adding new transport-level operations.
     KeyDistribution,
+
+    /// Infrastructure-level recovery notification (§9.12).
+    ///
+    /// Recovery messages bypass the access key wrapping layer on both the
+    /// send and receive paths. They carry plaintext recovery payloads
+    /// (trust recovery proposals, key rotation notifications) that must be
+    /// readable by all group members regardless of access key state.
+    Recovery,
 }
 
 impl MessageType {
@@ -64,6 +72,7 @@ impl MessageType {
             Self::Content => 0,
             Self::Signaling => 1,
             Self::KeyDistribution => 2,
+            Self::Recovery => 3,
         }
     }
 }

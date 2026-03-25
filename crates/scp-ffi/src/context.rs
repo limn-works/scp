@@ -1238,6 +1238,11 @@ fn py_context_send(
     let identity_did_owned = identity_did.to_owned();
     let rt = crate::runtime()?;
 
+    // Resolve the signing key from the identity registry so the ContextManager
+    // can produce a valid inner envelope signature. Passing None would cause
+    // the encrypted send path to fail with "signing key required".
+    let signing_key = resolve_signing_key(&identity_did_owned)?;
+
     // Delegate to ContextManager for message delivery through the transport.
     let context_id_for_drain = context_id.clone();
     {
@@ -1252,8 +1257,14 @@ fn py_context_send(
             let _ = temp_handle
                 .transition_to(&scp_core::context::ContextState::Active)
                 .await;
-            mgr.send_message(&temp_handle, &sender_did, &payload_bytes, None)
-                .await
+            mgr.send_message(
+                &temp_handle,
+                &sender_did,
+                &payload_bytes,
+                Some(&signing_key),
+                None,
+            )
+            .await
         })
         .map_err(|e| PyRuntimeError::new_err(format!("ContextManager send_message failed: {e}")))?;
     }
@@ -1341,6 +1352,26 @@ fn drain_and_deliver(context_id: &str) {
                 (
                     "scp:system".to_owned(),
                     format!("system_close:{initiator_did}").into_bytes(),
+                    ts,
+                )
+            }
+            scp_core::context::membership::ContextEvent::SequenceGapDetected {
+                sender_did,
+                expected_sequence,
+                first_delivered_sequence,
+                reason,
+            } => {
+                #[allow(clippy::cast_precision_loss)]
+                let ts = scp_primitives::SystemClock.now_secs() as f64;
+                (
+                    "scp:system".to_owned(),
+                    format!(
+                        "sequence_gap_detected:sender={sender_did},\
+                         expected={expected_sequence},\
+                         first_delivered={first_delivered_sequence},\
+                         reason={reason}"
+                    )
+                    .into_bytes(),
                     ts,
                 )
             }
@@ -3780,6 +3811,82 @@ fn parse_template_id(
     }
 }
 
+// ---------------------------------------------------------------------------
+// Access key operations (§9.17, ADR-038, #1529)
+// ---------------------------------------------------------------------------
+
+/// Generates and stores a per-member access key for explicit lifecycle
+/// management.
+///
+/// Delegates to [`ContextManager::generate_context_access_key`].
+///
+/// # Errors
+///
+/// Returns `RuntimeError` if the context is not registered, the member
+/// is not found, or the caller lacks admin capability.
+#[pyfunction]
+#[pyo3(name = "access_key_generate", signature = (context_id, member_did, caller_did))]
+fn py_access_key_generate(context_id: &str, member_did: &str, caller_did: &str) -> PyResult<()> {
+    validate::validate_context_id(context_id)?;
+    validate::validate_did(member_did)?;
+    validate::validate_did(caller_did)?;
+    let rt = crate::runtime()?;
+    let mgr =
+        crate::runtime::context_manager().map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+    rt.block_on(mgr.generate_context_access_key(context_id, member_did, caller_did))
+        .map_err(|e| {
+            PyRuntimeError::new_err(format!("[SCP-CTX-2070] access key generation failed: {e}"))
+        })
+}
+
+/// Revokes (removes) a member's access key from the context's access key
+/// store.
+///
+/// Delegates to [`ContextManager::revoke_context_access_key`].
+///
+/// # Errors
+///
+/// Returns `RuntimeError` if the context is not registered, no access
+/// key exists for the member, or the caller lacks admin capability.
+#[pyfunction]
+#[pyo3(name = "access_key_revoke", signature = (context_id, member_did, caller_did))]
+fn py_access_key_revoke(context_id: &str, member_did: &str, caller_did: &str) -> PyResult<()> {
+    validate::validate_context_id(context_id)?;
+    validate::validate_did(member_did)?;
+    validate::validate_did(caller_did)?;
+    let rt = crate::runtime()?;
+    let mgr =
+        crate::runtime::context_manager().map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+    rt.block_on(mgr.revoke_context_access_key(context_id, member_did, caller_did))
+        .map_err(|e| {
+            PyRuntimeError::new_err(format!("[SCP-CTX-2071] access key revocation failed: {e}"))
+        })
+}
+
+/// Restores a member's access key by generating a new key at the next
+/// epoch.
+///
+/// Delegates to [`ContextManager::restore_context_access_key`].
+///
+/// # Errors
+///
+/// Returns `RuntimeError` if the context is not registered, the member
+/// is not found, or the caller lacks admin capability.
+#[pyfunction]
+#[pyo3(name = "access_key_restore", signature = (context_id, member_did, caller_did))]
+fn py_access_key_restore(context_id: &str, member_did: &str, caller_did: &str) -> PyResult<()> {
+    validate::validate_context_id(context_id)?;
+    validate::validate_did(member_did)?;
+    validate::validate_did(caller_did)?;
+    let rt = crate::runtime()?;
+    let mgr =
+        crate::runtime::context_manager().map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+    rt.block_on(mgr.restore_context_access_key(context_id, member_did, caller_did))
+        .map_err(|e| {
+            PyRuntimeError::new_err(format!("[SCP-CTX-2072] access key restoration failed: {e}"))
+        })
+}
+
 /// Registers all context bridge types and functions with the Python module.
 ///
 /// Called from `lib.rs` during module initialization.
@@ -3855,6 +3962,10 @@ pub fn register_context(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(py_template_get_params, m)?)?;
     m.add_function(wrap_pyfunction!(py_validate_against_template, m)?)?;
     m.add_function(wrap_pyfunction!(py_validate_context_params, m)?)?;
+    // Access key operations (#1529)
+    m.add_function(wrap_pyfunction!(py_access_key_generate, m)?)?;
+    m.add_function(wrap_pyfunction!(py_access_key_revoke, m)?)?;
+    m.add_function(wrap_pyfunction!(py_access_key_restore, m)?)?;
     Ok(())
 }
 

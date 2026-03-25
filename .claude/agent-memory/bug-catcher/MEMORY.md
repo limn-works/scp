@@ -124,3 +124,20 @@ Notes:
 - **NAPI register_local_did inconsistency (LOW):** NAPI calls register_local_did in context_create; UniFFI/PyO3 don't. May cause is_local_did checks to fail on those bridges.
 - **RECURRING PATTERN UPDATE:** Authorization logic duplicated at bridge layer instead of delegated to ContextManager is a new pattern. Found across all 4 bridges with 3 different implementations. Fix: remove bridge-layer auth, rely on ContextManager enforcement.
 - **RECURRING PATTERN UPDATE:** `let _ = result;` (fire-and-forget on Result) is a code-smell for split-brain. Always propagate or explicitly handle close/cleanup errors.
+
+### Known Bug Patterns (Mar 2026 — Wiring Batch 1, envelope pipeline review, initial)
+- **FIXED: MlsCryptoProvider::open format mismatch (CRITICAL):** provider.rs now deserializes OuterEnvelope before MLS decrypt. Pattern was: new seal path wraps in OuterEnvelope but receive path not updated to unwrap.
+- **FIXED: InnerEnvelope sequence=0 breaks anti-replay (CRITICAL):** messaging.rs now passes real sequence from Phase 1 lock into InnerEnvelopeParams. Pattern was: placeholder value committed to signed immutable structure.
+- **FIXED: verify_and_unwrap fail-open on key_resolver returning None (HIGH):** Now uses `.ok_or_else()` to reject when key cannot be resolved. Pattern was: if-let-Some guard treated as fail-closed when None branch accepts.
+- **FIXED: Anti-replay before signature verification (MEDIUM):** Now: verify signature FIRST, THEN anti-replay. Pattern was: mutable state update before cryptographic verification.
+- **FIXED: No positive-path deliver_incoming test (MEDIUM):** Now has full send->deliver round-trip tests, replay rejection, tamper detection, reorder buffer tests.
+- **RECURRING PATTERN UPDATE:** Mock implementations that bypass production layers (MockCrypto vs MlsCryptoProvider) mask format mismatches. Always test at least one integration path through production crypto.
+
+### Known Bug Patterns (Mar 2026 — Wiring Batch 1, envelope pipeline review, second pass)
+- **deliver_incoming uses members().next() for local DID (CRITICAL):** messaging.rs:354-359. HashMap iteration is nondeterministic — returns arbitrary member, not local node. Access key lookup + unwrap fails in multi-member contexts. Pattern: using collection iteration where identity lookup is needed.
+- **All 3 non-WASM FFI bridges pass None for signing_key (MEDIUM):** PyO3 context.rs:1255, NAPI context.rs:773, UniFFI bridge.rs:3222 all pass `None` for signing_key to send_message. New encrypted path requires signing_key. Pattern: API signature change not propagated to call sites.
+- **Trust recovery signs with deterministic forgeable key (HIGH):** trust_recovery.rs:359-367. XOR-folds sender DID into signing key seed. Anyone with the public DID can derive the same key. Pattern: placeholder crypto using public data as secret.
+- **SequenceTracker::validate accepts sequence 0 for first message (MEDIUM):** validation.rs:226. `sequence <= 1` should be `sequence == 1`. Pattern: off-by-one in anti-replay initial state.
+- **validate_and_advance changed semantics without doc update (MEDIUM):** Now silently accepts gaps (jumps tracker forward). Doc says "rejects out-of-order". Pattern: semantic change not reflected in documentation.
+- **Dead provenance code in PyO3 tools.rs (MEDIUM):** tools.rs:903. Computes provenance but assigns to `_provenance` (discarded). Pattern: computed-but-unused result.
+- **RECURRING PATTERN UPDATE:** `members().next()` on HashMap is never safe for identity lookup. Always use an explicit local-DID field or parameter.

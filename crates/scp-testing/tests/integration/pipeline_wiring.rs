@@ -40,7 +40,7 @@ const PROVIDER_SRC: &str =
 // RATCHET CONSTANTS — may only increase
 // Any decrease requires human approval
 // =========================================================================
-const MIN_ACTIVE_PIPELINE_ASSERTIONS: usize = 5;
+const MIN_ACTIVE_PIPELINE_ASSERTIONS: usize = 15;
 
 // ---------------------------------------------------------------------------
 // Function body extraction — brace-matching parser
@@ -121,12 +121,14 @@ fn fn_body_contains(source: &str, fn_name: &str, callee: &str) -> bool {
 // Baseline assertions — currently wired, must pass today
 // ===========================================================================
 
-// Manager level: send_message calls crypto.encrypt_message
+// Manager level: send_message path calls crypto.seal (full envelope pipeline)
+// seal is in build_encrypted_envelope helper called from send_message
 #[test]
-fn send_message_calls_encrypt_message() {
+fn send_message_calls_seal() {
     assert!(
-        fn_body_contains(MANAGER_SRC, "send_message", "encrypt_message"),
-        "send_message must call encrypt_message (crypto provider)"
+        fn_body_contains(MANAGER_SRC, "send_message", ".seal(")
+            || fn_body_contains(MANAGER_SRC, "build_encrypted_envelope", ".seal("),
+        "send_message path must call crypto.seal (envelope pipeline)"
     );
 }
 
@@ -139,30 +141,163 @@ fn send_message_calls_transport_send() {
     );
 }
 
-// Manager level: deliver_incoming calls crypto.decrypt_message
+// Manager level: deliver_incoming calls crypto.open (full envelope pipeline)
 #[test]
-fn deliver_incoming_calls_decrypt_message() {
+fn deliver_incoming_calls_open() {
     assert!(
-        fn_body_contains(MANAGER_SRC, "deliver_incoming", "decrypt_message"),
-        "deliver_incoming must call decrypt_message (crypto provider)"
+        fn_body_contains(MANAGER_SRC, "deliver_incoming", ".open("),
+        "deliver_incoming must call crypto.open (envelope pipeline)"
     );
 }
 
-// Provider level: encrypt_message calls encrypt_sender_layer
+// Provider level: seal calls create_outer_envelope (envelope construction)
 #[test]
-fn encrypt_message_calls_encrypt_sender_layer() {
+fn seal_calls_create_outer_envelope() {
     assert!(
-        fn_body_contains(PROVIDER_SRC, "encrypt_message", "encrypt_sender_layer"),
-        "encrypt_message (provider) must call encrypt_sender_layer"
+        fn_body_contains(PROVIDER_SRC, "seal", "create_outer_envelope"),
+        "seal (provider) must call create_outer_envelope"
     );
 }
 
-// Provider level: decrypt_message calls decrypt_sender_layer
+// Provider level: seal calls encrypt_sender_layer (sender key encryption)
 #[test]
-fn decrypt_message_calls_decrypt_sender_layer() {
+fn seal_calls_encrypt_sender_layer() {
     assert!(
-        fn_body_contains(PROVIDER_SRC, "decrypt_message", "decrypt_sender_layer"),
-        "decrypt_message (provider) must call decrypt_sender_layer"
+        fn_body_contains(PROVIDER_SRC, "seal", "encrypt_sender_layer"),
+        "seal (provider) must call encrypt_sender_layer"
+    );
+}
+
+// Provider level: open calls decrypt_sender_layer
+#[test]
+fn open_calls_decrypt_sender_layer() {
+    assert!(
+        fn_body_contains(PROVIDER_SRC, "open", "decrypt_sender_layer"),
+        "open (provider) must call decrypt_sender_layer"
+    );
+}
+
+// --- Envelope layer (#1534) — NOW WIRED ---
+
+#[test]
+fn encrypt_path_calls_create_outer_envelope_or_seal() {
+    assert!(
+        fn_body_contains(PROVIDER_SRC, "seal", "create_outer_envelope")
+            || fn_body_contains(MANAGER_SRC, "send_message", "create_outer_envelope"),
+        "send/encrypt path must call create_outer_envelope"
+    );
+}
+
+// --- Inner envelope / signatures (#1534, #1547) — NOW WIRED ---
+
+#[test]
+fn encrypt_path_calls_create_inner_envelope() {
+    assert!(
+        fn_body_contains(MANAGER_SRC, "send_message", "create_inner_envelope_raw")
+            || fn_body_contains(
+                MANAGER_SRC,
+                "build_encrypted_envelope",
+                "create_inner_envelope_raw"
+            ),
+        "send path must call create_inner_envelope_raw"
+    );
+}
+
+#[test]
+fn decrypt_path_calls_verify_inner_signature() {
+    assert!(
+        fn_body_contains(MANAGER_SRC, "deliver_incoming", "verify_inner_signature")
+            || fn_body_contains(MANAGER_SRC, "verify_and_unwrap", "verify_inner_signature"),
+        "receive/decrypt path must call verify_inner_signature"
+    );
+}
+
+// --- Content wrapping (#1529) — NOW WIRED ---
+
+#[test]
+fn encrypt_path_calls_wrap_content() {
+    assert!(
+        fn_body_contains(MANAGER_SRC, "send_message", "wrap_content")
+            || fn_body_contains(MANAGER_SRC, "build_encrypted_envelope", "wrap_content"),
+        "send path must call wrap_content"
+    );
+}
+
+#[test]
+fn decrypt_path_calls_unwrap_content() {
+    assert!(
+        fn_body_contains(MANAGER_SRC, "deliver_incoming", "unwrap_content")
+            || fn_body_contains(MANAGER_SRC, "verify_and_unwrap", "unwrap_content"),
+        "receive/decrypt path must call unwrap_content"
+    );
+}
+
+// --- Padding (#1534) — NOW WIRED ---
+
+#[test]
+fn decrypt_path_calls_strip_padding() {
+    assert!(
+        fn_body_contains(PROVIDER_SRC, "open", "strip_padding")
+            || fn_body_contains(MANAGER_SRC, "deliver_incoming", "strip_padding")
+            || fn_body_contains(MANAGER_SRC, "verify_and_unwrap", "strip_padding"),
+        "receive/decrypt path must call strip_padding"
+    );
+}
+
+// --- Provenance (#1536) — WIRED (conditional on cross-context source) ---
+// attach_provenance is called in build_encrypted_envelope when
+// source_provenance is Some (cross-context data flow). For intra-context
+// direct messages source_provenance is None and attach_provenance is not
+// invoked. The pipeline test verifies the code path exists.
+
+#[test]
+fn encrypt_path_references_attach_provenance() {
+    assert!(
+        fn_body_contains(MANAGER_SRC, "send_message", "attach_provenance")
+            || fn_body_contains(MANAGER_SRC, "build_encrypted_envelope", "attach_provenance"),
+        "send path must reference attach_provenance"
+    );
+}
+
+// --- Anti-replay + reorder buffer (#1546, §9.8.5) — NOW WIRED ---
+
+#[test]
+fn deliver_incoming_calls_validate_received_envelope() {
+    // deliver_incoming delegates to validate_and_drain_timeouts which
+    // uses SequenceTracker::validate and TimestampValidator::validate
+    // separately, enabling out-of-order buffering per §9.8.5 while
+    // maintaining anti-replay protection.
+    assert!(
+        fn_body_contains(
+            MANAGER_SRC,
+            "deliver_incoming",
+            "validate_and_drain_timeouts"
+        ) && fn_body_contains(
+            MANAGER_SRC,
+            "validate_and_drain_timeouts",
+            "sequence_tracker"
+        ) && fn_body_contains(MANAGER_SRC, "validate_and_drain_timeouts", "tv.validate"),
+        "deliver_incoming must validate timestamps and sequence numbers (anti-replay + reorder)"
+    );
+}
+
+// --- Access key generation on member add (#1529) — NOW WIRED ---
+
+#[test]
+fn execute_add_member_calls_generate_access_key() {
+    assert!(
+        fn_body_contains(MANAGER_SRC, "execute_add_member", "generate_access_key"),
+        "execute_add_member must call generate_access_key"
+    );
+}
+
+// --- Negative assertion: send_message must NOT call old encrypt_message ---
+
+#[test]
+fn send_message_does_not_call_encrypt_message() {
+    assert!(
+        !fn_body_contains(MANAGER_SRC, "send_message", ".encrypt_message("),
+        "send_message must NOT call the old encrypt_message (replaced by seal)"
     );
 }
 
@@ -172,121 +307,6 @@ fn decrypt_message_calls_decrypt_sender_layer() {
 // Each assertion references the GitHub issue that will wire it.
 // When the wiring PR lands, remove the #[ignore] attribute.
 // ===========================================================================
-
-// --- Envelope layer (#1534) ---
-
-#[test]
-#[ignore = "#1534 — envelope sealing not yet wired into encrypt path"]
-fn encrypt_path_calls_seal_envelope() {
-    assert!(
-        fn_body_contains(PROVIDER_SRC, "encrypt_message", "seal_envelope")
-            || fn_body_contains(MANAGER_SRC, "send_message", "seal_envelope"),
-        "send/encrypt path must call seal_envelope"
-    );
-}
-
-#[test]
-#[ignore = "#1534 — envelope opening not yet wired into decrypt path"]
-fn decrypt_path_calls_open_envelope() {
-    assert!(
-        fn_body_contains(PROVIDER_SRC, "decrypt_message", "open_envelope")
-            || fn_body_contains(MANAGER_SRC, "deliver_incoming", "open_envelope"),
-        "receive/decrypt path must call open_envelope"
-    );
-}
-
-// --- Inner envelope / signatures (#1534, #1547) ---
-
-#[test]
-#[ignore = "#1534 — inner envelope creation not yet wired"]
-fn encrypt_path_calls_create_inner_envelope() {
-    assert!(
-        fn_body_contains(PROVIDER_SRC, "encrypt_message", "create_inner_envelope")
-            || fn_body_contains(MANAGER_SRC, "send_message", "create_inner_envelope"),
-        "send/encrypt path must call create_inner_envelope"
-    );
-}
-
-#[test]
-#[ignore = "#1547 — inner signature verification not yet wired"]
-fn decrypt_path_calls_verify_inner_signature() {
-    assert!(
-        fn_body_contains(PROVIDER_SRC, "decrypt_message", "verify_inner_signature")
-            || fn_body_contains(MANAGER_SRC, "deliver_incoming", "verify_inner_signature"),
-        "receive/decrypt path must call verify_inner_signature"
-    );
-}
-
-// --- Content wrapping (#1529) ---
-
-#[test]
-#[ignore = "#1529 — content wrapping not yet wired"]
-fn encrypt_path_calls_wrap_content() {
-    assert!(
-        fn_body_contains(PROVIDER_SRC, "encrypt_message", "wrap_content")
-            || fn_body_contains(MANAGER_SRC, "send_message", "wrap_content"),
-        "send/encrypt path must call wrap_content"
-    );
-}
-
-#[test]
-#[ignore = "#1529 — content unwrapping not yet wired"]
-fn decrypt_path_calls_unwrap_content() {
-    assert!(
-        fn_body_contains(PROVIDER_SRC, "decrypt_message", "unwrap_content")
-            || fn_body_contains(MANAGER_SRC, "deliver_incoming", "unwrap_content"),
-        "receive/decrypt path must call unwrap_content"
-    );
-}
-
-// --- Padding (#1534) ---
-
-#[test]
-#[ignore = "#1534 — padding not yet wired into encrypt path"]
-fn encrypt_path_calls_pad_to_bucket() {
-    assert!(
-        fn_body_contains(PROVIDER_SRC, "encrypt_message", "pad_to_bucket")
-            || fn_body_contains(MANAGER_SRC, "send_message", "pad_to_bucket"),
-        "send/encrypt path must call pad_to_bucket"
-    );
-}
-
-#[test]
-#[ignore = "#1534 — padding strip not yet wired into decrypt path"]
-fn decrypt_path_calls_strip_padding() {
-    assert!(
-        fn_body_contains(PROVIDER_SRC, "decrypt_message", "strip_padding")
-            || fn_body_contains(MANAGER_SRC, "deliver_incoming", "strip_padding"),
-        "receive/decrypt path must call strip_padding"
-    );
-}
-
-// --- Provenance (#1536) ---
-
-#[test]
-#[ignore = "#1536 — provenance attachment not yet wired"]
-fn encrypt_path_calls_attach_provenance() {
-    assert!(
-        fn_body_contains(PROVIDER_SRC, "encrypt_message", "attach_provenance")
-            || fn_body_contains(MANAGER_SRC, "send_message", "attach_provenance"),
-        "send/encrypt path must call attach_provenance"
-    );
-}
-
-// --- Anti-replay (#1546) ---
-
-#[test]
-#[ignore = "#1546 — sequence/replay check not yet wired into deliver_incoming"]
-fn deliver_incoming_calls_validate_received_envelope() {
-    assert!(
-        fn_body_contains(
-            MANAGER_SRC,
-            "deliver_incoming",
-            "validate_received_envelope"
-        ),
-        "deliver_incoming must call validate_received_envelope (anti-replay)"
-    );
-}
 
 // --- Governance / lifecycle ---
 
@@ -300,15 +320,6 @@ fn execute_remove_member_calls_remove_member_sender_key() {
             "remove_member_sender_key"
         ),
         "execute_remove_member must call remove_member_sender_key"
-    );
-}
-
-#[test]
-#[ignore = "#1529 — access key generation on member add not yet wired"]
-fn execute_add_member_calls_generate_access_key() {
-    assert!(
-        fn_body_contains(MANAGER_SRC, "execute_add_member", "generate_access_key"),
-        "execute_add_member must call generate_access_key"
     );
 }
 
@@ -402,62 +413,6 @@ fn pipeline_active_assertions_never_decrease() {
 fn no_stale_ignores() {
     let mut stale = vec![];
 
-    // Envelope (#1534)
-    if fn_body_contains(PROVIDER_SRC, "encrypt_message", "seal_envelope")
-        || fn_body_contains(MANAGER_SRC, "send_message", "seal_envelope")
-    {
-        stale.push("encrypt_path_calls_seal_envelope (#1534)");
-    }
-    if fn_body_contains(PROVIDER_SRC, "decrypt_message", "open_envelope")
-        || fn_body_contains(MANAGER_SRC, "deliver_incoming", "open_envelope")
-    {
-        stale.push("decrypt_path_calls_open_envelope (#1534)");
-    }
-    if fn_body_contains(PROVIDER_SRC, "encrypt_message", "create_inner_envelope")
-        || fn_body_contains(MANAGER_SRC, "send_message", "create_inner_envelope")
-    {
-        stale.push("encrypt_path_calls_create_inner_envelope (#1534)");
-    }
-    if fn_body_contains(PROVIDER_SRC, "encrypt_message", "pad_to_bucket")
-        || fn_body_contains(MANAGER_SRC, "send_message", "pad_to_bucket")
-    {
-        stale.push("encrypt_path_calls_pad_to_bucket (#1534)");
-    }
-    if fn_body_contains(PROVIDER_SRC, "decrypt_message", "strip_padding")
-        || fn_body_contains(MANAGER_SRC, "deliver_incoming", "strip_padding")
-    {
-        stale.push("decrypt_path_calls_strip_padding (#1534)");
-    }
-
-    // Signature verification (#1547)
-    if fn_body_contains(PROVIDER_SRC, "decrypt_message", "verify_inner_signature")
-        || fn_body_contains(MANAGER_SRC, "deliver_incoming", "verify_inner_signature")
-    {
-        stale.push("decrypt_path_calls_verify_inner_signature (#1547)");
-    }
-
-    // Access keys (#1529)
-    if fn_body_contains(PROVIDER_SRC, "encrypt_message", "wrap_content")
-        || fn_body_contains(MANAGER_SRC, "send_message", "wrap_content")
-    {
-        stale.push("encrypt_path_calls_wrap_content (#1529)");
-    }
-    if fn_body_contains(PROVIDER_SRC, "decrypt_message", "unwrap_content")
-        || fn_body_contains(MANAGER_SRC, "deliver_incoming", "unwrap_content")
-    {
-        stale.push("decrypt_path_calls_unwrap_content (#1529)");
-    }
-    if fn_body_contains(MANAGER_SRC, "execute_add_member", "generate_access_key") {
-        stale.push("execute_add_member_calls_generate_access_key (#1529)");
-    }
-
-    // Provenance (#1536)
-    if fn_body_contains(PROVIDER_SRC, "encrypt_message", "attach_provenance")
-        || fn_body_contains(MANAGER_SRC, "send_message", "attach_provenance")
-    {
-        stale.push("encrypt_path_calls_attach_provenance (#1536)");
-    }
-
     // Sender key rotation (#1541)
     if fn_body_contains(
         MANAGER_SRC,
@@ -465,15 +420,6 @@ fn no_stale_ignores() {
         "remove_member_sender_key",
     ) {
         stale.push("execute_remove_member_calls_remove_member_sender_key (#1541)");
-    }
-
-    // Anti-replay (#1546)
-    if fn_body_contains(
-        MANAGER_SRC,
-        "deliver_incoming",
-        "validate_received_envelope",
-    ) {
-        stale.push("deliver_incoming_calls_validate_received_envelope (#1546)");
     }
 
     // Standing (#1530)

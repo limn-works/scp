@@ -383,7 +383,7 @@ impl ContentAccessState {
 /// with a nested `HashMap<context_id, HashMap<member_did, AccessKey>>`.
 ///
 /// See ADR-038 §2, spec §9.17.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
 pub struct AccessKeyStore {
     /// Maps `context_id -> (member_did -> AccessKey)`.
     keys: HashMap<String, HashMap<String, AccessKey>>,

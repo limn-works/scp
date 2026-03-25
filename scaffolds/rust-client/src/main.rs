@@ -72,7 +72,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // ── 4. Send a message ─────────────────────────────────────────
     manager
-        .send_message(&handle, &did, b"Hello, SCP!", None)
+        .send_message(&handle, &did, b"Hello, SCP!", None, None)
         .await?;
     println!("Message sent.");
 

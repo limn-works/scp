@@ -133,6 +133,12 @@
 - GOOD: Exhaustive match arms in governance dispatch (no wildcards)
 - GOOD: Unanimity check via set-difference pattern in ExtendTtl and PromoteContext
 
+### Wiring Batch 1 Messaging (2026-03-24, updated)
+- See `wiring-batch1-messaging-findings.md` for full details (15 files, line-by-line review)
+- HIGH x4: NAPI/UniFFI signing key .ok() falls back to None; Recovery MessageType bypass skips access key unwrapping; access key TOCTOU between Phase 1/3; reorder buffer stores pre-decrypted plaintext
+- MEDIUM x7: sender key AAD zeros (#1422); access key wrapping AAD zeros; bridge trust level discarded; SequenceTracker not persisted; SequenceTracker validate() TOCTOU; snapshot key bytes not Zeroizing; FFI access key ops lack authorization
+- GOOD: Sig verify before anti-replay; cross-context injection defense; MLS credential match; constant-time hash; domain-sep routing IDs; fail-closed defaults; correct timestamp validator; sequence 0 rejection; bounded reorder buffer; correct sign order
+
 ### General Patterns
 - clippy deny unwrap/expect in lib code; thiserror; Rust 2024; #![forbid(unsafe_code)] except scp-ffi
 - zeroize inconsistent: store layer yes, identity signing keys and MLS key pairs no

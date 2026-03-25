@@ -22,8 +22,15 @@ use std::sync::Mutex;
 
 use scp_core::context::ContextError;
 use scp_core::context::builder::{ContextCreationError, ContextCryptoProvider};
+use scp_core::crypto::access_keys::{AccessKey, AccessKeyStore};
 use scp_core::crypto::mls::credential::ScpCredential;
-use scp_core::crypto::mls::encrypt::{decrypt, encrypt, serialize_ciphertext};
+use sha2::Digest;
+use subtle::ConstantTimeEq;
+
+use scp_core::crypto::mls::encrypt::encrypt as mls_encrypt;
+use scp_core::crypto::mls::encrypt::{
+    DecryptedContent, decrypt, decrypt_with_sender_did, serialize_ciphertext,
+};
 use scp_core::crypto::mls::epoch_grace::EpochGraceStore;
 use scp_core::crypto::mls::group::{
     ScpMlsGroup, add_member, create_group, destroy_group, generate_key_package, join_group,
@@ -59,6 +66,11 @@ pub struct E2eCryptoProvider {
     /// Tracks which members have been added to each context (for sender key
     /// distribution targeting).
     members: Mutex<HashMap<[u8; 32], Vec<String>>>,
+    /// Per-member access keys for content-access-key wrapping/unwrapping.
+    /// Keyed by `(context_id_str, member_did)`. Populated via
+    /// `pickup_access_keys` (joiner picks up all keys from `KeyExchange`)
+    /// and `set_access_key` (creator copies key from `ContextManager`).
+    access_keys: Mutex<AccessKeyStore>,
 }
 
 #[allow(clippy::significant_drop_tightening)]
@@ -75,6 +87,7 @@ impl E2eCryptoProvider {
             broadcast_keys: Mutex::new(HashMap::new()),
             exchange,
             members: Mutex::new(HashMap::new()),
+            access_keys: Mutex::new(AccessKeyStore::new()),
         }
     }
 
@@ -96,6 +109,17 @@ impl E2eCryptoProvider {
     }
 
     // -- Extra methods (not part of ContextCryptoProvider trait) ---------------
+
+    /// Returns the list of member DIDs for a context, as known from the MLS
+    /// group roster. Populated during `join_from_welcome`.
+    #[must_use]
+    pub fn context_members(&self, context_id: &[u8; 32]) -> Vec<String> {
+        let members = self
+            .members
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        members.get(context_id).cloned().unwrap_or_default()
+    }
 
     /// Joins a context by retrieving the Welcome message from the shared
     /// `KeyExchange` and forming the local MLS group state.
@@ -174,6 +198,10 @@ impl E2eCryptoProvider {
                 store.set(&ctx_hex, &sender_did, key);
             }
         }
+
+        // Access key pickup is handled by FullStackNode::join_from_welcome
+        // which has access to the original string context_id needed for
+        // the KeyExchange lookup.
 
         Ok(())
     }
@@ -298,21 +326,85 @@ impl E2eCryptoProvider {
         Ok(())
     }
 
-    /// Decrypts a message that was encrypted by `encrypt_message`.
+    /// Deposits an access key in the shared `KeyExchange` for a joiner to
+    /// pick up during `join_from_welcome`.
     ///
-    /// Performs the reverse: MLS decrypt → sender key decrypt.
+    /// `target_joiner_did` is the DID of the member who will retrieve this
+    /// key. `member_did` identifies whose access key this is.
+    pub fn deposit_access_key(
+        &self,
+        context_id: &str,
+        target_joiner_did: &str,
+        member_did: &str,
+        key: AccessKey,
+    ) {
+        let mut exchange = self
+            .exchange
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        exchange.deposit_access_key(context_id, target_joiner_did, member_did, key);
+    }
+
+    /// Picks up ALL access keys from the shared `KeyExchange` deposited for
+    /// this node and stores them locally in the access key store.
+    pub fn pickup_access_keys(&self, context_id: &str) {
+        let keys = {
+            let mut exchange = self
+                .exchange
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            exchange.take_access_keys(context_id, &self.local_did)
+        };
+        let mut store = self
+            .access_keys
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        for (member_did, key) in keys {
+            store.set(context_id, &member_did, key);
+        }
+    }
+
+    /// Returns a reference to the local access key store (for the decrypt
+    /// path in `FullStackNode`).
+    pub fn get_access_key(&self, context_id: &str, member_did: &str) -> Option<AccessKey> {
+        let store = self
+            .access_keys
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        store.get(context_id, member_did).cloned()
+    }
+
+    /// Stores an access key directly in the local access key store.
+    ///
+    /// Unlike [`pickup_access_keys`](Self::pickup_access_keys), this bypasses
+    /// the `KeyExchange` and writes directly to the provider's store.
+    /// Used to copy the context creator's access key from the
+    /// `ContextManager`'s `PerContextState` into the crypto provider.
+    pub fn set_access_key(&self, context_id: &str, member_did: &str, key: AccessKey) {
+        let mut store = self
+            .access_keys
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        store.set(context_id, member_did, key);
+    }
+
+    /// Decrypts a message produced by the full envelope pipeline (`seal`).
+    ///
+    /// Performs the reverse of the send path:
+    /// `OuterEnvelope` → MLS decrypt → sender key decrypt → `InnerEnvelope` →
+    /// strip padding → access key unwrap → plaintext.
     ///
     /// # Arguments
     ///
     /// * `context_id` - The 32-byte context identifier.
-    /// * `ciphertext` - The double-encrypted payload (sender key + MLS).
+    /// * `ciphertext` - The serialized `OuterEnvelope` (output of `seal`).
     /// * `sender_did` - The DID of the sender (for sender key lookup).
     /// * `epoch` - The sender key epoch (AAD).
     /// * `sequence` - The sequence number (AAD).
     ///
     /// # Errors
     ///
-    /// Returns `ContextError` if MLS decryption or sender key decryption fails.
+    /// Returns `ContextError` if any decryption or deserialization step fails.
     pub fn decrypt_message(
         &self,
         context_id: &[u8; 32],
@@ -323,6 +415,12 @@ impl E2eCryptoProvider {
     ) -> Result<Vec<u8>, ContextError> {
         let ctx_hex = Self::context_id_hex(context_id);
 
+        // Step 0: Deserialize outer envelope to extract MLS ciphertext.
+        let outer: scp_core::envelope::outer::OuterEnvelope = rmp_serde::from_slice(ciphertext)
+            .map_err(|e| {
+                ContextError::CryptoFailed(format!("outer envelope deserialization: {e}"))
+            })?;
+
         // Step 1: MLS decrypt.
         let mls_decrypted = {
             let mut groups = self
@@ -332,7 +430,8 @@ impl E2eCryptoProvider {
             let group = groups
                 .get_mut(context_id)
                 .ok_or_else(|| ContextError::CryptoFailed("no MLS group for context".into()))?;
-            decrypt(group, ciphertext).map_err(|e| ContextError::CryptoFailed(e.to_string()))?
+            decrypt(group, &outer.encrypted_blob)
+                .map_err(|e| ContextError::CryptoFailed(e.to_string()))?
         };
 
         // Step 2: Sender key decrypt.
@@ -348,13 +447,62 @@ impl E2eCryptoProvider {
             })?
         };
 
-        decrypt_sender_layer(
+        let sender_decrypted = decrypt_sender_layer(
             &sender_key,
             &mls_decrypted,
             &ctx_hex,
             sender_did,
             epoch,
             sequence,
+        )
+        .map_err(|e| ContextError::CryptoFailed(e.to_string()))?;
+
+        // Step 3: Deserialize InnerEnvelope.
+        let inner = scp_core::envelope::inner::InnerEnvelope::from_bytes(&sender_decrypted)
+            .map_err(|e| ContextError::CryptoFailed(e.to_string()))?;
+
+        // Step 4: Strip padding to recover wrapped content bytes.
+        let stripped = scp_core::envelope::strip_padding(&inner.payload)
+            .map_err(|e| ContextError::CryptoFailed(e.to_string()))?;
+
+        // Step 5: Verify content integrity (constant-time).
+        let computed_hash: [u8; 32] = sha2::Sha256::digest(&stripped).into();
+        if !bool::from(computed_hash[..].ct_eq(&inner.payload_hash[..])) {
+            return Err(ContextError::CryptoFailed(
+                "content integrity check failed".into(),
+            ));
+        }
+
+        // Step 6: Deserialize WrappedContent and unwrap access key layer.
+        let wrapped: scp_core::crypto::access_keys::WrappedContent =
+            rmp_serde::from_slice(&stripped).map_err(|e| {
+                ContextError::CryptoFailed(format!("wrapped content deserialization: {e}"))
+            })?;
+
+        let access_key = {
+            let store = self
+                .access_keys
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            store
+                .get(&inner.context_id, &self.local_did)
+                .cloned()
+                .ok_or_else(|| {
+                    ContextError::CryptoFailed(format!(
+                        "no access key for {} in context {}",
+                        self.local_did, inner.context_id
+                    ))
+                })?
+        };
+
+        scp_core::crypto::access_keys::wrapping::unwrap_content(
+            &wrapped,
+            &self.local_did,
+            &access_key,
+            &inner.context_id,
+            sender_did,
+            0,
+            0,
         )
         .map_err(|e| ContextError::CryptoFailed(e.to_string()))
     }
@@ -638,54 +786,6 @@ impl ContextCryptoProvider for E2eCryptoProvider {
         let _ = store.remove(&ctx_hex, member_did);
         Ok(())
     }
-
-    fn encrypt_message(
-        &self,
-        context_id: &[u8; 32],
-        _sender_did: &str,
-        payload: &[u8],
-        epoch: u64,
-        sequence: u64,
-    ) -> Result<Vec<u8>, ContextError> {
-        let ctx_hex = Self::context_id_hex(context_id);
-
-        // Step 1: Encrypt with sender key (AES-256-GCM, ADR-007).
-        let sender_encrypted = {
-            let store = self
-                .sender_keys
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            let sender_key = store.get(&ctx_hex, &self.local_did).ok_or_else(|| {
-                ContextError::CryptoFailed(
-                    "no sender key for local DID in this context".to_string(),
-                )
-            })?;
-            encrypt_sender_layer(
-                sender_key,
-                payload,
-                &ctx_hex,
-                &self.local_did,
-                epoch,
-                sequence,
-            )
-            .map_err(|e| ContextError::CryptoFailed(e.to_string()))?
-        };
-
-        // Step 2: Encrypt via MLS (ADR-001).
-        let mut groups = self
-            .groups
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let group = groups
-            .get_mut(context_id)
-            .ok_or_else(|| ContextError::CryptoFailed("no MLS group for context".into()))?;
-
-        let ciphertext = encrypt(group, &sender_encrypted)
-            .map_err(|e| ContextError::CryptoFailed(e.to_string()))?;
-
-        serialize_ciphertext(&ciphertext).map_err(|e| ContextError::CryptoFailed(e.to_string()))
-    }
-
     fn advance_epoch(&self, context_id: &[u8; 32]) -> Result<(), ContextError> {
         let mut groups = self
             .groups
@@ -697,5 +797,141 @@ impl ContextCryptoProvider for E2eCryptoProvider {
         let _commit =
             propose_update(group).map_err(|e| ContextError::CryptoFailed(e.to_string()))?;
         Ok(())
+    }
+
+    fn seal(
+        &self,
+        context_id: &[u8; 32],
+        inner: &scp_core::envelope::inner::InnerEnvelope,
+        routing_id: &[u8],
+        blob_ttl: u32,
+    ) -> Result<Vec<u8>, ContextError> {
+        let ctx_str = Self::context_id_hex(context_id);
+
+        // 1. Serialize inner envelope to MessagePack.
+        let serialized = rmp_serde::to_vec_named(inner).map_err(|e| {
+            ContextError::CryptoFailed(format!("inner envelope serialization: {e}"))
+        })?;
+
+        // 2. Sender key encrypt (AES-256-GCM, ADR-007).
+        let sender_key = {
+            let store = self
+                .sender_keys
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            store
+                .get(&ctx_str, &self.local_did)
+                .cloned()
+                .ok_or_else(|| {
+                    ContextError::CryptoFailed(
+                        "no sender key for local DID in this context".to_string(),
+                    )
+                })?
+        };
+        let sender_encrypted =
+            encrypt_sender_layer(&sender_key, &serialized, &ctx_str, &self.local_did, 0, 0)
+                .map_err(|e| ContextError::CryptoFailed(e.to_string()))?;
+
+        // 3. MLS encrypt.
+        let mls_message = {
+            let mut groups = self
+                .groups
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let group = groups
+                .get_mut(context_id)
+                .ok_or_else(|| ContextError::CryptoFailed("no MLS group for context".into()))?;
+            mls_encrypt(group, &sender_encrypted)
+                .map_err(|e| ContextError::CryptoFailed(e.to_string()))?
+        };
+        let encrypted_blob = serialize_ciphertext(&mls_message)
+            .map_err(|e| ContextError::CryptoFailed(e.to_string()))?;
+
+        // 4. Wrap in outer envelope.
+        let outer = scp_core::envelope::outer::create_outer_envelope(
+            routing_id,
+            None,
+            blob_ttl,
+            encrypted_blob,
+        )
+        .map_err(|e| ContextError::CryptoFailed(e.to_string()))?;
+
+        rmp_serde::to_vec_named(&outer)
+            .map_err(|e| ContextError::CryptoFailed(format!("outer envelope serialization: {e}")))
+    }
+
+    fn open(
+        &self,
+        context_id: &[u8; 32],
+        outer_bytes: &[u8],
+    ) -> Result<Option<scp_core::context::builder::OpenedEnvelope>, ContextError> {
+        let ctx_str = Self::context_id_hex(context_id);
+
+        // Step 0: Deserialize outer envelope to extract MLS ciphertext.
+        let outer: scp_core::envelope::outer::OuterEnvelope = rmp_serde::from_slice(outer_bytes)
+            .map_err(|e| {
+                ContextError::CryptoFailed(format!("outer envelope deserialization: {e}"))
+            })?;
+
+        // Step 1: MLS decrypt and extract sender DID from credential.
+        let content = {
+            let mut groups = self
+                .groups
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let group = groups
+                .get_mut(context_id)
+                .ok_or_else(|| ContextError::CryptoFailed("no MLS group for context".into()))?;
+            decrypt_with_sender_did(group, &outer.encrypted_blob)
+                .map_err(|e| ContextError::CryptoFailed(e.to_string()))?
+        };
+
+        match content {
+            DecryptedContent::Application {
+                plaintext: mls_decrypted,
+                sender_did,
+            } => {
+                // Step 2: Look up the sender's key from the sender key store.
+                let sender_key = {
+                    let store = self
+                        .sender_keys
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    store.get(&ctx_str, &sender_did).cloned().ok_or_else(|| {
+                        ContextError::CryptoFailed(format!(
+                            "no sender key for {sender_did} in context {ctx_str}"
+                        ))
+                    })?
+                };
+
+                // Step 3: Sender key decrypt (AES-256-GCM, ADR-007).
+                let decrypted =
+                    decrypt_sender_layer(&sender_key, &mls_decrypted, &ctx_str, &sender_did, 0, 0)
+                        .map_err(|e| ContextError::CryptoFailed(e.to_string()))?;
+
+                // Step 4: Deserialize as InnerEnvelope.
+                let inner = scp_core::envelope::inner::InnerEnvelope::from_bytes(&decrypted)
+                    .map_err(|e| ContextError::CryptoFailed(e.to_string()))?;
+
+                // Step 5: Strip padding to recover original payload.
+                let stripped = scp_core::envelope::strip_padding(&inner.payload)
+                    .map_err(|e| ContextError::CryptoFailed(e.to_string()))?;
+
+                // Step 6: Verify content integrity (constant-time).
+                let computed_hash: [u8; 32] = sha2::Sha256::digest(&stripped).into();
+                if !bool::from(computed_hash[..].ct_eq(&inner.payload_hash[..])) {
+                    return Err(ContextError::CryptoFailed(
+                        "content integrity check failed".into(),
+                    ));
+                }
+
+                Ok(Some(scp_core::context::builder::OpenedEnvelope {
+                    inner,
+                    sender_did,
+                }))
+            }
+            DecryptedContent::Commit { sender_did: _ }
+            | DecryptedContent::Proposal { sender_did: _ } => Ok(None),
+        }
     }
 }

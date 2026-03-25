@@ -69,8 +69,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     assert_eq!(handle.state().await, ContextState::Active);
 
     // 5. Send a message (mock transport captures it).
+    let alice_sk = support::signing_key_for(&alice);
     manager
-        .send_message(&handle, &alice, b"Hello, context!", None)
+        .send_message(&handle, &alice, b"Hello, context!", Some(&alice_sk), None)
         .await?;
     println!("  Message sent successfully.");
 

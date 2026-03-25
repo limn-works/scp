@@ -383,20 +383,6 @@ impl ContextCryptoProvider for NoOpCryptoProvider {
     ) -> Result<(), ContextError> {
         Ok(())
     }
-    fn encrypt_message(
-        &self,
-        _context_id: &[u8; 32],
-        _sender_did: &str,
-        _payload: &[u8],
-        _epoch: u64,
-        _sequence: u64,
-    ) -> Result<Vec<u8>, ContextError> {
-        Err(ContextError::CryptoFailed(
-            "NoOpCryptoProvider::encrypt_message is not a real implementation — \
-             wire a production crypto provider for MLS/sender-key encryption"
-                .to_owned(),
-        ))
-    }
 }
 
 // Use the not-configured transport provider from scp-core (#501).

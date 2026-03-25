@@ -1,7 +1,7 @@
 //! Simple queries and local DID management.
 
 use super::{
-    ContextError, ContextEvent, ContextEventLogProvider, ContextManager, ContextParams,
+    Capability, ContextError, ContextEvent, ContextEventLogProvider, ContextManager, ContextParams,
     ContextRoleState, DID, RoleAssignment, Zeroizing, instrument,
 };
 
@@ -248,5 +248,235 @@ impl ContextManager {
                 });
             }
         }
+    }
+
+    /// Generates and stores a per-member access key for explicit lifecycle
+    /// management.
+    ///
+    /// Creates a fresh random 32-byte AES-256 access key at epoch 0 and
+    /// stores it in the context's access key store. This is the explicit
+    /// counterpart to the implicit key generation that happens during
+    /// `AddMember` governance action execution (§9.17.2 step 1).
+    ///
+    /// If an access key already exists for this member, it is overwritten.
+    ///
+    /// # Errors
+    ///
+    /// - [`ContextError::ContextNotRegistered`] if the context is not
+    ///   registered with this manager.
+    /// - [`ContextError::MemberNotFound`] if `member_did` is not a member
+    ///   of the context.
+    #[instrument(skip_all, fields(context_id, member_did, caller_did))]
+    pub async fn generate_context_access_key(
+        &self,
+        context_id: &str,
+        member_did: &str,
+        caller_did: &str,
+    ) -> Result<(), ContextError> {
+        let mut contexts = self.contexts.lock().await;
+        let ctx = contexts
+            .get_mut(context_id)
+            .ok_or_else(|| ContextError::ContextNotRegistered(context_id.to_owned()))?;
+
+        // Authorization: access key management requires admin (ContextClose).
+        if !ctx
+            .role_state
+            .member_has_capability(caller_did, &Capability::ContextClose)
+        {
+            return Err(ContextError::PermissionDenied(
+                "access key management requires admin capability".into(),
+            ));
+        }
+
+        if !ctx.membership.contains(member_did) {
+            return Err(ContextError::MemberNotFound(format!(
+                "member not found: {member_did}"
+            )));
+        }
+
+        let key = scp_protocol::crypto::access_keys::generate_access_key(context_id, member_did);
+        ctx.access.access_key_store.set(context_id, member_did, key);
+        Ok(())
+    }
+
+    /// Revokes (removes) a member's access key from the context's access
+    /// key store.
+    ///
+    /// After revocation the member can no longer decrypt content encrypted
+    /// with future CEKs. Historical content remains accessible until the
+    /// member's local key material is destroyed.
+    ///
+    /// This is the explicit counterpart to the implicit key removal that
+    /// happens during `RevokeReadAccess` governance action execution
+    /// (§9.17.2 step 3, ADR-038).
+    ///
+    /// # Errors
+    ///
+    /// - [`ContextError::ContextNotRegistered`] if the context is not
+    ///   registered with this manager.
+    /// - [`ContextError::MemberNotFound`] if no access key exists for
+    ///   `member_did` in the context.
+    #[instrument(skip_all, fields(context_id, member_did, caller_did))]
+    pub async fn revoke_context_access_key(
+        &self,
+        context_id: &str,
+        member_did: &str,
+        caller_did: &str,
+    ) -> Result<(), ContextError> {
+        let mut contexts = self.contexts.lock().await;
+        let ctx = contexts
+            .get_mut(context_id)
+            .ok_or_else(|| ContextError::ContextNotRegistered(context_id.to_owned()))?;
+
+        // Authorization: access key management requires admin (ContextClose).
+        if !ctx
+            .role_state
+            .member_has_capability(caller_did, &Capability::ContextClose)
+        {
+            return Err(ContextError::PermissionDenied(
+                "access key management requires admin capability".into(),
+            ));
+        }
+
+        ctx.access
+            .access_key_store
+            .remove(context_id, member_did)
+            .ok_or_else(|| {
+                ContextError::MemberNotFound(format!(
+                    "no access key found for member: {member_did}"
+                ))
+            })?;
+        Ok(())
+    }
+
+    /// Restores a member's access key by generating a new key at epoch 0.
+    ///
+    /// The restored member can decrypt future content only. Historical
+    /// content encrypted during the revocation period remains permanently
+    /// inaccessible because the old access key was destroyed and is never
+    /// re-distributed (forward-only restoration, §9.16.8, ADR-038).
+    ///
+    /// This is the explicit counterpart to the implicit key restoration
+    /// that happens during `RestoreReadAccess` governance action execution
+    /// (§9.17.2 step 5).
+    ///
+    /// # Errors
+    ///
+    /// - [`ContextError::ContextNotRegistered`] if the context is not
+    ///   registered with this manager.
+    /// - [`ContextError::MemberNotFound`] if `member_did` is not a member
+    ///   of the context.
+    #[instrument(skip_all, fields(context_id, member_did, caller_did))]
+    pub async fn restore_context_access_key(
+        &self,
+        context_id: &str,
+        member_did: &str,
+        caller_did: &str,
+    ) -> Result<(), ContextError> {
+        let mut contexts = self.contexts.lock().await;
+        let ctx = contexts
+            .get_mut(context_id)
+            .ok_or_else(|| ContextError::ContextNotRegistered(context_id.to_owned()))?;
+
+        // Authorization: access key management requires admin (ContextClose).
+        if !ctx
+            .role_state
+            .member_has_capability(caller_did, &Capability::ContextClose)
+        {
+            return Err(ContextError::PermissionDenied(
+                "access key management requires admin capability".into(),
+            ));
+        }
+
+        if !ctx.membership.contains(member_did) {
+            return Err(ContextError::MemberNotFound(format!(
+                "member not found: {member_did}"
+            )));
+        }
+
+        let key = scp_protocol::crypto::access_keys::generate_access_key(context_id, member_did);
+        ctx.access.access_key_store.set(context_id, member_did, key);
+        Ok(())
+    }
+
+    /// Stores an access key in a context's access key store.
+    ///
+    /// Called by the FFI layer after generating a new access key for a member.
+    /// Overwrites any existing key for the same `(context_id, member_did)` pair.
+    ///
+    /// If the context is not registered, this is a no-op.
+    #[instrument(skip_all, fields(context_id, member_did))]
+    pub async fn set_access_key(
+        &self,
+        context_id: &str,
+        member_did: &str,
+        key: scp_protocol::crypto::access_keys::AccessKey,
+    ) {
+        if let Some(ctx) = self.contexts.lock().await.get_mut(context_id) {
+            ctx.access.access_key_store.set(context_id, member_did, key);
+        }
+    }
+
+    /// Removes a member's access key from a context's access key store.
+    ///
+    /// Called by the FFI layer on access key revocation. If no key exists
+    /// for the pair, or the context is not registered, this is a no-op.
+    #[instrument(skip_all, fields(context_id, member_did))]
+    pub async fn remove_access_key(&self, context_id: &str, member_did: &str) {
+        if let Some(ctx) = self.contexts.lock().await.get_mut(context_id) {
+            ctx.access.access_key_store.remove(context_id, member_did);
+        }
+    }
+
+    /// Injects an access key into a context's access key store.
+    ///
+    /// Test-only method for setting up access keys without going through
+    /// the full key distribution protocol. Production code MUST use the
+    /// proper key generation + distribution path.
+    #[cfg(feature = "testing")]
+    pub async fn inject_access_key(
+        &self,
+        context_id: &str,
+        member_did: &str,
+        key: scp_protocol::crypto::access_keys::AccessKey,
+    ) {
+        if let Some(ctx) = self.contexts.lock().await.get_mut(context_id) {
+            ctx.access.access_key_store.set(context_id, member_did, key);
+        }
+    }
+
+    /// Retrieves a clone of the access key for a member in a context.
+    ///
+    /// Test-only method for extracting access keys from the manager's
+    /// internal store.
+    #[cfg(feature = "testing")]
+    pub async fn get_access_key(
+        &self,
+        context_id: &str,
+        member_did: &str,
+    ) -> Option<scp_protocol::crypto::access_keys::AccessKey> {
+        let contexts = self.contexts.lock().await;
+        contexts
+            .get(context_id)?
+            .access
+            .access_key_store
+            .get(context_id, member_did)
+            .cloned()
+    }
+
+    /// Retrieves clones of ALL access keys for a context.
+    ///
+    /// Test-only method for extracting all access keys from the manager's
+    /// internal store. Returns a map of `member_did -> AccessKey`.
+    #[cfg(feature = "testing")]
+    pub async fn get_all_access_keys(
+        &self,
+        context_id: &str,
+    ) -> std::collections::HashMap<String, scp_protocol::crypto::access_keys::AccessKey> {
+        let contexts = self.contexts.lock().await;
+        contexts
+            .get(context_id)
+            .map(|ctx| ctx.access.access_key_store.get_all(context_id))
+            .unwrap_or_default()
     }
 }

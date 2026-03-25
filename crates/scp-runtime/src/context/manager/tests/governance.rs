@@ -614,6 +614,7 @@ fn governance_snapshot_serde_roundtrip() {
         needs_reconnect: false,
         migration_state: None,
         mls_crypto_state: Vec::new(),
+        access_key_store: scp_protocol::crypto::access_keys::AccessKeyStore::new(),
     };
 
     let json = serde_json::to_string(&snapshot).expect("serialize");
@@ -4518,7 +4519,13 @@ async fn migration_propose_approve_tombstone_lifecycle() {
 
     // send_message should be blocked (grace period = read-only).
     let send_result = manager
-        .send_message(&handle, &admin_did, b"hello", None)
+        .send_message(
+            &handle,
+            &admin_did,
+            b"hello",
+            Some(&signing_key_for_did(&admin_did)),
+            None,
+        )
         .await;
     assert!(
         send_result.is_err(),
@@ -4579,7 +4586,13 @@ async fn migration_propose_cancel_lifecycle() {
 
     // send_message should work again.
     let send_result = manager
-        .send_message(&handle, &admin_did, b"hello", None)
+        .send_message(
+            &handle,
+            &admin_did,
+            b"hello",
+            Some(&signing_key_for_did(&admin_did)),
+            None,
+        )
         .await;
     assert!(
         send_result.is_ok(),

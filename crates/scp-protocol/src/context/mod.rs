@@ -78,6 +78,37 @@ pub fn context_id_bytes(context_id: &str) -> [u8; 32] {
     bytes
 }
 
+/// Domain separator for context-based routing IDs.
+///
+/// Routing IDs are the values relays use to route messages to subscribers.
+/// Using a domain separator prevents collisions with raw context ID hashes
+/// (used internally for MLS groups, sender keys, event logs) and with
+/// DID-based routing IDs (`"scp:did:"` prefix — see `scp-identity`).
+const CONTEXT_ROUTING_DOMAIN_SEPARATOR: &[u8] = b"scp:context-routing:";
+
+/// Derives a 32-byte routing ID from a context ID string using
+/// domain-separated SHA-256.
+///
+/// The routing ID is `SHA-256("scp:context-routing:" || context_id)`.
+/// This is distinct from [`context_id_bytes`] (raw `SHA-256(context_id)`)
+/// which is used for internal crypto keying (MLS groups, sender keys, event
+/// logs). The domain separator prevents routing-level collisions with other
+/// hash domains.
+///
+/// Both the send path (`ContextManager::send_message`) and the subscribe
+/// path (`context_subscribe`) MUST use this function so that the relay
+/// routes messages to the correct subscribers.
+#[must_use]
+pub fn context_routing_id(context_id: &str) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    hasher.update(CONTEXT_ROUTING_DOMAIN_SEPARATOR);
+    hasher.update(context_id.as_bytes());
+    let result = hasher.finalize();
+    let mut bytes = [0u8; 32];
+    bytes.copy_from_slice(&result);
+    bytes
+}
+
 // ---------------------------------------------------------------------------
 // ContextState
 // ---------------------------------------------------------------------------
@@ -297,4 +328,50 @@ pub enum ContextError {
         /// The minor version the SDK supports.
         supported_minor: u8,
     },
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn context_routing_id_is_deterministic() {
+        let id1 = context_routing_id("test-ctx");
+        let id2 = context_routing_id("test-ctx");
+        assert_eq!(id1, id2);
+    }
+
+    #[test]
+    fn context_routing_id_differs_from_context_id_bytes() {
+        // The routing ID MUST differ from the raw context_id_bytes because
+        // it uses a domain separator. If they matched, the domain separator
+        // would be meaningless.
+        let raw = context_id_bytes("test-ctx");
+        let routing = context_routing_id("test-ctx");
+        assert_ne!(raw, routing);
+    }
+
+    #[test]
+    fn context_routing_id_different_inputs_produce_different_outputs() {
+        let id_a = context_routing_id("ctx-alpha");
+        let id_b = context_routing_id("ctx-beta");
+        assert_ne!(id_a, id_b);
+    }
+
+    #[test]
+    fn context_routing_id_uses_domain_separator() {
+        // Manually compute what context_routing_id should produce.
+        let mut hasher = Sha256::new();
+        hasher.update(b"scp:context-routing:");
+        hasher.update(b"test-ctx");
+        let expected = hasher.finalize();
+
+        let actual = context_routing_id("test-ctx");
+        assert_eq!(&actual[..], &expected[..]);
+    }
 }

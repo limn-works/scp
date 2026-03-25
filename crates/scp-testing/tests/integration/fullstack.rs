@@ -21,7 +21,9 @@ use futures::StreamExt;
 use scp_core::context::builder::ContextEventLogProvider;
 use scp_core::context::governance::KeyResolver;
 use scp_core::context::membership::ContextEvent;
-use scp_core::context::{Capability, ContextMode, ContextParams, ContextState, context_id_bytes};
+use scp_core::context::{
+    Capability, ContextMode, ContextParams, ContextState, context_id_bytes, context_routing_id,
+};
 use scp_core::envelope::outer::create_outer_envelope;
 use scp_identity::DID;
 use scp_testing::fullstack::FullStackNetwork;
@@ -99,7 +101,7 @@ async fn fullstack_alice_to_bob_encrypted_message() {
     println!("  [3] Alice added Bob to the context");
 
     // 4. Bob joins by retrieving the Welcome from the KeyExchange.
-    bob.join_from_welcome(&ctx_bytes).unwrap();
+    bob.join_from_welcome(ctx_id, &ctx_bytes).unwrap();
     println!("  [4] Bob joined the context via Welcome message");
 
     // 5. Alice sends an encrypted message through ContextManager.
@@ -114,8 +116,12 @@ async fn fullstack_alice_to_bob_encrypted_message() {
         1,
         "exactly one ciphertext should have been sent"
     );
-    let (sent_ctx_id, ciphertext) = &sent[0];
-    assert_eq!(sent_ctx_id, &ctx_bytes, "ciphertext context ID must match");
+    let (sent_routing_id, ciphertext) = &sent[0];
+    let expected_routing_id = context_routing_id(ctx_id);
+    assert_eq!(
+        sent_routing_id, &expected_routing_id,
+        "transport routing ID must use domain-separated context_routing_id"
+    );
     assert_ne!(
         ciphertext.as_slice(),
         plaintext.as_slice(),
@@ -127,9 +133,9 @@ async fn fullstack_alice_to_bob_encrypted_message() {
         plaintext.len()
     );
 
-    // 7. Bob decrypts: MLS decrypt → sender key decrypt.
+    // 7. Bob decrypts through the full envelope pipeline.
     let decrypted = bob
-        .decrypt_message(&ctx_bytes, ciphertext, ALICE_DID, 0, 0)
+        .decrypt_message(ctx_id, &ctx_bytes, ciphertext, ALICE_DID)
         .unwrap();
     assert_eq!(
         decrypted.as_slice(),
@@ -184,12 +190,12 @@ async fn fullstack_three_party_group() {
 
     // Alice adds Bob (Welcome #1).
     alice.add_member(&handle, BOB_DID).await.unwrap();
-    bob.join_from_welcome(&ctx_bytes).unwrap();
+    bob.join_from_welcome(ctx_id, &ctx_bytes).unwrap();
     println!("  [2] Bob joined");
 
     // Alice adds Carol (Welcome #2).
     alice.add_member(&handle, CAROL_DID).await.unwrap();
-    carol.join_from_welcome(&ctx_bytes).unwrap();
+    carol.join_from_welcome(ctx_id, &ctx_bytes).unwrap();
     println!("  [3] Carol joined");
 
     // Alice sends a message — both Bob and Carol should be able to decrypt.
@@ -205,14 +211,14 @@ async fn fullstack_three_party_group() {
 
     // Bob decrypts.
     let bob_decrypted = bob
-        .decrypt_message(&ctx_bytes, ciphertext, ALICE_DID, 0, 0)
+        .decrypt_message(ctx_id, &ctx_bytes, ciphertext, ALICE_DID)
         .unwrap();
     assert_eq!(bob_decrypted.as_slice(), msg.as_slice());
     println!("  [5] Bob decrypted successfully");
 
     // Carol decrypts.
     let carol_decrypted = carol
-        .decrypt_message(&ctx_bytes, ciphertext, ALICE_DID, 0, 0)
+        .decrypt_message(ctx_id, &ctx_bytes, ciphertext, ALICE_DID)
         .unwrap();
     assert_eq!(carol_decrypted.as_slice(), msg.as_slice());
     println!("  [6] Carol decrypted successfully");
@@ -238,7 +244,7 @@ async fn fullstack_governance_with_real_crypto() {
 
     let handle = alice.create_context(ctx_id, params).await.unwrap();
     alice.add_member(&handle, BOB_DID).await.unwrap();
-    bob.join_from_welcome(&ctx_bytes).unwrap();
+    bob.join_from_welcome(ctx_id, &ctx_bytes).unwrap();
     println!("  [1] Context created, Bob joined");
 
     // Alice sends a message before governance action.
@@ -246,7 +252,7 @@ async fn fullstack_governance_with_real_crypto() {
     alice.send_message(&handle, msg1).await.unwrap();
     let sent1 = alice.take_sent_ciphertexts();
     let decrypted1 = bob
-        .decrypt_message(&ctx_bytes, &sent1[0].1, ALICE_DID, 0, 0)
+        .decrypt_message(ctx_id, &ctx_bytes, &sent1[0].1, ALICE_DID)
         .unwrap();
     assert_eq!(decrypted1.as_slice(), msg1.as_slice());
     println!("  [2] Pre-governance message roundtrip verified");
@@ -273,7 +279,7 @@ async fn fullstack_governance_with_real_crypto() {
 
     // Bob should NOT be able to decrypt this message (MLS group epoch advanced,
     // Bob's group state is stale).
-    let decrypt_result = bob.decrypt_message(&ctx_bytes, &sent2[0].1, ALICE_DID, 0, 0);
+    let decrypt_result = bob.decrypt_message(ctx_id, &ctx_bytes, &sent2[0].1, ALICE_DID);
     assert!(
         decrypt_result.is_err(),
         "Bob must NOT decrypt after removal (MLS forward secrecy)"
@@ -301,7 +307,7 @@ async fn fullstack_event_log_merkle_chain() {
 
     let handle = alice.create_context(ctx_id, params).await.unwrap();
     alice.add_member(&handle, BOB_DID).await.unwrap();
-    bob.join_from_welcome(&ctx_bytes).unwrap();
+    bob.join_from_welcome(ctx_id, &ctx_bytes).unwrap();
 
     // Send 3 messages — each appends a MessageSent event to the log.
     for i in 0..3 {
@@ -364,7 +370,7 @@ async fn fullstack_multiple_messages_roundtrip() {
 
     let handle = alice.create_context(ctx_id, params).await.unwrap();
     alice.add_member(&handle, BOB_DID).await.unwrap();
-    bob.join_from_welcome(&ctx_bytes).unwrap();
+    bob.join_from_welcome(ctx_id, &ctx_bytes).unwrap();
 
     // Send 5 messages and verify each roundtrips correctly.
     for i in 0..5u64 {
@@ -374,7 +380,7 @@ async fn fullstack_multiple_messages_roundtrip() {
         assert_eq!(sent.len(), 1);
 
         let decrypted = bob
-            .decrypt_message(&ctx_bytes, &sent[0].1, ALICE_DID, 0, 0)
+            .decrypt_message(ctx_id, &ctx_bytes, &sent[0].1, ALICE_DID)
             .unwrap();
         assert_eq!(
             String::from_utf8_lossy(&decrypted),
@@ -405,7 +411,7 @@ async fn fullstack_ciphertext_is_nondeterministic() {
 
     let handle = alice.create_context(ctx_id, params).await.unwrap();
     alice.add_member(&handle, BOB_DID).await.unwrap();
-    bob.join_from_welcome(&ctx_bytes).unwrap();
+    bob.join_from_welcome(ctx_id, &ctx_bytes).unwrap();
 
     // Send the same plaintext twice — ciphertexts must differ (random nonce).
     let msg = b"same message twice";
@@ -423,10 +429,10 @@ async fn fullstack_ciphertext_is_nondeterministic() {
 
     // Both must still decrypt to the same plaintext.
     let d1 = bob
-        .decrypt_message(&ctx_bytes, &sent1[0].1, ALICE_DID, 0, 0)
+        .decrypt_message(ctx_id, &ctx_bytes, &sent1[0].1, ALICE_DID)
         .unwrap();
     let d2 = bob
-        .decrypt_message(&ctx_bytes, &sent2[0].1, ALICE_DID, 0, 0)
+        .decrypt_message(ctx_id, &ctx_bytes, &sent2[0].1, ALICE_DID)
         .unwrap();
     assert_eq!(d1.as_slice(), msg.as_slice());
     assert_eq!(d2.as_slice(), msg.as_slice());
@@ -523,18 +529,22 @@ async fn full_stack_relay_encrypted_roundtrip() {
     assert_eq!(handle.try_read_state().unwrap(), ContextState::Active);
 
     alice.add_member(&handle, BOB_DID).await.unwrap();
-    bob.join_from_welcome(&ctx_bytes).unwrap();
+    bob.join_from_welcome(ctx_id, &ctx_bytes).unwrap();
     println!("  [3] Context created and Bob joined via Welcome");
 
     // 4. Alice sends an encrypted message through ContextManager.
-    //    ContextManager calls E2eCryptoProvider::encrypt_message (real sender key
-    //    + real MLS encryption) and CapturingTransport captures the ciphertext.
+    //    ContextManager calls seal (real sender key + real MLS encryption +
+    //    outer envelope wrapping) and CapturingTransport captures the bytes.
     let plaintext = b"Hello Bob! Real MLS + real relay, full stack.";
     alice.send_message(&handle, plaintext).await.unwrap();
     let sent = alice.take_sent_ciphertexts();
     assert_eq!(sent.len(), 1, "exactly one ciphertext captured");
-    let (sent_ctx_id, ciphertext) = &sent[0];
-    assert_eq!(sent_ctx_id, &ctx_bytes, "ciphertext context ID must match");
+    let (sent_routing_id, ciphertext) = &sent[0];
+    let expected_routing_id = context_routing_id(ctx_id);
+    assert_eq!(
+        sent_routing_id, &expected_routing_id,
+        "transport routing ID must use domain-separated context_routing_id"
+    );
     assert_ne!(
         ciphertext.as_slice(),
         plaintext.as_slice(),
@@ -546,12 +556,19 @@ async fn full_stack_relay_encrypted_roundtrip() {
         ciphertext.len()
     );
 
-    // 5. Wrap ciphertext in an OuterEnvelope for relay transport.
-    //    Use a deterministic routing ID derived from the context ID (simulates
-    //    pseudonym routing — the relay sees only this opaque 32-byte identifier).
-    let routing_id = ctx_bytes; // deterministic for test; production uses HMAC pseudonym
-    let outer_envelope =
-        create_outer_envelope(&routing_id, None, 3600, ciphertext.clone()).unwrap();
+    // 5. The captured bytes are a serialized OuterEnvelope. Deserialize to
+    //    extract the inner envelope for relay transport, then re-wrap with a
+    //    relay-specific routing ID.
+    let captured_outer: scp_core::envelope::OuterEnvelope =
+        rmp_serde::from_slice(ciphertext).unwrap();
+    let routing_id = expected_routing_id; // domain-separated context routing ID
+    let outer_envelope = create_outer_envelope(
+        &routing_id,
+        None,
+        3600,
+        captured_outer.encrypted_blob.clone(),
+    )
+    .unwrap();
     println!(
         "  [5] Wrapped in OuterEnvelope (routing_id: {}...)",
         &hex::encode(routing_id)[..16]
@@ -593,9 +610,11 @@ async fn full_stack_relay_encrypted_roundtrip() {
         received_outer.encrypted_blob.len()
     );
 
-    // 8. Bob decrypts: MLS decrypt → sender key decrypt.
+    // 8. Bob decrypts using the original captured envelope (which is the
+    //    full serialized OuterEnvelope from the send pipeline).
+    //    The relay roundtrip above verified the encrypted_blob survived intact.
     let decrypted = bob
-        .decrypt_message(&ctx_bytes, &received_outer.encrypted_blob, ALICE_DID, 0, 0)
+        .decrypt_message(ctx_id, &ctx_bytes, ciphertext, ALICE_DID)
         .unwrap();
     assert_eq!(
         decrypted.as_slice(),
@@ -655,7 +674,7 @@ async fn full_stack_relay_multiple_messages() {
     let params = encrypted_params();
     let handle = alice.create_context(ctx_id, params).await.unwrap();
     alice.add_member(&handle, BOB_DID).await.unwrap();
-    bob.join_from_welcome(&ctx_bytes).unwrap();
+    bob.join_from_welcome(ctx_id, &ctx_bytes).unwrap();
 
     let sourced = SourcedRelayUrl {
         url: relay_url,
@@ -664,7 +683,7 @@ async fn full_stack_relay_multiple_messages() {
     let bob_adapter = NativeRelayAdapter::connect_sourced(&sourced).await.unwrap();
     let alice_adapter = NativeRelayAdapter::connect_sourced(&sourced).await.unwrap();
 
-    let routing_id = ctx_bytes;
+    let routing_id = context_routing_id(ctx_id);
     let bob_routing = RoutingId::new(routing_id);
     let mut stream = bob_adapter.subscribe(&bob_routing, None).await.unwrap();
 
@@ -672,20 +691,34 @@ async fn full_stack_relay_multiple_messages() {
     for i in 0..3u32 {
         let msg = format!("Relay message #{i}");
 
-        // Encrypt via ContextManager (real MLS + sender keys).
+        // Encrypt via ContextManager (real MLS + sender keys + envelope).
         alice.send_message(&handle, msg.as_bytes()).await.unwrap();
         let sent = alice.take_sent_ciphertexts();
         assert_eq!(sent.len(), 1);
         let ciphertext = &sent[0].1;
 
-        // Wrap in OuterEnvelope and send through relay.
-        let outer = create_outer_envelope(&routing_id, None, 3600, ciphertext.clone()).unwrap();
+        // The captured bytes are a serialized OuterEnvelope. Extract the
+        // encrypted_blob for relay transport.
+        let captured_outer: scp_core::envelope::OuterEnvelope =
+            rmp_serde::from_slice(ciphertext).unwrap();
+        let outer = create_outer_envelope(
+            &routing_id,
+            None,
+            3600,
+            captured_outer.encrypted_blob.clone(),
+        )
+        .unwrap();
         alice_adapter.send(&outer).await.unwrap();
 
-        // Bob receives from relay and decrypts.
+        // Bob receives from relay and verifies blob transit, then decrypts
+        // using the original captured envelope.
         let received = receive_envelope(&mut stream).await;
+        assert_eq!(
+            received.encrypted_blob, captured_outer.encrypted_blob,
+            "encrypted_blob must survive relay transit"
+        );
         let decrypted = bob
-            .decrypt_message(&ctx_bytes, &received.encrypted_blob, ALICE_DID, 0, 0)
+            .decrypt_message(ctx_id, &ctx_bytes, ciphertext, ALICE_DID)
             .unwrap();
         assert_eq!(
             String::from_utf8_lossy(&decrypted),
@@ -733,21 +766,29 @@ async fn full_stack_relay_three_party() {
 
     // Alice adds Bob, then Carol.
     alice.add_member(&handle, BOB_DID).await.unwrap();
-    bob.join_from_welcome(&ctx_bytes).unwrap();
+    bob.join_from_welcome(ctx_id, &ctx_bytes).unwrap();
     alice.add_member(&handle, CAROL_DID).await.unwrap();
-    carol.join_from_welcome(&ctx_bytes).unwrap();
+    carol.join_from_welcome(ctx_id, &ctx_bytes).unwrap();
     println!("  [1] Three-party context established");
 
-    // Alice sends message via ContextManager (real MLS + sender keys).
+    // Alice sends message via ContextManager (real MLS + sender keys + envelope).
     let msg = b"Hello group, full stack through relay!";
     alice.send_message(&handle, msg).await.unwrap();
     let sent = alice.take_sent_ciphertexts();
     assert_eq!(sent.len(), 1);
     let ciphertext = &sent[0].1;
 
-    // Wrap in OuterEnvelope and send through relay.
-    let routing_id = ctx_bytes;
-    let outer = create_outer_envelope(&routing_id, None, 3600, ciphertext.clone()).unwrap();
+    // Extract encrypted_blob from the captured OuterEnvelope for relay transport.
+    let captured_outer: scp_core::envelope::OuterEnvelope =
+        rmp_serde::from_slice(ciphertext).unwrap();
+    let routing_id = context_routing_id(ctx_id);
+    let outer = create_outer_envelope(
+        &routing_id,
+        None,
+        3600,
+        captured_outer.encrypted_blob.clone(),
+    )
+    .unwrap();
 
     let sourced = SourcedRelayUrl {
         url: relay_url,
@@ -766,18 +807,26 @@ async fn full_stack_relay_three_party() {
     alice_adapter.send(&outer).await.unwrap();
     println!("  [2] Published to relay");
 
-    // Bob receives and decrypts.
+    // Bob receives and verifies relay transit, then decrypts the original envelope.
     let bob_received = receive_envelope(&mut bob_stream).await;
+    assert_eq!(
+        bob_received.encrypted_blob, captured_outer.encrypted_blob,
+        "encrypted_blob must survive relay transit"
+    );
     let bob_decrypted = bob
-        .decrypt_message(&ctx_bytes, &bob_received.encrypted_blob, ALICE_DID, 0, 0)
+        .decrypt_message(ctx_id, &ctx_bytes, ciphertext, ALICE_DID)
         .unwrap();
     assert_eq!(bob_decrypted.as_slice(), msg.as_slice());
     println!("  [3] Bob decrypted from relay");
 
-    // Carol receives and decrypts.
+    // Carol receives and verifies relay transit, then decrypts the original envelope.
     let carol_received = receive_envelope(&mut carol_stream).await;
+    assert_eq!(
+        carol_received.encrypted_blob, captured_outer.encrypted_blob,
+        "encrypted_blob must survive relay transit"
+    );
     let carol_decrypted = carol
-        .decrypt_message(&ctx_bytes, &carol_received.encrypted_blob, ALICE_DID, 0, 0)
+        .decrypt_message(ctx_id, &ctx_bytes, ciphertext, ALICE_DID)
         .unwrap();
     assert_eq!(carol_decrypted.as_slice(), msg.as_slice());
     println!("  [4] Carol decrypted from relay");

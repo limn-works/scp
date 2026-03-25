@@ -768,9 +768,25 @@ pub async fn context_send(
             })?;
     }
 
+    // Resolve the signing key from the handle's retained custody so the
+    // ContextManager can produce a valid inner envelope signature. Passing
+    // None would cause the encrypted send path to fail with "signing key
+    // required".
+    #[cfg(feature = "allow_in_memory_custody")]
+    let resolved_signing_key = resolve_napi_signing_key(handle).await.ok();
+
+    #[cfg(not(feature = "allow_in_memory_custody"))]
+    let resolved_signing_key: Option<ed25519_dalek::SigningKey> = None;
+
     let manager = context_manager()?;
     manager
-        .send_message(core_handle, &did, &payload, None)
+        .send_message(
+            core_handle,
+            &did,
+            &payload,
+            resolved_signing_key.as_ref(),
+            None,
+        )
         .await
         .map_err(|e| NapiError::from(ScpNapiError::from(e)))?;
 
@@ -848,10 +864,9 @@ pub fn context_subscribe(
     };
 
     let context_id = handle.context_id.clone();
-    // NOTE: Both subscribe and send paths use SHA-256(context_id) as the
-    // routing ID — they match. See context_id_bytes() which hashes when
-    // the raw ID is not exactly 32 bytes.
-    let routing_id_bytes = scp_core::context::context_id_bytes(&context_id);
+    // Both subscribe and send paths use domain-separated
+    // SHA-256("scp:context-routing:" || context_id) as the routing ID.
+    let routing_id_bytes = scp_core::context::context_routing_id(&context_id);
     let routing_id = scp_transport::RoutingId::new(routing_id_bytes);
 
     // Replace the cancellation token with a fresh one so a previously
@@ -1119,6 +1134,79 @@ pub async fn context_drain_events(handle: &NapiContextHandle) -> napi::Result<Ve
     let manager = context_manager()?;
     let events = manager.drain_events(&handle.context_id).await;
     Ok(events.into_iter().map(|e| format!("{e:?}")).collect())
+}
+
+// ---------------------------------------------------------------------------
+// Bridge functions — access key lifecycle (#1529, delegated to ContextManager)
+// ---------------------------------------------------------------------------
+
+/// Generates and stores a per-member access key for explicit lifecycle
+/// management.
+///
+/// Delegates to `ContextManager::generate_context_access_key`.
+///
+/// # Errors
+///
+/// Returns an error if the context is not registered, the member is not
+/// found, or the caller lacks admin capability.
+#[napi(js_name = "accessKeyGenerate")]
+#[allow(clippy::needless_pass_by_value)] // napi-rs requires owned String
+pub async fn access_key_generate(
+    context_id: String,
+    member_did: String,
+    caller_did: String,
+) -> napi::Result<()> {
+    let manager = context_manager()?;
+    manager
+        .generate_context_access_key(&context_id, &member_did, &caller_did)
+        .await
+        .map_err(|e| napi::Error::from_reason(format!("[SCP-CTX-2070] {e}")))
+}
+
+/// Revokes (removes) a member's access key from the context's access key
+/// store.
+///
+/// Delegates to `ContextManager::revoke_context_access_key`.
+///
+/// # Errors
+///
+/// Returns an error if the context is not registered, no access key
+/// exists for the member, or the caller lacks admin capability.
+#[napi(js_name = "accessKeyRevoke")]
+#[allow(clippy::needless_pass_by_value)] // napi-rs requires owned String
+pub async fn access_key_revoke(
+    context_id: String,
+    member_did: String,
+    caller_did: String,
+) -> napi::Result<()> {
+    let manager = context_manager()?;
+    manager
+        .revoke_context_access_key(&context_id, &member_did, &caller_did)
+        .await
+        .map_err(|e| napi::Error::from_reason(format!("[SCP-CTX-2071] {e}")))
+}
+
+/// Restores a member's access key by generating a new key at the next
+/// epoch.
+///
+/// Delegates to `ContextManager::restore_context_access_key`.
+///
+/// # Errors
+///
+/// Returns an error if the context is not registered, the member is
+/// not found, or the caller lacks admin capability.
+#[napi(js_name = "accessKeyRestore")]
+#[allow(clippy::needless_pass_by_value)] // napi-rs requires owned String
+pub async fn access_key_restore(
+    context_id: String,
+    member_did: String,
+    caller_did: String,
+) -> napi::Result<()> {
+    let manager = context_manager()?;
+    manager
+        .restore_context_access_key(&context_id, &member_did, &caller_did)
+        .await
+        .map_err(|e| napi::Error::from_reason(format!("[SCP-CTX-2072] {e}")))
 }
 
 // ---------------------------------------------------------------------------
