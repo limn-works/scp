@@ -1,35 +1,43 @@
 {
   "name": "batch2-governance-state-wiring",
-  "description": "GovernanceState and PerContextState must have standing + consequence fields wired into the governance module",
-  "created": "2026-03-25T12:00:00Z",
+  "description": "GovernanceState and ContextManager have correct fields for consequence rules, economy, and standing context tracking",
+  "created": "2026-03-25T18:00:00Z",
   "gates": [
     {
-      "name": "STATE: standing field or StandingChannelManager referenced in mod.rs",
-      "check": "/Users/alec/.claude/plugins/cache/alecmarcus/odyssey/0.3.0/bin/check-ast crates/scp-runtime/src/context/manager/mod.rs '((identifier) @id (#match? @id \"StandingChannelManager|standing\"))' --min 1"
+      "name": "STATE: consequence_rules field in mod.rs",
+      "check": "/Users/alec/.claude/plugins/cache/alecmarcus/odyssey/0.5.1/bin/check-ast crates/scp-runtime/src/context/manager/mod.rs '((field_identifier) @f (#eq? @f \"consequence_rules\"))' --min 1"
     },
     {
-      "name": "STATE: consequence_rules or ConsequenceRule referenced in mod.rs or governance.rs",
-      "check": "/Users/alec/.claude/plugins/cache/alecmarcus/odyssey/0.3.0/bin/check-ast crates/scp-runtime/src/context/manager/mod.rs '((identifier) @id (#match? @id \"ConsequenceRule|consequence_rules\"))' --min 1 || /Users/alec/.claude/plugins/cache/alecmarcus/odyssey/0.3.0/bin/check-ast crates/scp-runtime/src/context/manager/governance.rs '((identifier) @id (#eq? @id \"ConsequenceRule\"))' --min 1"
+      "name": "STATE: standing_contexts field on ContextManager",
+      "check": "/Users/alec/.claude/plugins/cache/alecmarcus/odyssey/0.5.1/bin/check-ast crates/scp-runtime/src/context/manager/mod.rs '((field_identifier) @f (#eq? @f \"standing_contexts\"))' --min 1"
     },
     {
       "name": "STATE: evaluate_consequence_rules imported into governance.rs",
-      "check": "/Users/alec/.claude/plugins/cache/alecmarcus/odyssey/0.3.0/bin/check-ast crates/scp-runtime/src/context/manager/governance.rs '((identifier) @id (#eq? @id \"evaluate_consequence_rules\"))' --min 1"
+      "check": "/Users/alec/.claude/plugins/cache/alecmarcus/odyssey/0.5.1/bin/check-ast crates/scp-runtime/src/context/manager/governance.rs '((identifier) @id (#eq? @id \"evaluate_consequence_rules\"))' --min 1"
     },
     {
-      "name": "STATE: EconomicPolicy already in GovernanceState (verify not removed)",
-      "check": "/Users/alec/.claude/plugins/cache/alecmarcus/odyssey/0.3.0/bin/check-ast crates/scp-runtime/src/context/manager/mod.rs '((identifier) @id (#eq? @id \"EconomicPolicy\"))' --min 1"
+      "name": "STATE: EconomicPolicy referenced in mod.rs",
+      "check": "/Users/alec/.claude/plugins/cache/alecmarcus/odyssey/0.5.1/bin/check-ast crates/scp-runtime/src/context/manager/mod.rs '((identifier) @id (#eq? @id \"EconomicPolicy\"))' --min 1"
     },
     {
-      "name": "STATE: MemberBudgetTracker already in GovernanceState (verify not removed)",
-      "check": "/Users/alec/.claude/plugins/cache/alecmarcus/odyssey/0.3.0/bin/check-ast crates/scp-runtime/src/context/manager/mod.rs '((identifier) @id (#eq? @id \"MemberBudgetTracker\"))' --min 1"
+      "name": "STATE: MemberBudgetTracker referenced in mod.rs",
+      "check": "/Users/alec/.claude/plugins/cache/alecmarcus/odyssey/0.5.1/bin/check-ast crates/scp-runtime/src/context/manager/mod.rs '((identifier) @id (#eq? @id \"MemberBudgetTracker\"))' --min 1"
     },
     {
-      "name": "STATE: economic_policy field still present in GovernanceState",
-      "check": "/Users/alec/.claude/plugins/cache/alecmarcus/odyssey/0.3.0/bin/check-ast crates/scp-runtime/src/context/manager/mod.rs '((field_identifier) @fid (#eq? @fid \"economic_policy\"))' --min 1"
+      "name": "STATE: economic_policy field present",
+      "check": "/Users/alec/.claude/plugins/cache/alecmarcus/odyssey/0.5.1/bin/check-ast crates/scp-runtime/src/context/manager/mod.rs '((field_identifier) @fid (#eq? @fid \"economic_policy\"))' --min 1"
     },
     {
-      "name": "STATE: budget_tracker field still present in GovernanceState",
-      "check": "/Users/alec/.claude/plugins/cache/alecmarcus/odyssey/0.3.0/bin/check-ast crates/scp-runtime/src/context/manager/mod.rs '((field_identifier) @fid (#eq? @fid \"budget_tracker\"))' --min 1"
+      "name": "STATE: budget_tracker field present",
+      "check": "/Users/alec/.claude/plugins/cache/alecmarcus/odyssey/0.5.1/bin/check-ast crates/scp-runtime/src/context/manager/mod.rs '((field_identifier) @fid (#eq? @fid \"budget_tracker\"))' --min 1"
+    },
+    {
+      "name": "WIRING: enforce_economic_policy called in governance.rs",
+      "check": "/Users/alec/.claude/plugins/cache/alecmarcus/odyssey/0.5.1/bin/check-ast crates/scp-runtime/src/context/manager/governance.rs '(call_expression function: (identifier) @fn (#eq? @fn \"enforce_economic_policy\"))' --min 1"
+    },
+    {
+      "name": "WIRING: enforce_economic_policy uses ? (not silently ignored)",
+      "check": "/Users/alec/.claude/plugins/cache/alecmarcus/odyssey/0.5.1/bin/check-ast crates/scp-runtime/src/context/manager/governance.rs '(try_expression (call_expression function: (identifier) @fn (#eq? @fn \"enforce_economic_policy\")))' --min 1"
     }
   ]
 }
