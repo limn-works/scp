@@ -40,7 +40,7 @@ const PROVIDER_SRC: &str =
 // RATCHET CONSTANTS — may only increase
 // Any decrease requires human approval
 // =========================================================================
-const MIN_ACTIVE_PIPELINE_ASSERTIONS: usize = 15;
+const MIN_ACTIVE_PIPELINE_ASSERTIONS: usize = 20;
 
 // ---------------------------------------------------------------------------
 // Function body extraction — brace-matching parser
@@ -311,7 +311,6 @@ fn send_message_does_not_call_encrypt_message() {
 // --- Governance / lifecycle ---
 
 #[test]
-#[ignore = "#1541 — sender key cleanup on member removal not yet wired"]
 fn execute_remove_member_calls_remove_member_sender_key() {
     assert!(
         fn_body_contains(
@@ -326,7 +325,6 @@ fn execute_remove_member_calls_remove_member_sender_key() {
 // --- Standing (#1530) ---
 
 #[test]
-#[ignore = "#1530 — standing score not yet consulted in governance proposals"]
 fn propose_governance_checks_standing() {
     assert!(
         fn_body_contains(
@@ -341,7 +339,6 @@ fn propose_governance_checks_standing() {
 // --- Consequences (#1531) ---
 
 #[test]
-#[ignore = "#1531 — consequence evaluation not yet wired into governance dispatch"]
 fn governance_dispatch_calls_evaluate_consequences() {
     assert!(
         fn_body_contains(
@@ -356,26 +353,30 @@ fn governance_dispatch_calls_evaluate_consequences() {
 // --- Economy (#1537) ---
 
 #[test]
-#[ignore = "#1537 — economy enforcement not yet wired into governance"]
 fn governance_enforces_economic_policy() {
+    // propose_governance_action_inner calls enforce_economic_policy (helper),
+    // which in turn calls evaluate_cost. Check both links in the call chain.
     assert!(
         fn_body_contains(
             MANAGER_SRC,
             "propose_governance_action_inner",
-            "evaluate_cost"
-        ) || fn_body_contains(MANAGER_SRC, "send_message", "evaluate_cost"),
-        "governance or send_message must call evaluate_cost for economic enforcement"
+            "enforce_economic_policy"
+        ),
+        "propose_governance_action_inner must call enforce_economic_policy"
+    );
+    assert!(
+        fn_body_contains(MANAGER_SRC, "enforce_economic_policy", "evaluate_cost"),
+        "enforce_economic_policy must call evaluate_cost"
     );
 }
 
 // --- Content key rotation (#1548) ---
 
 #[test]
-#[ignore = "#1548 — encrypted mode content key rotation is a no-op"]
-fn rotate_content_keys_calls_propose_update() {
+fn rotate_content_keys_calls_advance_epoch() {
     assert!(
-        fn_body_contains(MANAGER_SRC, "execute_rotate_content_keys", "propose_update"),
-        "execute_rotate_content_keys must call propose_update for encrypted mode MLS rotation"
+        fn_body_contains(MANAGER_SRC, "execute_rotate_content_keys", "advance_epoch"),
+        "execute_rotate_content_keys must call advance_epoch for encrypted mode MLS rotation"
     );
 }
 
@@ -411,49 +412,11 @@ fn pipeline_active_assertions_never_decrease() {
 /// the ignored test would run. A passing check = stale ignore = CI failure.
 #[test]
 fn no_stale_ignores() {
-    let mut stale = vec![];
+    let stale: Vec<&str> = vec![];
 
-    // Sender key rotation (#1541)
-    if fn_body_contains(
-        MANAGER_SRC,
-        "execute_remove_member",
-        "remove_member_sender_key",
-    ) {
-        stale.push("execute_remove_member_calls_remove_member_sender_key (#1541)");
-    }
-
-    // Standing (#1530)
-    if fn_body_contains(
-        MANAGER_SRC,
-        "propose_governance_action_inner",
-        "check_standing",
-    ) {
-        stale.push("propose_governance_checks_standing (#1530)");
-    }
-
-    // Consequences (#1531)
-    if fn_body_contains(
-        MANAGER_SRC,
-        "finalize_governance_action",
-        "evaluate_consequence_rules",
-    ) {
-        stale.push("governance_dispatch_calls_evaluate_consequences (#1531)");
-    }
-
-    // Economy (#1537)
-    if fn_body_contains(
-        MANAGER_SRC,
-        "propose_governance_action_inner",
-        "evaluate_cost",
-    ) || fn_body_contains(MANAGER_SRC, "send_message", "evaluate_cost")
-    {
-        stale.push("governance_enforces_economic_policy (#1537)");
-    }
-
-    // Content key rotation (#1548)
-    if fn_body_contains(MANAGER_SRC, "execute_rotate_content_keys", "propose_update") {
-        stale.push("rotate_content_keys_calls_propose_update (#1548)");
-    }
+    // All batch-2 governance tests (#1541, #1530, #1531, #1537, #1548) have
+    // been wired and their #[ignore] attributes removed. No stale checks
+    // needed for these — they are now enforced directly.
 
     assert!(
         stale.is_empty(),

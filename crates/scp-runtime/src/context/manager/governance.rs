@@ -2,19 +2,63 @@
 
 use super::{
     Arc, CEILING_CHANGE_NOTIFICATION_PERIOD_SECS, Capability, CapabilityCeiling, Clock,
-    ContentKeysRotatedResult, ContextError, ContextEvent, ContextManager, ContextParams,
-    ContextState, DID, ECONOMIC_POLICY_NOTIFICATION_PERIOD_SECS, EXECUTED_PROPOSALS_TTL_SECS,
-    EconomicPolicy, GovernanceAction, GovernanceActionResult, GovernanceBanResult,
-    GovernanceContext, GovernanceEvent, GovernanceProposal, GovernanceReconfiguredResult, HashSet,
-    MAX_REGISTERED_TOOLS, MAX_THRESHOLD_SIGNERS, MAX_TOOL_INTERFACES, MigrationProposedResult,
-    MigrationState, MlsImpact, PendingCeilingModification, PendingEconomicPolicyChange,
-    PerContextState, ProposalId, ProposalOutcome, ProposalStatus, PruningPolicy,
-    ReadAccessRestoredResult, ReadAccessRevokedResult, RevocationScope, ToolInterface,
-    ToolRegistration, WriteAccessRestoredResult, WriteAccessRevokedResult, classify_action,
-    collect_active_voters, context_id_to_bytes, generate_mls_operations, instrument,
-    process_pending_proposals, push_welcome_event, require_active, require_migrating_out, roles,
-    update_detection_state,
+    ConsequenceRule, ContentKeysRotatedResult, ContextError, ContextEvent, ContextManager,
+    ContextParams, ContextState, DID, ECONOMIC_POLICY_NOTIFICATION_PERIOD_SECS,
+    EXECUTED_PROPOSALS_TTL_SECS, EconomicPolicy, GovernanceAction, GovernanceActionResult,
+    GovernanceBanResult, GovernanceContext, GovernanceEvent, GovernanceProposal,
+    GovernanceReconfiguredResult, HashSet, MAX_REGISTERED_TOOLS, MAX_THRESHOLD_SIGNERS,
+    MAX_TOOL_INTERFACES, MigrationProposedResult, MigrationState, MlsImpact,
+    PendingCeilingModification, PendingEconomicPolicyChange, PerContextState, ProposalId,
+    ProposalOutcome, ProposalStatus, PruningPolicy, ReadAccessRestoredResult,
+    ReadAccessRevokedResult, RevocationScope, ToolInterface, ToolRegistration,
+    TriggeredConsequence, WriteAccessRestoredResult, WriteAccessRevokedResult, classify_action,
+    collect_active_voters, context_id_to_bytes, evaluate_consequence_rules,
+    generate_mls_operations, instrument, process_pending_proposals, push_welcome_event,
+    require_active, require_migrating_out, roles, update_detection_state,
 };
+
+/// Enforces economic policy for a governance proposal (#1537).
+///
+/// If the context has an economic policy with a non-zero cost for the action,
+/// records the spend against the proposer's budget. Returns an error if the
+/// proposer's budget is exceeded.
+fn enforce_economic_policy(
+    ctx: &mut PerContextState,
+    proposer_did: &DID,
+) -> Result<(), ContextError> {
+    if let Some(ref policy) = ctx.governance.economic_policy {
+        let metrics = scp_protocol::economy::policy::ObservableMetrics::default();
+        if let Some(cost) = scp_protocol::economy::policy::evaluate_cost(
+            policy,
+            &scp_protocol::economy::types::PaidActionType::ToolInvoke,
+            &metrics,
+        ) && cost > scp_protocol::economy::types::Amount::new(0)
+        {
+            ctx.governance
+                .budget_tracker
+                .record_spend(proposer_did, cost)
+                .map_err(|e| ContextError::GovernanceFailed(e.to_string()))?;
+        }
+    }
+    Ok(())
+}
+
+/// Checks whether a proposer is in good governance standing.
+///
+/// Members with a pending `RemoveMember` proposal approved against them
+/// cannot create new proposals (defense in depth, #1530).
+fn check_standing(ctx: &PerContextState, proposer_did: &DID) -> Result<(), ContextError> {
+    for (proposal, _seq, _ts) in ctx.governance.approved_proposals.values() {
+        if let GovernanceAction::RemoveMember { did, .. } = &proposal.action
+            && did == proposer_did
+        {
+            return Err(ContextError::PermissionDenied(
+                "member has a pending removal — cannot propose governance actions".into(),
+            ));
+        }
+    }
+    Ok(())
+}
 
 #[allow(clippy::significant_drop_tightening)]
 impl ContextManager {
@@ -226,6 +270,26 @@ impl ContextManager {
                 ctx.governance
                     .approved_proposals
                     .remove(&proposal.proposal_id);
+
+                // Evaluate consequence rules after governance action (ADR-017, #1531).
+                let rules: &[ConsequenceRule] = &ctx.governance.consequence_rules;
+                if !rules.is_empty() {
+                    let now = self.clock.now_secs();
+                    let triggered: Vec<TriggeredConsequence> =
+                        evaluate_consequence_rules(rules, &[], proposal.proposer_did.as_ref(), now);
+                    for consequence in &triggered {
+                        ctx.receive_buffer
+                            .push(ContextEvent::GovernanceActionExecuted {
+                                proposal_id: proposal.proposal_id,
+                                action_summary: format!(
+                                    "ConsequenceTriggered:{}",
+                                    consequence.rule_index
+                                ),
+                                executor_did: proposal.proposer_did.clone(),
+                                resulting_epoch: None,
+                            });
+                    }
+                }
 
                 // 4. Persist the updated context state (best-effort).
                 if self.has_persistence() {
@@ -673,6 +737,13 @@ impl ContextManager {
                     "presence-only members cannot propose governance actions".into(),
                 ));
             }
+
+            // Standing check: verify proposer is in good governance
+            // standing before allowing new proposals (#1530).
+            check_standing(ctx, proposer_did)?;
+
+            // Economic policy enforcement: check proposer's budget (#1537).
+            enforce_economic_policy(ctx, proposer_did)?;
 
             // SCP-272: Check and auto-resolve expired governance freezes (48-hour timeout).
             let freeze_events = self.check_and_resolve_expired_freezes(ctx);
@@ -1509,6 +1580,9 @@ impl ContextManager {
             self.crypto
                 .remove_member(&context_id_bytes, did)
                 .map_err(|e| ContextError::MembershipFailed(e.to_string()))?;
+
+            self.crypto
+                .remove_member_sender_key(&context_id_bytes, did.as_ref())?;
 
             ctx.membership.remove_member(did);
             ctx.role_state.members.remove(did.as_ref());
@@ -2796,6 +2870,9 @@ impl ContextManager {
                     None
                 }
             } else {
+                // Encrypted mode: advance MLS epoch via propose_update (#1548).
+                self.crypto.advance_epoch(&context_id_bytes)?;
+
                 // Encrypted mode: regenerate per-member access keys at a new
                 // epoch (§9.17.2 step 6, ADR-038). MLS key rotation and access
                 // key rotation are independent — MLS handles group secrets,

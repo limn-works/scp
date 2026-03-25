@@ -83,32 +83,15 @@ impl ContextManager {
         handle: &ContextHandle,
     ) -> Result<(), ContextError> {
         let (ctx_snapshot, broadcast_ctx) = self.load_persisted_context_state(context_id)?;
-
-        // Restore the event log from persistence (#636).
-        let ctx_id_bytes = context_id_to_bytes(context_id);
-        if let Err(e) = self.event_log.restore_event_log(&ctx_id_bytes) {
-            tracing::warn!(
-                context_id = %context_id,
-                error = %e,
-                "failed to restore event log from persistence; \
-                 context will start with an empty event log"
-            );
-            // Best-effort: initialize an empty event log so operations
-            // can continue even if the persisted data is corrupt.
-            let _ = self.event_log.init_event_log(&ctx_id_bytes);
-        }
-
+        self.restore_event_log_best_effort(context_id);
         let ttl_remaining = ctx_snapshot.ttl_remaining_secs;
-
         // Reconstruct the governance engine from the persisted snapshot.
         let governance_engine =
             restore_governance_engine_from_snapshot(&ctx_snapshot, self.key_resolver.clone())?;
-
         // Restore the epoch grace store from persisted entries (§23.11
         // recovery-on-startup).
         let (grace_store, needs_reconnect) =
             restore_grace_store_from_snapshot(context_id, &ctx_snapshot);
-
         // Restore MLS crypto state from the persisted snapshot (#645).
         // This must happen before constructing PerContextState so the crypto
         // provider has the MLS group and sender keys available for subsequent
@@ -119,19 +102,14 @@ impl ContextManager {
                 .restore_crypto_state(&ctx_id_bytes, &ctx_snapshot.mls_crypto_state)?;
         }
 
-        let initial_members: HashSet<DID> = ctx_snapshot
+        let last_members: HashSet<DID> = ctx_snapshot
             .membership
             .members()
             .map(|m| m.did.clone())
             .collect();
-
         let per_context = PerContextState {
             handle: handle.clone(),
             membership: ctx_snapshot.membership,
-            role_state: ctx_snapshot.role_state,
-            receive_buffer: ReceiveBuffer::new(),
-            broadcast_context: broadcast_ctx,
-            migration_state: ctx_snapshot.migration_state,
             governance: GovernanceState {
                 engine: governance_engine,
                 executed_proposals: {
@@ -155,9 +133,15 @@ impl ContextManager {
                 pruning_policy: ctx_snapshot.pruning_policy,
                 economic_policy: ctx_snapshot.economic_policy,
                 budget_tracker: ctx_snapshot.budget_tracker,
-                last_known_members: initial_members,
+                last_known_members: last_members,
                 pending_epoch_resets: Vec::new(),
+                standing: true,
+                consequence_rules: ctx_snapshot.consequence_rules,
             },
+            role_state: ctx_snapshot.role_state,
+            receive_buffer: ReceiveBuffer::new(),
+            broadcast_context: broadcast_ctx,
+            migration_state: ctx_snapshot.migration_state,
             epoch: EpochState {
                 mls_epoch: ctx_snapshot.mls_epoch,
                 coordinator: EpochCoordinator::from_records(
@@ -202,6 +186,34 @@ impl ContextManager {
         }
 
         Ok(())
+    }
+
+    /// Best-effort event log restore from persistence (#636).
+    fn restore_event_log_best_effort(&self, context_id: &str) {
+        let ctx_id_bytes = context_id_to_bytes(context_id);
+        if let Err(e) = self.event_log.restore_event_log(&ctx_id_bytes) {
+            tracing::warn!(
+                context_id = %context_id,
+                error = %e,
+                "failed to restore event log from persistence; \
+                 context will start with an empty event log"
+            );
+            let _ = self.event_log.init_event_log(&ctx_id_bytes);
+        }
+    }
+
+    /// Generates the initial access key store for context creation (§9.17.2).
+    fn generate_initial_access_key_store(
+        context_id: &str,
+        creator_did: &DID,
+    ) -> scp_protocol::crypto::access_keys::AccessKeyStore {
+        let mut store = scp_protocol::crypto::access_keys::AccessKeyStore::new();
+        let key = scp_protocol::crypto::access_keys::generate_access_key(
+            context_id,
+            creator_did.as_ref(),
+        );
+        store.set(context_id, creator_did.as_ref(), key);
+        store
     }
 
     /// Returns `true` if the given context needs to re-enter the
@@ -611,6 +623,8 @@ impl ContextManager {
                 budget_tracker: export.snapshot.budget_tracker,
                 last_known_members: initial_members,
                 pending_epoch_resets: Vec::new(),
+                standing: true,
+                consequence_rules: export.snapshot.consequence_rules,
             },
             epoch: EpochState {
                 mls_epoch: export.snapshot.mls_epoch,
@@ -721,13 +735,8 @@ impl ContextManager {
         params: ContextParams,
         creator_did: DID,
     ) -> Result<ContextHandle, ContextCreationError> {
-        // Defense-in-depth: verify that the creator's SDK version satisfies the
-        // min_protocol_version it is setting. Without this check, an SDK 1.0
-        // creator could set min_protocol_version: (2, 0), creating a context
-        // nobody — including themselves — can join.
+        // Defense-in-depth: verify creator's SDK version satisfies min_protocol_version.
         params.check_version_compatibility(scp_protocol::envelope::SCP_PROTOCOL_VERSION)?;
-
-        // Validate governance model parameters before proceeding.
         validate_governance_model(&params.governance)?;
         let governance_engine =
             create_governance_engine(&params.governance, &creator_did, self.key_resolver.clone())?;
@@ -739,7 +748,6 @@ impl ContextManager {
             self.event_log.as_ref(),
         )
         .await?;
-
         let ceiling = CapabilityCeiling::new(params.ceiling.iter().cloned());
         let role_state =
             ContextRoleState::new(&context_id, &*creator_did, ceiling, vec![], &*self.clock)
@@ -751,32 +759,17 @@ impl ContextManager {
             .map(|a| a.tokens.clone())
             .unwrap_or_default();
         membership.add_member(creator_did.clone(), "admin".into(), creator_tokens);
-
         let broadcast_context = self.init_broadcast_context(&context_id, &params, &creator_did)?;
-
-        // Extract threshold signers/value from GovernanceModel (ADR-031).
         let (initial_threshold_signers, initial_threshold_value) = match &params.governance {
             GovernanceModel::Threshold { threshold, signers } => (signers.clone(), *threshold),
             _ => (Vec::new(), 0),
         };
-
+        let initial_access_key_store =
+            Self::generate_initial_access_key_store(&context_id, &creator_did);
         let initial_members: HashSet<DID> = membership.members().map(|m| m.did.clone()).collect();
-
-        // Generate access key for the creator (§9.17.2 step 1).
-        let mut initial_access_key_store = scp_protocol::crypto::access_keys::AccessKeyStore::new();
-        let creator_access_key = scp_protocol::crypto::access_keys::generate_access_key(
-            &context_id,
-            creator_did.as_ref(),
-        );
-        initial_access_key_store.set(&context_id, creator_did.as_ref(), creator_access_key);
-
         let per_context = PerContextState {
             handle: handle.clone(),
             membership,
-            role_state,
-            receive_buffer: ReceiveBuffer::new(),
-            broadcast_context,
-            migration_state: None,
             governance: GovernanceState {
                 engine: governance_engine,
                 executed_proposals: HashMap::new(),
@@ -795,7 +788,13 @@ impl ContextManager {
                 budget_tracker: MemberBudgetTracker::new(),
                 last_known_members: initial_members,
                 pending_epoch_resets: Vec::new(),
+                standing: true,
+                consequence_rules: Vec::new(),
             },
+            role_state,
+            receive_buffer: ReceiveBuffer::new(),
+            broadcast_context,
+            migration_state: None,
             epoch: EpochState {
                 mls_epoch: 0,
                 coordinator: EpochCoordinator::new(),
@@ -825,7 +824,6 @@ impl ContextManager {
             }
             contexts.insert(context_id.clone(), per_context);
         }
-
         self.update_context_gauges().await;
         self.start_governance_timeout_task(&context_id).await;
         self.persist_context_and_broadcast(&context_id).await;
@@ -1072,6 +1070,8 @@ impl ContextManager {
                 budget_tracker: MemberBudgetTracker::new(),
                 last_known_members: HashSet::new(),
                 pending_epoch_resets: Vec::new(),
+                standing: true,
+                consequence_rules: Vec::new(),
             },
             epoch: EpochState {
                 mls_epoch: 0,

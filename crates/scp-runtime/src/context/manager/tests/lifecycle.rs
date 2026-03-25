@@ -753,6 +753,7 @@ async fn persist_drop_restore_roundtrip() {
         migration_state: None,
         mls_crypto_state: Vec::new(),
         access_key_store: scp_protocol::crypto::access_keys::AccessKeyStore::new(),
+        consequence_rules: Vec::new(),
     };
 
     let bc_snapshot = test_broadcast_snapshot("persist-ctx-2");
@@ -865,6 +866,7 @@ async fn restore_preserves_executed_proposals() {
         migration_state: None,
         mls_crypto_state: Vec::new(),
         access_key_store: scp_protocol::crypto::access_keys::AccessKeyStore::new(),
+        consequence_rules: Vec::new(),
     };
 
     persistence
@@ -965,6 +967,7 @@ async fn restore_respawns_ttl_timer() {
         migration_state: None,
         mls_crypto_state: Vec::new(),
         access_key_store: scp_protocol::crypto::access_keys::AccessKeyStore::new(),
+        consequence_rules: Vec::new(),
     };
 
     persistence.persist_context("ttl-ctx", &snapshot).unwrap();
@@ -1044,6 +1047,7 @@ async fn restore_all_contexts_restores_persisted() {
             migration_state: None,
             mls_crypto_state: Vec::new(),
             access_key_store: scp_protocol::crypto::access_keys::AccessKeyStore::new(),
+            consequence_rules: Vec::new(),
         };
         persistence.persist_context(ctx_name, &snapshot).unwrap();
     }
@@ -1122,6 +1126,7 @@ async fn restore_context_rejects_duplicate() {
         migration_state: None,
         mls_crypto_state: Vec::new(),
         access_key_store: scp_protocol::crypto::access_keys::AccessKeyStore::new(),
+        consequence_rules: Vec::new(),
     };
 
     let bc_snapshot = test_broadcast_snapshot("dup-ctx");
@@ -1222,6 +1227,7 @@ async fn restore_context_sets_needs_reconnect_on_grace_inconsistency() {
         migration_state: None,
         mls_crypto_state: Vec::new(),
         access_key_store: scp_protocol::crypto::access_keys::AccessKeyStore::new(),
+        consequence_rules: Vec::new(),
     };
 
     let bc_snapshot = test_broadcast_snapshot("grace-incon-ctx");
@@ -1329,6 +1335,7 @@ async fn restore_context_no_reconnect_when_grace_consistent() {
         migration_state: None,
         mls_crypto_state: Vec::new(),
         access_key_store: scp_protocol::crypto::access_keys::AccessKeyStore::new(),
+        consequence_rules: Vec::new(),
     };
 
     let bc_snapshot = test_broadcast_snapshot("grace-ok-ctx");
@@ -1424,6 +1431,7 @@ fn reconnect_test_snapshot(
         mls_crypto_state: Vec::new(),
         migration_state: None,
         access_key_store: scp_protocol::crypto::access_keys::AccessKeyStore::new(),
+        consequence_rules: Vec::new(),
     }
 }
 

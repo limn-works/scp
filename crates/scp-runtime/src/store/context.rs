@@ -1748,6 +1748,7 @@ mod tests {
             mls_crypto_state: Vec::new(),
             migration_state: None,
             access_key_store: scp_protocol::crypto::access_keys::AccessKeyStore::new(),
+            consequence_rules: Vec::new(),
         }
     }
 
