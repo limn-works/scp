@@ -37,6 +37,7 @@ bindings/kotlin/scp-kt/src/main/kotlin/works/limn/scp/internal/*.kt
 .fastembed_cache/
 
 .claude/worktrees
+.worktrees
 
 .mcp.json
 .mcp_data
