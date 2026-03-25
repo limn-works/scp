@@ -1,0 +1,47 @@
+{
+  "name": "batch2-1530-standing-scores",
+  "description": "#1530: Wire StandingChannelManager into governance proposals — standing scores must gate proposal submission",
+  "created": "2026-03-25T12:00:00Z",
+  "gates": [
+    {
+      "name": "CALL: check_standing called in governance.rs (any call form)",
+      "check": "/Users/alec/.claude/plugins/cache/alecmarcus/odyssey/0.3.0/bin/check-ast crates/scp-runtime/src/context/manager/governance.rs '(call_expression function: (identifier) @fn (#eq? @fn \"check_standing\"))' --min 1 || /Users/alec/.claude/plugins/cache/alecmarcus/odyssey/0.3.0/bin/check-ast crates/scp-runtime/src/context/manager/governance.rs '(call_expression function: (field_expression field: (field_identifier) @method (#eq? @method \"check_standing\")))' --min 1 || /Users/alec/.claude/plugins/cache/alecmarcus/odyssey/0.3.0/bin/check-ast crates/scp-runtime/src/context/manager/governance.rs '(call_expression function: (scoped_identifier name: (identifier) @fn (#eq? @fn \"check_standing\")))' --min 1"
+    },
+    {
+      "name": "IMPORT: StandingChannelManager referenced in governance.rs",
+      "check": "/Users/alec/.claude/plugins/cache/alecmarcus/odyssey/0.3.0/bin/check-ast crates/scp-runtime/src/context/manager/governance.rs '((identifier) @id (#match? @id \"StandingChannelManager|standing\"))' --min 1"
+    },
+    {
+      "name": "FAIL-CLOSED: standing check result uses ? (not silently discarded)",
+      "check": "/Users/alec/.claude/plugins/cache/alecmarcus/odyssey/0.3.0/bin/check-ast crates/scp-runtime/src/context/manager/governance.rs '(try_expression (call_expression function: (field_expression field: (field_identifier) @method (#eq? @method \"check_standing\"))))' --min 1 || /Users/alec/.claude/plugins/cache/alecmarcus/odyssey/0.3.0/bin/check-ast crates/scp-runtime/src/context/manager/governance.rs '(try_expression (call_expression function: (identifier) @fn (#eq? @fn \"check_standing\")))' --min 1"
+    },
+    {
+      "name": "NO-DISCARD: check_standing not silently discarded via let_declaration",
+      "check": "/Users/alec/.claude/plugins/cache/alecmarcus/odyssey/0.3.0/bin/check-ast crates/scp-runtime/src/context/manager/governance.rs '(let_declaration value: (call_expression function: (identifier) @fn (#eq? @fn \"check_standing\")))' --zero && /Users/alec/.claude/plugins/cache/alecmarcus/odyssey/0.3.0/bin/check-ast crates/scp-runtime/src/context/manager/governance.rs '(let_declaration value: (call_expression function: (field_expression field: (field_identifier) @method (#eq? @method \"check_standing\"))))' --zero"
+    },
+    {
+      "name": "PIPELINE: #[ignore] for #1530 is removed",
+      "check": "/Users/alec/.claude/plugins/cache/alecmarcus/odyssey/0.3.0/bin/check-ast crates/scp-testing/tests/integration/pipeline_wiring.rs '(attribute_item (attribute (identifier) @attr value: (string_literal (string_content) @val (#match? @val \"#1530\")) (#eq? @attr \"ignore\")))' --zero"
+    },
+    {
+      "name": "PIPELINE-FN: pipeline test function is active",
+      "check": "/Users/alec/.claude/plugins/cache/alecmarcus/odyssey/0.3.0/bin/check-ast crates/scp-testing/tests/integration/pipeline_wiring.rs '(function_item name: (identifier) @fn (#eq? @fn \"propose_governance_checks_standing\"))' --min 1"
+    },
+    {
+      "name": "TEST-POSITIVE: governance test has standing score test",
+      "check": "/Users/alec/.claude/plugins/cache/alecmarcus/odyssey/0.3.0/bin/check-ast crates/scp-runtime/src/context/manager/tests/governance.rs '(function_item name: (identifier) @fn (#match? @fn \"standing\"))' --min 1"
+    },
+    {
+      "name": "TEST-NEGATIVE: governance test has rejection test for low standing",
+      "check": "/Users/alec/.claude/plugins/cache/alecmarcus/odyssey/0.3.0/bin/check-ast crates/scp-runtime/src/context/manager/tests/governance.rs '(function_item name: (identifier) @fn (#match? @fn \"standing.*(reject|denied|block|fail)|low.*standing|(reject|denied|block|fail).*standing\"))' --min 1"
+    },
+    {
+      "name": "TEST-HAS-ASSERT: standing test contains assertion",
+      "check": "/Users/alec/.claude/plugins/cache/alecmarcus/odyssey/0.3.0/bin/check-ast crates/scp-runtime/src/context/manager/tests/governance.rs '(function_item name: (identifier) @fn body: (block (expression_statement (macro_invocation macro: (identifier) @mac (#match? @mac \"assert\")))) (#match? @fn \"standing\"))' --min 1"
+    },
+    {
+      "name": "STATE: GovernanceState or PerContextState references standing (state is persisted)",
+      "check": "/Users/alec/.claude/plugins/cache/alecmarcus/odyssey/0.3.0/bin/check-ast crates/scp-runtime/src/context/manager/mod.rs '((identifier) @id (#match? @id \"standing|StandingChannelManager\"))' --min 1"
+    }
+  ]
+}

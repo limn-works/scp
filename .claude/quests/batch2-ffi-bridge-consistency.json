@@ -1,0 +1,39 @@
+{
+  "name": "batch2-ffi-bridge-consistency",
+  "description": "FFI bridges (PyO3, NAPI, UniFFI) must maintain governance execution coverage — no regression from Batch 2",
+  "created": "2026-03-25T12:00:00Z",
+  "gates": [
+    {
+      "name": "BRIDGE-PYO3: GovernanceActionResult enum handled",
+      "check": "/Users/alec/.claude/plugins/cache/alecmarcus/odyssey/0.3.0/bin/check-ast crates/scp-ffi/src/context.rs '((identifier) @id (#eq? @id \"GovernanceActionResult\"))' --min 1"
+    },
+    {
+      "name": "BRIDGE-UNIFFI: GovernanceActionResult enum handled",
+      "check": "/Users/alec/.claude/plugins/cache/alecmarcus/odyssey/0.3.0/bin/check-ast crates/scp-ffi/uniffi/src/bridge.rs '((identifier) @id (#eq? @id \"GovernanceActionResult\"))' --min 1"
+    },
+    {
+      "name": "BRIDGE-PYO3: ContentKeysRotated event handled",
+      "check": "/Users/alec/.claude/plugins/cache/alecmarcus/odyssey/0.3.0/bin/check-ast crates/scp-ffi/src/context.rs '((identifier) @id (#eq? @id \"ContentKeysRotated\"))' --min 1"
+    },
+    {
+      "name": "BRIDGE-UNIFFI: ContentKeysRotated event handled",
+      "check": "/Users/alec/.claude/plugins/cache/alecmarcus/odyssey/0.3.0/bin/check-ast crates/scp-ffi/uniffi/src/bridge.rs '((identifier) @id (#eq? @id \"ContentKeysRotated\"))' --min 1"
+    },
+    {
+      "name": "BRIDGE-PYO3: py_governance_execute function exists",
+      "check": "/Users/alec/.claude/plugins/cache/alecmarcus/odyssey/0.3.0/bin/check-ast crates/scp-ffi/src/context.rs '(function_item name: (identifier) @fn (#eq? @fn \"py_governance_execute\"))' --min 1"
+    },
+    {
+      "name": "BRIDGE-NAPI: context_execute_governance_action function exists",
+      "check": "/Users/alec/.claude/plugins/cache/alecmarcus/odyssey/0.3.0/bin/check-ast crates/scp-ffi/napi/src/context.rs '(function_item name: (identifier) @fn (#eq? @fn \"context_execute_governance_action\"))' --min 1"
+    },
+    {
+      "name": "BRIDGE-PYO3: py_governance_propose function exists",
+      "check": "/Users/alec/.claude/plugins/cache/alecmarcus/odyssey/0.3.0/bin/check-ast crates/scp-ffi/src/context.rs '(function_item name: (identifier) @fn (#eq? @fn \"py_governance_propose\"))' --min 1"
+    },
+    {
+      "name": "BRIDGE-NAPI: context_governance_propose function exists",
+      "check": "/Users/alec/.claude/plugins/cache/alecmarcus/odyssey/0.3.0/bin/check-ast crates/scp-ffi/napi/src/context.rs '(function_item name: (identifier) @fn (#eq? @fn \"context_governance_propose\"))' --min 1"
+    }
+  ]
+}

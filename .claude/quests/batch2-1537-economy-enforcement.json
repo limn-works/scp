@@ -1,0 +1,51 @@
+{
+  "name": "batch2-1537-economy-enforcement",
+  "description": "#1537: Wire evaluate_cost into governance/messaging — budget enforcement must gate costly operations",
+  "created": "2026-03-25T12:00:00Z",
+  "gates": [
+    {
+      "name": "CALL: evaluate_cost called in governance.rs or messaging.rs",
+      "check": "/Users/alec/.claude/plugins/cache/alecmarcus/odyssey/0.3.0/bin/check-ast crates/scp-runtime/src/context/manager/governance.rs '(call_expression function: (identifier) @fn (#eq? @fn \"evaluate_cost\"))' --min 1 || /Users/alec/.claude/plugins/cache/alecmarcus/odyssey/0.3.0/bin/check-ast crates/scp-runtime/src/context/manager/governance.rs '(call_expression function: (scoped_identifier name: (identifier) @fn (#eq? @fn \"evaluate_cost\")))' --min 1 || /Users/alec/.claude/plugins/cache/alecmarcus/odyssey/0.3.0/bin/check-ast crates/scp-runtime/src/context/manager/messaging.rs '(call_expression function: (identifier) @fn (#eq? @fn \"evaluate_cost\"))' --min 1 || /Users/alec/.claude/plugins/cache/alecmarcus/odyssey/0.3.0/bin/check-ast crates/scp-runtime/src/context/manager/messaging.rs '(call_expression function: (scoped_identifier name: (identifier) @fn (#eq? @fn \"evaluate_cost\")))' --min 1"
+    },
+    {
+      "name": "CALL: record_spend called in governance.rs or messaging.rs",
+      "check": "/Users/alec/.claude/plugins/cache/alecmarcus/odyssey/0.3.0/bin/check-ast crates/scp-runtime/src/context/manager/governance.rs '(call_expression function: (field_expression field: (field_identifier) @method (#eq? @method \"record_spend\")))' --min 1 || /Users/alec/.claude/plugins/cache/alecmarcus/odyssey/0.3.0/bin/check-ast crates/scp-runtime/src/context/manager/messaging.rs '(call_expression function: (field_expression field: (field_identifier) @method (#eq? @method \"record_spend\")))' --min 1"
+    },
+    {
+      "name": "FAIL-CLOSED: evaluate_cost uses ? (try_expression)",
+      "check": "/Users/alec/.claude/plugins/cache/alecmarcus/odyssey/0.3.0/bin/check-ast crates/scp-runtime/src/context/manager/governance.rs '(try_expression (call_expression function: (identifier) @fn (#eq? @fn \"evaluate_cost\")))' --min 1 || /Users/alec/.claude/plugins/cache/alecmarcus/odyssey/0.3.0/bin/check-ast crates/scp-runtime/src/context/manager/governance.rs '(try_expression (call_expression function: (scoped_identifier name: (identifier) @fn (#eq? @fn \"evaluate_cost\"))))' --min 1 || /Users/alec/.claude/plugins/cache/alecmarcus/odyssey/0.3.0/bin/check-ast crates/scp-runtime/src/context/manager/messaging.rs '(try_expression (call_expression function: (identifier) @fn (#eq? @fn \"evaluate_cost\")))' --min 1 || /Users/alec/.claude/plugins/cache/alecmarcus/odyssey/0.3.0/bin/check-ast crates/scp-runtime/src/context/manager/messaging.rs '(try_expression (call_expression function: (scoped_identifier name: (identifier) @fn (#eq? @fn \"evaluate_cost\"))))' --min 1"
+    },
+    {
+      "name": "FAIL-CLOSED: record_spend uses ? (try_expression)",
+      "check": "/Users/alec/.claude/plugins/cache/alecmarcus/odyssey/0.3.0/bin/check-ast crates/scp-runtime/src/context/manager/governance.rs '(try_expression (call_expression function: (field_expression field: (field_identifier) @method (#eq? @method \"record_spend\"))))' --min 1 || /Users/alec/.claude/plugins/cache/alecmarcus/odyssey/0.3.0/bin/check-ast crates/scp-runtime/src/context/manager/messaging.rs '(try_expression (call_expression function: (field_expression field: (field_identifier) @method (#eq? @method \"record_spend\"))))' --min 1"
+    },
+    {
+      "name": "NO-DISCARD: evaluate_cost not silently discarded",
+      "check": "/Users/alec/.claude/plugins/cache/alecmarcus/odyssey/0.3.0/bin/check-ast crates/scp-runtime/src/context/manager/governance.rs '(let_declaration value: (call_expression function: (identifier) @fn (#eq? @fn \"evaluate_cost\")))' --zero"
+    },
+    {
+      "name": "NO-DISCARD: record_spend not silently discarded",
+      "check": "/Users/alec/.claude/plugins/cache/alecmarcus/odyssey/0.3.0/bin/check-ast crates/scp-runtime/src/context/manager/governance.rs '(let_declaration value: (call_expression function: (field_expression field: (field_identifier) @method (#eq? @method \"record_spend\"))))' --zero"
+    },
+    {
+      "name": "PIPELINE: #[ignore] for #1537 is removed",
+      "check": "/Users/alec/.claude/plugins/cache/alecmarcus/odyssey/0.3.0/bin/check-ast crates/scp-testing/tests/integration/pipeline_wiring.rs '(attribute_item (attribute (identifier) @attr value: (string_literal (string_content) @val (#match? @val \"#1537\")) (#eq? @attr \"ignore\")))' --zero"
+    },
+    {
+      "name": "PIPELINE-FN: pipeline test function is active",
+      "check": "/Users/alec/.claude/plugins/cache/alecmarcus/odyssey/0.3.0/bin/check-ast crates/scp-testing/tests/integration/pipeline_wiring.rs '(function_item name: (identifier) @fn (#eq? @fn \"governance_enforces_economic_policy\"))' --min 1"
+    },
+    {
+      "name": "TEST-NEW: test specifically for evaluate_cost enforcement (not pre-existing policy tests)",
+      "check": "/Users/alec/.claude/plugins/cache/alecmarcus/odyssey/0.3.0/bin/check-ast crates/scp-runtime/src/context/manager/tests/governance.rs '(function_item name: (identifier) @fn (#match? @fn \"evaluate_cost|cost_enforce|enforce.*cost|propose.*cost|send.*cost\"))' --min 1"
+    },
+    {
+      "name": "TEST-NEGATIVE: over-budget rejection test",
+      "check": "/Users/alec/.claude/plugins/cache/alecmarcus/odyssey/0.3.0/bin/check-ast crates/scp-runtime/src/context/manager/tests/governance.rs '(function_item name: (identifier) @fn (#match? @fn \"budget.*(exceed|reject|denied|fail|block)|over.*(budget|cost)|(exceed|reject|denied|fail|block).*(budget|cost)|cost.*(reject|denied|block)\"))' --min 1"
+    },
+    {
+      "name": "TEST-HAS-ASSERT: new enforcement test has assertion",
+      "check": "/Users/alec/.claude/plugins/cache/alecmarcus/odyssey/0.3.0/bin/check-ast crates/scp-runtime/src/context/manager/tests/governance.rs '(function_item name: (identifier) @fn body: (block (expression_statement (macro_invocation macro: (identifier) @mac (#match? @mac \"assert\")))) (#match? @fn \"evaluate_cost|cost_enforce|enforce.*cost\"))' --min 1"
+    }
+  ]
+}
