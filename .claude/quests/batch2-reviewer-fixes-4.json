@@ -1,0 +1,19 @@
+{
+  "name": "batch2-reviewer-fixes-4",
+  "description": "Reviewer findings: consequence_rules creation flow, ObservableMetrics real in governance.rs, evaluate_cost dead-code prevention",
+  "created": "2026-03-26T00:30:00Z",
+  "gates": [
+    {
+      "name": "CREATION-FLOW: consequence_rules accessed (field_expression) in lifecycle.rs create_context (rules flow from ContextParams)",
+      "check": "/Users/alec/.claude/plugins/cache/alecmarcus/odyssey/0.6.0/bin/check-ast crates/scp-runtime/src/context/manager/lifecycle.rs '(field_expression field: (field_identifier) @fid (#eq? @fid \"consequence_rules\"))' --min 2"
+    },
+    {
+      "name": "REAL-METRICS-GOV: ObservableMetrics::default() absent from governance.rs (forces real metrics everywhere)",
+      "check": "/Users/alec/.claude/plugins/cache/alecmarcus/odyssey/0.6.0/bin/check-ast crates/scp-runtime/src/context/manager/governance.rs '(call_expression function: (scoped_identifier path: (identifier) @path name: (identifier) @name (#eq? @path \"ObservableMetrics\") (#eq? @name \"default\")))' --zero"
+    },
+    {
+      "name": "CONSEQUENCE-DISTINCT-EVENT: ConsequenceTriggered string NOT used as GovernanceActionExecuted action_summary (old hack removed)",
+      "check": "/Users/alec/.claude/plugins/cache/alecmarcus/odyssey/0.6.0/bin/check-ast crates/scp-runtime/src/context/manager/governance.rs '(string_literal (string_content) @s (#match? @s \"ConsequenceTriggered:\"))' --zero"
+    }
+  ]
+}

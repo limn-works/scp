@@ -133,6 +133,12 @@
 - GOOD: Exhaustive match arms in governance dispatch (no wildcards)
 - GOOD: Unanimity check via set-difference pattern in ExtendTtl and PromoteContext
 
+### Wiring Batch 2 Governance (2026-03-25)
+- HIGH x2: evaluate_consequence_rules called with empty events slice (always no-op for threshold>=1); triggered consequences only logged, never enforced (CapabilitySuspension/AccessRevocation/RoleDemotion ignored)
+- MEDIUM x3: enforce_economic_policy hardcodes PaidActionType::ToolInvoke for all proposals; standing context ID 64-bit collision resistance (hash[..8]); standing_contexts HashMap unbounded
+- MEDIUM: remove_member_sender_key after remove_member -- partial cleanup on failure
+- GOOD: check_standing + enforce_economic_policy cover all proposal entry points; lock ordering consistent; advance_epoch fail-closed; consequence_rules stripped from public export; StandingContextManager fold-in uses full create_context path
+
 ### Wiring Batch 1 Messaging (2026-03-24, updated)
 - See `wiring-batch1-messaging-findings.md` for full details (15 files, line-by-line review)
 - HIGH x4: NAPI/UniFFI signing key .ok() falls back to None; Recovery MessageType bypass skips access key unwrapping; access key TOCTOU between Phase 1/3; reorder buffer stores pre-decrypted plaintext

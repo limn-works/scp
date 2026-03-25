@@ -5,23 +5,23 @@
   "gates": [
     {
       "name": "INTEGRATION: test for consequence evaluation in governance execution flow",
-      "check": "/Users/alec/.claude/plugins/cache/alecmarcus/odyssey/0.3.0/bin/check-ast crates/scp-runtime/src/context/manager/tests/governance.rs '(function_item name: (identifier) @fn body: (block (expression_statement (macro_invocation macro: (identifier) @mac (#match? @mac \"assert\")))) (#match? @fn \"consequence.*(execute|dispatch|triggered|applied)\"))' --min 1 || /Users/alec/.claude/plugins/cache/alecmarcus/odyssey/0.3.0/bin/check-ast crates/scp-runtime/src/context/manager/tests/governance.rs '(function_item name: (identifier) @fn body: (block (expression_statement (macro_invocation macro: (identifier) @mac (#match? @mac \"assert\")))) (#match? @fn \"(execute|dispatch).*(consequence|triggers_consequence)\"))' --min 1"
+      "check": "/Users/alec/.claude/plugins/cache/alecmarcus/odyssey/0.6.0/bin/check-ast crates/scp-runtime/src/context/manager/tests/governance.rs '(function_item name: (identifier) @fn body: (block (expression_statement (macro_invocation macro: (identifier) @mac (#match? @mac \"assert\")))) (#match? @fn \"consequence.*(execute|dispatch|triggered|applied)\"))' --min 1 || /Users/alec/.claude/plugins/cache/alecmarcus/odyssey/0.6.0/bin/check-ast crates/scp-runtime/src/context/manager/tests/governance.rs '(function_item name: (identifier) @fn body: (block (expression_statement (macro_invocation macro: (identifier) @mac (#match? @mac \"assert\")))) (#match? @fn \"(execute|dispatch).*(consequence|triggers_consequence)\"))' --min 1"
     },
     {
       "name": "INTEGRATION: test for standing check in proposal flow",
-      "check": "/Users/alec/.claude/plugins/cache/alecmarcus/odyssey/0.3.0/bin/check-ast crates/scp-runtime/src/context/manager/tests/governance.rs '(function_item name: (identifier) @fn body: (block (expression_statement (macro_invocation macro: (identifier) @mac (#match? @mac \"assert\")))) (#match? @fn \"standing.*(proposal|propose|gate|check)|proposal.*(standing|reputation)\"))' --min 1"
+      "check": "/Users/alec/.claude/plugins/cache/alecmarcus/odyssey/0.6.0/bin/check-ast crates/scp-runtime/src/context/manager/tests/governance.rs '(function_item name: (identifier) @fn body: (block (expression_statement (macro_invocation macro: (identifier) @mac (#match? @mac \"assert\")))) (#match? @fn \"standing.*(proposal|propose|gate|check)|proposal.*(standing|reputation)\"))' --min 1"
     },
     {
       "name": "INTEGRATION: test for economy enforcement in governance/messaging",
-      "check": "/Users/alec/.claude/plugins/cache/alecmarcus/odyssey/0.3.0/bin/check-ast crates/scp-runtime/src/context/manager/tests/governance.rs '(function_item name: (identifier) @fn body: (block (expression_statement (macro_invocation macro: (identifier) @mac (#match? @mac \"assert\")))) (#match? @fn \"evaluate_cost|cost.*(enforce|check|gate)|enforce.*(cost|budget)\"))' --min 1"
+      "check": "/Users/alec/.claude/plugins/cache/alecmarcus/odyssey/0.6.0/bin/check-ast crates/scp-runtime/src/context/manager/tests/governance.rs '(function_item name: (identifier) @fn body: (block (expression_statement (macro_invocation macro: (identifier) @mac (#match? @mac \"assert\")))) (#match? @fn \"evaluate_cost|cost.*(enforce|check|gate)|enforce.*(cost|budget)\"))' --min 1"
     },
     {
       "name": "INTEGRATION: MockCrypto supports remove_member_sender_key (test infra)",
-      "check": "/Users/alec/.claude/plugins/cache/alecmarcus/odyssey/0.3.0/bin/check-ast crates/scp-runtime/src/context/manager/tests/mod.rs '((identifier) @id (#eq? @id \"remove_member_sender_key\"))' --min 1"
+      "check": "/Users/alec/.claude/plugins/cache/alecmarcus/odyssey/0.6.0/bin/check-ast crates/scp-runtime/src/context/manager/tests/mod.rs '((identifier) @id (#eq? @id \"remove_member_sender_key\"))' --min 1"
     },
     {
       "name": "INTEGRATION: encrypted rotation test calls advance_epoch or propose_update",
-      "check": "/Users/alec/.claude/plugins/cache/alecmarcus/odyssey/0.3.0/bin/check-ast crates/scp-runtime/src/context/manager/tests/governance.rs '(function_item name: (identifier) @fn body: (block (expression_statement (macro_invocation macro: (identifier) @mac (#match? @mac \"assert\")))) (#match? @fn \"encrypted.*(rotate|rotation)|rotate.*encrypted|content_key.*encrypted\"))' --min 1"
+      "check": "/Users/alec/.claude/plugins/cache/alecmarcus/odyssey/0.6.0/bin/check-ast crates/scp-runtime/src/context/manager/tests/governance.rs '(function_item name: (identifier) @fn body: (block (expression_statement (macro_invocation macro: (identifier) @mac (#match? @mac \"assert\")))) (#match? @fn \"encrypted.*(rotate|rotation)|rotate.*encrypted|content_key.*encrypted\"))' --min 1"
     }
   ]
 }

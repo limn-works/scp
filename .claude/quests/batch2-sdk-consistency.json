@@ -5,35 +5,35 @@
   "gates": [
     {
       "name": "SDK-PY: execute_governance_action exists",
-      "check": "/Users/alec/.claude/plugins/cache/alecmarcus/odyssey/0.3.0/bin/check-ast bindings/python/scp_sdk/governance.py '(function_definition name: (identifier) @fn (#eq? @fn \"execute_governance_action\"))' --min 1"
+      "check": "/Users/alec/.claude/plugins/cache/alecmarcus/odyssey/0.6.0/bin/check-ast bindings/python/scp_sdk/governance.py '(function_definition name: (identifier) @fn (#eq? @fn \"execute_governance_action\"))' --min 1"
     },
     {
       "name": "SDK-PY: propose_governance_action exists",
-      "check": "/Users/alec/.claude/plugins/cache/alecmarcus/odyssey/0.3.0/bin/check-ast bindings/python/scp_sdk/governance.py '(function_definition name: (identifier) @fn (#eq? @fn \"propose_governance_action\"))' --min 1"
+      "check": "/Users/alec/.claude/plugins/cache/alecmarcus/odyssey/0.6.0/bin/check-ast bindings/python/scp_sdk/governance.py '(function_definition name: (identifier) @fn (#eq? @fn \"propose_governance_action\"))' --min 1"
     },
     {
       "name": "SDK-PY: approve_governance_proposal exists",
-      "check": "/Users/alec/.claude/plugins/cache/alecmarcus/odyssey/0.3.0/bin/check-ast bindings/python/scp_sdk/governance.py '(function_definition name: (identifier) @fn (#eq? @fn \"approve_governance_proposal\"))' --min 1"
+      "check": "/Users/alec/.claude/plugins/cache/alecmarcus/odyssey/0.6.0/bin/check-ast bindings/python/scp_sdk/governance.py '(function_definition name: (identifier) @fn (#eq? @fn \"approve_governance_proposal\"))' --min 1"
     },
     {
       "name": "SDK-PY: reject_governance_proposal exists",
-      "check": "/Users/alec/.claude/plugins/cache/alecmarcus/odyssey/0.3.0/bin/check-ast bindings/python/scp_sdk/governance.py '(function_definition name: (identifier) @fn (#eq? @fn \"reject_governance_proposal\"))' --min 1"
+      "check": "/Users/alec/.claude/plugins/cache/alecmarcus/odyssey/0.6.0/bin/check-ast bindings/python/scp_sdk/governance.py '(function_definition name: (identifier) @fn (#eq? @fn \"reject_governance_proposal\"))' --min 1"
     },
     {
       "name": "SDK-TS: executeGovernanceAction method exists",
-      "check": "/Users/alec/.claude/plugins/cache/alecmarcus/odyssey/0.3.0/bin/check-ast bindings/typescript/src/context.ts '(method_definition name: (property_identifier) @fn (#eq? @fn \"executeGovernanceAction\"))' --min 1"
+      "check": "/Users/alec/.claude/plugins/cache/alecmarcus/odyssey/0.6.0/bin/check-ast bindings/typescript/src/context.ts '(method_definition name: (property_identifier) @fn (#eq? @fn \"executeGovernanceAction\"))' --min 1"
     },
     {
       "name": "SDK-TS: proposeGovernanceAction method exists",
-      "check": "/Users/alec/.claude/plugins/cache/alecmarcus/odyssey/0.3.0/bin/check-ast bindings/typescript/src/context.ts '(method_definition name: (property_identifier) @fn (#eq? @fn \"proposeGovernanceAction\"))' --min 1"
+      "check": "/Users/alec/.claude/plugins/cache/alecmarcus/odyssey/0.6.0/bin/check-ast bindings/typescript/src/context.ts '(method_definition name: (property_identifier) @fn (#eq? @fn \"proposeGovernanceAction\"))' --min 1"
     },
     {
       "name": "SDK-TS: send method still exists (messaging regression check)",
-      "check": "/Users/alec/.claude/plugins/cache/alecmarcus/odyssey/0.3.0/bin/check-ast bindings/typescript/src/context.ts '(method_definition name: (property_identifier) @fn (#eq? @fn \"send\"))' --min 1"
+      "check": "/Users/alec/.claude/plugins/cache/alecmarcus/odyssey/0.6.0/bin/check-ast bindings/typescript/src/context.ts '(method_definition name: (property_identifier) @fn (#eq? @fn \"send\"))' --min 1"
     },
     {
       "name": "SDK-PY: Python SDK has economy module",
-      "check": "/Users/alec/.claude/plugins/cache/alecmarcus/odyssey/0.3.0/bin/check-ast bindings/python/scp_sdk/economy.py '(module)' --min 1"
+      "check": "/Users/alec/.claude/plugins/cache/alecmarcus/odyssey/0.6.0/bin/check-ast bindings/python/scp_sdk/economy.py '(module)' --min 1"
     }
   ]
 }

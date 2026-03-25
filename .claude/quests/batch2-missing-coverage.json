@@ -1,0 +1,31 @@
+{
+  "name": "batch2-missing-coverage",
+  "description": "Coverage gaps: record_spend at join, consequence event in FFI bridges, standing decay timer, error codes",
+  "created": "2026-03-25T22:30:00Z",
+  "gates": [
+    {
+      "name": "JOIN: record_spend called (method call_expression) in lifecycle.rs",
+      "check": "/Users/alec/.claude/plugins/cache/alecmarcus/odyssey/0.6.0/bin/check-ast crates/scp-runtime/src/context/manager/lifecycle.rs '(call_expression function: (field_expression field: (field_identifier) @method (#eq? @method \"record_spend\")))' --min 1"
+    },
+    {
+      "name": "FFI-PYO3: ConsequenceTriggered or ConsequenceEnforced variant handled in PyO3 bridge",
+      "check": "/Users/alec/.claude/plugins/cache/alecmarcus/odyssey/0.6.0/bin/check-ast crates/scp-ffi/src/context.rs '(scoped_identifier name: (identifier) @name (#match? @name \"ConsequenceTriggered|ConsequenceEnforced|ConsequenceApplied\"))' --min 1 || /Users/alec/.claude/plugins/cache/alecmarcus/odyssey/0.6.0/bin/check-ast crates/scp-ffi/src/context.rs '((identifier) @id (#match? @id \"ConsequenceTriggered|ConsequenceEnforced|ConsequenceApplied\"))' --min 1"
+    },
+    {
+      "name": "FFI-UNIFFI: ConsequenceTriggered or ConsequenceEnforced variant handled in UniFFI bridge",
+      "check": "/Users/alec/.claude/plugins/cache/alecmarcus/odyssey/0.6.0/bin/check-ast crates/scp-ffi/uniffi/src/bridge.rs '(scoped_identifier name: (identifier) @name (#match? @name \"ConsequenceTriggered|ConsequenceEnforced|ConsequenceApplied\"))' --min 1 || /Users/alec/.claude/plugins/cache/alecmarcus/odyssey/0.6.0/bin/check-ast crates/scp-ffi/uniffi/src/bridge.rs '((identifier) @id (#match? @id \"ConsequenceTriggered|ConsequenceEnforced|ConsequenceApplied\"))' --min 1"
+    },
+    {
+      "name": "FFI-NAPI: ConsequenceTriggered or ConsequenceEnforced handled in NAPI bridge context or events",
+      "check": "/Users/alec/.claude/plugins/cache/alecmarcus/odyssey/0.6.0/bin/check-ast crates/scp-ffi/napi/src/context.rs '(scoped_identifier name: (identifier) @name (#match? @name \"ConsequenceTriggered|ConsequenceEnforced|ConsequenceApplied\"))' --min 1 || /Users/alec/.claude/plugins/cache/alecmarcus/odyssey/0.6.0/bin/check-ast crates/scp-ffi/napi/src/context.rs '((identifier) @id (#match? @id \"ConsequenceTriggered|ConsequenceEnforced|ConsequenceApplied\"))' --min 1"
+    },
+    {
+      "name": "DECAY: standing decay timer or periodic participation refresh wired in ttl_close.rs or mod.rs",
+      "check": "/Users/alec/.claude/plugins/cache/alecmarcus/odyssey/0.6.0/bin/check-ast crates/scp-runtime/src/context/manager/mod.rs '(call_expression function: (field_expression field: (field_identifier) @method (#match? @method \"decay_standing|refresh_participation|update_standing\")))' --min 1 || /Users/alec/.claude/plugins/cache/alecmarcus/odyssey/0.6.0/bin/check-ast crates/scp-runtime/src/context/manager/ttl_close.rs '(call_expression function: (field_expression field: (field_identifier) @method (#match? @method \"decay_standing|refresh_participation|update_standing\")))' --min 1 || /Users/alec/.claude/plugins/cache/alecmarcus/odyssey/0.6.0/bin/check-ast crates/scp-runtime/src/context/manager/queries.rs '(call_expression function: (field_expression field: (field_identifier) @method (#match? @method \"decay_standing|refresh_participation|update_standing\")))' --min 1"
+    },
+    {
+      "name": "TOOL: record_spend called (method call_expression) in tools/invoke.rs (budget deducted on tool use)",
+      "check": "/Users/alec/.claude/plugins/cache/alecmarcus/odyssey/0.6.0/bin/check-ast crates/scp-runtime/src/context/tools/invoke.rs '(call_expression function: (field_expression field: (field_identifier) @method (#eq? @method \"record_spend\")))' --min 1"
+    }
+  ]
+}

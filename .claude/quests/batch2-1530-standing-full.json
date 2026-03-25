@@ -1,0 +1,31 @@
+{
+  "name": "batch2-1530-standing-full",
+  "description": "#1530: Standing = participation records. Updated on events, influences votes, feeds sybil, persisted, decays, tested behaviorally.",
+  "created": "2026-03-25T22:00:00Z",
+  "gates": [
+    {
+      "name": "UPDATE-SEND: compute_participation_record called (call_expression) in messaging.rs",
+      "check": "/Users/alec/.claude/plugins/cache/alecmarcus/odyssey/0.6.0/bin/check-ast crates/scp-runtime/src/context/manager/messaging.rs '(call_expression function: (identifier) @fn (#eq? @fn \"compute_participation_record\"))' --min 1 || /Users/alec/.claude/plugins/cache/alecmarcus/odyssey/0.6.0/bin/check-ast crates/scp-runtime/src/context/manager/messaging.rs '(call_expression function: (scoped_identifier name: (identifier) @fn (#eq? @fn \"compute_participation_record\")))' --min 1"
+    },
+    {
+      "name": "UPDATE-GOV: compute_participation_record called (call_expression) in governance.rs",
+      "check": "/Users/alec/.claude/plugins/cache/alecmarcus/odyssey/0.6.0/bin/check-ast crates/scp-runtime/src/context/manager/governance.rs '(call_expression function: (identifier) @fn (#eq? @fn \"compute_participation_record\"))' --min 1 || /Users/alec/.claude/plugins/cache/alecmarcus/odyssey/0.6.0/bin/check-ast crates/scp-runtime/src/context/manager/governance.rs '(call_expression function: (scoped_identifier name: (identifier) @fn (#eq? @fn \"compute_participation_record\")))' --min 1"
+    },
+    {
+      "name": "SYBIL: evaluate_sybil_resistance called (call_expression) in lifecycle.rs",
+      "check": "/Users/alec/.claude/plugins/cache/alecmarcus/odyssey/0.6.0/bin/check-ast crates/scp-runtime/src/context/manager/lifecycle.rs '(call_expression function: (identifier) @fn (#eq? @fn \"evaluate_sybil_resistance\"))' --min 1 || /Users/alec/.claude/plugins/cache/alecmarcus/odyssey/0.6.0/bin/check-ast crates/scp-runtime/src/context/manager/lifecycle.rs '(call_expression function: (scoped_identifier name: (identifier) @fn (#eq? @fn \"evaluate_sybil_resistance\")))' --min 1"
+    },
+    {
+      "name": "PERSIST: participation_cache or participation_records accessed (field_expression) in mod.rs snapshot_context",
+      "check": "/Users/alec/.claude/plugins/cache/alecmarcus/odyssey/0.6.0/bin/check-ast crates/scp-runtime/src/context/manager/mod.rs '(field_expression field: (field_identifier) @fid (#match? @fid \"participation_cache|participation_records|participation_record\"))' --min 1"
+    },
+    {
+      "name": "TEST-BEHAVIORAL: standing test creates ContextManager (call_expression, not include_str)",
+      "check": "/Users/alec/.claude/plugins/cache/alecmarcus/odyssey/0.6.0/bin/check-ast crates/scp-runtime/src/context/manager/tests/governance.rs '(function_item name: (identifier) @fn body: (block (let_declaration value: (call_expression))) (#match? @fn \"standing.*vote|vote.*standing|standing.*influence|standing.*weight\"))' --min 1"
+    },
+    {
+      "name": "TEST-BEHAVIORAL: standing integration test with assert on governance outcome",
+      "check": "/Users/alec/.claude/plugins/cache/alecmarcus/odyssey/0.6.0/bin/check-ast crates/scp-runtime/src/context/manager/tests/governance.rs '(function_item name: (identifier) @fn body: (block (expression_statement (macro_invocation macro: (identifier) @mac (#match? @mac \"assert\")))) (#match? @fn \"standing.*vote|vote.*standing|standing.*influence\"))' --min 1"
+    }
+  ]
+}
