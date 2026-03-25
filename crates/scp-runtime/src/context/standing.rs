@@ -1,16 +1,16 @@
-//! Standing channels (contact graph) for SCP.
+//! Standing contexts (contact graph) for SCP.
 //!
 //! Standing bilateral contexts serve as the real-time communication primitive
 //! (spec section 5.12.4). The SDK manages them as persistent infrastructure --
-//! the agent's contact list. `standing_channel(peer_did)` is a get-or-create
+//! the agent's contact list. `standing_context(peer_did)` is a get-or-create
 //! operation that returns an existing `bilateral-persistent` context or creates
 //! one. Idempotent.
 //!
-//! On SDK initialization, [`StandingChannelManager::reconnect_all`] reconnects
-//! transport for all standing channels. Standing channels are available
+//! On SDK initialization, [`StandingContextManager::reconnect_all`] reconnects
+//! transport for all standing contexts. Standing contexts are available
 //! immediately after `sdk.init()` returns.
 //!
-//! See `.docs/standards/sdk-common.md` section "Standing channels (contact
+//! See `.docs/standards/sdk-common.md` section "Standing contexts (contact
 //! graph)" for the authoritative specification.
 //!
 //! # SCP-138
@@ -28,17 +28,17 @@ use scp_protocol::context::templates::template_params;
 use scp_protocol::context::{ContextError, ContextState, TemplateId};
 
 // ---------------------------------------------------------------------------
-// StandingChannelError
+// StandingContextError
 // ---------------------------------------------------------------------------
 
-/// Errors specific to standing channel operations.
+/// Errors specific to standing context operations.
 #[derive(Debug, thiserror::Error)]
-pub enum StandingChannelError {
-    /// Context creation failed during standing channel setup.
+pub enum StandingContextError {
+    /// Context creation failed during standing context setup.
     #[error("context creation failed: {0}")]
     CreationFailed(String),
 
-    /// Transport reconnection failed for a standing channel.
+    /// Transport reconnection failed for a standing context.
     #[error("transport reconnection failed for context {context_id}: {reason}")]
     ReconnectFailed {
         /// The context ID that failed to reconnect.
@@ -48,45 +48,45 @@ pub enum StandingChannelError {
     },
 }
 
-impl From<StandingChannelError> for ContextError {
-    fn from(err: StandingChannelError) -> Self {
+impl From<StandingContextError> for ContextError {
+    fn from(err: StandingContextError) -> Self {
         Self::TransportFailed(err.to_string())
     }
 }
 
 // ---------------------------------------------------------------------------
-// StandingChannelEntry -- internal per-channel tracking
+// StandingContextEntry -- internal per-context tracking
 // ---------------------------------------------------------------------------
 
-/// Internal entry tracking a standing channel with a peer.
+/// Internal entry tracking a standing context with a peer.
 #[derive(Debug, Clone)]
-struct StandingChannelEntry {
-    /// The peer DID this standing channel is with.
+struct StandingContextEntry {
+    /// The peer DID this standing context is with.
     /// Retained for future peer enumeration and diagnostics.
     #[allow(dead_code)]
     peer_did: DID,
-    /// The context handle for this standing channel.
+    /// The context handle for this standing context.
     handle: ContextHandle,
 }
 
 // ---------------------------------------------------------------------------
-// StandingChannelManager
+// StandingContextManager
 // ---------------------------------------------------------------------------
 
-/// Manages standing bilateral channels (the agent's contact graph).
+/// Manages standing bilateral contexts (the agent's contact graph).
 ///
-/// Standing channels are `bilateral-persistent` contexts that persist across
+/// Standing contexts are `bilateral-persistent` contexts that persist across
 /// sessions. The manager provides:
 ///
-/// - [`standing_channel`](Self::standing_channel) -- Idempotent get-or-create.
+/// - [`standing_context`](Self::standing_context) -- Idempotent get-or-create.
 /// - [`reconnect_all`](Self::reconnect_all) -- Startup transport reconnection.
 ///
 /// # Thread Safety
 ///
-/// `StandingChannelManager` is `Send + Sync`. Interior state is protected by
+/// `StandingContextManager` is `Send + Sync`. Interior state is protected by
 /// `tokio::sync::Mutex`.
-pub struct StandingChannelManager {
-    /// The local identity DID (creator of standing channels).
+pub struct StandingContextManager {
+    /// The local identity DID (creator of standing contexts).
     local_did: DID,
     /// Crypto provider for context creation.
     crypto: Arc<dyn ContextCryptoProvider>,
@@ -94,16 +94,16 @@ pub struct StandingChannelManager {
     transport: Arc<dyn ContextTransportProvider>,
     /// Event log provider for context creation.
     event_log: Arc<dyn ContextEventLogProvider>,
-    /// Standing channels indexed by peer DID string.
-    channels: Mutex<HashMap<String, StandingChannelEntry>>,
+    /// Standing contexts indexed by peer DID string.
+    contexts: Mutex<HashMap<String, StandingContextEntry>>,
 }
 
-impl StandingChannelManager {
-    /// Creates a new `StandingChannelManager`.
+impl StandingContextManager {
+    /// Creates a new `StandingContextManager`.
     ///
     /// # Arguments
     ///
-    /// * `local_did` -- The DID of the local identity (channel creator).
+    /// * `local_did` -- The DID of the local identity (context creator).
     /// * `crypto` -- Crypto provider for MLS and sender key operations.
     /// * `transport` -- Transport provider for relay connectivity.
     /// * `event_log` -- Event log provider for event logging.
@@ -119,11 +119,11 @@ impl StandingChannelManager {
             crypto,
             transport,
             event_log,
-            channels: Mutex::new(HashMap::new()),
+            contexts: Mutex::new(HashMap::new()),
         }
     }
 
-    /// Returns an existing standing channel or creates a new one.
+    /// Returns an existing standing context or creates a new one.
     ///
     /// This is the primary API for the contact graph. It follows four steps:
     ///
@@ -139,14 +139,14 @@ impl StandingChannelManager {
     /// # Errors
     ///
     /// Returns [`ContextError`] if context creation fails.
-    pub async fn standing_channel(&self, peer_did: &DID) -> Result<ContextHandle, ContextError> {
+    pub async fn standing_context(&self, peer_did: &DID) -> Result<ContextHandle, ContextError> {
         // Hold the lock across the entire get-or-create operation to prevent
-        // TOCTOU races where two concurrent calls could both see "no channel"
+        // TOCTOU races where two concurrent calls could both see "no context"
         // and create duplicates.
-        let mut channels = self.channels.lock().await;
+        let mut contexts = self.contexts.lock().await;
 
-        // Step 1: Check local state for an existing channel with this peer.
-        if let Some(entry) = channels.get(peer_did.as_ref()) {
+        // Step 1: Check local state for an existing context with this peer.
+        if let Some(entry) = contexts.get(peer_did.as_ref()) {
             let state = entry.handle.state().await;
             match state {
                 // Step 2: Active or still being set up -- return immediately.
@@ -160,51 +160,51 @@ impl StandingChannelManager {
                 | ContextState::Closing
                 | ContextState::MigratingOut
                 | ContextState::Tombstoned => {
-                    // Will create a new channel below.
+                    // Will create a new context below.
                 }
             }
         }
 
         // Step 3/4: Create a new bilateral-persistent context.
-        // Lock is held across creation to prevent duplicate channels.
-        let handle = self.create_standing_channel(peer_did).await?;
+        // Lock is held across creation to prevent duplicate contexts.
+        let handle = self.create_standing_context(peer_did).await?;
 
-        // Register the new channel (replacing any old entry).
-        channels.insert(
+        // Register the new context (replacing any old entry).
+        contexts.insert(
             peer_did.to_string(),
-            StandingChannelEntry {
+            StandingContextEntry {
                 peer_did: peer_did.clone(),
                 handle: handle.clone(),
             },
         );
-        drop(channels);
+        drop(contexts);
 
         Ok(handle)
     }
 
-    /// Reconnects transport for all active standing channels.
+    /// Reconnects transport for all active standing contexts.
     ///
-    /// Called during SDK initialization. Iterates all tracked standing channels
-    /// and reconnects transport for those in the `Active` state. Channels in
+    /// Called during SDK initialization. Iterates all tracked standing contexts
+    /// and reconnects transport for those in the `Active` state. Contexts in
     /// terminal states (`Closed`, `Expired`) are skipped.
     ///
-    /// This is background work -- standing channels are available immediately
+    /// This is background work -- standing contexts are available immediately
     /// after this method returns.
     ///
     /// # Returns
     ///
-    /// The number of channels successfully reconnected.
+    /// The number of contexts successfully reconnected.
     ///
     /// # Errors
     ///
-    /// Returns [`StandingChannelError::ReconnectFailed`] if any reconnection
-    /// fails. Partial reconnection results are still applied -- channels that
+    /// Returns [`StandingContextError::ReconnectFailed`] if any reconnection
+    /// fails. Partial reconnection results are still applied -- contexts that
     /// succeeded remain connected.
-    pub async fn reconnect_all(&self) -> Result<usize, StandingChannelError> {
+    pub async fn reconnect_all(&self) -> Result<usize, StandingContextError> {
         // Collect handles under lock, then release before async operations.
         let entries: Vec<_> = {
-            let channels = self.channels.lock().await;
-            channels.values().map(|e| e.handle.clone()).collect()
+            let contexts = self.contexts.lock().await;
+            contexts.values().map(|e| e.handle.clone()).collect()
         };
 
         let mut reconnected = 0;
@@ -218,7 +218,7 @@ impl StandingChannelManager {
                 // to the relay for this context's messages).
                 self.transport
                     .publish_context(&context_id_bytes, handle.params())
-                    .map_err(|e| StandingChannelError::ReconnectFailed {
+                    .map_err(|e| StandingContextError::ReconnectFailed {
                         context_id: context_id.to_owned(),
                         reason: e.to_string(),
                     })?;
@@ -229,25 +229,25 @@ impl StandingChannelManager {
         Ok(reconnected)
     }
 
-    /// Returns the number of tracked standing channels.
-    pub async fn channel_count(&self) -> usize {
-        self.channels.lock().await.len()
+    /// Returns the number of tracked standing contexts.
+    pub async fn context_count(&self) -> usize {
+        self.contexts.lock().await.len()
     }
 
-    /// Returns `true` if a standing channel exists for the given peer DID.
-    pub async fn has_channel(&self, peer_did: &DID) -> bool {
-        self.channels.lock().await.contains_key(peer_did.as_ref())
+    /// Returns `true` if a standing context exists for the given peer DID.
+    pub async fn has_context(&self, peer_did: &DID) -> bool {
+        self.contexts.lock().await.contains_key(peer_did.as_ref())
     }
 
-    /// Registers an existing context as a standing channel.
+    /// Registers an existing context as a standing context.
     ///
-    /// Used during startup to restore standing channels from persisted state.
+    /// Used during startup to restore standing contexts from persisted state.
     /// The context must be a `bilateral-persistent` context.
     pub async fn register_existing(&self, peer_did: DID, handle: ContextHandle) {
-        let mut channels = self.channels.lock().await;
-        channels.insert(
+        let mut contexts = self.contexts.lock().await;
+        contexts.insert(
             peer_did.to_string(),
-            StandingChannelEntry { peer_did, handle },
+            StandingContextEntry { peer_did, handle },
         );
     }
 
@@ -255,12 +255,12 @@ impl StandingChannelManager {
     // Private helpers
     // -----------------------------------------------------------------------
 
-    /// Creates a new bilateral-persistent context for a standing channel.
+    /// Creates a new bilateral-persistent context for a standing context.
     ///
     /// Uses the two-phase commit creation flow via the builder, then
     /// transitions the context to Active.
-    async fn create_standing_channel(&self, peer_did: &DID) -> Result<ContextHandle, ContextError> {
-        let context_id = generate_standing_channel_id(&self.local_did, peer_did);
+    async fn create_standing_context(&self, peer_did: &DID) -> Result<ContextHandle, ContextError> {
+        let context_id = generate_standing_context_id(&self.local_did, peer_did);
         let params = template_params(&TemplateId::BilateralPersistent);
 
         // Use the builder's create_context for the two-phase commit flow.
@@ -287,13 +287,13 @@ impl StandingChannelManager {
 // Helpers
 // ---------------------------------------------------------------------------
 
-/// Generates a deterministic context ID for a standing channel between two DIDs.
+/// Generates a deterministic context ID for a standing context between two DIDs.
 ///
 /// The ID is derived from both DIDs sorted lexicographically, ensuring the same
-/// channel ID is generated regardless of which peer initiates. Uses a
+/// context ID is generated regardless of which peer initiates. Uses a
 /// `standing:` prefix for namespace isolation and a truncated SHA-256 hash of
 /// the sorted DID pair for the unique portion.
-fn generate_standing_channel_id(local_did: &DID, peer_did: &DID) -> String {
+fn generate_standing_context_id(local_did: &DID, peer_did: &DID) -> String {
     use sha2::{Digest, Sha256};
 
     // Sort to ensure determinism regardless of direction.
@@ -312,10 +312,10 @@ fn generate_standing_channel_id(local_did: &DID, peer_did: &DID) -> String {
     format!("standing-{}", hex::encode(&hash[..8]))
 }
 
-// Compile-time assertion that `StandingChannelManager` is `Send + Sync`.
+// Compile-time assertion that `StandingContextManager` is `Send + Sync`.
 const fn _assert_send_sync() {
     const fn assert_send_sync<T: Send + Sync>() {}
-    assert_send_sync::<StandingChannelManager>();
+    assert_send_sync::<StandingContextManager>();
 }
 
 // ---------------------------------------------------------------------------
@@ -472,9 +472,9 @@ mod tests {
     // Helper: create a manager with default mocks
     // -----------------------------------------------------------------------
 
-    fn create_manager() -> (StandingChannelManager, Arc<MockTransport>) {
+    fn create_manager() -> (StandingContextManager, Arc<MockTransport>) {
         let transport = Arc::new(MockTransport::connected());
-        let manager = StandingChannelManager::new(
+        let manager = StandingContextManager::new(
             DID::from("did:dht:z6MkLocalAlice"),
             Arc::new(MockCrypto),
             transport.clone(),
@@ -484,23 +484,23 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // Test: standing_channel returns existing context without network call
+    // Test: standing_context returns existing context without network call
     // -----------------------------------------------------------------------
 
     #[tokio::test]
-    async fn standing_channel_returns_existing_active_context() {
+    async fn standing_context_returns_existing_active_context() {
         let (manager, transport) = create_manager();
         let bob = DID::from("did:dht:z6MkBob");
 
-        // First call creates the channel.
-        let handle1 = manager.standing_channel(&bob).await.unwrap();
+        // First call creates the context.
+        let handle1 = manager.standing_context(&bob).await.unwrap();
         assert_eq!(handle1.state().await, ContextState::Active);
 
         // Record transport publish count after first creation.
         let publishes_after_create = transport.publish_count();
 
         // Second call should return the same handle without network cost.
-        let handle2 = manager.standing_channel(&bob).await.unwrap();
+        let handle2 = manager.standing_context(&bob).await.unwrap();
         assert_eq!(handle2.context_id(), handle1.context_id());
         assert_eq!(handle2.state().await, ContextState::Active);
 
@@ -509,17 +509,17 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // Test: standing_channel creates new bilateral-persistent context
+    // Test: standing_context creates new bilateral-persistent context
     // -----------------------------------------------------------------------
 
     #[tokio::test]
-    async fn standing_channel_creates_new_bilateral_persistent_context() {
+    async fn standing_context_creates_new_bilateral_persistent_context() {
         let (manager, _transport) = create_manager();
         let carol = DID::from("did:dht:z6MkCarol");
 
-        assert!(!manager.has_channel(&carol).await);
+        assert!(!manager.has_context(&carol).await);
 
-        let handle = manager.standing_channel(&carol).await.unwrap();
+        let handle = manager.standing_context(&carol).await.unwrap();
 
         // Verify the context is Active.
         assert_eq!(handle.state().await, ContextState::Active);
@@ -530,30 +530,30 @@ mod tests {
         assert!(params.ttl.is_none()); // bilateral-persistent forbids TTL
         assert_eq!(params.memory_scope, super::super::params::MemoryScope::Full);
 
-        // Verify the channel is now tracked.
-        assert!(manager.has_channel(&carol).await);
-        assert_eq!(manager.channel_count().await, 1);
+        // Verify the context is now tracked.
+        assert!(manager.has_context(&carol).await);
+        assert_eq!(manager.context_count().await, 1);
     }
 
     // -----------------------------------------------------------------------
-    // Test: standing_channel re-creates context when peer has left
+    // Test: standing_context re-creates context when peer has left
     // -----------------------------------------------------------------------
 
     #[tokio::test]
-    async fn standing_channel_recreates_when_peer_has_left() {
+    async fn standing_context_recreates_when_peer_has_left() {
         let (manager, _transport) = create_manager();
         let dave = DID::from("did:dht:z6MkDave");
 
-        // Create initial channel.
-        let handle1 = manager.standing_channel(&dave).await.unwrap();
+        // Create initial context.
+        let handle1 = manager.standing_context(&dave).await.unwrap();
         assert_eq!(handle1.state().await, ContextState::Active);
 
         // Simulate peer leaving: transition to Closing -> Closed.
         handle1.transition_to(&ContextState::Closing).await.unwrap();
         handle1.transition_to(&ContextState::Closed).await.unwrap();
 
-        // Calling standing_channel again should create a new context.
-        let handle2 = manager.standing_channel(&dave).await.unwrap();
+        // Calling standing_context again should create a new context.
+        let handle2 = manager.standing_context(&dave).await.unwrap();
         assert_eq!(handle2.state().await, ContextState::Active);
 
         // The new context should have a different ID (or same stable ID but
@@ -567,49 +567,49 @@ mod tests {
         assert_eq!(handle1.state().await, ContextState::Closed);
 
         // Verify the new handle is now tracked (replacing the old entry).
-        assert_eq!(manager.channel_count().await, 1);
-        assert!(manager.has_channel(&dave).await);
+        assert_eq!(manager.context_count().await, 1);
+        assert!(manager.has_context(&dave).await);
     }
 
     // -----------------------------------------------------------------------
-    // Test: standing_channel re-creates when context expired
+    // Test: standing_context re-creates when context expired
     // -----------------------------------------------------------------------
 
     #[tokio::test]
-    async fn standing_channel_recreates_when_context_expired() {
+    async fn standing_context_recreates_when_context_expired() {
         let (manager, _transport) = create_manager();
         let eve = DID::from("did:dht:z6MkEve");
 
-        // Create initial channel.
-        let handle1 = manager.standing_channel(&eve).await.unwrap();
+        // Create initial context.
+        let handle1 = manager.standing_context(&eve).await.unwrap();
         assert_eq!(handle1.state().await, ContextState::Active);
 
         // Simulate expiry.
         handle1.transition_to(&ContextState::Expired).await.unwrap();
 
-        // Calling standing_channel should create a new one.
-        let handle2 = manager.standing_channel(&eve).await.unwrap();
+        // Calling standing_context should create a new one.
+        let handle2 = manager.standing_context(&eve).await.unwrap();
         assert_eq!(handle2.state().await, ContextState::Active);
     }
 
     // -----------------------------------------------------------------------
-    // Test: startup reconnection reconnects transport for all active channels
+    // Test: startup reconnection reconnects transport for all active contexts
     // -----------------------------------------------------------------------
 
     #[tokio::test]
-    async fn reconnect_all_reconnects_active_standing_channels() {
+    async fn reconnect_all_reconnects_active_standing_contexts() {
         let (manager, transport) = create_manager();
 
-        // Create channels with multiple peers.
+        // Create contexts with multiple peers.
         let bob = DID::from("did:dht:z6MkBob");
         let carol = DID::from("did:dht:z6MkCarol");
         let dave = DID::from("did:dht:z6MkDave");
 
-        let _h_bob = manager.standing_channel(&bob).await.unwrap();
-        let h_carol = manager.standing_channel(&carol).await.unwrap();
-        let _h_dave = manager.standing_channel(&dave).await.unwrap();
+        let _h_bob = manager.standing_context(&bob).await.unwrap();
+        let h_carol = manager.standing_context(&carol).await.unwrap();
+        let _h_dave = manager.standing_context(&dave).await.unwrap();
 
-        // Close Carol's channel (simulating peer left).
+        // Close Carol's context (simulating peer left).
         h_carol.transition_to(&ContextState::Closing).await.unwrap();
         h_carol.transition_to(&ContextState::Closed).await.unwrap();
 
@@ -627,11 +627,11 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // Test: reconnect_all with no channels returns zero
+    // Test: reconnect_all with no contexts returns zero
     // -----------------------------------------------------------------------
 
     #[tokio::test]
-    async fn reconnect_all_with_no_channels_returns_zero() {
+    async fn reconnect_all_with_no_contexts_returns_zero() {
         let (manager, _transport) = create_manager();
         let reconnected = manager.reconnect_all().await.unwrap();
         assert_eq!(reconnected, 0);
@@ -642,28 +642,28 @@ mod tests {
     // -----------------------------------------------------------------------
 
     #[tokio::test]
-    async fn standing_channel_is_idempotent() {
+    async fn standing_context_is_idempotent() {
         let (manager, _transport) = create_manager();
         let frank = DID::from("did:dht:z6MkFrank");
 
-        let h1 = manager.standing_channel(&frank).await.unwrap();
-        let h2 = manager.standing_channel(&frank).await.unwrap();
-        let h3 = manager.standing_channel(&frank).await.unwrap();
+        let h1 = manager.standing_context(&frank).await.unwrap();
+        let h2 = manager.standing_context(&frank).await.unwrap();
+        let h3 = manager.standing_context(&frank).await.unwrap();
 
         // All should return the same context_id.
         assert_eq!(h1.context_id(), h2.context_id());
         assert_eq!(h2.context_id(), h3.context_id());
 
-        // Only one channel should be tracked.
-        assert_eq!(manager.channel_count().await, 1);
+        // Only one context should be tracked.
+        assert_eq!(manager.context_count().await, 1);
     }
 
     // -----------------------------------------------------------------------
-    // Test: register_existing allows pre-populating channels
+    // Test: register_existing allows pre-populating contexts
     // -----------------------------------------------------------------------
 
     #[tokio::test]
-    async fn register_existing_populates_channel() {
+    async fn register_existing_populates_context() {
         let (manager, transport) = create_manager();
         let grace = DID::from("did:dht:z6MkGrace");
 
@@ -676,9 +676,9 @@ mod tests {
             .register_existing(grace.clone(), handle.clone())
             .await;
 
-        // standing_channel should return the pre-registered handle.
+        // standing_context should return the pre-registered handle.
         let publishes_before = transport.publish_count();
-        let returned = manager.standing_channel(&grace).await.unwrap();
+        let returned = manager.standing_context(&grace).await.unwrap();
         assert_eq!(returned.context_id(), "existing-ctx");
         assert_eq!(returned.state().await, ContextState::Active);
 
@@ -687,23 +687,23 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // Test: generate_standing_channel_id is deterministic and order-independent
+    // Test: generate_standing_context_id is deterministic and order-independent
     // -----------------------------------------------------------------------
 
     #[test]
-    fn standing_channel_id_is_deterministic() {
+    fn standing_context_id_is_deterministic() {
         let alice = DID::from("did:dht:z6MkAlice");
         let bob = DID::from("did:dht:z6MkBob");
 
-        let id1 = generate_standing_channel_id(&alice, &bob);
-        let id2 = generate_standing_channel_id(&bob, &alice);
+        let id1 = generate_standing_context_id(&alice, &bob);
+        let id2 = generate_standing_context_id(&bob, &alice);
 
         // Same pair produces the same ID regardless of order.
         assert_eq!(id1, id2);
 
         // Different pairs produce different IDs.
         let carol = DID::from("did:dht:z6MkCarol");
-        let id3 = generate_standing_channel_id(&alice, &carol);
+        let id3 = generate_standing_context_id(&alice, &carol);
         assert_ne!(id1, id3);
     }
 }

@@ -135,7 +135,6 @@ impl ContextManager {
                 budget_tracker: ctx_snapshot.budget_tracker,
                 last_known_members: last_members,
                 pending_epoch_resets: Vec::new(),
-                standing: true,
                 consequence_rules: ctx_snapshot.consequence_rules,
             },
             role_state: ctx_snapshot.role_state,
@@ -623,7 +622,6 @@ impl ContextManager {
                 budget_tracker: export.snapshot.budget_tracker,
                 last_known_members: initial_members,
                 pending_epoch_resets: Vec::new(),
-                standing: true,
                 consequence_rules: export.snapshot.consequence_rules,
             },
             epoch: EpochState {
@@ -788,7 +786,6 @@ impl ContextManager {
                 budget_tracker: MemberBudgetTracker::new(),
                 last_known_members: initial_members,
                 pending_epoch_resets: Vec::new(),
-                standing: true,
                 consequence_rules: Vec::new(),
             },
             role_state,
@@ -1070,7 +1067,6 @@ impl ContextManager {
                 budget_tracker: MemberBudgetTracker::new(),
                 last_known_members: HashSet::new(),
                 pending_epoch_resets: Vec::new(),
-                standing: true,
                 consequence_rules: Vec::new(),
             },
             epoch: EpochState {

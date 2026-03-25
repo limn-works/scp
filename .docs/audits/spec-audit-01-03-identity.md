@@ -68,7 +68,7 @@ The most severe gaps are: (1) the social/device recovery protocol in section 3.3
 - **Why it matters**: Implementors need a deterministic definition. If context age is used for trust evaluation (section 9.3 references participation history duration), the measurement must be unambiguous.
 - **Severity**: LOW
 
-### [02-SYSTEM-DESIGN] Standing channels "~200ms" context creation claim has no specification basis
+### [02-SYSTEM-DESIGN] Standing contexts "~200ms" context creation claim has no specification basis
 
 - **Category**: Missing conformance criteria
 - **Location**: Section 2 references are indirect, but section 9.2 line 88 states "Context creation is a runtime operation (~200ms, section 5.12.4)"

@@ -472,9 +472,9 @@ Two hard rules that cannot be overridden by any policy:
 - **No auto-accept for tool-bearing contexts.** Tool access enables cross-context data flow. Auto-accepting it would silently expand the agent's attack surface.
 - **No auto-accept for paid contexts.** Agents never silently incur costs.
 
-#### Standing channels
+#### Standing contexts
 
-Standing bilateral contexts are the protocol's answer to lightweight, persistent communication. Create once (~200ms), maintain indefinitely. An agent with 100 standing channels has ~200-500KB of local storage overhead and zero network cost when idle. This is the desired state — a rich contact graph, not proliferation.
+Standing bilateral contexts are the protocol's answer to lightweight, persistent communication. Create once (~200ms), maintain indefinitely. An agent with 100 standing contexts has ~200-500KB of local storage overhead and zero network cost when idle. This is the desired state — a rich contact graph, not proliferation.
 
 #### Memory scope
 
