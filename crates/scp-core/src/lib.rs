@@ -58,7 +58,6 @@ pub mod context {
     pub use scp_runtime::context::manager;
     pub use scp_runtime::context::policy;
     pub use scp_runtime::context::providers;
-    pub use scp_runtime::context::standing;
     pub use scp_runtime::context::ttl;
     pub use scp_runtime::context::ttl::{
         ExtensionConsentMode, TtlExtensionProposal, check_ttl, consent_mode_for_member_count,

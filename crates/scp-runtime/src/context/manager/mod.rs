@@ -70,6 +70,7 @@ mod governance;
 mod lifecycle;
 mod messaging;
 mod queries;
+pub(crate) mod standing;
 mod trust_recovery;
 mod ttl_close;
 
@@ -1442,6 +1443,13 @@ pub struct ContextManager {
     /// Injected via constructors / builder to allow test clock injection.
     /// Defaults to [`scp_primitives::SystemClock`].
     clock: Arc<dyn Clock>,
+    /// Standing bilateral contexts indexed by peer DID string (contact graph).
+    ///
+    /// Maps peer DID string to the peer's [`DID`]. The context ID is derived
+    /// deterministically via [`standing::generate_standing_context_id`], and
+    /// the context handle lives in [`Self::contexts`]. This map tracks which
+    /// peers have standing contexts without duplicating handle storage.
+    standing_contexts: Mutex<HashMap<String, DID>>,
 }
 
 // Nursery lint — false-positives on async functions holding tokio::sync::MutexGuard
@@ -1475,6 +1483,7 @@ impl ContextManager {
             contexts: Arc::new(Mutex::new(HashMap::new())),
             key_resolver,
             clock: Arc::new(scp_primitives::SystemClock),
+            standing_contexts: Mutex::new(HashMap::new()),
         }
     }
 
@@ -1509,6 +1518,7 @@ impl ContextManager {
             contexts: Arc::new(Mutex::new(HashMap::new())),
             key_resolver,
             clock: Arc::new(scp_primitives::SystemClock),
+            standing_contexts: Mutex::new(HashMap::new()),
         }
     }
 

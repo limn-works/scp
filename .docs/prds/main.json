@@ -7736,10 +7736,10 @@
         "Unit test: startup reconnection reconnects transport for all active standing contexts"
       ],
       "actionItems": [
-        "Create `crates/scp-core/context/standing.rs` with `StandingContextManager` for tracking persistent bilateral contexts",
+        "Standing context methods folded into `ContextManager` (`crates/scp-runtime/src/context/manager/standing.rs`): `standing_context`, `standing_context_count`, `has_standing_context`, `register_standing_context`, `reconnect_all_standing`",
         "Implement `standing_context` 4-step logic: check local state, return if active, create if not found, re-invite if peer left",
-        "Implement startup reconnection: background task that reconnects transport for all active standing contexts on SDK init",
-        "Wire standing context manager into ContextManager",
+        "Implement startup reconnection via `reconnect_all_standing`: reconnects transport for all active standing contexts on SDK init",
+        "Standing contexts tracked via `standing_contexts: Mutex<HashMap<String, DID>>` field on `ContextManager`",
         "Write unit tests for all 4 steps and startup reconnection"
       ],
       "blockedBy": [

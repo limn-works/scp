@@ -1817,3 +1817,269 @@ fn builder_storage_auto_wires_persistence_and_event_log() {
 }
 
 // -----------------------------------------------------------------------
+// Standing context tests (ported from context::standing -- SCP-138)
+// -----------------------------------------------------------------------
+
+#[tokio::test]
+async fn standing_context_creates_new_bilateral_persistent_context() {
+    let manager = ContextManager::new(
+        Box::new(MockCrypto::default()),
+        Box::new(MockTransport::connected()),
+        Box::new(MockEventLog::default()),
+        noop_key_resolver(),
+    );
+
+    let alice = DID::from("did:dht:z6MkLocalAlice");
+    let carol = DID::from("did:dht:z6MkCarol");
+
+    assert!(!manager.has_standing_context(&carol).await);
+
+    let context_id = manager.standing_context(&alice, &carol).await.unwrap();
+
+    // Verify the context exists in the manager.
+    let contexts = manager.contexts.lock().await;
+    let ctx = contexts.get(&context_id).unwrap();
+    let state = ctx.handle.state().await;
+    assert_eq!(state, ContextState::Active);
+
+    // Verify the context uses bilateral-persistent template params.
+    let params = ctx.handle.params();
+    assert_eq!(params.template_id, Some(TemplateId::BilateralPersistent));
+    assert!(params.ttl.is_none()); // bilateral-persistent forbids TTL
+    drop(contexts);
+
+    // Verify the standing context is now tracked.
+    assert!(manager.has_standing_context(&carol).await);
+    assert_eq!(manager.standing_context_count().await, 1);
+}
+
+#[tokio::test]
+async fn standing_context_returns_existing_active_context() {
+    let manager = ContextManager::new(
+        Box::new(MockCrypto::default()),
+        Box::new(MockTransport::connected()),
+        Box::new(MockEventLog::default()),
+        noop_key_resolver(),
+    );
+
+    let alice = DID::from("did:dht:z6MkLocalAlice");
+    let bob = DID::from("did:dht:z6MkBob");
+
+    // First call creates the context.
+    let ctx_id1 = manager.standing_context(&alice, &bob).await.unwrap();
+
+    // Second call should return the same context_id without creation.
+    let ctx_id2 = manager.standing_context(&alice, &bob).await.unwrap();
+    assert_eq!(ctx_id1, ctx_id2);
+
+    // Only one standing context should be tracked.
+    assert_eq!(manager.standing_context_count().await, 1);
+}
+
+#[tokio::test]
+async fn standing_context_recreates_when_peer_has_left() {
+    let manager = ContextManager::new(
+        Box::new(MockCrypto::default()),
+        Box::new(MockTransport::connected()),
+        Box::new(MockEventLog::default()),
+        noop_key_resolver(),
+    );
+
+    let alice = DID::from("did:dht:z6MkLocalAlice");
+    let dave = DID::from("did:dht:z6MkDave");
+
+    // Create initial context.
+    let ctx_id1 = manager.standing_context(&alice, &dave).await.unwrap();
+
+    // Simulate peer leaving: transition to Closing -> Closed.
+    {
+        let contexts = manager.contexts.lock().await;
+        let ctx = contexts.get(&ctx_id1).unwrap();
+        ctx.handle
+            .transition_to(&ContextState::Closing)
+            .await
+            .unwrap();
+        ctx.handle
+            .transition_to(&ContextState::Closed)
+            .await
+            .unwrap();
+    }
+
+    // Remove the old closed context so create_context can re-use the ID.
+    {
+        let mut contexts = manager.contexts.lock().await;
+        contexts.remove(&ctx_id1);
+    }
+
+    let ctx_id2 = manager.standing_context(&alice, &dave).await.unwrap();
+
+    // Same deterministic ID.
+    assert_eq!(ctx_id1, ctx_id2);
+
+    // Verify the new context is Active.
+    {
+        let contexts = manager.contexts.lock().await;
+        let ctx = contexts.get(&ctx_id2).unwrap();
+        assert_eq!(ctx.handle.state().await, ContextState::Active);
+    }
+
+    // Verify one standing context is tracked.
+    assert_eq!(manager.standing_context_count().await, 1);
+    assert!(manager.has_standing_context(&dave).await);
+}
+
+#[tokio::test]
+async fn standing_context_recreates_when_context_expired() {
+    let manager = ContextManager::new(
+        Box::new(MockCrypto::default()),
+        Box::new(MockTransport::connected()),
+        Box::new(MockEventLog::default()),
+        noop_key_resolver(),
+    );
+
+    let alice = DID::from("did:dht:z6MkLocalAlice");
+    let eve = DID::from("did:dht:z6MkEve");
+
+    // Create initial context.
+    let ctx_id1 = manager.standing_context(&alice, &eve).await.unwrap();
+
+    // Simulate expiry.
+    {
+        let contexts = manager.contexts.lock().await;
+        let ctx = contexts.get(&ctx_id1).unwrap();
+        ctx.handle
+            .transition_to(&ContextState::Expired)
+            .await
+            .unwrap();
+    }
+
+    // Remove old context to allow recreation.
+    {
+        let mut contexts = manager.contexts.lock().await;
+        contexts.remove(&ctx_id1);
+    }
+
+    // Calling standing_context should create a new one.
+    let ctx_id2 = manager.standing_context(&alice, &eve).await.unwrap();
+    assert_eq!(ctx_id1, ctx_id2);
+
+    {
+        let contexts = manager.contexts.lock().await;
+        let ctx = contexts.get(&ctx_id2).unwrap();
+        assert_eq!(ctx.handle.state().await, ContextState::Active);
+    }
+}
+
+#[tokio::test]
+async fn reconnect_all_standing_reconnects_active_contexts() {
+    let manager = ContextManager::new(
+        Box::new(MockCrypto::default()),
+        Box::new(MockTransport::connected()),
+        Box::new(MockEventLog::default()),
+        noop_key_resolver(),
+    );
+
+    let alice = DID::from("did:dht:z6MkLocalAlice");
+    manager.register_local_did(alice.clone()).await;
+
+    let bob = DID::from("did:dht:z6MkBob");
+    let carol = DID::from("did:dht:z6MkCarol");
+    let dave = DID::from("did:dht:z6MkDave");
+
+    let _id_bob = manager.standing_context(&alice, &bob).await.unwrap();
+    let id_carol = manager.standing_context(&alice, &carol).await.unwrap();
+    let _id_dave = manager.standing_context(&alice, &dave).await.unwrap();
+
+    // Close Carol's context (simulating peer left).
+    {
+        let contexts = manager.contexts.lock().await;
+        let ctx = contexts.get(&id_carol).unwrap();
+        ctx.handle
+            .transition_to(&ContextState::Closing)
+            .await
+            .unwrap();
+        ctx.handle
+            .transition_to(&ContextState::Closed)
+            .await
+            .unwrap();
+    }
+
+    // Reconnect all.
+    let reconnected = manager.reconnect_all_standing().await.unwrap();
+
+    // Only Bob and Dave should be reconnected (Active). Carol is Closed.
+    assert_eq!(reconnected, 2);
+}
+
+#[tokio::test]
+async fn reconnect_all_standing_with_no_contexts_returns_zero() {
+    let manager = ContextManager::new(
+        Box::new(MockCrypto::default()),
+        Box::new(MockTransport::connected()),
+        Box::new(MockEventLog::default()),
+        noop_key_resolver(),
+    );
+
+    let reconnected = manager.reconnect_all_standing().await.unwrap();
+    assert_eq!(reconnected, 0);
+}
+
+#[tokio::test]
+async fn standing_context_is_idempotent() {
+    let manager = ContextManager::new(
+        Box::new(MockCrypto::default()),
+        Box::new(MockTransport::connected()),
+        Box::new(MockEventLog::default()),
+        noop_key_resolver(),
+    );
+
+    let alice = DID::from("did:dht:z6MkLocalAlice");
+    let frank = DID::from("did:dht:z6MkFrank");
+
+    let id1 = manager.standing_context(&alice, &frank).await.unwrap();
+    let id2 = manager.standing_context(&alice, &frank).await.unwrap();
+    let id3 = manager.standing_context(&alice, &frank).await.unwrap();
+
+    // All should return the same context_id.
+    assert_eq!(id1, id2);
+    assert_eq!(id2, id3);
+
+    // Only one standing context should be tracked.
+    assert_eq!(manager.standing_context_count().await, 1);
+}
+
+#[tokio::test]
+async fn register_standing_context_populates_tracking() {
+    let manager = ContextManager::new(
+        Box::new(MockCrypto::default()),
+        Box::new(MockTransport::connected()),
+        Box::new(MockEventLog::default()),
+        noop_key_resolver(),
+    );
+
+    let grace = DID::from("did:dht:z6MkGrace");
+
+    assert!(!manager.has_standing_context(&grace).await);
+    manager.register_standing_context(grace.clone()).await;
+    assert!(manager.has_standing_context(&grace).await);
+    assert_eq!(manager.standing_context_count().await, 1);
+}
+
+#[test]
+fn standing_context_id_is_deterministic() {
+    use super::super::standing::generate_standing_context_id;
+
+    let alice = DID::from("did:dht:z6MkAlice");
+    let bob = DID::from("did:dht:z6MkBob");
+
+    let id1 = generate_standing_context_id(&alice, &bob);
+    let id2 = generate_standing_context_id(&bob, &alice);
+
+    // Same pair produces the same ID regardless of order.
+    assert_eq!(id1, id2);
+
+    // Different pairs produce different IDs.
+    let carol = DID::from("did:dht:z6MkCarol");
+    let id3 = generate_standing_context_id(&alice, &carol);
+    assert_ne!(id1, id3);
+}
