@@ -1,0 +1,35 @@
+{
+  "name": "batch2-fail-closed-sweep",
+  "description": "No silent discard of security-critical calls anywhere in governance.rs — every wired call must use ? not let _ =",
+  "created": "2026-03-25T12:00:00Z",
+  "gates": [
+    {
+      "name": "NO-DISCARD: remove_member_sender_key",
+      "check": "/Users/alec/.claude/plugins/cache/alecmarcus/odyssey/0.3.0/bin/check-ast crates/scp-runtime/src/context/manager/governance.rs '(let_declaration value: (call_expression function: (field_expression field: (field_identifier) @method (#eq? @method \"remove_member_sender_key\"))))' --zero"
+    },
+    {
+      "name": "NO-DISCARD: evaluate_consequence_rules",
+      "check": "/Users/alec/.claude/plugins/cache/alecmarcus/odyssey/0.3.0/bin/check-ast crates/scp-runtime/src/context/manager/governance.rs '(let_declaration value: (call_expression function: (identifier) @fn (#eq? @fn \"evaluate_consequence_rules\")))' --zero"
+    },
+    {
+      "name": "NO-DISCARD: check_standing",
+      "check": "/Users/alec/.claude/plugins/cache/alecmarcus/odyssey/0.3.0/bin/check-ast crates/scp-runtime/src/context/manager/governance.rs '(let_declaration value: (call_expression function: (identifier) @fn (#eq? @fn \"check_standing\")))' --zero && /Users/alec/.claude/plugins/cache/alecmarcus/odyssey/0.3.0/bin/check-ast crates/scp-runtime/src/context/manager/governance.rs '(let_declaration value: (call_expression function: (field_expression field: (field_identifier) @method (#eq? @method \"check_standing\"))))' --zero"
+    },
+    {
+      "name": "NO-DISCARD: evaluate_cost",
+      "check": "/Users/alec/.claude/plugins/cache/alecmarcus/odyssey/0.3.0/bin/check-ast crates/scp-runtime/src/context/manager/governance.rs '(let_declaration value: (call_expression function: (identifier) @fn (#eq? @fn \"evaluate_cost\")))' --zero"
+    },
+    {
+      "name": "NO-DISCARD: record_spend",
+      "check": "/Users/alec/.claude/plugins/cache/alecmarcus/odyssey/0.3.0/bin/check-ast crates/scp-runtime/src/context/manager/governance.rs '(let_declaration value: (call_expression function: (field_expression field: (field_identifier) @method (#eq? @method \"record_spend\"))))' --zero"
+    },
+    {
+      "name": "NO-DISCARD: propose_update or advance_epoch",
+      "check": "/Users/alec/.claude/plugins/cache/alecmarcus/odyssey/0.3.0/bin/check-ast crates/scp-runtime/src/context/manager/governance.rs '(let_declaration value: (call_expression function: (field_expression field: (field_identifier) @method (#match? @method \"propose_update|advance_epoch\"))))' --zero"
+    },
+    {
+      "name": "NO-DISCARD: remove_member (existing, regression check)",
+      "check": "/Users/alec/.claude/plugins/cache/alecmarcus/odyssey/0.3.0/bin/check-ast crates/scp-runtime/src/context/manager/governance.rs '(let_declaration value: (call_expression function: (field_expression field: (field_identifier) @method (#eq? @method \"remove_member\"))))' --zero"
+    }
+  ]
+}

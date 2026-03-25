@@ -1,0 +1,59 @@
+{
+  "name": "batch2-no-regression",
+  "description": "Existing governance wiring must not regress — verify pre-existing calls and structures still exist",
+  "created": "2026-03-25T12:00:00Z",
+  "gates": [
+    {
+      "name": "REGRESSION: leave_context still calls remove_member_sender_key",
+      "check": "/Users/alec/.claude/plugins/cache/alecmarcus/odyssey/0.3.0/bin/check-ast crates/scp-runtime/src/context/manager/lifecycle.rs '(call_expression function: (field_expression field: (field_identifier) @method (#eq? @method \"remove_member_sender_key\")))' --min 1"
+    },
+    {
+      "name": "REGRESSION: execute_remove_member still calls remove_member",
+      "check": "/Users/alec/.claude/plugins/cache/alecmarcus/odyssey/0.3.0/bin/check-ast crates/scp-runtime/src/context/manager/governance.rs '(call_expression function: (field_expression field: (field_identifier) @method (#eq? @method \"remove_member\")))' --min 1"
+    },
+    {
+      "name": "REGRESSION: rotate_all_author_keys still called for broadcast path",
+      "check": "/Users/alec/.claude/plugins/cache/alecmarcus/odyssey/0.3.0/bin/check-ast crates/scp-runtime/src/context/manager/governance.rs '(call_expression function: (field_expression field: (field_identifier) @method (#eq? @method \"rotate_all_author_keys\")))' --min 1"
+    },
+    {
+      "name": "REGRESSION: finalize_governance_action still exists as function_item",
+      "check": "/Users/alec/.claude/plugins/cache/alecmarcus/odyssey/0.3.0/bin/check-ast crates/scp-runtime/src/context/manager/governance.rs '(function_item name: (identifier) @fn (#eq? @fn \"finalize_governance_action\"))' --min 1"
+    },
+    {
+      "name": "REGRESSION: propose_governance_action_inner still exists",
+      "check": "/Users/alec/.claude/plugins/cache/alecmarcus/odyssey/0.3.0/bin/check-ast crates/scp-runtime/src/context/manager/governance.rs '(function_item name: (identifier) @fn (#eq? @fn \"propose_governance_action_inner\"))' --min 1"
+    },
+    {
+      "name": "REGRESSION: execute_governance_action still exists",
+      "check": "/Users/alec/.claude/plugins/cache/alecmarcus/odyssey/0.3.0/bin/check-ast crates/scp-runtime/src/context/manager/governance.rs '(function_item name: (identifier) @fn (#eq? @fn \"execute_governance_action\"))' --min 1"
+    },
+    {
+      "name": "REGRESSION: execute_remove_member still exists",
+      "check": "/Users/alec/.claude/plugins/cache/alecmarcus/odyssey/0.3.0/bin/check-ast crates/scp-runtime/src/context/manager/governance.rs '(function_item name: (identifier) @fn (#eq? @fn \"execute_remove_member\"))' --min 1"
+    },
+    {
+      "name": "REGRESSION: execute_rotate_content_keys still exists",
+      "check": "/Users/alec/.claude/plugins/cache/alecmarcus/odyssey/0.3.0/bin/check-ast crates/scp-runtime/src/context/manager/governance.rs '(function_item name: (identifier) @fn (#eq? @fn \"execute_rotate_content_keys\"))' --min 1"
+    },
+    {
+      "name": "REGRESSION: send_message still calls seal (Batch 1 wiring)",
+      "check": "/Users/alec/.claude/plugins/cache/alecmarcus/odyssey/0.3.0/bin/check-ast crates/scp-runtime/src/context/manager/messaging.rs '(call_expression function: (field_expression field: (field_identifier) @method (#eq? @method \"seal\")))' --min 1"
+    },
+    {
+      "name": "REGRESSION: deliver_incoming still calls open (Batch 1 wiring)",
+      "check": "/Users/alec/.claude/plugins/cache/alecmarcus/odyssey/0.3.0/bin/check-ast crates/scp-runtime/src/context/manager/messaging.rs '(call_expression function: (field_expression field: (field_identifier) @method (#eq? @method \"open\")))' --min 1"
+    },
+    {
+      "name": "REGRESSION: PerContextState struct still exists in mod.rs",
+      "check": "/Users/alec/.claude/plugins/cache/alecmarcus/odyssey/0.3.0/bin/check-ast crates/scp-runtime/src/context/manager/mod.rs '(struct_item name: (type_identifier) @name (#eq? @name \"PerContextState\"))' --min 1"
+    },
+    {
+      "name": "REGRESSION: GovernanceState struct still exists in mod.rs",
+      "check": "/Users/alec/.claude/plugins/cache/alecmarcus/odyssey/0.3.0/bin/check-ast crates/scp-runtime/src/context/manager/mod.rs '(struct_item name: (type_identifier) @name (#eq? @name \"GovernanceState\"))' --min 1"
+    },
+    {
+      "name": "REGRESSION: ContextSnapshot struct still exists in mod.rs",
+      "check": "/Users/alec/.claude/plugins/cache/alecmarcus/odyssey/0.3.0/bin/check-ast crates/scp-runtime/src/context/manager/mod.rs '(struct_item name: (type_identifier) @name (#eq? @name \"ContextSnapshot\"))' --min 1"
+    }
+  ]
+}

@@ -1,0 +1,43 @@
+{
+  "name": "batch2-crypto-trait",
+  "description": "ContextCryptoProvider trait and MlsCryptoProvider impl must support all Batch 2 crypto operations",
+  "created": "2026-03-25T12:00:00Z",
+  "gates": [
+    {
+      "name": "TRAIT: advance_epoch defined in ContextCryptoProvider",
+      "check": "/Users/alec/.claude/plugins/cache/alecmarcus/odyssey/0.3.0/bin/check-ast crates/scp-protocol/src/context/builder.rs '((identifier) @id (#eq? @id \"advance_epoch\"))' --min 1"
+    },
+    {
+      "name": "TRAIT: remove_member_sender_key defined in ContextCryptoProvider",
+      "check": "/Users/alec/.claude/plugins/cache/alecmarcus/odyssey/0.3.0/bin/check-ast crates/scp-protocol/src/context/builder.rs '((identifier) @id (#eq? @id \"remove_member_sender_key\"))' --min 1"
+    },
+    {
+      "name": "TRAIT: seal method defined in ContextCryptoProvider",
+      "check": "/Users/alec/.claude/plugins/cache/alecmarcus/odyssey/0.3.0/bin/check-ast crates/scp-protocol/src/context/builder.rs '(function_item name: (identifier) @fn (#eq? @fn \"seal\"))' --min 1"
+    },
+    {
+      "name": "TRAIT: open method defined in ContextCryptoProvider",
+      "check": "/Users/alec/.claude/plugins/cache/alecmarcus/odyssey/0.3.0/bin/check-ast crates/scp-protocol/src/context/builder.rs '(function_item name: (identifier) @fn (#eq? @fn \"open\"))' --min 1"
+    },
+    {
+      "name": "IMPL: MlsCryptoProvider implements advance_epoch",
+      "check": "/Users/alec/.claude/plugins/cache/alecmarcus/odyssey/0.3.0/bin/check-ast crates/scp-runtime/src/crypto/mls/provider.rs '(function_item name: (identifier) @fn (#eq? @fn \"advance_epoch\"))' --min 1"
+    },
+    {
+      "name": "IMPL: propose_update function exists in ratchet.rs",
+      "check": "/Users/alec/.claude/plugins/cache/alecmarcus/odyssey/0.3.0/bin/check-ast crates/scp-runtime/src/crypto/mls/ratchet.rs '(function_item name: (identifier) @fn (#eq? @fn \"propose_update\"))' --min 1"
+    },
+    {
+      "name": "IMPL: MlsCryptoProvider implements remove_member_sender_key",
+      "check": "/Users/alec/.claude/plugins/cache/alecmarcus/odyssey/0.3.0/bin/check-ast crates/scp-runtime/src/crypto/mls/provider.rs '(function_item name: (identifier) @fn (#eq? @fn \"remove_member_sender_key\"))' --min 1"
+    },
+    {
+      "name": "IMPL: MlsCryptoProvider implements seal",
+      "check": "/Users/alec/.claude/plugins/cache/alecmarcus/odyssey/0.3.0/bin/check-ast crates/scp-runtime/src/crypto/mls/provider.rs '(function_item name: (identifier) @fn (#eq? @fn \"seal\"))' --min 1"
+    },
+    {
+      "name": "IMPL: MlsCryptoProvider implements open",
+      "check": "/Users/alec/.claude/plugins/cache/alecmarcus/odyssey/0.3.0/bin/check-ast crates/scp-runtime/src/crypto/mls/provider.rs '(function_item name: (identifier) @fn (#eq? @fn \"open\"))' --min 1"
+    }
+  ]
+}
