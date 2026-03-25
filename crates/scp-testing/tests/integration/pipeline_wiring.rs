@@ -29,6 +29,7 @@ const MANAGER_SRC: &str = concat!(
     include_str!("../../../../crates/scp-runtime/src/context/manager/governance.rs"),
     include_str!("../../../../crates/scp-runtime/src/context/manager/lifecycle.rs"),
     include_str!("../../../../crates/scp-runtime/src/context/manager/queries.rs"),
+    include_str!("../../../../crates/scp-runtime/src/context/manager/standing.rs"),
     include_str!("../../../../crates/scp-runtime/src/context/manager/trust_recovery.rs"),
     include_str!("../../../../crates/scp-runtime/src/context/manager/ttl_close.rs"),
     include_str!("../../../../crates/scp-runtime/src/context/manager/mod.rs"),
