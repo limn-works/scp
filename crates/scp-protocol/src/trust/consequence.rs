@@ -86,7 +86,7 @@ pub enum ConsequenceAction {
 /// time window for counting events.
 ///
 /// See ADR-017 acceptance criterion 1.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ConsequenceRule {
     /// The condition that triggers this consequence.
     pub trigger: ConsequenceTrigger,

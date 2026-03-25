@@ -1551,6 +1551,7 @@ fn build_core_context_params(
             scp_core::context::params::IncompleteVerificationPolicy::default(),
         min_protocol_version: py_params.min_protocol_version,
         migration_source: None,
+        consequence_rules: Vec::new(),
     })
 }
 

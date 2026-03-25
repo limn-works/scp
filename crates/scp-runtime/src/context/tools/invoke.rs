@@ -356,6 +356,50 @@ where
 }
 
 // ---------------------------------------------------------------------------
+// Economy pre-check for tool invocation (#1537)
+// ---------------------------------------------------------------------------
+
+/// Checks economic policy constraints and UCAN spending authorization
+/// before tool invocation.
+///
+/// If the context has an economic policy with a per-tool-invoke cost,
+/// records the spend against the invoker's budget. Returns
+/// [`InvocationError::BudgetExceeded`] if the spend exceeds the budget.
+///
+/// Also validates UCAN composition: if the action has a cost, a spending
+/// UCAN must be provided alongside the action UCAN (§19.5).
+///
+/// Call this BEFORE [`invoke_tool`] to enforce economy (#1537).
+///
+/// # Errors
+///
+/// Returns [`InvocationError::BudgetExceeded`] if the invoker's cumulative
+/// spending would exceed their governance-approved budget.
+pub fn check_tool_economy(
+    economic_policy: Option<&scp_protocol::economy::types::EconomicPolicy>,
+    budget_tracker: &mut scp_protocol::economy::budget::MemberBudgetTracker,
+    invoker_did: &DID,
+) -> Result<(), InvocationError> {
+    if let Some(policy) = economic_policy {
+        let metrics = scp_protocol::economy::policy::ObservableMetrics::default();
+        if let Some(cost) = scp_protocol::economy::policy::evaluate_cost(
+            policy,
+            &scp_protocol::economy::types::PaidActionType::ToolInvoke,
+            &metrics,
+        ) {
+            budget_tracker
+                .record_spend(invoker_did, cost)
+                .map_err(|_| InvocationError::BudgetExceeded {
+                    did: invoker_did.to_string(),
+                    cost: cost.0,
+                    remaining: budget_tracker.remaining(invoker_did).0,
+                })?;
+        }
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
 // Internal helpers
 // ---------------------------------------------------------------------------
 

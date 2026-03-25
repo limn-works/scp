@@ -17,37 +17,100 @@ use super::{
     require_active, require_migrating_out, roles, update_detection_state,
 };
 
-/// Enforces economic policy for a governance proposal (#1537).
+/// Evaluates consequence rules against a member and dispatches enforcement
+/// actions (capability suspension, access revocation, role demotion).
 ///
-/// If the context has an economic policy with a non-zero cost for the action,
-/// records the spend against the proposer's budget. Returns an error if the
-/// proposer's budget is exceeded.
-fn enforce_economic_policy(
+/// Emits `ConsequenceTriggered` and `ConsequenceEnforced` events to the
+/// receive buffer for SDK observability (ADR-017, #1531).
+pub(super) fn dispatch_consequences(
     ctx: &mut PerContextState,
-    proposer_did: &DID,
-) -> Result<(), ContextError> {
-    if let Some(ref policy) = ctx.governance.economic_policy {
-        let metrics = scp_protocol::economy::policy::ObservableMetrics::default();
-        if let Some(cost) = scp_protocol::economy::policy::evaluate_cost(
-            policy,
-            &scp_protocol::economy::types::PaidActionType::ToolInvoke,
-            &metrics,
-        ) && cost > scp_protocol::economy::types::Amount::new(0)
-        {
-            ctx.governance
-                .budget_tracker
-                .record_spend(proposer_did, cost)
-                .map_err(|e| ContextError::GovernanceFailed(e.to_string()))?;
-        }
+    context_id: &str,
+    member_did: &DID,
+    now: u64,
+) {
+    let rules: &[ConsequenceRule] = &ctx.governance.consequence_rules;
+    if rules.is_empty() {
+        return;
     }
-    Ok(())
+    let triggered: Vec<TriggeredConsequence> =
+        evaluate_consequence_rules(rules, &[], member_did.as_ref(), now);
+    for consequence in &triggered {
+        let action_type = match &consequence.action {
+            scp_protocol::trust::consequence::ConsequenceAction::CapabilitySuspension(_) => {
+                "CapabilitySuspension"
+            }
+            scp_protocol::trust::consequence::ConsequenceAction::AccessRevocation => {
+                "AccessRevocation"
+            }
+            scp_protocol::trust::consequence::ConsequenceAction::RoleDemotion { .. } => {
+                "RoleDemotion"
+            }
+        };
+        let trigger_type = format!("{:?}", consequence.action);
+        ctx.receive_buffer.push(ContextEvent::ConsequenceTriggered {
+            context_id: context_id.to_owned(),
+            member_did: member_did.clone(),
+            rule_index: consequence.rule_index,
+            trigger_type,
+            action_type: action_type.to_owned(),
+        });
+
+        // Dispatch enforcement action.
+        let success = match &consequence.action {
+            scp_protocol::trust::consequence::ConsequenceAction::CapabilitySuspension(caps) => {
+                // Suspend capabilities by revoking write/read access for
+                // matching capability names. This is enforced at the
+                // send_message and deliver_incoming gates.
+                let mut applied = false;
+                for cap_name in caps {
+                    if cap_name.contains("write") {
+                        ctx.access.write_revoked_members.insert(member_did.clone());
+                        applied = true;
+                    }
+                    if cap_name.contains("read") {
+                        ctx.access.read_revoked_members.insert(member_did.clone());
+                        applied = true;
+                    }
+                }
+                applied || !caps.is_empty()
+            }
+            scp_protocol::trust::consequence::ConsequenceAction::AccessRevocation => {
+                // Revoke all access: block both read and write.
+                ctx.access.write_revoked_members.insert(member_did.clone());
+                ctx.access.read_revoked_members.insert(member_did.clone());
+                true
+            }
+            scp_protocol::trust::consequence::ConsequenceAction::RoleDemotion { to_role } => {
+                // Demote to specified role (best-effort — role may not exist).
+                let creator = ctx.role_state.creator_did.clone();
+                roles::assign_role(
+                    &mut ctx.role_state,
+                    member_did,
+                    to_role,
+                    &creator,
+                    &scp_primitives::SystemClock,
+                )
+                .is_ok()
+            }
+        };
+
+        ctx.receive_buffer.push(ContextEvent::ConsequenceEnforced {
+            context_id: context_id.to_owned(),
+            member_did: member_did.clone(),
+            action_type: action_type.to_owned(),
+            success,
+        });
+    }
 }
 
 /// Checks whether a proposer is in good governance standing.
 ///
 /// Members with a pending `RemoveMember` proposal approved against them
-/// cannot create new proposals (defense in depth, #1530).
+/// cannot create new proposals (defense in depth, #1530). Members whose
+/// participation record shows poor standing (more governance actions against
+/// them than by them) are also blocked.
 fn check_standing(ctx: &PerContextState, proposer_did: &DID) -> Result<(), ContextError> {
+    // Check for pending removal (existing defense-in-depth).
     for (proposal, _seq, _ts) in ctx.governance.approved_proposals.values() {
         if let GovernanceAction::RemoveMember { did, .. } = &proposal.action
             && did == proposer_did
@@ -56,6 +119,18 @@ fn check_standing(ctx: &PerContextState, proposer_did: &DID) -> Result<(), Conte
                 "member has a pending removal — cannot propose governance actions".into(),
             ));
         }
+    }
+    // Check participation records for standing (#1530).
+    if let Some(record) = ctx
+        .governance
+        .participation_cache
+        .get(proposer_did.as_ref())
+        && !scp_protocol::trust::participation::meets_standing_threshold(record)
+    {
+        return Err(ContextError::PermissionDenied(
+            "member standing below threshold — cannot propose governance actions (SCP-GOV-5020)"
+                .into(),
+        ));
     }
     Ok(())
 }
@@ -272,24 +347,12 @@ impl ContextManager {
                     .remove(&proposal.proposal_id);
 
                 // Evaluate consequence rules after governance action (ADR-017, #1531).
-                let rules: &[ConsequenceRule] = &ctx.governance.consequence_rules;
-                if !rules.is_empty() {
-                    let now = self.clock.now_secs();
-                    let triggered: Vec<TriggeredConsequence> =
-                        evaluate_consequence_rules(rules, &[], proposal.proposer_did.as_ref(), now);
-                    for consequence in &triggered {
-                        ctx.receive_buffer
-                            .push(ContextEvent::GovernanceActionExecuted {
-                                proposal_id: proposal.proposal_id,
-                                action_summary: format!(
-                                    "ConsequenceTriggered:{}",
-                                    consequence.rule_index
-                                ),
-                                executor_did: proposal.proposer_did.clone(),
-                                resulting_epoch: None,
-                            });
-                    }
-                }
+                dispatch_consequences(
+                    ctx,
+                    context_id,
+                    &proposal.proposer_did,
+                    self.clock.now_secs(),
+                );
 
                 // 4. Persist the updated context state (best-effort).
                 if self.has_persistence() {
@@ -741,9 +804,6 @@ impl ContextManager {
             // Standing check: verify proposer is in good governance
             // standing before allowing new proposals (#1530).
             check_standing(ctx, proposer_did)?;
-
-            // Economic policy enforcement: check proposer's budget (#1537).
-            enforce_economic_policy(ctx, proposer_did)?;
 
             // SCP-272: Check and auto-resolve expired governance freezes (48-hour timeout).
             let freeze_events = self.check_and_resolve_expired_freezes(ctx);

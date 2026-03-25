@@ -13,6 +13,41 @@ use super::{
     validate_governance_consistency, validate_governance_model,
 };
 
+/// Enforces economic policy for context joins (#1537).
+///
+/// Checks auto-accept guard and evaluates join cost from the context's
+/// economic policy. Records spend against the joiner's budget.
+fn enforce_join_economy(ctx: &mut PerContextState, joiner_did: &DID) -> Result<(), ContextError> {
+    if scp_protocol::economy::policy::auto_accept_blocked_by_economics(
+        ctx.governance.economic_policy.as_ref(),
+    ) {
+        return Err(ContextError::PermissionDenied(
+            "SCP-ECON-7030: paid context requires explicit acceptance".into(),
+        ));
+    }
+    if let Some(ref policy) = ctx.governance.economic_policy {
+        let metrics = scp_protocol::economy::policy::ObservableMetrics {
+            member_count: u64::try_from(ctx.membership.count()).unwrap_or(u64::MAX),
+            ..scp_protocol::economy::policy::ObservableMetrics::default()
+        };
+        if let Some(cost) = scp_protocol::economy::policy::evaluate_cost(
+            policy,
+            &scp_protocol::economy::types::PaidActionType::ContextJoin,
+            &metrics,
+        ) {
+            ctx.governance
+                .budget_tracker
+                .record_spend(joiner_did, cost)
+                .map_err(|e| {
+                    ContextError::PermissionDenied(format!(
+                        "SCP-ECON-7020: budget exceeded on join: {e}"
+                    ))
+                })?;
+        }
+    }
+    Ok(())
+}
+
 #[allow(clippy::significant_drop_tightening)]
 impl ContextManager {
     /// Loads persisted context state and reconstructs a `PerContextState`.
@@ -136,6 +171,8 @@ impl ContextManager {
                 last_known_members: last_members,
                 pending_epoch_resets: Vec::new(),
                 consequence_rules: ctx_snapshot.consequence_rules,
+                velocity_tracker: scp_protocol::economy::antispam::SenderVelocityTracker::new(3600),
+                participation_cache: ctx_snapshot.participation_cache,
             },
             role_state: ctx_snapshot.role_state,
             receive_buffer: ReceiveBuffer::new(),
@@ -623,6 +660,8 @@ impl ContextManager {
                 last_known_members: initial_members,
                 pending_epoch_resets: Vec::new(),
                 consequence_rules: export.snapshot.consequence_rules,
+                velocity_tracker: scp_protocol::economy::antispam::SenderVelocityTracker::new(3600),
+                participation_cache: export.snapshot.participation_cache,
             },
             epoch: EpochState {
                 mls_epoch: export.snapshot.mls_epoch,
@@ -786,7 +825,9 @@ impl ContextManager {
                 budget_tracker: MemberBudgetTracker::new(),
                 last_known_members: initial_members,
                 pending_epoch_resets: Vec::new(),
-                consequence_rules: Vec::new(),
+                consequence_rules: params.consequence_rules.clone(),
+                velocity_tracker: scp_protocol::economy::antispam::SenderVelocityTracker::new(3600),
+                participation_cache: HashMap::new(),
             },
             role_state,
             receive_buffer: ReceiveBuffer::new(),
@@ -1067,7 +1108,9 @@ impl ContextManager {
                 budget_tracker: MemberBudgetTracker::new(),
                 last_known_members: HashSet::new(),
                 pending_epoch_resets: Vec::new(),
-                consequence_rules: Vec::new(),
+                consequence_rules: params.consequence_rules.clone(),
+                velocity_tracker: scp_protocol::economy::antispam::SenderVelocityTracker::new(3600),
+                participation_cache: HashMap::new(),
             },
             epoch: EpochState {
                 mls_epoch: 0,
@@ -1197,6 +1240,9 @@ impl ContextManager {
             ctx.handle
                 .params()
                 .check_version_compatibility(scp_protocol::envelope::SCP_PROTOCOL_VERSION)?;
+
+            // Economy enforcement (#1537) — auto-accept guard + join cost.
+            enforce_join_economy(ctx, &member_did)?;
 
             // Add member to role state.
             ctx.role_state.members.insert(member_did.to_string());

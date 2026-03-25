@@ -9,9 +9,44 @@ use scp_protocol::envelope::validation::{BufferedMessage, SequenceCheck, Timesta
 use scp_protocol::identity::SigningKeyId;
 
 use super::{
-    Capability, ContextError, ContextEvent, ContextHandle, ContextManager, DID,
+    Capability, ContextError, ContextEvent, ContextHandle, ContextManager, DID, PerContextState,
     context_id_to_bytes, instrument, require_active,
 };
+
+/// Enforces economic policy for message sends (#1537).
+///
+/// Checks sender velocity and evaluates cost from the context's economic
+/// policy. Records spend against the sender's budget.
+fn enforce_send_economy(
+    ctx: &mut PerContextState,
+    sender_did: &DID,
+    now: u64,
+) -> Result<(), ContextError> {
+    if let Some(ref policy) = ctx.governance.economic_policy {
+        let velocity = ctx
+            .governance
+            .velocity_tracker
+            .get_velocity(sender_did, now);
+        let metrics = scp_protocol::economy::policy::ObservableMetrics {
+            sender_velocity: velocity,
+            member_count: u64::try_from(ctx.membership.count()).unwrap_or(u64::MAX),
+            ..scp_protocol::economy::policy::ObservableMetrics::default()
+        };
+        if let Some(cost) = scp_protocol::economy::policy::evaluate_cost(
+            policy,
+            &scp_protocol::economy::types::PaidActionType::MessageSend,
+            &metrics,
+        ) {
+            ctx.governance
+                .budget_tracker
+                .record_spend(sender_did, cost)
+                .map_err(|e| {
+                    ContextError::PermissionDenied(format!("SCP-ECON-7010: budget exceeded: {e}"))
+                })?;
+        }
+    }
+    Ok(())
+}
 
 /// Re-export of the protocol-level domain-separated routing ID derivation.
 ///
@@ -277,6 +312,8 @@ impl ContextManager {
                     "write access has been revoked for {sender_did}"
                 )));
             }
+            // Economy enforcement (#1537) — check cost before sending.
+            enforce_send_economy(ctx, sender_did, self.clock.now_secs())?;
             if let Some(ref mut bc) = ctx.broadcast_context {
                 let sk = signing_key.ok_or_else(|| {
                     ContextError::CryptoFailed("signing key required for broadcast publish".into())
@@ -380,6 +417,7 @@ impl ContextManager {
         payload: &[u8],
     ) -> Result<(), ContextError> {
         {
+            let now = self.clock.now_secs();
             let mut contexts = self.contexts.lock().await;
             if let Some(ctx) = contexts.get_mut(context_id)
                 && require_active(&ctx.handle).is_ok()
@@ -389,6 +427,14 @@ impl ContextManager {
                     sequence_number: sequence,
                     payload: payload.to_vec(),
                 });
+
+                // Velocity tracking (#1537) — feed data into consequence evaluation.
+                ctx.governance
+                    .velocity_tracker
+                    .record_message(sender_did, now);
+
+                // Consequence evaluation (#1531) — check velocity triggers after send.
+                super::governance::dispatch_consequences(ctx, context_id, sender_did, now);
             }
         }
         self.event_log

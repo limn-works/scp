@@ -179,6 +179,7 @@ async fn context_params_all_fields() {
             scp_core::context::params::IncompleteVerificationPolicy::default(),
         min_protocol_version: None,
         migration_source: None,
+        consequence_rules: Vec::new(),
     };
 
     assert_eq!(params.mode, ContextMode::Broadcast);
