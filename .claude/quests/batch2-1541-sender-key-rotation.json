@@ -5,35 +5,35 @@
   "gates": [
     {
       "name": "CALL: remove_member_sender_key is called in governance.rs",
-      "check": "/Users/alec/.claude/plugins/cache/alecmarcus/odyssey/0.3.0/bin/check-ast crates/scp-runtime/src/context/manager/governance.rs '(call_expression function: (field_expression field: (field_identifier) @method (#eq? @method \"remove_member_sender_key\")))' --min 1"
+      "check": "/Users/alec/.claude/plugins/cache/alecmarcus/odyssey/0.6.0/bin/check-ast crates/scp-runtime/src/context/manager/governance.rs '(call_expression function: (field_expression field: (field_identifier) @method (#eq? @method \"remove_member_sender_key\")))' --min 1"
     },
     {
       "name": "FAIL-CLOSED: remove_member_sender_key uses ? operator (try_expression)",
-      "check": "/Users/alec/.claude/plugins/cache/alecmarcus/odyssey/0.3.0/bin/check-ast crates/scp-runtime/src/context/manager/governance.rs '(try_expression (call_expression function: (field_expression field: (field_identifier) @method (#eq? @method \"remove_member_sender_key\"))))' --min 1"
+      "check": "/Users/alec/.claude/plugins/cache/alecmarcus/odyssey/0.6.0/bin/check-ast crates/scp-runtime/src/context/manager/governance.rs '(try_expression (call_expression function: (field_expression field: (field_identifier) @method (#eq? @method \"remove_member_sender_key\"))))' --min 1"
     },
     {
       "name": "NO-DISCARD: no let_declaration silently discarding remove_member_sender_key result",
-      "check": "/Users/alec/.claude/plugins/cache/alecmarcus/odyssey/0.3.0/bin/check-ast crates/scp-runtime/src/context/manager/governance.rs '(let_declaration value: (call_expression function: (field_expression field: (field_identifier) @method (#eq? @method \"remove_member_sender_key\"))))' --zero"
+      "check": "/Users/alec/.claude/plugins/cache/alecmarcus/odyssey/0.6.0/bin/check-ast crates/scp-runtime/src/context/manager/governance.rs '(let_declaration value: (call_expression function: (field_expression field: (field_identifier) @method (#eq? @method \"remove_member_sender_key\"))))' --zero"
     },
     {
       "name": "PIPELINE: #[ignore] for #1541 is removed from pipeline_wiring.rs",
-      "check": "/Users/alec/.claude/plugins/cache/alecmarcus/odyssey/0.3.0/bin/check-ast crates/scp-testing/tests/integration/pipeline_wiring.rs '(attribute_item (attribute (identifier) @attr value: (string_literal (string_content) @val (#match? @val \"#1541\")) (#eq? @attr \"ignore\")))' --zero"
+      "check": "/Users/alec/.claude/plugins/cache/alecmarcus/odyssey/0.6.0/bin/check-ast crates/scp-testing/tests/integration/pipeline_wiring.rs '(attribute_item (attribute (identifier) @attr value: (string_literal (string_content) @val (#match? @val \"#1541\")) (#eq? @attr \"ignore\")))' --zero"
     },
     {
       "name": "TEST-POSITIVE: governance test file has test for sender key rotation on removal",
-      "check": "/Users/alec/.claude/plugins/cache/alecmarcus/odyssey/0.3.0/bin/check-ast crates/scp-runtime/src/context/manager/tests/governance.rs '(function_item name: (identifier) @fn (#match? @fn \"sender_key.*remov|remove.*sender_key\"))' --min 1"
+      "check": "/Users/alec/.claude/plugins/cache/alecmarcus/odyssey/0.6.0/bin/check-ast crates/scp-runtime/src/context/manager/tests/governance.rs '(function_item name: (identifier) @fn (#match? @fn \"sender_key.*remov|remove.*sender_key\"))' --min 1"
     },
     {
       "name": "TEST-HAS-ASSERT: sender key rotation test contains assertion macro",
-      "check": "/Users/alec/.claude/plugins/cache/alecmarcus/odyssey/0.3.0/bin/check-ast crates/scp-runtime/src/context/manager/tests/governance.rs '(function_item name: (identifier) @fn body: (block (expression_statement (macro_invocation macro: (identifier) @mac (#match? @mac \"assert\")))) (#match? @fn \"sender_key.*remov|remove.*sender_key\"))' --min 1"
+      "check": "/Users/alec/.claude/plugins/cache/alecmarcus/odyssey/0.6.0/bin/check-ast crates/scp-runtime/src/context/manager/tests/governance.rs '(function_item name: (identifier) @fn body: (block (expression_statement (macro_invocation macro: (identifier) @mac (#match? @mac \"assert\")))) (#match? @fn \"sender_key.*remov|remove.*sender_key\"))' --min 1"
     },
     {
       "name": "SYMMETRY: leave_context still calls remove_member_sender_key (no regression)",
-      "check": "/Users/alec/.claude/plugins/cache/alecmarcus/odyssey/0.3.0/bin/check-ast crates/scp-runtime/src/context/manager/lifecycle.rs '(call_expression function: (field_expression field: (field_identifier) @method (#eq? @method \"remove_member_sender_key\")))' --min 1"
+      "check": "/Users/alec/.claude/plugins/cache/alecmarcus/odyssey/0.6.0/bin/check-ast crates/scp-runtime/src/context/manager/lifecycle.rs '(call_expression function: (field_expression field: (field_identifier) @method (#eq? @method \"remove_member_sender_key\")))' --min 1"
     },
     {
       "name": "PIPELINE-FN: pipeline_wiring test function is now active (not ignored, exists as function_item)",
-      "check": "/Users/alec/.claude/plugins/cache/alecmarcus/odyssey/0.3.0/bin/check-ast crates/scp-testing/tests/integration/pipeline_wiring.rs '(function_item name: (identifier) @fn (#eq? @fn \"execute_remove_member_calls_remove_member_sender_key\"))' --min 1"
+      "check": "/Users/alec/.claude/plugins/cache/alecmarcus/odyssey/0.6.0/bin/check-ast crates/scp-testing/tests/integration/pipeline_wiring.rs '(function_item name: (identifier) @fn (#eq? @fn \"execute_remove_member_calls_remove_member_sender_key\"))' --min 1"
     }
   ]
 }

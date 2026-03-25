@@ -1,0 +1,19 @@
+{
+  "name": "batch2-consequence-data-flow",
+  "description": "Consequence rules must flow from ContextParams through creation to evaluation with real event data — no empty slices, no empty vecs",
+  "created": "2026-03-25T18:00:00Z",
+  "gates": [
+    {
+      "name": "PARAMS: consequence_rules field exists in ContextParams",
+      "check": "/Users/alec/.claude/plugins/cache/alecmarcus/odyssey/0.6.0/bin/check-ast crates/scp-protocol/src/context/params.rs '((field_identifier) @fid (#eq? @fid \"consequence_rules\"))' --min 1"
+    },
+    {
+      "name": "SNAPSHOT: snapshot_context copies consequence_rules",
+      "check": "/Users/alec/.claude/plugins/cache/alecmarcus/odyssey/0.6.0/bin/check-ast crates/scp-runtime/src/context/manager/mod.rs '((field_identifier) @fid (#eq? @fid \"consequence_rules\"))' --min 2"
+    },
+    {
+      "name": "EVENTS: evaluate_consequence_rules receives event_log_entries (not empty slice)",
+      "check": "/Users/alec/.claude/plugins/cache/alecmarcus/odyssey/0.6.0/bin/check-ast crates/scp-runtime/src/context/manager/governance.rs '(call_expression function: (field_expression field: (field_identifier) @method (#eq? @method \"event_log_entries\")))' --min 1"
+    }
+  ]
+}

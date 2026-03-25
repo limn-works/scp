@@ -5,31 +5,31 @@
   "gates": [
     {
       "name": "QUALITY: at least 5 new test functions in governance.rs tests (1 per issue minimum)",
-      "check": "/Users/alec/.claude/plugins/cache/alecmarcus/odyssey/0.3.0/bin/check-ast crates/scp-runtime/src/context/manager/tests/governance.rs '(function_item name: (identifier) @fn (#match? @fn \"sender_key.*remov|remove.*sender_key|consequence|standing|evaluate_cost|cost_enforce|enforce.*cost|rotate.*content.*key.*encrypt|encrypted.*rotat\"))' --min 5"
+      "check": "/Users/alec/.claude/plugins/cache/alecmarcus/odyssey/0.6.0/bin/check-ast crates/scp-runtime/src/context/manager/tests/governance.rs '(function_item name: (identifier) @fn (#match? @fn \"sender_key.*remov|remove.*sender_key|consequence|standing|evaluate_cost|cost_enforce|enforce.*cost|rotate.*content.*key.*encrypt|encrypted.*rotat\"))' --min 5"
     },
     {
       "name": "QUALITY: sender key removal test has assert (not empty)",
-      "check": "/Users/alec/.claude/plugins/cache/alecmarcus/odyssey/0.3.0/bin/check-ast crates/scp-runtime/src/context/manager/tests/governance.rs '(function_item name: (identifier) @fn body: (block (expression_statement (macro_invocation macro: (identifier) @mac (#match? @mac \"assert\")))) (#match? @fn \"sender_key.*remov|remove.*sender_key\"))' --min 1"
+      "check": "/Users/alec/.claude/plugins/cache/alecmarcus/odyssey/0.6.0/bin/check-ast crates/scp-runtime/src/context/manager/tests/governance.rs '(function_item name: (identifier) @fn body: (block (expression_statement (macro_invocation macro: (identifier) @mac (#match? @mac \"assert\")))) (#match? @fn \"sender_key.*remov|remove.*sender_key\"))' --min 1"
     },
     {
       "name": "QUALITY: consequence test has assert (not empty)",
-      "check": "/Users/alec/.claude/plugins/cache/alecmarcus/odyssey/0.3.0/bin/check-ast crates/scp-runtime/src/context/manager/tests/governance.rs '(function_item name: (identifier) @fn body: (block (expression_statement (macro_invocation macro: (identifier) @mac (#match? @mac \"assert\")))) (#match? @fn \"consequence\"))' --min 1"
+      "check": "/Users/alec/.claude/plugins/cache/alecmarcus/odyssey/0.6.0/bin/check-ast crates/scp-runtime/src/context/manager/tests/governance.rs '(function_item name: (identifier) @fn body: (block (expression_statement (macro_invocation macro: (identifier) @mac (#match? @mac \"assert\")))) (#match? @fn \"consequence\"))' --min 1"
     },
     {
       "name": "QUALITY: standing test has assert (not empty)",
-      "check": "/Users/alec/.claude/plugins/cache/alecmarcus/odyssey/0.3.0/bin/check-ast crates/scp-runtime/src/context/manager/tests/governance.rs '(function_item name: (identifier) @fn body: (block (expression_statement (macro_invocation macro: (identifier) @mac (#match? @mac \"assert\")))) (#match? @fn \"standing\"))' --min 1"
+      "check": "/Users/alec/.claude/plugins/cache/alecmarcus/odyssey/0.6.0/bin/check-ast crates/scp-runtime/src/context/manager/tests/governance.rs '(function_item name: (identifier) @fn body: (block (expression_statement (macro_invocation macro: (identifier) @mac (#match? @mac \"assert\")))) (#match? @fn \"standing\"))' --min 1"
     },
     {
       "name": "QUALITY: cost enforcement test has assert (not empty)",
-      "check": "/Users/alec/.claude/plugins/cache/alecmarcus/odyssey/0.3.0/bin/check-ast crates/scp-runtime/src/context/manager/tests/governance.rs '(function_item name: (identifier) @fn body: (block (expression_statement (macro_invocation macro: (identifier) @mac (#match? @mac \"assert\")))) (#match? @fn \"evaluate_cost|cost_enforce|enforce.*cost\"))' --min 1"
+      "check": "/Users/alec/.claude/plugins/cache/alecmarcus/odyssey/0.6.0/bin/check-ast crates/scp-runtime/src/context/manager/tests/governance.rs '(function_item name: (identifier) @fn body: (block (expression_statement (macro_invocation macro: (identifier) @mac (#match? @mac \"assert\")))) (#match? @fn \"evaluate_cost|cost_enforce|enforce.*cost\"))' --min 1"
     },
     {
       "name": "QUALITY: encrypted rotation test has assert (not empty)",
-      "check": "/Users/alec/.claude/plugins/cache/alecmarcus/odyssey/0.3.0/bin/check-ast crates/scp-runtime/src/context/manager/tests/governance.rs '(function_item name: (identifier) @fn body: (block (expression_statement (macro_invocation macro: (identifier) @mac (#match? @mac \"assert\")))) (#match? @fn \"rotate.*content.*key|content.*key.*rotat|encrypted.*rotat\"))' --min 1"
+      "check": "/Users/alec/.claude/plugins/cache/alecmarcus/odyssey/0.6.0/bin/check-ast crates/scp-runtime/src/context/manager/tests/governance.rs '(function_item name: (identifier) @fn body: (block (expression_statement (macro_invocation macro: (identifier) @mac (#match? @mac \"assert\")))) (#match? @fn \"rotate.*content.*key|content.*key.*rotat|encrypted.*rotat\"))' --min 1"
     },
     {
       "name": "NEGATIVE-TESTS: at least 2 rejection/failure tests across all issues",
-      "check": "/Users/alec/.claude/plugins/cache/alecmarcus/odyssey/0.3.0/bin/check-ast crates/scp-runtime/src/context/manager/tests/governance.rs '(function_item name: (identifier) @fn (#match? @fn \"(reject|denied|fail|block|exceed|invalid).*(standing|consequence|cost|budget|sender_key)|(standing|consequence|cost|budget|sender_key).*(reject|denied|fail|block|exceed|invalid)\"))' --min 2"
+      "check": "/Users/alec/.claude/plugins/cache/alecmarcus/odyssey/0.6.0/bin/check-ast crates/scp-runtime/src/context/manager/tests/governance.rs '(function_item name: (identifier) @fn (#match? @fn \"(reject|denied|fail|block|exceed|invalid).*(standing|consequence|cost|budget|sender_key)|(standing|consequence|cost|budget|sender_key).*(reject|denied|fail|block|exceed|invalid)\"))' --min 2"
     }
   ]
 }

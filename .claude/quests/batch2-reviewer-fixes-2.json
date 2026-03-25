@@ -1,0 +1,39 @@
+{
+  "name": "batch2-reviewer-fixes-2",
+  "description": "Reviewer findings: RECEIPT narrowed, SYBIL fail-closed fixed, snapshot for new state, lock pattern regression, dead-code prevention",
+  "created": "2026-03-26T00:30:00Z",
+  "gates": [
+    {
+      "name": "RECEIPT-WIRED: verify_receipts called (call_expression) in messaging.rs or lifecycle.rs only (not just definition in receipt.rs)",
+      "check": "/Users/alec/.claude/plugins/cache/alecmarcus/odyssey/0.6.0/bin/check-ast crates/scp-runtime/src/context/manager/messaging.rs '(call_expression function: (field_expression field: (field_identifier) @method (#eq? @method \"verify_receipts\")))' --min 1 || /Users/alec/.claude/plugins/cache/alecmarcus/odyssey/0.6.0/bin/check-ast crates/scp-runtime/src/context/manager/lifecycle.rs '(call_expression function: (field_expression field: (field_identifier) @method (#eq? @method \"verify_receipts\")))' --min 1"
+    },
+    {
+      "name": "SYBIL-FAILCLOSED: evaluate_sybil_resistance uses ? (try_expression directly on call, not any map_err)",
+      "check": "/Users/alec/.claude/plugins/cache/alecmarcus/odyssey/0.6.0/bin/check-ast crates/scp-runtime/src/context/manager/lifecycle.rs '(try_expression (call_expression function: (identifier) @fn (#eq? @fn \"evaluate_sybil_resistance\")))' --min 1 || /Users/alec/.claude/plugins/cache/alecmarcus/odyssey/0.6.0/bin/check-ast crates/scp-runtime/src/context/manager/lifecycle.rs '(try_expression (call_expression function: (scoped_identifier name: (identifier) @fn (#eq? @fn \"evaluate_sybil_resistance\"))))' --min 1"
+    },
+    {
+      "name": "SNAPSHOT-VELOCITY: velocity_tracker or sender_velocity field accessed (field_expression) in mod.rs snapshot",
+      "check": "/Users/alec/.claude/plugins/cache/alecmarcus/odyssey/0.6.0/bin/check-ast crates/scp-runtime/src/context/manager/mod.rs '(field_expression field: (field_identifier) @fid (#match? @fid \"velocity_tracker|sender_velocity\"))' --min 1"
+    },
+    {
+      "name": "SNAPSHOT-PARTICIPATION: participation_cache or participation_records field accessed (field_expression) in snapshot",
+      "check": "/Users/alec/.claude/plugins/cache/alecmarcus/odyssey/0.6.0/bin/check-ast crates/scp-runtime/src/context/manager/mod.rs '(field_expression field: (field_identifier) @fid (#match? @fid \"participation_cache|participation_records|participation_record\"))' --min 1"
+    },
+    {
+      "name": "LOCK-PATTERN: send_message still has >=2 lock acquisitions (Phase 1/2/3 preserved)",
+      "check": "/Users/alec/.claude/plugins/cache/alecmarcus/odyssey/0.6.0/bin/check-ast crates/scp-runtime/src/context/manager/messaging.rs '(call_expression function: (field_expression field: (field_identifier) @method (#eq? @method \"lock\")))' --min 2"
+    },
+    {
+      "name": "RECORD-SPEND-FAILCLOSED-MSG: record_spend in messaging.rs uses map_err (error propagation, not silent)",
+      "check": "/Users/alec/.claude/plugins/cache/alecmarcus/odyssey/0.6.0/bin/check-ast crates/scp-runtime/src/context/manager/messaging.rs '(call_expression function: (field_expression field: (field_identifier) @method (#eq? @method \"map_err\")))' --min 1"
+    },
+    {
+      "name": "RECORD-SPEND-FAILCLOSED-LIFE: record_spend in lifecycle.rs uses map_err (error propagation)",
+      "check": "/Users/alec/.claude/plugins/cache/alecmarcus/odyssey/0.6.0/bin/check-ast crates/scp-runtime/src/context/manager/lifecycle.rs '(call_expression function: (field_expression field: (field_identifier) @method (#eq? @method \"map_err\")))' --min 1"
+    },
+    {
+      "name": "RECORD-SPEND-FAILCLOSED-TOOL: record_spend in invoke.rs uses map_err (error propagation)",
+      "check": "/Users/alec/.claude/plugins/cache/alecmarcus/odyssey/0.6.0/bin/check-ast crates/scp-runtime/src/context/tools/invoke.rs '(call_expression function: (field_expression field: (field_identifier) @method (#eq? @method \"map_err\")))' --min 1"
+    }
+  ]
+}
