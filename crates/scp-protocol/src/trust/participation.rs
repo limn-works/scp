@@ -225,6 +225,30 @@ pub fn compute_participation_record(
 }
 
 // ---------------------------------------------------------------------------
+// Standing threshold check
+// ---------------------------------------------------------------------------
+
+/// Returns `true` if the participation record meets the minimum standing
+/// threshold required for governance actions (#1530).
+///
+/// The threshold is based on `participation_count` — a member must have
+/// at least one event (i.e., any prior participation) AND must not have
+/// more governance actions against them than by them (net positive
+/// governance standing).
+///
+/// This is a simple, deterministic check that any agent can reproduce
+/// from the same event log data.
+#[must_use]
+pub const fn meets_standing_threshold(record: &ParticipationRecord) -> bool {
+    // Must have at least one participation event.
+    if record.participation_count == 0 {
+        return false;
+    }
+    // Net governance standing: actions by >= actions against.
+    record.governance_actions_by.len() >= record.governance_actions_against.len()
+}
+
+// ---------------------------------------------------------------------------
 // Payload extraction helpers
 // ---------------------------------------------------------------------------
 

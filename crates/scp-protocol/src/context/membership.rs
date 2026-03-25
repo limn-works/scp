@@ -630,6 +630,38 @@ pub enum ContextEvent {
         /// The governance proposal ID that authorized the migration.
         migration_proposal_id: [u8; 32],
     },
+    /// A consequence rule was triggered (ADR-017, #1531).
+    ///
+    /// Emitted when a consequence rule's trigger condition is met for a
+    /// member. Contains the rule index and trigger/action types for
+    /// observability.
+    ConsequenceTriggered {
+        /// The context where the consequence was triggered.
+        context_id: String,
+        /// The member whose behavior triggered the consequence.
+        member_did: DID,
+        /// Index of the triggered rule in the context's `consequence_rules`.
+        rule_index: usize,
+        /// Human-readable trigger type (e.g., `"MessageVelocity"`).
+        trigger_type: String,
+        /// Human-readable action type (e.g., `"CapabilitySuspension"`).
+        action_type: String,
+    },
+    /// A consequence enforcement action was executed (ADR-017, #1531).
+    ///
+    /// Emitted after the enforcement action (capability suspension, access
+    /// revocation, or role demotion) has been applied. The `success` field
+    /// indicates whether the enforcement was successfully applied.
+    ConsequenceEnforced {
+        /// The context where the consequence was enforced.
+        context_id: String,
+        /// The member the enforcement was applied to.
+        member_did: DID,
+        /// Human-readable action type (e.g., `"CapabilitySuspension"`).
+        action_type: String,
+        /// Whether the enforcement was successfully applied.
+        success: bool,
+    },
 }
 
 // ---------------------------------------------------------------------------

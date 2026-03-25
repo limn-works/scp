@@ -764,6 +764,13 @@ pub struct ContextParams {
     /// that authorized the migration. `None` for non-migration contexts.
     #[serde(default)]
     pub migration_source: Option<MigrationSource>,
+
+    /// Consequence rules declared at context creation (ADR-017, #1531).
+    ///
+    /// Visible before joining (part of the opt-in contract). Protocol-enforced,
+    /// verifiable. No hidden penalties. Empty means no consequence rules.
+    #[serde(default)]
+    pub consequence_rules: Vec<crate::trust::consequence::ConsequenceRule>,
 }
 
 impl Default for ContextParams {
@@ -791,6 +798,7 @@ impl Default for ContextParams {
             incomplete_verification_policy: IncompleteVerificationPolicy::default(),
             min_protocol_version: None,
             migration_source: None,
+            consequence_rules: Vec::new(),
         }
     }
 }
@@ -1008,6 +1016,7 @@ mod tests {
             incomplete_verification_policy: IncompleteVerificationPolicy::default(),
             min_protocol_version: None,
             migration_source: None,
+            consequence_rules: Vec::new(),
         };
 
         assert_eq!(params.mode, ContextMode::Broadcast);
@@ -1148,6 +1157,7 @@ mod tests {
             incomplete_verification_policy: IncompleteVerificationPolicy::default(),
             min_protocol_version: None,
             migration_source: None,
+            consequence_rules: Vec::new(),
         };
 
         let json = serde_json::to_string(&params).ok();
@@ -1208,6 +1218,7 @@ mod tests {
             incomplete_verification_policy: IncompleteVerificationPolicy::default(),
             min_protocol_version: None,
             migration_source: None,
+            consequence_rules: Vec::new(),
         };
 
         let json = serde_json::to_string(&params).unwrap();

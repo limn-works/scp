@@ -289,6 +289,7 @@ pub fn template_params(template_id: &TemplateId) -> ContextParams {
             incomplete_verification_policy: IncompleteVerificationPolicy::default(),
             min_protocol_version: None,
             migration_source: None,
+            consequence_rules: Vec::new(),
         },
         TemplateId::BilateralPersistent => ContextParams {
             mode: ContextMode::Encrypted,
@@ -313,6 +314,7 @@ pub fn template_params(template_id: &TemplateId) -> ContextParams {
             incomplete_verification_policy: IncompleteVerificationPolicy::default(),
             min_protocol_version: None,
             migration_source: None,
+            consequence_rules: Vec::new(),
         },
         TemplateId::Coordination => ContextParams {
             mode: ContextMode::Encrypted,
@@ -337,6 +339,7 @@ pub fn template_params(template_id: &TemplateId) -> ContextParams {
             incomplete_verification_policy: IncompleteVerificationPolicy::default(),
             min_protocol_version: None,
             migration_source: None,
+            consequence_rules: Vec::new(),
         },
         TemplateId::GroupDiscussion => ContextParams {
             mode: ContextMode::Encrypted,
@@ -361,6 +364,7 @@ pub fn template_params(template_id: &TemplateId) -> ContextParams {
             incomplete_verification_policy: IncompleteVerificationPolicy::default(),
             min_protocol_version: None,
             migration_source: None,
+            consequence_rules: Vec::new(),
         },
         TemplateId::PublicBroadcast => ContextParams {
             mode: ContextMode::Broadcast,
@@ -388,6 +392,7 @@ pub fn template_params(template_id: &TemplateId) -> ContextParams {
             incomplete_verification_policy: IncompleteVerificationPolicy::default(),
             min_protocol_version: None,
             migration_source: None,
+            consequence_rules: Vec::new(),
         },
         TemplateId::GatedBroadcast => ContextParams {
             mode: ContextMode::Broadcast,
@@ -415,6 +420,7 @@ pub fn template_params(template_id: &TemplateId) -> ContextParams {
             incomplete_verification_policy: IncompleteVerificationPolicy::default(),
             min_protocol_version: None,
             migration_source: None,
+            consequence_rules: Vec::new(),
         },
         TemplateId::ToolInterfaceTemplate => ContextParams {
             mode: ContextMode::Encrypted,
@@ -439,6 +445,7 @@ pub fn template_params(template_id: &TemplateId) -> ContextParams {
             incomplete_verification_policy: IncompleteVerificationPolicy::default(),
             min_protocol_version: None,
             migration_source: None,
+            consequence_rules: Vec::new(),
         },
         // Extends scp:template/tool-interface -- same ceiling and governance,
         // but economic_policy is caller-provided and validated separately.
@@ -465,6 +472,7 @@ pub fn template_params(template_id: &TemplateId) -> ContextParams {
             incomplete_verification_policy: IncompleteVerificationPolicy::default(),
             min_protocol_version: None,
             migration_source: None,
+            consequence_rules: Vec::new(),
         },
         // Extends scp:template/gated-broadcast -- broadcast mode with gated
         // subscriber admission. economic_policy is caller-provided.
@@ -494,6 +502,7 @@ pub fn template_params(template_id: &TemplateId) -> ContextParams {
             incomplete_verification_policy: IncompleteVerificationPolicy::default(),
             min_protocol_version: None,
             migration_source: None,
+            consequence_rules: Vec::new(),
         },
         // Context: encrypted mode with messaging + tool invocation
         // ceiling. Discoverable by default so it can be found via DHT. Used
@@ -521,6 +530,7 @@ pub fn template_params(template_id: &TemplateId) -> ContextParams {
             incomplete_verification_policy: IncompleteVerificationPolicy::default(),
             min_protocol_version: None,
             migration_source: None,
+            consequence_rules: Vec::new(),
         },
     }
 }

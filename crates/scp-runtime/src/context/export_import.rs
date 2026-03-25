@@ -315,6 +315,7 @@ fn strip_snapshot_for_public(snapshot: &ContextSnapshot) -> ContextSnapshot {
         // Access keys are sensitive material — not exported in public scope.
         access_key_store: scp_protocol::crypto::access_keys::AccessKeyStore::new(),
         consequence_rules: Vec::new(),
+        participation_cache: HashMap::new(),
     }
 }
 
@@ -425,6 +426,7 @@ mod tests {
             migration_state: None,
             access_key_store: scp_protocol::crypto::access_keys::AccessKeyStore::new(),
             consequence_rules: Vec::new(),
+            participation_cache: std::collections::HashMap::new(),
         }
     }
 

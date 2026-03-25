@@ -545,6 +545,10 @@ pub struct ContextSnapshot {
     /// Consequence rules declared at context creation (ADR-017, #1531).
     #[serde(default)]
     pub consequence_rules: Vec<scp_protocol::trust::consequence::ConsequenceRule>,
+    /// Per-member participation record cache for standing evaluation (#1530).
+    #[serde(default)]
+    pub participation_cache:
+        HashMap<String, scp_protocol::trust::participation::ParticipationRecord>,
 }
 
 // ---------------------------------------------------------------------------
@@ -691,6 +695,10 @@ struct GovernanceState {
     pending_epoch_resets: Vec<DID>,
     /// Consequence rules declared at context creation (ADR-017, #1531).
     consequence_rules: Vec<ConsequenceRule>,
+    /// Sender velocity tracker for anti-spam and consequence evaluation (§19.7, #1537).
+    velocity_tracker: scp_protocol::economy::antispam::SenderVelocityTracker,
+    /// Per-member participation record cache for standing evaluation (#1530).
+    participation_cache: HashMap<String, scp_protocol::trust::participation::ParticipationRecord>,
 }
 
 /// MLS epoch and reconnection state.
@@ -1710,6 +1718,7 @@ impl ContextManager {
             migration_state: ctx.migration_state.clone(),
             access_key_store: ctx.access.access_key_store.clone(),
             consequence_rules: ctx.governance.consequence_rules.clone(),
+            participation_cache: ctx.governance.participation_cache.clone(),
         }
     }
 }
