@@ -242,35 +242,35 @@ When the SDK receives a context invitation, it evaluates in this order:
 2. **Auto-accept check.** If a matching policy exists, evaluate trust requirement, TTL cap, and rate limit. If all pass, join automatically.
 3. **Agent prompt.** If no auto-accept policy matches, surface the invitation to the agent/human for decision. The invitation includes full context metadata (§5.7) plus the template ID if present.
 
-### Standing channels (contact graph)
+### Standing contexts (contact graph)
 
 Standing bilateral contexts serve as the real-time communication primitive (spec §5.12.4). The SDK manages them as persistent infrastructure — the agent's contact list.
 
 ```
-// Rust — get or create a standing channel with a peer
-let channel = sdk.standing_channel(&bob_did).await?;
+// Rust — get or create a standing context with a peer
+let channel = sdk.standing_context(&bob_did).await?;
 // Returns existing bilateral-persistent context if one exists,
 // creates one if not. Idempotent.
 
 channel.send("Are you available for the 3pm sync?").await?;
 
 // Python
-channel = await sdk.standing_channel(bob_did)
+channel = await sdk.standing_context(bob_did)
 await channel.send("Are you available for the 3pm sync?")
 
 // Swift
-let channel = try await sdk.standingChannel(with: bobDID)
+let channel = try await sdk.standingContext(with: bobDID)
 try await channel.send("Are you available for the 3pm sync?")
 ```
 
-**Semantics of `standing_channel`:**
+**Semantics of `standing_context`:**
 
 1. Check local state for an existing `bilateral-persistent` context with this peer DID.
 2. If found and `Active`, return it. Zero network cost — instant.
 3. If not found, create one (`bilateral-persistent` template), send invitation, return the handle. First message queues until the peer joins.
 4. If found but peer has left, create a new one (re-invitation).
 
-**Startup reconnection.** On SDK initialization, reconnect transport for all standing channels. This is background work — the SDK reconnects to relays for all active persistent contexts and begins receiving queued messages. Standing channels are available immediately after `sdk.init()` returns.
+**Startup reconnection.** On SDK initialization, reconnect transport for all standing contexts. This is background work — the SDK reconnects to relays for all active persistent contexts and begins receiving queued messages. Standing contexts are available immediately after `sdk.init()` returns.
 
 ## CI Matrix
 

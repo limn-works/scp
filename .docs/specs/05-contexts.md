@@ -901,7 +901,7 @@ Contexts are runtime objects. They are created, used, and destroyed during norma
    ├── Reconnect transport for all Active contexts (background, non-blocking)
    └── Begin processing queued invitations
 
-2. Standing channels are immediately available.
+2. Standing contexts are immediately available.
    Messages sent before transport reconnects are queued locally.
    Messages received while offline are retrieved from relay on reconnect.
 ```
@@ -913,7 +913,7 @@ Agent lifecycle                              Context operations
 ──────────────────────────────────────────────────────────────────
 
 Receives task: "coordinate with Bob"
-  └── sdk.standing_channel(bob_did)          [get-or-create, ~0ms or ~200ms]
+  └── sdk.standing_context(bob_did)          [get-or-create, ~0ms or ~200ms]
       └── channel.send("sync on project?")   [send, 1 hop]
 
 Receives task: "negotiate contract terms"
@@ -940,15 +940,15 @@ Application shutdown:
       // Contexts survive. On next startup, they reconnect.
 ```
 
-**Key property: contexts survive process restarts.** Context state (MLS group state, sender keys, event log position) is persisted to secure storage on every state transition (ADR-008). When the application restarts, all Active contexts are restored and transport is reconnected. No re-creation, no re-invitation, no re-negotiation. This is why standing channels work — they persist across application sessions, device reboots, and network interruptions.
+**Key property: contexts survive process restarts.** Context state (MLS group state, sender keys, event log position) is persisted to secure storage on every state transition (ADR-008). When the application restarts, all Active contexts are restored and transport is reconnected. No re-creation, no re-invitation, no re-negotiation. This is why standing contexts work — they persist across application sessions, device reboots, and network interruptions.
 
 **Contexts are not connections.** A TCP connection dies when the process exits. A context does not. A context is a durable cryptographic group that happens to use connections for transport. The transport layer is replaceable (§8, ADR-012) and reconnectable. The context is the stable entity; the transport is ephemeral plumbing underneath.
 
 ### 5.12.6 The Contact Graph
 
-Agents that coordinate regularly maintain **standing bilateral contexts** — the agent's contact graph. A standing channel is a `bilateral-persistent` context with no TTL, created once and kept alive for the duration of the relationship.
+Agents that coordinate regularly maintain **standing bilateral contexts** — the agent's contact graph. A standing context is a `bilateral-persistent` context with no TTL, created once and kept alive for the duration of the relationship.
 
-**Lifecycle of a standing channel:**
+**Lifecycle of a standing context:**
 
 ```
 Relationship stage        Protocol action                Cost
@@ -960,9 +960,9 @@ Reconnect after offline   transport reconnect            background, automatic
 Relationship ends         close_context                  one-time, keys preserved or destroyed per memory scope
 ```
 
-**Standing channels have zero idle cost.** No keepalives, no heartbeats, no periodic key rotation (MLS key updates happen on message send, not on a timer). An agent with 500 standing channels and no active conversations uses zero network bandwidth. The only cost is local storage for persisted MLS state — approximately 2-5KB per bilateral context (two-leaf ratchet tree, sender key material, minimal event log metadata).
+**Standing contexts have zero idle cost.** No keepalives, no heartbeats, no periodic key rotation (MLS key updates happen on message send, not on a timer). An agent with 500 standing contexts and no active conversations uses zero network bandwidth. The only cost is local storage for persisted MLS state — approximately 2-5KB per bilateral context (two-leaf ratchet tree, sender key material, minimal event log metadata).
 
-**Standing channels vs. ephemeral contexts — when to use which:**
+**Standing contexts vs. ephemeral contexts — when to use which:**
 
 | | Standing channel | Ephemeral context |
 |---|---|---|
@@ -973,9 +973,9 @@ Relationship ends         close_context                  one-time, keys preserve
 | Analogy | Phone contact | Phone call |
 | Creation | Once per relationship | Once per interaction |
 
-An agent typically has a standing channel with every peer it communicates with regularly, and creates ephemeral contexts on top of that for specific bounded tasks — especially tasks involving sensitive data that should not persist.
+An agent typically has a standing context with every peer it communicates with regularly, and creates ephemeral contexts on top of that for specific bounded tasks — especially tasks involving sensitive data that should not persist.
 
-**First-contact optimization.** When two agents already share a context (e.g., both are members of a group), creating a standing channel between them is faster: both agents already have each other's DID documents and MLS key packages cached from the shared context. The SDK SHOULD use this cached key material to skip DID resolution, reducing first-contact setup to a single relay roundtrip.
+**First-contact optimization.** When two agents already share a context (e.g., both are members of a group), creating a standing context between them is faster: both agents already have each other's DID documents and MLS key packages cached from the shared context. The SDK SHOULD use this cached key material to skip DID resolution, reducing first-contact setup to a single relay roundtrip.
 
 ## 5.13 Context Nesting
 
@@ -1318,7 +1318,7 @@ Full legibility before opt-in applies to nesting relationships the same as every
 
 **Templates.** Well-known templates (§5.12.1) can be used for child contexts. The template constrains the child's params as usual; the parent relationship adds the ceiling intersection and lifecycle coupling on top. A child created from `bilateral-ephemeral` with two parents is an ephemeral bridge — TTL'd, keys destroyed on close, ceiling ≤ intersection.
 
-**Standing channels.** A standing channel (§5.12.6) between Alice and Bob can be modeled as a multi-parent child of whatever context(s) Alice and Bob share. This is not required — standing channels remain lightweight bilateral contexts that work without nesting. But if structural governance over the standing channel is desired (a parent context's governance should have authority over the channel), nesting provides that.
+**Standing contexts.** A standing context (§5.12.6) between Alice and Bob can be modeled as a multi-parent child of whatever context(s) Alice and Bob share. This is not required — standing contexts remain lightweight bilateral contexts that work without nesting. But if structural governance over the standing context is desired (a parent context's governance should have authority over the channel), nesting provides that.
 
 **Tool interfaces.** Tool interfaces (§6.2) and multi-parent children serve different purposes and coexist:
 
