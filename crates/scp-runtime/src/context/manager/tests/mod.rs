@@ -75,6 +75,7 @@ pub(super) struct MockCrypto {
     pub(super) fail_create_mls: AtomicBool,
     pub(super) fail_validate_key_package: AtomicBool,
     pub(super) fail_advance_epoch: AtomicBool,
+    pub(super) fail_remove_member_sender_key: AtomicBool,
     pub(super) mls_created: std::sync::Mutex<Vec<[u8; 32]>>,
     pub(super) sender_keys_created: std::sync::Mutex<Vec<[u8; 32]>>,
     pub(super) broadcast_created: std::sync::Mutex<Vec<[u8; 32]>>,
@@ -182,6 +183,11 @@ impl ContextCryptoProvider for MockCrypto {
         _context_id: &[u8; 32],
         member_did: &str,
     ) -> Result<(), ContextError> {
+        if self.fail_remove_member_sender_key.load(Ordering::Relaxed) {
+            return Err(ContextError::CryptoFailed(
+                "mock remove_member_sender_key failure".into(),
+            ));
+        }
         self.sender_keys_removed
             .lock()
             .unwrap()
@@ -607,6 +613,7 @@ pub(super) fn governance_params() -> ContextParams {
             scp_protocol::context::params::Capability::new("governance:vote"),
             scp_protocol::context::params::Capability::new("member:ban"),
             scp_protocol::context::params::Capability::new("context:close"),
+            Capability::ToolRegister,
         ],
         ..ContextParams::default()
     }
