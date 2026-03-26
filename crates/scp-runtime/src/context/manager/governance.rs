@@ -82,6 +82,7 @@ pub(super) fn dispatch_consequences(
     member_did: &DID,
     now: u64,
     clock: &dyn scp_primitives::Clock,
+    event_log: &dyn super::super::builder::ContextEventLogProvider,
 ) {
     if ctx.governance.consequence_rules.is_empty() {
         return;
@@ -91,7 +92,7 @@ pub(super) fn dispatch_consequences(
     let rules: Vec<ConsequenceRule> = ctx.governance.consequence_rules.clone();
 
     // Collect event log entries for consequence evaluation (ADR-017).
-    let events = event_log_entries_for_consequences(ctx, context_id, now);
+    let events = event_log_entries_for_consequences(ctx, context_id, now, event_log);
 
     // Evaluate which consequences are triggered.
     let triggered: Vec<TriggeredConsequence> =
@@ -192,40 +193,65 @@ pub(super) fn enforce_triggered_consequences(
 ///
 /// **Why the Merkle event log cannot be used as a replacement:**
 /// `ContextEventLogProvider::event_log_entries()` returns `EventLogEntry`,
-/// which contains only `event: String` (event name) and `timestamp: u64`.
-/// It does NOT store structured event data — crucially, it lacks the
-/// `actor_did` field that consequence evaluation and participation record
-/// computation require. The Merkle event log was designed for provenance
-/// integrity (hash-chaining) and audit trails, not for querying behavioral
-/// history.
+/// Collects event history for consequence evaluation and participation
+/// record computation (ADR-017, #1530, #1531, #1594).
 ///
-/// **What would need to change for full-history support:**
-/// 1. Either extend `EventLogEntry` with an `actor_did: Option<DID>` field
-///    and a structured `event_type` enum (breaking the existing Merkle chain
-///    format), or
-/// 2. Introduce a separate `ContextBehaviorLog` that stores structured
-///    `ContextEvent` entries with DID information, indexed by context ID,
-///    alongside the Merkle event log.
-/// 3. The `ContextEventLogProvider` trait would need a new query method
-///    returning typed events, and this function would need access to the
-///    provider (currently it's a free function operating on `PerContextState`).
+/// Combines two sources:
+/// 1. **Event log history** — full persisted history from the
+///    `ContextEventLogProvider`. Each `EventLogEntry` includes `actor_did`
+///    (#1594), enabling proper attribution.
+/// 2. **Receive buffer events** — recent in-memory events that may not
+///    yet be in the event log (the event log is appended after the
+///    operation, but the receive buffer is updated inside the lock).
 ///
-/// Until then, the receive buffer provides a best-effort sliding window of
-/// recent events for consequence evaluation, which is sufficient for active
-/// contexts with normal message rates.
+/// Events from the event log use their real timestamps. Receive buffer
+/// events use estimated timestamps (spaced 1 second apart backwards from
+/// `now`). The merge deduplicates by preferring event log entries (which
+/// have accurate timestamps and hashes) over buffer estimates.
 pub(super) fn event_log_entries_for_consequences(
     ctx: &PerContextState,
-    _context_id: &str,
+    context_id: &str,
     now: u64,
+    event_log: &dyn super::super::builder::ContextEventLogProvider,
 ) -> Vec<scp_event_log::Event> {
     let mut events = Vec::new();
+
+    // Source 1: Full event log history (persisted, with real timestamps and actor_did).
+    let context_id_bytes = scp_protocol::context::context_id_bytes(context_id);
+    if let Ok(Some(entries)) = event_log.event_log_entries(&context_id_bytes) {
+        for (seq, entry) in entries.iter().enumerate() {
+            let event_type = match entry.event.as_str() {
+                "MessageSent" | "MessageReceived" => scp_event_log::EventType::MessageSent,
+                "MemberJoined" => scp_event_log::EventType::MemberJoined,
+                "MemberLeft" => scp_event_log::EventType::MemberLeft,
+                "RoleAssigned" => scp_event_log::EventType::RoleAssigned,
+                "ToolInvoked" => scp_event_log::EventType::ToolInvoked,
+                "GovernanceAction" => scp_event_log::EventType::GovernanceAction,
+                _ => continue, // Skip event types not relevant to consequence evaluation
+            };
+            events.push(scp_event_log::Event {
+                event_type,
+                actor_did: DID(entry.actor_did.clone()),
+                timestamp: entry.timestamp,
+                sequence: seq as u64,
+                payload: scp_event_log::EventPayload { data: Vec::new() },
+                prev_hash: [0u8; 32],
+                signature: Vec::new(),
+            });
+        }
+    }
+
+    // Source 2: Receive buffer events (recent, may not be in event log yet).
+    // Only add buffer events that are not already covered by the event log.
+    // We use a simple heuristic: if the event log already has events, we
+    // only add buffer events whose estimated timestamp is newer than the
+    // last event log entry.
+    let last_log_ts = events.last().map_or(0, |e| e.timestamp);
     let buffer_events = ctx.receive_buffer.event_log_entries();
     let buffer_len = buffer_events.len() as u64;
-    // Assign sequential timestamps so that velocity windowing works correctly.
-    // The most recent event gets `now`, and older events are spaced 1 second
-    // apart backwards in time. This is an approximation — the ReceiveBuffer
-    // does not track insertion timestamps.
-    for (seq, ctx_event) in buffer_events.iter().enumerate() {
+    let next_seq = events.len() as u64;
+
+    for (idx, ctx_event) in buffer_events.iter().enumerate() {
         let (event_type, actor_did) = match ctx_event {
             ContextEvent::MessageSent { sender_did, .. }
             | ContextEvent::MessageReceived { sender_did, .. } => {
@@ -238,12 +264,18 @@ pub(super) fn event_log_entries_for_consequences(
         };
         // Oldest event gets `now - (buffer_len - 1)`, newest gets `now`.
         let estimated_ts =
-            now.saturating_sub(buffer_len.saturating_sub(1).saturating_sub(seq as u64));
+            now.saturating_sub(buffer_len.saturating_sub(1).saturating_sub(idx as u64));
+
+        // Skip buffer events that are likely already covered by the event log.
+        if estimated_ts <= last_log_ts && last_log_ts > 0 {
+            continue;
+        }
+
         events.push(scp_event_log::Event {
             event_type,
             actor_did,
             timestamp: estimated_ts,
-            sequence: seq as u64,
+            sequence: next_seq + idx as u64,
             payload: scp_event_log::EventPayload { data: Vec::new() },
             prev_hash: [0u8; 32],
             signature: Vec::new(),
@@ -265,6 +297,7 @@ fn check_standing(
     ctx: &mut PerContextState,
     proposer_did: &DID,
     now: u64,
+    event_log: &dyn super::super::builder::ContextEventLogProvider,
 ) -> Result<(), ContextError> {
     // Check for pending removal (existing defense-in-depth).
     for (proposal, _seq, _ts) in ctx.governance.approved_proposals.values() {
@@ -279,7 +312,7 @@ fn check_standing(
 
     // Refresh participation record from recent events before checking standing (#1530).
     let context_id = ctx.handle.context_id().to_owned();
-    let events = event_log_entries_for_consequences(ctx, &context_id, now);
+    let events = event_log_entries_for_consequences(ctx, &context_id, now, event_log);
     if !events.is_empty()
         && let Ok(record) = scp_protocol::trust::participation::compute_participation_record(
             &events,
@@ -428,6 +461,7 @@ impl ContextManager {
     ///
     /// Extracted from [`execute_governance_action`] to keep that method
     /// focused on validation and dispatch.
+    #[allow(clippy::too_many_lines)]
     async fn finalize_governance_action(
         &self,
         context_id: &str,
@@ -494,6 +528,7 @@ impl ContextManager {
         self.event_log.append_context_event(
             &context_id_bytes,
             Self::governance_event_label(&executed_event),
+            proposal.proposer_did.as_ref(),
         )?;
 
         // Single lock acquisition for all post-event-log state mutations
@@ -543,11 +578,16 @@ impl ContextManager {
                     &proposal.proposer_did,
                     self.clock.now_secs(),
                     &*self.clock,
+                    &*self.event_log,
                 );
 
                 // Update participation record after governance action (#1530).
-                let gov_events =
-                    event_log_entries_for_consequences(ctx, context_id, self.clock.now_secs());
+                let gov_events = event_log_entries_for_consequences(
+                    ctx,
+                    context_id,
+                    self.clock.now_secs(),
+                    &*self.event_log,
+                );
                 if !gov_events.is_empty()
                     && let Ok(record) =
                         scp_protocol::trust::participation::compute_participation_record(
@@ -581,12 +621,14 @@ impl ContextManager {
     /// Separated from [`execute_governance_action`] to keep the public entry
     /// point focused on validation while this method handles the 28-action
     /// dispatch.
+    #[allow(clippy::too_many_lines)]
     async fn dispatch_governance_action(
         &self,
         context_id: &str,
         proposal: &GovernanceProposal,
     ) -> Result<GovernanceActionResult, ContextError> {
         let pid = proposal.proposal_id;
+        let actor = proposal.proposer_did.as_ref();
         match &proposal.action {
             GovernanceAction::BlockAuthor { did, .. } => {
                 // Delegate to RevokeWriteAccess with Full scope (SCP-RG-016,
@@ -594,8 +636,14 @@ impl ContextManager {
                 // key layer provides the proper mechanism for revoking write
                 // access. Delegation ensures key rotation and access tracking
                 // are handled consistently.
-                self.execute_revoke_write_access(context_id, did, RevocationScope::Full, pid)
-                    .await?;
+                self.execute_revoke_write_access(
+                    context_id,
+                    did,
+                    RevocationScope::Full,
+                    pid,
+                    actor,
+                )
+                .await?;
                 Ok(GovernanceActionResult::WriteAccessRevoked(
                     WriteAccessRevokedResult {
                         did: did.clone(),
@@ -605,7 +653,7 @@ impl ContextManager {
             }
             GovernanceAction::RevokeReadAccess { did, scope } => {
                 let r = self
-                    .revoke_read_access_internal(context_id, did, *scope)
+                    .revoke_read_access_internal(context_id, did, *scope, actor)
                     .await?;
                 Ok(GovernanceActionResult::ReadAccessRevoked(
                     ReadAccessRevokedResult {
@@ -616,25 +664,32 @@ impl ContextManager {
                 ))
             }
             GovernanceAction::RestoreReadAccess { did } => {
-                self.restore_read_access_internal(context_id, did).await?;
+                self.restore_read_access_internal(context_id, did, actor)
+                    .await?;
                 Ok(GovernanceActionResult::ReadAccessRestored(
                     ReadAccessRestoredResult { did: did.clone() },
                 ))
             }
             GovernanceAction::PromoteContext => {
-                self.execute_promote_context(context_id, &proposal.approvals, pid)
+                self.execute_promote_context(context_id, &proposal.approvals, pid, actor)
                     .await?;
                 Ok(GovernanceActionResult::ContextPromoted)
             }
             // ExtendTtl needs proposal.approvals for unanimity override
             // (ADR-031 §4d, spec §5.10).
             GovernanceAction::ExtendTtl { additional_secs } => {
-                self.execute_extend_ttl(context_id, *additional_secs, &proposal.approvals, pid)
-                    .await?;
+                self.execute_extend_ttl(
+                    context_id,
+                    *additional_secs,
+                    &proposal.approvals,
+                    pid,
+                    actor,
+                )
+                .await?;
                 Ok(GovernanceActionResult::TtlExtended)
             }
             GovernanceAction::SetEconomicPolicy { policy } => {
-                self.execute_set_economic_policy(context_id, policy, pid)
+                self.execute_set_economic_policy(context_id, policy, pid, actor)
                     .await?;
                 Ok(GovernanceActionResult::Executed)
             }
@@ -643,12 +698,13 @@ impl ContextManager {
                 amount,
                 purpose,
             } => {
-                self.execute_approve_spend(context_id, spender, *amount, purpose, pid)
+                self.execute_approve_spend(context_id, spender, *amount, purpose, pid, actor)
                     .await?;
                 Ok(GovernanceActionResult::Executed)
             }
             GovernanceAction::LockEconomicPolicy => {
-                self.execute_lock_economic_policy(context_id, pid).await?;
+                self.execute_lock_economic_policy(context_id, pid, actor)
+                    .await?;
                 Ok(GovernanceActionResult::Executed)
             }
             // Remaining actions dispatched to context-level handler.
@@ -674,7 +730,7 @@ impl ContextManager {
             | GovernanceAction::ReconfigureGovernance { .. }
             | GovernanceAction::ProposeContextMigration { .. }
             | GovernanceAction::CancelContextMigration => {
-                self.dispatch_context_governance_action(context_id, &proposal.action, pid)
+                self.dispatch_context_governance_action(context_id, &proposal.action, pid, actor)
                     .await
             }
         }
@@ -688,57 +744,62 @@ impl ContextManager {
     ///   actions (13 variants).
     /// - [`dispatch_content_governance_action`] handles content access,
     ///   key rotation, conflict resolution, and reconfiguration (9 variants).
+    #[allow(clippy::too_many_lines)]
     async fn dispatch_context_governance_action(
         &self,
         context_id: &str,
         action: &GovernanceAction,
         pid: ProposalId,
+        actor_did: &str,
     ) -> Result<GovernanceActionResult, ContextError> {
         match action {
             GovernanceAction::AddMember { did, role } => {
-                self.execute_add_member(context_id, did, role, pid).await?;
+                self.execute_add_member(context_id, did, role, pid, actor_did)
+                    .await?;
                 Ok(GovernanceActionResult::MemberAdded)
             }
             GovernanceAction::RemoveMember { did, .. } => {
-                self.execute_remove_member(context_id, did, pid).await?;
+                self.execute_remove_member(context_id, did, pid, actor_did)
+                    .await?;
                 Ok(GovernanceActionResult::MemberRemoved)
             }
             GovernanceAction::ChangeRole { did, new_role } => {
-                self.execute_change_role(context_id, did, new_role, pid)
+                self.execute_change_role(context_id, did, new_role, pid, actor_did)
                     .await?;
                 Ok(GovernanceActionResult::RoleChanged)
             }
             GovernanceAction::RegisterTool { registration } => {
-                self.execute_register_tool(context_id, registration, pid)
+                self.execute_register_tool(context_id, registration, pid, actor_did)
                     .await?;
                 Ok(GovernanceActionResult::ToolRegistered)
             }
             GovernanceAction::RemoveTool { tool_id } => {
-                self.execute_remove_tool(context_id, tool_id, pid).await?;
+                self.execute_remove_tool(context_id, tool_id, pid, actor_did)
+                    .await?;
                 Ok(GovernanceActionResult::ToolRemoved)
             }
             GovernanceAction::ModifyCeiling { new_ceiling } => {
-                self.execute_modify_ceiling(context_id, new_ceiling, pid)
+                self.execute_modify_ceiling(context_id, new_ceiling, pid, actor_did)
                     .await?;
                 Ok(GovernanceActionResult::CeilingModified)
             }
             GovernanceAction::CloseContext { reason } => {
-                self.execute_close_context(context_id, reason.as_deref(), pid)
+                self.execute_close_context(context_id, reason.as_deref(), pid, actor_did)
                     .await?;
                 Ok(GovernanceActionResult::ContextClosed)
             }
             GovernanceAction::TransferAdmin { new_admin } => {
-                self.execute_transfer_admin(context_id, new_admin, pid)
+                self.execute_transfer_admin(context_id, new_admin, pid, actor_did)
                     .await?;
                 Ok(GovernanceActionResult::AdminTransferred)
             }
             GovernanceAction::CreateChildContext { params } => {
-                self.execute_create_child_context(context_id, params, pid)
+                self.execute_create_child_context(context_id, params, pid, actor_did)
                     .await?;
                 Ok(GovernanceActionResult::ChildContextCreated)
             }
             GovernanceAction::ModifyPruningPolicy { new_policy } => {
-                self.execute_modify_pruning_policy(context_id, new_policy, pid)
+                self.execute_modify_pruning_policy(context_id, new_policy, pid, actor_did)
                     .await?;
                 Ok(GovernanceActionResult::PruningPolicyModified)
             }
@@ -756,12 +817,13 @@ impl ContextManager {
                         *grace_period_secs,
                         *auto_invite,
                         pid,
+                        actor_did,
                     )
                     .await?;
                 Ok(GovernanceActionResult::MigrationProposed(result))
             }
             GovernanceAction::CancelContextMigration => {
-                self.execute_cancel_context_migration(context_id, pid)
+                self.execute_cancel_context_migration(context_id, pid, actor_did)
                     .await?;
                 Ok(GovernanceActionResult::MigrationCancelled)
             }
@@ -777,7 +839,7 @@ impl ContextManager {
             | GovernanceAction::RestoreWriteAccess { .. }
             | GovernanceAction::RotateContentKeys { .. }
             | GovernanceAction::ReconfigureGovernance { .. } => {
-                self.dispatch_content_governance_action(context_id, action, pid)
+                self.dispatch_content_governance_action(context_id, action, pid, actor_did)
                     .await
             }
             // PromoteContext, ExtendTtl, BlockAuthor, RevokeReadAccess,
@@ -798,33 +860,37 @@ impl ContextManager {
 
     /// Dispatches content access, structural, and reconfiguration governance
     /// actions. Companion to [`dispatch_context_governance_action`].
+    #[allow(clippy::too_many_lines)]
     async fn dispatch_content_governance_action(
         &self,
         context_id: &str,
         action: &GovernanceAction,
         pid: ProposalId,
+        actor_did: &str,
     ) -> Result<GovernanceActionResult, ContextError> {
         match action {
             GovernanceAction::AddSigner { did } => {
-                self.execute_add_signer(context_id, did, pid).await?;
+                self.execute_add_signer(context_id, did, pid, actor_did)
+                    .await?;
                 Ok(GovernanceActionResult::SignerAdded)
             }
             GovernanceAction::RemoveSigner { did } => {
-                self.execute_remove_signer(context_id, did, pid).await?;
+                self.execute_remove_signer(context_id, did, pid, actor_did)
+                    .await?;
                 Ok(GovernanceActionResult::SignerRemoved)
             }
             GovernanceAction::ModifyThreshold { new_threshold } => {
-                self.execute_modify_threshold(context_id, *new_threshold, pid)
+                self.execute_modify_threshold(context_id, *new_threshold, pid, actor_did)
                     .await?;
                 Ok(GovernanceActionResult::ThresholdModified)
             }
             GovernanceAction::EstablishToolInterface { interface } => {
-                self.execute_establish_tool_interface(context_id, interface, pid)
+                self.execute_establish_tool_interface(context_id, interface, pid, actor_did)
                     .await?;
                 Ok(GovernanceActionResult::ToolInterfaceEstablished)
             }
             GovernanceAction::ResetMember { did, reason } => {
-                self.execute_reset_member(context_id, did, reason, pid)
+                self.execute_reset_member(context_id, did, reason, pid, actor_did)
                     .await?;
                 Ok(GovernanceActionResult::MemberReset)
             }
@@ -833,12 +899,14 @@ impl ContextManager {
                 proposal_b,
                 resolution,
             } => {
-                self.execute_resolve_conflict(context_id, proposal_a, proposal_b, resolution, pid)
-                    .await?;
+                self.execute_resolve_conflict(
+                    context_id, proposal_a, proposal_b, resolution, pid, actor_did,
+                )
+                .await?;
                 Ok(GovernanceActionResult::ConflictResolved)
             }
             GovernanceAction::RevokeWriteAccess { did, scope } => {
-                self.execute_revoke_write_access(context_id, did, *scope, pid)
+                self.execute_revoke_write_access(context_id, did, *scope, pid, actor_did)
                     .await?;
                 Ok(GovernanceActionResult::WriteAccessRevoked(
                     WriteAccessRevokedResult {
@@ -848,14 +916,14 @@ impl ContextManager {
                 ))
             }
             GovernanceAction::RestoreWriteAccess { did } => {
-                self.execute_restore_write_access(context_id, did, pid)
+                self.execute_restore_write_access(context_id, did, pid, actor_did)
                     .await?;
                 Ok(GovernanceActionResult::WriteAccessRestored(
                     WriteAccessRestoredResult { did: did.clone() },
                 ))
             }
             GovernanceAction::RotateContentKeys { reason } => {
-                self.execute_rotate_content_keys(context_id, reason.as_deref(), pid)
+                self.execute_rotate_content_keys(context_id, reason.as_deref(), pid, actor_did)
                     .await?;
                 Ok(GovernanceActionResult::ContentKeysRotated(
                     ContentKeysRotatedResult {
@@ -867,8 +935,14 @@ impl ContextManager {
                 changes,
                 justification,
             } => {
-                self.execute_reconfigure_governance(context_id, changes, justification, pid)
-                    .await?;
+                self.execute_reconfigure_governance(
+                    context_id,
+                    changes,
+                    justification,
+                    pid,
+                    actor_did,
+                )
+                .await?;
                 Ok(GovernanceActionResult::GovernanceReconfigured(
                     GovernanceReconfiguredResult {
                         changes_applied: changes.len(),
@@ -973,6 +1047,7 @@ impl ContextManager {
     /// Returns the proposal, events, and optional execution result. The
     /// execution result is `Some` when the proposal was auto-approved
     /// (`SingleAdmin`) and the action was successfully executed.
+    #[allow(clippy::too_many_lines)]
     async fn propose_governance_action_inner(
         &self,
         context_id: &str,
@@ -1013,7 +1088,7 @@ impl ContextManager {
 
             // Standing check: verify proposer is in good governance
             // standing before allowing new proposals (#1530).
-            check_standing(ctx, proposer_did, self.clock.now_secs())?;
+            check_standing(ctx, proposer_did, self.clock.now_secs(), &*self.event_log)?;
 
             // SCP-272: Check and auto-resolve expired governance freezes (48-hour timeout).
             let freeze_events = self.check_and_resolve_expired_freezes(ctx);
@@ -1021,8 +1096,11 @@ impl ContextManager {
                 let cid_bytes = context_id_to_bytes(context_id);
                 for event in &freeze_events {
                     if let GovernanceEvent::ConflictResolved { .. } = event {
-                        self.event_log
-                            .append_context_event(&cid_bytes, "GovernanceFreezeExpired")?;
+                        self.event_log.append_context_event(
+                            &cid_bytes,
+                            "GovernanceFreezeExpired",
+                            proposer_did.as_ref(),
+                        )?;
                     }
                 }
             }
@@ -1079,12 +1157,14 @@ impl ContextManager {
                         self.event_log.append_context_event(
                             &context_id_bytes,
                             "GovernanceConflictDetected",
+                            proposer_did.as_ref(),
                         )?;
                     }
                     GovernanceEvent::ConflictResolved { .. } => {
                         self.event_log.append_context_event(
                             &context_id_bytes,
                             "GovernanceConflictResolved",
+                            proposer_did.as_ref(),
                         )?;
                     }
                     _ => {}
@@ -1208,12 +1288,14 @@ impl ContextManager {
                         self.event_log.append_context_event(
                             &context_id_bytes,
                             "GovernanceConflictDetected",
+                            voter_did.as_ref(),
                         )?;
                     }
                     GovernanceEvent::ConflictResolved { .. } => {
                         self.event_log.append_context_event(
                             &context_id_bytes,
                             "GovernanceConflictResolved",
+                            voter_did.as_ref(),
                         )?;
                     }
                     _ => {}
@@ -1489,8 +1571,11 @@ impl ContextManager {
 
         let context_id_bytes = context_id_to_bytes(context_id);
         for event in &events {
-            self.event_log
-                .append_context_event(&context_id_bytes, Self::governance_event_label(event))?;
+            self.event_log.append_context_event(
+                &context_id_bytes,
+                Self::governance_event_label(event),
+                voter_did.as_ref(),
+            )?;
         }
 
         // Persist context state after withdrawal.
@@ -1539,6 +1624,7 @@ impl ContextManager {
         context_id: &str,
         did: &DID,
         scope: RevocationScope,
+        actor_did: &str,
     ) -> Result<GovernanceBanResult, ContextError> {
         let context_id_bytes = context_id_to_bytes(context_id);
 
@@ -1633,7 +1719,7 @@ impl ContextManager {
         }
 
         self.event_log
-            .append_context_event(&context_id_bytes, "ReadAccessRevoked")?;
+            .append_context_event(&context_id_bytes, "ReadAccessRevoked", actor_did)?;
 
         Ok(result)
     }
@@ -1663,6 +1749,7 @@ impl ContextManager {
         &self,
         context_id: &str,
         did: &DID,
+        actor_did: &str,
     ) -> Result<(), ContextError> {
         let context_id_bytes = context_id_to_bytes(context_id);
 
@@ -1751,7 +1838,7 @@ impl ContextManager {
         }
 
         self.event_log
-            .append_context_event(&context_id_bytes, "ReadAccessRestored")?;
+            .append_context_event(&context_id_bytes, "ReadAccessRestored", actor_did)?;
 
         Ok(())
     }
@@ -1762,6 +1849,7 @@ impl ContextManager {
         did: &DID,
         role: &str,
         _proposal_id: ProposalId,
+        actor_did: &str,
     ) -> Result<(), ContextError> {
         let context_id_bytes = context_id_to_bytes(context_id);
 
@@ -1822,7 +1910,7 @@ impl ContextManager {
             self.persist_context_snapshot(context_id, snapshot);
         }
         self.event_log
-            .append_context_event(&context_id_bytes, "MemberJoined")?;
+            .append_context_event(&context_id_bytes, "MemberJoined", actor_did)?;
         Ok(())
     }
 
@@ -1831,6 +1919,7 @@ impl ContextManager {
         context_id: &str,
         did: &DID,
         _proposal_id: ProposalId,
+        actor_did: &str,
     ) -> Result<(), ContextError> {
         let context_id_bytes = context_id_to_bytes(context_id);
 
@@ -1853,18 +1942,16 @@ impl ContextManager {
             self.crypto
                 .remove_member_sender_key(&context_id_bytes, did.as_ref())?;
 
-            // TODO(#1595): Remaining members' sender keys should be rotated after
-            // member removal (spec §9.16). The ContextCryptoProvider trait does
-            // not currently have a `rotate_sender_key` method for the general
-            // case — only `generate_sender_key` (creation-time) and
-            // `rotate_sender_key_for_block` (blocking-specific). A general-purpose
-            // rotation method is needed on the trait to implement this.
-
             // Crypto: remove from MLS group under lock to prevent TOCTOU
             // race (concurrent remove of same DID).
             self.crypto
                 .remove_member(&context_id_bytes, did)
                 .map_err(|e| ContextError::MembershipFailed(e.to_string()))?;
+
+            // Rotate the local sender key so the removed member cannot
+            // decrypt future messages (§9.16.4). Generates a fresh key,
+            // increments the epoch, and HPKE-seals to remaining members.
+            self.crypto.rotate_sender_key(&context_id_bytes)?;
 
             ctx.membership.remove_member(did);
             ctx.role_state.members.remove(did.as_ref());
@@ -1885,11 +1972,37 @@ impl ContextManager {
             }
         };
 
+        // Drain pending sender key distribution messages queued by
+        // rotate_sender_key and deliver via transport (§9.16.2).
+        let pending = self
+            .crypto
+            .drain_pending_sender_key_messages(&context_id_bytes)?;
+        if !pending.is_empty() {
+            let routing_id = super::messaging::derive_routing_id(context_id);
+            for (target_did, message) in pending {
+                tracing::debug!(
+                    target_did = %target_did,
+                    context_id = %context_id,
+                    message_len = message.len(),
+                    "sending rotated sender key distribution after member removal"
+                );
+                if let Err(e) = self.transport.send_message(&routing_id, &message) {
+                    tracing::warn!(
+                        target_did = %target_did,
+                        context_id = %context_id,
+                        error = %e,
+                        "failed to send rotated sender key — \
+                         recipient must request key via SenderKeyRequest"
+                    );
+                }
+            }
+        }
+
         if let Some(snapshot) = snapshot {
             self.persist_context_snapshot(context_id, snapshot);
         }
         self.event_log
-            .append_context_event(&context_id_bytes, "MemberLeft")?;
+            .append_context_event(&context_id_bytes, "MemberLeft", actor_did)?;
         Ok(())
     }
 
@@ -1899,6 +2012,7 @@ impl ContextManager {
         did: &DID,
         new_role: &str,
         _proposal_id: ProposalId,
+        actor_did: &str,
     ) -> Result<(), ContextError> {
         let context_id_bytes = context_id_to_bytes(context_id);
 
@@ -1942,7 +2056,7 @@ impl ContextManager {
             self.persist_context_snapshot(context_id, snapshot);
         }
         self.event_log
-            .append_context_event(&context_id_bytes, "RoleAssigned")?;
+            .append_context_event(&context_id_bytes, "RoleAssigned", actor_did)?;
         Ok(())
     }
 
@@ -1954,6 +2068,7 @@ impl ContextManager {
         context_id: &str,
         registration: &ToolRegistration,
         _proposal_id: ProposalId,
+        actor_did: &str,
     ) -> Result<(), ContextError> {
         let context_id_bytes = context_id_to_bytes(context_id);
 
@@ -1988,7 +2103,7 @@ impl ContextManager {
             self.persist_context_snapshot(context_id, snapshot);
         }
         self.event_log
-            .append_context_event(&context_id_bytes, "ToolRegistered")?;
+            .append_context_event(&context_id_bytes, "ToolRegistered", actor_did)?;
         Ok(())
     }
 
@@ -1997,6 +2112,7 @@ impl ContextManager {
         context_id: &str,
         tool_id: &str,
         _proposal_id: ProposalId,
+        actor_did: &str,
     ) -> Result<(), ContextError> {
         let context_id_bytes = context_id_to_bytes(context_id);
 
@@ -2021,7 +2137,7 @@ impl ContextManager {
             self.persist_context_snapshot(context_id, snapshot);
         }
         self.event_log
-            .append_context_event(&context_id_bytes, "ToolRemoved")?;
+            .append_context_event(&context_id_bytes, "ToolRemoved", actor_did)?;
         Ok(())
     }
 
@@ -2030,6 +2146,7 @@ impl ContextManager {
         context_id: &str,
         new_ceiling: &[Capability],
         proposal_id: ProposalId,
+        actor_did: &str,
     ) -> Result<(), ContextError> {
         let context_id_bytes = context_id_to_bytes(context_id);
 
@@ -2087,8 +2204,11 @@ impl ContextManager {
         if let Some(snapshot) = snapshot {
             self.persist_context_snapshot(context_id, snapshot);
         }
-        self.event_log
-            .append_context_event(&context_id_bytes, "CeilingModificationPending")?;
+        self.event_log.append_context_event(
+            &context_id_bytes,
+            "CeilingModificationPending",
+            actor_did,
+        )?;
         Ok(())
     }
 
@@ -2141,7 +2261,7 @@ impl ContextManager {
                 self.persist_context_snapshot(context_id, snapshot);
             }
             self.event_log
-                .append_context_event(&context_id_bytes, "CeilingModified")?;
+                .append_context_event(&context_id_bytes, "CeilingModified", "")?;
         }
 
         Ok(applied)
@@ -2152,6 +2272,7 @@ impl ContextManager {
         context_id: &str,
         _reason: Option<&str>,
         _proposal_id: ProposalId,
+        actor_did: &str,
     ) -> Result<(), ContextError> {
         let context_id_bytes = context_id_to_bytes(context_id);
 
@@ -2198,7 +2319,7 @@ impl ContextManager {
             self.persist_context_snapshot(context_id, snapshot);
         }
         self.event_log
-            .append_context_event(&context_id_bytes, "ContextClosing")?;
+            .append_context_event(&context_id_bytes, "ContextClosing", actor_did)?;
         Ok(())
     }
 
@@ -2211,6 +2332,7 @@ impl ContextManager {
         additional_secs: u64,
         approvals: &[scp_protocol::context::governance::SignedVote],
         proposal_id: ProposalId,
+        actor_did: &str,
     ) -> Result<(), ContextError> {
         let context_id_bytes = context_id_to_bytes(context_id);
 
@@ -2239,8 +2361,11 @@ impl ContextManager {
                     "proposal_id": hex::encode(proposal_id),
                     "rejecting_members": rejecting_members,
                 });
-                self.event_log
-                    .append_context_event(&context_id_bytes, &rejected_payload.to_string())?;
+                self.event_log.append_context_event(
+                    &context_id_bytes,
+                    &rejected_payload.to_string(),
+                    actor_did,
+                )?;
                 return Err(ContextError::PermissionDenied(format!(
                     "TTL extension requires unanimous consent — {} of {} members have not approved",
                     missing.len(),
@@ -2304,8 +2429,11 @@ impl ContextManager {
             "proposal_id": hex::encode(proposal_id),
             "consenting_members": consenting_members,
         });
-        self.event_log
-            .append_context_event(&context_id_bytes, &extended_payload.to_string())?;
+        self.event_log.append_context_event(
+            &context_id_bytes,
+            &extended_payload.to_string(),
+            actor_did,
+        )?;
         Ok(())
     }
 
@@ -2314,6 +2442,7 @@ impl ContextManager {
         context_id: &str,
         new_admin: &DID,
         _proposal_id: ProposalId,
+        actor_did: &str,
     ) -> Result<(), ContextError> {
         let context_id_bytes = context_id_to_bytes(context_id);
 
@@ -2376,7 +2505,7 @@ impl ContextManager {
             self.persist_context_snapshot(context_id, snapshot);
         }
         self.event_log
-            .append_context_event(&context_id_bytes, "AdminTransferred")?;
+            .append_context_event(&context_id_bytes, "AdminTransferred", actor_did)?;
         Ok(())
     }
 
@@ -2387,6 +2516,7 @@ impl ContextManager {
         context_id: &str,
         _params: &ContextParams,
         _proposal_id: ProposalId,
+        actor_did: &str,
     ) -> Result<(), ContextError> {
         let context_id_bytes = context_id_to_bytes(context_id);
         // Validate parent context is active and ceiling allows child creation.
@@ -2412,7 +2542,7 @@ impl ContextManager {
         // caller with the parent_context_id field set. This method records
         // the governance event on the parent.
         self.event_log
-            .append_context_event(&context_id_bytes, "ChildContextCreated")?;
+            .append_context_event(&context_id_bytes, "ChildContextCreated", actor_did)?;
         Ok(())
     }
 
@@ -2421,6 +2551,7 @@ impl ContextManager {
         context_id: &str,
         new_policy: &PruningPolicy,
         _proposal_id: ProposalId,
+        actor_did: &str,
     ) -> Result<(), ContextError> {
         let context_id_bytes = context_id_to_bytes(context_id);
 
@@ -2483,8 +2614,11 @@ impl ContextManager {
         if let Some(snapshot) = snapshot {
             self.persist_context_snapshot(context_id, snapshot);
         }
-        self.event_log
-            .append_context_event(&context_id_bytes, "PruningPolicyModified")?;
+        self.event_log.append_context_event(
+            &context_id_bytes,
+            "PruningPolicyModified",
+            actor_did,
+        )?;
         Ok(())
     }
 
@@ -2495,6 +2629,7 @@ impl ContextManager {
         context_id: &str,
         did: &DID,
         _proposal_id: ProposalId,
+        actor_did: &str,
     ) -> Result<(), ContextError> {
         let context_id_bytes = context_id_to_bytes(context_id);
 
@@ -2559,7 +2694,7 @@ impl ContextManager {
             self.persist_context_snapshot(context_id, snapshot);
         }
         self.event_log
-            .append_context_event(&context_id_bytes, "SignerAdded")?;
+            .append_context_event(&context_id_bytes, "SignerAdded", actor_did)?;
         Ok(())
     }
 
@@ -2570,6 +2705,7 @@ impl ContextManager {
         context_id: &str,
         did: &DID,
         _proposal_id: ProposalId,
+        actor_did: &str,
     ) -> Result<(), ContextError> {
         let context_id_bytes = context_id_to_bytes(context_id);
 
@@ -2630,7 +2766,7 @@ impl ContextManager {
             self.persist_context_snapshot(context_id, snapshot);
         }
         self.event_log
-            .append_context_event(&context_id_bytes, "SignerRemoved")?;
+            .append_context_event(&context_id_bytes, "SignerRemoved", actor_did)?;
         Ok(())
     }
 
@@ -2639,6 +2775,7 @@ impl ContextManager {
         context_id: &str,
         new_threshold: u32,
         _proposal_id: ProposalId,
+        actor_did: &str,
     ) -> Result<(), ContextError> {
         let context_id_bytes = context_id_to_bytes(context_id);
 
@@ -2668,7 +2805,7 @@ impl ContextManager {
             self.persist_context_snapshot(context_id, snapshot);
         }
         self.event_log
-            .append_context_event(&context_id_bytes, "ThresholdModified")?;
+            .append_context_event(&context_id_bytes, "ThresholdModified", actor_did)?;
         Ok(())
     }
 
@@ -2680,6 +2817,7 @@ impl ContextManager {
         context_id: &str,
         interface: &ToolInterface,
         _proposal_id: ProposalId,
+        actor_did: &str,
     ) -> Result<(), ContextError> {
         let context_id_bytes = context_id_to_bytes(context_id);
 
@@ -2713,8 +2851,11 @@ impl ContextManager {
         if let Some(snapshot) = snapshot {
             self.persist_context_snapshot(context_id, snapshot);
         }
-        self.event_log
-            .append_context_event(&context_id_bytes, "ToolInterfaceEstablished")?;
+        self.event_log.append_context_event(
+            &context_id_bytes,
+            "ToolInterfaceEstablished",
+            actor_did,
+        )?;
         Ok(())
     }
 
@@ -2724,6 +2865,7 @@ impl ContextManager {
         did: &DID,
         _reason: &str,
         _proposal_id: ProposalId,
+        actor_did: &str,
     ) -> Result<(), ContextError> {
         let context_id_bytes = context_id_to_bytes(context_id);
         {
@@ -2747,7 +2889,7 @@ impl ContextManager {
             .add_member(&context_id_bytes, did, None)
             .map_err(|e| ContextError::MembershipFailed(e.to_string()))?;
         self.event_log
-            .append_context_event(&context_id_bytes, "MemberReset")?;
+            .append_context_event(&context_id_bytes, "MemberReset", actor_did)?;
 
         // Track the epoch reset so the governance timeout task can invalidate
         // this member's votes on pending proposals (ADR-031 §5, ADR-029 Tier 3).
@@ -2768,6 +2910,7 @@ impl ContextManager {
         proposal_b: &ProposalId,
         resolution: &scp_protocol::context::governance::ConflictResolution,
         _proposal_id: ProposalId,
+        actor_did: &str,
     ) -> Result<(), ContextError> {
         let context_id_bytes = context_id_to_bytes(context_id);
 
@@ -2877,8 +3020,11 @@ impl ContextManager {
         if let Some(snapshot) = snapshot {
             self.persist_context_snapshot(context_id, snapshot);
         }
-        self.event_log
-            .append_context_event(&context_id_bytes, "GovernanceConflictResolved")?;
+        self.event_log.append_context_event(
+            &context_id_bytes,
+            "GovernanceConflictResolved",
+            actor_did,
+        )?;
         Ok(())
     }
 
@@ -2897,6 +3043,7 @@ impl ContextManager {
         context_id: &str,
         approvals: &[scp_protocol::context::governance::SignedVote],
         _proposal_id: ProposalId,
+        actor_did: &str,
     ) -> Result<(), ContextError> {
         let context_id_bytes = context_id_to_bytes(context_id);
 
@@ -2952,7 +3099,7 @@ impl ContextManager {
             self.persist_context_snapshot(context_id, snapshot);
         }
         self.event_log
-            .append_context_event(&context_id_bytes, "ContextPromoted")?;
+            .append_context_event(&context_id_bytes, "ContextPromoted", actor_did)?;
         Ok(())
     }
 
@@ -2973,6 +3120,7 @@ impl ContextManager {
         did: &DID,
         scope: RevocationScope,
         _proposal_id: ProposalId,
+        actor_did: &str,
     ) -> Result<(), ContextError> {
         let context_id_bytes = context_id_to_bytes(context_id);
 
@@ -3050,7 +3198,7 @@ impl ContextManager {
             self.persist_broadcast_snapshot(context_id, bc_snap);
         }
         self.event_log
-            .append_context_event(&context_id_bytes, "WriteAccessRevoked")?;
+            .append_context_event(&context_id_bytes, "WriteAccessRevoked", actor_did)?;
         Ok(())
     }
 
@@ -3069,6 +3217,7 @@ impl ContextManager {
         context_id: &str,
         did: &DID,
         _proposal_id: ProposalId,
+        actor_did: &str,
     ) -> Result<(), ContextError> {
         let context_id_bytes = context_id_to_bytes(context_id);
 
@@ -3116,7 +3265,7 @@ impl ContextManager {
             self.persist_context_snapshot(context_id, snapshot);
         }
         self.event_log
-            .append_context_event(&context_id_bytes, "WriteAccessRestored")?;
+            .append_context_event(&context_id_bytes, "WriteAccessRestored", actor_did)?;
         Ok(())
     }
 
@@ -3133,6 +3282,7 @@ impl ContextManager {
         context_id: &str,
         reason: Option<&str>,
         _proposal_id: ProposalId,
+        actor_did: &str,
     ) -> Result<(), ContextError> {
         let context_id_bytes = context_id_to_bytes(context_id);
 
@@ -3204,7 +3354,7 @@ impl ContextManager {
         }
 
         self.event_log
-            .append_context_event(&context_id_bytes, "ContentKeysRotated")?;
+            .append_context_event(&context_id_bytes, "ContentKeysRotated", actor_did)?;
         Ok(())
     }
 
@@ -3214,6 +3364,7 @@ impl ContextManager {
         changes: &[scp_protocol::context::governance::GovernanceReconfigAction],
         justification: &scp_protocol::context::governance::DeadlockJustification,
         _proposal_id: ProposalId,
+        actor_did: &str,
     ) -> Result<(), ContextError> {
         if changes.is_empty() {
             return Err(ContextError::PermissionDenied(
@@ -3299,8 +3450,11 @@ impl ContextManager {
         if let Some(snapshot) = snapshot {
             self.persist_context_snapshot(context_id, snapshot);
         }
-        self.event_log
-            .append_context_event(&context_id_bytes, "GovernanceReconfigured")?;
+        self.event_log.append_context_event(
+            &context_id_bytes,
+            "GovernanceReconfigured",
+            actor_did,
+        )?;
         Ok(())
     }
 
@@ -3326,6 +3480,7 @@ impl ContextManager {
         context_id: &str,
         policy: &EconomicPolicy,
         proposal_id: ProposalId,
+        actor_did: &str,
     ) -> Result<(), ContextError> {
         let context_id_bytes = context_id_to_bytes(context_id);
 
@@ -3380,8 +3535,11 @@ impl ContextManager {
         if let Some(snapshot) = snapshot {
             self.persist_context_snapshot(context_id, snapshot);
         }
-        self.event_log
-            .append_context_event(&context_id_bytes, "EconomicPolicyChanged")?;
+        self.event_log.append_context_event(
+            &context_id_bytes,
+            "EconomicPolicyChanged",
+            actor_did,
+        )?;
         Ok(())
     }
 
@@ -3431,7 +3589,7 @@ impl ContextManager {
                 self.persist_context_snapshot(context_id, snapshot);
             }
             self.event_log
-                .append_context_event(&context_id_bytes, "EconomicPolicyApplied")?;
+                .append_context_event(&context_id_bytes, "EconomicPolicyApplied", "")?;
         }
 
         Ok(applied)
@@ -3456,6 +3614,7 @@ impl ContextManager {
         amount: scp_protocol::economy::types::Amount,
         purpose: &str,
         _proposal_id: ProposalId,
+        actor_did: &str,
     ) -> Result<(), ContextError> {
         let context_id_bytes = context_id_to_bytes(context_id);
 
@@ -3491,7 +3650,7 @@ impl ContextManager {
             "purpose": purpose,
         });
         self.event_log
-            .append_context_event(&context_id_bytes, &payload.to_string())?;
+            .append_context_event(&context_id_bytes, &payload.to_string(), actor_did)?;
         Ok(())
     }
 
@@ -3507,6 +3666,7 @@ impl ContextManager {
         &self,
         context_id: &str,
         _proposal_id: ProposalId,
+        actor_did: &str,
     ) -> Result<(), ContextError> {
         let context_id_bytes = context_id_to_bytes(context_id);
 
@@ -3543,8 +3703,11 @@ impl ContextManager {
         if let Some(snapshot) = snapshot {
             self.persist_context_snapshot(context_id, snapshot);
         }
-        self.event_log
-            .append_context_event(&context_id_bytes, "EconomicPolicyLocked")?;
+        self.event_log.append_context_event(
+            &context_id_bytes,
+            "EconomicPolicyLocked",
+            actor_did,
+        )?;
         Ok(())
     }
 
@@ -3559,6 +3722,7 @@ impl ContextManager {
     /// - [`ContextError::ContextNotRegistered`] if the context is not registered.
     /// - [`ContextError::ContextNotActive`] if the context is not active.
     /// - [`ContextError::InvalidTransition`] if the state transition fails.
+    #[allow(clippy::too_many_arguments)]
     async fn execute_propose_context_migration(
         &self,
         context_id: &str,
@@ -3567,6 +3731,7 @@ impl ContextManager {
         grace_period_secs: u64,
         auto_invite: bool,
         proposal_id: ProposalId,
+        actor_did: &str,
     ) -> Result<MigrationProposedResult, ContextError> {
         let context_id_bytes = context_id_to_bytes(context_id);
 
@@ -3694,8 +3859,11 @@ impl ContextManager {
         if let Some(snapshot) = snapshot {
             self.persist_context_snapshot(context_id, snapshot);
         }
-        self.event_log
-            .append_context_event(&context_id_bytes, "ContextMigrationStarted")?;
+        self.event_log.append_context_event(
+            &context_id_bytes,
+            "ContextMigrationStarted",
+            actor_did,
+        )?;
 
         Ok(MigrationProposedResult {
             destination_context_id,
@@ -3717,6 +3885,7 @@ impl ContextManager {
         &self,
         context_id: &str,
         _proposal_id: ProposalId,
+        actor_did: &str,
     ) -> Result<(), ContextError> {
         let context_id_bytes = context_id_to_bytes(context_id);
 
@@ -3779,6 +3948,7 @@ impl ContextManager {
                 "ContextMigrationCancelled:{}",
                 hex::encode(original_proposal_id)
             ),
+            actor_did,
         )?;
         Ok(())
     }
@@ -3879,6 +4049,7 @@ impl ContextManager {
                 destination_id,
                 hex::encode(migration_pid)
             ),
+            "",
         )?;
         Ok(())
     }

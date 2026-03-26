@@ -202,7 +202,7 @@ impl ContextEventLogProvider for MockEventLog {
     fn init_event_log(&self, _id: &[u8; 32]) -> Result<(), ContextCreationError> {
         Ok(())
     }
-    fn append_event(&self, id: &[u8; 32], event: &str) -> Result<(), ContextCreationError> {
+    fn append_event(&self, id: &[u8; 32], event: &str, _actor_did: &str) -> Result<(), ContextCreationError> {
         self.events.lock().unwrap().push((*id, event.to_owned()));
         Ok(())
     }
@@ -438,7 +438,7 @@ async fn e2e_message_round_trip_encrypted() {
         owner_did: bob_did.clone(),
         mls_key_package_bytes: None,
     };
-    manager.join_context(&handle, kp).await.unwrap();
+    manager.join_context(&handle, kp, None).await.unwrap();
 
     // Verify MLS group membership.
     assert_eq!(manager.member_count(ctx_id).await, Some(2));
@@ -449,7 +449,7 @@ async fn e2e_message_round_trip_encrypted() {
     let original_msg = b"Hello Bob, this is a secret message from Alice!";
     let alice_sk = signing_key_for(&alice_did);
     manager
-        .send_message(&handle, &alice_did, original_msg, Some(&alice_sk), None)
+        .send_message(&handle, &alice_did, original_msg, Some(&alice_sk), None, None)
         .await
         .unwrap();
 
@@ -499,7 +499,7 @@ async fn e2e_governance_role_change_and_unauthorized_rejection() {
         owner_did: member_did.clone(),
         mls_key_package_bytes: None,
     };
-    manager.join_context(&handle, kp).await.unwrap();
+    manager.join_context(&handle, kp, None).await.unwrap();
     assert_eq!(manager.member_count(ctx_id).await, Some(2));
 
     // Verify initial role is "member".
@@ -722,13 +722,13 @@ async fn e2e_persistence_drop_and_restore() {
             owner_did: member_did.clone(),
             mls_key_package_bytes: None,
         };
-        manager.join_context(&handle, kp).await.unwrap();
+        manager.join_context(&handle, kp, None).await.unwrap();
         assert_eq!(manager.member_count(ctx_id).await, Some(2));
 
         // Send a message to advance sequence numbers.
         let admin_sk = signing_key_for(&admin_did);
         manager
-            .send_message(&handle, &admin_did, b"pre-restart message", Some(&admin_sk), None)
+            .send_message(&handle, &admin_did, b"pre-restart message", Some(&admin_sk), None, None)
             .await
             .unwrap();
     }
@@ -969,7 +969,7 @@ async fn e2e_governance_replay_protection() {
         owner_did: member_did.clone(),
         mls_key_package_bytes: None,
     };
-    manager.join_context(&handle, kp).await.unwrap();
+    manager.join_context(&handle, kp, None).await.unwrap();
 
     // Execute first governance action.
     let action1 = GovernanceAction::ChangeRole {
@@ -1041,13 +1041,13 @@ async fn e2e_full_lifecycle_create_join_send_leave_close() {
         owner_did: member_did.clone(),
         mls_key_package_bytes: None,
     };
-    manager.join_context(&handle, kp).await.unwrap();
+    manager.join_context(&handle, kp, None).await.unwrap();
     assert_eq!(manager.member_count(ctx_id).await, Some(2));
 
     // Send message.
     let admin_sk = signing_key_for(&admin_did);
     manager
-        .send_message(&handle, &admin_did, b"lifecycle test message", Some(&admin_sk), None)
+        .send_message(&handle, &admin_did, b"lifecycle test message", Some(&admin_sk), None, None)
         .await
         .unwrap();
 
@@ -1148,7 +1148,7 @@ async fn e2e_multi_bridge_api_surface_verification() {
     // send_message
     let alice_sk = signing_key_for(&alice);
     manager
-        .send_message(&enc_handle, &alice, b"bridge test", Some(&alice_sk), None)
+        .send_message(&enc_handle, &alice, b"bridge test", Some(&alice_sk), None, None)
         .await
         .unwrap();
 

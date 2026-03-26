@@ -1020,6 +1020,7 @@ impl scp_core::context::builder::ContextEventLogProvider for DemoEventLog {
         &self,
         _: &[u8; 32],
         event: &str,
+        _actor_did: &str,
     ) -> Result<(), scp_core::context::builder::ContextCreationError> {
         self.events.lock().unwrap().push(event.to_owned());
         Ok(())
@@ -1142,14 +1143,17 @@ async fn application_layer_demo() {
         owner_did: bob.clone(),
         mls_key_package_bytes: None,
     };
-    manager.join_context(&handle, bob_kp).await.unwrap();
+    manager.join_context(&handle, bob_kp, None).await.unwrap();
     println!("  Bob joined context");
 
     let charlie_kp = KeyPackage {
         owner_did: charlie.clone(),
         mls_key_package_bytes: None,
     };
-    manager.join_context(&handle, charlie_kp).await.unwrap();
+    manager
+        .join_context(&handle, charlie_kp, None)
+        .await
+        .unwrap();
     println!("  Charlie joined context");
 
     let count = manager.member_count(ctx_id).await.unwrap();
@@ -1177,21 +1181,21 @@ async fn application_layer_demo() {
 
     let alice_sk = demo_signing_key(&alice);
     manager
-        .send_message(&handle, &alice, msg1, Some(&alice_sk), None)
+        .send_message(&handle, &alice, msg1, Some(&alice_sk), None, None)
         .await
         .unwrap();
     println!("  Alice sent:   \"{}\"", String::from_utf8_lossy(msg1));
 
     let bob_sk = demo_signing_key(&bob);
     manager
-        .send_message(&handle, &bob, msg2, Some(&bob_sk), None)
+        .send_message(&handle, &bob, msg2, Some(&bob_sk), None, None)
         .await
         .unwrap();
     println!("  Bob sent:     \"{}\"", String::from_utf8_lossy(msg2));
 
     let charlie_sk = demo_signing_key(&charlie);
     manager
-        .send_message(&handle, &charlie, msg3, Some(&charlie_sk), None)
+        .send_message(&handle, &charlie, msg3, Some(&charlie_sk), None, None)
         .await
         .unwrap();
     println!("  Charlie sent: \"{}\"", String::from_utf8_lossy(msg3));

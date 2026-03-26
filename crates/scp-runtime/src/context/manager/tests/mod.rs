@@ -76,6 +76,7 @@ pub(super) struct MockCrypto {
     pub(super) fail_validate_key_package: AtomicBool,
     pub(super) fail_advance_epoch: AtomicBool,
     pub(super) fail_remove_member_sender_key: AtomicBool,
+    pub(super) fail_rotate_sender_key: AtomicBool,
     pub(super) mls_created: std::sync::Mutex<Vec<[u8; 32]>>,
     pub(super) sender_keys_created: std::sync::Mutex<Vec<[u8; 32]>>,
     pub(super) broadcast_created: std::sync::Mutex<Vec<[u8; 32]>>,
@@ -85,6 +86,7 @@ pub(super) struct MockCrypto {
     pub(super) members_removed: std::sync::Mutex<Vec<String>>,
     pub(super) sender_keys_distributed: std::sync::Mutex<Vec<String>>,
     pub(super) sender_keys_removed: std::sync::Mutex<Vec<String>>,
+    pub(super) sender_keys_rotated: std::sync::Mutex<Vec<[u8; 32]>>,
     pub(super) messages_encrypted: std::sync::Mutex<Vec<Vec<u8>>>,
     pub(super) epochs_advanced: std::sync::Mutex<Vec<[u8; 32]>>,
     /// Shared handle for test code to observe `advance_epoch` calls after
@@ -196,6 +198,20 @@ impl ContextCryptoProvider for MockCrypto {
             .lock()
             .unwrap()
             .push(("remove_member_sender_key".to_owned(), member_did.to_owned()));
+        Ok(())
+    }
+
+    fn rotate_sender_key(&self, context_id: &[u8; 32]) -> Result<(), ContextError> {
+        if self.fail_rotate_sender_key.load(Ordering::Relaxed) {
+            return Err(ContextError::CryptoFailed(
+                "mock rotate_sender_key failure".into(),
+            ));
+        }
+        self.sender_keys_rotated.lock().unwrap().push(*context_id);
+        self.call_order
+            .lock()
+            .unwrap()
+            .push(("rotate_sender_key".to_owned(), hex::encode(context_id)));
         Ok(())
     }
 
@@ -334,7 +350,12 @@ impl ContextEventLogProvider for MockEventLog {
         Ok(())
     }
 
-    fn append_event(&self, id: &[u8; 32], event: &str) -> Result<(), ContextCreationError> {
+    fn append_event(
+        &self,
+        id: &[u8; 32],
+        event: &str,
+        _actor_did: &str,
+    ) -> Result<(), ContextCreationError> {
         self.events.lock().unwrap().push((*id, event.to_owned()));
         Ok(())
     }

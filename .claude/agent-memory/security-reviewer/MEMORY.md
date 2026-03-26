@@ -133,11 +133,14 @@
 - GOOD: Exhaustive match arms in governance dispatch (no wildcards)
 - GOOD: Unanimity check via set-difference pattern in ExtendTtl and PromoteContext
 
-### Wiring Batch 2 Governance (2026-03-25)
-- HIGH x2: evaluate_consequence_rules called with empty events slice (always no-op for threshold>=1); triggered consequences only logged, never enforced (CapabilitySuspension/AccessRevocation/RoleDemotion ignored)
-- MEDIUM x3: enforce_economic_policy hardcodes PaidActionType::ToolInvoke for all proposals; standing context ID 64-bit collision resistance (hash[..8]); standing_contexts HashMap unbounded
-- MEDIUM: remove_member_sender_key after remove_member -- partial cleanup on failure
-- GOOD: check_standing + enforce_economic_policy cover all proposal entry points; lock ordering consistent; advance_epoch fail-closed; consequence_rules stripped from public export; StandingContextManager fold-in uses full create_context path
+### Wiring Batch 2 Governance (2026-03-25, updated)
+- HIGH x4: double budget charge on send/join (enforce_*_economy + execute_paid_action both record_spend); budget not rolled back on payment failure; CapabilitySuspension substring matching (contains("write")) misses non-read/write caps; event_log_entries_for_consequences sets all timestamps to now (defeats time windowing)
+- HIGH: record_spend result silently discarded in execute_paid_action (let _ =)
+- MEDIUM x5: standing context ID 64-bit collision (hash[..8]); NoOpPaymentAdapter pub without feature gate; check_standing silently passes on compute_participation_record Err; enforce_role_demotion ignores return value (success always true); participation_cache/cooldown_until unbounded
+- MEDIUM x2: tool invoke uses zero metrics for cost eval (arbitrage risk); standing_contexts HashMap unbounded
+- MEDIUM: lock ordering fragile in standing_context (standing_contexts + contexts simultaneous)
+- FIXED from prior review: consequences now enforced (not just logged); sender key removed BEFORE MLS removal; advance_epoch wired for RotateContentKeys
+- GOOD: fail-closed economy defaults; lock-drop-async pattern; auto_accept guard; cooldown prevents consequence spam; consequence_rules stripped from public export
 
 ### Wiring Batch 1 Messaging (2026-03-24, updated)
 - See `wiring-batch1-messaging-findings.md` for full details (15 files, line-by-line review)

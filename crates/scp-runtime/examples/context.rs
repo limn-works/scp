@@ -71,7 +71,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // 5. Send a message (mock transport captures it).
     let alice_sk = support::signing_key_for(&alice);
     manager
-        .send_message(&handle, &alice, b"Hello, context!", Some(&alice_sk), None)
+        .send_message(
+            &handle,
+            &alice,
+            b"Hello, context!",
+            Some(&alice_sk),
+            None,
+            None,
+        )
         .await?;
     println!("  Message sent successfully.");
 

@@ -401,6 +401,7 @@ impl ContextEventLogProvider for NoOpEventLogProvider {
         &self,
         _context_id: &[u8; 32],
         _event: &str,
+        _actor_did: &str,
     ) -> Result<(), ContextCreationError> {
         Ok(())
     }

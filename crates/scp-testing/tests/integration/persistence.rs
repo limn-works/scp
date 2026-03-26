@@ -1118,6 +1118,7 @@ mod mock_providers {
             &self,
             _ctx_id: &[u8; 32],
             _event: &str,
+            _actor_did: &str,
         ) -> Result<(), ContextCreationError> {
             Ok(())
         }

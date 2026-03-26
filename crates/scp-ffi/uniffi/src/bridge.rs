@@ -2912,7 +2912,7 @@ pub async fn context_join(
             };
 
             manager
-                .join_context(&core_handle, key_package)
+                .join_context(&core_handle, key_package, None)
                 .await
                 .map_err(ScpError::from)?;
 
@@ -3230,6 +3230,7 @@ pub async fn context_send(
                     &sender_did,
                     &payload,
                     resolved_signing_key.as_ref(),
+                    None,
                     None,
                 )
                 .await

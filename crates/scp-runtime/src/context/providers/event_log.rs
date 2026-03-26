@@ -48,11 +48,17 @@ use scp_protocol::context::builder::ContextCreationError;
 pub struct EventLogEntry {
     /// The event name (e.g., `"ContextCreated"`, `"MemberJoined"`).
     pub event: String,
+    /// The DID of the actor who produced this event (the sender for messages,
+    /// the proposer for governance, the joiner for membership events).
+    ///
+    /// Added as part of #1594 to enable full-history consequence evaluation.
+    /// Empty string for legacy entries that predate this field.
+    pub actor_did: String,
     /// Seconds since UNIX epoch when the event was appended.
     pub timestamp: u64,
     /// SHA-256 hash of the previous entry (all zeros for the first entry).
     pub prev_hash: [u8; 32],
-    /// SHA-256 hash of this entry (computed over event + timestamp + `prev_hash`).
+    /// SHA-256 hash of this entry (computed over event + `actor_did` + timestamp + `prev_hash`).
     pub hash: [u8; 32],
 }
 
@@ -65,7 +71,7 @@ struct ContextLog {
 
 impl ContextLog {
     /// Appends a new event to the log, chaining it to the previous entry.
-    fn append(&mut self, event: &str) -> EventLogEntry {
+    fn append(&mut self, event: &str, actor_did: &str) -> EventLogEntry {
         let timestamp = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
@@ -73,10 +79,11 @@ impl ContextLog {
 
         let prev_hash = self.entries.last().map_or([0u8; 32], |e| e.hash);
 
-        let hash = compute_entry_hash(event, timestamp, &prev_hash);
+        let hash = compute_entry_hash(event, actor_did, timestamp, &prev_hash);
 
         let entry = EventLogEntry {
             event: event.to_owned(),
+            actor_did: actor_did.to_owned(),
             timestamp,
             prev_hash,
             hash,
@@ -89,11 +96,34 @@ impl ContextLog {
 
 /// Computes the SHA-256 hash for an event log entry.
 ///
-/// Hash input: `"SCP-EXPORT-ENTRY-V1:" || event_bytes || timestamp_be_bytes || prev_hash`
+/// Hash input: `"SCP-EXPORT-ENTRY-V2:" || event_bytes || actor_did_bytes || timestamp_be_bytes || prev_hash`
 ///
 /// Uses big-endian for the timestamp to match codebase convention, and a
 /// domain separator to prevent cross-protocol hash confusion.
-fn compute_entry_hash(event: &str, timestamp: u64, prev_hash: &[u8; 32]) -> [u8; 32] {
+///
+/// V2 includes `actor_did` in the hash (#1594). V1 entries (without
+/// `actor_did`) use [`compute_entry_hash_v1`] for verification of legacy logs.
+fn compute_entry_hash(
+    event: &str,
+    actor_did: &str,
+    timestamp: u64,
+    prev_hash: &[u8; 32],
+) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    hasher.update(b"SCP-EXPORT-ENTRY-V2:");
+    hasher.update(event.as_bytes());
+    hasher.update(actor_did.as_bytes());
+    hasher.update(timestamp.to_be_bytes());
+    hasher.update(prev_hash);
+    let result = hasher.finalize();
+    let mut hash = [0u8; 32];
+    hash.copy_from_slice(&result);
+    hash
+}
+
+/// V1 hash computation for verifying legacy event log entries that do not
+/// include `actor_did`. Used by [`verify_chain_integrity`] as a fallback.
+fn compute_entry_hash_v1(event: &str, timestamp: u64, prev_hash: &[u8; 32]) -> [u8; 32] {
     let mut hasher = Sha256::new();
     hasher.update(b"SCP-EXPORT-ENTRY-V1:");
     hasher.update(event.as_bytes());
@@ -356,9 +386,19 @@ impl MerkleEventLogProvider {
                 return false;
             }
 
-            // Check self-hash correctness.
-            let expected_hash = compute_entry_hash(&entry.event, entry.timestamp, &entry.prev_hash);
-            if !bool::from(entry.hash.ct_eq(&expected_hash)) {
+            // Check self-hash correctness. Try V2 (with actor_did) first,
+            // fall back to V1 for legacy entries.
+            let expected_v2 = compute_entry_hash(
+                &entry.event,
+                &entry.actor_did,
+                entry.timestamp,
+                &entry.prev_hash,
+            );
+            let expected_v1 =
+                compute_entry_hash_v1(&entry.event, entry.timestamp, &entry.prev_hash);
+            if !bool::from(entry.hash.ct_eq(&expected_v2))
+                && !bool::from(entry.hash.ct_eq(&expected_v1))
+            {
                 return false;
             }
         }
@@ -663,7 +703,12 @@ impl ContextEventLogProvider for MerkleEventLogProvider {
         Ok(())
     }
 
-    fn append_event(&self, context_id: &[u8; 32], event: &str) -> Result<(), ContextCreationError> {
+    fn append_event(
+        &self,
+        context_id: &[u8; 32],
+        event: &str,
+        actor_did: &str,
+    ) -> Result<(), ContextCreationError> {
         let mut logs = self
             .logs
             .lock()
@@ -674,7 +719,7 @@ impl ContextEventLogProvider for MerkleEventLogProvider {
                 hex::encode(context_id)
             ))
         })?;
-        let entry = log.append(event);
+        let entry = log.append(event, actor_did);
         let seq = log.entries.len() - 1;
 
         // O(1) persist: only the newly appended entry (#710).
@@ -769,8 +814,18 @@ fn verify_chain_integrity(entries: &[EventLogEntry]) -> Result<(), ContextCreati
                 "Merkle chain broken at entry {i}: prev_hash mismatch"
             )));
         }
-        let expected_hash = compute_entry_hash(&entry.event, entry.timestamp, &entry.prev_hash);
-        if !bool::from(entry.hash.ct_eq(&expected_hash)) {
+        // Try V2 hash first (includes actor_did), fall back to V1 for
+        // legacy entries that predate the actor_did field.
+        let expected_v2 = compute_entry_hash(
+            &entry.event,
+            &entry.actor_did,
+            entry.timestamp,
+            &entry.prev_hash,
+        );
+        let expected_v1 = compute_entry_hash_v1(&entry.event, entry.timestamp, &entry.prev_hash);
+        if !bool::from(entry.hash.ct_eq(&expected_v2))
+            && !bool::from(entry.hash.ct_eq(&expected_v1))
+        {
             return Err(ContextCreationError::EventLogFailed(format!(
                 "Merkle chain broken at entry {i}: hash mismatch"
             )));
@@ -810,8 +865,10 @@ mod tests {
         let ctx_id = [2u8; 32];
 
         provider.init_event_log(&ctx_id).unwrap();
-        provider.append_event(&ctx_id, "ContextCreated").unwrap();
-        provider.append_event(&ctx_id, "MemberJoined").unwrap();
+        provider
+            .append_event(&ctx_id, "ContextCreated", "")
+            .unwrap();
+        provider.append_event(&ctx_id, "MemberJoined", "").unwrap();
 
         let entries = provider.entries(&ctx_id).unwrap();
         assert_eq!(entries.len(), 2);
@@ -833,7 +890,7 @@ mod tests {
         let provider = MerkleEventLogProvider::new();
         let ctx_id = [3u8; 32];
 
-        let result = provider.append_event(&ctx_id, "SomeEvent");
+        let result = provider.append_event(&ctx_id, "SomeEvent", "");
         assert!(result.is_err());
     }
 
@@ -843,7 +900,9 @@ mod tests {
         let ctx_id = [4u8; 32];
 
         provider.init_event_log(&ctx_id).unwrap();
-        provider.append_event(&ctx_id, "ContextCreated").unwrap();
+        provider
+            .append_event(&ctx_id, "ContextCreated", "")
+            .unwrap();
 
         provider.destroy_event_log(&ctx_id).unwrap();
 
@@ -856,9 +915,9 @@ mod tests {
         let ctx_id = [5u8; 32];
 
         provider.init_event_log(&ctx_id).unwrap();
-        provider.append_event(&ctx_id, "Event1").unwrap();
-        provider.append_event(&ctx_id, "Event2").unwrap();
-        provider.append_event(&ctx_id, "Event3").unwrap();
+        provider.append_event(&ctx_id, "Event1", "").unwrap();
+        provider.append_event(&ctx_id, "Event2", "").unwrap();
+        provider.append_event(&ctx_id, "Event3", "").unwrap();
 
         assert!(provider.verify_chain(&ctx_id));
 
@@ -888,13 +947,17 @@ mod tests {
 
     #[test]
     fn entry_hashes_are_deterministic() {
-        let hash1 = compute_entry_hash("test", 1000, &[0u8; 32]);
-        let hash2 = compute_entry_hash("test", 1000, &[0u8; 32]);
+        let hash1 = compute_entry_hash("test", "did:key:z123", 1000, &[0u8; 32]);
+        let hash2 = compute_entry_hash("test", "did:key:z123", 1000, &[0u8; 32]);
         assert_eq!(hash1, hash2);
 
         // Different input produces different hash.
-        let hash3 = compute_entry_hash("other", 1000, &[0u8; 32]);
+        let hash3 = compute_entry_hash("other", "did:key:z123", 1000, &[0u8; 32]);
         assert_ne!(hash1, hash3);
+
+        // Different actor_did produces different hash.
+        let hash4 = compute_entry_hash("test", "did:key:z456", 1000, &[0u8; 32]);
+        assert_ne!(hash1, hash4);
     }
 
     #[test]
@@ -905,7 +968,7 @@ mod tests {
         provider.init_event_log(&ctx_id).unwrap();
         // append_context_event is the default trait method that delegates to append_event.
         provider
-            .append_context_event(&ctx_id, "MemberLeft")
+            .append_context_event(&ctx_id, "MemberLeft", "")
             .unwrap();
 
         let entries = provider.entries(&ctx_id).unwrap();
@@ -944,6 +1007,7 @@ mod tests {
                     seq + 1,
                     EventLogEntry {
                         event: String::new(),
+                        actor_did: String::new(),
                         timestamp: 0,
                         prev_hash: [0u8; 32],
                         hash: [0u8; 32],
@@ -990,8 +1054,10 @@ mod tests {
         let ctx_hex = hex::encode(ctx_id);
 
         provider.init_event_log(&ctx_id).unwrap();
-        provider.append_event(&ctx_id, "ContextCreated").unwrap();
-        provider.append_event(&ctx_id, "MemberJoined").unwrap();
+        provider
+            .append_event(&ctx_id, "ContextCreated", "")
+            .unwrap();
+        provider.append_event(&ctx_id, "MemberJoined", "").unwrap();
 
         // Entries should be persisted.
         let persisted = persistence.load_entries(&ctx_hex).unwrap().unwrap();
@@ -1010,9 +1076,11 @@ mod tests {
         {
             let provider = MerkleEventLogProvider::with_persistence(persistence.clone());
             provider.init_event_log(&ctx_id).unwrap();
-            provider.append_event(&ctx_id, "ContextCreated").unwrap();
-            provider.append_event(&ctx_id, "MemberJoined").unwrap();
-            provider.append_event(&ctx_id, "MessageSent").unwrap();
+            provider
+                .append_event(&ctx_id, "ContextCreated", "")
+                .unwrap();
+            provider.append_event(&ctx_id, "MemberJoined", "").unwrap();
+            provider.append_event(&ctx_id, "MessageSent", "").unwrap();
 
             // Verify persisted.
             assert_eq!(
@@ -1036,7 +1104,7 @@ mod tests {
             assert!(provider.verify_chain(&ctx_id));
 
             // Appending after restore should chain correctly.
-            provider.append_event(&ctx_id, "MemberLeft").unwrap();
+            provider.append_event(&ctx_id, "MemberLeft", "").unwrap();
             let entries = provider.entries(&ctx_id).unwrap();
             assert_eq!(entries.len(), 4);
             assert_eq!(entries[3].prev_hash, entries[2].hash);
@@ -1063,7 +1131,9 @@ mod tests {
         let ctx_hex = hex::encode(ctx_id);
 
         provider.init_event_log(&ctx_id).unwrap();
-        provider.append_event(&ctx_id, "ContextCreated").unwrap();
+        provider
+            .append_event(&ctx_id, "ContextCreated", "")
+            .unwrap();
 
         assert!(persistence.load_entries(&ctx_hex).unwrap().is_some());
 
@@ -1084,7 +1154,7 @@ mod tests {
         provider.init_event_log(&ctx_id).unwrap();
         for i in 0..10 {
             provider
-                .append_event(&ctx_id, &format!("Event{i}"))
+                .append_event(&ctx_id, &format!("Event{i}"), "")
                 .unwrap();
         }
 
@@ -1110,8 +1180,8 @@ mod tests {
         let ctx_id = [15u8; 32];
 
         provider.init_event_log(&ctx_id).unwrap();
-        provider.append_event(&ctx_id, "Event0").unwrap();
-        provider.append_event(&ctx_id, "Event1").unwrap();
+        provider.append_event(&ctx_id, "Event0", "").unwrap();
+        provider.append_event(&ctx_id, "Event1", "").unwrap();
 
         let removed = provider.prune_event_log(&ctx_id, 5).unwrap();
         assert_eq!(removed, 0);
@@ -1137,7 +1207,7 @@ mod tests {
             provider.init_event_log(&ctx_id).unwrap();
             for i in 0..10 {
                 provider
-                    .append_event(&ctx_id, &format!("Event{i}"))
+                    .append_event(&ctx_id, &format!("Event{i}"), "")
                     .unwrap();
             }
 
@@ -1170,7 +1240,7 @@ mod tests {
             assert!(provider.verify_chain(&ctx_id));
 
             // Appending after restore should chain correctly.
-            provider.append_event(&ctx_id, "Event10").unwrap();
+            provider.append_event(&ctx_id, "Event10", "").unwrap();
             let entries = provider.entries(&ctx_id).unwrap();
             assert_eq!(entries.len(), 4);
             assert_eq!(entries[3].prev_hash, entries[2].hash);
@@ -1186,8 +1256,10 @@ mod tests {
         let ctx_id = [19u8; 32];
 
         provider.init_event_log(&ctx_id).unwrap();
-        provider.append_event(&ctx_id, "ContextCreated").unwrap();
-        provider.append_event(&ctx_id, "MemberJoined").unwrap();
+        provider
+            .append_event(&ctx_id, "ContextCreated", "")
+            .unwrap();
+        provider.append_event(&ctx_id, "MemberJoined", "").unwrap();
 
         // Call event_log_entries through dyn dispatch.
         let boxed: Box<dyn ContextEventLogProvider> = Box::new(provider);
@@ -1207,8 +1279,8 @@ mod tests {
         // Build entries via another provider (no persistence) to get valid chain.
         let source = MerkleEventLogProvider::new();
         source.init_event_log(&ctx_id).unwrap();
-        source.append_event(&ctx_id, "Imported1").unwrap();
-        source.append_event(&ctx_id, "Imported2").unwrap();
+        source.append_event(&ctx_id, "Imported1", "").unwrap();
+        source.append_event(&ctx_id, "Imported2", "").unwrap();
         let exported = source.export_event_log_entries(&ctx_id).unwrap();
 
         // Import into the persistent provider.

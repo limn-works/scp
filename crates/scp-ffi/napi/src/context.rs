@@ -603,7 +603,7 @@ pub async fn context_join(handle: &NapiContextHandle, identity_did: String) -> n
 
     let manager = context_manager()?;
     manager
-        .join_context(core_handle, key_package)
+        .join_context(core_handle, key_package, None)
         .await
         .map_err(|e| NapiError::from(ScpNapiError::from(e)))?;
 
@@ -785,6 +785,7 @@ pub async fn context_send(
             &did,
             &payload,
             resolved_signing_key.as_ref(),
+            None,
             None,
         )
         .await
@@ -3391,7 +3392,7 @@ mod tests {
 
         let kp = KeyPackage::mock(DID("did:key:z6MkJoiner".to_owned()));
         manager
-            .join_context(&handle, kp)
+            .join_context(&handle, kp, None)
             .await
             .expect("join_context should succeed");
 

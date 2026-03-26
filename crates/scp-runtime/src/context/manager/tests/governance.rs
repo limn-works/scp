@@ -1558,7 +1558,7 @@ async fn governance_propose_checked_without_capability_rejected() {
         let contexts = manager.contexts.lock().await;
         contexts.get(&ctx_id).unwrap().handle.clone()
     };
-    manager.join_context(&handle_ref, kp).await.unwrap();
+    manager.join_context(&handle_ref, kp, None).await.unwrap();
 
     let bob_did: DID = "did:key:bob".into();
     let signing_key = signing_key_for_did(&bob_did);
@@ -1590,7 +1590,7 @@ async fn governance_vote_without_capability_rejected() {
         let contexts = manager.contexts.lock().await;
         contexts.get(&ctx_id).unwrap().handle.clone()
     };
-    manager.join_context(&handle_ref, kp).await.unwrap();
+    manager.join_context(&handle_ref, kp, None).await.unwrap();
 
     let bob_did: DID = "did:key:bob".into();
     let signing_key = signing_key_for_did(&bob_did);
@@ -1696,7 +1696,7 @@ async fn governance_threshold_propose_approve_lifecycle() {
 
     // Join bob.
     let kp = KeyPackage::mock("did:key:bob".into());
-    manager.join_context(&handle, kp).await.unwrap();
+    manager.join_context(&handle, kp, None).await.unwrap();
 
     // Grant governance capabilities to bob.
     {
@@ -4528,6 +4528,7 @@ async fn migration_propose_approve_tombstone_lifecycle() {
             b"hello",
             Some(&signing_key_for_did(&admin_did)),
             None,
+            None,
         )
         .await;
     assert!(
@@ -4594,6 +4595,7 @@ async fn migration_propose_cancel_lifecycle() {
             &admin_did,
             b"hello",
             Some(&signing_key_for_did(&admin_did)),
+            None,
             None,
         )
         .await;
@@ -4937,6 +4939,7 @@ async fn test_consequence_rule_triggers_enforcement_event() {
             b"trigger",
             Some(&sk),
             None,
+            None,
         )
         .await;
     assert!(result.is_ok(), "send_message should succeed: {result:?}");
@@ -5016,6 +5019,7 @@ async fn test_economy_cost_deducted_on_send() {
             b"paid msg",
             Some(&sk),
             None,
+            None,
         )
         .await;
     assert!(
@@ -5084,7 +5088,14 @@ async fn test_cooldown_prevents_consequence_retrigger() {
 
     // First send: triggers consequence.
     manager
-        .send_message(&handle, &"did:key:admin".into(), b"first", Some(&sk), None)
+        .send_message(
+            &handle,
+            &"did:key:admin".into(),
+            b"first",
+            Some(&sk),
+            None,
+            None,
+        )
         .await
         .unwrap();
     let events1 = manager.drain_events("cooldown-ctx").await;
@@ -5107,7 +5118,14 @@ async fn test_cooldown_prevents_consequence_retrigger() {
 
     // Second send: cooldown should prevent re-triggering.
     manager
-        .send_message(&handle, &"did:key:admin".into(), b"second", Some(&sk), None)
+        .send_message(
+            &handle,
+            &"did:key:admin".into(),
+            b"second",
+            Some(&sk),
+            None,
+            None,
+        )
         .await
         .unwrap();
     let events2 = manager.drain_events("cooldown-ctx").await;
@@ -5178,6 +5196,7 @@ async fn test_budget_exceeded_blocks_send() {
             b"too expensive",
             Some(&sk),
             None,
+            None,
         )
         .await;
     assert!(result.is_err(), "send should fail when budget exceeded");
@@ -5231,7 +5250,14 @@ async fn test_capability_suspension_revokes_write() {
         .handle
         .clone();
     manager
-        .send_message(&handle, &"did:key:admin".into(), b"test", Some(&sk), None)
+        .send_message(
+            &handle,
+            &"did:key:admin".into(),
+            b"test",
+            Some(&sk),
+            None,
+            None,
+        )
         .await
         .unwrap();
 
@@ -5288,7 +5314,14 @@ async fn test_access_revocation_revokes_read_and_write() {
         .handle
         .clone();
     manager
-        .send_message(&handle, &"did:key:admin".into(), b"test", Some(&sk), None)
+        .send_message(
+            &handle,
+            &"did:key:admin".into(),
+            b"test",
+            Some(&sk),
+            None,
+            None,
+        )
         .await
         .unwrap();
 
@@ -5359,7 +5392,14 @@ async fn test_role_demotion_changes_member_role() {
         .handle
         .clone();
     manager
-        .send_message(&handle, &"did:key:admin".into(), b"test", Some(&sk), None)
+        .send_message(
+            &handle,
+            &"did:key:admin".into(),
+            b"test",
+            Some(&sk),
+            None,
+            None,
+        )
         .await
         .unwrap();
 
@@ -5463,7 +5503,7 @@ async fn test_velocity_tracker_records_messages() {
     // Send two messages.
     for msg in &[b"first".as_slice(), b"second".as_slice()] {
         manager
-            .send_message(&handle, &"did:key:admin".into(), msg, Some(&sk), None)
+            .send_message(&handle, &"did:key:admin".into(), msg, Some(&sk), None, None)
             .await
             .unwrap();
     }
@@ -5584,7 +5624,14 @@ async fn test_capability_suspension_no_match_returns_false() {
         .handle
         .clone();
     manager
-        .send_message(&handle, &"did:key:admin".into(), b"test", Some(&sk), None)
+        .send_message(
+            &handle,
+            &"did:key:admin".into(),
+            b"test",
+            Some(&sk),
+            None,
+            None,
+        )
         .await
         .unwrap();
 
@@ -5648,7 +5695,7 @@ async fn test_auto_accept_blocked_for_paid_contexts() {
         owner_did: "did:key:joiner".into(),
         mls_key_package_bytes: None,
     };
-    let result = manager.join_context(&handle, key_package).await;
+    let result = manager.join_context(&handle, key_package, None).await;
     assert!(
         result.is_err(),
         "join should fail for paid contexts without explicit acceptance"
@@ -5691,7 +5738,7 @@ async fn standing_blocks_proposal_for_pending_removal() {
         owner_did: alice.clone(),
         mls_key_package_bytes: None,
     };
-    manager.join_context(&handle, kp).await.unwrap();
+    manager.join_context(&handle, kp, None).await.unwrap();
 
     // Manually insert a pending removal against Alice.
     {
@@ -5804,7 +5851,7 @@ async fn consequence_triggered_after_execute_send() {
         .handle
         .clone();
     let _ = manager
-        .send_message(&handle, &admin, b"trigger", Some(&sk), None)
+        .send_message(&handle, &admin, b"trigger", Some(&sk), None, None)
         .await;
 
     // Check for ConsequenceTriggered event.
@@ -5845,7 +5892,7 @@ async fn standing_check_blocks_low_standing_proposer() {
         owner_did: alice.clone(),
         mls_key_package_bytes: None,
     };
-    manager.join_context(&handle, kp).await.unwrap();
+    manager.join_context(&handle, kp, None).await.unwrap();
 
     // Simulate a pending removal against Alice (standing defense-in-depth).
     {
@@ -5935,7 +5982,14 @@ async fn evaluate_cost_deducts_budget_on_send() {
         .handle
         .clone();
     let result = manager
-        .send_message(&handle, &"did:key:admin".into(), b"test", Some(&sk), None)
+        .send_message(
+            &handle,
+            &"did:key:admin".into(),
+            b"test",
+            Some(&sk),
+            None,
+            None,
+        )
         .await;
     assert!(result.is_ok(), "send should succeed: {result:?}");
 
@@ -6041,6 +6095,7 @@ async fn capability_suspension_suspends_write() {
             b"trigger",
             Some(&sk),
             None,
+            None,
         )
         .await;
 
@@ -6100,6 +6155,7 @@ async fn access_revocation_consequence_revokes() {
             &"did:key:admin".into(),
             b"trigger",
             Some(&sk),
+            None,
             None,
         )
         .await;
@@ -6165,6 +6221,7 @@ async fn role_demotion_consequence_demotes() {
             b"trigger",
             Some(&sk),
             None,
+            None,
         )
         .await;
 
@@ -6222,7 +6279,14 @@ async fn velocity_consequence_triggers_on_high_rate() {
         .handle
         .clone();
     let _ = manager
-        .send_message(&handle, &"did:key:admin".into(), b"msg", Some(&sk), None)
+        .send_message(
+            &handle,
+            &"did:key:admin".into(),
+            b"msg",
+            Some(&sk),
+            None,
+            None,
+        )
         .await;
 
     // Verify velocity was recorded and consequence triggered.
@@ -6360,7 +6424,7 @@ async fn sender_key_before_mls_removal_ordering() {
         owner_did: alice.clone(),
         mls_key_package_bytes: None,
     };
-    manager.join_context(&handle, kp).await.unwrap();
+    manager.join_context(&handle, kp, None).await.unwrap();
 
     // Clear call log from join operations so we only see removal calls.
     call_order.lock().unwrap().clear();
@@ -6452,7 +6516,7 @@ async fn rejected_standing_blocks_governance() {
         owner_did: target.clone(),
         mls_key_package_bytes: None,
     };
-    manager.join_context(&handle, kp).await.unwrap();
+    manager.join_context(&handle, kp, None).await.unwrap();
 
     // Add pending removal against target.
     {
@@ -6547,6 +6611,7 @@ async fn budget_exceeded_denies_send() {
             &"did:key:admin".into(),
             b"expensive",
             Some(&sk),
+            None,
             None,
         )
         .await;
@@ -6645,6 +6710,7 @@ async fn participation_record_updated_after_message_send() {
                 b"participation msg",
                 Some(&sk),
                 None,
+                None,
             )
             .await
             .unwrap();
@@ -6705,7 +6771,7 @@ async fn consequence_triggers_after_governance_action() {
         .handle
         .clone();
     let _ = manager
-        .send_message(&handle, &admin, b"populate", Some(&sk), None)
+        .send_message(&handle, &admin, b"populate", Some(&sk), None, None)
         .await;
     // Drain the send events so we can isolate governance events.
     let _ = manager.drain_events("gov-conseq-ctx").await;
@@ -6788,7 +6854,14 @@ async fn cooldown_expires_allows_retrigger() {
 
     // First send triggers consequence.
     manager
-        .send_message(&handle, &"did:key:admin".into(), b"first", Some(&sk), None)
+        .send_message(
+            &handle,
+            &"did:key:admin".into(),
+            b"first",
+            Some(&sk),
+            None,
+            None,
+        )
         .await
         .unwrap();
     let events1 = manager.drain_events("cooldown-exp-ctx").await;
@@ -6810,7 +6883,14 @@ async fn cooldown_expires_allows_retrigger() {
 
     // Second send should re-trigger (cooldown expired).
     manager
-        .send_message(&handle, &"did:key:admin".into(), b"second", Some(&sk), None)
+        .send_message(
+            &handle,
+            &"did:key:admin".into(),
+            b"second",
+            Some(&sk),
+            None,
+            None,
+        )
         .await
         .unwrap();
     let events2 = manager.drain_events("cooldown-exp-ctx").await;
@@ -6862,7 +6942,14 @@ async fn empty_consequence_rules_no_evaluation() {
 
     // Send a message — should NOT produce any ConsequenceTriggered events.
     manager
-        .send_message(&handle, &"did:key:admin".into(), b"test", Some(&sk), None)
+        .send_message(
+            &handle,
+            &"did:key:admin".into(),
+            b"test",
+            Some(&sk),
+            None,
+            None,
+        )
         .await
         .unwrap();
 
@@ -6924,6 +7011,7 @@ async fn event_log_entries_feed_consequence_evaluation() {
                 &"did:key:admin".into(),
                 format!("msg-{i}").as_bytes(),
                 Some(&sk),
+                None,
                 None,
             )
             .await
@@ -7126,7 +7214,7 @@ async fn sender_key_removal_error_propagates() {
         owner_did: alice.clone(),
         mls_key_package_bytes: None,
     };
-    manager.join_context(&handle, kp).await.unwrap();
+    manager.join_context(&handle, kp, None).await.unwrap();
 
     // Remove Alice — sender key removal will fail.
     let action = scp_protocol::context::governance::GovernanceAction::RemoveMember {
@@ -7183,7 +7271,7 @@ async fn remaining_members_keys_after_removal() {
             owner_did: did.clone(),
             mls_key_package_bytes: None,
         };
-        manager.join_context(&handle, kp).await.unwrap();
+        manager.join_context(&handle, kp, None).await.unwrap();
     }
 
     // Clear call log to isolate removal calls.
@@ -7402,6 +7490,7 @@ async fn full_send_consequence_enforcement_round_trip() {
             b"round trip",
             Some(&sk),
             None,
+            None,
         )
         .await;
     assert!(result.is_ok(), "send should succeed: {result:?}");
@@ -7475,7 +7564,7 @@ async fn governance_standing_participation_round_trip() {
         .clone();
     for _ in 0..3 {
         manager
-            .send_message(&handle, &admin, b"participate", Some(&sk), None)
+            .send_message(&handle, &admin, b"participate", Some(&sk), None, None)
             .await
             .unwrap();
     }
@@ -7550,6 +7639,7 @@ async fn capability_suspension_blocks_subsequent_send() {
             b"trigger",
             Some(&sk),
             None,
+            None,
         )
         .await;
 
@@ -7560,6 +7650,7 @@ async fn capability_suspension_blocks_subsequent_send() {
             &"did:key:admin".into(),
             b"blocked",
             Some(&sk),
+            None,
             None,
         )
         .await;
@@ -7619,6 +7710,7 @@ async fn access_revocation_blocks_subsequent_send() {
             b"trigger",
             Some(&sk),
             None,
+            None,
         )
         .await;
 
@@ -7629,6 +7721,7 @@ async fn access_revocation_blocks_subsequent_send() {
             &"did:key:admin".into(),
             b"blocked",
             Some(&sk),
+            None,
             None,
         )
         .await;
@@ -7676,7 +7769,7 @@ async fn join_context_with_join_cost_no_budget_rejected() {
         owner_did: "did:key:joiner".into(),
         mls_key_package_bytes: None,
     };
-    let result = manager.join_context(&handle, kp).await;
+    let result = manager.join_context(&handle, kp, None).await;
     assert!(
         result.is_err(),
         "join should fail for paid context: {result:?}"
@@ -7763,7 +7856,7 @@ async fn standing_blocks_low_participation() {
         owner_did: bob.clone(),
         mls_key_package_bytes: None,
     };
-    manager.join_context(&handle, kp).await.unwrap();
+    manager.join_context(&handle, kp, None).await.unwrap();
 
     // Drain events from the buffer so check_standing's refresh finds an
     // empty event list and preserves our injected cache entry.
@@ -7858,7 +7951,7 @@ async fn standing_allows_good_member() {
         owner_did: alice.clone(),
         mls_key_package_bytes: None,
     };
-    manager.join_context(&handle, kp).await.unwrap();
+    manager.join_context(&handle, kp, None).await.unwrap();
 
     // Manually inject a good participation record for Alice: more actions
     // by than against.
@@ -7955,6 +8048,7 @@ async fn consequence_triggers_on_message_send() {
             b"trigger msg",
             Some(&sk),
             None,
+            None,
         )
         .await
         .unwrap();
@@ -8030,6 +8124,7 @@ async fn role_demotion_consequence_changes_role() {
             b"demote trigger",
             Some(&sk),
             None,
+            None,
         )
         .await
         .unwrap();
@@ -8096,7 +8191,14 @@ async fn cooldown_prevents_retrigger_within_window() {
 
     // First send triggers consequence.
     manager
-        .send_message(&handle, &"did:key:admin".into(), b"first", Some(&sk), None)
+        .send_message(
+            &handle,
+            &"did:key:admin".into(),
+            b"first",
+            Some(&sk),
+            None,
+            None,
+        )
         .await
         .unwrap();
     let events1 = manager.drain_events("cooldown-block-ctx").await;
@@ -8117,7 +8219,14 @@ async fn cooldown_prevents_retrigger_within_window() {
 
     // Second send should NOT trigger the consequence again (cooldown active).
     manager
-        .send_message(&handle, &"did:key:admin".into(), b"second", Some(&sk), None)
+        .send_message(
+            &handle,
+            &"did:key:admin".into(),
+            b"second",
+            Some(&sk),
+            None,
+            None,
+        )
         .await
         .unwrap();
     let events2 = manager.drain_events("cooldown-block-ctx").await;
@@ -8190,6 +8299,7 @@ async fn send_message_deducts_budget() {
             b"budget test",
             Some(&sk),
             None,
+            None,
         )
         .await
         .unwrap();
@@ -8215,6 +8325,7 @@ async fn send_message_deducts_budget() {
             &"did:key:sender".into(),
             b"budget test 2",
             Some(&sk),
+            None,
             None,
         )
         .await
@@ -8322,7 +8433,14 @@ async fn velocity_tracker_records_messages() {
     // Send 5 messages.
     for i in 0..5u8 {
         manager
-            .send_message(&handle, &"did:key:admin".into(), &[i], Some(&sk), None)
+            .send_message(
+                &handle,
+                &"did:key:admin".into(),
+                &[i],
+                Some(&sk),
+                None,
+                None,
+            )
             .await
             .unwrap();
     }
@@ -8507,7 +8625,7 @@ async fn paid_join_end_to_end_with_adapter() {
         owner_did: "did:key:joiner".into(),
         mls_key_package_bytes: None,
     };
-    let result = manager.join_context(&handle, kp).await;
+    let result = manager.join_context(&handle, kp, None).await;
     assert!(
         result.is_err(),
         "join should fail for paid context even with adapter: {result:?}"
@@ -8567,7 +8685,7 @@ async fn sybil_resistance_evaluated_on_join() {
         owner_did: "did:key:newmember".into(),
         mls_key_package_bytes: None,
     };
-    let result = manager.join_context(&handle, kp).await;
+    let result = manager.join_context(&handle, kp, None).await;
     assert!(
         result.is_ok(),
         "join should succeed with valid member (sybil evaluation passes): {result:?}"
@@ -8710,7 +8828,7 @@ async fn test_participation_record_updated_after_governance() {
         .clone();
     for _ in 0..3 {
         manager
-            .send_message(&handle, &admin, b"build history", Some(&sk), None)
+            .send_message(&handle, &admin, b"build history", Some(&sk), None, None)
             .await
             .unwrap();
     }
@@ -8768,7 +8886,14 @@ async fn test_participation_record_updated_after_send() {
     // Send multiple messages to build participation.
     for _ in 0..4 {
         manager
-            .send_message(&handle, &"did:key:sender2".into(), b"msg", Some(&sk), None)
+            .send_message(
+                &handle,
+                &"did:key:sender2".into(),
+                b"msg",
+                Some(&sk),
+                None,
+                None,
+            )
             .await
             .unwrap();
     }
@@ -8828,7 +8953,7 @@ async fn test_consequence_triggers_on_governance_action() {
         .handle
         .clone();
     let _ = manager
-        .send_message(&handle, &admin, b"seed", Some(&sk), None)
+        .send_message(&handle, &admin, b"seed", Some(&sk), None, None)
         .await;
     // Drain to isolate governance events.
     let _ = manager.drain_events("gov-c-trig-ctx").await;
@@ -8906,6 +9031,7 @@ async fn test_capability_suspension_blocks_subsequent_send() {
             b"trigger",
             Some(&sk),
             None,
+            None,
         )
         .await;
 
@@ -8916,6 +9042,7 @@ async fn test_capability_suspension_blocks_subsequent_send() {
             &"did:key:admin".into(),
             b"blocked",
             Some(&sk),
+            None,
             None,
         )
         .await;
@@ -8975,6 +9102,7 @@ async fn test_access_revocation_blocks_subsequent_send() {
             b"trigger",
             Some(&sk),
             None,
+            None,
         )
         .await;
 
@@ -8985,6 +9113,7 @@ async fn test_access_revocation_blocks_subsequent_send() {
             &"did:key:admin".into(),
             b"blocked",
             Some(&sk),
+            None,
             None,
         )
         .await;
@@ -9036,7 +9165,14 @@ async fn test_cooldown_expires_allows_retrigger() {
 
     // First send triggers consequence.
     manager
-        .send_message(&handle, &"did:key:admin".into(), b"first", Some(&sk), None)
+        .send_message(
+            &handle,
+            &"did:key:admin".into(),
+            b"first",
+            Some(&sk),
+            None,
+            None,
+        )
         .await
         .unwrap();
     let events1 = manager.drain_events("cd-exp2-ctx").await;
@@ -9056,7 +9192,14 @@ async fn test_cooldown_expires_allows_retrigger() {
 
     // Second send should re-trigger since cooldown has expired.
     manager
-        .send_message(&handle, &"did:key:admin".into(), b"second", Some(&sk), None)
+        .send_message(
+            &handle,
+            &"did:key:admin".into(),
+            b"second",
+            Some(&sk),
+            None,
+            None,
+        )
         .await
         .unwrap();
     let events2 = manager.drain_events("cd-exp2-ctx").await;
@@ -9102,6 +9245,7 @@ async fn test_empty_consequence_rules_no_evaluation() {
             &"did:key:admin".into(),
             b"no rules",
             Some(&sk),
+            None,
             None,
         )
         .await
@@ -9168,7 +9312,14 @@ async fn test_multiple_consequence_rules_all_evaluated() {
 
     // Send message — both rules should trigger.
     manager
-        .send_message(&handle, &"did:key:admin".into(), b"multi", Some(&sk), None)
+        .send_message(
+            &handle,
+            &"did:key:admin".into(),
+            b"multi",
+            Some(&sk),
+            None,
+            None,
+        )
         .await
         .unwrap();
 
@@ -9242,6 +9393,7 @@ async fn test_send_rejected_insufficient_budget() {
             &"did:key:admin".into(),
             b"should fail",
             Some(&sk),
+            None,
             None,
         )
         .await;
@@ -9331,7 +9483,7 @@ async fn test_join_rejected_insufficient_budget() {
         owner_did: "did:key:joiner".into(),
         mls_key_package_bytes: None,
     };
-    let result = manager.join_context(&handle, kp).await;
+    let result = manager.join_context(&handle, kp, None).await;
     assert!(
         result.is_err(),
         "join should fail for paid context with insufficient budget: {result:?}"
@@ -9564,6 +9716,7 @@ async fn test_free_context_no_budget_deduction() {
             b"free msg",
             Some(&sk),
             None,
+            None,
         )
         .await
         .unwrap();
@@ -9615,7 +9768,7 @@ async fn test_sender_key_removal_error_propagates() {
         owner_did: alice.clone(),
         mls_key_package_bytes: None,
     };
-    manager.join_context(&handle, kp).await.unwrap();
+    manager.join_context(&handle, kp, None).await.unwrap();
 
     // Remove Alice — sender key removal will fail.
     let action = scp_protocol::context::governance::GovernanceAction::RemoveMember {
@@ -9663,7 +9816,7 @@ async fn test_remaining_members_unaffected_after_removal() {
             owner_did: did.clone(),
             mls_key_package_bytes: None,
         };
-        manager.join_context(&handle, kp).await.unwrap();
+        manager.join_context(&handle, kp, None).await.unwrap();
     }
 
     // Remove Bob.
@@ -9679,7 +9832,7 @@ async fn test_remaining_members_unaffected_after_removal() {
     // Alice (remaining) can still send.
     let sk = ed25519_dalek::SigningKey::from_bytes(&did_to_seed(&admin));
     let result = manager
-        .send_message(&handle, &admin, b"after removal", Some(&sk), None)
+        .send_message(&handle, &admin, b"after removal", Some(&sk), None, None)
         .await;
     assert!(
         result.is_ok(),
@@ -9855,6 +10008,7 @@ async fn test_send_consequence_economy_round_trip() {
             b"round trip",
             Some(&sk),
             None,
+            None,
         )
         .await
         .unwrap();
@@ -9920,7 +10074,7 @@ async fn test_governance_standing_participation_round_trip() {
         .clone();
     for _ in 0..3 {
         manager
-            .send_message(&handle, &admin, b"participate", Some(&sk), None)
+            .send_message(&handle, &admin, b"participate", Some(&sk), None, None)
             .await
             .unwrap();
     }
@@ -9992,7 +10146,7 @@ async fn test_paid_join_with_consequence_evaluation() {
         owner_did: "did:key:joiner".into(),
         mls_key_package_bytes: None,
     };
-    let result = manager.join_context(&handle, kp).await;
+    let result = manager.join_context(&handle, kp, None).await;
     assert!(result.is_err(), "join should fail for paid context");
 
     // Verify the budget deduction works by directly testing.
@@ -10118,6 +10272,7 @@ async fn test_full_lifecycle_economy() {
                 format!("msg-{i}").as_bytes(),
                 Some(&sk),
                 None,
+                None,
             )
             .await
             .unwrap();
@@ -10130,7 +10285,7 @@ async fn test_full_lifecycle_economy() {
 
     // 4th message costs 10 -> leaves 10.
     manager
-        .send_message(&handle, &user, b"msg-4", Some(&sk), None)
+        .send_message(&handle, &user, b"msg-4", Some(&sk), None, None)
         .await
         .unwrap();
     assert_eq!(
@@ -10141,7 +10296,7 @@ async fn test_full_lifecycle_economy() {
 
     // 5th message: 10 -> leaves 0.
     manager
-        .send_message(&handle, &user, b"msg-5", Some(&sk), None)
+        .send_message(&handle, &user, b"msg-5", Some(&sk), None, None)
         .await
         .unwrap();
     assert_eq!(
@@ -10152,7 +10307,7 @@ async fn test_full_lifecycle_economy() {
 
     // 6th message should fail — budget exhausted.
     let result = manager
-        .send_message(&handle, &user, b"msg-6", Some(&sk), None)
+        .send_message(&handle, &user, b"msg-6", Some(&sk), None, None)
         .await;
     assert!(
         result.is_err(),
@@ -10197,6 +10352,7 @@ async fn velocity_escalation_raises_effective_cost() {
                 format!("msg-{i}").as_bytes(),
                 Some(&sk),
                 None,
+                None,
             )
             .await
             .unwrap();
@@ -10218,6 +10374,7 @@ async fn velocity_escalation_raises_effective_cost() {
                 &admin,
                 format!("msg-{i}").as_bytes(),
                 Some(&sk),
+                None,
                 None,
             )
             .await
@@ -10317,4 +10474,195 @@ async fn setup_velocity_escalation_context() -> (
         .clone();
     let admin = DID::from("did:key:admin");
     (manager, handle, admin, sk)
+}
+
+// -----------------------------------------------------------------------
+// Sender key rotation after member removal (§9.16.4, #1541)
+// -----------------------------------------------------------------------
+
+/// Verify that `rotate_sender_key` is called after `remove_member` in the
+/// correct order: `remove_member_sender_key` → `remove_member` → `rotate_sender_key`.
+#[tokio::test]
+async fn rotate_sender_key_called_after_remove_member() {
+    let crypto = MockCrypto::default();
+    let call_order = Arc::clone(&crypto.call_order);
+
+    let manager = ContextManager::new(
+        Box::new(crypto),
+        Box::new(MockTransport::connected()),
+        Box::new(MockEventLog::default()),
+        mock_key_resolver(),
+    );
+
+    let admin: DID = "did:dht:z6MkCreator".into();
+    let alice: DID = "did:dht:z6MkAlice".into();
+    let key_admin = signing_key_for_did(&admin);
+
+    let params = governance_params();
+    let handle = manager
+        .create_context("rotate-ctx".into(), params, admin.clone())
+        .await
+        .unwrap();
+
+    // Add Alice.
+    let kp = scp_protocol::context::membership::KeyPackage {
+        owner_did: alice.clone(),
+        mls_key_package_bytes: None,
+    };
+    manager.join_context(&handle, kp, None).await.unwrap();
+
+    // Clear call log from join operations.
+    call_order.lock().unwrap().clear();
+
+    // Remove Alice via governance.
+    let action = scp_protocol::context::governance::GovernanceAction::RemoveMember {
+        did: alice.clone(),
+        reason: Some("rotation test".into()),
+    };
+    let result = manager
+        .propose_governance_action("rotate-ctx", &admin, action, &key_admin)
+        .await;
+    assert!(result.is_ok(), "remove member should succeed: {result:?}");
+
+    // Verify full call ordering: remove_member_sender_key → remove_member → rotate_sender_key.
+    let calls = call_order.lock().unwrap();
+    let sk_remove_pos = calls
+        .iter()
+        .position(|(method, _)| method == "remove_member_sender_key")
+        .expect("remove_member_sender_key should have been called");
+    let mls_remove_pos = calls
+        .iter()
+        .position(|(method, _)| method == "remove_member")
+        .expect("remove_member should have been called");
+    let rotate_pos = calls
+        .iter()
+        .position(|(method, _)| method == "rotate_sender_key")
+        .expect("rotate_sender_key should have been called");
+
+    assert!(
+        sk_remove_pos < mls_remove_pos,
+        "remove_member_sender_key (pos {sk_remove_pos}) must precede \
+         remove_member (pos {mls_remove_pos}). Calls: {calls:?}"
+    );
+    assert!(
+        mls_remove_pos < rotate_pos,
+        "remove_member (pos {mls_remove_pos}) must precede \
+         rotate_sender_key (pos {rotate_pos}). Calls: {calls:?}"
+    );
+}
+
+/// Verify that `rotate_sender_key` errors propagate from `execute_remove_member`.
+#[tokio::test]
+async fn rotate_sender_key_error_propagates() {
+    let crypto = MockCrypto::default();
+    crypto.fail_rotate_sender_key.store(true, Ordering::Relaxed);
+
+    let manager = ContextManager::new(
+        Box::new(crypto),
+        Box::new(MockTransport::connected()),
+        Box::new(MockEventLog::default()),
+        mock_key_resolver(),
+    );
+
+    let admin: DID = "did:dht:z6MkCreator".into();
+    let alice: DID = "did:dht:z6MkAlice".into();
+    let key_admin = signing_key_for_did(&admin);
+
+    let params = governance_params();
+    let handle = manager
+        .create_context("rotate-err-ctx".into(), params, admin.clone())
+        .await
+        .unwrap();
+
+    // Add Alice.
+    let kp = scp_protocol::context::membership::KeyPackage {
+        owner_did: alice.clone(),
+        mls_key_package_bytes: None,
+    };
+    manager.join_context(&handle, kp, None).await.unwrap();
+
+    // Remove Alice — should fail because rotate_sender_key fails.
+    let action = scp_protocol::context::governance::GovernanceAction::RemoveMember {
+        did: alice.clone(),
+        reason: Some("error test".into()),
+    };
+    let result = manager
+        .propose_governance_action("rotate-err-ctx", &admin, action, &key_admin)
+        .await;
+    assert!(result.is_err(), "remove member should fail: {result:?}");
+    let err = result.unwrap_err();
+    assert!(
+        format!("{err}").contains("rotate_sender_key"),
+        "error should mention rotate_sender_key: {err}"
+    );
+}
+
+/// Verify that `rotate_sender_key` is called on voluntary departure
+/// (`leave_context`).
+#[tokio::test]
+async fn rotate_sender_key_called_on_leave() {
+    let crypto = MockCrypto::default();
+    let call_order = Arc::clone(&crypto.call_order);
+
+    let manager = ContextManager::new(
+        Box::new(crypto),
+        Box::new(MockTransport::connected()),
+        Box::new(MockEventLog::default()),
+        mock_key_resolver(),
+    );
+
+    let admin: DID = "did:dht:z6MkCreator".into();
+    let alice: DID = "did:dht:z6MkAlice".into();
+
+    let params = governance_params();
+    let handle = manager
+        .create_context("leave-rotate-ctx".into(), params, admin.clone())
+        .await
+        .unwrap();
+
+    // Add Alice.
+    let kp = scp_protocol::context::membership::KeyPackage {
+        owner_did: alice.clone(),
+        mls_key_package_bytes: None,
+    };
+    manager.join_context(&handle, kp, None).await.unwrap();
+
+    // Clear call log from join operations.
+    call_order.lock().unwrap().clear();
+
+    // Alice voluntarily leaves.
+    let result = manager.leave_context(&handle, &alice, &alice).await;
+    assert!(result.is_ok(), "leave should succeed: {result:?}");
+
+    // Verify rotate_sender_key was called.
+    let calls = call_order.lock().unwrap();
+    let rotate_pos = calls
+        .iter()
+        .position(|(method, _)| method == "rotate_sender_key");
+    assert!(
+        rotate_pos.is_some(),
+        "rotate_sender_key must be called on leave_context. Calls: {calls:?}"
+    );
+
+    // Verify ordering: remove_member_sender_key → remove_member → rotate_sender_key.
+    let sk_remove_pos = calls
+        .iter()
+        .position(|(method, _)| method == "remove_member_sender_key")
+        .expect("remove_member_sender_key should have been called");
+    let mls_remove_pos = calls
+        .iter()
+        .position(|(method, _)| method == "remove_member")
+        .expect("remove_member should have been called");
+    let rotate_pos = rotate_pos.unwrap();
+
+    assert!(
+        sk_remove_pos < mls_remove_pos,
+        "remove_member_sender_key (pos {sk_remove_pos}) must precede \
+         remove_member (pos {mls_remove_pos}). Calls: {calls:?}"
+    );
+    assert!(
+        mls_remove_pos < rotate_pos,
+        "remove_member (pos {mls_remove_pos}) must precede \
+         rotate_sender_key (pos {rotate_pos}). Calls: {calls:?}"
+    );
 }

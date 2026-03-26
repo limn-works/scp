@@ -1895,12 +1895,14 @@ mod tests {
 
         let entry0 = EventLogEntry {
             event: "ContextCreated".to_owned(),
+            actor_did: String::new(),
             timestamp: 1_700_000_000,
             prev_hash: [0u8; 32],
             hash: [1u8; 32],
         };
         let entry1 = EventLogEntry {
             event: "MemberJoined".to_owned(),
+            actor_did: String::new(),
             timestamp: 1_700_000_001,
             prev_hash: [1u8; 32],
             hash: [2u8; 32],
@@ -1929,12 +1931,14 @@ mod tests {
         let entries = vec![
             EventLogEntry {
                 event: "BulkEvent0".to_owned(),
+                actor_did: String::new(),
                 timestamp: 1_700_000_000,
                 prev_hash: [0u8; 32],
                 hash: [1u8; 32],
             },
             EventLogEntry {
                 event: "BulkEvent1".to_owned(),
+                actor_did: String::new(),
                 timestamp: 1_700_000_001,
                 prev_hash: [1u8; 32],
                 hash: [2u8; 32],

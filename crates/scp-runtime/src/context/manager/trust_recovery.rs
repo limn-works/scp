@@ -274,9 +274,9 @@ impl ContextManager {
 
         // 4. Emit epoch advancement event to event log. Event log failures
         //    are non-fatal — recovery must not be blocked by logging issues.
-        if let Err(e) = self
-            .event_log
-            .append_context_event(&context_id_bytes, "recovery/epoch_advanced")
+        if let Err(e) =
+            self.event_log
+                .append_context_event(&context_id_bytes, "recovery/epoch_advanced", "")
         {
             tracing::warn!(
                 context_id = %context_id,

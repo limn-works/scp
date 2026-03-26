@@ -439,7 +439,7 @@ mod tests {
         let provider = MerkleEventLogProvider::new();
         provider.init_event_log(context_id_bytes).unwrap();
         for name in event_names {
-            provider.append_event(context_id_bytes, name).unwrap();
+            provider.append_event(context_id_bytes, name, "").unwrap();
         }
         provider.export_event_log_entries(context_id_bytes).unwrap()
     }
@@ -558,8 +558,8 @@ mod tests {
         let ctx_id_bytes = scp_protocol::context::context_id_bytes("ctx-merkle-2");
         let provider = MerkleEventLogProvider::new();
         provider.init_event_log(&ctx_id_bytes).unwrap();
-        provider.append_event(&ctx_id_bytes, "Event1").unwrap();
-        provider.append_event(&ctx_id_bytes, "Event2").unwrap();
+        provider.append_event(&ctx_id_bytes, "Event1", "").unwrap();
+        provider.append_event(&ctx_id_bytes, "Event2", "").unwrap();
 
         let mut entries = provider.entries(&ctx_id_bytes).unwrap();
         // Tamper with the first entry's hash.
@@ -577,9 +577,9 @@ mod tests {
         let ctx_id_bytes = scp_protocol::context::context_id_bytes("ctx-merkle-3");
         let provider = MerkleEventLogProvider::new();
         provider.init_event_log(&ctx_id_bytes).unwrap();
-        provider.append_event(&ctx_id_bytes, "Event1").unwrap();
-        provider.append_event(&ctx_id_bytes, "Event2").unwrap();
-        provider.append_event(&ctx_id_bytes, "Event3").unwrap();
+        provider.append_event(&ctx_id_bytes, "Event1", "").unwrap();
+        provider.append_event(&ctx_id_bytes, "Event2", "").unwrap();
+        provider.append_event(&ctx_id_bytes, "Event3", "").unwrap();
 
         let mut entries = provider.entries(&ctx_id_bytes).unwrap();
         // Remove the middle entry.
@@ -665,9 +665,9 @@ mod tests {
         let ctx_id_bytes = scp_protocol::context::context_id_bytes("ctx-validate-4");
         let provider = MerkleEventLogProvider::new();
         provider.init_event_log(&ctx_id_bytes).unwrap();
-        provider.append_event(&ctx_id_bytes, "Event1").unwrap();
-        provider.append_event(&ctx_id_bytes, "Event2").unwrap();
-        provider.append_event(&ctx_id_bytes, "Event3").unwrap();
+        provider.append_event(&ctx_id_bytes, "Event1", "").unwrap();
+        provider.append_event(&ctx_id_bytes, "Event2", "").unwrap();
+        provider.append_event(&ctx_id_bytes, "Event3", "").unwrap();
 
         let _original_data = provider.export_event_log_entries(&ctx_id_bytes).unwrap();
         let merkle_root = provider.merkle_root(&ctx_id_bytes).unwrap();
@@ -824,9 +824,9 @@ mod tests {
         let ctx_id_bytes = scp_protocol::context::context_id_bytes("ctx-el-roundtrip");
         let provider = MerkleEventLogProvider::new();
         provider.init_event_log(&ctx_id_bytes).unwrap();
-        provider.append_event(&ctx_id_bytes, "Event1").unwrap();
-        provider.append_event(&ctx_id_bytes, "Event2").unwrap();
-        provider.append_event(&ctx_id_bytes, "Event3").unwrap();
+        provider.append_event(&ctx_id_bytes, "Event1", "").unwrap();
+        provider.append_event(&ctx_id_bytes, "Event2", "").unwrap();
+        provider.append_event(&ctx_id_bytes, "Event3", "").unwrap();
 
         let original_entries = provider.entries(&ctx_id_bytes).unwrap();
         let original_root = provider.merkle_root(&ctx_id_bytes).unwrap();
@@ -868,7 +868,7 @@ mod tests {
         provider.init_event_log(&ctx_id_bytes).unwrap();
         for i in 0..10 {
             provider
-                .append_event(&ctx_id_bytes, &format!("Event{i}"))
+                .append_event(&ctx_id_bytes, &format!("Event{i}"), "")
                 .unwrap();
         }
 
@@ -917,7 +917,9 @@ mod tests {
         assert!(new_provider.verify_chain(&ctx_id_bytes));
 
         // Appending after import should chain correctly.
-        new_provider.append_event(&ctx_id_bytes, "Event10").unwrap();
+        new_provider
+            .append_event(&ctx_id_bytes, "Event10", "")
+            .unwrap();
         let final_entries = new_provider.entries(&ctx_id_bytes).unwrap();
         assert_eq!(final_entries.len(), 4);
         assert_eq!(final_entries[3].prev_hash, final_entries[2].hash);

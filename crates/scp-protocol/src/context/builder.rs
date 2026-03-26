@@ -208,6 +208,28 @@ pub trait ContextCryptoProvider: Send + Sync {
         member_did: &str,
     ) -> Result<(), ContextError>;
 
+    /// Rotates the local sender key for a context (§9.16.4).
+    ///
+    /// Generates a fresh AES-256 sender key, increments `sender_key_epoch`,
+    /// updates the local sender key store, HPKE-seals the new key to each
+    /// remaining member's wrapping public key, and queues distribution
+    /// messages in `pending_distributions`.
+    ///
+    /// Called after a member is removed (governance or voluntary departure)
+    /// so that the removed party cannot decrypt future messages encrypted
+    /// with the new sender key.
+    ///
+    /// The default implementation is a no-op (`Ok(())`) so that mock and
+    /// test providers compile without changes.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ContextError::CryptoFailed`] if key generation, HPKE
+    /// sealing, or internal lock acquisition fails.
+    fn rotate_sender_key(&self, _context_id: &[u8; 32]) -> Result<(), ContextError> {
+        Ok(())
+    }
+
     /// Drains pending sender key distribution messages for a context.
     ///
     /// Returns `(target_did, serialized_message)` pairs that should be
