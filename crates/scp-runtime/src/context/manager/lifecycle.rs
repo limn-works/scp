@@ -15,30 +15,30 @@ use super::{
 
 /// Performs sybil resistance evaluation for a join candidate (#1530).
 ///
-/// Uses a permissive default policy (no requirements) when the context
-/// doesn't specify one. Fail-closed with `?`.
-fn evaluate_sybil_resistance(member_did: &DID, now: u64) -> Result<(), ContextError> {
-    let sybil_policy = scp_protocol::trust::sybil::ContextSybilPolicy {
-        min_signal_breadth: None,
-        min_weighted_strength: None,
-        required_signals: Vec::new(),
-        freshness_config: scp_protocol::trust::sybil::FreshnessWeight::default_config(),
-        capacity_policy: scp_protocol::trust::sybil::CapacityTierPolicy::default_policy(),
-        require_device_attestation: false,
-    };
-    let sybil_assessment = scp_protocol::trust::sybil::IdentityDepthAssessment {
-        subject_did: member_did.clone(),
-        signals: std::collections::HashMap::new(),
-        signal_breadth: 0,
-        assessed_at: now,
-    };
-    scp_protocol::trust::sybil::evaluate_sybil_resistance(
-        &sybil_assessment,
-        &sybil_policy,
-        now,
-        None,
-    )
-    .map_err(|e| ContextError::PermissionDenied(format!("SCP-SYBIL-6010: sybil check failed: {e}")))
+/// Sybil resistance requires external identity signals (trust signals,
+/// device attestation, attestor data) that are not available at the
+/// `ContextManager` layer. `ContextParams` does not declare a sybil policy
+/// field. This function is a conditional gate: it only evaluates when a
+/// sybil policy is available in the future. Currently passes unconditionally
+/// with a trace log.
+///
+/// Returns `Result` for fail-closed semantics: when a real sybil policy is
+/// wired, failures will propagate via `?`.
+#[allow(clippy::unnecessary_wraps)]
+fn evaluate_sybil_resistance(
+    _ctx: &PerContextState,
+    member_did: &DID,
+    _now: u64,
+) -> Result<(), ContextError> {
+    // No sybil policy field on ContextParams yet — pass unconditionally.
+    // When ContextParams gains a `sybil_policy: Option<ContextSybilPolicy>`
+    // field, this function should evaluate against it using real signals
+    // from the trust layer.
+    tracing::trace!(
+        member = %member_did,
+        "sybil resistance check: no policy configured, passing"
+    );
+    Ok(())
 }
 
 /// Initializes participation record and records budget spend for a new member (#1530, #1537).
@@ -57,24 +57,6 @@ fn post_join_bookkeeping(ctx: &mut PerContextState, context_id: &str, member_did
         ctx.governance
             .participation_cache
             .insert(member_did.to_string(), record);
-    }
-
-    // Paid action context-join bookkeeping.
-    if ctx.governance.economic_policy.is_some() {
-        tracing::trace!(
-            action = "ContextJoin",
-            "paid context join cost already evaluated"
-        );
-    }
-
-    // Record join spend against budget (zero-cost for free joins).
-    if ctx
-        .governance
-        .budget_tracker
-        .record_spend(member_did, scp_protocol::economy::types::Amount::new(0))
-        .is_err()
-    {
-        // Budget tracking failure is non-fatal for free joins.
     }
 }
 
@@ -1318,7 +1300,7 @@ impl ContextManager {
             enforce_join_economy(ctx, &member_did)?;
 
             // Sybil resistance check (#1530) — fail-closed with `?`.
-            evaluate_sybil_resistance(&member_did, self.clock.now_secs())?;
+            evaluate_sybil_resistance(ctx, &member_did, self.clock.now_secs())?;
 
             // Participation + economy bookkeeping (#1530, #1537).
             post_join_bookkeeping(ctx, &context_id, &member_did, self.clock.now_secs());
