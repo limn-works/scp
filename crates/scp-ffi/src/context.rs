@@ -1303,6 +1303,92 @@ fn py_context_send(
 /// called), events are silently discarded. This is intentional: the channel
 /// is demand-driven, and events before subscription are lost (consistent
 /// with the subscription model in `TransportAdapter::subscribe`).
+/// Converts a [`ContextEvent`] into the `(sender_did, payload, timestamp)` triple
+/// used by the `PyO3` bridge event delivery pipeline.
+#[allow(clippy::cast_precision_loss)]
+fn convert_context_event(
+    event: scp_core::context::membership::ContextEvent,
+) -> (String, Vec<u8>, f64) {
+    let ts = scp_primitives::SystemClock.now_secs() as f64;
+    match event {
+        scp_core::context::membership::ContextEvent::MessageSent {
+            sender_did,
+            payload,
+            ..
+        } => (sender_did.to_string(), payload, ts),
+        scp_core::context::membership::ContextEvent::MemberJoined {
+            member_did,
+            role_name,
+        } => (
+            "scp:system".to_owned(),
+            format!("member_joined:{member_did}:{role_name}").into_bytes(),
+            ts,
+        ),
+        scp_core::context::membership::ContextEvent::MemberLeft { member_did } => (
+            "scp:system".to_owned(),
+            format!("member_left:{member_did}").into_bytes(),
+            ts,
+        ),
+        scp_core::context::membership::ContextEvent::SystemClose { initiator_did } => (
+            "scp:system".to_owned(),
+            format!("system_close:{initiator_did}").into_bytes(),
+            ts,
+        ),
+        scp_core::context::membership::ContextEvent::SequenceGapDetected {
+            sender_did,
+            expected_sequence,
+            first_delivered_sequence,
+            reason,
+        } => (
+            "scp:system".to_owned(),
+            format!(
+                "sequence_gap_detected:sender={sender_did},\
+                 expected={expected_sequence},\
+                 first_delivered={first_delivered_sequence},\
+                 reason={reason}"
+            )
+            .into_bytes(),
+            ts,
+        ),
+        scp_core::context::membership::ContextEvent::ConsequenceTriggered {
+            context_id: ctx_id,
+            member_did,
+            rule_index,
+            trigger_type,
+            action_type,
+        } => (
+            "scp:system".to_owned(),
+            format!(
+                "consequence_triggered:member={member_did},\
+                 rule={rule_index},trigger={trigger_type},\
+                 action={action_type},context={ctx_id}"
+            )
+            .into_bytes(),
+            ts,
+        ),
+        scp_core::context::membership::ContextEvent::ConsequenceEnforced {
+            context_id: ctx_id,
+            member_did,
+            action_type,
+            success,
+        } => (
+            "scp:system".to_owned(),
+            format!(
+                "consequence_enforced:member={member_did},\
+                 action={action_type},success={success},\
+                 context={ctx_id}"
+            )
+            .into_bytes(),
+            ts,
+        ),
+        other => (
+            "scp:system".to_owned(),
+            format!("{other:?}").into_bytes(),
+            ts,
+        ),
+    }
+}
+
 fn drain_and_deliver(context_id: &str) {
     let Ok(rt) = crate::runtime() else {
         return;
@@ -1315,76 +1401,7 @@ fn drain_and_deliver(context_id: &str) {
     let events = rt.block_on(mgr.drain_events(context_id));
 
     for event in events {
-        let (sender_did, payload, timestamp) = match event {
-            scp_core::context::membership::ContextEvent::MessageSent {
-                sender_did,
-                payload,
-                ..
-            } => {
-                #[allow(clippy::cast_precision_loss)]
-                let ts = scp_primitives::SystemClock.now_secs() as f64;
-                (sender_did.to_string(), payload, ts)
-            }
-            scp_core::context::membership::ContextEvent::MemberJoined {
-                member_did,
-                role_name,
-            } => {
-                #[allow(clippy::cast_precision_loss)]
-                let ts = scp_primitives::SystemClock.now_secs() as f64;
-                (
-                    "scp:system".to_owned(),
-                    format!("member_joined:{member_did}:{role_name}").into_bytes(),
-                    ts,
-                )
-            }
-            scp_core::context::membership::ContextEvent::MemberLeft { member_did } => {
-                #[allow(clippy::cast_precision_loss)]
-                let ts = scp_primitives::SystemClock.now_secs() as f64;
-                (
-                    "scp:system".to_owned(),
-                    format!("member_left:{member_did}").into_bytes(),
-                    ts,
-                )
-            }
-            scp_core::context::membership::ContextEvent::SystemClose { initiator_did } => {
-                #[allow(clippy::cast_precision_loss)]
-                let ts = scp_primitives::SystemClock.now_secs() as f64;
-                (
-                    "scp:system".to_owned(),
-                    format!("system_close:{initiator_did}").into_bytes(),
-                    ts,
-                )
-            }
-            scp_core::context::membership::ContextEvent::SequenceGapDetected {
-                sender_did,
-                expected_sequence,
-                first_delivered_sequence,
-                reason,
-            } => {
-                #[allow(clippy::cast_precision_loss)]
-                let ts = scp_primitives::SystemClock.now_secs() as f64;
-                (
-                    "scp:system".to_owned(),
-                    format!(
-                        "sequence_gap_detected:sender={sender_did},\
-                         expected={expected_sequence},\
-                         first_delivered={first_delivered_sequence},\
-                         reason={reason}"
-                    )
-                    .into_bytes(),
-                    ts,
-                )
-            }
-            other => {
-                #[allow(clippy::cast_precision_loss)]
-                let ts = scp_primitives::SystemClock.now_secs() as f64;
-                (
-                    "scp:system".to_owned(),
-                    format!("{other:?}").into_bytes(),
-                    ts,
-                )
-            }
-        };
+        let (sender_did, payload, timestamp) = convert_context_event(event);
 
         let msg = PyMessage::new(sender_did, payload, timestamp, context_id.to_owned());
         // Best-effort: if no channel is open or the channel is full, the

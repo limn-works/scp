@@ -355,19 +355,15 @@ fn governance_dispatch_calls_evaluate_consequences() {
 
 #[test]
 fn governance_enforces_economic_policy() {
-    // propose_governance_action_inner calls enforce_economic_policy (helper),
-    // which in turn calls evaluate_cost. Check both links in the call chain.
+    // Economy enforcement is now split between enforce_send_economy (messaging)
+    // and enforce_join_economy (lifecycle). Both call evaluate_cost directly.
     assert!(
-        fn_body_contains(
-            MANAGER_SRC,
-            "propose_governance_action_inner",
-            "enforce_economic_policy"
-        ),
-        "propose_governance_action_inner must call enforce_economic_policy"
+        fn_body_contains(MANAGER_SRC, "enforce_send_economy", "evaluate_cost"),
+        "enforce_send_economy must call evaluate_cost"
     );
     assert!(
-        fn_body_contains(MANAGER_SRC, "enforce_economic_policy", "evaluate_cost"),
-        "enforce_economic_policy must call evaluate_cost"
+        fn_body_contains(MANAGER_SRC, "enforce_join_economy", "evaluate_cost"),
+        "enforce_join_economy must call evaluate_cost"
     );
 }
 
@@ -413,11 +409,46 @@ fn pipeline_active_assertions_never_decrease() {
 /// the ignored test would run. A passing check = stale ignore = CI failure.
 #[test]
 fn no_stale_ignores() {
-    let stale: Vec<&str> = vec![];
+    let mut stale: Vec<&str> = vec![];
+    let source = include_str!("pipeline_wiring.rs");
 
-    // All batch-2 governance tests (#1541, #1530, #1531, #1537, #1548) have
-    // been wired and their #[ignore] attributes removed. No stale checks
-    // needed for these — they are now enforced directly.
+    // Check that batch-2 governance wiring is present (not ignored).
+    // These checks detect regressions where wiring is removed or ignored.
+    if fn_body_contains(
+        MANAGER_SRC,
+        "dispatch_consequences",
+        "evaluate_consequence_rules",
+    ) {
+        // #1531 consequence evaluation is wired -- verify no stale ignore.
+        if source.contains("#[ignore = \"waiting for #1531\"]") {
+            stale.push("governance_dispatch_calls_evaluate_consequences — #1531 is wired");
+        }
+    }
+
+    if fn_body_contains(MANAGER_SRC, "enforce_send_economy", "evaluate_cost") {
+        // #1537 economy enforcement is wired -- verify no stale ignore.
+        if source.contains("#[ignore = \"waiting for #1537\"]") {
+            stale.push("governance_enforces_economic_policy — #1537 is wired");
+        }
+    }
+
+    if fn_body_contains(
+        MANAGER_SRC,
+        "check_standing",
+        "compute_participation_record",
+    ) {
+        // #1530 standing checks are wired -- verify no stale ignore.
+        if source.contains("#[ignore = \"waiting for #1530\"]") {
+            stale.push("standing_check_wired — #1530 is wired");
+        }
+    }
+
+    if fn_body_contains(MANAGER_SRC, "execute_rotate_content_keys", "advance_epoch") {
+        // #1548 content key rotation is wired -- verify no stale ignore.
+        if source.contains("#[ignore = \"waiting for #1548\"]") {
+            stale.push("rotate_content_keys_calls_advance_epoch — #1548 is wired");
+        }
+    }
 
     assert!(
         stale.is_empty(),

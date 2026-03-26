@@ -77,6 +77,13 @@ impl ContextManager {
                 ctx.governance.timeout_task.cancel();
                 // Drop broadcast context state -- keys are zeroed by Zeroize.
                 ctx.broadcast_context = None;
+
+                // Standing decay: clear participation cache and cooldown state
+                // on context close. This ensures stale participation records
+                // don't carry over if the context is re-created (#1530).
+                ctx.governance.participation_cache.clear();
+                ctx.governance.cooldown_until.clear();
+
                 ctx.receive_buffer.push(ContextEvent::SystemClose {
                     initiator_did: initiator_did.clone(),
                 });

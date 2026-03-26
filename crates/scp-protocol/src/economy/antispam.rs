@@ -140,6 +140,12 @@ impl SenderVelocityTracker {
         }
     }
 
+    /// Returns the configured sliding window duration in seconds.
+    #[must_use]
+    pub const fn window_secs(&self) -> u64 {
+        self.window_secs
+    }
+
     /// Records a message from `sender` at the given `timestamp`.
     ///
     /// The timestamp is in seconds since the Unix epoch. Messages are

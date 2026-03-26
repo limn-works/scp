@@ -8414,6 +8414,38 @@ pub async fn context_member_role(handle: Arc<ContextHandle>, did: String) -> Opt
 // Free functions — events (#387)
 // ---------------------------------------------------------------------------
 
+/// Formats a [`ContextEvent`] as a human-readable string.
+///
+/// Consequence events (`ConsequenceTriggered`, `ConsequenceEnforced`) are
+/// formatted with structured key=value pairs for observability. All other
+/// events use their `Debug` representation.
+fn format_context_event(event: &scp_core::context::membership::ContextEvent) -> String {
+    match event {
+        scp_core::context::membership::ContextEvent::ConsequenceTriggered {
+            context_id,
+            member_did,
+            rule_index,
+            trigger_type,
+            action_type,
+        } => format!(
+            "consequence_triggered:member={member_did},\
+             rule={rule_index},trigger={trigger_type},\
+             action={action_type},context={context_id}"
+        ),
+        scp_core::context::membership::ContextEvent::ConsequenceEnforced {
+            context_id,
+            member_did,
+            action_type,
+            success,
+        } => format!(
+            "consequence_enforced:member={member_did},\
+             action={action_type},success={success},\
+             context={context_id}"
+        ),
+        other => format!("{other:?}"),
+    }
+}
+
 /// Drains all pending events from the context's receive buffer.
 ///
 /// Returns a list of event descriptions as JSON strings. Returns empty
@@ -8424,8 +8456,8 @@ pub async fn context_drain_events(handle: Arc<ContextHandle>) -> Vec<String> {
     manager
         .drain_events(&handle.context_id)
         .await
-        .into_iter()
-        .map(|e| format!("{e:?}"))
+        .iter()
+        .map(format_context_event)
         .collect()
 }
 
