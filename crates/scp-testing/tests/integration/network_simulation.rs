@@ -1380,7 +1380,7 @@ async fn application_layer_demo() {
     println!("    input: {search_input}");
 
     // The executor is a real async function that simulates the tool.
-    let (output, invoke_event, _consequences) = invoke_tool(
+    let (output, invoke_event, _consequences, _receipt) = invoke_tool(
         &handle,
         &tool_registry,
         &role_state,
@@ -1422,7 +1422,7 @@ async fn application_layer_demo() {
     println!("  Invoking 'calculator' as Charlie:");
     println!("    input: {calc_input}");
 
-    let (calc_output, _, _consequences) = invoke_tool(
+    let (calc_output, _, _consequences, _receipt) = invoke_tool(
         &handle,
         &tool_registry,
         &role_state,

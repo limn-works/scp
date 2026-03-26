@@ -607,7 +607,7 @@ async fn phase2_end_to_end_integration() {
 
     let tool_input = serde_json::json!({"operation": "add", "a": 1, "b": 2});
 
-    let (tool_output, tool_invoked_event, _consequences) = invoke_tool(
+    let (tool_output, tool_invoked_event, _consequences, _receipt) = invoke_tool(
         &context,
         &tool_registry,
         &role_state,

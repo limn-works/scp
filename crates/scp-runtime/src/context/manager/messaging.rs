@@ -33,13 +33,19 @@ fn enforce_send_economy(
         let metrics = scp_protocol::economy::policy::ObservableMetrics {
             sender_velocity: velocity,
             member_count: u64::try_from(ctx.membership.count()).unwrap_or(u64::MAX),
-            // context_message_rate: requires relay-level telemetry (#1597)
-            context_message_rate: 0,
-            // relay_queue_depth: requires relay-level telemetry (#1597)
+            context_message_rate: ctx.governance.velocity_tracker.aggregate_velocity(now),
+            // relay_queue_depth: Requires relay-level telemetry not available at ContextManager.
+            // The relay tracks its own queue depth server-side; populating this field would
+            // require a relay→client metrics channel (e.g., relay status subscription or
+            // periodic metric push). Until that transport-layer telemetry exists, relay-queue-
+            // based pricing variables evaluate to zero.
             relay_queue_depth: 0,
-            // time_of_day: seconds since midnight UTC from injected clock
             time_of_day: now % 86400,
-            // storage_usage: requires storage provider metrics (#1597)
+            // storage_usage: Requires storage provider metrics not available at ContextManager.
+            // The Storage trait (scp-platform) does not expose per-context byte counts.
+            // Populating this field would require adding a `storage_usage(context_id)` method
+            // to the Storage trait and propagating it through ContextManager. Until that
+            // provider-level API exists, storage-based pricing variables evaluate to zero.
             storage_usage: 0,
         };
         if let Some(cost) = scp_protocol::economy::policy::evaluate_cost(
@@ -483,13 +489,14 @@ impl ContextManager {
                 .governance
                 .velocity_tracker
                 .get_velocity(sender_did, self.clock.now_secs());
+            let now_secs = self.clock.now_secs();
             let metrics = scp_protocol::economy::policy::ObservableMetrics {
                 sender_velocity: velocity,
                 member_count: u64::try_from(ctx.membership.count()).unwrap_or(u64::MAX),
-                context_message_rate: 0,
-                relay_queue_depth: 0,
-                time_of_day: self.clock.now_secs() % 86400,
-                storage_usage: 0,
+                context_message_rate: ctx.governance.velocity_tracker.aggregate_velocity(now_secs),
+                relay_queue_depth: 0, // relay-level telemetry (see enforce_send_economy)
+                time_of_day: now_secs % 86400,
+                storage_usage: 0, // storage provider metrics (see enforce_send_economy)
             };
             if let Some(cost) = scp_protocol::economy::policy::evaluate_cost(
                 policy,
