@@ -723,6 +723,20 @@ impl GovernanceState {
         self.participation_cache.clear();
         self.cooldown_until.clear();
     }
+
+    /// Evicts stale entries from caches to prevent unbounded growth.
+    ///
+    /// Unlike [`decay_standing`](Self::decay_standing) (which clears
+    /// everything), this performs targeted eviction based on current state:
+    /// - `participation_cache`: removes DIDs not in `last_known_members`.
+    /// - `cooldown_until`: removes entries where `now >= expiry`.
+    fn evict_stale_entries(&mut self, now: u64) {
+        // Evict participation records for non-members.
+        self.participation_cache
+            .retain(|did, _| self.last_known_members.iter().any(|m| m.as_ref() == did));
+        // Evict expired cooldown entries.
+        self.cooldown_until.retain(|_, expiry| now < *expiry);
+    }
 }
 
 /// MLS epoch and reconnection state.
@@ -1658,7 +1672,11 @@ impl ContextManager {
                 // Best-effort persistence: log but don't fail the operation.
                 // In-memory state remains authoritative.
                 crate::metrics::record_persistence_failure();
-                let _ = e; // Suppress unused warning; tracing integration is TBD.
+                tracing::warn!(
+                    context_id = %context_id,
+                    error = %e,
+                    "failed to persist context snapshot"
+                );
             }
         }
     }
@@ -1669,7 +1687,11 @@ impl ContextManager {
         if let Some(ref persistence) = self.persistence
             && let Err(e) = persistence.persist_broadcast(context_id, snapshot)
         {
-            let _ = e;
+            tracing::warn!(
+                context_id = %context_id,
+                error = %e,
+                "failed to persist broadcast snapshot"
+            );
         }
     }
 

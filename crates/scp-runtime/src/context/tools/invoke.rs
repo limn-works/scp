@@ -258,18 +258,28 @@ where
     // 4b. Payment flow (#1537): 9-step paid action for tool invocations.
     // Runs after budget check but before tool execution. Only triggers when
     // a payment adapter is configured AND cost > 0.
+    // If payment fails, roll back the budget deducted by economy_pre_check.
     if let Some(ref econ) = economy
         && let (Some(adapter), Some(policy)) = (&econ.payment_adapter, econ.economic_policy)
     {
         let remaining = econ.budget_tracker.remaining(invoker_did);
-        execute_tool_payment(
+        if let Err(payment_err) = execute_tool_payment(
             adapter.as_ref(),
             policy,
             econ.context_id,
             invoker_did,
             remaining,
         )
-        .await?;
+        .await
+        {
+            // Restore the budget deducted by check_tool_economy.
+            if let Some(cost) = action_cost
+                && let Some(ref mut econ) = economy
+            {
+                econ.budget_tracker.grant(invoker_did, cost);
+            }
+            return Err(payment_err);
+        }
     }
 
     // 5. Execute the tool with timeout.
@@ -436,18 +446,28 @@ where
         .transpose()?;
 
     // 4b. Payment flow (#1537): 9-step paid action for tool invocations.
+    // If payment fails, roll back the budget deducted by economy_pre_check.
     if let Some(ref econ) = economy
         && let (Some(adapter), Some(policy)) = (&econ.payment_adapter, econ.economic_policy)
     {
         let remaining = econ.budget_tracker.remaining(invoker_did);
-        execute_tool_payment(
+        if let Err(payment_err) = execute_tool_payment(
             adapter.as_ref(),
             policy,
             econ.context_id,
             invoker_did,
             remaining,
         )
-        .await?;
+        .await
+        {
+            // Restore the budget deducted by check_tool_economy.
+            if let Some(cost) = action_cost
+                && let Some(ref mut econ) = economy
+            {
+                econ.budget_tracker.grant(invoker_did, cost);
+            }
+            return Err(payment_err);
+        }
     }
 
     // 5. Execute with timeout and cancellation.
@@ -534,6 +554,14 @@ pub fn check_tool_economy(
             &scp_protocol::economy::types::PaidActionType::ToolInvoke,
             &metrics,
         ) {
+            // Auto-grant unlimited budget on first spend if no governance-approved
+            // budget exists (same pattern as enforce_send_economy).
+            if !budget_tracker.has_budget(invoker_did) {
+                budget_tracker.grant(
+                    invoker_did,
+                    scp_protocol::economy::types::Amount::new(u64::MAX),
+                );
+            }
             // Record spend against invoker budget (§19.5, ADR-033).
             budget_tracker
                 .record_spend(invoker_did, cost)
@@ -738,7 +766,7 @@ async fn execute_tool_payment(
     })?;
 
     // Steps 5-8: Process (verify auth + capture).
-    let _processed = crate::economy::integration::process_paid_action(
+    let processed = crate::economy::integration::process_paid_action(
         &bridge,
         Some(policy),
         &prepared.envelope,
@@ -752,9 +780,18 @@ async fn execute_tool_payment(
         remaining: budget_remaining.0,
     })?;
 
-    // Receipt verification is done by the ContextManager layer
-    // (verify_payment_receipts) which has access to the event log.
-    // The invoke_tool function does not have event log access.
+    // TODO(#1596): Return the payment receipt alongside the tool output so the
+    // caller can pass it to `ContextManager::verify_payment_receipts`. Currently
+    // the receipt is logged but not returned because `execute_tool_payment`
+    // returns `Result<(), InvocationError>` and changing it to return the receipt
+    // requires threading through `invoke_tool`'s return type.
+    if let Some(receipt) = &processed.receipt {
+        tracing::debug!(
+            receipt_id = %hex::encode(receipt.receipt_id),
+            adapter_id = %receipt.adapter_id,
+            "tool invocation payment receipt captured"
+        );
+    }
 
     Ok(())
 }

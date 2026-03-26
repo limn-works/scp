@@ -177,6 +177,12 @@ impl ContextManager {
     /// When no payment adapter is configured, returns `Ok(None)` immediately.
     /// When the evaluated cost is zero, also returns `Ok(None)`.
     ///
+    /// **Known gaps (#1593):** Steps 2 (spending UCAN verification) and 4
+    /// (authorization attachment to envelope) are not yet implemented. These
+    /// require UCAN parameters threaded through `send_message` and
+    /// `join_context` from the FFI layer. Tool invoke has UCAN plumbing via
+    /// `ToolEconomyContext` but send/join do not.
+    ///
     /// # Lock pattern
     ///
     /// Policy and metrics are extracted under the contexts lock, then the lock
@@ -212,12 +218,17 @@ impl ContextManager {
                 .velocity_tracker
                 .get_velocity(payer_did, self.clock.now_secs());
 
+            let now_secs = self.clock.now_secs();
             let metrics = ObservableMetrics {
                 sender_velocity: velocity,
                 member_count,
+                // context_message_rate: requires relay-level telemetry (#1597)
                 context_message_rate: 0,
+                // relay_queue_depth: requires relay-level telemetry (#1597)
                 relay_queue_depth: 0,
-                time_of_day: 0,
+                // time_of_day: seconds since midnight UTC from injected clock
+                time_of_day: now_secs % 86400,
+                // storage_usage: requires storage provider metrics (#1597)
                 storage_usage: 0,
             };
             (policy, metrics)
@@ -229,7 +240,7 @@ impl ContextManager {
         };
 
         // Evaluate cost — zero cost means no payment needed.
-        let Some(cost) =
+        let Some(_cost) =
             scp_protocol::economy::policy::evaluate_cost(&policy, &action_type, &metrics)
                 .filter(|c| c.0 > 0)
         else {
@@ -268,13 +279,11 @@ impl ContextManager {
             );
         }
 
-        // Record spend in budget tracker under lock.
-        {
-            let mut contexts = self.contexts.lock().await;
-            if let Some(ctx) = contexts.get_mut(context_id) {
-                let _ = ctx.governance.budget_tracker.record_spend(payer_did, cost);
-            }
-        }
+        // Budget tracking (record_spend) is the responsibility of the
+        // per-action enforcement functions (enforce_send_economy,
+        // enforce_join_economy, check_tool_economy). The payment adapter
+        // handles real-money settlement independently. Recording spend
+        // here would double-charge the member.
 
         Ok(Some(receipt))
     }

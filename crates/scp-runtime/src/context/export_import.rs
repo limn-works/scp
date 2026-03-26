@@ -314,7 +314,9 @@ fn strip_snapshot_for_public(snapshot: &ContextSnapshot) -> ContextSnapshot {
         migration_state: None,
         // Access keys are sensitive material — not exported in public scope.
         access_key_store: scp_protocol::crypto::access_keys::AccessKeyStore::new(),
-        consequence_rules: Vec::new(),
+        // Consequence rules ARE part of the public opt-in contract — prospective
+        // members need to see what behavioral consequences exist before joining.
+        consequence_rules: snapshot.consequence_rules.clone(),
         participation_cache: HashMap::new(),
         velocity_tracker: None,
     }

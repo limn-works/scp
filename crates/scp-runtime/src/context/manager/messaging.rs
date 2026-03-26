@@ -17,6 +17,9 @@ use super::{
 ///
 /// Checks sender velocity and evaluates cost from the context's economic
 /// policy. Records spend against the sender's budget.
+// TODO(#1593): Spending UCAN AND-composition (spec §19.5) is only enforced for
+// tool invoke, not send_message. Send_message needs a UCAN parameter threaded
+// through the FFI layer to enforce check_and_composition here.
 fn enforce_send_economy(
     ctx: &mut PerContextState,
     sender_did: &DID,
@@ -30,13 +33,13 @@ fn enforce_send_economy(
         let metrics = scp_protocol::economy::policy::ObservableMetrics {
             sender_velocity: velocity,
             member_count: u64::try_from(ctx.membership.count()).unwrap_or(u64::MAX),
-            // context_message_rate: requires relay-level telemetry (not available at ContextManager layer)
+            // context_message_rate: requires relay-level telemetry (#1597)
             context_message_rate: 0,
-            // relay_queue_depth: requires relay-level telemetry (not available at ContextManager layer)
+            // relay_queue_depth: requires relay-level telemetry (#1597)
             relay_queue_depth: 0,
-            // time_of_day: could use wall-clock but pricing formula doesn't use it yet
-            time_of_day: 0,
-            // storage_usage: requires storage provider metrics (not available at ContextManager layer)
+            // time_of_day: seconds since midnight UTC from injected clock
+            time_of_day: now % 86400,
+            // storage_usage: requires storage provider metrics (#1597)
             storage_usage: 0,
         };
         if let Some(cost) = scp_protocol::economy::policy::evaluate_cost(
@@ -44,6 +47,15 @@ fn enforce_send_economy(
             &scp_protocol::economy::types::PaidActionType::MessageSend,
             &metrics,
         ) {
+            // Auto-grant unlimited budget on first spend if no governance-approved
+            // budget exists. This prevents NoBudget errors for new members while
+            // still allowing governance to cap spending via ApproveSpend.
+            if !ctx.governance.budget_tracker.has_budget(sender_did) {
+                ctx.governance.budget_tracker.grant(
+                    sender_did,
+                    scp_protocol::economy::types::Amount::new(u64::MAX),
+                );
+            }
             ctx.governance
                 .budget_tracker
                 .record_spend(sender_did, cost)
@@ -372,16 +384,8 @@ impl ContextManager {
             }
         };
         // Payment flow (#1537): execute 9-step payment for message sends.
-        // Runs between Phase 1 (lock) and Phase 2 (encrypt) — outside the lock.
-        // Only triggers when a payment adapter is configured AND cost > 0.
-        // Budget enforcement (evaluate_cost + record_spend) already happened
-        // in enforce_send_economy above (covers free-context budgets).
-        self.execute_paid_action(
-            scp_protocol::economy::types::PaidActionType::MessageSend,
-            sender_did,
-            &context_id,
-        )
-        .await?;
+        // If payment fails, roll back the budget deducted in Phase 1.
+        self.execute_send_payment(&context_id, sender_did).await?;
 
         // Phase 2 (no lock): Encrypt + send.
         // If encryption or transport fails, roll back the sequence number
@@ -438,6 +442,65 @@ impl ContextManager {
         .await
     }
 
+    /// Executes the 9-step payment flow for message sends with budget rollback.
+    ///
+    /// Runs between Phase 1 (lock) and Phase 2 (encrypt) — outside the lock.
+    /// Only triggers when a payment adapter is configured AND cost > 0.
+    /// Budget enforcement already happened in `enforce_send_economy` above.
+    /// If payment fails, rolls back the budget deducted in Phase 1.
+    async fn execute_send_payment(
+        &self,
+        context_id: &str,
+        sender_did: &DID,
+    ) -> Result<(), ContextError> {
+        if let Err(payment_err) = self
+            .execute_paid_action(
+                scp_protocol::economy::types::PaidActionType::MessageSend,
+                sender_did,
+                context_id,
+            )
+            .await
+        {
+            self.rollback_send_budget(context_id, sender_did).await;
+            return Err(payment_err);
+        }
+        Ok(())
+    }
+
+    /// Restores the budget deducted by `enforce_send_economy` when the
+    /// payment flow fails after budget deduction.
+    ///
+    /// Re-evaluates the cost from the economic policy (same formula as
+    /// `enforce_send_economy`) and grants it back to the sender. This is
+    /// best-effort: if the context is no longer registered or has no
+    /// economic policy, the rollback is silently skipped.
+    async fn rollback_send_budget(&self, context_id: &str, sender_did: &DID) {
+        let mut contexts = self.contexts.lock().await;
+        if let Some(ctx) = contexts.get_mut(context_id)
+            && let Some(ref policy) = ctx.governance.economic_policy
+        {
+            let velocity = ctx
+                .governance
+                .velocity_tracker
+                .get_velocity(sender_did, self.clock.now_secs());
+            let metrics = scp_protocol::economy::policy::ObservableMetrics {
+                sender_velocity: velocity,
+                member_count: u64::try_from(ctx.membership.count()).unwrap_or(u64::MAX),
+                context_message_rate: 0,
+                relay_queue_depth: 0,
+                time_of_day: self.clock.now_secs() % 86400,
+                storage_usage: 0,
+            };
+            if let Some(cost) = scp_protocol::economy::policy::evaluate_cost(
+                policy,
+                &scp_protocol::economy::types::PaidActionType::MessageSend,
+                &metrics,
+            ) {
+                ctx.governance.budget_tracker.grant(sender_did, cost);
+            }
+        }
+    }
+
     /// Pushes a `MessageSent` event, appends to the event log, and persists.
     ///
     /// Extracted from `send_message` Phase 3 to keep the outer function
@@ -487,6 +550,7 @@ impl ContextManager {
                         sender_did.as_ref(),
                         now,
                     ),
+                    &*self.clock,
                 );
 
                 // Participation record update (#1530) — refresh cache after send.
