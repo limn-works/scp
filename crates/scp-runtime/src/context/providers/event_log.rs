@@ -52,13 +52,12 @@ pub struct EventLogEntry {
     /// the proposer for governance, the joiner for membership events).
     ///
     /// Added as part of #1594 to enable full-history consequence evaluation.
-    /// Empty string for legacy entries that predate this field.
     pub actor_did: String,
     /// Seconds since UNIX epoch when the event was appended.
     pub timestamp: u64,
     /// SHA-256 hash of the previous entry (all zeros for the first entry).
     pub prev_hash: [u8; 32],
-    /// SHA-256 hash of this entry (computed over event + `actor_did` + timestamp + `prev_hash`).
+    /// SHA-256 hash of this entry (domain-separated SHA-256 over event + `actor_did` + timestamp + `prev_hash`).
     pub hash: [u8; 32],
 }
 
@@ -96,13 +95,10 @@ impl ContextLog {
 
 /// Computes the SHA-256 hash for an event log entry.
 ///
-/// Hash input: `"SCP-EXPORT-ENTRY-V2:" || event_bytes || actor_did_bytes || timestamp_be_bytes || prev_hash`
+/// Hash input: `"SCP-EXPORT-ENTRY:" || event_bytes || actor_did_bytes || timestamp_be_bytes || prev_hash`
 ///
 /// Uses big-endian for the timestamp to match codebase convention, and a
 /// domain separator to prevent cross-protocol hash confusion.
-///
-/// V2 includes `actor_did` in the hash (#1594). V1 entries (without
-/// `actor_did`) use [`compute_entry_hash_v1`] for verification of legacy logs.
 fn compute_entry_hash(
     event: &str,
     actor_did: &str,
@@ -110,23 +106,9 @@ fn compute_entry_hash(
     prev_hash: &[u8; 32],
 ) -> [u8; 32] {
     let mut hasher = Sha256::new();
-    hasher.update(b"SCP-EXPORT-ENTRY-V2:");
+    hasher.update(b"SCP-EXPORT-ENTRY:");
     hasher.update(event.as_bytes());
     hasher.update(actor_did.as_bytes());
-    hasher.update(timestamp.to_be_bytes());
-    hasher.update(prev_hash);
-    let result = hasher.finalize();
-    let mut hash = [0u8; 32];
-    hash.copy_from_slice(&result);
-    hash
-}
-
-/// V1 hash computation for verifying legacy event log entries that do not
-/// include `actor_did`. Used by [`verify_chain_integrity`] as a fallback.
-fn compute_entry_hash_v1(event: &str, timestamp: u64, prev_hash: &[u8; 32]) -> [u8; 32] {
-    let mut hasher = Sha256::new();
-    hasher.update(b"SCP-EXPORT-ENTRY-V1:");
-    hasher.update(event.as_bytes());
     hasher.update(timestamp.to_be_bytes());
     hasher.update(prev_hash);
     let result = hasher.finalize();
@@ -386,19 +368,14 @@ impl MerkleEventLogProvider {
                 return false;
             }
 
-            // Check self-hash correctness. Try V2 (with actor_did) first,
-            // fall back to V1 for legacy entries.
-            let expected_v2 = compute_entry_hash(
+            // Check self-hash correctness.
+            let expected = compute_entry_hash(
                 &entry.event,
                 &entry.actor_did,
                 entry.timestamp,
                 &entry.prev_hash,
             );
-            let expected_v1 =
-                compute_entry_hash_v1(&entry.event, entry.timestamp, &entry.prev_hash);
-            if !bool::from(entry.hash.ct_eq(&expected_v2))
-                && !bool::from(entry.hash.ct_eq(&expected_v1))
-            {
+            if !bool::from(entry.hash.ct_eq(&expected)) {
                 return false;
             }
         }
@@ -814,18 +791,14 @@ fn verify_chain_integrity(entries: &[EventLogEntry]) -> Result<(), ContextCreati
                 "Merkle chain broken at entry {i}: prev_hash mismatch"
             )));
         }
-        // Try V2 hash first (includes actor_did), fall back to V1 for
-        // legacy entries that predate the actor_did field.
-        let expected_v2 = compute_entry_hash(
+        // Verify self-hash correctness.
+        let expected = compute_entry_hash(
             &entry.event,
             &entry.actor_did,
             entry.timestamp,
             &entry.prev_hash,
         );
-        let expected_v1 = compute_entry_hash_v1(&entry.event, entry.timestamp, &entry.prev_hash);
-        if !bool::from(entry.hash.ct_eq(&expected_v2))
-            && !bool::from(entry.hash.ct_eq(&expected_v1))
-        {
+        if !bool::from(entry.hash.ct_eq(&expected)) {
             return Err(ContextCreationError::EventLogFailed(format!(
                 "Merkle chain broken at entry {i}: hash mismatch"
             )));
