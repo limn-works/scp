@@ -20,7 +20,9 @@ use super::{
 /// Enforces a `CapabilitySuspension` consequence action on a member.
 ///
 /// Suspends capabilities by revoking write/read access for matching
-/// capability names. Enforced at the `send_message` and `deliver_incoming` gates.
+/// capability names. Uses exact matching to prevent false positives
+/// (e.g., "spreadsheet" matching "write"). Enforced at the
+/// `send_message` and `deliver_incoming` gates.
 fn enforce_capability_suspension(
     ctx: &mut PerContextState,
     member_did: &DID,
@@ -28,13 +30,22 @@ fn enforce_capability_suspension(
 ) -> bool {
     let mut applied = false;
     for cap_name in caps {
-        if cap_name.contains("write") {
-            ctx.access.write_revoked_members.insert(member_did.clone());
-            applied = true;
-        }
-        if cap_name.contains("read") {
-            ctx.access.read_revoked_members.insert(member_did.clone());
-            applied = true;
+        match cap_name.as_str() {
+            "write" | "MessagesWrite" | "messages:write" => {
+                ctx.access.write_revoked_members.insert(member_did.clone());
+                applied = true;
+            }
+            "read" | "MessagesRead" | "messages:read" => {
+                ctx.access.read_revoked_members.insert(member_did.clone());
+                applied = true;
+            }
+            other => {
+                tracing::warn!(
+                    capability = other,
+                    member = %member_did,
+                    "unknown capability in suspension — no action taken"
+                );
+            }
         }
     }
     applied
@@ -43,16 +54,16 @@ fn enforce_capability_suspension(
 /// Enforces a `RoleDemotion` consequence action on a member.
 ///
 /// Demotes the member to the specified role (best-effort — role may not exist).
-fn enforce_role_demotion(ctx: &mut PerContextState, member_did: &DID, to_role: &str) -> bool {
+/// Uses the injected clock (via `now` parameter) instead of `SystemClock` to
+/// keep all governance timing consistent with the `ContextManager`'s clock.
+fn enforce_role_demotion(
+    ctx: &mut PerContextState,
+    member_did: &DID,
+    to_role: &str,
+    clock: &dyn scp_primitives::Clock,
+) -> bool {
     let creator = ctx.role_state.creator_did.clone();
-    roles::assign_role(
-        &mut ctx.role_state,
-        member_did,
-        to_role,
-        &creator,
-        &scp_primitives::SystemClock,
-    )
-    .is_ok()
+    roles::assign_role(&mut ctx.role_state, member_did, to_role, &creator, clock).is_ok()
 }
 
 /// Evaluates consequence rules against a member and dispatches enforcement
@@ -70,6 +81,7 @@ pub(super) fn dispatch_consequences(
     context_id: &str,
     member_did: &DID,
     now: u64,
+    clock: &dyn scp_primitives::Clock,
 ) {
     if ctx.governance.consequence_rules.is_empty() {
         return;
@@ -86,7 +98,7 @@ pub(super) fn dispatch_consequences(
         evaluate_consequence_rules(&rules, &events, member_did.as_ref(), now);
 
     // Enforce the triggered consequences.
-    enforce_triggered_consequences(ctx, context_id, member_did, now, &triggered);
+    enforce_triggered_consequences(ctx, context_id, member_did, now, &triggered, clock);
 }
 
 /// Enforces a set of pre-evaluated triggered consequences.
@@ -100,6 +112,7 @@ pub(super) fn enforce_triggered_consequences(
     member_did: &DID,
     now: u64,
     triggered: &[TriggeredConsequence],
+    clock: &dyn scp_primitives::Clock,
 ) {
     let rules: Vec<ConsequenceRule> = ctx.governance.consequence_rules.clone();
 
@@ -136,9 +149,7 @@ pub(super) fn enforce_triggered_consequences(
         // wiring gates can detect the call_expression per-variant.
         let success = match &consequence.action {
             scp_protocol::trust::consequence::ConsequenceAction::CapabilitySuspension(caps) => {
-                enforce_capability_suspension(ctx, member_did, caps);
-                ctx.access.write_revoked_members.contains(member_did)
-                    || ctx.access.read_revoked_members.contains(member_did)
+                enforce_capability_suspension(ctx, member_did, caps)
             }
             scp_protocol::trust::consequence::ConsequenceAction::AccessRevocation => {
                 // Revoke all access: block both read and write.
@@ -147,8 +158,7 @@ pub(super) fn enforce_triggered_consequences(
                 true
             }
             scp_protocol::trust::consequence::ConsequenceAction::RoleDemotion { to_role } => {
-                enforce_role_demotion(ctx, member_did, to_role);
-                true
+                enforce_role_demotion(ctx, member_did, to_role, clock)
             }
         };
 
@@ -174,6 +184,13 @@ pub(super) fn enforce_triggered_consequences(
 /// This bridges the gap between the in-memory receive buffer (which tracks
 /// recent context events) and the event log types expected by the trust
 /// evaluation functions.
+///
+/// **Known limitation (#1594):** The receive buffer is capped at 1000 events.
+/// Long-running contexts lose history, which means participation records and
+/// consequence evaluation only reflect recent activity. For full-history
+/// participation, use `self.event_log.event_log_entries()` instead — but
+/// that requires access to the `ContextEventLogProvider` which is not
+/// available to free functions. See #1594 for the migration plan.
 pub(super) fn event_log_entries_for_consequences(
     ctx: &PerContextState,
     _context_id: &str,
@@ -181,6 +198,11 @@ pub(super) fn event_log_entries_for_consequences(
 ) -> Vec<scp_event_log::Event> {
     let mut events = Vec::new();
     let buffer_events = ctx.receive_buffer.event_log_entries();
+    let buffer_len = buffer_events.len() as u64;
+    // Assign sequential timestamps so that velocity windowing works correctly.
+    // The most recent event gets `now`, and older events are spaced 1 second
+    // apart backwards in time. This is an approximation — the ReceiveBuffer
+    // does not track insertion timestamps.
     for (seq, ctx_event) in buffer_events.iter().enumerate() {
         let (event_type, actor_did) = match ctx_event {
             ContextEvent::MessageSent { sender_did, .. }
@@ -192,10 +214,13 @@ pub(super) fn event_log_entries_for_consequences(
             }
             _ => continue,
         };
+        // Oldest event gets `now - (buffer_len - 1)`, newest gets `now`.
+        let estimated_ts =
+            now.saturating_sub(buffer_len.saturating_sub(1).saturating_sub(seq as u64));
         events.push(scp_event_log::Event {
             event_type,
             actor_did,
-            timestamp: now,
+            timestamp: estimated_ts,
             sequence: seq as u64,
             payload: scp_event_log::EventPayload { data: Vec::new() },
             prev_hash: [0u8; 32],
@@ -214,7 +239,11 @@ pub(super) fn event_log_entries_for_consequences(
 ///
 /// Refreshes the participation cache before checking by calling
 /// `compute_participation_record` with recent events from the receive buffer.
-fn check_standing(ctx: &mut PerContextState, proposer_did: &DID) -> Result<(), ContextError> {
+fn check_standing(
+    ctx: &mut PerContextState,
+    proposer_did: &DID,
+    now: u64,
+) -> Result<(), ContextError> {
     // Check for pending removal (existing defense-in-depth).
     for (proposal, _seq, _ts) in ctx.governance.approved_proposals.values() {
         if let GovernanceAction::RemoveMember { did, .. } = &proposal.action
@@ -228,7 +257,6 @@ fn check_standing(ctx: &mut PerContextState, proposer_did: &DID) -> Result<(), C
 
     // Refresh participation record from recent events before checking standing (#1530).
     let context_id = ctx.handle.context_id().to_owned();
-    let now = scp_primitives::SystemClock.now_secs();
     let events = event_log_entries_for_consequences(ctx, &context_id, now);
     if !events.is_empty()
         && let Ok(record) = scp_protocol::trust::participation::compute_participation_record(
@@ -492,6 +520,7 @@ impl ContextManager {
                     context_id,
                     &proposal.proposer_did,
                     self.clock.now_secs(),
+                    &*self.clock,
                 );
 
                 // Update participation record after governance action (#1530).
@@ -962,7 +991,7 @@ impl ContextManager {
 
             // Standing check: verify proposer is in good governance
             // standing before allowing new proposals (#1530).
-            check_standing(ctx, proposer_did)?;
+            check_standing(ctx, proposer_did, self.clock.now_secs())?;
 
             // SCP-272: Check and auto-resolve expired governance freezes (48-hour timeout).
             let freeze_events = self.check_and_resolve_expired_freezes(ctx);
@@ -1801,6 +1830,13 @@ impl ContextManager {
             // that must also rotate on member removal (§9.16).
             self.crypto
                 .remove_member_sender_key(&context_id_bytes, did.as_ref())?;
+
+            // TODO(#1595): Remaining members' sender keys should be rotated after
+            // member removal (spec §9.16). The ContextCryptoProvider trait does
+            // not currently have a `rotate_sender_key` method for the general
+            // case — only `generate_sender_key` (creation-time) and
+            // `rotate_sender_key_for_block` (blocking-specific). A general-purpose
+            // rotation method is needed on the trait to implement this.
 
             // Crypto: remove from MLS group under lock to prevent TOCTOU
             // race (concurrent remove of same DID).
@@ -3963,6 +3999,10 @@ impl ContextManager {
                             .cloned()
                             .collect();
                         ctx.governance.last_known_members = current_members;
+
+                        // Evict stale cache entries to prevent unbounded growth
+                        // of participation_cache and cooldown_until (#1530).
+                        ctx.governance.evict_stale_entries(clock.now_secs());
 
                         // Drain epoch-reset members accumulated since last tick
                         // (ADR-031 §5: votes from reset members are invalidated).

@@ -206,6 +206,9 @@ pub struct PyContextParams {
     /// Per-caller session cap (spec §6.2.1, ADR-043).
     /// When `None`, defaults to `DEFAULT_SESSION_CAP_PER_CALLER` (1000).
     session_cap: Option<u32>,
+    /// Optional consequence rules as a JSON string (ADR-017, #1531).
+    /// When `None`, defaults to an empty list (no consequences).
+    consequence_rules: Option<String>,
 }
 
 #[pymethods]
@@ -321,6 +324,13 @@ impl PyContextParams {
     #[allow(clippy::missing_const_for_fn)] // PyO3 getter cannot be const.
     fn session_cap(&self) -> Option<u32> {
         self.session_cap
+    }
+
+    /// Returns the consequence rules as a JSON string, or `None` if the
+    /// context has no consequence rules (ADR-017, #1531).
+    #[getter]
+    fn consequence_rules(&self) -> Option<&str> {
+        self.consequence_rules.as_deref()
     }
 
     fn __repr__(&self) -> String {
@@ -542,6 +552,16 @@ impl PyContextParams {
             None => None,
         };
 
+        // consequence_rules: Optional[str] (JSON string, default: None) -- ADR-017, #1531
+        let consequence_rules: Option<String> = match dict.get_item("consequence_rules")? {
+            Some(val) if val.is_none() => None,
+            Some(val) => {
+                let cr: String = val.extract()?;
+                Some(cr)
+            }
+            None => None,
+        };
+
         Ok(Self {
             ceiling,
             roles,
@@ -558,6 +578,7 @@ impl PyContextParams {
             max_chain_depth,
             max_nesting_depth,
             session_cap,
+            consequence_rules,
         })
     }
 }
@@ -1463,6 +1484,7 @@ fn py_context_receive(handle: &PyContextHandle) -> PyResult<PyMessageReceiver> {
 ///
 /// Converts the flat FFI-facing parameter representation into the typed
 /// scp-core parameter struct used by [`ContextManager::create_context`].
+#[allow(clippy::too_many_lines)] // 1:1 field mapping — splitting would reduce readability
 fn build_core_context_params(
     py_params: &PyContextParams,
 ) -> PyResult<scp_core::context::ContextParams> {
@@ -1569,7 +1591,16 @@ fn build_core_context_params(
             scp_core::context::params::IncompleteVerificationPolicy::default(),
         min_protocol_version: py_params.min_protocol_version,
         migration_source: None,
-        consequence_rules: Vec::new(),
+        consequence_rules: py_params
+            .consequence_rules
+            .as_deref()
+            .map(|cr_json| {
+                serde_json::from_str(cr_json).map_err(|e| {
+                    PyRuntimeError::new_err(format!("invalid consequence_rules JSON: {e}"))
+                })
+            })
+            .transpose()?
+            .unwrap_or_default(),
     })
 }
 
@@ -4282,6 +4313,7 @@ mod tests {
             max_chain_depth: None,
             max_nesting_depth: None,
             session_cap: None,
+            consequence_rules: None,
         }
     }
 

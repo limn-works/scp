@@ -60,7 +60,14 @@ fn post_join_bookkeeping(ctx: &mut PerContextState, context_id: &str, member_did
     }
 }
 
-fn enforce_join_economy(ctx: &mut PerContextState, joiner_did: &DID) -> Result<(), ContextError> {
+// TODO(#1593): Spending UCAN AND-composition (spec §19.5) is only enforced for
+// tool invoke, not join_context. Join needs a UCAN parameter threaded through
+// the FFI layer to enforce check_and_composition here.
+fn enforce_join_economy(
+    ctx: &mut PerContextState,
+    joiner_did: &DID,
+    now: u64,
+) -> Result<(), ContextError> {
     if scp_protocol::economy::policy::auto_accept_blocked_by_economics(
         ctx.governance.economic_policy.as_ref(),
     ) {
@@ -71,15 +78,15 @@ fn enforce_join_economy(ctx: &mut PerContextState, joiner_did: &DID) -> Result<(
     if let Some(ref policy) = ctx.governance.economic_policy {
         let metrics = scp_protocol::economy::policy::ObservableMetrics {
             member_count: u64::try_from(ctx.membership.count()).unwrap_or(u64::MAX),
-            // context_message_rate: requires relay-level telemetry (unavailable at ContextManager)
+            // context_message_rate: requires relay-level telemetry (#1597)
             context_message_rate: 0,
-            // relay_queue_depth: requires relay-level telemetry (unavailable at ContextManager)
+            // relay_queue_depth: requires relay-level telemetry (#1597)
             relay_queue_depth: 0,
-            // time_of_day: could use wall-clock but pricing formula doesn't use it yet
-            time_of_day: 0,
+            // time_of_day: seconds since midnight UTC from injected clock
+            time_of_day: now % 86400,
             // sender_velocity: not tracked per-joiner (velocity is per-sender, join is one-shot)
             sender_velocity: 0,
-            // storage_usage: requires storage provider metrics (unavailable at ContextManager)
+            // storage_usage: requires storage provider metrics (#1597)
             storage_usage: 0,
         };
         if let Some(cost) = scp_protocol::economy::policy::evaluate_cost(
@@ -87,6 +94,14 @@ fn enforce_join_economy(ctx: &mut PerContextState, joiner_did: &DID) -> Result<(
             &scp_protocol::economy::types::PaidActionType::ContextJoin,
             &metrics,
         ) {
+            // Auto-grant unlimited budget on first spend if no governance-approved
+            // budget exists (same pattern as enforce_send_economy).
+            if !ctx.governance.budget_tracker.has_budget(joiner_did) {
+                ctx.governance.budget_tracker.grant(
+                    joiner_did,
+                    scp_protocol::economy::types::Amount::new(u64::MAX),
+                );
+            }
             ctx.governance
                 .budget_tracker
                 .record_spend(joiner_did, cost)
@@ -920,14 +935,24 @@ impl ContextManager {
             }
             contexts.insert(context_id.clone(), per_context);
         }
+        self.finalize_create(&context_id, params.ttl, &handle).await;
+        Ok(handle)
+    }
+
+    /// Post-creation finalization: gauges, governance timeout, persistence, TTL timer.
+    async fn finalize_create(
+        &self,
+        context_id: &str,
+        ttl: Option<std::time::Duration>,
+        handle: &ContextHandle,
+    ) {
         self.update_context_gauges().await;
-        self.start_governance_timeout_task(&context_id).await;
-        self.persist_context_and_broadcast(&context_id).await;
-        if let Some(ttl_duration) = params.ttl {
-            self.spawn_ttl_timer(&context_id, ttl_duration, handle.clone())
+        self.start_governance_timeout_task(context_id).await;
+        self.persist_context_and_broadcast(context_id).await;
+        if let Some(ttl_duration) = ttl {
+            self.spawn_ttl_timer(context_id, ttl_duration, handle.clone())
                 .await;
         }
-        Ok(handle)
     }
 
     /// Creates a new SCP context without tracking membership state.
@@ -1283,6 +1308,8 @@ impl ContextManager {
         // Runs before the lock acquisition so async adapter calls don't hold
         // the contexts mutex. Budget enforcement (evaluate_cost + record_spend)
         // happens inside enforce_join_economy below (covers free-context budgets).
+        // If payment fails, the join is rejected — no budget rollback needed
+        // because enforce_join_economy runs AFTER this point (inside the lock).
         self.execute_paid_action(
             scp_protocol::economy::types::PaidActionType::ContextJoin,
             &member_did,
@@ -1314,7 +1341,7 @@ impl ContextManager {
                 .check_version_compatibility(scp_protocol::envelope::SCP_PROTOCOL_VERSION)?;
 
             // Economy enforcement (#1537) — auto-accept guard + join cost.
-            enforce_join_economy(ctx, &member_did)?;
+            enforce_join_economy(ctx, &member_did, self.clock.now_secs())?;
 
             // Sybil resistance check (#1530) — fail-closed with `?`.
             evaluate_sybil_resistance(ctx, &member_did, self.clock.now_secs())?;
