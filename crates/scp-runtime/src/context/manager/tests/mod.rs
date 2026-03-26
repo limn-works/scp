@@ -4,6 +4,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use super::*;
 use scp_protocol::context::params::MemoryScope;
 use scp_protocol::context::{ContextMode, ContextState};
+use scp_protocol::crypto::ucan::UcanToken;
 
 mod broadcast;
 mod governance;
@@ -64,6 +65,35 @@ pub(super) async fn test_custody_from_seed(
     let custody = scp_platform::testing::InMemoryKeyCustody::new();
     let handle = custody.import_ed25519_key(seed).await;
     (custody, handle)
+}
+
+// -----------------------------------------------------------------------
+// Dummy UCAN for economy tests
+// -----------------------------------------------------------------------
+
+/// Returns a minimal [`UcanToken`] suitable for tests that need a spending
+/// UCAN to pass the AND-composition gate (spec §19.5, #1593).
+///
+/// This token is structurally valid but not cryptographically signed.
+/// The `check_and_composition` function only checks `Some` vs `None`,
+/// so this suffices for unit tests. Positive-path testing with a real
+/// signed JWT requires UCAN test fixtures (not yet built).
+pub(super) fn dummy_spending_ucan() -> UcanToken {
+    UcanToken {
+        header: scp_protocol::crypto::ucan::UcanHeader::new(),
+        payload: scp_protocol::crypto::ucan::UcanPayload {
+            iss: "did:key:test-spender".to_owned(),
+            aud: "did:key:test-context".to_owned(),
+            exp: u64::MAX,
+            nbf: None,
+            nnc: "test-nonce".to_owned(),
+            att: vec![],
+            prf: vec![],
+            fct: None,
+        },
+        signature: vec![],
+        encoded: "test.spending.ucan".to_owned(),
+    }
 }
 
 // -----------------------------------------------------------------------
@@ -363,6 +393,72 @@ impl ContextEventLogProvider for MockEventLog {
     fn destroy_event_log(&self, id: &[u8; 32]) -> Result<(), ContextCreationError> {
         self.destroyed.lock().unwrap().push(*id);
         Ok(())
+    }
+}
+
+/// Extended event log mock that stores `actor_did` and supports
+/// `event_log_entries()` reads. Used by tests that verify `actor_did`
+/// attribution on event log entries (#1594).
+#[derive(Default)]
+pub(super) struct MockEventLogWithActorDid {
+    pub(super) inited: std::sync::Mutex<Vec<[u8; 32]>>,
+    /// Each entry: (`context_id`, `event_name`, `actor_did`, timestamp).
+    pub(super) entries: std::sync::Mutex<Vec<([u8; 32], String, String, u64)>>,
+    pub(super) destroyed: std::sync::Mutex<Vec<[u8; 32]>>,
+}
+
+impl ContextEventLogProvider for MockEventLogWithActorDid {
+    fn init_event_log(&self, id: &[u8; 32]) -> Result<(), ContextCreationError> {
+        self.inited.lock().unwrap().push(*id);
+        Ok(())
+    }
+
+    fn append_event(
+        &self,
+        id: &[u8; 32],
+        event: &str,
+        actor_did: &str,
+    ) -> Result<(), ContextCreationError> {
+        let ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        self.entries
+            .lock()
+            .unwrap()
+            .push((*id, event.to_owned(), actor_did.to_owned(), ts));
+        Ok(())
+    }
+
+    fn destroy_event_log(&self, id: &[u8; 32]) -> Result<(), ContextCreationError> {
+        self.destroyed.lock().unwrap().push(*id);
+        Ok(())
+    }
+
+    fn event_log_entries(
+        &self,
+        context_id: &[u8; 32],
+    ) -> Result<Option<Vec<crate::context::providers::event_log::EventLogEntry>>, ContextError>
+    {
+        let entries = self.entries.lock().unwrap();
+        let result: Vec<_> = entries
+            .iter()
+            .filter(|(cid, _, _, _)| cid == context_id)
+            .map(
+                |(_, event, actor_did, ts)| crate::context::providers::event_log::EventLogEntry {
+                    event: event.clone(),
+                    actor_did: actor_did.clone(),
+                    timestamp: *ts,
+                    prev_hash: [0u8; 32],
+                    hash: [0u8; 32],
+                },
+            )
+            .collect();
+        if result.is_empty() {
+            Ok(None)
+        } else {
+            Ok(Some(result))
+        }
     }
 }
 

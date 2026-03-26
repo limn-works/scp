@@ -5012,6 +5012,7 @@ async fn test_economy_cost_deducted_on_send() {
         .unwrap()
         .handle
         .clone();
+    let ucan = dummy_spending_ucan();
     let result = manager
         .send_message(
             &handle,
@@ -5019,7 +5020,7 @@ async fn test_economy_cost_deducted_on_send() {
             b"paid msg",
             Some(&sk),
             None,
-            None,
+            Some(&ucan),
         )
         .await;
     assert!(
@@ -5189,6 +5190,7 @@ async fn test_budget_exceeded_blocks_send() {
         .unwrap()
         .handle
         .clone();
+    let ucan = dummy_spending_ucan();
     let result = manager
         .send_message(
             &handle,
@@ -5196,7 +5198,7 @@ async fn test_budget_exceeded_blocks_send() {
             b"too expensive",
             Some(&sk),
             None,
-            None,
+            Some(&ucan),
         )
         .await;
     assert!(result.is_err(), "send should fail when budget exceeded");
@@ -5981,6 +5983,7 @@ async fn evaluate_cost_deducts_budget_on_send() {
         .unwrap()
         .handle
         .clone();
+    let ucan = dummy_spending_ucan();
     let result = manager
         .send_message(
             &handle,
@@ -5988,7 +5991,7 @@ async fn evaluate_cost_deducts_budget_on_send() {
             b"test",
             Some(&sk),
             None,
-            None,
+            Some(&ucan),
         )
         .await;
     assert!(result.is_ok(), "send should succeed: {result:?}");
@@ -7483,6 +7486,7 @@ async fn full_send_consequence_enforcement_round_trip() {
         .clone();
 
     // Send message — should deduct budget AND trigger consequence AND record velocity.
+    let ucan = dummy_spending_ucan();
     let result = manager
         .send_message(
             &handle,
@@ -7490,7 +7494,7 @@ async fn full_send_consequence_enforcement_round_trip() {
             b"round trip",
             Some(&sk),
             None,
-            None,
+            Some(&ucan),
         )
         .await;
     assert!(result.is_ok(), "send should succeed: {result:?}");
@@ -8292,6 +8296,7 @@ async fn send_message_deducts_budget() {
         .clone();
 
     // Send message — should deduct 5 from budget.
+    let ucan = dummy_spending_ucan();
     manager
         .send_message(
             &handle,
@@ -8299,7 +8304,7 @@ async fn send_message_deducts_budget() {
             b"budget test",
             Some(&sk),
             None,
-            None,
+            Some(&ucan),
         )
         .await
         .unwrap();
@@ -8326,7 +8331,7 @@ async fn send_message_deducts_budget() {
             b"budget test 2",
             Some(&sk),
             None,
-            None,
+            Some(&ucan),
         )
         .await
         .unwrap();
@@ -9387,6 +9392,7 @@ async fn test_send_rejected_insufficient_budget() {
         .handle
         .clone();
 
+    let ucan = dummy_spending_ucan();
     let result = manager
         .send_message(
             &handle,
@@ -9394,7 +9400,7 @@ async fn test_send_rejected_insufficient_budget() {
             b"should fail",
             Some(&sk),
             None,
-            None,
+            Some(&ucan),
         )
         .await;
     assert!(result.is_err(), "send should fail with insufficient budget");
@@ -10001,6 +10007,7 @@ async fn test_send_consequence_economy_round_trip() {
         .clone();
 
     // Send message.
+    let ucan = dummy_spending_ucan();
     manager
         .send_message(
             &handle,
@@ -10008,7 +10015,7 @@ async fn test_send_consequence_economy_round_trip() {
             b"round trip",
             Some(&sk),
             None,
-            None,
+            Some(&ucan),
         )
         .await
         .unwrap();
@@ -10262,6 +10269,7 @@ async fn test_full_lifecycle_economy() {
         .handle
         .clone();
     let user: DID = "did:key:user".into();
+    let ucan = dummy_spending_ucan();
 
     // Send 3 messages at 10 each = 30 total cost, leaving 20.
     for i in 0..3 {
@@ -10272,7 +10280,7 @@ async fn test_full_lifecycle_economy() {
                 format!("msg-{i}").as_bytes(),
                 Some(&sk),
                 None,
-                None,
+                Some(&ucan),
             )
             .await
             .unwrap();
@@ -10285,7 +10293,7 @@ async fn test_full_lifecycle_economy() {
 
     // 4th message costs 10 -> leaves 10.
     manager
-        .send_message(&handle, &user, b"msg-4", Some(&sk), None, None)
+        .send_message(&handle, &user, b"msg-4", Some(&sk), None, Some(&ucan))
         .await
         .unwrap();
     assert_eq!(
@@ -10296,7 +10304,7 @@ async fn test_full_lifecycle_economy() {
 
     // 5th message: 10 -> leaves 0.
     manager
-        .send_message(&handle, &user, b"msg-5", Some(&sk), None, None)
+        .send_message(&handle, &user, b"msg-5", Some(&sk), None, Some(&ucan))
         .await
         .unwrap();
     assert_eq!(
@@ -10307,7 +10315,7 @@ async fn test_full_lifecycle_economy() {
 
     // 6th message should fail — budget exhausted.
     let result = manager
-        .send_message(&handle, &user, b"msg-6", Some(&sk), None, None)
+        .send_message(&handle, &user, b"msg-6", Some(&sk), None, Some(&ucan))
         .await;
     assert!(
         result.is_err(),
@@ -10343,6 +10351,8 @@ async fn velocity_escalation_raises_effective_cost() {
 
     assert_eq!(budget_remaining!(manager), Amount::new(10_000));
 
+    let ucan = dummy_spending_ucan();
+
     // Send 2 messages at low velocity (cost = 1 each, formula adds 0).
     for i in 0..2 {
         manager
@@ -10352,7 +10362,7 @@ async fn velocity_escalation_raises_effective_cost() {
                 format!("msg-{i}").as_bytes(),
                 Some(&sk),
                 None,
-                None,
+                Some(&ucan),
             )
             .await
             .unwrap();
@@ -10375,7 +10385,7 @@ async fn velocity_escalation_raises_effective_cost() {
                 format!("msg-{i}").as_bytes(),
                 Some(&sk),
                 None,
-                None,
+                Some(&ucan),
             )
             .await
             .unwrap();
@@ -10665,4 +10675,373 @@ async fn rotate_sender_key_called_on_leave() {
         "remove_member (pos {mls_remove_pos}) must precede \
          rotate_sender_key (pos {rotate_pos}). Calls: {calls:?}"
     );
+}
+
+// -----------------------------------------------------------------------
+// Spending UCAN enforcement (§19.5, #1593)
+// -----------------------------------------------------------------------
+
+/// Paid send (`per_message` cost > 0) is rejected without a spending UCAN.
+/// Verifies the AND-composition gate: action capability alone is
+/// insufficient; a spending UCAN is also required for paid actions.
+#[tokio::test]
+async fn test_paid_send_rejected_without_spending_ucan() {
+    use scp_protocol::economy::types::{Amount, CostSchedule, CurrencyCode, EconomicPolicy};
+
+    let manager = ContextManager::new(
+        Box::new(MockCrypto::default()),
+        Box::new(MockTransport::connected()),
+        Box::new(MockEventLog::default()),
+        noop_key_resolver(),
+    );
+
+    let mut params = governance_params();
+    params.economic_policy = Some(EconomicPolicy {
+        locked: false,
+        cost_schedule: CostSchedule {
+            currency: CurrencyCode::new([85, 83, 68, 0]),
+            per_message: Some(Amount::new(10)),
+            per_tool_invoke: None,
+            per_join: None,
+            per_period: None,
+            per_byte_stored: None,
+        },
+        payment_adapters: vec![],
+        pricing_formula: None,
+        payee: DID::from("did:key:payee"),
+    });
+    let _handle = manager
+        .create_context("paid-no-ucan-ctx".into(), params, "did:key:sender".into())
+        .await
+        .unwrap();
+
+    // Grant budget so the budget check itself would pass.
+    {
+        let mut contexts = manager.contexts.lock().await;
+        let ctx = contexts.get_mut("paid-no-ucan-ctx").unwrap();
+        ctx.governance
+            .budget_tracker
+            .grant(&"did:key:sender".into(), Amount::new(1000));
+    }
+
+    let sk = ed25519_dalek::SigningKey::from_bytes(&[1u8; 32]);
+    let handle = manager
+        .contexts
+        .lock()
+        .await
+        .get("paid-no-ucan-ctx")
+        .unwrap()
+        .handle
+        .clone();
+
+    // Send with spending_ucan: None — should be rejected.
+    let result = manager
+        .send_message(
+            &handle,
+            &"did:key:sender".into(),
+            b"no ucan",
+            Some(&sk),
+            None,
+            None,
+        )
+        .await;
+    assert!(
+        result.is_err(),
+        "paid send without spending UCAN should fail"
+    );
+    let err = result.unwrap_err();
+    assert!(
+        matches!(err, ContextError::PermissionDenied(ref msg) if msg.contains("spending UCAN")),
+        "expected spending UCAN error, got: {err}"
+    );
+}
+
+/// Free send (no `economic_policy`) succeeds without a spending UCAN.
+#[tokio::test]
+async fn test_free_send_ok_without_spending_ucan() {
+    let (manager, handle) = setup_active_context().await;
+    let sk = signing_key_for_did(&"did:key:creator".into());
+
+    // send_message with spending_ucan: None on a context WITHOUT economic_policy.
+    let result = manager
+        .send_message(
+            &handle,
+            &"did:key:creator".into(),
+            b"free message",
+            Some(&sk),
+            None,
+            None,
+        )
+        .await;
+    assert!(
+        result.is_ok(),
+        "free send without spending UCAN should succeed: {result:?}"
+    );
+}
+
+/// Paid join (`per_join` cost > 0) is rejected without a spending UCAN.
+/// The `auto_accept_blocked_by_economics` guard fires first for contexts
+/// with payment requirements, producing a `PermissionDenied` error that
+/// prevents unprompted cost incurrence.
+#[tokio::test]
+async fn test_paid_join_rejected_without_spending_ucan() {
+    use scp_protocol::economy::types::{Amount, CostSchedule, CurrencyCode, EconomicPolicy};
+
+    let manager = ContextManager::new(
+        Box::new(MockCrypto::default()),
+        Box::new(MockTransport::connected()),
+        Box::new(MockEventLog::default()),
+        noop_key_resolver(),
+    );
+
+    let mut params = governance_params();
+    params.economic_policy = Some(EconomicPolicy {
+        locked: false,
+        cost_schedule: CostSchedule {
+            currency: CurrencyCode::new([85, 83, 68, 0]),
+            per_message: None,
+            per_tool_invoke: None,
+            per_join: Some(Amount::new(50)),
+            per_period: None,
+            per_byte_stored: None,
+        },
+        payment_adapters: vec![],
+        pricing_formula: None,
+        payee: DID::from("did:key:payee"),
+    });
+    let handle = manager
+        .create_context("paid-join-ctx".into(), params, "did:key:admin".into())
+        .await
+        .unwrap();
+
+    // Try to join with spending_ucan: None — should be rejected.
+    let kp = scp_protocol::context::membership::KeyPackage {
+        owner_did: "did:key:joiner".into(),
+        mls_key_package_bytes: None,
+    };
+    let result = manager.join_context(&handle, kp, None).await;
+    assert!(
+        result.is_err(),
+        "paid join without spending UCAN should fail"
+    );
+    let err = result.unwrap_err();
+    // The auto_accept guard fires: "paid context requires explicit acceptance"
+    // OR the spending UCAN guard fires: "spending UCAN". Either confirms
+    // that paid joins are blocked without proper authorization.
+    assert!(
+        matches!(err, ContextError::PermissionDenied(_)),
+        "expected PermissionDenied for paid join, got: {err}"
+    );
+}
+
+/// Free join (no `economic_policy`) succeeds without a spending UCAN.
+#[tokio::test]
+async fn test_free_join_ok_without_spending_ucan() {
+    let manager = ContextManager::new(
+        Box::new(MockCrypto::default()),
+        Box::new(MockTransport::connected()),
+        Box::new(MockEventLog::default()),
+        noop_key_resolver(),
+    );
+
+    let params = governance_params();
+    let handle = manager
+        .create_context("free-join-ctx".into(), params, "did:key:admin".into())
+        .await
+        .unwrap();
+
+    // Join with spending_ucan: None on a free context — should succeed.
+    let kp = scp_protocol::context::membership::KeyPackage {
+        owner_did: "did:key:joiner".into(),
+        mls_key_package_bytes: None,
+    };
+    let result = manager.join_context(&handle, kp, None).await;
+    assert!(
+        result.is_ok(),
+        "free join without spending UCAN should succeed: {result:?}"
+    );
+}
+
+// -----------------------------------------------------------------------
+// actor_did on EventLogEntry (#1594)
+// -----------------------------------------------------------------------
+
+/// Sending a message appends an event log entry with the correct
+/// `actor_did` matching the sender. Uses `MockEventLogWithActorDid`
+/// which implements `event_log_entries()` for read-back verification.
+#[tokio::test]
+async fn test_event_log_stores_actor_did() {
+    let manager = ContextManager::new(
+        Box::new(MockCrypto::default()),
+        Box::new(MockTransport::connected()),
+        Box::new(MockEventLogWithActorDid::default()),
+        noop_key_resolver(),
+    );
+
+    let params = governance_params();
+    let handle = manager
+        .create_context("actor-did-ctx".into(), params, "did:key:sender".into())
+        .await
+        .unwrap();
+
+    let sk = ed25519_dalek::SigningKey::from_bytes(&[1u8; 32]);
+    manager
+        .send_message(
+            &handle,
+            &"did:key:sender".into(),
+            b"actor-did test",
+            Some(&sk),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+    // Query event log entries and verify actor_did.
+    let context_id_bytes = scp_protocol::context::context_id_bytes("actor-did-ctx");
+    let entries = manager
+        .event_log_entries(&context_id_bytes)
+        .unwrap()
+        .unwrap();
+
+    // Find the MessageSent entry.
+    let msg_entries: Vec<_> = entries
+        .iter()
+        .filter(|e| e.event == "MessageSent")
+        .collect();
+    assert_eq!(
+        msg_entries.len(),
+        1,
+        "should have exactly one MessageSent entry"
+    );
+    assert_eq!(
+        msg_entries[0].actor_did, "did:key:sender",
+        "actor_did should match the sender DID"
+    );
+}
+
+/// Consequence evaluation uses event log entries (full history) rather
+/// than only the bounded receive buffer. The `event_log_entries_for_consequences`
+/// function merges event log history with receive buffer, preferring
+/// event log entries for their accurate timestamps and `actor_did` (#1594).
+///
+/// This test verifies the function returns entries from the event log
+/// provider when available, enabling consequence evaluation to see
+/// the full history beyond the receive buffer's 1000-entry capacity.
+#[tokio::test]
+async fn test_consequence_evaluation_uses_full_history() {
+    use scp_protocol::trust::consequence::{
+        ConsequenceAction, ConsequenceRule, ConsequenceTrigger,
+    };
+    use std::time::Duration;
+
+    // Use MockEventLogWithActorDid so event_log_entries() returns real data.
+    let manager = ContextManager::new(
+        Box::new(MockCrypto::default()),
+        Box::new(MockTransport::connected()),
+        Box::new(MockEventLogWithActorDid::default()),
+        noop_key_resolver(),
+    );
+
+    let mut params = governance_params();
+    // Threshold=2: consequence triggers when 2+ MessageSent events are seen.
+    params.consequence_rules = vec![ConsequenceRule {
+        trigger: ConsequenceTrigger::MessageVelocity,
+        threshold: 2,
+        action: ConsequenceAction::CapabilitySuspension(vec!["write".to_owned()]),
+        window: Duration::from_secs(3600),
+    }];
+    let _handle = manager
+        .create_context("hist-ctx".into(), params, "did:key:admin".into())
+        .await
+        .unwrap();
+
+    let sk = ed25519_dalek::SigningKey::from_bytes(&[1u8; 32]);
+    let handle = manager
+        .contexts
+        .lock()
+        .await
+        .get("hist-ctx")
+        .unwrap()
+        .handle
+        .clone();
+
+    // Send 2 messages to build event log history.
+    for i in 0..2 {
+        manager
+            .send_message(
+                &handle,
+                &"did:key:admin".into(),
+                format!("msg-{i}").as_bytes(),
+                Some(&sk),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+    }
+
+    // Drain events so the receive buffer is cleared. The event log
+    // retains both entries because MockEventLogWithActorDid persists them.
+    let _ = manager.drain_events("hist-ctx").await;
+
+    // Clear the write revocation that may have been applied by the
+    // consequence on the 2nd send (threshold=2 was reached in-buffer).
+    {
+        let mut contexts = manager.contexts.lock().await;
+        let ctx = contexts.get_mut("hist-ctx").unwrap();
+        ctx.access
+            .write_revoked_members
+            .remove(&DID::from("did:key:admin"));
+        // Reset the cooldown so the consequence can trigger again.
+        ctx.governance.cooldown_until.clear();
+    }
+
+    // Send 3rd message — the receive buffer is empty (drained), so
+    // event_log_entries_for_consequences must read history from the
+    // event log provider. The event log has 2 MessageSent entries,
+    // which meets threshold=2, triggering the consequence again.
+    manager
+        .send_message(
+            &handle,
+            &"did:key:admin".into(),
+            b"msg-2",
+            Some(&sk),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+    let events = manager.drain_events("hist-ctx").await;
+    let triggered = events
+        .iter()
+        .any(|e| matches!(e, ContextEvent::ConsequenceTriggered { .. }));
+    assert!(
+        triggered,
+        "consequence should trigger because event log provides full history \
+         (2 persisted MessageSent from log >= threshold=2). Events: {events:?}"
+    );
+
+    // Verify event log entries include actor_did for all 3 messages.
+    let context_id_bytes = scp_protocol::context::context_id_bytes("hist-ctx");
+    let entries = manager
+        .event_log_entries(&context_id_bytes)
+        .unwrap()
+        .unwrap();
+    let msg_entries: Vec<_> = entries
+        .iter()
+        .filter(|e| e.event == "MessageSent")
+        .collect();
+    assert_eq!(
+        msg_entries.len(),
+        3,
+        "event log should have 3 MessageSent entries"
+    );
+    for entry in &msg_entries {
+        assert_eq!(
+            entry.actor_did, "did:key:admin",
+            "all entries should have actor_did = admin"
+        );
+    }
 }
