@@ -10,7 +10,7 @@ use scp_protocol::identity::SigningKeyId;
 
 use super::{
     Capability, ContextError, ContextEvent, ContextHandle, ContextManager, DID, PerContextState,
-    context_id_to_bytes, evaluate_consequence_rules, instrument, require_active,
+    context_id_to_bytes, instrument, require_active,
 };
 
 /// Enforces economic policy for message sends (#1537).
@@ -98,28 +98,6 @@ fn build_broadcast_envelope(
 /// Default blob TTL for outer envelopes (5 minutes / 300 seconds).
 /// Relays may store the blob up to this duration for offline recipients.
 const DEFAULT_BLOB_TTL_SECS: u32 = 300;
-
-/// Evaluates whether a paid action (message send) should be processed
-/// through the payment flow. Returns the cost if the context has an
-/// economic policy, or zero if the action is free.
-///
-/// This is the messaging-layer entry point for the paid action pipeline
-/// (§19.4, ADR-033). The full `prepare_paid_action` / `process_paid_action`
-/// flow from `crate::economy::integration` is used when a `PaymentAdapter`
-/// is available at the SDK layer.
-fn prepare_paid_action(
-    economic_policy: Option<&scp_protocol::economy::types::EconomicPolicy>,
-    action_type: &scp_protocol::economy::types::PaidActionType,
-    metrics: &scp_protocol::economy::policy::ObservableMetrics,
-) -> scp_protocol::economy::types::Amount {
-    economic_policy.map_or_else(
-        || scp_protocol::economy::types::Amount::new(0),
-        |policy| {
-            scp_protocol::economy::policy::evaluate_cost(policy, action_type, metrics)
-                .unwrap_or(scp_protocol::economy::types::Amount::new(0))
-        },
-    )
-}
 
 /// Builds the encrypted envelope bytes for the send path.
 ///
@@ -458,24 +436,6 @@ impl ContextManager {
                     .velocity_tracker
                     .record_message(sender_did, now);
 
-                // Direct consequence rule evaluation (#1531) — evaluate rules
-                // against recent events before dispatch. The dispatch function
-                // also evaluates, but this direct call ensures messaging.rs
-                // has the evaluate_consequence_rules wiring visible.
-                let rules: &[scp_protocol::trust::consequence::ConsequenceRule] =
-                    &ctx.governance.consequence_rules;
-                if !rules.is_empty() {
-                    let events =
-                        super::governance::event_log_entries_for_consequences(ctx, context_id, now);
-                    // Evaluate rules; results are consumed by dispatch_consequences below.
-                    drop(evaluate_consequence_rules(
-                        rules,
-                        &events,
-                        sender_did.as_ref(),
-                        now,
-                    ));
-                }
-
                 // Consequence enforcement (#1531) — dispatch triggered consequences.
                 super::governance::dispatch_consequences(ctx, context_id, sender_did, now);
 
@@ -497,49 +457,8 @@ impl ContextManager {
                         .participation_cache
                         .insert(sender_did.to_string(), record);
                 }
-
-                // Evaluate message send cost for the paid action pipeline (#1537).
-                let member_count = u64::try_from(ctx.membership.count()).unwrap_or(u64::MAX);
-                let send_metrics = scp_protocol::economy::policy::ObservableMetrics {
-                    sender_velocity: ctx
-                        .governance
-                        .velocity_tracker
-                        .get_velocity(sender_did, now),
-                    member_count,
-                    context_message_rate: 0,
-                    relay_queue_depth: 0,
-                    time_of_day: 0,
-                    storage_usage: 0,
-                };
-                let _send_cost = prepare_paid_action(
-                    ctx.governance.economic_policy.as_ref(),
-                    &scp_protocol::economy::types::PaidActionType::MessageSend,
-                    &send_metrics,
-                );
-
-                // Relay price adjustment (#1537) — adjust pricing based on
-                // utilization metrics after successful send.
-                let _price_adjustment = scp_protocol::economy::pricing::adjust_relay_price(
-                    &scp_protocol::economy::pricing::RelayPricingConfig {
-                        target_utilization_pct: 50,
-                        current_base_price: scp_protocol::economy::types::Amount::new(100),
-                        max_change_per_mille: 125,
-                        floor: scp_protocol::economy::types::Amount::new(1),
-                        cap: scp_protocol::economy::types::Amount::new(10_000),
-                    },
-                    member_count.min(100),
-                );
             }
         }
-        // Verify payment receipts if any are pending (#1537).
-        // No-op when no receipts are present (the common case).
-        let pending_receipts: Vec<crate::economy::adapter::PaymentReceipt> = Vec::new();
-        if !pending_receipts.is_empty() {
-            let verifiers: Vec<&dyn crate::economy::receipt::PaymentVerifierDyn> = Vec::new();
-            let _results =
-                crate::economy::receipt::verify_receipts_dyn(&verifiers, &pending_receipts).await;
-        }
-
         self.event_log
             .append_context_event(context_id_bytes, "MessageSent")?;
         if self.has_persistence() {

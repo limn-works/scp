@@ -8420,8 +8420,9 @@ pub async fn context_member_role(handle: Arc<ContextHandle>, did: String) -> Opt
 /// formatted with structured key=value pairs for observability. All other
 /// events use their `Debug` representation.
 fn format_context_event(event: &scp_core::context::membership::ContextEvent) -> String {
+    use scp_core::context::membership::ContextEvent::{ConsequenceEnforced, ConsequenceTriggered};
     match event {
-        scp_core::context::membership::ContextEvent::ConsequenceTriggered {
+        ConsequenceTriggered {
             context_id,
             member_did,
             rule_index,
@@ -8432,7 +8433,7 @@ fn format_context_event(event: &scp_core::context::membership::ContextEvent) -> 
              rule={rule_index},trigger={trigger_type},\
              action={action_type},context={context_id}"
         ),
-        scp_core::context::membership::ContextEvent::ConsequenceEnforced {
+        ConsequenceEnforced {
             context_id,
             member_did,
             action_type,

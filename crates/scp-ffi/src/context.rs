@@ -1309,6 +1309,7 @@ fn py_context_send(
 fn convert_context_event(
     event: scp_core::context::membership::ContextEvent,
 ) -> (String, Vec<u8>, f64) {
+    use scp_core::context::membership::ContextEvent::{ConsequenceEnforced, ConsequenceTriggered};
     let ts = scp_primitives::SystemClock.now_secs() as f64;
     match event {
         scp_core::context::membership::ContextEvent::MessageSent {
@@ -1350,7 +1351,7 @@ fn convert_context_event(
             .into_bytes(),
             ts,
         ),
-        scp_core::context::membership::ContextEvent::ConsequenceTriggered {
+        ConsequenceTriggered {
             context_id: ctx_id,
             member_did,
             rule_index,
@@ -1366,7 +1367,7 @@ fn convert_context_event(
             .into_bytes(),
             ts,
         ),
-        scp_core::context::membership::ContextEvent::ConsequenceEnforced {
+        ConsequenceEnforced {
             context_id: ctx_id,
             member_did,
             action_type,

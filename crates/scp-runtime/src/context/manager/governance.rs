@@ -37,7 +37,7 @@ fn enforce_capability_suspension(
             applied = true;
         }
     }
-    applied || !caps.is_empty()
+    applied
 }
 
 /// Enforces a `RoleDemotion` consequence action on a member.
@@ -114,8 +114,7 @@ pub(super) fn dispatch_consequences(
         // wiring gates can detect the call_expression per-variant.
         let success = match &consequence.action {
             scp_protocol::trust::consequence::ConsequenceAction::CapabilitySuspension(caps) => {
-                enforce_capability_suspension(ctx, member_did, caps);
-                true
+                enforce_capability_suspension(ctx, member_did, caps)
             }
             scp_protocol::trust::consequence::ConsequenceAction::AccessRevocation => {
                 // Revoke all access: block both read and write.
@@ -124,8 +123,7 @@ pub(super) fn dispatch_consequences(
                 true
             }
             scp_protocol::trust::consequence::ConsequenceAction::RoleDemotion { to_role } => {
-                enforce_role_demotion(ctx, member_did, to_role);
-                true
+                enforce_role_demotion(ctx, member_did, to_role)
             }
         };
 
@@ -1767,14 +1765,19 @@ impl ContextManager {
                 return Err(ContextError::MemberNotFound(did.to_string()));
             }
 
+            // Remove sender key BEFORE MLS group removal so the removed
+            // member cannot decrypt messages encrypted after this point.
+            // MLS provides forward secrecy via epoch advancement, but the
+            // sender key layer is an independent confidentiality mechanism
+            // that must also rotate on member removal (§9.16).
+            self.crypto
+                .remove_member_sender_key(&context_id_bytes, did.as_ref())?;
+
             // Crypto: remove from MLS group under lock to prevent TOCTOU
             // race (concurrent remove of same DID).
             self.crypto
                 .remove_member(&context_id_bytes, did)
                 .map_err(|e| ContextError::MembershipFailed(e.to_string()))?;
-
-            self.crypto
-                .remove_member_sender_key(&context_id_bytes, did.as_ref())?;
 
             ctx.membership.remove_member(did);
             ctx.role_state.members.remove(did.as_ref());

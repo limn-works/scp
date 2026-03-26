@@ -344,10 +344,10 @@ fn governance_dispatch_calls_evaluate_consequences() {
     assert!(
         fn_body_contains(
             MANAGER_SRC,
-            "finalize_governance_action",
+            "dispatch_consequences",
             "evaluate_consequence_rules"
         ),
-        "finalize_governance_action must call evaluate_consequence_rules"
+        "dispatch_consequences must call evaluate_consequence_rules"
     );
 }
 
@@ -370,10 +370,11 @@ fn governance_enforces_economic_policy() {
 // --- Content key rotation (#1548) ---
 
 #[test]
-fn rotate_content_keys_calls_advance_epoch() {
+fn rotate_content_keys_calls_propose_update() {
     assert!(
-        fn_body_contains(MANAGER_SRC, "execute_rotate_content_keys", "advance_epoch"),
-        "execute_rotate_content_keys must call advance_epoch for encrypted mode MLS rotation"
+        fn_body_contains(MANAGER_SRC, "execute_rotate_content_keys", "advance_epoch")
+            || fn_body_contains(MANAGER_SRC, "execute_rotate_content_keys", "propose_update"),
+        "execute_rotate_content_keys must call advance_epoch or propose_update for encrypted mode MLS rotation"
     );
 }
 
@@ -443,10 +444,12 @@ fn no_stale_ignores() {
         }
     }
 
-    if fn_body_contains(MANAGER_SRC, "execute_rotate_content_keys", "advance_epoch") {
+    if fn_body_contains(MANAGER_SRC, "execute_rotate_content_keys", "advance_epoch")
+        || fn_body_contains(MANAGER_SRC, "execute_rotate_content_keys", "propose_update")
+    {
         // #1548 content key rotation is wired -- verify no stale ignore.
         if source.contains("#[ignore = \"waiting for #1548\"]") {
-            stale.push("rotate_content_keys_calls_advance_epoch — #1548 is wired");
+            stale.push("rotate_content_keys_calls_propose_update — #1548 is wired");
         }
     }
 

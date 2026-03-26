@@ -710,6 +710,17 @@ struct GovernanceState {
     cooldown_until: HashMap<usize, u64>,
 }
 
+impl GovernanceState {
+    /// Clears participation cache and cooldown state (standing decay).
+    ///
+    /// Called on context close so stale participation records and cooldown
+    /// timers don't carry over if the context is re-created (#1530).
+    fn decay_standing(&mut self) {
+        self.participation_cache.clear();
+        self.cooldown_until.clear();
+    }
+}
+
 /// MLS epoch and reconnection state.
 struct EpochState {
     /// Monotonic MLS epoch counter. Incremented each time a governance action

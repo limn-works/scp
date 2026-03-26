@@ -79,10 +79,8 @@ impl ContextManager {
                 ctx.broadcast_context = None;
 
                 // Standing decay: clear participation cache and cooldown state
-                // on context close. This ensures stale participation records
-                // don't carry over if the context is re-created (#1530).
-                ctx.governance.participation_cache.clear();
-                ctx.governance.cooldown_until.clear();
+                // on context close (#1530).
+                ctx.governance.decay_standing();
 
                 ctx.receive_buffer.push(ContextEvent::SystemClose {
                     initiator_did: initiator_did.clone(),
