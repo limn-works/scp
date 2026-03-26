@@ -1380,7 +1380,7 @@ async fn application_layer_demo() {
     println!("    input: {search_input}");
 
     // The executor is a real async function that simulates the tool.
-    let (output, invoke_event) = invoke_tool(
+    let (output, invoke_event, _consequences) = invoke_tool(
         &handle,
         &tool_registry,
         &role_state,
@@ -1400,6 +1400,7 @@ async fn application_layer_demo() {
                 "total": std::cmp::min(max, 2)
             }))
         },
+        None::<&mut scp_core::context::tools::invoke::ToolEconomyContext<'_>>,
     )
     .await
     .unwrap();
@@ -1421,7 +1422,7 @@ async fn application_layer_demo() {
     println!("  Invoking 'calculator' as Charlie:");
     println!("    input: {calc_input}");
 
-    let (calc_output, _) = invoke_tool(
+    let (calc_output, _, _consequences) = invoke_tool(
         &handle,
         &tool_registry,
         &role_state,
@@ -1447,6 +1448,7 @@ async fn application_layer_demo() {
                 "operation": op
             }))
         },
+        None::<&mut scp_core::context::tools::invoke::ToolEconomyContext<'_>>,
     )
     .await
     .unwrap();

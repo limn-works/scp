@@ -30,9 +30,13 @@ fn enforce_send_economy(
         let metrics = scp_protocol::economy::policy::ObservableMetrics {
             sender_velocity: velocity,
             member_count: u64::try_from(ctx.membership.count()).unwrap_or(u64::MAX),
+            // context_message_rate: requires relay-level telemetry (not available at ContextManager layer)
             context_message_rate: 0,
+            // relay_queue_depth: requires relay-level telemetry (not available at ContextManager layer)
             relay_queue_depth: 0,
+            // time_of_day: could use wall-clock but pricing formula doesn't use it yet
             time_of_day: 0,
+            // storage_usage: requires storage provider metrics (not available at ContextManager layer)
             storage_usage: 0,
         };
         if let Some(cost) = scp_protocol::economy::policy::evaluate_cost(

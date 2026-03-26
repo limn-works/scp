@@ -60,78 +60,6 @@ fn post_join_bookkeeping(ctx: &mut PerContextState, context_id: &str, member_did
     }
 }
 
-/// Receipt verification wrapper for lifecycle paths.
-///
-/// Wraps the free-function `verify_receipts` in a method call so the pipeline
-/// wiring AST gate detects `self.verify_receipts(...)` in lifecycle.rs.
-struct ReceiptVerifier;
-
-impl ReceiptVerifier {
-    /// Verifies payment receipts using the no-op adapter.
-    ///
-    /// When a real payment adapter is injected (via the transport layer),
-    /// this would verify actual payment receipts against the payment rail.
-    async fn verify_receipts(&self, receipts: &[crate::economy::adapter::PaymentReceipt]) -> bool {
-        if receipts.is_empty() {
-            return true;
-        }
-        let adapter = crate::economy::adapter::NoOpPaymentAdapter;
-        let verifiers: Vec<&dyn crate::economy::receipt::PaymentVerifierDyn> = vec![&adapter];
-        let results = crate::economy::receipt::verify_receipts_dyn(&verifiers, receipts).await;
-        crate::economy::receipt::all_receipts_valid(&results)
-    }
-}
-
-/// Verifies payment receipts for a context join, if a payment verifier is available.
-///
-/// Called after a successful join when the context has an economic policy.
-async fn verify_join_receipts(receipts: &[crate::economy::adapter::PaymentReceipt]) -> bool {
-    let verifier = ReceiptVerifier;
-    verifier.verify_receipts(receipts).await
-}
-
-/// Enforces economic policy for context joins (#1537).
-///
-/// Checks auto-accept guard and evaluates join cost from the context's
-/// economic policy. Records spend against the joiner's budget.
-/// Prepares the paid action flow for context joins (§19.2.2, #1537).
-///
-/// If the context has an economic policy with a join cost, calls
-/// [`prepare_paid_action`] to wire the 9-step payment integration.
-/// For free joins, returns immediately.
-///
-/// Takes cloned policy data to avoid holding `&PerContextState` across await.
-async fn prepare_paid_join(
-    policy: Option<scp_protocol::economy::types::EconomicPolicy>,
-    joiner_did: DID,
-    context_id: String,
-    member_count: u64,
-) {
-    if let Some(ref policy) = policy {
-        let metrics = scp_protocol::economy::policy::ObservableMetrics {
-            member_count,
-            context_message_rate: 0,
-            relay_queue_depth: 0,
-            time_of_day: 0,
-            sender_velocity: 0,
-            storage_usage: 0,
-        };
-        let adapter = crate::economy::adapter::NoOpPaymentAdapter;
-        let metadata = crate::economy::adapter::PaymentMetadata::default();
-        let _ = crate::economy::integration::prepare_paid_action(
-            &adapter,
-            Some(policy),
-            scp_protocol::economy::types::PaidActionType::ContextJoin,
-            &joiner_did,
-            Some(context_id),
-            &metrics,
-            metadata,
-            Vec::new(),
-        )
-        .await;
-    }
-}
-
 fn enforce_join_economy(ctx: &mut PerContextState, joiner_did: &DID) -> Result<(), ContextError> {
     if scp_protocol::economy::policy::auto_accept_blocked_by_economics(
         ctx.governance.economic_policy.as_ref(),
@@ -143,10 +71,15 @@ fn enforce_join_economy(ctx: &mut PerContextState, joiner_did: &DID) -> Result<(
     if let Some(ref policy) = ctx.governance.economic_policy {
         let metrics = scp_protocol::economy::policy::ObservableMetrics {
             member_count: u64::try_from(ctx.membership.count()).unwrap_or(u64::MAX),
+            // context_message_rate: requires relay-level telemetry (unavailable at ContextManager)
             context_message_rate: 0,
+            // relay_queue_depth: requires relay-level telemetry (unavailable at ContextManager)
             relay_queue_depth: 0,
+            // time_of_day: could use wall-clock but pricing formula doesn't use it yet
             time_of_day: 0,
+            // sender_velocity: not tracked per-joiner (velocity is per-sender, join is one-shot)
             sender_velocity: 0,
+            // storage_usage: requires storage provider metrics (unavailable at ContextManager)
             storage_usage: 0,
         };
         if let Some(cost) = scp_protocol::economy::policy::evaluate_cost(
@@ -1346,10 +1279,9 @@ impl ContextManager {
             }
         }
 
-        // Snapshot data for post-lock paid-action call (#1537).
-        let mut join_policy: Option<scp_protocol::economy::types::EconomicPolicy> = None;
-        #[allow(unused_assignments)]
-        let mut join_member_count: u64 = 0;
+        // (No paid-action flow here — the 9-step payment integration
+        // requires a real PaymentAdapter injected via ContextManager, not a
+        // hardcoded NoOpPaymentAdapter. Tracked by #1537.)
 
         // Atomic state check + mutation: verify Active, then role assignment +
         // membership + event buffer, all within a single lock acquisition.
@@ -1380,9 +1312,6 @@ impl ContextManager {
             // Sybil resistance check (#1530) — fail-closed with `?`.
             evaluate_sybil_resistance(ctx, &member_did, self.clock.now_secs())?;
 
-            // Snapshot for post-lock paid action + receipt verification.
-            join_policy.clone_from(&ctx.governance.economic_policy);
-            join_member_count = u64::try_from(ctx.membership.count()).unwrap_or(0);
             post_join_bookkeeping(ctx, &context_id, &member_did, self.clock.now_secs());
 
             // Add member to role state.
@@ -1429,17 +1358,6 @@ impl ContextManager {
             );
         }
         // Lock dropped before event log append.
-
-        // Receipt verification + 9-step paid action flow (#1537).
-        // Called after lock release to avoid holding &PerContextState across await.
-        let _receipts_valid = verify_join_receipts(&[]).await;
-        prepare_paid_join(
-            join_policy,
-            member_did.clone(),
-            context_id.clone(),
-            join_member_count,
-        )
-        .await;
 
         // Append MemberJoined event to event log.
         self.event_log

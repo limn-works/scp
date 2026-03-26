@@ -205,35 +205,6 @@ pub(super) fn event_log_entries_for_consequences(
     events
 }
 
-/// Prepares the paid action flow for governance actions with economic cost.
-///
-/// If the context has an economic policy and the governance action type has a
-/// cost, prepares the payment authorization via [`prepare_paid_action`].
-/// Returns the prepared action envelope (or `None` for free actions).
-///
-/// This wires the 9-step payment integration flow (spec §19.2.2, ADR-033)
-/// into the governance dispatch path.
-/// Evaluates economic policy cost for a governance action.
-///
-/// If the context has an economic policy with a cost for this action type,
-/// logs the cost for transparency. The actual budget enforcement is done by
-/// `enforce_send_economy` (messaging) and `enforce_join_economy` (lifecycle).
-pub(super) fn evaluate_governance_action_cost(
-    ctx: &PerContextState,
-    action_type: &scp_protocol::economy::types::PaidActionType,
-) -> Option<scp_protocol::economy::types::Amount> {
-    let policy = ctx.governance.economic_policy.as_ref()?;
-    let metrics = scp_protocol::economy::policy::ObservableMetrics {
-        member_count: u64::try_from(ctx.membership.count()).unwrap_or(0),
-        context_message_rate: 0,
-        relay_queue_depth: 0,
-        time_of_day: 0,
-        sender_velocity: 0,
-        storage_usage: 0,
-    };
-    scp_protocol::economy::policy::evaluate_cost(policy, action_type, &metrics)
-}
-
 /// Checks whether a proposer is in good governance standing.
 ///
 /// Members with a pending `RemoveMember` proposal approved against them
@@ -372,16 +343,9 @@ impl ContextManager {
             }
         }
 
-        // Economy: evaluate governance action cost for transparency (#1537).
-        {
-            let contexts = self.contexts.lock().await;
-            if let Some(ctx) = contexts.get(context_id) {
-                let _ = evaluate_governance_action_cost(
-                    ctx,
-                    &scp_protocol::economy::types::PaidActionType::MessageSend,
-                );
-            }
-        }
+        // Governance action costing: no PaidActionType::GovernanceAction
+        // variant exists yet. Governance actions are free until the economy
+        // spec adds a governance cost tier. Tracked by #1537.
 
         let result = match self.dispatch_governance_action(context_id, proposal).await {
             Ok(r) => r,

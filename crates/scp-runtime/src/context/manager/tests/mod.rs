@@ -89,6 +89,11 @@ pub(super) struct MockCrypto {
     /// Shared handle for test code to observe `advance_epoch` calls after
     /// the mock has been moved into the `ContextManager`.
     pub(super) epochs_advanced_shared: Arc<std::sync::Mutex<Vec<[u8; 32]>>>,
+    /// Shared ordered call log for verifying cross-method call ordering.
+    /// Each entry is a (`method_name`, arg) tuple recorded in call order.
+    /// Used by `sender_key_before_mls_removal_ordering` to verify that
+    /// `remove_member_sender_key` is called before `remove_member`.
+    pub(super) call_order: Arc<std::sync::Mutex<Vec<(String, String)>>>,
 }
 
 impl ContextCryptoProvider for MockCrypto {
@@ -153,6 +158,10 @@ impl ContextCryptoProvider for MockCrypto {
             .lock()
             .unwrap()
             .push(member_did.to_owned());
+        self.call_order
+            .lock()
+            .unwrap()
+            .push(("remove_member".to_owned(), member_did.to_owned()));
         Ok(())
     }
 
@@ -177,6 +186,10 @@ impl ContextCryptoProvider for MockCrypto {
             .lock()
             .unwrap()
             .push(member_did.to_owned());
+        self.call_order
+            .lock()
+            .unwrap()
+            .push(("remove_member_sender_key".to_owned(), member_did.to_owned()));
         Ok(())
     }
 

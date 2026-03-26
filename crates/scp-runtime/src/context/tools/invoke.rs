@@ -120,6 +120,41 @@ pub enum InvocationError {
 }
 
 // ---------------------------------------------------------------------------
+// Economy context for tool invocation
+// ---------------------------------------------------------------------------
+
+/// Optional economy parameters for tool invocation.
+///
+/// When provided, `invoke_tool` enforces budget checks before execution
+/// and performs post-invocation bookkeeping (participation record update,
+/// consequence rule evaluation). Pass `None` when economy is not configured
+/// for the context.
+pub struct ToolEconomyContext<'a, S: BuildHasher = std::hash::RandomState> {
+    /// The context's economic policy (from `PerContextState.governance.economic_policy`).
+    pub economic_policy: Option<&'a scp_protocol::economy::types::EconomicPolicy>,
+    /// Mutable reference to the invoker's budget tracker.
+    pub budget_tracker: &'a mut scp_protocol::economy::budget::MemberBudgetTracker,
+    /// Action UCAN for AND-composition check (§19.5). `None` if no action UCAN presented.
+    pub action_ucan: Option<&'a UcanToken>,
+    /// Spending UCAN for AND-composition check (§19.5). `None` if no spending UCAN presented.
+    pub spending_ucan: Option<&'a UcanToken>,
+    /// Context ID for bookkeeping.
+    pub context_id: &'a str,
+    /// Current timestamp (seconds since epoch).
+    pub now: u64,
+    /// Event log entries for consequence evaluation.
+    pub events: &'a [scp_event_log::Event],
+    /// Participation cache for standing evaluation.
+    pub participation_cache: &'a mut std::collections::HashMap<
+        String,
+        scp_protocol::trust::participation::ParticipationRecord,
+        S,
+    >,
+    /// Consequence rules from the context's governance state.
+    pub consequence_rules: &'a [scp_protocol::trust::consequence::ConsequenceRule],
+}
+
+// ---------------------------------------------------------------------------
 // invoke_tool
 // ---------------------------------------------------------------------------
 
@@ -131,10 +166,12 @@ pub enum InvocationError {
 ///    or [`ToolInvokeAll`](Capability::ToolInvokeAll) capability via UCAN.
 /// 3. Looks up the tool in the registry.
 /// 4. Validates input against the tool's input schema.
+///    - 4a. Economy: checks budget and UCAN composition (if economy context provided).
 /// 5. Calls the tool implementation via the `executor` function.
 /// 6. Validates output against the tool's output schema.
+///    - 6a. Post-invocation bookkeeping — participation + consequences.
 /// 7. Builds a [`ToolInvokedEvent`] for the caller to append to the event log.
-/// 8. Returns the tool output.
+/// 8. Returns the tool output and any triggered consequences.
 ///
 /// # Timeout handling
 ///
@@ -151,11 +188,12 @@ pub enum InvocationError {
 ///
 /// # Errors
 ///
-/// Returns [`InvocationError`] on protocol-level validation failures.
+/// Returns [`InvocationError`] on protocol-level validation failures,
+/// budget exceeded, or UCAN composition failures.
 ///
 /// See ADR-010 acceptance criterion 3 (`invoke_tool`).
 #[allow(clippy::too_many_arguments)]
-pub async fn invoke_tool<F, Fut>(
+pub async fn invoke_tool<F, Fut, S: BuildHasher>(
     context: &ContextHandle,
     registry: &ToolRegistry,
     role_state: &ContextRoleState,
@@ -164,7 +202,15 @@ pub async fn invoke_tool<F, Fut>(
     invoker_did: &DID,
     timeout_ms: Option<u32>,
     executor: F,
-) -> Result<(serde_json::Value, ToolInvokedEvent), InvocationError>
+    mut economy: Option<&mut ToolEconomyContext<'_, S>>,
+) -> Result<
+    (
+        serde_json::Value,
+        ToolInvokedEvent,
+        Vec<scp_protocol::trust::consequence::TriggeredConsequence>,
+    ),
+    InvocationError,
+>
 where
     F: FnOnce(serde_json::Value) -> Fut,
     Fut: Future<Output = Result<serde_json::Value, String>>,
@@ -198,17 +244,19 @@ where
     validate_value_against_schema(&input, &registration.schema.input_schema)
         .map_err(|msg| InvocationError::InputValidationFailed { message: msg })?;
 
+    // 4a. Economy pre-check (#1537).
+    let action_cost = economy
+        .as_mut()
+        .map(|econ| economy_pre_check(econ, invoker_did))
+        .transpose()?;
+
     // 5. Execute the tool with timeout.
     let effective_timeout = timeout_ms.unwrap_or(DEFAULT_TIMEOUT_MS).min(MAX_TIMEOUT_MS);
     let timeout_duration = Duration::from_millis(u64::from(effective_timeout));
-
     let execution_result = tokio::time::timeout(timeout_duration, executor(input.clone())).await;
-
     let output = match execution_result {
         Ok(Ok(output)) => output,
-        Ok(Err(exec_err)) => {
-            return Err(InvocationError::ExecutionFailed { message: exec_err });
-        }
+        Ok(Err(exec_err)) => return Err(InvocationError::ExecutionFailed { message: exec_err }),
         Err(_elapsed) => {
             return Err(InvocationError::Timeout {
                 timeout_ms: effective_timeout,
@@ -216,28 +264,85 @@ where
         }
     };
 
-    // 6. Validate output against the tool's output schema.
+    // 6. Validate output + post-invocation bookkeeping (#1530, #1531).
     validate_value_against_schema(&output, &registration.schema.output_schema)
         .map_err(|msg| InvocationError::OutputValidationFailed { message: msg })?;
+    let triggered = economy
+        .as_mut()
+        .map(|econ| economy_post_check(econ, invoker_did))
+        .unwrap_or_default();
 
-    // 7. Build event payload.
-    let execution_time_ms = elapsed_ms(start);
-    let input_hash = sha256_json(&input);
-    let output_hash = Some(sha256_json(&output));
+    // 7-8. Build event + return.
+    let event = build_tool_event(tool_id, invoker_did, start, &input, &output, action_cost);
+    Ok((output, event, triggered))
+}
 
-    let event = ToolInvokedEvent {
+/// Runs economy pre-checks (budget enforcement + UCAN AND-composition).
+///
+/// Returns the evaluated action cost for inclusion in the `ToolInvokedEvent`.
+fn economy_pre_check<S: BuildHasher>(
+    economy: &mut ToolEconomyContext<'_, S>,
+    invoker_did: &DID,
+) -> Result<scp_protocol::economy::types::Amount, InvocationError> {
+    check_tool_economy(economy.economic_policy, economy.budget_tracker, invoker_did)?;
+    let cost = economy
+        .economic_policy
+        .and_then(|policy| {
+            let metrics = scp_protocol::economy::policy::ObservableMetrics {
+                member_count: 0,
+                context_message_rate: 0,
+                relay_queue_depth: 0,
+                time_of_day: 0,
+                sender_velocity: 0,
+                storage_usage: 0,
+            };
+            scp_protocol::economy::policy::evaluate_cost(
+                policy,
+                &scp_protocol::economy::types::PaidActionType::ToolInvoke,
+                &metrics,
+            )
+        })
+        .unwrap_or(scp_protocol::economy::types::Amount::new(0));
+    if cost.0 > 0 {
+        check_tool_ucan_composition(cost, economy.action_ucan, economy.spending_ucan)?;
+    }
+    Ok(cost)
+}
+
+/// Runs post-invocation bookkeeping (participation + consequence evaluation).
+fn economy_post_check<S: BuildHasher>(
+    economy: &mut ToolEconomyContext<'_, S>,
+    invoker_did: &DID,
+) -> Vec<scp_protocol::trust::consequence::TriggeredConsequence> {
+    post_tool_invocation_bookkeeping(
+        economy.events,
+        invoker_did,
+        economy.context_id,
+        economy.now,
+        economy.participation_cache,
+        economy.consequence_rules,
+    )
+}
+
+/// Builds a [`ToolInvokedEvent`] from invocation metadata.
+fn build_tool_event(
+    tool_id: &ToolId,
+    invoker_did: &DID,
+    start: std::time::Instant,
+    input: &serde_json::Value,
+    output: &serde_json::Value,
+    cost: Option<scp_protocol::economy::types::Amount>,
+) -> ToolInvokedEvent {
+    ToolInvokedEvent {
         request_id: uuid::Uuid::new_v4().to_string(),
         tool_id: tool_id.to_owned(),
         invoker_did: invoker_did.clone(),
         status: ToolStatus::Success,
-        execution_time_ms,
-        input_hash,
-        output_hash,
-        cost: None,
-    };
-
-    // 8. Return tool output and event.
-    Ok((output, event))
+        execution_time_ms: elapsed_ms(start),
+        input_hash: sha256_json(input),
+        output_hash: Some(sha256_json(output)),
+        cost,
+    }
 }
 
 /// Invokes a tool with cancellation support.
@@ -252,9 +357,9 @@ where
 /// # Errors
 ///
 /// Returns [`InvocationError`] on protocol-level validation failures,
-/// timeout, or cancellation.
+/// timeout, cancellation, budget exceeded, or UCAN composition failures.
 #[allow(clippy::too_many_arguments)]
-pub async fn invoke_tool_with_cancellation<F, Fut, C, CFut>(
+pub async fn invoke_tool_with_cancellation<F, Fut, C, CFut, S: BuildHasher>(
     context: &ContextHandle,
     registry: &ToolRegistry,
     role_state: &ContextRoleState,
@@ -264,7 +369,15 @@ pub async fn invoke_tool_with_cancellation<F, Fut, C, CFut>(
     timeout_ms: Option<u32>,
     executor: F,
     cancellation: C,
-) -> Result<(serde_json::Value, ToolInvokedEvent), InvocationError>
+    mut economy: Option<&mut ToolEconomyContext<'_, S>>,
+) -> Result<
+    (
+        serde_json::Value,
+        ToolInvokedEvent,
+        Vec<scp_protocol::trust::consequence::TriggeredConsequence>,
+    ),
+    InvocationError,
+>
 where
     F: FnOnce(serde_json::Value) -> Fut,
     Fut: Future<Output = Result<serde_json::Value, String>>,
@@ -273,43 +386,40 @@ where
 {
     let start = std::time::Instant::now();
 
-    // 1. Validate context state is Active.
+    // 1-4: Validate context, capability, tool, schema (same as invoke_tool).
     let state = context.state().await;
     if state != ContextState::Active {
         return Err(InvocationError::ContextNotActive {
             current_state: state.to_string(),
         });
     }
-
-    // 2. Validate invoker has ToolInvoke(tool_id) or ToolInvokeAll capability.
     if !has_tool_invoke_capability(role_state, invoker_did, tool_id) {
         return Err(InvocationError::InvokerNotAuthorized {
             did: invoker_did.to_string(),
             tool_id: tool_id.to_owned(),
         });
     }
-
-    // 3. Look up the tool in the registry.
     let registration = registry
         .get(tool_id)
         .ok_or_else(|| InvocationError::ToolNotFound {
             tool_id: tool_id.to_owned(),
         })?;
-
-    // 4. Validate input against the tool's input schema.
     validate_value_against_schema(&input, &registration.schema.input_schema)
         .map_err(|msg| InvocationError::InputValidationFailed { message: msg })?;
+
+    // 4a. Economy pre-check (#1537).
+    let action_cost = economy
+        .as_mut()
+        .map(|econ| economy_pre_check(econ, invoker_did))
+        .transpose()?;
 
     // 5. Execute with timeout and cancellation.
     let effective_timeout = timeout_ms.unwrap_or(DEFAULT_TIMEOUT_MS).min(MAX_TIMEOUT_MS);
     let timeout_duration = Duration::from_millis(u64::from(effective_timeout));
-
     let exec_fut = executor(input.clone());
     let cancel_fut = cancellation();
-
     tokio::pin!(exec_fut);
     tokio::pin!(cancel_fut);
-
     let execution_result = tokio::time::timeout(timeout_duration, async {
         tokio::select! {
             result = &mut exec_fut => result,
@@ -317,15 +427,10 @@ where
         }
     })
     .await;
-
     let output = match execution_result {
         Ok(Ok(output)) => output,
-        Ok(Err(msg)) if msg == "cancelled" => {
-            return Err(InvocationError::Cancelled);
-        }
-        Ok(Err(exec_err)) => {
-            return Err(InvocationError::ExecutionFailed { message: exec_err });
-        }
+        Ok(Err(msg)) if msg == "cancelled" => return Err(InvocationError::Cancelled),
+        Ok(Err(exec_err)) => return Err(InvocationError::ExecutionFailed { message: exec_err }),
         Err(_elapsed) => {
             return Err(InvocationError::Timeout {
                 timeout_ms: effective_timeout,
@@ -333,27 +438,17 @@ where
         }
     };
 
-    // 6. Validate output against the tool's output schema.
+    // 6. Validate output + post-invocation bookkeeping.
     validate_value_against_schema(&output, &registration.schema.output_schema)
         .map_err(|msg| InvocationError::OutputValidationFailed { message: msg })?;
+    let triggered = economy
+        .as_mut()
+        .map(|econ| economy_post_check(econ, invoker_did))
+        .unwrap_or_default();
 
-    // 7. Build event payload.
-    let execution_time_ms = elapsed_ms(start);
-    let input_hash = sha256_json(&input);
-    let output_hash = Some(sha256_json(&output));
-
-    let event = ToolInvokedEvent {
-        request_id: uuid::Uuid::new_v4().to_string(),
-        tool_id: tool_id.to_owned(),
-        invoker_did: invoker_did.clone(),
-        status: ToolStatus::Success,
-        execution_time_ms,
-        input_hash,
-        output_hash,
-        cost: None,
-    };
-
-    Ok((output, event))
+    // 7. Build event + return.
+    let event = build_tool_event(tool_id, invoker_did, start, &input, &output, action_cost);
+    Ok((output, event, triggered))
 }
 
 // ---------------------------------------------------------------------------
@@ -382,6 +477,13 @@ pub fn check_tool_economy(
     invoker_did: &DID,
 ) -> Result<(), InvocationError> {
     if let Some(policy) = economic_policy {
+        // Metrics are zero here because check_tool_economy is a standalone
+        // function without access to PerContextState. The caller (invoke_tool)
+        // already evaluates cost with context-aware metrics for the UCAN
+        // composition check. This function uses zero metrics as a conservative
+        // lower bound for budget enforcement — if the base cost exceeds the
+        // budget, it will be caught here; dynamic pricing adjustments happen
+        // in the caller's metrics-aware path.
         let metrics = scp_protocol::economy::policy::ObservableMetrics {
             context_message_rate: 0,
             member_count: 0,
@@ -692,11 +794,12 @@ mod tests {
             &DID::from(creator_did),
             None,
             add_executor,
+            None::<&mut ToolEconomyContext<'_>>,
         )
         .await;
 
         assert!(result.is_ok(), "invoke_tool should succeed: {result:?}");
-        let (output, event) = result.unwrap();
+        let (output, event, _consequences) = result.unwrap();
         assert_eq!(output, serde_json::json!({"result": 7.0}));
         assert_eq!(event.tool_id, "calculator");
         assert_eq!(event.invoker_did, creator_did);
@@ -727,6 +830,7 @@ mod tests {
             &DID::from(creator_did),
             None,
             add_executor,
+            None::<&mut ToolEconomyContext<'_>>,
         )
         .await;
 
@@ -760,6 +864,7 @@ mod tests {
             &DID::from(member_did),
             None,
             add_executor,
+            None::<&mut ToolEconomyContext<'_>>,
         )
         .await;
 
@@ -791,6 +896,7 @@ mod tests {
             &DID::from(creator_did),
             None,
             add_executor,
+            None::<&mut ToolEconomyContext<'_>>,
         )
         .await;
 
@@ -823,6 +929,7 @@ mod tests {
             &DID::from(creator_did),
             None,
             add_executor,
+            None::<&mut ToolEconomyContext<'_>>,
         )
         .await;
 
@@ -860,6 +967,7 @@ mod tests {
             &DID::from(creator_did),
             Some(50), // 50ms timeout -- will expire before the 5s sleep.
             slow_executor,
+            None::<&mut ToolEconomyContext<'_>>,
         )
         .await;
 
@@ -903,6 +1011,7 @@ mod tests {
             None,
             slow_executor,
             cancel,
+            None::<&mut ToolEconomyContext<'_>>,
         )
         .await;
 
@@ -939,6 +1048,7 @@ mod tests {
             &DID::from(creator_did),
             None,
             failing_executor,
+            None::<&mut ToolEconomyContext<'_>>,
         )
         .await;
 
@@ -976,6 +1086,7 @@ mod tests {
             &DID::from(creator_did),
             None,
             bad_output_executor,
+            None::<&mut ToolEconomyContext<'_>>,
         )
         .await;
 
@@ -1000,7 +1111,7 @@ mod tests {
 
         let input = serde_json::json!({"a": 10, "b": 20});
 
-        let (output, event) = invoke_tool(
+        let (output, event, _consequences) = invoke_tool(
             &context,
             &registry,
             &role_state,
@@ -1009,6 +1120,7 @@ mod tests {
             &DID::from(creator_did),
             None,
             add_executor,
+            None::<&mut ToolEconomyContext<'_>>,
         )
         .await
         .unwrap();
@@ -1048,6 +1160,7 @@ mod tests {
             &DID::from(creator_did),
             None,
             add_executor,
+            None::<&mut ToolEconomyContext<'_>>,
         )
         .await;
 
@@ -1130,6 +1243,7 @@ mod tests {
             &DID::from(creator_did),
             Some(999_999), // Above MAX_TIMEOUT_MS
             add_executor,
+            None::<&mut ToolEconomyContext<'_>>,
         )
         .await;
 
