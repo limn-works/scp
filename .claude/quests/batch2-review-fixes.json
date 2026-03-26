@@ -9,7 +9,7 @@
     },
     {
       "name": "NO-STALE: no_stale_ignores has if_expression (real checks, not gutted)",
-      "check": "/Users/alec/.claude/plugins/cache/alecmarcus/odyssey/0.6.0/bin/check-ast crates/scp-testing/tests/integration/pipeline_wiring.rs '(function_item name: (identifier) @fn body: (block (if_expression)) (#eq? @fn \"no_stale_ignores\"))' --min 1"
+      "check": "/Users/alec/.claude/plugins/cache/alecmarcus/odyssey/0.6.0/bin/check-ast crates/scp-testing/tests/integration/pipeline_wiring.rs '(function_item name: (identifier) @fn body: (block (expression_statement (if_expression))) (#eq? @fn \"no_stale_ignores\"))' --min 1"
     },
     {
       "name": "PIPELINE: enforce_economic_policy string absent from pipeline_wiring.rs",
