@@ -414,43 +414,36 @@ fn no_stale_ignores() {
     let source = include_str!("pipeline_wiring.rs");
 
     // Check that batch-2 governance wiring is present (not ignored).
-    // These checks detect regressions where wiring is removed or ignored.
+    // Each check verifies wiring is present AND no stale #[ignore] remains.
     if fn_body_contains(
         MANAGER_SRC,
         "dispatch_consequences",
         "evaluate_consequence_rules",
-    ) {
-        // #1531 consequence evaluation is wired -- verify no stale ignore.
-        if source.contains("#[ignore = \"waiting for #1531\"]") {
-            stale.push("governance_dispatch_calls_evaluate_consequences — #1531 is wired");
-        }
+    ) && source.contains("#[ignore = \"waiting for #1531\"]")
+    {
+        stale.push("governance_dispatch_calls_evaluate_consequences — #1531 is wired");
     }
 
-    if fn_body_contains(MANAGER_SRC, "enforce_send_economy", "evaluate_cost") {
-        // #1537 economy enforcement is wired -- verify no stale ignore.
-        if source.contains("#[ignore = \"waiting for #1537\"]") {
-            stale.push("governance_enforces_economic_policy — #1537 is wired");
-        }
+    if fn_body_contains(MANAGER_SRC, "enforce_send_economy", "evaluate_cost")
+        && source.contains("#[ignore = \"waiting for #1537\"]")
+    {
+        stale.push("governance_enforces_economic_policy — #1537 is wired");
     }
 
     if fn_body_contains(
         MANAGER_SRC,
         "check_standing",
         "compute_participation_record",
-    ) {
-        // #1530 standing checks are wired -- verify no stale ignore.
-        if source.contains("#[ignore = \"waiting for #1530\"]") {
-            stale.push("standing_check_wired — #1530 is wired");
-        }
+    ) && source.contains("#[ignore = \"waiting for #1530\"]")
+    {
+        stale.push("standing_check_wired — #1530 is wired");
     }
 
-    if fn_body_contains(MANAGER_SRC, "execute_rotate_content_keys", "advance_epoch")
-        || fn_body_contains(MANAGER_SRC, "execute_rotate_content_keys", "propose_update")
+    if (fn_body_contains(MANAGER_SRC, "execute_rotate_content_keys", "advance_epoch")
+        || fn_body_contains(MANAGER_SRC, "execute_rotate_content_keys", "propose_update"))
+        && source.contains("#[ignore = \"waiting for #1548\"]")
     {
-        // #1548 content key rotation is wired -- verify no stale ignore.
-        if source.contains("#[ignore = \"waiting for #1548\"]") {
-            stale.push("rotate_content_keys_calls_propose_update — #1548 is wired");
-        }
+        stale.push("rotate_content_keys_calls_propose_update — #1548 is wired");
     }
 
     assert!(

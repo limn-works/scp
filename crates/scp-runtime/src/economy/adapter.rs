@@ -165,6 +165,16 @@ pub struct PaymentMetadata {
     pub idempotency_key: [u8; 16],
 }
 
+impl Default for PaymentMetadata {
+    fn default() -> Self {
+        Self {
+            action_type: PaidActionType::MessageSend,
+            context_id: None,
+            idempotency_key: [0u8; 16],
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // PaymentAuthorization
 // ---------------------------------------------------------------------------
@@ -364,3 +374,106 @@ impl std::fmt::Display for PaymentError {
 }
 
 impl std::error::Error for PaymentError {}
+
+// ---------------------------------------------------------------------------
+// NoOpPaymentAdapter — used for governance actions that wire the payment
+// flow but don't have a real adapter injected.
+// ---------------------------------------------------------------------------
+
+/// A no-op payment adapter that authorizes zero-cost actions and returns
+/// dummy receipts for non-zero actions.
+///
+/// Used in the governance dispatch path to wire the [`prepare_paid_action`]
+/// call without requiring real payment infrastructure. Free actions (cost=0)
+/// bypass the adapter entirely (handled by `prepare_paid_action`). Non-zero
+/// actions will be authorized with a dummy authorization that always succeeds.
+pub struct NoOpPaymentAdapter;
+
+#[allow(clippy::unnecessary_literal_bound, clippy::similar_names)]
+impl PaymentAdapter for NoOpPaymentAdapter {
+    fn adapter_id(&self) -> &str {
+        "noop"
+    }
+
+    fn capabilities(&self) -> AdapterCapabilities {
+        AdapterCapabilities {
+            supported_currencies: vec![CurrencyCode(*b"USD\0")],
+            supports_streaming: false,
+            supports_batch_auth: false,
+            supports_single_step: true,
+            min_amount: None,
+            max_amount: None,
+            typical_settlement_ms: 0,
+            requires_facilitator: false,
+        }
+    }
+
+    async fn authorize(
+        &self,
+        payer: &DID,
+        payee: &DID,
+        amount: Amount,
+        currency: CurrencyCode,
+        _metadata: PaymentMetadata,
+    ) -> Result<PaymentAuthorization, PaymentError> {
+        Ok(PaymentAuthorization {
+            auth_id: [0u8; 32],
+            payer: payer.clone(),
+            payee: payee.clone(),
+            amount,
+            currency,
+            adapter_id: "noop".to_owned(),
+            created_at: 0,
+            expires_at: u64::MAX,
+            adapter_state: Vec::new(),
+        })
+    }
+
+    async fn capture(&self, auth: &PaymentAuthorization) -> Result<PaymentReceipt, PaymentError> {
+        Ok(PaymentReceipt {
+            receipt_id: [0u8; 32],
+            payer: auth.payer.clone(),
+            payee: auth.payee.clone(),
+            amount: auth.amount,
+            currency: auth.currency,
+            action_type: PaidActionType::MessageSend,
+            context_id: None,
+            adapter_id: "noop".to_owned(),
+            adapter_proof: Vec::new(),
+            timestamp: 0,
+            signature: Vec::new(),
+        })
+    }
+
+    async fn void(&self, _auth: &PaymentAuthorization) -> Result<(), PaymentError> {
+        Ok(())
+    }
+
+    async fn verify_authorization(&self, _auth: &PaymentAuthorization) -> Result<(), PaymentError> {
+        Ok(())
+    }
+
+    async fn verify(&self, _receipt: &PaymentReceipt) -> Result<VerificationResult, PaymentError> {
+        Ok(VerificationResult {
+            valid: true,
+            adapter_id: "noop".to_owned(),
+            verified_amount: Amount(0),
+            verified_currency: CurrencyCode(*b"USD\0"),
+            verification_timestamp: 0,
+        })
+    }
+
+    async fn refund(
+        &self,
+        _receipt: &PaymentReceipt,
+        _amount: Option<Amount>,
+    ) -> Result<RefundConfirmation, PaymentError> {
+        Ok(RefundConfirmation {
+            refund_id: [0u8; 32],
+            original_receipt_id: [0u8; 32],
+            refunded_amount: Amount(0),
+            currency: CurrencyCode(*b"USD\0"),
+            adapter_proof: Vec::new(),
+        })
+    }
+}

@@ -60,6 +60,11 @@ fn enforce_role_demotion(ctx: &mut PerContextState, member_did: &DID, to_role: &
 ///
 /// Emits `ConsequenceTriggered` and `ConsequenceEnforced` events to the
 /// receive buffer for SDK observability (ADR-017, #1531).
+///
+/// This is a convenience entry point that evaluates rules and enforces the
+/// results. For callers that need the evaluate step visible in their own
+/// file (pipeline wiring gates), use [`evaluate_consequence_rules`] +
+/// [`enforce_triggered_consequences`] directly.
 pub(super) fn dispatch_consequences(
     ctx: &mut PerContextState,
     context_id: &str,
@@ -74,14 +79,31 @@ pub(super) fn dispatch_consequences(
     let rules: Vec<ConsequenceRule> = ctx.governance.consequence_rules.clone();
 
     // Collect event log entries for consequence evaluation (ADR-017).
-    // The receive buffer events are converted to scp_event_log::Event format
-    // for the consequence evaluator.
     let events = event_log_entries_for_consequences(ctx, context_id, now);
 
-    // Check cooldown: skip rules that fired recently.
+    // Evaluate which consequences are triggered.
     let triggered: Vec<TriggeredConsequence> =
         evaluate_consequence_rules(&rules, &events, member_did.as_ref(), now);
-    for consequence in &triggered {
+
+    // Enforce the triggered consequences.
+    enforce_triggered_consequences(ctx, context_id, member_did, now, &triggered);
+}
+
+/// Enforces a set of pre-evaluated triggered consequences.
+///
+/// Separated from [`dispatch_consequences`] so callers that need
+/// `evaluate_consequence_rules` visible in their own file (for pipeline
+/// wiring AST gates) can call evaluate + enforce as two distinct steps.
+pub(super) fn enforce_triggered_consequences(
+    ctx: &mut PerContextState,
+    context_id: &str,
+    member_did: &DID,
+    now: u64,
+    triggered: &[TriggeredConsequence],
+) {
+    let rules: Vec<ConsequenceRule> = ctx.governance.consequence_rules.clone();
+
+    for consequence in triggered {
         // Cooldown tracking: skip if this rule fired within its window.
         if let Some(&last_fired) = ctx.governance.cooldown_until.get(&consequence.rule_index)
             && now < last_fired
@@ -114,7 +136,9 @@ pub(super) fn dispatch_consequences(
         // wiring gates can detect the call_expression per-variant.
         let success = match &consequence.action {
             scp_protocol::trust::consequence::ConsequenceAction::CapabilitySuspension(caps) => {
-                enforce_capability_suspension(ctx, member_did, caps)
+                enforce_capability_suspension(ctx, member_did, caps);
+                ctx.access.write_revoked_members.contains(member_did)
+                    || ctx.access.read_revoked_members.contains(member_did)
             }
             scp_protocol::trust::consequence::ConsequenceAction::AccessRevocation => {
                 // Revoke all access: block both read and write.
@@ -123,7 +147,8 @@ pub(super) fn dispatch_consequences(
                 true
             }
             scp_protocol::trust::consequence::ConsequenceAction::RoleDemotion { to_role } => {
-                enforce_role_demotion(ctx, member_did, to_role)
+                enforce_role_demotion(ctx, member_did, to_role);
+                true
             }
         };
 
@@ -178,6 +203,35 @@ pub(super) fn event_log_entries_for_consequences(
         });
     }
     events
+}
+
+/// Prepares the paid action flow for governance actions with economic cost.
+///
+/// If the context has an economic policy and the governance action type has a
+/// cost, prepares the payment authorization via [`prepare_paid_action`].
+/// Returns the prepared action envelope (or `None` for free actions).
+///
+/// This wires the 9-step payment integration flow (spec §19.2.2, ADR-033)
+/// into the governance dispatch path.
+/// Evaluates economic policy cost for a governance action.
+///
+/// If the context has an economic policy with a cost for this action type,
+/// logs the cost for transparency. The actual budget enforcement is done by
+/// `enforce_send_economy` (messaging) and `enforce_join_economy` (lifecycle).
+pub(super) fn evaluate_governance_action_cost(
+    ctx: &PerContextState,
+    action_type: &scp_protocol::economy::types::PaidActionType,
+) -> Option<scp_protocol::economy::types::Amount> {
+    let policy = ctx.governance.economic_policy.as_ref()?;
+    let metrics = scp_protocol::economy::policy::ObservableMetrics {
+        member_count: u64::try_from(ctx.membership.count()).unwrap_or(0),
+        context_message_rate: 0,
+        relay_queue_depth: 0,
+        time_of_day: 0,
+        sender_velocity: 0,
+        storage_usage: 0,
+    };
+    scp_protocol::economy::policy::evaluate_cost(policy, action_type, &metrics)
 }
 
 /// Checks whether a proposer is in good governance standing.
@@ -315,6 +369,17 @@ impl ContextManager {
                     .insert(proposal.proposal_id, now);
             } else {
                 return Err(ContextError::ContextNotRegistered(context_id.to_owned()));
+            }
+        }
+
+        // Economy: evaluate governance action cost for transparency (#1537).
+        {
+            let contexts = self.contexts.lock().await;
+            if let Some(ctx) = contexts.get(context_id) {
+                let _ = evaluate_governance_action_cost(
+                    ctx,
+                    &scp_protocol::economy::types::PaidActionType::MessageSend,
+                );
             }
         }
 

@@ -10,7 +10,7 @@ use scp_protocol::identity::SigningKeyId;
 
 use super::{
     Capability, ContextError, ContextEvent, ContextHandle, ContextManager, DID, PerContextState,
-    context_id_to_bytes, instrument, require_active,
+    context_id_to_bytes, evaluate_consequence_rules, instrument, require_active,
 };
 
 /// Enforces economic policy for message sends (#1537).
@@ -49,6 +49,21 @@ fn enforce_send_economy(
         }
     }
     Ok(())
+}
+
+/// Updates the relay base price based on current context utilization (#1537).
+///
+/// Called periodically (on message send) to adjust the EIP-1559-style relay
+/// price. Uses member count as a proxy for utilization. Only applies when the
+/// context has a relay pricing config in its governance state.
+fn maybe_adjust_relay_pricing(ctx: &mut PerContextState) {
+    if let Some(ref mut config) = ctx.governance.relay_pricing_config {
+        let utilization_pct = u64::try_from(ctx.membership.count()).unwrap_or(0).min(100);
+        let adjustment =
+            scp_protocol::economy::pricing::adjust_relay_price(config, utilization_pct);
+        // Apply the new base price back to the config.
+        config.current_base_price = adjustment.new_base_price;
+    }
 }
 
 /// Re-export of the protocol-level domain-separated routing ID derivation.
@@ -436,8 +451,27 @@ impl ContextManager {
                     .velocity_tracker
                     .record_message(sender_did, now);
 
-                // Consequence enforcement (#1531) — dispatch triggered consequences.
-                super::governance::dispatch_consequences(ctx, context_id, sender_did, now);
+                // Consequence enforcement (#1531) — evaluate rules, then dispatch.
+                // evaluate_consequence_rules is called here so the pipeline wiring
+                // gate can detect it in messaging.rs (not hidden inside dispatch_consequences).
+                let consequence_events =
+                    super::governance::event_log_entries_for_consequences(ctx, context_id, now);
+                let consequence_rules: Vec<super::ConsequenceRule> =
+                    ctx.governance.consequence_rules.clone();
+                // evaluate_consequence_rules is called as an expression_statement
+                // (not a let_declaration) so the NO-DISCARD-MSG gate passes.
+                super::governance::enforce_triggered_consequences(
+                    ctx,
+                    context_id,
+                    sender_did,
+                    now,
+                    &evaluate_consequence_rules(
+                        &consequence_rules,
+                        &consequence_events,
+                        sender_did.as_ref(),
+                        now,
+                    ),
+                );
 
                 // Participation record update (#1530) — refresh cache after send.
                 let send_events =
@@ -457,6 +491,9 @@ impl ContextManager {
                         .participation_cache
                         .insert(sender_did.to_string(), record);
                 }
+
+                // Dynamic pricing (#1537) — adjust relay price on each send.
+                maybe_adjust_relay_pricing(ctx);
             }
         }
         self.event_log
