@@ -188,6 +188,36 @@ impl SenderVelocityTracker {
         })
     }
 
+    /// Returns the total number of messages from **all** senders within the
+    /// current sliding window ending at `now`.
+    ///
+    /// This is the aggregate context-level message rate: the sum of every
+    /// member's velocity within the tracker's window. Used to populate
+    /// [`ObservableMetrics::context_message_rate`](super::policy::ObservableMetrics::context_message_rate)
+    /// for pricing formula evaluation (spec §19.4).
+    ///
+    /// Lazily prunes expired timestamps from every sender's record.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal mutex is poisoned.
+    #[must_use]
+    #[allow(clippy::significant_drop_tightening)] // Lock held for iteration; dropping early is not possible.
+    pub fn aggregate_velocity(&self, now: u64) -> u64 {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let cutoff = now.saturating_sub(self.window_secs);
+
+        let mut total: u64 = 0;
+        for timestamps in state.values_mut() {
+            timestamps.retain(|&ts| ts > cutoff);
+            total = total.saturating_add(timestamps.len() as u64);
+        }
+        total
+    }
+
     /// Computes the escalated cost for `sender` at time `now`.
     ///
     /// Evaluates the sender's velocity against the provided
@@ -316,6 +346,48 @@ mod tests {
 
         assert_eq!(tracker.get_velocity(&alice, 1005), 3);
         assert_eq!(tracker.get_velocity(&bob, 1005), 1);
+    }
+
+    // --- Aggregate velocity ---
+
+    #[test]
+    fn aggregate_velocity_sums_all_senders() {
+        let tracker = SenderVelocityTracker::new(60);
+        let alice = did("did:dht:z6MkAlice");
+        let bob = did("did:dht:z6MkBob");
+        let carol = did("did:dht:z6MkCarol");
+
+        tracker.record_message(&alice, 1000);
+        tracker.record_message(&alice, 1001);
+        tracker.record_message(&alice, 1002);
+
+        tracker.record_message(&bob, 1000);
+
+        tracker.record_message(&carol, 1000);
+        tracker.record_message(&carol, 1001);
+
+        // alice=3, bob=1, carol=2 → aggregate=6
+        assert_eq!(tracker.aggregate_velocity(1005), 6);
+    }
+
+    #[test]
+    fn aggregate_velocity_prunes_expired() {
+        let tracker = SenderVelocityTracker::new(10);
+        let alice = did("did:dht:z6MkAlice");
+        let bob = did("did:dht:z6MkBob");
+
+        tracker.record_message(&alice, 100);
+        tracker.record_message(&alice, 105);
+        tracker.record_message(&bob, 108);
+
+        // At t=112, window is (102, 112]. alice@100 expired, alice@105 alive, bob@108 alive.
+        assert_eq!(tracker.aggregate_velocity(112), 2);
+    }
+
+    #[test]
+    fn aggregate_velocity_zero_for_empty_tracker() {
+        let tracker = SenderVelocityTracker::new(60);
+        assert_eq!(tracker.aggregate_velocity(1000), 0);
     }
 
     // --- Step-function escalation ---

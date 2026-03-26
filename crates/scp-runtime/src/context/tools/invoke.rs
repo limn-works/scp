@@ -213,6 +213,7 @@ pub async fn invoke_tool<F, Fut, S: BuildHasher>(
         serde_json::Value,
         ToolInvokedEvent,
         Vec<scp_protocol::trust::consequence::TriggeredConsequence>,
+        Option<crate::economy::adapter::PaymentReceipt>,
     ),
     InvocationError,
 >
@@ -255,15 +256,16 @@ where
         .map(|econ| economy_pre_check(econ, invoker_did))
         .transpose()?;
 
-    // 4b. Payment flow (#1537): 9-step paid action for tool invocations.
+    // 4b. Payment flow (#1537, #1596): 9-step paid action for tool invocations.
     // Runs after budget check but before tool execution. Only triggers when
     // a payment adapter is configured AND cost > 0.
     // If payment fails, roll back the budget deducted by economy_pre_check.
-    if let Some(ref econ) = economy
+    // The receipt is returned to the caller for event log recording.
+    let payment_receipt = if let Some(ref econ) = economy
         && let (Some(adapter), Some(policy)) = (&econ.payment_adapter, econ.economic_policy)
     {
         let remaining = econ.budget_tracker.remaining(invoker_did);
-        if let Err(payment_err) = execute_tool_payment(
+        match execute_tool_payment(
             adapter.as_ref(),
             policy,
             econ.context_id,
@@ -272,15 +274,20 @@ where
         )
         .await
         {
-            // Restore the budget deducted by check_tool_economy.
-            if let Some(cost) = action_cost
-                && let Some(ref mut econ) = economy
-            {
-                econ.budget_tracker.grant(invoker_did, cost);
+            Ok(receipt) => receipt,
+            Err(payment_err) => {
+                // Restore the budget deducted by check_tool_economy.
+                if let Some(cost) = action_cost
+                    && let Some(ref mut econ) = economy
+                {
+                    econ.budget_tracker.grant(invoker_did, cost);
+                }
+                return Err(payment_err);
             }
-            return Err(payment_err);
         }
-    }
+    } else {
+        None
+    };
 
     // 5. Execute the tool with timeout.
     let effective_timeout = timeout_ms.unwrap_or(DEFAULT_TIMEOUT_MS).min(MAX_TIMEOUT_MS);
@@ -304,9 +311,9 @@ where
         .map(|econ| economy_post_check(econ, invoker_did))
         .unwrap_or_default();
 
-    // 7-8. Build event + return.
+    // 7-8. Build event + return (#1596: receipt returned to caller).
     let event = build_tool_event(tool_id, invoker_did, start, &input, &output, action_cost);
-    Ok((output, event, triggered))
+    Ok((output, event, triggered, payment_receipt))
 }
 
 /// Runs economy pre-checks (budget enforcement + UCAN AND-composition).
@@ -407,6 +414,7 @@ pub async fn invoke_tool_with_cancellation<F, Fut, C, CFut, S: BuildHasher>(
         serde_json::Value,
         ToolInvokedEvent,
         Vec<scp_protocol::trust::consequence::TriggeredConsequence>,
+        Option<crate::economy::adapter::PaymentReceipt>,
     ),
     InvocationError,
 >
@@ -445,13 +453,13 @@ where
         .map(|econ| economy_pre_check(econ, invoker_did))
         .transpose()?;
 
-    // 4b. Payment flow (#1537): 9-step paid action for tool invocations.
+    // 4b. Payment flow (#1537, #1596): 9-step paid action for tool invocations.
     // If payment fails, roll back the budget deducted by economy_pre_check.
-    if let Some(ref econ) = economy
+    let payment_receipt = if let Some(ref econ) = economy
         && let (Some(adapter), Some(policy)) = (&econ.payment_adapter, econ.economic_policy)
     {
         let remaining = econ.budget_tracker.remaining(invoker_did);
-        if let Err(payment_err) = execute_tool_payment(
+        match execute_tool_payment(
             adapter.as_ref(),
             policy,
             econ.context_id,
@@ -460,15 +468,20 @@ where
         )
         .await
         {
-            // Restore the budget deducted by check_tool_economy.
-            if let Some(cost) = action_cost
-                && let Some(ref mut econ) = economy
-            {
-                econ.budget_tracker.grant(invoker_did, cost);
+            Ok(receipt) => receipt,
+            Err(payment_err) => {
+                // Restore the budget deducted by check_tool_economy.
+                if let Some(cost) = action_cost
+                    && let Some(ref mut econ) = economy
+                {
+                    econ.budget_tracker.grant(invoker_did, cost);
+                }
+                return Err(payment_err);
             }
-            return Err(payment_err);
         }
-    }
+    } else {
+        None
+    };
 
     // 5. Execute with timeout and cancellation.
     let effective_timeout = timeout_ms.unwrap_or(DEFAULT_TIMEOUT_MS).min(MAX_TIMEOUT_MS);
@@ -503,9 +516,9 @@ where
         .map(|econ| economy_post_check(econ, invoker_did))
         .unwrap_or_default();
 
-    // 7. Build event + return.
+    // 7. Build event + return (#1596: receipt returned to caller).
     let event = build_tool_event(tool_id, invoker_did, start, &input, &output, action_cost);
-    Ok((output, event, triggered))
+    Ok((output, event, triggered, payment_receipt))
 }
 
 // ---------------------------------------------------------------------------
@@ -705,12 +718,17 @@ impl crate::economy::adapter::PaymentAdapter for ToolPaymentBridge<'_> {
     }
 }
 
-/// Executes the 9-step payment flow for tool invocations (#1537, spec §19.2.2).
+/// Executes the 9-step payment flow for tool invocations (#1537, #1596, spec §19.2.2).
 ///
 /// Called from `invoke_tool` after the economy pre-check (budget + UCAN
 /// composition) but before tool execution. Uses the adapter from
 /// `ToolEconomyContext::payment_adapter`. Skips if no economic policy or
 /// zero cost.
+///
+/// Returns the payment receipt when a payment was captured, `None` when
+/// the cost was zero or no payment was needed. The caller is responsible
+/// for recording the receipt in the event log (matching the pattern in
+/// `ContextManager::execute_paid_action`).
 ///
 /// # Errors
 ///
@@ -721,7 +739,7 @@ async fn execute_tool_payment(
     context_id: &str,
     invoker_did: &DID,
     budget_remaining: scp_protocol::economy::types::Amount,
-) -> Result<(), InvocationError> {
+) -> Result<Option<crate::economy::adapter::PaymentReceipt>, InvocationError> {
     let metrics = scp_protocol::economy::policy::ObservableMetrics {
         member_count: 0,
         context_message_rate: 0,
@@ -737,7 +755,7 @@ async fn execute_tool_payment(
         &metrics,
     );
     let Some(cost) = cost.filter(|c| c.0 > 0) else {
-        return Ok(());
+        return Ok(None);
     };
 
     let bridge = ToolPaymentBridge(adapter);
@@ -780,11 +798,6 @@ async fn execute_tool_payment(
         remaining: budget_remaining.0,
     })?;
 
-    // TODO(#1596): Return the payment receipt alongside the tool output so the
-    // caller can pass it to `ContextManager::verify_payment_receipts`. Currently
-    // the receipt is logged but not returned because `execute_tool_payment`
-    // returns `Result<(), InvocationError>` and changing it to return the receipt
-    // requires threading through `invoke_tool`'s return type.
     if let Some(receipt) = &processed.receipt {
         tracing::debug!(
             receipt_id = %hex::encode(receipt.receipt_id),
@@ -793,7 +806,7 @@ async fn execute_tool_payment(
         );
     }
 
-    Ok(())
+    Ok(processed.receipt)
 }
 
 // ---------------------------------------------------------------------------
@@ -1020,7 +1033,7 @@ mod tests {
         .await;
 
         assert!(result.is_ok(), "invoke_tool should succeed: {result:?}");
-        let (output, event, _consequences) = result.unwrap();
+        let (output, event, _consequences, _receipt) = result.unwrap();
         assert_eq!(output, serde_json::json!({"result": 7.0}));
         assert_eq!(event.tool_id, "calculator");
         assert_eq!(event.invoker_did, creator_did);
@@ -1332,7 +1345,7 @@ mod tests {
 
         let input = serde_json::json!({"a": 10, "b": 20});
 
-        let (output, event, _consequences) = invoke_tool(
+        let (output, event, _consequences, _receipt) = invoke_tool(
             &context,
             &registry,
             &role_state,

@@ -78,15 +78,15 @@ fn enforce_join_economy(
     if let Some(ref policy) = ctx.governance.economic_policy {
         let metrics = scp_protocol::economy::policy::ObservableMetrics {
             member_count: u64::try_from(ctx.membership.count()).unwrap_or(u64::MAX),
-            // context_message_rate: requires relay-level telemetry (#1597)
-            context_message_rate: 0,
-            // relay_queue_depth: requires relay-level telemetry (#1597)
+            context_message_rate: ctx.governance.velocity_tracker.aggregate_velocity(now),
+            // relay_queue_depth: Requires relay-level telemetry not available at ContextManager.
+            // See enforce_send_economy in messaging.rs for the full architectural note.
             relay_queue_depth: 0,
-            // time_of_day: seconds since midnight UTC from injected clock
             time_of_day: now % 86400,
             // sender_velocity: not tracked per-joiner (velocity is per-sender, join is one-shot)
             sender_velocity: 0,
-            // storage_usage: requires storage provider metrics (#1597)
+            // storage_usage: Requires storage provider metrics not available at ContextManager.
+            // See enforce_send_economy in messaging.rs for the full architectural note.
             storage_usage: 0,
         };
         if let Some(cost) = scp_protocol::economy::policy::evaluate_cost(

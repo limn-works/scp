@@ -185,12 +185,34 @@ pub(super) fn enforce_triggered_consequences(
 /// recent context events) and the event log types expected by the trust
 /// evaluation functions.
 ///
-/// **Known limitation (#1594):** The receive buffer is capped at 1000 events.
-/// Long-running contexts lose history, which means participation records and
-/// consequence evaluation only reflect recent activity. For full-history
-/// participation, use `self.event_log.event_log_entries()` instead — but
-/// that requires access to the `ContextEventLogProvider` which is not
-/// available to free functions. See #1594 for the migration plan.
+/// **Known limitation (#1594):** The receive buffer is capped at 1000 events
+/// (`ReceiveBuffer::DEFAULT_BUFFER_CAPACITY`). Long-running contexts lose
+/// older history, which means participation records and consequence evaluation
+/// only reflect recent activity.
+///
+/// **Why the Merkle event log cannot be used as a replacement:**
+/// `ContextEventLogProvider::event_log_entries()` returns `EventLogEntry`,
+/// which contains only `event: String` (event name) and `timestamp: u64`.
+/// It does NOT store structured event data — crucially, it lacks the
+/// `actor_did` field that consequence evaluation and participation record
+/// computation require. The Merkle event log was designed for provenance
+/// integrity (hash-chaining) and audit trails, not for querying behavioral
+/// history.
+///
+/// **What would need to change for full-history support:**
+/// 1. Either extend `EventLogEntry` with an `actor_did: Option<DID>` field
+///    and a structured `event_type` enum (breaking the existing Merkle chain
+///    format), or
+/// 2. Introduce a separate `ContextBehaviorLog` that stores structured
+///    `ContextEvent` entries with DID information, indexed by context ID,
+///    alongside the Merkle event log.
+/// 3. The `ContextEventLogProvider` trait would need a new query method
+///    returning typed events, and this function would need access to the
+///    provider (currently it's a free function operating on `PerContextState`).
+///
+/// Until then, the receive buffer provides a best-effort sliding window of
+/// recent events for consequence evaluation, which is sufficient for active
+/// contexts with normal message rates.
 pub(super) fn event_log_entries_for_consequences(
     ctx: &PerContextState,
     _context_id: &str,

@@ -222,13 +222,13 @@ impl ContextManager {
             let metrics = ObservableMetrics {
                 sender_velocity: velocity,
                 member_count,
-                // context_message_rate: requires relay-level telemetry (#1597)
-                context_message_rate: 0,
-                // relay_queue_depth: requires relay-level telemetry (#1597)
+                context_message_rate: ctx.governance.velocity_tracker.aggregate_velocity(now_secs),
+                // relay_queue_depth: Requires relay-level telemetry not available
+                // at ContextManager. See enforce_send_economy in messaging.rs.
                 relay_queue_depth: 0,
-                // time_of_day: seconds since midnight UTC from injected clock
                 time_of_day: now_secs % 86400,
-                // storage_usage: requires storage provider metrics (#1597)
+                // storage_usage: Requires storage provider metrics not available
+                // at ContextManager. See enforce_send_economy in messaging.rs.
                 storage_usage: 0,
             };
             (policy, metrics)

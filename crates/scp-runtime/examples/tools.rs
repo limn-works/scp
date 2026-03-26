@@ -108,7 +108,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let input = serde_json::json!({"a": 7, "b": 3, "op": "mul"});
     println!("\nInvoking calculator with: {input}");
 
-    let (output, invoke_event, _consequences) = invoke_tool(
+    let (output, invoke_event, _consequences, _receipt) = invoke_tool(
         &handle,
         &registry,
         &role_state,

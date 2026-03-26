@@ -10164,3 +10164,157 @@ async fn test_full_lifecycle_economy() {
         "expected budget exceeded, got: {err}"
     );
 }
+
+// -----------------------------------------------------------------------
+// Velocity-escalation integration: high velocity sending raises cost (#1537)
+// -----------------------------------------------------------------------
+
+/// End-to-end: high-velocity sending causes price escalation via `SenderVelocity`
+/// step thresholds. Velocity tracker records messages, formula evaluates
+/// `SenderVelocity`, budget deducted at higher rates as velocity increases.
+#[tokio::test]
+async fn velocity_escalation_raises_effective_cost() {
+    use scp_protocol::economy::types::Amount;
+
+    let (manager, handle, admin, sk) = setup_velocity_escalation_context().await;
+
+    macro_rules! budget_remaining {
+        ($mgr:expr) => {{
+            let contexts = $mgr.contexts.lock().await;
+            let ctx = contexts.get("vel-esc-ctx").unwrap();
+            ctx.governance.budget_tracker.remaining(&admin)
+        }};
+    }
+
+    assert_eq!(budget_remaining!(manager), Amount::new(10_000));
+
+    // Send 2 messages at low velocity (cost = 1 each, formula adds 0).
+    for i in 0..2 {
+        manager
+            .send_message(
+                &handle,
+                &admin,
+                format!("msg-{i}").as_bytes(),
+                Some(&sk),
+                None,
+            )
+            .await
+            .unwrap();
+    }
+
+    let after_2 = budget_remaining!(manager);
+    let cost_low = 10_000 - after_2.0;
+    // Velocity 0-1, below threshold of 3 — no formula addition.
+    assert!(
+        cost_low <= 4,
+        "low-velocity cost should be small (got {cost_low})"
+    );
+
+    // Send 4 more messages to push velocity above thresholds.
+    for i in 2..6 {
+        manager
+            .send_message(
+                &handle,
+                &admin,
+                format!("msg-{i}").as_bytes(),
+                Some(&sk),
+                None,
+            )
+            .await
+            .unwrap();
+    }
+
+    let after_6 = budget_remaining!(manager);
+    let cost_mid = after_2.0 - after_6.0;
+    // Velocity rises to 3-5 (first threshold: +10) and 6 (both thresholds: +60).
+    assert!(
+        cost_mid > 10,
+        "escalated cost should exceed 10 (got {cost_mid})"
+    );
+
+    // Average cost per message should exceed the base cost of 1.
+    let avg = (10_000 - after_6.0) / 6;
+    assert!(avg > 1, "average cost should exceed base cost (got {avg})");
+
+    // Velocity tracker should have >= 6 messages recorded.
+    let (velocity, aggregate) = {
+        let contexts = manager.contexts.lock().await;
+        let ctx = contexts.get("vel-esc-ctx").unwrap();
+        let now = scp_primitives::SystemClock.now_secs();
+        (
+            ctx.governance.velocity_tracker.get_velocity(&admin, now),
+            ctx.governance.velocity_tracker.aggregate_velocity(now),
+        )
+    };
+    assert!(velocity >= 6, "velocity should be >= 6, got {velocity}");
+    assert!(aggregate >= 6, "aggregate should be >= 6, got {aggregate}");
+}
+
+/// Setup helper for the velocity-escalation test.
+async fn setup_velocity_escalation_context() -> (
+    ContextManager,
+    crate::context::ContextHandle,
+    DID,
+    ed25519_dalek::SigningKey,
+) {
+    use scp_protocol::economy::types::{
+        Amount, CostSchedule, CurrencyCode, EconomicPolicy, PricingFormula, PricingMetric,
+        PricingVariable,
+    };
+
+    let manager = ContextManager::new(
+        Box::new(MockCrypto::default()),
+        Box::new(MockTransport::connected()),
+        Box::new(MockEventLog::default()),
+        noop_key_resolver(),
+    );
+    let mut params = governance_params();
+    // Pricing formula: base 1/msg + step thresholds on SenderVelocity.
+    params.economic_policy = Some(EconomicPolicy {
+        locked: false,
+        cost_schedule: CostSchedule {
+            currency: CurrencyCode::new([85, 83, 68, 0]),
+            per_message: Some(Amount::new(1)),
+            per_tool_invoke: None,
+            per_join: None,
+            per_period: None,
+            per_byte_stored: None,
+        },
+        payment_adapters: vec![],
+        pricing_formula: Some(PricingFormula {
+            base_cost: Amount::new(0),
+            variables: vec![PricingVariable::Step {
+                metric: PricingMetric::SenderVelocity,
+                thresholds: vec![(3, Amount::new(10)), (6, Amount::new(50))],
+            }],
+            cap: None,
+            floor: None,
+        }),
+        payee: DID::from("did:key:payee"),
+    });
+
+    manager
+        .create_context("vel-esc-ctx".into(), params, "did:key:admin".into())
+        .await
+        .unwrap();
+
+    {
+        let mut contexts = manager.contexts.lock().await;
+        let ctx = contexts.get_mut("vel-esc-ctx").unwrap();
+        ctx.governance
+            .budget_tracker
+            .grant(&"did:key:admin".into(), Amount::new(10_000));
+    }
+
+    let sk = ed25519_dalek::SigningKey::from_bytes(&[1u8; 32]);
+    let handle = manager
+        .contexts
+        .lock()
+        .await
+        .get("vel-esc-ctx")
+        .unwrap()
+        .handle
+        .clone();
+    let admin = DID::from("did:key:admin");
+    (manager, handle, admin, sk)
+}
