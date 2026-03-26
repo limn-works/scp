@@ -6335,8 +6335,8 @@ async fn standing_decay_reduces_participation() {
 #[tokio::test]
 async fn sender_key_before_mls_removal_ordering() {
     let crypto = MockCrypto::default();
-    let _sender_keys_removed = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
-    let _members_removed = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+    // Shared call-order tracker that survives after crypto moves into manager.
+    let call_order = Arc::clone(&crypto.call_order);
 
     let manager = ContextManager::new(
         Box::new(crypto),
@@ -6362,6 +6362,9 @@ async fn sender_key_before_mls_removal_ordering() {
     };
     manager.join_context(&handle, kp).await.unwrap();
 
+    // Clear call log from join operations so we only see removal calls.
+    call_order.lock().unwrap().clear();
+
     // Remove Alice via governance.
     let action = scp_protocol::context::governance::GovernanceAction::RemoveMember {
         did: alice.clone(),
@@ -6371,6 +6374,22 @@ async fn sender_key_before_mls_removal_ordering() {
         .propose_governance_action("order-ctx", &admin, action, &key_admin)
         .await;
     assert!(result.is_ok(), "remove member should succeed: {result:?}");
+
+    // Verify call ordering: remove_member_sender_key MUST come before remove_member.
+    let calls = call_order.lock().unwrap();
+    let sender_key_pos = calls
+        .iter()
+        .position(|(method, _)| method == "remove_member_sender_key")
+        .expect("remove_member_sender_key should have been called");
+    let remove_pos = calls
+        .iter()
+        .position(|(method, _)| method == "remove_member")
+        .expect("remove_member should have been called");
+    assert!(
+        sender_key_pos < remove_pos,
+        "remove_member_sender_key (pos {sender_key_pos}) must be called before \
+         remove_member (pos {remove_pos}). Call order: {calls:?}"
+    );
 }
 
 /// Budget exceeded on tool invoke returns `BudgetExceeded` (#1537).
