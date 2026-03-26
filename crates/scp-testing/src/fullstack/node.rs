@@ -196,7 +196,7 @@ impl FullStackNode {
         member_did: &str,
     ) -> Result<(), ContextError> {
         let kp = KeyPackage::mock(DID::from(member_did));
-        self.manager.join_context(handle, kp).await?;
+        self.manager.join_context(handle, kp, None).await?;
 
         // Deposit ALL existing members' access keys in the KeyExchange for
         // the joiner. This includes:
@@ -278,7 +278,14 @@ impl FullStackNode {
         payload: &[u8],
     ) -> Result<(), ContextError> {
         self.manager
-            .send_message(handle, &self.did, payload, Some(&self.signing_key), None)
+            .send_message(
+                handle,
+                &self.did,
+                payload,
+                Some(&self.signing_key),
+                None,
+                None,
+            )
             .await
     }
 
@@ -513,14 +520,16 @@ impl ContextEventLogProvider for ArcEventLogProvider {
     fn init_event_log(&self, id: &[u8; 32]) -> Result<(), ContextCreationError> {
         self.0.init_event_log(id)
     }
-    fn append_event(&self, id: &[u8; 32], event: &str) -> Result<(), ContextCreationError> {
-        self.0.append_event(id, event)
+    fn append_event(
+        &self,
+        id: &[u8; 32],
+        event: &str,
+        actor_did: &str,
+    ) -> Result<(), ContextCreationError> {
+        self.0.append_event(id, event, actor_did)
     }
     fn destroy_event_log(&self, id: &[u8; 32]) -> Result<(), ContextCreationError> {
         self.0.destroy_event_log(id)
-    }
-    fn append_context_event(&self, id: &[u8; 32], event: &str) -> Result<(), ContextError> {
-        self.0.append_context_event(id, event)
     }
     fn export_event_log_data(&self, id: &[u8; 32]) -> Result<Vec<u8>, ContextError> {
         self.0.export_event_log_data(id)

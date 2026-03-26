@@ -127,7 +127,7 @@ async fn join_adds_member_to_mls_group_and_issues_ucan_tokens() {
 
     let kp = KeyPackage::mock("did:key:bob".into());
 
-    let result = manager.join_context(&handle, kp).await;
+    let result = manager.join_context(&handle, kp, None).await;
     assert!(result.is_ok());
 
     // Verify member was added.
@@ -159,7 +159,7 @@ async fn join_rejects_when_context_not_active() {
 
     let kp = KeyPackage::mock("did:key:bob".into());
 
-    let result = manager.join_context(&handle, kp).await;
+    let result = manager.join_context(&handle, kp, None).await;
     assert!(result.is_err());
     assert!(matches!(
         result.unwrap_err(),
@@ -200,7 +200,7 @@ async fn join_version_check_rejects_before_crypto_ops() {
         .unwrap();
 
     let kp = KeyPackage::mock("did:key:bob".into());
-    let result = manager.join_context(&ephemeral_handle, kp).await;
+    let result = manager.join_context(&ephemeral_handle, kp, None).await;
 
     // Must fail with VersionIncompatible — the early check rejects
     // before any crypto operations (validate_key_package, add_member,
@@ -263,7 +263,7 @@ async fn leave_does_not_close_when_members_remain() {
 
     // Add a second member.
     let kp = KeyPackage::mock("did:key:bob".into());
-    manager.join_context(&handle, kp).await.unwrap();
+    manager.join_context(&handle, kp, None).await.unwrap();
     assert_eq!(manager.member_count("test-ctx").await, Some(2));
 
     // Remove bob (self-removal).
@@ -330,7 +330,7 @@ async fn setup_context_with_member_remove() -> (ContextManager, ContextHandle) {
 
     // Add an observer member.
     let kp = KeyPackage::mock("did:key:observer".into());
-    manager.join_context(&handle, kp).await.unwrap();
+    manager.join_context(&handle, kp, None).await.unwrap();
 
     // Reassign to observer role (joined members default to "member").
     {
@@ -464,7 +464,7 @@ async fn concurrent_joins_and_sends_do_not_corrupt_state() {
         let h = std::sync::Arc::clone(&handle);
         join_handles.push(tokio::spawn(async move {
             let kp = KeyPackage::mock(format!("did:key:member-{i}").into());
-            mgr.join_context(&h, kp).await
+            mgr.join_context(&h, kp, None).await
         }));
     }
 
@@ -475,8 +475,15 @@ async fn concurrent_joins_and_sends_do_not_corrupt_state() {
         let h = std::sync::Arc::clone(&handle);
         let sk_clone = sk.clone();
         join_handles.push(tokio::spawn(async move {
-            mgr.send_message(&h, &"did:key:creator".into(), &[i], Some(&sk_clone), None)
-                .await
+            mgr.send_message(
+                &h,
+                &"did:key:creator".into(),
+                &[i],
+                Some(&sk_clone),
+                None,
+                None,
+            )
+            .await
         }));
     }
 
@@ -544,7 +551,7 @@ async fn panic_does_not_poison_mutex() {
 
     // Further operations should succeed.
     let kp = KeyPackage::mock("did:key:after-panic".into());
-    let join_result = manager.join_context(&handle_clone, kp).await;
+    let join_result = manager.join_context(&handle_clone, kp, None).await;
     assert!(join_result.is_ok(), "join after panic should succeed");
     assert_eq!(manager.member_count("panic-ctx").await, Some(2));
 }
@@ -2142,7 +2149,7 @@ async fn auto_accept_blocked_by_economics_rejects_join() {
         owner_did: DID::from("did:key:joiner"),
         mls_key_package_bytes: None,
     };
-    let result = manager.join_context(&handle, kp).await;
+    let result = manager.join_context(&handle, kp, None).await;
     assert!(
         result.is_err(),
         "join should be blocked for paid context without explicit acceptance"
@@ -2225,7 +2232,7 @@ async fn budget_exceeded_on_join_rejects() {
         owner_did: DID::from("did:key:joiner"),
         mls_key_package_bytes: None,
     };
-    let result = manager.join_context(&handle, kp).await;
+    let result = manager.join_context(&handle, kp, None).await;
     assert!(
         result.is_err(),
         "join should fail: paid context auto_accept blocked"

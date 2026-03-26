@@ -639,6 +639,99 @@ impl ContextCryptoProvider for MlsCryptoProvider {
         Ok(())
     }
 
+    fn rotate_sender_key(&self, context_id: &[u8; 32]) -> Result<(), ContextError> {
+        let ctx_id_hex = hex::encode(context_id);
+        let mut contexts = self
+            .contexts
+            .lock()
+            .map_err(|e| ContextError::CryptoFailed(format!("lock poisoned: {e}")))?;
+        let state = contexts.get_mut(context_id).ok_or_else(|| {
+            ContextError::CryptoFailed("no MLS group for this context".to_string())
+        })?;
+
+        // 1. Generate fresh AES-256 sender key.
+        let new_key = generate_sender_key();
+        state.sender_key = new_key.clone();
+
+        // 2. Increment sender_key_epoch (monotonic, §9.16.5).
+        state.sender_key_epoch = state
+            .sender_key_epoch
+            .checked_add(1)
+            .ok_or_else(|| ContextError::CryptoFailed("sender key epoch overflow".to_string()))?;
+
+        // 3. Update local sender key store entry.
+        state
+            .sender_key_store
+            .set(&ctx_id_hex, &self.local_did, new_key);
+
+        // 4. HPKE-seal new key to each remaining member's wrapping pubkey
+        //    and queue distributions (§9.16.2).
+        let member_keys: Vec<(String, [u8; 32])> = state
+            .member_wrapping_keys
+            .iter()
+            .map(|(did, key)| (did.clone(), *key))
+            .collect();
+
+        for (member_did, wrapping_pub) in &member_keys {
+            let seal_result = crate::crypto::sender_keys::key_protocol::hpke_seal_sender_key(
+                state.sender_key.as_bytes(),
+                wrapping_pub,
+                &ctx_id_hex,
+                &self.local_did,
+                state.sender_key_epoch,
+            );
+
+            match seal_result {
+                Ok((sealed_vec, ephemeral_pub)) => {
+                    let sealed: [u8; 60] = match sealed_vec.try_into() {
+                        Ok(s) => s,
+                        Err(v) => {
+                            tracing::warn!(
+                                member_did = %member_did,
+                                "HPKE seal produced {} bytes, expected 60 — skipping",
+                                v.len()
+                            );
+                            continue;
+                        }
+                    };
+
+                    let response = SenderKeyResponse {
+                        sender_did: self.local_did.clone(),
+                        epoch: state.sender_key_epoch,
+                        hpke_sealed_key: sealed,
+                        ephemeral_pubkey: ephemeral_pub,
+                        request_nonce: [0u8; 16],
+                    };
+
+                    let msg = SenderKeyDistributionMessage::KeyResponse(response);
+                    match msg.to_bytes() {
+                        Ok(serialized) => {
+                            state
+                                .pending_distributions
+                                .push((member_did.clone(), serialized));
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                member_did = %member_did,
+                                error = %e,
+                                "failed to serialize sender key distribution — skipping"
+                            );
+                        }
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        member_did = %member_did,
+                        error = %e,
+                        "HPKE seal failed for sender key rotation — skipping"
+                    );
+                }
+            }
+        }
+
+        Ok(())
+    }
+
     fn drain_pending_sender_key_messages(
         &self,
         context_id: &[u8; 32],

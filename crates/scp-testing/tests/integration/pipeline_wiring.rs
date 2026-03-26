@@ -41,7 +41,7 @@ const PROVIDER_SRC: &str =
 // RATCHET CONSTANTS — may only increase
 // Any decrease requires human approval
 // =========================================================================
-const MIN_ACTIVE_PIPELINE_ASSERTIONS: usize = 20;
+const MIN_ACTIVE_PIPELINE_ASSERTIONS: usize = 22;
 
 // ---------------------------------------------------------------------------
 // Function body extraction — brace-matching parser
@@ -320,6 +320,22 @@ fn execute_remove_member_calls_remove_member_sender_key() {
             "remove_member_sender_key"
         ),
         "execute_remove_member must call remove_member_sender_key"
+    );
+}
+
+#[test]
+fn execute_remove_member_calls_rotate_sender_key() {
+    assert!(
+        fn_body_contains(MANAGER_SRC, "execute_remove_member", "rotate_sender_key"),
+        "execute_remove_member must call rotate_sender_key (§9.16.4)"
+    );
+}
+
+#[test]
+fn leave_context_calls_rotate_sender_key() {
+    assert!(
+        fn_body_contains(MANAGER_SRC, "leave_context", "rotate_sender_key"),
+        "leave_context must call rotate_sender_key (§9.16.4)"
     );
 }
 

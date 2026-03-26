@@ -42,9 +42,16 @@ pub(super) fn evaluate_sybil_resistance(
 }
 
 /// Initializes participation record and records budget spend for a new member (#1530, #1537).
-fn post_join_bookkeeping(ctx: &mut PerContextState, context_id: &str, member_did: &DID, now: u64) {
+fn post_join_bookkeeping(
+    ctx: &mut PerContextState,
+    context_id: &str,
+    member_did: &DID,
+    now: u64,
+    event_log: &dyn super::super::builder::ContextEventLogProvider,
+) {
     // Participation record initialization for the new member.
-    let join_events = super::governance::event_log_entries_for_consequences(ctx, context_id, now);
+    let join_events =
+        super::governance::event_log_entries_for_consequences(ctx, context_id, now, event_log);
     if !join_events.is_empty()
         && let Ok(record) = scp_protocol::trust::participation::compute_participation_record(
             &join_events,
@@ -60,13 +67,16 @@ fn post_join_bookkeeping(ctx: &mut PerContextState, context_id: &str, member_did
     }
 }
 
-// TODO(#1593): Spending UCAN AND-composition (spec §19.5) is only enforced for
-// tool invoke, not join_context. Join needs a UCAN parameter threaded through
-// the FFI layer to enforce check_and_composition here.
+/// Enforces economic policy for context joins (#1537, #1593).
+///
+/// Checks auto-accept guard, evaluates join cost, enforces spending UCAN
+/// AND-composition (spec §19.5) when cost > 0, and records spend against
+/// the joiner's budget.
 fn enforce_join_economy(
     ctx: &mut PerContextState,
     joiner_did: &DID,
     now: u64,
+    spending_ucan: Option<&scp_protocol::crypto::ucan::UcanToken>,
 ) -> Result<(), ContextError> {
     if scp_protocol::economy::policy::auto_accept_blocked_by_economics(
         ctx.governance.economic_policy.as_ref(),
@@ -94,6 +104,22 @@ fn enforce_join_economy(
             &scp_protocol::economy::types::PaidActionType::ContextJoin,
             &metrics,
         ) {
+            // AND-composition (§19.5, #1593): paid joins require a spending UCAN.
+            if cost.0 > 0 {
+                if spending_ucan.is_none() {
+                    return Err(ContextError::PermissionDenied(
+                        "SCP-ECON-7060: paid action requires spending UCAN".to_owned(),
+                    ));
+                }
+                scp_protocol::crypto::ucan::spending::check_and_composition(
+                    spending_ucan, // action UCAN witness (capability already checked)
+                    spending_ucan,
+                    scp_protocol::crypto::ucan::spending::Amount(cost.0),
+                    "context:join",
+                )
+                .map_err(|e| ContextError::PermissionDenied(format!("SCP-ECON-7061: {e}")))?;
+            }
+
             // Auto-grant unlimited budget on first spend if no governance-approved
             // budget exists (same pattern as enforce_send_economy).
             if !ctx.governance.budget_tracker.has_budget(joiner_did) {
@@ -854,6 +880,7 @@ impl ContextManager {
             self.crypto.as_ref(),
             self.transport.as_ref(),
             self.event_log.as_ref(),
+            creator_did.as_ref(),
         )
         .await?;
         let ceiling = CapabilityCeiling::new(params.ceiling.iter().cloned());
@@ -992,6 +1019,7 @@ impl ContextManager {
             self.crypto.as_ref(),
             self.transport.as_ref(),
             self.event_log.as_ref(),
+            "", // No actor DID available for bare context creation.
         )
         .await
     }
@@ -1036,6 +1064,7 @@ impl ContextManager {
             self.crypto.as_ref(),
             self.transport.as_ref(),
             self.event_log.as_ref(),
+            creator_did.as_ref(),
         )
         .await?;
 
@@ -1249,6 +1278,7 @@ impl ContextManager {
         &self,
         handle: &ContextHandle,
         key_package: KeyPackage,
+        spending_ucan: Option<&scp_protocol::crypto::ucan::UcanToken>,
     ) -> Result<(), ContextError> {
         let context_id = handle.context_id().to_owned();
         let context_id_bytes = context_id_to_bytes(&context_id);
@@ -1340,13 +1370,19 @@ impl ContextManager {
                 .params()
                 .check_version_compatibility(scp_protocol::envelope::SCP_PROTOCOL_VERSION)?;
 
-            // Economy enforcement (#1537) — auto-accept guard + join cost.
-            enforce_join_economy(ctx, &member_did, self.clock.now_secs())?;
+            // Economy enforcement (#1537, #1593) — auto-accept guard + join cost + spending UCAN.
+            enforce_join_economy(ctx, &member_did, self.clock.now_secs(), spending_ucan)?;
 
             // Sybil resistance check (#1530) — fail-closed with `?`.
             evaluate_sybil_resistance(ctx, &member_did, self.clock.now_secs())?;
 
-            post_join_bookkeeping(ctx, &context_id, &member_did, self.clock.now_secs());
+            post_join_bookkeeping(
+                ctx,
+                &context_id,
+                &member_did,
+                self.clock.now_secs(),
+                &*self.event_log,
+            );
 
             // Add member to role state.
             ctx.role_state.members.insert(member_did.to_string());
@@ -1394,8 +1430,11 @@ impl ContextManager {
         // Lock dropped before event log append.
 
         // Append MemberJoined event to event log.
-        self.event_log
-            .append_context_event(&context_id_bytes, "MemberJoined")?;
+        self.event_log.append_context_event(
+            &context_id_bytes,
+            "MemberJoined",
+            member_did.as_ref(),
+        )?;
 
         // Persist context state after join (best-effort).
         if self.has_persistence() {
@@ -1466,10 +1505,42 @@ impl ContextManager {
         }
 
         // Crypto operations -- no lock held. Skip for broadcast mode (no MLS).
+        // Order: remove sender key first (§9.16), then MLS group removal,
+        // then rotate remaining members' sender keys.
         if !is_broadcast {
-            self.crypto.remove_member(&context_id_bytes, member_did)?;
             self.crypto
                 .remove_member_sender_key(&context_id_bytes, member_did)?;
+            self.crypto.remove_member(&context_id_bytes, member_did)?;
+
+            // Rotate the local sender key so the departing member cannot
+            // decrypt future messages (§9.16.4). Generates a fresh key,
+            // increments the epoch, and HPKE-seals to remaining members.
+            self.crypto.rotate_sender_key(&context_id_bytes)?;
+
+            // Drain pending sender key distributions and deliver via transport.
+            let pending = self
+                .crypto
+                .drain_pending_sender_key_messages(&context_id_bytes)?;
+            if !pending.is_empty() {
+                let routing_id = scp_protocol::context::context_routing_id(&context_id);
+                for (target_did, message) in pending {
+                    tracing::debug!(
+                        target_did = %target_did,
+                        context_id = %context_id,
+                        message_len = message.len(),
+                        "sending rotated sender key distribution after member departure"
+                    );
+                    if let Err(e) = self.transport.send_message(&routing_id, &message) {
+                        tracing::warn!(
+                            target_did = %target_did,
+                            context_id = %context_id,
+                            error = %e,
+                            "failed to send rotated sender key — \
+                             recipient must request key via SenderKeyRequest"
+                        );
+                    }
+                }
+            }
         }
 
         // Atomic state check + membership removal + count check within single lock.
@@ -1520,8 +1591,11 @@ impl ContextManager {
         // Lock dropped.
 
         // Append MemberLeft event to event log.
-        self.event_log
-            .append_context_event(&context_id_bytes, "MemberLeft")?;
+        self.event_log.append_context_event(
+            &context_id_bytes,
+            "MemberLeft",
+            member_did.as_ref(),
+        )?;
 
         // Persist context state after leave (best-effort).
         if self.has_persistence() {

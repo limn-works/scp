@@ -94,10 +94,20 @@ pub trait ContextEventLogProvider: Send + Sync {
 
     /// Appends a named event to the context's event log.
     ///
+    /// `actor_did` is the DID of the actor who produced this event (the sender
+    /// for messages, the proposer for governance, the joiner for membership
+    /// events). Pass an empty string when the actor is unknown or not
+    /// applicable (e.g., system-initiated events).
+    ///
     /// # Errors
     ///
     /// Returns [`ContextCreationError`] if the append fails.
-    fn append_event(&self, context_id: &[u8; 32], event: &str) -> Result<(), ContextCreationError>;
+    fn append_event(
+        &self,
+        context_id: &[u8; 32],
+        event: &str,
+        actor_did: &str,
+    ) -> Result<(), ContextCreationError>;
 
     /// Destroys the event log for the given context (rollback).
     ///
@@ -114,11 +124,18 @@ pub trait ContextEventLogProvider: Send + Sync {
     /// This variant returns [`ContextError`] for use in membership and
     /// messaging operations (as opposed to creation-time operations).
     ///
+    /// `actor_did` is the DID of the actor who produced this event.
+    ///
     /// # Errors
     ///
     /// Returns [`ContextError::EventLogFailed`] if the append fails.
-    fn append_context_event(&self, context_id: &[u8; 32], event: &str) -> Result<(), ContextError> {
-        self.append_event(context_id, event)
+    fn append_context_event(
+        &self,
+        context_id: &[u8; 32],
+        event: &str,
+        actor_did: &str,
+    ) -> Result<(), ContextError> {
+        self.append_event(context_id, event, actor_did)
             .map_err(|e| ContextError::EventLogFailed(e.to_string()))
     }
 
@@ -555,6 +572,7 @@ pub async fn create_context(
     crypto: &dyn ContextCryptoProvider,
     transport: &dyn ContextTransportProvider,
     event_log_provider: &dyn ContextEventLogProvider,
+    creator_did: &str,
 ) -> Result<ContextHandle, ContextCreationError> {
     // ------------------------------------------------------------------
     // Phase 1 -- Validate (no side effects)
@@ -647,7 +665,7 @@ pub async fn create_context(
     }
 
     // Step 7: Append ContextCreated event.
-    if let Err(e) = event_log_provider.append_event(&id_bytes, "ContextCreated") {
+    if let Err(e) = event_log_provider.append_event(&id_bytes, "ContextCreated", creator_did) {
         // Even though the handle is Active, we must roll back everything.
         receipt.rollback(&id_bytes, crypto, transport, event_log_provider);
         return Err(e);
@@ -861,6 +879,7 @@ mod tests {
             &self,
             context_id: &[u8; 32],
             event: &str,
+            _actor_did: &str,
         ) -> Result<(), ContextCreationError> {
             if self.fail_append.load(Ordering::Relaxed) {
                 return Err(ContextCreationError::EventLogFailed(
@@ -892,7 +911,15 @@ mod tests {
 
         let params = ContextParams::default(); // Encrypted mode by default
 
-        let result = create_context("ctx-1".into(), params, &crypto, &transport, &event_log).await;
+        let result = create_context(
+            "ctx-1".into(),
+            params,
+            &crypto,
+            &transport,
+            &event_log,
+            "did:key:test",
+        )
+        .await;
 
         assert!(result.is_ok());
         let handle = result.unwrap();
@@ -931,7 +958,15 @@ mod tests {
             ..ContextParams::default()
         };
 
-        let result = create_context("ctx-bc".into(), params, &crypto, &transport, &event_log).await;
+        let result = create_context(
+            "ctx-bc".into(),
+            params,
+            &crypto,
+            &transport,
+            &event_log,
+            "did:key:test",
+        )
+        .await;
 
         assert!(result.is_ok());
         let handle = result.unwrap();
@@ -971,6 +1006,7 @@ mod tests {
             &crypto,
             &transport,
             &event_log,
+            "did:key:test",
         )
         .await;
 
@@ -993,6 +1029,7 @@ mod tests {
             &crypto,
             &transport,
             &event_log,
+            "did:key:test",
         )
         .await;
 
@@ -1026,6 +1063,7 @@ mod tests {
             &crypto,
             &transport,
             &event_log,
+            "did:key:test",
         )
         .await;
 
@@ -1054,6 +1092,7 @@ mod tests {
             &crypto,
             &transport,
             &event_log,
+            "did:key:test",
         )
         .await;
 
@@ -1090,6 +1129,7 @@ mod tests {
             &crypto,
             &transport,
             &event_log,
+            "did:key:test",
         )
         .await;
 
@@ -1114,6 +1154,7 @@ mod tests {
             &crypto,
             &transport,
             &event_log,
+            "did:key:test",
         )
         .await;
 
@@ -1147,6 +1188,7 @@ mod tests {
             &crypto,
             &transport,
             &event_log,
+            "did:key:test",
         )
         .await;
 
@@ -1181,6 +1223,7 @@ mod tests {
             &crypto,
             &transport,
             &event_log,
+            "did:key:test",
         )
         .await;
 
@@ -1294,6 +1337,7 @@ mod tests {
             &crypto,
             &transport,
             &event_log,
+            "did:key:test",
         )
         .await
         .unwrap();
@@ -1318,6 +1362,7 @@ mod tests {
             &crypto,
             &transport,
             &event_log,
+            "did:key:test",
         )
         .await;
 
@@ -1342,6 +1387,7 @@ mod tests {
             &crypto,
             &transport,
             &event_log,
+            "did:key:test",
         )
         .await;
 
@@ -1364,6 +1410,7 @@ mod tests {
             &crypto,
             &transport,
             &event_log,
+            "did:key:test",
         )
         .await;
 
@@ -1401,6 +1448,7 @@ mod tests {
             &crypto,
             &transport,
             &event_log,
+            "did:key:test",
         )
         .await;
 
@@ -1436,6 +1484,7 @@ mod tests {
             &crypto,
             &transport,
             &event_log,
+            "did:key:test",
         )
         .await;
 
@@ -1470,6 +1519,7 @@ mod tests {
             &crypto,
             &transport,
             &event_log,
+            "did:key:test",
         )
         .await;
 
@@ -1505,6 +1555,7 @@ mod tests {
             &crypto,
             &transport,
             &event_log,
+            "did:key:test",
         )
         .await;
 
@@ -1535,6 +1586,7 @@ mod tests {
             &crypto,
             &transport,
             &event_log,
+            "did:key:test",
         )
         .await;
 
@@ -1557,8 +1609,15 @@ mod tests {
             ..ContextParams::default()
         };
 
-        let result =
-            create_context("ctx-bc-eph".into(), params, &crypto, &transport, &event_log).await;
+        let result = create_context(
+            "ctx-bc-eph".into(),
+            params,
+            &crypto,
+            &transport,
+            &event_log,
+            "did:key:test",
+        )
+        .await;
 
         assert!(result.is_err());
         assert!(matches!(
@@ -1579,8 +1638,15 @@ mod tests {
             ..ContextParams::default()
         };
 
-        let result =
-            create_context("ctx-bc-sum".into(), params, &crypto, &transport, &event_log).await;
+        let result = create_context(
+            "ctx-bc-sum".into(),
+            params,
+            &crypto,
+            &transport,
+            &event_log,
+            "did:key:test",
+        )
+        .await;
 
         assert!(result.is_err());
         assert!(matches!(
@@ -1607,6 +1673,7 @@ mod tests {
             &crypto,
             &transport,
             &event_log,
+            "did:key:test",
         )
         .await;
 
@@ -1631,6 +1698,7 @@ mod tests {
             &crypto,
             &transport,
             &event_log,
+            "did:key:test",
         )
         .await;
 

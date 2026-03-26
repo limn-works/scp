@@ -13,7 +13,14 @@ async fn send_message_rejects_when_context_not_active() {
     handle.transition_to(&ContextState::Closing).await.unwrap();
 
     let result = manager
-        .send_message(&handle, &"did:key:creator".into(), b"hello", None, None)
+        .send_message(
+            &handle,
+            &"did:key:creator".into(),
+            b"hello",
+            None,
+            None,
+            None,
+        )
         .await;
     assert!(result.is_err());
     assert!(matches!(
@@ -29,7 +36,14 @@ async fn send_message_validates_ucan_before_sending() {
 
     // Try to send as a non-member -- should be denied.
     let result = manager
-        .send_message(&handle, &"did:key:nonexistent".into(), b"hello", None, None)
+        .send_message(
+            &handle,
+            &"did:key:nonexistent".into(),
+            b"hello",
+            None,
+            None,
+            None,
+        )
         .await;
     assert!(result.is_err());
 
@@ -52,6 +66,7 @@ async fn send_message_success_encrypts_and_sends() {
             &"did:key:creator".into(),
             b"hello world",
             Some(&sk),
+            None,
             None,
         )
         .await;
@@ -84,7 +99,14 @@ async fn send_message_assigns_monotonic_sequence_numbers() {
 
     for i in 1..=5u8 {
         manager
-            .send_message(&handle, &"did:key:creator".into(), &[i], Some(&sk), None)
+            .send_message(
+                &handle,
+                &"did:key:creator".into(),
+                &[i],
+                Some(&sk),
+                None,
+                None,
+            )
             .await
             .unwrap();
     }
@@ -143,6 +165,7 @@ async fn send_message_transport_failure_no_phantom_event() {
             b"hello",
             Some(&sk),
             None,
+            None,
         )
         .await;
     assert!(
@@ -188,6 +211,7 @@ async fn send_message_transport_success_emits_event() {
             &"did:key:creator".into(),
             b"positive-path",
             Some(&sk),
+            None,
             None,
         )
         .await;
@@ -407,6 +431,7 @@ async fn send_then_deliver_roundtrip() {
             b"hello from alice",
             Some(&alice_sk),
             None,
+            None,
         )
         .await
         .unwrap();
@@ -455,7 +480,7 @@ async fn deliver_incoming_rejects_replayed_message() {
 
     // Alice sends.
     manager
-        .send_message(&handle, &alice_did, b"first", Some(&alice_sk), None)
+        .send_message(&handle, &alice_did, b"first", Some(&alice_sk), None, None)
         .await
         .unwrap();
 
@@ -486,7 +511,14 @@ async fn deliver_incoming_rejects_tampered_signature() {
     let alice_sk = signing_key_for_did(&alice_did);
 
     manager
-        .send_message(&handle, &alice_did, b"original", Some(&alice_sk), None)
+        .send_message(
+            &handle,
+            &alice_did,
+            b"original",
+            Some(&alice_sk),
+            None,
+            None,
+        )
         .await
         .unwrap();
 
@@ -526,7 +558,14 @@ async fn deliver_incoming_rejects_wrong_signing_key() {
     // Alice sends a message but signs with Bob's key. send_message will
     // succeed (it doesn't verify the key matches the DID on the send side).
     manager
-        .send_message(&handle, &alice_did, b"wrong-key-msg", Some(&wrong_sk), None)
+        .send_message(
+            &handle,
+            &alice_did,
+            b"wrong-key-msg",
+            Some(&wrong_sk),
+            None,
+            None,
+        )
         .await
         .unwrap();
 
@@ -595,6 +634,7 @@ async fn revoked_member_cannot_decrypt_new_messages() {
             &alice_did,
             b"secret for alice only",
             Some(&alice_sk),
+            None,
             None,
         )
         .await
@@ -769,7 +809,7 @@ async fn deliver_incoming_buffers_out_of_order_message() {
     // Send two messages in order (seq 1, 2).
     for msg in &[b"msg-1".as_slice(), b"msg-2".as_slice()] {
         manager
-            .send_message(&handle, &alice_did, msg, Some(&alice_sk), None)
+            .send_message(&handle, &alice_did, msg, Some(&alice_sk), None, None)
             .await
             .unwrap();
     }
@@ -819,7 +859,7 @@ async fn deliver_incoming_gap_fill_delivers_buffered() {
         b"msg-3".as_slice(),
     ] {
         manager
-            .send_message(&handle, &alice_did, msg, Some(&alice_sk), None)
+            .send_message(&handle, &alice_did, msg, Some(&alice_sk), None, None)
             .await
             .unwrap();
     }
@@ -902,7 +942,7 @@ async fn deliver_incoming_rejects_replay_with_reorder_buffer() {
     let alice_sk = signing_key_for_did(&alice_did);
 
     manager
-        .send_message(&handle, &alice_did, b"msg-1", Some(&alice_sk), None)
+        .send_message(&handle, &alice_did, b"msg-1", Some(&alice_sk), None, None)
         .await
         .unwrap();
 
@@ -1231,7 +1271,14 @@ async fn send_message_produces_non_empty_encrypted_blob() {
     let alice_sk = signing_key_for_did(&alice_did);
 
     manager
-        .send_message(&handle, &alice_did, b"envelope-test", Some(&alice_sk), None)
+        .send_message(
+            &handle,
+            &alice_did,
+            b"envelope-test",
+            Some(&alice_sk),
+            None,
+            None,
+        )
         .await
         .unwrap();
 
@@ -1283,6 +1330,7 @@ async fn send_message_produces_valid_outer_envelope() {
             &"did:key:creator".into(),
             b"outer-envelope-test",
             Some(&sk),
+            None,
             None,
         )
         .await
@@ -1538,7 +1586,14 @@ async fn velocity_consequence_trigger_on_send() {
         .handle
         .clone();
     let _ = manager
-        .send_message(&handle, &"did:key:admin".into(), b"test", Some(&sk), None)
+        .send_message(
+            &handle,
+            &"did:key:admin".into(),
+            b"test",
+            Some(&sk),
+            None,
+            None,
+        )
         .await;
 
     let events = manager.drain_events("vel-msg-ctx").await;

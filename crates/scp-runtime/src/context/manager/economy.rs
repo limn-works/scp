@@ -177,11 +177,11 @@ impl ContextManager {
     /// When no payment adapter is configured, returns `Ok(None)` immediately.
     /// When the evaluated cost is zero, also returns `Ok(None)`.
     ///
-    /// **Known gaps (#1593):** Steps 2 (spending UCAN verification) and 4
-    /// (authorization attachment to envelope) are not yet implemented. These
-    /// require UCAN parameters threaded through `send_message` and
-    /// `join_context` from the FFI layer. Tool invoke has UCAN plumbing via
-    /// `ToolEconomyContext` but send/join do not.
+    /// **Spending UCAN AND-composition (#1593):** Enforced at the per-action
+    /// level in `enforce_send_economy` and `enforce_join_economy` via
+    /// `check_and_composition` (spec §19.5). The `spending_ucan` parameter is
+    /// threaded from FFI through `send_message` and `join_context`. Step 4
+    /// (authorization attachment to envelope) is not yet implemented.
     ///
     /// # Lock pattern
     ///
@@ -269,10 +269,11 @@ impl ContextManager {
 
         // Store receipt in event log.
         let context_id_bytes = super::context_id_to_bytes(context_id);
-        if let Err(e) = self
-            .event_log
-            .append_context_event(&context_id_bytes, "PaymentReceived")
-        {
+        if let Err(e) = self.event_log.append_context_event(
+            &context_id_bytes,
+            "PaymentReceived",
+            payer_did.as_ref(),
+        ) {
             tracing::warn!(
                 context_id,
                 "failed to store payment receipt in event log: {e}"

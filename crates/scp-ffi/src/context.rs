@@ -1041,7 +1041,7 @@ fn py_context_join(handle: &PyContextHandle, identity_did: &str) -> PyResult<()>
             let _ = temp_handle
                 .transition_to(&scp_core::context::ContextState::Active)
                 .await;
-            mgr.join_context(&temp_handle, key_package).await
+            mgr.join_context(&temp_handle, key_package, None).await
         })
         .map_err(|e| PyRuntimeError::new_err(format!("ContextManager join_context failed: {e}")))?;
 
@@ -1283,6 +1283,7 @@ fn py_context_send(
                 &sender_did,
                 &payload_bytes,
                 Some(&signing_key),
+                None,
                 None,
             )
             .await

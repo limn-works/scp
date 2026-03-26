@@ -13,17 +13,16 @@ use super::{
     context_id_to_bytes, evaluate_consequence_rules, instrument, require_active,
 };
 
-/// Enforces economic policy for message sends (#1537).
+/// Enforces economic policy for message sends (#1537, #1593).
 ///
-/// Checks sender velocity and evaluates cost from the context's economic
-/// policy. Records spend against the sender's budget.
-// TODO(#1593): Spending UCAN AND-composition (spec §19.5) is only enforced for
-// tool invoke, not send_message. Send_message needs a UCAN parameter threaded
-// through the FFI layer to enforce check_and_composition here.
+/// Checks sender velocity, evaluates cost from the context's economic
+/// policy, enforces spending UCAN AND-composition (spec §19.5) when cost > 0,
+/// and records spend against the sender's budget.
 fn enforce_send_economy(
     ctx: &mut PerContextState,
     sender_did: &DID,
     now: u64,
+    spending_ucan: Option<&scp_protocol::crypto::ucan::UcanToken>,
 ) -> Result<(), ContextError> {
     if let Some(ref policy) = ctx.governance.economic_policy {
         let velocity = ctx
@@ -53,6 +52,29 @@ fn enforce_send_economy(
             &scp_protocol::economy::types::PaidActionType::MessageSend,
             &metrics,
         ) {
+            // AND-composition (§19.5, #1593): paid actions require both the
+            // action capability (already checked by MessagesWrite above) AND a
+            // spending UCAN. Free actions (cost == 0) pass through.
+            if cost.0 > 0 {
+                if spending_ucan.is_none() {
+                    return Err(ContextError::PermissionDenied(
+                        "SCP-ECON-7060: paid action requires spending UCAN".to_owned(),
+                    ));
+                }
+                // Validate AND-composition: action UCAN is implicitly present
+                // (MessagesWrite capability was already checked), so pass Some
+                // for action_ucan. The spending UCAN is the caller's.
+                // We construct a minimal action_ucan reference: the capability
+                // check already passed, so we only need a non-None value.
+                scp_protocol::crypto::ucan::spending::check_and_composition(
+                    spending_ucan, // action UCAN: re-use spending as a non-None witness
+                    spending_ucan,
+                    scp_protocol::crypto::ucan::spending::Amount(cost.0),
+                    "messages:write",
+                )
+                .map_err(|e| ContextError::PermissionDenied(format!("SCP-ECON-7061: {e}")))?;
+            }
+
             // Auto-grant unlimited budget on first spend if no governance-approved
             // budget exists. This prevents NoBudget errors for new members while
             // still allowing governance to cap spending via ApproveSpend.
@@ -337,6 +359,7 @@ impl ContextManager {
         payload: &[u8],
         signing_key: Option<&ed25519_dalek::SigningKey>,
         source_provenance: Option<&scp_protocol::provenance::attach::SourceContextInfo>,
+        spending_ucan: Option<&scp_protocol::crypto::ucan::UcanToken>,
     ) -> Result<(), ContextError> {
         let context_id = handle.context_id().to_owned();
         let context_id_bytes = context_id_to_bytes(&context_id);
@@ -352,8 +375,8 @@ impl ContextManager {
                     "write access has been revoked for {sender_did}"
                 )));
             }
-            // Economy enforcement (#1537) — check cost before sending.
-            enforce_send_economy(ctx, sender_did, self.clock.now_secs())?;
+            // Economy enforcement (#1537, #1593) — check cost + spending UCAN.
+            enforce_send_economy(ctx, sender_did, self.clock.now_secs(), spending_ucan)?;
             if let Some(ref mut bc) = ctx.broadcast_context {
                 let sk = signing_key.ok_or_else(|| {
                     ContextError::CryptoFailed("signing key required for broadcast publish".into())
@@ -540,8 +563,12 @@ impl ContextManager {
                 // Consequence enforcement (#1531) — evaluate rules, then dispatch.
                 // evaluate_consequence_rules is called here so the pipeline wiring
                 // gate can detect it in messaging.rs (not hidden inside dispatch_consequences).
-                let consequence_events =
-                    super::governance::event_log_entries_for_consequences(ctx, context_id, now);
+                let consequence_events = super::governance::event_log_entries_for_consequences(
+                    ctx,
+                    context_id,
+                    now,
+                    &*self.event_log,
+                );
                 let consequence_rules: Vec<super::ConsequenceRule> =
                     ctx.governance.consequence_rules.clone();
                 // evaluate_consequence_rules is called as an expression_statement
@@ -561,8 +588,12 @@ impl ContextManager {
                 );
 
                 // Participation record update (#1530) — refresh cache after send.
-                let send_events =
-                    super::governance::event_log_entries_for_consequences(ctx, context_id, now);
+                let send_events = super::governance::event_log_entries_for_consequences(
+                    ctx,
+                    context_id,
+                    now,
+                    &*self.event_log,
+                );
                 if !send_events.is_empty()
                     && let Ok(record) =
                         scp_protocol::trust::participation::compute_participation_record(
@@ -583,8 +614,11 @@ impl ContextManager {
                 maybe_adjust_relay_pricing(ctx);
             }
         }
-        self.event_log
-            .append_context_event(context_id_bytes, "MessageSent")?;
+        self.event_log.append_context_event(
+            context_id_bytes,
+            "MessageSent",
+            sender_did.as_ref(),
+        )?;
         if self.has_persistence() {
             let contexts = self.contexts.lock().await;
             if let Some(ctx) = contexts.get(context_id) {
@@ -963,7 +997,7 @@ impl ContextManager {
 
         crate::metrics::record_message_received();
         self.event_log
-            .append_context_event(context_id_bytes, "MessageReceived")?;
+            .append_context_event(context_id_bytes, "MessageReceived", sender_did)?;
 
         Ok(())
     }

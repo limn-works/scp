@@ -15,7 +15,7 @@ async fn member_list_queries() {
     // Add members.
     for name in &["alice", "bob", "charlie"] {
         let kp = KeyPackage::mock(format!("did:key:{name}").into());
-        manager.join_context(&handle, kp).await.unwrap();
+        manager.join_context(&handle, kp, None).await.unwrap();
     }
 
     assert_eq!(manager.member_count("test-ctx").await, Some(4));
@@ -47,7 +47,7 @@ async fn member_role_assignment() {
 
     // Add a member.
     let kp = KeyPackage::mock("did:key:alice".into());
-    manager.join_context(&handle, kp).await.unwrap();
+    manager.join_context(&handle, kp, None).await.unwrap();
 
     let role = manager.member_role("test-ctx", "did:key:alice").await;
     assert!(role.is_some());
@@ -275,7 +275,7 @@ async fn registered_tools_bounded_at_256() {
     for i in 0..super::MAX_REGISTERED_TOOLS {
         let reg = test_tool_registration(&format!("tool-{i}"));
         manager
-            .execute_register_tool("test-ctx", &reg, pid)
+            .execute_register_tool("test-ctx", &reg, pid, "")
             .await
             .unwrap();
     }
@@ -283,7 +283,7 @@ async fn registered_tools_bounded_at_256() {
     // The 257th must fail with LimitExceeded.
     let overflow = test_tool_registration("tool-overflow");
     let err = manager
-        .execute_register_tool("test-ctx", &overflow, pid)
+        .execute_register_tool("test-ctx", &overflow, pid, "")
         .await
         .unwrap_err();
     assert!(
@@ -313,7 +313,7 @@ async fn tool_interfaces_bounded_at_256() {
             inbound_policy: None,
         };
         manager
-            .execute_establish_tool_interface("test-ctx", &iface, pid)
+            .execute_establish_tool_interface("test-ctx", &iface, pid, "")
             .await
             .unwrap();
     }
@@ -331,7 +331,7 @@ async fn tool_interfaces_bounded_at_256() {
         inbound_policy: None,
     };
     let err = manager
-        .execute_establish_tool_interface("test-ctx", &overflow, pid)
+        .execute_establish_tool_interface("test-ctx", &overflow, pid, "")
         .await
         .unwrap_err();
     assert!(
@@ -364,7 +364,7 @@ async fn threshold_signers_bounded_at_64() {
     // Add exactly MAX_THRESHOLD_SIGNERS signers.
     for did in &dids {
         manager
-            .execute_add_signer("test-ctx", did, pid)
+            .execute_add_signer("test-ctx", did, pid, "")
             .await
             .unwrap();
     }
@@ -378,7 +378,7 @@ async fn threshold_signers_bounded_at_64() {
             .add_member(overflow_did.clone(), "member".to_owned(), vec![]);
     }
     let err = manager
-        .execute_add_signer("test-ctx", &overflow_did, pid)
+        .execute_add_signer("test-ctx", &overflow_did, pid, "")
         .await
         .unwrap_err();
     assert!(

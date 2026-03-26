@@ -1836,6 +1836,7 @@ mod tests {
     // -----------------------------------------------------------------------
 
     /// Helper to create a minimal `ContextManager` for testing.
+    #[allow(clippy::too_many_lines)]
     fn test_context_manager() -> Arc<ContextManager> {
         use crate::context::builder::{ContextEventLogProvider, ContextTransportProvider};
         use crate::context::providers::event_log::EventLogEntry;
@@ -1920,7 +1921,12 @@ mod tests {
             fn init_event_log(&self, _: &[u8; 32]) -> Result<(), ContextCreationError> {
                 Ok(())
             }
-            fn append_event(&self, _: &[u8; 32], _: &str) -> Result<(), ContextCreationError> {
+            fn append_event(
+                &self,
+                _: &[u8; 32],
+                _: &str,
+                _actor_did: &str,
+            ) -> Result<(), ContextCreationError> {
                 Ok(())
             }
             fn destroy_event_log(&self, _: &[u8; 32]) -> Result<(), ContextCreationError> {
@@ -1981,7 +1987,7 @@ mod tests {
         for member_did in additional_members {
             let kp = KeyPackage::mock((*member_did).clone());
             manager
-                .join_context(&handle, kp)
+                .join_context(&handle, kp, None)
                 .await
                 .expect("failed to join test member");
         }

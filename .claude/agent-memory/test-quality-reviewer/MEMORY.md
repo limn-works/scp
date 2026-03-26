@@ -29,7 +29,23 @@
 - Doc comments on test suites explaining scope and known limitations
 - "Stub-era" marking so update scope is visible when real bridges ship
 
+### Rust ContextManager Test Patterns
+- Tests live in `crates/scp-runtime/src/context/manager/tests/{governance,lifecycle,messaging,mod}.rs`
+- MockCrypto in mod.rs: call_order, fail_* flags, epochs_advanced_shared for observing crypto calls
+- OrderTrackingCrypto wrapper: good pattern for verifying cross-method call ordering
+- `governance_params()` helper creates standard test params; extend via `params.consequence_rules`, `params.economic_policy`
+- `drain_events()` + pattern matching on ContextEvent variants is the standard event assertion pattern
+- Best test pattern: `test_full_lifecycle_economy` -- multi-step with intermediate assertions and boundary failure
+
+### Common Anti-Patterns Found (Rust)
+- Multi-pass agent generation creates systematic test duplication (~50% waste in batch-2 governance)
+- Tests bypassing ContextManager API to call internal functions directly (evaluate_cost, record_spend) -- not wiring tests
+- RoleDemotion tests asserting event emission instead of actual role state change
+- Sybil resistance tests on no-op functions asserting Ok -- tautological
+- See `feedback_test_duplication.md` for details
+
 ## Review Checklist Additions (SCP-specific)
 - Conformance dispatcher must cover ALL operations from `.docs/scaffold/shared.md` categories
 - Every SDK source module needs a corresponding test file (Trust.swift was missing tests)
 - Cross-reference acceptance criteria operations against actual SDK API surface (e.g., "append" vs "query")
+- For wiring tests: verify the test goes through ContextManager public API, not internal state manipulation

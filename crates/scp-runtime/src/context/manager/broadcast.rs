@@ -100,8 +100,11 @@ impl ContextManager {
         }
 
         // Append event to persistent event log.
-        self.event_log
-            .append_context_event(&context_id_bytes, "MemberJoined")?;
+        self.event_log.append_context_event(
+            &context_id_bytes,
+            "MemberJoined",
+            subscriber_did.as_ref(),
+        )?;
 
         Ok(result)
     }
@@ -176,8 +179,11 @@ impl ContextManager {
             }
         }
 
-        self.event_log
-            .append_context_event(&context_id_bytes, "MemberLeft")?;
+        self.event_log.append_context_event(
+            &context_id_bytes,
+            "MemberLeft",
+            subscriber_did.as_ref(),
+        )?;
 
         Ok(result)
     }
@@ -293,8 +299,11 @@ impl ContextManager {
             .send_message(&context_id_bytes, &envelope_bytes)?;
 
         // Append event to persistent event log.
-        self.event_log
-            .append_context_event(&context_id_bytes, "MessageSent")?;
+        self.event_log.append_context_event(
+            &context_id_bytes,
+            "MessageSent",
+            author_did.as_ref(),
+        )?;
 
         Ok(envelope)
     }
@@ -393,8 +402,11 @@ impl ContextManager {
             self.persist_broadcast_snapshot(context_id, snapshot);
         }
 
-        self.event_log
-            .append_context_event(&context_id_bytes, "MemberBlocked")?;
+        self.event_log.append_context_event(
+            &context_id_bytes,
+            "MemberBlocked",
+            author_did.as_ref(),
+        )?;
 
         Ok(result)
     }
@@ -460,8 +472,11 @@ impl ContextManager {
             self.persist_broadcast_snapshot(context_id, snapshot);
         }
 
-        self.event_log
-            .append_context_event(&context_id_bytes, "MemberUnblocked")?;
+        self.event_log.append_context_event(
+            &context_id_bytes,
+            "MemberUnblocked",
+            author_did.as_ref(),
+        )?;
 
         Ok(())
     }

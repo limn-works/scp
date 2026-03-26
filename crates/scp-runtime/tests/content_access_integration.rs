@@ -193,7 +193,12 @@ impl ContextEventLogProvider for MockEventLog {
     fn init_event_log(&self, _id: &[u8; 32]) -> Result<(), ContextCreationError> {
         Ok(())
     }
-    fn append_event(&self, _id: &[u8; 32], _event: &str) -> Result<(), ContextCreationError> {
+    fn append_event(
+        &self,
+        _id: &[u8; 32],
+        _event: &str,
+        _actor_did: &str,
+    ) -> Result<(), ContextCreationError> {
         Ok(())
     }
     fn destroy_event_log(&self, _id: &[u8; 32]) -> Result<(), ContextCreationError> {
@@ -823,6 +828,7 @@ async fn tier3_governance_revoke_write_access_broadcast() {
             b"blocked message",
             Some(&signing_key_for_did(&author_did())),
             None,
+            None,
         )
         .await;
     assert!(
@@ -873,6 +879,7 @@ async fn tier3_governance_revoke_write_access_broadcast() {
             &author_did(),
             b"restored message",
             Some(&signing_key_for_did(&author_did())),
+            None,
             None,
         )
         .await;
@@ -1526,6 +1533,7 @@ async fn governance_tier_stacking_via_context_manager() {
             b"should fail",
             Some(&signing_key_for_did(&dave())),
             None,
+            None,
         )
         .await;
     assert!(send.is_err(), "Dave should not be able to write (Tier 3)");
@@ -1553,6 +1561,7 @@ async fn governance_tier_stacking_via_context_manager() {
             b"still blocked",
             Some(&signing_key_for_did(&dave())),
             None,
+            None,
         )
         .await;
     assert!(
@@ -1574,6 +1583,7 @@ async fn governance_tier_stacking_via_context_manager() {
             &dave(),
             b"success",
             Some(&signing_key_for_did(&dave())),
+            None,
             None,
         )
         .await;

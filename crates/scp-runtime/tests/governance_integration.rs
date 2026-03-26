@@ -154,7 +154,12 @@ impl ContextEventLogProvider for MockEventLog {
     fn init_event_log(&self, _id: &[u8; 32]) -> Result<(), ContextCreationError> {
         Ok(())
     }
-    fn append_event(&self, _id: &[u8; 32], _event: &str) -> Result<(), ContextCreationError> {
+    fn append_event(
+        &self,
+        _id: &[u8; 32],
+        _event: &str,
+        _actor_did: &str,
+    ) -> Result<(), ContextCreationError> {
         Ok(())
     }
     fn destroy_event_log(&self, _id: &[u8; 32]) -> Result<(), ContextCreationError> {
