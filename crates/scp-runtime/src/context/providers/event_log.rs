@@ -1266,4 +1266,176 @@ mod tests {
         assert_eq!(persisted.len(), 2);
         assert_eq!(persisted[0].event, "Imported1");
     }
+
+    // -----------------------------------------------------------------------
+    // Hash computation unit tests (#1594, #33-41)
+    // -----------------------------------------------------------------------
+
+    /// Changing `actor_did` with all other fields constant changes the hash.
+    #[test]
+    fn compute_entry_hash_actor_did_changes_hash() {
+        let h1 = compute_entry_hash("MessageSent", "did:key:alice", 1000, &[0u8; 32]);
+        let h2 = compute_entry_hash("MessageSent", "did:key:bob", 1000, &[0u8; 32]);
+        assert_ne!(h1, h2, "different actor_did must produce different hash");
+    }
+
+    /// Changing event name with all other fields constant changes the hash.
+    #[test]
+    fn compute_entry_hash_event_changes_hash() {
+        let h1 = compute_entry_hash("MessageSent", "did:key:alice", 1000, &[0u8; 32]);
+        let h2 = compute_entry_hash("MemberJoined", "did:key:alice", 1000, &[0u8; 32]);
+        assert_ne!(h1, h2, "different event must produce different hash");
+    }
+
+    /// Changing timestamp with all other fields constant changes the hash.
+    #[test]
+    fn compute_entry_hash_timestamp_changes_hash() {
+        let h1 = compute_entry_hash("MessageSent", "did:key:alice", 1000, &[0u8; 32]);
+        let h2 = compute_entry_hash("MessageSent", "did:key:alice", 1001, &[0u8; 32]);
+        assert_ne!(h1, h2, "different timestamp must produce different hash");
+    }
+
+    /// Changing `prev_hash` with all other fields constant changes the hash.
+    #[test]
+    fn compute_entry_hash_prev_hash_changes_hash() {
+        let h1 = compute_entry_hash("MessageSent", "did:key:alice", 1000, &[0u8; 32]);
+        let h2 = compute_entry_hash("MessageSent", "did:key:alice", 1000, &[1u8; 32]);
+        assert_ne!(h1, h2, "different prev_hash must produce different hash");
+    }
+
+    /// Chain verification succeeds for a valid 3-entry chain.
+    #[test]
+    fn chain_verification_succeeds_for_valid_chain() {
+        let provider = MerkleEventLogProvider::new();
+        let ctx_id = [20u8; 32];
+        provider.init_event_log(&ctx_id).unwrap();
+        provider
+            .append_event(&ctx_id, "Event1", "did:key:alice")
+            .unwrap();
+        provider
+            .append_event(&ctx_id, "Event2", "did:key:bob")
+            .unwrap();
+        provider
+            .append_event(&ctx_id, "Event3", "did:key:carol")
+            .unwrap();
+        assert!(
+            provider.verify_chain(&ctx_id),
+            "valid 3-entry chain must verify"
+        );
+    }
+
+    /// Chain verification fails when `actor_did` in an entry is tampered.
+    #[test]
+    fn chain_verification_fails_for_tampered_actor_did() {
+        let provider = MerkleEventLogProvider::new();
+        let ctx_id = [21u8; 32];
+        provider.init_event_log(&ctx_id).unwrap();
+        provider
+            .append_event(&ctx_id, "Event1", "did:key:alice")
+            .unwrap();
+        provider
+            .append_event(&ctx_id, "Event2", "did:key:bob")
+            .unwrap();
+
+        {
+            let mut logs = provider.logs.lock().unwrap();
+            let log = logs.get_mut(&ctx_id).unwrap();
+            log.entries[1].actor_did = "did:key:mallory".to_owned();
+        }
+
+        assert!(
+            !provider.verify_chain(&ctx_id),
+            "tampered actor_did must fail chain verification"
+        );
+    }
+
+    /// Chain verification fails when event name in an entry is tampered.
+    #[test]
+    fn chain_verification_fails_for_tampered_event() {
+        let provider = MerkleEventLogProvider::new();
+        let ctx_id = [22u8; 32];
+        provider.init_event_log(&ctx_id).unwrap();
+        provider
+            .append_event(&ctx_id, "Event1", "did:key:alice")
+            .unwrap();
+        provider
+            .append_event(&ctx_id, "Event2", "did:key:bob")
+            .unwrap();
+
+        {
+            let mut logs = provider.logs.lock().unwrap();
+            let log = logs.get_mut(&ctx_id).unwrap();
+            log.entries[1].event = "TamperedEvent".to_owned();
+        }
+
+        assert!(
+            !provider.verify_chain(&ctx_id),
+            "tampered event name must fail chain verification"
+        );
+    }
+
+    /// Chain verification fails when hash field is tampered.
+    #[test]
+    fn chain_verification_fails_for_tampered_hash() {
+        let provider = MerkleEventLogProvider::new();
+        let ctx_id = [23u8; 32];
+        provider.init_event_log(&ctx_id).unwrap();
+        provider
+            .append_event(&ctx_id, "Event1", "did:key:alice")
+            .unwrap();
+        provider
+            .append_event(&ctx_id, "Event2", "did:key:bob")
+            .unwrap();
+        provider
+            .append_event(&ctx_id, "Event3", "did:key:carol")
+            .unwrap();
+
+        {
+            let mut logs = provider.logs.lock().unwrap();
+            let log = logs.get_mut(&ctx_id).unwrap();
+            log.entries[0].hash = [0xAA; 32]; // tamper first entry's hash
+        }
+
+        assert!(
+            !provider.verify_chain(&ctx_id),
+            "tampered hash must fail chain verification"
+        );
+    }
+
+    /// Domain separator "SCP-EXPORT-ENTRY:" is present in hash computation.
+    /// Verified by computing the hash manually and comparing.
+    #[test]
+    fn domain_separator_present_in_hash() {
+        use sha2::{Digest, Sha256};
+
+        let event = "TestEvent";
+        let actor_did = "did:key:test";
+        let timestamp: u64 = 12345;
+        let prev_hash = [0u8; 32];
+
+        // Compute with the function.
+        let hash = compute_entry_hash(event, actor_did, timestamp, &prev_hash);
+
+        // Compute manually WITH domain separator.
+        let mut hasher = Sha256::new();
+        hasher.update(b"SCP-EXPORT-ENTRY:");
+        hasher.update(event.as_bytes());
+        hasher.update(actor_did.as_bytes());
+        hasher.update(timestamp.to_be_bytes());
+        hasher.update(prev_hash);
+        let expected: [u8; 32] = hasher.finalize().into();
+        assert_eq!(
+            hash, expected,
+            "hash must match manual computation with domain separator"
+        );
+
+        // Compute manually WITHOUT domain separator — must NOT match.
+        let mut hasher_no_sep = Sha256::new();
+        hasher_no_sep.update(event.as_bytes());
+        hasher_no_sep.update(actor_did.as_bytes());
+        hasher_no_sep.update(timestamp.to_be_bytes());
+        hasher_no_sep.update(prev_hash);
+        let wrong: [u8; 32] = hasher_no_sep.finalize().into();
+        assert_ne!(hash, wrong, "hash without domain separator must differ");
+    }
 }

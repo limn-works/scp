@@ -105,6 +105,7 @@ pub(super) struct MockCrypto {
     pub(super) fail_create_mls: AtomicBool,
     pub(super) fail_validate_key_package: AtomicBool,
     pub(super) fail_advance_epoch: AtomicBool,
+    pub(super) fail_remove_member: AtomicBool,
     pub(super) fail_remove_member_sender_key: AtomicBool,
     pub(super) fail_rotate_sender_key: AtomicBool,
     pub(super) mls_created: std::sync::Mutex<Vec<[u8; 32]>>,
@@ -187,6 +188,11 @@ impl ContextCryptoProvider for MockCrypto {
     }
 
     fn remove_member(&self, _context_id: &[u8; 32], member_did: &str) -> Result<(), ContextError> {
+        if self.fail_remove_member.load(Ordering::Relaxed) {
+            return Err(ContextError::MembershipFailed(
+                "mock remove_member failure".into(),
+            ));
+        }
         self.members_removed
             .lock()
             .unwrap()
