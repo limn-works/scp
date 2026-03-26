@@ -25,12 +25,13 @@ use scp_protocol::context::tools::lifecycle::{
 };
 use scp_protocol::context::tools::registry::ToolRegistry;
 use scp_protocol::context::tools::schema::validate_value_against_schema;
-use scp_protocol::crypto::ucan::UcanError;
 use scp_protocol::crypto::ucan::capability::CapabilityUri;
 use scp_protocol::crypto::ucan::validate::{
     DidResolver, NonceTracker, ProofResolver, RevocationChecker, ValidationContext, parse_ucan,
     validate_ucan,
 };
+use scp_protocol::crypto::ucan::{UcanError, UcanToken};
+use scp_protocol::trust::consequence::evaluate_consequence_rules;
 
 // ---------------------------------------------------------------------------
 // InvocationError
@@ -407,11 +408,12 @@ pub fn check_tool_economy(
     Ok(())
 }
 
-/// Post-invocation bookkeeping: participation record update.
+/// Post-invocation bookkeeping: participation record update and consequence evaluation.
 ///
 /// Called after a successful tool invocation to update governance state.
 /// `compute_participation_record` refreshes the cache for standing evaluation
-/// (#1530).
+/// (#1530). `evaluate_consequence_rules` checks whether the tool invocation
+/// triggered any consequence rules (#1531).
 pub fn post_tool_invocation_bookkeeping<S: std::hash::BuildHasher>(
     events: &[scp_event_log::Event],
     invoker_did: &DID,
@@ -422,7 +424,8 @@ pub fn post_tool_invocation_bookkeeping<S: std::hash::BuildHasher>(
         scp_protocol::trust::participation::ParticipationRecord,
         S,
     >,
-) {
+    consequence_rules: &[scp_protocol::trust::consequence::ConsequenceRule],
+) -> Vec<scp_protocol::trust::consequence::TriggeredConsequence> {
     // Update participation record after tool execution (#1530).
     if !events.is_empty()
         && let Ok(record) = scp_protocol::trust::participation::compute_participation_record(
@@ -435,6 +438,39 @@ pub fn post_tool_invocation_bookkeeping<S: std::hash::BuildHasher>(
     {
         participation_cache.insert(invoker_did.to_string(), record);
     }
+
+    // Evaluate consequence rules after tool execution (#1531).
+    // The caller is responsible for enforcing triggered consequences via
+    // enforce_triggered_consequences on the PerContextState.
+    evaluate_consequence_rules(consequence_rules, events, invoker_did.as_ref(), now)
+}
+
+/// Validates UCAN AND-composition for tool invocations with economic cost.
+///
+/// If the tool invocation has a cost (from the context's economic policy),
+/// checks that the invoker has both an action UCAN and a spending UCAN.
+/// Called as part of the tool invocation economy pre-check (#1537, §19.5).
+///
+/// # Errors
+///
+/// Returns [`InvocationError::ExecutionFailed`] if the AND-composition check
+/// fails (missing action UCAN or missing spending UCAN for a paid action).
+pub fn check_tool_ucan_composition(
+    action_cost: scp_protocol::economy::types::Amount,
+    action_ucan: Option<&UcanToken>,
+    spending_ucan: Option<&UcanToken>,
+) -> Result<(), InvocationError> {
+    // Convert economy Amount to UCAN spending Amount (both are u64 wrappers).
+    let ucan_amount = scp_protocol::crypto::ucan::spending::Amount(action_cost.0);
+    scp_protocol::crypto::ucan::spending::check_and_composition(
+        action_ucan,
+        spending_ucan,
+        ucan_amount,
+        "tool:invoke",
+    )
+    .map_err(|e| InvocationError::ExecutionFailed {
+        message: format!("UCAN spending composition check failed: {e}"),
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -1211,6 +1247,38 @@ mod tests {
         assert!(
             matches!(err, UcanError::CapabilityNotGranted(..)),
             "expected CapabilityNotGranted, got {err:?}"
+        );
+    }
+
+    // budget_exceeded on tool invocation returns BudgetExceeded
+    #[tokio::test]
+    async fn budget_exceeded_tool_invoke() {
+        use scp_protocol::economy::types::{Amount, CostSchedule, CurrencyCode, EconomicPolicy};
+
+        let policy = EconomicPolicy {
+            locked: false,
+            cost_schedule: CostSchedule {
+                currency: CurrencyCode::new([85, 83, 68, 0]),
+                per_message: None,
+                per_tool_invoke: Some(Amount::new(200)),
+                per_join: None,
+                per_period: None,
+                per_byte_stored: None,
+            },
+            payment_adapters: vec![],
+            pricing_formula: None,
+            payee: DID::from("did:key:payee"),
+        };
+
+        let invoker: DID = "did:key:invoker".into();
+        let mut tracker = scp_protocol::economy::budget::MemberBudgetTracker::new();
+        // Grant only 100 budget but tool costs 200.
+        tracker.grant(&invoker, Amount::new(100));
+
+        let result = super::check_tool_economy(Some(&policy), &mut tracker, &invoker);
+        assert!(
+            matches!(result, Err(super::InvocationError::BudgetExceeded { .. })),
+            "should return BudgetExceeded when budget is insufficient, got: {result:?}"
         );
     }
 }

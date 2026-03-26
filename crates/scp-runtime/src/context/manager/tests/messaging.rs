@@ -1463,3 +1463,115 @@ async fn evaluate_provenance_quality_for_cross_context_data() {
         "persistent source with active context should be PersistentVerifiable"
     );
 }
+
+/// Payment receipt is generated and verifiable via `NoOpPaymentAdapter` (#1537).
+#[tokio::test]
+async fn receipt_verification_with_noop_adapter() {
+    use crate::economy::adapter::{NoOpPaymentAdapter, PaymentAdapter};
+    use crate::economy::receipt::{PaymentVerifierDyn, all_receipts_valid, verify_receipts_dyn};
+
+    let adapter = NoOpPaymentAdapter;
+
+    // Generate a receipt via capture.
+    let auth = adapter
+        .authorize(
+            &"did:key:payer".into(),
+            &"did:key:payee".into(),
+            scp_protocol::economy::types::Amount(100),
+            scp_protocol::economy::types::CurrencyCode::new([85, 83, 68, 0]),
+            crate::economy::adapter::PaymentMetadata::default(),
+        )
+        .await
+        .unwrap();
+
+    let receipt = adapter.capture(&auth).await.unwrap();
+
+    // Verify the receipt.
+    let verifiers: Vec<&dyn PaymentVerifierDyn> = vec![&adapter];
+    let results = verify_receipts_dyn(&verifiers, &[receipt]).await;
+    assert!(
+        all_receipts_valid(&results),
+        "receipt from NoOpPaymentAdapter should be verifiable"
+    );
+}
+
+/// Velocity data feeds into consequence evaluation end-to-end (#1537).
+#[tokio::test]
+async fn velocity_consequence_trigger_on_send() {
+    use scp_protocol::trust::consequence::{
+        ConsequenceAction, ConsequenceRule, ConsequenceTrigger,
+    };
+    use std::time::Duration;
+
+    let manager = ContextManager::new(
+        Box::new(MockCrypto::default()),
+        Box::new(MockTransport::connected()),
+        Box::new(MockEventLog::default()),
+        noop_key_resolver(),
+    );
+
+    let mut params = ContextParams {
+        ceiling: vec![
+            scp_protocol::context::params::Capability::new("messages:read"),
+            scp_protocol::context::params::Capability::new("messages:write"),
+        ],
+        ..ContextParams::default()
+    };
+    params.consequence_rules = vec![ConsequenceRule {
+        trigger: ConsequenceTrigger::MessageVelocity,
+        threshold: 0,
+        action: ConsequenceAction::CapabilitySuspension(vec!["write".to_owned()]),
+        window: Duration::from_secs(3600),
+    }];
+    let _handle = manager
+        .create_context("vel-msg-ctx".into(), params, "did:key:admin".into())
+        .await
+        .unwrap();
+
+    let sk = ed25519_dalek::SigningKey::from_bytes(&[1u8; 32]);
+    let handle = manager
+        .contexts
+        .lock()
+        .await
+        .get("vel-msg-ctx")
+        .unwrap()
+        .handle
+        .clone();
+    let _ = manager
+        .send_message(&handle, &"did:key:admin".into(), b"test", Some(&sk), None)
+        .await;
+
+    let events = manager.drain_events("vel-msg-ctx").await;
+    let triggered = events
+        .iter()
+        .any(|e| matches!(e, ContextEvent::ConsequenceTriggered { .. }));
+    assert!(
+        triggered,
+        "velocity tracking should trigger consequence evaluation after send"
+    );
+}
+
+/// Dynamic pricing adjusts cost based on utilization (#1537).
+#[test]
+fn dynamic_pricing_adjusts_relay_cost() {
+    use scp_protocol::economy::pricing::{PriceDirection, RelayPricingConfig, adjust_relay_price};
+    use scp_protocol::economy::types::Amount;
+
+    let config = RelayPricingConfig {
+        target_utilization_pct: 50,
+        current_base_price: Amount(1000),
+        max_change_per_mille: 125,
+        floor: Amount(100),
+        cap: Amount(10000),
+    };
+
+    let low = adjust_relay_price(&config, 20);
+    let high = adjust_relay_price(&config, 80);
+
+    assert_eq!(low.direction, PriceDirection::Decreased);
+    assert_eq!(high.direction, PriceDirection::Increased);
+    assert_ne!(
+        low.new_base_price, high.new_base_price,
+        "prices should differ at different utilization levels"
+    );
+}

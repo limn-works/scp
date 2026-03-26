@@ -708,6 +708,9 @@ struct GovernanceState {
     /// timestamp (seconds) until which the rule should not re-fire. Prevents
     /// repeated consequence dispatch within a rule's evaluation window.
     cooldown_until: HashMap<usize, u64>,
+    /// Optional EIP-1559-style relay pricing configuration (§19.8, #1537).
+    /// Updated on each message send via `maybe_adjust_relay_pricing`.
+    relay_pricing_config: Option<scp_protocol::economy::pricing::RelayPricingConfig>,
 }
 
 impl GovernanceState {

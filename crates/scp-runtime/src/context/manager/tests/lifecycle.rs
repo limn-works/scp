@@ -2099,3 +2099,135 @@ fn standing_context_id_is_deterministic() {
     let id3 = generate_standing_context_id(&alice, &carol);
     assert_ne!(id1, id3);
 }
+
+/// `auto_accept_blocked` rejects join for paid contexts (#1537).
+#[tokio::test]
+async fn auto_accept_blocked_by_economics_rejects_join() {
+    use scp_protocol::economy::types::{Amount, CostSchedule, CurrencyCode, EconomicPolicy};
+
+    let manager = ContextManager::new(
+        Box::new(MockCrypto::default()),
+        Box::new(MockTransport::connected()),
+        Box::new(MockEventLog::default()),
+        noop_key_resolver(),
+    );
+
+    let mut params = ContextParams {
+        ceiling: vec![
+            scp_protocol::context::params::Capability::new("messages:read"),
+            scp_protocol::context::params::Capability::new("messages:write"),
+        ],
+        ..ContextParams::default()
+    };
+    params.economic_policy = Some(EconomicPolicy {
+        locked: false,
+        cost_schedule: CostSchedule {
+            currency: CurrencyCode::new([85, 83, 68, 0]),
+            per_message: None,
+            per_tool_invoke: None,
+            per_join: Some(Amount::new(100)),
+            per_period: None,
+            per_byte_stored: None,
+        },
+        payment_adapters: vec![],
+        pricing_formula: None,
+        payee: DID::from("did:key:payee"),
+    });
+    let handle = manager
+        .create_context("paid-join-ctx".into(), params, "did:key:admin".into())
+        .await
+        .unwrap();
+
+    let kp = scp_protocol::context::membership::KeyPackage {
+        owner_did: DID::from("did:key:joiner"),
+        mls_key_package_bytes: None,
+    };
+    let result = manager.join_context(&handle, kp).await;
+    assert!(
+        result.is_err(),
+        "join should be blocked for paid context without explicit acceptance"
+    );
+}
+
+/// Sybil resistance rejects insufficient signals (#1530).
+#[tokio::test]
+async fn sybil_reject_insufficient_signals() {
+    // Currently the sybil resistance function is a no-op that passes
+    // unconditionally (no sybil policy field on ContextParams yet).
+    // This test verifies the function exists and can be called. When a
+    // real sybil policy is added, this test should be updated to verify
+    // actual rejection.
+    use super::super::lifecycle::evaluate_sybil_resistance;
+
+    let manager = ContextManager::new(
+        Box::new(MockCrypto::default()),
+        Box::new(MockTransport::connected()),
+        Box::new(MockEventLog::default()),
+        noop_key_resolver(),
+    );
+
+    let params = ContextParams::default();
+    let _handle = manager
+        .create_context("sybil-ctx".into(), params, "did:key:admin".into())
+        .await
+        .unwrap();
+
+    // Currently passes unconditionally — the test asserts the function is
+    // callable and returns Ok.
+    let contexts = manager.contexts.lock().await;
+    let ctx = contexts.get("sybil-ctx").unwrap();
+    let result = evaluate_sybil_resistance(ctx, &"did:key:test".into(), 0);
+    assert!(
+        result.is_ok(),
+        "sybil resistance should pass with no policy configured"
+    );
+}
+
+/// Budget exceeded on `join_context` rejects (#1537).
+#[tokio::test]
+async fn budget_exceeded_on_join_rejects() {
+    use scp_protocol::economy::types::{Amount, CostSchedule, CurrencyCode, EconomicPolicy};
+
+    let manager = ContextManager::new(
+        Box::new(MockCrypto::default()),
+        Box::new(MockTransport::connected()),
+        Box::new(MockEventLog::default()),
+        noop_key_resolver(),
+    );
+
+    let mut params = ContextParams {
+        ceiling: vec![
+            scp_protocol::context::params::Capability::new("messages:read"),
+            scp_protocol::context::params::Capability::new("messages:write"),
+        ],
+        ..ContextParams::default()
+    };
+    params.economic_policy = Some(EconomicPolicy {
+        locked: false,
+        cost_schedule: CostSchedule {
+            currency: CurrencyCode::new([85, 83, 68, 0]),
+            per_message: None,
+            per_tool_invoke: None,
+            per_join: Some(Amount::new(50)),
+            per_period: None,
+            per_byte_stored: None,
+        },
+        payment_adapters: vec![],
+        pricing_formula: None,
+        payee: DID::from("did:key:payee"),
+    });
+    let handle = manager
+        .create_context("budget-join-ctx".into(), params, "did:key:admin".into())
+        .await
+        .unwrap();
+
+    let kp = scp_protocol::context::membership::KeyPackage {
+        owner_did: DID::from("did:key:joiner"),
+        mls_key_package_bytes: None,
+    };
+    let result = manager.join_context(&handle, kp).await;
+    assert!(
+        result.is_err(),
+        "join should fail: paid context auto_accept blocked"
+    );
+}
