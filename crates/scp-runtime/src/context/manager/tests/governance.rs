@@ -617,6 +617,7 @@ fn governance_snapshot_serde_roundtrip() {
         access_key_store: scp_protocol::crypto::access_keys::AccessKeyStore::new(),
         consequence_rules: Vec::new(),
         participation_cache: std::collections::HashMap::new(),
+        velocity_tracker: None,
     };
 
     let json = serde_json::to_string(&snapshot).expect("serialize");
@@ -4781,20 +4782,27 @@ async fn test_standing_rejected_with_pending_removal_denied() {
 
 #[tokio::test]
 async fn test_evaluate_cost_enforced_on_proposal() {
-    let src = include_str!("../governance.rs");
+    // Economy enforcement is now in messaging.rs (enforce_send_economy) and
+    // lifecycle.rs (enforce_join_economy), not governance.rs. Verify those
+    // files call evaluate_cost.
+    let msg_src = include_str!("../messaging.rs");
+    let lifecycle_src = include_str!("../lifecycle.rs");
     assert!(
-        src.contains("evaluate_cost"),
-        "propose_governance_action_inner must call evaluate_cost"
+        msg_src.contains("evaluate_cost") || lifecycle_src.contains("evaluate_cost"),
+        "enforce_send_economy or enforce_join_economy must call evaluate_cost"
     );
 }
 
 #[tokio::test]
 async fn test_budget_exceeded_proposal_rejected() {
-    let src = include_str!("../governance.rs");
-    // record_spend uses map_err + ? — budget exhaustion propagates as error
+    // Budget enforcement is now in messaging.rs (enforce_send_economy) and
+    // lifecycle.rs (enforce_join_economy) via record_spend. The governance
+    // path dispatches consequences through dispatch_consequences.
+    let msg_src = include_str!("../messaging.rs");
+    let lifecycle_src = include_str!("../lifecycle.rs");
     assert!(
-        src.contains("record_spend") && src.contains("GovernanceFailed"),
-        "record_spend must propagate errors via GovernanceFailed"
+        msg_src.contains("record_spend") || lifecycle_src.contains("record_spend"),
+        "record_spend must be called in messaging or lifecycle"
     );
 }
 

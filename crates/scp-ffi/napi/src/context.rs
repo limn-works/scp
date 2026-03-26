@@ -1121,6 +1121,38 @@ pub async fn context_member_role(
 // Bridge functions — events (delegated to ContextManager)
 // ---------------------------------------------------------------------------
 
+/// Formats a [`ContextEvent`] as a human-readable string.
+///
+/// Consequence events (`ConsequenceTriggered`, `ConsequenceEnforced`) are
+/// formatted with structured key=value pairs for observability. All other
+/// events use their `Debug` representation.
+fn format_context_event(event: &scp_core::context::membership::ContextEvent) -> String {
+    match event {
+        scp_core::context::membership::ContextEvent::ConsequenceTriggered {
+            context_id,
+            member_did,
+            rule_index,
+            trigger_type,
+            action_type,
+        } => format!(
+            "consequence_triggered:member={member_did},\
+             rule={rule_index},trigger={trigger_type},\
+             action={action_type},context={context_id}"
+        ),
+        scp_core::context::membership::ContextEvent::ConsequenceEnforced {
+            context_id,
+            member_did,
+            action_type,
+            success,
+        } => format!(
+            "consequence_enforced:member={member_did},\
+             action={action_type},success={success},\
+             context={context_id}"
+        ),
+        other => format!("{other:?}"),
+    }
+}
+
 /// Drains all events from the receive buffer for a context.
 ///
 /// Delegates to `ContextManager::drain_events`. Returns events as JSON
@@ -1133,7 +1165,7 @@ pub async fn context_member_role(
 pub async fn context_drain_events(handle: &NapiContextHandle) -> napi::Result<Vec<String>> {
     let manager = context_manager()?;
     let events = manager.drain_events(&handle.context_id).await;
-    Ok(events.into_iter().map(|e| format!("{e:?}")).collect())
+    Ok(events.iter().map(format_context_event).collect())
 }
 
 // ---------------------------------------------------------------------------

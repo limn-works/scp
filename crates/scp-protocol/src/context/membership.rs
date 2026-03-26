@@ -820,6 +820,18 @@ impl ReceiveBuffer {
     pub fn truncate(&mut self, len: usize) {
         self.events.truncate(len);
     }
+
+    /// Returns a read-only view of buffered events for consequence rule
+    /// evaluation and participation record computation.
+    ///
+    /// Does NOT consume events — they remain in the buffer for SDK
+    /// consumption via [`drain`](Self::drain). This enables governance
+    /// consequence evaluation (#1531) and standing checks (#1530) to
+    /// inspect recent events without side effects.
+    #[must_use]
+    pub const fn event_log_entries(&self) -> &VecDeque<ContextEvent> {
+        &self.events
+    }
 }
 
 impl Default for ReceiveBuffer {

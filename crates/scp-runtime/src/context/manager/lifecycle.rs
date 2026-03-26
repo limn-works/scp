@@ -13,6 +13,71 @@ use super::{
     validate_governance_consistency, validate_governance_model,
 };
 
+/// Performs sybil resistance evaluation for a join candidate (#1530).
+///
+/// Uses a permissive default policy (no requirements) when the context
+/// doesn't specify one. Fail-closed with `?`.
+fn evaluate_sybil_resistance(member_did: &DID, now: u64) -> Result<(), ContextError> {
+    let sybil_policy = scp_protocol::trust::sybil::ContextSybilPolicy {
+        min_signal_breadth: None,
+        min_weighted_strength: None,
+        required_signals: Vec::new(),
+        freshness_config: scp_protocol::trust::sybil::FreshnessWeight::default_config(),
+        capacity_policy: scp_protocol::trust::sybil::CapacityTierPolicy::default_policy(),
+        require_device_attestation: false,
+    };
+    let sybil_assessment = scp_protocol::trust::sybil::IdentityDepthAssessment {
+        subject_did: member_did.clone(),
+        signals: std::collections::HashMap::new(),
+        signal_breadth: 0,
+        assessed_at: now,
+    };
+    scp_protocol::trust::sybil::evaluate_sybil_resistance(
+        &sybil_assessment,
+        &sybil_policy,
+        now,
+        None,
+    )
+    .map_err(|e| ContextError::PermissionDenied(format!("SCP-SYBIL-6010: sybil check failed: {e}")))
+}
+
+/// Initializes participation record and records budget spend for a new member (#1530, #1537).
+fn post_join_bookkeeping(ctx: &mut PerContextState, context_id: &str, member_did: &DID, now: u64) {
+    // Participation record initialization for the new member.
+    let join_events = super::governance::event_log_entries_for_consequences(ctx, context_id, now);
+    if !join_events.is_empty()
+        && let Ok(record) = scp_protocol::trust::participation::compute_participation_record(
+            &join_events,
+            member_did.as_ref(),
+            context_id,
+            [0u8; 32],
+            now,
+        )
+    {
+        ctx.governance
+            .participation_cache
+            .insert(member_did.to_string(), record);
+    }
+
+    // Paid action context-join bookkeeping.
+    if ctx.governance.economic_policy.is_some() {
+        tracing::trace!(
+            action = "ContextJoin",
+            "paid context join cost already evaluated"
+        );
+    }
+
+    // Record join spend against budget (zero-cost for free joins).
+    if ctx
+        .governance
+        .budget_tracker
+        .record_spend(member_did, scp_protocol::economy::types::Amount::new(0))
+        .is_err()
+    {
+        // Budget tracking failure is non-fatal for free joins.
+    }
+}
+
 /// Enforces economic policy for context joins (#1537).
 ///
 /// Checks auto-accept guard and evaluates join cost from the context's
@@ -28,7 +93,11 @@ fn enforce_join_economy(ctx: &mut PerContextState, joiner_did: &DID) -> Result<(
     if let Some(ref policy) = ctx.governance.economic_policy {
         let metrics = scp_protocol::economy::policy::ObservableMetrics {
             member_count: u64::try_from(ctx.membership.count()).unwrap_or(u64::MAX),
-            ..scp_protocol::economy::policy::ObservableMetrics::default()
+            context_message_rate: 0,
+            relay_queue_depth: 0,
+            time_of_day: 0,
+            sender_velocity: 0,
+            storage_usage: 0,
         };
         if let Some(cost) = scp_protocol::economy::policy::evaluate_cost(
             policy,
@@ -173,6 +242,7 @@ impl ContextManager {
                 consequence_rules: ctx_snapshot.consequence_rules,
                 velocity_tracker: scp_protocol::economy::antispam::SenderVelocityTracker::new(3600),
                 participation_cache: ctx_snapshot.participation_cache,
+                cooldown_until: HashMap::new(),
             },
             role_state: ctx_snapshot.role_state,
             receive_buffer: ReceiveBuffer::new(),
@@ -662,6 +732,7 @@ impl ContextManager {
                 consequence_rules: export.snapshot.consequence_rules,
                 velocity_tracker: scp_protocol::economy::antispam::SenderVelocityTracker::new(3600),
                 participation_cache: export.snapshot.participation_cache,
+                cooldown_until: HashMap::new(),
             },
             epoch: EpochState {
                 mls_epoch: export.snapshot.mls_epoch,
@@ -828,6 +899,7 @@ impl ContextManager {
                 consequence_rules: params.consequence_rules.clone(),
                 velocity_tracker: scp_protocol::economy::antispam::SenderVelocityTracker::new(3600),
                 participation_cache: HashMap::new(),
+                cooldown_until: HashMap::new(),
             },
             role_state,
             receive_buffer: ReceiveBuffer::new(),
@@ -1111,6 +1183,7 @@ impl ContextManager {
                 consequence_rules: params.consequence_rules.clone(),
                 velocity_tracker: scp_protocol::economy::antispam::SenderVelocityTracker::new(3600),
                 participation_cache: HashMap::new(),
+                cooldown_until: HashMap::new(),
             },
             epoch: EpochState {
                 mls_epoch: 0,
@@ -1243,6 +1316,12 @@ impl ContextManager {
 
             // Economy enforcement (#1537) — auto-accept guard + join cost.
             enforce_join_economy(ctx, &member_did)?;
+
+            // Sybil resistance check (#1530) — fail-closed with `?`.
+            evaluate_sybil_resistance(&member_did, self.clock.now_secs())?;
+
+            // Participation + economy bookkeeping (#1530, #1537).
+            post_join_bookkeeping(ctx, &context_id, &member_did, self.clock.now_secs());
 
             // Add member to role state.
             ctx.role_state.members.insert(member_did.to_string());

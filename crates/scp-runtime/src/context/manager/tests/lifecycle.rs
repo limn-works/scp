@@ -755,6 +755,7 @@ async fn persist_drop_restore_roundtrip() {
         access_key_store: scp_protocol::crypto::access_keys::AccessKeyStore::new(),
         consequence_rules: Vec::new(),
         participation_cache: std::collections::HashMap::new(),
+        velocity_tracker: None,
     };
 
     let bc_snapshot = test_broadcast_snapshot("persist-ctx-2");
@@ -869,6 +870,7 @@ async fn restore_preserves_executed_proposals() {
         access_key_store: scp_protocol::crypto::access_keys::AccessKeyStore::new(),
         consequence_rules: Vec::new(),
         participation_cache: std::collections::HashMap::new(),
+        velocity_tracker: None,
     };
 
     persistence
@@ -971,6 +973,7 @@ async fn restore_respawns_ttl_timer() {
         access_key_store: scp_protocol::crypto::access_keys::AccessKeyStore::new(),
         consequence_rules: Vec::new(),
         participation_cache: std::collections::HashMap::new(),
+        velocity_tracker: None,
     };
 
     persistence.persist_context("ttl-ctx", &snapshot).unwrap();
@@ -1052,6 +1055,7 @@ async fn restore_all_contexts_restores_persisted() {
             access_key_store: scp_protocol::crypto::access_keys::AccessKeyStore::new(),
             consequence_rules: Vec::new(),
             participation_cache: std::collections::HashMap::new(),
+            velocity_tracker: None,
         };
         persistence.persist_context(ctx_name, &snapshot).unwrap();
     }
@@ -1132,6 +1136,7 @@ async fn restore_context_rejects_duplicate() {
         access_key_store: scp_protocol::crypto::access_keys::AccessKeyStore::new(),
         consequence_rules: Vec::new(),
         participation_cache: std::collections::HashMap::new(),
+        velocity_tracker: None,
     };
 
     let bc_snapshot = test_broadcast_snapshot("dup-ctx");
@@ -1234,6 +1239,7 @@ async fn restore_context_sets_needs_reconnect_on_grace_inconsistency() {
         access_key_store: scp_protocol::crypto::access_keys::AccessKeyStore::new(),
         consequence_rules: Vec::new(),
         participation_cache: std::collections::HashMap::new(),
+        velocity_tracker: None,
     };
 
     let bc_snapshot = test_broadcast_snapshot("grace-incon-ctx");
@@ -1343,6 +1349,7 @@ async fn restore_context_no_reconnect_when_grace_consistent() {
         access_key_store: scp_protocol::crypto::access_keys::AccessKeyStore::new(),
         consequence_rules: Vec::new(),
         participation_cache: std::collections::HashMap::new(),
+        velocity_tracker: None,
     };
 
     let bc_snapshot = test_broadcast_snapshot("grace-ok-ctx");
@@ -1440,6 +1447,7 @@ fn reconnect_test_snapshot(
         access_key_store: scp_protocol::crypto::access_keys::AccessKeyStore::new(),
         consequence_rules: Vec::new(),
         participation_cache: std::collections::HashMap::new(),
+        velocity_tracker: None,
     }
 }
 

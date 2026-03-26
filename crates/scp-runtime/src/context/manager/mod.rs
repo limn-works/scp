@@ -549,6 +549,11 @@ pub struct ContextSnapshot {
     #[serde(default)]
     pub participation_cache:
         HashMap<String, scp_protocol::trust::participation::ParticipationRecord>,
+    /// Sender velocity tracker window configuration for anti-spam and
+    /// consequence evaluation (§19.7, #1537). Persisted so velocity state
+    /// survives process restarts. Contains the `window_secs` configuration.
+    #[serde(default)]
+    pub velocity_tracker: Option<u64>,
 }
 
 // ---------------------------------------------------------------------------
@@ -699,6 +704,10 @@ struct GovernanceState {
     velocity_tracker: scp_protocol::economy::antispam::SenderVelocityTracker,
     /// Per-member participation record cache for standing evaluation (#1530).
     participation_cache: HashMap<String, scp_protocol::trust::participation::ParticipationRecord>,
+    /// Cooldown tracking for consequence rules: maps `rule_index` to the Unix
+    /// timestamp (seconds) until which the rule should not re-fire. Prevents
+    /// repeated consequence dispatch within a rule's evaluation window.
+    cooldown_until: HashMap<usize, u64>,
 }
 
 /// MLS epoch and reconnection state.
@@ -1719,6 +1728,7 @@ impl ContextManager {
             access_key_store: ctx.access.access_key_store.clone(),
             consequence_rules: ctx.governance.consequence_rules.clone(),
             participation_cache: ctx.governance.participation_cache.clone(),
+            velocity_tracker: Some(ctx.governance.velocity_tracker.window_secs()),
         }
     }
 }

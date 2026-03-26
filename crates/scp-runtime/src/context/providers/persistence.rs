@@ -199,6 +199,7 @@ mod tests {
             access_key_store: scp_protocol::crypto::access_keys::AccessKeyStore::new(),
             consequence_rules: Vec::new(),
             participation_cache: std::collections::HashMap::new(),
+            velocity_tracker: None,
         }
     }
 

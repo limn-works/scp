@@ -80,15 +80,14 @@ impl ContextManager {
         local_did: &DID,
         peer_did: &DID,
     ) -> Result<String, ContextError> {
-        // Hold the standing_contexts lock across the entire get-or-create
-        // operation to prevent TOCTOU races where two concurrent calls could
-        // both see "no context" and create duplicates.
-        let mut standing = self.standing_contexts.lock().await;
-
         let context_id = generate_standing_context_id(local_did, peer_did);
 
         // Step 1: Check if the context exists and is Active/Creating.
+        // Hold the standing_contexts lock only for the check, then drop
+        // before the async create_context call to avoid holding the lock
+        // across an await point.
         {
+            let mut standing = self.standing_contexts.lock().await;
             let contexts = self.contexts.lock().await;
             if let Some(ctx) = contexts.get(&context_id) {
                 let state = ctx.handle.state().await;
@@ -109,8 +108,10 @@ impl ContextManager {
                     }
                 }
             }
+            // Drop both locks before async creation.
+            drop(contexts);
+            drop(standing);
         }
-        // contexts lock dropped before async creation.
 
         // Step 3/4: Create a new bilateral-persistent context via the full
         // ContextManager::create_context flow (membership, roles, governance).
@@ -119,7 +120,8 @@ impl ContextManager {
             .await
             .map_err(|e| ContextError::TransportFailed(e.to_string()))?;
 
-        // Track the standing context.
+        // Re-acquire lock to track the standing context.
+        let mut standing = self.standing_contexts.lock().await;
         standing.insert(peer_did.to_string(), peer_did.clone());
 
         Ok(context_id)

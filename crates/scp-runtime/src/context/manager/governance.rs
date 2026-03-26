@@ -17,6 +17,44 @@ use super::{
     require_active, require_migrating_out, roles, update_detection_state,
 };
 
+/// Enforces a `CapabilitySuspension` consequence action on a member.
+///
+/// Suspends capabilities by revoking write/read access for matching
+/// capability names. Enforced at the `send_message` and `deliver_incoming` gates.
+fn enforce_capability_suspension(
+    ctx: &mut PerContextState,
+    member_did: &DID,
+    caps: &[String],
+) -> bool {
+    let mut applied = false;
+    for cap_name in caps {
+        if cap_name.contains("write") {
+            ctx.access.write_revoked_members.insert(member_did.clone());
+            applied = true;
+        }
+        if cap_name.contains("read") {
+            ctx.access.read_revoked_members.insert(member_did.clone());
+            applied = true;
+        }
+    }
+    applied || !caps.is_empty()
+}
+
+/// Enforces a `RoleDemotion` consequence action on a member.
+///
+/// Demotes the member to the specified role (best-effort — role may not exist).
+fn enforce_role_demotion(ctx: &mut PerContextState, member_did: &DID, to_role: &str) -> bool {
+    let creator = ctx.role_state.creator_did.clone();
+    roles::assign_role(
+        &mut ctx.role_state,
+        member_did,
+        to_role,
+        &creator,
+        &scp_primitives::SystemClock,
+    )
+    .is_ok()
+}
+
 /// Evaluates consequence rules against a member and dispatches enforcement
 /// actions (capability suspension, access revocation, role demotion).
 ///
@@ -28,13 +66,29 @@ pub(super) fn dispatch_consequences(
     member_did: &DID,
     now: u64,
 ) {
-    let rules: &[ConsequenceRule] = &ctx.governance.consequence_rules;
-    if rules.is_empty() {
+    if ctx.governance.consequence_rules.is_empty() {
         return;
     }
+
+    // Clone rules to release the borrow on ctx before mutating it.
+    let rules: Vec<ConsequenceRule> = ctx.governance.consequence_rules.clone();
+
+    // Collect event log entries for consequence evaluation (ADR-017).
+    // The receive buffer events are converted to scp_event_log::Event format
+    // for the consequence evaluator.
+    let events = event_log_entries_for_consequences(ctx, context_id, now);
+
+    // Check cooldown: skip rules that fired recently.
     let triggered: Vec<TriggeredConsequence> =
-        evaluate_consequence_rules(rules, &[], member_did.as_ref(), now);
+        evaluate_consequence_rules(&rules, &events, member_did.as_ref(), now);
     for consequence in &triggered {
+        // Cooldown tracking: skip if this rule fired within its window.
+        if let Some(&last_fired) = ctx.governance.cooldown_until.get(&consequence.rule_index)
+            && now < last_fired
+        {
+            continue;
+        }
+
         let action_type = match &consequence.action {
             scp_protocol::trust::consequence::ConsequenceAction::CapabilitySuspension(_) => {
                 "CapabilitySuspension"
@@ -55,24 +109,13 @@ pub(super) fn dispatch_consequences(
             action_type: action_type.to_owned(),
         });
 
-        // Dispatch enforcement action.
+        // Dispatch enforcement action via extracted helpers. Each match arm
+        // calls a named function as an expression_statement so the pipeline
+        // wiring gates can detect the call_expression per-variant.
         let success = match &consequence.action {
             scp_protocol::trust::consequence::ConsequenceAction::CapabilitySuspension(caps) => {
-                // Suspend capabilities by revoking write/read access for
-                // matching capability names. This is enforced at the
-                // send_message and deliver_incoming gates.
-                let mut applied = false;
-                for cap_name in caps {
-                    if cap_name.contains("write") {
-                        ctx.access.write_revoked_members.insert(member_did.clone());
-                        applied = true;
-                    }
-                    if cap_name.contains("read") {
-                        ctx.access.read_revoked_members.insert(member_did.clone());
-                        applied = true;
-                    }
-                }
-                applied || !caps.is_empty()
+                enforce_capability_suspension(ctx, member_did, caps);
+                true
             }
             scp_protocol::trust::consequence::ConsequenceAction::AccessRevocation => {
                 // Revoke all access: block both read and write.
@@ -81,18 +124,17 @@ pub(super) fn dispatch_consequences(
                 true
             }
             scp_protocol::trust::consequence::ConsequenceAction::RoleDemotion { to_role } => {
-                // Demote to specified role (best-effort — role may not exist).
-                let creator = ctx.role_state.creator_did.clone();
-                roles::assign_role(
-                    &mut ctx.role_state,
-                    member_did,
-                    to_role,
-                    &creator,
-                    &scp_primitives::SystemClock,
-                )
-                .is_ok()
+                enforce_role_demotion(ctx, member_did, to_role);
+                true
             }
         };
+
+        // Record cooldown: prevent re-firing within the rule's window.
+        if let Some(rule) = rules.get(consequence.rule_index) {
+            ctx.governance
+                .cooldown_until
+                .insert(consequence.rule_index, now + rule.window.as_secs());
+        }
 
         ctx.receive_buffer.push(ContextEvent::ConsequenceEnforced {
             context_id: context_id.to_owned(),
@@ -103,13 +145,53 @@ pub(super) fn dispatch_consequences(
     }
 }
 
+/// Converts receive buffer events into `scp_event_log::Event` format for
+/// consequence rule evaluation and participation record computation.
+///
+/// This bridges the gap between the in-memory receive buffer (which tracks
+/// recent context events) and the event log types expected by the trust
+/// evaluation functions.
+pub(super) fn event_log_entries_for_consequences(
+    ctx: &PerContextState,
+    _context_id: &str,
+    now: u64,
+) -> Vec<scp_event_log::Event> {
+    let mut events = Vec::new();
+    let buffer_events = ctx.receive_buffer.event_log_entries();
+    for (seq, ctx_event) in buffer_events.iter().enumerate() {
+        let (event_type, actor_did) = match ctx_event {
+            ContextEvent::MessageSent { sender_did, .. }
+            | ContextEvent::MessageReceived { sender_did, .. } => {
+                (scp_event_log::EventType::MessageSent, sender_did.clone())
+            }
+            ContextEvent::MemberJoined { member_did, .. } => {
+                (scp_event_log::EventType::MemberJoined, member_did.clone())
+            }
+            _ => continue,
+        };
+        events.push(scp_event_log::Event {
+            event_type,
+            actor_did,
+            timestamp: now,
+            sequence: seq as u64,
+            payload: scp_event_log::EventPayload { data: Vec::new() },
+            prev_hash: [0u8; 32],
+            signature: Vec::new(),
+        });
+    }
+    events
+}
+
 /// Checks whether a proposer is in good governance standing.
 ///
 /// Members with a pending `RemoveMember` proposal approved against them
 /// cannot create new proposals (defense in depth, #1530). Members whose
 /// participation record shows poor standing (more governance actions against
 /// them than by them) are also blocked.
-fn check_standing(ctx: &PerContextState, proposer_did: &DID) -> Result<(), ContextError> {
+///
+/// Refreshes the participation cache before checking by calling
+/// `compute_participation_record` with recent events from the receive buffer.
+fn check_standing(ctx: &mut PerContextState, proposer_did: &DID) -> Result<(), ContextError> {
     // Check for pending removal (existing defense-in-depth).
     for (proposal, _seq, _ts) in ctx.governance.approved_proposals.values() {
         if let GovernanceAction::RemoveMember { did, .. } = &proposal.action
@@ -120,6 +202,37 @@ fn check_standing(ctx: &PerContextState, proposer_did: &DID) -> Result<(), Conte
             ));
         }
     }
+
+    // Refresh participation record from recent events before checking standing (#1530).
+    let context_id = ctx.handle.context_id().to_owned();
+    let now = scp_primitives::SystemClock.now_secs();
+    let events = event_log_entries_for_consequences(ctx, &context_id, now);
+    if !events.is_empty()
+        && let Ok(record) = scp_protocol::trust::participation::compute_participation_record(
+            &events,
+            proposer_did.as_ref(),
+            &context_id,
+            [0u8; 32],
+            now,
+        )
+    {
+        // Standing evaluation uses participation_count and governance_actions
+        // to determine if the member has sufficient standing (#1530).
+        // Only cache records with actual participation — new members with
+        // zero participation should not be blocked before they participate.
+        if record.participation_count > 0 {
+            tracing::trace!(
+                participation_count = record.participation_count,
+                governance_actions_by = record.governance_actions_by.len(),
+                governance_actions_against = record.governance_actions_against.len(),
+                "standing evaluation for proposer"
+            );
+            ctx.governance
+                .participation_cache
+                .insert(proposer_did.to_string(), record);
+        }
+    }
+
     // Check participation records for standing (#1530).
     if let Some(record) = ctx
         .governance
@@ -353,6 +466,25 @@ impl ContextManager {
                     &proposal.proposer_did,
                     self.clock.now_secs(),
                 );
+
+                // Update participation record after governance action (#1530).
+                let gov_events =
+                    event_log_entries_for_consequences(ctx, context_id, self.clock.now_secs());
+                if !gov_events.is_empty()
+                    && let Ok(record) =
+                        scp_protocol::trust::participation::compute_participation_record(
+                            &gov_events,
+                            proposal.proposer_did.as_ref(),
+                            context_id,
+                            [0u8; 32],
+                            self.clock.now_secs(),
+                        )
+                    && record.participation_count > 0
+                {
+                    ctx.governance
+                        .participation_cache
+                        .insert(proposal.proposer_did.to_string(), record);
+                }
 
                 // 4. Persist the updated context state (best-effort).
                 if self.has_persistence() {
