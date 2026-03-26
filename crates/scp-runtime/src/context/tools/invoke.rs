@@ -152,6 +152,11 @@ pub struct ToolEconomyContext<'a, S: BuildHasher = std::hash::RandomState> {
     >,
     /// Consequence rules from the context's governance state.
     pub consequence_rules: &'a [scp_protocol::trust::consequence::ConsequenceRule],
+    /// Optional payment adapter for the 9-step payment flow (spec §19.2.2, #1537).
+    ///
+    /// When `Some`, `invoke_tool` runs `prepare_paid_action` + `process_paid_action`
+    /// before tool execution. When `None`, only budget enforcement runs.
+    pub payment_adapter: Option<std::sync::Arc<dyn crate::economy::adapter::PaymentAdapterDyn>>,
 }
 
 // ---------------------------------------------------------------------------
@@ -249,6 +254,23 @@ where
         .as_mut()
         .map(|econ| economy_pre_check(econ, invoker_did))
         .transpose()?;
+
+    // 4b. Payment flow (#1537): 9-step paid action for tool invocations.
+    // Runs after budget check but before tool execution. Only triggers when
+    // a payment adapter is configured AND cost > 0.
+    if let Some(ref econ) = economy
+        && let (Some(adapter), Some(policy)) = (&econ.payment_adapter, econ.economic_policy)
+    {
+        let remaining = econ.budget_tracker.remaining(invoker_did);
+        execute_tool_payment(
+            adapter.as_ref(),
+            policy,
+            econ.context_id,
+            invoker_did,
+            remaining,
+        )
+        .await?;
+    }
 
     // 5. Execute the tool with timeout.
     let effective_timeout = timeout_ms.unwrap_or(DEFAULT_TIMEOUT_MS).min(MAX_TIMEOUT_MS);
@@ -413,6 +435,21 @@ where
         .map(|econ| economy_pre_check(econ, invoker_did))
         .transpose()?;
 
+    // 4b. Payment flow (#1537): 9-step paid action for tool invocations.
+    if let Some(ref econ) = economy
+        && let (Some(adapter), Some(policy)) = (&econ.payment_adapter, econ.economic_policy)
+    {
+        let remaining = econ.budget_tracker.remaining(invoker_did);
+        execute_tool_payment(
+            adapter.as_ref(),
+            policy,
+            econ.context_id,
+            invoker_did,
+            remaining,
+        )
+        .await?;
+    }
+
     // 5. Execute with timeout and cancellation.
     let effective_timeout = timeout_ms.unwrap_or(DEFAULT_TIMEOUT_MS).min(MAX_TIMEOUT_MS);
     let timeout_duration = Duration::from_millis(u64::from(effective_timeout));
@@ -573,6 +610,153 @@ pub fn check_tool_ucan_composition(
     .map_err(|e| InvocationError::ExecutionFailed {
         message: format!("UCAN spending composition check failed: {e}"),
     })
+}
+
+// ---------------------------------------------------------------------------
+// Payment flow for tool invocations (#1537)
+// ---------------------------------------------------------------------------
+
+/// Wrapper that bridges `&dyn PaymentAdapterDyn` to `PaymentAdapter` for the
+/// generic `prepare_paid_action` / `process_paid_action` functions.
+struct ToolPaymentBridge<'a>(&'a dyn crate::economy::adapter::PaymentAdapterDyn);
+
+#[allow(clippy::similar_names)] // payer/payee is the domain language
+impl crate::economy::adapter::PaymentAdapter for ToolPaymentBridge<'_> {
+    fn adapter_id(&self) -> &str {
+        self.0.adapter_id()
+    }
+    fn capabilities(&self) -> crate::economy::adapter::AdapterCapabilities {
+        self.0.capabilities()
+    }
+    async fn authorize(
+        &self,
+        payer: &DID,
+        payee: &DID,
+        amount: scp_protocol::economy::types::Amount,
+        currency: scp_protocol::economy::types::CurrencyCode,
+        metadata: crate::economy::adapter::PaymentMetadata,
+    ) -> Result<crate::economy::adapter::PaymentAuthorization, crate::economy::adapter::PaymentError>
+    {
+        self.0
+            .authorize_dyn(payer, payee, amount, currency, metadata)
+            .await
+    }
+    async fn capture(
+        &self,
+        auth: &crate::economy::adapter::PaymentAuthorization,
+    ) -> Result<crate::economy::adapter::PaymentReceipt, crate::economy::adapter::PaymentError>
+    {
+        self.0.capture_dyn(auth).await
+    }
+    async fn void(
+        &self,
+        auth: &crate::economy::adapter::PaymentAuthorization,
+    ) -> Result<(), crate::economy::adapter::PaymentError> {
+        self.0.void_dyn(auth).await
+    }
+    async fn verify_authorization(
+        &self,
+        auth: &crate::economy::adapter::PaymentAuthorization,
+    ) -> Result<(), crate::economy::adapter::PaymentError> {
+        self.0.verify_authorization_dyn(auth).await
+    }
+    async fn verify(
+        &self,
+        receipt: &crate::economy::adapter::PaymentReceipt,
+    ) -> Result<crate::economy::adapter::VerificationResult, crate::economy::adapter::PaymentError>
+    {
+        self.0.verify_dyn(receipt).await
+    }
+    async fn refund(
+        &self,
+        receipt: &crate::economy::adapter::PaymentReceipt,
+        amount: Option<scp_protocol::economy::types::Amount>,
+    ) -> Result<crate::economy::adapter::RefundConfirmation, crate::economy::adapter::PaymentError>
+    {
+        self.0.refund_dyn(receipt, amount).await
+    }
+}
+
+/// Executes the 9-step payment flow for tool invocations (#1537, spec §19.2.2).
+///
+/// Called from `invoke_tool` after the economy pre-check (budget + UCAN
+/// composition) but before tool execution. Uses the adapter from
+/// `ToolEconomyContext::payment_adapter`. Skips if no economic policy or
+/// zero cost.
+///
+/// # Errors
+///
+/// Returns [`InvocationError::BudgetExceeded`] on any payment flow failure.
+async fn execute_tool_payment(
+    adapter: &dyn crate::economy::adapter::PaymentAdapterDyn,
+    policy: &scp_protocol::economy::types::EconomicPolicy,
+    context_id: &str,
+    invoker_did: &DID,
+    budget_remaining: scp_protocol::economy::types::Amount,
+) -> Result<(), InvocationError> {
+    let metrics = scp_protocol::economy::policy::ObservableMetrics {
+        member_count: 0,
+        context_message_rate: 0,
+        relay_queue_depth: 0,
+        time_of_day: 0,
+        sender_velocity: 0,
+        storage_usage: 0,
+    };
+
+    let cost = scp_protocol::economy::policy::evaluate_cost(
+        policy,
+        &scp_protocol::economy::types::PaidActionType::ToolInvoke,
+        &metrics,
+    );
+    let Some(cost) = cost.filter(|c| c.0 > 0) else {
+        return Ok(());
+    };
+
+    let bridge = ToolPaymentBridge(adapter);
+    let metadata = crate::economy::adapter::PaymentMetadata {
+        action_type: scp_protocol::economy::types::PaidActionType::ToolInvoke,
+        context_id: Some(context_id.to_owned()),
+        idempotency_key: *uuid::Uuid::new_v4().as_bytes(),
+    };
+
+    // Steps 1-4: Prepare (evaluate cost + authorize).
+    let prepared = crate::economy::integration::prepare_paid_action(
+        &bridge,
+        Some(policy),
+        scp_protocol::economy::types::PaidActionType::ToolInvoke,
+        invoker_did,
+        Some(context_id.to_owned()),
+        &metrics,
+        metadata,
+        Vec::new(),
+    )
+    .await
+    .map_err(|_| InvocationError::BudgetExceeded {
+        did: invoker_did.to_string(),
+        cost: cost.0,
+        remaining: budget_remaining.0,
+    })?;
+
+    // Steps 5-8: Process (verify auth + capture).
+    let _processed = crate::economy::integration::process_paid_action(
+        &bridge,
+        Some(policy),
+        &prepared.envelope,
+        &metrics,
+        |payload| async move { Ok(payload) },
+    )
+    .await
+    .map_err(|_| InvocationError::BudgetExceeded {
+        did: invoker_did.to_string(),
+        cost: cost.0,
+        remaining: budget_remaining.0,
+    })?;
+
+    // Receipt verification is done by the ContextManager layer
+    // (verify_payment_receipts) which has access to the event log.
+    // The invoke_tool function does not have event log access.
+
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
