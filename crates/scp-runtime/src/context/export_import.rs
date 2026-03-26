@@ -184,7 +184,12 @@ pub fn verify_merkle_chain(event_log_data: &[u8]) -> Result<[u8; 32], ContextErr
         }
 
         // Verify self-hash correctness.
-        let expected_hash = compute_entry_hash(&entry.event, entry.timestamp, &entry.prev_hash);
+        let expected_hash = compute_entry_hash(
+            &entry.event,
+            &entry.actor_did,
+            entry.timestamp,
+            &entry.prev_hash,
+        );
         if !bool::from(entry.hash.ct_eq(&expected_hash)) {
             return Err(ContextError::EventLogFailed(format!(
                 "Merkle chain broken at entry {i}: hash mismatch"
@@ -197,7 +202,7 @@ pub fn verify_merkle_chain(event_log_data: &[u8]) -> Result<[u8; 32], ContextErr
 
 /// Computes the SHA-256 hash for an event log entry.
 ///
-/// Hash input: `"SCP-EXPORT-ENTRY-V1:" || event_bytes || timestamp_be_bytes || prev_hash`
+/// Hash input: `"SCP-EXPORT-ENTRY:" || event_bytes || actor_did_bytes || timestamp_be_bytes || prev_hash`
 ///
 /// Uses big-endian for the timestamp to match codebase convention, and a
 /// domain separator to prevent cross-protocol hash confusion.
@@ -205,10 +210,16 @@ pub fn verify_merkle_chain(event_log_data: &[u8]) -> Result<[u8; 32], ContextErr
 /// This must be identical to
 /// [`providers::event_log::compute_entry_hash`](super::providers::event_log)
 /// to ensure verification produces the same hashes.
-fn compute_entry_hash(event: &str, timestamp: u64, prev_hash: &[u8; 32]) -> [u8; 32] {
+fn compute_entry_hash(
+    event: &str,
+    actor_did: &str,
+    timestamp: u64,
+    prev_hash: &[u8; 32],
+) -> [u8; 32] {
     let mut hasher = Sha256::new();
-    hasher.update(b"SCP-EXPORT-ENTRY-V1:");
+    hasher.update(b"SCP-EXPORT-ENTRY:");
     hasher.update(event.as_bytes());
+    hasher.update(actor_did.as_bytes());
     hasher.update(timestamp.to_be_bytes());
     hasher.update(prev_hash);
     let result = hasher.finalize();

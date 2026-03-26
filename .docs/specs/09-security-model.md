@@ -1477,7 +1477,7 @@ All domain separators are UTF-8 strings used as prefixes in canonical hash const
 | `"SCP-ABSENT-AGENT-KEY"` | Sentinel for absent `#agent` key in continuity fingerprint — `SHA-256("SCP-ABSENT-AGENT-KEY")` | §9.11 |
 | `"SCP-CHECKPOINT-V1:"` | Event log checkpoint hash | §11 |
 | `"SCP-EVENT-V1:"` | Event log entry hash | §11 |
-| `"SCP-EXPORT-ENTRY-V1:"` | Context export chain hash | §5.13 |
+| `"SCP-EXPORT-ENTRY:"` | Context export chain hash | §5.13 |
 | `"SCP-TOOL-REGISTRATION-V1:"` | Tool registration integrity hash | §6.2 |
 | `"SCP-KEY-DESTRUCTION-V1:"` | Key destruction proof | §9.15 |
 | `"SCP-CLAIM-V1:"` | Shadow identity claim validation | §12.3 |
