@@ -371,6 +371,18 @@ impl ContextManager {
                 )
             }
         };
+        // Payment flow (#1537): execute 9-step payment for message sends.
+        // Runs between Phase 1 (lock) and Phase 2 (encrypt) — outside the lock.
+        // Only triggers when a payment adapter is configured AND cost > 0.
+        // Budget enforcement (evaluate_cost + record_spend) already happened
+        // in enforce_send_economy above (covers free-context budgets).
+        self.execute_paid_action(
+            scp_protocol::economy::types::PaidActionType::MessageSend,
+            sender_did,
+            &context_id,
+        )
+        .await?;
+
         // Phase 2 (no lock): Encrypt + send.
         // If encryption or transport fails, roll back the sequence number
         // consumed in Phase 1 so it is not permanently burned (#1420).

@@ -66,6 +66,7 @@ use tracing::instrument;
 use zeroize::Zeroizing;
 
 mod broadcast;
+mod economy;
 mod governance;
 mod lifecycle;
 mod messaging;
@@ -1262,6 +1263,7 @@ pub struct ContextManagerBuilder {
     persistence: Option<Box<dyn ContextPersistence>>,
     key_resolver: Option<KeyResolver>,
     clock: Option<Arc<dyn Clock>>,
+    payment_adapter: Option<Arc<dyn crate::economy::adapter::PaymentAdapterDyn>>,
 }
 
 impl ContextManagerBuilder {
@@ -1275,6 +1277,7 @@ impl ContextManagerBuilder {
             persistence: None,
             key_resolver: None,
             clock: None,
+            payment_adapter: None,
         }
     }
 
@@ -1329,6 +1332,19 @@ impl ContextManagerBuilder {
     #[must_use]
     pub fn clock(mut self, clock: Arc<dyn Clock>) -> Self {
         self.clock = Some(clock);
+        self
+    }
+
+    /// Sets the payment adapter for the 9-step paid action flow (spec §19.2.2).
+    ///
+    /// If not called, paid action entry points skip the payment rail
+    /// integration while still enforcing budget tracking.
+    #[must_use]
+    pub fn payment_adapter(
+        mut self,
+        adapter: Arc<dyn crate::economy::adapter::PaymentAdapterDyn>,
+    ) -> Self {
+        self.payment_adapter = Some(adapter);
         self
     }
 
@@ -1392,6 +1408,7 @@ impl ContextManagerBuilder {
             None => ContextManager::new(crypto, transport, event_log, key_resolver),
         };
         manager.clock = clock;
+        manager.payment_adapter = self.payment_adapter;
         Ok(manager)
     }
 }
@@ -1481,6 +1498,15 @@ pub struct ContextManager {
     /// the context handle lives in [`Self::contexts`]. This map tracks which
     /// peers have standing contexts without duplicating handle storage.
     standing_contexts: Mutex<HashMap<String, DID>>,
+    /// Optional payment adapter for the 9-step paid action flow (spec §19.2.2).
+    ///
+    /// When `Some`, `execute_paid_action` runs the full authorize→capture→verify
+    /// flow via this adapter. When `None`, paid action entry points skip payment
+    /// (free context) while still enforcing budget tracking via `evaluate_cost`
+    /// and `record_spend`.
+    ///
+    /// Set via [`set_payment_adapter`](Self::set_payment_adapter) or the builder.
+    payment_adapter: Option<Arc<dyn crate::economy::adapter::PaymentAdapterDyn>>,
 }
 
 // Nursery lint — false-positives on async functions holding tokio::sync::MutexGuard
@@ -1515,6 +1541,7 @@ impl ContextManager {
             key_resolver,
             clock: Arc::new(scp_primitives::SystemClock),
             standing_contexts: Mutex::new(HashMap::new()),
+            payment_adapter: None,
         }
     }
 
@@ -1550,6 +1577,7 @@ impl ContextManager {
             key_resolver,
             clock: Arc::new(scp_primitives::SystemClock),
             standing_contexts: Mutex::new(HashMap::new()),
+            payment_adapter: None,
         }
     }
 

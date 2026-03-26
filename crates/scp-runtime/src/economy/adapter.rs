@@ -376,6 +376,177 @@ impl std::fmt::Display for PaymentError {
 impl std::error::Error for PaymentError {}
 
 // ---------------------------------------------------------------------------
+// PaymentAdapterDyn — object-safe variant
+// ---------------------------------------------------------------------------
+
+/// Object-safe variant of [`PaymentAdapter`] for use with trait objects.
+///
+/// The base [`PaymentAdapter`] trait uses RPITIT (return-position impl trait
+/// in trait), which prevents `dyn PaymentAdapter`. This trait uses boxed
+/// futures instead, enabling `Arc<dyn PaymentAdapterDyn>` storage on
+/// `ContextManager` for the 9-step payment flow (spec §19.2.2).
+///
+/// See also [`super::receipt::PaymentVerifierDyn`] for the verification-only
+/// counterpart.
+pub trait PaymentAdapterDyn: Send + Sync {
+    /// Returns the unique identifier for this adapter.
+    fn adapter_id(&self) -> &str;
+
+    /// Returns the capabilities of this adapter.
+    fn capabilities(&self) -> AdapterCapabilities;
+
+    /// Authorizes (reserves) a payment from `payer` to `payee`.
+    fn authorize_dyn<'a>(
+        &'a self,
+        payer: &'a DID,
+        payee: &'a DID,
+        amount: Amount,
+        currency: CurrencyCode,
+        metadata: PaymentMetadata,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<Output = Result<PaymentAuthorization, PaymentError>>
+                + Send
+                + 'a,
+        >,
+    >;
+
+    /// Captures (settles) a previously authorized payment.
+    fn capture_dyn<'a>(
+        &'a self,
+        auth: &'a PaymentAuthorization,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<PaymentReceipt, PaymentError>> + Send + 'a>,
+    >;
+
+    /// Voids (cancels) a previously authorized payment.
+    fn void_dyn<'a>(
+        &'a self,
+        auth: &'a PaymentAuthorization,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), PaymentError>> + Send + 'a>>;
+
+    /// Verifies a [`PaymentAuthorization`] is authentic and still valid.
+    fn verify_authorization_dyn<'a>(
+        &'a self,
+        auth: &'a PaymentAuthorization,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), PaymentError>> + Send + 'a>>;
+
+    /// Verifies a payment receipt against the payment rail.
+    fn verify_dyn<'a>(
+        &'a self,
+        receipt: &'a PaymentReceipt,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<VerificationResult, PaymentError>> + Send + 'a>,
+    >;
+
+    /// Refunds a previously captured payment.
+    fn refund_dyn<'a>(
+        &'a self,
+        receipt: &'a PaymentReceipt,
+        amount: Option<Amount>,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<RefundConfirmation, PaymentError>> + Send + 'a>,
+    >;
+}
+
+/// Blanket impl: every [`PaymentAdapter`] is also [`PaymentAdapterDyn`].
+#[allow(clippy::similar_names)] // payer/payee is the domain language
+impl<T: PaymentAdapter> PaymentAdapterDyn for T {
+    fn adapter_id(&self) -> &str {
+        PaymentAdapter::adapter_id(self)
+    }
+
+    fn capabilities(&self) -> AdapterCapabilities {
+        PaymentAdapter::capabilities(self)
+    }
+
+    fn authorize_dyn<'a>(
+        &'a self,
+        payer: &'a DID,
+        payee: &'a DID,
+        amount: Amount,
+        currency: CurrencyCode,
+        metadata: PaymentMetadata,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<Output = Result<PaymentAuthorization, PaymentError>>
+                + Send
+                + 'a,
+        >,
+    > {
+        Box::pin(PaymentAdapter::authorize(
+            self, payer, payee, amount, currency, metadata,
+        ))
+    }
+
+    fn capture_dyn<'a>(
+        &'a self,
+        auth: &'a PaymentAuthorization,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<PaymentReceipt, PaymentError>> + Send + 'a>,
+    > {
+        Box::pin(PaymentAdapter::capture(self, auth))
+    }
+
+    fn void_dyn<'a>(
+        &'a self,
+        auth: &'a PaymentAuthorization,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), PaymentError>> + Send + 'a>>
+    {
+        Box::pin(PaymentAdapter::void(self, auth))
+    }
+
+    fn verify_authorization_dyn<'a>(
+        &'a self,
+        auth: &'a PaymentAuthorization,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), PaymentError>> + Send + 'a>>
+    {
+        Box::pin(PaymentAdapter::verify_authorization(self, auth))
+    }
+
+    fn verify_dyn<'a>(
+        &'a self,
+        receipt: &'a PaymentReceipt,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<VerificationResult, PaymentError>> + Send + 'a>,
+    > {
+        Box::pin(PaymentAdapter::verify(self, receipt))
+    }
+
+    fn refund_dyn<'a>(
+        &'a self,
+        receipt: &'a PaymentReceipt,
+        amount: Option<Amount>,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<RefundConfirmation, PaymentError>> + Send + 'a>,
+    > {
+        Box::pin(PaymentAdapter::refund(self, receipt, amount))
+    }
+}
+
+/// Wrapper that bridges [`PaymentAdapterDyn`] to [`super::receipt::PaymentVerifierDyn`].
+///
+/// Since `dyn PaymentAdapterDyn` cannot directly implement `PaymentVerifierDyn`
+/// (blanket impls would conflict for concrete types), this newtype wrapper
+/// provides the bridge. Used by [`super::super::context::manager::ContextManager::verify_payment_receipts`].
+pub struct AdapterAsVerifier<'a>(pub &'a dyn PaymentAdapterDyn);
+
+impl super::receipt::PaymentVerifierDyn for AdapterAsVerifier<'_> {
+    fn adapter_id(&self) -> &str {
+        self.0.adapter_id()
+    }
+
+    fn verify_dyn<'a>(
+        &'a self,
+        receipt: &'a PaymentReceipt,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<VerificationResult, PaymentError>> + Send + 'a>,
+    > {
+        self.0.verify_dyn(receipt)
+    }
+}
+
+// ---------------------------------------------------------------------------
 // NoOpPaymentAdapter — used for governance actions that wire the payment
 // flow but don't have a real adapter injected.
 // ---------------------------------------------------------------------------

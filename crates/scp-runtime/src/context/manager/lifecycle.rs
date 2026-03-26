@@ -1279,9 +1279,16 @@ impl ContextManager {
             }
         }
 
-        // (No paid-action flow here — the 9-step payment integration
-        // requires a real PaymentAdapter injected via ContextManager, not a
-        // hardcoded NoOpPaymentAdapter. Tracked by #1537.)
+        // Payment flow (#1537): execute 9-step payment for context joins.
+        // Runs before the lock acquisition so async adapter calls don't hold
+        // the contexts mutex. Budget enforcement (evaluate_cost + record_spend)
+        // happens inside enforce_join_economy below (covers free-context budgets).
+        self.execute_paid_action(
+            scp_protocol::economy::types::PaidActionType::ContextJoin,
+            &member_did,
+            &context_id,
+        )
+        .await?;
 
         // Atomic state check + mutation: verify Active, then role assignment +
         // membership + event buffer, all within a single lock acquisition.

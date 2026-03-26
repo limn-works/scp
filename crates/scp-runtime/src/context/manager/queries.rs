@@ -1,8 +1,8 @@
 //! Simple queries and local DID management.
 
 use super::{
-    Capability, ContextError, ContextEvent, ContextEventLogProvider, ContextManager, ContextParams,
-    ContextRoleState, DID, RoleAssignment, Zeroizing, instrument,
+    Arc, Capability, ContextError, ContextEvent, ContextEventLogProvider, ContextManager,
+    ContextParams, ContextRoleState, DID, RoleAssignment, Zeroizing, instrument,
 };
 
 #[allow(clippy::significant_drop_tightening)]
@@ -20,6 +20,21 @@ impl ContextManager {
     #[instrument(skip_all)]
     pub async fn register_local_did(&self, did: DID) {
         self.local_dids.write().await.insert(did);
+    }
+
+    /// Sets the payment adapter for the 9-step paid action flow (spec §19.2.2).
+    ///
+    /// When set, `execute_paid_action` runs the full authorize→capture→verify
+    /// sequence for each paid entry point (`send_message`, `join_context`,
+    /// `invoke_tool`). When `None`, those entry points still enforce budget
+    /// tracking but skip the payment rail integration.
+    ///
+    /// Can be called at any time; takes effect for subsequent actions.
+    pub fn set_payment_adapter(
+        &mut self,
+        adapter: Arc<dyn crate::economy::adapter::PaymentAdapterDyn>,
+    ) {
+        self.payment_adapter = Some(adapter);
     }
 
     /// Returns `true` if the given DID is registered as locally controlled.
