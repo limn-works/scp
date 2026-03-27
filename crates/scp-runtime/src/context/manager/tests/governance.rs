@@ -4793,7 +4793,11 @@ async fn test_remove_member_sender_key_before_mls_removal() {
         ) -> Result<scp_protocol::context::builder::AddMemberOutput, ContextError> {
             self.inner.add_member(ctx, did, kp)
         }
-        fn remove_member(&self, ctx: &[u8; 32], did: &str) -> Result<(), ContextError> {
+        fn remove_member(
+            &self,
+            ctx: &[u8; 32],
+            did: &str,
+        ) -> Result<scp_protocol::context::builder::RemoveMemberOutput, ContextError> {
             self.log
                 .lock()
                 .unwrap()
@@ -4826,7 +4830,10 @@ async fn test_remove_member_sender_key_before_mls_removal() {
         ) -> Result<Option<scp_protocol::context::builder::OpenedEnvelope>, ContextError> {
             self.inner.open(ctx, bytes)
         }
-        fn advance_epoch(&self, ctx: &[u8; 32]) -> Result<(), ContextError> {
+        fn advance_epoch(
+            &self,
+            ctx: &[u8; 32],
+        ) -> Result<scp_protocol::context::builder::AdvanceEpochOutput, ContextError> {
             self.inner.advance_epoch(ctx)
         }
     }

@@ -905,8 +905,12 @@ impl scp_core::context::builder::ContextCryptoProvider for DemoCrypto {
     ) -> Result<scp_core::context::AddMemberOutput, scp_core::context::ContextError> {
         Ok(scp_core::context::AddMemberOutput::default())
     }
-    fn remove_member(&self, _: &[u8; 32], _: &str) -> Result<(), scp_core::context::ContextError> {
-        Ok(())
+    fn remove_member(
+        &self,
+        _: &[u8; 32],
+        _: &str,
+    ) -> Result<scp_core::context::RemoveMemberOutput, scp_core::context::ContextError> {
+        Ok(scp_core::context::RemoveMemberOutput::default())
     }
     fn distribute_sender_key(
         &self,

@@ -366,8 +366,12 @@ impl ContextCryptoProvider for NoOpCryptoProvider {
     ) -> Result<scp_core::context::AddMemberOutput, ContextError> {
         Ok(scp_core::context::AddMemberOutput::default())
     }
-    fn remove_member(&self, _context_id: &[u8; 32], _member_did: &str) -> Result<(), ContextError> {
-        Ok(())
+    fn remove_member(
+        &self,
+        _context_id: &[u8; 32],
+        _member_did: &str,
+    ) -> Result<scp_core::context::RemoveMemberOutput, ContextError> {
+        Ok(scp_core::context::RemoveMemberOutput::default())
     }
     fn distribute_sender_key(
         &self,

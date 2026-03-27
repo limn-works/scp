@@ -1995,7 +1995,7 @@ impl ContextManager {
     ) -> Result<(), ContextError> {
         let context_id_bytes = context_id_to_bytes(context_id);
 
-        let snapshot = {
+        let (remove_output, snapshot) = {
             let mut contexts = self.contexts.lock().await;
             let ctx = contexts
                 .get_mut(context_id)
@@ -2016,7 +2016,8 @@ impl ContextManager {
 
             // Crypto: remove from MLS group under lock to prevent TOCTOU
             // race (concurrent remove of same DID).
-            self.crypto
+            let remove_output = self
+                .crypto
                 .remove_member(&context_id_bytes, did)
                 .map_err(|e| ContextError::MembershipFailed(e.to_string()))?;
 
@@ -2042,12 +2043,32 @@ impl ContextManager {
                 member_did: did.clone(),
             });
 
-            if self.has_persistence() {
-                Some(Self::snapshot_context(ctx))
-            } else {
-                None
-            }
+            (
+                remove_output,
+                if self.has_persistence() {
+                    Some(Self::snapshot_context(ctx))
+                } else {
+                    None
+                },
+            )
         };
+
+        // Broadcast the MLS Commit to remaining members so they can
+        // advance their group epoch and ratchet key material.
+        if !remove_output.commit_bytes.is_empty() {
+            let routing_id = scp_protocol::context::context_routing_id(context_id);
+            if let Err(e) = self
+                .transport
+                .send_message(&routing_id, &remove_output.commit_bytes)
+            {
+                tracing::warn!(
+                    context_id = %context_id,
+                    error = %e,
+                    "failed to broadcast remove_member MLS Commit — \
+                     remaining members may not advance epoch"
+                );
+            }
+        }
 
         // Drain pending sender key distribution messages queued by
         // rotate_sender_key and deliver via transport (§9.16.2).
@@ -2958,13 +2979,31 @@ impl ContextManager {
         }
         // Member reset = leave + immediately re-join (ADR-029 §Tier 3).
         // Step 1: Remove from MLS group (destroys stale leaf node).
-        self.crypto
+        let remove_output = self
+            .crypto
             .remove_member(&context_id_bytes, did)
             .map_err(|e| ContextError::MembershipFailed(e.to_string()))?;
         // Step 2: Re-add to MLS group with fresh key material.
-        self.crypto
+        let add_output = self
+            .crypto
             .add_member(&context_id_bytes, did, None)
             .map_err(|e| ContextError::MembershipFailed(e.to_string()))?;
+
+        // Broadcast the MLS Commits so remaining members can process
+        // the remove and re-add epoch changes.
+        let routing_id = scp_protocol::context::context_routing_id(context_id);
+        for commit_bytes in [&remove_output.commit_bytes, &add_output.commit_bytes] {
+            if !commit_bytes.is_empty()
+                && let Err(e) = self.transport.send_message(&routing_id, commit_bytes)
+            {
+                tracing::warn!(
+                    context_id = %context_id,
+                    error = %e,
+                    "failed to broadcast member reset MLS Commit"
+                );
+            }
+        }
+
         self.event_log
             .append_context_event(&context_id_bytes, "MemberReset", actor_did)?;
 
@@ -3363,24 +3402,25 @@ impl ContextManager {
     ) -> Result<(), ContextError> {
         let context_id_bytes = context_id_to_bytes(context_id);
 
-        let (snapshot, bc_snapshot) = {
+        let (epoch_output, snapshot, bc_snapshot) = {
             let mut contexts = self.contexts.lock().await;
             let ctx = contexts
                 .get_mut(context_id)
                 .ok_or_else(|| ContextError::ContextNotRegistered(context_id.to_owned()))?;
             require_active(&ctx.handle)?;
 
-            let bc_snap = if let Some(ref mut bc) = ctx.broadcast_context {
+            let (epoch_out, bc_snap) = if let Some(ref mut bc) = ctx.broadcast_context {
                 // Rotate every author's broadcast key (epoch advance + new key).
                 bc.rotate_all_author_keys()?;
-                if self.has_persistence() {
+                let snap = if self.has_persistence() {
                     Some(bc.to_snapshot())
                 } else {
                     None
-                }
+                };
+                (None, snap)
             } else {
                 // Encrypted mode: advance MLS epoch via propose_update (#1548).
-                self.crypto.advance_epoch(&context_id_bytes)?;
+                let epoch_out = self.crypto.advance_epoch(&context_id_bytes)?;
 
                 // Encrypted mode: regenerate per-member access keys at a new
                 // epoch (§9.17.2 step 6, ADR-038). MLS key rotation and access
@@ -3407,7 +3447,7 @@ impl ContextManager {
                     let did = new_key.member_did().to_owned();
                     ctx.access.access_key_store.set(context_id, &did, new_key);
                 }
-                None
+                (Some(epoch_out), None)
             };
 
             // Emit content keys rotated event to receive buffer.
@@ -3420,8 +3460,25 @@ impl ContextManager {
             } else {
                 None
             };
-            (snap, bc_snap)
+            (epoch_out, snap, bc_snap)
         };
+
+        // Broadcast the MLS epoch advance Commit to all members (encrypted mode).
+        if let Some(ref epoch_out) = epoch_output
+            && !epoch_out.commit_bytes.is_empty()
+        {
+            let routing_id = scp_protocol::context::context_routing_id(context_id);
+            if let Err(e) = self
+                .transport
+                .send_message(&routing_id, &epoch_out.commit_bytes)
+            {
+                tracing::warn!(
+                    context_id = %context_id,
+                    error = %e,
+                    "failed to broadcast epoch advance MLS Commit for content key rotation"
+                );
+            }
+        }
 
         if let Some(snapshot) = snapshot {
             self.persist_context_snapshot(context_id, snapshot);

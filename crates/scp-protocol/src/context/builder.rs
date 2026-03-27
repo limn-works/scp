@@ -80,6 +80,35 @@ pub struct AddMemberOutput {
     pub commit_bytes: Vec<u8>,
 }
 
+// ---------------------------------------------------------------------------
+// RemoveMemberOutput
+// ---------------------------------------------------------------------------
+
+/// Output of a successful `remove_member` operation on a crypto provider.
+#[derive(Debug, Clone, Default)]
+pub struct RemoveMemberOutput {
+    /// TLS-serialized MLS Commit message that advances the group epoch.
+    /// Must be distributed to all remaining group members so they ratchet
+    /// to new key material. Empty for non-MLS providers.
+    pub commit_bytes: Vec<u8>,
+    /// Optional TLS-serialized `GroupInfo` for external joins.
+    /// Empty for non-MLS providers.
+    pub group_info_bytes: Vec<u8>,
+}
+
+// ---------------------------------------------------------------------------
+// AdvanceEpochOutput
+// ---------------------------------------------------------------------------
+
+/// Output of a successful `advance_epoch` operation on a crypto provider.
+#[derive(Debug, Clone, Default)]
+pub struct AdvanceEpochOutput {
+    /// TLS-serialized MLS Commit message (Update + self-Commit) that
+    /// advances the group epoch. Must be distributed to all group members
+    /// so they ratchet to new key material. Empty for non-MLS providers.
+    pub commit_bytes: Vec<u8>,
+}
+
 /// Trait for MLS-backed context crypto operations (create group, add/remove member, encrypt/decrypt).
 pub trait ContextCryptoProvider: Send + Sync {
     /// Validates that the creator's identity is valid and the signing key is
@@ -181,10 +210,18 @@ pub trait ContextCryptoProvider: Send + Sync {
 
     /// Removes a member from the MLS group (ADR-001 `remove_member()`).
     ///
+    /// Returns a [`RemoveMemberOutput`] containing the TLS-serialized MLS
+    /// Commit (for remaining members to process). Non-MLS providers return
+    /// `RemoveMemberOutput::default()` (empty bytes).
+    ///
     /// # Errors
     ///
     /// Returns [`ContextError::CryptoFailed`] if the MLS operation fails.
-    fn remove_member(&self, context_id: &[u8; 32], member_did: &str) -> Result<(), ContextError>;
+    fn remove_member(
+        &self,
+        context_id: &[u8; 32],
+        member_did: &str,
+    ) -> Result<RemoveMemberOutput, ContextError>;
 
     /// Distributes sender key bundle to a new member via ADR-007.
     ///
@@ -379,14 +416,17 @@ pub trait ContextCryptoProvider: Send + Sync {
     /// a new epoch with fresh key material. After this call, the compromised
     /// old epoch key is useless for future messages.
     ///
-    /// The default implementation is a no-op (`Ok(())`) so that mock and
-    /// test providers compile without changes.
+    /// Returns an [`AdvanceEpochOutput`] containing the TLS-serialized MLS
+    /// Commit message that must be distributed to all group members.
+    ///
+    /// The default implementation is a no-op returning empty output so that
+    /// mock and test providers compile without changes.
     ///
     /// # Errors
     ///
     /// Returns [`ContextError::CryptoFailed`] if the MLS update/commit fails.
-    fn advance_epoch(&self, _context_id: &[u8; 32]) -> Result<(), ContextError> {
-        Ok(())
+    fn advance_epoch(&self, _context_id: &[u8; 32]) -> Result<AdvanceEpochOutput, ContextError> {
+        Ok(AdvanceEpochOutput::default())
     }
 
     // -- Persistence operations (§23.11, #645) ------------------------------

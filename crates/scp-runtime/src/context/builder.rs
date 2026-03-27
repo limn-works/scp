@@ -16,7 +16,8 @@ use scp_protocol::context::templates::validate_against_template;
 use scp_protocol::context::{ContextError, ContextMode, ContextParams, ContextState};
 
 pub use scp_protocol::context::builder::{
-    AddMemberOutput, ContextCreationError, ContextCryptoProvider, OpenedEnvelope,
+    AddMemberOutput, AdvanceEpochOutput, ContextCreationError, ContextCryptoProvider,
+    OpenedEnvelope, RemoveMemberOutput,
 };
 
 /// Provides transport operations needed during context creation.
@@ -785,8 +786,8 @@ mod tests {
             &self,
             _context_id: &[u8; 32],
             _member_did: &str,
-        ) -> Result<(), ContextError> {
-            Ok(())
+        ) -> Result<RemoveMemberOutput, ContextError> {
+            Ok(RemoveMemberOutput::default())
         }
 
         fn distribute_sender_key(
