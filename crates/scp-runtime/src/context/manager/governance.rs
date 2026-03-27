@@ -77,12 +77,10 @@ fn enforce_role_demotion(
 /// file (pipeline wiring gates), use [`evaluate_consequence_rules`] +
 /// [`enforce_triggered_consequences`] directly.
 ///
-/// **Known limitation:** Time-based consequences (rules that should trigger
-/// after a duration of inactivity) require a dedicated periodic evaluation
-/// timer. Currently, consequences are only evaluated when an action occurs
-/// (send, join, tool invoke, governance). A member who stops participating
-/// entirely will not trigger inactivity-based consequences until their
-/// next action or the governance timeout task processes them. See #1600.
+/// Time-based consequences (rules that should trigger after a duration of
+/// inactivity) are also evaluated by the governance timeout task's periodic
+/// tick (Phase 4 in [`start_governance_timeout_task`](ContextManager::start_governance_timeout_task)),
+/// so they fire even when no user action occurs (#1531).
 pub(super) fn dispatch_consequences(
     ctx: &mut PerContextState,
     context_id: &str,
@@ -105,8 +103,9 @@ pub(super) fn dispatch_consequences(
     let triggered: Vec<TriggeredConsequence> =
         evaluate_consequence_rules(&rules, &events, member_did.as_ref(), now);
 
-    // Enforce the triggered consequences.
-    enforce_triggered_consequences(ctx, context_id, member_did, now, &triggered, clock);
+    // Enforce the triggered consequences, passing the already-cloned rules
+    // to avoid cloning again inside enforce_triggered_consequences.
+    enforce_triggered_consequences(ctx, context_id, member_did, now, &triggered, &rules, clock);
 }
 
 /// Enforces a set of pre-evaluated triggered consequences.
@@ -114,16 +113,19 @@ pub(super) fn dispatch_consequences(
 /// Separated from [`dispatch_consequences`] so callers that need
 /// `evaluate_consequence_rules` visible in their own file (for pipeline
 /// wiring AST gates) can call evaluate + enforce as two distinct steps.
+///
+/// The `rules` parameter should be the same slice used for evaluation.
+/// When called from `dispatch_consequences`, the already-cloned rules are
+/// passed to avoid a second clone.
 pub(super) fn enforce_triggered_consequences(
     ctx: &mut PerContextState,
     context_id: &str,
     member_did: &DID,
     now: u64,
     triggered: &[TriggeredConsequence],
+    rules: &[ConsequenceRule],
     clock: &dyn scp_primitives::Clock,
 ) {
-    let rules: Vec<ConsequenceRule> = ctx.governance.consequence_rules.clone();
-
     for consequence in triggered {
         // Cooldown tracking: skip if this rule fired within its window.
         if let Some(&last_fired) = ctx.governance.cooldown_until.get(&consequence.rule_index)
@@ -162,7 +164,10 @@ pub(super) fn enforce_triggered_consequences(
                 enforce_capability_suspension(ctx, member_did, caps)
             }
             scp_protocol::trust::consequence::ConsequenceAction::AccessRevocation => {
-                // Revoke all access: block both read and write.
+                // AccessRevocation is application-level enforcement only.
+                // For cryptographic exclusion, dispatch a RemoveMember
+                // governance action which performs MLS group removal and
+                // sender key rotation.
                 ctx.access.write_revoked_members.insert(member_did.clone());
                 ctx.access.read_revoked_members.insert(member_did.clone());
                 true
@@ -340,29 +345,45 @@ fn check_standing(
     // Refresh participation record from recent events before checking standing (#1530).
     let context_id = ctx.handle.context_id().to_owned();
     let events = event_log_entries_for_consequences(ctx, &context_id, now, event_log);
-    if !events.is_empty()
-        && let Ok(record) = scp_protocol::trust::participation::compute_participation_record(
+    if !events.is_empty() {
+        match scp_protocol::trust::participation::compute_participation_record(
             &events,
             proposer_did.as_ref(),
             &context_id,
             [0u8; 32],
             now,
-        )
-    {
-        // Standing evaluation uses participation_count and governance_actions
-        // to determine if the member has sufficient standing (#1530).
-        // Only cache records with actual participation — new members with
-        // zero participation should not be blocked before they participate.
-        if record.participation_count > 0 {
-            tracing::trace!(
-                participation_count = record.participation_count,
-                governance_actions_by = record.governance_actions_by.len(),
-                governance_actions_against = record.governance_actions_against.len(),
-                "standing evaluation for proposer"
-            );
-            ctx.governance
-                .participation_cache
-                .insert(proposer_did.to_string(), record);
+        ) {
+            Err(e) => {
+                // Fail-closed: if participation record computation fails,
+                // log a warning and deny the proposal. This prevents
+                // silently passing members with corrupted standing data.
+                tracing::warn!(
+                    proposer = %proposer_did,
+                    error = %e,
+                    "compute_participation_record failed — denying proposal"
+                );
+                return Err(ContextError::PermissionDenied(
+                    "SCP-GOV-5021: participation record computation failed — cannot verify standing"
+                        .into(),
+                ));
+            }
+            Ok(record) => {
+                // Standing evaluation uses participation_count and governance_actions
+                // to determine if the member has sufficient standing (#1530).
+                // Only cache records with actual participation — new members with
+                // zero participation should not be blocked before they participate.
+                if record.participation_count > 0 {
+                    tracing::trace!(
+                        participation_count = record.participation_count,
+                        governance_actions_by = record.governance_actions_by.len(),
+                        governance_actions_against = record.governance_actions_against.len(),
+                        "standing evaluation for proposer"
+                    );
+                    ctx.governance
+                        .participation_cache
+                        .insert(proposer_did.to_string(), record);
+                }
+            }
         }
     }
 
@@ -609,6 +630,7 @@ impl ContextManager {
                 );
 
                 // Update participation record after governance action (#1530).
+                // Reuse the same event log entries for participation (finding #46).
                 let gov_events = event_log_entries_for_consequences(
                     ctx,
                     context_id,
@@ -4169,12 +4191,14 @@ impl ContextManager {
     /// 1. Checks active proposals for timeout expiry via `resolve()`.
     /// 2. Detects proposer/voter departures and adjusts tallies.
     /// 3. Detects deadlock conditions and emits recovery events.
+    /// 4. Evaluates consequence rules for all members (#1531).
     ///
     /// The task stops when the context is no longer `Active` or when
     /// cancelled via [`GovernanceTimeoutTask::cancel()`].
     pub(super) async fn start_governance_timeout_task(&self, context_id: &str) {
         let contexts = Arc::clone(&self.contexts);
         let clock = Arc::clone(&self.clock);
+        let event_log = Arc::clone(&self.event_log);
         let ctx_id = context_id.to_owned();
 
         let mut contexts_guard = self.contexts.lock().await;
@@ -4185,9 +4209,11 @@ impl ContextManager {
         ctx.governance.timeout_task.start({
             let ctx_id = ctx_id.clone();
             let clock = Arc::clone(&clock);
+            let event_log = Arc::clone(&event_log);
             move || {
                 let contexts = Arc::clone(&contexts);
                 let clock = Arc::clone(&clock);
+                let event_log = Arc::clone(&event_log);
                 let ctx_id = ctx_id.clone();
                 async move {
                     // Phase 1: Acquire lock, snapshot data, process proposals,
@@ -4292,10 +4318,53 @@ impl ContextManager {
                         }
                     }
 
+                    // Phase 4: Periodic consequence evaluation (#1531).
+                    Self::evaluate_periodic_consequences(&contexts, &ctx_id, &*clock, &*event_log)
+                        .await;
+
                     true // Continue the loop.
                 }
             }
         });
+    }
+
+    /// Phase 4 of the governance timeout task: evaluates consequence rules for
+    /// all members (#1531).
+    ///
+    /// Time-based rules (e.g., "if no messages in 1 hour, downgrade role") must
+    /// fire even when no user action occurs. Evaluates all members on every
+    /// tick. Early return when no rules are configured (the common case).
+    async fn evaluate_periodic_consequences(
+        contexts: &Arc<super::Mutex<super::HashMap<String, PerContextState>>>,
+        ctx_id: &str,
+        clock: &dyn Clock,
+        event_log: &dyn super::super::builder::ContextEventLogProvider,
+    ) {
+        let mut contexts_guard = contexts.lock().await;
+        let Some(ctx) = contexts_guard.get_mut(ctx_id) else {
+            return;
+        };
+        let rules = ctx.governance.consequence_rules.clone();
+        if rules.is_empty() {
+            return;
+        }
+        let now = clock.now_secs();
+        let member_dids: Vec<DID> = ctx.membership.members().map(|m| m.did.clone()).collect();
+        let events = event_log_entries_for_consequences(ctx, ctx_id, now, event_log);
+        for member_did in member_dids {
+            let triggered = evaluate_consequence_rules(&rules, &events, member_did.as_ref(), now);
+            if !triggered.is_empty() {
+                enforce_triggered_consequences(
+                    ctx,
+                    ctx_id,
+                    &member_did,
+                    now,
+                    &triggered,
+                    &rules,
+                    clock,
+                );
+            }
+        }
     }
 
     /// Detects and handles conflicts when a proposal becomes approved (ADR-031 §7).

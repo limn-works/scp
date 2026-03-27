@@ -95,9 +95,10 @@ fn derive_relay_pricing_config(
 
 /// Enforces economic policy for context joins (#1537, #1593).
 ///
-/// Checks auto-accept guard, evaluates join cost, enforces spending UCAN
-/// AND-composition (spec §19.5) when cost > 0, and records spend against
-/// the joiner's budget.
+/// Checks auto-accept guard, then delegates to the unified `enforce_economy`
+/// which evaluates join cost, checks spending UCAN AND-composition (spec
+/// §19.5), and records spend against the joiner's budget. No auto-grant —
+/// budget must be explicitly approved via `ApproveSpend` governance action.
 fn enforce_join_economy(
     ctx: &mut PerContextState,
     joiner_did: &DID,
@@ -111,58 +112,17 @@ fn enforce_join_economy(
             "SCP-ECON-7030: paid context requires explicit acceptance".into(),
         ));
     }
-    if let Some(ref policy) = ctx.governance.economic_policy {
-        let metrics = scp_protocol::economy::policy::ObservableMetrics {
-            member_count: u64::try_from(ctx.membership.count()).unwrap_or(u64::MAX),
-            context_message_rate: ctx.governance.velocity_tracker.aggregate_velocity(now),
-            // relay_queue_depth: Requires relay-level telemetry not available at ContextManager.
-            // See enforce_send_economy in messaging.rs for the full architectural note.
-            relay_queue_depth: 0,
-            time_of_day: now % 86400,
-            // sender_velocity: not tracked per-joiner (velocity is per-sender, join is one-shot)
-            sender_velocity: 0,
-            // storage_usage: Requires storage provider metrics not available at ContextManager.
-            // See enforce_send_economy in messaging.rs for the full architectural note.
-            storage_usage: 0,
-        };
-        if let Some(cost) = scp_protocol::economy::policy::evaluate_cost(
-            policy,
-            &scp_protocol::economy::types::PaidActionType::ContextJoin,
-            &metrics,
-        ) {
-            // AND-composition (§19.5, #1593): paid joins require a spending UCAN.
-            if cost.0 > 0 {
-                if spending_ucan.is_none() {
-                    return Err(ContextError::PermissionDenied(
-                        "SCP-ECON-7060: paid action requires spending UCAN".to_owned(),
-                    ));
-                }
-                scp_protocol::crypto::ucan::spending::check_and_composition(
-                    None, // action UCAN: already verified (join capability check above)
-                    spending_ucan,
-                    scp_protocol::crypto::ucan::spending::Amount(cost.0),
-                    "context:join",
-                )
-                .map_err(|e| ContextError::PermissionDenied(format!("SCP-ECON-7061: {e}")))?;
-            }
-
-            // Auto-grant the exact action cost on first spend if no
-            // governance-approved budget exists. This lets the member
-            // complete the join action but requires governance approval
-            // (ApproveSpend) for further spending.
-            if !ctx.governance.budget_tracker.has_budget(joiner_did) {
-                ctx.governance.budget_tracker.grant(joiner_did, cost);
-            }
-            ctx.governance
-                .budget_tracker
-                .record_spend(joiner_did, cost)
-                .map_err(|e| {
-                    ContextError::PermissionDenied(format!(
-                        "SCP-ECON-7020: budget exceeded on join: {e}"
-                    ))
-                })?;
-        }
-    }
+    super::economy::enforce_economy(
+        ctx.governance.economic_policy.as_ref(),
+        &mut ctx.governance.budget_tracker,
+        &ctx.governance.velocity_tracker,
+        ctx.membership.count(),
+        &scp_protocol::economy::types::PaidActionType::ContextJoin,
+        joiner_did,
+        now,
+        spending_ucan,
+        "context:join",
+    )?;
     Ok(())
 }
 
@@ -230,6 +190,7 @@ impl ContextManager {
     /// Returns [`ContextError::PersistenceFailed`] if no persisted state
     /// exists. Returns [`ContextError::MembershipFailed`] if the context
     #[instrument(skip_all, fields(context_id))]
+    #[allow(clippy::too_many_lines)] // Context restore requires reconstructing all substate; splitting would fragment the logic.
     pub async fn restore_context(
         &self,
         context_id: &str,
@@ -292,11 +253,19 @@ impl ContextManager {
                 last_known_members: last_members,
                 pending_epoch_resets: Vec::new(),
                 consequence_rules: ctx_snapshot.consequence_rules,
-                velocity_tracker: scp_protocol::economy::antispam::SenderVelocityTracker::new(
-                    ctx_snapshot.velocity_tracker.unwrap_or(3600),
-                ),
+                velocity_tracker: match ctx_snapshot.velocity_tracker_state {
+                    Some(vts) => {
+                        scp_protocol::economy::antispam::SenderVelocityTracker::from_snapshot(
+                            vts.window_secs,
+                            vts.entries,
+                        )
+                    }
+                    None => scp_protocol::economy::antispam::SenderVelocityTracker::new(
+                        ctx_snapshot.velocity_tracker.unwrap_or(3600),
+                    ),
+                },
                 participation_cache: ctx_snapshot.participation_cache,
-                cooldown_until: HashMap::new(),
+                cooldown_until: ctx_snapshot.cooldown_until,
             },
             role_state: ctx_snapshot.role_state,
             receive_buffer: ReceiveBuffer::new(),
@@ -787,11 +756,19 @@ impl ContextManager {
                 last_known_members: initial_members,
                 pending_epoch_resets: Vec::new(),
                 consequence_rules: export.snapshot.consequence_rules,
-                velocity_tracker: scp_protocol::economy::antispam::SenderVelocityTracker::new(
-                    export.snapshot.velocity_tracker.unwrap_or(3600),
-                ),
+                velocity_tracker: match export.snapshot.velocity_tracker_state {
+                    Some(vts) => {
+                        scp_protocol::economy::antispam::SenderVelocityTracker::from_snapshot(
+                            vts.window_secs,
+                            vts.entries,
+                        )
+                    }
+                    None => scp_protocol::economy::antispam::SenderVelocityTracker::new(
+                        export.snapshot.velocity_tracker.unwrap_or(3600),
+                    ),
+                },
                 participation_cache: export.snapshot.participation_cache,
-                cooldown_until: HashMap::new(),
+                cooldown_until: export.snapshot.cooldown_until,
             },
             epoch: EpochState {
                 mls_epoch: export.snapshot.mls_epoch,
