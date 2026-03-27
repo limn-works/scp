@@ -2077,11 +2077,13 @@ impl WasmContextManager {
                 arr[..len].copy_from_slice(&bytes[..len]);
                 arr
             };
+            let target_did = action.target_did().cloned();
             ctx.push_event(ContextEvent::GovernanceActionExecuted {
                 proposal_id: proposal_id_bytes,
                 action_summary,
                 executor_did: DID(initiator_did.to_owned()),
                 resulting_epoch: None,
+                target_did,
             });
             ctx.append_log_event(
                 EventType::GovernanceActionExecuted,
@@ -3031,6 +3033,7 @@ impl WasmContextManager {
             action_summary: "ProposalCreated".to_owned(),
             executor_did: DID(proposer_did.to_owned()),
             resulting_epoch: None,
+            target_did: action.target_did().cloned(),
         });
         ctx.append_log_event(
             EventType::GovernanceProposalCreated,

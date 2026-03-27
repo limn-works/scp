@@ -202,6 +202,7 @@ impl ContextEventLogProvider for MockEventLog {
         _id: &[u8; 32],
         _event: &str,
         _actor_did: &str,
+        _payload: Option<&serde_json::Value>,
     ) -> Result<(), ContextCreationError> {
         Ok(())
     }

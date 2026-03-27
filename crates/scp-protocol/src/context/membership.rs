@@ -392,6 +392,13 @@ pub enum ContextEvent {
         executor_did: DID,
         /// The MLS epoch after execution, if applicable.
         resulting_epoch: Option<u64>,
+        /// The DID targeted by this governance action, if any.
+        ///
+        /// Present for member-targeting actions (`AddMember`, `RemoveMember`,
+        /// `ChangeRole`, `BlockAuthor`, `RevokeReadAccess`, etc.). Used by
+        /// consequence triggers (`WarningCount`, `Custom`) and participation
+        /// records to identify the target without relying on opaque payloads.
+        target_did: Option<DID>,
     },
     /// A ceiling change notification was emitted (§5.3.2).
     ///

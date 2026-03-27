@@ -439,6 +439,7 @@ impl ContextEventLogProvider for MockEventLog {
         id: &[u8; 32],
         event: &str,
         _actor_did: &str,
+        _payload: Option<&serde_json::Value>,
     ) -> Result<(), ContextCreationError> {
         self.events.lock().unwrap().push((*id, event.to_owned()));
         Ok(())
@@ -456,8 +457,9 @@ impl ContextEventLogProvider for MockEventLog {
 #[derive(Default)]
 pub(super) struct MockEventLogWithActorDid {
     pub(super) inited: std::sync::Mutex<Vec<[u8; 32]>>,
-    /// Each entry: (`context_id`, `event_name`, `actor_did`, timestamp).
-    pub(super) entries: std::sync::Mutex<Vec<([u8; 32], String, String, u64)>>,
+    /// Each entry: (`context_id`, `event_name`, `actor_did`, timestamp, payload).
+    pub(super) entries:
+        std::sync::Mutex<Vec<([u8; 32], String, String, u64, Option<serde_json::Value>)>>,
     pub(super) destroyed: std::sync::Mutex<Vec<[u8; 32]>>,
 }
 
@@ -472,15 +474,19 @@ impl ContextEventLogProvider for MockEventLogWithActorDid {
         id: &[u8; 32],
         event: &str,
         actor_did: &str,
+        payload: Option<&serde_json::Value>,
     ) -> Result<(), ContextCreationError> {
         let ts = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs();
-        self.entries
-            .lock()
-            .unwrap()
-            .push((*id, event.to_owned(), actor_did.to_owned(), ts));
+        self.entries.lock().unwrap().push((
+            *id,
+            event.to_owned(),
+            actor_did.to_owned(),
+            ts,
+            payload.cloned(),
+        ));
         Ok(())
     }
 
@@ -497,16 +503,17 @@ impl ContextEventLogProvider for MockEventLogWithActorDid {
         let entries = self.entries.lock().unwrap();
         let result: Vec<_> = entries
             .iter()
-            .filter(|(cid, _, _, _)| cid == context_id)
-            .map(
-                |(_, event, actor_did, ts)| crate::context::providers::event_log::EventLogEntry {
+            .filter(|(cid, _, _, _, _)| cid == context_id)
+            .map(|(_, event, actor_did, ts, payload)| {
+                crate::context::providers::event_log::EventLogEntry {
                     event: event.clone(),
                     actor_did: actor_did.clone(),
                     timestamp: *ts,
                     prev_hash: [0u8; 32],
                     hash: [0u8; 32],
-                },
-            )
+                    payload: payload.clone(),
+                }
+            })
             .collect();
         if result.is_empty() {
             Ok(None)

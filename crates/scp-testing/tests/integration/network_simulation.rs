@@ -1025,6 +1025,7 @@ impl scp_core::context::builder::ContextEventLogProvider for DemoEventLog {
         _: &[u8; 32],
         event: &str,
         _actor_did: &str,
+        _payload: Option<&serde_json::Value>,
     ) -> Result<(), scp_core::context::builder::ContextCreationError> {
         self.events.lock().unwrap().push(event.to_owned());
         Ok(())

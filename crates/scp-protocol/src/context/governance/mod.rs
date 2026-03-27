@@ -800,6 +800,48 @@ impl GovernanceAction {
             Self::CancelContextMigration => "CancelContextMigration",
         }
     }
+
+    /// Returns the target DID for actions that operate on a specific member.
+    ///
+    /// This is used to populate structured event payloads so that consequence
+    /// triggers (e.g., `WarningCount`) and participation records can identify
+    /// who was targeted by a governance action without relying on opaque
+    /// byte-level payload conventions.
+    #[must_use]
+    pub const fn target_did(&self) -> Option<&DID> {
+        match self {
+            Self::AddMember { did, .. }
+            | Self::RemoveMember { did, .. }
+            | Self::ChangeRole { did, .. }
+            | Self::BlockAuthor { did, .. }
+            | Self::RevokeReadAccess { did, .. }
+            | Self::RestoreReadAccess { did }
+            | Self::ResetMember { did, .. }
+            | Self::AddSigner { did }
+            | Self::RemoveSigner { did }
+            | Self::RevokeWriteAccess { did, .. }
+            | Self::RestoreWriteAccess { did } => Some(did),
+            Self::TransferAdmin { new_admin } => Some(new_admin),
+            Self::ApproveSpend { spender, .. } => Some(spender),
+            Self::RegisterTool { .. }
+            | Self::RemoveTool { .. }
+            | Self::ModifyCeiling { .. }
+            | Self::CloseContext { .. }
+            | Self::ExtendTtl { .. }
+            | Self::CreateChildContext { .. }
+            | Self::ModifyPruningPolicy { .. }
+            | Self::ModifyThreshold { .. }
+            | Self::EstablishToolInterface { .. }
+            | Self::ResolveConflict { .. }
+            | Self::PromoteContext
+            | Self::RotateContentKeys { .. }
+            | Self::ReconfigureGovernance { .. }
+            | Self::SetEconomicPolicy { .. }
+            | Self::LockEconomicPolicy
+            | Self::ProposeContextMigration { .. }
+            | Self::CancelContextMigration => None,
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------

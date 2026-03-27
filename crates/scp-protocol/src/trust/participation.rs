@@ -266,13 +266,27 @@ fn extract_tool_id_from_payload(data: &[u8]) -> ToolId {
 
 /// Extracts a target DID from a governance action or role assignment payload.
 ///
-/// Convention: the payload data starts with a UTF-8 target DID string,
-/// terminated by a null byte or the end of data. Returns `None` if the
-/// payload is empty.
+/// The payload data is a JSON object with an optional `"target_did"` field.
+/// Falls back to the legacy null-terminated string convention for backward
+/// compatibility with entries created before structured payloads were
+/// introduced. Returns `None` if the payload is empty or has no target.
 fn extract_target_did_from_payload(data: &[u8]) -> Option<DID> {
     if data.is_empty() {
         return None;
     }
+    // Try structured JSON first.
+    if let Ok(val) = serde_json::from_slice::<serde_json::Value>(data) {
+        if let Some(did_str) = val
+            .get("target_did")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+        {
+            return Some(did_str.into());
+        }
+        // JSON parsed but no target_did field — no target.
+        return None;
+    }
+    // Legacy fallback: null-terminated UTF-8 string.
     let end = data.iter().position(|&b| b == 0).unwrap_or(data.len());
     let s = std::str::from_utf8(&data[..end]).ok()?;
     if s.is_empty() {
@@ -2228,4 +2242,63 @@ mod tests {
 
     // SCP-BA-006 tests moved to scp-runtime::trust::participation_service (they
     // depend on scp_identity::document::DidDocument).
+
+    // -----------------------------------------------------------------------
+    // Structured JSON payload tests (H11-H12)
+    // -----------------------------------------------------------------------
+
+    /// `governance_actions_against` is populated when structured JSON payloads
+    /// carry `target_did` matching the subject.
+    #[test]
+    fn test_participation_actions_against_populated() {
+        let payload =
+            serde_json::to_vec(&serde_json::json!({"target_did": "did:key:alice"})).unwrap();
+
+        let events = vec![
+            make_event(
+                EventType::GovernanceAction,
+                "did:key:admin",
+                1000,
+                0,
+                payload.clone(),
+            ),
+            make_event(
+                EventType::GovernanceAction,
+                "did:key:moderator",
+                1001,
+                1,
+                payload,
+            ),
+            // Action targeting bob — should not count against alice.
+            make_event(
+                EventType::GovernanceAction,
+                "did:key:admin",
+                1002,
+                2,
+                serde_json::to_vec(&serde_json::json!({"target_did": "did:key:bob"})).unwrap(),
+            ),
+        ];
+
+        let record =
+            compute_participation_record(&events, "did:key:alice", "ctx-1", [0u8; 32], 2000)
+                .unwrap();
+
+        assert_eq!(
+            record.governance_actions_against.len(),
+            2,
+            "both governance actions targeting alice should be recorded"
+        );
+        assert_eq!(
+            record.governance_actions_against[0].actor_did,
+            "did:key:admin"
+        );
+        assert_eq!(
+            record.governance_actions_against[0].target_did,
+            Some("did:key:alice".into())
+        );
+        assert_eq!(
+            record.governance_actions_against[1].actor_did,
+            "did:key:moderator"
+        );
+    }
 }

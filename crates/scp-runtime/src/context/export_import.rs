@@ -189,6 +189,7 @@ pub fn verify_merkle_chain(event_log_data: &[u8]) -> Result<[u8; 32], ContextErr
             &entry.actor_did,
             entry.timestamp,
             &entry.prev_hash,
+            entry.payload.as_ref(),
         );
         if !bool::from(entry.hash.ct_eq(&expected_hash)) {
             return Err(ContextError::EventLogFailed(format!(
@@ -202,7 +203,8 @@ pub fn verify_merkle_chain(event_log_data: &[u8]) -> Result<[u8; 32], ContextErr
 
 /// Computes the SHA-256 hash for an event log entry.
 ///
-/// Hash input: `"SCP-EXPORT-ENTRY:" || len(event) || event || len(actor_did) || actor_did || timestamp || prev_hash`
+/// Hash input: `"SCP-EXPORT-ENTRY:" || len(event) || event || len(actor_did)
+///   || actor_did || timestamp || prev_hash [|| len(payload_json) || payload_json]`
 ///
 /// Uses big-endian u32 length prefixes before variable-length fields to
 /// prevent length-extension ambiguity.
@@ -215,6 +217,7 @@ fn compute_entry_hash(
     actor_did: &str,
     timestamp: u64,
     prev_hash: &[u8; 32],
+    payload: Option<&serde_json::Value>,
 ) -> [u8; 32] {
     // Event names and DID strings are always well under u32::MAX bytes.
     let event_len = u32::try_from(event.len()).unwrap_or(u32::MAX);
@@ -227,6 +230,14 @@ fn compute_entry_hash(
     hasher.update(actor_did.as_bytes());
     hasher.update(timestamp.to_be_bytes());
     hasher.update(prev_hash);
+    // Payload is included in the hash when present.
+    // Absent payloads contribute no bytes, preserving backward compat.
+    if let Some(val) = payload {
+        let json_bytes = serde_json::to_vec(val).unwrap_or_default();
+        let payload_len = u32::try_from(json_bytes.len()).unwrap_or(u32::MAX);
+        hasher.update(payload_len.to_be_bytes());
+        hasher.update(&json_bytes);
+    }
     let result = hasher.finalize();
     let mut hash = [0u8; 32];
     hash.copy_from_slice(&result);
@@ -459,7 +470,9 @@ mod tests {
         let provider = MerkleEventLogProvider::new();
         provider.init_event_log(context_id_bytes).unwrap();
         for name in event_names {
-            provider.append_event(context_id_bytes, name, "").unwrap();
+            provider
+                .append_event(context_id_bytes, name, "", None)
+                .unwrap();
         }
         provider.export_event_log_entries(context_id_bytes).unwrap()
     }
@@ -578,8 +591,12 @@ mod tests {
         let ctx_id_bytes = scp_protocol::context::context_id_bytes("ctx-merkle-2");
         let provider = MerkleEventLogProvider::new();
         provider.init_event_log(&ctx_id_bytes).unwrap();
-        provider.append_event(&ctx_id_bytes, "Event1", "").unwrap();
-        provider.append_event(&ctx_id_bytes, "Event2", "").unwrap();
+        provider
+            .append_event(&ctx_id_bytes, "Event1", "", None)
+            .unwrap();
+        provider
+            .append_event(&ctx_id_bytes, "Event2", "", None)
+            .unwrap();
 
         let mut entries = provider.entries(&ctx_id_bytes).unwrap();
         // Tamper with the first entry's hash.
@@ -597,9 +614,15 @@ mod tests {
         let ctx_id_bytes = scp_protocol::context::context_id_bytes("ctx-merkle-3");
         let provider = MerkleEventLogProvider::new();
         provider.init_event_log(&ctx_id_bytes).unwrap();
-        provider.append_event(&ctx_id_bytes, "Event1", "").unwrap();
-        provider.append_event(&ctx_id_bytes, "Event2", "").unwrap();
-        provider.append_event(&ctx_id_bytes, "Event3", "").unwrap();
+        provider
+            .append_event(&ctx_id_bytes, "Event1", "", None)
+            .unwrap();
+        provider
+            .append_event(&ctx_id_bytes, "Event2", "", None)
+            .unwrap();
+        provider
+            .append_event(&ctx_id_bytes, "Event3", "", None)
+            .unwrap();
 
         let mut entries = provider.entries(&ctx_id_bytes).unwrap();
         // Remove the middle entry.
@@ -685,9 +708,15 @@ mod tests {
         let ctx_id_bytes = scp_protocol::context::context_id_bytes("ctx-validate-4");
         let provider = MerkleEventLogProvider::new();
         provider.init_event_log(&ctx_id_bytes).unwrap();
-        provider.append_event(&ctx_id_bytes, "Event1", "").unwrap();
-        provider.append_event(&ctx_id_bytes, "Event2", "").unwrap();
-        provider.append_event(&ctx_id_bytes, "Event3", "").unwrap();
+        provider
+            .append_event(&ctx_id_bytes, "Event1", "", None)
+            .unwrap();
+        provider
+            .append_event(&ctx_id_bytes, "Event2", "", None)
+            .unwrap();
+        provider
+            .append_event(&ctx_id_bytes, "Event3", "", None)
+            .unwrap();
 
         let _original_data = provider.export_event_log_entries(&ctx_id_bytes).unwrap();
         let merkle_root = provider.merkle_root(&ctx_id_bytes).unwrap();
@@ -844,9 +873,15 @@ mod tests {
         let ctx_id_bytes = scp_protocol::context::context_id_bytes("ctx-el-roundtrip");
         let provider = MerkleEventLogProvider::new();
         provider.init_event_log(&ctx_id_bytes).unwrap();
-        provider.append_event(&ctx_id_bytes, "Event1", "").unwrap();
-        provider.append_event(&ctx_id_bytes, "Event2", "").unwrap();
-        provider.append_event(&ctx_id_bytes, "Event3", "").unwrap();
+        provider
+            .append_event(&ctx_id_bytes, "Event1", "", None)
+            .unwrap();
+        provider
+            .append_event(&ctx_id_bytes, "Event2", "", None)
+            .unwrap();
+        provider
+            .append_event(&ctx_id_bytes, "Event3", "", None)
+            .unwrap();
 
         let original_entries = provider.entries(&ctx_id_bytes).unwrap();
         let original_root = provider.merkle_root(&ctx_id_bytes).unwrap();
@@ -888,7 +923,7 @@ mod tests {
         provider.init_event_log(&ctx_id_bytes).unwrap();
         for i in 0..10 {
             provider
-                .append_event(&ctx_id_bytes, &format!("Event{i}"), "")
+                .append_event(&ctx_id_bytes, &format!("Event{i}"), "", None)
                 .unwrap();
         }
 
@@ -938,7 +973,7 @@ mod tests {
 
         // Appending after import should chain correctly.
         new_provider
-            .append_event(&ctx_id_bytes, "Event10", "")
+            .append_event(&ctx_id_bytes, "Event10", "", None)
             .unwrap();
         let final_entries = new_provider.entries(&ctx_id_bytes).unwrap();
         assert_eq!(final_entries.len(), 4);

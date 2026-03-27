@@ -1359,6 +1359,7 @@ mod tests {
             id: &[u8; 32],
             event: &str,
             _actor_did: &str,
+            _payload: Option<&serde_json::Value>,
         ) -> Result<(), ContextCreationError> {
             self.events.lock().unwrap().push((*id, event.to_owned()));
             Ok(())
@@ -2471,6 +2472,7 @@ mod tests {
             _id: &[u8; 32],
             _event: &str,
             _actor_did: &str,
+            _payload: Option<&serde_json::Value>,
         ) -> Result<(), ContextCreationError> {
             Err(ContextCreationError::CryptoFailed(
                 "event log write failed".into(),

@@ -100,6 +100,10 @@ pub trait ContextEventLogProvider: Send + Sync {
     /// events). Pass an empty string when the actor is unknown or not
     /// applicable (e.g., system-initiated events).
     ///
+    /// `payload` is an optional structured JSON value included in the Merkle
+    /// hash. Used by governance actions to carry `target_did` and other
+    /// structured data for consequence triggers and participation records.
+    ///
     /// # Errors
     ///
     /// Returns [`ContextCreationError`] if the append fails.
@@ -108,6 +112,7 @@ pub trait ContextEventLogProvider: Send + Sync {
         context_id: &[u8; 32],
         event: &str,
         actor_did: &str,
+        payload: Option<&serde_json::Value>,
     ) -> Result<(), ContextCreationError>;
 
     /// Destroys the event log for the given context (rollback).
@@ -136,7 +141,26 @@ pub trait ContextEventLogProvider: Send + Sync {
         event: &str,
         actor_did: &str,
     ) -> Result<(), ContextError> {
-        self.append_event(context_id, event, actor_did)
+        self.append_event(context_id, event, actor_did, None)
+            .map_err(|e| ContextError::EventLogFailed(e.to_string()))
+    }
+
+    /// Appends a named event with an optional structured payload.
+    ///
+    /// Like [`append_context_event`](Self::append_context_event) but accepts
+    /// an optional JSON payload that is included in the Merkle hash.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ContextError::EventLogFailed`] if the append fails.
+    fn append_context_event_with_payload(
+        &self,
+        context_id: &[u8; 32],
+        event: &str,
+        actor_did: &str,
+        payload: Option<&serde_json::Value>,
+    ) -> Result<(), ContextError> {
+        self.append_event(context_id, event, actor_did, payload)
             .map_err(|e| ContextError::EventLogFailed(e.to_string()))
     }
 
@@ -666,7 +690,8 @@ pub async fn create_context(
     }
 
     // Step 7: Append ContextCreated event.
-    if let Err(e) = event_log_provider.append_event(&id_bytes, "ContextCreated", creator_did) {
+    if let Err(e) = event_log_provider.append_event(&id_bytes, "ContextCreated", creator_did, None)
+    {
         // Even though the handle is Active, we must roll back everything.
         receipt.rollback(&id_bytes, crypto, transport, event_log_provider);
         return Err(e);
@@ -881,6 +906,7 @@ mod tests {
             context_id: &[u8; 32],
             event: &str,
             _actor_did: &str,
+            _payload: Option<&serde_json::Value>,
         ) -> Result<(), ContextCreationError> {
             if self.fail_append.load(Ordering::Relaxed) {
                 return Err(ContextCreationError::EventLogFailed(
