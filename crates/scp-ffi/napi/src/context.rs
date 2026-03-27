@@ -718,6 +718,7 @@ pub async fn context_send(
     handle: &NapiContextHandle,
     identity_did: String,
     payload: Vec<u8>,
+    spending_ucan_jwt: Option<String>,
 ) -> napi::Result<()> {
     validate_did(&identity_did).map_err(|e| napi::Error::from(ScpNapiError::from(e)))?;
 
@@ -778,6 +779,18 @@ pub async fn context_send(
     #[cfg(not(feature = "allow_in_memory_custody"))]
     let resolved_signing_key: Option<ed25519_dalek::SigningKey> = None;
 
+    // Parse optional spending UCAN JWT into a UcanToken for AND-composition.
+    let spending_ucan = spending_ucan_jwt
+        .as_deref()
+        .map(scp_protocol::crypto::ucan::validate::parse_ucan)
+        .transpose()
+        .map_err(|e| {
+            NapiError::from(ScpNapiError::Context {
+                message: format!("invalid spending UCAN: {e}"),
+                code: "SCP-ECON-7061".to_owned(),
+            })
+        })?;
+
     let manager = context_manager()?;
     manager
         .send_message(
@@ -786,7 +799,7 @@ pub async fn context_send(
             &payload,
             resolved_signing_key.as_ref(),
             None,
-            None,
+            spending_ucan.as_ref(),
         )
         .await
         .map_err(|e| NapiError::from(ScpNapiError::from(e)))?;
@@ -3616,5 +3629,158 @@ mod tests {
         })
         .unwrap();
         crate::runtime::remove_context(&ctx_id);
+    }
+
+    // -------------------------------------------------------------------
+    // Consequence event format tests (#1531, #1593, #1594)
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn format_consequence_triggered_event() {
+        use scp_core::context::membership::ContextEvent;
+
+        let event = ContextEvent::ConsequenceTriggered {
+            context_id: "ctx-napi-123".to_owned(),
+            member_did: scp_identity::DID("did:dht:z6MkBob".to_owned()),
+            rule_index: 1,
+            trigger_type: "velocity".to_owned(),
+            action_type: "mute".to_owned(),
+        };
+
+        let formatted = super::format_context_event(&event);
+        assert!(
+            formatted.contains("consequence_triggered:"),
+            "must contain consequence_triggered prefix"
+        );
+        assert!(
+            formatted.contains("member=did:dht:z6MkBob"),
+            "must contain member DID"
+        );
+        assert!(formatted.contains("rule=1"), "must contain rule index");
+        assert!(
+            formatted.contains("trigger=velocity"),
+            "must contain trigger type"
+        );
+        assert!(
+            formatted.contains("action=mute"),
+            "must contain action type"
+        );
+        assert!(
+            formatted.contains("context=ctx-napi-123"),
+            "must contain context ID"
+        );
+    }
+
+    #[test]
+    fn format_consequence_enforced_event() {
+        use scp_core::context::membership::ContextEvent;
+
+        let event = ContextEvent::ConsequenceEnforced {
+            context_id: "ctx-napi-456".to_owned(),
+            member_did: scp_identity::DID("did:dht:z6MkAlice".to_owned()),
+            action_type: "restrict_write".to_owned(),
+            success: false,
+        };
+
+        let formatted = super::format_context_event(&event);
+        assert!(
+            formatted.contains("consequence_enforced:"),
+            "must contain consequence_enforced prefix"
+        );
+        assert!(
+            formatted.contains("member=did:dht:z6MkAlice"),
+            "must contain member DID"
+        );
+        assert!(
+            formatted.contains("action=restrict_write"),
+            "must contain action type"
+        );
+        assert!(
+            formatted.contains("success=false"),
+            "must contain success=false"
+        );
+    }
+
+    /// Verifies that `ContextParams` accepts `consequence_rules` and they
+    /// serialize/deserialize correctly for FFI bridge consumption.
+    #[test]
+    fn consequence_rules_in_context_params() {
+        use scp_core::context::ContextParams;
+
+        // Parse a consequence rule from JSON (mirrors what the bridge does).
+        let json = r#"[{"trigger":"MessageVelocity","action":"AccessRevocation","threshold":10,"window":{"secs":3600,"nanos":0}}]"#;
+        let rules: Vec<scp_core::trust::ConsequenceRule> = serde_json::from_str(json).unwrap();
+
+        let params = ContextParams {
+            consequence_rules: rules,
+            ..ContextParams::default()
+        };
+
+        assert_eq!(
+            params.consequence_rules.len(),
+            1,
+            "consequence_rules should carry 1 rule"
+        );
+    }
+
+    // -------------------------------------------------------------------
+    // Spending UCAN parameter acceptance tests (#1537, #1593)
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn evaluate_invitation_accepts_spending_json() {
+        let params = scp_core::context::ContextParams::default();
+        let params_json = serde_json::to_string(&params).unwrap();
+        let spending_json =
+            r#"{"has_spending_ucan":true,"configured_adapters":["x402"],"available_balance":10000}"#
+                .to_owned();
+
+        let result = super::evaluate_invitation(
+            params_json,
+            "did:dht:z6MkBobBobBobBobBobBobBobBobBobBobBobBobBo".to_owned(),
+            "did:dht:z6MkLocalLocalLocalLocalLocalLocalLocal".to_owned(),
+            None,
+            Some(spending_json),
+            None,
+        );
+
+        // Free context: pipeline reaches prompt_agent regardless of spending.
+        assert!(result.is_ok(), "spending_json should be accepted");
+        assert_eq!(result.unwrap().decision, "prompt_agent");
+    }
+
+    #[test]
+    fn evaluate_invitation_rejects_invalid_spending_json() {
+        let params = scp_core::context::ContextParams::default();
+        let params_json = serde_json::to_string(&params).unwrap();
+
+        let result = super::evaluate_invitation(
+            params_json,
+            "did:dht:z6MkBobBobBobBobBobBobBobBobBobBobBobBobBo".to_owned(),
+            "did:dht:z6MkLocalLocalLocalLocalLocalLocalLocal".to_owned(),
+            None,
+            Some("not valid json".to_owned()),
+            None,
+        );
+
+        assert!(result.is_err(), "invalid spending JSON should be rejected");
+    }
+
+    #[test]
+    fn evaluate_invitation_none_spending_accepted() {
+        let params = scp_core::context::ContextParams::default();
+        let params_json = serde_json::to_string(&params).unwrap();
+
+        let result = super::evaluate_invitation(
+            params_json,
+            "did:dht:z6MkBobBobBobBobBobBobBobBobBobBobBobBobBo".to_owned(),
+            "did:dht:z6MkLocalLocalLocalLocalLocalLocalLocal".to_owned(),
+            None,
+            None,
+            None,
+        );
+
+        assert!(result.is_ok(), "None spending should be accepted");
+        assert_eq!(result.unwrap().decision, "prompt_agent");
     }
 }

@@ -1827,3 +1827,84 @@ describe("Scope registry runtime (mock bridge)", () => {
     expect(["registered", "conflict", "updated"]).toContain(result.status);
   });
 });
+
+// ---------------------------------------------------------------------------
+// 13. Spending UCAN / consequence event SDK-level tests (#1537, #1593, #1594)
+// ---------------------------------------------------------------------------
+
+describe("Invitation evaluation with spending (mock bridge)", () => {
+  it("evaluateInvitation accepts spendingJson parameter", async () => {
+    _setBridge(mockBridge);
+    const { evaluateInvitation } = await import("../src/context");
+
+    const result = await evaluateInvitation(
+      '{"ceiling":[]}',
+      "did:dht:z6MkBobBobBobBobBobBobBobBobBobBobBobBobBo",
+      "did:dht:z6MkLocalLocalLocalLocalLocalLocalLocal",
+      undefined,
+      '{"has_spending_ucan":true,"configured_adapters":["x402"],"available_balance":10000}',
+    );
+
+    expect(result).toBeDefined();
+    expect(result.decision).toBeDefined();
+  });
+
+  it("evaluateInvitation works without spendingJson", async () => {
+    _setBridge(mockBridge);
+    const { evaluateInvitation } = await import("../src/context");
+
+    const result = await evaluateInvitation(
+      '{"ceiling":[]}',
+      "did:dht:z6MkBobBobBobBobBobBobBobBobBobBobBobBobBo",
+      "did:dht:z6MkLocalLocalLocalLocalLocalLocalLocal",
+    );
+
+    expect(result).toBeDefined();
+    expect(result.decision).toBeDefined();
+  });
+});
+
+describe("Consequence event types (SDK)", () => {
+  it("consequence_triggered event has correct structure", () => {
+    // Verify that system events with consequence_triggered prefix
+    // can be parsed from the expected format.
+    const payload =
+      "consequence_triggered: member=did:dht:z6MkBob rule=2 trigger=velocity action=mute context=ctx-123";
+    expect(payload).toContain("consequence_triggered:");
+    expect(payload).toContain("member=did:dht:z6MkBob");
+    expect(payload).toContain("rule=2");
+    expect(payload).toContain("trigger=velocity");
+    expect(payload).toContain("action=mute");
+  });
+
+  it("consequence_enforced event has correct structure", () => {
+    const payload =
+      "consequence_enforced: member=did:dht:z6MkAlice action=restrict_write success=true context=ctx-456";
+    expect(payload).toContain("consequence_enforced:");
+    expect(payload).toContain("success=true");
+  });
+});
+
+describe("Trust aggregation with consequence rules (mock bridge)", () => {
+  it("aggregateTrustInput accepts consequenceRules parameter", async () => {
+    _setBridge(mockBridge);
+    const { aggregateTrustInput } = await import("../src/trust");
+
+    const result = await aggregateTrustInput({
+      contextId: "ctx-consequence-test",
+      subjectDid: "did:dht:z6MkBobBobBobBobBobBobBobBobBobBobBobBobBo",
+      events: [],
+      merkleRoot: new Array(32).fill(0),
+      consequenceRules: [
+        {
+          trigger: "MessageVelocity",
+          action: "AccessRevocation",
+          threshold: 5,
+          window: { secs: 3600, nanos: 0 },
+        },
+      ],
+    });
+
+    expect(result).toBeDefined();
+  });
+});

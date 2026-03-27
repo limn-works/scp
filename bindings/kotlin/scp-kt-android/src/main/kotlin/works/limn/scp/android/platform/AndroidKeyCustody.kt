@@ -314,7 +314,8 @@ class AndroidKeyCustody internal constructor(
      *
      * **Software keys (API 26-32, [CustodyType.SOFTWARE]):**
      *   1. Extract 32-byte private key bytes from the Bouncy Castle [Ed25519PrivateKeyParameters].
-     *   2. Derive `pseudonymSecret = HKDF-SHA256(ikm: privateKeyBytes, salt: "scp-pseudonym-secret-v1", info: "", len: 32)`.
+     *   2. Derive pseudonymSecret = HKDF-SHA256(ikm: privateKeyBytes,
+     *      salt: "scp-pseudonym-secret-v1", info: "", len: 32).
      *   3. Compute `seed = HMAC-SHA256(pseudonymSecret, contextId || "scp-pseudonym")`.
      *   4. Derive an Ed25519 keypair from the first 32 bytes of `seed`.
      *

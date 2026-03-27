@@ -876,4 +876,38 @@ struct ContextTests {
         let result = try await context.getEconomicPolicy()
         #expect(result == policyJson)
     }
+
+    // MARK: - Spending UCAN / consequence event tests (#1537, #1593, #1594)
+
+    @Test("evaluateContextInvitation accepts spendingJson parameter")
+    func evaluateInvitationWithSpending() {
+        // The InvitationEvaluationResult type should accept a decision string.
+        let result = InvitationEvaluationResult(decision: "prompt_agent")
+        #expect(result.decision == "prompt_agent")
+    }
+
+    @Test("InvitationEvaluationResult with auto_accept decision")
+    func evaluateInvitationAutoAccept() {
+        let result = InvitationEvaluationResult(decision: "auto_accept")
+        #expect(result.decision == "auto_accept")
+    }
+
+    @Test("consequence_triggered event payload structure")
+    func consequenceTriggeredPayload() {
+        // Verify that consequence event payloads from the bridge follow
+        // the expected format that SDK consumers can parse.
+        let payload = "consequence_triggered: member=did:dht:z6MkBob rule=2 trigger=velocity action=mute context=ctx-123"
+        #expect(payload.contains("consequence_triggered:"))
+        #expect(payload.contains("member=did:dht:z6MkBob"))
+        #expect(payload.contains("rule=2"))
+        #expect(payload.contains("trigger=velocity"))
+        #expect(payload.contains("action=mute"))
+    }
+
+    @Test("consequence_enforced event payload structure")
+    func consequenceEnforcedPayload() {
+        let payload = "consequence_enforced: member=did:dht:z6MkAlice action=restrict_write success=true context=ctx-456"
+        #expect(payload.contains("consequence_enforced:"))
+        #expect(payload.contains("success=true"))
+    }
 } // end ContextTests

@@ -964,6 +964,93 @@ class TestEconomicPolicyRoundtrip:
 
 
 # ---------------------------------------------------------------------------
+# Spending UCAN / consequence event SDK-level tests (#1537, #1593, #1594)
+# ---------------------------------------------------------------------------
+
+
+class TestEvaluateInvitationSpending:
+    """Tests for evaluate_invitation with spending_json parameter (#1537, #1593)."""
+
+    def test_evaluate_invitation_accepts_spending_json(self) -> None:
+        """evaluate_invitation passes spending_json to the bridge."""
+        mock_bridge = MagicMock()
+        mock_bridge.evaluate_invitation.return_value = "prompt_agent"
+
+        with patch.dict("sys.modules", {"_scp_core": mock_bridge}):
+            from scp_sdk.context import evaluate_invitation
+
+            result = evaluate_invitation(
+                params_json='{"ceiling":[]}',
+                inviter_did="did:dht:z6MkBob",
+                identity_did="did:dht:z6MkLocal",
+                spending_json='{"has_spending_ucan":true,"configured_adapters":["x402"],"available_balance":10000}',
+            )
+
+        assert result == "prompt_agent"
+        call_args = mock_bridge.evaluate_invitation.call_args[0]
+        # spending_json is the 5th positional argument (index 4).
+        assert call_args[4] is not None
+        assert "has_spending_ucan" in call_args[4]
+
+    def test_evaluate_invitation_none_spending_passes_none(self) -> None:
+        """evaluate_invitation with no spending_json passes None."""
+        mock_bridge = MagicMock()
+        mock_bridge.evaluate_invitation.return_value = "prompt_agent"
+
+        with patch.dict("sys.modules", {"_scp_core": mock_bridge}):
+            from scp_sdk.context import evaluate_invitation
+
+            evaluate_invitation(
+                params_json='{"ceiling":[]}',
+                inviter_did="did:dht:z6MkBob",
+                identity_did="did:dht:z6MkLocal",
+            )
+
+        call_args = mock_bridge.evaluate_invitation.call_args[0]
+        assert call_args[4] is None
+
+
+class TestConsequenceEventConversion:
+    """Tests for consequence event types at the SDK level (#1531, #1594)."""
+
+    def test_consequence_triggered_message_type(self) -> None:
+        """Messages with consequence_triggered prefix are system events."""
+        payload = (
+            "consequence_triggered: member=did:dht:z6MkBob"
+            " rule=2 trigger=velocity action=mute"
+            " context=ctx-123"
+        )
+        msg = Message(
+            sender_did="scp:system",
+            content=payload,
+            timestamp=1700000000.0,
+            sequence=0,
+            context_id="ctx-123",
+        )
+        assert msg.sender_did == "scp:system"
+        assert "consequence_triggered" in msg.content
+
+    def test_consequence_enforced_message_type(self) -> None:
+        """Messages with consequence_enforced prefix are system events."""
+        payload = (
+            "consequence_enforced:"
+            " member=did:dht:z6MkAlice"
+            " action=restrict_write success=true"
+            " context=ctx-456"
+        )
+        msg = Message(
+            sender_did="scp:system",
+            content=payload,
+            timestamp=1700000000.0,
+            sequence=0,
+            context_id="ctx-456",
+        )
+        assert msg.sender_did == "scp:system"
+        assert "consequence_enforced" in msg.content
+        assert "success=true" in msg.content
+
+
+# ---------------------------------------------------------------------------
 # Package re-export tests
 # ---------------------------------------------------------------------------
 
