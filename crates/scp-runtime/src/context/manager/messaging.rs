@@ -371,8 +371,12 @@ impl ContextManager {
                 )
             }
         };
-        self.execute_send_payment(&context_id, sender_did, deducted_cost)
+        // Payment flow (#1537): escrow pattern — authorize (hold) before the
+        // action, complete (capture) after success, void + rollback on failure.
+        let auth = self
+            .authorize_send_payment(&context_id, sender_did, deducted_cost)
             .await?;
+
         // Phase 2: encrypt + send (no lock held).
         let phase2_result = self.encrypt_and_send(
             broadcast_envelope,
@@ -386,6 +390,11 @@ impl ContextManager {
             &routing_id,
         );
         if let Err(e) = phase2_result {
+            // Void the escrow hold and rollback budget on send failure.
+            if let Some(a) = auth {
+                self.void_paid_action(a, &context_id).await;
+            }
+            super::economy::rollback_budget(self, &context_id, sender_did, deducted_cost).await;
             if !is_broadcast {
                 let mut contexts = self.contexts.lock().await;
                 if let Some(ctx) = contexts.get_mut(&context_id) {
@@ -394,6 +403,11 @@ impl ContextManager {
             }
             return Err(e);
         }
+
+        // Phase 3: capture the escrow hold after successful send.
+        self.capture_send_payment(auth, sender_did, &context_id, deducted_cost)
+            .await;
+
         self.finalize_send(
             &context_id,
             &context_id_bytes,
@@ -449,42 +463,54 @@ impl ContextManager {
         Ok(())
     }
 
-    /// Executes the payment flow for message sends using the escrow pattern.
+    /// Authorizes escrow for send payment (Phase 1.5 of `send_message`).
     ///
-    /// Authorize -> the caller does the action -> complete on success / void
-    /// on failure. Budget rollback uses `rollback_budget`.
-    async fn execute_send_payment(
+    /// On authorization failure, rolls back the budget deducted in Phase 1.
+    /// Returns the authorization token (if payment is required) for later
+    /// capture or void.
+    async fn authorize_send_payment(
         &self,
         context_id: &str,
         sender_did: &DID,
         deducted_cost: Option<scp_protocol::economy::types::Amount>,
-    ) -> Result<(), ContextError> {
-        // Authorize payment (escrow hold).
-        let auth = self
+    ) -> Result<Option<super::economy::PaidActionAuthorization>, ContextError> {
+        match self
             .authorize_paid_action(
                 scp_protocol::economy::types::PaidActionType::MessageSend,
                 sender_did,
                 context_id,
             )
-            .await;
-        match auth {
-            Ok(Some(auth)) => {
-                // Complete after action succeeds (caller handles action).
-                if let Err(e) = self
-                    .complete_paid_action(auth, sender_did, context_id)
-                    .await
-                {
-                    super::economy::rollback_budget(self, context_id, sender_did, deducted_cost)
-                        .await;
-                    return Err(e);
-                }
-                Ok(())
-            }
-            Ok(None) => Ok(()), // No payment needed.
+            .await
+        {
+            Ok(auth) => Ok(auth),
             Err(payment_err) => {
                 super::economy::rollback_budget(self, context_id, sender_did, deducted_cost).await;
                 Err(payment_err)
             }
+        }
+    }
+
+    /// Captures the escrow hold after a successful send (Phase 3 of `send_message`).
+    ///
+    /// Best-effort: if capture fails, rolls back the budget and logs a warning
+    /// but does NOT fail the send (the message was already delivered).
+    async fn capture_send_payment(
+        &self,
+        auth: Option<super::economy::PaidActionAuthorization>,
+        sender_did: &DID,
+        context_id: &str,
+        deducted_cost: Option<scp_protocol::economy::types::Amount>,
+    ) {
+        if let Some(a) = auth
+            && let Err(e) = self.complete_paid_action(a, sender_did, context_id).await
+        {
+            // Capture failed — rollback budget. The message was already sent,
+            // so we log the payment failure but still finalize the send.
+            super::economy::rollback_budget(self, context_id, sender_did, deducted_cost).await;
+            tracing::warn!(
+                context_id,
+                "payment capture failed after successful send: {e}"
+            );
         }
     }
 

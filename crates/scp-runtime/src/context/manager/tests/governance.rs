@@ -13305,19 +13305,19 @@ async fn budget_not_deducted_on_transport_failure() {
         .await;
     assert!(result.is_err(), "send should fail due to transport failure");
 
-    // Budget is deducted before transport, so the budget WILL be charged.
-    // This is the current behavior: economy enforcement happens in Phase 1
-    // (under lock, before transport in Phase 2). The test documents this.
+    // Budget was deducted in Phase 1 (under lock) but rolled back on
+    // transport failure in Phase 2. The escrow pattern ensures money is
+    // not taken when the action fails.
     let remaining = {
         let contexts = manager.contexts.lock().await;
         let ctx = contexts.get("rollback-ctx").unwrap();
         ctx.governance.budget_tracker.remaining(&sender_did)
     };
-    // Budget was 500, cost is 50. Budget was charged in Phase 1.
+    // Budget was 500, cost is 50. Transport failed → rollback_budget restored it.
     assert_eq!(
         remaining,
-        Amount::new(450),
-        "budget deducted in Phase 1 (before transport): {remaining:?}"
+        Amount::new(500),
+        "budget rolled back after transport failure: {remaining:?}"
     );
 }
 
