@@ -428,11 +428,9 @@ impl ContextManager {
     /// Calls `adapter.void` to release the escrow hold. Best-effort —
     /// logs but does not propagate void failures.
     ///
-    /// Currently unused: `execute_join_payment` and `execute_send_payment`
-    /// only call authorize → complete (the auth is consumed by complete, so
-    /// void is not needed). Retained as part of the escrow API for callers
-    /// that need explicit void (e.g., a future "cancel" flow).
-    #[allow(dead_code)]
+    /// Used by `send_message` when `encrypt_and_send` fails after
+    /// `authorize_paid_action` succeeded (escrow pattern: authorize →
+    /// action → complete on success / void on failure).
     pub(super) async fn void_paid_action(&self, auth: PaidActionAuthorization, context_id: &str) {
         if let Some(ref authorization) = auth.prepared.envelope.authorization
             && let Err(e) = auth.bridge.void(authorization).await

@@ -1463,7 +1463,7 @@ impl ContextManager {
     /// Executes the payment flow for context joins using the escrow pattern.
     ///
     /// Authorize (escrow hold) → complete (capture) on success, or
-    /// void + `rollback_budget` on failure. Mirrors `execute_send_payment`.
+    /// void + `rollback_budget` on failure.
     async fn execute_join_payment(
         &self,
         context_id: &str,
