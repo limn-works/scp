@@ -81,6 +81,8 @@ pub enum PaidActionType {
 
 **Why integer amounts:** IEEE 754 floating-point arithmetic is non-associative — `(a + b) + c != a + (b + c)` in general. When payer and receiver independently evaluate a pricing formula, f64 coefficients can produce different results depending on evaluation order, platform, or compiler optimizations. Integer arithmetic is deterministic across all platforms. This follows the pattern established by Stripe (amounts in cents), Bitcoin (amounts in satoshis), and Solana (amounts in lamports).
 
+**`PaymentAdapterRef` validation (§9.1A).** `PaymentAdapterRef` strings are validated for control characters and HTML-special characters at the FFI boundary, since they may be rendered in payment UIs. Maximum length: 256 bytes.
+
 **Why fixed-point coefficients:** Pricing formulas need fractional multipliers (e.g., "cost increases by 0.5x per 100 messages/min"). `Coefficient` provides 6 decimal places of precision using integer arithmetic. Evaluation: `(coefficient.0 * metric_value) / 1_000_000`. Both sides compute the same result.
 
 ## 19.2 Payment Adapters

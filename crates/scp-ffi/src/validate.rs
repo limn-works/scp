@@ -405,6 +405,49 @@ pub fn validate_transport_mode(mode: &str) -> Result<(), ScpPyError> {
 }
 
 // ---------------------------------------------------------------------------
+// Constants — string field validation (#1601) — re-exported from common
+// ---------------------------------------------------------------------------
+
+pub use scp_ffi_common::validate::{
+    MAX_CONTEXT_DESCRIPTION_LEN, MAX_CONTEXT_NAME_LEN, MAX_GOVERNANCE_REASON_LEN,
+    MAX_PAYMENT_ADAPTER_REF_LEN, MAX_ROLE_NAME_LEN,
+};
+
+// ---------------------------------------------------------------------------
+// String field validators (#1601) — delegate to scp-ffi-common
+// ---------------------------------------------------------------------------
+
+/// Validates a role name string. Delegates to [`scp_ffi_common::validate::validate_role_name`].
+pub fn validate_role_name(role: &str) -> Result<(), ScpPyError> {
+    scp_ffi_common::validate::validate_role_name(role)
+        .map_err(|e| ScpPyError::validation(e.message))
+}
+
+/// Validates a context name string. Delegates to [`scp_ffi_common::validate::validate_context_name`].
+pub fn validate_context_name(name: &str) -> Result<(), ScpPyError> {
+    scp_ffi_common::validate::validate_context_name(name)
+        .map_err(|e| ScpPyError::validation(e.message))
+}
+
+/// Validates a context description string. Delegates to [`scp_ffi_common::validate::validate_context_description`].
+pub fn validate_context_description(description: &str) -> Result<(), ScpPyError> {
+    scp_ffi_common::validate::validate_context_description(description)
+        .map_err(|e| ScpPyError::validation(e.message))
+}
+
+/// Validates a governance action reason or purpose string. Delegates to [`scp_ffi_common::validate::validate_governance_reason`].
+pub fn validate_governance_reason(reason: &str) -> Result<(), ScpPyError> {
+    scp_ffi_common::validate::validate_governance_reason(reason)
+        .map_err(|e| ScpPyError::validation(e.message))
+}
+
+/// Validates a payment adapter reference string. Delegates to [`scp_ffi_common::validate::validate_payment_adapter_ref`].
+pub fn validate_payment_adapter_ref(adapter_ref: &str) -> Result<(), ScpPyError> {
+    scp_ffi_common::validate::validate_payment_adapter_ref(adapter_ref)
+        .map_err(|e| ScpPyError::validation(e.message))
+}
+
+// ---------------------------------------------------------------------------
 // Attestation field validation
 // ---------------------------------------------------------------------------
 
@@ -766,5 +809,63 @@ mod tests {
     fn empty_transport_mode_rejected() {
         let err = validate_transport_mode("").unwrap_err();
         assert!(err.to_string().contains("must not be empty"));
+    }
+
+    // -- Delegating validators: smoke tests for ScpPyError wrapping --
+    // Full validation logic is tested in scp-ffi-common::validate.
+
+    #[test]
+    fn role_name_delegation_accepts_valid() {
+        assert!(validate_role_name("admin").is_ok());
+    }
+
+    #[test]
+    fn role_name_delegation_rejects_html() {
+        let err = validate_role_name("<script>admin").unwrap_err();
+        assert!(err.to_string().contains("HTML-special character"));
+    }
+
+    #[test]
+    fn context_name_delegation_accepts_valid() {
+        assert!(validate_context_name("My Context").is_ok());
+    }
+
+    #[test]
+    fn context_name_delegation_rejects_html() {
+        let err = validate_context_name("<b>test</b>").unwrap_err();
+        assert!(err.to_string().contains("HTML-special character"));
+    }
+
+    #[test]
+    fn context_description_delegation_accepts_valid() {
+        assert!(validate_context_description("A context for collaboration").is_ok());
+    }
+
+    #[test]
+    fn context_description_delegation_rejects_html() {
+        let err = validate_context_description("test &amp; things").unwrap_err();
+        assert!(err.to_string().contains("HTML-special character"));
+    }
+
+    #[test]
+    fn governance_reason_delegation_accepts_valid() {
+        assert!(validate_governance_reason("Member violated community guidelines").is_ok());
+    }
+
+    #[test]
+    fn governance_reason_delegation_rejects_html() {
+        let err = validate_governance_reason("reason <script>alert(1)</script>").unwrap_err();
+        assert!(err.to_string().contains("HTML-special character"));
+    }
+
+    #[test]
+    fn payment_adapter_ref_delegation_accepts_valid() {
+        assert!(validate_payment_adapter_ref("lightning").is_ok());
+    }
+
+    #[test]
+    fn payment_adapter_ref_delegation_rejects_html() {
+        let err = validate_payment_adapter_ref("stripe<script>").unwrap_err();
+        assert!(err.to_string().contains("HTML-special character"));
     }
 }

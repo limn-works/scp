@@ -7119,6 +7119,7 @@ pub async fn governance_propose(
         .spawn(async move {
             let action: scp_core::context::governance::GovernanceAction =
                 serde_json::from_str(&action_json)?;
+            validate_governance_action_strings(&action)?;
             let action_name = action.variant_name();
             let did = scp_identity::DID(proposer_did);
             let manager = crate::runtime::context_manager()?;
@@ -7152,6 +7153,18 @@ pub async fn governance_propose(
     }
 
     Ok(result)
+}
+
+/// Validates all user-controlled string fields on a governance action.
+fn validate_governance_action_strings(
+    action: &scp_core::context::governance::GovernanceAction,
+) -> Result<(), ScpError> {
+    scp_ffi_common::validate::validate_governance_action_strings(action).map_err(|e| {
+        ScpError::Validation {
+            msg: e.message,
+            code: "SCP-CTX-2040".to_owned(),
+        }
+    })
 }
 
 /// Casts an approval vote on a pending governance proposal.
