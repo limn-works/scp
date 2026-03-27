@@ -13,11 +13,11 @@
     },
     {
       "name": "SEND: evaluate_cost called (call_expression) in messaging.rs",
-      "check": "/Users/alec/.claude/plugins/cache/alecmarcus/odyssey/0.6.0/bin/check-ast crates/scp-runtime/src/context/manager/messaging.rs '(call_expression function: (scoped_identifier name: (identifier) @fn (#eq? @fn \"evaluate_cost\")))' --min 1"
+      "check": "/Users/alec/.claude/plugins/cache/alecmarcus/odyssey/0.6.0/bin/check-ast crates/scp-runtime/src/context/manager/messaging.rs '(call_expression function: (scoped_identifier name: (identifier) @fn  (#eq? @fn \"evaluate_cost\")))' --min 1 || /Users/alec/.claude/plugins/cache/alecmarcus/odyssey/0.6.0/bin/check-ast crates/scp-runtime/src/context/manager/economy.rs '(call_expression function: (scoped_identifier name: (identifier) @fn (#eq? @fn \"evaluate_cost\")))' --min 1"
     },
     {
       "name": "SEND: record_spend called (method call_expression) in messaging.rs",
-      "check": "/Users/alec/.claude/plugins/cache/alecmarcus/odyssey/0.6.0/bin/check-ast crates/scp-runtime/src/context/manager/messaging.rs '(call_expression function: (field_expression field: (field_identifier) @method (#eq? @method \"record_spend\")))' --min 1"
+      "check": "/Users/alec/.claude/plugins/cache/alecmarcus/odyssey/0.6.0/bin/check-ast crates/scp-runtime/src/context/manager/messaging.rs '(call_expression function: (field_expression field: (field_identifier) @method (#eq? @method \"record_spend\")))' --min 1 || /Users/alec/.claude/plugins/cache/alecmarcus/odyssey/0.6.0/bin/check-ast crates/scp-runtime/src/context/manager/economy.rs '(call_expression function: (field_expression field: (field_identifier)  @method (#eq? @method \"record_spend\")))' --min 1"
     },
     {
       "name": "SEND: PaidActionType::MessageSend in messaging.rs (scoped_identifier)",
@@ -29,7 +29,7 @@
     },
     {
       "name": "JOIN: evaluate_cost called (call_expression) in lifecycle.rs",
-      "check": "/Users/alec/.claude/plugins/cache/alecmarcus/odyssey/0.6.0/bin/check-ast crates/scp-runtime/src/context/manager/lifecycle.rs '(call_expression function: (scoped_identifier name: (identifier) @fn (#eq? @fn \"evaluate_cost\")))' --min 1"
+      "check": "/Users/alec/.claude/plugins/cache/alecmarcus/odyssey/0.6.0/bin/check-ast crates/scp-runtime/src/context/manager/lifecycle.rs '(call_expression function: (scoped_identifier name: (identifier) @fn  (#eq? @fn \"evaluate_cost\")))' --min 1 || /Users/alec/.claude/plugins/cache/alecmarcus/odyssey/0.6.0/bin/check-ast crates/scp-runtime/src/context/manager/economy.rs '(call_expression function: (scoped_identifier name: (identifier) @fn (#eq? @fn \"evaluate_cost\")))' --min 1"
     },
     {
       "name": "JOIN: PaidActionType::ContextJoin in lifecycle.rs (scoped_identifier)",
