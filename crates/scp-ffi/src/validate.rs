@@ -413,6 +413,56 @@ pub use scp_ffi_common::validate::{
     MAX_PAYMENT_ADAPTER_REF_LEN, MAX_ROLE_NAME_LEN,
 };
 
+/// Validates a role name. See [`scp_ffi_common::validate::validate_role_name`].
+///
+/// # Errors
+///
+/// Returns [`ScpPyError`] if the role name is invalid.
+pub fn validate_role_name(role: &str) -> Result<(), ScpPyError> {
+    scp_ffi_common::validate::validate_role_name(role)
+        .map_err(|e| ScpPyError::validation(e.message))
+}
+
+/// Validates a context name. See [`scp_ffi_common::validate::validate_context_name`].
+///
+/// # Errors
+///
+/// Returns [`ScpPyError`] if the context name is invalid.
+pub fn validate_context_name(name: &str) -> Result<(), ScpPyError> {
+    scp_ffi_common::validate::validate_context_name(name)
+        .map_err(|e| ScpPyError::validation(e.message))
+}
+
+/// Validates a context description. See [`scp_ffi_common::validate::validate_context_description`].
+///
+/// # Errors
+///
+/// Returns [`ScpPyError`] if the context description is invalid.
+pub fn validate_context_description(description: &str) -> Result<(), ScpPyError> {
+    scp_ffi_common::validate::validate_context_description(description)
+        .map_err(|e| ScpPyError::validation(e.message))
+}
+
+/// Validates a governance reason/purpose. See [`scp_ffi_common::validate::validate_governance_reason`].
+///
+/// # Errors
+///
+/// Returns [`ScpPyError`] if the reason is invalid.
+pub fn validate_governance_reason(reason: &str) -> Result<(), ScpPyError> {
+    scp_ffi_common::validate::validate_governance_reason(reason)
+        .map_err(|e| ScpPyError::validation(e.message))
+}
+
+/// Validates a payment adapter ref. See [`scp_ffi_common::validate::validate_payment_adapter_ref`].
+///
+/// # Errors
+///
+/// Returns [`ScpPyError`] if the adapter ref is invalid.
+pub fn validate_payment_adapter_ref(adapter_ref: &str) -> Result<(), ScpPyError> {
+    scp_ffi_common::validate::validate_payment_adapter_ref(adapter_ref)
+        .map_err(|e| ScpPyError::validation(e.message))
+}
+
 // ---------------------------------------------------------------------------
 // Attestation field validation
 // ---------------------------------------------------------------------------
