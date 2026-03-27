@@ -24,6 +24,7 @@
 // Production submodules first so extract_fn_body finds real implementations
 // before test mocks in mod.rs (the parser returns the first match).
 const MANAGER_SRC: &str = concat!(
+    include_str!("../../../../crates/scp-runtime/src/context/manager/economy.rs"),
     include_str!("../../../../crates/scp-runtime/src/context/manager/messaging.rs"),
     include_str!("../../../../crates/scp-runtime/src/context/manager/broadcast.rs"),
     include_str!("../../../../crates/scp-runtime/src/context/manager/governance.rs"),
@@ -41,7 +42,7 @@ const PROVIDER_SRC: &str =
 // RATCHET CONSTANTS — may only increase
 // Any decrease requires human approval
 // =========================================================================
-const MIN_ACTIVE_PIPELINE_ASSERTIONS: usize = 22;
+const MIN_ACTIVE_PIPELINE_ASSERTIONS: usize = 23;
 
 // ---------------------------------------------------------------------------
 // Function body extraction — brace-matching parser
@@ -133,12 +134,17 @@ fn send_message_calls_seal() {
     );
 }
 
-// Manager level: send_message calls transport.send_message
+// Manager level: send_message delegates to encrypt_and_send which calls transport.send_message
 #[test]
 fn send_message_calls_transport_send() {
+    // send_message delegates to encrypt_and_send, which calls transport.send_message.
     assert!(
-        fn_body_contains(MANAGER_SRC, "send_message", ".send_message("),
-        "send_message must call transport.send_message"
+        fn_body_contains(MANAGER_SRC, "send_message", "encrypt_and_send"),
+        "send_message must call encrypt_and_send"
+    );
+    assert!(
+        fn_body_contains(MANAGER_SRC, "encrypt_and_send", ".send_message("),
+        "encrypt_and_send must call transport.send_message"
     );
 }
 
@@ -371,15 +377,20 @@ fn governance_dispatch_calls_evaluate_consequences() {
 
 #[test]
 fn governance_enforces_economic_policy() {
-    // Economy enforcement is now split between enforce_send_economy (messaging)
-    // and enforce_join_economy (lifecycle). Both call evaluate_cost directly.
+    // Economy enforcement is unified in enforce_economy (economy.rs) which calls
+    // evaluate_cost. Both enforce_send_economy and enforce_join_economy delegate
+    // to enforce_economy. Check the unified function and the delegation.
     assert!(
-        fn_body_contains(MANAGER_SRC, "enforce_send_economy", "evaluate_cost"),
-        "enforce_send_economy must call evaluate_cost"
+        fn_body_contains(MANAGER_SRC, "enforce_economy", "evaluate_cost"),
+        "enforce_economy must call evaluate_cost"
     );
     assert!(
-        fn_body_contains(MANAGER_SRC, "enforce_join_economy", "evaluate_cost"),
-        "enforce_join_economy must call evaluate_cost"
+        fn_body_contains(MANAGER_SRC, "enforce_send_economy", "enforce_economy"),
+        "enforce_send_economy must delegate to enforce_economy"
+    );
+    assert!(
+        fn_body_contains(MANAGER_SRC, "enforce_join_economy", "enforce_economy"),
+        "enforce_join_economy must delegate to enforce_economy"
     );
 }
 
@@ -421,52 +432,18 @@ fn pipeline_active_assertions_never_decrease() {
     );
 }
 
-/// Detects stale `#[ignore]` attributes. If a wiring PR lands but forgets
-/// to remove the `#[ignore]`, this test catches it by running the same check
-/// the ignored test would run. A passing check = stale ignore = CI failure.
+/// Asserts that no `#[ignore]` attributes remain in this test file.
+///
+/// All batch 2 ignores have been removed. Any `#[ignore]` is stale and
+/// must be removed (the wiring has landed). This is a strict assertion
+/// rather than per-test checking because all ignores should be gone.
 #[test]
 fn no_stale_ignores() {
-    let mut stale: Vec<&str> = vec![];
     let source = include_str!("pipeline_wiring.rs");
-
-    // Check that batch-2 governance wiring is present (not ignored).
-    // Each check verifies wiring is present AND no stale #[ignore] remains.
-    if fn_body_contains(
-        MANAGER_SRC,
-        "dispatch_consequences",
-        "evaluate_consequence_rules",
-    ) && source.contains("#[ignore = \"waiting for #1531\"]")
-    {
-        stale.push("governance_dispatch_calls_evaluate_consequences — #1531 is wired");
-    }
-
-    if fn_body_contains(MANAGER_SRC, "enforce_send_economy", "evaluate_cost")
-        && source.contains("#[ignore = \"waiting for #1537\"]")
-    {
-        stale.push("governance_enforces_economic_policy — #1537 is wired");
-    }
-
-    if fn_body_contains(
-        MANAGER_SRC,
-        "check_standing",
-        "compute_participation_record",
-    ) && source.contains("#[ignore = \"waiting for #1530\"]")
-    {
-        stale.push("standing_check_wired — #1530 is wired");
-    }
-
-    if (fn_body_contains(MANAGER_SRC, "execute_rotate_content_keys", "advance_epoch")
-        || fn_body_contains(MANAGER_SRC, "execute_rotate_content_keys", "propose_update"))
-        && source.contains("#[ignore = \"waiting for #1548\"]")
-    {
-        stale.push("rotate_content_keys_calls_propose_update — #1548 is wired");
-    }
-
-    assert!(
-        stale.is_empty(),
-        "Stale #[ignore] — these tests would pass but are still ignored. \
-         Remove the #[ignore] attribute and bump MIN_ACTIVE_PIPELINE_ASSERTIONS:\n  {}",
-        stale.join("\n  ")
+    assert_eq!(
+        source.matches("#[ignore = \"").count(),
+        0,
+        "all ignores should be removed — if wiring landed, remove the #[ignore]"
     );
 }
 

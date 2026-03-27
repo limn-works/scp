@@ -561,12 +561,15 @@ pub fn check_tool_economy(
             &scp_protocol::economy::types::PaidActionType::ToolInvoke,
             &metrics,
         ) {
-            // Auto-grant the exact action cost on first spend if no
-            // governance-approved budget exists. This lets the member
-            // complete this one action but requires governance approval
-            // (ApproveSpend) for further spending.
+            // No auto-grant — budget must be explicitly approved via
+            // ApproveSpend governance action. If no budget exists, fail
+            // with BudgetExceeded error.
             if !budget_tracker.has_budget(invoker_did) {
-                budget_tracker.grant(invoker_did, cost);
+                return Err(InvocationError::BudgetExceeded {
+                    did: invoker_did.to_string(),
+                    cost: cost.0,
+                    remaining: 0,
+                });
             }
             // Record spend against invoker budget (§19.5, ADR-033).
             budget_tracker

@@ -15,87 +15,30 @@ use super::{
 
 /// Enforces economic policy for message sends (#1537, #1593).
 ///
-/// Checks sender velocity, evaluates cost from the context's economic
-/// policy, enforces spending UCAN AND-composition (spec §19.5) when cost > 0,
-/// and records spend against the sender's budget.
+/// Unified economy enforcement: evaluates cost, checks spending UCAN
+/// AND-composition (spec §19.5), and records spend against the sender's
+/// budget. No auto-grant — budget must be explicitly approved via
+/// `ApproveSpend` governance action.
 ///
-/// Returns the deducted cost (if any) so that the caller can pass the exact
-/// amount to `rollback_send_budget` on failure, avoiding re-evaluation
-/// which could produce a different amount due to changed metrics.
+/// Returns the deducted cost (if any) so that the caller can rollback
+/// on failure via `rollback_budget`.
 fn enforce_send_economy(
     ctx: &mut PerContextState,
     sender_did: &DID,
     now: u64,
     spending_ucan: Option<&scp_protocol::crypto::ucan::UcanToken>,
 ) -> Result<Option<scp_protocol::economy::types::Amount>, ContextError> {
-    if let Some(ref policy) = ctx.governance.economic_policy {
-        let velocity = ctx
-            .governance
-            .velocity_tracker
-            .get_velocity(sender_did, now);
-        let metrics = scp_protocol::economy::policy::ObservableMetrics {
-            sender_velocity: velocity,
-            member_count: u64::try_from(ctx.membership.count()).unwrap_or(u64::MAX),
-            context_message_rate: ctx.governance.velocity_tracker.aggregate_velocity(now),
-            // relay_queue_depth: Requires relay-level telemetry not available at ContextManager.
-            // The relay tracks its own queue depth server-side; populating this field would
-            // require a relay→client metrics channel (e.g., relay status subscription or
-            // periodic metric push). Until that transport-layer telemetry exists, relay-queue-
-            // based pricing variables evaluate to zero.
-            relay_queue_depth: 0,
-            time_of_day: now % 86400,
-            // storage_usage: Requires storage provider metrics not available at ContextManager.
-            // The Storage trait (scp-platform) does not expose per-context byte counts.
-            // Populating this field would require adding a `storage_usage(context_id)` method
-            // to the Storage trait and propagating it through ContextManager. Until that
-            // provider-level API exists, storage-based pricing variables evaluate to zero.
-            storage_usage: 0,
-        };
-        if let Some(cost) = scp_protocol::economy::policy::evaluate_cost(
-            policy,
-            &scp_protocol::economy::types::PaidActionType::MessageSend,
-            &metrics,
-        ) {
-            // AND-composition (§19.5, #1593): paid actions require both the
-            // action capability (already checked by MessagesWrite above) AND a
-            // spending UCAN. Free actions (cost == 0) pass through.
-            if cost.0 > 0 {
-                if spending_ucan.is_none() {
-                    return Err(ContextError::PermissionDenied(
-                        "SCP-ECON-7060: paid action requires spending UCAN".to_owned(),
-                    ));
-                }
-                // Validate AND-composition: the action capability (MessagesWrite)
-                // was already verified earlier in the flow, so action_ucan is
-                // None (meaning "already verified"). Only the spending UCAN
-                // needs validation here.
-                scp_protocol::crypto::ucan::spending::check_and_composition(
-                    None, // action UCAN: already verified (MessagesWrite check above)
-                    spending_ucan,
-                    scp_protocol::crypto::ucan::spending::Amount(cost.0),
-                    "messages:write",
-                )
-                .map_err(|e| ContextError::PermissionDenied(format!("SCP-ECON-7061: {e}")))?;
-            }
-
-            // Auto-grant the exact action cost on first spend if no
-            // governance-approved budget exists. This lets the member
-            // complete this one action but requires governance approval
-            // (ApproveSpend) for further spending. Granting u64::MAX would
-            // bypass all budget governance.
-            if !ctx.governance.budget_tracker.has_budget(sender_did) {
-                ctx.governance.budget_tracker.grant(sender_did, cost);
-            }
-            ctx.governance
-                .budget_tracker
-                .record_spend(sender_did, cost)
-                .map_err(|e| {
-                    ContextError::PermissionDenied(format!("SCP-ECON-7010: budget exceeded: {e}"))
-                })?;
-            return Ok(Some(cost));
-        }
-    }
-    Ok(None)
+    super::economy::enforce_economy(
+        ctx.governance.economic_policy.as_ref(),
+        &mut ctx.governance.budget_tracker,
+        &ctx.governance.velocity_tracker,
+        ctx.membership.count(),
+        &scp_protocol::economy::types::PaidActionType::MessageSend,
+        sender_did,
+        now,
+        spending_ucan,
+        "messages:write",
+    )
 }
 
 /// Updates the relay base price based on current context utilization (#1537).
@@ -103,9 +46,17 @@ fn enforce_send_economy(
 /// Called periodically (on message send) to adjust the EIP-1559-style relay
 /// price. Uses member count as a proxy for utilization. Only applies when the
 /// context has a relay pricing config in its governance state.
-fn maybe_adjust_relay_pricing(ctx: &mut PerContextState) {
+fn maybe_adjust_relay_pricing(ctx: &mut PerContextState, now: u64) {
     if let Some(ref mut config) = ctx.governance.relay_pricing_config {
-        let utilization_pct = u64::try_from(ctx.membership.count()).unwrap_or(0).min(100);
+        // Use aggregate velocity (messages/window across all senders) as a
+        // utilization proxy instead of raw member count. This better reflects
+        // actual load on the relay and makes pricing responsive to traffic
+        // patterns rather than static membership.
+        let utilization_pct = ctx
+            .governance
+            .velocity_tracker
+            .aggregate_velocity(now)
+            .min(100);
         let adjustment =
             scp_protocol::economy::pricing::adjust_relay_price(config, utilization_pct);
         // Apply the new base price back to the config.
@@ -498,44 +449,41 @@ impl ContextManager {
         Ok(())
     }
 
-    /// Executes the 9-step payment flow for message sends with budget rollback.
+    /// Executes the payment flow for message sends using the escrow pattern.
+    ///
+    /// Authorize -> the caller does the action -> complete on success / void
+    /// on failure. Budget rollback uses `rollback_budget`.
     async fn execute_send_payment(
         &self,
         context_id: &str,
         sender_did: &DID,
         deducted_cost: Option<scp_protocol::economy::types::Amount>,
     ) -> Result<(), ContextError> {
-        if let Err(payment_err) = self
-            .execute_paid_action(
+        // Authorize payment (escrow hold).
+        let auth = self
+            .authorize_paid_action(
                 scp_protocol::economy::types::PaidActionType::MessageSend,
                 sender_did,
                 context_id,
             )
-            .await
-        {
-            self.rollback_send_budget(context_id, sender_did, deducted_cost)
-                .await;
-            return Err(payment_err);
-        }
-        Ok(())
-    }
-
-    /// Restores the exact amount deducted by `enforce_send_economy`.
-    ///
-    /// The `deducted_cost` parameter is the value returned by
-    /// `enforce_send_economy`. Using the stored cost avoids re-evaluating
-    /// the pricing formula (which could produce a different amount due to
-    /// changed metrics between the deduction and the rollback).
-    async fn rollback_send_budget(
-        &self,
-        context_id: &str,
-        sender_did: &DID,
-        deducted_cost: Option<scp_protocol::economy::types::Amount>,
-    ) {
-        if let Some(cost) = deducted_cost {
-            let mut contexts = self.contexts.lock().await;
-            if let Some(ctx) = contexts.get_mut(context_id) {
-                ctx.governance.budget_tracker.grant(sender_did, cost);
+            .await;
+        match auth {
+            Ok(Some(auth)) => {
+                // Complete after action succeeds (caller handles action).
+                if let Err(e) = self
+                    .complete_paid_action(auth, sender_did, context_id)
+                    .await
+                {
+                    super::economy::rollback_budget(self, context_id, sender_did, deducted_cost)
+                        .await;
+                    return Err(e);
+                }
+                Ok(())
+            }
+            Ok(None) => Ok(()), // No payment needed.
+            Err(payment_err) => {
+                super::economy::rollback_budget(self, context_id, sender_did, deducted_cost).await;
+                Err(payment_err)
             }
         }
     }
@@ -593,6 +541,7 @@ impl ContextManager {
                         sender_did.as_ref(),
                         now,
                     ),
+                    &consequence_rules,
                     &*self.clock,
                 );
 
@@ -620,7 +569,7 @@ impl ContextManager {
                 }
 
                 // Dynamic pricing (#1537) — adjust relay price on each send.
-                maybe_adjust_relay_pricing(ctx);
+                maybe_adjust_relay_pricing(ctx, now);
             }
         }
         self.event_log.append_context_event(
