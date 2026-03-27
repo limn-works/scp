@@ -146,6 +146,44 @@ impl SenderVelocityTracker {
         self.window_secs
     }
 
+    /// Exports the tracker's per-sender timestamp entries for persistence.
+    ///
+    /// Returns a clone of the internal `HashMap<DID, Vec<u64>>` mapping each
+    /// sender DID to their recorded message timestamps. Used by
+    /// [`ContextSnapshot`](crate) to persist velocity state across restarts.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal mutex is poisoned.
+    #[must_use]
+    pub fn snapshot_entries(&self) -> HashMap<String, Vec<u64>> {
+        let state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state
+            .iter()
+            .map(|(did, timestamps)| (did.as_ref().to_owned(), timestamps.clone()))
+            .collect()
+    }
+
+    /// Reconstructs a tracker from a persisted snapshot.
+    ///
+    /// Restores both the sliding window configuration and per-sender timestamp
+    /// entries. Used during context restoration to avoid losing velocity state
+    /// across process restarts.
+    #[must_use]
+    pub fn from_snapshot(window_secs: u64, entries: HashMap<String, Vec<u64>>) -> Self {
+        let converted: HashMap<DID, Vec<u64>> = entries
+            .into_iter()
+            .map(|(did_str, timestamps)| (DID::from(did_str), timestamps))
+            .collect();
+        Self {
+            window_secs,
+            state: Mutex::new(converted),
+        }
+    }
+
     /// Records a message from `sender` at the given `timestamp`.
     ///
     /// The timestamp is in seconds since the Unix epoch. Messages are
@@ -183,7 +221,7 @@ impl SenderVelocityTracker {
         let cutoff = now.saturating_sub(self.window_secs);
 
         state.get_mut(sender).map_or(0, |timestamps| {
-            timestamps.retain(|&ts| ts > cutoff);
+            timestamps.retain(|&ts| ts >= cutoff);
             timestamps.len() as u64
         })
     }
@@ -212,7 +250,7 @@ impl SenderVelocityTracker {
 
         let mut total: u64 = 0;
         for timestamps in state.values_mut() {
-            timestamps.retain(|&ts| ts > cutoff);
+            timestamps.retain(|&ts| ts >= cutoff);
             total = total.saturating_add(timestamps.len() as u64);
         }
         total
@@ -327,9 +365,10 @@ mod tests {
         // At t=105, both messages in window
         assert_eq!(tracker.get_velocity(&sender, 105), 2);
 
-        // At t=115, message at 100 is expired (115 - 10 = 105 cutoff, 100 <= 105)
-        // Message at 105 is also expired (105 <= 105, using > cutoff)
-        assert_eq!(tracker.get_velocity(&sender, 115), 0);
+        // At t=115, cutoff = 115 - 10 = 105. retain uses `ts >= cutoff`:
+        // - message at 100: 100 >= 105 → false → pruned
+        // - message at 105: 105 >= 105 → true → retained
+        assert_eq!(tracker.get_velocity(&sender, 115), 1);
     }
 
     #[test]
@@ -595,5 +634,76 @@ mod tests {
         let now = base_ts + (thread_count * messages_per_thread) as u64;
         let total = tracker.get_velocity(&sender, now);
         assert_eq!(total, (thread_count * messages_per_thread) as u64);
+    }
+
+    // --- Snapshot / restore ---
+
+    #[test]
+    fn snapshot_entries_captures_all_senders() {
+        let tracker = SenderVelocityTracker::new(60);
+        let alice = did("did:dht:z6MkAlice");
+        let bob = did("did:dht:z6MkBob");
+
+        tracker.record_message(&alice, 1000);
+        tracker.record_message(&alice, 1010);
+        tracker.record_message(&bob, 1005);
+
+        let entries = tracker.snapshot_entries();
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries.get("did:dht:z6MkAlice").unwrap(), &vec![1000, 1010]);
+        assert_eq!(entries.get("did:dht:z6MkBob").unwrap(), &vec![1005]);
+    }
+
+    #[test]
+    fn snapshot_entries_empty_for_new_tracker() {
+        let tracker = SenderVelocityTracker::new(60);
+        assert!(tracker.snapshot_entries().is_empty());
+    }
+
+    #[test]
+    fn from_snapshot_restores_velocity_state() {
+        let mut entries = HashMap::new();
+        entries.insert("did:dht:z6MkAlice".to_owned(), vec![1000, 1010, 1020]);
+        entries.insert("did:dht:z6MkBob".to_owned(), vec![1005]);
+
+        let restored = SenderVelocityTracker::from_snapshot(120, entries);
+
+        assert_eq!(restored.window_secs(), 120);
+        // All timestamps within 120s window of t=1020.
+        assert_eq!(restored.get_velocity(&did("did:dht:z6MkAlice"), 1020), 3);
+        assert_eq!(restored.get_velocity(&did("did:dht:z6MkBob"), 1020), 1);
+    }
+
+    #[test]
+    fn from_snapshot_empty_entries() {
+        let restored = SenderVelocityTracker::from_snapshot(60, HashMap::new());
+        assert_eq!(restored.window_secs(), 60);
+        assert_eq!(restored.get_velocity(&did("did:dht:z6MkUnknown"), 1000), 0);
+    }
+
+    #[test]
+    fn snapshot_roundtrip_preserves_velocity() {
+        let tracker = SenderVelocityTracker::new(120);
+        let alice = did("did:dht:z6MkAlice");
+        let bob = did("did:dht:z6MkBob");
+
+        tracker.record_message(&alice, 500);
+        tracker.record_message(&alice, 510);
+        tracker.record_message(&alice, 520);
+        tracker.record_message(&bob, 505);
+        tracker.record_message(&bob, 515);
+
+        // Original velocities at t=520.
+        let alice_vel = tracker.get_velocity(&alice, 520);
+        let bob_vel = tracker.get_velocity(&bob, 520);
+
+        // Snapshot → restore.
+        let entries = tracker.snapshot_entries();
+        let restored = SenderVelocityTracker::from_snapshot(120, entries);
+
+        // Velocities should match.
+        assert_eq!(restored.get_velocity(&alice, 520), alice_vel);
+        assert_eq!(restored.get_velocity(&bob, 520), bob_vel);
+        assert_eq!(restored.window_secs(), tracker.window_secs());
     }
 }

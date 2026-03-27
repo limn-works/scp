@@ -627,6 +627,8 @@ fn governance_snapshot_serde_roundtrip() {
         consequence_rules: Vec::new(),
         participation_cache: std::collections::HashMap::new(),
         velocity_tracker: None,
+        velocity_tracker_state: None,
+        cooldown_until: HashMap::new(),
     };
 
     let json = serde_json::to_string(&snapshot).expect("serialize");
@@ -6617,6 +6619,7 @@ async fn budget_exceeded_denies_send() {
         .unwrap()
         .handle
         .clone();
+    let ucan = dummy_spending_ucan();
     let result = manager
         .send_message(
             &handle,
@@ -6624,10 +6627,15 @@ async fn budget_exceeded_denies_send() {
             b"expensive",
             Some(&sk),
             None,
-            None,
+            Some(&ucan),
         )
         .await;
     assert!(result.is_err(), "send should fail when budget is exceeded");
+    let err_msg = result.unwrap_err().to_string();
+    assert!(
+        err_msg.contains("budget exceeded") || err_msg.contains("SCP-ECON-7010"),
+        "error should mention budget: {err_msg}"
+    );
 }
 
 // -----------------------------------------------------------------------
@@ -11692,11 +11700,11 @@ async fn context_created_event_has_creator_actor_did() {
 }
 
 // -----------------------------------------------------------------------
-// §42. Budget auto-grant on first spend
+// §42. No auto-grant — budget must be explicitly approved
 // -----------------------------------------------------------------------
 
 #[tokio::test]
-async fn budget_auto_grant_on_first_spend() {
+async fn no_auto_grant_requires_explicit_budget() {
     use scp_protocol::economy::types::{Amount, CostSchedule, CurrencyCode, EconomicPolicy};
 
     let manager = ContextManager::new(
@@ -11722,35 +11730,60 @@ async fn budget_auto_grant_on_first_spend() {
         payee: DID::from("did:key:payee"),
     });
     let _handle = manager
-        .create_context("auto-grant-ctx".into(), params, "did:key:sender".into())
+        .create_context("no-autogrant-ctx".into(), params, "did:key:sender".into())
         .await
         .unwrap();
 
-    // Do NOT manually grant budget — the auto-grant on first spend should handle it.
     let sk = ed25519_dalek::SigningKey::from_bytes(&[1u8; 32]);
     let handle = manager
         .contexts
         .lock()
         .await
-        .get("auto-grant-ctx")
+        .get("no-autogrant-ctx")
         .unwrap()
         .handle
         .clone();
 
+    // Without budget, send should fail with NoBudget error.
     let ucan = dummy_spending_ucan();
     let result = manager
         .send_message(
             &handle,
             &"did:key:sender".into(),
-            b"auto grant test",
+            b"no budget test",
+            Some(&sk),
+            None,
+            Some(&ucan),
+        )
+        .await;
+    assert!(result.is_err(), "send should fail without explicit budget");
+    let err_msg = result.unwrap_err().to_string();
+    assert!(
+        err_msg.contains("no budget") || err_msg.contains("SCP-ECON-7010"),
+        "error should indicate no budget: {err_msg}"
+    );
+
+    // After explicit budget grant, send should succeed.
+    {
+        let mut contexts = manager.contexts.lock().await;
+        let ctx = contexts.get_mut("no-autogrant-ctx").unwrap();
+        ctx.governance
+            .budget_tracker
+            .grant(&"did:key:sender".into(), Amount::new(100));
+    }
+    let result2 = manager
+        .send_message(
+            &handle,
+            &"did:key:sender".into(),
+            b"with budget",
             Some(&sk),
             None,
             Some(&ucan),
         )
         .await;
     assert!(
-        result.is_ok(),
-        "first spend should auto-grant unlimited budget: {result:?}"
+        result2.is_ok(),
+        "send should succeed after explicit budget grant: {result2:?}"
     );
 }
 
@@ -13233,6 +13266,15 @@ async fn observable_metrics_time_of_day_populated() {
         .handle
         .clone();
 
+    // Grant budget so economy enforcement passes.
+    {
+        let mut contexts = manager.contexts.lock().await;
+        let ctx = contexts.get_mut("tod-ctx").unwrap();
+        ctx.governance
+            .budget_tracker
+            .grant(&"did:key:sender".into(), Amount::new(100));
+    }
+
     let ucan = dummy_spending_ucan();
     // Send a message — the enforce_send_economy function constructs
     // ObservableMetrics with time_of_day = now % 86400. If this panics
@@ -13338,5 +13380,434 @@ async fn context_message_rate_from_aggregate_velocity() {
     assert!(
         aggregate >= 5,
         "context_message_rate should reflect 5+ sends, got {aggregate}"
+    );
+}
+
+// -----------------------------------------------------------------------
+// Velocity tracker + cooldown persistence roundtrip tests (#1530, #1531)
+// -----------------------------------------------------------------------
+
+/// Verifies that `VelocityTrackerSnapshot` serializes and deserializes with
+/// per-sender timestamps intact, and that `SenderVelocityTracker::from_snapshot`
+/// reconstructs velocity state correctly.
+#[test]
+fn velocity_tracker_snapshot_roundtrip() {
+    use scp_protocol::economy::antispam::SenderVelocityTracker;
+
+    let tracker = SenderVelocityTracker::new(120);
+    let alice = scp_identity::DID::from("did:dht:z6MkAlice");
+    let bob = scp_identity::DID::from("did:dht:z6MkBob");
+
+    // Record messages at specific timestamps.
+    tracker.record_message(&alice, 1000);
+    tracker.record_message(&alice, 1010);
+    tracker.record_message(&alice, 1020);
+    tracker.record_message(&bob, 1005);
+    tracker.record_message(&bob, 1015);
+
+    // Snapshot the tracker.
+    let snapshot = super::VelocityTrackerSnapshot {
+        window_secs: tracker.window_secs(),
+        entries: tracker.snapshot_entries(),
+    };
+
+    // Verify snapshot has correct entries.
+    assert_eq!(snapshot.window_secs, 120);
+    assert_eq!(snapshot.entries.len(), 2);
+    assert_eq!(snapshot.entries.get("did:dht:z6MkAlice").unwrap().len(), 3);
+    assert_eq!(snapshot.entries.get("did:dht:z6MkBob").unwrap().len(), 2);
+
+    // Serialize and deserialize.
+    let json = serde_json::to_string(&snapshot).expect("serialize");
+    let deserialized: super::VelocityTrackerSnapshot =
+        serde_json::from_str(&json).expect("deserialize");
+
+    assert_eq!(deserialized.window_secs, 120);
+    assert_eq!(deserialized.entries.len(), 2);
+
+    // Reconstruct tracker from snapshot.
+    let restored =
+        SenderVelocityTracker::from_snapshot(deserialized.window_secs, deserialized.entries);
+
+    assert_eq!(restored.window_secs(), 120);
+    // Query at t=1020 (within 120s window) — alice has 3, bob has 2.
+    assert_eq!(restored.get_velocity(&alice, 1020), 3);
+    assert_eq!(restored.get_velocity(&bob, 1020), 2);
+}
+
+/// Verifies that `ContextSnapshot` with `velocity_tracker_state` and
+/// `cooldown_until` survives a full serialize→deserialize roundtrip.
+#[test]
+fn velocity_tracker_state_in_context_snapshot_roundtrip() {
+    use scp_protocol::context::ContextParams;
+    use scp_protocol::context::membership::MembershipState;
+    use scp_protocol::context::roles::{ContextRoleState, default_ceiling};
+
+    let role_state = ContextRoleState::new(
+        "vt-persist-ctx",
+        "did:key:creator",
+        default_ceiling(),
+        vec![],
+        &scp_primitives::SystemClock,
+    )
+    .unwrap();
+
+    let mut entries = HashMap::new();
+    entries.insert("did:dht:z6MkAlice".to_owned(), vec![500, 510, 520]);
+    entries.insert("did:dht:z6MkBob".to_owned(), vec![505]);
+
+    let mut cooldowns = HashMap::new();
+    cooldowns.insert(0_usize, 9999_u64);
+    cooldowns.insert(2_usize, 12345_u64);
+
+    let snapshot = super::ContextSnapshot {
+        context_id: "vt-persist-ctx".to_owned(),
+        state: scp_protocol::context::ContextState::Active,
+        context_params: ContextParams::default(),
+        membership: MembershipState::new(),
+        role_state,
+        executed_proposals: HashSet::new(),
+        ttl_remaining_secs: None,
+        registered_tools: Vec::new(),
+        write_revoked_members: HashSet::new(),
+        read_revoked_members: HashSet::new(),
+        read_exclusion_list: HashSet::new(),
+        tool_interfaces: Vec::new(),
+        threshold_signers: Vec::new(),
+        threshold_value: 0,
+        pruning_policy: None,
+        governance_model_config: None,
+        economic_policy: None,
+        budget_tracker: scp_protocol::economy::budget::MemberBudgetTracker::new(),
+        approved_proposals: HashMap::new(),
+        governance_freeze: None,
+        pending_ceiling_modification: None,
+        pending_economic_policy_change: None,
+        mls_epoch: 0,
+        epoch_coordination_records: Vec::new(),
+        grace_entries: Vec::new(),
+        needs_reconnect: false,
+        mls_crypto_state: Vec::new(),
+        migration_state: None,
+        access_key_store: scp_protocol::crypto::access_keys::AccessKeyStore::new(),
+        consequence_rules: Vec::new(),
+        participation_cache: HashMap::new(),
+        velocity_tracker: Some(120),
+        velocity_tracker_state: Some(super::VelocityTrackerSnapshot {
+            window_secs: 120,
+            entries: entries.clone(),
+        }),
+        cooldown_until: cooldowns.clone(),
+    };
+
+    let json = serde_json::to_string(&snapshot).expect("serialize");
+    let deserialized: super::ContextSnapshot = serde_json::from_str(&json).expect("deserialize");
+
+    // Verify velocity tracker state survived.
+    let vts = deserialized.velocity_tracker_state.as_ref().unwrap();
+    assert_eq!(vts.window_secs, 120);
+    assert_eq!(vts.entries.len(), 2);
+    assert_eq!(
+        vts.entries.get("did:dht:z6MkAlice").unwrap(),
+        &vec![500, 510, 520]
+    );
+    assert_eq!(vts.entries.get("did:dht:z6MkBob").unwrap(), &vec![505]);
+
+    // Verify cooldown_until survived.
+    assert_eq!(deserialized.cooldown_until.len(), 2);
+    assert_eq!(deserialized.cooldown_until.get(&0), Some(&9999));
+    assert_eq!(deserialized.cooldown_until.get(&2), Some(&12345));
+}
+
+/// Verifies backward compatibility: old snapshots without `velocity_tracker_state`
+/// or `cooldown_until` deserialize cleanly using `#[serde(default)]`.
+#[test]
+fn velocity_tracker_backward_compat_deserialization() {
+    // Simulate a legacy snapshot JSON that has `velocity_tracker: 3600` but
+    // no `velocity_tracker_state` or `cooldown_until` keys.
+    use scp_protocol::context::ContextParams;
+    use scp_protocol::context::membership::MembershipState;
+    use scp_protocol::context::roles::{ContextRoleState, default_ceiling};
+
+    let role_state = ContextRoleState::new(
+        "legacy-ctx",
+        "did:key:creator",
+        default_ceiling(),
+        vec![],
+        &scp_primitives::SystemClock,
+    )
+    .unwrap();
+
+    // Build a snapshot with the new fields, serialize, then strip the new keys
+    // from JSON to simulate a legacy format.
+    let snapshot = super::ContextSnapshot {
+        context_id: "legacy-ctx".to_owned(),
+        state: scp_protocol::context::ContextState::Active,
+        context_params: ContextParams::default(),
+        membership: MembershipState::new(),
+        role_state,
+        executed_proposals: HashSet::new(),
+        ttl_remaining_secs: None,
+        registered_tools: Vec::new(),
+        write_revoked_members: HashSet::new(),
+        read_revoked_members: HashSet::new(),
+        read_exclusion_list: HashSet::new(),
+        tool_interfaces: Vec::new(),
+        threshold_signers: Vec::new(),
+        threshold_value: 0,
+        pruning_policy: None,
+        governance_model_config: None,
+        economic_policy: None,
+        budget_tracker: scp_protocol::economy::budget::MemberBudgetTracker::new(),
+        approved_proposals: HashMap::new(),
+        governance_freeze: None,
+        pending_ceiling_modification: None,
+        pending_economic_policy_change: None,
+        mls_epoch: 0,
+        epoch_coordination_records: Vec::new(),
+        grace_entries: Vec::new(),
+        needs_reconnect: false,
+        mls_crypto_state: Vec::new(),
+        migration_state: None,
+        access_key_store: scp_protocol::crypto::access_keys::AccessKeyStore::new(),
+        consequence_rules: Vec::new(),
+        participation_cache: HashMap::new(),
+        velocity_tracker: Some(3600),
+        velocity_tracker_state: None,
+        cooldown_until: HashMap::new(),
+    };
+
+    let mut json_value: serde_json::Value =
+        serde_json::to_value(&snapshot).expect("serialize to value");
+    // Remove the new fields to simulate a legacy snapshot.
+    json_value
+        .as_object_mut()
+        .unwrap()
+        .remove("velocity_tracker_state");
+    json_value.as_object_mut().unwrap().remove("cooldown_until");
+
+    let legacy_json = serde_json::to_string(&json_value).expect("serialize");
+    let deserialized: super::ContextSnapshot =
+        serde_json::from_str(&legacy_json).expect("deserialize legacy");
+
+    // New fields should default.
+    assert!(deserialized.velocity_tracker_state.is_none());
+    assert!(deserialized.cooldown_until.is_empty());
+    // Old field should survive.
+    assert_eq!(deserialized.velocity_tracker, Some(3600));
+}
+
+/// Verifies `cooldown_until` snapshot roundtrip: set cooldowns, snapshot,
+/// restore, and verify cooldowns are still active.
+#[test]
+fn cooldown_until_snapshot_roundtrip() {
+    let mut cooldowns: HashMap<usize, u64> = HashMap::new();
+    cooldowns.insert(0, 5000); // rule 0 on cooldown until t=5000
+    cooldowns.insert(3, 8000); // rule 3 on cooldown until t=8000
+
+    // Serialize and deserialize.
+    let json = serde_json::to_string(&cooldowns).expect("serialize");
+    let deserialized: HashMap<usize, u64> = serde_json::from_str(&json).expect("deserialize");
+
+    assert_eq!(deserialized.len(), 2);
+    assert_eq!(deserialized.get(&0), Some(&5000));
+    assert_eq!(deserialized.get(&3), Some(&8000));
+
+    // Verify cooldown logic: at t=4000, both rules are still on cooldown.
+    let now = 4000_u64;
+    for (&_rule_idx, &expiry) in &deserialized {
+        assert!(now < expiry, "cooldown should still be active at t={now}");
+    }
+
+    // At t=6000, rule 0 has expired but rule 3 is still active.
+    let now = 6000_u64;
+    assert!(
+        now >= *deserialized.get(&0).unwrap(),
+        "rule 0 cooldown should have expired"
+    );
+    assert!(
+        now < *deserialized.get(&3).unwrap(),
+        "rule 3 cooldown should still be active"
+    );
+}
+
+// -----------------------------------------------------------------------
+// Periodic consequence evaluation via governance timeout task (#1531)
+// -----------------------------------------------------------------------
+
+/// Time-based consequence rules fire via the governance timeout task's
+/// periodic tick, even when no user action (send, join, tool invoke)
+/// occurs. This validates that the Phase 4 consequence evaluation in
+/// `start_governance_timeout_task` works correctly.
+#[tokio::test(start_paused = true)]
+async fn consequence_timer_fires_without_user_action() {
+    use scp_protocol::trust::consequence::{
+        ConsequenceAction, ConsequenceRule, ConsequenceTrigger,
+    };
+    use std::time::Duration;
+
+    let manager = ContextManager::new(
+        Box::new(MockCrypto::default()),
+        Box::new(MockTransport::connected()),
+        Box::new(MockEventLog::default()),
+        mock_key_resolver(),
+    );
+
+    let admin: DID = "did:dht:z6MkCreator".into();
+
+    let mut params = governance_params();
+    params.economic_policy = None;
+    // threshold=0 means the rule triggers even with zero matching events
+    // (i.e., inactivity itself is the trigger).
+    params.consequence_rules = vec![ConsequenceRule {
+        trigger: ConsequenceTrigger::MessageVelocity,
+        threshold: 0,
+        action: ConsequenceAction::CapabilitySuspension(vec!["write".to_owned()]),
+        window: Duration::from_secs(3600),
+    }];
+
+    let _handle = manager
+        .create_context("timer-conseq-ctx".into(), params, admin.clone())
+        .await
+        .unwrap();
+
+    // Do NOT send any messages — the consequence should fire purely from
+    // the periodic timer tick.
+
+    // Drain any events from context creation itself.
+    let _ = manager.drain_events("timer-conseq-ctx").await;
+
+    // Advance past the 60-second governance timeout interval.
+    tokio::time::sleep(Duration::from_secs(61)).await;
+    // Yield to let the spawned timeout task process.
+    for _ in 0..20 {
+        tokio::task::yield_now().await;
+    }
+
+    let events = manager.drain_events("timer-conseq-ctx").await;
+    let triggered_count = events
+        .iter()
+        .filter(|e| matches!(e, ContextEvent::ConsequenceTriggered { .. }))
+        .count();
+    let enforced_count = events
+        .iter()
+        .filter(|e| matches!(e, ContextEvent::ConsequenceEnforced { .. }))
+        .count();
+
+    assert!(
+        triggered_count > 0,
+        "consequence should fire from periodic timer without any user action. Events: {events:?}"
+    );
+    assert!(
+        enforced_count > 0,
+        "consequence enforcement should follow trigger. Events: {events:?}"
+    );
+}
+
+/// The periodic consequence timer respects cooldown — a rule that already
+/// fired within its window does not re-fire on the next tick.
+#[tokio::test(start_paused = true)]
+async fn consequence_timer_respects_cooldown() {
+    use scp_protocol::trust::consequence::{
+        ConsequenceAction, ConsequenceRule, ConsequenceTrigger,
+    };
+    use std::time::Duration;
+
+    let manager = ContextManager::new(
+        Box::new(MockCrypto::default()),
+        Box::new(MockTransport::connected()),
+        Box::new(MockEventLog::default()),
+        mock_key_resolver(),
+    );
+
+    let admin: DID = "did:dht:z6MkCreator".into();
+
+    let mut params = governance_params();
+    params.economic_policy = None;
+    params.consequence_rules = vec![ConsequenceRule {
+        trigger: ConsequenceTrigger::MessageVelocity,
+        threshold: 0,
+        action: ConsequenceAction::CapabilitySuspension(vec!["write".to_owned()]),
+        // Long cooldown window — rule should NOT re-fire on second tick.
+        window: Duration::from_secs(7200),
+    }];
+
+    let _handle = manager
+        .create_context("cooldown-timer-ctx".into(), params, admin.clone())
+        .await
+        .unwrap();
+
+    let _ = manager.drain_events("cooldown-timer-ctx").await;
+
+    // First tick — fires the consequence.
+    tokio::time::sleep(Duration::from_secs(61)).await;
+    for _ in 0..20 {
+        tokio::task::yield_now().await;
+    }
+    let events1 = manager.drain_events("cooldown-timer-ctx").await;
+    let triggered1 = events1
+        .iter()
+        .filter(|e| matches!(e, ContextEvent::ConsequenceTriggered { .. }))
+        .count();
+    assert!(
+        triggered1 > 0,
+        "first tick should trigger consequence. Events: {events1:?}"
+    );
+
+    // Second tick — should NOT re-fire due to cooldown.
+    tokio::time::sleep(Duration::from_secs(61)).await;
+    for _ in 0..20 {
+        tokio::task::yield_now().await;
+    }
+    let events2 = manager.drain_events("cooldown-timer-ctx").await;
+    let triggered2 = events2
+        .iter()
+        .filter(|e| matches!(e, ContextEvent::ConsequenceTriggered { .. }))
+        .count();
+    assert_eq!(
+        triggered2, 0,
+        "second tick should NOT re-trigger consequence during cooldown. Events: {events2:?}"
+    );
+}
+
+/// Contexts with no consequence rules incur no overhead from the periodic
+/// consequence evaluation — the empty-rules early return is exercised.
+#[tokio::test(start_paused = true)]
+async fn consequence_timer_noop_without_rules() {
+    use std::time::Duration;
+
+    let manager = ContextManager::new(
+        Box::new(MockCrypto::default()),
+        Box::new(MockTransport::connected()),
+        Box::new(MockEventLog::default()),
+        mock_key_resolver(),
+    );
+
+    let admin: DID = "did:dht:z6MkCreator".into();
+    let mut params = governance_params();
+    params.economic_policy = None;
+    // No consequence rules — default.
+
+    let _handle = manager
+        .create_context("no-rules-ctx".into(), params, admin.clone())
+        .await
+        .unwrap();
+
+    let _ = manager.drain_events("no-rules-ctx").await;
+
+    // Advance past two ticks.
+    tokio::time::sleep(Duration::from_secs(121)).await;
+    for _ in 0..20 {
+        tokio::task::yield_now().await;
+    }
+
+    let events = manager.drain_events("no-rules-ctx").await;
+    let triggered = events
+        .iter()
+        .filter(|e| matches!(e, ContextEvent::ConsequenceTriggered { .. }))
+        .count();
+    assert_eq!(
+        triggered, 0,
+        "no consequence rules means no triggers. Events: {events:?}"
     );
 }

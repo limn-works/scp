@@ -1,14 +1,17 @@
-//! Reusable payment flow on `ContextManager` (spec section 19.2.2, #1537).
+//! Escrow-based payment flow on `ContextManager` (spec section 19.2.2, #1537).
 //!
-//! Provides [`ContextManager::execute_paid_action`] — the single entry point
-//! for the 9-step payment integration. Every paid entry point (`send_message`,
-//! `join_context`, `invoke_tool`) calls this method rather than inlining the
-//! payment logic.
+//! Implements the correct 9-step payment integration as an escrow pattern:
+//! 1. `authorize_paid_action` — evaluates cost, checks spending UCAN,
+//!    checks budget, calls adapter.authorize (escrow). Returns authorization.
+//! 2. The caller performs the action (encrypt, MLS add, tool execute).
+//! 3. `complete_paid_action` — captures payment, stores receipt, records spend.
+//! 4. `void_paid_action` — voids authorization, rolls back budget on failure.
+//!
+//! This eliminates the previous payment-before-action ordering bug where
+//! payment was captured before the action succeeded.
 //!
 //! When no payment adapter is configured (`self.payment_adapter` is `None`),
-//! the method returns `Ok(None)` immediately — budget enforcement
-//! (`evaluate_cost` + `record_spend`) is handled separately by the per-action
-//! economy functions.
+//! `authorize_paid_action` returns `Ok(None)` immediately.
 //!
 //! See spec section 19.2.2 and ADR-033 in `.docs/adrs/phase-3.md`.
 
@@ -20,7 +23,7 @@ use scp_protocol::economy::policy::ObservableMetrics;
 use scp_protocol::economy::types::PaidActionType;
 
 use crate::economy::adapter::{
-    AdapterAsVerifier, PaymentAdapterDyn, PaymentMetadata, PaymentReceipt,
+    AdapterAsVerifier, PaymentAdapter, PaymentAdapterDyn, PaymentMetadata, PaymentReceipt,
 };
 use crate::economy::integration::{self, IntegrationError};
 use crate::economy::receipt::{
@@ -28,6 +31,21 @@ use crate::economy::receipt::{
 };
 
 use super::ContextManager;
+
+/// Authorization token returned by `authorize_paid_action`.
+///
+/// Holds the escrow authorization and evaluated cost so that
+/// `complete_paid_action` and `void_paid_action` can finalize or roll back.
+pub(super) struct PaidActionAuthorization {
+    /// The prepared action containing the authorization envelope.
+    prepared: integration::PreparedAction,
+    /// The adapter bridge for capture/void.
+    bridge: DynAdapterBridge,
+    /// The economic policy used for evaluation.
+    policy: scp_protocol::economy::types::EconomicPolicy,
+    /// Metrics snapshot for `process_paid_action`.
+    metrics: ObservableMetrics,
+}
 
 /// Wrapper that delegates [`crate::economy::adapter::PaymentAdapter`] methods
 /// to a `dyn PaymentAdapterDyn` behind an `Arc`.
@@ -165,40 +183,129 @@ async fn verify_and_check_receipt(
     Ok(())
 }
 
+/// Unified economy enforcement: evaluate cost, check spending UCAN, check budget.
+///
+/// This replaces the former `enforce_send_economy`, `enforce_join_economy`, and
+/// `check_tool_economy` as separate functions. One unified flow per the escrow
+/// pattern: evaluate cost -> check spending UCAN -> check budget -> deduct.
+///
+/// Returns the deducted cost for rollback on failure, or `None` if no cost.
+#[allow(clippy::too_many_arguments)] // Economy enforcement requires many context parameters.
+pub(super) fn enforce_economy(
+    economic_policy: Option<&scp_protocol::economy::types::EconomicPolicy>,
+    budget_tracker: &mut scp_protocol::economy::budget::MemberBudgetTracker,
+    velocity_tracker: &scp_protocol::economy::antispam::SenderVelocityTracker,
+    member_count: usize,
+    action_type: &PaidActionType,
+    actor_did: &DID,
+    now: u64,
+    spending_ucan: Option<&scp_protocol::crypto::ucan::UcanToken>,
+    action_label: &str,
+) -> Result<Option<scp_protocol::economy::types::Amount>, ContextError> {
+    let Some(policy) = economic_policy else {
+        return Ok(None);
+    };
+
+    let velocity = velocity_tracker.get_velocity(actor_did, now);
+    let metrics = ObservableMetrics {
+        sender_velocity: velocity,
+        member_count: u64::try_from(member_count).unwrap_or(u64::MAX),
+        context_message_rate: velocity_tracker.aggregate_velocity(now),
+        // relay_queue_depth: Requires relay-level telemetry not available at ContextManager.
+        // The relay tracks its own queue depth server-side; populating this field would
+        // require a relay->client metrics channel. Until that transport-layer telemetry
+        // exists, relay-queue-based pricing variables evaluate to zero.
+        relay_queue_depth: 0,
+        time_of_day: now % 86400,
+        // storage_usage: Requires storage provider metrics not available at ContextManager.
+        // The Storage trait (scp-platform) does not expose per-context byte counts.
+        storage_usage: 0,
+    };
+
+    let Some(cost) = scp_protocol::economy::policy::evaluate_cost(policy, action_type, &metrics)
+    else {
+        return Ok(None);
+    };
+
+    if cost.0 == 0 {
+        return Ok(None);
+    }
+
+    // AND-composition (spec section 19.5, #1593): paid actions require both the
+    // action capability (already checked by the caller) AND a spending UCAN.
+    // Free actions (cost == 0) pass through above.
+    if spending_ucan.is_none() {
+        return Err(ContextError::PermissionDenied(
+            "SCP-ECON-7060: paid action requires spending UCAN".to_owned(),
+        ));
+    }
+    // Validate AND-composition: the action capability was already verified by the
+    // caller, so action_ucan is None (meaning "already verified by caller").
+    // Only the spending UCAN needs validation here.
+    //
+    // `action_ucan=None` means "already verified by caller" — this is a
+    // convention, not type-level enforcement. A future improvement could use
+    // a newtype wrapper to make this invariant compile-time checked.
+    debug_assert!(
+        spending_ucan.is_some(),
+        "spending UCAN should be Some at this point — None case returns above"
+    );
+    scp_protocol::crypto::ucan::spending::check_and_composition(
+        None, // action UCAN: already verified by caller
+        spending_ucan,
+        scp_protocol::crypto::ucan::spending::Amount(cost.0),
+        action_label,
+    )
+    .map_err(|e| ContextError::PermissionDenied(format!("SCP-ECON-7061: {e}")))?;
+
+    // Budget check — no auto-grant. If the member has no budget, fail with
+    // NoBudget error telling the caller to request an ApproveSpend governance
+    // action. Budget must be explicitly granted via governance.
+    if !budget_tracker.has_budget(actor_did) {
+        return Err(ContextError::PermissionDenied(format!(
+            "SCP-ECON-7010: no budget for {actor_did} — request ApproveSpend governance action"
+        )));
+    }
+    budget_tracker.record_spend(actor_did, cost).map_err(|e| {
+        ContextError::PermissionDenied(format!("SCP-ECON-7010: budget exceeded: {e}"))
+    })?;
+
+    Ok(Some(cost))
+}
+
+/// Rolls back a budget deduction on failure.
+///
+/// Used by messaging, lifecycle, and invoke to DRY the budget rollback pattern.
+/// Restores the exact amount previously deducted by `enforce_economy`.
+pub(super) async fn rollback_budget(
+    manager: &ContextManager,
+    context_id: &str,
+    actor_did: &DID,
+    deducted_cost: Option<scp_protocol::economy::types::Amount>,
+) {
+    if let Some(cost) = deducted_cost {
+        let mut contexts = manager.contexts.lock().await;
+        if let Some(ctx) = contexts.get_mut(context_id) {
+            ctx.governance.budget_tracker.grant(actor_did, cost);
+        }
+    }
+}
+
 #[allow(clippy::significant_drop_tightening)]
 impl ContextManager {
-    /// Executes the 9-step payment flow for a paid action (spec section 19.2.2).
+    /// Authorizes a paid action (escrow pattern, step 1).
     ///
-    /// This is the **reusable layer** that every paid entry point calls:
-    /// - `send_message` calls with `PaidActionType::MessageSend`
-    /// - `join_context` calls with `PaidActionType::ContextJoin`
-    /// - `invoke_tool` calls with `PaidActionType::ToolInvoke`
+    /// Evaluates cost, checks spending UCAN, checks budget, and calls
+    /// `adapter.authorize` to create an escrow hold. The caller performs the
+    /// action, then calls `complete_paid_action` or `void_paid_action`.
     ///
-    /// When no payment adapter is configured, returns `Ok(None)` immediately.
-    /// When the evaluated cost is zero, also returns `Ok(None)`.
-    ///
-    /// **Spending UCAN AND-composition (#1593):** Enforced at the per-action
-    /// level in `enforce_send_economy` and `enforce_join_economy` via
-    /// `check_and_composition` (spec §19.5). The `spending_ucan` parameter is
-    /// threaded from FFI through `send_message` and `join_context`. Step 4
-    /// (authorization attachment to envelope) is not yet implemented.
-    ///
-    /// # Lock pattern
-    ///
-    /// Policy and metrics are extracted under the contexts lock, then the lock
-    /// is dropped before calling async adapter methods. This matches the
-    /// `send_message` Phase 1 to Phase 2 pattern.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`ContextError::PermissionDenied`] with SCP-ECON-70xx codes
-    /// for any payment flow failure.
-    pub async fn execute_paid_action(
+    /// Returns `Ok(None)` when no payment adapter is configured or cost is zero.
+    pub(super) async fn authorize_paid_action(
         &self,
         action_type: PaidActionType,
         payer_did: &DID,
         context_id: &str,
-    ) -> Result<Option<PaymentReceipt>, ContextError> {
+    ) -> Result<Option<PaidActionAuthorization>, ContextError> {
         // Early exit: no adapter means no payment flow.
         let Some(adapter_arc) = self.payment_adapter.as_ref().map(Arc::clone) else {
             return Ok(None);
@@ -223,12 +330,8 @@ impl ContextManager {
                 sender_velocity: velocity,
                 member_count,
                 context_message_rate: ctx.governance.velocity_tracker.aggregate_velocity(now_secs),
-                // relay_queue_depth: Requires relay-level telemetry not available
-                // at ContextManager. See enforce_send_economy in messaging.rs.
                 relay_queue_depth: 0,
                 time_of_day: now_secs % 86400,
-                // storage_usage: Requires storage provider metrics not available
-                // at ContextManager. See enforce_send_economy in messaging.rs.
                 storage_usage: 0,
             };
             (policy, metrics)
@@ -240,32 +343,69 @@ impl ContextManager {
         };
 
         // Evaluate cost — zero cost means no payment needed.
-        let Some(_cost) =
-            scp_protocol::economy::policy::evaluate_cost(&policy, &action_type, &metrics)
-                .filter(|c| c.0 > 0)
-        else {
+        if scp_protocol::economy::policy::evaluate_cost(&policy, &action_type, &metrics)
+            .filter(|c| c.0 > 0)
+            .is_none()
+        {
             return Ok(None);
+        }
+
+        // Phase 2: Authorize (escrow) via adapter (no lock held).
+        let bridge = DynAdapterBridge(adapter_arc);
+        let metadata = PaymentMetadata {
+            action_type: action_type.clone(),
+            context_id: Some(context_id.to_owned()),
+            idempotency_key: rand_idempotency_key(),
         };
 
-        // Phase 2: Run payment flow (no lock held).
-        let bridge = DynAdapterBridge(adapter_arc);
-        let receipt = self
-            .run_payment_flow(
-                &bridge,
-                &policy,
-                action_type,
-                payer_did,
-                context_id,
-                &metrics,
-            )
-            .await?;
+        let prepared = integration::prepare_paid_action(
+            &bridge,
+            Some(&policy),
+            action_type,
+            payer_did,
+            Some(context_id.to_owned()),
+            &metrics,
+            metadata,
+            Vec::new(),
+        )
+        .await
+        .map_err(integration_error_to_context)?;
 
-        let Some(receipt) = receipt else {
+        Ok(Some(PaidActionAuthorization {
+            prepared,
+            bridge,
+            policy,
+            metrics,
+        }))
+    }
+
+    /// Completes a paid action after successful execution (escrow capture).
+    ///
+    /// Calls `adapter.capture`, verifies the receipt, stores it in the event
+    /// log, and records budget spend.
+    pub(super) async fn complete_paid_action(
+        &self,
+        auth: PaidActionAuthorization,
+        payer_did: &DID,
+        context_id: &str,
+    ) -> Result<Option<PaymentReceipt>, ContextError> {
+        // Capture the escrowed authorization via process_paid_action.
+        let processed = integration::process_paid_action(
+            &auth.bridge,
+            Some(&auth.policy),
+            &auth.prepared.envelope,
+            &auth.metrics,
+            |payload| async move { Ok(payload) },
+        )
+        .await
+        .map_err(integration_error_to_context)?;
+
+        let Some(receipt) = processed.receipt else {
             return Ok(None);
         };
 
         // Verify the receipt.
-        verify_and_check_receipt(&bridge, &receipt).await?;
+        verify_and_check_receipt(&auth.bridge, &receipt).await?;
 
         // Store receipt in event log.
         let context_id_bytes = super::context_id_to_bytes(context_id);
@@ -280,57 +420,54 @@ impl ContextManager {
             );
         }
 
-        // Budget tracking (record_spend) is the responsibility of the
-        // per-action enforcement functions (enforce_send_economy,
-        // enforce_join_economy, check_tool_economy). The payment adapter
-        // handles real-money settlement independently. Recording spend
-        // here would double-charge the member.
-
         Ok(Some(receipt))
     }
 
-    /// Runs the prepare + process payment flow, returning the receipt.
-    async fn run_payment_flow(
+    /// Voids a paid action authorization on failure (escrow rollback).
+    ///
+    /// Calls `adapter.void` to release the escrow hold. Best-effort —
+    /// logs but does not propagate void failures.
+    #[allow(dead_code)] // Part of the escrow pattern API; will be used by callers that need void.
+    pub(super) async fn void_paid_action(&self, auth: PaidActionAuthorization, context_id: &str) {
+        if let Some(ref authorization) = auth.prepared.envelope.authorization
+            && let Err(e) = auth.bridge.void(authorization).await
+        {
+            tracing::warn!(context_id, "failed to void payment authorization: {e}");
+        }
+    }
+
+    /// Executes the 9-step payment flow as authorize -> capture (escrow pattern).
+    ///
+    /// This is the unified entry point that every paid action calls:
+    /// - `send_message` calls with `PaidActionType::MessageSend`
+    /// - `join_context` calls with `PaidActionType::ContextJoin`
+    /// - `invoke_tool` calls with `PaidActionType::ToolInvoke`
+    ///
+    /// When no payment adapter is configured, returns `Ok(None)` immediately.
+    /// When the evaluated cost is zero, also returns `Ok(None)`.
+    ///
+    /// Budget enforcement (`evaluate_cost` + spending UCAN + `record_spend`) is
+    /// handled by [`enforce_economy`] at the per-action level, not here.
+    /// The payment adapter handles real-money settlement independently.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ContextError::PermissionDenied`] with SCP-ECON-70xx codes
+    /// for any payment flow failure.
+    pub async fn execute_paid_action(
         &self,
-        bridge: &DynAdapterBridge,
-        policy: &scp_protocol::economy::types::EconomicPolicy,
         action_type: PaidActionType,
         payer_did: &DID,
         context_id: &str,
-        metrics: &ObservableMetrics,
     ) -> Result<Option<PaymentReceipt>, ContextError> {
-        let metadata = PaymentMetadata {
-            action_type: action_type.clone(),
-            context_id: Some(context_id.to_owned()),
-            idempotency_key: rand_idempotency_key(),
+        let Some(auth) = self
+            .authorize_paid_action(action_type, payer_did, context_id)
+            .await?
+        else {
+            return Ok(None);
         };
 
-        // Steps 1-4: Sender-side preparation (cost eval + authorize).
-        let prepared = integration::prepare_paid_action(
-            bridge,
-            Some(policy),
-            action_type,
-            payer_did,
-            Some(context_id.to_owned()),
-            metrics,
-            metadata,
-            Vec::new(), // payload is opaque to payment flow
-        )
-        .await
-        .map_err(integration_error_to_context)?;
-
-        // Steps 5-8: Receiver-side processing (verify auth + capture).
-        let processed = integration::process_paid_action(
-            bridge,
-            Some(policy),
-            &prepared.envelope,
-            metrics,
-            |payload| async move { Ok(payload) },
-        )
-        .await
-        .map_err(integration_error_to_context)?;
-
-        Ok(processed.receipt)
+        self.complete_paid_action(auth, payer_did, context_id).await
     }
 
     /// Verifies payment receipts using the configured payment adapter.

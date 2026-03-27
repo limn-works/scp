@@ -200,6 +200,8 @@ mod tests {
             consequence_rules: Vec::new(),
             participation_cache: std::collections::HashMap::new(),
             velocity_tracker: None,
+            velocity_tracker_state: None,
+            cooldown_until: std::collections::HashMap::new(),
         }
     }
 

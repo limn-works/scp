@@ -763,6 +763,8 @@ async fn persist_drop_restore_roundtrip() {
         consequence_rules: Vec::new(),
         participation_cache: std::collections::HashMap::new(),
         velocity_tracker: None,
+        velocity_tracker_state: None,
+        cooldown_until: std::collections::HashMap::new(),
     };
 
     let bc_snapshot = test_broadcast_snapshot("persist-ctx-2");
@@ -878,6 +880,8 @@ async fn restore_preserves_executed_proposals() {
         consequence_rules: Vec::new(),
         participation_cache: std::collections::HashMap::new(),
         velocity_tracker: None,
+        velocity_tracker_state: None,
+        cooldown_until: std::collections::HashMap::new(),
     };
 
     persistence
@@ -981,6 +985,8 @@ async fn restore_respawns_ttl_timer() {
         consequence_rules: Vec::new(),
         participation_cache: std::collections::HashMap::new(),
         velocity_tracker: None,
+        velocity_tracker_state: None,
+        cooldown_until: std::collections::HashMap::new(),
     };
 
     persistence.persist_context("ttl-ctx", &snapshot).unwrap();
@@ -1063,6 +1069,8 @@ async fn restore_all_contexts_restores_persisted() {
             consequence_rules: Vec::new(),
             participation_cache: std::collections::HashMap::new(),
             velocity_tracker: None,
+            velocity_tracker_state: None,
+            cooldown_until: std::collections::HashMap::new(),
         };
         persistence.persist_context(ctx_name, &snapshot).unwrap();
     }
@@ -1144,6 +1152,8 @@ async fn restore_context_rejects_duplicate() {
         consequence_rules: Vec::new(),
         participation_cache: std::collections::HashMap::new(),
         velocity_tracker: None,
+        velocity_tracker_state: None,
+        cooldown_until: std::collections::HashMap::new(),
     };
 
     let bc_snapshot = test_broadcast_snapshot("dup-ctx");
@@ -1247,6 +1257,8 @@ async fn restore_context_sets_needs_reconnect_on_grace_inconsistency() {
         consequence_rules: Vec::new(),
         participation_cache: std::collections::HashMap::new(),
         velocity_tracker: None,
+        velocity_tracker_state: None,
+        cooldown_until: std::collections::HashMap::new(),
     };
 
     let bc_snapshot = test_broadcast_snapshot("grace-incon-ctx");
@@ -1357,6 +1369,8 @@ async fn restore_context_no_reconnect_when_grace_consistent() {
         consequence_rules: Vec::new(),
         participation_cache: std::collections::HashMap::new(),
         velocity_tracker: None,
+        velocity_tracker_state: None,
+        cooldown_until: std::collections::HashMap::new(),
     };
 
     let bc_snapshot = test_broadcast_snapshot("grace-ok-ctx");
@@ -1455,6 +1469,8 @@ fn reconnect_test_snapshot(
         consequence_rules: Vec::new(),
         participation_cache: std::collections::HashMap::new(),
         velocity_tracker: None,
+        velocity_tracker_state: None,
+        cooldown_until: std::collections::HashMap::new(),
     }
 }
 
@@ -2028,7 +2044,7 @@ async fn reconnect_all_standing_reconnects_active_contexts() {
     }
 
     // Reconnect all.
-    let reconnected = manager.reconnect_all_standing().await.unwrap();
+    let reconnected = manager.reconnect_all_standing().await.0;
 
     // Only Bob and Dave should be reconnected (Active). Carol is Closed.
     assert_eq!(reconnected, 2);
@@ -2043,7 +2059,7 @@ async fn reconnect_all_standing_with_no_contexts_returns_zero() {
         noop_key_resolver(),
     );
 
-    let reconnected = manager.reconnect_all_standing().await.unwrap();
+    let reconnected = manager.reconnect_all_standing().await.0;
     assert_eq!(reconnected, 0);
 }
 

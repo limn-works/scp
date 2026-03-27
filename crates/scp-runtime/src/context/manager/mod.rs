@@ -553,8 +553,41 @@ pub struct ContextSnapshot {
     /// Sender velocity tracker window configuration for anti-spam and
     /// consequence evaluation (§19.7, #1537). Persisted so velocity state
     /// survives process restarts. Contains the `window_secs` configuration.
+    ///
+    /// **Deprecated**: Retained for backward-compatible deserialization of
+    /// snapshots that predate `velocity_tracker_state`. New snapshots populate
+    /// `velocity_tracker_state` instead.
     #[serde(default)]
     pub velocity_tracker: Option<u64>,
+    /// Full velocity tracker state including per-sender timestamps (#1530).
+    ///
+    /// Supersedes `velocity_tracker` (config-only). Contains both the sliding
+    /// window configuration and the per-sender message timestamp entries so
+    /// velocity state survives process restarts without losing rate history.
+    #[serde(default)]
+    pub velocity_tracker_state: Option<VelocityTrackerSnapshot>,
+    /// Per-rule cooldown timers for consequence dispatch (#1531).
+    ///
+    /// Maps consequence rule index to the Unix timestamp (seconds) until which
+    /// the rule should not re-fire. Prevents repeated consequence dispatch
+    /// within a rule's evaluation window. Persisted so cooldown state survives
+    /// process restarts.
+    #[serde(default)]
+    pub cooldown_until: HashMap<usize, u64>,
+}
+
+/// Serializable snapshot of [`SenderVelocityTracker`](scp_protocol::economy::antispam::SenderVelocityTracker)
+/// state for persistence in [`ContextSnapshot`].
+///
+/// Captures both the sliding window configuration (`window_secs`) and per-sender
+/// message timestamps (`entries`) so velocity tracking survives process restarts
+/// without losing rate history. See spec §19.7 and #1530.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct VelocityTrackerSnapshot {
+    /// Sliding window duration in seconds (same as `SenderVelocityTracker::window_secs`).
+    pub window_secs: u64,
+    /// Per-sender message timestamps (DID string → Vec of Unix timestamps in seconds).
+    pub entries: HashMap<String, Vec<u64>>,
 }
 
 // ---------------------------------------------------------------------------
@@ -1793,6 +1826,11 @@ impl ContextManager {
             consequence_rules: ctx.governance.consequence_rules.clone(),
             participation_cache: ctx.governance.participation_cache.clone(),
             velocity_tracker: Some(ctx.governance.velocity_tracker.window_secs()),
+            velocity_tracker_state: Some(VelocityTrackerSnapshot {
+                window_secs: ctx.governance.velocity_tracker.window_secs(),
+                entries: ctx.governance.velocity_tracker.snapshot_entries(),
+            }),
+            cooldown_until: ctx.governance.cooldown_until.clone(),
         }
     }
 }
