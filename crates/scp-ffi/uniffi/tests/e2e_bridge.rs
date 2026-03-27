@@ -111,6 +111,7 @@ fn full_capability_params() -> ContextParams {
         max_nesting_depth: None,
         session_cap: None,
         economic_policy: None,
+        consequence_rules: None,
     }
 }
 
@@ -132,6 +133,7 @@ fn default_encrypted_params() -> ContextParams {
         max_nesting_depth: None,
         session_cap: None,
         economic_policy: None,
+        consequence_rules: None,
     }
 }
 
@@ -331,7 +333,9 @@ async fn context_join_and_leave() {
         .unwrap();
 
     // Bob joins
-    context_join(handle.clone(), bob.clone()).await.unwrap();
+    context_join(handle.clone(), bob.clone(), None)
+        .await
+        .unwrap();
 
     // Check membership
     let count = context_member_count(handle.clone()).await;
@@ -860,6 +864,7 @@ async fn context_create_with_all_governance_models() {
             max_nesting_depth: None,
             session_cap: None,
             economic_policy: None,
+            consequence_rules: None,
         };
         let handle = context_create(identity.clone(), params).await.unwrap();
         assert_eq!(handle.state().unwrap(), "active");
@@ -888,6 +893,7 @@ async fn context_create_with_all_memory_scopes() {
             max_nesting_depth: None,
             session_cap: None,
             economic_policy: None,
+            consequence_rules: None,
         };
         let handle = context_create(identity.clone(), params).await.unwrap();
         assert_eq!(handle.state().unwrap(), "active");

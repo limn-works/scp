@@ -69,10 +69,19 @@ export interface Bridge {
    * still accepts a DID string — extract `identity.did` before calling it.
    */
   contextCreate(identity: BridgeIdentityHandle, paramsJson: string): Promise<BridgeContextHandle>;
-  contextJoin(handle: BridgeContextHandle, identityDid: string): Promise<void>;
+  contextJoin(
+    handle: BridgeContextHandle,
+    identityDid: string,
+    spendingUcanJwt?: string | null,
+  ): Promise<void>;
   contextLeave(handle: BridgeContextHandle, identityDid: string): Promise<void>;
   contextClose(handle: BridgeContextHandle, identityDid: string): Promise<void>;
-  contextSend(handle: BridgeContextHandle, identityDid: string, payload: Uint8Array): Promise<void>;
+  contextSend(
+    handle: BridgeContextHandle,
+    identityDid: string,
+    payload: Uint8Array,
+    spendingUcanJwt?: string | null,
+  ): Promise<void>;
   contextSubscribe(
     handle: BridgeContextHandle,
     identityDid: string,

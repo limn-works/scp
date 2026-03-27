@@ -2182,6 +2182,16 @@ public struct ContextParams {
      * `0` means no minimum (defaults to SCP/1.0).
      */
     public var minProtocolVersion: UInt16
+    /**
+     * Optional economic policy as a JSON string (spec §19, ADR-033).
+     * `nil` means no economic policy (free context).
+     */
+    public var economicPolicy: String?
+    /**
+     * Optional consequence rules as a JSON string (spec §9.3, #1531).
+     * `nil` means no consequence rules (empty list).
+     */
+    public var consequenceRules: String?
 
     // Default memberwise initializers are never public by default, so we
     // declare one manually.
@@ -2189,30 +2199,38 @@ public struct ContextParams {
         /**
          * Capability ceiling — maximum capabilities any participant can hold.
          * Empty list means no ceiling restriction.
-         */ceiling: [String], 
+         */ceiling: [String],
         /**
          * Governance model for this context.
-         */governance: GovernanceModel, 
+         */governance: GovernanceModel,
         /**
          * Memory scope governing key destruction on close.
-         */memoryScope: MemoryScope, 
+         */memoryScope: MemoryScope,
         /**
          * Optional time-to-live in seconds (0 = no TTL).
-         */ttlSeconds: UInt64, 
+         */ttlSeconds: UInt64,
         /**
          * Whether this context can be promoted from ephemeral to persistent.
-         */promotable: Bool, 
+         */promotable: Bool,
         /**
          * Minimum protocol version required to join (spec §13.4).
          * Encoded as `(major << 8) | minor`, e.g., `0x0100` for SCP/1.0.
          * `0` means no minimum (defaults to SCP/1.0).
-         */minProtocolVersion: UInt16) {
+         */minProtocolVersion: UInt16,
+        /**
+         * Optional economic policy as a JSON string (spec §19, ADR-033).
+         */economicPolicy: String? = nil,
+        /**
+         * Optional consequence rules as a JSON string (spec §9.3, #1531).
+         */consequenceRules: String? = nil) {
         self.ceiling = ceiling
         self.governance = governance
         self.memoryScope = memoryScope
         self.ttlSeconds = ttlSeconds
         self.promotable = promotable
         self.minProtocolVersion = minProtocolVersion
+        self.economicPolicy = economicPolicy
+        self.consequenceRules = consequenceRules
     }
 }
 
@@ -2241,6 +2259,12 @@ extension ContextParams: Equatable, Hashable {
         if lhs.minProtocolVersion != rhs.minProtocolVersion {
             return false
         }
+        if lhs.economicPolicy != rhs.economicPolicy {
+            return false
+        }
+        if lhs.consequenceRules != rhs.consequenceRules {
+            return false
+        }
         return true
     }
 
@@ -2251,6 +2275,8 @@ extension ContextParams: Equatable, Hashable {
         hasher.combine(ttlSeconds)
         hasher.combine(promotable)
         hasher.combine(minProtocolVersion)
+        hasher.combine(economicPolicy)
+        hasher.combine(consequenceRules)
     }
 }
 
@@ -2263,12 +2289,14 @@ public struct FfiConverterTypeContextParams: FfiConverterRustBuffer {
     public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> ContextParams {
         return
             try ContextParams(
-                ceiling: FfiConverterSequenceString.read(from: &buf), 
-                governance: FfiConverterTypeGovernanceModel.read(from: &buf), 
-                memoryScope: FfiConverterTypeMemoryScope.read(from: &buf), 
-                ttlSeconds: FfiConverterUInt64.read(from: &buf), 
-                promotable: FfiConverterBool.read(from: &buf), 
-                minProtocolVersion: FfiConverterUInt16.read(from: &buf)
+                ceiling: FfiConverterSequenceString.read(from: &buf),
+                governance: FfiConverterTypeGovernanceModel.read(from: &buf),
+                memoryScope: FfiConverterTypeMemoryScope.read(from: &buf),
+                ttlSeconds: FfiConverterUInt64.read(from: &buf),
+                promotable: FfiConverterBool.read(from: &buf),
+                minProtocolVersion: FfiConverterUInt16.read(from: &buf),
+                economicPolicy: FfiConverterOptionString.read(from: &buf),
+                consequenceRules: FfiConverterOptionString.read(from: &buf)
         )
     }
 
@@ -2279,6 +2307,8 @@ public struct FfiConverterTypeContextParams: FfiConverterRustBuffer {
         FfiConverterUInt64.write(value.ttlSeconds, into: &buf)
         FfiConverterBool.write(value.promotable, into: &buf)
         FfiConverterUInt16.write(value.minProtocolVersion, into: &buf)
+        FfiConverterOptionString.write(value.economicPolicy, into: &buf)
+        FfiConverterOptionString.write(value.consequenceRules, into: &buf)
     }
 }
 
@@ -8061,11 +8091,11 @@ public func contextIsMember(handle: ContextHandle, did: String)async  -> Bool  {
  * Returns `ScpError::Context` if the context is not in active state or
  * if the join operation fails (key package, MLS add, event log).
  */
-public func contextJoin(handle: ContextHandle, identity: Identity)async throws   {
+public func contextJoin(handle: ContextHandle, identity: Identity, spendingUcanJwt: String? = nil)async throws   {
     return
         try  await uniffiRustCallAsync(
             rustFutureFunc: {
-                uniffi_scp_ffi_uniffi_fn_func_context_join(FfiConverterTypeContextHandle_lower(handle),FfiConverterTypeIdentity_lower(identity)
+                uniffi_scp_ffi_uniffi_fn_func_context_join(FfiConverterTypeContextHandle_lower(handle),FfiConverterTypeIdentity_lower(identity),FfiConverterOptionString.lower(spendingUcanJwt)
                 )
             },
             pollFunc: ffi_scp_ffi_uniffi_rust_future_poll_void,
@@ -8222,11 +8252,11 @@ public func contextResetTtlTimer(handle: ContextHandle, newSeconds: UInt64)async
  * Returns `ScpError::Crypto` if encryption fails.
  * Returns `ScpError::Transport` if delivery fails.
  */
-public func contextSend(handle: ContextHandle, identity: Identity, payload: Data)async throws   {
+public func contextSend(handle: ContextHandle, identity: Identity, payload: Data, spendingUcanJwt: String? = nil)async throws   {
     return
         try  await uniffiRustCallAsync(
             rustFutureFunc: {
-                uniffi_scp_ffi_uniffi_fn_func_context_send(FfiConverterTypeContextHandle_lower(handle),FfiConverterTypeIdentity_lower(identity),FfiConverterData.lower(payload)
+                uniffi_scp_ffi_uniffi_fn_func_context_send(FfiConverterTypeContextHandle_lower(handle),FfiConverterTypeIdentity_lower(identity),FfiConverterData.lower(payload),FfiConverterOptionString.lower(spendingUcanJwt)
                 )
             },
             pollFunc: ffi_scp_ffi_uniffi_rust_future_poll_void,

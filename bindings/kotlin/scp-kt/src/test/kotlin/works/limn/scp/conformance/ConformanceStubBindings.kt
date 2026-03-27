@@ -118,6 +118,7 @@ class ConformanceStubBindings : NativeBindings {
     override fun contextJoin(
         contextHandle: Long,
         identityHandle: Long,
+        spendingUcanJwt: String?,
     ) {
         contextJoinError?.let { throw it }
     }
@@ -142,6 +143,7 @@ class ConformanceStubBindings : NativeBindings {
         contextHandle: Long,
         identityHandle: Long,
         payload: ByteArray,
+        spendingUcanJwt: String?,
     ) {
         contextSendCalled = true
         contextSendPayload = payload

@@ -365,6 +365,7 @@ pub fn context_send(
     handle: &WasmContextHandle,
     identity_did: String,
     payload_base64: String,
+    spending_ucan_jwt: Option<String>,
 ) -> Promise {
     if let Err(e) = validate_did(&identity_did) {
         return future_to_promise(async move { Err(ScpWasmError::from(e).into_js().into()) });
@@ -381,6 +382,18 @@ pub fn context_send(
             }
             .into_js()
             .into());
+        }
+
+        // Validate spending UCAN JWT if provided (parse-only; actual budget
+        // enforcement is performed by the WasmContextManager).
+        if let Some(ref jwt) = spending_ucan_jwt {
+            let _ = scp_protocol::crypto::ucan::validate::parse_ucan(jwt).map_err(|e| {
+                ScpWasmError::Context {
+                    message: format!("invalid spending UCAN: {e}"),
+                    code: "SCP-ECON-7061".to_owned(),
+                }
+                .into_js()
+            })?;
         }
 
         with_manager(|mgr| mgr.send_message(&context_id, &identity_did, &payload_base64))

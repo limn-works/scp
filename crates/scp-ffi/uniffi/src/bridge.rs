@@ -869,6 +869,9 @@ pub struct ContextParams {
     /// Optional economic policy as a JSON string (spec §19, ADR-033).
     /// `None` means no economic policy (free context).
     pub economic_policy: Option<String>,
+    /// Optional consequence rules as a JSON string (spec §9.3, #1531).
+    /// `None` means no consequence rules (empty list).
+    pub consequence_rules: Option<String>,
 }
 
 /// A message received from an SCP context.
@@ -2867,6 +2870,7 @@ pub async fn context_create(
 pub async fn context_join(
     handle: Arc<ContextHandle>,
     identity: Arc<Identity>,
+    spending_ucan_jwt: Option<String>,
 ) -> Result<(), ScpError> {
     runtime()
         .spawn(async move {
@@ -2911,8 +2915,18 @@ pub async fn context_join(
                 mls_key_package_bytes: None,
             };
 
+            // Parse optional spending UCAN JWT for AND-composition (join cost).
+            let spending_ucan = spending_ucan_jwt
+                .as_deref()
+                .map(scp_core::crypto::ucan::validate::parse_ucan)
+                .transpose()
+                .map_err(|e| ScpError::Context {
+                    msg: format!("invalid spending UCAN: {e}"),
+                    code: "SCP-ECON-7061".to_owned(),
+                })?;
+
             manager
-                .join_context(&core_handle, key_package, None)
+                .join_context(&core_handle, key_package, spending_ucan.as_ref())
                 .await
                 .map_err(ScpError::from)?;
 
@@ -8781,6 +8795,19 @@ fn bridge_params_to_core(
         })
         .transpose()?;
 
+    // Deserialize consequence_rules JSON string, if provided (#1531).
+    let consequence_rules: Vec<scp_core::trust::ConsequenceRule> = params
+        .consequence_rules
+        .as_deref()
+        .map(|cr_json| {
+            serde_json::from_str(cr_json).map_err(|e| ScpError::Validation {
+                msg: format!("invalid consequence_rules JSON: {e}"),
+                code: "SCP-VALID-7000".to_owned(),
+            })
+        })
+        .transpose()?
+        .unwrap_or_default();
+
     Ok(scp_core::context::ContextParams {
         mode,
         ceiling,
@@ -8794,6 +8821,7 @@ fn bridge_params_to_core(
         max_nesting_depth: params.max_nesting_depth,
         session_cap: params.session_cap,
         economic_policy,
+        consequence_rules,
         ..scp_core::context::ContextParams::default()
     })
 }
