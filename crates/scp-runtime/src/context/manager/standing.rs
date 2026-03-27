@@ -86,12 +86,12 @@ impl ContextManager {
         let context_id = generate_standing_context_id(local_did, peer_did);
 
         // Step 1: Check if the context exists and is Active/Creating.
-        // Acquire `contexts` before `standing_contexts` for consistent lock
-        // ordering (contexts is the primary lock). Hold both only for the
-        // check, then drop before the async create_context call.
+        // Hold the standing_contexts lock only for the check, then drop
+        // before the async create_context call to avoid holding the lock
+        // across an await point.
         {
-            let contexts = self.contexts.lock().await;
             let mut standing = self.standing_contexts.lock().await;
+            let contexts = self.contexts.lock().await;
             if let Some(ctx) = contexts.get(&context_id) {
                 let state = ctx.handle.state().await;
                 match state {
@@ -187,19 +187,20 @@ impl ContextManager {
     ///
     /// # Returns
     ///
-    /// A tuple of `(reconnected_count, errors)`. The reconnected count is
-    /// the number of contexts successfully reconnected. Errors are collected
-    /// per-context rather than failing fast, so partial success is reported.
-    pub async fn reconnect_all_standing(&self) -> (usize, Vec<ContextError>) {
+    /// The number of contexts successfully reconnected.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ContextError::TransportFailed`] if any reconnection fails.
+    /// Partial reconnection results are still applied -- contexts that
+    /// succeeded remain connected.
+    pub async fn reconnect_all_standing(&self) -> Result<usize, ContextError> {
         // Phase 1: Collect (context_id, handle) pairs under locks, then release.
         // This avoids holding any locks across await points.
-        // M8: Lock ordering — acquire `contexts` before `standing_contexts`
-        // to match the lock order used everywhere else in the codebase and
-        // prevent potential deadlocks.
         let handles: Vec<(String, super::super::ContextHandle)> = {
-            let contexts = self.contexts.lock().await;
             let standing = self.standing_contexts.lock().await;
             let local_dids = self.local_dids.read().await;
+            let contexts = self.contexts.lock().await;
 
             let mut out = Vec::new();
             for peer_did in standing.values() {
@@ -216,31 +217,22 @@ impl ContextManager {
 
         // Phase 2: Iterate collected handles without any locks held.
         // Track terminal context IDs for eviction in Phase 3.
-        // Collect errors per-context rather than failing fast.
         let mut reconnected = 0;
-        let mut errors = Vec::new();
         let mut terminal_context_ids = Vec::new();
         for (context_id, handle) in &handles {
             let state = handle.state().await;
             match state {
                 ContextState::Active => {
-                    let context_id_bytes = scp_protocol::context::context_id_bytes(context_id);
-                    match self
-                        .transport
+                    let context_id_bytes =
+                        scp_protocol::context::context_id_bytes(context_id);
+                    self.transport
                         .publish_context(&context_id_bytes, handle.params())
-                    {
-                        Ok(()) => reconnected += 1,
-                        Err(e) => {
-                            tracing::warn!(
-                                context_id = %context_id,
-                                error = %e,
-                                "reconnection failed for standing context"
-                            );
-                            errors.push(ContextError::TransportFailed(format!(
+                        .map_err(|e| {
+                            ContextError::TransportFailed(format!(
                                 "reconnection failed for context {context_id}: {e}"
-                            )));
-                        }
-                    }
+                            ))
+                        })?;
+                    reconnected += 1;
                 }
                 // Standing contexts in terminal states are candidates for
                 // eviction to prevent unbounded map growth.
@@ -272,6 +264,6 @@ impl ContextManager {
             }
         }
 
-        (reconnected, errors)
+        Ok(reconnected)
     }
 }

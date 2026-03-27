@@ -85,7 +85,6 @@ use uuid::Uuid;
 
 use scp_core::context::membership::KeyPackage;
 
-use scp_ffi_common::html_escape_event_string;
 use scp_ffi_common::validate::{
     json_value_type_name, validate_capability_uri, validate_context_id, validate_did,
     validate_mcp_handle, validate_relay_url, validate_tool_id, validate_tool_name,
@@ -870,9 +869,6 @@ pub struct ContextParams {
     /// Optional economic policy as a JSON string (spec §19, ADR-033).
     /// `None` means no economic policy (free context).
     pub economic_policy: Option<String>,
-    /// Optional consequence rules as a JSON string (spec §9.3, #1531).
-    /// `None` means no consequence rules (empty list).
-    pub consequence_rules: Option<String>,
 }
 
 /// A message received from an SCP context.
@@ -2871,7 +2867,6 @@ pub async fn context_create(
 pub async fn context_join(
     handle: Arc<ContextHandle>,
     identity: Arc<Identity>,
-    spending_ucan_jwt: Option<String>,
 ) -> Result<(), ScpError> {
     runtime()
         .spawn(async move {
@@ -2916,18 +2911,8 @@ pub async fn context_join(
                 mls_key_package_bytes: None,
             };
 
-            // Parse optional spending UCAN JWT for AND-composition (join cost).
-            let spending_ucan = spending_ucan_jwt
-                .as_deref()
-                .map(scp_core::crypto::ucan::validate::parse_ucan)
-                .transpose()
-                .map_err(|e| ScpError::Context {
-                    msg: format!("invalid spending UCAN: {e}"),
-                    code: "SCP-ECON-7061".to_owned(),
-                })?;
-
             manager
-                .join_context(&core_handle, key_package, spending_ucan.as_ref())
+                .join_context(&core_handle, key_package, None)
                 .await
                 .map_err(ScpError::from)?;
 
@@ -3242,7 +3227,7 @@ pub async fn context_send(
             // Parse optional spending UCAN JWT into a UcanToken for AND-composition.
             let spending_ucan = spending_ucan_jwt
                 .as_deref()
-                .map(scp_core::crypto::ucan::validate::parse_ucan)
+                .map(scp_protocol::crypto::ucan::validate::parse_ucan)
                 .transpose()
                 .map_err(|e| ScpError::Context {
                     msg: format!("invalid spending UCAN: {e}"),
@@ -6974,11 +6959,6 @@ pub async fn governance_execute(
         .spawn(async move {
             let proposal: scp_core::context::governance::GovernanceProposal =
                 serde_json::from_str(&proposal_json)?;
-            scp_ffi_common::validate::validate_governance_action_strings(&proposal.action)
-                .map_err(|e| ScpError::Validation {
-                    msg: e.message,
-                    code: "SCP-CTX-2040".to_owned(),
-                })?;
             let action_name = proposal.action.variant_name();
             let manager = crate::runtime::context_manager()?;
             let result = manager
@@ -7151,7 +7131,6 @@ pub async fn governance_propose(
         .spawn(async move {
             let action: scp_core::context::governance::GovernanceAction =
                 serde_json::from_str(&action_json)?;
-            validate_governance_action_strings(&action)?;
             let action_name = action.variant_name();
             let did = scp_identity::DID(proposer_did);
             let manager = crate::runtime::context_manager()?;
@@ -7185,18 +7164,6 @@ pub async fn governance_propose(
     }
 
     Ok(result)
-}
-
-/// Validates all user-controlled string fields on a governance action.
-fn validate_governance_action_strings(
-    action: &scp_core::context::governance::GovernanceAction,
-) -> Result<(), ScpError> {
-    scp_ffi_common::validate::validate_governance_action_strings(action).map_err(|e| {
-        ScpError::Validation {
-            msg: e.message,
-            code: "SCP-CTX-2040".to_owned(),
-        }
-    })
 }
 
 /// Casts an approval vote on a pending governance proposal.
@@ -8474,13 +8441,9 @@ fn format_context_event(event: &scp_core::context::membership::ContextEvent) -> 
             trigger_type,
             action_type,
         } => format!(
-            "consequence_triggered:member={},\
-             rule={rule_index},trigger={},\
-             action={},context={}",
-            html_escape_event_string(member_did.as_ref()),
-            html_escape_event_string(trigger_type),
-            html_escape_event_string(action_type),
-            html_escape_event_string(context_id),
+            "consequence_triggered:member={member_did},\
+             rule={rule_index},trigger={trigger_type},\
+             action={action_type},context={context_id}"
         ),
         ConsequenceEnforced {
             context_id,
@@ -8488,12 +8451,9 @@ fn format_context_event(event: &scp_core::context::membership::ContextEvent) -> 
             action_type,
             success,
         } => format!(
-            "consequence_enforced:member={},\
-             action={},success={success},\
-             context={}",
-            html_escape_event_string(member_did.as_ref()),
-            html_escape_event_string(action_type),
-            html_escape_event_string(context_id),
+            "consequence_enforced:member={member_did},\
+             action={action_type},success={success},\
+             context={context_id}"
         ),
         other => format!("{other:?}"),
     }
@@ -8821,25 +8781,6 @@ fn bridge_params_to_core(
         })
         .transpose()?;
 
-    // Deserialize consequence_rules JSON string, if provided (#1531).
-    let consequence_rules: Vec<scp_core::trust::ConsequenceRule> = params
-        .consequence_rules
-        .as_deref()
-        .map(|cr_json| {
-            serde_json::from_str(cr_json).map_err(|e| ScpError::Validation {
-                msg: format!("invalid consequence_rules JSON: {e}"),
-                code: "SCP-VALID-7000".to_owned(),
-            })
-        })
-        .transpose()?
-        .unwrap_or_default();
-    for rule in &consequence_rules {
-        rule.validate().map_err(|e| ScpError::Validation {
-            msg: format!("consequence_rules validation failed: {e}"),
-            code: "SCP-VALID-7000".to_owned(),
-        })?;
-    }
-
     Ok(scp_core::context::ContextParams {
         mode,
         ceiling,
@@ -8853,7 +8794,6 @@ fn bridge_params_to_core(
         max_nesting_depth: params.max_nesting_depth,
         session_cap: params.session_cap,
         economic_policy,
-        consequence_rules,
         ..scp_core::context::ContextParams::default()
     })
 }
@@ -9271,12 +9211,6 @@ pub fn aggregate_trust_input(
             msg: format!("failed to parse consequence_rules JSON: {e}"),
             code: "SCP-VALID-7045".to_owned(),
         })?;
-    for rule in &consequence_rules {
-        rule.validate().map_err(|e| ScpError::Validation {
-            msg: format!("consequence_rules validation failed: {e}"),
-            code: "SCP-VALID-7045".to_owned(),
-        })?;
-    }
 
     let threshold_requirements: std::collections::HashMap<
         scp_core::trust::AttestationType,
