@@ -99,12 +99,15 @@ fn derive_relay_pricing_config(
 /// which evaluates join cost, checks spending UCAN AND-composition (spec
 /// §19.5), and records spend against the joiner's budget. No auto-grant —
 /// budget must be explicitly approved via `ApproveSpend` governance action.
+///
+/// Returns the deducted cost (if any) so the caller can rollback via
+/// `rollback_budget` on subsequent failure (escrow pattern).
 fn enforce_join_economy(
     ctx: &mut PerContextState,
     joiner_did: &DID,
     now: u64,
     spending_ucan: Option<&scp_protocol::crypto::ucan::UcanToken>,
-) -> Result<(), ContextError> {
+) -> Result<Option<scp_protocol::economy::types::Amount>, ContextError> {
     if scp_protocol::economy::policy::auto_accept_blocked_by_economics(
         ctx.governance.economic_policy.as_ref(),
     ) {
@@ -122,8 +125,7 @@ fn enforce_join_economy(
         now,
         spending_ucan,
         "context:join",
-    )?;
-    Ok(())
+    )
 }
 
 #[allow(clippy::significant_drop_tightening)]
@@ -1344,25 +1346,12 @@ impl ContextManager {
             }
         }
 
-        // Payment flow (#1537): execute 9-step payment for context joins.
-        // Runs before the lock acquisition so async adapter calls don't hold
-        // the contexts mutex. Budget enforcement (evaluate_cost + record_spend)
-        // happens inside enforce_join_economy below (covers free-context budgets).
-        // If payment fails, the join is rejected — no budget rollback needed
-        // because enforce_join_economy runs AFTER this point (inside the lock).
-        self.execute_paid_action(
-            scp_protocol::economy::types::PaidActionType::ContextJoin,
-            &member_did,
-            &context_id,
-        )
-        .await?;
-
-        // Atomic state check + mutation: verify Active, then role assignment +
-        // membership + event buffer, all within a single lock acquisition.
-        // The state check is inside the lock to eliminate the TOCTOU race
-        // where close_context could transition the state between the check
-        // and the mutation.
-        {
+        // Atomic state check + mutation: verify Active, then economy enforcement,
+        // role assignment, membership, and event buffer — all within a single
+        // lock acquisition. Budget deduction happens here via enforce_join_economy.
+        // The adapter flow (authorize/complete/void) happens after the lock is
+        // dropped so async adapter calls don't hold the contexts mutex.
+        let deducted_cost = {
             let mut contexts = self.contexts.lock().await;
             let ctx = contexts
                 .get_mut(&context_id)
@@ -1381,7 +1370,11 @@ impl ContextManager {
                 .check_version_compatibility(scp_protocol::envelope::SCP_PROTOCOL_VERSION)?;
 
             // Economy enforcement (#1537, #1593) — auto-accept guard + join cost + spending UCAN.
-            enforce_join_economy(ctx, &member_did, self.clock.now_secs(), spending_ucan)?;
+            // Budget deduction happens here. The adapter escrow (authorize/complete/void)
+            // runs after the lock is dropped. On adapter failure, rollback_budget
+            // restores the deducted amount.
+            let deducted_cost =
+                enforce_join_economy(ctx, &member_did, self.clock.now_secs(), spending_ucan)?;
 
             // Sybil resistance check (#1530) — fail-closed with `?`.
             evaluate_sybil_resistance(ctx, &member_did, self.clock.now_secs())?;
@@ -1436,8 +1429,16 @@ impl ContextManager {
                 &member_did,
                 add_output,
             );
-        }
-        // Lock dropped before event log append.
+
+            deducted_cost
+        };
+        // Lock dropped before adapter calls and event log append.
+
+        // Payment flow (#1537): escrow pattern for context joins.
+        // authorize (escrow hold) → complete (capture) on success /
+        // void + rollback_budget on failure. Matches send_message pattern.
+        self.execute_join_payment(&context_id, &member_did, deducted_cost)
+            .await?;
 
         // Append MemberJoined event to event log.
         self.event_log.append_context_event(
@@ -1457,6 +1458,43 @@ impl ContextManager {
         }
 
         Ok(())
+    }
+
+    /// Executes the payment flow for context joins using the escrow pattern.
+    ///
+    /// Authorize (escrow hold) → complete (capture) on success, or
+    /// void + `rollback_budget` on failure. Mirrors `execute_send_payment`.
+    async fn execute_join_payment(
+        &self,
+        context_id: &str,
+        member_did: &DID,
+        deducted_cost: Option<scp_protocol::economy::types::Amount>,
+    ) -> Result<(), ContextError> {
+        let auth = self
+            .authorize_paid_action(
+                scp_protocol::economy::types::PaidActionType::ContextJoin,
+                member_did,
+                context_id,
+            )
+            .await;
+        match auth {
+            Ok(Some(auth)) => {
+                if let Err(e) = self
+                    .complete_paid_action(auth, member_did, context_id)
+                    .await
+                {
+                    super::economy::rollback_budget(self, context_id, member_did, deducted_cost)
+                        .await;
+                    return Err(e);
+                }
+                Ok(())
+            }
+            Ok(None) => Ok(()), // No payment needed.
+            Err(payment_err) => {
+                super::economy::rollback_budget(self, context_id, member_did, deducted_cost).await;
+                Err(payment_err)
+            }
+        }
     }
 
     /// Removes a member from a context.
