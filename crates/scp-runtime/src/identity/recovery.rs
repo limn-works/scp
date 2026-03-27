@@ -1874,8 +1874,13 @@ mod tests {
             ) -> Result<scp_protocol::context::builder::AddMemberOutput, ContextError> {
                 Ok(scp_protocol::context::builder::AddMemberOutput::default())
             }
-            fn remove_member(&self, _: &[u8; 32], _: &str) -> Result<(), ContextError> {
-                Ok(())
+            fn remove_member(
+                &self,
+                _: &[u8; 32],
+                _: &str,
+            ) -> Result<scp_protocol::context::builder::RemoveMemberOutput, ContextError>
+            {
+                Ok(scp_protocol::context::builder::RemoveMemberOutput::default())
             }
             fn distribute_sender_key(&self, _: &[u8; 32], _: &str) -> Result<(), ContextError> {
                 Ok(())

@@ -64,7 +64,8 @@ pub mod context {
     };
     // Key runtime types re-exported at this level.
     pub use scp_protocol::context::builder::{
-        AddMemberOutput, ContextCreationError, ContextCryptoProvider,
+        AddMemberOutput, AdvanceEpochOutput, ContextCreationError, ContextCryptoProvider,
+        RemoveMemberOutput,
     };
     pub use scp_runtime::context::ContextHandle;
     pub use scp_runtime::context::builder::{

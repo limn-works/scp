@@ -15,6 +15,7 @@ use std::sync::Arc;
 
 use scp_core::context::builder::{
     AddMemberOutput, ContextCryptoProvider, ContextEventLogProvider, ContextTransportProvider,
+    RemoveMemberOutput,
 };
 use scp_core::context::governance::KeyResolver;
 use scp_core::context::manager::ContextManager;
@@ -133,8 +134,12 @@ impl ContextCryptoProvider for MockCrypto {
     ) -> Result<AddMemberOutput, ContextError> {
         Ok(AddMemberOutput::default())
     }
-    fn remove_member(&self, _id: &[u8; 32], _member_did: &str) -> Result<(), ContextError> {
-        Ok(())
+    fn remove_member(
+        &self,
+        _id: &[u8; 32],
+        _member_did: &str,
+    ) -> Result<RemoveMemberOutput, ContextError> {
+        Ok(RemoveMemberOutput::default())
     }
     fn distribute_sender_key(&self, _id: &[u8; 32], _member_did: &str) -> Result<(), ContextError> {
         Ok(())

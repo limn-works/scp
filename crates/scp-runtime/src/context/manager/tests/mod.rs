@@ -216,7 +216,11 @@ impl ContextCryptoProvider for MockCrypto {
         Ok(scp_protocol::context::builder::AddMemberOutput::default())
     }
 
-    fn remove_member(&self, _context_id: &[u8; 32], member_did: &str) -> Result<(), ContextError> {
+    fn remove_member(
+        &self,
+        _context_id: &[u8; 32],
+        member_did: &str,
+    ) -> Result<scp_protocol::context::builder::RemoveMemberOutput, ContextError> {
         if self.fail_remove_member.load(Ordering::Relaxed) {
             return Err(ContextError::MembershipFailed(
                 "mock remove_member failure".into(),
@@ -230,7 +234,7 @@ impl ContextCryptoProvider for MockCrypto {
             .lock()
             .unwrap()
             .push(("remove_member".to_owned(), member_did.to_owned()));
-        Ok(())
+        Ok(scp_protocol::context::builder::RemoveMemberOutput::default())
     }
 
     fn distribute_sender_key(
@@ -312,7 +316,10 @@ impl ContextCryptoProvider for MockCrypto {
         }))
     }
 
-    fn advance_epoch(&self, context_id: &[u8; 32]) -> Result<(), ContextError> {
+    fn advance_epoch(
+        &self,
+        context_id: &[u8; 32],
+    ) -> Result<scp_protocol::context::builder::AdvanceEpochOutput, ContextError> {
         if self.fail_advance_epoch.load(Ordering::Relaxed) {
             return Err(ContextError::CryptoFailed(
                 "mock advance_epoch failure".into(),
@@ -323,7 +330,7 @@ impl ContextCryptoProvider for MockCrypto {
             .lock()
             .unwrap()
             .push(*context_id);
-        Ok(())
+        Ok(scp_protocol::context::builder::AdvanceEpochOutput::default())
     }
 }
 

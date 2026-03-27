@@ -696,8 +696,13 @@ impl ContextCryptoProvider for E2eCryptoProvider {
         })
     }
 
-    fn remove_member(&self, context_id: &[u8; 32], member_did: &str) -> Result<(), ContextError> {
+    fn remove_member(
+        &self,
+        context_id: &[u8; 32],
+        member_did: &str,
+    ) -> Result<scp_core::context::RemoveMemberOutput, ContextError> {
         use scp_core::crypto::mls::group::remove_member as mls_remove_member;
+        use tls_codec::Serialize as TlsSerializeTrait;
 
         if member_did == self.local_did {
             return Err(ContextError::CryptoFailed(
@@ -732,10 +737,28 @@ impl ContextCryptoProvider for E2eCryptoProvider {
             ContextError::MemberNotFound(format!("member {member_did} not in MLS group"))
         })?;
 
-        let _result = mls_remove_member(group, leaf_index)
+        let result = mls_remove_member(group, leaf_index)
             .map_err(|e| ContextError::CryptoFailed(e.to_string()))?;
 
-        Ok(())
+        let commit_bytes = result
+            .commit
+            .tls_serialize_detached()
+            .map_err(|e| ContextError::CryptoFailed(format!("serializing remove commit: {e}")))?;
+
+        let group_info_bytes = result
+            .group_info
+            .map(|gi| {
+                gi.tls_serialize_detached().map_err(|e| {
+                    ContextError::CryptoFailed(format!("serializing remove group info: {e}"))
+                })
+            })
+            .transpose()?
+            .unwrap_or_default();
+
+        Ok(scp_core::context::RemoveMemberOutput {
+            commit_bytes,
+            group_info_bytes,
+        })
     }
 
     fn distribute_sender_key(
@@ -786,7 +809,12 @@ impl ContextCryptoProvider for E2eCryptoProvider {
         let _ = store.remove(&ctx_hex, member_did);
         Ok(())
     }
-    fn advance_epoch(&self, context_id: &[u8; 32]) -> Result<(), ContextError> {
+    fn advance_epoch(
+        &self,
+        context_id: &[u8; 32],
+    ) -> Result<scp_core::context::AdvanceEpochOutput, ContextError> {
+        use tls_codec::Serialize as TlsSerializeTrait;
+
         let mut groups = self
             .groups
             .lock()
@@ -794,9 +822,12 @@ impl ContextCryptoProvider for E2eCryptoProvider {
         let group = groups
             .get_mut(context_id)
             .ok_or_else(|| ContextError::CryptoFailed("no MLS group for context".into()))?;
-        let _commit =
+        let commit =
             propose_update(group).map_err(|e| ContextError::CryptoFailed(e.to_string()))?;
-        Ok(())
+        let commit_bytes = commit.tls_serialize_detached().map_err(|e| {
+            ContextError::CryptoFailed(format!("serializing epoch advance commit: {e}"))
+        })?;
+        Ok(scp_core::context::AdvanceEpochOutput { commit_bytes })
     }
 
     fn seal(

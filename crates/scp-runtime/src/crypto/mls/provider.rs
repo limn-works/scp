@@ -498,13 +498,19 @@ impl ContextCryptoProvider for MlsCryptoProvider {
         })
     }
 
-    fn remove_member(&self, context_id: &[u8; 32], member_did: &str) -> Result<(), ContextError> {
+    fn remove_member(
+        &self,
+        context_id: &[u8; 32],
+        member_did: &str,
+    ) -> Result<scp_protocol::context::builder::RemoveMemberOutput, ContextError> {
+        use tls_codec::Serialize as TlsSerializeTrait;
+
         // Self-removal (leave): the local member's MLS group state does not
         // need to be updated when they leave — they simply abandon their
         // local group state. The remaining members process the removal via
         // a Commit from the group admin. Treat as a no-op (#1294).
         if member_did == self.local_did {
-            return Ok(());
+            return Ok(scp_protocol::context::builder::RemoveMemberOutput::default());
         }
 
         self.with_context(context_id, |state| {
@@ -545,12 +551,30 @@ impl ContextCryptoProvider for MlsCryptoProvider {
                     "remove_member: member DID not found in MLS group leaf nodes — \
                      member may not have been MLS-added"
                 );
-                return Ok(());
+                return Ok(scp_protocol::context::builder::RemoveMemberOutput::default());
             };
 
-            let _result = group::remove_member(&mut state.mls_group, leaf_index)
+            let result = group::remove_member(&mut state.mls_group, leaf_index)
                 .map_err(|e| ContextError::CryptoFailed(e.to_string()))?;
-            Ok(())
+
+            let commit_bytes = result.commit.tls_serialize_detached().map_err(|e| {
+                ContextError::CryptoFailed(format!("serializing remove commit: {e}"))
+            })?;
+
+            let group_info_bytes = result
+                .group_info
+                .map(|gi| {
+                    gi.tls_serialize_detached().map_err(|e| {
+                        ContextError::CryptoFailed(format!("serializing remove group info: {e}"))
+                    })
+                })
+                .transpose()?
+                .unwrap_or_default();
+
+            Ok(scp_protocol::context::builder::RemoveMemberOutput {
+                commit_bytes,
+                group_info_bytes,
+            })
         })
     }
 
@@ -1023,7 +1047,12 @@ impl ContextCryptoProvider for MlsCryptoProvider {
         })
     }
 
-    fn advance_epoch(&self, context_id: &[u8; 32]) -> Result<(), ContextError> {
+    fn advance_epoch(
+        &self,
+        context_id: &[u8; 32],
+    ) -> Result<scp_protocol::context::builder::AdvanceEpochOutput, ContextError> {
+        use tls_codec::Serialize as TlsSerializeTrait;
+
         let wrapping_pk = {
             let guard = self
                 .wrapping_public_key
@@ -1032,16 +1061,17 @@ impl ContextCryptoProvider for MlsCryptoProvider {
             *guard
         };
         self.with_context(context_id, |state| {
-            // The Commit message is intentionally discarded here. In the recovery
-            // flow (§9.12), the caller distributes the epoch change to other members
-            // via `recovery_send_notification`, not by distributing the raw MLS Commit.
-            // This is consistent with governance epoch advances.
-            let _commit = super::ratchet::propose_update_with_wrapping_key(
+            let commit = super::ratchet::propose_update_with_wrapping_key(
                 &mut state.mls_group,
                 &wrapping_pk,
             )
             .map_err(|e| ContextError::CryptoFailed(e.to_string()))?;
-            Ok(())
+
+            let commit_bytes = commit.tls_serialize_detached().map_err(|e| {
+                ContextError::CryptoFailed(format!("serializing epoch advance commit: {e}"))
+            })?;
+
+            Ok(scp_protocol::context::builder::AdvanceEpochOutput { commit_bytes })
         })
     }
 
@@ -1507,6 +1537,43 @@ mod tests {
         // Remove Bob.
         let result = provider.remove_member(&ctx_id, bob_did);
         assert!(result.is_ok(), "remove_member failed: {result:?}");
+        let output = result.unwrap();
+        assert!(
+            !output.commit_bytes.is_empty(),
+            "remove_member must return non-empty commit_bytes for MLS group epoch advance"
+        );
+    }
+
+    #[test]
+    fn remove_member_self_returns_empty_commit() {
+        let provider = make_provider();
+        let ctx_id = make_context_id();
+        provider.create_mls_group(&ctx_id).unwrap();
+
+        // Self-removal (leave) returns empty commit bytes — the local node
+        // does not produce a Commit for its own departure.
+        let output = provider
+            .remove_member(&ctx_id, &provider.local_did)
+            .unwrap();
+        assert!(
+            output.commit_bytes.is_empty(),
+            "self-removal must return empty commit_bytes"
+        );
+    }
+
+    #[test]
+    fn advance_epoch_returns_non_empty_commit() {
+        let provider = make_provider();
+        let ctx_id = make_context_id();
+        provider.create_mls_group(&ctx_id).unwrap();
+
+        let output = provider.advance_epoch(&ctx_id);
+        assert!(output.is_ok(), "advance_epoch failed: {output:?}");
+        let output = output.unwrap();
+        assert!(
+            !output.commit_bytes.is_empty(),
+            "advance_epoch must return non-empty commit_bytes for MLS epoch advance"
+        );
     }
 
     #[test]

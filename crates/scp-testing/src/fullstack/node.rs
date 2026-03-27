@@ -461,7 +461,11 @@ impl ContextCryptoProvider for ArcCryptoProvider {
     ) -> Result<scp_core::context::AddMemberOutput, ContextError> {
         self.0.add_member(id, did, kp)
     }
-    fn remove_member(&self, id: &[u8; 32], did: &str) -> Result<(), ContextError> {
+    fn remove_member(
+        &self,
+        id: &[u8; 32],
+        did: &str,
+    ) -> Result<scp_core::context::RemoveMemberOutput, ContextError> {
         self.0.remove_member(id, did)
     }
     fn distribute_sender_key(&self, id: &[u8; 32], did: &str) -> Result<(), ContextError> {
@@ -492,7 +496,10 @@ impl ContextCryptoProvider for ArcCryptoProvider {
     ) -> Result<Option<Vec<u8>>, ContextError> {
         self.0.handle_sender_key_request(id, req, pk)
     }
-    fn advance_epoch(&self, id: &[u8; 32]) -> Result<(), ContextError> {
+    fn advance_epoch(
+        &self,
+        id: &[u8; 32],
+    ) -> Result<scp_core::context::AdvanceEpochOutput, ContextError> {
         self.0.advance_epoch(id)
     }
     fn seal(

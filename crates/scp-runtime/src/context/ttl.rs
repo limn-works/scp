@@ -1288,8 +1288,8 @@ mod tests {
             &self,
             _context_id: &[u8; 32],
             _member_did: &str,
-        ) -> Result<(), ContextError> {
-            Ok(())
+        ) -> Result<scp_protocol::context::builder::RemoveMemberOutput, ContextError> {
+            Ok(scp_protocol::context::builder::RemoveMemberOutput::default())
         }
         fn distribute_sender_key(
             &self,
@@ -2440,8 +2440,8 @@ mod tests {
             &self,
             _context_id: &[u8; 32],
             _member_did: &str,
-        ) -> Result<(), ContextError> {
-            Ok(())
+        ) -> Result<scp_protocol::context::builder::RemoveMemberOutput, ContextError> {
+            Ok(scp_protocol::context::builder::RemoveMemberOutput::default())
         }
         fn distribute_sender_key(
             &self,
@@ -2876,8 +2876,8 @@ mod tests {
             &self,
             _context_id: &[u8; 32],
             _member_did: &str,
-        ) -> Result<(), ContextError> {
-            Ok(())
+        ) -> Result<scp_protocol::context::builder::RemoveMemberOutput, ContextError> {
+            Ok(scp_protocol::context::builder::RemoveMemberOutput::default())
         }
         fn distribute_sender_key(
             &self,

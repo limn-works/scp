@@ -1661,41 +1661,27 @@ impl ContextManager {
         if !is_broadcast {
             self.crypto
                 .remove_member_sender_key(&context_id_bytes, member_did)?;
-            self.crypto.remove_member(&context_id_bytes, member_did)?;
+            let remove_output = self.crypto.remove_member(&context_id_bytes, member_did)?;
 
-            // Rotate the local sender key so the departing member cannot
-            // decrypt future messages (§9.16.4). Generates a fresh key,
-            // increments the epoch, and HPKE-seals to remaining members.
-            //
-            // Note: `publish_sender_key_epoch_advance` (§9.16.2) is called
-            // implicitly via `drain_pending_sender_key_messages` below. The
-            // distribution messages are queued by `rotate_sender_key`.
-            self.crypto.rotate_sender_key(&context_id_bytes)?;
-
-            // Drain pending sender key distributions and deliver via transport.
-            let pending = self
-                .crypto
-                .drain_pending_sender_key_messages(&context_id_bytes)?;
-            if !pending.is_empty() {
-                let routing_id = scp_protocol::context::context_routing_id(&context_id);
-                for (target_did, message) in pending {
-                    tracing::debug!(
-                        target_did = %target_did,
-                        context_id = %context_id,
-                        message_len = message.len(),
-                        "sending rotated sender key distribution after member departure"
-                    );
-                    if let Err(e) = self.transport.send_message(&routing_id, &message) {
-                        tracing::warn!(
-                            target_did = %target_did,
-                            context_id = %context_id,
-                            error = %e,
-                            "failed to send rotated sender key — \
-                             recipient must request key via SenderKeyRequest"
-                        );
-                    }
-                }
+            // Broadcast the MLS Commit to remaining members so they can
+            // advance their group epoch and ratchet key material.
+            if !remove_output.commit_bytes.is_empty()
+                && let Err(e) = self.transport.send_message(
+                    &scp_protocol::context::context_routing_id(&context_id),
+                    &remove_output.commit_bytes,
+                )
+            {
+                tracing::warn!(
+                    context_id = %context_id,
+                    error = %e,
+                    "failed to broadcast remove_member MLS Commit — \
+                     remaining members may not advance epoch"
+                );
             }
+
+            // Rotate the local sender key and distribute to remaining members (§9.16.4).
+            self.crypto.rotate_sender_key(&context_id_bytes)?;
+            self.drain_and_deliver_sender_keys(&context_id, &context_id_bytes)?;
         }
 
         // Atomic state check + membership removal + count check within single lock.
@@ -1767,6 +1753,40 @@ impl ContextManager {
             handle.transition_to(&ContextState::Closing).await?;
         }
 
+        Ok(())
+    }
+
+    /// Drains pending sender key distribution messages and delivers them
+    /// via transport (§9.16.2). Called after `rotate_sender_key` to send
+    /// HPKE-sealed sender key responses to remaining members.
+    fn drain_and_deliver_sender_keys(
+        &self,
+        context_id: &str,
+        context_id_bytes: &[u8; 32],
+    ) -> Result<(), ContextError> {
+        let pending = self
+            .crypto
+            .drain_pending_sender_key_messages(context_id_bytes)?;
+        if !pending.is_empty() {
+            let routing_id = scp_protocol::context::context_routing_id(context_id);
+            for (target_did, message) in pending {
+                tracing::debug!(
+                    target_did = %target_did,
+                    context_id = %context_id,
+                    message_len = message.len(),
+                    "sending rotated sender key distribution"
+                );
+                if let Err(e) = self.transport.send_message(&routing_id, &message) {
+                    tracing::warn!(
+                        target_did = %target_did,
+                        context_id = %context_id,
+                        error = %e,
+                        "failed to send rotated sender key — \
+                         recipient must request key via SenderKeyRequest"
+                    );
+                }
+            }
+        }
         Ok(())
     }
 }
