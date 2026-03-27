@@ -1312,45 +1312,13 @@ impl ContextManager {
                 .check_version_compatibility(scp_protocol::envelope::SCP_PROTOCOL_VERSION)?;
         }
 
-        // Crypto operations -- no lock held, no TOCTOU concern for these
-        // provider calls since they are idempotent or externally consistent.
+        // Validate key package before any mutations (idempotent, no lock needed).
         let kp_bytes = key_package.mls_key_package_bytes.as_deref();
         self.crypto.validate_key_package(&member_did, kp_bytes)?;
-        let add_output = self
-            .crypto
-            .add_member(&context_id_bytes, &member_did, kp_bytes)?;
-        self.crypto
-            .distribute_sender_key(&context_id_bytes, &member_did)?;
 
-        // Drain pending HPKE-sealed sender key distribution messages.
-        // These are SenderKeyResponse payloads that need to be delivered
-        // to the target member via transport (§9.16.2).
-        let pending = self
-            .crypto
-            .drain_pending_sender_key_messages(&context_id_bytes)?;
-        for (target_did, message) in pending {
-            tracing::debug!(
-                target_did = %target_did,
-                context_id = %context_id,
-                message_len = message.len(),
-                "sending sender key distribution message"
-            );
-            if let Err(e) = self.transport.send_message(&routing_id, &message) {
-                tracing::warn!(
-                    target_did = %target_did,
-                    context_id = %context_id,
-                    error = %e,
-                    "failed to send sender key distribution message — \
-                     recipient must request key via SenderKeyRequest"
-                );
-            }
-        }
-
-        // Atomic state check + mutation: verify Active, then economy enforcement,
-        // role assignment, membership, and event buffer — all within a single
-        // lock acquisition. Budget deduction happens here via enforce_join_economy.
-        // The adapter flow (authorize/complete/void) happens after the lock is
-        // dropped so async adapter calls don't hold the contexts mutex.
+        // Phase 1: Economy enforcement + sybil check under lock (budget deduction).
+        // This happens BEFORE any crypto mutations so that a rejected payment
+        // never grants MLS group access or sender keys.
         let deducted_cost = {
             let mut contexts = self.contexts.lock().await;
             let ctx = contexts
@@ -1379,66 +1347,93 @@ impl ContextManager {
             // Sybil resistance check (#1530) — fail-closed with `?`.
             evaluate_sybil_resistance(ctx, &member_did, self.clock.now_secs())?;
 
-            post_join_bookkeeping(
-                ctx,
-                &context_id,
-                &member_did,
-                self.clock.now_secs(),
-                &*self.event_log,
-            );
-
-            // Add member to role state.
-            ctx.role_state.members.insert(member_did.to_string());
-
-            // Assign default "member" role.
-            let creator_did = ctx.role_state.creator_did.clone();
-            let tokens = roles::assign_role(
-                &mut ctx.role_state,
-                &member_did,
-                "member",
-                &creator_did,
-                &*self.clock,
-            )
-            .map_err(|e| ContextError::MembershipFailed(e.to_string()))?;
-
-            // Add to membership tracking.
-            ctx.membership
-                .add_member(member_did.clone(), "member".into(), tokens);
-
-            // Generate access key for the new member (§9.17.2 step 2).
-            // The inviter stores the key so `send_message` can wrap content
-            // for this recipient. Key distribution to the joiner happens
-            // via the Welcome payload / out-of-band key exchange.
-            let member_access_key =
-                scp_protocol::crypto::access_keys::generate_access_key(&context_id, &member_did);
-            ctx.access
-                .access_key_store
-                .set(&context_id, &member_did, member_access_key);
-
-            // Emit MemberJoined event to receive buffer.
-            ctx.receive_buffer.push(ContextEvent::MemberJoined {
-                member_did: member_did.clone(),
-                role_name: "member".into(),
-            });
-
-            // Emit WelcomeGenerated event if the add produced a Welcome message.
-            push_welcome_event(
-                &mut ctx.receive_buffer,
-                &context_id,
-                &DID(creator_did),
-                &member_did,
-                add_output,
-            );
-
             deducted_cost
         };
-        // Lock dropped before adapter calls and event log append.
 
-        // Payment flow (#1537): escrow pattern for context joins.
-        // authorize (escrow hold) → complete (capture) on success /
-        // void + rollback_budget on failure. Matches send_message pattern.
-        self.execute_join_payment(&context_id, &member_did, deducted_cost)
+        // Phase 2: Authorize payment (escrow hold) BEFORE any crypto mutation.
+        // If authorization fails, rollback budget — no MLS state was touched.
+        let auth = self
+            .authorize_join_payment(&context_id, &member_did, deducted_cost)
             .await?;
+
+        // Phase 3: MLS add_member + sender key distribution (crypto mutations).
+        // On failure: void escrow + rollback budget. No MLS rollback needed
+        // because add_member itself failed (no state change occurred).
+        let add_output = match self
+            .crypto
+            .add_member(&context_id_bytes, &member_did, kp_bytes)
+        {
+            Ok(output) => output,
+            Err(e) => {
+                if let Some(a) = auth {
+                    self.void_paid_action(a, &context_id).await;
+                }
+                super::economy::rollback_budget(self, &context_id, &member_did, deducted_cost)
+                    .await;
+                return Err(e);
+            }
+        };
+
+        if let Err(e) = self
+            .crypto
+            .distribute_sender_key(&context_id_bytes, &member_did)
+        {
+            // Sender key distribution failed after MLS add — rollback MLS state.
+            let _ = self.crypto.remove_member(&context_id_bytes, &member_did);
+            let _ = self
+                .crypto
+                .remove_member_sender_key(&context_id_bytes, &member_did);
+            if let Some(a) = auth {
+                self.void_paid_action(a, &context_id).await;
+            }
+            super::economy::rollback_budget(self, &context_id, &member_did, deducted_cost).await;
+            return Err(e);
+        }
+
+        // Drain pending HPKE-sealed sender key distribution messages.
+        // These are SenderKeyResponse payloads that need to be delivered
+        // to the target member via transport (§9.16.2).
+        let pending = self
+            .crypto
+            .drain_pending_sender_key_messages(&context_id_bytes)?;
+        for (target_did, message) in pending {
+            tracing::debug!(
+                target_did = %target_did,
+                context_id = %context_id,
+                message_len = message.len(),
+                "sending sender key distribution message"
+            );
+            if let Err(e) = self.transport.send_message(&routing_id, &message) {
+                tracing::warn!(
+                    target_did = %target_did,
+                    context_id = %context_id,
+                    error = %e,
+                    "failed to send sender key distribution message — \
+                     recipient must request key via SenderKeyRequest"
+                );
+            }
+        }
+
+        // Phase 4: Membership mutation under lock. On failure: void escrow +
+        // rollback budget + rollback MLS state.
+        if let Err(e) = self
+            .join_context_membership(&context_id, &member_did, add_output)
+            .await
+        {
+            let _ = self.crypto.remove_member(&context_id_bytes, &member_did);
+            let _ = self
+                .crypto
+                .remove_member_sender_key(&context_id_bytes, &member_did);
+            if let Some(a) = auth {
+                self.void_paid_action(a, &context_id).await;
+            }
+            super::economy::rollback_budget(self, &context_id, &member_did, deducted_cost).await;
+            return Err(e);
+        }
+
+        // Phase 5: Capture the escrow hold after all mutations succeeded.
+        self.capture_join_payment(auth, &member_did, &context_id, deducted_cost)
+            .await;
 
         // Append MemberJoined event to event log.
         self.event_log.append_context_event(
@@ -1460,40 +1455,127 @@ impl ContextManager {
         Ok(())
     }
 
-    /// Executes the payment flow for context joins using the escrow pattern.
+    /// Performs the membership state mutations for `join_context` (Phase 4).
     ///
-    /// Authorize (escrow hold) → complete (capture) on success, or
-    /// void + `rollback_budget` on failure.
-    async fn execute_join_payment(
+    /// Extracted to keep `join_context` within the clippy `too_many_lines` limit.
+    /// Acquires the contexts lock, verifies Active state, then performs
+    /// bookkeeping, role assignment, membership add, access key generation,
+    /// and event buffer pushes.
+    async fn join_context_membership(
+        &self,
+        context_id: &str,
+        member_did: &DID,
+        add_output: scp_protocol::context::builder::AddMemberOutput,
+    ) -> Result<(), ContextError> {
+        let mut contexts = self.contexts.lock().await;
+        let ctx = contexts
+            .get_mut(context_id)
+            .ok_or_else(|| ContextError::ContextNotRegistered(context_id.to_owned()))?;
+
+        require_active(&ctx.handle)?;
+
+        post_join_bookkeeping(
+            ctx,
+            context_id,
+            member_did,
+            self.clock.now_secs(),
+            &*self.event_log,
+        );
+
+        // Add member to role state.
+        ctx.role_state.members.insert(member_did.to_string());
+
+        // Assign default "member" role.
+        let creator_did = ctx.role_state.creator_did.clone();
+        let tokens = roles::assign_role(
+            &mut ctx.role_state,
+            member_did,
+            "member",
+            &creator_did,
+            &*self.clock,
+        )
+        .map_err(|e| ContextError::MembershipFailed(e.to_string()))?;
+
+        // Add to membership tracking.
+        ctx.membership
+            .add_member(member_did.clone(), "member".into(), tokens);
+
+        // Generate access key for the new member (§9.17.2 step 2).
+        // The inviter stores the key so `send_message` can wrap content
+        // for this recipient. Key distribution to the joiner happens
+        // via the Welcome payload / out-of-band key exchange.
+        let member_access_key =
+            scp_protocol::crypto::access_keys::generate_access_key(context_id, member_did);
+        ctx.access
+            .access_key_store
+            .set(context_id, member_did, member_access_key);
+
+        // Emit MemberJoined event to receive buffer.
+        ctx.receive_buffer.push(ContextEvent::MemberJoined {
+            member_did: member_did.clone(),
+            role_name: "member".into(),
+        });
+
+        // Emit WelcomeGenerated event if the add produced a Welcome message.
+        push_welcome_event(
+            &mut ctx.receive_buffer,
+            context_id,
+            &DID(creator_did),
+            member_did,
+            add_output,
+        );
+
+        Ok(())
+    }
+
+    /// Authorizes escrow for join payment (Phase 2 of `join_context`).
+    ///
+    /// On authorization failure, rolls back the budget deducted in Phase 1.
+    /// Returns the authorization token (if payment is required) for later
+    /// capture or void.
+    async fn authorize_join_payment(
         &self,
         context_id: &str,
         member_did: &DID,
         deducted_cost: Option<scp_protocol::economy::types::Amount>,
-    ) -> Result<(), ContextError> {
-        let auth = self
+    ) -> Result<Option<super::economy::PaidActionAuthorization>, ContextError> {
+        match self
             .authorize_paid_action(
                 scp_protocol::economy::types::PaidActionType::ContextJoin,
                 member_did,
                 context_id,
             )
-            .await;
-        match auth {
-            Ok(Some(auth)) => {
-                if let Err(e) = self
-                    .complete_paid_action(auth, member_did, context_id)
-                    .await
-                {
-                    super::economy::rollback_budget(self, context_id, member_did, deducted_cost)
-                        .await;
-                    return Err(e);
-                }
-                Ok(())
-            }
-            Ok(None) => Ok(()), // No payment needed.
+            .await
+        {
+            Ok(auth) => Ok(auth),
             Err(payment_err) => {
                 super::economy::rollback_budget(self, context_id, member_did, deducted_cost).await;
                 Err(payment_err)
             }
+        }
+    }
+
+    /// Captures the escrow hold after a successful join (Phase 5 of `join_context`).
+    ///
+    /// Best-effort: if capture fails, rolls back the budget and logs a warning
+    /// but does NOT fail the join (the member was already added).
+    async fn capture_join_payment(
+        &self,
+        auth: Option<super::economy::PaidActionAuthorization>,
+        member_did: &DID,
+        context_id: &str,
+        deducted_cost: Option<scp_protocol::economy::types::Amount>,
+    ) {
+        if let Some(a) = auth
+            && let Err(e) = self.complete_paid_action(a, member_did, context_id).await
+        {
+            // Capture failed — rollback budget. The member was already added,
+            // so we log the payment failure but still finalize the join.
+            super::economy::rollback_budget(self, context_id, member_did, deducted_cost).await;
+            tracing::warn!(
+                context_id,
+                "payment capture failed after successful join: {e}"
+            );
         }
     }
 
