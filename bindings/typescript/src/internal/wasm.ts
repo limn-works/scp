@@ -70,6 +70,7 @@ interface WasmModule {
     handle: BridgeContextHandle,
     identityDid: string,
     payloadBase64: string,
+    spendingUcanJwt?: string,
   ) => Promise<void>;
   context_subscribe: (
     handle: BridgeContextHandle,
@@ -723,8 +724,14 @@ export function createWasmBridge(): Bridge {
       };
     },
 
-    async contextJoin(handle: BridgeContextHandle, identityDid: string): Promise<void> {
+    async contextJoin(
+      handle: BridgeContextHandle,
+      identityDid: string,
+      _spendingUcanJwt: string | null,
+    ): Promise<void> {
       const wasm = getWasm();
+      // WASM bridge's context_join does not yet accept spending_ucan_jwt;
+      // the parameter is accepted at the SDK layer for API parity.
       await wasm.context_join(handle, identityDid);
     },
 
@@ -742,10 +749,11 @@ export function createWasmBridge(): Bridge {
       handle: BridgeContextHandle,
       identityDid: string,
       payload: Uint8Array,
+      spendingUcanJwt: string | null,
     ): Promise<void> {
       const wasm = getWasm();
       const payloadBase64 = uint8ToBase64(payload);
-      await wasm.context_send(handle, identityDid, payloadBase64);
+      await wasm.context_send(handle, identityDid, payloadBase64, spendingUcanJwt ?? undefined);
     },
 
     contextSubscribe(

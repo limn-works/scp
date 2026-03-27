@@ -188,11 +188,14 @@ export function createNativeBridge(): Bridge {
       return handle;
     },
 
-    async contextJoin(handle: BridgeContextHandle, identityDid: string): Promise<void> {
-      await (addon.contextJoin as (h: BridgeContextHandle, d: string) => Promise<void>)(
-        handle,
-        identityDid,
-      );
+    async contextJoin(
+      handle: BridgeContextHandle,
+      identityDid: string,
+      spendingUcanJwt: string | null,
+    ): Promise<void> {
+      await (
+        addon.contextJoin as (h: BridgeContextHandle, d: string, s: string | null) => Promise<void>
+      )(handle, identityDid, spendingUcanJwt);
     },
 
     async contextLeave(handle: BridgeContextHandle, identityDid: string): Promise<void> {
@@ -213,12 +216,18 @@ export function createNativeBridge(): Bridge {
       handle: BridgeContextHandle,
       identityDid: string,
       payload: Uint8Array,
+      spendingUcanJwt: string | null,
     ): Promise<void> {
       // NAPI Vec<u8> maps to number[] in JS, not Uint8Array.
       const payloadArray = Array.from(payload) as unknown as number[];
       await (
-        addon.contextSend as (h: BridgeContextHandle, d: string, p: number[]) => Promise<void>
-      )(handle, identityDid, payloadArray);
+        addon.contextSend as (
+          h: BridgeContextHandle,
+          d: string,
+          p: number[],
+          s: string | null,
+        ) => Promise<void>
+      )(handle, identityDid, payloadArray, spendingUcanJwt);
     },
 
     contextSubscribe(

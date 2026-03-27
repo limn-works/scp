@@ -33,7 +33,8 @@ public enum ContextBridge {
     public typealias SendFn = @Sendable (
         _ handle: ContextHandle,
         _ identity: Identity,
-        _ payload: Data
+        _ payload: Data,
+        _ spendingUcanJwt: String?
     ) async throws -> Void
 
     /// The closure type for subscribing to messages. Injected for testability.
@@ -57,17 +58,20 @@ public enum ContextBridge {
     /// The closure type for joining an existing context. Injected for testability.
     public typealias JoinFn = @Sendable (
         _ handle: ContextHandle,
-        _ identity: Identity
+        _ identity: Identity,
+        _ spendingUcanJwt: String?
     ) async throws -> Void
 
     /// Default join function — delegates to UniFFI ``contextJoin``.
-    public static let defaultJoin: JoinFn = { handle, identity in
-        try await contextJoin(handle: handle, identity: identity)
+    public static let defaultJoin: JoinFn = { handle, identity, spendingUcanJwt in
+        try await contextJoin(handle: handle, identity: identity, spendingUcanJwt: spendingUcanJwt)
     }
 
     /// Default send function — delegates to UniFFI ``contextSend``.
-    public static let defaultSend: SendFn = { handle, identity, payload in
-        try await contextSend(handle: handle, identity: identity, payload: payload)
+    public static let defaultSend: SendFn = { handle, identity, payload, spendingUcanJwt in
+        try await contextSend(
+            handle: handle, identity: identity, payload: payload, spendingUcanJwt: spendingUcanJwt
+        )
     }
 
     /// Default leave function — delegates to UniFFI ``contextLeave``.
@@ -428,14 +432,14 @@ public actor Context {
     /// - Parameter payload: The raw message data to send.
     /// - Throws: ``ScpError/Context(msg:code:)`` with code `"SCP-CTX-2001"`
     ///   if the context is not active, or if the bridge send operation fails.
-    public func send(_ payload: Data) async throws {
+    public func send(_ payload: Data, spendingUcanJwt: String? = nil) async throws {
         guard state == .active else {
             throw ScpError.Context(
                 msg: "Context is not active",
                 code: "SCP-CTX-2001"
             )
         }
-        try await sendFn(handle, identity, payload)
+        try await sendFn(handle, identity, payload, spendingUcanJwt)
     }
 
     /// Sets the economic policy for this context (spec section 19).
@@ -613,9 +617,10 @@ public actor Context {
 public func joinContext(
     handle: ContextHandle,
     identity: Identity,
+    spendingUcanJwt: String? = nil,
     joinFn: ContextBridge.JoinFn = ContextBridge.defaultJoin
 ) async throws {
-    try await joinFn(handle, identity)
+    try await joinFn(handle, identity, spendingUcanJwt)
 }
 
 // MARK: - App Sandboxing (spec §8.4.1, §8.4.2, issue #595)

@@ -591,6 +591,7 @@ class Context:
         promotion_policy: PromotionPolicy | str = PromotionPolicy.NO_PROMOTION,
         template_id: str | None = None,
         economic_policy: str | None = None,
+        consequence_rules: list | None = None,
     ) -> Context:
         """Create a new SCP context.
 
@@ -625,6 +626,9 @@ class Context:
                 must match the template definition.
             economic_policy: Optional economic policy as a JSON string
                 (spec section 19).  ``None`` means free context.
+            consequence_rules: Optional list of consequence rule
+                dictionaries (spec section 9.3, issue #1531).
+                ``None`` means no consequence rules.
 
         Returns:
             A new :class:`Context` in the ``'active'`` state.
@@ -665,6 +669,7 @@ class Context:
             "promotion_policy": promotion_policy_str,
             "template_id": template_id,
             "economic_policy": economic_policy,
+            "consequence_rules": json.dumps(consequence_rules) if consequence_rules else None,
         }
 
         handle = await asyncio.to_thread(_scp_core.py_context_create, creator.did, params)
@@ -672,11 +677,17 @@ class Context:
 
     # -- Lifecycle ----------------------------------------------------------
 
-    async def join(self, identity: Identity) -> Membership:
+    async def join(
+        self,
+        identity: Identity,
+        spending_ucan_jwt: str | None = None,
+    ) -> Membership:
         """Join this context with the given identity.
 
         Args:
             identity: The identity joining the context.
+            spending_ucan_jwt: Optional spending UCAN JWT for
+                AND-composition with join cost (spec section 19).
 
         Returns:
             A :class:`Membership` representing the new participant.
@@ -692,7 +703,12 @@ class Context:
                 code="SCP-CTX-2001",
             ) from exc
 
-        await asyncio.to_thread(_scp_core.py_context_join, self._handle, identity.did)
+        await asyncio.to_thread(
+            _scp_core.py_context_join,
+            self._handle,
+            identity.did,
+            spending_ucan_jwt,
+        )
         return Membership(
             did=identity.did,
             role="member",
@@ -745,6 +761,7 @@ class Context:
         self,
         message: str | bytes,
         identity: Identity | None = None,
+        spending_ucan_jwt: str | None = None,
     ) -> None:
         """Send a message to this context.
 
@@ -752,6 +769,8 @@ class Context:
             message: The message payload (text or binary).
             identity: The sending identity.  Defaults to the context
                 creator if not specified.
+            spending_ucan_jwt: Optional spending UCAN JWT for
+                AND-composition with message cost (spec section 19).
 
         Raises:
             ContextError: If the context is not active.
@@ -765,7 +784,13 @@ class Context:
             ) from exc
 
         sender_did = identity.did if identity is not None else self._creator_did
-        await asyncio.to_thread(_scp_core.py_context_send, self._handle, sender_did, message)
+        await asyncio.to_thread(
+            _scp_core.py_context_send,
+            self._handle,
+            sender_did,
+            message,
+            spending_ucan_jwt,
+        )
 
     async def receive(self) -> AsyncIterator[Message]:
         """Return an async iterator of incoming messages.

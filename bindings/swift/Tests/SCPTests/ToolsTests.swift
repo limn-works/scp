@@ -31,7 +31,7 @@ struct ToolsTests {
     ) -> Context {
         let handle = ContextHandle(noPointer: .init())
 
-        let sendFn: ContextBridge.SendFn = { _, _, _ in }
+        let sendFn: ContextBridge.SendFn = { _, _, _, _ in }
         let subscribeFn: ContextBridge.SubscribeFn = { _, _ in }
         let leaveFn: ContextBridge.LeaveFn = { _, _ in }
         let closeFn: ContextBridge.CloseFn = { _, _ in }
@@ -176,7 +176,7 @@ struct ToolsTests {
     @Test("invokeTool calls bridge and returns result")
     func invokeToolRoundtrip() async throws {
         let handle = ContextHandle(noPointer: .init())
-        let sendFn: ContextBridge.SendFn = { _, _, _ in }
+        let sendFn: ContextBridge.SendFn = { _, _, _, _ in }
         let subscribeFn: ContextBridge.SubscribeFn = { _, _ in }
         let leaveFn: ContextBridge.LeaveFn = { _, _ in }
         let closeFn: ContextBridge.CloseFn = { _, _ in }
@@ -234,7 +234,7 @@ struct ToolsTests {
     @Test("registerTool calls bridge and returns tool ID")
     func registerToolRoundtrip() async throws {
         let handle = ContextHandle(noPointer: .init())
-        let sendFn: ContextBridge.SendFn = { _, _, _ in }
+        let sendFn: ContextBridge.SendFn = { _, _, _, _ in }
         let subscribeFn: ContextBridge.SubscribeFn = { _, _ in }
         let leaveFn: ContextBridge.LeaveFn = { _, _ in }
         let closeFn: ContextBridge.CloseFn = { _, _ in }
@@ -304,7 +304,7 @@ struct ToolsTests {
     @Test("verifyTool calls bridge and returns result")
     func verifyToolRoundtrip() async throws {
         let handle = ContextHandle(noPointer: .init())
-        let sendFn: ContextBridge.SendFn = { _, _, _ in }
+        let sendFn: ContextBridge.SendFn = { _, _, _, _ in }
         let subscribeFn: ContextBridge.SubscribeFn = { _, _ in }
         let leaveFn: ContextBridge.LeaveFn = { _, _ in }
         let closeFn: ContextBridge.CloseFn = { _, _ in }
@@ -384,7 +384,7 @@ struct ToolsTests {
     func invokeToolCrossContextRoundtrip() async throws {
         let sourceHandle = ContextHandle(noPointer: .init())
         let targetHandle = ContextHandle(noPointer: .init())
-        let sendFn: ContextBridge.SendFn = { _, _, _ in }
+        let sendFn: ContextBridge.SendFn = { _, _, _, _ in }
         let subscribeFn: ContextBridge.SubscribeFn = { _, _ in }
         let leaveFn: ContextBridge.LeaveFn = { _, _ in }
         let closeFn: ContextBridge.CloseFn = { _, _ in }
@@ -466,7 +466,7 @@ struct ToolsTests {
     @Test("createToolSession calls bridge and returns session result")
     func createToolSessionRoundtrip() async throws {
         let handle = ContextHandle(noPointer: .init())
-        let sendFn: ContextBridge.SendFn = { _, _, _ in }
+        let sendFn: ContextBridge.SendFn = { _, _, _, _ in }
         let subscribeFn: ContextBridge.SubscribeFn = { _, _ in }
         let leaveFn: ContextBridge.LeaveFn = { _, _ in }
         let closeFn: ContextBridge.CloseFn = { _, _ in }
@@ -506,7 +506,7 @@ struct ToolsTests {
     @Test("invokeToolSession calls bridge with session ID")
     func invokeToolSessionRoundtrip() async throws {
         let handle = ContextHandle(noPointer: .init())
-        let sendFn: ContextBridge.SendFn = { _, _, _ in }
+        let sendFn: ContextBridge.SendFn = { _, _, _, _ in }
         let subscribeFn: ContextBridge.SubscribeFn = { _, _ in }
         let leaveFn: ContextBridge.LeaveFn = { _, _ in }
         let closeFn: ContextBridge.CloseFn = { _, _ in }
@@ -546,7 +546,7 @@ struct ToolsTests {
     @Test("closeToolSession calls bridge with session ID")
     func closeToolSessionRoundtrip() async throws {
         let handle = ContextHandle(noPointer: .init())
-        let sendFn: ContextBridge.SendFn = { _, _, _ in }
+        let sendFn: ContextBridge.SendFn = { _, _, _, _ in }
         let subscribeFn: ContextBridge.SubscribeFn = { _, _ in }
         let leaveFn: ContextBridge.LeaveFn = { _, _ in }
         let closeFn: ContextBridge.CloseFn = { _, _ in }

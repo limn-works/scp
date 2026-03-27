@@ -412,6 +412,7 @@ pub async fn context_create(
         .unwrap_or("single_admin")
         .to_owned();
     let economic_policy = params["economicPolicy"].as_str().map(str::to_owned);
+    let consequence_rules_json = params["consequenceRules"].as_str().map(str::to_owned);
 
     // Extract key custody and signing key from the identity handle (RED-102).
     #[cfg(feature = "allow_in_memory_custody")]
@@ -501,6 +502,20 @@ pub async fn context_create(
         })
         .transpose()?;
 
+    // Deserialize consequence_rules JSON string, if provided (#1531).
+    let core_consequence_rules: Vec<scp_core::trust::ConsequenceRule> = consequence_rules_json
+        .as_deref()
+        .map(|cr_json| {
+            serde_json::from_str(cr_json).map_err(|e| {
+                NapiError::from(ScpNapiError::Validation {
+                    message: format!("invalid consequenceRules JSON: {e}"),
+                    code: "SCP-VALID-7000".to_owned(),
+                })
+            })
+        })
+        .transpose()?
+        .unwrap_or_default();
+
     let context_params = ContextParams {
         mode,
         ceiling: core_ceiling,
@@ -514,6 +529,7 @@ pub async fn context_create(
         max_nesting_depth,
         session_cap,
         economic_policy: core_economic_policy,
+        consequence_rules: core_consequence_rules,
         ..ContextParams::default()
     };
 
@@ -570,7 +586,11 @@ pub async fn context_create(
 /// Rejects with `SCP-CTX-2013` if the context is not in `"active"` state.
 #[napi]
 #[allow(clippy::needless_pass_by_value)] // napi-rs requires owned String
-pub async fn context_join(handle: &NapiContextHandle, identity_did: String) -> napi::Result<()> {
+pub async fn context_join(
+    handle: &NapiContextHandle,
+    identity_did: String,
+    spending_ucan_jwt: Option<String>,
+) -> napi::Result<()> {
     validate_did(&identity_did).map_err(|e| napi::Error::from(ScpNapiError::from(e)))?;
 
     let state_str = handle.current_state_str().map_err(NapiError::from)?;
@@ -601,9 +621,21 @@ pub async fn context_join(handle: &NapiContextHandle, identity_did: String) -> n
         mls_key_package_bytes: Some(kp_bytes),
     };
 
+    // Parse optional spending UCAN JWT for AND-composition (join cost).
+    let spending_ucan = spending_ucan_jwt
+        .as_deref()
+        .map(scp_core::crypto::ucan::validate::parse_ucan)
+        .transpose()
+        .map_err(|e| {
+            NapiError::from(ScpNapiError::Context {
+                message: format!("invalid spending UCAN: {e}"),
+                code: "SCP-ECON-7061".to_owned(),
+            })
+        })?;
+
     let manager = context_manager()?;
     manager
-        .join_context(core_handle, key_package, None)
+        .join_context(core_handle, key_package, spending_ucan.as_ref())
         .await
         .map_err(|e| NapiError::from(ScpNapiError::from(e)))?;
 

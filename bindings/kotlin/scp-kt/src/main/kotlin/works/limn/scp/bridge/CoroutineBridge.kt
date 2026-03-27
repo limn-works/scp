@@ -204,6 +204,7 @@ interface ContextBindings {
     fun contextJoin(
         contextHandle: Long,
         identityHandle: Long,
+        spendingUcanJwt: String? = null,
     )
 
     /**
@@ -257,6 +258,7 @@ interface ContextBindings {
         contextHandle: Long,
         identityHandle: Long,
         payload: ByteArray,
+        spendingUcanJwt: String? = null,
     )
 
     /**
@@ -1490,7 +1492,8 @@ class ContextBridge internal constructor(
     suspend fun join(
         contextHandle: Long,
         identityHandle: Long,
-    ): Unit = bridge.ffiCall { bindings.contextJoin(contextHandle, identityHandle) }
+        spendingUcanJwt: String? = null,
+    ): Unit = bridge.ffiCall { bindings.contextJoin(contextHandle, identityHandle, spendingUcanJwt) }
 
     /**
      * Leave a context gracefully (member action).
@@ -1525,7 +1528,11 @@ class ContextBridge internal constructor(
         contextHandle: Long,
         identityHandle: Long,
         payload: ByteArray,
-    ): Unit = bridge.ffiCall { bindings.contextSend(contextHandle, identityHandle, payload) }
+        spendingUcanJwt: String? = null,
+    ): Unit =
+        bridge.ffiCall {
+            bindings.contextSend(contextHandle, identityHandle, payload, spendingUcanJwt)
+        }
 
     /**
      * Set the economic policy for a context (§19.3).

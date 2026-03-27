@@ -22,7 +22,7 @@ struct GovernanceTests {
     /// contextId, creatorDid, and initialState.
     private func makeActiveContext() -> Context {
         let handle = ContextHandle(noPointer: .init())
-        let sendFn: ContextBridge.SendFn = { _, _, _ in }
+        let sendFn: ContextBridge.SendFn = { _, _, _, _ in }
         let subscribeFn: ContextBridge.SubscribeFn = { _, _ in }
         let leaveFn: ContextBridge.LeaveFn = { _, _ in }
         let closeFn: ContextBridge.CloseFn = { _, _ in }

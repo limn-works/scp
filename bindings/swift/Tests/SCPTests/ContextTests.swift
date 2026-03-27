@@ -62,7 +62,7 @@ struct ContextTests {
         let handle = ContextHandle(noPointer: .init())
         let identity = Identity(noPointer: .init())
 
-        let sendFn: ContextBridge.SendFn = { _, _, payload in
+        let sendFn: ContextBridge.SendFn = { _, _, payload, _ in
             onSend?(payload)
         }
 
@@ -121,7 +121,7 @@ struct ContextTests {
             capturedParams.withLock { $0 = params }
             return ContextHandle(noPointer: .init())
         }
-        let noOpSend: ContextBridge.SendFn = { _, _, _ in }
+        let noOpSend: ContextBridge.SendFn = { _, _, _, _ in }
         let noOpSubscribe: ContextBridge.SubscribeFn = { _, _ in }
         let noOpLeave: ContextBridge.LeaveFn = { _, _ in }
         let noOpClose: ContextBridge.CloseFn = { _, _ in }
@@ -175,7 +175,7 @@ struct ContextTests {
         let createFn: ContextBridge.CreateFn = { _, _ in
             throw ScpError.Context(msg: "creation failed", code: "SCP-CTX-2100")
         }
-        let noOpSend: ContextBridge.SendFn = { _, _, _ in }
+        let noOpSend: ContextBridge.SendFn = { _, _, _, _ in }
         let noOpSubscribe: ContextBridge.SubscribeFn = { _, _ in }
         let noOpLeave: ContextBridge.LeaveFn = { _, _ in }
         let noOpClose: ContextBridge.CloseFn = { _, _ in }
@@ -232,7 +232,7 @@ struct ContextTests {
         let handle = ContextHandle(noPointer: .init())
         let identity = Identity(noPointer: .init())
 
-        let sendFn: ContextBridge.SendFn = { _, id, _ in
+        let sendFn: ContextBridge.SendFn = { _, id, _, _ in
             capturedIdentity.withLock { $0 = id }
         }
 
@@ -580,7 +580,7 @@ struct ContextTests {
             contextId: "test-leave-identity",
             creatorDid: "did:dht:z6MkTest",
             initialState: .active,
-            sendFn: { _, _, _ in },
+            sendFn: { _, _, _, _ in },
             subscribeFn: { _, _ in },
             leaveFn: leaveFn,
             closeFn: { _, _ in }
@@ -634,7 +634,7 @@ struct ContextTests {
             contextId: "test-close-identity",
             creatorDid: "did:dht:z6MkTest",
             initialState: .active,
-            sendFn: { _, _, _ in },
+            sendFn: { _, _, _, _ in },
             subscribeFn: { _, _ in },
             leaveFn: { _, _ in },
             closeFn: closeFn
@@ -803,7 +803,7 @@ struct ContextTests {
         let identity = Identity(noPointer: .init())
         var joinCalled = false
 
-        let mockJoin: ContextBridge.JoinFn = { _, _ in
+        let mockJoin: ContextBridge.JoinFn = { _, _, _ in
             joinCalled = true
         }
 
@@ -816,7 +816,7 @@ struct ContextTests {
         let handle = ContextHandle(noPointer: .init())
         let identity = Identity(noPointer: .init())
 
-        let mockJoin: ContextBridge.JoinFn = { _, _ in
+        let mockJoin: ContextBridge.JoinFn = { _, _, _ in
             throw ScpError.Context(
                 msg: "cannot join context in Closed state",
                 code: "SCP-CTX-2013"
@@ -856,7 +856,7 @@ struct ContextTests {
             contextId: "econ-policy-test",
             creatorDid: "did:dht:z6MkTest",
             initialState: .active,
-            sendFn: { _, _, _ in },
+            sendFn: { _, _, _, _ in },
             subscribeFn: { _, _ in },
             leaveFn: { _, _ in },
             closeFn: { _, _ in },

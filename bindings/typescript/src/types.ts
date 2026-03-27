@@ -45,6 +45,8 @@ export interface ContextParams {
   readonly maxNestingDepth?: number;
   /** Per-caller session cap (§6.2.1). Default 1000. */
   readonly sessionCap?: number;
+  /** Consequence rules for automated governance enforcement (§9.3, #1531). */
+  readonly consequenceRules?: readonly Record<string, unknown>[];
 }
 
 // ---------------------------------------------------------------------------

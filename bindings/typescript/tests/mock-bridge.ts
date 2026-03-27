@@ -271,7 +271,11 @@ export function createMockBridge(): Bridge & {
       return { contextId, state: "active", creatorDid: identity.did };
     },
 
-    async contextJoin(handle: BridgeContextHandle, identityDid: string): Promise<void> {
+    async contextJoin(
+      handle: BridgeContextHandle,
+      identityDid: string,
+      _spendingUcanJwt?: string | null,
+    ): Promise<void> {
       const ctx = getContext(handle);
       ctx.members.add(identityDid);
       const joinedEvent: Event = {
@@ -324,6 +328,7 @@ export function createMockBridge(): Bridge & {
       handle: BridgeContextHandle,
       identityDid: string,
       payload: Uint8Array,
+      _spendingUcanJwt?: string | null,
     ): Promise<void> {
       const ctx = getContext(handle);
       const sequence = ctx.eventLog.length;

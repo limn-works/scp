@@ -214,7 +214,7 @@ struct TransportTests {
         let handle = ContextHandle(noPointer: .init())
         var sentPayload: Data?
 
-        let sendFn: ContextBridge.SendFn = { _, _, payload in
+        let sendFn: ContextBridge.SendFn = { _, _, payload, _ in
             sentPayload = payload
         }
         let subscribeFn: ContextBridge.SubscribeFn = { _, _ in }
@@ -246,7 +246,7 @@ struct TransportTests {
         var subscribed = false
         let handle = ContextHandle(noPointer: .init())
 
-        let sendFn: ContextBridge.SendFn = { _, _, _ in }
+        let sendFn: ContextBridge.SendFn = { _, _, _, _ in }
         let subscribeFn: ContextBridge.SubscribeFn = { _, listener in
             subscribed = true
             listener.onComplete()

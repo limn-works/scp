@@ -347,6 +347,9 @@ export class Context implements AsyncDisposable {
         ceilingPolicy: params.ceilingPolicy ?? "immutable",
         promotionPolicy: params.promotionPolicy,
         economicPolicy: params.economicPolicy,
+        consequenceRules: params.consequenceRules
+          ? JSON.stringify(params.consequenceRules)
+          : undefined,
       });
 
       const handle = await bridge.contextCreate(identity._handle, paramsJson);
@@ -362,11 +365,11 @@ export class Context implements AsyncDisposable {
    * @param identity - The identity joining the context.
    * @throws {ContextError} If the context is not in `"active"` state.
    */
-  async join(identity: Identity): Promise<void> {
+  async join(identity: Identity, spendingUcanJwt?: string): Promise<void> {
     this.assertActive();
     try {
       const bridge = await getBridge();
-      await bridge.contextJoin(this._handle, identity.did);
+      await bridge.contextJoin(this._handle, identity.did, spendingUcanJwt ?? null);
     } catch (error) {
       throw mapBridgeError(error);
     }
@@ -380,12 +383,12 @@ export class Context implements AsyncDisposable {
    * @param payload - The message content.
    * @throws {ContextError} If the context is not `"active"` or send fails.
    */
-  async send(payload: string | Uint8Array): Promise<void> {
+  async send(payload: string | Uint8Array, spendingUcanJwt?: string): Promise<void> {
     this.assertActive();
     try {
       const bridge = await getBridge();
       const bytes = typeof payload === "string" ? new TextEncoder().encode(payload) : payload;
-      await bridge.contextSend(this._handle, this._identityDid, bytes);
+      await bridge.contextSend(this._handle, this._identityDid, bytes, spendingUcanJwt ?? null);
     } catch (error) {
       throw mapBridgeError(error);
     }

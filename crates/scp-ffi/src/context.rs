@@ -984,8 +984,12 @@ fn py_context_create(identity_did: &str, params: &Bound<'_, PyDict>) -> PyResult
 ///
 /// Returns `RuntimeError` if the context is not in "active" state.
 #[pyfunction]
-#[pyo3(signature = (handle, identity_did))]
-fn py_context_join(handle: &PyContextHandle, identity_did: &str) -> PyResult<()> {
+#[pyo3(signature = (handle, identity_did, spending_ucan_jwt=None))]
+fn py_context_join(
+    handle: &PyContextHandle,
+    identity_did: &str,
+    spending_ucan_jwt: Option<&str>,
+) -> PyResult<()> {
     validate::validate_did(identity_did)?;
     let state = handle
         .state
@@ -998,6 +1002,14 @@ fn py_context_join(handle: &PyContextHandle, identity_did: &str) -> PyResult<()>
         )));
     }
     drop(state);
+
+    // Parse optional spending UCAN JWT for AND-composition (join cost).
+    let spending_ucan = spending_ucan_jwt
+        .map(|jwt| {
+            scp_core::crypto::ucan::validate::parse_ucan(jwt)
+                .map_err(|e| PyRuntimeError::new_err(format!("invalid spending UCAN: {e}")))
+        })
+        .transpose()?;
 
     // Ensure the ContextManager is initialized — context_join is a valid
     // first operation (e.g. a device joining a context without creating one).
@@ -1041,7 +1053,8 @@ fn py_context_join(handle: &PyContextHandle, identity_did: &str) -> PyResult<()>
             let _ = temp_handle
                 .transition_to(&scp_core::context::ContextState::Active)
                 .await;
-            mgr.join_context(&temp_handle, key_package, None).await
+            mgr.join_context(&temp_handle, key_package, spending_ucan.as_ref())
+                .await
         })
         .map_err(|e| PyRuntimeError::new_err(format!("ContextManager join_context failed: {e}")))?;
 
