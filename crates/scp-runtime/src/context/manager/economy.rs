@@ -185,8 +185,8 @@ async fn verify_and_check_receipt(
 
 /// Unified economy enforcement: evaluate cost, check spending UCAN, check budget.
 ///
-/// This replaces the former `enforce_send_economy`, `enforce_join_economy`, and
-/// `check_tool_economy` as separate functions. One unified flow per the escrow
+/// This replaces the former separate economy enforcement functions.
+/// One unified flow per the escrow
 /// pattern: evaluate cost -> check spending UCAN -> check budget -> deduct.
 ///
 /// Returns the deducted cost for rollback on failure, or `None` if no cost.
@@ -427,7 +427,12 @@ impl ContextManager {
     ///
     /// Calls `adapter.void` to release the escrow hold. Best-effort —
     /// logs but does not propagate void failures.
-    #[allow(dead_code)] // Part of the escrow pattern API; will be used by callers that need void.
+    ///
+    /// Currently unused: `execute_join_payment` and `execute_send_payment`
+    /// only call authorize → complete (the auth is consumed by complete, so
+    /// void is not needed). Retained as part of the escrow API for callers
+    /// that need explicit void (e.g., a future "cancel" flow).
+    #[allow(dead_code)]
     pub(super) async fn void_paid_action(&self, auth: PaidActionAuthorization, context_id: &str) {
         if let Some(ref authorization) = auth.prepared.envelope.authorization
             && let Err(e) = auth.bridge.void(authorization).await
