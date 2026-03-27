@@ -6473,7 +6473,7 @@ async fn sender_key_before_mls_removal_ordering() {
 /// Budget exceeded on tool invoke returns `BudgetExceeded` (#1537).
 #[tokio::test]
 async fn budget_exceeded_on_tool_invoke() {
-    use crate::context::tools::invoke::{InvocationError, check_tool_economy};
+    use crate::context::tools::invoke::{InvocationError, ToolEconomyContext, invoke_tool};
     use scp_protocol::economy::types::{Amount, CostSchedule, CurrencyCode, EconomicPolicy};
 
     let policy = EconomicPolicy {
@@ -6490,13 +6490,36 @@ async fn budget_exceeded_on_tool_invoke() {
         pricing_formula: None,
         payee: DID::from("did:key:payee"),
     };
-
     let invoker: DID = "did:key:invoker".into();
     let mut tracker = scp_protocol::economy::budget::MemberBudgetTracker::new();
-    // Grant only 50 but cost is 100 — should fail.
-    tracker.grant(&invoker, Amount::new(50));
-
-    let result = check_tool_economy(Some(&policy), &mut tracker, &invoker);
+    tracker.grant(&invoker, Amount::new(50)); // Less than cost=100.
+    let (handle, registry, role_state) = test_tool_invoke_setup(&invoker).await;
+    let spending_ucan = dummy_spending_ucan();
+    let mut economy = ToolEconomyContext {
+        economic_policy: Some(&policy),
+        budget_tracker: &mut tracker,
+        action_ucan: None,
+        spending_ucan: Some(&spending_ucan),
+        context_id: "ctx-test",
+        now: 0,
+        events: &[],
+        participation_cache: &mut std::collections::HashMap::new(),
+        consequence_rules: &[],
+        payment_adapter: None,
+        metrics: scp_protocol::economy::policy::ObservableMetrics::default(),
+    };
+    let result = invoke_tool(
+        &handle,
+        &registry,
+        &role_state,
+        &"calculator".to_owned(),
+        serde_json::json!({"a": 1, "b": 2}),
+        &invoker,
+        None,
+        |_| async move { Ok(serde_json::json!({"result": 3, "status": "ok"})) },
+        Some(&mut economy),
+    )
+    .await;
     assert!(
         matches!(result, Err(InvocationError::BudgetExceeded { .. })),
         "should return BudgetExceeded, got: {result:?}"
@@ -8368,9 +8391,11 @@ async fn send_message_deducts_budget() {
 }
 
 /// Tool invoke deducts budget by `per_tool_invoke` cost (#1537, positive case).
+///
+/// Tests budget deduction through `invoke_tool` with `ToolEconomyContext`.
 #[tokio::test]
 async fn tool_invoke_deducts_budget() {
-    use crate::context::tools::invoke::check_tool_economy;
+    use crate::context::tools::invoke::{ToolEconomyContext, invoke_tool};
     use scp_protocol::economy::types::{Amount, CostSchedule, CurrencyCode, EconomicPolicy};
 
     let policy = EconomicPolicy {
@@ -8387,31 +8412,136 @@ async fn tool_invoke_deducts_budget() {
         pricing_formula: None,
         payee: DID::from("did:key:payee"),
     };
-
     let invoker: DID = "did:key:invoker".into();
     let mut tracker = scp_protocol::economy::budget::MemberBudgetTracker::new();
     tracker.grant(&invoker, Amount::new(100));
+    let (handle, registry, role_state) = test_tool_invoke_setup(&invoker).await;
+    let metrics = scp_protocol::economy::policy::ObservableMetrics::default();
+    let spending_ucan = dummy_spending_ucan();
 
     // First invocation should deduct 20 from budget (100 -> 80).
-    let result = check_tool_economy(Some(&policy), &mut tracker, &invoker);
-    assert!(
-        result.is_ok(),
-        "first invocation should succeed: {result:?}"
-    );
-    assert_eq!(
-        tracker.remaining(&invoker),
-        Amount::new(80),
-        "budget should be 80 after first tool invoke (cost=20)"
-    );
+    {
+        let mut economy = ToolEconomyContext {
+            economic_policy: Some(&policy),
+            budget_tracker: &mut tracker,
+            action_ucan: None,
+            spending_ucan: Some(&spending_ucan),
+            context_id: "ctx-test",
+            now: 0,
+            events: &[],
+            participation_cache: &mut std::collections::HashMap::new(),
+            consequence_rules: &[],
+            payment_adapter: None,
+            metrics: metrics.clone(),
+        };
+        let result = invoke_tool(
+            &handle,
+            &registry,
+            &role_state,
+            &"calculator".to_owned(),
+            serde_json::json!({}),
+            &invoker,
+            None,
+            |input| async move { Ok(input) },
+            Some(&mut economy),
+        )
+        .await;
+        assert!(
+            result.is_ok(),
+            "first invocation should succeed: {result:?}"
+        );
+    }
+    assert_eq!(tracker.remaining(&invoker), Amount::new(80));
 
     // Second invocation: 80 -> 60.
-    let result2 = check_tool_economy(Some(&policy), &mut tracker, &invoker);
-    assert!(result2.is_ok(), "second invocation should succeed");
-    assert_eq!(
-        tracker.remaining(&invoker),
-        Amount::new(60),
-        "budget should be 60 after second tool invoke"
-    );
+    {
+        let mut economy = ToolEconomyContext {
+            economic_policy: Some(&policy),
+            budget_tracker: &mut tracker,
+            action_ucan: None,
+            spending_ucan: Some(&spending_ucan),
+            context_id: "ctx-test",
+            now: 0,
+            events: &[],
+            participation_cache: &mut std::collections::HashMap::new(),
+            consequence_rules: &[],
+            payment_adapter: None,
+            metrics: metrics.clone(),
+        };
+        let result2 = invoke_tool(
+            &handle,
+            &registry,
+            &role_state,
+            &"calculator".to_owned(),
+            serde_json::json!({}),
+            &invoker,
+            None,
+            |input| async move { Ok(input) },
+            Some(&mut economy),
+        )
+        .await;
+        assert!(result2.is_ok(), "second invocation should succeed");
+    }
+    assert_eq!(tracker.remaining(&invoker), Amount::new(60));
+}
+
+/// Creates common test fixtures for tool invoke economy tests.
+async fn test_tool_invoke_setup(
+    invoker: &DID,
+) -> (
+    crate::context::ContextHandle,
+    scp_protocol::context::tools::registry::ToolRegistry,
+    scp_protocol::context::roles::ContextRoleState,
+) {
+    use scp_protocol::context::ContextParams;
+    use scp_protocol::context::roles::{Capability, CapabilityCeiling, ContextRoleState};
+    use scp_protocol::context::tools::registry::{ToolRegistration, ToolSchema, register_tool};
+
+    let ceiling = CapabilityCeiling::new([Capability::ToolInvokeAll, Capability::ToolRegister]);
+    let role_state = ContextRoleState::new(
+        "ctx-test",
+        invoker.as_ref(),
+        ceiling,
+        vec![],
+        &scp_primitives::SystemClock,
+    )
+    .unwrap();
+    let mut registry = scp_protocol::context::tools::registry::ToolRegistry::new();
+    let registration = ToolRegistration {
+        tool_id: "calculator".to_owned(),
+        name: "Calculator".to_owned(),
+        description: "A simple calculator".to_owned(),
+        schema: ToolSchema {
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "a": {"type": "number"},
+                    "b": {"type": "number"}
+                }
+            }),
+            output_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "result": {"type": "number"},
+                    "status": {"type": "string"}
+                }
+            }),
+        },
+        implementation_hash: [0xAA; 32],
+        test_vectors: vec![],
+        operator_did: "did:dht:z6MkOperator".into(),
+        cost: None,
+        registered_at: 0,
+        signature: Vec::new(),
+    };
+    register_tool(&mut registry, &role_state, registration, invoker.as_ref()).unwrap();
+    let handle =
+        crate::context::ContextHandle::new("ctx-test".to_owned(), ContextParams::default());
+    handle
+        .transition_to(&scp_protocol::context::ContextState::Active)
+        .await
+        .unwrap();
+    (handle, registry, role_state)
 }
 
 /// Velocity tracker records messages after send (#1537).
@@ -9428,10 +9558,10 @@ async fn test_send_rejected_insufficient_budget() {
     );
 }
 
-/// Tool invoke rejected when budget insufficient via `check_tool_economy` (#1537).
+/// Tool invoke rejected when budget insufficient (#1537).
 #[tokio::test]
 async fn test_tool_invoke_rejected_insufficient_budget() {
-    use crate::context::tools::invoke::check_tool_economy;
+    use crate::context::tools::invoke::{InvocationError, ToolEconomyContext, invoke_tool};
     use scp_protocol::economy::types::{Amount, CostSchedule, CurrencyCode, EconomicPolicy};
 
     let policy = EconomicPolicy {
@@ -9448,23 +9578,39 @@ async fn test_tool_invoke_rejected_insufficient_budget() {
         pricing_formula: None,
         payee: DID::from("did:key:payee"),
     };
-
     let invoker: DID = "did:key:invoker".into();
     let mut tracker = scp_protocol::economy::budget::MemberBudgetTracker::new();
     tracker.grant(&invoker, Amount::new(30)); // Less than per_tool_invoke=50.
-
-    let result = check_tool_economy(Some(&policy), &mut tracker, &invoker);
+    let (handle, registry, role_state) = test_tool_invoke_setup(&invoker).await;
+    let spending_ucan = dummy_spending_ucan();
+    let mut economy = ToolEconomyContext {
+        economic_policy: Some(&policy),
+        budget_tracker: &mut tracker,
+        action_ucan: None,
+        spending_ucan: Some(&spending_ucan),
+        context_id: "ctx-test",
+        now: 0,
+        events: &[],
+        participation_cache: &mut std::collections::HashMap::new(),
+        consequence_rules: &[],
+        payment_adapter: None,
+        metrics: scp_protocol::economy::policy::ObservableMetrics::default(),
+    };
+    let result = invoke_tool(
+        &handle,
+        &registry,
+        &role_state,
+        &"calculator".to_owned(),
+        serde_json::json!({"a": 1, "b": 2}),
+        &invoker,
+        None,
+        |_| async move { Ok(serde_json::json!({"result": 3, "status": "ok"})) },
+        Some(&mut economy),
+    )
+    .await;
     assert!(
-        result.is_err(),
-        "tool invoke should fail with insufficient budget: {result:?}"
-    );
-    let err = result.unwrap_err();
-    assert!(
-        matches!(
-            err,
-            crate::context::tools::invoke::InvocationError::BudgetExceeded { .. }
-        ),
-        "expected BudgetExceeded error, got: {err:?}"
+        matches!(result, Err(InvocationError::BudgetExceeded { .. })),
+        "expected BudgetExceeded error, got: {result:?}"
     );
 }
 
