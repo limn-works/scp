@@ -18,6 +18,59 @@ use scp_event_log::{Event, EventType};
 use scp_primitives::DID;
 
 // ---------------------------------------------------------------------------
+// ConsequenceValidationError
+// ---------------------------------------------------------------------------
+
+/// Error returned when a [`ConsequenceRule`] fails input validation.
+///
+/// Used to reject attacker-controlled strings (custom trigger keys, capability
+/// names, role names) that contain control characters, HTML-special characters,
+/// or exceed length limits. Validation is performed at construction time, not
+/// at serialization time.
+#[derive(Debug, Clone, thiserror::Error)]
+#[error("consequence rule validation failed: {0}")]
+pub struct ConsequenceValidationError(String);
+
+/// Maximum length for custom trigger keys and capability names.
+const MAX_CONSEQUENCE_STRING_LEN: usize = 256;
+/// Maximum length for role names in `RoleDemotion`.
+const MAX_ROLE_NAME_LEN: usize = 128;
+/// Maximum number of capabilities in a `CapabilitySuspension` action.
+const MAX_CAPABILITY_SUSPENSION_COUNT: usize = 32;
+
+/// Characters forbidden in consequence string fields. These prevent
+/// HTML injection (`<`, `>`, `&`, `"`, `'`) and are checked alongside
+/// control characters.
+const FORBIDDEN_CHARS: &str = "<>&\"'";
+
+/// Validates a user-supplied string field in a [`ConsequenceRule`].
+///
+/// Rejects strings that:
+/// - Exceed `max_len` bytes
+/// - Contain ASCII control characters (`c.is_control()`)
+/// - Contain any of `<`, `>`, `&`, `"`, `'`
+fn validate_consequence_string(
+    s: &str,
+    field: &str,
+    max_len: usize,
+) -> Result<(), ConsequenceValidationError> {
+    if s.len() > max_len {
+        return Err(ConsequenceValidationError(format!(
+            "{field} exceeds max length {max_len} (got {})",
+            s.len()
+        )));
+    }
+    if s.chars()
+        .any(|c| c.is_control() || FORBIDDEN_CHARS.contains(c))
+    {
+        return Err(ConsequenceValidationError(format!(
+            "{field} contains forbidden characters (control chars or HTML-special chars)"
+        )));
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
 // ConsequenceTrigger
 // ---------------------------------------------------------------------------
 
@@ -112,6 +165,60 @@ pub struct ConsequenceRule {
     /// The time window (in seconds) within which events are counted. Only
     /// events with timestamps in `[now - window, now]` are considered.
     pub window: Duration,
+}
+
+impl ConsequenceRule {
+    /// Validates all user-supplied string fields in this rule.
+    ///
+    /// This should be called at the FFI boundary and in `ContextManager` before
+    /// storing consequence rules. It rejects:
+    ///
+    /// - `Custom(key)`: key with control/HTML chars or length > 256
+    /// - `CapabilitySuspension(caps)`: individual cap name with control/HTML
+    ///   chars or length > 256, or more than 32 capabilities
+    /// - `RoleDemotion { to_role }`: role name with control/HTML chars or
+    ///   length > 128
+    ///
+    /// Other trigger/action variants have no user-supplied strings and always
+    /// pass validation.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ConsequenceValidationError`] if any string field contains
+    /// forbidden characters (control chars, `<`, `>`, `&`, `"`, `'`), exceeds
+    /// its maximum length, or if `CapabilitySuspension` has more than 32
+    /// entries.
+    pub fn validate(&self) -> Result<(), ConsequenceValidationError> {
+        // Validate trigger.
+        if let ConsequenceTrigger::Custom(key) = &self.trigger {
+            validate_consequence_string(key, "Custom trigger key", MAX_CONSEQUENCE_STRING_LEN)?;
+        }
+
+        // Validate action.
+        match &self.action {
+            ConsequenceAction::CapabilitySuspension(caps) => {
+                if caps.len() > MAX_CAPABILITY_SUSPENSION_COUNT {
+                    return Err(ConsequenceValidationError(format!(
+                        "CapabilitySuspension has {} capabilities, max is {MAX_CAPABILITY_SUSPENSION_COUNT}",
+                        caps.len()
+                    )));
+                }
+                for (i, cap) in caps.iter().enumerate() {
+                    validate_consequence_string(
+                        cap,
+                        &format!("CapabilitySuspension[{i}]"),
+                        MAX_CONSEQUENCE_STRING_LEN,
+                    )?;
+                }
+            }
+            ConsequenceAction::RoleDemotion { to_role } => {
+                validate_consequence_string(to_role, "RoleDemotion.to_role", MAX_ROLE_NAME_LEN)?;
+            }
+            ConsequenceAction::AccessRevocation => { /* no user strings */ }
+        }
+
+        Ok(())
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -909,5 +1016,242 @@ mod tests {
         let json = serde_json::to_string(&action).unwrap();
         let deserialized: ConsequenceAction = serde_json::from_str(&json).unwrap();
         assert_eq!(deserialized, action);
+    }
+
+    // -----------------------------------------------------------------------
+    // 20. Validation: Custom trigger with script tag is rejected
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn validate_rejects_custom_trigger_with_script_tag() {
+        let rule = ConsequenceRule {
+            trigger: ConsequenceTrigger::Custom("<script>alert(1)</script>".to_owned()),
+            action: ConsequenceAction::AccessRevocation,
+            threshold: 1,
+            window: Duration::from_secs(60),
+        };
+        let err = rule.validate().unwrap_err();
+        assert!(
+            err.to_string().contains("forbidden characters"),
+            "error should mention forbidden characters, got: {err}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // 21. Validation: valid Custom trigger key is accepted
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn validate_accepts_valid_custom_trigger() {
+        let rule = ConsequenceRule {
+            trigger: ConsequenceTrigger::Custom("valid_trigger_name".to_owned()),
+            action: ConsequenceAction::AccessRevocation,
+            threshold: 1,
+            window: Duration::from_secs(60),
+        };
+        assert!(rule.validate().is_ok());
+    }
+
+    // -----------------------------------------------------------------------
+    // 22. Validation: CapabilitySuspension with HTML in cap name is rejected
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn validate_rejects_capability_suspension_with_html() {
+        let rule = ConsequenceRule {
+            trigger: ConsequenceTrigger::MessageVelocity,
+            action: ConsequenceAction::CapabilitySuspension(vec!["<img onerror=x>".to_owned()]),
+            threshold: 1,
+            window: Duration::from_secs(60),
+        };
+        let err = rule.validate().unwrap_err();
+        assert!(
+            err.to_string().contains("forbidden characters"),
+            "error should mention forbidden characters, got: {err}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // 23. Validation: valid CapabilitySuspension is accepted
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn validate_accepts_valid_capability_suspension() {
+        let rule = ConsequenceRule {
+            trigger: ConsequenceTrigger::MessageVelocity,
+            action: ConsequenceAction::CapabilitySuspension(vec!["messages:write".to_owned()]),
+            threshold: 1,
+            window: Duration::from_secs(60),
+        };
+        assert!(rule.validate().is_ok());
+    }
+
+    // -----------------------------------------------------------------------
+    // 24. Validation: valid RoleDemotion is accepted
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn validate_accepts_valid_role_demotion() {
+        let rule = ConsequenceRule {
+            trigger: ConsequenceTrigger::MessageVelocity,
+            action: ConsequenceAction::RoleDemotion {
+                to_role: "member".to_owned(),
+            },
+            threshold: 1,
+            window: Duration::from_secs(60),
+        };
+        assert!(rule.validate().is_ok());
+    }
+
+    // -----------------------------------------------------------------------
+    // 25. Validation: RoleDemotion with script tag is rejected
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn validate_rejects_role_demotion_with_script_tag() {
+        let rule = ConsequenceRule {
+            trigger: ConsequenceTrigger::MessageVelocity,
+            action: ConsequenceAction::RoleDemotion {
+                to_role: "<script>".to_owned(),
+            },
+            threshold: 1,
+            window: Duration::from_secs(60),
+        };
+        let err = rule.validate().unwrap_err();
+        assert!(
+            err.to_string().contains("forbidden characters"),
+            "error should mention forbidden characters, got: {err}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // 26. Validation: Custom trigger key exceeding max length is rejected
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn validate_rejects_oversized_custom_trigger_key() {
+        let long_key = "a".repeat(300);
+        let rule = ConsequenceRule {
+            trigger: ConsequenceTrigger::Custom(long_key),
+            action: ConsequenceAction::AccessRevocation,
+            threshold: 1,
+            window: Duration::from_secs(60),
+        };
+        let err = rule.validate().unwrap_err();
+        assert!(
+            err.to_string().contains("exceeds max length"),
+            "error should mention max length, got: {err}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // 27. Validation: control characters in trigger key are rejected
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn validate_rejects_control_chars_in_custom_trigger() {
+        let rule = ConsequenceRule {
+            trigger: ConsequenceTrigger::Custom("trigger\x00key".to_owned()),
+            action: ConsequenceAction::AccessRevocation,
+            threshold: 1,
+            window: Duration::from_secs(60),
+        };
+        let err = rule.validate().unwrap_err();
+        assert!(
+            err.to_string().contains("forbidden characters"),
+            "error should mention forbidden characters, got: {err}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // 28. Validation: too many capabilities in CapabilitySuspension rejected
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn validate_rejects_too_many_capabilities() {
+        let caps: Vec<String> = (0..33).map(|i| format!("cap:{i}")).collect();
+        let rule = ConsequenceRule {
+            trigger: ConsequenceTrigger::MessageVelocity,
+            action: ConsequenceAction::CapabilitySuspension(caps),
+            threshold: 1,
+            window: Duration::from_secs(60),
+        };
+        let err = rule.validate().unwrap_err();
+        assert!(
+            err.to_string().contains("33 capabilities"),
+            "error should mention capability count, got: {err}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // 29. Validation: exactly 32 capabilities in CapabilitySuspension is OK
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn validate_accepts_max_capabilities() {
+        let caps: Vec<String> = (0..32).map(|i| format!("cap:{i}")).collect();
+        let rule = ConsequenceRule {
+            trigger: ConsequenceTrigger::MessageVelocity,
+            action: ConsequenceAction::CapabilitySuspension(caps),
+            threshold: 1,
+            window: Duration::from_secs(60),
+        };
+        assert!(rule.validate().is_ok());
+    }
+
+    // -----------------------------------------------------------------------
+    // 30. Validation: AccessRevocation (no user strings) always passes
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn validate_accepts_access_revocation() {
+        let rule = ConsequenceRule {
+            trigger: ConsequenceTrigger::MessageVelocity,
+            action: ConsequenceAction::AccessRevocation,
+            threshold: 1,
+            window: Duration::from_secs(60),
+        };
+        assert!(rule.validate().is_ok());
+    }
+
+    // -----------------------------------------------------------------------
+    // 31. Validation: RoleDemotion exceeding max role name length rejected
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn validate_rejects_oversized_role_name() {
+        let long_role = "r".repeat(129);
+        let rule = ConsequenceRule {
+            trigger: ConsequenceTrigger::MessageVelocity,
+            action: ConsequenceAction::RoleDemotion { to_role: long_role },
+            threshold: 1,
+            window: Duration::from_secs(60),
+        };
+        let err = rule.validate().unwrap_err();
+        assert!(
+            err.to_string().contains("exceeds max length"),
+            "error should mention max length, got: {err}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // 32. Validation: each HTML-special char is individually rejected
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn validate_rejects_each_html_special_char() {
+        for ch in ['<', '>', '&', '"', '\''] {
+            let key = format!("trigger{ch}key");
+            let rule = ConsequenceRule {
+                trigger: ConsequenceTrigger::Custom(key),
+                action: ConsequenceAction::AccessRevocation,
+                threshold: 1,
+                window: Duration::from_secs(60),
+            };
+            assert!(
+                rule.validate().is_err(),
+                "should reject char '{ch}' in custom trigger key"
+            );
+        }
     }
 }

@@ -720,6 +720,7 @@ These rules are:
 - **Declared at context creation.** Visible in context metadata before opt-in.
 - **Protocol-enforced.** Not governance-discretion. Triggers are mechanical, consequences are automatic.
 - **Verifiable.** Any agent can evaluate the consequence structure and determine whether misbehavior is irrational given the costs.
+- **Sanitized at creation.** All string fields in consequence rules (`Custom` trigger keys, `CapabilitySuspension` capability names, `RoleDemotion` target roles) are validated when the context is created. Implementations MUST reject strings containing control characters (U+0000-U+001F, U+007F-U+009F), HTML-special characters (`<`, `>`, `&`, `"`, `'`), or strings exceeding 256 bytes. This prevents injection attacks when consequence events are serialized for SDK consumers or rendered in user interfaces.
 
 Consequence mechanisms transform "do I trust this agent to behave?" into "are the consequences of misbehaving sufficient to make it irrational?" The latter is a validation question, not a trust question.
 

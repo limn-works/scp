@@ -13,6 +13,22 @@ use super::{
     validate_governance_consistency, validate_governance_model,
 };
 
+/// Validates all consequence rule string fields (defense-in-depth).
+///
+/// Called from `create_context` to catch internal callers that bypass FFI
+/// validation. Rejects control characters, HTML-special characters, and
+/// overly long strings.
+fn validate_consequence_rules(
+    rules: &[scp_protocol::trust::consequence::ConsequenceRule],
+) -> Result<(), ContextCreationError> {
+    for rule in rules {
+        rule.validate().map_err(|e| {
+            ContextCreationError::CreationFailed(format!("consequence rule validation failed: {e}"))
+        })?;
+    }
+    Ok(())
+}
+
 /// Performs sybil resistance evaluation for a join candidate (#1530).
 ///
 /// Sybil resistance requires external identity signals (trust signals,
@@ -888,6 +904,7 @@ impl ContextManager {
         // Defense-in-depth: verify creator's SDK version satisfies min_protocol_version.
         params.check_version_compatibility(scp_protocol::envelope::SCP_PROTOCOL_VERSION)?;
         validate_governance_model(&params.governance)?;
+        validate_consequence_rules(&params.consequence_rules)?;
         let governance_engine =
             create_governance_engine(&params.governance, &creator_did, self.key_resolver.clone())?;
         let handle = builder_create_context(
