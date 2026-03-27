@@ -24,7 +24,6 @@ use uuid::Uuid;
 #[cfg(feature = "allow_in_memory_custody")]
 use scp_platform::traits::KeyCustody;
 
-use scp_ffi_common::html_escape_event_string;
 use scp_ffi_common::validate::validate_did;
 
 use crate::error::ScpNapiError;
@@ -413,7 +412,6 @@ pub async fn context_create(
         .unwrap_or("single_admin")
         .to_owned();
     let economic_policy = params["economicPolicy"].as_str().map(str::to_owned);
-    let consequence_rules_json = params["consequenceRules"].as_str().map(str::to_owned);
 
     // Extract key custody and signing key from the identity handle (RED-102).
     #[cfg(feature = "allow_in_memory_custody")]
@@ -503,28 +501,6 @@ pub async fn context_create(
         })
         .transpose()?;
 
-    // Deserialize consequence_rules JSON string, if provided (#1531).
-    let core_consequence_rules: Vec<scp_core::trust::ConsequenceRule> = consequence_rules_json
-        .as_deref()
-        .map(|cr_json| {
-            serde_json::from_str(cr_json).map_err(|e| {
-                NapiError::from(ScpNapiError::Validation {
-                    message: format!("invalid consequenceRules JSON: {e}"),
-                    code: "SCP-VALID-7000".to_owned(),
-                })
-            })
-        })
-        .transpose()?
-        .unwrap_or_default();
-    for rule in &core_consequence_rules {
-        rule.validate().map_err(|e| {
-            NapiError::from(ScpNapiError::Validation {
-                message: format!("consequenceRules validation failed: {e}"),
-                code: "SCP-VALID-7000".to_owned(),
-            })
-        })?;
-    }
-
     let context_params = ContextParams {
         mode,
         ceiling: core_ceiling,
@@ -538,7 +514,6 @@ pub async fn context_create(
         max_nesting_depth,
         session_cap,
         economic_policy: core_economic_policy,
-        consequence_rules: core_consequence_rules,
         ..ContextParams::default()
     };
 
@@ -595,11 +570,7 @@ pub async fn context_create(
 /// Rejects with `SCP-CTX-2013` if the context is not in `"active"` state.
 #[napi]
 #[allow(clippy::needless_pass_by_value)] // napi-rs requires owned String
-pub async fn context_join(
-    handle: &NapiContextHandle,
-    identity_did: String,
-    spending_ucan_jwt: Option<String>,
-) -> napi::Result<()> {
+pub async fn context_join(handle: &NapiContextHandle, identity_did: String) -> napi::Result<()> {
     validate_did(&identity_did).map_err(|e| napi::Error::from(ScpNapiError::from(e)))?;
 
     let state_str = handle.current_state_str().map_err(NapiError::from)?;
@@ -630,21 +601,9 @@ pub async fn context_join(
         mls_key_package_bytes: Some(kp_bytes),
     };
 
-    // Parse optional spending UCAN JWT for AND-composition (join cost).
-    let spending_ucan = spending_ucan_jwt
-        .as_deref()
-        .map(scp_core::crypto::ucan::validate::parse_ucan)
-        .transpose()
-        .map_err(|e| {
-            NapiError::from(ScpNapiError::Context {
-                message: format!("invalid spending UCAN: {e}"),
-                code: "SCP-ECON-7061".to_owned(),
-            })
-        })?;
-
     let manager = context_manager()?;
     manager
-        .join_context(core_handle, key_package, spending_ucan.as_ref())
+        .join_context(core_handle, key_package, None)
         .await
         .map_err(|e| NapiError::from(ScpNapiError::from(e)))?;
 
@@ -823,7 +782,7 @@ pub async fn context_send(
     // Parse optional spending UCAN JWT into a UcanToken for AND-composition.
     let spending_ucan = spending_ucan_jwt
         .as_deref()
-        .map(scp_core::crypto::ucan::validate::parse_ucan)
+        .map(scp_protocol::crypto::ucan::validate::parse_ucan)
         .transpose()
         .map_err(|e| {
             NapiError::from(ScpNapiError::Context {
@@ -1191,13 +1150,9 @@ fn format_context_event(event: &scp_core::context::membership::ContextEvent) -> 
             trigger_type,
             action_type,
         } => format!(
-            "consequence_triggered:member={},\
-             rule={rule_index},trigger={},\
-             action={},context={}",
-            html_escape_event_string(member_did.as_ref()),
-            html_escape_event_string(trigger_type),
-            html_escape_event_string(action_type),
-            html_escape_event_string(context_id),
+            "consequence_triggered:member={member_did},\
+             rule={rule_index},trigger={trigger_type},\
+             action={action_type},context={context_id}"
         ),
         ConsequenceEnforced {
             context_id,
@@ -1205,12 +1160,9 @@ fn format_context_event(event: &scp_core::context::membership::ContextEvent) -> 
             action_type,
             success,
         } => format!(
-            "consequence_enforced:member={},\
-             action={},success={success},\
-             context={}",
-            html_escape_event_string(member_did.as_ref()),
-            html_escape_event_string(action_type),
-            html_escape_event_string(context_id),
+            "consequence_enforced:member={member_did},\
+             action={action_type},success={success},\
+             context={context_id}"
         ),
         other => format!("{other:?}"),
     }
@@ -2002,13 +1954,6 @@ pub async fn context_execute_governance_action(
         })
     })?;
 
-    validate_governance_action_strings(&action).map_err(|e| {
-        NapiError::from(ScpNapiError::Validation {
-            message: format!("{e}"),
-            code: "SCP-CTX-2040".to_owned(),
-        })
-    })?;
-
     let action_name = action.variant_name();
 
     // Generate a random proposal ID (32 bytes).
@@ -2171,13 +2116,6 @@ pub async fn context_governance_propose(
         })
     })?;
 
-    validate_governance_action_strings(&action).map_err(|e| {
-        NapiError::from(ScpNapiError::Validation {
-            message: format!("{e}"),
-            code: "SCP-CTX-2040".to_owned(),
-        })
-    })?;
-
     let action_name = action.variant_name();
 
     #[cfg(feature = "allow_in_memory_custody")]
@@ -2230,13 +2168,6 @@ pub async fn context_governance_propose(
 
     #[allow(unreachable_code)]
     Ok(String::new())
-}
-
-/// Validates all user-controlled string fields on a governance action.
-fn validate_governance_action_strings(
-    action: &GovernanceAction,
-) -> Result<(), scp_ffi_common::validate::ValidationError> {
-    scp_ffi_common::validate::validate_governance_action_strings(action)
 }
 
 /// Casts an approval vote on a pending governance proposal.
