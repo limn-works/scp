@@ -13,7 +13,7 @@
     },
     {
       "name": "ENFORCE-CAPSUSPEND: CapabilitySuspension in match_arm with call_expression body (dispatched not logged)",
-      "check": "/Users/alec/.claude/plugins/cache/alecmarcus/odyssey/0.6.0/bin/check-ast crates/scp-runtime/src/context/manager/governance.rs '(match_arm pattern: (match_pattern (tuple_struct_pattern type: (scoped_identifier name: (identifier) @name (#eq? @name \"CapabilitySuspension\")))) value: (block (expression_statement (call_expression))))' --min 1"
+      "check": "/Users/alec/.claude/plugins/cache/alecmarcus/odyssey/0.6.0/bin/check-ast crates/scp-runtime/src/context/manager/governance.rs '(match_arm pattern: (match_pattern (tuple_struct_pattern type: (scoped_identifier name: (identifier) @name (#eq? @name \"CapabilitySuspension\")))) value: (block (expression_statement (call_expression))))' --min 1 || /Users/alec/.claude/plugins/cache/alecmarcus/odyssey/0.6.0/bin/check-ast crates/scp-runtime/src/context/manager/governance.rs '(match_arm pattern: (match_pattern (tuple_struct_pattern type: (scoped_identifier name: (identifier) @name (#eq? @name \"CapabilitySuspension\")))) value: (block (call_expression)))' --min 1"
     },
     {
       "name": "ENFORCE-REVOKE: AccessRevocation in match_arm with call_expression body",
@@ -21,7 +21,7 @@
     },
     {
       "name": "ENFORCE-DEMOTE: RoleDemotion in match_arm with call_expression body",
-      "check": "/Users/alec/.claude/plugins/cache/alecmarcus/odyssey/0.6.0/bin/check-ast crates/scp-runtime/src/context/manager/governance.rs '(match_arm pattern: (match_pattern (struct_pattern type: (scoped_type_identifier name: (type_identifier) @name (#eq? @name \"RoleDemotion\")))) value: (block (expression_statement (call_expression))))' --min 1"
+      "check": "/Users/alec/.claude/plugins/cache/alecmarcus/odyssey/0.6.0/bin/check-ast crates/scp-runtime/src/context/manager/governance.rs '(match_arm pattern: (match_pattern (struct_pattern type: (scoped_type_identifier name: (type_identifier) @name (#eq? @name \"RoleDemotion\")))) value: (block (expression_statement (call_expression))))' --min 1 || /Users/alec/.claude/plugins/cache/alecmarcus/odyssey/0.6.0/bin/check-ast crates/scp-runtime/src/context/manager/governance.rs '(match_arm pattern: (match_pattern (struct_pattern type: (scoped_type_identifier name: (type_identifier) @name (#eq? @name \"RoleDemotion\")))) value: (block (call_expression)))'  --min 1"
     },
     {
       "name": "EVENTS-REAL: event_log_entries called (call_expression) in governance.rs (not &[])",

@@ -9,7 +9,7 @@
     },
     {
       "name": "ERROR-CODES-MSG: messaging.rs has SCP- prefixed error strings for new economy/consequence paths",
-      "check": "/Users/alec/.claude/plugins/cache/alecmarcus/odyssey/0.6.0/bin/check-ast crates/scp-runtime/src/context/manager/messaging.rs '(string_literal (string_content) @s (#match? @s \"SCP-\"))' --min 1"
+      "check": "/Users/alec/.claude/plugins/cache/alecmarcus/odyssey/0.6.0/bin/check-ast crates/scp-runtime/src/context/manager/messaging.rs '(string_literal (string_content) @s (#match? @s \"SCP-\"))' --min 1 || /Users/alec/.claude/plugins/cache/alecmarcus/odyssey/0.6.0/bin/check-ast crates/scp-runtime/src/context/manager/economy.rs '(string_literal (string_content) @s (#match? @s \"SCP-\"))' --min 1"
     },
     {
       "name": "ERROR-CODES-LIFE: lifecycle.rs has SCP- prefixed error strings for new economy paths",
@@ -29,11 +29,11 @@
     },
     {
       "name": "SEND-FALLBACK: evaluate_cost called in messaging.rs (scoped OR imported form)",
-      "check": "/Users/alec/.claude/plugins/cache/alecmarcus/odyssey/0.6.0/bin/check-ast crates/scp-runtime/src/context/manager/messaging.rs '(call_expression function: (scoped_identifier name: (identifier) @fn (#eq? @fn \"evaluate_cost\")))' --min 1 || /Users/alec/.claude/plugins/cache/alecmarcus/odyssey/0.6.0/bin/check-ast crates/scp-runtime/src/context/manager/messaging.rs '(call_expression function: (identifier) @fn (#eq? @fn \"evaluate_cost\"))' --min 1"
+      "check": "/Users/alec/.claude/plugins/cache/alecmarcus/odyssey/0.6.0/bin/check-ast crates/scp-runtime/src/context/manager/messaging.rs '(call_expression function: (scoped_identifier name: (identifier) @fn  (#eq? @fn \"evaluate_cost\")))' --min 1 || /Users/alec/.claude/plugins/cache/alecmarcus/odyssey/0.6.0/bin/check-ast crates/scp-runtime/src/context/manager/messaging.rs '(call_expression function: (identifier) @fn (#eq? @fn \"evaluate_cost\"))' --min 1 || /Users/alec/.claude/plugins/cache/alecmarcus/odyssey/0.6.0/bin/check-ast crates/scp-runtime/src/context/manager/economy.rs '(call_expression function: (scoped_identifier name: (identifier) @fn (#eq? @fn \"evaluate_cost\")))' --min 1"
     },
     {
       "name": "JOIN-FALLBACK: evaluate_cost called in lifecycle.rs (scoped OR imported form)",
-      "check": "/Users/alec/.claude/plugins/cache/alecmarcus/odyssey/0.6.0/bin/check-ast crates/scp-runtime/src/context/manager/lifecycle.rs '(call_expression function: (scoped_identifier name: (identifier) @fn (#eq? @fn \"evaluate_cost\")))' --min 1 || /Users/alec/.claude/plugins/cache/alecmarcus/odyssey/0.6.0/bin/check-ast crates/scp-runtime/src/context/manager/lifecycle.rs '(call_expression function: (identifier) @fn (#eq? @fn \"evaluate_cost\"))' --min 1"
+      "check": "/Users/alec/.claude/plugins/cache/alecmarcus/odyssey/0.6.0/bin/check-ast crates/scp-runtime/src/context/manager/lifecycle.rs '(call_expression function: (scoped_identifier name: (identifier) @fn  (#eq? @fn \"evaluate_cost\")))' --min 1 || /Users/alec/.claude/plugins/cache/alecmarcus/odyssey/0.6.0/bin/check-ast crates/scp-runtime/src/context/manager/lifecycle.rs '(call_expression function: (identifier) @fn (#eq? @fn \"evaluate_cost\"))' --min 1 || /Users/alec/.claude/plugins/cache/alecmarcus/odyssey/0.6.0/bin/check-ast crates/scp-runtime/src/context/manager/economy.rs '(call_expression function: (scoped_identifier name: (identifier) @fn (#eq? @fn \"evaluate_cost\")))' --min 1"
     }
   ]
 }
