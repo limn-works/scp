@@ -188,8 +188,21 @@ pub(super) fn enforce_triggered_consequences(
                 context_id,
                 member = %member_did,
                 action_type,
-                "consequence enforcement failed"
+                "consequence enforcement failed — escalating to AccessRevocation"
             );
+
+            // H10: escalate to AccessRevocation when enforcement fails.
+            // Skip cooldown on failure so the escalation fires immediately.
+            ctx.access.write_revoked_members.insert(member_did.clone());
+            ctx.access.read_revoked_members.insert(member_did.clone());
+
+            ctx.receive_buffer.push(ContextEvent::ConsequenceEnforced {
+                context_id: context_id.to_owned(),
+                member_did: member_did.clone(),
+                action_type: "AccessRevocation(escalated)".to_owned(),
+                success: true,
+            });
+            continue; // skip cooldown recording — failed action doesn't count
         }
 
         // Record cooldown: prevent re-firing within the rule's window.
@@ -2006,20 +2019,31 @@ impl ContextManager {
                 return Err(ContextError::MemberNotFound(did.to_string()));
             }
 
-            // Remove sender key BEFORE MLS group removal so the removed
-            // member cannot decrypt messages encrypted after this point.
-            // MLS provides forward secrecy via epoch advancement, but the
-            // sender key layer is an independent confidentiality mechanism
-            // that must also rotate on member removal (§9.16).
-            self.crypto
-                .remove_member_sender_key(&context_id_bytes, did.as_ref())?;
-
-            // Crypto: remove from MLS group under lock to prevent TOCTOU
-            // race (concurrent remove of same DID).
+            // H9: MLS group removal FIRST (hard security boundary). If this
+            // fails, we abort without touching sender keys. MLS removal is
+            // the cryptographic enforcement that prevents the removed member
+            // from decrypting future group messages.
             let remove_output = self
                 .crypto
                 .remove_member(&context_id_bytes, did)
                 .map_err(|e| ContextError::MembershipFailed(e.to_string()))?;
+
+            // Sender key cleanup is best-effort: log failures but do not
+            // propagate. The MLS removal above is the hard boundary; sender
+            // key removal is defense-in-depth for the independent sender key
+            // confidentiality layer (§9.16).
+            if let Err(e) = self
+                .crypto
+                .remove_member_sender_key(&context_id_bytes, did.as_ref())
+            {
+                tracing::warn!(
+                    context_id,
+                    member = %did,
+                    error = %e,
+                    "remove_member_sender_key failed after MLS removal — \
+                     sender key layer may retain stale key"
+                );
+            }
 
             // Rotate the local sender key so the removed member cannot
             // decrypt future messages (§9.16.4). Generates a fresh key,

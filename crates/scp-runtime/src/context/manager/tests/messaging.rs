@@ -1567,7 +1567,7 @@ async fn velocity_consequence_trigger_on_send() {
     };
     params.consequence_rules = vec![ConsequenceRule {
         trigger: ConsequenceTrigger::MessageVelocity,
-        threshold: 0,
+        threshold: 1,
         action: ConsequenceAction::CapabilitySuspension(vec!["write".to_owned()]),
         window: Duration::from_secs(3600),
     }];

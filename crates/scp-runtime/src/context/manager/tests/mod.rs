@@ -108,15 +108,27 @@ pub(super) fn dummy_spending_ucan_with_cap(max_per_action: u64, max_total: u64) 
         "spending_capability".to_owned(),
         cap.to_fact_value().unwrap_or(serde_json::Value::Null),
     );
+    // C1: include a spending attestation in `att` so `validate_spending_ucan`
+    // can find the `scp:spending:*` entry (global scope, covers any context).
+    let spending_att = scp_protocol::crypto::ucan::Attenuation {
+        with: "scp:spending:*".to_owned(),
+        can: "spend".to_owned(),
+    };
+    // Use a near-future expiry so the 24-hour max lifetime check passes.
+    // `validate_spending_ucan` checks `exp - now <= 86400`.
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
     UcanToken {
         header: scp_protocol::crypto::ucan::UcanHeader::new(),
         payload: scp_protocol::crypto::ucan::UcanPayload {
             iss: "did:key:test-spender".to_owned(),
             aud: "did:key:test-context".to_owned(),
-            exp: u64::MAX,
-            nbf: None,
+            exp: now + 3600, // 1 hour from now (within 24-hour limit)
+            nbf: Some(now),
             nnc: "test-nonce".to_owned(),
-            att: vec![],
+            att: vec![spending_att],
             prf: vec![],
             fct: Some(serde_json::Value::Object(fct)),
         },
