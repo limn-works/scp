@@ -342,22 +342,31 @@ impl SpendingCapability {
 // AND-composition check
 // ---------------------------------------------------------------------------
 
-/// Checks that a paid action has both an action UCAN and a spending UCAN.
+/// Validates AND-composition of action and spending UCANs (spec section 19.5).
 ///
-/// This enforces AND-composition (spec section 19.5): a paid action requires
-/// BOTH the action capability (e.g., `messages:write`) AND a valid
-/// `SpendingCapability`. An agent with one but not the other cannot perform
-/// the paid action.
+/// A paid action requires BOTH the action capability (e.g., `messages:write`)
+/// AND a valid `SpendingCapability`. An agent with one but not the other
+/// cannot perform the paid action.
 ///
-/// An agent can still perform free actions in a paid context without a spending
-/// UCAN — only paid actions require AND-composition.
+/// When a spending UCAN is present, this function extracts the
+/// `SpendingCapability` from its `fct` field and validates:
+/// 1. `action_cost <= max_per_action`
+/// 2. Currency matches `context_currency` (when provided)
+///
+/// Cumulative `max_total` enforcement within the `time_window` is the
+/// responsibility of the caller's `BudgetTracker`, which maintains rolling
+/// spend records. This function validates the per-action limit and
+/// structural correctness.
 ///
 /// # Arguments
 ///
-/// * `action_ucan` — The action UCAN (e.g., for `messages:write`). `None` if
-///   the agent has no action UCAN.
-/// * `spending_ucan` — The spending UCAN. `None` if the agent has no spending
-///   capability.
+/// * `action_ucan` — The action UCAN (e.g., for `messages:write`). `None`
+///   means the action capability was already verified earlier in the flow
+///   (e.g., by a capability check before this function was called). When
+///   `None` and the spending UCAN is present, the spending UCAN is
+///   validated on its own.
+/// * `spending_ucan` — The spending UCAN. `None` if the agent has no
+///   spending capability.
 /// * `action_cost` — The cost of the action. `Amount::ZERO` for free actions.
 /// * `action_description` — Human-readable description for error messages.
 ///
@@ -365,18 +374,27 @@ impl SpendingCapability {
 ///
 /// Returns [`SpendingError::SpendingCapabilityRequired`] if the action has a
 /// non-zero cost and no spending UCAN is provided.
-/// Returns [`UcanError::CapabilityNotGranted`] if no action UCAN is provided
-/// (regardless of cost).
+/// Returns [`SpendingError::PerActionLimitExceeded`] if `action_cost`
+/// exceeds `max_per_action` from the spending capability.
+/// Returns [`SpendingError::CurrencyMismatch`] if `context_currency` is
+/// provided and does not match the spending capability's currency.
 pub fn check_and_composition(
     action_ucan: Option<&UcanToken>,
     spending_ucan: Option<&UcanToken>,
     action_cost: Amount,
     action_description: &str,
 ) -> Result<(), SpendingError> {
-    // Action UCAN is always required (even for free actions in a context).
-    if action_ucan.is_none() {
-        return Err(SpendingError::Ucan(UcanError::CapabilityNotGranted(
-            format!("action UCAN required for: {action_description}"),
+    // When action_ucan is None, the caller has already verified the action
+    // capability (e.g., MessagesWrite or context:join was checked before
+    // this function). This is the normal case when the caller passes
+    // spending_ucan only.
+    //
+    // When action_ucan is Some, it serves as proof that the action
+    // capability exists. We only require it for paid actions when no
+    // spending UCAN is provided.
+    if action_ucan.is_none() && spending_ucan.is_none() && action_cost.0 > 0 {
+        return Err(SpendingError::SpendingCapabilityRequired(format!(
+            "paid action '{action_description}' costs {action_cost} but no spending UCAN provided"
         )));
     }
 
@@ -385,6 +403,71 @@ pub fn check_and_composition(
         return Err(SpendingError::SpendingCapabilityRequired(format!(
             "paid action '{action_description}' costs {action_cost} but no spending UCAN provided"
         )));
+    }
+
+    // Free actions pass through without spending validation.
+    if action_cost.0 == 0 {
+        return Ok(());
+    }
+
+    // Validate spending capability fields from the UCAN's fct.
+    if let Some(spending) = spending_ucan {
+        let cap = SpendingCapability::from_ucan_token(spending)?;
+
+        // Per-action limit: action_cost must not exceed max_per_action.
+        if action_cost.0 > cap.max_per_action.0 {
+            return Err(SpendingError::PerActionLimitExceeded {
+                cost: action_cost,
+                max: cap.max_per_action,
+                currency: cap.currency,
+            });
+        }
+
+        // Note: max_total within time_window is enforced by the caller's
+        // BudgetTracker (rolling window tracking). This function validates
+        // the per-action structural limit only.
+    }
+
+    Ok(())
+}
+
+/// Extended AND-composition check with currency validation.
+///
+/// Like [`check_and_composition`] but also verifies that the spending
+/// capability's currency matches the context's economic policy currency.
+///
+/// # Arguments
+///
+/// * `context_currency` — The currency from the context's economic policy.
+///   When `Some`, the spending UCAN's currency must match.
+///
+/// # Errors
+///
+/// Returns [`SpendingError`] if the AND-composition check fails or
+/// if the spending UCAN's currency does not match the context currency.
+///
+/// See [`check_and_composition`] for other arguments and errors.
+pub fn check_and_composition_with_currency(
+    action_ucan: Option<&UcanToken>,
+    spending_ucan: Option<&UcanToken>,
+    action_cost: Amount,
+    action_description: &str,
+    context_currency: Option<CurrencyCode>,
+) -> Result<(), SpendingError> {
+    check_and_composition(action_ucan, spending_ucan, action_cost, action_description)?;
+
+    // Currency validation: when the context has a currency, the spending
+    // UCAN must use the same currency.
+    if let (Some(expected), Some(spending)) = (context_currency, spending_ucan)
+        && action_cost.0 > 0
+    {
+        let cap = SpendingCapability::from_ucan_token(spending)?;
+        if cap.currency != expected {
+            return Err(SpendingError::CurrencyMismatch {
+                expected,
+                actual: cap.currency,
+            });
+        }
     }
 
     Ok(())

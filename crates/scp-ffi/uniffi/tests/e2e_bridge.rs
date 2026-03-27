@@ -360,7 +360,7 @@ async fn context_send_message() {
         .unwrap();
 
     // Send a message (no real recipient, just validates the API path)
-    let result = context_send(handle, alice, b"Hello, world!".to_vec()).await;
+    let result = context_send(handle, alice, b"Hello, world!".to_vec(), None).await;
     // Send may succeed or fail depending on crypto provider wiring.
     // The important thing is it doesn't panic.
     let _ = result;

@@ -1223,11 +1223,12 @@ fn py_context_close(handle: &PyContextHandle, identity_did: &str) -> PyResult<()
 /// Returns `RuntimeError` if the context is not in "active" state, or
 /// `TypeError` if the payload is not bytes or str.
 #[pyfunction]
-#[pyo3(signature = (handle, identity_did, payload))]
+#[pyo3(signature = (handle, identity_did, payload, spending_ucan_jwt=None))]
 fn py_context_send(
     handle: &PyContextHandle,
     identity_did: &str,
     payload: &Bound<'_, PyAny>,
+    spending_ucan_jwt: Option<&str>,
 ) -> PyResult<()> {
     validate::validate_did(identity_did)?;
     let state = handle
@@ -1251,6 +1252,14 @@ fn py_context_send(
     } else {
         return Err(PyTypeError::new_err("payload must be bytes or str"));
     };
+
+    // Parse optional spending UCAN JWT into a UcanToken for AND-composition.
+    let spending_ucan = spending_ucan_jwt
+        .map(|jwt| {
+            scp_core::crypto::ucan::validate::parse_ucan(jwt)
+                .map_err(|e| PyRuntimeError::new_err(format!("invalid spending UCAN: {e}")))
+        })
+        .transpose()?;
 
     // Delegate message sending to the shared ContextManager. The ContextManager
     // validates Active state, checks write capabilities, assigns sequence numbers,
@@ -1284,7 +1293,7 @@ fn py_context_send(
                 &payload_bytes,
                 Some(&signing_key),
                 None,
-                None,
+                spending_ucan.as_ref(),
             )
             .await
         })
@@ -4838,6 +4847,53 @@ mod tests {
         );
     }
 
+    // -------------------------------------------------------------------
+    // Consequence event conversion tests (#1531, #1593, #1594)
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn convert_consequence_triggered_event_format() {
+        use scp_core::context::membership::ContextEvent;
+
+        let event = ContextEvent::ConsequenceTriggered {
+            context_id: "ctx-test-123".to_owned(),
+            member_did: scp_identity::DID("did:dht:z6MkBob".to_owned()),
+            rule_index: 2,
+            trigger_type: "velocity".to_owned(),
+            action_type: "mute".to_owned(),
+        };
+
+        let (sender, payload, ts) = super::convert_context_event(event);
+        assert_eq!(sender, "scp:system");
+        assert!(ts > 0.0, "timestamp must be positive");
+
+        let payload_str = String::from_utf8(payload).unwrap();
+        assert!(
+            payload_str.contains("consequence_triggered:"),
+            "payload must contain consequence_triggered prefix"
+        );
+        assert!(
+            payload_str.contains("member=did:dht:z6MkBob"),
+            "payload must contain member DID"
+        );
+        assert!(
+            payload_str.contains("rule=2"),
+            "payload must contain rule index"
+        );
+        assert!(
+            payload_str.contains("trigger=velocity"),
+            "payload must contain trigger type"
+        );
+        assert!(
+            payload_str.contains("action=mute"),
+            "payload must contain action type"
+        );
+        assert!(
+            payload_str.contains("context=ctx-test-123"),
+            "payload must contain context ID"
+        );
+    }
+
     #[test]
     fn governance_action_control_chars_in_reason_rejected() {
         let action = scp_core::context::governance::GovernanceAction::RemoveMember {
@@ -4848,6 +4904,63 @@ mod tests {
         assert!(
             err.to_string().contains("control character"),
             "expected control char rejection, got: {err}"
+        );
+    }
+
+    fn convert_consequence_enforced_event_format() {
+        use scp_core::context::membership::ContextEvent;
+
+        let event = ContextEvent::ConsequenceEnforced {
+            context_id: "ctx-test-456".to_owned(),
+            member_did: scp_identity::DID("did:dht:z6MkAlice".to_owned()),
+            action_type: "restrict_write".to_owned(),
+            success: true,
+        };
+
+        let (sender, payload, _ts) = super::convert_context_event(event);
+        assert_eq!(sender, "scp:system");
+
+        let payload_str = String::from_utf8(payload).unwrap();
+        assert!(
+            payload_str.contains("consequence_enforced:"),
+            "payload must contain consequence_enforced prefix"
+        );
+        assert!(
+            payload_str.contains("member=did:dht:z6MkAlice"),
+            "payload must contain member DID"
+        );
+        assert!(
+            payload_str.contains("action=restrict_write"),
+            "payload must contain action type"
+        );
+        assert!(
+            payload_str.contains("success=true"),
+            "payload must contain success flag"
+        );
+    }
+
+    // -------------------------------------------------------------------
+    // Consequence rules in context params tests (#1531, #1593)
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn consequence_rules_in_context_params_accepted() {
+        let consequence_json = r#"[{"trigger":"MessageVelocity","action":"AccessRevocation","threshold":5,"window":{"secs":3600,"nanos":0}}]"#;
+        let p = PyContextParams {
+            consequence_rules: Some(consequence_json.to_owned()),
+            ..default_params()
+        };
+        assert_eq!(
+            p.consequence_rules.as_deref(),
+            Some(consequence_json),
+            "consequence_rules should be stored in params"
+        );
+
+        // Verify it flows through to core context params.
+        let core_params = super::build_core_context_params(&p).unwrap();
+        assert!(
+            !core_params.consequence_rules.is_empty(),
+            "consequence_rules should parse into non-empty vec"
         );
     }
 
@@ -4870,6 +4983,17 @@ mod tests {
         assert!(
             err.to_string().contains("HTML-special character"),
             "expected HTML-special rejection, got: {err}"
+        );
+    }
+
+    fn consequence_rules_none_defaults_to_empty() {
+        let p = default_params();
+        assert!(p.consequence_rules.is_none());
+
+        let core_params = super::build_core_context_params(&p).unwrap();
+        assert!(
+            core_params.consequence_rules.is_empty(),
+            "None consequence_rules should default to empty vec"
         );
     }
 
@@ -4901,5 +5025,92 @@ mod tests {
             err.to_string().contains("HTML-special character"),
             "expected HTML-special rejection, got: {err}"
         );
+    }
+
+    #[test]
+    fn consequence_rules_invalid_json_rejected() {
+        let p = PyContextParams {
+            consequence_rules: Some("not valid json".to_owned()),
+            ..default_params()
+        };
+
+        let result = super::build_core_context_params(&p);
+        assert!(
+            result.is_err(),
+            "invalid consequence_rules JSON should be rejected"
+        );
+    }
+
+    // -------------------------------------------------------------------
+    // Spending UCAN parameter acceptance tests (#1537, #1593)
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn evaluate_invitation_accepts_spending_json() {
+        pyo3::prepare_freethreaded_python();
+        Python::with_gil(|_py| {
+            let params = scp_core::context::ContextParams::default();
+            let params_json = serde_json::to_string(&params).unwrap();
+            let spending_json = r#"{"has_spending_ucan":true,"configured_adapters":["x402"],"available_balance":10000}"#;
+
+            let result = py_evaluate_invitation(
+                &params_json,
+                "did:dht:z6MkBob",
+                "did:dht:z6MkLocal",
+                None,
+                Some(spending_json),
+                None,
+            );
+
+            // Free contexts do not require spending, so the pipeline should
+            // still reach prompt_agent regardless of spending context.
+            match &result {
+                Ok(v) => assert_eq!(v, "prompt_agent"),
+                Err(e) => panic!("expected Ok, got Err: {e}"),
+            }
+        });
+    }
+
+    #[test]
+    fn evaluate_invitation_rejects_invalid_spending_json() {
+        pyo3::prepare_freethreaded_python();
+        Python::with_gil(|_py| {
+            let params = scp_core::context::ContextParams::default();
+            let params_json = serde_json::to_string(&params).unwrap();
+
+            let result = py_evaluate_invitation(
+                &params_json,
+                "did:dht:z6MkBob",
+                "did:dht:z6MkLocal",
+                None,
+                Some("not valid json"),
+                None,
+            );
+
+            assert!(result.is_err(), "invalid spending JSON should be rejected");
+        });
+    }
+
+    #[test]
+    fn evaluate_invitation_none_spending_accepted() {
+        pyo3::prepare_freethreaded_python();
+        Python::with_gil(|_py| {
+            let params = scp_core::context::ContextParams::default();
+            let params_json = serde_json::to_string(&params).unwrap();
+
+            let result = py_evaluate_invitation(
+                &params_json,
+                "did:dht:z6MkBob",
+                "did:dht:z6MkLocal",
+                None,
+                None, // No spending context
+                None,
+            );
+
+            match &result {
+                Ok(v) => assert_eq!(v, "prompt_agent"),
+                Err(e) => panic!("expected Ok, got Err: {e}"),
+            }
+        });
     }
 }

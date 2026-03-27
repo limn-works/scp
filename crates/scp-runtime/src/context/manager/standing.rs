@@ -45,7 +45,10 @@ pub fn generate_standing_context_id(local_did: &DID, peer_did: &DID) -> String {
     hasher.update(b":");
     hasher.update(b.as_bytes());
     let hash = hasher.finalize();
-    format!("standing-{}", hex::encode(&hash[..8]))
+    // Use the full 32-byte hash to avoid birthday-bound collisions.
+    // Truncating to 8 bytes (64 bits) has a ~50% collision probability
+    // at ~5 billion standing contexts (birthday paradox).
+    format!("standing-{}", hex::encode(hash))
 }
 
 // ---------------------------------------------------------------------------
@@ -116,9 +119,30 @@ impl ContextManager {
         // Step 3/4: Create a new bilateral-persistent context via the full
         // ContextManager::create_context flow (membership, roles, governance).
         let params = template_params(&TemplateId::BilateralPersistent);
-        self.create_context(context_id.clone(), params, local_did.clone())
+        match self
+            .create_context(context_id.clone(), params, local_did.clone())
             .await
-            .map_err(|e| ContextError::TransportFailed(e.to_string()))?;
+        {
+            Ok(_) => {}
+            Err(e) => {
+                // TOCTOU: a concurrent call may have created the context
+                // between our check and this create attempt. If the context
+                // now exists and is Active/Creating, use it idempotently.
+                // Otherwise propagate the original error.
+                let contexts = self.contexts.lock().await;
+                if let Some(ctx) = contexts.get(&context_id) {
+                    let state = ctx.handle.state().await;
+                    if matches!(state, ContextState::Active | ContextState::Creating) {
+                        drop(contexts);
+                        // Concurrent creation succeeded — fall through.
+                    } else {
+                        return Err(ContextError::TransportFailed(e.to_string()));
+                    }
+                } else {
+                    return Err(ContextError::TransportFailed(e.to_string()));
+                }
+            }
+        }
 
         // Re-acquire lock to track the standing context.
         let mut standing = self.standing_contexts.lock().await;
@@ -192,19 +216,51 @@ impl ContextManager {
         };
 
         // Phase 2: Iterate collected handles without any locks held.
+        // Track terminal context IDs for eviction in Phase 3.
         let mut reconnected = 0;
+        let mut terminal_context_ids = Vec::new();
         for (context_id, handle) in &handles {
             let state = handle.state().await;
-            if state == ContextState::Active {
-                let context_id_bytes = scp_protocol::context::context_id_bytes(context_id);
-                self.transport
-                    .publish_context(&context_id_bytes, handle.params())
-                    .map_err(|e| {
-                        ContextError::TransportFailed(format!(
-                            "reconnection failed for context {context_id}: {e}"
-                        ))
-                    })?;
-                reconnected += 1;
+            match state {
+                ContextState::Active => {
+                    let context_id_bytes =
+                        scp_protocol::context::context_id_bytes(context_id);
+                    self.transport
+                        .publish_context(&context_id_bytes, handle.params())
+                        .map_err(|e| {
+                            ContextError::TransportFailed(format!(
+                                "reconnection failed for context {context_id}: {e}"
+                            ))
+                        })?;
+                    reconnected += 1;
+                }
+                // Standing contexts in terminal states are candidates for
+                // eviction to prevent unbounded map growth.
+                ContextState::Closed | ContextState::Expired | ContextState::Tombstoned => {
+                    terminal_context_ids.push(context_id.clone());
+                }
+                _ => {} // Creating, Closing, MigratingOut -- transient, keep
+            }
+        }
+
+        // Phase 3: Evict standing contexts in terminal states.
+        // Since generate_standing_context_id hashes the DIDs, we check each
+        // standing entry by regenerating its context ID and comparing.
+        if !terminal_context_ids.is_empty() {
+            let mut standing = self.standing_contexts.lock().await;
+            let local_dids = self.local_dids.read().await;
+            let to_remove: Vec<String> = standing
+                .iter()
+                .filter(|(_key, peer_did)| {
+                    local_dids.iter().any(|local_did| {
+                        let cid = generate_standing_context_id(local_did, peer_did);
+                        terminal_context_ids.contains(&cid)
+                    })
+                })
+                .map(|(key, _)| key.clone())
+                .collect();
+            for key in &to_remove {
+                standing.remove(key);
             }
         }
 
