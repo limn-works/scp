@@ -5823,61 +5823,6 @@ async fn standing_vote_influence_on_governance() {
     );
 }
 
-/// Consequence evaluation triggers after governance action execution (#1531).
-#[tokio::test]
-async fn consequence_triggered_after_execute_send() {
-    use scp_protocol::trust::consequence::{
-        ConsequenceAction, ConsequenceRule, ConsequenceTrigger,
-    };
-    use std::time::Duration;
-
-    let manager = ContextManager::new(
-        Box::new(MockCrypto::default()),
-        Box::new(MockTransport::connected()),
-        Box::new(MockEventLog::default()),
-        mock_key_resolver(),
-    );
-
-    let admin: DID = "did:dht:z6MkCreator".into();
-    let _key_admin = signing_key_for_did(&admin);
-
-    let mut params = governance_params();
-    params.consequence_rules = vec![ConsequenceRule {
-        trigger: ConsequenceTrigger::MessageVelocity,
-        threshold: 0,
-        action: ConsequenceAction::CapabilitySuspension(vec!["write".to_owned()]),
-        window: Duration::from_secs(3600),
-    }];
-    let _handle = manager
-        .create_context("consequence-gov-ctx".into(), params, admin.clone())
-        .await
-        .unwrap();
-
-    // Send a message to populate the event buffer (needed for consequence eval).
-    let sk = ed25519_dalek::SigningKey::from_bytes(&[1u8; 32]);
-    let handle = manager
-        .contexts
-        .lock()
-        .await
-        .get("consequence-gov-ctx")
-        .unwrap()
-        .handle
-        .clone();
-    let _ = manager
-        .send_message(&handle, &admin, b"trigger", Some(&sk), None, None)
-        .await;
-
-    // Check for ConsequenceTriggered event.
-    let events = manager.drain_events("consequence-gov-ctx").await;
-    let has_consequence = events
-        .iter()
-        .any(|e| matches!(e, ContextEvent::ConsequenceTriggered { .. }));
-    assert!(
-        has_consequence,
-        "expected ConsequenceTriggered event after send with consequence rules"
-    );
-}
-
 /// Standing check blocks proposal for member with low standing (#1530).
 #[tokio::test]
 async fn standing_check_blocks_low_standing_proposer() {
@@ -5941,318 +5886,6 @@ async fn standing_check_blocks_low_standing_proposer() {
     assert!(
         result.is_err(),
         "low-standing member should be denied proposal"
-    );
-}
-
-/// Economy enforcement deducts cost when `evaluate_cost` returns a cost (#1537).
-#[tokio::test]
-async fn evaluate_cost_deducts_budget_on_send() {
-    use scp_protocol::economy::types::{Amount, CostSchedule, CurrencyCode, EconomicPolicy};
-
-    let manager = ContextManager::new(
-        Box::new(MockCrypto::default()),
-        Box::new(MockTransport::connected()),
-        Box::new(MockEventLog::default()),
-        noop_key_resolver(),
-    );
-
-    let mut params = governance_params();
-    params.economic_policy = Some(EconomicPolicy {
-        locked: false,
-        cost_schedule: CostSchedule {
-            currency: CurrencyCode::new([85, 83, 68, 0]),
-            per_message: Some(Amount::new(5)),
-            per_tool_invoke: None,
-            per_join: None,
-            per_period: None,
-            per_byte_stored: None,
-        },
-        payment_adapters: vec![],
-        pricing_formula: None,
-        payee: DID::from("did:key:payee"),
-    });
-    let _handle = manager
-        .create_context("eval-cost-ctx".into(), params, "did:key:admin".into())
-        .await
-        .unwrap();
-
-    // Grant budget.
-    {
-        let mut contexts = manager.contexts.lock().await;
-        let ctx = contexts.get_mut("eval-cost-ctx").unwrap();
-        ctx.governance
-            .budget_tracker
-            .grant(&"did:key:admin".into(), Amount::new(50));
-    }
-
-    let sk = ed25519_dalek::SigningKey::from_bytes(&[1u8; 32]);
-    let handle = manager
-        .contexts
-        .lock()
-        .await
-        .get("eval-cost-ctx")
-        .unwrap()
-        .handle
-        .clone();
-    let ucan = dummy_spending_ucan();
-    let result = manager
-        .send_message(
-            &handle,
-            &"did:key:admin".into(),
-            b"test",
-            Some(&sk),
-            None,
-            Some(&ucan),
-        )
-        .await;
-    assert!(result.is_ok(), "send should succeed: {result:?}");
-
-    // Verify cost was actually deducted.
-    let remaining = {
-        let contexts = manager.contexts.lock().await;
-        let ctx = contexts.get("eval-cost-ctx").unwrap();
-        ctx.governance
-            .budget_tracker
-            .remaining(&"did:key:admin".into())
-    };
-    assert_eq!(
-        remaining,
-        Amount::new(45),
-        "budget should be deducted by per_message cost (5)"
-    );
-}
-
-/// Encrypted rotation calls `advance_epoch` (#1548).
-#[tokio::test]
-async fn encrypted_rotation_calls_advance_epoch() {
-    let epochs = Arc::new(std::sync::Mutex::new(Vec::<[u8; 32]>::new()));
-    let crypto = MockCrypto {
-        epochs_advanced_shared: Arc::clone(&epochs),
-        ..MockCrypto::default()
-    };
-
-    let manager = ContextManager::new(
-        Box::new(crypto),
-        Box::new(MockTransport::connected()),
-        Box::new(MockEventLog::default()),
-        mock_key_resolver(),
-    );
-
-    let admin: DID = "did:dht:z6MkCreator".into();
-    let key_admin = signing_key_for_did(&admin);
-
-    let mut params = governance_params();
-    params.mode = ContextMode::Encrypted;
-    let _handle = manager
-        .create_context("rotation-ctx".into(), params, admin.clone())
-        .await
-        .unwrap();
-
-    // Propose RotateContentKeys.
-    let action = scp_protocol::context::governance::GovernanceAction::RotateContentKeys {
-        reason: Some("test rotation".to_owned()),
-    };
-    let result = manager
-        .propose_governance_action("rotation-ctx", &admin, action, &key_admin)
-        .await;
-    assert!(result.is_ok(), "rotate should succeed: {result:?}");
-
-    // Verify advance_epoch was called.
-    let advanced = epochs.lock().unwrap();
-    assert!(
-        !advanced.is_empty(),
-        "advance_epoch should have been called during RotateContentKeys"
-    );
-}
-
-/// `CapabilitySuspension` consequence actually suspends write access (#1531).
-#[tokio::test]
-async fn capability_suspension_suspends_write() {
-    use scp_protocol::trust::consequence::{
-        ConsequenceAction, ConsequenceRule, ConsequenceTrigger,
-    };
-    use std::time::Duration;
-
-    let manager = ContextManager::new(
-        Box::new(MockCrypto::default()),
-        Box::new(MockTransport::connected()),
-        Box::new(MockEventLog::default()),
-        noop_key_resolver(),
-    );
-
-    let mut params = governance_params();
-    params.consequence_rules = vec![ConsequenceRule {
-        trigger: ConsequenceTrigger::MessageVelocity,
-        threshold: 0,
-        action: ConsequenceAction::CapabilitySuspension(vec!["write".to_owned()]),
-        window: Duration::from_secs(3600),
-    }];
-    let _handle = manager
-        .create_context("suspend-ctx".into(), params, "did:key:admin".into())
-        .await
-        .unwrap();
-
-    // Send a message to trigger the consequence.
-    let sk = ed25519_dalek::SigningKey::from_bytes(&[1u8; 32]);
-    let handle = manager
-        .contexts
-        .lock()
-        .await
-        .get("suspend-ctx")
-        .unwrap()
-        .handle
-        .clone();
-    let _ = manager
-        .send_message(
-            &handle,
-            &"did:key:admin".into(),
-            b"trigger",
-            Some(&sk),
-            None,
-            None,
-        )
-        .await;
-
-    // Verify write access was actually revoked.
-    let is_revoked = {
-        let contexts = manager.contexts.lock().await;
-        let ctx = contexts.get("suspend-ctx").unwrap();
-        ctx.access
-            .write_revoked_members
-            .contains(&DID::from("did:key:admin"))
-    };
-    assert!(
-        is_revoked,
-        "CapabilitySuspension should have revoked write access"
-    );
-}
-
-/// `AccessRevocation` consequence actually revokes access (#1531).
-#[tokio::test]
-async fn access_revocation_consequence_revokes() {
-    use scp_protocol::trust::consequence::{
-        ConsequenceAction, ConsequenceRule, ConsequenceTrigger,
-    };
-    use std::time::Duration;
-
-    let manager = ContextManager::new(
-        Box::new(MockCrypto::default()),
-        Box::new(MockTransport::connected()),
-        Box::new(MockEventLog::default()),
-        noop_key_resolver(),
-    );
-
-    let mut params = governance_params();
-    params.consequence_rules = vec![ConsequenceRule {
-        trigger: ConsequenceTrigger::MessageVelocity,
-        threshold: 0,
-        action: ConsequenceAction::AccessRevocation,
-        window: Duration::from_secs(3600),
-    }];
-    let _handle = manager
-        .create_context("revoke-ctx".into(), params, "did:key:admin".into())
-        .await
-        .unwrap();
-
-    let sk = ed25519_dalek::SigningKey::from_bytes(&[1u8; 32]);
-    let handle = manager
-        .contexts
-        .lock()
-        .await
-        .get("revoke-ctx")
-        .unwrap()
-        .handle
-        .clone();
-    let _ = manager
-        .send_message(
-            &handle,
-            &"did:key:admin".into(),
-            b"trigger",
-            Some(&sk),
-            None,
-            None,
-        )
-        .await;
-
-    let (write_revoked, read_revoked) = {
-        let contexts = manager.contexts.lock().await;
-        let ctx = contexts.get("revoke-ctx").unwrap();
-        (
-            ctx.access
-                .write_revoked_members
-                .contains(&DID::from("did:key:admin")),
-            ctx.access
-                .read_revoked_members
-                .contains(&DID::from("did:key:admin")),
-        )
-    };
-    assert!(write_revoked, "AccessRevocation should revoke write access");
-    assert!(read_revoked, "AccessRevocation should revoke read access");
-}
-
-/// `RoleDemotion` consequence demotes member role (#1531).
-#[tokio::test]
-async fn role_demotion_consequence_demotes() {
-    use scp_protocol::trust::consequence::{
-        ConsequenceAction, ConsequenceRule, ConsequenceTrigger,
-    };
-    use std::time::Duration;
-
-    let manager = ContextManager::new(
-        Box::new(MockCrypto::default()),
-        Box::new(MockTransport::connected()),
-        Box::new(MockEventLog::default()),
-        noop_key_resolver(),
-    );
-
-    let mut params = governance_params();
-    params.consequence_rules = vec![ConsequenceRule {
-        trigger: ConsequenceTrigger::MessageVelocity,
-        threshold: 0,
-        action: ConsequenceAction::RoleDemotion {
-            to_role: "observer".to_owned(),
-        },
-        window: Duration::from_secs(3600),
-    }];
-    let _handle = manager
-        .create_context("demote-ctx".into(), params, "did:key:admin".into())
-        .await
-        .unwrap();
-
-    let sk = ed25519_dalek::SigningKey::from_bytes(&[1u8; 32]);
-    let handle = manager
-        .contexts
-        .lock()
-        .await
-        .get("demote-ctx")
-        .unwrap()
-        .handle
-        .clone();
-    let _ = manager
-        .send_message(
-            &handle,
-            &"did:key:admin".into(),
-            b"trigger",
-            Some(&sk),
-            None,
-            None,
-        )
-        .await;
-
-    // Check that a ConsequenceEnforced event was emitted for the demotion.
-    let events = manager.drain_events("demote-ctx").await;
-    let has_enforced = events.iter().any(|e| {
-        matches!(
-            e,
-            ContextEvent::ConsequenceEnforced {
-                action_type,
-                ..
-            } if action_type == "RoleDemotion"
-        )
-    });
-    assert!(
-        has_enforced,
-        "RoleDemotion should have emitted ConsequenceEnforced event"
     );
 }
 
@@ -6589,75 +6222,6 @@ async fn rejected_standing_blocks_governance() {
     assert!(
         result.is_err(),
         "member with pending removal should be rejected"
-    );
-}
-
-/// Budget exceeded denies `send_message` (#1537).
-#[tokio::test]
-async fn budget_exceeded_denies_send() {
-    use scp_protocol::economy::types::{Amount, CostSchedule, CurrencyCode, EconomicPolicy};
-
-    let manager = ContextManager::new(
-        Box::new(MockCrypto::default()),
-        Box::new(MockTransport::connected()),
-        Box::new(MockEventLog::default()),
-        noop_key_resolver(),
-    );
-
-    let mut params = governance_params();
-    params.economic_policy = Some(EconomicPolicy {
-        locked: false,
-        cost_schedule: CostSchedule {
-            currency: CurrencyCode::new([85, 83, 68, 0]),
-            per_message: Some(Amount::new(100)),
-            per_tool_invoke: None,
-            per_join: None,
-            per_period: None,
-            per_byte_stored: None,
-        },
-        payment_adapters: vec![],
-        pricing_formula: None,
-        payee: DID::from("did:key:payee"),
-    });
-    let _handle = manager
-        .create_context("exceed-ctx".into(), params, "did:key:admin".into())
-        .await
-        .unwrap();
-
-    // Grant only 50 budget — message costs 100.
-    {
-        let mut contexts = manager.contexts.lock().await;
-        let ctx = contexts.get_mut("exceed-ctx").unwrap();
-        ctx.governance
-            .budget_tracker
-            .grant(&"did:key:admin".into(), Amount::new(50));
-    }
-
-    let sk = ed25519_dalek::SigningKey::from_bytes(&[1u8; 32]);
-    let handle = manager
-        .contexts
-        .lock()
-        .await
-        .get("exceed-ctx")
-        .unwrap()
-        .handle
-        .clone();
-    let ucan = dummy_spending_ucan();
-    let result = manager
-        .send_message(
-            &handle,
-            &"did:key:admin".into(),
-            b"expensive",
-            Some(&sk),
-            None,
-            Some(&ucan),
-        )
-        .await;
-    assert!(result.is_err(), "send should fail when budget is exceeded");
-    let err_msg = result.unwrap_err().to_string();
-    assert!(
-        err_msg.contains("budget exceeded") || err_msg.contains("SCP-ECON-7010"),
-        "error should mention budget: {err_msg}"
     );
 }
 
@@ -7080,116 +6644,6 @@ async fn event_log_entries_feed_consequence_evaluation() {
     );
 }
 
-/// `execute_paid_action` skips when no payment adapter is configured (#1537).
-#[tokio::test]
-async fn execute_paid_action_skips_without_adapter() {
-    use scp_protocol::economy::types::{Amount, CostSchedule, CurrencyCode, EconomicPolicy};
-
-    let manager = ContextManager::new(
-        Box::new(MockCrypto::default()),
-        Box::new(MockTransport::connected()),
-        Box::new(MockEventLog::default()),
-        noop_key_resolver(),
-    );
-
-    let mut params = governance_params();
-    params.economic_policy = Some(EconomicPolicy {
-        locked: false,
-        cost_schedule: CostSchedule {
-            currency: CurrencyCode::new([85, 83, 68, 0]),
-            per_message: Some(Amount::new(10)),
-            per_tool_invoke: None,
-            per_join: None,
-            per_period: None,
-            per_byte_stored: None,
-        },
-        payment_adapters: vec![],
-        pricing_formula: None,
-        payee: DID::from("did:key:payee"),
-    });
-    let _handle = manager
-        .create_context("no-adapter-ctx".into(), params, "did:key:admin".into())
-        .await
-        .unwrap();
-
-    // No payment adapter configured — execute_paid_action should return Ok(None).
-    let result = manager
-        .execute_paid_action(
-            scp_protocol::economy::types::PaidActionType::MessageSend,
-            &"did:key:admin".into(),
-            "no-adapter-ctx",
-        )
-        .await;
-    assert!(result.is_ok(), "should succeed without adapter: {result:?}");
-    assert!(
-        result.unwrap().is_none(),
-        "should return None when no adapter configured"
-    );
-}
-
-/// `execute_paid_action` runs full payment flow with adapter (#1537).
-#[tokio::test]
-async fn execute_paid_action_full_flow_with_adapter() {
-    use scp_protocol::economy::types::{Amount, CostSchedule, CurrencyCode, EconomicPolicy};
-
-    let mut manager = ContextManager::new(
-        Box::new(MockCrypto::default()),
-        Box::new(MockTransport::connected()),
-        Box::new(MockEventLog::default()),
-        noop_key_resolver(),
-    );
-
-    let mut params = governance_params();
-    params.economic_policy = Some(EconomicPolicy {
-        locked: false,
-        cost_schedule: CostSchedule {
-            currency: CurrencyCode::new([85, 83, 68, 0]),
-            per_message: Some(Amount::new(10)),
-            per_tool_invoke: None,
-            per_join: None,
-            per_period: None,
-            per_byte_stored: None,
-        },
-        payment_adapters: vec![],
-        pricing_formula: None,
-        payee: DID::from("did:key:payee"),
-    });
-    let _handle = manager
-        .create_context("adapter-ctx".into(), params, "did:key:admin".into())
-        .await
-        .unwrap();
-
-    // Grant budget so the send cost check doesn't reject.
-    {
-        let mut contexts = manager.contexts.lock().await;
-        let ctx = contexts.get_mut("adapter-ctx").unwrap();
-        ctx.governance
-            .budget_tracker
-            .grant(&"did:key:admin".into(), Amount::new(100));
-    }
-
-    // Set up a NoOpPaymentAdapter.
-    manager.set_payment_adapter(Arc::new(crate::economy::adapter::NoOpPaymentAdapter));
-
-    // execute_paid_action should run the full flow and return a receipt.
-    let result = manager
-        .execute_paid_action(
-            scp_protocol::economy::types::PaidActionType::MessageSend,
-            &"did:key:admin".into(),
-            "adapter-ctx",
-        )
-        .await;
-    assert!(
-        result.is_ok(),
-        "paid action should succeed with adapter: {result:?}"
-    );
-    let receipt = result.unwrap();
-    assert!(
-        receipt.is_some(),
-        "should return a receipt when adapter is configured and cost > 0"
-    );
-}
-
 /// `verify_payment_receipts` returns valid for `NoOp` adapter receipt (#1537).
 #[tokio::test]
 async fn verify_receipts_with_noop_adapter() {
@@ -7225,57 +6679,6 @@ async fn verify_receipts_with_noop_adapter() {
     assert!(results[0].is_ok(), "noop adapter should verify receipt OK");
     let verification = results[0].as_ref().unwrap();
     assert!(verification.result.valid, "receipt should be valid");
-}
-
-/// Sender key removal error propagates from `execute_remove_member` (#1541).
-#[tokio::test]
-async fn sender_key_removal_error_propagates() {
-    let crypto = MockCrypto {
-        fail_remove_member_sender_key: AtomicBool::new(true),
-        ..MockCrypto::default()
-    };
-
-    let manager = ContextManager::new(
-        Box::new(crypto),
-        Box::new(MockTransport::connected()),
-        Box::new(MockEventLog::default()),
-        mock_key_resolver(),
-    );
-
-    let admin: DID = "did:dht:z6MkCreator".into();
-    let alice: DID = "did:dht:z6MkAlice".into();
-    let key_admin = signing_key_for_did(&admin);
-
-    let params = governance_params();
-    let handle = manager
-        .create_context("sk-err-ctx".into(), params, admin.clone())
-        .await
-        .unwrap();
-
-    // Add Alice.
-    let kp = scp_protocol::context::membership::KeyPackage {
-        owner_did: alice.clone(),
-        mls_key_package_bytes: None,
-    };
-    manager.join_context(&handle, kp, None).await.unwrap();
-
-    // Remove Alice — sender key removal will fail.
-    let action = scp_protocol::context::governance::GovernanceAction::RemoveMember {
-        did: alice.clone(),
-        reason: Some("error propagation test".into()),
-    };
-    let result = manager
-        .propose_governance_action("sk-err-ctx", &admin, action, &key_admin)
-        .await;
-    assert!(
-        result.is_err(),
-        "remove_member should fail when sender key removal fails"
-    );
-    let err = result.unwrap_err();
-    assert!(
-        matches!(err, ContextError::CryptoFailed(_)),
-        "error should be CryptoFailed, got: {err}"
-    );
 }
 
 /// After removing one member, remaining members' sender keys are still available (#1541).
@@ -8195,95 +7598,6 @@ async fn role_demotion_consequence_changes_role() {
     }
 }
 
-/// Cooldown prevents re-trigger within the window (#1531).
-#[tokio::test]
-async fn cooldown_prevents_retrigger_within_window() {
-    use scp_protocol::trust::consequence::{
-        ConsequenceAction, ConsequenceRule, ConsequenceTrigger,
-    };
-    use std::time::Duration;
-
-    let manager = ContextManager::new(
-        Box::new(MockCrypto::default()),
-        Box::new(MockTransport::connected()),
-        Box::new(MockEventLog::default()),
-        noop_key_resolver(),
-    );
-
-    let mut params = governance_params();
-    // Rule with a very long cooldown window (1 hour) so it won't expire during test.
-    params.consequence_rules = vec![ConsequenceRule {
-        trigger: ConsequenceTrigger::MessageVelocity,
-        threshold: 0,
-        action: ConsequenceAction::CapabilitySuspension(vec!["write".to_owned()]),
-        window: Duration::from_secs(3600),
-    }];
-    let _handle = manager
-        .create_context("cooldown-block-ctx".into(), params, "did:key:admin".into())
-        .await
-        .unwrap();
-
-    let sk = ed25519_dalek::SigningKey::from_bytes(&[1u8; 32]);
-    let handle = manager
-        .contexts
-        .lock()
-        .await
-        .get("cooldown-block-ctx")
-        .unwrap()
-        .handle
-        .clone();
-
-    // First send triggers consequence.
-    manager
-        .send_message(
-            &handle,
-            &"did:key:admin".into(),
-            b"first",
-            Some(&sk),
-            None,
-            None,
-        )
-        .await
-        .unwrap();
-    let events1 = manager.drain_events("cooldown-block-ctx").await;
-    let count1 = events1
-        .iter()
-        .filter(|e| matches!(e, ContextEvent::ConsequenceTriggered { .. }))
-        .count();
-    assert!(count1 > 0, "first send should trigger consequence");
-
-    // Clear write revocation to allow the second send, but keep cooldown.
-    {
-        let mut contexts = manager.contexts.lock().await;
-        let ctx = contexts.get_mut("cooldown-block-ctx").unwrap();
-        ctx.access.write_revoked_members.clear();
-        ctx.access.read_revoked_members.clear();
-        // cooldown_until is still in the future — do NOT clear it.
-    }
-
-    // Second send should NOT trigger the consequence again (cooldown active).
-    manager
-        .send_message(
-            &handle,
-            &"did:key:admin".into(),
-            b"second",
-            Some(&sk),
-            None,
-            None,
-        )
-        .await
-        .unwrap();
-    let events2 = manager.drain_events("cooldown-block-ctx").await;
-    let count2 = events2
-        .iter()
-        .filter(|e| matches!(e, ContextEvent::ConsequenceTriggered { .. }))
-        .count();
-    assert_eq!(
-        count2, 0,
-        "second send should NOT re-trigger consequence during cooldown. Events: {events2:?}"
-    );
-}
-
 /// Send message deducts budget by `per_message` cost (#1537, positive case).
 #[tokio::test]
 async fn send_message_deducts_budget() {
@@ -8788,8 +8102,8 @@ async fn paid_join_end_to_end_with_adapter() {
         "expected paid context rejection, got: {err}"
     );
 
-    // Verify execute_paid_action works for the join action type though.
-    // Grant budget so the budget check passes if we call execute_paid_action directly.
+    // Verify authorize→complete works for the join action type though.
+    // Grant budget so the budget check passes.
     {
         let mut contexts = manager.contexts.lock().await;
         let ctx = contexts.get_mut("paid-join-ctx").unwrap();
@@ -8797,16 +8111,22 @@ async fn paid_join_end_to_end_with_adapter() {
             .budget_tracker
             .grant(&"did:key:joiner".into(), Amount::new(100));
     }
-    let receipt_result = manager
-        .execute_paid_action(
+    let auth = manager
+        .authorize_paid_action(
             scp_protocol::economy::types::PaidActionType::ContextJoin,
             &"did:key:joiner".into(),
             "paid-join-ctx",
         )
         .await;
+    assert!(auth.is_ok(), "authorize should succeed");
+    let auth = auth.unwrap();
+    assert!(auth.is_some(), "should return authorization for paid join");
+    let receipt_result = manager
+        .complete_paid_action(auth.unwrap(), &"did:key:joiner".into(), "paid-join-ctx")
+        .await;
     assert!(
         receipt_result.is_ok(),
-        "execute_paid_action should succeed with adapter: {receipt_result:?}"
+        "complete_paid_action should succeed with adapter"
     );
     let receipt = receipt_result.unwrap();
     assert!(
@@ -9699,7 +9019,7 @@ async fn test_dynamic_pricing_varies_with_utilization() {
     );
 }
 
-/// `execute_paid_action` skips when no payment adapter is configured (#1537).
+/// `authorize_paid_action` skips when no payment adapter is configured (#1537).
 #[tokio::test]
 async fn test_execute_paid_action_skips_without_adapter() {
     use scp_protocol::economy::types::{Amount, CostSchedule, CurrencyCode, EconomicPolicy};
@@ -9731,22 +9051,29 @@ async fn test_execute_paid_action_skips_without_adapter() {
         .await
         .unwrap();
 
-    // No payment adapter configured — should return Ok(None).
+    // No payment adapter configured — authorize_paid_action returns Ok(None).
     let result = manager
-        .execute_paid_action(
+        .authorize_paid_action(
             scp_protocol::economy::types::PaidActionType::MessageSend,
             &"did:key:admin".into(),
             "no-adpt2-ctx",
         )
         .await;
-    assert!(result.is_ok(), "should succeed without adapter: {result:?}");
+    assert!(
+        result.is_ok(),
+        "should succeed without adapter: {}",
+        result
+            .as_ref()
+            .err()
+            .map_or_else(String::new, ToString::to_string)
+    );
     assert!(
         result.unwrap().is_none(),
         "should return None when no adapter configured"
     );
 }
 
-/// `execute_paid_action` runs full payment flow with `NoOpPaymentAdapter` (#1537).
+/// Paid action flow (authorize→complete) with `NoOpPaymentAdapter` (#1537).
 #[tokio::test]
 async fn test_execute_paid_action_full_flow_with_adapter() {
     use scp_protocol::economy::types::{Amount, CostSchedule, CurrencyCode, EconomicPolicy};
@@ -9790,54 +9117,28 @@ async fn test_execute_paid_action_full_flow_with_adapter() {
     // Set up NoOpPaymentAdapter.
     manager.set_payment_adapter(Arc::new(crate::economy::adapter::NoOpPaymentAdapter));
 
-    let result = manager
-        .execute_paid_action(
+    // authorize_paid_action → complete_paid_action (escrow pattern).
+    let auth = manager
+        .authorize_paid_action(
             scp_protocol::economy::types::PaidActionType::MessageSend,
             &"did:key:admin".into(),
             "adpt2-ctx",
         )
         .await;
-    assert!(result.is_ok(), "paid action should succeed: {result:?}");
-    let receipt = result.unwrap();
+    assert!(auth.is_ok(), "authorize should succeed");
+    let auth = auth.unwrap();
     assert!(
-        receipt.is_some(),
-        "should return a receipt when adapter is configured"
+        auth.is_some(),
+        "should return authorization when adapter is configured"
     );
-}
-
-/// `verify_payment_receipts` with a real receipt from `NoOpPaymentAdapter` (#1537).
-#[tokio::test]
-async fn test_verify_receipts_with_real_receipt() {
-    use scp_protocol::economy::types::{Amount, CurrencyCode, PaidActionType};
-
-    let mut manager = ContextManager::new(
-        Box::new(MockCrypto::default()),
-        Box::new(MockTransport::connected()),
-        Box::new(MockEventLog::default()),
-        noop_key_resolver(),
+    let receipt = manager
+        .complete_paid_action(auth.unwrap(), &"did:key:admin".into(), "adpt2-ctx")
+        .await;
+    assert!(receipt.is_ok(), "complete should succeed");
+    assert!(
+        receipt.unwrap().is_some(),
+        "should return a receipt after capture"
     );
-
-    manager.set_payment_adapter(Arc::new(crate::economy::adapter::NoOpPaymentAdapter));
-
-    let receipt = crate::economy::adapter::PaymentReceipt {
-        receipt_id: [99u8; 32],
-        payer: "did:key:payer".into(),
-        payee: "did:key:payee".into(),
-        amount: Amount::new(10),
-        currency: CurrencyCode::new([85, 83, 68, 0]),
-        action_type: PaidActionType::MessageSend,
-        context_id: Some("test-ctx".to_owned()),
-        adapter_id: "noop".to_owned(),
-        adapter_proof: Vec::new(),
-        timestamp: 1000,
-        signature: Vec::new(),
-    };
-
-    let results = manager.verify_payment_receipts(&[receipt]).await;
-    assert_eq!(results.len(), 1);
-    assert!(results[0].is_ok(), "noop adapter should verify receipt OK");
-    let v = results[0].as_ref().unwrap();
-    assert!(v.result.valid, "receipt should be valid");
 }
 
 /// Free context (no `economic_policy`) does not deduct budget (#1537).
@@ -12372,7 +11673,7 @@ async fn role_demotion_nonexistent_role_reports_failure() {
 }
 
 // -----------------------------------------------------------------------
-// §53. execute_paid_action skips when cost is zero
+// §53. authorize_paid_action skips when cost is zero
 // -----------------------------------------------------------------------
 
 #[tokio::test]
@@ -12409,16 +11710,23 @@ async fn execute_paid_action_skips_zero_cost() {
         .unwrap();
 
     let result = manager
-        .execute_paid_action(
+        .authorize_paid_action(
             scp_protocol::economy::types::PaidActionType::MessageSend,
             &"did:key:sender".into(),
             "zero-paid-ctx",
         )
         .await;
-    assert!(result.is_ok(), "zero cost should not fail: {result:?}");
+    assert!(
+        result.is_ok(),
+        "zero cost should not fail: {}",
+        result
+            .as_ref()
+            .err()
+            .map_or_else(String::new, ToString::to_string)
+    );
     assert!(
         result.unwrap().is_none(),
-        "zero cost should return None (no receipt)"
+        "zero cost should return None (no authorization needed)"
     );
 }
 

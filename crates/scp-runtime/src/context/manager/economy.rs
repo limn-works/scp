@@ -439,40 +439,6 @@ impl ContextManager {
         }
     }
 
-    /// Executes the 9-step payment flow as authorize -> capture (escrow pattern).
-    ///
-    /// This is the unified entry point that every paid action calls:
-    /// - `send_message` calls with `PaidActionType::MessageSend`
-    /// - `join_context` calls with `PaidActionType::ContextJoin`
-    /// - `invoke_tool` calls with `PaidActionType::ToolInvoke`
-    ///
-    /// When no payment adapter is configured, returns `Ok(None)` immediately.
-    /// When the evaluated cost is zero, also returns `Ok(None)`.
-    ///
-    /// Budget enforcement (`evaluate_cost` + spending UCAN + `record_spend`) is
-    /// handled by [`enforce_economy`] at the per-action level, not here.
-    /// The payment adapter handles real-money settlement independently.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`ContextError::PermissionDenied`] with SCP-ECON-70xx codes
-    /// for any payment flow failure.
-    pub async fn execute_paid_action(
-        &self,
-        action_type: PaidActionType,
-        payer_did: &DID,
-        context_id: &str,
-    ) -> Result<Option<PaymentReceipt>, ContextError> {
-        let Some(auth) = self
-            .authorize_paid_action(action_type, payer_did, context_id)
-            .await?
-        else {
-            return Ok(None);
-        };
-
-        self.complete_paid_action(auth, payer_did, context_id).await
-    }
-
     /// Verifies payment receipts using the configured payment adapter.
     ///
     /// Wraps [`verify_receipts_dyn`] using the payment adapter as verifier.

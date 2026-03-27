@@ -434,17 +434,69 @@ fn pipeline_active_assertions_never_decrease() {
 
 /// Asserts that no `#[ignore]` attributes remain in this test file.
 ///
-/// All batch 2 ignores have been removed. Any `#[ignore]` is stale and
-/// must be removed (the wiring has landed). This is a strict assertion
-/// rather than per-test checking because all ignores should be gone.
+/// Each batch-2 issue's wiring is verified individually: if the wiring
+/// has landed (function body contains the expected callee), any
+/// remaining `#[ignore]` referencing that issue is stale and must be
+/// removed. A catch-all at the end rejects any `#[ignore]` at all.
 #[test]
 fn no_stale_ignores() {
+    let mut stale: Vec<&str> = vec![];
     let source = include_str!("pipeline_wiring.rs");
-    assert_eq!(
-        source.matches("#[ignore = \"").count(),
-        0,
-        "all ignores should be removed — if wiring landed, remove the #[ignore]"
-    );
+
+    // #1531 — consequence evaluation wired in dispatch_consequences
+    if fn_body_contains(
+        MANAGER_SRC,
+        "dispatch_consequences",
+        "evaluate_consequence_rules",
+    ) && source.contains("#[ignore = \"")
+        && source.contains("1531")
+    {
+        stale.push("consequence evaluation wired but #[ignore] for #1531 still present");
+    }
+
+    // #1537 — economy enforcement wired in enforce_economy
+    if fn_body_contains(MANAGER_SRC, "enforce_economy", "evaluate_cost")
+        && source.contains("#[ignore = \"")
+        && source.contains("1537")
+    {
+        stale.push("economy enforcement wired but #[ignore] for #1537 still present");
+    }
+
+    // #1530 — standing checks wired in propose_governance_action_inner
+    if fn_body_contains(
+        MANAGER_SRC,
+        "propose_governance_action_inner",
+        "check_standing",
+    ) && source.contains("#[ignore = \"")
+        && source.contains("1530")
+    {
+        stale.push("standing check wired but #[ignore] for #1530 still present");
+    }
+
+    // #1548 — content key rotation wired in execute_rotate_content_keys
+    if (fn_body_contains(MANAGER_SRC, "execute_rotate_content_keys", "advance_epoch")
+        || fn_body_contains(MANAGER_SRC, "execute_rotate_content_keys", "propose_update"))
+        && source.contains("#[ignore = \"")
+        && source.contains("1548")
+    {
+        stale.push("content key rotation wired but #[ignore] for #1548 still present");
+    }
+
+    // #1541 — sender key rotation wired in execute_remove_member and leave_context
+    if fn_body_contains(MANAGER_SRC, "execute_remove_member", "rotate_sender_key")
+        && fn_body_contains(MANAGER_SRC, "leave_context", "rotate_sender_key")
+        && source.contains("#[ignore = \"")
+        && source.contains("1541")
+    {
+        stale.push("sender key rotation wired but #[ignore] for #1541 still present");
+    }
+
+    // Catch-all: no ignores should exist at all
+    if source.matches("#[ignore = \"").count() > 0 {
+        stale.push("unexpected #[ignore] attributes found");
+    }
+
+    assert!(stale.is_empty(), "Stale ignores:\n  {}", stale.join("\n  "));
 }
 
 /// Verifies that CLAUDE.md contains the required enforcement sections.

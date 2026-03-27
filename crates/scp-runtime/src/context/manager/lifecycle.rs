@@ -50,6 +50,10 @@ fn post_join_bookkeeping(
     event_log: &dyn super::super::builder::ContextEventLogProvider,
 ) {
     // Participation record initialization for the new member.
+    let context_id_bytes = super::context_id_to_bytes(context_id);
+    let merkle_root = event_log
+        .event_log_merkle_root(&context_id_bytes)
+        .unwrap_or([0u8; 32]);
     let join_events =
         super::governance::event_log_entries_for_consequences(ctx, context_id, now, event_log);
     if !join_events.is_empty()
@@ -57,7 +61,7 @@ fn post_join_bookkeeping(
             &join_events,
             member_did.as_ref(),
             context_id,
-            [0u8; 32],
+            merkle_root,
             now,
         )
     {
@@ -1645,6 +1649,10 @@ impl ContextManager {
             // Rotate the local sender key so the departing member cannot
             // decrypt future messages (§9.16.4). Generates a fresh key,
             // increments the epoch, and HPKE-seals to remaining members.
+            //
+            // Note: `publish_sender_key_epoch_advance` (§9.16.2) is called
+            // implicitly via `drain_pending_sender_key_messages` below. The
+            // distribution messages are queued by `rotate_sender_key`.
             self.crypto.rotate_sender_key(&context_id_bytes)?;
 
             // Drain pending sender key distributions and deliver via transport.

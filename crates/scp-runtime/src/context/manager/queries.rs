@@ -24,10 +24,10 @@ impl ContextManager {
 
     /// Sets the payment adapter for the 9-step paid action flow (spec §19.2.2).
     ///
-    /// When set, `execute_paid_action` runs the full authorize→capture→verify
-    /// sequence for each paid entry point (`send_message`, `join_context`,
-    /// `invoke_tool`). When `None`, those entry points still enforce budget
-    /// tracking but skip the payment rail integration.
+    /// When set, `authorize_paid_action`→`complete_paid_action` runs the
+    /// full escrow sequence for each paid entry point (`send_message`,
+    /// `join_context`, `invoke_tool`). When `None`, those entry points
+    /// still enforce budget tracking but skip the payment rail integration.
     ///
     /// Can be called at any time; takes effect for subsequent actions.
     pub fn set_payment_adapter(

@@ -56,6 +56,12 @@ fn enforce_capability_suspension(
 /// Demotes the member to the specified role (best-effort — role may not exist).
 /// Uses the injected clock (via `now` parameter) instead of `SystemClock` to
 /// keep all governance timing consistent with the `ContextManager`'s clock.
+///
+/// **Known coupling:** Uses `creator_did` as the assigner because
+/// `assign_role` checks `RoleAssign` capability on the assigner. If the
+/// creator loses `RoleAssign`, consequence-driven demotions will silently
+/// fail (returning `false`). A `system_assign_role` function that bypasses
+/// the assigner capability check would fix this (tracked in #1596).
 fn enforce_role_demotion(
     ctx: &mut PerContextState,
     member_did: &DID,
@@ -176,6 +182,15 @@ pub(super) fn enforce_triggered_consequences(
                 enforce_role_demotion(ctx, member_did, to_role, clock)
             }
         };
+
+        if !success {
+            tracing::warn!(
+                context_id,
+                member = %member_did,
+                action_type,
+                "consequence enforcement failed"
+            );
+        }
 
         // Record cooldown: prevent re-firing within the rule's window.
         if let Some(rule) = rules.get(consequence.rule_index) {
@@ -344,13 +359,17 @@ fn check_standing(
 
     // Refresh participation record from recent events before checking standing (#1530).
     let context_id = ctx.handle.context_id().to_owned();
+    let context_id_bytes = context_id_to_bytes(&context_id);
+    let merkle_root = event_log
+        .event_log_merkle_root(&context_id_bytes)
+        .unwrap_or([0u8; 32]);
     let events = event_log_entries_for_consequences(ctx, &context_id, now, event_log);
     if !events.is_empty() {
         match scp_protocol::trust::participation::compute_participation_record(
             &events,
             proposer_did.as_ref(),
             &context_id,
-            [0u8; 32],
+            merkle_root,
             now,
         ) {
             Err(e) => {
@@ -637,13 +656,17 @@ impl ContextManager {
                     self.clock.now_secs(),
                     &*self.event_log,
                 );
+                let gov_merkle = self
+                    .event_log
+                    .event_log_merkle_root(&context_id_bytes)
+                    .unwrap_or([0u8; 32]);
                 if !gov_events.is_empty()
                     && let Ok(record) =
                         scp_protocol::trust::participation::compute_participation_record(
                             &gov_events,
                             proposal.proposer_did.as_ref(),
                             context_id,
-                            [0u8; 32],
+                            gov_merkle,
                             self.clock.now_secs(),
                         )
                     && record.participation_count > 0
@@ -2000,6 +2023,11 @@ impl ContextManager {
             // Rotate the local sender key so the removed member cannot
             // decrypt future messages (§9.16.4). Generates a fresh key,
             // increments the epoch, and HPKE-seals to remaining members.
+            //
+            // Note: `publish_sender_key_epoch_advance` (§9.16.2) is called
+            // implicitly via `drain_pending_sender_key_messages` after the
+            // lock is dropped. The distribution messages are queued by
+            // `rotate_sender_key` and sent below.
             self.crypto.rotate_sender_key(&context_id_bytes)?;
 
             ctx.membership.remove_member(did);
