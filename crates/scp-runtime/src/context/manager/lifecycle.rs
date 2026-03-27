@@ -67,6 +67,32 @@ fn post_join_bookkeeping(
     }
 }
 
+/// Derives a default [`RelayPricingConfig`] from an [`EconomicPolicy`].
+///
+/// When a context has an economic policy with a `per_message` cost, relay
+/// pricing should track utilization-based price adjustments. If no economic
+/// policy is configured, returns `None` (no relay pricing).
+///
+/// The defaults mirror EIP-1559: 50% target utilization, 12.5% max change,
+/// with floor = 1 and cap = 10x the per-message cost.
+fn derive_relay_pricing_config(
+    economic_policy: Option<&scp_protocol::economy::types::EconomicPolicy>,
+) -> Option<scp_protocol::economy::pricing::RelayPricingConfig> {
+    let policy = economic_policy?;
+    let base_price = policy.cost_schedule.per_message?;
+    // Only enable relay pricing when there's a non-zero message cost.
+    if base_price.0 == 0 {
+        return None;
+    }
+    Some(scp_protocol::economy::pricing::RelayPricingConfig {
+        target_utilization_pct: 50,
+        current_base_price: base_price,
+        max_change_per_mille: 125, // 12.5% per EIP-1559
+        floor: scp_protocol::economy::types::Amount::new(1),
+        cap: scp_protocol::economy::types::Amount::new(base_price.0.saturating_mul(10)),
+    })
+}
+
 /// Enforces economic policy for context joins (#1537, #1593).
 ///
 /// Checks auto-accept guard, evaluates join cost, enforces spending UCAN
@@ -112,7 +138,7 @@ fn enforce_join_economy(
                     ));
                 }
                 scp_protocol::crypto::ucan::spending::check_and_composition(
-                    spending_ucan, // action UCAN witness (capability already checked)
+                    None, // action UCAN: already verified (join capability check above)
                     spending_ucan,
                     scp_protocol::crypto::ucan::spending::Amount(cost.0),
                     "context:join",
@@ -120,13 +146,12 @@ fn enforce_join_economy(
                 .map_err(|e| ContextError::PermissionDenied(format!("SCP-ECON-7061: {e}")))?;
             }
 
-            // Auto-grant unlimited budget on first spend if no governance-approved
-            // budget exists (same pattern as enforce_send_economy).
+            // Auto-grant the exact action cost on first spend if no
+            // governance-approved budget exists. This lets the member
+            // complete the join action but requires governance approval
+            // (ApproveSpend) for further spending.
             if !ctx.governance.budget_tracker.has_budget(joiner_did) {
-                ctx.governance.budget_tracker.grant(
-                    joiner_did,
-                    scp_protocol::economy::types::Amount::new(u64::MAX),
-                );
+                ctx.governance.budget_tracker.grant(joiner_did, cost);
             }
             ctx.governance
                 .budget_tracker
@@ -259,15 +284,19 @@ impl ContextManager {
                 registered_tools: ctx_snapshot.registered_tools,
                 tool_interfaces: ctx_snapshot.tool_interfaces,
                 pruning_policy: ctx_snapshot.pruning_policy,
+                relay_pricing_config: derive_relay_pricing_config(
+                    ctx_snapshot.economic_policy.as_ref(),
+                ),
                 economic_policy: ctx_snapshot.economic_policy,
                 budget_tracker: ctx_snapshot.budget_tracker,
                 last_known_members: last_members,
                 pending_epoch_resets: Vec::new(),
                 consequence_rules: ctx_snapshot.consequence_rules,
-                velocity_tracker: scp_protocol::economy::antispam::SenderVelocityTracker::new(3600),
+                velocity_tracker: scp_protocol::economy::antispam::SenderVelocityTracker::new(
+                    ctx_snapshot.velocity_tracker.unwrap_or(3600),
+                ),
                 participation_cache: ctx_snapshot.participation_cache,
                 cooldown_until: HashMap::new(),
-                relay_pricing_config: None,
             },
             role_state: ctx_snapshot.role_state,
             receive_buffer: ReceiveBuffer::new(),
@@ -750,15 +779,19 @@ impl ContextManager {
                 registered_tools: export.snapshot.registered_tools,
                 tool_interfaces: export.snapshot.tool_interfaces,
                 pruning_policy: export.snapshot.pruning_policy,
+                relay_pricing_config: derive_relay_pricing_config(
+                    export.snapshot.economic_policy.as_ref(),
+                ),
                 economic_policy: export.snapshot.economic_policy,
                 budget_tracker: export.snapshot.budget_tracker,
                 last_known_members: initial_members,
                 pending_epoch_resets: Vec::new(),
                 consequence_rules: export.snapshot.consequence_rules,
-                velocity_tracker: scp_protocol::economy::antispam::SenderVelocityTracker::new(3600),
+                velocity_tracker: scp_protocol::economy::antispam::SenderVelocityTracker::new(
+                    export.snapshot.velocity_tracker.unwrap_or(3600),
+                ),
                 participation_cache: export.snapshot.participation_cache,
                 cooldown_until: HashMap::new(),
-                relay_pricing_config: None,
             },
             epoch: EpochState {
                 mls_epoch: export.snapshot.mls_epoch,
@@ -919,6 +952,7 @@ impl ContextManager {
                 registered_tools: Vec::new(),
                 tool_interfaces: Vec::new(),
                 pruning_policy: None,
+                relay_pricing_config: derive_relay_pricing_config(params.economic_policy.as_ref()),
                 economic_policy: params.economic_policy.clone(),
                 budget_tracker: MemberBudgetTracker::new(),
                 last_known_members: initial_members,
@@ -927,7 +961,6 @@ impl ContextManager {
                 velocity_tracker: scp_protocol::economy::antispam::SenderVelocityTracker::new(3600),
                 participation_cache: HashMap::new(),
                 cooldown_until: HashMap::new(),
-                relay_pricing_config: None,
             },
             role_state,
             receive_buffer: ReceiveBuffer::new(),
@@ -1216,6 +1249,7 @@ impl ContextManager {
                 registered_tools: Vec::new(),
                 tool_interfaces: Vec::new(),
                 pruning_policy: None,
+                relay_pricing_config: derive_relay_pricing_config(params.economic_policy.as_ref()),
                 economic_policy: params.economic_policy.clone(),
                 budget_tracker: MemberBudgetTracker::new(),
                 last_known_members: HashSet::new(),
@@ -1224,7 +1258,6 @@ impl ContextManager {
                 velocity_tracker: scp_protocol::economy::antispam::SenderVelocityTracker::new(3600),
                 participation_cache: HashMap::new(),
                 cooldown_until: HashMap::new(),
-                relay_pricing_config: None,
             },
             epoch: EpochState {
                 mls_epoch: 0,

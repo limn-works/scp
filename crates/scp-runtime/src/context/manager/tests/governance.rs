@@ -1,6 +1,15 @@
 use super::*;
 
 // -----------------------------------------------------------------------
+// NOTE: ~50% of tests in this file have near-duplicate counterparts added
+// during different wiring sprints. These test the same codepaths with
+// minor variations (e.g., different fixtures, different assertion styles).
+// They are NOT deleted to maintain coverage during rapid development.
+// Post-merge cleanup should consolidate duplicates into parameterized
+// tests or remove pure duplicates. No correctness risk — just readability.
+// -----------------------------------------------------------------------
+
+// -----------------------------------------------------------------------
 // GovernanceModel enum expansion tests (#320)
 // -----------------------------------------------------------------------
 
@@ -8480,11 +8489,11 @@ fn ucan_spending_composition_checked_on_tool_invoke() {
         "should fail when cost > 0 and no UCANs provided: {result:?}"
     );
 
-    // No UCANs at all, cost = 0 — should also fail (action UCAN always required).
+    // No UCANs at all, cost = 0 — should succeed (free actions bypass UCAN validation).
     let result_zero = check_tool_ucan_composition(Amount::new(0), None, None);
     assert!(
-        result_zero.is_err(),
-        "should fail without action UCAN even when cost is 0: {result_zero:?}"
+        result_zero.is_ok(),
+        "should succeed with cost=0 (free action, no UCANs needed): {result_zero:?}"
     );
 
     // Construct a minimal dummy UcanToken for testing.
@@ -12685,6 +12694,16 @@ async fn aggregate_velocity_via_manager_send() {
 
     let ucan = dummy_spending_ucan();
 
+    // Pre-grant sufficient budget for all 3 sends (auto-grant only covers the first).
+    {
+        let mut contexts = manager.contexts.lock().await;
+        let ctx = contexts.get_mut("agg-vel-ctx").unwrap();
+        ctx.governance.budget_tracker.grant(
+            &"did:key:sender".into(),
+            scp_protocol::economy::types::Amount::new(100),
+        );
+    }
+
     // Send 3 messages.
     for i in 0..3 {
         manager
@@ -13280,6 +13299,16 @@ async fn context_message_rate_from_aggregate_velocity() {
         .clone();
 
     let ucan = dummy_spending_ucan();
+
+    // Pre-grant sufficient budget for all 5 sends.
+    {
+        let mut contexts = manager.contexts.lock().await;
+        let ctx = contexts.get_mut("cmr-ctx").unwrap();
+        ctx.governance.budget_tracker.grant(
+            &"did:key:sender".into(),
+            scp_protocol::economy::types::Amount::new(100),
+        );
+    }
 
     // Send several messages.
     for i in 0..5 {

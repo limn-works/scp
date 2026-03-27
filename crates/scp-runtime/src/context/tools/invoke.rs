@@ -157,6 +157,10 @@ pub struct ToolEconomyContext<'a, S: BuildHasher = std::hash::RandomState> {
     /// When `Some`, `invoke_tool` runs `prepare_paid_action` + `process_paid_action`
     /// before tool execution. When `None`, only budget enforcement runs.
     pub payment_adapter: Option<std::sync::Arc<dyn crate::economy::adapter::PaymentAdapterDyn>>,
+    /// Observable metrics for dynamic cost evaluation. Populated from
+    /// `PerContextState` by the caller so that tool economy uses real
+    /// metrics instead of zeros.
+    pub metrics: scp_protocol::economy::policy::ObservableMetrics,
 }
 
 // ---------------------------------------------------------------------------
@@ -327,18 +331,10 @@ fn economy_pre_check<S: BuildHasher>(
     let cost = economy
         .economic_policy
         .and_then(|policy| {
-            let metrics = scp_protocol::economy::policy::ObservableMetrics {
-                member_count: 0,
-                context_message_rate: 0,
-                relay_queue_depth: 0,
-                time_of_day: 0,
-                sender_velocity: 0,
-                storage_usage: 0,
-            };
             scp_protocol::economy::policy::evaluate_cost(
                 policy,
                 &scp_protocol::economy::types::PaidActionType::ToolInvoke,
-                &metrics,
+                &economy.metrics,
             )
         })
         .unwrap_or(scp_protocol::economy::types::Amount::new(0));
@@ -547,13 +543,11 @@ pub fn check_tool_economy(
     invoker_did: &DID,
 ) -> Result<(), InvocationError> {
     if let Some(policy) = economic_policy {
-        // Metrics are zero here because check_tool_economy is a standalone
-        // function without access to PerContextState. The caller (invoke_tool)
-        // already evaluates cost with context-aware metrics for the UCAN
-        // composition check. This function uses zero metrics as a conservative
-        // lower bound for budget enforcement — if the base cost exceeds the
-        // budget, it will be caught here; dynamic pricing adjustments happen
-        // in the caller's metrics-aware path.
+        // Standalone callers (tests, direct API) pass zero metrics.
+        // Production callers use ToolEconomyContext.metrics via
+        // economy_pre_check which carries real ObservableMetrics from
+        // PerContextState. This function evaluates the base cost for
+        // budget enforcement; dynamic pricing is handled by the caller.
         let metrics = scp_protocol::economy::policy::ObservableMetrics {
             context_message_rate: 0,
             member_count: 0,
@@ -567,13 +561,12 @@ pub fn check_tool_economy(
             &scp_protocol::economy::types::PaidActionType::ToolInvoke,
             &metrics,
         ) {
-            // Auto-grant unlimited budget on first spend if no governance-approved
-            // budget exists (same pattern as enforce_send_economy).
+            // Auto-grant the exact action cost on first spend if no
+            // governance-approved budget exists. This lets the member
+            // complete this one action but requires governance approval
+            // (ApproveSpend) for further spending.
             if !budget_tracker.has_budget(invoker_did) {
-                budget_tracker.grant(
-                    invoker_did,
-                    scp_protocol::economy::types::Amount::new(u64::MAX),
-                );
+                budget_tracker.grant(invoker_did, cost);
             }
             // Record spend against invoker budget (§19.5, ADR-033).
             budget_tracker

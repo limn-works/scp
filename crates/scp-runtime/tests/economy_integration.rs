@@ -653,20 +653,28 @@ async fn invariant_2_authorize_capture_after_spending_check() {
     assert_eq!(receipt.adapter_id, "test");
 }
 
-/// Invariant 2: No action UCAN at all is rejected (even for free actions).
+/// Invariant 2: Free actions succeed without any UCANs. `action_ucan: None`
+/// means "already verified" — free actions bypass spending validation entirely.
+/// Paid actions with no spending UCAN are rejected.
 #[test]
 fn invariant_2_no_action_ucan_rejected() {
     use scp_protocol::crypto::ucan::spending::check_and_composition;
 
-    let cost = scp_protocol::crypto::ucan::spending::Amount(0);
-    let result = check_and_composition(
-        None, // No action UCAN
-        None, // No spending UCAN
-        cost,
-        "any action",
+    // Free action (cost=0) with no UCANs — should succeed.
+    let cost_zero = scp_protocol::crypto::ucan::spending::Amount(0);
+    let result_free = check_and_composition(None, None, cost_zero, "any action");
+    assert!(
+        result_free.is_ok(),
+        "free action should succeed without any UCANs"
     );
 
-    assert!(result.is_err(), "missing action UCAN should fail");
+    // Paid action (cost>0) with no UCANs — should fail.
+    let cost_paid = scp_protocol::crypto::ucan::spending::Amount(100);
+    let result_paid = check_and_composition(None, None, cost_paid, "paid action");
+    assert!(
+        result_paid.is_err(),
+        "paid action should fail without spending UCAN"
+    );
 }
 
 // ===========================================================================

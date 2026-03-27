@@ -223,8 +223,7 @@ impl ContextManager {
             let state = handle.state().await;
             match state {
                 ContextState::Active => {
-                    let context_id_bytes =
-                        scp_protocol::context::context_id_bytes(context_id);
+                    let context_id_bytes = scp_protocol::context::context_id_bytes(context_id);
                     self.transport
                         .publish_context(&context_id_bytes, handle.params())
                         .map_err(|e| {

@@ -1188,7 +1188,7 @@ fn domain_separators_are_all_unique() {
         "SCP-CHECKPOINT-V1:",
         "SCP-MIGRATION-V1:",
         "SCP-KEY-DESTRUCTION-V1:",
-        "SCP-EXPORT-ENTRY:",
+        "SCP-EXPORT-ENTRY-V2:",
         "SCP-CHUNK-MSG-ID-V1:",
         "SCP-PRIVATE-LOG-V1:",
         "SCP-BROADCAST-ENVELOPE-V1:",
