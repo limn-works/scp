@@ -52,6 +52,9 @@ pub struct EventLogEntry {
     /// the proposer for governance, the joiner for membership events).
     ///
     /// Added as part of #1594 to enable full-history consequence evaluation.
+    /// Defaults to empty string for backward compatibility with entries
+    /// serialized before `actor_did` was added.
+    #[serde(default)]
     pub actor_did: String,
     /// Seconds since UNIX epoch when the event was appended.
     pub timestamp: u64,

@@ -673,6 +673,12 @@ impl ContextCryptoProvider for MlsCryptoProvider {
             .collect();
 
         for (member_did, wrapping_pub) in &member_keys {
+            // Skip self-sealing: the local member already has the key in
+            // state.sender_key. Sealing to ourselves wastes CPU and queues
+            // a distribution message that the local node would discard.
+            if *member_did == self.local_did {
+                continue;
+            }
             let seal_result = crate::crypto::sender_keys::key_protocol::hpke_seal_sender_key(
                 state.sender_key.as_bytes(),
                 wrapping_pub,

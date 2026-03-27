@@ -62,9 +62,20 @@ pub enum ConsequenceAction {
     /// Suspend one or more capabilities for the subject. The suspended
     /// capabilities are identified by their `{resource}:{action}` names
     /// (matching the capability URI format from the UCAN module).
+    ///
+    /// **Known limitation:** Currently only `write`/`MessagesWrite`/
+    /// `messages:write` and `read`/`MessagesRead`/`messages:read` are
+    /// enforced. Other capability names are logged as unknown and ignored.
+    /// Adding new enforced capabilities requires extending the match arms
+    /// in `enforce_capability_suspension` in `governance.rs`.
     CapabilitySuspension(Vec<String>),
 
-    /// Revoke all access for the subject (effectively remove from context).
+    /// Revoke all access for the subject (application-level enforcement).
+    ///
+    /// This blocks read and write at the `send_message`/`deliver_incoming`
+    /// gates but does **not** perform cryptographic exclusion (MLS group
+    /// removal + sender key rotation). For full cryptographic exclusion,
+    /// dispatch a `RemoveMember` governance action instead.
     AccessRevocation,
 
     /// Demote the subject to a specified role.

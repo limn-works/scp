@@ -162,12 +162,16 @@ impl ContextManager {
         )
         .await;
 
-        // Cancel governance timeout task and emit appropriate event
-        // (lock acquired, then dropped).
+        // Cancel governance timeout task, decay standing, and emit appropriate
+        // event (lock acquired, then dropped).
         {
             let mut contexts = self.contexts.lock().await;
             if let Some(ctx) = contexts.get_mut(&context_id) {
                 ctx.governance.timeout_task.cancel();
+                // Standing decay on TTL expiry (#1530): clear participation
+                // cache and cooldown state so stale standing data does not
+                // carry over if the context is later restored.
+                ctx.governance.decay_standing();
                 if result.is_complete() {
                     ctx.receive_buffer.push(ContextEvent::Expired);
                 } else {
