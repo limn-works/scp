@@ -1164,10 +1164,35 @@ mod tests {
         }
     }
 
+    /// Dummy token with a valid `SpendingCapability` in the fct field.
+    fn dummy_spending_token() -> UcanToken {
+        let cap = sample_capability();
+        let mut fct = serde_json::Map::new();
+        fct.insert(
+            SPENDING_CAPABILITY_FACT_KEY.to_owned(),
+            cap.to_fact_value().unwrap(),
+        );
+        UcanToken {
+            header: super::super::UcanHeader::new(),
+            payload: UcanPayload {
+                iss: "did:dht:z6MkHuman".to_owned(),
+                aud: "did:dht:z6MkAgent".to_owned(),
+                exp: 1_700_000_000,
+                nbf: None,
+                nnc: "1699999000000-aabbccdd11223344".to_owned(),
+                att: vec![],
+                prf: vec![],
+                fct: Some(serde_json::Value::Object(fct)),
+            },
+            signature: vec![0u8; 64],
+            encoded: String::new(),
+        }
+    }
+
     #[test]
     fn and_composition_both_present_paid_action() {
         let action = dummy_token();
-        let spending = dummy_token();
+        let spending = dummy_spending_token();
         let result =
             check_and_composition(Some(&action), Some(&spending), Amount(100), "send message");
         assert!(result.is_ok());
@@ -1189,24 +1214,27 @@ mod tests {
     }
 
     #[test]
-    fn and_composition_no_action_ucan() {
-        let spending = dummy_token();
+    fn and_composition_no_action_ucan_with_spending() {
+        // action_ucan=None means "already verified". With a valid spending
+        // UCAN, paid actions should succeed.
+        let spending = dummy_spending_token();
         let result = check_and_composition(None, Some(&spending), Amount(100), "send message");
-        let err = result.unwrap_err();
-        assert!(matches!(
-            err,
-            SpendingError::Ucan(UcanError::CapabilityNotGranted(_))
-        ));
+        assert!(result.is_ok());
     }
 
     #[test]
-    fn and_composition_no_action_no_spending() {
+    fn and_composition_no_action_no_spending_paid() {
+        // Paid action with no spending UCAN should fail.
         let result = check_and_composition(None, None, Amount(100), "send message");
         let err = result.unwrap_err();
-        assert!(matches!(
-            err,
-            SpendingError::Ucan(UcanError::CapabilityNotGranted(_))
-        ));
+        assert!(matches!(err, SpendingError::SpendingCapabilityRequired(_)));
+    }
+
+    #[test]
+    fn and_composition_no_action_no_spending_free() {
+        // Free action with no UCANs should succeed.
+        let result = check_and_composition(None, None, Amount::ZERO, "free action");
+        assert!(result.is_ok());
     }
 
     // -----------------------------------------------------------------------

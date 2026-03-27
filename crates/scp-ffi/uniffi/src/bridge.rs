@@ -3227,7 +3227,7 @@ pub async fn context_send(
             // Parse optional spending UCAN JWT into a UcanToken for AND-composition.
             let spending_ucan = spending_ucan_jwt
                 .as_deref()
-                .map(scp_protocol::crypto::ucan::validate::parse_ucan)
+                .map(scp_core::crypto::ucan::validate::parse_ucan)
                 .transpose()
                 .map_err(|e| ScpError::Context {
                     msg: format!("invalid spending UCAN: {e}"),

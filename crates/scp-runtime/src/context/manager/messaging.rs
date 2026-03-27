@@ -18,12 +18,16 @@ use super::{
 /// Checks sender velocity, evaluates cost from the context's economic
 /// policy, enforces spending UCAN AND-composition (spec §19.5) when cost > 0,
 /// and records spend against the sender's budget.
+///
+/// Returns the deducted cost (if any) so that the caller can pass the exact
+/// amount to `rollback_send_budget` on failure, avoiding re-evaluation
+/// which could produce a different amount due to changed metrics.
 fn enforce_send_economy(
     ctx: &mut PerContextState,
     sender_did: &DID,
     now: u64,
     spending_ucan: Option<&scp_protocol::crypto::ucan::UcanToken>,
-) -> Result<(), ContextError> {
+) -> Result<Option<scp_protocol::economy::types::Amount>, ContextError> {
     if let Some(ref policy) = ctx.governance.economic_policy {
         let velocity = ctx
             .governance
@@ -61,13 +65,12 @@ fn enforce_send_economy(
                         "SCP-ECON-7060: paid action requires spending UCAN".to_owned(),
                     ));
                 }
-                // Validate AND-composition: action UCAN is implicitly present
-                // (MessagesWrite capability was already checked), so pass Some
-                // for action_ucan. The spending UCAN is the caller's.
-                // We construct a minimal action_ucan reference: the capability
-                // check already passed, so we only need a non-None value.
+                // Validate AND-composition: the action capability (MessagesWrite)
+                // was already verified earlier in the flow, so action_ucan is
+                // None (meaning "already verified"). Only the spending UCAN
+                // needs validation here.
                 scp_protocol::crypto::ucan::spending::check_and_composition(
-                    spending_ucan, // action UCAN: re-use spending as a non-None witness
+                    None, // action UCAN: already verified (MessagesWrite check above)
                     spending_ucan,
                     scp_protocol::crypto::ucan::spending::Amount(cost.0),
                     "messages:write",
@@ -75,14 +78,13 @@ fn enforce_send_economy(
                 .map_err(|e| ContextError::PermissionDenied(format!("SCP-ECON-7061: {e}")))?;
             }
 
-            // Auto-grant unlimited budget on first spend if no governance-approved
-            // budget exists. This prevents NoBudget errors for new members while
-            // still allowing governance to cap spending via ApproveSpend.
+            // Auto-grant the exact action cost on first spend if no
+            // governance-approved budget exists. This lets the member
+            // complete this one action but requires governance approval
+            // (ApproveSpend) for further spending. Granting u64::MAX would
+            // bypass all budget governance.
             if !ctx.governance.budget_tracker.has_budget(sender_did) {
-                ctx.governance.budget_tracker.grant(
-                    sender_did,
-                    scp_protocol::economy::types::Amount::new(u64::MAX),
-                );
+                ctx.governance.budget_tracker.grant(sender_did, cost);
             }
             ctx.governance
                 .budget_tracker
@@ -90,9 +92,10 @@ fn enforce_send_economy(
                 .map_err(|e| {
                     ContextError::PermissionDenied(format!("SCP-ECON-7010: budget exceeded: {e}"))
                 })?;
+            return Ok(Some(cost));
         }
     }
-    Ok(())
+    Ok(None)
 }
 
 /// Updates the relay base price based on current context utilization (#1537).
@@ -364,7 +367,7 @@ impl ContextManager {
         let context_id = handle.context_id().to_owned();
         let context_id_bytes = context_id_to_bytes(&context_id);
         let routing_id = scp_protocol::context::context_routing_id(&context_id);
-        let (broadcast_envelope, recipients_data, sequence, is_broadcast) = {
+        let (broadcast_envelope, recipients_data, sequence, is_broadcast, deducted_cost) = {
             let mut contexts = self.contexts.lock().await;
             let ctx = contexts
                 .get_mut(&context_id)
@@ -375,15 +378,21 @@ impl ContextManager {
                     "write access has been revoked for {sender_did}"
                 )));
             }
-            // Economy enforcement (#1537, #1593) — check cost + spending UCAN.
-            enforce_send_economy(ctx, sender_did, self.clock.now_secs(), spending_ucan)?;
+            let deducted_cost =
+                enforce_send_economy(ctx, sender_did, self.clock.now_secs(), spending_ucan)?;
             if let Some(ref mut bc) = ctx.broadcast_context {
                 let sk = signing_key.ok_or_else(|| {
                     ContextError::CryptoFailed("signing key required for broadcast publish".into())
                 })?;
-                let envelope =
+                let env =
                     build_broadcast_envelope(self.clock.as_ref(), bc, sender_did, payload, sk)?;
-                (Some(envelope), std::collections::HashMap::new(), 0, true)
+                (
+                    Some(env),
+                    std::collections::HashMap::new(),
+                    0,
+                    true,
+                    deducted_cost,
+                )
             } else {
                 if !ctx
                     .role_state
@@ -393,9 +402,7 @@ impl ContextManager {
                         "member {sender_did} does not have messages:write capability"
                     )));
                 }
-                // Assign sequence number under the lock (Phase 1) so the inner
-                // envelope carries the real sequence. SequenceTracker on the
-                // receive side rejects duplicates, so this must be consumed once.
+                // Assign sequence under lock — SequenceTracker rejects duplicates.
                 let seq = ctx
                     .membership
                     .next_sequence_number(sender_did)
@@ -409,49 +416,25 @@ impl ContextManager {
                     ctx.access.access_key_store.get_all(&context_id),
                     seq,
                     false,
+                    deducted_cost,
                 )
             }
         };
-        // Payment flow (#1537): execute 9-step payment for message sends.
-        // If payment fails, roll back the budget deducted in Phase 1.
-        self.execute_send_payment(&context_id, sender_did).await?;
-
-        // Phase 2 (no lock): Encrypt + send.
-        // If encryption or transport fails, roll back the sequence number
-        // consumed in Phase 1 so it is not permanently burned (#1420).
-        let phase2_result = (|| -> Result<(), ContextError> {
-            let encrypted = if let Some(envelope) = broadcast_envelope {
-                rmp_serde::to_vec_named(&envelope).map_err(|e| {
-                    ContextError::CryptoFailed(format!("envelope serialization: {e}"))
-                })?
-            } else {
-                let encrypt_start = std::time::Instant::now();
-                let sk = signing_key.ok_or_else(|| {
-                    ContextError::CryptoFailed("signing key required for encrypted send".into())
-                })?;
-                let result = build_encrypted_envelope(
-                    self,
-                    &context_id,
-                    sender_did,
-                    payload,
-                    sk,
-                    &recipients_data,
-                    sequence,
-                    source_provenance,
-                )?;
-                crate::metrics::record_encrypt_duration(encrypt_start.elapsed());
-                result
-            };
-            self.transport.send_message(&routing_id, &encrypted)?;
-            crate::metrics::record_message_sent();
-            Ok(())
-        })();
-
+        self.execute_send_payment(&context_id, sender_did, deducted_cost)
+            .await?;
+        // Phase 2: encrypt + send (no lock held).
+        let phase2_result = self.encrypt_and_send(
+            broadcast_envelope,
+            signing_key,
+            &context_id,
+            sender_did,
+            payload,
+            &recipients_data,
+            sequence,
+            source_provenance,
+            &routing_id,
+        );
         if let Err(e) = phase2_result {
-            // Only roll back sequence numbers for the encrypted path —
-            // broadcast contexts manage their own sequence numbering via
-            // BroadcastContext::publish and do not consume from the
-            // membership-level SequenceTracker.
             if !is_broadcast {
                 let mut contexts = self.contexts.lock().await;
                 if let Some(ctx) = contexts.get_mut(&context_id) {
@@ -460,7 +443,6 @@ impl ContextManager {
             }
             return Err(e);
         }
-        // Phase 3: push MessageSent event + persist.
         self.finalize_send(
             &context_id,
             &context_id_bytes,
@@ -471,16 +453,57 @@ impl ContextManager {
         .await
     }
 
-    /// Executes the 9-step payment flow for message sends with budget rollback.
+    /// Encrypts the payload and sends it via transport (Phase 2 of `send_message`).
     ///
-    /// Runs between Phase 1 (lock) and Phase 2 (encrypt) — outside the lock.
-    /// Only triggers when a payment adapter is configured AND cost > 0.
-    /// Budget enforcement already happened in `enforce_send_economy` above.
-    /// If payment fails, rolls back the budget deducted in Phase 1.
+    /// Extracted to keep `send_message` within the clippy `too_many_lines` limit.
+    #[allow(clippy::too_many_arguments)]
+    fn encrypt_and_send(
+        &self,
+        broadcast_envelope: Option<scp_protocol::crypto::sender_keys::broadcast::BroadcastEnvelope>,
+        signing_key: Option<&ed25519_dalek::SigningKey>,
+        context_id: &str,
+        sender_did: &DID,
+        payload: &[u8],
+        recipients_data: &std::collections::HashMap<
+            String,
+            scp_protocol::crypto::access_keys::AccessKey,
+        >,
+        sequence: u64,
+        source_provenance: Option<&scp_protocol::provenance::attach::SourceContextInfo>,
+        routing_id: &[u8; 32],
+    ) -> Result<(), ContextError> {
+        let encrypted = if let Some(envelope) = broadcast_envelope {
+            rmp_serde::to_vec_named(&envelope)
+                .map_err(|e| ContextError::CryptoFailed(format!("envelope serialization: {e}")))?
+        } else {
+            let encrypt_start = std::time::Instant::now();
+            let sk = signing_key.ok_or_else(|| {
+                ContextError::CryptoFailed("signing key required for encrypted send".into())
+            })?;
+            let result = build_encrypted_envelope(
+                self,
+                context_id,
+                sender_did,
+                payload,
+                sk,
+                recipients_data,
+                sequence,
+                source_provenance,
+            )?;
+            crate::metrics::record_encrypt_duration(encrypt_start.elapsed());
+            result
+        };
+        self.transport.send_message(routing_id, &encrypted)?;
+        crate::metrics::record_message_sent();
+        Ok(())
+    }
+
+    /// Executes the 9-step payment flow for message sends with budget rollback.
     async fn execute_send_payment(
         &self,
         context_id: &str,
         sender_did: &DID,
+        deducted_cost: Option<scp_protocol::economy::types::Amount>,
     ) -> Result<(), ContextError> {
         if let Err(payment_err) = self
             .execute_paid_action(
@@ -490,42 +513,28 @@ impl ContextManager {
             )
             .await
         {
-            self.rollback_send_budget(context_id, sender_did).await;
+            self.rollback_send_budget(context_id, sender_did, deducted_cost)
+                .await;
             return Err(payment_err);
         }
         Ok(())
     }
 
-    /// Restores the budget deducted by `enforce_send_economy` when the
-    /// payment flow fails after budget deduction.
+    /// Restores the exact amount deducted by `enforce_send_economy`.
     ///
-    /// Re-evaluates the cost from the economic policy (same formula as
-    /// `enforce_send_economy`) and grants it back to the sender. This is
-    /// best-effort: if the context is no longer registered or has no
-    /// economic policy, the rollback is silently skipped.
-    async fn rollback_send_budget(&self, context_id: &str, sender_did: &DID) {
-        let mut contexts = self.contexts.lock().await;
-        if let Some(ctx) = contexts.get_mut(context_id)
-            && let Some(ref policy) = ctx.governance.economic_policy
-        {
-            let velocity = ctx
-                .governance
-                .velocity_tracker
-                .get_velocity(sender_did, self.clock.now_secs());
-            let now_secs = self.clock.now_secs();
-            let metrics = scp_protocol::economy::policy::ObservableMetrics {
-                sender_velocity: velocity,
-                member_count: u64::try_from(ctx.membership.count()).unwrap_or(u64::MAX),
-                context_message_rate: ctx.governance.velocity_tracker.aggregate_velocity(now_secs),
-                relay_queue_depth: 0, // relay-level telemetry (see enforce_send_economy)
-                time_of_day: now_secs % 86400,
-                storage_usage: 0, // storage provider metrics (see enforce_send_economy)
-            };
-            if let Some(cost) = scp_protocol::economy::policy::evaluate_cost(
-                policy,
-                &scp_protocol::economy::types::PaidActionType::MessageSend,
-                &metrics,
-            ) {
+    /// The `deducted_cost` parameter is the value returned by
+    /// `enforce_send_economy`. Using the stored cost avoids re-evaluating
+    /// the pricing formula (which could produce a different amount due to
+    /// changed metrics between the deduction and the rollback).
+    async fn rollback_send_budget(
+        &self,
+        context_id: &str,
+        sender_did: &DID,
+        deducted_cost: Option<scp_protocol::economy::types::Amount>,
+    ) {
+        if let Some(cost) = deducted_cost {
+            let mut contexts = self.contexts.lock().await;
+            if let Some(ctx) = contexts.get_mut(context_id) {
                 ctx.governance.budget_tracker.grant(sender_did, cost);
             }
         }

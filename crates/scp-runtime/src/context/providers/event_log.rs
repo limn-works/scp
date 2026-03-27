@@ -95,19 +95,27 @@ impl ContextLog {
 
 /// Computes the SHA-256 hash for an event log entry.
 ///
-/// Hash input: `"SCP-EXPORT-ENTRY:" || event_bytes || actor_did_bytes || timestamp_be_bytes || prev_hash`
+/// Hash input: `"SCP-EXPORT-ENTRY-V2:" || len(event) || event || len(actor_did) || actor_did || timestamp || prev_hash`
 ///
-/// Uses big-endian for the timestamp to match codebase convention, and a
-/// domain separator to prevent cross-protocol hash confusion.
+/// Uses big-endian u32 length prefixes before variable-length fields to
+/// prevent length-extension ambiguity (e.g., event="AB" + actor="CD" vs
+/// event="ABC" + actor="D" producing the same hash). The domain separator
+/// was bumped from V1 to V2 when length prefixes were added.
 fn compute_entry_hash(
     event: &str,
     actor_did: &str,
     timestamp: u64,
     prev_hash: &[u8; 32],
 ) -> [u8; 32] {
+    // Event names and DID strings are always well under u32::MAX bytes.
+    // Saturating conversion is used to satisfy clippy::cast_possible_truncation.
+    let event_len = u32::try_from(event.len()).unwrap_or(u32::MAX);
+    let actor_len = u32::try_from(actor_did.len()).unwrap_or(u32::MAX);
     let mut hasher = Sha256::new();
-    hasher.update(b"SCP-EXPORT-ENTRY:");
+    hasher.update(b"SCP-EXPORT-ENTRY-V2:");
+    hasher.update(event_len.to_be_bytes());
     hasher.update(event.as_bytes());
+    hasher.update(actor_len.to_be_bytes());
     hasher.update(actor_did.as_bytes());
     hasher.update(timestamp.to_be_bytes());
     hasher.update(prev_hash);
@@ -1402,8 +1410,9 @@ mod tests {
         );
     }
 
-    /// Domain separator "SCP-EXPORT-ENTRY:" is present in hash computation.
-    /// Verified by computing the hash manually and comparing.
+    /// Domain separator "SCP-EXPORT-ENTRY-V2:" and length prefixes are
+    /// present in hash computation. Verified by computing the hash manually
+    /// and comparing.
     #[test]
     fn domain_separator_present_in_hash() {
         use sha2::{Digest, Sha256};
@@ -1416,17 +1425,21 @@ mod tests {
         // Compute with the function.
         let hash = compute_entry_hash(event, actor_did, timestamp, &prev_hash);
 
-        // Compute manually WITH domain separator.
+        // Compute manually WITH V2 domain separator and length prefixes.
+        let event_len = u32::try_from(event.len()).unwrap();
+        let actor_len = u32::try_from(actor_did.len()).unwrap();
         let mut hasher = Sha256::new();
-        hasher.update(b"SCP-EXPORT-ENTRY:");
+        hasher.update(b"SCP-EXPORT-ENTRY-V2:");
+        hasher.update(event_len.to_be_bytes());
         hasher.update(event.as_bytes());
+        hasher.update(actor_len.to_be_bytes());
         hasher.update(actor_did.as_bytes());
         hasher.update(timestamp.to_be_bytes());
         hasher.update(prev_hash);
         let expected: [u8; 32] = hasher.finalize().into();
         assert_eq!(
             hash, expected,
-            "hash must match manual computation with domain separator"
+            "hash must match manual computation with V2 domain separator and length prefixes"
         );
 
         // Compute manually WITHOUT domain separator — must NOT match.

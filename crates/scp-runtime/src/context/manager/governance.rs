@@ -76,6 +76,13 @@ fn enforce_role_demotion(
 /// results. For callers that need the evaluate step visible in their own
 /// file (pipeline wiring gates), use [`evaluate_consequence_rules`] +
 /// [`enforce_triggered_consequences`] directly.
+///
+/// **Known limitation:** Time-based consequences (rules that should trigger
+/// after a duration of inactivity) require a dedicated periodic evaluation
+/// timer. Currently, consequences are only evaluated when an action occurs
+/// (send, join, tool invoke, governance). A member who stops participating
+/// entirely will not trigger inactivity-based consequences until their
+/// next action or the governance timeout task processes them. See #1600.
 pub(super) fn dispatch_consequences(
     ctx: &mut PerContextState,
     context_id: &str,
@@ -136,7 +143,9 @@ pub(super) fn enforce_triggered_consequences(
                 "RoleDemotion"
             }
         };
-        let trigger_type = format!("{:?}", consequence.action);
+        let trigger_type = rules
+            .get(consequence.rule_index)
+            .map_or_else(|| "Unknown".to_owned(), |r| format!("{:?}", r.trigger));
         ctx.receive_buffer.push(ContextEvent::ConsequenceTriggered {
             context_id: context_id.to_owned(),
             member_did: member_did.clone(),
@@ -165,9 +174,10 @@ pub(super) fn enforce_triggered_consequences(
 
         // Record cooldown: prevent re-firing within the rule's window.
         if let Some(rule) = rules.get(consequence.rule_index) {
-            ctx.governance
-                .cooldown_until
-                .insert(consequence.rule_index, now + rule.window.as_secs());
+            ctx.governance.cooldown_until.insert(
+                consequence.rule_index,
+                now.saturating_add(rule.window.as_secs()),
+            );
         }
 
         ctx.receive_buffer.push(ContextEvent::ConsequenceEnforced {
@@ -225,8 +235,18 @@ pub(super) fn event_log_entries_for_consequences(
                 "MemberJoined" => scp_event_log::EventType::MemberJoined,
                 "MemberLeft" => scp_event_log::EventType::MemberLeft,
                 "RoleAssigned" => scp_event_log::EventType::RoleAssigned,
-                "ToolInvoked" => scp_event_log::EventType::ToolInvoked,
-                "GovernanceAction" => scp_event_log::EventType::GovernanceAction,
+                "ToolRegistered" | "ToolRemoved" | "ToolInvoked" => {
+                    scp_event_log::EventType::ToolInvoked
+                }
+                "GovernanceAction"
+                | "GovernanceProposalCreated"
+                | "GovernanceVoteCast"
+                | "GovernanceVoteWithdrawn"
+                | "GovernanceProposalResolved"
+                | "GovernanceDeadlockRecovery"
+                | "GovernanceConflictDetected"
+                | "GovernanceConflictResolved"
+                | "GovernanceActionExecuted" => scp_event_log::EventType::GovernanceAction,
                 _ => continue, // Skip event types not relevant to consequence evaluation
             };
             events.push(scp_event_log::Event {
@@ -260,6 +280,13 @@ pub(super) fn event_log_entries_for_consequences(
             ContextEvent::MemberJoined { member_did, .. } => {
                 (scp_event_log::EventType::MemberJoined, member_did.clone())
             }
+            ContextEvent::MemberLeft { member_did } => {
+                (scp_event_log::EventType::MemberLeft, member_did.clone())
+            }
+            ContextEvent::GovernanceActionExecuted { executor_did, .. } => (
+                scp_event_log::EventType::GovernanceAction,
+                executor_did.clone(),
+            ),
             _ => continue,
         };
         // Oldest event gets `now - (buffer_len - 1)`, newest gets `now`.

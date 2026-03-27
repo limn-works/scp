@@ -547,19 +547,24 @@ impl super::receipt::PaymentVerifierDyn for AdapterAsVerifier<'_> {
 }
 
 // ---------------------------------------------------------------------------
-// NoOpPaymentAdapter — used for governance actions that wire the payment
-// flow but don't have a real adapter injected.
+// NoOpPaymentAdapter — test-only no-op implementation.
 // ---------------------------------------------------------------------------
 
 /// A no-op payment adapter that authorizes zero-cost actions and returns
 /// dummy receipts for non-zero actions.
 ///
-/// Used in the governance dispatch path to wire the [`prepare_paid_action`]
-/// call without requiring real payment infrastructure. Free actions (cost=0)
-/// bypass the adapter entirely (handled by `prepare_paid_action`). Non-zero
-/// actions will be authorized with a dummy authorization that always succeeds.
+/// Used in tests and the governance dispatch path to wire the
+/// [`prepare_paid_action`] call without requiring real payment
+/// infrastructure. Free actions (cost=0) bypass the adapter entirely
+/// (handled by `prepare_paid_action`). Non-zero actions will be authorized
+/// with a dummy authorization that always succeeds.
+///
+/// Gated behind `#[cfg(any(test, feature = "testing"))]` to prevent
+/// accidental use in production code.
+#[cfg(any(test, feature = "testing"))]
 pub struct NoOpPaymentAdapter;
 
+#[cfg(any(test, feature = "testing"))]
 #[allow(clippy::unnecessary_literal_bound, clippy::similar_names)]
 impl PaymentAdapter for NoOpPaymentAdapter {
     fn adapter_id(&self) -> &str {

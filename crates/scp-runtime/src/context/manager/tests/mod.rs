@@ -71,14 +71,43 @@ pub(super) async fn test_custody_from_seed(
 // Dummy UCAN for economy tests
 // -----------------------------------------------------------------------
 
-/// Returns a minimal [`UcanToken`] suitable for tests that need a spending
+/// Returns a [`UcanToken`] with a generous default [`SpendingCapability`]
+/// embedded in the `fct` field, suitable for tests that need a spending
 /// UCAN to pass the AND-composition gate (spec §19.5, #1593).
 ///
 /// This token is structurally valid but not cryptographically signed.
-/// The `check_and_composition` function only checks `Some` vs `None`,
-/// so this suffices for unit tests. Positive-path testing with a real
-/// signed JWT requires UCAN test fixtures (not yet built).
+/// `check_and_composition` extracts `SpendingCapability` from the `fct`
+/// field and validates `action_cost <= max_per_action` and currency match.
+/// The default capability grants up to `u64::MAX` per action in USD —
+/// effectively unlimited, since most tests only care about the UCAN's
+/// presence, not the spending limit.
+///
+/// For tests that need to exercise specific spending limits, use
+/// [`dummy_spending_ucan_with_cap`].
 pub(super) fn dummy_spending_ucan() -> UcanToken {
+    dummy_spending_ucan_with_cap(u64::MAX, u64::MAX)
+}
+
+/// Returns a [`UcanToken`] with a real [`SpendingCapability`] embedded in
+/// the `fct` field for tests that exercise paid actions.
+///
+/// The capability grants up to `max_per_action` per single action and
+/// `max_total` within a 1-hour window, in USD.
+#[allow(dead_code)] // Test utility — will be used by future paid-action tests.
+pub(super) fn dummy_spending_ucan_with_cap(max_per_action: u64, max_total: u64) -> UcanToken {
+    use scp_protocol::crypto::ucan::spending::{Amount, CurrencyCode, SpendingCapability};
+    let cap = SpendingCapability {
+        max_per_action: Amount(max_per_action),
+        max_total: Amount(max_total),
+        currency: CurrencyCode::from_code("USD").unwrap_or(CurrencyCode(*b"USD\0")),
+        time_window: std::time::Duration::from_secs(3600),
+        allowed_adapters: vec![],
+    };
+    let mut fct = serde_json::Map::new();
+    fct.insert(
+        "spending_capability".to_owned(),
+        cap.to_fact_value().unwrap_or(serde_json::Value::Null),
+    );
     UcanToken {
         header: scp_protocol::crypto::ucan::UcanHeader::new(),
         payload: scp_protocol::crypto::ucan::UcanPayload {
@@ -89,7 +118,7 @@ pub(super) fn dummy_spending_ucan() -> UcanToken {
             nnc: "test-nonce".to_owned(),
             att: vec![],
             prf: vec![],
-            fct: None,
+            fct: Some(serde_json::Value::Object(fct)),
         },
         signature: vec![],
         encoded: "test.spending.ucan".to_owned(),
