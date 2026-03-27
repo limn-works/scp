@@ -1907,6 +1907,13 @@ pub async fn context_execute_governance_action(
         })
     })?;
 
+    scp_ffi_common::validate::validate_governance_action_strings(&action).map_err(|e| {
+        NapiError::from(ScpNapiError::Validation {
+            message: format!("{e}"),
+            code: "SCP-CTX-2040".to_owned(),
+        })
+    })?;
+
     let action_name = action.variant_name();
 
     // Generate a random proposal ID (32 bytes).
@@ -2069,7 +2076,7 @@ pub async fn context_governance_propose(
         })
     })?;
 
-    validate_governance_action_strings(&action).map_err(|e| {
+    scp_ffi_common::validate::validate_governance_action_strings(&action).map_err(|e| {
         NapiError::from(ScpNapiError::Validation {
             message: format!("{e}"),
             code: "SCP-CTX-2040".to_owned(),
@@ -2128,13 +2135,6 @@ pub async fn context_governance_propose(
 
     #[allow(unreachable_code)]
     Ok(String::new())
-}
-
-/// Validates all user-controlled string fields on a governance action.
-fn validate_governance_action_strings(
-    action: &GovernanceAction,
-) -> Result<(), scp_ffi_common::validate::ValidationError> {
-    scp_ffi_common::validate::validate_governance_action_strings(action)
 }
 
 /// Casts an approval vote on a pending governance proposal.

@@ -1774,6 +1774,8 @@ fn py_governance_execute(handle: &PyContextHandle, proposal_json: &str) -> PyRes
             serde_json::from_str(&proposal_json_owned).map_err(|e| {
                 PyValueError::new_err(format!("invalid governance proposal JSON: {e}"))
             })?;
+        validate_governance_action_strings(&proposal.action)
+            .map_err(|e| PyValueError::new_err(format!("SCP-CTX-2040: {e}")))?;
         let action_name = proposal.action.variant_name();
         let result = mgr
             .execute_governance_action(&context_id, &proposal)
@@ -4830,8 +4832,9 @@ mod tests {
 
     #[test]
     fn context_description_with_control_chars_rejected() {
-        use crate::validate::validate_context_description;
-        let err = validate_context_description("A context\x00with null bytes").unwrap_err();
+        let err =
+            scp_ffi_common::validate::validate_context_description("A context\x00with null bytes")
+                .unwrap_err();
         assert!(
             err.to_string().contains("control character"),
             "expected control char rejection, got: {err}"
@@ -4840,8 +4843,8 @@ mod tests {
 
     #[test]
     fn context_name_with_script_tag_rejected() {
-        use crate::validate::validate_context_name;
-        let err = validate_context_name("<script>alert(1)</script>").unwrap_err();
+        let err = scp_ffi_common::validate::validate_context_name("<script>alert(1)</script>")
+            .unwrap_err();
         assert!(
             err.to_string().contains("HTML-special character"),
             "expected HTML-special rejection, got: {err}"

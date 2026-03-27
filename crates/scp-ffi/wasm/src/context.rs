@@ -662,6 +662,14 @@ pub fn context_execute_governance(
             .into_js()
         })?;
 
+        scp_ffi_common::validate::validate_governance_action_strings(&action).map_err(|e| {
+            ScpWasmError::Validation {
+                message: format!("{e}"),
+                code: "SCP-CTX-2040".to_owned(),
+            }
+            .into_js()
+        })?;
+
         let result = with_manager(|mgr| {
             mgr.execute_governance_action(&context_id, &initiator_did, &proposal_id, &action)
         })
@@ -737,7 +745,7 @@ pub fn context_governance_propose(
             .into_js()
         })?;
 
-        validate_governance_action_strings(&action).map_err(|e| {
+        scp_ffi_common::validate::validate_governance_action_strings(&action).map_err(|e| {
             ScpWasmError::Validation {
                 message: format!("{e}"),
                 code: "SCP-CTX-2040".to_owned(),
@@ -760,13 +768,6 @@ pub fn context_governance_propose(
 
         Ok(JsValue::from_str(&json_str))
     })
-}
-
-/// Validates all user-controlled string fields on a governance action.
-fn validate_governance_action_strings(
-    action: &GovernanceAction,
-) -> Result<(), scp_ffi_common::validate::ValidationError> {
-    scp_ffi_common::validate::validate_governance_action_strings(action)
 }
 
 /// Casts an approval vote on a pending governance proposal.

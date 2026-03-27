@@ -495,133 +495,74 @@ pub fn validate_transport_mode(mode: &str) -> Result<(), ValidationError> {
 }
 
 // ---------------------------------------------------------------------------
-// Role name validation (§5.9, #1601)
+// User-controlled string validation (§9.1A, #1601)
 // ---------------------------------------------------------------------------
 
-/// Validates a role name string.
-///
-/// Role names appear in governance actions (`AddMember`, `ChangeRole`,
-/// `RoleDemotion`) and are serialized into governance events visible to
-/// SDK consumers and UIs. Validation enforces:
-/// - Non-empty
-/// - Length <= [`MAX_ROLE_NAME_LEN`] (256 bytes)
-/// - No control characters
-/// - No HTML-special characters (`<`, `>`, `&`, `"`, `'`)
+/// Validates a user-controlled string field: non-empty, within length limit,
+/// no control characters (U+0000–U+001F, U+007F–U+009F), no HTML-special
+/// characters (`<`, `>`, `&`, `"`, `'`).
+fn validate_user_string(
+    value: &str,
+    field_name: &str,
+    max_len: usize,
+) -> Result<(), ValidationError> {
+    validate_non_empty(value, field_name, max_len)?;
+    reject_control_chars(value, field_name)?;
+    reject_html_special_chars(value, field_name)?;
+    Ok(())
+}
+
+/// Validates a role name (governance actions, role definitions). Max 256 bytes.
 ///
 /// # Errors
 ///
-/// Returns [`ValidationError`] if the role name is empty, too long,
-/// contains control characters, or contains HTML-special characters.
+/// Returns [`ValidationError`] per [`validate_user_string`] rules.
 pub fn validate_role_name(role: &str) -> Result<(), ValidationError> {
-    validate_non_empty(role, "role name", MAX_ROLE_NAME_LEN)?;
-    reject_control_chars(role, "role name")?;
-    reject_html_special_chars(role, "role name")?;
-    Ok(())
+    validate_user_string(role, "role name", MAX_ROLE_NAME_LEN)
 }
 
-// ---------------------------------------------------------------------------
-// Context name validation (§5.9, #1601)
-// ---------------------------------------------------------------------------
-
-/// Validates a context name string.
-///
-/// Context names are displayed in UIs and appear in context metadata.
-/// Validation enforces:
-/// - Non-empty
-/// - Length <= [`MAX_CONTEXT_NAME_LEN`] (256 bytes)
-/// - No control characters
-/// - No HTML-special characters (`<`, `>`, `&`, `"`, `'`)
+/// Validates a context name (context metadata). Max 256 bytes.
 ///
 /// # Errors
 ///
-/// Returns [`ValidationError`] if the context name is empty, too long,
-/// contains control characters, or contains HTML-special characters.
+/// Returns [`ValidationError`] per [`validate_user_string`] rules.
 pub fn validate_context_name(name: &str) -> Result<(), ValidationError> {
-    validate_non_empty(name, "context name", MAX_CONTEXT_NAME_LEN)?;
-    reject_control_chars(name, "context name")?;
-    reject_html_special_chars(name, "context name")?;
-    Ok(())
+    validate_user_string(name, "context name", MAX_CONTEXT_NAME_LEN)
 }
 
-// ---------------------------------------------------------------------------
-// Context description validation (§5.9, #1601)
-// ---------------------------------------------------------------------------
-
-/// Validates a context description string.
-///
-/// Context descriptions are displayed in UIs and appear in context metadata.
-/// Validation enforces:
-/// - Non-empty
-/// - Length <= [`MAX_CONTEXT_DESCRIPTION_LEN`] (4096 bytes)
-/// - No control characters
-/// - No HTML-special characters (`<`, `>`, `&`, `"`, `'`)
+/// Validates a context description (context metadata). Max 4096 bytes.
 ///
 /// # Errors
 ///
-/// Returns [`ValidationError`] if the description is empty, too long,
-/// contains control characters, or contains HTML-special characters.
+/// Returns [`ValidationError`] per [`validate_user_string`] rules.
 pub fn validate_context_description(description: &str) -> Result<(), ValidationError> {
-    validate_non_empty(
+    validate_user_string(
         description,
         "context description",
         MAX_CONTEXT_DESCRIPTION_LEN,
-    )?;
-    reject_control_chars(description, "context description")?;
-    reject_html_special_chars(description, "context description")?;
-    Ok(())
+    )
 }
 
-// ---------------------------------------------------------------------------
-// Governance action reason/purpose validation (#1601)
-// ---------------------------------------------------------------------------
-
-/// Validates a governance action reason or purpose string.
-///
-/// Free-text reason/purpose fields on governance actions (e.g.,
-/// `RemoveMember.reason`, `ApproveSpend.purpose`, `ProposeContextMigration.reason`).
-/// Validation enforces:
-/// - Non-empty
-/// - Length <= [`MAX_GOVERNANCE_REASON_LEN`] (4096 bytes)
-/// - No control characters
-/// - No HTML-special characters (`<`, `>`, `&`, `"`, `'`)
+/// Validates a governance action reason or purpose string. Max 4096 bytes.
 ///
 /// # Errors
 ///
-/// Returns [`ValidationError`] if the reason is empty, too long,
-/// contains control characters, or contains HTML-special characters.
+/// Returns [`ValidationError`] per [`validate_user_string`] rules.
 pub fn validate_governance_reason(reason: &str) -> Result<(), ValidationError> {
-    validate_non_empty(reason, "governance reason", MAX_GOVERNANCE_REASON_LEN)?;
-    reject_control_chars(reason, "governance reason")?;
-    reject_html_special_chars(reason, "governance reason")?;
-    Ok(())
+    validate_user_string(reason, "governance reason", MAX_GOVERNANCE_REASON_LEN)
 }
 
-// ---------------------------------------------------------------------------
-// Payment adapter reference validation (§19.1, #1601)
-// ---------------------------------------------------------------------------
-
-/// Validates a payment adapter reference string.
-///
-/// Payment adapter refs identify payment adapters (e.g., "x402", "lightning",
-/// "stripe") and may be rendered in payment UIs. Validation enforces:
-/// - Non-empty
-/// - Length <= [`MAX_PAYMENT_ADAPTER_REF_LEN`] (256 bytes)
-/// - No control characters
-/// - No HTML-special characters (`<`, `>`, `&`, `"`, `'`)
+/// Validates a payment adapter reference (§19.1). Max 256 bytes.
 ///
 /// # Errors
 ///
-/// Returns [`ValidationError`] if the adapter ref is empty, too long,
-/// contains control characters, or contains HTML-special characters.
+/// Returns [`ValidationError`] per [`validate_user_string`] rules.
 pub fn validate_payment_adapter_ref(adapter_ref: &str) -> Result<(), ValidationError> {
-    validate_non_empty(
+    validate_user_string(
         adapter_ref,
         "payment adapter ref",
         MAX_PAYMENT_ADAPTER_REF_LEN,
-    )?;
-    reject_control_chars(adapter_ref, "payment adapter ref")?;
-    reject_html_special_chars(adapter_ref, "payment adapter ref")?;
-    Ok(())
+    )
 }
 
 // ---------------------------------------------------------------------------

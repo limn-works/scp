@@ -6947,6 +6947,11 @@ pub async fn governance_execute(
         .spawn(async move {
             let proposal: scp_core::context::governance::GovernanceProposal =
                 serde_json::from_str(&proposal_json)?;
+            scp_ffi_common::validate::validate_governance_action_strings(&proposal.action)
+                .map_err(|e| ScpError::Validation {
+                    msg: e.message,
+                    code: "SCP-CTX-2040".to_owned(),
+                })?;
             let action_name = proposal.action.variant_name();
             let manager = crate::runtime::context_manager()?;
             let result = manager
