@@ -35,6 +35,8 @@ use scp_platform::traits::KeyCustody;
 use scp_primitives::Clock;
 use tokio::sync::mpsc;
 
+use scp_ffi_common::html_escape_event_string;
+
 use crate::validate;
 
 // ---------------------------------------------------------------------------
@@ -1404,9 +1406,13 @@ fn convert_context_event(
         } => (
             "scp:system".to_owned(),
             format!(
-                "consequence_triggered:member={member_did},\
-                 rule={rule_index},trigger={trigger_type},\
-                 action={action_type},context={ctx_id}"
+                "consequence_triggered:member={},\
+                 rule={rule_index},trigger={},\
+                 action={},context={}",
+                html_escape_event_string(member_did.as_ref()),
+                html_escape_event_string(&trigger_type),
+                html_escape_event_string(&action_type),
+                html_escape_event_string(&ctx_id),
             )
             .into_bytes(),
             ts,
@@ -1419,9 +1425,12 @@ fn convert_context_event(
         } => (
             "scp:system".to_owned(),
             format!(
-                "consequence_enforced:member={member_did},\
-                 action={action_type},success={success},\
-                 context={ctx_id}"
+                "consequence_enforced:member={},\
+                 action={},success={success},\
+                 context={}",
+                html_escape_event_string(member_did.as_ref()),
+                html_escape_event_string(&action_type),
+                html_escape_event_string(&ctx_id),
             )
             .into_bytes(),
             ts,
@@ -1614,16 +1623,24 @@ fn build_core_context_params(
             scp_core::context::params::IncompleteVerificationPolicy::default(),
         min_protocol_version: py_params.min_protocol_version,
         migration_source: None,
-        consequence_rules: py_params
-            .consequence_rules
-            .as_deref()
-            .map(|cr_json| {
-                serde_json::from_str(cr_json).map_err(|e| {
-                    PyRuntimeError::new_err(format!("invalid consequence_rules JSON: {e}"))
+        consequence_rules: {
+            let parsed_consequence_rules: Vec<scp_core::trust::ConsequenceRule> = py_params
+                .consequence_rules
+                .as_deref()
+                .map(|cr_json| {
+                    serde_json::from_str(cr_json).map_err(|e| {
+                        PyRuntimeError::new_err(format!("invalid consequence_rules JSON: {e}"))
+                    })
                 })
-            })
-            .transpose()?
-            .unwrap_or_default(),
+                .transpose()?
+                .unwrap_or_default();
+            for rule in &parsed_consequence_rules {
+                rule.validate().map_err(|e| {
+                    PyRuntimeError::new_err(format!("consequence_rules validation failed: {e}"))
+                })?;
+            }
+            parsed_consequence_rules
+        },
     })
 }
 

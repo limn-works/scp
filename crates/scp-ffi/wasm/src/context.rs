@@ -11,6 +11,7 @@ use js_sys::Promise;
 use wasm_bindgen::prelude::*;
 use wasm_bindgen_futures::future_to_promise;
 
+use scp_ffi_common::html_escape_json;
 use scp_ffi_common::validate::validate_did;
 use scp_protocol::context::params::TemplateId;
 use scp_protocol::context::templates::{
@@ -610,7 +611,7 @@ pub fn context_drain_events(handle: &WasmContextHandle) -> String {
     for event in &mut json_events {
         serde_to_js_event(event);
     }
-    serde_json::to_string(&json_events).unwrap_or_else(|_| "[]".to_owned())
+    html_escape_json(&serde_json::to_string(&json_events).unwrap_or_else(|_| "[]".to_owned()))
 }
 
 // ---------------------------------------------------------------------------

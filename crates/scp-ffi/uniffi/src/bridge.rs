@@ -85,6 +85,7 @@ use uuid::Uuid;
 
 use scp_core::context::membership::KeyPackage;
 
+use scp_ffi_common::html_escape_event_string;
 use scp_ffi_common::validate::{
     json_value_type_name, validate_capability_uri, validate_context_id, validate_did,
     validate_mcp_handle, validate_relay_url, validate_tool_id, validate_tool_name,
@@ -8473,9 +8474,13 @@ fn format_context_event(event: &scp_core::context::membership::ContextEvent) -> 
             trigger_type,
             action_type,
         } => format!(
-            "consequence_triggered:member={member_did},\
-             rule={rule_index},trigger={trigger_type},\
-             action={action_type},context={context_id}"
+            "consequence_triggered:member={},\
+             rule={rule_index},trigger={},\
+             action={},context={}",
+            html_escape_event_string(member_did.as_ref()),
+            html_escape_event_string(trigger_type),
+            html_escape_event_string(action_type),
+            html_escape_event_string(context_id),
         ),
         ConsequenceEnforced {
             context_id,
@@ -8483,9 +8488,12 @@ fn format_context_event(event: &scp_core::context::membership::ContextEvent) -> 
             action_type,
             success,
         } => format!(
-            "consequence_enforced:member={member_did},\
-             action={action_type},success={success},\
-             context={context_id}"
+            "consequence_enforced:member={},\
+             action={},success={success},\
+             context={}",
+            html_escape_event_string(member_did.as_ref()),
+            html_escape_event_string(action_type),
+            html_escape_event_string(context_id),
         ),
         other => format!("{other:?}"),
     }
@@ -8825,6 +8833,12 @@ fn bridge_params_to_core(
         })
         .transpose()?
         .unwrap_or_default();
+    for rule in &consequence_rules {
+        rule.validate().map_err(|e| ScpError::Validation {
+            msg: format!("consequence_rules validation failed: {e}"),
+            code: "SCP-VALID-7000".to_owned(),
+        })?;
+    }
 
     Ok(scp_core::context::ContextParams {
         mode,
@@ -9257,6 +9271,12 @@ pub fn aggregate_trust_input(
             msg: format!("failed to parse consequence_rules JSON: {e}"),
             code: "SCP-VALID-7045".to_owned(),
         })?;
+    for rule in &consequence_rules {
+        rule.validate().map_err(|e| ScpError::Validation {
+            msg: format!("consequence_rules validation failed: {e}"),
+            code: "SCP-VALID-7045".to_owned(),
+        })?;
+    }
 
     let threshold_requirements: std::collections::HashMap<
         scp_core::trust::AttestationType,

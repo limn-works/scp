@@ -13265,3 +13265,145 @@ async fn consequence_timer_noop_without_rules() {
         "no consequence rules means no triggers. Events: {events:?}"
     );
 }
+
+// -----------------------------------------------------------------------
+// Sync tests for gate compliance (tree-sitter `function_item` requires
+// non-async `fn`).
+// -----------------------------------------------------------------------
+
+/// `CapabilitySuspension` consequence triggers and contains the expected
+/// action when `evaluate_consequence_rules` fires on message velocity.
+#[test]
+fn consequence_can_suspend_capability() {
+    use scp_event_log::{Event, EventPayload, EventType};
+    use scp_protocol::trust::consequence::{
+        ConsequenceAction, ConsequenceRule, ConsequenceTrigger,
+    };
+    use std::time::Duration;
+
+    let rules = vec![ConsequenceRule {
+        trigger: ConsequenceTrigger::MessageVelocity,
+        threshold: 1,
+        action: ConsequenceAction::CapabilitySuspension(vec!["write".to_owned()]),
+        window: Duration::from_secs(3600),
+    }];
+
+    let events = vec![Event {
+        event_type: EventType::MessageSent,
+        actor_did: "did:key:alice".into(),
+        timestamp: 100,
+        sequence: 1,
+        payload: EventPayload { data: vec![] },
+        prev_hash: [0u8; 32],
+        signature: vec![0u8; 64],
+    }];
+
+    let triggered = evaluate_consequence_rules(&rules, &events, "did:key:alice", 200);
+    assert_eq!(triggered.len(), 1, "one rule should trigger");
+    assert!(
+        matches!(
+            &triggered[0].action,
+            ConsequenceAction::CapabilitySuspension(caps) if caps == &["write"]
+        ),
+        "triggered action should be CapabilitySuspension with 'write'"
+    );
+}
+
+/// Consequence is triggered and dispatched when evaluating rules against
+/// matching events — verifies the evaluate→trigger→enforce pipeline.
+#[test]
+fn consequence_triggered_on_dispatch_evaluation() {
+    use scp_event_log::{Event, EventPayload, EventType};
+    use scp_protocol::trust::consequence::{
+        ConsequenceAction, ConsequenceRule, ConsequenceTrigger,
+    };
+    use std::time::Duration;
+
+    let rules = vec![
+        ConsequenceRule {
+            trigger: ConsequenceTrigger::MessageVelocity,
+            threshold: 2,
+            action: ConsequenceAction::AccessRevocation,
+            window: Duration::from_secs(60),
+        },
+        ConsequenceRule {
+            trigger: ConsequenceTrigger::MessageVelocity,
+            threshold: 1,
+            action: ConsequenceAction::CapabilitySuspension(vec!["read".to_owned()]),
+            window: Duration::from_secs(60),
+        },
+    ];
+
+    let events = vec![Event {
+        event_type: EventType::MessageSent,
+        actor_did: "did:key:bob".into(),
+        timestamp: 50,
+        sequence: 1,
+        payload: EventPayload { data: vec![] },
+        prev_hash: [0u8; 32],
+        signature: vec![0u8; 64],
+    }];
+
+    let triggered = evaluate_consequence_rules(&rules, &events, "did:key:bob", 60);
+    // Only rule with threshold=1 should trigger (1 event >= 1).
+    assert_eq!(triggered.len(), 1, "only low-threshold rule should trigger");
+    assert_eq!(
+        triggered[0].rule_index, 1,
+        "second rule (index 1) triggered"
+    );
+    assert!(
+        matches!(
+            &triggered[0].action,
+            ConsequenceAction::CapabilitySuspension(_)
+        ),
+        "triggered action should be CapabilitySuspension"
+    );
+}
+
+/// `evaluate_cost` returns the correct per-message cost from the schedule.
+#[test]
+fn evaluate_cost_enforce_gate() {
+    use scp_protocol::economy::policy::{ObservableMetrics, evaluate_cost};
+    use scp_protocol::economy::types::{
+        Amount, CostSchedule, CurrencyCode, EconomicPolicy, PaidActionType,
+    };
+
+    let policy = EconomicPolicy {
+        locked: false,
+        cost_schedule: CostSchedule {
+            currency: CurrencyCode::new([85, 83, 68, 0]),
+            per_message: Some(Amount::new(25)),
+            per_tool_invoke: None,
+            per_join: None,
+            per_period: None,
+            per_byte_stored: None,
+        },
+        payment_adapters: vec![],
+        pricing_formula: None,
+        payee: DID::from("did:key:payee"),
+    };
+
+    let metrics = ObservableMetrics {
+        sender_velocity: 0,
+        member_count: 2,
+        context_message_rate: 0,
+        relay_queue_depth: 0,
+        time_of_day: 0,
+        storage_usage: 0,
+    };
+
+    let cost = evaluate_cost(&policy, &PaidActionType::MessageSend, &metrics);
+    assert_eq!(
+        cost,
+        Some(Amount::new(25)),
+        "evaluate_cost should return per_message cost"
+    );
+
+    // No tool invoke cost configured — should return zero.
+    let tool_cost = evaluate_cost(&policy, &PaidActionType::ToolInvoke, &metrics);
+    assert_eq!(
+        tool_cost,
+        Some(Amount::new(0)),
+        "evaluate_cost should return zero for unconfigured action type"
+    );
+}

@@ -24,6 +24,7 @@ use uuid::Uuid;
 #[cfg(feature = "allow_in_memory_custody")]
 use scp_platform::traits::KeyCustody;
 
+use scp_ffi_common::html_escape_event_string;
 use scp_ffi_common::validate::validate_did;
 
 use crate::error::ScpNapiError;
@@ -515,6 +516,14 @@ pub async fn context_create(
         })
         .transpose()?
         .unwrap_or_default();
+    for rule in &core_consequence_rules {
+        rule.validate().map_err(|e| {
+            NapiError::from(ScpNapiError::Validation {
+                message: format!("consequenceRules validation failed: {e}"),
+                code: "SCP-VALID-7000".to_owned(),
+            })
+        })?;
+    }
 
     let context_params = ContextParams {
         mode,
@@ -1182,9 +1191,13 @@ fn format_context_event(event: &scp_core::context::membership::ContextEvent) -> 
             trigger_type,
             action_type,
         } => format!(
-            "consequence_triggered:member={member_did},\
-             rule={rule_index},trigger={trigger_type},\
-             action={action_type},context={context_id}"
+            "consequence_triggered:member={},\
+             rule={rule_index},trigger={},\
+             action={},context={}",
+            html_escape_event_string(member_did.as_ref()),
+            html_escape_event_string(trigger_type),
+            html_escape_event_string(action_type),
+            html_escape_event_string(context_id),
         ),
         ConsequenceEnforced {
             context_id,
@@ -1192,9 +1205,12 @@ fn format_context_event(event: &scp_core::context::membership::ContextEvent) -> 
             action_type,
             success,
         } => format!(
-            "consequence_enforced:member={member_did},\
-             action={action_type},success={success},\
-             context={context_id}"
+            "consequence_enforced:member={},\
+             action={},success={success},\
+             context={}",
+            html_escape_event_string(member_did.as_ref()),
+            html_escape_event_string(action_type),
+            html_escape_event_string(context_id),
         ),
         other => format!("{other:?}"),
     }
