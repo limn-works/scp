@@ -260,33 +260,21 @@ where
         .map(|econ| economy_pre_check(econ, invoker_did))
         .transpose()?;
 
-    // 4b. Payment flow (#1537, #1596): 9-step paid action for tool invocations.
-    // Runs after budget check but before tool execution. Only triggers when
-    // a payment adapter is configured AND cost > 0.
-    // If payment fails, roll back the budget deducted by economy_pre_check.
-    // The receipt is returned to the caller for event log recording.
-    let payment_receipt = if let Some(ref econ) = economy
-        && let (Some(adapter), Some(policy)) = (&econ.payment_adapter, econ.economic_policy)
-    {
-        let remaining = econ.budget_tracker.remaining(invoker_did);
-        match execute_tool_payment(
-            adapter.as_ref(),
-            policy,
-            econ.context_id,
-            invoker_did,
-            remaining,
-        )
-        .await
-        {
-            Ok(receipt) => receipt,
-            Err(payment_err) => {
-                // Restore the budget deducted by check_tool_economy.
-                if let Some(cost) = action_cost
-                    && let Some(ref mut econ) = economy
-                {
-                    econ.budget_tracker.grant(invoker_did, cost);
-                }
-                return Err(payment_err);
+    // 4b. Payment escrow (#1537, #1596): authorize (escrow hold) BEFORE tool execution.
+    let escrow_parts = extract_escrow_parts(&economy);
+    let mut escrow = if let Some((adapter, policy, metrics, ctx_id)) = &escrow_parts {
+        match authorize_tool_payment(adapter.as_ref(), policy, ctx_id, invoker_did, metrics).await {
+            Ok(prepared) => prepared,
+            Err(auth_err) => {
+                void_escrow_and_rollback(
+                    None,
+                    escrow_parts.as_ref(),
+                    action_cost,
+                    &mut economy,
+                    invoker_did,
+                )
+                .await;
+                return Err(auth_err);
             }
         }
     } else {
@@ -299,8 +287,26 @@ where
     let execution_result = tokio::time::timeout(timeout_duration, executor(input.clone())).await;
     let output = match execution_result {
         Ok(Ok(output)) => output,
-        Ok(Err(exec_err)) => return Err(InvocationError::ExecutionFailed { message: exec_err }),
+        Ok(Err(exec_err)) => {
+            void_escrow_and_rollback(
+                escrow.as_ref(),
+                escrow_parts.as_ref(),
+                action_cost,
+                &mut economy,
+                invoker_did,
+            )
+            .await;
+            return Err(InvocationError::ExecutionFailed { message: exec_err });
+        }
         Err(_elapsed) => {
+            void_escrow_and_rollback(
+                escrow.as_ref(),
+                escrow_parts.as_ref(),
+                action_cost,
+                &mut economy,
+                invoker_did,
+            )
+            .await;
             return Err(InvocationError::Timeout {
                 timeout_ms: effective_timeout,
             });
@@ -315,6 +321,16 @@ where
         .map(|econ| economy_post_check(econ, invoker_did))
         .unwrap_or_default();
 
+    // 6b. Complete (capture) the escrowed payment after successful execution.
+    let payment_receipt = finalize_tool_escrow(
+        escrow.take(),
+        escrow_parts.as_ref(),
+        action_cost,
+        &mut economy,
+        invoker_did,
+    )
+    .await?;
+
     // 7-8. Build event + return (#1596: receipt returned to caller).
     let event = build_tool_event(tool_id, invoker_did, start, &input, &output, action_cost);
     Ok((output, event, triggered, payment_receipt))
@@ -322,25 +338,53 @@ where
 
 /// Runs economy pre-checks (budget enforcement + UCAN AND-composition).
 ///
+/// Uses real observable metrics from `ToolEconomyContext` (not zero metrics).
+/// Evaluates cost, checks spending UCAN AND-composition (§19.5), and records
+/// spend against the invoker's budget. This is the single budget deduction
+/// point — the adapter escrow flow is separate.
+///
 /// Returns the evaluated action cost for inclusion in the `ToolInvokedEvent`.
 fn economy_pre_check<S: BuildHasher>(
     economy: &mut ToolEconomyContext<'_, S>,
     invoker_did: &DID,
 ) -> Result<scp_protocol::economy::types::Amount, InvocationError> {
-    check_tool_economy(economy.economic_policy, economy.budget_tracker, invoker_did)?;
-    let cost = economy
-        .economic_policy
-        .and_then(|policy| {
-            scp_protocol::economy::policy::evaluate_cost(
-                policy,
-                &scp_protocol::economy::types::PaidActionType::ToolInvoke,
-                &economy.metrics,
-            )
-        })
-        .unwrap_or(scp_protocol::economy::types::Amount::new(0));
-    if cost.0 > 0 {
-        check_tool_ucan_composition(cost, economy.action_ucan, economy.spending_ucan)?;
+    let Some(policy) = economy.economic_policy else {
+        return Ok(scp_protocol::economy::types::Amount::new(0));
+    };
+
+    let cost = scp_protocol::economy::policy::evaluate_cost(
+        policy,
+        &scp_protocol::economy::types::PaidActionType::ToolInvoke,
+        &economy.metrics,
+    )
+    .unwrap_or(scp_protocol::economy::types::Amount::new(0));
+
+    if cost.0 == 0 {
+        return Ok(cost);
     }
+
+    // UCAN AND-composition check (§19.5): paid actions require both an
+    // action capability (already checked by step 2) and a spending UCAN.
+    check_tool_ucan_composition(cost, economy.action_ucan, economy.spending_ucan)?;
+
+    // Budget check — no auto-grant. Budget must be explicitly approved via
+    // ApproveSpend governance action.
+    if !economy.budget_tracker.has_budget(invoker_did) {
+        return Err(InvocationError::BudgetExceeded {
+            did: invoker_did.to_string(),
+            cost: cost.0,
+            remaining: 0,
+        });
+    }
+    economy
+        .budget_tracker
+        .record_spend(invoker_did, cost)
+        .map_err(|_| InvocationError::BudgetExceeded {
+            did: invoker_did.to_string(),
+            cost: cost.0,
+            remaining: economy.budget_tracker.remaining(invoker_did).0,
+        })?;
+
     Ok(cost)
 }
 
@@ -449,30 +493,21 @@ where
         .map(|econ| economy_pre_check(econ, invoker_did))
         .transpose()?;
 
-    // 4b. Payment flow (#1537, #1596): 9-step paid action for tool invocations.
-    // If payment fails, roll back the budget deducted by economy_pre_check.
-    let payment_receipt = if let Some(ref econ) = economy
-        && let (Some(adapter), Some(policy)) = (&econ.payment_adapter, econ.economic_policy)
-    {
-        let remaining = econ.budget_tracker.remaining(invoker_did);
-        match execute_tool_payment(
-            adapter.as_ref(),
-            policy,
-            econ.context_id,
-            invoker_did,
-            remaining,
-        )
-        .await
-        {
-            Ok(receipt) => receipt,
-            Err(payment_err) => {
-                // Restore the budget deducted by check_tool_economy.
-                if let Some(cost) = action_cost
-                    && let Some(ref mut econ) = economy
-                {
-                    econ.budget_tracker.grant(invoker_did, cost);
-                }
-                return Err(payment_err);
+    // 4b. Payment escrow (#1537, #1596): authorize (escrow hold) BEFORE tool execution.
+    let escrow_parts = extract_escrow_parts(&economy);
+    let mut escrow = if let Some((adapter, policy, metrics, ctx_id)) = &escrow_parts {
+        match authorize_tool_payment(adapter.as_ref(), policy, ctx_id, invoker_did, metrics).await {
+            Ok(prepared) => prepared,
+            Err(auth_err) => {
+                void_escrow_and_rollback(
+                    None,
+                    escrow_parts.as_ref(),
+                    action_cost,
+                    &mut economy,
+                    invoker_did,
+                )
+                .await;
+                return Err(auth_err);
             }
         }
     } else {
@@ -493,14 +528,26 @@ where
         }
     })
     .await;
-    let output = match execution_result {
-        Ok(Ok(output)) => output,
-        Ok(Err(msg)) if msg == "cancelled" => return Err(InvocationError::Cancelled),
-        Ok(Err(exec_err)) => return Err(InvocationError::ExecutionFailed { message: exec_err }),
-        Err(_elapsed) => {
-            return Err(InvocationError::Timeout {
-                timeout_ms: effective_timeout,
-            });
+    let exec_result = match execution_result {
+        Ok(Ok(output)) => Ok(output),
+        Ok(Err(msg)) if msg == "cancelled" => Err(InvocationError::Cancelled),
+        Ok(Err(exec_err)) => Err(InvocationError::ExecutionFailed { message: exec_err }),
+        Err(_elapsed) => Err(InvocationError::Timeout {
+            timeout_ms: effective_timeout,
+        }),
+    };
+    let output = match exec_result {
+        Ok(output) => output,
+        Err(err) => {
+            void_escrow_and_rollback(
+                escrow.as_ref(),
+                escrow_parts.as_ref(),
+                action_cost,
+                &mut economy,
+                invoker_did,
+            )
+            .await;
+            return Err(err);
         }
     };
 
@@ -512,76 +559,19 @@ where
         .map(|econ| economy_post_check(econ, invoker_did))
         .unwrap_or_default();
 
+    // 6b. Complete (capture) the escrowed payment after successful execution.
+    let payment_receipt = finalize_tool_escrow(
+        escrow.take(),
+        escrow_parts.as_ref(),
+        action_cost,
+        &mut economy,
+        invoker_did,
+    )
+    .await?;
+
     // 7. Build event + return (#1596: receipt returned to caller).
     let event = build_tool_event(tool_id, invoker_did, start, &input, &output, action_cost);
     Ok((output, event, triggered, payment_receipt))
-}
-
-// ---------------------------------------------------------------------------
-// Economy pre-check for tool invocation (#1537)
-// ---------------------------------------------------------------------------
-
-/// Checks economic policy constraints and UCAN spending authorization
-/// before tool invocation.
-///
-/// If the context has an economic policy with a per-tool-invoke cost,
-/// records the spend against the invoker's budget. Returns
-/// [`InvocationError::BudgetExceeded`] if the spend exceeds the budget.
-///
-/// Also validates UCAN composition: if the action has a cost, a spending
-/// UCAN must be provided alongside the action UCAN (§19.5).
-///
-/// Call this BEFORE [`invoke_tool`] to enforce economy (#1537).
-///
-/// # Errors
-///
-/// Returns [`InvocationError::BudgetExceeded`] if the invoker's cumulative
-/// spending would exceed their governance-approved budget.
-pub fn check_tool_economy(
-    economic_policy: Option<&scp_protocol::economy::types::EconomicPolicy>,
-    budget_tracker: &mut scp_protocol::economy::budget::MemberBudgetTracker,
-    invoker_did: &DID,
-) -> Result<(), InvocationError> {
-    if let Some(policy) = economic_policy {
-        // Standalone callers (tests, direct API) pass zero metrics.
-        // Production callers use ToolEconomyContext.metrics via
-        // economy_pre_check which carries real ObservableMetrics from
-        // PerContextState. This function evaluates the base cost for
-        // budget enforcement; dynamic pricing is handled by the caller.
-        let metrics = scp_protocol::economy::policy::ObservableMetrics {
-            context_message_rate: 0,
-            member_count: 0,
-            relay_queue_depth: 0,
-            time_of_day: 0,
-            sender_velocity: 0,
-            storage_usage: 0,
-        };
-        if let Some(cost) = scp_protocol::economy::policy::evaluate_cost(
-            policy,
-            &scp_protocol::economy::types::PaidActionType::ToolInvoke,
-            &metrics,
-        ) {
-            // No auto-grant — budget must be explicitly approved via
-            // ApproveSpend governance action. If no budget exists, fail
-            // with BudgetExceeded error.
-            if !budget_tracker.has_budget(invoker_did) {
-                return Err(InvocationError::BudgetExceeded {
-                    did: invoker_did.to_string(),
-                    cost: cost.0,
-                    remaining: 0,
-                });
-            }
-            // Record spend against invoker budget (§19.5, ADR-033).
-            budget_tracker
-                .record_spend(invoker_did, cost)
-                .map_err(|_| InvocationError::BudgetExceeded {
-                    did: invoker_did.to_string(),
-                    cost: cost.0,
-                    remaining: budget_tracker.remaining(invoker_did).0,
-                })?;
-        }
-    }
-    Ok(())
 }
 
 /// Post-invocation bookkeeping: participation record update and consequence evaluation.
@@ -649,8 +639,82 @@ pub fn check_tool_ucan_composition(
     })
 }
 
+/// Extracts adapter/policy/metrics from economy context for escrow flow.
+///
+/// Returns owned copies to avoid holding a borrow of `economy` across the
+/// mutable post-check. Returns `None` when no adapter or policy is configured.
+fn extract_escrow_parts<S: BuildHasher>(
+    economy: &Option<&mut ToolEconomyContext<'_, S>>,
+) -> Option<EscrowParts> {
+    let econ = economy.as_ref()?;
+    let adapter = econ.payment_adapter.as_ref().map(std::sync::Arc::clone)?;
+    let policy = econ.economic_policy?.clone();
+    let metrics = econ.metrics.clone();
+    let context_id = econ.context_id.to_owned();
+    Some((adapter, policy, metrics, context_id))
+}
+
+/// Completes the escrow payment after successful tool execution, or rolls back
+/// the budget on capture failure.
+///
+/// Returns the payment receipt (if any). On capture failure, rolls back budget
+/// and returns the error.
+async fn finalize_tool_escrow<S: BuildHasher>(
+    escrow: Option<crate::economy::integration::PreparedAction>,
+    escrow_parts: Option<&EscrowParts>,
+    action_cost: Option<scp_protocol::economy::types::Amount>,
+    economy: &mut Option<&mut ToolEconomyContext<'_, S>>,
+    invoker_did: &DID,
+) -> Result<Option<crate::economy::adapter::PaymentReceipt>, InvocationError> {
+    if let (Some(prepared), Some((adapter, policy, metrics, _))) = (escrow, escrow_parts) {
+        match complete_tool_payment(adapter.as_ref(), Some(policy), &prepared, metrics).await {
+            Ok(receipt) => Ok(receipt),
+            Err(capture_err) => {
+                // Budget rollback only — escrow is already consumed by the capture attempt.
+                if let Some(cost) = action_cost
+                    && let Some(econ) = economy
+                {
+                    econ.budget_tracker.grant(invoker_did, cost);
+                }
+                Err(capture_err)
+            }
+        }
+    } else {
+        Ok(None)
+    }
+}
+
+/// Extracted escrow context: adapter, policy, metrics, context ID.
+type EscrowParts = (
+    std::sync::Arc<dyn crate::economy::adapter::PaymentAdapterDyn>,
+    scp_protocol::economy::types::EconomicPolicy,
+    scp_protocol::economy::policy::ObservableMetrics,
+    String,
+);
+
+/// Voids the payment escrow and rolls back budget on tool failure.
+///
+/// Combines the void + rollback pattern that appears in every failure branch
+/// of `invoke_tool` and `invoke_tool_with_cancellation`.
+async fn void_escrow_and_rollback<S: BuildHasher>(
+    escrow: Option<&crate::economy::integration::PreparedAction>,
+    escrow_parts: Option<&EscrowParts>,
+    action_cost: Option<scp_protocol::economy::types::Amount>,
+    economy: &mut Option<&mut ToolEconomyContext<'_, S>>,
+    invoker_did: &DID,
+) {
+    if let (Some(prepared), Some((adapter, _, _, _))) = (escrow, escrow_parts) {
+        void_tool_escrow(adapter.as_ref(), prepared).await;
+    }
+    if let Some(cost) = action_cost
+        && let Some(econ) = economy
+    {
+        econ.budget_tracker.grant(invoker_did, cost);
+    }
+}
+
 // ---------------------------------------------------------------------------
-// Payment flow for tool invocations (#1537)
+// Escrow payment flow for tool invocations (#1537)
 // ---------------------------------------------------------------------------
 
 /// Wrapper that bridges `&dyn PaymentAdapterDyn` to `PaymentAdapter` for the
@@ -714,41 +778,25 @@ impl crate::economy::adapter::PaymentAdapter for ToolPaymentBridge<'_> {
     }
 }
 
-/// Executes the 9-step payment flow for tool invocations (#1537, #1596, spec §19.2.2).
+/// Authorizes a tool payment (escrow step 1).
 ///
-/// Called from `invoke_tool` after the economy pre-check (budget + UCAN
-/// composition) but before tool execution. Uses the adapter from
-/// `ToolEconomyContext::payment_adapter`. Skips if no economic policy or
-/// zero cost.
+/// Creates an escrow hold via `prepare_paid_action`. Returns the bridge
+/// and prepared action for later completion or voiding. Returns `None`
+/// when cost is zero or no payment is needed.
 ///
-/// Returns the payment receipt when a payment was captured, `None` when
-/// the cost was zero or no payment was needed. The caller is responsible
-/// for recording the receipt in the event log (matching the pattern in
-/// `ContextManager::execute_paid_action`).
-///
-/// # Errors
-///
-/// Returns [`InvocationError::BudgetExceeded`] on any payment flow failure.
-async fn execute_tool_payment(
+/// Called BEFORE tool execution. On success, the caller must eventually call
+/// `complete_tool_payment` or `void_tool_escrow`.
+async fn authorize_tool_payment(
     adapter: &dyn crate::economy::adapter::PaymentAdapterDyn,
     policy: &scp_protocol::economy::types::EconomicPolicy,
     context_id: &str,
     invoker_did: &DID,
-    budget_remaining: scp_protocol::economy::types::Amount,
-) -> Result<Option<crate::economy::adapter::PaymentReceipt>, InvocationError> {
-    let metrics = scp_protocol::economy::policy::ObservableMetrics {
-        member_count: 0,
-        context_message_rate: 0,
-        relay_queue_depth: 0,
-        time_of_day: 0,
-        sender_velocity: 0,
-        storage_usage: 0,
-    };
-
+    metrics: &scp_protocol::economy::policy::ObservableMetrics,
+) -> Result<Option<crate::economy::integration::PreparedAction>, InvocationError> {
     let cost = scp_protocol::economy::policy::evaluate_cost(
         policy,
         &scp_protocol::economy::types::PaidActionType::ToolInvoke,
-        &metrics,
+        metrics,
     );
     let Some(cost) = cost.filter(|c| c.0 > 0) else {
         return Ok(None);
@@ -761,14 +809,13 @@ async fn execute_tool_payment(
         idempotency_key: *uuid::Uuid::new_v4().as_bytes(),
     };
 
-    // Steps 1-4: Prepare (evaluate cost + authorize).
     let prepared = crate::economy::integration::prepare_paid_action(
         &bridge,
         Some(policy),
         scp_protocol::economy::types::PaidActionType::ToolInvoke,
         invoker_did,
         Some(context_id.to_owned()),
-        &metrics,
+        metrics,
         metadata,
         Vec::new(),
     )
@@ -776,22 +823,33 @@ async fn execute_tool_payment(
     .map_err(|_| InvocationError::BudgetExceeded {
         did: invoker_did.to_string(),
         cost: cost.0,
-        remaining: budget_remaining.0,
+        remaining: 0, // Exact remaining not available here; adapter rejected the hold.
     })?;
 
-    // Steps 5-8: Process (verify auth + capture).
+    Ok(Some(prepared))
+}
+
+/// Completes a tool payment (escrow step 2: capture).
+///
+/// Called AFTER successful tool execution. Captures the escrowed payment
+/// and returns the receipt.
+async fn complete_tool_payment(
+    adapter: &dyn crate::economy::adapter::PaymentAdapterDyn,
+    policy: Option<&scp_protocol::economy::types::EconomicPolicy>,
+    prepared: &crate::economy::integration::PreparedAction,
+    metrics: &scp_protocol::economy::policy::ObservableMetrics,
+) -> Result<Option<crate::economy::adapter::PaymentReceipt>, InvocationError> {
+    let bridge = ToolPaymentBridge(adapter);
     let processed = crate::economy::integration::process_paid_action(
         &bridge,
-        Some(policy),
+        policy,
         &prepared.envelope,
-        &metrics,
+        metrics,
         |payload| async move { Ok(payload) },
     )
     .await
-    .map_err(|_| InvocationError::BudgetExceeded {
-        did: invoker_did.to_string(),
-        cost: cost.0,
-        remaining: budget_remaining.0,
+    .map_err(|_| InvocationError::ExecutionFailed {
+        message: "payment capture failed after successful tool execution".to_owned(),
     })?;
 
     if let Some(receipt) = &processed.receipt {
@@ -803,6 +861,24 @@ async fn execute_tool_payment(
     }
 
     Ok(processed.receipt)
+}
+
+/// Voids a tool payment escrow on failure.
+///
+/// Called when tool execution fails (error, timeout, cancellation) to
+/// release the escrow hold. Best-effort — logs but does not propagate
+/// void failures.
+async fn void_tool_escrow(
+    adapter: &dyn crate::economy::adapter::PaymentAdapterDyn,
+    prepared: &crate::economy::integration::PreparedAction,
+) {
+    if let Some(ref authorization) = prepared.envelope.authorization {
+        let bridge = ToolPaymentBridge(adapter);
+        if let Err(e) = crate::economy::adapter::PaymentAdapter::void(&bridge, authorization).await
+        {
+            tracing::warn!("failed to void tool payment escrow: {e}");
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1619,7 +1695,83 @@ mod tests {
         // Grant only 100 budget but tool costs 200.
         tracker.grant(&invoker, Amount::new(100));
 
-        let result = super::check_tool_economy(Some(&policy), &mut tracker, &invoker);
+        // Budget enforcement is now inline in economy_pre_check via invoke_tool.
+        // Test it through invoke_tool with a ToolEconomyContext.
+        let context = active_context().await;
+        let role_state = test_role_state(invoker.as_ref());
+        let registry = setup_registry_with_tool(&role_state, invoker.as_ref());
+        let metrics = scp_protocol::economy::policy::ObservableMetrics {
+            context_message_rate: 0,
+            member_count: 0,
+            relay_queue_depth: 0,
+            time_of_day: 0,
+            sender_velocity: 0,
+            storage_usage: 0,
+        };
+        let mut participation: std::collections::HashMap<
+            String,
+            scp_protocol::trust::participation::ParticipationRecord,
+        > = std::collections::HashMap::new();
+        // Provide a spending UCAN so the AND-composition check passes;
+        // the budget check (the actual test target) runs after.
+        let spending_ucan = {
+            use scp_protocol::crypto::ucan::spending::{
+                Amount as SpendingAmount, CurrencyCode as SpendingCurrency, SpendingCapability,
+            };
+            let cap = SpendingCapability {
+                max_per_action: SpendingAmount(u64::MAX),
+                max_total: SpendingAmount(u64::MAX),
+                currency: SpendingCurrency([85, 83, 68, 0]),
+                time_window: std::time::Duration::from_secs(86400),
+                allowed_adapters: vec![],
+            };
+            let mut fct = serde_json::Map::new();
+            fct.insert(
+                "spending_capability".to_owned(),
+                cap.to_fact_value().unwrap(),
+            );
+            scp_protocol::crypto::ucan::UcanToken {
+                header: scp_protocol::crypto::ucan::UcanHeader::new(),
+                payload: scp_protocol::crypto::ucan::UcanPayload {
+                    iss: "did:key:test".to_owned(),
+                    aud: "did:key:aud".to_owned(),
+                    exp: u64::MAX,
+                    nbf: None,
+                    nnc: "test-nonce".to_owned(),
+                    att: vec![],
+                    prf: vec![],
+                    fct: Some(serde_json::Value::Object(fct)),
+                },
+                signature: vec![0u8; 64],
+                encoded: String::new(),
+            }
+        };
+        let mut economy = super::ToolEconomyContext {
+            economic_policy: Some(&policy),
+            budget_tracker: &mut tracker,
+            action_ucan: None,
+            spending_ucan: Some(&spending_ucan),
+            context_id: "ctx-invoke-test",
+            now: 0,
+            events: &[],
+            participation_cache: &mut participation,
+            consequence_rules: &[],
+            payment_adapter: None,
+            metrics,
+        };
+
+        let result = super::invoke_tool(
+            &context,
+            &registry,
+            &role_state,
+            &"calculator".to_owned(),
+            serde_json::json!({"a": 1, "b": 2}),
+            &invoker,
+            None,
+            add_executor,
+            Some(&mut economy),
+        )
+        .await;
         assert!(
             matches!(result, Err(super::InvocationError::BudgetExceeded { .. })),
             "should return BudgetExceeded when budget is insufficient, got: {result:?}"
