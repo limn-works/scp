@@ -1931,6 +1931,7 @@ mod tests {
                 _: &[u8; 32],
                 _: &str,
                 _actor_did: &str,
+                _payload: Option<&serde_json::Value>,
             ) -> Result<(), ContextCreationError> {
                 Ok(())
             }

@@ -532,8 +532,9 @@ impl ContextEventLogProvider for ArcEventLogProvider {
         id: &[u8; 32],
         event: &str,
         actor_did: &str,
+        payload: Option<&serde_json::Value>,
     ) -> Result<(), ContextCreationError> {
-        self.0.append_event(id, event, actor_did)
+        self.0.append_event(id, event, actor_did, payload)
     }
     fn destroy_event_log(&self, id: &[u8; 32]) -> Result<(), ContextCreationError> {
         self.0.destroy_event_log(id)

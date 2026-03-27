@@ -2306,6 +2306,7 @@ fn context_event_to_js_camel_case_format() {
         action_summary: "AddMember".into(),
         executor_did: "did:dht:admin".into(),
         resulting_epoch: Some(42),
+        target_did: Some("did:dht:alice".into()),
     };
     let mut val = serde_json::to_value(&event).unwrap();
     serde_to_js(&mut val);

@@ -380,17 +380,47 @@ fn matches_trigger(trigger: &ConsequenceTrigger, event: &Event, subject_did: &st
 
 /// Checks if the payload data represents a target DID matching the given DID.
 ///
-/// Convention: the payload data starts with a UTF-8 string (the target DID),
-/// terminated by a null byte or the end of data.
+/// Parses the payload as a JSON object with a `"target_did"` field. Falls
+/// back to the legacy null-terminated string convention for backward
+/// compatibility.
 fn payload_target_is(data: &[u8], target_did: &str) -> bool {
+    if data.is_empty() {
+        return false;
+    }
+    // Try structured JSON first.
+    if let Ok(val) = serde_json::from_slice::<serde_json::Value>(data) {
+        return val
+            .get("target_did")
+            .and_then(|v| v.as_str())
+            .is_some_and(|s| s == target_did);
+    }
+    // Legacy fallback: null-terminated UTF-8 string.
     let end = data.iter().position(|&b| b == 0).unwrap_or(data.len());
     std::str::from_utf8(&data[..end]) == Ok(target_did)
 }
 
 /// Checks if a payload's data starts with the given prefix.
 ///
-/// The payload is treated as a null-terminated or end-of-data UTF-8 string.
+/// For structured JSON payloads, checks the `"custom_key"` field. Falls
+/// back to the legacy null-terminated string convention.
 fn payload_starts_with(data: &[u8], prefix: &str) -> bool {
+    if data.is_empty() {
+        return false;
+    }
+    // Try structured JSON first.
+    if let Ok(val) = serde_json::from_slice::<serde_json::Value>(data) {
+        // Check custom_key field for Custom triggers.
+        if let Some(key) = val.get("custom_key").and_then(|v| v.as_str()) {
+            return key == prefix || key.starts_with(prefix);
+        }
+        // Also check target_did for backward compat with custom triggers
+        // that might use target DID as key.
+        if let Some(did) = val.get("target_did").and_then(|v| v.as_str()) {
+            return did == prefix || did.starts_with(prefix);
+        }
+        return false;
+    }
+    // Legacy fallback: null-terminated UTF-8 string.
     let end = data.iter().position(|&b| b == 0).unwrap_or(data.len());
     std::str::from_utf8(&data[..end])
         .is_ok_and(|payload_str| payload_str == prefix || payload_str.starts_with(prefix))
@@ -1320,6 +1350,88 @@ mod tests {
         assert!(
             err.to_string().contains("must not be empty"),
             "expected empty key rejection, got: {err}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Structured JSON payload tests (H11-H12)
+    // -----------------------------------------------------------------------
+
+    /// `WarningCount` trigger fires when structured JSON payloads carry
+    /// `target_did` that matches the subject.
+    #[test]
+    fn test_warning_count_trigger_fires() {
+        let rules = vec![ConsequenceRule {
+            trigger: ConsequenceTrigger::WarningCount,
+            action: ConsequenceAction::RoleDemotion {
+                to_role: "observer".to_owned(),
+            },
+            threshold: 2,
+            window: Duration::from_secs(300),
+        }];
+
+        // Build structured JSON payloads targeting alice.
+        let payload =
+            serde_json::to_vec(&serde_json::json!({"target_did": "did:key:alice"})).unwrap();
+
+        let events = vec![
+            make_event(
+                EventType::GovernanceAction,
+                "did:key:admin",
+                800,
+                0,
+                payload.clone(),
+            ),
+            make_event(
+                EventType::GovernanceAction,
+                "did:key:moderator",
+                900,
+                1,
+                payload,
+            ),
+        ];
+
+        let result = evaluate_consequence_rules(&rules, &events, "did:key:alice", 1000);
+
+        assert_eq!(
+            result.len(),
+            1,
+            "WarningCount should fire with JSON payloads"
+        );
+        assert_eq!(
+            result[0].action,
+            ConsequenceAction::RoleDemotion {
+                to_role: "observer".to_owned()
+            }
+        );
+        assert_eq!(result[0].evidence.len(), 2);
+    }
+
+    /// `WarningCount` does NOT fire when JSON payload targets a different DID.
+    #[test]
+    fn test_warning_count_wrong_target_no_fire() {
+        let rules = vec![ConsequenceRule {
+            trigger: ConsequenceTrigger::WarningCount,
+            action: ConsequenceAction::AccessRevocation,
+            threshold: 1,
+            window: Duration::from_secs(300),
+        }];
+
+        let payload =
+            serde_json::to_vec(&serde_json::json!({"target_did": "did:key:bob"})).unwrap();
+
+        let events = vec![make_event(
+            EventType::GovernanceAction,
+            "did:key:admin",
+            800,
+            0,
+            payload,
+        )];
+
+        let result = evaluate_consequence_rules(&rules, &events, "did:key:alice", 1000);
+        assert!(
+            result.is_empty(),
+            "WarningCount should not fire when target_did != subject"
         );
     }
 }

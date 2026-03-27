@@ -206,7 +206,7 @@ impl ContextEventLogProvider for MockEventLog {
     fn init_event_log(&self, _id: &[u8; 32]) -> Result<(), ContextCreationError> {
         Ok(())
     }
-    fn append_event(&self, id: &[u8; 32], event: &str, _actor_did: &str) -> Result<(), ContextCreationError> {
+    fn append_event(&self, id: &[u8; 32], event: &str, _actor_did: &str, _payload: Option<&serde_json::Value>) -> Result<(), ContextCreationError> {
         self.events.lock().unwrap().push((*id, event.to_owned()));
         Ok(())
     }

@@ -251,6 +251,15 @@ pub(super) fn enforce_triggered_consequences(
 /// events use estimated timestamps (spaced 1 second apart backwards from
 /// `now`). The merge deduplicates by preferring event log entries (which
 /// have accurate timestamps and hashes) over buffer estimates.
+/// Serializes an optional target DID into JSON payload bytes for event log
+/// consumption by consequence triggers and participation records.
+fn target_did_to_payload(did: Option<&DID>) -> Vec<u8> {
+    did.map(|d| {
+        serde_json::to_vec(&serde_json::json!({"target_did": d.as_ref()})).unwrap_or_default()
+    })
+    .unwrap_or_default()
+}
+
 pub(super) fn event_log_entries_for_consequences(
     ctx: &PerContextState,
     context_id: &str,
@@ -282,12 +291,20 @@ pub(super) fn event_log_entries_for_consequences(
                 | "GovernanceActionExecuted" => scp_event_log::EventType::GovernanceAction,
                 _ => continue, // Skip event types not relevant to consequence evaluation
             };
+            // Convert structured JSON payload to EventPayload bytes.
+            // The payload is serialized as JSON bytes for consumption by
+            // extract_target_did_from_payload and payload_target_is.
+            let payload_data = entry
+                .payload
+                .as_ref()
+                .and_then(|v| serde_json::to_vec(v).ok())
+                .unwrap_or_default();
             events.push(scp_event_log::Event {
                 event_type,
                 actor_did: DID(entry.actor_did.clone()),
                 timestamp: entry.timestamp,
                 sequence: seq as u64,
-                payload: scp_event_log::EventPayload { data: Vec::new() },
+                payload: scp_event_log::EventPayload { data: payload_data },
                 prev_hash: [0u8; 32],
                 signature: Vec::new(),
             });
@@ -305,20 +322,31 @@ pub(super) fn event_log_entries_for_consequences(
     let next_seq = events.len() as u64;
 
     for (idx, ctx_event) in buffer_events.iter().enumerate() {
-        let (event_type, actor_did) = match ctx_event {
+        let (event_type, actor_did, payload_data) = match ctx_event {
             ContextEvent::MessageSent { sender_did, .. }
-            | ContextEvent::MessageReceived { sender_did, .. } => {
-                (scp_event_log::EventType::MessageSent, sender_did.clone())
-            }
-            ContextEvent::MemberJoined { member_did, .. } => {
-                (scp_event_log::EventType::MemberJoined, member_did.clone())
-            }
-            ContextEvent::MemberLeft { member_did } => {
-                (scp_event_log::EventType::MemberLeft, member_did.clone())
-            }
-            ContextEvent::GovernanceActionExecuted { executor_did, .. } => (
+            | ContextEvent::MessageReceived { sender_did, .. } => (
+                scp_event_log::EventType::MessageSent,
+                sender_did.clone(),
+                Vec::new(),
+            ),
+            ContextEvent::MemberJoined { member_did, .. } => (
+                scp_event_log::EventType::MemberJoined,
+                member_did.clone(),
+                Vec::new(),
+            ),
+            ContextEvent::MemberLeft { member_did } => (
+                scp_event_log::EventType::MemberLeft,
+                member_did.clone(),
+                Vec::new(),
+            ),
+            ContextEvent::GovernanceActionExecuted {
+                executor_did,
+                target_did,
+                ..
+            } => (
                 scp_event_log::EventType::GovernanceAction,
                 executor_did.clone(),
+                target_did_to_payload(target_did.as_ref()),
             ),
             _ => continue,
         };
@@ -336,7 +364,7 @@ pub(super) fn event_log_entries_for_consequences(
             actor_did,
             timestamp: estimated_ts,
             sequence: next_seq + idx as u64,
-            payload: scp_event_log::EventPayload { data: Vec::new() },
+            payload: scp_event_log::EventPayload { data: payload_data },
             prev_hash: [0u8; 32],
             signature: Vec::new(),
         });
@@ -604,17 +632,26 @@ impl ContextManager {
 
         // Append to Merkle event log using the standard governance event
         // label path (same pattern as propose/approve/reject/withdraw).
+        // Include structured payload with target_did so consequence triggers
+        // (WarningCount, Custom) and participation records can identify the
+        // target from event log entries.
         let context_id_bytes = context_id_to_bytes(context_id);
-        self.event_log.append_context_event(
+        let payload = proposal
+            .action
+            .target_did()
+            .map(|d| serde_json::json!({"target_did": d.as_ref()}));
+        self.event_log.append_context_event_with_payload(
             &context_id_bytes,
             Self::governance_event_label(&executed_event),
             proposal.proposer_did.as_ref(),
+            payload.as_ref(),
         )?;
 
         // Single lock acquisition for all post-event-log state mutations
         // (#1428 — eliminates TOCTOU window from multiple lock acquisitions).
         {
             let action_summary = proposal.action.variant_name().to_owned();
+            let target_did = proposal.action.target_did().cloned();
             let mut contexts = self.contexts.lock().await;
             if let Some(ctx) = contexts.get_mut(context_id) {
                 // 1. Push GovernanceActionExecuted to receive buffer so SDK
@@ -625,6 +662,7 @@ impl ContextManager {
                         action_summary,
                         executor_did: proposal.proposer_did.clone(),
                         resulting_epoch,
+                        target_did,
                     });
 
                 // 2. Trigger checkpoint cosignature collection for multi-admin
@@ -4259,6 +4297,7 @@ impl ContextManager {
                     action_summary: action.variant_name().to_owned(),
                     executor_did: executor_did.clone(),
                     resulting_epoch: *resulting_epoch,
+                    target_did: action.target_did().cloned(),
                 },
                 // These variants are not expected from timeout processing;
                 // listed explicitly so the compiler warns on new variants.

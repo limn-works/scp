@@ -1123,6 +1123,7 @@ mod mock_providers {
             _ctx_id: &[u8; 32],
             _event: &str,
             _actor_did: &str,
+            _payload: Option<&serde_json::Value>,
         ) -> Result<(), ContextCreationError> {
             Ok(())
         }

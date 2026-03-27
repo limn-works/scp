@@ -1230,6 +1230,7 @@ mod tests {
             timestamp: 1_700_000_000,
             prev_hash: [0u8; 32],
             hash: [1u8; 32],
+            payload: None,
         };
 
         store
@@ -1259,6 +1260,7 @@ mod tests {
                 timestamp: 1_700_000_000,
                 prev_hash: [0u8; 32],
                 hash: [1u8; 32],
+                payload: None,
             },
             EventLogEntry {
                 event: "MemberJoined".to_owned(),
@@ -1266,6 +1268,7 @@ mod tests {
                 timestamp: 1_700_000_001,
                 prev_hash: [1u8; 32],
                 hash: [2u8; 32],
+                payload: None,
             },
         ];
 
@@ -1306,6 +1309,7 @@ mod tests {
             timestamp: 1_700_000_000,
             prev_hash: [0u8; 32],
             hash: [1u8; 32],
+            payload: None,
         }];
 
         store
@@ -1349,6 +1353,7 @@ mod tests {
                 timestamp: u64::from(i),
                 prev_hash: [i; 32],
                 hash: [i + 1; 32],
+                payload: None,
             };
             store
                 .store_merkle_event_log_entry("ctx-bulk", usize::from(i), &entry)
@@ -1364,6 +1369,7 @@ mod tests {
                 timestamp: 3,
                 prev_hash: [3; 32],
                 hash: [4; 32],
+                payload: None,
             },
             EventLogEntry {
                 event: "Event4".to_owned(),
@@ -1371,6 +1377,7 @@ mod tests {
                 timestamp: 4,
                 prev_hash: [4; 32],
                 hash: [5; 32],
+                payload: None,
             },
         ];
         store

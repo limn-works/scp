@@ -31,6 +31,7 @@ sha2 = { workspace = true }
 subtle = { workspace = true }
 rand = { workspace = true }
 thiserror = { workspace = true }
+serde_json = { workspace = true }
 bytes = "1"
 futures = "0.3"
 rmp-serde = { workspace = true }

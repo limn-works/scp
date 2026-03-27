@@ -1901,6 +1901,7 @@ mod tests {
             timestamp: 1_700_000_000,
             prev_hash: [0u8; 32],
             hash: [1u8; 32],
+            payload: None,
         };
         let entry1 = EventLogEntry {
             event: "MemberJoined".to_owned(),
@@ -1908,6 +1909,7 @@ mod tests {
             timestamp: 1_700_000_001,
             prev_hash: [1u8; 32],
             hash: [2u8; 32],
+            payload: None,
         };
 
         // O(1) per-entry persist.
@@ -1937,6 +1939,7 @@ mod tests {
                 timestamp: 1_700_000_000,
                 prev_hash: [0u8; 32],
                 hash: [1u8; 32],
+                payload: None,
             },
             EventLogEntry {
                 event: "BulkEvent1".to_owned(),
@@ -1944,6 +1947,7 @@ mod tests {
                 timestamp: 1_700_000_001,
                 prev_hash: [1u8; 32],
                 hash: [2u8; 32],
+                payload: None,
             },
         ];
 
