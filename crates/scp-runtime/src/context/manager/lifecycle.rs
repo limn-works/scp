@@ -127,6 +127,8 @@ fn enforce_join_economy(
     joiner_did: &DID,
     now: u64,
     spending_ucan: Option<&scp_protocol::crypto::ucan::UcanToken>,
+    context_id: &str,
+    clock: &dyn scp_primitives::Clock,
 ) -> Result<Option<scp_protocol::economy::types::Amount>, ContextError> {
     if scp_protocol::economy::policy::auto_accept_blocked_by_economics(
         ctx.governance.economic_policy.as_ref(),
@@ -145,6 +147,8 @@ fn enforce_join_economy(
         now,
         spending_ucan,
         "context:join",
+        context_id,
+        clock,
     )
 }
 
@@ -1362,8 +1366,14 @@ impl ContextManager {
             // Budget deduction happens here. The adapter escrow (authorize/complete/void)
             // runs after the lock is dropped. On adapter failure, rollback_budget
             // restores the deducted amount.
-            let deducted_cost =
-                enforce_join_economy(ctx, &member_did, self.clock.now_secs(), spending_ucan)?;
+            let deducted_cost = enforce_join_economy(
+                ctx,
+                &member_did,
+                self.clock.now_secs(),
+                spending_ucan,
+                &context_id,
+                &*self.clock,
+            )?;
 
             // Sybil resistance check (#1530) — fail-closed with `?`.
             evaluate_sybil_resistance(ctx, &member_did, self.clock.now_secs())?;
@@ -1565,6 +1575,7 @@ impl ContextManager {
                 scp_protocol::economy::types::PaidActionType::ContextJoin,
                 member_did,
                 context_id,
+                deducted_cost, // M3: pass pre-evaluated cost
             )
             .await
         {
@@ -1585,14 +1596,12 @@ impl ContextManager {
         auth: Option<super::economy::PaidActionAuthorization>,
         member_did: &DID,
         context_id: &str,
-        deducted_cost: Option<scp_protocol::economy::types::Amount>,
+        _deducted_cost: Option<scp_protocol::economy::types::Amount>,
     ) {
         if let Some(a) = auth
             && let Err(e) = self.complete_paid_action(a, member_did, context_id).await
         {
-            // Capture failed — rollback budget. The member was already added,
-            // so we log the payment failure but still finalize the join.
-            super::economy::rollback_budget(self, context_id, member_did, deducted_cost).await;
+            // H8: do NOT rollback budget — service was delivered (member joined).
             tracing::warn!(
                 context_id,
                 "payment capture failed after successful join: {e}"
@@ -1628,40 +1637,43 @@ impl ContextManager {
         let context_id = handle.context_id().to_owned();
         let context_id_bytes = context_id_to_bytes(&context_id);
 
-        // Determine if this is a broadcast context (lock, read, drop).
+        // Determine broadcast mode + authorization in a single lock acquire.
         let is_broadcast = {
             let contexts = self.contexts.lock().await;
             let ctx = contexts
                 .get(&context_id)
                 .ok_or_else(|| ContextError::ContextNotRegistered(context_id.clone()))?;
-            ctx.broadcast_context.is_some()
-        };
-
-        // Authorization check: self-removal is always allowed; otherwise
-        // the caller must hold MemberRemove capability.
-        if caller_did != member_did {
-            let contexts = self.contexts.lock().await;
-            let ctx = contexts
-                .get(&context_id)
-                .ok_or_else(|| ContextError::ContextNotRegistered(context_id.clone()))?;
-            if !ctx
-                .role_state
-                .member_has_capability(caller_did, &Capability::MemberRemove)
+            // Authorization: self-removal always allowed; otherwise MemberRemove required.
+            if caller_did != member_did
+                && !ctx
+                    .role_state
+                    .member_has_capability(caller_did, &Capability::MemberRemove)
             {
                 return Err(ContextError::PermissionDenied(
                     "caller lacks permission to remove this member".into(),
                 ));
             }
-            drop(contexts);
-        }
+            ctx.broadcast_context.is_some()
+        };
 
         // Crypto operations -- no lock held. Skip for broadcast mode (no MLS).
-        // Order: remove sender key first (§9.16), then MLS group removal,
-        // then rotate remaining members' sender keys.
+        // H9: MLS group removal FIRST (hard security boundary), then sender
+        // key cleanup as best-effort. MLS removal is the cryptographic
+        // enforcement; sender key removal is defense-in-depth (§9.16).
         if !is_broadcast {
-            self.crypto
-                .remove_member_sender_key(&context_id_bytes, member_did)?;
             let remove_output = self.crypto.remove_member(&context_id_bytes, member_did)?;
+            if let Err(e) = self
+                .crypto
+                .remove_member_sender_key(&context_id_bytes, member_did)
+            {
+                tracing::warn!(
+                    context_id = %context_id,
+                    member = %member_did,
+                    error = %e,
+                    "remove_member_sender_key failed after MLS removal — \
+                     sender key layer may retain stale key"
+                );
+            }
 
             // Broadcast the MLS Commit to remaining members so they can
             // advance their group epoch and ratchet key material.

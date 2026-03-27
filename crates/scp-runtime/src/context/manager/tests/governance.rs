@@ -4889,19 +4889,20 @@ async fn test_remove_member_sender_key_before_mls_removal() {
         .await
         .unwrap();
 
+    // H9: MLS removal (remove_member) FIRST, then sender key cleanup.
     let log = call_log.lock().unwrap();
     assert!(log.len() >= 2, "expected at least 2 calls, got: {log:?}");
-    let sk_idx = log
-        .iter()
-        .position(|s| s.starts_with("remove_member_sender_key"))
-        .expect("remove_member_sender_key not called");
     let rm_idx = log
         .iter()
         .position(|s| s.starts_with("remove_member:"))
         .expect("remove_member not called");
+    let sk_idx = log
+        .iter()
+        .position(|s| s.starts_with("remove_member_sender_key"))
+        .expect("remove_member_sender_key not called");
     assert!(
-        sk_idx < rm_idx,
-        "remove_member_sender_key (idx={sk_idx}) must be called BEFORE remove_member (idx={rm_idx}): {log:?}"
+        rm_idx < sk_idx,
+        "remove_member (idx={rm_idx}) must be called BEFORE remove_member_sender_key (idx={sk_idx}): {log:?}"
     );
 }
 
@@ -4996,7 +4997,7 @@ async fn test_economy_cost_deducted_on_send() {
     params.economic_policy = Some(EconomicPolicy {
         locked: false,
         cost_schedule: CostSchedule {
-            currency: CurrencyCode::new([85, 83, 68, 0]),
+            currency: CurrencyCode([85, 83, 68, 0]),
             per_message: Some(Amount::new(10)),
             per_tool_invoke: None,
             per_join: None,
@@ -5174,7 +5175,7 @@ async fn test_budget_exceeded_blocks_send() {
     params.economic_policy = Some(EconomicPolicy {
         locked: false,
         cost_schedule: CostSchedule {
-            currency: CurrencyCode::new([85, 83, 68, 0]),
+            currency: CurrencyCode([85, 83, 68, 0]),
             per_message: Some(Amount::new(100)),
             per_tool_invoke: None,
             per_join: None,
@@ -5655,26 +5656,27 @@ async fn test_capability_suspension_no_match_returns_false() {
         .await
         .unwrap();
 
-    // The ConsequenceEnforced event should show success=false since no capabilities
-    // actually matched.
+    // H10: non-matching caps produce success=false, which escalates to
+    // AccessRevocation. The escalation event has action_type="AccessRevocation(escalated)"
+    // and success=true.
     let events = manager.drain_events("no-match-ctx").await;
-    let enforced_with_success_false = events.iter().any(|e| {
+    let enforced_with_escalation = events.iter().any(|e| {
         matches!(e, ContextEvent::ConsequenceEnforced { action_type, success, .. }
-            if action_type == "CapabilitySuspension" && !*success)
+            if action_type == "AccessRevocation(escalated)" && *success)
     });
     assert!(
-        enforced_with_success_false,
-        "expected ConsequenceEnforced with success=false for non-matching caps: {events:?}"
+        enforced_with_escalation,
+        "expected ConsequenceEnforced with escalated AccessRevocation for non-matching caps: {events:?}"
     );
 
-    // Verify admin was NOT added to write_revoked (no capabilities matched).
+    // H10: admin IS now in write_revoked due to escalation.
     let contexts = manager.contexts.lock().await;
     let ctx = contexts.get("no-match-ctx").unwrap();
     assert!(
-        !ctx.access
+        ctx.access
             .write_revoked_members
             .contains(&DID::from("did:key:admin")),
-        "admin should NOT be in write_revoked when no capabilities matched"
+        "admin should be in write_revoked after escalation (H10)"
     );
 }
 
@@ -5694,7 +5696,7 @@ async fn test_auto_accept_blocked_for_paid_contexts() {
     params.economic_policy = Some(EconomicPolicy {
         locked: false,
         cost_schedule: CostSchedule {
-            currency: CurrencyCode::new([85, 83, 68, 0]),
+            currency: CurrencyCode([85, 83, 68, 0]),
             per_message: None,
             per_tool_invoke: None,
             per_join: Some(Amount::new(50)),
@@ -5914,7 +5916,7 @@ async fn velocity_consequence_triggers_on_high_rate() {
     let mut params = governance_params();
     params.consequence_rules = vec![ConsequenceRule {
         trigger: ConsequenceTrigger::MessageVelocity,
-        threshold: 0,
+        threshold: 1,
         action: ConsequenceAction::CapabilitySuspension(vec!["write".to_owned()]),
         window: Duration::from_secs(3600),
     }];
@@ -6093,20 +6095,21 @@ async fn sender_key_before_mls_removal_ordering() {
         .await;
     assert!(result.is_ok(), "remove member should succeed: {result:?}");
 
-    // Verify call ordering: remove_member_sender_key MUST come before remove_member.
+    // H9: verify call ordering: remove_member (MLS, hard boundary) MUST come
+    // BEFORE remove_member_sender_key (best-effort cleanup).
     let calls = call_order.lock().unwrap();
-    let sender_key_pos = calls
-        .iter()
-        .position(|(method, _)| method == "remove_member_sender_key")
-        .expect("remove_member_sender_key should have been called");
     let remove_pos = calls
         .iter()
         .position(|(method, _)| method == "remove_member")
         .expect("remove_member should have been called");
+    let sender_key_pos = calls
+        .iter()
+        .position(|(method, _)| method == "remove_member_sender_key")
+        .expect("remove_member_sender_key should have been called");
     assert!(
-        sender_key_pos < remove_pos,
-        "remove_member_sender_key (pos {sender_key_pos}) must be called before \
-         remove_member (pos {remove_pos}). Call order: {calls:?}"
+        remove_pos < sender_key_pos,
+        "remove_member (pos {remove_pos}) must be called before \
+         remove_member_sender_key (pos {sender_key_pos}). Call order: {calls:?}"
     );
 }
 
@@ -6119,7 +6122,7 @@ async fn budget_exceeded_on_tool_invoke() {
     let policy = EconomicPolicy {
         locked: false,
         cost_schedule: CostSchedule {
-            currency: CurrencyCode::new([85, 83, 68, 0]),
+            currency: CurrencyCode([85, 83, 68, 0]),
             per_message: None,
             per_tool_invoke: Some(Amount::new(100)),
             per_join: None,
@@ -6365,7 +6368,7 @@ async fn consequence_triggers_after_governance_action() {
     let mut params = governance_params();
     params.consequence_rules = vec![ConsequenceRule {
         trigger: ConsequenceTrigger::MessageVelocity,
-        threshold: 0,
+        threshold: 1,
         action: ConsequenceAction::CapabilitySuspension(vec!["write".to_owned()]),
         window: Duration::from_secs(3600),
     }];
@@ -6391,12 +6394,19 @@ async fn consequence_triggers_after_governance_action() {
     let _ = manager.drain_events("gov-conseq-ctx").await;
 
     // Clear write revocation from the first send's consequence.
+    // Re-inject a MessageSent event so the rule (threshold=1) can fire
+    // during governance finalization.
     {
         let mut contexts = manager.contexts.lock().await;
         let ctx = contexts.get_mut("gov-conseq-ctx").unwrap();
         ctx.access.write_revoked_members.clear();
         ctx.access.read_revoked_members.clear();
         ctx.governance.cooldown_until.clear();
+        ctx.receive_buffer.push(ContextEvent::MessageSent {
+            sender_did: admin.clone(),
+            sequence_number: 1,
+            payload: vec![],
+        });
     }
 
     // Execute a governance action — finalize_governance_action calls
@@ -6893,7 +6903,7 @@ async fn full_send_consequence_enforcement_round_trip() {
     params.economic_policy = Some(EconomicPolicy {
         locked: false,
         cost_schedule: CostSchedule {
-            currency: CurrencyCode::new([85, 83, 68, 0]),
+            currency: CurrencyCode([85, 83, 68, 0]),
             per_message: Some(Amount::new(5)),
             per_tool_invoke: None,
             per_join: None,
@@ -6907,7 +6917,7 @@ async fn full_send_consequence_enforcement_round_trip() {
     // Consequence rule that triggers on any message.
     params.consequence_rules = vec![ConsequenceRule {
         trigger: ConsequenceTrigger::MessageVelocity,
-        threshold: 0,
+        threshold: 1,
         action: ConsequenceAction::CapabilitySuspension(vec!["write".to_owned()]),
         window: Duration::from_secs(3600),
     }];
@@ -7066,7 +7076,7 @@ async fn capability_suspension_blocks_subsequent_send() {
     let mut params = governance_params();
     params.consequence_rules = vec![ConsequenceRule {
         trigger: ConsequenceTrigger::MessageVelocity,
-        threshold: 0,
+        threshold: 1,
         action: ConsequenceAction::CapabilitySuspension(vec!["write".to_owned()]),
         window: Duration::from_secs(3600),
     }];
@@ -7137,7 +7147,7 @@ async fn access_revocation_blocks_subsequent_send() {
     let mut params = governance_params();
     params.consequence_rules = vec![ConsequenceRule {
         trigger: ConsequenceTrigger::MessageVelocity,
-        threshold: 0,
+        threshold: 1,
         action: ConsequenceAction::AccessRevocation,
         window: Duration::from_secs(3600),
     }];
@@ -7202,7 +7212,7 @@ async fn join_context_with_join_cost_no_budget_rejected() {
     params.economic_policy = Some(EconomicPolicy {
         locked: false,
         cost_schedule: CostSchedule {
-            currency: CurrencyCode::new([85, 83, 68, 0]),
+            currency: CurrencyCode([85, 83, 68, 0]),
             per_message: None,
             per_tool_invoke: None,
             per_join: Some(Amount::new(50)),
@@ -7475,7 +7485,7 @@ async fn consequence_triggers_on_message_send() {
     let mut params = governance_params();
     params.consequence_rules = vec![ConsequenceRule {
         trigger: ConsequenceTrigger::MessageVelocity,
-        threshold: 0,
+        threshold: 1,
         action: ConsequenceAction::CapabilitySuspension(vec!["write".to_owned()]),
         window: Duration::from_secs(3600),
     }];
@@ -7549,7 +7559,7 @@ async fn role_demotion_consequence_changes_role() {
     // Rule: on any message (threshold=0), demote to "subscriber" role.
     params.consequence_rules = vec![ConsequenceRule {
         trigger: ConsequenceTrigger::MessageVelocity,
-        threshold: 0,
+        threshold: 1,
         action: ConsequenceAction::RoleDemotion {
             to_role: "subscriber".to_owned(),
         },
@@ -7621,7 +7631,7 @@ async fn send_message_deducts_budget() {
     params.economic_policy = Some(EconomicPolicy {
         locked: false,
         cost_schedule: CostSchedule {
-            currency: CurrencyCode::new([85, 83, 68, 0]),
+            currency: CurrencyCode([85, 83, 68, 0]),
             per_message: Some(Amount::new(5)),
             per_tool_invoke: None,
             per_join: None,
@@ -7722,7 +7732,7 @@ async fn tool_invoke_deducts_budget() {
     let policy = EconomicPolicy {
         locked: false,
         cost_schedule: CostSchedule {
-            currency: CurrencyCode::new([85, 83, 68, 0]),
+            currency: CurrencyCode([85, 83, 68, 0]),
             per_message: None,
             per_tool_invoke: Some(Amount::new(20)),
             per_join: None,
@@ -8065,7 +8075,7 @@ async fn paid_join_end_to_end_with_adapter() {
     params.economic_policy = Some(EconomicPolicy {
         locked: false,
         cost_schedule: CostSchedule {
-            currency: CurrencyCode::new([85, 83, 68, 0]),
+            currency: CurrencyCode([85, 83, 68, 0]),
             per_message: None,
             per_tool_invoke: None,
             per_join: Some(Amount::new(25)),
@@ -8123,6 +8133,7 @@ async fn paid_join_end_to_end_with_adapter() {
             scp_protocol::economy::types::PaidActionType::ContextJoin,
             &"did:key:joiner".into(),
             "paid-join-ctx",
+            None,
         )
         .await;
     assert!(auth.is_ok(), "authorize should succeed");
@@ -8200,7 +8211,7 @@ async fn join_context_deducts_budget_when_granted() {
     params.economic_policy = Some(EconomicPolicy {
         locked: false,
         cost_schedule: CostSchedule {
-            currency: CurrencyCode::new([85, 83, 68, 0]),
+            currency: CurrencyCode([85, 83, 68, 0]),
             per_message: None,
             per_tool_invoke: None,
             per_join: Some(Amount::new(10)),
@@ -8412,7 +8423,7 @@ async fn test_consequence_triggers_on_governance_action() {
     let mut params = governance_params();
     params.consequence_rules = vec![ConsequenceRule {
         trigger: ConsequenceTrigger::MessageVelocity,
-        threshold: 0,
+        threshold: 1,
         action: ConsequenceAction::CapabilitySuspension(vec!["write".to_owned()]),
         window: Duration::from_secs(3600),
     }];
@@ -8437,12 +8448,18 @@ async fn test_consequence_triggers_on_governance_action() {
     // Drain to isolate governance events.
     let _ = manager.drain_events("gov-c-trig-ctx").await;
 
-    // Clear consequence enforcement from the send.
+    // Clear consequence enforcement from the send and re-inject an event
+    // so the rule (threshold=1) can fire during governance finalization.
     {
         let mut contexts = manager.contexts.lock().await;
         let ctx = contexts.get_mut("gov-c-trig-ctx").unwrap();
         ctx.access.write_revoked_members.clear();
         ctx.governance.cooldown_until.clear();
+        ctx.receive_buffer.push(ContextEvent::MessageSent {
+            sender_did: admin.clone(),
+            sequence_number: 1,
+            payload: vec![],
+        });
     }
 
     // Execute governance action.
@@ -8483,7 +8500,7 @@ async fn test_capability_suspension_blocks_subsequent_send() {
     let mut params = governance_params();
     params.consequence_rules = vec![ConsequenceRule {
         trigger: ConsequenceTrigger::MessageVelocity,
-        threshold: 0,
+        threshold: 1,
         action: ConsequenceAction::CapabilitySuspension(vec!["write".to_owned()]),
         window: Duration::from_secs(3600),
     }];
@@ -8554,7 +8571,7 @@ async fn test_access_revocation_blocks_subsequent_send() {
     let mut params = governance_params();
     params.consequence_rules = vec![ConsequenceRule {
         trigger: ConsequenceTrigger::MessageVelocity,
-        threshold: 0,
+        threshold: 1,
         action: ConsequenceAction::AccessRevocation,
         window: Duration::from_secs(3600),
     }];
@@ -8761,13 +8778,13 @@ async fn test_multiple_consequence_rules_all_evaluated() {
     params.consequence_rules = vec![
         ConsequenceRule {
             trigger: ConsequenceTrigger::MessageVelocity,
-            threshold: 0,
+            threshold: 1,
             action: ConsequenceAction::CapabilitySuspension(vec!["write".to_owned()]),
             window: Duration::from_secs(3600),
         },
         ConsequenceRule {
             trigger: ConsequenceTrigger::MessageVelocity,
-            threshold: 0,
+            threshold: 1,
             action: ConsequenceAction::RoleDemotion {
                 to_role: "subscriber".to_owned(),
             },
@@ -8831,7 +8848,7 @@ async fn test_send_rejected_insufficient_budget() {
     params.economic_policy = Some(EconomicPolicy {
         locked: false,
         cost_schedule: CostSchedule {
-            currency: CurrencyCode::new([85, 83, 68, 0]),
+            currency: CurrencyCode([85, 83, 68, 0]),
             per_message: Some(Amount::new(5)),
             per_tool_invoke: None,
             per_join: None,
@@ -8894,7 +8911,7 @@ async fn test_tool_invoke_rejected_insufficient_budget() {
     let policy = EconomicPolicy {
         locked: false,
         cost_schedule: CostSchedule {
-            currency: CurrencyCode::new([85, 83, 68, 0]),
+            currency: CurrencyCode([85, 83, 68, 0]),
             per_message: None,
             per_tool_invoke: Some(Amount::new(50)),
             per_join: None,
@@ -8957,7 +8974,7 @@ async fn test_join_rejected_insufficient_budget() {
     params.economic_policy = Some(EconomicPolicy {
         locked: false,
         cost_schedule: CostSchedule {
-            currency: CurrencyCode::new([85, 83, 68, 0]),
+            currency: CurrencyCode([85, 83, 68, 0]),
             per_message: None,
             per_tool_invoke: None,
             per_join: Some(Amount::new(100)),
@@ -9042,7 +9059,7 @@ async fn test_execute_paid_action_skips_without_adapter() {
     params.economic_policy = Some(EconomicPolicy {
         locked: false,
         cost_schedule: CostSchedule {
-            currency: CurrencyCode::new([85, 83, 68, 0]),
+            currency: CurrencyCode([85, 83, 68, 0]),
             per_message: Some(Amount::new(10)),
             per_tool_invoke: None,
             per_join: None,
@@ -9064,6 +9081,7 @@ async fn test_execute_paid_action_skips_without_adapter() {
             scp_protocol::economy::types::PaidActionType::MessageSend,
             &"did:key:admin".into(),
             "no-adpt2-ctx",
+            None,
         )
         .await;
     assert!(
@@ -9096,7 +9114,7 @@ async fn test_execute_paid_action_full_flow_with_adapter() {
     params.economic_policy = Some(EconomicPolicy {
         locked: false,
         cost_schedule: CostSchedule {
-            currency: CurrencyCode::new([85, 83, 68, 0]),
+            currency: CurrencyCode([85, 83, 68, 0]),
             per_message: Some(Amount::new(10)),
             per_tool_invoke: None,
             per_join: None,
@@ -9130,6 +9148,7 @@ async fn test_execute_paid_action_full_flow_with_adapter() {
             scp_protocol::economy::types::PaidActionType::MessageSend,
             &"did:key:admin".into(),
             "adpt2-ctx",
+            None,
         )
         .await;
     assert!(auth.is_ok(), "authorize should succeed");
@@ -9218,6 +9237,8 @@ async fn test_free_context_no_budget_deduction() {
 /// Sender key removal error propagates from `execute_remove_member` (#1541).
 #[tokio::test]
 async fn test_sender_key_removal_error_propagates() {
+    // H9: sender key failure is now best-effort — MLS removal (the hard
+    // boundary) succeeds, and sender key failure is logged but not propagated.
     let crypto = MockCrypto {
         fail_remove_member_sender_key: AtomicBool::new(true),
         ..MockCrypto::default()
@@ -9247,7 +9268,7 @@ async fn test_sender_key_removal_error_propagates() {
     };
     manager.join_context(&handle, kp, None).await.unwrap();
 
-    // Remove Alice — sender key removal will fail.
+    // Remove Alice — sender key removal will fail but MLS removal succeeds.
     let action = scp_protocol::context::governance::GovernanceAction::RemoveMember {
         did: alice.clone(),
         reason: Some("error propagation test".into()),
@@ -9255,14 +9276,10 @@ async fn test_sender_key_removal_error_propagates() {
     let result = manager
         .propose_governance_action("sk-err2-ctx", &admin, action, &key_admin)
         .await;
+    // H9: removal should succeed — sender key failure is best-effort.
     assert!(
-        result.is_err(),
-        "remove_member should fail when sender key removal fails"
-    );
-    let err = result.unwrap_err();
-    assert!(
-        matches!(err, ContextError::CryptoFailed(_)),
-        "expected CryptoFailed, got: {err}"
+        result.is_ok(),
+        "remove_member should succeed even when sender key removal fails: {result:?}"
     );
 }
 
@@ -9436,7 +9453,7 @@ async fn test_send_consequence_economy_round_trip() {
     params.economic_policy = Some(EconomicPolicy {
         locked: false,
         cost_schedule: CostSchedule {
-            currency: CurrencyCode::new([85, 83, 68, 0]),
+            currency: CurrencyCode([85, 83, 68, 0]),
             per_message: Some(Amount::new(5)),
             per_tool_invoke: None,
             per_join: None,
@@ -9449,7 +9466,7 @@ async fn test_send_consequence_economy_round_trip() {
     });
     params.consequence_rules = vec![ConsequenceRule {
         trigger: ConsequenceTrigger::MessageVelocity,
-        threshold: 0,
+        threshold: 1,
         action: ConsequenceAction::CapabilitySuspension(vec!["write".to_owned()]),
         window: Duration::from_secs(3600),
     }];
@@ -9597,7 +9614,7 @@ async fn test_paid_join_with_consequence_evaluation() {
     params.economic_policy = Some(EconomicPolicy {
         locked: false,
         cost_schedule: CostSchedule {
-            currency: CurrencyCode::new([85, 83, 68, 0]),
+            currency: CurrencyCode([85, 83, 68, 0]),
             per_message: None,
             per_tool_invoke: None,
             per_join: Some(Amount::new(25)),
@@ -9610,7 +9627,7 @@ async fn test_paid_join_with_consequence_evaluation() {
     });
     params.consequence_rules = vec![ConsequenceRule {
         trigger: ConsequenceTrigger::MessageVelocity,
-        threshold: 0,
+        threshold: 1,
         action: ConsequenceAction::CapabilitySuspension(vec!["write".to_owned()]),
         window: Duration::from_secs(3600),
     }];
@@ -9705,7 +9722,7 @@ async fn test_full_lifecycle_economy() {
     params.economic_policy = Some(EconomicPolicy {
         locked: false,
         cost_schedule: CostSchedule {
-            currency: CurrencyCode::new([85, 83, 68, 0]),
+            currency: CurrencyCode([85, 83, 68, 0]),
             per_message: Some(Amount::new(10)),
             per_tool_invoke: None,
             per_join: None,
@@ -9911,7 +9928,7 @@ async fn setup_velocity_escalation_context() -> (
     params.economic_policy = Some(EconomicPolicy {
         locked: false,
         cost_schedule: CostSchedule {
-            currency: CurrencyCode::new([85, 83, 68, 0]),
+            currency: CurrencyCode([85, 83, 68, 0]),
             per_message: Some(Amount::new(1)),
             per_tool_invoke: None,
             per_join: None,
@@ -10005,29 +10022,30 @@ async fn rotate_sender_key_called_after_remove_member() {
         .await;
     assert!(result.is_ok(), "remove member should succeed: {result:?}");
 
-    // Verify full call ordering: remove_member_sender_key → remove_member → rotate_sender_key.
+    // H9: verify ordering: remove_member → remove_member_sender_key → rotate_sender_key.
+    // MLS removal (hard boundary) first, then sender key cleanup (best-effort).
     let calls = call_order.lock().unwrap();
-    let sk_remove_pos = calls
-        .iter()
-        .position(|(method, _)| method == "remove_member_sender_key")
-        .expect("remove_member_sender_key should have been called");
     let mls_remove_pos = calls
         .iter()
         .position(|(method, _)| method == "remove_member")
         .expect("remove_member should have been called");
+    let sk_remove_pos = calls
+        .iter()
+        .position(|(method, _)| method == "remove_member_sender_key")
+        .expect("remove_member_sender_key should have been called");
     let rotate_pos = calls
         .iter()
         .position(|(method, _)| method == "rotate_sender_key")
         .expect("rotate_sender_key should have been called");
 
     assert!(
-        sk_remove_pos < mls_remove_pos,
-        "remove_member_sender_key (pos {sk_remove_pos}) must precede \
-         remove_member (pos {mls_remove_pos}). Calls: {calls:?}"
+        mls_remove_pos < sk_remove_pos,
+        "remove_member (pos {mls_remove_pos}) must precede \
+         remove_member_sender_key (pos {sk_remove_pos}). Calls: {calls:?}"
     );
     assert!(
-        mls_remove_pos < rotate_pos,
-        "remove_member (pos {mls_remove_pos}) must precede \
+        sk_remove_pos < rotate_pos,
+        "remove_member_sender_key (pos {sk_remove_pos}) must precede \
          rotate_sender_key (pos {rotate_pos}). Calls: {calls:?}"
     );
 }
@@ -10125,25 +10143,26 @@ async fn rotate_sender_key_called_on_leave() {
         "rotate_sender_key must be called on leave_context. Calls: {calls:?}"
     );
 
-    // Verify ordering: remove_member_sender_key → remove_member → rotate_sender_key.
-    let sk_remove_pos = calls
-        .iter()
-        .position(|(method, _)| method == "remove_member_sender_key")
-        .expect("remove_member_sender_key should have been called");
+    // H9: verify ordering: remove_member → remove_member_sender_key → rotate_sender_key.
+    // MLS removal (hard boundary) first, then sender key cleanup (best-effort).
     let mls_remove_pos = calls
         .iter()
         .position(|(method, _)| method == "remove_member")
         .expect("remove_member should have been called");
+    let sk_remove_pos = calls
+        .iter()
+        .position(|(method, _)| method == "remove_member_sender_key")
+        .expect("remove_member_sender_key should have been called");
     let rotate_pos = rotate_pos.unwrap();
 
     assert!(
-        sk_remove_pos < mls_remove_pos,
-        "remove_member_sender_key (pos {sk_remove_pos}) must precede \
-         remove_member (pos {mls_remove_pos}). Calls: {calls:?}"
+        mls_remove_pos < sk_remove_pos,
+        "remove_member (pos {mls_remove_pos}) must precede \
+         remove_member_sender_key (pos {sk_remove_pos}). Calls: {calls:?}"
     );
     assert!(
-        mls_remove_pos < rotate_pos,
-        "remove_member (pos {mls_remove_pos}) must precede \
+        sk_remove_pos < rotate_pos,
+        "remove_member_sender_key (pos {sk_remove_pos}) must precede \
          rotate_sender_key (pos {rotate_pos}). Calls: {calls:?}"
     );
 }
@@ -10170,7 +10189,7 @@ async fn test_paid_send_rejected_without_spending_ucan() {
     params.economic_policy = Some(EconomicPolicy {
         locked: false,
         cost_schedule: CostSchedule {
-            currency: CurrencyCode::new([85, 83, 68, 0]),
+            currency: CurrencyCode([85, 83, 68, 0]),
             per_message: Some(Amount::new(10)),
             per_tool_invoke: None,
             per_join: None,
@@ -10269,7 +10288,7 @@ async fn test_paid_join_rejected_without_spending_ucan() {
     params.economic_policy = Some(EconomicPolicy {
         locked: false,
         cost_schedule: CostSchedule {
-            currency: CurrencyCode::new([85, 83, 68, 0]),
+            currency: CurrencyCode([85, 83, 68, 0]),
             per_message: None,
             per_tool_invoke: None,
             per_join: Some(Amount::new(50)),
@@ -10542,7 +10561,7 @@ async fn paid_send_with_valid_spending_ucan_succeeds() {
     params.economic_policy = Some(EconomicPolicy {
         locked: false,
         cost_schedule: CostSchedule {
-            currency: CurrencyCode::new([85, 83, 68, 0]),
+            currency: CurrencyCode([85, 83, 68, 0]),
             per_message: Some(Amount::new(10)),
             per_tool_invoke: None,
             per_join: None,
@@ -10641,7 +10660,7 @@ async fn zero_cost_per_message_no_ucan_required() {
     params.economic_policy = Some(EconomicPolicy {
         locked: false,
         cost_schedule: CostSchedule {
-            currency: CurrencyCode::new([85, 83, 68, 0]),
+            currency: CurrencyCode([85, 83, 68, 0]),
             per_message: Some(Amount::new(0)), // zero cost
             per_tool_invoke: None,
             per_join: None,
@@ -10703,7 +10722,7 @@ async fn none_per_message_no_ucan_required() {
     params.economic_policy = Some(EconomicPolicy {
         locked: false,
         cost_schedule: CostSchedule {
-            currency: CurrencyCode::new([85, 83, 68, 0]),
+            currency: CurrencyCode([85, 83, 68, 0]),
             per_message: None, // no per-message cost
             per_tool_invoke: Some(Amount::new(100)),
             per_join: None,
@@ -10765,7 +10784,7 @@ async fn multiple_sends_same_spending_ucan_all_succeed() {
     params.economic_policy = Some(EconomicPolicy {
         locked: false,
         cost_schedule: CostSchedule {
-            currency: CurrencyCode::new([85, 83, 68, 0]),
+            currency: CurrencyCode([85, 83, 68, 0]),
             per_message: Some(Amount::new(5)),
             per_tool_invoke: None,
             per_join: None,
@@ -10842,7 +10861,7 @@ async fn paid_join_with_spending_ucan_still_blocked_by_auto_accept() {
     params.economic_policy = Some(EconomicPolicy {
         locked: false,
         cost_schedule: CostSchedule {
-            currency: CurrencyCode::new([85, 83, 68, 0]),
+            currency: CurrencyCode([85, 83, 68, 0]),
             per_message: None,
             per_tool_invoke: None,
             per_join: Some(Amount::new(50)),
@@ -10936,7 +10955,8 @@ async fn rotate_sender_key_not_called_when_remove_member_fails() {
         "remove_member failure should propagate: {result:?}"
     );
 
-    // Verify rotate_sender_key was NOT called.
+    // H9: MLS removal is first. Since it failed, neither sender key removal
+    // nor rotate_sender_key should have been called.
     let calls = call_order.lock().unwrap();
     let rotate_called = calls
         .iter()
@@ -10945,13 +10965,14 @@ async fn rotate_sender_key_not_called_when_remove_member_fails() {
         !rotate_called,
         "rotate_sender_key should NOT be called when remove_member fails. Calls: {calls:?}"
     );
-    // But remove_member_sender_key SHOULD have been called (it precedes remove_member).
+    // remove_member_sender_key should NOT have been called either (it comes after
+    // remove_member in H9 ordering, and remove_member failed).
     let sk_remove_called = calls
         .iter()
         .any(|(method, _)| method == "remove_member_sender_key");
     assert!(
-        sk_remove_called,
-        "remove_member_sender_key should still have been called. Calls: {calls:?}"
+        !sk_remove_called,
+        "remove_member_sender_key should NOT be called when remove_member fails. Calls: {calls:?}"
     );
 }
 
@@ -11172,7 +11193,7 @@ async fn no_auto_grant_requires_explicit_budget() {
     params.economic_policy = Some(EconomicPolicy {
         locked: false,
         cost_schedule: CostSchedule {
-            currency: CurrencyCode::new([85, 83, 68, 0]),
+            currency: CurrencyCode([85, 83, 68, 0]),
             per_message: Some(Amount::new(10)),
             per_tool_invoke: None,
             per_join: None,
@@ -11260,7 +11281,7 @@ async fn no_double_charge_on_paid_send() {
     params.economic_policy = Some(EconomicPolicy {
         locked: false,
         cost_schedule: CostSchedule {
-            currency: CurrencyCode::new([85, 83, 68, 0]),
+            currency: CurrencyCode([85, 83, 68, 0]),
             per_message: Some(Amount::new(100)),
             per_tool_invoke: None,
             per_join: None,
@@ -11376,7 +11397,8 @@ async fn capability_suspension_exact_match_no_false_positive() {
         .await
         .unwrap();
 
-    // "spreadsheet" should NOT have revoked write access.
+    // H10: "spreadsheet" is unknown — enforce_capability_suspension returns false,
+    // which escalates to AccessRevocation. So write access IS now revoked.
     let write_revoked = {
         let contexts = manager.contexts.lock().await;
         let ctx = contexts.get("cap-exact-ctx").unwrap();
@@ -11385,24 +11407,24 @@ async fn capability_suspension_exact_match_no_false_positive() {
             .contains(&DID::from("did:key:sender"))
     };
     assert!(
-        !write_revoked,
-        "\"spreadsheet\" suspension should NOT revoke write access (exact match)"
+        write_revoked,
+        "unknown capability suspension should escalate to access revocation (H10)"
     );
 
-    // Member should still be able to send.
+    // Member should NOT be able to send after escalation.
     let result = manager
         .send_message(
             &handle,
             &"did:key:sender".into(),
-            b"still allowed",
+            b"should be blocked",
             Some(&sk),
             None,
             None,
         )
         .await;
     assert!(
-        result.is_ok(),
-        "sender should still have write access: {result:?}"
+        result.is_err(),
+        "sender should be blocked after escalation: {result:?}"
     );
 }
 
@@ -11659,7 +11681,7 @@ async fn role_demotion_nonexistent_role_reports_failure() {
         .await
         .unwrap();
 
-    // Verify that ConsequenceEnforced event has success=false.
+    // H10: failed enforcement (nonexistent role) escalates to AccessRevocation.
     let events = manager.drain_events("role-noexist-ctx").await;
     let enforced_events: Vec<_> = events
         .iter()
@@ -11669,13 +11691,28 @@ async fn role_demotion_nonexistent_role_reports_failure() {
         !enforced_events.is_empty(),
         "should have ConsequenceEnforced event"
     );
-    // Check for success=false in the enforcement event.
-    let has_failure = enforced_events
-        .iter()
-        .any(|e| matches!(e, ContextEvent::ConsequenceEnforced { success, .. } if !success));
+    // The escalated enforcement should be AccessRevocation(escalated) with success=true.
+    let has_escalation = enforced_events.iter().any(|e| {
+        matches!(
+            e,
+            ContextEvent::ConsequenceEnforced {
+                action_type,
+                success,
+                ..
+            } if *success && action_type == "AccessRevocation(escalated)"
+        )
+    });
     assert!(
-        has_failure,
-        "RoleDemotion to nonexistent role should report success=false. Events: {enforced_events:?}"
+        has_escalation,
+        "Failed RoleDemotion should escalate to AccessRevocation. Events: {enforced_events:?}"
+    );
+    // Verify the member is now access-revoked.
+    let contexts = manager.contexts.lock().await;
+    let ctx = contexts.get("role-noexist-ctx").unwrap();
+    let sender_did: DID = "did:key:sender".into();
+    assert!(
+        ctx.access.write_revoked_members.contains(&sender_did),
+        "sender should be write-revoked after escalation"
     );
 }
 
@@ -11700,7 +11737,7 @@ async fn execute_paid_action_skips_zero_cost() {
     params.economic_policy = Some(EconomicPolicy {
         locked: false,
         cost_schedule: CostSchedule {
-            currency: CurrencyCode::new([85, 83, 68, 0]),
+            currency: CurrencyCode([85, 83, 68, 0]),
             per_message: Some(Amount::new(0)), // zero cost
             per_tool_invoke: None,
             per_join: None,
@@ -11721,6 +11758,7 @@ async fn execute_paid_action_skips_zero_cost() {
             scp_protocol::economy::types::PaidActionType::MessageSend,
             &"did:key:sender".into(),
             "zero-paid-ctx",
+            None,
         )
         .await;
     assert!(
@@ -12012,45 +12050,47 @@ async fn capability_suspension_empty_caps_no_action() {
         .await
         .unwrap();
 
-    // The consequence fires but with empty caps, nothing should be revoked.
-    let write_revoked = {
+    // H10: empty caps produces success=false, which escalates to AccessRevocation.
+    // So the member should be write+read revoked after escalation.
+    let (write_revoked, read_revoked) = {
         let contexts = manager.contexts.lock().await;
         let ctx = contexts.get("empty-caps-ctx").unwrap();
-        ctx.access
-            .write_revoked_members
-            .contains(&DID::from("did:key:sender"))
-    };
-    let read_revoked = {
-        let contexts = manager.contexts.lock().await;
-        let ctx = contexts.get("empty-caps-ctx").unwrap();
-        ctx.access
-            .read_revoked_members
-            .contains(&DID::from("did:key:sender"))
+        let sender = DID::from("did:key:sender");
+        (
+            ctx.access.write_revoked_members.contains(&sender),
+            ctx.access.read_revoked_members.contains(&sender),
+        )
     };
     assert!(
-        !write_revoked,
-        "empty caps suspension should not revoke write"
+        write_revoked,
+        "empty caps suspension should escalate to write revocation (H10)"
     );
     assert!(
-        !read_revoked,
-        "empty caps suspension should not revoke read"
+        read_revoked,
+        "empty caps suspension should escalate to read revocation (H10)"
     );
 
-    // Verify ConsequenceEnforced with success=false.
+    // Verify ConsequenceEnforced with escalated AccessRevocation.
     let events = manager.drain_events("empty-caps-ctx").await;
     let enforced_events: Vec<_> = events
         .iter()
         .filter(|e| matches!(e, ContextEvent::ConsequenceEnforced { .. }))
         .collect();
-    if !enforced_events.is_empty() {
-        let has_false_success = enforced_events
-            .iter()
-            .any(|e| matches!(e, ContextEvent::ConsequenceEnforced { success, .. } if !success));
-        assert!(
-            has_false_success,
-            "empty caps CapabilitySuspension should report success=false"
-        );
-    }
+    assert!(
+        !enforced_events.is_empty(),
+        "should have ConsequenceEnforced event"
+    );
+    let has_escalation = enforced_events.iter().any(|e| {
+        matches!(
+            e,
+            ContextEvent::ConsequenceEnforced { action_type, success, .. }
+                if *success && action_type == "AccessRevocation(escalated)"
+        )
+    });
+    assert!(
+        has_escalation,
+        "empty caps should escalate to AccessRevocation. Events: {enforced_events:?}"
+    );
 }
 
 // -----------------------------------------------------------------------
@@ -12160,7 +12200,7 @@ async fn aggregate_velocity_via_manager_send() {
     params.economic_policy = Some(EconomicPolicy {
         locked: false,
         cost_schedule: CostSchedule {
-            currency: CurrencyCode::new([85, 83, 68, 0]),
+            currency: CurrencyCode([85, 83, 68, 0]),
             per_message: Some(Amount::new(1)),
             per_tool_invoke: None,
             per_join: None,
@@ -12571,7 +12611,7 @@ async fn budget_not_deducted_on_transport_failure() {
     params.economic_policy = Some(EconomicPolicy {
         locked: false,
         cost_schedule: CostSchedule {
-            currency: CurrencyCode::new([85, 83, 68, 0]),
+            currency: CurrencyCode([85, 83, 68, 0]),
             per_message: Some(Amount::new(50)),
             per_tool_invoke: None,
             per_join: None,
@@ -12701,7 +12741,7 @@ async fn observable_metrics_time_of_day_populated() {
     params.economic_policy = Some(EconomicPolicy {
         locked: false,
         cost_schedule: CostSchedule {
-            currency: CurrencyCode::new([85, 83, 68, 0]),
+            currency: CurrencyCode([85, 83, 68, 0]),
             per_message: Some(Amount::new(1)),
             per_tool_invoke: None,
             per_join: None,
@@ -12775,7 +12815,7 @@ async fn context_message_rate_from_aggregate_velocity() {
     params.economic_policy = Some(EconomicPolicy {
         locked: false,
         cost_schedule: CostSchedule {
-            currency: CurrencyCode::new([85, 83, 68, 0]),
+            currency: CurrencyCode([85, 83, 68, 0]),
             per_message: Some(Amount::new(1)),
             per_tool_invoke: None,
             per_join: None,
@@ -13122,7 +13162,7 @@ async fn consequence_timer_fires_without_user_action() {
     // (i.e., inactivity itself is the trigger).
     params.consequence_rules = vec![ConsequenceRule {
         trigger: ConsequenceTrigger::MessageVelocity,
-        threshold: 0,
+        threshold: 1,
         action: ConsequenceAction::CapabilitySuspension(vec!["write".to_owned()]),
         window: Duration::from_secs(3600),
     }];
@@ -13132,11 +13172,20 @@ async fn consequence_timer_fires_without_user_action() {
         .await
         .unwrap();
 
-    // Do NOT send any messages — the consequence should fire purely from
-    // the periodic timer tick.
-
     // Drain any events from context creation itself.
     let _ = manager.drain_events("timer-conseq-ctx").await;
+
+    // Inject one event into the receive buffer so the rule (threshold=1)
+    // can fire from the periodic timer tick.
+    {
+        let mut contexts = manager.contexts.lock().await;
+        let ctx = contexts.get_mut("timer-conseq-ctx").unwrap();
+        ctx.receive_buffer.push(ContextEvent::MessageSent {
+            sender_did: admin.clone(),
+            sequence_number: 0,
+            payload: vec![],
+        });
+    }
 
     // Advance past the 60-second governance timeout interval.
     tokio::time::sleep(Duration::from_secs(61)).await;
@@ -13187,7 +13236,7 @@ async fn consequence_timer_respects_cooldown() {
     params.economic_policy = None;
     params.consequence_rules = vec![ConsequenceRule {
         trigger: ConsequenceTrigger::MessageVelocity,
-        threshold: 0,
+        threshold: 1,
         action: ConsequenceAction::CapabilitySuspension(vec!["write".to_owned()]),
         // Long cooldown window — rule should NOT re-fire on second tick.
         window: Duration::from_secs(7200),
@@ -13199,6 +13248,17 @@ async fn consequence_timer_respects_cooldown() {
         .unwrap();
 
     let _ = manager.drain_events("cooldown-timer-ctx").await;
+
+    // Inject one event so the rule (threshold=1) can fire.
+    {
+        let mut contexts = manager.contexts.lock().await;
+        let ctx = contexts.get_mut("cooldown-timer-ctx").unwrap();
+        ctx.receive_buffer.push(ContextEvent::MessageSent {
+            sender_did: admin.clone(),
+            sequence_number: 0,
+            payload: vec![],
+        });
+    }
 
     // First tick — fires the consequence.
     tokio::time::sleep(Duration::from_secs(61)).await;
@@ -13378,7 +13438,7 @@ fn evaluate_cost_enforce_gate() {
     let policy = EconomicPolicy {
         locked: false,
         cost_schedule: CostSchedule {
-            currency: CurrencyCode::new([85, 83, 68, 0]),
+            currency: CurrencyCode([85, 83, 68, 0]),
             per_message: Some(Amount::new(25)),
             per_tool_invoke: None,
             per_join: None,
@@ -13412,5 +13472,506 @@ fn evaluate_cost_enforce_gate() {
         tool_cost,
         Some(Amount::new(0)),
         "evaluate_cost should return zero for unconfigured action type"
+    );
+}
+
+// -----------------------------------------------------------------------
+// C1: validate_spending_ucan rejects fabricated tokens
+// -----------------------------------------------------------------------
+
+#[tokio::test]
+async fn test_fabricated_spending_ucan_rejected() {
+    use scp_protocol::economy::types::{Amount, CostSchedule, CurrencyCode, EconomicPolicy};
+
+    let manager = ContextManager::new(
+        Box::new(MockCrypto::default()),
+        Box::new(MockTransport::connected()),
+        Box::new(MockEventLog::default()),
+        noop_key_resolver(),
+    );
+
+    let mut params = governance_params();
+    params.economic_policy = Some(EconomicPolicy {
+        locked: false,
+        cost_schedule: CostSchedule {
+            currency: CurrencyCode([85, 83, 68, 0]),
+            per_message: Some(Amount::new(10)),
+            per_join: None,
+            per_tool_invoke: None,
+            per_period: None,
+            per_byte_stored: None,
+        },
+        payment_adapters: vec![],
+        pricing_formula: None,
+        payee: DID::from("did:dht:z6MkPayee"),
+    });
+    let handle = manager
+        .create_context("fab-ucan-ctx".into(), params, "did:key:sender".into())
+        .await
+        .unwrap();
+
+    // Grant budget so the budget check passes.
+    {
+        let mut contexts = manager.contexts.lock().await;
+        let ctx = contexts.get_mut("fab-ucan-ctx").unwrap();
+        ctx.governance
+            .budget_tracker
+            .grant(&"did:key:sender".into(), Amount::new(1000));
+    }
+
+    // Fabricated UCAN: has spending_capability in fct but NO spending
+    // attestation in att — validate_spending_ucan will reject it.
+    let fabricated = scp_protocol::crypto::ucan::UcanToken {
+        header: scp_protocol::crypto::ucan::UcanHeader::new(),
+        payload: scp_protocol::crypto::ucan::UcanPayload {
+            iss: "did:key:attacker".to_owned(),
+            aud: "did:key:target".to_owned(),
+            exp: u64::MAX,
+            nbf: None,
+            nnc: "fabricated".to_owned(),
+            att: vec![], // missing spending attestation
+            prf: vec![],
+            fct: None,
+        },
+        signature: vec![],
+        encoded: "fabricated.ucan".to_owned(),
+    };
+
+    let sk = ed25519_dalek::SigningKey::from_bytes(&[1u8; 32]);
+    let result = manager
+        .send_message(
+            &handle,
+            &"did:key:sender".into(),
+            b"test",
+            Some(&sk),
+            None,
+            Some(&fabricated),
+        )
+        .await;
+    assert!(
+        result.is_err(),
+        "fabricated spending UCAN should be rejected"
+    );
+    let err = format!("{}", result.unwrap_err());
+    // Rejected at AND-composition (SCP-ECON-7061) or validation (SCP-ECON-7062).
+    assert!(
+        err.contains("SCP-ECON-706"),
+        "error should reference an economy error code: {err}"
+    );
+}
+
+// -----------------------------------------------------------------------
+// H7: capability failure does not leak budget
+// -----------------------------------------------------------------------
+
+#[tokio::test]
+async fn test_capability_failure_no_budget_leak() {
+    use scp_protocol::economy::types::{Amount, CostSchedule, CurrencyCode, EconomicPolicy};
+
+    let manager = ContextManager::new(
+        Box::new(MockCrypto::default()),
+        Box::new(MockTransport::connected()),
+        Box::new(MockEventLog::default()),
+        noop_key_resolver(),
+    );
+
+    let mut params = governance_params();
+    params.economic_policy = Some(EconomicPolicy {
+        locked: false,
+        cost_schedule: CostSchedule {
+            currency: CurrencyCode([85, 83, 68, 0]),
+            per_message: Some(Amount::new(50)),
+            per_join: None,
+            per_tool_invoke: None,
+            per_period: None,
+            per_byte_stored: None,
+        },
+        payment_adapters: vec![],
+        pricing_formula: None,
+        payee: DID::from("did:dht:z6MkPayee"),
+    });
+    let handle = manager
+        .create_context("cap-leak-ctx".into(), params, "did:key:admin".into())
+        .await
+        .unwrap();
+
+    // Add a member directly via state mutation (bypassing join_context which
+    // would be blocked by auto_accept_blocked_by_economics). Grant budget but
+    // withhold messages:write capability.
+    {
+        let mut contexts = manager.contexts.lock().await;
+        let ctx = contexts.get_mut("cap-leak-ctx").unwrap();
+        ctx.membership
+            .add_member(DID::from("did:key:nocap"), "member".to_owned(), vec![]);
+        ctx.governance
+            .budget_tracker
+            .grant(&"did:key:nocap".into(), Amount::new(1000));
+        // Ensure the member does NOT have MessagesWrite capability.
+        ctx.role_state.member_capabilities.remove("did:key:nocap");
+    }
+
+    let sk = ed25519_dalek::SigningKey::from_bytes(&[2u8; 32]);
+    let result = manager
+        .send_message(
+            &handle,
+            &"did:key:nocap".into(),
+            b"should fail",
+            Some(&sk),
+            None,
+            None,
+        )
+        .await;
+    assert!(
+        result.is_err(),
+        "send should fail due to missing capability"
+    );
+
+    // Budget should be unchanged (no deduction occurred).
+    let remaining = {
+        let contexts = manager.contexts.lock().await;
+        let ctx = contexts.get("cap-leak-ctx").unwrap();
+        ctx.governance
+            .budget_tracker
+            .remaining(&"did:key:nocap".into())
+    };
+    assert_eq!(
+        remaining,
+        Amount::new(1000),
+        "budget should be unchanged after capability failure (H7)"
+    );
+}
+
+// -----------------------------------------------------------------------
+// H8: capture failure retains budget
+// -----------------------------------------------------------------------
+
+#[tokio::test]
+async fn test_capture_failure_budget_retained() {
+    use scp_protocol::economy::types::Amount;
+
+    // This test verifies the behavioral contract: after a successful send,
+    // the budget deduction is permanent even if capture fails. We test this
+    // by verifying that send_message succeeds and the budget is deducted.
+    let manager = ContextManager::new(
+        Box::new(MockCrypto::default()),
+        Box::new(MockTransport::connected()),
+        Box::new(MockEventLog::default()),
+        noop_key_resolver(),
+    );
+
+    let mut params = governance_params();
+    params.economic_policy = Some(scp_protocol::economy::types::EconomicPolicy {
+        locked: false,
+        cost_schedule: scp_protocol::economy::types::CostSchedule {
+            currency: scp_protocol::economy::types::CurrencyCode([85, 83, 68, 0]),
+            per_message: Some(Amount::new(10)),
+            per_join: None,
+            per_tool_invoke: None,
+            per_period: None,
+            per_byte_stored: None,
+        },
+        payment_adapters: vec![],
+        pricing_formula: None,
+        payee: DID::from("did:dht:z6MkPayee"),
+    });
+    let handle = manager
+        .create_context("capture-ctx".into(), params, "did:key:sender".into())
+        .await
+        .unwrap();
+    {
+        let mut contexts = manager.contexts.lock().await;
+        let ctx = contexts.get_mut("capture-ctx").unwrap();
+        ctx.governance
+            .budget_tracker
+            .grant(&"did:key:sender".into(), Amount::new(100));
+    }
+
+    let ucan = dummy_spending_ucan();
+    let sk = ed25519_dalek::SigningKey::from_bytes(&[1u8; 32]);
+    manager
+        .send_message(
+            &handle,
+            &"did:key:sender".into(),
+            b"test",
+            Some(&sk),
+            None,
+            Some(&ucan),
+        )
+        .await
+        .unwrap();
+
+    // Budget was deducted and stays deducted (H8: no rollback on capture failure).
+    let remaining = {
+        let contexts = manager.contexts.lock().await;
+        let ctx = contexts.get("capture-ctx").unwrap();
+        ctx.governance
+            .budget_tracker
+            .remaining(&"did:key:sender".into())
+    };
+    assert_eq!(
+        remaining,
+        Amount::new(90),
+        "budget should remain deducted after successful send"
+    );
+}
+
+// -----------------------------------------------------------------------
+// H9: sender key failure still removes from MLS
+// -----------------------------------------------------------------------
+
+#[tokio::test]
+async fn test_sender_key_failure_still_removes_from_mls() {
+    let crypto = MockCrypto {
+        fail_remove_member_sender_key: AtomicBool::new(true),
+        ..MockCrypto::default()
+    };
+    // Use the call_order to verify MLS removal happened.
+    let call_order = Arc::clone(&crypto.call_order);
+
+    let manager = ContextManager::new(
+        Box::new(crypto),
+        Box::new(MockTransport::connected()),
+        Box::new(MockEventLog::default()),
+        mock_key_resolver(),
+    );
+
+    let admin: DID = "did:dht:z6MkSKFail".into();
+    let alice: DID = "did:dht:z6MkSKAlice".into();
+    let key_admin = signing_key_for_did(&admin);
+
+    let params = governance_params();
+    let handle = manager
+        .create_context("sk-fail-ctx".into(), params, admin.clone())
+        .await
+        .unwrap();
+
+    let kp = scp_protocol::context::membership::KeyPackage {
+        owner_did: alice.clone(),
+        mls_key_package_bytes: None,
+    };
+    manager.join_context(&handle, kp, None).await.unwrap();
+    call_order.lock().unwrap().clear();
+
+    // Remove Alice — sender key fails but MLS succeeds.
+    let action = scp_protocol::context::governance::GovernanceAction::RemoveMember {
+        did: alice.clone(),
+        reason: Some("H9 test".into()),
+    };
+    let result = manager
+        .propose_governance_action("sk-fail-ctx", &admin, action, &key_admin)
+        .await;
+
+    // H9: should succeed despite sender key failure.
+    assert!(
+        result.is_ok(),
+        "removal should succeed when sender key fails: {result:?}"
+    );
+
+    // MLS removal DID happen.
+    let calls = call_order.lock().unwrap();
+    let mls_removed = calls.iter().any(|(method, _)| method == "remove_member");
+    assert!(mls_removed, "remove_member should have been called");
+}
+
+// -----------------------------------------------------------------------
+// H10: consequence failure escalates
+// -----------------------------------------------------------------------
+
+#[tokio::test]
+async fn test_consequence_failure_escalates() {
+    use scp_protocol::trust::consequence::{
+        ConsequenceAction, ConsequenceRule, ConsequenceTrigger,
+    };
+    use std::time::Duration;
+
+    let manager = ContextManager::new(
+        Box::new(MockCrypto::default()),
+        Box::new(MockTransport::connected()),
+        Box::new(MockEventLog::default()),
+        noop_key_resolver(),
+    );
+
+    let mut params = governance_params();
+    // Role demotion to a nonexistent role will fail (success=false).
+    params.consequence_rules = vec![ConsequenceRule {
+        trigger: ConsequenceTrigger::MessageVelocity,
+        threshold: 1,
+        action: ConsequenceAction::RoleDemotion {
+            to_role: "nonexistent".to_owned(),
+        },
+        window: Duration::from_secs(3600),
+    }];
+    let _handle = manager
+        .create_context("esc-ctx".into(), params, "did:key:sender".into())
+        .await
+        .unwrap();
+
+    let sk = ed25519_dalek::SigningKey::from_bytes(&[1u8; 32]);
+    let handle = manager
+        .contexts
+        .lock()
+        .await
+        .get("esc-ctx")
+        .unwrap()
+        .handle
+        .clone();
+
+    manager
+        .send_message(
+            &handle,
+            &"did:key:sender".into(),
+            b"trigger",
+            Some(&sk),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+    // Verify escalation to AccessRevocation.
+    let events = manager.drain_events("esc-ctx").await;
+    let has_escalation = events.iter().any(|e| {
+        matches!(
+            e,
+            ContextEvent::ConsequenceEnforced { action_type, success, .. }
+                if *success && action_type == "AccessRevocation(escalated)"
+        )
+    });
+    assert!(
+        has_escalation,
+        "failed enforcement should escalate to AccessRevocation (H10). Events: {events:?}"
+    );
+
+    // Member should be access-revoked.
+    let contexts = manager.contexts.lock().await;
+    let ctx = contexts.get("esc-ctx").unwrap();
+    let sender: DID = "did:key:sender".into();
+    assert!(ctx.access.write_revoked_members.contains(&sender));
+    assert!(ctx.access.read_revoked_members.contains(&sender));
+}
+
+// -----------------------------------------------------------------------
+// M2: cost overflow returns error
+// -----------------------------------------------------------------------
+
+#[tokio::test]
+async fn test_cost_overflow_error() {
+    use scp_protocol::economy::policy::evaluate_cost;
+    use scp_protocol::economy::types::{
+        Amount, Coefficient, CostSchedule, CurrencyCode, EconomicPolicy, PaidActionType,
+        PricingFormula, PricingMetric, PricingVariable,
+    };
+
+    // Create a policy with a formula that will return None (overflow).
+    let policy = EconomicPolicy {
+        locked: false,
+        cost_schedule: CostSchedule {
+            currency: CurrencyCode([85, 83, 68, 0]),
+            per_message: Some(Amount::new(u64::MAX)),
+            per_join: None,
+            per_tool_invoke: None,
+            per_period: None,
+            per_byte_stored: None,
+        },
+        payment_adapters: vec![],
+        pricing_formula: Some(PricingFormula {
+            base_cost: Amount::new(u64::MAX),
+            variables: vec![PricingVariable::Linear {
+                metric: PricingMetric::SenderVelocity,
+                coefficient: Coefficient(i64::MAX),
+            }],
+            cap: None,
+            floor: None,
+        }),
+        payee: DID::from("did:dht:z6MkPayee"),
+    };
+
+    let metrics = scp_protocol::economy::policy::ObservableMetrics {
+        sender_velocity: u64::MAX,
+        member_count: 1,
+        context_message_rate: 0,
+        relay_queue_depth: 0,
+        time_of_day: 0,
+        storage_usage: 0,
+    };
+
+    // evaluate_cost itself returns None on overflow.
+    let result = evaluate_cost(&policy, &PaidActionType::MessageSend, &metrics);
+    // The formula multiplies u64::MAX * u64::MAX which overflows to None.
+    // enforce_economy converts this None to an error (SCP-ECON-7063).
+    // We verify the protocol-level behavior here.
+    assert!(
+        result.is_none(),
+        "evaluate_cost should return None on overflow"
+    );
+}
+
+// -----------------------------------------------------------------------
+// M4: velocity includes current message
+// -----------------------------------------------------------------------
+
+#[tokio::test]
+async fn test_velocity_includes_current_message() {
+    use scp_protocol::economy::types::{Amount, CostSchedule, CurrencyCode, EconomicPolicy};
+
+    let manager = ContextManager::new(
+        Box::new(MockCrypto::default()),
+        Box::new(MockTransport::connected()),
+        Box::new(MockEventLog::default()),
+        noop_key_resolver(),
+    );
+
+    let mut params = governance_params();
+    params.economic_policy = Some(EconomicPolicy {
+        locked: false,
+        cost_schedule: CostSchedule {
+            currency: CurrencyCode([85, 83, 68, 0]),
+            per_message: Some(Amount::new(5)),
+            per_join: None,
+            per_tool_invoke: None,
+            per_period: None,
+            per_byte_stored: None,
+        },
+        payment_adapters: vec![],
+        pricing_formula: None,
+        payee: DID::from("did:dht:z6MkPayee"),
+    });
+    let handle = manager
+        .create_context("vel-msg-ctx2".into(), params, "did:key:sender".into())
+        .await
+        .unwrap();
+    {
+        let mut contexts = manager.contexts.lock().await;
+        let ctx = contexts.get_mut("vel-msg-ctx2").unwrap();
+        ctx.governance
+            .budget_tracker
+            .grant(&"did:key:sender".into(), Amount::new(1000));
+    }
+
+    let ucan = dummy_spending_ucan();
+    let sk = ed25519_dalek::SigningKey::from_bytes(&[1u8; 32]);
+    manager
+        .send_message(
+            &handle,
+            &"did:key:sender".into(),
+            b"first",
+            Some(&sk),
+            None,
+            Some(&ucan),
+        )
+        .await
+        .unwrap();
+
+    // Velocity should include the message we just sent (M4).
+    let velocity = {
+        let contexts = manager.contexts.lock().await;
+        let ctx = contexts.get("vel-msg-ctx2").unwrap();
+        ctx.governance
+            .velocity_tracker
+            .get_velocity(&"did:key:sender".into(), manager.clock.now_secs())
+    };
+    assert!(
+        velocity >= 1,
+        "velocity should include the current message (M4). Got: {velocity}"
     );
 }

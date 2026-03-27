@@ -27,6 +27,8 @@ fn enforce_send_economy(
     sender_did: &DID,
     now: u64,
     spending_ucan: Option<&scp_protocol::crypto::ucan::UcanToken>,
+    context_id: &str,
+    clock: &dyn scp_primitives::Clock,
 ) -> Result<Option<scp_protocol::economy::types::Amount>, ContextError> {
     super::economy::enforce_economy(
         ctx.governance.economic_policy.as_ref(),
@@ -38,6 +40,8 @@ fn enforce_send_economy(
         now,
         spending_ucan,
         "messages:write",
+        context_id,
+        clock,
     )
 }
 
@@ -306,6 +310,7 @@ impl ContextManager {
     /// Returns [`ContextError`] if the context is not active, the sender
     /// lacks capability, or any crypto/transport step fails.
     #[instrument(skip_all, fields(context_id = handle.context_id()))]
+    #[allow(clippy::too_many_lines)] // H7+M4 moved capability check and velocity before economy enforcement; cannot split further without fragmenting the lock scope.
     pub async fn send_message(
         &self,
         handle: &ContextHandle,
@@ -329,8 +334,31 @@ impl ContextManager {
                     "write access has been revoked for {sender_did}"
                 )));
             }
-            let deducted_cost =
-                enforce_send_economy(ctx, sender_did, self.clock.now_secs(), spending_ucan)?;
+            // H7: check capability BEFORE budget deduction so a capability
+            // failure doesn't leak budget.
+            if ctx.broadcast_context.is_none()
+                && !ctx
+                    .role_state
+                    .member_has_capability(sender_did, &Capability::MessagesWrite)
+            {
+                return Err(ContextError::PermissionDenied(format!(
+                    "member {sender_did} does not have messages:write capability"
+                )));
+            }
+            // M4: record velocity BEFORE economy enforcement so the current
+            // message is included in the velocity metric used for pricing.
+            ctx.governance
+                .velocity_tracker
+                .record_message(sender_did, self.clock.now_secs());
+
+            let deducted_cost = enforce_send_economy(
+                ctx,
+                sender_did,
+                self.clock.now_secs(),
+                spending_ucan,
+                &context_id,
+                &*self.clock,
+            )?;
             if let Some(ref mut bc) = ctx.broadcast_context {
                 let sk = signing_key.ok_or_else(|| {
                     ContextError::CryptoFailed("signing key required for broadcast publish".into())
@@ -345,14 +373,7 @@ impl ContextManager {
                     deducted_cost,
                 )
             } else {
-                if !ctx
-                    .role_state
-                    .member_has_capability(sender_did, &Capability::MessagesWrite)
-                {
-                    return Err(ContextError::PermissionDenied(format!(
-                        "member {sender_did} does not have messages:write capability"
-                    )));
-                }
+                // Capability already checked above (H7: before budget deduction).
                 // Assign sequence under lock — SequenceTracker rejects duplicates.
                 let seq = ctx
                     .membership
@@ -479,6 +500,7 @@ impl ContextManager {
                 scp_protocol::economy::types::PaidActionType::MessageSend,
                 sender_did,
                 context_id,
+                deducted_cost, // M3: pass pre-evaluated cost
             )
             .await
         {
@@ -492,21 +514,22 @@ impl ContextManager {
 
     /// Captures the escrow hold after a successful send (Phase 3 of `send_message`).
     ///
-    /// Best-effort: if capture fails, rolls back the budget and logs a warning
-    /// but does NOT fail the send (the message was already delivered).
+    /// Best-effort: if capture fails, logs a warning but does NOT roll back
+    /// the budget and does NOT fail the send. The message was already
+    /// delivered -- the service was rendered, so the budget deduction stands.
+    /// Rolling back on capture failure would let senders consume the service
+    /// for free whenever the payment adapter is flaky (H8).
     async fn capture_send_payment(
         &self,
         auth: Option<super::economy::PaidActionAuthorization>,
         sender_did: &DID,
         context_id: &str,
-        deducted_cost: Option<scp_protocol::economy::types::Amount>,
+        _deducted_cost: Option<scp_protocol::economy::types::Amount>,
     ) {
         if let Some(a) = auth
             && let Err(e) = self.complete_paid_action(a, sender_did, context_id).await
         {
-            // Capture failed — rollback budget. The message was already sent,
-            // so we log the payment failure but still finalize the send.
-            super::economy::rollback_budget(self, context_id, sender_did, deducted_cost).await;
+            // H8: do NOT rollback budget — service was delivered.
             tracing::warn!(
                 context_id,
                 "payment capture failed after successful send: {e}"
@@ -538,10 +561,8 @@ impl ContextManager {
                     payload: payload.to_vec(),
                 });
 
-                // Velocity tracking (#1537) — feed data into consequence evaluation.
-                ctx.governance
-                    .velocity_tracker
-                    .record_message(sender_did, now);
+                // Velocity already recorded in send_message Phase 1 (M4: before
+                // economy enforcement). No duplicate record_message here.
 
                 // Consequence enforcement (#1531) — evaluate rules, then dispatch.
                 // evaluate_consequence_rules is called here so the pipeline wiring

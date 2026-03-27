@@ -189,8 +189,21 @@ impl ConsequenceRule {
     /// its maximum length, or if `CapabilitySuspension` has more than 32
     /// entries.
     pub fn validate(&self) -> Result<(), ConsequenceValidationError> {
+        // M5: threshold of 0 would trigger on every evaluation — reject.
+        if self.threshold == 0 {
+            return Err(ConsequenceValidationError(
+                "threshold must be > 0".to_owned(),
+            ));
+        }
+
         // Validate trigger.
         if let ConsequenceTrigger::Custom(key) = &self.trigger {
+            // M6: empty custom key has no semantic meaning — reject.
+            if key.is_empty() {
+                return Err(ConsequenceValidationError(
+                    "Custom trigger key must not be empty".to_owned(),
+                ));
+            }
             validate_consequence_string(key, "Custom trigger key", MAX_CONSEQUENCE_STRING_LEN)?;
         }
 
@@ -955,21 +968,38 @@ mod tests {
     // -----------------------------------------------------------------------
 
     #[test]
-    fn zero_threshold_triggers_with_empty_evidence() {
+    fn zero_threshold_rejected_by_validation() {
+        // M5: threshold=0 is rejected at validation time.
+        let rule = ConsequenceRule {
+            trigger: ConsequenceTrigger::MessageVelocity,
+            action: ConsequenceAction::AccessRevocation,
+            threshold: 0,
+            window: Duration::from_secs(60),
+        };
+        assert!(rule.validate().is_err());
+    }
+
+    #[test]
+    fn threshold_one_triggers_with_one_event() {
+        // Replacement for old threshold=0 behavior: threshold=1 triggers
+        // with a single matching event.
         let rules = vec![ConsequenceRule {
             trigger: ConsequenceTrigger::MessageVelocity,
             action: ConsequenceAction::AccessRevocation,
-            // Threshold 0 means "any count triggers"
-            threshold: 0,
+            threshold: 1,
             window: Duration::from_secs(60),
         }];
 
-        // Even with zero matching events, threshold 0 means 0 >= 0 = true.
-        let result = evaluate_consequence_rules(&rules, &[], "did:key:alice", 1000);
-
-        // Zero events >= threshold 0 -> triggered with empty evidence.
+        let events = vec![make_event(
+            EventType::MessageSent,
+            "did:key:alice",
+            990,
+            0,
+            vec![],
+        )];
+        let result = evaluate_consequence_rules(&rules, &events, "did:key:alice", 1000);
         assert_eq!(result.len(), 1);
-        assert!(result[0].evidence.is_empty());
+        assert_eq!(result[0].evidence.len(), 1);
     }
 
     // -----------------------------------------------------------------------
@@ -1253,5 +1283,43 @@ mod tests {
                 "should reject char '{ch}' in custom trigger key"
             );
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // M5: threshold:0 is rejected
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_threshold_zero_rejected() {
+        let rule = ConsequenceRule {
+            trigger: ConsequenceTrigger::MessageVelocity,
+            action: ConsequenceAction::AccessRevocation,
+            threshold: 0,
+            window: Duration::from_secs(60),
+        };
+        let err = rule.validate().unwrap_err();
+        assert!(
+            err.to_string().contains("threshold must be > 0"),
+            "expected threshold rejection, got: {err}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // M6: Custom("") is rejected
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_empty_custom_key_rejected() {
+        let rule = ConsequenceRule {
+            trigger: ConsequenceTrigger::Custom(String::new()),
+            action: ConsequenceAction::AccessRevocation,
+            threshold: 1,
+            window: Duration::from_secs(60),
+        };
+        let err = rule.validate().unwrap_err();
+        assert!(
+            err.to_string().contains("must not be empty"),
+            "expected empty key rejection, got: {err}"
+        );
     }
 }

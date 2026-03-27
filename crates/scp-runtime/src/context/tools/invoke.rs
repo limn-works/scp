@@ -314,8 +314,19 @@ where
     };
 
     // 6. Validate output + post-invocation bookkeeping (#1530, #1531).
-    validate_value_against_schema(&output, &registration.schema.output_schema)
-        .map_err(|msg| InvocationError::OutputValidationFailed { message: msg })?;
+    // H6: on output validation failure, void escrow and rollback budget
+    // before returning. The `?` would leak the escrow hold.
+    if let Err(msg) = validate_value_against_schema(&output, &registration.schema.output_schema) {
+        void_escrow_and_rollback(
+            escrow.as_ref(),
+            escrow_parts.as_ref(),
+            action_cost,
+            &mut economy,
+            invoker_did,
+        )
+        .await;
+        return Err(InvocationError::OutputValidationFailed { message: msg });
+    }
     let triggered = economy
         .as_mut()
         .map(|econ| economy_post_check(econ, invoker_did))
@@ -437,7 +448,7 @@ fn build_tool_event(
 ///
 /// Returns [`InvocationError`] on protocol-level validation failures,
 /// timeout, cancellation, budget exceeded, or UCAN composition failures.
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)] // H6 escrow rollback on output validation adds lines; splitting would fragment the escrow lifecycle.
 pub async fn invoke_tool_with_cancellation<F, Fut, C, CFut, S: BuildHasher>(
     context: &ContextHandle,
     registry: &ToolRegistry,
@@ -552,8 +563,19 @@ where
     };
 
     // 6. Validate output + post-invocation bookkeeping.
-    validate_value_against_schema(&output, &registration.schema.output_schema)
-        .map_err(|msg| InvocationError::OutputValidationFailed { message: msg })?;
+    // H6: on output validation failure, void escrow and rollback budget
+    // before returning.
+    if let Err(msg) = validate_value_against_schema(&output, &registration.schema.output_schema) {
+        void_escrow_and_rollback(
+            escrow.as_ref(),
+            escrow_parts.as_ref(),
+            action_cost,
+            &mut economy,
+            invoker_did,
+        )
+        .await;
+        return Err(InvocationError::OutputValidationFailed { message: msg });
+    }
     let triggered = economy
         .as_mut()
         .map(|econ| economy_post_check(econ, invoker_did))
@@ -709,7 +731,7 @@ async fn void_escrow_and_rollback<S: BuildHasher>(
     if let Some(cost) = action_cost
         && let Some(econ) = economy
     {
-        econ.budget_tracker.grant(invoker_did, cost);
+        econ.budget_tracker.reverse_spend(invoker_did, cost);
     }
 }
 

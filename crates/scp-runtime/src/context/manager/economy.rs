@@ -201,6 +201,8 @@ pub(super) fn enforce_economy(
     now: u64,
     spending_ucan: Option<&scp_protocol::crypto::ucan::UcanToken>,
     action_label: &str,
+    context_id: &str,
+    clock: &dyn scp_primitives::Clock,
 ) -> Result<Option<scp_protocol::economy::types::Amount>, ContextError> {
     let Some(policy) = economic_policy else {
         return Ok(None);
@@ -222,9 +224,13 @@ pub(super) fn enforce_economy(
         storage_usage: 0,
     };
 
+    // M2: evaluate_cost returns None on formula overflow — treat as error,
+    // not free pass. Returning Ok(None) would silently skip the payment gate.
     let Some(cost) = scp_protocol::economy::policy::evaluate_cost(policy, action_type, &metrics)
     else {
-        return Ok(None);
+        return Err(ContextError::PermissionDenied(
+            "SCP-ECON-7063: cost evaluation overflow".to_owned(),
+        ));
     };
 
     if cost.0 == 0 {
@@ -258,6 +264,16 @@ pub(super) fn enforce_economy(
     )
     .map_err(|e| ContextError::PermissionDenied(format!("SCP-ECON-7061: {e}")))?;
 
+    // Validate the spending UCAN itself: context scope, expiry, attenuation.
+    // `spending_ucan` is guaranteed `Some` by the guard above.
+    if let Some(spending) = spending_ucan {
+        scp_protocol::crypto::ucan::spending::validate_spending_ucan(
+            spending, context_id, None, // no parent capability (top-level delegation)
+            clock,
+        )
+        .map_err(|e| ContextError::PermissionDenied(format!("SCP-ECON-7062: {e}")))?;
+    }
+
     // Budget check — no auto-grant. If the member has no budget, fail with
     // NoBudget error telling the caller to request an ApproveSpend governance
     // action. Budget must be explicitly granted via governance.
@@ -276,7 +292,9 @@ pub(super) fn enforce_economy(
 /// Rolls back a budget deduction on failure.
 ///
 /// Used by messaging, lifecycle, and invoke to DRY the budget rollback pattern.
-/// Restores the exact amount previously deducted by `enforce_economy`.
+/// Restores the exact amount previously deducted by `enforce_economy` using
+/// `reverse_spend` (which decrements `spent`) instead of `grant` (which
+/// would inflate the limit). This preserves accurate `total_spent` accounting.
 pub(super) async fn rollback_budget(
     manager: &ContextManager,
     context_id: &str,
@@ -286,7 +304,7 @@ pub(super) async fn rollback_budget(
     if let Some(cost) = deducted_cost {
         let mut contexts = manager.contexts.lock().await;
         if let Some(ctx) = contexts.get_mut(context_id) {
-            ctx.governance.budget_tracker.grant(actor_did, cost);
+            ctx.governance.budget_tracker.reverse_spend(actor_did, cost);
         }
     }
 }
@@ -300,16 +318,28 @@ impl ContextManager {
     /// action, then calls `complete_paid_action` or `void_paid_action`.
     ///
     /// Returns `Ok(None)` when no payment adapter is configured or cost is zero.
+    /// M3: accepts an optional `pre_evaluated_cost` to avoid re-evaluating
+    /// the pricing formula when cost was already computed by `enforce_economy`.
+    /// When `Some`, the adapter escrow uses the same cost the budget saw.
+    /// When `None`, cost is evaluated fresh (backward-compatible path).
     pub(super) async fn authorize_paid_action(
         &self,
         action_type: PaidActionType,
         payer_did: &DID,
         context_id: &str,
+        pre_evaluated_cost: Option<scp_protocol::economy::types::Amount>,
     ) -> Result<Option<PaidActionAuthorization>, ContextError> {
         // Early exit: no adapter means no payment flow.
         let Some(adapter_arc) = self.payment_adapter.as_ref().map(Arc::clone) else {
             return Ok(None);
         };
+
+        // If caller already evaluated cost and it was zero/absent, skip.
+        if let Some(cost) = pre_evaluated_cost
+            && cost.0 == 0
+        {
+            return Ok(None);
+        }
 
         // Phase 1: Extract policy + metrics under lock, then drop.
         let (policy, metrics) = {
@@ -342,12 +372,15 @@ impl ContextManager {
             return Ok(None);
         };
 
-        // Evaluate cost — zero cost means no payment needed.
-        if scp_protocol::economy::policy::evaluate_cost(&policy, &action_type, &metrics)
-            .filter(|c| c.0 > 0)
-            .is_none()
-        {
-            return Ok(None);
+        // M3: skip re-evaluation if cost was already computed upstream.
+        if pre_evaluated_cost.is_none() {
+            // Evaluate cost — zero cost means no payment needed.
+            if scp_protocol::economy::policy::evaluate_cost(&policy, &action_type, &metrics)
+                .filter(|c| c.0 > 0)
+                .is_none()
+            {
+                return Ok(None);
+            }
         }
 
         // Phase 2: Authorize (escrow) via adapter (no lock held).
