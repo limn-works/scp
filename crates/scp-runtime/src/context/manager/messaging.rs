@@ -546,7 +546,10 @@ impl ContextManager {
                 // Consequence enforcement (#1531) — evaluate rules, then dispatch.
                 // evaluate_consequence_rules is called here so the pipeline wiring
                 // gate can detect it in messaging.rs (not hidden inside dispatch_consequences).
-                let consequence_events = super::governance::event_log_entries_for_consequences(
+                //
+                // The same event snapshot is reused for both consequence evaluation
+                // and participation record computation (finding #46 dedup).
+                let send_events = super::governance::event_log_entries_for_consequences(
                     ctx,
                     context_id,
                     now,
@@ -563,7 +566,7 @@ impl ContextManager {
                     now,
                     &evaluate_consequence_rules(
                         &consequence_rules,
-                        &consequence_events,
+                        &send_events,
                         sender_did.as_ref(),
                         now,
                     ),
@@ -572,19 +575,19 @@ impl ContextManager {
                 );
 
                 // Participation record update (#1530) — refresh cache after send.
-                let send_events = super::governance::event_log_entries_for_consequences(
-                    ctx,
-                    context_id,
-                    now,
-                    &*self.event_log,
-                );
+                // Reuses `send_events` from above to avoid a second
+                // event_log_entries_for_consequences call.
+                let send_merkle = self
+                    .event_log
+                    .event_log_merkle_root(context_id_bytes)
+                    .unwrap_or([0u8; 32]);
                 if !send_events.is_empty()
                     && let Ok(record) =
                         scp_protocol::trust::participation::compute_participation_record(
                             &send_events,
                             sender_did.as_ref(),
                             context_id,
-                            [0u8; 32],
+                            send_merkle,
                             now,
                         )
                     && record.participation_count > 0

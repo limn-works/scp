@@ -658,7 +658,7 @@ pub async fn finalize_close(
         let _ = transport.delete_published(&context_id_bytes);
     }
 
-    event_log.append_context_event(&context_id_bytes, "ContextClosed", "")?;
+    event_log.append_context_event(&context_id_bytes, "ContextClosed", "system:close")?;
 
     Ok(())
 }
@@ -836,7 +836,7 @@ pub async fn try_ttl_expiry_cleanup(
     // 3. Event log append — skip if already succeeded on a prior attempt to
     //    avoid duplicate ContextExpired entries in the Merkle log.
     if result.completed_steps & STEP_EVENT_LOGGED == 0 {
-        match event_log.append_context_event(&context_id_bytes, "ContextExpired", "") {
+        match event_log.append_context_event(&context_id_bytes, "ContextExpired", "system:timer") {
             Ok(()) => result.set_step(STEP_EVENT_LOGGED),
             Err(e) => {
                 let msg = format!("failed to log ContextExpired event: {e}");

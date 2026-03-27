@@ -1547,10 +1547,10 @@ pub struct ContextManager {
     standing_contexts: Mutex<HashMap<String, DID>>,
     /// Optional payment adapter for the 9-step paid action flow (spec §19.2.2).
     ///
-    /// When `Some`, `execute_paid_action` runs the full authorize→capture→verify
-    /// flow via this adapter. When `None`, paid action entry points skip payment
-    /// (free context) while still enforcing budget tracking via `evaluate_cost`
-    /// and `record_spend`.
+    /// When `Some`, `authorize_paid_action`→`complete_paid_action` runs the
+    /// full escrow flow via this adapter. When `None`, paid action entry
+    /// points skip payment (free context) while still enforcing budget
+    /// tracking via `evaluate_cost` and `record_spend`.
     ///
     /// Set via [`set_payment_adapter`](Self::set_payment_adapter) or the builder.
     payment_adapter: Option<Arc<dyn crate::economy::adapter::PaymentAdapterDyn>>,

@@ -98,12 +98,11 @@ impl ContextLog {
 
 /// Computes the SHA-256 hash for an event log entry.
 ///
-/// Hash input: `"SCP-EXPORT-ENTRY-V2:" || len(event) || event || len(actor_did) || actor_did || timestamp || prev_hash`
+/// Hash input: `"SCP-EXPORT-ENTRY:" || len(event) || event || len(actor_did) || actor_did || timestamp || prev_hash`
 ///
 /// Uses big-endian u32 length prefixes before variable-length fields to
 /// prevent length-extension ambiguity (e.g., event="AB" + actor="CD" vs
-/// event="ABC" + actor="D" producing the same hash). The domain separator
-/// was bumped from V1 to V2 when length prefixes were added.
+/// event="ABC" + actor="D" producing the same hash).
 fn compute_entry_hash(
     event: &str,
     actor_did: &str,
@@ -115,7 +114,7 @@ fn compute_entry_hash(
     let event_len = u32::try_from(event.len()).unwrap_or(u32::MAX);
     let actor_len = u32::try_from(actor_did.len()).unwrap_or(u32::MAX);
     let mut hasher = Sha256::new();
-    hasher.update(b"SCP-EXPORT-ENTRY-V2:");
+    hasher.update(b"SCP-EXPORT-ENTRY:");
     hasher.update(event_len.to_be_bytes());
     hasher.update(event.as_bytes());
     hasher.update(actor_len.to_be_bytes());
@@ -1413,7 +1412,7 @@ mod tests {
         );
     }
 
-    /// Domain separator "SCP-EXPORT-ENTRY-V2:" and length prefixes are
+    /// Domain separator "SCP-EXPORT-ENTRY:" and length prefixes are
     /// present in hash computation. Verified by computing the hash manually
     /// and comparing.
     #[test]
@@ -1428,11 +1427,11 @@ mod tests {
         // Compute with the function.
         let hash = compute_entry_hash(event, actor_did, timestamp, &prev_hash);
 
-        // Compute manually WITH V2 domain separator and length prefixes.
+        // Compute manually WITH domain separator and length prefixes.
         let event_len = u32::try_from(event.len()).unwrap();
         let actor_len = u32::try_from(actor_did.len()).unwrap();
         let mut hasher = Sha256::new();
-        hasher.update(b"SCP-EXPORT-ENTRY-V2:");
+        hasher.update(b"SCP-EXPORT-ENTRY:");
         hasher.update(event_len.to_be_bytes());
         hasher.update(event.as_bytes());
         hasher.update(actor_len.to_be_bytes());
@@ -1442,7 +1441,7 @@ mod tests {
         let expected: [u8; 32] = hasher.finalize().into();
         assert_eq!(
             hash, expected,
-            "hash must match manual computation with V2 domain separator and length prefixes"
+            "hash must match manual computation with domain separator and length prefixes"
         );
 
         // Compute manually WITHOUT domain separator — must NOT match.

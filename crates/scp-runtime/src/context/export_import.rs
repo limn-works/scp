@@ -202,11 +202,10 @@ pub fn verify_merkle_chain(event_log_data: &[u8]) -> Result<[u8; 32], ContextErr
 
 /// Computes the SHA-256 hash for an event log entry.
 ///
-/// Hash input: `"SCP-EXPORT-ENTRY-V2:" || len(event) || event || len(actor_did) || actor_did || timestamp || prev_hash`
+/// Hash input: `"SCP-EXPORT-ENTRY:" || len(event) || event || len(actor_did) || actor_did || timestamp || prev_hash`
 ///
 /// Uses big-endian u32 length prefixes before variable-length fields to
-/// prevent length-extension ambiguity. Domain separator bumped from V1
-/// to V2 when length prefixes were added.
+/// prevent length-extension ambiguity.
 ///
 /// This must be identical to
 /// [`providers::event_log::compute_entry_hash`](super::providers::event_log)
@@ -221,7 +220,7 @@ fn compute_entry_hash(
     let event_len = u32::try_from(event.len()).unwrap_or(u32::MAX);
     let actor_len = u32::try_from(actor_did.len()).unwrap_or(u32::MAX);
     let mut hasher = Sha256::new();
-    hasher.update(b"SCP-EXPORT-ENTRY-V2:");
+    hasher.update(b"SCP-EXPORT-ENTRY:");
     hasher.update(event_len.to_be_bytes());
     hasher.update(event.as_bytes());
     hasher.update(actor_len.to_be_bytes());
