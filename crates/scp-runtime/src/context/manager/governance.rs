@@ -2468,6 +2468,9 @@ impl ContextManager {
             // Drop broadcast context state -- keys are zeroed by Zeroize.
             ctx.broadcast_context = None;
 
+            // M7: Standing decay on governance-driven close (#1530).
+            ctx.governance.decay_standing();
+
             if self.has_persistence() {
                 Some(Self::snapshot_context(ctx))
             } else {
@@ -3063,6 +3066,48 @@ impl ContextManager {
                     error = %e,
                     "failed to broadcast member reset MLS Commit"
                 );
+            }
+        }
+
+        // H5: Sender key rotation after MLS reset — remove the reset
+        // member's stale sender key, rotate our own key, and distribute
+        // new key material to remaining members (§9.16.4). This ensures
+        // the reset member cannot decrypt messages sent with the old key.
+        if let Err(e) = self
+            .crypto
+            .remove_member_sender_key(&context_id_bytes, did.as_ref())
+        {
+            tracing::warn!(
+                context_id,
+                member = %did,
+                error = %e,
+                "remove_member_sender_key failed after MLS reset — \
+                 sender key layer may retain stale key"
+            );
+        }
+        if let Err(e) = self.crypto.rotate_sender_key(&context_id_bytes) {
+            tracing::warn!(
+                context_id,
+                error = %e,
+                "rotate_sender_key failed after MLS reset"
+            );
+        }
+
+        // Drain pending sender key distribution messages and deliver
+        // via transport (same pattern as execute_remove_member).
+        if let Ok(pending) = self
+            .crypto
+            .drain_pending_sender_key_messages(&context_id_bytes)
+        {
+            let routing_id = super::messaging::derive_routing_id(context_id);
+            for (target_did, message) in pending {
+                if let Err(e) = self.transport.send_message(&routing_id, &message) {
+                    tracing::warn!(
+                        target_did = %target_did,
+                        error = %e,
+                        "failed to send rotated sender key distribution after member reset"
+                    );
+                }
             }
         }
 
@@ -4226,6 +4271,8 @@ impl ContextManager {
             ctx.broadcast_context = None;
             // Clear migration state.
             ctx.migration_state = None;
+            // M7: Standing decay on tombstone (#1530).
+            ctx.governance.decay_standing();
 
             let snapshot = if self.has_persistence() {
                 Some(Self::snapshot_context(ctx))
@@ -4488,30 +4535,41 @@ impl ContextManager {
         clock: &dyn Clock,
         event_log: &dyn super::super::builder::ContextEventLogProvider,
     ) {
+        // M9: Clone data under lock, drop lock for evaluation, reacquire
+        // for enforcement. This prevents holding the contexts lock for
+        // the entire evaluation duration (which includes event log I/O).
+        let now = clock.now_secs();
+        let (rules, member_dids, events) = {
+            let contexts_guard = contexts.lock().await;
+            let Some(ctx) = contexts_guard.get(ctx_id) else {
+                return;
+            };
+            let rules = ctx.governance.consequence_rules.clone();
+            if rules.is_empty() {
+                return;
+            }
+            let member_dids: Vec<DID> = ctx.membership.members().map(|m| m.did.clone()).collect();
+            let events = event_log_entries_for_consequences(ctx, ctx_id, now, event_log);
+            (rules, member_dids, events)
+        };
+        // Lock dropped — pure evaluation with no lock held.
+        let mut results: Vec<(DID, Vec<TriggeredConsequence>)> = Vec::new();
+        for member_did in member_dids {
+            let triggered = evaluate_consequence_rules(&rules, &events, member_did.as_ref(), now);
+            if !triggered.is_empty() {
+                results.push((member_did, triggered));
+            }
+        }
+        if results.is_empty() {
+            return;
+        }
+        // Reacquire lock for enforcement.
         let mut contexts_guard = contexts.lock().await;
         let Some(ctx) = contexts_guard.get_mut(ctx_id) else {
             return;
         };
-        let rules = ctx.governance.consequence_rules.clone();
-        if rules.is_empty() {
-            return;
-        }
-        let now = clock.now_secs();
-        let member_dids: Vec<DID> = ctx.membership.members().map(|m| m.did.clone()).collect();
-        let events = event_log_entries_for_consequences(ctx, ctx_id, now, event_log);
-        for member_did in member_dids {
-            let triggered = evaluate_consequence_rules(&rules, &events, member_did.as_ref(), now);
-            if !triggered.is_empty() {
-                enforce_triggered_consequences(
-                    ctx,
-                    ctx_id,
-                    &member_did,
-                    now,
-                    &triggered,
-                    &rules,
-                    clock,
-                );
-            }
+        for (member_did, triggered) in &results {
+            enforce_triggered_consequences(ctx, ctx_id, member_did, now, triggered, &rules, clock);
         }
     }
 

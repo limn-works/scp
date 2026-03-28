@@ -167,10 +167,13 @@ pub struct PaymentMetadata {
 
 impl Default for PaymentMetadata {
     fn default() -> Self {
+        // M20: Use random idempotency key in Default to prevent accidental
+        // collisions between two independently-constructed defaults.
+        let key: [u8; 16] = rand::random();
         Self {
             action_type: PaidActionType::MessageSend,
             context_id: None,
-            idempotency_key: [0u8; 16],
+            idempotency_key: key,
         }
     }
 }

@@ -755,6 +755,9 @@ impl GovernanceState {
     fn decay_standing(&mut self) {
         self.participation_cache.clear();
         self.cooldown_until.clear();
+        // M26: Clear velocity tracker on standing decay. Stale velocity
+        // data from a closed/expired context must not carry over.
+        self.velocity_tracker.clear();
     }
 
     /// Evicts stale entries from caches to prevent unbounded growth.
@@ -764,9 +767,11 @@ impl GovernanceState {
     /// - `participation_cache`: removes DIDs not in `last_known_members`.
     /// - `cooldown_until`: removes entries where `now >= expiry`.
     fn evict_stale_entries(&mut self, now: u64) {
-        // Evict participation records for non-members.
+        // M25: O(1) membership check per entry via HashSet::contains.
+        // last_known_members is HashSet<DID> which implements Borrow<str>,
+        // so we can look up &str keys directly.
         self.participation_cache
-            .retain(|did, _| self.last_known_members.iter().any(|m| m.as_ref() == did));
+            .retain(|did, _| self.last_known_members.contains(did.as_str()));
         // Evict expired cooldown entries.
         self.cooldown_until.retain(|_, expiry| now < *expiry);
     }

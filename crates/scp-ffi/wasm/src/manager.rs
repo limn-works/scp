@@ -245,6 +245,9 @@ struct PerContextState {
     pruning_policy: Option<String>,
     /// Whether the economic policy is locked (§19.3, ADR-033).
     economic_policy_locked: bool,
+    /// Consequence rules declared at context creation (ADR-017, #1531).
+    /// Parsed and validated from `params.consequenceRules` in `create_context`.
+    consequence_rules: Vec<scp_protocol::trust::consequence::ConsequenceRule>,
     /// MLS encryption + sender key state. `Some` for encrypted contexts,
     /// `None` for broadcast-only or unencrypted contexts.
     crypto: Option<crate::crypto::WasmCryptoState>,
@@ -758,6 +761,23 @@ impl WasmContextManager {
         // creator's SDK version must satisfy the minimum it sets.
         parse_and_check_min_protocol_version(params)?;
 
+        // H14: Parse and validate consequence_rules from params (ADR-017, #1531).
+        let consequence_rules: Vec<scp_protocol::trust::consequence::ConsequenceRule> =
+            if let Some(rules_val) = params.get("consequenceRules") {
+                serde_json::from_value(rules_val.clone()).map_err(|e| ScpWasmError::Validation {
+                    message: format!("invalid consequence_rules: {e}"),
+                    code: "SCP-VALID-7000".to_owned(),
+                })?
+            } else {
+                Vec::new()
+            };
+        for rule in &consequence_rules {
+            rule.validate().map_err(|e| ScpWasmError::Validation {
+                message: format!("consequence rule validation failed: {e}"),
+                code: "SCP-VALID-7000".to_owned(),
+            })?;
+        }
+
         // Initialize broadcast context for Broadcast mode (§5.14.2).
         let broadcast_context = if mode == "Broadcast" {
             let admission_str = params["admission"].as_str().unwrap_or("open");
@@ -841,6 +861,7 @@ impl WasmContextManager {
             resolved_proposals: HashMap::new(),
             pruning_policy: None,
             economic_policy_locked: false,
+            consequence_rules,
             crypto,
         };
 
@@ -950,6 +971,7 @@ impl WasmContextManager {
         context_id: &str,
         sender_did: &str,
         payload_base64: &str,
+        _spending_ucan_jwt: Option<&str>,
     ) -> Result<(), ScpWasmError> {
         let ctx = self.require_active_context_mut(context_id)?;
 
@@ -4613,6 +4635,7 @@ impl WasmContextManager {
             resolved_proposals: HashMap::new(),
             pruning_policy: snap.pruning_policy.clone(),
             economic_policy_locked: snap.economic_policy_locked,
+            consequence_rules: Vec::new(),
             // Imported contexts do not carry MLS state — they must re-establish
             // encryption via join_context_encrypted after import.
             crypto: None,
@@ -5737,6 +5760,7 @@ mod tests {
             resolved_proposals: HashMap::new(),
             pruning_policy: None,
             economic_policy_locked: false,
+            consequence_rules: Vec::new(),
             crypto: None,
         };
 
@@ -5846,6 +5870,7 @@ mod tests {
             resolved_proposals: HashMap::new(),
             pruning_policy: None,
             economic_policy_locked: false,
+            consequence_rules: Vec::new(),
             crypto: None,
         };
         let mut mgr = WasmContextManager::new();

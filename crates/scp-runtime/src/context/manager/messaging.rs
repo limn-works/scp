@@ -549,6 +549,15 @@ impl ContextManager {
         sequence: u64,
         payload: &[u8],
     ) -> Result<(), ContextError> {
+        // M12: Append event log BEFORE consequence evaluation so that
+        // event_log_entries_for_consequences sees the current event.
+        // Periodic consequence timers only read from the event log (not
+        // the receive buffer), so the event must be persisted first.
+        self.event_log.append_context_event(
+            context_id_bytes,
+            "MessageSent",
+            sender_did.as_ref(),
+        )?;
         {
             let now = self.clock.now_secs();
             let mut contexts = self.contexts.lock().await;
@@ -622,11 +631,6 @@ impl ContextManager {
                 maybe_adjust_relay_pricing(ctx, now);
             }
         }
-        self.event_log.append_context_event(
-            context_id_bytes,
-            "MessageSent",
-            sender_did.as_ref(),
-        )?;
         if self.has_persistence() {
             let contexts = self.contexts.lock().await;
             if let Some(ctx) = contexts.get(context_id) {
@@ -999,6 +1003,34 @@ impl ContextManager {
                 sender_did: DID(msg.sender_did.clone()),
                 payload: msg.plaintext.clone(),
             });
+        }
+
+        // H16: Defense-in-depth velocity tracking and consequence evaluation
+        // for the sender on the receive path. This ensures that even if the
+        // sender's node doesn't enforce consequences, the receiver still
+        // evaluates rules against incoming messages.
+        let now = self.clock.now_secs();
+        ctx.governance
+            .velocity_tracker
+            .record_message(&DID(sender_did.to_owned()), now);
+        let consequence_rules: Vec<super::ConsequenceRule> =
+            ctx.governance.consequence_rules.clone();
+        if !consequence_rules.is_empty() {
+            let recv_events = super::governance::event_log_entries_for_consequences(
+                ctx,
+                context_id,
+                now,
+                &*self.event_log,
+            );
+            super::governance::enforce_triggered_consequences(
+                ctx,
+                context_id,
+                &DID(sender_did.to_owned()),
+                now,
+                &evaluate_consequence_rules(&consequence_rules, &recv_events, sender_did, now),
+                &consequence_rules,
+                &*self.clock,
+            );
         }
 
         drop(contexts);

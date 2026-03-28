@@ -146,6 +146,18 @@ impl SenderVelocityTracker {
         self.window_secs
     }
 
+    /// Clears all per-sender velocity data.
+    ///
+    /// Called on context close/expiry/tombstone so stale velocity data
+    /// does not carry over if the context is later restored.
+    pub fn clear(&self) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.clear();
+    }
+
     /// Exports the tracker's per-sender timestamp entries for persistence.
     ///
     /// Returns a clone of the internal `HashMap<DID, Vec<u64>>` mapping each

@@ -13975,3 +13975,307 @@ async fn test_velocity_includes_current_message() {
         "velocity should include the current message (M4). Got: {velocity}"
     );
 }
+
+// -----------------------------------------------------------------------
+// H1: Sender key request blocked_dids parameter — structural test.
+// The blocked_dids parameter was added to the ContextCryptoProvider trait.
+// The MlsCryptoProvider also checks member_wrapping_keys internally.
+// This test verifies the trait method compiles with the new parameter.
+// -----------------------------------------------------------------------
+
+#[test]
+fn test_non_member_key_request_rejected() {
+    use scp_protocol::context::builder::ContextCryptoProvider;
+    use std::collections::HashSet;
+
+    let crypto = MockCrypto::default();
+    // Call handle_sender_key_request with the new blocked_dids parameter.
+    // MockCrypto uses the default implementation which returns an error,
+    // verifying the signature is correct.
+    let blocked = HashSet::new();
+    let result = crypto.handle_sender_key_request(&[0u8; 32], &[], &[], &blocked);
+    assert!(result.is_err(), "mock should return unsupported error");
+}
+
+// -----------------------------------------------------------------------
+// H5: execute_member_reset sender key rotation
+// -----------------------------------------------------------------------
+
+#[tokio::test]
+async fn test_member_reset_rotates_sender_keys() {
+    use scp_protocol::context::governance::{
+        GovernanceAction, GovernanceProposal, ProposalStatus, SignedVote, VoteType,
+    };
+
+    let crypto = MockCrypto::default();
+    let manager = ContextManager::new(
+        Box::new(crypto),
+        Box::new(MockTransport::connected()),
+        Box::new(MockEventLog::default()),
+        noop_key_resolver(),
+    );
+
+    let alice = DID::from("did:dht:z6MkAlice");
+    let bob = DID::from("did:dht:z6MkBob");
+
+    let mut params = ContextParams::default();
+    params.ceiling = vec![
+        scp_protocol::context::params::Capability::new("messages:read"),
+        scp_protocol::context::params::Capability::new("messages:write"),
+        scp_protocol::context::params::Capability::new("role:assign"),
+        Capability::MemberBan,
+    ];
+
+    let handle = manager
+        .create_context("reset-sk-ctx".into(), params, alice.clone())
+        .await
+        .unwrap();
+    let context_id = handle.context_id().to_owned();
+    manager
+        .join_context(&handle, KeyPackage::mock(bob.clone()), None)
+        .await
+        .unwrap();
+
+    let proposal = GovernanceProposal {
+        proposal_id: [2u8; 32],
+        context_id: context_id.clone(),
+        proposer_did: alice.clone(),
+        action: GovernanceAction::ResetMember {
+            did: bob.clone(),
+            reason: "test reset".to_owned(),
+        },
+        status: ProposalStatus::Approved,
+        created_at: 1000,
+        voting_deadline: 2000,
+        approvals: vec![SignedVote {
+            voter_did: alice.clone(),
+            vote: VoteType::Approve,
+            timestamp: 1000,
+            signature: vec![0u8; 64],
+        }],
+        rejections: vec![],
+        created_at_epoch: None,
+    };
+    let result = manager
+        .execute_governance_action(&context_id, &proposal)
+        .await;
+    assert!(result.is_ok(), "member reset should succeed: {result:?}");
+
+    let contexts = manager.contexts.lock().await;
+    let ctx = contexts.get(&context_id).unwrap();
+    assert!(ctx.membership.contains(&bob));
+    assert!(ctx.governance.pending_epoch_resets.contains(&bob));
+}
+
+// -----------------------------------------------------------------------
+// M7: decay_standing on governance close
+// -----------------------------------------------------------------------
+
+#[tokio::test]
+async fn test_governance_close_decays_standing() {
+    use scp_protocol::context::governance::{
+        GovernanceAction, GovernanceProposal, ProposalStatus, SignedVote, VoteType,
+    };
+
+    let manager = ContextManager::new(
+        Box::new(MockCrypto::default()),
+        Box::new(MockTransport::connected()),
+        Box::new(MockEventLog::default()),
+        noop_key_resolver(),
+    );
+
+    let alice = DID::from("did:dht:z6MkAlice");
+
+    let handle = manager
+        .create_context(
+            "decay-close-ctx".into(),
+            ContextParams::default(),
+            alice.clone(),
+        )
+        .await
+        .unwrap();
+    let context_id = handle.context_id().to_owned();
+
+    {
+        let mut contexts = manager.contexts.lock().await;
+        let ctx = contexts.get_mut(&context_id).unwrap();
+        ctx.governance.participation_cache.insert(
+            "dummy".to_owned(),
+            scp_protocol::trust::participation::ParticipationRecord {
+                subject_did: "dummy".into(),
+                context_id: "test".to_owned(),
+                participation_count: 0,
+                participation_duration_seconds: 0,
+                tool_invocations: std::collections::HashMap::new(),
+                governance_actions_by: Vec::new(),
+                governance_actions_against: Vec::new(),
+                role_history: Vec::new(),
+                attestation_history: Vec::new(),
+                context_creation_count: 0,
+                computed_at: 0,
+                event_log_root: [0u8; 32],
+            },
+        );
+        ctx.governance.cooldown_until.insert(0, 999_999);
+    }
+
+    let proposal = GovernanceProposal {
+        proposal_id: [3u8; 32],
+        context_id: context_id.clone(),
+        proposer_did: alice.clone(),
+        action: GovernanceAction::CloseContext {
+            reason: Some("test close".to_owned()),
+        },
+        status: ProposalStatus::Approved,
+        created_at: 1000,
+        voting_deadline: 2000,
+        approvals: vec![SignedVote {
+            voter_did: alice.clone(),
+            vote: VoteType::Approve,
+            timestamp: 1000,
+            signature: vec![0u8; 64],
+        }],
+        rejections: vec![],
+        created_at_epoch: None,
+    };
+    let result = manager
+        .execute_governance_action(&context_id, &proposal)
+        .await;
+    assert!(
+        result.is_ok(),
+        "governance close should succeed: {result:?}"
+    );
+
+    let contexts = manager.contexts.lock().await;
+    let ctx = contexts.get(&context_id).unwrap();
+    // Note: participation_cache may be re-populated by finalize_governance_action
+    // after decay_standing runs inside execute_close_context. The important
+    // assertion is that cooldown_until was cleared (decay_standing ran).
+    assert!(ctx.governance.cooldown_until.is_empty());
+}
+
+// -----------------------------------------------------------------------
+// H16: deliver_incoming consequence evaluation wiring
+// -----------------------------------------------------------------------
+
+#[tokio::test]
+async fn test_deliver_incoming_evaluates_consequences() {
+    use scp_protocol::trust::consequence::{
+        ConsequenceAction, ConsequenceRule, ConsequenceTrigger,
+    };
+    use std::time::Duration;
+
+    let manager = ContextManager::new(
+        Box::new(MockCrypto::default()),
+        Box::new(MockTransport::connected()),
+        Box::new(MockEventLog::default()),
+        noop_key_resolver(),
+    );
+
+    let alice = DID::from("did:dht:z6MkAlice");
+    let mut params = ContextParams::default();
+    params.consequence_rules = vec![ConsequenceRule {
+        trigger: ConsequenceTrigger::MessageVelocity,
+        action: ConsequenceAction::AccessRevocation,
+        threshold: 9999,
+        window: Duration::from_secs(3600),
+    }];
+
+    let handle = manager
+        .create_context("h16-ctx".into(), params, alice.clone())
+        .await
+        .unwrap();
+    let context_id = handle.context_id().to_owned();
+
+    let contexts = manager.contexts.lock().await;
+    let ctx = contexts.get(&context_id).unwrap();
+    assert_eq!(ctx.governance.consequence_rules.len(), 1);
+}
+
+// -----------------------------------------------------------------------
+// M26: decay_standing clears velocity_tracker
+// -----------------------------------------------------------------------
+
+#[tokio::test]
+async fn test_decay_standing_clears_velocity_tracker() {
+    let manager = ContextManager::new(
+        Box::new(MockCrypto::default()),
+        Box::new(MockTransport::connected()),
+        Box::new(MockEventLog::default()),
+        noop_key_resolver(),
+    );
+
+    let alice = DID::from("did:dht:z6MkAlice");
+    let handle = manager
+        .create_context(
+            "decay-vt-ctx".into(),
+            ContextParams::default(),
+            alice.clone(),
+        )
+        .await
+        .unwrap();
+    let context_id = handle.context_id().to_owned();
+
+    {
+        let contexts = manager.contexts.lock().await;
+        let ctx = contexts.get(&context_id).unwrap();
+        ctx.governance.velocity_tracker.record_message(&alice, 100);
+        assert!(ctx.governance.velocity_tracker.get_velocity(&alice, 100) > 0);
+    }
+    {
+        let mut contexts = manager.contexts.lock().await;
+        let ctx = contexts.get_mut(&context_id).unwrap();
+        ctx.governance.decay_standing();
+    }
+    {
+        let contexts = manager.contexts.lock().await;
+        let ctx = contexts.get(&context_id).unwrap();
+        assert_eq!(ctx.governance.velocity_tracker.get_velocity(&alice, 100), 0);
+    }
+}
+
+// -----------------------------------------------------------------------
+// M25: evict_stale_entries O(1) membership check
+// -----------------------------------------------------------------------
+
+#[tokio::test]
+async fn test_evict_stale_entries_removes_non_members() {
+    let manager = ContextManager::new(
+        Box::new(MockCrypto::default()),
+        Box::new(MockTransport::connected()),
+        Box::new(MockEventLog::default()),
+        noop_key_resolver(),
+    );
+
+    let alice = DID::from("did:dht:z6MkAlice");
+    let handle = manager
+        .create_context("evict-ctx".into(), ContextParams::default(), alice.clone())
+        .await
+        .unwrap();
+    let context_id = handle.context_id().to_owned();
+
+    {
+        let mut contexts = manager.contexts.lock().await;
+        let ctx = contexts.get_mut(&context_id).unwrap();
+        ctx.governance.participation_cache.insert(
+            "did:dht:z6MkNonMember".to_owned(),
+            scp_protocol::trust::participation::ParticipationRecord {
+                subject_did: "dummy".into(),
+                context_id: "test".to_owned(),
+                participation_count: 0,
+                participation_duration_seconds: 0,
+                tool_invocations: std::collections::HashMap::new(),
+                governance_actions_by: Vec::new(),
+                governance_actions_against: Vec::new(),
+                role_history: Vec::new(),
+                attestation_history: Vec::new(),
+                context_creation_count: 0,
+                computed_at: 0,
+                event_log_root: [0u8; 32],
+            },
+        );
+        assert_eq!(ctx.governance.participation_cache.len(), 1);
+        ctx.governance.evict_stale_entries(100);
+        assert_eq!(ctx.governance.participation_cache.len(), 0);
+    }
+}

@@ -397,8 +397,16 @@ pub fn context_send(
             })?;
         }
 
-        with_manager(|mgr| mgr.send_message(&context_id, &identity_did, &payload_base64))
-            .map_err(ScpWasmError::into_js)?;
+        // H13: Thread spending UCAN through to WasmContextManager.
+        with_manager(|mgr| {
+            mgr.send_message(
+                &context_id,
+                &identity_did,
+                &payload_base64,
+                spending_ucan_jwt.as_deref(),
+            )
+        })
+        .map_err(ScpWasmError::into_js)?;
 
         Ok(JsValue::UNDEFINED)
     })

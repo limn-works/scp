@@ -838,6 +838,7 @@ impl ContextCryptoProvider for MlsCryptoProvider {
         context_id: &[u8; 32],
         request_bytes: &[u8],
         requester_public_key: &[u8],
+        blocked_dids: &std::collections::HashSet<String>,
     ) -> Result<Option<Vec<u8>>, ContextError> {
         let ctx_id_hex = hex::encode(context_id);
 
@@ -878,6 +879,25 @@ impl ContextCryptoProvider for MlsCryptoProvider {
         if state.nonce_dedup.is_replayed(&request.nonce, now_secs) {
             return Err(ContextError::CryptoFailed(
                 "replayed sender key request".to_string(),
+            ));
+        }
+
+        // H1: Membership check — requester must be a known member (has a
+        // wrapping key registered via add_member). Prevents non-members
+        // from obtaining sender keys even if they forge a valid request.
+        if !state
+            .member_wrapping_keys
+            .contains_key(&request.requester_did)
+        {
+            return Err(ContextError::CryptoFailed(
+                "sender key request from non-member".to_string(),
+            ));
+        }
+
+        // H1: Blocked DID check — requester must not be blocked.
+        if blocked_dids.contains(&request.requester_did) {
+            return Err(ContextError::CryptoFailed(
+                "sender key request from blocked member".to_string(),
             ));
         }
 
