@@ -4,6 +4,8 @@
 //! implementation (`create_context`, `CreateContextPhases`) remains in
 //! `scp-runtime::context::builder`.
 
+use std::collections::HashSet;
+
 use super::ContextError;
 use crate::envelope::inner::InnerEnvelope;
 
@@ -333,6 +335,7 @@ pub trait ContextCryptoProvider: Send + Sync {
         _context_id: &[u8; 32],
         _request_bytes: &[u8],
         _requester_public_key: &[u8],
+        _blocked_dids: &HashSet<String>,
     ) -> Result<Option<Vec<u8>>, ContextError> {
         Err(ContextError::CryptoFailed(
             "sender key request handling not supported by this provider".to_string(),

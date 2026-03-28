@@ -48,7 +48,7 @@ const ACCESS_KEY_NONCE_SIZE: usize = 16;
 /// big-endian length prefixes to prevent concatenation ambiguity. The epoch
 /// is fixed-width (8 bytes BE) and needs no prefix.
 ///
-/// This MUST be distinct from the sender key HPKE info (`"scp-sender-key-hpke-v1"`)
+/// This MUST be distinct from the sender key HPKE info (`"scp-sender-key-v1"`)
 /// to prevent cross-protocol key confusion per spec §9.17.1.
 const HPKE_INFO_PREFIX: &[u8] = b"scp-access-key-v1";
 
@@ -732,7 +732,7 @@ mod tests {
     #[test]
     fn build_hpke_info_distinct_from_sender_key_info() {
         let access_info = build_hpke_info("ctx-1", "did:dht:alice", 0);
-        // Sender key HPKE uses "scp-sender-key-hpke-v1" as a flat info string.
+        // Sender key HPKE uses "scp-sender-key-v1" as a flat info string.
         assert!(!access_info.starts_with(b"scp-sender-key"));
     }
 

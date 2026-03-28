@@ -493,8 +493,9 @@ impl ContextCryptoProvider for ArcCryptoProvider {
         id: &[u8; 32],
         req: &[u8],
         pk: &[u8],
+        blocked_dids: &std::collections::HashSet<String>,
     ) -> Result<Option<Vec<u8>>, ContextError> {
-        self.0.handle_sender_key_request(id, req, pk)
+        self.0.handle_sender_key_request(id, req, pk, blocked_dids)
     }
     fn advance_epoch(
         &self,

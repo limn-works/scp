@@ -224,6 +224,15 @@ impl ContextManager {
     ) -> Result<(), ContextError> {
         let (ctx_snapshot, broadcast_ctx) = self.load_persisted_context_state(context_id)?;
         self.restore_event_log_best_effort(context_id);
+        // M15: Validate consequence rules on restore — reject tampered rules
+        // with control characters or other invalid content.
+        for rule in &ctx_snapshot.consequence_rules {
+            rule.validate().map_err(|e| {
+                ContextError::MembershipFailed(format!(
+                    "consequence rule validation failed on restore: {e}"
+                ))
+            })?;
+        }
         let ttl_remaining = ctx_snapshot.ttl_remaining_secs;
         // Reconstruct the governance engine from the persisted snapshot.
         let governance_engine =
@@ -677,6 +686,14 @@ impl ContextManager {
     ) -> Result<ContextHandle, ContextError> {
         // 1. Validate export.
         crate::context::export_import::validate_export_for_import(&export)?;
+        // M15: Validate consequence rules on import — reject tampered rules.
+        for rule in &export.snapshot.consequence_rules {
+            rule.validate().map_err(|e| {
+                ContextError::MembershipFailed(format!(
+                    "consequence rule validation failed on import: {e}"
+                ))
+            })?;
+        }
 
         let context_id = export.snapshot.context_id.clone();
         let ctx_id_bytes = scp_protocol::context::context_id_bytes(&context_id);
@@ -1366,19 +1383,18 @@ impl ContextManager {
             // Budget deduction happens here. The adapter escrow (authorize/complete/void)
             // runs after the lock is dropped. On adapter failure, rollback_budget
             // restores the deducted amount.
-            let deducted_cost = enforce_join_economy(
+            // M13: Sybil resistance check BEFORE economy enforcement so that
+            // a rejected sybil attacker doesn't consume budget. Fail-closed.
+            evaluate_sybil_resistance(ctx, &member_did, self.clock.now_secs())?;
+
+            enforce_join_economy(
                 ctx,
                 &member_did,
                 self.clock.now_secs(),
                 spending_ucan,
                 &context_id,
                 &*self.clock,
-            )?;
-
-            // Sybil resistance check (#1530) — fail-closed with `?`.
-            evaluate_sybil_resistance(ctx, &member_did, self.clock.now_secs())?;
-
-            deducted_cost
+            )?
         };
 
         // Phase 2: Authorize payment (escrow hold) BEFORE any crypto mutation.

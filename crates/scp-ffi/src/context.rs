@@ -1368,17 +1368,31 @@ fn convert_context_event(
             role_name,
         } => (
             "scp:system".to_owned(),
-            format!("member_joined:{member_did}:{role_name}").into_bytes(),
+            // M10: HTML-escape all user-supplied values in event strings.
+            format!(
+                "member_joined:{}:{}",
+                html_escape_event_string(member_did.as_ref()),
+                html_escape_event_string(&role_name),
+            )
+            .into_bytes(),
             ts,
         ),
         scp_core::context::membership::ContextEvent::MemberLeft { member_did } => (
             "scp:system".to_owned(),
-            format!("member_left:{member_did}").into_bytes(),
+            format!(
+                "member_left:{}",
+                html_escape_event_string(member_did.as_ref()),
+            )
+            .into_bytes(),
             ts,
         ),
         scp_core::context::membership::ContextEvent::SystemClose { initiator_did } => (
             "scp:system".to_owned(),
-            format!("system_close:{initiator_did}").into_bytes(),
+            format!(
+                "system_close:{}",
+                html_escape_event_string(initiator_did.as_ref()),
+            )
+            .into_bytes(),
             ts,
         ),
         scp_core::context::membership::ContextEvent::SequenceGapDetected {
@@ -1389,10 +1403,12 @@ fn convert_context_event(
         } => (
             "scp:system".to_owned(),
             format!(
-                "sequence_gap_detected:sender={sender_did},\
+                "sequence_gap_detected:sender={},\
                  expected={expected_sequence},\
                  first_delivered={first_delivered_sequence},\
-                 reason={reason}"
+                 reason={}",
+                html_escape_event_string(&sender_did),
+                html_escape_event_string(&reason),
             )
             .into_bytes(),
             ts,
@@ -1437,7 +1453,7 @@ fn convert_context_event(
         ),
         other => (
             "scp:system".to_owned(),
-            format!("{other:?}").into_bytes(),
+            html_escape_event_string(&format!("{other:?}")).into_bytes(),
             ts,
         ),
     }

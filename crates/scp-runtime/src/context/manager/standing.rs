@@ -193,10 +193,13 @@ impl ContextManager {
     pub async fn reconnect_all_standing(&self) -> (usize, Vec<ContextError>) {
         // Phase 1: Collect (context_id, handle) pairs under locks, then release.
         // This avoids holding any locks across await points.
+        // M8: Lock ordering — acquire `contexts` before `standing_contexts`
+        // to match the lock order used everywhere else in the codebase and
+        // prevent potential deadlocks.
         let handles: Vec<(String, super::super::ContextHandle)> = {
+            let contexts = self.contexts.lock().await;
             let standing = self.standing_contexts.lock().await;
             let local_dids = self.local_dids.read().await;
-            let contexts = self.contexts.lock().await;
 
             let mut out = Vec::new();
             for peer_did in standing.values() {
