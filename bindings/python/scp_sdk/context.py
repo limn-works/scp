@@ -669,7 +669,9 @@ class Context:
             "promotion_policy": promotion_policy_str,
             "template_id": template_id,
             "economic_policy": economic_policy,
-            "consequence_rules": json.dumps(consequence_rules) if consequence_rules else None,
+            "consequence_rules": json.dumps(consequence_rules)
+            if consequence_rules is not None
+            else None,
         }
 
         handle = await asyncio.to_thread(_scp_core.py_context_create, creator.did, params)

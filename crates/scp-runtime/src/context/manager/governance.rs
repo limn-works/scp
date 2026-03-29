@@ -57,19 +57,16 @@ fn enforce_capability_suspension(
 /// Uses the injected clock (via `now` parameter) instead of `SystemClock` to
 /// keep all governance timing consistent with the `ContextManager`'s clock.
 ///
-/// **Known coupling:** Uses `creator_did` as the assigner because
-/// `assign_role` checks `RoleAssign` capability on the assigner. If the
-/// creator loses `RoleAssign`, consequence-driven demotions will silently
-/// fail (returning `false`). A `system_assign_role` function that bypasses
-/// the assigner capability check would fix this (tracked in #1596).
+/// Uses [`roles::system_assign_role`] which bypasses the `RoleAssign`
+/// capability check — the governance engine must be able to demote members
+/// regardless of which member (if any) currently holds `RoleAssign`.
 fn enforce_role_demotion(
     ctx: &mut PerContextState,
     member_did: &DID,
     to_role: &str,
     clock: &dyn scp_primitives::Clock,
 ) -> bool {
-    let creator = ctx.role_state.creator_did.clone();
-    roles::assign_role(&mut ctx.role_state, member_did, to_role, &creator, clock).is_ok()
+    roles::system_assign_role(&mut ctx.role_state, member_did, to_role, clock).is_ok()
 }
 
 /// Evaluates consequence rules against a member and dispatches enforcement
@@ -690,6 +687,10 @@ impl ContextManager {
                     .remove(&proposal.proposal_id);
 
                 // Evaluate consequence rules after governance action (ADR-017, #1531).
+                // Evaluate for both the proposer and the target (if different).
+                // WarningCount triggers match events where the *target* DID
+                // appears in the payload, so skipping the target would miss
+                // accumulating warnings against them.
                 dispatch_consequences(
                     ctx,
                     context_id,
@@ -698,6 +699,18 @@ impl ContextManager {
                     &*self.clock,
                     &*self.event_log,
                 );
+                if let Some(target) = proposal.action.target_did()
+                    && target != &proposal.proposer_did
+                {
+                    dispatch_consequences(
+                        ctx,
+                        context_id,
+                        target,
+                        self.clock.now_secs(),
+                        &*self.clock,
+                        &*self.event_log,
+                    );
+                }
 
                 // Update participation record after governance action (#1530).
                 // Reuse the same event log entries for participation (finding #46).
@@ -1157,12 +1170,16 @@ impl ContextManager {
         proposer_did: &DID,
         action: GovernanceAction,
         signing_key: &ed25519_dalek::SigningKey,
-    ) -> Result<(GovernanceProposal, Vec<GovernanceEvent>), ContextError> {
-        let (proposal, events, execution_result) = self
-            .propose_governance_action_inner(context_id, proposer_did, action, signing_key)
-            .await?;
-        let _ = execution_result; // Callers of the old API don't use it.
-        Ok((proposal, events))
+    ) -> Result<
+        (
+            GovernanceProposal,
+            Vec<GovernanceEvent>,
+            Option<GovernanceActionResult>,
+        ),
+        ContextError,
+    > {
+        self.propose_governance_action_inner(context_id, proposer_did, action, signing_key)
+            .await
     }
 
     /// Inner implementation of proposal submission with auto-execution.

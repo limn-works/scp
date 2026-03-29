@@ -1352,6 +1352,7 @@ fn py_context_send(
 /// Converts a [`ContextEvent`] into the `(sender_did, payload, timestamp)` triple
 /// used by the `PyO3` bridge event delivery pipeline.
 #[allow(clippy::cast_precision_loss)]
+#[allow(clippy::too_many_lines)]
 fn convert_context_event(
     event: scp_core::context::membership::ContextEvent,
 ) -> (String, Vec<u8>, f64) {

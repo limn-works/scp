@@ -165,6 +165,11 @@ async fn verify_and_check_receipt(
         std::slice::from_ref(receipt),
     )
     .await;
+    if verification_results.is_empty() {
+        return Err(ContextError::PermissionDenied(
+            "SCP-ECON-7050: receipt verification returned no results (vacuous pass)".to_owned(),
+        ));
+    }
     for result in &verification_results {
         match result {
             Ok(v) if !v.result.valid => {

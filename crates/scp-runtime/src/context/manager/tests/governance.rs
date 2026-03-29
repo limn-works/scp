@@ -242,7 +242,7 @@ async fn single_admin_propose_auto_executes() {
         registration: Box::new(test_tool_registration("test-tool")),
     };
 
-    let (proposal, events) = manager
+    let (proposal, events, _) = manager
         .propose_governance_action(
             "ctx-single-admin-lifecycle",
             &creator_did,
@@ -320,7 +320,7 @@ async fn threshold_context_proposal_lifecycle() {
         registration: Box::new(test_tool_registration("threshold-tool")),
     };
 
-    let (proposal, _events) = manager
+    let (proposal, _events, _) = manager
         .propose_governance_action("ctx-threshold", &alice, action, &key_a)
         .await
         .unwrap();
@@ -389,7 +389,7 @@ async fn majority_context_proposal_lifecycle() {
         reason: Some("test close".to_owned()),
     };
 
-    let (proposal, _) = manager
+    let (proposal, _, _) = manager
         .propose_governance_action("ctx-majority", &alice, action, &key_a)
         .await
         .unwrap();
@@ -466,7 +466,7 @@ async fn unanimity_context_single_rejection_defeats_proposal() {
         reason: Some("test removal".to_owned()),
     };
 
-    let (proposal, _) = manager
+    let (proposal, _, _) = manager
         .propose_governance_action("ctx-unanimity", &alice, action, &key_a)
         .await
         .unwrap();
@@ -541,7 +541,7 @@ async fn non_eligible_voter_rejected() {
         registration: Box::new(test_tool_registration("tool")),
     };
 
-    let (proposal, _) = manager
+    let (proposal, _, _) = manager
         .propose_governance_action("ctx-eligibility", &alice, action, &key_a)
         .await
         .unwrap();
@@ -1936,7 +1936,7 @@ async fn governance_auto_execution_single_admin() {
     let signing_key = signing_key_for_did(&admin_did);
 
     // propose_governance_action for SingleAdmin auto-executes.
-    let (proposal, _events) = manager
+    let (proposal, _events, _) = manager
         .propose_governance_action(
             &ctx_id,
             &admin_did,
@@ -1985,7 +1985,7 @@ async fn governance_auto_execution_threshold_on_approval() {
 
     let signing_key = signing_key_for_did(&creator);
     // Threshold with 1-of-1: proposal auto-approved on propose.
-    let (proposal, _) = manager
+    let (proposal, _, _) = manager
         .propose_governance_action(
             "thresh-auto-ctx",
             &creator,
@@ -3287,7 +3287,7 @@ async fn execute_modify_ceiling_sets_pending_with_72h_period() {
     let action = GovernanceAction::ModifyCeiling {
         new_ceiling: new_ceiling.clone(),
     };
-    let (_proposal, _events) = manager
+    let (_proposal, _events, _) = manager
         .propose_governance_action("ctx-ceiling", &alice, action, &key_a)
         .await
         .unwrap();
@@ -3347,7 +3347,7 @@ async fn apply_pending_ceiling_modification_respects_notification_period() {
     let action = GovernanceAction::ModifyCeiling {
         new_ceiling: new_ceiling.clone(),
     };
-    let (_proposal, _events) = manager
+    let (_proposal, _events, _) = manager
         .propose_governance_action("ctx-apply", &alice, action, &key_a)
         .await
         .unwrap();
@@ -3428,7 +3428,7 @@ async fn execute_modify_ceiling_emits_ceiling_change_notification() {
     let action = GovernanceAction::ModifyCeiling {
         new_ceiling: new_ceiling.clone(),
     };
-    let (_proposal, _events) = manager
+    let (_proposal, _events, _) = manager
         .propose_governance_action("ctx-notify", &alice, action, &key_a)
         .await
         .unwrap();
@@ -3590,7 +3590,7 @@ async fn execute_set_economic_policy_stages_with_24h_delay() {
         policy: policy.clone(),
     };
 
-    let (_proposal, _events) = manager
+    let (_proposal, _events, _) = manager
         .propose_governance_action("ctx-econ-delay", &alice, action, &key_a)
         .await
         .unwrap();
@@ -3657,7 +3657,7 @@ async fn apply_pending_economic_policy_change_respects_notification_period() {
         policy: policy.clone(),
     };
 
-    let (_proposal, _events) = manager
+    let (_proposal, _events, _) = manager
         .propose_governance_action("ctx-econ-apply", &alice, action, &key_a)
         .await
         .unwrap();
@@ -3742,7 +3742,7 @@ async fn execute_set_economic_policy_emits_notification_event() {
     };
     let action = GovernanceAction::SetEconomicPolicy { policy };
 
-    let (_proposal, _events) = manager
+    let (_proposal, _events, _) = manager
         .propose_governance_action("ctx-econ-notify", &alice, action, &key_a)
         .await
         .unwrap();
@@ -12519,6 +12519,179 @@ async fn consequence_fires_on_governance_action() {
 }
 
 // -----------------------------------------------------------------------
+// §60b. WarningCount trigger fires end-to-end through ContextManager
+// -----------------------------------------------------------------------
+
+/// Behavioral test: governance actions against a member create event log
+/// entries with structured `target_did` payloads. When the number of
+/// governance actions targeting a member exceeds the `WarningCount` threshold,
+/// the consequence engine fires and emits `ConsequenceTriggered`/`Enforced`
+/// events to the receive buffer.
+#[tokio::test]
+async fn test_warning_count_trigger_fires_behavioral() {
+    use scp_protocol::trust::consequence::{
+        ConsequenceAction, ConsequenceRule, ConsequenceTrigger,
+    };
+    use std::time::Duration;
+
+    // Use MockEventLogWithActorDid so event log entries are queryable.
+    let manager = ContextManager::new(
+        Box::new(MockCrypto::default()),
+        Box::new(MockTransport::connected()),
+        Box::new(MockEventLogWithActorDid::default()),
+        mock_key_resolver(),
+    );
+
+    let admin: DID = "did:dht:z6MkAdmin".into();
+    let target: DID = "did:dht:z6MkTarget".into();
+    let key_admin = signing_key_for_did(&admin);
+
+    // WarningCount threshold = 2: two governance actions against a member
+    // within the window should trigger a CapabilitySuspension.
+    let mut params = governance_params();
+    params.consequence_rules = vec![ConsequenceRule {
+        trigger: ConsequenceTrigger::WarningCount,
+        threshold: 2,
+        action: ConsequenceAction::CapabilitySuspension(vec!["messages:write".to_owned()]),
+        window: Duration::from_secs(3600),
+    }];
+    let handle = manager
+        .create_context("warn-ctx".into(), params, admin.clone())
+        .await
+        .unwrap();
+
+    // Add target member.
+    let kp = scp_protocol::context::membership::KeyPackage {
+        owner_did: target.clone(),
+        mls_key_package_bytes: None,
+    };
+    manager.join_context(&handle, kp, None).await.unwrap();
+
+    // Drain creation + join events.
+    let _ = manager.drain_events("warn-ctx").await;
+
+    // First governance action against target — threshold not yet met.
+    let action1 = scp_protocol::context::governance::GovernanceAction::RemoveMember {
+        did: target.clone(),
+        reason: Some("warning 1".into()),
+    };
+    let _ = manager
+        .propose_governance_action("warn-ctx", &admin, action1, &key_admin)
+        .await;
+    let events1 = manager.drain_events("warn-ctx").await;
+    let triggered1 = events1
+        .iter()
+        .any(|e| matches!(e, ContextEvent::ConsequenceTriggered { .. }));
+    // Below threshold — should not fire.
+    assert!(
+        !triggered1,
+        "WarningCount should not fire below threshold (only 1 of 2)"
+    );
+
+    // Re-add target (they were removed by the first governance action).
+    let kp2 = scp_protocol::context::membership::KeyPackage {
+        owner_did: target.clone(),
+        mls_key_package_bytes: None,
+    };
+    manager.join_context(&handle, kp2, None).await.unwrap();
+    let _ = manager.drain_events("warn-ctx").await;
+
+    // Second governance action against target — threshold met.
+    let action2 = scp_protocol::context::governance::GovernanceAction::RemoveMember {
+        did: target.clone(),
+        reason: Some("warning 2".into()),
+    };
+    let _ = manager
+        .propose_governance_action("warn-ctx", &admin, action2, &key_admin)
+        .await;
+    let events2 = manager.drain_events("warn-ctx").await;
+    let triggered2 = events2
+        .iter()
+        .any(|e| matches!(e, ContextEvent::ConsequenceTriggered { .. }));
+    let enforced2 = events2
+        .iter()
+        .any(|e| matches!(e, ContextEvent::ConsequenceEnforced { .. }));
+    assert!(
+        triggered2,
+        "WarningCount should fire when threshold met (2 of 2). Events: {events2:?}"
+    );
+    assert!(
+        enforced2,
+        "Consequence should be enforced after trigger. Events: {events2:?}"
+    );
+}
+
+// -----------------------------------------------------------------------
+// §60c. Participation governance_actions_against populated
+// -----------------------------------------------------------------------
+
+/// Behavioral test: governance actions (e.g., `RemoveMember`) executed via
+/// `propose_governance_action` create event log entries that populate
+/// `governance_actions_against` in participation records.
+#[tokio::test]
+async fn test_participation_actions_against_populated() {
+    // Use MockEventLogWithActorDid so event log entries are readable.
+    // Wrap in Arc so we can inspect entries after construction.
+    let event_log = std::sync::Arc::new(MockEventLogWithActorDid::default());
+    let manager = ContextManager::new(
+        Box::new(MockCrypto::default()),
+        Box::new(MockTransport::connected()),
+        Box::new(ArcEventLog(event_log.clone())),
+        mock_key_resolver(),
+    );
+
+    let admin: DID = "did:dht:z6MkAdmin".into();
+    let target: DID = "did:dht:z6MkTarget".into();
+    let key_admin = signing_key_for_did(&admin);
+
+    let mut params = governance_params();
+    params.consequence_rules = vec![];
+    let handle = manager
+        .create_context("part-act-ctx".into(), params, admin.clone())
+        .await
+        .unwrap();
+
+    let kp = scp_protocol::context::membership::KeyPackage {
+        owner_did: target.clone(),
+        mls_key_package_bytes: None,
+    };
+    manager.join_context(&handle, kp, None).await.unwrap();
+
+    // Execute a governance action against the target.
+    let action = scp_protocol::context::governance::GovernanceAction::RemoveMember {
+        did: target.clone(),
+        reason: Some("test action".into()),
+    };
+    let _ = manager
+        .propose_governance_action("part-act-ctx", &admin, action, &key_admin)
+        .await;
+
+    // Check the event log contains a GovernanceActionExecuted entry with target_did payload.
+    let context_id_bytes = scp_protocol::context::context_id_bytes("part-act-ctx");
+    let entries = event_log.entries.lock().unwrap();
+    let gov_entries: Vec<_> = entries
+        .iter()
+        .filter(|(cid, event, _, _, _)| {
+            cid == &context_id_bytes && event == "GovernanceActionExecuted"
+        })
+        .collect();
+    assert!(
+        !gov_entries.is_empty(),
+        "GovernanceActionExecuted should be in event log"
+    );
+    // Verify the payload contains target_did.
+    let (_, _, _, _, payload) = &gov_entries[0];
+    let payload = payload
+        .as_ref()
+        .unwrap_or_else(|| panic!("GovernanceActionExecuted should have a payload"));
+    assert_eq!(
+        payload.get("target_did").and_then(|v| v.as_str()),
+        Some(target.as_ref()),
+        "Payload should contain target_did matching the removed member"
+    );
+}
+
+// -----------------------------------------------------------------------
 // §31. event_log_entries_for_consequences merges buffer with history
 // -----------------------------------------------------------------------
 
@@ -14173,13 +14346,15 @@ async fn test_deliver_incoming_evaluates_consequences() {
     );
 
     let alice = DID::from("did:dht:z6MkAlice");
-    let mut params = ContextParams::default();
-    params.consequence_rules = vec![ConsequenceRule {
-        trigger: ConsequenceTrigger::MessageVelocity,
-        action: ConsequenceAction::AccessRevocation,
-        threshold: 9999,
-        window: Duration::from_secs(3600),
-    }];
+    let params = ContextParams {
+        consequence_rules: vec![ConsequenceRule {
+            trigger: ConsequenceTrigger::MessageVelocity,
+            action: ConsequenceAction::AccessRevocation,
+            threshold: 9999,
+            window: Duration::from_secs(3600),
+        }],
+        ..ContextParams::default()
+    };
 
     let handle = manager
         .create_context("h16-ctx".into(), params, alice.clone())
