@@ -302,15 +302,33 @@ pub fn context_create(identity_did: String, params_json: String) -> Promise {
 ///
 /// Delegates to `WasmContextManager::join_context`.
 #[wasm_bindgen]
-pub fn context_join(handle: &WasmContextHandle, identity_did: String) -> Promise {
+pub fn context_join(
+    handle: &WasmContextHandle,
+    identity_did: String,
+    spending_ucan_jwt: Option<String>,
+) -> Promise {
     if let Err(e) = validate_did(&identity_did) {
         return future_to_promise(async move { Err(ScpWasmError::from(e).into_js().into()) });
     }
     let context_id = handle.context_id();
 
     future_to_promise(async move {
-        with_manager(|mgr| mgr.join_context(&context_id, &identity_did))
-            .map_err(ScpWasmError::into_js)?;
+        // Validate spending UCAN JWT if provided (parse-only; actual budget
+        // enforcement is performed by the WasmContextManager).
+        if let Some(ref jwt) = spending_ucan_jwt {
+            let _ = scp_protocol::crypto::ucan::validate::parse_ucan(jwt).map_err(|e| {
+                ScpWasmError::Context {
+                    message: format!("invalid spending UCAN: {e}"),
+                    code: "SCP-ECON-7061".to_owned(),
+                }
+                .into_js()
+            })?;
+        }
+
+        with_manager(|mgr| {
+            mgr.join_context(&context_id, &identity_did, spending_ucan_jwt.as_deref())
+        })
+        .map_err(ScpWasmError::into_js)?;
         Ok(JsValue::UNDEFINED)
     })
 }

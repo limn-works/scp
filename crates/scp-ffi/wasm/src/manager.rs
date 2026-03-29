@@ -883,7 +883,12 @@ impl WasmContextManager {
     /// # Errors
     ///
     /// Returns an error if the context is not active.
-    pub fn join_context(&mut self, context_id: &str, member_did: &str) -> Result<(), ScpWasmError> {
+    pub fn join_context(
+        &mut self,
+        context_id: &str,
+        member_did: &str,
+        _spending_ucan_jwt: Option<&str>,
+    ) -> Result<(), ScpWasmError> {
         let ctx = self.require_active_context_mut(context_id)?;
 
         // Version compatibility check (spec §13.4): reject join if the
@@ -1186,7 +1191,9 @@ impl WasmContextManager {
             })?;
 
         // First join the context normally (membership, events, etc.).
-        self.join_context(context_id, member_did)?;
+        // Encrypted join doesn't carry a separate spending UCAN — the Welcome
+        // flow implies the adder already validated the join cost.
+        self.join_context(context_id, member_did, None)?;
 
         // Then set up MLS crypto state from the Welcome.
         let mls_group =
