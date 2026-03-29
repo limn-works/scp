@@ -1643,6 +1643,7 @@ impl ContextManager {
     /// - The context is not in `Active` state.
     /// - The caller is neither the member being removed nor holds `MemberRemove`.
     /// - The member is not found.
+    #[allow(clippy::too_many_lines)]
     #[instrument(skip_all, fields(context_id = handle.context_id()))]
     pub async fn leave_context(
         &self,
@@ -1708,8 +1709,24 @@ impl ContextManager {
             }
 
             // Rotate the local sender key and distribute to remaining members (§9.16.4).
-            self.crypto.rotate_sender_key(&context_id_bytes)?;
-            self.drain_and_deliver_sender_keys(&context_id, &context_id_bytes)?;
+            // M23: Non-fatal — MLS removal above is the hard security boundary.
+            // If rotation fails, log but continue: returning Err here would leave
+            // the system inconsistent (MLS removed, but caller thinks leave failed).
+            if let Err(e) = self.crypto.rotate_sender_key(&context_id_bytes) {
+                tracing::warn!(
+                    context_id = %context_id,
+                    error = %e,
+                    "rotate_sender_key failed after leave — \
+                     remaining members retain old sender key"
+                );
+            }
+            if let Err(e) = self.drain_and_deliver_sender_keys(&context_id, &context_id_bytes) {
+                tracing::warn!(
+                    context_id = %context_id,
+                    error = %e,
+                    "failed to deliver rotated sender keys after leave"
+                );
+            }
         }
 
         // Atomic state check + membership removal + count check within single lock.
