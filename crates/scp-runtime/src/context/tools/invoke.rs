@@ -368,7 +368,11 @@ fn economy_pre_check<S: BuildHasher>(
         &scp_protocol::economy::types::PaidActionType::ToolInvoke,
         &economy.metrics,
     )
-    .unwrap_or(scp_protocol::economy::types::Amount::new(0));
+    .ok_or_else(|| InvocationError::BudgetExceeded {
+        did: invoker_did.to_string(),
+        cost: u64::MAX,
+        remaining: 0,
+    })?;
 
     if cost.0 == 0 {
         return Ok(cost);
@@ -693,10 +697,11 @@ async fn finalize_tool_escrow<S: BuildHasher>(
             Ok(receipt) => Ok(receipt),
             Err(capture_err) => {
                 // Budget rollback only — escrow is already consumed by the capture attempt.
+                // Use reverse_spend (not grant) to avoid inflating limits (#1606 M1).
                 if let Some(cost) = action_cost
                     && let Some(econ) = economy
                 {
-                    econ.budget_tracker.grant(invoker_did, cost);
+                    econ.budget_tracker.reverse_spend(invoker_did, cost);
                 }
                 Err(capture_err)
             }
