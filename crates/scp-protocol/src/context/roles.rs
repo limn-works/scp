@@ -999,6 +999,58 @@ pub fn assign_role(
     Ok(tokens)
 }
 
+/// System-level role assignment that bypasses the `RoleAssign` capability check.
+///
+/// Used by the governance consequence engine when demoting a member. The system
+/// must be able to enforce role demotions regardless of which member (if any)
+/// currently holds `RoleAssign`. All other checks (member existence, role
+/// existence) still apply.
+///
+/// # Errors
+///
+/// Returns [`RoleError::MemberNotInContext`] if the member is not in the
+/// context, or [`RoleError::RoleNotFound`] if the role doesn't exist.
+pub fn system_assign_role(
+    state: &mut ContextRoleState,
+    member_did: &str,
+    role_name: &str,
+    clock: &dyn Clock,
+) -> Result<Vec<UcanToken>, RoleError> {
+    // 1. Verify member is in the context.
+    if !state.members.contains(member_did) {
+        return Err(RoleError::MemberNotInContext(member_did.to_owned()));
+    }
+
+    // 2. Look up the role definition.
+    let role_def = state
+        .role_definitions
+        .get(role_name)
+        .ok_or_else(|| RoleError::RoleNotFound(role_name.to_owned()))?
+        .clone();
+
+    // 3. Mint UCAN tokens for each capability in the role.
+    let tokens = mint_role_tokens(
+        &state.context_id,
+        &state.creator_did,
+        member_did,
+        &role_def,
+        clock,
+    );
+
+    // 4. Update state: replace any previous assignment.
+    let assignment = RoleAssignment {
+        member_did: member_did.to_owned(),
+        role_name: role_name.to_owned(),
+        tokens: tokens.clone(),
+    };
+    state.assignments.insert(member_did.to_owned(), assignment);
+    state
+        .member_capabilities
+        .insert(member_did.to_owned(), role_def.capabilities);
+
+    Ok(tokens)
+}
+
 // ---------------------------------------------------------------------------
 // Role name validation (M3)
 // ---------------------------------------------------------------------------

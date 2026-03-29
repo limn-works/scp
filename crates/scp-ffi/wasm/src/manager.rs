@@ -247,7 +247,9 @@ struct PerContextState {
     economic_policy_locked: bool,
     /// Consequence rules declared at context creation (ADR-017, #1531).
     /// Parsed and validated from `params.consequenceRules` in `create_context`.
-    consequence_rules: Vec<scp_protocol::trust::consequence::ConsequenceRule>,
+    /// Currently stored for future use — WASM has no governance timeout task
+    /// to drive periodic evaluation.
+    _consequence_rules: Vec<scp_protocol::trust::consequence::ConsequenceRule>,
     /// MLS encryption + sender key state. `Some` for encrypted contexts,
     /// `None` for broadcast-only or unencrypted contexts.
     crypto: Option<crate::crypto::WasmCryptoState>,
@@ -861,7 +863,7 @@ impl WasmContextManager {
             resolved_proposals: HashMap::new(),
             pruning_policy: None,
             economic_policy_locked: false,
-            consequence_rules,
+            _consequence_rules: consequence_rules,
             crypto,
         };
 
@@ -4635,7 +4637,7 @@ impl WasmContextManager {
             resolved_proposals: HashMap::new(),
             pruning_policy: snap.pruning_policy.clone(),
             economic_policy_locked: snap.economic_policy_locked,
-            consequence_rules: Vec::new(),
+            _consequence_rules: Vec::new(),
             // Imported contexts do not carry MLS state — they must re-establish
             // encryption via join_context_encrypted after import.
             crypto: None,
@@ -5760,7 +5762,7 @@ mod tests {
             resolved_proposals: HashMap::new(),
             pruning_policy: None,
             economic_policy_locked: false,
-            consequence_rules: Vec::new(),
+            _consequence_rules: Vec::new(),
             crypto: None,
         };
 
@@ -5870,7 +5872,7 @@ mod tests {
             resolved_proposals: HashMap::new(),
             pruning_policy: None,
             economic_policy_locked: false,
-            consequence_rules: Vec::new(),
+            _consequence_rules: Vec::new(),
             crypto: None,
         };
         let mut mgr = WasmContextManager::new();

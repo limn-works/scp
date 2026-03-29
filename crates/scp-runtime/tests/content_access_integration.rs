@@ -796,7 +796,7 @@ async fn tier3_governance_revoke_write_access_broadcast() {
     let sk_alice = signing_key_for_did(&alice());
     let sk_bob = signing_key_for_did(&bob());
 
-    let (add_author, _) = manager
+    let (add_author, _, _) = manager
         .propose_governance_action(
             ctx_id,
             &alice(),
@@ -1501,7 +1501,7 @@ async fn governance_tier_stacking_via_context_manager() {
     let sk_alice = signing_key_for_did(&alice());
     let sk_bob = signing_key_for_did(&bob());
 
-    let (add_dave, _) = manager
+    let (add_dave, _, _) = manager
         .propose_governance_action(
             ctx_id,
             &alice(),

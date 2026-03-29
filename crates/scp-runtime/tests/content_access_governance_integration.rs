@@ -260,7 +260,7 @@ async fn setup_threshold_context_with_dave(ctx_id: &str) -> ContextManager {
     let sk_alice = signing_key_for_did(&alice());
     let sk_bob = signing_key_for_did(&bob());
 
-    let (proposal, _) = manager
+    let (proposal, _, _) = manager
         .propose_governance_action(
             ctx_id,
             &alice(),
@@ -698,7 +698,7 @@ async fn revoked_member_can_still_participate_in_governance() {
     let sk_alice = signing_key_for_did(&alice());
     let sk_bob = signing_key_for_did(&bob());
 
-    let (add_dave, _) = manager
+    let (add_dave, _, _) = manager
         .propose_governance_action(
             ctx_id,
             &alice(),
@@ -719,7 +719,7 @@ async fn revoked_member_can_still_participate_in_governance() {
     // Revoke ONLY Dave's write access (making him a read-only member).
     // Per §5.9: "Read-only members retain governance capabilities —
     // they can still observe content and participate meaningfully."
-    let (proposal, _) = manager
+    let (proposal, _, _) = manager
         .propose_governance_action(
             ctx_id,
             &alice(),
@@ -744,7 +744,7 @@ async fn revoked_member_can_still_participate_in_governance() {
     );
 
     // Alice proposes a new action. Dave (read-only) should be able to vote.
-    let (proposal, _) = manager
+    let (proposal, _, _) = manager
         .propose_governance_action(
             ctx_id,
             &alice(),
@@ -782,7 +782,7 @@ async fn revoked_member_can_still_participate_in_governance() {
     // Now also revoke Dave's read access, making him presence-only.
     // Per §5.9: "Presence-only members lose GovernanceVote and
     // GovernancePropose capabilities alongside content access."
-    let (proposal, _) = manager
+    let (proposal, _, _) = manager
         .propose_governance_action(
             ctx_id,
             &alice(),
@@ -807,7 +807,7 @@ async fn revoked_member_can_still_participate_in_governance() {
     );
 
     // Alice proposes another action. Dave (presence-only) should NOT be able to vote.
-    let (proposal, _) = manager
+    let (proposal, _, _) = manager
         .propose_governance_action(
             ctx_id,
             &alice(),
@@ -860,7 +860,7 @@ async fn single_admin_auto_executes_revoke_read_access() {
 
     // Add Dave as a member first.
     let sk_alice = signing_key_for_did(&alice());
-    let (add_proposal, _) = manager
+    let (add_proposal, _, _) = manager
         .propose_governance_action(
             ctx_id,
             &alice(),
@@ -1096,7 +1096,7 @@ async fn unanimity_rotate_content_keys_requires_all_votes() {
         .unwrap();
 
     let sk_alice = signing_key_for_did(&alice());
-    let (proposal, _) = manager
+    let (proposal, _, _) = manager
         .propose_governance_action(
             ctx_id,
             &alice(),
@@ -1166,7 +1166,7 @@ async fn unanimity_rotate_content_keys_rejected_by_single_vote() {
         .unwrap();
 
     let sk_alice = signing_key_for_did(&alice());
-    let (proposal, _) = manager
+    let (proposal, _, _) = manager
         .propose_governance_action(
             ctx_id,
             &alice(),
@@ -1323,7 +1323,7 @@ async fn majority_revoke_write_access() {
 
     // Add Dave as a member.
     let sk_alice = signing_key_for_did(&alice());
-    let (add_proposal, _) = manager
+    let (add_proposal, _, _) = manager
         .propose_governance_action(
             ctx_id,
             &alice(),
@@ -1351,7 +1351,7 @@ async fn majority_revoke_write_access() {
     }
 
     // Now propose RevokeWriteAccess for Dave.
-    let (proposal, _) = manager
+    let (proposal, _, _) = manager
         .propose_governance_action(
             ctx_id,
             &alice(),

@@ -523,6 +523,39 @@ impl ContextEventLogProvider for MockEventLogWithActorDid {
     }
 }
 
+/// Thin wrapper that delegates `ContextEventLogProvider` to an
+/// `Arc<MockEventLogWithActorDid>`, allowing tests to inspect the event log
+/// entries after the `ContextManager` has been constructed.
+pub(super) struct ArcEventLog(pub(super) std::sync::Arc<MockEventLogWithActorDid>);
+
+impl ContextEventLogProvider for ArcEventLog {
+    fn init_event_log(&self, id: &[u8; 32]) -> Result<(), ContextCreationError> {
+        self.0.init_event_log(id)
+    }
+
+    fn append_event(
+        &self,
+        id: &[u8; 32],
+        event: &str,
+        actor_did: &str,
+        payload: Option<&serde_json::Value>,
+    ) -> Result<(), ContextCreationError> {
+        self.0.append_event(id, event, actor_did, payload)
+    }
+
+    fn destroy_event_log(&self, id: &[u8; 32]) -> Result<(), ContextCreationError> {
+        self.0.destroy_event_log(id)
+    }
+
+    fn event_log_entries(
+        &self,
+        context_id: &[u8; 32],
+    ) -> Result<Option<Vec<crate::context::providers::event_log::EventLogEntry>>, ContextError>
+    {
+        self.0.event_log_entries(context_id)
+    }
+}
+
 /// A transport mock that always fails on `send_message`.
 /// Used to test that phantom `MessageSent` events are not emitted
 /// when transport fails (#1420).

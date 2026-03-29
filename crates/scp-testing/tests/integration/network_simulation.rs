@@ -1481,7 +1481,7 @@ async fn application_layer_demo() {
     println!();
 
     // Propose via ContextManager.
-    let (proposal, gov_events) = manager
+    let (proposal, gov_events, _) = manager
         .propose_governance_action(
             ctx_id,
             &alice,
@@ -1520,7 +1520,7 @@ async fn application_layer_demo() {
     println!("━━━ PHASE 7: Context Close ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
     println!();
 
-    let (close_proposal, _) = manager
+    let (close_proposal, _, _) = manager
         .propose_governance_action(
             ctx_id,
             &alice,
