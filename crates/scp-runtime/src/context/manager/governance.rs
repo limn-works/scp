@@ -2104,11 +2104,18 @@ impl ContextManager {
             // decrypt future messages (§9.16.4). Generates a fresh key,
             // increments the epoch, and HPKE-seals to remaining members.
             //
-            // Note: `publish_sender_key_epoch_advance` (§9.16.2) is called
-            // implicitly via `drain_pending_sender_key_messages` after the
-            // lock is dropped. The distribution messages are queued by
-            // `rotate_sender_key` and sent below.
-            self.crypto.rotate_sender_key(&context_id_bytes)?;
+            // Non-fatal: MLS removal above is the hard security boundary.
+            // If rotation fails after MLS removal succeeded, returning Err
+            // would leave the system inconsistent (member removed from MLS
+            // but governance action appears to have failed).
+            if let Err(e) = self.crypto.rotate_sender_key(&context_id_bytes) {
+                tracing::warn!(
+                    context_id,
+                    error = %e,
+                    "rotate_sender_key failed after member removal — \
+                     remaining members retain old sender key"
+                );
+            }
 
             ctx.membership.remove_member(did);
             ctx.role_state.members.remove(did.as_ref());

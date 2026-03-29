@@ -10080,7 +10080,10 @@ async fn rotate_sender_key_error_propagates() {
     };
     manager.join_context(&handle, kp, None).await.unwrap();
 
-    // Remove Alice — should fail because rotate_sender_key fails.
+    // Remove Alice — rotation failure is non-fatal, so the governance
+    // action succeeds. MLS removal (the hard security boundary) completes;
+    // rotate_sender_key failure is logged as a warning but does not abort
+    // the operation, avoiding inconsistent state.
     let action = scp_protocol::context::governance::GovernanceAction::RemoveMember {
         did: alice.clone(),
         reason: Some("error test".into()),
@@ -10088,11 +10091,9 @@ async fn rotate_sender_key_error_propagates() {
     let result = manager
         .propose_governance_action("rotate-err-ctx", &admin, action, &key_admin)
         .await;
-    assert!(result.is_err(), "remove member should fail: {result:?}");
-    let err = result.unwrap_err();
     assert!(
-        format!("{err}").contains("rotate_sender_key"),
-        "error should mention rotate_sender_key: {err}"
+        result.is_ok(),
+        "remove member should succeed despite rotation failure: {result:?}"
     );
 }
 
