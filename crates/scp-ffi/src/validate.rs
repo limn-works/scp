@@ -227,16 +227,10 @@ pub fn validate_did(did: &str) -> Result<(), ScpPyError> {
 /// too long, contains control characters, or contains format string
 /// characters.
 pub fn validate_tool_name(name: &str) -> Result<(), ScpPyError> {
-    validate_non_empty(name, "tool name", MAX_TOOL_NAME_LEN)?;
-    reject_control_chars(name, "tool name")?;
-
-    if name.contains('{') || name.contains('}') {
-        return Err(ScpPyError::validation(format!(
-            "tool name must not contain '{{' or '}}' (format string risk), got {name:?}"
-        )));
-    }
-
-    Ok(())
+    // Delegate to common for control chars + HTML-special + length checks,
+    // then add the format-string brace check locally.
+    scp_ffi_common::validate::validate_tool_name(name)
+        .map_err(|e| ScpPyError::validation(e.message))
 }
 
 /// Validates a tool ID string.
@@ -290,9 +284,8 @@ pub fn validate_tool_id(tool_id: &str) -> Result<(), ScpPyError> {
 /// Returns [`ScpPyError::ValidationError`] if the capability URI is empty,
 /// too long, or contains control characters.
 pub fn validate_capability_uri(uri: &str) -> Result<(), ScpPyError> {
-    validate_non_empty(uri, "capability URI", MAX_CAPABILITY_URI_LEN)?;
-    reject_control_chars(uri, "capability URI")?;
-    Ok(())
+    scp_ffi_common::validate::validate_capability_uri(uri)
+        .map_err(|e| ScpPyError::validation(e.message))
 }
 
 // ---------------------------------------------------------------------------

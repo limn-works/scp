@@ -319,6 +319,7 @@ pub fn validate_did(did: &str) -> Result<(), ValidationError> {
 pub fn validate_tool_name(name: &str) -> Result<(), ValidationError> {
     validate_non_empty(name, "tool name", MAX_TOOL_NAME_LEN)?;
     reject_control_chars(name, "tool name")?;
+    reject_html_special_chars(name, "tool name")?;
 
     if name.contains('{') || name.contains('}') {
         return Err(ValidationError::new(format!(
@@ -382,6 +383,7 @@ pub fn validate_tool_id(tool_id: &str) -> Result<(), ValidationError> {
 pub fn validate_capability_uri(uri: &str) -> Result<(), ValidationError> {
     validate_non_empty(uri, "capability URI", MAX_CAPABILITY_URI_LEN)?;
     reject_control_chars(uri, "capability URI")?;
+    reject_html_special_chars(uri, "capability URI")?;
     Ok(())
 }
 
@@ -729,8 +731,10 @@ pub fn validate_attestation_fields(
 ) -> Result<(), ValidationError> {
     validate_non_empty(platform, "platform", MAX_ATTESTATION_PLATFORM_LEN)?;
     reject_control_chars(platform, "platform")?;
+    reject_html_special_chars(platform, "platform")?;
     validate_non_empty(handle, "handle", MAX_ATTESTATION_HANDLE_LEN)?;
     reject_control_chars(handle, "handle")?;
+    reject_html_special_chars(handle, "handle")?;
     validate_non_empty(proof, "proof", MAX_ATTESTATION_PROOF_LEN)?;
     reject_control_chars(proof, "proof")?;
     Ok(())
