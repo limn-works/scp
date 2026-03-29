@@ -295,7 +295,7 @@ impl ContextCryptoProvider for MlsCryptoProvider {
             mls_group,
             sender_key,
             sender_key_store,
-            sender_key_epoch: 0,
+            sender_key_epoch: 1,
             pending_distributions: Vec::new(),
             nonce_dedup: NonceDedup::new(),
             member_wrapping_keys: HashMap::new(),
@@ -814,7 +814,7 @@ impl ContextCryptoProvider for MlsCryptoProvider {
                     )));
                 }
 
-                // Store the recovered sender key.
+                // Store the recovered sender key with epoch monotonicity check (#1608).
                 let mut contexts = self
                     .contexts
                     .lock()
@@ -824,7 +824,8 @@ impl ContextCryptoProvider for MlsCryptoProvider {
                 })?;
                 state
                     .sender_key_store
-                    .set(&ctx_id_hex, sender_did, sender_key);
+                    .set_checked(&ctx_id_hex, sender_did, sender_key, response.epoch)
+                    .map_err(|e| ContextError::CryptoFailed(format!("epoch check failed: {e}")))?;
                 Ok(())
             }
             _ => Err(ContextError::CryptoFailed(
@@ -1401,7 +1402,7 @@ impl ContextCryptoProvider for MlsCryptoProvider {
                 mls_group: group,
                 sender_key,
                 sender_key_store: SenderKeyStore::new(),
-                sender_key_epoch: 0,
+                sender_key_epoch: 1,
                 pending_distributions: Vec::new(),
                 nonce_dedup: NonceDedup::new(),
                 member_wrapping_keys: HashMap::new(),
@@ -1988,7 +1989,7 @@ mod tests {
         match msg {
             scp_protocol::crypto::sender_keys::SenderKeyDistributionMessage::KeyResponse(resp) => {
                 assert_eq!(resp.sender_did, TEST_DID);
-                assert_eq!(resp.epoch, 0);
+                assert_eq!(resp.epoch, 1, "initial epoch starts at 1 (0 is sentinel)");
             }
             _ => panic!("expected KeyResponse variant"),
         }

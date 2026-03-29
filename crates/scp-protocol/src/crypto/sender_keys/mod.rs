@@ -189,6 +189,21 @@ pub enum SenderKeyError {
     #[error("epoch counter overflow: already at u64::MAX")]
     EpochOverflow,
 
+    /// A received sender key has an epoch ≤ the current stored epoch.
+    ///
+    /// Indicates a rollback attempt or replay of an old key distribution.
+    #[error(
+        "sender key epoch not monotonic for {sender_did}: current={current}, received={received}"
+    )]
+    EpochNotMonotonic {
+        /// The DID of the sender whose key was rejected.
+        sender_did: String,
+        /// The epoch currently stored.
+        current: u64,
+        /// The epoch in the rejected distribution.
+        received: u64,
+    },
+
     /// The broadcast key epoch does not match the envelope epoch.
     ///
     /// The caller must provide a key whose epoch matches the envelope's
@@ -240,6 +255,9 @@ pub enum SenderKeyError {
 pub struct SenderKeyStore {
     /// Maps `context_id -> (sender_did -> SenderKey)`.
     keys: HashMap<String, HashMap<String, SenderKey>>,
+    /// Maps `context_id -> (sender_did -> epoch)`.
+    /// Tracked separately from `keys` to avoid changing the `SenderKey` type.
+    epochs: HashMap<String, HashMap<String, u64>>,
 }
 
 impl SenderKeyStore {
@@ -259,11 +277,65 @@ impl SenderKeyStore {
     }
 
     /// Stores or updates the sender key for a given context and sender DID.
+    ///
+    /// Does NOT enforce epoch monotonicity — use [`set_checked`] when
+    /// accepting keys from other members.
     pub fn set(&mut self, context_id: &str, sender_did: &str, key: SenderKey) {
         self.keys
             .entry(context_id.to_owned())
             .or_default()
             .insert(sender_did.to_owned(), key);
+    }
+
+    /// Stores a sender key with epoch monotonicity enforcement (#1608).
+    ///
+    /// Rejects the key if `epoch` is not strictly greater than the
+    /// currently stored epoch for this `(context_id, sender_did)` pair.
+    /// A sender with no prior epoch is treated as epoch 0.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` with a message if the epoch is not monotonically
+    /// increasing (rollback attempt or replay).
+    pub fn set_checked(
+        &mut self,
+        context_id: &str,
+        sender_did: &str,
+        key: SenderKey,
+        epoch: u64,
+    ) -> Result<(), SenderKeyError> {
+        let current_epoch = self
+            .epochs
+            .get(context_id)
+            .and_then(|m| m.get(sender_did))
+            .copied()
+            .unwrap_or(0);
+        if epoch <= current_epoch {
+            return Err(SenderKeyError::EpochNotMonotonic {
+                sender_did: sender_did.to_owned(),
+                current: current_epoch,
+                received: epoch,
+            });
+        }
+        self.keys
+            .entry(context_id.to_owned())
+            .or_default()
+            .insert(sender_did.to_owned(), key);
+        self.epochs
+            .entry(context_id.to_owned())
+            .or_default()
+            .insert(sender_did.to_owned(), epoch);
+        Ok(())
+    }
+
+    /// Returns the stored epoch for a given context and sender DID.
+    #[must_use]
+    pub fn epoch(&self, context_id: &str, sender_did: &str) -> u64 {
+        self.epochs
+            .get(context_id)
+            .and_then(|m| m.get(sender_did))
+            .copied()
+            .unwrap_or(0)
     }
 
     /// Removes the sender key for a given context and sender DID.
@@ -274,6 +346,13 @@ impl SenderKeyStore {
         let removed = inner.remove(sender_did);
         if inner.is_empty() {
             self.keys.remove(context_id);
+        }
+        // Also clean up epoch tracking.
+        if let Some(epoch_inner) = self.epochs.get_mut(context_id) {
+            epoch_inner.remove(sender_did);
+            if epoch_inner.is_empty() {
+                self.epochs.remove(context_id);
+            }
         }
         removed
     }
@@ -451,5 +530,79 @@ mod tests {
         assert!(removed.is_some());
         // The inner map for ctx-1 should be cleaned up entirely.
         assert!(store.keys.is_empty());
+    }
+
+    #[test]
+    fn set_checked_accepts_monotonically_increasing_epoch() {
+        let mut store = SenderKeyStore::new();
+        let key1 = generate_sender_key();
+        let key2 = generate_sender_key();
+        assert!(store.set_checked("ctx", "did:a", key1, 1).is_ok());
+        assert_eq!(store.epoch("ctx", "did:a"), 1);
+        assert!(store.set_checked("ctx", "did:a", key2, 2).is_ok());
+        assert_eq!(store.epoch("ctx", "did:a"), 2);
+    }
+
+    #[test]
+    fn set_checked_rejects_same_epoch() {
+        let mut store = SenderKeyStore::new();
+        let key1 = generate_sender_key();
+        let key2 = generate_sender_key();
+        store.set_checked("ctx", "did:a", key1, 5).unwrap();
+        let err = store.set_checked("ctx", "did:a", key2, 5).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                SenderKeyError::EpochNotMonotonic {
+                    current: 5,
+                    received: 5,
+                    ..
+                }
+            ),
+            "expected EpochNotMonotonic, got: {err}"
+        );
+    }
+
+    #[test]
+    fn set_checked_rejects_older_epoch() {
+        let mut store = SenderKeyStore::new();
+        let key1 = generate_sender_key();
+        let key2 = generate_sender_key();
+        store.set_checked("ctx", "did:a", key1, 10).unwrap();
+        let err = store.set_checked("ctx", "did:a", key2, 3).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                SenderKeyError::EpochNotMonotonic {
+                    current: 10,
+                    received: 3,
+                    ..
+                }
+            ),
+            "expected EpochNotMonotonic, got: {err}"
+        );
+        // Key should not have been replaced.
+        assert_eq!(store.epoch("ctx", "did:a"), 10);
+    }
+
+    #[test]
+    fn set_checked_first_key_requires_epoch_gt_zero() {
+        let mut store = SenderKeyStore::new();
+        let key = generate_sender_key();
+        // Epoch 0 is the default — a new key must be at least epoch 1.
+        let err = store.set_checked("ctx", "did:a", key, 0).unwrap_err();
+        assert!(matches!(err, SenderKeyError::EpochNotMonotonic { .. }));
+    }
+
+    #[test]
+    fn remove_cleans_up_epoch_tracking() {
+        let mut store = SenderKeyStore::new();
+        store
+            .set_checked("ctx", "did:a", generate_sender_key(), 1)
+            .unwrap();
+        assert_eq!(store.epoch("ctx", "did:a"), 1);
+        store.remove("ctx", "did:a");
+        assert_eq!(store.epoch("ctx", "did:a"), 0);
+        assert!(store.epochs.is_empty());
     }
 }
