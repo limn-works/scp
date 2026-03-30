@@ -1774,6 +1774,8 @@ fn py_governance_execute(handle: &PyContextHandle, proposal_json: &str) -> PyRes
             serde_json::from_str(&proposal_json_owned).map_err(|e| {
                 PyValueError::new_err(format!("invalid governance proposal JSON: {e}"))
             })?;
+        validate_governance_action_strings(&proposal.action)
+            .map_err(|e| PyValueError::new_err(format!("SCP-CTX-2040: {e}")))?;
         let action_name = proposal.action.variant_name();
         let result = mgr
             .execute_governance_action(&context_id, &proposal)
@@ -2030,6 +2032,9 @@ fn py_governance_propose(
                 PyValueError::new_err(format!("SCP-CTX-2040: invalid governance action JSON: {e}"))
             })?;
 
+        validate_governance_action_strings(&action)
+            .map_err(|e| PyValueError::new_err(format!("SCP-CTX-2040: {e}")))?;
+
         let action_name = action.variant_name();
 
         let outcome = mgr
@@ -2060,6 +2065,14 @@ fn py_governance_propose(
         });
         Ok(response.to_string())
     })
+}
+
+/// Validates all user-controlled string fields on a governance action.
+fn validate_governance_action_strings(
+    action: &scp_core::context::governance::GovernanceAction,
+) -> Result<(), crate::error::ScpPyError> {
+    scp_ffi_common::validate::validate_governance_action_strings(action)
+        .map_err(|e| crate::error::ScpPyError::validation(e.message))
 }
 
 /// Casts an approval vote on a pending governance proposal.
@@ -4756,5 +4769,85 @@ mod tests {
                 Err(e) => panic!("expected Ok, got Err: {e}"),
             }
         });
+    }
+
+    // -- Governance action string validation (#1601) --
+
+    #[test]
+    fn governance_action_script_tag_in_role_name_rejected() {
+        let action = scp_core::context::governance::GovernanceAction::AddMember {
+            did: scp_identity::DID("did:dht:z6MkTest".to_owned()),
+            role: "<script>alert('xss')</script>".to_owned(),
+        };
+        let err = validate_governance_action_strings(&action).unwrap_err();
+        assert!(
+            err.to_string().contains("HTML-special character"),
+            "expected HTML-special rejection, got: {err}"
+        );
+    }
+
+    #[test]
+    fn governance_action_control_chars_in_reason_rejected() {
+        let action = scp_core::context::governance::GovernanceAction::RemoveMember {
+            did: scp_identity::DID("did:dht:z6MkTest".to_owned()),
+            reason: Some("bad\0actor".to_owned()),
+        };
+        let err = validate_governance_action_strings(&action).unwrap_err();
+        assert!(
+            err.to_string().contains("control character"),
+            "expected control char rejection, got: {err}"
+        );
+    }
+
+    #[test]
+    fn governance_action_valid_role_accepted() {
+        let action = scp_core::context::governance::GovernanceAction::AddMember {
+            did: scp_identity::DID("did:dht:z6MkTest".to_owned()),
+            role: "moderator".to_owned(),
+        };
+        assert!(validate_governance_action_strings(&action).is_ok());
+    }
+
+    #[test]
+    fn governance_action_html_in_change_role_rejected() {
+        let action = scp_core::context::governance::GovernanceAction::ChangeRole {
+            did: scp_identity::DID("did:dht:z6MkTest".to_owned()),
+            new_role: "admin&owner".to_owned(),
+        };
+        let err = validate_governance_action_strings(&action).unwrap_err();
+        assert!(
+            err.to_string().contains("HTML-special character"),
+            "expected HTML-special rejection, got: {err}"
+        );
+    }
+
+    #[test]
+    fn governance_action_none_reason_accepted() {
+        let action = scp_core::context::governance::GovernanceAction::RemoveMember {
+            did: scp_identity::DID("did:dht:z6MkTest".to_owned()),
+            reason: None,
+        };
+        assert!(validate_governance_action_strings(&action).is_ok());
+    }
+
+    #[test]
+    fn context_description_with_control_chars_rejected() {
+        let err =
+            scp_ffi_common::validate::validate_context_description("A context\x00with null bytes")
+                .unwrap_err();
+        assert!(
+            err.to_string().contains("control character"),
+            "expected control char rejection, got: {err}"
+        );
+    }
+
+    #[test]
+    fn context_name_with_script_tag_rejected() {
+        let err = scp_ffi_common::validate::validate_context_name("<script>alert(1)</script>")
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("HTML-special character"),
+            "expected HTML-special rejection, got: {err}"
+        );
     }
 }

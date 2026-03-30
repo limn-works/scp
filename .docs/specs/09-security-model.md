@@ -11,6 +11,16 @@
 7. **Context metadata is transparent.** Full legibility before opt-in.
 8. **Apps are capability-scoped.** The SDK enforces declaration contracts — apps receive scoped handles that expose only declared capabilities. API calls exceeding declared capabilities are rejected at the call site (§8.4.2).
 
+## 9.1A Input Validation Principle
+
+All user-provided string fields in protocol types are validated at two points: (1) the FFI boundary, where strings cross from SDK to bridge, and (2) type construction, where protocol types enforce their own invariants. Validation rejects:
+
+- **Control characters** (U+0000–U+001F, U+007F–U+009F) — prevents log injection, display confusion, and format string attacks.
+- **HTML-special characters** (`<`, `>`, `&`, `"`, `'`) — prevents injection when fields are serialized for SDK consumers or rendered in downstream UIs. Applied to fields that reach UI or serialization surfaces (role names, reasons, context names/descriptions, payment adapter refs).
+- **Excessive length** — per-field maximum lengths prevent resource exhaustion and buffer abuse.
+
+Per-field limits are defined where each field is specified: context names and descriptions (§5.9), governance action string fields (§5.9), and payment adapter references (§19.1).
+
 ## 9.2 Identified Threat Vectors and Mitigations
 
 **Context spoofing.** Creating a context that impersonates a legitimate one. Mitigation: contexts are cryptographic entities; you opt into a key, not a name. Name-based spoofing is a client-layer problem.

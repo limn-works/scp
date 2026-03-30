@@ -107,6 +107,21 @@ pub const MAX_ATTESTATION_PROOF_LEN: usize = 65_536;
 /// everywhere — no divergent limits.
 pub const MAX_IDENTITY_LINK_ATTESTATIONS_PER_DID: usize = 64;
 
+/// Maximum length for a role name (spec §5.9).
+pub const MAX_ROLE_NAME_LEN: usize = 256;
+
+/// Maximum length for a context name (spec §5.9).
+pub const MAX_CONTEXT_NAME_LEN: usize = 256;
+
+/// Maximum length for a context description (spec §5.9).
+pub const MAX_CONTEXT_DESCRIPTION_LEN: usize = 4096;
+
+/// Maximum length for a governance action reason/purpose field.
+pub const MAX_GOVERNANCE_REASON_LEN: usize = 4096;
+
+/// Maximum length for a payment adapter reference (spec §19.1).
+pub const MAX_PAYMENT_ADAPTER_REF_LEN: usize = 256;
+
 // ---------------------------------------------------------------------------
 // String emptiness and length
 // ---------------------------------------------------------------------------
@@ -138,6 +153,24 @@ fn reject_control_chars(value: &str, field_name: &str) -> Result<(), ValidationE
     if let Some(pos) = value.chars().position(char::is_control) {
         return Err(ValidationError::new(format!(
             "{field_name} contains control character at position {pos}"
+        )));
+    }
+    Ok(())
+}
+
+/// HTML-special characters that could enable injection when string fields
+/// are serialized for SDK consumers or rendered in UIs.
+const HTML_SPECIAL_CHARS: [char; 5] = ['<', '>', '&', '"', '\''];
+
+/// Rejects strings containing HTML-special characters (`<`, `>`, `&`, `"`, `'`).
+/// These characters create injection vectors when user-controlled fields are
+/// serialized into JSON for SDK consumers or rendered in downstream UIs.
+fn reject_html_special_chars(value: &str, field_name: &str) -> Result<(), ValidationError> {
+    if let Some(pos) = value.find(HTML_SPECIAL_CHARS.as_slice()) {
+        let ch = value[pos..].chars().next().unwrap_or('?');
+        return Err(ValidationError::new(format!(
+            "{field_name} contains HTML-special character U+{:04X} at byte position {pos}",
+            ch as u32
         )));
     }
     Ok(())
@@ -286,6 +319,7 @@ pub fn validate_did(did: &str) -> Result<(), ValidationError> {
 pub fn validate_tool_name(name: &str) -> Result<(), ValidationError> {
     validate_non_empty(name, "tool name", MAX_TOOL_NAME_LEN)?;
     reject_control_chars(name, "tool name")?;
+    reject_html_special_chars(name, "tool name")?;
 
     if name.contains('{') || name.contains('}') {
         return Err(ValidationError::new(format!(
@@ -349,6 +383,7 @@ pub fn validate_tool_id(tool_id: &str) -> Result<(), ValidationError> {
 pub fn validate_capability_uri(uri: &str) -> Result<(), ValidationError> {
     validate_non_empty(uri, "capability URI", MAX_CAPABILITY_URI_LEN)?;
     reject_control_chars(uri, "capability URI")?;
+    reject_html_special_chars(uri, "capability URI")?;
     Ok(())
 }
 
@@ -462,6 +497,200 @@ pub fn validate_transport_mode(mode: &str) -> Result<(), ValidationError> {
 }
 
 // ---------------------------------------------------------------------------
+// User-controlled string validation (§9.1A, #1601)
+// ---------------------------------------------------------------------------
+
+/// Validates a user-controlled string field: non-empty, within length limit,
+/// no control characters (U+0000–U+001F, U+007F–U+009F), no HTML-special
+/// characters (`<`, `>`, `&`, `"`, `'`).
+fn validate_user_string(
+    value: &str,
+    field_name: &str,
+    max_len: usize,
+) -> Result<(), ValidationError> {
+    validate_non_empty(value, field_name, max_len)?;
+    reject_control_chars(value, field_name)?;
+    reject_html_special_chars(value, field_name)?;
+    Ok(())
+}
+
+/// Validates a role name (governance actions, role definitions). Max 256 bytes.
+///
+/// # Errors
+///
+/// Returns [`ValidationError`] per [`validate_user_string`] rules.
+pub fn validate_role_name(role: &str) -> Result<(), ValidationError> {
+    validate_user_string(role, "role name", MAX_ROLE_NAME_LEN)
+}
+
+/// Validates a context name (context metadata). Max 256 bytes.
+///
+/// # Errors
+///
+/// Returns [`ValidationError`] per [`validate_user_string`] rules.
+pub fn validate_context_name(name: &str) -> Result<(), ValidationError> {
+    validate_user_string(name, "context name", MAX_CONTEXT_NAME_LEN)
+}
+
+/// Validates a context description (context metadata). Max 4096 bytes.
+///
+/// # Errors
+///
+/// Returns [`ValidationError`] per [`validate_user_string`] rules.
+pub fn validate_context_description(description: &str) -> Result<(), ValidationError> {
+    validate_user_string(
+        description,
+        "context description",
+        MAX_CONTEXT_DESCRIPTION_LEN,
+    )
+}
+
+/// Validates a governance action reason or purpose string. Max 4096 bytes.
+///
+/// # Errors
+///
+/// Returns [`ValidationError`] per [`validate_user_string`] rules.
+pub fn validate_governance_reason(reason: &str) -> Result<(), ValidationError> {
+    validate_user_string(reason, "governance reason", MAX_GOVERNANCE_REASON_LEN)
+}
+
+/// Validates a payment adapter reference (§19.1). Max 256 bytes.
+///
+/// # Errors
+///
+/// Returns [`ValidationError`] per [`validate_user_string`] rules.
+pub fn validate_payment_adapter_ref(adapter_ref: &str) -> Result<(), ValidationError> {
+    validate_user_string(
+        adapter_ref,
+        "payment adapter ref",
+        MAX_PAYMENT_ADAPTER_REF_LEN,
+    )
+}
+
+// ---------------------------------------------------------------------------
+// Governance action string validation (#1601)
+// ---------------------------------------------------------------------------
+
+/// Validates all user-controlled string fields on a [`GovernanceAction`].
+///
+/// Called from all FFI bridge `governance_propose` functions after JSON
+/// deserialization and before passing the action to the `ContextManager`.
+///
+/// Covers role names, reason/purpose text, payment adapter refs, and
+/// nested string fields inside `ContextParams` and `ToolRegistration`.
+///
+/// # Errors
+///
+/// Returns [`ValidationError`] if any string field contains control
+/// characters, HTML-special characters, or exceeds its maximum length.
+pub fn validate_governance_action_strings(
+    action: &scp_protocol::context::governance::GovernanceAction,
+) -> Result<(), ValidationError> {
+    use scp_protocol::context::governance::GovernanceAction;
+
+    match action {
+        GovernanceAction::AddMember { role, .. } => {
+            validate_role_name(role)?;
+        }
+        GovernanceAction::ChangeRole { new_role, .. } => {
+            validate_role_name(new_role)?;
+        }
+        GovernanceAction::RemoveMember {
+            reason: Some(r), ..
+        }
+        | GovernanceAction::CloseContext {
+            reason: Some(r), ..
+        }
+        | GovernanceAction::BlockAuthor {
+            reason: Some(r), ..
+        }
+        | GovernanceAction::RotateContentKeys {
+            reason: Some(r), ..
+        } => {
+            validate_governance_reason(r)?;
+        }
+        GovernanceAction::ResetMember { reason, .. } => {
+            validate_governance_reason(reason)?;
+        }
+        GovernanceAction::ProposeContextMigration {
+            reason,
+            new_context_params,
+            ..
+        } => {
+            validate_governance_reason(reason)?;
+            validate_context_params_strings(new_context_params)?;
+        }
+        GovernanceAction::ApproveSpend { purpose, .. } => {
+            validate_governance_reason(purpose)?;
+        }
+        GovernanceAction::SetEconomicPolicy { policy } => {
+            validate_economic_policy_strings(policy)?;
+        }
+        GovernanceAction::RegisterTool { registration } => {
+            validate_tool_name(&registration.name)?;
+            validate_governance_reason(&registration.description)?;
+        }
+        GovernanceAction::CreateChildContext { params } => {
+            validate_context_params_strings(params)?;
+        }
+        // Variants without user-controlled string fields.
+        GovernanceAction::RemoveMember { reason: None, .. }
+        | GovernanceAction::CloseContext { reason: None, .. }
+        | GovernanceAction::BlockAuthor { reason: None, .. }
+        | GovernanceAction::RotateContentKeys { reason: None, .. }
+        | GovernanceAction::RemoveTool { .. }
+        | GovernanceAction::ModifyCeiling { .. }
+        | GovernanceAction::ExtendTtl { .. }
+        | GovernanceAction::TransferAdmin { .. }
+        | GovernanceAction::RevokeReadAccess { .. }
+        | GovernanceAction::RestoreReadAccess { .. }
+        | GovernanceAction::ModifyPruningPolicy { .. }
+        | GovernanceAction::AddSigner { .. }
+        | GovernanceAction::RemoveSigner { .. }
+        | GovernanceAction::ModifyThreshold { .. }
+        | GovernanceAction::EstablishToolInterface { .. }
+        | GovernanceAction::ResolveConflict { .. }
+        | GovernanceAction::PromoteContext
+        | GovernanceAction::RevokeWriteAccess { .. }
+        | GovernanceAction::RestoreWriteAccess { .. }
+        | GovernanceAction::ReconfigureGovernance { .. }
+        | GovernanceAction::LockEconomicPolicy
+        | GovernanceAction::CancelContextMigration => {}
+    }
+    Ok(())
+}
+
+/// Validates string fields inside an [`EconomicPolicy`].
+fn validate_economic_policy_strings(
+    policy: &scp_protocol::economy::types::EconomicPolicy,
+) -> Result<(), ValidationError> {
+    for adapter in &policy.payment_adapters {
+        validate_payment_adapter_ref(adapter)?;
+    }
+    Ok(())
+}
+
+/// Validates user-controlled string fields inside a [`ContextParams`].
+///
+/// Checks role names in role definitions and payment adapter refs in
+/// economic policy. Tool registration names/descriptions are also validated.
+fn validate_context_params_strings(
+    params: &scp_protocol::context::params::ContextParams,
+) -> Result<(), ValidationError> {
+    for role_def in &params.roles {
+        validate_role_name(&role_def.name)?;
+    }
+    for tool_reg in &params.tools {
+        validate_tool_name(&tool_reg.name)?;
+        validate_governance_reason(&tool_reg.description)?;
+    }
+    if let Some(policy) = &params.economic_policy {
+        validate_economic_policy_strings(policy)?;
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
 // JSON value type name
 // ---------------------------------------------------------------------------
 
@@ -502,8 +731,10 @@ pub fn validate_attestation_fields(
 ) -> Result<(), ValidationError> {
     validate_non_empty(platform, "platform", MAX_ATTESTATION_PLATFORM_LEN)?;
     reject_control_chars(platform, "platform")?;
+    reject_html_special_chars(platform, "platform")?;
     validate_non_empty(handle, "handle", MAX_ATTESTATION_HANDLE_LEN)?;
     reject_control_chars(handle, "handle")?;
+    reject_html_special_chars(handle, "handle")?;
     validate_non_empty(proof, "proof", MAX_ATTESTATION_PROOF_LEN)?;
     reject_control_chars(proof, "proof")?;
     Ok(())
@@ -929,5 +1160,281 @@ mod tests {
         assert_eq!(json_value_type_name(&serde_json::json!("hello")), "string");
         assert_eq!(json_value_type_name(&serde_json::json!([1, 2])), "array");
         assert_eq!(json_value_type_name(&serde_json::json!({"a": 1})), "object");
+    }
+
+    // -- Role name --
+
+    #[test]
+    fn valid_role_name() {
+        assert!(validate_role_name("admin").is_ok());
+    }
+
+    #[test]
+    fn role_name_with_html_rejected() {
+        let err = validate_role_name("<script>admin").unwrap_err();
+        assert!(err.message.contains("HTML-special character"));
+    }
+
+    #[test]
+    fn role_name_with_control_chars_rejected() {
+        let err = validate_role_name("admin\0").unwrap_err();
+        assert!(err.message.contains("control character"));
+    }
+
+    #[test]
+    fn role_name_too_long_rejected() {
+        let long = "a".repeat(MAX_ROLE_NAME_LEN + 1);
+        let err = validate_role_name(&long).unwrap_err();
+        assert!(err.message.contains("exceeds maximum length"));
+    }
+
+    #[test]
+    fn empty_role_name_rejected() {
+        let err = validate_role_name("").unwrap_err();
+        assert!(err.message.contains("must not be empty"));
+    }
+
+    // -- Context name --
+
+    #[test]
+    fn valid_context_name() {
+        assert!(validate_context_name("My Context").is_ok());
+    }
+
+    #[test]
+    fn context_name_with_html_rejected() {
+        let err = validate_context_name("<b>My Context</b>").unwrap_err();
+        assert!(err.message.contains("HTML-special character"));
+    }
+
+    #[test]
+    fn context_name_with_control_chars_rejected() {
+        let err = validate_context_name("My\nContext").unwrap_err();
+        assert!(err.message.contains("control character"));
+    }
+
+    #[test]
+    fn context_name_too_long_rejected() {
+        let long = "a".repeat(MAX_CONTEXT_NAME_LEN + 1);
+        let err = validate_context_name(&long).unwrap_err();
+        assert!(err.message.contains("exceeds maximum length"));
+    }
+
+    // -- Context description --
+
+    #[test]
+    fn valid_context_description() {
+        assert!(validate_context_description("A context for collaboration").is_ok());
+    }
+
+    #[test]
+    fn context_description_with_html_rejected() {
+        let err = validate_context_description("test &amp; things").unwrap_err();
+        assert!(err.message.contains("HTML-special character"));
+    }
+
+    #[test]
+    fn context_description_too_long_rejected() {
+        let long = "a".repeat(MAX_CONTEXT_DESCRIPTION_LEN + 1);
+        let err = validate_context_description(&long).unwrap_err();
+        assert!(err.message.contains("exceeds maximum length"));
+    }
+
+    // -- Governance reason --
+
+    #[test]
+    fn valid_governance_reason() {
+        assert!(validate_governance_reason("Member violated community guidelines").is_ok());
+    }
+
+    #[test]
+    fn governance_reason_with_html_rejected() {
+        let err = validate_governance_reason("reason <script>alert(1)</script>").unwrap_err();
+        assert!(err.message.contains("HTML-special character"));
+    }
+
+    #[test]
+    fn governance_reason_too_long_rejected() {
+        let long = "a".repeat(MAX_GOVERNANCE_REASON_LEN + 1);
+        let err = validate_governance_reason(&long).unwrap_err();
+        assert!(err.message.contains("exceeds maximum length"));
+    }
+
+    // -- Payment adapter ref --
+
+    #[test]
+    fn valid_payment_adapter_ref() {
+        assert!(validate_payment_adapter_ref("lightning").is_ok());
+    }
+
+    #[test]
+    fn payment_adapter_ref_with_html_rejected() {
+        let err = validate_payment_adapter_ref("stripe<script>").unwrap_err();
+        assert!(err.message.contains("HTML-special character"));
+    }
+
+    #[test]
+    fn payment_adapter_ref_too_long_rejected() {
+        let long = "a".repeat(MAX_PAYMENT_ADAPTER_REF_LEN + 1);
+        let err = validate_payment_adapter_ref(&long).unwrap_err();
+        assert!(err.message.contains("exceeds maximum length"));
+    }
+
+    // -- HTML special char helper --
+
+    #[test]
+    fn html_chars_angle_bracket_rejected() {
+        let err = reject_html_special_chars("test<value", "field").unwrap_err();
+        assert!(err.message.contains("HTML-special character"));
+        assert!(err.message.contains("U+003C"));
+    }
+
+    #[test]
+    fn html_chars_ampersand_rejected() {
+        let err = reject_html_special_chars("test&value", "field").unwrap_err();
+        assert!(err.message.contains("HTML-special character"));
+        assert!(err.message.contains("U+0026"));
+    }
+
+    #[test]
+    fn html_chars_quote_rejected() {
+        let err = reject_html_special_chars("test\"value", "field").unwrap_err();
+        assert!(err.message.contains("HTML-special character"));
+        assert!(err.message.contains("U+0022"));
+    }
+
+    #[test]
+    fn html_chars_apostrophe_rejected() {
+        let err = reject_html_special_chars("test'value", "field").unwrap_err();
+        assert!(err.message.contains("HTML-special character"));
+        assert!(err.message.contains("U+0027"));
+    }
+
+    #[test]
+    fn clean_string_passes_html_check() {
+        assert!(reject_html_special_chars("hello world 123-_.", "field").is_ok());
+    }
+
+    // -- Governance action string validation --
+
+    #[test]
+    fn governance_action_register_tool_braces_in_name_rejected() {
+        use scp_protocol::context::governance::GovernanceAction;
+        use scp_protocol::context::tools::registry::{ToolRegistration, ToolSchema};
+
+        let action = GovernanceAction::RegisterTool {
+            registration: Box::new(ToolRegistration {
+                tool_id: "test-tool".to_owned(),
+                name: "tool-{inject}".to_owned(),
+                description: "a tool".to_owned(),
+                schema: ToolSchema {
+                    input_schema: serde_json::json!({"type": "object"}),
+                    output_schema: serde_json::json!({"type": "object"}),
+                },
+                implementation_hash: [0u8; 32],
+                test_vectors: vec![],
+                operator_did: scp_primitives::DID("did:dht:z6MkTest".to_owned()),
+                cost: None,
+                registered_at: 0,
+                signature: vec![],
+            }),
+        };
+        let err = validate_governance_action_strings(&action).unwrap_err();
+        assert!(err.message.contains("format string risk"));
+    }
+
+    #[test]
+    fn governance_action_register_tool_html_in_description_rejected() {
+        use scp_protocol::context::governance::GovernanceAction;
+        use scp_protocol::context::tools::registry::{ToolRegistration, ToolSchema};
+
+        let action = GovernanceAction::RegisterTool {
+            registration: Box::new(ToolRegistration {
+                tool_id: "test-tool".to_owned(),
+                name: "my-tool".to_owned(),
+                description: "a <script>alert(1)</script> tool".to_owned(),
+                schema: ToolSchema {
+                    input_schema: serde_json::json!({"type": "object"}),
+                    output_schema: serde_json::json!({"type": "object"}),
+                },
+                implementation_hash: [0u8; 32],
+                test_vectors: vec![],
+                operator_did: scp_primitives::DID("did:dht:z6MkTest".to_owned()),
+                cost: None,
+                registered_at: 0,
+                signature: vec![],
+            }),
+        };
+        let err = validate_governance_action_strings(&action).unwrap_err();
+        assert!(err.message.contains("HTML-special character"));
+    }
+
+    #[test]
+    fn governance_action_add_member_valid_role_accepted() {
+        use scp_protocol::context::governance::GovernanceAction;
+
+        let action = GovernanceAction::AddMember {
+            did: scp_primitives::DID("did:dht:z6MkTest".to_owned()),
+            role: "moderator".to_owned(),
+        };
+        assert!(validate_governance_action_strings(&action).is_ok());
+    }
+
+    #[test]
+    fn governance_action_add_member_html_role_rejected() {
+        use scp_protocol::context::governance::GovernanceAction;
+
+        let action = GovernanceAction::AddMember {
+            did: scp_primitives::DID("did:dht:z6MkTest".to_owned()),
+            role: "<admin>".to_owned(),
+        };
+        let err = validate_governance_action_strings(&action).unwrap_err();
+        assert!(err.message.contains("HTML-special character"));
+    }
+
+    #[test]
+    fn governance_action_none_reason_accepted() {
+        use scp_protocol::context::governance::GovernanceAction;
+
+        let action = GovernanceAction::RemoveMember {
+            did: scp_primitives::DID("did:dht:z6MkTest".to_owned()),
+            reason: None,
+        };
+        assert!(validate_governance_action_strings(&action).is_ok());
+    }
+
+    #[test]
+    fn governance_action_control_chars_in_reason_rejected() {
+        use scp_protocol::context::governance::GovernanceAction;
+
+        let action = GovernanceAction::RemoveMember {
+            did: scp_primitives::DID("did:dht:z6MkTest".to_owned()),
+            reason: Some("bad\0actor".to_owned()),
+        };
+        let err = validate_governance_action_strings(&action).unwrap_err();
+        assert!(err.message.contains("control character"));
+    }
+
+    #[test]
+    fn governance_action_propose_migration_validates_nested_params() {
+        use scp_protocol::context::governance::GovernanceAction;
+        use scp_protocol::context::params::ContextParams;
+        use scp_protocol::context::roles::RoleDefinition;
+        use std::collections::HashSet;
+
+        let mut params = ContextParams::default();
+        params.roles.push(RoleDefinition {
+            name: "role<xss>".to_owned(),
+            capabilities: HashSet::new(),
+        });
+
+        let action = GovernanceAction::ProposeContextMigration {
+            new_context_params: Box::new(params),
+            reason: "migration reason".to_owned(),
+            grace_period_secs: 604_800,
+            auto_invite: false,
+        };
+        let err = validate_governance_action_strings(&action).unwrap_err();
+        assert!(err.message.contains("HTML-special character"));
     }
 }
