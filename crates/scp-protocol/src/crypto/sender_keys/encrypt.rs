@@ -53,7 +53,7 @@ pub fn encrypt_sender_layer(
     sequence: u64,
 ) -> Result<Vec<u8>, SenderKeyError> {
     let cipher = Aes256Gcm::new_from_slice(sender_key.as_bytes())
-        .map_err(|_| SenderKeyError::EncryptionFailed)?;
+        .map_err(|e| SenderKeyError::EncryptionFailed(e.to_string()))?;
 
     let mut nonce_bytes = [0u8; NONCE_SIZE];
     OsRng.fill_bytes(&mut nonce_bytes);
@@ -68,7 +68,7 @@ pub fn encrypt_sender_layer(
                 aad: &aad,
             },
         )
-        .map_err(|_| SenderKeyError::EncryptionFailed)?;
+        .map_err(|e| SenderKeyError::EncryptionFailed(e.to_string()))?;
 
     let mut output = Vec::with_capacity(NONCE_SIZE + encrypted.len());
     output.extend_from_slice(&nonce_bytes);
@@ -181,6 +181,7 @@ pub fn parse_sender_header(data: &[u8]) -> Result<(u64, u64, &[u8]), &'static st
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
     use crate::crypto::sender_keys::generate_sender_key;
@@ -205,11 +206,9 @@ mod tests {
     fn wrong_context_id_fails_aead() {
         let key = generate_sender_key();
         let plaintext = b"hello";
-        let ct =
-            encrypt_sender_layer(&key, plaintext, TEST_CTX, TEST_DID, TEST_EPOCH, TEST_SEQ)
-                .unwrap();
-        let result =
-            decrypt_sender_layer(&key, &ct, "wrong-ctx", TEST_DID, TEST_EPOCH, TEST_SEQ);
+        let ct = encrypt_sender_layer(&key, plaintext, TEST_CTX, TEST_DID, TEST_EPOCH, TEST_SEQ)
+            .unwrap();
+        let result = decrypt_sender_layer(&key, &ct, "wrong-ctx", TEST_DID, TEST_EPOCH, TEST_SEQ);
         assert!(result.is_err());
     }
 
@@ -217,9 +216,8 @@ mod tests {
     fn wrong_sender_did_fails_aead() {
         let key = generate_sender_key();
         let plaintext = b"hello";
-        let ct =
-            encrypt_sender_layer(&key, plaintext, TEST_CTX, TEST_DID, TEST_EPOCH, TEST_SEQ)
-                .unwrap();
+        let ct = encrypt_sender_layer(&key, plaintext, TEST_CTX, TEST_DID, TEST_EPOCH, TEST_SEQ)
+            .unwrap();
         let result =
             decrypt_sender_layer(&key, &ct, TEST_CTX, "did:dht:wrong", TEST_EPOCH, TEST_SEQ);
         assert!(result.is_err());
@@ -229,9 +227,8 @@ mod tests {
     fn wrong_epoch_fails_aead() {
         let key = generate_sender_key();
         let plaintext = b"hello";
-        let ct =
-            encrypt_sender_layer(&key, plaintext, TEST_CTX, TEST_DID, TEST_EPOCH, TEST_SEQ)
-                .unwrap();
+        let ct = encrypt_sender_layer(&key, plaintext, TEST_CTX, TEST_DID, TEST_EPOCH, TEST_SEQ)
+            .unwrap();
         let result = decrypt_sender_layer(&key, &ct, TEST_CTX, TEST_DID, 999, TEST_SEQ);
         assert!(result.is_err());
     }
@@ -240,9 +237,8 @@ mod tests {
     fn wrong_sequence_fails_aead() {
         let key = generate_sender_key();
         let plaintext = b"hello";
-        let ct =
-            encrypt_sender_layer(&key, plaintext, TEST_CTX, TEST_DID, TEST_EPOCH, TEST_SEQ)
-                .unwrap();
+        let ct = encrypt_sender_layer(&key, plaintext, TEST_CTX, TEST_DID, TEST_EPOCH, TEST_SEQ)
+            .unwrap();
         let result = decrypt_sender_layer(&key, &ct, TEST_CTX, TEST_DID, TEST_EPOCH, 0);
         assert!(result.is_err());
     }
@@ -252,9 +248,8 @@ mod tests {
         let key = generate_sender_key();
         let wrong_key = generate_sender_key();
         let plaintext = b"hello";
-        let ct =
-            encrypt_sender_layer(&key, plaintext, TEST_CTX, TEST_DID, TEST_EPOCH, TEST_SEQ)
-                .unwrap();
+        let ct = encrypt_sender_layer(&key, plaintext, TEST_CTX, TEST_DID, TEST_EPOCH, TEST_SEQ)
+            .unwrap();
         let result =
             decrypt_sender_layer(&wrong_key, &ct, TEST_CTX, TEST_DID, TEST_EPOCH, TEST_SEQ);
         assert!(result.is_err());
@@ -263,7 +258,8 @@ mod tests {
     #[test]
     fn truncated_ciphertext_fails() {
         let key = generate_sender_key();
-        let result = decrypt_sender_layer(&key, &[0u8; 5], TEST_CTX, TEST_DID, TEST_EPOCH, TEST_SEQ);
+        let result =
+            decrypt_sender_layer(&key, &[0u8; 5], TEST_CTX, TEST_DID, TEST_EPOCH, TEST_SEQ);
         assert!(result.is_err());
     }
 
