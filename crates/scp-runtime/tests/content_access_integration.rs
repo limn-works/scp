@@ -973,7 +973,7 @@ async fn three_layer_enforcement_after_full_revocation() {
 
     // Set up Dave's stores with Alice's cached material.
     let mut dave_sender_store = SenderKeyStore::new();
-    dave_sender_store.set(context_id, ALICE, generate_sender_key());
+    dave_sender_store.set_unchecked(context_id, ALICE, generate_sender_key());
     let mut dave_access_store = AccessKeyStore::new();
     dave_access_store.set(context_id, ALICE, generate_access_key(context_id, ALICE));
 
@@ -1293,7 +1293,7 @@ async fn invalid_block_notification_no_destruction() {
 
     // Dave's stores with Alice's cached material.
     let mut sender_store = SenderKeyStore::new();
-    sender_store.set(context_id, ALICE, generate_sender_key());
+    sender_store.set_unchecked(context_id, ALICE, generate_sender_key());
     let mut access_store = AccessKeyStore::new();
     access_store.set(context_id, ALICE, generate_access_key(context_id, ALICE));
 

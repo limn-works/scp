@@ -556,7 +556,7 @@ pub fn create_shadow(
     // shadow does not affect others. The key is stored before the shadow
     // is committed to the registry — if this fails, no shadow is created.
     let sender_key = generate_sender_key();
-    sender_key_store.set(&registry.context_id, shadow_id, sender_key);
+    sender_key_store.set_unchecked(&registry.context_id, shadow_id, sender_key);
 
     registry.shadows.push(shadow.clone());
     registry.creation_events.push(event.clone());

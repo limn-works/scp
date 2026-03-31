@@ -1983,9 +1983,9 @@ mod tests {
         use crate::crypto::sender_keys::SenderKeyStore;
 
         let mut store = SenderKeyStore::new();
-        store.set("ctx-1", "shadow:bridge-001:alice", generate_sender_key());
-        store.set("ctx-1", "shadow:bridge-001:bob", generate_sender_key());
-        store.set("ctx-1", "did:dht:z6MkNative", generate_sender_key());
+        store.set_unchecked("ctx-1", "shadow:bridge-001:alice", generate_sender_key());
+        store.set_unchecked("ctx-1", "shadow:bridge-001:bob", generate_sender_key());
+        store.set_unchecked("ctx-1", "did:dht:z6MkNative", generate_sender_key());
 
         let shadow_dids = list_shadow_sender_key_dids(&store, "ctx-1", "shadow:");
         assert_eq!(shadow_dids.len(), 2);

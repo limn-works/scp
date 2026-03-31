@@ -596,7 +596,7 @@ mod tests {
 
             // Set up Dave's stores with Alice's sender key.
             let mut sender_store = SenderKeyStore::new();
-            sender_store.set("ctx-1", "did:dht:alice", generate_sender_key());
+            sender_store.set_unchecked("ctx-1", "did:dht:alice", generate_sender_key());
             let mut access_store = AccessKeyStore::new();
 
             let result = handle_block_as_blocked_party(
@@ -662,7 +662,7 @@ mod tests {
                     .await;
 
             let mut sender_store = SenderKeyStore::new();
-            sender_store.set("ctx-1", "did:dht:alice", generate_sender_key());
+            sender_store.set_unchecked("ctx-1", "did:dht:alice", generate_sender_key());
             let mut access_store = AccessKeyStore::new();
             access_store.set(
                 "ctx-1",
@@ -722,7 +722,7 @@ mod tests {
                     .await;
 
             let mut sender_store = SenderKeyStore::new();
-            sender_store.set("ctx-1", "did:dht:alice", generate_sender_key());
+            sender_store.set_unchecked("ctx-1", "did:dht:alice", generate_sender_key());
             let mut access_store = AccessKeyStore::new();
             access_store.set(
                 "ctx-1",
@@ -753,7 +753,7 @@ mod tests {
                     .await;
 
             let mut sender_store = SenderKeyStore::new();
-            sender_store.set("ctx-1", "did:dht:alice", generate_sender_key());
+            sender_store.set_unchecked("ctx-1", "did:dht:alice", generate_sender_key());
             let mut access_store = AccessKeyStore::new();
             access_store.set(
                 "ctx-1",
@@ -786,7 +786,7 @@ mod tests {
                     .await;
 
             let mut sender_store = SenderKeyStore::new();
-            sender_store.set("ctx-1", "did:dht:alice", generate_sender_key());
+            sender_store.set_unchecked("ctx-1", "did:dht:alice", generate_sender_key());
             let mut access_store = AccessKeyStore::new();
             access_store.set(
                 "ctx-1",
@@ -863,9 +863,9 @@ mod tests {
                     .await;
 
             let mut sender_store = SenderKeyStore::new();
-            sender_store.set("ctx-1", "did:dht:alice", generate_sender_key());
+            sender_store.set_unchecked("ctx-1", "did:dht:alice", generate_sender_key());
             // Also have a sender key for another context — should NOT be affected.
-            sender_store.set("ctx-2", "did:dht:alice", generate_sender_key());
+            sender_store.set_unchecked("ctx-2", "did:dht:alice", generate_sender_key());
             let mut access_store = AccessKeyStore::new();
 
             let result = handle_block_as_blocked_party(
