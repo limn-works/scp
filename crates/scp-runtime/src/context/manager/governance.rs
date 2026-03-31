@@ -257,6 +257,16 @@ fn target_did_to_payload(did: Option<&DID>) -> Vec<u8> {
     .unwrap_or_default()
 }
 
+/// Maximum age (in seconds) for receive-buffer events used in consequence
+/// evaluation. Events estimated to be older than this are discarded as
+/// stale, preventing manipulation via timestamp back-dating.
+const MAX_BUFFER_EVENT_AGE_SECS: u64 = 3600; // 1 hour
+
+/// Maximum clock skew tolerance (in seconds) for buffer event timestamps.
+/// Events with estimated timestamps more than this far in the future are
+/// discarded.
+const MAX_FUTURE_TOLERANCE_SECS: u64 = 5;
+
 pub(super) fn event_log_entries_for_consequences(
     ctx: &PerContextState,
     context_id: &str,
@@ -353,6 +363,16 @@ pub(super) fn event_log_entries_for_consequences(
 
         // Skip buffer events that are likely already covered by the event log.
         if estimated_ts <= last_log_ts && last_log_ts > 0 {
+            continue;
+        }
+
+        // Reject buffer events with timestamps too far in the future (M18).
+        if estimated_ts > now.saturating_add(MAX_FUTURE_TOLERANCE_SECS) {
+            continue;
+        }
+
+        // Reject buffer events with timestamps too far in the past (M18).
+        if now.saturating_sub(estimated_ts) > MAX_BUFFER_EVENT_AGE_SECS {
             continue;
         }
 
