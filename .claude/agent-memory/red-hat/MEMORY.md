@@ -41,6 +41,14 @@ After commit 54b8096 ("close 6 remaining gaps"), reassessed all chains.
 - **RED-404 (LOW->CONFIRMED SAFE)**: Global cache not context-scoped. Cache key is SHA-256(JWT). Pre-cache checks (capability + audience) run BEFORE cache lookup. Audience includes routing_id (unique per context). Cross-context cache reuse impossible.
 - **Latent risk**: Dead `None` arm in check_projection_auth (line 883) provides structural-only validation without audience/sig/revocation. Unreachable today (all callers pass Some). Recommend replacing with hard 401 or unreachable!().
 
+## PR #1606 Assessment (2026-03-31) - Epoch/Sequence AAD + SCPM Management + Buffer Bounds
+- **RED-501 (LOW)**: SCPM magic prefix collision with epoch header bytes requires epoch ~6 quintillion. Unreachable. MLS credential binding prevents cross-identity sender key injection via management messages.
+- **RED-502 (MEDIUM)**: E2eCryptoProvider hardcodes epoch=0, sequence=0 (fullstack/crypto.rs:863). H2 AAD binding untested in E2E. Fix: wire real counters.
+- **RED-503 (LOW)**: `#[serde(default)]` on send_sequence means old snapshots restore to 0. Safe because GCM nonce is random (OsRng), not counter-derived. Latent risk if nonce strategy changes.
+- **RED-504 (MEDIUM)**: Buffer capacity > 3601 causes timestamp estimation to exceed 3600s bounds, silently dropping valid events. Governance evasion in large-buffer contexts. Fix: clamp estimation range.
+- **RED-505 (LOW)**: 300s freshness window for access key requests. Replay harmless due to HPKE wrapping to requester's pubkey.
+- Controls that hold: MLS credential binding, SCPM collision resistance, epoch monotonicity on sender key store, random GCM nonces, HPKE key wrapping.
+
 ## Key Attack Patterns for This Codebase
 - **Bridge parity gap**: WASM bridge cannot depend on scp-core (tokio incompatibility), so it re-implements validation partially. ALWAYS check WASM bridge when core validation changes.
 - **Two UcanToken types**: `roles::UcanToken` (stub, no sig/expiry) vs `crypto::ucan::UcanToken` (full, has sig/encoded). Broadcast uses the stub. Any code accepting the stub has no sig verification.
