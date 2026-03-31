@@ -642,6 +642,36 @@ impl ContextManager {
         Ok(())
     }
 
+    /// Decrypts an incoming envelope and dispatches management/control messages.
+    ///
+    /// Returns `Some(OpenedEnvelope)` for application messages that need further
+    /// processing, or `None` for control/management messages that are handled
+    /// internally.
+    fn decrypt_and_dispatch(
+        &self,
+        context_id: &str,
+        context_id_bytes: &[u8; 32],
+        encrypted_blob: &[u8],
+    ) -> Result<Option<scp_protocol::context::builder::OpenedEnvelope>, ContextError> {
+        let decrypt_start = std::time::Instant::now();
+        let open_result = self.crypto.open(context_id_bytes, encrypted_blob)?;
+        crate::metrics::record_decrypt_duration(decrypt_start.elapsed());
+
+        match open_result {
+            scp_protocol::context::builder::OpenResult::Application(env) => Ok(Some(*env)),
+            scp_protocol::context::builder::OpenResult::Control => Ok(None),
+            scp_protocol::context::builder::OpenResult::Management {
+                sender_did,
+                payload,
+            } => {
+                tracing::debug!(sender_did = %sender_did, context_id = %context_id, "received MLS-wrapped management message");
+                self.crypto
+                    .process_incoming_sender_key(context_id_bytes, &sender_did, &payload)?;
+                Ok(None)
+            }
+        }
+    }
+
     /// Delivers an incoming encrypted message from the relay to a context.
     ///
     /// Opens the received envelope through the full receive pipeline,
@@ -662,7 +692,6 @@ impl ContextManager {
     /// Returns [`ContextError`] if the context is not active, decryption
     /// fails, signature verification fails, anti-replay check fails,
     /// access key unwrapping fails, or the sender lacks capability.
-    #[allow(clippy::too_many_lines)]
     #[instrument(skip_all, fields(context_id))]
     pub async fn deliver_incoming(
         &self,
@@ -695,25 +724,10 @@ impl ContextManager {
         drop(local_dids);
 
         // Phase 2: open envelope (MLS + sender key + deserialize + integrity).
-        let decrypt_start = std::time::Instant::now();
-        let open_result = self.crypto.open(&context_id_bytes, encrypted_blob)?;
-        crate::metrics::record_decrypt_duration(decrypt_start.elapsed());
-
-        let opened_envelope = match open_result {
-            scp_protocol::context::builder::OpenResult::Application(env) => *env,
-            scp_protocol::context::builder::OpenResult::Control => return Ok(None),
-            scp_protocol::context::builder::OpenResult::Management {
-                sender_did,
-                payload,
-            } => {
-                tracing::debug!(sender_did = %sender_did, context_id = %context_id, "received MLS-wrapped management message");
-                self.crypto.process_incoming_sender_key(
-                    &context_id_bytes,
-                    &sender_did,
-                    &payload,
-                )?;
-                return Ok(None);
-            }
+        let Some(opened_envelope) =
+            self.decrypt_and_dispatch(context_id, &context_id_bytes, encrypted_blob)?
+        else {
+            return Ok(None);
         };
 
         let inner = opened_envelope.inner;
