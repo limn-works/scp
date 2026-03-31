@@ -278,11 +278,12 @@ impl SenderKeyStore {
         self.keys.get(context_id)?.get(sender_did)
     }
 
-    /// Stores or updates the sender key for a given context and sender DID.
+    /// Sets a sender key WITHOUT enforcing epoch monotonicity.
     ///
-    /// Does NOT enforce epoch monotonicity — use [`set_checked`] when
-    /// accepting keys from other members.
-    pub fn set(&mut self, context_id: &str, sender_did: &str, key: SenderKey) {
+    /// Use [`set_checked`] when accepting keys from other members to prevent
+    /// epoch rollback attacks. This method is intended only for the local
+    /// member's own key rotation.
+    pub fn set_unchecked(&mut self, context_id: &str, sender_did: &str, key: SenderKey) {
         self.keys
             .entry(context_id.to_owned())
             .or_default()
@@ -412,7 +413,7 @@ mod tests {
         let key = generate_sender_key();
         let expected = *key.as_bytes();
 
-        store.set("ctx-1", "did:example:alice", key);
+        store.set_unchecked("ctx-1", "did:example:alice", key);
 
         let retrieved = store.get("ctx-1", "did:example:alice");
         assert!(retrieved.is_some());
@@ -429,7 +430,7 @@ mod tests {
     fn sender_key_store_remove() {
         let mut store = SenderKeyStore::new();
         let key = generate_sender_key();
-        store.set("ctx-1", "did:example:alice", key);
+        store.set_unchecked("ctx-1", "did:example:alice", key);
 
         let removed = store.remove("ctx-1", "did:example:alice");
         assert!(removed.is_some());
@@ -450,10 +451,10 @@ mod tests {
         let alice_bytes = *key_alice.as_bytes();
         let bob_bytes = *key_bob.as_bytes();
 
-        store.set("ctx-1", "did:example:alice", key_alice);
-        store.set("ctx-1", "did:example:bob", key_bob);
+        store.set_unchecked("ctx-1", "did:example:alice", key_alice);
+        store.set_unchecked("ctx-1", "did:example:bob", key_bob);
         // Different context — should not appear in ctx-1 results.
-        store.set("ctx-2", "did:example:charlie", generate_sender_key());
+        store.set_unchecked("ctx-2", "did:example:charlie", generate_sender_key());
 
         let all = store.get_all("ctx-1");
         assert_eq!(all.len(), 2);
@@ -481,8 +482,8 @@ mod tests {
         let key2 = generate_sender_key();
         let key2_bytes = *key2.as_bytes();
 
-        store.set("ctx-1", "did:example:alice", key1);
-        store.set("ctx-1", "did:example:alice", key2);
+        store.set_unchecked("ctx-1", "did:example:alice", key1);
+        store.set_unchecked("ctx-1", "did:example:alice", key2);
 
         let retrieved = store.get("ctx-1", "did:example:alice");
         assert_eq!(retrieved.map(SenderKey::as_bytes), Some(&key2_bytes));
@@ -498,7 +499,7 @@ mod tests {
         let key = generate_sender_key();
         let expected_ptr = std::ptr::from_ref::<[u8; 32]>(key.as_bytes());
 
-        store.set("ctx-1", "did:example:alice", key);
+        store.set_unchecked("ctx-1", "did:example:alice", key);
 
         let retrieved = store.get("ctx-1", "did:example:alice");
         assert!(retrieved.is_some());
@@ -526,7 +527,7 @@ mod tests {
     #[test]
     fn sender_key_store_remove_cleans_up_empty_context() {
         let mut store = SenderKeyStore::new();
-        store.set("ctx-1", "did:example:alice", generate_sender_key());
+        store.set_unchecked("ctx-1", "did:example:alice", generate_sender_key());
 
         let removed = store.remove("ctx-1", "did:example:alice");
         assert!(removed.is_some());

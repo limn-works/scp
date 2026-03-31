@@ -234,7 +234,7 @@ async fn alice_bob_encrypted_message_via_relay() {
     // ---------------------------------------------------------------
     let alice_sender_key = generate_sender_key();
     let mut alice_sk_store = SenderKeyStore::new();
-    alice_sk_store.set(ctx_id, &alice_id.did, alice_sender_key.clone());
+    alice_sk_store.set_unchecked(ctx_id, &alice_id.did, alice_sender_key.clone());
 
     let advance_bytes = publish_sender_key_epoch_advance(
         &alice_custody,
@@ -335,7 +335,7 @@ async fn alice_bob_encrypted_message_via_relay() {
 
     // Bob stores Alice's sender key.
     let mut bob_sk_store = SenderKeyStore::new();
-    bob_sk_store.set(ctx_id, &alice_id.did, received_sk);
+    bob_sk_store.set_unchecked(ctx_id, &alice_id.did, received_sk);
 
     // ---------------------------------------------------------------
     // Step 8: Alice wraps message in envelopes with sender key + MLS (ADR-002, ADR-007)

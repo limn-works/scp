@@ -207,7 +207,7 @@ impl E2eCryptoProvider {
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             for (sender_did, key) in sender_keys {
-                store.set(&ctx_hex, &sender_did, key);
+                store.set_unchecked(&ctx_hex, &sender_did, key);
             }
         }
 
@@ -284,7 +284,7 @@ impl E2eCryptoProvider {
                 .sender_keys
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            store.set(&ctx_hex, &self.local_did, key);
+            store.set_unchecked(&ctx_hex, &self.local_did, key);
         }
 
         // Distribute to all known members in the exchange.
@@ -332,7 +332,7 @@ impl E2eCryptoProvider {
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             for (sender_did, key) in sender_keys {
-                store.set(&ctx_hex, &sender_did, key);
+                store.set_unchecked(&ctx_hex, &sender_did, key);
             }
         }
         Ok(())
@@ -561,7 +561,7 @@ impl ContextCryptoProvider for E2eCryptoProvider {
             .sender_keys
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        store.set(&ctx_hex, &self.local_did, key);
+        store.set_unchecked(&ctx_hex, &self.local_did, key);
 
         // Initialize epoch and sequence counters for this context.
         self.sender_key_epochs
@@ -948,7 +948,9 @@ impl ContextCryptoProvider for E2eCryptoProvider {
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             let seq = seqs.entry(*context_id).or_insert(0);
-            *seq = seq.wrapping_add(1);
+            *seq = seq.checked_add(1).ok_or_else(|| {
+                ContextError::CryptoFailed("send sequence counter overflow".into())
+            })?;
         }
 
         Ok(result)

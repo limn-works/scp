@@ -33,8 +33,7 @@ pub struct ConsequenceValidationError(String);
 
 /// Maximum length for custom trigger keys and capability names.
 const MAX_CONSEQUENCE_STRING_LEN: usize = 256;
-/// Maximum length for role names in `RoleDemotion`.
-const MAX_ROLE_NAME_LEN: usize = 128;
+use crate::context::roles::MAX_ROLE_NAME_LENGTH;
 /// Maximum number of capabilities in a `CapabilitySuspension` action.
 const MAX_CAPABILITY_SUSPENSION_COUNT: usize = 32;
 
@@ -225,7 +224,7 @@ impl ConsequenceRule {
                 }
             }
             ConsequenceAction::RoleDemotion { to_role } => {
-                validate_consequence_string(to_role, "RoleDemotion.to_role", MAX_ROLE_NAME_LEN)?;
+                validate_consequence_string(to_role, "RoleDemotion.to_role", MAX_ROLE_NAME_LENGTH)?;
             }
             ConsequenceAction::AccessRevocation => { /* no user strings */ }
         }
