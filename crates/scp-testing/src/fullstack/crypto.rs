@@ -36,7 +36,9 @@ use scp_core::crypto::mls::group::{
     ScpMlsGroup, add_member, create_group, destroy_group, generate_key_package, join_group,
 };
 use scp_core::crypto::mls::ratchet::{process_commit, propose_update, serialize_mls_message};
-use scp_core::crypto::sender_keys::encrypt::{decrypt_sender_layer, encrypt_sender_layer};
+use scp_core::crypto::sender_keys::encrypt::{
+    build_sender_header, decrypt_sender_layer, encrypt_sender_layer, parse_sender_header,
+};
 use scp_core::crypto::sender_keys::{SenderKey, SenderKeyStore, generate_sender_key};
 use scp_identity::SigningKeyId;
 
@@ -71,6 +73,10 @@ pub struct E2eCryptoProvider {
     /// `pickup_access_keys` (joiner picks up all keys from `KeyExchange`)
     /// and `set_access_key` (creator copies key from `ContextManager`).
     access_keys: Mutex<AccessKeyStore>,
+    /// Per-context sender key epoch counter: `context_id` -> epoch.
+    sender_key_epochs: Mutex<HashMap<[u8; 32], u64>>,
+    /// Per-context send-side message sequence counter: `context_id` -> sequence.
+    send_sequences: Mutex<HashMap<[u8; 32], u64>>,
 }
 
 #[allow(clippy::significant_drop_tightening)]
@@ -88,6 +94,8 @@ impl E2eCryptoProvider {
             exchange,
             members: Mutex::new(HashMap::new()),
             access_keys: Mutex::new(AccessKeyStore::new()),
+            sender_key_epochs: Mutex::new(HashMap::new()),
+            send_sequences: Mutex::new(HashMap::new()),
         }
     }
 
@@ -550,6 +558,19 @@ impl ContextCryptoProvider for E2eCryptoProvider {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         store.set(&ctx_hex, &self.local_did, key);
+
+        // Initialize epoch and sequence counters for this context.
+        self.sender_key_epochs
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .entry(*context_id)
+            .or_insert(1);
+        self.send_sequences
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .entry(*context_id)
+            .or_insert(0);
+
         Ok(())
     }
 
@@ -859,14 +880,32 @@ impl ContextCryptoProvider for E2eCryptoProvider {
                     )
                 })?
         };
-        let sender_encrypted =
-            encrypt_sender_layer(&sender_key, &serialized, &ctx_str, &self.local_did, 0, 0)
-                .map_err(|e| ContextError::CryptoFailed(e.to_string()))?;
+        let epoch = {
+            let epochs = self
+                .sender_key_epochs
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            epochs.get(context_id).copied().unwrap_or(1)
+        };
+        let sequence = {
+            let seqs = self
+                .send_sequences
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            seqs.get(context_id).copied().unwrap_or(0)
+        };
 
-        let mut with_header = Vec::with_capacity(16 + sender_encrypted.len());
-        with_header.extend_from_slice(&0u64.to_be_bytes());
-        with_header.extend_from_slice(&0u64.to_be_bytes());
-        with_header.extend_from_slice(&sender_encrypted);
+        let sender_encrypted = encrypt_sender_layer(
+            &sender_key,
+            &serialized,
+            &ctx_str,
+            &self.local_did,
+            epoch,
+            sequence,
+        )
+        .map_err(|e| ContextError::CryptoFailed(e.to_string()))?;
+
+        let with_header = build_sender_header(epoch, sequence, &sender_encrypted);
 
         // 3. MLS encrypt.
         let mls_message = {
@@ -891,6 +930,16 @@ impl ContextCryptoProvider for E2eCryptoProvider {
             encrypted_blob,
         )
         .map_err(|e| ContextError::CryptoFailed(e.to_string()))?;
+
+        // Increment send sequence after successful encryption.
+        {
+            let mut seqs = self
+                .send_sequences
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let seq = seqs.entry(*context_id).or_insert(0);
+            *seq = seq.wrapping_add(1);
+        }
 
         rmp_serde::to_vec_named(&outer)
             .map_err(|e| ContextError::CryptoFailed(format!("outer envelope serialization: {e}")))
@@ -949,18 +998,8 @@ impl ContextCryptoProvider for E2eCryptoProvider {
                 };
 
                 // Step 3: Parse header and sender key decrypt.
-                if mls_decrypted.len() < 16 {
-                    return Err(ContextError::CryptoFailed(
-                        "sender key header too short".to_string(),
-                    ));
-                }
-                let mut epoch_bytes = [0u8; 8];
-                epoch_bytes.copy_from_slice(&mls_decrypted[..8]);
-                let epoch = u64::from_be_bytes(epoch_bytes);
-                let mut seq_bytes = [0u8; 8];
-                seq_bytes.copy_from_slice(&mls_decrypted[8..16]);
-                let sequence = u64::from_be_bytes(seq_bytes);
-                let sender_ciphertext = &mls_decrypted[16..];
+                let (epoch, sequence, sender_ciphertext) = parse_sender_header(&mls_decrypted)
+                    .map_err(|e| ContextError::CryptoFailed(e.to_string()))?;
 
                 let decrypted = decrypt_sender_layer(
                     &sender_key,
@@ -997,5 +1036,42 @@ impl ContextCryptoProvider for E2eCryptoProvider {
                 Ok(scp_core::context::builder::OpenResult::Control)
             }
         }
+    }
+
+    fn mls_encrypt_management(
+        &self,
+        context_id: &[u8; 32],
+        plaintext: &[u8],
+        routing_id: &[u8],
+        blob_ttl: u32,
+    ) -> Result<Vec<u8>, ContextError> {
+        let magic = &scp_core::context::builder::MANAGEMENT_MSG_MAGIC;
+        let mut tagged = Vec::with_capacity(magic.len() + plaintext.len());
+        tagged.extend_from_slice(magic);
+        tagged.extend_from_slice(plaintext);
+
+        let mls_message = {
+            let mut groups = self
+                .groups
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let group = groups
+                .get_mut(context_id)
+                .ok_or_else(|| ContextError::CryptoFailed("no MLS group for context".into()))?;
+            mls_encrypt(group, &tagged).map_err(|e| ContextError::CryptoFailed(e.to_string()))?
+        };
+        let encrypted_blob = serialize_ciphertext(&mls_message)
+            .map_err(|e| ContextError::CryptoFailed(e.to_string()))?;
+
+        let outer = scp_core::envelope::outer::create_outer_envelope(
+            routing_id,
+            None,
+            blob_ttl,
+            encrypted_blob,
+        )
+        .map_err(|e| ContextError::CryptoFailed(e.to_string()))?;
+
+        rmp_serde::to_vec_named(&outer)
+            .map_err(|e| ContextError::CryptoFailed(format!("serialization: {e}")))
     }
 }
