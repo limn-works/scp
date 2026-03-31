@@ -100,6 +100,9 @@ struct MlsCryptoSnapshot {
     /// The sender key epoch counter.
     sender_key_epoch: u64,
     /// The send-side message sequence counter.
+    /// MIGRATION: `#[serde(default)]` — old snapshots deserialize as 0, which is
+    /// the correct initial state. GCM nonces are random (`OsRng`), not counter-derived,
+    /// so a sequence reset does not create nonce reuse.
     #[serde(default)]
     send_sequence: u64,
     /// Remote members' X25519 wrapping public keys: `(did, pubkey)` pairs.
@@ -111,6 +114,10 @@ struct MlsCryptoSnapshot {
     /// The MLS group ID bytes. Required to call `MlsGroup::load` on restore.
     group_id: Vec<u8>,
     /// Receive-side sequence tracking: `(sender_did, last_epoch, last_sequence)`.
+    /// MIGRATION: `#[serde(default)]` — old snapshots deserialize with an empty
+    /// tracker, so the first message from each sender is accepted unconditionally.
+    /// MLS-level replay protection remains the primary defense; this tracker is
+    /// defense-in-depth at the sender-key layer.
     #[serde(default)]
     recv_sequence_tracker: Vec<(String, u64, u64)>,
     /// The provider-level X25519 wrapping public key (§9.16.1).
@@ -850,10 +857,9 @@ impl ContextCryptoProvider for MlsCryptoProvider {
                 // permanently block future key rotations via epoch monotonicity.
                 let current_epoch = state.sender_key_store.epoch(&ctx_id_hex, sender_did);
                 if response.epoch > current_epoch.saturating_add(MAX_EPOCH_ADVANCE) {
-                    return Err(ContextError::CryptoFailed(format!(
-                        "epoch poisoning: claimed epoch {} exceeds current {} by more than {}",
-                        response.epoch, current_epoch, MAX_EPOCH_ADVANCE
-                    )));
+                    return Err(ContextError::CryptoFailed(
+                        "epoch poisoning: claimed epoch exceeds acceptable advance".into(),
+                    ));
                 }
 
                 state
@@ -1108,10 +1114,9 @@ impl ContextCryptoProvider for MlsCryptoProvider {
                         state.recv_sequence_tracker.get(&tracker_key)
                         && (epoch < last_epoch || (epoch == last_epoch && sequence <= last_seq))
                     {
-                        return Err(ContextError::CryptoFailed(format!(
-                            "replay detected: ({epoch}, {sequence}) \
-                             <= ({last_epoch}, {last_seq}) for {sender_did}"
-                        )));
+                        return Err(ContextError::CryptoFailed(
+                            "replay or reorder detected".into(),
+                        ));
                     }
                     state
                         .recv_sequence_tracker
