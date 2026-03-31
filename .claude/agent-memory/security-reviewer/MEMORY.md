@@ -189,15 +189,21 @@
 - RUSTSEC-2026-0044/0048/0049 (aws-lc-sys): suppressed as transitive, awaiting upstream. Appropriate.
 - MEDIUM REMAINING: BootstrapConfig bootstrap resolver doesn't enforce expected_creator_did -- intentional but documentation-only guarantee. If callers skip post-join verification, Sybil attack vector remains.
 
-### PR #1606 -- Epoch/Sequence AAD, MLS Management Messages, Timestamp Bounds (2026-03-31)
-- FIXED: sender key AAD zeros (#1422) -- real epoch/sequence now wired into AES-256-GCM AAD with length-prefixed build_sender_aad
+### PR #1606 -- Epoch/Sequence AAD, MLS Management Messages, Timestamp Bounds (2026-03-31, R2)
+- FIXED: sender key AAD zeros (#1422) -- real epoch/sequence wired into AES-256-GCM AAD with length-prefixed build_sender_aad
 - FIXED: sender key distributions now MLS-wrapped via mls_encrypt_management (SCPM magic prefix dispatch)
-- FIXED: buffer event timestamp bounds (M18) -- 1h past + 5s future tolerance in event_log_entries_for_consequences
-- MEDIUM: SCPM magic prefix collision safe in practice (epoch header prevents 0x5343504D prefix), document invariant
-- MEDIUM: No receive-side sequence validation at sender-key layer (MLS provides primary anti-replay)
-- MEDIUM: REQUEST_FRESHNESS_SECS 30->300s widens access key replay window; NonceDedup still not wired for access keys (more urgent now)
-- MEDIUM: E2eCryptoProvider hardcodes epoch=0/sequence=0 -- tests don't exercise real AAD values
-- GOOD: OpenResult enum forces exhaustive handling; send_sequence persisted in snapshot; wrapping_add; tight future tolerance
+- FIXED: buffer event timestamp bounds (M18) -- 1h past + 5s future tolerance
+- FIXED: E2eCryptoProvider now uses real epoch/sequence (was hardcoded 0/0)
+- FIXED: recv-side sequence tracking added (per-sender epoch/seq monotonicity)
+- FIXED: epoch poisoning defense (MAX_EPOCH_ADVANCE=1000)
+- FIXED: asymmetric access key freshness (past=300s, future=30s)
+- MEDIUM REMAINING: E2eCryptoProvider::open missing management payload 64KiB size check (production has it)
+- MEDIUM REMAINING: mls_encrypt_management has no send-side size check (only recv-side enforced)
+- MEDIUM REMAINING: recv_sequence_tracker unbounded HashMap growth (never pruned on member removal)
+- MEDIUM REMAINING: E2eCryptoProvider seal TOCTOU on epoch/sequence (separate lock acquisitions)
+- MEDIUM REMAINING: Error messages in replay detection and epoch poisoning leak internal state (epoch, sequence, sender_did)
+- MEDIUM PRE-EXISTING: NonceDedup still not wired for access keys
+- GOOD: OpenResult enum forces exhaustive handling; send_sequence persisted; wrapping_add; shared header helpers
 
 ### P0 Audit Batch 1 Review (2026-03-19) -- fix/audit-batch-1-p0-blockers
 - FIXES VERIFIED: #1418 (WASM event tags), #1419 (ceiling escalation), #1420 (phantom events), #1431 (pseudonym oracle), #1470 (atomic writes)
