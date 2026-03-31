@@ -145,7 +145,7 @@
 ### Wiring Batch 1 Messaging (2026-03-24, updated)
 - See `wiring-batch1-messaging-findings.md` for full details (15 files, line-by-line review)
 - HIGH x4: NAPI/UniFFI signing key .ok() falls back to None; Recovery MessageType bypass skips access key unwrapping; access key TOCTOU between Phase 1/3; reorder buffer stores pre-decrypted plaintext
-- MEDIUM x7: sender key AAD zeros (#1422); access key wrapping AAD zeros; bridge trust level discarded; SequenceTracker not persisted; SequenceTracker validate() TOCTOU; snapshot key bytes not Zeroizing; FFI access key ops lack authorization
+- MEDIUM x7: sender key AAD zeros (#1422 -- FIXED in PR#1606); access key wrapping AAD zeros; bridge trust level discarded; SequenceTracker not persisted; SequenceTracker validate() TOCTOU; snapshot key bytes not Zeroizing; FFI access key ops lack authorization
 - GOOD: Sig verify before anti-replay; cross-context injection defense; MLS credential match; constant-time hash; domain-sep routing IDs; fail-closed defaults; correct timestamp validator; sequence 0 rejection; bounded reorder buffer; correct sign order
 
 ### General Patterns
@@ -188,6 +188,16 @@
 - Context import TOCTOU gap: re-check under lock at step 7. Correct fix.
 - RUSTSEC-2026-0044/0048/0049 (aws-lc-sys): suppressed as transitive, awaiting upstream. Appropriate.
 - MEDIUM REMAINING: BootstrapConfig bootstrap resolver doesn't enforce expected_creator_did -- intentional but documentation-only guarantee. If callers skip post-join verification, Sybil attack vector remains.
+
+### PR #1606 -- Epoch/Sequence AAD, MLS Management Messages, Timestamp Bounds (2026-03-31)
+- FIXED: sender key AAD zeros (#1422) -- real epoch/sequence now wired into AES-256-GCM AAD with length-prefixed build_sender_aad
+- FIXED: sender key distributions now MLS-wrapped via mls_encrypt_management (SCPM magic prefix dispatch)
+- FIXED: buffer event timestamp bounds (M18) -- 1h past + 5s future tolerance in event_log_entries_for_consequences
+- MEDIUM: SCPM magic prefix collision safe in practice (epoch header prevents 0x5343504D prefix), document invariant
+- MEDIUM: No receive-side sequence validation at sender-key layer (MLS provides primary anti-replay)
+- MEDIUM: REQUEST_FRESHNESS_SECS 30->300s widens access key replay window; NonceDedup still not wired for access keys (more urgent now)
+- MEDIUM: E2eCryptoProvider hardcodes epoch=0/sequence=0 -- tests don't exercise real AAD values
+- GOOD: OpenResult enum forces exhaustive handling; send_sequence persisted in snapshot; wrapping_add; tight future tolerance
 
 ### P0 Audit Batch 1 Review (2026-03-19) -- fix/audit-batch-1-p0-blockers
 - FIXES VERIFIED: #1418 (WASM event tags), #1419 (ceiling escalation), #1420 (phantom events), #1431 (pseudonym oracle), #1470 (atomic writes)
