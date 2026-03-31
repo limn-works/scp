@@ -884,9 +884,8 @@ impl ContextCryptoProvider for E2eCryptoProvider {
                     )
                 })?
         };
-        // Read epoch and atomically claim the next sequence number under a
-        // single lock scope to prevent concurrent seal() calls from producing
-        // duplicate (epoch, sequence) pairs.
+        // Read epoch and current sequence. Increment happens after successful
+        // encryption to match production MlsCryptoProvider behavior.
         let (epoch, sequence) = {
             let epochs = self
                 .sender_key_epochs
@@ -894,13 +893,11 @@ impl ContextCryptoProvider for E2eCryptoProvider {
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             let epoch = epochs.get(context_id).copied().unwrap_or(1);
 
-            let mut seqs = self
+            let seqs = self
                 .send_sequences
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            let seq_entry = seqs.entry(*context_id).or_insert(0);
-            let sequence = *seq_entry;
-            *seq_entry = seq_entry.wrapping_add(1);
+            let sequence = seqs.get(context_id).copied().unwrap_or(0);
             (epoch, sequence)
         };
 
@@ -940,8 +937,21 @@ impl ContextCryptoProvider for E2eCryptoProvider {
         )
         .map_err(|e| ContextError::CryptoFailed(e.to_string()))?;
 
-        rmp_serde::to_vec_named(&outer)
-            .map_err(|e| ContextError::CryptoFailed(format!("outer envelope serialization: {e}")))
+        let result = rmp_serde::to_vec_named(&outer)
+            .map_err(|e| ContextError::CryptoFailed(format!("outer envelope serialization: {e}")))?;
+
+        // Increment send sequence only after successful encryption — matches
+        // production MlsCryptoProvider behavior.
+        {
+            let mut seqs = self
+                .send_sequences
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let seq = seqs.entry(*context_id).or_insert(0);
+            *seq = seq.wrapping_add(1);
+        }
+
+        Ok(result)
     }
 
     fn open(
@@ -975,20 +985,20 @@ impl ContextCryptoProvider for E2eCryptoProvider {
                 plaintext: mls_decrypted,
                 sender_did,
             } => {
-                const MAX_MANAGEMENT_PAYLOAD_SIZE: usize = 65_536;
                 let magic = &scp_core::context::builder::MANAGEMENT_MSG_MAGIC;
                 if mls_decrypted.len() >= magic.len() && mls_decrypted[..magic.len()] == *magic {
-                    let mgmt_payload = mls_decrypted[magic.len()..].to_vec();
+                    let mgmt_slice = &mls_decrypted[magic.len()..];
                     // Management payload size limit — mirrors MlsCryptoProvider.
-                    if mgmt_payload.len() > MAX_MANAGEMENT_PAYLOAD_SIZE {
-                        return Err(ContextError::CryptoFailed(format!(
-                            "management payload too large: {} bytes (max {MAX_MANAGEMENT_PAYLOAD_SIZE})",
-                            mgmt_payload.len()
-                        )));
+                    if mgmt_slice.len()
+                        > scp_core::context::MAX_MANAGEMENT_PAYLOAD_SIZE
+                    {
+                        return Err(ContextError::CryptoFailed(
+                            "management payload exceeds size limit".into(),
+                        ));
                     }
                     return Ok(scp_core::context::builder::OpenResult::Management {
                         sender_did,
-                        payload: mgmt_payload,
+                        payload: mgmt_slice.to_vec(),
                     });
                 }
 
@@ -999,9 +1009,9 @@ impl ContextCryptoProvider for E2eCryptoProvider {
                         .lock()
                         .unwrap_or_else(std::sync::PoisonError::into_inner);
                     store.get(&ctx_str, &sender_did).cloned().ok_or_else(|| {
-                        ContextError::CryptoFailed(format!(
-                            "no sender key for {sender_did} in context {ctx_str}"
-                        ))
+                        ContextError::CryptoFailed(
+                            "sender key lookup failed".into(),
+                        )
                     })?
                 };
 
@@ -1070,6 +1080,11 @@ impl ContextCryptoProvider for E2eCryptoProvider {
         routing_id: &[u8],
         blob_ttl: u32,
     ) -> Result<Vec<u8>, ContextError> {
+        if plaintext.len() > scp_core::context::MAX_MANAGEMENT_PAYLOAD_SIZE {
+            return Err(ContextError::CryptoFailed(
+                "management payload exceeds size limit".into(),
+            ));
+        }
         let magic = &scp_core::context::builder::MANAGEMENT_MSG_MAGIC;
         let mut tagged = Vec::with_capacity(magic.len() + plaintext.len());
         tagged.extend_from_slice(magic);

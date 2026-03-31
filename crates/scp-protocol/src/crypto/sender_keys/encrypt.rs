@@ -161,22 +161,32 @@ pub fn build_sender_header(epoch: u64, sequence: u64, ciphertext: &[u8]) -> Vec<
 ///
 /// # Errors
 ///
-/// Returns an error string if `data` is shorter than [`SENDER_HEADER_SIZE`].
-pub fn parse_sender_header(data: &[u8]) -> Result<(u64, u64, &[u8]), &'static str> {
+/// Returns [`SenderKeyError::CiphertextTooShort`] if `data` is shorter than
+/// [`SENDER_HEADER_SIZE`].
+pub fn parse_sender_header(data: &[u8]) -> Result<(u64, u64, &[u8]), SenderKeyError> {
     if data.len() < SENDER_HEADER_SIZE {
-        return Err("sender key header too short");
+        return Err(SenderKeyError::CiphertextTooShort {
+            actual: data.len(),
+            minimum: SENDER_HEADER_SIZE,
+        });
     }
-    // SAFETY: length validated above; slice sizes are exact.
-    let epoch_bytes: [u8; 8] = match data[..8].try_into() {
-        Ok(b) => b,
-        Err(_) => return Err("sender key header too short"),
-    };
-    let seq_bytes: [u8; 8] = match data[8..16].try_into() {
-        Ok(b) => b,
-        Err(_) => return Err("sender key header too short"),
-    };
-    let epoch = u64::from_be_bytes(epoch_bytes);
-    let sequence = u64::from_be_bytes(seq_bytes);
+    // Length validated above — try_into is infallible for exact-size slices.
+    let epoch = u64::from_be_bytes(
+        data[..8]
+            .try_into()
+            .map_err(|_| SenderKeyError::CiphertextTooShort {
+                actual: data.len(),
+                minimum: SENDER_HEADER_SIZE,
+            })?,
+    );
+    let sequence = u64::from_be_bytes(
+        data[8..16]
+            .try_into()
+            .map_err(|_| SenderKeyError::CiphertextTooShort {
+                actual: data.len(),
+                minimum: SENDER_HEADER_SIZE,
+            })?,
+    );
     Ok((epoch, sequence, &data[16..]))
 }
 

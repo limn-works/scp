@@ -36,10 +36,9 @@ pub use broadcast::{
     compute_provenance_hash, generate_broadcast_key, generate_broadcast_nonce, open_broadcast,
     open_broadcast_trusted, rotate_broadcast_key, seal_broadcast, validate_broadcast_version,
 };
-pub use encrypt::{
-    SENDER_HEADER_SIZE, build_sender_header, decrypt_sender_layer, encrypt_sender_layer,
-    parse_sender_header,
-};
+pub use encrypt::{decrypt_sender_layer, encrypt_sender_layer};
+// build_sender_header, parse_sender_header, and SENDER_HEADER_SIZE are wire-format
+// internals used by crypto providers — access via encrypt:: submodule directly.
 pub use key_protocol_verify::{
     BlockNotification, BridgeShadowKeyParams, HandleRequestParams, NonceDedup,
     RotateForBlockParams, RotateForBlockResult, SenderKeyDistributionMessage,
