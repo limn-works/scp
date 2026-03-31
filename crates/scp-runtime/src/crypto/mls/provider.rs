@@ -40,6 +40,10 @@ use scp_protocol::crypto::sender_keys::{
     generate_sender_key, generate_wrapping_keypair,
 };
 
+/// Maximum allowed epoch advance in a single sender key distribution.
+/// Prevents epoch poisoning attacks where an attacker sets `epoch=u64::MAX`.
+const MAX_EPOCH_ADVANCE: u64 = 1000;
+
 // ---------------------------------------------------------------------------
 // MlsCryptoSnapshot — serializable per-context crypto state for persistence
 // ---------------------------------------------------------------------------
@@ -106,6 +110,9 @@ struct MlsCryptoSnapshot {
     signer_bytes: Vec<u8>,
     /// The MLS group ID bytes. Required to call `MlsGroup::load` on restore.
     group_id: Vec<u8>,
+    /// Receive-side sequence tracking: `(sender_did, last_epoch, last_sequence)`.
+    #[serde(default)]
+    recv_sequence_tracker: Vec<(String, u64, u64)>,
     /// The provider-level X25519 wrapping public key (§9.16.1).
     /// Persisted so remote members' HPKE-sealed sender key responses can
     /// still be decrypted after a restart. Without this, the restored
@@ -140,6 +147,10 @@ impl std::fmt::Debug for MlsCryptoSnapshot {
             .field("sender_key_epoch", &self.sender_key_epoch)
             .field("send_sequence", &self.send_sequence)
             .field(
+                "recv_sequence_tracker",
+                &format_args!("[{} entries]", self.recv_sequence_tracker.len()),
+            )
+            .field(
                 "member_wrapping_keys",
                 &format_args!("[{} entries]", self.member_wrapping_keys.len()),
             )
@@ -171,6 +182,9 @@ struct ContextCryptoState {
     /// Remote members' X25519 wrapping public keys, keyed by DID.
     /// Populated from key packages during [`MlsCryptoProvider::add_member`].
     member_wrapping_keys: HashMap<String, [u8; 32]>,
+    /// Receive-side sequence tracking for replay detection.
+    /// Maps `sender_did` -> (`last_epoch`, `last_sequence`).
+    recv_sequence_tracker: HashMap<String, (u64, u64)>,
 }
 
 /// State retained for a pending Welcome-based join operation.
@@ -306,6 +320,7 @@ impl ContextCryptoProvider for MlsCryptoProvider {
             pending_distributions: Vec::new(),
             nonce_dedup: NonceDedup::new(),
             member_wrapping_keys: HashMap::new(),
+            recv_sequence_tracker: HashMap::new(),
         };
 
         let mut contexts = self
@@ -829,6 +844,18 @@ impl ContextCryptoProvider for MlsCryptoProvider {
                 let state = contexts.get_mut(context_id).ok_or_else(|| {
                     ContextError::CryptoFailed("no MLS group for this context".to_string())
                 })?;
+
+                // Epoch poisoning defense: reject sender keys with unreasonably
+                // high epoch values. An attacker could set epoch=u64::MAX to
+                // permanently block future key rotations via epoch monotonicity.
+                let current_epoch = state.sender_key_store.epoch(&ctx_id_hex, sender_did);
+                if response.epoch > current_epoch.saturating_add(MAX_EPOCH_ADVANCE) {
+                    return Err(ContextError::CryptoFailed(format!(
+                        "epoch poisoning: claimed epoch {} exceeds current {} by more than {}",
+                        response.epoch, current_epoch, MAX_EPOCH_ADVANCE
+                    )));
+                }
+
                 state
                     .sender_key_store
                     .set_checked(&ctx_id_hex, sender_did, sender_key, response.epoch)
@@ -975,10 +1002,11 @@ impl ContextCryptoProvider for MlsCryptoProvider {
                 )
                 .map_err(|e| ContextError::CryptoFailed(e.to_string()))?;
 
-            let mut with_header = Vec::with_capacity(16 + sender_encrypted.len());
-            with_header.extend_from_slice(&state.sender_key_epoch.to_be_bytes());
-            with_header.extend_from_slice(&state.send_sequence.to_be_bytes());
-            with_header.extend_from_slice(&sender_encrypted);
+            let with_header = scp_protocol::crypto::sender_keys::encrypt::build_sender_header(
+                state.sender_key_epoch,
+                state.send_sequence,
+                &sender_encrypted,
+            );
 
             // 3. MLS encrypt.
             let mls_message =
@@ -1030,9 +1058,18 @@ impl ContextCryptoProvider for MlsCryptoProvider {
                     let magic = &scp_protocol::context::builder::MANAGEMENT_MSG_MAGIC;
                     if mls_decrypted.len() >= magic.len() && mls_decrypted[..magic.len()] == *magic
                     {
+                        const MAX_MANAGEMENT_PAYLOAD_SIZE: usize = 65_536; // 64 KiB
+                        let mgmt_payload = &mls_decrypted[magic.len()..];
+                        if mgmt_payload.len() > MAX_MANAGEMENT_PAYLOAD_SIZE {
+                            return Err(ContextError::CryptoFailed(format!(
+                                "management payload too large: {} bytes (max {})",
+                                mgmt_payload.len(),
+                                MAX_MANAGEMENT_PAYLOAD_SIZE
+                            )));
+                        }
                         return Ok(scp_protocol::context::builder::OpenResult::Management {
                             sender_did,
-                            payload: mls_decrypted[magic.len()..].to_vec(),
+                            payload: mgmt_payload.to_vec(),
                         });
                     }
 
@@ -1048,18 +1085,11 @@ impl ContextCryptoProvider for MlsCryptoProvider {
                         })?;
 
                     // Step 3: Parse header and sender key decrypt.
-                    if mls_decrypted.len() < 16 {
-                        return Err(ContextError::CryptoFailed(
-                            "sender key header too short".to_string(),
-                        ));
-                    }
-                    let mut epoch_bytes = [0u8; 8];
-                    epoch_bytes.copy_from_slice(&mls_decrypted[..8]);
-                    let epoch = u64::from_be_bytes(epoch_bytes);
-                    let mut seq_bytes = [0u8; 8];
-                    seq_bytes.copy_from_slice(&mls_decrypted[8..16]);
-                    let sequence = u64::from_be_bytes(seq_bytes);
-                    let sender_ciphertext = &mls_decrypted[16..];
+                    let (epoch, sequence, sender_ciphertext) =
+                        scp_protocol::crypto::sender_keys::encrypt::parse_sender_header(
+                            &mls_decrypted,
+                        )
+                        .map_err(|e| ContextError::CryptoFailed(e.to_string()))?;
                     // Epoch/sequence from header — see send_message comment about AAD.
                     let decrypted = scp_protocol::crypto::sender_keys::decrypt_sender_layer(
                         &sender_key,
@@ -1070,6 +1100,22 @@ impl ContextCryptoProvider for MlsCryptoProvider {
                         sequence,
                     )
                     .map_err(|e| ContextError::CryptoFailed(e.to_string()))?;
+
+                    // Receive-side replay detection: reject messages with
+                    // epoch/sequence <= last seen for this sender.
+                    let tracker_key = sender_did.clone();
+                    if let Some(&(last_epoch, last_seq)) =
+                        state.recv_sequence_tracker.get(&tracker_key)
+                        && (epoch < last_epoch || (epoch == last_epoch && sequence <= last_seq))
+                    {
+                        return Err(ContextError::CryptoFailed(format!(
+                            "replay detected: ({epoch}, {sequence}) \
+                             <= ({last_epoch}, {last_seq}) for {sender_did}"
+                        )));
+                    }
+                    state
+                        .recv_sequence_tracker
+                        .insert(tracker_key, (epoch, sequence));
 
                     // Step 4: Deserialize as InnerEnvelope.
                     // The inner envelope is returned with its padded payload intact.
@@ -1235,6 +1281,11 @@ impl ContextCryptoProvider for MlsCryptoProvider {
             // Move signer bytes out of the Zeroizing wrapper and into the
             // snapshot. The wrapper is left holding an empty Vec (which it
             // will zeroize on drop — a no-op for an empty vec).
+            recv_sequence_tracker: state
+                .recv_sequence_tracker
+                .iter()
+                .map(|(did, (epoch, seq))| (did.clone(), *epoch, *seq))
+                .collect(),
             signer_bytes: std::mem::take(&mut signer_bytes),
             group_id,
             wrapping_public_key: *pub_key_guard,
@@ -1335,6 +1386,12 @@ impl ContextCryptoProvider for MlsCryptoProvider {
             SenderKey::from_bytes([0u8; 32]),
         );
 
+        let recv_sequence_tracker: HashMap<String, (u64, u64)> = snapshot
+            .recv_sequence_tracker
+            .drain(..)
+            .map(|(did, epoch, seq)| (did, (epoch, seq)))
+            .collect();
+
         let crypto_state = ContextCryptoState {
             mls_group: scp_group,
             sender_key: local_sender_key,
@@ -1344,6 +1401,7 @@ impl ContextCryptoProvider for MlsCryptoProvider {
             pending_distributions: Vec::new(),
             nonce_dedup: NonceDedup::new(),
             member_wrapping_keys,
+            recv_sequence_tracker,
         };
 
         // Restore the provider-level X25519 wrapping keypair BEFORE inserting
@@ -1472,6 +1530,7 @@ impl ContextCryptoProvider for MlsCryptoProvider {
                 pending_distributions: Vec::new(),
                 nonce_dedup: NonceDedup::new(),
                 member_wrapping_keys: HashMap::new(),
+                recv_sequence_tracker: HashMap::new(),
             },
         );
 
