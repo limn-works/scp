@@ -689,6 +689,8 @@ impl ContextCryptoProvider for MlsCryptoProvider {
         state.sender_key_store.remove(&ctx_id_hex, member_did);
         // Also remove the member's wrapping key — they are no longer a member.
         state.member_wrapping_keys.remove(member_did);
+        // Prune replay tracker entry — prevents unbounded growth on member churn.
+        state.recv_sequence_tracker.remove(member_did);
         Ok(())
     }
 
@@ -837,10 +839,9 @@ impl ContextCryptoProvider for MlsCryptoProvider {
 
                 // Verify the sender DID matches the claimed sender.
                 if response.sender_did != sender_did {
-                    return Err(ContextError::CryptoFailed(format!(
-                        "sender DID mismatch: message claims {}, transport says {}",
-                        response.sender_did, sender_did
-                    )));
+                    return Err(ContextError::CryptoFailed(
+                        "sender DID mismatch in sender key distribution".into(),
+                    ));
                 }
 
                 // Store the recovered sender key with epoch monotonicity check (#1608).
@@ -1064,14 +1065,13 @@ impl ContextCryptoProvider for MlsCryptoProvider {
                     let magic = &scp_protocol::context::builder::MANAGEMENT_MSG_MAGIC;
                     if mls_decrypted.len() >= magic.len() && mls_decrypted[..magic.len()] == *magic
                     {
-                        const MAX_MANAGEMENT_PAYLOAD_SIZE: usize = 65_536; // 64 KiB
                         let mgmt_payload = &mls_decrypted[magic.len()..];
-                        if mgmt_payload.len() > MAX_MANAGEMENT_PAYLOAD_SIZE {
-                            return Err(ContextError::CryptoFailed(format!(
-                                "management payload too large: {} bytes (max {})",
-                                mgmt_payload.len(),
-                                MAX_MANAGEMENT_PAYLOAD_SIZE
-                            )));
+                        if mgmt_payload.len()
+                            > scp_protocol::context::builder::MAX_MANAGEMENT_PAYLOAD_SIZE
+                        {
+                            return Err(ContextError::CryptoFailed(
+                                "management payload exceeds size limit".into(),
+                            ));
                         }
                         return Ok(scp_protocol::context::builder::OpenResult::Management {
                             sender_did,
@@ -1085,9 +1085,9 @@ impl ContextCryptoProvider for MlsCryptoProvider {
                         .get(&ctx_str, &sender_did)
                         .cloned()
                         .ok_or_else(|| {
-                            ContextError::CryptoFailed(format!(
-                                "no sender key for {sender_did} in context {ctx_str}"
-                            ))
+                            ContextError::CryptoFailed(
+                                "sender key lookup failed".into(),
+                            )
                         })?;
 
                     // Step 3: Parse header and sender key decrypt.
@@ -1109,9 +1109,8 @@ impl ContextCryptoProvider for MlsCryptoProvider {
 
                     // Receive-side replay detection: reject messages with
                     // epoch/sequence <= last seen for this sender.
-                    let tracker_key = sender_did.clone();
                     if let Some(&(last_epoch, last_seq)) =
-                        state.recv_sequence_tracker.get(&tracker_key)
+                        state.recv_sequence_tracker.get(&sender_did)
                         && (epoch < last_epoch || (epoch == last_epoch && sequence <= last_seq))
                     {
                         return Err(ContextError::CryptoFailed(
@@ -1120,7 +1119,7 @@ impl ContextCryptoProvider for MlsCryptoProvider {
                     }
                     state
                         .recv_sequence_tracker
-                        .insert(tracker_key, (epoch, sequence));
+                        .insert(sender_did.clone(), (epoch, sequence));
 
                     // Step 4: Deserialize as InnerEnvelope.
                     // The inner envelope is returned with its padded payload intact.
@@ -1161,6 +1160,11 @@ impl ContextCryptoProvider for MlsCryptoProvider {
         routing_id: &[u8],
         blob_ttl: u32,
     ) -> Result<Vec<u8>, ContextError> {
+        if plaintext.len() > scp_protocol::context::builder::MAX_MANAGEMENT_PAYLOAD_SIZE {
+            return Err(ContextError::CryptoFailed(
+                "management payload exceeds size limit".into(),
+            ));
+        }
         self.with_context(context_id, |state| {
             let magic = &scp_protocol::context::builder::MANAGEMENT_MSG_MAGIC;
             let mut tagged = Vec::with_capacity(magic.len() + plaintext.len());

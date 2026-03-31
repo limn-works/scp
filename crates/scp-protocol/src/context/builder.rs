@@ -55,6 +55,13 @@ pub enum OpenResult {
 /// from application messages.
 pub const MANAGEMENT_MSG_MAGIC: [u8; 4] = [0x53, 0x43, 0x50, 0x4D];
 
+/// Maximum management payload size in bytes (64 KiB).
+///
+/// Management payloads MUST NOT exceed this limit (§9.16.1). Enforced on
+/// both send side ([`ContextCryptoProvider::mls_encrypt_management`]) and
+/// receive side ([`ContextCryptoProvider::open`]).
+pub const MAX_MANAGEMENT_PAYLOAD_SIZE: usize = 65_536;
+
 // ---------------------------------------------------------------------------
 // ContextCreationError
 // ---------------------------------------------------------------------------
