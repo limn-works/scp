@@ -1639,8 +1639,8 @@ This section consolidates all HKDF labels, HPKE info prefixes, HMAC domain strin
 | SCPM management magic | `[0x53, 0x43, 0x50, 0x4D]` | 4-byte ASCII prefix distinguishing management from application messages in MLS plaintext | §9.16.1 |
 | Management payload max size | 65,536 bytes (64 KiB) | Maximum management message payload after SCPM prefix | §9.16.1 |
 | Epoch poisoning max advance | 1,000 | Maximum allowed epoch jump in a single sender key distribution | §9.16.1 |
-| Buffer event max age | 3,600s (1h) | Maximum estimated age for buffer events in consequence evaluation | §9.16 |
-| Buffer event future tolerance | 5s | Maximum future tolerance for buffer event timestamps | §9.16 |
+| Buffer event max age | 3,600s (1h) | Maximum estimated age for buffer events in consequence evaluation | §7.3.7 |
+| Buffer event future tolerance | 5s | Maximum future tolerance for buffer event timestamps | §7.3.7 |
 | Broadcast replay max authors | 10,000 | Maximum unique senders tracked in broadcast replay detector | §9.16.5 |
 
 #### 9.18.9 Sync and Offline Recovery (Invariants)
