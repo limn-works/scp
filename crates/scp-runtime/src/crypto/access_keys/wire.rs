@@ -70,7 +70,7 @@ const REQUEST_FRESHNESS_SECS: u64 = 300;
 /// responder can HPKE-encrypt the access key material.
 ///
 /// Contains a timestamp and cryptographic nonce for replay protection.
-/// The responder rejects requests older than 30 seconds and deduplicates
+/// The responder rejects requests older than 300 seconds and deduplicates
 /// by nonce within the freshness window.
 ///
 /// Signature payload: `SHA-256("SCP-ACCESS-KEY-REQUEST-V1:" || context_id || requester_did || nonce || timestamp_BE || wrapping_pubkey)`.

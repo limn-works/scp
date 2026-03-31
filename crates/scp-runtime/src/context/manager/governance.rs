@@ -366,7 +366,10 @@ pub(super) fn event_log_entries_for_consequences(
             continue;
         }
 
-        // Reject buffer events with timestamps too far in the future (M18).
+        // Defense in depth: reject buffer events with estimated timestamps too far
+        // in the future. Currently the estimation formula guarantees
+        // estimated_ts <= now, so this never triggers — but it guards against
+        // future changes to the formula.
         if estimated_ts > now.saturating_add(MAX_FUTURE_TOLERANCE_SECS) {
             continue;
         }
