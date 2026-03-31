@@ -1819,16 +1819,22 @@ impl ContextManager {
                     target_did = %target_did,
                     context_id = %context_id,
                     message_len = message.len(),
-                    "sending rotated sender key distribution"
+                    "MLS-encrypting and sending rotated sender key distribution"
                 );
-                if let Err(e) = self.transport.send_message(&routing_id, &message) {
-                    tracing::warn!(
-                        target_did = %target_did,
-                        context_id = %context_id,
-                        error = %e,
-                        "failed to send rotated sender key — \
-                         recipient must request key via SenderKeyRequest"
-                    );
+                match self.crypto.mls_encrypt_management(
+                    context_id_bytes,
+                    &message,
+                    &routing_id,
+                    super::messaging::DEFAULT_BLOB_TTL_SECS,
+                ) {
+                    Ok(sealed) => {
+                        if let Err(e) = self.transport.send_message(&routing_id, &sealed) {
+                            tracing::warn!(target_did = %target_did, context_id = %context_id, error = %e, "failed to send rotated sender key");
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!(target_did = %target_did, context_id = %context_id, error = %e, "MLS encryption of sender key distribution failed");
+                    }
                 }
             }
         }

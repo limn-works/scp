@@ -343,12 +343,23 @@ impl FullStackNode {
 
         // Open: deserialize outer envelope → MLS decrypt → sender key
         // decrypt → deserialize InnerEnvelope → strip padding → verify hash.
-        let opened = self.crypto.open(context_id, ciphertext)?;
-        let opened = opened.ok_or_else(|| {
-            ContextError::CryptoFailed(
-                "open returned None (Commit/Proposal, not Application)".into(),
-            )
-        })?;
+        let open_result = self.crypto.open(context_id, ciphertext)?;
+        let opened = match open_result {
+            scp_core::context::builder::OpenResult::Application(env) => *env,
+            scp_core::context::builder::OpenResult::Control => {
+                return Err(ContextError::CryptoFailed("open returned Control".into()));
+            }
+            scp_core::context::builder::OpenResult::Management {
+                sender_did,
+                payload,
+            } => {
+                self.crypto
+                    .process_incoming_sender_key(context_id, &sender_did, &payload)?;
+                return Err(ContextError::CryptoFailed(
+                    "open returned Management".into(),
+                ));
+            }
+        };
 
         // Strip padding to recover the serialized WrappedContent.
         let stripped = scp_core::envelope::strip_padding(&opened.inner.payload)
@@ -516,7 +527,7 @@ impl ContextCryptoProvider for ArcCryptoProvider {
         &self,
         id: &[u8; 32],
         outer_bytes: &[u8],
-    ) -> Result<Option<scp_core::context::builder::OpenedEnvelope>, ContextError> {
+    ) -> Result<scp_core::context::builder::OpenResult, ContextError> {
         self.0.open(id, outer_bytes)
     }
 }

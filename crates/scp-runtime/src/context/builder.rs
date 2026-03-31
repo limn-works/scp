@@ -17,7 +17,7 @@ use scp_protocol::context::{ContextError, ContextMode, ContextParams, ContextSta
 
 pub use scp_protocol::context::builder::{
     AddMemberOutput, AdvanceEpochOutput, ContextCreationError, ContextCryptoProvider,
-    OpenedEnvelope, RemoveMemberOutput,
+    MANAGEMENT_MSG_MAGIC, OpenResult, OpenedEnvelope, RemoveMemberOutput,
 };
 
 /// Provides transport operations needed during context creation.

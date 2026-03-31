@@ -4827,7 +4827,7 @@ async fn test_remove_member_sender_key_before_mls_removal() {
             &self,
             ctx: &[u8; 32],
             bytes: &[u8],
-        ) -> Result<Option<scp_protocol::context::builder::OpenedEnvelope>, ContextError> {
+        ) -> Result<scp_protocol::context::builder::OpenResult, ContextError> {
             self.inner.open(ctx, bytes)
         }
         fn advance_epoch(

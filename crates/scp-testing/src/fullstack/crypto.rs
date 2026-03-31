@@ -863,6 +863,11 @@ impl ContextCryptoProvider for E2eCryptoProvider {
             encrypt_sender_layer(&sender_key, &serialized, &ctx_str, &self.local_did, 0, 0)
                 .map_err(|e| ContextError::CryptoFailed(e.to_string()))?;
 
+        let mut with_header = Vec::with_capacity(16 + sender_encrypted.len());
+        with_header.extend_from_slice(&0u64.to_be_bytes());
+        with_header.extend_from_slice(&0u64.to_be_bytes());
+        with_header.extend_from_slice(&sender_encrypted);
+
         // 3. MLS encrypt.
         let mls_message = {
             let mut groups = self
@@ -872,7 +877,7 @@ impl ContextCryptoProvider for E2eCryptoProvider {
             let group = groups
                 .get_mut(context_id)
                 .ok_or_else(|| ContextError::CryptoFailed("no MLS group for context".into()))?;
-            mls_encrypt(group, &sender_encrypted)
+            mls_encrypt(group, &with_header)
                 .map_err(|e| ContextError::CryptoFailed(e.to_string()))?
         };
         let encrypted_blob = serialize_ciphertext(&mls_message)
@@ -895,7 +900,7 @@ impl ContextCryptoProvider for E2eCryptoProvider {
         &self,
         context_id: &[u8; 32],
         outer_bytes: &[u8],
-    ) -> Result<Option<scp_core::context::builder::OpenedEnvelope>, ContextError> {
+    ) -> Result<scp_core::context::builder::OpenResult, ContextError> {
         let ctx_str = Self::context_id_hex(context_id);
 
         // Step 0: Deserialize outer envelope to extract MLS ciphertext.
@@ -922,6 +927,14 @@ impl ContextCryptoProvider for E2eCryptoProvider {
                 plaintext: mls_decrypted,
                 sender_did,
             } => {
+                let magic = &scp_core::context::builder::MANAGEMENT_MSG_MAGIC;
+                if mls_decrypted.len() >= magic.len() && mls_decrypted[..magic.len()] == *magic {
+                    return Ok(scp_core::context::builder::OpenResult::Management {
+                        sender_did,
+                        payload: mls_decrypted[magic.len()..].to_vec(),
+                    });
+                }
+
                 // Step 2: Look up the sender's key from the sender key store.
                 let sender_key = {
                     let store = self
@@ -935,10 +948,29 @@ impl ContextCryptoProvider for E2eCryptoProvider {
                     })?
                 };
 
-                // Step 3: Sender key decrypt (AES-256-GCM, ADR-007).
-                let decrypted =
-                    decrypt_sender_layer(&sender_key, &mls_decrypted, &ctx_str, &sender_did, 0, 0)
-                        .map_err(|e| ContextError::CryptoFailed(e.to_string()))?;
+                // Step 3: Parse header and sender key decrypt.
+                if mls_decrypted.len() < 16 {
+                    return Err(ContextError::CryptoFailed(
+                        "sender key header too short".to_string(),
+                    ));
+                }
+                let mut epoch_bytes = [0u8; 8];
+                epoch_bytes.copy_from_slice(&mls_decrypted[..8]);
+                let epoch = u64::from_be_bytes(epoch_bytes);
+                let mut seq_bytes = [0u8; 8];
+                seq_bytes.copy_from_slice(&mls_decrypted[8..16]);
+                let sequence = u64::from_be_bytes(seq_bytes);
+                let sender_ciphertext = &mls_decrypted[16..];
+
+                let decrypted = decrypt_sender_layer(
+                    &sender_key,
+                    sender_ciphertext,
+                    &ctx_str,
+                    &sender_did,
+                    epoch,
+                    sequence,
+                )
+                .map_err(|e| ContextError::CryptoFailed(e.to_string()))?;
 
                 // Step 4: Deserialize as InnerEnvelope.
                 let inner = scp_core::envelope::inner::InnerEnvelope::from_bytes(&decrypted)
@@ -956,13 +988,14 @@ impl ContextCryptoProvider for E2eCryptoProvider {
                     ));
                 }
 
-                Ok(Some(scp_core::context::builder::OpenedEnvelope {
-                    inner,
-                    sender_did,
-                }))
+                Ok(scp_core::context::builder::OpenResult::Application(
+                    Box::new(scp_core::context::builder::OpenedEnvelope { inner, sender_did }),
+                ))
             }
             DecryptedContent::Commit { sender_did: _ }
-            | DecryptedContent::Proposal { sender_did: _ } => Ok(None),
+            | DecryptedContent::Proposal { sender_did: _ } => {
+                Ok(scp_core::context::builder::OpenResult::Control)
+            }
         }
     }
 }

@@ -113,12 +113,11 @@ fn cross_process_welcome_delivery() {
 
     // Bob opens Alice's message — proves the full pipeline works:
     // MLS Welcome join + sender key distribution + seal + open.
-    let opened = bob_crypto.open(&context_id, &sealed).unwrap();
-    assert!(
-        opened.is_some(),
-        "opened must be Some for application message"
-    );
-    let envelope = opened.unwrap();
+    let open_result = bob_crypto.open(&context_id, &sealed).unwrap();
+    let envelope = match open_result {
+        scp_core::context::builder::OpenResult::Application(env) => env,
+        other => panic!("expected Application, got {other:?}"),
+    };
     assert_eq!(envelope.sender_did, alice_did);
 }
 

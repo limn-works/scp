@@ -1076,16 +1076,15 @@ mod mock_providers {
             &self,
             _context_id: &[u8; 32],
             outer_bytes: &[u8],
-        ) -> Result<Option<scp_core::context::builder::OpenedEnvelope>, ContextError> {
+        ) -> Result<scp_core::context::builder::OpenResult, ContextError> {
             // Mock: deserialize directly as InnerEnvelope (no decryption).
             let inner: scp_core::envelope::inner::InnerEnvelope =
                 rmp_serde::from_slice(outer_bytes)
                     .map_err(|e| ContextError::CryptoFailed(format!("mock open: {e}")))?;
             let sender_did = inner.sender_did.clone();
-            Ok(Some(scp_core::context::builder::OpenedEnvelope {
-                inner,
-                sender_did,
-            }))
+            Ok(scp_core::context::builder::OpenResult::Application(
+                Box::new(scp_core::context::builder::OpenedEnvelope { inner, sender_did }),
+            ))
         }
     }
 
