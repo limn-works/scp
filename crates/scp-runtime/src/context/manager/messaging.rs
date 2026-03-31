@@ -114,7 +114,7 @@ fn build_broadcast_envelope(
 
 /// Default blob TTL for outer envelopes (5 minutes / 300 seconds).
 /// Relays may store the blob up to this duration for offline recipients.
-const DEFAULT_BLOB_TTL_SECS: u32 = 300;
+pub(super) const DEFAULT_BLOB_TTL_SECS: u32 = 300;
 
 /// Builds the encrypted envelope bytes for the send path.
 ///
@@ -662,6 +662,7 @@ impl ContextManager {
     /// Returns [`ContextError`] if the context is not active, decryption
     /// fails, signature verification fails, anti-replay check fails,
     /// access key unwrapping fails, or the sender lacks capability.
+    #[allow(clippy::too_many_lines)]
     #[instrument(skip_all, fields(context_id))]
     pub async fn deliver_incoming(
         &self,
@@ -695,11 +696,24 @@ impl ContextManager {
 
         // Phase 2: open envelope (MLS + sender key + deserialize + integrity).
         let decrypt_start = std::time::Instant::now();
-        let opened = self.crypto.open(&context_id_bytes, encrypted_blob)?;
+        let open_result = self.crypto.open(&context_id_bytes, encrypted_blob)?;
         crate::metrics::record_decrypt_duration(decrypt_start.elapsed());
 
-        let Some(opened_envelope) = opened else {
-            return Ok(None);
+        let opened_envelope = match open_result {
+            scp_protocol::context::builder::OpenResult::Application(env) => *env,
+            scp_protocol::context::builder::OpenResult::Control => return Ok(None),
+            scp_protocol::context::builder::OpenResult::Management {
+                sender_did,
+                payload,
+            } => {
+                tracing::debug!(sender_did = %sender_did, context_id = %context_id, "received MLS-wrapped management message");
+                self.crypto.process_incoming_sender_key(
+                    &context_id_bytes,
+                    &sender_did,
+                    &payload,
+                )?;
+                return Ok(None);
+            }
         };
 
         let inner = opened_envelope.inner;
