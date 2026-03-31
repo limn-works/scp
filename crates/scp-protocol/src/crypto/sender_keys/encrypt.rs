@@ -148,6 +148,47 @@ fn build_sender_aad(context_id: &str, sender_did: &str, epoch: u64, sequence: u6
     aad
 }
 
+/// Prepends epoch + sequence header to sender-key ciphertext.
+///
+/// Wire format: `epoch (8 bytes BE) || sequence (8 bytes BE) || ciphertext`.
+/// Used by [`ContextCryptoProvider::seal`] to construct the MLS plaintext.
+#[must_use]
+pub fn build_sender_header(epoch: u64, sequence: u64, ciphertext: &[u8]) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(16 + ciphertext.len());
+    buf.extend_from_slice(&epoch.to_be_bytes());
+    buf.extend_from_slice(&sequence.to_be_bytes());
+    buf.extend_from_slice(ciphertext);
+    buf
+}
+
+/// Size of the epoch + sequence header in bytes.
+pub const SENDER_HEADER_SIZE: usize = 16;
+
+/// Parses epoch + sequence header from the front of `data`.
+///
+/// Returns `(epoch, sequence, ciphertext_slice)`.
+///
+/// # Errors
+///
+/// Returns an error string if `data` is shorter than [`SENDER_HEADER_SIZE`].
+pub fn parse_sender_header(data: &[u8]) -> Result<(u64, u64, &[u8]), &'static str> {
+    if data.len() < SENDER_HEADER_SIZE {
+        return Err("sender key header too short");
+    }
+    // SAFETY: length validated above; slice sizes are exact.
+    let epoch_bytes: [u8; 8] = match data[..8].try_into() {
+        Ok(b) => b,
+        Err(_) => return Err("sender key header too short"),
+    };
+    let seq_bytes: [u8; 8] = match data[8..16].try_into() {
+        Ok(b) => b,
+        Err(_) => return Err("sender key header too short"),
+    };
+    let epoch = u64::from_be_bytes(epoch_bytes);
+    let sequence = u64::from_be_bytes(seq_bytes);
+    Ok((epoch, sequence, &data[16..]))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
