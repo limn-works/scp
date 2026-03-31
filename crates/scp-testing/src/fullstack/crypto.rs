@@ -77,6 +77,9 @@ pub struct E2eCryptoProvider {
     sender_key_epochs: Mutex<HashMap<[u8; 32], u64>>,
     /// Per-context send-side message sequence counter: `context_id` -> sequence.
     send_sequences: Mutex<HashMap<[u8; 32], u64>>,
+    /// Receive-side sequence tracking: `(sender_did, last_epoch, last_sequence)`.
+    /// Mirrors `MlsCryptoProvider::recv_sequence_tracker` for E2E parity.
+    recv_sequence_tracker: Mutex<HashMap<String, (u64, u64)>>,
 }
 
 #[allow(clippy::significant_drop_tightening)]
@@ -96,6 +99,7 @@ impl E2eCryptoProvider {
             access_keys: Mutex::new(AccessKeyStore::new()),
             sender_key_epochs: Mutex::new(HashMap::new()),
             send_sequences: Mutex::new(HashMap::new()),
+            recv_sequence_tracker: Mutex::new(HashMap::new()),
         }
     }
 
@@ -976,11 +980,20 @@ impl ContextCryptoProvider for E2eCryptoProvider {
                 plaintext: mls_decrypted,
                 sender_did,
             } => {
+                const MAX_MANAGEMENT_PAYLOAD_SIZE: usize = 65_536;
                 let magic = &scp_core::context::builder::MANAGEMENT_MSG_MAGIC;
                 if mls_decrypted.len() >= magic.len() && mls_decrypted[..magic.len()] == *magic {
+                    let mgmt_payload = mls_decrypted[magic.len()..].to_vec();
+                    // Management payload size limit — mirrors MlsCryptoProvider.
+                    if mgmt_payload.len() > MAX_MANAGEMENT_PAYLOAD_SIZE {
+                        return Err(ContextError::CryptoFailed(format!(
+                            "management payload too large: {} bytes (max {MAX_MANAGEMENT_PAYLOAD_SIZE})",
+                            mgmt_payload.len()
+                        )));
+                    }
                     return Ok(scp_core::context::builder::OpenResult::Management {
                         sender_did,
-                        payload: mls_decrypted[magic.len()..].to_vec(),
+                        payload: mgmt_payload,
                     });
                 }
 
@@ -1010,6 +1023,23 @@ impl ContextCryptoProvider for E2eCryptoProvider {
                     sequence,
                 )
                 .map_err(|e| ContextError::CryptoFailed(e.to_string()))?;
+
+                // Receive-side replay detection — mirrors MlsCryptoProvider.
+                {
+                    let mut tracker = self
+                        .recv_sequence_tracker
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    if let Some(&(last_epoch, last_seq)) = tracker.get(&sender_did)
+                        && (epoch < last_epoch
+                            || (epoch == last_epoch && sequence <= last_seq))
+                    {
+                        return Err(ContextError::CryptoFailed(
+                            "replay or reorder detected".into(),
+                        ));
+                    }
+                    tracker.insert(sender_did.clone(), (epoch, sequence));
+                }
 
                 // Step 4: Deserialize as InnerEnvelope.
                 let inner = scp_core::envelope::inner::InnerEnvelope::from_bytes(&decrypted)
