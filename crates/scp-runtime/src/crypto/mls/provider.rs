@@ -95,6 +95,9 @@ struct MlsCryptoSnapshot {
     sender_key_entries: Vec<(String, SenderKey)>,
     /// The sender key epoch counter.
     sender_key_epoch: u64,
+    /// The send-side message sequence counter.
+    #[serde(default)]
+    send_sequence: u64,
     /// Remote members' X25519 wrapping public keys: `(did, pubkey)` pairs.
     member_wrapping_keys: Vec<(String, [u8; 32])>,
     /// The MLS signer (`SignatureKeyPair`) serialized via serde to bytes.
@@ -135,6 +138,7 @@ impl std::fmt::Debug for MlsCryptoSnapshot {
                 &format_args!("[{} entries, REDACTED]", self.sender_key_entries.len()),
             )
             .field("sender_key_epoch", &self.sender_key_epoch)
+            .field("send_sequence", &self.send_sequence)
             .field(
                 "member_wrapping_keys",
                 &format_args!("[{} entries]", self.member_wrapping_keys.len()),
@@ -157,6 +161,8 @@ struct ContextCryptoState {
     sender_key_store: SenderKeyStore,
     /// Sender key epoch counter (incremented on each key rotation).
     sender_key_epoch: u64,
+    /// Send-side message sequence counter.
+    send_sequence: u64,
     /// Pending sender key distribution messages: `(target_did, serialized_message)`.
     /// Drained by [`MlsCryptoProvider::drain_pending_sender_key_messages`].
     pending_distributions: Vec<(String, Vec<u8>)>,
@@ -296,6 +302,7 @@ impl ContextCryptoProvider for MlsCryptoProvider {
             sender_key,
             sender_key_store,
             sender_key_epoch: 1,
+            send_sequence: 0,
             pending_distributions: Vec::new(),
             nonce_dedup: NonceDedup::new(),
             member_wrapping_keys: HashMap::new(),
@@ -963,14 +970,19 @@ impl ContextCryptoProvider for MlsCryptoProvider {
                     &serialized,
                     &ctx_str,
                     &self.local_did,
-                    0,
-                    0,
+                    state.sender_key_epoch,
+                    state.send_sequence,
                 )
                 .map_err(|e| ContextError::CryptoFailed(e.to_string()))?;
 
+            let mut with_header = Vec::with_capacity(16 + sender_encrypted.len());
+            with_header.extend_from_slice(&state.sender_key_epoch.to_be_bytes());
+            with_header.extend_from_slice(&state.send_sequence.to_be_bytes());
+            with_header.extend_from_slice(&sender_encrypted);
+
             // 3. MLS encrypt.
             let mls_message =
-                crate::crypto::mls::encrypt::encrypt(&mut state.mls_group, &sender_encrypted)
+                crate::crypto::mls::encrypt::encrypt(&mut state.mls_group, &with_header)
                     .map_err(|e| ContextError::CryptoFailed(e.to_string()))?;
             let encrypted_blob = crate::crypto::mls::encrypt::serialize_ciphertext(&mls_message)
                 .map_err(|e| ContextError::CryptoFailed(e.to_string()))?;
@@ -984,6 +996,8 @@ impl ContextCryptoProvider for MlsCryptoProvider {
             )
             .map_err(|e| ContextError::CryptoFailed(e.to_string()))?;
 
+            state.send_sequence = state.send_sequence.wrapping_add(1);
+
             rmp_serde::to_vec_named(&outer).map_err(|e| {
                 ContextError::CryptoFailed(format!("outer envelope serialization: {e}"))
             })
@@ -994,7 +1008,7 @@ impl ContextCryptoProvider for MlsCryptoProvider {
         &self,
         context_id: &[u8; 32],
         outer_bytes: &[u8],
-    ) -> Result<Option<scp_protocol::context::builder::OpenedEnvelope>, ContextError> {
+    ) -> Result<scp_protocol::context::builder::OpenResult, ContextError> {
         self.with_context(context_id, |state| {
             let ctx_str = hex::encode(context_id);
 
@@ -1013,6 +1027,15 @@ impl ContextCryptoProvider for MlsCryptoProvider {
                     plaintext: mls_decrypted,
                     sender_did,
                 } => {
+                    let magic = &scp_protocol::context::builder::MANAGEMENT_MSG_MAGIC;
+                    if mls_decrypted.len() >= magic.len() && mls_decrypted[..magic.len()] == *magic
+                    {
+                        return Ok(scp_protocol::context::builder::OpenResult::Management {
+                            sender_did,
+                            payload: mls_decrypted[magic.len()..].to_vec(),
+                        });
+                    }
+
                     // Step 2: Look up the sender's key from the sender key store.
                     let sender_key = state
                         .sender_key_store
@@ -1024,15 +1047,27 @@ impl ContextCryptoProvider for MlsCryptoProvider {
                             ))
                         })?;
 
-                    // Step 3: Sender key decrypt (AES-256-GCM, ADR-007).
-                    // Epoch 0, sequence 0 — see send_message comment about AAD.
+                    // Step 3: Parse header and sender key decrypt.
+                    if mls_decrypted.len() < 16 {
+                        return Err(ContextError::CryptoFailed(
+                            "sender key header too short".to_string(),
+                        ));
+                    }
+                    let mut epoch_bytes = [0u8; 8];
+                    epoch_bytes.copy_from_slice(&mls_decrypted[..8]);
+                    let epoch = u64::from_be_bytes(epoch_bytes);
+                    let mut seq_bytes = [0u8; 8];
+                    seq_bytes.copy_from_slice(&mls_decrypted[8..16]);
+                    let sequence = u64::from_be_bytes(seq_bytes);
+                    let sender_ciphertext = &mls_decrypted[16..];
+                    // Epoch/sequence from header — see send_message comment about AAD.
                     let decrypted = scp_protocol::crypto::sender_keys::decrypt_sender_layer(
                         &sender_key,
-                        &mls_decrypted,
+                        sender_ciphertext,
                         &ctx_str,
                         &sender_did,
-                        0,
-                        0,
+                        epoch,
+                        sequence,
                     )
                     .map_err(|e| ContextError::CryptoFailed(e.to_string()))?;
 
@@ -1048,23 +1083,51 @@ impl ContextCryptoProvider for MlsCryptoProvider {
                     // Signature verification is deferred to ContextManager which
                     // has access to the key_resolver for resolving sender public keys.
 
-                    Ok(Some(scp_protocol::context::builder::OpenedEnvelope {
-                        inner,
-                        sender_did,
-                    }))
+                    Ok(scp_protocol::context::builder::OpenResult::Application(
+                        Box::new(scp_protocol::context::builder::OpenedEnvelope {
+                            inner,
+                            sender_did,
+                        }),
+                    ))
                 }
                 DecryptedContent::Commit { sender_did: _ } => {
                     // Commit messages advance the MLS epoch. `decrypt_with_sender_did`
                     // has already called `merge_staged_commit` to apply the epoch
                     // change. No application payload exists.
-                    Ok(None)
+                    Ok(scp_protocol::context::builder::OpenResult::Control)
                 }
                 DecryptedContent::Proposal { sender_did: _ } => {
-                    // Proposals are cached by OpenMLS during process_message.
-                    // No application payload to return.
-                    Ok(None)
+                    Ok(scp_protocol::context::builder::OpenResult::Control)
                 }
             }
+        })
+    }
+
+    fn mls_encrypt_management(
+        &self,
+        context_id: &[u8; 32],
+        plaintext: &[u8],
+        routing_id: &[u8],
+        blob_ttl: u32,
+    ) -> Result<Vec<u8>, ContextError> {
+        self.with_context(context_id, |state| {
+            let magic = &scp_protocol::context::builder::MANAGEMENT_MSG_MAGIC;
+            let mut tagged = Vec::with_capacity(magic.len() + plaintext.len());
+            tagged.extend_from_slice(magic);
+            tagged.extend_from_slice(plaintext);
+            let mls_message = crate::crypto::mls::encrypt::encrypt(&mut state.mls_group, &tagged)
+                .map_err(|e| ContextError::CryptoFailed(e.to_string()))?;
+            let encrypted_blob = crate::crypto::mls::encrypt::serialize_ciphertext(&mls_message)
+                .map_err(|e| ContextError::CryptoFailed(e.to_string()))?;
+            let outer = scp_protocol::envelope::outer::create_outer_envelope(
+                routing_id,
+                None,
+                blob_ttl,
+                encrypted_blob,
+            )
+            .map_err(|e| ContextError::CryptoFailed(e.to_string()))?;
+            rmp_serde::to_vec_named(&outer)
+                .map_err(|e| ContextError::CryptoFailed(format!("serialization: {e}")))
         })
     }
 
@@ -1163,6 +1226,7 @@ impl ContextCryptoProvider for MlsCryptoProvider {
             local_sender_key: state.sender_key.clone(),
             sender_key_entries,
             sender_key_epoch: state.sender_key_epoch,
+            send_sequence: state.send_sequence,
             member_wrapping_keys: state
                 .member_wrapping_keys
                 .iter()
@@ -1276,6 +1340,7 @@ impl ContextCryptoProvider for MlsCryptoProvider {
             sender_key: local_sender_key,
             sender_key_store,
             sender_key_epoch: snapshot.sender_key_epoch,
+            send_sequence: snapshot.send_sequence,
             pending_distributions: Vec::new(),
             nonce_dedup: NonceDedup::new(),
             member_wrapping_keys,
@@ -1403,6 +1468,7 @@ impl ContextCryptoProvider for MlsCryptoProvider {
                 sender_key,
                 sender_key_store: SenderKeyStore::new(),
                 sender_key_epoch: 1,
+                send_sequence: 0,
                 pending_distributions: Vec::new(),
                 nonce_dedup: NonceDedup::new(),
                 member_wrapping_keys: HashMap::new(),
