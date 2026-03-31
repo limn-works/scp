@@ -399,8 +399,10 @@ pub trait ContextCryptoProvider: Send + Sync {
     /// Opens a received envelope: MLS decrypts, sender-key decrypts,
     /// deserializes, verifies membership + padding + integrity check.
     ///
-    /// Returns `Some(OpenedEnvelope)` for application messages, `None` for
-    /// MLS Commit/Proposal messages (no application payload).
+    /// Returns [`OpenResult::Application`] for application messages,
+    /// [`OpenResult::Control`] for MLS Commit/Proposal messages, or
+    /// [`OpenResult::Management`] for MLS-wrapped management messages
+    /// (identified by the [`MANAGEMENT_MSG_MAGIC`] prefix).
     ///
     /// Signature verification is NOT performed here — the caller
     /// (`ContextManager`) handles it via `key_resolver` after `open` returns.
