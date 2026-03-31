@@ -92,6 +92,30 @@
 - lib.rs L747: No jitter on 30-min tier re-eval interval
 - lib.rs L802-831: apply_tier_change should validate exactly one SCPRelay
 
+## Economy/Consequences Feature Review (2026-03-31)
+
+### P0 Findings
+- validate_governance_action_strings + reject_html_special_chars + all user-string validators DELETED from FFI common. No input-side length/content validation on role names, context names, descriptions, reasons, payment adapter refs. Output-escaping is NOT replacement.
+- check_and_composition now allows (None, None, Amount::ZERO) -- any caller can bypass AND-composition for "free" actions without any UCAN proof.
+
+### P1 Findings
+- send_sequence wrapping_add(1) -- wraps to 0 after u64::MAX, all subsequent messages rejected as replays
+- SenderKeyStore::set() remains pub, bypasses epoch monotonicity
+- system_assign_role is pub (not pub(crate)), bypasses RoleAssign capability
+- Escrow capture failure keeps budget deducted but no payment captured
+- html_escape_json doesn't escape double-quote (inconsistent with html_escape_event_string)
+- EpochNotMonotonic error leaks sender_did + epoch values
+- request_nonce: [0u8;16] in rotated sender key distributions may trigger nonce dedup
+
+### Well-Defended
+- Epoch poisoning defense (MAX_EPOCH_ADVANCE=1000 + set_checked monotonicity)
+- Blocked DID check on sender key requests
+- Management message 64KiB size limits (both send+receive)
+- Join economy ordering: sybil -> budget -> payment -> crypto
+- Cost evaluation overflow fails closed (tested)
+- Asymmetric timestamp freshness (300s past, 30s future)
+- HTML escaping on all event output strings across all 4 FFI bridges
+
 ## Recurring Patterns
 - TOCTOU races in check-then-act patterns (nonce replay, standing channels, budget)
 - Missing zeroization on crypto key material
@@ -99,3 +123,4 @@
 - unwrap_or_default on serialization hides failures
 - Manual string parsing where URL parser should be used
 - Projection UCAN validation is structural-only (parse not validate) -- recurring weakness
+- Input validation removals justified by output escaping -- defense regression pattern
