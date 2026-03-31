@@ -55,8 +55,9 @@ const HPKE_INFO_PREFIX: &[u8] = b"scp-access-key-v1";
 /// Maximum age in seconds for an access key request to be considered fresh.
 ///
 /// Requests older than this are rejected to prevent replay attacks.
-/// See spec §9.17.1.
-const REQUEST_FRESHNESS_SECS: u64 = 30;
+/// Aligned with the protocol-wide clock skew tolerance (§9.14, §9.17.1)
+/// and the sender key request freshness window (300 seconds).
+const REQUEST_FRESHNESS_SECS: u64 = 300;
 
 // ---------------------------------------------------------------------------
 // Wire types
@@ -857,7 +858,8 @@ mod tests {
             timestamp: 1_000_000,
             signature: vec![0u8; 64],
         };
-        assert!(validate_request_freshness(&request, 1_000_030).is_ok());
+        // At exactly REQUEST_FRESHNESS_SECS (300s) age — still within window.
+        assert!(validate_request_freshness(&request, 1_000_300).is_ok());
     }
 
     #[test]
@@ -870,7 +872,8 @@ mod tests {
             timestamp: 1_000_000,
             signature: vec![0u8; 64],
         };
-        let result = validate_request_freshness(&request, 1_000_031);
+        // One second past the 300s window.
+        let result = validate_request_freshness(&request, 1_000_301);
         assert!(matches!(result, Err(AccessKeyError::StaleRequest)));
     }
 
@@ -881,8 +884,8 @@ mod tests {
             context_id: "ctx-1".to_owned(),
             wrapping_pubkey: vec![0u8; 32],
             nonce: [0u8; ACCESS_KEY_NONCE_SIZE],
-            // Timestamp far ahead of "now".
-            timestamp: 1_000_100,
+            // Timestamp more than 300s ahead of "now".
+            timestamp: 1_000_400,
             signature: vec![0u8; 64],
         };
         let result = validate_request_freshness(&request, 1_000_000);
@@ -891,14 +894,14 @@ mod tests {
 
     #[test]
     fn validate_request_freshness_accepts_slight_future() {
-        // A timestamp up to REQUEST_FRESHNESS_SECS ahead should be accepted
-        // (covers minor clock skew).
+        // A timestamp within REQUEST_FRESHNESS_SECS ahead should be accepted
+        // (covers clock skew per §9.14).
         let request = AccessKeyRequest {
             requester_did: "did:dht:alice".to_owned(),
             context_id: "ctx-1".to_owned(),
             wrapping_pubkey: vec![0u8; 32],
             nonce: [0u8; ACCESS_KEY_NONCE_SIZE],
-            timestamp: 1_000_030,
+            timestamp: 1_000_100,
             signature: vec![0u8; 64],
         };
         assert!(validate_request_freshness(&request, 1_000_000).is_ok());
@@ -969,8 +972,8 @@ mod tests {
         };
 
         // Will fail on signature first, but validate_request_freshness
-        // independently rejects stale:
-        let freshness = validate_request_freshness(&request, 1_000_100);
+        // independently rejects stale (more than 300s old):
+        let freshness = validate_request_freshness(&request, 1_000_400);
         assert!(matches!(freshness, Err(AccessKeyError::StaleRequest)));
 
         // And the full handler also rejects (due to sig failure):

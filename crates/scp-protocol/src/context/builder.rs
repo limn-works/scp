@@ -26,6 +26,35 @@ pub struct OpenedEnvelope {
     pub sender_did: String,
 }
 
+/// Discriminated result of [`ContextCryptoProvider::open`].
+///
+/// After MLS decryption, the plaintext may be an application message,
+/// an MLS control message, or a management message (e.g., sender key
+/// distribution). The `SCPM` magic prefix distinguishes management
+/// payloads from application payloads.
+#[derive(Debug, Clone)]
+pub enum OpenResult {
+    /// Application message containing a verified inner envelope.
+    Application(Box<OpenedEnvelope>),
+    /// MLS control message (Commit or Proposal) with no application payload.
+    Control,
+    /// MLS-wrapped management message (e.g., sender key distribution).
+    Management {
+        /// The sender's DID extracted from MLS credentials.
+        sender_did: String,
+        /// The raw management payload after stripping the `SCPM` prefix.
+        payload: Vec<u8>,
+    },
+}
+
+/// 4-byte magic prefix for management messages inside MLS application payloads.
+///
+/// ASCII `SCPM` (Shared Context Protocol Management). Prepended by
+/// [`ContextCryptoProvider::mls_encrypt_management`] and detected by
+/// [`ContextCryptoProvider::open`] to distinguish management traffic
+/// from application messages.
+pub const MANAGEMENT_MSG_MAGIC: [u8; 4] = [0x53, 0x43, 0x50, 0x4D];
+
 // ---------------------------------------------------------------------------
 // ContextCreationError
 // ---------------------------------------------------------------------------
@@ -387,9 +416,34 @@ pub trait ContextCryptoProvider: Send + Sync {
         &self,
         _context_id: &[u8; 32],
         _outer_bytes: &[u8],
-    ) -> Result<Option<OpenedEnvelope>, ContextError> {
+    ) -> Result<OpenResult, ContextError> {
         Err(ContextError::CryptoFailed(
             "open not supported by this provider".to_string(),
+        ))
+    }
+
+    /// MLS-encrypts a management payload for group-authenticated delivery.
+    ///
+    /// Prepends the [`MANAGEMENT_MSG_MAGIC`] prefix, MLS-encrypts the result,
+    /// and wraps in an outer envelope. Used to send sender key distributions
+    /// that are authenticated by MLS membership.
+    ///
+    /// The default implementation returns an error. Production providers
+    /// (`MlsCryptoProvider`) override this.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ContextError::CryptoFailed`] if MLS encryption or
+    /// serialization fails.
+    fn mls_encrypt_management(
+        &self,
+        _context_id: &[u8; 32],
+        _plaintext: &[u8],
+        _routing_id: &[u8],
+        _blob_ttl: u32,
+    ) -> Result<Vec<u8>, ContextError> {
+        Err(ContextError::CryptoFailed(
+            "mls_encrypt_management not supported".to_string(),
         ))
     }
 

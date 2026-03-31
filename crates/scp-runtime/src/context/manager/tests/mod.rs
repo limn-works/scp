@@ -316,16 +316,15 @@ impl ContextCryptoProvider for MockCrypto {
         &self,
         _context_id: &[u8; 32],
         outer_bytes: &[u8],
-    ) -> Result<Option<scp_protocol::context::builder::OpenedEnvelope>, ContextError> {
+    ) -> Result<scp_protocol::context::builder::OpenResult, ContextError> {
         // Mock: deserialize directly as InnerEnvelope (no decryption).
         let inner: scp_protocol::envelope::inner::InnerEnvelope =
             rmp_serde::from_slice(outer_bytes)
                 .map_err(|e| ContextError::CryptoFailed(format!("mock open: {e}")))?;
         let sender_did = inner.sender_did.clone();
-        Ok(Some(scp_protocol::context::builder::OpenedEnvelope {
-            inner,
-            sender_did,
-        }))
+        Ok(scp_protocol::context::builder::OpenResult::Application(
+            Box::new(scp_protocol::context::builder::OpenedEnvelope { inner, sender_did }),
+        ))
     }
 
     fn advance_epoch(
