@@ -884,19 +884,24 @@ impl ContextCryptoProvider for E2eCryptoProvider {
                     )
                 })?
         };
-        let epoch = {
+        // Read epoch and atomically claim the next sequence number under a
+        // single lock scope to prevent concurrent seal() calls from producing
+        // duplicate (epoch, sequence) pairs.
+        let (epoch, sequence) = {
             let epochs = self
                 .sender_key_epochs
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            epochs.get(context_id).copied().unwrap_or(1)
-        };
-        let sequence = {
-            let seqs = self
+            let epoch = epochs.get(context_id).copied().unwrap_or(1);
+
+            let mut seqs = self
                 .send_sequences
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            seqs.get(context_id).copied().unwrap_or(0)
+            let seq_entry = seqs.entry(*context_id).or_insert(0);
+            let sequence = *seq_entry;
+            *seq_entry = seq_entry.wrapping_add(1);
+            (epoch, sequence)
         };
 
         let sender_encrypted = encrypt_sender_layer(
@@ -934,16 +939,6 @@ impl ContextCryptoProvider for E2eCryptoProvider {
             encrypted_blob,
         )
         .map_err(|e| ContextError::CryptoFailed(e.to_string()))?;
-
-        // Increment send sequence after successful encryption.
-        {
-            let mut seqs = self
-                .send_sequences
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            let seq = seqs.entry(*context_id).or_insert(0);
-            *seq = seq.wrapping_add(1);
-        }
 
         rmp_serde::to_vec_named(&outer)
             .map_err(|e| ContextError::CryptoFailed(format!("outer envelope serialization: {e}")))
