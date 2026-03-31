@@ -12763,6 +12763,130 @@ async fn event_log_entries_merge_buffer_and_history() {
 }
 
 // -----------------------------------------------------------------------
+// §31b. Buffer event timestamp bounds validation (M18)
+// -----------------------------------------------------------------------
+
+/// Validates that `event_log_entries_for_consequences` rejects buffer events
+/// whose estimated timestamps fall outside the allowed window (M18):
+/// - Past timestamps beyond `MAX_BUFFER_EVENT_AGE_SECS` (1 hour) are rejected
+/// - Events within bounds are included
+/// - Future check does not reject valid events (defense-in-depth)
+#[tokio::test]
+async fn buffer_event_timestamp_bounds_m18() {
+    use super::super::governance::event_log_entries_for_consequences;
+
+    let event_log = MockEventLog::default();
+    let manager = ContextManager::new(
+        Box::new(MockCrypto::default()),
+        Box::new(MockTransport::connected()),
+        Box::new(MockEventLog::default()),
+        noop_key_resolver(),
+    );
+
+    let _handle = manager
+        .create_context(
+            "bounds-ctx".into(),
+            governance_params(),
+            "did:key:admin".into(),
+        )
+        .await
+        .unwrap();
+
+    let now_normal: u64 = 1_700_000_000;
+
+    // Push 10 buffer events — all within the 1-hour window.
+    {
+        let mut contexts = manager.contexts.lock().await;
+        let ctx = contexts.get_mut("bounds-ctx").unwrap();
+        for i in 0..10u64 {
+            ctx.receive_buffer.push(ContextEvent::MessageSent {
+                sender_did: "did:key:sender".into(),
+                sequence_number: i,
+                payload: Vec::new(),
+            });
+        }
+    }
+
+    // All 10 events should be included — estimated timestamps are
+    // `now - 9` through `now`, well within the 1-hour window.
+    {
+        let contexts = manager.contexts.lock().await;
+        let ctx = contexts.get("bounds-ctx").unwrap();
+        let events = event_log_entries_for_consequences(ctx, "bounds-ctx", now_normal, &event_log);
+        assert_eq!(
+            events.len(),
+            10,
+            "all 10 buffer events should be included with normal `now`"
+        );
+    }
+
+    // --- Test stale event rejection ---
+    // Replace buffer with larger capacity (5000) and push 3602 events.
+    // Oldest event gets estimated_ts = now - 3601, age = 3601 > 3600.
+    {
+        let mut contexts = manager.contexts.lock().await;
+        let ctx = contexts.get_mut("bounds-ctx").unwrap();
+        ctx.receive_buffer.drain();
+        ctx.receive_buffer = ReceiveBuffer::with_capacity(5000);
+
+        for i in 0..3602u64 {
+            ctx.receive_buffer.push(ContextEvent::MessageSent {
+                sender_did: "did:key:sender".into(),
+                sequence_number: i,
+                payload: Vec::new(),
+            });
+        }
+    }
+
+    {
+        let contexts = manager.contexts.lock().await;
+        let ctx = contexts.get("bounds-ctx").unwrap();
+        let events = event_log_entries_for_consequences(ctx, "bounds-ctx", now_normal, &event_log);
+
+        // Oldest event (age 3601s) rejected, rest (3601 events) pass.
+        assert_eq!(
+            events.len(),
+            3601,
+            "oldest buffer event (age 3601s) should be rejected, rest included"
+        );
+
+        // Oldest included event should be at now - 3600.
+        let oldest_ts = events.iter().map(|e| e.timestamp).min().unwrap();
+        assert_eq!(
+            oldest_ts,
+            now_normal - 3600,
+            "oldest included event should be at now - 3600"
+        );
+    }
+
+    // --- Test future check does not reject valid events ---
+    // With now=0, all estimated timestamps saturate to 0 — within bounds.
+    {
+        let mut contexts = manager.contexts.lock().await;
+        let ctx = contexts.get_mut("bounds-ctx").unwrap();
+        ctx.receive_buffer = ReceiveBuffer::new();
+        for i in 0..5u64 {
+            ctx.receive_buffer.push(ContextEvent::MessageSent {
+                sender_did: "did:key:sender".into(),
+                sequence_number: i,
+                payload: Vec::new(),
+            });
+        }
+    }
+
+    {
+        let contexts = manager.contexts.lock().await;
+        let ctx = contexts.get("bounds-ctx").unwrap();
+        let events = event_log_entries_for_consequences(ctx, "bounds-ctx", 0, &event_log);
+        assert_eq!(
+            events.len(),
+            5,
+            "all buffer events should be included with now=0"
+        );
+    }
+}
+
+// -----------------------------------------------------------------------
 // §44. Budget rolled back on payment failure
 // (Note: budget is tracked separately from payment; payment failure
 //  prevents budget deduction because budget enforcement runs in the
