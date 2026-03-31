@@ -265,7 +265,7 @@ async fn end_to_end_network_demo() {
 
     let alice_sender_key = generate_sender_key();
     let mut alice_sk_store = SenderKeyStore::new();
-    alice_sk_store.set(ctx_id, alice_did_str, alice_sender_key.clone());
+    alice_sk_store.set_unchecked(ctx_id, alice_did_str, alice_sender_key.clone());
 
     println!(
         "  Alice generated sender key: {}...",
@@ -347,7 +347,7 @@ async fn end_to_end_network_demo() {
     assert!(keys_match);
 
     let mut bob_sk_store = SenderKeyStore::new();
-    bob_sk_store.set(ctx_id, alice_did_str, received_sk);
+    bob_sk_store.set_unchecked(ctx_id, alice_did_str, received_sk);
     println!();
 
     // =====================================================================

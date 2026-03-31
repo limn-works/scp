@@ -624,7 +624,7 @@ impl ContextCryptoProvider for MlsCryptoProvider {
         // encrypt/decrypt can find it.
         state
             .sender_key_store
-            .set(&ctx_id_hex, &self.local_did, state.sender_key.clone());
+            .set_unchecked(&ctx_id_hex, &self.local_did, state.sender_key.clone());
 
         // HPKE-seal our sender key to the target member's wrapping pubkey
         // and queue a SenderKeyResponse for transport delivery.
@@ -717,7 +717,7 @@ impl ContextCryptoProvider for MlsCryptoProvider {
         // 3. Update local sender key store entry.
         state
             .sender_key_store
-            .set(&ctx_id_hex, &self.local_did, new_key);
+            .set_unchecked(&ctx_id_hex, &self.local_did, new_key);
 
         // 4. HPKE-seal new key to each remaining member's wrapping pubkey
         //    and queue distributions (§9.16.2).
@@ -1031,7 +1031,9 @@ impl ContextCryptoProvider for MlsCryptoProvider {
             )
             .map_err(|e| ContextError::CryptoFailed(e.to_string()))?;
 
-            state.send_sequence = state.send_sequence.wrapping_add(1);
+            state.send_sequence = state.send_sequence.checked_add(1).ok_or_else(|| {
+                ContextError::CryptoFailed("send sequence counter overflow".into())
+            })?;
 
             rmp_serde::to_vec_named(&outer).map_err(|e| {
                 ContextError::CryptoFailed(format!("outer envelope serialization: {e}"))
@@ -1373,7 +1375,7 @@ impl ContextCryptoProvider for MlsCryptoProvider {
         let ctx_id_hex = hex::encode(context_id);
         let mut sender_key_store = SenderKeyStore::new();
         for (did, key) in snapshot.sender_key_entries.drain(..) {
-            sender_key_store.set(&ctx_id_hex, &did, key);
+            sender_key_store.set_unchecked(&ctx_id_hex, &did, key);
         }
 
         // Reconstruct member wrapping keys.
@@ -2317,7 +2319,7 @@ mod tests {
             let ctx_id_hex = hex::encode(ctx_id);
             let mut contexts = provider.contexts.lock().unwrap();
             let state = contexts.get_mut(&ctx_id).unwrap();
-            state.sender_key_store.set(
+            state.sender_key_store.set_unchecked(
                 &ctx_id_hex,
                 "did:dht:z6MkBobBobBobBobBobBobBobBobBobBobBobBobBo",
                 generate_sender_key(),
