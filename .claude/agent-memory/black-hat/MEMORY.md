@@ -202,3 +202,29 @@ Notes:
 - See [refactor-plan-adversarial-analysis.md](refactor-plan-adversarial-analysis.md)
 - BLACK-301 through BLACK-311: facade divergence, Phase B TOCTOU, asymmetric wiring, BridgeInstance split-brain
 - Key mitigations: generation counter, atomic send+receive wiring, CI mod/re-export check, feature-flagged BridgeInstance
+
+## PR #1606 -- Sender Key AAD, SCPM Magic, Timestamp Bounds (2026-03-31)
+
+### HIGH: SCPM magic prefix injection by any group member (BLACK-1601)
+- File: `crates/scp-runtime/src/crypto/mls/provider.rs` open() method
+- 4-byte prefix [0x53,0x43,0x50,0x4D] checked post-MLS-decrypt, no further auth
+- sender_did check prevents cross-member injection, but epoch poisoning possible
+- Attacker can set epoch=u64::MAX, blocking all future key rotations for their DID
+
+### HIGH: No receive-side sequence tracking (BLACK-1602)
+- send_sequence tracked on send side only, no recv-side monotonicity check
+- epoch+sequence in cleartext header = AAD prevents modification but not replay
+- Snapshot restore resets sequence, enables duplicate (epoch,seq) pairs
+
+### MEDIUM: Access key freshness widened 30s->300s (BLACK-1603)
+- File: `crates/scp-runtime/src/crypto/access_keys/wire.rs`
+- Combined with nonce dedup loss on restart = expanded replay window
+- Freshness and clock skew serve different purposes, should be separate params
+
+### MEDIUM: Buffer event timestamp estimation exploitable (BLACK-1604)
+- File: `crates/scp-runtime/src/context/manager/governance.rs`
+- Position-based estimation, flooding shifts timestamps out of bounds window
+
+### Testing gap: E2eCryptoProvider hardcodes epoch=0, seq=0
+- File: `crates/scp-testing/src/fullstack/crypto.rs` line 707
+- Does not implement mls_encrypt_management -- management flow untested in E2E
