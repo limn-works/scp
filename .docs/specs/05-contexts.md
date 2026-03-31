@@ -964,7 +964,7 @@ Relationship ends         close_context                  one-time, keys preserve
 
 **Standing contexts vs. ephemeral contexts — when to use which:**
 
-| | Standing channel | Ephemeral context |
+| | Standing context | Ephemeral context |
 |---|---|---|
 | Template | `bilateral-persistent` | `bilateral-ephemeral` |
 | TTL | None (lives indefinitely) | Required (forces intentionality) |
