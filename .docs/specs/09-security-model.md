@@ -1141,6 +1141,34 @@ Each participant in a context holds one AES-256 symmetric sender key. All messag
 - **Key size:** 32 bytes per sender key per context member. Storage is trivial.
 - **Encryption order:** Sender-first (AES-256-GCM), then MLS. Recipients decrypt MLS layer, then decrypt sender layer with the cached sender key.
 
+**Sender-key plaintext wire format.** The MLS application message plaintext for application messages is structured as:
+
+```
+epoch (8 bytes BE) || sequence (8 bytes BE) || sender_key_ciphertext
+```
+
+Where `epoch` is the sender's current `sender_key_epoch` and `sequence` is a per-sender monotonic send counter (incremented after each successful encryption). The epoch and sequence are bound into the AES-256-GCM AAD (§9.16.1 AAD format below) alongside `context_id` and `sender_did`, preventing ciphertext relocation across epochs, reordering within an epoch, and cross-sender attribution forgery. The 16-byte header is inside the MLS ciphertext envelope and therefore protected by MLS confidentiality and integrity.
+
+**Sender-key AAD format.** The AAD for sender-key AES-256-GCM encryption is:
+
+```
+BE32(len(context_id)) || context_id || BE32(len(sender_did)) || sender_did || epoch (8 bytes BE) || sequence (8 bytes BE)
+```
+
+Variable-length fields use 4-byte big-endian length prefixes to prevent boundary-shift collisions (§9.5.1). Recipients reconstruct the AAD from the 16-byte header and MLS credential, then verify it during AEAD decryption.
+
+**Receive-side replay detection.** Recipients MUST maintain a per-sender `(last_epoch, last_sequence)` tracker. Messages with `epoch < last_epoch` or `(epoch == last_epoch && sequence <= last_sequence)` MUST be rejected as replays. This provides defense-in-depth alongside MLS-layer replay protection. The tracker is persisted in the crypto state snapshot.
+
+**Epoch poisoning defense.** Recipients MUST reject sender key distributions with `epoch > current_epoch + 1000`. This prevents an attacker from setting an artificially high epoch (e.g., `u64::MAX`) to permanently block future legitimate key rotations via the epoch monotonicity check.
+
+**Management messages.** MLS application messages may carry management payloads (e.g., sender key distributions during key rotation) instead of application content. Management messages are distinguished by a 4-byte ASCII magic prefix:
+
+```
+SCPM_MAGIC = [0x53, 0x43, 0x50, 0x4D]  ("SCPM" — Shared Context Protocol Management)
+```
+
+Management message MLS plaintext format: `SCPM_MAGIC (4 bytes) || management_payload`. Management messages bypass the sender-key encryption layer entirely — they are MLS-encrypted only, with authentication provided by MLS group membership. Recipients check the first 4 bytes of the MLS plaintext after decryption: if they match `SCPM_MAGIC`, the message is routed to management message processing; otherwise, it is parsed as a sender-key-encrypted application message (16-byte header + ciphertext). The epoch value in an application message header starts at 1 and increments monotonically, so the first 4 bytes (`0x00000000` for epoch ≤ 255) can never collide with `SCPM_MAGIC` (`0x5343504D`). Management payloads MUST NOT exceed 65,536 bytes (64 KiB).
+
 **Wrapping key terminology.** The sender-side key layer uses two distinct wrapping keys, both HPKE-based (RFC 9180 Base mode, §9.5) but serving different roles: (1) the **stable wrapping keypair** (below) protects the persistent per-sender AES-256 symmetric key during key distribution — it is long-lived and published in the MLS LeafNode; (2) the **ephemeral wrapping keypair** (§9.16.2) protects per-request key material during individual key exchanges — it is generated fresh for each `SenderKeyRequest` and discarded after use. Both use X25519 DHKEM + HPKE for key encapsulation, but the stable key enables offline key distribution while the ephemeral key provides forward secrecy for individual key exchanges.
 
 **Stable wrapping keypair.** Each member maintains a single dedicated X25519 keypair per context (one per DID, shared by human and agent — ADR-039), used exclusively for HPKE wrapping of sender key distributions (§9.16.2). This keypair is published as an MLS LeafNode extension (`scp_wrapping_key`) and is distinct from the MLS leaf HPKE key used for MLS key agreement. The wrapping keypair does NOT rotate on MLS Updates (epoch advances) — it remains stable across epochs so that sender key distributions can always be unwrapped, even by members who are offline during epoch transitions or who join after an epoch advance. The wrapping keypair rotates only on: (1) identity key rotation (§9.12), or (2) suspected compromise. On rotation, the member publishes the new wrapping public key in their LeafNode extension via an MLS Update and re-distributes their current sender key to all non-blocked members using the new wrapping keys.
@@ -1313,7 +1341,7 @@ Content Encryption:
 
 **AES-256-GCM additional authenticated data (AAD).** Content encryption MUST bind `context_id` as AAD: `AAD = context_id || sender_did || sequence_number`. This prevents ciphertext from being moved between contexts or reordered within a context. The AEAD authentication tag provides integrity verification — no separate content hash is needed.
 
-**Access key request protocol.** `AccessKeyRequest` messages MUST include a signed payload: `{ context_id, requester_did, epoch, timestamp, nonce }` signed with the requester's Active Signing Key or Agent Signing Key (either `#active` or `#agent` is valid — ADR-039). The `nonce` is a 16-byte random value, unique per request. The responder verifies the signature, checks the block list and revocation list, and responds with the HPKE-encrypted access key only if the requester is authorized. **Replay prevention:** The responder validates that the request timestamp is within 5 minutes of local time (consistent with the protocol-wide clock skew tolerance, §9.14) and that the `nonce` has not been previously seen. The responder maintains a nonce deduplication cache with a 5-minute TTL — nonces are single-use and cached for the duration of the validity window. Requests with expired timestamps or duplicate nonces are rejected. This replaces the previous 30-second window, which was inconsistent with the 5-minute clock skew tolerance (§9.14) — a 30-second window with 5-minute skew would reject legitimate requests from slightly-skewed clocks.
+**Access key request protocol.** `AccessKeyRequest` messages MUST include a signed payload: `{ context_id, requester_did, epoch, timestamp, nonce }` signed with the requester's Active Signing Key or Agent Signing Key (either `#active` or `#agent` is valid — ADR-039). The `nonce` is a 16-byte random value, unique per request. The responder verifies the signature, checks the block list and revocation list, and responds with the HPKE-encrypted access key only if the requester is authorized. **Replay prevention:** The responder validates that the request timestamp is not older than 300 seconds (5 minutes, consistent with the protocol-wide clock skew tolerance §9.14) and not more than 30 seconds in the future (tighter bound — future timestamps indicate clock manipulation rather than legitimate network delay). The responder also verifies that the `nonce` has not been previously seen. The responder maintains a nonce deduplication cache with a 5-minute TTL — nonces are single-use and cached for the duration of the validity window. Requests with expired timestamps or duplicate nonces are rejected.
 
 ### 9.17.2 Access Key Lifecycle
 
@@ -1595,7 +1623,14 @@ This section consolidates all HKDF labels, HPKE info prefixes, HMAC domain strin
 | Sender key request freshness | 300s (5 min) | Request freshness window (synchronized with nonce expiry) | §9.16.2 |
 | Block notification freshness | 30,000ms (30s) | Maximum age for block notification messages | §9.16.4 |
 | Sender key nonce dedup capacity | 10,000 | Maximum nonces tracked for sender key replay prevention | §9.16.2 |
-| Access key request freshness | 30s | Freshness window for access key request messages | §9.17.1 |
+| Access key request max age | 300s (5 min) | Maximum age for access key request messages (past window). Aligned with protocol-wide clock skew tolerance (§9.14). | §9.17.1 |
+| Access key request max future | 30s | Maximum future tolerance for access key request timestamps. Tighter than past window — future timestamps indicate clock manipulation, not network delay. | §9.17.1 |
+| Sender key header size | 16 bytes | `epoch (8B BE) \|\| sequence (8B BE)` prepended to sender-key ciphertext inside MLS plaintext | §9.16.1 |
+| SCPM management magic | `[0x53, 0x43, 0x50, 0x4D]` | 4-byte ASCII prefix distinguishing management from application messages in MLS plaintext | §9.16.1 |
+| Management payload max size | 65,536 bytes (64 KiB) | Maximum management message payload after SCPM prefix | §9.16.1 |
+| Epoch poisoning max advance | 1,000 | Maximum allowed epoch jump in a single sender key distribution | §9.16.1 |
+| Buffer event max age | 3,600s (1h) | Maximum estimated age for buffer events in consequence evaluation | §9.16 |
+| Buffer event future tolerance | 5s | Maximum future tolerance for buffer event timestamps | §9.16 |
 | Broadcast replay max authors | 10,000 | Maximum unique senders tracked in broadcast replay detector | §9.16.5 |
 
 #### 9.18.9 Sync and Offline Recovery (Invariants)
