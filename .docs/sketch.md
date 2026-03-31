@@ -254,7 +254,7 @@ For multi-parent children, governance approval from every parent is required. Th
 
 Members must be in at least one parent to join the child. Eligibility is continuous: lose your last parent, lose the child.
 
-### Standing Channel (contact graph, §5.12.6)
+### Standing Context (contact graph, §5.12.6)
 
 ```
 // Get-or-create a bilateral-persistent context with a peer.
