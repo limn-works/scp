@@ -206,25 +206,40 @@ Notes:
 ## PR #1606 -- Sender Key AAD, SCPM Magic, Timestamp Bounds (2026-03-31)
 
 ### HIGH: SCPM magic prefix injection by any group member (BLACK-1601)
-- File: `crates/scp-runtime/src/crypto/mls/provider.rs` open() method
-- 4-byte prefix [0x53,0x43,0x50,0x4D] checked post-MLS-decrypt, no further auth
-- sender_did check prevents cross-member injection, but epoch poisoning possible
-- Attacker can set epoch=u64::MAX, blocking all future key rotations for their DID
-
 ### HIGH: No receive-side sequence tracking (BLACK-1602)
-- send_sequence tracked on send side only, no recv-side monotonicity check
-- epoch+sequence in cleartext header = AAD prevents modification but not replay
-- Snapshot restore resets sequence, enables duplicate (epoch,seq) pairs
-
 ### MEDIUM: Access key freshness widened 30s->300s (BLACK-1603)
-- File: `crates/scp-runtime/src/crypto/access_keys/wire.rs`
-- Combined with nonce dedup loss on restart = expanded replay window
-- Freshness and clock skew serve different purposes, should be separate params
-
 ### MEDIUM: Buffer event timestamp estimation exploitable (BLACK-1604)
-- File: `crates/scp-runtime/src/context/manager/governance.rs`
-- Position-based estimation, flooding shifts timestamps out of bounds window
-
 ### Testing gap: E2eCryptoProvider hardcodes epoch=0, seq=0
-- File: `crates/scp-testing/src/fullstack/crypto.rs` line 707
-- Does not implement mls_encrypt_management -- management flow untested in E2E
+
+## Complete Branch Review (2026-04-01) -- consequence/economy/FFI
+
+### CRITICAL: Consequence WarningCount weaponized against innocents (BLACK-1706)
+- Counts GovernanceAction events TARGETING a DID, not actions BY that DID
+- Admin can manufacture governance proposals to trigger automated eviction
+- system_assign_role bypasses RoleAssign capability check
+- No recovery mechanism exists; enforcement is permanent
+
+### HIGH: FFI string injection on NAPI+UniFFI (BLACK-1705)
+- All input-side HTML validation removed from validate.rs
+- Output escaping applied to consequence events only
+- NAPI line 1215 + UniFFI line 8480: `format!("{other:?}")` unescaped
+- PyO3 line 1457 correctly escapes; bridge parity gap
+
+### HIGH: Standing score inflation via message flooding (BLACK-1701)
+- evaluate_sybil_resistance remains a no-op stub
+- Participation record is count-based, no quality gate
+- Inflation computed BEFORE consequence evaluation
+
+### HIGH: Relay pricing manipulation via velocity flooding (BLACK-1702)
+- EIP-1559 base_fee driven by aggregate_velocity
+- Attacker flood drives up cost for all members
+- No per-member velocity contribution cap
+
+### MEDIUM: Escrow capture failure harms operator (BLACK-1703)
+- Budget enforcement prevents free rides for members
+- Capture failure = operator revenue loss (deliberate H8 tradeoff)
+
+### MEDIUM: check_and_composition latent bypass risk (BLACK-1704)
+- action_ucan=None now means "already verified"
+- Current callers correct; future callers may skip capability check
+- No compile-time enforcement of precondition
