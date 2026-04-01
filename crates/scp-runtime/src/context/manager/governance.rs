@@ -2188,29 +2188,13 @@ impl ContextManager {
         }
 
         // Drain pending sender key distribution messages queued by
-        // rotate_sender_key and deliver via transport (§9.16.2).
-        let pending = self
-            .crypto
-            .drain_pending_sender_key_messages(&context_id_bytes)?;
-        if !pending.is_empty() {
-            let routing_id = super::messaging::derive_routing_id(context_id);
-            for (target_did, message) in pending {
-                tracing::debug!(
-                    target_did = %target_did,
-                    context_id = %context_id,
-                    message_len = message.len(),
-                    "sending rotated sender key distribution after member removal"
-                );
-                if let Err(e) = self.transport.send_message(&routing_id, &message) {
-                    tracing::warn!(
-                        target_did = %target_did,
-                        context_id = %context_id,
-                        error = %e,
-                        "failed to send rotated sender key — \
-                         recipient must request key via SenderKeyRequest"
-                    );
-                }
-            }
+        // rotate_sender_key, MLS-encrypt, and deliver via transport (§9.16.2).
+        if let Err(e) = self.drain_and_deliver_sender_keys(context_id, &context_id_bytes) {
+            tracing::warn!(
+                context_id = %context_id,
+                error = %e,
+                "failed to deliver rotated sender keys after member removal"
+            );
         }
 
         if let Some(snapshot) = snapshot {
@@ -3148,22 +3132,14 @@ impl ContextManager {
             );
         }
 
-        // Drain pending sender key distribution messages and deliver
-        // via transport (same pattern as execute_remove_member).
-        if let Ok(pending) = self
-            .crypto
-            .drain_pending_sender_key_messages(&context_id_bytes)
-        {
-            let routing_id = super::messaging::derive_routing_id(context_id);
-            for (target_did, message) in pending {
-                if let Err(e) = self.transport.send_message(&routing_id, &message) {
-                    tracing::warn!(
-                        target_did = %target_did,
-                        error = %e,
-                        "failed to send rotated sender key distribution after member reset"
-                    );
-                }
-            }
+        // Drain pending sender key distribution messages, MLS-encrypt,
+        // and deliver via transport (same pattern as lifecycle leave).
+        if let Err(e) = self.drain_and_deliver_sender_keys(context_id, &context_id_bytes) {
+            tracing::warn!(
+                context_id = %context_id,
+                error = %e,
+                "failed to deliver rotated sender keys after member reset"
+            );
         }
 
         self.event_log

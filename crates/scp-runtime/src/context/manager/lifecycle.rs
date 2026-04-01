@@ -1804,7 +1804,7 @@ impl ContextManager {
     /// Drains pending sender key distribution messages and delivers them
     /// via transport (§9.16.2). Called after `rotate_sender_key` to send
     /// HPKE-sealed sender key responses to remaining members.
-    fn drain_and_deliver_sender_keys(
+    pub(super) fn drain_and_deliver_sender_keys(
         &self,
         context_id: &str,
         context_id_bytes: &[u8; 32],
