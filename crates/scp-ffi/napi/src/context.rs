@@ -1212,7 +1212,7 @@ fn format_context_event(event: &scp_core::context::membership::ContextEvent) -> 
             html_escape_event_string(action_type),
             html_escape_event_string(context_id),
         ),
-        other => format!("{other:?}"),
+        other => html_escape_event_string(&format!("{other:?}")),
     }
 }
 
