@@ -53,6 +53,16 @@ After commit 54b8096 ("close 6 remaining gaps"), reassessed all chains.
 - **RED-603 (LOW)**: Asymmetric freshness (300s past/30s future) is sound. Pre-existing gap: NonceDedup not wired for access keys.
 - **RED-606 (MEDIUM)**: E2eCryptoProvider missing epoch poisoning, recv_tracker, mgmt size limit. New defenses untested in integration.
 
+## PR Branch `complete-pr-work-review-0TQtO` Assessment (2026-04-01)
+- **RED-701 (HIGH)**: NAPI/UniFFI catch-all event formatters lack HTML escaping. Input-side rejection removed; output-side escaping inconsistent across bridges. PyO3 safe, WASM safe (json escaping), NAPI/UniFFI unsafe on catch-all arm.
+- **RED-702 (MEDIUM)**: Spending UCAN replay. No nonce dedup. BudgetTracker ceiling bounds damage but doesn't prevent replay within ceiling.
+- **RED-703 (LOW)**: Escrow double-spend prevented by Rust ownership model. H8 no-rollback-after-delivery is correct.
+- **RED-704 (LOW)**: Tool cost overflow infeasible (requires near-u64::MAX prior spend).
+- **RED-705 (MEDIUM)**: system_assign_role bypasses RoleAssign for consequence engine. No appeal, no cooldown. Rules immutable but powerful.
+- **RED-706 (HIGH)**: evaluate_sybil_resistance() is a stub (passes unconditionally). Standing score gaming trivial via Sybil identities.
+- **RED-707 (LOW)**: Trust recovery abuse defended by MLS removal + sender key rotation + membership checks.
+- **RED-708 (LOW)**: Crypto boundaries hold. Epoch poisoning capped at 1000-step, replay detection has MLS primary + sequence secondary, SCPM magic collision infeasible.
+
 ## Key Attack Patterns for This Codebase
 - **Bridge parity gap**: WASM bridge cannot depend on scp-core (tokio incompatibility), so it re-implements validation partially. ALWAYS check WASM bridge when core validation changes.
 - **Two UcanToken types**: `roles::UcanToken` (stub, no sig/expiry) vs `crypto::ucan::UcanToken` (full, has sig/encoded). Broadcast uses the stub. Any code accepting the stub has no sig verification.
@@ -61,6 +71,9 @@ After commit 54b8096 ("close 6 remaining gaps"), reassessed all chains.
 - **SSE broadcast model**: All SSE clients receive all responses. No per-session isolation.
 - **Wildcard prefix matching**: `starts_with` on context_id without delimiter allows cross-context access for IDs sharing a prefix.
 - **"Caller is responsible" pattern**: Still present from PR #76. claim_shadow, upgrade_shadow_role defer sig verification.
+- **Output escaping parity gap**: Input-side HTML rejection removed (validate.rs). Output-side escaping added but only PyO3 catch-all is consistent. NAPI/UniFFI catch-all arms unescaped. Any new event variant auto-falls through unescaped.
+- **Stub sybil resistance**: evaluate_sybil_resistance() passes unconditionally. Any standing-based feature is Sybil-vulnerable until implemented.
+- **system_assign_role bypass**: Consequence engine can demote/ban without governance vote. No appeal, no cooldown, no rate limit.
 - **Replay without nonce**: BRIDGE_REGISTER uses timestamp-only replay protection (60s window). No nonce, no connection binding. Captured frames are replayable within window.
 - **Unbounded event-driven loops**: tier re-evaluation loop has no debounce. Any channel sender can trigger unlimited STUN probes + DID publishes.
 - **Structural fallback bypass (FIXED)**: check_projection_auth now hard-rejects empty member_keys with 401. Dead `None` arm remains but is unreachable. Latent risk only.
