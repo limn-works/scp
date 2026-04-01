@@ -8455,7 +8455,7 @@ fn format_context_event(event: &scp_core::context::membership::ContextEvent) -> 
              action={action_type},success={success},\
              context={context_id}"
         ),
-        other => format!("{other:?}"),
+        other => html_escape_event_string(&format!("{other:?}")),
     }
 }
 
