@@ -384,19 +384,10 @@ pub fn check_and_composition(
     action_cost: Amount,
     action_description: &str,
 ) -> Result<(), SpendingError> {
-    // When action_ucan is None, the caller has already verified the action
-    // capability (e.g., MessagesWrite or context:join was checked before
-    // this function). This is the normal case when the caller passes
-    // spending_ucan only.
-    //
-    // When action_ucan is Some, it serves as proof that the action
-    // capability exists. We only require it for paid actions when no
-    // spending UCAN is provided.
-    if action_ucan.is_none() && spending_ucan.is_none() && action_cost.0 > 0 {
-        return Err(SpendingError::SpendingCapabilityRequired(format!(
-            "paid action '{action_description}' costs {action_cost} but no spending UCAN provided"
-        )));
-    }
+    // action_ucan is accepted for API compatibility but not inspected here.
+    // The caller has already verified the action capability before invoking
+    // this AND-composition check; this function validates spending only.
+    let _ = action_ucan;
 
     // Spending UCAN is required only for paid actions (cost > 0).
     if action_cost.0 > 0 && spending_ucan.is_none() {
