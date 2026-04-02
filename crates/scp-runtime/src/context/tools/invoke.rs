@@ -1734,6 +1734,7 @@ mod tests {
             time_of_day: 0,
             sender_velocity: 0,
             storage_usage: 0,
+            relay_base_price: 0,
         };
         let mut participation: std::collections::HashMap<
             String,

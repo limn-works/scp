@@ -85,6 +85,10 @@ fn parse_metrics(dict: &Bound<'_, PyDict>) -> PyResult<scp_core::economy::Observ
             .get_item("storage_usage")?
             .and_then(|v| v.extract::<u64>().ok())
             .unwrap_or(0),
+        relay_base_price: dict
+            .get_item("relay_base_price")?
+            .and_then(|v| v.extract::<u64>().ok())
+            .unwrap_or(0),
     })
 }
 

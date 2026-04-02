@@ -208,6 +208,7 @@ pub(super) fn enforce_economy(
     action_label: &str,
     context_id: &str,
     clock: &dyn scp_primitives::Clock,
+    relay_base_price: u64,
 ) -> Result<Option<scp_protocol::economy::types::Amount>, ContextError> {
     let Some(policy) = economic_policy else {
         return Ok(None);
@@ -227,6 +228,7 @@ pub(super) fn enforce_economy(
         // storage_usage: Requires storage provider metrics not available at ContextManager.
         // The Storage trait (scp-platform) does not expose per-context byte counts.
         storage_usage: 0,
+        relay_base_price,
     };
 
     // M2: evaluate_cost returns None on formula overflow — treat as error,
@@ -368,6 +370,11 @@ impl ContextManager {
                 relay_queue_depth: 0,
                 time_of_day: now_secs % 86400,
                 storage_usage: 0,
+                relay_base_price: ctx
+                    .governance
+                    .relay_pricing_config
+                    .as_ref()
+                    .map_or(0, |c| c.current_base_price.0),
             };
             (policy, metrics)
         };

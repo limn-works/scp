@@ -171,22 +171,18 @@ pub fn parse_sender_header(data: &[u8]) -> Result<(u64, u64, &[u8]), SenderKeyEr
         });
     }
     // Length validated above — try_into is infallible for exact-size slices.
-    let epoch = u64::from_be_bytes(
-        data[..8]
-            .try_into()
-            .map_err(|_| SenderKeyError::CiphertextTooShort {
-                actual: data.len(),
-                minimum: SENDER_HEADER_SIZE,
-            })?,
-    );
-    let sequence = u64::from_be_bytes(
-        data[8..16]
-            .try_into()
-            .map_err(|_| SenderKeyError::CiphertextTooShort {
-                actual: data.len(),
-                minimum: SENDER_HEADER_SIZE,
-            })?,
-    );
+    let epoch = u64::from_be_bytes(data[..8].try_into().map_err(|_| {
+        SenderKeyError::CiphertextTooShort {
+            actual: data.len(),
+            minimum: SENDER_HEADER_SIZE,
+        }
+    })?);
+    let sequence = u64::from_be_bytes(data[8..16].try_into().map_err(|_| {
+        SenderKeyError::CiphertextTooShort {
+            actual: data.len(),
+            minimum: SENDER_HEADER_SIZE,
+        }
+    })?);
     Ok((epoch, sequence, &data[16..]))
 }
 

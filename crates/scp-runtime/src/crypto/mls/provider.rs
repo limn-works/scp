@@ -622,9 +622,11 @@ impl ContextCryptoProvider for MlsCryptoProvider {
         })?;
         // Store our sender key locally under our DID so local
         // encrypt/decrypt can find it.
-        state
-            .sender_key_store
-            .set_unchecked(&ctx_id_hex, &self.local_did, state.sender_key.clone());
+        state.sender_key_store.set_unchecked(
+            &ctx_id_hex,
+            &self.local_did,
+            state.sender_key.clone(),
+        );
 
         // HPKE-seal our sender key to the target member's wrapping pubkey
         // and queue a SenderKeyResponse for transport delivery.
@@ -1087,9 +1089,7 @@ impl ContextCryptoProvider for MlsCryptoProvider {
                         .get(&ctx_str, &sender_did)
                         .cloned()
                         .ok_or_else(|| {
-                            ContextError::CryptoFailed(
-                                "sender key lookup failed".into(),
-                            )
+                            ContextError::CryptoFailed("sender key lookup failed".into())
                         })?;
 
                     // Step 3: Parse header and sender key decrypt.

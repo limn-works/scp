@@ -937,8 +937,9 @@ impl ContextCryptoProvider for E2eCryptoProvider {
         )
         .map_err(|e| ContextError::CryptoFailed(e.to_string()))?;
 
-        let result = rmp_serde::to_vec_named(&outer)
-            .map_err(|e| ContextError::CryptoFailed(format!("outer envelope serialization: {e}")))?;
+        let result = rmp_serde::to_vec_named(&outer).map_err(|e| {
+            ContextError::CryptoFailed(format!("outer envelope serialization: {e}"))
+        })?;
 
         // Increment send sequence only after successful encryption — matches
         // production MlsCryptoProvider behavior.
@@ -991,9 +992,7 @@ impl ContextCryptoProvider for E2eCryptoProvider {
                 if mls_decrypted.len() >= magic.len() && mls_decrypted[..magic.len()] == *magic {
                     let mgmt_slice = &mls_decrypted[magic.len()..];
                     // Management payload size limit — mirrors MlsCryptoProvider.
-                    if mgmt_slice.len()
-                        > scp_core::context::MAX_MANAGEMENT_PAYLOAD_SIZE
-                    {
+                    if mgmt_slice.len() > scp_core::context::MAX_MANAGEMENT_PAYLOAD_SIZE {
                         return Err(ContextError::CryptoFailed(
                             "management payload exceeds size limit".into(),
                         ));
@@ -1011,9 +1010,7 @@ impl ContextCryptoProvider for E2eCryptoProvider {
                         .lock()
                         .unwrap_or_else(std::sync::PoisonError::into_inner);
                     store.get(&ctx_str, &sender_did).cloned().ok_or_else(|| {
-                        ContextError::CryptoFailed(
-                            "sender key lookup failed".into(),
-                        )
+                        ContextError::CryptoFailed("sender key lookup failed".into())
                     })?
                 };
 
@@ -1038,8 +1035,7 @@ impl ContextCryptoProvider for E2eCryptoProvider {
                         .lock()
                         .unwrap_or_else(std::sync::PoisonError::into_inner);
                     if let Some(&(last_epoch, last_seq)) = tracker.get(&sender_did)
-                        && (epoch < last_epoch
-                            || (epoch == last_epoch && sequence <= last_seq))
+                        && (epoch < last_epoch || (epoch == last_epoch && sequence <= last_seq))
                     {
                         return Err(ContextError::CryptoFailed(
                             "replay or reorder detected".into(),

@@ -39,6 +39,8 @@ export interface ObservableMetrics {
   readonly senderVelocity?: number;
   /** Context storage usage in bytes. */
   readonly storageUsage?: number;
+  /** Current EIP-1559-style relay base price. */
+  readonly relayBasePrice?: number;
 }
 
 /** Paid action type for cost estimation. */

@@ -92,6 +92,10 @@ fn parse_metrics(json: &str) -> Result<scp_core::economy::ObservableMetrics, nap
             .get("storage_usage")
             .and_then(serde_json::Value::as_u64)
             .unwrap_or(0),
+        relay_base_price: v
+            .get("relay_base_price")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0),
     })
 }
 
