@@ -137,6 +137,11 @@ fn enforce_join_economy(
             "SCP-ECON-7030: paid context requires explicit acceptance".into(),
         ));
     }
+    let relay_base_price = ctx
+        .governance
+        .relay_pricing_config
+        .as_ref()
+        .map_or(0, |c| c.current_base_price.0);
     super::economy::enforce_economy(
         ctx.governance.economic_policy.as_ref(),
         &mut ctx.governance.budget_tracker,
@@ -149,6 +154,7 @@ fn enforce_join_economy(
         "context:join",
         context_id,
         clock,
+        relay_base_price,
     )
 }
 

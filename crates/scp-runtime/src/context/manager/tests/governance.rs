@@ -8252,6 +8252,7 @@ async fn join_context_deducts_budget_when_granted() {
                 time_of_day: 0,
                 sender_velocity: 0,
                 storage_usage: 0,
+                relay_base_price: 0,
             },
         )
         .unwrap();
@@ -9661,6 +9662,7 @@ async fn test_paid_join_with_consequence_evaluation() {
                 time_of_day: 0,
                 sender_velocity: 0,
                 storage_usage: 0,
+                relay_base_price: 0,
             },
         )
         .unwrap();
@@ -13755,6 +13757,7 @@ fn evaluate_cost_enforce_gate() {
         relay_queue_depth: 0,
         time_of_day: 0,
         storage_usage: 0,
+        relay_base_price: 0,
     };
 
     let cost = evaluate_cost(&policy, &PaidActionType::MessageSend, &metrics);
@@ -14191,6 +14194,7 @@ async fn test_cost_overflow_error() {
         relay_queue_depth: 0,
         time_of_day: 0,
         storage_usage: 0,
+        relay_base_price: 0,
     };
 
     // evaluate_cost itself returns None on overflow.

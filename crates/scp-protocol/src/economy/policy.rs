@@ -114,6 +114,8 @@ pub struct ObservableMetrics {
     pub sender_velocity: u64,
     /// Context storage usage in bytes.
     pub storage_usage: u64,
+    /// Current relay base price from EIP-1559 dynamic pricing (Amount value).
+    pub relay_base_price: u64,
 }
 
 impl ObservableMetrics {
@@ -127,6 +129,7 @@ impl ObservableMetrics {
             PricingMetric::TimeOfDay => self.time_of_day,
             PricingMetric::SenderVelocity => self.sender_velocity,
             PricingMetric::StorageUsage => self.storage_usage,
+            PricingMetric::RelayBasePrice => self.relay_base_price,
         }
     }
 
@@ -153,7 +156,7 @@ impl ObservableMetrics {
         snapshot
     }
 
-    /// Collects a snapshot of all six metric values.
+    /// Collects a snapshot of all seven metric values.
     #[must_use]
     pub fn snapshot_all(&self) -> Vec<(PricingMetric, u64)> {
         vec![
@@ -163,6 +166,7 @@ impl ObservableMetrics {
             (PricingMetric::TimeOfDay, self.time_of_day),
             (PricingMetric::SenderVelocity, self.sender_velocity),
             (PricingMetric::StorageUsage, self.storage_usage),
+            (PricingMetric::RelayBasePrice, self.relay_base_price),
         ]
     }
 }
@@ -1176,6 +1180,7 @@ mod tests {
             time_of_day: 14,
             sender_velocity: 30,
             storage_usage: 1_000_000,
+            relay_base_price: 42,
         };
 
         assert_eq!(metrics.get(&PricingMetric::ContextMessageRate), 100);
@@ -1184,6 +1189,7 @@ mod tests {
         assert_eq!(metrics.get(&PricingMetric::TimeOfDay), 14);
         assert_eq!(metrics.get(&PricingMetric::SenderVelocity), 30);
         assert_eq!(metrics.get(&PricingMetric::StorageUsage), 1_000_000);
+        assert_eq!(metrics.get(&PricingMetric::RelayBasePrice), 42);
     }
 
     #[test]
@@ -1243,10 +1249,10 @@ mod tests {
     }
 
     #[test]
-    fn observable_metrics_snapshot_all_returns_six_entries() {
+    fn observable_metrics_snapshot_all_returns_seven_entries() {
         let metrics = default_metrics();
         let snapshot = metrics.snapshot_all();
-        assert_eq!(snapshot.len(), 6);
+        assert_eq!(snapshot.len(), 7);
     }
 
     #[test]
@@ -1258,6 +1264,7 @@ mod tests {
         assert_eq!(metrics.time_of_day, 0);
         assert_eq!(metrics.sender_velocity, 0);
         assert_eq!(metrics.storage_usage, 0);
+        assert_eq!(metrics.relay_base_price, 0);
     }
 
     // =======================================================================

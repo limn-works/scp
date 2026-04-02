@@ -294,6 +294,8 @@ pub enum PricingMetric {
     SenderVelocity,
     /// Context storage usage in bytes.
     StorageUsage,
+    /// Current EIP-1559-style relay base price (from `RelayPricingConfig`).
+    RelayBasePrice,
 }
 
 // ---------------------------------------------------------------------------
@@ -622,6 +624,7 @@ mod tests {
             PricingMetric::TimeOfDay,
             PricingMetric::SenderVelocity,
             PricingMetric::StorageUsage,
+            PricingMetric::RelayBasePrice,
         ];
         for metric in &metrics {
             let json = serde_json::to_string(metric).unwrap();
