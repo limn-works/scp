@@ -344,19 +344,20 @@ impl SenderKeyStore {
     /// Removes the sender key for a given context and sender DID.
     ///
     /// Returns the removed key if it existed, or `None` otherwise.
+    ///
+    /// The epoch high-water mark is deliberately preserved so that
+    /// `set_checked()` continues to reject epochs ≤ the previously seen
+    /// maximum even after the key is removed and later re-added.
     pub fn remove(&mut self, context_id: &str, sender_did: &str) -> Option<SenderKey> {
         let inner = self.keys.get_mut(context_id)?;
         let removed = inner.remove(sender_did);
         if inner.is_empty() {
             self.keys.remove(context_id);
         }
-        // Also clean up epoch tracking.
-        if let Some(epoch_inner) = self.epochs.get_mut(context_id) {
-            epoch_inner.remove(sender_did);
-            if epoch_inner.is_empty() {
-                self.epochs.remove(context_id);
-            }
-        }
+        // Deliberately preserve the epoch high-water mark. If this sender key
+        // is removed (e.g., member leaves) and later re-added, set_checked()
+        // must still reject epochs <= the previously seen maximum. Clearing
+        // the epoch would allow a replayed old-epoch key to be accepted.
         removed
     }
 
@@ -598,14 +599,60 @@ mod tests {
     }
 
     #[test]
-    fn remove_cleans_up_epoch_tracking() {
+    fn remove_preserves_epoch_high_water_mark() {
         let mut store = SenderKeyStore::new();
+
+        // 1. Set a key with set_checked at epoch 5.
         store
-            .set_checked("ctx", "did:a", generate_sender_key(), 1)
+            .set_checked("ctx", "did:a", generate_sender_key(), 5)
             .unwrap();
-        assert_eq!(store.epoch("ctx", "did:a"), 1);
-        store.remove("ctx", "did:a");
-        assert_eq!(store.epoch("ctx", "did:a"), 0);
-        assert!(store.epochs.is_empty());
+        assert_eq!(store.epoch("ctx", "did:a"), 5);
+
+        // 2. Remove the key.
+        let removed = store.remove("ctx", "did:a");
+        assert!(removed.is_some());
+
+        // 3. Verify get() returns None (key gone).
+        assert!(store.get("ctx", "did:a").is_none());
+
+        // 4. Verify set_checked at epoch 3 fails (epoch preserved).
+        let err = store
+            .set_checked("ctx", "did:a", generate_sender_key(), 3)
+            .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                SenderKeyError::EpochNotMonotonic {
+                    current: 5,
+                    received: 3,
+                    ..
+                }
+            ),
+            "expected EpochNotMonotonic(current=5, received=3), got: {err}"
+        );
+
+        // 5. Verify set_checked at epoch 5 fails (epoch preserved — must be strictly greater).
+        let err = store
+            .set_checked("ctx", "did:a", generate_sender_key(), 5)
+            .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                SenderKeyError::EpochNotMonotonic {
+                    current: 5,
+                    received: 5,
+                    ..
+                }
+            ),
+            "expected EpochNotMonotonic(current=5, received=5), got: {err}"
+        );
+
+        // 6. Verify set_checked at epoch 6 succeeds.
+        assert!(
+            store
+                .set_checked("ctx", "did:a", generate_sender_key(), 6)
+                .is_ok()
+        );
+        assert_eq!(store.epoch("ctx", "did:a"), 6);
     }
 }
