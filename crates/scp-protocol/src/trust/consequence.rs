@@ -42,6 +42,17 @@ const MAX_CAPABILITY_SUSPENSION_COUNT: usize = 32;
 /// control characters.
 const FORBIDDEN_CHARS: &str = "<>&\"'";
 
+/// Capability names recognized by enforcement. Only these have real gate
+/// semantics; accepting others gives a false sense of security.
+const VALID_SUSPENSION_CAPABILITIES: &[&str] = &[
+    "write",
+    "MessagesWrite",
+    "messages:write",
+    "read",
+    "MessagesRead",
+    "messages:read",
+];
+
 /// Validates a user-supplied string field in a [`ConsequenceRule`].
 ///
 /// Rejects strings that:
@@ -221,6 +232,12 @@ impl ConsequenceRule {
                         &format!("CapabilitySuspension[{i}]"),
                         MAX_CONSEQUENCE_STRING_LEN,
                     )?;
+                    if !VALID_SUSPENSION_CAPABILITIES.contains(&cap.as_str()) {
+                        return Err(ConsequenceValidationError(format!(
+                            "CapabilitySuspension[{i}] '{cap}' is not a recognized capability name; \
+                             valid names: {VALID_SUSPENSION_CAPABILITIES:?}",
+                        )));
+                    }
                 }
             }
             ConsequenceAction::RoleDemotion { to_role } => {
@@ -1248,7 +1265,11 @@ mod tests {
 
     #[test]
     fn validate_accepts_max_capabilities() {
-        let caps: Vec<String> = (0..32).map(|i| format!("cap:{i}")).collect();
+        // Use valid capability names repeated to fill the 32-entry limit.
+        let valid_names: Vec<&str> = VALID_SUSPENSION_CAPABILITIES.to_vec();
+        let caps: Vec<String> = (0..32)
+            .map(|i| valid_names[i % valid_names.len()].to_owned())
+            .collect();
         let rule = ConsequenceRule {
             trigger: ConsequenceTrigger::MessageVelocity,
             action: ConsequenceAction::CapabilitySuspension(caps),
@@ -1432,5 +1453,44 @@ mod tests {
             result.is_empty(),
             "WarningCount should not fire when target_did != subject"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // Validation: unrecognized capability name is rejected
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn validate_rejects_unknown_capability_name() {
+        let rule = ConsequenceRule {
+            trigger: ConsequenceTrigger::MessageVelocity,
+            action: ConsequenceAction::CapabilitySuspension(vec!["fly_to_moon".into()]),
+            threshold: 1,
+            window: Duration::from_secs(60),
+        };
+        let err = rule.validate().unwrap_err();
+        assert!(
+            err.to_string().contains("not a recognized capability name"),
+            "error should mention unrecognized capability, got: {err}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Validation: all valid suspension capability names are accepted
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn validate_accepts_all_valid_suspension_capabilities() {
+        for &cap_name in VALID_SUSPENSION_CAPABILITIES {
+            let rule = ConsequenceRule {
+                trigger: ConsequenceTrigger::MessageVelocity,
+                action: ConsequenceAction::CapabilitySuspension(vec![cap_name.to_owned()]),
+                threshold: 1,
+                window: Duration::from_secs(60),
+            };
+            assert!(
+                rule.validate().is_ok(),
+                "valid capability '{cap_name}' should be accepted"
+            );
+        }
     }
 }
