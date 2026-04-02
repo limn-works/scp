@@ -48,6 +48,10 @@ fn metrics_from_json(metrics: &serde_json::Value) -> ObservableMetrics {
             .get("storage_usage")
             .and_then(serde_json::Value::as_u64)
             .unwrap_or(0),
+        relay_base_price: metrics
+            .get("relay_base_price")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0),
     }
 }
 

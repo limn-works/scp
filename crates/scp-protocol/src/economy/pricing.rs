@@ -410,6 +410,7 @@ mod tests {
             time_of_day: 14,
             sender_velocity: 75,
             storage_usage: 1_000,
+            relay_base_price: 0,
         };
 
         // Evaluate twice ("payer side" and "receiver side").
