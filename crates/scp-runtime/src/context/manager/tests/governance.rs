@@ -11366,18 +11366,24 @@ async fn capability_suspension_exact_match_no_false_positive() {
         noop_key_resolver(),
     );
 
-    let mut params = governance_params();
-    // Rule that suspends "spreadsheet" capability (not "write" or "read").
-    params.consequence_rules = vec![ConsequenceRule {
-        trigger: ConsequenceTrigger::MessageVelocity,
-        threshold: 1,
-        action: ConsequenceAction::CapabilitySuspension(vec!["spreadsheet".to_owned()]),
-        window: Duration::from_secs(3600),
-    }];
+    let params = governance_params();
+    // Create context without consequence rules, then inject the rule directly
+    // to bypass validation (which now rejects unknown capability names).
+    // This test exercises the enforcement path for an unrecognized capability.
     let _handle = manager
         .create_context("cap-exact-ctx".into(), params, "did:key:sender".into())
         .await
         .unwrap();
+    {
+        let mut contexts = manager.contexts.lock().await;
+        let ctx = contexts.get_mut("cap-exact-ctx").unwrap();
+        ctx.governance.consequence_rules = vec![ConsequenceRule {
+            trigger: ConsequenceTrigger::MessageVelocity,
+            threshold: 1,
+            action: ConsequenceAction::CapabilitySuspension(vec!["spreadsheet".to_owned()]),
+            window: Duration::from_secs(3600),
+        }];
+    }
 
     let sk = ed25519_dalek::SigningKey::from_bytes(&[1u8; 32]);
     let handle = manager
