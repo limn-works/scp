@@ -14583,3 +14583,79 @@ async fn test_evict_stale_entries_removes_non_members() {
         assert_eq!(ctx.governance.participation_cache.len(), 0);
     }
 }
+
+// -----------------------------------------------------------------------
+// TOCTOU guard: enforce_triggered_consequences skips non-members
+// -----------------------------------------------------------------------
+
+#[tokio::test]
+async fn enforce_triggered_consequences_skips_absent_member() {
+    use scp_protocol::trust::consequence::{
+        ConsequenceAction, ConsequenceRule, ConsequenceTrigger, TriggeredConsequence,
+    };
+    use std::time::Duration;
+
+    let (manager, _handle) = setup_active_context().await;
+
+    let non_member_did: DID = "did:key:ghost".into();
+
+    let rules = vec![ConsequenceRule {
+        trigger: ConsequenceTrigger::MessageVelocity,
+        action: ConsequenceAction::CapabilitySuspension(vec!["write".to_owned()]),
+        threshold: 1,
+        window: Duration::from_secs(60),
+    }];
+
+    let triggered = vec![TriggeredConsequence {
+        rule_index: 0,
+        action: ConsequenceAction::CapabilitySuspension(vec!["write".to_owned()]),
+        evidence: vec![],
+    }];
+
+    let now = 1000;
+    {
+        let mut contexts = manager.contexts.lock().await;
+        let ctx = contexts.get_mut("test-ctx").unwrap();
+
+        // Verify the non-member is indeed not in membership.
+        assert!(
+            !ctx.membership.contains(non_member_did.as_ref()),
+            "ghost DID should not be a member"
+        );
+
+        let events_before = ctx.receive_buffer.drain().len();
+        assert_eq!(
+            events_before, 0,
+            "receive buffer should be empty before test"
+        );
+
+        super::super::governance::enforce_triggered_consequences(
+            ctx,
+            "test-ctx",
+            &non_member_did,
+            now,
+            &triggered,
+            &rules,
+            &scp_primitives::SystemClock,
+        );
+
+        // No ConsequenceTriggered or ConsequenceEnforced events should be emitted.
+        let events_after = ctx.receive_buffer.drain();
+        assert!(
+            events_after.is_empty(),
+            "no consequences should be applied to a non-member, but got {} events: {:?}",
+            events_after.len(),
+            events_after,
+        );
+
+        // Verify no access revocation occurred either.
+        assert!(
+            !ctx.access.write_revoked_members.contains(&non_member_did),
+            "non-member should not appear in write_revoked_members"
+        );
+        assert!(
+            !ctx.access.read_revoked_members.contains(&non_member_did),
+            "non-member should not appear in read_revoked_members"
+        );
+    }
+}

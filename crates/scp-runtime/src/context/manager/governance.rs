@@ -130,6 +130,15 @@ pub(super) fn enforce_triggered_consequences(
     clock: &dyn scp_primitives::Clock,
 ) {
     for consequence in triggered {
+        // TOCTOU guard: member may have left between evaluation and enforcement.
+        if !ctx.membership.contains(member_did) {
+            tracing::debug!(
+                member = %member_did,
+                "skipping consequence enforcement: member is no longer present"
+            );
+            break;
+        }
+
         // Cooldown tracking: skip if this rule fired within its window.
         if let Some(&last_fired) = ctx.governance.cooldown_until.get(&consequence.rule_index)
             && now < last_fired
