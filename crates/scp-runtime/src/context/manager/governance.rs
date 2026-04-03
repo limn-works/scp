@@ -3373,10 +3373,10 @@ impl ContextManager {
     /// Revokes a member's write access per §9.17 and ADR-038.
     ///
     /// Scope differentiation:
-    /// - `Full`: destroys the target's sender/broadcast key AND revokes
+    /// - `AccessScope::Both`: destroys the target's sender/broadcast key AND revokes
     ///   write capability. Historical content by the target may be
     ///   suppressed by the access key layer.
-    /// - `FutureOnly`: revokes write capability only. No key destruction
+    /// - `AccessScope::Write`: revokes write capability only. No key destruction
     ///   — existing broadcast keys remain for historical decryption.
     ///
     /// Redundancy: revoke-when-already-revoked is a no-op (§5.9).

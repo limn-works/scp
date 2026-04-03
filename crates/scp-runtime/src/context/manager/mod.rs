@@ -418,7 +418,7 @@ pub struct ContextSnapshot {
     /// Dynamically registered tools (beyond initial `ContextParams.tools`).
     #[serde(default)]
     pub registered_tools: Vec<ToolRegistration>,
-    /// Members excluded from future CEK wrapping (`FutureOnly` read revocation).
+    /// Members excluded from future CEK wrapping (`Revoke { access: AccessScope::Write }`).
     /// These members won't receive new content keys but retain access to
     /// historical content encrypted before the revocation (ADR-038, §9.17).
     #[serde(default)]
@@ -815,7 +815,7 @@ struct EpochState {
 /// Capability suspension is now handled by `ContextRoleState::suspended_capabilities`.
 /// This struct retains the CEK exclusion list and per-member access key store.
 struct AccessControlState {
-    /// Members excluded from future CEK wrapping (`FutureOnly` read revocation,
+    /// Members excluded from future CEK wrapping (`Revoke { access: AccessScope::Write }`,
     /// ADR-038, §9.17). This is a cryptographic exclusion list, NOT an
     /// application-level capability suspension.
     read_exclusion_list: HashSet<DID>,
