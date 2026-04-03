@@ -172,6 +172,101 @@ impl ObservableMetrics {
 }
 
 // ---------------------------------------------------------------------------
+// Metric availability validation (pit-of-success)
+// ---------------------------------------------------------------------------
+
+/// Metrics that are currently populated by the runtime infrastructure.
+///
+/// Formulas referencing metrics NOT in this list will be rejected at context
+/// creation time. Update this constant as new metric sources are wired.
+///
+/// Available: `SenderVelocity`, `MemberCount`, `ContextMessageRate`,
+/// `TimeOfDay`, `RelayBasePrice`.
+///
+/// NOT available: `RelayQueueDepth`, `StorageUsage`.
+pub const AVAILABLE_METRICS: &[PricingMetric] = &[
+    PricingMetric::SenderVelocity,
+    PricingMetric::MemberCount,
+    PricingMetric::ContextMessageRate,
+    PricingMetric::TimeOfDay,
+    PricingMetric::RelayBasePrice,
+];
+
+/// Error returned when a [`PricingFormula`] references metrics that are not
+/// yet populated by the runtime infrastructure.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct UnavailableMetricError {
+    /// Metrics referenced by the formula that are not currently available.
+    pub unavailable: Vec<PricingMetric>,
+}
+
+impl std::fmt::Display for UnavailableMetricError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "pricing formula references unavailable metrics: ")?;
+        for (i, m) in self.unavailable.iter().enumerate() {
+            if i > 0 {
+                write!(f, ", ")?;
+            }
+            write!(f, "{m}")?;
+        }
+        Ok(())
+    }
+}
+
+impl std::error::Error for UnavailableMetricError {}
+
+/// Validates that a [`PricingFormula`] only references metrics that are
+/// currently populated by the runtime.
+///
+/// Returns `Ok(())` if all referenced metrics are in [`AVAILABLE_METRICS`].
+/// Returns `Err(UnavailableMetricError)` listing the unavailable metrics
+/// otherwise.
+///
+/// # Errors
+///
+/// Returns [`UnavailableMetricError`] when the formula references unpopulated
+/// metrics.
+pub fn validate_formula_metrics(formula: &PricingFormula) -> Result<(), UnavailableMetricError> {
+    let mut unavailable = Vec::new();
+    for var in &formula.variables {
+        let metric = match var {
+            PricingVariable::Linear { metric, .. } | PricingVariable::Step { metric, .. } => metric,
+        };
+        if !AVAILABLE_METRICS.contains(metric) && !unavailable.contains(metric) {
+            unavailable.push(metric.clone());
+        }
+    }
+    if unavailable.is_empty() {
+        Ok(())
+    } else {
+        Err(UnavailableMetricError { unavailable })
+    }
+}
+
+/// Convenience wrapper: validates metric availability for an optional
+/// [`EconomicPolicy`].
+///
+/// Returns `Ok(())` if:
+/// - The policy is `None` (no economic policy = no formula to validate).
+/// - The policy has no `pricing_formula`.
+/// - All formula metrics are available.
+///
+/// # Errors
+///
+/// Returns [`UnavailableMetricError`] when the formula references unpopulated
+/// metrics.
+pub fn validate_economic_policy_metrics(
+    policy: Option<&EconomicPolicy>,
+) -> Result<(), UnavailableMetricError> {
+    if let Some(p) = policy
+        && let Some(formula) = &p.pricing_formula
+    {
+        return validate_formula_metrics(formula);
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
 // PricingFormula evaluation
 // ---------------------------------------------------------------------------
 
@@ -1382,5 +1477,125 @@ mod tests {
             Amount(u64::MAX),
             "overflow must assume maximum cost"
         );
+    }
+
+    // =======================================================================
+    // Metric availability validation
+    // =======================================================================
+
+    #[test]
+    fn formula_with_available_metrics_passes() {
+        let formula = PricingFormula {
+            base_cost: Amount(10),
+            variables: vec![
+                PricingVariable::Linear {
+                    metric: PricingMetric::SenderVelocity,
+                    coefficient: Coefficient(500_000),
+                },
+                PricingVariable::Step {
+                    metric: PricingMetric::MemberCount,
+                    thresholds: vec![(10, Amount(5))],
+                },
+                PricingVariable::Linear {
+                    metric: PricingMetric::ContextMessageRate,
+                    coefficient: Coefficient(100_000),
+                },
+                PricingVariable::Linear {
+                    metric: PricingMetric::TimeOfDay,
+                    coefficient: Coefficient(200_000),
+                },
+            ],
+            cap: None,
+            floor: None,
+        };
+        assert!(validate_formula_metrics(&formula).is_ok());
+    }
+
+    #[test]
+    fn formula_with_relay_queue_depth_fails() {
+        let formula = PricingFormula {
+            base_cost: Amount(10),
+            variables: vec![PricingVariable::Linear {
+                metric: PricingMetric::RelayQueueDepth,
+                coefficient: Coefficient(500_000),
+            }],
+            cap: None,
+            floor: None,
+        };
+        let err = validate_formula_metrics(&formula).unwrap_err();
+        assert_eq!(err.unavailable, vec![PricingMetric::RelayQueueDepth]);
+    }
+
+    #[test]
+    fn formula_with_storage_usage_fails() {
+        let formula = PricingFormula {
+            base_cost: Amount(10),
+            variables: vec![PricingVariable::Step {
+                metric: PricingMetric::StorageUsage,
+                thresholds: vec![(1024, Amount(1))],
+            }],
+            cap: None,
+            floor: None,
+        };
+        let err = validate_formula_metrics(&formula).unwrap_err();
+        assert_eq!(err.unavailable, vec![PricingMetric::StorageUsage]);
+    }
+
+    #[test]
+    fn formula_with_mixed_available_and_unavailable_lists_only_unavailable() {
+        let formula = PricingFormula {
+            base_cost: Amount(10),
+            variables: vec![
+                PricingVariable::Linear {
+                    metric: PricingMetric::MemberCount,
+                    coefficient: Coefficient(500_000),
+                },
+                PricingVariable::Linear {
+                    metric: PricingMetric::RelayQueueDepth,
+                    coefficient: Coefficient(100_000),
+                },
+                PricingVariable::Step {
+                    metric: PricingMetric::StorageUsage,
+                    thresholds: vec![(1024, Amount(1))],
+                },
+                PricingVariable::Linear {
+                    metric: PricingMetric::SenderVelocity,
+                    coefficient: Coefficient(200_000),
+                },
+            ],
+            cap: None,
+            floor: None,
+        };
+        let err = validate_formula_metrics(&formula).unwrap_err();
+        assert_eq!(
+            err.unavailable,
+            vec![PricingMetric::RelayQueueDepth, PricingMetric::StorageUsage]
+        );
+    }
+
+    #[test]
+    fn none_policy_passes_validation() {
+        assert!(validate_economic_policy_metrics(None).is_ok());
+    }
+
+    #[test]
+    fn policy_without_formula_passes_validation() {
+        let policy = free_policy();
+        assert!(policy.pricing_formula.is_none());
+        assert!(validate_economic_policy_metrics(Some(&policy)).is_ok());
+    }
+
+    #[test]
+    fn relay_base_price_is_available() {
+        let formula = PricingFormula {
+            base_cost: Amount(10),
+            variables: vec![PricingVariable::Linear {
+                metric: PricingMetric::RelayBasePrice,
+                coefficient: Coefficient(1_000_000),
+            }],
+            cap: None,
+            floor: None,
+        };
+        assert!(validate_formula_metrics(&formula).is_ok());
     }
 }
