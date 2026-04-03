@@ -209,6 +209,9 @@ pub(super) fn enforce_economy(
     context_id: &str,
     clock: &dyn scp_primitives::Clock,
     relay_base_price: u64,
+    nonce_tracker: &mut scp_protocol::crypto::ucan::nonce::NonceTracker<
+        std::sync::Arc<dyn scp_primitives::Clock>,
+    >,
 ) -> Result<Option<scp_protocol::economy::types::Amount>, ContextError> {
     let Some(policy) = economic_policy else {
         return Ok(None);
@@ -279,6 +282,17 @@ pub(super) fn enforce_economy(
             clock,
         )
         .map_err(|e| ContextError::PermissionDenied(format!("SCP-ECON-7062: {e}")))?;
+
+        // Nonce replay prevention: validate the spending UCAN nonce has not been
+        // used before. This prevents replay attacks where a valid spending UCAN
+        // is resubmitted to authorize the same action multiple times.
+        nonce_tracker
+            .check_and_record(&spending.payload.nnc, spending.payload.exp)
+            .map_err(|e| {
+                ContextError::PermissionDenied(format!(
+                    "SCP-ECON-7064: spending UCAN nonce replay: {e}"
+                ))
+            })?;
     }
 
     // Budget check — no auto-grant. If the member has no budget, fail with

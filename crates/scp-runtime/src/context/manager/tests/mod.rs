@@ -127,7 +127,7 @@ pub(super) fn dummy_spending_ucan_with_cap(max_per_action: u64, max_total: u64) 
             aud: "did:key:test-context".to_owned(),
             exp: now + 3600, // 1 hour from now (within 24-hour limit)
             nbf: Some(now),
-            nnc: "test-nonce".to_owned(),
+            nnc: scp_protocol::crypto::ucan::nonce::generate_nonce(&scp_primitives::SystemClock),
             att: vec![spending_att],
             prf: vec![],
             fct: Some(serde_json::Value::Object(fct)),
