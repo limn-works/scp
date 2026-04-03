@@ -31,30 +31,39 @@ fn validate_consequence_rules(
 
 /// Performs sybil resistance evaluation for a join candidate (#1530).
 ///
-/// Sybil resistance requires external identity signals (trust signals,
-/// device attestation, attestor data) that are not available at the
-/// `ContextManager` layer. `ContextParams` does not declare a sybil policy
-/// field. This function is a conditional gate: it only evaluates when a
-/// sybil policy is available in the future. Currently passes unconditionally
-/// with a trace log.
+/// Reads the `sybil_policy` from `ContextParams`. When `None`, passes
+/// unconditionally (backward compatible). When `Some`, constructs an
+/// [`IdentityDepthAssessment`] from the member's available trust signals
+/// and delegates to [`scp_protocol::trust::sybil::evaluate_sybil_resistance`].
 ///
-/// Returns `Result` for fail-closed semantics: when a real sybil policy is
-/// wired, failures will propagate via `?`.
-#[allow(clippy::unnecessary_wraps)]
+/// Currently, the `ContextManager` layer does not have access to external
+/// trust signals (social attestations, device attestations, etc.), so the
+/// assessment is constructed with an empty signal set. Contexts that set a
+/// sybil policy with non-trivial requirements will reject members until
+/// signal providers are wired in at a higher layer.
 pub(super) fn evaluate_sybil_resistance(
-    _ctx: &PerContextState,
+    ctx: &PerContextState,
     member_did: &DID,
-    _now: u64,
+    now: u64,
 ) -> Result<(), ContextError> {
-    // No sybil policy field on ContextParams yet — pass unconditionally.
-    // When ContextParams gains a `sybil_policy: Option<ContextSybilPolicy>`
-    // field, this function should evaluate against it using real signals
-    // from the trust layer.
-    tracing::trace!(
-        member = %member_did,
-        "sybil resistance check: no policy configured, passing"
-    );
-    Ok(())
+    let Some(policy) = &ctx.handle.params().sybil_policy else {
+        tracing::trace!(
+            member = %member_did,
+            "sybil resistance check: no policy configured, passing"
+        );
+        return Ok(());
+    };
+
+    // Build an assessment from available trust signals. At the ContextManager
+    // layer we do not yet have access to external signal providers, so the
+    // signal map is empty. Contexts requiring real signals will correctly
+    // reject until signal providers are wired.
+    let signals = HashMap::new();
+    let assessment =
+        scp_protocol::trust::sybil::IdentityDepthAssessment::new(member_did.clone(), signals, now);
+
+    scp_protocol::trust::sybil::evaluate_sybil_resistance(&assessment, policy, now, None)
+        .map_err(|e| ContextError::PermissionDenied(format!("sybil resistance check failed: {e}")))
 }
 
 /// Initializes participation record and records budget spend for a new member (#1530, #1537).

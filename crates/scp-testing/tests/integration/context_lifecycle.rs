@@ -180,6 +180,7 @@ async fn context_params_all_fields() {
         min_protocol_version: None,
         migration_source: None,
         consequence_rules: Vec::new(),
+        sybil_policy: None,
     };
 
     assert_eq!(params.mode, ContextMode::Broadcast);

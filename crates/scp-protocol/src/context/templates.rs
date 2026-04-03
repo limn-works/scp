@@ -290,6 +290,7 @@ pub fn template_params(template_id: &TemplateId) -> ContextParams {
             min_protocol_version: None,
             migration_source: None,
             consequence_rules: Vec::new(),
+            sybil_policy: None,
         },
         TemplateId::BilateralPersistent => ContextParams {
             mode: ContextMode::Encrypted,
@@ -315,6 +316,7 @@ pub fn template_params(template_id: &TemplateId) -> ContextParams {
             min_protocol_version: None,
             migration_source: None,
             consequence_rules: Vec::new(),
+            sybil_policy: None,
         },
         TemplateId::Coordination => ContextParams {
             mode: ContextMode::Encrypted,
@@ -340,6 +342,7 @@ pub fn template_params(template_id: &TemplateId) -> ContextParams {
             min_protocol_version: None,
             migration_source: None,
             consequence_rules: Vec::new(),
+            sybil_policy: None,
         },
         TemplateId::GroupDiscussion => ContextParams {
             mode: ContextMode::Encrypted,
@@ -365,6 +368,7 @@ pub fn template_params(template_id: &TemplateId) -> ContextParams {
             min_protocol_version: None,
             migration_source: None,
             consequence_rules: Vec::new(),
+            sybil_policy: None,
         },
         TemplateId::PublicBroadcast => ContextParams {
             mode: ContextMode::Broadcast,
@@ -393,6 +397,7 @@ pub fn template_params(template_id: &TemplateId) -> ContextParams {
             min_protocol_version: None,
             migration_source: None,
             consequence_rules: Vec::new(),
+            sybil_policy: None,
         },
         TemplateId::GatedBroadcast => ContextParams {
             mode: ContextMode::Broadcast,
@@ -421,6 +426,7 @@ pub fn template_params(template_id: &TemplateId) -> ContextParams {
             min_protocol_version: None,
             migration_source: None,
             consequence_rules: Vec::new(),
+            sybil_policy: None,
         },
         TemplateId::ToolInterfaceTemplate => ContextParams {
             mode: ContextMode::Encrypted,
@@ -446,6 +452,7 @@ pub fn template_params(template_id: &TemplateId) -> ContextParams {
             min_protocol_version: None,
             migration_source: None,
             consequence_rules: Vec::new(),
+            sybil_policy: None,
         },
         // Extends scp:template/tool-interface -- same ceiling and governance,
         // but economic_policy is caller-provided and validated separately.
@@ -473,6 +480,7 @@ pub fn template_params(template_id: &TemplateId) -> ContextParams {
             min_protocol_version: None,
             migration_source: None,
             consequence_rules: Vec::new(),
+            sybil_policy: None,
         },
         // Extends scp:template/gated-broadcast -- broadcast mode with gated
         // subscriber admission. economic_policy is caller-provided.
@@ -503,6 +511,7 @@ pub fn template_params(template_id: &TemplateId) -> ContextParams {
             min_protocol_version: None,
             migration_source: None,
             consequence_rules: Vec::new(),
+            sybil_policy: None,
         },
         // Context: encrypted mode with messaging + tool invocation
         // ceiling. Discoverable by default so it can be found via DHT. Used
@@ -531,6 +540,7 @@ pub fn template_params(template_id: &TemplateId) -> ContextParams {
             min_protocol_version: None,
             migration_source: None,
             consequence_rules: Vec::new(),
+            sybil_policy: None,
         },
     }
 }
