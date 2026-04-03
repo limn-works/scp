@@ -1706,7 +1706,7 @@ async fn revoke_write_access_full_in_broadcast() {
     assert!(ctx.membership.contains("did:key:alice"));
 }
 
-/// SCP-CAC-007: `Revoke (write)(FutureOnly)` does NOT destroy broadcast key.
+/// SCP-CAC-007: `Revoke { access: AccessScope::Write }` does NOT destroy broadcast key.
 #[tokio::test]
 async fn revoke_write_access_future_only_no_key_destruction() {
     let (manager, ctx_id) = setup_broadcast_with_member_ban().await;
@@ -1732,7 +1732,7 @@ async fn revoke_write_access_future_only_no_key_destruction() {
     let result = manager.execute_governance_action(&ctx_id, &proposal).await;
     assert!(
         result.is_ok(),
-        "Revoke (write)(FutureOnly) should succeed"
+        "Revoke (write, FutureOnly) should succeed"
     );
 
     // Alice should be in suspended_capabilities.
@@ -1744,11 +1744,11 @@ async fn revoke_write_access_future_only_no_key_destruction() {
             .get("did:key:alice")
             .is_some_and(|s| s.contains(&Capability::MessagesWrite))
     );
-    // In FutureOnly mode, broadcast author should still exist (key not destroyed).
+    // In write-only scope, broadcast author should still exist (key not destroyed).
     let bc = ctx.broadcast_context.as_ref().unwrap();
     assert!(
         bc.is_author("did:key:alice"),
-        "FutureOnly should NOT destroy broadcast keys"
+        "AccessScope::Write should NOT destroy broadcast keys"
     );
 }
 
