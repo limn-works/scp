@@ -668,7 +668,7 @@ pub fn remove_ffi_state(context_id: &str) {
 /// `ContextManager`.
 ///
 /// Must be called after any governance action that modifies role state
-/// (`ChangeRole`, `ModifyCeiling`, `AddMember`, `RemoveMember`, etc.) so that the
+/// (`ChangeRole`, `ModifyCeiling`, `AddMember`, `Eject`, etc.) so that the
 /// FFI-side copy used by UCAN/tool capability checks stays current.
 ///
 /// # Errors

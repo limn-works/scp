@@ -6969,7 +6969,7 @@ pub async fn governance_execute(
             use scp_core::context::manager::GovernanceActionResult;
             let result_str = match result {
                 GovernanceActionResult::MemberAdded => "MemberAdded",
-                GovernanceActionResult::MemberRemoved => "MemberRemoved",
+                GovernanceActionResult::MemberEjected => "MemberEjected",
                 GovernanceActionResult::RoleChanged => "RoleChanged",
                 GovernanceActionResult::ToolRegistered => "ToolRegistered",
                 GovernanceActionResult::ToolRemoved => "ToolRemoved",
@@ -6986,13 +6986,11 @@ pub async fn governance_execute(
                 GovernanceActionResult::MemberReset => "MemberReset",
                 GovernanceActionResult::ConflictResolved => "ConflictResolved",
                 GovernanceActionResult::ContextPromoted => "ContextPromoted",
-                GovernanceActionResult::ReadAccessRevoked(_) => "ReadAccessRevoked",
-                GovernanceActionResult::ReadAccessRestored(_) => "ReadAccessRestored",
-                GovernanceActionResult::WriteAccessRevoked(_) => "WriteAccessRevoked",
-                GovernanceActionResult::WriteAccessRestored(_) => "WriteAccessRestored",
+                GovernanceActionResult::MemberSuspended(_) => "MemberSuspended",
+                GovernanceActionResult::AccessRevoked(_) => "AccessRevoked",
+                GovernanceActionResult::AccessRestored(_) => "AccessRestored",
                 GovernanceActionResult::ContentKeysRotated(_) => "ContentKeysRotated",
                 GovernanceActionResult::GovernanceReconfigured(_) => "GovernanceReconfigured",
-                GovernanceActionResult::AuthorBlocked(_) => "AuthorBlocked",
                 GovernanceActionResult::SubscriberBanned(_) => "SubscriberBanned",
                 GovernanceActionResult::SubscriberUnbanned { .. } => "SubscriberUnbanned",
                 GovernanceActionResult::Executed => "Executed",
@@ -14096,7 +14094,7 @@ mod tests {
     /// when parsed from JSON (mirrors the `UniFFI` bridge param flow).
     #[test]
     fn consequence_rules_in_context_params_via_json() {
-        let json = r#"[{"trigger":"MessageVelocity","action":"AccessRevocation","threshold":10,"window":{"secs":3600,"nanos":0}}]"#;
+        let json = r#"[{"trigger":"MessageVelocity","action":"SuspendAll","threshold":10,"window":{"secs":3600,"nanos":0}}]"#;
         let rules: Vec<scp_core::trust::ConsequenceRule> = serde_json::from_str(json).unwrap();
 
         let params = scp_core::context::ContextParams {
