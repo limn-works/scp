@@ -39,7 +39,7 @@ use scp_event_log::{DID, Event, EventLog, EventPayload, EventType};
 
 use scp_protocol::context::broadcast::{BroadcastAdmission, BroadcastContext};
 use scp_protocol::context::governance::{
-    ConflictResolution, GovernanceAction, GovernanceProposal, ProposalStatus, RevocationScope,
+    AccessScope, ConflictResolution, GovernanceAction, GovernanceProposal, ProposalStatus,
     SignedVote, VoteType,
 };
 use scp_protocol::context::membership::ContextEvent;
@@ -209,10 +209,9 @@ struct PerContextState {
     /// Executed proposal IDs with insertion timestamps (replay protection).
     /// Evicts entries older than [`WASM_PROPOSAL_TTL_MS`] when exceeding [`WASM_PROPOSAL_CAP`].
     executed_proposals: HashMap<String, f64>,
-    /// Write-revoked member DIDs (§9.17, ADR-038).
-    write_revoked_members: HashSet<String>,
-    /// Read-revoked member DIDs (ADR-038, §9.17).
-    read_revoked_members: HashSet<String>,
+    /// Suspended capabilities per member DID (replaces `write_revoked_members` / `read_revoked_members`).
+    /// Key: member DID, Value: set of suspended capability strings (e.g. "messages:write").
+    suspended_capabilities: HashMap<String, HashSet<String>>,
     /// Members excluded from future CEK wrapping (`FutureOnly` read revocation).
     read_exclusion_list: HashSet<String>,
     /// Broadcast context state (only for Broadcast mode).
@@ -850,8 +849,7 @@ impl WasmContextManager {
             members,
             event_buffer: VecDeque::new(),
             executed_proposals: HashMap::new(),
-            write_revoked_members: HashSet::new(),
-            read_revoked_members: HashSet::new(),
+            suspended_capabilities: HashMap::new(),
             read_exclusion_list: HashSet::new(),
             broadcast_context,
             sessions: HashMap::new(),
@@ -982,10 +980,14 @@ impl WasmContextManager {
     ) -> Result<(), ScpWasmError> {
         let ctx = self.require_active_context_mut(context_id)?;
 
-        // Check write revocation (§9.17, ADR-038).
-        if ctx.write_revoked_members.contains(sender_did) {
+        // Check write suspension.
+        if ctx
+            .suspended_capabilities
+            .get(sender_did)
+            .is_some_and(|caps| caps.contains("messages:write"))
+        {
             return Err(ScpWasmError::Permission {
-                message: format!("write access has been revoked for {sender_did}"),
+                message: format!("write access has been suspended for {sender_did}"),
                 code: "SCP-PERM-3000".to_owned(),
             });
         }
@@ -1995,14 +1997,13 @@ impl WasmContextManager {
     /// matching `member_has_capability` and the ceiling strings.
     fn required_capability_for_action(action: &GovernanceAction) -> &'static str {
         match action {
-            GovernanceAction::AddMember { .. }
-            | GovernanceAction::RestoreWriteAccess { .. }
-            | GovernanceAction::RestoreReadAccess { .. } => "member:invite",
+            GovernanceAction::AddMember { .. } | GovernanceAction::RestoreAccess { .. } => {
+                "member:invite"
+            }
 
-            GovernanceAction::RemoveMember { .. }
-            | GovernanceAction::RevokeWriteAccess { .. }
-            | GovernanceAction::BlockAuthor { .. }
-            | GovernanceAction::RevokeReadAccess { .. }
+            GovernanceAction::Eject { .. }
+            | GovernanceAction::SuspendMember { .. }
+            | GovernanceAction::Revoke { .. }
             | GovernanceAction::ResetMember { .. } => "member:remove",
 
             GovernanceAction::ChangeRole { .. } => "role:assign",
@@ -2138,8 +2139,8 @@ impl WasmContextManager {
             GovernanceAction::AddMember { did, role } => {
                 self.dispatch_add_member(context_id, did, role)
             }
-            GovernanceAction::RemoveMember { did, .. } => {
-                self.dispatch_remove_member(context_id, did)
+            GovernanceAction::Eject { did, .. } => {
+                self.dispatch_eject(context_id, did)
             }
             GovernanceAction::ChangeRole { did, new_role } => {
                 let ctx = self.require_active_context_mut(context_id)?;
@@ -2203,12 +2204,10 @@ impl WasmContextManager {
                 }
                 Ok(serde_json::json!({"action": "ExtendTtl", "additionalSecs": additional_secs}))
             }
-            GovernanceAction::TransferAdmin { .. } // 22 remaining: exhaustive, no wildcard
-            | GovernanceAction::RevokeWriteAccess { .. }
-            | GovernanceAction::RestoreWriteAccess { .. }
-            | GovernanceAction::BlockAuthor { .. }
-            | GovernanceAction::RevokeReadAccess { .. }
-            | GovernanceAction::RestoreReadAccess { .. }
+            GovernanceAction::TransferAdmin { .. } // remaining: exhaustive, no wildcard
+            | GovernanceAction::SuspendMember { .. }
+            | GovernanceAction::Revoke { .. }
+            | GovernanceAction::RestoreAccess { .. }
             | GovernanceAction::PromoteContext
             | GovernanceAction::CreateChildContext { .. }
             | GovernanceAction::ModifyPruningPolicy { .. }
@@ -2270,10 +2269,10 @@ impl WasmContextManager {
         Ok(serde_json::json!({"action": "AddMember", "did": did}))
     }
 
-    /// Handles `RemoveMember` governance action: removes the member and, for
-    /// broadcast contexts, cleans up author state when the removed member had
+    /// Handles `Eject` governance action: removes the member and, for
+    /// broadcast contexts, cleans up author state when the ejected member had
     /// the "author" role.
-    fn dispatch_remove_member(
+    fn dispatch_eject(
         &mut self,
         context_id: &str,
         did: &str,
@@ -2286,7 +2285,7 @@ impl WasmContextManager {
                 message: format!("member '{did}' not found"),
                 code: "SCP-CTX-2015".to_owned(),
             })?;
-        // If the removed member was an author in a broadcast context,
+        // If the ejected member was an author in a broadcast context,
         // clean up their broadcast state (destroys broadcast key).
         if removed.role == "author"
             && let Some(ref mut bc) = ctx.broadcast_context
@@ -2296,7 +2295,7 @@ impl WasmContextManager {
         ctx.push_event(ContextEvent::MemberLeft {
             member_did: DID(did.to_owned()),
         });
-        Ok(serde_json::json!({"action": "RemoveMember", "did": did}))
+        Ok(serde_json::json!({"action": "Eject", "did": did}))
     }
 
     /// Handles governance actions that don't fit in the primary dispatch.
@@ -2319,72 +2318,55 @@ impl WasmContextManager {
                 new_admin_str.clone_into(&mut ctx.creator_did);
                 Ok(serde_json::json!({"action": "TransferAdmin", "newAdmin": new_admin_str}))
             }
-            GovernanceAction::RevokeWriteAccess { did, scope } => {
+            GovernanceAction::SuspendMember { did, capabilities } => {
                 let did_str: &str = did;
-                let scope_str = format!("{scope:?}");
                 let ctx = self.require_active_context_mut(context_id)?;
-                // For Full scope in broadcast contexts, destroy the author's
-                // broadcast key (matching scp-core SCP-CAC-007).
-                if matches!(
-                    scope,
-                    scp_protocol::context::governance::RevocationScope::Full
-                ) && let Some(ref mut bc) = ctx.broadcast_context
+                let entry = ctx
+                    .suspended_capabilities
+                    .entry(did_str.to_owned())
+                    .or_default();
+                for cap in capabilities {
+                    entry.insert(Self::capability_to_ucan_format(&cap.name()));
+                }
+                // Emit WriteAccessRevoked if write was suspended.
+                if capabilities
+                    .iter()
+                    .any(|c| matches!(c, scp_protocol::context::roles::Capability::MessagesWrite))
                 {
-                    let _ = bc.block_author(did_str);
+                    ctx.push_event(ContextEvent::WriteAccessRevoked { did: did.clone() });
                 }
-                ctx.write_revoked_members.insert(did_str.to_owned());
-                ctx.push_event(ContextEvent::WriteAccessRevoked { did: did.clone() });
-                Ok(
-                    serde_json::json!({"action": "RevokeWriteAccess", "did": did_str, "scope": scope_str}),
-                )
+                if capabilities
+                    .iter()
+                    .any(|c| matches!(c, scp_protocol::context::roles::Capability::MessagesRead))
+                {
+                    ctx.push_event(ContextEvent::ReadAccessRevoked { did: did.clone() });
+                }
+                Ok(serde_json::json!({"action": "SuspendMember", "did": did_str}))
             }
-            GovernanceAction::RestoreWriteAccess { did } => {
+            GovernanceAction::Revoke { did, access } => {
+                self.dispatch_revoke(context_id, did, *access)
+            }
+            GovernanceAction::RestoreAccess { did, capabilities } => {
                 let did_str: &str = did;
                 let ctx = self.require_active_context_mut(context_id)?;
-                if !ctx.write_revoked_members.remove(did_str) {
-                    return Err(ScpWasmError::Context {
-                        message: format!("write access not revoked for {did}"),
-                        code: "SCP-CTX-2001".to_owned(),
-                    });
-                }
-                Ok(serde_json::json!({"action": "RestoreWriteAccess", "did": did_str}))
-            }
-            GovernanceAction::BlockAuthor { did, reason } => {
-                // CAC-008: BlockAuthor delegates to RevokeWriteAccess(Full).
-                // Destroy the author's broadcast key and mark write-revoked.
-                let did_str: &str = did;
-                let ctx = self.require_active_context_mut(context_id)?;
-                if let Some(ref mut bc) = ctx.broadcast_context {
-                    let _ = bc.block_author(did_str);
-                }
-                ctx.write_revoked_members.insert(did_str.to_owned());
-                ctx.push_event(ContextEvent::WriteAccessRevoked { did: did.clone() });
-                Ok(
-                    serde_json::json!({"action": "WriteAccessRevoked", "did": did_str, "scope": "full", "reason": reason}),
-                )
-            }
-            GovernanceAction::RevokeReadAccess { did, scope } => {
-                self.dispatch_revoke_read_access(context_id, did, *scope)
-            }
-            GovernanceAction::RestoreReadAccess { did } => {
-                let did_str: &str = did;
-                let ctx = self.require_active_context_mut(context_id)?;
-                if !ctx.read_revoked_members.remove(did_str) {
-                    return Err(ScpWasmError::Context {
-                        message: format!("read access not revoked for {did}"),
-                        code: "SCP-CTX-2001".to_owned(),
-                    });
+                if let Some(entry) = ctx.suspended_capabilities.get_mut(did_str) {
+                    for cap in capabilities {
+                        entry.remove(&Self::capability_to_ucan_format(&cap.name()));
+                    }
+                    if entry.is_empty() {
+                        ctx.suspended_capabilities.remove(did_str);
+                    }
                 }
                 ctx.read_exclusion_list.remove(did_str);
                 if let Some(bc) = ctx.broadcast_context.as_mut() {
                     // Governance unban: remove from ALL authors' block lists (§5.14.8).
                     bc.governance_unban_subscriber(did_str);
                 }
-                Ok(serde_json::json!({"action": "RestoreReadAccess", "did": did_str}))
+                Ok(serde_json::json!({"action": "RestoreAccess", "did": did_str}))
             }
             // 8 variants handled by upstream dispatch method (exhaustive, no wildcard).
             GovernanceAction::AddMember { .. }
-            | GovernanceAction::RemoveMember { .. }
+            | GovernanceAction::Eject { .. }
             | GovernanceAction::ChangeRole { .. }
             | GovernanceAction::RegisterTool { .. }
             | GovernanceAction::RemoveTool { .. }
@@ -2413,20 +2395,20 @@ impl WasmContextManager {
         }
     }
 
-    /// Handles `RevokeReadAccess` governance action (§5.14.8).
+    /// Handles `Revoke` governance action (§5.14.8).
     ///
     /// Extracted from `dispatch_governance_action_ext` to stay within the
     /// line limit. Governance ban: removes from subscriber registry, adds to
     /// all authors' block lists, increments all authors' key epochs, and
     /// emits `ContentKeysRotated` events.
-    fn dispatch_revoke_read_access(
+    fn dispatch_revoke(
         &mut self,
         context_id: &str,
         did: &DID,
-        scope: RevocationScope,
+        access: AccessScope,
     ) -> Result<serde_json::Value, ScpWasmError> {
         let did_str: &str = did;
-        let scope_str = format!("{scope:?}");
+        let access_str = format!("{access:?}");
         let ctx = self.require_active_context_mut(context_id)?;
 
         // Pre-validate: check ALL authors' block lists before any mutation.
@@ -2448,26 +2430,55 @@ impl WasmContextManager {
             }
         }
 
-        // All caps validated — now commit mutations atomically.
-        ctx.read_revoked_members.insert(did_str.to_owned());
-        let mut key_rotated = false;
-        if let Some(bc) = ctx.broadcast_context.as_mut() {
-            // governance_ban_subscriber handles: remove from subscriber roster,
-            // add to ALL authors' block lists, rotate ALL authors' keys, and
-            // increment ALL epochs (§5.14.8 steps 2-4).
-            if let Ok(ban_result) = bc.governance_ban_subscriber(did_str, scope) {
-                key_rotated = !ban_result.rotated_authors.is_empty();
+        // Suspend capabilities based on access scope.
+        {
+            let entry = ctx
+                .suspended_capabilities
+                .entry(did_str.to_owned())
+                .or_default();
+            match access {
+                AccessScope::Read => {
+                    entry.insert("messages:read".to_owned());
+                }
+                AccessScope::Write => {
+                    entry.insert("messages:write".to_owned());
+                }
+                AccessScope::Both => {
+                    entry.insert("messages:read".to_owned());
+                    entry.insert("messages:write".to_owned());
+                }
             }
-            // Subscriber not in roster — still add to block lists and revoke.
-            // Fall through: read_revoked_members already inserted above.
         }
+
+        // For write revocation, destroy broadcast key in Full scope.
+        if matches!(access, AccessScope::Write | AccessScope::Both) {
+            if let Some(ref mut bc) = ctx.broadcast_context {
+                let _ = bc.block_author(did_str);
+            }
+            ctx.push_event(ContextEvent::WriteAccessRevoked { did: did.clone() });
+        }
+
+        // For read revocation, perform governance ban.
+        let mut key_rotated = false;
+        if matches!(access, AccessScope::Read | AccessScope::Both) {
+            if let Some(bc) = ctx.broadcast_context.as_mut() {
+                // governance_ban_subscriber handles: remove from subscriber roster,
+                // add to ALL authors' block lists, rotate ALL authors' keys, and
+                // increment ALL epochs (§5.14.8 steps 2-4).
+                if let Ok(ban_result) = bc.governance_ban_subscriber(did_str, access) {
+                    key_rotated = !ban_result.rotated_authors.is_empty();
+                }
+            }
+            ctx.push_event(ContextEvent::ReadAccessRevoked { did: did.clone() });
+        }
+
         // Emit ContentKeysRotated if any author keys were rotated (§5.14.8 step 4).
         if key_rotated {
             ctx.push_event(ContextEvent::ContentKeysRotated {
-                reason: Some(format!("RevokeReadAccess for {did}")),
+                reason: Some(format!("Revoke for {did}")),
             });
         }
-        Ok(serde_json::json!({"action": "RevokeReadAccess", "did": did_str, "scope": scope_str}))
+        Ok(serde_json::json!({"action": "Revoke", "did": did_str, "access": access_str}))
     }
 
     /// Handles structural, threshold, and economic governance actions.
@@ -2544,7 +2555,7 @@ impl WasmContextManager {
                 Ok(serde_json::json!({"action": "ModifyThreshold", "newThreshold": new_threshold}))
             }
             GovernanceAction::AddMember { .. } // 14 upstream (exhaustive, no wildcard)
-            | GovernanceAction::RemoveMember { .. }
+            | GovernanceAction::Eject { .. }
             | GovernanceAction::ChangeRole { .. }
             | GovernanceAction::RegisterTool { .. }
             | GovernanceAction::RemoveTool { .. }
@@ -2552,11 +2563,9 @@ impl WasmContextManager {
             | GovernanceAction::CloseContext { .. }
             | GovernanceAction::ExtendTtl { .. }
             | GovernanceAction::TransferAdmin { .. }
-            | GovernanceAction::RevokeWriteAccess { .. }
-            | GovernanceAction::RestoreWriteAccess { .. }
-            | GovernanceAction::BlockAuthor { .. }
-            | GovernanceAction::RevokeReadAccess { .. }
-            | GovernanceAction::RestoreReadAccess { .. } => unreachable!(),
+            | GovernanceAction::SuspendMember { .. }
+            | GovernanceAction::Revoke { .. }
+            | GovernanceAction::RestoreAccess { .. } => unreachable!(),
             GovernanceAction::EstablishToolInterface { .. } // 10 downstream
             | GovernanceAction::ResetMember { .. }
             | GovernanceAction::ResolveConflict { .. }
@@ -2643,9 +2652,9 @@ impl WasmContextManager {
                 let _ = self.require_active_context_mut(context_id)?;
                 Ok(serde_json::json!({"action": "CancelContextMigration"}))
             }
-            // 20 variants handled by upstream dispatch methods (exhaustive, no wildcard).
+            // 18 variants handled by upstream dispatch methods (exhaustive, no wildcard).
             GovernanceAction::AddMember { .. }
-            | GovernanceAction::RemoveMember { .. }
+            | GovernanceAction::Eject { .. }
             | GovernanceAction::ChangeRole { .. }
             | GovernanceAction::RegisterTool { .. }
             | GovernanceAction::RemoveTool { .. }
@@ -2653,11 +2662,9 @@ impl WasmContextManager {
             | GovernanceAction::CloseContext { .. }
             | GovernanceAction::ExtendTtl { .. }
             | GovernanceAction::TransferAdmin { .. }
-            | GovernanceAction::RevokeWriteAccess { .. }
-            | GovernanceAction::RestoreWriteAccess { .. }
-            | GovernanceAction::BlockAuthor { .. }
-            | GovernanceAction::RevokeReadAccess { .. }
-            | GovernanceAction::RestoreReadAccess { .. }
+            | GovernanceAction::SuspendMember { .. }
+            | GovernanceAction::Revoke { .. }
+            | GovernanceAction::RestoreAccess { .. }
             | GovernanceAction::PromoteContext
             | GovernanceAction::CreateChildContext { .. }
             | GovernanceAction::ModifyPruningPolicy { .. }
@@ -2730,9 +2737,9 @@ impl WasmContextManager {
                 ctx.economic_policy_locked = true;
                 Ok(serde_json::json!({"action": "LockEconomicPolicy"}))
             }
-            // 27 variants handled by upstream dispatch methods (exhaustive, no wildcard).
+            // 25 variants handled by upstream dispatch methods (exhaustive, no wildcard).
             GovernanceAction::AddMember { .. }
-            | GovernanceAction::RemoveMember { .. }
+            | GovernanceAction::Eject { .. }
             | GovernanceAction::ChangeRole { .. }
             | GovernanceAction::RegisterTool { .. }
             | GovernanceAction::RemoveTool { .. }
@@ -2740,11 +2747,9 @@ impl WasmContextManager {
             | GovernanceAction::CloseContext { .. }
             | GovernanceAction::ExtendTtl { .. }
             | GovernanceAction::TransferAdmin { .. }
-            | GovernanceAction::RevokeWriteAccess { .. }
-            | GovernanceAction::RestoreWriteAccess { .. }
-            | GovernanceAction::BlockAuthor { .. }
-            | GovernanceAction::RevokeReadAccess { .. }
-            | GovernanceAction::RestoreReadAccess { .. }
+            | GovernanceAction::SuspendMember { .. }
+            | GovernanceAction::Revoke { .. }
+            | GovernanceAction::RestoreAccess { .. }
             | GovernanceAction::PromoteContext
             | GovernanceAction::CreateChildContext { .. }
             | GovernanceAction::ModifyPruningPolicy { .. }
@@ -3550,9 +3555,13 @@ impl WasmContextManager {
     ) -> Result<(), ScpWasmError> {
         let ctx = self.require_active_context_mut(context_id)?;
 
-        if ctx.write_revoked_members.contains(author_did) {
+        if ctx
+            .suspended_capabilities
+            .get(author_did)
+            .is_some_and(|caps| caps.contains("messages:write"))
+        {
             return Err(ScpWasmError::Permission {
-                message: format!("write access has been revoked for {author_did}"),
+                message: format!("write access has been suspended for {author_did}"),
                 code: "SCP-PERM-3000".to_owned(),
             });
         }
@@ -4392,8 +4401,11 @@ impl WasmContextManager {
             governance: ctx.governance.clone(),
             economic_policy: ctx.economic_policy.clone(),
             members,
-            write_revoked_members: ctx.write_revoked_members.iter().cloned().collect(),
-            read_revoked_members: ctx.read_revoked_members.iter().cloned().collect(),
+            suspended_capabilities: ctx
+                .suspended_capabilities
+                .iter()
+                .map(|(k, v)| (k.clone(), v.iter().cloned().collect()))
+                .collect(),
             read_exclusion_list: ctx.read_exclusion_list.iter().cloned().collect(),
             broadcast,
             revoked_tokens: ctx.revoked_tokens.iter().cloned().collect(),
@@ -4631,8 +4643,11 @@ impl WasmContextManager {
             members,
             event_buffer: VecDeque::new(),
             executed_proposals: HashMap::new(),
-            write_revoked_members: snap.write_revoked_members.iter().cloned().collect(),
-            read_revoked_members: snap.read_revoked_members.iter().cloned().collect(),
+            suspended_capabilities: snap
+                .suspended_capabilities
+                .iter()
+                .map(|(k, v)| (k.clone(), v.iter().cloned().collect()))
+                .collect(),
             read_exclusion_list: snap.read_exclusion_list.iter().cloned().collect(),
             broadcast_context,
             sessions: HashMap::new(),
@@ -4896,8 +4911,9 @@ struct WasmContextExportSnapshot {
     governance: String,
     economic_policy: Option<String>,
     members: Vec<WasmExportMember>,
-    write_revoked_members: Vec<String>,
-    read_revoked_members: Vec<String>,
+    /// Suspended capabilities per member DID.
+    #[serde(default)]
+    suspended_capabilities: HashMap<String, Vec<String>>,
     read_exclusion_list: Vec<String>,
     broadcast: Option<WasmExportBroadcast>,
     /// UCAN revocation CIDs. Preserves revocation state across export/import
@@ -4997,8 +5013,8 @@ mod tests {
     }
 
     #[test]
-    fn serde_roundtrip_remove_member() {
-        roundtrip(&GovernanceAction::RemoveMember {
+    fn serde_roundtrip_eject() {
+        roundtrip(&GovernanceAction::Eject {
             did: DID("did:dht:z123".to_owned()),
             reason: Some("inactive".to_owned()),
         });
@@ -5167,17 +5183,18 @@ mod tests {
     }
 
     #[test]
-    fn serde_roundtrip_revoke_write_access() {
-        roundtrip(&GovernanceAction::RevokeWriteAccess {
+    fn serde_roundtrip_suspend_member() {
+        roundtrip(&GovernanceAction::SuspendMember {
             did: DID("did:dht:z123".to_owned()),
-            scope: RevocationScope::Full,
+            capabilities: vec![Capability::MessagesWrite],
         });
     }
 
     #[test]
-    fn serde_roundtrip_restore_write_access() {
-        roundtrip(&GovernanceAction::RestoreWriteAccess {
+    fn serde_roundtrip_revoke() {
+        roundtrip(&GovernanceAction::Revoke {
             did: DID("did:dht:z123".to_owned()),
+            access: AccessScope::Both,
         });
     }
 
@@ -5204,25 +5221,10 @@ mod tests {
     }
 
     #[test]
-    fn serde_roundtrip_block_author() {
-        roundtrip(&GovernanceAction::BlockAuthor {
-            did: DID("did:dht:zauthor".to_owned()),
-            reason: Some("spam".to_owned()),
-        });
-    }
-
-    #[test]
-    fn serde_roundtrip_revoke_read_access() {
-        roundtrip(&GovernanceAction::RevokeReadAccess {
+    fn serde_roundtrip_restore_access() {
+        roundtrip(&GovernanceAction::RestoreAccess {
             did: DID("did:dht:z123".to_owned()),
-            scope: RevocationScope::FutureOnly,
-        });
-    }
-
-    #[test]
-    fn serde_roundtrip_restore_read_access() {
-        roundtrip(&GovernanceAction::RestoreReadAccess {
-            did: DID("did:dht:z123".to_owned()),
+            capabilities: vec![Capability::MessagesRead, Capability::MessagesWrite],
         });
     }
 
@@ -5289,14 +5291,14 @@ mod tests {
     // Variant count exhaustiveness
     // -----------------------------------------------------------------------
 
-    /// Builds all 30 `GovernanceAction` variants for exhaustive testing.
+    /// Builds all 28 `GovernanceAction` variants for exhaustive testing.
     ///
     /// Uses JSON deserialization to construct complex inner types (`ContextParams`,
     /// `ToolRegistration`, etc.) rather than manual struct construction.
     fn all_wasm_governance_actions() -> Vec<GovernanceAction> {
         let json_actions: Vec<serde_json::Value> = vec![
             serde_json::json!({"AddMember": {"did": "d", "role": "r"}}),
-            serde_json::json!({"RemoveMember": {"did": "d", "reason": null}}),
+            serde_json::json!({"Eject": {"did": "d", "reason": null}}),
             serde_json::json!({"ChangeRole": {"did": "d", "new_role": "r"}}),
             serde_json::json!({"RegisterTool": {"registration": {
                 "tool_id": "t", "name": "n", "description": "d",
@@ -5335,17 +5337,15 @@ mod tests {
                 "resolution": "InvalidateBoth"
             }}),
             serde_json::json!("PromoteContext"),
-            serde_json::json!({"RevokeWriteAccess": {"did": "d", "scope": "Full"}}),
-            serde_json::json!({"RestoreWriteAccess": {"did": "d"}}),
+            serde_json::json!({"SuspendMember": {"did": "d", "capabilities": ["MessagesWrite"]}}),
+            serde_json::json!({"Revoke": {"did": "d", "access": "Both"}}),
+            serde_json::json!({"RestoreAccess": {"did": "d", "capabilities": ["MessagesRead", "MessagesWrite"]}}),
             serde_json::json!({"RotateContentKeys": {"reason": null}}),
             serde_json::json!({"ReconfigureGovernance": {
                 "changes": [], "justification": {
                     "unavailable_dids": [], "missed_windows": [], "detected_at": 0
                 }
             }}),
-            serde_json::json!({"BlockAuthor": {"did": "d", "reason": null}}),
-            serde_json::json!({"RevokeReadAccess": {"did": "d", "scope": "FutureOnly"}}),
-            serde_json::json!({"RestoreReadAccess": {"did": "d"}}),
             serde_json::json!({"SetEconomicPolicy": {"policy": {
                 "locked": false,
                     "cost_schedule": {"currency": [85, 83, 68, 0], "per_message": null, "per_tool_invoke": null, "per_join": null, "per_period": null, "per_byte_stored": null},
@@ -5372,9 +5372,9 @@ mod tests {
     }
 
     #[test]
-    fn governance_action_has_30_variants() {
+    fn governance_action_has_28_variants() {
         let all = all_wasm_governance_actions();
-        assert_eq!(all.len(), 30, "expected 30 governance action variants");
+        assert_eq!(all.len(), 28, "expected 28 governance action variants");
 
         // Verify each variant serializes successfully (unit variants serialize
         // as strings, struct variants as objects — both are valid).
@@ -5558,7 +5558,7 @@ mod tests {
         let mut bc = make_broadcast(&["author-a", "author-b", "author-c"], &["sub1"]);
 
         // Governance ban: delegates to BroadcastContext
-        let _ = bc.governance_ban_subscriber("sub1", RevocationScope::Full);
+        let _ = bc.governance_ban_subscriber("sub1", AccessScope::Both);
 
         assert!(bc.is_blocked("author-a", "sub1"));
         assert!(bc.is_blocked("author-b", "sub1"));
@@ -5570,7 +5570,7 @@ mod tests {
         let mut bc = make_broadcast(&["author-a", "author-b"], &["sub1"]);
 
         // Ban first
-        let _ = bc.governance_ban_subscriber("sub1", RevocationScope::Full);
+        let _ = bc.governance_ban_subscriber("sub1", AccessScope::Both);
         assert!(bc.is_blocked("author-a", "sub1"));
         assert!(bc.is_blocked("author-b", "sub1"));
 
@@ -5674,7 +5674,7 @@ mod tests {
         let mut bc = make_broadcast(&["author-a", "author-b", "author-c"], &["sub1"]);
 
         // Governance ban (§5.14.8 steps 3-4) via BroadcastContext API
-        let _ = bc.governance_ban_subscriber("sub1", RevocationScope::Full);
+        let _ = bc.governance_ban_subscriber("sub1", AccessScope::Both);
 
         // All authors blocked sub1
         assert!(bc.is_blocked("author-a", "sub1"));
@@ -5696,7 +5696,7 @@ mod tests {
         assert_eq!(bc.get_author("author-a").map(|a| a.epoch), Some(1));
 
         // Now governance ban sub2 → all authors' epochs increment again
-        let _ = bc.governance_ban_subscriber("sub2", RevocationScope::Full);
+        let _ = bc.governance_ban_subscriber("sub2", AccessScope::Both);
 
         // author-a: was 1, now 2. author-b: was 0, now 1.
         assert_eq!(bc.get_author("author-a").map(|a| a.epoch), Some(2));
@@ -5756,8 +5756,7 @@ mod tests {
             members,
             event_buffer: VecDeque::new(),
             executed_proposals: HashMap::new(),
-            write_revoked_members: HashSet::new(),
-            read_revoked_members: HashSet::new(),
+            suspended_capabilities: HashMap::new(),
             read_exclusion_list: HashSet::new(),
             broadcast_context: Some(bc),
             sessions: HashMap::new(),
@@ -5801,10 +5800,10 @@ mod tests {
         // Call the real dispatch method — it should fail because author-a's
         // block list is at capacity (pre-validation rejects before any mutation).
         let err = mgr
-            .dispatch_revoke_read_access(
+            .dispatch_revoke(
                 "ctx-1",
                 &DID("did:dht:zbanned".to_owned()),
-                RevocationScope::Full,
+                AccessScope::Both,
             )
             .unwrap_err();
 
@@ -5866,8 +5865,7 @@ mod tests {
             members,
             event_buffer: VecDeque::new(),
             executed_proposals: HashMap::new(),
-            write_revoked_members: HashSet::new(),
-            read_revoked_members: HashSet::new(),
+            suspended_capabilities: HashMap::new(),
             read_exclusion_list: HashSet::new(),
             broadcast_context: None,
             sessions: HashMap::new(),
@@ -6001,11 +5999,7 @@ mod tests {
 
         // Banning an already-blocked DID when block lists are at capacity
         // must succeed — HashSet::insert is a no-op for existing entries.
-        let result = mgr.dispatch_revoke_read_access(
-            "ctx-1",
-            &DID(target_did.to_owned()),
-            RevocationScope::Full,
-        );
+        let result = mgr.dispatch_revoke("ctx-1", &DID(target_did.to_owned()), AccessScope::Both);
         assert!(
             result.is_ok(),
             "idempotent governance ban at capacity should succeed, got: {result:?}"

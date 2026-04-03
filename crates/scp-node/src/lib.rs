@@ -876,16 +876,16 @@ impl<S: Storage> ApplicationNode<S> {
     /// [`ProjectedContext`] key registry. If the context is not projected
     /// (not registered via `enable_broadcast_projection`), this is a no-op.
     ///
-    /// When the ban's `RevocationScope` is `Full`, old-epoch keys are
+    /// When the ban's `AccessScope` is `Both`, old-epoch keys are
     /// purged from the projection registry so historical content encrypted
-    /// under pre-ban keys is no longer served. `FutureOnly` retains old
-    /// keys (historical content remains accessible).
+    /// under pre-ban keys is no longer served. `Read` or `Write` scope
+    /// retains old keys (historical content remains accessible).
     pub async fn propagate_ban_keys(
         &self,
         context_id: &str,
         ban_result: &scp_core::context::broadcast::GovernanceBanResult,
     ) {
-        use scp_core::context::governance::RevocationScope;
+        use scp_core::context::governance::AccessScope;
 
         let routing_id = projection::compute_routing_id(context_id);
         let mut registry = self.state.projected_contexts.write().await;
@@ -895,11 +895,11 @@ impl<S: Storage> ApplicationNode<S> {
                 projected.insert_key(rotation.new_key.clone());
             }
 
-            // Full scope: retain only the new post-rotation keys, purging
+            // Both scope: retain only the new post-rotation keys, purging
             // all pre-ban keys so historical content is no longer
             // decryptable via projection. Uses retain_only_epochs to
             // correctly handle epoch-divergent multi-author contexts.
-            if ban_result.scope == RevocationScope::Full {
+            if ban_result.scope == AccessScope::Both {
                 let new_epochs: std::collections::HashSet<u64> = ban_result
                     .rotated_authors
                     .iter()

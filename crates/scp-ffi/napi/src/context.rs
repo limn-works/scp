@@ -3657,7 +3657,7 @@ mod tests {
         let rm = approved_proposal(
             [14u8; 32],
             &ctx_id,
-            GovernanceAction::RemoveMember {
+            GovernanceAction::Eject {
                 did: DID(target.to_owned()),
                 reason: Some("test removal".to_owned()),
             },
@@ -3756,7 +3756,7 @@ mod tests {
         use scp_core::context::ContextParams;
 
         // Parse a consequence rule from JSON (mirrors what the bridge does).
-        let json = r#"[{"trigger":"MessageVelocity","action":"AccessRevocation","threshold":10,"window":{"secs":3600,"nanos":0}}]"#;
+        let json = r#"[{"trigger":"MessageVelocity","action":"SuspendAll","threshold":10,"window":{"secs":3600,"nanos":0}}]"#;
         let rules: Vec<scp_core::trust::ConsequenceRule> = serde_json::from_str(json).unwrap();
 
         let params = ContextParams {

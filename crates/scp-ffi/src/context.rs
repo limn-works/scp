@@ -1923,7 +1923,7 @@ fn py_governance_execute(handle: &PyContextHandle, proposal_json: &str) -> PyRes
         use scp_core::context::manager::GovernanceActionResult;
         let result_str = match result {
             GovernanceActionResult::MemberAdded => "MemberAdded",
-            GovernanceActionResult::MemberRemoved => "MemberRemoved",
+            GovernanceActionResult::MemberEjected => "MemberEjected",
             GovernanceActionResult::RoleChanged => "RoleChanged",
             GovernanceActionResult::ToolRegistered => "ToolRegistered",
             GovernanceActionResult::ToolRemoved => "ToolRemoved",
@@ -1940,13 +1940,11 @@ fn py_governance_execute(handle: &PyContextHandle, proposal_json: &str) -> PyRes
             GovernanceActionResult::MemberReset => "MemberReset",
             GovernanceActionResult::ConflictResolved => "ConflictResolved",
             GovernanceActionResult::ContextPromoted => "ContextPromoted",
-            GovernanceActionResult::ReadAccessRevoked(_) => "ReadAccessRevoked",
-            GovernanceActionResult::ReadAccessRestored(_) => "ReadAccessRestored",
-            GovernanceActionResult::WriteAccessRevoked(_) => "WriteAccessRevoked",
-            GovernanceActionResult::WriteAccessRestored(_) => "WriteAccessRestored",
+            GovernanceActionResult::MemberSuspended(_) => "MemberSuspended",
+            GovernanceActionResult::AccessRevoked(_) => "AccessRevoked",
+            GovernanceActionResult::AccessRestored(_) => "AccessRestored",
             GovernanceActionResult::ContentKeysRotated(_) => "ContentKeysRotated",
             GovernanceActionResult::GovernanceReconfigured(_) => "GovernanceReconfigured",
-            GovernanceActionResult::AuthorBlocked(_) => "AuthorBlocked",
             GovernanceActionResult::SubscriberBanned(_) => "SubscriberBanned",
             GovernanceActionResult::SubscriberUnbanned { .. } => "SubscriberUnbanned",
             GovernanceActionResult::Executed => "Executed",
@@ -4791,7 +4789,7 @@ mod tests {
         let rm = approved_proposal(
             [5u8; 32],
             &ctx_id,
-            scp_core::context::governance::GovernanceAction::RemoveMember {
+            scp_core::context::governance::GovernanceAction::Eject {
                 did: scp_identity::DID(target.to_owned()),
                 reason: Some("test removal".to_owned()),
             },
@@ -4953,7 +4951,7 @@ mod tests {
 
     #[test]
     fn consequence_rules_in_context_params_accepted() {
-        let consequence_json = r#"[{"trigger":"MessageVelocity","action":"AccessRevocation","threshold":5,"window":{"secs":3600,"nanos":0}}]"#;
+        let consequence_json = r#"[{"trigger":"MessageVelocity","action":"SuspendAll","threshold":5,"window":{"secs":3600,"nanos":0}}]"#;
         let p = PyContextParams {
             consequence_rules: Some(consequence_json.to_owned()),
             ..default_params()

@@ -651,7 +651,7 @@ pub fn context_drain_events(handle: &WasmContextHandle) -> String {
 ///
 /// Authorization is enforced: the `initiator_did` must be a member with
 /// the capability required for the specific governance action. For example,
-/// `RemoveMember` requires `member_remove:*` (admin-only by default),
+/// `Eject` requires `member:remove` (admin-only by default),
 /// `ChangeRole` requires `role_assign:*`, etc.
 ///
 /// # Arguments
@@ -3079,7 +3079,7 @@ mod tests {
     fn pascal_camel_roundtrip() {
         let variants = [
             "AddMember",
-            "RemoveMember",
+            "Eject",
             "ChangeRole",
             "RegisterTool",
             "RemoveTool",
