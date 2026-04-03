@@ -38,9 +38,9 @@ async fn cac009_tier1_encrypted_block_unblock() {
         &"did:key:alice".into(),
         "cac009-enc",
         &"did:key:dave".into(),
-        GovernanceAction::RevokeReadAccess {
+        GovernanceAction::Revoke {
             did: "did:key:dave".into(),
-            scope: super::RevocationScope::Full,
+            access: super::AccessScope::Read,
         },
     );
     let result = manager
@@ -48,14 +48,14 @@ async fn cac009_tier1_encrypted_block_unblock() {
         .await;
     assert!(
         result.is_ok(),
-        "RevokeReadAccess should succeed: {result:?}"
+        "Revoke (read) should succeed: {result:?}"
     );
     {
         let contexts = manager.contexts.lock().await;
         let ctx = contexts.get("cac009-enc").unwrap();
         assert!(
             ctx.access
-                .read_revoked_members
+                .read_exclusion_list
                 .contains(&DID("did:key:dave".into())),
             "Dave should be read-revoked"
         );
@@ -74,8 +74,9 @@ async fn cac009_tier1_encrypted_block_unblock() {
         &"did:key:alice".into(),
         "cac009-enc",
         &"did:key:dave".into(),
-        GovernanceAction::RestoreReadAccess {
+        GovernanceAction::RestoreAccess {
             did: "did:key:dave".into(),
+            capabilities: vec![super::Capability::MessagesRead],
         },
     );
     let result = manager
@@ -83,14 +84,14 @@ async fn cac009_tier1_encrypted_block_unblock() {
         .await;
     assert!(
         result.is_ok(),
-        "RestoreReadAccess should succeed: {result:?}"
+        "RestoreAccess (read) should succeed: {result:?}"
     );
     {
         let contexts = manager.contexts.lock().await;
         let ctx = contexts.get("cac009-enc").unwrap();
         assert!(
             !ctx.access
-                .read_revoked_members
+                .read_exclusion_list
                 .contains(&DID("did:key:dave".into()))
         );
     }
@@ -143,9 +144,9 @@ async fn cac009_tier2_global_block_multiple_contexts() {
             &"did:key:alice".into(),
             ctx_id,
             &"did:key:eve".into(),
-            GovernanceAction::RevokeReadAccess {
+            GovernanceAction::Revoke {
                 did: "did:key:eve".into(),
-                scope: super::RevocationScope::Full,
+                access: super::AccessScope::Read,
             },
         );
         manager
@@ -161,7 +162,7 @@ async fn cac009_tier2_global_block_multiple_contexts() {
                     .get(*ctx_id)
                     .unwrap()
                     .access
-                    .read_revoked_members
+                    .read_exclusion_list
                     .contains(&DID("did:key:eve".into())),
                 "Eve read-revoked in {ctx_id}"
             );
@@ -172,8 +173,9 @@ async fn cac009_tier2_global_block_multiple_contexts() {
             &"did:key:alice".into(),
             ctx_id,
             &"did:key:eve".into(),
-            GovernanceAction::RestoreReadAccess {
+            GovernanceAction::RestoreAccess {
                 did: "did:key:eve".into(),
+                capabilities: vec![super::Capability::MessagesRead],
             },
         );
         manager
@@ -189,7 +191,7 @@ async fn cac009_tier2_global_block_multiple_contexts() {
                     .get(*ctx_id)
                     .unwrap()
                     .access
-                    .read_revoked_members
+                    .read_exclusion_list
                     .contains(&DID("did:key:eve".into())),
                 "Eve restored in {ctx_id}"
             );
@@ -216,9 +218,9 @@ async fn cac009_broadcast_governance_revoke_restore() {
         &"did:key:alice".into(),
         &ctx_id,
         &"did:key:bob".into(),
-        GovernanceAction::RevokeWriteAccess {
+        GovernanceAction::Revoke {
             did: "did:key:bob".into(),
-            scope: super::RevocationScope::Full,
+            access: super::AccessScope::Both,
         },
     );
     manager
@@ -259,8 +261,9 @@ async fn cac009_broadcast_governance_revoke_restore() {
         &"did:key:alice".into(),
         &ctx_id,
         &"did:key:bob".into(),
-        GovernanceAction::RestoreWriteAccess {
+        GovernanceAction::RestoreAccess {
             did: "did:key:bob".into(),
+            capabilities: vec![super::Capability::MessagesWrite],
         },
     );
     manager
@@ -292,9 +295,9 @@ async fn cac009_tier_stacking_both_must_reverse() {
         &"did:key:alice".into(),
         &ctx_id,
         &"did:key:bob".into(),
-        GovernanceAction::RevokeWriteAccess {
+        GovernanceAction::Revoke {
             did: "did:key:bob".into(),
-            scope: super::RevocationScope::Full,
+            access: super::AccessScope::Both,
         },
     );
     manager
@@ -305,9 +308,9 @@ async fn cac009_tier_stacking_both_must_reverse() {
         &"did:key:alice".into(),
         &ctx_id,
         &"did:key:bob".into(),
-        GovernanceAction::RevokeReadAccess {
+        GovernanceAction::Revoke {
             did: "did:key:bob".into(),
-            scope: super::RevocationScope::Full,
+            access: super::AccessScope::Read,
         },
     );
     manager
@@ -318,13 +321,14 @@ async fn cac009_tier_stacking_both_must_reverse() {
         let contexts = manager.contexts.lock().await;
         let ctx = contexts.get(&ctx_id).unwrap();
         assert!(
-            ctx.access
-                .write_revoked_members
-                .contains(&DID("did:key:bob".into()))
+            ctx.role_state
+                .suspended_capabilities
+                .get("did:key:bob")
+                .is_some_and(|s| s.contains(&Capability::MessagesWrite))
         );
         assert!(
             ctx.access
-                .read_revoked_members
+                .read_exclusion_list
                 .contains(&DID("did:key:bob".into()))
         );
     }
@@ -332,8 +336,9 @@ async fn cac009_tier_stacking_both_must_reverse() {
         &"did:key:alice".into(),
         &ctx_id,
         &"did:key:bob".into(),
-        GovernanceAction::RestoreWriteAccess {
+        GovernanceAction::RestoreAccess {
             did: "did:key:bob".into(),
+            capabilities: vec![super::Capability::MessagesWrite],
         },
     );
     manager
@@ -344,14 +349,15 @@ async fn cac009_tier_stacking_both_must_reverse() {
         let contexts = manager.contexts.lock().await;
         let ctx = contexts.get(&ctx_id).unwrap();
         assert!(
-            !ctx.access
-                .write_revoked_members
-                .contains(&DID("did:key:bob".into())),
+            !ctx.role_state
+                .suspended_capabilities
+                .get("did:key:bob")
+                .is_some_and(|s| s.contains(&Capability::MessagesWrite)),
             "write restored"
         );
         assert!(
             ctx.access
-                .read_revoked_members
+                .read_exclusion_list
                 .contains(&DID("did:key:bob".into())),
             "read still revoked"
         );
@@ -360,8 +366,9 @@ async fn cac009_tier_stacking_both_must_reverse() {
         &"did:key:alice".into(),
         &ctx_id,
         &"did:key:bob".into(),
-        GovernanceAction::RestoreReadAccess {
+        GovernanceAction::RestoreAccess {
             did: "did:key:bob".into(),
+            capabilities: vec![super::Capability::MessagesRead],
         },
     );
     manager
@@ -372,13 +379,14 @@ async fn cac009_tier_stacking_both_must_reverse() {
         let contexts = manager.contexts.lock().await;
         let ctx = contexts.get(&ctx_id).unwrap();
         assert!(
-            !ctx.access
-                .write_revoked_members
-                .contains(&DID("did:key:bob".into()))
+            !ctx.role_state
+                .suspended_capabilities
+                .get("did:key:bob")
+                .is_some_and(|s| s.contains(&Capability::MessagesWrite))
         );
         assert!(
             !ctx.access
-                .read_revoked_members
+                .read_exclusion_list
                 .contains(&DID("did:key:bob".into()))
         );
     }
@@ -399,9 +407,9 @@ async fn cac009_layer_verification() {
         &"did:key:alice".into(),
         &ctx_id,
         &"did:key:bob".into(),
-        GovernanceAction::RevokeWriteAccess {
+        GovernanceAction::Revoke {
             did: "did:key:bob".into(),
-            scope: super::RevocationScope::Full,
+            access: super::AccessScope::Both,
         },
     );
     manager
@@ -410,13 +418,12 @@ async fn cac009_layer_verification() {
         .unwrap();
     {
         let contexts = manager.contexts.lock().await;
+        let ctx = contexts.get(&ctx_id).unwrap();
         assert!(
-            contexts
-                .get(&ctx_id)
-                .unwrap()
-                .access
-                .write_revoked_members
-                .contains(&DID("did:key:bob".into())),
+            ctx.role_state
+                .suspended_capabilities
+                .get("did:key:bob")
+                .is_some_and(|s| s.contains(&Capability::MessagesWrite)),
             "Layer 3"
         );
     }
@@ -449,9 +456,9 @@ async fn cac009_forward_only_verification() {
         &"did:key:alice".into(),
         &ctx_id,
         &"did:key:bob".into(),
-        GovernanceAction::RevokeWriteAccess {
+        GovernanceAction::Revoke {
             did: "did:key:bob".into(),
-            scope: super::RevocationScope::Full,
+            access: super::AccessScope::Both,
         },
     );
     manager
@@ -474,8 +481,9 @@ async fn cac009_forward_only_verification() {
         &"did:key:alice".into(),
         &ctx_id,
         &"did:key:bob".into(),
-        GovernanceAction::RestoreWriteAccess {
+        GovernanceAction::RestoreAccess {
             did: "did:key:bob".into(),
+            capabilities: vec![super::Capability::MessagesWrite],
         },
     );
     manager
@@ -539,9 +547,9 @@ async fn cac010_threshold_revoke_read_access() {
         .propose_governance_action_checked(
             "cac010-thresh",
             &creator,
-            GovernanceAction::RevokeReadAccess {
+            GovernanceAction::Revoke {
                 did: "did:key:dave".into(),
-                scope: super::RevocationScope::Full,
+                access: super::AccessScope::Read,
             },
             &signing_key,
         )
@@ -571,9 +579,9 @@ async fn cac010_restore_read_access_forward_only() {
         &"did:key:alice".into(),
         &ctx_id,
         &"did:key:sub1".into(),
-        GovernanceAction::RevokeReadAccess {
+        GovernanceAction::Revoke {
             did: "did:key:sub1".into(),
-            scope: super::RevocationScope::Full,
+            access: super::AccessScope::Read,
         },
     );
     manager
@@ -589,8 +597,9 @@ async fn cac010_restore_read_access_forward_only() {
         &"did:key:alice".into(),
         &ctx_id,
         &"did:key:sub1".into(),
-        GovernanceAction::RestoreReadAccess {
+        GovernanceAction::RestoreAccess {
             did: "did:key:sub1".into(),
+            capabilities: vec![super::Capability::MessagesRead],
         },
     );
     manager
@@ -612,9 +621,9 @@ async fn cac010_revoke_write_full_can_still_read() {
         &"did:key:alice".into(),
         &ctx_id,
         &"did:key:bob".into(),
-        GovernanceAction::RevokeWriteAccess {
+        GovernanceAction::Revoke {
             did: "did:key:bob".into(),
-            scope: super::RevocationScope::Full,
+            access: super::AccessScope::Both,
         },
     );
     manager
@@ -625,14 +634,15 @@ async fn cac010_revoke_write_full_can_still_read() {
         let contexts = manager.contexts.lock().await;
         let ctx = contexts.get(&ctx_id).unwrap();
         assert!(
-            ctx.access
-                .write_revoked_members
-                .contains(&DID("did:key:bob".into())),
-            "write-revoked"
+            ctx.role_state
+                .suspended_capabilities
+                .get("did:key:bob")
+                .is_some_and(|s| s.contains(&Capability::MessagesWrite)),
+            "write-suspended"
         );
         assert!(
             !ctx.access
-                .read_revoked_members
+                .read_exclusion_list
                 .contains(&DID("did:key:bob".into())),
             "NOT read-revoked"
         );
@@ -646,9 +656,9 @@ async fn cac010_revoke_write_future_only() {
         &"did:key:alice".into(),
         &ctx_id,
         &"did:key:bob".into(),
-        GovernanceAction::RevokeWriteAccess {
+        GovernanceAction::Revoke {
             did: "did:key:bob".into(),
-            scope: super::RevocationScope::FutureOnly,
+            access: super::AccessScope::Write,
         },
     );
     manager
@@ -720,9 +730,9 @@ async fn cac010_membership_access_decoupling() {
         &"did:key:alice".into(),
         &ctx_id,
         &"did:key:sub1".into(),
-        GovernanceAction::RevokeReadAccess {
+        GovernanceAction::Revoke {
             did: "did:key:sub1".into(),
-            scope: super::RevocationScope::Full,
+            access: super::AccessScope::Read,
         },
     );
     manager
@@ -748,18 +758,18 @@ async fn cac010_single_admin_auto_execute() {
         &"did:key:alice".into(),
         &ctx_id,
         &"did:key:sub1".into(),
-        GovernanceAction::RevokeReadAccess {
+        GovernanceAction::Revoke {
             did: "did:key:sub1".into(),
-            scope: super::RevocationScope::Full,
+            access: super::AccessScope::Read,
         },
     );
     let result = manager.execute_governance_action(&ctx_id, &revoke).await;
     assert!(result.is_ok());
     match result.unwrap() {
-        GovernanceActionResult::ReadAccessRevoked(r) => {
+        GovernanceActionResult::AccessRevoked(r) => {
             assert_eq!(r.did.0, "did:key:sub1");
         }
-        other => panic!("expected ReadAccessRevoked, got {other:?}"),
+        other => panic!("expected AccessRevoked, got {other:?}"),
     }
 }
 

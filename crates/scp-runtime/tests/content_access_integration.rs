@@ -25,7 +25,7 @@ use scp_platform::traits::{KeyCustody, KeyType};
 use scp_protocol::context::ContextError;
 use scp_protocol::context::builder::{ContextCreationError, ContextCryptoProvider};
 use scp_protocol::context::governance::{
-    GovernanceAction, KeyResolver, ProposalStatus, RevocationScope,
+    GovernanceAction, KeyResolver, ProposalStatus, AccessScope,
 };
 use scp_protocol::context::params::{Capability, ContextParams, GovernanceModel};
 use scp_protocol::crypto::access_keys::wrapping::{Recipient, unwrap_content, wrap_content};
@@ -817,9 +817,9 @@ async fn tier3_governance_revoke_write_access_broadcast() {
 
     // --- Governance RevokeWriteAccess(Full) on Author ---
 
-    let revoke = GovernanceAction::RevokeWriteAccess {
+    let revoke = GovernanceAction::Revoke {
         did: author_did(),
-        scope: RevocationScope::Full,
+        access: AccessScope::Both,
     };
     let outcome = propose_and_approve_threshold(&manager, ctx_id, revoke).await;
     assert_eq!(outcome.status, ProposalStatus::Approved);
@@ -859,7 +859,7 @@ async fn tier3_governance_revoke_write_access_broadcast() {
     // --- RestoreWriteAccess -> Author can publish again ---
 
     let _ = manager.drain_events(ctx_id).await;
-    let restore = GovernanceAction::RestoreWriteAccess { did: author_did() };
+    let restore = GovernanceAction::RestoreAccess { did: author_did(), capabilities: vec![Capability::MessagesWrite] };
     let outcome = propose_and_approve_threshold(&manager, ctx_id, restore).await;
     assert_eq!(outcome.status, ProposalStatus::Approved);
 
@@ -1522,9 +1522,9 @@ async fn governance_tier_stacking_via_context_manager() {
 
     // --- Governance (Tier 3): RevokeWriteAccess on Dave ---
 
-    let revoke = GovernanceAction::RevokeWriteAccess {
+    let revoke = GovernanceAction::Revoke {
         did: dave(),
-        scope: RevocationScope::Full,
+        access: AccessScope::Both,
     };
     let outcome = propose_and_approve_threshold(&manager, ctx_id, revoke).await;
     assert_eq!(outcome.status, ProposalStatus::Approved);
@@ -1577,7 +1577,7 @@ async fn governance_tier_stacking_via_context_manager() {
     // --- Reverse Tier 3 too: RestoreWriteAccess ---
 
     let _ = manager.drain_events(ctx_id).await;
-    let restore = GovernanceAction::RestoreWriteAccess { did: dave() };
+    let restore = GovernanceAction::RestoreAccess { did: dave(), capabilities: vec![Capability::MessagesWrite] };
     let outcome = propose_and_approve_threshold(&manager, ctx_id, restore).await;
     assert_eq!(outcome.status, ProposalStatus::Approved);
 

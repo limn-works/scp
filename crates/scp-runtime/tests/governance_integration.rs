@@ -40,7 +40,7 @@ use scp_protocol::context::governance::multisig::ThresholdEngine;
 use scp_protocol::context::governance::unanimity::UnanimityEngine;
 use scp_protocol::context::governance::{
     CheckpointAttestationStatus, CosignedCheckpoint, GovernanceAction, GovernanceContext,
-    GovernanceEngine, GovernanceEvent, KeyResolver, ProposalStatus, RevocationScope,
+    AccessScope, GovernanceEngine, GovernanceEvent, KeyResolver, ProposalStatus,
     SingleAdminEngine, VoteType, actions_conflict, sign_vote,
 };
 use scp_protocol::context::params::{Capability, ContextParams, GovernanceModel};
@@ -919,7 +919,7 @@ async fn ac9_checked_propose_requires_capability() {
 // =========================================================================
 // AC-10: 7+ GovernanceAction variants exercised
 // Variants: RemoveMember, ChangeRole, CloseContext, AddSigner,
-//           ExtendTtl, RevokeWriteAccess, RestoreReadAccess
+//           ExtendTtl, Revoke, RestoreAccess
 // =========================================================================
 
 #[tokio::test]
@@ -957,7 +957,7 @@ async fn ac10_remove_member_action() {
         .propose_governance_action(
             ctx_id,
             &alice(),
-            GovernanceAction::RemoveMember {
+            GovernanceAction::Eject {
                 did: bob(),
                 reason: Some("test removal".into()),
             },
@@ -1157,9 +1157,9 @@ async fn ac10_revoke_write_access_action() {
         .propose_governance_action(
             ctx_id,
             &alice(),
-            GovernanceAction::RevokeWriteAccess {
+            GovernanceAction::Revoke {
                 did: bob(),
-                scope: RevocationScope::FutureOnly,
+                access: AccessScope::Write,
             },
             &sk_alice,
         )
@@ -1201,9 +1201,9 @@ async fn ac10_restore_write_access_action() {
         .propose_governance_action(
             ctx_id,
             &alice(),
-            GovernanceAction::RevokeWriteAccess {
+            GovernanceAction::Revoke {
                 did: bob(),
-                scope: RevocationScope::FutureOnly,
+                access: AccessScope::Write,
             },
             &sk_alice,
         )
@@ -1214,7 +1214,7 @@ async fn ac10_restore_write_access_action() {
         .propose_governance_action(
             ctx_id,
             &alice(),
-            GovernanceAction::RestoreWriteAccess { did: bob() },
+            GovernanceAction::RestoreAccess { did: bob(), capabilities: vec![Capability::MessagesWrite] },
             &sk_alice,
         )
         .await
@@ -1444,11 +1444,11 @@ fn ac13_actions_no_conflict_different_dids() {
 
 #[test]
 fn ac13_actions_conflict_revoke_vs_restore_write() {
-    let action_a = GovernanceAction::RevokeWriteAccess {
+    let action_a = GovernanceAction::Revoke {
         did: bob(),
-        scope: RevocationScope::Full,
+        access: AccessScope::Both,
     };
-    let action_b = GovernanceAction::RestoreWriteAccess { did: bob() };
+    let action_b = GovernanceAction::RestoreAccess { did: bob() };
     assert!(
         actions_conflict(&action_a, &alice(), &action_b, &carol()),
         "RevokeWriteAccess vs RestoreWriteAccess for same DID should conflict"
@@ -1457,11 +1457,11 @@ fn ac13_actions_conflict_revoke_vs_restore_write() {
 
 #[test]
 fn ac13_actions_conflict_revoke_vs_restore_read() {
-    let action_a = GovernanceAction::RevokeReadAccess {
+    let action_a = GovernanceAction::Revoke {
         did: bob(),
-        scope: RevocationScope::FutureOnly,
+        access: AccessScope::Write,
     };
-    let action_b = GovernanceAction::RestoreReadAccess { did: bob() };
+    let action_b = GovernanceAction::RestoreAccess { did: bob() };
     assert!(
         actions_conflict(&action_a, &alice(), &action_b, &carol()),
         "RevokeReadAccess vs RestoreReadAccess for same DID should conflict"
@@ -1470,7 +1470,7 @@ fn ac13_actions_conflict_revoke_vs_restore_read() {
 
 #[test]
 fn ac13_actions_conflict_remove_member_vs_change_role() {
-    let action_a = GovernanceAction::RemoveMember {
+    let action_a = GovernanceAction::Eject {
         did: bob(),
         reason: None,
     };
@@ -1487,11 +1487,11 @@ fn ac13_actions_conflict_remove_member_vs_change_role() {
 #[test]
 fn ac13_actions_conflict_mutual_removal() {
     // Alice proposes removing Bob, Bob proposes removing Alice.
-    let action_a = GovernanceAction::RemoveMember {
+    let action_a = GovernanceAction::Eject {
         did: bob(),
         reason: None,
     };
-    let action_b = GovernanceAction::RemoveMember {
+    let action_b = GovernanceAction::Eject {
         did: alice(),
         reason: None,
     };

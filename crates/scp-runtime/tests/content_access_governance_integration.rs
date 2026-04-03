@@ -30,7 +30,7 @@ use scp_identity::DID;
 use scp_protocol::context::ContextError;
 use scp_protocol::context::builder::{ContextCreationError, ContextCryptoProvider};
 use scp_protocol::context::governance::{
-    GovernanceAction, GovernanceEvent, KeyResolver, ProposalStatus, RevocationScope,
+    GovernanceAction, GovernanceEvent, KeyResolver, ProposalStatus, AccessScope,
 };
 use scp_protocol::context::params::{Capability, ContextParams, GovernanceModel};
 use scp_runtime::context::builder::{ContextEventLogProvider, ContextTransportProvider};
@@ -345,9 +345,9 @@ async fn revoke_read_access_full_via_threshold_governance() {
     let manager = Box::pin(setup_threshold_context_with_dave(ctx_id)).await;
 
     // Propose RevokeReadAccess(Full) for Dave.
-    let action = GovernanceAction::RevokeReadAccess {
+    let action = GovernanceAction::Revoke {
         did: dave(),
-        scope: RevocationScope::Full,
+        access: AccessScope::Read,
     };
 
     let outcome = propose_and_approve_threshold(&manager, ctx_id, action).await;
@@ -385,9 +385,9 @@ async fn restore_read_access_forward_only() {
     let manager = Box::pin(setup_threshold_context_with_dave(ctx_id)).await;
 
     // First revoke Dave's read access.
-    let revoke = GovernanceAction::RevokeReadAccess {
+    let revoke = GovernanceAction::Revoke {
         did: dave(),
-        scope: RevocationScope::Full,
+        access: AccessScope::Read,
     };
     let outcome = propose_and_approve_threshold(&manager, ctx_id, revoke).await;
     assert_eq!(outcome.status, ProposalStatus::Approved);
@@ -396,7 +396,7 @@ async fn restore_read_access_forward_only() {
     let _ = manager.drain_events(ctx_id).await;
 
     // Now restore Dave's read access via governance.
-    let restore = GovernanceAction::RestoreReadAccess { did: dave() };
+    let restore = GovernanceAction::RestoreAccess { did: dave(), capabilities: vec![Capability::MessagesRead] };
     let outcome = propose_and_approve_threshold(&manager, ctx_id, restore).await;
     assert_eq!(outcome.status, ProposalStatus::Approved);
 
@@ -453,9 +453,9 @@ async fn revoke_write_access_full_blocks_publishing() {
     let manager = Box::pin(setup_threshold_context_with_dave(ctx_id)).await;
 
     // Revoke Dave's write access with Full scope.
-    let action = GovernanceAction::RevokeWriteAccess {
+    let action = GovernanceAction::Revoke {
         did: dave(),
-        scope: RevocationScope::Full,
+        access: AccessScope::Both,
     };
     let outcome = propose_and_approve_threshold(&manager, ctx_id, action).await;
     assert_eq!(outcome.status, ProposalStatus::Approved);
@@ -527,9 +527,9 @@ async fn revoke_write_access_future_only() {
     let manager = Box::pin(setup_threshold_context_with_dave(ctx_id)).await;
 
     // Revoke Dave's write access with FutureOnly scope.
-    let action = GovernanceAction::RevokeWriteAccess {
+    let action = GovernanceAction::Revoke {
         did: dave(),
-        scope: RevocationScope::FutureOnly,
+        access: AccessScope::Write,
     };
     let outcome = propose_and_approve_threshold(&manager, ctx_id, action).await;
     assert_eq!(outcome.status, ProposalStatus::Approved);
@@ -578,9 +578,9 @@ async fn restore_write_access_forward_only() {
     let manager = Box::pin(setup_threshold_context_with_dave(ctx_id)).await;
 
     // First revoke Dave's write access.
-    let revoke = GovernanceAction::RevokeWriteAccess {
+    let revoke = GovernanceAction::Revoke {
         did: dave(),
-        scope: RevocationScope::FutureOnly,
+        access: AccessScope::Write,
     };
     let outcome = propose_and_approve_threshold(&manager, ctx_id, revoke).await;
     assert_eq!(outcome.status, ProposalStatus::Approved);
@@ -589,7 +589,7 @@ async fn restore_write_access_forward_only() {
     let _ = manager.drain_events(ctx_id).await;
 
     // Now restore Dave's write access.
-    let restore = GovernanceAction::RestoreWriteAccess { did: dave() };
+    let restore = GovernanceAction::RestoreAccess { did: dave(), capabilities: vec![Capability::MessagesWrite] };
     let outcome = propose_and_approve_threshold(&manager, ctx_id, restore).await;
     assert_eq!(outcome.status, ProposalStatus::Approved);
 
@@ -723,9 +723,9 @@ async fn revoked_member_can_still_participate_in_governance() {
         .propose_governance_action(
             ctx_id,
             &alice(),
-            GovernanceAction::RevokeWriteAccess {
+            GovernanceAction::Revoke {
                 did: dave(),
-                scope: RevocationScope::Full,
+                access: AccessScope::Both,
             },
             &sk_alice,
         )
@@ -786,9 +786,9 @@ async fn revoked_member_can_still_participate_in_governance() {
         .propose_governance_action(
             ctx_id,
             &alice(),
-            GovernanceAction::RevokeReadAccess {
+            GovernanceAction::Revoke {
                 did: dave(),
-                scope: RevocationScope::Full,
+                access: AccessScope::Read,
             },
             &sk_alice,
         )
@@ -879,9 +879,9 @@ async fn single_admin_auto_executes_revoke_read_access() {
         .propose_governance_action_checked(
             ctx_id,
             &alice(),
-            GovernanceAction::RevokeReadAccess {
+            GovernanceAction::Revoke {
                 did: dave(),
-                scope: RevocationScope::Full,
+                access: AccessScope::Read,
             },
             &sk_alice,
         )
@@ -898,9 +898,9 @@ async fn single_admin_auto_executes_revoke_read_access() {
         "SingleAdmin should auto-execute"
     );
     match outcome.execution_result.unwrap() {
-        GovernanceActionResult::ReadAccessRevoked(r) => {
+        GovernanceActionResult::AccessRevoked(r) => {
             assert_eq!(r.did, dave());
-            assert_eq!(r.scope, RevocationScope::Full);
+            assert_eq!(r.access, AccessScope::Read);
         }
         other => panic!("expected ReadAccessRevoked, got {other:?}"),
     }
@@ -947,9 +947,9 @@ async fn single_admin_auto_executes_revoke_write_access() {
         .propose_governance_action_checked(
             ctx_id,
             &alice(),
-            GovernanceAction::RevokeWriteAccess {
+            GovernanceAction::Revoke {
                 did: dave(),
-                scope: RevocationScope::FutureOnly,
+                access: AccessScope::Write,
             },
             &sk_alice,
         )
@@ -959,9 +959,9 @@ async fn single_admin_auto_executes_revoke_write_access() {
     assert_eq!(outcome.status, ProposalStatus::Approved);
     assert!(outcome.execution_result.is_some());
     match outcome.execution_result.unwrap() {
-        GovernanceActionResult::WriteAccessRevoked(r) => {
+        GovernanceActionResult::AccessRevoked(r) => {
             assert_eq!(r.did, dave());
-            assert_eq!(r.scope, RevocationScope::FutureOnly);
+            assert_eq!(r.access, AccessScope::Write);
         }
         other => panic!("expected WriteAccessRevoked, got {other:?}"),
     }
@@ -1004,9 +1004,9 @@ async fn single_admin_auto_executes_restore_read_access() {
         .propose_governance_action(
             ctx_id,
             &alice(),
-            GovernanceAction::RevokeReadAccess {
+            GovernanceAction::Revoke {
                 did: dave(),
-                scope: RevocationScope::Full,
+                access: AccessScope::Read,
             },
             &sk_alice,
         )
@@ -1018,7 +1018,7 @@ async fn single_admin_auto_executes_restore_read_access() {
         .propose_governance_action_checked(
             ctx_id,
             &alice(),
-            GovernanceAction::RestoreReadAccess { did: dave() },
+            GovernanceAction::RestoreAccess { did: dave(), capabilities: vec![Capability::MessagesRead] },
             &sk_alice,
         )
         .await
@@ -1027,7 +1027,7 @@ async fn single_admin_auto_executes_restore_read_access() {
     assert_eq!(outcome.status, ProposalStatus::Approved);
     assert!(outcome.execution_result.is_some());
     match outcome.execution_result.unwrap() {
-        GovernanceActionResult::ReadAccessRestored(r) => {
+        GovernanceActionResult::AccessRestored(r) => {
             assert_eq!(r.did, dave());
         }
         other => panic!("expected ReadAccessRestored, got {other:?}"),
@@ -1212,18 +1212,18 @@ async fn full_content_access_lifecycle() {
     let manager = Box::pin(setup_threshold_context_with_dave(ctx_id)).await;
 
     // Phase 1: Revoke Dave's read access (Full).
-    let revoke_read = GovernanceAction::RevokeReadAccess {
+    let revoke_read = GovernanceAction::Revoke {
         did: dave(),
-        scope: RevocationScope::Full,
+        access: AccessScope::Read,
     };
     let outcome = propose_and_approve_threshold(&manager, ctx_id, revoke_read).await;
     assert_eq!(outcome.status, ProposalStatus::Approved);
     let _ = manager.drain_events(ctx_id).await;
 
     // Phase 2: Revoke Dave's write access (Full).
-    let revoke_write = GovernanceAction::RevokeWriteAccess {
+    let revoke_write = GovernanceAction::Revoke {
         did: dave(),
-        scope: RevocationScope::Full,
+        access: AccessScope::Both,
     };
     let outcome = propose_and_approve_threshold(&manager, ctx_id, revoke_write).await;
     assert_eq!(outcome.status, ProposalStatus::Approved);
@@ -1260,13 +1260,13 @@ async fn full_content_access_lifecycle() {
     assert!(send_result.is_err());
 
     // Phase 3: Restore Dave's read access.
-    let restore_read = GovernanceAction::RestoreReadAccess { did: dave() };
+    let restore_read = GovernanceAction::RestoreAccess { did: dave(), capabilities: vec![Capability::MessagesRead] };
     let outcome = propose_and_approve_threshold(&manager, ctx_id, restore_read).await;
     assert_eq!(outcome.status, ProposalStatus::Approved);
     let _ = manager.drain_events(ctx_id).await;
 
     // Phase 4: Restore Dave's write access.
-    let restore_write = GovernanceAction::RestoreWriteAccess { did: dave() };
+    let restore_write = GovernanceAction::RestoreAccess { did: dave(), capabilities: vec![Capability::MessagesWrite] };
     let outcome = propose_and_approve_threshold(&manager, ctx_id, restore_write).await;
     assert_eq!(outcome.status, ProposalStatus::Approved);
     let _ = manager.drain_events(ctx_id).await;
@@ -1355,9 +1355,9 @@ async fn majority_revoke_write_access() {
         .propose_governance_action(
             ctx_id,
             &alice(),
-            GovernanceAction::RevokeWriteAccess {
+            GovernanceAction::Revoke {
                 did: dave(),
-                scope: RevocationScope::Full,
+                access: AccessScope::Both,
             },
             &sk_alice,
         )
