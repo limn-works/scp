@@ -1658,6 +1658,7 @@ fn build_core_context_params(
             }
             parsed_consequence_rules
         },
+        sybil_policy: None,
     })
 }
 

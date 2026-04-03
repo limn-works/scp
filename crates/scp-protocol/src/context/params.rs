@@ -611,7 +611,7 @@ fn filter_field<T>(visibility: FieldVisibility, value: Option<T>) -> Option<T> {
 /// exactly. For explicit creation, the caller specifies all parameters directly.
 ///
 /// See ADR-008 in `.docs/adrs/phase-2.md` for the full specification.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ContextParams {
     /// Context processing mode: [`Encrypted`](ContextMode::Encrypted) (default)
     /// or [`Broadcast`](ContextMode::Broadcast). Immutable after creation.
@@ -771,6 +771,14 @@ pub struct ContextParams {
     /// verifiable. No hidden penalties. Empty means no consequence rules.
     #[serde(default)]
     pub consequence_rules: Vec<crate::trust::consequence::ConsequenceRule>,
+
+    /// Per-context Sybil resistance policy (spec §9.3, #1530).
+    ///
+    /// When `Some`, joining members are evaluated against the policy's trust
+    /// signal requirements. When `None` (the default), no Sybil resistance
+    /// check is performed — any valid DID can join.
+    #[serde(default)]
+    pub sybil_policy: Option<crate::trust::sybil::ContextSybilPolicy>,
 }
 
 impl Default for ContextParams {
@@ -799,6 +807,7 @@ impl Default for ContextParams {
             min_protocol_version: None,
             migration_source: None,
             consequence_rules: Vec::new(),
+            sybil_policy: None,
         }
     }
 }
@@ -1017,6 +1026,7 @@ mod tests {
             min_protocol_version: None,
             migration_source: None,
             consequence_rules: Vec::new(),
+            sybil_policy: None,
         };
 
         assert_eq!(params.mode, ContextMode::Broadcast);
@@ -1158,6 +1168,7 @@ mod tests {
             min_protocol_version: None,
             migration_source: None,
             consequence_rules: Vec::new(),
+            sybil_policy: None,
         };
 
         let json = serde_json::to_string(&params).ok();
@@ -1219,6 +1230,7 @@ mod tests {
             min_protocol_version: None,
             migration_source: None,
             consequence_rules: Vec::new(),
+            sybil_policy: None,
         };
 
         let json = serde_json::to_string(&params).unwrap();
