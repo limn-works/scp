@@ -11,11 +11,11 @@
 //! Exercises Tier 3 (governance-gated) content access control through
 //! `ContextManager` for all governance models. Verifies that:
 //!
-//! 1. RevokeReadAccess(Full) via Threshold(2-of-3) governance
-//! 2. `RestoreReadAccess` forward-only semantics
-//! 3. RevokeWriteAccess(Full) — sender key destroyed, write blocked
-//! 4. RevokeWriteAccess(FutureOnly) — future writes blocked, history intact
-//! 5. `RestoreWriteAccess` forward-only semantics
+//! 1. `Revoke { access: AccessScope::Read }` via Threshold(2-of-3) governance
+//! 2. `RestoreAccess { access: AccessScope::Read }` forward-only semantics
+//! 3. `Revoke { access: AccessScope::Both }` — sender key destroyed, write blocked
+//! 4. `Revoke { access: AccessScope::Write }` — future writes blocked, history intact
+//! 5. `RestoreAccess { access: AccessScope::Write }` forward-only semantics
 //! 6. `RotateContentKeys` — context-wide key rotation
 //! 7. Membership/access decoupling — revoked member can still vote
 //! 8. `SingleAdmin` auto-execute for content access actions
@@ -336,7 +336,7 @@ async fn propose_and_approve_threshold(
 }
 
 // =========================================================================
-// AC-1 / AC-2: RevokeReadAccess(Full) via Threshold(2-of-3) governance
+// AC-1 / AC-2: Revoke { access: AccessScope::Read } via Threshold(2-of-3) governance
 // =========================================================================
 
 #[tokio::test]
@@ -344,7 +344,7 @@ async fn revoke_read_access_full_via_threshold_governance() {
     let ctx_id = "ctx-cac-revoke-read";
     let manager = Box::pin(setup_threshold_context_with_dave(ctx_id)).await;
 
-    // Propose RevokeReadAccess(Full) for Dave.
+    // Propose Revoke { access: AccessScope::Read } for Dave.
     let action = GovernanceAction::Revoke {
         did: dave(),
         access: AccessScope::Read,
@@ -376,7 +376,7 @@ async fn revoke_read_access_full_via_threshold_governance() {
 }
 
 // =========================================================================
-// AC-3: RestoreReadAccess — forward-only semantics
+// AC-3: RestoreAccess { access: AccessScope::Read } — forward-only semantics
 // =========================================================================
 
 #[tokio::test]
@@ -406,7 +406,7 @@ async fn restore_read_access_forward_only() {
         "Dave should remain a member after read access restoration"
     );
 
-    // Verify RestoreReadAccess event was emitted.
+    // Verify read access restored event was emitted.
     let events = manager.drain_events(ctx_id).await;
     let has_restored = events.iter().any(|e| {
         matches!(
@@ -444,7 +444,7 @@ async fn restore_read_access_forward_only() {
 }
 
 // =========================================================================
-// AC-4: RevokeWriteAccess(Full) — sender key destroyed, write blocked
+// AC-4: Revoke { access: AccessScope::Both } — sender key destroyed, write blocked
 // =========================================================================
 
 #[tokio::test]
@@ -518,7 +518,7 @@ async fn revoke_write_access_full_blocks_publishing() {
 }
 
 // =========================================================================
-// AC-5: RevokeWriteAccess(FutureOnly) — future writes blocked
+// AC-5: Revoke { access: AccessScope::Write } — future writes blocked
 // =========================================================================
 
 #[tokio::test]
@@ -526,7 +526,7 @@ async fn revoke_write_access_future_only() {
     let ctx_id = "ctx-cac-revoke-write-future";
     let manager = Box::pin(setup_threshold_context_with_dave(ctx_id)).await;
 
-    // Revoke Dave's write access with FutureOnly scope.
+    // Revoke Dave's write access with AccessScope::Write (no key destruction).
     let action = GovernanceAction::Revoke {
         did: dave(),
         access: AccessScope::Write,
@@ -558,7 +558,7 @@ async fn revoke_write_access_future_only() {
         .await;
     assert!(
         send_result.is_err(),
-        "Dave should not be able to send future messages with FutureOnly revocation"
+        "Dave should not be able to send future messages with write-only revocation"
     );
 
     // Dave should still be a member (can still read if read not revoked).
@@ -569,7 +569,7 @@ async fn revoke_write_access_future_only() {
 }
 
 // =========================================================================
-// AC-6: RestoreWriteAccess — forward-only
+// AC-6: RestoreAccess { access: AccessScope::Write } — forward-only
 // =========================================================================
 
 #[tokio::test]
@@ -841,7 +841,7 @@ async fn revoked_member_can_still_participate_in_governance() {
 }
 
 // =========================================================================
-// AC-9: SingleAdmin auto-execute for RevokeReadAccess
+// AC-9: SingleAdmin auto-execute for read revocation
 // =========================================================================
 
 #[tokio::test]
@@ -874,7 +874,7 @@ async fn single_admin_auto_executes_revoke_read_access() {
         .unwrap();
     assert_eq!(add_proposal.status, ProposalStatus::Approved);
 
-    // Admin proposes RevokeReadAccess — should auto-approve and auto-execute.
+    // Admin proposes read revocation — should auto-approve and auto-execute.
     let outcome: ProposalOutcome = manager
         .propose_governance_action_checked(
             ctx_id,
@@ -910,7 +910,7 @@ async fn single_admin_auto_executes_revoke_read_access() {
 }
 
 // =========================================================================
-// AC-9b: SingleAdmin auto-execute for RevokeWriteAccess
+// AC-9b: SingleAdmin auto-execute for write revocation
 // =========================================================================
 
 #[tokio::test]
@@ -968,7 +968,7 @@ async fn single_admin_auto_executes_revoke_write_access() {
 }
 
 // =========================================================================
-// AC-9c: SingleAdmin auto-execute for RestoreReadAccess
+// AC-9c: SingleAdmin auto-execute for read restore
 // =========================================================================
 
 #[tokio::test]
@@ -1302,7 +1302,7 @@ async fn full_content_access_lifecycle() {
 }
 
 // =========================================================================
-// Majority model: RevokeWriteAccess requires majority
+// Majority model: write revocation requires majority
 // =========================================================================
 
 #[tokio::test]
@@ -1350,7 +1350,7 @@ async fn majority_revoke_write_access() {
         assert_eq!(status, ProposalStatus::Approved);
     }
 
-    // Now propose RevokeWriteAccess for Dave.
+    // Now propose write revocation for Dave.
     let (proposal, _, _) = manager
         .propose_governance_action(
             ctx_id,
@@ -1381,7 +1381,7 @@ async fn majority_revoke_write_access() {
         assert_eq!(
             status,
             ProposalStatus::Approved,
-            "majority vote should approve RevokeWriteAccess"
+            "majority vote should approve write revocation"
         );
     } else {
         // Already approved with Alice's vote alone (if proposer auto-vote counted).
