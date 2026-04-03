@@ -13,6 +13,21 @@ use super::{
     validate_governance_consistency, validate_governance_model,
 };
 
+/// Builds an [`IdentityDepthAssessment`] for a member in a context.
+///
+/// Shared by `evaluate_sybil_resistance` (join path) and `check_standing`
+/// (governance path). At the `ContextManager` layer we do not yet have
+/// access to external trust signal providers, so the signal map is empty.
+/// Contexts requiring real signals will correctly reject until signal
+/// providers are wired at a higher layer.
+pub(super) fn build_identity_assessment(
+    member_did: &DID,
+    now: u64,
+) -> scp_protocol::trust::sybil::IdentityDepthAssessment {
+    let signals = HashMap::new();
+    scp_protocol::trust::sybil::IdentityDepthAssessment::new(member_did.clone(), signals, now)
+}
+
 /// Validates all consequence rule string fields (defense-in-depth).
 ///
 /// Called from `create_context` to catch internal callers that bypass FFI
@@ -54,13 +69,7 @@ pub(super) fn evaluate_sybil_resistance(
         return Ok(());
     };
 
-    // Build an assessment from available trust signals. At the ContextManager
-    // layer we do not yet have access to external signal providers, so the
-    // signal map is empty. Contexts requiring real signals will correctly
-    // reject until signal providers are wired.
-    let signals = HashMap::new();
-    let assessment =
-        scp_protocol::trust::sybil::IdentityDepthAssessment::new(member_did.clone(), signals, now);
+    let assessment = build_identity_assessment(member_did, now);
 
     scp_protocol::trust::sybil::evaluate_sybil_resistance(&assessment, policy, now, None)
         .map_err(|e| ContextError::PermissionDenied(format!("sybil resistance check failed: {e}")))
@@ -321,6 +330,7 @@ impl ContextManager {
                     context_id.to_owned(),
                     Arc::clone(&self.clock),
                 ),
+                proposal_timestamps: ctx_snapshot.proposal_timestamps,
             },
             role_state: ctx_snapshot.role_state,
             receive_buffer: ReceiveBuffer::new(),
@@ -836,6 +846,7 @@ impl ContextManager {
                     context_id.clone(),
                     Arc::clone(&self.clock),
                 ),
+                proposal_timestamps: export.snapshot.proposal_timestamps,
             },
             epoch: EpochState {
                 mls_epoch: export.snapshot.mls_epoch,
@@ -1015,6 +1026,7 @@ impl ContextManager {
                     context_id.clone(),
                     Arc::clone(&self.clock),
                 ),
+                proposal_timestamps: HashMap::new(),
             },
             role_state,
             receive_buffer: ReceiveBuffer::new(),
@@ -1322,6 +1334,7 @@ impl ContextManager {
                     context_id.to_owned(),
                     Arc::clone(&self.clock),
                 ),
+                proposal_timestamps: HashMap::new(),
             },
             epoch: EpochState {
                 mls_epoch: 0,

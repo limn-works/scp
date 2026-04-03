@@ -348,6 +348,7 @@ fn strip_snapshot_for_public(snapshot: &ContextSnapshot) -> ContextSnapshot {
         velocity_tracker: None,
         velocity_tracker_state: None,
         cooldown_until: HashMap::new(),
+        proposal_timestamps: HashMap::new(),
     }
 }
 
@@ -462,6 +463,7 @@ mod tests {
             velocity_tracker: None,
             velocity_tracker_state: None,
             cooldown_until: std::collections::HashMap::new(),
+            proposal_timestamps: std::collections::HashMap::new(),
         }
     }
 

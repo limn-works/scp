@@ -629,6 +629,7 @@ fn governance_snapshot_serde_roundtrip() {
         velocity_tracker: None,
         velocity_tracker_state: None,
         cooldown_until: HashMap::new(),
+        proposal_timestamps: HashMap::new(),
     };
 
     let json = serde_json::to_string(&snapshot).expect("serialize");
@@ -13320,6 +13321,7 @@ fn velocity_tracker_state_in_context_snapshot_roundtrip() {
             entries: entries.clone(),
         }),
         cooldown_until: cooldowns.clone(),
+        proposal_timestamps: HashMap::new(),
     };
 
     let json = serde_json::to_string(&snapshot).expect("serialize");
@@ -13397,6 +13399,7 @@ fn velocity_tracker_backward_compat_deserialization() {
         velocity_tracker: Some(3600),
         velocity_tracker_state: None,
         cooldown_until: HashMap::new(),
+        proposal_timestamps: HashMap::new(),
     };
 
     let mut json_value: serde_json::Value =
@@ -14786,4 +14789,165 @@ async fn enforce_triggered_consequences_skips_absent_member() {
             "non-member should not appear in read_revoked_members"
         );
     }
+}
+
+// ---------------------------------------------------------------------------
+// Earned capacity enforcement in check_standing (§9.3)
+// ---------------------------------------------------------------------------
+
+/// When a context has a `sybil_policy`, `check_standing` enforces governance
+/// proposal rate limits from `EarnedCapacityPolicy`. A "new" identity (empty
+/// signals) gets `max_governance_proposals_per_window = 5` per 24h window.
+/// Once that limit is reached, further proposals are rejected.
+#[tokio::test]
+async fn earned_capacity_limits_governance_proposals() {
+    use scp_protocol::trust::sybil::ContextSybilPolicy;
+
+    let manager = ContextManager::new(
+        Box::new(MockCrypto::default()),
+        Box::new(MockTransport::connected()),
+        Box::new(MockEventLog::default()),
+        mock_key_resolver(),
+    );
+
+    let admin: DID = "did:dht:z6MkCreator".into();
+    let key_admin = signing_key_for_did(&admin);
+
+    let mut params = governance_params();
+    params.sybil_policy = Some(ContextSybilPolicy::casual());
+
+    let _handle = manager
+        .create_context("capacity-ctx".into(), params, admin.clone())
+        .await
+        .unwrap();
+
+    // Inject proposal timestamps to simulate the proposer having already
+    // submitted the maximum number of proposals for a "New" identity.
+    // New identity default: max_governance_proposals_per_window = 5,
+    // governance_proposal_window_secs = 86400 (24h).
+    {
+        let mut contexts = manager.contexts.lock().await;
+        let ctx = contexts.get_mut("capacity-ctx").unwrap();
+        let now = manager.clock.now_secs();
+        // Fill up to the limit (5 proposals) within the current window.
+        let timestamps = vec![now - 100, now - 80, now - 60, now - 40, now - 20];
+        ctx.governance
+            .proposal_timestamps
+            .insert(admin.to_string(), timestamps);
+    }
+
+    // Now attempt a 6th proposal — should be rejected.
+    let action = scp_protocol::context::governance::GovernanceAction::RegisterTool {
+        registration: Box::new(test_tool_registration("capacity-tool")),
+    };
+    let result = manager
+        .propose_governance_action("capacity-ctx", &admin, action, &key_admin)
+        .await;
+
+    assert!(
+        result.is_err(),
+        "should reject proposal over earned capacity limit"
+    );
+    let err = result.unwrap_err();
+    assert!(
+        matches!(&err, ContextError::PermissionDenied(msg) if msg.contains("SCP-GOV-5030")),
+        "expected earned capacity error code, got: {err}"
+    );
+}
+
+/// Without `sybil_policy`, `check_standing` does not enforce earned capacity
+/// limits (backward compatibility). Unlimited proposals should succeed.
+#[tokio::test]
+async fn no_sybil_policy_allows_unlimited_proposals() {
+    let manager = ContextManager::new(
+        Box::new(MockCrypto::default()),
+        Box::new(MockTransport::connected()),
+        Box::new(MockEventLog::default()),
+        mock_key_resolver(),
+    );
+
+    let admin: DID = "did:dht:z6MkCreator".into();
+    let key_admin = signing_key_for_did(&admin);
+
+    // No sybil_policy (default).
+    let params = governance_params();
+    let _handle = manager
+        .create_context("no-sybil-ctx".into(), params, admin.clone())
+        .await
+        .unwrap();
+
+    // Even with many timestamps injected, no sybil_policy means no limit.
+    {
+        let mut contexts = manager.contexts.lock().await;
+        let ctx = contexts.get_mut("no-sybil-ctx").unwrap();
+        let now = manager.clock.now_secs();
+        let timestamps: Vec<u64> = (0..100).map(|i| now - i).collect();
+        ctx.governance
+            .proposal_timestamps
+            .insert(admin.to_string(), timestamps);
+    }
+
+    let action = scp_protocol::context::governance::GovernanceAction::RegisterTool {
+        registration: Box::new(test_tool_registration("unlimited-tool")),
+    };
+    let result = manager
+        .propose_governance_action("no-sybil-ctx", &admin, action, &key_admin)
+        .await;
+
+    assert!(
+        result.is_ok(),
+        "without sybil_policy, proposals should not be rate-limited: {:?}",
+        result.err()
+    );
+}
+
+/// Proposals outside the sliding window are not counted toward the limit.
+#[tokio::test]
+async fn earned_capacity_evicts_stale_timestamps() {
+    use scp_protocol::trust::sybil::ContextSybilPolicy;
+
+    let manager = ContextManager::new(
+        Box::new(MockCrypto::default()),
+        Box::new(MockTransport::connected()),
+        Box::new(MockEventLog::default()),
+        mock_key_resolver(),
+    );
+
+    let admin: DID = "did:dht:z6MkCreator".into();
+    let key_admin = signing_key_for_did(&admin);
+
+    let mut params = governance_params();
+    params.sybil_policy = Some(ContextSybilPolicy::casual());
+
+    let _handle = manager
+        .create_context("evict-ctx".into(), params, admin.clone())
+        .await
+        .unwrap();
+
+    // Inject timestamps that are all outside the 24h window.
+    // New identity default: governance_proposal_window_secs = 86400.
+    {
+        let mut contexts = manager.contexts.lock().await;
+        let ctx = contexts.get_mut("evict-ctx").unwrap();
+        let now = manager.clock.now_secs();
+        // All timestamps are older than the window.
+        let old_timestamps: Vec<u64> = (0..10).map(|i| now - 86400 - 100 - i).collect();
+        ctx.governance
+            .proposal_timestamps
+            .insert(admin.to_string(), old_timestamps);
+    }
+
+    // Proposal should succeed because stale entries are evicted.
+    let action = scp_protocol::context::governance::GovernanceAction::RegisterTool {
+        registration: Box::new(test_tool_registration("evict-tool")),
+    };
+    let result = manager
+        .propose_governance_action("evict-ctx", &admin, action, &key_admin)
+        .await;
+
+    assert!(
+        result.is_ok(),
+        "stale timestamps should be evicted, allowing new proposals: {:?}",
+        result.err()
+    );
 }
