@@ -357,14 +357,23 @@ impl ContextManager {
                 .velocity_tracker
                 .record_message(sender_did, self.clock.now_secs());
 
-            let deducted_cost = enforce_send_economy(
+            let deducted_cost = match enforce_send_economy(
                 ctx,
                 sender_did,
                 self.clock.now_secs(),
                 spending_ucan,
                 &context_id,
                 &*self.clock,
-            )?;
+            ) {
+                Ok(cost) => cost,
+                Err(e) => {
+                    // Roll back the velocity increment recorded above so a
+                    // rejected message does not permanently inflate the
+                    // sender's velocity count.
+                    ctx.governance.velocity_tracker.rollback_last(sender_did);
+                    return Err(e);
+                }
+            };
             if let Some(ref mut bc) = ctx.broadcast_context {
                 let sk = signing_key.ok_or_else(|| {
                     ContextError::CryptoFailed("signing key required for broadcast publish".into())

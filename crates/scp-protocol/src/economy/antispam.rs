@@ -303,6 +303,23 @@ impl SenderVelocityTracker {
         }
         cost
     }
+
+    /// Removes the most recent timestamp for `sender`, undoing one
+    /// [`record_message`](Self::record_message) call.
+    ///
+    /// No-op if `sender` has no recorded timestamps (including unknown DIDs).
+    /// This is used to roll back a velocity increment when a downstream
+    /// operation (e.g. economy enforcement) fails after the message was
+    /// already recorded.
+    pub fn rollback_last(&self, sender: &DID) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(timestamps) = state.get_mut(sender) {
+            timestamps.pop();
+        }
+    }
 }
 
 impl std::fmt::Debug for SenderVelocityTracker {
@@ -717,5 +734,46 @@ mod tests {
         assert_eq!(restored.get_velocity(&alice, 520), alice_vel);
         assert_eq!(restored.get_velocity(&bob, 520), bob_vel);
         assert_eq!(restored.window_secs(), tracker.window_secs());
+    }
+
+    // --- Rollback ---
+
+    #[test]
+    fn rollback_last_reduces_velocity_by_one() {
+        let tracker = SenderVelocityTracker::new(60);
+        let sender = did("did:dht:z6MkAlice");
+
+        tracker.record_message(&sender, 1000);
+        tracker.record_message(&sender, 1001);
+        tracker.record_message(&sender, 1002);
+        assert_eq!(tracker.get_velocity(&sender, 1005), 3);
+
+        tracker.rollback_last(&sender);
+        assert_eq!(tracker.get_velocity(&sender, 1005), 2);
+    }
+
+    #[test]
+    fn rollback_last_on_unknown_did_is_noop() {
+        let tracker = SenderVelocityTracker::new(60);
+        let unknown = did("did:dht:z6MkUnknown");
+
+        // Should not panic or alter state.
+        tracker.rollback_last(&unknown);
+        assert_eq!(tracker.get_velocity(&unknown, 1000), 0);
+    }
+
+    #[test]
+    fn rollback_last_on_empty_timestamps_is_noop() {
+        let tracker = SenderVelocityTracker::new(10);
+        let sender = did("did:dht:z6MkAlice");
+
+        // Record a message then let it expire via pruning.
+        tracker.record_message(&sender, 100);
+        // Prune by querying well past the window.
+        assert_eq!(tracker.get_velocity(&sender, 200), 0);
+
+        // Rollback on a known sender with empty timestamps should be no-op.
+        tracker.rollback_last(&sender);
+        assert_eq!(tracker.get_velocity(&sender, 200), 0);
     }
 }
