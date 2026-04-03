@@ -48,6 +48,7 @@ fn enforce_send_economy(
         context_id,
         clock,
         relay_base_price,
+        &mut ctx.governance.spending_nonce_tracker,
     )
 }
 

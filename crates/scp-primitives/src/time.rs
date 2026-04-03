@@ -153,7 +153,7 @@ impl Clock for TestClock {
 ///
 /// This allows clocks to be shared between production code and test code
 /// that needs to advance time.
-impl<T: Clock> Clock for Arc<T> {
+impl<T: Clock + ?Sized> Clock for Arc<T> {
     fn now_secs(&self) -> u64 {
         (**self).now_secs()
     }

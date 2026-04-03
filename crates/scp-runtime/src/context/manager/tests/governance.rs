@@ -7668,6 +7668,8 @@ async fn send_message_deducts_budget() {
         .clone();
 
     // Send message — should deduct 5 from budget.
+    // Each send uses a fresh spending UCAN (unique nonce) per NonceTracker
+    // replay prevention.
     let ucan = dummy_spending_ucan();
     manager
         .send_message(
@@ -7696,6 +7698,7 @@ async fn send_message_deducts_budget() {
     );
 
     // Send another message — budget should go to 40.
+    let ucan2 = dummy_spending_ucan();
     manager
         .send_message(
             &handle,
@@ -7703,7 +7706,7 @@ async fn send_message_deducts_budget() {
             b"budget test 2",
             Some(&sk),
             None,
-            Some(&ucan),
+            Some(&ucan2),
         )
         .await
         .unwrap();
@@ -9761,10 +9764,12 @@ async fn test_full_lifecycle_economy() {
         .handle
         .clone();
     let user: DID = "did:key:user".into();
-    let ucan = dummy_spending_ucan();
 
     // Send 3 messages at 10 each = 30 total cost, leaving 20.
+    // Each send uses a fresh spending UCAN (unique nonce) as required by
+    // the NonceTracker replay prevention.
     for i in 0..3 {
+        let ucan = dummy_spending_ucan();
         manager
             .send_message(
                 &handle,
@@ -9784,6 +9789,7 @@ async fn test_full_lifecycle_economy() {
     );
 
     // 4th message costs 10 -> leaves 10.
+    let ucan = dummy_spending_ucan();
     manager
         .send_message(&handle, &user, b"msg-4", Some(&sk), None, Some(&ucan))
         .await
@@ -9795,6 +9801,7 @@ async fn test_full_lifecycle_economy() {
     );
 
     // 5th message: 10 -> leaves 0.
+    let ucan = dummy_spending_ucan();
     manager
         .send_message(&handle, &user, b"msg-5", Some(&sk), None, Some(&ucan))
         .await
@@ -9806,6 +9813,7 @@ async fn test_full_lifecycle_economy() {
     );
 
     // 6th message should fail — budget exhausted.
+    let ucan = dummy_spending_ucan();
     let result = manager
         .send_message(&handle, &user, b"msg-6", Some(&sk), None, Some(&ucan))
         .await;
@@ -9843,10 +9851,11 @@ async fn velocity_escalation_raises_effective_cost() {
 
     assert_eq!(budget_remaining!(manager), Amount::new(10_000));
 
-    let ucan = dummy_spending_ucan();
-
     // Send 2 messages at low velocity (cost = 1 each, formula adds 0).
+    // Each send uses a fresh spending UCAN (unique nonce) per NonceTracker
+    // replay prevention.
     for i in 0..2 {
+        let ucan = dummy_spending_ucan();
         manager
             .send_message(
                 &handle,
@@ -9870,6 +9879,7 @@ async fn velocity_escalation_raises_effective_cost() {
 
     // Send 4 more messages to push velocity above thresholds.
     for i in 2..6 {
+        let ucan = dummy_spending_ucan();
         manager
             .send_message(
                 &handle,
@@ -10775,7 +10785,7 @@ async fn none_per_message_no_ucan_required() {
 // -----------------------------------------------------------------------
 
 #[tokio::test]
-async fn multiple_sends_same_spending_ucan_all_succeed() {
+async fn multiple_sends_unique_spending_ucans_all_succeed() {
     use scp_protocol::economy::types::{Amount, CostSchedule, CurrencyCode, EconomicPolicy};
 
     let manager = ContextManager::new(
@@ -10824,9 +10834,11 @@ async fn multiple_sends_same_spending_ucan_all_succeed() {
         .handle
         .clone();
 
-    let ucan = dummy_spending_ucan();
-
+    // Each send must use a fresh spending UCAN with a unique nonce.
+    // Reusing the same UCAN would be rejected by the NonceTracker
+    // as a replay attack (defense-in-depth).
     for i in 0..5 {
+        let ucan = dummy_spending_ucan();
         let result = manager
             .send_message(
                 &handle,
@@ -10839,7 +10851,7 @@ async fn multiple_sends_same_spending_ucan_all_succeed() {
             .await;
         assert!(
             result.is_ok(),
-            "send {i} with same spending UCAN should succeed: {result:?}"
+            "send {i} with unique spending UCAN should succeed: {result:?}"
         );
     }
 }
@@ -11244,6 +11256,8 @@ async fn no_auto_grant_requires_explicit_budget() {
     );
 
     // After explicit budget grant, send should succeed.
+    // Use a fresh UCAN because the nonce tracker records nonces even on
+    // failed attempts (defense-in-depth against replay).
     {
         let mut contexts = manager.contexts.lock().await;
         let ctx = contexts.get_mut("no-autogrant-ctx").unwrap();
@@ -11251,6 +11265,7 @@ async fn no_auto_grant_requires_explicit_budget() {
             .budget_tracker
             .grant(&"did:key:sender".into(), Amount::new(100));
     }
+    let ucan2 = dummy_spending_ucan();
     let result2 = manager
         .send_message(
             &handle,
@@ -11258,7 +11273,7 @@ async fn no_auto_grant_requires_explicit_budget() {
             b"with budget",
             Some(&sk),
             None,
-            Some(&ucan),
+            Some(&ucan2),
         )
         .await;
     assert!(
@@ -12237,8 +12252,6 @@ async fn aggregate_velocity_via_manager_send() {
         .handle
         .clone();
 
-    let ucan = dummy_spending_ucan();
-
     // Pre-grant sufficient budget for all 3 sends (auto-grant only covers the first).
     {
         let mut contexts = manager.contexts.lock().await;
@@ -12249,8 +12262,9 @@ async fn aggregate_velocity_via_manager_send() {
         );
     }
 
-    // Send 3 messages.
+    // Send 3 messages, each with a fresh spending UCAN (unique nonce).
     for i in 0..3 {
+        let ucan = dummy_spending_ucan();
         manager
             .send_message(
                 &handle,
@@ -13149,8 +13163,6 @@ async fn context_message_rate_from_aggregate_velocity() {
         .handle
         .clone();
 
-    let ucan = dummy_spending_ucan();
-
     // Pre-grant sufficient budget for all 5 sends.
     {
         let mut contexts = manager.contexts.lock().await;
@@ -13161,8 +13173,9 @@ async fn context_message_rate_from_aggregate_velocity() {
         );
     }
 
-    // Send several messages.
+    // Send several messages, each with a fresh spending UCAN (unique nonce).
     for i in 0..5 {
+        let ucan = dummy_spending_ucan();
         manager
             .send_message(
                 &handle,
@@ -14021,6 +14034,113 @@ async fn test_capture_failure_budget_retained() {
         remaining,
         Amount::new(90),
         "budget should remain deducted after successful send"
+    );
+}
+
+// -----------------------------------------------------------------------
+// Spending UCAN nonce replay prevention
+// -----------------------------------------------------------------------
+
+/// Replaying a spending UCAN with the same nonce is rejected on the second
+/// attempt. This test exercises the `NonceTracker` wired into `enforce_economy`
+/// via `GovernanceState.spending_nonce_tracker`.
+#[tokio::test]
+async fn spending_ucan_nonce_replay_rejected() {
+    use scp_protocol::economy::types::{Amount, CostSchedule, CurrencyCode, EconomicPolicy};
+
+    let manager = ContextManager::new(
+        Box::new(MockCrypto::default()),
+        Box::new(MockTransport::connected()),
+        Box::new(MockEventLog::default()),
+        noop_key_resolver(),
+    );
+
+    let mut params = governance_params();
+    params.economic_policy = Some(EconomicPolicy {
+        locked: false,
+        cost_schedule: CostSchedule {
+            currency: CurrencyCode([85, 83, 68, 0]),
+            per_message: Some(Amount::new(5)),
+            per_tool_invoke: None,
+            per_join: None,
+            per_period: None,
+            per_byte_stored: None,
+        },
+        payment_adapters: vec![],
+        pricing_formula: None,
+        payee: DID::from("did:key:payee"),
+    });
+    let _handle = manager
+        .create_context("nonce-replay-ctx".into(), params, "did:key:sender".into())
+        .await
+        .unwrap();
+
+    // Grant enough budget for multiple sends.
+    {
+        let mut contexts = manager.contexts.lock().await;
+        let ctx = contexts.get_mut("nonce-replay-ctx").unwrap();
+        ctx.governance
+            .budget_tracker
+            .grant(&"did:key:sender".into(), Amount::new(100));
+    }
+
+    let sk = ed25519_dalek::SigningKey::from_bytes(&[1u8; 32]);
+    let handle = manager
+        .contexts
+        .lock()
+        .await
+        .get("nonce-replay-ctx")
+        .unwrap()
+        .handle
+        .clone();
+
+    // First send with a spending UCAN succeeds.
+    let ucan = dummy_spending_ucan();
+    manager
+        .send_message(
+            &handle,
+            &"did:key:sender".into(),
+            b"first send",
+            Some(&sk),
+            None,
+            Some(&ucan),
+        )
+        .await
+        .unwrap();
+
+    // Replay: second send with the SAME spending UCAN (same nonce) must fail.
+    let result = manager
+        .send_message(
+            &handle,
+            &"did:key:sender".into(),
+            b"replay attempt",
+            Some(&sk),
+            None,
+            Some(&ucan),
+        )
+        .await;
+    assert!(result.is_err(), "replayed spending UCAN should be rejected");
+    let err = result.unwrap_err();
+    assert!(
+        matches!(err, ContextError::PermissionDenied(ref msg) if msg.contains("nonce")),
+        "error should mention nonce replay: {err}"
+    );
+
+    // A fresh UCAN (new nonce) should succeed.
+    let ucan2 = dummy_spending_ucan();
+    let result2 = manager
+        .send_message(
+            &handle,
+            &"did:key:sender".into(),
+            b"fresh nonce",
+            Some(&sk),
+            None,
+            Some(&ucan2),
+        )
+        .await;
+    assert!(
+        result2.is_ok(),
+        "fresh spending UCAN should succeed: {result2:?}"
     );
 }
 
