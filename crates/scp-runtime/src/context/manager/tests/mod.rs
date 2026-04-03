@@ -885,16 +885,16 @@ pub(super) async fn setup_broadcast_context() -> (ContextManager, ContextHandle,
     (manager, handle, "broadcast-ctx".into())
 }
 
-/// Helper: creates an approved `BlockAuthor` governance proposal using
+/// Helper: creates an approved `Revoke` (write) governance proposal using
 /// `SingleAdminEngine` (admin = `admin_did`). Returns the approved
 /// proposal that can be passed to `execute_governance_action()`.
-pub(super) fn approved_block_author_proposal(
+pub(super) fn approved_revoke_proposal(
     admin_did: &DID,
     context_id: &str,
     target_did: &DID,
 ) -> super::GovernanceProposal {
     use scp_protocol::context::governance::{
-        GovernanceAction, GovernanceContext, GovernanceEngine, SingleAdminEngine,
+        AccessScope, GovernanceAction, GovernanceContext, GovernanceEngine, SingleAdminEngine,
     };
 
     let signing_key = ed25519_dalek::SigningKey::from_bytes(&[1u8; 32]);
@@ -915,9 +915,9 @@ pub(super) fn approved_block_author_proposal(
         now: 1000,
     };
 
-    let action = GovernanceAction::BlockAuthor {
+    let action = GovernanceAction::Revoke {
         did: target_did.clone(),
-        reason: Some("governance test".to_owned()),
+        access: AccessScope::Write,
     };
 
     let (proposal, _events) = engine

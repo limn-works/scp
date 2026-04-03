@@ -318,22 +318,22 @@ fn send_message_does_not_call_encrypt_message() {
 // --- Governance / lifecycle ---
 
 #[test]
-fn execute_remove_member_calls_remove_member_sender_key() {
+fn execute_eject_calls_remove_member_sender_key() {
     assert!(
         fn_body_contains(
             MANAGER_SRC,
-            "execute_remove_member",
+            "execute_eject",
             "remove_member_sender_key"
         ),
-        "execute_remove_member must call remove_member_sender_key"
+        "execute_eject must call remove_member_sender_key"
     );
 }
 
 #[test]
-fn execute_remove_member_calls_rotate_sender_key() {
+fn execute_eject_calls_rotate_sender_key() {
     assert!(
-        fn_body_contains(MANAGER_SRC, "execute_remove_member", "rotate_sender_key"),
-        "execute_remove_member must call rotate_sender_key (§9.16.4)"
+        fn_body_contains(MANAGER_SRC, "execute_eject", "rotate_sender_key"),
+        "execute_eject must call rotate_sender_key (§9.16.4)"
     );
 }
 
@@ -483,8 +483,8 @@ fn no_stale_ignores() {
         stale.push("content key rotation wired but #[ignore] for #1548 still present");
     }
 
-    // #1541 — sender key rotation wired in execute_remove_member and leave_context
-    if fn_body_contains(MANAGER_SRC, "execute_remove_member", "rotate_sender_key")
+    // #1541 — sender key rotation wired in execute_eject and leave_context
+    if fn_body_contains(MANAGER_SRC, "execute_eject", "rotate_sender_key")
         && fn_body_contains(MANAGER_SRC, "leave_context", "rotate_sender_key")
         && source.contains("#[ignore = \"")
         && source.contains("1541")

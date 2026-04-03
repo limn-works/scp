@@ -17,7 +17,7 @@ use scp_core::context::governance::unanimity::UnanimityEngine;
 use scp_core::context::governance::{
     ConflictResolution, DeadlockJustification, GovernanceAction, GovernanceContext,
     GovernanceEngine, GovernanceError, GovernanceEvent, GovernanceReconfigAction, KeyResolver,
-    ProposalStatus, PruningPolicy, RevocationScope, SingleAdminEngine, VoteType, actions_conflict,
+    ProposalStatus, PruningPolicy, AccessScope, SingleAdminEngine, VoteType, actions_conflict,
     sign_vote, verify_vote,
 };
 use scp_core::context::params::{Capability, ContextParams};
@@ -143,7 +143,7 @@ fn all_governance_actions_for_test() -> Vec<GovernanceAction> {
             did: bob(),
             role: "member".to_owned(),
         },
-        GovernanceAction::RemoveMember {
+        GovernanceAction::Eject {
             did: bob(),
             reason: Some("inactive".to_owned()),
         },
@@ -170,15 +170,11 @@ fn all_governance_actions_for_test() -> Vec<GovernanceAction> {
         GovernanceAction::CreateChildContext {
             params: Box::new(ContextParams::default()),
         },
-        GovernanceAction::BlockAuthor {
+        GovernanceAction::Revoke {
             did: bob(),
-            reason: Some("spam".to_owned()),
+            access: AccessScope::Read,
         },
-        GovernanceAction::RevokeReadAccess {
-            did: bob(),
-            scope: RevocationScope::Full,
-        },
-        GovernanceAction::RestoreReadAccess { did: bob() },
+        GovernanceAction::RestoreAccess { did: bob(), capabilities: vec![Capability::MessagesRead] },
         GovernanceAction::ModifyPruningPolicy {
             new_policy: PruningPolicy::default(),
         },
@@ -200,11 +196,11 @@ fn all_governance_actions_for_test() -> Vec<GovernanceAction> {
             },
         },
         GovernanceAction::PromoteContext,
-        GovernanceAction::RevokeWriteAccess {
+        GovernanceAction::Revoke {
             did: bob(),
-            scope: RevocationScope::FutureOnly,
+            access: AccessScope::Write,
         },
-        GovernanceAction::RestoreWriteAccess { did: bob() },
+        GovernanceAction::RestoreAccess { did: bob(), capabilities: vec![Capability::MessagesWrite] },
         GovernanceAction::RotateContentKeys {
             reason: Some("periodic hygiene".to_owned()),
         },
@@ -833,17 +829,17 @@ async fn conflict_detection() {
     );
 
     // Mutual RemoveMember.
-    let remove_a = GovernanceAction::RemoveMember {
+    let remove_a = GovernanceAction::Eject {
         did: bob(),
         reason: None,
     };
-    let remove_b = GovernanceAction::RemoveMember {
+    let remove_b = GovernanceAction::Eject {
         did: alice(),
         reason: None,
     };
     assert!(
         actions_conflict(&remove_a, &alice(), &remove_b, &bob()),
-        "mutual RemoveMember should conflict"
+        "mutual Eject should conflict"
     );
 
     // Competing ModifyCeiling.
@@ -859,25 +855,25 @@ async fn conflict_detection() {
     );
 
     // RevokeReadAccess vs RestoreReadAccess.
-    let revoke = GovernanceAction::RevokeReadAccess {
+    let revoke = GovernanceAction::Revoke {
         did: bob(),
-        scope: RevocationScope::Full,
+        access: AccessScope::Read,
     };
-    let restore = GovernanceAction::RestoreReadAccess { did: bob() };
+    let restore = GovernanceAction::RestoreAccess { did: bob(), capabilities: vec![Capability::MessagesRead] };
     assert!(
         actions_conflict(&revoke, &alice(), &restore, &carol()),
-        "RevokeReadAccess vs RestoreReadAccess should conflict"
+        "Revoke (read) vs RestoreAccess (read) should conflict"
     );
 
     // RevokeWriteAccess vs RestoreWriteAccess.
-    let revoke_w = GovernanceAction::RevokeWriteAccess {
+    let revoke_w = GovernanceAction::Revoke {
         did: bob(),
-        scope: RevocationScope::FutureOnly,
+        access: AccessScope::Write,
     };
-    let restore_w = GovernanceAction::RestoreWriteAccess { did: bob() };
+    let restore_w = GovernanceAction::RestoreAccess { did: bob(), capabilities: vec![Capability::MessagesWrite] };
     assert!(
         actions_conflict(&revoke_w, &alice(), &restore_w, &carol()),
-        "RevokeWriteAccess vs RestoreWriteAccess should conflict"
+        "Revoke (write) vs RestoreAccess (write) should conflict"
     );
 }
 
@@ -926,17 +922,17 @@ async fn non_conflicting_actions() {
     );
 
     // Non-mutual RemoveMember (Alice removes Bob, Carol removes Dave).
-    let remove_a = GovernanceAction::RemoveMember {
+    let remove_a = GovernanceAction::Eject {
         did: bob(),
         reason: None,
     };
-    let remove_b = GovernanceAction::RemoveMember {
+    let remove_b = GovernanceAction::Eject {
         did: dave(),
         reason: None,
     };
     assert!(
         !actions_conflict(&remove_a, &alice(), &remove_b, &carol()),
-        "RemoveMember targeting different DIDs (not mutual) should not conflict"
+        "Eject targeting different DIDs (not mutual) should not conflict"
     );
 }
 
@@ -1036,49 +1032,51 @@ async fn governance_event_variants() {
 
 #[tokio::test]
 async fn revocation_scope_variants() {
-    // Verify the two RevocationScope variants for content access actions.
-    let full = RevocationScope::Full;
-    let future_only = RevocationScope::FutureOnly;
+    // Verify the three AccessScope variants for content access actions.
+    let read = AccessScope::Read;
+    let write = AccessScope::Write;
+    let both = AccessScope::Both;
 
-    assert_ne!(full, future_only);
+    assert_ne!(read, write);
+    assert_ne!(read, both);
 
-    // RevokeReadAccess with Full.
-    let action_full = GovernanceAction::RevokeReadAccess {
+    // Revoke with Read scope.
+    let action_read = GovernanceAction::Revoke {
         did: bob(),
-        scope: RevocationScope::Full,
+        access: AccessScope::Read,
     };
-    let json_full = serde_json::to_string(&action_full).unwrap();
-    let deser_full: GovernanceAction = serde_json::from_str(&json_full).unwrap();
+    let json_read = serde_json::to_string(&action_read).unwrap();
+    let deser_read: GovernanceAction = serde_json::from_str(&json_read).unwrap();
     assert_eq!(
-        serde_json::to_string(&deser_full).unwrap(),
-        json_full,
-        "Full scope roundtrip"
+        serde_json::to_string(&deser_read).unwrap(),
+        json_read,
+        "Read scope roundtrip"
     );
 
-    // RevokeReadAccess with FutureOnly.
-    let action_fo = GovernanceAction::RevokeReadAccess {
+    // Revoke with Write scope.
+    let action_write = GovernanceAction::Revoke {
         did: bob(),
-        scope: RevocationScope::FutureOnly,
+        access: AccessScope::Write,
     };
-    let json_fo = serde_json::to_string(&action_fo).unwrap();
-    let deser_fo: GovernanceAction = serde_json::from_str(&json_fo).unwrap();
+    let json_write = serde_json::to_string(&action_write).unwrap();
+    let deser_write: GovernanceAction = serde_json::from_str(&json_write).unwrap();
     assert_eq!(
-        serde_json::to_string(&deser_fo).unwrap(),
-        json_fo,
-        "FutureOnly scope roundtrip"
+        serde_json::to_string(&deser_write).unwrap(),
+        json_write,
+        "Write scope roundtrip"
     );
 
     // Conflicting scopes on same DID.
-    let revoke_full = GovernanceAction::RevokeReadAccess {
+    let revoke_both = GovernanceAction::Revoke {
         did: bob(),
-        scope: RevocationScope::Full,
+        access: AccessScope::Both,
     };
-    let revoke_fo = GovernanceAction::RevokeReadAccess {
+    let revoke_write = GovernanceAction::Revoke {
         did: bob(),
-        scope: RevocationScope::FutureOnly,
+        access: AccessScope::Write,
     };
     assert!(
-        actions_conflict(&revoke_full, &alice(), &revoke_fo, &carol()),
+        actions_conflict(&revoke_both, &alice(), &revoke_write, &carol()),
         "same DID + different scopes should conflict"
     );
 }

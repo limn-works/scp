@@ -1,5 +1,5 @@
 use super::*;
-use scp_protocol::context::governance::{GovernanceAction, RevocationScope};
+use scp_protocol::context::governance::{AccessScope, GovernanceAction};
 
 // -----------------------------------------------------------------------
 // Send message tests
@@ -599,9 +599,9 @@ async fn revoked_member_cannot_decrypt_new_messages() {
         &alice_did,
         "test-ctx",
         &bob_did,
-        GovernanceAction::RevokeReadAccess {
+        GovernanceAction::Revoke {
             did: bob_did.clone(),
-            scope: RevocationScope::Full,
+            access: AccessScope::Read,
         },
     );
     manager
@@ -1568,7 +1568,7 @@ async fn velocity_consequence_trigger_on_send() {
     params.consequence_rules = vec![ConsequenceRule {
         trigger: ConsequenceTrigger::MessageVelocity,
         threshold: 1,
-        action: ConsequenceAction::CapabilitySuspension(vec!["write".to_owned()]),
+        action: ConsequenceAction::Suspend { capabilities: vec!["write".to_owned()] },
         window: Duration::from_secs(3600),
     }];
     let _handle = manager
