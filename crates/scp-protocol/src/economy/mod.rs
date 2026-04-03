@@ -11,6 +11,10 @@ pub mod pricing;
 pub mod types;
 
 // Re-exports for backward compatibility.
+pub use policy::{
+    AVAILABLE_METRICS, UnavailableMetricError, validate_economic_policy_metrics,
+    validate_formula_metrics,
+};
 pub use types::{
     Amount, Coefficient, CostSchedule, CurrencyCode, EconomicPolicy, PaidActionType,
     PricingFormula, PricingMetric, PricingVariable, SubscriptionCost, SubscriptionPeriod,

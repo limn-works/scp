@@ -932,6 +932,10 @@ impl ContextManager {
         params.check_version_compatibility(scp_protocol::envelope::SCP_PROTOCOL_VERSION)?;
         validate_governance_model(&params.governance)?;
         validate_consequence_rules(&params.consequence_rules)?;
+        scp_protocol::economy::policy::validate_economic_policy_metrics(
+            params.economic_policy.as_ref(),
+        )
+        .map_err(|e| ContextCreationError::CreationFailed(e.to_string()))?;
         let governance_engine =
             create_governance_engine(&params.governance, &creator_did, self.key_resolver.clone())?;
         let handle = builder_create_context(
@@ -1116,6 +1120,12 @@ impl ContextManager {
 
         // Validate consistency between GovernanceModel and GovernanceModelConfig.
         validate_governance_consistency(&params.governance, &governance_config)?;
+
+        // Validate that pricing formula only references available metrics.
+        scp_protocol::economy::policy::validate_economic_policy_metrics(
+            params.economic_policy.as_ref(),
+        )
+        .map_err(|e| ContextCreationError::CreationFailed(e.to_string()))?;
 
         // Phase 1+2: builder performs validation and creation (async, no lock held).
         let handle = builder_create_context(

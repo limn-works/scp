@@ -3755,6 +3755,10 @@ impl ContextManager {
         proposal_id: ProposalId,
         actor_did: &str,
     ) -> Result<(), ContextError> {
+        // Validate that pricing formula only references available metrics.
+        scp_protocol::economy::policy::validate_economic_policy_metrics(Some(policy))
+            .map_err(|e| ContextError::PermissionDenied(format!("invalid economic policy: {e}")))?;
+
         let context_id_bytes = context_id_to_bytes(context_id);
 
         let snapshot = {
