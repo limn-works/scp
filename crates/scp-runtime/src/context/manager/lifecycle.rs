@@ -164,6 +164,7 @@ fn enforce_join_economy(
         context_id,
         clock,
         relay_base_price,
+        &mut ctx.governance.spending_nonce_tracker,
     )
 }
 
@@ -316,6 +317,10 @@ impl ContextManager {
                 },
                 participation_cache: ctx_snapshot.participation_cache,
                 cooldown_until: ctx_snapshot.cooldown_until,
+                spending_nonce_tracker: scp_protocol::crypto::ucan::nonce::NonceTracker::new(
+                    context_id.to_owned(),
+                    Arc::clone(&self.clock),
+                ),
             },
             role_state: ctx_snapshot.role_state,
             receive_buffer: ReceiveBuffer::new(),
@@ -827,6 +832,10 @@ impl ContextManager {
                 },
                 participation_cache: export.snapshot.participation_cache,
                 cooldown_until: export.snapshot.cooldown_until,
+                spending_nonce_tracker: scp_protocol::crypto::ucan::nonce::NonceTracker::new(
+                    context_id.clone(),
+                    Arc::clone(&self.clock),
+                ),
             },
             epoch: EpochState {
                 mls_epoch: export.snapshot.mls_epoch,
@@ -930,6 +939,7 @@ impl ContextManager {
     /// persists.
     ///
     /// See ADR-008 acceptance criterion 2.
+    #[allow(clippy::too_many_lines)] // Context creation initializes many subsystems including nonce tracking.
     #[instrument(skip_all, fields(context_id = %context_id))]
     pub async fn create_context(
         &self,
@@ -1001,6 +1011,10 @@ impl ContextManager {
                 velocity_tracker: scp_protocol::economy::antispam::SenderVelocityTracker::new(3600),
                 participation_cache: HashMap::new(),
                 cooldown_until: HashMap::new(),
+                spending_nonce_tracker: scp_protocol::crypto::ucan::nonce::NonceTracker::new(
+                    context_id.clone(),
+                    Arc::clone(&self.clock),
+                ),
             },
             role_state,
             receive_buffer: ReceiveBuffer::new(),
@@ -1304,6 +1318,10 @@ impl ContextManager {
                 velocity_tracker: scp_protocol::economy::antispam::SenderVelocityTracker::new(3600),
                 participation_cache: HashMap::new(),
                 cooldown_until: HashMap::new(),
+                spending_nonce_tracker: scp_protocol::crypto::ucan::nonce::NonceTracker::new(
+                    context_id.to_owned(),
+                    Arc::clone(&self.clock),
+                ),
             },
             epoch: EpochState {
                 mls_epoch: 0,

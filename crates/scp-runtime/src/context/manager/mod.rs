@@ -745,6 +745,10 @@ struct GovernanceState {
     /// Optional EIP-1559-style relay pricing configuration (§19.8, #1537).
     /// Updated on each message send via `maybe_adjust_relay_pricing`.
     relay_pricing_config: Option<scp_protocol::economy::pricing::RelayPricingConfig>,
+    /// Per-context nonce tracker for spending UCAN replay prevention (ADR-016 §6).
+    /// Validates that each spending UCAN nonce is used at most once, preventing
+    /// replay attacks where a valid spending UCAN is resubmitted.
+    spending_nonce_tracker: scp_protocol::crypto::ucan::nonce::NonceTracker<Arc<dyn Clock>>,
 }
 
 impl GovernanceState {
