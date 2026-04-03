@@ -2,7 +2,7 @@
 //!
 //! Governance proposals and votes are MLS application messages. They do **not**
 //! trigger MLS epoch advances on their own. However, governance actions that
-//! result in membership changes (`AddMember`, `RemoveMember`) DO trigger MLS
+//! result in membership changes (`AddMember`, `Eject`) DO trigger MLS
 //! operations (add/remove), which advance the epoch.
 //!
 //! The lifecycle when a membership-affecting proposal is approved:
@@ -59,12 +59,12 @@ pub enum MlsImpact {
 
 /// Classify a [`GovernanceAction`] by its MLS impact.
 ///
-/// `AddMember`, `RemoveMember`, and `RevokeReadAccess` require MLS group
-/// operations (in encrypted contexts, revocation removes the member from the
-/// MLS group). All other governance actions (role changes, settings changes,
-/// tool registration, `RestoreReadAccess`, etc.) operate at the governance
-/// layer without touching MLS state. `RestoreReadAccess` is `NoMlsChange`
-/// because re-adding a member to the MLS group is a separate flow.
+/// `AddMember`, `Eject`, and `Revoke` require MLS group operations (in
+/// encrypted contexts, revocation removes the member from the MLS group).
+/// All other governance actions (role changes, settings changes, tool
+/// registration, `RestoreAccess`, etc.) operate at the governance layer
+/// without touching MLS state. `RestoreAccess` is `NoMlsChange` because
+/// re-adding a member to the MLS group is a separate flow.
 ///
 /// # Examples
 ///
@@ -87,8 +87,8 @@ pub const fn classify_action(action: &GovernanceAction) -> MlsImpact {
     match action {
         // Membership changes trigger MLS Commit (epoch advance).
         GovernanceAction::AddMember { .. }
-        | GovernanceAction::RemoveMember { .. }
-        | GovernanceAction::RevokeReadAccess { .. }
+        | GovernanceAction::Eject { .. }
+        | GovernanceAction::Revoke { .. }
         | GovernanceAction::ResetMember { .. } => MlsImpact::MembershipChange,
         // All other actions are governance-level state changes that do not
         // affect MLS group membership (ADR-031 §8).
@@ -100,8 +100,8 @@ pub const fn classify_action(action: &GovernanceAction) -> MlsImpact {
         | GovernanceAction::ExtendTtl { .. }
         | GovernanceAction::TransferAdmin { .. }
         | GovernanceAction::CreateChildContext { .. }
-        | GovernanceAction::BlockAuthor { .. }
-        | GovernanceAction::RestoreReadAccess { .. }
+        | GovernanceAction::SuspendMember { .. }
+        | GovernanceAction::RestoreAccess { .. }
         | GovernanceAction::ModifyPruningPolicy { .. }
         | GovernanceAction::AddSigner { .. }
         | GovernanceAction::RemoveSigner { .. }
@@ -109,8 +109,6 @@ pub const fn classify_action(action: &GovernanceAction) -> MlsImpact {
         | GovernanceAction::EstablishToolInterface { .. }
         | GovernanceAction::ResolveConflict { .. }
         | GovernanceAction::PromoteContext
-        | GovernanceAction::RevokeWriteAccess { .. }
-        | GovernanceAction::RestoreWriteAccess { .. }
         | GovernanceAction::RotateContentKeys { .. }
         | GovernanceAction::ReconfigureGovernance { .. }
         | GovernanceAction::SetEconomicPolicy { .. }
@@ -179,16 +177,16 @@ pub fn generate_mls_operations(
             did: did.clone(),
             role: role.clone(),
         }),
-        GovernanceAction::RemoveMember { did, reason } => Some(MlsOperation::RemoveMember {
+        GovernanceAction::Eject { did, reason } => Some(MlsOperation::RemoveMember {
             did: did.clone(),
             reason: reason.clone(),
         }),
-        // RevokeReadAccess in encrypted mode is MLS group removal (same as
-        // RemoveMember at the MLS layer). In broadcast mode, the manager
+        // Revoke in encrypted mode is MLS group removal (same as
+        // Eject at the MLS layer). In broadcast mode, the manager
         // handles this directly without MLS.
-        GovernanceAction::RevokeReadAccess { did, .. } => Some(MlsOperation::RemoveMember {
+        GovernanceAction::Revoke { did, .. } => Some(MlsOperation::RemoveMember {
             did: did.clone(),
-            reason: Some("read access revoked".to_owned()),
+            reason: Some("access revoked".to_owned()),
         }),
         // ResetMember is MLS remove + re-add. The manager handles both
         // operations directly, but we classify the MLS impact as removal
@@ -495,7 +493,7 @@ pub const fn is_proposal_epoch_valid(
 mod tests {
     use super::*;
     use crate::context::governance::{
-        GovernanceAction, GovernanceProposal, ProposalStatus, RevocationScope, VoteType, sign_vote,
+        AccessScope, GovernanceAction, GovernanceProposal, ProposalStatus, VoteType, sign_vote,
     };
     use crate::context::params::{Capability, ContextParams, ToolRegistration};
     use scp_primitives::DID;
@@ -586,8 +584,8 @@ mod tests {
     }
 
     #[test]
-    fn classify_remove_member_is_membership_change() {
-        let action = GovernanceAction::RemoveMember {
+    fn classify_eject_is_membership_change() {
+        let action = GovernanceAction::Eject {
             did: bob(),
             reason: Some("inactive".to_owned()),
         };
@@ -672,26 +670,29 @@ mod tests {
     }
 
     #[test]
-    fn classify_revoke_read_access_is_membership_change() {
-        let action = GovernanceAction::RevokeReadAccess {
+    fn classify_revoke_read_is_membership_change() {
+        let action = GovernanceAction::Revoke {
             did: bob(),
-            scope: RevocationScope::Full,
+            access: AccessScope::Read,
         };
         assert_eq!(classify_action(&action), MlsImpact::MembershipChange);
     }
 
     #[test]
-    fn classify_revoke_read_access_future_only_is_membership_change() {
-        let action = GovernanceAction::RevokeReadAccess {
+    fn classify_revoke_both_is_membership_change() {
+        let action = GovernanceAction::Revoke {
             did: bob(),
-            scope: RevocationScope::FutureOnly,
+            access: AccessScope::Both,
         };
         assert_eq!(classify_action(&action), MlsImpact::MembershipChange);
     }
 
     #[test]
-    fn classify_restore_read_access_is_no_mls_change() {
-        let action = GovernanceAction::RestoreReadAccess { did: bob() };
+    fn classify_restore_access_is_no_mls_change() {
+        let action = GovernanceAction::RestoreAccess {
+            did: bob(),
+            capabilities: vec![Capability::MessagesRead],
+        };
         assert_eq!(classify_action(&action), MlsImpact::NoMlsChange);
     }
 
@@ -718,8 +719,8 @@ mod tests {
     }
 
     #[test]
-    fn generate_mls_ops_for_remove_member() {
-        let action = GovernanceAction::RemoveMember {
+    fn generate_mls_ops_for_eject() {
+        let action = GovernanceAction::Eject {
             did: bob(),
             reason: Some("inactive".to_owned()),
         };
@@ -1012,8 +1013,8 @@ mod tests {
     }
 
     #[test]
-    fn approved_remove_member_requires_mls_coordination() {
-        let action = GovernanceAction::RemoveMember {
+    fn approved_eject_requires_mls_coordination() {
+        let action = GovernanceAction::Eject {
             did: bob(),
             reason: None,
         };
@@ -1103,7 +1104,7 @@ mod tests {
     #[test]
     fn reset_does_not_invalidate_approved_proposals() {
         let proposals = vec![approved_proposal(
-            GovernanceAction::RemoveMember {
+            GovernanceAction::Eject {
                 did: bob(),
                 reason: None,
             },
@@ -1322,10 +1323,10 @@ mod tests {
     }
 
     #[test]
-    fn full_coordination_flow_remove_member() {
-        // Simulate remove member flow.
+    fn full_coordination_flow_eject() {
+        // Simulate eject member flow.
 
-        let action = GovernanceAction::RemoveMember {
+        let action = GovernanceAction::Eject {
             did: bob(),
             reason: Some("violation".to_owned()),
         };
@@ -1341,6 +1342,7 @@ mod tests {
             mls_op,
             MlsOperation::RemoveMember {
                 did: bob(),
+                // Eject passes reason through directly.
                 reason: Some("violation".to_owned()),
             }
         );
