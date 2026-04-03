@@ -346,8 +346,6 @@ impl ContextManager {
                 needs_reconnect,
             },
             access: AccessControlState {
-                write_revoked_members: ctx_snapshot.write_revoked_members,
-                read_revoked_members: ctx_snapshot.read_revoked_members,
                 read_exclusion_list: ctx_snapshot.read_exclusion_list,
                 access_key_store: ctx_snapshot.access_key_store,
             },
@@ -858,8 +856,6 @@ impl ContextManager {
                 needs_reconnect: false,
             },
             access: AccessControlState {
-                write_revoked_members: export.snapshot.write_revoked_members,
-                read_revoked_members: export.snapshot.read_revoked_members,
                 read_exclusion_list: export.snapshot.read_exclusion_list,
                 access_key_store: export.snapshot.access_key_store,
             },
@@ -1039,8 +1035,6 @@ impl ContextManager {
                 needs_reconnect: false,
             },
             access: AccessControlState {
-                write_revoked_members: HashSet::new(),
-                read_revoked_members: HashSet::new(),
                 read_exclusion_list: HashSet::new(),
                 access_key_store: initial_access_key_store,
             },
@@ -1343,8 +1337,6 @@ impl ContextManager {
                 needs_reconnect: false,
             },
             access: AccessControlState {
-                write_revoked_members: HashSet::new(),
-                read_revoked_members: HashSet::new(),
                 read_exclusion_list: HashSet::new(),
                 // Generate access key for the creator (§9.17.2 step 1),
                 // matching the pattern in create_context. Without this,

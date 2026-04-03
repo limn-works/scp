@@ -322,7 +322,7 @@ impl ContextManager {
     /// member's local key material is destroyed.
     ///
     /// This is the explicit counterpart to the implicit key removal that
-    /// happens during `RevokeReadAccess` governance action execution
+    /// happens during `Revoke` governance action execution
     /// (§9.17.2 step 3, ADR-038).
     ///
     /// # Errors
@@ -372,7 +372,7 @@ impl ContextManager {
     /// re-distributed (forward-only restoration, §9.16.8, ADR-038).
     ///
     /// This is the explicit counterpart to the implicit key restoration
-    /// that happens during `RestoreReadAccess` governance action execution
+    /// that happens during `RestoreAccess` governance action execution
     /// (§9.17.2 step 5).
     ///
     /// # Errors

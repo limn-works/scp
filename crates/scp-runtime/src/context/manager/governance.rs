@@ -1,66 +1,58 @@
 //! Governance proposal, vote, execute, and dispatch operations.
 
 use super::{
-    Arc, CEILING_CHANGE_NOTIFICATION_PERIOD_SECS, Capability, CapabilityCeiling, Clock,
-    ConsequenceRule, ContentKeysRotatedResult, ContextError, ContextEvent, ContextManager,
+    AccessScope, Arc, CEILING_CHANGE_NOTIFICATION_PERIOD_SECS, Capability, CapabilityCeiling,
+    Clock, ConsequenceRule, ContentKeysRotatedResult, ContextError, ContextEvent, ContextManager,
     ContextParams, ContextState, DID, ECONOMIC_POLICY_NOTIFICATION_PERIOD_SECS,
     EXECUTED_PROPOSALS_TTL_SECS, EconomicPolicy, GovernanceAction, GovernanceActionResult,
-    GovernanceBanResult, GovernanceContext, GovernanceEvent, GovernanceProposal,
-    GovernanceReconfiguredResult, HashSet, MAX_REGISTERED_TOOLS, MAX_THRESHOLD_SIGNERS,
-    MAX_TOOL_INTERFACES, MigrationProposedResult, MigrationState, MlsImpact,
-    PendingCeilingModification, PendingEconomicPolicyChange, PerContextState, ProposalId,
-    ProposalOutcome, ProposalStatus, PruningPolicy, ReadAccessRestoredResult,
-    ReadAccessRevokedResult, RevocationScope, ToolInterface, ToolRegistration,
-    TriggeredConsequence, WriteAccessRestoredResult, WriteAccessRevokedResult, classify_action,
-    collect_active_voters, context_id_to_bytes, evaluate_consequence_rules,
-    generate_mls_operations, instrument, process_pending_proposals, push_welcome_event,
-    require_active, require_migrating_out, roles, update_detection_state,
+    GovernanceContext, GovernanceEvent, GovernanceProposal, GovernanceReconfiguredResult, HashSet,
+    MAX_REGISTERED_TOOLS, MAX_THRESHOLD_SIGNERS, MAX_TOOL_INTERFACES, MigrationProposedResult,
+    MigrationState, MlsImpact, PendingCeilingModification, PendingEconomicPolicyChange,
+    PerContextState, ProposalId, ProposalOutcome, ProposalStatus, PruningPolicy,
+    RestoreAccessResult, RevokeResult, SuspendMemberResult, ToolInterface, ToolRegistration,
+    TriggeredConsequence, classify_action, collect_active_voters, context_id_to_bytes,
+    evaluate_consequence_rules, generate_mls_operations, instrument, process_pending_proposals,
+    push_welcome_event, require_active, require_migrating_out, roles, update_detection_state,
 };
 
-/// Enforces a `CapabilitySuspension` consequence action on a member.
+/// Enforces a `Suspend` consequence action on a member.
 ///
-/// Suspends capabilities by revoking write/read access for matching
-/// capability names. Uses exact matching to prevent false positives
-/// (e.g., "spreadsheet" matching "write"). Enforced at the
-/// `send_message` and `deliver_incoming` gates.
-fn enforce_capability_suspension(
-    ctx: &mut PerContextState,
-    member_did: &DID,
-    caps: &[String],
-) -> bool {
+/// Suspends capabilities by adding them to the member's suspended set
+/// in `ContextRoleState`. The suspension-aware `member_has_capability`
+/// check in the `send_message` and `deliver_incoming` gates will then
+/// reject operations requiring those capabilities.
+fn enforce_suspend(ctx: &mut PerContextState, member_did: &DID, caps: &[String]) -> bool {
     let mut applied = false;
     for cap_name in caps {
-        match cap_name.as_str() {
-            "write" | "MessagesWrite" | "messages:write" => {
-                ctx.access.write_revoked_members.insert(member_did.clone());
-                applied = true;
-            }
-            "read" | "MessagesRead" | "messages:read" => {
-                ctx.access.read_revoked_members.insert(member_did.clone());
-                applied = true;
-            }
+        let capability = match cap_name.as_str() {
+            "write" | "MessagesWrite" | "messages:write" => Capability::MessagesWrite,
+            "read" | "MessagesRead" | "messages:read" => Capability::MessagesRead,
             other => {
                 tracing::warn!(
                     capability = other,
                     member = %member_did,
                     "unknown capability in suspension — no action taken"
                 );
+                continue;
             }
-        }
+        };
+        ctx.role_state
+            .suspend_capabilities(member_did.as_ref(), [capability]);
+        applied = true;
     }
     applied
 }
 
-/// Enforces a `RoleDemotion` consequence action on a member.
+/// Enforces an `AssignRole` consequence action on a member.
 ///
-/// Demotes the member to the specified role (best-effort — role may not exist).
+/// Assigns the member to the specified role (best-effort — role may not exist).
 /// Uses the injected clock (via `now` parameter) instead of `SystemClock` to
 /// keep all governance timing consistent with the `ContextManager`'s clock.
 ///
 /// Uses [`roles::system_assign_role`] which bypasses the `RoleAssign`
 /// capability check — the governance engine must be able to demote members
 /// regardless of which member (if any) currently holds `RoleAssign`.
-fn enforce_role_demotion(
+fn enforce_assign_role(
     ctx: &mut PerContextState,
     member_did: &DID,
     to_role: &str,
@@ -147,15 +139,9 @@ pub(super) fn enforce_triggered_consequences(
         }
 
         let action_type = match &consequence.action {
-            scp_protocol::trust::consequence::ConsequenceAction::CapabilitySuspension(_) => {
-                "CapabilitySuspension"
-            }
-            scp_protocol::trust::consequence::ConsequenceAction::AccessRevocation => {
-                "AccessRevocation"
-            }
-            scp_protocol::trust::consequence::ConsequenceAction::RoleDemotion { .. } => {
-                "RoleDemotion"
-            }
+            scp_protocol::trust::consequence::ConsequenceAction::Suspend { .. } => "Suspend",
+            scp_protocol::trust::consequence::ConsequenceAction::SuspendAll => "SuspendAll",
+            scp_protocol::trust::consequence::ConsequenceAction::AssignRole { .. } => "AssignRole",
         };
         let trigger_type = rules
             .get(consequence.rule_index)
@@ -172,20 +158,19 @@ pub(super) fn enforce_triggered_consequences(
         // calls a named function as an expression_statement so the pipeline
         // wiring gates can detect the call_expression per-variant.
         let success = match &consequence.action {
-            scp_protocol::trust::consequence::ConsequenceAction::CapabilitySuspension(caps) => {
-                enforce_capability_suspension(ctx, member_did, caps)
+            scp_protocol::trust::consequence::ConsequenceAction::Suspend { capabilities } => {
+                enforce_suspend(ctx, member_did, capabilities)
             }
-            scp_protocol::trust::consequence::ConsequenceAction::AccessRevocation => {
-                // AccessRevocation is application-level enforcement only.
-                // For cryptographic exclusion, dispatch a RemoveMember
-                // governance action which performs MLS group removal and
-                // sender key rotation.
-                ctx.access.write_revoked_members.insert(member_did.clone());
-                ctx.access.read_revoked_members.insert(member_did.clone());
+            scp_protocol::trust::consequence::ConsequenceAction::SuspendAll => {
+                // SuspendAll: suspend all capabilities via role_state.
+                // For cryptographic exclusion, dispatch an Eject governance
+                // action which performs MLS group removal and sender key
+                // rotation.
+                ctx.role_state.suspend_all(member_did.as_ref());
                 true
             }
-            scp_protocol::trust::consequence::ConsequenceAction::RoleDemotion { to_role } => {
-                enforce_role_demotion(ctx, member_did, to_role, clock)
+            scp_protocol::trust::consequence::ConsequenceAction::AssignRole { to_role } => {
+                enforce_assign_role(ctx, member_did, to_role, clock)
             }
         };
 
@@ -194,18 +179,17 @@ pub(super) fn enforce_triggered_consequences(
                 context_id,
                 member = %member_did,
                 action_type,
-                "consequence enforcement failed — escalating to AccessRevocation"
+                "consequence enforcement failed — escalating to SuspendAll"
             );
 
-            // H10: escalate to AccessRevocation when enforcement fails.
+            // H10: escalate to SuspendAll when enforcement fails.
             // Skip cooldown on failure so the escalation fires immediately.
-            ctx.access.write_revoked_members.insert(member_did.clone());
-            ctx.access.read_revoked_members.insert(member_did.clone());
+            ctx.role_state.suspend_all(member_did.as_ref());
 
             ctx.receive_buffer.push(ContextEvent::ConsequenceEnforced {
                 context_id: context_id.to_owned(),
                 member_did: member_did.clone(),
-                action_type: "AccessRevocation(escalated)".to_owned(),
+                action_type: "SuspendAll(escalated)".to_owned(),
                 success: true,
             });
             continue; // skip cooldown recording — failed action doesn't count
@@ -403,9 +387,9 @@ pub(super) fn event_log_entries_for_consequences(
 
 /// Checks whether a proposer is eligible to submit a governance proposal.
 ///
-/// Composite gate combining three independent eligibility signals (#1530):
+/// Composite gate combining independent eligibility signals:
 /// 1. **Pending removal** — defense-in-depth: members with an approved
-///    `RemoveMember` proposal targeting them cannot submit new proposals.
+///    `MemberEject` proposal targeting them cannot submit new proposals.
 /// 2. **Participation threshold** — members whose participation record
 ///    shows a net-negative governance ratio (more actions against than by)
 ///    are blocked. See [`scp_protocol::trust::participation::meets_threshold`].
@@ -422,13 +406,13 @@ fn check_proposer_eligibility(
     now: u64,
     event_log: &dyn super::super::builder::ContextEventLogProvider,
 ) -> Result<(), ContextError> {
-    // Check for pending removal (existing defense-in-depth).
+    // Check for pending ejection (existing defense-in-depth).
     for (proposal, _seq, _ts) in ctx.governance.approved_proposals.values() {
-        if let GovernanceAction::RemoveMember { did, .. } = &proposal.action
+        if let GovernanceAction::Eject { did, .. } = &proposal.action
             && did == proposer_did
         {
             return Err(ContextError::PermissionDenied(
-                "member has a pending removal — cannot propose governance actions".into(),
+                "member has a pending ejection — cannot propose governance actions".into(),
             ));
         }
     }
@@ -541,19 +525,16 @@ impl ContextManager {
     /// context's governance model (e.g., `SingleAdminEngine::propose()` for
     /// single-admin contexts, or `ThresholdEngine::approve()` reaching quorum).
     ///
-    /// Supports all 25 [`GovernanceAction`] variants (24 from ADR-031 + legacy `BlockAuthor`).
-    /// Actions that modify context state do so under the context write lock
-    /// and emit appropriate events.
+    /// Supports all [`GovernanceAction`] variants. Actions that modify context
+    /// state do so under the context write lock and emit appropriate events.
     ///
     /// # Errors
     ///
     /// - [`ContextError::PermissionDenied`] if the proposal is not in
     ///   `Approved` status.
     /// - [`ContextError::PermissionDenied`] if the context's ceiling does not
-    ///   include `MemberBan` (for `RevokeReadAccess`/`RestoreReadAccess`).
+    ///   include `MemberBan` (for `Revoke`/`RestoreAccess`/`SuspendMember`).
     /// - [`ContextError::ContextNotActive`] if the context is not `Active`.
-    /// - [`ContextError::MembershipFailed`] if the context is not a broadcast
-    ///   context (for `BlockAuthor`, `RevokeReadAccess`, `RestoreReadAccess`).
     #[instrument(skip_all, fields(context_id))]
     pub async fn execute_governance_action(
         &self,
@@ -645,7 +626,7 @@ impl ContextManager {
         context_id: &str,
         proposal: &GovernanceProposal,
     ) -> Result<(), ContextError> {
-        // For MLS-mutating actions (AddMember, RemoveMember, RevokeReadAccess,
+        // For MLS-mutating actions (AddMember, Eject, Revoke,
         // ResetMember), increment the epoch counter, place the old epoch into
         // the grace store (§23.11), record the coordination in the
         // EpochCoordinator (ADR-031 §8, issue #630), and report the new epoch.
@@ -839,44 +820,34 @@ impl ContextManager {
         let pid = proposal.proposal_id;
         let actor = proposal.proposer_did.as_ref();
         match &proposal.action {
-            GovernanceAction::BlockAuthor { did, .. } => {
-                // Delegate to RevokeWriteAccess with Full scope (SCP-RG-016,
-                // ADR-038). BlockAuthor is a legacy action; the content access
-                // key layer provides the proper mechanism for revoking write
-                // access. Delegation ensures key rotation and access tracking
-                // are handled consistently.
-                self.execute_revoke_write_access(
-                    context_id,
-                    did,
-                    RevocationScope::Full,
-                    pid,
-                    actor,
-                )
-                .await?;
-                Ok(GovernanceActionResult::WriteAccessRevoked(
-                    WriteAccessRevokedResult {
+            GovernanceAction::SuspendMember { did, capabilities } => {
+                self.execute_suspend_member(context_id, did, capabilities, pid, actor)
+                    .await?;
+                Ok(GovernanceActionResult::MemberSuspended(
+                    SuspendMemberResult {
                         did: did.clone(),
-                        scope: RevocationScope::Full,
+                        capabilities: capabilities.clone(),
                     },
                 ))
             }
-            GovernanceAction::RevokeReadAccess { did, scope } => {
+            GovernanceAction::Revoke { did, access } => {
                 let r = self
-                    .revoke_read_access_internal(context_id, did, *scope, actor)
+                    .execute_revoke(context_id, did, *access, pid, actor)
                     .await?;
-                Ok(GovernanceActionResult::ReadAccessRevoked(
-                    ReadAccessRevokedResult {
-                        did: did.clone(),
-                        scope: *scope,
-                        rotated_author_count: r.rotated_authors.len(),
-                    },
-                ))
+                Ok(GovernanceActionResult::AccessRevoked(RevokeResult {
+                    did: did.clone(),
+                    access: *access,
+                    rotated_author_count: r,
+                }))
             }
-            GovernanceAction::RestoreReadAccess { did } => {
-                self.restore_read_access_internal(context_id, did, actor)
+            GovernanceAction::RestoreAccess { did, capabilities } => {
+                self.execute_restore_access(context_id, did, capabilities, pid, actor)
                     .await?;
-                Ok(GovernanceActionResult::ReadAccessRestored(
-                    ReadAccessRestoredResult { did: did.clone() },
+                Ok(GovernanceActionResult::AccessRestored(
+                    RestoreAccessResult {
+                        did: did.clone(),
+                        capabilities: capabilities.clone(),
+                    },
                 ))
             }
             GovernanceAction::PromoteContext => {
@@ -918,7 +889,7 @@ impl ContextManager {
             }
             // Remaining actions dispatched to context-level handler.
             GovernanceAction::AddMember { .. }
-            | GovernanceAction::RemoveMember { .. }
+            | GovernanceAction::Eject { .. }
             | GovernanceAction::ChangeRole { .. }
             | GovernanceAction::RegisterTool { .. }
             | GovernanceAction::RemoveTool { .. }
@@ -933,8 +904,6 @@ impl ContextManager {
             | GovernanceAction::EstablishToolInterface { .. }
             | GovernanceAction::ResetMember { .. }
             | GovernanceAction::ResolveConflict { .. }
-            | GovernanceAction::RevokeWriteAccess { .. }
-            | GovernanceAction::RestoreWriteAccess { .. }
             | GovernanceAction::RotateContentKeys { .. }
             | GovernanceAction::ReconfigureGovernance { .. }
             | GovernanceAction::ProposeContextMigration { .. }
@@ -967,10 +936,9 @@ impl ContextManager {
                     .await?;
                 Ok(GovernanceActionResult::MemberAdded)
             }
-            GovernanceAction::RemoveMember { did, .. } => {
-                self.execute_remove_member(context_id, did, pid, actor_did)
-                    .await?;
-                Ok(GovernanceActionResult::MemberRemoved)
+            GovernanceAction::Eject { did, .. } => {
+                self.execute_eject(context_id, did, pid, actor_did).await?;
+                Ok(GovernanceActionResult::MemberEjected)
             }
             GovernanceAction::ChangeRole { did, new_role } => {
                 self.execute_change_role(context_id, did, new_role, pid, actor_did)
@@ -1044,21 +1012,18 @@ impl ContextManager {
             | GovernanceAction::EstablishToolInterface { .. }
             | GovernanceAction::ResetMember { .. }
             | GovernanceAction::ResolveConflict { .. }
-            | GovernanceAction::RevokeWriteAccess { .. }
-            | GovernanceAction::RestoreWriteAccess { .. }
             | GovernanceAction::RotateContentKeys { .. }
             | GovernanceAction::ReconfigureGovernance { .. } => {
                 self.dispatch_content_governance_action(context_id, action, pid, actor_did)
                     .await
             }
-            // PromoteContext, ExtendTtl, BlockAuthor, RevokeReadAccess,
-            // RestoreReadAccess, and economic actions are handled in
-            // dispatch_governance_action.
+            // SuspendMember, Revoke, RestoreAccess, PromoteContext, ExtendTtl,
+            // and economic actions are handled in dispatch_governance_action.
             GovernanceAction::PromoteContext
             | GovernanceAction::ExtendTtl { .. }
-            | GovernanceAction::BlockAuthor { .. }
-            | GovernanceAction::RevokeReadAccess { .. }
-            | GovernanceAction::RestoreReadAccess { .. }
+            | GovernanceAction::SuspendMember { .. }
+            | GovernanceAction::Revoke { .. }
+            | GovernanceAction::RestoreAccess { .. }
             | GovernanceAction::SetEconomicPolicy { .. }
             | GovernanceAction::ApproveSpend { .. }
             | GovernanceAction::LockEconomicPolicy => {
@@ -1114,23 +1079,6 @@ impl ContextManager {
                 .await?;
                 Ok(GovernanceActionResult::ConflictResolved)
             }
-            GovernanceAction::RevokeWriteAccess { did, scope } => {
-                self.execute_revoke_write_access(context_id, did, *scope, pid, actor_did)
-                    .await?;
-                Ok(GovernanceActionResult::WriteAccessRevoked(
-                    WriteAccessRevokedResult {
-                        did: did.clone(),
-                        scope: *scope,
-                    },
-                ))
-            }
-            GovernanceAction::RestoreWriteAccess { did } => {
-                self.execute_restore_write_access(context_id, did, pid, actor_did)
-                    .await?;
-                Ok(GovernanceActionResult::WriteAccessRestored(
-                    WriteAccessRestoredResult { did: did.clone() },
-                ))
-            }
             GovernanceAction::RotateContentKeys { reason } => {
                 self.execute_rotate_content_keys(context_id, reason.as_deref(), pid, actor_did)
                     .await?;
@@ -1163,14 +1111,14 @@ impl ContextManager {
             // for compile-time coverage (no wildcard).
             GovernanceAction::PromoteContext
             | GovernanceAction::ExtendTtl { .. }
-            | GovernanceAction::BlockAuthor { .. }
-            | GovernanceAction::RevokeReadAccess { .. }
-            | GovernanceAction::RestoreReadAccess { .. }
+            | GovernanceAction::SuspendMember { .. }
+            | GovernanceAction::Revoke { .. }
+            | GovernanceAction::RestoreAccess { .. }
             | GovernanceAction::SetEconomicPolicy { .. }
             | GovernanceAction::ApproveSpend { .. }
             | GovernanceAction::LockEconomicPolicy
             | GovernanceAction::AddMember { .. }
-            | GovernanceAction::RemoveMember { .. }
+            | GovernanceAction::Eject { .. }
             | GovernanceAction::ChangeRole { .. }
             | GovernanceAction::RegisterTool { .. }
             | GovernanceAction::RemoveTool { .. }
@@ -1289,13 +1237,14 @@ impl ContextManager {
                 require_active(&ctx.handle)?;
             }
 
-            // Presence-only members (read + write revoked) lose
+            // Presence-only members (all capabilities suspended) lose
             // GovernancePropose capability (§5.9, ADR-038).
-            if ctx.access.read_revoked_members.contains(proposer_did)
-                && ctx.access.write_revoked_members.contains(proposer_did)
+            if !ctx
+                .role_state
+                .member_has_capability(proposer_did.as_ref(), &Capability::GovernancePropose)
             {
                 return Err(ContextError::PermissionDenied(
-                    "presence-only members cannot propose governance actions".into(),
+                    "member does not have governance:propose capability".into(),
                 ));
             }
 
@@ -1457,13 +1406,13 @@ impl ContextManager {
 
             require_active(&ctx.handle)?;
 
-            // Presence-only members (read + write revoked) lose
-            // GovernanceVote capability (§5.9, ADR-038).
-            if ctx.access.read_revoked_members.contains(voter_did)
-                && ctx.access.write_revoked_members.contains(voter_did)
+            // Suspended members lose GovernanceVote capability (§5.9, ADR-038).
+            if !ctx
+                .role_state
+                .member_has_capability(voter_did.as_ref(), &Capability::GovernanceVote)
             {
                 return Err(ContextError::PermissionDenied(
-                    "presence-only members cannot vote on governance proposals".into(),
+                    "member does not have governance:vote capability".into(),
                 ));
             }
 
@@ -1811,170 +1760,192 @@ impl ContextManager {
         Ok(status)
     }
 
-    /// Internal implementation of read access revocation. Only callable within
-    /// the crate -- external callers must go through [`execute_governance_action`]
-    /// with an approved [`GovernanceProposal`] containing a
-    /// [`GovernanceAction::RevokeReadAccess`] action.
+    /// Executes a `SuspendMember` governance action.
     ///
-    /// Works in both broadcast and encrypted contexts (ADR-038, §9.17):
-    /// - **Broadcast mode**: bans subscriber via
-    ///   [`BroadcastContext::governance_ban_subscriber`], rotating all
-    ///   author keys to exclude the target.
-    /// - **Encrypted mode**: tracks revocation in `read_revoked_members`
-    ///   and emits event so the MLS/crypto layer can act.
-    ///
-    /// Scope differentiation (§5.9):
-    /// - `Full`: target loses access to both historical and future content.
-    ///   Tracked in `read_revoked_members`.
-    /// - `FutureOnly`: target retains historical access but is excluded
-    ///   from future CEK wrapping. Tracked in `read_exclusion_list`.
-    ///
-    /// Redundancy handling: revoke-when-already-revoked is a no-op (§5.9).
-    /// The member remains in the context (membership/access decoupling).
+    /// Suspends specific capabilities for a member via the role state's
+    /// `suspend_capabilities` method. The member remains in the context
+    /// but the suspended capabilities are blocked at the application-level
+    /// gates (`send_message`, `deliver_incoming`, etc.).
     ///
     /// Requires the `MemberBan` capability in the context's ceiling (§5.3).
-    ///
-    /// # Errors
-    ///
-    /// - [`ContextError::PermissionDenied`] if the ceiling lacks `MemberBan`.
-    /// - [`ContextError::ContextNotActive`] if the context is not `Active`.
-    /// - [`ContextError::MemberNotFound`] if the DID is not a member.
-    async fn revoke_read_access_internal(
+    async fn execute_suspend_member(
         &self,
         context_id: &str,
         did: &DID,
-        scope: RevocationScope,
+        capabilities: &[Capability],
+        _proposal_id: ProposalId,
         actor_did: &str,
-    ) -> Result<GovernanceBanResult, ContextError> {
+    ) -> Result<(), ContextError> {
         let context_id_bytes = context_id_to_bytes(context_id);
 
-        // Replay check and executed_proposals tracking are handled by the
-        // outer execute_governance_action wrapper — not duplicated here.
-        let (result, ctx_snapshot, bc_snapshot) = {
+        let snapshot = {
             let mut contexts = self.contexts.lock().await;
             let ctx = contexts
                 .get_mut(context_id)
                 .ok_or_else(|| ContextError::ContextNotRegistered(context_id.to_owned()))?;
             require_active(&ctx.handle)?;
 
-            // Gate: ceiling must include MemberBan (§5.3, ADR-031).
             if !ctx.role_state.ceiling.contains(&Capability::MemberBan) {
                 return Err(ContextError::PermissionDenied(
-                    "context ceiling does not include member:ban capability".into(),
+                    "MemberBan capability not in ceiling".to_owned(),
                 ));
             }
-
-            // Gate: target must be a member (membership/access decoupling
-            // still requires context membership).
             if !ctx.membership.contains(did) {
                 return Err(ContextError::MemberNotFound(did.to_string()));
             }
 
-            // Redundant operation handling (§5.9):
-            // Already read-revoked → no-op that returns success.
-            if ctx.access.read_revoked_members.contains(did) {
-                return Ok(GovernanceBanResult {
-                    banned_did: did.0.clone(),
-                    rotated_authors: Vec::new(),
-                    scope,
-                });
-            }
+            // Suspend the specified capabilities via role_state.
+            ctx.role_state
+                .suspend_capabilities(did.as_ref(), capabilities.iter().cloned());
 
-            // Track read-revoked state. The member remains in the context
-            // for governance/presence (membership/access decoupling §5.9).
-            ctx.access.read_revoked_members.insert(did.clone());
-            // FutureOnly also needs exclusion list tracking.
-            // Full revocation implies exclusion from future content too.
-            ctx.access.read_exclusion_list.insert(did.clone());
+            // Emit suspension event to receive buffer.
+            ctx.receive_buffer
+                .push(ContextEvent::WriteAccessRevoked { did: did.clone() });
 
-            // Presence-only check: if both read AND write are revoked,
-            // strip GovernanceVote and GovernancePropose capabilities (§5.9).
-            if ctx.access.write_revoked_members.contains(did) {
-                ctx.role_state.revoke_governance_capabilities(did);
-            }
-
-            // Broadcast mode: also ban via broadcast-specific subscriber registry.
-            let (ban_result, bc_snap) = if let Some(ref mut bc) = ctx.broadcast_context {
-                let r = bc.governance_ban_subscriber(&did.0, scope)?;
-                let snap = if self.has_persistence() {
-                    Some(bc.to_snapshot())
-                } else {
-                    None
-                };
-                (r, snap)
+            if self.has_persistence() {
+                Some(Self::snapshot_context(ctx))
             } else {
-                // Encrypted mode: destroy the member's access key so they
-                // cannot decrypt future content (§9.17.2 step 3, ADR-038).
-                ctx.access.access_key_store.remove(context_id, did.as_ref());
-                (
-                    GovernanceBanResult {
-                        banned_did: did.0.clone(),
-                        rotated_authors: Vec::new(),
-                        scope,
-                    },
-                    None,
-                )
-            };
+                None
+            }
+        };
 
-            // Emit revocation events to receive buffer.
-            ctx.receive_buffer
-                .push(ContextEvent::ReadAccessRevoked { did: did.clone() });
-            ctx.receive_buffer
-                .push(ContextEvent::AccessKeyRevoked { did: did.clone() });
+        if let Some(snapshot) = snapshot {
+            self.persist_context_snapshot(context_id, snapshot);
+        }
+        self.event_log
+            .append_context_event(&context_id_bytes, "MemberSuspended", actor_did)?;
+        Ok(())
+    }
+
+    /// Executes a `Revoke` governance action — cryptographic key destruction.
+    ///
+    /// Works in both broadcast and encrypted contexts (ADR-038, §9.17):
+    /// - **Write scope**: suspends write capabilities and destroys sender/broadcast
+    ///   keys so the member cannot publish. In broadcast mode, also calls
+    ///   `block_author` for key rotation.
+    /// - **Read scope**: destroys access keys and adds to CEK exclusion list.
+    ///   In broadcast mode, bans the subscriber with key rotation.
+    /// - **Both scope**: applies both write and read revocation.
+    ///
+    /// Additionally suspends the corresponding capabilities via `role_state`
+    /// so application-level gates also block the member.
+    ///
+    /// Requires the `MemberBan` capability in the context's ceiling (§5.3).
+    ///
+    /// Returns the number of rotated authors (for broadcast contexts).
+    async fn execute_revoke(
+        &self,
+        context_id: &str,
+        did: &DID,
+        access: AccessScope,
+        _proposal_id: ProposalId,
+        actor_did: &str,
+    ) -> Result<usize, ContextError> {
+        let context_id_bytes = context_id_to_bytes(context_id);
+
+        let (rotated_count, ctx_snapshot, bc_snapshot) = {
+            let mut contexts = self.contexts.lock().await;
+            let ctx = contexts
+                .get_mut(context_id)
+                .ok_or_else(|| ContextError::ContextNotRegistered(context_id.to_owned()))?;
+            require_active(&ctx.handle)?;
+
+            if !ctx.role_state.ceiling.contains(&Capability::MemberBan) {
+                return Err(ContextError::PermissionDenied(
+                    "MemberBan capability not in ceiling".to_owned(),
+                ));
+            }
+            if !ctx.membership.contains(did) {
+                return Err(ContextError::MemberNotFound(did.to_string()));
+            }
+
+            let mut rotated = 0usize;
+            let mut bc_snap = None;
+
+            // Write revocation: suspend write capabilities + destroy keys.
+            if matches!(access, AccessScope::Write | AccessScope::Both) {
+                ctx.role_state
+                    .suspend_capabilities(did.as_ref(), [Capability::MessagesWrite]);
+
+                // Broadcast mode: block author for key rotation.
+                if let Some(ref mut bc) = ctx.broadcast_context {
+                    match bc.block_author(&did.0) {
+                        Ok(_) | Err(ContextError::MemberNotFound(_)) => {}
+                        Err(e) => return Err(e),
+                    }
+                    if self.has_persistence() {
+                        bc_snap = Some(bc.to_snapshot());
+                    }
+                }
+
+                ctx.receive_buffer
+                    .push(ContextEvent::WriteAccessRevoked { did: did.clone() });
+            }
+
+            // Read revocation: suspend read capabilities + destroy access keys.
+            if matches!(access, AccessScope::Read | AccessScope::Both) {
+                ctx.role_state
+                    .suspend_capabilities(did.as_ref(), [Capability::MessagesRead]);
+
+                // CEK exclusion list for cryptographic enforcement.
+                ctx.access.read_exclusion_list.insert(did.clone());
+
+                // Broadcast mode: ban subscriber with key rotation.
+                if let Some(ref mut bc) = ctx.broadcast_context {
+                    let r = bc.governance_ban_subscriber(&did.0, access)?;
+                    rotated = r.rotated_authors.len();
+                    if self.has_persistence() {
+                        bc_snap = Some(bc.to_snapshot());
+                    }
+                } else {
+                    // Encrypted mode: destroy the member's access key.
+                    ctx.access.access_key_store.remove(context_id, did.as_ref());
+                }
+
+                ctx.receive_buffer
+                    .push(ContextEvent::ReadAccessRevoked { did: did.clone() });
+                ctx.receive_buffer
+                    .push(ContextEvent::AccessKeyRevoked { did: did.clone() });
+            }
 
             let snap = if self.has_persistence() {
                 Some(Self::snapshot_context(ctx))
             } else {
                 None
             };
-            (ban_result, snap, bc_snap)
+            (rotated, snap, bc_snap)
         };
 
-        // Persist context and broadcast state for crash recovery.
         if let Some(ctx_snapshot) = ctx_snapshot {
             self.persist_context_snapshot(context_id, ctx_snapshot);
         }
         if let Some(ref bc_snap) = bc_snapshot {
             self.persist_broadcast_snapshot(context_id, bc_snap);
         }
-
         self.event_log
-            .append_context_event(&context_id_bytes, "ReadAccessRevoked", actor_did)?;
+            .append_context_event(&context_id_bytes, "AccessRevoked", actor_did)?;
 
-        Ok(result)
+        Ok(rotated_count)
     }
 
-    /// Internal implementation of read access restoration (§5.9, ADR-038).
+    /// Executes a `RestoreAccess` governance action.
     ///
-    /// Works for both broadcast and encrypted contexts. Removes the member
-    /// from the read-revoked set. In broadcast mode, also unbans the
-    /// subscriber. Generates a new access key (new epoch) and emits
-    /// `AccessKeyRestored` event. Restoration is always forward-only
-    /// (§9.16.8): content encrypted during the revocation period remains
-    /// permanently inaccessible.
-    ///
-    /// If the member was presence-only (both read + write revoked), restoring
-    /// read access brings them to read-only state and restores governance
-    /// capabilities (they can see content again → can vote meaningfully).
+    /// Restores previously suspended capabilities and, for read revocations,
+    /// generates a new access key (forward-only restoration, §9.16.8).
+    /// Content encrypted during the revocation period remains permanently
+    /// inaccessible.
     ///
     /// Requires the `MemberBan` capability in the context's ceiling (§5.3).
-    ///
-    /// # Errors
-    ///
-    /// - [`ContextError::PermissionDenied`] if the ceiling lacks `MemberBan`.
-    /// - [`ContextError::ContextNotActive`] if the context is not `Active`.
-    /// - [`ContextError::NothingToRestore`] if the member's read access was
-    ///   never revoked.
-    async fn restore_read_access_internal(
+    async fn execute_restore_access(
         &self,
         context_id: &str,
         did: &DID,
+        capabilities: &[Capability],
+        _proposal_id: ProposalId,
         actor_did: &str,
     ) -> Result<(), ContextError> {
         let context_id_bytes = context_id_to_bytes(context_id);
 
-        // Replay check and executed_proposals tracking are handled by the
-        // outer execute_governance_action wrapper — not duplicated here.
         let (ctx_snapshot, bc_snapshot) = {
             let mut contexts = self.contexts.lock().await;
             let ctx = contexts
@@ -1982,64 +1953,59 @@ impl ContextManager {
                 .ok_or_else(|| ContextError::ContextNotRegistered(context_id.to_owned()))?;
             require_active(&ctx.handle)?;
 
-            // Gate: ceiling must include MemberBan (§5.3, ADR-031).
             if !ctx.role_state.ceiling.contains(&Capability::MemberBan) {
                 return Err(ContextError::PermissionDenied(
-                    "context ceiling does not include member:ban capability".into(),
+                    "MemberBan capability not in ceiling".to_owned(),
                 ));
             }
 
-            // Redundant operation handling (§5.9):
-            // Restoring access that was never revoked → NothingToRestore.
-            if !ctx.access.read_revoked_members.contains(did) {
-                return Err(ContextError::NothingToRestore(format!(
-                    "read access was never revoked for {did}"
-                )));
-            }
+            // Restore the specified capabilities.
+            ctx.role_state
+                .restore_capabilities(did.as_ref(), capabilities);
 
-            // Clear read revocation state.
-            ctx.access.read_revoked_members.remove(did);
-            ctx.access.read_exclusion_list.remove(did);
+            // If read capability is being restored, also restore access keys
+            // and remove from exclusion list.
+            let has_read = capabilities.contains(&Capability::MessagesRead);
+            let bc_snap = if has_read {
+                ctx.access.read_exclusion_list.remove(did);
 
-            // If the member was presence-only (both read + write revoked),
-            // restoring read access means they're now write-revoked-only.
-            // Restore governance capabilities only if write is NOT revoked
-            // (i.e., they go back to full member state).
-            if !ctx.access.write_revoked_members.contains(did) {
-                ctx.role_state.restore_governance_capabilities(did);
-            }
+                // Broadcast mode: unban subscriber.
+                let snap = ctx.broadcast_context.as_mut().and_then(|bc| {
+                    bc.governance_unban_subscriber(&did.0);
+                    if self.has_persistence() {
+                        Some(bc.to_snapshot())
+                    } else {
+                        None
+                    }
+                });
 
-            // Broadcast mode: also unban via broadcast-specific subscriber registry.
-            let bc_snap = ctx.broadcast_context.as_mut().and_then(|bc| {
-                bc.governance_unban_subscriber(&did.0);
-                if self.has_persistence() {
-                    Some(bc.to_snapshot())
-                } else {
-                    None
+                // Encrypted mode: generate new access key (forward-only).
+                if ctx.broadcast_context.is_none() {
+                    let restored_key = scp_protocol::crypto::access_keys::generate_access_key(
+                        context_id,
+                        did.as_ref(),
+                    );
+                    ctx.access
+                        .access_key_store
+                        .set(context_id, did.as_ref(), restored_key);
                 }
-            });
 
-            // Encrypted mode: generate a new access key at epoch 1 so the
-            // restored member can decrypt future content. Historical content
-            // from the revocation period is permanently inaccessible
-            // (forward-only restoration, §9.16.8, ADR-038).
-            if ctx.broadcast_context.is_none() {
-                let restored_key = scp_protocol::crypto::access_keys::generate_access_key(
-                    context_id,
-                    did.as_ref(),
-                );
-                ctx.access
-                    .access_key_store
-                    .set(context_id, did.as_ref(), restored_key);
+                ctx.receive_buffer
+                    .push(ContextEvent::ReadAccessRestored { did: did.clone() });
+                ctx.receive_buffer.push(ContextEvent::AccessKeyRestored {
+                    did: did.clone(),
+                    new_epoch: 1,
+                });
+
+                snap
+            } else {
+                None
+            };
+
+            if capabilities.contains(&Capability::MessagesWrite) {
+                ctx.receive_buffer
+                    .push(ContextEvent::WriteAccessRestored { did: did.clone() });
             }
-
-            // Emit restoration events to receive buffer.
-            ctx.receive_buffer
-                .push(ContextEvent::ReadAccessRestored { did: did.clone() });
-            ctx.receive_buffer.push(ContextEvent::AccessKeyRestored {
-                did: did.clone(),
-                new_epoch: 1,
-            });
 
             let snap = if self.has_persistence() {
                 Some(Self::snapshot_context(ctx))
@@ -2049,16 +2015,14 @@ impl ContextManager {
             (snap, bc_snap)
         };
 
-        // Persist context and broadcast state for crash recovery.
         if let Some(ctx_snapshot) = ctx_snapshot {
             self.persist_context_snapshot(context_id, ctx_snapshot);
         }
         if let Some(ref bc_snap) = bc_snapshot {
             self.persist_broadcast_snapshot(context_id, bc_snap);
         }
-
         self.event_log
-            .append_context_event(&context_id_bytes, "ReadAccessRestored", actor_did)?;
+            .append_context_event(&context_id_bytes, "AccessRestored", actor_did)?;
 
         Ok(())
     }
@@ -2134,7 +2098,7 @@ impl ContextManager {
         Ok(())
     }
 
-    async fn execute_remove_member(
+    async fn execute_eject(
         &self,
         context_id: &str,
         did: &DID,
@@ -3417,161 +3381,6 @@ impl ContextManager {
     ///
     /// Redundancy: revoke-when-already-revoked is a no-op (§5.9).
     /// The member remains in the context (membership/access decoupling).
-    async fn execute_revoke_write_access(
-        &self,
-        context_id: &str,
-        did: &DID,
-        scope: RevocationScope,
-        _proposal_id: ProposalId,
-        actor_did: &str,
-    ) -> Result<(), ContextError> {
-        let context_id_bytes = context_id_to_bytes(context_id);
-
-        let (snapshot, bc_snapshot) = {
-            let mut contexts = self.contexts.lock().await;
-            let ctx = contexts
-                .get_mut(context_id)
-                .ok_or_else(|| ContextError::ContextNotRegistered(context_id.to_owned()))?;
-            require_active(&ctx.handle)?;
-
-            if !ctx.role_state.ceiling.contains(&Capability::MemberBan) {
-                return Err(ContextError::PermissionDenied(
-                    "MemberBan capability not in ceiling".to_owned(),
-                ));
-            }
-            if !ctx.membership.contains(did) {
-                return Err(ContextError::MemberNotFound(did.to_string()));
-            }
-
-            // Redundant operation handling (§5.9):
-            // Already write-revoked → no-op that returns success.
-            if ctx.access.write_revoked_members.contains(did) {
-                return Ok(());
-            }
-
-            // Mark member as write-revoked. The member remains present but
-            // their messages will be rejected by the send path.
-            ctx.access.write_revoked_members.insert(did.clone());
-
-            // Presence-only check: if both read AND write are revoked,
-            // strip GovernanceVote and GovernancePropose capabilities (§5.9).
-            if ctx.access.read_revoked_members.contains(did) {
-                ctx.role_state.revoke_governance_capabilities(did);
-            }
-
-            // Full scope: destroy the author's sender/broadcast key so
-            // historical content is suppressed and key requests return Deny.
-            // FutureOnly scope: only block future writes via write_revoked_members.
-            let bc_snap = match scope {
-                RevocationScope::Full => ctx
-                    .broadcast_context
-                    .as_mut()
-                    .map(|bc| {
-                        match bc.block_author(&did.0) {
-                            Ok(_) | Err(ContextError::MemberNotFound(_)) => {}
-                            Err(e) => return Err(e),
-                        }
-                        Ok(if self.has_persistence() {
-                            Some(bc.to_snapshot())
-                        } else {
-                            None
-                        })
-                    })
-                    .transpose()?
-                    .flatten(),
-                RevocationScope::FutureOnly => None,
-            };
-
-            // Emit write access revoked event to receive buffer.
-            ctx.receive_buffer
-                .push(ContextEvent::WriteAccessRevoked { did: did.clone() });
-
-            let snap = if self.has_persistence() {
-                Some(Self::snapshot_context(ctx))
-            } else {
-                None
-            };
-            (snap, bc_snap)
-        };
-
-        if let Some(snapshot) = snapshot {
-            self.persist_context_snapshot(context_id, snapshot);
-        }
-        if let Some(ref bc_snap) = bc_snapshot {
-            self.persist_broadcast_snapshot(context_id, bc_snap);
-        }
-        self.event_log
-            .append_context_event(&context_id_bytes, "WriteAccessRevoked", actor_did)?;
-        Ok(())
-    }
-
-    /// Restores a member's write access per §9.17 and ADR-038.
-    ///
-    /// Restoration is always forward-only (§9.16.8): the member can
-    /// publish new messages but previously suppressed content remains
-    /// suppressed. The member gets a new sender key (in broadcast mode,
-    /// new broadcast key at new epoch; in encrypted mode, re-inclusion
-    /// in MLS group key distribution).
-    ///
-    /// Redundancy: restore-when-never-revoked returns
-    /// [`ContextError::NothingToRestore`] (§5.9).
-    async fn execute_restore_write_access(
-        &self,
-        context_id: &str,
-        did: &DID,
-        _proposal_id: ProposalId,
-        actor_did: &str,
-    ) -> Result<(), ContextError> {
-        let context_id_bytes = context_id_to_bytes(context_id);
-
-        let snapshot = {
-            let mut contexts = self.contexts.lock().await;
-            let ctx = contexts
-                .get_mut(context_id)
-                .ok_or_else(|| ContextError::ContextNotRegistered(context_id.to_owned()))?;
-            require_active(&ctx.handle)?;
-
-            if !ctx.role_state.ceiling.contains(&Capability::MemberBan) {
-                return Err(ContextError::PermissionDenied(
-                    "MemberBan capability not in ceiling".to_owned(),
-                ));
-            }
-
-            // Redundant operation handling (§5.9):
-            // Restoring access that was never revoked → NothingToRestore.
-            if !ctx.access.write_revoked_members.contains(did) {
-                return Err(ContextError::NothingToRestore(format!(
-                    "write access was never revoked for {did}"
-                )));
-            }
-
-            ctx.access.write_revoked_members.remove(did);
-
-            // Restore governance capabilities if member is no longer
-            // presence-only (i.e., read access is not also revoked).
-            if !ctx.access.read_revoked_members.contains(did) {
-                ctx.role_state.restore_governance_capabilities(did);
-            }
-
-            // Emit write access restored event to receive buffer.
-            ctx.receive_buffer
-                .push(ContextEvent::WriteAccessRestored { did: did.clone() });
-
-            if self.has_persistence() {
-                Some(Self::snapshot_context(ctx))
-            } else {
-                None
-            }
-        };
-
-        if let Some(snapshot) = snapshot {
-            self.persist_context_snapshot(context_id, snapshot);
-        }
-        self.event_log
-            .append_context_event(&context_id_bytes, "WriteAccessRestored", actor_did)?;
-        Ok(())
-    }
-
     /// Rotates all access keys context-wide per §9.17 and ADR-038.
     ///
     /// In broadcast mode: rotates every author's broadcast key (epoch
