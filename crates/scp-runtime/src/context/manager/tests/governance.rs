@@ -444,7 +444,7 @@ async fn unanimity_context_single_rejection_defeats_proposal() {
         ..ContextParams::default()
     };
 
-    // Add bob as member so we can test RemoveMember doesn't happen.
+    // Add bob as member so we can test Eject doesn't happen.
     let _handle = manager
         .create_context("ctx-unanimity".into(), params, alice.clone())
         .await
@@ -460,8 +460,8 @@ async fn unanimity_context_single_rejection_defeats_proposal() {
             .add_member(carol.clone(), "member".into(), vec![]);
     }
 
-    // Alice proposes RemoveMember(bob).
-    let action = GovernanceAction::RemoveMember {
+    // Alice proposes Eject(bob).
+    let action = GovernanceAction::Eject {
         did: bob.clone(),
         reason: Some("test removal".to_owned()),
     };
@@ -593,8 +593,6 @@ fn governance_snapshot_serde_roundtrip() {
         executed_proposals: HashSet::new(),
         ttl_remaining_secs: None,
         registered_tools: Vec::new(),
-        write_revoked_members: HashSet::new(),
-        read_revoked_members: HashSet::new(),
         read_exclusion_list: HashSet::new(),
         tool_interfaces: Vec::new(),
         threshold_signers: Vec::new(),
@@ -1027,9 +1025,9 @@ async fn create_child_context_rejected_without_ceiling_capability() {
     );
 }
 
-/// #339: `BlockAuthor` is rejected when `MemberBan` is not in ceiling.
+/// #339: `Revoke` (write) is rejected when `MemberBan` is not in ceiling.
 #[tokio::test]
-async fn block_author_rejected_without_member_ban_ceiling() {
+async fn revoke_rejected_without_member_ban_ceiling() {
     let manager = ContextManager::new(
         Box::new(MockCrypto::default()),
         Box::new(MockTransport::connected()),
@@ -1067,8 +1065,11 @@ async fn block_author_rejected_without_member_ban_ceiling() {
             .add_member("did:key:bob".into(), "author".into(), vec![]);
     }
 
-    let proposal =
-        approved_block_author_proposal(&"did:key:alice".into(), "bc-no-ban", &"did:key:bob".into());
+    let proposal = approved_revoke_proposal(
+        &"did:key:alice".into(),
+        "bc-no-ban",
+        &"did:key:bob".into(),
+    );
     let result = manager
         .execute_governance_action("bc-no-ban", &proposal)
         .await;
@@ -1898,12 +1899,12 @@ async fn governance_dispatch_returns_typed_results() {
         "AddMember should return MemberAdded, got: {result:?}"
     );
 
-    // RemoveMember
+    // Eject
     let proposal = GovernanceProposal {
         proposal_id: [11u8; 32],
         context_id: "typed-result-ctx".into(),
         proposer_did: "did:key:creator".into(),
-        action: GovernanceAction::RemoveMember {
+        action: GovernanceAction::Eject {
             did: "did:key:new".into(),
             reason: None,
         },
@@ -1924,8 +1925,8 @@ async fn governance_dispatch_returns_typed_results() {
         .await
         .unwrap();
     assert!(
-        matches!(result, GovernanceActionResult::MemberRemoved),
-        "RemoveMember should return MemberRemoved, got: {result:?}"
+        matches!(result, GovernanceActionResult::MemberEjected),
+        "Eject should return MemberEjected, got: {result:?}"
     );
 }
 
@@ -2446,7 +2447,7 @@ async fn scp274_single_admin_full_lifecycle() {
         .propose_governance_action_checked(
             &ctx_id,
             &admin_did,
-            GovernanceAction::RemoveMember {
+            GovernanceAction::Eject {
                 did: "did:key:target".into(),
                 reason: Some("test".into()),
             },
@@ -2507,7 +2508,7 @@ async fn scp274_threshold_full_lifecycle() {
         .propose_governance_action_checked(
             "scp274-thresh",
             &creator,
-            GovernanceAction::RemoveMember {
+            GovernanceAction::Eject {
                 did: "did:key:target".into(),
                 reason: None,
             },
@@ -2614,7 +2615,7 @@ async fn scp274_unanimity_full_lifecycle() {
         .propose_governance_action_checked(
             "scp274-unan",
             &creator,
-            GovernanceAction::RemoveMember {
+            GovernanceAction::Eject {
                 did: "did:key:target".into(),
                 reason: None,
             },
@@ -2668,7 +2669,7 @@ async fn scp274_rejected_proposal_does_not_execute() {
         .propose_governance_action_checked(
             "scp274-reject",
             &creator,
-            GovernanceAction::RemoveMember {
+            GovernanceAction::Eject {
                 did: "did:key:target".into(),
                 reason: None,
             },
@@ -2723,7 +2724,7 @@ async fn scp274_governance_events_in_log() {
         .propose_governance_action_checked(
             "scp274-events",
             &creator,
-            GovernanceAction::RemoveMember {
+            GovernanceAction::Eject {
                 did: "did:key:target".into(),
                 reason: None,
             },
@@ -2809,7 +2810,7 @@ async fn scp274_exercises_seven_action_variants() {
     let rm = approved_proposal(
         [101u8; 32],
         "scp274-7a",
-        GovernanceAction::RemoveMember {
+        GovernanceAction::Eject {
             did: "did:key:target".into(),
             reason: None,
         },
@@ -2820,7 +2821,7 @@ async fn scp274_exercises_seven_action_variants() {
             .execute_governance_action("scp274-7a", &rm)
             .await
             .is_ok(),
-        "RemoveMember"
+        "Eject"
     );
     let add2 = approved_proposal(
         [102u8; 32],
@@ -2913,9 +2914,9 @@ async fn scp274_exercises_seven_action_variants() {
     let revoke = approved_proposal(
         [107u8; 32],
         "scp274-7b",
-        GovernanceAction::RevokeWriteAccess {
+        GovernanceAction::Revoke {
             did: "did:key:signer".into(),
-            scope: super::RevocationScope::FutureOnly,
+            access: super::AccessScope::Write,
         },
         &["did:key:admin"],
     );
@@ -2924,14 +2925,14 @@ async fn scp274_exercises_seven_action_variants() {
             .execute_governance_action("scp274-7b", &revoke)
             .await
             .is_ok(),
-        "RevokeWriteAccess"
+        "Revoke Write"
     );
     let revoke_r = approved_proposal(
         [108u8; 32],
         "scp274-7b",
-        GovernanceAction::RevokeReadAccess {
+        GovernanceAction::Revoke {
             did: "did:key:signer".into(),
-            scope: super::RevocationScope::Full,
+            access: super::AccessScope::Both,
         },
         &["did:key:admin"],
     );
@@ -2942,8 +2943,9 @@ async fn scp274_exercises_seven_action_variants() {
     let restore_r = approved_proposal(
         [109u8; 32],
         "scp274-7b",
-        GovernanceAction::RestoreReadAccess {
+        GovernanceAction::RestoreAccess {
             did: "did:key:signer".into(),
+            capabilities: vec![super::Capability::MessagesRead],
         },
         &["did:key:admin"],
     );
@@ -2952,7 +2954,7 @@ async fn scp274_exercises_seven_action_variants() {
             .execute_governance_action("scp274-7b", &restore_r)
             .await
             .is_ok(),
-        "RestoreReadAccess"
+        "RestoreAccess Read"
     );
 }
 
@@ -4185,8 +4187,8 @@ async fn mls_integration_epoch_coordinator_records_coordination() {
         .await
         .unwrap();
 
-    // Execute RemoveMember — should record second coordination.
-    let action2 = super::GovernanceAction::RemoveMember {
+    // Execute Eject — should record second coordination.
+    let action2 = super::GovernanceAction::Eject {
         did: "did:key:member-a".into(),
         reason: Some("done".to_owned()),
     };
@@ -4213,7 +4215,7 @@ async fn mls_integration_epoch_coordinator_records_coordination() {
         scp_protocol::context::governance::mls_integration::MlsOperation::AddMember { .. }
     ));
 
-    // Verify second record: epoch 1 → 2 for RemoveMember.
+    // Verify second record: epoch 1 → 2 for Eject.
     assert_eq!(records[1].epoch_before, 1);
     assert_eq!(records[1].epoch_after, 2);
     assert!(matches!(
@@ -4368,7 +4370,7 @@ async fn mls_integration_resolve_conflict_lifts_freeze() {
     let other_did: DID = "did:key:other-admin".into();
     let (manager, _handle) = setup_active_context().await;
 
-    // Build two conflicting proposals (mutual RemoveMember — each
+    // Build two conflicting proposals (mutual Eject — each
     // proposer removes the other, which is a canonical conflict per
     // ADR-031 §7).
     let proposal_a_id = [10u8; 32];
@@ -4378,7 +4380,7 @@ async fn mls_integration_resolve_conflict_lifts_freeze() {
         proposal_id: proposal_a_id,
         context_id: "test-ctx".to_owned(),
         proposer_did: admin_did.clone(),
-        action: super::GovernanceAction::RemoveMember {
+        action: super::GovernanceAction::Eject {
             did: other_did.clone(),
             reason: None,
         },
@@ -4393,7 +4395,7 @@ async fn mls_integration_resolve_conflict_lifts_freeze() {
         proposal_id: proposal_b_id,
         context_id: "test-ctx".to_owned(),
         proposer_did: other_did.clone(),
-        action: super::GovernanceAction::RemoveMember {
+        action: super::GovernanceAction::Eject {
             did: admin_did.clone(),
             reason: None,
         },
@@ -4744,7 +4746,7 @@ async fn migration_destination_has_migration_source_metadata() {
 
 // --- Batch 2 behavioral wiring tests ---
 
-/// Governance `RemoveMember` calls `remove_member_sender_key` before
+/// Governance `Eject` calls `remove_member_sender_key` before
 /// `remove_member` on the crypto provider.
 #[tokio::test]
 #[allow(clippy::too_many_lines)]
@@ -4879,7 +4881,7 @@ async fn test_remove_member_sender_key_before_mls_removal() {
     let rm = approved_proposal(
         [2u8; 32],
         "sk-order-ctx",
-        GovernanceAction::RemoveMember {
+        GovernanceAction::Eject {
             did: "did:key:target".into(),
             reason: None,
         },
@@ -4936,7 +4938,7 @@ async fn test_consequence_rule_triggers_enforcement_event() {
         let ctx = contexts.get_mut("conseq-ctx").unwrap();
         ctx.governance.consequence_rules = vec![ConsequenceRule {
             trigger: ConsequenceTrigger::MessageVelocity,
-            action: ConsequenceAction::AccessRevocation,
+            action: ConsequenceAction::SuspendAll,
             threshold: 1,
             window: Duration::from_secs(3600),
         }];
@@ -5091,7 +5093,7 @@ async fn test_cooldown_prevents_consequence_retrigger() {
         let ctx = contexts.get_mut("cooldown-ctx").unwrap();
         ctx.governance.consequence_rules = vec![ConsequenceRule {
             trigger: ConsequenceTrigger::MessageVelocity,
-            action: ConsequenceAction::AccessRevocation,
+            action: ConsequenceAction::SuspendAll,
             threshold: 1,
             window: Duration::from_secs(999_999),
         }];
@@ -5133,8 +5135,8 @@ async fn test_cooldown_prevents_consequence_retrigger() {
     {
         let mut contexts = manager.contexts.lock().await;
         let ctx = contexts.get_mut("cooldown-ctx").unwrap();
-        ctx.access.write_revoked_members.clear();
-        ctx.access.read_revoked_members.clear();
+        ctx.role_state.suspended_capabilities.clear();
+        ctx.access.read_exclusion_list.clear();
     }
 
     // Second send: cooldown should prevent re-triggering.
@@ -5229,7 +5231,7 @@ async fn test_budget_exceeded_blocks_send() {
     );
 }
 
-/// `CapabilitySuspension` adds member to `write_revoked`.
+/// `Suspend` suspends member's write capability.
 #[tokio::test]
 async fn test_capability_suspension_revokes_write() {
     use scp_protocol::trust::consequence::{
@@ -5256,7 +5258,7 @@ async fn test_capability_suspension_revokes_write() {
         let ctx = contexts.get_mut("cap-susp-ctx").unwrap();
         ctx.governance.consequence_rules = vec![ConsequenceRule {
             trigger: ConsequenceTrigger::MessageVelocity,
-            action: ConsequenceAction::CapabilitySuspension(vec!["write".to_owned()]),
+            action: ConsequenceAction::Suspend { capabilities: vec!["write".to_owned()] },
             threshold: 1,
             window: Duration::from_secs(3600),
         }];
@@ -5283,18 +5285,19 @@ async fn test_capability_suspension_revokes_write() {
         .await
         .unwrap();
 
-    // Verify admin is now in write_revoked_members.
+    // Verify admin write capability is now suspended.
     let contexts = manager.contexts.lock().await;
     let ctx = contexts.get("cap-susp-ctx").unwrap();
     assert!(
-        ctx.access
-            .write_revoked_members
-            .contains(&DID::from("did:key:admin")),
-        "admin should be in write_revoked_members after CapabilitySuspension"
+        ctx.role_state
+            .suspended_capabilities
+            .get("did:key:admin")
+            .is_some_and(|s| s.contains(&Capability::MessagesWrite)),
+        "admin should have MessagesWrite suspended after Suspend"
     );
 }
 
-/// `AccessRevocation` adds member to both read and write revoked.
+/// `SuspendAll` adds member to both read and write revoked.
 #[tokio::test]
 async fn test_access_revocation_revokes_read_and_write() {
     use scp_protocol::trust::consequence::{
@@ -5320,7 +5323,7 @@ async fn test_access_revocation_revokes_read_and_write() {
         let ctx = contexts.get_mut("access-rev-ctx").unwrap();
         ctx.governance.consequence_rules = vec![ConsequenceRule {
             trigger: ConsequenceTrigger::MessageVelocity,
-            action: ConsequenceAction::AccessRevocation,
+            action: ConsequenceAction::SuspendAll,
             threshold: 1,
             window: Duration::from_secs(3600),
         }];
@@ -5349,18 +5352,16 @@ async fn test_access_revocation_revokes_read_and_write() {
 
     let contexts = manager.contexts.lock().await;
     let ctx = contexts.get("access-rev-ctx").unwrap();
-    let admin_did: DID = "did:key:admin".into();
     assert!(
-        ctx.access.read_revoked_members.contains(&admin_did),
-        "admin should be in read_revoked after AccessRevocation"
-    );
-    assert!(
-        ctx.access.write_revoked_members.contains(&admin_did),
-        "admin should be in write_revoked after AccessRevocation"
+        ctx.role_state
+            .suspended_capabilities
+            .get("did:key:admin")
+            .is_some_and(|s| !s.is_empty()),
+        "admin should have suspended capabilities after SuspendAll"
     );
 }
 
-/// `RoleDemotion` changes member role via consequence enforcement.
+/// `AssignRole` changes member role via consequence enforcement.
 #[tokio::test]
 async fn test_role_demotion_changes_member_role() {
     use scp_protocol::trust::consequence::{
@@ -5396,7 +5397,7 @@ async fn test_role_demotion_changes_member_role() {
         let ctx = contexts.get_mut("demotion-ctx").unwrap();
         ctx.governance.consequence_rules = vec![ConsequenceRule {
             trigger: ConsequenceTrigger::MessageVelocity,
-            action: ConsequenceAction::RoleDemotion {
+            action: ConsequenceAction::AssignRole {
                 to_role: "observer".to_owned(),
             },
             threshold: 1,
@@ -5429,11 +5430,11 @@ async fn test_role_demotion_changes_member_role() {
     let events = manager.drain_events("demotion-ctx").await;
     let enforced = events.iter().any(|e| {
         matches!(e, ContextEvent::ConsequenceEnforced { action_type, success, .. }
-            if action_type == "RoleDemotion" && *success)
+            if action_type == "AssignRole" && *success)
     });
     assert!(
         enforced,
-        "expected RoleDemotion ConsequenceEnforced event in: {events:?}"
+        "expected AssignRole ConsequenceEnforced event in: {events:?}"
     );
 }
 
@@ -5630,7 +5631,7 @@ async fn test_capability_suspension_no_match_returns_false() {
         let ctx = contexts.get_mut("no-match-ctx").unwrap();
         ctx.governance.consequence_rules = vec![ConsequenceRule {
             trigger: ConsequenceTrigger::MessageVelocity,
-            action: ConsequenceAction::CapabilitySuspension(vec!["foobar".to_owned()]),
+            action: ConsequenceAction::Suspend { capabilities: vec!["foobar".to_owned()] },
             threshold: 1,
             window: Duration::from_secs(3600),
         }];
@@ -5658,26 +5659,27 @@ async fn test_capability_suspension_no_match_returns_false() {
         .unwrap();
 
     // H10: non-matching caps produce success=false, which escalates to
-    // AccessRevocation. The escalation event has action_type="AccessRevocation(escalated)"
+    // SuspendAll. The escalation event has action_type="SuspendAll(escalated)"
     // and success=true.
     let events = manager.drain_events("no-match-ctx").await;
     let enforced_with_escalation = events.iter().any(|e| {
         matches!(e, ContextEvent::ConsequenceEnforced { action_type, success, .. }
-            if action_type == "AccessRevocation(escalated)" && *success)
+            if action_type == "SuspendAll(escalated)" && *success)
     });
     assert!(
         enforced_with_escalation,
-        "expected ConsequenceEnforced with escalated AccessRevocation for non-matching caps: {events:?}"
+        "expected ConsequenceEnforced with escalated SuspendAll for non-matching caps: {events:?}"
     );
 
-    // H10: admin IS now in write_revoked due to escalation.
+    // H10: admin IS now suspended due to escalation.
     let contexts = manager.contexts.lock().await;
     let ctx = contexts.get("no-match-ctx").unwrap();
     assert!(
-        ctx.access
-            .write_revoked_members
-            .contains(&DID::from("did:key:admin")),
-        "admin should be in write_revoked after escalation (H10)"
+        ctx.role_state
+            .suspended_capabilities
+            .get("did:key:admin")
+            .is_some_and(|s| !s.is_empty()),
+        "admin should have suspended capabilities after escalation (H10)"
     );
 }
 
@@ -5771,7 +5773,7 @@ async fn pending_removal_blocks_proposal() {
             proposal_id: [0u8; 32],
             context_id: "standing-ctx".to_owned(),
             proposer_did: admin.clone(),
-            action: GovernanceAction::RemoveMember {
+            action: GovernanceAction::Eject {
                 did: alice.clone(),
                 reason: Some("test".into()),
             },
@@ -5870,7 +5872,7 @@ async fn participation_blocks_low_score_proposer() {
             proposal_id: [1u8; 32],
             context_id: "standing-low-ctx".to_owned(),
             proposer_did: admin.clone(),
-            action: GovernanceAction::RemoveMember {
+            action: GovernanceAction::Eject {
                 did: alice.clone(),
                 reason: Some("standing test".into()),
             },
@@ -5918,7 +5920,7 @@ async fn velocity_consequence_triggers_on_high_rate() {
     params.consequence_rules = vec![ConsequenceRule {
         trigger: ConsequenceTrigger::MessageVelocity,
         threshold: 1,
-        action: ConsequenceAction::CapabilitySuspension(vec!["write".to_owned()]),
+        action: ConsequenceAction::Suspend { capabilities: vec!["write".to_owned()] },
         window: Duration::from_secs(3600),
     }];
     let _handle = manager
@@ -6087,7 +6089,7 @@ async fn sender_key_before_mls_removal_ordering() {
     call_order.lock().unwrap().clear();
 
     // Remove Alice via governance.
-    let action = scp_protocol::context::governance::GovernanceAction::RemoveMember {
+    let action = scp_protocol::context::governance::GovernanceAction::Eject {
         did: alice.clone(),
         reason: Some("ordering test".into()),
     };
@@ -6207,7 +6209,7 @@ async fn pending_removal_blocks_governance() {
             proposal_id: [2u8; 32],
             context_id: "reject-ctx".to_owned(),
             proposer_did: admin.clone(),
-            action: GovernanceAction::RemoveMember {
+            action: GovernanceAction::Eject {
                 did: target.clone(),
                 reason: Some("bad actor".into()),
             },
@@ -6370,7 +6372,7 @@ async fn consequence_triggers_after_governance_action() {
     params.consequence_rules = vec![ConsequenceRule {
         trigger: ConsequenceTrigger::MessageVelocity,
         threshold: 1,
-        action: ConsequenceAction::CapabilitySuspension(vec!["write".to_owned()]),
+        action: ConsequenceAction::Suspend { capabilities: vec!["write".to_owned()] },
         window: Duration::from_secs(3600),
     }];
     let _handle = manager
@@ -6400,8 +6402,8 @@ async fn consequence_triggers_after_governance_action() {
     {
         let mut contexts = manager.contexts.lock().await;
         let ctx = contexts.get_mut("gov-conseq-ctx").unwrap();
-        ctx.access.write_revoked_members.clear();
-        ctx.access.read_revoked_members.clear();
+        ctx.role_state.suspended_capabilities.clear();
+        ctx.access.read_exclusion_list.clear();
         ctx.governance.cooldown_until.clear();
         ctx.receive_buffer.push(ContextEvent::MessageSent {
             sender_did: admin.clone(),
@@ -6461,7 +6463,7 @@ async fn cooldown_expires_allows_retrigger() {
         let ctx = contexts.get_mut("cooldown-exp-ctx").unwrap();
         ctx.governance.consequence_rules = vec![ConsequenceRule {
             trigger: ConsequenceTrigger::MessageVelocity,
-            action: ConsequenceAction::AccessRevocation,
+            action: ConsequenceAction::SuspendAll,
             threshold: 1,
             window: Duration::from_secs(1), // 1 second cooldown
         }];
@@ -6500,8 +6502,8 @@ async fn cooldown_expires_allows_retrigger() {
     {
         let mut contexts = manager.contexts.lock().await;
         let ctx = contexts.get_mut("cooldown-exp-ctx").unwrap();
-        ctx.access.write_revoked_members.clear();
-        ctx.access.read_revoked_members.clear();
+        ctx.role_state.suspended_capabilities.clear();
+        ctx.access.read_exclusion_list.clear();
         // Set cooldown to 0 (already expired).
         ctx.governance.cooldown_until.insert(0, 0);
     }
@@ -6608,7 +6610,7 @@ async fn event_log_entries_feed_consequence_evaluation() {
     params.consequence_rules = vec![ConsequenceRule {
         trigger: ConsequenceTrigger::MessageVelocity,
         threshold: 3,
-        action: ConsequenceAction::CapabilitySuspension(vec!["write".to_owned()]),
+        action: ConsequenceAction::Suspend { capabilities: vec!["write".to_owned()] },
         window: Duration::from_secs(3600),
     }];
     let _handle = manager
@@ -6742,7 +6744,7 @@ async fn remaining_members_keys_after_removal() {
     sk_removed_clone.lock().unwrap().clear();
 
     // Remove only Alice.
-    let action = scp_protocol::context::governance::GovernanceAction::RemoveMember {
+    let action = scp_protocol::context::governance::GovernanceAction::Eject {
         did: alice.clone(),
         reason: Some("selective removal".into()),
     };
@@ -6919,7 +6921,7 @@ async fn full_send_consequence_enforcement_round_trip() {
     params.consequence_rules = vec![ConsequenceRule {
         trigger: ConsequenceTrigger::MessageVelocity,
         threshold: 1,
-        action: ConsequenceAction::CapabilitySuspension(vec!["write".to_owned()]),
+        action: ConsequenceAction::Suspend { capabilities: vec!["write".to_owned()] },
         window: Duration::from_secs(3600),
     }];
     let _handle = manager
@@ -7059,7 +7061,7 @@ async fn governance_participation_round_trip() {
     );
 }
 
-/// `CapabilitySuspension` blocks subsequent `send_message` (#1531).
+/// `Suspend` blocks subsequent `send_message` (#1531).
 #[tokio::test]
 async fn capability_suspension_blocks_subsequent_send() {
     use scp_protocol::trust::consequence::{
@@ -7078,7 +7080,7 @@ async fn capability_suspension_blocks_subsequent_send() {
     params.consequence_rules = vec![ConsequenceRule {
         trigger: ConsequenceTrigger::MessageVelocity,
         threshold: 1,
-        action: ConsequenceAction::CapabilitySuspension(vec!["write".to_owned()]),
+        action: ConsequenceAction::Suspend { capabilities: vec!["write".to_owned()] },
         window: Duration::from_secs(3600),
     }];
     let _handle = manager
@@ -7130,7 +7132,7 @@ async fn capability_suspension_blocks_subsequent_send() {
     );
 }
 
-/// `AccessRevocation` blocks subsequent `send_message` (#1531).
+/// `SuspendAll` blocks subsequent `send_message` (#1531).
 #[tokio::test]
 async fn access_revocation_blocks_subsequent_send() {
     use scp_protocol::trust::consequence::{
@@ -7149,7 +7151,7 @@ async fn access_revocation_blocks_subsequent_send() {
     params.consequence_rules = vec![ConsequenceRule {
         trigger: ConsequenceTrigger::MessageVelocity,
         threshold: 1,
-        action: ConsequenceAction::AccessRevocation,
+        action: ConsequenceAction::SuspendAll,
         window: Duration::from_secs(3600),
     }];
     let _handle = manager
@@ -7488,7 +7490,7 @@ async fn consequence_triggers_on_message_send() {
     params.consequence_rules = vec![ConsequenceRule {
         trigger: ConsequenceTrigger::MessageVelocity,
         threshold: 1,
-        action: ConsequenceAction::CapabilitySuspension(vec!["write".to_owned()]),
+        action: ConsequenceAction::Suspend { capabilities: vec!["write".to_owned()] },
         window: Duration::from_secs(3600),
     }];
     let _handle = manager
@@ -7542,7 +7544,7 @@ async fn consequence_triggers_on_message_send() {
     );
 }
 
-/// `RoleDemotion` consequence actually changes the member's role (#1531).
+/// `AssignRole` consequence actually changes the member's role (#1531).
 #[tokio::test]
 async fn role_demotion_consequence_changes_role() {
     use scp_protocol::trust::consequence::{
@@ -7562,7 +7564,7 @@ async fn role_demotion_consequence_changes_role() {
     params.consequence_rules = vec![ConsequenceRule {
         trigger: ConsequenceTrigger::MessageVelocity,
         threshold: 1,
-        action: ConsequenceAction::RoleDemotion {
+        action: ConsequenceAction::AssignRole {
             to_role: "subscriber".to_owned(),
         },
         window: Duration::from_secs(3600),
@@ -7604,7 +7606,7 @@ async fn role_demotion_consequence_changes_role() {
         .collect();
     assert!(
         !enforced.is_empty(),
-        "ConsequenceEnforced should be emitted for RoleDemotion. Events: {events:?}"
+        "ConsequenceEnforced should be emitted for AssignRole. Events: {events:?}"
     );
     if let ContextEvent::ConsequenceEnforced {
         action_type,
@@ -7612,8 +7614,8 @@ async fn role_demotion_consequence_changes_role() {
         ..
     } = &enforced[0]
     {
-        assert_eq!(action_type, "RoleDemotion");
-        assert!(success, "RoleDemotion enforcement should succeed");
+        assert_eq!(action_type, "AssignRole");
+        assert!(success, "AssignRole enforcement should succeed");
     }
 }
 
@@ -8430,7 +8432,7 @@ async fn test_consequence_triggers_on_governance_action() {
     params.consequence_rules = vec![ConsequenceRule {
         trigger: ConsequenceTrigger::MessageVelocity,
         threshold: 1,
-        action: ConsequenceAction::CapabilitySuspension(vec!["write".to_owned()]),
+        action: ConsequenceAction::Suspend { capabilities: vec!["write".to_owned()] },
         window: Duration::from_secs(3600),
     }];
     let _handle = manager
@@ -8459,7 +8461,7 @@ async fn test_consequence_triggers_on_governance_action() {
     {
         let mut contexts = manager.contexts.lock().await;
         let ctx = contexts.get_mut("gov-c-trig-ctx").unwrap();
-        ctx.access.write_revoked_members.clear();
+        ctx.role_state.suspended_capabilities.clear();
         ctx.governance.cooldown_until.clear();
         ctx.receive_buffer.push(ContextEvent::MessageSent {
             sender_did: admin.clone(),
@@ -8488,7 +8490,7 @@ async fn test_consequence_triggers_on_governance_action() {
     );
 }
 
-/// `CapabilitySuspension` blocks subsequent `send_message` (#1531).
+/// `Suspend` blocks subsequent `send_message` (#1531).
 #[tokio::test]
 async fn test_capability_suspension_blocks_subsequent_send() {
     use scp_protocol::trust::consequence::{
@@ -8507,7 +8509,7 @@ async fn test_capability_suspension_blocks_subsequent_send() {
     params.consequence_rules = vec![ConsequenceRule {
         trigger: ConsequenceTrigger::MessageVelocity,
         threshold: 1,
-        action: ConsequenceAction::CapabilitySuspension(vec!["write".to_owned()]),
+        action: ConsequenceAction::Suspend { capabilities: vec!["write".to_owned()] },
         window: Duration::from_secs(3600),
     }];
     let _handle = manager
@@ -8550,7 +8552,7 @@ async fn test_capability_suspension_blocks_subsequent_send() {
         .await;
     assert!(
         result.is_err(),
-        "send should fail after CapabilitySuspension"
+        "send should fail after Suspend"
     );
     let err = result.unwrap_err();
     assert!(
@@ -8559,7 +8561,7 @@ async fn test_capability_suspension_blocks_subsequent_send() {
     );
 }
 
-/// `AccessRevocation` blocks subsequent `send_message` (#1531).
+/// `SuspendAll` blocks subsequent `send_message` (#1531).
 #[tokio::test]
 async fn test_access_revocation_blocks_subsequent_send() {
     use scp_protocol::trust::consequence::{
@@ -8578,7 +8580,7 @@ async fn test_access_revocation_blocks_subsequent_send() {
     params.consequence_rules = vec![ConsequenceRule {
         trigger: ConsequenceTrigger::MessageVelocity,
         threshold: 1,
-        action: ConsequenceAction::AccessRevocation,
+        action: ConsequenceAction::SuspendAll,
         window: Duration::from_secs(3600),
     }];
     let _handle = manager
@@ -8619,7 +8621,7 @@ async fn test_access_revocation_blocks_subsequent_send() {
             None,
         )
         .await;
-    assert!(result.is_err(), "send should fail after AccessRevocation");
+    assert!(result.is_err(), "send should fail after SuspendAll");
 }
 
 /// Cooldown expires and allows re-trigger of consequence rule (#1531).
@@ -8649,7 +8651,7 @@ async fn test_cooldown_expires_allows_retrigger() {
         let ctx = contexts.get_mut("cd-exp2-ctx").unwrap();
         ctx.governance.consequence_rules = vec![ConsequenceRule {
             trigger: ConsequenceTrigger::MessageVelocity,
-            action: ConsequenceAction::AccessRevocation,
+            action: ConsequenceAction::SuspendAll,
             threshold: 1,
             window: Duration::from_secs(1),
         }];
@@ -8687,8 +8689,8 @@ async fn test_cooldown_expires_allows_retrigger() {
     {
         let mut contexts = manager.contexts.lock().await;
         let ctx = contexts.get_mut("cd-exp2-ctx").unwrap();
-        ctx.access.write_revoked_members.clear();
-        ctx.access.read_revoked_members.clear();
+        ctx.role_state.suspended_capabilities.clear();
+        ctx.access.read_exclusion_list.clear();
         ctx.governance.cooldown_until.insert(0, 0); // already expired
     }
 
@@ -8780,18 +8782,18 @@ async fn test_multiple_consequence_rules_all_evaluated() {
     );
 
     let mut params = governance_params();
-    // Two rules: one CapabilitySuspension, one RoleDemotion.
+    // Two rules: one Suspend, one AssignRole.
     params.consequence_rules = vec![
         ConsequenceRule {
             trigger: ConsequenceTrigger::MessageVelocity,
             threshold: 1,
-            action: ConsequenceAction::CapabilitySuspension(vec!["write".to_owned()]),
+            action: ConsequenceAction::Suspend { capabilities: vec!["write".to_owned()] },
             window: Duration::from_secs(3600),
         },
         ConsequenceRule {
             trigger: ConsequenceTrigger::MessageVelocity,
             threshold: 1,
-            action: ConsequenceAction::RoleDemotion {
+            action: ConsequenceAction::AssignRole {
                 to_role: "subscriber".to_owned(),
             },
             window: Duration::from_secs(3600),
@@ -9275,7 +9277,7 @@ async fn test_sender_key_removal_error_propagates() {
     manager.join_context(&handle, kp, None).await.unwrap();
 
     // Remove Alice — sender key removal will fail but MLS removal succeeds.
-    let action = scp_protocol::context::governance::GovernanceAction::RemoveMember {
+    let action = scp_protocol::context::governance::GovernanceAction::Eject {
         did: alice.clone(),
         reason: Some("error propagation test".into()),
     };
@@ -9320,7 +9322,7 @@ async fn test_remaining_members_unaffected_after_removal() {
     }
 
     // Remove Bob.
-    let action = scp_protocol::context::governance::GovernanceAction::RemoveMember {
+    let action = scp_protocol::context::governance::GovernanceAction::Eject {
         did: bob.clone(),
         reason: Some("test removal".into()),
     };
@@ -9473,7 +9475,7 @@ async fn test_send_consequence_economy_round_trip() {
     params.consequence_rules = vec![ConsequenceRule {
         trigger: ConsequenceTrigger::MessageVelocity,
         threshold: 1,
-        action: ConsequenceAction::CapabilitySuspension(vec!["write".to_owned()]),
+        action: ConsequenceAction::Suspend { capabilities: vec!["write".to_owned()] },
         window: Duration::from_secs(3600),
     }];
     let _handle = manager
@@ -9635,7 +9637,7 @@ async fn test_paid_join_with_consequence_evaluation() {
     params.consequence_rules = vec![ConsequenceRule {
         trigger: ConsequenceTrigger::MessageVelocity,
         threshold: 1,
-        action: ConsequenceAction::CapabilitySuspension(vec!["write".to_owned()]),
+        action: ConsequenceAction::Suspend { capabilities: vec!["write".to_owned()] },
         window: Duration::from_secs(3600),
     }];
     let handle = manager
@@ -10028,7 +10030,7 @@ async fn rotate_sender_key_called_after_remove_member() {
     call_order.lock().unwrap().clear();
 
     // Remove Alice via governance.
-    let action = scp_protocol::context::governance::GovernanceAction::RemoveMember {
+    let action = scp_protocol::context::governance::GovernanceAction::Eject {
         did: alice.clone(),
         reason: Some("rotation test".into()),
     };
@@ -10099,7 +10101,7 @@ async fn rotate_sender_key_error_propagates() {
     // action succeeds. MLS removal (the hard security boundary) completes;
     // rotate_sender_key failure is logged as a warning but does not abort
     // the operation, avoiding inconsistent state.
-    let action = scp_protocol::context::governance::GovernanceAction::RemoveMember {
+    let action = scp_protocol::context::governance::GovernanceAction::Eject {
         did: alice.clone(),
         reason: Some("error test".into()),
     };
@@ -10454,7 +10456,7 @@ async fn test_consequence_evaluation_uses_full_history() {
     params.consequence_rules = vec![ConsequenceRule {
         trigger: ConsequenceTrigger::MessageVelocity,
         threshold: 2,
-        action: ConsequenceAction::CapabilitySuspension(vec!["write".to_owned()]),
+        action: ConsequenceAction::Suspend { capabilities: vec!["write".to_owned()] },
         window: Duration::from_secs(3600),
     }];
     let _handle = manager
@@ -10491,14 +10493,14 @@ async fn test_consequence_evaluation_uses_full_history() {
     // retains both entries because MockEventLogWithActorDid persists them.
     let _ = manager.drain_events("hist-ctx").await;
 
-    // Clear the write revocation that may have been applied by the
+    // Clear the write suspension that may have been applied by the
     // consequence on the 2nd send (threshold=2 was reached in-buffer).
     {
         let mut contexts = manager.contexts.lock().await;
         let ctx = contexts.get_mut("hist-ctx").unwrap();
-        ctx.access
-            .write_revoked_members
-            .remove(&DID::from("did:key:admin"));
+        ctx.role_state
+            .suspended_capabilities
+            .remove("did:key:admin");
         // Reset the cooldown so the consequence can trigger again.
         ctx.governance.cooldown_until.clear();
     }
@@ -10961,7 +10963,7 @@ async fn rotate_sender_key_not_called_when_remove_member_fails() {
     call_order.lock().unwrap().clear();
 
     // Remove Alice via governance — should fail at remove_member.
-    let action = scp_protocol::context::governance::GovernanceAction::RemoveMember {
+    let action = scp_protocol::context::governance::GovernanceAction::Eject {
         did: alice.clone(),
         reason: Some("rotation skip test".into()),
     };
@@ -11124,8 +11126,8 @@ async fn governance_action_stores_actor_did() {
     };
     manager.join_context(&handle, kp, None).await.unwrap();
 
-    // Execute governance action: RemoveMember.
-    let action = scp_protocol::context::governance::GovernanceAction::RemoveMember {
+    // Execute governance action: Eject.
+    let action = scp_protocol::context::governance::GovernanceAction::Eject {
         did: target.clone(),
         reason: Some("actor_did test".into()),
     };
@@ -11396,7 +11398,7 @@ async fn capability_suspension_exact_match_no_false_positive() {
         ctx.governance.consequence_rules = vec![ConsequenceRule {
             trigger: ConsequenceTrigger::MessageVelocity,
             threshold: 1,
-            action: ConsequenceAction::CapabilitySuspension(vec!["spreadsheet".to_owned()]),
+            action: ConsequenceAction::Suspend { capabilities: vec!["spreadsheet".to_owned()] },
             window: Duration::from_secs(3600),
         }];
     }
@@ -11424,18 +11426,19 @@ async fn capability_suspension_exact_match_no_false_positive() {
         .await
         .unwrap();
 
-    // H10: "spreadsheet" is unknown — enforce_capability_suspension returns false,
-    // which escalates to AccessRevocation. So write access IS now revoked.
-    let write_revoked = {
+    // H10: "spreadsheet" is unknown — enforce_suspend returns false,
+    // which escalates to SuspendAll. So capabilities are now suspended.
+    let write_suspended = {
         let contexts = manager.contexts.lock().await;
         let ctx = contexts.get("cap-exact-ctx").unwrap();
-        ctx.access
-            .write_revoked_members
-            .contains(&DID::from("did:key:sender"))
+        ctx.role_state
+            .suspended_capabilities
+            .get("did:key:sender")
+            .is_some_and(|s| !s.is_empty())
     };
     assert!(
-        write_revoked,
-        "unknown capability suspension should escalate to access revocation (H10)"
+        write_suspended,
+        "unknown capability suspension should escalate to SuspendAll (H10)"
     );
 
     // Member should NOT be able to send after escalation.
@@ -11477,7 +11480,7 @@ async fn capability_suspension_write_revokes_write() {
     params.consequence_rules = vec![ConsequenceRule {
         trigger: ConsequenceTrigger::MessageVelocity,
         threshold: 1,
-        action: ConsequenceAction::CapabilitySuspension(vec!["write".to_owned()]),
+        action: ConsequenceAction::Suspend { capabilities: vec!["write".to_owned()] },
         window: Duration::from_secs(3600),
     }];
     let _handle = manager
@@ -11508,17 +11511,18 @@ async fn capability_suspension_write_revokes_write() {
         .await
         .unwrap();
 
-    // Write access should be revoked.
-    let write_revoked = {
+    // Write capability should be suspended.
+    let write_suspended = {
         let contexts = manager.contexts.lock().await;
         let ctx = contexts.get("cap-write-ctx").unwrap();
-        ctx.access
-            .write_revoked_members
-            .contains(&DID::from("did:key:sender"))
+        ctx.role_state
+            .suspended_capabilities
+            .get("did:key:sender")
+            .is_some_and(|s| s.contains(&Capability::MessagesWrite))
     };
     assert!(
-        write_revoked,
-        "\"write\" suspension should revoke write access"
+        write_suspended,
+        "\"write\" suspension should suspend MessagesWrite capability"
     );
 }
 
@@ -11544,7 +11548,7 @@ async fn capability_suspension_read_revokes_read() {
     params.consequence_rules = vec![ConsequenceRule {
         trigger: ConsequenceTrigger::MessageVelocity,
         threshold: 1,
-        action: ConsequenceAction::CapabilitySuspension(vec!["read".to_owned()]),
+        action: ConsequenceAction::Suspend { capabilities: vec!["read".to_owned()] },
         window: Duration::from_secs(3600),
     }];
     let _handle = manager
@@ -11574,16 +11578,17 @@ async fn capability_suspension_read_revokes_read() {
         .await
         .unwrap();
 
-    let read_revoked = {
+    let read_suspended = {
         let contexts = manager.contexts.lock().await;
         let ctx = contexts.get("cap-read-ctx").unwrap();
-        ctx.access
-            .read_revoked_members
-            .contains(&DID::from("did:key:sender"))
+        ctx.role_state
+            .suspended_capabilities
+            .get("did:key:sender")
+            .is_some_and(|s| s.contains(&Capability::MessagesRead))
     };
     assert!(
-        read_revoked,
-        "\"read\" suspension should revoke read access"
+        read_suspended,
+        "\"read\" suspension should suspend MessagesRead capability"
     );
 }
 
@@ -11609,7 +11614,7 @@ async fn capability_suspension_messages_write_revokes_write() {
     params.consequence_rules = vec![ConsequenceRule {
         trigger: ConsequenceTrigger::MessageVelocity,
         threshold: 1,
-        action: ConsequenceAction::CapabilitySuspension(vec!["MessagesWrite".to_owned()]),
+        action: ConsequenceAction::Suspend { capabilities: vec!["MessagesWrite".to_owned()] },
         window: Duration::from_secs(3600),
     }];
     let _handle = manager
@@ -11639,16 +11644,17 @@ async fn capability_suspension_messages_write_revokes_write() {
         .await
         .unwrap();
 
-    let write_revoked = {
+    let write_suspended = {
         let contexts = manager.contexts.lock().await;
         let ctx = contexts.get("cap-mw-ctx").unwrap();
-        ctx.access
-            .write_revoked_members
-            .contains(&DID::from("did:key:sender"))
+        ctx.role_state
+            .suspended_capabilities
+            .get("did:key:sender")
+            .is_some_and(|s| s.contains(&Capability::MessagesWrite))
     };
     assert!(
-        write_revoked,
-        "\"MessagesWrite\" suspension should revoke write access"
+        write_suspended,
+        "\"MessagesWrite\" suspension should suspend MessagesWrite capability"
     );
 }
 
@@ -11676,7 +11682,7 @@ async fn role_demotion_nonexistent_role_reports_failure() {
     params.consequence_rules = vec![ConsequenceRule {
         trigger: ConsequenceTrigger::MessageVelocity,
         threshold: 1,
-        action: ConsequenceAction::RoleDemotion {
+        action: ConsequenceAction::AssignRole {
             to_role: "nonexistent_role".to_owned(),
         },
         window: Duration::from_secs(3600),
@@ -11708,7 +11714,7 @@ async fn role_demotion_nonexistent_role_reports_failure() {
         .await
         .unwrap();
 
-    // H10: failed enforcement (nonexistent role) escalates to AccessRevocation.
+    // H10: failed enforcement (nonexistent role) escalates to SuspendAll.
     let events = manager.drain_events("role-noexist-ctx").await;
     let enforced_events: Vec<_> = events
         .iter()
@@ -11718,7 +11724,7 @@ async fn role_demotion_nonexistent_role_reports_failure() {
         !enforced_events.is_empty(),
         "should have ConsequenceEnforced event"
     );
-    // The escalated enforcement should be AccessRevocation(escalated) with success=true.
+    // The escalated enforcement should be SuspendAll(escalated) with success=true.
     let has_escalation = enforced_events.iter().any(|e| {
         matches!(
             e,
@@ -11726,20 +11732,22 @@ async fn role_demotion_nonexistent_role_reports_failure() {
                 action_type,
                 success,
                 ..
-            } if *success && action_type == "AccessRevocation(escalated)"
+            } if *success && action_type == "SuspendAll(escalated)"
         )
     });
     assert!(
         has_escalation,
-        "Failed RoleDemotion should escalate to AccessRevocation. Events: {enforced_events:?}"
+        "Failed AssignRole should escalate to SuspendAll. Events: {enforced_events:?}"
     );
-    // Verify the member is now access-revoked.
+    // Verify the member is now suspended.
     let contexts = manager.contexts.lock().await;
     let ctx = contexts.get("role-noexist-ctx").unwrap();
-    let sender_did: DID = "did:key:sender".into();
     assert!(
-        ctx.access.write_revoked_members.contains(&sender_did),
-        "sender should be write-revoked after escalation"
+        ctx.role_state
+            .suspended_capabilities
+            .get("did:key:sender")
+            .is_some_and(|s| !s.is_empty()),
+        "sender should have suspended capabilities after escalation"
     );
 }
 
@@ -11868,7 +11876,7 @@ async fn cooldown_advance_past_allows_retrigger() {
     params.consequence_rules = vec![ConsequenceRule {
         trigger: ConsequenceTrigger::MessageVelocity,
         threshold: 1,
-        action: ConsequenceAction::CapabilitySuspension(vec!["write".to_owned()]),
+        action: ConsequenceAction::Suspend { capabilities: vec!["write".to_owned()] },
         window: Duration::from_secs(10),
     }];
     let _handle = manager
@@ -11909,13 +11917,13 @@ async fn cooldown_advance_past_allows_retrigger() {
         "first send should trigger consequence. Events: {events1:?}"
     );
 
-    // Clear revocation + cooldown, and advance cooldown_until to the past.
+    // Clear suspension + cooldown, and advance cooldown_until to the past.
     {
         let mut contexts = manager.contexts.lock().await;
         let ctx = contexts.get_mut("cooldown-adv-ctx").unwrap();
-        ctx.access
-            .write_revoked_members
-            .remove(&DID::from("did:key:sender"));
+        ctx.role_state
+            .suspended_capabilities
+            .remove("did:key:sender");
         // Set cooldown_until to 0 (past) — allows re-trigger.
         ctx.governance.cooldown_until.insert(0, 0);
     }
@@ -12047,7 +12055,7 @@ async fn capability_suspension_empty_caps_no_action() {
     params.consequence_rules = vec![ConsequenceRule {
         trigger: ConsequenceTrigger::MessageVelocity,
         threshold: 1,
-        action: ConsequenceAction::CapabilitySuspension(vec![]), // empty caps
+        action: ConsequenceAction::Suspend { capabilities: vec![] }, // empty caps
         window: Duration::from_secs(3600),
     }];
     let _handle = manager
@@ -12077,27 +12085,22 @@ async fn capability_suspension_empty_caps_no_action() {
         .await
         .unwrap();
 
-    // H10: empty caps produces success=false, which escalates to AccessRevocation.
-    // So the member should be write+read revoked after escalation.
-    let (write_revoked, read_revoked) = {
+    // H10: empty caps produces success=false, which escalates to SuspendAll.
+    // So the member should have all capabilities suspended after escalation.
+    let all_suspended = {
         let contexts = manager.contexts.lock().await;
         let ctx = contexts.get("empty-caps-ctx").unwrap();
-        let sender = DID::from("did:key:sender");
-        (
-            ctx.access.write_revoked_members.contains(&sender),
-            ctx.access.read_revoked_members.contains(&sender),
-        )
+        ctx.role_state
+            .suspended_capabilities
+            .get("did:key:sender")
+            .is_some_and(|s| !s.is_empty())
     };
     assert!(
-        write_revoked,
-        "empty caps suspension should escalate to write revocation (H10)"
-    );
-    assert!(
-        read_revoked,
-        "empty caps suspension should escalate to read revocation (H10)"
+        all_suspended,
+        "empty caps suspension should escalate to SuspendAll (H10)"
     );
 
-    // Verify ConsequenceEnforced with escalated AccessRevocation.
+    // Verify ConsequenceEnforced with escalated SuspendAll.
     let events = manager.drain_events("empty-caps-ctx").await;
     let enforced_events: Vec<_> = events
         .iter()
@@ -12111,12 +12114,12 @@ async fn capability_suspension_empty_caps_no_action() {
         matches!(
             e,
             ContextEvent::ConsequenceEnforced { action_type, success, .. }
-                if *success && action_type == "AccessRevocation(escalated)"
+                if *success && action_type == "SuspendAll(escalated)"
         )
     });
     assert!(
         has_escalation,
-        "empty caps should escalate to AccessRevocation. Events: {enforced_events:?}"
+        "empty caps should escalate to SuspendAll. Events: {enforced_events:?}"
     );
 }
 
@@ -12143,13 +12146,13 @@ async fn multiple_consequence_rules_all_trigger() {
         ConsequenceRule {
             trigger: ConsequenceTrigger::MessageVelocity,
             threshold: 1,
-            action: ConsequenceAction::CapabilitySuspension(vec!["write".to_owned()]),
+            action: ConsequenceAction::Suspend { capabilities: vec!["write".to_owned()] },
             window: Duration::from_secs(3600),
         },
         ConsequenceRule {
             trigger: ConsequenceTrigger::MessageVelocity,
             threshold: 1,
-            action: ConsequenceAction::CapabilitySuspension(vec!["read".to_owned()]),
+            action: ConsequenceAction::Suspend { capabilities: vec!["read".to_owned()] },
             window: Duration::from_secs(3600),
         },
     ];
@@ -12180,21 +12183,18 @@ async fn multiple_consequence_rules_all_trigger() {
         .await
         .unwrap();
 
-    // Both rules should have fired — both write and read revoked.
-    let (write_revoked, read_revoked) = {
+    // Both rules should have fired — both write and read suspended.
+    let (write_suspended, read_suspended) = {
         let contexts = manager.contexts.lock().await;
         let ctx = contexts.get("multi-rule-ctx").unwrap();
+        let suspended = ctx.role_state.suspended_capabilities.get("did:key:sender");
         (
-            ctx.access
-                .write_revoked_members
-                .contains(&DID::from("did:key:sender")),
-            ctx.access
-                .read_revoked_members
-                .contains(&DID::from("did:key:sender")),
+            suspended.is_some_and(|s| s.contains(&Capability::MessagesWrite)),
+            suspended.is_some_and(|s| s.contains(&Capability::MessagesRead)),
         )
     };
-    assert!(write_revoked, "first rule should revoke write");
-    assert!(read_revoked, "second rule should revoke read");
+    assert!(write_suspended, "first rule should suspend write");
+    assert!(read_suspended, "second rule should suspend read");
 
     // Verify 2 ConsequenceTriggered events.
     let events = manager.drain_events("multi-rule-ctx").await;
@@ -12500,7 +12500,7 @@ async fn consequence_fires_on_governance_action() {
     params.consequence_rules = vec![ConsequenceRule {
         trigger: ConsequenceTrigger::WarningCount,
         threshold: 1,
-        action: ConsequenceAction::CapabilitySuspension(vec!["write".to_owned()]),
+        action: ConsequenceAction::Suspend { capabilities: vec!["write".to_owned()] },
         window: Duration::from_secs(3600),
     }];
     let handle = manager
@@ -12519,7 +12519,7 @@ async fn consequence_fires_on_governance_action() {
     let _ = manager.drain_events("gov-csq-ctx").await;
 
     // Execute governance action: ban target.
-    let action = scp_protocol::context::governance::GovernanceAction::RemoveMember {
+    let action = scp_protocol::context::governance::GovernanceAction::Eject {
         did: target.clone(),
         reason: Some("consequence test".into()),
     };
@@ -12573,12 +12573,12 @@ async fn test_warning_count_trigger_fires_behavioral() {
     let key_admin = signing_key_for_did(&admin);
 
     // WarningCount threshold = 2: two governance actions against a member
-    // within the window should trigger a CapabilitySuspension.
+    // within the window should trigger a Suspend.
     let mut params = governance_params();
     params.consequence_rules = vec![ConsequenceRule {
         trigger: ConsequenceTrigger::WarningCount,
         threshold: 2,
-        action: ConsequenceAction::CapabilitySuspension(vec!["messages:write".to_owned()]),
+        action: ConsequenceAction::Suspend { capabilities: vec!["messages:write".to_owned()] },
         window: Duration::from_secs(3600),
     }];
     let handle = manager
@@ -12597,7 +12597,7 @@ async fn test_warning_count_trigger_fires_behavioral() {
     let _ = manager.drain_events("warn-ctx").await;
 
     // First governance action against target — threshold not yet met.
-    let action1 = scp_protocol::context::governance::GovernanceAction::RemoveMember {
+    let action1 = scp_protocol::context::governance::GovernanceAction::Eject {
         did: target.clone(),
         reason: Some("warning 1".into()),
     };
@@ -12623,7 +12623,7 @@ async fn test_warning_count_trigger_fires_behavioral() {
     let _ = manager.drain_events("warn-ctx").await;
 
     // Second governance action against target — threshold met.
-    let action2 = scp_protocol::context::governance::GovernanceAction::RemoveMember {
+    let action2 = scp_protocol::context::governance::GovernanceAction::Eject {
         did: target.clone(),
         reason: Some("warning 2".into()),
     };
@@ -12651,7 +12651,7 @@ async fn test_warning_count_trigger_fires_behavioral() {
 // §60c. Participation governance_actions_against populated
 // -----------------------------------------------------------------------
 
-/// Behavioral test: governance actions (e.g., `RemoveMember`) executed via
+/// Behavioral test: governance actions (e.g., `Eject`) executed via
 /// `propose_governance_action` create event log entries that populate
 /// `governance_actions_against` in participation records.
 #[tokio::test]
@@ -12684,7 +12684,7 @@ async fn test_participation_actions_against_populated() {
     manager.join_context(&handle, kp, None).await.unwrap();
 
     // Execute a governance action against the target.
-    let action = scp_protocol::context::governance::GovernanceAction::RemoveMember {
+    let action = scp_protocol::context::governance::GovernanceAction::Eject {
         did: target.clone(),
         reason: Some("test action".into()),
     };
@@ -13032,7 +13032,7 @@ async fn eligibility_check_uses_context_manager_clock() {
     manager.join_context(&handle, kp, None).await.unwrap();
 
     // Execute a governance action — verifies clock is used without panicking.
-    let action = scp_protocol::context::governance::GovernanceAction::RemoveMember {
+    let action = scp_protocol::context::governance::GovernanceAction::Eject {
         did: "did:key:member".into(),
         reason: Some("clock test".into()),
     };
@@ -13292,8 +13292,6 @@ fn velocity_tracker_state_in_context_snapshot_roundtrip() {
         executed_proposals: HashSet::new(),
         ttl_remaining_secs: None,
         registered_tools: Vec::new(),
-        write_revoked_members: HashSet::new(),
-        read_revoked_members: HashSet::new(),
         read_exclusion_list: HashSet::new(),
         tool_interfaces: Vec::new(),
         threshold_signers: Vec::new(),
@@ -13373,8 +13371,6 @@ fn velocity_tracker_backward_compat_deserialization() {
         executed_proposals: HashSet::new(),
         ttl_remaining_secs: None,
         registered_tools: Vec::new(),
-        write_revoked_members: HashSet::new(),
-        read_revoked_members: HashSet::new(),
         read_exclusion_list: HashSet::new(),
         tool_interfaces: Vec::new(),
         threshold_signers: Vec::new(),
@@ -13487,7 +13483,7 @@ async fn consequence_timer_fires_without_user_action() {
     params.consequence_rules = vec![ConsequenceRule {
         trigger: ConsequenceTrigger::MessageVelocity,
         threshold: 1,
-        action: ConsequenceAction::CapabilitySuspension(vec!["write".to_owned()]),
+        action: ConsequenceAction::Suspend { capabilities: vec!["write".to_owned()] },
         window: Duration::from_secs(3600),
     }];
 
@@ -13561,7 +13557,7 @@ async fn consequence_timer_respects_cooldown() {
     params.consequence_rules = vec![ConsequenceRule {
         trigger: ConsequenceTrigger::MessageVelocity,
         threshold: 1,
-        action: ConsequenceAction::CapabilitySuspension(vec!["write".to_owned()]),
+        action: ConsequenceAction::Suspend { capabilities: vec!["write".to_owned()] },
         // Long cooldown window — rule should NOT re-fire on second tick.
         window: Duration::from_secs(7200),
     }];
@@ -13662,7 +13658,7 @@ async fn consequence_timer_noop_without_rules() {
 // non-async `fn`).
 // -----------------------------------------------------------------------
 
-/// `CapabilitySuspension` consequence triggers and contains the expected
+/// `Suspend` consequence triggers and contains the expected
 /// action when `evaluate_consequence_rules` fires on message velocity.
 #[test]
 fn consequence_can_suspend_capability() {
@@ -13675,7 +13671,7 @@ fn consequence_can_suspend_capability() {
     let rules = vec![ConsequenceRule {
         trigger: ConsequenceTrigger::MessageVelocity,
         threshold: 1,
-        action: ConsequenceAction::CapabilitySuspension(vec!["write".to_owned()]),
+        action: ConsequenceAction::Suspend { capabilities: vec!["write".to_owned()] },
         window: Duration::from_secs(3600),
     }];
 
@@ -13694,9 +13690,9 @@ fn consequence_can_suspend_capability() {
     assert!(
         matches!(
             &triggered[0].action,
-            ConsequenceAction::CapabilitySuspension(caps) if caps == &["write"]
+            ConsequenceAction::Suspend { capabilities: caps } if caps == &["write"]
         ),
-        "triggered action should be CapabilitySuspension with 'write'"
+        "triggered action should be Suspend with 'write'"
     );
 }
 
@@ -13714,13 +13710,13 @@ fn consequence_triggered_on_dispatch_evaluation() {
         ConsequenceRule {
             trigger: ConsequenceTrigger::MessageVelocity,
             threshold: 2,
-            action: ConsequenceAction::AccessRevocation,
+            action: ConsequenceAction::SuspendAll,
             window: Duration::from_secs(60),
         },
         ConsequenceRule {
             trigger: ConsequenceTrigger::MessageVelocity,
             threshold: 1,
-            action: ConsequenceAction::CapabilitySuspension(vec!["read".to_owned()]),
+            action: ConsequenceAction::Suspend { capabilities: vec!["read".to_owned()] },
             window: Duration::from_secs(60),
         },
     ];
@@ -13745,9 +13741,9 @@ fn consequence_triggered_on_dispatch_evaluation() {
     assert!(
         matches!(
             &triggered[0].action,
-            ConsequenceAction::CapabilitySuspension(_)
+            ConsequenceAction::Suspend { capabilities: _ }
         ),
-        "triggered action should be CapabilitySuspension"
+        "triggered action should be Suspend"
     );
 }
 
@@ -14185,7 +14181,7 @@ async fn test_sender_key_failure_still_removes_from_mls() {
     call_order.lock().unwrap().clear();
 
     // Remove Alice — sender key fails but MLS succeeds.
-    let action = scp_protocol::context::governance::GovernanceAction::RemoveMember {
+    let action = scp_protocol::context::governance::GovernanceAction::Eject {
         did: alice.clone(),
         reason: Some("H9 test".into()),
     };
@@ -14228,7 +14224,7 @@ async fn test_consequence_failure_escalates() {
     params.consequence_rules = vec![ConsequenceRule {
         trigger: ConsequenceTrigger::MessageVelocity,
         threshold: 1,
-        action: ConsequenceAction::RoleDemotion {
+        action: ConsequenceAction::AssignRole {
             to_role: "nonexistent".to_owned(),
         },
         window: Duration::from_secs(3600),
@@ -14260,26 +14256,30 @@ async fn test_consequence_failure_escalates() {
         .await
         .unwrap();
 
-    // Verify escalation to AccessRevocation.
+    // Verify escalation to SuspendAll.
     let events = manager.drain_events("esc-ctx").await;
     let has_escalation = events.iter().any(|e| {
         matches!(
             e,
             ContextEvent::ConsequenceEnforced { action_type, success, .. }
-                if *success && action_type == "AccessRevocation(escalated)"
+                if *success && action_type == "SuspendAll(escalated)"
         )
     });
     assert!(
         has_escalation,
-        "failed enforcement should escalate to AccessRevocation (H10). Events: {events:?}"
+        "failed enforcement should escalate to SuspendAll (H10). Events: {events:?}"
     );
 
-    // Member should be access-revoked.
+    // Member should have all capabilities suspended.
     let contexts = manager.contexts.lock().await;
     let ctx = contexts.get("esc-ctx").unwrap();
-    let sender: DID = "did:key:sender".into();
-    assert!(ctx.access.write_revoked_members.contains(&sender));
-    assert!(ctx.access.read_revoked_members.contains(&sender));
+    assert!(
+        ctx.role_state
+            .suspended_capabilities
+            .get("did:key:sender")
+            .is_some_and(|s| !s.is_empty()),
+        "sender should have suspended capabilities after escalation"
+    );
 }
 
 // -----------------------------------------------------------------------
@@ -14609,7 +14609,7 @@ async fn test_deliver_incoming_evaluates_consequences() {
     let params = ContextParams {
         consequence_rules: vec![ConsequenceRule {
             trigger: ConsequenceTrigger::MessageVelocity,
-            action: ConsequenceAction::AccessRevocation,
+            action: ConsequenceAction::SuspendAll,
             threshold: 9999,
             window: Duration::from_secs(3600),
         }],
@@ -14732,14 +14732,14 @@ async fn enforce_triggered_consequences_skips_absent_member() {
 
     let rules = vec![ConsequenceRule {
         trigger: ConsequenceTrigger::MessageVelocity,
-        action: ConsequenceAction::CapabilitySuspension(vec!["write".to_owned()]),
+        action: ConsequenceAction::Suspend { capabilities: vec!["write".to_owned()] },
         threshold: 1,
         window: Duration::from_secs(60),
     }];
 
     let triggered = vec![TriggeredConsequence {
         rule_index: 0,
-        action: ConsequenceAction::CapabilitySuspension(vec!["write".to_owned()]),
+        action: ConsequenceAction::Suspend { capabilities: vec!["write".to_owned()] },
         evidence: vec![],
     }];
 
@@ -14779,14 +14779,12 @@ async fn enforce_triggered_consequences_skips_absent_member() {
             events_after,
         );
 
-        // Verify no access revocation occurred either.
+        // Verify no capability suspension occurred either.
         assert!(
-            !ctx.access.write_revoked_members.contains(&non_member_did),
-            "non-member should not appear in write_revoked_members"
-        );
-        assert!(
-            !ctx.access.read_revoked_members.contains(&non_member_did),
-            "non-member should not appear in read_revoked_members"
+            !ctx.role_state
+                .suspended_capabilities
+                .contains_key(non_member_did.as_ref()),
+            "non-member should not appear in suspended_capabilities"
         );
     }
 }

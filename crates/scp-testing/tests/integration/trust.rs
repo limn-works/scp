@@ -473,13 +473,13 @@ async fn consequence_rules_evaluation() {
     let rules = vec![
         ConsequenceRule {
             trigger: ConsequenceTrigger::MessageVelocity,
-            action: ConsequenceAction::CapabilitySuspension(vec!["messages:write".to_owned()]),
+            action: ConsequenceAction::Suspend { capabilities: vec!["messages:write".to_owned()] },
             threshold: 3,
             window: Duration::from_secs(60),
         },
         ConsequenceRule {
             trigger: ConsequenceTrigger::ToolRateExceeded,
-            action: ConsequenceAction::AccessRevocation,
+            action: ConsequenceAction::SuspendAll,
             threshold: 2,
             window: Duration::from_secs(120),
         },
@@ -500,12 +500,12 @@ async fn consequence_rules_evaluation() {
     assert_eq!(triggered[0].rule_index, 0);
     assert_eq!(
         triggered[0].action,
-        ConsequenceAction::CapabilitySuspension(vec!["messages:write".to_owned()])
+        ConsequenceAction::Suspend { capabilities: vec!["messages:write".to_owned()] }
     );
     assert_eq!(triggered[0].evidence.len(), 3);
 
     assert_eq!(triggered[1].rule_index, 1);
-    assert_eq!(triggered[1].action, ConsequenceAction::AccessRevocation);
+    assert_eq!(triggered[1].action, ConsequenceAction::SuspendAll);
     assert_eq!(triggered[1].evidence.len(), 2);
 }
 
