@@ -367,9 +367,9 @@ pub struct UnblockResult {
 /// - `block_list`: The blocker's [`BlockListState`].
 /// - `target`: The DID to check.
 /// - `context_id`: The context in which to check.
-/// - `governance_revoked`: Whether governance (Tier 3) has revoked the
-///   target's read or write access. The caller queries this from the
-///   context's `write_revoked_members` set.
+/// - `governance_revoked`: Whether governance has suspended or revoked the
+///   target's read or write access (Suspend/Revoke enforcement). The caller
+///   queries this from the context's suspension and revocation tracking sets.
 #[must_use]
 pub fn is_effectively_blocked(
     block_list: &BlockListState,
