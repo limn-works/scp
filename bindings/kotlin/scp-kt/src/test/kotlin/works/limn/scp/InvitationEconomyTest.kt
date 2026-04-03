@@ -147,7 +147,7 @@ class InvitationEconomyTest {
         fun `aggregateTrustInput passes consequence rules JSON to bridge`() =
             runTest(testDispatcher) {
                 val rulesJson =
-                    """[{"trigger":"MessageVelocity","action":"AccessRevocation","threshold":5}]"""
+                    """[{"trigger":"MessageVelocity","action":"SuspendAll","threshold":5}]"""
                 aggregateTrustInput(
                     bridge = bridge,
                     contextId = "ctx-consequence-test",

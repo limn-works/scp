@@ -49,28 +49,27 @@ struct GovernanceTests {
 
     // MARK: - GovernanceActionResult enum tests
 
-    @Test("GovernanceActionResult has exactly 28 cases")
+    @Test("GovernanceActionResult has exactly 26 cases")
     func governanceActionResultCount() {
         let allCases: [GovernanceActionResult] = [
-            .memberAdded, .memberRemoved, .roleChanged,
+            .memberAdded, .memberEjected, .roleChanged,
             .toolRegistered, .toolRemoved, .ceilingModified,
             .contextClosed, .ttlExtended, .pruningPolicyModified,
             .adminTransferred, .signerAdded, .signerRemoved,
             .thresholdModified, .childContextCreated, .toolInterfaceEstablished,
             .memberReset, .conflictResolved, .contextPromoted,
-            .readAccessRevoked, .readAccessRestored,
-            .writeAccessRevoked, .writeAccessRestored,
+            .memberSuspended, .accessRevoked, .accessRestored,
             .contentKeysRotated, .governanceReconfigured,
-            .authorBlocked, .subscriberBanned, .subscriberUnbanned,
+            .subscriberBanned, .subscriberUnbanned,
             .executed
         ]
-        #expect(allCases.count == 28)
+        #expect(allCases.count == 26)
     }
 
     @Test("GovernanceActionResult raw values match Rust GovernanceActionResult variants")
     func governanceActionResultRawValues() {
         #expect(GovernanceActionResult.memberAdded.rawValue == "MemberAdded")
-        #expect(GovernanceActionResult.memberRemoved.rawValue == "MemberRemoved")
+        #expect(GovernanceActionResult.memberEjected.rawValue == "MemberEjected")
         #expect(GovernanceActionResult.roleChanged.rawValue == "RoleChanged")
         #expect(GovernanceActionResult.toolRegistered.rawValue == "ToolRegistered")
         #expect(GovernanceActionResult.toolRemoved.rawValue == "ToolRemoved")
@@ -87,13 +86,11 @@ struct GovernanceTests {
         #expect(GovernanceActionResult.memberReset.rawValue == "MemberReset")
         #expect(GovernanceActionResult.conflictResolved.rawValue == "ConflictResolved")
         #expect(GovernanceActionResult.contextPromoted.rawValue == "ContextPromoted")
-        #expect(GovernanceActionResult.readAccessRevoked.rawValue == "ReadAccessRevoked")
-        #expect(GovernanceActionResult.readAccessRestored.rawValue == "ReadAccessRestored")
-        #expect(GovernanceActionResult.writeAccessRevoked.rawValue == "WriteAccessRevoked")
-        #expect(GovernanceActionResult.writeAccessRestored.rawValue == "WriteAccessRestored")
+        #expect(GovernanceActionResult.memberSuspended.rawValue == "MemberSuspended")
+        #expect(GovernanceActionResult.accessRevoked.rawValue == "AccessRevoked")
+        #expect(GovernanceActionResult.accessRestored.rawValue == "AccessRestored")
         #expect(GovernanceActionResult.contentKeysRotated.rawValue == "ContentKeysRotated")
         #expect(GovernanceActionResult.governanceReconfigured.rawValue == "GovernanceReconfigured")
-        #expect(GovernanceActionResult.authorBlocked.rawValue == "AuthorBlocked")
         #expect(GovernanceActionResult.subscriberBanned.rawValue == "SubscriberBanned")
         #expect(GovernanceActionResult.subscriberUnbanned.rawValue == "SubscriberUnbanned")
         #expect(GovernanceActionResult.executed.rawValue == "Executed")
@@ -208,7 +205,7 @@ struct GovernanceTests {
 
         let expectedPairs: [(String, GovernanceActionResult)] = [
             ("MemberAdded", .memberAdded),
-            ("MemberRemoved", .memberRemoved),
+            ("MemberEjected", .memberEjected),
             ("RoleChanged", .roleChanged),
             ("ToolRegistered", .toolRegistered),
             ("ToolRemoved", .toolRemoved),
@@ -225,13 +222,11 @@ struct GovernanceTests {
             ("MemberReset", .memberReset),
             ("ConflictResolved", .conflictResolved),
             ("ContextPromoted", .contextPromoted),
-            ("ReadAccessRevoked", .readAccessRevoked),
-            ("ReadAccessRestored", .readAccessRestored),
-            ("WriteAccessRevoked", .writeAccessRevoked),
-            ("WriteAccessRestored", .writeAccessRestored),
+            ("MemberSuspended", .memberSuspended),
+            ("AccessRevoked", .accessRevoked),
+            ("AccessRestored", .accessRestored),
             ("ContentKeysRotated", .contentKeysRotated),
             ("GovernanceReconfigured", .governanceReconfigured),
-            ("AuthorBlocked", .authorBlocked),
             ("SubscriberBanned", .subscriberBanned),
             ("SubscriberUnbanned", .subscriberUnbanned),
             ("Executed", .executed)
