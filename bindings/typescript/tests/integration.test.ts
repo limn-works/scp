@@ -1898,7 +1898,7 @@ describe("Trust aggregation with consequence rules (mock bridge)", () => {
       consequenceRules: [
         {
           trigger: "MessageVelocity",
-          action: "AccessRevocation",
+          action: "SuspendAll",
           threshold: 5,
           window: { secs: 3600, nanos: 0 },
         },

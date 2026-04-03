@@ -350,7 +350,7 @@ class TestGovernanceWithRelay:
         proposal_json = _make_proposal_json(
             handle.context_id,
             alice_did,
-            {"RemoveMember": {"did": bob_did, "reason": None}},
+            {"Eject": {"did": bob_did, "reason": None}},
         )
         _scp_core.py_governance_execute(handle, proposal_json)
 

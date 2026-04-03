@@ -490,7 +490,7 @@ if (bridge === null || serverAddon === null) {
       await napi.contextExecuteGovernanceAction(
         ctx,
         JSON.stringify({
-          RemoveMember: {
+          Eject: {
             did: bob.did,
             reason: null,
           },
