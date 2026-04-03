@@ -574,6 +574,11 @@ pub struct ContextSnapshot {
     /// process restarts.
     #[serde(default)]
     pub cooldown_until: HashMap<usize, u64>,
+    /// Per-member governance proposal timestamps for earned capacity rate
+    /// limiting (§9.3). Maps member DID string to Unix timestamps of recent
+    /// proposals. Persisted so rate limiting survives process restarts.
+    #[serde(default)]
+    pub proposal_timestamps: HashMap<String, Vec<u64>>,
 }
 
 /// Serializable snapshot of [`SenderVelocityTracker`](scp_protocol::economy::antispam::SenderVelocityTracker)
@@ -749,6 +754,12 @@ struct GovernanceState {
     /// Validates that each spending UCAN nonce is used at most once, preventing
     /// replay attacks where a valid spending UCAN is resubmitted.
     spending_nonce_tracker: scp_protocol::crypto::ucan::nonce::NonceTracker<Arc<dyn Clock>>,
+    /// Per-member governance proposal timestamps for earned capacity rate limiting
+    /// (§9.3). Maps member DID string to a list of Unix timestamps (seconds) when
+    /// the member submitted governance proposals. Used by `check_standing` to
+    /// enforce `max_governance_proposals_per_window` from `EarnedCapacityPolicy`.
+    /// Entries outside the sliding window are evicted on each check.
+    proposal_timestamps: HashMap<String, Vec<u64>>,
 }
 
 impl GovernanceState {
@@ -759,6 +770,7 @@ impl GovernanceState {
     fn decay_standing(&mut self) {
         self.participation_cache.clear();
         self.cooldown_until.clear();
+        self.proposal_timestamps.clear();
         // M26: Clear velocity tracker on standing decay. Stale velocity
         // data from a closed/expired context must not carry over.
         self.velocity_tracker.clear();
@@ -778,6 +790,9 @@ impl GovernanceState {
             .retain(|did, _| self.last_known_members.contains(did.as_str()));
         // Evict expired cooldown entries.
         self.cooldown_until.retain(|_, expiry| now < *expiry);
+        // Evict departed members from proposal timestamps.
+        self.proposal_timestamps
+            .retain(|did, _| self.last_known_members.contains(did.as_str()));
     }
 }
 
@@ -1840,6 +1855,7 @@ impl ContextManager {
                 entries: ctx.governance.velocity_tracker.snapshot_entries(),
             }),
             cooldown_until: ctx.governance.cooldown_until.clone(),
+            proposal_timestamps: ctx.governance.proposal_timestamps.clone(),
         }
     }
 }

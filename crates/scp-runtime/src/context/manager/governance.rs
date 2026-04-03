@@ -488,6 +488,39 @@ fn check_standing(
                 .into(),
         ));
     }
+
+    // Earned capacity enforcement (§9.3): when the context has a sybil_policy,
+    // evaluate the proposer's identity depth to determine their governance
+    // proposal rate limit, then check recent proposals against that limit.
+    if let Some(sybil_policy) = ctx.handle.params().sybil_policy.as_ref() {
+        let assessment = super::lifecycle::build_identity_assessment(proposer_did, now);
+        let (_level, capacity) =
+            scp_protocol::trust::sybil::evaluate_earned_capacity(&assessment, sybil_policy, now);
+
+        let window_secs = capacity.governance_proposal_window_secs;
+        let max_proposals = capacity.max_governance_proposals_per_window;
+        let window_start = now.saturating_sub(window_secs);
+
+        // Count proposals within the sliding window for this member.
+        let timestamps = ctx
+            .governance
+            .proposal_timestamps
+            .entry(proposer_did.to_string())
+            .or_default();
+
+        // Evict stale entries outside the window.
+        timestamps.retain(|&ts| ts > window_start);
+
+        #[allow(clippy::cast_possible_truncation)]
+        let recent_count = timestamps.len() as u32;
+        if recent_count >= max_proposals {
+            return Err(ContextError::PermissionDenied(format!(
+                "earned capacity limit reached: {recent_count}/{max_proposals} governance proposals \
+                 in {window_secs}s window (SCP-GOV-5030)"
+            )));
+        }
+    }
+
     Ok(())
 }
 
@@ -1293,6 +1326,13 @@ impl ContextManager {
                 .engine
                 .propose(proposer_did, action, &gov_ctx, signing_key)
                 .map_err(|e| ContextError::GovernanceFailed(e.to_string()))?;
+
+            // Record proposal timestamp for earned capacity rate limiting (§9.3).
+            ctx.governance
+                .proposal_timestamps
+                .entry(proposer_did.to_string())
+                .or_default()
+                .push(self.clock.now_secs());
 
             let should_execute = proposal.status == ProposalStatus::Approved;
 
