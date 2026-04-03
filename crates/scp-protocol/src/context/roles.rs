@@ -102,7 +102,7 @@ pub enum Capability {
     /// Screen sharing via delegated media transport (spec section 10.9.1).
     MediaScreenShare,
     /// Ban a member from the context, revoking all access permanently (spec section 5.3).
-    /// Gates the `RevokeReadAccess` governance action.
+    /// Gates the `Revoke` governance action.
     MemberBan,
     /// Edit context operational metadata (spec section 5.7, §5.3.1).
     MetadataEdit,
@@ -793,6 +793,10 @@ pub struct ContextRoleState {
     pub members: HashSet<String>,
     /// Capabilities held by each member (derived from assignments).
     pub member_capabilities: HashMap<String, HashSet<Capability>>,
+    /// Suspended capabilities per member DID. A member whose DID appears here
+    /// is denied the listed capabilities even if their role grants them.
+    #[serde(default)]
+    pub suspended_capabilities: HashMap<String, HashSet<Capability>>,
 }
 
 impl ContextRoleState {
@@ -870,61 +874,69 @@ impl ContextRoleState {
             assignments,
             members,
             member_capabilities,
+            suspended_capabilities: HashMap::new(),
         })
     }
 
     /// Returns `true` if the given member has the specified capability.
+    ///
+    /// Suspension-aware: returns `false` if the capability is in the member's
+    /// suspended set, even if their role grants it.
     #[must_use]
     pub fn member_has_capability(&self, member_did: &str, capability: &Capability) -> bool {
+        // Check suspension first.
+        if self
+            .suspended_capabilities
+            .get(member_did)
+            .is_some_and(|suspended| suspended.contains(capability))
+        {
+            return false;
+        }
         self.member_capabilities
             .get(member_did)
             .is_some_and(|caps| caps.contains(capability))
     }
 
-    /// Revokes `GovernanceVote` and `GovernancePropose` capabilities from a
-    /// member (§5.9: presence-only members lose governance capabilities).
+    /// Suspends specific capabilities for a member.
     ///
-    /// Called when a member has both read and write access revoked. The member
-    /// remains in the context but cannot influence governance decisions about
-    /// content they cannot see.
-    pub fn revoke_governance_capabilities(&mut self, member_did: &scp_primitives::DID) {
-        let did_str = member_did.as_ref();
-        if let Some(caps) = self.member_capabilities.get_mut(did_str) {
-            caps.remove(&Capability::GovernanceVote);
-            caps.remove(&Capability::GovernancePropose);
+    /// The capabilities are added to the member's suspended set. While
+    /// suspended, `member_has_capability` returns `false` for these
+    /// capabilities even if the member's role grants them.
+    pub fn suspend_capabilities(
+        &mut self,
+        member_did: &str,
+        capabilities: impl IntoIterator<Item = Capability>,
+    ) {
+        self.suspended_capabilities
+            .entry(member_did.to_owned())
+            .or_default()
+            .extend(capabilities);
+    }
+
+    /// Restores previously suspended capabilities for a member.
+    ///
+    /// Removes the specified capabilities from the member's suspended set.
+    /// If the member has no remaining suspensions, the entry is removed.
+    pub fn restore_capabilities(&mut self, member_did: &str, capabilities: &[Capability]) {
+        if let Some(suspended) = self.suspended_capabilities.get_mut(member_did) {
+            for cap in capabilities {
+                suspended.remove(cap);
+            }
+            if suspended.is_empty() {
+                self.suspended_capabilities.remove(member_did);
+            }
         }
     }
 
-    /// Restores `GovernanceVote` and `GovernancePropose` capabilities for a
-    /// member, re-deriving them from the member's current role definition.
+    /// Suspends ALL capabilities for a member.
     ///
-    /// Called when a presence-only member has read or write access restored,
-    /// taking them out of presence-only state. Only restores capabilities
-    /// that exist in the member's role definition AND the context ceiling.
-    pub fn restore_governance_capabilities(&mut self, member_did: &scp_primitives::DID) {
-        let did_str = member_did.as_ref();
-        // Look up the member's current role to see which capabilities they
-        // should have. Only restore governance capabilities that are in the
-        // role definition AND the ceiling.
-        let role_caps: Option<HashSet<Capability>> = self
-            .assignments
-            .get(did_str)
-            .and_then(|assignment| self.role_definitions.get(&assignment.role_name))
-            .map(|def| def.capabilities.clone());
-
-        if let Some(role_caps) = role_caps
-            && let Some(caps) = self.member_capabilities.get_mut(did_str)
-        {
-            if role_caps.contains(&Capability::GovernanceVote)
-                && self.ceiling.contains(&Capability::GovernanceVote)
-            {
-                caps.insert(Capability::GovernanceVote);
-            }
-            if role_caps.contains(&Capability::GovernancePropose)
-                && self.ceiling.contains(&Capability::GovernancePropose)
-            {
-                caps.insert(Capability::GovernancePropose);
-            }
+    /// Copies every capability from the member's current capability set into
+    /// their suspended set. Equivalent to a full application-level block.
+    pub fn suspend_all(&mut self, member_did: &str) {
+        if let Some(caps) = self.member_capabilities.get(member_did) {
+            let all_caps: HashSet<Capability> = caps.clone();
+            self.suspended_capabilities
+                .insert(member_did.to_owned(), all_caps);
         }
     }
 }

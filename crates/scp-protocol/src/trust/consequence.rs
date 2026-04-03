@@ -34,7 +34,7 @@ pub struct ConsequenceValidationError(String);
 /// Maximum length for custom trigger keys and capability names.
 const MAX_CONSEQUENCE_STRING_LEN: usize = 256;
 use crate::context::roles::MAX_ROLE_NAME_LENGTH;
-/// Maximum number of capabilities in a `CapabilitySuspension` action.
+/// Maximum number of capabilities in a `Suspend` action.
 const MAX_CAPABILITY_SUSPENSION_COUNT: usize = 32;
 
 /// Characters forbidden in consequence string fields. These prevent
@@ -122,7 +122,7 @@ pub enum ConsequenceTrigger {
 /// participants before they join. See ADR-017.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ConsequenceAction {
-    /// Suspend one or more capabilities for the subject. The suspended
+    /// Suspend specific capabilities for the subject. The suspended
     /// capabilities are identified by their `{resource}:{action}` names
     /// (matching the capability URI format from the UCAN module).
     ///
@@ -131,19 +131,22 @@ pub enum ConsequenceAction {
     /// enforced. Other capability names are logged as unknown and ignored.
     /// Adding new enforced capabilities requires extending the match arms
     /// in `enforce_capability_suspension` in `governance.rs`.
-    CapabilitySuspension(Vec<String>),
+    Suspend {
+        /// The capabilities to suspend, identified by their capability names.
+        capabilities: Vec<String>,
+    },
 
-    /// Revoke all access for the subject (application-level enforcement).
+    /// Suspend ALL member capabilities (application-level enforcement).
     ///
     /// This blocks read and write at the `send_message`/`deliver_incoming`
     /// gates but does **not** perform cryptographic exclusion (MLS group
     /// removal + sender key rotation). For full cryptographic exclusion,
-    /// dispatch a `RemoveMember` governance action instead.
-    AccessRevocation,
+    /// dispatch an `Eject` governance action instead.
+    SuspendAll,
 
-    /// Demote the subject to a specified role.
-    RoleDemotion {
-        /// The role to demote the subject to.
+    /// Assign a role to the subject (replaces previous role).
+    AssignRole {
+        /// The role to assign to the subject.
         to_role: String,
     },
 }
@@ -184,9 +187,9 @@ impl ConsequenceRule {
     /// storing consequence rules. It rejects:
     ///
     /// - `Custom(key)`: key with control/HTML chars or length > 256
-    /// - `CapabilitySuspension(caps)`: individual cap name with control/HTML
+    /// - `Suspend { capabilities }`: individual cap name with control/HTML
     ///   chars or length > 256, or more than 32 capabilities
-    /// - `RoleDemotion { to_role }`: role name with control/HTML chars or
+    /// - `AssignRole { to_role }`: role name with control/HTML chars or
     ///   length > 128
     ///
     /// Other trigger/action variants have no user-supplied strings and always
@@ -196,8 +199,7 @@ impl ConsequenceRule {
     ///
     /// Returns [`ConsequenceValidationError`] if any string field contains
     /// forbidden characters (control chars, `<`, `>`, `&`, `"`, `'`), exceeds
-    /// its maximum length, or if `CapabilitySuspension` has more than 32
-    /// entries.
+    /// its maximum length, or if `Suspend` has more than 32 entries.
     pub fn validate(&self) -> Result<(), ConsequenceValidationError> {
         // M5: threshold of 0 would trigger on every evaluation — reject.
         if self.threshold == 0 {
@@ -219,31 +221,31 @@ impl ConsequenceRule {
 
         // Validate action.
         match &self.action {
-            ConsequenceAction::CapabilitySuspension(caps) => {
-                if caps.len() > MAX_CAPABILITY_SUSPENSION_COUNT {
+            ConsequenceAction::Suspend { capabilities } => {
+                if capabilities.len() > MAX_CAPABILITY_SUSPENSION_COUNT {
                     return Err(ConsequenceValidationError(format!(
-                        "CapabilitySuspension has {} capabilities, max is {MAX_CAPABILITY_SUSPENSION_COUNT}",
-                        caps.len()
+                        "Suspend has {} capabilities, max is {MAX_CAPABILITY_SUSPENSION_COUNT}",
+                        capabilities.len()
                     )));
                 }
-                for (i, cap) in caps.iter().enumerate() {
+                for (i, cap) in capabilities.iter().enumerate() {
                     validate_consequence_string(
                         cap,
-                        &format!("CapabilitySuspension[{i}]"),
+                        &format!("Suspend[{i}]"),
                         MAX_CONSEQUENCE_STRING_LEN,
                     )?;
                     if !VALID_SUSPENSION_CAPABILITIES.contains(&cap.as_str()) {
                         return Err(ConsequenceValidationError(format!(
-                            "CapabilitySuspension[{i}] '{cap}' is not a recognized capability name; \
+                            "Suspend[{i}] '{cap}' is not a recognized capability name; \
                              valid names: {VALID_SUSPENSION_CAPABILITIES:?}",
                         )));
                     }
                 }
             }
-            ConsequenceAction::RoleDemotion { to_role } => {
-                validate_consequence_string(to_role, "RoleDemotion.to_role", MAX_ROLE_NAME_LENGTH)?;
+            ConsequenceAction::AssignRole { to_role } => {
+                validate_consequence_string(to_role, "AssignRole.to_role", MAX_ROLE_NAME_LENGTH)?;
             }
-            ConsequenceAction::AccessRevocation => { /* no user strings */ }
+            ConsequenceAction::SuspendAll => { /* no user strings */ }
         }
 
         Ok(())
@@ -481,7 +483,9 @@ mod tests {
     fn message_velocity_triggers_capability_suspension() {
         let rules = vec![ConsequenceRule {
             trigger: ConsequenceTrigger::MessageVelocity,
-            action: ConsequenceAction::CapabilitySuspension(vec!["messages:write".to_owned()]),
+            action: ConsequenceAction::Suspend {
+                capabilities: vec!["messages:write".to_owned()],
+            },
             threshold: 3,
             window: Duration::from_secs(60),
         }];
@@ -498,7 +502,9 @@ mod tests {
         assert_eq!(result[0].rule_index, 0);
         assert_eq!(
             result[0].action,
-            ConsequenceAction::CapabilitySuspension(vec!["messages:write".to_owned()])
+            ConsequenceAction::Suspend {
+                capabilities: vec!["messages:write".to_owned()]
+            }
         );
         assert_eq!(result[0].evidence.len(), 3);
     }
@@ -508,10 +514,10 @@ mod tests {
     // -----------------------------------------------------------------------
 
     #[test]
-    fn tool_rate_triggers_access_revocation() {
+    fn tool_rate_triggers_suspend_all() {
         let rules = vec![ConsequenceRule {
             trigger: ConsequenceTrigger::ToolRateExceeded,
-            action: ConsequenceAction::AccessRevocation,
+            action: ConsequenceAction::SuspendAll,
             threshold: 5,
             window: Duration::from_secs(120),
         }];
@@ -531,7 +537,7 @@ mod tests {
         let result = evaluate_consequence_rules(&rules, &events, "did:key:alice", 1000);
 
         assert_eq!(result.len(), 1);
-        assert_eq!(result[0].action, ConsequenceAction::AccessRevocation);
+        assert_eq!(result[0].action, ConsequenceAction::SuspendAll);
         assert_eq!(result[0].evidence.len(), 5);
     }
 
@@ -540,10 +546,10 @@ mod tests {
     // -----------------------------------------------------------------------
 
     #[test]
-    fn warning_count_triggers_role_demotion() {
+    fn warning_count_triggers_assign_role() {
         let rules = vec![ConsequenceRule {
             trigger: ConsequenceTrigger::WarningCount,
-            action: ConsequenceAction::RoleDemotion {
+            action: ConsequenceAction::AssignRole {
                 to_role: "observer".to_owned(),
             },
             threshold: 2,
@@ -572,7 +578,7 @@ mod tests {
         assert_eq!(result.len(), 1);
         assert_eq!(
             result[0].action,
-            ConsequenceAction::RoleDemotion {
+            ConsequenceAction::AssignRole {
                 to_role: "observer".to_owned()
             }
         );
@@ -587,7 +593,7 @@ mod tests {
     fn threshold_exactly_met_triggers_consequence() {
         let rules = vec![ConsequenceRule {
             trigger: ConsequenceTrigger::MessageVelocity,
-            action: ConsequenceAction::AccessRevocation,
+            action: ConsequenceAction::SuspendAll,
             threshold: 2,
             window: Duration::from_secs(60),
         }];
@@ -611,7 +617,7 @@ mod tests {
     fn threshold_not_met_does_not_trigger() {
         let rules = vec![ConsequenceRule {
             trigger: ConsequenceTrigger::MessageVelocity,
-            action: ConsequenceAction::AccessRevocation,
+            action: ConsequenceAction::SuspendAll,
             threshold: 3,
             window: Duration::from_secs(60),
         }];
@@ -634,7 +640,7 @@ mod tests {
     fn events_outside_time_window_are_excluded() {
         let rules = vec![ConsequenceRule {
             trigger: ConsequenceTrigger::MessageVelocity,
-            action: ConsequenceAction::AccessRevocation,
+            action: ConsequenceAction::SuspendAll,
             threshold: 3,
             window: Duration::from_secs(60),
         }];
@@ -662,7 +668,7 @@ mod tests {
     fn events_from_other_actors_not_counted_for_velocity() {
         let rules = vec![ConsequenceRule {
             trigger: ConsequenceTrigger::MessageVelocity,
-            action: ConsequenceAction::AccessRevocation,
+            action: ConsequenceAction::SuspendAll,
             threshold: 3,
             window: Duration::from_secs(60),
         }];
@@ -689,13 +695,15 @@ mod tests {
         let rules = vec![
             ConsequenceRule {
                 trigger: ConsequenceTrigger::MessageVelocity,
-                action: ConsequenceAction::CapabilitySuspension(vec!["messages:write".to_owned()]),
+                action: ConsequenceAction::Suspend {
+                    capabilities: vec!["messages:write".to_owned()],
+                },
                 threshold: 2,
                 window: Duration::from_secs(60),
             },
             ConsequenceRule {
                 trigger: ConsequenceTrigger::ToolRateExceeded,
-                action: ConsequenceAction::AccessRevocation,
+                action: ConsequenceAction::SuspendAll,
                 threshold: 1,
                 window: Duration::from_secs(60),
             },
@@ -728,7 +736,7 @@ mod tests {
     fn empty_event_log_triggers_nothing() {
         let rules = vec![ConsequenceRule {
             trigger: ConsequenceTrigger::MessageVelocity,
-            action: ConsequenceAction::AccessRevocation,
+            action: ConsequenceAction::SuspendAll,
             threshold: 1,
             window: Duration::from_secs(60),
         }];
@@ -765,7 +773,7 @@ mod tests {
     fn custom_trigger_matches_governance_events_with_payload() {
         let rules = vec![ConsequenceRule {
             trigger: ConsequenceTrigger::Custom("spam-report".to_owned()),
-            action: ConsequenceAction::RoleDemotion {
+            action: ConsequenceAction::AssignRole {
                 to_role: "restricted".to_owned(),
             },
             threshold: 2,
@@ -811,7 +819,7 @@ mod tests {
     fn warning_count_ignores_self_authored_governance_events() {
         let rules = vec![ConsequenceRule {
             trigger: ConsequenceTrigger::WarningCount,
-            action: ConsequenceAction::RoleDemotion {
+            action: ConsequenceAction::AssignRole {
                 to_role: "observer".to_owned(),
             },
             threshold: 2,
@@ -851,7 +859,7 @@ mod tests {
     fn evidence_contains_correct_event_references() {
         let rules = vec![ConsequenceRule {
             trigger: ConsequenceTrigger::MessageVelocity,
-            action: ConsequenceAction::AccessRevocation,
+            action: ConsequenceAction::SuspendAll,
             threshold: 2,
             window: Duration::from_secs(60),
         }];
@@ -883,7 +891,7 @@ mod tests {
     fn tool_rate_excludes_non_tool_events() {
         let rules = vec![ConsequenceRule {
             trigger: ConsequenceTrigger::ToolRateExceeded,
-            action: ConsequenceAction::AccessRevocation,
+            action: ConsequenceAction::SuspendAll,
             threshold: 3,
             window: Duration::from_secs(60),
         }];
@@ -921,7 +929,7 @@ mod tests {
     fn event_at_exact_window_boundary_is_included() {
         let rules = vec![ConsequenceRule {
             trigger: ConsequenceTrigger::MessageVelocity,
-            action: ConsequenceAction::AccessRevocation,
+            action: ConsequenceAction::SuspendAll,
             threshold: 1,
             window: Duration::from_secs(60),
         }];
@@ -949,7 +957,7 @@ mod tests {
     fn event_at_exact_now_is_included() {
         let rules = vec![ConsequenceRule {
             trigger: ConsequenceTrigger::MessageVelocity,
-            action: ConsequenceAction::AccessRevocation,
+            action: ConsequenceAction::SuspendAll,
             threshold: 1,
             window: Duration::from_secs(60),
         }];
@@ -976,14 +984,16 @@ mod tests {
         let rules = vec![
             ConsequenceRule {
                 trigger: ConsequenceTrigger::MessageVelocity,
-                action: ConsequenceAction::CapabilitySuspension(vec!["messages:write".to_owned()]),
+                action: ConsequenceAction::Suspend {
+                    capabilities: vec!["messages:write".to_owned()],
+                },
                 threshold: 2,
                 // Short window: only events in [980, 1000]
                 window: Duration::from_secs(20),
             },
             ConsequenceRule {
                 trigger: ConsequenceTrigger::MessageVelocity,
-                action: ConsequenceAction::AccessRevocation,
+                action: ConsequenceAction::SuspendAll,
                 threshold: 3,
                 // Longer window: events in [900, 1000]
                 window: Duration::from_secs(100),
@@ -1018,7 +1028,7 @@ mod tests {
         // M5: threshold=0 is rejected at validation time.
         let rule = ConsequenceRule {
             trigger: ConsequenceTrigger::MessageVelocity,
-            action: ConsequenceAction::AccessRevocation,
+            action: ConsequenceAction::SuspendAll,
             threshold: 0,
             window: Duration::from_secs(60),
         };
@@ -1031,7 +1041,7 @@ mod tests {
         // with a single matching event.
         let rules = vec![ConsequenceRule {
             trigger: ConsequenceTrigger::MessageVelocity,
-            action: ConsequenceAction::AccessRevocation,
+            action: ConsequenceAction::SuspendAll,
             threshold: 1,
             window: Duration::from_secs(60),
         }];
@@ -1056,7 +1066,9 @@ mod tests {
     fn consequence_rule_serialization_roundtrip() {
         let rule = ConsequenceRule {
             trigger: ConsequenceTrigger::MessageVelocity,
-            action: ConsequenceAction::CapabilitySuspension(vec!["messages:write".to_owned()]),
+            action: ConsequenceAction::Suspend {
+                capabilities: vec!["messages:write".to_owned()],
+            },
             threshold: 10,
             window: Duration::from_secs(300),
         };
@@ -1069,10 +1081,10 @@ mod tests {
         assert_eq!(deserialized.window, Duration::from_secs(300));
 
         match deserialized.action {
-            ConsequenceAction::CapabilitySuspension(caps) => {
-                assert_eq!(caps, vec!["messages:write".to_owned()]);
+            ConsequenceAction::Suspend { capabilities } => {
+                assert_eq!(capabilities, vec!["messages:write".to_owned()]);
             }
-            other => panic!("expected CapabilitySuspension, got {other:?}"),
+            other => panic!("expected Suspend, got {other:?}"),
         }
     }
 
@@ -1085,8 +1097,8 @@ mod tests {
     }
 
     #[test]
-    fn consequence_action_role_demotion_serialization_roundtrip() {
-        let action = ConsequenceAction::RoleDemotion {
+    fn consequence_action_assign_role_serialization_roundtrip() {
+        let action = ConsequenceAction::AssignRole {
             to_role: "viewer".to_owned(),
         };
         let json = serde_json::to_string(&action).unwrap();
@@ -1102,7 +1114,7 @@ mod tests {
     fn validate_rejects_custom_trigger_with_script_tag() {
         let rule = ConsequenceRule {
             trigger: ConsequenceTrigger::Custom("<script>alert(1)</script>".to_owned()),
-            action: ConsequenceAction::AccessRevocation,
+            action: ConsequenceAction::SuspendAll,
             threshold: 1,
             window: Duration::from_secs(60),
         };
@@ -1121,7 +1133,7 @@ mod tests {
     fn validate_accepts_valid_custom_trigger() {
         let rule = ConsequenceRule {
             trigger: ConsequenceTrigger::Custom("valid_trigger_name".to_owned()),
-            action: ConsequenceAction::AccessRevocation,
+            action: ConsequenceAction::SuspendAll,
             threshold: 1,
             window: Duration::from_secs(60),
         };
@@ -1129,14 +1141,16 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // 22. Validation: CapabilitySuspension with HTML in cap name is rejected
+    // 22. Validation: Suspend with HTML in cap name is rejected
     // -----------------------------------------------------------------------
 
     #[test]
-    fn validate_rejects_capability_suspension_with_html() {
+    fn validate_rejects_suspend_with_html() {
         let rule = ConsequenceRule {
             trigger: ConsequenceTrigger::MessageVelocity,
-            action: ConsequenceAction::CapabilitySuspension(vec!["<img onerror=x>".to_owned()]),
+            action: ConsequenceAction::Suspend {
+                capabilities: vec!["<img onerror=x>".to_owned()],
+            },
             threshold: 1,
             window: Duration::from_secs(60),
         };
@@ -1148,14 +1162,16 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // 23. Validation: valid CapabilitySuspension is accepted
+    // 23. Validation: valid Suspend is accepted
     // -----------------------------------------------------------------------
 
     #[test]
-    fn validate_accepts_valid_capability_suspension() {
+    fn validate_accepts_valid_suspend() {
         let rule = ConsequenceRule {
             trigger: ConsequenceTrigger::MessageVelocity,
-            action: ConsequenceAction::CapabilitySuspension(vec!["messages:write".to_owned()]),
+            action: ConsequenceAction::Suspend {
+                capabilities: vec!["messages:write".to_owned()],
+            },
             threshold: 1,
             window: Duration::from_secs(60),
         };
@@ -1163,14 +1179,14 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // 24. Validation: valid RoleDemotion is accepted
+    // 24. Validation: valid AssignRole is accepted
     // -----------------------------------------------------------------------
 
     #[test]
-    fn validate_accepts_valid_role_demotion() {
+    fn validate_accepts_valid_assign_role() {
         let rule = ConsequenceRule {
             trigger: ConsequenceTrigger::MessageVelocity,
-            action: ConsequenceAction::RoleDemotion {
+            action: ConsequenceAction::AssignRole {
                 to_role: "member".to_owned(),
             },
             threshold: 1,
@@ -1180,14 +1196,14 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // 25. Validation: RoleDemotion with script tag is rejected
+    // 25. Validation: AssignRole with script tag is rejected
     // -----------------------------------------------------------------------
 
     #[test]
-    fn validate_rejects_role_demotion_with_script_tag() {
+    fn validate_rejects_assign_role_with_script_tag() {
         let rule = ConsequenceRule {
             trigger: ConsequenceTrigger::MessageVelocity,
-            action: ConsequenceAction::RoleDemotion {
+            action: ConsequenceAction::AssignRole {
                 to_role: "<script>".to_owned(),
             },
             threshold: 1,
@@ -1209,7 +1225,7 @@ mod tests {
         let long_key = "a".repeat(300);
         let rule = ConsequenceRule {
             trigger: ConsequenceTrigger::Custom(long_key),
-            action: ConsequenceAction::AccessRevocation,
+            action: ConsequenceAction::SuspendAll,
             threshold: 1,
             window: Duration::from_secs(60),
         };
@@ -1228,7 +1244,7 @@ mod tests {
     fn validate_rejects_control_chars_in_custom_trigger() {
         let rule = ConsequenceRule {
             trigger: ConsequenceTrigger::Custom("trigger\x00key".to_owned()),
-            action: ConsequenceAction::AccessRevocation,
+            action: ConsequenceAction::SuspendAll,
             threshold: 1,
             window: Duration::from_secs(60),
         };
@@ -1240,15 +1256,15 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // 28. Validation: too many capabilities in CapabilitySuspension rejected
+    // 28. Validation: too many capabilities in Suspend rejected
     // -----------------------------------------------------------------------
 
     #[test]
     fn validate_rejects_too_many_capabilities() {
-        let caps: Vec<String> = (0..33).map(|i| format!("cap:{i}")).collect();
+        let capabilities: Vec<String> = (0..33).map(|i| format!("cap:{i}")).collect();
         let rule = ConsequenceRule {
             trigger: ConsequenceTrigger::MessageVelocity,
-            action: ConsequenceAction::CapabilitySuspension(caps),
+            action: ConsequenceAction::Suspend { capabilities },
             threshold: 1,
             window: Duration::from_secs(60),
         };
@@ -1260,19 +1276,19 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // 29. Validation: exactly 32 capabilities in CapabilitySuspension is OK
+    // 29. Validation: exactly 32 capabilities in Suspend is OK
     // -----------------------------------------------------------------------
 
     #[test]
     fn validate_accepts_max_capabilities() {
         // Use valid capability names repeated to fill the 32-entry limit.
         let valid_names: Vec<&str> = VALID_SUSPENSION_CAPABILITIES.to_vec();
-        let caps: Vec<String> = (0..32)
+        let capabilities: Vec<String> = (0..32)
             .map(|i| valid_names[i % valid_names.len()].to_owned())
             .collect();
         let rule = ConsequenceRule {
             trigger: ConsequenceTrigger::MessageVelocity,
-            action: ConsequenceAction::CapabilitySuspension(caps),
+            action: ConsequenceAction::Suspend { capabilities },
             threshold: 1,
             window: Duration::from_secs(60),
         };
@@ -1280,14 +1296,14 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // 30. Validation: AccessRevocation (no user strings) always passes
+    // 30. Validation: SuspendAll (no user strings) always passes
     // -----------------------------------------------------------------------
 
     #[test]
-    fn validate_accepts_access_revocation() {
+    fn validate_accepts_suspend_all() {
         let rule = ConsequenceRule {
             trigger: ConsequenceTrigger::MessageVelocity,
-            action: ConsequenceAction::AccessRevocation,
+            action: ConsequenceAction::SuspendAll,
             threshold: 1,
             window: Duration::from_secs(60),
         };
@@ -1295,15 +1311,15 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // 31. Validation: RoleDemotion exceeding max role name length rejected
+    // 31. Validation: AssignRole exceeding max role name length rejected
     // -----------------------------------------------------------------------
 
     #[test]
-    fn validate_rejects_oversized_role_name() {
+    fn validate_rejects_oversized_assign_role_name() {
         let long_role = "r".repeat(129);
         let rule = ConsequenceRule {
             trigger: ConsequenceTrigger::MessageVelocity,
-            action: ConsequenceAction::RoleDemotion { to_role: long_role },
+            action: ConsequenceAction::AssignRole { to_role: long_role },
             threshold: 1,
             window: Duration::from_secs(60),
         };
@@ -1324,7 +1340,7 @@ mod tests {
             let key = format!("trigger{ch}key");
             let rule = ConsequenceRule {
                 trigger: ConsequenceTrigger::Custom(key),
-                action: ConsequenceAction::AccessRevocation,
+                action: ConsequenceAction::SuspendAll,
                 threshold: 1,
                 window: Duration::from_secs(60),
             };
@@ -1343,7 +1359,7 @@ mod tests {
     fn test_threshold_zero_rejected() {
         let rule = ConsequenceRule {
             trigger: ConsequenceTrigger::MessageVelocity,
-            action: ConsequenceAction::AccessRevocation,
+            action: ConsequenceAction::SuspendAll,
             threshold: 0,
             window: Duration::from_secs(60),
         };
@@ -1362,7 +1378,7 @@ mod tests {
     fn test_empty_custom_key_rejected() {
         let rule = ConsequenceRule {
             trigger: ConsequenceTrigger::Custom(String::new()),
-            action: ConsequenceAction::AccessRevocation,
+            action: ConsequenceAction::SuspendAll,
             threshold: 1,
             window: Duration::from_secs(60),
         };
@@ -1383,7 +1399,7 @@ mod tests {
     fn test_warning_count_trigger_fires() {
         let rules = vec![ConsequenceRule {
             trigger: ConsequenceTrigger::WarningCount,
-            action: ConsequenceAction::RoleDemotion {
+            action: ConsequenceAction::AssignRole {
                 to_role: "observer".to_owned(),
             },
             threshold: 2,
@@ -1420,7 +1436,7 @@ mod tests {
         );
         assert_eq!(
             result[0].action,
-            ConsequenceAction::RoleDemotion {
+            ConsequenceAction::AssignRole {
                 to_role: "observer".to_owned()
             }
         );
@@ -1432,7 +1448,7 @@ mod tests {
     fn test_warning_count_wrong_target_no_fire() {
         let rules = vec![ConsequenceRule {
             trigger: ConsequenceTrigger::WarningCount,
-            action: ConsequenceAction::AccessRevocation,
+            action: ConsequenceAction::SuspendAll,
             threshold: 1,
             window: Duration::from_secs(300),
         }];
@@ -1463,7 +1479,9 @@ mod tests {
     fn validate_rejects_unknown_capability_name() {
         let rule = ConsequenceRule {
             trigger: ConsequenceTrigger::MessageVelocity,
-            action: ConsequenceAction::CapabilitySuspension(vec!["fly_to_moon".into()]),
+            action: ConsequenceAction::Suspend {
+                capabilities: vec!["fly_to_moon".into()],
+            },
             threshold: 1,
             window: Duration::from_secs(60),
         };
@@ -1483,7 +1501,9 @@ mod tests {
         for &cap_name in VALID_SUSPENSION_CAPABILITIES {
             let rule = ConsequenceRule {
                 trigger: ConsequenceTrigger::MessageVelocity,
-                action: ConsequenceAction::CapabilitySuspension(vec![cap_name.to_owned()]),
+                action: ConsequenceAction::Suspend {
+                    capabilities: vec![cap_name.to_owned()],
+                },
                 threshold: 1,
                 window: Duration::from_secs(60),
             };

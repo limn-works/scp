@@ -394,8 +394,8 @@ pub enum ContextEvent {
         resulting_epoch: Option<u64>,
         /// The DID targeted by this governance action, if any.
         ///
-        /// Present for member-targeting actions (`AddMember`, `RemoveMember`,
-        /// `ChangeRole`, `BlockAuthor`, `RevokeReadAccess`, etc.). Used by
+        /// Present for member-targeting actions (`AddMember`, `Eject`,
+        /// `ChangeRole`, `SuspendMember`, `Revoke`, etc.). Used by
         /// consequence triggers (`WarningCount`, `Custom`) and participation
         /// records to identify the target without relying on opaque payloads.
         target_did: Option<DID>,
@@ -651,20 +651,20 @@ pub enum ContextEvent {
         rule_index: usize,
         /// Human-readable trigger type (e.g., `"MessageVelocity"`).
         trigger_type: String,
-        /// Human-readable action type (e.g., `"CapabilitySuspension"`).
+        /// Human-readable action type (e.g., `"Suspend"`).
         action_type: String,
     },
     /// A consequence enforcement action was executed (ADR-017, #1531).
     ///
-    /// Emitted after the enforcement action (capability suspension, access
-    /// revocation, or role demotion) has been applied. The `success` field
+    /// Emitted after the enforcement action (capability suspension, suspend
+    /// all, or role assignment) has been applied. The `success` field
     /// indicates whether the enforcement was successfully applied.
     ConsequenceEnforced {
         /// The context where the consequence was enforced.
         context_id: String,
         /// The member the enforcement was applied to.
         member_did: DID,
-        /// Human-readable action type (e.g., `"CapabilitySuspension"`).
+        /// Human-readable action type (e.g., `"Suspend"`).
         action_type: String,
         /// Whether the enforcement was successfully applied.
         success: bool,

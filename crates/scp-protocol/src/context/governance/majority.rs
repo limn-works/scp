@@ -2003,7 +2003,7 @@ mod tests {
                 did: dave(),
                 role: "member".to_owned(),
             },
-            GovernanceAction::RemoveMember {
+            GovernanceAction::Eject {
                 did: bob(),
                 reason: None,
             },

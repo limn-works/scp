@@ -361,7 +361,7 @@ pub struct GovernanceBanResult {
     /// Per-author key rotations triggered by the ban.
     pub rotated_authors: Vec<AuthorKeyRotation>,
     /// The revocation scope that was applied.
-    pub scope: crate::context::governance::RevocationScope,
+    pub scope: crate::context::governance::AccessScope,
 }
 
 /// Record of an author's key rotation during a governance ban.
@@ -950,7 +950,7 @@ impl BroadcastContext {
     pub fn governance_ban_subscriber(
         &mut self,
         did: &str,
-        scope: crate::context::governance::RevocationScope,
+        scope: crate::context::governance::AccessScope,
     ) -> Result<GovernanceBanResult, ContextError> {
         if !self.subscribers.contains_key(did) {
             return Err(ContextError::MemberNotFound(format!(
@@ -1522,7 +1522,7 @@ where
 )]
 mod tests {
     use super::*;
-    use crate::context::governance::RevocationScope;
+    use crate::context::governance::AccessScope;
     use crate::crypto::sender_keys::{
         SenderKey, decrypt_sender_layer, encrypt_sender_layer, open_broadcast_trusted,
     };
@@ -3789,7 +3789,7 @@ mod tests {
         assert_eq!(ctx.get_author("did:example:carol").unwrap().epoch, 0);
 
         let result = ctx
-            .governance_ban_subscriber("did:example:sub1", RevocationScope::FutureOnly)
+            .governance_ban_subscriber("did:example:sub1", AccessScope::Read)
             .unwrap();
 
         // Banned DID is correct.
@@ -3821,8 +3821,7 @@ mod tests {
         let mut ctx = make_open_ctx();
         ctx.add_author("did:example:alice").unwrap();
 
-        let result =
-            ctx.governance_ban_subscriber("did:example:ghost", RevocationScope::FutureOnly);
+        let result = ctx.governance_ban_subscriber("did:example:ghost", AccessScope::Read);
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
         assert!(
@@ -3839,7 +3838,7 @@ mod tests {
         subscribe_open(&mut ctx, "did:example:sub1", None, 1000).unwrap();
 
         // Ban.
-        ctx.governance_ban_subscriber("did:example:sub1", RevocationScope::FutureOnly)
+        ctx.governance_ban_subscriber("did:example:sub1", AccessScope::Read)
             .unwrap();
         assert!(ctx.is_blocked("did:example:alice", "did:example:sub1"));
         assert!(ctx.is_blocked("did:example:bob", "did:example:sub1"));
@@ -3878,7 +3877,7 @@ mod tests {
         ));
 
         // Ban sub1.
-        ctx.governance_ban_subscriber("did:example:sub1", RevocationScope::FutureOnly)
+        ctx.governance_ban_subscriber("did:example:sub1", AccessScope::Read)
             .unwrap();
 
         // After ban: sub1 is denied from ALL authors.
@@ -3917,7 +3916,7 @@ mod tests {
         subscribe_open(&mut ctx, "did:example:sub1", None, 1000).unwrap();
 
         // Ban, unban, re-subscribe.
-        ctx.governance_ban_subscriber("did:example:sub1", RevocationScope::FutureOnly)
+        ctx.governance_ban_subscriber("did:example:sub1", AccessScope::Read)
             .unwrap();
         ctx.governance_unban_subscriber("did:example:sub1");
         subscribe_open(&mut ctx, "did:example:sub1", None, 2000).unwrap();
@@ -3937,7 +3936,7 @@ mod tests {
         assert!(ctx.is_subscriber("did:example:sub1"));
 
         let result = ctx
-            .governance_ban_subscriber("did:example:sub1", RevocationScope::FutureOnly)
+            .governance_ban_subscriber("did:example:sub1", AccessScope::Read)
             .unwrap();
 
         assert_eq!(result.banned_did, "did:example:sub1");
@@ -3953,11 +3952,11 @@ mod tests {
         subscribe_open(&mut ctx, "did:example:sub1", None, 1000).unwrap();
 
         let result = ctx
-            .governance_ban_subscriber("did:example:sub1", RevocationScope::Full)
+            .governance_ban_subscriber("did:example:sub1", AccessScope::Both)
             .unwrap();
 
         // Scope is preserved on the result.
-        assert_eq!(result.scope, RevocationScope::Full);
+        assert_eq!(result.scope, AccessScope::Both);
         assert_eq!(result.rotated_authors.len(), 2);
 
         // Each rotation includes a usable new key.
