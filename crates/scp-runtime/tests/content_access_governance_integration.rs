@@ -342,7 +342,7 @@ async fn propose_and_approve_threshold(
 #[tokio::test]
 async fn revoke_read_access_full_via_threshold_governance() {
     let ctx_id = "ctx-cac-revoke-read";
-    let manager = setup_threshold_context_with_dave(ctx_id).await;
+    let manager = Box::pin(setup_threshold_context_with_dave(ctx_id)).await;
 
     // Propose RevokeReadAccess(Full) for Dave.
     let action = GovernanceAction::RevokeReadAccess {
@@ -382,7 +382,7 @@ async fn revoke_read_access_full_via_threshold_governance() {
 #[tokio::test]
 async fn restore_read_access_forward_only() {
     let ctx_id = "ctx-cac-restore-read";
-    let manager = setup_threshold_context_with_dave(ctx_id).await;
+    let manager = Box::pin(setup_threshold_context_with_dave(ctx_id)).await;
 
     // First revoke Dave's read access.
     let revoke = GovernanceAction::RevokeReadAccess {
@@ -450,7 +450,7 @@ async fn restore_read_access_forward_only() {
 #[tokio::test]
 async fn revoke_write_access_full_blocks_publishing() {
     let ctx_id = "ctx-cac-revoke-write-full";
-    let manager = setup_threshold_context_with_dave(ctx_id).await;
+    let manager = Box::pin(setup_threshold_context_with_dave(ctx_id)).await;
 
     // Revoke Dave's write access with Full scope.
     let action = GovernanceAction::RevokeWriteAccess {
@@ -524,7 +524,7 @@ async fn revoke_write_access_full_blocks_publishing() {
 #[tokio::test]
 async fn revoke_write_access_future_only() {
     let ctx_id = "ctx-cac-revoke-write-future";
-    let manager = setup_threshold_context_with_dave(ctx_id).await;
+    let manager = Box::pin(setup_threshold_context_with_dave(ctx_id)).await;
 
     // Revoke Dave's write access with FutureOnly scope.
     let action = GovernanceAction::RevokeWriteAccess {
@@ -575,7 +575,7 @@ async fn revoke_write_access_future_only() {
 #[tokio::test]
 async fn restore_write_access_forward_only() {
     let ctx_id = "ctx-cac-restore-write";
-    let manager = setup_threshold_context_with_dave(ctx_id).await;
+    let manager = Box::pin(setup_threshold_context_with_dave(ctx_id)).await;
 
     // First revoke Dave's write access.
     let revoke = GovernanceAction::RevokeWriteAccess {
@@ -645,7 +645,7 @@ async fn restore_write_access_forward_only() {
 #[tokio::test]
 async fn rotate_content_keys_via_threshold_governance() {
     let ctx_id = "ctx-cac-rotate-keys";
-    let manager = setup_threshold_context_with_dave(ctx_id).await;
+    let manager = Box::pin(setup_threshold_context_with_dave(ctx_id)).await;
 
     let action = GovernanceAction::RotateContentKeys {
         reason: Some("periodic key hygiene".into()),
@@ -1209,7 +1209,7 @@ async fn unanimity_rotate_content_keys_rejected_by_single_vote() {
 #[tokio::test]
 async fn full_content_access_lifecycle() {
     let ctx_id = "ctx-cac-lifecycle";
-    let manager = setup_threshold_context_with_dave(ctx_id).await;
+    let manager = Box::pin(setup_threshold_context_with_dave(ctx_id)).await;
 
     // Phase 1: Revoke Dave's read access (Full).
     let revoke_read = GovernanceAction::RevokeReadAccess {
