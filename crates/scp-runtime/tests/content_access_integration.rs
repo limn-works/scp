@@ -765,15 +765,15 @@ async fn tier2_global_block_propagation() {
 }
 
 // =========================================================================
-// Test 3: Tier 3 governance RevokeWriteAccess in broadcast
+// Test 3: Tier 3 governance write revocation in broadcast
 // =========================================================================
 
 /// Tier 3 governance-gated content access control in broadcast context.
 ///
 /// Creates a context with Author as a member.
-/// - Governance RevokeWriteAccess(Full) on Author.
+/// - Governance `Revoke { access: AccessScope::Both }` on Author.
 /// - Verify Author cannot publish new messages.
-/// - `RestoreWriteAccess` -> Author can publish again (forward-only).
+/// - `RestoreAccess { access: AccessScope::Write }` -> Author can publish again (forward-only).
 #[tokio::test]
 async fn tier3_governance_revoke_write_access_broadcast() {
     let manager = new_manager();
@@ -815,7 +815,7 @@ async fn tier3_governance_revoke_write_access_broadcast() {
     assert_eq!(status, ProposalStatus::Approved);
     assert!(manager.is_member(ctx_id, AUTHOR).await);
 
-    // --- Governance RevokeWriteAccess(Full) on Author ---
+    // --- Governance Revoke { access: AccessScope::Both } on Author ---
 
     let revoke = GovernanceAction::Revoke {
         did: author_did(),
@@ -838,7 +838,7 @@ async fn tier3_governance_revoke_write_access_broadcast() {
         .await;
     assert!(
         send_result.is_err(),
-        "Author should not be able to publish after RevokeWriteAccess"
+        "Author should not be able to publish after write revocation"
     );
     match send_result.unwrap_err() {
         ContextError::PermissionDenied(msg) => {
@@ -856,7 +856,7 @@ async fn tier3_governance_revoke_write_access_broadcast() {
         "Author should remain a member after write revocation"
     );
 
-    // --- RestoreWriteAccess -> Author can publish again ---
+    // --- RestoreAccess { access: AccessScope::Write } -> Author can publish again ---
 
     let _ = manager.drain_events(ctx_id).await;
     let restore = GovernanceAction::RestoreAccess { did: author_did(), capabilities: vec![Capability::MessagesWrite] };
@@ -890,7 +890,7 @@ async fn tier3_governance_revoke_write_access_broadcast() {
         .await;
     assert!(
         send_result.is_ok(),
-        "Author should be able to publish after RestoreWriteAccess: {:?}",
+        "Author should be able to publish after write restore: {:?}",
         send_result.err()
     );
 }
@@ -1476,7 +1476,7 @@ fn wrapping_excludes_blocked_member_even_with_cached_key() {
 /// End-to-end tier stacking test through the `ContextManager` governance path.
 ///
 /// Alice (Tier 1, via block list) AND governance (Tier 3, via
-/// `RevokeWriteAccess`) both revoke Dave.
+/// write revocation) both revoke Dave.
 /// - Reverse only Alice's block -> Dave still revoked (governance block active).
 /// - Reverse governance block too -> Dave restored.
 #[tokio::test]
@@ -1520,7 +1520,7 @@ async fn governance_tier_stacking_via_context_manager() {
     assert_eq!(status, ProposalStatus::Approved);
     assert!(manager.is_member(ctx_id, DAVE).await);
 
-    // --- Governance (Tier 3): RevokeWriteAccess on Dave ---
+    // --- Governance (Tier 3): write revocation on Dave ---
 
     let revoke = GovernanceAction::Revoke {
         did: dave(),
@@ -1574,7 +1574,7 @@ async fn governance_tier_stacking_via_context_manager() {
         "Dave should still not write (governance Tier 3 active)"
     );
 
-    // --- Reverse Tier 3 too: RestoreWriteAccess ---
+    // --- Reverse Tier 3 too: RestoreAccess (write) ---
 
     let _ = manager.drain_events(ctx_id).await;
     let restore = GovernanceAction::RestoreAccess { did: dave(), capabilities: vec![Capability::MessagesWrite] };

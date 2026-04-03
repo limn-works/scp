@@ -854,7 +854,7 @@ async fn conflict_detection() {
         "competing ModifyCeiling should conflict"
     );
 
-    // RevokeReadAccess vs RestoreReadAccess.
+    // Revoke (read) vs RestoreAccess (read).
     let revoke = GovernanceAction::Revoke {
         did: bob(),
         access: AccessScope::Read,
@@ -865,7 +865,7 @@ async fn conflict_detection() {
         "Revoke (read) vs RestoreAccess (read) should conflict"
     );
 
-    // RevokeWriteAccess vs RestoreWriteAccess.
+    // Revoke (write) vs RestoreAccess (write).
     let revoke_w = GovernanceAction::Revoke {
         did: bob(),
         access: AccessScope::Write,

@@ -1448,10 +1448,10 @@ fn ac13_actions_conflict_revoke_vs_restore_write() {
         did: bob(),
         access: AccessScope::Both,
     };
-    let action_b = GovernanceAction::RestoreAccess { did: bob() };
+    let action_b = GovernanceAction::RestoreAccess { did: bob(), capabilities: vec![Capability::MessagesWrite] };
     assert!(
         actions_conflict(&action_a, &alice(), &action_b, &carol()),
-        "RevokeWriteAccess vs RestoreWriteAccess for same DID should conflict"
+        "Revoke (write) vs RestoreAccess (write) for same DID should conflict"
     );
 }
 
@@ -1461,10 +1461,10 @@ fn ac13_actions_conflict_revoke_vs_restore_read() {
         did: bob(),
         access: AccessScope::Write,
     };
-    let action_b = GovernanceAction::RestoreAccess { did: bob() };
+    let action_b = GovernanceAction::RestoreAccess { did: bob(), capabilities: vec![Capability::MessagesRead] };
     assert!(
         actions_conflict(&action_a, &alice(), &action_b, &carol()),
-        "RevokeReadAccess vs RestoreReadAccess for same DID should conflict"
+        "Revoke (read) vs RestoreAccess (read) for same DID should conflict"
     );
 }
 

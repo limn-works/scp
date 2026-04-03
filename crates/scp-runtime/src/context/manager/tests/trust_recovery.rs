@@ -688,7 +688,7 @@ async fn cac010_revoke_write_future_only() {
                 .as_ref()
                 .unwrap()
                 .is_author("did:key:bob"),
-            "FutureOnly keeps author in BC"
+            "AccessScope::Write keeps author in BC"
         );
     }
 }

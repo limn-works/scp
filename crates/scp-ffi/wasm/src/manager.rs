@@ -209,10 +209,10 @@ struct PerContextState {
     /// Executed proposal IDs with insertion timestamps (replay protection).
     /// Evicts entries older than [`WASM_PROPOSAL_TTL_MS`] when exceeding [`WASM_PROPOSAL_CAP`].
     executed_proposals: HashMap<String, f64>,
-    /// Suspended capabilities per member DID (replaces `write_revoked_members` / `read_revoked_members`).
+    /// Suspended capabilities per member DID (replaces legacy per-member revocation tracking).
     /// Key: member DID, Value: set of suspended capability strings (e.g. "messages:write").
     suspended_capabilities: HashMap<String, HashSet<String>>,
-    /// Members excluded from future CEK wrapping (`FutureOnly` read revocation).
+    /// Members excluded from future CEK wrapping (`AccessScope::Read` revocation).
     read_exclusion_list: HashSet<String>,
     /// Broadcast context state (only for Broadcast mode).
     /// Uses `BroadcastContext` from scp-protocol per §5.14.2 cohesion invariant.
