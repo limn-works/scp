@@ -27,16 +27,15 @@ use super::ttl::{self, CloseResult, TtlExtension, TtlTimer};
 use scp_identity::DID;
 use scp_primitives::Clock;
 use scp_protocol::context::broadcast::{
-    AuthorBlockResult, BlockResult, BroadcastAdmission, BroadcastContext, BroadcastContextSnapshot,
+    BlockResult, BroadcastAdmission, BroadcastContext, BroadcastContextSnapshot,
     GovernanceBanResult, KeyRequestDecision, SubscriptionResult, UnsubscribeResult,
 };
 use scp_protocol::context::broadcast_content::{BroadcastContent, serialize_broadcast_content};
 use scp_protocol::context::builder::{ContextCreationError, ContextCryptoProvider};
 use scp_protocol::context::governance::{
-    CheckpointAttestationStatus, ContextCheckpoint, CosignedCheckpoint, GovernanceAction,
-    GovernanceContext, GovernanceEngine, GovernanceEvent, GovernanceModelConfig,
-    GovernanceProposal, KeyResolver, ProposalId, ProposalStatus, PruningPolicy, RevocationScope,
-    SingleAdminEngine,
+    AccessScope, CheckpointAttestationStatus, ContextCheckpoint, CosignedCheckpoint,
+    GovernanceAction, GovernanceContext, GovernanceEngine, GovernanceEvent, GovernanceModelConfig,
+    GovernanceProposal, KeyResolver, ProposalId, ProposalStatus, PruningPolicy, SingleAdminEngine,
     majority::MajorityVoteEngine,
     mls_integration::{
         CoordinationRecord, EpochCoordinator, MlsImpact, classify_action, generate_mls_operations,
@@ -209,38 +208,33 @@ impl PendingEconomicPolicyChange {
 // GovernanceActionResult
 // ---------------------------------------------------------------------------
 
-/// Result of revoking a member's read access (§5.9, ADR-031).
+/// Result of suspending a member's capabilities (§5.9, ADR-031).
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ReadAccessRevokedResult {
-    /// The DID whose read access was revoked.
+pub struct SuspendMemberResult {
+    /// The DID whose capabilities were suspended.
     pub did: DID,
-    /// The revocation scope applied.
-    pub scope: RevocationScope,
+    /// The capabilities that were suspended.
+    pub capabilities: Vec<Capability>,
+}
+
+/// Result of cryptographic revocation (§9.17, ADR-038).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RevokeResult {
+    /// The DID whose access was revoked.
+    pub did: DID,
+    /// The scope of revocation applied.
+    pub access: AccessScope,
     /// Number of authors whose keys were rotated (broadcast contexts).
     pub rotated_author_count: usize,
 }
 
-/// Result of restoring a member's read access (§5.9, ADR-031).
+/// Result of restoring a member's access (§5.9, ADR-031).
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ReadAccessRestoredResult {
-    /// The DID whose read access was restored.
+pub struct RestoreAccessResult {
+    /// The DID whose access was restored.
     pub did: DID,
-}
-
-/// Result of revoking a member's write access (§9.17, ADR-038).
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct WriteAccessRevokedResult {
-    /// The DID whose write access was revoked.
-    pub did: DID,
-    /// The revocation scope applied.
-    pub scope: RevocationScope,
-}
-
-/// Result of restoring a member's write access (§9.17, ADR-038).
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct WriteAccessRestoredResult {
-    /// The DID whose write access was restored.
-    pub did: DID,
+    /// The capabilities that were restored.
+    pub capabilities: Vec<Capability>,
 }
 
 /// Result of a context-wide content key rotation (§9.17, ADR-038).
@@ -299,8 +293,8 @@ pub struct MigrationProposedResult {
 pub enum GovernanceActionResult {
     /// A member was added to the context.
     MemberAdded,
-    /// A member was removed from the context.
-    MemberRemoved,
+    /// A member was ejected from the context (MLS removal).
+    MemberEjected,
     /// A member's role was changed.
     RoleChanged,
     /// A tool was registered in the context.
@@ -333,22 +327,16 @@ pub enum GovernanceActionResult {
     ConflictResolved,
     /// The context was promoted from ephemeral to persistent.
     ContextPromoted,
-    /// A member's read access was revoked (§5.9, ADR-031).
-    ReadAccessRevoked(ReadAccessRevokedResult),
-    /// A member's read access was restored (§5.9, ADR-031).
-    ReadAccessRestored(ReadAccessRestoredResult),
-    /// A member's write access was revoked (§9.17, ADR-038).
-    WriteAccessRevoked(WriteAccessRevokedResult),
-    /// A member's write access was restored (§9.17, ADR-038).
-    WriteAccessRestored(WriteAccessRestoredResult),
+    /// A member's capabilities were suspended (application-level gate block).
+    MemberSuspended(SuspendMemberResult),
+    /// A member's access was cryptographically revoked (key destruction).
+    AccessRevoked(RevokeResult),
+    /// A member's access was restored (capabilities unsuspended / forward-restore).
+    AccessRestored(RestoreAccessResult),
     /// Context-wide content keys were rotated (§9.17, ADR-038).
     ContentKeysRotated(ContentKeysRotatedResult),
     /// Governance was reconfigured via deadlock recovery (ADR-031 §10).
     GovernanceReconfigured(GovernanceReconfiguredResult),
-    /// An author was blocked from a broadcast context (spec section 5.14.8).
-    /// Legacy variant — new code should use `WriteAccessRevoked` with
-    /// `RevocationScope::Full`.
-    AuthorBlocked(AuthorBlockResult),
     /// A subscriber's read access was revoked in a broadcast context
     /// (ADR-031, §5.9). The subscriber was removed from the registry and
     /// added to all authors' block lists; all author keys were rotated.
@@ -430,12 +418,6 @@ pub struct ContextSnapshot {
     /// Dynamically registered tools (beyond initial `ContextParams.tools`).
     #[serde(default)]
     pub registered_tools: Vec<ToolRegistration>,
-    /// Members whose write access has been governance-revoked (ADR-031).
-    #[serde(default)]
-    pub write_revoked_members: HashSet<DID>,
-    /// Members whose read access has been governance-revoked (§5.9, ADR-038).
-    #[serde(default)]
-    pub read_revoked_members: HashSet<DID>,
     /// Members excluded from future CEK wrapping (`FutureOnly` read revocation).
     /// These members won't receive new content keys but retain access to
     /// historical content encrypted before the revocation (ADR-038, §9.17).
@@ -496,8 +478,8 @@ pub struct ContextSnapshot {
     #[serde(default)]
     pub pending_economic_policy_change: Option<PendingEconomicPolicyChange>,
     /// Monotonic MLS epoch counter. Tracks epoch advances from membership-
-    /// mutating governance actions (`AddMember`, `RemoveMember`,
-    /// `RevokeReadAccess`, `ResetMember`).
+    /// mutating governance actions (`AddMember`, `Eject`,
+    /// `Revoke`, `ResetMember`).
     #[serde(default)]
     pub mls_epoch: u64,
     /// Epoch coordination records linking governance proposals to MLS epoch
@@ -799,8 +781,8 @@ impl GovernanceState {
 /// MLS epoch and reconnection state.
 struct EpochState {
     /// Monotonic MLS epoch counter. Incremented each time a governance action
-    /// triggers an MLS membership change (`AddMember`, `RemoveMember`,
-    /// `RevokeReadAccess`, `ResetMember`). Used to populate
+    /// triggers an MLS membership change (`AddMember`, `Eject`,
+    /// `Revoke`, `ResetMember`). Used to populate
     /// `GovernanceActionExecuted.resulting_epoch` and
     /// `GovernanceContext.current_epoch`.
     mls_epoch: u64,
@@ -827,14 +809,14 @@ struct EpochState {
     needs_reconnect: bool,
 }
 
-/// Write/read revocation and context migration state.
+/// Access control state (CEK wrapping, key store).
+///
+/// Capability suspension is now handled by `ContextRoleState::suspended_capabilities`.
+/// This struct retains the CEK exclusion list and per-member access key store.
 struct AccessControlState {
-    /// Members whose write access has been governance-revoked (ADR-031).
-    write_revoked_members: HashSet<DID>,
-    /// Members whose read access has been governance-revoked (§5.9, ADR-038).
-    read_revoked_members: HashSet<DID>,
     /// Members excluded from future CEK wrapping (`FutureOnly` read revocation,
-    /// ADR-038, §9.17). Subset of or equal to `read_revoked_members`.
+    /// ADR-038, §9.17). This is a cryptographic exclusion list, NOT an
+    /// application-level capability suspension.
     read_exclusion_list: HashSet<DID>,
     /// Per-member access key store for content encryption key wrapping
     /// (ADR-038, §9.17). Keys are generated when members join and used
@@ -1824,8 +1806,6 @@ impl ContextManager {
             executed_proposals: ctx.governance.executed_proposals.keys().copied().collect(),
             ttl_remaining_secs,
             registered_tools: ctx.governance.registered_tools.clone(),
-            write_revoked_members: ctx.access.write_revoked_members.clone(),
-            read_revoked_members: ctx.access.read_revoked_members.clone(),
             read_exclusion_list: ctx.access.read_exclusion_list.clone(),
             tool_interfaces: ctx.governance.tool_interfaces.clone(),
             threshold_signers: ctx.governance.threshold_signers.clone(),

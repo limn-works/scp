@@ -2,10 +2,10 @@
 
 use super::{
     BlockResult, BroadcastAdmission, BroadcastContent, BroadcastContext, BroadcastEnvelope,
-    BuildHasher, ContextError, ContextEvent, ContextManager, DID, DidResolver, KeyRequestDecision,
-    NonceTracker, ProofResolver, RevocationChecker, SubscriptionResult, UcanToken,
-    UnsubscribeResult, ValidationContext, context_id_to_bytes, instrument, require_active,
-    serialize_broadcast_content,
+    BuildHasher, Capability, ContextError, ContextEvent, ContextManager, DID, DidResolver,
+    KeyRequestDecision, NonceTracker, ProofResolver, RevocationChecker, SubscriptionResult,
+    UcanToken, UnsubscribeResult, ValidationContext, context_id_to_bytes, instrument,
+    require_active, serialize_broadcast_content,
 };
 
 #[allow(clippy::significant_drop_tightening)]
@@ -222,10 +222,13 @@ impl ContextManager {
 
             require_active(&ctx.handle)?;
 
-            // Governance-level write revocation check (§9.17, ADR-038).
-            if ctx.access.write_revoked_members.contains(author_did) {
+            // Suspension-aware capability check (§9.17, ADR-038).
+            if !ctx
+                .role_state
+                .member_has_capability(author_did.as_ref(), &Capability::MessagesWrite)
+            {
                 return Err(ContextError::PermissionDenied(format!(
-                    "write access has been revoked for {author_did}"
+                    "write access has been suspended for {author_did}"
                 )));
             }
 

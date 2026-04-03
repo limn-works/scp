@@ -336,17 +336,14 @@ impl ContextManager {
                 .get_mut(&context_id)
                 .ok_or_else(|| ContextError::ContextNotRegistered(context_id.clone()))?;
             require_active(&ctx.handle)?;
-            if ctx.access.write_revoked_members.contains(sender_did) {
-                return Err(ContextError::PermissionDenied(format!(
-                    "write access has been revoked for {sender_did}"
-                )));
-            }
             // H7: check capability BEFORE budget deduction so a capability
-            // failure doesn't leak budget.
+            // failure doesn't leak budget. The suspension-aware
+            // member_has_capability check handles both role-based and
+            // suspension-based denial.
             if ctx.broadcast_context.is_none()
                 && !ctx
                     .role_state
-                    .member_has_capability(sender_did, &Capability::MessagesWrite)
+                    .member_has_capability(sender_did.as_ref(), &Capability::MessagesWrite)
             {
                 return Err(ContextError::PermissionDenied(format!(
                     "member {sender_did} does not have messages:write capability"
@@ -875,10 +872,6 @@ impl ContextManager {
                 // removed or had capability revoked while the message was
                 // buffered waiting for the gap to fill.
                 if !ctx.membership.contains(&msg.sender_did)
-                    || ctx
-                        .access
-                        .write_revoked_members
-                        .contains(&DID(msg.sender_did.clone()))
                     || !ctx
                         .role_state
                         .member_has_capability(&msg.sender_did, &Capability::MessagesWrite)
@@ -944,10 +937,6 @@ impl ContextManager {
                 // removed or had capability revoked while the message was
                 // buffered (buffer overflow force-delivery).
                 if !ctx.membership.contains(&msg.sender_did)
-                    || ctx
-                        .access
-                        .write_revoked_members
-                        .contains(&DID(msg.sender_did.clone()))
                     || !ctx
                         .role_state
                         .member_has_capability(&msg.sender_did, &Capability::MessagesWrite)
@@ -995,11 +984,8 @@ impl ContextManager {
                 "sender {sender_did} is not a member of this context"
             )));
         }
-        if ctx.access.write_revoked_members.contains(&sender_did_obj) {
-            return Err(ContextError::PermissionDenied(format!(
-                "write access has been revoked for {sender_did}"
-            )));
-        }
+        // Suspension-aware capability check handles both role-based and
+        // suspension-based denial (replaces separate write_revoked_members check).
         if !ctx
             .role_state
             .member_has_capability(sender_did, &Capability::MessagesWrite)
@@ -1027,10 +1013,6 @@ impl ContextManager {
             // sender may have been removed or had capability revoked while the
             // message was buffered.
             if !ctx.membership.contains(&msg.sender_did)
-                || ctx
-                    .access
-                    .write_revoked_members
-                    .contains(&DID(msg.sender_did.clone()))
                 || !ctx
                     .role_state
                     .member_has_capability(&msg.sender_did, &Capability::MessagesWrite)

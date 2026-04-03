@@ -313,7 +313,7 @@ where
 /// Scope of cryptographic access revocation (§5.9, ADR-031).
 ///
 /// Determines whether revocation targets read access, write access, or both.
-#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum AccessScope {
     /// Revoke read access only.
     Read,
