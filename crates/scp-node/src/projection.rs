@@ -642,7 +642,7 @@ impl ProjectedContext {
     /// If pruning becomes necessary, add a `prune_before(epoch)` method
     /// keyed to the relay's `max_blob_ttl`.
     ///
-    /// **Important:** After a governance ban (`RevokeReadAccess` /
+    /// **Important:** After a governance ban (`Revoke` /
     /// `governance_ban_subscriber`), all author keys are rotated in the
     /// `ContextManager`. The caller MUST propagate the new-epoch keys to
     /// the projection registry via this method; otherwise the projection

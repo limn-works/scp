@@ -359,7 +359,9 @@ mod tests {
 
         let consequence_rules = vec![ConsequenceRule {
             trigger: ConsequenceTrigger::MessageVelocity,
-            action: ConsequenceAction::CapabilitySuspension(vec!["messages:write".to_owned()]),
+            action: ConsequenceAction::Suspend {
+                capabilities: vec!["messages:write".to_owned()],
+            },
             threshold: 100,
             window: std::time::Duration::from_secs(3600),
         }];
