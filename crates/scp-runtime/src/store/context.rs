@@ -1753,6 +1753,7 @@ mod tests {
             velocity_tracker: None,
             velocity_tracker_state: None,
             cooldown_until: std::collections::HashMap::new(),
+            proposal_timestamps: std::collections::HashMap::new(),
         }
     }
 
