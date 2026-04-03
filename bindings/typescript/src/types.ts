@@ -123,7 +123,7 @@ export interface BatchPublishResult {
  */
 export type GovernanceActionResult =
   | "MemberAdded"
-  | "MemberRemoved"
+  | "MemberEjected"
   | "RoleChanged"
   | "ToolRegistered"
   | "ToolRemoved"
@@ -140,13 +140,11 @@ export type GovernanceActionResult =
   | "MemberReset"
   | "ConflictResolved"
   | "ContextPromoted"
-  | "ReadAccessRevoked"
-  | "ReadAccessRestored"
-  | "WriteAccessRevoked"
-  | "WriteAccessRestored"
+  | "MemberSuspended"
+  | "AccessRevoked"
+  | "AccessRestored"
   | "ContentKeysRotated"
   | "GovernanceReconfigured"
-  | "AuthorBlocked"
   | "SubscriberBanned"
   | "SubscriberUnbanned"
   | "Executed";
