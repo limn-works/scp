@@ -31,10 +31,10 @@ pub use broadcast::{
 };
 pub use broadcast_content::{BroadcastContent, BroadcastContentError};
 pub use governance::{
-    CheckpointAttestationStatus, ConflictResolution, CosignedCheckpoint, GovernanceAction,
-    GovernanceContext, GovernanceEngine, GovernanceError, GovernanceEvent, GovernanceModelConfig,
-    GovernanceProposal, GovernanceReconfigAction, KeyResolver, ProposalId, ProposalStatus,
-    RejectionReason, RevocationScope, SignedVote, VoteType, actions_conflict, compute_proposal_id,
+    AccessScope, CheckpointAttestationStatus, ConflictResolution, CosignedCheckpoint,
+    GovernanceAction, GovernanceContext, GovernanceEngine, GovernanceError, GovernanceEvent,
+    GovernanceModelConfig, GovernanceProposal, GovernanceReconfigAction, KeyResolver, ProposalId,
+    ProposalStatus, RejectionReason, SignedVote, VoteType, actions_conflict, compute_proposal_id,
     sign_vote, verify_proposal_votes, verify_vote,
 };
 pub use membership::{MemberInfo, MembershipState};

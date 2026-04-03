@@ -310,18 +310,17 @@ where
 // GovernanceAction
 // ---------------------------------------------------------------------------
 
-/// Scope of content access revocation (§5.9, ADR-031).
+/// Scope of cryptographic access revocation (§5.9, ADR-031).
 ///
-/// Determines whether revocation is retroactive (destroying historical access keys)
-/// or forward-only (preserving access to already-distributed content).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub enum RevocationScope {
-    /// Retroactive: destroy access keys for historical content AND
-    /// exclude from future content key distribution.
-    Full,
-    /// Forward-only: exclude from future content key distribution.
-    /// Historical content remains accessible.
-    FutureOnly,
+/// Determines whether revocation targets read access, write access, or both.
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum AccessScope {
+    /// Revoke read access only.
+    Read,
+    /// Revoke write access only.
+    Write,
+    /// Revoke both read and write access.
+    Both,
 }
 
 // ---------------------------------------------------------------------------
@@ -538,11 +537,11 @@ pub enum GovernanceAction {
         /// The role to assign to the new member.
         role: String,
     },
-    /// Remove a member from the context.
-    RemoveMember {
-        /// The DID of the member to remove.
+    /// MLS ejection — irreversible, governance only.
+    Eject {
+        /// The DID of the member to eject.
         did: DID,
-        /// Optional reason for removal.
+        /// Optional reason for ejection.
         reason: Option<String>,
     },
     /// Change a member's role.
@@ -587,39 +586,26 @@ pub enum GovernanceAction {
         /// The parameters for the child context.
         params: Box<ContextParams>,
     },
-    /// Block an author in a broadcast context (spec section 5.14.8).
-    ///
-    /// Removes the author from the broadcast context, destroying their sender
-    /// key and preventing future publishing. Requires governance approval
-    /// because author removal is a membership change that must go through
-    /// the context's governance model. See spec section 5.14.8.
-    BlockAuthor {
-        /// The DID of the author to block.
+    /// Suspend specific capabilities for a member (application-level gate block).
+    SuspendMember {
+        /// The DID of the member whose capabilities are suspended.
         did: DID,
-        /// Optional reason for the block.
-        reason: Option<String>,
+        /// The capabilities to suspend.
+        capabilities: Vec<Capability>,
     },
-    /// Revoke a member's read access to context content (§5.9, ADR-031).
-    ///
-    /// Requires `MemberBan` capability in the context's ceiling (§5.3).
-    /// In broadcast contexts: removes subscriber from registry, adds to all
-    /// authors' block lists, forces key rotation on all authors (§5.14.8).
-    /// In encrypted contexts: removes from MLS group.
-    /// Does NOT remove the member -- they remain for governance/presence.
-    RevokeReadAccess {
-        /// The DID whose read access is revoked.
+    /// Cryptographic revocation — destroy keys. Forward-restore only.
+    Revoke {
+        /// The DID whose access is revoked.
         did: DID,
-        /// Whether revocation is retroactive or forward-only.
-        scope: RevocationScope,
+        /// The scope of access to revoke (read, write, or both).
+        access: AccessScope,
     },
-    /// Restore a member's read access to context content (§5.9, ADR-031).
-    ///
-    /// Requires `MemberBan` capability in the context's ceiling (§5.3).
-    /// Always forward-only -- historical content from before/during revocation
-    /// remains inaccessible (access keys were destroyed, not archived).
-    RestoreReadAccess {
-        /// The DID whose read access is restored.
+    /// Restore suspended capabilities or forward-restore after revocation.
+    RestoreAccess {
+        /// The DID whose access is restored.
         did: DID,
+        /// The capabilities to restore.
+        capabilities: Vec<Capability>,
     },
     /// Modify the context's event log pruning policy (ADR-030 §6).
     ModifyPruningPolicy {
@@ -677,24 +663,6 @@ pub enum GovernanceAction {
     /// governance model — protocol-level override enforced by
     /// `ContextManager`.
     PromoteContext,
-    /// Revoke a member's write access to context content (§9.17, ADR-038).
-    ///
-    /// `Full` scope: stop publishing and suppress historical content.
-    /// `FutureOnly` scope: stop future publishing only.
-    /// Does NOT remove the member — they remain for governance/presence.
-    RevokeWriteAccess {
-        /// The DID whose write access is revoked.
-        did: DID,
-        /// Whether revocation is retroactive or forward-only.
-        scope: RevocationScope,
-    },
-    /// Restore a member's write access to context content (§9.17, ADR-038).
-    ///
-    /// Always forward-only — previously suppressed content remains suppressed.
-    RestoreWriteAccess {
-        /// The DID whose write access is restored.
-        did: DID,
-    },
     /// Context-wide content key rotation (§9.17, ADR-038).
     ///
     /// Not DID-targeted — rotates keys for all members. Use after compromise
@@ -769,7 +737,7 @@ impl GovernanceAction {
     pub const fn variant_name(&self) -> &'static str {
         match self {
             Self::AddMember { .. } => "AddMember",
-            Self::RemoveMember { .. } => "RemoveMember",
+            Self::Eject { .. } => "Eject",
             Self::ChangeRole { .. } => "ChangeRole",
             Self::RegisterTool { .. } => "RegisterTool",
             Self::RemoveTool { .. } => "RemoveTool",
@@ -778,9 +746,9 @@ impl GovernanceAction {
             Self::ExtendTtl { .. } => "ExtendTtl",
             Self::TransferAdmin { .. } => "TransferAdmin",
             Self::CreateChildContext { .. } => "CreateChildContext",
-            Self::BlockAuthor { .. } => "BlockAuthor",
-            Self::RevokeReadAccess { .. } => "RevokeReadAccess",
-            Self::RestoreReadAccess { .. } => "RestoreReadAccess",
+            Self::SuspendMember { .. } => "SuspendMember",
+            Self::Revoke { .. } => "Revoke",
+            Self::RestoreAccess { .. } => "RestoreAccess",
             Self::ModifyPruningPolicy { .. } => "ModifyPruningPolicy",
             Self::AddSigner { .. } => "AddSigner",
             Self::RemoveSigner { .. } => "RemoveSigner",
@@ -789,8 +757,6 @@ impl GovernanceAction {
             Self::ResetMember { .. } => "ResetMember",
             Self::ResolveConflict { .. } => "ResolveConflict",
             Self::PromoteContext => "PromoteContext",
-            Self::RevokeWriteAccess { .. } => "RevokeWriteAccess",
-            Self::RestoreWriteAccess { .. } => "RestoreWriteAccess",
             Self::RotateContentKeys { .. } => "RotateContentKeys",
             Self::ReconfigureGovernance { .. } => "ReconfigureGovernance",
             Self::SetEconomicPolicy { .. } => "SetEconomicPolicy",
@@ -811,16 +777,14 @@ impl GovernanceAction {
     pub const fn target_did(&self) -> Option<&DID> {
         match self {
             Self::AddMember { did, .. }
-            | Self::RemoveMember { did, .. }
+            | Self::Eject { did, .. }
             | Self::ChangeRole { did, .. }
-            | Self::BlockAuthor { did, .. }
-            | Self::RevokeReadAccess { did, .. }
-            | Self::RestoreReadAccess { did }
+            | Self::SuspendMember { did, .. }
+            | Self::Revoke { did, .. }
+            | Self::RestoreAccess { did, .. }
             | Self::ResetMember { did, .. }
             | Self::AddSigner { did }
-            | Self::RemoveSigner { did }
-            | Self::RevokeWriteAccess { did, .. }
-            | Self::RestoreWriteAccess { did } => Some(did),
+            | Self::RemoveSigner { did } => Some(did),
             Self::TransferAdmin { new_admin } => Some(new_admin),
             Self::ApproveSpend { spender, .. } => Some(spender),
             Self::RegisterTool { .. }
@@ -1744,16 +1708,14 @@ impl GovernanceEngine for SingleAdminEngine {
 /// implements the conflict detection rules from ADR-031 section 7.
 ///
 /// # Conflict types detected:
-/// - Mutual `RemoveMember` proposals (each targeting the other's proposer)
+/// - Mutual `Eject` proposals (each targeting the other's proposer)
 /// - Competing `ChangeRole` proposals for the same DID with different roles
 /// - Competing `ModifyCeiling` proposals with different ceiling sets
-/// - `RemoveMember` + `ChangeRole` for the same DID
-/// - `RevokeReadAccess` + `RestoreReadAccess` for the same DID
-/// - `RevokeWriteAccess` + `RestoreWriteAccess` for the same DID
-/// - Multiple `RevokeReadAccess` for same DID with different scopes
-/// - Multiple `RevokeWriteAccess` for same DID with different scopes
-/// - Multiple `RestoreReadAccess` for same DID
-/// - Multiple `RestoreWriteAccess` for same DID
+/// - `Eject` + `ChangeRole` for the same DID
+/// - `Revoke` + `RestoreAccess` for the same DID
+/// - Multiple `Revoke` for same DID with different scopes
+/// - Multiple `SuspendMember` for same DID
+/// - `SuspendMember` + `RestoreAccess` for same DID
 ///
 /// # Arguments
 /// * `action_a` - The first governance action
@@ -1771,9 +1733,9 @@ pub fn actions_conflict(
     proposer_b: &DID,
 ) -> bool {
     use GovernanceAction::{
-        AddSigner, ChangeRole, ModifyCeiling, ModifyPruningPolicy, ModifyThreshold,
-        ReconfigureGovernance, RemoveMember, RemoveSigner, RestoreReadAccess, RestoreWriteAccess,
-        RevokeReadAccess, RevokeWriteAccess, RotateContentKeys,
+        AddSigner, ChangeRole, Eject, ModifyCeiling, ModifyPruningPolicy, ModifyThreshold,
+        ReconfigureGovernance, RemoveSigner, RestoreAccess, Revoke, RotateContentKeys,
+        SuspendMember,
     };
 
     // Canonical conflict matrix. The sync module's `actions_conflict`
@@ -1802,35 +1764,28 @@ pub fn actions_conflict(
         // Concurrent context-wide key rotations conflict (global property mutation).
         | (RotateContentKeys { .. }, RotateContentKeys { .. }) => true,
 
-        // Remove + role change for the same DID.
-        (RemoveMember { did: did_a, .. }, ChangeRole { did: did_b, .. })
-        | (ChangeRole { did: did_a, .. }, RemoveMember { did: did_b, .. }) => did_a == did_b,
-
-        // Two concurrent removals of the same member conflict (ADR-031 §7:
+        // Two concurrent ejections of the same member conflict (ADR-031 §7:
         // concurrent modifications to the same membership state).
-        // Also catches mutual removal (each proposer removes the other).
-        (RemoveMember { did: did_a, .. }, RemoveMember { did: did_b, .. }) => {
+        // Also catches mutual ejection (each proposer ejects the other).
+        (Eject { did: did_a, .. }, Eject { did: did_b, .. }) => {
             did_a == did_b || (did_a == proposer_b && did_b == proposer_a)
         }
 
-        // Two concurrent revocations or restorations of the same type targeting
-        // the same DID conflict (scope may differ, but concurrent modification
-        // is unsafe — ADR-031 §7). Revoke and Restore for the same DID also
-        // conflict (contradictory intent on the same member's access state).
-        (RevokeReadAccess { did: did_a, .. }, RevokeReadAccess { did: did_b, .. })
-        | (RevokeWriteAccess { did: did_a, .. }, RevokeWriteAccess { did: did_b, .. })
-        | (
-            RestoreReadAccess { did: did_a } | RevokeReadAccess { did: did_a, .. },
-            RestoreReadAccess { did: did_b },
-        )
-        | (
-            RestoreWriteAccess { did: did_a } | RevokeWriteAccess { did: did_a, .. },
-            RestoreWriteAccess { did: did_b },
-        )
-        | (RestoreReadAccess { did: did_a }, RevokeReadAccess { did: did_b, .. })
-        | (RestoreWriteAccess { did: did_a }, RevokeWriteAccess { did: did_b, .. }) => {
-            did_a == did_b
-        }
+        // Eject + role change for the same DID.
+        // Two concurrent revocations targeting the same DID conflict (scope may
+        // differ, but concurrent modification is unsafe — ADR-031 §7).
+        // Revoke and RestoreAccess for the same DID also conflict (contradictory
+        // intent on the same member's access state). SuspendMember targeting
+        // the same DID also conflicts with itself and with RestoreAccess.
+        (Eject { did: did_a, .. }, ChangeRole { did: did_b, .. })
+        | (ChangeRole { did: did_a, .. }, Eject { did: did_b, .. })
+        | (Revoke { did: did_a, .. }, Revoke { did: did_b, .. })
+        | (SuspendMember { did: did_a, .. }, SuspendMember { did: did_b, .. })
+        | (Revoke { did: did_a, .. }, RestoreAccess { did: did_b, .. })
+        | (RestoreAccess { did: did_a, .. }, Revoke { did: did_b, .. })
+        | (SuspendMember { did: did_a, .. }, RestoreAccess { did: did_b, .. })
+        | (RestoreAccess { did: did_a, .. }, SuspendMember { did: did_b, .. })
+        | (RestoreAccess { did: did_a, .. }, RestoreAccess { did: did_b, .. }) => did_a == did_b,
 
         // AddSigner and RemoveSigner for the same DID conflict.
         (AddSigner { did: add_did }, RemoveSigner { did: remove_did })
@@ -1928,28 +1883,38 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // RevocationScope serialization roundtrip
+    // AccessScope serialization roundtrip
     // -----------------------------------------------------------------------
 
     #[test]
-    fn revocation_scope_full_roundtrip() {
-        let scope = RevocationScope::Full;
+    fn access_scope_read_roundtrip() {
+        let scope = AccessScope::Read;
         let json = serde_json::to_string(&scope).unwrap();
-        let deserialized: RevocationScope = serde_json::from_str(&json).unwrap();
+        let deserialized: AccessScope = serde_json::from_str(&json).unwrap();
         assert_eq!(scope, deserialized);
     }
 
     #[test]
-    fn revocation_scope_future_only_roundtrip() {
-        let scope = RevocationScope::FutureOnly;
+    fn access_scope_write_roundtrip() {
+        let scope = AccessScope::Write;
         let json = serde_json::to_string(&scope).unwrap();
-        let deserialized: RevocationScope = serde_json::from_str(&json).unwrap();
+        let deserialized: AccessScope = serde_json::from_str(&json).unwrap();
         assert_eq!(scope, deserialized);
     }
 
     #[test]
-    fn revocation_scope_variants_are_distinct() {
-        assert_ne!(RevocationScope::Full, RevocationScope::FutureOnly);
+    fn access_scope_both_roundtrip() {
+        let scope = AccessScope::Both;
+        let json = serde_json::to_string(&scope).unwrap();
+        let deserialized: AccessScope = serde_json::from_str(&json).unwrap();
+        assert_eq!(scope, deserialized);
+    }
+
+    #[test]
+    fn access_scope_variants_are_distinct() {
+        assert_ne!(AccessScope::Read, AccessScope::Write);
+        assert_ne!(AccessScope::Read, AccessScope::Both);
+        assert_ne!(AccessScope::Write, AccessScope::Both);
     }
 
     // -----------------------------------------------------------------------
@@ -2037,11 +2002,8 @@ mod tests {
     // GovernanceAction serialization
     // -----------------------------------------------------------------------
 
-    /// Returns all 30 `GovernanceAction` variants (24 per ADR-031, `BlockAuthor`,
-    /// 3 economic: `SetEconomicPolicy`, `ApproveSpend`, `LockEconomicPolicy`,
-    /// and 2 migration: `ProposeContextMigration`, `CancelContextMigration`)
-    /// for serialization testing. Split into two helpers to stay within the
-    /// function line limit.
+    /// Returns all 28 `GovernanceAction` variants for serialization testing.
+    /// Split into two helpers to stay within the function line limit.
     fn all_governance_actions() -> Vec<GovernanceAction> {
         let mut actions = governance_actions_core();
         actions.extend(governance_actions_extended());
@@ -2055,7 +2017,7 @@ mod tests {
                 did: bob(),
                 role: "member".to_owned(),
             },
-            GovernanceAction::RemoveMember {
+            GovernanceAction::Eject {
                 did: bob(),
                 reason: Some("inactive".to_owned()),
             },
@@ -2096,15 +2058,18 @@ mod tests {
             GovernanceAction::CreateChildContext {
                 params: Box::new(ContextParams::default()),
             },
-            GovernanceAction::BlockAuthor {
+            GovernanceAction::SuspendMember {
                 did: bob(),
-                reason: Some("spam".to_owned()),
+                capabilities: vec![Capability::MessagesWrite],
             },
-            GovernanceAction::RevokeReadAccess {
+            GovernanceAction::Revoke {
                 did: bob(),
-                scope: RevocationScope::Full,
+                access: AccessScope::Both,
             },
-            GovernanceAction::RestoreReadAccess { did: bob() },
+            GovernanceAction::RestoreAccess {
+                did: bob(),
+                capabilities: vec![Capability::MessagesRead, Capability::MessagesWrite],
+            },
             GovernanceAction::ModifyPruningPolicy {
                 new_policy: PruningPolicy::default(),
             },
@@ -2145,11 +2110,6 @@ mod tests {
                 },
             },
             GovernanceAction::PromoteContext,
-            GovernanceAction::RevokeWriteAccess {
-                did: bob(),
-                scope: RevocationScope::FutureOnly,
-            },
-            GovernanceAction::RestoreWriteAccess { did: bob() },
             GovernanceAction::RotateContentKeys {
                 reason: Some("periodic hygiene".to_owned()),
             },
@@ -2200,10 +2160,10 @@ mod tests {
     fn governance_action_serialization_roundtrip() {
         let actions = all_governance_actions();
 
-        // Verify all 30 variants are covered.
+        // Verify all 28 variants are covered.
         assert_eq!(
             actions.len(),
-            30,
+            28,
             "all GovernanceAction variants must be tested"
         );
 
@@ -2621,7 +2581,7 @@ mod tests {
                 did: DID::from("did:dht:z6MkDave"),
                 role: "member".to_owned(),
             },
-            GovernanceAction::RemoveMember {
+            GovernanceAction::Eject {
                 did: bob(),
                 reason: None,
             },

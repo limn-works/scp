@@ -947,9 +947,9 @@ mod tests {
         // Define consequence rules.
         let consequence_rules = vec![ConsequenceRule {
             trigger: super::super::consequence::ConsequenceTrigger::MessageVelocity,
-            action: super::super::consequence::ConsequenceAction::CapabilitySuspension(vec![
-                "messages:write".to_owned(),
-            ]),
+            action: super::super::consequence::ConsequenceAction::Suspend {
+                capabilities: vec!["messages:write".to_owned()],
+            },
             threshold: 10,
             window: Duration::from_secs(3600),
         }];
@@ -1166,13 +1166,13 @@ mod tests {
         let consequence_rules = vec![
             ConsequenceRule {
                 trigger: super::super::consequence::ConsequenceTrigger::MessageVelocity,
-                action: super::super::consequence::ConsequenceAction::AccessRevocation,
+                action: super::super::consequence::ConsequenceAction::SuspendAll,
                 threshold: 10,
                 window: Duration::from_secs(60),
             },
             ConsequenceRule {
                 trigger: super::super::consequence::ConsequenceTrigger::ToolRateExceeded,
-                action: super::super::consequence::ConsequenceAction::RoleDemotion {
+                action: super::super::consequence::ConsequenceAction::AssignRole {
                     to_role: "observer".to_owned(),
                 },
                 threshold: 5,
