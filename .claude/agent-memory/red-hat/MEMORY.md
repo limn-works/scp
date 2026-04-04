@@ -53,15 +53,18 @@ After commit 54b8096 ("close 6 remaining gaps"), reassessed all chains.
 - **RED-603 (LOW)**: Asymmetric freshness (300s past/30s future) is sound. Pre-existing gap: NonceDedup not wired for access keys.
 - **RED-606 (MEDIUM)**: E2eCryptoProvider missing epoch poisoning, recv_tracker, mgmt size limit. New defenses untested in integration.
 
-## PR Branch `complete-pr-work-review-0TQtO` Assessment (2026-04-01)
-- **RED-701 (HIGH)**: NAPI/UniFFI catch-all event formatters lack HTML escaping. Input-side rejection removed; output-side escaping inconsistent across bridges. PyO3 safe, WASM safe (json escaping), NAPI/UniFFI unsafe on catch-all arm.
-- **RED-702 (MEDIUM)**: Spending UCAN replay. No nonce dedup. BudgetTracker ceiling bounds damage but doesn't prevent replay within ceiling.
-- **RED-703 (LOW)**: Escrow double-spend prevented by Rust ownership model. H8 no-rollback-after-delivery is correct.
-- **RED-704 (LOW)**: Tool cost overflow infeasible (requires near-u64::MAX prior spend).
-- **RED-705 (MEDIUM)**: system_assign_role bypasses RoleAssign for consequence engine. No appeal, no cooldown. Rules immutable but powerful.
-- **RED-706 (HIGH)**: evaluate_sybil_resistance() is a stub (passes unconditionally). Standing score gaming trivial via Sybil identities.
-- **RED-707 (LOW)**: Trust recovery abuse defended by MLS removal + sender key rotation + membership checks.
-- **RED-708 (LOW)**: Crypto boundaries hold. Epoch poisoning capped at 1000-step, replay detection has MLS primary + sequence secondary, SCPM magic collision infeasible.
+## PR Branch `complete-pr-work-review-0TQtO` Assessment (2026-04-01, round 1)
+- **RED-701 (HIGH)**: NAPI/UniFFI catch-all event formatters lack HTML escaping.
+- **RED-702 (MEDIUM)**: Spending UCAN replay. No nonce dedup.
+- **RED-705 (MEDIUM)**: system_assign_role bypasses RoleAssign for consequence engine.
+- **RED-706 (HIGH)**: evaluate_sybil_resistance() stub. Standing score gaming via Sybil.
+
+## PR Branch `complete-pr-work-review-0TQtO` Assessment (2026-04-04, round 2 - governance/economy focus)
+- **RED-801 (CRITICAL)**: WASM `member_has_capability` ignores `suspended_capabilities` map. Suspension is cosmetic. `send_message` has inline check but governance propose/vote uses `member_has_capability` which never queries suspension state.
+- **RED-802 (HIGH)**: WASM `dispatch_revoke` never inserts into `read_exclusion_list`. CEK wrapping exclusion is dead code for Revoke actions.
+- **RED-803 (HIGH)**: `check_and_composition` silently discards `action_ucan` (`let _ = action_ucan`). Callers passing None for action_ucan succeed for free actions. AND-composition broken: spending UCAN alone is sufficient.
+- **RED-804 (MEDIUM)**: WASM nonce tracker uses HashMap with f64 timestamps (JS precision). 10K cap with TTL eviction. Reset on context import loses all nonces -- full replay window opens.
+- **RED-805 (MEDIUM)**: `rollback_last` on velocity tracker always pops the LAST timestamp regardless of which message failed. Concurrent senders can roll back the wrong sender's velocity.
 
 ## Key Attack Patterns for This Codebase
 - **Bridge parity gap**: WASM bridge cannot depend on scp-core (tokio incompatibility), so it re-implements validation partially. ALWAYS check WASM bridge when core validation changes.
