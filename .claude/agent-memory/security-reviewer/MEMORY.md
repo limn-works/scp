@@ -213,15 +213,15 @@
 - Ceiling fix: NAPI + UniFFI fixed; PyO3 was already correct (resolves at registration); WASM was already correct
 - Atomic write: create_new has fsync; append_entry does NOT have fsync -- inconsistency
 
-### Complete PR Work Review (2026-04-01) -- claude/complete-pr-work-review-0TQtO
-- HIGH: validate_governance_action_strings + all callees DELETED from FFI -- role names, reasons, descriptions now unvalidated (length, control chars, HTML)
-- HIGH: AND-composition check_and_composition allows None/None/free=Ok(()) -- convention not type-enforced
+### Complete PR Work Review (2026-04-01, re-reviewed 2026-04-04) -- claude/complete-pr-work-review-0TQtO
+- HIGH: validate_governance_action_strings + all callees DELETED from FFI -- role names, reasons, descriptions now unvalidated (length, control chars, HTML). reject_html_special_chars also deleted.
+- HIGH: AND-composition check_and_composition allows None/None/free=Ok(()) -- action_ucan explicitly discarded with `let _ =`. Rename or audit all callers.
 - HIGH: system_assign_role pub (not pub(crate)), bypasses RoleAssign with no audit trail differentiation
 - MEDIUM: SenderKeyStore::remove clears epoch tracking -- epoch rollback possible on re-add
-- MEDIUM: AccessRevocation consequence is application-level only (no MLS exclusion)
-- MEDIUM: evaluate_sybil_resistance is a no-op stub called in security-critical join path
-- MEDIUM: Receive buffer events use estimated timestamps for consequence evaluation
+- MEDIUM: SuspendAll consequence is application-level only (no MLS exclusion)
+- MEDIUM: evaluate_sybil_resistance always passes -- build_identity_assessment uses empty signal HashMap
+- MEDIUM: SenderVelocityTracker still unbounded (from_snapshot/record_message grow without limit)
+- MEDIUM: ConsequenceTriggered events leak trigger_type (Debug format) and rule_index to SDK
 - MEDIUM: send_sequence wrapping_add allows theoretical nonce reuse at u64::MAX
-- MEDIUM: meets_standing_threshold trivially bypassable via self-generated proposals
 - FIXED from prior: sender key AAD zeros; MLS management messages; epoch poisoning defense; error message sanitization
-- GOOD: Escrow budget pattern with reverse_spend; html_escape_event_string at output; ConsequenceRule::validate at all boundaries; blocked DID check in sender key requests
+- GOOD: Escrow budget pattern with reverse_spend; ConsequenceRule::validate whitelist; NoOpPaymentAdapter cfg-gated; decrypt collapses CiphertextTooShort into AuthenticationFailed (oracle prevention); TOCTOU guard in enforce_triggered_consequences
