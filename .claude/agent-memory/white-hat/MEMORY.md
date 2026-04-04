@@ -116,6 +116,29 @@
 - Asymmetric timestamp freshness (300s past, 30s future)
 - HTML escaping on all event output strings across all 4 FFI bridges
 
+## Branch claude/complete-pr-work-review-0TQtO Review (2026-04-04)
+
+### P1 Findings
+- VALID_SUSPENSION_CAPABILITIES covers only MessagesRead/Write (6 aliases). 19 other Capability variants (ToolInvoke, GovernancePropose, MemberRemove, etc.) cannot be suspended via consequence rules -- Suspend silently logs unknown and skips.
+- Standing context ID changed from 8-byte truncated hash to full 32-byte hash (good), but old standing contexts using truncated IDs will not be found on reconnect (no migration path).
+- SuspendAll is app-layer only (role_state.suspend_all). No automatic MLS removal or sender key rotation. Comment says "dispatch Eject governance action" but no code actually dispatches it. Gap between Suspend (app) and Eject (crypto) layers.
+- enforce_assign_role returns bool but does not escalate on false except in the outer loop. If role doesn't exist, enforce_assign_role returns false -> SuspendAll escalation is correct, but the role existence isn't validated at rule creation time.
+
+### P2 Findings
+- event_log_entries_for_consequences estimated timestamps (1-second spacing) are approximations. High-throughput senders could have multiple events within same second, collapsing their timestamps and potentially under-counting velocity.
+- cooldown_until HashMap unbounded -- one entry per rule_index forever. No eviction of stale cooldowns.
+
+### Well-Defended
+- Consequence TOCTOU guard: membership check inside enforce loop, break on member departure
+- Fail-closed on participation record computation failure (denies proposal)
+- Budget rollback uses reverse_spend (decrements spent) not grant (inflates limit)
+- Cost evaluation overflow returns Err, not Ok(None) -- fail-closed
+- threshold=0 rejected at validation time
+- Escrow pattern: authorize -> action -> capture/void with proper rollback
+- H7: capability check BEFORE budget deduction prevents budget leak on permission failure
+- M4: velocity recorded BEFORE economy enforcement for accurate pricing
+- Nonce replay prevention on spending UCANs
+
 ## Recurring Patterns
 - TOCTOU races in check-then-act patterns (nonce replay, standing channels, budget)
 - Missing zeroization on crypto key material
