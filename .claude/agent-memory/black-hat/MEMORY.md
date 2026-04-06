@@ -96,6 +96,7 @@ Notes:
 ## Patterns Confirmed Working (PR #127)
 - Broadcast key isolation per author sound (AES-256-GCM, random nonces)
 - Epoch overflow protection at u64::MAX
+- Sender key epoch poisoning: LOW (downgraded from HIGH). HPKE seal binds (ctx_id, sender_did, epoch) AAD to recipient wrapping key; process_incoming_sender_key enforces response.sender_did == claimed_sender. Cross-member poisoning structurally impossible — only self-DoS or compromised-sender. MAX_EPOCH_ADVANCE=1000 kept belt-and-braces; see threat-model comment in provider.rs process_incoming_sender_key (branch fix/epoch-poisoning-doc).
 - Key material Debug redaction across all bridges
 - scp-core 11-step UCAN pipeline thorough when invoked (NAPI/UniFFI/PyO3)
 - NAPI TLS enforcement (rejects ws://)

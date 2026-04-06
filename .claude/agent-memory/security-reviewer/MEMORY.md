@@ -195,7 +195,7 @@
 - FIXED: buffer event timestamp bounds (M18) -- 1h past + 5s future tolerance
 - FIXED: E2eCryptoProvider now uses real epoch/sequence (was hardcoded 0/0)
 - FIXED: recv-side sequence tracking added (per-sender epoch/seq monotonicity)
-- FIXED: epoch poisoning defense (MAX_EPOCH_ADVANCE=1000)
+- FIXED: epoch poisoning defense (MAX_EPOCH_ADVANCE=1000) -- severity LOW not HIGH: HPKE AAD binding + sender_did equality check make cross-member poisoning structurally impossible; defense is belt-and-braces for self-DoS / compromised-sender only. See provider.rs threat-model comment (fix/epoch-poisoning-doc).
 - FIXED: asymmetric access key freshness (past=300s, future=30s)
 - MEDIUM REMAINING: E2eCryptoProvider::open missing management payload 64KiB size check (production has it)
 - MEDIUM REMAINING: mls_encrypt_management has no send-side size check (only recv-side enforced)

@@ -48,7 +48,7 @@ After commit 54b8096 ("close 6 remaining gaps"), reassessed all chains.
 - **RED-504 (MEDIUM)**: Buffer capacity > 3601 causes timestamp estimation to exceed 3600s bounds, silently dropping valid events. Governance evasion in large-buffer contexts. Fix: clamp estimation range.
 - **RED-505 (LOW)**: 300s freshness window for access key requests. Replay harmless due to HPKE wrapping to requester's pubkey.
 - Controls that hold: MLS credential binding, SCPM collision resistance, epoch monotonicity on sender key store, random GCM nonces, HPKE key wrapping.
-- **RED-601 (LOW)**: Epoch ratcheting 999/step possible but infeasible to reach u64::MAX (~585M years). Check uses STORED epoch. Defense holds.
+- **RED-601 (LOW)**: Epoch ratcheting 999/step possible but infeasible to reach u64::MAX (~585M years). Check uses STORED epoch. Defense holds. Also confirmed LOW for cross-member poisoning: HPKE AAD (ctx_id, sender_did, epoch) + sender_did equality check make it structurally impossible; only self-DoS / compromised sender. See provider.rs threat-model comment (fix/epoch-poisoning-doc).
 - **RED-602 (LOW)**: Post-snapshot empty recv_sequence_tracker. MLS primary replay protection survives restore. Belt-and-suspenders only.
 - **RED-603 (LOW)**: Asymmetric freshness (300s past/30s future) is sound. Pre-existing gap: NonceDedup not wired for access keys.
 - **RED-606 (MEDIUM)**: E2eCryptoProvider missing epoch poisoning, recv_tracker, mgmt size limit. New defenses untested in integration.

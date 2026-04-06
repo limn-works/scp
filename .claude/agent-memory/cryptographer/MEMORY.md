@@ -156,6 +156,12 @@
 - [u8;16] nonce fields lack serde_bytes (integer array in msgpack, not binary blob) -- wire format interop risk
 - Block notification future-timestamp rejection added but no dedicated test for that code path
 
+### Sender key epoch poisoning defense (2026-04-06)
+- Reviewed MAX_EPOCH_ADVANCE=1000 check in crypto/mls/provider.rs process_incoming_sender_key.
+- Downgraded from HIGH to LOW: cross-member poisoning is structurally impossible because the HPKE seal binds (context_id, sender_did, epoch) as AAD to the recipient's wrapping pubkey AND process_incoming_sender_key enforces response.sender_did == claimed_sender_did. Only a compromised sender (strictly stronger capability) or self-DoS can reach the store.
+- MAX_EPOCH_ADVANCE=1000 retained belt-and-braces against future HPKE-layer or sender_did-check regressions.
+- Threat-model comment added to provider.rs; doc comment added on MAX_EPOCH_ADVANCE constant. Branch fix/epoch-poisoning-doc.
+
 ### White Paper Crypto Review (2026-03-09)
 - Reviewed .docs/white-paper.md against specs. Substantially correct, no construction flaws.
 - MEDIUM: Paper omits that MLS ciphersuite uses AES-128-GCM (not 256). System security bounded at 128-bit.

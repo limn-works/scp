@@ -41,7 +41,19 @@ use scp_protocol::crypto::sender_keys::{
 };
 
 /// Maximum allowed epoch advance in a single sender key distribution.
-/// Prevents epoch poisoning attacks where an attacker sets `epoch=u64::MAX`.
+///
+/// This is a belt-and-braces defense against a *self-DoS* scenario where the
+/// legitimate sender (or a sender whose long-term keys are compromised)
+/// publishes a sender key response with `epoch = u64::MAX`, which would
+/// permanently block future key rotations via the epoch monotonicity check
+/// in `SenderKeyStore::set_checked`.
+///
+/// It is **not** a defense against cross-member epoch poisoning: such an
+/// attack is structurally impossible because sender key responses are
+/// HPKE-sealed to the recipient's wrapping key with `(context_id,
+/// sender_did, epoch)` bound as AAD, and `process_incoming_sender_key`
+/// additionally enforces `response.sender_did == claimed_sender_did`. See
+/// the threat model comment in that function for the full argument.
 const MAX_EPOCH_ADVANCE: u64 = 1000;
 
 // ---------------------------------------------------------------------------
@@ -855,9 +867,43 @@ impl ContextCryptoProvider for MlsCryptoProvider {
                     ContextError::CryptoFailed("no MLS group for this context".to_string())
                 })?;
 
-                // Epoch poisoning defense: reject sender keys with unreasonably
-                // high epoch values. An attacker could set epoch=u64::MAX to
-                // permanently block future key rotations via epoch monotonicity.
+                // Epoch poisoning defense (#1608).
+                //
+                // Threat model: a `SenderKeyDistributionMessage::KeyResponse`
+                // could carry `epoch = u64::MAX`, which — via the epoch
+                // monotonicity check in `SenderKeyStore::set_checked` —
+                // would permanently block future key rotations for this
+                // (context, sender) pair.
+                //
+                // Why cross-member poisoning is structurally impossible:
+                //
+                //   1. The response body is HPKE-sealed to *this recipient's*
+                //      wrapping public key. The AAD binds `(context_id,
+                //      response.sender_did, response.epoch)`, so only a
+                //      party that knows the sender's long-term signing/
+                //      wrapping material can produce a ciphertext that
+                //      `hpke_open_sender_key` will successfully open above
+                //      (see lines ~832-840).
+                //
+                //   2. After the open succeeds, we additionally enforce
+                //      `response.sender_did == sender_did` (the DID claimed
+                //      by the caller), so a third party cannot coerce the
+                //      recipient into attributing a poisoned epoch to a
+                //      different member (see lines ~843-847).
+                //
+                //   3. Together, (1) and (2) mean the only actors who can
+                //      reach this point with an attacker-chosen epoch are:
+                //      (a) the legitimate sender performing self-DoS, or
+                //      (b) an attacker who has already compromised the
+                //      sender's keys — in which case epoch poisoning is
+                //      strictly less damaging than the capabilities they
+                //      already possess.
+                //
+                // The `MAX_EPOCH_ADVANCE` bound is therefore a *self-DoS*
+                // mitigation, not a cross-member defense. It is kept as
+                // belt-and-braces so that bugs in the HPKE layer or the
+                // sender_did equality check above cannot be escalated into
+                // permanent rotation lock-out.
                 let current_epoch = state.sender_key_store.epoch(&ctx_id_hex, sender_did);
                 if response.epoch > current_epoch.saturating_add(MAX_EPOCH_ADVANCE) {
                     return Err(ContextError::CryptoFailed(
