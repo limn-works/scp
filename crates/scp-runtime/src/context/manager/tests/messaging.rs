@@ -1620,6 +1620,7 @@ fn dynamic_pricing_adjusts_relay_cost() {
         max_change_per_mille: 125,
         floor: Amount(100),
         cap: Amount(10000),
+        target_capacity_per_window: None,
     };
 
     let low = adjust_relay_price(&config, 20);

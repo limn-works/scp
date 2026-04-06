@@ -5974,6 +5974,7 @@ fn dynamic_pricing_adjusts_on_utilization() {
         max_change_per_mille: 125,
         floor: Amount(100),
         cap: Amount(10000),
+        target_capacity_per_window: None,
     };
 
     // Low utilization: price should decrease.
@@ -9044,6 +9045,7 @@ async fn test_dynamic_pricing_varies_with_utilization() {
         max_change_per_mille: 125, // 12.5%
         floor: Amount::new(100),
         cap: Amount::new(10000),
+        target_capacity_per_window: None,
     };
 
     let low = adjust_relay_price(&config, 10);
@@ -12363,6 +12365,10 @@ async fn relay_pricing_adjusts_on_send() {
             max_change_per_mille: 125,
             floor: Amount(100),
             cap: Amount(10_000),
+            // Target 100 messages/window so a single-message send produces a
+            // well-defined utilization signal (1% of capacity, far below the
+            // 50% target → price should decrease).
+            target_capacity_per_window: Some(100),
         });
     }
 
@@ -12399,7 +12405,8 @@ async fn relay_pricing_adjusts_on_send() {
             .unwrap()
             .current_base_price
     };
-    // With 1 member, utilization_pct = 1, target = 50, delta = 49% below target.
+    // velocity=1, target_capacity=100 → utilization_pct = 1,
+    // target_utilization = 50, delta = 49% below target.
     // max_change = 1000 * 125 / 1000 = 125
     // proportional = 125 * 49 / 100 = 61
     // new price = 1000 - 61 = 939
@@ -12467,6 +12474,172 @@ async fn relay_pricing_noop_when_config_none() {
     assert!(
         result.is_ok(),
         "send should succeed without relay pricing: {result:?}"
+    );
+}
+
+// -----------------------------------------------------------------------
+// §68b. Dynamic adjustment disabled when target_capacity_per_window is None
+// -----------------------------------------------------------------------
+
+/// Regression guard for item #7: when `target_capacity_per_window` is `None`,
+/// the EIP-1559 controller must not touch `current_base_price`. Previously the
+/// runtime fed raw `aggregate_velocity` into `adjust_relay_price` as a percent,
+/// which produced meaningless adjustments even when governance had not opted
+/// into dynamic pricing.
+#[tokio::test]
+async fn relay_pricing_frozen_when_target_capacity_is_none() {
+    use scp_protocol::economy::pricing::RelayPricingConfig;
+    use scp_protocol::economy::types::Amount;
+
+    let manager = ContextManager::new(
+        Box::new(MockCrypto::default()),
+        Box::new(MockTransport::connected()),
+        Box::new(MockEventLog::default()),
+        noop_key_resolver(),
+    );
+
+    let params = governance_params();
+    let _handle = manager
+        .create_context("frozen-price-ctx".into(), params, "did:key:sender".into())
+        .await
+        .unwrap();
+
+    // Install a config with target_capacity_per_window = None → dynamic
+    // pricing controller must be a no-op even though a config exists.
+    {
+        let mut contexts = manager.contexts.lock().await;
+        let ctx = contexts.get_mut("frozen-price-ctx").unwrap();
+        ctx.governance.relay_pricing_config = Some(RelayPricingConfig {
+            target_utilization_pct: 50,
+            current_base_price: Amount(2_500),
+            max_change_per_mille: 125,
+            floor: Amount(1),
+            cap: Amount(10_000),
+            target_capacity_per_window: None,
+        });
+    }
+
+    let sk = ed25519_dalek::SigningKey::from_bytes(&[2u8; 32]);
+    let handle = manager
+        .contexts
+        .lock()
+        .await
+        .get("frozen-price-ctx")
+        .unwrap()
+        .handle
+        .clone();
+
+    // Several sends — each invokes maybe_adjust_relay_pricing.
+    for i in 0..5 {
+        manager
+            .send_message(
+                &handle,
+                &"did:key:sender".into(),
+                format!("frozen-{i}").as_bytes(),
+                Some(&sk),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+    }
+
+    let price = {
+        let contexts = manager.contexts.lock().await;
+        let ctx = contexts.get("frozen-price-ctx").unwrap();
+        ctx.governance
+            .relay_pricing_config
+            .as_ref()
+            .unwrap()
+            .current_base_price
+    };
+    assert_eq!(
+        price,
+        Amount(2_500),
+        "base price must stay frozen when target_capacity_per_window is None"
+    );
+}
+
+// -----------------------------------------------------------------------
+// §68c. Dynamic adjustment moves price when target_capacity_per_window is set
+// -----------------------------------------------------------------------
+
+/// With `target_capacity_per_window = Some(n)`, sends must produce a
+/// meaningful utilization signal. Counterpart to `relay_pricing_adjusts_on_send`
+/// but exercises the new wiring explicitly at the runtime layer: a burst of
+/// sends with a small target pushes velocity above `target_utilization_pct` and
+/// therefore increases the price.
+#[tokio::test]
+async fn relay_pricing_moves_price_when_target_capacity_set() {
+    use scp_protocol::economy::pricing::RelayPricingConfig;
+    use scp_protocol::economy::types::Amount;
+
+    let manager = ContextManager::new(
+        Box::new(MockCrypto::default()),
+        Box::new(MockTransport::connected()),
+        Box::new(MockEventLog::default()),
+        noop_key_resolver(),
+    );
+
+    let params = governance_params();
+    let _handle = manager
+        .create_context("target-price-ctx".into(), params, "did:key:sender".into())
+        .await
+        .unwrap();
+
+    // target_capacity_per_window = 2 → after two sends we're at 100%
+    // utilization (well above target_utilization_pct=50), so price should
+    // increase.
+    {
+        let mut contexts = manager.contexts.lock().await;
+        let ctx = contexts.get_mut("target-price-ctx").unwrap();
+        ctx.governance.relay_pricing_config = Some(RelayPricingConfig {
+            target_utilization_pct: 50,
+            current_base_price: Amount(1_000),
+            max_change_per_mille: 125,
+            floor: Amount(1),
+            cap: Amount(10_000),
+            target_capacity_per_window: Some(2),
+        });
+    }
+
+    let sk = ed25519_dalek::SigningKey::from_bytes(&[3u8; 32]);
+    let handle = manager
+        .contexts
+        .lock()
+        .await
+        .get("target-price-ctx")
+        .unwrap()
+        .handle
+        .clone();
+
+    // Send four messages so velocity >> target capacity → price increases.
+    for i in 0..4 {
+        manager
+            .send_message(
+                &handle,
+                &"did:key:sender".into(),
+                format!("burst-{i}").as_bytes(),
+                Some(&sk),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+    }
+
+    let price = {
+        let contexts = manager.contexts.lock().await;
+        let ctx = contexts.get("target-price-ctx").unwrap();
+        ctx.governance
+            .relay_pricing_config
+            .as_ref()
+            .unwrap()
+            .current_base_price
+    };
+    assert!(
+        price > Amount(1_000),
+        "burst above target_capacity should push price above starting 1000, got {price:?}"
     );
 }
 

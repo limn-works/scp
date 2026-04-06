@@ -54,25 +54,49 @@ fn enforce_send_economy(
 
 /// Updates the relay base price based on current context utilization (#1537).
 ///
-/// Called periodically (on message send) to adjust the EIP-1559-style relay
-/// price. Uses member count as a proxy for utilization. Only applies when the
-/// context has a relay pricing config in its governance state.
+/// Called periodically (on message send) to drive the EIP-1559-style relay
+/// price controller. Dynamic adjustment runs only when the context has a
+/// relay pricing config AND that config has an explicit
+/// `target_capacity_per_window` (the inflection point of the pricing curve).
+/// When the target is `None`, pricing stays static at whatever
+/// `current_base_price` governance set.
+///
+/// Utilization is computed as
+/// `min(100, aggregate_velocity * 100 / target_capacity_per_window)` —
+/// the raw message count in the velocity window, normalized against the
+/// configured target capacity, and clamped to the 0..=100 range that
+/// `adjust_relay_price` expects. This replaces the previous behavior which
+/// passed the raw message count straight to `adjust_relay_price` and thus
+/// never produced a meaningful utilization signal.
 fn maybe_adjust_relay_pricing(ctx: &mut PerContextState, now: u64) {
-    if let Some(ref mut config) = ctx.governance.relay_pricing_config {
-        // Use aggregate velocity (messages/window across all senders) as a
-        // utilization proxy instead of raw member count. This better reflects
-        // actual load on the relay and makes pricing responsive to traffic
-        // patterns rather than static membership.
-        let utilization_pct = ctx
-            .governance
-            .velocity_tracker
-            .aggregate_velocity(now)
-            .min(100);
-        let adjustment =
-            scp_protocol::economy::pricing::adjust_relay_price(config, utilization_pct);
-        // Apply the new base price back to the config.
-        config.current_base_price = adjustment.new_base_price;
+    let Some(ref mut config) = ctx.governance.relay_pricing_config else {
+        return;
+    };
+    // Dynamic adjustment is opt-in per context. A `None` target means the
+    // controller does not run — `current_base_price` stays as set by
+    // governance. This mirrors the documented semantics on
+    // `RelayPricingConfig::target_capacity_per_window`.
+    let Some(target) = config.target_capacity_per_window else {
+        return;
+    };
+    // `RelayPricingConfig::validate` rejects `Some(0)`; defense-in-depth
+    // guard here ensures we never divide by zero even if an unvalidated
+    // config slipped through.
+    if target == 0 {
+        return;
     }
+    let velocity = ctx.governance.velocity_tracker.aggregate_velocity(now);
+    // Saturating multiplication + integer division, then clamp to 100.
+    // `target` is `u32` (widened to u64 for the division) so the denominator
+    // is always representable and nonzero per the guard above.
+    let utilization_pct = velocity
+        .saturating_mul(100)
+        .checked_div(u64::from(target))
+        .unwrap_or(0)
+        .min(100);
+    let adjustment = scp_protocol::economy::pricing::adjust_relay_price(config, utilization_pct);
+    // Apply the new base price back to the config.
+    config.current_base_price = adjustment.new_base_price;
 }
 
 /// Re-export of the protocol-level domain-separated routing ID derivation.

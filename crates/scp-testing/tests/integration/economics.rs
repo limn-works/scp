@@ -429,6 +429,7 @@ async fn relay_pricing_adjustment() {
         max_change_per_mille: 125, // 12.5%
         floor: Amount::new(100),
         cap: Amount::new(10_000),
+        target_capacity_per_window: None,
     };
 
     // Above target: price increases.
@@ -459,6 +460,7 @@ async fn relay_pricing_adjustment() {
         max_change_per_mille: config.max_change_per_mille,
         floor: config.floor,
         cap: config.cap,
+        target_capacity_per_window: config.target_capacity_per_window,
     };
     let result_cap = adjust_relay_price(&high_config, 100);
     assert!(result_cap.new_base_price <= Amount::new(10_000));
@@ -470,6 +472,7 @@ async fn relay_pricing_adjustment() {
         target_utilization_pct: config.target_utilization_pct,
         floor: config.floor,
         cap: config.cap,
+        target_capacity_per_window: config.target_capacity_per_window,
     };
     let result_floor = adjust_relay_price(&low_config, 0);
     assert!(result_floor.new_base_price >= Amount::new(100));

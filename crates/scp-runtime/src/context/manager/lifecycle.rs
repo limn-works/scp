@@ -113,6 +113,12 @@ fn post_join_bookkeeping(
 ///
 /// The defaults mirror EIP-1559: 50% target utilization, 12.5% max change,
 /// with floor = 1 and cap = 10x the per-message cost.
+///
+/// `target_capacity_per_window` is seeded with a sensible default (100 messages
+/// per velocity window) so dynamic adjustment is active out of the box. A
+/// context can always override this via a governance proposal that updates
+/// the relay pricing config — set to `None` to freeze the base price or to a
+/// different value to move the inflection point.
 fn derive_relay_pricing_config(
     economic_policy: Option<&scp_protocol::economy::types::EconomicPolicy>,
 ) -> Option<scp_protocol::economy::pricing::RelayPricingConfig> {
@@ -128,6 +134,9 @@ fn derive_relay_pricing_config(
         max_change_per_mille: 125, // 12.5% per EIP-1559
         floor: scp_protocol::economy::types::Amount::new(1),
         cap: scp_protocol::economy::types::Amount::new(base_price.0.saturating_mul(10)),
+        // Default inflection point: 100 messages per velocity window.
+        // Governance can change this at any time.
+        target_capacity_per_window: Some(100),
     })
 }
 

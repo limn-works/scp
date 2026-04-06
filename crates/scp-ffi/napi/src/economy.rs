@@ -201,6 +201,9 @@ pub fn economy_adjust_relay_price(
 ) -> napi::Result<NapiRelayPriceAdjustment> {
     let config: scp_core::economy::RelayPricingConfig = serde_json::from_str(&config_json)
         .map_err(|e| validation_error(&format!("invalid relay pricing config JSON: {e}")))?;
+    config
+        .validate()
+        .map_err(|e| validation_error(&e.to_string()))?;
 
     #[allow(clippy::cast_sign_loss)]
     let result = scp_core::economy::adjust_relay_price(&config, actual_utilization_pct as u64);

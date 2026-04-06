@@ -58,6 +58,58 @@ pub struct RelayPricingConfig {
 
     /// Maximum price (cap). Price cannot increase above this value.
     pub cap: Amount,
+
+    /// EIP-1559 anchor: the messages-per-velocity-window count at which the
+    /// relay base price stays neutral. This is the **inflection point** of the
+    /// dynamic pricing curve, not a hard cap or a rate limit — traffic above
+    /// this value pushes price up, traffic below pushes price down.
+    ///
+    /// Semantics:
+    /// - `None` — dynamic pricing adjustment is disabled. The runtime controller
+    ///   will not modify `current_base_price`; it stays as set by governance.
+    /// - `Some(n)` with `n > 0` — utilization percent is computed as
+    ///   `min(100, velocity * 100 / n)` and fed into [`adjust_relay_price`].
+    /// - `Some(0)` — invalid; rejected by [`RelayPricingConfig::validate`] to
+    ///   prevent division by zero in the controller.
+    ///
+    /// This value can be changed at any time by a governance proposal that
+    /// updates the relay pricing config. It defaults to `None` so pre-existing
+    /// serialized configs (which never had this field) deserialize cleanly and
+    /// leave pricing static until governance opts in.
+    #[serde(default)]
+    pub target_capacity_per_window: Option<u32>,
+}
+
+/// Errors from [`RelayPricingConfig::validate`].
+#[derive(Debug, Clone, thiserror::Error, PartialEq, Eq)]
+pub enum RelayPricingConfigError {
+    /// `target_capacity_per_window` was `Some(0)`, which would divide by zero
+    /// in the pricing controller. Use `None` to disable dynamic pricing, or a
+    /// positive value to set the inflection point.
+    #[error(
+        "SCP-ECON-7051: RelayPricingConfig.target_capacity_per_window must be > 0 if set; use None to disable dynamic pricing"
+    )]
+    ZeroTargetCapacity,
+}
+
+impl RelayPricingConfig {
+    /// Validates the configuration. Currently checks that
+    /// `target_capacity_per_window`, if set, is strictly positive.
+    ///
+    /// Callers that accept a `RelayPricingConfig` from an untrusted source
+    /// (FFI bridges, governance proposals, persisted state) MUST invoke this
+    /// before installing the config.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RelayPricingConfigError::ZeroTargetCapacity`] if
+    /// `target_capacity_per_window` is `Some(0)`.
+    pub const fn validate(&self) -> Result<(), RelayPricingConfigError> {
+        match self.target_capacity_per_window {
+            Some(0) => Err(RelayPricingConfigError::ZeroTargetCapacity),
+            _ => Ok(()),
+        }
+    }
 }
 
 /// Result of an EIP-1559-style relay price adjustment.
@@ -529,6 +581,7 @@ mod tests {
             max_change_per_mille: 125, // 12.5%
             floor: Amount(100),
             cap: Amount(10_000),
+            target_capacity_per_window: None,
         };
 
         // 80% utilization (30% above target)
@@ -548,6 +601,7 @@ mod tests {
             max_change_per_mille: 125,
             floor: Amount(100),
             cap: Amount(10_000),
+            target_capacity_per_window: None,
         };
 
         // 20% utilization (30% below target)
@@ -566,6 +620,7 @@ mod tests {
             max_change_per_mille: 125,
             floor: Amount(100),
             cap: Amount(10_000),
+            target_capacity_per_window: None,
         };
 
         let result = adjust_relay_price(&config, 50);
@@ -581,6 +636,7 @@ mod tests {
             max_change_per_mille: 125,
             floor: Amount(100),
             cap: Amount(10_000),
+            target_capacity_per_window: None,
         };
 
         // 100% utilization -> max increase
@@ -599,6 +655,7 @@ mod tests {
             max_change_per_mille: 125,
             floor: Amount(100),
             cap: Amount(10_000),
+            target_capacity_per_window: None,
         };
 
         // 0% utilization -> max decrease
@@ -617,6 +674,7 @@ mod tests {
             max_change_per_mille: 500, // 50% max change
             floor: Amount(100),
             cap: Amount(10_000),
+            target_capacity_per_window: None,
         };
 
         // 0% utilization -> large decrease
@@ -635,6 +693,7 @@ mod tests {
             max_change_per_mille: 125,
             floor: Amount(100),
             cap: Amount(10_000),
+            target_capacity_per_window: None,
         };
 
         // 200% utilization (extreme over-target) -> clamped to max_change
@@ -792,10 +851,76 @@ mod tests {
             max_change_per_mille: 125,
             floor: Amount(100),
             cap: Amount(10_000),
+            target_capacity_per_window: Some(250),
         };
 
         let json = serde_json::to_string(&config).unwrap();
         let deserialized: RelayPricingConfig = serde_json::from_str(&json).unwrap();
         assert_eq!(config, deserialized);
+    }
+
+    // =======================================================================
+    // target_capacity_per_window: serde default + validation
+    // =======================================================================
+
+    #[test]
+    fn relay_pricing_config_target_capacity_defaults_to_none_when_missing() {
+        // Pre-existing persisted configs (before target_capacity_per_window
+        // existed) must deserialize cleanly with None so dynamic pricing is
+        // off by default until governance opts in.
+        let json = r#"{
+            "target_utilization_pct": 50,
+            "current_base_price": 1000,
+            "max_change_per_mille": 125,
+            "floor": 100,
+            "cap": 10000
+        }"#;
+        let cfg: RelayPricingConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(cfg.target_capacity_per_window, None);
+        assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn relay_pricing_config_validate_rejects_zero_target_capacity() {
+        // A zero target would divide by zero in the runtime controller.
+        let cfg = RelayPricingConfig {
+            target_utilization_pct: 50,
+            current_base_price: Amount(1000),
+            max_change_per_mille: 125,
+            floor: Amount(100),
+            cap: Amount(10_000),
+            target_capacity_per_window: Some(0),
+        };
+        assert_eq!(
+            cfg.validate().unwrap_err(),
+            RelayPricingConfigError::ZeroTargetCapacity
+        );
+    }
+
+    #[test]
+    fn relay_pricing_config_validate_accepts_none_target_capacity() {
+        // None means dynamic pricing is disabled — always valid.
+        let cfg = RelayPricingConfig {
+            target_utilization_pct: 50,
+            current_base_price: Amount(1000),
+            max_change_per_mille: 125,
+            floor: Amount(100),
+            cap: Amount(10_000),
+            target_capacity_per_window: None,
+        };
+        assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn relay_pricing_config_validate_accepts_positive_target_capacity() {
+        let cfg = RelayPricingConfig {
+            target_utilization_pct: 50,
+            current_base_price: Amount(1000),
+            max_change_per_mille: 125,
+            floor: Amount(100),
+            cap: Amount(10_000),
+            target_capacity_per_window: Some(1),
+        };
+        assert!(cfg.validate().is_ok());
     }
 }

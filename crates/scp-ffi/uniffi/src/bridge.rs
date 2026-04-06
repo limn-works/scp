@@ -12356,6 +12356,10 @@ pub fn economy_adjust_relay_price(
             msg: format!("invalid relay pricing config JSON: {e}"),
             code: "SCP-VALID-7050".to_owned(),
         })?;
+    config.validate().map_err(|e| ScpError::Validation {
+        msg: e.to_string(),
+        code: "SCP-ECON-7051".to_owned(),
+    })?;
     let result = scp_core::economy::adjust_relay_price(&config, actual_utilization_pct);
     let direction = match result.direction {
         scp_core::economy::PriceDirection::Increased => "Increased",

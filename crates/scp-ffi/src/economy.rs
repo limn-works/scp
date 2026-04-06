@@ -276,6 +276,9 @@ pub fn py_economy_adjust_relay_price(
                 "failed to parse relay pricing config JSON: {e}"
             ))
         })?;
+    config
+        .validate()
+        .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
 
     let result = scp_core::economy::adjust_relay_price(&config, actual_utilization_pct);
 
