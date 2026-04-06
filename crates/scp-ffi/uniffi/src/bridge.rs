@@ -6959,6 +6959,13 @@ pub async fn governance_execute(
         .spawn(async move {
             let proposal: scp_core::context::governance::GovernanceProposal =
                 serde_json::from_str(&proposal_json)?;
+            // Defense-in-depth: validate user-controlled string fields at the
+            // FFI boundary before the action reaches the ContextManager (#1601).
+            scp_ffi_common::validate::validate_governance_action_strings(&proposal.action)
+                .map_err(|e| ScpError::Validation {
+                    msg: e.message,
+                    code: "SCP-VALID-7000".to_owned(),
+                })?;
             let action_name = proposal.action.variant_name();
             let manager = crate::runtime::context_manager()?;
             let result = manager
@@ -7129,6 +7136,14 @@ pub async fn governance_propose(
         .spawn(async move {
             let action: scp_core::context::governance::GovernanceAction =
                 serde_json::from_str(&action_json)?;
+            // Defense-in-depth: validate user-controlled string fields at the
+            // FFI boundary before the action reaches the ContextManager (#1601).
+            scp_ffi_common::validate::validate_governance_action_strings(&action).map_err(
+                |e| ScpError::Validation {
+                    msg: e.message,
+                    code: "SCP-CTX-2041".to_owned(),
+                },
+            )?;
             let action_name = action.variant_name();
             let did = scp_identity::DID(proposer_did);
             let manager = crate::runtime::context_manager()?;

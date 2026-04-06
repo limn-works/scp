@@ -702,10 +702,10 @@ pub fn context_execute_governance(
             .into_js()
         })?;
 
-        validate_governance_action_strings(&action).map_err(|e| {
+        scp_ffi_common::validate::validate_governance_action_strings(&action).map_err(|e| {
             ScpWasmError::Validation {
-                message: format!("{e}"),
-                code: "SCP-CTX-2040".to_owned(),
+                message: e.message,
+                code: "SCP-VALID-7000".to_owned(),
             }
             .into_js()
         })?;
@@ -785,9 +785,9 @@ pub fn context_governance_propose(
             .into_js()
         })?;
 
-        validate_governance_action_strings(&action).map_err(|e| {
+        scp_ffi_common::validate::validate_governance_action_strings(&action).map_err(|e| {
             ScpWasmError::Validation {
-                message: format!("{e}"),
+                message: e.message,
                 code: "SCP-CTX-2040".to_owned(),
             }
             .into_js()
