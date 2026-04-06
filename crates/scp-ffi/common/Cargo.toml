@@ -22,6 +22,7 @@ server = ["dep:scp-transport", "dep:scp-node", "dep:scp-platform", "dep:scp-iden
 
 [dependencies]
 scp-core = { path = "../../scp-core", optional = true }
+scp-protocol = { path = "../../scp-protocol" }
 scp-primitives = { path = "../../scp-primitives" }
 scp-protocol = { path = "../../scp-protocol" }
 scp-event-log = { path = "../../scp-event-log", optional = true }
