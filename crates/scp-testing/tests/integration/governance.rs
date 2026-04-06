@@ -15,10 +15,10 @@ use scp_core::context::governance::timeout::{
 };
 use scp_core::context::governance::unanimity::UnanimityEngine;
 use scp_core::context::governance::{
-    ConflictResolution, DeadlockJustification, GovernanceAction, GovernanceContext,
+    AccessScope, ConflictResolution, DeadlockJustification, GovernanceAction, GovernanceContext,
     GovernanceEngine, GovernanceError, GovernanceEvent, GovernanceReconfigAction, KeyResolver,
-    ProposalStatus, PruningPolicy, AccessScope, SingleAdminEngine, VoteType, actions_conflict,
-    sign_vote, verify_vote,
+    ProposalStatus, PruningPolicy, SingleAdminEngine, VoteType, actions_conflict, sign_vote,
+    verify_vote,
 };
 use scp_core::context::params::{Capability, ContextParams};
 use scp_core::context::tools::ToolSchema;
@@ -174,7 +174,10 @@ fn all_governance_actions_for_test() -> Vec<GovernanceAction> {
             did: bob(),
             access: AccessScope::Read,
         },
-        GovernanceAction::RestoreAccess { did: bob(), capabilities: vec![Capability::MessagesRead] },
+        GovernanceAction::RestoreAccess {
+            did: bob(),
+            capabilities: vec![Capability::MessagesRead],
+        },
         GovernanceAction::ModifyPruningPolicy {
             new_policy: PruningPolicy::default(),
         },
@@ -200,7 +203,10 @@ fn all_governance_actions_for_test() -> Vec<GovernanceAction> {
             did: bob(),
             access: AccessScope::Write,
         },
-        GovernanceAction::RestoreAccess { did: bob(), capabilities: vec![Capability::MessagesWrite] },
+        GovernanceAction::RestoreAccess {
+            did: bob(),
+            capabilities: vec![Capability::MessagesWrite],
+        },
         GovernanceAction::RotateContentKeys {
             reason: Some("periodic hygiene".to_owned()),
         },
@@ -859,7 +865,10 @@ async fn conflict_detection() {
         did: bob(),
         access: AccessScope::Read,
     };
-    let restore = GovernanceAction::RestoreAccess { did: bob(), capabilities: vec![Capability::MessagesRead] };
+    let restore = GovernanceAction::RestoreAccess {
+        did: bob(),
+        capabilities: vec![Capability::MessagesRead],
+    };
     assert!(
         actions_conflict(&revoke, &alice(), &restore, &carol()),
         "Revoke (read) vs RestoreAccess (read) should conflict"
@@ -870,7 +879,10 @@ async fn conflict_detection() {
         did: bob(),
         access: AccessScope::Write,
     };
-    let restore_w = GovernanceAction::RestoreAccess { did: bob(), capabilities: vec![Capability::MessagesWrite] };
+    let restore_w = GovernanceAction::RestoreAccess {
+        did: bob(),
+        capabilities: vec![Capability::MessagesWrite],
+    };
     assert!(
         actions_conflict(&revoke_w, &alice(), &restore_w, &carol()),
         "Revoke (write) vs RestoreAccess (write) should conflict"
