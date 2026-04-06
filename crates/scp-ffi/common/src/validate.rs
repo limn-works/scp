@@ -253,7 +253,7 @@ pub fn validate_payment_adapter_ref(adapter_ref: &str) -> Result<(), ValidationE
 /// Called from every FFI bridge `governance_propose` / `governance_execute`
 /// entry point after JSON deserialization and before the action is handed
 /// to the runtime. Defense-in-depth against control-character injection,
-/// HTML / template injection, and length-based DoS in user-controlled fields.
+/// HTML / template injection, and length-based `DoS` in user-controlled fields.
 ///
 /// Covers role names, reason / purpose text, payment adapter refs, and
 /// nested string fields inside [`ContextParams`] and [`ToolRegistration`].
@@ -1311,7 +1311,7 @@ mod tests {
         let mut params = make_default_params();
         params.roles.push(RoleDefinition {
             name: "<bad>".to_owned(),
-            capabilities: Default::default(),
+            capabilities: std::collections::HashSet::default(),
         });
         let action = GovernanceAction::CreateChildContext {
             params: Box::new(params),

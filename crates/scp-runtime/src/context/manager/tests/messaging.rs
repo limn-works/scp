@@ -1568,7 +1568,9 @@ async fn velocity_consequence_trigger_on_send() {
     params.consequence_rules = vec![ConsequenceRule {
         trigger: ConsequenceTrigger::MessageVelocity,
         threshold: 1,
-        action: ConsequenceAction::Suspend { capabilities: vec!["write".to_owned()] },
+        action: ConsequenceAction::Suspend {
+            capabilities: vec!["write".to_owned()],
+        },
         window: Duration::from_secs(3600),
     }];
     let _handle = manager

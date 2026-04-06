@@ -2142,9 +2142,8 @@ fn py_governance_propose(
 
         // Defense-in-depth: validate user-controlled string fields at the FFI
         // boundary before the action reaches the ContextManager (#1601).
-        scp_ffi_common::validate::validate_governance_action_strings(&action).map_err(|e| {
-            PyValueError::new_err(format!("SCP-CTX-2040: {}", e.message))
-        })?;
+        scp_ffi_common::validate::validate_governance_action_strings(&action)
+            .map_err(|e| PyValueError::new_err(format!("SCP-CTX-2040: {}", e.message)))?;
 
         let action_name = action.variant_name();
 

@@ -33,7 +33,7 @@ pub struct ConsequenceValidationError(String);
 
 /// Maximum length for custom trigger keys and capability names.
 const MAX_CONSEQUENCE_STRING_LEN: usize = 256;
-use crate::context::roles::MAX_ROLE_NAME_LENGTH;
+use crate::context::roles::{Capability, MAX_ROLE_NAME_LENGTH};
 /// Maximum number of capabilities in a `Suspend` action.
 const MAX_CAPABILITY_SUSPENSION_COUNT: usize = 32;
 
@@ -42,16 +42,193 @@ const MAX_CAPABILITY_SUSPENSION_COUNT: usize = 32;
 /// control characters.
 const FORBIDDEN_CHARS: &str = "<>&\"'";
 
-/// Capability names recognized by enforcement. Only these have real gate
-/// semantics; accepting others gives a false sense of security.
-const VALID_SUSPENSION_CAPABILITIES: &[&str] = &[
-    "write",
-    "MessagesWrite",
-    "messages:write",
-    "read",
-    "MessagesRead",
+/// Canonical names + aliases for every unit variant of [`Capability`] that
+/// may be listed in a [`ConsequenceAction::Suspend`].
+///
+/// Parametric variants ([`Capability::ToolInvoke`], [`Capability::Custom`]) are
+/// **not** in this slice — they require a non-empty payload and are matched
+/// by [`parse_suspension_capability`] via prefix detection.
+///
+/// The variant coverage of this slice is enforced by
+/// [`canonical_suspension_capability_string`], which performs an exhaustive
+/// match over [`Capability`] (no `_` arm) so a new variant becomes a compile
+/// error here.
+///
+/// Aliases per variant:
+/// - **canonical user-facing name** from [`Capability::name`]
+///   (e.g. `"messages:write"`)
+/// - **Debug-style identifier** matching the Rust variant
+///   (e.g. `"MessagesWrite"`)
+/// - For [`Capability::MessagesRead`] / [`Capability::MessagesWrite`], the
+///   short forms `"read"` and `"write"` (legacy compatibility — pre-#1601
+///   rules in deployed contexts still use these).
+pub const VALID_SUSPENSION_CAPABILITIES: &[&str] = &[
+    // MessagesRead
     "messages:read",
+    "MessagesRead",
+    "read",
+    // MessagesWrite
+    "messages:write",
+    "MessagesWrite",
+    "write",
+    // ToolInvokeAll (the wildcard form of ToolInvoke)
+    "tool:invoke:*",
+    "ToolInvokeAll",
+    // ToolRegister
+    "tool:register",
+    "ToolRegister",
+    // MemberInvite
+    "member:invite",
+    "MemberInvite",
+    // MemberRemove
+    "member:remove",
+    "MemberRemove",
+    // RoleAssign
+    "role:assign",
+    "RoleAssign",
+    // GovernancePropose
+    "governance:propose",
+    "GovernancePropose",
+    // GovernanceVote
+    "governance:vote",
+    "GovernanceVote",
+    // ContextClose
+    "context:close",
+    "ContextClose",
+    // ChildContextCreate
+    "context:child:create",
+    "ChildContextCreate",
+    // ToolInterface
+    "tool:interface",
+    "ToolInterface",
+    // Bridging
+    "bridging",
+    "Bridging",
+    // MediaVoice
+    "media:voice",
+    "MediaVoice",
+    // MediaVideo
+    "media:video",
+    "MediaVideo",
+    // MediaScreenShare
+    "media:screen_share",
+    "MediaScreenShare",
+    // MemberBan
+    "member:ban",
+    "MemberBan",
+    // MetadataEdit
+    "metadata:edit",
+    "MetadataEdit",
 ];
+
+/// Returns a representative valid input string for `cap`.
+///
+/// **Compile-time exhaustiveness anchor.** This function exists solely so the
+/// compiler enforces that every variant of [`Capability`] is considered as a
+/// suspendable capability. The match has no `_` arm, so adding a new variant
+/// fails compilation here, forcing the author to:
+///
+/// 1. Update [`VALID_SUSPENSION_CAPABILITIES`] (for unit variants), or
+/// 2. Update [`parse_suspension_capability`] (for parametric variants), then
+/// 3. Add a returned representative string here.
+///
+/// The string returned for unit variants is the canonical
+/// [`Capability::name`] form. For parametric variants, a representative
+/// non-empty payload is returned (e.g. `tool:invoke:example_tool`,
+/// `custom:rate_limit_bypass`).
+#[allow(dead_code)] // Compile-time exhaustiveness anchor; exercised by tests.
+fn canonical_suspension_capability_string(cap: &Capability) -> String {
+    match cap {
+        Capability::MessagesRead => "messages:read".to_owned(),
+        Capability::MessagesWrite => "messages:write".to_owned(),
+        Capability::ToolInvoke(id) => format!("tool:invoke:{id}"),
+        Capability::ToolInvokeAll => "tool:invoke:*".to_owned(),
+        Capability::ToolRegister => "tool:register".to_owned(),
+        Capability::MemberInvite => "member:invite".to_owned(),
+        Capability::MemberRemove => "member:remove".to_owned(),
+        Capability::RoleAssign => "role:assign".to_owned(),
+        Capability::GovernancePropose => "governance:propose".to_owned(),
+        Capability::GovernanceVote => "governance:vote".to_owned(),
+        Capability::ContextClose => "context:close".to_owned(),
+        Capability::ChildContextCreate => "context:child:create".to_owned(),
+        Capability::ToolInterface => "tool:interface".to_owned(),
+        Capability::Bridging => "bridging".to_owned(),
+        Capability::MediaVoice => "media:voice".to_owned(),
+        Capability::MediaVideo => "media:video".to_owned(),
+        Capability::MediaScreenShare => "media:screen_share".to_owned(),
+        Capability::MemberBan => "member:ban".to_owned(),
+        Capability::MetadataEdit => "metadata:edit".to_owned(),
+        Capability::Custom(name) => format!("custom:{name}"),
+    }
+}
+
+/// Parses a suspension capability string into a typed [`Capability`].
+///
+/// Accepts every form listed in [`VALID_SUSPENSION_CAPABILITIES`] plus the
+/// parametric forms:
+///
+/// - `"tool:invoke:<tool_id>"` — any non-empty `<tool_id>` (excluding `*`,
+///   which maps to [`Capability::ToolInvokeAll`])
+/// - `"custom:<name>"` — any non-empty `<name>`
+///
+/// Returns `None` for unrecognized strings, empty parametric payloads, or
+/// for parametric strings with no payload (e.g. bare `"tool:invoke:"` or
+/// bare `"custom:"`).
+///
+/// Used by both validation ([`ConsequenceRule::validate`]) and enforcement
+/// (the runtime's `enforce_suspend` path) so the two layers cannot drift.
+#[must_use]
+#[allow(clippy::option_if_let_else)] // Nested if-let chain is clearer than map_or_else here.
+pub fn parse_suspension_capability(s: &str) -> Option<Capability> {
+    match s {
+        "messages:read" | "MessagesRead" | "read" => Some(Capability::MessagesRead),
+        "messages:write" | "MessagesWrite" | "write" => Some(Capability::MessagesWrite),
+        "tool:invoke:*" | "ToolInvokeAll" => Some(Capability::ToolInvokeAll),
+        "tool:register" | "ToolRegister" => Some(Capability::ToolRegister),
+        "member:invite" | "MemberInvite" => Some(Capability::MemberInvite),
+        "member:remove" | "MemberRemove" => Some(Capability::MemberRemove),
+        "role:assign" | "RoleAssign" => Some(Capability::RoleAssign),
+        "governance:propose" | "GovernancePropose" => Some(Capability::GovernancePropose),
+        "governance:vote" | "GovernanceVote" => Some(Capability::GovernanceVote),
+        "context:close" | "ContextClose" => Some(Capability::ContextClose),
+        "context:child:create" | "ChildContextCreate" => Some(Capability::ChildContextCreate),
+        "tool:interface" | "ToolInterface" => Some(Capability::ToolInterface),
+        "bridging" | "Bridging" => Some(Capability::Bridging),
+        "media:voice" | "MediaVoice" => Some(Capability::MediaVoice),
+        "media:video" | "MediaVideo" => Some(Capability::MediaVideo),
+        "media:screen_share" | "MediaScreenShare" => Some(Capability::MediaScreenShare),
+        "member:ban" | "MemberBan" => Some(Capability::MemberBan),
+        "metadata:edit" | "MetadataEdit" => Some(Capability::MetadataEdit),
+        other => {
+            if let Some(tail) = other.strip_prefix("tool:invoke:") {
+                if tail.is_empty() {
+                    None
+                } else if tail == "*" {
+                    Some(Capability::ToolInvokeAll)
+                } else {
+                    Some(Capability::ToolInvoke(tail.to_owned()))
+                }
+            } else if let Some(name) = other.strip_prefix("custom:") {
+                if name.is_empty() {
+                    None
+                } else {
+                    Some(Capability::Custom(name.to_owned()))
+                }
+            } else {
+                None
+            }
+        }
+    }
+}
+
+/// Returns true if `s` names a suspendable capability.
+///
+/// Wraps [`parse_suspension_capability`] for callers that need only the
+/// boolean answer (e.g. validation paths).
+#[must_use]
+pub fn is_valid_suspension_capability(s: &str) -> bool {
+    parse_suspension_capability(s).is_some()
+}
 
 /// Validates a user-supplied string field in a [`ConsequenceRule`].
 ///
@@ -234,10 +411,11 @@ impl ConsequenceRule {
                         &format!("Suspend[{i}]"),
                         MAX_CONSEQUENCE_STRING_LEN,
                     )?;
-                    if !VALID_SUSPENSION_CAPABILITIES.contains(&cap.as_str()) {
+                    if !is_valid_suspension_capability(cap) {
                         return Err(ConsequenceValidationError(format!(
                             "Suspend[{i}] '{cap}' is not a recognized capability name; \
-                             valid names: {VALID_SUSPENSION_CAPABILITIES:?}",
+                             expected one of {VALID_SUSPENSION_CAPABILITIES:?}, \
+                             or a parametric form 'tool:invoke:<id>' / 'custom:<name>'",
                         )));
                     }
                 }
@@ -1512,5 +1690,197 @@ mod tests {
                 "valid capability '{cap_name}' should be accepted"
             );
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // Exhaustive coverage: every Capability variant is suspendable
+    // -----------------------------------------------------------------------
+
+    /// Returns one representative of every variant of [`Capability`].
+    ///
+    /// Mirrors the exhaustive match in
+    /// `canonical_suspension_capability_string` so the compiler keeps both
+    /// in sync. If a new variant is added to [`Capability`], compilation
+    /// fails here, forcing the author to add coverage for the new variant
+    /// in the suspension validation paths as well.
+    fn capability_variant_examples() -> Vec<Capability> {
+        // Exhaustive (no `_` arm) — a new variant of Capability becomes a
+        // compile error here.
+        #[allow(clippy::no_effect_underscore_binding)]
+        let _exhaustiveness_check = |c: &Capability| match c {
+            Capability::MessagesRead
+            | Capability::MessagesWrite
+            | Capability::ToolInvoke(_)
+            | Capability::ToolInvokeAll
+            | Capability::ToolRegister
+            | Capability::MemberInvite
+            | Capability::MemberRemove
+            | Capability::RoleAssign
+            | Capability::GovernancePropose
+            | Capability::GovernanceVote
+            | Capability::ContextClose
+            | Capability::ChildContextCreate
+            | Capability::ToolInterface
+            | Capability::Bridging
+            | Capability::MediaVoice
+            | Capability::MediaVideo
+            | Capability::MediaScreenShare
+            | Capability::MemberBan
+            | Capability::MetadataEdit
+            | Capability::Custom(_) => (),
+        };
+
+        vec![
+            Capability::MessagesRead,
+            Capability::MessagesWrite,
+            Capability::ToolInvoke("example_tool".to_owned()),
+            Capability::ToolInvokeAll,
+            Capability::ToolRegister,
+            Capability::MemberInvite,
+            Capability::MemberRemove,
+            Capability::RoleAssign,
+            Capability::GovernancePropose,
+            Capability::GovernanceVote,
+            Capability::ContextClose,
+            Capability::ChildContextCreate,
+            Capability::ToolInterface,
+            Capability::Bridging,
+            Capability::MediaVoice,
+            Capability::MediaVideo,
+            Capability::MediaScreenShare,
+            Capability::MemberBan,
+            Capability::MetadataEdit,
+            Capability::Custom("rate_limit_bypass".to_owned()),
+        ]
+    }
+
+    #[test]
+    fn every_capability_variant_is_suspendable() {
+        for cap in capability_variant_examples() {
+            let canonical = canonical_suspension_capability_string(&cap);
+            assert!(
+                is_valid_suspension_capability(&canonical),
+                "canonical form {canonical:?} for {cap:?} must be a valid suspension capability"
+            );
+            // The string round-trips back to the same typed Capability.
+            assert_eq!(
+                parse_suspension_capability(&canonical),
+                Some(cap.clone()),
+                "{canonical:?} should parse back to {cap:?}"
+            );
+            // And a Suspend rule with that capability validates.
+            let rule = ConsequenceRule {
+                trigger: ConsequenceTrigger::MessageVelocity,
+                action: ConsequenceAction::Suspend {
+                    capabilities: vec![canonical.clone()],
+                },
+                threshold: 1,
+                window: Duration::from_secs(60),
+            };
+            assert!(
+                rule.validate().is_ok(),
+                "Suspend rule with {canonical:?} for variant {cap:?} should validate"
+            );
+        }
+    }
+
+    #[test]
+    fn parse_suspension_capability_handles_aliases() {
+        assert_eq!(
+            parse_suspension_capability("read"),
+            Some(Capability::MessagesRead)
+        );
+        assert_eq!(
+            parse_suspension_capability("MessagesRead"),
+            Some(Capability::MessagesRead)
+        );
+        assert_eq!(
+            parse_suspension_capability("messages:read"),
+            Some(Capability::MessagesRead)
+        );
+        assert_eq!(
+            parse_suspension_capability("write"),
+            Some(Capability::MessagesWrite)
+        );
+        assert_eq!(
+            parse_suspension_capability("Bridging"),
+            Some(Capability::Bridging)
+        );
+        assert_eq!(
+            parse_suspension_capability("bridging"),
+            Some(Capability::Bridging)
+        );
+    }
+
+    #[test]
+    fn parse_suspension_capability_handles_parametric_forms() {
+        assert_eq!(
+            parse_suspension_capability("tool:invoke:my_tool"),
+            Some(Capability::ToolInvoke("my_tool".to_owned()))
+        );
+        assert_eq!(
+            parse_suspension_capability("tool:invoke:*"),
+            Some(Capability::ToolInvokeAll)
+        );
+        assert_eq!(
+            parse_suspension_capability("custom:rate_limit_bypass"),
+            Some(Capability::Custom("rate_limit_bypass".to_owned()))
+        );
+    }
+
+    #[test]
+    fn parse_suspension_capability_rejects_empty_parametric_payload() {
+        assert_eq!(parse_suspension_capability("tool:invoke:"), None);
+        assert_eq!(parse_suspension_capability("custom:"), None);
+    }
+
+    #[test]
+    fn parse_suspension_capability_rejects_unknown_strings() {
+        assert_eq!(parse_suspension_capability(""), None);
+        assert_eq!(parse_suspension_capability("fly_to_moon"), None);
+        assert_eq!(parse_suspension_capability("MESSAGES:READ"), None);
+    }
+
+    #[test]
+    fn validate_accepts_parametric_tool_invoke_capability() {
+        let rule = ConsequenceRule {
+            trigger: ConsequenceTrigger::MessageVelocity,
+            action: ConsequenceAction::Suspend {
+                capabilities: vec!["tool:invoke:calculator".to_owned()],
+            },
+            threshold: 1,
+            window: Duration::from_secs(60),
+        };
+        assert!(rule.validate().is_ok());
+    }
+
+    #[test]
+    fn validate_accepts_custom_capability() {
+        let rule = ConsequenceRule {
+            trigger: ConsequenceTrigger::MessageVelocity,
+            action: ConsequenceAction::Suspend {
+                capabilities: vec!["custom:my_app_action".to_owned()],
+            },
+            threshold: 1,
+            window: Duration::from_secs(60),
+        };
+        assert!(rule.validate().is_ok());
+    }
+
+    #[test]
+    fn validate_rejects_empty_tool_invoke_payload() {
+        let rule = ConsequenceRule {
+            trigger: ConsequenceTrigger::MessageVelocity,
+            action: ConsequenceAction::Suspend {
+                capabilities: vec!["tool:invoke:".to_owned()],
+            },
+            threshold: 1,
+            window: Duration::from_secs(60),
+        };
+        let err = rule.validate().unwrap_err();
+        assert!(
+            err.to_string().contains("not a recognized capability name"),
+            "should reject empty tool:invoke payload, got: {err}"
+        );
     }
 }

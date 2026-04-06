@@ -473,7 +473,9 @@ async fn consequence_rules_evaluation() {
     let rules = vec![
         ConsequenceRule {
             trigger: ConsequenceTrigger::MessageVelocity,
-            action: ConsequenceAction::Suspend { capabilities: vec!["messages:write".to_owned()] },
+            action: ConsequenceAction::Suspend {
+                capabilities: vec!["messages:write".to_owned()],
+            },
             threshold: 3,
             window: Duration::from_secs(60),
         },
@@ -500,7 +502,9 @@ async fn consequence_rules_evaluation() {
     assert_eq!(triggered[0].rule_index, 0);
     assert_eq!(
         triggered[0].action,
-        ConsequenceAction::Suspend { capabilities: vec!["messages:write".to_owned()] }
+        ConsequenceAction::Suspend {
+            capabilities: vec!["messages:write".to_owned()]
+        }
     );
     assert_eq!(triggered[0].evidence.len(), 3);
 

@@ -910,8 +910,7 @@ async fn broadcast_block_author_via_governance_revokes_publish() {
         approved_revoke_proposal(&"did:key:alice".into(), &ctx_id, &"did:key:bob".into());
     let action_result = manager.execute_governance_action(&ctx_id, &proposal).await;
     assert!(action_result.is_ok());
-    let super::GovernanceActionResult::AccessRevoked(revoke_result) = action_result.unwrap()
-    else {
+    let super::GovernanceActionResult::AccessRevoked(revoke_result) = action_result.unwrap() else {
         panic!("expected AccessRevoked result from Revoke action");
     };
     assert_eq!(revoke_result.did.0, "did:key:bob");
@@ -1730,10 +1729,7 @@ async fn revoke_write_access_future_only_no_key_destruction() {
     );
 
     let result = manager.execute_governance_action(&ctx_id, &proposal).await;
-    assert!(
-        result.is_ok(),
-        "Revoke (write, FutureOnly) should succeed"
-    );
+    assert!(result.is_ok(), "Revoke (write, FutureOnly) should succeed");
 
     // Alice should be in suspended_capabilities.
     let contexts = manager.contexts.lock().await;
@@ -1858,9 +1854,9 @@ async fn restore_write_access_after_revocation() {
         let ctx = contexts.get(&ctx_id).unwrap();
         assert!(
             !ctx.role_state
-    .suspended_capabilities
-    .get("did:key:bob")
-    .is_some_and(|s| s.contains(&Capability::MessagesWrite))
+                .suspended_capabilities
+                .get("did:key:bob")
+                .is_some_and(|s| s.contains(&Capability::MessagesWrite))
         );
     }
 
@@ -1872,10 +1868,7 @@ async fn restore_write_access_after_revocation() {
             super::ContextEvent::WriteAccessRestored { did } if did.0 == "did:key:bob"
         )
     });
-    assert!(
-        has_event,
-        "AccessRestored event should have been emitted"
-    );
+    assert!(has_event, "AccessRestored event should have been emitted");
 }
 
 /// SCP-CAC-007: `RotateContentKeys` on broadcast context rotates all author keys.
@@ -2269,9 +2262,9 @@ async fn restore_write_access_removes_revocation() {
         let ctx = contexts.get(&ctx_id).unwrap();
         assert!(
             !ctx.role_state
-    .suspended_capabilities
-    .get("did:key:bob")
-    .is_some_and(|s| s.contains(&Capability::MessagesWrite)),
+                .suspended_capabilities
+                .get("did:key:bob")
+                .is_some_and(|s| s.contains(&Capability::MessagesWrite)),
             "bob should not be in suspended_capabilities after restore"
         );
     }
@@ -2551,10 +2544,7 @@ async fn revoke_write_access_non_member_fails() {
     );
 
     let result = manager.execute_governance_action(&ctx_id, &proposal).await;
-    assert!(
-        result.is_err(),
-        "Revoke (write) on non-member should fail"
-    );
+    assert!(result.is_err(), "Revoke (write) on non-member should fail");
     assert!(
         matches!(result.unwrap_err(), ContextError::MemberNotFound(_)),
         "error should be MemberNotFound"

@@ -39,8 +39,8 @@ use scp_protocol::context::governance::majority::MajorityVoteEngine;
 use scp_protocol::context::governance::multisig::ThresholdEngine;
 use scp_protocol::context::governance::unanimity::UnanimityEngine;
 use scp_protocol::context::governance::{
-    CheckpointAttestationStatus, CosignedCheckpoint, GovernanceAction, GovernanceContext,
-    AccessScope, GovernanceEngine, GovernanceEvent, KeyResolver, ProposalStatus,
+    AccessScope, CheckpointAttestationStatus, CosignedCheckpoint, GovernanceAction,
+    GovernanceContext, GovernanceEngine, GovernanceEvent, KeyResolver, ProposalStatus,
     SingleAdminEngine, VoteType, actions_conflict, sign_vote,
 };
 use scp_protocol::context::params::{Capability, ContextParams, GovernanceModel};
@@ -1214,7 +1214,10 @@ async fn ac10_restore_write_access_action() {
         .propose_governance_action(
             ctx_id,
             &alice(),
-            GovernanceAction::RestoreAccess { did: bob(), capabilities: vec![Capability::MessagesWrite] },
+            GovernanceAction::RestoreAccess {
+                did: bob(),
+                capabilities: vec![Capability::MessagesWrite],
+            },
             &sk_alice,
         )
         .await
@@ -1448,7 +1451,10 @@ fn ac13_actions_conflict_revoke_vs_restore_write() {
         did: bob(),
         access: AccessScope::Both,
     };
-    let action_b = GovernanceAction::RestoreAccess { did: bob(), capabilities: vec![Capability::MessagesWrite] };
+    let action_b = GovernanceAction::RestoreAccess {
+        did: bob(),
+        capabilities: vec![Capability::MessagesWrite],
+    };
     assert!(
         actions_conflict(&action_a, &alice(), &action_b, &carol()),
         "Revoke (write) vs RestoreAccess (write) for same DID should conflict"
@@ -1461,7 +1467,10 @@ fn ac13_actions_conflict_revoke_vs_restore_read() {
         did: bob(),
         access: AccessScope::Write,
     };
-    let action_b = GovernanceAction::RestoreAccess { did: bob(), capabilities: vec![Capability::MessagesRead] };
+    let action_b = GovernanceAction::RestoreAccess {
+        did: bob(),
+        capabilities: vec![Capability::MessagesRead],
+    };
     assert!(
         actions_conflict(&action_a, &alice(), &action_b, &carol()),
         "Revoke (read) vs RestoreAccess (read) for same DID should conflict"

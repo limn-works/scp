@@ -1065,11 +1065,8 @@ async fn revoke_rejected_without_member_ban_ceiling() {
             .add_member("did:key:bob".into(), "author".into(), vec![]);
     }
 
-    let proposal = approved_revoke_proposal(
-        &"did:key:alice".into(),
-        "bc-no-ban",
-        &"did:key:bob".into(),
-    );
+    let proposal =
+        approved_revoke_proposal(&"did:key:alice".into(), "bc-no-ban", &"did:key:bob".into());
     let result = manager
         .execute_governance_action("bc-no-ban", &proposal)
         .await;
@@ -5258,7 +5255,9 @@ async fn test_capability_suspension_revokes_write() {
         let ctx = contexts.get_mut("cap-susp-ctx").unwrap();
         ctx.governance.consequence_rules = vec![ConsequenceRule {
             trigger: ConsequenceTrigger::MessageVelocity,
-            action: ConsequenceAction::Suspend { capabilities: vec!["write".to_owned()] },
+            action: ConsequenceAction::Suspend {
+                capabilities: vec!["write".to_owned()],
+            },
             threshold: 1,
             window: Duration::from_secs(3600),
         }];
@@ -5631,7 +5630,9 @@ async fn test_capability_suspension_no_match_returns_false() {
         let ctx = contexts.get_mut("no-match-ctx").unwrap();
         ctx.governance.consequence_rules = vec![ConsequenceRule {
             trigger: ConsequenceTrigger::MessageVelocity,
-            action: ConsequenceAction::Suspend { capabilities: vec!["foobar".to_owned()] },
+            action: ConsequenceAction::Suspend {
+                capabilities: vec!["foobar".to_owned()],
+            },
             threshold: 1,
             window: Duration::from_secs(3600),
         }];
@@ -5920,7 +5921,9 @@ async fn velocity_consequence_triggers_on_high_rate() {
     params.consequence_rules = vec![ConsequenceRule {
         trigger: ConsequenceTrigger::MessageVelocity,
         threshold: 1,
-        action: ConsequenceAction::Suspend { capabilities: vec!["write".to_owned()] },
+        action: ConsequenceAction::Suspend {
+            capabilities: vec!["write".to_owned()],
+        },
         window: Duration::from_secs(3600),
     }];
     let _handle = manager
@@ -6372,7 +6375,9 @@ async fn consequence_triggers_after_governance_action() {
     params.consequence_rules = vec![ConsequenceRule {
         trigger: ConsequenceTrigger::MessageVelocity,
         threshold: 1,
-        action: ConsequenceAction::Suspend { capabilities: vec!["write".to_owned()] },
+        action: ConsequenceAction::Suspend {
+            capabilities: vec!["write".to_owned()],
+        },
         window: Duration::from_secs(3600),
     }];
     let _handle = manager
@@ -6610,7 +6615,9 @@ async fn event_log_entries_feed_consequence_evaluation() {
     params.consequence_rules = vec![ConsequenceRule {
         trigger: ConsequenceTrigger::MessageVelocity,
         threshold: 3,
-        action: ConsequenceAction::Suspend { capabilities: vec!["write".to_owned()] },
+        action: ConsequenceAction::Suspend {
+            capabilities: vec!["write".to_owned()],
+        },
         window: Duration::from_secs(3600),
     }];
     let _handle = manager
@@ -6921,7 +6928,9 @@ async fn full_send_consequence_enforcement_round_trip() {
     params.consequence_rules = vec![ConsequenceRule {
         trigger: ConsequenceTrigger::MessageVelocity,
         threshold: 1,
-        action: ConsequenceAction::Suspend { capabilities: vec!["write".to_owned()] },
+        action: ConsequenceAction::Suspend {
+            capabilities: vec!["write".to_owned()],
+        },
         window: Duration::from_secs(3600),
     }];
     let _handle = manager
@@ -7080,7 +7089,9 @@ async fn capability_suspension_blocks_subsequent_send() {
     params.consequence_rules = vec![ConsequenceRule {
         trigger: ConsequenceTrigger::MessageVelocity,
         threshold: 1,
-        action: ConsequenceAction::Suspend { capabilities: vec!["write".to_owned()] },
+        action: ConsequenceAction::Suspend {
+            capabilities: vec!["write".to_owned()],
+        },
         window: Duration::from_secs(3600),
     }];
     let _handle = manager
@@ -7489,7 +7500,9 @@ async fn consequence_triggers_on_message_send() {
     params.consequence_rules = vec![ConsequenceRule {
         trigger: ConsequenceTrigger::MessageVelocity,
         threshold: 1,
-        action: ConsequenceAction::Suspend { capabilities: vec!["write".to_owned()] },
+        action: ConsequenceAction::Suspend {
+            capabilities: vec!["write".to_owned()],
+        },
         window: Duration::from_secs(3600),
     }];
     let _handle = manager
@@ -8431,7 +8444,9 @@ async fn test_consequence_triggers_on_governance_action() {
     params.consequence_rules = vec![ConsequenceRule {
         trigger: ConsequenceTrigger::MessageVelocity,
         threshold: 1,
-        action: ConsequenceAction::Suspend { capabilities: vec!["write".to_owned()] },
+        action: ConsequenceAction::Suspend {
+            capabilities: vec!["write".to_owned()],
+        },
         window: Duration::from_secs(3600),
     }];
     let _handle = manager
@@ -8508,7 +8523,9 @@ async fn test_capability_suspension_blocks_subsequent_send() {
     params.consequence_rules = vec![ConsequenceRule {
         trigger: ConsequenceTrigger::MessageVelocity,
         threshold: 1,
-        action: ConsequenceAction::Suspend { capabilities: vec!["write".to_owned()] },
+        action: ConsequenceAction::Suspend {
+            capabilities: vec!["write".to_owned()],
+        },
         window: Duration::from_secs(3600),
     }];
     let _handle = manager
@@ -8549,10 +8566,7 @@ async fn test_capability_suspension_blocks_subsequent_send() {
             None,
         )
         .await;
-    assert!(
-        result.is_err(),
-        "send should fail after Suspend"
-    );
+    assert!(result.is_err(), "send should fail after Suspend");
     let err = result.unwrap_err();
     assert!(
         matches!(err, ContextError::PermissionDenied(ref msg) if msg.contains("write access has been revoked")),
@@ -8786,7 +8800,9 @@ async fn test_multiple_consequence_rules_all_evaluated() {
         ConsequenceRule {
             trigger: ConsequenceTrigger::MessageVelocity,
             threshold: 1,
-            action: ConsequenceAction::Suspend { capabilities: vec!["write".to_owned()] },
+            action: ConsequenceAction::Suspend {
+                capabilities: vec!["write".to_owned()],
+            },
             window: Duration::from_secs(3600),
         },
         ConsequenceRule {
@@ -9474,7 +9490,9 @@ async fn test_send_consequence_economy_round_trip() {
     params.consequence_rules = vec![ConsequenceRule {
         trigger: ConsequenceTrigger::MessageVelocity,
         threshold: 1,
-        action: ConsequenceAction::Suspend { capabilities: vec!["write".to_owned()] },
+        action: ConsequenceAction::Suspend {
+            capabilities: vec!["write".to_owned()],
+        },
         window: Duration::from_secs(3600),
     }];
     let _handle = manager
@@ -9635,7 +9653,9 @@ async fn test_paid_join_with_consequence_evaluation() {
     params.consequence_rules = vec![ConsequenceRule {
         trigger: ConsequenceTrigger::MessageVelocity,
         threshold: 1,
-        action: ConsequenceAction::Suspend { capabilities: vec!["write".to_owned()] },
+        action: ConsequenceAction::Suspend {
+            capabilities: vec!["write".to_owned()],
+        },
         window: Duration::from_secs(3600),
     }];
     let handle = manager
@@ -10454,7 +10474,9 @@ async fn test_consequence_evaluation_uses_full_history() {
     params.consequence_rules = vec![ConsequenceRule {
         trigger: ConsequenceTrigger::MessageVelocity,
         threshold: 2,
-        action: ConsequenceAction::Suspend { capabilities: vec!["write".to_owned()] },
+        action: ConsequenceAction::Suspend {
+            capabilities: vec!["write".to_owned()],
+        },
         window: Duration::from_secs(3600),
     }];
     let _handle = manager
@@ -11396,7 +11418,9 @@ async fn capability_suspension_exact_match_no_false_positive() {
         ctx.governance.consequence_rules = vec![ConsequenceRule {
             trigger: ConsequenceTrigger::MessageVelocity,
             threshold: 1,
-            action: ConsequenceAction::Suspend { capabilities: vec!["spreadsheet".to_owned()] },
+            action: ConsequenceAction::Suspend {
+                capabilities: vec!["spreadsheet".to_owned()],
+            },
             window: Duration::from_secs(3600),
         }];
     }
@@ -11478,7 +11502,9 @@ async fn capability_suspension_write_revokes_write() {
     params.consequence_rules = vec![ConsequenceRule {
         trigger: ConsequenceTrigger::MessageVelocity,
         threshold: 1,
-        action: ConsequenceAction::Suspend { capabilities: vec!["write".to_owned()] },
+        action: ConsequenceAction::Suspend {
+            capabilities: vec!["write".to_owned()],
+        },
         window: Duration::from_secs(3600),
     }];
     let _handle = manager
@@ -11546,7 +11572,9 @@ async fn capability_suspension_read_revokes_read() {
     params.consequence_rules = vec![ConsequenceRule {
         trigger: ConsequenceTrigger::MessageVelocity,
         threshold: 1,
-        action: ConsequenceAction::Suspend { capabilities: vec!["read".to_owned()] },
+        action: ConsequenceAction::Suspend {
+            capabilities: vec!["read".to_owned()],
+        },
         window: Duration::from_secs(3600),
     }];
     let _handle = manager
@@ -11612,7 +11640,9 @@ async fn capability_suspension_messages_write_revokes_write() {
     params.consequence_rules = vec![ConsequenceRule {
         trigger: ConsequenceTrigger::MessageVelocity,
         threshold: 1,
-        action: ConsequenceAction::Suspend { capabilities: vec!["MessagesWrite".to_owned()] },
+        action: ConsequenceAction::Suspend {
+            capabilities: vec!["MessagesWrite".to_owned()],
+        },
         window: Duration::from_secs(3600),
     }];
     let _handle = manager
@@ -11874,7 +11904,9 @@ async fn cooldown_advance_past_allows_retrigger() {
     params.consequence_rules = vec![ConsequenceRule {
         trigger: ConsequenceTrigger::MessageVelocity,
         threshold: 1,
-        action: ConsequenceAction::Suspend { capabilities: vec!["write".to_owned()] },
+        action: ConsequenceAction::Suspend {
+            capabilities: vec!["write".to_owned()],
+        },
         window: Duration::from_secs(10),
     }];
     let _handle = manager
@@ -12053,7 +12085,9 @@ async fn capability_suspension_empty_caps_no_action() {
     params.consequence_rules = vec![ConsequenceRule {
         trigger: ConsequenceTrigger::MessageVelocity,
         threshold: 1,
-        action: ConsequenceAction::Suspend { capabilities: vec![] }, // empty caps
+        action: ConsequenceAction::Suspend {
+            capabilities: vec![],
+        }, // empty caps
         window: Duration::from_secs(3600),
     }];
     let _handle = manager
@@ -12144,13 +12178,17 @@ async fn multiple_consequence_rules_all_trigger() {
         ConsequenceRule {
             trigger: ConsequenceTrigger::MessageVelocity,
             threshold: 1,
-            action: ConsequenceAction::Suspend { capabilities: vec!["write".to_owned()] },
+            action: ConsequenceAction::Suspend {
+                capabilities: vec!["write".to_owned()],
+            },
             window: Duration::from_secs(3600),
         },
         ConsequenceRule {
             trigger: ConsequenceTrigger::MessageVelocity,
             threshold: 1,
-            action: ConsequenceAction::Suspend { capabilities: vec!["read".to_owned()] },
+            action: ConsequenceAction::Suspend {
+                capabilities: vec!["read".to_owned()],
+            },
             window: Duration::from_secs(3600),
         },
     ];
@@ -12498,7 +12536,9 @@ async fn consequence_fires_on_governance_action() {
     params.consequence_rules = vec![ConsequenceRule {
         trigger: ConsequenceTrigger::WarningCount,
         threshold: 1,
-        action: ConsequenceAction::Suspend { capabilities: vec!["write".to_owned()] },
+        action: ConsequenceAction::Suspend {
+            capabilities: vec!["write".to_owned()],
+        },
         window: Duration::from_secs(3600),
     }];
     let handle = manager
@@ -12576,7 +12616,9 @@ async fn test_warning_count_trigger_fires_behavioral() {
     params.consequence_rules = vec![ConsequenceRule {
         trigger: ConsequenceTrigger::WarningCount,
         threshold: 2,
-        action: ConsequenceAction::Suspend { capabilities: vec!["messages:write".to_owned()] },
+        action: ConsequenceAction::Suspend {
+            capabilities: vec!["messages:write".to_owned()],
+        },
         window: Duration::from_secs(3600),
     }];
     let handle = manager
@@ -13481,7 +13523,9 @@ async fn consequence_timer_fires_without_user_action() {
     params.consequence_rules = vec![ConsequenceRule {
         trigger: ConsequenceTrigger::MessageVelocity,
         threshold: 1,
-        action: ConsequenceAction::Suspend { capabilities: vec!["write".to_owned()] },
+        action: ConsequenceAction::Suspend {
+            capabilities: vec!["write".to_owned()],
+        },
         window: Duration::from_secs(3600),
     }];
 
@@ -13555,7 +13599,9 @@ async fn consequence_timer_respects_cooldown() {
     params.consequence_rules = vec![ConsequenceRule {
         trigger: ConsequenceTrigger::MessageVelocity,
         threshold: 1,
-        action: ConsequenceAction::Suspend { capabilities: vec!["write".to_owned()] },
+        action: ConsequenceAction::Suspend {
+            capabilities: vec!["write".to_owned()],
+        },
         // Long cooldown window — rule should NOT re-fire on second tick.
         window: Duration::from_secs(7200),
     }];
@@ -13669,7 +13715,9 @@ fn consequence_can_suspend_capability() {
     let rules = vec![ConsequenceRule {
         trigger: ConsequenceTrigger::MessageVelocity,
         threshold: 1,
-        action: ConsequenceAction::Suspend { capabilities: vec!["write".to_owned()] },
+        action: ConsequenceAction::Suspend {
+            capabilities: vec!["write".to_owned()],
+        },
         window: Duration::from_secs(3600),
     }];
 
@@ -13714,7 +13762,9 @@ fn consequence_triggered_on_dispatch_evaluation() {
         ConsequenceRule {
             trigger: ConsequenceTrigger::MessageVelocity,
             threshold: 1,
-            action: ConsequenceAction::Suspend { capabilities: vec!["read".to_owned()] },
+            action: ConsequenceAction::Suspend {
+                capabilities: vec!["read".to_owned()],
+            },
             window: Duration::from_secs(60),
         },
     ];
@@ -14730,14 +14780,18 @@ async fn enforce_triggered_consequences_skips_absent_member() {
 
     let rules = vec![ConsequenceRule {
         trigger: ConsequenceTrigger::MessageVelocity,
-        action: ConsequenceAction::Suspend { capabilities: vec!["write".to_owned()] },
+        action: ConsequenceAction::Suspend {
+            capabilities: vec!["write".to_owned()],
+        },
         threshold: 1,
         window: Duration::from_secs(60),
     }];
 
     let triggered = vec![TriggeredConsequence {
         rule_index: 0,
-        action: ConsequenceAction::Suspend { capabilities: vec!["write".to_owned()] },
+        action: ConsequenceAction::Suspend {
+            capabilities: vec!["write".to_owned()],
+        },
         evidence: vec![],
     }];
 
