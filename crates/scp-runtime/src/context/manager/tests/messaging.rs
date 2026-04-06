@@ -1568,7 +1568,9 @@ async fn velocity_consequence_trigger_on_send() {
     params.consequence_rules = vec![ConsequenceRule {
         trigger: ConsequenceTrigger::MessageVelocity,
         threshold: 1,
-        action: ConsequenceAction::Suspend { capabilities: vec!["write".to_owned()] },
+        action: ConsequenceAction::Suspend {
+            capabilities: vec!["write".to_owned()],
+        },
         window: Duration::from_secs(3600),
     }];
     let _handle = manager
@@ -1628,5 +1630,102 @@ fn dynamic_pricing_adjusts_relay_cost() {
     assert_ne!(
         low.new_base_price, high.new_base_price,
         "prices should differ at different utilization levels"
+    );
+}
+
+/// Regression test: when a Phase 1 step AFTER `enforce_send_economy` fails
+/// (here: missing `signing_key` on the broadcast publish path), the budget
+/// deduction and velocity increment performed before that point MUST be
+/// rolled back. Without the fix, both states would leak permanently and a
+/// rejected message would still consume the sender's budget and velocity.
+#[tokio::test]
+async fn send_message_rolls_back_economy_when_phase1_finalization_fails() {
+    use scp_protocol::economy::types::{Amount, CostSchedule, CurrencyCode, EconomicPolicy};
+
+    let (manager, handle, ctx_id) = setup_broadcast_context_two_authors().await;
+    let alice = DID::from("did:key:alice");
+    const COST: u64 = 25;
+
+    // Install an economic policy with a non-zero per-message cost and grant
+    // alice enough budget to cover one send. We mutate state directly under
+    // the contexts lock — this is a unit test, not a governance flow test.
+    {
+        let mut contexts = manager.contexts.lock().await;
+        let ctx = contexts.get_mut(&ctx_id).expect("context registered");
+        ctx.governance.economic_policy = Some(EconomicPolicy {
+            locked: false,
+            cost_schedule: CostSchedule {
+                currency: CurrencyCode([85, 83, 68, 0]), // "USD\0"
+                per_message: Some(Amount(COST)),
+                per_tool_invoke: None,
+                per_join: None,
+                per_period: None,
+                per_byte_stored: None,
+            },
+            payment_adapters: vec![],
+            pricing_formula: None,
+            payee: DID::from("did:key:payee"),
+        });
+        ctx.governance
+            .budget_tracker
+            .grant(&alice, Amount(COST * 10));
+    }
+
+    // Snapshot pre-call state.
+    let (spent_before, velocity_before) = {
+        let contexts = manager.contexts.lock().await;
+        let ctx = contexts.get(&ctx_id).expect("context registered");
+        (
+            ctx.governance.budget_tracker.total_spent(&alice),
+            ctx.governance
+                .velocity_tracker
+                .get_velocity(&alice, manager.clock.now_secs()),
+        )
+    };
+    assert_eq!(spent_before, Amount(0));
+    assert_eq!(velocity_before, 0);
+
+    // Force Phase 1 finalization to fail by omitting `signing_key` on the
+    // broadcast path. `enforce_send_economy` will succeed (deducting COST
+    // and incrementing velocity), then `build_broadcast_envelope` requires
+    // a signing key and returns CryptoFailed.
+    let result = manager
+        .send_message(
+            &handle,
+            &alice,
+            b"this should be rejected after economy enforcement",
+            None, // <-- forces Phase 1 failure
+            None,
+            Some(&dummy_spending_ucan()),
+        )
+        .await;
+    assert!(
+        result.is_err(),
+        "send_message must fail when signing key is absent"
+    );
+    assert!(
+        matches!(result.as_ref().unwrap_err(), ContextError::CryptoFailed(_)),
+        "expected CryptoFailed, got {:?}",
+        result.unwrap_err()
+    );
+
+    // Verify both budget and velocity are restored to pre-call values.
+    let (spent_after, velocity_after) = {
+        let contexts = manager.contexts.lock().await;
+        let ctx = contexts.get(&ctx_id).expect("context registered");
+        (
+            ctx.governance.budget_tracker.total_spent(&alice),
+            ctx.governance
+                .velocity_tracker
+                .get_velocity(&alice, manager.clock.now_secs()),
+        )
+    };
+    assert_eq!(
+        spent_after, spent_before,
+        "budget spent must be rolled back when Phase 1 finalization fails"
+    );
+    assert_eq!(
+        velocity_after, velocity_before,
+        "velocity must be rolled back when Phase 1 finalization fails"
     );
 }

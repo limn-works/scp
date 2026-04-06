@@ -372,37 +372,62 @@ impl ContextManager {
                     return Err(e);
                 }
             };
-            if let Some(ref mut bc) = ctx.broadcast_context {
-                let sk = signing_key.ok_or_else(|| {
-                    ContextError::CryptoFailed("signing key required for broadcast publish".into())
-                })?;
-                let env =
-                    build_broadcast_envelope(self.clock.as_ref(), bc, sender_did, payload, sk)?;
-                (
-                    Some(env),
-                    std::collections::HashMap::new(),
-                    0,
-                    true,
-                    deducted_cost,
-                )
-            } else {
-                // Capability already checked above (H7: before budget deduction).
-                // Assign sequence under lock — SequenceTracker rejects duplicates.
-                let seq = ctx
-                    .membership
-                    .next_sequence_number(sender_did)
-                    .ok_or_else(|| {
-                        ContextError::MemberNotFound(format!(
-                            "cannot assign sequence: {sender_did} is not a member"
-                        ))
+            // Phase 1 finalization: any fallible step here must roll back BOTH
+            // the velocity increment and the budget deduction performed above,
+            // otherwise a rejected message permanently consumes economy state.
+            // The rollback mirrors the `enforce_send_economy` error path.
+            let phase1: Result<_, ContextError> = (|| {
+                if let Some(ref mut bc) = ctx.broadcast_context {
+                    let sk = signing_key.ok_or_else(|| {
+                        ContextError::CryptoFailed(
+                            "signing key required for broadcast publish".into(),
+                        )
                     })?;
-                (
-                    None,
-                    ctx.access.access_key_store.get_all(&context_id),
-                    seq,
-                    false,
-                    deducted_cost,
-                )
+                    let env =
+                        build_broadcast_envelope(self.clock.as_ref(), bc, sender_did, payload, sk)?;
+                    Ok((
+                        Some(env),
+                        std::collections::HashMap::new(),
+                        0u64,
+                        true,
+                        deducted_cost,
+                    ))
+                } else {
+                    // Capability already checked above (H7: before budget deduction).
+                    // Assign sequence under lock — SequenceTracker rejects duplicates.
+                    let seq = ctx
+                        .membership
+                        .next_sequence_number(sender_did)
+                        .ok_or_else(|| {
+                            ContextError::MemberNotFound(format!(
+                                "cannot assign sequence: {sender_did} is not a member"
+                            ))
+                        })?;
+                    Ok((
+                        None,
+                        ctx.access.access_key_store.get_all(&context_id),
+                        seq,
+                        false,
+                        deducted_cost,
+                    ))
+                }
+            })();
+            match phase1 {
+                Ok(tuple) => tuple,
+                Err(e) => {
+                    // Roll back velocity (recorded above) AND the budget
+                    // deduction performed by `enforce_send_economy` so a
+                    // failed Phase 1 finalization does not leak economy state.
+                    // Inline rollback (vs. calling `rollback_budget`) is
+                    // required because we still hold the contexts lock.
+                    ctx.governance.velocity_tracker.rollback_last(sender_did);
+                    if let Some(cost) = deducted_cost {
+                        ctx.governance
+                            .budget_tracker
+                            .reverse_spend(sender_did, cost);
+                    }
+                    return Err(e);
+                }
             }
         };
         // Payment flow (#1537): escrow pattern — authorize (hold) before the
