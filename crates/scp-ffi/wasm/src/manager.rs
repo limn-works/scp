@@ -394,6 +394,23 @@ impl PerContextState {
             return false;
         };
 
+        // Suspension check (RED-801): mirrors the native
+        // `ContextRoleState::member_has_capability` short-circuit. A member
+        // whose capability has been suspended via `SuspendMember` or `Revoke`
+        // governance must fail capability checks even if their role would
+        // otherwise grant the capability. The capability strings stored in
+        // `suspended_capabilities` are in the same UCAN `{resource}:{action}`
+        // format used by the role checks below (see
+        // `dispatch_revoke` and `SuspendMember` handling around line ~2330,
+        // and `Self::capability_to_ucan_format`).
+        if self
+            .suspended_capabilities
+            .get(member_did)
+            .is_some_and(|suspended| suspended.contains(capability))
+        {
+            return false;
+        }
+
         // Helper: check that the capability is within the context ceiling.
         let in_ceiling = |cap: &str| -> bool {
             let (resource, _action) = cap.rsplit_once(':').unwrap_or((cap, "*"));
@@ -2461,6 +2478,16 @@ impl WasmContextManager {
         // For read revocation, perform governance ban.
         let mut key_rotated = false;
         if matches!(access, AccessScope::Read | AccessScope::Both) {
+            // CEK exclusion list (RED-802): mirrors native runtime
+            // `execute_revoke` (see `crates/scp-runtime/src/context/manager/
+            // governance.rs` ~line 1883). The read exclusion list is the
+            // cryptographic enforcement signal — future Read scope checks
+            // (e.g. CEK wrapping, access-key derivation) consult this set
+            // to refuse re-admitting revoked DIDs. Without this insertion
+            // the WASM bridge would silently re-admit revoked members on
+            // subsequent operations.
+            ctx.read_exclusion_list.insert(did_str.to_owned());
+
             if let Some(bc) = ctx.broadcast_context.as_mut() {
                 // governance_ban_subscriber handles: remove from subscriber roster,
                 // add to ALL authors' block lists, rotate ALL authors' keys, and
@@ -6076,5 +6103,258 @@ mod tests {
         // Unblock sub1 → epoch stays at 1 (per spec: no key rotation on unblock)
         let _ = bc.unblock_subscriber("author-a", "sub1");
         assert_eq!(bc.get_author("author-a").map(|a| a.epoch), Some(1));
+    }
+
+    // -----------------------------------------------------------------------
+    // Suspension + revocation conformance tests (RED-801, RED-802).
+    //
+    // These tests guard against two regressions in the WASM governance path
+    // that previously diverged from the native scp-runtime behavior:
+    //   * RED-801: `member_has_capability` ignored `suspended_capabilities`,
+    //     so a `SuspendMember` (or partial `Revoke`) action did not actually
+    //     deny capability checks. The WASM bridge mirrored neither the
+    //     `ContextRoleState::member_has_capability` short-circuit
+    //     (`crates/scp-protocol/src/context/roles.rs`) nor the runtime use
+    //     in `crates/scp-runtime/src/context/manager/governance.rs`.
+    //   * RED-802: `dispatch_revoke` destroyed broadcast keys but never
+    //     inserted the revoked DID into `read_exclusion_list`, so future
+    //     Read-scope checks (CEK wrapping, access-key derivation) would
+    //     silently re-admit a revoked member. The native runtime sets the
+    //     exclusion list in `execute_revoke` (governance.rs ~line 1883).
+    // -----------------------------------------------------------------------
+
+    /// Helper: build a minimal active encrypted context with a single member
+    /// holding the given role. Used for capability/exclusion-list assertions
+    /// where broadcast state is irrelevant.
+    fn make_manager_with_member(
+        context_id: &str,
+        member_did: &str,
+        role: &str,
+        ceiling: &[&str],
+    ) -> WasmContextManager {
+        let mut members = HashMap::new();
+        members.insert(
+            member_did.to_owned(),
+            MemberEntry {
+                did: member_did.to_owned(),
+                role: role.to_owned(),
+                sequence_number: 0,
+            },
+        );
+        let ceiling_strings: HashSet<String> = ceiling.iter().map(|s| (*s).to_owned()).collect();
+        let ctx = PerContextState {
+            state: "active".to_owned(),
+            params_json: serde_json::json!({}),
+            creator_did: member_did.to_owned(),
+            mode: "Encrypted".to_owned(),
+            ceiling_strings,
+            ceiling_policy: "immutable".to_owned(),
+            ttl_seconds: None,
+            promotion_policy: None,
+            governance: "single_admin".to_owned(),
+            economic_policy: None,
+            tool_registry: ToolRegistry::new(),
+            tool_handlers: HashMap::new(),
+            event_log: EventLog::new(context_id.to_owned()),
+            revoked_tokens: HashSet::new(),
+            seen_nonces: HashMap::new(),
+            members,
+            event_buffer: VecDeque::new(),
+            executed_proposals: HashMap::new(),
+            suspended_capabilities: HashMap::new(),
+            read_exclusion_list: HashSet::new(),
+            broadcast_context: None,
+            sessions: HashMap::new(),
+            threshold_signers: Vec::new(),
+            threshold_value: 0,
+            tool_interfaces: Vec::new(),
+            governance_freeze: false,
+            pending_proposals: HashMap::new(),
+            resolved_proposals: HashMap::new(),
+            pruning_policy: None,
+            economic_policy_locked: false,
+            _consequence_rules: Vec::new(),
+            crypto: None,
+        };
+        let mut mgr = WasmContextManager::new();
+        mgr.contexts.insert(context_id.to_owned(), ctx);
+        mgr
+    }
+
+    /// RED-801: a member with a suspended capability must fail
+    /// `member_has_capability` for that capability, even though the role
+    /// (`member`) would otherwise grant it.
+    #[test]
+    fn member_has_capability_denies_suspended_write() {
+        let did = "did:dht:zmember1";
+        let mut mgr = make_manager_with_member(
+            "ctx-1",
+            did,
+            "member",
+            &["messages:read", "messages:write", "tool_invoke:*"],
+        );
+
+        // Baseline: the member has both read and write before suspension.
+        let ctx = mgr.contexts.get("ctx-1").unwrap();
+        assert!(
+            ctx.member_has_capability(did, "messages:write"),
+            "baseline: member should have messages:write before suspension"
+        );
+        assert!(
+            ctx.member_has_capability(did, "messages:read"),
+            "baseline: member should have messages:read before suspension"
+        );
+
+        // Suspend write only.
+        {
+            let ctx_mut = mgr.contexts.get_mut("ctx-1").unwrap();
+            ctx_mut
+                .suspended_capabilities
+                .entry(did.to_owned())
+                .or_default()
+                .insert("messages:write".to_owned());
+        }
+
+        // After suspension: write is denied, read still allowed.
+        let ctx = mgr.contexts.get("ctx-1").unwrap();
+        assert!(
+            !ctx.member_has_capability(did, "messages:write"),
+            "RED-801: suspended messages:write must be denied"
+        );
+        assert!(
+            ctx.member_has_capability(did, "messages:read"),
+            "non-suspended messages:read must remain allowed"
+        );
+
+        // Non-existent member is still denied (sanity).
+        assert!(!ctx.member_has_capability("did:dht:zghost", "messages:read"));
+    }
+
+    /// RED-801 follow-on: `Revoke` of `AccessScope::Write` (which inserts
+    /// `messages:write` into `suspended_capabilities` via `dispatch_revoke`)
+    /// must be observable by `member_has_capability`. End-to-end check that
+    /// the dispatch path and the capability check stay in sync.
+    #[test]
+    fn dispatch_revoke_write_denies_capability_via_suspension() {
+        let did = "did:dht:zmember2";
+        let mut mgr = make_manager_with_member(
+            "ctx-1",
+            did,
+            "member",
+            &["messages:read", "messages:write", "tool_invoke:*"],
+        );
+
+        // Sanity: write capability is granted.
+        assert!(
+            mgr.contexts["ctx-1"].member_has_capability(did, "messages:write"),
+            "baseline: member should have messages:write"
+        );
+
+        // Revoke write only via the dispatch path.
+        mgr.dispatch_revoke("ctx-1", &DID(did.to_owned()), AccessScope::Write)
+            .unwrap();
+
+        // After revoke: write is denied (RED-801), read still allowed.
+        let ctx = &mgr.contexts["ctx-1"];
+        assert!(
+            ctx.suspended_capabilities
+                .get(did)
+                .is_some_and(|s| s.contains("messages:write")),
+            "Revoke(Write) must populate suspended_capabilities[did] with messages:write"
+        );
+        assert!(
+            !ctx.member_has_capability(did, "messages:write"),
+            "RED-801: write must be denied after Revoke(Write)"
+        );
+        assert!(
+            ctx.member_has_capability(did, "messages:read"),
+            "read should remain allowed after Revoke(Write)"
+        );
+    }
+
+    /// RED-802: `Revoke` with `AccessScope::Read` must insert the revoked
+    /// DID into `read_exclusion_list` so subsequent CEK wrapping refuses
+    /// to re-admit the member. Encrypted-mode (no broadcast context).
+    #[test]
+    fn dispatch_revoke_read_inserts_into_exclusion_list() {
+        let did = "did:dht:zmember3";
+        let mut mgr =
+            make_manager_with_member("ctx-1", did, "member", &["messages:read", "messages:write"]);
+        // Pre-condition: not yet excluded.
+        assert!(
+            !mgr.contexts["ctx-1"].read_exclusion_list.contains(did),
+            "baseline: did must not be in read_exclusion_list"
+        );
+
+        mgr.dispatch_revoke("ctx-1", &DID(did.to_owned()), AccessScope::Read)
+            .unwrap();
+
+        // Post-condition: present in exclusion list and read suspended.
+        let ctx = &mgr.contexts["ctx-1"];
+        assert!(
+            ctx.read_exclusion_list.contains(did),
+            "RED-802: Revoke(Read) must insert did into read_exclusion_list"
+        );
+        assert!(
+            ctx.suspended_capabilities
+                .get(did)
+                .is_some_and(|s| s.contains("messages:read")),
+            "Revoke(Read) must suspend messages:read"
+        );
+        // Defense in depth: capability check denies read.
+        assert!(
+            !ctx.member_has_capability(did, "messages:read"),
+            "RED-801 + RED-802: read capability must be denied after Revoke(Read)"
+        );
+    }
+
+    /// RED-802: `Revoke` with `AccessScope::Both` must also insert into
+    /// `read_exclusion_list` (the read half of the action).
+    #[test]
+    fn dispatch_revoke_both_inserts_into_exclusion_list() {
+        let did = "did:dht:zmember4";
+        let mut mgr =
+            make_manager_with_member("ctx-1", did, "member", &["messages:read", "messages:write"]);
+
+        mgr.dispatch_revoke("ctx-1", &DID(did.to_owned()), AccessScope::Both)
+            .unwrap();
+
+        let ctx = &mgr.contexts["ctx-1"];
+        assert!(
+            ctx.read_exclusion_list.contains(did),
+            "RED-802: Revoke(Both) must insert did into read_exclusion_list"
+        );
+        assert!(
+            ctx.suspended_capabilities
+                .get(did)
+                .is_some_and(|s| s.contains("messages:read") && s.contains("messages:write")),
+            "Revoke(Both) must suspend both read and write"
+        );
+        assert!(
+            !ctx.member_has_capability(did, "messages:read"),
+            "RED-801 + RED-802: read denied after Revoke(Both)"
+        );
+        assert!(
+            !ctx.member_has_capability(did, "messages:write"),
+            "RED-801 + RED-802: write denied after Revoke(Both)"
+        );
+    }
+
+    /// RED-802 negative: `Revoke` with `AccessScope::Write` only must NOT
+    /// insert into `read_exclusion_list` (we only exclude on read scope).
+    #[test]
+    fn dispatch_revoke_write_only_does_not_touch_exclusion_list() {
+        let did = "did:dht:zmember5";
+        let mut mgr =
+            make_manager_with_member("ctx-1", did, "member", &["messages:read", "messages:write"]);
+
+        mgr.dispatch_revoke("ctx-1", &DID(did.to_owned()), AccessScope::Write)
+            .unwrap();
+
+        let ctx = &mgr.contexts["ctx-1"];
+        assert!(
+            !ctx.read_exclusion_list.contains(did),
+            "Revoke(Write) must not affect read_exclusion_list"
+        );
     }
 }
