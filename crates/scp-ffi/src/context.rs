@@ -1882,6 +1882,10 @@ fn py_governance_execute(handle: &PyContextHandle, proposal_json: &str) -> PyRes
             serde_json::from_str(&proposal_json_owned).map_err(|e| {
                 PyValueError::new_err(format!("invalid governance proposal JSON: {e}"))
             })?;
+        // Defense-in-depth: validate user-controlled string fields at the FFI
+        // boundary before the action reaches the ContextManager (#1601).
+        scp_ffi_common::validate::validate_governance_action_strings(&proposal.action)
+            .map_err(|e| PyValueError::new_err(e.message))?;
         let action_name = proposal.action.variant_name();
         let result = mgr
             .execute_governance_action(&context_id, &proposal)
@@ -2135,6 +2139,12 @@ fn py_governance_propose(
             serde_json::from_str(&action_json_owned).map_err(|e| {
                 PyValueError::new_err(format!("SCP-CTX-2040: invalid governance action JSON: {e}"))
             })?;
+
+        // Defense-in-depth: validate user-controlled string fields at the FFI
+        // boundary before the action reaches the ContextManager (#1601).
+        scp_ffi_common::validate::validate_governance_action_strings(&action).map_err(|e| {
+            PyValueError::new_err(format!("SCP-CTX-2040: {}", e.message))
+        })?;
 
         let action_name = action.variant_name();
 

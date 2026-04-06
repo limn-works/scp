@@ -702,6 +702,16 @@ pub fn context_execute_governance(
             .into_js()
         })?;
 
+        // Defense-in-depth: validate user-controlled string fields at the FFI
+        // boundary before the action reaches the manager (#1601).
+        scp_ffi_common::validate::validate_governance_action_strings(&action).map_err(|e| {
+            ScpWasmError::Validation {
+                message: e.message,
+                code: "SCP-VALID-7000".to_owned(),
+            }
+            .into_js()
+        })?;
+
         let result = with_manager(|mgr| {
             mgr.execute_governance_action(&context_id, &initiator_did, &proposal_id, &action)
         })
@@ -772,6 +782,16 @@ pub fn context_governance_propose(
         let action: GovernanceAction = serde_json::from_value(action_value).map_err(|e| {
             ScpWasmError::Validation {
                 message: format!("action_json is not valid: {e}"),
+                code: "SCP-CTX-2040".to_owned(),
+            }
+            .into_js()
+        })?;
+
+        // Defense-in-depth: validate user-controlled string fields at the FFI
+        // boundary before the action reaches the manager (#1601).
+        scp_ffi_common::validate::validate_governance_action_strings(&action).map_err(|e| {
+            ScpWasmError::Validation {
+                message: e.message,
                 code: "SCP-CTX-2040".to_owned(),
             }
             .into_js()

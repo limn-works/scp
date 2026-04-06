@@ -2002,6 +2002,15 @@ pub async fn context_execute_governance_action(
         })
     })?;
 
+    // Defense-in-depth: validate user-controlled string fields at the FFI
+    // boundary before the action reaches the ContextManager (#1601).
+    scp_ffi_common::validate::validate_governance_action_strings(&action).map_err(|e| {
+        NapiError::from(ScpNapiError::Validation {
+            message: e.message,
+            code: "SCP-VALID-7000".to_owned(),
+        })
+    })?;
+
     let action_name = action.variant_name();
 
     // Generate a random proposal ID (32 bytes).
@@ -2160,6 +2169,15 @@ pub async fn context_governance_propose(
     let action: GovernanceAction = serde_json::from_str(&action_json).map_err(|e| {
         NapiError::from(ScpNapiError::Validation {
             message: format!("invalid governance action JSON: {e}"),
+            code: "SCP-CTX-2040".to_owned(),
+        })
+    })?;
+
+    // Defense-in-depth: validate user-controlled string fields at the FFI
+    // boundary before the action reaches the ContextManager (#1601).
+    scp_ffi_common::validate::validate_governance_action_strings(&action).map_err(|e| {
+        NapiError::from(ScpNapiError::Validation {
+            message: e.message,
             code: "SCP-CTX-2040".to_owned(),
         })
     })?;
