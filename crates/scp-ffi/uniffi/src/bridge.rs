@@ -7138,12 +7138,12 @@ pub async fn governance_propose(
                 serde_json::from_str(&action_json)?;
             // Defense-in-depth: validate user-controlled string fields at the
             // FFI boundary before the action reaches the ContextManager (#1601).
-            scp_ffi_common::validate::validate_governance_action_strings(&action).map_err(
-                |e| ScpError::Validation {
+            scp_ffi_common::validate::validate_governance_action_strings(&action).map_err(|e| {
+                ScpError::Validation {
                     msg: e.message,
                     code: "SCP-CTX-2041".to_owned(),
-                },
-            )?;
+                }
+            })?;
             let action_name = action.variant_name();
             let did = scp_identity::DID(proposer_did);
             let manager = crate::runtime::context_manager()?;

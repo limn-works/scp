@@ -21,20 +21,27 @@ use super::{
 /// in `ContextRoleState`. The suspension-aware `member_has_capability`
 /// check in the `send_message` and `deliver_incoming` gates will then
 /// reject operations requiring those capabilities.
+///
+/// Parses every variant of [`Capability`] via
+/// [`scp_protocol::trust::consequence::parse_suspension_capability`] —
+/// the same parser used by [`ConsequenceRule::validate`], so the
+/// validation and enforcement layers cannot drift. If a string is
+/// unrecognized at this point it has bypassed validation, which is a
+/// programmer error worth logging.
 fn enforce_suspend(ctx: &mut PerContextState, member_did: &DID, caps: &[String]) -> bool {
+    use scp_protocol::trust::consequence::parse_suspension_capability;
+
     let mut applied = false;
     for cap_name in caps {
-        let capability = match cap_name.as_str() {
-            "write" | "MessagesWrite" | "messages:write" => Capability::MessagesWrite,
-            "read" | "MessagesRead" | "messages:read" => Capability::MessagesRead,
-            other => {
-                tracing::warn!(
-                    capability = other,
-                    member = %member_did,
-                    "unknown capability in suspension — no action taken"
-                );
-                continue;
-            }
+        let Some(capability) = parse_suspension_capability(cap_name) else {
+            tracing::warn!(
+                capability = cap_name,
+                member = %member_did,
+                "unknown capability in suspension — no action taken (this should have \
+                 been rejected by ConsequenceRule::validate; this branch indicates a \
+                 bypass of validation)"
+            );
+            continue;
         };
         ctx.role_state
             .suspend_capabilities(member_did.as_ref(), [capability]);

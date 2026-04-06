@@ -320,11 +320,7 @@ fn send_message_does_not_call_encrypt_message() {
 #[test]
 fn execute_eject_calls_remove_member_sender_key() {
     assert!(
-        fn_body_contains(
-            MANAGER_SRC,
-            "execute_eject",
-            "remove_member_sender_key"
-        ),
+        fn_body_contains(MANAGER_SRC, "execute_eject", "remove_member_sender_key"),
         "execute_eject must call remove_member_sender_key"
     );
 }

@@ -30,7 +30,7 @@ use scp_identity::DID;
 use scp_protocol::context::ContextError;
 use scp_protocol::context::builder::{ContextCreationError, ContextCryptoProvider};
 use scp_protocol::context::governance::{
-    GovernanceAction, GovernanceEvent, KeyResolver, ProposalStatus, AccessScope,
+    AccessScope, GovernanceAction, GovernanceEvent, KeyResolver, ProposalStatus,
 };
 use scp_protocol::context::params::{Capability, ContextParams, GovernanceModel};
 use scp_runtime::context::builder::{ContextEventLogProvider, ContextTransportProvider};
@@ -396,7 +396,10 @@ async fn restore_read_access_forward_only() {
     let _ = manager.drain_events(ctx_id).await;
 
     // Now restore Dave's read access via governance.
-    let restore = GovernanceAction::RestoreAccess { did: dave(), capabilities: vec![Capability::MessagesRead] };
+    let restore = GovernanceAction::RestoreAccess {
+        did: dave(),
+        capabilities: vec![Capability::MessagesRead],
+    };
     let outcome = propose_and_approve_threshold(&manager, ctx_id, restore).await;
     assert_eq!(outcome.status, ProposalStatus::Approved);
 
@@ -589,7 +592,10 @@ async fn restore_write_access_forward_only() {
     let _ = manager.drain_events(ctx_id).await;
 
     // Now restore Dave's write access.
-    let restore = GovernanceAction::RestoreAccess { did: dave(), capabilities: vec![Capability::MessagesWrite] };
+    let restore = GovernanceAction::RestoreAccess {
+        did: dave(),
+        capabilities: vec![Capability::MessagesWrite],
+    };
     let outcome = propose_and_approve_threshold(&manager, ctx_id, restore).await;
     assert_eq!(outcome.status, ProposalStatus::Approved);
 
@@ -1018,7 +1024,10 @@ async fn single_admin_auto_executes_restore_read_access() {
         .propose_governance_action_checked(
             ctx_id,
             &alice(),
-            GovernanceAction::RestoreAccess { did: dave(), capabilities: vec![Capability::MessagesRead] },
+            GovernanceAction::RestoreAccess {
+                did: dave(),
+                capabilities: vec![Capability::MessagesRead],
+            },
             &sk_alice,
         )
         .await
@@ -1260,13 +1269,19 @@ async fn full_content_access_lifecycle() {
     assert!(send_result.is_err());
 
     // Phase 3: Restore Dave's read access.
-    let restore_read = GovernanceAction::RestoreAccess { did: dave(), capabilities: vec![Capability::MessagesRead] };
+    let restore_read = GovernanceAction::RestoreAccess {
+        did: dave(),
+        capabilities: vec![Capability::MessagesRead],
+    };
     let outcome = propose_and_approve_threshold(&manager, ctx_id, restore_read).await;
     assert_eq!(outcome.status, ProposalStatus::Approved);
     let _ = manager.drain_events(ctx_id).await;
 
     // Phase 4: Restore Dave's write access.
-    let restore_write = GovernanceAction::RestoreAccess { did: dave(), capabilities: vec![Capability::MessagesWrite] };
+    let restore_write = GovernanceAction::RestoreAccess {
+        did: dave(),
+        capabilities: vec![Capability::MessagesWrite],
+    };
     let outcome = propose_and_approve_threshold(&manager, ctx_id, restore_write).await;
     assert_eq!(outcome.status, ProposalStatus::Approved);
     let _ = manager.drain_events(ctx_id).await;

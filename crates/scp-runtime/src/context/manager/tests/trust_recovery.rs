@@ -46,10 +46,7 @@ async fn cac009_tier1_encrypted_block_unblock() {
     let result = manager
         .execute_governance_action("cac009-enc", &revoke)
         .await;
-    assert!(
-        result.is_ok(),
-        "Revoke (read) should succeed: {result:?}"
-    );
+    assert!(result.is_ok(), "Revoke (read) should succeed: {result:?}");
     {
         let contexts = manager.contexts.lock().await;
         let ctx = contexts.get("cac009-enc").unwrap();

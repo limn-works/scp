@@ -25,7 +25,7 @@ use scp_platform::traits::{KeyCustody, KeyType};
 use scp_protocol::context::ContextError;
 use scp_protocol::context::builder::{ContextCreationError, ContextCryptoProvider};
 use scp_protocol::context::governance::{
-    GovernanceAction, KeyResolver, ProposalStatus, AccessScope,
+    AccessScope, GovernanceAction, KeyResolver, ProposalStatus,
 };
 use scp_protocol::context::params::{Capability, ContextParams, GovernanceModel};
 use scp_protocol::crypto::access_keys::wrapping::{Recipient, unwrap_content, wrap_content};
@@ -859,7 +859,10 @@ async fn tier3_governance_revoke_write_access_broadcast() {
     // --- RestoreAccess { access: AccessScope::Write } -> Author can publish again ---
 
     let _ = manager.drain_events(ctx_id).await;
-    let restore = GovernanceAction::RestoreAccess { did: author_did(), capabilities: vec![Capability::MessagesWrite] };
+    let restore = GovernanceAction::RestoreAccess {
+        did: author_did(),
+        capabilities: vec![Capability::MessagesWrite],
+    };
     let outcome = propose_and_approve_threshold(&manager, ctx_id, restore).await;
     assert_eq!(outcome.status, ProposalStatus::Approved);
 
@@ -1577,7 +1580,10 @@ async fn governance_tier_stacking_via_context_manager() {
     // --- Reverse Tier 3 too: RestoreAccess (write) ---
 
     let _ = manager.drain_events(ctx_id).await;
-    let restore = GovernanceAction::RestoreAccess { did: dave(), capabilities: vec![Capability::MessagesWrite] };
+    let restore = GovernanceAction::RestoreAccess {
+        did: dave(),
+        capabilities: vec![Capability::MessagesWrite],
+    };
     let outcome = propose_and_approve_threshold(&manager, ctx_id, restore).await;
     assert_eq!(outcome.status, ProposalStatus::Approved);
 
