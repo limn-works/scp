@@ -8358,17 +8358,6 @@ public func discoveryParseAddress(address: String)throws  -> String  {
 })
 }
 /**
- * Computes an EIP-1559-style relay price adjustment. Returns JSON.
- */
-public func economyAdjustRelayPrice(configJson: String, actualUtilizationPct: UInt64)throws  -> String  {
-    return try  FfiConverterString.lift(try rustCallWithError(FfiConverterTypeScpError_lift) {
-    uniffi_scp_ffi_uniffi_fn_func_economy_adjust_relay_price(
-        FfiConverterString.lower(configJson),
-        FfiConverterUInt64.lower(actualUtilizationPct),$0
-    )
-})
-}
-/**
  * Computes escalated cost for a sender based on antispam velocity.
  */
 public func economyAntispamEscalatedCost(contextId: String, senderDid: String, now: UInt64, baseCost: UInt64, thresholdsJson: String, floor: UInt64?, cap: UInt64?)throws  -> UInt64  {
@@ -11051,9 +11040,6 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_scp_ffi_uniffi_checksum_func_discovery_parse_address() != 10962) {
-        return InitializationResult.apiChecksumMismatch
-    }
-    if (uniffi_scp_ffi_uniffi_checksum_func_economy_adjust_relay_price() != 4682) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_scp_ffi_uniffi_checksum_func_economy_antispam_escalated_cost() != 13986) {

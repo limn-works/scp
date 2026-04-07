@@ -193,7 +193,6 @@
         {"name": "check_policy_lock", "python": true, "typescript": true, "kotlin": true, "swift": true},
         {"name": "validate_policy_change", "python": true, "typescript": true, "kotlin": true, "swift": true},
         {"name": "evaluate_formula", "python": true, "typescript": true, "kotlin": true, "swift": true},
-        {"name": "adjust_relay_price", "python": true, "typescript": true, "kotlin": true, "swift": true},
         {"name": "budget_remaining", "python": true, "typescript": true, "kotlin": true, "swift": true},
         {"name": "budget_grant", "python": true, "typescript": true, "kotlin": true, "swift": true},
         {"name": "budget_record_spend", "python": true, "typescript": true, "kotlin": true, "swift": true},

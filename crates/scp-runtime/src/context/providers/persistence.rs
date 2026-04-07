@@ -201,6 +201,9 @@ mod tests {
             velocity_tracker_state: None,
             cooldown_until: std::collections::HashMap::new(),
             proposal_timestamps: std::collections::HashMap::new(),
+            message_pricing: None,
+            hard_rate_limit_config: None,
+            hard_rate_limit_state: std::collections::HashMap::new(),
         }
     }
 

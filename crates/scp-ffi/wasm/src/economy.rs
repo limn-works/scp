@@ -48,10 +48,6 @@ fn metrics_from_json(metrics: &serde_json::Value) -> ObservableMetrics {
             .get("storage_usage")
             .and_then(serde_json::Value::as_u64)
             .unwrap_or(0),
-        relay_base_price: metrics
-            .get("relay_base_price")
-            .and_then(serde_json::Value::as_u64)
-            .unwrap_or(0),
     }
 }
 
@@ -231,83 +227,6 @@ pub fn economy_check_policy_lock(policy_json: String) -> Promise {
             .unwrap_or(false);
 
         let result = serde_json::json!({ "locked": locked });
-        Ok(JsValue::from_str(&result.to_string()))
-    })
-}
-
-// ---------------------------------------------------------------------------
-// economy_adjust_relay_price
-// ---------------------------------------------------------------------------
-
-/// Computes an EIP-1559-style relay price adjustment.
-///
-/// Returns a JSON string with `new_base_price`, `previous_base_price`, and
-/// `direction`.
-#[wasm_bindgen]
-pub fn economy_adjust_relay_price(config_json: String, actual_utilization_pct: u32) -> Promise {
-    future_to_promise(async move {
-        let config: serde_json::Value = serde_json::from_str(&config_json).map_err(|e| {
-            JsValue::from_str(&format!(
-                "[SCP-VALID-7050] invalid relay pricing config JSON: {e}"
-            ))
-        })?;
-
-        let target = config
-            .get("target_utilization_pct")
-            .and_then(serde_json::Value::as_u64)
-            .unwrap_or(50);
-        let current = config
-            .get("current_base_price")
-            .and_then(serde_json::Value::as_u64)
-            .unwrap_or(0);
-        let max_change_per_mille = config
-            .get("max_change_per_mille")
-            .and_then(serde_json::Value::as_u64)
-            .unwrap_or(125);
-        let floor = config
-            .get("floor")
-            .and_then(serde_json::Value::as_u64)
-            .unwrap_or(0);
-        let cap = config
-            .get("cap")
-            .and_then(serde_json::Value::as_u64)
-            .unwrap_or(u64::MAX);
-
-        let actual = u64::from(actual_utilization_pct);
-        let max_change = current.saturating_mul(max_change_per_mille) / 1000;
-
-        let (above_target, delta_pct) = if actual >= target {
-            (true, actual.saturating_sub(target))
-        } else {
-            (false, target.saturating_sub(actual))
-        };
-
-        let change = if delta_pct >= 100 {
-            max_change
-        } else {
-            max_change.saturating_mul(delta_pct) / 100
-        };
-
-        let new_price = if above_target {
-            current.saturating_add(change)
-        } else {
-            current.saturating_sub(change)
-        };
-
-        let clamped = new_price.max(floor).min(cap);
-
-        let direction = match clamped.cmp(&current) {
-            std::cmp::Ordering::Greater => "Increased",
-            std::cmp::Ordering::Less => "Decreased",
-            std::cmp::Ordering::Equal => "Unchanged",
-        };
-
-        let result = serde_json::json!({
-            "new_base_price": clamped,
-            "previous_base_price": current,
-            "direction": direction,
-        });
-
         Ok(JsValue::from_str(&result.to_string()))
     })
 }

@@ -764,6 +764,9 @@ async fn persist_drop_restore_roundtrip() {
         velocity_tracker_state: None,
         cooldown_until: std::collections::HashMap::new(),
         proposal_timestamps: std::collections::HashMap::new(),
+        message_pricing: None,
+        hard_rate_limit_config: None,
+        hard_rate_limit_state: std::collections::HashMap::new(),
     };
 
     let bc_snapshot = test_broadcast_snapshot("persist-ctx-2");
@@ -880,6 +883,9 @@ async fn restore_preserves_executed_proposals() {
         velocity_tracker_state: None,
         cooldown_until: std::collections::HashMap::new(),
         proposal_timestamps: std::collections::HashMap::new(),
+        message_pricing: None,
+        hard_rate_limit_config: None,
+        hard_rate_limit_state: std::collections::HashMap::new(),
     };
 
     persistence
@@ -984,6 +990,9 @@ async fn restore_respawns_ttl_timer() {
         velocity_tracker_state: None,
         cooldown_until: std::collections::HashMap::new(),
         proposal_timestamps: std::collections::HashMap::new(),
+        message_pricing: None,
+        hard_rate_limit_config: None,
+        hard_rate_limit_state: std::collections::HashMap::new(),
     };
 
     persistence.persist_context("ttl-ctx", &snapshot).unwrap();
@@ -1067,6 +1076,9 @@ async fn restore_all_contexts_restores_persisted() {
             velocity_tracker_state: None,
             cooldown_until: std::collections::HashMap::new(),
             proposal_timestamps: std::collections::HashMap::new(),
+            message_pricing: None,
+            hard_rate_limit_config: None,
+            hard_rate_limit_state: std::collections::HashMap::new(),
         };
         persistence.persist_context(ctx_name, &snapshot).unwrap();
     }
@@ -1149,6 +1161,9 @@ async fn restore_context_rejects_duplicate() {
         velocity_tracker_state: None,
         cooldown_until: std::collections::HashMap::new(),
         proposal_timestamps: std::collections::HashMap::new(),
+        message_pricing: None,
+        hard_rate_limit_config: None,
+        hard_rate_limit_state: std::collections::HashMap::new(),
     };
 
     let bc_snapshot = test_broadcast_snapshot("dup-ctx");
@@ -1253,6 +1268,9 @@ async fn restore_context_sets_needs_reconnect_on_grace_inconsistency() {
         velocity_tracker_state: None,
         cooldown_until: std::collections::HashMap::new(),
         proposal_timestamps: std::collections::HashMap::new(),
+        message_pricing: None,
+        hard_rate_limit_config: None,
+        hard_rate_limit_state: std::collections::HashMap::new(),
     };
 
     let bc_snapshot = test_broadcast_snapshot("grace-incon-ctx");
@@ -1364,6 +1382,9 @@ async fn restore_context_no_reconnect_when_grace_consistent() {
         velocity_tracker_state: None,
         cooldown_until: std::collections::HashMap::new(),
         proposal_timestamps: std::collections::HashMap::new(),
+        message_pricing: None,
+        hard_rate_limit_config: None,
+        hard_rate_limit_state: std::collections::HashMap::new(),
     };
 
     let bc_snapshot = test_broadcast_snapshot("grace-ok-ctx");
@@ -1463,6 +1484,9 @@ fn reconnect_test_snapshot(
         velocity_tracker_state: None,
         cooldown_until: std::collections::HashMap::new(),
         proposal_timestamps: std::collections::HashMap::new(),
+        message_pricing: None,
+        hard_rate_limit_config: None,
+        hard_rate_limit_state: std::collections::HashMap::new(),
     }
 }
 

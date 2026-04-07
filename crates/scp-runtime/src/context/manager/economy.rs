@@ -194,6 +194,11 @@ async fn verify_and_check_receipt(
 /// One unified flow per the escrow
 /// pattern: evaluate cost -> check spending UCAN -> check budget -> deduct.
 ///
+/// The cost is composed by (a) evaluating the policy formula (if any) to obtain
+/// a base cost — falling back to `pricing.base_cost` when the formula is absent
+/// — and then (b) layering the per-DID escalation/floor/cap from `pricing` via
+/// [`SenderVelocityTracker::compute_escalated_cost`] (spec §19.7).
+///
 /// Returns the deducted cost for rollback on failure, or `None` if no cost.
 #[allow(clippy::too_many_arguments)] // Economy enforcement requires many context parameters.
 pub(super) fn enforce_economy(
@@ -208,39 +213,65 @@ pub(super) fn enforce_economy(
     action_label: &str,
     context_id: &str,
     clock: &dyn scp_primitives::Clock,
-    relay_base_price: u64,
+    pricing: &scp_protocol::economy::antispam::ContextMessagePricingConfig,
     nonce_tracker: &mut scp_protocol::crypto::ucan::nonce::NonceTracker<
         std::sync::Arc<dyn scp_primitives::Clock>,
     >,
 ) -> Result<Option<scp_protocol::economy::types::Amount>, ContextError> {
+    // Free contexts (no `economic_policy`) do not charge at the cost layer.
+    // Defense-in-depth against spam on free contexts is provided by the
+    // Matrix-style token-bucket hard rate limit, which is enforced earlier
+    // in the send/join/invoke paths and operates independently of cost.
     let Some(policy) = economic_policy else {
         return Ok(None);
     };
+
+    // Step 1: derive a base cost from the policy. When the policy carries a
+    // pricing formula, evaluate it against observable metrics; otherwise the
+    // formula is absent and `evaluate_cost` consults the flat `CostSchedule`.
+    //
+    // §19.7 escalation applies to MessageSend, ContextJoin, and ToolInvoke.
+    // For SubscriptionPeriod and ByteStored we delegate entirely to the
+    // policy (no per-DID escalation makes sense for them).
+    let escalation_eligible = matches!(
+        action_type,
+        PaidActionType::MessageSend | PaidActionType::ContextJoin | PaidActionType::ToolInvoke
+    );
 
     let velocity = velocity_tracker.get_velocity(actor_did, now);
     let metrics = ObservableMetrics {
         sender_velocity: velocity,
         member_count: u64::try_from(member_count).unwrap_or(u64::MAX),
         context_message_rate: velocity_tracker.aggregate_velocity(now),
-        // relay_queue_depth: Requires relay-level telemetry not available at ContextManager.
-        // The relay tracks its own queue depth server-side; populating this field would
-        // require a relay->client metrics channel. Until that transport-layer telemetry
-        // exists, relay-queue-based pricing variables evaluate to zero.
         relay_queue_depth: 0,
         time_of_day: now % 86400,
-        // storage_usage: Requires storage provider metrics not available at ContextManager.
-        // The Storage trait (scp-platform) does not expose per-context byte counts.
         storage_usage: 0,
-        relay_base_price,
     };
-
-    // M2: evaluate_cost returns None on formula overflow — treat as error,
-    // not free pass. Returning Ok(None) would silently skip the payment gate.
-    let Some(cost) = scp_protocol::economy::policy::evaluate_cost(policy, action_type, &metrics)
+    let Some(base_cost) =
+        scp_protocol::economy::policy::evaluate_cost(policy, action_type, &metrics)
     else {
         return Err(ContextError::PermissionDenied(
             "SCP-ECON-7063: cost evaluation overflow".to_owned(),
         ));
+    };
+
+    // Step 2: layer per-DID escalation/floor/cap (§19.7) on top of the
+    // policy-derived base cost for eligible actions. When the policy
+    // explicitly prices an action at zero (`per_message: Some(Amount(0))`
+    // or `per_message: None`), the action remains free — escalation only
+    // layers on top of an existing non-zero cost so that operators can
+    // define free action types even under a priced policy.
+    let cost = if escalation_eligible && base_cost.value() > 0 {
+        velocity_tracker.compute_escalated_cost(
+            actor_did,
+            now,
+            base_cost,
+            &pricing.escalation,
+            pricing.floor,
+            pricing.cap,
+        )
+    } else {
+        base_cost
     };
 
     if cost.0 == 0 {
@@ -384,11 +415,6 @@ impl ContextManager {
                 relay_queue_depth: 0,
                 time_of_day: now_secs % 86400,
                 storage_usage: 0,
-                relay_base_price: ctx
-                    .governance
-                    .relay_pricing_config
-                    .as_ref()
-                    .map_or(0, |c| c.current_base_price.0),
             };
             (policy, metrics)
         };

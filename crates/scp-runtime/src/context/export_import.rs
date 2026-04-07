@@ -347,6 +347,12 @@ fn strip_snapshot_for_public(snapshot: &ContextSnapshot) -> ContextSnapshot {
         velocity_tracker_state: None,
         cooldown_until: HashMap::new(),
         proposal_timestamps: HashMap::new(),
+        // Per-DID anti-spam pricing (§19.7) is part of the public opt-in
+        // contract — joiners must see the cost before joining. Hard rate
+        // limit config is also public; the per-sender bucket state is local.
+        message_pricing: snapshot.message_pricing.clone(),
+        hard_rate_limit_config: snapshot.hard_rate_limit_config.clone(),
+        hard_rate_limit_state: HashMap::new(),
     }
 }
 
@@ -460,6 +466,9 @@ mod tests {
             velocity_tracker_state: None,
             cooldown_until: std::collections::HashMap::new(),
             proposal_timestamps: std::collections::HashMap::new(),
+            message_pricing: None,
+            hard_rate_limit_config: None,
+            hard_rate_limit_state: std::collections::HashMap::new(),
         }
     }
 

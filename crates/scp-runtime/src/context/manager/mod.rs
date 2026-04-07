@@ -71,6 +71,7 @@ mod lifecycle;
 mod messaging;
 mod queries;
 pub(crate) mod standing;
+mod tools;
 mod trust_recovery;
 mod ttl_close;
 
@@ -561,6 +562,21 @@ pub struct ContextSnapshot {
     /// proposals. Persisted so rate limiting survives process restarts.
     #[serde(default)]
     pub proposal_timestamps: HashMap<String, Vec<u64>>,
+    /// Spec §19.7 per-DID escalating-cost message pricing configuration.
+    /// `None` for legacy snapshots; on restore, defaults to
+    /// `ContextMessagePricingConfig::spec_default()`.
+    #[serde(default)]
+    pub message_pricing: Option<scp_protocol::economy::antispam::ContextMessagePricingConfig>,
+    /// Hard rate limit (Matrix Synapse–style token bucket) configuration.
+    /// `None` for legacy snapshots; on restore, defaults to
+    /// `HardRateLimitConfig::matrix_defaults()`.
+    #[serde(default)]
+    pub hard_rate_limit_config: Option<scp_protocol::economy::antispam::HardRateLimitConfig>,
+    /// Per-sender token bucket state for the hard rate limit, captured at
+    /// snapshot time. Empty for legacy snapshots; restored verbatim into the
+    /// new limiter via `TokenBucketLimiter::from_snapshot`.
+    #[serde(default)]
+    pub hard_rate_limit_state: HashMap<String, (u64, u64)>,
 }
 
 /// Serializable snapshot of [`SenderVelocityTracker`](scp_protocol::economy::antispam::SenderVelocityTracker)
@@ -729,9 +745,18 @@ struct GovernanceState {
     /// timestamp (seconds) until which the rule should not re-fire. Prevents
     /// repeated consequence dispatch within a rule's evaluation window.
     cooldown_until: HashMap<usize, u64>,
-    /// Optional EIP-1559-style relay pricing configuration (§19.8, #1537).
-    /// Updated on each message send via `maybe_adjust_relay_pricing`.
-    relay_pricing_config: Option<scp_protocol::economy::pricing::RelayPricingConfig>,
+    /// Spec §19.7 per-DID escalating-cost message pricing configuration.
+    ///
+    /// Bundles base cost, escalation tiers, floor/cap clamps, and the
+    /// (separate) hard rate limit configuration. Replaces the deleted
+    /// non-spec aggregate `RelayPricingConfig`.
+    message_pricing: Option<scp_protocol::economy::antispam::ContextMessagePricingConfig>,
+    /// Defense-in-depth Matrix-style token bucket hard rate limiter.
+    ///
+    /// Layered on top of the per-DID economic escalation in spec §19.7. This
+    /// is enforced even when `economic_policy` is `None`. See ADR notes on
+    /// the dormant anti-spam wiring fix.
+    hard_rate_limit: scp_protocol::economy::antispam::TokenBucketLimiter,
     /// Per-context nonce tracker for spending UCAN replay prevention (ADR-016 §6).
     /// Validates that each spending UCAN nonce is used at most once, preventing
     /// replay attacks where a valid spending UCAN is resubmitted.
@@ -1837,6 +1862,9 @@ impl ContextManager {
             }),
             cooldown_until: ctx.governance.cooldown_until.clone(),
             proposal_timestamps: ctx.governance.proposal_timestamps.clone(),
+            message_pricing: ctx.governance.message_pricing.clone(),
+            hard_rate_limit_config: Some(ctx.governance.hard_rate_limit.config().clone()),
+            hard_rate_limit_state: ctx.governance.hard_rate_limit.snapshot_entries(),
         }
     }
 }

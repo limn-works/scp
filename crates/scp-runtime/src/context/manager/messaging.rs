@@ -30,11 +30,13 @@ fn enforce_send_economy(
     context_id: &str,
     clock: &dyn scp_primitives::Clock,
 ) -> Result<Option<scp_protocol::economy::types::Amount>, ContextError> {
-    let relay_base_price = ctx
+    let pricing_default =
+        scp_protocol::economy::antispam::ContextMessagePricingConfig::spec_default();
+    let pricing = ctx
         .governance
-        .relay_pricing_config
+        .message_pricing
         .as_ref()
-        .map_or(0, |c| c.current_base_price.0);
+        .unwrap_or(&pricing_default);
     super::economy::enforce_economy(
         ctx.governance.economic_policy.as_ref(),
         &mut ctx.governance.budget_tracker,
@@ -47,32 +49,9 @@ fn enforce_send_economy(
         "messages:write",
         context_id,
         clock,
-        relay_base_price,
+        pricing,
         &mut ctx.governance.spending_nonce_tracker,
     )
-}
-
-/// Updates the relay base price based on current context utilization (#1537).
-///
-/// Called periodically (on message send) to adjust the EIP-1559-style relay
-/// price. Uses member count as a proxy for utilization. Only applies when the
-/// context has a relay pricing config in its governance state.
-fn maybe_adjust_relay_pricing(ctx: &mut PerContextState, now: u64) {
-    if let Some(ref mut config) = ctx.governance.relay_pricing_config {
-        // Use aggregate velocity (messages/window across all senders) as a
-        // utilization proxy instead of raw member count. This better reflects
-        // actual load on the relay and makes pricing responsive to traffic
-        // patterns rather than static membership.
-        let utilization_pct = ctx
-            .governance
-            .velocity_tracker
-            .aggregate_velocity(now)
-            .min(100);
-        let adjustment =
-            scp_protocol::economy::pricing::adjust_relay_price(config, utilization_pct);
-        // Apply the new base price back to the config.
-        config.current_base_price = adjustment.new_base_price;
-    }
 }
 
 /// Re-export of the protocol-level domain-separated routing ID derivation.
@@ -357,26 +336,42 @@ impl ContextManager {
                 };
                 return Err(ContextError::PermissionDenied(msg));
             }
+            // Defense-in-depth (Matrix Synapse–style hard rate limit): consume
+            // a token from the per-sender bucket before any pricing logic.
+            // This bounds inbound load even when no economic policy or budget
+            // is configured. On any subsequent failure we refund the token so
+            // a rejected attempt does not consume bucket capacity.
+            let now_secs = self.clock.now_secs();
+            if !ctx
+                .governance
+                .hard_rate_limit
+                .try_consume(sender_did, now_secs)
+            {
+                return Err(ContextError::PermissionDenied(
+                    "SCP-ECON-7090: hard rate limit exceeded for sender".to_owned(),
+                ));
+            }
             // M4: record velocity BEFORE economy enforcement so the current
             // message is included in the velocity metric used for pricing.
             ctx.governance
                 .velocity_tracker
-                .record_message(sender_did, self.clock.now_secs());
+                .record_message(sender_did, now_secs);
 
             let deducted_cost = match enforce_send_economy(
                 ctx,
                 sender_did,
-                self.clock.now_secs(),
+                now_secs,
                 spending_ucan,
                 &context_id,
                 &*self.clock,
             ) {
                 Ok(cost) => cost,
                 Err(e) => {
-                    // Roll back the velocity increment recorded above so a
-                    // rejected message does not permanently inflate the
-                    // sender's velocity count.
+                    // Roll back both: the velocity increment recorded above
+                    // and the hard-rate-limit token. A rejected message must
+                    // not permanently penalize the sender on either axis.
                     ctx.governance.velocity_tracker.rollback_last(sender_did);
+                    ctx.governance.hard_rate_limit.refund(sender_did);
                     return Err(e);
                 }
             };
@@ -647,9 +642,6 @@ impl ContextManager {
                         .participation_cache
                         .insert(sender_did.to_string(), record);
                 }
-
-                // Dynamic pricing (#1537) — adjust relay price on each send.
-                maybe_adjust_relay_pricing(ctx, now);
             }
         }
         if self.has_persistence() {

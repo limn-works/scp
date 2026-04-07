@@ -11,6 +11,10 @@ pub mod pricing;
 pub mod types;
 
 // Re-exports for backward compatibility.
+pub use antispam::{
+    ContextMessagePricingConfig, EscalationConfig, EscalationThreshold, HardRateLimitConfig,
+    SenderVelocityTracker, TokenBucketLimiter,
+};
 pub use policy::{
     AVAILABLE_METRICS, UnavailableMetricError, validate_economic_policy_metrics,
     validate_formula_metrics,

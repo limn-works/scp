@@ -167,7 +167,6 @@ const PARITY_OPERATIONS: &[(&str, &str, bool)] = &[
     ("economy", "economy_check_policy_lock", false),
     ("economy", "economy_validate_policy_change", false),
     ("economy", "economy_evaluate_formula", false),
-    ("economy", "economy_adjust_relay_price", false),
     ("economy", "economy_budget_remaining", false),
     ("economy", "economy_budget_grant", false),
     ("economy", "economy_budget_record_spend", false),
@@ -1030,7 +1029,16 @@ fn discovery_and_provenance_coverage() {
 // Any decrease requires human approval
 // =========================================================================
 
-const MIN_PARITY_OPERATIONS: usize = 98;
+// Ratchet lowered from 98 -> 97 by the spec §19.7 anti-spam wiring plan:
+// the non-spec aggregate-velocity relay pricing operation
+// (`economy_evaluate_relay_cost` / `evaluate_relay_cost`) was deleted
+// across all FFI bridges + language SDK wrappers because it is NOT in the
+// protocol spec. The authoritative per-DID escalation mechanism (spec
+// §19.7) is now wired through the existing `context_send_message` and
+// `context_invoke_tool_with_economy` paths, so no new parity operation
+// was added in its place. This is a legitimate removal with human
+// approval via the 7-step plan; the ratchet is reset to the new floor.
+const MIN_PARITY_OPERATIONS: usize = 97;
 
 /// Named set of operations that must have `wasm_required=true`.
 /// This is a named set, not a count — swapping one operation for another is

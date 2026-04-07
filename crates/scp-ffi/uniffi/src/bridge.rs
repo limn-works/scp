@@ -12297,31 +12297,6 @@ pub fn economy_evaluate_formula(
         .map(scp_core::economy::Amount::value))
 }
 
-/// Computes an EIP-1559-style relay price adjustment. Returns JSON.
-#[uniffi::export]
-pub fn economy_adjust_relay_price(
-    config_json: String,
-    actual_utilization_pct: u64,
-) -> Result<String, ScpError> {
-    let config: scp_core::economy::RelayPricingConfig = serde_json::from_str(&config_json)
-        .map_err(|e| ScpError::Validation {
-            msg: format!("invalid relay pricing config JSON: {e}"),
-            code: "SCP-VALID-7050".to_owned(),
-        })?;
-    let result = scp_core::economy::adjust_relay_price(&config, actual_utilization_pct);
-    let direction = match result.direction {
-        scp_core::economy::PriceDirection::Increased => "Increased",
-        scp_core::economy::PriceDirection::Decreased => "Decreased",
-        scp_core::economy::PriceDirection::Unchanged => "Unchanged",
-    };
-    let json = serde_json::json!({
-        "new_base_price": result.new_base_price.value(),
-        "previous_base_price": result.previous_base_price.value(),
-        "direction": direction,
-    });
-    Ok(json.to_string())
-}
-
 /// Queries the remaining budget for a member in a context.
 #[uniffi::export]
 pub fn economy_budget_remaining(context_id: String, did: String) -> Result<u64, ScpError> {
@@ -12687,10 +12662,6 @@ fn parse_observable_metrics(json: &str) -> Result<scp_core::economy::ObservableM
             .unwrap_or(0),
         storage_usage: v
             .get("storage_usage")
-            .and_then(serde_json::Value::as_u64)
-            .unwrap_or(0),
-        relay_base_price: v
-            .get("relay_base_price")
             .and_then(serde_json::Value::as_u64)
             .unwrap_or(0),
     })
