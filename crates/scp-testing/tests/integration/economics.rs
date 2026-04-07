@@ -17,10 +17,7 @@ use scp_core::economy::{
     PaymentAdapter, PaymentMetadata, PaymentReceipt, PricingFormula, PricingMetric,
     PricingVariable, SenderVelocityTracker,
 };
-use scp_core::economy::{
-    ObservableMetrics, PriceDirection, RelayPricingConfig, adjust_relay_price, check_policy_lock,
-    evaluate_formula, lookup_cost,
-};
+use scp_core::economy::{ObservableMetrics, check_policy_lock, evaluate_formula, lookup_cost};
 use scp_identity::DID;
 use scp_testing::TestAdapter;
 
@@ -415,64 +412,6 @@ async fn velocity_tracker() {
     assert_eq!(tracker.get_velocity(&sender2, 1005), 1);
     // sender's messages are now outside the window at t=1070
     assert_eq!(tracker.get_velocity(&sender, 1070), 0);
-}
-
-// -----------------------------------------------------------------------
-// Test 10: relay_pricing_adjustment
-// -----------------------------------------------------------------------
-
-#[tokio::test]
-async fn relay_pricing_adjustment() {
-    let config = RelayPricingConfig {
-        target_utilization_pct: 50,
-        current_base_price: Amount::new(1000),
-        max_change_per_mille: 125, // 12.5%
-        floor: Amount::new(100),
-        cap: Amount::new(10_000),
-    };
-
-    // Above target: price increases.
-    let result = adjust_relay_price(&config, 80);
-    assert_eq!(result.direction, PriceDirection::Increased);
-    assert!(result.new_base_price > config.current_base_price);
-    // max_change = 1000 * 125 / 1000 = 125
-    // proportional = 125 * 30 / 100 = 37
-    // new_price = 1000 + 37 = 1037
-    assert_eq!(result.new_base_price, Amount::new(1037));
-
-    // Below target: price decreases.
-    let result_low = adjust_relay_price(&config, 20);
-    assert_eq!(result_low.direction, PriceDirection::Decreased);
-    // proportional = 125 * 30 / 100 = 37
-    // new_price = 1000 - 37 = 963
-    assert_eq!(result_low.new_base_price, Amount::new(963));
-
-    // At target: unchanged.
-    let result_eq = adjust_relay_price(&config, 50);
-    assert_eq!(result_eq.direction, PriceDirection::Unchanged);
-    assert_eq!(result_eq.new_base_price, Amount::new(1000));
-
-    // Cap enforcement.
-    let high_config = RelayPricingConfig {
-        current_base_price: Amount::new(9900),
-        target_utilization_pct: config.target_utilization_pct,
-        max_change_per_mille: config.max_change_per_mille,
-        floor: config.floor,
-        cap: config.cap,
-    };
-    let result_cap = adjust_relay_price(&high_config, 100);
-    assert!(result_cap.new_base_price <= Amount::new(10_000));
-
-    // Floor enforcement.
-    let low_config = RelayPricingConfig {
-        current_base_price: Amount::new(105),
-        max_change_per_mille: 500,
-        target_utilization_pct: config.target_utilization_pct,
-        floor: config.floor,
-        cap: config.cap,
-    };
-    let result_floor = adjust_relay_price(&low_config, 0);
-    assert!(result_floor.new_base_price >= Amount::new(100));
 }
 
 // -----------------------------------------------------------------------

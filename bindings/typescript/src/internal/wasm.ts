@@ -463,10 +463,6 @@ interface WasmModule {
   economy_check_policy_lock: (policyJson: string) => boolean;
   economy_validate_policy_change: (currentJson: string, proposedJson: string) => boolean;
   economy_evaluate_formula: (formulaJson: string, metricsJson: string) => number;
-  economy_adjust_relay_price: (
-    configJson: string,
-    utilizationPct: number,
-  ) => { newBasePrice: number; previousBasePrice: number; direction: string };
   economy_budget_remaining: (contextId: string, did: string) => number;
   economy_budget_grant: (contextId: string, did: string, amount: number) => void;
   economy_budget_record_spend: (contextId: string, did: string, amount: number) => void;
@@ -1926,11 +1922,6 @@ export function createWasmBridge(): Bridge {
     economyEvaluateFormula(formulaJson: string, metricsJson: string): number {
       const wasm = getWasm();
       return wasm.economy_evaluate_formula(formulaJson, metricsJson);
-    },
-
-    economyAdjustRelayPrice(configJson: string, utilizationPct: number) {
-      const wasm = getWasm();
-      return wasm.economy_adjust_relay_price(configJson, utilizationPct);
     },
 
     economyBudgetRemaining(contextId: string, did: string): number {

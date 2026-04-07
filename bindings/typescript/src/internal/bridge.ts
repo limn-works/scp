@@ -519,10 +519,6 @@ export interface Bridge {
   economyCheckPolicyLock(policyJson: string): boolean;
   economyValidatePolicyChange(currentJson: string, proposedJson: string): boolean;
   economyEvaluateFormula(formulaJson: string, metricsJson: string): number;
-  economyAdjustRelayPrice(
-    configJson: string,
-    utilizationPct: number,
-  ): { newBasePrice: number; previousBasePrice: number; direction: string };
   economyBudgetRemaining(contextId: string, did: string): number;
   economyBudgetGrant(contextId: string, did: string, amount: number): void;
   economyBudgetRecordSpend(contextId: string, did: string, amount: number): void;

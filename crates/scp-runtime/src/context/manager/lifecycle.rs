@@ -105,30 +105,21 @@ fn post_join_bookkeeping(
     }
 }
 
-/// Derives a default [`RelayPricingConfig`] from an [`EconomicPolicy`].
+/// Returns the spec §19.7 default per-DID message pricing configuration.
 ///
-/// When a context has an economic policy with a `per_message` cost, relay
-/// pricing should track utilization-based price adjustments. If no economic
-/// policy is configured, returns `None` (no relay pricing).
-///
-/// The defaults mirror EIP-1559: 50% target utilization, 12.5% max change,
-/// with floor = 1 and cap = 10x the per-message cost.
-fn derive_relay_pricing_config(
-    economic_policy: Option<&scp_protocol::economy::types::EconomicPolicy>,
-) -> Option<scp_protocol::economy::pricing::RelayPricingConfig> {
-    let policy = economic_policy?;
-    let base_price = policy.cost_schedule.per_message?;
-    // Only enable relay pricing when there's a non-zero message cost.
-    if base_price.0 == 0 {
-        return None;
-    }
-    Some(scp_protocol::economy::pricing::RelayPricingConfig {
-        target_utilization_pct: 50,
-        current_base_price: base_price,
-        max_change_per_mille: 125, // 12.5% per EIP-1559
-        floor: scp_protocol::economy::types::Amount::new(1),
-        cap: scp_protocol::economy::types::Amount::new(base_price.0.saturating_mul(10)),
-    })
+/// Every context now uses the same baseline: per-DID escalating cost for
+/// `MessageSend`, `ContextJoin`, and `ToolInvoke`, plus the Matrix-style
+/// hard rate limit. The `_economic_policy` parameter is intentionally
+/// unused — it is kept in the signature so call-sites stay symmetrical
+/// with the old `derive_relay_pricing_config` while documenting that
+/// pricing is uniform across all contexts. Per-context pricing
+/// customization will land via governance in a follow-up PR.
+#[allow(clippy::unnecessary_wraps)] // Option return kept for forward compat
+// with per-context pricing customization landing via governance.
+fn derive_message_pricing(
+    _economic_policy: Option<&scp_protocol::economy::types::EconomicPolicy>,
+) -> Option<scp_protocol::economy::antispam::ContextMessagePricingConfig> {
+    Some(scp_protocol::economy::antispam::ContextMessagePricingConfig::spec_default())
 }
 
 /// Enforces economic policy for context joins (#1537, #1593).
@@ -155,11 +146,13 @@ fn enforce_join_economy(
             "SCP-ECON-7030: paid context requires explicit acceptance".into(),
         ));
     }
-    let relay_base_price = ctx
+    let pricing_default =
+        scp_protocol::economy::antispam::ContextMessagePricingConfig::spec_default();
+    let pricing = ctx
         .governance
-        .relay_pricing_config
+        .message_pricing
         .as_ref()
-        .map_or(0, |c| c.current_base_price.0);
+        .unwrap_or(&pricing_default);
     super::economy::enforce_economy(
         ctx.governance.economic_policy.as_ref(),
         &mut ctx.governance.budget_tracker,
@@ -172,7 +165,7 @@ fn enforce_join_economy(
         "context:join",
         context_id,
         clock,
-        relay_base_price,
+        pricing,
         &mut ctx.governance.spending_nonce_tracker,
     )
 }
@@ -305,8 +298,15 @@ impl ContextManager {
                 registered_tools: ctx_snapshot.registered_tools,
                 tool_interfaces: ctx_snapshot.tool_interfaces,
                 pruning_policy: ctx_snapshot.pruning_policy,
-                relay_pricing_config: derive_relay_pricing_config(
-                    ctx_snapshot.economic_policy.as_ref(),
+                message_pricing: ctx_snapshot
+                    .message_pricing
+                    .clone()
+                    .or_else(|| derive_message_pricing(ctx_snapshot.economic_policy.as_ref())),
+                hard_rate_limit: scp_protocol::economy::antispam::TokenBucketLimiter::from_snapshot(
+                    ctx_snapshot.hard_rate_limit_config.clone().unwrap_or_else(
+                        scp_protocol::economy::antispam::HardRateLimitConfig::matrix_defaults,
+                    ),
+                    ctx_snapshot.hard_rate_limit_state.clone(),
                 ),
                 economic_policy: ctx_snapshot.economic_policy,
                 budget_tracker: ctx_snapshot.budget_tracker,
@@ -314,15 +314,16 @@ impl ContextManager {
                 pending_epoch_resets: Vec::new(),
                 consequence_rules: ctx_snapshot.consequence_rules,
                 velocity_tracker: match ctx_snapshot.velocity_tracker_state {
+                    // Always normalize to the spec §19.4 60-second window on
+                    // restore, even when the persisted snapshot used the old
+                    // 3600s default. Per-sender entries are preserved.
                     Some(vts) => {
                         scp_protocol::economy::antispam::SenderVelocityTracker::from_snapshot(
-                            vts.window_secs,
+                            60,
                             vts.entries,
                         )
                     }
-                    None => scp_protocol::economy::antispam::SenderVelocityTracker::new(
-                        ctx_snapshot.velocity_tracker.unwrap_or(3600),
-                    ),
+                    None => scp_protocol::economy::antispam::SenderVelocityTracker::new(60),
                 },
                 participation_cache: ctx_snapshot.participation_cache,
                 cooldown_until: ctx_snapshot.cooldown_until,
@@ -819,8 +820,20 @@ impl ContextManager {
                 registered_tools: export.snapshot.registered_tools,
                 tool_interfaces: export.snapshot.tool_interfaces,
                 pruning_policy: export.snapshot.pruning_policy,
-                relay_pricing_config: derive_relay_pricing_config(
-                    export.snapshot.economic_policy.as_ref(),
+                message_pricing: export
+                    .snapshot
+                    .message_pricing
+                    .clone()
+                    .or_else(|| derive_message_pricing(export.snapshot.economic_policy.as_ref())),
+                hard_rate_limit: scp_protocol::economy::antispam::TokenBucketLimiter::from_snapshot(
+                    export
+                        .snapshot
+                        .hard_rate_limit_config
+                        .clone()
+                        .unwrap_or_else(
+                            scp_protocol::economy::antispam::HardRateLimitConfig::matrix_defaults,
+                        ),
+                    export.snapshot.hard_rate_limit_state.clone(),
                 ),
                 economic_policy: export.snapshot.economic_policy,
                 budget_tracker: export.snapshot.budget_tracker,
@@ -828,15 +841,14 @@ impl ContextManager {
                 pending_epoch_resets: Vec::new(),
                 consequence_rules: export.snapshot.consequence_rules,
                 velocity_tracker: match export.snapshot.velocity_tracker_state {
+                    // Always normalize to spec §19.4 60s window on import.
                     Some(vts) => {
                         scp_protocol::economy::antispam::SenderVelocityTracker::from_snapshot(
-                            vts.window_secs,
+                            60,
                             vts.entries,
                         )
                     }
-                    None => scp_protocol::economy::antispam::SenderVelocityTracker::new(
-                        export.snapshot.velocity_tracker.unwrap_or(3600),
-                    ),
+                    None => scp_protocol::economy::antispam::SenderVelocityTracker::new(60),
                 },
                 participation_cache: export.snapshot.participation_cache,
                 cooldown_until: export.snapshot.cooldown_until,
@@ -1009,13 +1021,16 @@ impl ContextManager {
                 registered_tools: Vec::new(),
                 tool_interfaces: Vec::new(),
                 pruning_policy: None,
-                relay_pricing_config: derive_relay_pricing_config(params.economic_policy.as_ref()),
+                message_pricing: derive_message_pricing(params.economic_policy.as_ref()),
+                hard_rate_limit: scp_protocol::economy::antispam::TokenBucketLimiter::new(
+                    scp_protocol::economy::antispam::HardRateLimitConfig::matrix_defaults(),
+                ),
                 economic_policy: params.economic_policy.clone(),
                 budget_tracker: MemberBudgetTracker::new(),
                 last_known_members: initial_members,
                 pending_epoch_resets: Vec::new(),
                 consequence_rules: params.consequence_rules.clone(),
-                velocity_tracker: scp_protocol::economy::antispam::SenderVelocityTracker::new(3600),
+                velocity_tracker: scp_protocol::economy::antispam::SenderVelocityTracker::new(60),
                 participation_cache: HashMap::new(),
                 cooldown_until: HashMap::new(),
                 spending_nonce_tracker: scp_protocol::crypto::ucan::nonce::NonceTracker::new(
@@ -1315,13 +1330,16 @@ impl ContextManager {
                 registered_tools: Vec::new(),
                 tool_interfaces: Vec::new(),
                 pruning_policy: None,
-                relay_pricing_config: derive_relay_pricing_config(params.economic_policy.as_ref()),
+                message_pricing: derive_message_pricing(params.economic_policy.as_ref()),
+                hard_rate_limit: scp_protocol::economy::antispam::TokenBucketLimiter::new(
+                    scp_protocol::economy::antispam::HardRateLimitConfig::matrix_defaults(),
+                ),
                 economic_policy: params.economic_policy.clone(),
                 budget_tracker: MemberBudgetTracker::new(),
                 last_known_members: HashSet::new(),
                 pending_epoch_resets: Vec::new(),
                 consequence_rules: params.consequence_rules.clone(),
-                velocity_tracker: scp_protocol::economy::antispam::SenderVelocityTracker::new(3600),
+                velocity_tracker: scp_protocol::economy::antispam::SenderVelocityTracker::new(60),
                 participation_cache: HashMap::new(),
                 cooldown_until: HashMap::new(),
                 spending_nonce_tracker: scp_protocol::crypto::ucan::nonce::NonceTracker::new(
@@ -1435,14 +1453,39 @@ impl ContextManager {
             // a rejected sybil attacker doesn't consume budget. Fail-closed.
             evaluate_sybil_resistance(ctx, &member_did, self.clock.now_secs())?;
 
-            enforce_join_economy(
+            // Defense-in-depth hard rate limit on joins (Matrix-style token
+            // bucket). On any subsequent failure we refund the token.
+            let now_secs = self.clock.now_secs();
+            if !ctx
+                .governance
+                .hard_rate_limit
+                .try_consume(&member_did, now_secs)
+            {
+                return Err(ContextError::PermissionDenied(
+                    "SCP-ECON-7090: hard rate limit exceeded for joiner".to_owned(),
+                ));
+            }
+            // Record the join in the velocity tracker so subsequent §19.7
+            // escalation observes the same activity surface as message sends.
+            ctx.governance
+                .velocity_tracker
+                .record_message(&member_did, now_secs);
+
+            match enforce_join_economy(
                 ctx,
                 &member_did,
-                self.clock.now_secs(),
+                now_secs,
                 spending_ucan,
                 &context_id,
                 &*self.clock,
-            )?
+            ) {
+                Ok(cost) => cost,
+                Err(e) => {
+                    ctx.governance.velocity_tracker.rollback_last(&member_did);
+                    ctx.governance.hard_rate_limit.refund(&member_did);
+                    return Err(e);
+                }
+            }
         };
 
         // Phase 2: Authorize payment (escrow hold) BEFORE any crypto mutation.

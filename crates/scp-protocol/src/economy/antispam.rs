@@ -24,6 +24,8 @@
 use std::collections::HashMap;
 use std::sync::Mutex;
 
+use serde::{Deserialize, Serialize};
+
 use scp_primitives::DID;
 
 use super::types::Amount;
@@ -40,7 +42,7 @@ use super::types::Amount;
 /// thresholds, all corresponding costs are summed.
 ///
 /// See spec section 19.7 for example threshold schedules.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EscalationThreshold {
     /// Minimum velocity (message count in window) that triggers this tier.
     pub velocity_threshold: u64,
@@ -69,7 +71,7 @@ pub struct EscalationThreshold {
 ///   (50/min, +$0.01)    → high:     $0.012/msg
 ///   (200/min, +$0.10)   → extreme:  $0.112/msg
 /// ```
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EscalationConfig {
     /// Step-function thresholds, ordered by velocity. Each threshold whose
     /// velocity is met contributes its additional cost.
@@ -77,6 +79,32 @@ pub struct EscalationConfig {
 }
 
 impl EscalationConfig {
+    /// Returns the spec §19.7 default escalation schedule.
+    ///
+    /// Tiers (per `Amount(1) = $0.001` milli-cent convention):
+    /// - velocity ≥ 10  → +Amount(1)   (elevated)
+    /// - velocity ≥ 50  → +Amount(10)  (high)
+    /// - velocity ≥ 200 → +Amount(100) (extreme)
+    #[must_use]
+    pub fn spec_default() -> Self {
+        Self {
+            thresholds: vec![
+                EscalationThreshold {
+                    velocity_threshold: 10,
+                    additional_cost: Amount(1),
+                },
+                EscalationThreshold {
+                    velocity_threshold: 50,
+                    additional_cost: Amount(10),
+                },
+                EscalationThreshold {
+                    velocity_threshold: 200,
+                    additional_cost: Amount(100),
+                },
+            ],
+        }
+    }
+
     /// Computes the total additional cost for a given velocity.
     ///
     /// Sums the `additional_cost` of every threshold whose
@@ -328,6 +356,231 @@ impl std::fmt::Debug for SenderVelocityTracker {
             .field("window_secs", &self.window_secs)
             .field("state", &"<locked>")
             .finish()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// HardRateLimitConfig
+// ---------------------------------------------------------------------------
+
+/// Configuration for the Matrix Synapse–style token bucket hard rate limit.
+///
+/// This is a defense-in-depth cap layered on top of the per-DID economic
+/// escalation in spec §19.7. It is independent of cost and is enforced even
+/// when no `EconomicPolicy` is configured. Modeled after Matrix Synapse's
+/// `rc_message` defaults.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HardRateLimitConfig {
+    /// Token refill rate expressed as tokens per 1000 seconds (kilo-second).
+    /// Matrix's default is 0.2 tokens/sec → `200` tokens/kilo-sec.
+    pub refill_per_kilosec: u64,
+    /// Maximum tokens a single sender may accumulate (burst capacity).
+    /// Matrix default: `10`.
+    pub burst: u64,
+}
+
+impl HardRateLimitConfig {
+    /// Matrix Synapse defaults: 0.2 messages per second, burst 10.
+    #[must_use]
+    pub const fn matrix_defaults() -> Self {
+        Self {
+            refill_per_kilosec: 200,
+            burst: 10,
+        }
+    }
+}
+
+impl Default for HardRateLimitConfig {
+    fn default() -> Self {
+        Self::matrix_defaults()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// TokenBucketLimiter
+// ---------------------------------------------------------------------------
+
+/// Per-sender token bucket hard rate limiter (defense-in-depth, Matrix-style).
+///
+/// Each sender DID has an independent token bucket. Each `try_consume` call
+/// drains one token; tokens refill at a configurable rate. Tokens are stored
+/// in milli-tokens internally so that fractional refill rates work with
+/// integer arithmetic.
+///
+/// This limiter complements the per-DID cost escalation in spec §19.7 by
+/// rejecting bursts at the protocol layer regardless of cost: even an actor
+/// with infinite budget cannot exceed `burst` messages without waiting for
+/// refill. See [`HardRateLimitConfig::matrix_defaults`].
+pub struct TokenBucketLimiter {
+    /// Per-sender state: (`tokens_milli`, `last_refill_secs`).
+    state: Mutex<HashMap<DID, (u64, u64)>>,
+    config: HardRateLimitConfig,
+}
+
+impl TokenBucketLimiter {
+    /// Creates a new limiter with the given configuration.
+    #[must_use]
+    pub fn new(config: HardRateLimitConfig) -> Self {
+        Self {
+            state: Mutex::new(HashMap::new()),
+            config,
+        }
+    }
+
+    /// Returns the configuration.
+    #[must_use]
+    pub const fn config(&self) -> &HardRateLimitConfig {
+        &self.config
+    }
+
+    /// Maximum tokens (in milli-units) any sender may hold.
+    const fn burst_milli(&self) -> u64 {
+        self.config.burst.saturating_mul(1000)
+    }
+
+    /// Refills the sender's bucket based on elapsed wall time and attempts to
+    /// consume one token. Returns `true` if a token was consumed, `false` if
+    /// the sender is over their budget.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal mutex is poisoned.
+    #[allow(clippy::significant_drop_tightening)]
+    pub fn try_consume(&self, sender: &DID, now_secs: u64) -> bool {
+        let burst_milli = self.burst_milli();
+        let refill_rate = self.config.refill_per_kilosec; // tokens per 1000 seconds
+
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let entry = state
+            .entry(sender.clone())
+            .or_insert((burst_milli, now_secs));
+
+        // Refill: (now - last) * refill_rate, capped at burst_milli.
+        let elapsed = now_secs.saturating_sub(entry.1);
+        let refill = elapsed.saturating_mul(refill_rate);
+        entry.0 = entry.0.saturating_add(refill).min(burst_milli);
+        entry.1 = now_secs;
+
+        // Consume one token (1000 milli-tokens).
+        if entry.0 >= 1000 {
+            entry.0 -= 1000;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Refunds one token to the sender's bucket (clamped at the burst).
+    /// Used to roll back a `try_consume` when a downstream operation fails.
+    ///
+    /// No-op if the sender has no recorded bucket.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal mutex is poisoned.
+    pub fn refund(&self, sender: &DID) {
+        let burst_milli = self.burst_milli();
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(entry) = state.get_mut(sender) {
+            entry.0 = entry.0.saturating_add(1000).min(burst_milli);
+        }
+    }
+
+    /// Exports the per-sender state for persistence.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal mutex is poisoned.
+    #[must_use]
+    pub fn snapshot_entries(&self) -> HashMap<String, (u64, u64)> {
+        let state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state
+            .iter()
+            .map(|(did, entry)| (did.as_ref().to_owned(), *entry))
+            .collect()
+    }
+
+    /// Reconstructs a limiter from a persisted snapshot.
+    #[must_use]
+    pub fn from_snapshot(
+        config: HardRateLimitConfig,
+        entries: HashMap<String, (u64, u64)>,
+    ) -> Self {
+        let converted: HashMap<DID, (u64, u64)> = entries
+            .into_iter()
+            .map(|(did_str, entry)| (DID::from(did_str), entry))
+            .collect();
+        Self {
+            state: Mutex::new(converted),
+            config,
+        }
+    }
+}
+
+impl std::fmt::Debug for TokenBucketLimiter {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TokenBucketLimiter")
+            .field("config", &self.config)
+            .field("state", &"<locked>")
+            .finish()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// ContextMessagePricingConfig
+// ---------------------------------------------------------------------------
+
+/// Spec §19.7 per-DID escalating-cost message pricing configuration.
+///
+/// Bundles the base cost, escalation schedule, floor/cap clamps, and the
+/// hard rate limit (defense-in-depth) for a single context. This is the
+/// in-context replacement for the deleted aggregate `RelayPricingConfig`.
+///
+/// Amount unit convention: `Amount(1) = $0.001` (one milli-cent), per
+/// existing test conventions in this module. The spec example
+/// `base=$0.001, tiers (10,+$0.001), (50,+$0.01), (200,+$0.10), cap=$1`
+/// therefore maps to: `base=Amount(1), (10, +1), (50, +10), (200, +100),
+/// cap=Amount(1000)`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ContextMessagePricingConfig {
+    /// Base cost per message before escalation.
+    pub base_cost: Amount,
+    /// Step-function escalation tiers applied based on per-DID velocity.
+    pub escalation: EscalationConfig,
+    /// Floor (clamps cost upward to at least this value).
+    pub floor: Option<Amount>,
+    /// Cap (clamps cost downward to at most this value).
+    pub cap: Option<Amount>,
+    /// Token-bucket hard rate limit (defense-in-depth, independent of cost).
+    pub hard_rate_limit: HardRateLimitConfig,
+}
+
+impl ContextMessagePricingConfig {
+    /// Returns the spec §19.7 default pricing configuration.
+    #[must_use]
+    pub fn spec_default() -> Self {
+        Self {
+            base_cost: Amount(1),
+            escalation: EscalationConfig::spec_default(),
+            floor: Some(Amount(1)),
+            cap: Some(Amount(1000)),
+            hard_rate_limit: HardRateLimitConfig::matrix_defaults(),
+        }
+    }
+}
+
+impl Default for ContextMessagePricingConfig {
+    fn default() -> Self {
+        Self::spec_default()
     }
 }
 
@@ -736,6 +989,35 @@ mod tests {
         assert_eq!(restored.window_secs(), tracker.window_secs());
     }
 
+    /// Test A: a legacy snapshot captured under the old 3600-second window
+    /// is restored into a new 60-second tracker (spec §19.4 normalization).
+    /// Entries whose timestamps are within the new 60s window relative to
+    /// `now` continue to count toward velocity; entries outside the 60s
+    /// window are pruned on the next query.
+    #[test]
+    fn from_snapshot_normalizes_legacy_window_to_60_seconds() {
+        // Legacy tracker used a 3600-second window.
+        let legacy = SenderVelocityTracker::new(3600);
+        let alice = did("did:dht:z6MkAlice");
+
+        // Record two messages: one recent (within new 60s window), one old
+        // (inside the legacy 3600s window but outside the new 60s window).
+        legacy.record_message(&alice, 600); // t=600, old relative to t=1000
+        legacy.record_message(&alice, 990); // t=990, within last 60s at t=1000
+
+        // Under the legacy window both messages count.
+        assert_eq!(legacy.get_velocity(&alice, 1000), 2);
+
+        // Snapshot and restore into the new 60-second window.
+        let entries = legacy.snapshot_entries();
+        let restored = SenderVelocityTracker::from_snapshot(60, entries);
+        assert_eq!(restored.window_secs(), 60);
+
+        // Under the normalized 60s window only the recent message counts;
+        // the stale one is pruned on access.
+        assert_eq!(restored.get_velocity(&alice, 1000), 1);
+    }
+
     // --- Rollback ---
 
     #[test]
@@ -775,5 +1057,116 @@ mod tests {
         // Rollback on a known sender with empty timestamps should be no-op.
         tracker.rollback_last(&sender);
         assert_eq!(tracker.get_velocity(&sender, 200), 0);
+    }
+
+    // --- HardRateLimitConfig / TokenBucketLimiter ---
+
+    #[test]
+    fn matrix_defaults_match_synapse_rc_message() {
+        let cfg = HardRateLimitConfig::matrix_defaults();
+        assert_eq!(cfg.refill_per_kilosec, 200);
+        assert_eq!(cfg.burst, 10);
+    }
+
+    #[test]
+    fn token_bucket_consumes_burst_tokens_then_rejects() {
+        let limiter = TokenBucketLimiter::new(HardRateLimitConfig::matrix_defaults());
+        let sender = did("did:dht:z6MkBurst");
+        for _ in 0..10 {
+            assert!(limiter.try_consume(&sender, 1000));
+        }
+        assert!(!limiter.try_consume(&sender, 1000));
+    }
+
+    #[test]
+    fn token_bucket_refills_over_time() {
+        let limiter = TokenBucketLimiter::new(HardRateLimitConfig::matrix_defaults());
+        let sender = did("did:dht:z6MkRefill");
+        for _ in 0..10 {
+            assert!(limiter.try_consume(&sender, 1000));
+        }
+        assert!(!limiter.try_consume(&sender, 1000));
+        // 5 seconds of refill: 5 * 200 = 1000 milli-tokens = 1 full token.
+        assert!(limiter.try_consume(&sender, 1005));
+        assert!(!limiter.try_consume(&sender, 1005));
+    }
+
+    #[test]
+    fn token_bucket_refund_returns_a_token() {
+        let limiter = TokenBucketLimiter::new(HardRateLimitConfig::matrix_defaults());
+        let sender = did("did:dht:z6MkRefund");
+        for _ in 0..10 {
+            assert!(limiter.try_consume(&sender, 1000));
+        }
+        assert!(!limiter.try_consume(&sender, 1000));
+        limiter.refund(&sender);
+        assert!(limiter.try_consume(&sender, 1000));
+        assert!(!limiter.try_consume(&sender, 1000));
+    }
+
+    #[test]
+    fn token_bucket_refund_clamps_at_burst() {
+        let limiter = TokenBucketLimiter::new(HardRateLimitConfig::matrix_defaults());
+        let sender = did("did:dht:z6MkClamp");
+        // Bucket starts at burst (10). Refund without consuming should be a no-op.
+        for _ in 0..20 {
+            limiter.refund(&sender);
+        }
+        // Cannot exceed burst.
+        for _ in 0..10 {
+            assert!(limiter.try_consume(&sender, 1000));
+        }
+        assert!(!limiter.try_consume(&sender, 1000));
+    }
+
+    #[test]
+    fn token_bucket_snapshot_roundtrip() {
+        let limiter = TokenBucketLimiter::new(HardRateLimitConfig::matrix_defaults());
+        let alice = did("did:dht:z6MkAlice");
+        let bob = did("did:dht:z6MkBob");
+        for _ in 0..3 {
+            limiter.try_consume(&alice, 1000);
+        }
+        for _ in 0..7 {
+            limiter.try_consume(&bob, 1000);
+        }
+        let snap = limiter.snapshot_entries();
+        let restored =
+            TokenBucketLimiter::from_snapshot(HardRateLimitConfig::matrix_defaults(), snap);
+        // Alice has 7 tokens left → 7 successes; Bob has 3.
+        for _ in 0..7 {
+            assert!(restored.try_consume(&alice, 1000));
+        }
+        assert!(!restored.try_consume(&alice, 1000));
+        for _ in 0..3 {
+            assert!(restored.try_consume(&bob, 1000));
+        }
+        assert!(!restored.try_consume(&bob, 1000));
+    }
+
+    // --- ContextMessagePricingConfig ---
+
+    #[test]
+    fn context_message_pricing_spec_default_values() {
+        let cfg = ContextMessagePricingConfig::spec_default();
+        assert_eq!(cfg.base_cost, Amount(1));
+        assert_eq!(cfg.floor, Some(Amount(1)));
+        assert_eq!(cfg.cap, Some(Amount(1000)));
+        assert_eq!(cfg.escalation.thresholds.len(), 3);
+        assert_eq!(cfg.escalation.thresholds[0].velocity_threshold, 10);
+        assert_eq!(cfg.escalation.thresholds[0].additional_cost, Amount(1));
+        assert_eq!(cfg.escalation.thresholds[1].velocity_threshold, 50);
+        assert_eq!(cfg.escalation.thresholds[1].additional_cost, Amount(10));
+        assert_eq!(cfg.escalation.thresholds[2].velocity_threshold, 200);
+        assert_eq!(cfg.escalation.thresholds[2].additional_cost, Amount(100));
+        assert_eq!(cfg.hard_rate_limit, HardRateLimitConfig::matrix_defaults());
+    }
+
+    #[test]
+    fn context_message_pricing_serde_roundtrip() {
+        let cfg = ContextMessagePricingConfig::spec_default();
+        let json = serde_json::to_string(&cfg).unwrap();
+        let parsed: ContextMessagePricingConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed, cfg);
     }
 }

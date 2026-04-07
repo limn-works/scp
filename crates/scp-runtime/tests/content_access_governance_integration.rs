@@ -293,46 +293,53 @@ async fn setup_threshold_context_with_dave(ctx_id: &str) -> ContextManager {
 ///
 /// Alice proposes, Bob approves. Returns the proposal status after
 /// the second approval (should be `Approved`).
-async fn propose_and_approve_threshold(
-    manager: &ContextManager,
-    ctx_id: &str,
+///
+/// Returns a boxed future because the composed state machine inside
+/// `ContextManager::propose_governance_action_checked` +
+/// `vote_on_proposal` exceeds clippy's `large_futures` threshold
+/// (~16 KB) when inlined at many call sites.
+fn propose_and_approve_threshold<'a>(
+    manager: &'a ContextManager,
+    ctx_id: &'a str,
     action: GovernanceAction,
-) -> ProposalOutcome {
-    let sk_alice = signing_key_for_did(&alice());
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = ProposalOutcome> + Send + 'a>> {
+    Box::pin(async move {
+        let sk_alice = signing_key_for_did(&alice());
 
-    let outcome = manager
-        .propose_governance_action_checked(ctx_id, &alice(), action, &sk_alice)
-        .await
-        .unwrap();
-
-    // For Threshold(2-of-3), Alice's proposal counts as 1 approval.
-    // Need Bob for the second.
-    if outcome.status == ProposalStatus::Pending {
-        let sk_bob = signing_key_for_did(&bob());
-        let (status, _events) = manager
-            .vote_on_proposal(ctx_id, &outcome.proposal.proposal_id, &bob(), true, &sk_bob)
+        let outcome = manager
+            .propose_governance_action_checked(ctx_id, &alice(), action, &sk_alice)
             .await
             .unwrap();
-        assert_eq!(
-            status,
-            ProposalStatus::Approved,
-            "threshold proposal should be approved after 2/2 votes"
-        );
 
-        // Re-fetch the proposal to get the execution result.
-        // The vote_on_proposal auto-executes; we trust the status.
-        let fetched = manager
-            .get_proposal(ctx_id, &outcome.proposal.proposal_id)
-            .await
-            .unwrap();
-        ProposalOutcome {
-            proposal: fetched,
-            status,
-            execution_result: None, // Execution happened inside vote_on_proposal.
+        // For Threshold(2-of-3), Alice's proposal counts as 1 approval.
+        // Need Bob for the second.
+        if outcome.status == ProposalStatus::Pending {
+            let sk_bob = signing_key_for_did(&bob());
+            let (status, _events) = manager
+                .vote_on_proposal(ctx_id, &outcome.proposal.proposal_id, &bob(), true, &sk_bob)
+                .await
+                .unwrap();
+            assert_eq!(
+                status,
+                ProposalStatus::Approved,
+                "threshold proposal should be approved after 2/2 votes"
+            );
+
+            // Re-fetch the proposal to get the execution result.
+            // The vote_on_proposal auto-executes; we trust the status.
+            let fetched = manager
+                .get_proposal(ctx_id, &outcome.proposal.proposal_id)
+                .await
+                .unwrap();
+            ProposalOutcome {
+                proposal: fetched,
+                status,
+                execution_result: None, // Execution happened inside vote_on_proposal.
+            }
+        } else {
+            outcome
         }
-    } else {
-        outcome
-    }
+    })
 }
 
 // =========================================================================

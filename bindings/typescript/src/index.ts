@@ -198,9 +198,8 @@ export {
 // Economy
 // ---------------------------------------------------------------------------
 
-export type { ObservableMetrics, PaidActionType, RelayPriceAdjustment } from "./economy";
+export type { ObservableMetrics, PaidActionType } from "./economy";
 export {
-  adjustRelayPrice,
   antispamEscalatedCost,
   antispamRecord,
   antispamVelocity,

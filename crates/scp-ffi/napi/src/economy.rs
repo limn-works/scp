@@ -8,7 +8,6 @@
 //! - [`economy_check_policy_lock`] — Check if policy is locked.
 //! - [`economy_validate_policy_change`] — Validate a proposed policy change.
 //! - [`economy_evaluate_formula`] — Evaluate a pricing formula.
-//! - [`economy_adjust_relay_price`] — Compute EIP-1559-style relay price.
 //! - [`economy_budget_remaining`] — Query remaining budget.
 //! - [`economy_budget_grant`] — Grant spending budget.
 //! - [`economy_budget_record_spend`] — Record a spend.
@@ -21,21 +20,6 @@
 use napi_derive::napi;
 
 use crate::error::ScpNapiError;
-
-// ---------------------------------------------------------------------------
-// Result types
-// ---------------------------------------------------------------------------
-
-/// Relay price adjustment result.
-#[napi(object)]
-pub struct NapiRelayPriceAdjustment {
-    /// New base price (smallest currency unit).
-    pub new_base_price: i64,
-    /// Previous base price.
-    pub previous_base_price: i64,
-    /// Price direction: "Increased", "Decreased", or "Unchanged".
-    pub direction: String,
-}
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -90,10 +74,6 @@ fn parse_metrics(json: &str) -> Result<scp_core::economy::ObservableMetrics, nap
             .unwrap_or(0),
         storage_usage: v
             .get("storage_usage")
-            .and_then(serde_json::Value::as_u64)
-            .unwrap_or(0),
-        relay_base_price: v
-            .get("relay_base_price")
             .and_then(serde_json::Value::as_u64)
             .unwrap_or(0),
     })
@@ -191,30 +171,6 @@ pub fn economy_evaluate_formula(formula_json: String, metrics_json: String) -> n
     let metrics = parse_metrics(&metrics_json)?;
     #[allow(clippy::cast_possible_wrap)]
     Ok(scp_core::economy::evaluate_formula(&formula, &metrics).map_or(-1, |a| a.value() as i64))
-}
-
-/// Computes an EIP-1559-style relay price adjustment.
-#[napi]
-pub fn economy_adjust_relay_price(
-    config_json: String,
-    actual_utilization_pct: i64,
-) -> napi::Result<NapiRelayPriceAdjustment> {
-    let config: scp_core::economy::RelayPricingConfig = serde_json::from_str(&config_json)
-        .map_err(|e| validation_error(&format!("invalid relay pricing config JSON: {e}")))?;
-
-    #[allow(clippy::cast_sign_loss)]
-    let result = scp_core::economy::adjust_relay_price(&config, actual_utilization_pct as u64);
-
-    #[allow(clippy::cast_possible_wrap)]
-    Ok(NapiRelayPriceAdjustment {
-        new_base_price: result.new_base_price.value() as i64,
-        previous_base_price: result.previous_base_price.value() as i64,
-        direction: match result.direction {
-            scp_core::economy::PriceDirection::Increased => "Increased".to_owned(),
-            scp_core::economy::PriceDirection::Decreased => "Decreased".to_owned(),
-            scp_core::economy::PriceDirection::Unchanged => "Unchanged".to_owned(),
-        },
-    })
 }
 
 /// Queries the remaining budget for a member in a context.

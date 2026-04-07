@@ -46,12 +46,6 @@ interface EconomyBindings {
         metricsJson: String,
     ): ULong?
 
-    /** Computes an EIP-1559-style relay price adjustment. */
-    fun economyAdjustRelayPrice(
-        configJson: String,
-        utilizationPct: ULong,
-    ): String
-
     /** Queries the remaining budget for a member. */
     fun economyBudgetRemaining(
         contextId: String,
@@ -193,21 +187,6 @@ class EconomyBridge internal constructor(
     ): ULong? =
         bridge.ffiCall {
             bindings.economyEvaluateFormula(formulaJson, metricsJson)
-        }
-
-    /**
-     * Computes an EIP-1559-style relay price adjustment.
-     *
-     * @param configJson Relay pricing config JSON string.
-     * @param utilizationPct Current utilization percentage (0-100).
-     * @return JSON string with new_base_price, previous_base_price, direction.
-     */
-    suspend fun adjustRelayPrice(
-        configJson: String,
-        utilizationPct: ULong,
-    ): String =
-        bridge.ffiCall {
-            bindings.economyAdjustRelayPrice(configJson, utilizationPct)
         }
 
     // -----------------------------------------------------------------------

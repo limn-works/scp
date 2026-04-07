@@ -31,6 +31,7 @@ const MANAGER_SRC: &str = concat!(
     include_str!("../../../../crates/scp-runtime/src/context/manager/lifecycle.rs"),
     include_str!("../../../../crates/scp-runtime/src/context/manager/queries.rs"),
     include_str!("../../../../crates/scp-runtime/src/context/manager/standing.rs"),
+    include_str!("../../../../crates/scp-runtime/src/context/manager/tools.rs"),
     include_str!("../../../../crates/scp-runtime/src/context/manager/trust_recovery.rs"),
     include_str!("../../../../crates/scp-runtime/src/context/manager/ttl_close.rs"),
     include_str!("../../../../crates/scp-runtime/src/context/manager/mod.rs"),
@@ -42,7 +43,7 @@ const PROVIDER_SRC: &str =
 // RATCHET CONSTANTS — may only increase
 // Any decrease requires human approval
 // =========================================================================
-const MIN_ACTIVE_PIPELINE_ASSERTIONS: usize = 23;
+const MIN_ACTIVE_PIPELINE_ASSERTIONS: usize = 24;
 
 // ---------------------------------------------------------------------------
 // Function body extraction — brace-matching parser
@@ -388,6 +389,36 @@ fn governance_enforces_economic_policy() {
     assert!(
         fn_body_contains(MANAGER_SRC, "enforce_join_economy", "enforce_economy"),
         "enforce_join_economy must delegate to enforce_economy"
+    );
+}
+
+// --- Per-DID anti-spam escalation for tool invocations (§19.7) ---
+
+#[test]
+fn invoke_tool_with_economy_wires_escalation_and_rollback() {
+    // The manager wrapper must (a) call the free invoke_tool, (b) record the
+    // new velocity entry so compute_escalated_cost sees it, (c) thread the
+    // per-context velocity_tracker and message_pricing into ToolEconomyContext,
+    // and (d) roll back the velocity entry on invocation failure.
+    assert!(
+        fn_body_contains(MANAGER_SRC, "invoke_tool_with_economy", "invoke_tool"),
+        "invoke_tool_with_economy must delegate to invoke_tool"
+    );
+    assert!(
+        fn_body_contains(MANAGER_SRC, "invoke_tool_with_economy", "record_message"),
+        "invoke_tool_with_economy must record the invocation for velocity tracking"
+    );
+    assert!(
+        fn_body_contains(MANAGER_SRC, "invoke_tool_with_economy", "velocity_tracker"),
+        "invoke_tool_with_economy must thread velocity_tracker into ToolEconomyContext"
+    );
+    assert!(
+        fn_body_contains(MANAGER_SRC, "invoke_tool_with_economy", "message_pricing"),
+        "invoke_tool_with_economy must thread message_pricing into ToolEconomyContext"
+    );
+    assert!(
+        fn_body_contains(MANAGER_SRC, "invoke_tool_with_economy", "rollback_last"),
+        "invoke_tool_with_economy must roll back the velocity entry on failure"
     );
 }
 

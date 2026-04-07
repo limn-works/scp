@@ -1848,13 +1848,6 @@ export function createMockBridge(): Bridge & {
       return 0;
     },
 
-    economyAdjustRelayPrice(
-      _configJson: string,
-      _utilizationPct: number,
-    ): { newBasePrice: number; previousBasePrice: number; direction: string } {
-      return { newBasePrice: 0, previousBasePrice: 0, direction: "unchanged" };
-    },
-
     economyBudgetRemaining(_contextId: string, _did: string): number {
       return 0;
     },

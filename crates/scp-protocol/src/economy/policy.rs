@@ -114,8 +114,6 @@ pub struct ObservableMetrics {
     pub sender_velocity: u64,
     /// Context storage usage in bytes.
     pub storage_usage: u64,
-    /// Current relay base price from EIP-1559 dynamic pricing (Amount value).
-    pub relay_base_price: u64,
 }
 
 impl ObservableMetrics {
@@ -129,7 +127,6 @@ impl ObservableMetrics {
             PricingMetric::TimeOfDay => self.time_of_day,
             PricingMetric::SenderVelocity => self.sender_velocity,
             PricingMetric::StorageUsage => self.storage_usage,
-            PricingMetric::RelayBasePrice => self.relay_base_price,
         }
     }
 
@@ -166,7 +163,6 @@ impl ObservableMetrics {
             (PricingMetric::TimeOfDay, self.time_of_day),
             (PricingMetric::SenderVelocity, self.sender_velocity),
             (PricingMetric::StorageUsage, self.storage_usage),
-            (PricingMetric::RelayBasePrice, self.relay_base_price),
         ]
     }
 }
@@ -181,7 +177,7 @@ impl ObservableMetrics {
 /// creation time. Update this constant as new metric sources are wired.
 ///
 /// Available: `SenderVelocity`, `MemberCount`, `ContextMessageRate`,
-/// `TimeOfDay`, `RelayBasePrice`.
+/// `TimeOfDay`.
 ///
 /// NOT available: `RelayQueueDepth`, `StorageUsage`.
 pub const AVAILABLE_METRICS: &[PricingMetric] = &[
@@ -189,7 +185,6 @@ pub const AVAILABLE_METRICS: &[PricingMetric] = &[
     PricingMetric::MemberCount,
     PricingMetric::ContextMessageRate,
     PricingMetric::TimeOfDay,
-    PricingMetric::RelayBasePrice,
 ];
 
 /// Error returned when a [`PricingFormula`] references metrics that are not
@@ -1275,7 +1270,6 @@ mod tests {
             time_of_day: 14,
             sender_velocity: 30,
             storage_usage: 1_000_000,
-            relay_base_price: 42,
         };
 
         assert_eq!(metrics.get(&PricingMetric::ContextMessageRate), 100);
@@ -1284,7 +1278,6 @@ mod tests {
         assert_eq!(metrics.get(&PricingMetric::TimeOfDay), 14);
         assert_eq!(metrics.get(&PricingMetric::SenderVelocity), 30);
         assert_eq!(metrics.get(&PricingMetric::StorageUsage), 1_000_000);
-        assert_eq!(metrics.get(&PricingMetric::RelayBasePrice), 42);
     }
 
     #[test]
@@ -1344,10 +1337,10 @@ mod tests {
     }
 
     #[test]
-    fn observable_metrics_snapshot_all_returns_seven_entries() {
+    fn observable_metrics_snapshot_all_returns_six_entries() {
         let metrics = default_metrics();
         let snapshot = metrics.snapshot_all();
-        assert_eq!(snapshot.len(), 7);
+        assert_eq!(snapshot.len(), 6);
     }
 
     #[test]
@@ -1359,7 +1352,6 @@ mod tests {
         assert_eq!(metrics.time_of_day, 0);
         assert_eq!(metrics.sender_velocity, 0);
         assert_eq!(metrics.storage_usage, 0);
-        assert_eq!(metrics.relay_base_price, 0);
     }
 
     // =======================================================================
@@ -1583,19 +1575,5 @@ mod tests {
         let policy = free_policy();
         assert!(policy.pricing_formula.is_none());
         assert!(validate_economic_policy_metrics(Some(&policy)).is_ok());
-    }
-
-    #[test]
-    fn relay_base_price_is_available() {
-        let formula = PricingFormula {
-            base_cost: Amount(10),
-            variables: vec![PricingVariable::Linear {
-                metric: PricingMetric::RelayBasePrice,
-                coefficient: Coefficient(1_000_000),
-            }],
-            cap: None,
-            floor: None,
-        };
-        assert!(validate_formula_metrics(&formula).is_ok());
     }
 }

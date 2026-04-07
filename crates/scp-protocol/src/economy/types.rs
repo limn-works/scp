@@ -294,8 +294,6 @@ pub enum PricingMetric {
     SenderVelocity,
     /// Context storage usage in bytes.
     StorageUsage,
-    /// Current EIP-1559-style relay base price (from `RelayPricingConfig`).
-    RelayBasePrice,
 }
 
 impl std::fmt::Display for PricingMetric {
@@ -307,7 +305,6 @@ impl std::fmt::Display for PricingMetric {
             Self::TimeOfDay => f.write_str("TimeOfDay"),
             Self::SenderVelocity => f.write_str("SenderVelocity"),
             Self::StorageUsage => f.write_str("StorageUsage"),
-            Self::RelayBasePrice => f.write_str("RelayBasePrice"),
         }
     }
 }
@@ -638,7 +635,6 @@ mod tests {
             PricingMetric::TimeOfDay,
             PricingMetric::SenderVelocity,
             PricingMetric::StorageUsage,
-            PricingMetric::RelayBasePrice,
         ];
         for metric in &metrics {
             let json = serde_json::to_string(metric).unwrap();

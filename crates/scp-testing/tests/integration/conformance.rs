@@ -1560,7 +1560,6 @@ fn conf_035_dynamic_pricing() {
         time_of_day: 0,
         sender_velocity: 0,
         storage_usage: 0,
-        relay_base_price: 0,
     };
     let cost = evaluate_formula(&formula, &metrics);
     assert!(cost.is_some(), "formula must evaluate");
@@ -1579,7 +1578,6 @@ fn conf_035_dynamic_pricing() {
         time_of_day: 0,
         sender_velocity: 0,
         storage_usage: 0,
-        relay_base_price: 0,
     };
     let capped = evaluate_formula(&formula, &high_metrics).unwrap();
     assert!(capped.value() <= 10000, "cost must not exceed cap of 10000");

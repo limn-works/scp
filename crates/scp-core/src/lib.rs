@@ -144,7 +144,6 @@ pub mod identity {
 pub mod economy {
     pub use scp_protocol::economy::*;
     // Re-export all items from each submodule at this level.
-    pub use scp_protocol::economy::antispam::*;
     pub use scp_protocol::economy::budget::*;
     pub use scp_protocol::economy::estimate::*;
     pub use scp_protocol::economy::policy::*;

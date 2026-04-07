@@ -1604,15 +1604,6 @@ export function createNativeBridge(): Bridge {
       );
     },
 
-    economyAdjustRelayPrice(configJson: string, utilizationPct: number) {
-      return (
-        addon.economyAdjustRelayPrice as (
-          c: string,
-          u: number,
-        ) => { newBasePrice: number; previousBasePrice: number; direction: string }
-      )(configJson, utilizationPct);
-    },
-
     economyBudgetRemaining(contextId: string, did: string): number {
       return (addon.economyBudgetRemaining as (c: string, d: string) => number)(contextId, did);
     },
