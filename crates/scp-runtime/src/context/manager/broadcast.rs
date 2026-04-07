@@ -222,10 +222,18 @@ impl ContextManager {
 
             require_active(&ctx.handle)?;
 
-            // Suspension-aware capability check (§9.17, ADR-038).
-            if !ctx
+            // Suspension-aware capability check (§9.17, ADR-038). In
+            // broadcast contexts, authors may be registered with the
+            // BroadcastContext without being members of the role_state, so
+            // we check the suspension overlay directly: only members whose
+            // MessagesWrite capability has been explicitly suspended via
+            // governance Revoke are blocked here. The downstream
+            // `bc.publish` enforces author registration.
+            if ctx
                 .role_state
-                .member_has_capability(author_did.as_ref(), &Capability::MessagesWrite)
+                .suspended_capabilities
+                .get(author_did.as_ref())
+                .is_some_and(|s| s.contains(&Capability::MessagesWrite))
             {
                 return Err(ContextError::PermissionDenied(format!(
                     "write access has been suspended for {author_did}"
