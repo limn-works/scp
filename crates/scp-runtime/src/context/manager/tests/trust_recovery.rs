@@ -294,7 +294,7 @@ async fn cac009_tier_stacking_both_must_reverse() {
         &"did:key:bob".into(),
         GovernanceAction::Revoke {
             did: "did:key:bob".into(),
-            access: super::AccessScope::Both,
+            access: super::AccessScope::Write,
         },
     );
     manager
@@ -620,7 +620,7 @@ async fn cac010_revoke_write_full_can_still_read() {
         &"did:key:bob".into(),
         GovernanceAction::Revoke {
             did: "did:key:bob".into(),
-            access: super::AccessScope::Both,
+            access: super::AccessScope::Write,
         },
     );
     manager
@@ -676,16 +676,21 @@ async fn cac010_revoke_write_future_only() {
             .is_err()
     );
     {
+        // Per spec §05-contexts §5.9, revocation removes publishing
+        // authority. In broadcast mode the BroadcastContext author entry
+        // is removed; historical messages remain decryptable by
+        // subscribers via cached broadcast keys (forward-only restoration
+        // applies if access is later restored).
         let contexts = manager.contexts.lock().await;
         assert!(
-            contexts
+            !contexts
                 .get(&ctx_id)
                 .unwrap()
                 .broadcast_context
                 .as_ref()
                 .unwrap()
                 .is_author("did:key:bob"),
-            "AccessScope::Write keeps author in BC"
+            "AccessScope::Write removes author from BroadcastContext"
         );
     }
 }

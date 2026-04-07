@@ -1397,7 +1397,7 @@ async fn restore_read_access_unbans_subscriber_in_broadcast() {
     // First, revoke read access.
     let revoke_action = super::GovernanceAction::Revoke {
         did: "did:key:sub1".into(),
-        access: super::AccessScope::Write,
+        access: super::AccessScope::Read,
     };
     let revoke_proposal = approved_governance_proposal(
         &"did:key:alice".into(),
@@ -1740,11 +1740,14 @@ async fn revoke_write_access_future_only_no_key_destruction() {
             .get("did:key:alice")
             .is_some_and(|s| s.contains(&Capability::MessagesWrite))
     );
-    // In write-only scope, broadcast author should still exist (key not destroyed).
+    // Per spec §05-contexts §5.9, Revoke removes publishing authority:
+    // the BroadcastContext author entry is removed. Subscribers retain
+    // any cached broadcast keys for historical content (forward-only
+    // restoration model).
     let bc = ctx.broadcast_context.as_ref().unwrap();
     assert!(
-        bc.is_author("did:key:alice"),
-        "AccessScope::Write should NOT destroy broadcast keys"
+        !bc.is_author("did:key:alice"),
+        "AccessScope::Write removes broadcast author"
     );
 }
 
@@ -1961,7 +1964,7 @@ async fn presence_only_member_cannot_propose() {
 
     let revoke_write = super::GovernanceAction::Revoke {
         did: "did:key:bob".into(),
-        access: super::AccessScope::Both,
+        access: super::AccessScope::Write,
     };
     let rw_proposal = approved_governance_proposal(
         &"did:key:alice".into(),
@@ -1999,7 +2002,7 @@ async fn write_only_revoked_member_can_still_propose() {
     // Revoke bob's write only.
     let revoke_write = super::GovernanceAction::Revoke {
         did: "did:key:bob".into(),
-        access: super::AccessScope::Both,
+        access: super::AccessScope::Write,
     };
     let rw_proposal = approved_governance_proposal(
         &"did:key:alice".into(),
@@ -2336,7 +2339,7 @@ async fn presence_only_strips_governance_capabilities() {
     // Revoke read access for bob — now presence-only.
     let revoke_read = super::GovernanceAction::Revoke {
         did: "did:key:bob".into(),
-        access: super::AccessScope::Write,
+        access: super::AccessScope::Read,
     };
     let read_proposal = approved_governance_proposal(
         &"did:key:alice".into(),

@@ -731,7 +731,7 @@ async fn revoked_member_can_still_participate_in_governance() {
             &alice(),
             GovernanceAction::Revoke {
                 did: dave(),
-                access: AccessScope::Both,
+                access: AccessScope::Write,
             },
             &sk_alice,
         )

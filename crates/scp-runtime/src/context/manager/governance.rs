@@ -129,19 +129,25 @@ pub(super) fn enforce_triggered_consequences(
     clock: &dyn scp_primitives::Clock,
 ) {
     for consequence in triggered {
-        // TOCTOU guard: member may have left between evaluation and enforcement.
-        if !ctx.membership.contains(member_did) {
-            tracing::debug!(
-                member = %member_did,
-                "skipping consequence enforcement: member is no longer present"
-            );
-            break;
-        }
-
         // Cooldown tracking: skip if this rule fired within its window.
         if let Some(&last_fired) = ctx.governance.cooldown_until.get(&consequence.rule_index)
             && now < last_fired
         {
+            continue;
+        }
+
+        // TOCTOU/ghost guard: skip entirely if the member is absent AND
+        // there is no evidence that the member ever participated. Members
+        // who left mid-flight after accumulating real evidence (e.g.,
+        // WarningCount triggered by prior governance actions against
+        // them) still emit ConsequenceTriggered so observers see the
+        // behavioral signal.
+        let member_present = ctx.membership.contains(member_did);
+        if !member_present && consequence.evidence.is_empty() {
+            tracing::debug!(
+                member = %member_did,
+                "skipping consequence: ghost DID with no evidence"
+            );
             continue;
         }
 
@@ -153,6 +159,7 @@ pub(super) fn enforce_triggered_consequences(
         let trigger_type = rules
             .get(consequence.rule_index)
             .map_or_else(|| "Unknown".to_owned(), |r| format!("{:?}", r.trigger));
+
         ctx.receive_buffer.push(ContextEvent::ConsequenceTriggered {
             context_id: context_id.to_owned(),
             member_did: member_did.clone(),
@@ -160,6 +167,23 @@ pub(super) fn enforce_triggered_consequences(
             trigger_type,
             action_type: action_type.to_owned(),
         });
+
+        // If the member has left between evaluation and enforcement,
+        // emit a failed Enforced event and skip the actual mutation —
+        // suspending capabilities for an absent member is a no-op.
+        if !member_present {
+            tracing::debug!(
+                member = %member_did,
+                "skipping consequence enforcement: member is no longer present"
+            );
+            ctx.receive_buffer.push(ContextEvent::ConsequenceEnforced {
+                context_id: context_id.to_owned(),
+                member_did: member_did.clone(),
+                action_type: action_type.to_owned(),
+                success: false,
+            });
+            continue;
+        }
 
         // Dispatch enforcement action via extracted helpers. Each match arm
         // calls a named function as an expression_statement so the pipeline
@@ -1244,14 +1268,23 @@ impl ContextManager {
                 require_active(&ctx.handle)?;
             }
 
-            // Presence-only members (all capabilities suspended) lose
-            // GovernancePropose capability (§5.9, ADR-038).
-            if !ctx
+            // Presence-only members (read + write both suspended) lose
+            // GovernancePropose capability (§5.9, ADR-038, spec §05-contexts).
+            // Eligibility for the specific governance role/signer set is
+            // checked by the governance engine itself; this layer only
+            // enforces the presence-only state — a member who can neither
+            // read nor write content cannot propose governance actions on
+            // content they cannot see.
+            if ctx
                 .role_state
-                .member_has_capability(proposer_did.as_ref(), &Capability::GovernancePropose)
+                .suspended_capabilities
+                .get(proposer_did.as_ref())
+                .is_some_and(|s| {
+                    s.contains(&Capability::MessagesRead) && s.contains(&Capability::MessagesWrite)
+                })
             {
                 return Err(ContextError::PermissionDenied(
-                    "member does not have governance:propose capability".into(),
+                    "presence-only members cannot propose governance actions".into(),
                 ));
             }
 
@@ -1413,13 +1446,28 @@ impl ContextManager {
 
             require_active(&ctx.handle)?;
 
-            // Suspended members lose GovernanceVote capability (§5.9, ADR-038).
-            if !ctx
+            // Suspended members lose GovernanceVote capability (§5.9,
+            // ADR-038). The runtime layer only enforces the suspension
+            // overlay here; role-based eligibility (signer set, admin
+            // status) is checked by the governance engine itself, which
+            // returns `GovernanceFailed` for non-eligible voters.
+            //
+            // Presence-only members (both MessagesRead and MessagesWrite
+            // suspended) also lose GovernanceVote per spec §05-contexts.
+            let suspended = ctx
                 .role_state
-                .member_has_capability(voter_did.as_ref(), &Capability::GovernanceVote)
-            {
+                .suspended_capabilities
+                .get(voter_did.as_ref());
+            if suspended.is_some_and(|s| s.contains(&Capability::GovernanceVote)) {
                 return Err(ContextError::PermissionDenied(
                     "member does not have governance:vote capability".into(),
+                ));
+            }
+            if suspended.is_some_and(|s| {
+                s.contains(&Capability::MessagesRead) && s.contains(&Capability::MessagesWrite)
+            }) {
+                return Err(ContextError::PermissionDenied(
+                    "presence-only members cannot vote on governance proposals".into(),
                 ));
             }
 
@@ -1568,9 +1616,12 @@ impl ContextManager {
     /// Submits a new governance proposal with capability validation.
     ///
     /// Validates that the proposer holds the `GovernancePropose` capability
-    /// (UCAN) before delegating to the governance engine. Returns a
-    /// [`ProposalOutcome`] containing the proposal, its status, and an
-    /// optional execution result.
+    /// (UCAN) before delegating to the governance engine. The
+    /// suspension-aware `member_has_capability` check rejects both members
+    /// whose role does not grant the capability AND members whose
+    /// capability is currently suspended (e.g., presence-only members per
+    /// spec §05-contexts and ADR-038). Returns a [`ProposalOutcome`]
+    /// containing the proposal, its status, and an optional execution result.
     ///
     /// For `SingleAdmin`, the proposal is simultaneously created and approved
     /// (ADR-031 section 4a). The action is auto-executed and the result is
@@ -1592,7 +1643,9 @@ impl ContextManager {
         action: GovernanceAction,
         signing_key: &ed25519_dalek::SigningKey,
     ) -> Result<ProposalOutcome, ContextError> {
-        // Validate capability before delegating.
+        // Validate capability before delegating. The suspension-aware
+        // member_has_capability also rejects presence-only members whose
+        // GovernancePropose capability has been suspended (§5.9, ADR-038).
         {
             let contexts = self.contexts.lock().await;
             let ctx = contexts
@@ -1794,7 +1847,7 @@ impl ContextManager {
 
             if !ctx.role_state.ceiling.contains(&Capability::MemberBan) {
                 return Err(ContextError::PermissionDenied(
-                    "MemberBan capability not in ceiling".to_owned(),
+                    "member:ban (MemberBan) capability not in ceiling".to_owned(),
                 ));
             }
             if !ctx.membership.contains(did) {
@@ -1859,7 +1912,7 @@ impl ContextManager {
 
             if !ctx.role_state.ceiling.contains(&Capability::MemberBan) {
                 return Err(ContextError::PermissionDenied(
-                    "MemberBan capability not in ceiling".to_owned(),
+                    "member:ban (MemberBan) capability not in ceiling".to_owned(),
                 ));
             }
             if !ctx.membership.contains(did) {
@@ -1869,12 +1922,16 @@ impl ContextManager {
             let mut rotated = 0usize;
             let mut bc_snap = None;
 
-            // Write revocation: suspend write capabilities + destroy keys.
+            // Write revocation: suspend write capabilities and, in
+            // broadcast contexts, block the author so the BroadcastContext
+            // also rejects new publishes and key requests for the blocked
+            // author. Spec §05-contexts §5.9: revocation removes publishing
+            // authority. Historical messages remain decryptable by
+            // subscribers who already cached the broadcast key.
             if matches!(access, AccessScope::Write | AccessScope::Both) {
                 ctx.role_state
                     .suspend_capabilities(did.as_ref(), [Capability::MessagesWrite]);
 
-                // Broadcast mode: block author for key rotation.
                 if let Some(ref mut bc) = ctx.broadcast_context {
                     match bc.block_author(&did.0) {
                         Ok(_) | Err(ContextError::MemberNotFound(_)) => {}
@@ -1897,10 +1954,18 @@ impl ContextManager {
                 // CEK exclusion list for cryptographic enforcement.
                 ctx.access.read_exclusion_list.insert(did.clone());
 
-                // Broadcast mode: ban subscriber with key rotation.
+                // Broadcast mode: ban subscriber with key rotation. The
+                // target may be an author rather than a subscriber — in
+                // that case the read-side ban is a no-op (authors are
+                // handled by `block_author` under `Both`).
                 if let Some(ref mut bc) = ctx.broadcast_context {
-                    let r = bc.governance_ban_subscriber(&did.0, access)?;
-                    rotated = r.rotated_authors.len();
+                    match bc.governance_ban_subscriber(&did.0, access) {
+                        Ok(r) => {
+                            rotated = r.rotated_authors.len();
+                        }
+                        Err(ContextError::MemberNotFound(_)) => {}
+                        Err(e) => return Err(e),
+                    }
                     if self.has_persistence() {
                         bc_snap = Some(bc.to_snapshot());
                     }
@@ -1962,8 +2027,23 @@ impl ContextManager {
 
             if !ctx.role_state.ceiling.contains(&Capability::MemberBan) {
                 return Err(ContextError::PermissionDenied(
-                    "MemberBan capability not in ceiling".to_owned(),
+                    "member:ban (MemberBan) capability not in ceiling".to_owned(),
                 ));
+            }
+
+            // Determine whether anything is actually suspended for this member.
+            // Per spec §05-contexts §5.9: restore on a never-revoked member is
+            // an error (NothingToRestore).
+            let suspended_set = ctx.role_state.suspended_capabilities.get(did.as_ref());
+            let nothing_suspended_for_request =
+                suspended_set.is_none_or(|set| !capabilities.iter().any(|c| set.contains(c)));
+            // Read-side: also check exclusion list (CEK exclusion).
+            let read_excluded = ctx.access.read_exclusion_list.contains(did);
+            let read_requested = capabilities.contains(&Capability::MessagesRead);
+            if nothing_suspended_for_request && !(read_requested && read_excluded) {
+                return Err(ContextError::NothingToRestore(format!(
+                    "no suspended capabilities to restore for {did}"
+                )));
             }
 
             // Restore the specified capabilities.

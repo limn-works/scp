@@ -345,9 +345,17 @@ impl ContextManager {
                     .role_state
                     .member_has_capability(sender_did.as_ref(), &Capability::MessagesWrite)
             {
-                return Err(ContextError::PermissionDenied(format!(
-                    "member {sender_did} does not have messages:write capability"
-                )));
+                let is_suspended = ctx
+                    .role_state
+                    .suspended_capabilities
+                    .get(sender_did.as_ref())
+                    .is_some_and(|s| s.contains(&Capability::MessagesWrite));
+                let msg = if is_suspended {
+                    format!("member {sender_did} write access has been revoked")
+                } else {
+                    format!("member {sender_did} does not have messages:write capability")
+                };
+                return Err(ContextError::PermissionDenied(msg));
             }
             // M4: record velocity BEFORE economy enforcement so the current
             // message is included in the velocity metric used for pricing.
@@ -990,9 +998,17 @@ impl ContextManager {
             .role_state
             .member_has_capability(sender_did, &Capability::MessagesWrite)
         {
-            return Err(ContextError::PermissionDenied(format!(
-                "member {sender_did} does not have messages:write capability"
-            )));
+            let is_suspended = ctx
+                .role_state
+                .suspended_capabilities
+                .get(sender_did)
+                .is_some_and(|s| s.contains(&Capability::MessagesWrite));
+            let msg = if is_suspended {
+                format!("member {sender_did} write access has been revoked")
+            } else {
+                format!("member {sender_did} does not have messages:write capability")
+            };
+            return Err(ContextError::PermissionDenied(msg));
         }
 
         // Advance sequence tracker and deliver the in-order message.
