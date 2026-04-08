@@ -417,8 +417,9 @@ fn invoke_tool_with_economy_wires_escalation_and_rollback() {
         "invoke_tool_with_economy must thread message_pricing into ToolEconomyContext"
     );
     assert!(
-        fn_body_contains(MANAGER_SRC, "invoke_tool_with_economy", "rollback_last"),
-        "invoke_tool_with_economy must roll back the velocity entry on failure"
+        fn_body_contains(MANAGER_SRC, "invoke_tool_with_economy", ".rollback("),
+        "invoke_tool_with_economy must roll back the velocity entry on failure \
+         via the F5 identity-based `rollback(token)` API"
     );
 }
 

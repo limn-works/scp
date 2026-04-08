@@ -353,7 +353,10 @@ impl ContextManager {
             }
             // M4: record velocity BEFORE economy enforcement so the current
             // message is included in the velocity metric used for pricing.
-            ctx.governance
+            // F5: capture the rollback token so we can refund THIS entry
+            // specifically (not race concurrent senders on "the last one").
+            let velocity_token = ctx
+                .governance
                 .velocity_tracker
                 .record_message(sender_did, now_secs);
 
@@ -370,7 +373,9 @@ impl ContextManager {
                     // Roll back both: the velocity increment recorded above
                     // and the hard-rate-limit token. A rejected message must
                     // not permanently penalize the sender on either axis.
-                    ctx.governance.velocity_tracker.rollback_last(sender_did);
+                    ctx.governance
+                        .velocity_tracker
+                        .rollback(sender_did, velocity_token);
                     ctx.governance.hard_rate_limit.refund(sender_did);
                     return Err(e);
                 }
