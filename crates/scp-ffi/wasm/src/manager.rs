@@ -140,12 +140,12 @@ where
 
 /// Per-member state within a context.
 #[derive(Debug, Clone)]
-struct MemberEntry {
+pub(crate) struct MemberEntry {
     /// Stored for diagnostics and serialization; read via `HashMap` key.
     #[allow(dead_code)]
-    did: String,
-    role: String,
-    sequence_number: u64,
+    pub(crate) did: String,
+    pub(crate) role: String,
+    pub(crate) sequence_number: u64,
 }
 
 // WasmProposal deleted: replaced by GovernanceProposal from scp-protocol
@@ -167,7 +167,7 @@ const WASM_PROPOSAL_DEADLINE_MS: f64 = 3_600_000.0;
 /// Per-context runtime state.
 ///
 /// Mirrors `PerContextState` in `scp_core::context::manager`.
-struct PerContextState {
+pub(crate) struct PerContextState {
     /// Context lifecycle state.
     state: String,
     /// Context creation parameters stored as JSON. Used for version compatibility
@@ -246,9 +246,16 @@ struct PerContextState {
     economic_policy_locked: bool,
     /// Consequence rules declared at context creation (ADR-017, #1531).
     /// Parsed and validated from `params.consequenceRules` in `create_context`.
-    /// Currently stored for future use — WASM has no governance timeout task
-    /// to drive periodic evaluation.
-    _consequence_rules: Vec<scp_protocol::trust::consequence::ConsequenceRule>,
+    /// Evaluated via [`crate::consequence::dispatch_consequences_for_subject`]
+    /// at every mutation site that the runtime bridge fires
+    /// `enforce_triggered_consequences` at (send, governance dispatch).
+    consequence_rules: Vec<scp_protocol::trust::consequence::ConsequenceRule>,
+    /// Per-rule cooldown timers (`rule_index` → Unix second until which the
+    /// rule should not re-fire). Mirrors
+    /// `scp_runtime::context::manager::PerContextState.governance.cooldown_until`
+    /// and is consulted by [`crate::consequence::dispatch_consequences_for_subject`]
+    /// to prevent re-firing within a rule's window.
+    cooldown_until: HashMap<usize, u64>,
     /// MLS encryption + sender key state. `Some` for encrypted contexts,
     /// `None` for broadcast-only or unencrypted contexts.
     crypto: Option<crate::crypto::WasmCryptoState>,
@@ -459,6 +466,76 @@ impl PerContextState {
         parse_and_check_min_protocol_version(&self.params_json)
     }
 
+    // -----------------------------------------------------------------------
+    // Accessors used by `crate::consequence`
+    //
+    // These are colocated with the struct so that the private fields stay
+    // accessible without leaking the full `PerContextState` surface out of
+    // the module. The consequence module calls these directly.
+    // -----------------------------------------------------------------------
+
+    /// Read-only view of the declared consequence rules (ADR-017).
+    pub(crate) fn consequence_rules(&self) -> &[scp_protocol::trust::consequence::ConsequenceRule] {
+        &self.consequence_rules
+    }
+
+    /// Returns the stored event log's event slice. Wraps
+    /// [`scp_event_log::EventLog::events`] so the consequence module can
+    /// call `evaluate_consequence_rules` without pulling in extra surface.
+    pub(crate) fn event_log_events(&self) -> &[scp_event_log::Event] {
+        self.event_log.events()
+    }
+
+    /// Checks whether the subject is currently a member of the context.
+    pub(crate) fn members_contains(&self, subject_did: &str) -> bool {
+        self.members.contains_key(subject_did)
+    }
+
+    /// Returns a mutable reference to the subject's member entry.
+    pub(crate) fn members_get_mut(&mut self, subject_did: &str) -> Option<&mut MemberEntry> {
+        self.members.get_mut(subject_did)
+    }
+
+    /// Pushes a context event onto the receive buffer (public wrapper so
+    /// `crate::consequence` can emit `ConsequenceTriggered` /
+    /// `ConsequenceEnforced`).
+    pub(crate) fn push_event_pub(&mut self, event: ContextEvent) {
+        self.push_event(event);
+    }
+
+    /// Role-based capability check (public wrapper around the module-private
+    /// `member_has_capability`).
+    pub(crate) fn member_has_capability_pub(
+        &self,
+        subject_did: &str,
+        capability: &str,
+    ) -> bool {
+        self.member_has_capability(subject_did, capability)
+    }
+
+    /// Inserts `capability` into the subject's suspended capability set.
+    /// Creates a new `HashSet` if the subject has no existing entry.
+    pub(crate) fn suspended_capabilities_insert(
+        &mut self,
+        subject_did: &str,
+        capability: String,
+    ) {
+        self.suspended_capabilities
+            .entry(subject_did.to_owned())
+            .or_default()
+            .insert(capability);
+    }
+
+    /// Reads a cooldown timer for a given rule index.
+    pub(crate) fn cooldown_until_get(&self, rule_index: usize) -> Option<&u64> {
+        self.cooldown_until.get(&rule_index)
+    }
+
+    /// Records a cooldown timer for a given rule index.
+    pub(crate) fn cooldown_until_insert(&mut self, rule_index: usize, until_secs: u64) {
+        self.cooldown_until.insert(rule_index, until_secs);
+    }
+
     /// Inserts a resolved proposal, evicting the oldest (by `created_at`) if
     /// at [`WASM_RESOLVED_PROPOSAL_CAP`].
     fn insert_resolved_proposal(&mut self, id: String, proposal: GovernanceProposal) {
@@ -548,6 +625,130 @@ fn validate_imported_did(value: &str, field_name: &str) -> Result<(), ScpWasmErr
             code: "SCP-CTX-2032".to_owned(),
         });
     }
+    Ok(())
+}
+
+/// Validates the v3 anti-replay fields (`seen_nonces_v3`,
+/// `executed_proposals`, `resolved_proposals_json`), the `consequence_rules`
+/// vector, and the `cooldown_until` map on an imported snapshot.
+///
+/// This is defense-in-depth: the envelope HMAC already prevents tampering,
+/// but malformed state (empty nonce strings, `NaN` or unbounded timestamps,
+/// over-cap entries, invalid consequence rules) must fail loud rather than
+/// silently propagate into `PerContextState`.
+fn validate_imported_antispam_state(
+    snap: &WasmContextExportSnapshot,
+) -> Result<(), ScpWasmError> {
+    // Capacity caps — match live `PerContextState` limits. A malicious
+    // export cannot bloat the importer beyond its runtime policy.
+    if snap.seen_nonces_v3.len() > WASM_NONCE_CAP {
+        return Err(ScpWasmError::Context {
+            message: format!(
+                "snapshot contains {} nonces, exceeds cap {WASM_NONCE_CAP}",
+                snap.seen_nonces_v3.len()
+            ),
+            code: "SCP-CTX-2032".to_owned(),
+        });
+    }
+    if snap.seen_nonces_legacy_v2.len() > WASM_NONCE_CAP {
+        return Err(ScpWasmError::Context {
+            message: format!(
+                "snapshot contains {} legacy nonces, exceeds cap {WASM_NONCE_CAP}",
+                snap.seen_nonces_legacy_v2.len()
+            ),
+            code: "SCP-CTX-2032".to_owned(),
+        });
+    }
+    if snap.executed_proposals.len() > WASM_PROPOSAL_CAP {
+        return Err(ScpWasmError::Context {
+            message: format!(
+                "snapshot contains {} executed proposals, exceeds cap {WASM_PROPOSAL_CAP}",
+                snap.executed_proposals.len()
+            ),
+            code: "SCP-CTX-2032".to_owned(),
+        });
+    }
+    if snap.resolved_proposals_json.len() > WASM_RESOLVED_PROPOSAL_CAP {
+        return Err(ScpWasmError::Context {
+            message: format!(
+                "snapshot contains {} resolved proposals, exceeds cap {WASM_RESOLVED_PROPOSAL_CAP}",
+                snap.resolved_proposals_json.len()
+            ),
+            code: "SCP-CTX-2032".to_owned(),
+        });
+    }
+
+    // Per-entry shape + timestamp sanity on seen_nonces_v3.
+    //
+    // We DO NOT use `crate::time::now_ms()` here because on native test
+    // targets the captured `Date.now` extern would panic if called. The
+    // clock-skew clamp is enforced at use time in `import_context` (each
+    // imported `inserted_at_ms` is `min`ed against `now_ms` when the
+    // `HashMap<String, f64>` is constructed). Here we only reject clearly
+    // malformed values: NaN / infinity / negative.
+    for entry in &snap.seen_nonces_v3 {
+        validate_imported_string(&entry.nonce, "seen_nonces_v3.nonce", 256)?;
+        if !entry.inserted_at_ms.is_finite() || entry.inserted_at_ms < 0.0 {
+            return Err(ScpWasmError::Context {
+                message: format!(
+                    "nonce '{}' has invalid inserted_at_ms={}",
+                    entry.nonce, entry.inserted_at_ms
+                ),
+                code: "SCP-CTX-2032".to_owned(),
+            });
+        }
+    }
+
+    for entry in &snap.executed_proposals {
+        validate_imported_string(
+            &entry.proposal_id,
+            "executed_proposals.proposal_id",
+            256,
+        )?;
+        if !entry.executed_at_ms.is_finite() || entry.executed_at_ms < 0.0 {
+            return Err(ScpWasmError::Context {
+                message: format!(
+                    "executed proposal '{}' has invalid executed_at_ms={}",
+                    entry.proposal_id, entry.executed_at_ms
+                ),
+                code: "SCP-CTX-2032".to_owned(),
+            });
+        }
+    }
+
+    // Legacy v2 entries are flat strings. Same length/shape rules as v3.
+    for nonce in &snap.seen_nonces_legacy_v2 {
+        validate_imported_string(nonce, "seen_nonces_legacy_v2", 256)?;
+    }
+
+    // resolved_proposals keys must be valid hex strings (proposal IDs).
+    for key in snap.resolved_proposals_json.keys() {
+        validate_imported_string(key, "resolved_proposals_json.key", 256)?;
+    }
+
+    // Validate imported consequence rules via ConsequenceRule::validate().
+    for (idx, rule) in snap.consequence_rules.iter().enumerate() {
+        rule.validate().map_err(|e| ScpWasmError::Context {
+            message: format!("imported consequence_rules[{idx}] invalid: {e}"),
+            code: "SCP-CTX-2032".to_owned(),
+        })?;
+    }
+
+    // Cooldown map: rule_index must be within the rules vector's bounds so
+    // an attacker cannot inject cooldowns for nonexistent rules and
+    // indirectly affect future rule evaluation.
+    for (&rule_index, _) in &snap.cooldown_until {
+        if rule_index >= snap.consequence_rules.len() {
+            return Err(ScpWasmError::Context {
+                message: format!(
+                    "cooldown_until contains rule_index={rule_index} but only {} rules are declared",
+                    snap.consequence_rules.len()
+                ),
+                code: "SCP-CTX-2032".to_owned(),
+            });
+        }
+    }
+
     Ok(())
 }
 
@@ -861,7 +1062,8 @@ impl WasmContextManager {
             resolved_proposals: HashMap::new(),
             pruning_policy: None,
             economic_policy_locked: false,
-            _consequence_rules: consequence_rules,
+            consequence_rules,
+            cooldown_until: HashMap::new(),
             crypto,
         };
 
@@ -1040,6 +1242,16 @@ impl WasmContextManager {
             EventType::MessageSent,
             sender_did,
             recorded_payload.as_bytes(),
+        );
+
+        // Evaluate and enforce consequence rules for the sender. Mirrors
+        // `scp_runtime::context::manager::messaging::send_message` which
+        // calls `enforce_triggered_consequences` after appending the
+        // outbound event. This is a no-op if no rules were declared at
+        // context creation.
+        let now_secs = crate::time::now_secs();
+        crate::consequence::dispatch_consequences_for_subject(
+            ctx, context_id, sender_did, now_secs,
         );
 
         Ok(())
@@ -2109,19 +2321,40 @@ impl WasmContextManager {
                 arr[..len].copy_from_slice(&bytes[..len]);
                 arr
             };
-            let target_did = action.target_did().cloned();
+            let target_did: Option<DID> = action.target_did().cloned();
             ctx.push_event(ContextEvent::GovernanceActionExecuted {
                 proposal_id: proposal_id_bytes,
                 action_summary,
                 executor_did: DID(initiator_did.to_owned()),
                 resulting_epoch: None,
-                target_did,
+                target_did: target_did.clone(),
             });
             ctx.append_log_event(
                 EventType::GovernanceActionExecuted,
                 initiator_did,
                 proposal_id.as_bytes(),
             );
+
+            // Evaluate and enforce consequence rules. Mirrors
+            // `scp_runtime::context::manager::governance::
+            // execute_governance_action` which dispatches consequences
+            // for both the executor and the action's target DID (if any)
+            // after the governance event has been recorded.
+            let now_secs = crate::time::now_secs();
+            crate::consequence::dispatch_consequences_for_subject(
+                ctx,
+                context_id,
+                initiator_did,
+                now_secs,
+            );
+            if let Some(target) = target_did.as_ref() {
+                crate::consequence::dispatch_consequences_for_subject(
+                    ctx,
+                    context_id,
+                    target.as_ref(),
+                    now_secs,
+                );
+            }
         }
 
         result
@@ -4409,7 +4642,43 @@ impl WasmContextManager {
             read_exclusion_list: ctx.read_exclusion_list.iter().cloned().collect(),
             broadcast,
             revoked_tokens: ctx.revoked_tokens.iter().cloned().collect(),
-            seen_nonces: ctx.seen_nonces.keys().cloned().collect(),
+            // v3 format: always leave the v2-only field empty on export.
+            // Legacy v2 binaries cannot import v3 envelopes anyway (version
+            // check rejects). v3 binaries ignore this field when
+            // `seen_nonces_v3` is non-empty.
+            seen_nonces_legacy_v2: Vec::new(),
+            seen_nonces_v3: ctx
+                .seen_nonces
+                .iter()
+                .map(|(nonce, ts)| WasmExportNonceEntry {
+                    nonce: nonce.clone(),
+                    inserted_at_ms: *ts,
+                })
+                .collect(),
+            executed_proposals: ctx
+                .executed_proposals
+                .iter()
+                .map(|(pid, ts)| WasmExportExecutedProposalEntry {
+                    proposal_id: pid.clone(),
+                    executed_at_ms: *ts,
+                })
+                .collect(),
+            // GovernanceProposal implements Serialize/Deserialize in
+            // scp-protocol. Serializing to `serde_json::Value` here defers
+            // the shape commitment to the envelope JSON bytes, so additions
+            // to GovernanceProposal don't require a separate snapshot bump.
+            resolved_proposals_json: ctx
+                .resolved_proposals
+                .iter()
+                .map(|(k, v)| {
+                    (
+                        k.clone(),
+                        serde_json::to_value(v).unwrap_or(serde_json::Value::Null),
+                    )
+                })
+                .collect(),
+            consequence_rules: ctx.consequence_rules.clone(),
+            cooldown_until: ctx.cooldown_until.clone(),
             threshold_signers: ctx.threshold_signers.clone(),
             threshold_value: ctx.threshold_value,
             tool_interfaces: ctx.tool_interfaces.clone(),
@@ -4551,6 +4820,11 @@ impl WasmContextManager {
         // imported contexts that require a newer SDK than we support.
         parse_and_check_min_protocol_version(&snap.params_json)?;
 
+        // Validate v3 anti-replay fields (defense-in-depth; HMAC already
+        // covers tamper detection, but we validate shape and bounds to
+        // fail loud, not silently accept malformed state).
+        validate_imported_antispam_state(snap)?;
+
         if self.contexts.contains_key(&context_id) {
             return Err(ScpWasmError::Context {
                 message: format!(
@@ -4636,13 +4910,38 @@ impl WasmContextManager {
             tool_handlers: HashMap::new(),
             event_log: EventLog::new(context_id.clone()),
             revoked_tokens: snap.revoked_tokens.iter().cloned().collect(),
-            seen_nonces: {
+            // v3 import: prefer `seen_nonces_v3` if present, falling back to
+            // the v2-legacy `seen_nonces_legacy_v2` field for back-compat.
+            // In both branches, timestamps are clamped to `now_ms` to block
+            // snapshot forgery that pushes timestamps into the future and
+            // evades TTL eviction.
+            seen_nonces: if snap.seen_nonces_v3.is_empty() {
+                // v2 compat — legacy snapshot had no timestamps. Reset to
+                // now (the current, knowingly-lossy behavior for v2).
                 let now = crate::time::now_ms();
-                snap.seen_nonces.iter().map(|n| (n.clone(), now)).collect()
+                snap.seen_nonces_legacy_v2
+                    .iter()
+                    .map(|n| (n.clone(), now))
+                    .collect()
+            } else {
+                // v3 import — restore real timestamps.
+                let now = crate::time::now_ms();
+                snap.seen_nonces_v3
+                    .iter()
+                    .map(|e| (e.nonce.clone(), e.inserted_at_ms.min(now)))
+                    .collect()
             },
             members,
             event_buffer: VecDeque::new(),
-            executed_proposals: HashMap::new(),
+            // v3 import: preserve executed_proposals timestamps so replay
+            // protection survives export/import.
+            executed_proposals: {
+                let now = crate::time::now_ms();
+                snap.executed_proposals
+                    .iter()
+                    .map(|e| (e.proposal_id.clone(), e.executed_at_ms.min(now)))
+                    .collect()
+            },
             suspended_capabilities: snap
                 .suspended_capabilities
                 .iter()
@@ -4656,10 +4955,23 @@ impl WasmContextManager {
             tool_interfaces: snap.tool_interfaces.clone(),
             governance_freeze: snap.governance_freeze,
             pending_proposals: HashMap::new(),
-            resolved_proposals: HashMap::new(),
+            // v3 import: reconstruct resolved_proposals from serde_json::Value
+            // entries. Malformed entries (e.g., struct shape drift) are
+            // dropped — the envelope HMAC already gates this path, so this
+            // is a last-line defense against forward-incompatible imports.
+            resolved_proposals: {
+                let mut out: HashMap<String, GovernanceProposal> = HashMap::new();
+                for (k, v) in &snap.resolved_proposals_json {
+                    if let Ok(proposal) = serde_json::from_value::<GovernanceProposal>(v.clone()) {
+                        out.insert(k.clone(), proposal);
+                    }
+                }
+                out
+            },
             pruning_policy: snap.pruning_policy.clone(),
             economic_policy_locked: snap.economic_policy_locked,
-            _consequence_rules: Vec::new(),
+            consequence_rules: snap.consequence_rules.clone(),
+            cooldown_until: snap.cooldown_until.clone(),
             // Imported contexts do not carry MLS state — they must re-establish
             // encryption via join_context_encrypted after import.
             crypto: None,
@@ -4862,7 +5174,22 @@ pub struct ContextMetadata {
 // ---------------------------------------------------------------------------
 
 /// Current version of the WASM context export format.
-const WASM_EXPORT_VERSION: u32 = 2;
+///
+/// # Version history
+///
+/// - **v1**: initial format.
+/// - **v2**: added per-author broadcast state (block lists, key epochs).
+/// - **v3**: added lossless anti-replay state —
+///   `seen_nonces_v3` (full `(nonce, inserted_at_ms)` pairs),
+///   `executed_proposals` (full `(proposal_id, executed_at_ms)` pairs),
+///   `resolved_proposals_json`, `consequence_rules`, `cooldown_until`.
+///   v2 `seen_nonces: Vec<String>` is retained as `seen_nonces_legacy_v2`
+///   for back-compat so v2 exports can still be imported into v3 binaries
+///   (with the documented lossy timestamp-reset behavior for that field).
+///   v3 exports are NOT importable by v2 binaries because the version
+///   check below rejects exports with `version > WASM_EXPORT_VERSION`,
+///   which prevents silent loss of the new lossless state.
+const WASM_EXPORT_VERSION: u32 = 3;
 
 /// Versioned envelope for context exports.
 ///
@@ -4891,12 +5218,54 @@ struct WasmContextExportEnvelope {
     snapshot: WasmContextExportSnapshot,
 }
 
+/// A UCAN nonce plus its insertion timestamp (ms since Unix epoch), used to
+/// round-trip the live `PerContextState.seen_nonces: HashMap<String, f64>`.
+///
+/// Introduced in `WASM_EXPORT_VERSION = 3`. The `inserted_at_ms` field is an
+/// `f64` to match the live field's representation exactly and preserve
+/// bit-for-bit round-trip fidelity.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct WasmExportNonceEntry {
+    /// The nonce string as recorded by `ucan_record_nonce`.
+    nonce: String,
+    /// Milliseconds since Unix epoch when the nonce was first observed.
+    /// Matches `PerContextState.seen_nonces` value type (`f64`).
+    inserted_at_ms: f64,
+}
+
+/// An executed-proposal replay entry plus its execution timestamp (ms since
+/// Unix epoch).
+///
+/// Introduced in `WASM_EXPORT_VERSION = 3`. Mirrors
+/// `WasmExportNonceEntry` in shape but keyed on governance proposal IDs, so
+/// that governance replay protection survives export/import without
+/// TTL-bypass.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct WasmExportExecutedProposalEntry {
+    /// Hex-encoded governance proposal ID.
+    proposal_id: String,
+    /// Milliseconds since Unix epoch when the proposal was recorded as
+    /// executed. Matches `PerContextState.executed_proposals` value type
+    /// (`f64`).
+    executed_at_ms: f64,
+}
+
 /// Snapshot of a context's state for export.
 ///
 /// Contains all fields needed to reconstruct a `PerContextState` on import.
 /// Tool registry, event log, and tool handlers are NOT exported (they can be
 /// re-registered after import). Membership, roles, governance, broadcast,
 /// UCAN revocation, and nonce replay state are preserved.
+///
+/// # Versioning
+///
+/// - v1/v2: flat `seen_nonces: Vec<String>` (keys only — timestamps lost).
+/// - v3: adds `seen_nonces_v3` with full `(nonce, inserted_at_ms)` pairs,
+///   `executed_proposals` with full `(proposal_id, executed_at_ms)` pairs,
+///   `resolved_proposals_json`, `consequence_rules`, and `cooldown_until` so
+///   anti-replay, governance audit, and consequence enforcement state survive
+///   round-trip without TTL-bypass. v2's `seen_nonces` field is retained as
+///   `seen_nonces_legacy_v2` for back-compat.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 struct WasmContextExportSnapshot {
     context_id: String,
@@ -4920,10 +5289,41 @@ struct WasmContextExportSnapshot {
     /// so that previously revoked tokens remain rejected.
     #[serde(default)]
     revoked_tokens: Vec<String>,
-    /// Seen UCAN nonces. Preserves nonce replay protection across
-    /// export/import so that previously used nonces are still rejected.
+    /// v1/v2 lossy seen-nonces field (keys only). Retained under the original
+    /// serde name so that v2 envelopes still deserialize into a v3 snapshot.
+    /// v3 exporters always leave this empty and populate `seen_nonces_v3`
+    /// instead.
+    #[serde(default, rename = "seen_nonces")]
+    seen_nonces_legacy_v2: Vec<String>,
+    /// v3 lossless seen-nonces field. Each entry preserves both the nonce
+    /// string and its insertion timestamp (ms since epoch) so TTL eviction
+    /// survives export/import without the "nonces become young again on
+    /// import" bug present in v1/v2.
     #[serde(default)]
-    seen_nonces: Vec<String>,
+    seen_nonces_v3: Vec<WasmExportNonceEntry>,
+    /// v3 lossless executed-proposals field. Each entry preserves the
+    /// proposal ID and the execution timestamp so governance replay
+    /// protection survives export/import. Absent in v1/v2.
+    #[serde(default)]
+    executed_proposals: Vec<WasmExportExecutedProposalEntry>,
+    /// v3 resolved-proposals audit field. Keys are proposal IDs; values are
+    /// the raw `GovernanceProposal` JSON. Stored as `serde_json::Value` for
+    /// forward compatibility with any additions to the struct in
+    /// scp-protocol. Malformed entries are dropped on import (defense in
+    /// depth; the envelope HMAC already gates this path).
+    #[serde(default)]
+    resolved_proposals_json: HashMap<String, serde_json::Value>,
+    /// Consequence rules declared at context creation (ADR-017). Mirrors
+    /// `scp_runtime::context::manager::ContextSnapshot.consequence_rules` and
+    /// is wired to `evaluate_consequence_rules` via the WASM
+    /// `consequence::dispatch_consequences_for_subject` helper.
+    #[serde(default)]
+    consequence_rules: Vec<scp_protocol::trust::consequence::ConsequenceRule>,
+    /// Per-rule cooldown timers for consequence dispatch. Maps rule index to
+    /// the Unix second until which the rule should not re-fire. Mirrors
+    /// `scp_runtime` governance `cooldown_until`.
+    #[serde(default)]
+    cooldown_until: HashMap<usize, u64>,
     /// Threshold governance signers (ADR-031 §4b).
     #[serde(default)]
     threshold_signers: Vec<String>,
@@ -5620,8 +6020,8 @@ mod tests {
     }
 
     #[test]
-    fn export_version_is_two() {
-        assert_eq!(WASM_EXPORT_VERSION, 2);
+    fn export_version_is_three() {
+        assert_eq!(WASM_EXPORT_VERSION, 3);
     }
 
     // -----------------------------------------------------------------------
@@ -5768,7 +6168,8 @@ mod tests {
             resolved_proposals: HashMap::new(),
             pruning_policy: None,
             economic_policy_locked: false,
-            _consequence_rules: Vec::new(),
+            consequence_rules: Vec::new(),
+            cooldown_until: HashMap::new(),
             crypto: None,
         };
 
@@ -5877,7 +6278,8 @@ mod tests {
             resolved_proposals: HashMap::new(),
             pruning_policy: None,
             economic_policy_locked: false,
-            _consequence_rules: Vec::new(),
+            consequence_rules: Vec::new(),
+            cooldown_until: HashMap::new(),
             crypto: None,
         };
         let mut mgr = WasmContextManager::new();

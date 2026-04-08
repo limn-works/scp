@@ -76,6 +76,13 @@
 pub mod bridge;
 /// Context lifecycle and messaging (create, join, leave, close, send, subscribe).
 pub mod context;
+/// Consequence rule evaluation and enforcement (ADR-017, #1531).
+///
+/// Wraps `scp_protocol::trust::consequence::evaluate_consequence_rules`
+/// with WASM-local state mutation so that rules declared at context creation
+/// are enforced inside [`crate::manager::PerContextState`]. See the module
+/// docs for dispatch call sites.
+pub(crate) mod consequence;
 /// MLS encryption and sender key layer for real message confidentiality.
 pub mod crypto;
 /// JS-injected key custody callback types (`WebCrypto` integration).
