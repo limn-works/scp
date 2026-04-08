@@ -1467,7 +1467,10 @@ impl ContextManager {
             }
             // Record the join in the velocity tracker so subsequent §19.7
             // escalation observes the same activity surface as message sends.
-            ctx.governance
+            // F5: capture the rollback token so a join failure refunds
+            // THIS entry specifically rather than racing concurrent joiners.
+            let velocity_token = ctx
+                .governance
                 .velocity_tracker
                 .record_message(&member_did, now_secs);
 
@@ -1481,7 +1484,9 @@ impl ContextManager {
             ) {
                 Ok(cost) => cost,
                 Err(e) => {
-                    ctx.governance.velocity_tracker.rollback_last(&member_did);
+                    ctx.governance
+                        .velocity_tracker
+                        .rollback(&member_did, velocity_token);
                     ctx.governance.hard_rate_limit.refund(&member_did);
                     return Err(e);
                 }

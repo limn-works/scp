@@ -93,9 +93,12 @@ impl ContextManager {
 
         // Record the invocation for velocity tracking BEFORE enforcement
         // so that compute_escalated_cost sees the new window entry
-        // (matching send_message behavior).
+        // (matching send_message behavior). F5: capture the rollback
+        // token so a post-enforcement failure refunds THIS entry
+        // specifically, not whatever happens to be last in the queue.
         let now_secs = self.clock.now_secs();
-        ctx.governance
+        let velocity_token = ctx
+            .governance
             .velocity_tracker
             .record_message(invoker_did, now_secs);
 
@@ -169,8 +172,11 @@ impl ContextManager {
                 payment_receipt,
             }),
             Err(err) => {
-                // Roll back the velocity tracker entry we recorded above.
-                ctx.governance.velocity_tracker.rollback_last(invoker_did);
+                // Roll back the velocity tracker entry we recorded above
+                // using the F5 identity-based token.
+                ctx.governance
+                    .velocity_tracker
+                    .rollback(invoker_did, velocity_token);
                 Err(invocation_error_to_context(err))
             }
         }

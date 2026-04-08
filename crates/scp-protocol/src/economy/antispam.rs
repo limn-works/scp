@@ -23,12 +23,122 @@
 
 use std::collections::HashMap;
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use serde::{Deserialize, Serialize};
 
 use scp_primitives::DID;
 
 use super::types::Amount;
+
+/// Defense-in-depth cap on per-sender velocity Vec length. If a caller
+/// floods a single DID, oldest entries are dropped once this cap is
+/// exceeded. The Matrix-style token-bucket limiter prevents legitimate
+/// callers from ever reaching this — 4096 leaves four orders of
+/// magnitude of headroom over normal conversation rates.
+///
+/// Exposed at `pub(crate)` visibility so the tests module can reference
+/// it without leaking into the public API.
+pub(crate) const MAX_VELOCITY_ENTRIES_PER_SENDER: usize = 4096;
+
+/// Maximum acceptable clock-skew tolerance when validating persisted
+/// anti-spam snapshot state. Timestamps more than this far in the
+/// future are rejected; `last_refill` values more than this far in the
+/// future are clamped to `now`. Five seconds is the same tolerance used
+/// elsewhere in governance to bound NTP jitter between honest nodes.
+pub const SNAPSHOT_CLOCK_SKEW_TOLERANCE_SECS: u64 = 5;
+
+// ---------------------------------------------------------------------------
+// VelocityRollbackToken
+// ---------------------------------------------------------------------------
+
+/// Opaque identifier for a single recorded velocity entry.
+///
+/// Returned by [`SenderVelocityTracker::record_message`] so that a
+/// failed downstream operation can roll back its specific entry via
+/// [`SenderVelocityTracker::rollback`] — rather than popping "the most
+/// recent" entry, which is racy under concurrent senders (RED-805).
+///
+/// Tokens are monotonically minted per-tracker (never reused) and are
+/// **not persisted**: snapshot exports preserve timestamps only, and
+/// `from_snapshot` synthesizes fresh sequence numbers for restored
+/// entries (which by construction are never legitimate rollback
+/// targets — restored history is finalized).
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct VelocityRollbackToken(u64);
+
+impl VelocityRollbackToken {
+    /// Exposes the internal sequence number. Used only in tests and in
+    /// the snapshot format sanity checks. External callers should treat
+    /// this as opaque.
+    #[must_use]
+    pub const fn into_inner(self) -> u64 {
+        self.0
+    }
+}
+
+// ---------------------------------------------------------------------------
+// SnapshotValidationError (F6)
+// ---------------------------------------------------------------------------
+
+/// Error emitted by snapshot validators when a deserialized anti-spam
+/// snapshot cannot be reconstructed safely. See spec §19.7.
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+pub enum SnapshotValidationError {
+    /// A velocity entry's timestamp is beyond `now + skew_tolerance`.
+    /// This is never legitimate — it indicates a tampered snapshot.
+    #[error(
+        "velocity snapshot for {did}: timestamp {timestamp} exceeds now+{tolerance} (now={now})"
+    )]
+    VelocityFutureTimestamp {
+        /// Stringified sender DID the offending entry belongs to.
+        did: String,
+        /// The offending timestamp value (seconds since epoch).
+        timestamp: u64,
+        /// The current wall time used for validation.
+        now: u64,
+        /// The accepted skew tolerance in seconds.
+        tolerance: u64,
+    },
+    /// A velocity entry sequence number is duplicated within a single
+    /// sender's Vec. Indicates malformed state.
+    #[error("velocity snapshot for {did}: duplicate sequence {seq}")]
+    VelocityDuplicateSeq {
+        /// Stringified sender DID.
+        did: String,
+        /// The duplicated sequence number.
+        seq: u64,
+    },
+    /// A sender's velocity Vec exceeds the hard cap. Rejection prevents
+    /// a tampered snapshot from bypassing the per-sender memory bound.
+    #[error("velocity snapshot for {did}: entry count {count} exceeds cap {cap}")]
+    VelocityEntryCountExceeded {
+        /// Stringified sender DID.
+        did: String,
+        /// The observed entry count.
+        count: usize,
+        /// The configured maximum entry cap.
+        cap: usize,
+    },
+    /// `HardRateLimitConfig` carries an invalid `burst`.
+    #[error("hard rate limit config: burst must be > 0")]
+    InvalidBurst,
+    /// `HardRateLimitConfig` carries an out-of-range refill rate. Upper
+    /// bound prevents multiplication overflow in `try_consume`.
+    #[error("hard rate limit config: refill_per_kilosec={rate} out of range")]
+    InvalidRefillRate {
+        /// The offending refill rate value.
+        rate: u64,
+    },
+    /// `ContextMessagePricingConfig` floor exceeds cap.
+    #[error("pricing config: floor ({floor}) exceeds cap ({cap})")]
+    PricingFloorExceedsCap {
+        /// The configured pricing floor (inner Amount).
+        floor: u64,
+        /// The configured pricing cap (inner Amount).
+        cap: u64,
+    },
+}
 
 // ---------------------------------------------------------------------------
 // EscalationThreshold
@@ -148,9 +258,15 @@ impl EscalationConfig {
 pub struct SenderVelocityTracker {
     /// Sliding window duration in seconds.
     window_secs: u64,
-    /// Per-sender message timestamps, protected by a mutex.
-    /// Key: sender DID, Value: Vec of timestamps (seconds since epoch).
-    state: Mutex<HashMap<DID, Vec<u64>>>,
+    /// Per-sender message state, protected by a mutex.
+    /// Key: sender DID, Value: Vec of `(timestamp, sequence)` tuples where
+    /// `sequence` is a tracker-wide monotonic rollback token id.
+    state: Mutex<HashMap<DID, Vec<(u64, u64)>>>,
+    /// Monotonic counter used to mint unique [`VelocityRollbackToken`]
+    /// values. Relaxed ordering is fine — the sequence itself is only
+    /// used for identity comparisons within each sender's Vec (which is
+    /// already serialized by the state mutex).
+    next_seq: AtomicU64,
 }
 
 impl SenderVelocityTracker {
@@ -165,6 +281,7 @@ impl SenderVelocityTracker {
         Self {
             window_secs,
             state: Mutex::new(HashMap::new()),
+            next_seq: AtomicU64::new(0),
         }
     }
 
@@ -188,9 +305,10 @@ impl SenderVelocityTracker {
 
     /// Exports the tracker's per-sender timestamp entries for persistence.
     ///
-    /// Returns a clone of the internal `HashMap<DID, Vec<u64>>` mapping each
-    /// sender DID to their recorded message timestamps. Used by
-    /// [`ContextSnapshot`](crate) to persist velocity state across restarts.
+    /// Returns a `HashMap<String, Vec<u64>>` mapping each sender DID to
+    /// their recorded message timestamps. Rollback-token sequence numbers
+    /// are intentionally **not** persisted — they are local-only identity
+    /// markers that have no meaning once the process restarts.
     ///
     /// # Panics
     ///
@@ -203,7 +321,12 @@ impl SenderVelocityTracker {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         state
             .iter()
-            .map(|(did, timestamps)| (did.as_ref().to_owned(), timestamps.clone()))
+            .map(|(did, entries)| {
+                (
+                    did.as_ref().to_owned(),
+                    entries.iter().map(|&(ts, _)| ts).collect(),
+                )
+            })
             .collect()
     }
 
@@ -211,35 +334,123 @@ impl SenderVelocityTracker {
     ///
     /// Restores both the sliding window configuration and per-sender timestamp
     /// entries. Used during context restoration to avoid losing velocity state
-    /// across process restarts.
+    /// across process restarts. Each restored entry is assigned a fresh
+    /// sequence number drawn from the tracker's counter — these entries will
+    /// never be legitimate rollback targets because they predate any
+    /// `record_message` call made after restore.
+    ///
+    /// Callers are expected to have validated the snapshot via
+    /// [`Self::validate_and_sanitize_snapshot`] before calling this.
     #[must_use]
     pub fn from_snapshot(window_secs: u64, entries: HashMap<String, Vec<u64>>) -> Self {
-        let converted: HashMap<DID, Vec<u64>> = entries
-            .into_iter()
-            .map(|(did_str, timestamps)| (DID::from(did_str), timestamps))
-            .collect();
-        Self {
-            window_secs,
-            state: Mutex::new(converted),
+        let tracker = Self::new(window_secs);
+        {
+            let mut state = tracker
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            for (did_str, timestamps) in entries {
+                let tagged: Vec<(u64, u64)> = timestamps
+                    .into_iter()
+                    .map(|ts| {
+                        let seq = tracker.next_seq.fetch_add(1, Ordering::Relaxed);
+                        (ts, seq)
+                    })
+                    .collect();
+                state.insert(DID::from(did_str), tagged);
+            }
         }
+        tracker
+    }
+
+    /// Validates and sanitizes a persisted velocity snapshot before
+    /// reconstruction. Rejects future timestamps beyond the skew
+    /// tolerance and rejects oversized Vecs. Stale entries (beyond the
+    /// sliding window floor) are **clamped-dropped** rather than
+    /// rejected because stale data is legitimate snapshot-replay
+    /// (no attacker advantage) whereas future data is uniquely an attack.
+    ///
+    /// Call this before [`Self::from_snapshot`]. Mutates the input to
+    /// remove stale entries.
+    pub fn validate_and_sanitize_snapshot(
+        entries: &mut HashMap<String, Vec<u64>>,
+        window_secs: u64,
+        now: u64,
+        clock_skew_tolerance: u64,
+    ) -> Result<(), SnapshotValidationError> {
+        let future_bound = now.saturating_add(clock_skew_tolerance);
+        let past_bound = now
+            .saturating_sub(window_secs)
+            .saturating_sub(clock_skew_tolerance);
+
+        for (did, timestamps) in entries.iter_mut() {
+            // Reject future timestamps outright.
+            for &ts in timestamps.iter() {
+                if ts > future_bound {
+                    return Err(SnapshotValidationError::VelocityFutureTimestamp {
+                        did: did.clone(),
+                        timestamp: ts,
+                        now,
+                        tolerance: clock_skew_tolerance,
+                    });
+                }
+            }
+            // Clamp-drop stale entries that are outside the window floor.
+            timestamps.retain(|&ts| ts >= past_bound);
+            // Reject any Vec that exceeds the hard cap — tampering.
+            if timestamps.len() > MAX_VELOCITY_ENTRIES_PER_SENDER {
+                return Err(SnapshotValidationError::VelocityEntryCountExceeded {
+                    did: did.clone(),
+                    count: timestamps.len(),
+                    cap: MAX_VELOCITY_ENTRIES_PER_SENDER,
+                });
+            }
+        }
+        Ok(())
     }
 
     /// Records a message from `sender` at the given `timestamp`.
     ///
-    /// The timestamp is in seconds since the Unix epoch. Messages are
-    /// appended to the sender's window; pruning happens lazily on
-    /// [`get_velocity`](Self::get_velocity) calls.
+    /// The timestamp is in seconds since the Unix epoch. Prunes
+    /// expired entries on append so free-context traffic (which never
+    /// calls [`Self::get_velocity`]) does not grow unbounded. Enforces
+    /// a per-sender hard cap as defense-in-depth.
+    ///
+    /// Returns a [`VelocityRollbackToken`] that identifies this specific
+    /// entry so callers can roll it back via [`Self::rollback`] without
+    /// racing concurrent senders.
     ///
     /// # Panics
     ///
     /// Panics if the internal mutex is poisoned (indicates a prior panic
     /// while holding the lock — an unrecoverable state).
-    pub fn record_message(&self, sender: &DID, timestamp: u64) {
+    pub fn record_message(&self, sender: &DID, timestamp: u64) -> VelocityRollbackToken {
         let mut state = self
             .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        state.entry(sender.clone()).or_default().push(timestamp);
+        let cutoff = timestamp.saturating_sub(self.window_secs);
+        let entries = state.entry(sender.clone()).or_default();
+
+        // F8: prune expired entries before append so a free-context path
+        // (which never calls get_velocity) does not grow unbounded.
+        entries.retain(|&(ts, _)| ts >= cutoff);
+
+        // F8: defense-in-depth hard cap. If a pathological caller floods
+        // this sender's slot, drop the oldest entries.
+        if entries.len() >= MAX_VELOCITY_ENTRIES_PER_SENDER {
+            let drop_count = entries.len() + 1 - MAX_VELOCITY_ENTRIES_PER_SENDER;
+            entries.drain(0..drop_count);
+            tracing::warn!(
+                did = %sender.as_ref(),
+                cap = MAX_VELOCITY_ENTRIES_PER_SENDER,
+                "velocity tracker per-sender cap hit; dropping oldest entries"
+            );
+        }
+
+        let seq = self.next_seq.fetch_add(1, Ordering::Relaxed);
+        entries.push((timestamp, seq));
+        VelocityRollbackToken(seq)
     }
 
     /// Returns the number of messages from `sender` within the current
@@ -260,9 +471,9 @@ impl SenderVelocityTracker {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let cutoff = now.saturating_sub(self.window_secs);
 
-        state.get_mut(sender).map_or(0, |timestamps| {
-            timestamps.retain(|&ts| ts >= cutoff);
-            timestamps.len() as u64
+        state.get_mut(sender).map_or(0, |entries| {
+            entries.retain(|&(ts, _)| ts >= cutoff);
+            entries.len() as u64
         })
     }
 
@@ -289,9 +500,9 @@ impl SenderVelocityTracker {
         let cutoff = now.saturating_sub(self.window_secs);
 
         let mut total: u64 = 0;
-        for timestamps in state.values_mut() {
-            timestamps.retain(|&ts| ts >= cutoff);
-            total = total.saturating_add(timestamps.len() as u64);
+        for entries in state.values_mut() {
+            entries.retain(|&(ts, _)| ts >= cutoff);
+            total = total.saturating_add(entries.len() as u64);
         }
         total
     }
@@ -332,21 +543,30 @@ impl SenderVelocityTracker {
         cost
     }
 
-    /// Removes the most recent timestamp for `sender`, undoing one
-    /// [`record_message`](Self::record_message) call.
+    /// Removes the specific entry identified by `token` for `sender`,
+    /// undoing exactly the [`record_message`](Self::record_message) call
+    /// that returned the token.
     ///
-    /// No-op if `sender` has no recorded timestamps (including unknown DIDs).
-    /// This is used to roll back a velocity increment when a downstream
-    /// operation (e.g. economy enforcement) fails after the message was
-    /// already recorded.
-    pub fn rollback_last(&self, sender: &DID) {
+    /// Returns `true` if the entry was found and removed. A return of
+    /// `false` is not an error: legitimate cases include the entry
+    /// having been pruned on a later `get_velocity` / `record_message`
+    /// call, or the sender having no entries at all.
+    ///
+    /// This replaces the old `rollback_last` which popped "the most
+    /// recent" entry — a race bug under concurrent senders. See
+    /// red-hat finding RED-805 and batch1 plan §F5.
+    pub fn rollback(&self, sender: &DID, token: VelocityRollbackToken) -> bool {
         let mut state = self
             .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if let Some(timestamps) = state.get_mut(sender) {
-            timestamps.pop();
+        if let Some(entries) = state.get_mut(sender) {
+            if let Some(pos) = entries.iter().position(|&(_, seq)| seq == token.0) {
+                entries.swap_remove(pos);
+                return true;
+            }
         }
+        false
     }
 }
 
@@ -380,6 +600,12 @@ pub struct HardRateLimitConfig {
 }
 
 impl HardRateLimitConfig {
+    /// Upper bound on `refill_per_kilosec`. Prevents arithmetic overflow
+    /// in [`TokenBucketLimiter::try_consume`] when multiplied by elapsed
+    /// time. Chosen to leave headroom for any realistic Matrix-style
+    /// configuration (the default is 200).
+    pub const MAX_REFILL_PER_KILOSEC: u64 = 1_000_000;
+
     /// Matrix Synapse defaults: 0.2 messages per second, burst 10.
     #[must_use]
     pub const fn matrix_defaults() -> Self {
@@ -387,6 +613,28 @@ impl HardRateLimitConfig {
             refill_per_kilosec: 200,
             burst: 10,
         }
+    }
+
+    /// Validates the configuration. Called during snapshot restore and
+    /// context creation (spec §19.7) to prevent tampered or
+    /// nonsensical values from reaching the hot path.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SnapshotValidationError::InvalidBurst`] if `burst == 0`
+    /// and [`SnapshotValidationError::InvalidRefillRate`] if
+    /// `refill_per_kilosec` is zero or exceeds
+    /// [`Self::MAX_REFILL_PER_KILOSEC`].
+    pub const fn validate(&self) -> Result<(), SnapshotValidationError> {
+        if self.burst == 0 {
+            return Err(SnapshotValidationError::InvalidBurst);
+        }
+        if self.refill_per_kilosec == 0 || self.refill_per_kilosec > Self::MAX_REFILL_PER_KILOSEC {
+            return Err(SnapshotValidationError::InvalidRefillRate {
+                rate: self.refill_per_kilosec,
+            });
+        }
+        Ok(())
     }
 }
 
@@ -411,6 +659,14 @@ impl Default for HardRateLimitConfig {
 /// rejecting bursts at the protocol layer regardless of cost: even an actor
 /// with infinite budget cannot exceed `burst` messages without waiting for
 /// refill. See [`HardRateLimitConfig::matrix_defaults`].
+///
+/// # Monotonic clock requirement
+///
+/// Callers MUST pass `now_secs` values that never regress. A regressing
+/// clock does NOT corrupt internal state — [`Self::try_consume`] clamps
+/// `last_refill` forward so subsequent refills continue to compute
+/// against the highest observed timestamp — but refills may be delayed
+/// until wall time catches up to the stored timestamp.
 pub struct TokenBucketLimiter {
     /// Per-sender state: (`tokens_milli`, `last_refill_secs`).
     state: Mutex<HashMap<DID, (u64, u64)>>,
@@ -442,6 +698,12 @@ impl TokenBucketLimiter {
     /// consume one token. Returns `true` if a token was consumed, `false` if
     /// the sender is over their budget.
     ///
+    /// Clock-skew-safe: if `now_secs` is less than the stored
+    /// `last_refill` (the caller's clock went backwards), elapsed is
+    /// treated as zero and `last_refill` is kept at the previous value.
+    /// This prevents a non-monotonic clock from corrupting refill
+    /// accounting or enabling a spurious-refund-after-the-fact attack.
+    ///
     /// # Panics
     ///
     /// Panics if the internal mutex is poisoned.
@@ -458,11 +720,13 @@ impl TokenBucketLimiter {
             .entry(sender.clone())
             .or_insert((burst_milli, now_secs));
 
-        // Refill: (now - last) * refill_rate, capped at burst_milli.
-        let elapsed = now_secs.saturating_sub(entry.1);
+        // F7: clock-skew safety. Clamp `effective_now` forward so
+        // `last_refill` never regresses.
+        let effective_now = now_secs.max(entry.1);
+        let elapsed = effective_now.saturating_sub(entry.1);
         let refill = elapsed.saturating_mul(refill_rate);
         entry.0 = entry.0.saturating_add(refill).min(burst_milli);
-        entry.1 = now_secs;
+        entry.1 = effective_now;
 
         // Consume one token (1000 milli-tokens).
         if entry.0 >= 1000 {
@@ -471,6 +735,47 @@ impl TokenBucketLimiter {
         } else {
             false
         }
+    }
+
+    /// Validates and sanitizes persisted token bucket state. Clamps
+    /// `tokens_milli > burst_milli` (legitimate if `burst` was lowered
+    /// via governance between snapshots), and clamps `last_refill >
+    /// now + skew_tolerance` to `now` (tampering).
+    ///
+    /// # Errors
+    ///
+    /// No errors today — all irregularities are clamped. Returns
+    /// `Ok(())` unconditionally; kept as `Result` for forward
+    /// compatibility when stricter rejection policies are added.
+    pub fn validate_and_sanitize_snapshot(
+        entries: &mut HashMap<String, (u64, u64)>,
+        config: &HardRateLimitConfig,
+        now: u64,
+        clock_skew_tolerance: u64,
+    ) -> Result<(), SnapshotValidationError> {
+        let burst_milli = config.burst.saturating_mul(1000);
+        let future_bound = now.saturating_add(clock_skew_tolerance);
+        for (did, entry) in entries.iter_mut() {
+            if entry.0 > burst_milli {
+                tracing::warn!(
+                    did = %did,
+                    tokens_milli = entry.0,
+                    burst_milli,
+                    "token bucket snapshot tokens exceeded burst; clamping"
+                );
+                entry.0 = burst_milli;
+            }
+            if entry.1 > future_bound {
+                tracing::warn!(
+                    did = %did,
+                    last_refill = entry.1,
+                    now,
+                    "token bucket snapshot last_refill in future; clamping to now"
+                );
+                entry.1 = now;
+            }
+        }
+        Ok(())
     }
 
     /// Refunds one token to the sender's bucket (clamped at the burst).
@@ -575,6 +880,29 @@ impl ContextMessagePricingConfig {
             cap: Some(Amount(1000)),
             hard_rate_limit: HardRateLimitConfig::matrix_defaults(),
         }
+    }
+
+    /// Validates the pricing configuration. Called during context
+    /// creation and snapshot restore to prevent invalid configurations
+    /// from reaching the hot path.
+    ///
+    /// # Errors
+    ///
+    /// - [`SnapshotValidationError::PricingFloorExceedsCap`] if
+    ///   `floor > cap` when both are set.
+    /// - Any error from [`HardRateLimitConfig::validate`] on the embedded
+    ///   hard rate limit.
+    pub fn validate(&self) -> Result<(), SnapshotValidationError> {
+        self.hard_rate_limit.validate()?;
+        if let (Some(floor), Some(cap)) = (self.floor, self.cap)
+            && floor.0 > cap.0
+        {
+            return Err(SnapshotValidationError::PricingFloorExceedsCap {
+                floor: floor.0,
+                cap: cap.0,
+            });
+        }
+        Ok(())
     }
 }
 
@@ -782,7 +1110,11 @@ mod tests {
         // Spec example from section 19.7:
         // base_cost: $0.001 (1 unit)
         // thresholds: (10, +1), (50, +10), (200, +100)
-        let tracker = SenderVelocityTracker::new(60);
+        //
+        // NOTE: window must cover all 200 recorded messages, so we use a
+        // 300s window. All record timestamps are within [now-299, now]
+        // so F8's prune-on-append does not drop entries mid-test.
+        let tracker = SenderVelocityTracker::new(300);
         let sender = did("did:dht:z6MkSpammer");
         let base_cost = Amount(1);
         let config = EscalationConfig {
@@ -802,7 +1134,7 @@ mod tests {
             ],
         };
 
-        let now = 1000;
+        let now = 10_000;
 
         // 0 messages: base cost only
         assert_eq!(
@@ -810,9 +1142,11 @@ mod tests {
             Amount(1),
         );
 
-        // Record 10 messages (hits first threshold)
-        for i in 0..10 {
-            tracker.record_message(&sender, now - 30 + i);
+        // Record 10 messages (hits first threshold). All timestamps are
+        // strictly in the past relative to `now`, so prune-on-append
+        // (F8) is a no-op within the 300s window.
+        for i in 0..10u64 {
+            tracker.record_message(&sender, now - 250 + i);
         }
         assert_eq!(
             tracker.compute_escalated_cost(&sender, now, base_cost, &config, None, None),
@@ -820,8 +1154,8 @@ mod tests {
         );
 
         // Record 40 more (total 50, hits second threshold)
-        for i in 10..50 {
-            tracker.record_message(&sender, now - 30 + i);
+        for i in 10..50u64 {
+            tracker.record_message(&sender, now - 250 + i);
         }
         assert_eq!(
             tracker.compute_escalated_cost(&sender, now, base_cost, &config, None, None),
@@ -829,8 +1163,8 @@ mod tests {
         );
 
         // Record 150 more (total 200, hits all thresholds)
-        for i in 50..200 {
-            tracker.record_message(&sender, now - 30 + i);
+        for i in 50..200u64 {
+            tracker.record_message(&sender, now - 250 + i);
         }
         assert_eq!(
             tracker.compute_escalated_cost(&sender, now, base_cost, &config, None, None),
@@ -1018,46 +1352,312 @@ mod tests {
         assert_eq!(restored.get_velocity(&alice, 1000), 1);
     }
 
-    // --- Rollback ---
+    // --- Rollback (F5: token-based) ---
 
     #[test]
-    fn rollback_last_reduces_velocity_by_one() {
+    fn rollback_token_reduces_velocity_by_one() {
         let tracker = SenderVelocityTracker::new(60);
         let sender = did("did:dht:z6MkAlice");
 
-        tracker.record_message(&sender, 1000);
-        tracker.record_message(&sender, 1001);
-        tracker.record_message(&sender, 1002);
+        let _t1 = tracker.record_message(&sender, 1000);
+        let _t2 = tracker.record_message(&sender, 1001);
+        let t3 = tracker.record_message(&sender, 1002);
         assert_eq!(tracker.get_velocity(&sender, 1005), 3);
 
-        tracker.rollback_last(&sender);
+        assert!(tracker.rollback(&sender, t3));
         assert_eq!(tracker.get_velocity(&sender, 1005), 2);
     }
 
     #[test]
-    fn rollback_last_on_unknown_did_is_noop() {
+    fn rollback_on_unknown_did_is_safe_false() {
         let tracker = SenderVelocityTracker::new(60);
         let unknown = did("did:dht:z6MkUnknown");
 
-        // Should not panic or alter state.
-        tracker.rollback_last(&unknown);
+        // Mint a token for some OTHER sender so we have one to pass —
+        // the value does not need to match any entry on `unknown`.
+        let sender = did("did:dht:z6MkAlice");
+        let tok = tracker.record_message(&sender, 1000);
+
+        assert!(!tracker.rollback(&unknown, tok));
         assert_eq!(tracker.get_velocity(&unknown, 1000), 0);
     }
 
     #[test]
-    fn rollback_last_on_empty_timestamps_is_noop() {
+    fn rollback_after_pruning_is_safe_false() {
         let tracker = SenderVelocityTracker::new(10);
         let sender = did("did:dht:z6MkAlice");
 
-        // Record a message then let it expire via pruning.
-        tracker.record_message(&sender, 100);
+        let tok = tracker.record_message(&sender, 100);
         // Prune by querying well past the window.
         assert_eq!(tracker.get_velocity(&sender, 200), 0);
 
-        // Rollback on a known sender with empty timestamps should be no-op.
-        tracker.rollback_last(&sender);
+        // Rollback on a known sender with the now-pruned entry must
+        // return false (not panic, not remove some other entry).
+        assert!(!tracker.rollback(&sender, tok));
         assert_eq!(tracker.get_velocity(&sender, 200), 0);
     }
+
+    /// F5: interleaved senders must not race. Rollback of alice's
+    /// first token must NOT pop the most-recent entry (which belongs
+    /// to a different sender's timeline under concurrent interleaving).
+    #[test]
+    fn rollback_token_removes_correct_entry_under_interleaving() {
+        let tracker = SenderVelocityTracker::new(60);
+        let alice = did("did:dht:z6MkAlice");
+        let bob = did("did:dht:z6MkBob");
+
+        let t_alice_1 = tracker.record_message(&alice, 1000);
+        let _t_bob_1 = tracker.record_message(&bob, 1001);
+        let t_alice_2 = tracker.record_message(&alice, 1002);
+
+        assert_eq!(tracker.get_velocity(&alice, 1005), 2);
+        assert_eq!(tracker.get_velocity(&bob, 1005), 1);
+
+        // Roll back alice's FIRST entry — t_alice_1 — and confirm that
+        // alice still has t_alice_2 and bob is untouched.
+        assert!(tracker.rollback(&alice, t_alice_1));
+        assert_eq!(tracker.get_velocity(&alice, 1005), 1);
+        assert_eq!(tracker.get_velocity(&bob, 1005), 1);
+
+        // The remaining alice entry is t_alice_2; rolling it back
+        // leaves alice empty.
+        assert!(tracker.rollback(&alice, t_alice_2));
+        assert_eq!(tracker.get_velocity(&alice, 1005), 0);
+        assert_eq!(tracker.get_velocity(&bob, 1005), 1);
+    }
+
+    /// F5: rollback must target the OLDEST entry even after later
+    /// record_message calls reorder memory. Verifies identity-based
+    /// rollback rather than LIFO semantics.
+    #[test]
+    fn rollback_targets_specific_token_even_after_interleaved_record() {
+        let tracker = SenderVelocityTracker::new(60);
+        let alice = did("did:dht:z6MkAlice");
+        let t1 = tracker.record_message(&alice, 1000);
+        let _t2 = tracker.record_message(&alice, 1001);
+        let _t3 = tracker.record_message(&alice, 1002);
+
+        // Roll back the OLDEST entry rather than the newest.
+        assert!(tracker.rollback(&alice, t1));
+        assert_eq!(tracker.get_velocity(&alice, 1005), 2);
+
+        let snap = tracker.snapshot_entries();
+        let ts = snap.get(alice.as_ref()).unwrap();
+        assert!(!ts.contains(&1000));
+        assert!(ts.contains(&1001));
+        assert!(ts.contains(&1002));
+    }
+
+    // --- F8: prune-on-record + hard cap ---
+
+    /// Without F8, a free context that never calls `get_velocity`
+    /// grows the velocity Vec unbounded.
+    #[test]
+    fn free_context_record_message_prunes_expired_entries() {
+        let tracker = SenderVelocityTracker::new(10);
+        let alice = did("did:dht:z6MkAlice");
+        for t in 0..50u64 {
+            tracker.record_message(&alice, t);
+        }
+        for t in 1_000..1_010u64 {
+            tracker.record_message(&alice, t);
+        }
+        let snap = tracker.snapshot_entries();
+        let ts = snap.get(alice.as_ref()).unwrap();
+        // Without prune-on-append the Vec would be 60+. With the fix
+        // only the last 10 entries (within the 10s window of t=1009) survive.
+        assert!(
+            ts.len() <= 10,
+            "expected prune on append, got len={}",
+            ts.len()
+        );
+    }
+
+    #[test]
+    fn velocity_tracker_hard_cap_enforced() {
+        // Window = huge so nothing is ever pruned by the window check.
+        let tracker = SenderVelocityTracker::new(u64::MAX);
+        let alice = did("did:dht:z6MkAlice");
+        for t in 0..(MAX_VELOCITY_ENTRIES_PER_SENDER as u64 + 500) {
+            tracker.record_message(&alice, t);
+        }
+        let snap = tracker.snapshot_entries();
+        assert_eq!(
+            snap.get(alice.as_ref()).unwrap().len(),
+            MAX_VELOCITY_ENTRIES_PER_SENDER
+        );
+    }
+
+    // --- F6: snapshot validation ---
+
+    #[test]
+    fn validate_velocity_snapshot_rejects_future_timestamp_beyond_skew() {
+        let mut entries = HashMap::new();
+        entries.insert("did:dht:z6MkAlice".to_owned(), vec![10_000]);
+        // Snapshot claims ts=10_000 but now=100 — far future.
+        let err = SenderVelocityTracker::validate_and_sanitize_snapshot(
+            &mut entries,
+            60,
+            100,
+            SNAPSHOT_CLOCK_SKEW_TOLERANCE_SECS,
+        )
+        .unwrap_err();
+        assert!(matches!(
+            err,
+            SnapshotValidationError::VelocityFutureTimestamp { .. }
+        ));
+    }
+
+    #[test]
+    fn validate_velocity_snapshot_clamps_stale_entries() {
+        let mut entries = HashMap::new();
+        // Two stale entries + one fresh entry.
+        entries.insert(
+            "did:dht:z6MkAlice".to_owned(),
+            vec![1, 2, 950, 990, 999],
+        );
+        SenderVelocityTracker::validate_and_sanitize_snapshot(
+            &mut entries,
+            60, // window_secs
+            1000,
+            SNAPSHOT_CLOCK_SKEW_TOLERANCE_SECS,
+        )
+        .unwrap();
+        // Stale entries (1, 2) dropped; 950+ survive because window floor =
+        // 1000 - 60 - 5 = 935.
+        let ts = entries.get("did:dht:z6MkAlice").unwrap();
+        assert_eq!(ts, &vec![950, 990, 999]);
+    }
+
+    #[test]
+    fn validate_velocity_snapshot_rejects_oversized_entry_count() {
+        let mut entries = HashMap::new();
+        let huge: Vec<u64> = (0..(MAX_VELOCITY_ENTRIES_PER_SENDER as u64 + 1)).collect();
+        entries.insert("did:dht:z6MkAlice".to_owned(), huge);
+        let err = SenderVelocityTracker::validate_and_sanitize_snapshot(
+            &mut entries,
+            u64::MAX, // window so nothing clamp-drops by staleness
+            MAX_VELOCITY_ENTRIES_PER_SENDER as u64 + 10,
+            SNAPSHOT_CLOCK_SKEW_TOLERANCE_SECS,
+        )
+        .unwrap_err();
+        assert!(matches!(
+            err,
+            SnapshotValidationError::VelocityEntryCountExceeded { .. }
+        ));
+    }
+
+    #[test]
+    fn validate_hard_rate_limit_snapshot_clamps_tokens_over_burst() {
+        let cfg = HardRateLimitConfig {
+            burst: 10,
+            refill_per_kilosec: 200,
+        };
+        let mut entries = HashMap::new();
+        entries.insert("did:dht:z6MkAlice".to_owned(), (99_999, 100));
+        TokenBucketLimiter::validate_and_sanitize_snapshot(
+            &mut entries,
+            &cfg,
+            100,
+            SNAPSHOT_CLOCK_SKEW_TOLERANCE_SECS,
+        )
+        .unwrap();
+        // Clamped to burst_milli = 10 * 1000.
+        assert_eq!(entries.get("did:dht:z6MkAlice").unwrap().0, 10_000);
+    }
+
+    #[test]
+    fn validate_hard_rate_limit_snapshot_clamps_future_last_refill() {
+        let cfg = HardRateLimitConfig::matrix_defaults();
+        let mut entries = HashMap::new();
+        entries.insert("did:dht:z6MkAlice".to_owned(), (5_000, 10_000));
+        TokenBucketLimiter::validate_and_sanitize_snapshot(
+            &mut entries,
+            &cfg,
+            100,
+            SNAPSHOT_CLOCK_SKEW_TOLERANCE_SECS,
+        )
+        .unwrap();
+        // last_refill clamped to `now` because 10_000 > 100 + 5 skew.
+        assert_eq!(entries.get("did:dht:z6MkAlice").unwrap().1, 100);
+    }
+
+    #[test]
+    fn hard_rate_limit_config_validate_rejects_zero_burst() {
+        let cfg = HardRateLimitConfig {
+            burst: 0,
+            refill_per_kilosec: 200,
+        };
+        assert!(matches!(
+            cfg.validate(),
+            Err(SnapshotValidationError::InvalidBurst)
+        ));
+    }
+
+    #[test]
+    fn hard_rate_limit_config_validate_rejects_zero_refill() {
+        let cfg = HardRateLimitConfig {
+            burst: 10,
+            refill_per_kilosec: 0,
+        };
+        assert!(matches!(
+            cfg.validate(),
+            Err(SnapshotValidationError::InvalidRefillRate { rate: 0 })
+        ));
+    }
+
+    #[test]
+    fn hard_rate_limit_config_validate_rejects_huge_refill() {
+        let cfg = HardRateLimitConfig {
+            burst: 10,
+            refill_per_kilosec: HardRateLimitConfig::MAX_REFILL_PER_KILOSEC + 1,
+        };
+        assert!(matches!(
+            cfg.validate(),
+            Err(SnapshotValidationError::InvalidRefillRate { .. })
+        ));
+    }
+
+    #[test]
+    fn pricing_config_validate_rejects_floor_above_cap() {
+        let mut cfg = ContextMessagePricingConfig::spec_default();
+        cfg.floor = Some(Amount(100));
+        cfg.cap = Some(Amount(10));
+        assert!(matches!(
+            cfg.validate(),
+            Err(SnapshotValidationError::PricingFloorExceedsCap { .. })
+        ));
+    }
+
+    // --- F7: clock-backwards safety ---
+
+    /// Regression test for the bug where `try_consume` wrote
+    /// `entry.1 = now_secs` unconditionally, allowing a backwards clock
+    /// to stall future refills and corrupt state.
+    #[test]
+    fn token_bucket_clock_backwards_does_not_corrupt_state() {
+        let limiter = TokenBucketLimiter::new(HardRateLimitConfig {
+            burst: 1,
+            refill_per_kilosec: 0,
+        });
+        let alice = did("did:dht:z6MkAlice");
+
+        // Prime at t=100. Burst = 1 → one success then empty.
+        assert!(limiter.try_consume(&alice, 100));
+
+        // Clock jumps backward to t=50. With the fix `last_refill`
+        // must NOT regress.
+        assert!(!limiter.try_consume(&alice, 50));
+
+        let snap = limiter.snapshot_entries();
+        let (_tokens, last) = *snap.get(alice.as_ref()).unwrap();
+        assert!(last >= 100, "last_refill regressed to {last}");
+
+        // Subsequent calls at the previously-highest timestamp must
+        // continue to reject (no spurious refund).
+        assert!(!limiter.try_consume(&alice, 100));
+    }
+
 
     // --- HardRateLimitConfig / TokenBucketLimiter ---
 
