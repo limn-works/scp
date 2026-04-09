@@ -505,21 +505,13 @@ impl PerContextState {
 
     /// Role-based capability check (public wrapper around the module-private
     /// `member_has_capability`).
-    pub(crate) fn member_has_capability_pub(
-        &self,
-        subject_did: &str,
-        capability: &str,
-    ) -> bool {
+    pub(crate) fn member_has_capability_pub(&self, subject_did: &str, capability: &str) -> bool {
         self.member_has_capability(subject_did, capability)
     }
 
     /// Inserts `capability` into the subject's suspended capability set.
     /// Creates a new `HashSet` if the subject has no existing entry.
-    pub(crate) fn suspended_capabilities_insert(
-        &mut self,
-        subject_did: &str,
-        capability: String,
-    ) {
+    pub(crate) fn suspended_capabilities_insert(&mut self, subject_did: &str, capability: String) {
         self.suspended_capabilities
             .entry(subject_did.to_owned())
             .or_default()
@@ -636,9 +628,7 @@ fn validate_imported_did(value: &str, field_name: &str) -> Result<(), ScpWasmErr
 /// but malformed state (empty nonce strings, `NaN` or unbounded timestamps,
 /// over-cap entries, invalid consequence rules) must fail loud rather than
 /// silently propagate into `PerContextState`.
-fn validate_imported_antispam_state(
-    snap: &WasmContextExportSnapshot,
-) -> Result<(), ScpWasmError> {
+fn validate_imported_antispam_state(snap: &WasmContextExportSnapshot) -> Result<(), ScpWasmError> {
     // Capacity caps — match live `PerContextState` limits. A malicious
     // export cannot bloat the importer beyond its runtime policy.
     if snap.seen_nonces_v3.len() > WASM_NONCE_CAP {
@@ -700,11 +690,7 @@ fn validate_imported_antispam_state(
     }
 
     for entry in &snap.executed_proposals {
-        validate_imported_string(
-            &entry.proposal_id,
-            "executed_proposals.proposal_id",
-            256,
-        )?;
+        validate_imported_string(&entry.proposal_id, "executed_proposals.proposal_id", 256)?;
         if !entry.executed_at_ms.is_finite() || entry.executed_at_ms < 0.0 {
             return Err(ScpWasmError::Context {
                 message: format!(
@@ -737,7 +723,7 @@ fn validate_imported_antispam_state(
     // Cooldown map: rule_index must be within the rules vector's bounds so
     // an attacker cannot inject cooldowns for nonexistent rules and
     // indirectly affect future rule evaluation.
-    for (&rule_index, _) in &snap.cooldown_until {
+    for &rule_index in snap.cooldown_until.keys() {
         if rule_index >= snap.consequence_rules.len() {
             return Err(ScpWasmError::Context {
                 message: format!(
@@ -4578,6 +4564,7 @@ impl WasmContextManager {
     /// # Errors
     ///
     /// Returns an error if the context is not registered or serialization fails.
+    #[allow(clippy::too_many_lines)] // Exhaustive snapshot construction — every state field materialized inline.
     pub fn export_context(
         &self,
         context_id: &str,
@@ -4895,6 +4882,9 @@ impl WasmContextManager {
             })
         });
 
+        // Clamp timestamps to `now` so snapshot forgery cannot push them
+        // into the future and evade TTL eviction.
+        let now_ms_for_clamp = crate::time::now_ms();
         let ctx = PerContextState {
             state: snap.state.clone(),
             params_json: snap.params_json.clone(),
@@ -4912,36 +4902,34 @@ impl WasmContextManager {
             revoked_tokens: snap.revoked_tokens.iter().cloned().collect(),
             // v3 import: prefer `seen_nonces_v3` if present, falling back to
             // the v2-legacy `seen_nonces_legacy_v2` field for back-compat.
-            // In both branches, timestamps are clamped to `now_ms` to block
-            // snapshot forgery that pushes timestamps into the future and
-            // evades TTL eviction.
             seen_nonces: if snap.seen_nonces_v3.is_empty() {
                 // v2 compat — legacy snapshot had no timestamps. Reset to
                 // now (the current, knowingly-lossy behavior for v2).
-                let now = crate::time::now_ms();
                 snap.seen_nonces_legacy_v2
                     .iter()
-                    .map(|n| (n.clone(), now))
+                    .map(|n| (n.clone(), now_ms_for_clamp))
                     .collect()
             } else {
                 // v3 import — restore real timestamps.
-                let now = crate::time::now_ms();
                 snap.seen_nonces_v3
                     .iter()
-                    .map(|e| (e.nonce.clone(), e.inserted_at_ms.min(now)))
+                    .map(|e| (e.nonce.clone(), e.inserted_at_ms.min(now_ms_for_clamp)))
                     .collect()
             },
             members,
             event_buffer: VecDeque::new(),
             // v3 import: preserve executed_proposals timestamps so replay
             // protection survives export/import.
-            executed_proposals: {
-                let now = crate::time::now_ms();
-                snap.executed_proposals
-                    .iter()
-                    .map(|e| (e.proposal_id.clone(), e.executed_at_ms.min(now)))
-                    .collect()
-            },
+            executed_proposals: snap
+                .executed_proposals
+                .iter()
+                .map(|e| {
+                    (
+                        e.proposal_id.clone(),
+                        e.executed_at_ms.min(now_ms_for_clamp),
+                    )
+                })
+                .collect(),
             suspended_capabilities: snap
                 .suspended_capabilities
                 .iter()

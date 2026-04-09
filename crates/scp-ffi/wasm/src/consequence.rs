@@ -62,7 +62,7 @@ use crate::manager::{MemberEntry, PerContextState};
 ///
 /// The number of `ConsequenceTriggered` events emitted. Useful for tests
 /// and for callers that want to know whether the subject's state mutated.
-pub(crate) fn dispatch_consequences_for_subject(
+pub fn dispatch_consequences_for_subject(
     ctx: &mut PerContextState,
     context_id: &str,
     subject_did: &str,
@@ -107,8 +107,8 @@ fn enforce_triggered(
     triggered: &[TriggeredConsequence],
     rules: &[ConsequenceRule],
 ) -> usize {
-    use scp_protocol::context::membership::ContextEvent;
     use scp_event_log::DID;
+    use scp_protocol::context::membership::ContextEvent;
 
     let mut dispatched = 0usize;
 
@@ -267,13 +267,11 @@ fn apply_suspend_all(ctx: &mut PerContextState, subject_did: &str) -> bool {
 /// in the member losing all capabilities — which is an acceptable
 /// degradation for a forcibly-applied consequence.
 fn apply_assign_role(ctx: &mut PerContextState, subject_did: &str, to_role: &str) -> bool {
-    if let Some(entry) = ctx.members_get_mut(subject_did) {
+    ctx.members_get_mut(subject_did).is_some_and(|entry| {
         let MemberEntry { role, .. } = entry;
-        *role = to_role.to_owned();
+        to_role.clone_into(role);
         true
-    } else {
-        false
-    }
+    })
 }
 
 // NOTE: `PerContextState` accessors used by this module
