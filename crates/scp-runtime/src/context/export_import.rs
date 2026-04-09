@@ -353,6 +353,10 @@ fn strip_snapshot_for_public(snapshot: &ContextSnapshot) -> ContextSnapshot {
         message_pricing: snapshot.message_pricing.clone(),
         hard_rate_limit_config: snapshot.hard_rate_limit_config.clone(),
         hard_rate_limit_state: HashMap::new(),
+        // Nonce tracker state is strictly local — it has no meaning
+        // to a joiner and could leak activity patterns. Always empty
+        // in public scope.
+        spending_nonce_tracker_state: HashMap::new(),
     }
 }
 
@@ -469,6 +473,7 @@ mod tests {
             message_pricing: None,
             hard_rate_limit_config: None,
             hard_rate_limit_state: std::collections::HashMap::new(),
+            spending_nonce_tracker_state: std::collections::HashMap::new(),
         }
     }
 

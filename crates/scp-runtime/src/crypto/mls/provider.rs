@@ -97,6 +97,23 @@ struct MlsCryptoSnapshot {
     local_sender_key: SenderKey,
     /// All sender keys for this context: `(sender_did, key)` pairs.
     sender_key_entries: Vec<(String, SenderKey)>,
+    /// Per-sender epoch high-water marks for this context:
+    /// `(sender_did, epoch)` pairs.
+    ///
+    /// Persisted so the `#1608` rollback-protection invariant
+    /// (`SenderKeyStore::set_checked` rejects epoch regressions) survives
+    /// a restart. Without this, an attacker who captured an old-epoch
+    /// sender-key distribution pre-restart could replay it after restore
+    /// because the fresh in-memory map would have no record of the
+    /// higher epoch.
+    ///
+    /// MIGRATION: `#[serde(default)]` — old snapshots deserialize with
+    /// an empty map, leaving the epoch high-water mark at zero. In that
+    /// case, restore fills the map from `sender_key_entries` below so
+    /// the floor at least matches the persisted key epoch, preserving
+    /// monotonicity across upgrades.
+    #[serde(default)]
+    sender_key_epochs: Vec<(String, u64)>,
     /// The sender key epoch counter.
     sender_key_epoch: u64,
     /// The send-side message sequence counter.
@@ -150,6 +167,10 @@ impl std::fmt::Debug for MlsCryptoSnapshot {
             .field(
                 "sender_key_entries",
                 &format_args!("[{} entries, REDACTED]", self.sender_key_entries.len()),
+            )
+            .field(
+                "sender_key_epochs",
+                &format_args!("[{} entries]", self.sender_key_epochs.len()),
             )
             .field("sender_key_epoch", &self.sender_key_epoch)
             .field("send_sequence", &self.send_sequence)
@@ -1289,6 +1310,16 @@ impl ContextCryptoProvider for MlsCryptoProvider {
             .into_iter()
             .collect();
 
+        // Persist per-sender epoch high-water marks so the `#1608`
+        // rollback-protection invariant survives a restart
+        // (`SenderKeyStore::set_checked` will reject any restored epoch
+        // that regresses below the persisted floor). Includes entries
+        // for senders whose key has been removed but whose floor is
+        // still retained — `remove` intentionally preserves the epoch
+        // as a high-water mark.
+        let sender_key_epochs: Vec<(String, u64)> =
+            state.sender_key_store.epochs_for_context(&ctx_id_hex);
+
         // Read the provider-level wrapping keypair for persistence.
         let pub_key_guard = self
             .wrapping_public_key
@@ -1303,6 +1334,7 @@ impl ContextCryptoProvider for MlsCryptoProvider {
             mls_storage_entries,
             local_sender_key: state.sender_key.clone(),
             sender_key_entries,
+            sender_key_epochs,
             sender_key_epoch: state.sender_key_epoch,
             send_sequence: state.send_sequence,
             member_wrapping_keys: state
@@ -1395,6 +1427,26 @@ impl ContextCryptoProvider for MlsCryptoProvider {
         // snapshot's copy.
         let ctx_id_hex = hex::encode(context_id);
         let mut sender_key_store = SenderKeyStore::new();
+
+        // Restore the per-sender epoch high-water map FIRST so it acts
+        // as a floor for the `set_checked` path going forward. The
+        // restored values are authoritative high-water marks (not
+        // user-supplied receive traffic), so `restore_epoch_high_water`
+        // bypasses the monotonicity check.
+        //
+        // `sender_key_epochs` can cover DIDs that no longer have a key
+        // entry (e.g., removed members whose floor was preserved by
+        // `SenderKeyStore::remove`) — those entries still matter for
+        // rollback protection and must be restored.
+        for (did, epoch) in snapshot.sender_key_epochs.drain(..) {
+            sender_key_store.restore_epoch_high_water(&ctx_id_hex, &did, epoch);
+        }
+        // Then install the key material itself. `set_unchecked` bypasses
+        // the monotonicity check because the floor was restored above
+        // and the restored key IS authoritative (it was persisted by
+        // this same provider). Using `set_checked` here would be
+        // rejected for any key whose epoch equals an already-restored
+        // floor.
         for (did, key) in snapshot.sender_key_entries.drain(..) {
             sender_key_store.set_unchecked(&ctx_id_hex, &did, key);
         }
@@ -1581,6 +1633,7 @@ mod tests {
     use super::*;
     use crate::crypto::mls::encrypt::{encrypt, serialize_ciphertext};
     use crate::crypto::mls::group::generate_key_package;
+    use scp_protocol::crypto::sender_keys::SenderKeyError;
     use tls_codec::Serialize as TlsSerializeTrait;
 
     const TEST_DID: &str = "did:dht:z6MkhaXgBZDvotDkL5257faiztiGiC2QtKLGpbnnEGta2doK";
@@ -2442,6 +2495,243 @@ mod tests {
                 state.pending_distributions.is_empty(),
                 "pending distributions should be empty after restore"
             );
+        }
+    }
+
+    #[test]
+    fn restore_preserves_sender_key_epoch_high_water_mark() {
+        // Regression for #1608 rollback-protection across restart.
+        //
+        // Scenario:
+        //   1. Alice stores Bob's sender key via set_checked at epoch=5.
+        //   2. Alice exports the crypto state (snapshot).
+        //   3. Alice restarts and restores the snapshot into a fresh
+        //      provider.
+        //   4. An attacker replays an older-epoch distribution (epoch=3)
+        //      or attempts same-epoch (epoch=5) — BOTH must be rejected.
+        //   5. A legitimate post-snapshot rotation (epoch=6) must be
+        //      accepted.
+        //
+        // Without persistence of the per-sender epoch map, the fresh
+        // in-memory store would have no floor and accept any epoch,
+        // silently re-opening the rollback window.
+        let provider = make_provider();
+        let ctx_id = make_context_id();
+        provider.create_mls_group(&ctx_id).unwrap();
+        provider.generate_sender_key(&ctx_id).unwrap();
+
+        let bob_did = "did:dht:z6MkBobBobBobBobBobBobBobBobBobBobBobBobBo";
+        let ctx_id_hex = hex::encode(ctx_id);
+
+        // Step 1: install Bob's epoch-5 key via set_checked so the
+        // epoch map is populated exactly as it would be in production.
+        {
+            let mut contexts = provider.contexts.lock().unwrap();
+            let state = contexts.get_mut(&ctx_id).unwrap();
+            state
+                .sender_key_store
+                .set_checked(&ctx_id_hex, bob_did, generate_sender_key(), 5)
+                .expect("first set_checked at epoch 5 must succeed");
+            assert_eq!(
+                state.sender_key_store.epoch(&ctx_id_hex, bob_did),
+                5,
+                "pre-snapshot epoch must be 5"
+            );
+        }
+
+        // Step 2: export snapshot.
+        let exported = provider.export_crypto_state(&ctx_id).unwrap();
+        assert!(!exported.is_empty());
+
+        // Step 3: simulate restart — fresh provider, restore state.
+        let provider2 = MlsCryptoProvider::new(TEST_DID.to_string());
+        provider2.restore_crypto_state(&ctx_id, &exported).unwrap();
+
+        // Verify the restored floor exactly matches the persisted epoch.
+        {
+            let contexts = provider2.contexts.lock().unwrap();
+            let state = contexts.get(&ctx_id).unwrap();
+            assert_eq!(
+                state.sender_key_store.epoch(&ctx_id_hex, bob_did),
+                5,
+                "post-restore epoch floor must match persisted value"
+            );
+        }
+
+        // Step 4a: replay of pre-snapshot epoch=3 MUST be rejected.
+        {
+            let mut contexts = provider2.contexts.lock().unwrap();
+            let state = contexts.get_mut(&ctx_id).unwrap();
+            let err = state
+                .sender_key_store
+                .set_checked(&ctx_id_hex, bob_did, generate_sender_key(), 3)
+                .expect_err("replay of epoch 3 must be rejected after restore");
+            assert!(
+                matches!(
+                    err,
+                    SenderKeyError::EpochNotMonotonic {
+                        current: 5,
+                        received: 3,
+                        ..
+                    }
+                ),
+                "expected EpochNotMonotonic(current=5, received=3), got {err:?}"
+            );
+        }
+
+        // Step 4b: same-epoch replay at 5 MUST also be rejected.
+        {
+            let mut contexts = provider2.contexts.lock().unwrap();
+            let state = contexts.get_mut(&ctx_id).unwrap();
+            let err = state
+                .sender_key_store
+                .set_checked(&ctx_id_hex, bob_did, generate_sender_key(), 5)
+                .expect_err("same-epoch replay at 5 must be rejected after restore");
+            assert!(
+                matches!(
+                    err,
+                    SenderKeyError::EpochNotMonotonic {
+                        current: 5,
+                        received: 5,
+                        ..
+                    }
+                ),
+                "expected EpochNotMonotonic(current=5, received=5), got {err:?}"
+            );
+        }
+
+        // Step 5: legitimate post-snapshot rotation to epoch=6 is accepted.
+        {
+            let mut contexts = provider2.contexts.lock().unwrap();
+            let state = contexts.get_mut(&ctx_id).unwrap();
+            state
+                .sender_key_store
+                .set_checked(&ctx_id_hex, bob_did, generate_sender_key(), 6)
+                .expect("post-snapshot rotation at epoch 6 must succeed");
+            assert_eq!(
+                state.sender_key_store.epoch(&ctx_id_hex, bob_did),
+                6,
+                "epoch floor should advance to 6 after legitimate rotation"
+            );
+        }
+    }
+
+    #[test]
+    fn restore_preserves_epoch_floor_for_removed_members() {
+        // Removed members still have their epoch floor retained (see
+        // `SenderKeyStore::remove`) so a rejoining member cannot replay
+        // an earlier-epoch key. This invariant must survive a restart.
+        let provider = make_provider();
+        let ctx_id = make_context_id();
+        provider.create_mls_group(&ctx_id).unwrap();
+        provider.generate_sender_key(&ctx_id).unwrap();
+
+        let carol_did = "did:dht:z6MkCarolCarolCarolCarolCarolCarolCarolCa";
+        let ctx_id_hex = hex::encode(ctx_id);
+
+        // Install then remove Carol's epoch-9 key. The key is gone but
+        // the floor is retained.
+        {
+            let mut contexts = provider.contexts.lock().unwrap();
+            let state = contexts.get_mut(&ctx_id).unwrap();
+            state
+                .sender_key_store
+                .set_checked(&ctx_id_hex, carol_did, generate_sender_key(), 9)
+                .unwrap();
+            state.sender_key_store.remove(&ctx_id_hex, carol_did);
+            assert!(
+                state.sender_key_store.get(&ctx_id_hex, carol_did).is_none(),
+                "key must be gone after remove"
+            );
+            assert_eq!(
+                state.sender_key_store.epoch(&ctx_id_hex, carol_did),
+                9,
+                "epoch floor must be retained post-remove"
+            );
+        }
+
+        // Snapshot + restart.
+        let exported = provider.export_crypto_state(&ctx_id).unwrap();
+        let provider2 = MlsCryptoProvider::new(TEST_DID.to_string());
+        provider2.restore_crypto_state(&ctx_id, &exported).unwrap();
+
+        // Restored store has no key for Carol but still has the floor.
+        {
+            let contexts = provider2.contexts.lock().unwrap();
+            let state = contexts.get(&ctx_id).unwrap();
+            assert!(
+                state.sender_key_store.get(&ctx_id_hex, carol_did).is_none(),
+                "removed key must not reappear after restore"
+            );
+            assert_eq!(
+                state.sender_key_store.epoch(&ctx_id_hex, carol_did),
+                9,
+                "removed-member floor must survive restart"
+            );
+        }
+
+        // Attempt to install an earlier-epoch key (rejoin attack) — rejected.
+        {
+            let mut contexts = provider2.contexts.lock().unwrap();
+            let state = contexts.get_mut(&ctx_id).unwrap();
+            let err = state
+                .sender_key_store
+                .set_checked(&ctx_id_hex, carol_did, generate_sender_key(), 4)
+                .expect_err("rejoin at older epoch must be rejected");
+            assert!(matches!(err, SenderKeyError::EpochNotMonotonic { .. }));
+        }
+    }
+
+    #[test]
+    fn restore_tolerates_legacy_snapshot_without_epoch_map() {
+        // Back-compat: a snapshot serialized before `sender_key_epochs`
+        // was persisted must still deserialize cleanly and produce a
+        // working crypto state, with the floor defaulting to zero.
+        //
+        // We simulate a legacy snapshot by clearing the new field from
+        // the freshly-exported snapshot and re-serializing it, which
+        // models the wire format of the old struct (serde(default)
+        // fills in an empty Vec on deserialize).
+        let provider = make_provider();
+        let ctx_id = make_context_id();
+        provider.create_mls_group(&ctx_id).unwrap();
+        provider.generate_sender_key(&ctx_id).unwrap();
+
+        let bob_did = "did:dht:z6MkBobBobBobBobBobBobBobBobBobBobBobBobBo";
+        let ctx_id_hex = hex::encode(ctx_id);
+        {
+            let mut contexts = provider.contexts.lock().unwrap();
+            let state = contexts.get_mut(&ctx_id).unwrap();
+            state
+                .sender_key_store
+                .set_unchecked(&ctx_id_hex, bob_did, generate_sender_key());
+        }
+
+        // Export, then hand-edit the msgpack to drop the epoch map.
+        let exported = provider.export_crypto_state(&ctx_id).unwrap();
+        let mut snapshot: MlsCryptoSnapshot = rmp_serde::from_slice(&exported).unwrap();
+        snapshot.sender_key_epochs.clear();
+        let legacy_bytes = rmp_serde::to_vec_named(&snapshot).unwrap();
+
+        let provider2 = MlsCryptoProvider::new(TEST_DID.to_string());
+        provider2
+            .restore_crypto_state(&ctx_id, &legacy_bytes)
+            .expect("legacy snapshot (empty epoch map) must restore cleanly");
+
+        // Since the legacy snapshot had no epoch map, the floor is 0
+        // and a fresh set_checked at epoch 1 is the baseline.
+        {
+            let mut contexts = provider2.contexts.lock().unwrap();
+            let state = contexts.get_mut(&ctx_id).unwrap();
+            assert_eq!(
+                state.sender_key_store.epoch(&ctx_id_hex, bob_did),
+                0,
+                "legacy restore yields floor of 0 for senders without prior epochs"
+            );
+            state
+                .sender_key_store
+                .set_checked(&ctx_id_hex, bob_did, generate_sender_key(), 1)
+                .expect("legacy floor allows a first checked epoch of 1");
         }
     }
 

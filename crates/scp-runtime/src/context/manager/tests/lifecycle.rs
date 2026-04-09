@@ -767,6 +767,7 @@ async fn persist_drop_restore_roundtrip() {
         message_pricing: None,
         hard_rate_limit_config: None,
         hard_rate_limit_state: std::collections::HashMap::new(),
+        spending_nonce_tracker_state: std::collections::HashMap::new(),
     };
 
     let bc_snapshot = test_broadcast_snapshot("persist-ctx-2");
@@ -886,6 +887,7 @@ async fn restore_preserves_executed_proposals() {
         message_pricing: None,
         hard_rate_limit_config: None,
         hard_rate_limit_state: std::collections::HashMap::new(),
+        spending_nonce_tracker_state: std::collections::HashMap::new(),
     };
 
     persistence
@@ -993,6 +995,7 @@ async fn restore_respawns_ttl_timer() {
         message_pricing: None,
         hard_rate_limit_config: None,
         hard_rate_limit_state: std::collections::HashMap::new(),
+        spending_nonce_tracker_state: std::collections::HashMap::new(),
     };
 
     persistence.persist_context("ttl-ctx", &snapshot).unwrap();
@@ -1079,6 +1082,7 @@ async fn restore_all_contexts_restores_persisted() {
             message_pricing: None,
             hard_rate_limit_config: None,
             hard_rate_limit_state: std::collections::HashMap::new(),
+            spending_nonce_tracker_state: std::collections::HashMap::new(),
         };
         persistence.persist_context(ctx_name, &snapshot).unwrap();
     }
@@ -1164,6 +1168,7 @@ async fn restore_context_rejects_duplicate() {
         message_pricing: None,
         hard_rate_limit_config: None,
         hard_rate_limit_state: std::collections::HashMap::new(),
+        spending_nonce_tracker_state: std::collections::HashMap::new(),
     };
 
     let bc_snapshot = test_broadcast_snapshot("dup-ctx");
@@ -1271,6 +1276,7 @@ async fn restore_context_sets_needs_reconnect_on_grace_inconsistency() {
         message_pricing: None,
         hard_rate_limit_config: None,
         hard_rate_limit_state: std::collections::HashMap::new(),
+        spending_nonce_tracker_state: std::collections::HashMap::new(),
     };
 
     let bc_snapshot = test_broadcast_snapshot("grace-incon-ctx");
@@ -1385,6 +1391,7 @@ async fn restore_context_no_reconnect_when_grace_consistent() {
         message_pricing: None,
         hard_rate_limit_config: None,
         hard_rate_limit_state: std::collections::HashMap::new(),
+        spending_nonce_tracker_state: std::collections::HashMap::new(),
     };
 
     let bc_snapshot = test_broadcast_snapshot("grace-ok-ctx");
@@ -1418,6 +1425,161 @@ async fn restore_context_no_reconnect_when_grace_consistent() {
         !manager.context_needs_reconnect("grace-ok-ctx").await,
         "consistent grace entries should not set needs_reconnect"
     );
+}
+
+// -----------------------------------------------------------------------
+// C2: spending_nonce_tracker persistence round-trip (replay protection
+// across restart)
+// -----------------------------------------------------------------------
+
+/// Seeds a snapshot with a populated `spending_nonce_tracker_state`,
+/// restores via `ContextManager::restore_context`, then asserts that
+/// replaying one of the seeded nonces is rejected — proving the
+/// `NonceTracker` state survived the simulated restart and closes the
+/// post-restart replay window that would otherwise allow a captured
+/// spending UCAN to be reused.
+#[allow(clippy::too_many_lines)]
+#[tokio::test]
+async fn restore_preserves_spending_nonce_tracker_across_restart() {
+    use scp_protocol::context::roles::{ContextRoleState, default_ceiling};
+    use scp_protocol::crypto::ucan::UcanError;
+
+    let persistence = Arc::new(MockContextPersistence::default());
+
+    let params = ContextParams {
+        mode: ContextMode::Encrypted,
+        memory_scope: scp_protocol::context::MemoryScope::Full,
+        ceiling: vec![
+            scp_protocol::context::params::Capability::new("messages:read"),
+            scp_protocol::context::params::Capability::new("messages:write"),
+            scp_protocol::context::params::Capability::new("role:assign"),
+        ],
+        ..ContextParams::default()
+    };
+
+    let ceiling = default_ceiling();
+    let role_state = ContextRoleState::new(
+        "nonce-persist-ctx",
+        "did:key:creator",
+        ceiling,
+        vec![],
+        &scp_primitives::SystemClock,
+    )
+    .unwrap();
+    let mut membership = MembershipState::new();
+    membership.add_member("did:key:creator".into(), "admin".into(), vec![]);
+
+    // Pre-populate the tracker state with a nonce that was "seen" before
+    // the simulated restart. The timestamp is in milliseconds for the
+    // nonce format but `first_seen` / `token_expiry` are in seconds to
+    // match `NonceTracker`'s internal representation.
+    let now_secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    let nonce_millis = u128::from(now_secs) * 1000;
+    let preseen_nonce = format!("{nonce_millis}-aabbccdd11223344aabbccdd11223344");
+    let first_seen = now_secs;
+    let token_expiry = now_secs + 3600;
+    let mut spending_nonce_tracker_state = std::collections::HashMap::new();
+    spending_nonce_tracker_state.insert(preseen_nonce.clone(), (first_seen, token_expiry));
+
+    let snapshot = super::ContextSnapshot {
+        context_id: "nonce-persist-ctx".to_owned(),
+        state: ContextState::Active,
+        context_params: params.clone(),
+        membership,
+        role_state,
+        executed_proposals: HashSet::new(),
+        ttl_remaining_secs: None,
+        registered_tools: Vec::new(),
+        read_exclusion_list: HashSet::new(),
+        tool_interfaces: Vec::new(),
+        threshold_signers: Vec::new(),
+        threshold_value: 0,
+        pruning_policy: None,
+        governance_model_config: None,
+        economic_policy: None,
+        budget_tracker: scp_protocol::economy::budget::MemberBudgetTracker::new(),
+        approved_proposals: HashMap::new(),
+        governance_freeze: None,
+        pending_ceiling_modification: None,
+        pending_economic_policy_change: None,
+        mls_epoch: 0,
+        epoch_coordination_records: Vec::new(),
+        grace_entries: Vec::new(),
+        needs_reconnect: false,
+        migration_state: None,
+        mls_crypto_state: Vec::new(),
+        access_key_store: scp_protocol::crypto::access_keys::AccessKeyStore::new(),
+        consequence_rules: Vec::new(),
+        participation_cache: std::collections::HashMap::new(),
+        velocity_tracker: None,
+        velocity_tracker_state: None,
+        cooldown_until: std::collections::HashMap::new(),
+        proposal_timestamps: std::collections::HashMap::new(),
+        message_pricing: None,
+        hard_rate_limit_config: None,
+        hard_rate_limit_state: std::collections::HashMap::new(),
+        spending_nonce_tracker_state,
+    };
+
+    persistence
+        .persist_context("nonce-persist-ctx", &snapshot)
+        .unwrap();
+
+    // Simulate restart: fresh manager with the pre-populated persistence.
+    let manager = ContextManager::with_persistence(
+        Box::new(MockCrypto::default()),
+        Box::new(MockTransport::connected()),
+        Box::new(MockEventLog::default()),
+        Box::new(MockContextPersistence {
+            contexts: std::sync::Mutex::new(persistence.contexts.lock().unwrap().clone()),
+            broadcasts: std::sync::Mutex::new(persistence.broadcasts.lock().unwrap().clone()),
+        }),
+        noop_key_resolver(),
+    );
+
+    let handle = ContextHandle::new("nonce-persist-ctx".to_owned(), params);
+    handle.transition_to(&ContextState::Active).await.unwrap();
+    manager
+        .restore_context("nonce-persist-ctx", &handle)
+        .await
+        .expect("restore should succeed");
+
+    // Verify the nonce tracker was rehydrated with the preseen nonce and
+    // rejects a replay.
+    {
+        let mut contexts = manager.contexts.lock().await;
+        let ctx = contexts
+            .get_mut("nonce-persist-ctx")
+            .expect("restored context must be registered");
+        assert_eq!(
+            ctx.governance.spending_nonce_tracker.len(),
+            1,
+            "restored tracker must contain the preseen nonce"
+        );
+
+        // Replay attempt — must be rejected as NonceReused.
+        let err = ctx
+            .governance
+            .spending_nonce_tracker
+            .check_and_record(&preseen_nonce, token_expiry)
+            .expect_err("replay of preseen nonce must be rejected post-restart");
+        assert!(
+            matches!(err, UcanError::NonceReused(_)),
+            "expected NonceReused, got {err:?}"
+        );
+
+        // A fresh nonce (different hex suffix) at the same timestamp
+        // must succeed — the tracker isn't blanket-rejecting, just the
+        // specific replay.
+        let fresh_nonce = format!("{nonce_millis}-11223344aabbccdd11223344aabbccdd");
+        ctx.governance
+            .spending_nonce_tracker
+            .check_and_record(&fresh_nonce, token_expiry)
+            .expect("fresh nonce at same timestamp must succeed");
+    }
 }
 
 // -----------------------------------------------------------------------
@@ -1487,6 +1649,7 @@ fn reconnect_test_snapshot(
         message_pricing: None,
         hard_rate_limit_config: None,
         hard_rate_limit_state: std::collections::HashMap::new(),
+        spending_nonce_tracker_state: std::collections::HashMap::new(),
     }
 }
 

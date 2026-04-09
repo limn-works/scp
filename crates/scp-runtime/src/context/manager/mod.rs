@@ -577,6 +577,21 @@ pub struct ContextSnapshot {
     /// new limiter via `TokenBucketLimiter::from_snapshot`.
     #[serde(default)]
     pub hard_rate_limit_state: HashMap<String, (u64, u64)>,
+    /// Per-context spending-UCAN nonce tracker state (ADR-016 §6, #1608
+    /// follow-up). Maps nonce string to `(first_seen_secs, token_expiry_secs)`.
+    ///
+    /// Persisted so a captured spending UCAN cannot be replayed after a
+    /// restart — without this, the fresh in-memory tracker would have
+    /// no record of previously-consumed nonces, and an attacker could
+    /// replay valid spending tokens until the `max_total` budget was
+    /// exhausted a second time.
+    ///
+    /// MIGRATION: `#[serde(default)]` — legacy snapshots deserialize as
+    /// an empty map, producing a tracker with no prior entries. This
+    /// is the same behavior as the pre-persistence runtime, so upgrade
+    /// does not introduce any new risk.
+    #[serde(default)]
+    pub spending_nonce_tracker_state: HashMap<String, (u64, u64)>,
 }
 
 /// Serializable snapshot of [`SenderVelocityTracker`](scp_protocol::economy::antispam::SenderVelocityTracker)
@@ -1865,6 +1880,7 @@ impl ContextManager {
             message_pricing: ctx.governance.message_pricing.clone(),
             hard_rate_limit_config: Some(ctx.governance.hard_rate_limit.config().clone()),
             hard_rate_limit_state: ctx.governance.hard_rate_limit.snapshot_entries(),
+            spending_nonce_tracker_state: ctx.governance.spending_nonce_tracker.snapshot_entries(),
         }
     }
 }
