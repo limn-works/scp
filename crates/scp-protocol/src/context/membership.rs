@@ -341,6 +341,29 @@ pub enum ContextEvent {
         /// The DID whose write access was revoked.
         did: DID,
     },
+    /// One or more capabilities were suspended for a member via governance
+    /// (ADR-017, §7.3.7 — `SuspendMember` action).
+    ///
+    /// Unlike [`Self::WriteAccessRevoked`] / [`Self::ReadAccessRevoked`],
+    /// which correspond to the stronger cryptographic `Revoke` action
+    /// (key destruction + exclusion list), suspension is an
+    /// application-level capability gate: the member retains their MLS
+    /// membership, sender keys, access keys, and broadcast subscription,
+    /// but the listed capabilities are blocked at every authorization
+    /// gate (`member_has_capability` fold).
+    ///
+    /// The event carries the exact capability set that was suspended so
+    /// consumers can apply path-specific UI hints (e.g., "this member
+    /// can no longer vote but can still send messages") without having
+    /// to re-read the role state. Replaces the previously hardcoded
+    /// `WriteAccessRevoked` emission in `execute_suspend_member` which
+    /// was wrong for any suspension that did not include `MessagesWrite`.
+    CapabilitiesSuspended {
+        /// The DID of the member whose capabilities were suspended.
+        did: DID,
+        /// The capabilities that were suspended.
+        capabilities: Vec<super::params::Capability>,
+    },
     /// A member's write access was restored via governance (§9.17, ADR-038).
     ///
     /// Forward-only: the member can publish new content but previously
