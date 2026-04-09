@@ -301,6 +301,7 @@ Sync errors are categorized by the reconnection phase in which they occur:
 - **EventSignatureFailure** -- A received event failed per-event signature verification during reconciliation (section 23.13).
 - **EventGapDetected** -- Gap in event sequence could not be filled during reconciliation (section 23.13).
 - **EventChainTampered** -- Hash chain continuity was broken during reconciliation, indicating tampering or data loss (section 23.13).
+- **SnapshotFloorRegression** -- Imported or restored snapshot would lower the local SequenceFloor for one or more senders, indicating stale state or a replay attempt (section 23.17).
 
 Per-context sync outcomes are reported to the application layer:
 
@@ -386,7 +387,7 @@ Self-contained context state at a point in time. Used for Tier 2 delta sync reco
 |-------|------|-------------|
 | `did` | string | Member's DID |
 | `role_name` | string | Assigned role name (e.g., `"admin"`, `"member"`) |
-| `sequence_number` | u64 | Per-sender monotonic sequence number at snapshot time |
+| `sequence_number` | u64 | Per-sender monotonic sequence number at snapshot time. MUST be preserved under the invariants specified in §23.17. |
 
 ### 23.16.5 SnapshotDelta
 
@@ -464,3 +465,56 @@ Sent via relay as **plaintext** (not MLS-encrypted) when the member cannot encry
 | `GovernanceAction` | `proposal_id: string` | Governance action triggered the reset |
 
 Canonical hash construction for ResetRequest signature is specified in §23.5.2.
+
+## 23.17 Snapshot Sequence-Floor Invariants
+
+The `ContextSnapshot` wire format (§23.16.4) persists each member's `sequence_number` in the `MembershipEntry` map, and other per-sender monotonic counters live in related persisted state (MLS epoch, `send_sequence`, sender-key epoch, receive-side sequence tracker). To prevent snapshot-mediated replay — where an attacker uses an older snapshot to roll a node's accepted-sequence high-water mark backward — this section specifies the normative invariants that restoring and importing implementations MUST enforce.
+
+### 23.17.1 Definitions
+
+- **Local sequence floor.** For each context `C` and each sender DID `D`, the local node's `SequenceFloor[C, D]` is the highest sequence number the node has ever accepted from `D` in `C`. Sequence numbers strictly below the floor are always rejected as replay (§23.13 paragraph 3).
+- **Snapshot sequence floor.** For each `MembershipEntry` in a `ContextSnapshot`, the `sequence_number` field is the snapshot author's floor for that member at snapshot time. The floor concept also applies transitively to `mls_epoch`, `send_sequence`, sender-key `epoch` (§9.16.1, §9.17), and receive-side sequence-tracker entries persisted alongside or within the snapshot.
+
+### 23.17.2 Invariants
+
+**Invariant 1 — Floor monotonicity on save.** When taking a snapshot, each per-sender sequence value written into the snapshot MUST equal the current local floor for that sender. Implementations MUST NOT write a lower value for any sender. A snapshot that regresses any floor relative to a prior snapshot from the same node for the same context is a protocol violation.
+
+**Invariant 2 — Floor preservation on restore.** When restoring a local snapshot (Tier 3 recovery, crash recovery, or device migration from this node's own prior state), the restoring node MUST initialize each `SequenceFloor[C, D]` to:
+
+```
+max(snapshot_floor[D], retained_floor[D])
+```
+
+where `retained_floor[D]` is any value the node retains through persistence paths orthogonal to the snapshot (for example, event-log entries for `D` at a sequence higher than the snapshot's `MembershipEntry.sequence_number`, or a sender-key epoch high-water map persisted alongside the snapshot). The restored floor MUST NEVER be lower than either source. If the node has no other retained state for `D`, the snapshot's value is authoritative.
+
+**Invariant 3 — Floor monotonicity on import.** When importing a snapshot received from another member (delta sync recovery, device migration from a peer), the importing node MUST compare each per-sender sequence value in the imported snapshot against the node's current local floor for that sender:
+
+- If the imported value is greater than or equal to the local floor, the local floor is updated to `max(local, imported)`.
+- If the imported value is strictly less than the local floor for ANY sender, the import MUST be rejected entirely with `SnapshotFloorRegression` (§23.15). A partial import that accepts some senders' floors but rejects others is forbidden — the snapshot is atomic.
+
+**Invariant 4 — Append-only dominance.** A receiving node MUST NEVER lower its own `SequenceFloor` as the result of snapshot import or restore. The floor is append-only over the lifetime of the node's state for a given context. If a snapshot would require lowering the floor for any sender, the snapshot is malformed, stale, or adversarial, and the import MUST be rejected.
+
+### 23.17.3 Scope
+
+These invariants apply to every per-sender monotonic counter persisted as part of context state, including but not limited to:
+
+- `MembershipEntry.sequence_number` for each context member (§23.16.4).
+- The sending node's own `send_sequence` counter per context (§9.16.1 sender-key AEAD AAD binding).
+- Per-sender `mls_epoch` observation from received Commits where tracked.
+- Sender-key `epoch` high-water mark maintained by the sender-key store (§9.16.1, §9.17) — preserved on member removal per the sender-key store contract.
+- Receive-side sequence tracker entries keyed by `(context_id, sender_did)` (§9.16.1 anti-replay defense-in-depth).
+- Broadcast context `epoch` and `next_sequence` counters.
+
+An implementation MUST ensure every counter in this set is covered by a concrete save/restore/import path that honors the invariants above. Gaps are bugs.
+
+### 23.17.4 Rationale
+
+Without these invariants, an attacker who obtains any historical snapshot of a context can replay it at a victim node to reset the victim's replay-detection state, allowing previously-rejected messages (replayed from a captured event log or relay buffer) to be accepted as fresh. The floor invariants guarantee that a node's accepted-sequence state is strictly non-decreasing over time regardless of snapshot lineage, matching the per-sender monotonicity guarantee in §23.13 and the sender-key epoch monotonicity guarantee in §9.16.1.
+
+### 23.17.5 Error reporting
+
+A rejected snapshot MUST produce a `SnapshotFloorRegression` error (§23.15) with per-sender details (sender DID, local floor value, imported value) suitable for diagnostic logging. The error MUST NOT be silently swallowed, as it may indicate either benign stale state (for example, an out-of-order delta sync) or an active replay attempt. Implementations SHOULD log each per-sender regression distinctly so operators can distinguish single-sender anomalies from broad-front replay attempts.
+
+### 23.17.6 Interaction with reconciliation
+
+After a valid snapshot restore, the node's `SequenceFloor` map is initialized per Invariant 2 and remains subject to §23.13 paragraph 3: any subsequent event received during reconciliation with a `sequence_number` at or below the floor is rejected as replay. Reconciliation NEVER overrides the floor — it only accepts events at or above it. Conversely, reconciliation MAY advance the floor when it accepts a higher-numbered event for a sender; this advancement is propagated into the next snapshot save per Invariant 1.
