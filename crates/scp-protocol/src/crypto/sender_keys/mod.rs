@@ -390,11 +390,30 @@ impl SenderKeyStore {
     ///   produce `local = max(local, incoming)` per sender, never
     ///   lowering the floor.
     ///
+    /// # Epoch advance bounds
+    ///
+    /// `max_advance_per_sender` bounds how far an incoming epoch may
+    /// exceed the local floor for a given sender. This mirrors the
+    /// `set_checked` receive-path guard (`MAX_EPOCH_ADVANCE = 1000`
+    /// in the MLS crypto provider) which prevents epoch-poisoning
+    /// attacks where a malicious peer sets `epoch = u64::MAX`,
+    /// permanently blocking that sender's future legitimate
+    /// rotations against `set_checked`'s monotonicity guard.
+    ///
+    /// The bound is applied to BOTH:
+    /// - Senders the local store already knows: `incoming > local + max_advance` → reject
+    /// - Senders not in the local store (first-merge case): `incoming > max_advance` → reject
+    ///   (the first-merge ceiling is the same bound, treating "no local entry" as "local floor = 0")
+    ///
+    /// Pass `max_advance_per_sender = u64::MAX` to disable the bound
+    /// for trusted-source merges (e.g., cross-node replication where
+    /// the source is cryptographically authenticated).
+    ///
     /// Returns `Ok(())` on successful max-merge. Returns
     /// `Err(Vec<(String, u64, u64)>)` carrying
     /// `(sender_did, local_floor, incoming_floor)` tuples for every
-    /// regression found (the caller wraps this in
-    /// `ContextError::SnapshotFloorRegression`).
+    /// regression OR out-of-bounds advance found. The caller wraps
+    /// this in `ContextError::SnapshotFloorRegression`.
     ///
     /// # When to use this vs [`Self::restore_epoch_high_water`]
     ///
@@ -406,36 +425,55 @@ impl SenderKeyStore {
     /// - Use `merge_incoming_epochs_with_atomic_reject` on any path
     ///   that INCORPORATES external state (snapshot received from a
     ///   peer, cross-node replication, import that retains prior
-    ///   crypto state) into ALREADY-POPULATED local state. Today's
-    ///   `import_context` destroys prior crypto state before
+    ///   crypto state) into ALREADY-POPULATED or fresh local state.
+    ///   Today's `import_context` destroys prior crypto state before
     ///   reimport, so this helper is defense-in-depth — but the
     ///   invariant is enforceable from this single point so any
     ///   future code path that adds a merge case is forced through
     ///   the check, satisfying spec §23.17 structurally.
     ///
+    /// **WARNING**: Callers MUST pass a realistic `max_advance_per_sender`
+    /// bound (typically matching the provider's `MAX_EPOCH_ADVANCE`)
+    /// unless the merge source is cryptographically authenticated as
+    /// trusted. The first-merge branch (empty local state) has no
+    /// regression to check against, so the bound is the only defense
+    /// against epoch-poisoning by a malicious incoming snapshot.
+    ///
     /// # Errors
     ///
-    /// Returns the per-sender regression deltas via `Err`. The store
-    /// is NOT mutated if any regression is detected — the merge is
-    /// strictly atomic (invariant 3).
+    /// Returns the per-sender regression/overshoot deltas via `Err`.
+    /// The store is NOT mutated if any entry fails validation — the
+    /// merge is strictly atomic (invariant 3).
     pub fn merge_incoming_epochs_with_atomic_reject(
         &mut self,
         context_id: &str,
         incoming: impl IntoIterator<Item = (String, u64)>,
+        max_advance_per_sender: u64,
     ) -> Result<(), Vec<(String, u64, u64)>> {
         // First pass: materialize the incoming iterator and detect
-        // any regression against the current local state. We need
-        // to scan twice (detect, then apply) and the caller may have
-        // passed a one-shot iterator.
+        // any regression OR out-of-bounds advance against the current
+        // local state. We scan twice (detect, apply); the caller may
+        // have passed a one-shot iterator.
         let incoming: Vec<(String, u64)> = incoming.into_iter().collect();
         let mut regressions: Vec<(String, u64, u64)> = Vec::new();
-        if let Some(local) = self.epochs.get(context_id) {
-            for (did, incoming_epoch) in &incoming {
-                if let Some(&local_epoch) = local.get(did)
-                    && *incoming_epoch < local_epoch
-                {
-                    regressions.push((did.clone(), local_epoch, *incoming_epoch));
-                }
+        let local_map = self.epochs.get(context_id);
+        for (did, incoming_epoch) in &incoming {
+            let local_epoch = local_map.and_then(|m| m.get(did)).copied().unwrap_or(0);
+
+            // Invariant 3: strict regression.
+            if *incoming_epoch < local_epoch {
+                regressions.push((did.clone(), local_epoch, *incoming_epoch));
+                continue;
+            }
+
+            // Epoch-poisoning guard: reject if the incoming value
+            // overshoots the local floor by more than
+            // `max_advance_per_sender`. `saturating_add` clamps the
+            // comparison at u64::MAX so passing u64::MAX disables
+            // the bound entirely.
+            let max_allowed = local_epoch.saturating_add(max_advance_per_sender);
+            if *incoming_epoch > max_allowed {
+                regressions.push((did.clone(), local_epoch, *incoming_epoch));
             }
         }
         if !regressions.is_empty() {
@@ -777,6 +815,10 @@ mod tests {
     // merge_incoming_epochs_with_atomic_reject — §23.17 invariants 3 + 4
     // -----------------------------------------------------------------------
 
+    /// Default bound for merge tests — matches the production
+    /// `MAX_EPOCH_ADVANCE = 1000` from the `scp-runtime` crypto provider.
+    const TEST_MAX_ADVANCE: u64 = 1000;
+
     #[test]
     fn merge_empty_incoming_is_noop() {
         let mut store = SenderKeyStore::new();
@@ -784,7 +826,8 @@ mod tests {
             .set_checked("ctx", "did:a", generate_sender_key(), 5)
             .unwrap();
         let incoming: Vec<(String, u64)> = vec![];
-        let result = store.merge_incoming_epochs_with_atomic_reject("ctx", incoming);
+        let result =
+            store.merge_incoming_epochs_with_atomic_reject("ctx", incoming, TEST_MAX_ADVANCE);
         assert!(result.is_ok());
         assert_eq!(store.epoch("ctx", "did:a"), 5, "local floor unchanged");
     }
@@ -798,7 +841,8 @@ mod tests {
 
         // Incoming floor is strictly higher → accepted, local advances.
         let incoming = vec![("did:a".to_owned(), 10)];
-        let result = store.merge_incoming_epochs_with_atomic_reject("ctx", incoming);
+        let result =
+            store.merge_incoming_epochs_with_atomic_reject("ctx", incoming, TEST_MAX_ADVANCE);
         assert!(result.is_ok());
         assert_eq!(
             store.epoch("ctx", "did:a"),
@@ -815,7 +859,8 @@ mod tests {
             .unwrap();
 
         let incoming = vec![("did:a".to_owned(), 5)];
-        let result = store.merge_incoming_epochs_with_atomic_reject("ctx", incoming);
+        let result =
+            store.merge_incoming_epochs_with_atomic_reject("ctx", incoming, TEST_MAX_ADVANCE);
         assert!(result.is_ok(), "equal epoch is not a regression");
         assert_eq!(store.epoch("ctx", "did:a"), 5, "floor unchanged");
     }
@@ -840,7 +885,7 @@ mod tests {
             ("did:b".to_owned(), 15),
         ];
         let err = store
-            .merge_incoming_epochs_with_atomic_reject("ctx", incoming)
+            .merge_incoming_epochs_with_atomic_reject("ctx", incoming, TEST_MAX_ADVANCE)
             .expect_err("regression must reject the entire merge");
         assert_eq!(err.len(), 1, "exactly one regression reported");
         assert_eq!(err[0], ("did:a".to_owned(), 10, 5));
@@ -877,7 +922,7 @@ mod tests {
         // retained.
         let incoming = vec![("did:c".to_owned(), 3)];
         store
-            .merge_incoming_epochs_with_atomic_reject("ctx", incoming)
+            .merge_incoming_epochs_with_atomic_reject("ctx", incoming, TEST_MAX_ADVANCE)
             .unwrap();
 
         assert_eq!(store.epoch("ctx", "did:a"), 10);
@@ -886,14 +931,14 @@ mod tests {
     }
 
     #[test]
-    fn merge_incoming_into_empty_context_accepts_all() {
-        // First-merge case: no local state exists for this context,
-        // so every incoming entry is accepted without regression
-        // checks.
+    fn merge_incoming_into_empty_context_accepts_all_within_bound() {
+        // First-merge case: no local state exists for this context.
+        // Every incoming entry within `max_advance_per_sender` of
+        // zero is accepted.
         let mut store = SenderKeyStore::new();
         let incoming = vec![("did:a".to_owned(), 5), ("did:b".to_owned(), 12)];
         store
-            .merge_incoming_epochs_with_atomic_reject("ctx", incoming)
+            .merge_incoming_epochs_with_atomic_reject("ctx", incoming, TEST_MAX_ADVANCE)
             .unwrap();
         assert_eq!(store.epoch("ctx", "did:a"), 5);
         assert_eq!(store.epoch("ctx", "did:b"), 12);
@@ -913,12 +958,111 @@ mod tests {
 
         let incoming = vec![("did:a".to_owned(), 5), ("did:b".to_owned(), 15)];
         let err = store
-            .merge_incoming_epochs_with_atomic_reject("ctx", incoming)
+            .merge_incoming_epochs_with_atomic_reject("ctx", incoming, TEST_MAX_ADVANCE)
             .unwrap_err();
         assert_eq!(err.len(), 2, "both regressions must be reported");
         // Order is insertion-order of the incoming iterator, which
         // is deterministic because we built a Vec above.
         assert!(err.contains(&("did:a".to_owned(), 10, 5)));
         assert!(err.contains(&("did:b".to_owned(), 20, 15)));
+    }
+
+    // -----------------------------------------------------------------------
+    // Epoch-poisoning guard (cryptographer Round 2 finding #2)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn merge_first_branch_rejects_epoch_above_max_advance() {
+        // Empty local context + an incoming snapshot from a
+        // malicious peer that tries to poison a sender's floor at a
+        // huge epoch. Without the bound, this would permanently DoS
+        // the sender's future rotations via set_checked's
+        // monotonicity guard.
+        let mut store = SenderKeyStore::new();
+        let incoming = vec![("did:malicious".to_owned(), u64::MAX - 1)];
+        let err = store
+            .merge_incoming_epochs_with_atomic_reject("ctx", incoming, TEST_MAX_ADVANCE)
+            .expect_err("epoch above max_advance must be rejected");
+        assert_eq!(err.len(), 1);
+        assert_eq!(err[0].0, "did:malicious");
+        assert_eq!(err[0].1, 0, "local floor reported as 0 (no prior entry)");
+        assert_eq!(err[0].2, u64::MAX - 1);
+        // Atomic reject — no state was modified.
+        assert_eq!(store.epoch("ctx", "did:malicious"), 0);
+    }
+
+    #[test]
+    fn merge_existing_sender_rejects_epoch_above_max_advance() {
+        // Already-populated local floor at 10. Incoming tries
+        // 10 + MAX_ADVANCE + 1 — must be rejected even though it is
+        // strictly greater than local (not a regression), because it
+        // overshoots the poisoning guard.
+        let mut store = SenderKeyStore::new();
+        store
+            .set_checked("ctx", "did:a", generate_sender_key(), 10)
+            .unwrap();
+
+        let overshoot = 10 + TEST_MAX_ADVANCE + 1;
+        let incoming = vec![("did:a".to_owned(), overshoot)];
+        let err = store
+            .merge_incoming_epochs_with_atomic_reject("ctx", incoming, TEST_MAX_ADVANCE)
+            .expect_err("epoch overshoot must be rejected");
+        assert_eq!(err[0], ("did:a".to_owned(), 10, overshoot));
+        assert_eq!(
+            store.epoch("ctx", "did:a"),
+            10,
+            "atomic reject — floor unchanged"
+        );
+
+        // A value EXACTLY at local + MAX_ADVANCE is still acceptable.
+        let at_bound = 10 + TEST_MAX_ADVANCE;
+        let incoming = vec![("did:a".to_owned(), at_bound)];
+        store
+            .merge_incoming_epochs_with_atomic_reject("ctx", incoming, TEST_MAX_ADVANCE)
+            .expect("epoch exactly at local + max_advance must be accepted");
+        assert_eq!(store.epoch("ctx", "did:a"), at_bound);
+    }
+
+    #[test]
+    fn merge_with_u64_max_disables_bound_for_trusted_sources() {
+        // Passing `u64::MAX` disables the bound via saturating_add,
+        // allowing huge incoming epochs. Use only when the source is
+        // cryptographically authenticated as trusted.
+        let mut store = SenderKeyStore::new();
+        let incoming = vec![("did:trusted".to_owned(), u64::MAX - 1)];
+        store
+            .merge_incoming_epochs_with_atomic_reject("ctx", incoming, u64::MAX)
+            .expect("u64::MAX bound must disable the guard entirely");
+        assert_eq!(store.epoch("ctx", "did:trusted"), u64::MAX - 1);
+    }
+
+    #[test]
+    fn merge_mixed_regressions_and_overshoots_reports_all() {
+        // A single merge with one regression AND one overshoot.
+        // Both must be reported in the error, neither mutation
+        // applied (atomic reject). Proves the first-pass scan is
+        // comprehensive: a caller seeing one finding does not lose
+        // sight of the other.
+        let mut store = SenderKeyStore::new();
+        store
+            .set_checked("ctx", "did:reg", generate_sender_key(), 50)
+            .unwrap();
+        store
+            .set_checked("ctx", "did:ok", generate_sender_key(), 10)
+            .unwrap();
+
+        let incoming = vec![
+            ("did:reg".to_owned(), 20),          // regression: 20 < 50
+            ("did:ok".to_owned(), 15),           // legitimate advance
+            ("did:poison".to_owned(), u64::MAX), // first-merge overshoot
+        ];
+        let err = store
+            .merge_incoming_epochs_with_atomic_reject("ctx", incoming, TEST_MAX_ADVANCE)
+            .expect_err("mixed failures must reject the entire merge");
+        assert_eq!(err.len(), 2, "regression + overshoot both reported");
+        assert!(err.iter().any(|(d, _, _)| d == "did:reg"));
+        assert!(err.iter().any(|(d, _, _)| d == "did:poison"));
+        // did:ok must NOT have been advanced (atomic reject).
+        assert_eq!(store.epoch("ctx", "did:ok"), 10);
     }
 }

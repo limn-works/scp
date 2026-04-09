@@ -113,9 +113,12 @@ struct MlsCryptoSnapshot {
     /// be recovered exactly from legacy data. The restore path
     /// compensates by seeding every sender with a conservative lower
     /// bound derived from the persisted global `sender_key_epoch`
-    /// counter. This closes the one-shot rollback window that would
-    /// otherwise exist at the first post-upgrade restart. See the
-    /// `had_epoch_map` / `legacy_floor` logic in `restore_crypto_state`.
+    /// counter. This closes the one-shot rollback window for the
+    /// common case. See `had_epoch_map` / `legacy_floor` logic in
+    /// `restore_crypto_state` for details and the documented
+    /// residual window for peers whose true floor exceeded the local
+    /// counter at snapshot time (bounded by `MAX_EPOCH_ADVANCE` in
+    /// the receive path).
     #[serde(default)]
     sender_key_epochs: Vec<(String, u64)>,
     /// The sender key epoch counter.
@@ -1457,16 +1460,37 @@ impl ContextCryptoProvider for MlsCryptoProvider {
         // exactly one boot cycle.
         //
         // `SenderKey` material does not carry the epoch it was bound
-        // to, so we cannot recover per-sender floors exactly. Use the
-        // snapshot's global `sender_key_epoch` counter (which IS
-        // persisted in legacy snapshots) as a conservative lower bound
-        // for every sender we see key material for. This is strictly
-        // tighter than zero and tighter than the provider's current
-        // epoch, and it guarantees the one-shot rollback window is
-        // closed. Senders who were at a strictly higher local floor
-        // than the global counter are the only ones not fully
-        // protected under legacy snapshots, and for those the next
-        // legitimate rotation will advance the floor anyway.
+        // to, so we cannot recover per-sender floors exactly from
+        // legacy data. Use the snapshot's global `sender_key_epoch`
+        // counter (which IS persisted in legacy snapshots) as a
+        // conservative lower bound for every sender we see key
+        // material for. This is strictly tighter than zero and
+        // closes the one-shot rollback window for the common case.
+        //
+        // RESIDUAL WINDOW (explicit): the global `sender_key_epoch`
+        // counter increments ONLY when the local provider runs
+        // `rotate_sender_key` — it reflects LOCAL rotation count, not
+        // remote peers' rotation counts. A remote sender whose true
+        // per-sender floor exceeded the local `sender_key_epoch` at
+        // snapshot time will be seeded with the lower local counter
+        // value. The residual rollback window for that sender is
+        //     peer_floor - local_floor
+        // where the upper bound on a single reject-window is bounded
+        // by the `MAX_EPOCH_ADVANCE = 1000` guard in the receive path
+        // (`open_inner_envelope` clamps any accepted epoch advance
+        // per distribution). An attacker who captured a sender-key
+        // distribution at peer epoch K where K > local_sender_key_epoch
+        // can replay it against the legacy-restored floor, but only
+        // up to the MAX_EPOCH_ADVANCE ceiling. The next legitimate
+        // rotation from that sender advances the floor past the
+        // exposed window permanently.
+        //
+        // Fully closing this residual would require either a format
+        // break (carrying per-sender epochs in legacy snapshots,
+        // which by definition they don't have) or rejecting legacy
+        // snapshots outright, which would lock users out of their
+        // contexts on upgrade. The conservative seed is the best
+        // recoverable bound without either of those trade-offs.
         let legacy_floor = if had_epoch_map {
             None
         } else {
@@ -2793,6 +2817,89 @@ mod tests {
                 .sender_key_store
                 .set_checked(&ctx_id_hex, bob_did, generate_sender_key(), 8)
                 .expect("post-seed rotation at epoch 8 must succeed");
+        }
+    }
+
+    #[test]
+    fn restore_legacy_snapshot_gap_case_residual_window_documented() {
+        // Exercises the RESIDUAL WINDOW case from the cryptographer
+        // Round 2 review: the legacy-snapshot floor seed uses the
+        // global `sender_key_epoch` counter, which reflects LOCAL
+        // rotation count only. A remote peer whose true
+        // per-sender floor exceeded the local counter at snapshot
+        // time will be seeded with the lower local value, leaving a
+        // residual rollback window bounded by `MAX_EPOCH_ADVANCE`
+        // in the receive path.
+        //
+        // This test pins the OBSERVED behavior (the seed = global
+        // counter, not the true peer floor) so future readers
+        // understand the residual window is known and documented,
+        // not a bug. The commit message's "fully close the rollback
+        // window" claim applies to the common case; this test
+        // acknowledges the gap case exists.
+        let provider = make_provider();
+        let ctx_id = make_context_id();
+        provider.create_mls_group(&ctx_id).unwrap();
+        provider.generate_sender_key(&ctx_id).unwrap();
+
+        let peer_did = "did:dht:z6MkPeerPeerPeerPeerPeerPeerPeerPeerPeerPe";
+        let ctx_id_hex = hex::encode(ctx_id);
+
+        // Scenario: local provider has rotated only once
+        // (`sender_key_epoch = 1`), but the peer has rotated many
+        // times and set_checked has been called with epoch = 50 for
+        // the peer. This represents a pre-C1 runtime where the peer
+        // epoch IS tracked in the `epochs` map but the snapshot
+        // format does NOT persist it.
+        {
+            let mut contexts = provider.contexts.lock().unwrap();
+            let state = contexts.get_mut(&ctx_id).unwrap();
+            state.sender_key_epoch = 1;
+            state
+                .sender_key_store
+                .set_checked(&ctx_id_hex, peer_did, generate_sender_key(), 50)
+                .unwrap();
+            assert_eq!(
+                state.sender_key_store.epoch(&ctx_id_hex, peer_did),
+                50,
+                "pre-snapshot peer floor is 50 (above local counter 1)"
+            );
+        }
+
+        // Export, then strip the per-sender epoch map to simulate a
+        // legacy snapshot.
+        let exported = provider.export_crypto_state(&ctx_id).unwrap();
+        let mut snapshot: MlsCryptoSnapshot = rmp_serde::from_slice(&exported).unwrap();
+        snapshot.sender_key_epochs.clear();
+        let legacy_bytes = rmp_serde::to_vec_named(&snapshot).unwrap();
+
+        let provider2 = MlsCryptoProvider::new(TEST_DID.to_string());
+        provider2
+            .restore_crypto_state(&ctx_id, &legacy_bytes)
+            .expect("legacy restore must succeed");
+
+        // OBSERVED BEHAVIOR: the peer's restored floor equals the
+        // LOCAL sender_key_epoch counter (1), NOT the true pre-snapshot
+        // peer floor (50). This is the documented residual window.
+        {
+            let contexts = provider2.contexts.lock().unwrap();
+            let state = contexts.get(&ctx_id).unwrap();
+            let seeded = state.sender_key_store.epoch(&ctx_id_hex, peer_did);
+            assert_eq!(
+                seeded, 1,
+                "legacy seed uses global sender_key_epoch (1), NOT the true peer floor (50). \
+                 This is the documented residual window bounded by MAX_EPOCH_ADVANCE in the \
+                 receive path. Fully closing it would require a format break."
+            );
+            // The residual window is `peer_floor - seeded_floor` = 49
+            // in this scenario, bounded from above by MAX_EPOCH_ADVANCE
+            // in the actual receive path.
+            assert!(
+                50 > seeded,
+                "gap exists: true peer floor ({}) > seeded floor ({})",
+                50,
+                seeded
+            );
         }
     }
 
