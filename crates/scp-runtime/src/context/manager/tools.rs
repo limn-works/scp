@@ -147,8 +147,15 @@ impl Drop for ToolEconomyTicket {
 
 /// Marks the ticket committed (success path). Returns the deducted cost
 /// so the caller can populate the `ToolInvokedEvent`.
+///
+/// Clears `needs_hard_rate_limit_refund` so the invariant
+/// "`needs_hard_rate_limit_refund == true` iff a refund is still owed"
+/// holds across all call sites. Without this, a future refactor that
+/// calls `rollback_tool_economy_ticket` after `commit_tool_economy_ticket`
+/// on the same ticket would double-refund the token bucket.
 fn commit_tool_economy_ticket(mut ticket: ToolEconomyTicket) -> Option<Amount> {
     ticket.consumed = true;
+    ticket.needs_hard_rate_limit_refund = false;
     ticket.deducted_cost
 }
 
@@ -201,6 +208,131 @@ async fn rollback_tool_economy_ticket(
 }
 
 impl ContextManager {
+    /// Synchronously consume one hard-rate-limit token for the given
+    /// `(context_id, did)` pair.
+    ///
+    /// Returns `true` if a token was consumed OR if the context is
+    /// not registered in the `ContextManager` (pass-through semantics
+    /// — see below). Returns `false` only when the context IS
+    /// registered AND the sender is over their rate-limit budget.
+    ///
+    /// # Purpose
+    ///
+    /// This is the SYNC entry point for FFI bridges
+    /// (`PyO3` `py_tool_invoke`, `NAPI` `tool_invoke`,
+    /// `UniFFI` `tool_invoke`)
+    /// whose tool-dispatch paths do NOT go through
+    /// [`Self::invoke_tool_with_economy`]. The bridges own their own
+    /// tool registry + handler dispatch (because JS/Python callables
+    /// live in bridge-side state, not in the `ContextManager`), so
+    /// they cannot reuse the full economy wrapper directly. Without
+    /// this helper, the bridge paths would bypass the Matrix
+    /// Synapse–style hard rate limit entirely — the D4
+    /// "tool-path bypass close" is otherwise incomplete.
+    ///
+    /// Bridges MUST pair every `true` return with a matching
+    /// [`Self::refund_hard_rate_limit_blocking`] call on every
+    /// downstream failure branch, mirroring the refund discipline
+    /// inside [`Self::invoke_tool_with_economy`]. Refund is also
+    /// safe for the "context not registered" pass-through case — it
+    /// is a no-op when the context is unknown.
+    ///
+    /// # Pass-through semantic
+    ///
+    /// An unknown `context_id` returns `true` rather than an error.
+    /// Rationale:
+    ///   - In production, `py_context_create` / `NAPI` / `UniFFI` always
+    ///     register with BOTH the bridge's local state AND the
+    ///     `ContextManager`, so a missing entry means the caller is
+    ///     operating on a context the bridge state does not know
+    ///     about either — the downstream `with_context` call will
+    ///     fail with a bridge-level "tool not found" error that is
+    ///     more specific than a generic "context not registered".
+    ///   - In unit tests, bridges routinely populate the local state
+    ///     without initializing the manager; the test already proves
+    ///     the dispatch path works, and requiring manager
+    ///     initialization would force every `MCP` test to set up a
+    ///     full `ContextManager`. Pass-through lets the tests keep
+    ///     their current setup.
+    ///   - The trust model does not change: if there is no manager
+    ///     entry, there is no rate-limit state to enforce against,
+    ///     and the downstream tool dispatch still runs under its
+    ///     own authorization surface.
+    ///
+    /// # Concurrency
+    ///
+    /// Uses `blocking_lock` on `self.contexts`. Callers MUST NOT
+    /// invoke this from within an async task on the same tokio
+    /// runtime — doing so will panic. The bridges are sync-entry
+    /// points that run outside the async executor, so this is safe.
+    #[allow(clippy::significant_drop_tightening)] // two-step borrow on the contexts map
+    #[must_use]
+    pub fn try_consume_hard_rate_limit_blocking(
+        &self,
+        context_id: &str,
+        did: &DID,
+        now_secs: u64,
+    ) -> bool {
+        let contexts = self.contexts.blocking_lock();
+        // Pass-through (`true`) when the context is not registered in
+        // the manager — see doc comment above.
+        contexts
+            .get(context_id)
+            .is_none_or(|ctx| ctx.governance.hard_rate_limit.try_consume(did, now_secs))
+    }
+
+    /// Synchronously refund one hard-rate-limit token for the given
+    /// `(context_id, did)` pair. Used by FFI bridges to match a
+    /// previously-successful [`Self::try_consume_hard_rate_limit_blocking`]
+    /// call when the downstream tool dispatch fails.
+    ///
+    /// No-op if the context is no longer registered.
+    ///
+    /// # Concurrency
+    ///
+    /// Same `blocking_lock` constraint as
+    /// [`Self::try_consume_hard_rate_limit_blocking`].
+    pub fn refund_hard_rate_limit_blocking(&self, context_id: &str, did: &DID) {
+        let contexts = self.contexts.blocking_lock();
+        if let Some(ctx) = contexts.get(context_id) {
+            ctx.governance.hard_rate_limit.refund(did);
+        }
+    }
+
+    /// Async variant of [`Self::try_consume_hard_rate_limit_blocking`].
+    ///
+    /// Used by async FFI bridges (`UniFFI` tool invoke) whose tool
+    /// dispatch also bypasses [`Self::invoke_tool_with_economy`]. The
+    /// `.await` form is safe inside the tokio executor where
+    /// `blocking_lock` would panic.
+    ///
+    /// Same pass-through semantic as the blocking variant: returns
+    /// `true` when the context is not registered in the
+    /// `ContextManager`.
+    #[allow(clippy::significant_drop_tightening)] // two-step borrow on the contexts map
+    #[must_use]
+    pub async fn try_consume_hard_rate_limit(
+        &self,
+        context_id: &str,
+        did: &DID,
+        now_secs: u64,
+    ) -> bool {
+        let contexts = self.contexts.lock().await;
+        // Pass-through (`true`) when the context is not registered —
+        // see doc comment on the blocking variant.
+        contexts
+            .get(context_id)
+            .is_none_or(|ctx| ctx.governance.hard_rate_limit.try_consume(did, now_secs))
+    }
+
+    /// Async variant of [`Self::refund_hard_rate_limit_blocking`].
+    pub async fn refund_hard_rate_limit(&self, context_id: &str, did: &DID) {
+        let contexts = self.contexts.lock().await;
+        if let Some(ctx) = contexts.get(context_id) {
+            ctx.governance.hard_rate_limit.refund(did);
+        }
+    }
+
     /// Invokes a tool under the full economy pipeline without holding
     /// the `contexts` mutex across the executor future (spec §19.7).
     ///
@@ -588,21 +720,50 @@ impl ContextManager {
                         // Capture failed AFTER successful execution.
                         // The escrow hold is consumed by the capture
                         // attempt (no void), but we must still reverse
-                        // the per-context budget deduction. Re-acquire
-                        // the lock to do so, then mark the ticket
-                        // consumed so the `Drop` guard stays quiet —
-                        // we cannot use `rollback_tool_economy_ticket`
-                        // because that would double-void the escrow.
-                        if let Some(cost) = ticket.deducted_cost {
+                        // the per-context budget deduction AND refund
+                        // the hard rate limit token. Re-acquire the
+                        // lock to do so, then mark the ticket consumed
+                        // so the `Drop` guard stays quiet — we cannot
+                        // use `rollback_tool_economy_ticket` because
+                        // that would double-void the escrow.
+                        //
+                        // D4 review finding (security-reviewer HIGH):
+                        // previously this branch only reversed budget
+                        // and velocity was missed entirely. An
+                        // attacker with a flaky or malicious payment
+                        // adapter could walk an invoker's bucket to
+                        // zero by triggering capture failures while
+                        // paying no actual cost. The refund + rollback
+                        // calls below close that.
+                        {
                             let mut contexts = self.contexts.lock().await;
                             if let Some(ctx) = contexts.get_mut(context_id) {
+                                if let Some(cost) = ticket.deducted_cost {
+                                    ctx.governance
+                                        .budget_tracker
+                                        .reverse_spend(invoker_did, cost);
+                                }
+                                // Velocity: the Phase 1 recorded entry
+                                // must be rolled back. The executor
+                                // ran successfully but the invocation
+                                // was not ultimately paid-for, so from
+                                // an accounting standpoint it did not
+                                // complete.
                                 ctx.governance
-                                    .budget_tracker
-                                    .reverse_spend(invoker_did, cost);
+                                    .velocity_tracker
+                                    .rollback(invoker_did, ticket.velocity_token);
+                                // Hard rate limit: refund the token so
+                                // a capture failure does not burn
+                                // bucket capacity (the security issue
+                                // above).
+                                if ticket.needs_hard_rate_limit_refund {
+                                    ctx.governance.hard_rate_limit.refund(invoker_did);
+                                }
                             }
                         }
                         let mut ticket = ticket;
                         ticket.consumed = true;
+                        ticket.needs_hard_rate_limit_refund = false;
                         return Err(invocation_error_to_context(capture_err));
                     }
                 }

@@ -364,6 +364,7 @@ fn validate_tool_ucan(
 #[pyo3(name = "tool_invoke")]
 #[pyo3(signature = (context_id, tool_id, input, identity_did, ucan_token, proof_tokens=None))]
 #[allow(clippy::needless_pass_by_value)] // PyO3 requires owned Option<Vec<String>>.
+#[allow(clippy::too_many_lines)] // Dispatch is linear: validate + consume + invoke + refund/commit
 pub fn py_tool_invoke(
     py: Python<'_>,
     context_id: &str,
@@ -395,10 +396,40 @@ pub fn py_tool_invoke(
         proof_tokens.as_ref(),
     )?;
 
+    // D4 bypass close: consume a hard-rate-limit token BEFORE any
+    // bridge-side tool dispatch. The bridge's tool invocation path
+    // does NOT go through `ContextManager::invoke_tool_with_economy`
+    // (bridges own their own tool registry + handler dispatch), so
+    // without this explicit hook a member rate-limited on
+    // `send_message` could still burn relay capacity via
+    // `py_tool_invoke`. On any subsequent failure we refund the
+    // token.
+    let invoker_did_typed: scp_primitives::DID = identity_did.to_owned().into();
+    let now_secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let manager = crate::runtime::context_manager()?;
+    if !manager.try_consume_hard_rate_limit_blocking(context_id, &invoker_did_typed, now_secs) {
+        return Err(ScpPyError::context(
+            "SCP-ECON-7090: rate limit exceeded on tool_invoke: hard rate limit exceeded for invoker".to_owned(),
+        )
+        .into());
+    }
+
+    // Refund-on-failure wrapper: any `?` return below must refund the
+    // token. We use an RAII guard pattern via a closure that's called
+    // on every Err path; since we don't have a `Drop` guard here,
+    // every early-return site calls `refund_and_err` explicitly.
+    let refund_and_err = |e: ScpPyError| -> PyErr {
+        manager.refund_hard_rate_limit_blocking(context_id, &invoker_did_typed);
+        e.into()
+    };
+
     // Validates tool existence, input schema, capability, dispatches to handler,
     // validates output schema, and builds a ToolInvokedEvent for provenance.
     // Mirrors the dispatch logic in FfiBridgeProvider::invoke_tool (mcp.rs).
-    let output_json = crate::runtime::with_context(context_id, |rt| {
+    let output_json = match crate::runtime::with_context(context_id, |rt| {
         let registration = rt.tool_registry.get(tool_id).ok_or_else(|| {
             ScpPyError::context(format!(
                 "tool '{tool_id}' not found in context '{context_id}'"
@@ -478,7 +509,10 @@ pub fn py_tool_invoke(
         };
 
         Ok(output)
-    })?;
+    }) {
+        Ok(out) => out,
+        Err(e) => return Err(refund_and_err(e)),
+    };
 
     json_to_py_dict(py, &output_json)
 }

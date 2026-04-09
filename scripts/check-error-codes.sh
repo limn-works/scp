@@ -169,7 +169,7 @@ while IFS=: read -r file line_num content; do
         *) continue ;;
     esac
 
-    while [[ "$content" =~ SCP-(IDENT|CTX|PERM|CRYPTO|TRANS|TOOL|VALID|STORAGE|ATTEST|MCP)-([0-9]+) ]]; do
+    while [[ "$content" =~ SCP-(IDENT|CTX|PERM|CRYPTO|TRANS|TOOL|VALID|STORAGE|ATTEST|MCP|GOV|ECON)-([0-9]+) ]]; do
         prefix="${BASH_REMATCH[1]}"
         number="${BASH_REMATCH[2]}"
         full_code="SCP-${prefix}-${number}"
@@ -233,7 +233,7 @@ while IFS=: read -r file line_num content; do
         content="${content#*"$full_code"}"
     done
 done < <(
-    grep -rnE 'SCP-(IDENT|CTX|PERM|CRYPTO|TRANS|TOOL|VALID|STORAGE|ATTEST|MCP)-[0-9]+' \
+    grep -rnE 'SCP-(IDENT|CTX|PERM|CRYPTO|TRANS|TOOL|VALID|STORAGE|ATTEST|MCP|GOV|ECON)-[0-9]+' \
         --include='*.rs' \
         --include='*.kt' \
         --include='*.swift' \

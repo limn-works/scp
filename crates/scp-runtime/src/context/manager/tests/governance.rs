@@ -3909,6 +3909,89 @@ async fn modify_hard_rate_limit_updates_live_limiter() {
     }
 }
 
+/// D4 security-review regression: tightening the hard rate limit
+/// from burst=10 down to burst=3 must NOT give any sender a free
+/// burst above 3. The clamp in `execute_modify_hard_rate_limit` uses
+/// `TokenBucketLimiter::validate_and_sanitize_snapshot` to clip
+/// `tokens_milli` to the new burst before the limiter is
+/// reconstructed. Without this clamp, a sender whose bucket held 10
+/// tokens at reconfigure time could consume all 10 even though the
+/// new burst is 3 — effectively a free burst up to the old cap.
+#[tokio::test]
+async fn modify_hard_rate_limit_clamps_preserved_state_when_tightening() {
+    use scp_protocol::context::governance::GovernanceAction;
+    use scp_protocol::economy::antispam::HardRateLimitConfig;
+
+    let manager = ContextManager::new(
+        Box::new(MockCrypto::default()),
+        Box::new(MockTransport::connected()),
+        Box::new(MockEventLog::default()),
+        mock_key_resolver(),
+    );
+
+    let alice: DID = "did:dht:z6MkAlice".into();
+    let key_a = signing_key_for_did(&alice);
+
+    let params = ContextParams {
+        governance: scp_protocol::context::params::GovernanceModel::SingleAdmin,
+        ..ContextParams::default()
+    };
+    let _handle = manager
+        .create_context("ctx-rl-clamp".into(), params, alice.clone())
+        .await
+        .unwrap();
+
+    // Sanity: default Matrix burst is 10. Alice's bucket starts full.
+    {
+        let contexts = manager.contexts.lock().await;
+        let ctx = contexts.get("ctx-rl-clamp").unwrap();
+        assert_eq!(ctx.governance.hard_rate_limit.config().burst, 10);
+    }
+
+    // Tighten the limit to burst = 3. Alice has consumed no tokens,
+    // so her bucket is at 10 * 1000 = 10_000 milli-tokens — above
+    // the new burst of 3 * 1000 = 3_000. The clamp must reduce her
+    // to 3_000 before the reconfigured limiter is installed.
+    let new_config = HardRateLimitConfig {
+        refill_per_kilosec: 200,
+        burst: 3,
+    };
+    let action = GovernanceAction::ModifyHardRateLimit {
+        new_config: new_config.clone(),
+    };
+    manager
+        .propose_governance_action("ctx-rl-clamp", &alice, action, &key_a)
+        .await
+        .expect("tightening ModifyHardRateLimit should execute");
+
+    // After reconfigure, the NEW burst is 3. Alice must NOT be able
+    // to consume more than 3 tokens in a row — if the clamp is
+    // missing she would still be able to consume 10 (the old bucket
+    // contents). We consume 4 in succession: the first 3 must
+    // succeed, the 4th must fail.
+    {
+        let contexts = manager.contexts.lock().await;
+        let ctx = contexts.get("ctx-rl-clamp").unwrap();
+        assert_eq!(
+            ctx.governance.hard_rate_limit.config().burst,
+            3,
+            "burst should be tightened to 3"
+        );
+
+        let now = 2_000_000;
+        assert!(ctx.governance.hard_rate_limit.try_consume(&alice, now));
+        assert!(ctx.governance.hard_rate_limit.try_consume(&alice, now));
+        assert!(ctx.governance.hard_rate_limit.try_consume(&alice, now));
+        // 4th consume must fail — the old bucket's 7 extra tokens
+        // MUST NOT carry across the reconfigure.
+        assert!(
+            !ctx.governance.hard_rate_limit.try_consume(&alice, now),
+            "tightened limit must not grant a free burst from the old bucket contents — \
+             this is the clamp-on-reconfigure invariant"
+        );
+    }
+}
+
 /// A `ModifyHardRateLimit` proposal with an invalid config (burst=0)
 /// must be rejected BEFORE touching the live limiter, so a malformed
 /// proposal cannot corrupt the per-context enforcement surface.
