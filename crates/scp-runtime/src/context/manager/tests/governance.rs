@@ -3828,6 +3828,141 @@ async fn execute_set_economic_policy_rejects_when_already_pending() {
 }
 
 // -----------------------------------------------------------------------
+// D4: ModifyHardRateLimit governance action
+// -----------------------------------------------------------------------
+
+/// Proposing a `ModifyHardRateLimit` in a `SingleAdmin` context applies
+/// the new configuration to the live limiter and preserves per-sender
+/// bucket state (so tightening the limit cannot give any sender a free
+/// burst past the new cap).
+#[tokio::test]
+async fn modify_hard_rate_limit_updates_live_limiter() {
+    use scp_protocol::context::governance::GovernanceAction;
+    use scp_protocol::economy::antispam::HardRateLimitConfig;
+
+    let manager = ContextManager::new(
+        Box::new(MockCrypto::default()),
+        Box::new(MockTransport::connected()),
+        Box::new(MockEventLog::default()),
+        mock_key_resolver(),
+    );
+
+    let alice: DID = "did:dht:z6MkAlice".into();
+    let key_a = signing_key_for_did(&alice);
+
+    let params = ContextParams {
+        governance: scp_protocol::context::params::GovernanceModel::SingleAdmin,
+        ..ContextParams::default()
+    };
+    let _handle = manager
+        .create_context("ctx-rl-modify".into(), params, alice.clone())
+        .await
+        .unwrap();
+
+    // Consume 3 tokens so the bucket has observable per-sender state.
+    {
+        let contexts = manager.contexts.lock().await;
+        let ctx = contexts.get("ctx-rl-modify").unwrap();
+        let now = 1_000_000;
+        for _ in 0..3 {
+            assert!(ctx.governance.hard_rate_limit.try_consume(&alice, now));
+        }
+        // Verify the starting config is the Matrix default.
+        assert_eq!(
+            ctx.governance.hard_rate_limit.config().burst,
+            10,
+            "starting burst should be Matrix default 10"
+        );
+    }
+
+    // Tighten the limit to burst 5 via governance.
+    let new_config = HardRateLimitConfig {
+        refill_per_kilosec: 200,
+        burst: 5,
+    };
+    let action = GovernanceAction::ModifyHardRateLimit {
+        new_config: new_config.clone(),
+    };
+    let (_proposal, _events, _) = manager
+        .propose_governance_action("ctx-rl-modify", &alice, action, &key_a)
+        .await
+        .expect("ModifyHardRateLimit should execute under SingleAdmin governance");
+
+    // Verify the config was applied AND per-sender state was preserved.
+    {
+        let contexts = manager.contexts.lock().await;
+        let ctx = contexts.get("ctx-rl-modify").unwrap();
+        assert_eq!(
+            ctx.governance.hard_rate_limit.config().burst,
+            5,
+            "burst should be updated to 5"
+        );
+        // After reconfigure, alice's bucket was clamped to the new
+        // burst (5) — she should be able to consume a few more before
+        // hitting the limit, but not 7+ which would imply a free
+        // burst above the new cap.
+        let snap = ctx.governance.hard_rate_limit.snapshot_entries();
+        assert!(
+            snap.contains_key(alice.as_ref()),
+            "alice's per-sender state must be preserved across reconfigure"
+        );
+    }
+}
+
+/// A `ModifyHardRateLimit` proposal with an invalid config (burst=0)
+/// must be rejected BEFORE touching the live limiter, so a malformed
+/// proposal cannot corrupt the per-context enforcement surface.
+#[tokio::test]
+async fn modify_hard_rate_limit_rejects_invalid_config() {
+    use scp_protocol::context::governance::GovernanceAction;
+    use scp_protocol::economy::antispam::HardRateLimitConfig;
+
+    let manager = ContextManager::new(
+        Box::new(MockCrypto::default()),
+        Box::new(MockTransport::connected()),
+        Box::new(MockEventLog::default()),
+        mock_key_resolver(),
+    );
+    let alice: DID = "did:dht:z6MkAlice".into();
+    let key_a = signing_key_for_did(&alice);
+
+    let params = ContextParams {
+        governance: scp_protocol::context::params::GovernanceModel::SingleAdmin,
+        ..ContextParams::default()
+    };
+    let _handle = manager
+        .create_context("ctx-rl-invalid".into(), params, alice.clone())
+        .await
+        .unwrap();
+
+    // burst = 0 fails HardRateLimitConfig::validate().
+    let action = GovernanceAction::ModifyHardRateLimit {
+        new_config: HardRateLimitConfig {
+            refill_per_kilosec: 200,
+            burst: 0,
+        },
+    };
+    let result = manager
+        .propose_governance_action("ctx-rl-invalid", &alice, action, &key_a)
+        .await;
+    assert!(
+        result.is_err(),
+        "ModifyHardRateLimit with burst=0 must be rejected"
+    );
+
+    // The live limiter must retain the Matrix default.
+    {
+        let contexts = manager.contexts.lock().await;
+        let ctx = contexts.get("ctx-rl-invalid").unwrap();
+        assert_eq!(
+            ctx.governance.hard_rate_limit.config().burst,
+            10,
+            "failed proposal must not have corrupted the live config"
+        );
+    }
+}
+
+// -----------------------------------------------------------------------
 // ApproveSpend → MemberBudgetTracker integration (issue #622)
 // -----------------------------------------------------------------------
 

@@ -348,9 +348,10 @@ impl ContextManager {
                 .hard_rate_limit
                 .try_consume(sender_did, now_secs)
             {
-                return Err(ContextError::PermissionDenied(
-                    "SCP-ECON-7090: hard rate limit exceeded for sender".to_owned(),
-                ));
+                return Err(ContextError::RateLimited {
+                    resource: "send".to_owned(),
+                    message: "hard rate limit exceeded for sender".to_owned(),
+                });
             }
             // M4: record velocity BEFORE economy enforcement so the current
             // message is included in the velocity metric used for pricing.

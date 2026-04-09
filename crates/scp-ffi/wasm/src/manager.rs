@@ -244,6 +244,18 @@ pub(crate) struct PerContextState {
     pruning_policy: Option<String>,
     /// Whether the economic policy is locked (§19.3, ADR-033).
     economic_policy_locked: bool,
+    /// Hard rate limit configuration (D4, §19.7) as an opaque JSON blob.
+    ///
+    /// The WASM bridge does not run the runtime-side
+    /// `TokenBucketLimiter` (that lives in scp-runtime which cannot
+    /// compile to wasm32 due to tokio). Consumers of this bridge
+    /// enforce rate limits via JS-side counterparts; the stored
+    /// config is the authoritative governance-approved configuration.
+    ///
+    /// `None` means the context is using the Matrix-style default
+    /// (burst 10, refill 0.2/sec). A `ModifyHardRateLimit` governance
+    /// action populates this field.
+    hard_rate_limit_config: Option<String>,
     /// Consequence rules declared at context creation (ADR-017, #1531).
     /// Parsed and validated from `params.consequenceRules` in `create_context`.
     /// Evaluated via [`crate::consequence::dispatch_consequences_for_subject`]
@@ -1041,6 +1053,7 @@ pub(crate) fn make_bare_per_context_state(context_id: &str, creator_did: &str) -
         resolved_proposals: HashMap::new(),
         pruning_policy: None,
         economic_policy_locked: false,
+        hard_rate_limit_config: None,
         consequence_rules: Vec::new(),
         cooldown_until: HashMap::new(),
         crypto: None,
@@ -1208,6 +1221,7 @@ impl WasmContextManager {
             resolved_proposals: HashMap::new(),
             pruning_policy: None,
             economic_policy_locked: false,
+            hard_rate_limit_config: None,
             consequence_rules,
             cooldown_until: HashMap::new(),
             crypto,
@@ -2387,6 +2401,7 @@ impl WasmContextManager {
             | GovernanceAction::SetEconomicPolicy { .. }
             | GovernanceAction::ApproveSpend { .. }
             | GovernanceAction::LockEconomicPolicy
+            | GovernanceAction::ModifyHardRateLimit { .. }
             | GovernanceAction::ProposeContextMigration { .. }
             | GovernanceAction::CancelContextMigration => "governance:propose",
         }
@@ -2601,6 +2616,7 @@ impl WasmContextManager {
             | GovernanceAction::SetEconomicPolicy { .. }
             | GovernanceAction::ApproveSpend { .. }
             | GovernanceAction::LockEconomicPolicy
+            | GovernanceAction::ModifyHardRateLimit { .. }
             | GovernanceAction::ProposeContextMigration { .. }
             | GovernanceAction::CancelContextMigration => self.dispatch_governance_action_ext(context_id, action),
         }
@@ -2767,6 +2783,7 @@ impl WasmContextManager {
             | GovernanceAction::SetEconomicPolicy { .. }
             | GovernanceAction::ApproveSpend { .. }
             | GovernanceAction::LockEconomicPolicy
+            | GovernanceAction::ModifyHardRateLimit { .. }
             | GovernanceAction::ProposeContextMigration { .. }
             | GovernanceAction::CancelContextMigration => {
                 self.dispatch_governance_action_structural(context_id, action)
@@ -2945,7 +2962,7 @@ impl WasmContextManager {
             | GovernanceAction::SuspendMember { .. }
             | GovernanceAction::Revoke { .. }
             | GovernanceAction::RestoreAccess { .. } => unreachable!(),
-            GovernanceAction::EstablishToolInterface { .. } // 10 downstream
+            GovernanceAction::EstablishToolInterface { .. } // 11 downstream
             | GovernanceAction::ResetMember { .. }
             | GovernanceAction::ResolveConflict { .. }
             | GovernanceAction::RotateContentKeys { .. }
@@ -2953,6 +2970,7 @@ impl WasmContextManager {
             | GovernanceAction::SetEconomicPolicy { .. }
             | GovernanceAction::ApproveSpend { .. }
             | GovernanceAction::LockEconomicPolicy
+            | GovernanceAction::ModifyHardRateLimit { .. }
             | GovernanceAction::ProposeContextMigration { .. }
             | GovernanceAction::CancelContextMigration => {
                 self.dispatch_governance_action_remaining(context_id, action)
@@ -3050,10 +3068,12 @@ impl WasmContextManager {
             | GovernanceAction::AddSigner { .. }
             | GovernanceAction::RemoveSigner { .. }
             | GovernanceAction::ModifyThreshold { .. } => unreachable!(),
-            // 3 variants handled by dispatch_governance_action_economic.
+            // 4 variants handled by dispatch_governance_action_economic
+            // (SetEconomicPolicy, ApproveSpend, LockEconomicPolicy, ModifyHardRateLimit).
             GovernanceAction::SetEconomicPolicy { .. }
             | GovernanceAction::ApproveSpend { .. }
-            | GovernanceAction::LockEconomicPolicy => {
+            | GovernanceAction::LockEconomicPolicy
+            | GovernanceAction::ModifyHardRateLimit { .. } => {
                 self.dispatch_governance_action_economic(context_id, action)
             }
         }
@@ -3116,6 +3136,29 @@ impl WasmContextManager {
                 ctx.economic_policy_locked = true;
                 Ok(serde_json::json!({"action": "LockEconomicPolicy"}))
             }
+            GovernanceAction::ModifyHardRateLimit { new_config } => {
+                // Validate BEFORE touching context state so a malformed
+                // proposal cannot corrupt the persisted config.
+                new_config.validate().map_err(|e| ScpWasmError::Context {
+                    message: format!("ModifyHardRateLimit: new config failed validation: {e}"),
+                    code: "SCP-ECON-7091".to_owned(),
+                })?;
+                let ctx = self.require_active_context_mut(context_id)?;
+                // WASM bridge stores the config as an opaque JSON blob
+                // because it does not run the runtime-side
+                // `TokenBucketLimiter` (that lives in scp-runtime, which
+                // cannot compile to wasm32). Consumers of the WASM
+                // bridge enforce rate limits via their own JS-side
+                // counterparts; the stored config is what governance
+                // has approved and is the authoritative reference.
+                ctx.hard_rate_limit_config =
+                    Some(serde_json::to_string(new_config).unwrap_or_default());
+                Ok(serde_json::json!({
+                    "action": "ModifyHardRateLimit",
+                    "refillPerKilosec": new_config.refill_per_kilosec,
+                    "burst": new_config.burst,
+                }))
+            }
             // 25 variants handled by upstream dispatch methods (exhaustive, no wildcard).
             GovernanceAction::AddMember { .. }
             | GovernanceAction::Eject { .. }
@@ -3145,7 +3188,7 @@ impl WasmContextManager {
         }
     }
 
-    /// Helper for `ResolveConflict` governance action.
+    /// Helper for `ResolveConflict` governance action (upstream from dispatcher).
     ///
     /// Validates the `resolution` value, then records conflicting proposals as
     /// executed (invalidated). `resolution` must be `"invalidateBoth"` or one
@@ -4832,6 +4875,7 @@ impl WasmContextManager {
             governance_freeze: ctx.governance_freeze,
             pruning_policy: ctx.pruning_policy.clone(),
             economic_policy_locked: ctx.economic_policy_locked,
+            hard_rate_limit_config: ctx.hard_rate_limit_config.clone(),
         };
 
         // Serialize snapshot to RFC 8785 JCS canonical JSON for HMAC
@@ -5118,6 +5162,7 @@ impl WasmContextManager {
             },
             pruning_policy: snap.pruning_policy.clone(),
             economic_policy_locked: snap.economic_policy_locked,
+            hard_rate_limit_config: snap.hard_rate_limit_config.clone(),
             consequence_rules: snap.consequence_rules.clone(),
             cooldown_until: snap.cooldown_until.clone(),
             // Imported contexts do not carry MLS state — they must re-establish
@@ -5490,6 +5535,10 @@ struct WasmContextExportSnapshot {
     /// Whether the economic policy is locked (§19.3, ADR-033).
     #[serde(default)]
     economic_policy_locked: bool,
+    /// Hard rate limit configuration (D4, §19.7) as an opaque JSON blob.
+    /// `None` means the default Matrix-style config applies.
+    #[serde(default)]
+    hard_rate_limit_config: Option<String>,
 }
 
 /// Serializable member entry for export.
@@ -6316,6 +6365,7 @@ mod tests {
             resolved_proposals: HashMap::new(),
             pruning_policy: None,
             economic_policy_locked: false,
+            hard_rate_limit_config: None,
             consequence_rules: Vec::new(),
             cooldown_until: HashMap::new(),
             crypto: None,
@@ -6426,6 +6476,7 @@ mod tests {
             resolved_proposals: HashMap::new(),
             pruning_policy: None,
             economic_policy_locked: false,
+            hard_rate_limit_config: None,
             consequence_rules: Vec::new(),
             cooldown_until: HashMap::new(),
             crypto: None,
@@ -6684,6 +6735,7 @@ mod tests {
             governance_freeze: false,
             pruning_policy: None,
             economic_policy_locked: false,
+            hard_rate_limit_config: None,
         }
     }
 

@@ -13,6 +13,10 @@
 #   SCP-VALID-   7000-7999    SCP-STORAGE- 8000-8999
 #   SCP-ATTEST-  9000-9999    SCP-MCP-     10000-10999
 #
+# Aliased subranges:
+#   SCP-GOV-     5000-5999    (governance subset of SCP-TRANS range)
+#   SCP-ECON-    7000-7999    (economics subset of SCP-VALID range)
+#
 # Exit 0 on success, 1 on any violation.
 # Usage: ./scripts/check-error-codes.sh
 
@@ -53,6 +57,22 @@ check_code() {
         SCP-STORAGE)  [[ $num -ge 8000 && $num -le 8999 ]] || { echo "VIOLATION: $file:$line_num: $code — STORAGE range is 8000-8999"; VIOLATIONS=$((VIOLATIONS + 1)); } ;;
         SCP-ATTEST)   [[ $num -ge 9000 && $num -le 9999 ]] || { echo "VIOLATION: $file:$line_num: $code — ATTEST range is 9000-9999"; VIOLATIONS=$((VIOLATIONS + 1)); } ;;
         SCP-MCP)      [[ $num -ge 10000 && $num -le 10999 ]] || { echo "VIOLATION: $file:$line_num: $code — MCP range is 10000-10999"; VIOLATIONS=$((VIOLATIONS + 1)); } ;;
+        SCP-GOV)
+            # Numbers < 1000 are prefix-truncated string matches in
+            # test assertions (e.g. `.contains("SCP-GOV-50")`), not
+            # real error codes. Allow them through so tests can
+            # match on code ranges without tripping the validator.
+            if [[ $num -ge 1000 ]]; then
+                [[ $num -ge 5000 && $num -le 5999 ]] || { echo "VIOLATION: $file:$line_num: $code — GOV subrange is 5000-5999"; VIOLATIONS=$((VIOLATIONS + 1)); }
+            fi
+            ;;
+        SCP-ECON)
+            # Same relaxation as SCP-GOV above: prefix-truncated test
+            # assertions use `.contains("SCP-ECON-70")` style matches.
+            if [[ $num -ge 1000 ]]; then
+                [[ $num -ge 7000 && $num -le 7999 ]] || { echo "VIOLATION: $file:$line_num: $code — ECON subrange is 7000-7999"; VIOLATIONS=$((VIOLATIONS + 1)); }
+            fi
+            ;;
         SCP-UNKNOWN)  ;; # Sentinel for unmapped bridge errors — allowed
         SCP-TEST)     ;; # Test sentinel — allowed
         *)

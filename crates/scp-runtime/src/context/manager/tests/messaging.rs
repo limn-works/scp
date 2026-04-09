@@ -1913,13 +1913,20 @@ async fn tool_invoke_respects_hard_rate_limit() {
     assert!(result.is_err(), "11th tool invoke should be rate-limited");
     let err = result.unwrap_err();
     match err {
-        ContextError::PermissionDenied(ref msg) => {
+        ContextError::RateLimited {
+            ref resource,
+            ref message,
+        } => {
+            assert_eq!(
+                resource, "tool_invoke",
+                "resource tag should be tool_invoke"
+            );
             assert!(
-                msg.contains("SCP-ECON-7090"),
-                "expected SCP-ECON-7090 hard rate limit error, got: {msg}"
+                message.contains("invoker"),
+                "rate limit message should mention the invoker: {message}"
             );
         }
-        other => panic!("expected PermissionDenied, got: {other:?}"),
+        other => panic!("expected ContextError::RateLimited, got: {other:?}"),
     }
 }
 
@@ -1998,13 +2005,11 @@ async fn tool_invoke_failure_refunds_hard_rate_limit_token() {
         .await;
     assert!(result.is_err(), "11th failing invoke should still error");
     let err = result.unwrap_err();
-    if let ContextError::PermissionDenied(msg) = &err {
-        assert!(
-            !msg.contains("SCP-ECON-7090"),
-            "11th failing invoke must NOT hit hard rate limit \
-             (token should have been refunded on each failure): {msg}"
-        );
-    }
+    assert!(
+        !matches!(err, ContextError::RateLimited { .. }),
+        "11th failing invoke must NOT hit hard rate limit \
+         (token should have been refunded on each failure): got {err:?}"
+    );
 }
 
 /// Test D: `join_context` ticks the velocity tracker for the joiner
@@ -2189,13 +2194,17 @@ async fn hard_rate_limit_rejects_burst_over_ten() {
     assert!(result.is_err(), "11th rapid send should be rate-limited");
     let err = result.unwrap_err();
     match err {
-        ContextError::PermissionDenied(ref msg) => {
+        ContextError::RateLimited {
+            ref resource,
+            ref message,
+        } => {
+            assert_eq!(resource, "send", "resource tag should be send");
             assert!(
-                msg.contains("SCP-ECON-7090"),
-                "expected SCP-ECON-7090 hard rate limit error, got: {msg}"
+                message.contains("sender"),
+                "rate limit message should mention the sender: {message}"
             );
         }
-        other => panic!("expected PermissionDenied, got: {other:?}"),
+        other => panic!("expected ContextError::RateLimited, got: {other:?}"),
     }
 }
 
