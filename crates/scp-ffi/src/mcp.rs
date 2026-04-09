@@ -804,62 +804,46 @@ impl ContextProvider for FfiBridgeProvider {
         // per-context rate limit. Matches the pattern in
         // `py_tool_invoke` / NAPI `tool_invoke` / UniFFI `tool_invoke`.
         //
-        // SYNC-IN-ASYNC caveat (bug-catcher Round 2 finding): this
-        // trait method is sync, but its callers (`py_mcp_serve`
-        // stdio loop via `rt.spawn(async move ...)` and the SSE
-        // async handler) invoke it from inside a tokio runtime. The
-        // `_blocking` helper would panic because
-        // `tokio::sync::Mutex::blocking_lock` rejects calls from
-        // within an async context.
+        // SYNC-IN-ASYNC caveat (bug-catcher Rounds 2 + 3 findings):
+        // this trait method is sync, but its callers vary:
+        //   (a) `py_mcp_serve` stdio loop → `rt.spawn(async move ...)`
+        //       → MAY run on multi-thread OR current-thread runtime
+        //       depending on the runtime fallback at lib.rs:131-145.
+        //   (b) SSE async handler → multi-thread runtime.
+        //   (c) Sync `#[test]` tests → no runtime at all.
         //
-        // We detect the context via `Handle::try_current()`:
-        //   - Inside an async runtime → use `block_in_place` +
-        //     `Handle::current().block_on(async helper)`. Requires
-        //     multi-thread runtime (production MCP servers deploy
-        //     multi-thread via `crates/scp-ffi/src/lib.rs:131-145`).
-        //   - Outside an async runtime (unit tests exercising the
-        //     `FfiBridgeProvider::invoke_tool` trait method
-        //     directly from a sync `#[test]`) → use the `_blocking`
-        //     variant, which is safe when no runtime is present.
+        // Delegate to the runtime-agnostic helper on `ContextManager`
+        // which internally dispatches between:
+        //   - `blocking_lock` (no runtime active),
+        //   - `block_in_place + block_on` (multi-thread runtime), or
+        //   - dedicated `std::thread` with its own tiny runtime
+        //     (current-thread runtime fallback, where the first two
+        //     would panic).
         //
-        // This dual-path preserves both the production correctness
-        // fix AND the existing sync test harness.
+        // This centralizes the runtime-detection logic and ensures
+        // NAPI/UniFFI/PyO3 bridges share a single correct dispatch
+        // surface.
         let invoker_did_typed: scp_primitives::DID = agent_did.clone().into();
         let now_secs = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs())
             .unwrap_or(0);
         let manager = crate::runtime::context_manager().map_err(|e| format!("{e}"))?;
-        let consumed = if tokio::runtime::Handle::try_current().is_ok() {
-            tokio::task::block_in_place(|| {
-                tokio::runtime::Handle::current().block_on(manager.try_consume_hard_rate_limit(
-                    context_id,
-                    &invoker_did_typed,
-                    now_secs,
-                ))
-            })
-        } else {
-            manager.try_consume_hard_rate_limit_blocking(context_id, &invoker_did_typed, now_secs)
-        };
-        if !consumed {
+        if !manager.try_consume_hard_rate_limit_from_any_context(
+            context_id,
+            &invoker_did_typed,
+            now_secs,
+        ) {
             return Err("SCP-ECON-7090: rate limit exceeded on tool_invoke: \
                         hard rate limit exceeded for invoker"
                 .to_owned());
         }
         // Helper that refunds the token on any failure path. Used by
-        // every `return Err` below. Same dual-path sync-in-async
-        // bridging as the consume call above.
+        // every `return Err` below. Same runtime-agnostic dispatch
+        // as the consume call above.
         let ctx_id_for_refund = context_id.to_owned();
         let refund = |e: String| -> String {
-            if tokio::runtime::Handle::try_current().is_ok() {
-                tokio::task::block_in_place(|| {
-                    tokio::runtime::Handle::current().block_on(
-                        manager.refund_hard_rate_limit(&ctx_id_for_refund, &invoker_did_typed),
-                    );
-                });
-            } else {
-                manager.refund_hard_rate_limit_blocking(&ctx_id_for_refund, &invoker_did_typed);
-            }
+            manager.refund_hard_rate_limit_from_any_context(&ctx_id_for_refund, &invoker_did_typed);
             e
         };
 

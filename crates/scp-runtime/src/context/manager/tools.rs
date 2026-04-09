@@ -333,6 +333,166 @@ impl ContextManager {
         }
     }
 
+    /// Runtime-agnostic hard-rate-limit consume for sync bridge trait
+    /// methods that may be called from ANY of the three tokio runtime
+    /// contexts:
+    ///
+    /// 1. **No runtime active**: use `blocking_lock` directly — safe
+    ///    when no tokio executor is present (sync unit tests that
+    ///    exercise a sync trait method outside `#[tokio::test]`).
+    /// 2. **Multi-thread runtime active**: use `block_in_place` +
+    ///    `Handle::current().block_on(async_helper)`. The
+    ///    `block_in_place` primitive is only valid on multi-thread
+    ///    runtimes — it moves the current task off the worker so
+    ///    the worker can progress other tasks while we await.
+    /// 3. **Current-thread runtime active**: neither `blocking_lock`
+    ///    (panics because inside runtime) NOR `block_in_place`
+    ///    (panics because single-threaded) is safe. Fall back to
+    ///    spawning a dedicated `std::thread` with its own tiny
+    ///    current-thread runtime that calls `block_on` on the
+    ///    async helper, then join via an mpsc channel.
+    ///
+    /// The third case is a defensive fallback for resource-constrained
+    /// deployments where the primary multi-thread runtime failed to
+    /// build (see the fallback path in `crates/scp-ffi/src/lib.rs`).
+    /// It is slow (thread spawn + runtime build per call) but
+    /// correct. Production MCP servers should deploy on multi-thread
+    /// and never exercise this path.
+    ///
+    /// Same pass-through semantic as the blocking/async variants:
+    /// returns `true` when the context is not registered.
+    ///
+    /// # Purpose
+    ///
+    /// The `PyO3` MCP server bridge (`FfiBridgeProvider::invoke_tool`
+    /// in `crates/scp-ffi/src/mcp.rs`) is a sync trait method called
+    /// from both async tokio contexts (stdio `rt.spawn` loop, SSE
+    /// async handler) AND sync unit tests. Using only the async or
+    /// only the blocking variant would break one or the other. This
+    /// smart wrapper handles all three cases uniformly.
+    #[must_use]
+    #[allow(clippy::option_if_let_else)] // match is clearer than map_or_else for this dual arm
+    pub fn try_consume_hard_rate_limit_from_any_context(
+        self: &Arc<Self>,
+        context_id: &str,
+        did: &DID,
+        now_secs: u64,
+    ) -> bool {
+        match tokio::runtime::Handle::try_current() {
+            Err(_) => {
+                // Case 1: no runtime active. `blocking_lock` is safe.
+                self.try_consume_hard_rate_limit_blocking(context_id, did, now_secs)
+            }
+            Ok(handle) => {
+                use tokio::runtime::RuntimeFlavor;
+                match handle.runtime_flavor() {
+                    RuntimeFlavor::MultiThread => {
+                        // Case 2: multi-thread runtime. `block_in_place`
+                        // + `block_on` is safe.
+                        tokio::task::block_in_place(|| {
+                            handle.block_on(
+                                self.try_consume_hard_rate_limit(context_id, did, now_secs),
+                            )
+                        })
+                    }
+                    // Current-thread or any future flavor we do not
+                    // explicitly know about: spawn a dedicated
+                    // `std::thread` with its own tiny runtime so we
+                    // never touch the parent runtime's executor.
+                    _ => Self::run_blocking_on_dedicated_thread(
+                        Arc::clone(self),
+                        context_id.to_owned(),
+                        did.clone(),
+                        now_secs,
+                        /* refund = */ false,
+                    ),
+                }
+            }
+        }
+    }
+
+    /// Runtime-agnostic hard-rate-limit refund. Mirrors
+    /// [`Self::try_consume_hard_rate_limit_from_any_context`]'s
+    /// three-case dispatch.
+    #[allow(clippy::option_if_let_else)] // match is clearer than map_or_else for this dual arm
+    pub fn refund_hard_rate_limit_from_any_context(self: &Arc<Self>, context_id: &str, did: &DID) {
+        match tokio::runtime::Handle::try_current() {
+            Err(_) => {
+                self.refund_hard_rate_limit_blocking(context_id, did);
+            }
+            Ok(handle) => {
+                use tokio::runtime::RuntimeFlavor;
+                match handle.runtime_flavor() {
+                    RuntimeFlavor::MultiThread => {
+                        tokio::task::block_in_place(|| {
+                            handle.block_on(self.refund_hard_rate_limit(context_id, did));
+                        });
+                    }
+                    _ => {
+                        let _ = Self::run_blocking_on_dedicated_thread(
+                            Arc::clone(self),
+                            context_id.to_owned(),
+                            did.clone(),
+                            0,
+                            /* refund = */ true,
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// Dedicated-thread escape hatch for current-thread runtime
+    /// environments where both `blocking_lock` and `block_in_place`
+    /// panic. Spawns a one-shot `std::thread`, builds a tiny
+    /// current-thread tokio runtime there, and runs the async helper
+    /// to completion. Returns the consume result (or `true` for
+    /// refund calls where the return value is unused).
+    ///
+    /// Slow: thread spawn + runtime build per call. Only triggered
+    /// on current-thread runtime fallback, which is a non-production
+    /// resource-constrained deployment path.
+    fn run_blocking_on_dedicated_thread(
+        manager: Arc<Self>,
+        context_id: String,
+        did: DID,
+        now_secs: u64,
+        refund: bool,
+    ) -> bool {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            // Build a dedicated current-thread runtime in the new
+            // thread so we are NOT in the parent runtime's context.
+            let rt = match tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+            {
+                Ok(rt) => rt,
+                Err(e) => {
+                    tracing::error!(
+                        error = %e,
+                        "dedicated rate-limit runtime build failed; \
+                         falling back to pass-through"
+                    );
+                    // Pass-through on runtime build failure — matches
+                    // the "unknown context" pass-through semantic so
+                    // a degraded env does not hard-fail tool invokes.
+                    let _ = tx.send(true);
+                    return;
+                }
+            };
+            let result = if refund {
+                rt.block_on(manager.refund_hard_rate_limit(&context_id, &did));
+                true
+            } else {
+                rt.block_on(manager.try_consume_hard_rate_limit(&context_id, &did, now_secs))
+            };
+            let _ = tx.send(result);
+        });
+        // Pass-through on channel failure (panicked worker etc.).
+        rx.recv().unwrap_or(true)
+    }
+
     /// Invokes a tool under the full economy pipeline without holding
     /// the `contexts` mutex across the executor future (spec §19.7).
     ///

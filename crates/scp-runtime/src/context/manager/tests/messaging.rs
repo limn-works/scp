@@ -1877,10 +1877,131 @@ async fn try_consume_hard_rate_limit_async_variant_is_safe_from_async_context() 
     assert!(ok, "unknown context must pass-through as true");
 }
 
+/// D4 bug-catcher Round 3: the runtime-agnostic helper
+/// `try_consume_hard_rate_limit_from_any_context` MUST survive a
+/// current-thread tokio runtime. Round 2's `block_in_place`-only
+/// path would have panicked here because `block_in_place` requires
+/// multi-thread. The Round 3 helper detects the runtime flavor and
+/// falls back to a dedicated `std::thread` with its own tiny
+/// current-thread runtime for this case.
+///
+/// This regression test SPECIFICALLY covers the `PyO3` MCP server
+/// fallback path at `crates/scp-ffi/src/lib.rs:131-145` where the
+/// primary multi-thread runtime builder failed and the service is
+/// running on a current-thread runtime instead.
+#[test]
+fn any_context_helper_survives_current_thread_runtime() {
+    use std::sync::Arc as StdArc;
+    // Build a current-thread runtime explicitly (NOT via
+    // `#[tokio::test(flavor = "current_thread")]` because we want
+    // to exercise the flavor-detection branch from INSIDE the
+    // runtime via explicit `block_on` calls).
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("current-thread runtime must build");
+
+    // Create the manager outside the runtime scope, then use it
+    // from within the runtime's block_on. The helper takes
+    // `&Arc<Self>` so we need a full Arc here.
+    let manager = StdArc::new(ContextManager::new(
+        Box::new(MockCrypto::default()),
+        Box::new(MockTransport::connected()),
+        Box::new(MockEventLog::default()),
+        noop_key_resolver(),
+    ));
+
+    // First, set up the context from inside the runtime (required
+    // because `create_context` is async).
+    let alice: DID = "did:key:alice".into();
+    let manager_for_setup = StdArc::clone(&manager);
+    let alice_for_setup = alice.clone();
+    rt.block_on(async move {
+        manager_for_setup
+            .create_context("ct-rt-ctx".into(), governance_params(), alice_for_setup)
+            .await
+            .expect("create_context must succeed");
+    });
+
+    // Now enter the runtime again and call the runtime-agnostic
+    // sync helper from inside a `block_on` task. This is the
+    // pattern that would panic under Round 2's `block_in_place`
+    // implementation — the Round 3 dedicated-thread fallback must
+    // handle it cleanly.
+    let manager_for_consume = StdArc::clone(&manager);
+    let alice_for_consume = alice.clone();
+    let result = rt.block_on(async move {
+        manager_for_consume.try_consume_hard_rate_limit_from_any_context(
+            "ct-rt-ctx",
+            &alice_for_consume,
+            3_000,
+        )
+    });
+    assert!(
+        result,
+        "helper must succeed on current-thread runtime via dedicated-thread fallback"
+    );
+
+    // Refund path under the same constraint.
+    let manager_for_refund = StdArc::clone(&manager);
+    rt.block_on(async move {
+        manager_for_refund.refund_hard_rate_limit_from_any_context("ct-rt-ctx", &alice);
+    });
+}
+
+/// D4 bug-catcher Round 3: the runtime-agnostic helper must also
+/// work from outside any runtime (sync unit tests that exercise
+/// bridge traits directly) — the "no runtime" branch that uses
+/// `blocking_lock` directly.
+#[test]
+fn any_context_helper_survives_no_runtime() {
+    use std::sync::Arc as StdArc;
+    // Build a throwaway runtime JUST to create the context, then
+    // drop it so the helper is called from a no-runtime environment.
+    let manager = StdArc::new(ContextManager::new(
+        Box::new(MockCrypto::default()),
+        Box::new(MockTransport::connected()),
+        Box::new(MockEventLog::default()),
+        noop_key_resolver(),
+    ));
+    let alice: DID = "did:key:alice".into();
+    {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let manager_setup = StdArc::clone(&manager);
+        let alice_setup = alice.clone();
+        rt.block_on(async move {
+            manager_setup
+                .create_context("no-rt-ctx".into(), governance_params(), alice_setup)
+                .await
+                .expect("create_context must succeed");
+        });
+        // `rt` dropped here — we are now outside any runtime.
+    }
+
+    // Verify we are outside a runtime.
+    assert!(
+        tokio::runtime::Handle::try_current().is_err(),
+        "test must run outside any runtime for this branch"
+    );
+
+    // The helper MUST use the `blocking_lock` branch here — neither
+    // `block_in_place` (needs multi-thread runtime) nor
+    // `Handle::current()` (panics outside runtime) would work.
+    let result = manager.try_consume_hard_rate_limit_from_any_context("no-rt-ctx", &alice, 4_000);
+    assert!(result, "helper must succeed outside any runtime");
+
+    manager.refund_hard_rate_limit_from_any_context("no-rt-ctx", &alice);
+}
+
 /// D4 bug-catcher Round 2: same regression guard for the
 /// `block_in_place + Handle::current().block_on(...)` pattern used
 /// by `PyO3` `FfiBridgeProvider::invoke_tool` — this simulates the
-/// sync-in-async call path that the `MCP` server bridge uses.
+/// sync-in-async call path that the `MCP` server bridge uses on
+/// multi-thread runtimes. The Round 3 `_from_any_context` helper
+/// uses the `block_in_place` branch in this case.
 ///
 /// The inner `block_on` call on the current handle is allowed ONLY
 /// if wrapped in `block_in_place` (which moves the current task to
