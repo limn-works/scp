@@ -3527,62 +3527,124 @@ pub async fn tool_invoke(
                 proof_tokens.as_ref(),
             )?;
 
-            let registry = handle.tool_registry.lock().await;
-            let registration = registry.get(&tool_id).ok_or_else(|| ScpError::Tool {
-                msg: format!(
-                    "tool '{tool_id}' not found in context '{}'",
-                    handle.context_id
-                ),
-                code: "SCP-TOOL-6002".to_owned(),
-            })?;
+            // D4 bypass close (UniFFI tool invoke): consume a
+            // hard-rate-limit token BEFORE any bridge-side tool
+            // dispatch. The UniFFI bridge owns its own
+            // `tool_registry` + `tool_handlers` on `ContextHandle`,
+            // so it does NOT go through
+            // `ContextManager::invoke_tool_with_economy`; without
+            // this hook a member rate-limited on `send_message` could
+            // still burn relay capacity via this path. Matches the
+            // pattern applied in PyO3 `py_tool_invoke` and NAPI
+            // `tool_invoke`.
+            let invoker_did_typed: scp_primitives::DID = identity.did.clone().into();
+            let now_secs = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+            let manager = crate::runtime::context_manager_expect();
+            if !manager
+                .try_consume_hard_rate_limit(&handle.context_id, &invoker_did_typed, now_secs)
+                .await
+            {
+                return Err(ScpError::Tool {
+                    msg: "SCP-ECON-7090: rate limit exceeded on tool_invoke: hard rate limit exceeded for invoker".to_owned(),
+                    code: "SCP-ECON-7090".to_owned(),
+                });
+            }
 
-            let input_value: serde_json::Value =
-                serde_json::from_str(&input_json).map_err(|e| ScpError::Tool {
-                    msg: format!("invalid input JSON: {e}"),
-                    code: "SCP-TOOL-6002".to_owned(),
-                })?;
-            scp_core::context::tools::validate_value_against_schema(
-                &input_value,
-                &registration.schema.input_schema,
-            )
-            .map_err(|e| ScpError::Tool {
-                msg: format!("input validation failed for tool '{tool_id}': {e}"),
-                code: "SCP-TOOL-6002".to_owned(),
-            })?;
+            // Wrap the rest of the dispatch in an inner async block
+            // so we can refund the hard-rate-limit token on any
+            // failure path via a single match at the end. Every
+            // error path inside the block propagates via `?` as
+            // before; only the outer match converts Err into a
+            // refund + re-raise.
+            let ctx_id_for_refund = handle.context_id.clone();
+            let invoker_for_refund = invoker_did_typed.clone();
+            let handle_for_dispatch = Arc::clone(&handle);
+            let tool_id_owned = tool_id.clone();
+            let identity_did_owned = identity.did.clone();
 
-            let output_schema = registration.schema.output_schema.clone();
-            drop(registry);
-
-            let handlers = handle.tool_handlers.lock().await;
-            let output = if let Some(handler) = handlers.get(&tool_id) {
-                let handler = handler.clone();
-                drop(handlers);
-                let out = handler(input_value.clone()).map_err(|e| ScpError::Tool {
-                    msg: format!("tool handler for '{tool_id}' failed: {e}"),
-                    code: "SCP-TOOL-6002".to_owned(),
-                })?;
-                scp_core::context::tools::validate_value_against_schema(&out, &output_schema)
-                    .map_err(|msg| ScpError::Tool {
-                        msg: format!("output validation failed for tool '{tool_id}': {msg}"),
+            let dispatch_result: Result<String, ScpError> = async {
+                let registry = handle_for_dispatch.tool_registry.lock().await;
+                let registration =
+                    registry.get(&tool_id_owned).ok_or_else(|| ScpError::Tool {
+                        msg: format!(
+                            "tool '{tool_id_owned}' not found in context '{}'",
+                            handle_for_dispatch.context_id
+                        ),
                         code: "SCP-TOOL-6002".to_owned(),
                     })?;
-                out
-            } else {
-                drop(handlers);
-                serde_json::json!({
-                    "tool": tool_id,
-                    "context": handle.context_id,
-                    "status": "validated",
-                    "input_valid": true,
-                    "invoker_did": identity.did,
-                    "validated_input": input_value,
-                })
-            };
 
-            serde_json::to_string(&output).map_err(|e| ScpError::Tool {
-                msg: format!("failed to serialize tool output: {e}"),
-                code: "SCP-TOOL-6006".to_owned(),
-            })
+                let input_value: serde_json::Value = serde_json::from_str(&input_json)
+                    .map_err(|e| ScpError::Tool {
+                        msg: format!("invalid input JSON: {e}"),
+                        code: "SCP-TOOL-6002".to_owned(),
+                    })?;
+                scp_core::context::tools::validate_value_against_schema(
+                    &input_value,
+                    &registration.schema.input_schema,
+                )
+                .map_err(|e| ScpError::Tool {
+                    msg: format!("input validation failed for tool '{tool_id_owned}': {e}"),
+                    code: "SCP-TOOL-6002".to_owned(),
+                })?;
+
+                let output_schema = registration.schema.output_schema.clone();
+                drop(registry);
+
+                let handlers = handle_for_dispatch.tool_handlers.lock().await;
+                let output = if let Some(handler) = handlers.get(&tool_id_owned) {
+                    let handler = handler.clone();
+                    drop(handlers);
+                    let out =
+                        handler(input_value.clone()).map_err(|e| ScpError::Tool {
+                            msg: format!("tool handler for '{tool_id_owned}' failed: {e}"),
+                            code: "SCP-TOOL-6002".to_owned(),
+                        })?;
+                    scp_core::context::tools::validate_value_against_schema(
+                        &out,
+                        &output_schema,
+                    )
+                    .map_err(|msg| ScpError::Tool {
+                        msg: format!(
+                            "output validation failed for tool '{tool_id_owned}': {msg}"
+                        ),
+                        code: "SCP-TOOL-6002".to_owned(),
+                    })?;
+                    out
+                } else {
+                    drop(handlers);
+                    serde_json::json!({
+                        "tool": tool_id_owned,
+                        "context": handle_for_dispatch.context_id,
+                        "status": "validated",
+                        "input_valid": true,
+                        "invoker_did": identity_did_owned,
+                        "validated_input": input_value,
+                    })
+                };
+
+                serde_json::to_string(&output).map_err(|e| ScpError::Tool {
+                    msg: format!("failed to serialize tool output: {e}"),
+                    code: "SCP-TOOL-6006".to_owned(),
+                })
+            }
+            .await;
+
+            match dispatch_result {
+                Ok(s) => Ok(s),
+                Err(e) => {
+                    // Refund the hard-rate-limit token so a rejected
+                    // dispatch does not permanently burn bucket
+                    // capacity. Matches the refund discipline in
+                    // `invoke_tool_with_economy`.
+                    manager
+                        .refund_hard_rate_limit(&ctx_id_for_refund, &invoker_for_refund)
+                        .await;
+                    Err(e)
+                }
+            }
         })
         .await
         .map_err(|e| ScpError::Tool {

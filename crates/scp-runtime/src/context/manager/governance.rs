@@ -3987,15 +3987,34 @@ impl ContextManager {
                 .ok_or_else(|| ContextError::ContextNotRegistered(context_id.to_owned()))?;
             require_active(&ctx.handle)?;
 
-            // Preserve per-sender bucket state across the reconfigure.
-            // `snapshot_entries` returns `HashMap<String, (u64, u64)>`,
-            // and `from_snapshot` reconstructs with the new config —
-            // the effective burst is reapplied on the next
-            // `try_consume`, and over-capacity tokens get clamped by
-            // `validate_and_sanitize_snapshot` on restore. This
-            // guarantees that tightening the limit does NOT give any
-            // sender a free burst.
-            let preserved_state = ctx.governance.hard_rate_limit.snapshot_entries();
+            // Preserve per-sender bucket state across the reconfigure,
+            // but clamp `tokens_milli > new_burst_milli` BEFORE handing
+            // the state to `from_snapshot`. `from_snapshot` itself does
+            // NOT clamp — the clamp relies on `try_consume`'s
+            // `.min(burst_milli)` after refill, which would only apply
+            // lazily on the next `try_consume` call. Calling
+            // `validate_and_sanitize_snapshot` here closes the window
+            // where a sender whose bucket holds more tokens than the
+            // NEW burst could consume them before refill hits —
+            // effectively a free burst up to the old cap.
+            //
+            // D4 review finding (security-reviewer MEDIUM): the
+            // previous version relied on a commented-but-nonexistent
+            // clamp invariant in `from_snapshot`. The explicit sanitize
+            // call below is load-bearing for the invariant that
+            // tightening the limit cannot grant a free burst.
+            let mut preserved_state = ctx.governance.hard_rate_limit.snapshot_entries();
+            scp_protocol::economy::antispam::TokenBucketLimiter::validate_and_sanitize_snapshot(
+                &mut preserved_state,
+                new_config,
+                self.clock.now_secs(),
+                scp_protocol::economy::antispam::SNAPSHOT_CLOCK_SKEW_TOLERANCE_SECS,
+            )
+            .map_err(|e| {
+                ContextError::GovernanceFailed(format!(
+                    "ModifyHardRateLimit: preserved state sanitization failed: {e}"
+                ))
+            })?;
             ctx.governance.hard_rate_limit =
                 scp_protocol::economy::antispam::TokenBucketLimiter::from_snapshot(
                     new_config.clone(),

@@ -794,6 +794,34 @@ impl ContextProvider for FfiBridgeProvider {
         let agent_did = self.agent_did.clone();
         let timeout = std::time::Duration::from_millis(self.tool_timeout_ms);
 
+        // D4 bypass close: consume a hard-rate-limit token BEFORE
+        // dispatching the MCP tool invocation. The MCP server path
+        // (this function, reachable from external MCP clients) does
+        // NOT go through `ContextManager::invoke_tool_with_economy`
+        // — it dispatches directly against the bridge-side tool
+        // registry. Without this hook, an external MCP client could
+        // burn relay capacity via tool invocations regardless of the
+        // per-context rate limit. Matches the pattern in
+        // `py_tool_invoke` / NAPI `tool_invoke` / UniFFI `tool_invoke`.
+        let invoker_did_typed: scp_primitives::DID = agent_did.clone().into();
+        let now_secs = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let manager = crate::runtime::context_manager().map_err(|e| format!("{e}"))?;
+        if !manager.try_consume_hard_rate_limit_blocking(context_id, &invoker_did_typed, now_secs) {
+            return Err("SCP-ECON-7090: rate limit exceeded on tool_invoke: \
+                        hard rate limit exceeded for invoker"
+                .to_owned());
+        }
+        // Helper that refunds the token on any failure path. Used by
+        // every `return Err` below.
+        let ctx_id_for_refund = context_id.to_owned();
+        let refund = |e: String| -> String {
+            manager.refund_hard_rate_limit_blocking(&ctx_id_for_refund, &invoker_did_typed);
+            e
+        };
+
         // Phase 1: Validate input and extract handler + output schema under
         // the DashMap shard lock. The lock is released when with_context
         // returns. Also compute input hash before dispatch (arguments may
@@ -827,7 +855,7 @@ impl ContextProvider for FfiBridgeProvider {
                 input_hash,
             ))
         })
-        .map_err(|e| format!("{e}"))?;
+        .map_err(|e| refund(format!("{e}")))?;
 
         // Phase 2: Execute handler OUTSIDE the DashMap shard lock so that
         // concurrent same-context operations are not blocked during Python
@@ -847,21 +875,25 @@ impl ContextProvider for FfiBridgeProvider {
                 });
 
                 let handler_result = rx.recv_timeout(timeout).map_err(|_| {
-                    format!(
+                    refund(format!(
                         "tool handler for '{tool_name}' timed out after {}ms",
                         timeout.as_millis()
-                    )
+                    ))
                 })?;
 
                 let output = handler_result
-                    .map_err(|e| format!("tool handler for '{tool_name}' failed: {e}"))?;
+                    .map_err(|e| refund(format!("tool handler for '{tool_name}' failed: {e}")))?;
 
                 // Validate output against the tool's output schema (defense-in-depth).
                 scp_core::context::tools::schema::validate_value_against_schema(
                     &output,
                     &output_schema,
                 )
-                .map_err(|msg| format!("output validation failed for tool '{tool_name}': {msg}"))?;
+                .map_err(|msg| {
+                    refund(format!(
+                        "output validation failed for tool '{tool_name}': {msg}"
+                    ))
+                })?;
 
                 output
             }

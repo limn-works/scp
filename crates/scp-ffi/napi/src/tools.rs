@@ -359,8 +359,31 @@ pub async fn tool_invoke(
     )
     .map_err(napi::Error::from)?;
 
+    // D4 bypass close: consume a hard-rate-limit token BEFORE any
+    // bridge-side tool dispatch. Mirrors `py_tool_invoke` in the
+    // PyO3 bridge. The NAPI tool-dispatch path owns its own
+    // `tool_handlers` map, so it does NOT go through
+    // `ContextManager::invoke_tool_with_economy`; without this hook
+    // a member rate-limited on `send_message` could still burn
+    // relay capacity via `tool_invoke`.
+    let invoker_did_typed: scp_primitives::DID = identity_did.clone().into();
+    let now_secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let manager = crate::runtime::context_manager()?;
+    if !manager.try_consume_hard_rate_limit_blocking(&context_id, &invoker_did_typed, now_secs) {
+        return Err(ScpNapiError::Tool {
+            message:
+                "SCP-ECON-7090: rate limit exceeded on tool_invoke: hard rate limit exceeded for invoker"
+                    .to_owned(),
+            code: "SCP-ECON-7090".to_owned(),
+        }
+        .into());
+    }
+
     // Validate tool existence, input schema, and dispatch (matching PyO3 pattern).
-    let output_json = crate::runtime::with_context(&context_id, |rt| {
+    let output_json = match crate::runtime::with_context(&context_id, |rt| {
         let registration = rt
             .tool_registry
             .get(&tool_id)
@@ -416,10 +439,22 @@ pub async fn tool_invoke(
         };
 
         Ok(output)
-    })
-    .map_err(napi::Error::from)?;
+    }) {
+        Ok(out) => out,
+        Err(e) => {
+            // Refund the hard-rate-limit token so a rejected dispatch
+            // does not permanently burn bucket capacity.
+            manager.refund_hard_rate_limit_blocking(&context_id, &invoker_did_typed);
+            return Err(napi::Error::from(e));
+        }
+    };
 
     serde_json::to_string(&output_json).map_err(|e| {
+        // Serialization failure after the tool dispatched successfully
+        // still charges the token — the dispatch was completed, only
+        // the outbound serialization is failing. Matches the D4
+        // manager-path invariant that only pre-execution failures
+        // refund.
         napi::Error::from(ScpNapiError::Tool {
             message: format!("failed to serialize tool output: {e}"),
             code: "SCP-TOOL-6002".to_owned(),

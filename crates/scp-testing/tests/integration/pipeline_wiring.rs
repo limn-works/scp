@@ -50,7 +50,7 @@ const WASM_CONSEQUENCE_SRC: &str =
 // RATCHET CONSTANTS — may only increase
 // Any decrease requires human approval
 // =========================================================================
-const MIN_ACTIVE_PIPELINE_ASSERTIONS: usize = 28;
+const MIN_ACTIVE_PIPELINE_ASSERTIONS: usize = 30;
 
 // ---------------------------------------------------------------------------
 // Function body extraction — brace-matching parser
@@ -448,6 +448,41 @@ fn invoke_tool_with_economy_wires_escalation_and_rollback() {
         fn_body_contains(MANAGER_SRC, "invoke_tool_with_economy", ".rollback("),
         "invoke_tool_with_economy must roll back the velocity entry on failure \
          via the F5 identity-based `rollback(token)` API"
+    );
+}
+
+/// D4: `invoke_tool_with_economy` must reference the hard rate limit.
+/// Enforced structurally so a future refactor cannot silently drop
+/// the Matrix Synapse–style defense-in-depth cap on the tool path.
+#[test]
+fn invoke_tool_with_economy_enforces_hard_rate_limit() {
+    assert!(
+        fn_body_contains(MANAGER_SRC, "invoke_tool_with_economy", "hard_rate_limit"),
+        "invoke_tool_with_economy must reference hard_rate_limit so the Matrix Synapse–style \
+         defense-in-depth cap is enforced on the tool path (D4)"
+    );
+    assert!(
+        fn_body_contains(MANAGER_SRC, "invoke_tool_with_economy", "try_consume"),
+        "invoke_tool_with_economy must call try_consume on the hard rate limit token bucket \
+         before any Phase 1 bookkeeping — mirrors enforce_send_economy at messaging.rs:346"
+    );
+}
+
+/// D4: every Phase 1 failure branch in `invoke_tool_with_economy`
+/// MUST refund the hard rate limit token. We expect at least 3 inline
+/// refund sites: `economy_pre_check` failure, `record_spend` failure,
+/// and `authorize_tool_payment` failure. Dropping any branch leaks a
+/// rate-limit token on failure.
+#[test]
+fn invoke_tool_with_economy_refunds_hard_rate_limit_on_every_phase1_failure() {
+    let body = extract_fn_body(MANAGER_SRC, "invoke_tool_with_economy")
+        .expect("invoke_tool_with_economy body must exist");
+    let refund_sites = body.matches("hard_rate_limit.refund").count();
+    assert!(
+        refund_sites >= 3,
+        "invoke_tool_with_economy must have at least 3 inline hard_rate_limit.refund sites \
+         (economy_pre_check failure, record_spend failure, authorize_tool_payment failure); \
+         found {refund_sites}. Dropping any branch leaks a rate-limit token on failure."
     );
 }
 

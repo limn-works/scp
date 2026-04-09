@@ -2723,19 +2723,25 @@ impl WasmContextManager {
                 for cap in capabilities {
                     entry.insert(Self::capability_to_ucan_format(&cap.name()));
                 }
-                // Emit WriteAccessRevoked if write was suspended.
-                if capabilities
-                    .iter()
-                    .any(|c| matches!(c, scp_protocol::context::roles::Capability::MessagesWrite))
-                {
-                    ctx.push_event(ContextEvent::WriteAccessRevoked { did: did.clone() });
-                }
-                if capabilities
-                    .iter()
-                    .any(|c| matches!(c, scp_protocol::context::roles::Capability::MessagesRead))
-                {
-                    ctx.push_event(ContextEvent::ReadAccessRevoked { did: did.clone() });
-                }
+                // Emit a capability-precise suspension event that
+                // carries the exact suspended set — mirrors the
+                // runtime bridge (`execute_suspend_member` in
+                // `crates/scp-runtime/src/context/manager/governance.rs`)
+                // which landed B4 in commit d1b71203.
+                //
+                // Previously this path emitted `WriteAccessRevoked`
+                // only when the set included `MessagesWrite` and
+                // `ReadAccessRevoked` only when it included
+                // `MessagesRead` — a suspension of e.g. only
+                // `GovernanceVote` would silently emit nothing, and
+                // `WriteAccessRevoked` is semantically wrong for any
+                // non-write suspension. Cross-SDK parity requires
+                // both the native manager and the WASM bridge to
+                // emit `CapabilitiesSuspended` with the full set.
+                ctx.push_event(ContextEvent::CapabilitiesSuspended {
+                    did: did.clone(),
+                    capabilities: capabilities.clone(),
+                });
                 Ok(serde_json::json!({"action": "SuspendMember", "did": did_str}))
             }
             GovernanceAction::Revoke { did, access } => {
