@@ -803,22 +803,63 @@ impl ContextProvider for FfiBridgeProvider {
         // burn relay capacity via tool invocations regardless of the
         // per-context rate limit. Matches the pattern in
         // `py_tool_invoke` / NAPI `tool_invoke` / UniFFI `tool_invoke`.
+        //
+        // SYNC-IN-ASYNC caveat (bug-catcher Round 2 finding): this
+        // trait method is sync, but its callers (`py_mcp_serve`
+        // stdio loop via `rt.spawn(async move ...)` and the SSE
+        // async handler) invoke it from inside a tokio runtime. The
+        // `_blocking` helper would panic because
+        // `tokio::sync::Mutex::blocking_lock` rejects calls from
+        // within an async context.
+        //
+        // We detect the context via `Handle::try_current()`:
+        //   - Inside an async runtime → use `block_in_place` +
+        //     `Handle::current().block_on(async helper)`. Requires
+        //     multi-thread runtime (production MCP servers deploy
+        //     multi-thread via `crates/scp-ffi/src/lib.rs:131-145`).
+        //   - Outside an async runtime (unit tests exercising the
+        //     `FfiBridgeProvider::invoke_tool` trait method
+        //     directly from a sync `#[test]`) → use the `_blocking`
+        //     variant, which is safe when no runtime is present.
+        //
+        // This dual-path preserves both the production correctness
+        // fix AND the existing sync test harness.
         let invoker_did_typed: scp_primitives::DID = agent_did.clone().into();
         let now_secs = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs())
             .unwrap_or(0);
         let manager = crate::runtime::context_manager().map_err(|e| format!("{e}"))?;
-        if !manager.try_consume_hard_rate_limit_blocking(context_id, &invoker_did_typed, now_secs) {
+        let consumed = if tokio::runtime::Handle::try_current().is_ok() {
+            tokio::task::block_in_place(|| {
+                tokio::runtime::Handle::current().block_on(manager.try_consume_hard_rate_limit(
+                    context_id,
+                    &invoker_did_typed,
+                    now_secs,
+                ))
+            })
+        } else {
+            manager.try_consume_hard_rate_limit_blocking(context_id, &invoker_did_typed, now_secs)
+        };
+        if !consumed {
             return Err("SCP-ECON-7090: rate limit exceeded on tool_invoke: \
                         hard rate limit exceeded for invoker"
                 .to_owned());
         }
         // Helper that refunds the token on any failure path. Used by
-        // every `return Err` below.
+        // every `return Err` below. Same dual-path sync-in-async
+        // bridging as the consume call above.
         let ctx_id_for_refund = context_id.to_owned();
         let refund = |e: String| -> String {
-            manager.refund_hard_rate_limit_blocking(&ctx_id_for_refund, &invoker_did_typed);
+            if tokio::runtime::Handle::try_current().is_ok() {
+                tokio::task::block_in_place(|| {
+                    tokio::runtime::Handle::current().block_on(
+                        manager.refund_hard_rate_limit(&ctx_id_for_refund, &invoker_did_typed),
+                    );
+                });
+            } else {
+                manager.refund_hard_rate_limit_blocking(&ctx_id_for_refund, &invoker_did_typed);
+            }
             e
         };
 
