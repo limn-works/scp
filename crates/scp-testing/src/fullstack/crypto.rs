@@ -988,9 +988,13 @@ impl ContextCryptoProvider for E2eCryptoProvider {
                 plaintext: mls_decrypted,
                 sender_did,
             } => {
-                let magic = &scp_core::context::builder::MANAGEMENT_MSG_MAGIC;
-                if mls_decrypted.len() >= magic.len() && mls_decrypted[..magic.len()] == *magic {
-                    let mgmt_slice = &mls_decrypted[magic.len()..];
+                // Per spec §9.16.1 "Management prefix exclusivity", the
+                // SCPM_MAGIC check lives in exactly one place — the shared
+                // helper in scp-protocol (re-exported via scp-core). Do not
+                // re-implement the prefix check inline.
+                if let Some(mgmt_slice) =
+                    scp_core::context::builder::try_strip_management_prefix(&mls_decrypted)
+                {
                     // Management payload size limit — mirrors MlsCryptoProvider.
                     if mgmt_slice.len() > scp_core::context::MAX_MANAGEMENT_PAYLOAD_SIZE {
                         return Err(ContextError::CryptoFailed(
