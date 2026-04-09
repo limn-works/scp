@@ -43,7 +43,7 @@ const PROVIDER_SRC: &str =
 // RATCHET CONSTANTS — may only increase
 // Any decrease requires human approval
 // =========================================================================
-const MIN_ACTIVE_PIPELINE_ASSERTIONS: usize = 24;
+const MIN_ACTIVE_PIPELINE_ASSERTIONS: usize = 25;
 
 // ---------------------------------------------------------------------------
 // Function body extraction — brace-matching parser
@@ -404,19 +404,11 @@ fn governance_enforces_economic_policy() {
         "enforce_economy must take EnforceEconomyRequest (F9 refactor)"
     );
     assert!(
-        fn_body_contains(
-            MANAGER_SRC,
-            "enforce_send_economy",
-            "EnforceEconomyRequest"
-        ),
+        fn_body_contains(MANAGER_SRC, "enforce_send_economy", "EnforceEconomyRequest"),
         "enforce_send_economy must construct EnforceEconomyRequest"
     );
     assert!(
-        fn_body_contains(
-            MANAGER_SRC,
-            "enforce_join_economy",
-            "EnforceEconomyRequest"
-        ),
+        fn_body_contains(MANAGER_SRC, "enforce_join_economy", "EnforceEconomyRequest"),
         "enforce_join_economy must construct EnforceEconomyRequest"
     );
 }
@@ -449,6 +441,41 @@ fn invoke_tool_with_economy_wires_escalation_and_rollback() {
         fn_body_contains(MANAGER_SRC, "invoke_tool_with_economy", ".rollback("),
         "invoke_tool_with_economy must roll back the velocity entry on failure \
          via the F5 identity-based `rollback(token)` API"
+    );
+}
+
+#[test]
+fn invoke_tool_with_economy_releases_lock_before_executor() {
+    // F1-F3 lock-split invariant: the caller-supplied executor must run
+    // WITHOUT holding the `ContextManager.contexts` mutex. The wrapper
+    // must explicitly release the Phase-1 lock before dispatching the
+    // executor. A mis-behaving tool executor blocked every concurrent
+    // manager call until this refactor landed; regressions here reintroduce
+    // a process-wide stall bug.
+    //
+    // We assert:
+    //   (1) The function body contains an explicit `drop(contexts)` call.
+    //       This is the exit boundary of Phase 1.
+    //   (2) The function body acquires `self.contexts.lock()` at least
+    //       twice — once in Phase 1 (pre-check / record_spend / escrow
+    //       authorize) and once in Phase 3 (post-invocation bookkeeping).
+    //       A single lock acquisition would imply the lock is held across
+    //       the executor future.
+    assert!(
+        fn_body_contains(MANAGER_SRC, "invoke_tool_with_economy", "drop(contexts)"),
+        "invoke_tool_with_economy must explicitly drop(contexts) between Phase 1 \
+         (economy pre-check / escrow authorize) and Phase 2 (executor) so the \
+         `contexts` mutex is not held across the caller-supplied executor future"
+    );
+    // Count lock acquisitions via substring match inside the function body.
+    let body = extract_fn_body(MANAGER_SRC, "invoke_tool_with_economy")
+        .expect("invoke_tool_with_economy body must exist");
+    let lock_acquisitions = body.matches("self.contexts.lock().await").count();
+    assert!(
+        lock_acquisitions >= 2,
+        "invoke_tool_with_economy must acquire self.contexts.lock().await at \
+         least twice (Phase 1 + Phase 3), found {lock_acquisitions}. A single \
+         acquisition implies the executor runs while the lock is held."
     );
 }
 
