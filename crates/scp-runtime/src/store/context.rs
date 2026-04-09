@@ -1755,6 +1755,7 @@ mod tests {
             message_pricing: None,
             hard_rate_limit_config: None,
             hard_rate_limit_state: std::collections::HashMap::new(),
+            spending_nonce_tracker_state: std::collections::HashMap::new(),
         }
     }
 

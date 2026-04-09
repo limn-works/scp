@@ -341,6 +341,44 @@ impl SenderKeyStore {
             .unwrap_or(0)
     }
 
+    /// Exports the per-sender epoch high-water map for a given context as
+    /// a `(sender_did, epoch)` list. Used by the crypto-provider snapshot
+    /// path to persist the map so the `#1608` rollback-protection
+    /// invariant (`set_checked` rejects epoch regressions) survives a
+    /// restart. Returns an empty vector when the context has no entries.
+    #[must_use]
+    pub fn epochs_for_context(&self, context_id: &str) -> Vec<(String, u64)> {
+        self.epochs
+            .get(context_id)
+            .map(|inner| {
+                inner
+                    .iter()
+                    .map(|(did, &epoch)| (did.clone(), epoch))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// Restores a previously-observed epoch high-water mark for a
+    /// `(context_id, sender_did)` pair without enforcing monotonicity.
+    ///
+    /// Used exclusively by the crypto-provider snapshot restore path to
+    /// repopulate the epoch map from a persisted snapshot — the restored
+    /// values ARE the authoritative high-water marks, so `set_checked`
+    /// must not reject them. After restore, subsequent [`set_checked`]
+    /// calls continue to enforce monotonicity against the restored
+    /// values.
+    ///
+    /// This method does NOT touch the `keys` map — the matching
+    /// [`set_unchecked`] or [`set_checked`] call is still required to
+    /// install the key material itself.
+    pub fn restore_epoch_high_water(&mut self, context_id: &str, sender_did: &str, epoch: u64) {
+        self.epochs
+            .entry(context_id.to_owned())
+            .or_default()
+            .insert(sender_did.to_owned(), epoch);
+    }
+
     /// Removes the sender key for a given context and sender DID.
     ///
     /// Returns the removed key if it existed, or `None` otherwise.

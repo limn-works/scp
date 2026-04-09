@@ -372,10 +372,12 @@ impl ContextManager {
                 velocity_tracker: validated_velocity_tracker,
                 participation_cache: ctx_snapshot.participation_cache,
                 cooldown_until: ctx_snapshot.cooldown_until,
-                spending_nonce_tracker: scp_protocol::crypto::ucan::nonce::NonceTracker::new(
-                    context_id.to_owned(),
-                    Arc::clone(&self.clock),
-                ),
+                spending_nonce_tracker:
+                    scp_protocol::crypto::ucan::nonce::NonceTracker::from_snapshot(
+                        context_id.to_owned(),
+                        Arc::clone(&self.clock),
+                        ctx_snapshot.spending_nonce_tracker_state,
+                    ),
                 proposal_timestamps: ctx_snapshot.proposal_timestamps,
             },
             role_state: ctx_snapshot.role_state,
@@ -937,10 +939,12 @@ impl ContextManager {
                 velocity_tracker: validated_velocity_tracker,
                 participation_cache: export.snapshot.participation_cache,
                 cooldown_until: export.snapshot.cooldown_until,
-                spending_nonce_tracker: scp_protocol::crypto::ucan::nonce::NonceTracker::new(
-                    context_id.clone(),
-                    Arc::clone(&self.clock),
-                ),
+                spending_nonce_tracker:
+                    scp_protocol::crypto::ucan::nonce::NonceTracker::from_snapshot(
+                        context_id.clone(),
+                        Arc::clone(&self.clock),
+                        export.snapshot.spending_nonce_tracker_state,
+                    ),
                 proposal_timestamps: export.snapshot.proposal_timestamps,
             },
             epoch: EpochState {
