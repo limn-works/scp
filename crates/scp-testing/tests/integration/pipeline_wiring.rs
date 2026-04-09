@@ -39,11 +39,18 @@ const MANAGER_SRC: &str = concat!(
 const PROVIDER_SRC: &str =
     include_str!("../../../../crates/scp-runtime/src/crypto/mls/provider.rs");
 
+// WASM bridge sources. Bridge has its own consequence-dispatch path and is
+// asserted separately below — scp-runtime and scp-ffi-wasm are two parallel
+// implementations of the same protocol and both must honor the wiring.
+const WASM_MANAGER_SRC: &str = include_str!("../../../../crates/scp-ffi/wasm/src/manager.rs");
+const WASM_CONSEQUENCE_SRC: &str =
+    include_str!("../../../../crates/scp-ffi/wasm/src/consequence.rs");
+
 // =========================================================================
 // RATCHET CONSTANTS — may only increase
 // Any decrease requires human approval
 // =========================================================================
-const MIN_ACTIVE_PIPELINE_ASSERTIONS: usize = 25;
+const MIN_ACTIVE_PIPELINE_ASSERTIONS: usize = 28;
 
 // ---------------------------------------------------------------------------
 // Function body extraction — brace-matching parser
@@ -487,6 +494,58 @@ fn rotate_content_keys_calls_propose_update() {
         fn_body_contains(MANAGER_SRC, "execute_rotate_content_keys", "advance_epoch")
             || fn_body_contains(MANAGER_SRC, "execute_rotate_content_keys", "propose_update"),
         "execute_rotate_content_keys must call advance_epoch or propose_update for encrypted mode MLS rotation"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// WASM bridge: consequence dispatch wiring
+//
+// The WASM bridge (scp-ffi-wasm) is a parallel implementation of consequence
+// rule enforcement to the scp-runtime path. Both must dispatch consequences at
+// every mutation site the plan identifies so rate- and participation-based
+// rules fire on either bridge. These assertions catch the wiring regression
+// (observed historically as "consequence rules declared but never enforced in
+// WASM") by structurally verifying the dispatch call sites on the WASM manager
+// and the delegation from the dispatcher to the shared scp-protocol evaluator.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn wasm_send_message_dispatches_consequences() {
+    assert!(
+        fn_body_contains(
+            WASM_MANAGER_SRC,
+            "send_message",
+            "dispatch_consequences_for_subject",
+        ),
+        "WASM send_message body must call dispatch_consequences_for_subject \
+         after appending MessageSent so rate-based rules fire on the sender"
+    );
+}
+
+#[test]
+fn wasm_execute_governance_action_dispatches_consequences() {
+    let body = extract_fn_body(WASM_MANAGER_SRC, "execute_governance_action")
+        .expect("WASM execute_governance_action body must exist");
+    let call_count = body.matches("dispatch_consequences_for_subject").count();
+    assert!(
+        call_count >= 2,
+        "WASM execute_governance_action must call dispatch_consequences_for_subject \
+         at least twice (once for the executor DID, once for the action's target \
+         DID); found {call_count}"
+    );
+}
+
+#[test]
+fn wasm_dispatch_consequences_calls_evaluate_consequence_rules() {
+    assert!(
+        fn_body_contains(
+            WASM_CONSEQUENCE_SRC,
+            "dispatch_consequences_for_subject",
+            "evaluate_consequence_rules",
+        ),
+        "WASM dispatch_consequences_for_subject must delegate to the shared \
+         scp-protocol evaluate_consequence_rules function so rule-matching \
+         logic stays consistent between bridges"
     );
 }
 
