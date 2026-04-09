@@ -135,9 +135,24 @@ impl From<scp_identity::IdentityError> for ScpNapiError {
 
 impl From<scp_core::context::ContextError> for ScpNapiError {
     fn from(e: scp_core::context::ContextError) -> Self {
-        Self::Context {
-            message: format!("{e} — verify context state, membership, and permissions"),
-            code: "SCP-CTX-2001".to_owned(),
+        use scp_core::context::ContextError as CE;
+        match &e {
+            // D4: expose canonical rate-limit code programmatically
+            // so TypeScript callers don't have to string-match on
+            // SCP-ECON-7090 inside the message body.
+            CE::RateLimited { .. } => Self::Context {
+                message: format!("{e}"),
+                code: "SCP-ECON-7090".to_owned(),
+            },
+            // §23.17 snapshot import regression.
+            CE::SnapshotFloorRegression { .. } => Self::Context {
+                message: format!("{e}"),
+                code: "SCP-CTX-2091".to_owned(),
+            },
+            _ => Self::Context {
+                message: format!("{e} — verify context state, membership, and permissions"),
+                code: "SCP-CTX-2001".to_owned(),
+            },
         }
     }
 }

@@ -263,12 +263,35 @@ impl From<scp_identity::IdentityError> for ScpPyError {
 }
 
 // Context errors → ScpPyError::ContextError
+//
+// Most ContextError variants map to the generic SCP-CTX-2001 envelope.
+// A few variants carry typed semantics that the Python binding can
+// distinguish programmatically — those are mapped to their canonical
+// error codes so callers can `except ScpError` + `.code` check
+// without string-matching on the message body.
 
 impl From<scp_core::context::ContextError> for ScpPyError {
     fn from(e: scp_core::context::ContextError) -> Self {
-        Self::ContextError {
-            message: format!("{e} — verify context state, membership, and permissions"),
-            code: "SCP-CTX-2001".to_owned(),
+        use scp_core::context::ContextError as CE;
+        match &e {
+            // D4: expose the canonical rate-limit code through the
+            // typed error envelope, not just inside the formatted
+            // message. Without this, Python callers would have to
+            // string-match on `SCP-ECON-7090` embedded in the
+            // message to detect rate-limit rejection.
+            CE::RateLimited { .. } => Self::ContextError {
+                message: format!("{e}"),
+                code: "SCP-ECON-7090".to_owned(),
+            },
+            // §23.17: snapshot import regression rejection.
+            CE::SnapshotFloorRegression { .. } => Self::ContextError {
+                message: format!("{e}"),
+                code: "SCP-CTX-2091".to_owned(),
+            },
+            _ => Self::ContextError {
+                message: format!("{e} — verify context state, membership, and permissions"),
+                code: "SCP-CTX-2001".to_owned(),
+            },
         }
     }
 }

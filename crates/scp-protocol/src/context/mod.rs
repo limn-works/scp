@@ -350,6 +350,32 @@ pub enum ContextError {
         /// Human-readable explanation of the bucket state.
         message: String,
     },
+
+    /// An imported snapshot attempted to regress a per-sender
+    /// monotonic floor (sender-key epoch, spending nonce, etc.)
+    /// relative to the local state. Rejected atomically per spec
+    /// §23.17 invariants 3 and 4 (import max-merge + append-only
+    /// dominance).
+    ///
+    /// `per_sender_deltas` carries every `(sender_did, local_floor,
+    /// incoming_floor)` tuple where `incoming_floor < local_floor`
+    /// so the caller can report the exact divergence. The import is
+    /// rejected WHOLE — no partial merge is applied, matching the
+    /// §23.17 Invariant 3 "reject atomically if any member's floor
+    /// would regress" clause.
+    #[error(
+        "SCP-CTX-2091: snapshot floor regression on {resource}: \
+         {} sender(s) would regress",
+        .per_sender_deltas.len()
+    )]
+    SnapshotFloorRegression {
+        /// Which monotonic resource class the regression applies to:
+        /// `"sender_key_epoch"`, `"spending_nonce"`, etc.
+        resource: String,
+        /// Per-sender `(did, local_floor, incoming_floor)` tuples
+        /// where `incoming_floor < local_floor`.
+        per_sender_deltas: Vec<(String, u64, u64)>,
+    },
 }
 
 // ---------------------------------------------------------------------------
