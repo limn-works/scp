@@ -13033,7 +13033,7 @@ async fn budget_not_deducted_on_transport_failure() {
         let ctx = contexts.get("rollback-ctx").unwrap();
         ctx.governance.budget_tracker.remaining(&sender_did)
     };
-    // Budget was 500, cost is 50. Transport failed → rollback_budget restored it.
+    // Budget was 500, cost is 50. Transport failed → EconomyTicket rollback restored it.
     assert_eq!(
         remaining,
         Amount::new(500),

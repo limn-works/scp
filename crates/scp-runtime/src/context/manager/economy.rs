@@ -379,22 +379,99 @@ pub(super) fn enforce_economy(
     Ok(Some(cost))
 }
 
-/// Rolls back a budget deduction on failure.
+/// Bundle of per-DID economy state that Phase 1 of a paid action took
+/// ownership of. Every ticket **must** be consumed by either
+/// [`commit_economy_ticket`] (success path) or [`rollback_economy_ticket`]
+/// (failure path). Dropping a ticket without consuming it leaks budget
+/// deduction, a velocity entry, and a hard-rate-limit token — the
+/// `#[must_use]` attribute makes this a compile-time warning, and the
+/// `Drop` impl logs + debug-asserts so unit tests fail loudly.
 ///
-/// Used by messaging, lifecycle, and invoke to DRY the budget rollback pattern.
-/// Restores the exact amount previously deducted by `enforce_economy` using
-/// `reverse_spend` (which decrements `spent`) instead of `grant` (which
-/// would inflate the limit). This preserves accurate `total_spent` accounting.
-pub(super) async fn rollback_budget(
+/// F4: this type exists because the previous `send_message` Phase 2 error
+/// path only rolled back the budget, silently leaking the velocity entry
+/// and the hard-rate-limit token. Unifying the rollback under a single
+/// must-use handle prevents that class of bug from recurring when new
+/// error branches are added.
+#[must_use = "EconomyTicket must be committed or rolled back — dropping leaks budget, velocity, and hard-rate-limit state"]
+pub(super) struct EconomyTicket {
+    /// The DID being charged — needed for every rollback operation.
+    pub actor_did: DID,
+    /// The budget amount deducted by [`enforce_economy`] (if any).
+    pub deducted_cost: Option<scp_protocol::economy::types::Amount>,
+    /// Identifier of the velocity entry appended in Phase 1; used to
+    /// roll back the specific entry and not race concurrent senders.
+    pub velocity_token: scp_protocol::economy::antispam::VelocityRollbackToken,
+    /// When `true`, Phase 1 consumed a hard-rate-limit token that must
+    /// be refunded on rollback. `false` only for code paths that did
+    /// not consume a token (e.g., `ContextJoin`).
+    pub needs_hard_rate_limit_refund: bool,
+    /// Set to `true` by `commit`/`rollback` so the `Drop` guard knows
+    /// the caller honored the contract. Visible to the `messaging` /
+    /// `lifecycle` modules that construct the ticket; mutated only via
+    /// the `commit`/`rollback` helpers below.
+    pub(super) consumed: bool,
+}
+
+impl Drop for EconomyTicket {
+    fn drop(&mut self) {
+        if !self.consumed {
+            // Log at error level so a leak is visible in production, and
+            // debug-assert so the next CI run fails loudly.
+            tracing::error!(
+                actor_did = %self.actor_did,
+                cost = ?self.deducted_cost,
+                "EconomyTicket dropped without commit or rollback — budget and velocity state may be inconsistent"
+            );
+            debug_assert!(
+                false,
+                "EconomyTicket dropped without commit or rollback for actor {}",
+                self.actor_did
+            );
+        }
+    }
+}
+
+/// Marks the ticket as committed (success path). Returns the deducted
+/// cost so callers can pass it to the payment capture step.
+///
+/// Call this exactly once per ticket. Dropping the returned
+/// `Option<Amount>` is safe; the budget deduction has already been
+/// recorded under the Phase 1 lock.
+pub(super) fn commit_economy_ticket(
+    mut ticket: EconomyTicket,
+) -> Option<scp_protocol::economy::types::Amount> {
+    ticket.consumed = true;
+    ticket.deducted_cost
+}
+
+/// Rolls back every piece of state the ticket represents: the budget
+/// deduction, the velocity entry (via its rollback token, so we do not
+/// race concurrent senders), and the hard-rate-limit token (when the
+/// Phase 1 path consumed one).
+///
+/// Re-acquires the `contexts` lock internally so this is safe to call
+/// from Phase 2 (off-lock) error paths. If the context has been
+/// deregistered between Phase 1 and rollback (unusual), the rollback
+/// is a best-effort no-op — the ticket is still marked consumed so
+/// the `Drop` guard does not fire.
+pub(super) async fn rollback_economy_ticket(
     manager: &ContextManager,
     context_id: &str,
-    actor_did: &DID,
-    deducted_cost: Option<scp_protocol::economy::types::Amount>,
+    mut ticket: EconomyTicket,
 ) {
-    if let Some(cost) = deducted_cost {
-        let mut contexts = manager.contexts.lock().await;
-        if let Some(ctx) = contexts.get_mut(context_id) {
-            ctx.governance.budget_tracker.reverse_spend(actor_did, cost);
+    ticket.consumed = true;
+    let mut contexts = manager.contexts.lock().await;
+    if let Some(ctx) = contexts.get_mut(context_id) {
+        ctx.governance
+            .velocity_tracker
+            .rollback(&ticket.actor_did, ticket.velocity_token);
+        if ticket.needs_hard_rate_limit_refund {
+            ctx.governance.hard_rate_limit.refund(&ticket.actor_did);
+        }
+        if let Some(cost) = ticket.deducted_cost {
+            ctx.governance
+                .budget_tracker
+                .reverse_spend(&ticket.actor_did, cost);
         }
     }
 }
