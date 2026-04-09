@@ -401,16 +401,39 @@ impl<C: Clock> NonceTracker<C> {
         tracker.prune();
 
         // Defense-in-depth: if a poisoned snapshot somehow exceeded
-        // capacity after pruning, truncate to the capacity bound. We
-        // do this by collecting and taking the first `max_capacity`
-        // entries — the truncation is deterministic once `HashMap` has
-        // stabilized (iteration order is random but the SNAPSHOT is
-        // trusted to be consistent with itself; the attacker only gets
-        // oversized state, not control over which entries are kept).
+        // capacity after pruning, truncate deterministically to the
+        // capacity bound.
+        //
+        // Keep policy: retain the entries with the latest
+        // `token_expiry` (tie-break by latest `first_seen`, then by
+        // nonce string lexicographic order for full determinism).
+        // This is strictly better than `HashMap::drain().take()`'s
+        // non-deterministic iteration:
+        //   - "latest expiry first" keeps the entries most likely
+        //     to still correspond to unexpired tokens, which is the
+        //     only state that still carries anti-replay value.
+        //   - Full determinism eliminates audit ambiguity: two
+        //     instances restoring the same oversized snapshot
+        //     converge to the same surviving set.
+        //
+        // In normal operation this path is unreachable: a tracker
+        // produced by this codebase never exceeds `max_capacity`
+        // (`check_and_record` rejects inserts at capacity), so the
+        // sort cost is only ever paid on a snapshot that was tampered
+        // or corrupted.
         if tracker.seen.len() > max_capacity {
-            let kept: HashMap<String, (u64, u64)> =
-                tracker.seen.drain().take(max_capacity).collect();
-            tracker.seen = kept;
+            let mut all: Vec<(String, (u64, u64))> = tracker.seen.drain().collect();
+            all.sort_by(|a, b| {
+                // Primary: descending token_expiry.
+                b.1.1
+                    .cmp(&a.1.1)
+                    // Secondary: descending first_seen.
+                    .then_with(|| b.1.0.cmp(&a.1.0))
+                    // Tertiary: ascending nonce string for total order.
+                    .then_with(|| a.0.cmp(&b.0))
+            });
+            all.truncate(max_capacity);
+            tracker.seen = all.into_iter().collect();
         }
 
         tracker
