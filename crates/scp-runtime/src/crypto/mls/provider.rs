@@ -107,11 +107,15 @@ struct MlsCryptoSnapshot {
     /// because the fresh in-memory map would have no record of the
     /// higher epoch.
     ///
-    /// MIGRATION: `#[serde(default)]` — old snapshots deserialize with
-    /// an empty map, leaving the epoch high-water mark at zero. In that
-    /// case, restore fills the map from `sender_key_entries` below so
-    /// the floor at least matches the persisted key epoch, preserving
-    /// monotonicity across upgrades.
+    /// MIGRATION: `#[serde(default)]` — legacy snapshots (pre-C1)
+    /// deserialize with an empty vec. `SenderKey` material does not
+    /// carry the epoch it was bound to, so per-sender floors cannot
+    /// be recovered exactly from legacy data. The restore path
+    /// compensates by seeding every sender with a conservative lower
+    /// bound derived from the persisted global `sender_key_epoch`
+    /// counter. This closes the one-shot rollback window that would
+    /// otherwise exist at the first post-upgrade restart. See the
+    /// `had_epoch_map` / `legacy_floor` logic in `restore_crypto_state`.
     #[serde(default)]
     sender_key_epochs: Vec<(String, u64)>,
     /// The sender key epoch counter.
@@ -1438,17 +1442,47 @@ impl ContextCryptoProvider for MlsCryptoProvider {
         // entry (e.g., removed members whose floor was preserved by
         // `SenderKeyStore::remove`) — those entries still matter for
         // rollback protection and must be restored.
+        let had_epoch_map = !snapshot.sender_key_epochs.is_empty();
         for (did, epoch) in snapshot.sender_key_epochs.drain(..) {
             sender_key_store.restore_epoch_high_water(&ctx_id_hex, &did, epoch);
         }
-        // Then install the key material itself. `set_unchecked` bypasses
-        // the monotonicity check because the floor was restored above
-        // and the restored key IS authoritative (it was persisted by
-        // this same provider). Using `set_checked` here would be
-        // rejected for any key whose epoch equals an already-restored
-        // floor.
+
+        // Legacy-snapshot back-compat hardening (cryptographer review
+        // finding, C1 follow-up): pre-C1 snapshots have no
+        // `sender_key_epochs` field, so the map above is empty. If we
+        // installed key material below with `set_unchecked` and left
+        // every floor at 0, the first post-upgrade receive would be
+        // `set_checked(..., epoch=k>0)` and would be accepted against
+        // a zero floor — re-opening the `#1608` rollback window for
+        // exactly one boot cycle.
+        //
+        // `SenderKey` material does not carry the epoch it was bound
+        // to, so we cannot recover per-sender floors exactly. Use the
+        // snapshot's global `sender_key_epoch` counter (which IS
+        // persisted in legacy snapshots) as a conservative lower bound
+        // for every sender we see key material for. This is strictly
+        // tighter than zero and tighter than the provider's current
+        // epoch, and it guarantees the one-shot rollback window is
+        // closed. Senders who were at a strictly higher local floor
+        // than the global counter are the only ones not fully
+        // protected under legacy snapshots, and for those the next
+        // legitimate rotation will advance the floor anyway.
+        let legacy_floor = if had_epoch_map {
+            None
+        } else {
+            Some(snapshot.sender_key_epoch.max(1))
+        };
         for (did, key) in snapshot.sender_key_entries.drain(..) {
+            // Install key material via `set_unchecked` — the restored
+            // key IS authoritative (it was persisted by this same
+            // provider). `set_checked` would be rejected when the
+            // restored key's epoch equals an already-restored floor.
             sender_key_store.set_unchecked(&ctx_id_hex, &did, key);
+            // Legacy-path only: seed a floor from the global
+            // `sender_key_epoch` if no per-sender map was persisted.
+            if let Some(floor) = legacy_floor {
+                sender_key_store.restore_epoch_high_water(&ctx_id_hex, &did, floor);
+            }
         }
 
         // Reconstruct member wrapping keys.
@@ -2683,10 +2717,18 @@ mod tests {
     }
 
     #[test]
-    fn restore_tolerates_legacy_snapshot_without_epoch_map() {
+    fn restore_tolerates_legacy_snapshot_with_seeded_floor() {
         // Back-compat: a snapshot serialized before `sender_key_epochs`
-        // was persisted must still deserialize cleanly and produce a
-        // working crypto state, with the floor defaulting to zero.
+        // was persisted must still deserialize cleanly AND must close
+        // the one-shot rollback window that would otherwise exist at
+        // the first post-upgrade restart.
+        //
+        // Without the legacy-floor seed, restoring would leave every
+        // per-sender floor at 0, so a captured pre-upgrade epoch=k>0
+        // distribution could be replayed through `set_checked` against
+        // a zero floor. The fix seeds every restored sender with the
+        // global `sender_key_epoch` counter (which IS persisted in
+        // legacy snapshots) as a conservative lower bound.
         //
         // We simulate a legacy snapshot by clearing the new field from
         // the freshly-exported snapshot and re-serializing it, which
@@ -2702,6 +2744,9 @@ mod tests {
         {
             let mut contexts = provider.contexts.lock().unwrap();
             let state = contexts.get_mut(&ctx_id).unwrap();
+            // Set a non-trivial global sender_key_epoch so we can verify
+            // the legacy seed uses it.
+            state.sender_key_epoch = 7;
             state
                 .sender_key_store
                 .set_unchecked(&ctx_id_hex, bob_did, generate_sender_key());
@@ -2718,21 +2763,80 @@ mod tests {
             .restore_crypto_state(&ctx_id, &legacy_bytes)
             .expect("legacy snapshot (empty epoch map) must restore cleanly");
 
-        // Since the legacy snapshot had no epoch map, the floor is 0
-        // and a fresh set_checked at epoch 1 is the baseline.
+        // The legacy snapshot had no per-sender epoch map, so the
+        // restore path seeds every sender with the global
+        // `sender_key_epoch` counter as a conservative lower bound.
+        // This closes the one-shot rollback window.
         {
             let mut contexts = provider2.contexts.lock().unwrap();
             let state = contexts.get_mut(&ctx_id).unwrap();
             assert_eq!(
                 state.sender_key_store.epoch(&ctx_id_hex, bob_did),
-                0,
-                "legacy restore yields floor of 0 for senders without prior epochs"
+                7,
+                "legacy restore must seed per-sender floor from the global sender_key_epoch \
+                 counter (= 7 in this fixture), not leave it at zero"
             );
+            // Replay of epoch <= 7 must be rejected — the one-shot
+            // window is closed.
+            let err = state
+                .sender_key_store
+                .set_checked(&ctx_id_hex, bob_did, generate_sender_key(), 7)
+                .expect_err("same-epoch replay must be rejected under legacy seed");
+            assert!(matches!(err, SenderKeyError::EpochNotMonotonic { .. }));
+            let err = state
+                .sender_key_store
+                .set_checked(&ctx_id_hex, bob_did, generate_sender_key(), 3)
+                .expect_err("older-epoch replay must be rejected under legacy seed");
+            assert!(matches!(err, SenderKeyError::EpochNotMonotonic { .. }));
+            // Legitimate rotation above the seeded floor is accepted.
             state
                 .sender_key_store
-                .set_checked(&ctx_id_hex, bob_did, generate_sender_key(), 1)
-                .expect("legacy floor allows a first checked epoch of 1");
+                .set_checked(&ctx_id_hex, bob_did, generate_sender_key(), 8)
+                .expect("post-seed rotation at epoch 8 must succeed");
         }
+    }
+
+    #[test]
+    fn restore_legacy_snapshot_with_zero_global_epoch_seeds_floor_to_one() {
+        // Edge case of the legacy-floor seed: if the legacy snapshot's
+        // global `sender_key_epoch` is 0 (brand-new context, never
+        // rotated), the seed must still be at least 1 so that
+        // `set_checked` rejects an incoming epoch=0 (which would fail
+        // the `epoch > current_epoch` guard regardless, but we want
+        // the floor to be explicit rather than implicit).
+        let provider = make_provider();
+        let ctx_id = make_context_id();
+        provider.create_mls_group(&ctx_id).unwrap();
+        provider.generate_sender_key(&ctx_id).unwrap();
+
+        let bob_did = "did:dht:z6MkBobBobBobBobBobBobBobBobBobBobBobBobBo";
+        let ctx_id_hex = hex::encode(ctx_id);
+        {
+            let mut contexts = provider.contexts.lock().unwrap();
+            let state = contexts.get_mut(&ctx_id).unwrap();
+            state.sender_key_epoch = 0;
+            state
+                .sender_key_store
+                .set_unchecked(&ctx_id_hex, bob_did, generate_sender_key());
+        }
+
+        let exported = provider.export_crypto_state(&ctx_id).unwrap();
+        let mut snapshot: MlsCryptoSnapshot = rmp_serde::from_slice(&exported).unwrap();
+        snapshot.sender_key_epochs.clear();
+        let legacy_bytes = rmp_serde::to_vec_named(&snapshot).unwrap();
+
+        let provider2 = MlsCryptoProvider::new(TEST_DID.to_string());
+        provider2
+            .restore_crypto_state(&ctx_id, &legacy_bytes)
+            .unwrap();
+
+        let contexts = provider2.contexts.lock().unwrap();
+        let state = contexts.get(&ctx_id).unwrap();
+        assert_eq!(
+            state.sender_key_store.epoch(&ctx_id_hex, bob_did),
+            1,
+            "legacy seed must clamp to at least 1 when global counter is 0"
+        );
     }
 
     #[test]
