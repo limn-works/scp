@@ -339,34 +339,46 @@ impl SpendingCapability {
 }
 
 // ---------------------------------------------------------------------------
-// AND-composition check
+// Spending capability check — the spending side of AND-composition
 // ---------------------------------------------------------------------------
 
-/// Validates AND-composition of action and spending UCANs (spec section 19.5).
+/// Validates the spending side of the AND-composition required by spec §19.5.
 ///
-/// A paid action requires BOTH the action capability (e.g., `messages:write`)
-/// AND a valid `SpendingCapability`. An agent with one but not the other
-/// cannot perform the paid action.
+/// Per spec §19.5, a paid action requires BOTH (a) an action capability
+/// (e.g., `messages:write`, `tool:invoke:*`, or a context-defined custom
+/// capability) AND (b) a valid `SpendingCapability`. The check is split
+/// across two layers of the runtime on purpose:
 ///
-/// When a spending UCAN is present, this function extracts the
-/// `SpendingCapability` from its `fct` field and validates:
-/// 1. `action_cost <= max_per_action`
-/// 2. Currency matches `context_currency` (when provided)
+/// 1. **Action capability** — verified UPSTREAM at the capability gate via
+///    `ContextRoleState::member_has_capability`. See the `MessagesWrite`
+///    check in `scp-runtime/src/context/manager/messaging.rs` (send path),
+///    and the `ToolInvoke` / `ToolInvokeAll` check in
+///    `scp-runtime/src/context/tools/invoke.rs` (tool path). A member whose
+///    role does not grant the required capability is rejected at the gate,
+///    before this function is ever called.
+///
+/// 2. **Spending capability** — verified HERE. When a spending UCAN is
+///    present, this function extracts the `SpendingCapability` from its
+///    `fct` field and validates:
+///    - `action_cost <= max_per_action`
+///    - The `SpendingCapability` structure is well-formed
+///    - Currency matches `context_currency` (via
+///      [`check_spending_capability_with_currency`])
+///
+/// This function deliberately does not accept an action UCAN. Delegated
+/// action UCANs are not currently wired end-to-end through the runtime;
+/// if added in the future, their validation belongs at the gate layer
+/// alongside the existing role-based capability checks, not here.
 ///
 /// Cumulative `max_total` enforcement within the `time_window` is the
 /// responsibility of the caller's `BudgetTracker`, which maintains rolling
-/// spend records. This function validates the per-action limit and
-/// structural correctness.
+/// spend records. This function validates the per-action structural limit
+/// only.
 ///
 /// # Arguments
 ///
-/// * `action_ucan` — The action UCAN (e.g., for `messages:write`). `None`
-///   means the action capability was already verified earlier in the flow
-///   (e.g., by a capability check before this function was called). When
-///   `None` and the spending UCAN is present, the spending UCAN is
-///   validated on its own.
 /// * `spending_ucan` — The spending UCAN. `None` if the agent has no
-///   spending capability.
+///   spending capability. MUST be `Some` for paid actions (`action_cost > 0`).
 /// * `action_cost` — The cost of the action. `Amount::ZERO` for free actions.
 /// * `action_description` — Human-readable description for error messages.
 ///
@@ -376,19 +388,11 @@ impl SpendingCapability {
 /// non-zero cost and no spending UCAN is provided.
 /// Returns [`SpendingError::PerActionLimitExceeded`] if `action_cost`
 /// exceeds `max_per_action` from the spending capability.
-/// Returns [`SpendingError::CurrencyMismatch`] if `context_currency` is
-/// provided and does not match the spending capability's currency.
-pub fn check_and_composition(
-    action_ucan: Option<&UcanToken>,
+pub fn check_spending_capability(
     spending_ucan: Option<&UcanToken>,
     action_cost: Amount,
     action_description: &str,
 ) -> Result<(), SpendingError> {
-    // action_ucan is accepted for API compatibility but not inspected here.
-    // The caller has already verified the action capability before invoking
-    // this AND-composition check; this function validates spending only.
-    let _ = action_ucan;
-
     // Spending UCAN is required only for paid actions (cost > 0).
     if action_cost.0 > 0 && spending_ucan.is_none() {
         return Err(SpendingError::SpendingCapabilityRequired(format!(
@@ -422,9 +426,9 @@ pub fn check_and_composition(
     Ok(())
 }
 
-/// Extended AND-composition check with currency validation.
+/// Extended spending-capability check with currency validation.
 ///
-/// Like [`check_and_composition`] but also verifies that the spending
+/// Like [`check_spending_capability`] but also verifies that the spending
 /// capability's currency matches the context's economic policy currency.
 ///
 /// # Arguments
@@ -434,18 +438,19 @@ pub fn check_and_composition(
 ///
 /// # Errors
 ///
-/// Returns [`SpendingError`] if the AND-composition check fails or
+/// Returns [`SpendingError`] if the spending-capability check fails or
 /// if the spending UCAN's currency does not match the context currency.
 ///
-/// See [`check_and_composition`] for other arguments and errors.
-pub fn check_and_composition_with_currency(
-    action_ucan: Option<&UcanToken>,
+/// See [`check_spending_capability`] for other arguments and errors, and
+/// for the layer-split rationale (action-capability verification is the
+/// caller's responsibility at the gate layer).
+pub fn check_spending_capability_with_currency(
     spending_ucan: Option<&UcanToken>,
     action_cost: Amount,
     action_description: &str,
     context_currency: Option<CurrencyCode>,
 ) -> Result<(), SpendingError> {
-    check_and_composition(action_ucan, spending_ucan, action_cost, action_description)?;
+    check_spending_capability(spending_ucan, action_cost, action_description)?;
 
     // Currency validation: when the context has a currency, the spending
     // UCAN must use the same currency.
@@ -1134,26 +1139,8 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // AND-composition
+    // Spending capability check
     // -----------------------------------------------------------------------
-
-    fn dummy_token() -> UcanToken {
-        UcanToken {
-            header: super::super::UcanHeader::new(),
-            payload: UcanPayload {
-                iss: "did:dht:z6MkHuman".to_owned(),
-                aud: "did:dht:z6MkAgent".to_owned(),
-                exp: 1_700_000_000,
-                nbf: None,
-                nnc: "1699999000000-aabbccdd11223344".to_owned(),
-                att: vec![],
-                prf: vec![],
-                fct: None,
-            },
-            signature: vec![0u8; 64],
-            encoded: String::new(),
-        }
-    }
 
     /// Dummy token with a valid `SpendingCapability` in the fct field.
     fn dummy_spending_token() -> UcanToken {
@@ -1181,51 +1168,28 @@ mod tests {
     }
 
     #[test]
-    fn and_composition_both_present_paid_action() {
-        let action = dummy_token();
+    fn check_spending_capability_paid_action_with_spending_succeeds() {
+        // Action capability is assumed verified at the gate layer per §19.5
+        // (see docstring). With a valid spending UCAN and cost within
+        // max_per_action, the check succeeds.
         let spending = dummy_spending_token();
-        let result =
-            check_and_composition(Some(&action), Some(&spending), Amount(100), "send message");
+        let result = check_spending_capability(Some(&spending), Amount(100), "send message");
         assert!(result.is_ok());
     }
 
     #[test]
-    fn and_composition_free_action_no_spending() {
-        let action = dummy_token();
-        let result = check_and_composition(Some(&action), None, Amount::ZERO, "send free message");
+    fn check_spending_capability_free_action_no_spending_succeeds() {
+        // Free actions (cost == 0) pass without any spending UCAN.
+        let result = check_spending_capability(None, Amount::ZERO, "send free message");
         assert!(result.is_ok());
     }
 
     #[test]
-    fn and_composition_paid_action_no_spending() {
-        let action = dummy_token();
-        let result = check_and_composition(Some(&action), None, Amount(100), "send message");
+    fn check_spending_capability_paid_action_no_spending_rejected() {
+        // Paid action (cost > 0) with no spending UCAN must be rejected.
+        let result = check_spending_capability(None, Amount(100), "send message");
         let err = result.unwrap_err();
         assert!(matches!(err, SpendingError::SpendingCapabilityRequired(_)));
-    }
-
-    #[test]
-    fn and_composition_no_action_ucan_with_spending() {
-        // action_ucan=None means "already verified". With a valid spending
-        // UCAN, paid actions should succeed.
-        let spending = dummy_spending_token();
-        let result = check_and_composition(None, Some(&spending), Amount(100), "send message");
-        assert!(result.is_ok());
-    }
-
-    #[test]
-    fn and_composition_no_action_no_spending_paid() {
-        // Paid action with no spending UCAN should fail.
-        let result = check_and_composition(None, None, Amount(100), "send message");
-        let err = result.unwrap_err();
-        assert!(matches!(err, SpendingError::SpendingCapabilityRequired(_)));
-    }
-
-    #[test]
-    fn and_composition_no_action_no_spending_free() {
-        // Free action with no UCANs should succeed.
-        let result = check_and_composition(None, None, Amount::ZERO, "free action");
-        assert!(result.is_ok());
     }
 
     // -----------------------------------------------------------------------

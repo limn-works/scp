@@ -76,7 +76,7 @@ pub(super) async fn test_custody_from_seed(
 /// UCAN to pass the AND-composition gate (spec §19.5, #1593).
 ///
 /// This token is structurally valid but not cryptographically signed.
-/// `check_and_composition` extracts `SpendingCapability` from the `fct`
+/// `check_spending_capability` extracts `SpendingCapability` from the `fct`
 /// field and validates `action_cost <= max_per_action` and currency match.
 /// The default capability grants up to `u64::MAX` per action in USD —
 /// effectively unlimited, since most tests only care about the UCAN's

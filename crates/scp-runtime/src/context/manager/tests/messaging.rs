@@ -1802,7 +1802,6 @@ async fn tool_invoke_escalation_via_managed_wrapper() {
             &ToolId::from("echo"),
             serde_json::json!({}),
             &"did:key:invoker".into(),
-            None,
             Some(&ucan),
             None,
             |_input| async { Ok(serde_json::json!({})) },
