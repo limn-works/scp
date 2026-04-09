@@ -1550,9 +1550,10 @@ impl ContextManager {
                 .hard_rate_limit
                 .try_consume(&member_did, now_secs)
             {
-                return Err(ContextError::PermissionDenied(
-                    "SCP-ECON-7090: hard rate limit exceeded for joiner".to_owned(),
-                ));
+                return Err(ContextError::RateLimited {
+                    resource: "join".to_owned(),
+                    message: "hard rate limit exceeded for joiner".to_owned(),
+                });
             }
             // Record the join in the velocity tracker so subsequent §19.7
             // escalation observes the same activity surface as message sends.

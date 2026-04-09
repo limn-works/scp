@@ -918,6 +918,11 @@ impl ContextManager {
                     .await?;
                 Ok(GovernanceActionResult::Executed)
             }
+            GovernanceAction::ModifyHardRateLimit { new_config } => {
+                self.execute_modify_hard_rate_limit(context_id, new_config, pid, actor)
+                    .await?;
+                Ok(GovernanceActionResult::Executed)
+            }
             // Remaining actions dispatched to context-level handler.
             GovernanceAction::AddMember { .. }
             | GovernanceAction::Eject { .. }
@@ -1049,7 +1054,8 @@ impl ContextManager {
                     .await
             }
             // SuspendMember, Revoke, RestoreAccess, PromoteContext, ExtendTtl,
-            // and economic actions are handled in dispatch_governance_action.
+            // economic, and rate-limit actions are handled in
+            // dispatch_governance_action.
             GovernanceAction::PromoteContext
             | GovernanceAction::ExtendTtl { .. }
             | GovernanceAction::SuspendMember { .. }
@@ -1057,7 +1063,8 @@ impl ContextManager {
             | GovernanceAction::RestoreAccess { .. }
             | GovernanceAction::SetEconomicPolicy { .. }
             | GovernanceAction::ApproveSpend { .. }
-            | GovernanceAction::LockEconomicPolicy => {
+            | GovernanceAction::LockEconomicPolicy
+            | GovernanceAction::ModifyHardRateLimit { .. } => {
                 unreachable!("handled in dispatch_governance_action")
             }
         }
@@ -1159,7 +1166,8 @@ impl ContextManager {
             | GovernanceAction::CreateChildContext { .. }
             | GovernanceAction::ModifyPruningPolicy { .. }
             | GovernanceAction::ProposeContextMigration { .. }
-            | GovernanceAction::CancelContextMigration => {
+            | GovernanceAction::CancelContextMigration
+            | GovernanceAction::ModifyHardRateLimit { .. } => {
                 unreachable!(
                     "action variant handled by dispatch_governance_action \
                      or dispatch_context_governance_action"
@@ -3927,6 +3935,76 @@ impl ContextManager {
         self.event_log.append_context_event(
             &context_id_bytes,
             "EconomicPolicyLocked",
+            actor_did,
+        )?;
+        Ok(())
+    }
+
+    /// Executes a `ModifyHardRateLimit` governance action (D4, §19.7).
+    ///
+    /// Replaces the context's `TokenBucketLimiter` configuration with a
+    /// new `HardRateLimitConfig`, preserving per-sender bucket state so
+    /// active senders are not given a spurious free burst. The new
+    /// config is validated at execution time to prevent a malformed
+    /// config from reaching the limiter hot path.
+    ///
+    /// # Errors
+    ///
+    /// - [`ContextError::ContextNotRegistered`] if the context is not registered.
+    /// - [`ContextError::ContextNotActive`] if the context is not active.
+    /// - [`ContextError::GovernanceFailed`] if `new_config` fails validation.
+    async fn execute_modify_hard_rate_limit(
+        &self,
+        context_id: &str,
+        new_config: &scp_protocol::economy::antispam::HardRateLimitConfig,
+        _proposal_id: ProposalId,
+        actor_did: &str,
+    ) -> Result<(), ContextError> {
+        let context_id_bytes = context_id_to_bytes(context_id);
+
+        // Validate BEFORE touching per-context state so a malformed
+        // proposal cannot corrupt the active limiter.
+        new_config.validate().map_err(|e| {
+            ContextError::GovernanceFailed(format!(
+                "ModifyHardRateLimit: new config failed validation: {e}"
+            ))
+        })?;
+
+        let snapshot = {
+            let mut contexts = self.contexts.lock().await;
+            let ctx = contexts
+                .get_mut(context_id)
+                .ok_or_else(|| ContextError::ContextNotRegistered(context_id.to_owned()))?;
+            require_active(&ctx.handle)?;
+
+            // Preserve per-sender bucket state across the reconfigure.
+            // `snapshot_entries` returns `HashMap<String, (u64, u64)>`,
+            // and `from_snapshot` reconstructs with the new config —
+            // the effective burst is reapplied on the next
+            // `try_consume`, and over-capacity tokens get clamped by
+            // `validate_and_sanitize_snapshot` on restore. This
+            // guarantees that tightening the limit does NOT give any
+            // sender a free burst.
+            let preserved_state = ctx.governance.hard_rate_limit.snapshot_entries();
+            ctx.governance.hard_rate_limit =
+                scp_protocol::economy::antispam::TokenBucketLimiter::from_snapshot(
+                    new_config.clone(),
+                    preserved_state,
+                );
+
+            if self.has_persistence() {
+                Some(Self::snapshot_context(ctx))
+            } else {
+                None
+            }
+        };
+
+        if let Some(snapshot) = snapshot {
+            self.persist_context_snapshot(context_id, snapshot);
+        }
+        self.event_log.append_context_event(
+            &context_id_bytes,
+            "HardRateLimitModified",
             actor_did,
         )?;
         Ok(())

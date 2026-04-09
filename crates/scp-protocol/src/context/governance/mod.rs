@@ -58,6 +58,7 @@ use sha2::{Digest, Sha256};
 use super::params::{Capability, ContextParams, ToolRegistration};
 use super::roles::ToolId;
 use super::tools::interface::ToolInterface;
+use crate::economy::antispam::HardRateLimitConfig;
 use crate::economy::types::{Amount, EconomicPolicy};
 use scp_event_log::{ContextId, Ed25519Signature};
 use scp_primitives::DID;
@@ -729,6 +730,29 @@ pub enum GovernanceAction {
     /// Only valid while the source context is in `MigratingOut` state
     /// (during the grace period). Returns the context to `Active`.
     CancelContextMigration,
+    /// Modify the Matrix Synapse–style hard rate limit configuration
+    /// (D4, defense-in-depth anti-spam cap — §19.7).
+    ///
+    /// The hard rate limit is a token bucket layered on top of the
+    /// per-DID economic escalation, enforced on messaging, join, and
+    /// tool invocation paths. Allows governance to tighten or loosen
+    /// the cap in response to observed abuse patterns without having
+    /// to close and recreate the context.
+    ///
+    /// The new config is validated at execution time (burst > 0,
+    /// `refill_per_kilosec` within bounds) and applied atomically.
+    /// Per-sender token bucket entries are preserved — only the
+    /// refill/burst parameters change.
+    ///
+    /// This action is distinct from [`Self::SetEconomicPolicy`] on
+    /// purpose: rate limiting is a bounded-capacity protection layer,
+    /// not a pricing lever, so conflating them under a single
+    /// governance action would force clients to bundle unrelated
+    /// policy decisions.
+    ModifyHardRateLimit {
+        /// The new hard rate limit configuration.
+        new_config: HardRateLimitConfig,
+    },
 }
 
 impl GovernanceAction {
@@ -764,6 +788,7 @@ impl GovernanceAction {
             Self::LockEconomicPolicy => "LockEconomicPolicy",
             Self::ProposeContextMigration { .. } => "ProposeContextMigration",
             Self::CancelContextMigration => "CancelContextMigration",
+            Self::ModifyHardRateLimit { .. } => "ModifyHardRateLimit",
         }
     }
 
@@ -803,7 +828,8 @@ impl GovernanceAction {
             | Self::SetEconomicPolicy { .. }
             | Self::LockEconomicPolicy
             | Self::ProposeContextMigration { .. }
-            | Self::CancelContextMigration => None,
+            | Self::CancelContextMigration
+            | Self::ModifyHardRateLimit { .. } => None,
         }
     }
 }

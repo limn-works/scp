@@ -297,9 +297,10 @@ impl ContextManager {
                 .hard_rate_limit
                 .try_consume(invoker_did, now_secs)
             {
-                return Err(ContextError::PermissionDenied(
-                    "SCP-ECON-7090: hard rate limit exceeded for invoker".to_owned(),
-                ));
+                return Err(ContextError::RateLimited {
+                    resource: "tool_invoke".to_owned(),
+                    message: "hard rate limit exceeded for invoker".to_owned(),
+                });
             }
 
             // Record velocity BEFORE the pre-check so that
@@ -642,31 +643,35 @@ struct Phase1Snapshot {
 }
 
 /// Maps an [`InvocationError`] to a [`ContextError`] with SCP codes.
+///
+/// Uses the canonical `SCP-TOOL` prefix (6000-6999 range) for
+/// tool-invocation failures, per the canonical error-code registry in
+/// `.docs/standards/sdk-common.md`.
 fn invocation_error_to_context(err: InvocationError) -> ContextError {
     match err {
         InvocationError::ContextNotActive { current_state } => ContextError::PermissionDenied(
-            format!("SCP-CTX-7080: context not active: {current_state}"),
+            format!("SCP-TOOL-6080: context not active: {current_state}"),
         ),
         InvocationError::InvokerNotAuthorized { did, tool_id } => ContextError::PermissionDenied(
-            format!("SCP-CTX-7081: invoker {did} lacks ToolInvoke({tool_id})"),
+            format!("SCP-TOOL-6081: invoker {did} lacks ToolInvoke({tool_id})"),
         ),
         InvocationError::ToolNotFound { tool_id } => {
-            ContextError::PermissionDenied(format!("SCP-CTX-7082: tool not found: {tool_id}"))
+            ContextError::PermissionDenied(format!("SCP-TOOL-6082: tool not found: {tool_id}"))
         }
         InvocationError::InputValidationFailed { message } => ContextError::PermissionDenied(
-            format!("SCP-CTX-7083: input schema validation failed: {message}"),
+            format!("SCP-TOOL-6083: input schema validation failed: {message}"),
         ),
         InvocationError::OutputValidationFailed { message } => ContextError::PermissionDenied(
-            format!("SCP-CTX-7084: output schema validation failed: {message}"),
+            format!("SCP-TOOL-6084: output schema validation failed: {message}"),
         ),
         InvocationError::ExecutionFailed { message } => ContextError::PermissionDenied(format!(
-            "SCP-CTX-7085: tool execution failed: {message}"
+            "SCP-TOOL-6085: tool execution failed: {message}"
         )),
         InvocationError::Timeout { timeout_ms } => ContextError::PermissionDenied(format!(
-            "SCP-CTX-7086: tool execution timed out after {timeout_ms}ms"
+            "SCP-TOOL-6086: tool execution timed out after {timeout_ms}ms"
         )),
         InvocationError::Cancelled => {
-            ContextError::PermissionDenied("SCP-CTX-7087: tool invocation cancelled".to_owned())
+            ContextError::PermissionDenied("SCP-TOOL-6087: tool invocation cancelled".to_owned())
         }
         InvocationError::BudgetExceeded {
             did,
