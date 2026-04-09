@@ -1934,6 +1934,20 @@ mod tests {
         let context = active_context().await;
         let role_state = test_role_state(invoker.as_ref());
         let registry = setup_registry_with_tool(&role_state, invoker.as_ref());
+        // Test fixture metrics: zeros are intentional for this budget-
+        // exhaustion test. The test asserts budget-cap behaviour in
+        // isolation and does NOT exercise §19.7 per-DID velocity
+        // escalation — that behaviour is covered end-to-end by the
+        // `invoke_tool_with_economy` wrapper on `ContextManager` which
+        // populates `sender_velocity` from the live velocity tracker via
+        // `velocity_tracker.get_velocity(invoker_did, now_secs)` at
+        // `crates/scp-runtime/src/context/manager/tools.rs` (see the
+        // `invoke_tool_with_economy_wires_escalation_and_rollback` and
+        // `invoke_tool_with_economy_releases_lock_before_executor`
+        // structural assertions in
+        // `crates/scp-testing/tests/integration/pipeline_wiring.rs` which
+        // pin the real wiring, and the behavioural escalation test in
+        // `crates/scp-runtime/src/context/manager/tests/messaging.rs`).
         let metrics = scp_protocol::economy::policy::ObservableMetrics {
             context_message_rate: 0,
             member_count: 0,
