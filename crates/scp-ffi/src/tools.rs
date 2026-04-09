@@ -396,14 +396,12 @@ pub fn py_tool_invoke(
         proof_tokens.as_ref(),
     )?;
 
-    // D4 bypass close: consume a hard-rate-limit token BEFORE any
-    // bridge-side tool dispatch. The bridge's tool invocation path
-    // does NOT go through `ContextManager::invoke_tool_with_economy`
-    // (bridges own their own tool registry + handler dispatch), so
-    // without this explicit hook a member rate-limited on
-    // `send_message` could still burn relay capacity via
-    // `py_tool_invoke`. On any subsequent failure we refund the
-    // token.
+    // Consume a hard-rate-limit token BEFORE dispatching. The
+    // bridge's tool invocation path does not go through
+    // `ContextManager::invoke_tool_with_economy` (bridges own their
+    // own tool registry + handler dispatch), so this explicit hook
+    // is load-bearing for cap enforcement on tool calls. Refunded
+    // on every failure path below.
     let invoker_did_typed: scp_primitives::DID = identity_did.to_owned().into();
     let now_secs = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)

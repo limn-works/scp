@@ -1831,17 +1831,11 @@ async fn tool_invoke_escalation_via_managed_wrapper() {
     );
 }
 
-/// D4 bug-catcher Round 2: the async variant
-/// `try_consume_hard_rate_limit` must be callable from inside a
-/// tokio async context without panicking. The `_blocking` sibling
-/// uses `tokio::sync::Mutex::blocking_lock` which panics from
-/// within an async runtime; the async variant uses `.lock().await`
-/// and is safe. `NAPI` + `UniFFI` tool-invoke paths depend on this.
-///
-/// Regression for the bug where calling `_blocking` from a
-/// `pub async fn` under `napi-rs`'s tokio worker would panic on
-/// every invocation. The `NAPI` test suite did not exercise
-/// `tool_invoke` end-to-end, so the panic slipped past local CI.
+/// The async variant `try_consume_hard_rate_limit` must be
+/// callable from inside a tokio async context without panicking —
+/// the `_blocking` sibling uses `blocking_lock` which panics inside
+/// an async runtime. NAPI + `UniFFI` tool-invoke paths depend on
+/// this.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn try_consume_hard_rate_limit_async_variant_is_safe_from_async_context() {
     let manager = ContextManager::new(
@@ -1877,18 +1871,14 @@ async fn try_consume_hard_rate_limit_async_variant_is_safe_from_async_context() 
     assert!(ok, "unknown context must pass-through as true");
 }
 
-/// D4 bug-catcher Round 3: the runtime-agnostic helper
-/// `try_consume_hard_rate_limit_from_any_context` MUST survive a
-/// current-thread tokio runtime. Round 2's `block_in_place`-only
-/// path would have panicked here because `block_in_place` requires
-/// multi-thread. The Round 3 helper detects the runtime flavor and
+/// The runtime-agnostic helper
+/// `try_consume_hard_rate_limit_from_any_context` must survive a
+/// current-thread tokio runtime. `block_in_place` requires
+/// multi-thread, so the helper detects the runtime flavor and
 /// falls back to a dedicated `std::thread` with its own tiny
-/// current-thread runtime for this case.
-///
-/// This regression test SPECIFICALLY covers the `PyO3` MCP server
-/// fallback path at `crates/scp-ffi/src/lib.rs:131-145` where the
-/// primary multi-thread runtime builder failed and the service is
-/// running on a current-thread runtime instead.
+/// current-thread runtime. This covers the `PyO3` MCP server
+/// fallback path where the multi-thread runtime builder failed
+/// and the service runs on a current-thread runtime instead.
 #[test]
 fn any_context_helper_survives_current_thread_runtime() {
     use std::sync::Arc as StdArc;
@@ -1924,10 +1914,10 @@ fn any_context_helper_survives_current_thread_runtime() {
     });
 
     // Now enter the runtime again and call the runtime-agnostic
-    // sync helper from inside a `block_on` task. This is the
-    // pattern that would panic under Round 2's `block_in_place`
-    // implementation — the Round 3 dedicated-thread fallback must
-    // handle it cleanly.
+    // sync helper from inside a `block_on` task. The dedicated-
+    // thread fallback must handle this cleanly — plain
+    // `block_in_place` would panic because the surrounding
+    // runtime is current-thread.
     let manager_for_consume = StdArc::clone(&manager);
     let alice_for_consume = alice.clone();
     let result = rt.block_on(async move {
@@ -1949,10 +1939,9 @@ fn any_context_helper_survives_current_thread_runtime() {
     });
 }
 
-/// D4 bug-catcher Round 3: the runtime-agnostic helper must also
-/// work from outside any runtime (sync unit tests that exercise
-/// bridge traits directly) — the "no runtime" branch that uses
-/// `blocking_lock` directly.
+/// The runtime-agnostic helper must also work from outside any
+/// runtime (sync unit tests exercising bridge traits directly) —
+/// the "no runtime" branch that uses `blocking_lock` directly.
 #[test]
 fn any_context_helper_survives_no_runtime() {
     use std::sync::Arc as StdArc;
@@ -1996,17 +1985,13 @@ fn any_context_helper_survives_no_runtime() {
     manager.refund_hard_rate_limit_from_any_context("no-rt-ctx", &alice);
 }
 
-/// D4 bug-catcher Round 2: same regression guard for the
+/// Regression guard for the
 /// `block_in_place + Handle::current().block_on(...)` pattern used
-/// by `PyO3` `FfiBridgeProvider::invoke_tool` — this simulates the
-/// sync-in-async call path that the `MCP` server bridge uses on
-/// multi-thread runtimes. The Round 3 `_from_any_context` helper
-/// uses the `block_in_place` branch in this case.
-///
-/// The inner `block_on` call on the current handle is allowed ONLY
-/// if wrapped in `block_in_place` (which moves the current task to
-/// a blocking pool on multi-thread runtimes). Without
-/// `block_in_place`, `Handle::block_on` panics.
+/// by the MCP server bridge's sync-in-async call path on a
+/// multi-thread runtime. The inner `block_on` on the current
+/// handle is allowed only when wrapped in `block_in_place`, which
+/// moves the current task to a blocking pool; without it,
+/// `Handle::block_on` panics.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn block_in_place_bridge_pattern_survives_mcp_sync_in_async_call() {
     let manager = ContextManager::new(
@@ -2043,9 +2028,9 @@ async fn block_in_place_bridge_pattern_survives_mcp_sync_in_async_call() {
     });
 }
 
-/// D4: the tool-invoke path consumes a hard-rate-limit token before any
-/// economy bookkeeping, matching the `send_message` path. Without this,
-/// a member rate-limited on `send_message` could bypass the cap via
+/// The tool-invoke path consumes a hard-rate-limit token before
+/// any economy bookkeeping, matching the `send_message` path, so a
+/// member rate-limited on `send_message` cannot bypass the cap via
 /// `invoke_tool_with_economy`.
 #[tokio::test]
 async fn tool_invoke_respects_hard_rate_limit() {
@@ -2142,10 +2127,11 @@ async fn tool_invoke_respects_hard_rate_limit() {
     }
 }
 
-/// D4: a rejected tool invocation (e.g., execution failure) MUST refund
-/// the hard-rate-limit token so a rejected attempt does not permanently
-/// burn bucket capacity. Otherwise an invoker hitting a failing tool
-/// would be rate-limited into silence via its own failures.
+/// A rejected tool invocation (e.g., execution failure) must
+/// refund the hard-rate-limit token so a rejected attempt does
+/// not permanently burn bucket capacity. Otherwise an invoker
+/// hitting a failing tool would be rate-limited into silence via
+/// its own failures.
 #[tokio::test]
 async fn tool_invoke_failure_refunds_hard_rate_limit_token() {
     use scp_protocol::context::tools::ToolId;

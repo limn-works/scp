@@ -355,9 +355,7 @@ pub enum ContextEvent {
     /// The event carries the exact capability set that was suspended so
     /// consumers can apply path-specific UI hints (e.g., "this member
     /// can no longer vote but can still send messages") without having
-    /// to re-read the role state. Replaces the previously hardcoded
-    /// `WriteAccessRevoked` emission in `execute_suspend_member` which
-    /// was wrong for any suspension that did not include `MessagesWrite`.
+    /// to re-read the role state.
     CapabilitiesSuspended {
         /// The DID of the member whose capabilities were suspended.
         did: DID,

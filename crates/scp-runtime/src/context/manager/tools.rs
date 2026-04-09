@@ -10,11 +10,11 @@
 //! so that tool invocations participate in the same per-DID anti-spam
 //! regime as message sends (spec §19.7).
 //!
-//! # Lock-split invariant (F1-F3)
+//! # Lock-split invariant
 //!
 //! The caller-supplied executor must run **without** holding the
 //! `ContextManager.contexts` mutex. A mis-behaving or long-running tool
-//! executor previously blocked every concurrent call into the manager.
+//! executor would otherwise block every concurrent call into the manager.
 //! This module enforces the split by structuring the wrapper into three
 //! phases:
 //!
@@ -146,13 +146,10 @@ impl Drop for ToolEconomyTicket {
 }
 
 /// Marks the ticket committed (success path). Returns the deducted cost
-/// so the caller can populate the `ToolInvokedEvent`.
-///
-/// Clears `needs_hard_rate_limit_refund` so the invariant
+/// so the caller can populate the `ToolInvokedEvent`. Clears
+/// `needs_hard_rate_limit_refund` so the invariant
 /// "`needs_hard_rate_limit_refund == true` iff a refund is still owed"
-/// holds across all call sites. Without this, a future refactor that
-/// calls `rollback_tool_economy_ticket` after `commit_tool_economy_ticket`
-/// on the same ticket would double-refund the token bucket.
+/// holds against any defensive rollback call.
 fn commit_tool_economy_ticket(mut ticket: ToolEconomyTicket) -> Option<Amount> {
     ticket.consumed = true;
     ticket.needs_hard_rate_limit_refund = false;
@@ -212,59 +209,31 @@ impl ContextManager {
     /// `(context_id, did)` pair.
     ///
     /// Returns `true` if a token was consumed OR if the context is
-    /// not registered in the `ContextManager` (pass-through semantics
-    /// — see below). Returns `false` only when the context IS
-    /// registered AND the sender is over their rate-limit budget.
+    /// not registered in the `ContextManager`. Returns `false` only
+    /// when the context IS registered AND the sender is over budget.
     ///
-    /// # Purpose
-    ///
-    /// This is the SYNC entry point for FFI bridges
-    /// (`PyO3` `py_tool_invoke`, `NAPI` `tool_invoke`,
-    /// `UniFFI` `tool_invoke`)
-    /// whose tool-dispatch paths do NOT go through
-    /// [`Self::invoke_tool_with_economy`]. The bridges own their own
-    /// tool registry + handler dispatch (because JS/Python callables
-    /// live in bridge-side state, not in the `ContextManager`), so
-    /// they cannot reuse the full economy wrapper directly. Without
-    /// this helper, the bridge paths would bypass the Matrix
-    /// Synapse–style hard rate limit entirely — the D4
-    /// "tool-path bypass close" is otherwise incomplete.
+    /// SYNC entry point for FFI bridge tool-dispatch paths that do
+    /// not flow through [`Self::invoke_tool_with_economy`] (the
+    /// bridges own their own tool registry + handler dispatch
+    /// because JS/Python callables live in bridge-side state, not
+    /// in the `ContextManager`).
     ///
     /// Bridges MUST pair every `true` return with a matching
     /// [`Self::refund_hard_rate_limit_blocking`] call on every
-    /// downstream failure branch, mirroring the refund discipline
-    /// inside [`Self::invoke_tool_with_economy`]. Refund is also
-    /// safe for the "context not registered" pass-through case — it
-    /// is a no-op when the context is unknown.
+    /// downstream failure branch. Refund is a no-op when the
+    /// context is unknown.
     ///
-    /// # Pass-through semantic
-    ///
-    /// An unknown `context_id` returns `true` rather than an error.
-    /// Rationale:
-    ///   - In production, `py_context_create` / `NAPI` / `UniFFI` always
-    ///     register with BOTH the bridge's local state AND the
-    ///     `ContextManager`, so a missing entry means the caller is
-    ///     operating on a context the bridge state does not know
-    ///     about either — the downstream `with_context` call will
-    ///     fail with a bridge-level "tool not found" error that is
-    ///     more specific than a generic "context not registered".
-    ///   - In unit tests, bridges routinely populate the local state
-    ///     without initializing the manager; the test already proves
-    ///     the dispatch path works, and requiring manager
-    ///     initialization would force every `MCP` test to set up a
-    ///     full `ContextManager`. Pass-through lets the tests keep
-    ///     their current setup.
-    ///   - The trust model does not change: if there is no manager
-    ///     entry, there is no rate-limit state to enforce against,
-    ///     and the downstream tool dispatch still runs under its
-    ///     own authorization surface.
+    /// An unknown `context_id` returns `true` rather than an error
+    /// because the downstream `with_context` call inside the bridge
+    /// will fail with a more specific "tool not found" error, and
+    /// because there is no rate-limit state to enforce against
+    /// without a manager entry.
     ///
     /// # Concurrency
     ///
     /// Uses `blocking_lock` on `self.contexts`. Callers MUST NOT
     /// invoke this from within an async task on the same tokio
-    /// runtime — doing so will panic. The bridges are sync-entry
-    /// points that run outside the async executor, so this is safe.
+    /// runtime — doing so will panic.
     #[allow(clippy::significant_drop_tightening)] // two-step borrow on the contexts map
     #[must_use]
     pub fn try_consume_hard_rate_limit_blocking(
@@ -274,23 +243,13 @@ impl ContextManager {
         now_secs: u64,
     ) -> bool {
         let contexts = self.contexts.blocking_lock();
-        // Pass-through (`true`) when the context is not registered in
-        // the manager — see doc comment above.
         contexts
             .get(context_id)
             .is_none_or(|ctx| ctx.governance.hard_rate_limit.try_consume(did, now_secs))
     }
 
-    /// Synchronously refund one hard-rate-limit token for the given
-    /// `(context_id, did)` pair. Used by FFI bridges to match a
-    /// previously-successful [`Self::try_consume_hard_rate_limit_blocking`]
-    /// call when the downstream tool dispatch fails.
-    ///
-    /// No-op if the context is no longer registered.
-    ///
-    /// # Concurrency
-    ///
-    /// Same `blocking_lock` constraint as
+    /// Synchronously refund one hard-rate-limit token. No-op if the
+    /// context is unknown. Same `blocking_lock` constraint as
     /// [`Self::try_consume_hard_rate_limit_blocking`].
     pub fn refund_hard_rate_limit_blocking(&self, context_id: &str, did: &DID) {
         let contexts = self.contexts.blocking_lock();
@@ -299,16 +258,9 @@ impl ContextManager {
         }
     }
 
-    /// Async variant of [`Self::try_consume_hard_rate_limit_blocking`].
-    ///
-    /// Used by async FFI bridges (`UniFFI` tool invoke) whose tool
-    /// dispatch also bypasses [`Self::invoke_tool_with_economy`]. The
-    /// `.await` form is safe inside the tokio executor where
-    /// `blocking_lock` would panic.
-    ///
-    /// Same pass-through semantic as the blocking variant: returns
-    /// `true` when the context is not registered in the
-    /// `ContextManager`.
+    /// Async variant of [`Self::try_consume_hard_rate_limit_blocking`]
+    /// for callers already inside a tokio executor where
+    /// `blocking_lock` would panic. Same unknown-context pass-through.
     #[allow(clippy::significant_drop_tightening)] // two-step borrow on the contexts map
     #[must_use]
     pub async fn try_consume_hard_rate_limit(
@@ -318,14 +270,12 @@ impl ContextManager {
         now_secs: u64,
     ) -> bool {
         let contexts = self.contexts.lock().await;
-        // Pass-through (`true`) when the context is not registered —
-        // see doc comment on the blocking variant.
         contexts
             .get(context_id)
             .is_none_or(|ctx| ctx.governance.hard_rate_limit.try_consume(did, now_secs))
     }
 
-    /// Async variant of [`Self::refund_hard_rate_limit_blocking`].
+    /// Async refund. No-op if the context is unknown.
     pub async fn refund_hard_rate_limit(&self, context_id: &str, did: &DID) {
         let contexts = self.contexts.lock().await;
         if let Some(ctx) = contexts.get(context_id) {
@@ -334,42 +284,19 @@ impl ContextManager {
     }
 
     /// Runtime-agnostic hard-rate-limit consume for sync bridge trait
-    /// methods that may be called from ANY of the three tokio runtime
-    /// contexts:
+    /// methods that may be called from any of three tokio contexts:
     ///
-    /// 1. **No runtime active**: use `blocking_lock` directly — safe
-    ///    when no tokio executor is present (sync unit tests that
-    ///    exercise a sync trait method outside `#[tokio::test]`).
+    /// 1. **No runtime active**: use `blocking_lock` directly.
     /// 2. **Multi-thread runtime active**: use `block_in_place` +
-    ///    `Handle::current().block_on(async_helper)`. The
-    ///    `block_in_place` primitive is only valid on multi-thread
-    ///    runtimes — it moves the current task off the worker so
-    ///    the worker can progress other tasks while we await.
+    ///    `Handle::current().block_on(async_helper)`. `block_in_place`
+    ///    is only valid on multi-thread runtimes.
     /// 3. **Current-thread runtime active**: neither `blocking_lock`
-    ///    (panics because inside runtime) NOR `block_in_place`
-    ///    (panics because single-threaded) is safe. Fall back to
-    ///    spawning a dedicated `std::thread` with its own tiny
-    ///    current-thread runtime that calls `block_on` on the
-    ///    async helper, then join via an mpsc channel.
+    ///    nor `block_in_place` is safe. Spawn a dedicated
+    ///    `std::thread` with its own tiny current-thread runtime,
+    ///    `block_on` the async helper, join via an mpsc channel.
     ///
-    /// The third case is a defensive fallback for resource-constrained
-    /// deployments where the primary multi-thread runtime failed to
-    /// build (see the fallback path in `crates/scp-ffi/src/lib.rs`).
-    /// It is slow (thread spawn + runtime build per call) but
-    /// correct. Production MCP servers should deploy on multi-thread
-    /// and never exercise this path.
-    ///
-    /// Same pass-through semantic as the blocking/async variants:
-    /// returns `true` when the context is not registered.
-    ///
-    /// # Purpose
-    ///
-    /// The `PyO3` MCP server bridge (`FfiBridgeProvider::invoke_tool`
-    /// in `crates/scp-ffi/src/mcp.rs`) is a sync trait method called
-    /// from both async tokio contexts (stdio `rt.spawn` loop, SSE
-    /// async handler) AND sync unit tests. Using only the async or
-    /// only the blocking variant would break one or the other. This
-    /// smart wrapper handles all three cases uniformly.
+    /// The third case is a defensive fallback. Same unknown-context
+    /// pass-through as the blocking/async variants.
     #[must_use]
     #[allow(clippy::option_if_let_else)] // match is clearer than map_or_else for this dual arm
     pub fn try_consume_hard_rate_limit_from_any_context(
@@ -379,26 +306,16 @@ impl ContextManager {
         now_secs: u64,
     ) -> bool {
         match tokio::runtime::Handle::try_current() {
-            Err(_) => {
-                // Case 1: no runtime active. `blocking_lock` is safe.
-                self.try_consume_hard_rate_limit_blocking(context_id, did, now_secs)
-            }
+            Err(_) => self.try_consume_hard_rate_limit_blocking(context_id, did, now_secs),
             Ok(handle) => {
                 use tokio::runtime::RuntimeFlavor;
                 match handle.runtime_flavor() {
-                    RuntimeFlavor::MultiThread => {
-                        // Case 2: multi-thread runtime. `block_in_place`
-                        // + `block_on` is safe.
-                        tokio::task::block_in_place(|| {
-                            handle.block_on(
-                                self.try_consume_hard_rate_limit(context_id, did, now_secs),
-                            )
-                        })
-                    }
-                    // Current-thread or any future flavor we do not
-                    // explicitly know about: spawn a dedicated
-                    // `std::thread` with its own tiny runtime so we
-                    // never touch the parent runtime's executor.
+                    RuntimeFlavor::MultiThread => tokio::task::block_in_place(|| {
+                        handle.block_on(self.try_consume_hard_rate_limit(context_id, did, now_secs))
+                    }),
+                    // Current-thread or any future flavor: spawn a
+                    // dedicated `std::thread` with its own runtime so
+                    // we never touch the parent runtime's executor.
                     _ => Self::run_blocking_on_dedicated_thread(
                         Arc::clone(self),
                         context_id.to_owned(),
@@ -412,8 +329,7 @@ impl ContextManager {
     }
 
     /// Runtime-agnostic hard-rate-limit refund. Mirrors
-    /// [`Self::try_consume_hard_rate_limit_from_any_context`]'s
-    /// three-case dispatch.
+    /// [`Self::try_consume_hard_rate_limit_from_any_context`].
     #[allow(clippy::option_if_let_else)] // match is clearer than map_or_else for this dual arm
     pub fn refund_hard_rate_limit_from_any_context(self: &Arc<Self>, context_id: &str, did: &DID) {
         match tokio::runtime::Handle::try_current() {
@@ -444,14 +360,8 @@ impl ContextManager {
 
     /// Dedicated-thread escape hatch for current-thread runtime
     /// environments where both `blocking_lock` and `block_in_place`
-    /// panic. Spawns a one-shot `std::thread`, builds a tiny
-    /// current-thread tokio runtime there, and runs the async helper
-    /// to completion. Returns the consume result (or `true` for
-    /// refund calls where the return value is unused).
-    ///
-    /// Slow: thread spawn + runtime build per call. Only triggered
-    /// on current-thread runtime fallback, which is a non-production
-    /// resource-constrained deployment path.
+    /// panic. Spawns a `std::thread`, builds a current-thread tokio
+    /// runtime there, runs the async helper, returns via mpsc.
     fn run_blocking_on_dedicated_thread(
         manager: Arc<Self>,
         context_id: String,
@@ -461,8 +371,6 @@ impl ContextManager {
     ) -> bool {
         let (tx, rx) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
-            // Build a dedicated current-thread runtime in the new
-            // thread so we are NOT in the parent runtime's context.
             let rt = match tokio::runtime::Builder::new_current_thread()
                 .enable_all()
                 .build()
@@ -471,12 +379,8 @@ impl ContextManager {
                 Err(e) => {
                     tracing::error!(
                         error = %e,
-                        "dedicated rate-limit runtime build failed; \
-                         falling back to pass-through"
+                        "dedicated rate-limit runtime build failed; falling back to pass-through"
                     );
-                    // Pass-through on runtime build failure — matches
-                    // the "unknown context" pass-through semantic so
-                    // a degraded env does not hard-fail tool invokes.
                     let _ = tx.send(true);
                     return;
                 }
@@ -573,16 +477,11 @@ impl ContextManager {
             let handle = ctx.handle.clone();
             let role_state = ctx.role_state.clone();
 
-            // Defense-in-depth (Matrix Synapse–style hard rate limit):
-            // consume a token from the per-invoker bucket BEFORE any
-            // bookkeeping. This closes the tool-path bypass where a
-            // member rate-limited on `send_message` could still burn
-            // the relay via tool invocations. Mirrors the same check
-            // in `enforce_send_economy` at messaging.rs:346.
-            //
-            // On any subsequent Phase 1 / Phase 2 / Phase 3 failure
-            // the token is refunded: inline rollbacks reverse it
-            // directly and the `ToolEconomyTicket`-based rollback
+            // Defense-in-depth Matrix-style hard rate limit: consume
+            // a token from the per-invoker bucket BEFORE any
+            // bookkeeping so the cap applies even when the cost
+            // pipeline is free. Inline rollback paths refund
+            // directly; the `ToolEconomyTicket`-based rollback
             // consults `needs_hard_rate_limit_refund`.
             if !ctx
                 .governance
@@ -595,10 +494,11 @@ impl ContextManager {
                 });
             }
 
-            // Record velocity BEFORE the pre-check so that
-            // `compute_escalated_cost` sees the new window entry
-            // (matching `send_message`). F5: capture the rollback
-            // token so a failure refunds THIS entry specifically.
+            // Record velocity BEFORE the pre-check so
+            // `compute_escalated_cost` sees the new window entry,
+            // matching `send_message`. Capture the rollback token so
+            // a failure refunds THIS entry specifically rather than
+            // racing concurrent invokers.
             let velocity_token = ctx
                 .governance
                 .velocity_tracker
@@ -623,10 +523,9 @@ impl ContextManager {
             let consequence_rules = ctx.governance.consequence_rules.clone();
             let message_pricing = ctx.governance.message_pricing.clone();
 
-            // Real per-context event snapshot from the event log. This
-            // replaces the previous `Vec::new()` placeholder so that
+            // Per-context event snapshot from the event log so
             // consequence evaluation and participation-record
-            // computation actually see the context's history.
+            // computation see the context's history.
             let events_snapshot = super::governance::event_log_entries_for_consequences(
                 ctx,
                 context_id,
@@ -879,22 +778,14 @@ impl ContextManager {
                     Err(capture_err) => {
                         // Capture failed AFTER successful execution.
                         // The escrow hold is consumed by the capture
-                        // attempt (no void), but we must still reverse
-                        // the per-context budget deduction AND refund
-                        // the hard rate limit token. Re-acquire the
-                        // lock to do so, then mark the ticket consumed
-                        // so the `Drop` guard stays quiet — we cannot
-                        // use `rollback_tool_economy_ticket` because
-                        // that would double-void the escrow.
-                        //
-                        // D4 review finding (security-reviewer HIGH):
-                        // previously this branch only reversed budget
-                        // and velocity was missed entirely. An
-                        // attacker with a flaky or malicious payment
-                        // adapter could walk an invoker's bucket to
-                        // zero by triggering capture failures while
-                        // paying no actual cost. The refund + rollback
-                        // calls below close that.
+                        // attempt (no void), but the per-context
+                        // budget, velocity entry, and rate-limit
+                        // token must all be reversed so that an
+                        // unpaid-for invocation does not permanently
+                        // charge any of the three. We cannot delegate
+                        // to `rollback_tool_economy_ticket` because
+                        // it would attempt to void the already-
+                        // consumed escrow.
                         {
                             let mut contexts = self.contexts.lock().await;
                             if let Some(ctx) = contexts.get_mut(context_id) {
@@ -903,19 +794,9 @@ impl ContextManager {
                                         .budget_tracker
                                         .reverse_spend(invoker_did, cost);
                                 }
-                                // Velocity: the Phase 1 recorded entry
-                                // must be rolled back. The executor
-                                // ran successfully but the invocation
-                                // was not ultimately paid-for, so from
-                                // an accounting standpoint it did not
-                                // complete.
                                 ctx.governance
                                     .velocity_tracker
                                     .rollback(invoker_did, ticket.velocity_token);
-                                // Hard rate limit: refund the token so
-                                // a capture failure does not burn
-                                // bucket capacity (the security issue
-                                // above).
                                 if ticket.needs_hard_rate_limit_refund {
                                     ctx.governance.hard_rate_limit.refund(invoker_did);
                                 }

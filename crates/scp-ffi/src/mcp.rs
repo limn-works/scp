@@ -794,35 +794,24 @@ impl ContextProvider for FfiBridgeProvider {
         let agent_did = self.agent_did.clone();
         let timeout = std::time::Duration::from_millis(self.tool_timeout_ms);
 
-        // D4 bypass close: consume a hard-rate-limit token BEFORE
-        // dispatching the MCP tool invocation. The MCP server path
-        // (this function, reachable from external MCP clients) does
-        // NOT go through `ContextManager::invoke_tool_with_economy`
-        // — it dispatches directly against the bridge-side tool
-        // registry. Without this hook, an external MCP client could
-        // burn relay capacity via tool invocations regardless of the
-        // per-context rate limit. Matches the pattern in
-        // `py_tool_invoke` / NAPI `tool_invoke` / UniFFI `tool_invoke`.
+        // Consume a hard-rate-limit token BEFORE dispatching the MCP
+        // tool invocation. This path — reachable from external MCP
+        // clients — does not go through
+        // `ContextManager::invoke_tool_with_economy`; it dispatches
+        // directly against the bridge-side tool registry, so without
+        // this hook an external client could burn relay capacity
+        // regardless of the per-context rate limit.
         //
-        // SYNC-IN-ASYNC caveat (bug-catcher Rounds 2 + 3 findings):
-        // this trait method is sync, but its callers vary:
-        //   (a) `py_mcp_serve` stdio loop → `rt.spawn(async move ...)`
-        //       → MAY run on multi-thread OR current-thread runtime
-        //       depending on the runtime fallback at lib.rs:131-145.
+        // This trait method is sync but its callers vary:
+        //   (a) `py_mcp_serve` stdio loop → `rt.spawn(async move …)`
+        //       on either a multi-thread or current-thread runtime.
         //   (b) SSE async handler → multi-thread runtime.
-        //   (c) Sync `#[test]` tests → no runtime at all.
+        //   (c) Sync `#[test]` tests → no runtime.
         //
-        // Delegate to the runtime-agnostic helper on `ContextManager`
-        // which internally dispatches between:
-        //   - `blocking_lock` (no runtime active),
-        //   - `block_in_place + block_on` (multi-thread runtime), or
-        //   - dedicated `std::thread` with its own tiny runtime
-        //     (current-thread runtime fallback, where the first two
-        //     would panic).
-        //
-        // This centralizes the runtime-detection logic and ensures
-        // NAPI/UniFFI/PyO3 bridges share a single correct dispatch
-        // surface.
+        // `try_consume_hard_rate_limit_from_any_context` dispatches
+        // internally between `blocking_lock`, `block_in_place +
+        // block_on`, or a dedicated `std::thread` with its own tiny
+        // runtime depending on which regime the caller is in.
         let invoker_did_typed: scp_primitives::DID = agent_did.clone().into();
         let now_secs = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)

@@ -940,30 +940,24 @@ impl ContextManager {
                 participation_cache: export.snapshot.participation_cache,
                 cooldown_until: export.snapshot.cooldown_until,
                 // IMPORT path (not restore): start with a FRESH
-                // spending-nonce tracker regardless of what the export
-                // carries.
-                //
-                // Rationale (cryptographer review, C2 follow-up):
+                // spending-nonce tracker regardless of what the
+                // export carries. Three reasons:
                 //   1. Nonce tracker state is per-local-instance
-                //      anti-replay state — it has no meaning in an
+                //      anti-replay state with no meaning in an
                 //      inter-instance transfer.
                 //   2. The exporter may be untrusted; a malicious
-                //      export could pre-populate the tracker with up
-                //      to `DEFAULT_MAX_CAPACITY` attacker-chosen
-                //      entries whose `first_seen = now` survives the
-                //      post-restore prune. That is a DoS on local
-                //      memory without any forgery benefit.
+                //      export could pre-populate the tracker with
+                //      up to `DEFAULT_MAX_CAPACITY` attacker-chosen
+                //      entries, a DoS on local memory with no
+                //      forgery benefit.
                 //   3. The importing instance has not yet consumed
                 //      any spending UCANs — a fresh tracker cannot
                 //      reopen a replay window.
                 // The public-scope stripper already applies this
-                // invariant (`strip_snapshot_for_public` in
-                // `export_import.rs` zeros the field). Full-scope
-                // import now matches.
-                //
-                // `restore_context` is the local-reload path and MUST
-                // still rehydrate from `spending_nonce_tracker_state`;
-                // this divergence is the correct one.
+                // invariant; full-scope import matches. The
+                // `restore_context` local-reload path MUST still
+                // rehydrate from `spending_nonce_tracker_state` —
+                // this divergence is deliberate.
                 spending_nonce_tracker: scp_protocol::crypto::ucan::nonce::NonceTracker::new(
                     context_id.clone(),
                     Arc::clone(&self.clock),
