@@ -4954,6 +4954,7 @@ mod tests {
         );
     }
 
+    #[test]
     fn convert_consequence_enforced_event_format() {
         use scp_core::context::membership::ContextEvent;
 
@@ -5033,6 +5034,7 @@ mod tests {
         );
     }
 
+    #[test]
     fn consequence_rules_none_defaults_to_empty() {
         let p = default_params();
         assert!(p.consequence_rules.is_none());
