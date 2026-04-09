@@ -1831,6 +1831,97 @@ async fn tool_invoke_escalation_via_managed_wrapper() {
     );
 }
 
+/// D4 bug-catcher Round 2: the async variant
+/// `try_consume_hard_rate_limit` must be callable from inside a
+/// tokio async context without panicking. The `_blocking` sibling
+/// uses `tokio::sync::Mutex::blocking_lock` which panics from
+/// within an async runtime; the async variant uses `.lock().await`
+/// and is safe. `NAPI` + `UniFFI` tool-invoke paths depend on this.
+///
+/// Regression for the bug where calling `_blocking` from a
+/// `pub async fn` under `napi-rs`'s tokio worker would panic on
+/// every invocation. The `NAPI` test suite did not exercise
+/// `tool_invoke` end-to-end, so the panic slipped past local CI.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn try_consume_hard_rate_limit_async_variant_is_safe_from_async_context() {
+    let manager = ContextManager::new(
+        Box::new(MockCrypto::default()),
+        Box::new(MockTransport::connected()),
+        Box::new(MockEventLog::default()),
+        noop_key_resolver(),
+    );
+    let alice: DID = "did:key:alice".into();
+    let _handle = manager
+        .create_context("async-hrl-ctx".into(), governance_params(), alice.clone())
+        .await
+        .unwrap();
+
+    // Awaiting this future must not panic. If the implementation
+    // ever regressed to calling `blocking_lock` internally, this
+    // would panic with "Cannot block the current thread from
+    // within a runtime."
+    let ok = manager
+        .try_consume_hard_rate_limit("async-hrl-ctx", &alice, 1_000)
+        .await;
+    assert!(ok, "first consume should succeed");
+
+    // Refund — also must not panic.
+    manager
+        .refund_hard_rate_limit("async-hrl-ctx", &alice)
+        .await;
+
+    // Pass-through semantic: unknown context returns true (pass).
+    let ok = manager
+        .try_consume_hard_rate_limit("unregistered-ctx", &alice, 1_000)
+        .await;
+    assert!(ok, "unknown context must pass-through as true");
+}
+
+/// D4 bug-catcher Round 2: same regression guard for the
+/// `block_in_place + Handle::current().block_on(...)` pattern used
+/// by `PyO3` `FfiBridgeProvider::invoke_tool` — this simulates the
+/// sync-in-async call path that the `MCP` server bridge uses.
+///
+/// The inner `block_on` call on the current handle is allowed ONLY
+/// if wrapped in `block_in_place` (which moves the current task to
+/// a blocking pool on multi-thread runtimes). Without
+/// `block_in_place`, `Handle::block_on` panics.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn block_in_place_bridge_pattern_survives_mcp_sync_in_async_call() {
+    let manager = ContextManager::new(
+        Box::new(MockCrypto::default()),
+        Box::new(MockTransport::connected()),
+        Box::new(MockEventLog::default()),
+        noop_key_resolver(),
+    );
+    let alice: DID = "did:key:alice".into();
+    let _handle = manager
+        .create_context("mcp-sync-ctx".into(), governance_params(), alice.clone())
+        .await
+        .unwrap();
+
+    // Simulate the MCP server bridge's call pattern: sync code path
+    // that needs to acquire the tokio Mutex, reached from within
+    // an async context (we are inside a `#[tokio::test]`).
+    let ok = tokio::task::block_in_place(|| {
+        tokio::runtime::Handle::current().block_on(manager.try_consume_hard_rate_limit(
+            "mcp-sync-ctx",
+            &alice,
+            2_000,
+        ))
+    });
+    assert!(
+        ok,
+        "sync-in-async bridge pattern (block_in_place + handle.block_on) must succeed"
+    );
+
+    // And the refund path.
+    tokio::task::block_in_place(|| {
+        tokio::runtime::Handle::current()
+            .block_on(manager.refund_hard_rate_limit("mcp-sync-ctx", &alice));
+    });
+}
+
 /// D4: the tool-invoke path consumes a hard-rate-limit token before any
 /// economy bookkeeping, matching the `send_message` path. Without this,
 /// a member rate-limited on `send_message` could bypass the cap via

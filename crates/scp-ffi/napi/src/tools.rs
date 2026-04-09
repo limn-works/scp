@@ -366,13 +366,23 @@ pub async fn tool_invoke(
     // `ContextManager::invoke_tool_with_economy`; without this hook
     // a member rate-limited on `send_message` could still burn
     // relay capacity via `tool_invoke`.
+    //
+    // This function is `pub async fn`, executed on a tokio worker
+    // by napi-rs. We MUST use the `.await` variant of the rate-limit
+    // helper — the `_blocking` variant uses `tokio::sync::Mutex::blocking_lock`
+    // which panics when called from within an async runtime context
+    // (bug-catcher Round 2 finding). The prior sync call would
+    // have panicked on every real Node/Bun invocation.
     let invoker_did_typed: scp_primitives::DID = identity_did.clone().into();
     let now_secs = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0);
     let manager = crate::runtime::context_manager()?;
-    if !manager.try_consume_hard_rate_limit_blocking(&context_id, &invoker_did_typed, now_secs) {
+    if !manager
+        .try_consume_hard_rate_limit(&context_id, &invoker_did_typed, now_secs)
+        .await
+    {
         return Err(ScpNapiError::Tool {
             message:
                 "SCP-ECON-7090: rate limit exceeded on tool_invoke: hard rate limit exceeded for invoker"
@@ -443,8 +453,12 @@ pub async fn tool_invoke(
         Ok(out) => out,
         Err(e) => {
             // Refund the hard-rate-limit token so a rejected dispatch
-            // does not permanently burn bucket capacity.
-            manager.refund_hard_rate_limit_blocking(&context_id, &invoker_did_typed);
+            // does not permanently burn bucket capacity. Uses the
+            // async variant to match the consume call above (we are
+            // on a tokio worker thread — `blocking_lock` would panic).
+            manager
+                .refund_hard_rate_limit(&context_id, &invoker_did_typed)
+                .await;
             return Err(napi::Error::from(e));
         }
     };
