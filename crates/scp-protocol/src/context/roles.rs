@@ -2296,6 +2296,186 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
+    // B2: suspended_capabilities fold precision (silent-escalation regression)
+    //
+    // Before the suspended_capabilities fold landed in
+    // `member_has_capability`, suspending a member with an unknown
+    // capability name caused silent full escalation to WriteAccess
+    // revocation (any gate that required any capability would return
+    // false). The fold now checks the suspension set for the exact
+    // capability being queried, so suspending one capability blocks
+    // ONLY that capability — other gates remain passable.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn suspension_blocks_only_the_exact_capability() {
+        // Suspend MessagesWrite. MessagesRead and GovernanceVote must
+        // remain passable — this is the core regression test for the
+        // old silent-escalation bug.
+        let ceiling = test_ceiling();
+        let mut state = ContextRoleState::new(
+            "ctx-b2-precise",
+            "did:dht:creator",
+            ceiling,
+            vec![],
+            &scp_primitives::SystemClock,
+        )
+        .unwrap();
+        state.members.insert("did:dht:alice".to_owned());
+        // Use admin so alice has all ceiling capabilities (incl. GovernanceVote/Propose).
+        assign_role(
+            &mut state,
+            "did:dht:alice",
+            "admin",
+            "did:dht:creator",
+            &scp_primitives::SystemClock,
+        )
+        .unwrap();
+
+        // Sanity: admin has all four before suspension.
+        assert!(state.member_has_capability("did:dht:alice", &Capability::MessagesRead));
+        assert!(state.member_has_capability("did:dht:alice", &Capability::MessagesWrite));
+        assert!(state.member_has_capability("did:dht:alice", &Capability::GovernanceVote));
+        assert!(state.member_has_capability("did:dht:alice", &Capability::GovernancePropose));
+
+        // Suspend only MessagesWrite.
+        state.suspend_capabilities("did:dht:alice", [Capability::MessagesWrite]);
+
+        // Only MessagesWrite is blocked. Everything else still passes.
+        assert!(!state.member_has_capability("did:dht:alice", &Capability::MessagesWrite));
+        assert!(state.member_has_capability("did:dht:alice", &Capability::MessagesRead));
+        assert!(state.member_has_capability("did:dht:alice", &Capability::GovernanceVote));
+        assert!(state.member_has_capability("did:dht:alice", &Capability::GovernancePropose));
+    }
+
+    #[test]
+    fn suspension_blocks_custom_capability_without_escalating() {
+        // Previously, suspending a custom capability (not a standard
+        // enum variant) caused a silent fall-through that the old
+        // string-match code path handled as "write access revoked".
+        // The fold check now looks at the exact `Capability::Custom`
+        // value, so the block is surgical: MessagesWrite stays
+        // passable when only the custom capability is suspended.
+        let ceiling = test_ceiling();
+        let mut state = ContextRoleState::new(
+            "ctx-b2-custom",
+            "did:dht:creator",
+            ceiling,
+            vec![],
+            &scp_primitives::SystemClock,
+        )
+        .unwrap();
+        state.members.insert("did:dht:alice".to_owned());
+        assign_role(
+            &mut state,
+            "did:dht:alice",
+            "member",
+            "did:dht:creator",
+            &scp_primitives::SystemClock,
+        )
+        .unwrap();
+
+        // Grant a custom capability by injecting it directly into the
+        // member's capability set (roles.rs doesn't add custom
+        // capabilities via the standard role flow but the fold must
+        // handle them correctly if someone does).
+        let custom = Capability::Custom("tool:invoke:calculator".to_owned());
+        state
+            .member_capabilities
+            .get_mut("did:dht:alice")
+            .unwrap()
+            .insert(custom.clone());
+        assert!(state.member_has_capability("did:dht:alice", &custom));
+
+        // Suspend the custom capability.
+        state.suspend_capabilities("did:dht:alice", [custom.clone()]);
+
+        // The custom capability is blocked; standard ones remain passable.
+        assert!(!state.member_has_capability("did:dht:alice", &custom));
+        assert!(state.member_has_capability("did:dht:alice", &Capability::MessagesWrite));
+        assert!(state.member_has_capability("did:dht:alice", &Capability::MessagesRead));
+    }
+
+    #[test]
+    fn suspension_of_mixed_standard_and_custom_capabilities() {
+        // Suspending a set containing both a standard variant AND a
+        // custom string must block both surgically without affecting
+        // unrelated capabilities.
+        let ceiling = test_ceiling();
+        let mut state = ContextRoleState::new(
+            "ctx-b2-mixed",
+            "did:dht:creator",
+            ceiling,
+            vec![],
+            &scp_primitives::SystemClock,
+        )
+        .unwrap();
+        state.members.insert("did:dht:alice".to_owned());
+        // Use admin so alice has GovernanceVote/GovernancePropose.
+        assign_role(
+            &mut state,
+            "did:dht:alice",
+            "admin",
+            "did:dht:creator",
+            &scp_primitives::SystemClock,
+        )
+        .unwrap();
+        let custom = Capability::Custom("payments:approve".to_owned());
+        state
+            .member_capabilities
+            .get_mut("did:dht:alice")
+            .unwrap()
+            .insert(custom.clone());
+
+        state.suspend_capabilities(
+            "did:dht:alice",
+            [Capability::GovernanceVote, custom.clone()],
+        );
+
+        // Both suspended capabilities are blocked.
+        assert!(!state.member_has_capability("did:dht:alice", &Capability::GovernanceVote));
+        assert!(!state.member_has_capability("did:dht:alice", &custom));
+        // Unrelated capabilities remain passable.
+        assert!(state.member_has_capability("did:dht:alice", &Capability::MessagesWrite));
+        assert!(state.member_has_capability("did:dht:alice", &Capability::MessagesRead));
+        assert!(state.member_has_capability("did:dht:alice", &Capability::GovernancePropose));
+    }
+
+    #[test]
+    fn restoring_capability_lifts_the_suspension() {
+        // restore_capabilities removes entries from the suspended set
+        // and drops the whole entry if empty. After restore, the gate
+        // passes again.
+        let ceiling = test_ceiling();
+        let mut state = ContextRoleState::new(
+            "ctx-b2-restore",
+            "did:dht:creator",
+            ceiling,
+            vec![],
+            &scp_primitives::SystemClock,
+        )
+        .unwrap();
+        state.members.insert("did:dht:alice".to_owned());
+        assign_role(
+            &mut state,
+            "did:dht:alice",
+            "member",
+            "did:dht:creator",
+            &scp_primitives::SystemClock,
+        )
+        .unwrap();
+        state.suspend_capabilities("did:dht:alice", [Capability::MessagesWrite]);
+        assert!(!state.member_has_capability("did:dht:alice", &Capability::MessagesWrite));
+
+        state.restore_capabilities("did:dht:alice", &[Capability::MessagesWrite]);
+        assert!(state.member_has_capability("did:dht:alice", &Capability::MessagesWrite));
+        assert!(
+            !state.suspended_capabilities.contains_key("did:dht:alice"),
+            "empty suspension set should be removed after full restore"
+        );
+    }
+
+    // -----------------------------------------------------------------------
     // validate_role_definition
     // -----------------------------------------------------------------------
 
