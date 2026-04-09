@@ -1036,13 +1036,10 @@ pub fn assign_role(
         .member_capabilities
         .insert(member_did.to_owned(), role_def.capabilities.clone());
 
-    // B5: prune any suspensions that fall outside the new role's
-    // grant set. Without this, `suspended_capabilities` would retain
-    // entries for capabilities the member no longer holds — either
-    // a) silently no-op (harmless but dead state) or b) accidentally
-    // re-engage if the member cycles back to a role that grants
-    // those capabilities later. Pruning on every role change is the
-    // safe, deterministic choice.
+    // Prune suspensions outside the new role's grant set. Otherwise
+    // `suspended_capabilities` would retain entries for capabilities
+    // the member no longer holds, which could accidentally re-engage
+    // if the member cycles back to a granting role later.
     state.prune_suspensions_to_role_grants(member_did, &role_def.capabilities);
 
     Ok(tokens)
@@ -1098,11 +1095,11 @@ pub fn system_assign_role(
         .member_capabilities
         .insert(member_did.to_owned(), role_def.capabilities.clone());
 
-    // B5: same prune-suspensions-to-role-grants invariant as
+    // Same prune-suspensions-to-role-grants invariant as
     // `assign_role` — system-level reassignment must also clean up
-    // stale suspensions. Otherwise a consequence-engine-triggered
-    // demotion could leave dangling suspension entries for
-    // capabilities the demoted role no longer grants.
+    // stale suspensions so a consequence-engine-triggered demotion
+    // cannot leave dangling entries for capabilities the demoted
+    // role no longer grants.
     state.prune_suspensions_to_role_grants(member_did, &role_def.capabilities);
 
     Ok(tokens)
@@ -2028,10 +2025,9 @@ mod tests {
 
     #[test]
     fn assign_role_prunes_suspensions_outside_new_role_grants() {
-        // B5: when a member is reassigned from a role that granted
-        // GovernanceVote to a role that does NOT grant it, the
-        // suspended-capability entry for GovernanceVote becomes
-        // meaningless and must be pruned.
+        // Reassigning from a role that granted GovernanceVote to a
+        // role that does NOT grant it must prune the now-meaningless
+        // suspended-capability entry.
         let ceiling = test_ceiling();
         let mut state = ContextRoleState::new(
             "ctx-b5-prune",
@@ -2085,9 +2081,9 @@ mod tests {
 
     #[test]
     fn assign_role_retains_suspensions_still_granted_by_new_role() {
-        // B5: when a member is reassigned to a role that still grants
-        // the suspended capability, the suspension must PERSIST. A
-        // banned voter who becomes admin is still banned from voting.
+        // Reassigning to a role that still grants the suspended
+        // capability must keep the suspension in place: a banned
+        // voter promoted to admin is still banned from voting.
         let ceiling = test_ceiling();
         let mut state = ContextRoleState::new(
             "ctx-b5-retain",
@@ -2139,9 +2135,9 @@ mod tests {
 
     #[test]
     fn assign_role_prunes_mixed_suspensions() {
-        // B5: when only some suspensions are outside the new role's
-        // grants, only those specific entries are dropped — the rest
-        // persist.
+        // When only some suspensions are outside the new role's
+        // grants, only those specific entries are dropped — the
+        // rest persist.
         let ceiling = test_ceiling();
         let mut state = ContextRoleState::new(
             "ctx-b5-mixed",
@@ -2295,23 +2291,14 @@ mod tests {
         assert!(state.member_has_capability("did:dht:alice", &Capability::MemberRemove));
     }
 
-    // -----------------------------------------------------------------------
-    // B2: suspended_capabilities fold precision (silent-escalation regression)
-    //
-    // Before the suspended_capabilities fold landed in
-    // `member_has_capability`, suspending a member with an unknown
-    // capability name caused silent full escalation to WriteAccess
-    // revocation (any gate that required any capability would return
-    // false). The fold now checks the suspension set for the exact
-    // capability being queried, so suspending one capability blocks
-    // ONLY that capability — other gates remain passable.
-    // -----------------------------------------------------------------------
+    // `suspended_capabilities` fold must check the exact capability
+    // being queried, so suspending one capability blocks only that
+    // capability — other gates remain passable.
 
     #[test]
     fn suspension_blocks_only_the_exact_capability() {
-        // Suspend MessagesWrite. MessagesRead and GovernanceVote must
-        // remain passable — this is the core regression test for the
-        // old silent-escalation bug.
+        // Suspend MessagesWrite. MessagesRead and GovernanceVote
+        // must remain passable.
         let ceiling = test_ceiling();
         let mut state = ContextRoleState::new(
             "ctx-b2-precise",
@@ -2350,12 +2337,9 @@ mod tests {
 
     #[test]
     fn suspension_blocks_custom_capability_without_escalating() {
-        // Previously, suspending a custom capability (not a standard
-        // enum variant) caused a silent fall-through that the old
-        // string-match code path handled as "write access revoked".
-        // The fold check now looks at the exact `Capability::Custom`
-        // value, so the block is surgical: MessagesWrite stays
-        // passable when only the custom capability is suspended.
+        // Suspending a `Capability::Custom` must block the exact
+        // capability and leave standard variants passable —
+        // surgical, not an escalation to "write access revoked".
         let ceiling = test_ceiling();
         let mut state = ContextRoleState::new(
             "ctx-b2-custom",

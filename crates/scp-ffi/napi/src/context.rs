@@ -116,10 +116,10 @@ pub struct NapiContextHandle {
     governance: String,
     /// Optional economic policy string.
     economic_policy: Option<String>,
-    /// Retained [`InMemoryKeyCustody`] for UCAN signing (RED-102).
+    /// Retained [`InMemoryKeyCustody`] for UCAN signing.
     #[cfg(feature = "allow_in_memory_custody")]
     pub(crate) in_memory_custody: Option<Arc<OpaqueInMemoryKeyCustody>>,
-    /// Handle to the creator's active signing key for UCAN minting (RED-102).
+    /// Handle to the creator's active signing key for UCAN minting.
     pub(crate) signing_key: Option<scp_platform::traits::KeyHandle>,
     /// The scp-core `ContextHandle` for this context, used for manager delegation.
     pub(crate) core_handle: Option<ContextHandle>,
@@ -413,7 +413,7 @@ pub async fn context_create(
         .to_owned();
     let economic_policy = params["economicPolicy"].as_str().map(str::to_owned);
 
-    // Extract key custody and signing key from the identity handle (RED-102).
+    // Extract key custody and signing key from the identity handle.
     #[cfg(feature = "allow_in_memory_custody")]
     let in_memory_custody = identity.inner.in_memory_custody.clone();
     let signing_key = identity

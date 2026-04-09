@@ -214,7 +214,7 @@ pub fn new_connection_tracker() -> ConnectionTracker {
 /// Returns `Ok(())` if the connection is allowed, or a
 /// [`ConnectionLimitExceeded`] error if the per-IP budget or the total
 /// connection budget is exhausted. Both checks and the increment happen
-/// under a single write lock to prevent TOCTOU races (BUG-002).
+/// under a single write lock to prevent TOCTOU races.
 ///
 /// Pass `Some(max_total)` to enforce a global connection cap alongside the
 /// per-IP cap. Pass `None` to skip the total check (the caller may enforce
@@ -241,7 +241,7 @@ fn register_connection_inner(
     max_per_ip: usize,
     max_total: Option<usize>,
 ) -> Result<(), ConnectionLimitExceeded> {
-    // Check total connection limit (BUG-002).
+    // Check total connection limit.
     if let Some(limit) = max_total {
         let total: usize = t.values().sum();
         if total >= limit {

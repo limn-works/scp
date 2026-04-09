@@ -470,8 +470,8 @@ impl From<scp_core::context::ContextError> for ScpError {
     fn from(e: scp_core::context::ContextError) -> Self {
         use scp_core::context::ContextError as CE;
         match &e {
-            // D4: surface the canonical rate-limit code through the
-            // typed envelope so Swift / Kotlin callers can detect
+            // Surface the canonical rate-limit code on the typed
+            // envelope so Swift / Kotlin callers can detect
             // rate-limit rejection without string-matching on the
             // message body.
             CE::RateLimited { .. } => Self::Context {
@@ -1716,7 +1716,7 @@ pub struct ContextHandle {
     pub(crate) state: tokio::sync::Mutex<ContextState>,
     /// DID of the context creator.
     pub(crate) creator_did: String,
-    /// Retained [`InMemoryKeyCustody`] for UCAN signing (RED-102).
+    /// Retained [`InMemoryKeyCustody`] for UCAN signing.
     ///
     /// Set during `context_create` from the creating identity's custody.
     /// Used by `ucan_mint` to produce real Ed25519 signatures.
@@ -1727,7 +1727,7 @@ pub struct ContextHandle {
     /// Retained [`CallbackKeyCustody`] for platform custody contexts.
     #[allow(dead_code)]
     pub(crate) callback_custody: Option<Arc<CallbackKeyCustody>>,
-    /// Handle to the creator's active signing key for UCAN minting (RED-102).
+    /// Handle to the creator's active signing key for UCAN minting.
     ///
     /// Points into the custody provider. Used by `ucan_mint`.
     #[allow(dead_code)]
@@ -1869,9 +1869,9 @@ impl UcanToken {
     }
 }
 
-// `Drop` for `UcanToken` — now that `ucan_mint` is wired to `scp-core` and
-// calls `increment_handle_count()`, this `Drop` impl decrements the counter
-// to maintain `scp_shutdown` handle-drain correctness (RED-102).
+// `ucan_mint` calls `increment_handle_count()`, so this `Drop` impl
+// decrements the counter to maintain `scp_shutdown` handle-drain
+// correctness.
 impl Drop for UcanToken {
     fn drop(&mut self) {
         decrement_handle_count();
@@ -2787,7 +2787,7 @@ pub async fn context_create(
                 .register_local_did(identity.did.clone().into())
                 .await;
 
-            // Extract key custody and signing key from the identity (RED-102).
+            // Extract key custody and signing key from the identity.
             #[cfg(feature = "allow_in_memory_custody")]
             let in_memory_custody = identity.in_memory_custody.clone();
             let callback_custody = identity.callback_custody.clone();
@@ -3543,16 +3543,12 @@ pub async fn tool_invoke(
                 proof_tokens.as_ref(),
             )?;
 
-            // D4 bypass close (UniFFI tool invoke): consume a
-            // hard-rate-limit token BEFORE any bridge-side tool
-            // dispatch. The UniFFI bridge owns its own
-            // `tool_registry` + `tool_handlers` on `ContextHandle`,
-            // so it does NOT go through
-            // `ContextManager::invoke_tool_with_economy`; without
-            // this hook a member rate-limited on `send_message` could
-            // still burn relay capacity via this path. Matches the
-            // pattern applied in PyO3 `py_tool_invoke` and NAPI
-            // `tool_invoke`.
+            // Consume a hard-rate-limit token BEFORE dispatching.
+            // The UniFFI bridge owns its own `tool_registry` +
+            // `tool_handlers` on `ContextHandle` and does not go
+            // through `ContextManager::invoke_tool_with_economy`, so
+            // this explicit hook is load-bearing for cap enforcement
+            // on tool calls.
             let invoker_did_typed: scp_primitives::DID = identity.did.clone().into();
             let now_secs = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -6091,8 +6087,6 @@ pub async fn ucan_validate(
 /// Returns `ScpError::Permission` if the context does not have key custody
 /// (created from an `identity_load` handle without key material) or if
 /// signing fails.
-///
-/// See RED-102 for the `KeyCustody` wiring story.
 #[uniffi::export]
 pub async fn ucan_mint(
     handle: Arc<ContextHandle>,
@@ -6122,7 +6116,7 @@ async fn ucan_mint_impl(
 ) -> Result<Arc<UcanToken>, ScpError> {
     runtime()
         .spawn(async move {
-            // Extract key custody and signing key from the context handle (RED-102).
+            // Extract key custody and signing key from the context handle.
             let custody =
                 handle
                     .in_memory_custody

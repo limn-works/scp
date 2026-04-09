@@ -1238,12 +1238,12 @@ async fn governance_action_rejects_replayed_proposal() {
 }
 
 // ===================================================================
-// Read access revocation/restoration (SCP-GG-006) — governance-gated
+// Read access revocation/restoration — governance-gated
 // ===================================================================
 
 /// Helper: creates a broadcast context with `MemberBan` in the ceiling,
 /// one author (alice), and one subscriber (sub1).
-/// SCP-GG-006: `Revoke (read)` on broadcast context bans subscriber.
+/// `Revoke (read)` on broadcast context bans subscriber.
 #[tokio::test]
 async fn revoke_read_access_bans_subscriber_in_broadcast() {
     let (manager, ctx_id) = setup_broadcast_with_member_ban().await;
@@ -1305,7 +1305,7 @@ async fn revoke_read_access_bans_subscriber_in_broadcast() {
     );
 }
 
-/// SCP-GG-006: `Revoke (read)` fails when ceiling lacks `MemberBan`.
+/// `Revoke (read)` fails when ceiling lacks `MemberBan`.
 #[tokio::test]
 async fn revoke_read_access_rejected_without_member_ban_ceiling() {
     // Create a broadcast context WITHOUT MemberBan in ceiling.
@@ -1389,7 +1389,7 @@ async fn revoke_read_access_rejected_without_member_ban_ceiling() {
     );
 }
 
-/// SCP-GG-006: `RestoreAccess (read)` unbans subscriber in broadcast context.
+/// `RestoreAccess (read)` unbans subscriber in broadcast context.
 #[tokio::test]
 async fn restore_read_access_unbans_subscriber_in_broadcast() {
     let (manager, ctx_id) = setup_broadcast_with_member_ban().await;
@@ -1451,7 +1451,7 @@ async fn restore_read_access_unbans_subscriber_in_broadcast() {
     );
 }
 
-/// SCP-GG-006: `RestoreAccess (read)` also fails without `MemberBan` in ceiling.
+/// `RestoreAccess (read)` also fails without `MemberBan` in ceiling.
 #[tokio::test]
 async fn restore_read_access_rejected_without_member_ban_ceiling() {
     // Create a broadcast context WITHOUT MemberBan in ceiling.

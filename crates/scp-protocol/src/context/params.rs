@@ -38,10 +38,8 @@ pub use super::roles::Capability;
 // RoleDefinition (re-export from roles module)
 // ---------------------------------------------------------------------------
 
-/// Re-export of the full [`RoleDefinition`] type.
-///
-/// Previously a name-only placeholder. Now re-exports the full type from
-/// `roles.rs` which includes `name` and `capabilities: HashSet<Capability>`.
+/// Re-export of the full [`RoleDefinition`] type from `roles.rs`,
+/// which includes `name` and `capabilities: HashSet<Capability>`.
 /// See ADR-009 in `.docs/adrs/phase-2.md`.
 pub use super::roles::RoleDefinition;
 
@@ -49,12 +47,11 @@ pub use super::roles::RoleDefinition;
 // ToolRegistration (re-export from tools/registry module)
 // ---------------------------------------------------------------------------
 
-/// Re-export of the full [`ToolRegistration`] type.
-///
-/// Previously a name-only placeholder. Now re-exports the full type from
-/// `tools/registry.rs` which includes `tool_id`, `name`, `description`,
-/// `schema`, `implementation_hash`, `test_vectors`, `operator_did`, and
-/// `cost`. See ADR-010 in `.docs/adrs/phase-2.md`.
+/// Re-export of the full [`ToolRegistration`] type from
+/// `tools/registry.rs`, which includes `tool_id`, `name`,
+/// `description`, `schema`, `implementation_hash`, `test_vectors`,
+/// `operator_did`, and `cost`. See ADR-010 in
+/// `.docs/adrs/phase-2.md`.
 pub use super::tools::ToolRegistration;
 
 // ---------------------------------------------------------------------------

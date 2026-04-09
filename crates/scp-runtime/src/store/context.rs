@@ -726,7 +726,7 @@ impl<S: Storage> ProtocolRepository<S> {
     /// `BroadcastContext::block_subscriber` returns, using the
     /// `block_list` field from `BlockResult`.
     ///
-    /// See spec section 5.14.8 for blocking semantics. See RED-016.
+    /// See spec section 5.14.8 for blocking semantics.
     ///
     /// # Errors
     ///
@@ -748,7 +748,7 @@ impl<S: Storage> ProtocolRepository<S> {
     /// author. The caller should pass the loaded set to
     /// `BroadcastContext::restore_block_list` during initialization.
     ///
-    /// See spec section 5.14.8 for blocking semantics. See RED-016.
+    /// See spec section 5.14.8 for blocking semantics.
     ///
     /// # Errors
     ///
@@ -1461,7 +1461,7 @@ mod tests {
     }
 
     // -------------------------------------------------------------------
-    // Broadcast block list persistence (RED-016)
+    // Broadcast block list persistence
     // -------------------------------------------------------------------
 
     #[tokio::test]

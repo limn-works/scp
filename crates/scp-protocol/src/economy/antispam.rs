@@ -57,8 +57,8 @@ pub const SNAPSHOT_CLOCK_SKEW_TOLERANCE_SECS: u64 = 5;
 ///
 /// Returned by [`SenderVelocityTracker::record_message`] so that a
 /// failed downstream operation can roll back its specific entry via
-/// [`SenderVelocityTracker::rollback`] — rather than popping "the most
-/// recent" entry, which is racy under concurrent senders (RED-805).
+/// [`SenderVelocityTracker::rollback`] — popping "the most recent"
+/// entry is racy under concurrent senders.
 ///
 /// Tokens are monotonically minted per-tracker (never reused) and are
 /// **not persisted**: snapshot exports preserve timestamps only, and
@@ -563,9 +563,9 @@ impl SenderVelocityTracker {
     /// having been pruned on a later `get_velocity` / `record_message`
     /// call, or the sender having no entries at all.
     ///
-    /// This replaces the old `rollback_last` which popped "the most
-    /// recent" entry — a race bug under concurrent senders. See
-    /// red-hat finding RED-805 and batch1 plan §F5.
+    /// A `rollback_last` style helper that pops "the most recent"
+    /// entry is racy under concurrent senders — token-scoped
+    /// rollback is the only correct form.
     #[allow(clippy::significant_drop_tightening)] // Lock scopes the entire lookup+mutate.
     pub fn rollback(&self, sender: &DID, token: VelocityRollbackToken) -> bool {
         let mut state = self
@@ -859,9 +859,10 @@ impl std::fmt::Debug for TokenBucketLimiter {
 
 /// Spec §19.7 per-DID escalating-cost message pricing configuration.
 ///
-/// Bundles the base cost, escalation schedule, floor/cap clamps, and the
-/// hard rate limit (defense-in-depth) for a single context. This is the
-/// in-context replacement for the deleted aggregate `RelayPricingConfig`.
+/// Bundles the base cost, escalation schedule, and floor/cap clamps
+/// for a single context. The hard rate limit (defense-in-depth,
+/// Matrix-style token bucket) is configured separately on the
+/// per-context governance state.
 ///
 /// Amount unit convention: `Amount(1) = $0.001` (one milli-cent), per
 /// existing test conventions in this module. The spec example

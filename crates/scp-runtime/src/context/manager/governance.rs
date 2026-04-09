@@ -1862,15 +1862,10 @@ impl ContextManager {
                 return Err(ContextError::MemberNotFound(did.to_string()));
             }
 
-            // Suspend the specified capabilities via role_state.
             ctx.role_state
                 .suspend_capabilities(did.as_ref(), capabilities.iter().cloned());
 
-            // Emit a capability-precise suspension event. Previously
-            // this path hardcoded `WriteAccessRevoked` which was wrong
-            // for any suspension that did not include
-            // `MessagesWrite` — the event would falsely claim write
-            // access had been revoked. The new variant carries the
+            // Emit a capability-precise suspension event carrying the
             // exact capability list so consumers can render accurate
             // UI and so the event payload matches the underlying
             // role_state mutation.
@@ -3987,22 +3982,14 @@ impl ContextManager {
                 .ok_or_else(|| ContextError::ContextNotRegistered(context_id.to_owned()))?;
             require_active(&ctx.handle)?;
 
-            // Preserve per-sender bucket state across the reconfigure,
-            // but clamp `tokens_milli > new_burst_milli` BEFORE handing
-            // the state to `from_snapshot`. `from_snapshot` itself does
-            // NOT clamp — the clamp relies on `try_consume`'s
-            // `.min(burst_milli)` after refill, which would only apply
-            // lazily on the next `try_consume` call. Calling
-            // `validate_and_sanitize_snapshot` here closes the window
-            // where a sender whose bucket holds more tokens than the
-            // NEW burst could consume them before refill hits —
-            // effectively a free burst up to the old cap.
-            //
-            // D4 review finding (security-reviewer MEDIUM): the
-            // previous version relied on a commented-but-nonexistent
-            // clamp invariant in `from_snapshot`. The explicit sanitize
-            // call below is load-bearing for the invariant that
-            // tightening the limit cannot grant a free burst.
+            // Preserve per-sender bucket state across the reconfigure
+            // and eagerly clamp `tokens_milli > new_burst_milli` before
+            // handing the state to `from_snapshot`. `from_snapshot`
+            // itself does not clamp; without this sanitize step a
+            // sender holding more tokens than the NEW burst could
+            // consume them before refill applies `.min(burst_milli)`,
+            // granting a free burst up to the old cap when the limit
+            // tightens.
             let mut preserved_state = ctx.governance.hard_rate_limit.snapshot_entries();
             scp_protocol::economy::antispam::TokenBucketLimiter::validate_and_sanitize_snapshot(
                 &mut preserved_state,

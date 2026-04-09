@@ -2848,8 +2848,8 @@ pub fn validate_against_template(params_json: String) -> Result<Option<String>, 
 /// WASM-local re-implementation of the 4-step pipeline from `scp-core`.
 /// Returns a Promise resolving to JSON: `{"decision": "auto_accept"|"prompt_agent"}`.
 ///
-/// Includes rate limiting (B1), full template validation (B2), and
-/// adapter/balance economic checks (B3) per #614 review findings.
+/// Includes rate limiting, full template validation, and
+/// adapter/balance economic checks.
 #[wasm_bindgen]
 pub fn evaluate_invitation(
     params_json: String,

@@ -274,11 +274,10 @@ impl From<scp_core::context::ContextError> for ScpPyError {
     fn from(e: scp_core::context::ContextError) -> Self {
         use scp_core::context::ContextError as CE;
         match &e {
-            // D4: expose the canonical rate-limit code through the
-            // typed error envelope, not just inside the formatted
-            // message. Without this, Python callers would have to
-            // string-match on `SCP-ECON-7090` embedded in the
-            // message to detect rate-limit rejection.
+            // Surface the canonical rate-limit code on the typed
+            // envelope so callers can `except ScpError` + `.code`
+            // check instead of string-matching `SCP-ECON-7090`
+            // inside the message body.
             CE::RateLimited { .. } => Self::ContextError {
                 message: format!("{e}"),
                 code: "SCP-ECON-7090".to_owned(),

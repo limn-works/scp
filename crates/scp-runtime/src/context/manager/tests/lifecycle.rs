@@ -1968,8 +1968,7 @@ async fn create_context_accepts_none_min_protocol_version() {
 }
 
 // -----------------------------------------------------------------------
-
-// ContextManagerBuilder tests (#937 review finding 6)
+// ContextManagerBuilder tests
 // -----------------------------------------------------------------------
 
 #[test]

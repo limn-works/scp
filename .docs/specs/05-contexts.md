@@ -415,7 +415,8 @@ Content access actions go through the context's governance model (propose/vote/e
 | `registered_tools` | 256 per context | Tools are heavyweight registrations; 256 exceeds any practical context |
 | `tool_interfaces` | 256 per context | Cross-context interfaces are bilateral agreements; 256 exceeds any practical context |
 | `threshold_signers` | 64 per context | Signers participate in quorum; >64 is operationally impractical |
-| `write_revoked_members` | No artificial cap | Naturally bounded by membership count — cannot revoke write for non-members |
+| `suspended_capabilities[did]` | No artificial cap | Naturally bounded by ceiling cardinality — at most one entry per capability per member |
+| `read_exclusion_list` | No artificial cap | Naturally bounded by membership count — cannot exclude non-members from CEK wrapping |
 
 Implementations MUST return an error (e.g., `LimitExceeded`) when an append would exceed the limit. The error message MUST include the limit value for debuggability.
 

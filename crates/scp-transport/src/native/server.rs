@@ -352,7 +352,7 @@ impl RelayServer {
 
             let ip = addr.ip();
 
-            // Enforce per-IP and total connection limits atomically (BUG-002).
+            // Enforce per-IP and total connection limits atomically.
             if let Err(e) = rate_limit::register_connection(
                 &self.connection_tracker,
                 ip,
@@ -477,7 +477,7 @@ impl RelayServer {
 
                 let ip = addr.ip();
 
-                // Enforce per-IP and total connection limits atomically (BUG-002).
+                // Enforce per-IP and total connection limits atomically.
                 if let Err(e) = rate_limit::register_connection(
                     &conn_tracker,
                     ip,
@@ -1430,7 +1430,7 @@ async fn handle_bridge_register(
     // this onto the WebSocket as pre-serialized binary frames.
     // When the connection closes (send fails), deregister the routing ID
     // so subsequent BRIDGE_DATA operations fail immediately instead of
-    // silently succeeding (GH review finding).
+    // silently succeeding.
     let pipe_tx = bridge_forward_tx.clone();
     let pipe_registry = Arc::clone(bridge_registry);
     let pipe_routing_id = routing_id;
@@ -1464,7 +1464,7 @@ async fn handle_bridge_register(
 /// pipe.
 ///
 /// Rate-limited via the same [`PublishRateLimiter`] as `PUBLISH` to
-/// prevent amplification attacks (security review finding).
+/// prevent amplification attacks.
 #[allow(clippy::too_many_arguments)]
 async fn handle_bridge_data(
     ref_id: Option<String>,
@@ -1516,7 +1516,7 @@ async fn handle_bridge_data(
 
     // Look up the forwarding channel for the target routing ID.
     // Error message is intentionally generic to prevent routing ID
-    // enumeration attacks (GH review finding).
+    // enumeration attacks.
     let Some(forward_tx) = bridge_registry.lookup(&target_routing_id).await else {
         let err = RelayMessage::Err {
             ref_id,

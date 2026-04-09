@@ -762,9 +762,9 @@ struct GovernanceState {
     cooldown_until: HashMap<usize, u64>,
     /// Spec §19.7 per-DID escalating-cost message pricing configuration.
     ///
-    /// Bundles base cost, escalation tiers, floor/cap clamps, and the
-    /// (separate) hard rate limit configuration. Replaces the deleted
-    /// non-spec aggregate `RelayPricingConfig`.
+    /// Bundles base cost, escalation tiers, and floor/cap clamps. The
+    /// hard rate limit (Matrix-style token bucket, defense-in-depth)
+    /// is configured separately via `hard_rate_limit` below.
     message_pricing: Option<scp_protocol::economy::antispam::ContextMessagePricingConfig>,
     /// Defense-in-depth Matrix-style token bucket hard rate limiter.
     ///

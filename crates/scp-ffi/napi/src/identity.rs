@@ -1217,10 +1217,6 @@ pub async fn identity_resolve(did: String) -> napi::Result<NapiDIDDocument> {
     })
 }
 
-// ---------------------------------------------------------------------------
-// Identity cleanup — remove_identity (#771 review finding 4)
-// ---------------------------------------------------------------------------
-
 /// Removes an identity from the global identity registry.
 ///
 /// Drops the retained key material (`InMemoryKeyCustody`) and `ScpIdentity`

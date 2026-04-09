@@ -1450,47 +1450,34 @@ impl ContextCryptoProvider for MlsCryptoProvider {
             sender_key_store.restore_epoch_high_water(&ctx_id_hex, &did, epoch);
         }
 
-        // Legacy-snapshot back-compat hardening (cryptographer review
-        // finding, C1 follow-up): pre-C1 snapshots have no
-        // `sender_key_epochs` field, so the map above is empty. If we
-        // installed key material below with `set_unchecked` and left
-        // every floor at 0, the first post-upgrade receive would be
-        // `set_checked(..., epoch=k>0)` and would be accepted against
-        // a zero floor — re-opening the `#1608` rollback window for
-        // exactly one boot cycle.
+        // Legacy-snapshot back-compat hardening: snapshots without a
+        // `sender_key_epochs` field leave the map above empty. If
+        // we installed key material below with `set_unchecked` and
+        // left every floor at 0, the first post-upgrade receive
+        // would be `set_checked(..., epoch=k>0)` and would be
+        // accepted against a zero floor — re-opening the rollback
+        // window for exactly one boot cycle.
         //
-        // `SenderKey` material does not carry the epoch it was bound
-        // to, so we cannot recover per-sender floors exactly from
-        // legacy data. Use the snapshot's global `sender_key_epoch`
-        // counter (which IS persisted in legacy snapshots) as a
-        // conservative lower bound for every sender we see key
-        // material for. This is strictly tighter than zero and
-        // closes the one-shot rollback window for the common case.
+        // `SenderKey` material does not carry the epoch it was
+        // bound to, so legacy data cannot recover per-sender floors
+        // exactly. Use the snapshot's global `sender_key_epoch`
+        // counter (present in legacy snapshots) as a conservative
+        // lower bound for every sender we see key material for.
+        // This is strictly tighter than zero and closes the one-
+        // shot rollback window for the common case.
         //
-        // RESIDUAL WINDOW (explicit): the global `sender_key_epoch`
-        // counter increments ONLY when the local provider runs
-        // `rotate_sender_key` — it reflects LOCAL rotation count, not
-        // remote peers' rotation counts. A remote sender whose true
-        // per-sender floor exceeded the local `sender_key_epoch` at
-        // snapshot time will be seeded with the lower local counter
-        // value. The residual rollback window for that sender is
-        //     peer_floor - local_floor
-        // where the upper bound on a single reject-window is bounded
-        // by the `MAX_EPOCH_ADVANCE = 1000` guard in the receive path
-        // (`open_inner_envelope` clamps any accepted epoch advance
-        // per distribution). An attacker who captured a sender-key
-        // distribution at peer epoch K where K > local_sender_key_epoch
-        // can replay it against the legacy-restored floor, but only
-        // up to the MAX_EPOCH_ADVANCE ceiling. The next legitimate
-        // rotation from that sender advances the floor past the
-        // exposed window permanently.
-        //
-        // Fully closing this residual would require either a format
-        // break (carrying per-sender epochs in legacy snapshots,
-        // which by definition they don't have) or rejecting legacy
-        // snapshots outright, which would lock users out of their
-        // contexts on upgrade. The conservative seed is the best
-        // recoverable bound without either of those trade-offs.
+        // Residual window: the global `sender_key_epoch` counter
+        // increments only on local `rotate_sender_key`, so a remote
+        // sender whose true floor exceeded the local counter at
+        // snapshot time is seeded with the lower local value. The
+        // residual window per sender is `peer_floor - local_floor`,
+        // bounded by the `MAX_EPOCH_ADVANCE = 1000` guard in
+        // `open_inner_envelope`. The next legitimate rotation from
+        // that sender advances the floor past the exposed window
+        // permanently. Closing this residual fully would require
+        // either a format break (carrying per-sender epochs in
+        // legacy snapshots, which they do not have) or rejecting
+        // legacy snapshots outright, locking users out on upgrade.
         let legacy_floor = if had_epoch_map {
             None
         } else {
@@ -2822,21 +2809,15 @@ mod tests {
 
     #[test]
     fn restore_legacy_snapshot_gap_case_residual_window_documented() {
-        // Exercises the RESIDUAL WINDOW case from the cryptographer
-        // Round 2 review: the legacy-snapshot floor seed uses the
-        // global `sender_key_epoch` counter, which reflects LOCAL
-        // rotation count only. A remote peer whose true
-        // per-sender floor exceeded the local counter at snapshot
-        // time will be seeded with the lower local value, leaving a
-        // residual rollback window bounded by `MAX_EPOCH_ADVANCE`
-        // in the receive path.
-        //
-        // This test pins the OBSERVED behavior (the seed = global
-        // counter, not the true peer floor) so future readers
-        // understand the residual window is known and documented,
-        // not a bug. The commit message's "fully close the rollback
-        // window" claim applies to the common case; this test
-        // acknowledges the gap case exists.
+        // Pins the residual-window case for legacy snapshots: the
+        // floor seed uses the global `sender_key_epoch` counter,
+        // which reflects LOCAL rotation count only. A remote peer
+        // whose true per-sender floor exceeded the local counter at
+        // snapshot time is seeded with the lower local value,
+        // leaving a residual rollback window bounded by
+        // `MAX_EPOCH_ADVANCE` in the receive path. This test
+        // encodes the observed behavior so the gap case is
+        // unambiguous.
         let provider = make_provider();
         let ctx_id = make_context_id();
         provider.create_mls_group(&ctx_id).unwrap();

@@ -88,7 +88,7 @@ The NAPI bridge uses `rand::rngs::OsRng.fill_bytes` directly. Format:
 - UCAN validation state (revocation lists, nonce trackers) lives in a separate `DashMap` registry,
   NOT in the `ContextManager`. The `ensure_registered` / `with_context` pattern accesses this state.
 - `context_close` does NOT perform bridge-layer authorization — it delegates to `ContextManager::close_context` which checks the `ContextClose` capability. Removes UCAN state via `remove_context` after closing.
-- `context_create` maps all user-specified fields from params JSON to `ContextParams` (mode, ceiling, ceiling_policy, promotion_policy, memory_scope, governance, ttl). Previously only mode and ttl were passed.
+- `context_create` maps all user-specified fields from params JSON to `ContextParams` (mode, ceiling, ceiling_policy, promotion_policy, memory_scope, governance, ttl).
 - The bridge event log provider uses `MerkleEventLogProvider::with_persistence` backed by
   `ProtocolRepositoryEventLogBridge` over encrypted in-memory storage (#484). The UCAN
   registry's `EventLog` is used separately for per-context Merkle proofs.

@@ -1032,7 +1032,8 @@ impl ContextManager {
             )));
         }
         // Suspension-aware capability check handles both role-based and
-        // suspension-based denial (replaces separate write_revoked_members check).
+        // suspension-based denial via the single source of truth at
+        // `member_has_capability` (folds `suspended_capabilities` first).
         if !ctx
             .role_state
             .member_has_capability(sender_did, &Capability::MessagesWrite)

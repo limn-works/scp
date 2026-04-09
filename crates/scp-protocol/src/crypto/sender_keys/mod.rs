@@ -967,10 +967,6 @@ mod tests {
         assert!(err.contains(&("did:b".to_owned(), 20, 15)));
     }
 
-    // -----------------------------------------------------------------------
-    // Epoch-poisoning guard (cryptographer Round 2 finding #2)
-    // -----------------------------------------------------------------------
-
     #[test]
     fn merge_first_branch_rejects_epoch_above_max_advance() {
         // Empty local context + an incoming snapshot from a

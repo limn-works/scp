@@ -632,10 +632,10 @@ fn py_identity_create_with_agent_key(py: Python<'_>, custody: &str) -> PyResult<
 ///   in a different process with in-memory custody (which does not
 ///   persist key material). File-backed custody survives restarts.
 ///
-/// Does NOT silently fall back to in-memory -- an explicit error is raised
-/// if the DID is not found (SCP-217 acceptance criterion 4).
+/// Does NOT silently fall back to in-memory -- an explicit error is
+/// raised if the DID is not found.
 ///
-/// See SCP-217, spec section 17.3, and RED-013.
+/// See spec section 17.3.
 #[pyfunction]
 fn py_identity_load(py: Python<'_>, did: &str) -> PyResult<PyIdentity> {
     validate::validate_did(did)?;
@@ -677,11 +677,11 @@ fn py_identity_load(py: Python<'_>, did: &str) -> PyResult<PyIdentity> {
                 ))));
             }
 
-            // SCP-IDENT-1010: Verify the identity has live crypto state
-            // in the registry. Without this check, the returned PyIdentity
-            // would be a dangling handle -- subsequent bridge functions
-            // (UCAN minting, signing, pseudonym derivation, key rotation)
-            // would fail with "identity not found in registry" (RED-013).
+            // Verify the identity has live crypto state in the registry.
+            // Without this check, the returned PyIdentity would be a
+            // dangling handle — subsequent bridge functions (UCAN
+            // minting, signing, pseudonym derivation, key rotation) would
+            // fail with "identity not found in registry".
             if crate::runtime::identity_registry_contains(&did_owned) {
                 let has_agent = crate::runtime::with_identity(&did_owned, |entry| {
                     Ok(entry.document.has_agent_key())

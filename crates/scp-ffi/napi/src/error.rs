@@ -137,9 +137,10 @@ impl From<scp_core::context::ContextError> for ScpNapiError {
     fn from(e: scp_core::context::ContextError) -> Self {
         use scp_core::context::ContextError as CE;
         match &e {
-            // D4: expose canonical rate-limit code programmatically
-            // so TypeScript callers don't have to string-match on
-            // SCP-ECON-7090 inside the message body.
+            // Surface the canonical rate-limit code on the typed
+            // envelope so TypeScript callers can check `.code`
+            // instead of string-matching `SCP-ECON-7090` inside
+            // the message body.
             CE::RateLimited { .. } => Self::Context {
                 message: format!("{e}"),
                 code: "SCP-ECON-7090".to_owned(),

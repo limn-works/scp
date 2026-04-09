@@ -274,7 +274,7 @@ pub struct SubscriptionResult {
 /// Contains the new broadcast key and epoch after rotation, which the caller
 /// must distribute to non-blocked subscribers. Also includes the author DID
 /// and the full block list so the caller can persist block state via
-/// `ProtocolRepository::store_broadcast_block_list`. See RED-016.
+/// `ProtocolRepository::store_broadcast_block_list`.
 #[derive(Debug)]
 pub struct BlockResult {
     /// The new AES-256-GCM broadcast key after rotation.
@@ -906,7 +906,7 @@ impl BroadcastContext {
     ///
     /// Called during initialization to rehydrate block state from
     /// `ProtocolRepository::load_broadcast_block_list`. If the author is not
-    /// registered, returns an error. See RED-016.
+    /// registered, returns an error.
     ///
     /// # Errors
     ///
@@ -939,7 +939,7 @@ impl BroadcastContext {
     ///    future content from any author.
     ///
     /// This method does NOT check ceiling policy — that is the
-    /// `ContextManager`'s responsibility (SCP-GG-006).
+    /// `ContextManager`'s responsibility.
     ///
     /// # Errors
     ///
@@ -1009,7 +1009,7 @@ impl BroadcastContext {
     /// restoration, not revocation.
     ///
     /// This method does NOT check ceiling policy — that is the
-    /// `ContextManager`'s responsibility (SCP-GG-006).
+    /// `ContextManager`'s responsibility.
     pub fn governance_unban_subscriber(&mut self, did: &str) {
         for author in self.authors.values_mut() {
             author.block_list.remove(did);
@@ -1367,7 +1367,7 @@ impl BroadcastContext {
     /// admission policy. Used by `ProtocolRepository::store_broadcast_state` to
     /// persist broadcast context state across process restarts.
     ///
-    /// See spec section 5.14 and RED-016.
+    /// See spec section 5.14.
     #[must_use]
     pub fn to_snapshot(&self) -> BroadcastContextSnapshot {
         let authors = self
@@ -1489,9 +1489,6 @@ pub struct AuthorStateSnapshot {
 /// subscriber, (6) capability match for `messages:read`, (7) attenuation
 /// narrowing, (8) ceiling compliance, (9) nonce freshness + uniqueness,
 /// (10) revocation check, (11) expiry + not-before bounds.
-///
-/// This replaces the previous stub that only checked `aud` and `att` strings
-/// without cryptographic verification (RED-103).
 fn validate_messages_read_ucan<D, N, R, P, S>(
     token: &UcanToken,
     context_id: &str,
@@ -2458,17 +2455,15 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // Wildcard UCAN rejection (RED-012)
+    // Wildcard UCAN with full validation
     // -----------------------------------------------------------------------
 
     #[test]
     fn subscribe_gated_accepts_wildcard_ucan_with_full_validation() {
         // With full UCAN validation (signature, chain, expiry, revocation),
-        // wildcard capabilities from legitimate issuers are safe to accept.
-        // The original stub rejected wildcards because it lacked cryptographic
-        // verification — without that, any wildcard token would grant access
-        // to all contexts. Now that full validation is in place (RED-103),
-        // wildcard grants from the context creator are legitimate.
+        // wildcard capabilities from legitimate issuers are safe to accept:
+        // only the context creator can issue them, and the chain guarantees
+        // that provenance.
         let mut ctx = make_gated_ctx();
         ctx.add_author("did:example:alice").unwrap();
         let mut setup = GatedTestSetup::new();
@@ -2603,7 +2598,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // Block list restore (RED-016)
+    // Block list restore
     // -----------------------------------------------------------------------
 
     #[test]
@@ -3772,7 +3767,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // Governance ban (SCP-GG-005)
+    // Governance ban
     // -----------------------------------------------------------------------
 
     #[test]
