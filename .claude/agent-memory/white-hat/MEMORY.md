@@ -70,7 +70,7 @@
 ### Critical Findings
 - claim_shadow() does NOT verify Ed25519 signatures - caller responsibility
 - BudgetTracker in spending.rs not thread-safe for concurrent async
-- StandingChannelManager TOCTOU race between lock drop and re-acquire
+- ContextManager standing context (contact graph, manager/standing.rs) TOCTOU race between lock drop and re-acquire
 - SenderVelocityTracker unbounded HashMap growth (Sybil DID exhaustion)
 
 ### Well-Defended

@@ -78,9 +78,9 @@ impl ContextManager {
                 // Drop broadcast context state -- keys are zeroed by Zeroize.
                 ctx.broadcast_context = None;
 
-                // Standing decay: clear participation cache and cooldown state
-                // on context close (#1530).
-                ctx.governance.decay_standing();
+                // Participation decay: clear participation cache and cooldown
+                // state on context close (#1530).
+                ctx.governance.decay_participation();
 
                 ctx.receive_buffer.push(ContextEvent::SystemClose {
                     initiator_did: initiator_did.clone(),
@@ -162,16 +162,16 @@ impl ContextManager {
         )
         .await;
 
-        // Cancel governance timeout task, decay standing, and emit appropriate
-        // event (lock acquired, then dropped).
+        // Cancel governance timeout task, decay participation, and emit
+        // appropriate event (lock acquired, then dropped).
         {
             let mut contexts = self.contexts.lock().await;
             if let Some(ctx) = contexts.get_mut(&context_id) {
                 ctx.governance.timeout_task.cancel();
-                // Standing decay on TTL expiry (#1530): clear participation
-                // cache and cooldown state so stale standing data does not
-                // carry over if the context is later restored.
-                ctx.governance.decay_standing();
+                // Participation decay on TTL expiry (#1530): clear
+                // participation cache and cooldown state so stale data does
+                // not carry over if the context is later restored.
+                ctx.governance.decay_participation();
                 if result.is_complete() {
                     ctx.receive_buffer.push(ContextEvent::Expired);
                 } else {

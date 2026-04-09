@@ -369,16 +369,22 @@ pub(super) fn event_log_entries_for_consequences(
     events
 }
 
-/// Checks whether a proposer is in good governance standing.
+/// Checks whether a proposer is eligible to submit a governance proposal.
 ///
-/// Members with a pending `RemoveMember` proposal approved against them
-/// cannot create new proposals (defense in depth, #1530). Members whose
-/// participation record shows poor standing (more governance actions against
-/// them than by them) are also blocked.
+/// Composite gate combining three independent eligibility signals (#1530):
+/// 1. **Pending removal** — defense-in-depth: members with an approved
+///    `RemoveMember` proposal targeting them cannot submit new proposals.
+/// 2. **Participation threshold** — members whose participation record
+///    shows a net-negative governance ratio (more actions against than by)
+///    are blocked. See [`scp_protocol::trust::participation::meets_threshold`].
 ///
 /// Refreshes the participation cache before checking by calling
 /// `compute_participation_record` with recent events from the receive buffer.
-fn check_standing(
+///
+/// Note: "standing" in the spec refers to persistent bilateral contact-graph
+/// contexts (§5.12.4-6), which is unrelated to this check. Do not reuse the
+/// word for the participation/eligibility model.
+fn check_proposer_eligibility(
     ctx: &mut PerContextState,
     proposer_did: &DID,
     now: u64,
@@ -395,7 +401,8 @@ fn check_standing(
         }
     }
 
-    // Refresh participation record from recent events before checking standing (#1530).
+    // Refresh participation record from recent events before checking the
+    // participation threshold (#1530).
     let context_id = ctx.handle.context_id().to_owned();
     let context_id_bytes = context_id_to_bytes(&context_id);
     let merkle_root = event_log
@@ -413,28 +420,29 @@ fn check_standing(
             Err(e) => {
                 // Fail-closed: if participation record computation fails,
                 // log a warning and deny the proposal. This prevents
-                // silently passing members with corrupted standing data.
+                // silently passing members with corrupted participation data.
                 tracing::warn!(
                     proposer = %proposer_did,
                     error = %e,
                     "compute_participation_record failed — denying proposal"
                 );
                 return Err(ContextError::PermissionDenied(
-                    "SCP-GOV-5021: participation record computation failed — cannot verify standing"
+                    "SCP-GOV-5021: participation record computation failed — cannot verify proposer eligibility"
                         .into(),
                 ));
             }
             Ok(record) => {
-                // Standing evaluation uses participation_count and governance_actions
-                // to determine if the member has sufficient standing (#1530).
-                // Only cache records with actual participation — new members with
-                // zero participation should not be blocked before they participate.
+                // Participation evaluation uses participation_count and
+                // governance_actions to determine eligibility (#1530).
+                // Only cache records with actual participation — new members
+                // with zero participation should not be blocked before they
+                // participate.
                 if record.participation_count > 0 {
                     tracing::trace!(
                         participation_count = record.participation_count,
                         governance_actions_by = record.governance_actions_by.len(),
                         governance_actions_against = record.governance_actions_against.len(),
-                        "standing evaluation for proposer"
+                        "participation evaluation for proposer"
                     );
                     ctx.governance
                         .participation_cache
@@ -444,15 +452,15 @@ fn check_standing(
         }
     }
 
-    // Check participation records for standing (#1530).
+    // Check participation records for eligibility (#1530).
     if let Some(record) = ctx
         .governance
         .participation_cache
         .get(proposer_did.as_ref())
-        && !scp_protocol::trust::participation::meets_standing_threshold(record)
+        && !scp_protocol::trust::participation::meets_threshold(record)
     {
         return Err(ContextError::PermissionDenied(
-            "member standing below threshold — cannot propose governance actions (SCP-GOV-5020)"
+            "member participation below threshold — cannot propose governance actions (SCP-GOV-5020)"
                 .into(),
         ));
     }
@@ -1226,9 +1234,9 @@ impl ContextManager {
                 ));
             }
 
-            // Standing check: verify proposer is in good governance
-            // standing before allowing new proposals (#1530).
-            check_standing(ctx, proposer_did, self.clock.now_secs(), &*self.event_log)?;
+            // Eligibility check: verify proposer satisfies pending-removal
+            // and participation gates before allowing new proposals (#1530).
+            check_proposer_eligibility(ctx, proposer_did, self.clock.now_secs(), &*self.event_log)?;
 
             // SCP-272: Check and auto-resolve expired governance freezes (48-hour timeout).
             let freeze_events = self.check_and_resolve_expired_freezes(ctx);
@@ -2492,8 +2500,8 @@ impl ContextManager {
             // Drop broadcast context state -- keys are zeroed by Zeroize.
             ctx.broadcast_context = None;
 
-            // M7: Standing decay on governance-driven close (#1530).
-            ctx.governance.decay_standing();
+            // M7: Participation decay on governance-driven close (#1530).
+            ctx.governance.decay_participation();
 
             if self.has_persistence() {
                 Some(Self::snapshot_context(ctx))
@@ -4295,8 +4303,8 @@ impl ContextManager {
             ctx.broadcast_context = None;
             // Clear migration state.
             ctx.migration_state = None;
-            // M7: Standing decay on tombstone (#1530).
-            ctx.governance.decay_standing();
+            // M7: Participation decay on tombstone (#1530).
+            ctx.governance.decay_participation();
 
             let snapshot = if self.has_persistence() {
                 Some(Self::snapshot_context(ctx))

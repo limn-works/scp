@@ -546,7 +546,7 @@ pub struct ContextSnapshot {
     /// Consequence rules declared at context creation (ADR-017, #1531).
     #[serde(default)]
     pub consequence_rules: Vec<scp_protocol::trust::consequence::ConsequenceRule>,
-    /// Per-member participation record cache for standing evaluation (#1530).
+    /// Per-member participation record cache for proposer eligibility (#1530).
     #[serde(default)]
     pub participation_cache:
         HashMap<String, scp_protocol::trust::participation::ParticipationRecord>,
@@ -736,7 +736,7 @@ struct GovernanceState {
     consequence_rules: Vec<ConsequenceRule>,
     /// Sender velocity tracker for anti-spam and consequence evaluation (§19.7, #1537).
     velocity_tracker: scp_protocol::economy::antispam::SenderVelocityTracker,
-    /// Per-member participation record cache for standing evaluation (#1530).
+    /// Per-member participation record cache for proposer eligibility (#1530).
     participation_cache: HashMap<String, scp_protocol::trust::participation::ParticipationRecord>,
     /// Cooldown tracking for consequence rules: maps `rule_index` to the Unix
     /// timestamp (seconds) until which the rule should not re-fire. Prevents
@@ -748,22 +748,23 @@ struct GovernanceState {
 }
 
 impl GovernanceState {
-    /// Clears participation cache and cooldown state (standing decay).
+    /// Clears participation cache, cooldown state, and velocity tracker.
     ///
     /// Called on context close so stale participation records and cooldown
     /// timers don't carry over if the context is re-created (#1530).
-    fn decay_standing(&mut self) {
+    fn decay_participation(&mut self) {
         self.participation_cache.clear();
         self.cooldown_until.clear();
-        // M26: Clear velocity tracker on standing decay. Stale velocity
+        // M26: Clear velocity tracker on participation decay. Stale velocity
         // data from a closed/expired context must not carry over.
         self.velocity_tracker.clear();
     }
 
     /// Evicts stale entries from caches to prevent unbounded growth.
     ///
-    /// Unlike [`decay_standing`](Self::decay_standing) (which clears
-    /// everything), this performs targeted eviction based on current state:
+    /// Unlike [`decay_participation`](Self::decay_participation) (which
+    /// clears everything), this performs targeted eviction based on current
+    /// state:
     /// - `participation_cache`: removes DIDs not in `last_known_members`.
     /// - `cooldown_until`: removes entries where `now >= expiry`.
     fn evict_stale_entries(&mut self, now: u64) {

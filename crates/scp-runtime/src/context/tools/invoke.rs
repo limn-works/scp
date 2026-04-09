@@ -144,7 +144,7 @@ pub struct ToolEconomyContext<'a, S: BuildHasher = std::hash::RandomState> {
     pub now: u64,
     /// Event log entries for consequence evaluation.
     pub events: &'a [scp_event_log::Event],
-    /// Participation cache for standing evaluation.
+    /// Participation cache for proposer eligibility evaluation.
     pub participation_cache: &'a mut std::collections::HashMap<
         String,
         scp_protocol::trust::participation::ParticipationRecord,
@@ -603,7 +603,7 @@ where
 /// Post-invocation bookkeeping: participation record update and consequence evaluation.
 ///
 /// Called after a successful tool invocation to update governance state.
-/// `compute_participation_record` refreshes the cache for standing evaluation
+/// `compute_participation_record` refreshes the cache for proposer eligibility
 /// (#1530). `evaluate_consequence_rules` checks whether the tool invocation
 /// triggered any consequence rules (#1531).
 pub fn post_tool_invocation_bookkeeping<S: std::hash::BuildHasher>(

@@ -345,17 +345,18 @@ fn leave_context_calls_rotate_sender_key() {
     );
 }
 
-// --- Standing (#1530) ---
+// --- Proposer eligibility / Participation (#1530) ---
 
 #[test]
-fn propose_governance_checks_standing() {
+fn propose_governance_checks_proposer_eligibility() {
     assert!(
         fn_body_contains(
             MANAGER_SRC,
             "propose_governance_action_inner",
-            "check_standing"
+            "check_proposer_eligibility"
         ),
-        "propose_governance_action_inner must consult standing scores"
+        "propose_governance_action_inner must consult proposer eligibility \
+         (pending removal + participation threshold)"
     );
 }
 
@@ -462,15 +463,15 @@ fn no_stale_ignores() {
         stale.push("economy enforcement wired but #[ignore] for #1537 still present");
     }
 
-    // #1530 — standing checks wired in propose_governance_action_inner
+    // #1530 — proposer eligibility check wired in propose_governance_action_inner
     if fn_body_contains(
         MANAGER_SRC,
         "propose_governance_action_inner",
-        "check_standing",
+        "check_proposer_eligibility",
     ) && source.contains("#[ignore = \"")
         && source.contains("1530")
     {
-        stale.push("standing check wired but #[ignore] for #1530 still present");
+        stale.push("proposer eligibility check wired but #[ignore] for #1530 still present");
     }
 
     // #1548 — content key rotation wired in execute_rotate_content_keys

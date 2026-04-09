@@ -5438,7 +5438,7 @@ async fn test_role_demotion_changes_member_role() {
 
 /// Standing decay clears participation cache and cooldown state.
 #[tokio::test]
-async fn test_standing_decay_clears_caches() {
+async fn test_participation_decay_clears_caches() {
     let manager = ContextManager::new(
         Box::new(MockCrypto::default()),
         Box::new(MockTransport::connected()),
@@ -5478,7 +5478,7 @@ async fn test_standing_decay_clears_caches() {
         ctx.governance.cooldown_until.insert(0, 999_999);
     }
 
-    // Close the context (triggers standing decay).
+    // Close the context (triggers participation decay).
     let admin_did: DID = "did:key:admin".into();
     manager.close_context(&handle, &admin_did).await.unwrap();
 
@@ -5733,9 +5733,9 @@ async fn test_auto_accept_blocked_for_paid_contexts() {
 // Behavioral tests for quest gates (batch 2)
 // -----------------------------------------------------------------------
 
-/// Standing blocks proposal: member with pending removal cannot propose (#1530).
+/// Pending removal blocks proposal: member with pending removal cannot propose (#1530).
 #[tokio::test]
-async fn standing_blocks_proposal_for_pending_removal() {
+async fn pending_removal_blocks_proposal() {
     use scp_protocol::context::governance::{GovernanceAction, GovernanceProposal, ProposalStatus};
 
     let manager = ContextManager::new(
@@ -5802,7 +5802,7 @@ async fn standing_blocks_proposal_for_pending_removal() {
 /// Standing vote influence: member with participation can propose, member without cannot
 /// when they have a pending removal (#1530).
 #[tokio::test]
-async fn standing_vote_influence_on_governance() {
+async fn participation_influences_governance_eligibility() {
     let manager = ContextManager::new(
         Box::new(MockCrypto::default()),
         Box::new(MockTransport::connected()),
@@ -5819,7 +5819,7 @@ async fn standing_vote_influence_on_governance() {
         .await
         .unwrap();
 
-    // Admin can propose (no pending removal, good standing).
+    // Admin can propose (no pending removal, eligible participation).
     let action = scp_protocol::context::governance::GovernanceAction::RegisterTool {
         registration: Box::new(test_tool_registration("admin-tool")),
     };
@@ -5828,13 +5828,13 @@ async fn standing_vote_influence_on_governance() {
         .await;
     assert!(
         result.is_ok(),
-        "admin with good standing should be able to propose"
+        "admin with eligible participation should be able to propose"
     );
 }
 
-/// Standing check blocks proposal for member with low standing (#1530).
+/// Eligibility check blocks proposal for member with low participation (#1530).
 #[tokio::test]
-async fn standing_check_blocks_low_standing_proposer() {
+async fn participation_blocks_low_score_proposer() {
     use scp_protocol::context::governance::GovernanceAction;
 
     let manager = ContextManager::new(
@@ -5861,7 +5861,7 @@ async fn standing_check_blocks_low_standing_proposer() {
     };
     manager.join_context(&handle, kp, None).await.unwrap();
 
-    // Simulate a pending removal against Alice (standing defense-in-depth).
+    // Simulate a pending removal against Alice (eligibility defense-in-depth).
     {
         let mut contexts = manager.contexts.lock().await;
         let ctx = contexts.get_mut("standing-low-ctx").unwrap();
@@ -5885,7 +5885,7 @@ async fn standing_check_blocks_low_standing_proposer() {
             .insert([1u8; 32], (proposal, 0, 0));
     }
 
-    // Alice tries to propose — denied due to pending removal (standing).
+    // Alice tries to propose — denied due to pending removal.
     let action = GovernanceAction::RegisterTool {
         registration: Box::new(test_tool_registration("blocked-tool")),
     };
@@ -5894,7 +5894,7 @@ async fn standing_check_blocks_low_standing_proposer() {
         .await;
     assert!(
         result.is_err(),
-        "low-standing member should be denied proposal"
+        "low-participation member should be denied proposal"
     );
 }
 
@@ -5993,9 +5993,9 @@ fn dynamic_pricing_adjusts_on_utilization() {
     );
 }
 
-/// Standing decay reduces participation count when cache is cleared (#1530).
+/// Participation decay clears participation cache (#1530).
 #[tokio::test]
-async fn standing_decay_reduces_participation() {
+async fn decay_participation_clears_state() {
     let manager = ContextManager::new(
         Box::new(MockCrypto::default()),
         Box::new(MockTransport::connected()),
@@ -6032,11 +6032,11 @@ async fn standing_decay_reduces_participation() {
         );
     }
 
-    // Simulate standing decay (called on close).
+    // Simulate participation decay (called on close).
     {
         let mut contexts = manager.contexts.lock().await;
         let ctx = contexts.get_mut("decay-ctx").unwrap();
-        ctx.governance.decay_standing();
+        ctx.governance.decay_participation();
     }
 
     // Verify participation cache is empty after decay.
@@ -6171,7 +6171,7 @@ async fn budget_exceeded_on_tool_invoke() {
 
 /// Negative test: rejection for pending removal blocks governance (#1530).
 #[tokio::test]
-async fn rejected_standing_blocks_governance() {
+async fn pending_removal_blocks_governance() {
     use scp_protocol::context::governance::GovernanceAction;
 
     let manager = ContextManager::new(
@@ -6997,9 +6997,9 @@ async fn full_send_consequence_enforcement_round_trip() {
     assert!(has_velocity, "velocity should be recorded after send");
 }
 
-/// Governance -> standing -> participation round trip (#1530, cross-cutting).
+/// Governance action -> participation update -> eligibility round trip (#1530).
 #[tokio::test]
-async fn governance_standing_participation_round_trip() {
+async fn governance_participation_round_trip() {
     let manager = ContextManager::new(
         Box::new(MockCrypto::default()),
         Box::new(MockTransport::connected()),
@@ -7285,11 +7285,11 @@ async fn verify_receipts_no_adapter_returns_error() {
 // Comprehensive behavioral tests — batch 2 delta (37-test plan coverage)
 // -----------------------------------------------------------------------
 
-/// Standing blocks member with low participation record — more governance
+/// Eligibility check blocks member with low participation — more governance
 /// actions against them than by them (#1530).
 /// Uses Threshold governance so non-admin members can propose.
 #[tokio::test]
-async fn standing_blocks_low_participation() {
+async fn eligibility_blocks_low_participation() {
     use scp_protocol::context::governance::GovernanceAction;
     use scp_protocol::trust::GovernanceActionSummary;
     use scp_protocol::trust::participation::ParticipationRecord;
@@ -7322,12 +7322,13 @@ async fn standing_blocks_low_participation() {
     };
     manager.join_context(&handle, kp, None).await.unwrap();
 
-    // Drain events from the buffer so check_standing's refresh finds an
-    // empty event list and preserves our injected cache entry.
+    // Drain events from the buffer so check_proposer_eligibility's refresh
+    // finds an empty event list and preserves our injected cache entry.
     let _ = manager.drain_events("low-stand-ctx").await;
 
     // Now inject a poor participation record for Bob: more actions against
-    // than by. With an empty buffer, check_standing won't overwrite it.
+    // than by. With an empty buffer, check_proposer_eligibility won't
+    // overwrite it.
     {
         let mut contexts = manager.contexts.lock().await;
         let ctx = contexts.get_mut("low-stand-ctx").unwrap();
@@ -7363,7 +7364,7 @@ async fn standing_blocks_low_participation() {
         );
     }
 
-    // Bob tries to propose — should fail due to low standing.
+    // Bob tries to propose — should fail due to low participation.
     let action = GovernanceAction::RegisterTool {
         registration: Box::new(test_tool_registration("low-standing-tool")),
     };
@@ -7372,19 +7373,19 @@ async fn standing_blocks_low_participation() {
         .await;
     assert!(
         result.is_err(),
-        "member with low standing should be rejected"
+        "member with low participation should be rejected"
     );
     let err = result.unwrap_err();
     assert!(
-        matches!(err, ContextError::PermissionDenied(ref msg) if msg.contains("standing below threshold")),
-        "expected standing threshold error, got: {err}"
+        matches!(err, ContextError::PermissionDenied(ref msg) if msg.contains("participation below threshold")),
+        "expected participation threshold error, got: {err}"
     );
 }
 
-/// Standing allows member with good participation (more actions by than against) (#1530).
+/// Eligibility check allows member with good participation (more actions by than against) (#1530).
 /// Uses Threshold governance so non-admin members can propose.
 #[tokio::test]
-async fn standing_allows_good_member() {
+async fn eligibility_allows_good_participation() {
     use scp_protocol::context::governance::GovernanceAction;
     use scp_protocol::trust::GovernanceActionSummary;
     use scp_protocol::trust::participation::ParticipationRecord;
@@ -7454,7 +7455,7 @@ async fn standing_allows_good_member() {
         );
     }
 
-    // Alice proposes — should succeed (good standing).
+    // Alice proposes — should succeed (good participation).
     let action = GovernanceAction::RegisterTool {
         registration: Box::new(test_tool_registration("good-standing-tool")),
     };
@@ -7463,7 +7464,7 @@ async fn standing_allows_good_member() {
         .await;
     assert!(
         result.is_ok(),
-        "member with good standing should be allowed to propose: {result:?}"
+        "member with good participation should be allowed to propose: {result:?}"
     );
 }
 
@@ -9538,9 +9539,10 @@ async fn test_send_consequence_economy_round_trip() {
     assert!(has_velocity, "velocity should be recorded");
 }
 
-/// Governance action updates participation, which is then used by `check_standing` (#1530).
+/// Governance action updates participation, which is then used by
+/// `check_proposer_eligibility` (#1530).
 #[tokio::test]
-async fn test_governance_standing_participation_round_trip() {
+async fn test_governance_eligibility_participation_round_trip() {
     let manager = ContextManager::new(
         Box::new(MockCrypto::default()),
         Box::new(MockTransport::connected()),
@@ -11984,8 +11986,8 @@ async fn participation_cache_cleared_after_member_leaves() {
             .participation_cache
             .contains_key(alice.as_ref())
     };
-    // Note: participation cache eviction is triggered by standing decay, not
-    // immediately on leave. The cache MAY still have Alice's entry. What we
+    // Note: participation cache eviction is triggered by participation decay,
+    // not immediately on leave. The cache MAY still have Alice's entry. What we
     // verify is that the membership state no longer contains Alice.
     let membership_has_alice = {
         let contexts = manager.contexts.lock().await;
@@ -12851,11 +12853,11 @@ async fn budget_not_deducted_on_transport_failure() {
 }
 
 // -----------------------------------------------------------------------
-// §50. Standing check uses injected clock
+// §50. Eligibility check uses injected clock
 // -----------------------------------------------------------------------
 
 #[tokio::test]
-async fn standing_check_uses_context_manager_clock() {
+async fn eligibility_check_uses_context_manager_clock() {
     // Verify the ContextManager is constructed with a clock and uses it
     // for governance operations. The default clock is SystemClock, but the
     // builder allows injection.
@@ -14242,11 +14244,11 @@ async fn test_member_reset_rotates_sender_keys() {
 }
 
 // -----------------------------------------------------------------------
-// M7: decay_standing on governance close
+// M7: decay_participation on governance close
 // -----------------------------------------------------------------------
 
 #[tokio::test]
-async fn test_governance_close_decays_standing() {
+async fn test_governance_close_decays_participation() {
     use scp_protocol::context::governance::{
         GovernanceAction, GovernanceProposal, ProposalStatus, SignedVote, VoteType,
     };
@@ -14323,8 +14325,8 @@ async fn test_governance_close_decays_standing() {
     let contexts = manager.contexts.lock().await;
     let ctx = contexts.get(&context_id).unwrap();
     // Note: participation_cache may be re-populated by finalize_governance_action
-    // after decay_standing runs inside execute_close_context. The important
-    // assertion is that cooldown_until was cleared (decay_standing ran).
+    // after decay_participation runs inside execute_close_context. The important
+    // assertion is that cooldown_until was cleared (decay_participation ran).
     assert!(ctx.governance.cooldown_until.is_empty());
 }
 
@@ -14369,11 +14371,11 @@ async fn test_deliver_incoming_evaluates_consequences() {
 }
 
 // -----------------------------------------------------------------------
-// M26: decay_standing clears velocity_tracker
+// M26: decay_participation clears velocity_tracker
 // -----------------------------------------------------------------------
 
 #[tokio::test]
-async fn test_decay_standing_clears_velocity_tracker() {
+async fn test_decay_participation_clears_velocity_tracker() {
     let manager = ContextManager::new(
         Box::new(MockCrypto::default()),
         Box::new(MockTransport::connected()),
@@ -14401,7 +14403,7 @@ async fn test_decay_standing_clears_velocity_tracker() {
     {
         let mut contexts = manager.contexts.lock().await;
         let ctx = contexts.get_mut(&context_id).unwrap();
-        ctx.governance.decay_standing();
+        ctx.governance.decay_participation();
     }
     {
         let contexts = manager.contexts.lock().await;
