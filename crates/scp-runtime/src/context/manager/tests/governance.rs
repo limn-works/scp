@@ -6147,7 +6147,6 @@ async fn budget_exceeded_on_tool_invoke() {
     let mut economy = ToolEconomyContext {
         economic_policy: Some(&policy),
         budget_tracker: &mut tracker,
-        action_ucan: None,
         spending_ucan: Some(&spending_ucan),
         context_id: "ctx-test",
         now: 0,
@@ -7775,7 +7774,6 @@ async fn tool_invoke_deducts_budget() {
         let mut economy = ToolEconomyContext {
             economic_policy: Some(&policy),
             budget_tracker: &mut tracker,
-            action_ucan: None,
             spending_ucan: Some(&spending_ucan),
             context_id: "ctx-test",
             now: 0,
@@ -7809,7 +7807,6 @@ async fn tool_invoke_deducts_budget() {
         let mut economy = ToolEconomyContext {
             economic_policy: Some(&policy),
             budget_tracker: &mut tracker,
-            action_ucan: None,
             spending_ucan: Some(&spending_ucan),
             context_id: "ctx-test",
             now: 0,
@@ -7964,57 +7961,27 @@ async fn velocity_tracker_records_messages() {
 }
 
 /// UCAN spending composition checked on tool invoke (#1537).
-/// When cost > 0, both action UCAN and spending UCAN must be present.
-/// Action UCAN is always required even for free actions.
+/// Per spec §19.5, paid tool invocations require a spending UCAN. The action
+/// capability side of AND-composition is verified UPSTREAM at the
+/// `ToolInvoke` / `ToolInvokeAll` `member_has_capability` gate (see
+/// `invoke_tool`), so this test only exercises the spending side.
 #[test]
-fn ucan_spending_composition_checked_on_tool_invoke() {
-    use crate::context::tools::invoke::check_tool_ucan_composition;
+fn ucan_spending_capability_checked_on_tool_invoke() {
+    use crate::context::tools::invoke::check_tool_spending_capability;
     use scp_protocol::economy::types::Amount;
 
-    // No UCANs at all, cost > 0 — should fail (action UCAN required).
-    let result = check_tool_ucan_composition(Amount::new(100), None, None);
+    // No spending UCAN, cost > 0 — must fail.
+    let result = check_tool_spending_capability(Amount::new(100), None);
     assert!(
         result.is_err(),
-        "should fail when cost > 0 and no UCANs provided: {result:?}"
+        "should fail when cost > 0 and no spending UCAN provided: {result:?}"
     );
 
-    // No UCANs at all, cost = 0 — should succeed (free actions bypass UCAN validation).
-    let result_zero = check_tool_ucan_composition(Amount::new(0), None, None);
+    // No spending UCAN, cost = 0 — free actions bypass spending validation.
+    let result_zero = check_tool_spending_capability(Amount::new(0), None);
     assert!(
         result_zero.is_ok(),
-        "should succeed with cost=0 (free action, no UCANs needed): {result_zero:?}"
-    );
-
-    // Construct a minimal dummy UcanToken for testing.
-    let dummy_token = scp_protocol::crypto::ucan::UcanToken {
-        header: scp_protocol::crypto::ucan::UcanHeader::new(),
-        payload: scp_protocol::crypto::ucan::UcanPayload {
-            iss: "did:key:test".to_owned(),
-            aud: "did:key:aud".to_owned(),
-            exp: u64::MAX,
-            nbf: None,
-            nnc: "test-nonce".to_owned(),
-            att: vec![],
-            prf: vec![],
-            fct: None,
-        },
-        signature: vec![],
-        encoded: "test.token.encoded".to_owned(),
-    };
-
-    // With action UCAN but no spending UCAN, cost > 0 — should fail (spending required).
-    let result_no_spending =
-        check_tool_ucan_composition(Amount::new(100), Some(&dummy_token), None);
-    assert!(
-        result_no_spending.is_err(),
-        "should fail when cost > 0 and no spending UCAN: {result_no_spending:?}"
-    );
-
-    // With action UCAN but no spending UCAN, cost = 0 — should succeed.
-    let result_free = check_tool_ucan_composition(Amount::new(0), Some(&dummy_token), None);
-    assert!(
-        result_free.is_ok(),
-        "should succeed with action UCAN and cost=0: {result_free:?}"
+        "should succeed with cost=0 (free action, no spending UCAN needed): {result_zero:?}"
     );
 }
 
@@ -8954,7 +8921,6 @@ async fn test_tool_invoke_rejected_insufficient_budget() {
     let mut economy = ToolEconomyContext {
         economic_policy: Some(&policy),
         budget_tracker: &mut tracker,
-        action_ucan: None,
         spending_ucan: Some(&spending_ucan),
         context_id: "ctx-test",
         now: 0,

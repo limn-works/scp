@@ -134,9 +134,10 @@ pub struct ToolEconomyContext<'a, S: BuildHasher = std::hash::RandomState> {
     pub economic_policy: Option<&'a scp_protocol::economy::types::EconomicPolicy>,
     /// Mutable reference to the invoker's budget tracker.
     pub budget_tracker: &'a mut scp_protocol::economy::budget::MemberBudgetTracker,
-    /// Action UCAN for AND-composition check (§19.5). `None` if no action UCAN presented.
-    pub action_ucan: Option<&'a UcanToken>,
-    /// Spending UCAN for AND-composition check (§19.5). `None` if no spending UCAN presented.
+    /// Spending UCAN for spending-capability check (§19.5). `None` if no
+    /// spending UCAN presented. The action capability side of AND-composition
+    /// is verified UPSTREAM at the `member_has_capability` gate — see the
+    /// `ToolInvoke` / `ToolInvokeAll` check earlier in `invoke_tool`.
     pub spending_ucan: Option<&'a UcanToken>,
     /// Context ID for bookkeeping.
     pub context_id: &'a str,
@@ -550,9 +551,11 @@ pub(crate) fn economy_pre_check<S: BuildHasher>(
         return Ok(cost);
     }
 
-    // UCAN AND-composition check (§19.5): paid actions require both an
-    // action capability (already checked by step 2) and a spending UCAN.
-    check_tool_ucan_composition(cost, economy.action_ucan, economy.spending_ucan)?;
+    // Spending UCAN check (§19.5): paid actions require a spending UCAN.
+    // The action capability was already verified at step 2 via the
+    // `ToolInvoke` / `ToolInvokeAll` `member_has_capability` check — that
+    // is the action side of AND-composition (see spec §19.5 layer split).
+    check_tool_spending_capability(cost, economy.spending_ucan)?;
 
     // Budget check — no auto-grant. Budget must be explicitly approved via
     // ApproveSpend governance action. We deliberately do NOT call
@@ -841,31 +844,31 @@ pub fn post_tool_invocation_bookkeeping<S: std::hash::BuildHasher>(
     evaluate_consequence_rules(consequence_rules, events, invoker_did.as_ref(), now)
 }
 
-/// Validates UCAN AND-composition for tool invocations with economic cost.
+/// Validates the spending side of AND-composition for paid tool invocations
+/// (spec §19.5).
 ///
-/// If the tool invocation has a cost (from the context's economic policy),
-/// checks that the invoker has both an action UCAN and a spending UCAN.
-/// Called as part of the tool invocation economy pre-check (#1537, §19.5).
+/// Per spec §19.5, paid actions require BOTH an action capability AND a
+/// spending UCAN. The action capability is verified UPSTREAM at the
+/// `ToolInvoke` / `ToolInvokeAll` `member_has_capability` gate (see
+/// `invoke_tool`). This function verifies the spending side only.
 ///
 /// # Errors
 ///
-/// Returns [`InvocationError::ExecutionFailed`] if the AND-composition check
-/// fails (missing action UCAN or missing spending UCAN for a paid action).
-pub fn check_tool_ucan_composition(
+/// Returns [`InvocationError::ExecutionFailed`] if the spending UCAN is
+/// missing for a paid action or if the spending capability is malformed.
+pub fn check_tool_spending_capability(
     action_cost: scp_protocol::economy::types::Amount,
-    action_ucan: Option<&UcanToken>,
     spending_ucan: Option<&UcanToken>,
 ) -> Result<(), InvocationError> {
     // Convert economy Amount to UCAN spending Amount (both are u64 wrappers).
     let ucan_amount = scp_protocol::crypto::ucan::spending::Amount(action_cost.0);
-    scp_protocol::crypto::ucan::spending::check_and_composition(
-        action_ucan,
+    scp_protocol::crypto::ucan::spending::check_spending_capability(
         spending_ucan,
         ucan_amount,
         "tool:invoke",
     )
     .map_err(|e| InvocationError::ExecutionFailed {
-        message: format!("UCAN spending composition check failed: {e}"),
+        message: format!("UCAN spending capability check failed: {e}"),
     })
 }
 
@@ -1980,7 +1983,6 @@ mod tests {
         let mut economy = super::ToolEconomyContext {
             economic_policy: Some(&policy),
             budget_tracker: &mut tracker,
-            action_ucan: None,
             spending_ucan: Some(&spending_ucan),
             context_id: "ctx-invoke-test",
             now: 0,

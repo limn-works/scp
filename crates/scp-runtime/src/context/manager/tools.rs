@@ -240,7 +240,6 @@ impl ContextManager {
         tool_id: &ToolId,
         input: serde_json::Value,
         invoker_did: &DID,
-        action_ucan: Option<&UcanToken>,
         spending_ucan: Option<&UcanToken>,
         timeout_ms: Option<u32>,
         executor: F,
@@ -326,7 +325,6 @@ impl ContextManager {
                 let economy = ToolEconomyContext {
                     economic_policy: economic_policy.as_ref(),
                     budget_tracker: &mut ctx.governance.budget_tracker,
-                    action_ucan,
                     spending_ucan,
                     context_id,
                     now: now_secs,

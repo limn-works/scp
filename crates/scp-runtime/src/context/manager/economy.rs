@@ -316,27 +316,22 @@ pub(super) fn enforce_economy(
         return Ok(None);
     }
 
-    // AND-composition (spec section 19.5, #1593): paid actions require both the
-    // action capability (already checked by the caller) AND a spending UCAN.
+    // AND-composition (spec §19.5, #1593): paid actions require both the
+    // action capability AND a spending UCAN. The action capability side is
+    // verified UPSTREAM at the `member_has_capability` gate (see
+    // `messaging.rs` for `MessagesWrite`, `lifecycle.rs` for `ContextJoin`,
+    // etc.). This block verifies the spending side.
     // Free actions (cost == 0) pass through above.
     if spending_ucan.is_none() {
         return Err(ContextError::PermissionDenied(
             "SCP-ECON-7060: paid action requires spending UCAN".to_owned(),
         ));
     }
-    // Validate AND-composition: the action capability was already verified by the
-    // caller, so action_ucan is None (meaning "already verified by caller").
-    // Only the spending UCAN needs validation here.
-    //
-    // `action_ucan=None` means "already verified by caller" — this is a
-    // convention, not type-level enforcement. A future improvement could use
-    // a newtype wrapper to make this invariant compile-time checked.
     debug_assert!(
         spending_ucan.is_some(),
         "spending UCAN should be Some at this point — None case returns above"
     );
-    scp_protocol::crypto::ucan::spending::check_and_composition(
-        None, // action UCAN: already verified by caller
+    scp_protocol::crypto::ucan::spending::check_spending_capability(
         spending_ucan,
         scp_protocol::crypto::ucan::spending::Amount(cost.0),
         action_label,
