@@ -41,11 +41,12 @@ use super::types::Amount;
 /// it without leaking into the public API.
 pub(crate) const MAX_VELOCITY_ENTRIES_PER_SENDER: usize = 4096;
 
-/// Maximum acceptable clock-skew tolerance when validating persisted
-/// anti-spam snapshot state. Timestamps more than this far in the
-/// future are rejected; `last_refill` values more than this far in the
-/// future are clamped to `now`. Five seconds is the same tolerance used
-/// elsewhere in governance to bound NTP jitter between honest nodes.
+/// Maximum acceptable clock-skew tolerance for anti-spam snapshot validation.
+///
+/// Timestamps more than this far in the future are rejected; `last_refill`
+/// values more than this far in the future are clamped to `now`. Five
+/// seconds is the same tolerance used elsewhere in governance to bound NTP
+/// jitter between honest nodes.
 pub const SNAPSHOT_CLOCK_SKEW_TOLERANCE_SECS: u64 = 5;
 
 // ---------------------------------------------------------------------------
@@ -372,6 +373,15 @@ impl SenderVelocityTracker {
     ///
     /// Call this before [`Self::from_snapshot`]. Mutates the input to
     /// remove stale entries.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SnapshotValidationError::VelocityFutureTimestamp`] if any
+    /// entry has a timestamp more than `clock_skew_tolerance` seconds in
+    /// the future relative to `now`, and
+    /// [`SnapshotValidationError::VelocityEntryCountExceeded`] if any
+    /// sender's entry list exceeds [`MAX_VELOCITY_ENTRIES_PER_SENDER`]
+    /// after pruning stale entries.
     pub fn validate_and_sanitize_snapshot(
         entries: &mut HashMap<String, Vec<u64>>,
         window_secs: u64,
@@ -424,6 +434,7 @@ impl SenderVelocityTracker {
     ///
     /// Panics if the internal mutex is poisoned (indicates a prior panic
     /// while holding the lock — an unrecoverable state).
+    #[allow(clippy::significant_drop_tightening)] // Lock scopes the prune+append; split would race.
     pub fn record_message(&self, sender: &DID, timestamp: u64) -> VelocityRollbackToken {
         let mut state = self
             .state
@@ -555,16 +566,17 @@ impl SenderVelocityTracker {
     /// This replaces the old `rollback_last` which popped "the most
     /// recent" entry — a race bug under concurrent senders. See
     /// red-hat finding RED-805 and batch1 plan §F5.
+    #[allow(clippy::significant_drop_tightening)] // Lock scopes the entire lookup+mutate.
     pub fn rollback(&self, sender: &DID, token: VelocityRollbackToken) -> bool {
         let mut state = self
             .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if let Some(entries) = state.get_mut(sender) {
-            if let Some(pos) = entries.iter().position(|&(_, seq)| seq == token.0) {
-                entries.swap_remove(pos);
-                return true;
-            }
+        if let Some(entries) = state.get_mut(sender)
+            && let Some(pos) = entries.iter().position(|&(_, seq)| seq == token.0)
+        {
+            entries.swap_remove(pos);
+            return true;
         }
         false
     }
@@ -575,6 +587,7 @@ impl std::fmt::Debug for SenderVelocityTracker {
         f.debug_struct("SenderVelocityTracker")
             .field("window_secs", &self.window_secs)
             .field("state", &"<locked>")
+            .field("next_seq", &self.next_seq)
             .finish()
     }
 }

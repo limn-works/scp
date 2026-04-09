@@ -188,6 +188,44 @@ async fn verify_and_check_receipt(
     Ok(())
 }
 
+/// Input parameters for [`enforce_economy`].
+///
+/// F9: grouped into a struct to stop the parameter list from drifting
+/// back above the `clippy::too_many_arguments` threshold as new layers
+/// (pricing, nonce tracker, per-DID escalation) are added. Constructing
+/// this struct directly at call sites is the contract; positional
+/// argument calls are compile-rejected.
+pub(super) struct EnforceEconomyRequest<'a> {
+    /// Per-context economic policy, if any. `None` means a free context.
+    pub economic_policy: Option<&'a scp_protocol::economy::types::EconomicPolicy>,
+    /// Per-context budget tracker (mutable — deductions happen in-place).
+    pub budget_tracker: &'a mut scp_protocol::economy::budget::MemberBudgetTracker,
+    /// Per-context velocity tracker — consulted for per-DID escalation.
+    pub velocity_tracker: &'a scp_protocol::economy::antispam::SenderVelocityTracker,
+    /// Current member count (used for the `member_count` metric).
+    pub member_count: usize,
+    /// The kind of paid action being enforced.
+    pub action_type: PaidActionType,
+    /// The DID being charged.
+    pub actor_did: &'a DID,
+    /// Unix seconds when this enforcement is running.
+    pub now: u64,
+    /// Optional spending UCAN provided by the caller. Required for paid actions.
+    pub spending_ucan: Option<&'a scp_protocol::crypto::ucan::UcanToken>,
+    /// Capability URI label stamped onto spending-UCAN validation errors.
+    pub action_label: &'a str,
+    /// Context ID the spending UCAN must scope to.
+    pub context_id: &'a str,
+    /// Clock used for UCAN expiry validation.
+    pub clock: &'a dyn scp_primitives::Clock,
+    /// Per-context pricing configuration (escalation curve, floor, cap).
+    pub pricing: &'a scp_protocol::economy::antispam::ContextMessagePricingConfig,
+    /// Per-context nonce tracker for spending-UCAN replay prevention.
+    pub nonce_tracker: &'a mut scp_protocol::crypto::ucan::nonce::NonceTracker<
+        std::sync::Arc<dyn scp_primitives::Clock>,
+    >,
+}
+
 /// Unified economy enforcement: evaluate cost, check spending UCAN, check budget.
 ///
 /// This replaces the former separate economy enforcement functions.
@@ -200,24 +238,24 @@ async fn verify_and_check_receipt(
 /// [`SenderVelocityTracker::compute_escalated_cost`] (spec §19.7).
 ///
 /// Returns the deducted cost for rollback on failure, or `None` if no cost.
-#[allow(clippy::too_many_arguments)] // Economy enforcement requires many context parameters.
 pub(super) fn enforce_economy(
-    economic_policy: Option<&scp_protocol::economy::types::EconomicPolicy>,
-    budget_tracker: &mut scp_protocol::economy::budget::MemberBudgetTracker,
-    velocity_tracker: &scp_protocol::economy::antispam::SenderVelocityTracker,
-    member_count: usize,
-    action_type: &PaidActionType,
-    actor_did: &DID,
-    now: u64,
-    spending_ucan: Option<&scp_protocol::crypto::ucan::UcanToken>,
-    action_label: &str,
-    context_id: &str,
-    clock: &dyn scp_primitives::Clock,
-    pricing: &scp_protocol::economy::antispam::ContextMessagePricingConfig,
-    nonce_tracker: &mut scp_protocol::crypto::ucan::nonce::NonceTracker<
-        std::sync::Arc<dyn scp_primitives::Clock>,
-    >,
+    req: EnforceEconomyRequest<'_>,
 ) -> Result<Option<scp_protocol::economy::types::Amount>, ContextError> {
+    let EnforceEconomyRequest {
+        economic_policy,
+        budget_tracker,
+        velocity_tracker,
+        member_count,
+        action_type,
+        actor_did,
+        now,
+        spending_ucan,
+        action_label,
+        context_id,
+        clock,
+        pricing,
+        nonce_tracker,
+    } = req;
     // Free contexts (no `economic_policy`) do not charge at the cost layer.
     // Defense-in-depth against spam on free contexts is provided by the
     // Matrix-style token-bucket hard rate limit, which is enforced earlier
@@ -248,7 +286,7 @@ pub(super) fn enforce_economy(
         storage_usage: 0,
     };
     let Some(base_cost) =
-        scp_protocol::economy::policy::evaluate_cost(policy, action_type, &metrics)
+        scp_protocol::economy::policy::evaluate_cost(policy, &action_type, &metrics)
     else {
         return Err(ContextError::PermissionDenied(
             "SCP-ECON-7063: cost evaluation overflow".to_owned(),

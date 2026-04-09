@@ -37,21 +37,21 @@ fn enforce_send_economy(
         .message_pricing
         .as_ref()
         .unwrap_or(&pricing_default);
-    super::economy::enforce_economy(
-        ctx.governance.economic_policy.as_ref(),
-        &mut ctx.governance.budget_tracker,
-        &ctx.governance.velocity_tracker,
-        ctx.membership.count(),
-        &scp_protocol::economy::types::PaidActionType::MessageSend,
-        sender_did,
+    super::economy::enforce_economy(super::economy::EnforceEconomyRequest {
+        economic_policy: ctx.governance.economic_policy.as_ref(),
+        budget_tracker: &mut ctx.governance.budget_tracker,
+        velocity_tracker: &ctx.governance.velocity_tracker,
+        member_count: ctx.membership.count(),
+        action_type: scp_protocol::economy::types::PaidActionType::MessageSend,
+        actor_did: sender_did,
         now,
         spending_ucan,
-        "messages:write",
+        action_label: "messages:write",
         context_id,
         clock,
         pricing,
-        &mut ctx.governance.spending_nonce_tracker,
-    )
+        nonce_tracker: &mut ctx.governance.spending_nonce_tracker,
+    })
 }
 
 /// Re-export of the protocol-level domain-separated routing ID derivation.

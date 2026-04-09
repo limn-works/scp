@@ -153,21 +153,21 @@ fn enforce_join_economy(
         .message_pricing
         .as_ref()
         .unwrap_or(&pricing_default);
-    super::economy::enforce_economy(
-        ctx.governance.economic_policy.as_ref(),
-        &mut ctx.governance.budget_tracker,
-        &ctx.governance.velocity_tracker,
-        ctx.membership.count(),
-        &scp_protocol::economy::types::PaidActionType::ContextJoin,
-        joiner_did,
+    super::economy::enforce_economy(super::economy::EnforceEconomyRequest {
+        economic_policy: ctx.governance.economic_policy.as_ref(),
+        budget_tracker: &mut ctx.governance.budget_tracker,
+        velocity_tracker: &ctx.governance.velocity_tracker,
+        member_count: ctx.membership.count(),
+        action_type: scp_protocol::economy::types::PaidActionType::ContextJoin,
+        actor_did: joiner_did,
         now,
         spending_ucan,
-        "context:join",
+        action_label: "context:join",
         context_id,
         clock,
         pricing,
-        &mut ctx.governance.spending_nonce_tracker,
-    )
+        nonce_tracker: &mut ctx.governance.spending_nonce_tracker,
+    })
 }
 
 #[allow(clippy::significant_drop_tightening)]
@@ -274,6 +274,72 @@ impl ContextManager {
             .members()
             .map(|m| m.did.clone())
             .collect();
+
+        // F6: Validate and sanitize persisted anti-spam snapshot state
+        // BEFORE reconstructing the trackers. Policy: stale entries get
+        // clamped, future-beyond-skew entries are rejected. The 5s skew
+        // tolerance matches governance NTP jitter bounds.
+        let now_for_validation = self.clock.now_secs();
+        let hrl_config = ctx_snapshot
+            .hard_rate_limit_config
+            .clone()
+            .unwrap_or_else(
+                scp_protocol::economy::antispam::HardRateLimitConfig::matrix_defaults,
+            );
+        hrl_config.validate().map_err(|e| {
+            ContextError::PersistenceFailed(format!(
+                "restore: hard-rate-limit config validation failed: {e}"
+            ))
+        })?;
+        let mut hrl_state = ctx_snapshot.hard_rate_limit_state.clone();
+        scp_protocol::economy::antispam::TokenBucketLimiter::validate_and_sanitize_snapshot(
+            &mut hrl_state,
+            &hrl_config,
+            now_for_validation,
+            scp_protocol::economy::antispam::SNAPSHOT_CLOCK_SKEW_TOLERANCE_SECS,
+        )
+        .map_err(|e| {
+            ContextError::PersistenceFailed(format!(
+                "restore: hard-rate-limit snapshot validation failed: {e}"
+            ))
+        })?;
+        let validated_velocity_tracker = match ctx_snapshot.velocity_tracker_state {
+            // Always normalize to the spec §19.4 60-second window on
+            // restore, even when the persisted snapshot used the old
+            // 3600s default. Per-sender entries are preserved.
+            Some(vts) => {
+                let mut entries = vts.entries;
+                scp_protocol::economy::antispam::SenderVelocityTracker
+                    ::validate_and_sanitize_snapshot(
+                        &mut entries,
+                        60,
+                        now_for_validation,
+                        scp_protocol::economy::antispam::SNAPSHOT_CLOCK_SKEW_TOLERANCE_SECS,
+                    )
+                    .map_err(|e| {
+                        ContextError::PersistenceFailed(format!(
+                            "restore: velocity snapshot validation failed: {e}"
+                        ))
+                    })?;
+                scp_protocol::economy::antispam::SenderVelocityTracker::from_snapshot(
+                    60,
+                    entries,
+                )
+            }
+            None => scp_protocol::economy::antispam::SenderVelocityTracker::new(60),
+        };
+        let validated_message_pricing = ctx_snapshot
+            .message_pricing
+            .clone()
+            .or_else(|| derive_message_pricing(ctx_snapshot.economic_policy.as_ref()));
+        if let Some(ref pricing) = validated_message_pricing {
+            pricing.validate().map_err(|e| {
+                ContextError::PersistenceFailed(format!(
+                    "restore: message pricing config validation failed: {e}"
+                ))
+            })?;
+        }
+
         let per_context = PerContextState {
             handle: handle.clone(),
             membership: ctx_snapshot.membership,
@@ -298,33 +364,17 @@ impl ContextManager {
                 registered_tools: ctx_snapshot.registered_tools,
                 tool_interfaces: ctx_snapshot.tool_interfaces,
                 pruning_policy: ctx_snapshot.pruning_policy,
-                message_pricing: ctx_snapshot
-                    .message_pricing
-                    .clone()
-                    .or_else(|| derive_message_pricing(ctx_snapshot.economic_policy.as_ref())),
+                message_pricing: validated_message_pricing,
                 hard_rate_limit: scp_protocol::economy::antispam::TokenBucketLimiter::from_snapshot(
-                    ctx_snapshot.hard_rate_limit_config.clone().unwrap_or_else(
-                        scp_protocol::economy::antispam::HardRateLimitConfig::matrix_defaults,
-                    ),
-                    ctx_snapshot.hard_rate_limit_state.clone(),
+                    hrl_config,
+                    hrl_state,
                 ),
                 economic_policy: ctx_snapshot.economic_policy,
                 budget_tracker: ctx_snapshot.budget_tracker,
                 last_known_members: last_members,
                 pending_epoch_resets: Vec::new(),
                 consequence_rules: ctx_snapshot.consequence_rules,
-                velocity_tracker: match ctx_snapshot.velocity_tracker_state {
-                    // Always normalize to the spec §19.4 60-second window on
-                    // restore, even when the persisted snapshot used the old
-                    // 3600s default. Per-sender entries are preserved.
-                    Some(vts) => {
-                        scp_protocol::economy::antispam::SenderVelocityTracker::from_snapshot(
-                            60,
-                            vts.entries,
-                        )
-                    }
-                    None => scp_protocol::economy::antispam::SenderVelocityTracker::new(60),
-                },
+                velocity_tracker: validated_velocity_tracker,
                 participation_cache: ctx_snapshot.participation_cache,
                 cooldown_until: ctx_snapshot.cooldown_until,
                 spending_nonce_tracker: scp_protocol::crypto::ucan::nonce::NonceTracker::new(
@@ -791,6 +841,71 @@ impl ContextManager {
             .map(|m| m.did.clone())
             .collect();
 
+        // F6: Validate and sanitize persisted anti-spam snapshot state
+        // BEFORE reconstructing the trackers. Tampered imports that
+        // carry future timestamps (which would let a malicious sender
+        // "pre-consume" future capacity) are rejected; stale entries
+        // are clamped. Matches restore_context policy verbatim.
+        let now_for_validation = self.clock.now_secs();
+        let hrl_config = export
+            .snapshot
+            .hard_rate_limit_config
+            .clone()
+            .unwrap_or_else(
+                scp_protocol::economy::antispam::HardRateLimitConfig::matrix_defaults,
+            );
+        hrl_config.validate().map_err(|e| {
+            ContextError::PersistenceFailed(format!(
+                "import: hard-rate-limit config validation failed: {e}"
+            ))
+        })?;
+        let mut hrl_state = export.snapshot.hard_rate_limit_state.clone();
+        scp_protocol::economy::antispam::TokenBucketLimiter::validate_and_sanitize_snapshot(
+            &mut hrl_state,
+            &hrl_config,
+            now_for_validation,
+            scp_protocol::economy::antispam::SNAPSHOT_CLOCK_SKEW_TOLERANCE_SECS,
+        )
+        .map_err(|e| {
+            ContextError::PersistenceFailed(format!(
+                "import: hard-rate-limit snapshot validation failed: {e}"
+            ))
+        })?;
+        let validated_velocity_tracker = match export.snapshot.velocity_tracker_state.clone() {
+            Some(vts) => {
+                let mut entries = vts.entries;
+                scp_protocol::economy::antispam::SenderVelocityTracker
+                    ::validate_and_sanitize_snapshot(
+                        &mut entries,
+                        60,
+                        now_for_validation,
+                        scp_protocol::economy::antispam::SNAPSHOT_CLOCK_SKEW_TOLERANCE_SECS,
+                    )
+                    .map_err(|e| {
+                        ContextError::PersistenceFailed(format!(
+                            "import: velocity snapshot validation failed: {e}"
+                        ))
+                    })?;
+                scp_protocol::economy::antispam::SenderVelocityTracker::from_snapshot(
+                    60,
+                    entries,
+                )
+            }
+            None => scp_protocol::economy::antispam::SenderVelocityTracker::new(60),
+        };
+        let validated_message_pricing = export
+            .snapshot
+            .message_pricing
+            .clone()
+            .or_else(|| derive_message_pricing(export.snapshot.economic_policy.as_ref()));
+        if let Some(ref pricing) = validated_message_pricing {
+            pricing.validate().map_err(|e| {
+                ContextError::PersistenceFailed(format!(
+                    "import: message pricing config validation failed: {e}"
+                ))
+            })?;
+        }
+
         let per_context = PerContextState {
             handle: handle.clone(),
             membership: export.snapshot.membership,
@@ -820,36 +935,17 @@ impl ContextManager {
                 registered_tools: export.snapshot.registered_tools,
                 tool_interfaces: export.snapshot.tool_interfaces,
                 pruning_policy: export.snapshot.pruning_policy,
-                message_pricing: export
-                    .snapshot
-                    .message_pricing
-                    .clone()
-                    .or_else(|| derive_message_pricing(export.snapshot.economic_policy.as_ref())),
+                message_pricing: validated_message_pricing,
                 hard_rate_limit: scp_protocol::economy::antispam::TokenBucketLimiter::from_snapshot(
-                    export
-                        .snapshot
-                        .hard_rate_limit_config
-                        .clone()
-                        .unwrap_or_else(
-                            scp_protocol::economy::antispam::HardRateLimitConfig::matrix_defaults,
-                        ),
-                    export.snapshot.hard_rate_limit_state.clone(),
+                    hrl_config,
+                    hrl_state,
                 ),
                 economic_policy: export.snapshot.economic_policy,
                 budget_tracker: export.snapshot.budget_tracker,
                 last_known_members: initial_members,
                 pending_epoch_resets: Vec::new(),
                 consequence_rules: export.snapshot.consequence_rules,
-                velocity_tracker: match export.snapshot.velocity_tracker_state {
-                    // Always normalize to spec §19.4 60s window on import.
-                    Some(vts) => {
-                        scp_protocol::economy::antispam::SenderVelocityTracker::from_snapshot(
-                            60,
-                            vts.entries,
-                        )
-                    }
-                    None => scp_protocol::economy::antispam::SenderVelocityTracker::new(60),
-                },
+                velocity_tracker: validated_velocity_tracker,
                 participation_cache: export.snapshot.participation_cache,
                 cooldown_until: export.snapshot.cooldown_until,
                 spending_nonce_tracker: scp_protocol::crypto::ucan::nonce::NonceTracker::new(
