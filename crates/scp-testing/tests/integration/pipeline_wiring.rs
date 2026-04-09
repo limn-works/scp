@@ -150,11 +150,18 @@ fn send_message_calls_transport_send() {
 }
 
 // Manager level: deliver_incoming calls crypto.open (full envelope pipeline)
+// Note: the `.open(` call is now inside the `decrypt_and_dispatch` helper
+// which `deliver_incoming` delegates to. The assertion accepts either the
+// direct call in `deliver_incoming` or the call in the helper, plus the
+// delegation from `deliver_incoming` to `decrypt_and_dispatch`.
 #[test]
 fn deliver_incoming_calls_open() {
     assert!(
-        fn_body_contains(MANAGER_SRC, "deliver_incoming", ".open("),
-        "deliver_incoming must call crypto.open (envelope pipeline)"
+        fn_body_contains(MANAGER_SRC, "deliver_incoming", ".open(")
+            || (fn_body_contains(MANAGER_SRC, "deliver_incoming", "decrypt_and_dispatch")
+                && fn_body_contains(MANAGER_SRC, "decrypt_and_dispatch", ".open(")),
+        "deliver_incoming must call crypto.open (envelope pipeline), either directly \
+         or via decrypt_and_dispatch"
     );
 }
 
@@ -389,6 +396,28 @@ fn governance_enforces_economic_policy() {
     assert!(
         fn_body_contains(MANAGER_SRC, "enforce_join_economy", "enforce_economy"),
         "enforce_join_economy must delegate to enforce_economy"
+    );
+    // F9: enforce_economy must take the EnforceEconomyRequest struct (not a
+    // long positional argument list). Both call sites must construct one.
+    assert!(
+        MANAGER_SRC.contains("fn enforce_economy(\n    req: EnforceEconomyRequest"),
+        "enforce_economy must take EnforceEconomyRequest (F9 refactor)"
+    );
+    assert!(
+        fn_body_contains(
+            MANAGER_SRC,
+            "enforce_send_economy",
+            "EnforceEconomyRequest"
+        ),
+        "enforce_send_economy must construct EnforceEconomyRequest"
+    );
+    assert!(
+        fn_body_contains(
+            MANAGER_SRC,
+            "enforce_join_economy",
+            "EnforceEconomyRequest"
+        ),
+        "enforce_join_economy must construct EnforceEconomyRequest"
     );
 }
 
