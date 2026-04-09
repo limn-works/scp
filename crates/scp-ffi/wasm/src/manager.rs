@@ -401,6 +401,24 @@ impl PerContextState {
             return false;
         };
 
+        // Suspension check FIRST — a suspended capability is denied even if
+        // the member's role + ceiling would grant it. Mirrors
+        // `ContextRoleState::member_has_capability` in scp-protocol, which
+        // checks `suspended_capabilities` before the role-granted set.
+        //
+        // This closes the wiring gap where consequence rules (via
+        // `crate::consequence::apply_suspend` / `apply_suspend_all`) would
+        // insert entries into `suspended_capabilities` but every gate that
+        // calls `member_has_capability` would still grant the capability,
+        // leaving the suspension unenforced.
+        if self
+            .suspended_capabilities
+            .get(member_did)
+            .is_some_and(|s| s.contains(capability))
+        {
+            return false;
+        }
+
         // Helper: check that the capability is within the context ceiling.
         let in_ceiling = |cap: &str| -> bool {
             let (resource, _action) = cap.rsplit_once(':').unwrap_or((cap, "*"));
@@ -526,6 +544,89 @@ impl PerContextState {
     /// Records a cooldown timer for a given rule index.
     pub(crate) fn cooldown_until_insert(&mut self, rule_index: usize, until_secs: u64) {
         self.cooldown_until.insert(rule_index, until_secs);
+    }
+
+    // ---- Test-only helpers (compiled away in release builds) -------------
+    //
+    // These expose a minimal subset of the private internals needed by the
+    // consequence-dispatch tests and the snapshot-validator tests in this
+    // file. They are `#[cfg(test)]` so they do not widen the production API
+    // surface. They also take an explicit `timestamp` parameter where
+    // applicable so tests can run on the native target without invoking
+    // `crate::time::now_secs()` (which requires the WASM JS runtime).
+
+    /// Test-only: append an event to the event log with an explicit
+    /// timestamp. Mirrors [`append_log_event`] but does not call
+    /// `crate::time::now_secs()`, so this is safe in native tests.
+    #[cfg(test)]
+    pub(crate) fn test_append_log_event_at(
+        &mut self,
+        event_type: EventType,
+        actor_did: &str,
+        timestamp: u64,
+        payload: &[u8],
+    ) {
+        let sequence = event_count(&self.event_log);
+        let prev_hash = if self.event_log.leaves().is_empty() {
+            scp_event_log::tree::GENESIS_PREV_HASH
+        } else {
+            self.event_log.leaves()[self.event_log.leaves().len() - 1]
+        };
+        let event = Event {
+            event_type,
+            actor_did: DID::from(actor_did.to_owned()),
+            timestamp,
+            sequence,
+            payload: EventPayload {
+                data: payload.to_vec(),
+            },
+            prev_hash,
+            signature: vec![],
+        };
+        let _ = append_unsigned_event(&mut self.event_log, &event);
+    }
+
+    /// Test-only: insert a member with the given role.
+    #[cfg(test)]
+    pub(crate) fn test_insert_member(&mut self, did: &str, role: &str) {
+        self.members.insert(
+            did.to_owned(),
+            MemberEntry {
+                did: did.to_owned(),
+                role: role.to_owned(),
+                sequence_number: 0,
+            },
+        );
+    }
+
+    /// Test-only: read the current role string for a member.
+    #[cfg(test)]
+    pub(crate) fn test_member_role(&self, did: &str) -> Option<&str> {
+        self.members.get(did).map(|m| m.role.as_str())
+    }
+
+    /// Test-only: read the suspended capability set for a member.
+    #[cfg(test)]
+    pub(crate) fn test_suspended_capabilities(
+        &self,
+        did: &str,
+    ) -> Option<&std::collections::HashSet<String>> {
+        self.suspended_capabilities.get(did)
+    }
+
+    /// Test-only: push a consequence rule onto the context's declared rules.
+    #[cfg(test)]
+    pub(crate) fn test_push_consequence_rule(
+        &mut self,
+        rule: scp_protocol::trust::consequence::ConsequenceRule,
+    ) {
+        self.consequence_rules.push(rule);
+    }
+
+    /// Test-only: add a capability string to the context ceiling.
+    #[cfg(test)]
+    pub(crate) fn test_insert_ceiling(&mut self, capability: &str) {
+        self.ceiling_strings.insert(capability.to_owned());
     }
 
     /// Inserts a resolved proposal, evicting the oldest (by `created_at`) if
@@ -885,6 +986,65 @@ fn serialize_broadcast_content_wasm(
     };
 
     serialize_broadcast_content(&content).map_err(|e| e.to_string())
+}
+
+/// Test-only: construct a minimal [`PerContextState`] with the creator
+/// registered as an `admin` member and no crypto/broadcast state.
+///
+/// This bypasses [`WasmContextManager::create_context`] entirely so
+/// native tests (which lack the WASM JS runtime required by
+/// `crate::time::now_secs`) can build a per-context state without
+/// triggering the `ContextCreated` event-log append (which calls time).
+///
+/// Consumers should use the `test_*` helpers on [`PerContextState`] to
+/// append events, insert members, push consequence rules, etc.
+#[cfg(test)]
+pub(crate) fn make_bare_per_context_state(context_id: &str, creator_did: &str) -> PerContextState {
+    let mut members = HashMap::new();
+    members.insert(
+        creator_did.to_owned(),
+        MemberEntry {
+            did: creator_did.to_owned(),
+            role: "admin".to_owned(),
+            sequence_number: 0,
+        },
+    );
+
+    PerContextState {
+        state: "active".to_owned(),
+        params_json: serde_json::Value::Null,
+        creator_did: creator_did.to_owned(),
+        mode: "Unencrypted".to_owned(),
+        ceiling_strings: HashSet::new(),
+        ceiling_policy: "immutable".to_owned(),
+        ttl_seconds: None,
+        promotion_policy: None,
+        governance: "single_admin".to_owned(),
+        economic_policy: None,
+        tool_registry: ToolRegistry::new(),
+        tool_handlers: HashMap::new(),
+        event_log: EventLog::new(context_id.to_owned()),
+        revoked_tokens: HashSet::new(),
+        seen_nonces: HashMap::new(),
+        members,
+        event_buffer: VecDeque::new(),
+        executed_proposals: HashMap::new(),
+        suspended_capabilities: HashMap::new(),
+        read_exclusion_list: HashSet::new(),
+        broadcast_context: None,
+        sessions: HashMap::new(),
+        threshold_signers: Vec::new(),
+        threshold_value: 0,
+        tool_interfaces: Vec::new(),
+        governance_freeze: false,
+        pending_proposals: HashMap::new(),
+        resolved_proposals: HashMap::new(),
+        pruning_policy: None,
+        economic_policy_locked: false,
+        consequence_rules: Vec::new(),
+        cooldown_until: HashMap::new(),
+        crypto: None,
+    }
 }
 
 impl WasmContextManager {
@@ -6466,5 +6626,253 @@ mod tests {
         // Unblock sub1 → epoch stays at 1 (per spec: no key rotation on unblock)
         let _ = bc.unblock_subscriber("author-a", "sub1");
         assert_eq!(bc.get_author("author-a").map(|a| a.epoch), Some(1));
+    }
+
+    // =======================================================================
+    // validate_imported_antispam_state tests (E1 of the PR-review plan)
+    //
+    // These exercise the WASM import-path defensive validator directly by
+    // constructing `WasmContextExportSnapshot` instances in various
+    // pathological shapes and asserting the validator rejects them with a
+    // clear error.
+    //
+    // Not covered here (require full export/import flow and would trip
+    // `crate::time::now_ms` on native):
+    //   - v2 → v3 legacy-nonce upgrade path — `import_context` drains
+    //     `seen_nonces_legacy_v2` into the live `seen_nonces` map, but
+    //     that path reads `crate::time::now_ms()` for clock-skew clamping.
+    //   - HMAC mismatch — verified via `verify_export_hmac` inside
+    //     `import_context`.
+    //   - Round-trip equivalence — `export_context` also calls
+    //     `crate::time::now_ms()` for the `snapshot.timestamp` field.
+    //
+    // The validator itself is a pure sync function that takes an owned
+    // snapshot and returns Result, so every field-level check can be tested
+    // here without touching time or HMAC.
+    // =======================================================================
+
+    /// Builds a minimal valid [`WasmContextExportSnapshot`] that passes
+    /// [`validate_imported_antispam_state`] cleanly. Tests start from this
+    /// and mutate one field to drive a specific rejection path.
+    fn make_minimal_valid_snapshot() -> WasmContextExportSnapshot {
+        WasmContextExportSnapshot {
+            context_id: "ctx-test".to_owned(),
+            state: "active".to_owned(),
+            params_json: serde_json::Value::Null,
+            creator_did: "did:test:creator".to_owned(),
+            mode: "Unencrypted".to_owned(),
+            ceiling_strings: Vec::new(),
+            ceiling_policy: "immutable".to_owned(),
+            ttl_seconds: None,
+            promotion_policy: None,
+            governance: "single_admin".to_owned(),
+            economic_policy: None,
+            members: Vec::new(),
+            suspended_capabilities: HashMap::new(),
+            read_exclusion_list: Vec::new(),
+            broadcast: None,
+            revoked_tokens: Vec::new(),
+            seen_nonces_legacy_v2: Vec::new(),
+            seen_nonces_v3: Vec::new(),
+            executed_proposals: Vec::new(),
+            resolved_proposals_json: HashMap::new(),
+            consequence_rules: Vec::new(),
+            cooldown_until: HashMap::new(),
+            threshold_signers: Vec::new(),
+            threshold_value: 0,
+            tool_interfaces: Vec::new(),
+            governance_freeze: false,
+            pruning_policy: None,
+            economic_policy_locked: false,
+        }
+    }
+
+    /// **E1-baseline:** the default minimal snapshot passes validation.
+    #[test]
+    fn validate_antispam_minimal_snapshot_accepted() {
+        let snap = make_minimal_valid_snapshot();
+        assert!(validate_imported_antispam_state(&snap).is_ok());
+    }
+
+    /// **E1-1:** `seen_nonces_v3.len() > WASM_NONCE_CAP` → rejected.
+    #[test]
+    fn validate_antispam_rejects_seen_nonces_v3_over_cap() {
+        let mut snap = make_minimal_valid_snapshot();
+        snap.seen_nonces_v3 = (0..=WASM_NONCE_CAP)
+            .map(|i| WasmExportNonceEntry {
+                nonce: format!("nonce-{i}"),
+                inserted_at_ms: 1.0,
+            })
+            .collect();
+        let err = validate_imported_antispam_state(&snap).unwrap_err();
+        match err {
+            ScpWasmError::Context {
+                ref message,
+                ref code,
+            } => {
+                assert_eq!(code, "SCP-CTX-2032");
+                assert!(
+                    message.contains("exceeds cap"),
+                    "unexpected message: {message}"
+                );
+            }
+            other => panic!("expected Context error, got: {other:?}"),
+        }
+    }
+
+    /// **E1-2:** `seen_nonces_legacy_v2.len() > WASM_NONCE_CAP` → rejected.
+    #[test]
+    fn validate_antispam_rejects_seen_nonces_legacy_v2_over_cap() {
+        let mut snap = make_minimal_valid_snapshot();
+        snap.seen_nonces_legacy_v2 = (0..=WASM_NONCE_CAP)
+            .map(|i| format!("legacy-nonce-{i}"))
+            .collect();
+        let err = validate_imported_antispam_state(&snap).unwrap_err();
+        match err {
+            ScpWasmError::Context {
+                ref message,
+                ref code,
+            } => {
+                assert_eq!(code, "SCP-CTX-2032");
+                assert!(message.contains("legacy nonces"));
+            }
+            other => panic!("expected Context error, got: {other:?}"),
+        }
+    }
+
+    /// **E1-3:** `executed_proposals.len() > WASM_PROPOSAL_CAP` → rejected.
+    #[test]
+    fn validate_antispam_rejects_executed_proposals_over_cap() {
+        let mut snap = make_minimal_valid_snapshot();
+        snap.executed_proposals = (0..=WASM_PROPOSAL_CAP)
+            .map(|i| WasmExportExecutedProposalEntry {
+                proposal_id: format!("prop-{i:08x}"),
+                executed_at_ms: 1.0,
+            })
+            .collect();
+        let err = validate_imported_antispam_state(&snap).unwrap_err();
+        match err {
+            ScpWasmError::Context {
+                ref message,
+                ref code,
+            } => {
+                assert_eq!(code, "SCP-CTX-2032");
+                assert!(message.contains("executed proposals"));
+            }
+            other => panic!("expected Context error, got: {other:?}"),
+        }
+    }
+
+    /// **E1-4:** `resolved_proposals_json.len() > WASM_RESOLVED_PROPOSAL_CAP`
+    /// → rejected.
+    #[test]
+    fn validate_antispam_rejects_resolved_proposals_over_cap() {
+        let mut snap = make_minimal_valid_snapshot();
+        snap.resolved_proposals_json = (0..=WASM_RESOLVED_PROPOSAL_CAP)
+            .map(|i| (format!("prop-{i:08x}"), serde_json::Value::Null))
+            .collect();
+        let err = validate_imported_antispam_state(&snap).unwrap_err();
+        match err {
+            ScpWasmError::Context {
+                ref message,
+                ref code,
+            } => {
+                assert_eq!(code, "SCP-CTX-2032");
+                assert!(message.contains("resolved proposals"));
+            }
+            other => panic!("expected Context error, got: {other:?}"),
+        }
+    }
+
+    /// **E1-5:** NaN `inserted_at_ms` on a v3 nonce entry → rejected.
+    #[test]
+    fn validate_antispam_rejects_nan_nonce_timestamp() {
+        let mut snap = make_minimal_valid_snapshot();
+        snap.seen_nonces_v3.push(WasmExportNonceEntry {
+            nonce: "corrupt-nonce".to_owned(),
+            inserted_at_ms: f64::NAN,
+        });
+        let err = validate_imported_antispam_state(&snap).unwrap_err();
+        match err {
+            ScpWasmError::Context {
+                ref message,
+                ref code,
+            } => {
+                assert_eq!(code, "SCP-CTX-2032");
+                assert!(message.contains("corrupt-nonce"));
+                assert!(message.contains("inserted_at_ms"));
+            }
+            other => panic!("expected Context error, got: {other:?}"),
+        }
+    }
+
+    /// **E1-6:** negative `inserted_at_ms` on a v3 nonce entry → rejected.
+    #[test]
+    fn validate_antispam_rejects_negative_nonce_timestamp() {
+        let mut snap = make_minimal_valid_snapshot();
+        snap.seen_nonces_v3.push(WasmExportNonceEntry {
+            nonce: "past-nonce".to_owned(),
+            inserted_at_ms: -1.0,
+        });
+        assert!(validate_imported_antispam_state(&snap).is_err());
+    }
+
+    /// **E1-7:** infinite `executed_at_ms` on an executed proposal entry →
+    /// rejected.
+    #[test]
+    fn validate_antispam_rejects_infinite_proposal_timestamp() {
+        let mut snap = make_minimal_valid_snapshot();
+        snap.executed_proposals
+            .push(WasmExportExecutedProposalEntry {
+                proposal_id: "infprop".to_owned(),
+                executed_at_ms: f64::INFINITY,
+            });
+        let err = validate_imported_antispam_state(&snap).unwrap_err();
+        match err {
+            ScpWasmError::Context { ref message, .. } => {
+                assert!(message.contains("infprop"));
+                assert!(message.contains("executed_at_ms"));
+            }
+            other => panic!("expected Context error, got: {other:?}"),
+        }
+    }
+
+    /// **E1-8:** empty nonce string in `seen_nonces_v3` → rejected via
+    /// `validate_imported_string`.
+    #[test]
+    fn validate_antispam_rejects_empty_nonce_string() {
+        let mut snap = make_minimal_valid_snapshot();
+        snap.seen_nonces_v3.push(WasmExportNonceEntry {
+            nonce: String::new(),
+            inserted_at_ms: 1.0,
+        });
+        let err = validate_imported_antispam_state(&snap).unwrap_err();
+        match err {
+            ScpWasmError::Context { ref message, .. } => {
+                assert!(message.contains("must not be empty"));
+            }
+            other => panic!("expected Context error, got: {other:?}"),
+        }
+    }
+
+    /// **E1-9:** cooldown map with a rule index beyond the declared rules
+    /// vector → rejected (prevents an attacker from injecting cooldowns for
+    /// nonexistent rules).
+    #[test]
+    fn validate_antispam_rejects_cooldown_index_out_of_bounds() {
+        let mut snap = make_minimal_valid_snapshot();
+        // No rules declared, but cooldown has a dangling entry.
+        snap.cooldown_until.insert(0, 1_000_000);
+        let err = validate_imported_antispam_state(&snap).unwrap_err();
+        match err {
+            ScpWasmError::Context {
+                ref message,
+                ref code,
+            } => {
+                assert_eq!(code, "SCP-CTX-2032");
+                assert!(message.contains("cooldown_until"));
+            }
+            other => panic!("expected Context error, got: {other:?}"),
+        }
     }
 }
