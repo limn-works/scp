@@ -798,8 +798,8 @@ Keys are retained per epoch for the blob TTL window. When a key epoch advances, 
 **Governance-ban key purge.** When a governance-level subscriber ban (§5.14.8) triggers key rotation via `RevokeReadAccess`, the projection registry must be updated to reflect the new key epoch(s). The SDK method `propagate_ban_keys()` (§18.11.8) handles this:
 
 1. For each rotated author, the new post-rotation key is inserted into the `ProjectedContext` key registry.
-2. If the ban's `RevocationScope` is `Full`, all pre-ban epoch keys are **purged** from the registry via `retain_only_epochs()`. This ensures historical content encrypted under pre-ban keys is no longer decryptable by the projection endpoint — messages referencing purged epochs return 410 Gone (§18.11.4) on per-message requests and are silently omitted from feed responses (§18.11.3).
-3. If the ban's `RevocationScope` is `FutureOnly`, old-epoch keys are retained. Historical content remains accessible; only future content (under the new key) is inaccessible to the banned subscriber.
+2. If the ban's `AccessScope` is `Full`, all pre-ban epoch keys are **purged** from the registry via `retain_only_epochs()`. This ensures historical content encrypted under pre-ban keys is no longer decryptable by the projection endpoint — messages referencing purged epochs return 410 Gone (§18.11.4) on per-message requests and are silently omitted from feed responses (§18.11.3).
+3. If the ban's `AccessScope` is `FutureOnly`, old-epoch keys are retained. Historical content remains accessible; only future content (under the new key) is inaccessible to the banned subscriber.
 
 This differs from normal key rotation (where old keys are retained for the TTL window): a `Full`-scope governance ban is an explicit revocation of historical access, so old keys are immediately purged rather than retained.
 
