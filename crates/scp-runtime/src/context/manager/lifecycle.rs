@@ -129,8 +129,9 @@ fn derive_message_pricing(
 /// §19.5), and records spend against the joiner's budget. No auto-grant —
 /// budget must be explicitly approved via `ApproveSpend` governance action.
 ///
-/// Returns the deducted cost (if any) so the caller can rollback via
-/// `rollback_budget` on subsequent failure (escrow pattern).
+/// Returns the deducted cost (if any) so the caller can carry it in an
+/// `EconomyTicket` and drain all refundable economic state together via
+/// `rollback_economy_ticket` on subsequent failure (F4 escrow pattern).
 fn enforce_join_economy(
     ctx: &mut PerContextState,
     joiner_did: &DID,
@@ -1523,7 +1524,7 @@ impl ContextManager {
         // Phase 1: Economy enforcement + sybil check under lock (budget deduction).
         // This happens BEFORE any crypto mutations so that a rejected payment
         // never grants MLS group access or sender keys.
-        let deducted_cost = {
+        let ticket = {
             let mut contexts = self.contexts.lock().await;
             let ctx = contexts
                 .get_mut(&context_id)
@@ -1543,8 +1544,8 @@ impl ContextManager {
 
             // Economy enforcement (#1537, #1593) — auto-accept guard + join cost + spending UCAN.
             // Budget deduction happens here. The adapter escrow (authorize/complete/void)
-            // runs after the lock is dropped. On adapter failure, rollback_budget
-            // restores the deducted amount.
+            // runs after the lock is dropped. On adapter failure, the F4 EconomyTicket
+            // rollback restores the deducted amount AND the velocity+hard-rate state.
             // M13: Sybil resistance check BEFORE economy enforcement so that
             // a rejected sybil attacker doesn't consume budget. Fail-closed.
             evaluate_sybil_resistance(ctx, &member_did, self.clock.now_secs())?;
@@ -1570,7 +1571,7 @@ impl ContextManager {
                 .velocity_tracker
                 .record_message(&member_did, now_secs);
 
-            match enforce_join_economy(
+            let deducted_cost = match enforce_join_economy(
                 ctx,
                 &member_did,
                 now_secs,
@@ -1580,23 +1581,47 @@ impl ContextManager {
             ) {
                 Ok(cost) => cost,
                 Err(e) => {
+                    // No ticket exists yet — roll back inline under lock.
                     ctx.governance
                         .velocity_tracker
                         .rollback(&member_did, velocity_token);
                     ctx.governance.hard_rate_limit.refund(&member_did);
                     return Err(e);
                 }
+            };
+            // F4: wrap the Phase 1 state in an EconomyTicket so every
+            // downstream error path (adapter, MLS, sender-key) is forced
+            // to roll back velocity + hard_rate_limit + budget, not just
+            // the budget.
+            super::economy::EconomyTicket {
+                actor_did: member_did.clone(),
+                deducted_cost,
+                velocity_token,
+                needs_hard_rate_limit_refund: true,
+                consumed: false,
             }
         };
 
         // Phase 2: Authorize payment (escrow hold) BEFORE any crypto mutation.
-        // If authorization fails, rollback budget — no MLS state was touched.
-        let auth = self
-            .authorize_join_payment(&context_id, &member_did, deducted_cost)
-            .await?;
+        // If authorization fails, rollback the ticket — no MLS state was touched.
+        let auth = match self
+            .authorize_paid_action(
+                scp_protocol::economy::types::PaidActionType::ContextJoin,
+                &member_did,
+                &context_id,
+                ticket.deducted_cost,
+            )
+            .await
+        {
+            Ok(auth) => auth,
+            Err(payment_err) => {
+                super::economy::rollback_economy_ticket(self, &context_id, ticket).await;
+                return Err(payment_err);
+            }
+        };
 
         // Phase 3: MLS add_member + sender key distribution (crypto mutations).
-        // On failure: void escrow + rollback budget. No MLS rollback needed
+        // On failure: void escrow + rollback ticket. No MLS rollback needed
         // because add_member itself failed (no state change occurred).
         let add_output = match self
             .crypto
@@ -1607,8 +1632,7 @@ impl ContextManager {
                 if let Some(a) = auth {
                     self.void_paid_action(a, &context_id).await;
                 }
-                super::economy::rollback_budget(self, &context_id, &member_did, deducted_cost)
-                    .await;
+                super::economy::rollback_economy_ticket(self, &context_id, ticket).await;
                 return Err(e);
             }
         };
@@ -1625,7 +1649,7 @@ impl ContextManager {
             if let Some(a) = auth {
                 self.void_paid_action(a, &context_id).await;
             }
-            super::economy::rollback_budget(self, &context_id, &member_did, deducted_cost).await;
+            super::economy::rollback_economy_ticket(self, &context_id, ticket).await;
             return Err(e);
         }
 
@@ -1654,7 +1678,7 @@ impl ContextManager {
         }
 
         // Phase 4: Membership mutation under lock. On failure: void escrow +
-        // rollback budget + rollback MLS state.
+        // rollback ticket + rollback MLS state.
         if let Err(e) = self
             .join_context_membership(&context_id, &member_did, add_output)
             .await
@@ -1666,11 +1690,15 @@ impl ContextManager {
             if let Some(a) = auth {
                 self.void_paid_action(a, &context_id).await;
             }
-            super::economy::rollback_budget(self, &context_id, &member_did, deducted_cost).await;
+            super::economy::rollback_economy_ticket(self, &context_id, ticket).await;
             return Err(e);
         }
 
         // Phase 5: Capture the escrow hold after all mutations succeeded.
+        // Consume the ticket — commit returns the deducted cost for the
+        // capture step and marks the ticket as committed so the Drop
+        // guard stays quiet.
+        let deducted_cost = super::economy::commit_economy_ticket(ticket);
         self.capture_join_payment(auth, &member_did, &context_id, deducted_cost)
             .await;
 
@@ -1765,34 +1793,6 @@ impl ContextManager {
         );
 
         Ok(())
-    }
-
-    /// Authorizes escrow for join payment (Phase 2 of `join_context`).
-    ///
-    /// On authorization failure, rolls back the budget deducted in Phase 1.
-    /// Returns the authorization token (if payment is required) for later
-    /// capture or void.
-    async fn authorize_join_payment(
-        &self,
-        context_id: &str,
-        member_did: &DID,
-        deducted_cost: Option<scp_protocol::economy::types::Amount>,
-    ) -> Result<Option<super::economy::PaidActionAuthorization>, ContextError> {
-        match self
-            .authorize_paid_action(
-                scp_protocol::economy::types::PaidActionType::ContextJoin,
-                member_did,
-                context_id,
-                deducted_cost, // M3: pass pre-evaluated cost
-            )
-            .await
-        {
-            Ok(auth) => Ok(auth),
-            Err(payment_err) => {
-                super::economy::rollback_budget(self, context_id, member_did, deducted_cost).await;
-                Err(payment_err)
-            }
-        }
     }
 
     /// Captures the escrow hold after a successful join (Phase 5 of `join_context`).

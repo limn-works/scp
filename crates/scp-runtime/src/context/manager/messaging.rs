@@ -20,8 +20,9 @@ use super::{
 /// budget. No auto-grant — budget must be explicitly approved via
 /// `ApproveSpend` governance action.
 ///
-/// Returns the deducted cost (if any) so that the caller can rollback
-/// on failure via `rollback_budget`.
+/// Returns the deducted cost (if any) so that the caller can carry it in
+/// an `EconomyTicket` and drain all refundable economic state together via
+/// `rollback_economy_ticket` on failure (F4).
 fn enforce_send_economy(
     ctx: &mut PerContextState,
     sender_did: &DID,
@@ -309,7 +310,7 @@ impl ContextManager {
         let context_id = handle.context_id().to_owned();
         let context_id_bytes = context_id_to_bytes(&context_id);
         let routing_id = scp_protocol::context::context_routing_id(&context_id);
-        let (broadcast_envelope, recipients_data, sequence, is_broadcast, deducted_cost) = {
+        let (broadcast_envelope, recipients_data, sequence, is_broadcast, ticket) = {
             let mut contexts = self.contexts.lock().await;
             let ctx = contexts
                 .get_mut(&context_id)
@@ -373,6 +374,8 @@ impl ContextManager {
                     // Roll back both: the velocity increment recorded above
                     // and the hard-rate-limit token. A rejected message must
                     // not permanently penalize the sender on either axis.
+                    // No EconomyTicket exists yet at this point — rollback
+                    // inline under the still-held lock.
                     ctx.governance
                         .velocity_tracker
                         .rollback(sender_did, velocity_token);
@@ -380,44 +383,92 @@ impl ContextManager {
                     return Err(e);
                 }
             };
+            // F4: wrap the Phase 1 economy state in an EconomyTicket so
+            // every downstream error branch is forced to consume it.
+            // Dropping without commit/rollback is a compile-time warning
+            // (`#[must_use]`) + debug-assert at runtime.
+            let ticket = super::economy::EconomyTicket {
+                actor_did: sender_did.clone(),
+                deducted_cost,
+                velocity_token,
+                needs_hard_rate_limit_refund: true,
+                consumed: false,
+            };
             if let Some(ref mut bc) = ctx.broadcast_context {
-                let sk = signing_key.ok_or_else(|| {
-                    ContextError::CryptoFailed("signing key required for broadcast publish".into())
-                })?;
-                let env =
-                    build_broadcast_envelope(self.clock.as_ref(), bc, sender_did, payload, sk)?;
+                let Some(sk) = signing_key else {
+                    // Phase 1 failed after ticket creation — drain it.
+                    drop(contexts);
+                    super::economy::rollback_economy_ticket(self, &context_id, ticket).await;
+                    return Err(ContextError::CryptoFailed(
+                        "signing key required for broadcast publish".into(),
+                    ));
+                };
+                let env = match build_broadcast_envelope(
+                    self.clock.as_ref(),
+                    bc,
+                    sender_did,
+                    payload,
+                    sk,
+                ) {
+                    Ok(env) => env,
+                    Err(e) => {
+                        drop(contexts);
+                        super::economy::rollback_economy_ticket(
+                            self,
+                            &context_id,
+                            ticket,
+                        )
+                        .await;
+                        return Err(e);
+                    }
+                };
                 (
                     Some(env),
                     std::collections::HashMap::new(),
                     0,
                     true,
-                    deducted_cost,
+                    ticket,
                 )
             } else {
                 // Capability already checked above (H7: before budget deduction).
                 // Assign sequence under lock — SequenceTracker rejects duplicates.
-                let seq = ctx
-                    .membership
-                    .next_sequence_number(sender_did)
-                    .ok_or_else(|| {
-                        ContextError::MemberNotFound(format!(
-                            "cannot assign sequence: {sender_did} is not a member"
-                        ))
-                    })?;
+                let Some(seq) = ctx.membership.next_sequence_number(sender_did) else {
+                    drop(contexts);
+                    super::economy::rollback_economy_ticket(self, &context_id, ticket).await;
+                    return Err(ContextError::MemberNotFound(format!(
+                        "cannot assign sequence: {sender_did} is not a member"
+                    )));
+                };
                 (
                     None,
                     ctx.access.access_key_store.get_all(&context_id),
                     seq,
                     false,
-                    deducted_cost,
+                    ticket,
                 )
             }
         };
         // Payment flow (#1537): escrow pattern — authorize (hold) before the
         // action, complete (capture) after success, void + rollback on failure.
-        let auth = self
-            .authorize_send_payment(&context_id, sender_did, deducted_cost)
-            .await?;
+        let auth = match self
+            .authorize_send_payment(&context_id, sender_did, ticket.deducted_cost)
+            .await
+        {
+            Ok(auth) => auth,
+            Err(e) => {
+                // Authorization failure — roll back the ticket. The sequence
+                // number rollback is also needed because Phase 1 already
+                // incremented it for non-broadcast.
+                super::economy::rollback_economy_ticket(self, &context_id, ticket).await;
+                if !is_broadcast {
+                    let mut contexts = self.contexts.lock().await;
+                    if let Some(ctx) = contexts.get_mut(&context_id) {
+                        ctx.membership.rollback_sequence_number(sender_did);
+                    }
+                }
+                return Err(e);
+            }
+        };
 
         // Phase 2: encrypt + send (no lock held).
         let phase2_result = self.encrypt_and_send(
@@ -432,11 +483,14 @@ impl ContextManager {
             &routing_id,
         );
         if let Err(e) = phase2_result {
-            // Void the escrow hold and rollback budget on send failure.
+            // Void the escrow hold and roll back the full ticket (budget,
+            // velocity, hard-rate-limit) on send failure. F4: before this
+            // patch the outer rollback only touched the budget, silently
+            // leaking the velocity entry and the hard-rate-limit token.
             if let Some(a) = auth {
                 self.void_paid_action(a, &context_id).await;
             }
-            super::economy::rollback_budget(self, &context_id, sender_did, deducted_cost).await;
+            super::economy::rollback_economy_ticket(self, &context_id, ticket).await;
             if !is_broadcast {
                 let mut contexts = self.contexts.lock().await;
                 if let Some(ctx) = contexts.get_mut(&context_id) {
@@ -446,7 +500,10 @@ impl ContextManager {
             return Err(e);
         }
 
-        // Phase 3: capture the escrow hold after successful send.
+        // Phase 3: capture the escrow hold after successful send. Consume
+        // the ticket — commit returns the deducted cost for the capture step
+        // and marks the ticket as committed so the Drop guard stays quiet.
+        let deducted_cost = super::economy::commit_economy_ticket(ticket);
         self.capture_send_payment(auth, sender_did, &context_id, deducted_cost)
             .await;
 
@@ -507,7 +564,10 @@ impl ContextManager {
 
     /// Authorizes escrow for send payment (Phase 1.5 of `send_message`).
     ///
-    /// On authorization failure, rolls back the budget deducted in Phase 1.
+    /// On failure, the caller is responsible for draining the `EconomyTicket`
+    /// via `rollback_economy_ticket`. This helper MUST NOT roll back any
+    /// economic state itself — doing so from here would double-refund the
+    /// budget when the caller subsequently drains the ticket (F4).
     /// Returns the authorization token (if payment is required) for later
     /// capture or void.
     async fn authorize_send_payment(
@@ -516,21 +576,13 @@ impl ContextManager {
         sender_did: &DID,
         deducted_cost: Option<scp_protocol::economy::types::Amount>,
     ) -> Result<Option<super::economy::PaidActionAuthorization>, ContextError> {
-        match self
-            .authorize_paid_action(
-                scp_protocol::economy::types::PaidActionType::MessageSend,
-                sender_did,
-                context_id,
-                deducted_cost, // M3: pass pre-evaluated cost
-            )
-            .await
-        {
-            Ok(auth) => Ok(auth),
-            Err(payment_err) => {
-                super::economy::rollback_budget(self, context_id, sender_did, deducted_cost).await;
-                Err(payment_err)
-            }
-        }
+        self.authorize_paid_action(
+            scp_protocol::economy::types::PaidActionType::MessageSend,
+            sender_did,
+            context_id,
+            deducted_cost, // M3: pass pre-evaluated cost
+        )
+        .await
     }
 
     /// Captures the escrow hold after a successful send (Phase 3 of `send_message`).
