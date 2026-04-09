@@ -939,6 +939,34 @@ impl ContextRoleState {
                 .insert(member_did.to_owned(), all_caps);
         }
     }
+
+    /// Prunes a member's suspended capabilities to only those that the
+    /// `new_role_capabilities` set actually grants. Called by
+    /// [`assign_role`] and [`system_assign_role`] after a role
+    /// replacement so suspensions for capabilities the member no longer
+    /// has become meaningless entries and are dropped.
+    ///
+    /// If all of a member's suspensions become meaningless, the entire
+    /// entry is removed from the map to avoid leaving dangling empty
+    /// sets.
+    ///
+    /// Semantics: suspensions PERSIST across role changes for
+    /// capabilities the new role still grants (a banned voter who
+    /// becomes an admin is still banned from voting), but are dropped
+    /// for capabilities the new role no longer grants (a banned voter
+    /// who becomes an observer has no vote to suspend).
+    pub fn prune_suspensions_to_role_grants(
+        &mut self,
+        member_did: &str,
+        new_role_capabilities: &HashSet<Capability>,
+    ) {
+        if let Some(suspended) = self.suspended_capabilities.get_mut(member_did) {
+            suspended.retain(|cap| new_role_capabilities.contains(cap));
+            if suspended.is_empty() {
+                self.suspended_capabilities.remove(member_did);
+            }
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1006,7 +1034,16 @@ pub fn assign_role(
     state.assignments.insert(member_did.to_owned(), assignment);
     state
         .member_capabilities
-        .insert(member_did.to_owned(), role_def.capabilities);
+        .insert(member_did.to_owned(), role_def.capabilities.clone());
+
+    // B5: prune any suspensions that fall outside the new role's
+    // grant set. Without this, `suspended_capabilities` would retain
+    // entries for capabilities the member no longer holds — either
+    // a) silently no-op (harmless but dead state) or b) accidentally
+    // re-engage if the member cycles back to a role that grants
+    // those capabilities later. Pruning on every role change is the
+    // safe, deterministic choice.
+    state.prune_suspensions_to_role_grants(member_did, &role_def.capabilities);
 
     Ok(tokens)
 }
@@ -1059,7 +1096,14 @@ pub fn system_assign_role(
     state.assignments.insert(member_did.to_owned(), assignment);
     state
         .member_capabilities
-        .insert(member_did.to_owned(), role_def.capabilities);
+        .insert(member_did.to_owned(), role_def.capabilities.clone());
+
+    // B5: same prune-suspensions-to-role-grants invariant as
+    // `assign_role` — system-level reassignment must also clean up
+    // stale suspensions. Otherwise a consequence-engine-triggered
+    // demotion could leave dangling suspension entries for
+    // capabilities the demoted role no longer grants.
+    state.prune_suspensions_to_role_grants(member_did, &role_def.capabilities);
 
     Ok(tokens)
 }
@@ -1980,6 +2024,169 @@ mod tests {
 
         let assignment = state.assignments.get("did:dht:alice").unwrap();
         assert_eq!(assignment.role_name, "observer");
+    }
+
+    #[test]
+    fn assign_role_prunes_suspensions_outside_new_role_grants() {
+        // B5: when a member is reassigned from a role that granted
+        // GovernanceVote to a role that does NOT grant it, the
+        // suspended-capability entry for GovernanceVote becomes
+        // meaningless and must be pruned.
+        let ceiling = test_ceiling();
+        let mut state = ContextRoleState::new(
+            "ctx-b5-prune",
+            "did:dht:creator",
+            ceiling,
+            vec![],
+            &scp_primitives::SystemClock,
+        )
+        .unwrap();
+
+        state.members.insert("did:dht:alice".to_owned());
+
+        // Start Alice as member (grants MessagesWrite, GovernanceVote, etc).
+        assign_role(
+            &mut state,
+            "did:dht:alice",
+            "member",
+            "did:dht:creator",
+            &scp_primitives::SystemClock,
+        )
+        .unwrap();
+
+        // Suspend Alice's GovernanceVote capability.
+        state.suspend_capabilities("did:dht:alice", [Capability::GovernanceVote]);
+        assert!(
+            state
+                .suspended_capabilities
+                .get("did:dht:alice")
+                .unwrap()
+                .contains(&Capability::GovernanceVote)
+        );
+
+        // Demote Alice to observer (which only grants MessagesRead).
+        assign_role(
+            &mut state,
+            "did:dht:alice",
+            "observer",
+            "did:dht:creator",
+            &scp_primitives::SystemClock,
+        )
+        .unwrap();
+
+        // The GovernanceVote suspension is meaningless now — observer
+        // doesn't grant GovernanceVote. The prune should have dropped
+        // the empty set entirely.
+        assert!(
+            !state.suspended_capabilities.contains_key("did:dht:alice"),
+            "stale suspension set must be dropped when new role grants none of the suspended capabilities"
+        );
+    }
+
+    #[test]
+    fn assign_role_retains_suspensions_still_granted_by_new_role() {
+        // B5: when a member is reassigned to a role that still grants
+        // the suspended capability, the suspension must PERSIST. A
+        // banned voter who becomes admin is still banned from voting.
+        let ceiling = test_ceiling();
+        let mut state = ContextRoleState::new(
+            "ctx-b5-retain",
+            "did:dht:creator",
+            ceiling,
+            vec![],
+            &scp_primitives::SystemClock,
+        )
+        .unwrap();
+
+        state.members.insert("did:dht:alice".to_owned());
+
+        // Start Alice as member.
+        assign_role(
+            &mut state,
+            "did:dht:alice",
+            "member",
+            "did:dht:creator",
+            &scp_primitives::SystemClock,
+        )
+        .unwrap();
+
+        // Suspend GovernanceVote.
+        state.suspend_capabilities("did:dht:alice", [Capability::GovernanceVote]);
+
+        // Promote Alice to admin (which also grants GovernanceVote).
+        assign_role(
+            &mut state,
+            "did:dht:alice",
+            "admin",
+            "did:dht:creator",
+            &scp_primitives::SystemClock,
+        )
+        .unwrap();
+
+        // The GovernanceVote suspension must still be in place.
+        assert!(
+            state
+                .suspended_capabilities
+                .get("did:dht:alice")
+                .is_some_and(|s| s.contains(&Capability::GovernanceVote)),
+            "suspension must persist across role change when new role still grants the capability"
+        );
+        assert!(
+            !state.member_has_capability("did:dht:alice", &Capability::GovernanceVote),
+            "member_has_capability must still block the suspended capability"
+        );
+    }
+
+    #[test]
+    fn assign_role_prunes_mixed_suspensions() {
+        // B5: when only some suspensions are outside the new role's
+        // grants, only those specific entries are dropped — the rest
+        // persist.
+        let ceiling = test_ceiling();
+        let mut state = ContextRoleState::new(
+            "ctx-b5-mixed",
+            "did:dht:creator",
+            ceiling,
+            vec![],
+            &scp_primitives::SystemClock,
+        )
+        .unwrap();
+
+        state.members.insert("did:dht:alice".to_owned());
+        assign_role(
+            &mut state,
+            "did:dht:alice",
+            "member",
+            "did:dht:creator",
+            &scp_primitives::SystemClock,
+        )
+        .unwrap();
+
+        // Suspend BOTH GovernanceVote (not granted by observer) AND
+        // MessagesRead (still granted by observer).
+        state.suspend_capabilities(
+            "did:dht:alice",
+            [Capability::GovernanceVote, Capability::MessagesRead],
+        );
+
+        // Demote to observer.
+        assign_role(
+            &mut state,
+            "did:dht:alice",
+            "observer",
+            "did:dht:creator",
+            &scp_primitives::SystemClock,
+        )
+        .unwrap();
+
+        // GovernanceVote suspension → dropped (observer does not grant it).
+        // MessagesRead suspension → retained (observer grants MessagesRead).
+        let suspended = state
+            .suspended_capabilities
+            .get("did:dht:alice")
+            .expect("suspension entry must still exist because MessagesRead is retained");
+        assert!(!suspended.contains(&Capability::GovernanceVote));
+        assert!(suspended.contains(&Capability::MessagesRead));
     }
 
     #[test]

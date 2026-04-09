@@ -1866,9 +1866,19 @@ impl ContextManager {
             ctx.role_state
                 .suspend_capabilities(did.as_ref(), capabilities.iter().cloned());
 
-            // Emit suspension event to receive buffer.
+            // Emit a capability-precise suspension event. Previously
+            // this path hardcoded `WriteAccessRevoked` which was wrong
+            // for any suspension that did not include
+            // `MessagesWrite` — the event would falsely claim write
+            // access had been revoked. The new variant carries the
+            // exact capability list so consumers can render accurate
+            // UI and so the event payload matches the underlying
+            // role_state mutation.
             ctx.receive_buffer
-                .push(ContextEvent::WriteAccessRevoked { did: did.clone() });
+                .push(ContextEvent::CapabilitiesSuspended {
+                    did: did.clone(),
+                    capabilities: capabilities.to_vec(),
+                });
 
             if self.has_persistence() {
                 Some(Self::snapshot_context(ctx))
