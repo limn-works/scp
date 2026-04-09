@@ -209,7 +209,7 @@ pub struct ToolEconomyContext<'a, S: BuildHasher = std::hash::RandomState> {
 /// budget exceeded, or UCAN composition failures.
 ///
 /// See ADR-010 acceptance criterion 3 (`invoke_tool`).
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)] // Full economy + escrow lifecycle
 pub async fn invoke_tool<F, Fut, S: BuildHasher>(
     context: &ContextHandle,
     registry: &ToolRegistry,
@@ -229,6 +229,197 @@ pub async fn invoke_tool<F, Fut, S: BuildHasher>(
     ),
     InvocationError,
 >
+where
+    F: FnOnce(serde_json::Value) -> Fut,
+    Fut: Future<Output = Result<serde_json::Value, String>>,
+{
+    // 1-4. Validate context state, capability, tool registration, and input
+    // schema BEFORE deducting budget. The helper
+    // `invoke_tool_execute_and_validate` runs the same checks again after the
+    // economy pre-check — this is intentional redundancy so direct callers
+    // get the pre-budget early bail path while the manager wrapper can share
+    // the helper directly without replicating the economy flow.
+    let state = context.state().await;
+    if state != ContextState::Active {
+        return Err(InvocationError::ContextNotActive {
+            current_state: state.to_string(),
+        });
+    }
+    if !has_tool_invoke_capability(role_state, invoker_did, tool_id) {
+        return Err(InvocationError::InvokerNotAuthorized {
+            did: invoker_did.to_string(),
+            tool_id: tool_id.to_owned(),
+        });
+    }
+    let registration = registry
+        .get(tool_id)
+        .ok_or_else(|| InvocationError::ToolNotFound {
+            tool_id: tool_id.to_owned(),
+        })?;
+    validate_value_against_schema(&input, &registration.schema.input_schema)
+        .map_err(|msg| InvocationError::InputValidationFailed { message: msg })?;
+
+    // 4a. Economy pre-check (#1537). Strategy B: `economy_pre_check` is pure
+    // compute — it does NOT deduct budget. We immediately call `record_spend`
+    // here so the behavior visible to direct callers of `invoke_tool` is
+    // unchanged (budget is still debited before the executor runs). The
+    // manager wrapper `ContextManager::invoke_tool_with_economy` bypasses
+    // this code path entirely so it can snapshot state under its own lock.
+    let action_cost = match economy.as_deref_mut() {
+        Some(econ) => {
+            let cost = economy_pre_check(econ, invoker_did)?;
+            if cost.0 > 0 {
+                econ.budget_tracker
+                    .record_spend(invoker_did, cost)
+                    .map_err(|_| InvocationError::BudgetExceeded {
+                        did: invoker_did.to_string(),
+                        cost: cost.0,
+                        remaining: econ.budget_tracker.remaining(invoker_did).0,
+                    })?;
+            }
+            Some(cost)
+        }
+        None => None,
+    };
+
+    // 4b. Payment escrow (#1537, #1596): authorize (escrow hold) BEFORE tool execution.
+    let escrow_parts = extract_escrow_parts(&economy);
+    let mut escrow = if let Some((adapter, policy, metrics, ctx_id)) = &escrow_parts {
+        match authorize_tool_payment(adapter.as_ref(), policy, ctx_id, invoker_did, metrics).await {
+            Ok(prepared) => prepared,
+            Err(auth_err) => {
+                void_escrow_and_rollback(
+                    None,
+                    escrow_parts.as_ref(),
+                    action_cost,
+                    &mut economy,
+                    invoker_did,
+                )
+                .await;
+                return Err(auth_err);
+            }
+        }
+    } else {
+        None
+    };
+
+    // 5-6. Execute the tool with timeout and validate the output. Delegates
+    // to the shared `invoke_tool_execute_and_validate` helper so the manager
+    // wrapper can share the exact same execution path.
+    let outcome = match invoke_tool_execute_and_validate(
+        context,
+        registry,
+        role_state,
+        tool_id,
+        input,
+        invoker_did,
+        timeout_ms,
+        executor,
+    )
+    .await
+    {
+        Ok(outcome) => outcome,
+        Err(err) => {
+            void_escrow_and_rollback(
+                escrow.as_ref(),
+                escrow_parts.as_ref(),
+                action_cost,
+                &mut economy,
+                invoker_did,
+            )
+            .await;
+            return Err(err);
+        }
+    };
+    let InvokeExecuteOutcome {
+        output,
+        input_hash,
+        output_hash,
+        execution_time_ms,
+    } = outcome;
+
+    // 6a. Post-invocation bookkeeping (#1530, #1531) — participation +
+    // consequence evaluation.
+    let triggered = economy
+        .as_mut()
+        .map(|econ| economy_post_check(econ, invoker_did))
+        .unwrap_or_default();
+
+    // 6b. Complete (capture) the escrowed payment after successful execution.
+    let payment_receipt = finalize_tool_escrow(
+        escrow.take(),
+        escrow_parts.as_ref(),
+        action_cost,
+        &mut economy,
+        invoker_did,
+    )
+    .await?;
+
+    // 7-8. Build event + return (#1596: receipt returned to caller).
+    let event = build_tool_event(
+        tool_id,
+        invoker_did,
+        execution_time_ms,
+        input_hash,
+        output_hash,
+        action_cost,
+    );
+    Ok((output, event, triggered, payment_receipt))
+}
+
+/// Outcome of [`invoke_tool_execute_and_validate`] — the pure-execution half
+/// of tool invocation shared between direct callers and the
+/// [`ContextManager::invoke_tool_with_economy`](crate::context::ContextManager::invoke_tool_with_economy)
+/// wrapper. Captures everything needed to build a [`ToolInvokedEvent`]
+/// without re-running the executor or rehashing the payloads.
+#[derive(Debug)]
+pub(crate) struct InvokeExecuteOutcome {
+    /// The tool output value (already schema-validated).
+    pub output: serde_json::Value,
+    /// SHA-256 hash of the input JSON (hex-encoded). Computed from the input
+    /// the executor actually saw, before execution.
+    pub input_hash: String,
+    /// SHA-256 hash of the output JSON (hex-encoded). Computed after the
+    /// executor returned and before output-schema validation so the hash
+    /// reflects what the executor produced verbatim.
+    pub output_hash: String,
+    /// Wall-clock execution time in milliseconds, from just before the
+    /// executor was dispatched to just after output-schema validation
+    /// succeeded.
+    pub execution_time_ms: u64,
+}
+
+/// Runs steps 1-6 of tool invocation without any economy state.
+///
+/// This helper is the off-lock execution half of tool invocation. It
+/// performs: context-state check, capability check, tool lookup, input
+/// schema validation, executor dispatch under a bounded timeout, and
+/// output schema validation. It deliberately takes NO economy context
+/// and touches no governance state so that
+/// [`ContextManager::invoke_tool_with_economy`](crate::context::ContextManager::invoke_tool_with_economy)
+/// can call it with the `contexts` mutex dropped.
+///
+/// The free [`invoke_tool`] function also delegates to this helper after
+/// running economy pre-check / escrow authorization, so the execution
+/// path is shared between the two entry points.
+///
+/// # Errors
+///
+/// Returns [`InvocationError`] on state, capability, schema validation,
+/// timeout, or executor failure. Cancellation is not supported by this
+/// variant — see the inline timeout-plus-select! path in
+/// [`invoke_tool_with_cancellation`] instead.
+#[allow(clippy::too_many_arguments)] // 8 parameters mirror `invoke_tool`; lower bound imposed by the execution contract.
+pub(crate) async fn invoke_tool_execute_and_validate<F, Fut>(
+    context: &ContextHandle,
+    registry: &ToolRegistry,
+    role_state: &ContextRoleState,
+    tool_id: &ToolId,
+    input: serde_json::Value,
+    invoker_did: &DID,
+    timeout_ms: Option<u32>,
+    executor: F,
+) -> Result<InvokeExecuteOutcome, InvocationError>
 where
     F: FnOnce(serde_json::Value) -> Fut,
     Fut: Future<Output = Result<serde_json::Value, String>>,
@@ -262,109 +453,62 @@ where
     validate_value_against_schema(&input, &registration.schema.input_schema)
         .map_err(|msg| InvocationError::InputValidationFailed { message: msg })?;
 
-    // 4a. Economy pre-check (#1537).
-    let action_cost = economy
-        .as_mut()
-        .map(|econ| economy_pre_check(econ, invoker_did))
-        .transpose()?;
-
-    // 4b. Payment escrow (#1537, #1596): authorize (escrow hold) BEFORE tool execution.
-    let escrow_parts = extract_escrow_parts(&economy);
-    let mut escrow = if let Some((adapter, policy, metrics, ctx_id)) = &escrow_parts {
-        match authorize_tool_payment(adapter.as_ref(), policy, ctx_id, invoker_did, metrics).await {
-            Ok(prepared) => prepared,
-            Err(auth_err) => {
-                void_escrow_and_rollback(
-                    None,
-                    escrow_parts.as_ref(),
-                    action_cost,
-                    &mut economy,
-                    invoker_did,
-                )
-                .await;
-                return Err(auth_err);
-            }
-        }
-    } else {
-        None
-    };
+    // 4a. Compute the input hash up-front from the value the executor will
+    // see. Doing this before execution lets the hash be recorded even if the
+    // executor mutates the input object (serde_json::Value is a value type,
+    // but this also protects against any future change to `F` that might
+    // take the input by reference and mutate it).
+    let input_hash = sha256_json(&input);
 
     // 5. Execute the tool with timeout.
     let effective_timeout = timeout_ms.unwrap_or(DEFAULT_TIMEOUT_MS).min(MAX_TIMEOUT_MS);
     let timeout_duration = Duration::from_millis(u64::from(effective_timeout));
-    let execution_result = tokio::time::timeout(timeout_duration, executor(input.clone())).await;
+    let execution_result = tokio::time::timeout(timeout_duration, executor(input)).await;
     let output = match execution_result {
         Ok(Ok(output)) => output,
         Ok(Err(exec_err)) => {
-            void_escrow_and_rollback(
-                escrow.as_ref(),
-                escrow_parts.as_ref(),
-                action_cost,
-                &mut economy,
-                invoker_did,
-            )
-            .await;
             return Err(InvocationError::ExecutionFailed { message: exec_err });
         }
         Err(_elapsed) => {
-            void_escrow_and_rollback(
-                escrow.as_ref(),
-                escrow_parts.as_ref(),
-                action_cost,
-                &mut economy,
-                invoker_did,
-            )
-            .await;
             return Err(InvocationError::Timeout {
                 timeout_ms: effective_timeout,
             });
         }
     };
 
-    // 6. Validate output + post-invocation bookkeeping (#1530, #1531).
-    // H6: on output validation failure, void escrow and rollback budget
-    // before returning. The `?` would leak the escrow hold.
-    if let Err(msg) = validate_value_against_schema(&output, &registration.schema.output_schema) {
-        void_escrow_and_rollback(
-            escrow.as_ref(),
-            escrow_parts.as_ref(),
-            action_cost,
-            &mut economy,
-            invoker_did,
-        )
-        .await;
-        return Err(InvocationError::OutputValidationFailed { message: msg });
-    }
-    let triggered = economy
-        .as_mut()
-        .map(|econ| economy_post_check(econ, invoker_did))
-        .unwrap_or_default();
+    // 6. Validate output against the tool's output schema.
+    validate_value_against_schema(&output, &registration.schema.output_schema)
+        .map_err(|msg| InvocationError::OutputValidationFailed { message: msg })?;
 
-    // 6b. Complete (capture) the escrowed payment after successful execution.
-    let payment_receipt = finalize_tool_escrow(
-        escrow.take(),
-        escrow_parts.as_ref(),
-        action_cost,
-        &mut economy,
-        invoker_did,
-    )
-    .await?;
+    let output_hash = sha256_json(&output);
+    let execution_time_ms = elapsed_ms(start);
 
-    // 7-8. Build event + return (#1596: receipt returned to caller).
-    let event = build_tool_event(tool_id, invoker_did, start, &input, &output, action_cost);
-    Ok((output, event, triggered, payment_receipt))
+    Ok(InvokeExecuteOutcome {
+        output,
+        input_hash,
+        output_hash,
+        execution_time_ms,
+    })
 }
 
-/// Runs economy pre-checks (budget enforcement + UCAN AND-composition).
+/// Runs economy pre-checks (pure compute — no state mutation).
+///
+/// Strategy B: this function is a PURE compute that returns the owned
+/// evaluated cost. It does NOT mutate `budget_tracker`. Callers are
+/// responsible for explicitly calling `budget_tracker.record_spend` after
+/// this function returns so that budget mutation is visible at the call
+/// site. Separating "compute cost" from "deduct budget" lets the
+/// `ContextManager::invoke_tool_with_economy` wrapper snapshot state in
+/// Phase 1 under the locked contexts mutex, drop the lock, run the
+/// executor off-lock, and commit/rollback in Phase 3.
 ///
 /// Uses real observable metrics from `ToolEconomyContext` (not zero metrics).
-/// Evaluates cost, checks spending UCAN AND-composition (§19.5), and records
-/// spend against the invoker's budget. This is the single budget deduction
-/// point — the adapter escrow flow is separate.
+/// Evaluates cost, applies per-DID escalation, checks spending UCAN
+/// AND-composition (§19.5), and checks `has_budget` for the invoker.
 ///
 /// Returns the evaluated action cost for inclusion in the `ToolInvokedEvent`.
-fn economy_pre_check<S: BuildHasher>(
-    economy: &mut ToolEconomyContext<'_, S>,
+pub(crate) fn economy_pre_check<S: BuildHasher>(
+    economy: &ToolEconomyContext<'_, S>,
     invoker_did: &DID,
 ) -> Result<scp_protocol::economy::types::Amount, InvocationError> {
     // Step 1: derive a base cost. Policy formula takes precedence; otherwise
@@ -411,7 +555,10 @@ fn economy_pre_check<S: BuildHasher>(
     check_tool_ucan_composition(cost, economy.action_ucan, economy.spending_ucan)?;
 
     // Budget check — no auto-grant. Budget must be explicitly approved via
-    // ApproveSpend governance action.
+    // ApproveSpend governance action. We deliberately do NOT call
+    // `record_spend` here; the caller performs the deduction after this
+    // function returns so the mutation point is visible and Strategy B
+    // keeps this function pure.
     if !economy.budget_tracker.has_budget(invoker_did) {
         return Err(InvocationError::BudgetExceeded {
             did: invoker_did.to_string(),
@@ -419,14 +566,6 @@ fn economy_pre_check<S: BuildHasher>(
             remaining: 0,
         });
     }
-    economy
-        .budget_tracker
-        .record_spend(invoker_did, cost)
-        .map_err(|_| InvocationError::BudgetExceeded {
-            did: invoker_did.to_string(),
-            cost: cost.0,
-            remaining: economy.budget_tracker.remaining(invoker_did).0,
-        })?;
 
     Ok(cost)
 }
@@ -447,12 +586,16 @@ fn economy_post_check<S: BuildHasher>(
 }
 
 /// Builds a [`ToolInvokedEvent`] from invocation metadata.
-fn build_tool_event(
+///
+/// Accepts pre-computed hashes and elapsed time so the event constructor
+/// is a pure data-assembly step that both direct callers and the
+/// `ContextManager::invoke_tool_with_economy` wrapper can share.
+pub(crate) fn build_tool_event(
     tool_id: &ToolId,
     invoker_did: &DID,
-    start: std::time::Instant,
-    input: &serde_json::Value,
-    output: &serde_json::Value,
+    execution_time_ms: u64,
+    input_hash: String,
+    output_hash: String,
     cost: Option<scp_protocol::economy::types::Amount>,
 ) -> ToolInvokedEvent {
     ToolInvokedEvent {
@@ -460,9 +603,9 @@ fn build_tool_event(
         tool_id: tool_id.to_owned(),
         invoker_did: invoker_did.clone(),
         status: ToolStatus::Success,
-        execution_time_ms: elapsed_ms(start),
-        input_hash: sha256_json(input),
-        output_hash: Some(sha256_json(output)),
+        execution_time_ms,
+        input_hash,
+        output_hash: Some(output_hash),
         cost,
     }
 }
@@ -530,11 +673,26 @@ where
     validate_value_against_schema(&input, &registration.schema.input_schema)
         .map_err(|msg| InvocationError::InputValidationFailed { message: msg })?;
 
-    // 4a. Economy pre-check (#1537).
-    let action_cost = economy
-        .as_mut()
-        .map(|econ| economy_pre_check(econ, invoker_did))
-        .transpose()?;
+    // 4a. Economy pre-check (#1537). Strategy B: `economy_pre_check` is pure
+    // compute — it does NOT deduct budget. Callers record the spend
+    // explicitly so the mutation point is visible. See
+    // `invoke_tool` for the matching comment on the non-cancellable path.
+    let action_cost = match economy.as_deref_mut() {
+        Some(econ) => {
+            let cost = economy_pre_check(econ, invoker_did)?;
+            if cost.0 > 0 {
+                econ.budget_tracker
+                    .record_spend(invoker_did, cost)
+                    .map_err(|_| InvocationError::BudgetExceeded {
+                        did: invoker_did.to_string(),
+                        cost: cost.0,
+                        remaining: econ.budget_tracker.remaining(invoker_did).0,
+                    })?;
+            }
+            Some(cost)
+        }
+        None => None,
+    };
 
     // 4b. Payment escrow (#1537, #1596): authorize (escrow hold) BEFORE tool execution.
     let escrow_parts = extract_escrow_parts(&economy);
@@ -557,10 +715,19 @@ where
         None
     };
 
-    // 5. Execute with timeout and cancellation.
+    // 4c. Compute the input hash from the value the executor will see so
+    // the resulting `ToolInvokedEvent` records it verbatim even though we
+    // have to clone the input for the cancellation path.
+    let input_hash = sha256_json(&input);
+
+    // 5. Execute with timeout and cancellation. The cancellation variant
+    // keeps its own `tokio::select!` body because composing `tokio::select!`
+    // across a helper boundary cannot carry the pinned `&mut` futures out
+    // of scope — the cancellation-free path delegates to
+    // `invoke_tool_execute_and_validate` instead.
     let effective_timeout = timeout_ms.unwrap_or(DEFAULT_TIMEOUT_MS).min(MAX_TIMEOUT_MS);
     let timeout_duration = Duration::from_millis(u64::from(effective_timeout));
-    let exec_fut = executor(input.clone());
+    let exec_fut = executor(input);
     let cancel_fut = cancellation();
     tokio::pin!(exec_fut);
     tokio::pin!(cancel_fut);
@@ -608,6 +775,8 @@ where
         .await;
         return Err(InvocationError::OutputValidationFailed { message: msg });
     }
+    let output_hash = sha256_json(&output);
+    let execution_time_ms = elapsed_ms(start);
     let triggered = economy
         .as_mut()
         .map(|econ| economy_post_check(econ, invoker_did))
@@ -624,7 +793,14 @@ where
     .await?;
 
     // 7. Build event + return (#1596: receipt returned to caller).
-    let event = build_tool_event(tool_id, invoker_did, start, &input, &output, action_cost);
+    let event = build_tool_event(
+        tool_id,
+        invoker_did,
+        execution_time_ms,
+        input_hash,
+        output_hash,
+        action_cost,
+    );
     Ok((output, event, triggered, payment_receipt))
 }
 
@@ -841,7 +1017,7 @@ impl crate::economy::adapter::PaymentAdapter for ToolPaymentBridge<'_> {
 ///
 /// Called BEFORE tool execution. On success, the caller must eventually call
 /// `complete_tool_payment` or `void_tool_escrow`.
-async fn authorize_tool_payment(
+pub(crate) async fn authorize_tool_payment(
     adapter: &dyn crate::economy::adapter::PaymentAdapterDyn,
     policy: &scp_protocol::economy::types::EconomicPolicy,
     context_id: &str,
@@ -888,7 +1064,7 @@ async fn authorize_tool_payment(
 ///
 /// Called AFTER successful tool execution. Captures the escrowed payment
 /// and returns the receipt.
-async fn complete_tool_payment(
+pub(crate) async fn complete_tool_payment(
     adapter: &dyn crate::economy::adapter::PaymentAdapterDyn,
     policy: Option<&scp_protocol::economy::types::EconomicPolicy>,
     prepared: &crate::economy::integration::PreparedAction,
@@ -923,7 +1099,7 @@ async fn complete_tool_payment(
 /// Called when tool execution fails (error, timeout, cancellation) to
 /// release the escrow hold. Best-effort — logs but does not propagate
 /// void failures.
-async fn void_tool_escrow(
+pub(crate) async fn void_tool_escrow(
     adapter: &dyn crate::economy::adapter::PaymentAdapterDyn,
     prepared: &crate::economy::integration::PreparedAction,
 ) {
