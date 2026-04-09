@@ -132,11 +132,16 @@ fn simple_tool_registration() -> scp_core::context::params::ToolRegistration {
 }
 
 // ---------------------------------------------------------------------------
-// 1. all_30_governance_action_variants_roundtrip
+// 1. all_governance_action_variants_roundtrip
 // ---------------------------------------------------------------------------
 
-/// Builds all 30 `GovernanceAction` variants for exhaustive testing.
+/// Builds governance action fixtures covering every variant (plus a
+/// few variants with multiple `AccessScope` values) for exhaustive
+/// serde round-trip testing. The assertion below pins the fixture
+/// count so adding a new variant to the enum without updating this
+/// helper breaks the test loudly.
 /// Split into a helper to keep the test function within the line limit.
+#[allow(clippy::too_many_lines)]
 fn all_governance_actions_for_test() -> Vec<GovernanceAction> {
     vec![
         GovernanceAction::AddMember {
@@ -234,17 +239,29 @@ fn all_governance_actions_for_test() -> Vec<GovernanceAction> {
             auto_invite: true,
         },
         GovernanceAction::CancelContextMigration,
+        GovernanceAction::SuspendMember {
+            did: bob(),
+            capabilities: vec![Capability::GovernanceVote],
+        },
+        GovernanceAction::ModifyHardRateLimit {
+            new_config: scp_core::economy::antispam::HardRateLimitConfig::matrix_defaults(),
+        },
     ]
 }
 
 #[tokio::test]
-async fn all_30_governance_action_variants_roundtrip() {
+async fn all_governance_action_variants_roundtrip() {
     let actions = all_governance_actions_for_test();
 
+    // The fixture count is pinned to catch enum growth. When adding
+    // a new GovernanceAction variant, extend `all_governance_actions_for_test`
+    // and bump this number. Not equal to the raw variant count —
+    // Revoke / RestoreAccess appear twice with different AccessScope
+    // values to exercise both scopes of the AccessScope enum.
     assert_eq!(
         actions.len(),
-        30,
-        "must cover all 30 GovernanceAction variants"
+        31,
+        "fixture must cover every GovernanceAction variant; bump when adding a new variant"
     );
 
     for action in &actions {
