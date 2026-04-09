@@ -74,8 +74,6 @@
 
 /// Bridge connector operations (registration, trust evaluation, shadow identities).
 pub mod bridge;
-/// Context lifecycle and messaging (create, join, leave, close, send, subscribe).
-pub mod context;
 /// Consequence rule evaluation and enforcement (ADR-017, #1531).
 ///
 /// Wraps `scp_protocol::trust::consequence::evaluate_consequence_rules`
@@ -83,6 +81,8 @@ pub mod context;
 /// are enforced inside [`crate::manager::PerContextState`]. See the module
 /// docs for dispatch call sites.
 pub(crate) mod consequence;
+/// Context lifecycle and messaging (create, join, leave, close, send, subscribe).
+pub mod context;
 /// MLS encryption and sender key layer for real message confidentiality.
 pub mod crypto;
 /// JS-injected key custody callback types (`WebCrypto` integration).

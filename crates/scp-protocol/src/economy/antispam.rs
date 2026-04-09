@@ -1440,7 +1440,7 @@ mod tests {
     }
 
     /// F5: rollback must target the OLDEST entry even after later
-    /// record_message calls reorder memory. Verifies identity-based
+    /// `record_message` calls reorder memory. Verifies identity-based
     /// rollback rather than LIFO semantics.
     #[test]
     fn rollback_targets_specific_token_even_after_interleaved_record() {
@@ -1525,10 +1525,7 @@ mod tests {
     fn validate_velocity_snapshot_clamps_stale_entries() {
         let mut entries = HashMap::new();
         // Two stale entries + one fresh entry.
-        entries.insert(
-            "did:dht:z6MkAlice".to_owned(),
-            vec![1, 2, 950, 990, 999],
-        );
+        entries.insert("did:dht:z6MkAlice".to_owned(), vec![1, 2, 950, 990, 999]);
         SenderVelocityTracker::validate_and_sanitize_snapshot(
             &mut entries,
             60, // window_secs
@@ -1545,7 +1542,7 @@ mod tests {
     #[test]
     fn validate_velocity_snapshot_rejects_oversized_entry_count() {
         let mut entries = HashMap::new();
-        let huge: Vec<u64> = (0..(MAX_VELOCITY_ENTRIES_PER_SENDER as u64 + 1)).collect();
+        let huge: Vec<u64> = (0..=(MAX_VELOCITY_ENTRIES_PER_SENDER as u64)).collect();
         entries.insert("did:dht:z6MkAlice".to_owned(), huge);
         let err = SenderVelocityTracker::validate_and_sanitize_snapshot(
             &mut entries,
@@ -1670,7 +1667,6 @@ mod tests {
         // continue to reject (no spurious refund).
         assert!(!limiter.try_consume(&alice, 100));
     }
-
 
     // --- HardRateLimitConfig / TokenBucketLimiter ---
 

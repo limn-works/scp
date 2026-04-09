@@ -284,9 +284,7 @@ impl ContextManager {
         let hrl_config = ctx_snapshot
             .hard_rate_limit_config
             .clone()
-            .unwrap_or_else(
-                scp_protocol::economy::antispam::HardRateLimitConfig::matrix_defaults,
-            );
+            .unwrap_or_else(scp_protocol::economy::antispam::HardRateLimitConfig::matrix_defaults);
         hrl_config.validate().map_err(|e| {
             ContextError::PersistenceFailed(format!(
                 "restore: hard-rate-limit config validation failed: {e}"
@@ -322,10 +320,7 @@ impl ContextManager {
                             "restore: velocity snapshot validation failed: {e}"
                         ))
                     })?;
-                scp_protocol::economy::antispam::SenderVelocityTracker::from_snapshot(
-                    60,
-                    entries,
-                )
+                scp_protocol::economy::antispam::SenderVelocityTracker::from_snapshot(60, entries)
             }
             None => scp_protocol::economy::antispam::SenderVelocityTracker::new(60),
         };
@@ -367,8 +362,7 @@ impl ContextManager {
                 pruning_policy: ctx_snapshot.pruning_policy,
                 message_pricing: validated_message_pricing,
                 hard_rate_limit: scp_protocol::economy::antispam::TokenBucketLimiter::from_snapshot(
-                    hrl_config,
-                    hrl_state,
+                    hrl_config, hrl_state,
                 ),
                 economic_policy: ctx_snapshot.economic_policy,
                 budget_tracker: ctx_snapshot.budget_tracker,
@@ -852,9 +846,7 @@ impl ContextManager {
             .snapshot
             .hard_rate_limit_config
             .clone()
-            .unwrap_or_else(
-                scp_protocol::economy::antispam::HardRateLimitConfig::matrix_defaults,
-            );
+            .unwrap_or_else(scp_protocol::economy::antispam::HardRateLimitConfig::matrix_defaults);
         hrl_config.validate().map_err(|e| {
             ContextError::PersistenceFailed(format!(
                 "import: hard-rate-limit config validation failed: {e}"
@@ -887,10 +879,7 @@ impl ContextManager {
                             "import: velocity snapshot validation failed: {e}"
                         ))
                     })?;
-                scp_protocol::economy::antispam::SenderVelocityTracker::from_snapshot(
-                    60,
-                    entries,
-                )
+                scp_protocol::economy::antispam::SenderVelocityTracker::from_snapshot(60, entries)
             }
             None => scp_protocol::economy::antispam::SenderVelocityTracker::new(60),
         };
@@ -938,8 +927,7 @@ impl ContextManager {
                 pruning_policy: export.snapshot.pruning_policy,
                 message_pricing: validated_message_pricing,
                 hard_rate_limit: scp_protocol::economy::antispam::TokenBucketLimiter::from_snapshot(
-                    hrl_config,
-                    hrl_state,
+                    hrl_config, hrl_state,
                 ),
                 economic_policy: export.snapshot.economic_policy,
                 budget_tracker: export.snapshot.budget_tracker,

@@ -413,22 +413,11 @@ impl ContextManager {
                     Ok(env) => env,
                     Err(e) => {
                         drop(contexts);
-                        super::economy::rollback_economy_ticket(
-                            self,
-                            &context_id,
-                            ticket,
-                        )
-                        .await;
+                        super::economy::rollback_economy_ticket(self, &context_id, ticket).await;
                         return Err(e);
                     }
                 };
-                (
-                    Some(env),
-                    std::collections::HashMap::new(),
-                    0,
-                    true,
-                    ticket,
-                )
+                (Some(env), std::collections::HashMap::new(), 0, true, ticket)
             } else {
                 // Capability already checked above (H7: before budget deduction).
                 // Assign sequence under lock — SequenceTracker rejects duplicates.
