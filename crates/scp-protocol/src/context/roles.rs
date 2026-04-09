@@ -2601,4 +2601,143 @@ mod tests {
             );
         }
     }
+
+    // -----------------------------------------------------------------------
+    // Regression tests — consequence enforcement is per-context opt-in and
+    // app-level only (spec §7.3.7). A `SuspendAll` consequence MUST NOT
+    // remove the target from the context membership set (that would be an
+    // `Eject` governance action, O(N), MLS-level) and MUST block every
+    // capability including governance participation. These tests pin that
+    // contract so a future refactor cannot accidentally escalate a
+    // consequence-tier suspension into a membership-destroying action.
+    // -----------------------------------------------------------------------
+
+    /// `suspend_all` MUST NOT remove the member from
+    /// `ContextRoleState.members` or clear their granted
+    /// `member_capabilities`. The suspension is an overlay in
+    /// `suspended_capabilities`; the underlying role state is intact and
+    /// can be reversed by `restore_capabilities`. This is the protocol-
+    /// level analogue of "MLS membership preserved" at the spec layer
+    /// (§7.3.7, §5.9) — the crypto provider's MLS group is never touched
+    /// by a consequence path.
+    #[test]
+    fn consequence_suspend_all_preserves_membership_and_roles() {
+        let ceiling = test_ceiling();
+        let mut state = ContextRoleState::new(
+            "ctx-suspend-membership",
+            "did:dht:creator",
+            ceiling,
+            vec![],
+            &scp_primitives::SystemClock,
+        )
+        .unwrap();
+
+        // Add alice and give her the member role so she has concrete
+        // capabilities to suspend.
+        state.members.insert("did:dht:alice".to_owned());
+        let _ = assign_role(
+            &mut state,
+            "did:dht:alice",
+            "member",
+            "did:dht:creator",
+            &scp_primitives::SystemClock,
+        )
+        .expect("creator can assign member role");
+
+        // Sanity — alice is a member and has role-granted caps before suspension.
+        assert!(state.members.contains("did:dht:alice"));
+        assert!(state.member_has_capability("did:dht:alice", &Capability::MessagesWrite));
+        let pre_caps = state
+            .member_capabilities
+            .get("did:dht:alice")
+            .cloned()
+            .expect("alice has role-granted capability set");
+
+        // Apply the consequence.
+        state.suspend_all("did:dht:alice");
+
+        // Membership set: UNCHANGED. A consequence does not destroy
+        // membership.
+        assert!(
+            state.members.contains("did:dht:alice"),
+            "consequence SuspendAll must not remove the subject from members; \
+             that is an Eject governance action"
+        );
+
+        // Role-granted capability set: UNCHANGED. Suspension is an overlay
+        // in `suspended_capabilities`, not a role mutation — so the
+        // underlying capability set survives and `restore_capabilities`
+        // can reverse it.
+        assert_eq!(
+            state.member_capabilities.get("did:dht:alice"),
+            Some(&pre_caps),
+            "consequence SuspendAll must not purge the member's role-granted \
+             capabilities — it overlays suspensions, not mutates roles"
+        );
+
+        // Every capability alice was granted via her role is now gated by
+        // the suspension check.
+        for cap in &pre_caps {
+            assert!(
+                !state.member_has_capability("did:dht:alice", cap),
+                "capability {cap:?} should be blocked after SuspendAll"
+            );
+        }
+    }
+
+    /// `suspend_all` MUST block governance participation capabilities
+    /// (`GovernancePropose`, `GovernanceVote`) so a suspended member
+    /// cannot submit proposals or vote. This pins the §7.3.7 contract
+    /// that `SuspendAll` is a full app-level gate block — not just
+    /// messaging, but every capability the member holds.
+    #[test]
+    fn consequence_suspend_all_blocks_governance_participation() {
+        let ceiling = CapabilityCeiling {
+            capabilities: std::collections::HashSet::from([
+                Capability::MessagesRead,
+                Capability::MessagesWrite,
+                Capability::GovernancePropose,
+                Capability::GovernanceVote,
+            ]),
+        };
+        let mut state = ContextRoleState::new(
+            "ctx-governance-suspension",
+            "did:dht:creator",
+            ceiling,
+            vec![],
+            &scp_primitives::SystemClock,
+        )
+        .unwrap();
+
+        // Creator is admin and has the full ceiling. Precondition: the
+        // creator can propose and vote.
+        assert!(state.member_has_capability("did:dht:creator", &Capability::GovernancePropose));
+        assert!(state.member_has_capability("did:dht:creator", &Capability::GovernanceVote));
+        assert!(state.member_has_capability("did:dht:creator", &Capability::MessagesWrite));
+
+        // Apply the consequence against the creator (standing in for a
+        // policy-violating participant).
+        state.suspend_all("did:dht:creator");
+
+        // Governance participation is blocked.
+        assert!(
+            !state.member_has_capability("did:dht:creator", &Capability::GovernancePropose),
+            "SuspendAll must block governance:propose — suspended members cannot submit proposals"
+        );
+        assert!(
+            !state.member_has_capability("did:dht:creator", &Capability::GovernanceVote),
+            "SuspendAll must block governance:vote — suspended members cannot vote"
+        );
+        // And messaging is also blocked, for completeness.
+        assert!(
+            !state.member_has_capability("did:dht:creator", &Capability::MessagesWrite),
+            "SuspendAll must block messages:write"
+        );
+        // But the subject is still a context member (spec §7.3.7: app-level
+        // consequence, not a membership action).
+        assert!(
+            state.members.contains("did:dht:creator"),
+            "SuspendAll must preserve membership — that's what Eject is for"
+        );
+    }
 }
