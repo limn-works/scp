@@ -1831,6 +1831,182 @@ async fn tool_invoke_escalation_via_managed_wrapper() {
     );
 }
 
+/// D4: the tool-invoke path consumes a hard-rate-limit token before any
+/// economy bookkeeping, matching the `send_message` path. Without this,
+/// a member rate-limited on `send_message` could bypass the cap via
+/// `invoke_tool_with_economy`.
+#[tokio::test]
+async fn tool_invoke_respects_hard_rate_limit() {
+    use scp_protocol::context::tools::ToolId;
+    use scp_protocol::context::tools::registry::ToolRegistry;
+    use scp_protocol::economy::types::Amount;
+
+    let manager = ContextManager::new(
+        Box::new(MockCrypto::default()),
+        Box::new(MockTransport::connected()),
+        Box::new(MockEventLog::default()),
+        noop_key_resolver(),
+    );
+
+    let mut params = governance_params();
+    params
+        .ceiling
+        .push(scp_protocol::context::params::Capability::ToolInvokeAll);
+    // Free context — the hard rate limit fires independent of cost.
+    let _handle = manager
+        .create_context("tool-rl-ctx".into(), params, "did:key:spammer".into())
+        .await
+        .unwrap();
+
+    // Grant a large budget so budget exhaustion cannot be confused with
+    // the rate limit. The rate limit fires first.
+    {
+        let mut contexts = manager.contexts.lock().await;
+        let ctx = contexts.get_mut("tool-rl-ctx").unwrap();
+        ctx.governance
+            .budget_tracker
+            .grant(&"did:key:spammer".into(), Amount::new(1_000_000));
+    }
+
+    let mut registry = ToolRegistry::new();
+    registry.insert(test_tool_registration("echo"));
+
+    // A spending UCAN is required because the default message pricing
+    // gives `tool:invoke` a base cost of 1, even without a configured
+    // economic policy (`derive_message_pricing` returns `spec_default`).
+    // This isolates the hard-rate-limit behavior from UCAN machinery.
+    let ucan = dummy_spending_ucan();
+
+    // Burst of 10 should all succeed (default burst capacity).
+    for i in 0..10u8 {
+        let result = manager
+            .invoke_tool_with_economy(
+                "tool-rl-ctx",
+                &registry,
+                &ToolId::from("echo"),
+                serde_json::json!({"n": i}),
+                &"did:key:spammer".into(),
+                Some(&ucan),
+                None,
+                |_input| async { Ok(serde_json::json!({})) },
+            )
+            .await;
+        assert!(
+            result.is_ok(),
+            "tool invoke #{i} should succeed within burst: {result:?}"
+        );
+    }
+
+    // The 11th in the same tick should be rejected by the token bucket.
+    let result = manager
+        .invoke_tool_with_economy(
+            "tool-rl-ctx",
+            &registry,
+            &ToolId::from("echo"),
+            serde_json::json!({"n": 11}),
+            &"did:key:spammer".into(),
+            Some(&ucan),
+            None,
+            |_input| async { Ok(serde_json::json!({})) },
+        )
+        .await;
+    assert!(result.is_err(), "11th tool invoke should be rate-limited");
+    let err = result.unwrap_err();
+    match err {
+        ContextError::PermissionDenied(ref msg) => {
+            assert!(
+                msg.contains("SCP-ECON-7090"),
+                "expected SCP-ECON-7090 hard rate limit error, got: {msg}"
+            );
+        }
+        other => panic!("expected PermissionDenied, got: {other:?}"),
+    }
+}
+
+/// D4: a rejected tool invocation (e.g., execution failure) MUST refund
+/// the hard-rate-limit token so a rejected attempt does not permanently
+/// burn bucket capacity. Otherwise an invoker hitting a failing tool
+/// would be rate-limited into silence via its own failures.
+#[tokio::test]
+async fn tool_invoke_failure_refunds_hard_rate_limit_token() {
+    use scp_protocol::context::tools::ToolId;
+    use scp_protocol::context::tools::registry::ToolRegistry;
+    use scp_protocol::economy::types::Amount;
+
+    let manager = ContextManager::new(
+        Box::new(MockCrypto::default()),
+        Box::new(MockTransport::connected()),
+        Box::new(MockEventLog::default()),
+        noop_key_resolver(),
+    );
+
+    let mut params = governance_params();
+    params
+        .ceiling
+        .push(scp_protocol::context::params::Capability::ToolInvokeAll);
+    let _handle = manager
+        .create_context(
+            "tool-rl-refund-ctx".into(),
+            params,
+            "did:key:invoker".into(),
+        )
+        .await
+        .unwrap();
+
+    {
+        let mut contexts = manager.contexts.lock().await;
+        let ctx = contexts.get_mut("tool-rl-refund-ctx").unwrap();
+        ctx.governance
+            .budget_tracker
+            .grant(&"did:key:invoker".into(), Amount::new(1_000));
+    }
+
+    let mut registry = ToolRegistry::new();
+    registry.insert(test_tool_registration("echo"));
+
+    // Fire 10 failing invocations — each should fail, each should
+    // refund the token, leaving the bucket fully replenished.
+    for i in 0..10u8 {
+        let _ = manager
+            .invoke_tool_with_economy(
+                "tool-rl-refund-ctx",
+                &registry,
+                &ToolId::from("echo"),
+                serde_json::json!({"n": i}),
+                &"did:key:invoker".into(),
+                None,
+                None,
+                |_input| async { Err::<serde_json::Value, _>("executor failed".to_owned()) },
+            )
+            .await;
+    }
+
+    // The 11th attempt (also failing) should NOT hit the rate limit —
+    // because every prior token was refunded. It should fail on the
+    // executor error instead.
+    let result = manager
+        .invoke_tool_with_economy(
+            "tool-rl-refund-ctx",
+            &registry,
+            &ToolId::from("echo"),
+            serde_json::json!({"n": 11}),
+            &"did:key:invoker".into(),
+            None,
+            None,
+            |_input| async { Err::<serde_json::Value, _>("executor failed".to_owned()) },
+        )
+        .await;
+    assert!(result.is_err(), "11th failing invoke should still error");
+    let err = result.unwrap_err();
+    if let ContextError::PermissionDenied(msg) = &err {
+        assert!(
+            !msg.contains("SCP-ECON-7090"),
+            "11th failing invoke must NOT hit hard rate limit \
+             (token should have been refunded on each failure): {msg}"
+        );
+    }
+}
+
 /// Test D: `join_context` ticks the velocity tracker for the joiner
 /// so that a second join attempt would see non-zero velocity. The join
 /// counts toward per-DID anti-spam tracking the same way message sends do.

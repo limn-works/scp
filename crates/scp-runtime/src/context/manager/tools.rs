@@ -117,6 +117,12 @@ struct ToolEconomyTicket {
     /// sees the same metrics the Phase 1 authorize saw — eliminating a
     /// TOCTOU window where the adapter could diverge from the budget.
     metrics_for_capture: ObservableMetrics,
+    /// Whether the Phase 1 hard-rate-limit token must be refunded on
+    /// rollback. Set to `true` on ticket creation because the token
+    /// was consumed before the ticket was built; cleared after the
+    /// rollback path calls `refund` so repeated rollback calls are
+    /// idempotent.
+    needs_hard_rate_limit_refund: bool,
     /// Set to `true` by `commit`/`rollback` so the `Drop` guard can tell
     /// that the caller honored the contract.
     consumed: bool,
@@ -186,6 +192,10 @@ async fn rollback_tool_economy_ticket(
             ctx.governance
                 .budget_tracker
                 .reverse_spend(&ticket.actor_did, cost);
+        }
+        if ticket.needs_hard_rate_limit_refund {
+            ctx.governance.hard_rate_limit.refund(&ticket.actor_did);
+            ticket.needs_hard_rate_limit_refund = false;
         }
     }
 }
@@ -271,6 +281,27 @@ impl ContextManager {
             let handle = ctx.handle.clone();
             let role_state = ctx.role_state.clone();
 
+            // Defense-in-depth (Matrix Synapse–style hard rate limit):
+            // consume a token from the per-invoker bucket BEFORE any
+            // bookkeeping. This closes the tool-path bypass where a
+            // member rate-limited on `send_message` could still burn
+            // the relay via tool invocations. Mirrors the same check
+            // in `enforce_send_economy` at messaging.rs:346.
+            //
+            // On any subsequent Phase 1 / Phase 2 / Phase 3 failure
+            // the token is refunded: inline rollbacks reverse it
+            // directly and the `ToolEconomyTicket`-based rollback
+            // consults `needs_hard_rate_limit_refund`.
+            if !ctx
+                .governance
+                .hard_rate_limit
+                .try_consume(invoker_did, now_secs)
+            {
+                return Err(ContextError::PermissionDenied(
+                    "SCP-ECON-7090: hard rate limit exceeded for invoker".to_owned(),
+                ));
+            }
+
             // Record velocity BEFORE the pre-check so that
             // `compute_escalated_cost` sees the new window entry
             // (matching `send_message`). F5: capture the rollback
@@ -343,13 +374,14 @@ impl ContextManager {
                 match economy_pre_check(&economy, invoker_did) {
                     Ok(cost) => cost,
                     Err(err) => {
-                        // Roll back the velocity entry we just
-                        // recorded — nothing else has been mutated yet
-                        // so the rollback is inline (no ticket to
-                        // drain).
+                        // Roll back the velocity entry and the hard
+                        // rate-limit token we consumed above — nothing
+                        // else has been mutated yet so the rollback
+                        // is inline (no ticket to drain).
                         ctx.governance
                             .velocity_tracker
                             .rollback(invoker_did, velocity_token);
+                        ctx.governance.hard_rate_limit.refund(invoker_did);
                         return Err(invocation_error_to_context(err));
                     }
                 }
@@ -369,6 +401,7 @@ impl ContextManager {
                     ctx.governance
                         .velocity_tracker
                         .rollback(invoker_did, velocity_token);
+                    ctx.governance.hard_rate_limit.refund(invoker_did);
                     return Err(invocation_error_to_context(
                         InvocationError::BudgetExceeded {
                             did: invoker_did.to_string(),
@@ -401,9 +434,10 @@ impl ContextManager {
                     {
                         Ok(prepared) => prepared,
                         Err(auth_err) => {
-                            // Authorization failed — reverse budget
-                            // and velocity inline (no ticket to drain
-                            // yet) under the still-held lock.
+                            // Authorization failed — reverse budget,
+                            // velocity, and the hard-rate-limit token
+                            // inline (no ticket to drain yet) under
+                            // the still-held lock.
                             if let Some(cost) = deducted_cost {
                                 ctx.governance
                                     .budget_tracker
@@ -412,6 +446,7 @@ impl ContextManager {
                             ctx.governance
                                 .velocity_tracker
                                 .rollback(invoker_did, velocity_token);
+                            ctx.governance.hard_rate_limit.refund(invoker_did);
                             return Err(invocation_error_to_context(auth_err));
                         }
                     }
@@ -426,6 +461,7 @@ impl ContextManager {
                 escrow,
                 policy_for_capture: economic_policy,
                 metrics_for_capture: metrics,
+                needs_hard_rate_limit_refund: true,
                 consumed: false,
             };
 
