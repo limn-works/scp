@@ -468,9 +468,25 @@ impl From<scp_identity::IdentityError> for ScpError {
 
 impl From<scp_core::context::ContextError> for ScpError {
     fn from(e: scp_core::context::ContextError) -> Self {
-        Self::Context {
-            msg: format!("{e} — verify context state, membership, and permissions"),
-            code: "SCP-CTX-2001".to_owned(),
+        use scp_core::context::ContextError as CE;
+        match &e {
+            // D4: surface the canonical rate-limit code through the
+            // typed envelope so Swift / Kotlin callers can detect
+            // rate-limit rejection without string-matching on the
+            // message body.
+            CE::RateLimited { .. } => Self::Context {
+                msg: format!("{e}"),
+                code: "SCP-ECON-7090".to_owned(),
+            },
+            // §23.17 snapshot import regression.
+            CE::SnapshotFloorRegression { .. } => Self::Context {
+                msg: format!("{e}"),
+                code: "SCP-CTX-2091".to_owned(),
+            },
+            _ => Self::Context {
+                msg: format!("{e} — verify context state, membership, and permissions"),
+                code: "SCP-CTX-2001".to_owned(),
+            },
         }
     }
 }
