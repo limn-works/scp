@@ -691,8 +691,20 @@ impl ContextCryptoProvider for MlsCryptoProvider {
         state.sender_key_store.remove(&ctx_id_hex, member_did);
         // Also remove the member's wrapping key — they are no longer a member.
         state.member_wrapping_keys.remove(member_did);
-        // Prune replay tracker entry — prevents unbounded growth on member churn.
+        // Prune replay tracker entry for this specific member.
         state.recv_sequence_tracker.remove(member_did);
+        // D3 defensive sweep: also drop any recv_sequence_tracker entries
+        // for DIDs that are no longer in member_wrapping_keys. This catches
+        // the re-population edge case where in-flight messages from a
+        // previously-removed member arrive after their explicit prune and
+        // re-populate the tracker via `open()`. Without this sweep the
+        // tracker could slowly accumulate entries for non-members across a
+        // churning context. Bounded by current membership size.
+        let current_members: std::collections::HashSet<String> =
+            state.member_wrapping_keys.keys().cloned().collect();
+        state
+            .recv_sequence_tracker
+            .retain(|did, _| current_members.contains(did));
         Ok(())
     }
 
@@ -1066,10 +1078,14 @@ impl ContextCryptoProvider for MlsCryptoProvider {
                     plaintext: mls_decrypted,
                     sender_did,
                 } => {
-                    let magic = &scp_protocol::context::builder::MANAGEMENT_MSG_MAGIC;
-                    if mls_decrypted.len() >= magic.len() && mls_decrypted[..magic.len()] == *magic
+                    // Per spec §9.16.1 "Management prefix exclusivity", the
+                    // SCPM_MAGIC check lives in exactly one place — the
+                    // shared helper in scp-protocol::context::builder. Do
+                    // not re-implement the prefix check inline here or
+                    // anywhere else in the codebase.
+                    if let Some(mgmt_payload) =
+                        scp_protocol::context::builder::try_strip_management_prefix(&mls_decrypted)
                     {
-                        let mgmt_payload = &mls_decrypted[magic.len()..];
                         if mgmt_payload.len()
                             > scp_protocol::context::builder::MAX_MANAGEMENT_PAYLOAD_SIZE
                         {
@@ -1168,6 +1184,11 @@ impl ContextCryptoProvider for MlsCryptoProvider {
             ));
         }
         self.with_context(context_id, |state| {
+            // Prepend the canonical SCPM magic to tag this as a management
+            // message for the receive side. The strip/check logic lives in
+            // the shared `try_strip_management_prefix` helper per spec
+            // §9.16.1 exclusivity; the prepend side is symmetric and
+            // trivial enough to leave inline.
             let magic = &scp_protocol::context::builder::MANAGEMENT_MSG_MAGIC;
             let mut tagged = Vec::with_capacity(magic.len() + plaintext.len());
             tagged.extend_from_slice(magic);
