@@ -378,9 +378,9 @@ pub async fn tool_invoke(
     {
         return Err(ScpNapiError::Tool {
             message:
-                "SCP-ECON-7090: rate limit exceeded on tool_invoke: hard rate limit exceeded for invoker"
+                "SCP-ECON-12090: rate limit exceeded on tool_invoke: hard rate limit exceeded for invoker"
                     .to_owned(),
-            code: "SCP-ECON-7090".to_owned(),
+            code: "SCP-ECON-12090".to_owned(),
         }
         .into());
     }

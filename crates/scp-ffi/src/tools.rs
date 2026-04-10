@@ -410,7 +410,7 @@ pub fn py_tool_invoke(
     let manager = crate::runtime::context_manager()?;
     if !manager.try_consume_hard_rate_limit_blocking(context_id, &invoker_did_typed, now_secs) {
         return Err(ScpPyError::context(
-            "SCP-ECON-7090: rate limit exceeded on tool_invoke: hard rate limit exceeded for invoker".to_owned(),
+            "SCP-ECON-12090: rate limit exceeded on tool_invoke: hard rate limit exceeded for invoker".to_owned(),
         )
         .into());
     }

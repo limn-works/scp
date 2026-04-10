@@ -787,7 +787,7 @@ pub async fn context_send(
         .map_err(|e| {
             NapiError::from(ScpNapiError::Context {
                 message: format!("invalid spending UCAN: {e}"),
-                code: "SCP-ECON-7061".to_owned(),
+                code: "SCP-ECON-12061".to_owned(),
             })
         })?;
 

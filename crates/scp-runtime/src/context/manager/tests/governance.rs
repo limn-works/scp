@@ -11400,7 +11400,7 @@ async fn no_auto_grant_requires_explicit_budget() {
     assert!(result.is_err(), "send should fail without explicit budget");
     let err_msg = result.unwrap_err().to_string();
     assert!(
-        err_msg.contains("no budget") || err_msg.contains("SCP-ECON-7010"),
+        err_msg.contains("no budget") || err_msg.contains("SCP-ECON-12010"),
         "error should indicate no budget: {err_msg}"
     );
 
@@ -13927,9 +13927,9 @@ async fn test_fabricated_spending_ucan_rejected() {
         "fabricated spending UCAN should be rejected"
     );
     let err = format!("{}", result.unwrap_err());
-    // Rejected at AND-composition (SCP-ECON-7061) or validation (SCP-ECON-7062).
+    // Rejected at AND-composition (SCP-ECON-12061) or validation (SCP-ECON-12062).
     assert!(
-        err.contains("SCP-ECON-706"),
+        err.contains("SCP-ECON-12061") || err.contains("SCP-ECON-12062"),
         "error should reference an economy error code: {err}"
     );
 }
@@ -14383,7 +14383,7 @@ async fn test_cost_overflow_error() {
     // evaluate_cost itself returns None on overflow.
     let result = evaluate_cost(&policy, &PaidActionType::MessageSend, &metrics);
     // The formula multiplies u64::MAX * u64::MAX which overflows to None.
-    // enforce_economy converts this None to an error (SCP-ECON-7063).
+    // enforce_economy converts this None to an error (SCP-ECON-12063).
     // We verify the protocol-level behavior here.
     assert!(
         result.is_none(),
@@ -14905,7 +14905,7 @@ async fn earned_capacity_limits_governance_proposals() {
     );
     let err = result.unwrap_err();
     assert!(
-        matches!(&err, ContextError::PermissionDenied(msg) if msg.contains("SCP-GOV-5030")),
+        matches!(&err, ContextError::PermissionDenied(msg) if msg.contains("SCP-GOV-11030")),
         "expected earned capacity error code, got: {err}"
     );
 }

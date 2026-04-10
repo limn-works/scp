@@ -123,33 +123,33 @@ impl crate::economy::adapter::PaymentAdapter for DynAdapterBridge {
 fn integration_error_to_context(err: IntegrationError) -> ContextError {
     match err {
         IntegrationError::CostEvaluationOverflow => {
-            ContextError::PermissionDenied("SCP-ECON-7040: cost evaluation overflow".to_owned())
+            ContextError::PermissionDenied("SCP-ECON-12040: cost evaluation overflow".to_owned())
         }
         IntegrationError::AuthorizationFailed(e) => ContextError::PermissionDenied(format!(
-            "SCP-ECON-7041: payment authorization failed: {e}"
+            "SCP-ECON-12041: payment authorization failed: {e}"
         )),
         IntegrationError::CostInsufficient {
             expected, provided, ..
         } => ContextError::PermissionDenied(format!(
-            "SCP-ECON-7042: cost insufficient: expected {expected}, provided {provided}"
+            "SCP-ECON-12042: cost insufficient: expected {expected}, provided {provided}"
         )),
         IntegrationError::AuthorizationVerificationFailed(e) => ContextError::PermissionDenied(
-            format!("SCP-ECON-7043: authorization verification failed: {e}"),
+            format!("SCP-ECON-12043: authorization verification failed: {e}"),
         ),
         IntegrationError::ActionProcessingFailed(msg) => ContextError::PermissionDenied(format!(
-            "SCP-ECON-7044: action processing failed: {msg}"
+            "SCP-ECON-12044: action processing failed: {msg}"
         )),
         IntegrationError::CaptureFailed(e) => {
-            ContextError::PermissionDenied(format!("SCP-ECON-7045: payment capture failed: {e}"))
+            ContextError::PermissionDenied(format!("SCP-ECON-12045: payment capture failed: {e}"))
         }
         IntegrationError::VoidFailed {
             original,
             void_error,
         } => ContextError::PermissionDenied(format!(
-            "SCP-ECON-7046: void failed (original: {original}, void: {void_error})"
+            "SCP-ECON-12046: void failed (original: {original}, void: {void_error})"
         )),
         IntegrationError::NoEconomicPolicy => ContextError::PermissionDenied(
-            "SCP-ECON-7047: no economic policy configured".to_owned(),
+            "SCP-ECON-12047: no economic policy configured".to_owned(),
         ),
     }
 }
@@ -167,19 +167,20 @@ async fn verify_and_check_receipt(
     .await;
     if verification_results.is_empty() {
         return Err(ContextError::PermissionDenied(
-            "SCP-ECON-7050: receipt verification returned no results (vacuous pass)".to_owned(),
+            "SCP-ECON-12050: receipt verification returned no results (vacuous pass)".to_owned(),
         ));
     }
     for result in &verification_results {
         match result {
             Ok(v) if !v.result.valid => {
                 return Err(ContextError::PermissionDenied(
-                    "SCP-ECON-7048: receipt verification failed: receipt marked invalid".to_owned(),
+                    "SCP-ECON-12048: receipt verification failed: receipt marked invalid"
+                        .to_owned(),
                 ));
             }
             Err(e) => {
                 return Err(ContextError::PermissionDenied(format!(
-                    "SCP-ECON-7049: receipt verification error: {e}"
+                    "SCP-ECON-12049: receipt verification error: {e}"
                 )));
             }
             _ => {}
@@ -289,7 +290,7 @@ pub(super) fn enforce_economy(
         scp_protocol::economy::policy::evaluate_cost(policy, &action_type, &metrics)
     else {
         return Err(ContextError::PermissionDenied(
-            "SCP-ECON-7063: cost evaluation overflow".to_owned(),
+            "SCP-ECON-12063: cost evaluation overflow".to_owned(),
         ));
     };
 
@@ -324,7 +325,7 @@ pub(super) fn enforce_economy(
     // Free actions (cost == 0) pass through above.
     if spending_ucan.is_none() {
         return Err(ContextError::PermissionDenied(
-            "SCP-ECON-7060: paid action requires spending UCAN".to_owned(),
+            "SCP-ECON-12060: paid action requires spending UCAN".to_owned(),
         ));
     }
     debug_assert!(
@@ -336,7 +337,7 @@ pub(super) fn enforce_economy(
         scp_protocol::crypto::ucan::spending::Amount(cost.0),
         action_label,
     )
-    .map_err(|e| ContextError::PermissionDenied(format!("SCP-ECON-7061: {e}")))?;
+    .map_err(|e| ContextError::PermissionDenied(format!("SCP-ECON-12061: {e}")))?;
 
     // Validate the spending UCAN itself: context scope, expiry, attenuation.
     // `spending_ucan` is guaranteed `Some` by the guard above.
@@ -345,7 +346,7 @@ pub(super) fn enforce_economy(
             spending, context_id, None, // no parent capability (top-level delegation)
             clock,
         )
-        .map_err(|e| ContextError::PermissionDenied(format!("SCP-ECON-7062: {e}")))?;
+        .map_err(|e| ContextError::PermissionDenied(format!("SCP-ECON-12062: {e}")))?;
 
         // Nonce replay prevention: validate the spending UCAN nonce has not been
         // used before. This prevents replay attacks where a valid spending UCAN
@@ -354,7 +355,7 @@ pub(super) fn enforce_economy(
             .check_and_record(&spending.payload.nnc, spending.payload.exp)
             .map_err(|e| {
                 ContextError::PermissionDenied(format!(
-                    "SCP-ECON-7064: spending UCAN nonce replay: {e}"
+                    "SCP-ECON-12064: spending UCAN nonce replay: {e}"
                 ))
             })?;
     }
@@ -364,11 +365,11 @@ pub(super) fn enforce_economy(
     // action. Budget must be explicitly granted via governance.
     if !budget_tracker.has_budget(actor_did) {
         return Err(ContextError::PermissionDenied(format!(
-            "SCP-ECON-7010: no budget for {actor_did} — request ApproveSpend governance action"
+            "SCP-ECON-12010: no budget for {actor_did} — request ApproveSpend governance action"
         )));
     }
     budget_tracker.record_spend(actor_did, cost).map_err(|e| {
-        ContextError::PermissionDenied(format!("SCP-ECON-7010: budget exceeded: {e}"))
+        ContextError::PermissionDenied(format!("SCP-ECON-12010: budget exceeded: {e}"))
     })?;
 
     Ok(Some(cost))

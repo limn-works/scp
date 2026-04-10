@@ -2341,7 +2341,7 @@ async fn enforcement_failure_rolls_back_velocity_and_rate_limit() {
 }
 
 /// Test F: the Matrix Synapse–style hard rate limit (burst=10) rejects
-/// the 11th rapid-fire message from a single DID with SCP-ECON-7090,
+/// the 11th rapid-fire message from a single DID with SCP-ECON-12090,
 /// even when no economic policy is configured (defense-in-depth for
 /// free contexts).
 #[tokio::test]

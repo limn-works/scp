@@ -823,7 +823,7 @@ impl ContextProvider for FfiBridgeProvider {
             &invoker_did_typed,
             now_secs,
         ) {
-            return Err("SCP-ECON-7090: rate limit exceeded on tool_invoke: \
+            return Err("SCP-ECON-12090: rate limit exceeded on tool_invoke: \
                         hard rate limit exceeded for invoker"
                 .to_owned());
         }
