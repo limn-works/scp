@@ -385,9 +385,9 @@ The governance model is declared at creation and visible to all. Governance impl
 
 | Action | Effect | Scope |
 |--------|--------|-------|
-| `MemberRevoke { did, access: Read }` | Revoke decryption access to context content | `Full` (retroactive + future) or `FutureOnly` via `AccessScope` |
+| `MemberRevoke { did, access: Read }` | Revoke decryption access to context content | `AccessScope::Both` (retroactive + future) or `AccessScope::Read` (read-only) |
 | `RestoreAccess { did, capabilities }` | Restore access, forward-only | Future content only — historical gap permanent |
-| `MemberRevoke { did, access: Write }` | Revoke publishing authority | `Full` or `FutureOnly` via `AccessScope` |
+| `MemberRevoke { did, access: Write }` | Revoke publishing authority | `AccessScope::Both` or `AccessScope::Write` |
 | `RotateContentKeys { reason }` | Context-wide key rotation | All members, not DID-targeted |
 
 **Membership/access decoupling.** These actions do NOT remove the target from the context. A member with revoked read access remains a member for governance participation and presence but cannot decrypt content. Member states:
@@ -1531,7 +1531,7 @@ Governance ban lifecycle:
 
 Default template configuration: encrypted templates include `member:ban` in their ceiling by default (§5.12.1); broadcast templates do not. Broadcast contexts can add `member:ban` via explicit `ContextParams` at creation or via `ModifyCeiling` governance action if `CeilingPolicy::Governed`.
 
-**Author removal.** Removing an author from a broadcast context (revoking their broadcast key and preventing future publishing) is a governance-gated action. Author removal uses `GovernanceAction::MemberRevoke { did, access: Write }` — the general content access revocation mechanism (§5.9, ADR-031). `MemberRevoke` with `access: Full` stops publishing AND suppresses historical content; `access: FutureOnly` stops future publishing only. There is no standalone API to remove an author without governance approval. This enforces the protocol tenet: "Agents are participants, not enforcers." When the governance proposal is approved and executed: the author's broadcast key is destroyed, `publish()` returns `PermissionDenied`, key requests for the author return `Deny`, and a `WriteAccessRevoked` event is emitted. Subscribers who cached the author's old key can still decrypt historical messages (unless `access: Full` was used, in which case access keys are also destroyed per §9.17).
+**Author removal.** Removing an author from a broadcast context (revoking their broadcast key and preventing future publishing) is a governance-gated action. Author removal uses `GovernanceAction::MemberRevoke { did, access: Write }` — the general content access revocation mechanism (§5.9, ADR-031). `MemberRevoke` with `access: Both` stops publishing AND suppresses historical content; `access: Write` stops future publishing only. There is no standalone API to remove an author without governance approval. This enforces the protocol tenet: "Agents are participants, not enforcers." When the governance proposal is approved and executed: the author's broadcast key is destroyed, `publish()` returns `PermissionDenied`, key requests for the author return `Deny`, and a `WriteAccessRevoked` event is emitted. Subscribers who cached the author's old key can still decrypt historical messages (unless `access: Both` was used, in which case access keys are also destroyed per §9.17).
 
 **Sybil resistance.** Broadcast contexts are the primary target for Sybil block bypass because key requests travel as relay messages (not MLS application messages). The membership gate in `handle_sender_key_request` verifies that the requester is a registered subscriber before distributing keys. Identity-linked block expansion and group blocking further mitigate Sybil attacks. See §9.16.6 for the full mitigation specification.
 

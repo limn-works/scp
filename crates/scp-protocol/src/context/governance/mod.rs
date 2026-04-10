@@ -852,46 +852,6 @@ impl GovernanceAction {
             | Self::ModifyHardRateLimit { .. } => None,
         }
     }
-
-    /// Returns `true` if this governance action encodes an MLS ejection
-    /// (`Enforce { severity: MemberEject }`).
-    ///
-    /// Helper for call sites that previously matched on the `Eject` variant
-    /// and need the same boolean answer after the B1 unification.
-    #[must_use]
-    pub const fn is_member_eject(&self) -> bool {
-        matches!(self, Self::MemberEject { .. })
-    }
-
-    /// Converts this action's enforcement tier (if any) to the shared
-    /// [`EnforcementSeverity`](crate::trust::consequence::EnforcementSeverity)
-    /// type used by consequence rules.
-    ///
-    /// Returns `None` for variants that are not enforcement actions (e.g.,
-    /// `AddMember`, `ChangeRole`, `RestoreAccess`).
-    #[must_use]
-    pub fn to_enforcement_severity(
-        &self,
-    ) -> Option<crate::trust::consequence::EnforcementSeverity> {
-        use crate::trust::consequence::EnforcementSeverity;
-        match self {
-            Self::SuspendCapability { capabilities, .. } => {
-                Some(EnforcementSeverity::SuspendCapability {
-                    capabilities: capabilities.clone(),
-                })
-            }
-            Self::SuspendAccess { .. } => Some(EnforcementSeverity::SuspendAccess),
-            Self::MemberRevoke { did, access } => Some(EnforcementSeverity::MemberRevoke {
-                did: did.clone(),
-                access: *access,
-            }),
-            Self::MemberEject { did, reason } => Some(EnforcementSeverity::MemberEject {
-                did: did.clone(),
-                reason: reason.clone(),
-            }),
-            _ => None,
-        }
-    }
 }
 
 // ---------------------------------------------------------------------------
