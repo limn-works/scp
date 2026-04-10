@@ -2222,7 +2222,7 @@ async fn reconnect_all_standing_reconnects_active_contexts() {
     }
 
     // Reconnect all.
-    let reconnected = manager.reconnect_all_standing().await.0;
+    let reconnected = manager.reconnect_all_standing().await.unwrap();
 
     // Only Bob and Dave should be reconnected (Active). Carol is Closed.
     assert_eq!(reconnected, 2);
@@ -2237,7 +2237,7 @@ async fn reconnect_all_standing_with_no_contexts_returns_zero() {
         noop_key_resolver(),
     );
 
-    let reconnected = manager.reconnect_all_standing().await.0;
+    let reconnected = manager.reconnect_all_standing().await.unwrap();
     assert_eq!(reconnected, 0);
 }
 

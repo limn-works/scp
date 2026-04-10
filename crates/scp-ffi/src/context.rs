@@ -2139,9 +2139,8 @@ fn py_governance_propose(
                 PyValueError::new_err(format!("SCP-CTX-2040: invalid governance action JSON: {e}"))
             })?;
 
-        scp_ffi_common::validate::validate_governance_action_strings(&action).map_err(|e| {
-            PyValueError::new_err(format!("SCP-CTX-2040: {}", e.message))
-        })?;
+        scp_ffi_common::validate::validate_governance_action_strings(&action)
+            .map_err(|e| PyValueError::new_err(format!("SCP-CTX-2040: {}", e.message)))?;
 
         let action_name = action.variant_name();
 
@@ -2176,6 +2175,7 @@ fn py_governance_propose(
 }
 
 /// Validates all user-controlled string fields on a governance action.
+#[cfg(test)]
 fn validate_governance_action_strings(
     action: &scp_core::context::governance::GovernanceAction,
 ) -> Result<(), crate::error::ScpPyError> {
@@ -4944,7 +4944,7 @@ mod tests {
 
     #[test]
     fn governance_action_control_chars_in_reason_rejected() {
-        let action = scp_core::context::governance::GovernanceAction::RemoveMember {
+        let action = scp_core::context::governance::GovernanceAction::MemberEject {
             did: scp_identity::DID("did:dht:z6MkTest".to_owned()),
             reason: Some("bad\0actor".to_owned()),
         };
@@ -5049,7 +5049,7 @@ mod tests {
 
     #[test]
     fn governance_action_none_reason_accepted() {
-        let action = scp_core::context::governance::GovernanceAction::RemoveMember {
+        let action = scp_core::context::governance::GovernanceAction::MemberEject {
             did: scp_identity::DID("did:dht:z6MkTest".to_owned()),
             reason: None,
         };

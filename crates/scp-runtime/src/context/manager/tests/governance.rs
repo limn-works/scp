@@ -628,6 +628,10 @@ fn governance_snapshot_serde_roundtrip() {
         velocity_tracker_state: None,
         cooldown_until: HashMap::new(),
         proposal_timestamps: HashMap::new(),
+        message_pricing: None,
+        hard_rate_limit_config: None,
+        hard_rate_limit_state: HashMap::new(),
+        spending_nonce_tracker_state: HashMap::new(),
     };
 
     let json = serde_json::to_string(&snapshot).expect("serialize");
@@ -6182,43 +6186,6 @@ async fn velocity_consequence_triggers_on_high_rate() {
     );
 }
 
-/// Dynamic pricing adjusts cost based on utilization (#1537).
-#[test]
-fn dynamic_pricing_adjusts_on_utilization() {
-    use scp_protocol::economy::pricing::{PriceDirection, RelayPricingConfig, adjust_relay_price};
-    use scp_protocol::economy::types::Amount;
-
-    let config = RelayPricingConfig {
-        target_utilization_pct: 50,
-        current_base_price: Amount(1000),
-        max_change_per_mille: 125,
-        floor: Amount(100),
-        cap: Amount(10000),
-    };
-
-    // Low utilization: price should decrease.
-    let low = adjust_relay_price(&config, 10);
-    assert_eq!(
-        low.direction,
-        PriceDirection::Decreased,
-        "price should decrease at low utilization"
-    );
-
-    // High utilization: price should increase.
-    let high = adjust_relay_price(&config, 90);
-    assert_eq!(
-        high.direction,
-        PriceDirection::Increased,
-        "price should increase at high utilization"
-    );
-
-    // Prices should differ.
-    assert_ne!(
-        low.new_base_price, high.new_base_price,
-        "prices should differ between low and high utilization"
-    );
-}
-
 /// Participation decay clears participation cache (#1530).
 #[tokio::test]
 async fn decay_participation_clears_state() {
@@ -6375,6 +6342,8 @@ async fn budget_exceeded_on_tool_invoke() {
         consequence_rules: &[],
         payment_adapter: None,
         metrics: scp_protocol::economy::policy::ObservableMetrics::default(),
+        velocity_tracker: None,
+        message_pricing: None,
     };
     let result = invoke_tool(
         &handle,
@@ -8002,6 +7971,8 @@ async fn tool_invoke_deducts_budget() {
             consequence_rules: &[],
             payment_adapter: None,
             metrics: metrics.clone(),
+            velocity_tracker: None,
+            message_pricing: None,
         };
         let result = invoke_tool(
             &handle,
@@ -8035,6 +8006,8 @@ async fn tool_invoke_deducts_budget() {
             consequence_rules: &[],
             payment_adapter: None,
             metrics: metrics.clone(),
+            velocity_tracker: None,
+            message_pricing: None,
         };
         let result2 = invoke_tool(
             &handle,
@@ -8459,7 +8432,6 @@ async fn join_context_deducts_budget_when_granted() {
                 time_of_day: 0,
                 sender_velocity: 0,
                 storage_usage: 0,
-                relay_base_price: 0,
             },
         )
         .unwrap();
@@ -9149,6 +9121,8 @@ async fn test_tool_invoke_rejected_insufficient_budget() {
         consequence_rules: &[],
         payment_adapter: None,
         metrics: scp_protocol::economy::policy::ObservableMetrics::default(),
+        velocity_tracker: None,
+        message_pricing: None,
     };
     let result = invoke_tool(
         &handle,
@@ -9215,41 +9189,6 @@ async fn test_join_rejected_insufficient_budget() {
     assert!(
         matches!(err, ContextError::PermissionDenied(ref msg) if msg.contains("paid context")),
         "expected paid context rejection, got: {err}"
-    );
-}
-
-/// Dynamic pricing varies with utilization — different utilization values
-/// produce different price adjustments (#1537).
-#[tokio::test]
-async fn test_dynamic_pricing_varies_with_utilization() {
-    use scp_protocol::economy::pricing::{RelayPricingConfig, adjust_relay_price};
-    use scp_protocol::economy::types::Amount;
-
-    let config = RelayPricingConfig {
-        target_utilization_pct: 50,
-        current_base_price: Amount::new(1000),
-        max_change_per_mille: 125, // 12.5%
-        floor: Amount::new(100),
-        cap: Amount::new(10000),
-    };
-
-    let low = adjust_relay_price(&config, 10);
-    let high = adjust_relay_price(&config, 90);
-
-    // Low utilization should decrease price, high should increase.
-    assert!(
-        low.new_base_price < config.current_base_price,
-        "low utilization (10%) should decrease price: got {}",
-        low.new_base_price
-    );
-    assert!(
-        high.new_base_price > config.current_base_price,
-        "high utilization (90%) should increase price: got {}",
-        high.new_base_price
-    );
-    assert_ne!(
-        low.new_base_price, high.new_base_price,
-        "different utilizations should produce different prices"
     );
 }
 
@@ -9876,7 +9815,6 @@ async fn test_paid_join_with_consequence_evaluation() {
                 time_of_day: 0,
                 sender_velocity: 0,
                 storage_usage: 0,
-                relay_base_price: 0,
             },
         )
         .unwrap();
@@ -12529,145 +12467,6 @@ async fn aggregate_velocity_via_manager_send() {
 }
 
 // -----------------------------------------------------------------------
-// §65-67. adjust_relay_price integration at context manager level
-// -----------------------------------------------------------------------
-
-#[tokio::test]
-async fn relay_pricing_adjusts_on_send() {
-    use scp_protocol::economy::pricing::RelayPricingConfig;
-    use scp_protocol::economy::types::Amount;
-
-    let manager = ContextManager::new(
-        Box::new(MockCrypto::default()),
-        Box::new(MockTransport::connected()),
-        Box::new(MockEventLog::default()),
-        noop_key_resolver(),
-    );
-
-    let params = governance_params();
-    let _handle = manager
-        .create_context("relay-price-ctx".into(), params, "did:key:sender".into())
-        .await
-        .unwrap();
-
-    // Set relay pricing config.
-    {
-        let mut contexts = manager.contexts.lock().await;
-        let ctx = contexts.get_mut("relay-price-ctx").unwrap();
-        ctx.governance.relay_pricing_config = Some(RelayPricingConfig {
-            target_utilization_pct: 50,
-            current_base_price: Amount(1000),
-            max_change_per_mille: 125,
-            floor: Amount(100),
-            cap: Amount(10_000),
-        });
-    }
-
-    let sk = ed25519_dalek::SigningKey::from_bytes(&[1u8; 32]);
-    let handle = manager
-        .contexts
-        .lock()
-        .await
-        .get("relay-price-ctx")
-        .unwrap()
-        .handle
-        .clone();
-
-    // Send a message — triggers maybe_adjust_relay_pricing.
-    manager
-        .send_message(
-            &handle,
-            &"did:key:sender".into(),
-            b"price adjust",
-            Some(&sk),
-            None,
-            None,
-        )
-        .await
-        .unwrap();
-
-    // The price should have been updated (member count=1, utilization ~1% < 50%).
-    let new_price = {
-        let contexts = manager.contexts.lock().await;
-        let ctx = contexts.get("relay-price-ctx").unwrap();
-        ctx.governance
-            .relay_pricing_config
-            .as_ref()
-            .unwrap()
-            .current_base_price
-    };
-    // With 1 member, utilization_pct = 1, target = 50, delta = 49% below target.
-    // max_change = 1000 * 125 / 1000 = 125
-    // proportional = 125 * 49 / 100 = 61
-    // new price = 1000 - 61 = 939
-    assert!(
-        new_price < Amount(1000),
-        "low utilization should decrease price from 1000, got {new_price:?}"
-    );
-    assert!(
-        new_price >= Amount(100),
-        "price should not go below floor (100), got {new_price:?}"
-    );
-}
-
-// -----------------------------------------------------------------------
-// §68. maybe_adjust_relay_pricing no-op when config is None
-// -----------------------------------------------------------------------
-
-#[tokio::test]
-async fn relay_pricing_noop_when_config_none() {
-    let manager = ContextManager::new(
-        Box::new(MockCrypto::default()),
-        Box::new(MockTransport::connected()),
-        Box::new(MockEventLog::default()),
-        noop_key_resolver(),
-    );
-
-    let params = governance_params();
-    let _handle = manager
-        .create_context("no-relay-ctx".into(), params, "did:key:sender".into())
-        .await
-        .unwrap();
-
-    // Verify no relay_pricing_config.
-    let has_config = {
-        let contexts = manager.contexts.lock().await;
-        let ctx = contexts.get("no-relay-ctx").unwrap();
-        ctx.governance.relay_pricing_config.is_some()
-    };
-    assert!(
-        !has_config,
-        "default context should not have relay pricing config"
-    );
-
-    let sk = ed25519_dalek::SigningKey::from_bytes(&[1u8; 32]);
-    let handle = manager
-        .contexts
-        .lock()
-        .await
-        .get("no-relay-ctx")
-        .unwrap()
-        .handle
-        .clone();
-
-    // Send should succeed without relay pricing.
-    let result = manager
-        .send_message(
-            &handle,
-            &"did:key:sender".into(),
-            b"no pricing",
-            Some(&sk),
-            None,
-            None,
-        )
-        .await;
-    assert!(
-        result.is_ok(),
-        "send should succeed without relay pricing: {result:?}"
-    );
-}
-
-// -----------------------------------------------------------------------
 // §55. verify_payment_receipts returns valid for NoOpPaymentAdapter
 // -----------------------------------------------------------------------
 
@@ -13557,6 +13356,10 @@ fn velocity_tracker_state_in_context_snapshot_roundtrip() {
         }),
         cooldown_until: cooldowns.clone(),
         proposal_timestamps: HashMap::new(),
+        message_pricing: None,
+        hard_rate_limit_config: None,
+        hard_rate_limit_state: HashMap::new(),
+        spending_nonce_tracker_state: HashMap::new(),
     };
 
     let json = serde_json::to_string(&snapshot).expect("serialize");
@@ -13633,6 +13436,10 @@ fn velocity_tracker_backward_compat_deserialization() {
         velocity_tracker_state: None,
         cooldown_until: HashMap::new(),
         proposal_timestamps: HashMap::new(),
+        message_pricing: None,
+        hard_rate_limit_config: None,
+        hard_rate_limit_state: HashMap::new(),
+        spending_nonce_tracker_state: HashMap::new(),
     };
 
     let mut json_value: serde_json::Value =
@@ -14024,7 +13831,6 @@ fn evaluate_cost_enforce_gate() {
         relay_queue_depth: 0,
         time_of_day: 0,
         storage_usage: 0,
-        relay_base_price: 0,
     };
 
     let cost = evaluate_cost(&policy, &PaidActionType::MessageSend, &metrics);
@@ -14572,7 +14378,6 @@ async fn test_cost_overflow_error() {
         relay_queue_depth: 0,
         time_of_day: 0,
         storage_usage: 0,
-        relay_base_price: 0,
     };
 
     // evaluate_cost itself returns None on overflow.
@@ -15042,10 +14847,10 @@ async fn enforce_triggered_consequences_skips_absent_member() {
 }
 
 // ---------------------------------------------------------------------------
-// Earned capacity enforcement in check_standing (§9.3)
+// Earned capacity enforcement in check_proposer_eligibility (§9.3)
 // ---------------------------------------------------------------------------
 
-/// When a context has a `sybil_policy`, `check_standing` enforces governance
+/// When a context has a `sybil_policy`, `check_proposer_eligibility` enforces governance
 /// proposal rate limits from `EarnedCapacityPolicy`. A "new" identity (empty
 /// signals) gets `max_governance_proposals_per_window = 5` per 24h window.
 /// Once that limit is reached, further proposals are rejected.
@@ -15105,7 +14910,7 @@ async fn earned_capacity_limits_governance_proposals() {
     );
 }
 
-/// Without `sybil_policy`, `check_standing` does not enforce earned capacity
+/// Without `sybil_policy`, `check_proposer_eligibility` does not enforce earned capacity
 /// limits (backward compatibility). Unlimited proposals should succeed.
 #[tokio::test]
 async fn no_sybil_policy_allows_unlimited_proposals() {

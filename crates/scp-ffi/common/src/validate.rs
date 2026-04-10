@@ -595,13 +595,10 @@ pub fn validate_governance_action_strings(
         GovernanceAction::ChangeRole { new_role, .. } => {
             validate_role_name(new_role)?;
         }
-        GovernanceAction::RemoveMember {
+        GovernanceAction::MemberEject {
             reason: Some(r), ..
         }
         | GovernanceAction::CloseContext {
-            reason: Some(r), ..
-        }
-        | GovernanceAction::BlockAuthor {
             reason: Some(r), ..
         }
         | GovernanceAction::RotateContentKeys {
@@ -634,16 +631,15 @@ pub fn validate_governance_action_strings(
             validate_context_params_strings(params)?;
         }
         // Variants without user-controlled string fields.
-        GovernanceAction::RemoveMember { reason: None, .. }
+        GovernanceAction::MemberEject { reason: None, .. }
         | GovernanceAction::CloseContext { reason: None, .. }
-        | GovernanceAction::BlockAuthor { reason: None, .. }
         | GovernanceAction::RotateContentKeys { reason: None, .. }
         | GovernanceAction::RemoveTool { .. }
         | GovernanceAction::ModifyCeiling { .. }
         | GovernanceAction::ExtendTtl { .. }
         | GovernanceAction::TransferAdmin { .. }
-        | GovernanceAction::RevokeReadAccess { .. }
-        | GovernanceAction::RestoreReadAccess { .. }
+        | GovernanceAction::MemberRevoke { .. }
+        | GovernanceAction::RestoreAccess { .. }
         | GovernanceAction::ModifyPruningPolicy { .. }
         | GovernanceAction::AddSigner { .. }
         | GovernanceAction::RemoveSigner { .. }
@@ -651,10 +647,11 @@ pub fn validate_governance_action_strings(
         | GovernanceAction::EstablishToolInterface { .. }
         | GovernanceAction::ResolveConflict { .. }
         | GovernanceAction::PromoteContext
-        | GovernanceAction::RevokeWriteAccess { .. }
-        | GovernanceAction::RestoreWriteAccess { .. }
+        | GovernanceAction::SuspendCapability { .. }
+        | GovernanceAction::SuspendAccess { .. }
         | GovernanceAction::ReconfigureGovernance { .. }
         | GovernanceAction::LockEconomicPolicy
+        | GovernanceAction::ModifyHardRateLimit { .. }
         | GovernanceAction::CancelContextMigration => {}
     }
     Ok(())
@@ -1396,7 +1393,7 @@ mod tests {
     fn governance_action_none_reason_accepted() {
         use scp_protocol::context::governance::GovernanceAction;
 
-        let action = GovernanceAction::RemoveMember {
+        let action = GovernanceAction::MemberEject {
             did: scp_primitives::DID("did:dht:z6MkTest".to_owned()),
             reason: None,
         };
@@ -1407,7 +1404,7 @@ mod tests {
     fn governance_action_control_chars_in_reason_rejected() {
         use scp_protocol::context::governance::GovernanceAction;
 
-        let action = GovernanceAction::RemoveMember {
+        let action = GovernanceAction::MemberEject {
             did: scp_primitives::DID("did:dht:z6MkTest".to_owned()),
             reason: Some("bad\0actor".to_owned()),
         };

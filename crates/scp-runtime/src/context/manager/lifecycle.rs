@@ -15,7 +15,7 @@ use super::{
 
 /// Builds an [`IdentityDepthAssessment`] for a member in a context.
 ///
-/// Shared by `evaluate_sybil_resistance` (join path) and `check_standing`
+/// Shared by `evaluate_sybil_resistance` (join path) and `check_proposer_eligibility`
 /// (governance path). At the `ContextManager` layer we do not yet have
 /// access to external trust signal providers, so the signal map is empty.
 /// Contexts requiring real signals will correctly reject until signal
