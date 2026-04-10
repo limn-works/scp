@@ -401,7 +401,7 @@ The governance model is declared at creation and visible to all. Governance impl
 
 Presence-only members lose `governance:vote` and `governance:propose` capabilities alongside content access. A member who can neither read nor write content should not influence governance decisions about content they cannot see. Read-only members retain governance capabilities — they can still observe content and participate meaningfully in governance.
 
-**Redundant operations.** Revoking access for a member whose access is already revoked (same scope) is a no-op that returns success. Restoring access for a member who was never revoked returns `GovernanceError::NothingToRestore`. Revoking with `FutureOnly` scope when a `Full` revocation is already active is a no-op (Full subsumes FutureOnly). Revoking with `Full` scope when `FutureOnly` is active upgrades to Full.
+**Redundant operations.** Revoking access for a member whose access is already revoked (same scope) is a no-op that returns success. Restoring access for a member who was never revoked returns `GovernanceError::NothingToRestore`. Revoking with `Write` scope when a `Both` revocation is already active is a no-op (Both subsumes Write). Revoking with `Both` scope when `Write` is active upgrades to Both.
 
 Content access actions go through the context's governance model (propose/vote/execute). In SingleAdmin contexts, the admin's proposal auto-executes. In multi-admin contexts, the action requires the configured quorum. Tiers 1-2 (DID-to-DID blocking) are unilateral identity-layer operations and do NOT go through governance.
 

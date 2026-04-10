@@ -1057,6 +1057,9 @@ pub fn assign_role(
 /// Returns [`RoleError::MemberNotInContext`] if the member is not in the
 /// context, or [`RoleError::RoleNotFound`] if the role doesn't exist.
 // SAFETY: Called only by governance consequence engine. Do not use for direct role assignment.
+// This must remain `pub` (not `pub(crate)`) because scp-runtime calls it
+// from enforce_assign_role(). Hidden from public API docs.
+#[doc(hidden)]
 pub fn system_assign_role(
     state: &mut ContextRoleState,
     member_did: &str,

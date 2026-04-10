@@ -1780,8 +1780,8 @@ pub fn actions_conflict(
 ) -> bool {
     use GovernanceAction::{
         AddSigner, ChangeRole, MemberEject, MemberRevoke, ModifyCeiling, ModifyPruningPolicy,
-        ModifyThreshold, ReconfigureGovernance, RemoveSigner, RestoreAccess, RotateContentKeys,
-        SuspendAccess, SuspendCapability,
+        ModifyThreshold, ReconfigureGovernance, RemoveSigner, ResetMember, RestoreAccess,
+        RotateContentKeys, SuspendAccess, SuspendCapability,
     };
 
     // Canonical conflict matrix. The sync module's `actions_conflict`
@@ -1849,7 +1849,23 @@ pub fn actions_conflict(
         | (SuspendAccess { did: did_a, .. }, RestoreAccess { did: did_b, .. })
         | (RestoreAccess { did: did_a, .. }, SuspendAccess { did: did_b, .. })
         | (MemberEject { did: did_a, .. }, RestoreAccess { did: did_b, .. })
-        | (RestoreAccess { did: did_a, .. }, MemberEject { did: did_b, .. }) => did_a == did_b,
+        | (RestoreAccess { did: did_a, .. }, MemberEject { did: did_b, .. })
+        // ResetMember forces a group state reset — concurrent modifications
+        // to the same member's access/membership state are unsafe (ADR-031 §7).
+        | (ResetMember { did: did_a, .. }, MemberEject { did: did_b, .. })
+        | (MemberEject { did: did_a, .. }, ResetMember { did: did_b, .. })
+        | (ResetMember { did: did_a, .. }, ChangeRole { did: did_b, .. })
+        | (ChangeRole { did: did_a, .. }, ResetMember { did: did_b, .. })
+        | (ResetMember { did: did_a, .. }, SuspendCapability { did: did_b, .. })
+        | (SuspendCapability { did: did_a, .. }, ResetMember { did: did_b, .. })
+        | (ResetMember { did: did_a, .. }, SuspendAccess { did: did_b, .. })
+        | (SuspendAccess { did: did_a, .. }, ResetMember { did: did_b, .. })
+        | (ResetMember { did: did_a, .. }, MemberRevoke { did: did_b, .. })
+        | (MemberRevoke { did: did_a, .. }, ResetMember { did: did_b, .. })
+        | (ResetMember { did: did_a, .. }, RestoreAccess { did: did_b, .. })
+        | (RestoreAccess { did: did_a, .. }, ResetMember { did: did_b, .. })
+        // Two concurrent ResetMember on the same DID conflict.
+        | (ResetMember { did: did_a, .. }, ResetMember { did: did_b, .. }) => did_a == did_b,
 
         // AddSigner and RemoveSigner for the same DID conflict.
         (AddSigner { did: add_did }, RemoveSigner { did: remove_did })

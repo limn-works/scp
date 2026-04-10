@@ -776,7 +776,7 @@ Conditional GET: if the client sends `If-None-Match: "<blob_id>"`, the server re
 
 - **400 Bad Request** — invalid hex in `routing_id` or `blob_id` path segment.
 - **404 Not Found** — unknown routing ID (no projected context registered) or unknown blob ID (not in storage or routing ID mismatch).
-- **410 Gone** — the message's key epoch has been purged from the projection registry after a `Full`-scope governance ban (§5.14.8). The content is permanently unavailable through projection. Clients should not retry. Body: `{"error": "content revoked", "code": "GONE"}`.
+- **410 Gone** — the message's key epoch has been purged from the projection registry after a `Both`-scope governance ban (§5.14.8). The content is permanently unavailable through projection. Clients should not retry. Body: `{"error": "content revoked", "code": "GONE"}`.
 - **404 Not Found** — decryption failure (corrupt envelope or AEAD open failure). Returns the same `NOT_FOUND` response body as an unknown blob to prevent a decryption oracle — attackers cannot distinguish "blob exists but decryption failed" from "blob does not exist." Decryption failures are logged server-side at `WARN` level for operator diagnostics.
 
 The feed endpoint (§18.11.3) silently omits messages whose epoch keys have been purged — they simply disappear from the feed rather than producing errors. This is consistent with the feed's role as a "latest content" view: revoked historical content is no longer latest.
@@ -798,10 +798,10 @@ Keys are retained per epoch for the blob TTL window. When a key epoch advances, 
 **Governance-ban key purge.** When a governance-level subscriber ban (§5.14.8) triggers key rotation via `MemberRevoke { access: Read }`, the projection registry must be updated to reflect the new key epoch(s). The SDK method `propagate_ban_keys()` (§18.11.8) handles this:
 
 1. For each rotated author, the new post-rotation key is inserted into the `ProjectedContext` key registry.
-2. If the ban's `AccessScope` is `Full`, all pre-ban epoch keys are **purged** from the registry via `retain_only_epochs()`. This ensures historical content encrypted under pre-ban keys is no longer decryptable by the projection endpoint — messages referencing purged epochs return 410 Gone (§18.11.4) on per-message requests and are silently omitted from feed responses (§18.11.3).
-3. If the ban's `AccessScope` is `FutureOnly`, old-epoch keys are retained. Historical content remains accessible; only future content (under the new key) is inaccessible to the banned subscriber.
+2. If the ban's `AccessScope` is `Both`, all pre-ban epoch keys are **purged** from the registry via `retain_only_epochs()`. This ensures historical content encrypted under pre-ban keys is no longer decryptable by the projection endpoint — messages referencing purged epochs return 410 Gone (§18.11.4) on per-message requests and are silently omitted from feed responses (§18.11.3).
+3. If the ban's `AccessScope` is `Write`, old-epoch keys are retained. Historical content remains accessible; only future content (under the new key) is inaccessible to the banned subscriber.
 
-This differs from normal key rotation (where old keys are retained for the TTL window): a `Full`-scope governance ban is an explicit revocation of historical access, so old keys are immediately purged rather than retained.
+This differs from normal key rotation (where old keys are retained for the TTL window): a `Both`-scope governance ban is an explicit revocation of historical access, so old keys are immediately purged rather than retained.
 
 ### 18.11.6 Security Properties
 
@@ -834,7 +834,7 @@ This allows URI consumers to choose between the native SCP path (relay + broadca
 - `ApplicationNode::disable_broadcast_projection(context_id)` — deactivates HTTP projection for the specified context. Removes it from the registry. Existing CDN caches may continue serving stale content per their cache headers.
 - `ApplicationNode::update_projection_member_keys(context_id, member_keys) -> Result<(), NodeError>` — updates the cached member public keys for a projected context. Called when context membership changes (new subscribers, removed subscribers, key rotations). No-op if the context is not projected.
 - `ApplicationNode::revoke_projection_token(context_id, token_cid)` — adds a token CID to the projected context's revocation set. Tokens matching this CID will be rejected on subsequent requests. No-op if the context is not projected.
-- `ApplicationNode::propagate_ban_keys(context_id, ban_result)` — updates the projection key registry after a governance-level subscriber ban. Inserts post-rotation keys for each rotated author. For `Full`-scope bans, purges all pre-ban epoch keys so historical content is no longer served (§18.11.5). No-op if the context is not projected. Must be called after `execute_governance_action` returns `GovernanceActionResult::SubscriberBanned`.
+- `ApplicationNode::propagate_ban_keys(context_id, ban_result)` — updates the projection key registry after a governance-level subscriber ban. Inserts post-rotation keys for each rotated author. For `Both`-scope bans, purges all pre-ban epoch keys so historical content is no longer served (§18.11.5). No-op if the context is not projected. Must be called after `execute_governance_action` returns `GovernanceActionResult::SubscriberBanned`.
 - `ApplicationNode::broadcastPublishAsset(asset: AssetEntry) -> Result<PublishResult, NodeError>` — publishes a single asset to the current deploy. Returns `{ blob_id: String, etag: String }` where `etag` is `SHA-256(body)` hex-encoded. Content-hash dedup: if a blob with the same `SHA-256(body)` already exists in the current `deploy_id`, skips re-upload and returns existing `blob_id`.
 - `ApplicationNode::broadcastPublishAssets(assets: Vec<AssetEntry>, deploy_id: Option<String>) -> Result<Vec<PublishResult>, NodeError>` — publishes a batch of assets and commits the deploy atomically. If `deploy_id` is `None`, generates a new one. Returns `Vec<{ blob_id, etag }>`. Content-hash dedup applied per asset.
 - `ApplicationNode::broadcast_projection_router() -> axum::Router` — returns the projection router for composition. Served on the public HTTPS port alongside `.well-known/scp` and `/scp/v1`.

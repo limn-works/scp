@@ -1361,9 +1361,9 @@ Content Encryption:
 
 2. **Normal operation.** Each message sender generates a fresh CEK, encrypts the content, wraps the CEK with each intended recipient's access key, and publishes the wrapped CEKs alongside the ciphertext. In encrypted contexts, this wrapping occurs BEFORE the MLS encryption layer. In broadcast contexts, it occurs before the sender key encryption.
 
-3. **Revocation.** On `MemberRevoke { did, access: Full }` (governance, Tier 3) or on block (Tiers 1-2): the target's access key is deleted from all members who hold it. Without the access key, the target cannot unwrap CEKs for any stored content. This is retroactive — previously decryptable content becomes undecryptable.
+3. **Revocation.** On `MemberRevoke { did, access: Both }` (governance, Tier 3) or on block (Tiers 1-2): the target's access key is deleted from all members who hold it. Without the access key, the target cannot unwrap CEKs for any stored content. This is retroactive — previously decryptable content becomes undecryptable.
 
-4. **Revocation (FutureOnly).** On `MemberRevoke { did, access: FutureOnly }`: the target is excluded from future CEK wrapping (their access key is no longer used for new messages) but existing wrapped CEKs are not deleted. The target can still decrypt historical content with their cached access key.
+4. **Revocation (Write-only).** On `MemberRevoke { did, access: Write }`: the target is excluded from future CEK wrapping (their access key is no longer used for new messages) but existing wrapped CEKs are not deleted. The target can still decrypt historical content with their cached access key.
 
 5. **Restoration.** On `RestoreAccess { did, capabilities }` or unblock: a NEW access key is generated for the target. The new key is used for future CEK wrapping only. Historical wrapped CEKs used the old (deleted) access key — they are permanently inaccessible. This enforces the forward-only restoration guarantee.
 
@@ -1413,9 +1413,9 @@ Because `WrappedContent` (including the `wrapped_ceks` entries) is inside the br
 
 ### 9.17.5 Revocation Mechanics
 
-**Full revocation (retroactive):**
+**Both-scope revocation (retroactive):**
 
-1. The revoker publishes an `AccessKeyRevoked { did, scope: Full, revocation_id, timestamp, signature }` event as an MLS application message. The `revocation_id` is a unique identifier (`SHA-256(context_id || target_did || "access-key-revoke" || timestamp)`). The signature covers `context_id || target_did || scope || revocation_id || timestamp` using the revoker's signing key.
+1. The revoker publishes an `AccessKeyRevoked { did, scope: Both, revocation_id, timestamp, signature }` event as an MLS application message. The `revocation_id` is a unique identifier (`SHA-256(context_id || target_did || "access-key-revoke" || timestamp)`). The signature covers `context_id || target_did || scope || revocation_id || timestamp` using the revoker's signing key.
 2. Each member's SDK, upon receiving and verifying the `AccessKeyRevoked` event:
    a. Deletes the target's access key from the local key store.
    b. Adds the target's DID to the local access key revocation list.

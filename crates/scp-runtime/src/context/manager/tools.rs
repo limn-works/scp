@@ -379,9 +379,9 @@ impl ContextManager {
                 Err(e) => {
                     tracing::error!(
                         error = %e,
-                        "dedicated rate-limit runtime build failed; falling back to pass-through"
+                        "dedicated rate-limit runtime build failed; failing closed"
                     );
-                    let _ = tx.send(true);
+                    let _ = tx.send(false);
                     return;
                 }
             };
@@ -393,8 +393,8 @@ impl ContextManager {
             };
             let _ = tx.send(result);
         });
-        // Pass-through on channel failure (panicked worker etc.).
-        rx.recv().unwrap_or(true)
+        // Fail closed on channel failure (panicked worker etc.).
+        rx.recv().unwrap_or(false)
     }
 
     /// Invokes a tool under the full economy pipeline without holding
@@ -747,6 +747,22 @@ impl ContextManager {
                 now,
                 &mut ctx.governance.participation_cache,
                 &consequence_rules,
+            );
+
+            // Enforce triggered consequences while the lock is held,
+            // matching the messaging path (messaging.rs:655-668).
+            // evaluate_consequence_rules is called inside
+            // post_tool_invocation_bookkeeping; enforcement must happen
+            // here so that consequences are actually applied (not just
+            // reported in the output).
+            super::governance::enforce_triggered_consequences(
+                ctx,
+                context_id,
+                invoker_did,
+                now,
+                &triggered,
+                &consequence_rules,
+                &*self.clock,
             );
 
             (triggered, ticket)
