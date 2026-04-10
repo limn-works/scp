@@ -1475,7 +1475,7 @@ async fn application_layer_demo() {
     let alice_signing_key = demo_signing_key(&alice);
 
     println!("  Governance model: SingleAdmin (Alice is admin)");
-    println!("  Proposing: Eject(Charlie)");
+    println!("  Proposing: RemoveMember(Charlie)");
     println!();
 
     // Propose via ContextManager.
@@ -1483,7 +1483,7 @@ async fn application_layer_demo() {
         .propose_governance_action(
             ctx_id,
             &alice,
-            GovernanceAction::MemberEject {
+            GovernanceAction::RemoveMember {
                 did: charlie.clone(),
                 reason: Some("demo: testing governance removal".to_owned()),
             },

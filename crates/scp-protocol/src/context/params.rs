@@ -622,7 +622,7 @@ pub struct ConsequenceConfig {
     /// validation time. It remains callable as an explicit governance action
     /// regardless of this flag.
     ///
-    /// `EnforcementSeverity::MemberEject` is **never** allowed in a
+    /// `EnforcementSeverity::RemoveMember` is **never** allowed in a
     /// consequence rule regardless of this flag. MLS ejection is permanent
     /// and must always originate from a deliberate governance proposal.
     #[serde(default)]
@@ -808,7 +808,7 @@ pub struct ContextParams {
     /// may be referenced by automatic consequence rules. Defaults to
     /// `allow_automatic_member_revoke = false`, meaning cryptographic
     /// revocation is governance-only unless this context explicitly opts
-    /// in at creation time. `MemberEject` is never allowed in a consequence
+    /// in at creation time. `RemoveMember` is never allowed in a consequence
     /// rule regardless of this configuration.
     #[serde(default)]
     pub consequence_config: ConsequenceConfig,

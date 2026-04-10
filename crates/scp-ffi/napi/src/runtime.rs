@@ -799,7 +799,7 @@ pub fn remove_context(context_id: &str) {
 /// `ContextManager`.
 ///
 /// Must be called after any governance action that modifies role state
-/// (`ChangeRole`, `ModifyCeiling`, `AddMember`, `Eject`, etc.) so that
+/// (`ChangeRole`, `ModifyCeiling`, `AddMember`, `RemoveMember`, etc.) so that
 /// the NAPI-side copy used by UCAN/tool capability checks stays current.
 ///
 /// # Errors

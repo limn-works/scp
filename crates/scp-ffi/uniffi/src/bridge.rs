@@ -7048,7 +7048,7 @@ pub async fn governance_execute(
             use scp_core::context::manager::GovernanceActionResult;
             let result_str = match result {
                 GovernanceActionResult::MemberAdded => "MemberAdded",
-                GovernanceActionResult::MemberEjected => "MemberEjected",
+                GovernanceActionResult::MemberRemoved => "MemberRemoved",
                 GovernanceActionResult::RoleChanged => "RoleChanged",
                 GovernanceActionResult::ToolRegistered => "ToolRegistered",
                 GovernanceActionResult::ToolRemoved => "ToolRemoved",

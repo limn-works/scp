@@ -121,7 +121,7 @@
 ### P1 Findings
 - VALID_SUSPENSION_CAPABILITIES covers only MessagesRead/Write (6 aliases). 19 other Capability variants (ToolInvoke, GovernancePropose, MemberRemove, etc.) cannot be suspended via consequence rules -- Suspend silently logs unknown and skips.
 - Standing context ID changed from 8-byte truncated hash to full 32-byte hash (good), but old standing contexts using truncated IDs will not be found on reconnect (no migration path).
-- SuspendAll is app-layer only (role_state.suspend_all). No automatic MLS removal or sender key rotation. Comment says "dispatch Eject governance action" but no code actually dispatches it. Gap between Suspend (app) and Eject (crypto) layers.
+- SuspendAll is app-layer only (role_state.suspend_all). No automatic MLS removal or sender key rotation. Comment says "dispatch RemoveMember governance action" but no code actually dispatches it. Gap between Suspend (app) and RemoveMember (crypto) layers.
 - enforce_assign_role returns bool but does not escalate on false except in the outer loop. If role doesn't exist, enforce_assign_role returns false -> SuspendAll escalation is correct, but the role existence isn't validated at rule creation time.
 
 ### P2 Findings

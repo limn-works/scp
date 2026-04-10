@@ -957,7 +957,7 @@ async fn ac10_remove_member_action() {
         .propose_governance_action(
             ctx_id,
             &alice(),
-            GovernanceAction::MemberEject {
+            GovernanceAction::RemoveMember {
                 did: bob(),
                 reason: Some("test removal".into()),
             },
@@ -1479,7 +1479,7 @@ fn ac13_actions_conflict_revoke_vs_restore_read() {
 
 #[test]
 fn ac13_actions_conflict_remove_member_vs_change_role() {
-    let action_a = GovernanceAction::MemberEject {
+    let action_a = GovernanceAction::RemoveMember {
         did: bob(),
         reason: None,
     };
@@ -1496,11 +1496,11 @@ fn ac13_actions_conflict_remove_member_vs_change_role() {
 #[test]
 fn ac13_actions_conflict_mutual_removal() {
     // Alice proposes removing Bob, Bob proposes removing Alice.
-    let action_a = GovernanceAction::MemberEject {
+    let action_a = GovernanceAction::RemoveMember {
         did: bob(),
         reason: None,
     };
-    let action_b = GovernanceAction::MemberEject {
+    let action_b = GovernanceAction::RemoveMember {
         did: alice(),
         reason: None,
     };

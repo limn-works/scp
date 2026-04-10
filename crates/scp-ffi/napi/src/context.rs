@@ -3627,7 +3627,7 @@ mod tests {
         let rm = approved_proposal(
             [14u8; 32],
             &ctx_id,
-            GovernanceAction::MemberEject {
+            GovernanceAction::RemoveMember {
                 did: DID(target.to_owned()),
                 reason: Some("test removal".to_owned()),
             },

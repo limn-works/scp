@@ -52,7 +52,7 @@ struct GovernanceTests {
     @Test("GovernanceActionResult has exactly 26 cases")
     func governanceActionResultCount() {
         let allCases: [GovernanceActionResult] = [
-            .memberAdded, .memberEjected, .roleChanged,
+            .memberAdded, .memberRemoved, .roleChanged,
             .toolRegistered, .toolRemoved, .ceilingModified,
             .contextClosed, .ttlExtended, .pruningPolicyModified,
             .adminTransferred, .signerAdded, .signerRemoved,
@@ -69,7 +69,7 @@ struct GovernanceTests {
     @Test("GovernanceActionResult raw values match Rust GovernanceActionResult variants")
     func governanceActionResultRawValues() {
         #expect(GovernanceActionResult.memberAdded.rawValue == "MemberAdded")
-        #expect(GovernanceActionResult.memberEjected.rawValue == "MemberEjected")
+        #expect(GovernanceActionResult.memberRemoved.rawValue == "MemberRemoved")
         #expect(GovernanceActionResult.roleChanged.rawValue == "RoleChanged")
         #expect(GovernanceActionResult.toolRegistered.rawValue == "ToolRegistered")
         #expect(GovernanceActionResult.toolRemoved.rawValue == "ToolRemoved")
@@ -205,7 +205,7 @@ struct GovernanceTests {
 
         let expectedPairs: [(String, GovernanceActionResult)] = [
             ("MemberAdded", .memberAdded),
-            ("MemberEjected", .memberEjected),
+            ("MemberRemoved", .memberRemoved),
             ("RoleChanged", .roleChanged),
             ("ToolRegistered", .toolRegistered),
             ("ToolRemoved", .toolRemoved),

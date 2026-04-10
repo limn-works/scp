@@ -2,7 +2,7 @@
 //!
 //! Governance proposals and votes are MLS application messages. They do **not**
 //! trigger MLS epoch advances on their own. However, governance actions that
-//! result in membership changes (`AddMember`, `Eject`) DO trigger MLS
+//! result in membership changes (`AddMember`, `RemoveMember`) DO trigger MLS
 //! operations (add/remove), which advance the epoch.
 //!
 //! The lifecycle when a membership-affecting proposal is approved:
@@ -59,7 +59,7 @@ pub enum MlsImpact {
 
 /// Classify a [`GovernanceAction`] by its MLS impact.
 ///
-/// `AddMember`, `Eject`, and `Revoke` require MLS group operations (in
+/// `AddMember`, `RemoveMember`, and `Revoke` require MLS group operations (in
 /// encrypted contexts, revocation removes the member from the MLS group).
 /// All other governance actions (role changes, settings changes, tool
 /// registration, `RestoreAccess`, etc.) operate at the governance layer
@@ -87,7 +87,7 @@ pub const fn classify_action(action: &GovernanceAction) -> MlsImpact {
     match action {
         // Membership changes trigger MLS Commit (epoch advance).
         GovernanceAction::AddMember { .. }
-        | GovernanceAction::MemberEject { .. }
+        | GovernanceAction::RemoveMember { .. }
         | GovernanceAction::MemberRevoke { .. }
         | GovernanceAction::ResetMember { .. } => MlsImpact::MembershipChange,
         // All other actions are governance-level state changes that do not
@@ -180,12 +180,12 @@ pub fn generate_mls_operations(
             did: did.clone(),
             role: role.clone(),
         }),
-        GovernanceAction::MemberEject { did, reason } => Some(MlsOperation::RemoveMember {
+        GovernanceAction::RemoveMember { did, reason } => Some(MlsOperation::RemoveMember {
             did: did.clone(),
             reason: reason.clone(),
         }),
         // Revoke in encrypted mode is MLS group removal (same as
-        // Eject at the MLS layer). In broadcast mode, the manager
+        // RemoveMember at the MLS layer). In broadcast mode, the manager
         // handles this directly without MLS.
         GovernanceAction::MemberRevoke { did, .. } => Some(MlsOperation::RemoveMember {
             did: did.clone(),
@@ -587,8 +587,8 @@ mod tests {
     }
 
     #[test]
-    fn classify_eject_is_membership_change() {
-        let action = GovernanceAction::MemberEject {
+    fn classify_remove_member_is_membership_change() {
+        let action = GovernanceAction::RemoveMember {
             did: bob(),
             reason: Some("inactive".to_owned()),
         };
@@ -722,8 +722,8 @@ mod tests {
     }
 
     #[test]
-    fn generate_mls_ops_for_eject() {
-        let action = GovernanceAction::MemberEject {
+    fn generate_mls_ops_for_remove_member() {
+        let action = GovernanceAction::RemoveMember {
             did: bob(),
             reason: Some("inactive".to_owned()),
         };
@@ -1016,8 +1016,8 @@ mod tests {
     }
 
     #[test]
-    fn approved_eject_requires_mls_coordination() {
-        let action = GovernanceAction::MemberEject {
+    fn approved_remove_member_requires_mls_coordination() {
+        let action = GovernanceAction::RemoveMember {
             did: bob(),
             reason: None,
         };
@@ -1107,7 +1107,7 @@ mod tests {
     #[test]
     fn reset_does_not_invalidate_approved_proposals() {
         let proposals = vec![approved_proposal(
-            GovernanceAction::MemberEject {
+            GovernanceAction::RemoveMember {
                 did: bob(),
                 reason: None,
             },
@@ -1326,10 +1326,10 @@ mod tests {
     }
 
     #[test]
-    fn full_coordination_flow_eject() {
+    fn full_coordination_flow_remove_member() {
         // Simulate eject member flow.
 
-        let action = GovernanceAction::MemberEject {
+        let action = GovernanceAction::RemoveMember {
             did: bob(),
             reason: Some("violation".to_owned()),
         };
@@ -1345,7 +1345,7 @@ mod tests {
             mls_op,
             MlsOperation::RemoveMember {
                 did: bob(),
-                // Eject passes reason through directly.
+                // RemoveMember passes reason through directly.
                 reason: Some("violation".to_owned()),
             }
         );

@@ -110,7 +110,7 @@ pub enum ConsequenceTrigger {
 ///
 /// This type collapses the previous split between
 /// `ConsequenceAction::{Suspend, SuspendAll}` and
-/// `GovernanceAction::{SuspendMember, Revoke, Eject}` into a single typed
+/// `GovernanceAction::{SuspendMember, Revoke, RemoveMember}` into a single typed
 /// ladder ordered from least to most severe:
 ///
 /// 1. [`SuspendCapability`](Self::SuspendCapability) — application-level block
@@ -122,7 +122,7 @@ pub enum ConsequenceTrigger {
 ///    keys are destroyed, the member is added to an exclusion list. The
 ///    member remains in MLS for auditability but cannot read or write in the
 ///    specified [`AccessScope`].
-/// 4. [`MemberEject`](Self::MemberEject) — MLS group removal. Irreversible.
+/// 4. [`RemoveMember`](Self::RemoveMember) — MLS group removal. Irreversible.
 ///
 /// # Severity levels and their target DIDs
 ///
@@ -143,7 +143,7 @@ pub enum ConsequenceTrigger {
 ///   ([`ContextParams.consequence_config`](crate::context::params::ContextParams::consequence_config)).
 ///   Defaults to `false`: cryptographic revocation is governance-only unless
 ///   the context explicitly opts in at creation time.
-/// - `MemberEject` — never allowed in consequence rules. MLS ejection is
+/// - `RemoveMember` — never allowed in consequence rules. MLS ejection is
 ///   permanent and must originate from an explicit governance proposal.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum EnforcementSeverity {
@@ -211,7 +211,7 @@ pub enum EnforcementSeverity {
     ///
     /// **Governance-only.** Cannot be referenced by a consequence rule
     /// because MLS ejection is permanent and disruptive.
-    MemberEject {
+    RemoveMember {
         /// DID of the member to eject from the MLS group.
         did: DID,
         /// Optional human-readable reason recorded on the event log.
@@ -227,7 +227,7 @@ impl EnforcementSeverity {
             Self::SuspendCapability { .. } => "SuspendCapability",
             Self::SuspendAccess => "SuspendAccess",
             Self::MemberRevoke { .. } => "MemberRevoke",
-            Self::MemberEject { .. } => "MemberEject",
+            Self::RemoveMember { .. } => "RemoveMember",
         }
     }
 
@@ -237,11 +237,11 @@ impl EnforcementSeverity {
     /// [`SuspendAccess`](Self::SuspendAccess)) do not carry a DID — the subject
     /// is derived from the rule-evaluation context. Governance-targeting
     /// severities ([`MemberRevoke`](Self::MemberRevoke),
-    /// [`MemberEject`](Self::MemberEject)) carry the explicit target.
+    /// [`RemoveMember`](Self::RemoveMember)) carry the explicit target.
     #[must_use]
     pub const fn target_did(&self) -> Option<&DID> {
         match self {
-            Self::MemberRevoke { did, .. } | Self::MemberEject { did, .. } => Some(did),
+            Self::MemberRevoke { did, .. } | Self::RemoveMember { did, .. } => Some(did),
             Self::SuspendCapability { .. } | Self::SuspendAccess => None,
         }
     }
@@ -253,13 +253,13 @@ impl EnforcementSeverity {
     /// - `SuspendCapability`, `SuspendAccess` — always allowed.
     /// - `MemberRevoke` — allowed only when `allow_automatic_member_revoke`
     ///   is `true`.
-    /// - `MemberEject` — never allowed in consequence rules; governance-only.
+    /// - `RemoveMember` — never allowed in consequence rules; governance-only.
     #[must_use]
     pub const fn is_consequence_eligible(&self, allow_automatic_member_revoke: bool) -> bool {
         match self {
             Self::SuspendCapability { .. } | Self::SuspendAccess => true,
             Self::MemberRevoke { .. } => allow_automatic_member_revoke,
-            Self::MemberEject { .. } => false,
+            Self::RemoveMember { .. } => false,
         }
     }
 }
@@ -344,7 +344,7 @@ impl ConsequenceRule {
     /// - `Enforcement(MemberRevoke { .. })`: unless the context's
     ///   `allow_automatic_member_revoke` flag is `true` (checked via
     ///   [`validate_against_config`](Self::validate_against_config))
-    /// - `Enforcement(MemberEject { .. })`: always rejected — MLS ejection
+    /// - `Enforcement(RemoveMember { .. })`: always rejected — MLS ejection
     ///   is governance-only
     /// - `AssignRole { to_role }`: role name with control/HTML chars or
     ///   length > 128
@@ -357,7 +357,7 @@ impl ConsequenceRule {
     /// Returns [`ConsequenceValidationError`] if any string field contains
     /// forbidden characters (control chars, `<`, `>`, `&`, `"`, `'`), exceeds
     /// its maximum length, exceeds capability count limits, or references
-    /// `MemberEject` (which is always rejected regardless of config).
+    /// `RemoveMember` (which is always rejected regardless of config).
     ///
     /// `MemberRevoke` is accepted here and rejected later by
     /// [`validate_against_config`](Self::validate_against_config) when the
@@ -388,11 +388,11 @@ impl ConsequenceRule {
         match &self.action {
             ConsequenceAction::Enforcement(severity) => {
                 validate_severity_shape(severity)?;
-                // MemberEject is always rejected at this layer — it is
+                // RemoveMember is always rejected at this layer — it is
                 // governance-only regardless of per-context opt-in.
-                if matches!(severity, EnforcementSeverity::MemberEject { .. }) {
+                if matches!(severity, EnforcementSeverity::RemoveMember { .. }) {
                     return Err(ConsequenceValidationError(
-                        "MemberEject may not be referenced from a consequence rule; \
+                        "RemoveMember may not be referenced from a consequence rule; \
                          MLS ejection is governance-only"
                             .to_owned(),
                     ));
@@ -451,8 +451,8 @@ impl ConsequenceRule {
 ///   capabilities are all rejected.
 /// - `SuspendAccess`: no fields, always passes shape validation.
 /// - `MemberRevoke`: the embedded DID must be non-empty.
-/// - `MemberEject`: reason length check is performed when present; note
-///   that [`ConsequenceRule::validate`] rejects `MemberEject` outright
+/// - `RemoveMember`: reason length check is performed when present; note
+///   that [`ConsequenceRule::validate`] rejects `RemoveMember` outright
 ///   regardless of shape.
 fn validate_severity_shape(
     severity: &EnforcementSeverity,
@@ -515,14 +515,14 @@ fn validate_severity_shape(
                 ));
             }
         }
-        EnforcementSeverity::MemberEject { did, reason } => {
+        EnforcementSeverity::RemoveMember { did, reason } => {
             if did.0.is_empty() {
                 return Err(ConsequenceValidationError(
-                    "MemberEject.did must not be empty".to_owned(),
+                    "RemoveMember.did must not be empty".to_owned(),
                 ));
             }
             if let Some(r) = reason {
-                validate_consequence_string(r, "MemberEject.reason", MAX_CONSEQUENCE_STRING_LEN)?;
+                validate_consequence_string(r, "RemoveMember.reason", MAX_CONSEQUENCE_STRING_LEN)?;
             }
         }
     }
@@ -1083,7 +1083,7 @@ mod tests {
                 did: DID("did:key:alice".to_owned()),
                 access: AccessScope::Both,
             },
-            EnforcementSeverity::MemberEject {
+            EnforcementSeverity::RemoveMember {
                 did: DID("did:key:bob".to_owned()),
                 reason: Some("spam".to_owned()),
             },
@@ -1405,7 +1405,7 @@ mod tests {
         };
         assert_eq!(rev.target_did().unwrap().as_ref(), "did:key:alice");
 
-        let ej = EnforcementSeverity::MemberEject {
+        let ej = EnforcementSeverity::RemoveMember {
             did: DID("did:key:bob".to_owned()),
             reason: None,
         };
@@ -1435,24 +1435,24 @@ mod tests {
             "MemberRevoke"
         );
         assert_eq!(
-            EnforcementSeverity::MemberEject {
+            EnforcementSeverity::RemoveMember {
                 did: DID("did:key:alice".to_owned()),
                 reason: None,
             }
             .variant_name(),
-            "MemberEject"
+            "RemoveMember"
         );
     }
 
     // -----------------------------------------------------------------------
-    // B3: per-context opt-in for MemberRevoke / always reject MemberEject
+    // B3: per-context opt-in for MemberRevoke / always reject RemoveMember
     // -----------------------------------------------------------------------
 
     #[test]
-    fn validate_rejects_member_eject_consequence_unconditionally() {
+    fn validate_rejects_remove_member_consequence_unconditionally() {
         let rule = ConsequenceRule {
             trigger: ConsequenceTrigger::MessageVelocity,
-            action: ConsequenceAction::Enforcement(EnforcementSeverity::MemberEject {
+            action: ConsequenceAction::Enforcement(EnforcementSeverity::RemoveMember {
                 did: DID("did:key:alice".to_owned()),
                 reason: None,
             }),
@@ -1461,8 +1461,8 @@ mod tests {
         };
         let err = rule.validate().unwrap_err();
         assert!(
-            err.to_string().contains("MemberEject"),
-            "should reject MemberEject, got: {err}"
+            err.to_string().contains("RemoveMember"),
+            "should reject RemoveMember, got: {err}"
         );
 
         // Also rejected under validate_against_config regardless of opt-in.
@@ -1562,8 +1562,8 @@ mod tests {
         };
         assert!(!rev.is_consequence_eligible(false));
         assert!(rev.is_consequence_eligible(true));
-        // MemberEject always ineligible.
-        let ej = EnforcementSeverity::MemberEject {
+        // RemoveMember always ineligible.
+        let ej = EnforcementSeverity::RemoveMember {
             did: DID("did:key:alice".to_owned()),
             reason: None,
         };

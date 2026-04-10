@@ -148,7 +148,7 @@ fn all_governance_actions_for_test() -> Vec<GovernanceAction> {
             did: bob(),
             role: "member".to_owned(),
         },
-        GovernanceAction::MemberEject {
+        GovernanceAction::RemoveMember {
             did: bob(),
             reason: Some("inactive".to_owned()),
         },
@@ -852,17 +852,17 @@ async fn conflict_detection() {
     );
 
     // Mutual RemoveMember.
-    let remove_a = GovernanceAction::MemberEject {
+    let remove_a = GovernanceAction::RemoveMember {
         did: bob(),
         reason: None,
     };
-    let remove_b = GovernanceAction::MemberEject {
+    let remove_b = GovernanceAction::RemoveMember {
         did: alice(),
         reason: None,
     };
     assert!(
         actions_conflict(&remove_a, &alice(), &remove_b, &bob()),
-        "mutual Eject should conflict"
+        "mutual RemoveMember should conflict"
     );
 
     // Competing ModifyCeiling.
@@ -951,17 +951,17 @@ async fn non_conflicting_actions() {
     );
 
     // Non-mutual RemoveMember (Alice removes Bob, Carol removes Dave).
-    let remove_a = GovernanceAction::MemberEject {
+    let remove_a = GovernanceAction::RemoveMember {
         did: bob(),
         reason: None,
     };
-    let remove_b = GovernanceAction::MemberEject {
+    let remove_b = GovernanceAction::RemoveMember {
         did: dave(),
         reason: None,
     };
     assert!(
         !actions_conflict(&remove_a, &alice(), &remove_b, &carol()),
-        "Eject targeting different DIDs (not mutual) should not conflict"
+        "RemoveMember targeting different DIDs (not mutual) should not conflict"
     );
 }
 

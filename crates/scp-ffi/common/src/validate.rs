@@ -595,7 +595,7 @@ pub fn validate_governance_action_strings(
         GovernanceAction::ChangeRole { new_role, .. } => {
             validate_role_name(new_role)?;
         }
-        GovernanceAction::MemberEject {
+        GovernanceAction::RemoveMember {
             reason: Some(r), ..
         }
         | GovernanceAction::CloseContext {
@@ -631,7 +631,7 @@ pub fn validate_governance_action_strings(
             validate_context_params_strings(params)?;
         }
         // Variants without user-controlled string fields.
-        GovernanceAction::MemberEject { reason: None, .. }
+        GovernanceAction::RemoveMember { reason: None, .. }
         | GovernanceAction::CloseContext { reason: None, .. }
         | GovernanceAction::RotateContentKeys { reason: None, .. }
         | GovernanceAction::RemoveTool { .. }
@@ -1393,7 +1393,7 @@ mod tests {
     fn governance_action_none_reason_accepted() {
         use scp_protocol::context::governance::GovernanceAction;
 
-        let action = GovernanceAction::MemberEject {
+        let action = GovernanceAction::RemoveMember {
             did: scp_primitives::DID("did:dht:z6MkTest".to_owned()),
             reason: None,
         };
@@ -1404,7 +1404,7 @@ mod tests {
     fn governance_action_control_chars_in_reason_rejected() {
         use scp_protocol::context::governance::GovernanceAction;
 
-        let action = GovernanceAction::MemberEject {
+        let action = GovernanceAction::RemoveMember {
             did: scp_primitives::DID("did:dht:z6MkTest".to_owned()),
             reason: Some("bad\0actor".to_owned()),
         };

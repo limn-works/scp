@@ -123,7 +123,7 @@ export interface BatchPublishResult {
  */
 export type GovernanceActionResult =
   | "MemberAdded"
-  | "MemberEjected"
+  | "MemberRemoved"
   | "RoleChanged"
   | "ToolRegistered"
   | "ToolRemoved"

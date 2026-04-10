@@ -1037,7 +1037,7 @@ fn add_member_author_role_populates_broadcast_state() {
 }
 
 // ===========================================================================
-// Test: Eject of author cleans up broadcast state
+// Test: RemoveMember of author cleans up broadcast state
 // ===========================================================================
 
 #[test]
@@ -1063,11 +1063,11 @@ fn remove_member_author_cleans_broadcast_state() {
     let bc = ctx.broadcast.as_ref().unwrap();
     assert!(
         !bc.authors.contains_key(author_did),
-        "Eject should remove author from bc.authors"
+        "RemoveMember should remove author from bc.authors"
     );
     assert!(
         !bc.key_epochs.contains_key(author_did),
-        "Eject should remove author from bc.key_epochs"
+        "RemoveMember should remove author from bc.key_epochs"
     );
 }
 
@@ -2148,8 +2148,8 @@ fn governance_action_from_js_camel_case_format() {
             "AddMember",
         ),
         (
-            serde_json::json!({"type": "memberEject", "did": "did:dht:z2", "reason": null}),
-            "MemberEject",
+            serde_json::json!({"type": "removeMember", "did": "did:dht:z2", "reason": null}),
+            "RemoveMember",
         ),
         (
             serde_json::json!({"type": "changeRole", "did": "did:dht:z3", "new_role": "admin"}),

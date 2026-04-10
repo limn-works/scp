@@ -415,7 +415,7 @@ pub enum ContextEvent {
         resulting_epoch: Option<u64>,
         /// The DID targeted by this governance action, if any.
         ///
-        /// Present for member-targeting actions (`AddMember`, `Eject`,
+        /// Present for member-targeting actions (`AddMember`, `RemoveMember`,
         /// `ChangeRole`, `SuspendMember`, `Revoke`, etc.). Used by
         /// consequence triggers (`WarningCount`, `Custom`) and participation
         /// records to identify the target without relying on opaque payloads.

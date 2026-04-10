@@ -1926,7 +1926,7 @@ fn py_governance_execute(handle: &PyContextHandle, proposal_json: &str) -> PyRes
         use scp_core::context::manager::GovernanceActionResult;
         let result_str = match result {
             GovernanceActionResult::MemberAdded => "MemberAdded",
-            GovernanceActionResult::MemberEjected => "MemberEjected",
+            GovernanceActionResult::MemberRemoved => "MemberRemoved",
             GovernanceActionResult::RoleChanged => "RoleChanged",
             GovernanceActionResult::ToolRegistered => "ToolRegistered",
             GovernanceActionResult::ToolRemoved => "ToolRemoved",
@@ -4804,7 +4804,7 @@ mod tests {
         let rm = approved_proposal(
             [5u8; 32],
             &ctx_id,
-            scp_core::context::governance::GovernanceAction::MemberEject {
+            scp_core::context::governance::GovernanceAction::RemoveMember {
                 did: scp_identity::DID(target.to_owned()),
                 reason: Some("test removal".to_owned()),
             },
@@ -4944,7 +4944,7 @@ mod tests {
 
     #[test]
     fn governance_action_control_chars_in_reason_rejected() {
-        let action = scp_core::context::governance::GovernanceAction::MemberEject {
+        let action = scp_core::context::governance::GovernanceAction::RemoveMember {
             did: scp_identity::DID("did:dht:z6MkTest".to_owned()),
             reason: Some("bad\0actor".to_owned()),
         };
@@ -5049,7 +5049,7 @@ mod tests {
 
     #[test]
     fn governance_action_none_reason_accepted() {
-        let action = scp_core::context::governance::GovernanceAction::MemberEject {
+        let action = scp_core::context::governance::GovernanceAction::RemoveMember {
             did: scp_identity::DID("did:dht:z6MkTest".to_owned()),
             reason: None,
         };

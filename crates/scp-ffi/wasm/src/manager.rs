@@ -2388,7 +2388,7 @@ impl WasmContextManager {
                 "member:invite"
             }
 
-            GovernanceAction::MemberEject { .. }
+            GovernanceAction::RemoveMember { .. }
             | GovernanceAction::SuspendCapability { .. }
             | GovernanceAction::SuspendAccess { .. }
             | GovernanceAction::MemberRevoke { .. }
@@ -2549,8 +2549,8 @@ impl WasmContextManager {
             GovernanceAction::AddMember { did, role } => {
                 self.dispatch_add_member(context_id, did, role)
             }
-            GovernanceAction::MemberEject { did, .. } => {
-                self.dispatch_eject(context_id, did)
+            GovernanceAction::RemoveMember { did, .. } => {
+                self.dispatch_remove_member(context_id, did)
             }
             GovernanceAction::ChangeRole { did, new_role } => {
                 let ctx = self.require_active_context_mut(context_id)?;
@@ -2681,10 +2681,10 @@ impl WasmContextManager {
         Ok(serde_json::json!({"action": "AddMember", "did": did}))
     }
 
-    /// Handles `Eject` governance action: removes the member and, for
+    /// Handles `RemoveMember` governance action: removes the member and, for
     /// broadcast contexts, cleans up author state when the ejected member had
     /// the "author" role.
-    fn dispatch_eject(
+    fn dispatch_remove_member(
         &mut self,
         context_id: &str,
         did: &str,
@@ -2707,7 +2707,7 @@ impl WasmContextManager {
         ctx.push_event(ContextEvent::MemberLeft {
             member_did: DID(did.to_owned()),
         });
-        Ok(serde_json::json!({"action": "MemberEject", "did": did}))
+        Ok(serde_json::json!({"action": "RemoveMember", "did": did}))
     }
 
     /// Handles governance actions that don't fit in the primary dispatch.
@@ -2794,7 +2794,7 @@ impl WasmContextManager {
             }
             // 8 variants handled by upstream dispatch method (exhaustive, no wildcard).
             GovernanceAction::AddMember { .. }
-            | GovernanceAction::MemberEject { .. }
+            | GovernanceAction::RemoveMember { .. }
             | GovernanceAction::ChangeRole { .. }
             | GovernanceAction::RegisterTool { .. }
             | GovernanceAction::RemoveTool { .. }
@@ -2984,7 +2984,7 @@ impl WasmContextManager {
                 Ok(serde_json::json!({"action": "ModifyThreshold", "newThreshold": new_threshold}))
             }
             GovernanceAction::AddMember { .. } // 14 upstream (exhaustive, no wildcard)
-            | GovernanceAction::MemberEject { .. }
+            | GovernanceAction::RemoveMember { .. }
             | GovernanceAction::ChangeRole { .. }
             | GovernanceAction::RegisterTool { .. }
             | GovernanceAction::RemoveTool { .. }
@@ -3085,7 +3085,7 @@ impl WasmContextManager {
             }
             // 18 variants handled by upstream dispatch methods (exhaustive, no wildcard).
             GovernanceAction::AddMember { .. }
-            | GovernanceAction::MemberEject { .. }
+            | GovernanceAction::RemoveMember { .. }
             | GovernanceAction::ChangeRole { .. }
             | GovernanceAction::RegisterTool { .. }
             | GovernanceAction::RemoveTool { .. }
@@ -3196,7 +3196,7 @@ impl WasmContextManager {
             }
             // 25 variants handled by upstream dispatch methods (exhaustive, no wildcard).
             GovernanceAction::AddMember { .. }
-            | GovernanceAction::MemberEject { .. }
+            | GovernanceAction::RemoveMember { .. }
             | GovernanceAction::ChangeRole { .. }
             | GovernanceAction::RegisterTool { .. }
             | GovernanceAction::RemoveTool { .. }
@@ -5646,8 +5646,8 @@ mod tests {
     }
 
     #[test]
-    fn serde_roundtrip_eject() {
-        roundtrip(&GovernanceAction::MemberEject {
+    fn serde_roundtrip_remove_member() {
+        roundtrip(&GovernanceAction::RemoveMember {
             did: DID("did:dht:z123".to_owned()),
             reason: Some("inactive".to_owned()),
         });
@@ -5931,7 +5931,7 @@ mod tests {
     fn all_wasm_governance_actions() -> Vec<GovernanceAction> {
         let json_actions: Vec<serde_json::Value> = vec![
             serde_json::json!({"AddMember": {"did": "d", "role": "r"}}),
-            serde_json::json!({"MemberEject": {"did": "d", "reason": null}}),
+            serde_json::json!({"RemoveMember": {"did": "d", "reason": null}}),
             serde_json::json!({"ChangeRole": {"did": "d", "new_role": "r"}}),
             serde_json::json!({"RegisterTool": {"registration": {
                 "tool_id": "t", "name": "n", "description": "d",

@@ -32,7 +32,7 @@ class GovernanceActionResult(enum.Enum):
     """
 
     MEMBER_ADDED = "MemberAdded"
-    MEMBER_EJECTED = "MemberEjected"
+    MEMBER_REMOVED = "MemberRemoved"
     ROLE_CHANGED = "RoleChanged"
     TOOL_REGISTERED = "ToolRegistered"
     TOOL_REMOVED = "ToolRemoved"
