@@ -824,7 +824,7 @@ async fn tier3_governance_revoke_write_access_broadcast() {
 
     // --- Governance Revoke { access: AccessScope::Both } on Author ---
 
-    let revoke = GovernanceAction::MemberRevoke {
+    let revoke = GovernanceAction::RevokeAccess {
         did: author_did(),
         access: AccessScope::Both,
     };
@@ -1532,7 +1532,7 @@ async fn governance_tier_stacking_via_context_manager() {
 
     // --- Governance (Tier 3): write revocation on Dave ---
 
-    let revoke = GovernanceAction::MemberRevoke {
+    let revoke = GovernanceAction::RevokeAccess {
         did: dave(),
         access: AccessScope::Both,
     };

@@ -831,7 +831,7 @@ fn validate_imported_antispam_state(snap: &WasmContextExportSnapshot) -> Result<
     }
 
     // Validate imported consequence rules via validate_against_config.
-    // Default config (allow_automatic_member_revoke = false) is the
+    // Default config (allow_automatic_access_revocation = false) is the
     // safe choice for imported snapshots of unknown provenance.
     let import_config = scp_protocol::context::params::ConsequenceConfig::default();
     for (idx, rule) in snap.consequence_rules.iter().enumerate() {
@@ -2391,7 +2391,7 @@ impl WasmContextManager {
             GovernanceAction::RemoveMember { .. }
             | GovernanceAction::SuspendCapability { .. }
             | GovernanceAction::SuspendAccess { .. }
-            | GovernanceAction::MemberRevoke { .. }
+            | GovernanceAction::RevokeAccess { .. }
             | GovernanceAction::ResetMember { .. } => "member:remove",
 
             GovernanceAction::ChangeRole { .. } => "role:assign",
@@ -2617,7 +2617,7 @@ impl WasmContextManager {
             GovernanceAction::TransferAdmin { .. } // remaining: exhaustive, no wildcard
             | GovernanceAction::SuspendCapability { .. }
             | GovernanceAction::SuspendAccess { .. }
-            | GovernanceAction::MemberRevoke { .. }
+            | GovernanceAction::RevokeAccess { .. }
             | GovernanceAction::RestoreAccess { .. }
             | GovernanceAction::PromoteContext
             | GovernanceAction::CreateChildContext { .. }
@@ -2771,7 +2771,7 @@ impl WasmContextManager {
                 });
                 Ok(serde_json::json!({"action": "SuspendAccess", "did": did_str}))
             }
-            GovernanceAction::MemberRevoke { did, access } => {
+            GovernanceAction::RevokeAccess { did, access } => {
                 self.dispatch_revoke(context_id, did, *access)
             }
             GovernanceAction::RestoreAccess { did, capabilities } => {
@@ -2907,7 +2907,7 @@ impl WasmContextManager {
                 reason: Some(format!("Revoke for {did}")),
             });
         }
-        Ok(serde_json::json!({"action": "MemberRevoke", "did": did_str, "access": access_str}))
+        Ok(serde_json::json!({"action": "RevokeAccess", "did": did_str, "access": access_str}))
     }
 
     /// Handles structural, threshold, and economic governance actions.
@@ -2994,7 +2994,7 @@ impl WasmContextManager {
             | GovernanceAction::TransferAdmin { .. }
             | GovernanceAction::SuspendCapability { .. }
             | GovernanceAction::SuspendAccess { .. }
-            | GovernanceAction::MemberRevoke { .. }
+            | GovernanceAction::RevokeAccess { .. }
             | GovernanceAction::RestoreAccess { .. } => unreachable!(),
             GovernanceAction::EstablishToolInterface { .. } // 11 downstream
             | GovernanceAction::ResetMember { .. }
@@ -3095,7 +3095,7 @@ impl WasmContextManager {
             | GovernanceAction::TransferAdmin { .. }
             | GovernanceAction::SuspendCapability { .. }
             | GovernanceAction::SuspendAccess { .. }
-            | GovernanceAction::MemberRevoke { .. }
+            | GovernanceAction::RevokeAccess { .. }
             | GovernanceAction::RestoreAccess { .. }
             | GovernanceAction::PromoteContext
             | GovernanceAction::CreateChildContext { .. }
@@ -3206,7 +3206,7 @@ impl WasmContextManager {
             | GovernanceAction::TransferAdmin { .. }
             | GovernanceAction::SuspendCapability { .. }
             | GovernanceAction::SuspendAccess { .. }
-            | GovernanceAction::MemberRevoke { .. }
+            | GovernanceAction::RevokeAccess { .. }
             | GovernanceAction::RestoreAccess { .. }
             | GovernanceAction::PromoteContext
             | GovernanceAction::CreateChildContext { .. }
@@ -5825,7 +5825,7 @@ mod tests {
 
     #[test]
     fn serde_roundtrip_revoke() {
-        roundtrip(&GovernanceAction::MemberRevoke {
+        roundtrip(&GovernanceAction::RevokeAccess {
             did: DID("did:dht:z123".to_owned()),
             access: AccessScope::Both,
         });
@@ -5971,7 +5971,7 @@ mod tests {
             }}),
             serde_json::json!("PromoteContext"),
             serde_json::json!({"SuspendCapability": {"did": "d", "capabilities": ["MessagesWrite"]}}),
-            serde_json::json!({"MemberRevoke": {"did": "d", "access": "Both"}}),
+            serde_json::json!({"RevokeAccess": {"did": "d", "access": "Both"}}),
             serde_json::json!({"RestoreAccess": {"did": "d", "capabilities": ["MessagesRead", "MessagesWrite"]}}),
             serde_json::json!({"RotateContentKeys": {"reason": null}}),
             serde_json::json!({"ReconfigureGovernance": {

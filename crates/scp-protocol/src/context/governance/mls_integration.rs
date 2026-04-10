@@ -88,7 +88,7 @@ pub const fn classify_action(action: &GovernanceAction) -> MlsImpact {
         // Membership changes trigger MLS Commit (epoch advance).
         GovernanceAction::AddMember { .. }
         | GovernanceAction::RemoveMember { .. }
-        | GovernanceAction::MemberRevoke { .. }
+        | GovernanceAction::RevokeAccess { .. }
         | GovernanceAction::ResetMember { .. } => MlsImpact::MembershipChange,
         // All other actions are governance-level state changes that do not
         // affect MLS group membership (ADR-031 §8). Application-level
@@ -187,7 +187,7 @@ pub fn generate_mls_operations(
         // Revoke in encrypted mode is MLS group removal (same as
         // RemoveMember at the MLS layer). In broadcast mode, the manager
         // handles this directly without MLS.
-        GovernanceAction::MemberRevoke { did, .. } => Some(MlsOperation::RemoveMember {
+        GovernanceAction::RevokeAccess { did, .. } => Some(MlsOperation::RemoveMember {
             did: did.clone(),
             reason: Some("access revoked".to_owned()),
         }),
@@ -674,7 +674,7 @@ mod tests {
 
     #[test]
     fn classify_revoke_read_is_membership_change() {
-        let action = GovernanceAction::MemberRevoke {
+        let action = GovernanceAction::RevokeAccess {
             did: bob(),
             access: AccessScope::Read,
         };
@@ -683,7 +683,7 @@ mod tests {
 
     #[test]
     fn classify_revoke_both_is_membership_change() {
-        let action = GovernanceAction::MemberRevoke {
+        let action = GovernanceAction::RevokeAccess {
             did: bob(),
             access: AccessScope::Both,
         };

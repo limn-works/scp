@@ -38,7 +38,7 @@ async fn cac009_tier1_encrypted_block_unblock() {
         &"did:key:alice".into(),
         "cac009-enc",
         &"did:key:dave".into(),
-        GovernanceAction::MemberRevoke {
+        GovernanceAction::RevokeAccess {
             did: "did:key:dave".into(),
             access: super::AccessScope::Read,
         },
@@ -141,7 +141,7 @@ async fn cac009_tier2_global_block_multiple_contexts() {
             &"did:key:alice".into(),
             ctx_id,
             &"did:key:eve".into(),
-            GovernanceAction::MemberRevoke {
+            GovernanceAction::RevokeAccess {
                 did: "did:key:eve".into(),
                 access: super::AccessScope::Read,
             },
@@ -215,7 +215,7 @@ async fn cac009_broadcast_governance_revoke_restore() {
         &"did:key:alice".into(),
         &ctx_id,
         &"did:key:bob".into(),
-        GovernanceAction::MemberRevoke {
+        GovernanceAction::RevokeAccess {
             did: "did:key:bob".into(),
             access: super::AccessScope::Both,
         },
@@ -292,7 +292,7 @@ async fn cac009_tier_stacking_both_must_reverse() {
         &"did:key:alice".into(),
         &ctx_id,
         &"did:key:bob".into(),
-        GovernanceAction::MemberRevoke {
+        GovernanceAction::RevokeAccess {
             did: "did:key:bob".into(),
             access: super::AccessScope::Write,
         },
@@ -305,7 +305,7 @@ async fn cac009_tier_stacking_both_must_reverse() {
         &"did:key:alice".into(),
         &ctx_id,
         &"did:key:bob".into(),
-        GovernanceAction::MemberRevoke {
+        GovernanceAction::RevokeAccess {
             did: "did:key:bob".into(),
             access: super::AccessScope::Read,
         },
@@ -404,7 +404,7 @@ async fn cac009_layer_verification() {
         &"did:key:alice".into(),
         &ctx_id,
         &"did:key:bob".into(),
-        GovernanceAction::MemberRevoke {
+        GovernanceAction::RevokeAccess {
             did: "did:key:bob".into(),
             access: super::AccessScope::Both,
         },
@@ -453,7 +453,7 @@ async fn cac009_forward_only_verification() {
         &"did:key:alice".into(),
         &ctx_id,
         &"did:key:bob".into(),
-        GovernanceAction::MemberRevoke {
+        GovernanceAction::RevokeAccess {
             did: "did:key:bob".into(),
             access: super::AccessScope::Both,
         },
@@ -544,7 +544,7 @@ async fn cac010_threshold_revoke_read_access() {
         .propose_governance_action_checked(
             "cac010-thresh",
             &creator,
-            GovernanceAction::MemberRevoke {
+            GovernanceAction::RevokeAccess {
                 did: "did:key:dave".into(),
                 access: super::AccessScope::Read,
             },
@@ -576,7 +576,7 @@ async fn cac010_restore_read_access_forward_only() {
         &"did:key:alice".into(),
         &ctx_id,
         &"did:key:sub1".into(),
-        GovernanceAction::MemberRevoke {
+        GovernanceAction::RevokeAccess {
             did: "did:key:sub1".into(),
             access: super::AccessScope::Read,
         },
@@ -618,7 +618,7 @@ async fn cac010_revoke_write_full_can_still_read() {
         &"did:key:alice".into(),
         &ctx_id,
         &"did:key:bob".into(),
-        GovernanceAction::MemberRevoke {
+        GovernanceAction::RevokeAccess {
             did: "did:key:bob".into(),
             access: super::AccessScope::Write,
         },
@@ -653,7 +653,7 @@ async fn cac010_revoke_write_future_only() {
         &"did:key:alice".into(),
         &ctx_id,
         &"did:key:bob".into(),
-        GovernanceAction::MemberRevoke {
+        GovernanceAction::RevokeAccess {
             did: "did:key:bob".into(),
             access: super::AccessScope::Write,
         },
@@ -732,7 +732,7 @@ async fn cac010_membership_access_decoupling() {
         &"did:key:alice".into(),
         &ctx_id,
         &"did:key:sub1".into(),
-        GovernanceAction::MemberRevoke {
+        GovernanceAction::RevokeAccess {
             did: "did:key:sub1".into(),
             access: super::AccessScope::Read,
         },
@@ -760,7 +760,7 @@ async fn cac010_single_admin_auto_execute() {
         &"did:key:alice".into(),
         &ctx_id,
         &"did:key:sub1".into(),
-        GovernanceAction::MemberRevoke {
+        GovernanceAction::RevokeAccess {
             did: "did:key:sub1".into(),
             access: super::AccessScope::Read,
         },

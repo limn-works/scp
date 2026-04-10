@@ -638,7 +638,7 @@ pub fn validate_governance_action_strings(
         | GovernanceAction::ModifyCeiling { .. }
         | GovernanceAction::ExtendTtl { .. }
         | GovernanceAction::TransferAdmin { .. }
-        | GovernanceAction::MemberRevoke { .. }
+        | GovernanceAction::RevokeAccess { .. }
         | GovernanceAction::RestoreAccess { .. }
         | GovernanceAction::ModifyPruningPolicy { .. }
         | GovernanceAction::AddSigner { .. }

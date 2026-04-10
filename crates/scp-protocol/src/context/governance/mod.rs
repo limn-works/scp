@@ -612,8 +612,8 @@ pub enum GovernanceAction {
     /// Cryptographic revocation — destroy keys. Forward-restore only.
     ///
     /// Session-approved name (B1): corresponds to
-    /// [`EnforcementSeverity::MemberRevoke`](crate::trust::consequence::EnforcementSeverity::MemberRevoke).
-    MemberRevoke {
+    /// [`EnforcementSeverity::RevokeAccess`](crate::trust::consequence::EnforcementSeverity::RevokeAccess).
+    RevokeAccess {
         /// The DID whose access is revoked.
         did: DID,
         /// The scope of access to revoke (read, write, or both).
@@ -790,7 +790,7 @@ impl GovernanceAction {
             Self::CreateChildContext { .. } => "CreateChildContext",
             Self::SuspendCapability { .. } => "SuspendCapability",
             Self::SuspendAccess { .. } => "SuspendAccess",
-            Self::MemberRevoke { .. } => "MemberRevoke",
+            Self::RevokeAccess { .. } => "RevokeAccess",
             Self::RestoreAccess { .. } => "RestoreAccess",
             Self::ModifyPruningPolicy { .. } => "ModifyPruningPolicy",
             Self::AddSigner { .. } => "AddSigner",
@@ -825,7 +825,7 @@ impl GovernanceAction {
             | Self::ChangeRole { did, .. }
             | Self::SuspendCapability { did, .. }
             | Self::SuspendAccess { did, .. }
-            | Self::MemberRevoke { did, .. }
+            | Self::RevokeAccess { did, .. }
             | Self::RestoreAccess { did, .. }
             | Self::ResetMember { did, .. }
             | Self::AddSigner { did }
@@ -1779,9 +1779,9 @@ pub fn actions_conflict(
     proposer_b: &DID,
 ) -> bool {
     use GovernanceAction::{
-        AddSigner, ChangeRole, MemberRevoke, ModifyCeiling, ModifyPruningPolicy, ModifyThreshold,
+        AddSigner, ChangeRole, ModifyCeiling, ModifyPruningPolicy, ModifyThreshold,
         ReconfigureGovernance, RemoveMember, RemoveSigner, ResetMember, RestoreAccess,
-        RotateContentKeys, SuspendAccess, SuspendCapability,
+        RevokeAccess, RotateContentKeys, SuspendAccess, SuspendCapability,
     };
 
     // Canonical conflict matrix. The sync module's `actions_conflict`
@@ -1824,26 +1824,26 @@ pub fn actions_conflict(
         (RemoveMember { did: did_a, .. }, ChangeRole { did: did_b, .. })
         | (ChangeRole { did: did_a, .. }, RemoveMember { did: did_b, .. })
         // Same-type pairs:
-        | (MemberRevoke { did: did_a, .. }, MemberRevoke { did: did_b, .. })
+        | (RevokeAccess { did: did_a, .. }, RevokeAccess { did: did_b, .. })
         | (SuspendCapability { did: did_a, .. }, SuspendCapability { did: did_b, .. })
         | (SuspendAccess { did: did_a, .. }, SuspendAccess { did: did_b, .. })
         | (RestoreAccess { did: did_a, .. }, RestoreAccess { did: did_b, .. })
         // Cross-type enforcement pairs:
         | (SuspendCapability { did: did_a, .. }, SuspendAccess { did: did_b, .. })
         | (SuspendAccess { did: did_a, .. }, SuspendCapability { did: did_b, .. })
-        | (SuspendCapability { did: did_a, .. }, MemberRevoke { did: did_b, .. })
-        | (MemberRevoke { did: did_a, .. }, SuspendCapability { did: did_b, .. })
-        | (SuspendAccess { did: did_a, .. }, MemberRevoke { did: did_b, .. })
-        | (MemberRevoke { did: did_a, .. }, SuspendAccess { did: did_b, .. })
-        | (RemoveMember { did: did_a, .. }, MemberRevoke { did: did_b, .. })
-        | (MemberRevoke { did: did_a, .. }, RemoveMember { did: did_b, .. })
+        | (SuspendCapability { did: did_a, .. }, RevokeAccess { did: did_b, .. })
+        | (RevokeAccess { did: did_a, .. }, SuspendCapability { did: did_b, .. })
+        | (SuspendAccess { did: did_a, .. }, RevokeAccess { did: did_b, .. })
+        | (RevokeAccess { did: did_a, .. }, SuspendAccess { did: did_b, .. })
+        | (RemoveMember { did: did_a, .. }, RevokeAccess { did: did_b, .. })
+        | (RevokeAccess { did: did_a, .. }, RemoveMember { did: did_b, .. })
         | (RemoveMember { did: did_a, .. }, SuspendCapability { did: did_b, .. })
         | (SuspendCapability { did: did_a, .. }, RemoveMember { did: did_b, .. })
         | (RemoveMember { did: did_a, .. }, SuspendAccess { did: did_b, .. })
         | (SuspendAccess { did: did_a, .. }, RemoveMember { did: did_b, .. })
         // Enforcement + RestoreAccess:
-        | (MemberRevoke { did: did_a, .. }, RestoreAccess { did: did_b, .. })
-        | (RestoreAccess { did: did_a, .. }, MemberRevoke { did: did_b, .. })
+        | (RevokeAccess { did: did_a, .. }, RestoreAccess { did: did_b, .. })
+        | (RestoreAccess { did: did_a, .. }, RevokeAccess { did: did_b, .. })
         | (SuspendCapability { did: did_a, .. }, RestoreAccess { did: did_b, .. })
         | (RestoreAccess { did: did_a, .. }, SuspendCapability { did: did_b, .. })
         | (SuspendAccess { did: did_a, .. }, RestoreAccess { did: did_b, .. })
@@ -1860,8 +1860,8 @@ pub fn actions_conflict(
         | (SuspendCapability { did: did_a, .. }, ResetMember { did: did_b, .. })
         | (ResetMember { did: did_a, .. }, SuspendAccess { did: did_b, .. })
         | (SuspendAccess { did: did_a, .. }, ResetMember { did: did_b, .. })
-        | (ResetMember { did: did_a, .. }, MemberRevoke { did: did_b, .. })
-        | (MemberRevoke { did: did_a, .. }, ResetMember { did: did_b, .. })
+        | (ResetMember { did: did_a, .. }, RevokeAccess { did: did_b, .. })
+        | (RevokeAccess { did: did_a, .. }, ResetMember { did: did_b, .. })
         | (ResetMember { did: did_a, .. }, RestoreAccess { did: did_b, .. })
         | (RestoreAccess { did: did_a, .. }, ResetMember { did: did_b, .. })
         // Two concurrent ResetMember on the same DID conflict.
@@ -2142,7 +2142,7 @@ mod tests {
                 did: bob(),
                 capabilities: vec![Capability::MessagesWrite],
             },
-            GovernanceAction::MemberRevoke {
+            GovernanceAction::RevokeAccess {
                 did: bob(),
                 access: AccessScope::Both,
             },

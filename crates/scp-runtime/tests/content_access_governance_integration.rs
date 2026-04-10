@@ -352,7 +352,7 @@ async fn revoke_read_access_full_via_threshold_governance() {
     let manager = Box::pin(setup_threshold_context_with_dave(ctx_id)).await;
 
     // Propose Revoke { access: AccessScope::Read } for Dave.
-    let action = GovernanceAction::MemberRevoke {
+    let action = GovernanceAction::RevokeAccess {
         did: dave(),
         access: AccessScope::Read,
     };
@@ -392,7 +392,7 @@ async fn restore_read_access_forward_only() {
     let manager = Box::pin(setup_threshold_context_with_dave(ctx_id)).await;
 
     // First revoke Dave's read access.
-    let revoke = GovernanceAction::MemberRevoke {
+    let revoke = GovernanceAction::RevokeAccess {
         did: dave(),
         access: AccessScope::Read,
     };
@@ -463,7 +463,7 @@ async fn revoke_write_access_full_blocks_publishing() {
     let manager = Box::pin(setup_threshold_context_with_dave(ctx_id)).await;
 
     // Revoke Dave's write access with Full scope.
-    let action = GovernanceAction::MemberRevoke {
+    let action = GovernanceAction::RevokeAccess {
         did: dave(),
         access: AccessScope::Both,
     };
@@ -537,7 +537,7 @@ async fn revoke_write_access_future_only() {
     let manager = Box::pin(setup_threshold_context_with_dave(ctx_id)).await;
 
     // Revoke Dave's write access with AccessScope::Write (no key destruction).
-    let action = GovernanceAction::MemberRevoke {
+    let action = GovernanceAction::RevokeAccess {
         did: dave(),
         access: AccessScope::Write,
     };
@@ -588,7 +588,7 @@ async fn restore_write_access_forward_only() {
     let manager = Box::pin(setup_threshold_context_with_dave(ctx_id)).await;
 
     // First revoke Dave's write access.
-    let revoke = GovernanceAction::MemberRevoke {
+    let revoke = GovernanceAction::RevokeAccess {
         did: dave(),
         access: AccessScope::Write,
     };
@@ -736,7 +736,7 @@ async fn revoked_member_can_still_participate_in_governance() {
         .propose_governance_action(
             ctx_id,
             &alice(),
-            GovernanceAction::MemberRevoke {
+            GovernanceAction::RevokeAccess {
                 did: dave(),
                 access: AccessScope::Write,
             },
@@ -799,7 +799,7 @@ async fn revoked_member_can_still_participate_in_governance() {
         .propose_governance_action(
             ctx_id,
             &alice(),
-            GovernanceAction::MemberRevoke {
+            GovernanceAction::RevokeAccess {
                 did: dave(),
                 access: AccessScope::Read,
             },
@@ -892,7 +892,7 @@ async fn single_admin_auto_executes_revoke_read_access() {
         .propose_governance_action_checked(
             ctx_id,
             &alice(),
-            GovernanceAction::MemberRevoke {
+            GovernanceAction::RevokeAccess {
                 did: dave(),
                 access: AccessScope::Read,
             },
@@ -960,7 +960,7 @@ async fn single_admin_auto_executes_revoke_write_access() {
         .propose_governance_action_checked(
             ctx_id,
             &alice(),
-            GovernanceAction::MemberRevoke {
+            GovernanceAction::RevokeAccess {
                 did: dave(),
                 access: AccessScope::Write,
             },
@@ -1017,7 +1017,7 @@ async fn single_admin_auto_executes_restore_read_access() {
         .propose_governance_action(
             ctx_id,
             &alice(),
-            GovernanceAction::MemberRevoke {
+            GovernanceAction::RevokeAccess {
                 did: dave(),
                 access: AccessScope::Read,
             },
@@ -1228,7 +1228,7 @@ async fn full_content_access_lifecycle() {
     let manager = Box::pin(setup_threshold_context_with_dave(ctx_id)).await;
 
     // Phase 1: Revoke Dave's read access (Full).
-    let revoke_read = GovernanceAction::MemberRevoke {
+    let revoke_read = GovernanceAction::RevokeAccess {
         did: dave(),
         access: AccessScope::Read,
     };
@@ -1237,7 +1237,7 @@ async fn full_content_access_lifecycle() {
     let _ = manager.drain_events(ctx_id).await;
 
     // Phase 2: Revoke Dave's write access (Full).
-    let revoke_write = GovernanceAction::MemberRevoke {
+    let revoke_write = GovernanceAction::RevokeAccess {
         did: dave(),
         access: AccessScope::Both,
     };
@@ -1377,7 +1377,7 @@ async fn majority_revoke_write_access() {
         .propose_governance_action(
             ctx_id,
             &alice(),
-            GovernanceAction::MemberRevoke {
+            GovernanceAction::RevokeAccess {
                 did: dave(),
                 access: AccessScope::Both,
             },

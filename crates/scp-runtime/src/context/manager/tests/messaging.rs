@@ -599,7 +599,7 @@ async fn revoked_member_cannot_decrypt_new_messages() {
         &alice_did,
         "test-ctx",
         &bob_did,
-        GovernanceAction::MemberRevoke {
+        GovernanceAction::RevokeAccess {
             did: bob_did.clone(),
             access: AccessScope::Read,
         },

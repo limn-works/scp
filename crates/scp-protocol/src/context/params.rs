@@ -615,10 +615,10 @@ fn filter_field<T>(visibility: FieldVisibility, value: Option<T>) -> Option<T> {
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ConsequenceConfig {
     /// If `true`, consequence rules may reference
-    /// [`EnforcementSeverity::MemberRevoke`](crate::trust::consequence::EnforcementSeverity::MemberRevoke)
+    /// [`EnforcementSeverity::RevokeAccess`](crate::trust::consequence::EnforcementSeverity::RevokeAccess)
     /// — i.e., automatic cryptographic revocation of a member's access keys.
     ///
-    /// When `false` (the default), `MemberRevoke` is rejected at rule
+    /// When `false` (the default), `RevokeAccess` is rejected at rule
     /// validation time. It remains callable as an explicit governance action
     /// regardless of this flag.
     ///
@@ -626,7 +626,7 @@ pub struct ConsequenceConfig {
     /// consequence rule regardless of this flag. MLS ejection is permanent
     /// and must always originate from a deliberate governance proposal.
     #[serde(default)]
-    pub allow_automatic_member_revoke: bool,
+    pub allow_automatic_access_revocation: bool,
 }
 
 /// Full configuration for an SCP context, declared at creation time.
@@ -804,9 +804,9 @@ pub struct ContextParams {
     /// (Group B3 opt-in, ADR-017).
     ///
     /// Controls whether
-    /// [`EnforcementSeverity::MemberRevoke`](crate::trust::consequence::EnforcementSeverity::MemberRevoke)
+    /// [`EnforcementSeverity::RevokeAccess`](crate::trust::consequence::EnforcementSeverity::RevokeAccess)
     /// may be referenced by automatic consequence rules. Defaults to
-    /// `allow_automatic_member_revoke = false`, meaning cryptographic
+    /// `allow_automatic_access_revocation = false`, meaning cryptographic
     /// revocation is governance-only unless this context explicitly opts
     /// in at creation time. `RemoveMember` is never allowed in a consequence
     /// rule regardless of this configuration.
