@@ -1857,22 +1857,39 @@ pub fn actions_conflict(
             did_a == did_b || (did_a == proposer_b && did_b == proposer_a)
         }
 
-        // Ejection/revocation + role change for the same DID.
-        // Two concurrent enforcement actions targeting the same DID conflict
-        // (scope may differ, but concurrent modification is unsafe — ADR-031
-        // §7). RestoreAccess for the same DID also conflicts.
+        // Any two concurrent enforcement actions targeting the same DID
+        // conflict — they all modify the target's access or membership
+        // state, and concurrent modification is unsafe (ADR-031 §7).
+        // This covers same-type pairs AND cross-type pairs.
         (MemberEject { did: did_a, .. }, ChangeRole { did: did_b, .. })
         | (ChangeRole { did: did_a, .. }, MemberEject { did: did_b, .. })
+        // Same-type pairs:
         | (MemberRevoke { did: did_a, .. }, MemberRevoke { did: did_b, .. })
         | (SuspendCapability { did: did_a, .. }, SuspendCapability { did: did_b, .. })
         | (SuspendAccess { did: did_a, .. }, SuspendAccess { did: did_b, .. })
+        | (RestoreAccess { did: did_a, .. }, RestoreAccess { did: did_b, .. })
+        // Cross-type enforcement pairs:
+        | (SuspendCapability { did: did_a, .. }, SuspendAccess { did: did_b, .. })
+        | (SuspendAccess { did: did_a, .. }, SuspendCapability { did: did_b, .. })
+        | (SuspendCapability { did: did_a, .. }, MemberRevoke { did: did_b, .. })
+        | (MemberRevoke { did: did_a, .. }, SuspendCapability { did: did_b, .. })
+        | (SuspendAccess { did: did_a, .. }, MemberRevoke { did: did_b, .. })
+        | (MemberRevoke { did: did_a, .. }, SuspendAccess { did: did_b, .. })
+        | (MemberEject { did: did_a, .. }, MemberRevoke { did: did_b, .. })
+        | (MemberRevoke { did: did_a, .. }, MemberEject { did: did_b, .. })
+        | (MemberEject { did: did_a, .. }, SuspendCapability { did: did_b, .. })
+        | (SuspendCapability { did: did_a, .. }, MemberEject { did: did_b, .. })
+        | (MemberEject { did: did_a, .. }, SuspendAccess { did: did_b, .. })
+        | (SuspendAccess { did: did_a, .. }, MemberEject { did: did_b, .. })
+        // Enforcement + RestoreAccess:
         | (MemberRevoke { did: did_a, .. }, RestoreAccess { did: did_b, .. })
         | (RestoreAccess { did: did_a, .. }, MemberRevoke { did: did_b, .. })
         | (SuspendCapability { did: did_a, .. }, RestoreAccess { did: did_b, .. })
         | (RestoreAccess { did: did_a, .. }, SuspendCapability { did: did_b, .. })
         | (SuspendAccess { did: did_a, .. }, RestoreAccess { did: did_b, .. })
         | (RestoreAccess { did: did_a, .. }, SuspendAccess { did: did_b, .. })
-        | (RestoreAccess { did: did_a, .. }, RestoreAccess { did: did_b, .. }) => did_a == did_b,
+        | (MemberEject { did: did_a, .. }, RestoreAccess { did: did_b, .. })
+        | (RestoreAccess { did: did_a, .. }, MemberEject { did: did_b, .. }) => did_a == did_b,
 
         // AddSigner and RemoveSigner for the same DID conflict.
         (AddSigner { did: add_did }, RemoveSigner { did: remove_did })
