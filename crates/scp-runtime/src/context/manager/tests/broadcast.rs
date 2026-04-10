@@ -983,7 +983,7 @@ async fn broadcast_block_author_rejects_pending_proposal() {
         proposal_id: [0u8; 32],
         context_id: ctx_id.clone(),
         proposer_did: "did:key:alice".into(),
-        action: super::GovernanceAction::Revoke {
+        action: super::GovernanceAction::MemberRevoke {
             did: "did:key:bob".into(),
             access: super::AccessScope::Write,
         },
@@ -1256,7 +1256,7 @@ async fn revoke_read_access_bans_subscriber_in_broadcast() {
         "sub1 should be subscribed before revocation"
     );
 
-    let action = super::GovernanceAction::Revoke {
+    let action = super::GovernanceAction::MemberRevoke {
         did: "did:key:sub1".into(),
         access: super::AccessScope::Read,
     };
@@ -1367,7 +1367,7 @@ async fn revoke_read_access_rejected_without_member_ban_ceiling() {
             .unwrap();
     }
 
-    let action = super::GovernanceAction::Revoke {
+    let action = super::GovernanceAction::MemberRevoke {
         did: "did:key:sub1".into(),
         access: super::AccessScope::Read,
     };
@@ -1395,7 +1395,7 @@ async fn restore_read_access_unbans_subscriber_in_broadcast() {
     let (manager, ctx_id) = setup_broadcast_with_member_ban().await;
 
     // First, revoke read access.
-    let revoke_action = super::GovernanceAction::Revoke {
+    let revoke_action = super::GovernanceAction::MemberRevoke {
         did: "did:key:sub1".into(),
         access: super::AccessScope::Read,
     };
@@ -1507,7 +1507,7 @@ async fn restore_read_access_rejected_without_member_ban_ceiling() {
 async fn revoke_read_access_works_on_encrypted_context() {
     let (manager, ctx_id) = setup_encrypted_with_member_ban().await;
 
-    let action = super::GovernanceAction::Revoke {
+    let action = super::GovernanceAction::MemberRevoke {
         did: "did:key:bob".into(),
         access: super::AccessScope::Read,
     };
@@ -1549,7 +1549,7 @@ async fn revoke_read_access_works_on_encrypted_context() {
 async fn revoke_read_access_redundant_rejected_by_replay_protection() {
     let (manager, ctx_id) = setup_encrypted_with_member_ban().await;
 
-    let action = super::GovernanceAction::Revoke {
+    let action = super::GovernanceAction::MemberRevoke {
         did: "did:key:bob".into(),
         access: super::AccessScope::Read,
     };
@@ -1567,7 +1567,7 @@ async fn revoke_read_access_redundant_rejected_by_replay_protection() {
         .unwrap();
 
     // Second identical proposal is rejected by replay protection.
-    let action2 = super::GovernanceAction::Revoke {
+    let action2 = super::GovernanceAction::MemberRevoke {
         did: "did:key:bob".into(),
         access: super::AccessScope::Read,
     };
@@ -1614,7 +1614,7 @@ async fn restore_read_access_after_revocation_on_encrypted() {
     let (manager, ctx_id) = setup_encrypted_with_member_ban().await;
 
     // First revoke.
-    let revoke_action = super::GovernanceAction::Revoke {
+    let revoke_action = super::GovernanceAction::MemberRevoke {
         did: "did:key:bob".into(),
         access: super::AccessScope::Read,
     };
@@ -1678,7 +1678,7 @@ async fn revoke_write_access_full_in_broadcast() {
             .add_member("did:key:sub1".into(), "subscriber".into(), vec![]);
     }
 
-    let action = super::GovernanceAction::Revoke {
+    let action = super::GovernanceAction::MemberRevoke {
         did: "did:key:alice".into(),
         access: super::AccessScope::Both,
     };
@@ -1717,7 +1717,7 @@ async fn revoke_write_access_future_only_no_key_destruction() {
             .add_member("did:key:sub1".into(), "subscriber".into(), vec![]);
     }
 
-    let action = super::GovernanceAction::Revoke {
+    let action = super::GovernanceAction::MemberRevoke {
         did: "did:key:alice".into(),
         access: super::AccessScope::Write,
     };
@@ -1756,7 +1756,7 @@ async fn revoke_write_access_future_only_no_key_destruction() {
 async fn revoke_write_access_redundant_rejected_by_replay_protection() {
     let (manager, ctx_id) = setup_encrypted_with_member_ban().await;
 
-    let action = super::GovernanceAction::Revoke {
+    let action = super::GovernanceAction::MemberRevoke {
         did: "did:key:bob".into(),
         access: super::AccessScope::Both,
     };
@@ -1772,7 +1772,7 @@ async fn revoke_write_access_redundant_rejected_by_replay_protection() {
         .unwrap();
 
     // Second identical proposal is rejected by replay protection.
-    let action2 = super::GovernanceAction::Revoke {
+    let action2 = super::GovernanceAction::MemberRevoke {
         did: "did:key:bob".into(),
         access: super::AccessScope::Both,
     };
@@ -1819,7 +1819,7 @@ async fn restore_write_access_after_revocation() {
     let (manager, ctx_id) = setup_encrypted_with_member_ban().await;
 
     // First revoke.
-    let revoke_action = super::GovernanceAction::Revoke {
+    let revoke_action = super::GovernanceAction::MemberRevoke {
         did: "did:key:bob".into(),
         access: super::AccessScope::Both,
     };
@@ -1947,7 +1947,7 @@ async fn presence_only_member_cannot_propose() {
     let (manager, ctx_id) = setup_encrypted_with_member_ban().await;
 
     // Revoke bob's read and write access to make them presence-only.
-    let revoke_read = super::GovernanceAction::Revoke {
+    let revoke_read = super::GovernanceAction::MemberRevoke {
         did: "did:key:bob".into(),
         access: super::AccessScope::Read,
     };
@@ -1962,7 +1962,7 @@ async fn presence_only_member_cannot_propose() {
         .await
         .unwrap();
 
-    let revoke_write = super::GovernanceAction::Revoke {
+    let revoke_write = super::GovernanceAction::MemberRevoke {
         did: "did:key:bob".into(),
         access: super::AccessScope::Write,
     };
@@ -2000,7 +2000,7 @@ async fn write_only_revoked_member_can_still_propose() {
     let (manager, ctx_id) = setup_encrypted_with_member_ban().await;
 
     // Revoke bob's write only.
-    let revoke_write = super::GovernanceAction::Revoke {
+    let revoke_write = super::GovernanceAction::MemberRevoke {
         did: "did:key:bob".into(),
         access: super::AccessScope::Write,
     };
@@ -2043,7 +2043,7 @@ async fn write_only_revoked_member_can_still_propose() {
 async fn revoke_read_access_non_member_fails() {
     let (manager, ctx_id) = setup_encrypted_with_member_ban().await;
 
-    let action = super::GovernanceAction::Revoke {
+    let action = super::GovernanceAction::MemberRevoke {
         did: "did:key:nonexistent".into(),
         access: super::AccessScope::Read,
     };
@@ -2068,7 +2068,7 @@ async fn content_access_preserves_membership() {
     let (manager, ctx_id) = setup_encrypted_with_member_ban().await;
 
     // Revoke both read and write.
-    let rr_action = super::GovernanceAction::Revoke {
+    let rr_action = super::GovernanceAction::MemberRevoke {
         did: "did:key:bob".into(),
         access: super::AccessScope::Read,
     };
@@ -2083,7 +2083,7 @@ async fn content_access_preserves_membership() {
         .await
         .unwrap();
 
-    let rw_action = super::GovernanceAction::Revoke {
+    let rw_action = super::GovernanceAction::MemberRevoke {
         did: "did:key:bob".into(),
         access: super::AccessScope::Both,
     };
@@ -2127,7 +2127,7 @@ async fn content_access_preserves_membership() {
 async fn revoke_write_access_marks_member() {
     let (manager, ctx_id) = setup_encrypted_with_member_ban().await;
 
-    let action = super::GovernanceAction::Revoke {
+    let action = super::GovernanceAction::MemberRevoke {
         did: "did:key:bob".into(),
         access: super::AccessScope::Write,
     };
@@ -2177,7 +2177,7 @@ async fn revoke_write_access_marks_member() {
 async fn revoke_write_access_redundant_is_noop() {
     let (manager, ctx_id) = setup_encrypted_with_member_ban().await;
 
-    let action = super::GovernanceAction::Revoke {
+    let action = super::GovernanceAction::MemberRevoke {
         did: "did:key:bob".into(),
         access: super::AccessScope::Write,
     };
@@ -2220,7 +2220,7 @@ async fn restore_write_access_removes_revocation() {
     let (manager, ctx_id) = setup_encrypted_with_member_ban().await;
 
     // First revoke.
-    let revoke = super::GovernanceAction::Revoke {
+    let revoke = super::GovernanceAction::MemberRevoke {
         did: "did:key:bob".into(),
         access: super::AccessScope::Write,
     };
@@ -2321,7 +2321,7 @@ async fn presence_only_strips_governance_capabilities() {
     let (manager, ctx_id) = setup_encrypted_with_member_ban().await;
 
     // Revoke write access for bob.
-    let revoke_write = super::GovernanceAction::Revoke {
+    let revoke_write = super::GovernanceAction::MemberRevoke {
         did: "did:key:bob".into(),
         access: super::AccessScope::Write,
     };
@@ -2337,7 +2337,7 @@ async fn presence_only_strips_governance_capabilities() {
         .unwrap();
 
     // Revoke read access for bob — now presence-only.
-    let revoke_read = super::GovernanceAction::Revoke {
+    let revoke_read = super::GovernanceAction::MemberRevoke {
         did: "did:key:bob".into(),
         access: super::AccessScope::Read,
     };
@@ -2450,7 +2450,7 @@ async fn revoke_write_access_full_scope_broadcast() {
         bc.add_author("did:key:sub1").unwrap();
     }
 
-    let action = super::GovernanceAction::Revoke {
+    let action = super::GovernanceAction::MemberRevoke {
         did: "did:key:sub1".into(),
         access: super::AccessScope::Both,
     };
@@ -2510,7 +2510,7 @@ async fn revoke_write_access_rejected_without_member_ban() {
             .add_member("did:key:bob".into(), "member".into(), vec![]);
     }
 
-    let action = super::GovernanceAction::Revoke {
+    let action = super::GovernanceAction::MemberRevoke {
         did: "did:key:bob".into(),
         access: super::AccessScope::Both,
     };
@@ -2535,7 +2535,7 @@ async fn revoke_write_access_rejected_without_member_ban() {
 async fn revoke_write_access_non_member_fails() {
     let (manager, ctx_id) = setup_encrypted_with_member_ban().await;
 
-    let action = super::GovernanceAction::Revoke {
+    let action = super::GovernanceAction::MemberRevoke {
         did: "did:key:nonexistent".into(),
         access: super::AccessScope::Both,
     };

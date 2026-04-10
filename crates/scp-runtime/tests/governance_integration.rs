@@ -957,7 +957,7 @@ async fn ac10_remove_member_action() {
         .propose_governance_action(
             ctx_id,
             &alice(),
-            GovernanceAction::Eject {
+            GovernanceAction::MemberEject {
                 did: bob(),
                 reason: Some("test removal".into()),
             },
@@ -1157,7 +1157,7 @@ async fn ac10_revoke_write_access_action() {
         .propose_governance_action(
             ctx_id,
             &alice(),
-            GovernanceAction::Revoke {
+            GovernanceAction::MemberRevoke {
                 did: bob(),
                 access: AccessScope::Write,
             },
@@ -1201,7 +1201,7 @@ async fn ac10_restore_write_access_action() {
         .propose_governance_action(
             ctx_id,
             &alice(),
-            GovernanceAction::Revoke {
+            GovernanceAction::MemberRevoke {
                 did: bob(),
                 access: AccessScope::Write,
             },
@@ -1447,7 +1447,7 @@ fn ac13_actions_no_conflict_different_dids() {
 
 #[test]
 fn ac13_actions_conflict_revoke_vs_restore_write() {
-    let action_a = GovernanceAction::Revoke {
+    let action_a = GovernanceAction::MemberRevoke {
         did: bob(),
         access: AccessScope::Both,
     };
@@ -1463,7 +1463,7 @@ fn ac13_actions_conflict_revoke_vs_restore_write() {
 
 #[test]
 fn ac13_actions_conflict_revoke_vs_restore_read() {
-    let action_a = GovernanceAction::Revoke {
+    let action_a = GovernanceAction::MemberRevoke {
         did: bob(),
         access: AccessScope::Write,
     };
@@ -1479,7 +1479,7 @@ fn ac13_actions_conflict_revoke_vs_restore_read() {
 
 #[test]
 fn ac13_actions_conflict_remove_member_vs_change_role() {
-    let action_a = GovernanceAction::Eject {
+    let action_a = GovernanceAction::MemberEject {
         did: bob(),
         reason: None,
     };
@@ -1496,11 +1496,11 @@ fn ac13_actions_conflict_remove_member_vs_change_role() {
 #[test]
 fn ac13_actions_conflict_mutual_removal() {
     // Alice proposes removing Bob, Bob proposes removing Alice.
-    let action_a = GovernanceAction::Eject {
+    let action_a = GovernanceAction::MemberEject {
         did: bob(),
         reason: None,
     };
-    let action_b = GovernanceAction::Eject {
+    let action_b = GovernanceAction::MemberEject {
         did: alice(),
         reason: None,
     };

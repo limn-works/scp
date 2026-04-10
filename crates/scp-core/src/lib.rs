@@ -118,7 +118,8 @@ pub mod trust {
     };
     pub use scp_protocol::trust::consequence::{
         ConsequenceAction, ConsequenceEvidence, ConsequenceRule, ConsequenceTrigger,
-        ConsequenceValidationError, TriggeredConsequence, evaluate_consequence_rules,
+        ConsequenceValidationError, EnforcementSeverity, TriggeredConsequence,
+        evaluate_consequence_rules,
     };
     pub use scp_protocol::trust::participation::{
         PARTICIPATION_STATEMENTS_SERVICE_TYPE, ParticipationFact, ParticipationProfile,

@@ -14152,7 +14152,7 @@ mod tests {
     /// when parsed from JSON (mirrors the `UniFFI` bridge param flow).
     #[test]
     fn consequence_rules_in_context_params_via_json() {
-        let json = r#"[{"trigger":"MessageVelocity","action":"SuspendAll","threshold":10,"window":{"secs":3600,"nanos":0}}]"#;
+        let json = r#"[{"trigger":"MessageVelocity","action":{"Enforcement":"SuspendAccess"},"threshold":10,"window":{"secs":3600,"nanos":0}}]"#;
         let rules: Vec<scp_core::trust::ConsequenceRule> = serde_json::from_str(json).unwrap();
 
         let params = scp_core::context::ContextParams {

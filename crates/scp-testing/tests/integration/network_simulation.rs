@@ -1483,7 +1483,7 @@ async fn application_layer_demo() {
         .propose_governance_action(
             ctx_id,
             &alice,
-            GovernanceAction::Eject {
+            GovernanceAction::MemberEject {
                 did: charlie.clone(),
                 reason: Some("demo: testing governance removal".to_owned()),
             },

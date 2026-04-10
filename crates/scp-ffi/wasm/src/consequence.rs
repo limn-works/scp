@@ -34,8 +34,8 @@
 //!   fire.
 
 use scp_protocol::trust::consequence::{
-    ConsequenceAction, ConsequenceRule, TriggeredConsequence, evaluate_consequence_rules,
-    parse_suspension_capability,
+    ConsequenceAction, ConsequenceRule, EnforcementSeverity, TriggeredConsequence,
+    evaluate_consequence_rules,
 };
 
 use crate::manager::{MemberEntry, PerContextState};
@@ -128,8 +128,7 @@ fn enforce_triggered(
         }
 
         let action_type = match &consequence.action {
-            ConsequenceAction::Suspend { .. } => "Suspend",
-            ConsequenceAction::SuspendAll => "SuspendAll",
+            ConsequenceAction::Enforcement(sev) => sev.variant_name(),
             ConsequenceAction::AssignRole { .. } => "AssignRole",
         };
         let trigger_type = rules
@@ -157,10 +156,19 @@ fn enforce_triggered(
         }
 
         let success = match &consequence.action {
-            ConsequenceAction::Suspend { capabilities } => {
-                apply_suspend(ctx, subject_did, capabilities)
-            }
-            ConsequenceAction::SuspendAll => apply_suspend_all(ctx, subject_did),
+            ConsequenceAction::Enforcement(severity) => match severity {
+                EnforcementSeverity::SuspendCapability { capabilities } => {
+                    apply_suspend(ctx, subject_did, capabilities)
+                }
+                EnforcementSeverity::SuspendAccess => apply_suspend_all(ctx, subject_did),
+                EnforcementSeverity::MemberRevoke { .. }
+                | EnforcementSeverity::MemberEject { .. } => {
+                    // Cryptographic tiers should not reach consequence dispatch
+                    // without the opt-in flag. Log error and fail (escalation
+                    // to SuspendAll happens below).
+                    false
+                }
+            },
             ConsequenceAction::AssignRole { to_role } => {
                 apply_assign_role(ctx, subject_did, to_role)
             }
@@ -200,30 +208,29 @@ fn enforce_triggered(
     dispatched
 }
 
-/// Enforces `ConsequenceAction::Suspend` by adding each capability string
+/// Enforces `EnforcementSeverity::SuspendCapability` by adding each capability string
 /// to the subject's suspended set. Unknown capability names are ignored
 /// (matching runtime; validation is supposed to have rejected them at
 /// context creation time via `ConsequenceRule::validate`).
 ///
 /// Returns `true` if at least one capability was successfully applied.
-fn apply_suspend(ctx: &mut PerContextState, subject_did: &str, caps: &[String]) -> bool {
-    let mut applied = false;
-    for cap_name in caps {
-        // Parse defensively so we get the same normalization as the runtime
-        // (e.g., "write" → Capability::MessagesWrite → "messages:write").
-        let Some(capability) = parse_suspension_capability(cap_name) else {
-            continue;
-        };
+fn apply_suspend(
+    ctx: &mut PerContextState,
+    subject_did: &str,
+    caps: &[scp_protocol::context::roles::Capability],
+) -> bool {
+    if caps.is_empty() {
+        return false;
+    }
+    for cap in caps {
         // WASM's `suspended_capabilities` uses the `Display` format, which
         // matches `member_has_capability` lookup in `PerContextState`.
-        let key = capability.to_string();
-        ctx.suspended_capabilities_insert(subject_did, key);
-        applied = true;
+        ctx.suspended_capabilities_insert(subject_did, cap.to_string());
     }
-    applied
+    true
 }
 
-/// Enforces `ConsequenceAction::SuspendAll` by computing every capability
+/// Enforces `ConsequenceAction::Enforcement(EnforcementSeverity::SuspendAccess)` by computing every capability
 /// the subject could exercise via their current role, intersected with the
 /// context ceiling, and adding all of them to the subject's suspended set.
 ///
@@ -310,9 +317,10 @@ mod tests {
     };
     use crate::manager::make_bare_per_context_state;
     use scp_event_log::{DID as LogDID, EventType};
+    use scp_protocol::context::roles::Capability;
     use scp_protocol::trust::consequence::{
         ConsequenceAction, ConsequenceEvidence, ConsequenceRule, ConsequenceTrigger,
-        TriggeredConsequence,
+        EnforcementSeverity, TriggeredConsequence,
     };
     use std::time::Duration;
 
@@ -357,7 +365,9 @@ mod tests {
     #[test]
     fn dispatch_no_triggering_events_returns_zero() {
         let mut ctx = make_bare_per_context_state("ctx", "did:test:admin");
-        ctx.test_push_consequence_rule(rule(ConsequenceAction::SuspendAll));
+        ctx.test_push_consequence_rule(rule(ConsequenceAction::Enforcement(
+            EnforcementSeverity::SuspendAccess,
+        )));
         // Event log is empty, so MessageVelocity count is 0 < threshold(1).
         let dispatched = dispatch_consequences_for_subject(&mut ctx, "ctx", "did:test:admin", 1000);
         assert_eq!(dispatched, 0);
@@ -373,9 +383,11 @@ mod tests {
         ctx.test_insert_ceiling("messages:write");
         ctx.test_insert_ceiling("messages:read");
 
-        ctx.test_push_consequence_rule(rule(ConsequenceAction::Suspend {
-            capabilities: vec!["messages:write".to_owned()],
-        }));
+        ctx.test_push_consequence_rule(rule(ConsequenceAction::Enforcement(
+            EnforcementSeverity::SuspendCapability {
+                capabilities: vec![Capability::MessagesWrite],
+            },
+        )));
         // Two MessageSent events inside the 60s window (threshold=1, so 1+
         // is enough).
         ctx.test_append_log_event_at(EventType::MessageSent, "did:test:admin", 990, b"hi");
@@ -400,14 +412,22 @@ mod tests {
         ctx.test_insert_ceiling("messages:write");
         ctx.test_insert_ceiling("messages:read");
 
-        let rules = vec![rule(ConsequenceAction::Suspend {
-            capabilities: vec!["messages:write".to_owned(), "messages:read".to_owned()],
-        })];
+        let rules = vec![rule(ConsequenceAction::Enforcement(
+            EnforcementSeverity::SuspendCapability {
+                capabilities: vec![
+                    scp_protocol::context::roles::Capability::MessagesWrite,
+                    scp_protocol::context::roles::Capability::MessagesRead,
+                ],
+            },
+        ))];
         let triggered = vec![TriggeredConsequence {
             rule_index: 0,
-            action: ConsequenceAction::Suspend {
-                capabilities: vec!["messages:write".to_owned(), "messages:read".to_owned()],
-            },
+            action: ConsequenceAction::Enforcement(EnforcementSeverity::SuspendCapability {
+                capabilities: vec![
+                    scp_protocol::context::roles::Capability::MessagesWrite,
+                    scp_protocol::context::roles::Capability::MessagesRead,
+                ],
+            }),
             evidence: vec![make_evidence(0, "did:test:admin")],
         }];
 
@@ -435,10 +455,12 @@ mod tests {
             ctx.test_insert_ceiling(cap);
         }
 
-        let rules = vec![rule(ConsequenceAction::SuspendAll)];
+        let rules = vec![rule(ConsequenceAction::Enforcement(
+            EnforcementSeverity::SuspendAccess,
+        ))];
         let triggered = vec![TriggeredConsequence {
             rule_index: 0,
-            action: ConsequenceAction::SuspendAll,
+            action: ConsequenceAction::Enforcement(EnforcementSeverity::SuspendAccess),
             evidence: vec![make_evidence(0, "did:test:admin")],
         }];
 
@@ -491,14 +513,16 @@ mod tests {
         let mut ctx = make_bare_per_context_state("ctx", "did:test:admin");
         ctx.test_insert_ceiling("messages:write");
 
-        let rules = vec![rule(ConsequenceAction::Suspend {
-            capabilities: vec!["messages:write".to_owned()],
-        })];
+        let rules = vec![rule(ConsequenceAction::Enforcement(
+            EnforcementSeverity::SuspendCapability {
+                capabilities: vec![Capability::MessagesWrite],
+            },
+        ))];
         let triggered = vec![TriggeredConsequence {
             rule_index: 0,
-            action: ConsequenceAction::Suspend {
-                capabilities: vec!["messages:write".to_owned()],
-            },
+            action: ConsequenceAction::Enforcement(EnforcementSeverity::SuspendCapability {
+                capabilities: vec![Capability::MessagesWrite],
+            }),
             evidence: vec![make_evidence(0, "did:test:admin")],
         }];
 
@@ -524,10 +548,12 @@ mod tests {
     #[test]
     fn enforce_triggered_ghost_did_no_evidence_skipped() {
         let mut ctx = make_bare_per_context_state("ctx", "did:test:admin");
-        let rules = vec![rule(ConsequenceAction::SuspendAll)];
+        let rules = vec![rule(ConsequenceAction::Enforcement(
+            EnforcementSeverity::SuspendAccess,
+        ))];
         let triggered = vec![TriggeredConsequence {
             rule_index: 0,
-            action: ConsequenceAction::SuspendAll,
+            action: ConsequenceAction::Enforcement(EnforcementSeverity::SuspendAccess),
             evidence: vec![], // <- no evidence
         }];
 
@@ -547,7 +573,9 @@ mod tests {
     fn enforce_triggered_ghost_did_with_evidence_emits_and_skips() {
         let mut ctx = make_bare_per_context_state("ctx", "did:test:admin");
         let rules = vec![
-            rule(ConsequenceAction::SuspendAll),
+            rule(ConsequenceAction::Enforcement(
+                EnforcementSeverity::SuspendAccess,
+            )),
             rule(ConsequenceAction::AssignRole {
                 to_role: "observer".to_owned(),
             }),
@@ -555,7 +583,7 @@ mod tests {
         let triggered = vec![
             TriggeredConsequence {
                 rule_index: 0,
-                action: ConsequenceAction::SuspendAll,
+                action: ConsequenceAction::Enforcement(EnforcementSeverity::SuspendAccess),
                 evidence: vec![make_evidence(0, "did:test:ghost")],
             },
             TriggeredConsequence {
@@ -603,12 +631,13 @@ mod tests {
             &mut ctx,
             "did:test:admin",
             &[
-                "not-a-real-capability".to_owned(),
-                "messages:write".to_owned(),
+                Capability::Custom("not-a-real-capability".to_owned()),
+                Capability::MessagesWrite,
             ],
         );
         assert!(applied);
         let suspended = ctx.test_suspended_capabilities("did:test:admin").unwrap();
+        // Custom capabilities use Display format; MessagesWrite is "messages:write"
         assert!(suspended.contains("messages:write"));
         assert!(!suspended.contains("not-a-real-capability"));
     }
