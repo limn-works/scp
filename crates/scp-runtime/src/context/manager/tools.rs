@@ -896,7 +896,7 @@ fn invocation_error_to_context(err: InvocationError) -> ContextError {
             cost,
             remaining,
         } => ContextError::PermissionDenied(format!(
-            "SCP-ECON-7010: budget exceeded for {did}: cost {cost}, remaining {remaining}"
+            "SCP-ECON-12010: budget exceeded for {did}: cost {cost}, remaining {remaining}"
         )),
     }
 }

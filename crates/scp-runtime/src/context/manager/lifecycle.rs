@@ -145,7 +145,7 @@ fn enforce_join_economy(
         ctx.governance.economic_policy.as_ref(),
     ) {
         return Err(ContextError::PermissionDenied(
-            "SCP-ECON-7030: paid context requires explicit acceptance".into(),
+            "SCP-ECON-12030: paid context requires explicit acceptance".into(),
         ));
     }
     let pricing_default =

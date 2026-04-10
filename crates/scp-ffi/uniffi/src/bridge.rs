@@ -476,7 +476,7 @@ impl From<scp_core::context::ContextError> for ScpError {
             // message body.
             CE::RateLimited { .. } => Self::Context {
                 msg: format!("{e}"),
-                code: "SCP-ECON-7090".to_owned(),
+                code: "SCP-ECON-12090".to_owned(),
             },
             // §23.17 snapshot import regression.
             CE::SnapshotFloorRegression { .. } => Self::Context {
@@ -3247,7 +3247,7 @@ pub async fn context_send(
                 .transpose()
                 .map_err(|e| ScpError::Context {
                     msg: format!("invalid spending UCAN: {e}"),
-                    code: "SCP-ECON-7061".to_owned(),
+                    code: "SCP-ECON-12061".to_owned(),
                 })?;
 
             let sender_did: scp_identity::DID = identity.did.clone().into();
@@ -3560,8 +3560,8 @@ pub async fn tool_invoke(
                 .await
             {
                 return Err(ScpError::Tool {
-                    msg: "SCP-ECON-7090: rate limit exceeded on tool_invoke: hard rate limit exceeded for invoker".to_owned(),
-                    code: "SCP-ECON-7090".to_owned(),
+                    msg: "SCP-ECON-12090: rate limit exceeded on tool_invoke: hard rate limit exceeded for invoker".to_owned(),
+                    code: "SCP-ECON-12090".to_owned(),
                 });
             }
 

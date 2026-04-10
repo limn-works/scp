@@ -3176,7 +3176,7 @@ impl WasmContextManager {
                 // proposal cannot corrupt the persisted config.
                 new_config.validate().map_err(|e| ScpWasmError::Context {
                     message: format!("ModifyHardRateLimit: new config failed validation: {e}"),
-                    code: "SCP-ECON-7091".to_owned(),
+                    code: "SCP-ECON-12091".to_owned(),
                 })?;
                 let ctx = self.require_active_context_mut(context_id)?;
                 // WASM bridge stores the config as an opaque JSON blob

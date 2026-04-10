@@ -335,14 +335,14 @@ pub enum ContextError {
     /// Defense-in-depth cap: a burst of operations above the token
     /// bucket capacity is rejected regardless of cost, even when no
     /// economic policy is configured. Applies to the messaging, join,
-    /// and tool invoke paths. Mapped to the canonical `SCP-ECON-7090`
+    /// and tool invoke paths. Mapped to the canonical `SCP-ECON-12090`
     /// code through the bridge error translators.
     ///
     /// `resource` identifies which path tripped the limit (`"send"`,
     /// `"join"`, or `"tool_invoke"`) so callers can apply path-specific
     /// back-off strategies. Untyped `PermissionDenied` predated this
     /// variant; the three call sites were migrated as part of D4.
-    #[error("SCP-ECON-7090: rate limit exceeded on {resource}: {message}")]
+    #[error("SCP-ECON-12090: rate limit exceeded on {resource}: {message}")]
     RateLimited {
         /// The path that tripped the limit (e.g., `"send"`, `"join"`,
         /// `"tool_invoke"`).

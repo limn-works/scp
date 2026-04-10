@@ -276,11 +276,11 @@ impl From<scp_core::context::ContextError> for ScpPyError {
         match &e {
             // Surface the canonical rate-limit code on the typed
             // envelope so callers can `except ScpError` + `.code`
-            // check instead of string-matching `SCP-ECON-7090`
+            // check instead of string-matching `SCP-ECON-12090`
             // inside the message body.
             CE::RateLimited { .. } => Self::ContextError {
                 message: format!("{e}"),
-                code: "SCP-ECON-7090".to_owned(),
+                code: "SCP-ECON-12090".to_owned(),
             },
             // §23.17: snapshot import regression rejection.
             CE::SnapshotFloorRegression { .. } => Self::ContextError {

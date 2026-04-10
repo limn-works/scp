@@ -40,8 +40,8 @@ ScpError (root)
 | `SCP-STORAGE-` | 8000-8999 |
 | `SCP-ATTEST-` | 9000-9999 |
 | `SCP-MCP-` | 10000-10999 |
-| `SCP-GOV-` | 5000-5999 (governance subrange; shares SCP-TRANS transport range for cross-layer governance↔transport errors) |
-| `SCP-ECON-` | 7000-7999 (economics subrange; shares SCP-VALID validation range since pricing/rate-limit violations are economy-validation errors) |
+| `SCP-GOV-` | 11000-11999 |
+| `SCP-ECON-` | 12000-12999 |
 
 ## Stub and Placeholder Policy
 

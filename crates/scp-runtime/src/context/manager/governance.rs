@@ -476,7 +476,7 @@ fn check_proposer_eligibility(
                     "compute_participation_record failed — denying proposal"
                 );
                 return Err(ContextError::PermissionDenied(
-                    "SCP-GOV-5021: participation record computation failed — cannot verify proposer eligibility"
+                    "SCP-GOV-11021: participation record computation failed — cannot verify proposer eligibility"
                         .into(),
                 ));
             }
@@ -509,7 +509,7 @@ fn check_proposer_eligibility(
         && !scp_protocol::trust::participation::meets_threshold(record)
     {
         return Err(ContextError::PermissionDenied(
-            "member participation below threshold — cannot propose governance actions (SCP-GOV-5020)"
+            "member participation below threshold — cannot propose governance actions (SCP-GOV-11020)"
                 .into(),
         ));
     }
@@ -541,7 +541,7 @@ fn check_proposer_eligibility(
         if recent_count >= max_proposals {
             return Err(ContextError::PermissionDenied(format!(
                 "earned capacity limit reached: {recent_count}/{max_proposals} governance proposals \
-                 in {window_secs}s window (SCP-GOV-5030)"
+                 in {window_secs}s window (SCP-GOV-11030)"
             )));
         }
     }

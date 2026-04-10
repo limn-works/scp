@@ -319,7 +319,7 @@ pub fn context_join(
             let _ = scp_protocol::crypto::ucan::validate::parse_ucan(jwt).map_err(|e| {
                 ScpWasmError::Context {
                     message: format!("invalid spending UCAN: {e}"),
-                    code: "SCP-ECON-7061".to_owned(),
+                    code: "SCP-ECON-12061".to_owned(),
                 }
                 .into_js()
             })?;
@@ -409,7 +409,7 @@ pub fn context_send(
             let _ = scp_protocol::crypto::ucan::validate::parse_ucan(jwt).map_err(|e| {
                 ScpWasmError::Context {
                     message: format!("invalid spending UCAN: {e}"),
-                    code: "SCP-ECON-7061".to_owned(),
+                    code: "SCP-ECON-12061".to_owned(),
                 }
                 .into_js()
             })?;
