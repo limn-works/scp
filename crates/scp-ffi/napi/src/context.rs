@@ -782,7 +782,7 @@ pub async fn context_send(
     // Parse optional spending UCAN JWT into a UcanToken for AND-composition.
     let spending_ucan = spending_ucan_jwt
         .as_deref()
-        .map(scp_protocol::crypto::ucan::validate::parse_ucan)
+        .map(scp_core::crypto::ucan::validate::parse_ucan)
         .transpose()
         .map_err(|e| {
             NapiError::from(ScpNapiError::Context {
@@ -1164,7 +1164,7 @@ fn format_context_event(event: &scp_core::context::membership::ContextEvent) -> 
              action={action_type},success={success},\
              context={context_id}"
         ),
-        other => html_escape_event_string(&format!("{other:?}")),
+        other => scp_ffi_common::html_escape_event_string(&format!("{other:?}")),
     }
 }
 

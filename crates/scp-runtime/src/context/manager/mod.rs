@@ -778,7 +778,7 @@ struct GovernanceState {
     spending_nonce_tracker: scp_protocol::crypto::ucan::nonce::NonceTracker<Arc<dyn Clock>>,
     /// Per-member governance proposal timestamps for earned capacity rate limiting
     /// (§9.3). Maps member DID string to a list of Unix timestamps (seconds) when
-    /// the member submitted governance proposals. Used by `check_standing` to
+    /// the member submitted governance proposals. Used by `check_proposer_eligibility` to
     /// enforce `max_governance_proposals_per_window` from `EarnedCapacityPolicy`.
     /// Entries outside the sliding window are evicted on each check.
     proposal_timestamps: HashMap<String, Vec<u64>>,
