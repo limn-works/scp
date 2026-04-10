@@ -208,10 +208,8 @@ fn enforce_triggered(
     dispatched
 }
 
-/// Enforces `EnforcementSeverity::SuspendCapability` by adding each capability string
-/// to the subject's suspended set. Unknown capability names are ignored
-/// (matching runtime; validation is supposed to have rejected them at
-/// context creation time via `ConsequenceRule::validate`).
+/// Enforces `EnforcementSeverity::SuspendCapability` by adding each
+/// typed capability to the subject's suspended set.
 ///
 /// Returns `true` if at least one capability was successfully applied.
 fn apply_suspend(

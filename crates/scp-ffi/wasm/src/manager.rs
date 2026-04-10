@@ -825,12 +825,16 @@ fn validate_imported_antispam_state(snap: &WasmContextExportSnapshot) -> Result<
         validate_imported_string(key, "resolved_proposals_json.key", 256)?;
     }
 
-    // Validate imported consequence rules via ConsequenceRule::validate().
+    // Validate imported consequence rules via validate_against_config.
+    // Default config (allow_automatic_member_revoke = false) is the
+    // safe choice for imported snapshots of unknown provenance.
+    let import_config = scp_protocol::context::params::ConsequenceConfig::default();
     for (idx, rule) in snap.consequence_rules.iter().enumerate() {
-        rule.validate().map_err(|e| ScpWasmError::Context {
-            message: format!("imported consequence_rules[{idx}] invalid: {e}"),
-            code: "SCP-CTX-2032".to_owned(),
-        })?;
+        rule.validate_against_config(&import_config)
+            .map_err(|e| ScpWasmError::Context {
+                message: format!("imported consequence_rules[{idx}] invalid: {e}"),
+                code: "SCP-CTX-2032".to_owned(),
+            })?;
     }
 
     // Cooldown map: rule_index must be within the rules vector's bounds so
@@ -1132,11 +1136,17 @@ impl WasmContextManager {
             } else {
                 Vec::new()
             };
+        let consequence_config: scp_protocol::context::params::ConsequenceConfig =
+            params.get("consequenceConfig").map_or_else(
+                scp_protocol::context::params::ConsequenceConfig::default,
+                |cfg_val| serde_json::from_value(cfg_val.clone()).unwrap_or_default(),
+            );
         for rule in &consequence_rules {
-            rule.validate().map_err(|e| ScpWasmError::Validation {
-                message: format!("consequence rule validation failed: {e}"),
-                code: "SCP-VALID-7000".to_owned(),
-            })?;
+            rule.validate_against_config(&consequence_config)
+                .map_err(|e| ScpWasmError::Validation {
+                    message: format!("consequence rule validation failed: {e}"),
+                    code: "SCP-VALID-7000".to_owned(),
+                })?;
         }
 
         // Initialize broadcast context for Broadcast mode (§5.14.2).
