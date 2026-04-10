@@ -541,8 +541,8 @@ pub enum GovernanceAction {
     /// MLS ejection — irreversible, governance only.
     ///
     /// Session-approved name (B1): corresponds to
-    /// [`EnforcementSeverity::MemberEject`](crate::trust::consequence::EnforcementSeverity::MemberEject).
-    MemberEject {
+    /// [`EnforcementSeverity::RemoveMember`](crate::trust::consequence::EnforcementSeverity::RemoveMember).
+    RemoveMember {
         /// The DID of the member to eject.
         did: DID,
         /// Optional reason for ejection.
@@ -779,7 +779,7 @@ impl GovernanceAction {
     pub const fn variant_name(&self) -> &'static str {
         match self {
             Self::AddMember { .. } => "AddMember",
-            Self::MemberEject { .. } => "MemberEject",
+            Self::RemoveMember { .. } => "RemoveMember",
             Self::ChangeRole { .. } => "ChangeRole",
             Self::RegisterTool { .. } => "RegisterTool",
             Self::RemoveTool { .. } => "RemoveTool",
@@ -821,7 +821,7 @@ impl GovernanceAction {
     pub const fn target_did(&self) -> Option<&DID> {
         match self {
             Self::AddMember { did, .. }
-            | Self::MemberEject { did, .. }
+            | Self::RemoveMember { did, .. }
             | Self::ChangeRole { did, .. }
             | Self::SuspendCapability { did, .. }
             | Self::SuspendAccess { did, .. }
@@ -1754,10 +1754,10 @@ impl GovernanceEngine for SingleAdminEngine {
 /// implements the conflict detection rules from ADR-031 section 7.
 ///
 /// # Conflict types detected:
-/// - Mutual `Eject` proposals (each targeting the other's proposer)
+/// - Mutual `RemoveMember` proposals (each targeting the other's proposer)
 /// - Competing `ChangeRole` proposals for the same DID with different roles
 /// - Competing `ModifyCeiling` proposals with different ceiling sets
-/// - `Eject` + `ChangeRole` for the same DID
+/// - `RemoveMember` + `ChangeRole` for the same DID
 /// - `Revoke` + `RestoreAccess` for the same DID
 /// - Multiple `Revoke` for same DID with different scopes
 /// - Multiple `SuspendMember` for same DID
@@ -1779,8 +1779,8 @@ pub fn actions_conflict(
     proposer_b: &DID,
 ) -> bool {
     use GovernanceAction::{
-        AddSigner, ChangeRole, MemberEject, MemberRevoke, ModifyCeiling, ModifyPruningPolicy,
-        ModifyThreshold, ReconfigureGovernance, RemoveSigner, ResetMember, RestoreAccess,
+        AddSigner, ChangeRole, MemberRevoke, ModifyCeiling, ModifyPruningPolicy, ModifyThreshold,
+        ReconfigureGovernance, RemoveMember, RemoveSigner, ResetMember, RestoreAccess,
         RotateContentKeys, SuspendAccess, SuspendCapability,
     };
 
@@ -1813,7 +1813,7 @@ pub fn actions_conflict(
         // Two concurrent ejections of the same member conflict (ADR-031 §7:
         // concurrent modifications to the same membership state).
         // Also catches mutual ejection (each proposer ejects the other).
-        (MemberEject { did: did_a, .. }, MemberEject { did: did_b, .. }) => {
+        (RemoveMember { did: did_a, .. }, RemoveMember { did: did_b, .. }) => {
             did_a == did_b || (did_a == proposer_b && did_b == proposer_a)
         }
 
@@ -1821,8 +1821,8 @@ pub fn actions_conflict(
         // conflict — they all modify the target's access or membership
         // state, and concurrent modification is unsafe (ADR-031 §7).
         // This covers same-type pairs AND cross-type pairs.
-        (MemberEject { did: did_a, .. }, ChangeRole { did: did_b, .. })
-        | (ChangeRole { did: did_a, .. }, MemberEject { did: did_b, .. })
+        (RemoveMember { did: did_a, .. }, ChangeRole { did: did_b, .. })
+        | (ChangeRole { did: did_a, .. }, RemoveMember { did: did_b, .. })
         // Same-type pairs:
         | (MemberRevoke { did: did_a, .. }, MemberRevoke { did: did_b, .. })
         | (SuspendCapability { did: did_a, .. }, SuspendCapability { did: did_b, .. })
@@ -1835,12 +1835,12 @@ pub fn actions_conflict(
         | (MemberRevoke { did: did_a, .. }, SuspendCapability { did: did_b, .. })
         | (SuspendAccess { did: did_a, .. }, MemberRevoke { did: did_b, .. })
         | (MemberRevoke { did: did_a, .. }, SuspendAccess { did: did_b, .. })
-        | (MemberEject { did: did_a, .. }, MemberRevoke { did: did_b, .. })
-        | (MemberRevoke { did: did_a, .. }, MemberEject { did: did_b, .. })
-        | (MemberEject { did: did_a, .. }, SuspendCapability { did: did_b, .. })
-        | (SuspendCapability { did: did_a, .. }, MemberEject { did: did_b, .. })
-        | (MemberEject { did: did_a, .. }, SuspendAccess { did: did_b, .. })
-        | (SuspendAccess { did: did_a, .. }, MemberEject { did: did_b, .. })
+        | (RemoveMember { did: did_a, .. }, MemberRevoke { did: did_b, .. })
+        | (MemberRevoke { did: did_a, .. }, RemoveMember { did: did_b, .. })
+        | (RemoveMember { did: did_a, .. }, SuspendCapability { did: did_b, .. })
+        | (SuspendCapability { did: did_a, .. }, RemoveMember { did: did_b, .. })
+        | (RemoveMember { did: did_a, .. }, SuspendAccess { did: did_b, .. })
+        | (SuspendAccess { did: did_a, .. }, RemoveMember { did: did_b, .. })
         // Enforcement + RestoreAccess:
         | (MemberRevoke { did: did_a, .. }, RestoreAccess { did: did_b, .. })
         | (RestoreAccess { did: did_a, .. }, MemberRevoke { did: did_b, .. })
@@ -1848,12 +1848,12 @@ pub fn actions_conflict(
         | (RestoreAccess { did: did_a, .. }, SuspendCapability { did: did_b, .. })
         | (SuspendAccess { did: did_a, .. }, RestoreAccess { did: did_b, .. })
         | (RestoreAccess { did: did_a, .. }, SuspendAccess { did: did_b, .. })
-        | (MemberEject { did: did_a, .. }, RestoreAccess { did: did_b, .. })
-        | (RestoreAccess { did: did_a, .. }, MemberEject { did: did_b, .. })
+        | (RemoveMember { did: did_a, .. }, RestoreAccess { did: did_b, .. })
+        | (RestoreAccess { did: did_a, .. }, RemoveMember { did: did_b, .. })
         // ResetMember forces a group state reset — concurrent modifications
         // to the same member's access/membership state are unsafe (ADR-031 §7).
-        | (ResetMember { did: did_a, .. }, MemberEject { did: did_b, .. })
-        | (MemberEject { did: did_a, .. }, ResetMember { did: did_b, .. })
+        | (ResetMember { did: did_a, .. }, RemoveMember { did: did_b, .. })
+        | (RemoveMember { did: did_a, .. }, ResetMember { did: did_b, .. })
         | (ResetMember { did: did_a, .. }, ChangeRole { did: did_b, .. })
         | (ChangeRole { did: did_a, .. }, ResetMember { did: did_b, .. })
         | (ResetMember { did: did_a, .. }, SuspendCapability { did: did_b, .. })
@@ -2097,7 +2097,7 @@ mod tests {
                 did: bob(),
                 role: "member".to_owned(),
             },
-            GovernanceAction::MemberEject {
+            GovernanceAction::RemoveMember {
                 did: bob(),
                 reason: Some("inactive".to_owned()),
             },
@@ -2661,7 +2661,7 @@ mod tests {
                 did: DID::from("did:dht:z6MkDave"),
                 role: "member".to_owned(),
             },
-            GovernanceAction::MemberEject {
+            GovernanceAction::RemoveMember {
                 did: bob(),
                 reason: None,
             },

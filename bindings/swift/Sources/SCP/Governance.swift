@@ -10,7 +10,7 @@ import Foundation
 /// See `.docs/specs/05-contexts.md` section 5.9 and ADR-031.
 public enum GovernanceActionResult: String, Sendable {
     case memberAdded = "MemberAdded"
-    case memberEjected = "MemberEjected"
+    case memberRemoved = "MemberRemoved"
     case roleChanged = "RoleChanged"
     case toolRegistered = "ToolRegistered"
     case toolRemoved = "ToolRemoved"

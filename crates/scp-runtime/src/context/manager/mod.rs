@@ -295,7 +295,7 @@ pub enum GovernanceActionResult {
     /// A member was added to the context.
     MemberAdded,
     /// A member was ejected from the context (MLS removal).
-    MemberEjected,
+    MemberRemoved,
     /// A member's role was changed.
     RoleChanged,
     /// A tool was registered in the context.
@@ -479,7 +479,7 @@ pub struct ContextSnapshot {
     #[serde(default)]
     pub pending_economic_policy_change: Option<PendingEconomicPolicyChange>,
     /// Monotonic MLS epoch counter. Tracks epoch advances from membership-
-    /// mutating governance actions (`AddMember`, `Eject`,
+    /// mutating governance actions (`AddMember`, `RemoveMember`,
     /// `Revoke`, `ResetMember`).
     #[serde(default)]
     pub mls_epoch: u64,
@@ -822,7 +822,7 @@ impl GovernanceState {
 /// MLS epoch and reconnection state.
 struct EpochState {
     /// Monotonic MLS epoch counter. Incremented each time a governance action
-    /// triggers an MLS membership change (`AddMember`, `Eject`,
+    /// triggers an MLS membership change (`AddMember`, `RemoveMember`,
     /// `Revoke`, `ResetMember`). Used to populate
     /// `GovernanceActionExecuted.resulting_epoch` and
     /// `GovernanceContext.current_epoch`.

@@ -186,8 +186,8 @@ pub(super) fn enforce_triggered_consequences(
                         true
                     }
                     EnforcementSeverity::MemberRevoke { .. }
-                    | EnforcementSeverity::MemberEject { .. } => {
-                        // MemberRevoke and MemberEject should not reach the
+                    | EnforcementSeverity::RemoveMember { .. } => {
+                        // MemberRevoke and RemoveMember should not reach the
                         // consequence dispatch path without the opt-in flag.
                         // If they do, escalate to SuspendAccess as a safe
                         // fallback.
@@ -195,7 +195,7 @@ pub(super) fn enforce_triggered_consequences(
                             context_id,
                             member = %member_did,
                             severity = ?severity,
-                            "MemberRevoke/MemberEject reached consequence dispatch; \
+                            "MemberRevoke/RemoveMember reached consequence dispatch; \
                              this should have been rejected at validation time"
                         );
                         false
@@ -422,7 +422,7 @@ pub(super) fn event_log_entries_for_consequences(
 ///
 /// Composite gate combining independent eligibility signals:
 /// 1. **Pending removal** — defense-in-depth: members with an approved
-///    `MemberEject` proposal targeting them cannot submit new proposals.
+///    `RemoveMember` proposal targeting them cannot submit new proposals.
 /// 2. **Participation threshold** — members whose participation record
 ///    shows a net-negative governance ratio (more actions against than by)
 ///    are blocked. See [`scp_protocol::trust::participation::meets_threshold`].
@@ -441,7 +441,7 @@ fn check_proposer_eligibility(
 ) -> Result<(), ContextError> {
     // Check for pending ejection (existing defense-in-depth).
     for (proposal, _seq, _ts) in ctx.governance.approved_proposals.values() {
-        if let GovernanceAction::MemberEject { did, .. } = &proposal.action
+        if let GovernanceAction::RemoveMember { did, .. } = &proposal.action
             && did == proposer_did
         {
             return Err(ContextError::PermissionDenied(
@@ -659,7 +659,7 @@ impl ContextManager {
         context_id: &str,
         proposal: &GovernanceProposal,
     ) -> Result<(), ContextError> {
-        // For MLS-mutating actions (AddMember, Eject, Revoke,
+        // For MLS-mutating actions (AddMember, RemoveMember, Revoke,
         // ResetMember), increment the epoch counter, place the old epoch into
         // the grace store (§23.11), record the coordination in the
         // EpochCoordinator (ADR-031 §8, issue #630), and report the new epoch.
@@ -972,7 +972,7 @@ impl ContextManager {
             // SuspendCapability, SuspendAccess, MemberRevoke are handled above.
             // Remaining actions dispatched to context-level handler.
             GovernanceAction::AddMember { .. }
-            | GovernanceAction::MemberEject { .. }
+            | GovernanceAction::RemoveMember { .. }
             | GovernanceAction::ChangeRole { .. }
             | GovernanceAction::RegisterTool { .. }
             | GovernanceAction::RemoveTool { .. }
@@ -1019,9 +1019,10 @@ impl ContextManager {
                     .await?;
                 Ok(GovernanceActionResult::MemberAdded)
             }
-            GovernanceAction::MemberEject { did, .. } => {
-                self.execute_eject(context_id, did, pid, actor_did).await?;
-                Ok(GovernanceActionResult::MemberEjected)
+            GovernanceAction::RemoveMember { did, .. } => {
+                self.execute_remove_member(context_id, did, pid, actor_did)
+                    .await?;
+                Ok(GovernanceActionResult::MemberRemoved)
             }
             GovernanceAction::ChangeRole { did, new_role } => {
                 self.execute_change_role(context_id, did, new_role, pid, actor_did)
@@ -1205,7 +1206,7 @@ impl ContextManager {
             | GovernanceAction::ApproveSpend { .. }
             | GovernanceAction::LockEconomicPolicy
             | GovernanceAction::AddMember { .. }
-            | GovernanceAction::MemberEject { .. }
+            | GovernanceAction::RemoveMember { .. }
             | GovernanceAction::ChangeRole { .. }
             | GovernanceAction::RegisterTool { .. }
             | GovernanceAction::RemoveTool { .. }
@@ -2247,7 +2248,7 @@ impl ContextManager {
         Ok(())
     }
 
-    async fn execute_eject(
+    async fn execute_remove_member(
         &self,
         context_id: &str,
         did: &DID,

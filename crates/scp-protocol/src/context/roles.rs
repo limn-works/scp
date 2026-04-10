@@ -2980,7 +2980,7 @@ mod tests {
     // Regression tests — consequence enforcement is per-context opt-in and
     // app-level only (spec §7.3.7). A `SuspendAll` consequence MUST NOT
     // remove the target from the context membership set (that would be an
-    // `Eject` governance action, O(N), MLS-level) and MUST block every
+    // `RemoveMember` governance action, O(N), MLS-level) and MUST block every
     // capability including governance participation. These tests pin that
     // contract so a future refactor cannot accidentally escalate a
     // consequence-tier suspension into a membership-destroying action.
@@ -3035,7 +3035,7 @@ mod tests {
         assert!(
             state.members.contains("did:dht:alice"),
             "consequence SuspendAll must not remove the subject from members; \
-             that is an Eject governance action"
+             that is a RemoveMember governance action"
         );
 
         // Role-granted capability set: UNCHANGED. Suspension is an overlay
@@ -3111,7 +3111,7 @@ mod tests {
         // consequence, not a membership action).
         assert!(
             state.members.contains("did:dht:creator"),
-            "SuspendAll must preserve membership — that's what Eject is for"
+            "SuspendAll must preserve membership — that's what RemoveMember is for"
         );
     }
 }

@@ -618,8 +618,8 @@ fn is_mutual_removal(
     matches!(
         (a, b),
         (
-            GovernanceAction::MemberEject { did: did_a, .. },
-            GovernanceAction::MemberEject { did: did_b, .. },
+            GovernanceAction::RemoveMember { did: did_a, .. },
+            GovernanceAction::RemoveMember { did: did_b, .. },
         ) if did_a == b_proposer && did_b == a_proposer
     )
 }
@@ -839,7 +839,7 @@ mod tests {
 
     #[test]
     fn conflicting_remove_and_role_change_same_did() {
-        let remove = GovernanceAction::MemberEject {
+        let remove = GovernanceAction::RemoveMember {
             did: did("did:dht:alice"),
             reason: None,
         };
@@ -864,11 +864,11 @@ mod tests {
 
     #[test]
     fn conflicting_mutual_removal() {
-        let a = GovernanceAction::MemberEject {
+        let a = GovernanceAction::RemoveMember {
             did: did("did:dht:bob"),
             reason: None,
         };
-        let b = GovernanceAction::MemberEject {
+        let b = GovernanceAction::RemoveMember {
             did: did("did:dht:alice"),
             reason: None,
         };
@@ -882,11 +882,11 @@ mod tests {
 
     #[test]
     fn non_conflicting_removals_of_different_members() {
-        let a = GovernanceAction::MemberEject {
+        let a = GovernanceAction::RemoveMember {
             did: did("did:dht:carol"),
             reason: None,
         };
-        let b = GovernanceAction::MemberEject {
+        let b = GovernanceAction::RemoveMember {
             did: did("did:dht:dave"),
             reason: None,
         };
@@ -901,11 +901,11 @@ mod tests {
     #[test]
     fn conflicting_same_target_removal_by_different_proposers() {
         // Two different admins both propose to remove the same member.
-        let a = GovernanceAction::MemberEject {
+        let a = GovernanceAction::RemoveMember {
             did: did("did:dht:carol"),
             reason: Some("spam".to_owned()),
         };
-        let b = GovernanceAction::MemberEject {
+        let b = GovernanceAction::RemoveMember {
             did: did("did:dht:carol"),
             reason: Some("inactive".to_owned()),
         };
@@ -1321,7 +1321,7 @@ mod tests {
         let p1 = gov_proposal(
             1,
             "did:dht:alice",
-            GovernanceAction::MemberEject {
+            GovernanceAction::RemoveMember {
                 did: did("did:dht:bob"),
                 reason: None,
             },
@@ -1330,7 +1330,7 @@ mod tests {
         let p2 = gov_proposal(
             2,
             "did:dht:bob",
-            GovernanceAction::MemberEject {
+            GovernanceAction::RemoveMember {
                 did: did("did:dht:alice"),
                 reason: None,
             },
@@ -1357,7 +1357,7 @@ mod tests {
         let p1 = gov_proposal(
             1,
             "did:dht:alice",
-            GovernanceAction::MemberEject {
+            GovernanceAction::RemoveMember {
                 did: did("did:dht:bob"),
                 reason: None,
             },
@@ -1366,7 +1366,7 @@ mod tests {
         let p2 = gov_proposal(
             2,
             "did:dht:bob",
-            GovernanceAction::MemberEject {
+            GovernanceAction::RemoveMember {
                 did: did("did:dht:alice"),
                 reason: None,
             },
@@ -1384,7 +1384,7 @@ mod tests {
         let p1 = gov_proposal(
             1,
             "did:dht:alice",
-            GovernanceAction::MemberEject {
+            GovernanceAction::RemoveMember {
                 did: did("did:dht:bob"),
                 reason: None,
             },
@@ -1393,7 +1393,7 @@ mod tests {
         let p2 = gov_proposal(
             2,
             "did:dht:bob",
-            GovernanceAction::MemberEject {
+            GovernanceAction::RemoveMember {
                 did: did("did:dht:alice"),
                 reason: None,
             },
@@ -1420,7 +1420,7 @@ mod tests {
         let p1 = gov_proposal(
             1,
             "did:dht:alice",
-            GovernanceAction::MemberEject {
+            GovernanceAction::RemoveMember {
                 did: did("did:dht:bob"),
                 reason: None,
             },
@@ -1429,14 +1429,14 @@ mod tests {
         let p2 = gov_proposal(
             2,
             "did:dht:bob",
-            GovernanceAction::MemberEject {
+            GovernanceAction::RemoveMember {
                 did: did("did:dht:alice"),
                 reason: None,
             },
             7,
         );
         // p3 conflicts with p1: Alice removes Bob (p1) while Carol changes
-        // Bob's role (p3) — Eject vs ChangeRole on same DID.
+        // Bob's role (p3) — RemoveMember vs ChangeRole on same DID.
         let p3 = gov_proposal(
             3,
             "did:dht:carol",
@@ -1766,7 +1766,7 @@ mod tests {
         let p1 = gov_proposal(
             1,
             "did:dht:alice",
-            GovernanceAction::MemberEject {
+            GovernanceAction::RemoveMember {
                 did: did("did:dht:bob"),
                 reason: None,
             },
@@ -1775,7 +1775,7 @@ mod tests {
         let p2 = gov_proposal(
             2,
             "did:dht:bob",
-            GovernanceAction::MemberEject {
+            GovernanceAction::RemoveMember {
                 did: did("did:dht:alice"),
                 reason: None,
             },
@@ -1802,7 +1802,7 @@ mod tests {
         let p1 = gov_proposal(
             1,
             "did:dht:alice",
-            GovernanceAction::MemberEject {
+            GovernanceAction::RemoveMember {
                 did: did("did:dht:bob"),
                 reason: None,
             },
@@ -1811,7 +1811,7 @@ mod tests {
         let p2 = gov_proposal(
             2,
             "did:dht:bob",
-            GovernanceAction::MemberEject {
+            GovernanceAction::RemoveMember {
                 did: did("did:dht:alice"),
                 reason: None,
             },
@@ -2056,7 +2056,7 @@ mod tests {
         let p1 = gov_proposal(
             1,
             "did:dht:alice",
-            GovernanceAction::MemberEject {
+            GovernanceAction::RemoveMember {
                 did: did("did:dht:bob"),
                 reason: None,
             },
@@ -2065,7 +2065,7 @@ mod tests {
         let p2 = gov_proposal(
             2,
             "did:dht:bob",
-            GovernanceAction::MemberEject {
+            GovernanceAction::RemoveMember {
                 did: did("did:dht:alice"),
                 reason: None,
             },

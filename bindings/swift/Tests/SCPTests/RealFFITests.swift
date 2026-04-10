@@ -1287,7 +1287,7 @@ struct RealFFIUcanAndGovernanceTests {
     func ffiGovernanceActionResultVariants() {
         // Verify all 26 governance action variants are present
         let allCases: [GovernanceActionResult] = [
-            .memberAdded, .memberEjected, .roleChanged,
+            .memberAdded, .memberRemoved, .roleChanged,
             .toolRegistered, .toolRemoved, .ceilingModified,
             .contextClosed, .ttlExtended, .pruningPolicyModified,
             .adminTransferred, .signerAdded, .signerRemoved,

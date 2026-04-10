@@ -444,7 +444,7 @@ async fn unanimity_context_single_rejection_defeats_proposal() {
         ..ContextParams::default()
     };
 
-    // Add bob as member so we can test Eject doesn't happen.
+    // Add bob as member so we can test RemoveMember doesn't happen.
     let _handle = manager
         .create_context("ctx-unanimity".into(), params, alice.clone())
         .await
@@ -460,8 +460,8 @@ async fn unanimity_context_single_rejection_defeats_proposal() {
             .add_member(carol.clone(), "member".into(), vec![]);
     }
 
-    // Alice proposes Eject(bob).
-    let action = GovernanceAction::MemberEject {
+    // Alice proposes RemoveMember(bob).
+    let action = GovernanceAction::RemoveMember {
         did: bob.clone(),
         reason: Some("test removal".to_owned()),
     };
@@ -1900,12 +1900,12 @@ async fn governance_dispatch_returns_typed_results() {
         "AddMember should return MemberAdded, got: {result:?}"
     );
 
-    // Eject
+    // RemoveMember
     let proposal = GovernanceProposal {
         proposal_id: [11u8; 32],
         context_id: "typed-result-ctx".into(),
         proposer_did: "did:key:creator".into(),
-        action: GovernanceAction::MemberEject {
+        action: GovernanceAction::RemoveMember {
             did: "did:key:new".into(),
             reason: None,
         },
@@ -1926,8 +1926,8 @@ async fn governance_dispatch_returns_typed_results() {
         .await
         .unwrap();
     assert!(
-        matches!(result, GovernanceActionResult::MemberEjected),
-        "Eject should return MemberEjected, got: {result:?}"
+        matches!(result, GovernanceActionResult::MemberRemoved),
+        "RemoveMember should return MemberRemoved, got: {result:?}"
     );
 }
 
@@ -2448,7 +2448,7 @@ async fn scp274_single_admin_full_lifecycle() {
         .propose_governance_action_checked(
             &ctx_id,
             &admin_did,
-            GovernanceAction::MemberEject {
+            GovernanceAction::RemoveMember {
                 did: "did:key:target".into(),
                 reason: Some("test".into()),
             },
@@ -2509,7 +2509,7 @@ async fn scp274_threshold_full_lifecycle() {
         .propose_governance_action_checked(
             "scp274-thresh",
             &creator,
-            GovernanceAction::MemberEject {
+            GovernanceAction::RemoveMember {
                 did: "did:key:target".into(),
                 reason: None,
             },
@@ -2616,7 +2616,7 @@ async fn scp274_unanimity_full_lifecycle() {
         .propose_governance_action_checked(
             "scp274-unan",
             &creator,
-            GovernanceAction::MemberEject {
+            GovernanceAction::RemoveMember {
                 did: "did:key:target".into(),
                 reason: None,
             },
@@ -2670,7 +2670,7 @@ async fn scp274_rejected_proposal_does_not_execute() {
         .propose_governance_action_checked(
             "scp274-reject",
             &creator,
-            GovernanceAction::MemberEject {
+            GovernanceAction::RemoveMember {
                 did: "did:key:target".into(),
                 reason: None,
             },
@@ -2725,7 +2725,7 @@ async fn scp274_governance_events_in_log() {
         .propose_governance_action_checked(
             "scp274-events",
             &creator,
-            GovernanceAction::MemberEject {
+            GovernanceAction::RemoveMember {
                 did: "did:key:target".into(),
                 reason: None,
             },
@@ -2811,7 +2811,7 @@ async fn scp274_exercises_seven_action_variants() {
     let rm = approved_proposal(
         [101u8; 32],
         "scp274-7a",
-        GovernanceAction::MemberEject {
+        GovernanceAction::RemoveMember {
             did: "did:key:target".into(),
             reason: None,
         },
@@ -2822,7 +2822,7 @@ async fn scp274_exercises_seven_action_variants() {
             .execute_governance_action("scp274-7a", &rm)
             .await
             .is_ok(),
-        "Eject"
+        "RemoveMember"
     );
     let add2 = approved_proposal(
         [102u8; 32],
@@ -4406,8 +4406,8 @@ async fn mls_integration_epoch_coordinator_records_coordination() {
         .await
         .unwrap();
 
-    // Execute Eject — should record second coordination.
-    let action2 = super::GovernanceAction::MemberEject {
+    // Execute RemoveMember — should record second coordination.
+    let action2 = super::GovernanceAction::RemoveMember {
         did: "did:key:member-a".into(),
         reason: Some("done".to_owned()),
     };
@@ -4434,7 +4434,7 @@ async fn mls_integration_epoch_coordinator_records_coordination() {
         scp_protocol::context::governance::mls_integration::MlsOperation::AddMember { .. }
     ));
 
-    // Verify second record: epoch 1 → 2 for Eject.
+    // Verify second record: epoch 1 → 2 for RemoveMember.
     assert_eq!(records[1].epoch_before, 1);
     assert_eq!(records[1].epoch_after, 2);
     assert!(matches!(
@@ -4589,7 +4589,7 @@ async fn mls_integration_resolve_conflict_lifts_freeze() {
     let other_did: DID = "did:key:other-admin".into();
     let (manager, _handle) = setup_active_context().await;
 
-    // Build two conflicting proposals (mutual Eject — each
+    // Build two conflicting proposals (mutual RemoveMember — each
     // proposer removes the other, which is a canonical conflict per
     // ADR-031 §7).
     let proposal_a_id = [10u8; 32];
@@ -4599,7 +4599,7 @@ async fn mls_integration_resolve_conflict_lifts_freeze() {
         proposal_id: proposal_a_id,
         context_id: "test-ctx".to_owned(),
         proposer_did: admin_did.clone(),
-        action: super::GovernanceAction::MemberEject {
+        action: super::GovernanceAction::RemoveMember {
             did: other_did.clone(),
             reason: None,
         },
@@ -4614,7 +4614,7 @@ async fn mls_integration_resolve_conflict_lifts_freeze() {
         proposal_id: proposal_b_id,
         context_id: "test-ctx".to_owned(),
         proposer_did: other_did.clone(),
-        action: super::GovernanceAction::MemberEject {
+        action: super::GovernanceAction::RemoveMember {
             did: admin_did.clone(),
             reason: None,
         },
@@ -4965,7 +4965,7 @@ async fn migration_destination_has_migration_source_metadata() {
 
 // --- Batch 2 behavioral wiring tests ---
 
-/// Governance `Eject` calls `remove_member_sender_key` before
+/// Governance `RemoveMember` calls `remove_member_sender_key` before
 /// `remove_member` on the crypto provider.
 #[tokio::test]
 #[allow(clippy::too_many_lines)]
@@ -5100,7 +5100,7 @@ async fn test_remove_member_sender_key_before_mls_removal() {
     let rm = approved_proposal(
         [2u8; 32],
         "sk-order-ctx",
-        GovernanceAction::MemberEject {
+        GovernanceAction::RemoveMember {
             did: "did:key:target".into(),
             reason: None,
         },
@@ -5998,7 +5998,7 @@ async fn pending_removal_blocks_proposal() {
             proposal_id: [0u8; 32],
             context_id: "standing-ctx".to_owned(),
             proposer_did: admin.clone(),
-            action: GovernanceAction::MemberEject {
+            action: GovernanceAction::RemoveMember {
                 did: alice.clone(),
                 reason: Some("test".into()),
             },
@@ -6097,7 +6097,7 @@ async fn participation_blocks_low_score_proposer() {
             proposal_id: [1u8; 32],
             context_id: "standing-low-ctx".to_owned(),
             proposer_did: admin.clone(),
-            action: GovernanceAction::MemberEject {
+            action: GovernanceAction::RemoveMember {
                 did: alice.clone(),
                 reason: Some("standing test".into()),
             },
@@ -6279,7 +6279,7 @@ async fn sender_key_before_mls_removal_ordering() {
     call_order.lock().unwrap().clear();
 
     // Remove Alice via governance.
-    let action = scp_protocol::context::governance::GovernanceAction::MemberEject {
+    let action = scp_protocol::context::governance::GovernanceAction::RemoveMember {
         did: alice.clone(),
         reason: Some("ordering test".into()),
     };
@@ -6400,7 +6400,7 @@ async fn pending_removal_blocks_governance() {
             proposal_id: [2u8; 32],
             context_id: "reject-ctx".to_owned(),
             proposer_did: admin.clone(),
-            action: GovernanceAction::MemberEject {
+            action: GovernanceAction::RemoveMember {
                 did: target.clone(),
                 reason: Some("bad actor".into()),
             },
@@ -6939,7 +6939,7 @@ async fn remaining_members_keys_after_removal() {
     sk_removed_clone.lock().unwrap().clear();
 
     // Remove only Alice.
-    let action = scp_protocol::context::governance::GovernanceAction::MemberEject {
+    let action = scp_protocol::context::governance::GovernanceAction::RemoveMember {
         did: alice.clone(),
         reason: Some("selective removal".into()),
     };
@@ -9418,7 +9418,7 @@ async fn test_sender_key_removal_error_propagates() {
     manager.join_context(&handle, kp, None).await.unwrap();
 
     // Remove Alice — sender key removal will fail but MLS removal succeeds.
-    let action = scp_protocol::context::governance::GovernanceAction::MemberEject {
+    let action = scp_protocol::context::governance::GovernanceAction::RemoveMember {
         did: alice.clone(),
         reason: Some("error propagation test".into()),
     };
@@ -9463,7 +9463,7 @@ async fn test_remaining_members_unaffected_after_removal() {
     }
 
     // Remove Bob.
-    let action = scp_protocol::context::governance::GovernanceAction::MemberEject {
+    let action = scp_protocol::context::governance::GovernanceAction::RemoveMember {
         did: bob.clone(),
         reason: Some("test removal".into()),
     };
@@ -10174,7 +10174,7 @@ async fn rotate_sender_key_called_after_remove_member() {
     call_order.lock().unwrap().clear();
 
     // Remove Alice via governance.
-    let action = scp_protocol::context::governance::GovernanceAction::MemberEject {
+    let action = scp_protocol::context::governance::GovernanceAction::RemoveMember {
         did: alice.clone(),
         reason: Some("rotation test".into()),
     };
@@ -10245,7 +10245,7 @@ async fn rotate_sender_key_error_propagates() {
     // action succeeds. MLS removal (the hard security boundary) completes;
     // rotate_sender_key failure is logged as a warning but does not abort
     // the operation, avoiding inconsistent state.
-    let action = scp_protocol::context::governance::GovernanceAction::MemberEject {
+    let action = scp_protocol::context::governance::GovernanceAction::RemoveMember {
         did: alice.clone(),
         reason: Some("error test".into()),
     };
@@ -11109,7 +11109,7 @@ async fn rotate_sender_key_not_called_when_remove_member_fails() {
     call_order.lock().unwrap().clear();
 
     // Remove Alice via governance — should fail at remove_member.
-    let action = scp_protocol::context::governance::GovernanceAction::MemberEject {
+    let action = scp_protocol::context::governance::GovernanceAction::RemoveMember {
         did: alice.clone(),
         reason: Some("rotation skip test".into()),
     };
@@ -11272,8 +11272,8 @@ async fn governance_action_stores_actor_did() {
     };
     manager.join_context(&handle, kp, None).await.unwrap();
 
-    // Execute governance action: Eject.
-    let action = scp_protocol::context::governance::GovernanceAction::MemberEject {
+    // Execute governance action: RemoveMember.
+    let action = scp_protocol::context::governance::GovernanceAction::RemoveMember {
         did: target.clone(),
         reason: Some("actor_did test".into()),
     };
@@ -12553,7 +12553,7 @@ async fn consequence_fires_on_governance_action() {
     let _ = manager.drain_events("gov-csq-ctx").await;
 
     // Execute governance action: ban target.
-    let action = scp_protocol::context::governance::GovernanceAction::MemberEject {
+    let action = scp_protocol::context::governance::GovernanceAction::RemoveMember {
         did: target.clone(),
         reason: Some("consequence test".into()),
     };
@@ -12633,7 +12633,7 @@ async fn test_warning_count_trigger_fires_behavioral() {
     let _ = manager.drain_events("warn-ctx").await;
 
     // First governance action against target — threshold not yet met.
-    let action1 = scp_protocol::context::governance::GovernanceAction::MemberEject {
+    let action1 = scp_protocol::context::governance::GovernanceAction::RemoveMember {
         did: target.clone(),
         reason: Some("warning 1".into()),
     };
@@ -12659,7 +12659,7 @@ async fn test_warning_count_trigger_fires_behavioral() {
     let _ = manager.drain_events("warn-ctx").await;
 
     // Second governance action against target — threshold met.
-    let action2 = scp_protocol::context::governance::GovernanceAction::MemberEject {
+    let action2 = scp_protocol::context::governance::GovernanceAction::RemoveMember {
         did: target.clone(),
         reason: Some("warning 2".into()),
     };
@@ -12687,7 +12687,7 @@ async fn test_warning_count_trigger_fires_behavioral() {
 // §60c. Participation governance_actions_against populated
 // -----------------------------------------------------------------------
 
-/// Behavioral test: governance actions (e.g., `Eject`) executed via
+/// Behavioral test: governance actions (e.g., `RemoveMember`) executed via
 /// `propose_governance_action` create event log entries that populate
 /// `governance_actions_against` in participation records.
 #[tokio::test]
@@ -12720,7 +12720,7 @@ async fn test_participation_actions_against_populated() {
     manager.join_context(&handle, kp, None).await.unwrap();
 
     // Execute a governance action against the target.
-    let action = scp_protocol::context::governance::GovernanceAction::MemberEject {
+    let action = scp_protocol::context::governance::GovernanceAction::RemoveMember {
         did: target.clone(),
         reason: Some("test action".into()),
     };
@@ -13068,7 +13068,7 @@ async fn eligibility_check_uses_context_manager_clock() {
     manager.join_context(&handle, kp, None).await.unwrap();
 
     // Execute a governance action — verifies clock is used without panicking.
-    let action = scp_protocol::context::governance::GovernanceAction::MemberEject {
+    let action = scp_protocol::context::governance::GovernanceAction::RemoveMember {
         did: "did:key:member".into(),
         reason: Some("clock test".into()),
     };
@@ -14234,7 +14234,7 @@ async fn test_sender_key_failure_still_removes_from_mls() {
     call_order.lock().unwrap().clear();
 
     // Remove Alice — sender key fails but MLS succeeds.
-    let action = scp_protocol::context::governance::GovernanceAction::MemberEject {
+    let action = scp_protocol::context::governance::GovernanceAction::RemoveMember {
         did: alice.clone(),
         reason: Some("H9 test".into()),
     };
