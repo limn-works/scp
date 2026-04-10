@@ -35,9 +35,10 @@ pub(super) fn build_identity_assessment(
 /// overly long strings.
 fn validate_consequence_rules(
     rules: &[scp_protocol::trust::consequence::ConsequenceRule],
+    config: &scp_protocol::context::params::ConsequenceConfig,
 ) -> Result<(), ContextCreationError> {
     for rule in rules {
-        rule.validate().map_err(|e| {
+        rule.validate_against_config(config).map_err(|e| {
             ContextCreationError::CreationFailed(format!("consequence rule validation failed: {e}"))
         })?;
     }
@@ -243,14 +244,16 @@ impl ContextManager {
     ) -> Result<(), ContextError> {
         let (ctx_snapshot, broadcast_ctx) = self.load_persisted_context_state(context_id)?;
         self.restore_event_log_best_effort(context_id);
-        // M15: Validate consequence rules on restore — reject tampered rules
-        // with control characters or other invalid content.
+        // Validate consequence rules on restore — reject tampered
+        // rules. Uses validate_against_config to enforce the opt-in
+        // gate for MemberRevoke even on restore from persistence.
         for rule in &ctx_snapshot.consequence_rules {
-            rule.validate().map_err(|e| {
-                ContextError::MembershipFailed(format!(
-                    "consequence rule validation failed on restore: {e}"
-                ))
-            })?;
+            rule.validate_against_config(&ctx_snapshot.context_params.consequence_config)
+                .map_err(|e| {
+                    ContextError::MembershipFailed(format!(
+                        "consequence rule validation failed on restore: {e}"
+                    ))
+                })?;
         }
         let ttl_remaining = ctx_snapshot.ttl_remaining_secs;
         // Reconstruct the governance engine from the persisted snapshot.
@@ -762,13 +765,16 @@ impl ContextManager {
     ) -> Result<ContextHandle, ContextError> {
         // 1. Validate export.
         crate::context::export_import::validate_export_for_import(&export)?;
-        // M15: Validate consequence rules on import — reject tampered rules.
+        // Validate consequence rules on import — reject tampered
+        // rules. Uses validate_against_config to enforce the opt-in
+        // gate for MemberRevoke even on imported snapshots.
         for rule in &export.snapshot.consequence_rules {
-            rule.validate().map_err(|e| {
-                ContextError::MembershipFailed(format!(
-                    "consequence rule validation failed on import: {e}"
-                ))
-            })?;
+            rule.validate_against_config(&export.snapshot.context_params.consequence_config)
+                .map_err(|e| {
+                    ContextError::MembershipFailed(format!(
+                        "consequence rule validation failed on import: {e}"
+                    ))
+                })?;
         }
 
         let context_id = export.snapshot.context_id.clone();
@@ -1075,7 +1081,7 @@ impl ContextManager {
         // Defense-in-depth: verify creator's SDK version satisfies min_protocol_version.
         params.check_version_compatibility(scp_protocol::envelope::SCP_PROTOCOL_VERSION)?;
         validate_governance_model(&params.governance)?;
-        validate_consequence_rules(&params.consequence_rules)?;
+        validate_consequence_rules(&params.consequence_rules, &params.consequence_config)?;
         scp_protocol::economy::policy::validate_economic_policy_metrics(
             params.economic_policy.as_ref(),
         )

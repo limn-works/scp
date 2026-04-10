@@ -58,7 +58,7 @@ Every context declares a capability ceiling at creation: the maximum set of thin
 - **`bridging`** — bridge connector participation (§12)
 - **`tool:interface`** — cross-context tool interface exposure (§6.2)
 - **`context:child:create`** — creating child contexts (§5.13)
-- **`member:ban`** — governance-level member removal (ban/unban). Gates whether governance can execute `RevokeReadAccess` / `RestoreReadAccess` against members (§5.9). Without this capability in the ceiling, governance cannot ban members regardless of governance model.
+- **`member:ban`** — governance-level member removal (ban/unban). Gates whether governance can execute `MemberRevoke` / `RestoreAccess` against members (§5.9). Without this capability in the ceiling, governance cannot ban members regardless of governance model.
 
 Media capabilities (`media:*`) enable the delegated media transport model (§10.9.1) where the context establishes identity, trust, and governance while media flows over WebRTC/DTLS-SRTP. A context without media capabilities in its ceiling cannot initiate voice or video sessions regardless of participant roles.
 
@@ -385,10 +385,9 @@ The governance model is declared at creation and visible to all. Governance impl
 
 | Action | Effect | Scope |
 |--------|--------|-------|
-| `RevokeReadAccess { did, scope }` | Revoke decryption access to context content | `Full` (retroactive + future) or `FutureOnly` |
-| `RestoreReadAccess { did }` | Restore decryption access, forward-only | Future content only — historical gap permanent |
-| `RevokeWriteAccess { did, scope }` | Revoke publishing authority | `Full` (stop + suppress historical) or `FutureOnly` |
-| `RestoreWriteAccess { did }` | Restore publishing authority, forward-only | Future content only |
+| `MemberRevoke { did, access: Read }` | Revoke decryption access to context content | `Full` (retroactive + future) or `FutureOnly` via `AccessScope` |
+| `RestoreAccess { did, capabilities }` | Restore access, forward-only | Future content only — historical gap permanent |
+| `MemberRevoke { did, access: Write }` | Revoke publishing authority | `Full` or `FutureOnly` via `AccessScope` |
 | `RotateContentKeys { reason }` | Context-wide key rotation | All members, not DID-targeted |
 
 **Membership/access decoupling.** These actions do NOT remove the target from the context. A member with revoked read access remains a member for governance participation and presence but cannot decrypt content. Member states:
@@ -1517,18 +1516,18 @@ Author-level, cryptographic, pull-based — the same protocol as encrypted conte
 
 Blocking is per-author. Author A blocking a subscriber does not affect the subscriber's access to Author B's content.
 
-**Governance-level subscriber ban.** When the context's capability ceiling includes `member:ban` (§5.3), governance can execute `RevokeReadAccess` (§5.9, ADR-031) against broadcast subscribers. Unlike per-author blocking (which is unilateral and affects only one author's content), a governance ban removes the subscriber from the registry AND adds them to ALL authors' block lists simultaneously. All authors MUST rotate keys after a governance ban (mandatory `KeyEpochAdvance`). This mirrors `RevokeReadAccess` semantics in encrypted contexts (MLS group removal), adapted for broadcast's per-author key model.
+**Governance-level subscriber ban.** When the context's capability ceiling includes `member:ban` (§5.3), governance can execute `MemberRevoke { did, access: Read }` (§5.9, ADR-031) against broadcast subscribers. Unlike per-author blocking (which is unilateral and affects only one author's content), a governance ban removes the subscriber from the registry AND adds them to ALL authors' block lists simultaneously. All authors MUST rotate keys after a governance ban (mandatory `KeyEpochAdvance`). This mirrors `MemberRevoke` semantics in encrypted contexts (MLS group removal), adapted for broadcast's per-author key model.
 
 Governance ban lifecycle:
 
-1. Governance proposal: `RevokeReadAccess { did, scope }` — proposed via the standard governance flow (§5.9).
+1. Governance proposal: `MemberRevoke { did, access: Read }` — proposed via the standard governance flow (§5.9).
 2. Context manager verifies `member:ban` capability in ceiling — rejects with `PermissionDenied` if absent.
 3. On approval: subscriber removed from registry, added to all authors' block lists.
 4. All authors rotate keys — mandatory `KeyEpochAdvance` per author.
 5. `ReadAccessRevoked` event emitted to event log.
 6. Future `handle_key_request` from banned subscriber returns `Deny` for all authors.
 
-`RestoreReadAccess { did }` reverses the ban: subscriber removed from all authors' block lists, but NOT re-registered (they must re-register manually). No key rotation on restore (forward-only — unban grants future access, the registration gap is permanent). `ReadAccessRestored` event emitted.
+`RestoreAccess { did, capabilities }` reverses the ban: subscriber removed from all authors' block lists, but NOT re-registered (they must re-register manually). No key rotation on restore (forward-only — unban grants future access, the registration gap is permanent). `ReadAccessRestored` event emitted.
 
 Default template configuration: encrypted templates include `member:ban` in their ceiling by default (§5.12.1); broadcast templates do not. Broadcast contexts can add `member:ban` via explicit `ContextParams` at creation or via `ModifyCeiling` governance action if `CeilingPolicy::Governed`.
 
