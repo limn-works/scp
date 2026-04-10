@@ -952,11 +952,11 @@ mod tests {
 
     #[test]
     fn conflicting_revoke_same_did() {
-        let a = GovernanceAction::MemberRevoke {
+        let a = GovernanceAction::RevokeAccess {
             did: did("did:dht:alice"),
             access: AccessScope::Read,
         };
-        let b = GovernanceAction::MemberRevoke {
+        let b = GovernanceAction::RevokeAccess {
             did: did("did:dht:alice"),
             access: AccessScope::Write,
         };
@@ -970,11 +970,11 @@ mod tests {
 
     #[test]
     fn non_conflicting_revoke_different_dids() {
-        let a = GovernanceAction::MemberRevoke {
+        let a = GovernanceAction::RevokeAccess {
             did: did("did:dht:alice"),
             access: AccessScope::Both,
         };
-        let b = GovernanceAction::MemberRevoke {
+        let b = GovernanceAction::RevokeAccess {
             did: did("did:dht:bob"),
             access: AccessScope::Both,
         };
@@ -989,7 +989,7 @@ mod tests {
     #[test]
     fn conflicting_revoke_and_restore_access_same_did() {
         use crate::context::params::Capability;
-        let revoke = GovernanceAction::MemberRevoke {
+        let revoke = GovernanceAction::RevokeAccess {
             did: did("did:dht:alice"),
             access: AccessScope::Both,
         };
@@ -1016,7 +1016,7 @@ mod tests {
     #[test]
     fn non_conflicting_revoke_and_restore_access_different_dids() {
         use crate::context::params::Capability;
-        let revoke = GovernanceAction::MemberRevoke {
+        let revoke = GovernanceAction::RevokeAccess {
             did: did("did:dht:alice"),
             access: AccessScope::Write,
         };

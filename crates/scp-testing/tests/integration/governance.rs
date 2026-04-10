@@ -175,7 +175,7 @@ fn all_governance_actions_for_test() -> Vec<GovernanceAction> {
         GovernanceAction::CreateChildContext {
             params: Box::new(ContextParams::default()),
         },
-        GovernanceAction::MemberRevoke {
+        GovernanceAction::RevokeAccess {
             did: bob(),
             access: AccessScope::Read,
         },
@@ -204,7 +204,7 @@ fn all_governance_actions_for_test() -> Vec<GovernanceAction> {
             },
         },
         GovernanceAction::PromoteContext,
-        GovernanceAction::MemberRevoke {
+        GovernanceAction::RevokeAccess {
             did: bob(),
             access: AccessScope::Write,
         },
@@ -878,7 +878,7 @@ async fn conflict_detection() {
     );
 
     // Revoke (read) vs RestoreAccess (read).
-    let revoke = GovernanceAction::MemberRevoke {
+    let revoke = GovernanceAction::RevokeAccess {
         did: bob(),
         access: AccessScope::Read,
     };
@@ -892,7 +892,7 @@ async fn conflict_detection() {
     );
 
     // Revoke (write) vs RestoreAccess (write).
-    let revoke_w = GovernanceAction::MemberRevoke {
+    let revoke_w = GovernanceAction::RevokeAccess {
         did: bob(),
         access: AccessScope::Write,
     };
@@ -1070,7 +1070,7 @@ async fn revocation_scope_variants() {
     assert_ne!(read, both);
 
     // Revoke with Read scope.
-    let action_read = GovernanceAction::MemberRevoke {
+    let action_read = GovernanceAction::RevokeAccess {
         did: bob(),
         access: AccessScope::Read,
     };
@@ -1083,7 +1083,7 @@ async fn revocation_scope_variants() {
     );
 
     // Revoke with Write scope.
-    let action_write = GovernanceAction::MemberRevoke {
+    let action_write = GovernanceAction::RevokeAccess {
         did: bob(),
         access: AccessScope::Write,
     };
@@ -1096,11 +1096,11 @@ async fn revocation_scope_variants() {
     );
 
     // Conflicting scopes on same DID.
-    let revoke_both = GovernanceAction::MemberRevoke {
+    let revoke_both = GovernanceAction::RevokeAccess {
         did: bob(),
         access: AccessScope::Both,
     };
-    let revoke_write = GovernanceAction::MemberRevoke {
+    let revoke_write = GovernanceAction::RevokeAccess {
         did: bob(),
         access: AccessScope::Write,
     };

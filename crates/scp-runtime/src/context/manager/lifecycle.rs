@@ -246,7 +246,7 @@ impl ContextManager {
         self.restore_event_log_best_effort(context_id);
         // Validate consequence rules on restore — reject tampered
         // rules. Uses validate_against_config to enforce the opt-in
-        // gate for MemberRevoke even on restore from persistence.
+        // gate for RevokeAccess even on restore from persistence.
         for rule in &ctx_snapshot.consequence_rules {
             rule.validate_against_config(&ctx_snapshot.context_params.consequence_config)
                 .map_err(|e| {
@@ -767,7 +767,7 @@ impl ContextManager {
         crate::context::export_import::validate_export_for_import(&export)?;
         // Validate consequence rules on import — reject tampered
         // rules. Uses validate_against_config to enforce the opt-in
-        // gate for MemberRevoke even on imported snapshots.
+        // gate for RevokeAccess even on imported snapshots.
         for rule in &export.snapshot.consequence_rules {
             rule.validate_against_config(&export.snapshot.context_params.consequence_config)
                 .map_err(|e| {

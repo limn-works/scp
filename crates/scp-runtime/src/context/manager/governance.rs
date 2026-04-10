@@ -185,9 +185,9 @@ pub(super) fn enforce_triggered_consequences(
                         ctx.role_state.suspend_all(member_did.as_ref());
                         true
                     }
-                    EnforcementSeverity::MemberRevoke { .. }
+                    EnforcementSeverity::RevokeAccess { .. }
                     | EnforcementSeverity::RemoveMember { .. } => {
-                        // MemberRevoke and RemoveMember should not reach the
+                        // RevokeAccess and RemoveMember should not reach the
                         // consequence dispatch path without the opt-in flag.
                         // If they do, escalate to SuspendAccess as a safe
                         // fallback.
@@ -195,7 +195,7 @@ pub(super) fn enforce_triggered_consequences(
                             context_id,
                             member = %member_did,
                             severity = ?severity,
-                            "MemberRevoke/RemoveMember reached consequence dispatch; \
+                            "RevokeAccess/RemoveMember reached consequence dispatch; \
                              this should have been rejected at validation time"
                         );
                         false
@@ -907,7 +907,7 @@ impl ContextManager {
                 )?;
                 Ok(GovernanceActionResult::Executed)
             }
-            GovernanceAction::MemberRevoke { did, access } => {
+            GovernanceAction::RevokeAccess { did, access } => {
                 let r = self
                     .execute_revoke(context_id, did, *access, pid, actor)
                     .await?;
@@ -969,7 +969,7 @@ impl ContextManager {
                     .await?;
                 Ok(GovernanceActionResult::Executed)
             }
-            // SuspendCapability, SuspendAccess, MemberRevoke are handled above.
+            // SuspendCapability, SuspendAccess, RevokeAccess are handled above.
             // Remaining actions dispatched to context-level handler.
             GovernanceAction::AddMember { .. }
             | GovernanceAction::RemoveMember { .. }
@@ -1108,7 +1108,7 @@ impl ContextManager {
             | GovernanceAction::ExtendTtl { .. }
             | GovernanceAction::SuspendCapability { .. }
             | GovernanceAction::SuspendAccess { .. }
-            | GovernanceAction::MemberRevoke { .. }
+            | GovernanceAction::RevokeAccess { .. }
             | GovernanceAction::RestoreAccess { .. }
             | GovernanceAction::SetEconomicPolicy { .. }
             | GovernanceAction::ApproveSpend { .. }
@@ -1200,7 +1200,7 @@ impl ContextManager {
             | GovernanceAction::ExtendTtl { .. }
             | GovernanceAction::SuspendCapability { .. }
             | GovernanceAction::SuspendAccess { .. }
-            | GovernanceAction::MemberRevoke { .. }
+            | GovernanceAction::RevokeAccess { .. }
             | GovernanceAction::RestoreAccess { .. }
             | GovernanceAction::SetEconomicPolicy { .. }
             | GovernanceAction::ApproveSpend { .. }

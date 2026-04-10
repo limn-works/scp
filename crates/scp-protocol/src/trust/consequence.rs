@@ -118,7 +118,7 @@ pub enum ConsequenceTrigger {
 /// 2. [`SuspendAccess`](Self::SuspendAccess) — application-level block on
 ///    the member's full capability set. Member keeps keys, remains in the
 ///    group.
-/// 3. [`MemberRevoke`](Self::MemberRevoke) — cryptographic revocation: access
+/// 3. [`RevokeAccess`](Self::RevokeAccess) — cryptographic revocation: access
 ///    keys are destroyed, the member is added to an exclusion list. The
 ///    member remains in MLS for auditability but cannot read or write in the
 ///    specified [`AccessScope`].
@@ -138,8 +138,8 @@ pub enum ConsequenceTrigger {
 ///
 /// - `SuspendCapability`, `SuspendAccess` — always allowed. These are pure
 ///   application-level suspensions with no cryptographic side effects.
-/// - `MemberRevoke` — allowed **only** when the context's
-///   [`ConsequenceConfig::allow_automatic_member_revoke`] is `true`
+/// - `RevokeAccess` — allowed **only** when the context's
+///   [`ConsequenceConfig::allow_automatic_access_revocation`] is `true`
 ///   ([`ContextParams.consequence_config`](crate::context::params::ContextParams::consequence_config)).
 ///   Defaults to `false`: cryptographic revocation is governance-only unless
 ///   the context explicitly opts in at creation time.
@@ -174,7 +174,7 @@ pub enum EnforcementSeverity {
     ///
     /// This blocks read and write at the `send_message` / `deliver_incoming`
     /// gates but does **not** perform cryptographic exclusion. For full
-    /// cryptographic exclusion, escalate to [`MemberRevoke`](Self::MemberRevoke).
+    /// cryptographic exclusion, escalate to [`RevokeAccess`](Self::RevokeAccess).
     SuspendAccess,
 
     /// Cryptographic revocation — destroy the subject's access keys and add
@@ -192,9 +192,9 @@ pub enum EnforcementSeverity {
     /// auditability.
     ///
     /// **Cannot be referenced by a consequence rule** unless the
-    /// context's [`ConsequenceConfig::allow_automatic_member_revoke`] is
+    /// context's [`ConsequenceConfig::allow_automatic_access_revocation`] is
     /// explicitly set to `true` at context creation time.
-    MemberRevoke {
+    RevokeAccess {
         /// DID of the member whose access is being cryptographically
         /// revoked.
         did: DID,
@@ -226,7 +226,7 @@ impl EnforcementSeverity {
         match self {
             Self::SuspendCapability { .. } => "SuspendCapability",
             Self::SuspendAccess => "SuspendAccess",
-            Self::MemberRevoke { .. } => "MemberRevoke",
+            Self::RevokeAccess { .. } => "RevokeAccess",
             Self::RemoveMember { .. } => "RemoveMember",
         }
     }
@@ -236,29 +236,29 @@ impl EnforcementSeverity {
     /// Consequence-dispatch severities ([`SuspendCapability`](Self::SuspendCapability),
     /// [`SuspendAccess`](Self::SuspendAccess)) do not carry a DID — the subject
     /// is derived from the rule-evaluation context. Governance-targeting
-    /// severities ([`MemberRevoke`](Self::MemberRevoke),
+    /// severities ([`RevokeAccess`](Self::RevokeAccess),
     /// [`RemoveMember`](Self::RemoveMember)) carry the explicit target.
     #[must_use]
     pub const fn target_did(&self) -> Option<&DID> {
         match self {
-            Self::MemberRevoke { did, .. } | Self::RemoveMember { did, .. } => Some(did),
+            Self::RevokeAccess { did, .. } | Self::RemoveMember { did, .. } => Some(did),
             Self::SuspendCapability { .. } | Self::SuspendAccess => None,
         }
     }
 
     /// Returns `true` if this severity may be referenced by an automatic
-    /// consequence rule under the given `allow_automatic_member_revoke`
+    /// consequence rule under the given `allow_automatic_access_revocation`
     /// opt-in.
     ///
     /// - `SuspendCapability`, `SuspendAccess` — always allowed.
-    /// - `MemberRevoke` — allowed only when `allow_automatic_member_revoke`
+    /// - `RevokeAccess` — allowed only when `allow_automatic_access_revocation`
     ///   is `true`.
     /// - `RemoveMember` — never allowed in consequence rules; governance-only.
     #[must_use]
-    pub const fn is_consequence_eligible(&self, allow_automatic_member_revoke: bool) -> bool {
+    pub const fn is_consequence_eligible(&self, allow_automatic_access_revocation: bool) -> bool {
         match self {
             Self::SuspendCapability { .. } | Self::SuspendAccess => true,
-            Self::MemberRevoke { .. } => allow_automatic_member_revoke,
+            Self::RevokeAccess { .. } => allow_automatic_access_revocation,
             Self::RemoveMember { .. } => false,
         }
     }
@@ -291,7 +291,7 @@ pub enum ConsequenceAction {
     /// The severity's [`is_consequence_eligible`](EnforcementSeverity::is_consequence_eligible)
     /// gate MUST be checked by [`ConsequenceRule::validate`] against the
     /// context's
-    /// [`ConsequenceConfig::allow_automatic_member_revoke`](crate::context::params::ConsequenceConfig::allow_automatic_member_revoke)
+    /// [`ConsequenceConfig::allow_automatic_access_revocation`](crate::context::params::ConsequenceConfig::allow_automatic_access_revocation)
     /// before the rule is accepted.
     Enforcement(EnforcementSeverity),
 
@@ -341,8 +341,8 @@ impl ConsequenceRule {
     /// - `Custom(key)`: key with control/HTML chars or length > 256
     /// - `Enforcement(SuspendCapability { capabilities })`: empty or
     ///   duplicated capability set, or more than 32 capabilities
-    /// - `Enforcement(MemberRevoke { .. })`: unless the context's
-    ///   `allow_automatic_member_revoke` flag is `true` (checked via
+    /// - `Enforcement(RevokeAccess { .. })`: unless the context's
+    ///   `allow_automatic_access_revocation` flag is `true` (checked via
     ///   [`validate_against_config`](Self::validate_against_config))
     /// - `Enforcement(RemoveMember { .. })`: always rejected — MLS ejection
     ///   is governance-only
@@ -359,7 +359,7 @@ impl ConsequenceRule {
     /// its maximum length, exceeds capability count limits, or references
     /// `RemoveMember` (which is always rejected regardless of config).
     ///
-    /// `MemberRevoke` is accepted here and rejected later by
+    /// `RevokeAccess` is accepted here and rejected later by
     /// [`validate_against_config`](Self::validate_against_config) when the
     /// context's opt-in flag is `false`. Callers that do not have access to
     /// a [`ConsequenceConfig`](crate::context::params::ConsequenceConfig) MUST
@@ -410,8 +410,8 @@ impl ConsequenceRule {
     ///
     /// Performs all checks of [`validate`](Self::validate) plus:
     ///
-    /// - `Enforcement(MemberRevoke { .. })` is rejected unless
-    ///   [`ConsequenceConfig::allow_automatic_member_revoke`](crate::context::params::ConsequenceConfig::allow_automatic_member_revoke)
+    /// - `Enforcement(RevokeAccess { .. })` is rejected unless
+    ///   [`ConsequenceConfig::allow_automatic_access_revocation`](crate::context::params::ConsequenceConfig::allow_automatic_access_revocation)
     ///   is `true`.
     ///
     /// Call this in `ContextParams` validation and at any FFI boundary that
@@ -428,12 +428,12 @@ impl ConsequenceRule {
     ) -> Result<(), ConsequenceValidationError> {
         self.validate()?;
         if let ConsequenceAction::Enforcement(severity) = &self.action
-            && !severity.is_consequence_eligible(config.allow_automatic_member_revoke)
+            && !severity.is_consequence_eligible(config.allow_automatic_access_revocation)
         {
             return Err(ConsequenceValidationError(format!(
                 "{} severity is not eligible for automatic consequence dispatch in this \
-                 context; set ContextParams.consequence_config.allow_automatic_member_revoke = \
-                 true to permit MemberRevoke in consequence rules, or use a governance \
+                 context; set ContextParams.consequence_config.allow_automatic_access_revocation = \
+                 true to permit RevokeAccess in consequence rules, or use a governance \
                  proposal for one-off enforcement",
                 severity.variant_name()
             )));
@@ -450,7 +450,7 @@ impl ConsequenceRule {
 /// - `SuspendCapability`: empty set, duplicates, or > `MAX_CAPABILITY_SUSPENSION_COUNT`
 ///   capabilities are all rejected.
 /// - `SuspendAccess`: no fields, always passes shape validation.
-/// - `MemberRevoke`: the embedded DID must be non-empty.
+/// - `RevokeAccess`: the embedded DID must be non-empty.
 /// - `RemoveMember`: reason length check is performed when present; note
 ///   that [`ConsequenceRule::validate`] rejects `RemoveMember` outright
 ///   regardless of shape.
@@ -508,10 +508,10 @@ fn validate_severity_shape(
             }
         }
         EnforcementSeverity::SuspendAccess => { /* no fields */ }
-        EnforcementSeverity::MemberRevoke { did, .. } => {
+        EnforcementSeverity::RevokeAccess { did, .. } => {
             if did.0.is_empty() {
                 return Err(ConsequenceValidationError(
-                    "MemberRevoke.did must not be empty".to_owned(),
+                    "RevokeAccess.did must not be empty".to_owned(),
                 ));
             }
         }
@@ -1079,7 +1079,7 @@ mod tests {
                 capabilities: vec![Capability::MessagesWrite, Capability::GovernanceVote],
             },
             EnforcementSeverity::SuspendAccess,
-            EnforcementSeverity::MemberRevoke {
+            EnforcementSeverity::RevokeAccess {
                 did: DID("did:key:alice".to_owned()),
                 access: AccessScope::Both,
             },
@@ -1399,7 +1399,7 @@ mod tests {
     #[test]
     fn severity_target_did_is_some_for_governance_variants() {
         use crate::context::governance::AccessScope;
-        let rev = EnforcementSeverity::MemberRevoke {
+        let rev = EnforcementSeverity::RevokeAccess {
             did: DID("did:key:alice".to_owned()),
             access: AccessScope::Write,
         };
@@ -1427,12 +1427,12 @@ mod tests {
             "SuspendAccess"
         );
         assert_eq!(
-            EnforcementSeverity::MemberRevoke {
+            EnforcementSeverity::RevokeAccess {
                 did: DID("did:key:alice".to_owned()),
                 access: AccessScope::Read,
             }
             .variant_name(),
-            "MemberRevoke"
+            "RevokeAccess"
         );
         assert_eq!(
             EnforcementSeverity::RemoveMember {
@@ -1445,7 +1445,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // B3: per-context opt-in for MemberRevoke / always reject RemoveMember
+    // B3: per-context opt-in for RevokeAccess / always reject RemoveMember
     // -----------------------------------------------------------------------
 
     #[test]
@@ -1467,42 +1467,44 @@ mod tests {
 
         // Also rejected under validate_against_config regardless of opt-in.
         let opt_in = ConsequenceConfig {
-            allow_automatic_member_revoke: true,
+            allow_automatic_access_revocation: true,
         };
         assert!(rule.validate_against_config(&opt_in).is_err());
     }
 
     #[test]
-    fn default_config_rejects_member_revoke_consequence() {
+    fn default_config_rejects_revoke_access_consequence() {
         use crate::context::governance::AccessScope;
         let rule = ConsequenceRule {
             trigger: ConsequenceTrigger::MessageVelocity,
-            action: ConsequenceAction::Enforcement(EnforcementSeverity::MemberRevoke {
+            action: ConsequenceAction::Enforcement(EnforcementSeverity::RevokeAccess {
                 did: DID("did:key:alice".to_owned()),
                 access: AccessScope::Both,
             }),
             threshold: 1,
             window: Duration::from_secs(60),
         };
-        // Shape-level validate() passes (MemberRevoke is well-formed).
+        // Shape-level validate() passes (RevokeAccess is well-formed).
         assert!(rule.validate().is_ok());
         // But validate_against_config() with default (opt-in false) rejects.
         let default_config = ConsequenceConfig::default();
-        assert!(!default_config.allow_automatic_member_revoke);
+        assert!(!default_config.allow_automatic_access_revocation);
         let err = rule.validate_against_config(&default_config).unwrap_err();
         assert!(
-            err.to_string().contains("MemberRevoke")
-                && err.to_string().contains("allow_automatic_member_revoke"),
+            err.to_string().contains("RevokeAccess")
+                && err
+                    .to_string()
+                    .contains("allow_automatic_access_revocation"),
             "error should mention the opt-in flag, got: {err}"
         );
     }
 
     #[test]
-    fn opt_in_config_accepts_member_revoke_consequence() {
+    fn opt_in_config_accepts_revoke_access_consequence() {
         use crate::context::governance::AccessScope;
         let rule = ConsequenceRule {
             trigger: ConsequenceTrigger::MessageVelocity,
-            action: ConsequenceAction::Enforcement(EnforcementSeverity::MemberRevoke {
+            action: ConsequenceAction::Enforcement(EnforcementSeverity::RevokeAccess {
                 did: DID("did:key:alice".to_owned()),
                 access: AccessScope::Write,
             }),
@@ -1510,7 +1512,7 @@ mod tests {
             window: Duration::from_secs(60),
         };
         let opt_in = ConsequenceConfig {
-            allow_automatic_member_revoke: true,
+            allow_automatic_access_revocation: true,
         };
         assert!(rule.validate_against_config(&opt_in).is_ok());
     }
@@ -1518,7 +1520,7 @@ mod tests {
     #[test]
     fn opt_in_config_accepts_standard_severities() {
         let opt_in = ConsequenceConfig {
-            allow_automatic_member_revoke: true,
+            allow_automatic_access_revocation: true,
         };
         let rule = ConsequenceRule {
             trigger: ConsequenceTrigger::MessageVelocity,
@@ -1555,8 +1557,8 @@ mod tests {
         );
         assert!(EnforcementSeverity::SuspendAccess.is_consequence_eligible(false));
         assert!(EnforcementSeverity::SuspendAccess.is_consequence_eligible(true));
-        // MemberRevoke gated on the flag.
-        let rev = EnforcementSeverity::MemberRevoke {
+        // RevokeAccess gated on the flag.
+        let rev = EnforcementSeverity::RevokeAccess {
             did: DID("did:key:alice".to_owned()),
             access: AccessScope::Both,
         };

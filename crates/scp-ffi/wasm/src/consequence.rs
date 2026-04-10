@@ -161,7 +161,7 @@ fn enforce_triggered(
                     apply_suspend(ctx, subject_did, capabilities)
                 }
                 EnforcementSeverity::SuspendAccess => apply_suspend_all(ctx, subject_did),
-                EnforcementSeverity::MemberRevoke { .. }
+                EnforcementSeverity::RevokeAccess { .. }
                 | EnforcementSeverity::RemoveMember { .. } => {
                     // Cryptographic tiers should not reach consequence dispatch
                     // without the opt-in flag. Log error and fail (escalation
@@ -291,7 +291,7 @@ fn apply_assign_role(ctx: &mut PerContextState, subject_did: &str, to_role: &str
 // panics on native. Where timestamps matter (event log entries, `now_secs`
 // for cooldown math) the test supplies them explicitly.
 //
-// **Variants not covered**: `ConsequenceAction::{MemberRevoke, RemoveMember}` do not exist.
+// **Variants not covered**: `ConsequenceAction::{RevokeAccess, RemoveMember}` do not exist.
 // The WASM consequence model (shared with scp-protocol) exposes only
 // `Suspend`, `SuspendAll`, and `AssignRole` as consequence-triggerable
 // actions. Cryptographic key destruction and MLS ejection are

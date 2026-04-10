@@ -795,7 +795,7 @@ The `BlobStorage` instance is shared between the relay server and the projection
 
 Keys are retained per epoch for the blob TTL window. When a key epoch advances, the previous epoch's key remains available to decrypt blobs published under the old epoch until those blobs expire.
 
-**Governance-ban key purge.** When a governance-level subscriber ban (§5.14.8) triggers key rotation via `MemberRevoke { access: Read }`, the projection registry must be updated to reflect the new key epoch(s). The SDK method `propagate_ban_keys()` (§18.11.8) handles this:
+**Governance-ban key purge.** When a governance-level subscriber ban (§5.14.8) triggers key rotation via `RevokeAccess { access: Read }`, the projection registry must be updated to reflect the new key epoch(s). The SDK method `propagate_ban_keys()` (§18.11.8) handles this:
 
 1. For each rotated author, the new post-rotation key is inserted into the `ProjectedContext` key registry.
 2. If the ban's `AccessScope` is `Both`, all pre-ban epoch keys are **purged** from the registry via `retain_only_epochs()`. This ensures historical content encrypted under pre-ban keys is no longer decryptable by the projection endpoint — messages referencing purged epochs return 410 Gone (§18.11.4) on per-message requests and are silently omitted from feed responses (§18.11.3).

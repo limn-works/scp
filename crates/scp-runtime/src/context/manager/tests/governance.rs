@@ -2915,7 +2915,7 @@ async fn scp274_exercises_seven_action_variants() {
     let revoke = approved_proposal(
         [107u8; 32],
         "scp274-7b",
-        GovernanceAction::MemberRevoke {
+        GovernanceAction::RevokeAccess {
             did: "did:key:signer".into(),
             access: super::AccessScope::Write,
         },
@@ -2931,7 +2931,7 @@ async fn scp274_exercises_seven_action_variants() {
     let revoke_r = approved_proposal(
         [108u8; 32],
         "scp274-7b",
-        GovernanceAction::MemberRevoke {
+        GovernanceAction::RevokeAccess {
             did: "did:key:signer".into(),
             access: super::AccessScope::Both,
         },
