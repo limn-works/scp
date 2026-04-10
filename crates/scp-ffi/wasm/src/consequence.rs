@@ -238,23 +238,16 @@ fn apply_suspend(
 /// we iterate the candidate capabilities and keep the ones
 /// `member_has_capability` would grant.
 fn apply_suspend_all(ctx: &mut PerContextState, subject_did: &str) -> bool {
-    // Candidate capability set: all strings WASM's `member_has_capability`
-    // may grant across roles. Kept as a fixed list (matching the hardcoded
-    // role-to-capability table in `PerContextState::member_has_capability`)
-    // so this function does not silently miss new capabilities when they're
-    // added to the resolver.
-    const CANDIDATE_CAPABILITIES: &[&str] = &[
-        "messages:read",
-        "messages:write",
-        "tool_invoke:*",
-        "member:remove",
-        "governance:propose",
-    ];
-
+    // Suspend every capability the context's ceiling grants. This
+    // matches the runtime's `ContextRoleState::suspend_all` which
+    // copies the member's full effective set into the suspended set.
+    // Using the ceiling (not a hardcoded list) ensures no capability
+    // is silently missed when new variants are added.
+    let all_capabilities: Vec<String> = ctx.ceiling_strings_pub().iter().cloned().collect();
     let mut applied = false;
-    for cap in CANDIDATE_CAPABILITIES {
+    for cap in &all_capabilities {
         if ctx.member_has_capability_pub(subject_did, cap) {
-            ctx.suspended_capabilities_insert(subject_did, (*cap).to_owned());
+            ctx.suspended_capabilities_insert(subject_did, cap.clone());
             applied = true;
         }
     }

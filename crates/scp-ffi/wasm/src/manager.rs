@@ -558,6 +558,11 @@ impl PerContextState {
         self.cooldown_until.insert(rule_index, until_secs);
     }
 
+    /// Returns a reference to the context's capability ceiling strings.
+    pub(crate) fn ceiling_strings_pub(&self) -> &HashSet<String> {
+        &self.ceiling_strings
+    }
+
     // ---- Test-only helpers (compiled away in release builds) -------------
     //
     // These expose a minimal subset of the private internals needed by the
@@ -2750,19 +2755,14 @@ impl WasmContextManager {
             GovernanceAction::SuspendAccess { did } => {
                 let did_str: &str = did;
                 let ctx = self.require_active_context_mut(context_id)?;
-                // Suspend ALL capabilities for the member.
-                let all_caps: Vec<String> = vec![
-                    "messages:read".to_owned(),
-                    "messages:write".to_owned(),
-                    "tool_invoke:*".to_owned(),
-                    "member:remove".to_owned(),
-                    "governance:propose".to_owned(),
-                ];
+                // Suspend every capability in the context's ceiling,
+                // matching runtime's `suspend_all` semantics.
+                let all_capabilities: Vec<String> = ctx.ceiling_strings.iter().cloned().collect();
                 let entry = ctx
                     .suspended_capabilities
                     .entry(did_str.to_owned())
                     .or_default();
-                for cap in &all_caps {
+                for cap in &all_capabilities {
                     entry.insert(cap.clone());
                 }
                 ctx.push_event(ContextEvent::CapabilitiesSuspended {
