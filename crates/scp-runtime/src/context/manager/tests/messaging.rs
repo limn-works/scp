@@ -599,7 +599,7 @@ async fn revoked_member_cannot_decrypt_new_messages() {
         &alice_did,
         "test-ctx",
         &bob_did,
-        GovernanceAction::Revoke {
+        GovernanceAction::MemberRevoke {
             did: bob_did.clone(),
             access: AccessScope::Read,
         },
@@ -1547,7 +1547,7 @@ async fn receipt_verification_with_noop_adapter() {
 #[tokio::test]
 async fn velocity_consequence_trigger_on_send() {
     use scp_protocol::trust::consequence::{
-        ConsequenceAction, ConsequenceRule, ConsequenceTrigger,
+        ConsequenceAction, ConsequenceRule, ConsequenceTrigger, EnforcementSeverity,
     };
     use std::time::Duration;
 
@@ -1568,9 +1568,9 @@ async fn velocity_consequence_trigger_on_send() {
     params.consequence_rules = vec![ConsequenceRule {
         trigger: ConsequenceTrigger::MessageVelocity,
         threshold: 1,
-        action: ConsequenceAction::Suspend {
-            capabilities: vec!["write".to_owned()],
-        },
+        action: ConsequenceAction::Enforcement(EnforcementSeverity::SuspendCapability {
+            capabilities: vec![Capability::MessagesWrite],
+        }),
         window: Duration::from_secs(3600),
     }];
     let _handle = manager

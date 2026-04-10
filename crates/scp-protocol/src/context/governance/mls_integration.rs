@@ -87,11 +87,12 @@ pub const fn classify_action(action: &GovernanceAction) -> MlsImpact {
     match action {
         // Membership changes trigger MLS Commit (epoch advance).
         GovernanceAction::AddMember { .. }
-        | GovernanceAction::Eject { .. }
-        | GovernanceAction::Revoke { .. }
+        | GovernanceAction::MemberEject { .. }
+        | GovernanceAction::MemberRevoke { .. }
         | GovernanceAction::ResetMember { .. } => MlsImpact::MembershipChange,
         // All other actions are governance-level state changes that do not
-        // affect MLS group membership (ADR-031 §8).
+        // affect MLS group membership (ADR-031 §8). Application-level
+        // suspensions (SuspendCapability, SuspendAccess) do NOT touch MLS.
         GovernanceAction::ChangeRole { .. }
         | GovernanceAction::RegisterTool { .. }
         | GovernanceAction::RemoveTool { .. }
@@ -100,7 +101,8 @@ pub const fn classify_action(action: &GovernanceAction) -> MlsImpact {
         | GovernanceAction::ExtendTtl { .. }
         | GovernanceAction::TransferAdmin { .. }
         | GovernanceAction::CreateChildContext { .. }
-        | GovernanceAction::SuspendMember { .. }
+        | GovernanceAction::SuspendCapability { .. }
+        | GovernanceAction::SuspendAccess { .. }
         | GovernanceAction::RestoreAccess { .. }
         | GovernanceAction::ModifyPruningPolicy { .. }
         | GovernanceAction::AddSigner { .. }
@@ -178,14 +180,14 @@ pub fn generate_mls_operations(
             did: did.clone(),
             role: role.clone(),
         }),
-        GovernanceAction::Eject { did, reason } => Some(MlsOperation::RemoveMember {
+        GovernanceAction::MemberEject { did, reason } => Some(MlsOperation::RemoveMember {
             did: did.clone(),
             reason: reason.clone(),
         }),
         // Revoke in encrypted mode is MLS group removal (same as
         // Eject at the MLS layer). In broadcast mode, the manager
         // handles this directly without MLS.
-        GovernanceAction::Revoke { did, .. } => Some(MlsOperation::RemoveMember {
+        GovernanceAction::MemberRevoke { did, .. } => Some(MlsOperation::RemoveMember {
             did: did.clone(),
             reason: Some("access revoked".to_owned()),
         }),
@@ -586,7 +588,7 @@ mod tests {
 
     #[test]
     fn classify_eject_is_membership_change() {
-        let action = GovernanceAction::Eject {
+        let action = GovernanceAction::MemberEject {
             did: bob(),
             reason: Some("inactive".to_owned()),
         };
@@ -672,7 +674,7 @@ mod tests {
 
     #[test]
     fn classify_revoke_read_is_membership_change() {
-        let action = GovernanceAction::Revoke {
+        let action = GovernanceAction::MemberRevoke {
             did: bob(),
             access: AccessScope::Read,
         };
@@ -681,7 +683,7 @@ mod tests {
 
     #[test]
     fn classify_revoke_both_is_membership_change() {
-        let action = GovernanceAction::Revoke {
+        let action = GovernanceAction::MemberRevoke {
             did: bob(),
             access: AccessScope::Both,
         };
@@ -721,7 +723,7 @@ mod tests {
 
     #[test]
     fn generate_mls_ops_for_eject() {
-        let action = GovernanceAction::Eject {
+        let action = GovernanceAction::MemberEject {
             did: bob(),
             reason: Some("inactive".to_owned()),
         };
@@ -1015,7 +1017,7 @@ mod tests {
 
     #[test]
     fn approved_eject_requires_mls_coordination() {
-        let action = GovernanceAction::Eject {
+        let action = GovernanceAction::MemberEject {
             did: bob(),
             reason: None,
         };
@@ -1105,7 +1107,7 @@ mod tests {
     #[test]
     fn reset_does_not_invalidate_approved_proposals() {
         let proposals = vec![approved_proposal(
-            GovernanceAction::Eject {
+            GovernanceAction::MemberEject {
                 did: bob(),
                 reason: None,
             },
@@ -1327,7 +1329,7 @@ mod tests {
     fn full_coordination_flow_eject() {
         // Simulate eject member flow.
 
-        let action = GovernanceAction::Eject {
+        let action = GovernanceAction::MemberEject {
             did: bob(),
             reason: Some("violation".to_owned()),
         };

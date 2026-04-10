@@ -539,7 +539,10 @@ pub enum GovernanceAction {
         role: String,
     },
     /// MLS ejection — irreversible, governance only.
-    Eject {
+    ///
+    /// Session-approved name (B1): corresponds to
+    /// [`EnforcementSeverity::MemberEject`](crate::trust::consequence::EnforcementSeverity::MemberEject).
+    MemberEject {
         /// The DID of the member to eject.
         did: DID,
         /// Optional reason for ejection.
@@ -587,15 +590,30 @@ pub enum GovernanceAction {
         /// The parameters for the child context.
         params: Box<ContextParams>,
     },
-    /// Suspend specific capabilities for a member (application-level gate block).
-    SuspendMember {
+    /// Suspend specific capabilities for a member (application-level gate
+    /// block).
+    ///
+    /// Session-approved name (B1): corresponds to
+    /// [`EnforcementSeverity::SuspendCapability`](crate::trust::consequence::EnforcementSeverity::SuspendCapability).
+    SuspendCapability {
         /// The DID of the member whose capabilities are suspended.
         did: DID,
         /// The capabilities to suspend.
         capabilities: Vec<Capability>,
     },
+    /// Suspend ALL member capabilities (application-level enforcement).
+    ///
+    /// Session-approved name (B1): corresponds to
+    /// [`EnforcementSeverity::SuspendAccess`](crate::trust::consequence::EnforcementSeverity::SuspendAccess).
+    SuspendAccess {
+        /// The DID of the member whose full capability set is suspended.
+        did: DID,
+    },
     /// Cryptographic revocation — destroy keys. Forward-restore only.
-    Revoke {
+    ///
+    /// Session-approved name (B1): corresponds to
+    /// [`EnforcementSeverity::MemberRevoke`](crate::trust::consequence::EnforcementSeverity::MemberRevoke).
+    MemberRevoke {
         /// The DID whose access is revoked.
         did: DID,
         /// The scope of access to revoke (read, write, or both).
@@ -761,7 +779,7 @@ impl GovernanceAction {
     pub const fn variant_name(&self) -> &'static str {
         match self {
             Self::AddMember { .. } => "AddMember",
-            Self::Eject { .. } => "Eject",
+            Self::MemberEject { .. } => "MemberEject",
             Self::ChangeRole { .. } => "ChangeRole",
             Self::RegisterTool { .. } => "RegisterTool",
             Self::RemoveTool { .. } => "RemoveTool",
@@ -770,8 +788,9 @@ impl GovernanceAction {
             Self::ExtendTtl { .. } => "ExtendTtl",
             Self::TransferAdmin { .. } => "TransferAdmin",
             Self::CreateChildContext { .. } => "CreateChildContext",
-            Self::SuspendMember { .. } => "SuspendMember",
-            Self::Revoke { .. } => "Revoke",
+            Self::SuspendCapability { .. } => "SuspendCapability",
+            Self::SuspendAccess { .. } => "SuspendAccess",
+            Self::MemberRevoke { .. } => "MemberRevoke",
             Self::RestoreAccess { .. } => "RestoreAccess",
             Self::ModifyPruningPolicy { .. } => "ModifyPruningPolicy",
             Self::AddSigner { .. } => "AddSigner",
@@ -802,10 +821,11 @@ impl GovernanceAction {
     pub const fn target_did(&self) -> Option<&DID> {
         match self {
             Self::AddMember { did, .. }
-            | Self::Eject { did, .. }
+            | Self::MemberEject { did, .. }
             | Self::ChangeRole { did, .. }
-            | Self::SuspendMember { did, .. }
-            | Self::Revoke { did, .. }
+            | Self::SuspendCapability { did, .. }
+            | Self::SuspendAccess { did, .. }
+            | Self::MemberRevoke { did, .. }
             | Self::RestoreAccess { did, .. }
             | Self::ResetMember { did, .. }
             | Self::AddSigner { did }
@@ -830,6 +850,46 @@ impl GovernanceAction {
             | Self::ProposeContextMigration { .. }
             | Self::CancelContextMigration
             | Self::ModifyHardRateLimit { .. } => None,
+        }
+    }
+
+    /// Returns `true` if this governance action encodes an MLS ejection
+    /// (`Enforce { severity: MemberEject }`).
+    ///
+    /// Helper for call sites that previously matched on the `Eject` variant
+    /// and need the same boolean answer after the B1 unification.
+    #[must_use]
+    pub const fn is_member_eject(&self) -> bool {
+        matches!(self, Self::MemberEject { .. })
+    }
+
+    /// Converts this action's enforcement tier (if any) to the shared
+    /// [`EnforcementSeverity`](crate::trust::consequence::EnforcementSeverity)
+    /// type used by consequence rules.
+    ///
+    /// Returns `None` for variants that are not enforcement actions (e.g.,
+    /// `AddMember`, `ChangeRole`, `RestoreAccess`).
+    #[must_use]
+    pub fn to_enforcement_severity(
+        &self,
+    ) -> Option<crate::trust::consequence::EnforcementSeverity> {
+        use crate::trust::consequence::EnforcementSeverity;
+        match self {
+            Self::SuspendCapability { capabilities, .. } => {
+                Some(EnforcementSeverity::SuspendCapability {
+                    capabilities: capabilities.clone(),
+                })
+            }
+            Self::SuspendAccess { .. } => Some(EnforcementSeverity::SuspendAccess),
+            Self::MemberRevoke { did, access } => Some(EnforcementSeverity::MemberRevoke {
+                did: did.clone(),
+                access: *access,
+            }),
+            Self::MemberEject { did, reason } => Some(EnforcementSeverity::MemberEject {
+                did: did.clone(),
+                reason: reason.clone(),
+            }),
+            _ => None,
         }
     }
 }
@@ -1759,9 +1819,9 @@ pub fn actions_conflict(
     proposer_b: &DID,
 ) -> bool {
     use GovernanceAction::{
-        AddSigner, ChangeRole, Eject, ModifyCeiling, ModifyPruningPolicy, ModifyThreshold,
-        ReconfigureGovernance, RemoveSigner, RestoreAccess, Revoke, RotateContentKeys,
-        SuspendMember,
+        AddSigner, ChangeRole, MemberEject, MemberRevoke, ModifyCeiling, ModifyPruningPolicy,
+        ModifyThreshold, ReconfigureGovernance, RemoveSigner, RestoreAccess, RotateContentKeys,
+        SuspendAccess, SuspendCapability,
     };
 
     // Canonical conflict matrix. The sync module's `actions_conflict`
@@ -1793,24 +1853,25 @@ pub fn actions_conflict(
         // Two concurrent ejections of the same member conflict (ADR-031 §7:
         // concurrent modifications to the same membership state).
         // Also catches mutual ejection (each proposer ejects the other).
-        (Eject { did: did_a, .. }, Eject { did: did_b, .. }) => {
+        (MemberEject { did: did_a, .. }, MemberEject { did: did_b, .. }) => {
             did_a == did_b || (did_a == proposer_b && did_b == proposer_a)
         }
 
-        // Eject + role change for the same DID.
-        // Two concurrent revocations targeting the same DID conflict (scope may
-        // differ, but concurrent modification is unsafe — ADR-031 §7).
-        // Revoke and RestoreAccess for the same DID also conflict (contradictory
-        // intent on the same member's access state). SuspendMember targeting
-        // the same DID also conflicts with itself and with RestoreAccess.
-        (Eject { did: did_a, .. }, ChangeRole { did: did_b, .. })
-        | (ChangeRole { did: did_a, .. }, Eject { did: did_b, .. })
-        | (Revoke { did: did_a, .. }, Revoke { did: did_b, .. })
-        | (SuspendMember { did: did_a, .. }, SuspendMember { did: did_b, .. })
-        | (Revoke { did: did_a, .. }, RestoreAccess { did: did_b, .. })
-        | (RestoreAccess { did: did_a, .. }, Revoke { did: did_b, .. })
-        | (SuspendMember { did: did_a, .. }, RestoreAccess { did: did_b, .. })
-        | (RestoreAccess { did: did_a, .. }, SuspendMember { did: did_b, .. })
+        // Ejection/revocation + role change for the same DID.
+        // Two concurrent enforcement actions targeting the same DID conflict
+        // (scope may differ, but concurrent modification is unsafe — ADR-031
+        // §7). RestoreAccess for the same DID also conflicts.
+        (MemberEject { did: did_a, .. }, ChangeRole { did: did_b, .. })
+        | (ChangeRole { did: did_a, .. }, MemberEject { did: did_b, .. })
+        | (MemberRevoke { did: did_a, .. }, MemberRevoke { did: did_b, .. })
+        | (SuspendCapability { did: did_a, .. }, SuspendCapability { did: did_b, .. })
+        | (SuspendAccess { did: did_a, .. }, SuspendAccess { did: did_b, .. })
+        | (MemberRevoke { did: did_a, .. }, RestoreAccess { did: did_b, .. })
+        | (RestoreAccess { did: did_a, .. }, MemberRevoke { did: did_b, .. })
+        | (SuspendCapability { did: did_a, .. }, RestoreAccess { did: did_b, .. })
+        | (RestoreAccess { did: did_a, .. }, SuspendCapability { did: did_b, .. })
+        | (SuspendAccess { did: did_a, .. }, RestoreAccess { did: did_b, .. })
+        | (RestoreAccess { did: did_a, .. }, SuspendAccess { did: did_b, .. })
         | (RestoreAccess { did: did_a, .. }, RestoreAccess { did: did_b, .. }) => did_a == did_b,
 
         // AddSigner and RemoveSigner for the same DID conflict.
@@ -2043,7 +2104,7 @@ mod tests {
                 did: bob(),
                 role: "member".to_owned(),
             },
-            GovernanceAction::Eject {
+            GovernanceAction::MemberEject {
                 did: bob(),
                 reason: Some("inactive".to_owned()),
             },
@@ -2084,11 +2145,11 @@ mod tests {
             GovernanceAction::CreateChildContext {
                 params: Box::new(ContextParams::default()),
             },
-            GovernanceAction::SuspendMember {
+            GovernanceAction::SuspendCapability {
                 did: bob(),
                 capabilities: vec![Capability::MessagesWrite],
             },
-            GovernanceAction::Revoke {
+            GovernanceAction::MemberRevoke {
                 did: bob(),
                 access: AccessScope::Both,
             },
@@ -2607,7 +2668,7 @@ mod tests {
                 did: DID::from("did:dht:z6MkDave"),
                 role: "member".to_owned(),
             },
-            GovernanceAction::Eject {
+            GovernanceAction::MemberEject {
                 did: bob(),
                 reason: None,
             },

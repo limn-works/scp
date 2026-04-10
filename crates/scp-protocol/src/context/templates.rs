@@ -18,9 +18,9 @@
 use crate::provenance::CounterpartyPolicy;
 
 use super::params::{
-    Capability, CeilingPolicy, ContextMode, ContextParams, FieldVisibility, GovernanceModel,
-    IncompleteVerificationPolicy, MemoryScope, MetadataVisibilityPolicy, ProjectionPolicy,
-    ProjectionRule, PromotionPolicy, TemplateId,
+    Capability, CeilingPolicy, ConsequenceConfig, ContextMode, ContextParams, FieldVisibility,
+    GovernanceModel, IncompleteVerificationPolicy, MemoryScope, MetadataVisibilityPolicy,
+    ProjectionPolicy, ProjectionRule, PromotionPolicy, TemplateId,
 };
 
 // ---------------------------------------------------------------------------
@@ -290,6 +290,7 @@ pub fn template_params(template_id: &TemplateId) -> ContextParams {
             min_protocol_version: None,
             migration_source: None,
             consequence_rules: Vec::new(),
+            consequence_config: ConsequenceConfig::default(),
             sybil_policy: None,
         },
         TemplateId::BilateralPersistent => ContextParams {
@@ -316,6 +317,7 @@ pub fn template_params(template_id: &TemplateId) -> ContextParams {
             min_protocol_version: None,
             migration_source: None,
             consequence_rules: Vec::new(),
+            consequence_config: ConsequenceConfig::default(),
             sybil_policy: None,
         },
         TemplateId::Coordination => ContextParams {
@@ -342,6 +344,7 @@ pub fn template_params(template_id: &TemplateId) -> ContextParams {
             min_protocol_version: None,
             migration_source: None,
             consequence_rules: Vec::new(),
+            consequence_config: ConsequenceConfig::default(),
             sybil_policy: None,
         },
         TemplateId::GroupDiscussion => ContextParams {
@@ -368,6 +371,7 @@ pub fn template_params(template_id: &TemplateId) -> ContextParams {
             min_protocol_version: None,
             migration_source: None,
             consequence_rules: Vec::new(),
+            consequence_config: ConsequenceConfig::default(),
             sybil_policy: None,
         },
         TemplateId::PublicBroadcast => ContextParams {
@@ -397,6 +401,7 @@ pub fn template_params(template_id: &TemplateId) -> ContextParams {
             min_protocol_version: None,
             migration_source: None,
             consequence_rules: Vec::new(),
+            consequence_config: ConsequenceConfig::default(),
             sybil_policy: None,
         },
         TemplateId::GatedBroadcast => ContextParams {
@@ -426,6 +431,7 @@ pub fn template_params(template_id: &TemplateId) -> ContextParams {
             min_protocol_version: None,
             migration_source: None,
             consequence_rules: Vec::new(),
+            consequence_config: ConsequenceConfig::default(),
             sybil_policy: None,
         },
         TemplateId::ToolInterfaceTemplate => ContextParams {
@@ -452,6 +458,7 @@ pub fn template_params(template_id: &TemplateId) -> ContextParams {
             min_protocol_version: None,
             migration_source: None,
             consequence_rules: Vec::new(),
+            consequence_config: ConsequenceConfig::default(),
             sybil_policy: None,
         },
         // Extends scp:template/tool-interface -- same ceiling and governance,
@@ -480,6 +487,7 @@ pub fn template_params(template_id: &TemplateId) -> ContextParams {
             min_protocol_version: None,
             migration_source: None,
             consequence_rules: Vec::new(),
+            consequence_config: ConsequenceConfig::default(),
             sybil_policy: None,
         },
         // Extends scp:template/gated-broadcast -- broadcast mode with gated
@@ -511,6 +519,7 @@ pub fn template_params(template_id: &TemplateId) -> ContextParams {
             min_protocol_version: None,
             migration_source: None,
             consequence_rules: Vec::new(),
+            consequence_config: ConsequenceConfig::default(),
             sybil_policy: None,
         },
         // Context: encrypted mode with messaging + tool invocation
@@ -540,6 +549,7 @@ pub fn template_params(template_id: &TemplateId) -> ContextParams {
             min_protocol_version: None,
             migration_source: None,
             consequence_rules: Vec::new(),
+            consequence_config: ConsequenceConfig::default(),
             sybil_policy: None,
         },
     }

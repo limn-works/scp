@@ -15,39 +15,23 @@ use super::{
     push_welcome_event, require_active, require_migrating_out, roles, update_detection_state,
 };
 
-/// Enforces a `Suspend` consequence action on a member.
+/// Enforces a `SuspendCapability` consequence action on a member.
 ///
-/// Suspends capabilities by adding them to the member's suspended set
+/// Suspends typed capabilities by adding them to the member's suspended set
 /// in `ContextRoleState`. The suspension-aware `member_has_capability`
 /// check in the `send_message` and `deliver_incoming` gates will then
 /// reject operations requiring those capabilities.
 ///
-/// Parses every variant of [`Capability`] via
-/// [`scp_protocol::trust::consequence::parse_suspension_capability`] —
-/// the same parser used by [`ConsequenceRule::validate`], so the
-/// validation and enforcement layers cannot drift. If a string is
-/// unrecognized at this point it has bypassed validation, which is a
-/// programmer error worth logging.
-fn enforce_suspend(ctx: &mut PerContextState, member_did: &DID, caps: &[String]) -> bool {
-    use scp_protocol::trust::consequence::parse_suspension_capability;
-
-    let mut applied = false;
-    for cap_name in caps {
-        let Some(capability) = parse_suspension_capability(cap_name) else {
-            tracing::warn!(
-                capability = cap_name,
-                member = %member_did,
-                "unknown capability in suspension — no action taken (this should have \
-                 been rejected by ConsequenceRule::validate; this branch indicates a \
-                 bypass of validation)"
-            );
-            continue;
-        };
-        ctx.role_state
-            .suspend_capabilities(member_did.as_ref(), [capability]);
-        applied = true;
+/// With the B1 unification, capabilities are typed [`Capability`] values
+/// (no string parsing needed). The previous string-based
+/// `parse_suspension_capability` round-trip is eliminated.
+fn enforce_suspend(ctx: &mut PerContextState, member_did: &DID, caps: &[Capability]) -> bool {
+    if caps.is_empty() {
+        return false;
     }
-    applied
+    ctx.role_state
+        .suspend_capabilities(member_did.as_ref(), caps.iter().cloned());
+    true
 }
 
 /// Enforces an `AssignRole` consequence action on a member.
@@ -152,8 +136,9 @@ pub(super) fn enforce_triggered_consequences(
         }
 
         let action_type = match &consequence.action {
-            scp_protocol::trust::consequence::ConsequenceAction::Suspend { .. } => "Suspend",
-            scp_protocol::trust::consequence::ConsequenceAction::SuspendAll => "SuspendAll",
+            scp_protocol::trust::consequence::ConsequenceAction::Enforcement(sev) => {
+                sev.variant_name()
+            }
             scp_protocol::trust::consequence::ConsequenceAction::AssignRole { .. } => "AssignRole",
         };
         let trigger_type = rules
@@ -189,16 +174,33 @@ pub(super) fn enforce_triggered_consequences(
         // calls a named function as an expression_statement so the pipeline
         // wiring gates can detect the call_expression per-variant.
         let success = match &consequence.action {
-            scp_protocol::trust::consequence::ConsequenceAction::Suspend { capabilities } => {
-                enforce_suspend(ctx, member_did, capabilities)
-            }
-            scp_protocol::trust::consequence::ConsequenceAction::SuspendAll => {
-                // SuspendAll: suspend all capabilities via role_state.
-                // For cryptographic exclusion, dispatch an Eject governance
-                // action which performs MLS group removal and sender key
-                // rotation.
-                ctx.role_state.suspend_all(member_did.as_ref());
-                true
+            scp_protocol::trust::consequence::ConsequenceAction::Enforcement(severity) => {
+                use scp_protocol::trust::consequence::EnforcementSeverity;
+                match severity {
+                    EnforcementSeverity::SuspendCapability { capabilities } => {
+                        enforce_suspend(ctx, member_did, capabilities)
+                    }
+                    EnforcementSeverity::SuspendAccess => {
+                        // SuspendAccess: suspend all capabilities via role_state.
+                        ctx.role_state.suspend_all(member_did.as_ref());
+                        true
+                    }
+                    EnforcementSeverity::MemberRevoke { .. }
+                    | EnforcementSeverity::MemberEject { .. } => {
+                        // MemberRevoke and MemberEject should not reach the
+                        // consequence dispatch path without the opt-in flag.
+                        // If they do, escalate to SuspendAccess as a safe
+                        // fallback.
+                        tracing::error!(
+                            context_id,
+                            member = %member_did,
+                            severity = ?severity,
+                            "MemberRevoke/MemberEject reached consequence dispatch; \
+                             this should have been rejected at validation time"
+                        );
+                        false
+                    }
+                }
             }
             scp_protocol::trust::consequence::ConsequenceAction::AssignRole { to_role } => {
                 enforce_assign_role(ctx, member_did, to_role, clock)
@@ -439,7 +441,7 @@ fn check_proposer_eligibility(
 ) -> Result<(), ContextError> {
     // Check for pending ejection (existing defense-in-depth).
     for (proposal, _seq, _ts) in ctx.governance.approved_proposals.values() {
-        if let GovernanceAction::Eject { did, .. } = &proposal.action
+        if let GovernanceAction::MemberEject { did, .. } = &proposal.action
             && did == proposer_did
         {
             return Err(ContextError::PermissionDenied(
@@ -851,7 +853,7 @@ impl ContextManager {
         let pid = proposal.proposal_id;
         let actor = proposal.proposer_did.as_ref();
         match &proposal.action {
-            GovernanceAction::SuspendMember { did, capabilities } => {
+            GovernanceAction::SuspendCapability { did, capabilities } => {
                 self.execute_suspend_member(context_id, did, capabilities, pid, actor)
                     .await?;
                 Ok(GovernanceActionResult::MemberSuspended(
@@ -861,7 +863,51 @@ impl ContextManager {
                     },
                 ))
             }
-            GovernanceAction::Revoke { did, access } => {
+            GovernanceAction::SuspendAccess { did } => {
+                // Suspend all capabilities for the member.
+                let snapshot = {
+                    let mut contexts = self.contexts.lock().await;
+                    let ctx = contexts
+                        .get_mut(context_id)
+                        .ok_or_else(|| ContextError::ContextNotRegistered(context_id.to_owned()))?;
+                    require_active(&ctx.handle)?;
+
+                    if !ctx.role_state.ceiling.contains(&Capability::MemberBan) {
+                        return Err(ContextError::PermissionDenied(
+                            "member:ban (MemberBan) capability not in ceiling".to_owned(),
+                        ));
+                    }
+                    if !ctx.membership.contains(did) {
+                        return Err(ContextError::MemberNotFound(did.to_string()));
+                    }
+
+                    ctx.role_state.suspend_all(did.as_ref());
+
+                    ctx.receive_buffer
+                        .push(ContextEvent::CapabilitiesSuspended {
+                            did: did.clone(),
+                            capabilities: vec![], // all — indicated by empty
+                        });
+
+                    if self.has_persistence() {
+                        Some(Self::snapshot_context(ctx))
+                    } else {
+                        None
+                    }
+                };
+
+                if let Some(snapshot) = snapshot {
+                    self.persist_context_snapshot(context_id, snapshot);
+                }
+                let context_id_bytes = context_id_to_bytes(context_id);
+                self.event_log.append_context_event(
+                    &context_id_bytes,
+                    "MemberSuspendedAll",
+                    actor,
+                )?;
+                Ok(GovernanceActionResult::Executed)
+            }
+            GovernanceAction::MemberRevoke { did, access } => {
                 let r = self
                     .execute_revoke(context_id, did, *access, pid, actor)
                     .await?;
@@ -923,9 +969,10 @@ impl ContextManager {
                     .await?;
                 Ok(GovernanceActionResult::Executed)
             }
+            // SuspendCapability, SuspendAccess, MemberRevoke are handled above.
             // Remaining actions dispatched to context-level handler.
             GovernanceAction::AddMember { .. }
-            | GovernanceAction::Eject { .. }
+            | GovernanceAction::MemberEject { .. }
             | GovernanceAction::ChangeRole { .. }
             | GovernanceAction::RegisterTool { .. }
             | GovernanceAction::RemoveTool { .. }
@@ -972,7 +1019,7 @@ impl ContextManager {
                     .await?;
                 Ok(GovernanceActionResult::MemberAdded)
             }
-            GovernanceAction::Eject { did, .. } => {
+            GovernanceAction::MemberEject { did, .. } => {
                 self.execute_eject(context_id, did, pid, actor_did).await?;
                 Ok(GovernanceActionResult::MemberEjected)
             }
@@ -1058,8 +1105,9 @@ impl ContextManager {
             // dispatch_governance_action.
             GovernanceAction::PromoteContext
             | GovernanceAction::ExtendTtl { .. }
-            | GovernanceAction::SuspendMember { .. }
-            | GovernanceAction::Revoke { .. }
+            | GovernanceAction::SuspendCapability { .. }
+            | GovernanceAction::SuspendAccess { .. }
+            | GovernanceAction::MemberRevoke { .. }
             | GovernanceAction::RestoreAccess { .. }
             | GovernanceAction::SetEconomicPolicy { .. }
             | GovernanceAction::ApproveSpend { .. }
@@ -1149,14 +1197,15 @@ impl ContextManager {
             // for compile-time coverage (no wildcard).
             GovernanceAction::PromoteContext
             | GovernanceAction::ExtendTtl { .. }
-            | GovernanceAction::SuspendMember { .. }
-            | GovernanceAction::Revoke { .. }
+            | GovernanceAction::SuspendCapability { .. }
+            | GovernanceAction::SuspendAccess { .. }
+            | GovernanceAction::MemberRevoke { .. }
             | GovernanceAction::RestoreAccess { .. }
             | GovernanceAction::SetEconomicPolicy { .. }
             | GovernanceAction::ApproveSpend { .. }
             | GovernanceAction::LockEconomicPolicy
             | GovernanceAction::AddMember { .. }
-            | GovernanceAction::Eject { .. }
+            | GovernanceAction::MemberEject { .. }
             | GovernanceAction::ChangeRole { .. }
             | GovernanceAction::RegisterTool { .. }
             | GovernanceAction::RemoveTool { .. }

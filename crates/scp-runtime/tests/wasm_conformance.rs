@@ -2148,8 +2148,8 @@ fn governance_action_from_js_camel_case_format() {
             "AddMember",
         ),
         (
-            serde_json::json!({"type": "eject", "did": "did:dht:z2", "reason": null}),
-            "Eject",
+            serde_json::json!({"type": "memberEject", "did": "did:dht:z2", "reason": null}),
+            "MemberEject",
         ),
         (
             serde_json::json!({"type": "changeRole", "did": "did:dht:z3", "new_role": "admin"}),

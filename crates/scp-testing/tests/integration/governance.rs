@@ -148,7 +148,7 @@ fn all_governance_actions_for_test() -> Vec<GovernanceAction> {
             did: bob(),
             role: "member".to_owned(),
         },
-        GovernanceAction::Eject {
+        GovernanceAction::MemberEject {
             did: bob(),
             reason: Some("inactive".to_owned()),
         },
@@ -175,7 +175,7 @@ fn all_governance_actions_for_test() -> Vec<GovernanceAction> {
         GovernanceAction::CreateChildContext {
             params: Box::new(ContextParams::default()),
         },
-        GovernanceAction::Revoke {
+        GovernanceAction::MemberRevoke {
             did: bob(),
             access: AccessScope::Read,
         },
@@ -204,7 +204,7 @@ fn all_governance_actions_for_test() -> Vec<GovernanceAction> {
             },
         },
         GovernanceAction::PromoteContext,
-        GovernanceAction::Revoke {
+        GovernanceAction::MemberRevoke {
             did: bob(),
             access: AccessScope::Write,
         },
@@ -239,7 +239,7 @@ fn all_governance_actions_for_test() -> Vec<GovernanceAction> {
             auto_invite: true,
         },
         GovernanceAction::CancelContextMigration,
-        GovernanceAction::SuspendMember {
+        GovernanceAction::SuspendCapability {
             did: bob(),
             capabilities: vec![Capability::GovernanceVote],
         },
@@ -852,11 +852,11 @@ async fn conflict_detection() {
     );
 
     // Mutual RemoveMember.
-    let remove_a = GovernanceAction::Eject {
+    let remove_a = GovernanceAction::MemberEject {
         did: bob(),
         reason: None,
     };
-    let remove_b = GovernanceAction::Eject {
+    let remove_b = GovernanceAction::MemberEject {
         did: alice(),
         reason: None,
     };
@@ -878,7 +878,7 @@ async fn conflict_detection() {
     );
 
     // Revoke (read) vs RestoreAccess (read).
-    let revoke = GovernanceAction::Revoke {
+    let revoke = GovernanceAction::MemberRevoke {
         did: bob(),
         access: AccessScope::Read,
     };
@@ -892,7 +892,7 @@ async fn conflict_detection() {
     );
 
     // Revoke (write) vs RestoreAccess (write).
-    let revoke_w = GovernanceAction::Revoke {
+    let revoke_w = GovernanceAction::MemberRevoke {
         did: bob(),
         access: AccessScope::Write,
     };
@@ -951,11 +951,11 @@ async fn non_conflicting_actions() {
     );
 
     // Non-mutual RemoveMember (Alice removes Bob, Carol removes Dave).
-    let remove_a = GovernanceAction::Eject {
+    let remove_a = GovernanceAction::MemberEject {
         did: bob(),
         reason: None,
     };
-    let remove_b = GovernanceAction::Eject {
+    let remove_b = GovernanceAction::MemberEject {
         did: dave(),
         reason: None,
     };
@@ -1070,7 +1070,7 @@ async fn revocation_scope_variants() {
     assert_ne!(read, both);
 
     // Revoke with Read scope.
-    let action_read = GovernanceAction::Revoke {
+    let action_read = GovernanceAction::MemberRevoke {
         did: bob(),
         access: AccessScope::Read,
     };
@@ -1083,7 +1083,7 @@ async fn revocation_scope_variants() {
     );
 
     // Revoke with Write scope.
-    let action_write = GovernanceAction::Revoke {
+    let action_write = GovernanceAction::MemberRevoke {
         did: bob(),
         access: AccessScope::Write,
     };
@@ -1096,11 +1096,11 @@ async fn revocation_scope_variants() {
     );
 
     // Conflicting scopes on same DID.
-    let revoke_both = GovernanceAction::Revoke {
+    let revoke_both = GovernanceAction::MemberRevoke {
         did: bob(),
         access: AccessScope::Both,
     };
-    let revoke_write = GovernanceAction::Revoke {
+    let revoke_write = GovernanceAction::MemberRevoke {
         did: bob(),
         access: AccessScope::Write,
     };

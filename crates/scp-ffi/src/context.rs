@@ -1658,6 +1658,7 @@ fn build_core_context_params(
             }
             parsed_consequence_rules
         },
+        consequence_config: scp_core::context::params::ConsequenceConfig::default(),
         sybil_policy: None,
     })
 }
@@ -4803,7 +4804,7 @@ mod tests {
         let rm = approved_proposal(
             [5u8; 32],
             &ctx_id,
-            scp_core::context::governance::GovernanceAction::Eject {
+            scp_core::context::governance::GovernanceAction::MemberEject {
                 did: scp_identity::DID(target.to_owned()),
                 reason: Some("test removal".to_owned()),
             },
@@ -4993,7 +4994,7 @@ mod tests {
 
     #[test]
     fn consequence_rules_in_context_params_accepted() {
-        let consequence_json = r#"[{"trigger":"MessageVelocity","action":"SuspendAll","threshold":5,"window":{"secs":3600,"nanos":0}}]"#;
+        let consequence_json = r#"[{"trigger":"MessageVelocity","action":{"Enforcement":"SuspendAccess"},"threshold":5,"window":{"secs":3600,"nanos":0}}]"#;
         let p = PyContextParams {
             consequence_rules: Some(consequence_json.to_owned()),
             ..default_params()

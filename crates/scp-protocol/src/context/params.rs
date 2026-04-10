@@ -598,6 +598,37 @@ fn filter_field<T>(visibility: FieldVisibility, value: Option<T>) -> Option<T> {
 // ContextParams
 // ---------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+// ConsequenceConfig (B3 per-context opt-in)
+// ---------------------------------------------------------------------------
+
+/// Per-context configuration for automatic consequence-rule dispatch.
+///
+/// Controls which [`EnforcementSeverity`](crate::trust::consequence::EnforcementSeverity)
+/// tiers a [`ConsequenceRule`](crate::trust::consequence::ConsequenceRule)
+/// may reference. See ADR-017 and the Group B plan for the rationale.
+///
+/// Default: all flags `false`. Consequence rules may reference only the
+/// least-severe tiers (`SuspendCapability`, `SuspendAccess`) by default;
+/// cryptographic revocation and MLS ejection are governance-only unless the
+/// context explicitly opts in at creation time.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ConsequenceConfig {
+    /// If `true`, consequence rules may reference
+    /// [`EnforcementSeverity::MemberRevoke`](crate::trust::consequence::EnforcementSeverity::MemberRevoke)
+    /// — i.e., automatic cryptographic revocation of a member's access keys.
+    ///
+    /// When `false` (the default), `MemberRevoke` is rejected at rule
+    /// validation time. It remains callable as an explicit governance action
+    /// regardless of this flag.
+    ///
+    /// `EnforcementSeverity::MemberEject` is **never** allowed in a
+    /// consequence rule regardless of this flag. MLS ejection is permanent
+    /// and must always originate from a deliberate governance proposal.
+    #[serde(default)]
+    pub allow_automatic_member_revoke: bool,
+}
+
 /// Full configuration for an SCP context, declared at creation time.
 ///
 /// `ContextParams` captures every parameter that defines a context's behavior:
@@ -769,6 +800,19 @@ pub struct ContextParams {
     #[serde(default)]
     pub consequence_rules: Vec<crate::trust::consequence::ConsequenceRule>,
 
+    /// Per-context configuration for consequence-rule enforcement severity
+    /// (Group B3 opt-in, ADR-017).
+    ///
+    /// Controls whether
+    /// [`EnforcementSeverity::MemberRevoke`](crate::trust::consequence::EnforcementSeverity::MemberRevoke)
+    /// may be referenced by automatic consequence rules. Defaults to
+    /// `allow_automatic_member_revoke = false`, meaning cryptographic
+    /// revocation is governance-only unless this context explicitly opts
+    /// in at creation time. `MemberEject` is never allowed in a consequence
+    /// rule regardless of this configuration.
+    #[serde(default)]
+    pub consequence_config: ConsequenceConfig,
+
     /// Per-context Sybil resistance policy (spec §9.3, #1530).
     ///
     /// When `Some`, joining members are evaluated against the policy's trust
@@ -804,6 +848,7 @@ impl Default for ContextParams {
             min_protocol_version: None,
             migration_source: None,
             consequence_rules: Vec::new(),
+            consequence_config: ConsequenceConfig::default(),
             sybil_policy: None,
         }
     }
@@ -1023,6 +1068,7 @@ mod tests {
             min_protocol_version: None,
             migration_source: None,
             consequence_rules: Vec::new(),
+            consequence_config: ConsequenceConfig::default(),
             sybil_policy: None,
         };
 
@@ -1165,6 +1211,7 @@ mod tests {
             min_protocol_version: None,
             migration_source: None,
             consequence_rules: Vec::new(),
+            consequence_config: ConsequenceConfig::default(),
             sybil_policy: None,
         };
 
@@ -1227,6 +1274,7 @@ mod tests {
             min_protocol_version: None,
             migration_source: None,
             consequence_rules: Vec::new(),
+            consequence_config: ConsequenceConfig::default(),
             sybil_policy: None,
         };
 

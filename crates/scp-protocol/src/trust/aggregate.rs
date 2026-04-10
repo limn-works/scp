@@ -947,9 +947,11 @@ mod tests {
         // Define consequence rules.
         let consequence_rules = vec![ConsequenceRule {
             trigger: super::super::consequence::ConsequenceTrigger::MessageVelocity,
-            action: super::super::consequence::ConsequenceAction::Suspend {
-                capabilities: vec!["messages:write".to_owned()],
-            },
+            action: super::super::consequence::ConsequenceAction::Enforcement(
+                super::super::consequence::EnforcementSeverity::SuspendCapability {
+                    capabilities: vec![crate::context::roles::Capability::MessagesWrite],
+                },
+            ),
             threshold: 10,
             window: Duration::from_secs(3600),
         }];
@@ -1166,7 +1168,9 @@ mod tests {
         let consequence_rules = vec![
             ConsequenceRule {
                 trigger: super::super::consequence::ConsequenceTrigger::MessageVelocity,
-                action: super::super::consequence::ConsequenceAction::SuspendAll,
+                action: super::super::consequence::ConsequenceAction::Enforcement(
+                    super::super::consequence::EnforcementSeverity::SuspendAccess,
+                ),
                 threshold: 10,
                 window: Duration::from_secs(60),
             },

@@ -461,7 +461,7 @@ async fn unanimity_context_single_rejection_defeats_proposal() {
     }
 
     // Alice proposes Eject(bob).
-    let action = GovernanceAction::Eject {
+    let action = GovernanceAction::MemberEject {
         did: bob.clone(),
         reason: Some("test removal".to_owned()),
     };
@@ -1901,7 +1901,7 @@ async fn governance_dispatch_returns_typed_results() {
         proposal_id: [11u8; 32],
         context_id: "typed-result-ctx".into(),
         proposer_did: "did:key:creator".into(),
-        action: GovernanceAction::Eject {
+        action: GovernanceAction::MemberEject {
             did: "did:key:new".into(),
             reason: None,
         },
@@ -2444,7 +2444,7 @@ async fn scp274_single_admin_full_lifecycle() {
         .propose_governance_action_checked(
             &ctx_id,
             &admin_did,
-            GovernanceAction::Eject {
+            GovernanceAction::MemberEject {
                 did: "did:key:target".into(),
                 reason: Some("test".into()),
             },
@@ -2505,7 +2505,7 @@ async fn scp274_threshold_full_lifecycle() {
         .propose_governance_action_checked(
             "scp274-thresh",
             &creator,
-            GovernanceAction::Eject {
+            GovernanceAction::MemberEject {
                 did: "did:key:target".into(),
                 reason: None,
             },
@@ -2612,7 +2612,7 @@ async fn scp274_unanimity_full_lifecycle() {
         .propose_governance_action_checked(
             "scp274-unan",
             &creator,
-            GovernanceAction::Eject {
+            GovernanceAction::MemberEject {
                 did: "did:key:target".into(),
                 reason: None,
             },
@@ -2666,7 +2666,7 @@ async fn scp274_rejected_proposal_does_not_execute() {
         .propose_governance_action_checked(
             "scp274-reject",
             &creator,
-            GovernanceAction::Eject {
+            GovernanceAction::MemberEject {
                 did: "did:key:target".into(),
                 reason: None,
             },
@@ -2721,7 +2721,7 @@ async fn scp274_governance_events_in_log() {
         .propose_governance_action_checked(
             "scp274-events",
             &creator,
-            GovernanceAction::Eject {
+            GovernanceAction::MemberEject {
                 did: "did:key:target".into(),
                 reason: None,
             },
@@ -2807,7 +2807,7 @@ async fn scp274_exercises_seven_action_variants() {
     let rm = approved_proposal(
         [101u8; 32],
         "scp274-7a",
-        GovernanceAction::Eject {
+        GovernanceAction::MemberEject {
             did: "did:key:target".into(),
             reason: None,
         },
@@ -2911,7 +2911,7 @@ async fn scp274_exercises_seven_action_variants() {
     let revoke = approved_proposal(
         [107u8; 32],
         "scp274-7b",
-        GovernanceAction::Revoke {
+        GovernanceAction::MemberRevoke {
             did: "did:key:signer".into(),
             access: super::AccessScope::Write,
         },
@@ -2927,7 +2927,7 @@ async fn scp274_exercises_seven_action_variants() {
     let revoke_r = approved_proposal(
         [108u8; 32],
         "scp274-7b",
-        GovernanceAction::Revoke {
+        GovernanceAction::MemberRevoke {
             did: "did:key:signer".into(),
             access: super::AccessScope::Both,
         },
@@ -4403,7 +4403,7 @@ async fn mls_integration_epoch_coordinator_records_coordination() {
         .unwrap();
 
     // Execute Eject — should record second coordination.
-    let action2 = super::GovernanceAction::Eject {
+    let action2 = super::GovernanceAction::MemberEject {
         did: "did:key:member-a".into(),
         reason: Some("done".to_owned()),
     };
@@ -4595,7 +4595,7 @@ async fn mls_integration_resolve_conflict_lifts_freeze() {
         proposal_id: proposal_a_id,
         context_id: "test-ctx".to_owned(),
         proposer_did: admin_did.clone(),
-        action: super::GovernanceAction::Eject {
+        action: super::GovernanceAction::MemberEject {
             did: other_did.clone(),
             reason: None,
         },
@@ -4610,7 +4610,7 @@ async fn mls_integration_resolve_conflict_lifts_freeze() {
         proposal_id: proposal_b_id,
         context_id: "test-ctx".to_owned(),
         proposer_did: other_did.clone(),
-        action: super::GovernanceAction::Eject {
+        action: super::GovernanceAction::MemberEject {
             did: admin_did.clone(),
             reason: None,
         },
@@ -5096,7 +5096,7 @@ async fn test_remove_member_sender_key_before_mls_removal() {
     let rm = approved_proposal(
         [2u8; 32],
         "sk-order-ctx",
-        GovernanceAction::Eject {
+        GovernanceAction::MemberEject {
             did: "did:key:target".into(),
             reason: None,
         },
@@ -5128,7 +5128,7 @@ async fn test_remove_member_sender_key_before_mls_removal() {
 #[tokio::test]
 async fn test_consequence_rule_triggers_enforcement_event() {
     use scp_protocol::trust::consequence::{
-        ConsequenceAction, ConsequenceRule, ConsequenceTrigger,
+        ConsequenceAction, ConsequenceRule, ConsequenceTrigger, EnforcementSeverity,
     };
     use std::time::Duration;
 
@@ -5153,7 +5153,7 @@ async fn test_consequence_rule_triggers_enforcement_event() {
         let ctx = contexts.get_mut("conseq-ctx").unwrap();
         ctx.governance.consequence_rules = vec![ConsequenceRule {
             trigger: ConsequenceTrigger::MessageVelocity,
-            action: ConsequenceAction::SuspendAll,
+            action: ConsequenceAction::Enforcement(EnforcementSeverity::SuspendAccess),
             threshold: 1,
             window: Duration::from_secs(3600),
         }];
@@ -5285,7 +5285,7 @@ async fn test_economy_cost_deducted_on_send() {
 #[tokio::test]
 async fn test_cooldown_prevents_consequence_retrigger() {
     use scp_protocol::trust::consequence::{
-        ConsequenceAction, ConsequenceRule, ConsequenceTrigger,
+        ConsequenceAction, ConsequenceRule, ConsequenceTrigger, EnforcementSeverity,
     };
     use std::time::Duration;
 
@@ -5308,7 +5308,7 @@ async fn test_cooldown_prevents_consequence_retrigger() {
         let ctx = contexts.get_mut("cooldown-ctx").unwrap();
         ctx.governance.consequence_rules = vec![ConsequenceRule {
             trigger: ConsequenceTrigger::MessageVelocity,
-            action: ConsequenceAction::SuspendAll,
+            action: ConsequenceAction::Enforcement(EnforcementSeverity::SuspendAccess),
             threshold: 1,
             window: Duration::from_secs(999_999),
         }];
@@ -5450,7 +5450,7 @@ async fn test_budget_exceeded_blocks_send() {
 #[tokio::test]
 async fn test_capability_suspension_revokes_write() {
     use scp_protocol::trust::consequence::{
-        ConsequenceAction, ConsequenceRule, ConsequenceTrigger,
+        ConsequenceAction, ConsequenceRule, ConsequenceTrigger, EnforcementSeverity,
     };
     use std::time::Duration;
 
@@ -5473,9 +5473,9 @@ async fn test_capability_suspension_revokes_write() {
         let ctx = contexts.get_mut("cap-susp-ctx").unwrap();
         ctx.governance.consequence_rules = vec![ConsequenceRule {
             trigger: ConsequenceTrigger::MessageVelocity,
-            action: ConsequenceAction::Suspend {
-                capabilities: vec!["write".to_owned()],
-            },
+            action: ConsequenceAction::Enforcement(EnforcementSeverity::SuspendCapability {
+                capabilities: vec![Capability::MessagesWrite],
+            }),
             threshold: 1,
             window: Duration::from_secs(3600),
         }];
@@ -5518,7 +5518,7 @@ async fn test_capability_suspension_revokes_write() {
 #[tokio::test]
 async fn test_access_revocation_revokes_read_and_write() {
     use scp_protocol::trust::consequence::{
-        ConsequenceAction, ConsequenceRule, ConsequenceTrigger,
+        ConsequenceAction, ConsequenceRule, ConsequenceTrigger, EnforcementSeverity,
     };
     use std::time::Duration;
 
@@ -5540,7 +5540,7 @@ async fn test_access_revocation_revokes_read_and_write() {
         let ctx = contexts.get_mut("access-rev-ctx").unwrap();
         ctx.governance.consequence_rules = vec![ConsequenceRule {
             trigger: ConsequenceTrigger::MessageVelocity,
-            action: ConsequenceAction::SuspendAll,
+            action: ConsequenceAction::Enforcement(EnforcementSeverity::SuspendAccess),
             threshold: 1,
             window: Duration::from_secs(3600),
         }];
@@ -5825,7 +5825,7 @@ async fn test_rotate_content_keys_advances_epoch() {
 #[tokio::test]
 async fn test_capability_suspension_no_match_returns_false() {
     use scp_protocol::trust::consequence::{
-        ConsequenceAction, ConsequenceRule, ConsequenceTrigger,
+        ConsequenceAction, ConsequenceRule, ConsequenceTrigger, EnforcementSeverity,
     };
     use std::time::Duration;
 
@@ -5848,9 +5848,9 @@ async fn test_capability_suspension_no_match_returns_false() {
         let ctx = contexts.get_mut("no-match-ctx").unwrap();
         ctx.governance.consequence_rules = vec![ConsequenceRule {
             trigger: ConsequenceTrigger::MessageVelocity,
-            action: ConsequenceAction::Suspend {
-                capabilities: vec!["foobar".to_owned()],
-            },
+            action: ConsequenceAction::Enforcement(EnforcementSeverity::SuspendCapability {
+                capabilities: vec![Capability::Custom("foobar".to_owned())],
+            }),
             threshold: 1,
             window: Duration::from_secs(3600),
         }];
@@ -5877,20 +5877,22 @@ async fn test_capability_suspension_no_match_returns_false() {
         .await
         .unwrap();
 
-    // H10: non-matching caps produce success=false, which escalates to
-    // SuspendAll. The escalation event has action_type="SuspendAll(escalated)"
-    // and success=true.
+    // With typed Capability, Custom("foobar") is a valid capability that
+    // successfully suspends even though the member may not hold it. The old
+    // string-based path would have returned false for an unknown string, but
+    // typed capabilities are always valid. Enforcement succeeds.
     let events = manager.drain_events("no-match-ctx").await;
-    let enforced_with_escalation = events.iter().any(|e| {
+    let enforced_success = events.iter().any(|e| {
         matches!(e, ContextEvent::ConsequenceEnforced { action_type, success, .. }
-            if action_type == "SuspendAll(escalated)" && *success)
+            if action_type == "SuspendCapability" && *success)
     });
     assert!(
-        enforced_with_escalation,
-        "expected ConsequenceEnforced with escalated SuspendAll for non-matching caps: {events:?}"
+        enforced_success,
+        "expected ConsequenceEnforced success for typed Custom capability: {events:?}"
     );
 
-    // H10: admin IS now suspended due to escalation.
+    // Custom("foobar") is in the suspended set even though it may not be
+    // in the member's granted capabilities.
     let contexts = manager.contexts.lock().await;
     let ctx = contexts.get("no-match-ctx").unwrap();
     assert!(
@@ -5992,7 +5994,7 @@ async fn pending_removal_blocks_proposal() {
             proposal_id: [0u8; 32],
             context_id: "standing-ctx".to_owned(),
             proposer_did: admin.clone(),
-            action: GovernanceAction::Eject {
+            action: GovernanceAction::MemberEject {
                 did: alice.clone(),
                 reason: Some("test".into()),
             },
@@ -6091,7 +6093,7 @@ async fn participation_blocks_low_score_proposer() {
             proposal_id: [1u8; 32],
             context_id: "standing-low-ctx".to_owned(),
             proposer_did: admin.clone(),
-            action: GovernanceAction::Eject {
+            action: GovernanceAction::MemberEject {
                 did: alice.clone(),
                 reason: Some("standing test".into()),
             },
@@ -6124,7 +6126,7 @@ async fn participation_blocks_low_score_proposer() {
 #[tokio::test]
 async fn velocity_consequence_triggers_on_high_rate() {
     use scp_protocol::trust::consequence::{
-        ConsequenceAction, ConsequenceRule, ConsequenceTrigger,
+        ConsequenceAction, ConsequenceRule, ConsequenceTrigger, EnforcementSeverity,
     };
     use std::time::Duration;
 
@@ -6139,9 +6141,9 @@ async fn velocity_consequence_triggers_on_high_rate() {
     params.consequence_rules = vec![ConsequenceRule {
         trigger: ConsequenceTrigger::MessageVelocity,
         threshold: 1,
-        action: ConsequenceAction::Suspend {
-            capabilities: vec!["write".to_owned()],
-        },
+        action: ConsequenceAction::Enforcement(EnforcementSeverity::SuspendCapability {
+            capabilities: vec![Capability::MessagesWrite],
+        }),
         window: Duration::from_secs(3600),
     }];
     let _handle = manager
@@ -6310,7 +6312,7 @@ async fn sender_key_before_mls_removal_ordering() {
     call_order.lock().unwrap().clear();
 
     // Remove Alice via governance.
-    let action = scp_protocol::context::governance::GovernanceAction::Eject {
+    let action = scp_protocol::context::governance::GovernanceAction::MemberEject {
         did: alice.clone(),
         reason: Some("ordering test".into()),
     };
@@ -6429,7 +6431,7 @@ async fn pending_removal_blocks_governance() {
             proposal_id: [2u8; 32],
             context_id: "reject-ctx".to_owned(),
             proposer_did: admin.clone(),
-            action: GovernanceAction::Eject {
+            action: GovernanceAction::MemberEject {
                 did: target.clone(),
                 reason: Some("bad actor".into()),
             },
@@ -6574,7 +6576,7 @@ async fn participation_record_updated_after_message_send() {
 #[tokio::test]
 async fn consequence_triggers_after_governance_action() {
     use scp_protocol::trust::consequence::{
-        ConsequenceAction, ConsequenceRule, ConsequenceTrigger,
+        ConsequenceAction, ConsequenceRule, ConsequenceTrigger, EnforcementSeverity,
     };
     use std::time::Duration;
 
@@ -6592,9 +6594,9 @@ async fn consequence_triggers_after_governance_action() {
     params.consequence_rules = vec![ConsequenceRule {
         trigger: ConsequenceTrigger::MessageVelocity,
         threshold: 1,
-        action: ConsequenceAction::Suspend {
-            capabilities: vec!["write".to_owned()],
-        },
+        action: ConsequenceAction::Enforcement(EnforcementSeverity::SuspendCapability {
+            capabilities: vec![Capability::MessagesWrite],
+        }),
         window: Duration::from_secs(3600),
     }];
     let _handle = manager
@@ -6662,7 +6664,7 @@ async fn consequence_triggers_after_governance_action() {
 #[tokio::test]
 async fn cooldown_expires_allows_retrigger() {
     use scp_protocol::trust::consequence::{
-        ConsequenceAction, ConsequenceRule, ConsequenceTrigger,
+        ConsequenceAction, ConsequenceRule, ConsequenceTrigger, EnforcementSeverity,
     };
     use std::time::Duration;
 
@@ -6685,7 +6687,7 @@ async fn cooldown_expires_allows_retrigger() {
         let ctx = contexts.get_mut("cooldown-exp-ctx").unwrap();
         ctx.governance.consequence_rules = vec![ConsequenceRule {
             trigger: ConsequenceTrigger::MessageVelocity,
-            action: ConsequenceAction::SuspendAll,
+            action: ConsequenceAction::Enforcement(EnforcementSeverity::SuspendAccess),
             threshold: 1,
             window: Duration::from_secs(1), // 1 second cooldown
         }];
@@ -6816,7 +6818,7 @@ async fn empty_consequence_rules_no_evaluation() {
 #[tokio::test]
 async fn event_log_entries_feed_consequence_evaluation() {
     use scp_protocol::trust::consequence::{
-        ConsequenceAction, ConsequenceRule, ConsequenceTrigger,
+        ConsequenceAction, ConsequenceRule, ConsequenceTrigger, EnforcementSeverity,
     };
     use std::time::Duration;
 
@@ -6832,9 +6834,9 @@ async fn event_log_entries_feed_consequence_evaluation() {
     params.consequence_rules = vec![ConsequenceRule {
         trigger: ConsequenceTrigger::MessageVelocity,
         threshold: 3,
-        action: ConsequenceAction::Suspend {
-            capabilities: vec!["write".to_owned()],
-        },
+        action: ConsequenceAction::Enforcement(EnforcementSeverity::SuspendCapability {
+            capabilities: vec![Capability::MessagesWrite],
+        }),
         window: Duration::from_secs(3600),
     }];
     let _handle = manager
@@ -6968,7 +6970,7 @@ async fn remaining_members_keys_after_removal() {
     sk_removed_clone.lock().unwrap().clear();
 
     // Remove only Alice.
-    let action = scp_protocol::context::governance::GovernanceAction::Eject {
+    let action = scp_protocol::context::governance::GovernanceAction::MemberEject {
         did: alice.clone(),
         reason: Some("selective removal".into()),
     };
@@ -7114,7 +7116,7 @@ async fn encrypted_rotation_updates_epoch_counter() {
 async fn full_send_consequence_enforcement_round_trip() {
     use scp_protocol::economy::types::{Amount, CostSchedule, CurrencyCode, EconomicPolicy};
     use scp_protocol::trust::consequence::{
-        ConsequenceAction, ConsequenceRule, ConsequenceTrigger,
+        ConsequenceAction, ConsequenceRule, ConsequenceTrigger, EnforcementSeverity,
     };
     use std::time::Duration;
 
@@ -7145,9 +7147,9 @@ async fn full_send_consequence_enforcement_round_trip() {
     params.consequence_rules = vec![ConsequenceRule {
         trigger: ConsequenceTrigger::MessageVelocity,
         threshold: 1,
-        action: ConsequenceAction::Suspend {
-            capabilities: vec!["write".to_owned()],
-        },
+        action: ConsequenceAction::Enforcement(EnforcementSeverity::SuspendCapability {
+            capabilities: vec![Capability::MessagesWrite],
+        }),
         window: Duration::from_secs(3600),
     }];
     let _handle = manager
@@ -7291,7 +7293,7 @@ async fn governance_participation_round_trip() {
 #[tokio::test]
 async fn capability_suspension_blocks_subsequent_send() {
     use scp_protocol::trust::consequence::{
-        ConsequenceAction, ConsequenceRule, ConsequenceTrigger,
+        ConsequenceAction, ConsequenceRule, ConsequenceTrigger, EnforcementSeverity,
     };
     use std::time::Duration;
 
@@ -7306,9 +7308,9 @@ async fn capability_suspension_blocks_subsequent_send() {
     params.consequence_rules = vec![ConsequenceRule {
         trigger: ConsequenceTrigger::MessageVelocity,
         threshold: 1,
-        action: ConsequenceAction::Suspend {
-            capabilities: vec!["write".to_owned()],
-        },
+        action: ConsequenceAction::Enforcement(EnforcementSeverity::SuspendCapability {
+            capabilities: vec![Capability::MessagesWrite],
+        }),
         window: Duration::from_secs(3600),
     }];
     let _handle = manager
@@ -7364,7 +7366,7 @@ async fn capability_suspension_blocks_subsequent_send() {
 #[tokio::test]
 async fn access_revocation_blocks_subsequent_send() {
     use scp_protocol::trust::consequence::{
-        ConsequenceAction, ConsequenceRule, ConsequenceTrigger,
+        ConsequenceAction, ConsequenceRule, ConsequenceTrigger, EnforcementSeverity,
     };
     use std::time::Duration;
 
@@ -7379,7 +7381,7 @@ async fn access_revocation_blocks_subsequent_send() {
     params.consequence_rules = vec![ConsequenceRule {
         trigger: ConsequenceTrigger::MessageVelocity,
         threshold: 1,
-        action: ConsequenceAction::SuspendAll,
+        action: ConsequenceAction::Enforcement(EnforcementSeverity::SuspendAccess),
         window: Duration::from_secs(3600),
     }];
     let _handle = manager
@@ -7703,7 +7705,7 @@ async fn eligibility_allows_good_participation() {
 #[tokio::test]
 async fn consequence_triggers_on_message_send() {
     use scp_protocol::trust::consequence::{
-        ConsequenceAction, ConsequenceRule, ConsequenceTrigger,
+        ConsequenceAction, ConsequenceRule, ConsequenceTrigger, EnforcementSeverity,
     };
     use std::time::Duration;
 
@@ -7718,9 +7720,9 @@ async fn consequence_triggers_on_message_send() {
     params.consequence_rules = vec![ConsequenceRule {
         trigger: ConsequenceTrigger::MessageVelocity,
         threshold: 1,
-        action: ConsequenceAction::Suspend {
-            capabilities: vec!["write".to_owned()],
-        },
+        action: ConsequenceAction::Enforcement(EnforcementSeverity::SuspendCapability {
+            capabilities: vec![Capability::MessagesWrite],
+        }),
         window: Duration::from_secs(3600),
     }];
     let _handle = manager
@@ -8612,7 +8614,7 @@ async fn test_participation_record_updated_after_send() {
 #[tokio::test]
 async fn test_consequence_triggers_on_governance_action() {
     use scp_protocol::trust::consequence::{
-        ConsequenceAction, ConsequenceRule, ConsequenceTrigger,
+        ConsequenceAction, ConsequenceRule, ConsequenceTrigger, EnforcementSeverity,
     };
     use std::time::Duration;
 
@@ -8630,9 +8632,9 @@ async fn test_consequence_triggers_on_governance_action() {
     params.consequence_rules = vec![ConsequenceRule {
         trigger: ConsequenceTrigger::MessageVelocity,
         threshold: 1,
-        action: ConsequenceAction::Suspend {
-            capabilities: vec!["write".to_owned()],
-        },
+        action: ConsequenceAction::Enforcement(EnforcementSeverity::SuspendCapability {
+            capabilities: vec![Capability::MessagesWrite],
+        }),
         window: Duration::from_secs(3600),
     }];
     let _handle = manager
@@ -8694,7 +8696,7 @@ async fn test_consequence_triggers_on_governance_action() {
 #[tokio::test]
 async fn test_capability_suspension_blocks_subsequent_send() {
     use scp_protocol::trust::consequence::{
-        ConsequenceAction, ConsequenceRule, ConsequenceTrigger,
+        ConsequenceAction, ConsequenceRule, ConsequenceTrigger, EnforcementSeverity,
     };
     use std::time::Duration;
 
@@ -8709,9 +8711,9 @@ async fn test_capability_suspension_blocks_subsequent_send() {
     params.consequence_rules = vec![ConsequenceRule {
         trigger: ConsequenceTrigger::MessageVelocity,
         threshold: 1,
-        action: ConsequenceAction::Suspend {
-            capabilities: vec!["write".to_owned()],
-        },
+        action: ConsequenceAction::Enforcement(EnforcementSeverity::SuspendCapability {
+            capabilities: vec![Capability::MessagesWrite],
+        }),
         window: Duration::from_secs(3600),
     }];
     let _handle = manager
@@ -8764,7 +8766,7 @@ async fn test_capability_suspension_blocks_subsequent_send() {
 #[tokio::test]
 async fn test_access_revocation_blocks_subsequent_send() {
     use scp_protocol::trust::consequence::{
-        ConsequenceAction, ConsequenceRule, ConsequenceTrigger,
+        ConsequenceAction, ConsequenceRule, ConsequenceTrigger, EnforcementSeverity,
     };
     use std::time::Duration;
 
@@ -8779,7 +8781,7 @@ async fn test_access_revocation_blocks_subsequent_send() {
     params.consequence_rules = vec![ConsequenceRule {
         trigger: ConsequenceTrigger::MessageVelocity,
         threshold: 1,
-        action: ConsequenceAction::SuspendAll,
+        action: ConsequenceAction::Enforcement(EnforcementSeverity::SuspendAccess),
         window: Duration::from_secs(3600),
     }];
     let _handle = manager
@@ -8827,7 +8829,7 @@ async fn test_access_revocation_blocks_subsequent_send() {
 #[tokio::test]
 async fn test_cooldown_expires_allows_retrigger() {
     use scp_protocol::trust::consequence::{
-        ConsequenceAction, ConsequenceRule, ConsequenceTrigger,
+        ConsequenceAction, ConsequenceRule, ConsequenceTrigger, EnforcementSeverity,
     };
     use std::time::Duration;
 
@@ -8850,7 +8852,7 @@ async fn test_cooldown_expires_allows_retrigger() {
         let ctx = contexts.get_mut("cd-exp2-ctx").unwrap();
         ctx.governance.consequence_rules = vec![ConsequenceRule {
             trigger: ConsequenceTrigger::MessageVelocity,
-            action: ConsequenceAction::SuspendAll,
+            action: ConsequenceAction::Enforcement(EnforcementSeverity::SuspendAccess),
             threshold: 1,
             window: Duration::from_secs(1),
         }];
@@ -8969,7 +8971,7 @@ async fn test_empty_consequence_rules_no_evaluation() {
 #[tokio::test]
 async fn test_multiple_consequence_rules_all_evaluated() {
     use scp_protocol::trust::consequence::{
-        ConsequenceAction, ConsequenceRule, ConsequenceTrigger,
+        ConsequenceAction, ConsequenceRule, ConsequenceTrigger, EnforcementSeverity,
     };
     use std::time::Duration;
 
@@ -8986,9 +8988,9 @@ async fn test_multiple_consequence_rules_all_evaluated() {
         ConsequenceRule {
             trigger: ConsequenceTrigger::MessageVelocity,
             threshold: 1,
-            action: ConsequenceAction::Suspend {
-                capabilities: vec!["write".to_owned()],
-            },
+            action: ConsequenceAction::Enforcement(EnforcementSeverity::SuspendCapability {
+                capabilities: vec![Capability::MessagesWrite],
+            }),
             window: Duration::from_secs(3600),
         },
         ConsequenceRule {
@@ -9477,7 +9479,7 @@ async fn test_sender_key_removal_error_propagates() {
     manager.join_context(&handle, kp, None).await.unwrap();
 
     // Remove Alice — sender key removal will fail but MLS removal succeeds.
-    let action = scp_protocol::context::governance::GovernanceAction::Eject {
+    let action = scp_protocol::context::governance::GovernanceAction::MemberEject {
         did: alice.clone(),
         reason: Some("error propagation test".into()),
     };
@@ -9522,7 +9524,7 @@ async fn test_remaining_members_unaffected_after_removal() {
     }
 
     // Remove Bob.
-    let action = scp_protocol::context::governance::GovernanceAction::Eject {
+    let action = scp_protocol::context::governance::GovernanceAction::MemberEject {
         did: bob.clone(),
         reason: Some("test removal".into()),
     };
@@ -9646,7 +9648,7 @@ async fn test_encrypted_rotation_increments_epoch() {
 async fn test_send_consequence_economy_round_trip() {
     use scp_protocol::economy::types::{Amount, CostSchedule, CurrencyCode, EconomicPolicy};
     use scp_protocol::trust::consequence::{
-        ConsequenceAction, ConsequenceRule, ConsequenceTrigger,
+        ConsequenceAction, ConsequenceRule, ConsequenceTrigger, EnforcementSeverity,
     };
     use std::time::Duration;
 
@@ -9675,9 +9677,9 @@ async fn test_send_consequence_economy_round_trip() {
     params.consequence_rules = vec![ConsequenceRule {
         trigger: ConsequenceTrigger::MessageVelocity,
         threshold: 1,
-        action: ConsequenceAction::Suspend {
-            capabilities: vec!["write".to_owned()],
-        },
+        action: ConsequenceAction::Enforcement(EnforcementSeverity::SuspendCapability {
+            capabilities: vec![Capability::MessagesWrite],
+        }),
         window: Duration::from_secs(3600),
     }];
     let _handle = manager
@@ -9810,7 +9812,7 @@ async fn test_governance_eligibility_participation_round_trip() {
 async fn test_paid_join_with_consequence_evaluation() {
     use scp_protocol::economy::types::{Amount, CostSchedule, CurrencyCode, EconomicPolicy};
     use scp_protocol::trust::consequence::{
-        ConsequenceAction, ConsequenceRule, ConsequenceTrigger,
+        ConsequenceAction, ConsequenceRule, ConsequenceTrigger, EnforcementSeverity,
     };
     use std::time::Duration;
 
@@ -9839,9 +9841,9 @@ async fn test_paid_join_with_consequence_evaluation() {
     params.consequence_rules = vec![ConsequenceRule {
         trigger: ConsequenceTrigger::MessageVelocity,
         threshold: 1,
-        action: ConsequenceAction::Suspend {
-            capabilities: vec!["write".to_owned()],
-        },
+        action: ConsequenceAction::Enforcement(EnforcementSeverity::SuspendCapability {
+            capabilities: vec![Capability::MessagesWrite],
+        }),
         window: Duration::from_secs(3600),
     }];
     let handle = manager
@@ -10234,7 +10236,7 @@ async fn rotate_sender_key_called_after_remove_member() {
     call_order.lock().unwrap().clear();
 
     // Remove Alice via governance.
-    let action = scp_protocol::context::governance::GovernanceAction::Eject {
+    let action = scp_protocol::context::governance::GovernanceAction::MemberEject {
         did: alice.clone(),
         reason: Some("rotation test".into()),
     };
@@ -10305,7 +10307,7 @@ async fn rotate_sender_key_error_propagates() {
     // action succeeds. MLS removal (the hard security boundary) completes;
     // rotate_sender_key failure is logged as a warning but does not abort
     // the operation, avoiding inconsistent state.
-    let action = scp_protocol::context::governance::GovernanceAction::Eject {
+    let action = scp_protocol::context::governance::GovernanceAction::MemberEject {
         did: alice.clone(),
         reason: Some("error test".into()),
     };
@@ -10643,7 +10645,7 @@ async fn test_event_log_stores_actor_did() {
 #[tokio::test]
 async fn test_consequence_evaluation_uses_full_history() {
     use scp_protocol::trust::consequence::{
-        ConsequenceAction, ConsequenceRule, ConsequenceTrigger,
+        ConsequenceAction, ConsequenceRule, ConsequenceTrigger, EnforcementSeverity,
     };
     use std::time::Duration;
 
@@ -10660,9 +10662,9 @@ async fn test_consequence_evaluation_uses_full_history() {
     params.consequence_rules = vec![ConsequenceRule {
         trigger: ConsequenceTrigger::MessageVelocity,
         threshold: 2,
-        action: ConsequenceAction::Suspend {
-            capabilities: vec!["write".to_owned()],
-        },
+        action: ConsequenceAction::Enforcement(EnforcementSeverity::SuspendCapability {
+            capabilities: vec![Capability::MessagesWrite],
+        }),
         window: Duration::from_secs(3600),
     }];
     let _handle = manager
@@ -11169,7 +11171,7 @@ async fn rotate_sender_key_not_called_when_remove_member_fails() {
     call_order.lock().unwrap().clear();
 
     // Remove Alice via governance — should fail at remove_member.
-    let action = scp_protocol::context::governance::GovernanceAction::Eject {
+    let action = scp_protocol::context::governance::GovernanceAction::MemberEject {
         did: alice.clone(),
         reason: Some("rotation skip test".into()),
     };
@@ -11333,7 +11335,7 @@ async fn governance_action_stores_actor_did() {
     manager.join_context(&handle, kp, None).await.unwrap();
 
     // Execute governance action: Eject.
-    let action = scp_protocol::context::governance::GovernanceAction::Eject {
+    let action = scp_protocol::context::governance::GovernanceAction::MemberEject {
         did: target.clone(),
         reason: Some("actor_did test".into()),
     };
@@ -11579,7 +11581,7 @@ async fn no_double_charge_on_paid_send() {
 #[tokio::test]
 async fn capability_suspension_exact_match_no_false_positive() {
     use scp_protocol::trust::consequence::{
-        ConsequenceAction, ConsequenceRule, ConsequenceTrigger,
+        ConsequenceAction, ConsequenceRule, ConsequenceTrigger, EnforcementSeverity,
     };
     use std::time::Duration;
 
@@ -11604,9 +11606,9 @@ async fn capability_suspension_exact_match_no_false_positive() {
         ctx.governance.consequence_rules = vec![ConsequenceRule {
             trigger: ConsequenceTrigger::MessageVelocity,
             threshold: 1,
-            action: ConsequenceAction::Suspend {
-                capabilities: vec!["spreadsheet".to_owned()],
-            },
+            action: ConsequenceAction::Enforcement(EnforcementSeverity::SuspendCapability {
+                capabilities: vec![Capability::Custom("spreadsheet".to_owned())],
+            }),
             window: Duration::from_secs(3600),
         }];
     }
@@ -11634,35 +11636,37 @@ async fn capability_suspension_exact_match_no_false_positive() {
         .await
         .unwrap();
 
-    // H10: "spreadsheet" is unknown — enforce_suspend returns false,
-    // which escalates to SuspendAll. So capabilities are now suspended.
-    let write_suspended = {
+    // With typed Capability, Custom("spreadsheet") is a valid capability and
+    // suspension succeeds. The member gets Custom("spreadsheet") in their
+    // suspended set. Since MessagesWrite is NOT suspended, they can still send.
+    let cap_suspended = {
         let contexts = manager.contexts.lock().await;
         let ctx = contexts.get("cap-exact-ctx").unwrap();
         ctx.role_state
             .suspended_capabilities
             .get("did:key:sender")
-            .is_some_and(|s| !s.is_empty())
+            .is_some_and(|s| s.contains(&Capability::Custom("spreadsheet".to_owned())))
     };
     assert!(
-        write_suspended,
-        "unknown capability suspension should escalate to SuspendAll (H10)"
+        cap_suspended,
+        "Custom('spreadsheet') should be in suspended set"
     );
 
-    // Member should NOT be able to send after escalation.
+    // Member CAN still send because only Custom("spreadsheet") is suspended,
+    // not MessagesWrite.
     let result = manager
         .send_message(
             &handle,
             &"did:key:sender".into(),
-            b"should be blocked",
+            b"should succeed",
             Some(&sk),
             None,
             None,
         )
         .await;
     assert!(
-        result.is_err(),
-        "sender should be blocked after escalation: {result:?}"
+        result.is_ok(),
+        "sender should NOT be blocked when only Custom('spreadsheet') is suspended: {result:?}"
     );
 }
 
@@ -11673,7 +11677,7 @@ async fn capability_suspension_exact_match_no_false_positive() {
 #[tokio::test]
 async fn capability_suspension_write_revokes_write() {
     use scp_protocol::trust::consequence::{
-        ConsequenceAction, ConsequenceRule, ConsequenceTrigger,
+        ConsequenceAction, ConsequenceRule, ConsequenceTrigger, EnforcementSeverity,
     };
     use std::time::Duration;
 
@@ -11688,9 +11692,9 @@ async fn capability_suspension_write_revokes_write() {
     params.consequence_rules = vec![ConsequenceRule {
         trigger: ConsequenceTrigger::MessageVelocity,
         threshold: 1,
-        action: ConsequenceAction::Suspend {
-            capabilities: vec!["write".to_owned()],
-        },
+        action: ConsequenceAction::Enforcement(EnforcementSeverity::SuspendCapability {
+            capabilities: vec![Capability::MessagesWrite],
+        }),
         window: Duration::from_secs(3600),
     }];
     let _handle = manager
@@ -11743,7 +11747,7 @@ async fn capability_suspension_write_revokes_write() {
 #[tokio::test]
 async fn capability_suspension_read_revokes_read() {
     use scp_protocol::trust::consequence::{
-        ConsequenceAction, ConsequenceRule, ConsequenceTrigger,
+        ConsequenceAction, ConsequenceRule, ConsequenceTrigger, EnforcementSeverity,
     };
     use std::time::Duration;
 
@@ -11758,9 +11762,9 @@ async fn capability_suspension_read_revokes_read() {
     params.consequence_rules = vec![ConsequenceRule {
         trigger: ConsequenceTrigger::MessageVelocity,
         threshold: 1,
-        action: ConsequenceAction::Suspend {
-            capabilities: vec!["read".to_owned()],
-        },
+        action: ConsequenceAction::Enforcement(EnforcementSeverity::SuspendCapability {
+            capabilities: vec![Capability::MessagesRead],
+        }),
         window: Duration::from_secs(3600),
     }];
     let _handle = manager
@@ -11811,7 +11815,7 @@ async fn capability_suspension_read_revokes_read() {
 #[tokio::test]
 async fn capability_suspension_messages_write_revokes_write() {
     use scp_protocol::trust::consequence::{
-        ConsequenceAction, ConsequenceRule, ConsequenceTrigger,
+        ConsequenceAction, ConsequenceRule, ConsequenceTrigger, EnforcementSeverity,
     };
     use std::time::Duration;
 
@@ -11826,9 +11830,9 @@ async fn capability_suspension_messages_write_revokes_write() {
     params.consequence_rules = vec![ConsequenceRule {
         trigger: ConsequenceTrigger::MessageVelocity,
         threshold: 1,
-        action: ConsequenceAction::Suspend {
-            capabilities: vec!["MessagesWrite".to_owned()],
-        },
+        action: ConsequenceAction::Enforcement(EnforcementSeverity::SuspendCapability {
+            capabilities: vec![Capability::MessagesWrite],
+        }),
         window: Duration::from_secs(3600),
     }];
     let _handle = manager
@@ -12074,7 +12078,7 @@ async fn verify_receipts_no_adapter_returns_no_verifier_error() {
 #[tokio::test]
 async fn cooldown_advance_past_allows_retrigger() {
     use scp_protocol::trust::consequence::{
-        ConsequenceAction, ConsequenceRule, ConsequenceTrigger,
+        ConsequenceAction, ConsequenceRule, ConsequenceTrigger, EnforcementSeverity,
     };
     use std::time::Duration;
 
@@ -12090,9 +12094,9 @@ async fn cooldown_advance_past_allows_retrigger() {
     params.consequence_rules = vec![ConsequenceRule {
         trigger: ConsequenceTrigger::MessageVelocity,
         threshold: 1,
-        action: ConsequenceAction::Suspend {
-            capabilities: vec!["write".to_owned()],
-        },
+        action: ConsequenceAction::Enforcement(EnforcementSeverity::SuspendCapability {
+            capabilities: vec![Capability::MessagesWrite],
+        }),
         window: Duration::from_secs(10),
     }];
     let _handle = manager
@@ -12256,7 +12260,7 @@ async fn participation_cache_cleared_after_member_leaves() {
 #[tokio::test]
 async fn capability_suspension_empty_caps_no_action() {
     use scp_protocol::trust::consequence::{
-        ConsequenceAction, ConsequenceRule, ConsequenceTrigger,
+        ConsequenceAction, ConsequenceRule, ConsequenceTrigger, EnforcementSeverity,
     };
     use std::time::Duration;
 
@@ -12267,19 +12271,26 @@ async fn capability_suspension_empty_caps_no_action() {
         noop_key_resolver(),
     );
 
-    let mut params = governance_params();
-    params.consequence_rules = vec![ConsequenceRule {
-        trigger: ConsequenceTrigger::MessageVelocity,
-        threshold: 1,
-        action: ConsequenceAction::Suspend {
-            capabilities: vec![],
-        }, // empty caps
-        window: Duration::from_secs(3600),
-    }];
+    let params = governance_params();
+    // Create context without consequence rules, then inject directly to
+    // bypass validation (which now rejects empty capabilities in
+    // SuspendCapability).
     let _handle = manager
         .create_context("empty-caps-ctx".into(), params, "did:key:sender".into())
         .await
         .unwrap();
+    {
+        let mut contexts = manager.contexts.lock().await;
+        let ctx = contexts.get_mut("empty-caps-ctx").unwrap();
+        ctx.governance.consequence_rules = vec![ConsequenceRule {
+            trigger: ConsequenceTrigger::MessageVelocity,
+            threshold: 1,
+            action: ConsequenceAction::Enforcement(EnforcementSeverity::SuspendCapability {
+                capabilities: vec![],
+            }),
+            window: Duration::from_secs(3600),
+        }];
+    }
 
     let sk = ed25519_dalek::SigningKey::from_bytes(&[1u8; 32]);
     let handle = manager
@@ -12348,7 +12359,7 @@ async fn capability_suspension_empty_caps_no_action() {
 #[tokio::test]
 async fn multiple_consequence_rules_all_trigger() {
     use scp_protocol::trust::consequence::{
-        ConsequenceAction, ConsequenceRule, ConsequenceTrigger,
+        ConsequenceAction, ConsequenceRule, ConsequenceTrigger, EnforcementSeverity,
     };
     use std::time::Duration;
 
@@ -12364,17 +12375,17 @@ async fn multiple_consequence_rules_all_trigger() {
         ConsequenceRule {
             trigger: ConsequenceTrigger::MessageVelocity,
             threshold: 1,
-            action: ConsequenceAction::Suspend {
-                capabilities: vec!["write".to_owned()],
-            },
+            action: ConsequenceAction::Enforcement(EnforcementSeverity::SuspendCapability {
+                capabilities: vec![Capability::MessagesWrite],
+            }),
             window: Duration::from_secs(3600),
         },
         ConsequenceRule {
             trigger: ConsequenceTrigger::MessageVelocity,
             threshold: 1,
-            action: ConsequenceAction::Suspend {
-                capabilities: vec!["read".to_owned()],
-            },
+            action: ConsequenceAction::Enforcement(EnforcementSeverity::SuspendCapability {
+                capabilities: vec![Capability::MessagesRead],
+            }),
             window: Duration::from_secs(3600),
         },
     ];
@@ -12703,7 +12714,7 @@ async fn verify_receipts_with_noop_adapter_returns_valid() {
 #[tokio::test]
 async fn consequence_fires_on_governance_action() {
     use scp_protocol::trust::consequence::{
-        ConsequenceAction, ConsequenceRule, ConsequenceTrigger,
+        ConsequenceAction, ConsequenceRule, ConsequenceTrigger, EnforcementSeverity,
     };
     use std::time::Duration;
 
@@ -12722,9 +12733,9 @@ async fn consequence_fires_on_governance_action() {
     params.consequence_rules = vec![ConsequenceRule {
         trigger: ConsequenceTrigger::WarningCount,
         threshold: 1,
-        action: ConsequenceAction::Suspend {
-            capabilities: vec!["write".to_owned()],
-        },
+        action: ConsequenceAction::Enforcement(EnforcementSeverity::SuspendCapability {
+            capabilities: vec![Capability::MessagesWrite],
+        }),
         window: Duration::from_secs(3600),
     }];
     let handle = manager
@@ -12743,7 +12754,7 @@ async fn consequence_fires_on_governance_action() {
     let _ = manager.drain_events("gov-csq-ctx").await;
 
     // Execute governance action: ban target.
-    let action = scp_protocol::context::governance::GovernanceAction::Eject {
+    let action = scp_protocol::context::governance::GovernanceAction::MemberEject {
         did: target.clone(),
         reason: Some("consequence test".into()),
     };
@@ -12780,7 +12791,7 @@ async fn consequence_fires_on_governance_action() {
 #[tokio::test]
 async fn test_warning_count_trigger_fires_behavioral() {
     use scp_protocol::trust::consequence::{
-        ConsequenceAction, ConsequenceRule, ConsequenceTrigger,
+        ConsequenceAction, ConsequenceRule, ConsequenceTrigger, EnforcementSeverity,
     };
     use std::time::Duration;
 
@@ -12802,9 +12813,9 @@ async fn test_warning_count_trigger_fires_behavioral() {
     params.consequence_rules = vec![ConsequenceRule {
         trigger: ConsequenceTrigger::WarningCount,
         threshold: 2,
-        action: ConsequenceAction::Suspend {
-            capabilities: vec!["messages:write".to_owned()],
-        },
+        action: ConsequenceAction::Enforcement(EnforcementSeverity::SuspendCapability {
+            capabilities: vec![Capability::MessagesWrite],
+        }),
         window: Duration::from_secs(3600),
     }];
     let handle = manager
@@ -12823,7 +12834,7 @@ async fn test_warning_count_trigger_fires_behavioral() {
     let _ = manager.drain_events("warn-ctx").await;
 
     // First governance action against target — threshold not yet met.
-    let action1 = scp_protocol::context::governance::GovernanceAction::Eject {
+    let action1 = scp_protocol::context::governance::GovernanceAction::MemberEject {
         did: target.clone(),
         reason: Some("warning 1".into()),
     };
@@ -12849,7 +12860,7 @@ async fn test_warning_count_trigger_fires_behavioral() {
     let _ = manager.drain_events("warn-ctx").await;
 
     // Second governance action against target — threshold met.
-    let action2 = scp_protocol::context::governance::GovernanceAction::Eject {
+    let action2 = scp_protocol::context::governance::GovernanceAction::MemberEject {
         did: target.clone(),
         reason: Some("warning 2".into()),
     };
@@ -12910,7 +12921,7 @@ async fn test_participation_actions_against_populated() {
     manager.join_context(&handle, kp, None).await.unwrap();
 
     // Execute a governance action against the target.
-    let action = scp_protocol::context::governance::GovernanceAction::Eject {
+    let action = scp_protocol::context::governance::GovernanceAction::MemberEject {
         did: target.clone(),
         reason: Some("test action".into()),
     };
@@ -13258,7 +13269,7 @@ async fn eligibility_check_uses_context_manager_clock() {
     manager.join_context(&handle, kp, None).await.unwrap();
 
     // Execute a governance action — verifies clock is used without panicking.
-    let action = scp_protocol::context::governance::GovernanceAction::Eject {
+    let action = scp_protocol::context::governance::GovernanceAction::MemberEject {
         did: "did:key:member".into(),
         reason: Some("clock test".into()),
     };
@@ -13689,7 +13700,7 @@ fn cooldown_until_snapshot_roundtrip() {
 #[tokio::test(start_paused = true)]
 async fn consequence_timer_fires_without_user_action() {
     use scp_protocol::trust::consequence::{
-        ConsequenceAction, ConsequenceRule, ConsequenceTrigger,
+        ConsequenceAction, ConsequenceRule, ConsequenceTrigger, EnforcementSeverity,
     };
     use std::time::Duration;
 
@@ -13709,9 +13720,9 @@ async fn consequence_timer_fires_without_user_action() {
     params.consequence_rules = vec![ConsequenceRule {
         trigger: ConsequenceTrigger::MessageVelocity,
         threshold: 1,
-        action: ConsequenceAction::Suspend {
-            capabilities: vec!["write".to_owned()],
-        },
+        action: ConsequenceAction::Enforcement(EnforcementSeverity::SuspendCapability {
+            capabilities: vec![Capability::MessagesWrite],
+        }),
         window: Duration::from_secs(3600),
     }];
 
@@ -13767,7 +13778,7 @@ async fn consequence_timer_fires_without_user_action() {
 #[tokio::test(start_paused = true)]
 async fn consequence_timer_respects_cooldown() {
     use scp_protocol::trust::consequence::{
-        ConsequenceAction, ConsequenceRule, ConsequenceTrigger,
+        ConsequenceAction, ConsequenceRule, ConsequenceTrigger, EnforcementSeverity,
     };
     use std::time::Duration;
 
@@ -13785,9 +13796,9 @@ async fn consequence_timer_respects_cooldown() {
     params.consequence_rules = vec![ConsequenceRule {
         trigger: ConsequenceTrigger::MessageVelocity,
         threshold: 1,
-        action: ConsequenceAction::Suspend {
-            capabilities: vec!["write".to_owned()],
-        },
+        action: ConsequenceAction::Enforcement(EnforcementSeverity::SuspendCapability {
+            capabilities: vec![Capability::MessagesWrite],
+        }),
         // Long cooldown window — rule should NOT re-fire on second tick.
         window: Duration::from_secs(7200),
     }];
@@ -13894,16 +13905,16 @@ async fn consequence_timer_noop_without_rules() {
 fn consequence_can_suspend_capability() {
     use scp_event_log::{Event, EventPayload, EventType};
     use scp_protocol::trust::consequence::{
-        ConsequenceAction, ConsequenceRule, ConsequenceTrigger,
+        ConsequenceAction, ConsequenceRule, ConsequenceTrigger, EnforcementSeverity,
     };
     use std::time::Duration;
 
     let rules = vec![ConsequenceRule {
         trigger: ConsequenceTrigger::MessageVelocity,
         threshold: 1,
-        action: ConsequenceAction::Suspend {
-            capabilities: vec!["write".to_owned()],
-        },
+        action: ConsequenceAction::Enforcement(EnforcementSeverity::SuspendCapability {
+            capabilities: vec![Capability::MessagesWrite],
+        }),
         window: Duration::from_secs(3600),
     }];
 
@@ -13922,7 +13933,7 @@ fn consequence_can_suspend_capability() {
     assert!(
         matches!(
             &triggered[0].action,
-            ConsequenceAction::Suspend { capabilities: caps } if caps == &["write"]
+            ConsequenceAction::Enforcement(EnforcementSeverity::SuspendCapability { capabilities: caps }) if caps == &[Capability::MessagesWrite]
         ),
         "triggered action should be Suspend with 'write'"
     );
@@ -13934,7 +13945,7 @@ fn consequence_can_suspend_capability() {
 fn consequence_triggered_on_dispatch_evaluation() {
     use scp_event_log::{Event, EventPayload, EventType};
     use scp_protocol::trust::consequence::{
-        ConsequenceAction, ConsequenceRule, ConsequenceTrigger,
+        ConsequenceAction, ConsequenceRule, ConsequenceTrigger, EnforcementSeverity,
     };
     use std::time::Duration;
 
@@ -13942,15 +13953,15 @@ fn consequence_triggered_on_dispatch_evaluation() {
         ConsequenceRule {
             trigger: ConsequenceTrigger::MessageVelocity,
             threshold: 2,
-            action: ConsequenceAction::SuspendAll,
+            action: ConsequenceAction::Enforcement(EnforcementSeverity::SuspendAccess),
             window: Duration::from_secs(60),
         },
         ConsequenceRule {
             trigger: ConsequenceTrigger::MessageVelocity,
             threshold: 1,
-            action: ConsequenceAction::Suspend {
-                capabilities: vec!["read".to_owned()],
-            },
+            action: ConsequenceAction::Enforcement(EnforcementSeverity::SuspendCapability {
+                capabilities: vec![Capability::MessagesRead],
+            }),
             window: Duration::from_secs(60),
         },
     ];
@@ -13975,7 +13986,9 @@ fn consequence_triggered_on_dispatch_evaluation() {
     assert!(
         matches!(
             &triggered[0].action,
-            ConsequenceAction::Suspend { capabilities: _ }
+            ConsequenceAction::Enforcement(EnforcementSeverity::SuspendCapability {
+                capabilities: _
+            })
         ),
         "triggered action should be Suspend"
     );
@@ -14415,7 +14428,7 @@ async fn test_sender_key_failure_still_removes_from_mls() {
     call_order.lock().unwrap().clear();
 
     // Remove Alice — sender key fails but MLS succeeds.
-    let action = scp_protocol::context::governance::GovernanceAction::Eject {
+    let action = scp_protocol::context::governance::GovernanceAction::MemberEject {
         did: alice.clone(),
         reason: Some("H9 test".into()),
     };
@@ -14828,7 +14841,7 @@ async fn test_governance_close_decays_participation() {
 #[tokio::test]
 async fn test_deliver_incoming_evaluates_consequences() {
     use scp_protocol::trust::consequence::{
-        ConsequenceAction, ConsequenceRule, ConsequenceTrigger,
+        ConsequenceAction, ConsequenceRule, ConsequenceTrigger, EnforcementSeverity,
     };
     use std::time::Duration;
 
@@ -14843,7 +14856,7 @@ async fn test_deliver_incoming_evaluates_consequences() {
     let params = ContextParams {
         consequence_rules: vec![ConsequenceRule {
             trigger: ConsequenceTrigger::MessageVelocity,
-            action: ConsequenceAction::SuspendAll,
+            action: ConsequenceAction::Enforcement(EnforcementSeverity::SuspendAccess),
             threshold: 9999,
             window: Duration::from_secs(3600),
         }],
@@ -14956,7 +14969,8 @@ async fn test_evict_stale_entries_removes_non_members() {
 #[tokio::test]
 async fn enforce_triggered_consequences_skips_absent_member() {
     use scp_protocol::trust::consequence::{
-        ConsequenceAction, ConsequenceRule, ConsequenceTrigger, TriggeredConsequence,
+        ConsequenceAction, ConsequenceRule, ConsequenceTrigger, EnforcementSeverity,
+        TriggeredConsequence,
     };
     use std::time::Duration;
 
@@ -14966,18 +14980,18 @@ async fn enforce_triggered_consequences_skips_absent_member() {
 
     let rules = vec![ConsequenceRule {
         trigger: ConsequenceTrigger::MessageVelocity,
-        action: ConsequenceAction::Suspend {
-            capabilities: vec!["write".to_owned()],
-        },
+        action: ConsequenceAction::Enforcement(EnforcementSeverity::SuspendCapability {
+            capabilities: vec![Capability::MessagesWrite],
+        }),
         threshold: 1,
         window: Duration::from_secs(60),
     }];
 
     let triggered = vec![TriggeredConsequence {
         rule_index: 0,
-        action: ConsequenceAction::Suspend {
-            capabilities: vec!["write".to_owned()],
-        },
+        action: ConsequenceAction::Enforcement(EnforcementSeverity::SuspendCapability {
+            capabilities: vec![Capability::MessagesWrite],
+        }),
         evidence: vec![],
     }];
 

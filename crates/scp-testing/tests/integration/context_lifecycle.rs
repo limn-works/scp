@@ -11,7 +11,9 @@ use std::collections::HashSet;
 use std::time::Duration;
 
 use scp_core::context::nesting::ParentRef;
-use scp_core::context::params::{CeilingPolicy, GovernanceModel, MemoryScope, PromotionPolicy};
+use scp_core::context::params::{
+    CeilingPolicy, ConsequenceConfig, GovernanceModel, MemoryScope, PromotionPolicy,
+};
 use scp_core::context::ttl::{TtlError, TtlPolicy};
 use scp_core::context::{
     Capability, CapabilityCeiling, ContextError, ContextHandle, ContextMode, ContextParams,
@@ -180,6 +182,7 @@ async fn context_params_all_fields() {
         min_protocol_version: None,
         migration_source: None,
         consequence_rules: Vec::new(),
+        consequence_config: ConsequenceConfig::default(),
         sybil_policy: None,
     };
 

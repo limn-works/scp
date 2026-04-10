@@ -2373,9 +2373,10 @@ impl WasmContextManager {
                 "member:invite"
             }
 
-            GovernanceAction::Eject { .. }
-            | GovernanceAction::SuspendMember { .. }
-            | GovernanceAction::Revoke { .. }
+            GovernanceAction::MemberEject { .. }
+            | GovernanceAction::SuspendCapability { .. }
+            | GovernanceAction::SuspendAccess { .. }
+            | GovernanceAction::MemberRevoke { .. }
             | GovernanceAction::ResetMember { .. } => "member:remove",
 
             GovernanceAction::ChangeRole { .. } => "role:assign",
@@ -2533,7 +2534,7 @@ impl WasmContextManager {
             GovernanceAction::AddMember { did, role } => {
                 self.dispatch_add_member(context_id, did, role)
             }
-            GovernanceAction::Eject { did, .. } => {
+            GovernanceAction::MemberEject { did, .. } => {
                 self.dispatch_eject(context_id, did)
             }
             GovernanceAction::ChangeRole { did, new_role } => {
@@ -2599,8 +2600,9 @@ impl WasmContextManager {
                 Ok(serde_json::json!({"action": "ExtendTtl", "additionalSecs": additional_secs}))
             }
             GovernanceAction::TransferAdmin { .. } // remaining: exhaustive, no wildcard
-            | GovernanceAction::SuspendMember { .. }
-            | GovernanceAction::Revoke { .. }
+            | GovernanceAction::SuspendCapability { .. }
+            | GovernanceAction::SuspendAccess { .. }
+            | GovernanceAction::MemberRevoke { .. }
             | GovernanceAction::RestoreAccess { .. }
             | GovernanceAction::PromoteContext
             | GovernanceAction::CreateChildContext { .. }
@@ -2690,10 +2692,11 @@ impl WasmContextManager {
         ctx.push_event(ContextEvent::MemberLeft {
             member_did: DID(did.to_owned()),
         });
-        Ok(serde_json::json!({"action": "Eject", "did": did}))
+        Ok(serde_json::json!({"action": "MemberEject", "did": did}))
     }
 
     /// Handles governance actions that don't fit in the primary dispatch.
+    #[allow(clippy::too_many_lines)]
     fn dispatch_governance_action_ext(
         &mut self,
         context_id: &str,
@@ -2713,7 +2716,7 @@ impl WasmContextManager {
                 new_admin_str.clone_into(&mut ctx.creator_did);
                 Ok(serde_json::json!({"action": "TransferAdmin", "newAdmin": new_admin_str}))
             }
-            GovernanceAction::SuspendMember { did, capabilities } => {
+            GovernanceAction::SuspendCapability { did, capabilities } => {
                 let did_str: &str = did;
                 let ctx = self.require_active_context_mut(context_id)?;
                 let entry = ctx
@@ -2732,9 +2735,33 @@ impl WasmContextManager {
                     did: did.clone(),
                     capabilities: capabilities.clone(),
                 });
-                Ok(serde_json::json!({"action": "SuspendMember", "did": did_str}))
+                Ok(serde_json::json!({"action": "SuspendCapability", "did": did_str}))
             }
-            GovernanceAction::Revoke { did, access } => {
+            GovernanceAction::SuspendAccess { did } => {
+                let did_str: &str = did;
+                let ctx = self.require_active_context_mut(context_id)?;
+                // Suspend ALL capabilities for the member.
+                let all_caps: Vec<String> = vec![
+                    "messages:read".to_owned(),
+                    "messages:write".to_owned(),
+                    "tool_invoke:*".to_owned(),
+                    "member:remove".to_owned(),
+                    "governance:propose".to_owned(),
+                ];
+                let entry = ctx
+                    .suspended_capabilities
+                    .entry(did_str.to_owned())
+                    .or_default();
+                for cap in &all_caps {
+                    entry.insert(cap.clone());
+                }
+                ctx.push_event(ContextEvent::CapabilitiesSuspended {
+                    did: did.clone(),
+                    capabilities: vec![], // all — indicated by empty
+                });
+                Ok(serde_json::json!({"action": "SuspendAccess", "did": did_str}))
+            }
+            GovernanceAction::MemberRevoke { did, access } => {
                 self.dispatch_revoke(context_id, did, *access)
             }
             GovernanceAction::RestoreAccess { did, capabilities } => {
@@ -2757,7 +2784,7 @@ impl WasmContextManager {
             }
             // 8 variants handled by upstream dispatch method (exhaustive, no wildcard).
             GovernanceAction::AddMember { .. }
-            | GovernanceAction::Eject { .. }
+            | GovernanceAction::MemberEject { .. }
             | GovernanceAction::ChangeRole { .. }
             | GovernanceAction::RegisterTool { .. }
             | GovernanceAction::RemoveTool { .. }
@@ -2870,7 +2897,7 @@ impl WasmContextManager {
                 reason: Some(format!("Revoke for {did}")),
             });
         }
-        Ok(serde_json::json!({"action": "Revoke", "did": did_str, "access": access_str}))
+        Ok(serde_json::json!({"action": "MemberRevoke", "did": did_str, "access": access_str}))
     }
 
     /// Handles structural, threshold, and economic governance actions.
@@ -2947,7 +2974,7 @@ impl WasmContextManager {
                 Ok(serde_json::json!({"action": "ModifyThreshold", "newThreshold": new_threshold}))
             }
             GovernanceAction::AddMember { .. } // 14 upstream (exhaustive, no wildcard)
-            | GovernanceAction::Eject { .. }
+            | GovernanceAction::MemberEject { .. }
             | GovernanceAction::ChangeRole { .. }
             | GovernanceAction::RegisterTool { .. }
             | GovernanceAction::RemoveTool { .. }
@@ -2955,8 +2982,9 @@ impl WasmContextManager {
             | GovernanceAction::CloseContext { .. }
             | GovernanceAction::ExtendTtl { .. }
             | GovernanceAction::TransferAdmin { .. }
-            | GovernanceAction::SuspendMember { .. }
-            | GovernanceAction::Revoke { .. }
+            | GovernanceAction::SuspendCapability { .. }
+            | GovernanceAction::SuspendAccess { .. }
+            | GovernanceAction::MemberRevoke { .. }
             | GovernanceAction::RestoreAccess { .. } => unreachable!(),
             GovernanceAction::EstablishToolInterface { .. } // 11 downstream
             | GovernanceAction::ResetMember { .. }
@@ -3047,7 +3075,7 @@ impl WasmContextManager {
             }
             // 18 variants handled by upstream dispatch methods (exhaustive, no wildcard).
             GovernanceAction::AddMember { .. }
-            | GovernanceAction::Eject { .. }
+            | GovernanceAction::MemberEject { .. }
             | GovernanceAction::ChangeRole { .. }
             | GovernanceAction::RegisterTool { .. }
             | GovernanceAction::RemoveTool { .. }
@@ -3055,8 +3083,9 @@ impl WasmContextManager {
             | GovernanceAction::CloseContext { .. }
             | GovernanceAction::ExtendTtl { .. }
             | GovernanceAction::TransferAdmin { .. }
-            | GovernanceAction::SuspendMember { .. }
-            | GovernanceAction::Revoke { .. }
+            | GovernanceAction::SuspendCapability { .. }
+            | GovernanceAction::SuspendAccess { .. }
+            | GovernanceAction::MemberRevoke { .. }
             | GovernanceAction::RestoreAccess { .. }
             | GovernanceAction::PromoteContext
             | GovernanceAction::CreateChildContext { .. }
@@ -3157,7 +3186,7 @@ impl WasmContextManager {
             }
             // 25 variants handled by upstream dispatch methods (exhaustive, no wildcard).
             GovernanceAction::AddMember { .. }
-            | GovernanceAction::Eject { .. }
+            | GovernanceAction::MemberEject { .. }
             | GovernanceAction::ChangeRole { .. }
             | GovernanceAction::RegisterTool { .. }
             | GovernanceAction::RemoveTool { .. }
@@ -3165,8 +3194,9 @@ impl WasmContextManager {
             | GovernanceAction::CloseContext { .. }
             | GovernanceAction::ExtendTtl { .. }
             | GovernanceAction::TransferAdmin { .. }
-            | GovernanceAction::SuspendMember { .. }
-            | GovernanceAction::Revoke { .. }
+            | GovernanceAction::SuspendCapability { .. }
+            | GovernanceAction::SuspendAccess { .. }
+            | GovernanceAction::MemberRevoke { .. }
             | GovernanceAction::RestoreAccess { .. }
             | GovernanceAction::PromoteContext
             | GovernanceAction::CreateChildContext { .. }
@@ -5607,7 +5637,7 @@ mod tests {
 
     #[test]
     fn serde_roundtrip_eject() {
-        roundtrip(&GovernanceAction::Eject {
+        roundtrip(&GovernanceAction::MemberEject {
             did: DID("did:dht:z123".to_owned()),
             reason: Some("inactive".to_owned()),
         });
@@ -5777,7 +5807,7 @@ mod tests {
 
     #[test]
     fn serde_roundtrip_suspend_member() {
-        roundtrip(&GovernanceAction::SuspendMember {
+        roundtrip(&GovernanceAction::SuspendCapability {
             did: DID("did:dht:z123".to_owned()),
             capabilities: vec![Capability::MessagesWrite],
         });
@@ -5785,7 +5815,7 @@ mod tests {
 
     #[test]
     fn serde_roundtrip_revoke() {
-        roundtrip(&GovernanceAction::Revoke {
+        roundtrip(&GovernanceAction::MemberRevoke {
             did: DID("did:dht:z123".to_owned()),
             access: AccessScope::Both,
         });
@@ -5891,7 +5921,7 @@ mod tests {
     fn all_wasm_governance_actions() -> Vec<GovernanceAction> {
         let json_actions: Vec<serde_json::Value> = vec![
             serde_json::json!({"AddMember": {"did": "d", "role": "r"}}),
-            serde_json::json!({"Eject": {"did": "d", "reason": null}}),
+            serde_json::json!({"MemberEject": {"did": "d", "reason": null}}),
             serde_json::json!({"ChangeRole": {"did": "d", "new_role": "r"}}),
             serde_json::json!({"RegisterTool": {"registration": {
                 "tool_id": "t", "name": "n", "description": "d",
@@ -5930,8 +5960,8 @@ mod tests {
                 "resolution": "InvalidateBoth"
             }}),
             serde_json::json!("PromoteContext"),
-            serde_json::json!({"SuspendMember": {"did": "d", "capabilities": ["MessagesWrite"]}}),
-            serde_json::json!({"Revoke": {"did": "d", "access": "Both"}}),
+            serde_json::json!({"SuspendCapability": {"did": "d", "capabilities": ["MessagesWrite"]}}),
+            serde_json::json!({"MemberRevoke": {"did": "d", "access": "Both"}}),
             serde_json::json!({"RestoreAccess": {"did": "d", "capabilities": ["MessagesRead", "MessagesWrite"]}}),
             serde_json::json!({"RotateContentKeys": {"reason": null}}),
             serde_json::json!({"ReconfigureGovernance": {

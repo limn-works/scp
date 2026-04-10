@@ -915,7 +915,7 @@ pub(super) fn approved_revoke_proposal(
         now: 1000,
     };
 
-    let action = GovernanceAction::Revoke {
+    let action = GovernanceAction::MemberRevoke {
         did: target_did.clone(),
         access: AccessScope::Write,
     };
