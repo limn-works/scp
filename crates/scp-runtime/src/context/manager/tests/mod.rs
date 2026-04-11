@@ -258,6 +258,10 @@ pub(super) struct MockCrypto {
     pub(super) fail_remove_member: AtomicBool,
     pub(super) fail_remove_member_sender_key: AtomicBool,
     pub(super) fail_rotate_sender_key: AtomicBool,
+    /// H3: when set, `drain_pending_sender_key_messages` returns an error.
+    /// Used to assert that `join_context` rolls back MLS + economy state
+    /// when sender key drain fails catastrophically.
+    pub(super) fail_drain_pending_sender_key_messages: AtomicBool,
     pub(super) mls_created: std::sync::Mutex<Vec<[u8; 32]>>,
     pub(super) sender_keys_created: std::sync::Mutex<Vec<[u8; 32]>>,
     pub(super) broadcast_created: std::sync::Mutex<Vec<[u8; 32]>>,
@@ -374,6 +378,23 @@ impl ContextCryptoProvider for MockCrypto {
             .unwrap()
             .push(member_did.to_owned());
         Ok(())
+    }
+
+    fn drain_pending_sender_key_messages(
+        &self,
+        _context_id: &[u8; 32],
+    ) -> Result<Vec<(String, Vec<u8>)>, ContextError> {
+        if self
+            .fail_drain_pending_sender_key_messages
+            .load(Ordering::Relaxed)
+        {
+            return Err(ContextError::CryptoFailed(
+                "mock drain_pending_sender_key_messages failure".into(),
+            ));
+        }
+        // Default behavior: no pending distributions. Real distributions
+        // are exercised at the provider level (welcome_delivery.rs).
+        Ok(Vec::new())
     }
 
     fn remove_member_sender_key(

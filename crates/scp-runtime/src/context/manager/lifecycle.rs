@@ -1703,7 +1703,6 @@ impl ContextManager {
     ) -> Result<(), ContextError> {
         let context_id = handle.context_id().to_owned();
         let context_id_bytes = context_id_to_bytes(&context_id);
-        let routing_id = scp_protocol::context::context_routing_id(&context_id);
         let member_did = key_package.owner_did.clone();
 
         // Fast-fail: reject obviously incompatible versions before expensive
@@ -1858,28 +1857,46 @@ impl ContextManager {
             return Err(e);
         }
 
-        // Drain pending HPKE-sealed sender key distribution messages.
-        // These are SenderKeyResponse payloads that need to be delivered
-        // to the target member via transport (§9.16.2).
-        let pending = self
-            .crypto
-            .drain_pending_sender_key_messages(&context_id_bytes)?;
-        for (target_did, message) in pending {
-            tracing::debug!(
-                target_did = %target_did,
-                context_id = %context_id,
-                message_len = message.len(),
-                "sending sender key distribution message"
-            );
-            if let Err(e) = self.transport.send_message(&routing_id, &message) {
-                tracing::warn!(
-                    target_did = %target_did,
-                    context_id = %context_id,
-                    error = %e,
-                    "failed to send sender key distribution message — \
-                     recipient must request key via SenderKeyRequest"
-                );
+        // Drain pending HPKE-sealed sender key distribution messages and
+        // deliver them via the MLS management channel (§9.16.2).
+        //
+        // CRITICAL: distributions MUST be MLS-wrapped via
+        // `mls_encrypt_management` so the receive-side dispatcher
+        // (`decrypt_and_dispatch`) recognizes them as
+        // `OpenResult::Management` and routes them through
+        // `process_incoming_sender_key`. Sending the raw HPKE-sealed
+        // bytes via `transport.send_message` would fail to deserialize
+        // as an `OuterEnvelope` on the joiner side, causing silent
+        // distribution loss (recoverable only via `SenderKeyRequest`).
+        //
+        // Helper semantics (matches the rotation path used by
+        // `execute_remove_member`, `leave_context`, and `execute_rotate_content_keys`):
+        //   - Drain failure (catastrophic, e.g. lock poisoned) → propagated
+        //     and forces full rollback below.
+        //   - Per-target encrypt/send failure → warned and continued. The
+        //     joiner falls back to `SenderKeyRequest` to recover the key.
+        //
+        // Ordering invariant: this point is reached AFTER `add_member`
+        // has merged the pending Commit on the inviter side, so the
+        // inviter's MLS group already includes the new joiner in the
+        // post-add epoch. The joiner can decrypt this management message
+        // once they process the Welcome (delivered out-of-band via the
+        // `WelcomeGenerated` event). If the joiner receives the
+        // management message before the Welcome, their `crypto.open()`
+        // call fails to decrypt and the `SenderKeyRequest` fallback
+        // recovers the key.
+        if let Err(e) = self.drain_and_deliver_sender_keys(&context_id, &context_id_bytes) {
+            // Drain failed catastrophically — roll back MLS state, sender
+            // key, escrow, and economy ticket so the join is fully aborted.
+            let _ = self.crypto.remove_member(&context_id_bytes, &member_did);
+            let _ = self
+                .crypto
+                .remove_member_sender_key(&context_id_bytes, &member_did);
+            if let Some(a) = auth {
+                self.void_paid_action(a, &context_id).await;
             }
+            super::economy::rollback_economy_ticket(self, &context_id, ticket).await;
+            return Err(e);
         }
 
         // Phase 4: Membership mutation under lock. On failure: void escrow +
