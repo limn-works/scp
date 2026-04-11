@@ -326,6 +326,11 @@ impl ContextManager {
                 .get_mut(&context_id)
                 .ok_or_else(|| ContextError::ContextNotRegistered(context_id.clone()))?;
             require_active(&ctx.handle)?;
+            // N3: Fail-close on commit fault — if a prior governance
+            // mutation's MLS Commit failed to broadcast and exhausted
+            // retries, messages encrypted under the divergent epoch may
+            // be undecryptable by members who never received the Commit.
+            Self::check_commit_fault(ctx)?;
             // H7: check capability BEFORE budget deduction so a capability
             // failure doesn't leak budget. The suspension-aware
             // member_has_capability check handles both role-based and

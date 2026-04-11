@@ -7,14 +7,14 @@ use super::{
     ECONOMIC_POLICY_NOTIFICATION_PERIOD_SECS, EXECUTED_PROPOSALS_TTL_SECS, EconomicPolicy,
     GovernanceAction, GovernanceActionResult, GovernanceContext, GovernanceEvent,
     GovernanceProposal, GovernanceReconfiguredResult, HashSet, MAX_COMMIT_AGE_SECS,
-    MAX_COMMIT_RETRIES, MAX_REGISTERED_TOOLS, MAX_THRESHOLD_SIGNERS, MAX_TOOL_INTERFACES,
-    MigrationProposedResult, MigrationState, MlsImpact, PendingCeilingModification, PendingCommit,
-    PendingEconomicPolicyChange, PerContextState, ProposalId, ProposalOutcome, ProposalStatus,
-    PruningPolicy, RestoreAccessResult, RevokeResult, SuspendMemberResult, ToolInterface,
-    ToolRegistration, TriggeredConsequence, classify_action, collect_active_voters,
-    commit_retry_backoff, context_id_to_bytes, evaluate_consequence_rules, generate_mls_operations,
-    instrument, process_pending_proposals, push_welcome_event, require_active,
-    require_migrating_out, roles, update_detection_state,
+    MAX_COMMIT_RETRIES, MAX_PENDING_COMMITS, MAX_REGISTERED_TOOLS, MAX_THRESHOLD_SIGNERS,
+    MAX_TOOL_INTERFACES, MigrationProposedResult, MigrationState, MlsImpact,
+    PendingCeilingModification, PendingCommit, PendingEconomicPolicyChange, PerContextState,
+    ProposalId, ProposalOutcome, ProposalStatus, PruningPolicy, RestoreAccessResult, RevokeResult,
+    SuspendMemberResult, ToolInterface, ToolRegistration, TriggeredConsequence, classify_action,
+    collect_active_voters, commit_retry_backoff, context_id_to_bytes, evaluate_consequence_rules,
+    generate_mls_operations, instrument, process_pending_proposals, push_welcome_event,
+    require_active, require_migrating_out, roles, update_detection_state,
 };
 
 // ---------------------------------------------------------------------------
@@ -5516,6 +5516,25 @@ impl ContextManager {
                     let ctx = contexts
                         .get_mut(context_id)
                         .ok_or_else(|| ContextError::ContextNotRegistered(context_id.to_owned()))?;
+                    // N2: Cap the pending commits queue to prevent unbounded
+                    // memory growth during sustained transport outages.
+                    if ctx.pending_commits.len() >= MAX_PENDING_COMMITS {
+                        ctx.commit_fault = Some(CommitFaultMarker {
+                            operation: operation.clone(),
+                            reason: format!(
+                                "pending commit queue full ({MAX_PENDING_COMMITS} entries)"
+                            ),
+                            retry_count: 1,
+                            failed_at: now,
+                        });
+                        ctx.receive_buffer
+                            .push(ContextEvent::CommitBroadcastFailed {
+                                operation: label.clone(),
+                                reason: format!("queue full ({MAX_PENDING_COMMITS}): {error_str}"),
+                                attempts: 1,
+                            });
+                        return Ok(());
+                    }
                     ctx.pending_commits.push_back(pending);
                     ctx.receive_buffer
                         .push(ContextEvent::CommitBroadcastPending {

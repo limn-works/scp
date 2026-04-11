@@ -121,6 +121,14 @@ pub const MAX_COMMIT_RETRIES: u32 = 20;
 /// can intervene rather than wait for retry-count exhaustion.
 pub const MAX_COMMIT_AGE_SECS: u64 = 3600; // 1 hour
 
+/// Maximum number of pending commits allowed in the retry queue per context.
+///
+/// Prevents unbounded memory growth during sustained transport outages.
+/// When this cap is reached, [`try_broadcast_commit_or_enqueue`] sets the
+/// `commit_fault` marker immediately rather than enqueuing, fail-closing
+/// the context for operator attention.
+pub const MAX_PENDING_COMMITS: usize = 50;
+
 /// Exponential backoff schedule (in seconds) for commit retry attempts.
 ///
 /// `COMMIT_RETRY_BACKOFFS[i]` is the delay before attempt `i + 1` (i.e., the

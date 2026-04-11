@@ -129,23 +129,23 @@ pub fn economy_estimate_cost(
 
         // Evaluate formula if present — delegates to scp-protocol's
         // evaluate_formula (shared implementation).
-        let formula_cost = policy
-            .get("pricing_formula")
-            .and_then(|f| {
-                if f.is_null() {
-                    return None;
-                }
-                // Deserialize the pricing formula JSON into the typed struct.
-                let formula: PricingFormula = serde_json::from_value(f.clone()).ok()?;
-                let observable = metrics_from_json(&metrics);
-                // evaluate_formula returns Option<Amount>; None means overflow.
-                evaluate_formula(&formula, &observable).map(scp_protocol::economy::Amount::value)
-            })
-            .unwrap_or(0);
+        let formula_cost = policy.get("pricing_formula").and_then(|f| {
+            if f.is_null() {
+                return Some(0);
+            }
+            // Deserialize the pricing formula JSON into the typed struct.
+            let formula: PricingFormula = serde_json::from_value(f.clone()).ok()?;
+            let observable = metrics_from_json(&metrics);
+            // evaluate_formula returns Option<Amount>; None means overflow.
+            evaluate_formula(&formula, &observable).map(scp_protocol::economy::Amount::value)
+        });
 
-        let total = schedule_cost.saturating_add(formula_cost);
-
-        let result = serde_json::json!({ "cost": total });
+        // N4: propagate overflow as null (not 0) so callers know the estimate
+        // failed, matching the doc comment and native SCP-ECON-12040 behavior.
+        let result = formula_cost.map_or_else(
+            || serde_json::json!({ "cost": null }),
+            |fc| serde_json::json!({ "cost": schedule_cost.saturating_add(fc) }),
+        );
         Ok(JsValue::from_str(&result.to_string()))
     })
 }
