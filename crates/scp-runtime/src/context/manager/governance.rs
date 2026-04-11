@@ -921,7 +921,8 @@ fn check_proposer_eligibility(
     // evaluate the proposer's identity depth to determine their governance
     // proposal rate limit, then check recent proposals against that limit.
     if let Some(sybil_policy) = ctx.handle.params().sybil_policy.as_ref() {
-        let assessment = super::lifecycle::build_identity_assessment(proposer_did, now);
+        let assessment =
+            super::lifecycle::build_identity_assessment(proposer_did, &ctx.governance, now);
         let (_level, capacity) =
             scp_protocol::trust::sybil::evaluate_earned_capacity(&assessment, sybil_policy, now);
 

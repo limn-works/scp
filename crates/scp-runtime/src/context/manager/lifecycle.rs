@@ -18,15 +18,64 @@ use super::{
 /// Builds an [`IdentityDepthAssessment`] for a member in a context.
 ///
 /// Shared by `evaluate_sybil_resistance` (join path) and `check_proposer_eligibility`
-/// (governance path). At the `ContextManager` layer we do not yet have
-/// access to external trust signal providers, so the signal map is empty.
-/// Contexts requiring real signals will correctly reject until signal
-/// providers are wired at a higher layer.
+/// (governance path). Populates trust signals from available context state:
+///
+/// - **`ParticipationHistory`** — participation duration from the member's
+///   cached `ParticipationRecord` (§9.3 trust signal table row 3).
+/// - **`ParticipationRecord`** — participation count from the same record
+///   (§9.3 row 4). Strength = number of events by the member.
+/// - **`EconomicActivity`** — total spend from the budget tracker (§9.3
+///   row 5 / §19). Only populated if the member has budget state.
+///
+/// External signals (social attestation, device attestation, endorsements)
+/// require DID document resolution and attestation verification, which
+/// are not yet wired at the `ContextManager` layer. Those categories remain
+/// empty until the trust signal provider infrastructure is built.
 pub(super) fn build_identity_assessment(
     member_did: &DID,
+    governance: &super::GovernanceState,
     now: u64,
 ) -> scp_protocol::trust::sybil::IdentityDepthAssessment {
-    let signals = HashMap::new();
+    use scp_protocol::trust::sybil::{TrustSignal, TrustSignalCategory};
+
+    let mut signals = HashMap::new();
+
+    // Populate from participation cache if the member has a record.
+    if let Some(record) = governance.participation_cache.get(member_did.as_ref()) {
+        signals.insert(
+            TrustSignalCategory::ParticipationHistory,
+            TrustSignal {
+                category: TrustSignalCategory::ParticipationHistory,
+                verified_at: record.computed_at,
+                strength: record.participation_duration_seconds,
+                details: None,
+            },
+        );
+        signals.insert(
+            TrustSignalCategory::ParticipationRecord,
+            TrustSignal {
+                category: TrustSignalCategory::ParticipationRecord,
+                verified_at: record.computed_at,
+                strength: record.participation_count,
+                details: None,
+            },
+        );
+    }
+
+    // Populate economic activity from budget tracker.
+    let total_spent = governance.budget_tracker.total_spent(member_did).0;
+    if total_spent > 0 {
+        signals.insert(
+            TrustSignalCategory::EconomicActivity,
+            TrustSignal {
+                category: TrustSignalCategory::EconomicActivity,
+                verified_at: now,
+                strength: total_spent,
+                details: None,
+            },
+        );
+    }
+
     scp_protocol::trust::sybil::IdentityDepthAssessment::new(member_did.clone(), signals, now)
 }
 
@@ -146,7 +195,7 @@ pub(super) fn evaluate_sybil_resistance(
         return Ok(());
     };
 
-    let assessment = build_identity_assessment(member_did, now);
+    let assessment = build_identity_assessment(member_did, &ctx.governance, now);
 
     scp_protocol::trust::sybil::evaluate_sybil_resistance(&assessment, policy, now, None)
         .map_err(|e| ContextError::PermissionDenied(format!("sybil resistance check failed: {e}")))
