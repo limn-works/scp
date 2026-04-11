@@ -323,6 +323,9 @@ fn strip_snapshot_for_public(snapshot: &ContextSnapshot) -> ContextSnapshot {
         economic_policy: snapshot.economic_policy.clone(),
         budget_tracker: scp_protocol::economy::budget::MemberBudgetTracker::new(),
         approved_proposals: HashMap::new(),
+        // H10: monotonic seq counter is local-instance state with no
+        // meaning to a public observer — always 0 in public scope.
+        next_proposal_seq: 0,
         governance_freeze: None,
         pending_ceiling_modification: None,
         pending_economic_policy_change: None,
@@ -460,6 +463,7 @@ mod tests {
             budget_tracker: scp_protocol::economy::budget::MemberBudgetTracker::new(),
             read_exclusion_list: HashSet::new(),
             approved_proposals: HashMap::new(),
+            next_proposal_seq: 0,
             governance_freeze: None,
             pending_ceiling_modification: None,
             pending_economic_policy_change: None,

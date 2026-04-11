@@ -1736,6 +1736,7 @@ mod tests {
             economic_policy: None,
             budget_tracker: scp_protocol::economy::budget::MemberBudgetTracker::new(),
             approved_proposals: std::collections::HashMap::new(),
+            next_proposal_seq: 0,
             governance_freeze: None,
             pending_ceiling_modification: None,
             pending_economic_policy_change: None,

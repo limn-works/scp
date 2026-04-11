@@ -4714,8 +4714,29 @@ impl ContextManager {
     /// Detects and handles conflicts when a proposal becomes approved (ADR-031 §7).
     ///
     /// Checks if the newly approved proposal conflicts with any other approved
-    /// proposals. Handles sequential conflicts (lower sequence number wins) and
-    /// simultaneous conflicts (governance freeze).
+    /// proposals. Handles sequential conflicts (lower monotonic sequence
+    /// number wins) and simultaneous conflicts (governance freeze).
+    ///
+    /// # H10: monotonic seq, not wall-clock timestamp
+    ///
+    /// Sequence numbers come from
+    /// [`GovernanceState::next_proposal_seq`], a strictly monotonic
+    /// per-context counter persisted in the snapshot. Previously this
+    /// function used `clock.now_secs()` (1-second granularity) as the
+    /// sequence. Two proposals approved within the same wall-clock
+    /// second compared as `Equal`, which routed them into a 48-hour
+    /// governance freeze. With `GovernancePropose` capability, an
+    /// attacker could race a conflicting proposal against any defensive
+    /// admin action and brick governance for two days. The monotonic
+    /// counter eliminates that collision window: every approved
+    /// proposal receives a strictly unique seq, even within the same
+    /// wall-clock second and even across process restarts (the counter
+    /// is persisted).
+    ///
+    /// The wall-clock timestamp is still recorded in the third tuple
+    /// slot (`approved_at_unix_secs`) and on the freeze record so audit
+    /// consumers and the 48-hour freeze-expiry timer continue to work
+    /// against real time.
     ///
     /// # Arguments
     /// * `ctx` - The context state containing approved proposals
@@ -4732,7 +4753,20 @@ impl ContextManager {
         use scp_protocol::context::governance::{GovernanceEvent, actions_conflict};
 
         let mut events = Vec::new();
+        // Wall-clock timestamp — used ONLY for the audit slot of
+        // `approved_proposals` and for the freeze start time. Never
+        // used for sequence comparison (H10).
         let current_timestamp = self.clock.now_secs();
+
+        // H10: assign the monotonic seq for the new proposal up front,
+        // and bump the counter immediately so any nested or concurrent
+        // call cannot reuse it. `saturating_add` matches the rest of
+        // the runtime — wraparound is impossible in practice (u64 at
+        // 1 proposal/sec exceeds the heat death of the universe), and
+        // saturating semantics prevent any DoS vector even under
+        // pathological forged input.
+        let new_seq = ctx.governance.next_proposal_seq;
+        ctx.governance.next_proposal_seq = ctx.governance.next_proposal_seq.saturating_add(1);
 
         // Check for conflicts with existing approved proposals
         let mut conflicts = Vec::new();
@@ -4754,16 +4788,26 @@ impl ContextManager {
             }
         }
 
-        // Handle conflicts
+        // Handle conflicts. `new_seq` is strictly greater than every
+        // existing `existing_seq` (the counter is monotonic and we
+        // bumped it above), so the `Equal` arm is now mathematically
+        // unreachable from a real call site. The only way it could
+        // fire is via a synthesized `existing_seq` equal to the
+        // pre-bump counter — i.e. via tampered persistence. We keep
+        // the arm as defense-in-depth: a corrupted snapshot still
+        // routes into the freeze rather than silently dropping a
+        // proposal, which preserves the existing 48-hour
+        // resolution-window invariant for that pathological case.
         for (conflicting_id, conflicting_seq, _conflicting_timestamp, _conflicting_proposal) in
             conflicts
         {
-            // Assign sequence numbers - for now, use timestamp as sequence
-            let new_seq = current_timestamp;
-
             match new_seq.cmp(&conflicting_seq) {
                 std::cmp::Ordering::Equal => {
-                    // Simultaneous conflict - enter governance freeze
+                    // Simultaneous conflict — only reachable via
+                    // tampered persistence (see above). Enter
+                    // governance freeze with the wall-clock start
+                    // time so the 48-hour expiry works against real
+                    // time, not the monotonic counter.
                     ctx.governance.freeze =
                         Some((new_proposal.proposal_id, conflicting_id, current_timestamp));
                     events.push(GovernanceEvent::ConflictDetected {
@@ -4772,7 +4816,16 @@ impl ContextManager {
                     });
                 }
                 std::cmp::Ordering::Less => {
-                    // New proposal wins - invalidate the conflicting one
+                    // Lower seq wins — the new proposal supersedes
+                    // the existing one. With the monotonic counter,
+                    // `new_seq` is always strictly greater than
+                    // every `existing_seq` produced by this code
+                    // path, so this branch is only reachable via
+                    // tampered persistence (an attacker-supplied
+                    // snapshot with `existing_seq > next_proposal_seq`).
+                    // Behavior is preserved as-is for spec
+                    // consistency — the runtime always honors
+                    // "lower seq wins" regardless of source.
                     ctx.governance.approved_proposals.remove(&conflicting_id);
                     events.push(GovernanceEvent::ConflictResolved {
                         winner_id: new_proposal.proposal_id,
@@ -4780,8 +4833,16 @@ impl ContextManager {
                     });
                 }
                 std::cmp::Ordering::Greater => {
-                    // Existing proposal wins - invalidate the new one
-                    // Don't add the new proposal to approved_proposals
+                    // The normal sequential-conflict case: an earlier
+                    // proposal already exists (lower seq → earlier),
+                    // so it wins and the new proposal is invalidated.
+                    // We do NOT add the new proposal to
+                    // `approved_proposals`, but the monotonic counter
+                    // has already been bumped — by design, every
+                    // conflict-detection invocation consumes a seq
+                    // slot regardless of outcome, so sequence
+                    // numbers are stable across retries and never
+                    // reused.
                     events.push(GovernanceEvent::ConflictResolved {
                         winner_id: conflicting_id,
                         loser_id: new_proposal.proposal_id,
@@ -4791,11 +4852,15 @@ impl ContextManager {
             }
         }
 
-        // Add the new proposal to approved proposals if not invalidated
+        // Add the new proposal to approved proposals if not invalidated.
+        // Tuple layout (see `GovernanceState::approved_proposals` doc):
+        //   .0 = the proposal itself
+        //   .1 = monotonic seq (for conflict resolution — H10)
+        //   .2 = wall-clock unix seconds at approval (audit only)
         if !events.iter().any(|e| matches!(e, GovernanceEvent::ConflictResolved { loser_id, .. } if *loser_id == new_proposal.proposal_id)) {
             ctx.governance.approved_proposals.insert(
                 new_proposal.proposal_id,
-                (new_proposal.clone(), current_timestamp, current_timestamp)
+                (new_proposal.clone(), new_seq, current_timestamp)
             );
         }
 

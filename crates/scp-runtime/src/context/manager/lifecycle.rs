@@ -448,6 +448,19 @@ impl ContextManager {
                         .map(|id| (id, now))
                         .collect()
                 },
+                // H10: monotonic seq counter is persisted across restart so
+                // proposals can never share a sequence number even within
+                // the same wall-clock second. This is the LOCAL-TRUSTED
+                // restore path — use the persisted value verbatim. Legacy
+                // snapshots without the field deserialize as 0 via
+                // `#[serde(default)]`; in that case we still bump past
+                // the existing approved set so newly inserted proposals
+                // don't collide with restored ones. If the persisted
+                // value is already higher (the common case after the
+                // first H10 snapshot), `max` preserves it.
+                next_proposal_seq: ctx_snapshot
+                    .next_proposal_seq
+                    .max(ctx_snapshot.approved_proposals.len() as u64),
                 approved_proposals: ctx_snapshot.approved_proposals,
                 freeze: ctx_snapshot.governance_freeze,
                 timeout_task: GovernanceTimeoutTask::new(),
@@ -1072,6 +1085,12 @@ impl ContextManager {
                 // would then permanently block the victim from
                 // proposing. The legitimate set is rebuilt from the
                 // imported event log on next governance evaluation.
+                // H10: Reset next_proposal_seq as well — the exporter
+                // could carry an arbitrary value (e.g. u64::MAX) to
+                // rewind the importing instance's seq space and
+                // reintroduce collision windows. Since approved_proposals
+                // is wiped, reset to 0.
+                next_proposal_seq: 0,
                 approved_proposals: HashMap::new(),
                 freeze: export.snapshot.governance_freeze,
                 timeout_task: GovernanceTimeoutTask::new(),
@@ -1295,6 +1314,8 @@ impl ContextManager {
                 engine: governance_engine,
                 executed_proposals: HashMap::new(),
                 approved_proposals: HashMap::new(),
+                // H10: fresh contexts start with a zero monotonic counter.
+                next_proposal_seq: 0,
                 freeze: None,
                 timeout_task: GovernanceTimeoutTask::new(),
                 deadlock: DeadlockDetectionState::default(),
@@ -1616,6 +1637,8 @@ impl ContextManager {
                 engine: governance_engine,
                 executed_proposals: HashMap::new(),
                 approved_proposals: HashMap::new(),
+                // H10: fresh contexts start with a zero monotonic counter.
+                next_proposal_seq: 0,
                 freeze: None,
                 timeout_task: GovernanceTimeoutTask::new(),
                 deadlock: DeadlockDetectionState::default(),

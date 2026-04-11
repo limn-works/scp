@@ -612,6 +612,8 @@ fn governance_snapshot_serde_roundtrip() {
         economic_policy: None,
         budget_tracker: scp_protocol::economy::budget::MemberBudgetTracker::new(),
         approved_proposals: HashMap::new(),
+
+        next_proposal_seq: 0,
         governance_freeze: None,
         pending_ceiling_modification: None,
         pending_economic_policy_change: None,
@@ -12091,6 +12093,7 @@ fn velocity_tracker_state_in_context_snapshot_roundtrip() {
         economic_policy: None,
         budget_tracker: scp_protocol::economy::budget::MemberBudgetTracker::new(),
         approved_proposals: HashMap::new(),
+        next_proposal_seq: 0,
         governance_freeze: None,
         pending_ceiling_modification: None,
         pending_economic_policy_change: None,
@@ -12176,6 +12179,7 @@ fn velocity_tracker_backward_compat_deserialization() {
         economic_policy: None,
         budget_tracker: scp_protocol::economy::budget::MemberBudgetTracker::new(),
         approved_proposals: HashMap::new(),
+        next_proposal_seq: 0,
         governance_freeze: None,
         pending_ceiling_modification: None,
         pending_economic_policy_change: None,
@@ -15386,4 +15390,495 @@ fn h2_dispatch_paths_do_not_pass_creator_did_to_assign_role() {
         source.contains("async fn execute_add_member"),
         "execute_add_member must still exist as the AddMember dispatcher"
     );
+}
+
+// ---------------------------------------------------------------------------
+// H10: monotonic proposal sequence numbers (PR #1606 H10)
+//
+// Bug: `detect_and_handle_conflicts` previously used `clock.now_secs()` as
+// the sequence number for conflict resolution. Two conflicting proposals
+// approved within the same wall-clock second compared as `Equal`, which
+// routed both into a 48-hour governance freeze. With `GovernancePropose`
+// capability, an attacker could race a conflicting proposal against any
+// defensive admin action and brick governance for two days.
+//
+// Fix: per-context monotonic counter `GovernanceState::next_proposal_seq`
+// that strictly increments on every conflict-detection invocation,
+// persisted in `ContextSnapshot::next_proposal_seq` so it survives
+// process restarts.
+// ---------------------------------------------------------------------------
+
+/// Builds a manager + active context wired to a `TestClock` so the wall
+/// clock can be pinned for H10 collision tests.
+async fn h10_setup_with_test_clock(
+    context_id: &str,
+    start_secs: u64,
+) -> (
+    super::ContextManager,
+    super::ContextHandle,
+    std::sync::Arc<scp_primitives::TestClock>,
+) {
+    let clock = std::sync::Arc::new(scp_primitives::TestClock::new(start_secs));
+    let manager = super::ContextManager::builder()
+        .crypto(Box::new(MockCrypto::default()))
+        .transport(Box::new(MockTransport::connected()))
+        .event_log(Box::new(MockEventLog::default()))
+        .key_resolver(noop_key_resolver())
+        .clock(clock.clone() as std::sync::Arc<dyn scp_primitives::Clock>)
+        .build()
+        .expect("builder must succeed");
+
+    let params = governance_params();
+    let handle = manager
+        .create_context(context_id.into(), params, "did:key:admin".into())
+        .await
+        .unwrap();
+
+    (manager, handle, clock)
+}
+
+/// H10 #1: Two proposals that conflict and land within the same wall-clock
+/// second MUST NOT route into a governance freeze.
+///
+/// Pre-fix this test would fail: both proposals received `seq = now_secs`,
+/// the `Equal` arm fired, and `governance.freeze` became `Some(...)`.
+/// Post-fix the monotonic counter assigns distinct seqs even when the
+/// wall clock has not advanced, so the loser is invalidated immediately
+/// via the normal sequential path and no freeze is set.
+#[tokio::test]
+async fn h10_governance_freeze_not_triggered_by_timestamp_collision() {
+    use scp_protocol::context::governance::GovernanceAction;
+
+    let (manager, _handle, clock) = h10_setup_with_test_clock("h10-collision-ctx", 1_000_000).await;
+
+    // Add a target member so ChangeRole has somewhere to land.
+    {
+        let mut contexts = manager.contexts.lock().await;
+        let ctx = contexts.get_mut("h10-collision-ctx").unwrap();
+        ctx.membership
+            .add_member("did:key:target".into(), "member".into(), vec![]);
+        ctx.role_state.members.insert("did:key:target".into());
+    }
+
+    let proposal_a = approved_proposal(
+        [201u8; 32],
+        "h10-collision-ctx",
+        GovernanceAction::ChangeRole {
+            did: "did:key:target".into(),
+            new_role: "admin".into(),
+        },
+        &["did:key:admin"],
+    );
+    let proposal_b = approved_proposal(
+        [202u8; 32],
+        "h10-collision-ctx",
+        GovernanceAction::ChangeRole {
+            did: "did:key:target".into(),
+            new_role: "observer".into(),
+        },
+        &["did:key:admin"],
+    );
+
+    // Hold the wall clock pinned so both proposals see the same `now_secs`.
+    // Pre-fix this is exactly the trigger condition for the bug.
+    let pinned = clock.now_secs();
+    assert_eq!(pinned, 1_000_000);
+
+    // Drive both proposals through the conflict detector while the clock
+    // is pinned. We call detect_and_handle_conflicts directly so the test
+    // does not depend on engine signing — the function is what the
+    // attacker would race in the real bug.
+    let mut contexts = manager.contexts.lock().await;
+    let ctx = contexts.get_mut("h10-collision-ctx").unwrap();
+
+    let events_a = manager.detect_and_handle_conflicts(ctx, &proposal_a);
+    let events_b = manager.detect_and_handle_conflicts(ctx, &proposal_b);
+
+    // Wall clock did NOT advance.
+    assert_eq!(
+        clock.now_secs(),
+        pinned,
+        "test sanity: TestClock must not advance on its own"
+    );
+
+    // The freeze MUST be empty. Pre-fix it would be `Some(...)`.
+    assert!(
+        ctx.governance.freeze.is_none(),
+        "H10 regression: same-second conflicting proposals must not enter \
+         a governance freeze (got freeze={:?})",
+        ctx.governance.freeze
+    );
+
+    // Proposal A must be approved (it arrived first → lower monotonic seq).
+    assert!(
+        ctx.governance
+            .approved_proposals
+            .contains_key(&proposal_a.proposal_id),
+        "first proposal must be in approved set; events_a={events_a:?}"
+    );
+    // Proposal B must NOT be approved (it lost the sequential conflict).
+    assert!(
+        !ctx.governance
+            .approved_proposals
+            .contains_key(&proposal_b.proposal_id),
+        "second proposal must lose to existing conflicting proposal; \
+         events_b={events_b:?}"
+    );
+
+    // The events must reflect a sequential resolution (ConflictResolved),
+    // NOT a simultaneous detection (ConflictDetected).
+    use scp_protocol::context::governance::GovernanceEvent;
+    assert!(
+        events_b
+            .iter()
+            .any(|e| matches!(e, GovernanceEvent::ConflictResolved { .. })),
+        "second proposal must produce ConflictResolved (lower seq wins), \
+         not ConflictDetected; got {events_b:?}"
+    );
+    assert!(
+        events_b
+            .iter()
+            .all(|e| !matches!(e, GovernanceEvent::ConflictDetected { .. })),
+        "ConflictDetected (which routes to freeze) must not appear; got {events_b:?}"
+    );
+}
+
+/// H10 #2: Proposals stored in `approved_proposals` carry the monotonic
+/// counter, not the wall-clock timestamp, in the second tuple slot.
+#[tokio::test]
+async fn h10_approved_proposals_stores_monotonic_seq() {
+    use scp_protocol::context::governance::GovernanceAction;
+
+    let (manager, _handle, _clock) =
+        h10_setup_with_test_clock("h10-monotonic-ctx", 1_700_000_000).await;
+
+    // Three non-conflicting proposals so each gets stored independently.
+    let proposals: Vec<_> = (0u8..3)
+        .map(|i| {
+            approved_proposal(
+                [100 + i; 32],
+                "h10-monotonic-ctx",
+                GovernanceAction::RegisterTool {
+                    registration: Box::new(test_tool_registration(&format!("tool-{i}"))),
+                },
+                &["did:key:admin"],
+            )
+        })
+        .collect();
+
+    // Drive them through conflict detection. None conflict, so each is
+    // inserted with the monotonically-assigned seq.
+    {
+        let mut contexts = manager.contexts.lock().await;
+        let ctx = contexts.get_mut("h10-monotonic-ctx").unwrap();
+
+        // Sanity: counter starts at 0 on a fresh context.
+        assert_eq!(
+            ctx.governance.next_proposal_seq, 0,
+            "fresh context must start with next_proposal_seq = 0"
+        );
+
+        for p in &proposals {
+            let _ = manager.detect_and_handle_conflicts(ctx, p);
+        }
+
+        // Counter must have advanced exactly 3 times.
+        assert_eq!(
+            ctx.governance.next_proposal_seq, 3,
+            "counter must increment once per detect_and_handle_conflicts call"
+        );
+
+        // Each proposal must carry its assigned seq in the tuple's
+        // second slot. Slots are: (proposal, monotonic_seq, approved_at).
+        for (i, p) in proposals.iter().enumerate() {
+            let entry = ctx
+                .governance
+                .approved_proposals
+                .get(&p.proposal_id)
+                .unwrap_or_else(|| panic!("proposal {i} missing from approved set"));
+            assert_eq!(
+                entry.1, i as u64,
+                "proposal {i} must carry monotonic seq {i}, got {}",
+                entry.1
+            );
+            // Wall-clock slot is non-zero (TestClock at 1.7e9).
+            assert_eq!(
+                entry.2, 1_700_000_000,
+                "approved_at slot must be the wall-clock timestamp"
+            );
+        }
+    }
+}
+
+/// H10 #3: The monotonic counter is persisted in `ContextSnapshot` and
+/// restored on reload, so two proposals can never share a seq across a
+/// process restart.
+#[tokio::test]
+async fn h10_next_proposal_seq_persists_across_snapshot() {
+    use scp_protocol::context::governance::GovernanceAction;
+
+    let (manager, _handle, _clock) =
+        h10_setup_with_test_clock("h10-persist-ctx", 1_700_000_000).await;
+
+    // Insert two non-conflicting proposals (seqs 0 and 1).
+    let p_a = approved_proposal(
+        [210u8; 32],
+        "h10-persist-ctx",
+        GovernanceAction::RegisterTool {
+            registration: Box::new(test_tool_registration("persist-tool-a")),
+        },
+        &["did:key:admin"],
+    );
+    let p_b = approved_proposal(
+        [211u8; 32],
+        "h10-persist-ctx",
+        GovernanceAction::RegisterTool {
+            registration: Box::new(test_tool_registration("persist-tool-b")),
+        },
+        &["did:key:admin"],
+    );
+
+    let snapshot = {
+        let mut contexts = manager.contexts.lock().await;
+        let ctx = contexts.get_mut("h10-persist-ctx").unwrap();
+        let _ = manager.detect_and_handle_conflicts(ctx, &p_a);
+        let _ = manager.detect_and_handle_conflicts(ctx, &p_b);
+        assert_eq!(ctx.governance.next_proposal_seq, 2);
+        super::ContextManager::snapshot_context(ctx)
+    };
+
+    // Snapshot must carry the counter.
+    assert_eq!(
+        snapshot.next_proposal_seq, 2,
+        "ContextSnapshot must persist next_proposal_seq"
+    );
+
+    // Round-trip through the production wire format (rmp_serde, the
+    // same encoder used by `persist_context`) to confirm the field
+    // survives persistence and is not a hidden in-memory-only field.
+    let bytes = rmp_serde::to_vec_named(&snapshot).expect("serialize msgpack");
+    let restored: super::ContextSnapshot =
+        rmp_serde::from_slice(&bytes).expect("deserialize msgpack");
+    assert_eq!(
+        restored.next_proposal_seq, 2,
+        "next_proposal_seq must round-trip through rmp_serde (production wire format)"
+    );
+
+    // Backward-compat: a legacy snapshot missing the field MUST
+    // deserialize cleanly with `next_proposal_seq = 0` via
+    // `#[serde(default)]`. We construct the legacy bytes by
+    // re-encoding via `rmpv::Value`, removing the new key, and
+    // re-serializing.
+    let legacy_bytes = {
+        let mut value: rmpv::Value =
+            rmpv::decode::read_value(&mut bytes.as_slice()).expect("rmpv decode");
+        if let rmpv::Value::Map(ref mut entries) = value {
+            entries.retain(|(k, _)| k.as_str().is_none_or(|s| s != "next_proposal_seq"));
+        } else {
+            panic!("expected msgpack map at top level");
+        }
+        let mut out = Vec::new();
+        rmpv::encode::write_value(&mut out, &value).expect("rmpv encode");
+        out
+    };
+    let legacy: super::ContextSnapshot =
+        rmp_serde::from_slice(&legacy_bytes).expect("legacy deserialize");
+    assert_eq!(
+        legacy.next_proposal_seq, 0,
+        "legacy snapshot without the field must default to 0 via #[serde(default)]"
+    );
+}
+
+/// H10 #4: After import (untrusted exporter), `next_proposal_seq` is
+/// reset to `approved_proposals.len() as u64` — never preserved from
+/// the export. A malicious export carrying `u64::MAX` must NOT be able
+/// to rewind the importing instance's seq space to 0 on the next insert.
+#[tokio::test]
+async fn h10_import_context_resets_next_proposal_seq() {
+    use scp_protocol::context::governance::GovernanceAction;
+
+    // Stand up a source manager and approve two non-conflicting proposals
+    // so the snapshot has a populated `approved_proposals` map of length 2.
+    let (manager, _handle, _clock) =
+        h10_setup_with_test_clock("h10-source-ctx", 1_700_000_000).await;
+
+    let p_a = approved_proposal(
+        [220u8; 32],
+        "h10-source-ctx",
+        GovernanceAction::RegisterTool {
+            registration: Box::new(test_tool_registration("imp-tool-a")),
+        },
+        &["did:key:admin"],
+    );
+    let p_b = approved_proposal(
+        [221u8; 32],
+        "h10-source-ctx",
+        GovernanceAction::RegisterTool {
+            registration: Box::new(test_tool_registration("imp-tool-b")),
+        },
+        &["did:key:admin"],
+    );
+
+    let mut snapshot = {
+        let mut contexts = manager.contexts.lock().await;
+        let ctx = contexts.get_mut("h10-source-ctx").unwrap();
+        let _ = manager.detect_and_handle_conflicts(ctx, &p_a);
+        let _ = manager.detect_and_handle_conflicts(ctx, &p_b);
+        super::ContextManager::snapshot_context(ctx)
+    };
+
+    // Adversarial tampering: forge a `next_proposal_seq = u64::MAX`. If
+    // the importer trusted this, the next insert would overflow the
+    // saturating_add and reuse u64::MAX forever, OR an attacker could
+    // forge `approved_proposals` entries with seqs in [0..N] and force
+    // collisions on the next live insert.
+    snapshot.next_proposal_seq = u64::MAX;
+
+    // The exporter is untrusted at the import boundary; build the export
+    // by hand so we can sneak the tampered field in past `create_export`.
+    let export = crate::context::export_import::ContextExport {
+        snapshot,
+        event_log_data: Vec::new(),
+        mls_state: Vec::new(),
+        version: crate::context::export_import::CURRENT_EXPORT_VERSION,
+        exported_at: 1_700_000_000,
+        exporter_did: "did:key:malicious-exporter".into(),
+        merkle_root: [0u8; 32],
+        scope: crate::context::export_import::ExportScope::Full,
+    };
+
+    // Import into a fresh manager so we can observe the post-import state.
+    let importer = super::ContextManager::new(
+        Box::new(MockCrypto::default()),
+        Box::new(MockTransport::connected()),
+        Box::new(MockEventLog::default()),
+        noop_key_resolver(),
+    );
+    importer
+        .import_context(export)
+        .await
+        .expect("import must succeed");
+
+    // After import, `next_proposal_seq` MUST be reset to
+    // `approved_proposals.len() as u64` (= 2), NOT u64::MAX.
+    let contexts = importer.contexts.lock().await;
+    let ctx = contexts.get("h10-source-ctx").unwrap();
+    assert_eq!(
+        ctx.governance.next_proposal_seq, 2,
+        "import_context must reset next_proposal_seq to approved_proposals.len(), \
+         not trust the exporter (got {})",
+        ctx.governance.next_proposal_seq
+    );
+    assert_ne!(
+        ctx.governance.next_proposal_seq,
+        u64::MAX,
+        "tampered u64::MAX must NOT be preserved across import"
+    );
+}
+
+/// H10 #5: Conflict resolution follows the monotonic seq, not the wall
+/// clock. We craft a scenario where the wall clock goes BACKWARD between
+/// two proposals (via `TestClock::set`) — the older wall-clock proposal
+/// must still lose to the proposal that received an earlier seq, because
+/// monotonic seq is the source of truth.
+#[tokio::test]
+async fn h10_conflict_resolution_uses_seq_not_timestamp() {
+    use scp_protocol::context::governance::{GovernanceAction, GovernanceEvent};
+
+    let (manager, _handle, clock) = h10_setup_with_test_clock("h10-time-skew-ctx", 2_000_000).await;
+
+    {
+        let mut contexts = manager.contexts.lock().await;
+        let ctx = contexts.get_mut("h10-time-skew-ctx").unwrap();
+        ctx.membership
+            .add_member("did:key:target".into(), "member".into(), vec![]);
+        ctx.role_state.members.insert("did:key:target".into());
+    }
+
+    // Proposal A is approved at t=2_000_000.
+    let proposal_a = approved_proposal(
+        [230u8; 32],
+        "h10-time-skew-ctx",
+        GovernanceAction::ChangeRole {
+            did: "did:key:target".into(),
+            new_role: "admin".into(),
+        },
+        &["did:key:admin"],
+    );
+
+    // Proposal B is approved at t=1_500_000 — EARLIER than A in wall
+    // clock terms. Pre-fix (timestamp-as-seq), B would have a lower seq
+    // and thus WIN under "lower seq wins" semantics, despite arriving
+    // later. Post-fix, the monotonic counter assigns A=0 and B=1
+    // regardless of the clock direction, so A wins.
+    let proposal_b = approved_proposal(
+        [231u8; 32],
+        "h10-time-skew-ctx",
+        GovernanceAction::ChangeRole {
+            did: "did:key:target".into(),
+            new_role: "observer".into(),
+        },
+        &["did:key:admin"],
+    );
+
+    {
+        let mut contexts = manager.contexts.lock().await;
+        let ctx = contexts.get_mut("h10-time-skew-ctx").unwrap();
+        let _events_a = manager.detect_and_handle_conflicts(ctx, &proposal_a);
+
+        // Rewind the wall clock — simulates clock skew, NTP step-back,
+        // or the attacker's most aggressive forgery.
+        clock.set(1_500_000);
+        assert_eq!(clock.now_secs(), 1_500_000, "TestClock rewound");
+
+        let events_b = manager.detect_and_handle_conflicts(ctx, &proposal_b);
+
+        // Proposal A must still hold the approved slot.
+        assert!(
+            ctx.governance
+                .approved_proposals
+                .contains_key(&proposal_a.proposal_id),
+            "proposal A (earlier monotonic seq) must remain approved \
+             even when proposal B has an earlier wall-clock timestamp"
+        );
+        assert!(
+            !ctx.governance
+                .approved_proposals
+                .contains_key(&proposal_b.proposal_id),
+            "proposal B must lose to proposal A on monotonic seq, \
+             not on wall-clock timestamp"
+        );
+        // The wall-clock slot for proposal A is its insertion time
+        // (2_000_000), not the rewound clock (1_500_000) — confirming
+        // we never recompute the audit timestamp.
+        let entry_a = ctx
+            .governance
+            .approved_proposals
+            .get(&proposal_a.proposal_id)
+            .unwrap();
+        assert_eq!(entry_a.1, 0, "proposal A must carry monotonic seq 0");
+        assert_eq!(
+            entry_a.2, 2_000_000,
+            "proposal A's audit timestamp must be its original wall-clock \
+             time, not the rewound clock"
+        );
+
+        // Event from proposal B must be ConflictResolved with A as
+        // winner — the sequential resolution path.
+        assert!(
+            events_b.iter().any(|e| matches!(
+                e,
+                GovernanceEvent::ConflictResolved { winner_id, loser_id }
+                    if *winner_id == proposal_a.proposal_id
+                        && *loser_id == proposal_b.proposal_id
+            )),
+            "expected ConflictResolved {{ winner: A, loser: B }} from monotonic seq, \
+             got {events_b:?}"
+        );
+        // No freeze should ever be entered.
+        assert!(
+            ctx.governance.freeze.is_none(),
+            "H10: freeze must remain empty across the wall-clock rewind"
+        );
+    }
 }
