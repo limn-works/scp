@@ -14386,12 +14386,15 @@ async fn enforce_triggered_consequences_skips_absent_member() {
 
         super::super::governance::enforce_triggered_consequences(
             ctx,
-            "test-ctx",
-            &non_member_did,
-            now,
-            &triggered,
-            &rules,
-            &scp_primitives::SystemClock,
+            &super::super::governance::EnforceConsequencesCtx {
+                context_id: "test-ctx",
+                member_did: &non_member_did,
+                now,
+                triggered: &triggered,
+                rules: &rules,
+                clock: &scp_primitives::SystemClock,
+                event_log: &MockEventLog::default(),
+            },
         );
 
         // No ConsequenceTriggered or ConsequenceEnforced events should be emitted.
@@ -16038,12 +16041,15 @@ async fn suspend_all_consequence_preserves_mls_membership() {
         let ctx = contexts.get_mut("h20a-ctx").unwrap();
         super::super::governance::enforce_triggered_consequences(
             ctx,
-            "h20a-ctx",
-            &alice,
-            2000,
-            &triggered,
-            &rules,
-            &scp_primitives::SystemClock,
+            &super::super::governance::EnforceConsequencesCtx {
+                context_id: "h20a-ctx",
+                member_did: &alice,
+                now: 2000,
+                triggered: &triggered,
+                rules: &rules,
+                clock: &scp_primitives::SystemClock,
+                event_log: &MockEventLog::default(),
+            },
         );
     }
 
@@ -16244,12 +16250,15 @@ async fn suspend_capability_consequence_preserves_mls_membership() {
         let ctx = contexts.get_mut("h20b-ctx").unwrap();
         super::super::governance::enforce_triggered_consequences(
             ctx,
-            "h20b-ctx",
-            &alice,
-            2000,
-            &triggered,
-            &rules,
-            &scp_primitives::SystemClock,
+            &super::super::governance::EnforceConsequencesCtx {
+                context_id: "h20b-ctx",
+                member_did: &alice,
+                now: 2000,
+                triggered: &triggered,
+                rules: &rules,
+                clock: &scp_primitives::SystemClock,
+                event_log: &MockEventLog::default(),
+            },
         );
     }
 
@@ -16411,12 +16420,15 @@ async fn restore_access_after_suspend_all_regrants_capabilities() {
         let ctx = contexts.get_mut("h20c-ctx").unwrap();
         super::super::governance::enforce_triggered_consequences(
             ctx,
-            "h20c-ctx",
-            &alice,
-            2000,
-            &triggered,
-            &rules,
-            &scp_primitives::SystemClock,
+            &super::super::governance::EnforceConsequencesCtx {
+                context_id: "h20c-ctx",
+                member_did: &alice,
+                now: 2000,
+                triggered: &triggered,
+                rules: &rules,
+                clock: &scp_primitives::SystemClock,
+                event_log: &MockEventLog::default(),
+            },
         );
     }
 
@@ -16542,5 +16554,640 @@ async fn restore_access_after_suspend_all_regrants_capabilities() {
         "H20.3 INVARIANT: no MLS membership-affecting calls may target \
          Alice during the SuspendAccess + RestoreAccess roundtrip. \
          Recorded calls: {calls:?}"
+    );
+}
+
+/// H4 test 1: a consequence enforced via `send_message` produces a
+/// durable `ConsequenceEnforced` event log entry with the structured
+/// payload from the H4 spec.
+#[allow(clippy::too_many_lines)]
+#[tokio::test]
+async fn consequence_enforced_appended_to_durable_event_log() {
+    use scp_protocol::trust::consequence::{
+        ConsequenceAction, ConsequenceRule, ConsequenceTrigger, EnforcementSeverity,
+    };
+    use std::time::Duration;
+
+    let event_log = std::sync::Arc::new(MockEventLogWithActorDid::default());
+    let manager = ContextManager::new(
+        Box::new(MockCrypto::default()),
+        Box::new(MockTransport::connected()),
+        Box::new(ArcEventLog(event_log.clone())),
+        noop_key_resolver(),
+    );
+
+    let mut params = governance_params();
+    params.economic_policy = None;
+    let _handle = manager
+        .create_context("h4-enforce-ctx".into(), params, "did:key:admin".into())
+        .await
+        .unwrap();
+
+    {
+        let mut contexts = manager.contexts.lock().await;
+        let ctx = contexts.get_mut("h4-enforce-ctx").unwrap();
+        ctx.governance.consequence_rules = vec![ConsequenceRule {
+            trigger: ConsequenceTrigger::MessageVelocity,
+            action: ConsequenceAction::Enforcement(EnforcementSeverity::SuspendCapability {
+                capabilities: vec![Capability::MessagesWrite],
+            }),
+            threshold: 1,
+            window: Duration::from_secs(3600),
+        }];
+    }
+
+    let sk = ed25519_dalek::SigningKey::from_bytes(&[1u8; 32]);
+    let handle = manager
+        .contexts
+        .lock()
+        .await
+        .get("h4-enforce-ctx")
+        .unwrap()
+        .handle
+        .clone();
+    manager
+        .send_message(
+            &handle,
+            &"did:key:admin".into(),
+            b"trigger",
+            Some(&sk),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+    // Sanity: receive buffer still emits the in-session event.
+    let buffer_events = manager.drain_events("h4-enforce-ctx").await;
+    assert!(
+        buffer_events
+            .iter()
+            .any(|e| matches!(e, ContextEvent::ConsequenceEnforced { .. })),
+        "receive buffer should still emit ConsequenceEnforced for in-session observability: {buffer_events:?}"
+    );
+
+    // Durable record: assert ConsequenceEnforced is in the event log
+    // with the structured payload (target_did, rule_index, trigger_kind,
+    // action_type).
+    let context_id_bytes = scp_protocol::context::context_id_bytes("h4-enforce-ctx");
+    let entries = event_log.entries.lock().unwrap();
+    let enforced: Vec<_> = entries
+        .iter()
+        .filter(|(cid, event, _, _, _)| cid == &context_id_bytes && event == "ConsequenceEnforced")
+        .collect();
+    assert_eq!(
+        enforced.len(),
+        1,
+        "expected exactly one ConsequenceEnforced entry in durable log, got {}: {:?}",
+        enforced.len(),
+        entries.iter().map(|e| &e.1).collect::<Vec<_>>()
+    );
+    let (_, _, actor_did, _, payload) = &enforced[0];
+    assert_eq!(
+        actor_did, "system",
+        "ConsequenceEnforced actor_did should be the system sentinel \
+         (not the affected member) so WarningCount triggers can match \
+         this entry against the same subject in subsequent evaluations"
+    );
+    let payload = payload
+        .as_ref()
+        .expect("ConsequenceEnforced must carry a structured payload");
+    assert_eq!(
+        payload.get("target_did").and_then(|v| v.as_str()),
+        Some("did:key:admin"),
+        "payload.target_did must match the affected member"
+    );
+    assert_eq!(
+        payload
+            .get("rule_index")
+            .and_then(serde_json::Value::as_u64),
+        Some(0),
+        "payload.rule_index must match the rule index that fired"
+    );
+    assert_eq!(
+        payload.get("trigger_kind").and_then(|v| v.as_str()),
+        Some("MessageVelocity"),
+        "payload.trigger_kind must use the canonical wire-stable trigger name"
+    );
+    assert_eq!(
+        payload.get("action_type").and_then(|v| v.as_str()),
+        Some("SuspendCapability"),
+        "payload.action_type must match the EnforcementSeverity variant name"
+    );
+
+    // Triggered must also have a durable record (audit reconstruction).
+    let triggered: Vec<_> = entries
+        .iter()
+        .filter(|(cid, event, _, _, _)| cid == &context_id_bytes && event == "ConsequenceTriggered")
+        .collect();
+    assert_eq!(
+        triggered.len(),
+        1,
+        "expected exactly one ConsequenceTriggered entry in durable log"
+    );
+}
+
+/// H4 test 2: when enforcement fails (e.g. `SuspendCapability` with empty
+/// capabilities triggers H10 escalation), both
+/// `ConsequenceEnforcementFailed` and `ConsequenceEscalatedToSuspendAll`
+/// must appear in the durable log.
+#[tokio::test]
+async fn consequence_escalation_appended_with_distinct_event_type() {
+    use scp_protocol::trust::consequence::{
+        ConsequenceAction, ConsequenceRule, ConsequenceTrigger, EnforcementSeverity,
+    };
+    use std::time::Duration;
+
+    let event_log = std::sync::Arc::new(MockEventLogWithActorDid::default());
+    let manager = ContextManager::new(
+        Box::new(MockCrypto::default()),
+        Box::new(MockTransport::connected()),
+        Box::new(ArcEventLog(event_log.clone())),
+        noop_key_resolver(),
+    );
+
+    let params = governance_params();
+    let _handle = manager
+        .create_context("h4-escal-ctx".into(), params, "did:key:sender".into())
+        .await
+        .unwrap();
+
+    // Empty capability list — enforce_suspend returns false → H10
+    // escalates to SuspendAll. Inject directly to bypass the validation
+    // that rejects empty capabilities at rule-creation time.
+    {
+        let mut contexts = manager.contexts.lock().await;
+        let ctx = contexts.get_mut("h4-escal-ctx").unwrap();
+        ctx.governance.consequence_rules = vec![ConsequenceRule {
+            trigger: ConsequenceTrigger::MessageVelocity,
+            threshold: 1,
+            action: ConsequenceAction::Enforcement(EnforcementSeverity::SuspendCapability {
+                capabilities: vec![],
+            }),
+            window: Duration::from_secs(3600),
+        }];
+    }
+
+    let sk = ed25519_dalek::SigningKey::from_bytes(&[1u8; 32]);
+    let handle = manager
+        .contexts
+        .lock()
+        .await
+        .get("h4-escal-ctx")
+        .unwrap()
+        .handle
+        .clone();
+    manager
+        .send_message(
+            &handle,
+            &"did:key:sender".into(),
+            b"trigger escalation",
+            Some(&sk),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+    let context_id_bytes = scp_protocol::context::context_id_bytes("h4-escal-ctx");
+    let entries = event_log.entries.lock().unwrap();
+    let event_names: Vec<&String> = entries
+        .iter()
+        .filter(|(cid, _, _, _, _)| cid == &context_id_bytes)
+        .map(|(_, e, _, _, _)| e)
+        .collect();
+
+    let failed_count = entries
+        .iter()
+        .filter(|(cid, event, _, _, _)| {
+            cid == &context_id_bytes && event == "ConsequenceEnforcementFailed"
+        })
+        .count();
+    assert_eq!(
+        failed_count, 1,
+        "expected exactly one ConsequenceEnforcementFailed entry in durable log, \
+         got {failed_count}. Events: {event_names:?}"
+    );
+
+    let escalation_entries: Vec<_> = entries
+        .iter()
+        .filter(|(cid, event, _, _, _)| {
+            cid == &context_id_bytes && event == "ConsequenceEscalatedToSuspendAll"
+        })
+        .collect();
+    assert_eq!(
+        escalation_entries.len(),
+        1,
+        "expected exactly one ConsequenceEscalatedToSuspendAll entry. \
+         Events: {event_names:?}"
+    );
+    let (_, _, actor, _, escalation_payload) = &escalation_entries[0];
+    assert_eq!(
+        actor, "system",
+        "escalation actor_did must be the system sentinel (H4)"
+    );
+    let escalation_payload = escalation_payload
+        .as_ref()
+        .expect("escalation entry must have a payload");
+    assert_eq!(
+        escalation_payload
+            .get("action_type")
+            .and_then(|v| v.as_str()),
+        Some("SuspendAll"),
+        "escalation payload action_type must record the escalated action"
+    );
+    assert_eq!(
+        escalation_payload
+            .get("target_did")
+            .and_then(|v| v.as_str()),
+        Some("did:key:sender"),
+        "escalation payload target_did must match affected member"
+    );
+}
+
+/// H4 test 3: the recursive blind spot is closed — once a
+/// `ConsequenceEnforced` event lands in the durable log, a subsequent
+/// `WarningCount` rule (which matches `EventType::GovernanceAction`
+/// payloads whose `target_did` equals the subject) can fire on the
+/// auto-suspension and apply its own consequence.
+#[allow(clippy::too_many_lines)]
+#[tokio::test]
+async fn consequence_events_visible_to_subsequent_rule_evaluation() {
+    use scp_protocol::trust::consequence::{
+        ConsequenceAction, ConsequenceRule, ConsequenceTrigger, EnforcementSeverity,
+    };
+    use std::time::Duration;
+
+    let event_log = std::sync::Arc::new(MockEventLogWithActorDid::default());
+    let manager = ContextManager::new(
+        Box::new(MockCrypto::default()),
+        Box::new(MockTransport::connected()),
+        Box::new(ArcEventLog(event_log.clone())),
+        noop_key_resolver(),
+    );
+
+    let params = governance_params();
+    let _handle = manager
+        .create_context("h4-recur-ctx".into(), params, "did:key:alice".into())
+        .await
+        .unwrap();
+
+    // Two rules:
+    //   Rule 0: SuspendCapability(MessagesWrite) on first message velocity
+    //           hit. Short window so the cooldown doesn't suppress the
+    //           second send.
+    //   Rule 1: WarningCount AssignRole(quarantined). Matches when alice
+    //           accumulates 1+ governance-action-typed event targeting
+    //           her — which now includes ConsequenceEnforced records.
+    {
+        let mut contexts = manager.contexts.lock().await;
+        let ctx = contexts.get_mut("h4-recur-ctx").unwrap();
+        ctx.governance.consequence_rules = vec![
+            ConsequenceRule {
+                trigger: ConsequenceTrigger::MessageVelocity,
+                action: ConsequenceAction::Enforcement(EnforcementSeverity::SuspendCapability {
+                    capabilities: vec![Capability::MessagesRead], // not MessagesWrite, so we can still send
+                }),
+                threshold: 1,
+                window: Duration::from_secs(1),
+            },
+            ConsequenceRule {
+                trigger: ConsequenceTrigger::WarningCount,
+                action: ConsequenceAction::AssignRole {
+                    to_role: "observer".to_owned(),
+                },
+                threshold: 1,
+                window: Duration::from_secs(3600),
+            },
+        ];
+    }
+
+    let sk = ed25519_dalek::SigningKey::from_bytes(&[1u8; 32]);
+    let handle = manager
+        .contexts
+        .lock()
+        .await
+        .get("h4-recur-ctx")
+        .unwrap()
+        .handle
+        .clone();
+
+    // First send: rule 0 fires SuspendCapability(MessagesRead). Rule 1
+    // (WarningCount) does NOT match yet because at this point in
+    // `enforce_triggered_consequences` for rule 0, the durable log does
+    // not yet contain the ConsequenceEnforced record. Rule 1 will see it
+    // on the second send.
+    manager
+        .send_message(
+            &handle,
+            &"did:key:alice".into(),
+            b"first",
+            Some(&sk),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+    // Drop role state so the cooldown is the only gating factor for
+    // rule 0 — and force a clock advance so the cooldown elapses.
+    {
+        let mut contexts = manager.contexts.lock().await;
+        let ctx = contexts.get_mut("h4-recur-ctx").unwrap();
+        ctx.role_state.suspended_capabilities.clear();
+        ctx.governance.cooldown_until.clear();
+    }
+
+    let _ = manager.drain_events("h4-recur-ctx").await; // discard buffer events from first send
+
+    // Second send: rule 0 fires again — and rule 1 (WarningCount) now
+    // matches because the first send's ConsequenceEnforced is in the
+    // durable log. The recursive consequence applies AssignRole to
+    // alice.
+    manager
+        .send_message(
+            &handle,
+            &"did:key:alice".into(),
+            b"second",
+            Some(&sk),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+    let events = manager.drain_events("h4-recur-ctx").await;
+    let assign_role_enforced = events.iter().any(|e| {
+        matches!(
+            e,
+            ContextEvent::ConsequenceEnforced { action_type, success: true, .. }
+                if action_type == "AssignRole"
+        )
+    });
+    assert!(
+        assign_role_enforced,
+        "rule 1 (WarningCount → AssignRole) should fire on the second send because \
+         the durable log now contains the first send's ConsequenceEnforced record. \
+         Events: {events:?}"
+    );
+
+    // And the assigned role should land in the role state.
+    let contexts = manager.contexts.lock().await;
+    let ctx = contexts.get("h4-recur-ctx").unwrap();
+    let assignment = ctx
+        .role_state
+        .assignments
+        .get("did:key:alice")
+        .expect("alice must still have a role assignment after demotion");
+    assert_eq!(
+        assignment.role_name, "observer",
+        "AssignRole(observer) consequence should have landed in role state"
+    );
+}
+
+/// H4 test 4 (structural): the durable event log append must precede
+/// the receive buffer push so a crash between the two leaves the
+/// Merkle-anchored record intact. Verified at the source level by
+/// inspecting the helper functions that comprise the consequence
+/// enforcement path.
+///
+/// Layout after the H4 refactor:
+///   * `enforce_triggered_consequences` — thin wrapper that dispatches to
+///     `process_one_triggered_consequence` for each consequence.
+///   * `process_one_triggered_consequence` — cooldown / TOCTOU / dispatch
+///     logic. Delegates emission to the four helpers below.
+///   * `emit_consequence_triggered` — appends + pushes `ConsequenceTriggered`.
+///   * `emit_absent_member_enforcement_failed` — appends + pushes
+///     `ConsequenceEnforcementFailed` (member-departed path, no escalation).
+///   * `emit_consequence_enforced_success` — appends + pushes
+///     `ConsequenceEnforced` on the success path.
+///   * `emit_failure_escalation` — H10 escalation path. Appends
+///     `ConsequenceEnforcementFailed` + `ConsequenceEscalatedToSuspendAll`,
+///     then pushes a single `ConsequenceEnforced` to the receive buffer.
+///   * `append_consequence_event` — single canonical helper that wraps the
+///     `append_context_event_with_payload` call. Every emission helper
+///     calls this; the structural test verifies that invariant.
+#[allow(clippy::too_many_lines)]
+#[test]
+fn consequence_event_log_append_ordering() {
+    let source = include_str!("../governance.rs");
+
+    /// Extracts the body of a top-level function from `source`.
+    fn extract_body<'a>(source: &'a str, sig: &str) -> &'a str {
+        let sig_pos = source
+            .find(sig)
+            .unwrap_or_else(|| panic!("signature not found: {sig}"));
+        let after_sig = &source[sig_pos..];
+        let body_start = after_sig
+            .find('{')
+            .expect("function signature must be followed by an opening brace");
+        let mut depth = 0i32;
+        let mut body_end = body_start;
+        for (i, ch) in after_sig[body_start..].char_indices() {
+            match ch {
+                '{' => depth += 1,
+                '}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        body_end = body_start + i + 1;
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        &after_sig[body_start..body_end]
+    }
+
+    // 1. The single canonical helper that wraps the durable append.
+    //    Renaming or removing it must fail this assertion so the test
+    //    cannot be silently neutralized.
+    let helper_body = extract_body(source, "fn append_consequence_event(");
+    assert!(
+        helper_body.contains("append_context_event_with_payload"),
+        "append_consequence_event helper must call append_context_event_with_payload"
+    );
+    assert!(
+        helper_body.contains("CONSEQUENCE_ACTOR_DID"),
+        "append_consequence_event helper must use the CONSEQUENCE_ACTOR_DID sentinel"
+    );
+
+    // 2. Each leaf-level emission helper must reference the event type it
+    //    emits AND must call append_consequence_event before any
+    //    receive_buffer.push(ContextEvent::Consequence...) call.
+    //    This verifies the H4 durability ordering invariant at the source
+    //    level for each event type.
+    for (helper_name, expected_events) in [
+        (
+            "fn emit_consequence_triggered(",
+            &["ConsequenceTriggered"][..],
+        ),
+        (
+            "fn emit_absent_member_enforcement_failed(",
+            &["ConsequenceEnforcementFailed", "ConsequenceEnforced"][..],
+        ),
+        (
+            "fn emit_consequence_enforced_success(",
+            &["ConsequenceEnforced"][..],
+        ),
+        (
+            "fn emit_failure_escalation(",
+            &[
+                "ConsequenceEnforcementFailed",
+                "ConsequenceEscalatedToSuspendAll",
+            ][..],
+        ),
+    ] {
+        let body = extract_body(source, helper_name);
+
+        for evt in expected_events {
+            assert!(
+                body.contains(evt),
+                "{helper_name} body must reference {evt} (H4)"
+            );
+        }
+
+        let push_offset = body.find("receive_buffer.push(ContextEvent::Consequence");
+        if let Some(push_offset) = push_offset {
+            let append_offset = body.find("append_consequence_event(").unwrap_or_else(|| {
+                panic!(
+                    "{helper_name} body has a ContextEvent::Consequence push \
+                     but no append_consequence_event call — H4 ordering invariant \
+                     violated"
+                )
+            });
+            assert!(
+                append_offset < push_offset,
+                "{helper_name}: first append_consequence_event (offset {append_offset}) \
+                 must precede first ContextEvent::Consequence receive_buffer.push \
+                 (offset {push_offset}) — H4 invariant: durable record before \
+                 in-memory observation"
+            );
+        }
+
+        let push_count = body
+            .matches("receive_buffer.push(ContextEvent::Consequence")
+            .count();
+        let append_count = body.matches("append_consequence_event(").count();
+        assert!(
+            append_count >= push_count,
+            "{helper_name}: every ContextEvent::Consequence buffer push must be \
+             paired with an append_consequence_event call. \
+             Pushes: {push_count}, appends: {append_count}. H4 invariant violated."
+        );
+    }
+
+    // 3. `process_one_triggered_consequence` must delegate to all four
+    //    emission helpers — verifying that none were accidentally removed
+    //    from the dispatch path.
+    let process_body = extract_body(source, "fn process_one_triggered_consequence(");
+    for helper in [
+        "emit_consequence_triggered(",
+        "emit_absent_member_enforcement_failed(",
+        "emit_consequence_enforced_success(",
+        "emit_failure_escalation(",
+    ] {
+        assert!(
+            process_body.contains(helper),
+            "process_one_triggered_consequence must call {helper} (H4 dispatch completeness)"
+        );
+    }
+
+    // 4. Aggregate sanity: across the four leaf-level emission helpers there
+    //    are at least four append_consequence_event calls (one per canonical
+    //    event string: Triggered, Enforced, EnforcementFailed,
+    //    EscalatedToSuspendAll). This is a coarse anti-regression that
+    //    catches accidental deletion of an entire helper.
+    let triggered_body = extract_body(source, "fn emit_consequence_triggered(");
+    let absent_body = extract_body(source, "fn emit_absent_member_enforcement_failed(");
+    let success_body = extract_body(source, "fn emit_consequence_enforced_success(");
+    let escalate_body = extract_body(source, "fn emit_failure_escalation(");
+    let total_appends = triggered_body.matches("append_consequence_event(").count()
+        + absent_body.matches("append_consequence_event(").count()
+        + success_body.matches("append_consequence_event(").count()
+        + escalate_body.matches("append_consequence_event(").count();
+    assert!(
+        total_appends >= 4,
+        "consequence-emission helpers must contain at least 4 \
+         append_consequence_event calls (Triggered, Enforced, \
+         EnforcementFailed, EscalatedToSuspendAll); found {total_appends}. \
+         Removing any of them is a non-repudiation regression (H4)."
+    );
+}
+
+/// H4 test 5: regression — when no consequence rules are configured,
+/// `enforce_triggered_consequences` must produce zero durable event log
+/// entries and zero receive buffer events.
+#[tokio::test]
+async fn consequence_rule_with_empty_rules_no_durable_append() {
+    let event_log = std::sync::Arc::new(MockEventLogWithActorDid::default());
+    let manager = ContextManager::new(
+        Box::new(MockCrypto::default()),
+        Box::new(MockTransport::connected()),
+        Box::new(ArcEventLog(event_log.clone())),
+        noop_key_resolver(),
+    );
+
+    let mut params = governance_params();
+    params.consequence_rules = vec![];
+    let _handle = manager
+        .create_context("h4-empty-ctx".into(), params, "did:key:admin".into())
+        .await
+        .unwrap();
+
+    let sk = ed25519_dalek::SigningKey::from_bytes(&[1u8; 32]);
+    let handle = manager
+        .contexts
+        .lock()
+        .await
+        .get("h4-empty-ctx")
+        .unwrap()
+        .handle
+        .clone();
+    manager
+        .send_message(
+            &handle,
+            &"did:key:admin".into(),
+            b"no rules",
+            Some(&sk),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+    // Receive buffer must NOT contain ConsequenceTriggered or
+    // ConsequenceEnforced.
+    let events = manager.drain_events("h4-empty-ctx").await;
+    let any_consequence = events.iter().any(|e| {
+        matches!(
+            e,
+            ContextEvent::ConsequenceTriggered { .. } | ContextEvent::ConsequenceEnforced { .. }
+        )
+    });
+    assert!(
+        !any_consequence,
+        "empty consequence_rules must not emit any consequence event to the receive buffer. \
+         Events: {events:?}"
+    );
+
+    // Durable log must NOT contain ConsequenceTriggered, ConsequenceEnforced,
+    // ConsequenceEnforcementFailed, or ConsequenceEscalatedToSuspendAll.
+    let context_id_bytes = scp_protocol::context::context_id_bytes("h4-empty-ctx");
+    let entries = event_log.entries.lock().unwrap();
+    let consequence_entries: Vec<_> = entries
+        .iter()
+        .filter(|(cid, event, _, _, _)| {
+            cid == &context_id_bytes
+                && (event == "ConsequenceTriggered"
+                    || event == "ConsequenceEnforced"
+                    || event == "ConsequenceEnforcementFailed"
+                    || event == "ConsequenceEscalatedToSuspendAll")
+        })
+        .collect();
+    assert!(
+        consequence_entries.is_empty(),
+        "empty consequence_rules must not append any consequence event to the durable log. \
+         Found: {consequence_entries:?}"
     );
 }

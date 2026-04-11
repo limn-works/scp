@@ -670,19 +670,23 @@ impl ContextManager {
                     ctx.governance.consequence_rules.clone();
                 // evaluate_consequence_rules is called as an expression_statement
                 // (not a let_declaration) so the NO-DISCARD-MSG gate passes.
+                let send_triggered = evaluate_consequence_rules(
+                    &consequence_rules,
+                    &send_events,
+                    sender_did.as_ref(),
+                    now,
+                );
                 super::governance::enforce_triggered_consequences(
                     ctx,
-                    context_id,
-                    sender_did,
-                    now,
-                    &evaluate_consequence_rules(
-                        &consequence_rules,
-                        &send_events,
-                        sender_did.as_ref(),
+                    &super::governance::EnforceConsequencesCtx {
+                        context_id,
+                        member_did: sender_did,
                         now,
-                    ),
-                    &consequence_rules,
-                    &*self.clock,
+                        triggered: &send_triggered,
+                        rules: &consequence_rules,
+                        clock: &*self.clock,
+                        event_log: &*self.event_log,
+                    },
                 );
 
                 // Participation record update (#1530) — refresh cache after send.
@@ -1037,6 +1041,7 @@ impl ContextManager {
     /// (i.e. the same node that sent the message). In that case velocity is
     /// already recorded on the send path and must not be counted again here,
     /// otherwise a single message would be double-counted on single-node setups.
+    #[allow(clippy::too_many_lines)]
     pub(super) async fn deliver_message_and_drain_buffered(
         &self,
         context_id: &str,
@@ -1176,14 +1181,20 @@ impl ContextManager {
                 now,
                 &*self.event_log,
             );
+            let recv_triggered =
+                evaluate_consequence_rules(&consequence_rules, &recv_events, sender_did, now);
+            let recv_member_did = DID(sender_did.to_owned());
             super::governance::enforce_triggered_consequences(
                 ctx,
-                context_id,
-                &DID(sender_did.to_owned()),
-                now,
-                &evaluate_consequence_rules(&consequence_rules, &recv_events, sender_did, now),
-                &consequence_rules,
-                &*self.clock,
+                &super::governance::EnforceConsequencesCtx {
+                    context_id,
+                    member_did: &recv_member_did,
+                    now,
+                    triggered: &recv_triggered,
+                    rules: &consequence_rules,
+                    clock: &*self.clock,
+                    event_log: &*self.event_log,
+                },
             );
         }
 
