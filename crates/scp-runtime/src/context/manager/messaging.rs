@@ -30,19 +30,27 @@ fn enforce_send_economy(
     spending_ucan: Option<&scp_protocol::crypto::ucan::UcanToken>,
     context_id: &str,
     clock: &dyn scp_primitives::Clock,
+    key_resolver: &scp_protocol::context::governance::KeyResolver,
 ) -> Result<Option<scp_protocol::economy::types::Amount>, ContextError> {
     let pricing_default =
         scp_protocol::economy::antispam::ContextMessagePricingConfig::spec_default();
-    let pricing = ctx
-        .governance
+    // Compute member_count first so it does not race the upcoming split
+    // borrow of `ctx.governance`.
+    let member_count = ctx.membership.count();
+    // C1 (PR #1606): split-borrow `ctx.governance` so that the mutable
+    // budget/nonce borrows and the immutable velocity/policy/revocation
+    // borrows can coexist in a single `EnforceEconomyRequest`. Disjoint
+    // fields are borrow-checked individually.
+    let governance = &mut ctx.governance;
+    let pricing = governance
         .message_pricing
         .as_ref()
         .unwrap_or(&pricing_default);
     super::economy::enforce_economy(super::economy::EnforceEconomyRequest {
-        economic_policy: ctx.governance.economic_policy.as_ref(),
-        budget_tracker: &mut ctx.governance.budget_tracker,
-        velocity_tracker: &ctx.governance.velocity_tracker,
-        member_count: ctx.membership.count(),
+        economic_policy: governance.economic_policy.as_ref(),
+        budget_tracker: &mut governance.budget_tracker,
+        velocity_tracker: &governance.velocity_tracker,
+        member_count,
         action_type: scp_protocol::economy::types::PaidActionType::MessageSend,
         actor_did: sender_did,
         now,
@@ -51,7 +59,9 @@ fn enforce_send_economy(
         context_id,
         clock,
         pricing,
-        nonce_tracker: &mut ctx.governance.spending_nonce_tracker,
+        nonce_tracker: &mut governance.spending_nonce_tracker,
+        revoked_spending_ucan_cids: &governance.revoked_spending_ucan_cids,
+        key_resolver,
     })
 }
 
@@ -369,6 +379,7 @@ impl ContextManager {
                 spending_ucan,
                 &context_id,
                 &*self.clock,
+                &self.key_resolver,
             ) {
                 Ok(cost) => cost,
                 Err(e) => {

@@ -606,7 +606,7 @@ fn extract_key_scope(payload: &UcanPayload) -> Option<String> {
 ///
 /// Returns [`UcanError::SelfDelegationWithoutKeyScope`] or
 /// [`UcanError::KeyScopeMismatch`] on violation.
-fn validate_key_scope(token: &UcanToken) -> Result<(), UcanError> {
+pub(super) fn validate_key_scope(token: &UcanToken) -> Result<(), UcanError> {
     let key_scope = extract_key_scope(&token.payload);
 
     // Step 5a: Self-delegation without key_scope is a safety violation.
@@ -692,7 +692,10 @@ fn enforce_ucan_category_a(
 /// Returns [`UcanError::SignatureInvalid`] if the signature does not verify.
 /// Returns [`UcanError::MalformedToken`] if the DID cannot be resolved or
 /// the public key / signature bytes are malformed.
-fn verify_signature(token: &UcanToken, did_resolver: &impl DidResolver) -> Result<(), UcanError> {
+pub(super) fn verify_signature(
+    token: &UcanToken,
+    did_resolver: &impl DidResolver,
+) -> Result<(), UcanError> {
     // When kid is present in the header, resolve the specific verification
     // method from the DID document (ADR-039, SCP-AB-013).
     let pk_bytes = match &token.header.kid {
@@ -737,7 +740,7 @@ fn verify_signature(token: &UcanToken, did_resolver: &impl DidResolver) -> Resul
 /// range, has an expiry too far in the future, or has been revoked.  This
 /// wrapping allows downstream classifiers to distinguish parent-token failures
 /// from leaf-token failures (see issue #1026).
-fn verify_delegation_chain(
+pub(super) fn verify_delegation_chain(
     token: &UcanToken,
     did_resolver: &impl DidResolver,
     proof_resolver: &impl ProofResolver,
@@ -948,7 +951,7 @@ fn verify_attenuation(
 /// Returns [`UcanError::TokenExpired`] if the token has expired beyond tolerance.
 /// Returns [`UcanError::ExpiryTooFar`] if `exp` exceeds now + 24 hours.
 /// Returns [`UcanError::TokenNotYetValid`] if `nbf > now + tolerance`.
-fn verify_expiry(
+pub(super) fn verify_expiry(
     token: &UcanToken,
     clock_skew_tolerance_secs: u64,
     clock: &dyn Clock,

@@ -776,6 +776,17 @@ struct GovernanceState {
     /// Validates that each spending UCAN nonce is used at most once, preventing
     /// replay attacks where a valid spending UCAN is resubmitted.
     spending_nonce_tracker: scp_protocol::crypto::ucan::nonce::NonceTracker<Arc<dyn Clock>>,
+    /// Per-context revoked spending-UCAN CIDs (C1, PR #1606).
+    ///
+    /// Consulted by `enforce_economy` via the
+    /// [`super::economy::ContextRevocationChecker`] adapter when validating
+    /// spending UCANs through the full cryptographic pipeline. Currently
+    /// empty in steady state — spending UCAN revocation lists have not been
+    /// wired through governance — but the field exists so the only change
+    /// required when revocation lands is populating it (no enforcement
+    /// rewrite needed). The set is part of the governance bucket because
+    /// revocation actions are governance-driven (§19.5).
+    revoked_spending_ucan_cids: HashSet<String>,
     /// Per-member governance proposal timestamps for earned capacity rate limiting
     /// (§9.3). Maps member DID string to a list of Unix timestamps (seconds) when
     /// the member submitted governance proposals. Used by `check_proposer_eligibility` to
