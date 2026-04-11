@@ -1139,6 +1139,25 @@ impl WasmContextManager {
         }
     }
 
+    /// Returns `true` if the context's stored economic policy requires payment.
+    /// Returns `false` if the context is not found, not active, or has no/free policy.
+    ///
+    /// # Errors
+    ///
+    /// Returns `ScpWasmError::Context` if the context is not registered.
+    pub fn context_has_paid_policy(&self, context_id: &str) -> Result<bool, ScpWasmError> {
+        let ctx = self
+            .contexts
+            .get(context_id)
+            .ok_or_else(|| ScpWasmError::Context {
+                message: format!("context '{context_id}' not found"),
+                code: "SCP-CTX-2000".to_owned(),
+            })?;
+        Ok(stored_policy_requires_payment(
+            ctx.economic_policy.as_deref(),
+        ))
+    }
+
     // -----------------------------------------------------------------------
     // Context lifecycle
     // -----------------------------------------------------------------------
