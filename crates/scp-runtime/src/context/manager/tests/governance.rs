@@ -5128,6 +5128,166 @@ async fn test_remove_member_sender_key_before_mls_removal() {
     );
 }
 
+/// Consequence rules trigger enforcement events when fired.
+#[tokio::test]
+async fn test_consequence_rule_triggers_enforcement_event() {
+    use scp_protocol::trust::consequence::{
+        ConsequenceAction, ConsequenceRule, ConsequenceTrigger, EnforcementSeverity,
+    };
+    use std::time::Duration;
+
+    let manager = ContextManager::new(
+        Box::new(MockCrypto::default()),
+        Box::new(MockTransport::connected()),
+        Box::new(MockEventLog::default()),
+        noop_key_resolver(),
+    );
+
+    let mut params = governance_params();
+    params.economic_policy = None;
+    let _handle = manager
+        .create_context("conseq-ctx".into(), params, "did:key:admin".into())
+        .await
+        .unwrap();
+
+    // Inject a consequence rule via direct state mutation (since ContextParams
+    // consequence_rules is set in create_context from params).
+    {
+        let mut contexts = manager.contexts.lock().await;
+        let ctx = contexts.get_mut("conseq-ctx").unwrap();
+        ctx.governance.consequence_rules = vec![ConsequenceRule {
+            trigger: ConsequenceTrigger::MessageVelocity,
+            action: ConsequenceAction::Enforcement(EnforcementSeverity::SuspendAccess),
+            threshold: 1,
+            window: Duration::from_secs(3600),
+        }];
+    }
+
+    // Send a message to trigger consequence evaluation.
+    let sk = ed25519_dalek::SigningKey::from_bytes(&[1u8; 32]);
+    let handle = manager
+        .contexts
+        .lock()
+        .await
+        .get("conseq-ctx")
+        .unwrap()
+        .handle
+        .clone();
+    let result = manager
+        .send_message(
+            &handle,
+            &"did:key:admin".into(),
+            b"trigger",
+            Some(&sk),
+            None,
+            None,
+        )
+        .await;
+    assert!(result.is_ok(), "send_message should succeed: {result:?}");
+
+    // Drain events and check for ConsequenceTriggered + ConsequenceEnforced.
+    let events = manager.drain_events("conseq-ctx").await;
+    let triggered = events
+        .iter()
+        .any(|e| matches!(e, ContextEvent::ConsequenceTriggered { .. }));
+    let enforced = events
+        .iter()
+        .any(|e| matches!(e, ContextEvent::ConsequenceEnforced { .. }));
+    assert!(
+        triggered,
+        "expected ConsequenceTriggered event in: {events:?}"
+    );
+    assert!(
+        enforced,
+        "expected ConsequenceEnforced event in: {events:?}"
+    );
+}
+
+/// Economy enforcement deducts cost on `send_message`.
+#[tokio::test]
+async fn test_economy_cost_deducted_on_send() {
+    use scp_protocol::economy::types::{Amount, CostSchedule, CurrencyCode, EconomicPolicy};
+
+    // C1 (PR #1606): paid sends require signature-verified spending UCANs.
+    // `mock_key_resolver` resolves the deterministic test key for the actor
+    // so the new validation pipeline succeeds.
+    let manager = ContextManager::new(
+        Box::new(MockCrypto::default()),
+        Box::new(MockTransport::connected()),
+        Box::new(MockEventLog::default()),
+        mock_key_resolver(),
+    );
+
+    let mut params = governance_params();
+    params.economic_policy = Some(EconomicPolicy {
+        locked: false,
+        cost_schedule: CostSchedule {
+            currency: CurrencyCode([85, 83, 68, 0]),
+            per_message: Some(Amount::new(10)),
+            per_tool_invoke: None,
+            per_join: None,
+            per_period: None,
+            per_byte_stored: None,
+        },
+        payment_adapters: vec![],
+        pricing_formula: None,
+        payee: DID::from("did:key:payee"),
+    });
+    let _handle = manager
+        .create_context("econ-ctx".into(), params, "did:key:admin".into())
+        .await
+        .unwrap();
+
+    // Grant budget so the send can succeed.
+    {
+        let mut contexts = manager.contexts.lock().await;
+        let ctx = contexts.get_mut("econ-ctx").unwrap();
+        ctx.governance
+            .budget_tracker
+            .grant(&"did:key:admin".into(), Amount::new(100));
+    }
+
+    let sk = ed25519_dalek::SigningKey::from_bytes(&[1u8; 32]);
+    let handle = manager
+        .contexts
+        .lock()
+        .await
+        .get("econ-ctx")
+        .unwrap()
+        .handle
+        .clone();
+    let ucan = dummy_spending_ucan_for(&"did:key:admin".into());
+    let result = manager
+        .send_message(
+            &handle,
+            &"did:key:admin".into(),
+            b"paid msg",
+            Some(&sk),
+            None,
+            Some(&ucan),
+        )
+        .await;
+    assert!(
+        result.is_ok(),
+        "send should succeed with budget: {result:?}"
+    );
+
+    // Verify budget was deducted.
+    {
+        let contexts = manager.contexts.lock().await;
+        let ctx = contexts.get("econ-ctx").unwrap();
+        let remaining = ctx
+            .governance
+            .budget_tracker
+            .remaining(&"did:key:admin".into());
+        assert_eq!(
+            remaining,
+            Amount::new(90),
+            "budget should have been deducted by 10, remaining: {remaining:?}"
+        );
+    }
+}
+
 /// Cooldown prevents consequence rule from re-triggering within its window.
 #[tokio::test]
 async fn test_cooldown_prevents_consequence_retrigger() {
@@ -5229,11 +5389,12 @@ async fn test_cooldown_prevents_consequence_retrigger() {
 async fn test_budget_exceeded_blocks_send() {
     use scp_protocol::economy::types::{Amount, CostSchedule, CurrencyCode, EconomicPolicy};
 
+    // C1 (PR #1606): paid sends require signature-verified spending UCANs.
     let manager = ContextManager::new(
         Box::new(MockCrypto::default()),
         Box::new(MockTransport::connected()),
         Box::new(MockEventLog::default()),
-        noop_key_resolver(),
+        mock_key_resolver(),
     );
 
     let mut params = governance_params();
@@ -5274,7 +5435,7 @@ async fn test_budget_exceeded_blocks_send() {
         .unwrap()
         .handle
         .clone();
-    let ucan = dummy_spending_ucan();
+    let ucan = dummy_spending_ucan_for(&"did:key:admin".into());
     let result = manager
         .send_message(
             &handle,
@@ -6534,11 +6695,12 @@ async fn full_send_consequence_enforcement_round_trip() {
     };
     use std::time::Duration;
 
+    // C1 (PR #1606): paid sends require signature-verified spending UCANs.
     let manager = ContextManager::new(
         Box::new(MockCrypto::default()),
         Box::new(MockTransport::connected()),
         Box::new(MockEventLog::default()),
-        noop_key_resolver(),
+        mock_key_resolver(),
     );
 
     let mut params = governance_params();
@@ -6591,7 +6753,7 @@ async fn full_send_consequence_enforcement_round_trip() {
         .clone();
 
     // Send message — should deduct budget AND trigger consequence AND record velocity.
-    let ucan = dummy_spending_ucan();
+    let ucan = dummy_spending_ucan_for(&"did:key:admin".into());
     let result = manager
         .send_message(
             &handle,
@@ -7159,11 +7321,12 @@ async fn consequence_triggers_on_message_send() {
 async fn send_message_deducts_budget() {
     use scp_protocol::economy::types::{Amount, CostSchedule, CurrencyCode, EconomicPolicy};
 
+    // C1 (PR #1606): paid sends require signature-verified spending UCANs.
     let manager = ContextManager::new(
         Box::new(MockCrypto::default()),
         Box::new(MockTransport::connected()),
         Box::new(MockEventLog::default()),
-        noop_key_resolver(),
+        mock_key_resolver(),
     );
 
     let mut params = governance_params();
@@ -7208,7 +7371,7 @@ async fn send_message_deducts_budget() {
     // Send message — should deduct 5 from budget.
     // Each send uses a fresh spending UCAN (unique nonce) per NonceTracker
     // replay prevention.
-    let ucan = dummy_spending_ucan();
+    let ucan = dummy_spending_ucan_for(&"did:key:sender".into());
     manager
         .send_message(
             &handle,
@@ -7236,7 +7399,7 @@ async fn send_message_deducts_budget() {
     );
 
     // Send another message — budget should go to 40.
-    let ucan2 = dummy_spending_ucan();
+    let ucan2 = dummy_spending_ucan_for(&"did:key:sender".into());
     manager
         .send_message(
             &handle,
@@ -7863,6 +8026,184 @@ async fn participation_record_updated_after_governance() {
 
 // --- #1537 — Economy (8 tests) ------------------------------------------
 
+/// Send rejected when budget insufficient (#1537).
+#[tokio::test]
+async fn test_send_rejected_insufficient_budget() {
+    use scp_protocol::economy::types::{Amount, CostSchedule, CurrencyCode, EconomicPolicy};
+
+    // C1 (PR #1606): paid sends require signature-verified spending UCANs.
+    let manager = ContextManager::new(
+        Box::new(MockCrypto::default()),
+        Box::new(MockTransport::connected()),
+        Box::new(MockEventLog::default()),
+        mock_key_resolver(),
+    );
+
+    let mut params = governance_params();
+    params.economic_policy = Some(EconomicPolicy {
+        locked: false,
+        cost_schedule: CostSchedule {
+            currency: CurrencyCode([85, 83, 68, 0]),
+            per_message: Some(Amount::new(5)),
+            per_tool_invoke: None,
+            per_join: None,
+            per_period: None,
+            per_byte_stored: None,
+        },
+        payment_adapters: vec![],
+        pricing_formula: None,
+        payee: DID::from("did:key:payee"),
+    });
+    let _handle = manager
+        .create_context("insuf-ctx".into(), params, "did:key:admin".into())
+        .await
+        .unwrap();
+
+    // Grant budget of 3 (less than per_message=5).
+    {
+        let mut contexts = manager.contexts.lock().await;
+        let ctx = contexts.get_mut("insuf-ctx").unwrap();
+        ctx.governance
+            .budget_tracker
+            .grant(&"did:key:admin".into(), Amount::new(3));
+    }
+
+    let sk = ed25519_dalek::SigningKey::from_bytes(&[1u8; 32]);
+    let handle = manager
+        .contexts
+        .lock()
+        .await
+        .get("insuf-ctx")
+        .unwrap()
+        .handle
+        .clone();
+
+    let ucan = dummy_spending_ucan_for(&"did:key:admin".into());
+    let result = manager
+        .send_message(
+            &handle,
+            &"did:key:admin".into(),
+            b"should fail",
+            Some(&sk),
+            None,
+            Some(&ucan),
+        )
+        .await;
+    assert!(result.is_err(), "send should fail with insufficient budget");
+    let err = result.unwrap_err();
+    assert!(
+        matches!(err, ContextError::PermissionDenied(ref msg) if msg.contains("budget exceeded")),
+        "expected budget exceeded error, got: {err}"
+    );
+}
+
+/// Tool invoke rejected when budget insufficient (#1537).
+#[tokio::test]
+async fn test_tool_invoke_rejected_insufficient_budget() {
+    use crate::context::tools::invoke::{InvocationError, ToolEconomyContext, invoke_tool};
+    use scp_protocol::economy::types::{Amount, CostSchedule, CurrencyCode, EconomicPolicy};
+
+    let policy = EconomicPolicy {
+        locked: false,
+        cost_schedule: CostSchedule {
+            currency: CurrencyCode([85, 83, 68, 0]),
+            per_message: None,
+            per_tool_invoke: Some(Amount::new(50)),
+            per_join: None,
+            per_period: None,
+            per_byte_stored: None,
+        },
+        payment_adapters: vec![],
+        pricing_formula: None,
+        payee: DID::from("did:key:payee"),
+    };
+    let invoker: DID = "did:key:invoker".into();
+    let mut tracker = scp_protocol::economy::budget::MemberBudgetTracker::new();
+    tracker.grant(&invoker, Amount::new(30)); // Less than per_tool_invoke=50.
+    let (handle, registry, role_state) = test_tool_invoke_setup(&invoker).await;
+    let spending_ucan = dummy_spending_ucan();
+    let mut economy = ToolEconomyContext {
+        economic_policy: Some(&policy),
+        budget_tracker: &mut tracker,
+        spending_ucan: Some(&spending_ucan),
+        context_id: "ctx-test",
+        now: 0,
+        events: &[],
+        participation_cache: &mut std::collections::HashMap::new(),
+        consequence_rules: &[],
+        payment_adapter: None,
+        metrics: scp_protocol::economy::policy::ObservableMetrics::default(),
+        velocity_tracker: None,
+        message_pricing: None,
+    };
+    let result = invoke_tool(
+        &handle,
+        &registry,
+        &role_state,
+        &"calculator".to_owned(),
+        serde_json::json!({"a": 1, "b": 2}),
+        &invoker,
+        None,
+        |_| async move { Ok(serde_json::json!({"result": 3, "status": "ok"})) },
+        Some(&mut economy),
+    )
+    .await;
+    assert!(
+        matches!(result, Err(InvocationError::BudgetExceeded { .. })),
+        "expected BudgetExceeded error, got: {result:?}"
+    );
+}
+
+/// Join rejected when budget insufficient — paid context blocks join (#1537).
+#[tokio::test]
+async fn test_join_rejected_insufficient_budget() {
+    use scp_protocol::economy::types::{Amount, CostSchedule, CurrencyCode, EconomicPolicy};
+
+    let manager = ContextManager::new(
+        Box::new(MockCrypto::default()),
+        Box::new(MockTransport::connected()),
+        Box::new(MockEventLog::default()),
+        noop_key_resolver(),
+    );
+
+    let mut params = governance_params();
+    params.economic_policy = Some(EconomicPolicy {
+        locked: false,
+        cost_schedule: CostSchedule {
+            currency: CurrencyCode([85, 83, 68, 0]),
+            per_message: None,
+            per_tool_invoke: None,
+            per_join: Some(Amount::new(100)),
+            per_period: None,
+            per_byte_stored: None,
+        },
+        payment_adapters: vec![],
+        pricing_formula: None,
+        payee: DID::from("did:key:payee"),
+    });
+    let handle = manager
+        .create_context("join-insuf-ctx".into(), params, "did:key:admin".into())
+        .await
+        .unwrap();
+
+    // Try to join without any budget grant — auto_accept_blocked_by_economics
+    // blocks before budget check, so we expect PermissionDenied about "paid context".
+    let kp = scp_protocol::context::membership::KeyPackage {
+        owner_did: "did:key:joiner".into(),
+        mls_key_package_bytes: None,
+    };
+    let result = manager.join_context(&handle, kp, None).await;
+    assert!(
+        result.is_err(),
+        "join should fail for paid context with insufficient budget: {result:?}"
+    );
+    let err = result.unwrap_err();
+    assert!(
+        matches!(err, ContextError::PermissionDenied(ref msg) if msg.contains("paid context")),
+        "expected paid context rejection, got: {err}"
+    );
+}
+
 /// `authorize_paid_action` skips when no payment adapter is configured (#1537).
 #[tokio::test]
 async fn test_execute_paid_action_skips_without_adapter() {
@@ -8202,6 +8543,171 @@ async fn test_encrypted_rotation_increments_epoch() {
 
 // --- Cross-cutting integration (4 tests) ---------------------------------
 
+/// Send triggers consequence + economy + velocity in one action (#1531, #1537).
+#[tokio::test]
+async fn test_send_consequence_economy_round_trip() {
+    use scp_protocol::economy::types::{Amount, CostSchedule, CurrencyCode, EconomicPolicy};
+    use scp_protocol::trust::consequence::{
+        ConsequenceAction, ConsequenceRule, ConsequenceTrigger, EnforcementSeverity,
+    };
+    use std::time::Duration;
+
+    // C1 (PR #1606): paid sends require signature-verified spending UCANs.
+    let manager = ContextManager::new(
+        Box::new(MockCrypto::default()),
+        Box::new(MockTransport::connected()),
+        Box::new(MockEventLog::default()),
+        mock_key_resolver(),
+    );
+
+    let mut params = governance_params();
+    params.economic_policy = Some(EconomicPolicy {
+        locked: false,
+        cost_schedule: CostSchedule {
+            currency: CurrencyCode([85, 83, 68, 0]),
+            per_message: Some(Amount::new(5)),
+            per_tool_invoke: None,
+            per_join: None,
+            per_period: None,
+            per_byte_stored: None,
+        },
+        payment_adapters: vec![],
+        pricing_formula: None,
+        payee: DID::from("did:key:payee"),
+    });
+    params.consequence_rules = vec![ConsequenceRule {
+        trigger: ConsequenceTrigger::MessageVelocity,
+        threshold: 1,
+        action: ConsequenceAction::Enforcement(EnforcementSeverity::SuspendCapability {
+            capabilities: vec![Capability::MessagesWrite],
+        }),
+        window: Duration::from_secs(3600),
+    }];
+    let _handle = manager
+        .create_context("xcut-rt-ctx".into(), params, "did:key:admin".into())
+        .await
+        .unwrap();
+
+    // Grant budget.
+    {
+        let mut contexts = manager.contexts.lock().await;
+        let ctx = contexts.get_mut("xcut-rt-ctx").unwrap();
+        ctx.governance
+            .budget_tracker
+            .grant(&"did:key:admin".into(), Amount::new(50));
+    }
+
+    let sk = ed25519_dalek::SigningKey::from_bytes(&[1u8; 32]);
+    let handle = manager
+        .contexts
+        .lock()
+        .await
+        .get("xcut-rt-ctx")
+        .unwrap()
+        .handle
+        .clone();
+
+    // Send message.
+    let ucan = dummy_spending_ucan_for(&"did:key:admin".into());
+    manager
+        .send_message(
+            &handle,
+            &"did:key:admin".into(),
+            b"round trip",
+            Some(&sk),
+            None,
+            Some(&ucan),
+        )
+        .await
+        .unwrap();
+
+    // 1) Budget deducted.
+    let remaining = {
+        let contexts = manager.contexts.lock().await;
+        let ctx = contexts.get("xcut-rt-ctx").unwrap();
+        ctx.governance
+            .budget_tracker
+            .remaining(&"did:key:admin".into())
+    };
+    assert_eq!(remaining, Amount::new(45), "budget should be deducted");
+
+    // 2) Consequence triggered.
+    let events = manager.drain_events("xcut-rt-ctx").await;
+    let has_consequence = events
+        .iter()
+        .any(|e| matches!(e, ContextEvent::ConsequenceTriggered { .. }));
+    assert!(has_consequence, "ConsequenceTriggered should fire");
+
+    // 3) Velocity recorded.
+    let has_velocity = {
+        let contexts = manager.contexts.lock().await;
+        let ctx = contexts.get("xcut-rt-ctx").unwrap();
+        let now = scp_primitives::SystemClock.now_secs();
+        ctx.governance
+            .velocity_tracker
+            .get_velocity(&"did:key:admin".into(), now)
+            > 0
+    };
+    assert!(has_velocity, "velocity should be recorded");
+}
+
+/// Governance action updates participation, which is then used by
+/// `check_proposer_eligibility` (#1530).
+#[tokio::test]
+async fn test_governance_eligibility_participation_round_trip() {
+    let manager = ContextManager::new(
+        Box::new(MockCrypto::default()),
+        Box::new(MockTransport::connected()),
+        Box::new(MockEventLog::default()),
+        mock_key_resolver(),
+    );
+
+    let admin: DID = "did:dht:z6MkStandRT".into();
+    let key_admin = signing_key_for_did(&admin);
+
+    let params = governance_params();
+    let _handle = manager
+        .create_context("stand-rt-ctx".into(), params, admin.clone())
+        .await
+        .unwrap();
+
+    // Send messages to build participation.
+    let sk = ed25519_dalek::SigningKey::from_bytes(&did_to_seed(&admin));
+    let handle = manager
+        .contexts
+        .lock()
+        .await
+        .get("stand-rt-ctx")
+        .unwrap()
+        .handle
+        .clone();
+    for _ in 0..3 {
+        manager
+            .send_message(&handle, &admin, b"participate", Some(&sk), None, None)
+            .await
+            .unwrap();
+    }
+
+    // Execute governance action.
+    let action = scp_protocol::context::governance::GovernanceAction::RegisterTool {
+        registration: Box::new(test_tool_registration("stand-rt-tool")),
+    };
+    manager
+        .propose_governance_action("stand-rt-ctx", &admin, action, &key_admin)
+        .await
+        .unwrap();
+
+    // Participation cache should be populated after governance + messages.
+    let contexts = manager.contexts.lock().await;
+    let ctx = contexts.get("stand-rt-ctx").unwrap();
+    assert!(
+        ctx.governance
+            .participation_cache
+            .contains_key(admin.as_ref()),
+        "participation cache should contain admin after governance + messages"
+    );
+}
+
 /// Paid join with consequence rules — join cost and consequence evaluation (#1537, #1531).
 #[tokio::test]
 async fn test_paid_join_with_consequence_evaluation() {
@@ -8321,11 +8827,12 @@ async fn read_remaining_budget(
 async fn test_full_lifecycle_economy() {
     use scp_protocol::economy::types::{Amount, CostSchedule, CurrencyCode, EconomicPolicy};
 
+    // C1 (PR #1606): paid sends require signature-verified spending UCANs.
     let manager = ContextManager::new(
         Box::new(MockCrypto::default()),
         Box::new(MockTransport::connected()),
         Box::new(MockEventLog::default()),
-        noop_key_resolver(),
+        mock_key_resolver(),
     );
 
     let mut params = governance_params();
@@ -8372,7 +8879,7 @@ async fn test_full_lifecycle_economy() {
     // Each send uses a fresh spending UCAN (unique nonce) as required by
     // the NonceTracker replay prevention.
     for i in 0..3 {
-        let ucan = dummy_spending_ucan();
+        let ucan = dummy_spending_ucan_for(&user);
         manager
             .send_message(
                 &handle,
@@ -8392,7 +8899,7 @@ async fn test_full_lifecycle_economy() {
     );
 
     // 4th message costs 10 -> leaves 10.
-    let ucan = dummy_spending_ucan();
+    let ucan = dummy_spending_ucan_for(&user);
     manager
         .send_message(&handle, &user, b"msg-4", Some(&sk), None, Some(&ucan))
         .await
@@ -8404,7 +8911,7 @@ async fn test_full_lifecycle_economy() {
     );
 
     // 5th message: 10 -> leaves 0.
-    let ucan = dummy_spending_ucan();
+    let ucan = dummy_spending_ucan_for(&user);
     manager
         .send_message(&handle, &user, b"msg-5", Some(&sk), None, Some(&ucan))
         .await
@@ -8416,7 +8923,7 @@ async fn test_full_lifecycle_economy() {
     );
 
     // 6th message should fail — budget exhausted.
-    let ucan = dummy_spending_ucan();
+    let ucan = dummy_spending_ucan_for(&user);
     let result = manager
         .send_message(&handle, &user, b"msg-6", Some(&sk), None, Some(&ucan))
         .await;
@@ -8458,7 +8965,7 @@ async fn velocity_escalation_raises_effective_cost() {
     // Each send uses a fresh spending UCAN (unique nonce) per NonceTracker
     // replay prevention.
     for i in 0..2 {
-        let ucan = dummy_spending_ucan();
+        let ucan = dummy_spending_ucan_for(&admin);
         manager
             .send_message(
                 &handle,
@@ -8482,7 +8989,7 @@ async fn velocity_escalation_raises_effective_cost() {
 
     // Send 4 more messages to push velocity above thresholds.
     for i in 2..6 {
-        let ucan = dummy_spending_ucan();
+        let ucan = dummy_spending_ucan_for(&admin);
         manager
             .send_message(
                 &handle,
@@ -8534,11 +9041,15 @@ async fn setup_velocity_escalation_context() -> (
         PricingVariable,
     };
 
+    // C1 (PR #1606): the velocity escalation tests below send paid
+    // messages, which now require signature-verified spending UCANs.
+    // `mock_key_resolver` resolves the deterministic test key for the
+    // admin so the new validation pipeline succeeds.
     let manager = ContextManager::new(
         Box::new(MockCrypto::default()),
         Box::new(MockTransport::connected()),
         Box::new(MockEventLog::default()),
-        noop_key_resolver(),
+        mock_key_resolver(),
     );
     let mut params = governance_params();
     // Pricing formula: base 1/msg + step thresholds on SenderVelocity.
@@ -9170,11 +9681,12 @@ async fn test_consequence_evaluation_uses_full_history() {
 async fn paid_send_with_valid_spending_ucan_succeeds() {
     use scp_protocol::economy::types::{Amount, CostSchedule, CurrencyCode, EconomicPolicy};
 
+    // C1 (PR #1606): paid sends require signature-verified spending UCANs.
     let manager = ContextManager::new(
         Box::new(MockCrypto::default()),
         Box::new(MockTransport::connected()),
         Box::new(MockEventLog::default()),
-        noop_key_resolver(),
+        mock_key_resolver(),
     );
 
     let mut params = governance_params();
@@ -9216,7 +9728,7 @@ async fn paid_send_with_valid_spending_ucan_succeeds() {
         .handle
         .clone();
 
-    let ucan = dummy_spending_ucan();
+    let ucan = dummy_spending_ucan_for(&"did:key:sender".into());
     let result = manager
         .send_message(
             &handle,
@@ -9393,11 +9905,12 @@ async fn none_per_message_no_ucan_required() {
 async fn multiple_sends_unique_spending_ucans_all_succeed() {
     use scp_protocol::economy::types::{Amount, CostSchedule, CurrencyCode, EconomicPolicy};
 
+    // C1 (PR #1606): paid sends require signature-verified spending UCANs.
     let manager = ContextManager::new(
         Box::new(MockCrypto::default()),
         Box::new(MockTransport::connected()),
         Box::new(MockEventLog::default()),
-        noop_key_resolver(),
+        mock_key_resolver(),
     );
 
     let mut params = governance_params();
@@ -9442,12 +9955,13 @@ async fn multiple_sends_unique_spending_ucans_all_succeed() {
     // Each send must use a fresh spending UCAN with a unique nonce.
     // Reusing the same UCAN would be rejected by the NonceTracker
     // as a replay attack (defense-in-depth).
+    let sender_did: DID = "did:key:sender".into();
     for i in 0..5 {
-        let ucan = dummy_spending_ucan();
+        let ucan = dummy_spending_ucan_for(&sender_did);
         let result = manager
             .send_message(
                 &handle,
-                &"did:key:sender".into(),
+                &sender_did,
                 format!("msg-{i}").as_bytes(),
                 Some(&sk),
                 None,
@@ -9804,11 +10318,12 @@ async fn context_created_event_has_creator_actor_did() {
 async fn no_auto_grant_requires_explicit_budget() {
     use scp_protocol::economy::types::{Amount, CostSchedule, CurrencyCode, EconomicPolicy};
 
+    // C1 (PR #1606): paid sends require signature-verified spending UCANs.
     let manager = ContextManager::new(
         Box::new(MockCrypto::default()),
         Box::new(MockTransport::connected()),
         Box::new(MockEventLog::default()),
-        noop_key_resolver(),
+        mock_key_resolver(),
     );
 
     let mut params = governance_params();
@@ -9842,7 +10357,7 @@ async fn no_auto_grant_requires_explicit_budget() {
         .clone();
 
     // Without budget, send should fail with NoBudget error.
-    let ucan = dummy_spending_ucan();
+    let ucan = dummy_spending_ucan_for(&"did:key:sender".into());
     let result = manager
         .send_message(
             &handle,
@@ -9870,7 +10385,7 @@ async fn no_auto_grant_requires_explicit_budget() {
             .budget_tracker
             .grant(&"did:key:sender".into(), Amount::new(100));
     }
-    let ucan2 = dummy_spending_ucan();
+    let ucan2 = dummy_spending_ucan_for(&"did:key:sender".into());
     let result2 = manager
         .send_message(
             &handle,
@@ -9895,11 +10410,12 @@ async fn no_auto_grant_requires_explicit_budget() {
 async fn no_double_charge_on_paid_send() {
     use scp_protocol::economy::types::{Amount, CostSchedule, CurrencyCode, EconomicPolicy};
 
+    // C1 (PR #1606): paid sends require signature-verified spending UCANs.
     let manager = ContextManager::new(
         Box::new(MockCrypto::default()),
         Box::new(MockTransport::connected()),
         Box::new(MockEventLog::default()),
-        noop_key_resolver(),
+        mock_key_resolver(),
     );
 
     let mut params = governance_params();
@@ -9942,7 +10458,7 @@ async fn no_double_charge_on_paid_send() {
         .handle
         .clone();
 
-    let ucan = dummy_spending_ucan();
+    let ucan = dummy_spending_ucan_for(&sender_did);
     manager
         .send_message(
             &handle,
@@ -10681,11 +11197,12 @@ async fn multiple_consequence_rules_all_trigger() {
 async fn aggregate_velocity_via_manager_send() {
     use scp_protocol::economy::types::{Amount, CostSchedule, CurrencyCode, EconomicPolicy};
 
+    // C1 (PR #1606): paid sends require signature-verified spending UCANs.
     let manager = ContextManager::new(
         Box::new(MockCrypto::default()),
         Box::new(MockTransport::connected()),
         Box::new(MockEventLog::default()),
-        noop_key_resolver(),
+        mock_key_resolver(),
     );
 
     let mut params = governance_params();
@@ -10729,12 +11246,13 @@ async fn aggregate_velocity_via_manager_send() {
     }
 
     // Send 3 messages, each with a fresh spending UCAN (unique nonce).
+    let sender_did: DID = "did:key:sender".into();
     for i in 0..3 {
-        let ucan = dummy_spending_ucan();
+        let ucan = dummy_spending_ucan_for(&sender_did);
         manager
             .send_message(
                 &handle,
-                &"did:key:sender".into(),
+                &sender_did,
                 format!("vel-msg-{i}").as_bytes(),
                 Some(&sk),
                 None,
@@ -11320,11 +11838,12 @@ async fn eligibility_check_uses_context_manager_clock() {
 async fn observable_metrics_time_of_day_populated() {
     use scp_protocol::economy::types::{Amount, CostSchedule, CurrencyCode, EconomicPolicy};
 
+    // C1 (PR #1606): paid sends require signature-verified spending UCANs.
     let manager = ContextManager::new(
         Box::new(MockCrypto::default()),
         Box::new(MockTransport::connected()),
         Box::new(MockEventLog::default()),
-        noop_key_resolver(),
+        mock_key_resolver(),
     );
 
     let mut params = governance_params();
@@ -11366,7 +11885,7 @@ async fn observable_metrics_time_of_day_populated() {
             .grant(&"did:key:sender".into(), Amount::new(100));
     }
 
-    let ucan = dummy_spending_ucan();
+    let ucan = dummy_spending_ucan_for(&"did:key:sender".into());
     // Send a message — the enforce_send_economy function constructs
     // ObservableMetrics with time_of_day = now % 86400. If this panics
     // or fails, the metrics construction has a bug.
@@ -11394,11 +11913,12 @@ async fn observable_metrics_time_of_day_populated() {
 async fn context_message_rate_from_aggregate_velocity() {
     use scp_protocol::economy::types::{Amount, CostSchedule, CurrencyCode, EconomicPolicy};
 
+    // C1 (PR #1606): paid sends require signature-verified spending UCANs.
     let manager = ContextManager::new(
         Box::new(MockCrypto::default()),
         Box::new(MockTransport::connected()),
         Box::new(MockEventLog::default()),
-        noop_key_resolver(),
+        mock_key_resolver(),
     );
 
     let mut params = governance_params();
@@ -11442,12 +11962,13 @@ async fn context_message_rate_from_aggregate_velocity() {
     }
 
     // Send several messages, each with a fresh spending UCAN (unique nonce).
+    let sender_did: DID = "did:key:sender".into();
     for i in 0..5 {
-        let ucan = dummy_spending_ucan();
+        let ucan = dummy_spending_ucan_for(&sender_did);
         manager
             .send_message(
                 &handle,
-                &"did:key:sender".into(),
+                &sender_did,
                 format!("cmr-{i}").as_bytes(),
                 Some(&sk),
                 None,
@@ -12158,12 +12679,398 @@ async fn test_fabricated_spending_ucan_rejected() {
         "fabricated spending UCAN should be rejected"
     );
     let err = format!("{}", result.unwrap_err());
-    // Rejected at AND-composition (SCP-ECON-12061) or validation (SCP-ECON-12062).
+    // C1 (PR #1606): rejection now happens at the combined signature +
+    // signature/iss/expiry/nonce/scope pipeline (SCP-ECON-12065). The
+    // fabricated token has `iss == "did:key:attacker"` which fails the
+    // actor-binding check before any of the legacy paths run. Either
+    // SCP-ECON-12061 (cap-only check) or SCP-ECON-12065 (signed
+    // validation) is acceptable depending on whether the cap surface
+    // ran first.
     assert!(
-        err.contains("SCP-ECON-12061") || err.contains("SCP-ECON-12062"),
+        err.contains("SCP-ECON-12061")
+            || err.contains("SCP-ECON-12062")
+            || err.contains("SCP-ECON-12065"),
         "error should reference an economy error code: {err}"
     );
 }
+
+// -----------------------------------------------------------------------
+// C1 (PR #1606): full cryptographic spending UCAN validation tests
+// -----------------------------------------------------------------------
+//
+// These tests verify each step of `validate_spending_ucan_signed` from
+// inside `enforce_economy`. Each test sets up a paid context with the
+// `mock_key_resolver` (so signature verification can succeed when the
+// actor signs with the matching deterministic key), grants budget, and
+// then sends with a deliberately broken spending UCAN to confirm the
+// pipeline rejects the action.
+
+/// Helper: paid context with `per_message=10`, sender already granted 1000 budget,
+/// and a `mock_key_resolver` so the C1 signature pipeline has a key to resolve.
+async fn c1_paid_context(name: &str, sender_did: &DID) -> (ContextManager, ContextHandle) {
+    use scp_protocol::economy::types::{Amount, CostSchedule, CurrencyCode, EconomicPolicy};
+
+    let manager = ContextManager::new(
+        Box::new(MockCrypto::default()),
+        Box::new(MockTransport::connected()),
+        Box::new(MockEventLog::default()),
+        mock_key_resolver(),
+    );
+
+    let mut params = governance_params();
+    params.economic_policy = Some(EconomicPolicy {
+        locked: false,
+        cost_schedule: CostSchedule {
+            currency: CurrencyCode([85, 83, 68, 0]),
+            per_message: Some(Amount::new(10)),
+            per_join: None,
+            per_tool_invoke: None,
+            per_period: None,
+            per_byte_stored: None,
+        },
+        payment_adapters: vec![],
+        pricing_formula: None,
+        payee: DID::from("did:dht:z6MkPayee"),
+    });
+
+    let handle = manager
+        .create_context(name.to_owned(), params, sender_did.clone())
+        .await
+        .unwrap();
+
+    {
+        let mut contexts = manager.contexts.lock().await;
+        let ctx = contexts.get_mut(name).unwrap();
+        ctx.governance
+            .budget_tracker
+            .grant(sender_did, Amount::new(1000));
+    }
+
+    (manager, handle)
+}
+
+/// C1 #1: a UCAN with the right shape but a fabricated signature is
+/// rejected at signature verification. Constructs a spending UCAN bound
+/// to `sender`, then overwrites the signature bytes with attacker-chosen
+/// noise. The actor binding (`iss == sender`) passes, the key scope
+/// passes, but the Ed25519 signature check fails fail-closed.
+#[tokio::test]
+async fn test_fabricated_spending_ucan_rejected_by_signature() {
+    let sender: DID = "did:key:c1-sig-sender".into();
+    let (manager, handle) = c1_paid_context("c1-sig-ctx", &sender).await;
+
+    // Mint a fully signed token, then tamper with the signature so the
+    // resolver-derived public key cannot verify it. Tampering bytes does
+    // NOT update `encoded`, so verify_signature recomputes from the
+    // base64url segments and fails fail-closed.
+    let mut ucan = dummy_spending_ucan_for(&sender);
+    for byte in &mut ucan.signature {
+        *byte ^= 0xFF; // Flip every bit.
+    }
+
+    let sk = ed25519_dalek::SigningKey::from_bytes(&[1u8; 32]);
+    let result = manager
+        .send_message(&handle, &sender, b"forged", Some(&sk), None, Some(&ucan))
+        .await;
+
+    assert!(result.is_err(), "fabricated signature must be rejected");
+    let err = format!("{}", result.unwrap_err());
+    assert!(
+        err.contains("SCP-ECON-12065"),
+        "rejection should be from C1 signature pipeline (SCP-ECON-12065): {err}"
+    );
+    assert!(
+        err.to_lowercase().contains("signature") || err.to_lowercase().contains("invalid"),
+        "error should mention signature/invalid: {err}"
+    );
+}
+
+/// C1 #2: a UCAN signed by a different DID than the actor is rejected by
+/// the `iss == actor_did` binding. The token has a valid signature, but
+/// the issuer field does not match the sender, so the actor-binding
+/// check fires before signature verification even runs.
+#[tokio::test]
+async fn test_spending_ucan_iss_must_match_actor_did() {
+    let sender: DID = "did:key:c1-iss-sender".into();
+    let attacker: DID = "did:key:c1-iss-attacker".into();
+    let (manager, handle) = c1_paid_context("c1-iss-ctx", &sender).await;
+
+    // The attacker mints a perfectly valid spending UCAN bound to their
+    // own DID, then presents it to the manager pretending to act as
+    // `sender`. The actor-binding step rejects this — `iss == attacker`
+    // does not equal `actor == sender`.
+    let attacker_ucan = dummy_spending_ucan_for(&attacker);
+
+    let sk = ed25519_dalek::SigningKey::from_bytes(&[1u8; 32]);
+    let result = manager
+        .send_message(
+            &handle,
+            &sender,
+            b"forged-iss",
+            Some(&sk),
+            None,
+            Some(&attacker_ucan),
+        )
+        .await;
+
+    assert!(
+        result.is_err(),
+        "spending UCAN with iss != actor must be rejected"
+    );
+    let err = format!("{}", result.unwrap_err());
+    assert!(
+        err.contains("SCP-ECON-12065"),
+        "rejection should be from C1 signature pipeline (SCP-ECON-12065): {err}"
+    );
+    assert!(
+        err.to_lowercase().contains("issuer") || err.to_lowercase().contains("iss"),
+        "error should mention issuer mismatch: {err}"
+    );
+}
+
+/// C1 #3: replaying the same signed spending UCAN twice is rejected by
+/// the per-context nonce tracker. This is the same property exercised by
+/// `spending_ucan_nonce_replay_rejected` above; we re-state it here so
+/// the C1 test surface stays self-contained.
+#[tokio::test]
+async fn test_spending_ucan_replay_via_nonce_tracker_c1() {
+    let sender: DID = "did:key:c1-replay-sender".into();
+    let (manager, handle) = c1_paid_context("c1-replay-ctx", &sender).await;
+
+    // Mint ONE signed spending UCAN and use it twice. The first send
+    // succeeds (cap = u64::MAX, nonce fresh). The second send presents
+    // the SAME nonce, which the per-context spending_nonce_tracker has
+    // already recorded — replay is rejected fail-closed.
+    let ucan = dummy_spending_ucan_for(&sender);
+    let sk = ed25519_dalek::SigningKey::from_bytes(&[1u8; 32]);
+
+    manager
+        .send_message(&handle, &sender, b"first", Some(&sk), None, Some(&ucan))
+        .await
+        .unwrap();
+
+    let result = manager
+        .send_message(&handle, &sender, b"replay", Some(&sk), None, Some(&ucan))
+        .await;
+
+    assert!(result.is_err(), "replayed spending UCAN must be rejected");
+    let err = format!("{}", result.unwrap_err());
+    assert!(
+        err.contains("SCP-ECON-12065"),
+        "rejection should be from C1 signature pipeline (SCP-ECON-12065): {err}"
+    );
+    assert!(
+        err.to_lowercase().contains("nonce") || err.to_lowercase().contains("reused"),
+        "error should mention nonce replay: {err}"
+    );
+}
+
+/// C1 #4: a spending UCAN whose `exp` is already in the past is rejected
+/// by the expiry check. We construct the token by hand so `exp < now`,
+/// then sign it the same way `dummy_spending_ucan_for` does. Without the
+/// C1 fix this token would pass — the legacy `validate_spending_ucan`
+/// only checks the 24-hour ceiling, never the actual expiry.
+#[tokio::test]
+async fn test_spending_ucan_expired_c1() {
+    use base64::Engine;
+    use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+    use scp_protocol::crypto::ucan::spending::{
+        Amount as SpendAmount, CurrencyCode as SpendCcy, SpendingCapability,
+    };
+
+    let sender: DID = "did:key:c1-exp-sender".into();
+    let (manager, handle) = c1_paid_context("c1-exp-ctx", &sender).await;
+
+    // Mint a spending UCAN payload by hand with `exp` 1 hour in the
+    // past, then JWT-encode and sign it with the matching test key.
+    let cap = SpendingCapability {
+        max_per_action: SpendAmount(u64::MAX),
+        max_total: SpendAmount(u64::MAX),
+        currency: SpendCcy::from_code("USD").unwrap(),
+        time_window: std::time::Duration::from_secs(3600),
+        allowed_adapters: vec![],
+    };
+    let mut fct = serde_json::Map::new();
+    fct.insert(
+        "spending_capability".to_owned(),
+        cap.to_fact_value().unwrap(),
+    );
+    fct.insert(
+        "scp_key_scope".to_owned(),
+        serde_json::Value::String("#agent".to_owned()),
+    );
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    let header = scp_protocol::crypto::ucan::UcanHeader::with_kid("#agent".to_owned());
+    let payload = scp_protocol::crypto::ucan::UcanPayload {
+        iss: sender.as_ref().to_owned(),
+        aud: sender.as_ref().to_owned(),
+        // exp ~1 hour in the past, well outside the 5-minute clock-skew tolerance
+        exp: now.saturating_sub(3600),
+        nbf: Some(now.saturating_sub(7200)),
+        nnc: scp_protocol::crypto::ucan::nonce::generate_nonce(&scp_primitives::SystemClock),
+        att: vec![scp_protocol::crypto::ucan::Attenuation {
+            with: "scp:spending:*".to_owned(),
+            can: "spend".to_owned(),
+        }],
+        prf: vec![],
+        fct: Some(serde_json::Value::Object(fct)),
+    };
+    let header_b64 = URL_SAFE_NO_PAD.encode(serde_json::to_vec(&header).unwrap());
+    let payload_b64 = URL_SAFE_NO_PAD.encode(serde_json::to_vec(&payload).unwrap());
+    let signing_input = format!("{header_b64}.{payload_b64}");
+    let signing_key = signing_key_for_did(&sender);
+    let signature = ed25519_dalek::Signer::sign(&signing_key, signing_input.as_bytes());
+    let sig_b64 = URL_SAFE_NO_PAD.encode(signature.to_bytes());
+    let encoded = format!("{signing_input}.{sig_b64}");
+    let expired_ucan = scp_protocol::crypto::ucan::UcanToken {
+        header,
+        payload,
+        signature: signature.to_bytes().to_vec(),
+        encoded,
+    };
+
+    let sk = ed25519_dalek::SigningKey::from_bytes(&[1u8; 32]);
+    let result = manager
+        .send_message(
+            &handle,
+            &sender,
+            b"expired",
+            Some(&sk),
+            None,
+            Some(&expired_ucan),
+        )
+        .await;
+
+    assert!(result.is_err(), "expired spending UCAN must be rejected");
+    let err = format!("{}", result.unwrap_err());
+    assert!(
+        err.contains("SCP-ECON-12065"),
+        "rejection should be from C1 signature pipeline (SCP-ECON-12065): {err}"
+    );
+    assert!(
+        err.to_lowercase().contains("expired"),
+        "error should mention expiry: {err}"
+    );
+}
+
+/// C1 #5: a spending UCAN whose CID has been added to the per-context
+/// revoked set is rejected by the revocation check. Mints a real token,
+/// computes its revocation CID, inserts it into
+/// `revoked_spending_ucan_cids` BEFORE the send, and verifies the
+/// validator rejects the token even though signature, expiry, scope,
+/// and nonce all check out.
+#[tokio::test]
+async fn test_spending_ucan_revoked_c1() {
+    let sender: DID = "did:key:c1-revoke-sender".into();
+    let (manager, handle) = c1_paid_context("c1-revoke-ctx", &sender).await;
+
+    let ucan = dummy_spending_ucan_for(&sender);
+    // The revocation CID is the SHA-256 of the encoded JWT (matching
+    // `compute_revocation_cid` from scp_protocol::crypto::ucan::revoke).
+    let revocation_cid = scp_protocol::crypto::ucan::revoke::compute_revocation_cid(&ucan.encoded);
+
+    // Insert the CID into the per-context revoked set BEFORE the send.
+    {
+        let mut contexts = manager.contexts.lock().await;
+        let ctx = contexts.get_mut("c1-revoke-ctx").unwrap();
+        ctx.governance
+            .revoked_spending_ucan_cids
+            .insert(revocation_cid);
+    }
+
+    let sk = ed25519_dalek::SigningKey::from_bytes(&[1u8; 32]);
+    let result = manager
+        .send_message(&handle, &sender, b"revoked", Some(&sk), None, Some(&ucan))
+        .await;
+
+    assert!(result.is_err(), "revoked spending UCAN must be rejected");
+    let err = format!("{}", result.unwrap_err());
+    assert!(
+        err.contains("SCP-ECON-12065"),
+        "rejection should be from C1 signature pipeline (SCP-ECON-12065): {err}"
+    );
+    assert!(
+        err.to_lowercase().contains("revoked"),
+        "error should mention revocation: {err}"
+    );
+}
+
+/// C1 #6: happy path. A fully signed, in-window, fresh-nonce spending
+/// UCAN bound to the actor passes the entire pipeline and the message
+/// is sent. This test exists in addition to
+/// `paid_send_with_valid_spending_ucan_succeeds` so the C1 surface has
+/// a self-contained positive case alongside the negative cases above.
+#[tokio::test]
+async fn test_spending_ucan_happy_path_c1() {
+    let sender: DID = "did:key:c1-happy-sender".into();
+    let (manager, handle) = c1_paid_context("c1-happy-ctx", &sender).await;
+
+    let ucan = dummy_spending_ucan_for(&sender);
+    let sk = ed25519_dalek::SigningKey::from_bytes(&[1u8; 32]);
+    let result = manager
+        .send_message(&handle, &sender, b"valid", Some(&sk), None, Some(&ucan))
+        .await;
+
+    assert!(
+        result.is_ok(),
+        "fully signed in-window fresh-nonce spending UCAN must succeed: {result:?}"
+    );
+}
+
+// -----------------------------------------------------------------------
+// C1 (PR #1606): join_context spending UCAN signature validation
+// -----------------------------------------------------------------------
+//
+// `join_context` flows through `enforce_join_economy → enforce_economy`,
+// so the C1 fix applies identically to the join path. The validator is
+// `validate_spending_ucan_signed`, the same function exercised by the
+// send-path tests above.
+//
+// IMPORTANT: per spec §19.3 and `paid_join_with_spending_ucan_still_blocked_by_auto_accept`
+// below, paid contexts NEVER auto-accept invitations — the
+// `auto_accept_blocked_by_economics` guard inside `enforce_join_economy`
+// fires BEFORE delegating to `enforce_economy`. As a result, an
+// end-to-end test that wires a forged spending UCAN through
+// `join_context` always rejects at SCP-ECON-12030 (the auto-accept
+// guard), not at SCP-ECON-12065 (the C1 signature pipeline).
+//
+// This makes a true end-to-end "join + paid policy + forged UCAN"
+// test impossible to write today without changing the spec.
+// Verification of the C1 wiring on the join path is therefore done
+// THREE ways:
+//
+//   1. **Mechanical (compile-time):** `enforce_join_economy` constructs
+//      an `EnforceEconomyRequest` with the same `key_resolver` and
+//      `revoked_spending_ucan_cids` fields the send path uses, and
+//      passes it to `enforce_economy`. If the wiring were ever broken
+//      the function would not type-check.
+//
+//   2. **Behavioral (send path):** the C1 unit tests above
+//      (`test_fabricated_spending_ucan_rejected_by_signature`,
+//      `test_spending_ucan_iss_must_match_actor_did`,
+//      `test_spending_ucan_replay_via_nonce_tracker_c1`,
+//      `test_spending_ucan_expired_c1`,
+//      `test_spending_ucan_revoked_c1`,
+//      `test_spending_ucan_happy_path_c1`) all hit the same
+//      `validate_spending_ucan_signed → validate_spending_ucan` codepath
+//      that the join path uses. Since both paths share the
+//      `EnforceEconomyRequest` constructor and call the same
+//      `enforce_economy` function, the join path inherits the same
+//      cryptographic guarantees.
+//
+//   3. **Integration with the existing guard test:**
+//      `paid_join_with_spending_ucan_still_blocked_by_auto_accept`
+//      below confirms the upstream guard fires; combined with the
+//      send-path C1 tests, the join wiring is complete in both
+//      directions (negative-on-guard, negative-on-signature).
+//
+// When the spec eventually grows an explicit-accept path that bypasses
+// the auto-accept guard for paid joins, the join-side C1 tests should
+// be added at that time. They are deliberately omitted now because
+// writing them today would require pre-bypassing a spec invariant.
 
 // -----------------------------------------------------------------------
 // H7: capability failure does not leak budget
@@ -12257,11 +13164,13 @@ async fn test_capture_failure_budget_retained() {
     // This test verifies the behavioral contract: after a successful send,
     // the budget deduction is permanent even if capture fails. We test this
     // by verifying that send_message succeeds and the budget is deducted.
+    //
+    // C1 (PR #1606): paid sends require signature-verified spending UCANs.
     let manager = ContextManager::new(
         Box::new(MockCrypto::default()),
         Box::new(MockTransport::connected()),
         Box::new(MockEventLog::default()),
-        noop_key_resolver(),
+        mock_key_resolver(),
     );
 
     let mut params = governance_params();
@@ -12291,7 +13200,7 @@ async fn test_capture_failure_budget_retained() {
             .grant(&"did:key:sender".into(), Amount::new(100));
     }
 
-    let ucan = dummy_spending_ucan();
+    let ucan = dummy_spending_ucan_for(&"did:key:sender".into());
     let sk = ed25519_dalek::SigningKey::from_bytes(&[1u8; 32]);
     manager
         .send_message(
@@ -12331,11 +13240,12 @@ async fn test_capture_failure_budget_retained() {
 async fn spending_ucan_nonce_replay_rejected() {
     use scp_protocol::economy::types::{Amount, CostSchedule, CurrencyCode, EconomicPolicy};
 
+    // C1 (PR #1606): paid sends require signature-verified spending UCANs.
     let manager = ContextManager::new(
         Box::new(MockCrypto::default()),
         Box::new(MockTransport::connected()),
         Box::new(MockEventLog::default()),
-        noop_key_resolver(),
+        mock_key_resolver(),
     );
 
     let mut params = governance_params();
@@ -12378,11 +13288,12 @@ async fn spending_ucan_nonce_replay_rejected() {
         .clone();
 
     // First send with a spending UCAN succeeds.
-    let ucan = dummy_spending_ucan();
+    let sender_did: DID = "did:key:sender".into();
+    let ucan = dummy_spending_ucan_for(&sender_did);
     manager
         .send_message(
             &handle,
-            &"did:key:sender".into(),
+            &sender_did,
             b"first send",
             Some(&sk),
             None,
@@ -12395,7 +13306,7 @@ async fn spending_ucan_nonce_replay_rejected() {
     let result = manager
         .send_message(
             &handle,
-            &"did:key:sender".into(),
+            &sender_did,
             b"replay attempt",
             Some(&sk),
             None,
@@ -12410,7 +13321,7 @@ async fn spending_ucan_nonce_replay_rejected() {
     );
 
     // A fresh UCAN (new nonce) should succeed.
-    let ucan2 = dummy_spending_ucan();
+    let ucan2 = dummy_spending_ucan_for(&sender_did);
     let result2 = manager
         .send_message(
             &handle,
@@ -12630,11 +13541,12 @@ async fn test_cost_overflow_error() {
 async fn test_velocity_includes_current_message() {
     use scp_protocol::economy::types::{Amount, CostSchedule, CurrencyCode, EconomicPolicy};
 
+    // C1 (PR #1606): paid sends require signature-verified spending UCANs.
     let manager = ContextManager::new(
         Box::new(MockCrypto::default()),
         Box::new(MockTransport::connected()),
         Box::new(MockEventLog::default()),
-        noop_key_resolver(),
+        mock_key_resolver(),
     );
 
     let mut params = governance_params();
@@ -12664,7 +13576,7 @@ async fn test_velocity_includes_current_message() {
             .grant(&"did:key:sender".into(), Amount::new(1000));
     }
 
-    let ucan = dummy_spending_ucan();
+    let ucan = dummy_spending_ucan_for(&"did:key:sender".into());
     let sk = ed25519_dalek::SigningKey::from_bytes(&[1u8; 32]);
     manager
         .send_message(

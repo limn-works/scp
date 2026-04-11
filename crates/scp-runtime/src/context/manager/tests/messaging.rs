@@ -1649,11 +1649,14 @@ fn escalation_test_policy() -> scp_protocol::economy::types::EconomicPolicy {
 async fn escalation_kicks_in_at_velocity_threshold_10() {
     use scp_protocol::economy::types::Amount;
 
+    // C1 (PR #1606): paid sends require signature-verified spending
+    // UCANs. `mock_key_resolver` resolves the deterministic test key
+    // for `did:key:sender` so the new validation pipeline succeeds.
     let manager = ContextManager::new(
         Box::new(MockCrypto::default()),
         Box::new(MockTransport::connected()),
         Box::new(MockEventLog::default()),
-        noop_key_resolver(),
+        mock_key_resolver(),
     );
 
     let mut params = governance_params();
@@ -1698,8 +1701,14 @@ async fn escalation_kicks_in_at_velocity_threshold_10() {
     // applies so the 11th costs 2 instead of 1. Each send uses a fresh
     // spending UCAN so the per-context nonce tracker does not reject
     // replays (ADR-016 §6).
+    //
+    // C1 (PR #1606): paid sends require signature-verified spending
+    // UCANs. `dummy_spending_ucan_for(sender_did)` mints a fully signed
+    // self-delegation matching the deterministic test key that
+    // `mock_key_resolver` resolves for the sender.
+    let sender_did: DID = "did:key:sender".into();
     for i in 0..11u8 {
-        let ucan = dummy_spending_ucan();
+        let ucan = dummy_spending_ucan_for(&sender_did);
         manager
             .send_message(
                 &handle,
@@ -1782,6 +1791,9 @@ async fn tool_invoke_escalation_via_managed_wrapper() {
     let mut registry = ToolRegistry::new();
     registry.insert(test_tool_registration("echo"));
 
+    // Tool invoke path uses `check_tool_spending_capability` (cap-only),
+    // not `enforce_economy`, so the unsigned `dummy_spending_ucan()` is
+    // still accepted here. Tracked separately from C1.
     let ucan = dummy_spending_ucan();
 
     let before = {
@@ -2072,6 +2084,9 @@ async fn tool_invoke_respects_hard_rate_limit() {
     // gives `tool:invoke` a base cost of 1, even without a configured
     // economic policy (`derive_message_pricing` returns `spec_default`).
     // This isolates the hard-rate-limit behavior from UCAN machinery.
+    //
+    // Tool invoke path uses `check_tool_spending_capability` (cap-only),
+    // not `enforce_economy`, so the unsigned helper still works here.
     let ucan = dummy_spending_ucan();
 
     // Burst of 10 should all succeed (default burst capacity).
@@ -2257,11 +2272,17 @@ async fn join_context_records_velocity_for_joiner() {
 async fn enforcement_failure_rolls_back_velocity_and_rate_limit() {
     use scp_protocol::economy::types::Amount;
 
+    // C1 (PR #1606): the success branch grants budget and then expects
+    // the send to succeed. With spending-UCAN signature verification now
+    // running, that requires the key resolver to return the signing key
+    // bound to `did:key:sender`. `mock_key_resolver` produces a
+    // deterministic key from the DID string and matches what
+    // `signing_key_for_did` (used by `dummy_spending_ucan`) signs with.
     let manager = ContextManager::new(
         Box::new(MockCrypto::default()),
         Box::new(MockTransport::connected()),
         Box::new(MockEventLog::default()),
-        noop_key_resolver(),
+        mock_key_resolver(),
     );
 
     let mut params = governance_params();
@@ -2283,7 +2304,7 @@ async fn enforcement_failure_rolls_back_velocity_and_rate_limit() {
             b"will fail",
             Some(&sk),
             None,
-            Some(&dummy_spending_ucan()),
+            Some(&dummy_spending_ucan_for(&"did:key:sender".into())),
         )
         .await;
     assert!(result.is_err(), "send should fail with zero budget");
@@ -2312,7 +2333,7 @@ async fn enforcement_failure_rolls_back_velocity_and_rate_limit() {
                 b"again",
                 Some(&sk),
                 None,
-                Some(&dummy_spending_ucan()),
+                Some(&dummy_spending_ucan_for(&"did:key:sender".into())),
             )
             .await;
     }
@@ -2331,7 +2352,7 @@ async fn enforcement_failure_rolls_back_velocity_and_rate_limit() {
             b"now ok",
             Some(&sk),
             None,
-            Some(&dummy_spending_ucan()),
+            Some(&dummy_spending_ucan_for(&"did:key:sender".into())),
         )
         .await;
     assert!(

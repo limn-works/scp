@@ -84,18 +84,79 @@ pub(super) async fn test_custody_from_seed(
 ///
 /// For tests that need to exercise specific spending limits, use
 /// [`dummy_spending_ucan_with_cap`].
+///
+/// C1 (PR #1606) follow-up: spending UCANs are now cryptographically
+/// validated end-to-end on the `send_message` and `join_context` paths.
+/// This zero-arg helper produces an UNSIGNED token bound to the
+/// placeholder DID `did:key:test-spender` — sufficient for tests that
+/// (a) only exercise the tool-invoke path (which uses
+/// `check_tool_spending_capability`, the cap-only check that does NOT
+/// run signature verification) or (b) only assert that a paid send is
+/// rejected (the rejection now happens at signature validation rather
+/// than at the previous attestation/scope check, but the visible
+/// outcome is identical: `Result::is_err()`).
+///
+/// Tests that exercise the `send_message` / `join_context` HAPPY PATH
+/// with a paid policy MUST use [`dummy_spending_ucan_for`] (which signs
+/// the token with the deterministic test key matching `mock_key_resolver`).
+/// Pairing the unsigned helper with a paid happy-path send will fail
+/// signature validation — that is the correct fail-closed behavior
+/// introduced by the C1 fix.
 pub(super) fn dummy_spending_ucan() -> UcanToken {
-    dummy_spending_ucan_with_cap(u64::MAX, u64::MAX)
+    // Unsigned token bound to a placeholder DID. Used by tests where
+    // the spending UCAN does not need to pass signature verification
+    // (tool invoke path, or assert-rejects tests).
+    build_spending_ucan(
+        &DID::from("did:key:test-spender"),
+        u64::MAX,
+        u64::MAX,
+        false,
+    )
+}
+
+/// Returns a fully-signed spending UCAN bound to the given actor DID.
+///
+/// The token is signed with the deterministic Ed25519 key produced by
+/// [`signing_key_for_did`], which matches what [`mock_key_resolver`]
+/// returns for the same DID. Tests using this helper with
+/// `mock_key_resolver` get end-to-end cryptographic validation (closing
+/// C1) without any per-test plumbing.
+pub(super) fn dummy_spending_ucan_for(actor_did: &DID) -> UcanToken {
+    build_spending_ucan(actor_did, u64::MAX, u64::MAX, true)
 }
 
 /// Returns a [`UcanToken`] with a real [`SpendingCapability`] embedded in
 /// the `fct` field for tests that exercise paid actions.
 ///
 /// The capability grants up to `max_per_action` per single action and
-/// `max_total` within a 1-hour window, in USD.
-#[allow(dead_code)] // Test utility — will be used by future paid-action tests.
-pub(super) fn dummy_spending_ucan_with_cap(max_per_action: u64, max_total: u64) -> UcanToken {
+/// `max_total` within a 1-hour window, in USD. The token is signed with
+/// the deterministic test key for `actor_did` so it passes the C1
+/// signature validation pipeline.
+#[allow(dead_code)] // Test utility — used by paid-action tests.
+pub(super) fn dummy_spending_ucan_with_cap(
+    actor_did: &DID,
+    max_per_action: u64,
+    max_total: u64,
+) -> UcanToken {
+    build_spending_ucan(actor_did, max_per_action, max_total, true)
+}
+
+/// Internal helper — builds a spending UCAN with the given cap, optionally
+/// signing it with the deterministic test key for `actor_did`.
+///
+/// `signed = false` produces the legacy unsigned shape used by the
+/// pre-C1 helpers. `signed = true` mints a real Ed25519 signature
+/// bound to `actor_did` (matches `mock_key_resolver`).
+fn build_spending_ucan(
+    actor_did: &DID,
+    max_per_action: u64,
+    max_total: u64,
+    signed: bool,
+) -> UcanToken {
+    use base64::Engine;
+    use base64::engine::general_purpose::URL_SAFE_NO_PAD;
     use scp_protocol::crypto::ucan::spending::{Amount, CurrencyCode, SpendingCapability};
+
     let cap = SpendingCapability {
         max_per_action: Amount(max_per_action),
         max_total: Amount(max_total),
@@ -103,37 +164,84 @@ pub(super) fn dummy_spending_ucan_with_cap(max_per_action: u64, max_total: u64) 
         time_window: std::time::Duration::from_secs(3600),
         allowed_adapters: vec![],
     };
+
+    // Build the spending UCAN facts: capability + key scope. ADR-039 requires
+    // self-delegation tokens (`iss == aud`) to carry `scp_key_scope` so the
+    // validator can map `kid` to a verification method.
     let mut fct = serde_json::Map::new();
     fct.insert(
         "spending_capability".to_owned(),
         cap.to_fact_value().unwrap_or(serde_json::Value::Null),
     );
-    // C1: include a spending attestation in `att` so `validate_spending_ucan`
-    // can find the `scp:spending:*` entry (global scope, covers any context).
+    fct.insert(
+        "scp_key_scope".to_owned(),
+        serde_json::Value::String("#agent".to_owned()),
+    );
+
+    // Spending attestation. Global scope (`scp:spending:*`) so the same
+    // helper works for any test context — `validate_spending_ucan_signed`
+    // delegates scope coverage to `validate_spending_ucan`, which accepts
+    // global scope as covering any context ID.
     let spending_att = scp_protocol::crypto::ucan::Attenuation {
         with: "scp:spending:*".to_owned(),
         can: "spend".to_owned(),
     };
-    // Use a near-future expiry so the 24-hour max lifetime check passes.
-    // `validate_spending_ucan` checks `exp - now <= 86400`.
+
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs();
+
+    // Use a unique nonce per call so back-to-back tests cannot collide on
+    // the per-context nonce tracker. The standard helper uses unix-millis
+    // plus 16 random bytes — sufficient even when tests share a manager.
+    let nonce = scp_protocol::crypto::ucan::nonce::generate_nonce(&scp_primitives::SystemClock);
+
+    let header = scp_protocol::crypto::ucan::UcanHeader::with_kid("#agent".to_owned());
+    let payload = scp_protocol::crypto::ucan::UcanPayload {
+        iss: actor_did.as_ref().to_owned(),
+        aud: actor_did.as_ref().to_owned(),
+        exp: now + 3600, // 1 hour — within the 24-hour spending UCAN ceiling.
+        nbf: Some(now.saturating_sub(60)), // tolerate small clock skew in CI runners
+        nnc: nonce,
+        att: vec![spending_att],
+        prf: vec![],
+        fct: Some(serde_json::Value::Object(fct)),
+    };
+
+    if !signed {
+        // Legacy unsigned shape — preserved so the zero-arg
+        // `dummy_spending_ucan()` helper does not break tests that
+        // (a) only exercise the tool-invoke path or (b) only assert
+        // rejection. The token IS still rejected by the C1 signature
+        // pipeline; that rejection is the test's expected outcome.
+        return UcanToken {
+            header,
+            payload,
+            signature: Vec::new(),
+            encoded: "test.spending.ucan.unsigned".to_owned(),
+        };
+    }
+
+    // JWT-encode header.payload, sign with the deterministic test signing
+    // key for this DID. `mock_key_resolver` returns the matching verifying
+    // key, so the validator's signature check will pass.
+    let header_json = serde_json::to_vec(&header).expect("header serializes");
+    let payload_json = serde_json::to_vec(&payload).expect("payload serializes");
+    let header_b64 = URL_SAFE_NO_PAD.encode(&header_json);
+    let payload_b64 = URL_SAFE_NO_PAD.encode(&payload_json);
+    let signing_input = format!("{header_b64}.{payload_b64}");
+
+    let signing_key = signing_key_for_did(actor_did);
+    let signature = ed25519_dalek::Signer::sign(&signing_key, signing_input.as_bytes());
+    let sig_b64 = URL_SAFE_NO_PAD.encode(signature.to_bytes());
+    let encoded = format!("{signing_input}.{sig_b64}");
+
     UcanToken {
-        header: scp_protocol::crypto::ucan::UcanHeader::new(),
-        payload: scp_protocol::crypto::ucan::UcanPayload {
-            iss: "did:key:test-spender".to_owned(),
-            aud: "did:key:test-context".to_owned(),
-            exp: now + 3600, // 1 hour from now (within 24-hour limit)
-            nbf: Some(now),
-            nnc: scp_protocol::crypto::ucan::nonce::generate_nonce(&scp_primitives::SystemClock),
-            att: vec![spending_att],
-            prf: vec![],
-            fct: Some(serde_json::Value::Object(fct)),
-        },
-        signature: vec![],
-        encoded: "test.spending.ucan".to_owned(),
+        header,
+        payload,
+        signature: signature.to_bytes().to_vec(),
+        encoded,
     }
 }
 
