@@ -15,10 +15,17 @@
 //!
 //! See spec section 19.2.2 and ADR-033 in `.docs/adrs/phase-3.md`.
 
+use std::collections::HashSet;
 use std::sync::Arc;
 
 use scp_identity::DID;
 use scp_protocol::context::ContextError;
+use scp_protocol::context::governance::KeyResolver;
+use scp_protocol::crypto::ucan::UcanError;
+use scp_protocol::crypto::ucan::spending::{SpendingUcanCheck, validate_spending_ucan_signed};
+use scp_protocol::crypto::ucan::validate::{
+    DEFAULT_CLOCK_SKEW_TOLERANCE_SECS, DidResolver, InMemoryProofResolver, RevocationChecker,
+};
 use scp_protocol::economy::policy::ObservableMetrics;
 use scp_protocol::economy::types::PaidActionType;
 
@@ -31,6 +38,133 @@ use crate::economy::receipt::{
 };
 
 use super::ContextManager;
+
+// ---------------------------------------------------------------------------
+// Spending UCAN signature validation wiring (C1, PR #1606)
+// ---------------------------------------------------------------------------
+
+/// Adapts the [`KeyResolver`] closure that the `ContextManager` already
+/// holds for governance vote verification into a UCAN [`DidResolver`].
+///
+/// The runtime models a single signing key per DID (`KeyResolver` returns
+/// `Option<VerifyingKey>`). Spending UCANs declare `kid: "#agent"` per
+/// ADR-039, but until full DID-document resolution is wired the runtime
+/// resolves both `#active` and `#agent` to the same key — the one the
+/// caller registered for the DID. This is the same model that governance
+/// uses for vote signature verification, so it never produces a different
+/// answer than the rest of the runtime.
+///
+/// When a DID has no key registered (the `noop_key_resolver` test path),
+/// resolution returns [`UcanError::MalformedToken`] which the spending
+/// UCAN validator surfaces as a signature failure — closing the C1 attack
+/// where a fabricated UCAN with no real signer was accepted.
+struct KeyResolverDidResolver<'a> {
+    key_resolver: &'a KeyResolver,
+}
+
+impl<'a> KeyResolverDidResolver<'a> {
+    fn new(key_resolver: &'a KeyResolver) -> Self {
+        Self { key_resolver }
+    }
+}
+
+impl DidResolver for KeyResolverDidResolver<'_> {
+    fn resolve_public_key(&self, did: &str) -> Result<[u8; 32], UcanError> {
+        let did_owned = scp_identity::DID::from(did.to_owned());
+        (self.key_resolver)(&did_owned)
+            .map(|vk| vk.to_bytes())
+            .ok_or_else(|| {
+                UcanError::MalformedToken(format!(
+                    "no public key registered for DID '{did}' (key_resolver returned None) — \
+                     spending UCAN signature cannot be verified"
+                ))
+            })
+    }
+
+    fn resolve_public_key_by_kid(&self, did: &str, _kid: &str) -> Result<[u8; 32], UcanError> {
+        // Single-key model: the manager's KeyResolver does not differentiate
+        // between #active and #agent. Both fragments resolve to the same
+        // key. When the runtime grows full DID-document resolution this
+        // method will become kid-aware. For now we deliberately collapse so
+        // that signature verification still runs (closing C1) instead of
+        // silently being skipped.
+        self.resolve_public_key(did)
+    }
+}
+
+/// Per-context revocation checker for spending UCANs.
+///
+/// Backed by an immutable borrow of the per-context `revoked_spending_ucan_cids`
+/// set. The set is empty in the current build — spending UCAN revocation lists
+/// have not yet been wired through governance — but the trait surface is
+/// real, so when revocation lands the only change required is populating the
+/// set. This is the opposite of a stub: it is the empty case of a real
+/// integration.
+struct ContextRevocationChecker<'a> {
+    revoked_cids: &'a HashSet<String>,
+}
+
+impl RevocationChecker for ContextRevocationChecker<'_> {
+    fn is_revoked(&self, token_cid: &str) -> bool {
+        self.revoked_cids.contains(token_cid)
+    }
+}
+
+/// Runs the full cryptographic + spending validation pipeline on a
+/// spending UCAN, then maps any failure into a `ContextError` with the
+/// appropriate SCP-ECON error code.
+///
+/// Splitting this out of [`enforce_economy`] keeps the latter focused on
+/// cost evaluation and budget arithmetic. The validator owns:
+///
+/// - Ed25519 signature verification (kid-aware via the manager's
+///   `KeyResolver`).
+/// - `iss == aud == actor_did` binding (the C1 fix).
+/// - Key-scope enforcement (ADR-039 self-delegation rule).
+/// - Delegation chain walk (no-op for root spending UCANs, real for
+///   sub-delegated ones).
+/// - Expiry / not-before / 24-hour ceiling.
+/// - Revocation lookup against the per-context revoked-CID set.
+/// - Nonce reservation against the per-context spending nonce tracker.
+/// - Spending-specific scope, lifetime, and parent attenuation checks.
+fn validate_spending_ucan_or_error(
+    spending: &scp_protocol::crypto::ucan::UcanToken,
+    actor_did: &DID,
+    context_id: &str,
+    nonce_tracker: &mut scp_protocol::crypto::ucan::nonce::NonceTracker<
+        Arc<dyn scp_primitives::Clock>,
+    >,
+    revoked_cids: &HashSet<String>,
+    key_resolver: &KeyResolver,
+    clock: &dyn scp_primitives::Clock,
+) -> Result<(), ContextError> {
+    let did_resolver = KeyResolverDidResolver::new(key_resolver);
+    let revocation_checker = ContextRevocationChecker { revoked_cids };
+    let proof_resolver = InMemoryProofResolver::new();
+
+    let check = SpendingUcanCheck {
+        token: spending,
+        context_id,
+        actor_did: actor_did.as_ref(),
+        parent_capability: None,
+    };
+
+    validate_spending_ucan_signed(
+        check,
+        &did_resolver,
+        nonce_tracker,
+        &revocation_checker,
+        &proof_resolver,
+        DEFAULT_CLOCK_SKEW_TOLERANCE_SECS,
+        clock,
+    )
+    .map(|_| ())
+    .map_err(|e| {
+        ContextError::PermissionDenied(format!(
+            "SCP-ECON-12065: spending UCAN signature/replay validation failed: {e}"
+        ))
+    })
+}
 
 /// Authorization token returned by `authorize_paid_action`.
 ///
@@ -225,6 +359,23 @@ pub(super) struct EnforceEconomyRequest<'a> {
     pub nonce_tracker: &'a mut scp_protocol::crypto::ucan::nonce::NonceTracker<
         std::sync::Arc<dyn scp_primitives::Clock>,
     >,
+    /// Per-context revoked spending-UCAN CIDs (C1, PR #1606).
+    ///
+    /// Currently always empty — spending UCAN revocation lists have not been
+    /// wired through governance. Passing the set explicitly (rather than
+    /// constructing one inside `enforce_economy`) means the only change
+    /// required when revocation lands is populating this field at call
+    /// sites. The set is consumed by `validate_spending_ucan_signed` via
+    /// the [`ContextRevocationChecker`] adapter.
+    pub revoked_spending_ucan_cids: &'a HashSet<String>,
+    /// Resolver for the actor's UCAN signing key (C1, PR #1606).
+    ///
+    /// The runtime models a single signing key per DID. Spending UCANs
+    /// declare `kid: "#agent"` per ADR-039, but until full DID-document
+    /// resolution is wired the runtime resolves both `#active` and
+    /// `#agent` to whatever the manager's `KeyResolver` returns. This is
+    /// the same resolver used for governance vote verification.
+    pub key_resolver: &'a KeyResolver,
 }
 
 /// Unified economy enforcement: evaluate cost, check spending UCAN, check budget.
@@ -256,6 +407,8 @@ pub(super) fn enforce_economy(
         clock,
         pricing,
         nonce_tracker,
+        revoked_spending_ucan_cids,
+        key_resolver,
     } = req;
     // Free contexts (no `economic_policy`) do not charge at the cost layer.
     // Defense-in-depth against spam on free contexts is provided by the
@@ -339,25 +492,32 @@ pub(super) fn enforce_economy(
     )
     .map_err(|e| ContextError::PermissionDenied(format!("SCP-ECON-12061: {e}")))?;
 
-    // Validate the spending UCAN itself: context scope, expiry, attenuation.
-    // `spending_ucan` is guaranteed `Some` by the guard above.
+    // Cryptographic + replay + scope + expiry + attenuation validation of
+    // the spending UCAN. `spending_ucan` is guaranteed `Some` by the guard
+    // above.
+    //
+    // C1 (PR #1606): before this call landed, only `validate_spending_ucan`
+    // was invoked, which checks scope and lifetime but performs NO
+    // signature verification, NO `iss == actor_did` binding, NO key-scope
+    // check, NO revocation lookup, and (separately) only the nonce check
+    // below. A fabricated `UcanToken` with attacker-chosen fields and
+    // `signature: vec![]` passed enforcement. The combined entry point
+    // `validate_spending_ucan_signed` runs the full pipeline — signature,
+    // chain, key scope, expiry, revocation, nonce, scope, capability,
+    // attenuation — in one call, with the per-context nonce tracker and
+    // revocation set wired in. The previous separate `nonce_tracker.check_and_record`
+    // call is now performed inside the combined validator (step G), so it
+    // is no longer issued here.
     if let Some(spending) = spending_ucan {
-        scp_protocol::crypto::ucan::spending::validate_spending_ucan(
-            spending, context_id, None, // no parent capability (top-level delegation)
+        validate_spending_ucan_or_error(
+            spending,
+            actor_did,
+            context_id,
+            nonce_tracker,
+            revoked_spending_ucan_cids,
+            key_resolver,
             clock,
-        )
-        .map_err(|e| ContextError::PermissionDenied(format!("SCP-ECON-12062: {e}")))?;
-
-        // Nonce replay prevention: validate the spending UCAN nonce has not been
-        // used before. This prevents replay attacks where a valid spending UCAN
-        // is resubmitted to authorize the same action multiple times.
-        nonce_tracker
-            .check_and_record(&spending.payload.nnc, spending.payload.exp)
-            .map_err(|e| {
-                ContextError::PermissionDenied(format!(
-                    "SCP-ECON-12064: spending UCAN nonce replay: {e}"
-                ))
-            })?;
+        )?;
     }
 
     // Budget check — no auto-grant. If the member has no budget, fail with

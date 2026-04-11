@@ -37,9 +37,7 @@ use scp_event_log::tree;
 use scp_event_log::{Event, EventLog, EventPayload, EventType};
 use scp_identity::DID;
 use scp_primitives::Clock;
-use scp_protocol::crypto::ucan::spending::{
-    BudgetTracker, SpendingCapability, SpendingError, validate_spending_ucan,
-};
+use scp_protocol::crypto::ucan::spending::{BudgetTracker, SpendingCapability, SpendingError};
 use scp_protocol::crypto::ucan::{Attenuation, UcanHeader, UcanPayload, UcanToken};
 use scp_protocol::economy::antispam::{
     EscalationConfig, EscalationThreshold, SenderVelocityTracker,
@@ -551,6 +549,15 @@ fn invariant_2_paid_action_without_spending_ucan_rejected() {
 /// Invariant 2: Grant spending UCAN, attempt paid action — spending side of
 /// AND-composition passes. Action capability is verified at the gate layer
 /// upstream per spec §19.5.
+///
+/// C1 (PR #1606): the standalone `validate_spending_ucan` is now `pub(crate)`
+/// in `scp-protocol`. End-to-end spending validation goes through
+/// `validate_spending_ucan_signed` (the only public entry point), which is
+/// exercised by the manager-level tests in
+/// `crates/scp-runtime/src/context/manager/tests/governance.rs`. This
+/// integration test now only exercises the cap-only `check_spending_capability`
+/// surface — the scope/lifetime/attenuation surface is covered by the
+/// scp-protocol unit tests in `crypto/ucan/spending.rs`.
 #[test]
 fn invariant_2_paid_action_with_spending_ucan_succeeds() {
     use scp_protocol::crypto::ucan::spending::check_spending_capability;
@@ -565,15 +572,6 @@ fn invariant_2_paid_action_with_spending_ucan_succeeds() {
         result.is_ok(),
         "spending capability check should succeed: {result:?}"
     );
-
-    // Validate spending UCAN itself.
-    let validated = validate_spending_ucan(
-        &spending_ucan,
-        "ctx-econ-test",
-        None,
-        &scp_primitives::SystemClock,
-    );
-    assert!(validated.is_ok(), "spending UCAN validation should succeed");
 }
 
 /// Invariant 2: Full authorize-capture cycle with adapter after UCAN check passes.
@@ -1637,42 +1635,22 @@ fn integration_anti_spam_via_pricing_formula() {
 // ===========================================================================
 // Integration: spending UCAN validation
 // ===========================================================================
-
-/// Spending UCAN scoped to context validates correctly.
-#[test]
-fn integration_spending_ucan_context_scoped() {
-    let cap = test_spending_capability();
-    let token = make_spending_ucan(&cap, "scp:spending:ctx-econ-test");
-
-    let result =
-        validate_spending_ucan(&token, "ctx-econ-test", None, &scp_primitives::SystemClock);
-    assert!(result.is_ok());
-}
-
-/// Spending UCAN with global scope covers any context.
-#[test]
-fn integration_spending_ucan_global_scope() {
-    let cap = test_spending_capability();
-    let token = make_spending_ucan(&cap, "scp:spending:*");
-
-    let result =
-        validate_spending_ucan(&token, "any-context-id", None, &scp_primitives::SystemClock);
-    assert!(result.is_ok());
-}
-
-/// Spending UCAN scope mismatch is rejected.
-#[test]
-fn integration_spending_ucan_scope_mismatch() {
-    let cap = test_spending_capability();
-    let token = make_spending_ucan(&cap, "scp:spending:ctx-123");
-
-    let err =
-        validate_spending_ucan(&token, "ctx-456", None, &scp_primitives::SystemClock).unwrap_err();
-    assert!(
-        matches!(err, SpendingError::ScopeNotCovered { .. }),
-        "expected ScopeNotCovered, got: {err:?}"
-    );
-}
+//
+// C1 (PR #1606): the partial `validate_spending_ucan` helper is now
+// `pub(crate)` in `scp-protocol`, so the three previous test cases that
+// exercised it directly (`integration_spending_ucan_context_scoped`,
+// `integration_spending_ucan_global_scope`,
+// `integration_spending_ucan_scope_mismatch`) have been removed from this
+// file. They duplicated unit tests already living in
+// `crates/scp-protocol/src/crypto/ucan/spending.rs`
+// (`validate_spending_ucan_context_scoped`,
+// `validate_spending_ucan_global_scope`,
+// `validate_spending_ucan_scope_mismatch`), which still cover the same
+// scope/lifetime surface from inside the crate and continue to run on
+// every `cargo test -p scp-protocol`. End-to-end spending validation
+// (signature + chain + replay + scope + lifetime + attenuation) is now
+// exercised through `validate_spending_ucan_signed` by the manager-level
+// tests in `crates/scp-runtime/src/context/manager/tests/governance.rs`.
 
 /// Budget tracker enforces per-action and total limits via `check_and_record`.
 #[test]

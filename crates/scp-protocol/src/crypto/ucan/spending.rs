@@ -829,9 +829,24 @@ fn generate_spending_nonce(clock: &dyn Clock) -> String {
 // Validate spending UCAN
 // ---------------------------------------------------------------------------
 
-/// Validates a spending UCAN token for a specific context and action cost.
+/// Validates the spending-specific surface of a spending UCAN token (scope,
+/// 24-hour lifetime cap, capability extraction, attenuation against an
+/// optional parent).
 ///
-/// Performs spending-specific validation on top of standard UCAN validation:
+/// **DO NOT CALL THIS DIRECTLY for enforcement.** It performs none of the
+/// cryptographic checks that make a UCAN trustworthy: no signature
+/// verification, no chain walk, no revocation lookup, no nonce replay
+/// guard, no expiry check, no key-scope check, no `iss == actor_did`
+/// binding. A token can satisfy every assertion this function makes while
+/// being entirely fabricated by an attacker.
+///
+/// The combined entry point [`validate_spending_ucan_signed`] runs the full
+/// 11-step UCAN validation pipeline (via `validate.rs` helpers) **before**
+/// delegating here. That is the only public way to validate a spending UCAN.
+/// This function is restricted to `pub(crate)` so the misuse-prone partial
+/// API cannot escape the crate.
+///
+/// # Steps performed by this function
 ///
 /// 1. Verifies the token contains a spending attestation (`scp:spending:...`).
 /// 2. Extracts the [`SpendingCapability`] from the token's facts.
@@ -839,18 +854,15 @@ fn generate_spending_nonce(clock: &dyn Clock) -> String {
 /// 4. Verifies the token expiry does not exceed 24 hours.
 /// 5. If `parent_capability` is provided, validates attenuation.
 ///
-/// Standard UCAN validation (signature, chain, revocation, nonce) should be
-/// performed separately via [`super::validate::validate_ucan`].
-///
 /// # Key scope validation
 ///
 /// This function does **not** validate `scp_key_scope` from the token's facts.
 /// Key scope validation (verifying that the `kid` header matches the signing
-/// key and that `scp_key_scope` is consistent) is handled by the parent UCAN
-/// validator (SCP-AB-012/SCP-AB-013 steps 5a/5b). This function validates
-/// spending-specific fields only — duplicating key scope checks here would
-/// violate the single-responsibility split between spending validation and
-/// general UCAN validation.
+/// key and that `scp_key_scope` is consistent) is handled by
+/// [`validate_spending_ucan_signed`] via the shared `validate.rs` helpers
+/// (SCP-AB-012/SCP-AB-013 steps 5a/5b). Duplicating key scope checks here
+/// would violate the single-responsibility split between spending validation
+/// and general UCAN validation.
 ///
 /// # Arguments
 ///
@@ -862,7 +874,7 @@ fn generate_spending_nonce(clock: &dyn Clock) -> String {
 /// # Errors
 ///
 /// Returns [`SpendingError`] variants for each validation failure.
-pub fn validate_spending_ucan(
+pub(crate) fn validate_spending_ucan(
     token: &UcanToken,
     context_id: &str,
     parent_capability: Option<&SpendingCapability>,
@@ -915,6 +927,188 @@ pub fn validate_spending_ucan(
     }
 
     Ok(capability)
+}
+
+// ---------------------------------------------------------------------------
+// validate_spending_ucan_signed — combined cryptographic + spending validation
+// ---------------------------------------------------------------------------
+
+/// Inputs that bind a spending UCAN to its presenting actor and the
+/// runtime state needed to verify it cryptographically.
+///
+/// Grouped into a struct so the public entry point keeps a single positional
+/// argument and survives future additions (key-scope override, attestation
+/// witness, etc.) without churn at every call site. All fields are
+/// references so the struct is `Copy`-cheap; passing it by value at the
+/// call site avoids a needless borrow ceremony.
+#[derive(Clone, Copy)]
+pub struct SpendingUcanCheck<'a> {
+    /// The spending UCAN token to validate.
+    pub token: &'a UcanToken,
+    /// The target context the paid action runs in.
+    pub context_id: &'a str,
+    /// The DID the runtime is about to charge. The token's `iss` and `aud`
+    /// MUST equal this string — that is the binding that prevents an
+    /// attacker from replaying or fabricating someone else's spending UCAN.
+    pub actor_did: &'a str,
+    /// Optional parent spending capability for sub-delegated spending UCANs.
+    /// `None` for the (overwhelmingly common) root spending UCAN case.
+    pub parent_capability: Option<&'a SpendingCapability>,
+}
+
+/// Validates a spending UCAN end-to-end: signature, expiry, key scope,
+/// revocation, nonce, scope, and the spending-specific facts.
+///
+/// This is the **only** entry point that exists for runtime enforcement of
+/// spending UCANs. The partial helper [`validate_spending_ucan`] is now
+/// `pub(crate)` and unreachable from outside the crate; bridges and SDKs
+/// must call this function (or a wrapper around it) instead.
+///
+/// # Validation pipeline
+///
+/// In order:
+///
+/// 1. **Actor binding** — `token.payload.iss == token.payload.aud == actor_did`.
+///    Spending UCANs are self-delegations under the shared-DID model
+///    (ADR-039), so both `iss` and `aud` must equal the actor whose budget
+///    will be debited. This check rejects forged-signer attacks where an
+///    attacker presents `iss == "did:victim"` to drain a victim's budget.
+/// 2. **Key scope** — Steps 5a/5b from `validate_ucan`: self-delegation
+///    requires `fct.scp_key_scope` and the `kid` header must match. This is
+///    what guarantees the token was signed by the agent verification method
+///    that the actor explicitly authorized (typically `#agent`).
+/// 3. **Delegation chain** — If `prf` is non-empty, walks every parent
+///    UCAN, verifying signatures, expiry, revocation, key-scope, and
+///    `aud`/`iss` linkage. The root issuer must be the actor (spending
+///    UCANs cannot be delegated from elsewhere into an actor's budget).
+/// 4. **Signature** — Verifies the Ed25519 signature with kid-aware DID
+///    resolution (`resolve_public_key_by_kid` for `#agent`).
+/// 5. **Expiry** — `nbf <= now < exp`, with the configured clock-skew
+///    tolerance. Rejects tokens whose `exp` is more than 24 hours away.
+/// 6. **Revocation** — Computes the SHA-256 revocation CID over the
+///    encoded JWT and consults the revocation checker.
+/// 7. **Nonce** — Reserves the nonce in the per-context tracker so a
+///    replay of the same UCAN is rejected on the second presentation.
+/// 8. **Spending facts** — Delegates to [`validate_spending_ucan`] for
+///    scope coverage, lifetime cap, capability extraction, and parent
+///    attenuation.
+///
+/// # Why a combined function instead of `validate_ucan`
+///
+/// The general `validate_ucan` pipeline parses every attestation as a
+/// `scp:ctx:{id}/{resource}:{action}` capability URI. Spending UCANs carry
+/// `scp:spending:{id}` URIs, which are not parseable as `CapabilityUri`,
+/// so calling `validate_ucan` directly fails fail-closed at step 6 with
+/// `MalformedToken`. This function reuses the same `validate.rs` helpers
+/// for the cryptographic checks (signature, chain, expiry, key scope) and
+/// then runs the spending-specific scope/cap/attenuation logic instead.
+///
+/// # Errors
+///
+/// Returns [`SpendingError`] variants for each validation failure. UCAN-level
+/// failures (signature, key scope, expiry, nonce, revocation, delegation
+/// chain) are surfaced via the [`SpendingError::Ucan`] variant.
+///
+/// # Closes
+///
+/// PR #1606 finding C1: spending UCANs were never cryptographically
+/// validated on the `send_message`/`join_context` paths.
+pub fn validate_spending_ucan_signed<D, N, R, P>(
+    check: SpendingUcanCheck<'_>,
+    did_resolver: &D,
+    nonce_tracker: &mut N,
+    revocation_checker: &R,
+    proof_resolver: &P,
+    clock_skew_tolerance_secs: u64,
+    clock: &dyn Clock,
+) -> Result<SpendingCapability, SpendingError>
+where
+    D: super::validate::DidResolver,
+    N: super::validate::NonceTracker,
+    R: super::validate::RevocationChecker,
+    P: super::validate::ProofResolver,
+{
+    let SpendingUcanCheck {
+        token,
+        context_id,
+        actor_did,
+        parent_capability,
+    } = check;
+
+    // Validate the token's parsed JWT header (alg/typ/ucv).
+    token.header.validate()?;
+
+    // Step A: Actor binding. Spending UCANs are self-delegations: the
+    // issuer and audience MUST both equal the actor whose budget the
+    // runtime is about to debit. This is the single most important check
+    // for closing C1 — without it an attacker can present `iss == victim`
+    // and forge a spending UCAN signed by the attacker's own key.
+    if token.payload.iss != actor_did {
+        return Err(SpendingError::Ucan(UcanError::InvalidIssuer {
+            expected: actor_did.to_owned(),
+            actual: token.payload.iss.clone(),
+        }));
+    }
+    if token.payload.aud != actor_did {
+        return Err(SpendingError::Ucan(UcanError::AudienceMismatch {
+            expected: actor_did.to_owned(),
+            actual: token.payload.aud.clone(),
+        }));
+    }
+
+    // Step B: Key scope. Rejects self-delegation without `scp_key_scope`
+    // and rejects `kid`/`scp_key_scope` mismatches (ADR-039 SCP-AB-012/013).
+    super::validate::validate_key_scope(token)?;
+
+    // Step C: Delegation chain. For root spending UCANs (`prf` empty)
+    // this returns `iss` immediately. For sub-delegated spending UCANs
+    // it walks the chain, verifying every parent's signature, expiry,
+    // revocation, key scope, and aud/iss linkage. The returned root
+    // issuer is then bound to the actor — sub-delegation cannot smuggle
+    // in a different root.
+    let root_issuer = super::validate::verify_delegation_chain(
+        token,
+        did_resolver,
+        proof_resolver,
+        revocation_checker,
+        clock_skew_tolerance_secs,
+        clock,
+    )?;
+    if root_issuer != actor_did {
+        return Err(SpendingError::Ucan(UcanError::InvalidIssuer {
+            expected: actor_did.to_owned(),
+            actual: root_issuer,
+        }));
+    }
+
+    // Step D: Signature. kid-aware Ed25519 verification — when the header
+    // includes `kid: "#agent"` (the standard for spending UCANs) the
+    // verifier consults the agent verification method on the issuer's
+    // DID document.
+    super::validate::verify_signature(token, did_resolver)?;
+
+    // Step E: Expiry / not-before / 24-hour ceiling, with clock skew
+    // tolerance for NTP drift.
+    super::validate::verify_expiry(token, clock_skew_tolerance_secs, clock)?;
+
+    // Step F: Revocation. Computes the SHA-256 CID of the encoded JWT
+    // (matching the format produced by `revoke_ucan`) and consults the
+    // revocation checker.
+    let revocation_cid = super::revoke::compute_revocation_cid(&token.encoded);
+    if revocation_checker.is_revoked(&revocation_cid) {
+        return Err(SpendingError::Ucan(UcanError::TokenRevoked(revocation_cid)));
+    }
+
+    // Step G: Nonce reservation. Rejects format/freshness violations and
+    // replays. Records the nonce on success so subsequent presentations
+    // of the same UCAN are caught at step G on the second call.
+    nonce_tracker.check_and_record(&token.payload.nnc, token.payload.exp)?;
+
+    // Step H: Spending-specific validation. Delegates to the partial
+    // helper, which is now `pub(crate)` and unreachable from outside the
+    // crate. Validates the spending attestation scope, lifetime cap,
+    // capability extraction, and (if a parent is supplied) attenuation.
+    validate_spending_ucan(token, context_id, parent_capability, clock)
 }
 
 // ---------------------------------------------------------------------------

@@ -441,6 +441,28 @@ impl<C: Clock> NonceTracker<C> {
 }
 
 // ---------------------------------------------------------------------------
+// Trait wiring: production NonceTracker satisfies the validate-pipeline trait
+// ---------------------------------------------------------------------------
+
+/// Adapts the production [`NonceTracker`] to the validate-pipeline
+/// [`super::validate::NonceTracker`] trait so the same per-context tracker
+/// used by the runtime is also the one consulted by `validate_ucan` /
+/// `validate_spending_ucan_signed`.
+///
+/// Without this impl, callers would have to maintain a separate
+/// [`super::validate::InMemoryNonceTracker`] alongside the production
+/// tracker — that is the bug the C1 finding describes (a fabricated
+/// spending UCAN's nonce was never checked against the per-context
+/// tracker because no shared trait existed). The impl is intentionally
+/// trivial: it forwards directly to the inherent `check_and_record`,
+/// preserving capacity limits, pruning, and persistence semantics.
+impl<C: Clock> super::validate::NonceTracker for NonceTracker<C> {
+    fn check_and_record(&mut self, nonce: &str, token_expiry: u64) -> Result<(), UcanError> {
+        Self::check_and_record(self, nonce, token_expiry)
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Serialization helpers
 // ---------------------------------------------------------------------------
 
