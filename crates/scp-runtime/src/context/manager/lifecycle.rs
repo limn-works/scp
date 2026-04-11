@@ -1625,7 +1625,6 @@ impl ContextManager {
                 scp_protocol::economy::types::PaidActionType::ContextJoin,
                 &member_did,
                 &context_id,
-                ticket.deducted_cost,
             )
             .await
         {
