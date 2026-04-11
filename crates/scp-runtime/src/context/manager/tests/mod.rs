@@ -1,5 +1,9 @@
 use std::collections::HashSet;
 use std::sync::atomic::{AtomicBool, Ordering};
+// AtomicUsize / AtomicU64 are referenced via fully-qualified paths inside
+// the H5 mock event logs (`OrderedMockEventLog`, `FailingAppendEventLog`)
+// to avoid widening the global `std::sync::atomic::*` import for the rest
+// of this module.
 
 use super::*;
 use scp_protocol::context::params::MemoryScope;
@@ -692,6 +696,332 @@ impl ContextEventLogProvider for ArcEventLog {
     ) -> Result<Option<Vec<crate::context::providers::event_log::EventLogEntry>>, ContextError>
     {
         self.0.event_log_entries(context_id)
+    }
+}
+
+/// Records the relative call order of `append_event` and `event_log_entries`
+/// so structural tests can assert that an append for a given event happened
+/// BEFORE a subsequent read. Used by H5 to verify that
+/// `deliver_incoming` appends `MessageReceived` to the durable event log
+/// before invoking the receive-side consequence evaluation block (which
+/// calls `event_log_entries_for_consequences`, which in turn calls
+/// `event_log_entries`).
+///
+/// Each call records `(operation_kind, optional_event_name, monotonic_seq)`.
+#[derive(Default)]
+pub(super) struct OrderedMockEventLog {
+    pub(super) inited: std::sync::Mutex<Vec<[u8; 32]>>,
+    pub(super) entries:
+        std::sync::Mutex<Vec<([u8; 32], String, String, u64, Option<serde_json::Value>)>>,
+    pub(super) destroyed: std::sync::Mutex<Vec<[u8; 32]>>,
+    /// Monotonic operation log: each tuple is (kind, `event_name_or_empty`, seq).
+    /// `kind` is `"append"` or `"read"`. `seq` is a monotonic counter assigned
+    /// from `next_seq` at the moment the operation completes.
+    pub(super) op_log: std::sync::Mutex<Vec<(String, String, u64)>>,
+    pub(super) next_seq: std::sync::atomic::AtomicU64,
+}
+
+impl OrderedMockEventLog {
+    fn record(&self, kind: &str, event_name: &str) -> u64 {
+        let seq = self.next_seq.fetch_add(1, Ordering::SeqCst);
+        self.op_log
+            .lock()
+            .unwrap()
+            .push((kind.to_owned(), event_name.to_owned(), seq));
+        seq
+    }
+}
+
+impl ContextEventLogProvider for OrderedMockEventLog {
+    fn init_event_log(&self, id: &[u8; 32]) -> Result<(), ContextCreationError> {
+        self.inited.lock().unwrap().push(*id);
+        Ok(())
+    }
+
+    fn append_event(
+        &self,
+        id: &[u8; 32],
+        event: &str,
+        actor_did: &str,
+        payload: Option<&serde_json::Value>,
+    ) -> Result<(), ContextCreationError> {
+        let ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        self.entries.lock().unwrap().push((
+            *id,
+            event.to_owned(),
+            actor_did.to_owned(),
+            ts,
+            payload.cloned(),
+        ));
+        self.record("append", event);
+        Ok(())
+    }
+
+    fn destroy_event_log(&self, id: &[u8; 32]) -> Result<(), ContextCreationError> {
+        self.destroyed.lock().unwrap().push(*id);
+        Ok(())
+    }
+
+    fn event_log_entries(
+        &self,
+        context_id: &[u8; 32],
+    ) -> Result<Option<Vec<crate::context::providers::event_log::EventLogEntry>>, ContextError>
+    {
+        let entries = self.entries.lock().unwrap();
+        let result: Vec<_> = entries
+            .iter()
+            .filter(|(cid, _, _, _, _)| cid == context_id)
+            .map(|(_, event, actor_did, ts, payload)| {
+                crate::context::providers::event_log::EventLogEntry {
+                    event: event.clone(),
+                    actor_did: actor_did.clone(),
+                    timestamp: *ts,
+                    prev_hash: [0u8; 32],
+                    hash: [0u8; 32],
+                    payload: payload.clone(),
+                }
+            })
+            .collect();
+        drop(entries);
+        self.record("read", "");
+        if result.is_empty() {
+            Ok(None)
+        } else {
+            Ok(Some(result))
+        }
+    }
+}
+
+/// Thin wrapper that delegates `ContextEventLogProvider` to an
+/// `Arc<OrderedMockEventLog>`, allowing the test to retain a handle on the
+/// underlying mock and inspect the recorded operation log after
+/// `ContextManager` has been constructed.
+pub(super) struct ArcOrderedEventLog(pub(super) std::sync::Arc<OrderedMockEventLog>);
+
+impl ContextEventLogProvider for ArcOrderedEventLog {
+    fn init_event_log(&self, id: &[u8; 32]) -> Result<(), ContextCreationError> {
+        self.0.init_event_log(id)
+    }
+
+    fn append_event(
+        &self,
+        id: &[u8; 32],
+        event: &str,
+        actor_did: &str,
+        payload: Option<&serde_json::Value>,
+    ) -> Result<(), ContextCreationError> {
+        self.0.append_event(id, event, actor_did, payload)
+    }
+
+    fn destroy_event_log(&self, id: &[u8; 32]) -> Result<(), ContextCreationError> {
+        self.0.destroy_event_log(id)
+    }
+
+    fn event_log_entries(
+        &self,
+        context_id: &[u8; 32],
+    ) -> Result<Option<Vec<crate::context::providers::event_log::EventLogEntry>>, ContextError>
+    {
+        self.0.event_log_entries(context_id)
+    }
+}
+
+/// Event log mock with clock-controlled timestamps. Identical to
+/// [`MockEventLogWithActorDid`] except that `append_event` reads the
+/// current time from a caller-supplied [`Clock`] instead of [`SystemTime`].
+/// Used by H5 behavioural tests so the same [`TestClock`] instance can
+/// drive both the manager (`now = clock.now_secs()` inside `deliver_incoming`)
+/// and the event log entries it produces (timestamps written by
+/// `append_event`). Without a shared clock the mock would stamp new entries
+/// with wall-clock seconds, which the window filter inside
+/// `evaluate_consequence_rules` would reject (`event.timestamp <= now`).
+pub(super) struct ClockedMockEventLog {
+    pub(super) inited: std::sync::Mutex<Vec<[u8; 32]>>,
+    pub(super) entries:
+        std::sync::Mutex<Vec<([u8; 32], String, String, u64, Option<serde_json::Value>)>>,
+    pub(super) destroyed: std::sync::Mutex<Vec<[u8; 32]>>,
+    pub(super) clock: Arc<dyn scp_primitives::Clock>,
+}
+
+impl ClockedMockEventLog {
+    pub(super) fn new(clock: Arc<dyn scp_primitives::Clock>) -> Self {
+        Self {
+            inited: std::sync::Mutex::new(Vec::new()),
+            entries: std::sync::Mutex::new(Vec::new()),
+            destroyed: std::sync::Mutex::new(Vec::new()),
+            clock,
+        }
+    }
+}
+
+impl ContextEventLogProvider for ClockedMockEventLog {
+    fn init_event_log(&self, id: &[u8; 32]) -> Result<(), ContextCreationError> {
+        self.inited.lock().unwrap().push(*id);
+        Ok(())
+    }
+
+    fn append_event(
+        &self,
+        id: &[u8; 32],
+        event: &str,
+        actor_did: &str,
+        payload: Option<&serde_json::Value>,
+    ) -> Result<(), ContextCreationError> {
+        let ts = self.clock.now_secs();
+        self.entries.lock().unwrap().push((
+            *id,
+            event.to_owned(),
+            actor_did.to_owned(),
+            ts,
+            payload.cloned(),
+        ));
+        Ok(())
+    }
+
+    fn destroy_event_log(&self, id: &[u8; 32]) -> Result<(), ContextCreationError> {
+        self.destroyed.lock().unwrap().push(*id);
+        Ok(())
+    }
+
+    fn event_log_entries(
+        &self,
+        context_id: &[u8; 32],
+    ) -> Result<Option<Vec<crate::context::providers::event_log::EventLogEntry>>, ContextError>
+    {
+        let entries = self.entries.lock().unwrap();
+        let result: Vec<_> = entries
+            .iter()
+            .filter(|(cid, _, _, _, _)| cid == context_id)
+            .map(|(_, event, actor_did, ts, payload)| {
+                crate::context::providers::event_log::EventLogEntry {
+                    event: event.clone(),
+                    actor_did: actor_did.clone(),
+                    timestamp: *ts,
+                    prev_hash: [0u8; 32],
+                    hash: [0u8; 32],
+                    payload: payload.clone(),
+                }
+            })
+            .collect();
+        if result.is_empty() {
+            Ok(None)
+        } else {
+            Ok(Some(result))
+        }
+    }
+}
+
+/// Thin Arc wrapper for [`ClockedMockEventLog`].
+pub(super) struct ArcClockedEventLog(pub(super) std::sync::Arc<ClockedMockEventLog>);
+
+impl ContextEventLogProvider for ArcClockedEventLog {
+    fn init_event_log(&self, id: &[u8; 32]) -> Result<(), ContextCreationError> {
+        self.0.init_event_log(id)
+    }
+
+    fn append_event(
+        &self,
+        id: &[u8; 32],
+        event: &str,
+        actor_did: &str,
+        payload: Option<&serde_json::Value>,
+    ) -> Result<(), ContextCreationError> {
+        self.0.append_event(id, event, actor_did, payload)
+    }
+
+    fn destroy_event_log(&self, id: &[u8; 32]) -> Result<(), ContextCreationError> {
+        self.0.destroy_event_log(id)
+    }
+
+    fn event_log_entries(
+        &self,
+        context_id: &[u8; 32],
+    ) -> Result<Option<Vec<crate::context::providers::event_log::EventLogEntry>>, ContextError>
+    {
+        self.0.event_log_entries(context_id)
+    }
+}
+
+/// Event log mock that succeeds on `init_event_log` but fails on every
+/// `append_event` call whose event name matches `fail_event`. Used by H5 to
+/// assert that `deliver_incoming` does NOT propagate event log append
+/// failures (the receive buffer already holds the message).
+pub(super) struct FailingAppendEventLog {
+    pub(super) inited: std::sync::Mutex<Vec<[u8; 32]>>,
+    /// Successful append entries (those whose event name does NOT match
+    /// `fail_event`). Mirrors [`MockEventLog::events`] so the test can
+    /// verify that other events still land.
+    pub(super) events: std::sync::Mutex<Vec<([u8; 32], String)>>,
+    pub(super) destroyed: std::sync::Mutex<Vec<[u8; 32]>>,
+    pub(super) fail_event: String,
+    pub(super) failed_attempts: std::sync::atomic::AtomicUsize,
+}
+
+impl FailingAppendEventLog {
+    pub(super) fn new(fail_event: impl Into<String>) -> Self {
+        Self {
+            inited: std::sync::Mutex::new(Vec::new()),
+            events: std::sync::Mutex::new(Vec::new()),
+            destroyed: std::sync::Mutex::new(Vec::new()),
+            fail_event: fail_event.into(),
+            failed_attempts: std::sync::atomic::AtomicUsize::new(0),
+        }
+    }
+}
+
+impl ContextEventLogProvider for FailingAppendEventLog {
+    fn init_event_log(&self, id: &[u8; 32]) -> Result<(), ContextCreationError> {
+        self.inited.lock().unwrap().push(*id);
+        Ok(())
+    }
+
+    fn append_event(
+        &self,
+        id: &[u8; 32],
+        event: &str,
+        _actor_did: &str,
+        _payload: Option<&serde_json::Value>,
+    ) -> Result<(), ContextCreationError> {
+        if event == self.fail_event {
+            self.failed_attempts.fetch_add(1, Ordering::SeqCst);
+            return Err(ContextCreationError::EventLogFailed(format!(
+                "FailingAppendEventLog: forced failure for event {event}"
+            )));
+        }
+        self.events.lock().unwrap().push((*id, event.to_owned()));
+        Ok(())
+    }
+
+    fn destroy_event_log(&self, id: &[u8; 32]) -> Result<(), ContextCreationError> {
+        self.destroyed.lock().unwrap().push(*id);
+        Ok(())
+    }
+}
+
+/// Thin Arc wrapper for [`FailingAppendEventLog`] (mirrors [`ArcEventLog`]
+/// pattern) so tests can keep a handle on the underlying mock.
+pub(super) struct ArcFailingAppendEventLog(pub(super) std::sync::Arc<FailingAppendEventLog>);
+
+impl ContextEventLogProvider for ArcFailingAppendEventLog {
+    fn init_event_log(&self, id: &[u8; 32]) -> Result<(), ContextCreationError> {
+        self.0.init_event_log(id)
+    }
+
+    fn append_event(
+        &self,
+        id: &[u8; 32],
+        event: &str,
+        actor_did: &str,
+        payload: Option<&serde_json::Value>,
+    ) -> Result<(), ContextCreationError> {
+        self.0.append_event(id, event, actor_did, payload)
+    }
+
+    fn destroy_event_log(&self, id: &[u8; 32]) -> Result<(), ContextCreationError> {
+        self.0.destroy_event_log(id)
     }
 }
 

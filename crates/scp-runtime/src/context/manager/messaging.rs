@@ -1116,6 +1116,42 @@ impl ContextManager {
             });
         }
 
+        // H5: Append the durable event log entry for `MessageReceived` BEFORE
+        // running the receive-side consequence evaluation block below. This
+        // mirrors the M12 fix on the send-side `finalize_send` and preserves
+        // the invariant that rule triggers reading
+        // `event_log_entries_for_consequences` observe the just-delivered
+        // message.
+        //
+        // The receive buffer (Source 2 of `event_log_entries_for_consequences`)
+        // does contain the just-pushed event in fresh conditions, but the
+        // dedup filter at `governance::event_log_entries_for_consequences`
+        // (`estimated_ts <= last_log_ts && last_log_ts > 0`) drops buffer
+        // entries whose estimated timestamp is at or before the latest event
+        // log entry — and the receive buffer is also bounded by both
+        // `DEFAULT_BUFFER_CAPACITY = 1000` and `MAX_BUFFER_EVENT_AGE_SECS =
+        // 3600`. Without the durable append happening first, the just-
+        // received message becomes invisible to the receive-side eval whenever
+        // any of those bounds are crossed.
+        //
+        // The append is performed while the contexts mutex is still held so
+        // that a crash between append and consequence evaluation leaves a
+        // consistent Merkle-anchored record. If the persistence layer fails
+        // we WARN and continue: the receive buffer already holds the message,
+        // and dropping the whole delivery on a log-append failure is too
+        // strict — the receiver has already validated decryption, signature,
+        // membership, capability, and sequence.
+        if let Err(e) =
+            self.event_log
+                .append_context_event(context_id_bytes, "MessageReceived", sender_did)
+        {
+            tracing::warn!(
+                context_id,
+                sender_did,
+                "failed to append MessageReceived to event log on receive path: {e}"
+            );
+        }
+
         // H16: Defense-in-depth velocity tracking and consequence evaluation
         // for the sender on the receive path. This ensures that even if the
         // sender's node doesn't enforce consequences, the receiver still
@@ -1154,8 +1190,6 @@ impl ContextManager {
         drop(contexts);
 
         crate::metrics::record_message_received();
-        self.event_log
-            .append_context_event(context_id_bytes, "MessageReceived", sender_did)?;
 
         Ok(())
     }

@@ -3439,3 +3439,341 @@ fn role_name_max_length_matches_doc() {
         "MAX_ROLE_NAME_LENGTH must be 64 (doc in consequence.rs was corrected to match)"
     );
 }
+
+// =======================================================================
+// H5: deliver_incoming event-log append precedes consequence evaluation
+//
+// Mirrors the M12 fix on the send-side `finalize_send`. The durable event
+// log append for `MessageReceived` must precede the receive-side
+// consequence evaluation block so that rule triggers reading
+// `event_log_entries_for_consequences` (whose Source 1 is the persistent
+// event log via `event_log_entries`) observe the just-delivered message.
+//
+// Without the H5 fix, the receive buffer (Source 2) is the only path by
+// which the just-pushed `MessageReceived` reaches the consequence eval —
+// and that source is bounded by `DEFAULT_BUFFER_CAPACITY = 1000`,
+// `MAX_BUFFER_EVENT_AGE_SECS = 3600`, and the dedup filter
+// (`estimated_ts <= last_log_ts && last_log_ts > 0`).
+// =======================================================================
+
+/// Builds a two-member (Alice creator + Bob member) test context using a
+/// caller-supplied event log provider and (optionally) a custom clock.
+/// Mirrors `setup_two_member_verified_context` but parameterised so H5
+/// tests can inject `OrderedMockEventLog`, `ClockedMockEventLog`, and
+/// `FailingAppendEventLog` instances.
+async fn setup_two_member_context_with(
+    event_log: Box<dyn ContextEventLogProvider>,
+    clock: Option<Arc<dyn scp_primitives::Clock>>,
+) -> (
+    ContextManager,
+    ContextHandle,
+    std::sync::Arc<std::sync::Mutex<Vec<Vec<u8>>>>,
+) {
+    let transport = MockTransport::connected();
+    let sent = transport.sent_messages_handle();
+
+    let mut builder = ContextManager::builder()
+        .crypto(Box::new(MockCrypto::default()))
+        .transport(Box::new(transport))
+        .event_log(event_log)
+        .key_resolver(mock_key_resolver());
+    if let Some(c) = clock {
+        builder = builder.clock(c);
+    }
+    let manager = builder.build().expect("manager build must succeed");
+
+    let params = ContextParams {
+        ceiling: vec![
+            scp_protocol::context::params::Capability::new("messages:read"),
+            scp_protocol::context::params::Capability::new("messages:write"),
+            scp_protocol::context::params::Capability::new("role:assign"),
+            Capability::MemberBan,
+        ],
+        ..ContextParams::default()
+    };
+
+    manager.register_local_did("did:key:alice".into()).await;
+
+    let handle = manager
+        .create_context("test-ctx".into(), params, "did:key:alice".into())
+        .await
+        .unwrap();
+
+    {
+        let mut contexts = manager.contexts.lock().await;
+        let ctx = contexts.get_mut("test-ctx").unwrap();
+        ctx.membership
+            .add_member("did:key:bob".into(), "member".into(), vec![]);
+        ctx.role_state.members.insert("did:key:bob".to_owned());
+
+        let bob_access_key =
+            scp_protocol::crypto::access_keys::generate_access_key("test-ctx", "did:key:bob");
+        ctx.access
+            .access_key_store
+            .set("test-ctx", "did:key:bob", bob_access_key);
+    }
+
+    (manager, handle, sent)
+}
+
+/// Structural test: with the H5 fix in place, the `MessageReceived` durable
+/// event log append must occur strictly before the receive-side consequence
+/// evaluation reads back the event log via `event_log_entries`.
+///
+/// The instrumentation captures every `append_event` and `event_log_entries`
+/// call against an [`OrderedMockEventLog`]; the assertion checks that the
+/// monotonic operation log contains an `append("MessageReceived")` BEFORE
+/// any `read` performed during `deliver_incoming`.
+#[tokio::test]
+async fn deliver_incoming_event_log_append_precedes_consequence_eval() {
+    use scp_protocol::trust::consequence::{
+        ConsequenceAction, ConsequenceRule, ConsequenceTrigger, EnforcementSeverity,
+    };
+    use std::time::Duration;
+
+    let ordered = std::sync::Arc::new(OrderedMockEventLog::default());
+    let (manager, handle, sent) =
+        setup_two_member_context_with(Box::new(ArcOrderedEventLog(ordered.clone())), None).await;
+
+    // Install a consequence rule so the receive-side eval block actually
+    // calls `event_log_entries_for_consequences` (the rule list cannot be
+    // empty or the block short-circuits).
+    {
+        let mut contexts = manager.contexts.lock().await;
+        let ctx = contexts.get_mut("test-ctx").unwrap();
+        ctx.governance.consequence_rules = vec![ConsequenceRule {
+            trigger: ConsequenceTrigger::MessageVelocity,
+            // High threshold so eval observes but does not actually trigger,
+            // keeping this test focused on call ORDER (not the trigger logic).
+            threshold: 9999,
+            window: Duration::from_secs(3600),
+            action: ConsequenceAction::Enforcement(EnforcementSeverity::SuspendCapability {
+                capabilities: vec![Capability::MessagesWrite],
+            }),
+        }];
+    }
+
+    let alice_did: DID = "did:key:alice".into();
+    let alice_sk = signing_key_for_did(&alice_did);
+    manager
+        .send_message(
+            &handle,
+            &alice_did,
+            b"h5-structural-probe",
+            Some(&alice_sk),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    let encrypted = last_sent(&sent);
+    let _ = manager.drain_events("test-ctx").await;
+
+    // Snapshot the op log length BEFORE deliver_incoming so the assertion
+    // ignores any reads/writes performed by send_message.
+    let pre_delivery_len = ordered.op_log.lock().unwrap().len();
+
+    manager
+        .deliver_incoming("test-ctx", &encrypted)
+        .await
+        .unwrap();
+
+    let op_log = ordered.op_log.lock().unwrap();
+    let delivery_ops: Vec<&(String, String, u64)> = op_log[pre_delivery_len..].iter().collect();
+
+    // Find the FIRST `append` of `MessageReceived` after delivery began.
+    let received_append_idx = delivery_ops
+        .iter()
+        .position(|(kind, name, _)| kind == "append" && name == "MessageReceived")
+        .unwrap_or_else(|| {
+            panic!(
+                "deliver_incoming did not append MessageReceived to event log; ops: {delivery_ops:?}"
+            )
+        });
+
+    // Find the FIRST `read` (event_log_entries) after delivery began.
+    let first_read_idx = delivery_ops
+        .iter()
+        .position(|(kind, _, _)| kind == "read")
+        .unwrap_or_else(|| {
+            panic!(
+                "deliver_incoming did not read the event log during consequence eval; ops: {delivery_ops:?}"
+            )
+        });
+
+    assert!(
+        received_append_idx < first_read_idx,
+        "H5 invariant violated: MessageReceived append (index {received_append_idx}) \
+         must precede the first event_log_entries read (index {first_read_idx}) \
+         within deliver_incoming. Ops since pre_delivery: {delivery_ops:?}"
+    );
+}
+
+/// Behavioural test: with H5 in place, a `MessageVelocity` consequence rule
+/// whose threshold is exactly met by the just-received message fires during
+/// the receive-side eval. Constructed so that the receive buffer's
+/// dedup filter (`estimated_ts <= last_log_ts && last_log_ts > 0`) is
+/// activated by a prior `MessageSent` in the event log — this is the precise
+/// condition under which Source 2 (receive buffer) silently drops the
+/// just-pushed event, leaving Source 1 (event log) as the only path.
+#[tokio::test]
+async fn deliver_incoming_with_velocity_rule_counts_just_received_message() {
+    use scp_protocol::trust::consequence::{
+        ConsequenceAction, ConsequenceRule, ConsequenceTrigger, EnforcementSeverity,
+    };
+    use std::time::Duration;
+
+    // We need a fully clock-controlled environment so that:
+    //   1. The receive-side eval reads `now = clock.now_secs()` from a
+    //      fixed value we control.
+    //   2. The event log entries persisted by the mock are stamped with
+    //      the SAME clock-controlled time, so the window filter inside
+    //      `evaluate_consequence_rules` (`event.timestamp <= now`) does
+    //      NOT discard newly appended entries.
+    //
+    // `ClockedMockEventLog` wraps an `Arc<dyn Clock>` and uses it for
+    // every `append_event` timestamp. The same `Arc<TestClock>` is also
+    // injected into the `ContextManager` via the builder.
+    let test_clock = Arc::new(scp_primitives::TestClock::new(1_000_000_000));
+    let log = std::sync::Arc::new(ClockedMockEventLog::new(test_clock.clone()));
+    let (manager, handle, sent) = setup_two_member_context_with(
+        Box::new(ArcClockedEventLog(log.clone())),
+        Some(test_clock.clone() as Arc<dyn scp_primitives::Clock>),
+    )
+    .await;
+
+    let alice_did: DID = "did:key:alice".into();
+
+    // First send Alice's message WITHOUT any consequence rule installed,
+    // so the send-side eval (M12) does not pre-empt the receive-side
+    // assertion. We then capture the encrypted bytes, install the rule
+    // and pre-populated prior log entries, and deliver back through
+    // `deliver_incoming`.
+    let alice_sk = signing_key_for_did(&alice_did);
+    manager
+        .send_message(
+            &handle,
+            &alice_did,
+            b"h5-behavioural-probe",
+            Some(&alice_sk),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    let encrypted = last_sent(&sent);
+    let _ = manager.drain_events("test-ctx").await;
+
+    // Install the H5 trigger rule. After `send_message` ran above, the
+    // event log already contains exactly one Alice-attributed entry: the
+    // `MessageSent` finalize_send append at clock time T = 1_000_000_000.
+    // We pre-populate two more Alice-attributed `MessageSent` entries at
+    // the same T so that the event log has 3 matching entries before the
+    // delivery's eval.
+    //
+    // With threshold=4 the rule fires only when a fourth Alice-attributed
+    // matching event becomes visible to the eval. The receive-buffer
+    // source CANNOT supply that fourth event because the dedup filter
+    // (`estimated_ts <= last_log_ts && last_log_ts > 0`) drops it: the
+    // just-pushed buffer event has `estimated_ts = now = T` and
+    // `last_log_ts = T`. The only remaining path is the durable event
+    // log, which only contains the new `MessageReceived` entry post-H5.
+    {
+        let ctx_id_bytes = scp_protocol::context::context_id_bytes("test-ctx");
+        log.append_event(&ctx_id_bytes, "MessageSent", alice_did.as_ref(), None)
+            .unwrap();
+        log.append_event(&ctx_id_bytes, "MessageSent", alice_did.as_ref(), None)
+            .unwrap();
+    }
+    {
+        let mut contexts = manager.contexts.lock().await;
+        let ctx = contexts.get_mut("test-ctx").unwrap();
+        ctx.governance.consequence_rules = vec![ConsequenceRule {
+            trigger: ConsequenceTrigger::MessageVelocity,
+            threshold: 4,
+            window: Duration::from_secs(3600),
+            action: ConsequenceAction::Enforcement(EnforcementSeverity::SuspendCapability {
+                capabilities: vec![Capability::MessagesWrite],
+            }),
+        }];
+    }
+
+    manager
+        .deliver_incoming("test-ctx", &encrypted)
+        .await
+        .unwrap();
+
+    let events = manager.drain_events("test-ctx").await;
+    let triggered = events
+        .iter()
+        .any(|e| matches!(e, ContextEvent::ConsequenceTriggered { .. }));
+    assert!(
+        triggered,
+        "H5: receive-side consequence eval must count the just-delivered \
+         MessageReceived. Without the H5 fix the receive buffer copy is \
+         filtered out by the dedup gate and the threshold=2 rule never \
+         fires. Drained events: {events:?}"
+    );
+}
+
+/// Regression test: an event log append failure on `MessageReceived` does
+/// NOT block delivery. The receive buffer still receives the message, the
+/// caller still observes a successful `Result`, and the failure is logged
+/// (we cannot easily inspect tracing output here, so we instead assert
+/// against the mock's `failed_attempts` counter).
+#[tokio::test]
+async fn deliver_incoming_event_log_append_failure_still_delivers() {
+    let failing = std::sync::Arc::new(FailingAppendEventLog::new("MessageReceived"));
+    let (manager, handle, sent) =
+        setup_two_member_context_with(Box::new(ArcFailingAppendEventLog(failing.clone())), None)
+            .await;
+
+    let alice_did: DID = "did:key:alice".into();
+    let alice_sk = signing_key_for_did(&alice_did);
+    manager
+        .send_message(
+            &handle,
+            &alice_did,
+            b"h5-failure-probe",
+            Some(&alice_sk),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    let encrypted = last_sent(&sent);
+    let _ = manager.drain_events("test-ctx").await;
+
+    let result = manager.deliver_incoming("test-ctx", &encrypted).await;
+    assert!(
+        result.is_ok(),
+        "deliver_incoming must NOT propagate event log append failures \
+         (the receive buffer already holds the message). Got: {result:?}"
+    );
+    let returned = result.unwrap();
+    let (plaintext, sender_did) = returned.expect("ApplicationMessage must return Some");
+    assert_eq!(plaintext, b"h5-failure-probe");
+    assert_eq!(sender_did, "did:key:alice");
+
+    assert!(
+        failing
+            .failed_attempts
+            .load(std::sync::atomic::Ordering::SeqCst)
+            >= 1,
+        "FailingAppendEventLog must have observed at least one rejected \
+         MessageReceived append attempt"
+    );
+
+    // The receive buffer must still hold the MessageReceived event.
+    let events = manager.drain_events("test-ctx").await;
+    let recv_events: Vec<_> = events
+        .iter()
+        .filter(|e| matches!(e, ContextEvent::MessageReceived { .. }))
+        .collect();
+    assert_eq!(
+        recv_events.len(),
+        1,
+        "receive buffer must still contain MessageReceived even when the \
+         event log append fails. Drained events: {events:?}"
+    );
+}
