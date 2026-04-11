@@ -1153,6 +1153,28 @@ impl ContextCryptoProvider for MlsCryptoProvider {
                     )
                     .map_err(|e| ContextError::CryptoFailed(e.to_string()))?;
 
+                    // Receive-side epoch ceiling (H9): reject messages whose
+                    // claimed sender-key epoch exceeds the highest legitimately
+                    // distributed epoch for that sender by more than
+                    // `MAX_EPOCH_ADVANCE`. Without this guard a sender could
+                    // craft a single message with `epoch = u64::MAX`, which
+                    // updates `recv_sequence_tracker` and permanently locks
+                    // out all subsequent legitimate messages from that sender
+                    // (self-DoS / persistent per-receiver poisoning). The
+                    // `process_incoming_sender_key` path enforces the same
+                    // ceiling on key distributions; this mirrors that bound
+                    // on the message receive path so the two cannot diverge.
+                    let stored_high_water = state.sender_key_store.epoch(&ctx_str, &sender_did);
+                    let allowed_epoch_ceiling = stored_high_water.saturating_add(MAX_EPOCH_ADVANCE);
+                    if epoch > allowed_epoch_ceiling {
+                        return Err(ContextError::CryptoFailed(format!(
+                            "sender key epoch {epoch} exceeds ceiling \
+                             {allowed_epoch_ceiling} (stored high-water \
+                             {stored_high_water}, MAX_EPOCH_ADVANCE \
+                             {MAX_EPOCH_ADVANCE})",
+                        )));
+                    }
+
                     // Receive-side replay detection: reject messages with
                     // epoch/sequence <= last seen for this sender.
                     if let Some(&(last_epoch, last_seq)) =
@@ -3051,5 +3073,294 @@ mod tests {
             restored_secret, original_secret,
             "wrapping secret key must be restored from snapshot, not freshly generated"
         );
+    }
+
+    // -------------------------------------------------------------------
+    // H9: receive-side sender-key epoch ceiling
+    // -------------------------------------------------------------------
+
+    /// Two-party fixture: Alice (creator) and Bob (joiner) share a real
+    /// MLS group via the provider-level Welcome flow, exchange Alice's
+    /// sender key, and return both providers ready for `seal()` /
+    /// `open()`. Used by the H9 ceiling tests.
+    fn setup_alice_bob_two_party() -> (MlsCryptoProvider, MlsCryptoProvider, [u8; 32], String) {
+        let alice_did = TEST_DID;
+        let bob_did = "did:dht:z6MkBobBobBobBobBobBobBobBobBobBobBobBobBo";
+        let context_id = make_context_id();
+
+        let alice = MlsCryptoProvider::new(alice_did.to_string());
+        alice.create_mls_group(&context_id).unwrap();
+        alice.generate_sender_key(&context_id).unwrap();
+
+        let bob = MlsCryptoProvider::new(bob_did.to_string());
+        let bob_kp_bytes = bob.prepare_key_package_for_join().unwrap();
+
+        let add_output = alice
+            .add_member(&context_id, bob_did, Some(&bob_kp_bytes))
+            .unwrap();
+
+        bob.join_from_welcome(&context_id, &add_output.welcome_bytes)
+            .unwrap();
+        bob.generate_sender_key(&context_id).unwrap();
+
+        // Distribute Alice's sender key to Bob via the legitimate path.
+        // This sets `bob.sender_key_store.epoch(ctx, alice_did) = 1`,
+        // which is the H9 high-water mark.
+        alice.distribute_sender_key(&context_id, bob_did).unwrap();
+        let pending = alice
+            .drain_pending_sender_key_messages(&context_id)
+            .unwrap();
+        assert_eq!(pending.len(), 1);
+        for (_target, msg) in pending {
+            bob.process_incoming_sender_key(&context_id, alice_did, &msg)
+                .unwrap();
+        }
+
+        (alice, bob, context_id, alice_did.to_string())
+    }
+
+    /// Build a minimal `InnerEnvelope` with a deterministic signing key.
+    /// `provider.open()` does not verify signatures (per the comment in
+    /// `open()`, signature verification is deferred to `ContextManager`),
+    /// so an arbitrary key suffices for the H9 receive-ceiling tests.
+    fn build_test_inner(
+        context_id: &[u8; 32],
+        sender_did: &str,
+        epoch_field: u64,
+        sequence_field: u64,
+    ) -> scp_protocol::envelope::inner::InnerEnvelope {
+        let sk = ed25519_dalek::SigningKey::from_bytes(&[7u8; 32]);
+        let params = crate::envelope::inner::InnerEnvelopeParams {
+            version: crate::envelope::inner::SCP_INNER_ENVELOPE_VERSION,
+            context_id: &hex::encode(context_id),
+            sender_did,
+            epoch: epoch_field,
+            generation: 0,
+            sequence: sequence_field,
+            timestamp: 1_700_000_000,
+            message_type: crate::envelope::inner::MessageType::Content,
+            payload: b"h9 ceiling probe",
+            provenance: None,
+            signing_key_id: SigningKeyId::Active,
+        };
+        crate::envelope::inner::sign::create_inner_envelope_raw(&params, &sk).unwrap()
+    }
+
+    /// Force Alice's local `sender_key_epoch` to a specific value so the
+    /// next `seal()` emits a sender-layer header with that epoch in the
+    /// clear, bypassing any sender-side bound. Bob's `open()` is what
+    /// the test exercises.
+    fn force_alice_sender_key_epoch(alice: &MlsCryptoProvider, context_id: &[u8; 32], epoch: u64) {
+        let mut contexts = alice.contexts.lock().unwrap();
+        let state = contexts.get_mut(context_id).unwrap();
+        state.sender_key_epoch = epoch;
+    }
+
+    fn ctx_routing_id(context_id: &[u8; 32]) -> Vec<u8> {
+        // Any 32-byte routing id satisfies `create_outer_envelope`'s
+        // length check; the open() path does not validate routing_id.
+        context_id.to_vec()
+    }
+
+    #[test]
+    fn test_recv_epoch_ceiling_rejects_far_future() {
+        // H9: A crafted sender-layer header with `epoch = u64::MAX` must
+        // be rejected before it pollutes `recv_sequence_tracker` and
+        // permanently locks Bob out of subsequent legitimate messages
+        // from Alice. Bob's stored high-water for Alice is 1 (set by
+        // the legitimate distribution in `setup_alice_bob_two_party`),
+        // so the ceiling is `1 + MAX_EPOCH_ADVANCE = 1001`.
+        let (alice, bob, ctx_id, alice_did) = setup_alice_bob_two_party();
+
+        force_alice_sender_key_epoch(&alice, &ctx_id, u64::MAX);
+
+        let inner = build_test_inner(&ctx_id, &alice_did, 0, 0);
+        let routing_id = ctx_routing_id(&ctx_id);
+        let sealed = alice.seal(&ctx_id, &inner, &routing_id, 300).unwrap();
+
+        let err = bob
+            .open(&ctx_id, &sealed)
+            .expect_err("u64::MAX epoch must be rejected by the H9 ceiling");
+        match err {
+            ContextError::CryptoFailed(msg) => {
+                assert!(
+                    msg.contains("exceeds ceiling"),
+                    "expected ceiling-rejection error, got: {msg}"
+                );
+            }
+            other => panic!("expected CryptoFailed, got {other:?}"),
+        }
+
+        // Bob's recv_sequence_tracker for Alice MUST NOT have been
+        // updated by the rejected message. Without this guarantee the
+        // attack still succeeds — the next legitimate message from
+        // Alice would be rejected as a "replay or reorder".
+        {
+            let contexts = bob.contexts.lock().unwrap();
+            let state = contexts.get(&ctx_id).unwrap();
+            assert!(
+                !state.recv_sequence_tracker.contains_key(&alice_did),
+                "rejected H9 message must not pollute recv_sequence_tracker"
+            );
+        }
+    }
+
+    #[test]
+    fn test_recv_epoch_ceiling_rejects_unreasonable_advance() {
+        // H9 boundary: stored high-water = 1, MAX_EPOCH_ADVANCE = 1000,
+        // so ceiling = 1001. An advance of 1001 (epoch = 1002) is one
+        // past the boundary and must be rejected.
+        let (alice, bob, ctx_id, alice_did) = setup_alice_bob_two_party();
+
+        force_alice_sender_key_epoch(&alice, &ctx_id, 1002);
+
+        let inner = build_test_inner(&ctx_id, &alice_did, 0, 0);
+        let routing_id = ctx_routing_id(&ctx_id);
+        let sealed = alice.seal(&ctx_id, &inner, &routing_id, 300).unwrap();
+
+        let err = bob
+            .open(&ctx_id, &sealed)
+            .expect_err("epoch one past the ceiling must be rejected");
+        match err {
+            ContextError::CryptoFailed(msg) => {
+                assert!(
+                    msg.contains("exceeds ceiling"),
+                    "expected ceiling-rejection error, got: {msg}"
+                );
+            }
+            other => panic!("expected CryptoFailed, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_recv_epoch_ceiling_allows_gap_fill() {
+        // H9 boundary: an advance of exactly MAX_EPOCH_ADVANCE must be
+        // accepted. Stored high-water = 1, ceiling = 1001, so an
+        // incoming epoch of 1001 sits exactly on the boundary.
+        let (alice, bob, ctx_id, alice_did) = setup_alice_bob_two_party();
+
+        force_alice_sender_key_epoch(&alice, &ctx_id, 1001);
+
+        let inner = build_test_inner(&ctx_id, &alice_did, 0, 0);
+        let routing_id = ctx_routing_id(&ctx_id);
+        let sealed = alice.seal(&ctx_id, &inner, &routing_id, 300).unwrap();
+
+        let result = bob
+            .open(&ctx_id, &sealed)
+            .expect("epoch == ceiling must be accepted (boundary inclusive)");
+        match result {
+            scp_protocol::context::builder::OpenResult::Application(env) => {
+                assert_eq!(env.sender_did, alice_did);
+            }
+            other => panic!("expected Application, got {other:?}"),
+        }
+
+        // The receive tracker must have been updated with the boundary
+        // epoch so subsequent same-epoch messages don't replay.
+        let contexts = bob.contexts.lock().unwrap();
+        let state = contexts.get(&ctx_id).unwrap();
+        let entry = state.recv_sequence_tracker.get(&alice_did).copied();
+        assert_eq!(entry, Some((1001, 0)));
+    }
+
+    #[test]
+    fn test_recv_epoch_normal_path_unchanged() {
+        // Regression: the H9 ceiling must not break the happy path.
+        // A sequential epoch+sequence stream below the ceiling is
+        // accepted, and the receive tracker advances monotonically.
+        let (alice, bob, ctx_id, alice_did) = setup_alice_bob_two_party();
+
+        let routing_id = ctx_routing_id(&ctx_id);
+        let inner1 = build_test_inner(&ctx_id, &alice_did, 0, 0);
+        let inner2 = build_test_inner(&ctx_id, &alice_did, 0, 1);
+
+        // Two sequential seals at Alice's natural epoch=1, sequence
+        // increments handled by `seal()` itself.
+        let sealed1 = alice.seal(&ctx_id, &inner1, &routing_id, 300).unwrap();
+        let sealed2 = alice.seal(&ctx_id, &inner2, &routing_id, 300).unwrap();
+
+        bob.open(&ctx_id, &sealed1).expect("first seal must open");
+        bob.open(&ctx_id, &sealed2).expect("second seal must open");
+
+        let contexts = bob.contexts.lock().unwrap();
+        let state = contexts.get(&ctx_id).unwrap();
+        let (epoch, seq) = state
+            .recv_sequence_tracker
+            .get(&alice_did)
+            .copied()
+            .expect("tracker must be populated by happy-path opens");
+        assert_eq!(epoch, 1, "epoch should be Alice's natural epoch");
+        assert_eq!(seq, 1, "sequence should advance to the second message");
+    }
+
+    #[test]
+    fn test_recv_epoch_reorder_still_rejected() {
+        // Regression: existing replay/reorder rejection must still
+        // fire even with the H9 ceiling in place. After a successful
+        // open at (epoch=1, seq=1), a replay of the same (epoch, seq)
+        // and a lower-sequence message must both be rejected.
+        let (alice, bob, ctx_id, alice_did) = setup_alice_bob_two_party();
+
+        let routing_id = ctx_routing_id(&ctx_id);
+
+        // First, advance the receive tracker to (1, 1) via two
+        // legitimate messages.
+        let inner_a = build_test_inner(&ctx_id, &alice_did, 0, 0);
+        let inner_b = build_test_inner(&ctx_id, &alice_did, 0, 1);
+        let sealed_a = alice.seal(&ctx_id, &inner_a, &routing_id, 300).unwrap();
+        let sealed_b = alice.seal(&ctx_id, &inner_b, &routing_id, 300).unwrap();
+        bob.open(&ctx_id, &sealed_a).unwrap();
+        bob.open(&ctx_id, &sealed_b).unwrap();
+
+        // Now force Alice's send_sequence backwards and re-seal. The
+        // resulting header has (epoch=1, sequence=0) which is below
+        // Bob's last-seen (epoch=1, sequence=1) — must be rejected by
+        // the existing replay guard, NOT silently accepted because
+        // the H9 ceiling check passed.
+        {
+            let mut contexts = alice.contexts.lock().unwrap();
+            let state = contexts.get_mut(&ctx_id).unwrap();
+            state.send_sequence = 0;
+        }
+        let inner_replay = build_test_inner(&ctx_id, &alice_did, 0, 0);
+        let sealed_replay = alice
+            .seal(&ctx_id, &inner_replay, &routing_id, 300)
+            .unwrap();
+        let err = bob.open(&ctx_id, &sealed_replay).expect_err(
+            "lower-sequence message at the same epoch must still be rejected as replay",
+        );
+        match err {
+            ContextError::CryptoFailed(msg) => {
+                assert!(
+                    msg.contains("replay or reorder"),
+                    "expected replay/reorder rejection, got: {msg}"
+                );
+            }
+            other => panic!("expected CryptoFailed, got {other:?}"),
+        }
+
+        // Lower-epoch reorder: force Alice's epoch to 0 and re-seal.
+        // The header carries (epoch=0, sequence=...), which is below
+        // Bob's last-seen (epoch=1, ...) and must be rejected.
+        force_alice_sender_key_epoch(&alice, &ctx_id, 0);
+        {
+            let mut contexts = alice.contexts.lock().unwrap();
+            let state = contexts.get_mut(&ctx_id).unwrap();
+            state.send_sequence = 5;
+        }
+        let inner_lower = build_test_inner(&ctx_id, &alice_did, 0, 0);
+        let sealed_lower = alice.seal(&ctx_id, &inner_lower, &routing_id, 300).unwrap();
+        let err = bob
+            .open(&ctx_id, &sealed_lower)
+            .expect_err("lower-epoch message must still be rejected as reorder");
+        match err {
+            ContextError::CryptoFailed(msg) => {
+                assert!(
+                    msg.contains("replay or reorder"),
+                    "expected replay/reorder rejection, got: {msg}"
+                );
+            }
+            other => panic!("expected CryptoFailed, got {other:?}"),
+        }
     }
 }
