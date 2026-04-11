@@ -440,10 +440,7 @@ impl ContextManager {
         };
         // Payment flow (#1537): escrow pattern — authorize (hold) before the
         // action, complete (capture) after success, void + rollback on failure.
-        let auth = match self
-            .authorize_send_payment(&context_id, sender_did, ticket.deducted_cost)
-            .await
-        {
+        let auth = match self.authorize_send_payment(&context_id, sender_did).await {
             Ok(auth) => auth,
             Err(e) => {
                 // Authorization failure — roll back the ticket. The sequence
@@ -564,13 +561,11 @@ impl ContextManager {
         &self,
         context_id: &str,
         sender_did: &DID,
-        deducted_cost: Option<scp_protocol::economy::types::Amount>,
     ) -> Result<Option<super::economy::PaidActionAuthorization>, ContextError> {
         self.authorize_paid_action(
             scp_protocol::economy::types::PaidActionType::MessageSend,
             sender_did,
             context_id,
-            deducted_cost, // M3: pass pre-evaluated cost
         )
         .await
     }
