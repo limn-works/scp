@@ -75,7 +75,13 @@ impl DidResolver for NoOpDidResolver {
 struct NoOpNonceTracker;
 
 impl NonceTracker for NoOpNonceTracker {
-    fn check_and_record(&mut self, _nonce: &str, _token_expiry: u64) -> Result<(), UcanError> {
+    fn check_replay(&self, _nonce: &str, _token_expiry: u64) -> Result<(), UcanError> {
+        Err(UcanError::NonceFormatInvalid(
+            "NoOpNonceTracker: not a real tracker".to_owned(),
+        ))
+    }
+
+    fn record(&mut self, _nonce: &str, _token_expiry: u64) -> Result<(), UcanError> {
         Err(UcanError::NonceFormatInvalid(
             "NoOpNonceTracker: not a real tracker".to_owned(),
         ))

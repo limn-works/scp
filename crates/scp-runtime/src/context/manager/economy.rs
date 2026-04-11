@@ -29,13 +29,9 @@ use scp_protocol::crypto::ucan::validate::{
 use scp_protocol::economy::policy::ObservableMetrics;
 use scp_protocol::economy::types::PaidActionType;
 
-use crate::economy::adapter::{
-    AdapterAsVerifier, PaymentAdapter, PaymentAdapterDyn, PaymentMetadata, PaymentReceipt,
-};
+use crate::economy::adapter::{PaymentAdapterDyn, PaymentMetadata, PaymentReceipt};
 use crate::economy::integration::{self, IntegrationError};
-use crate::economy::receipt::{
-    PaymentVerifierDyn, ReceiptVerification, ReceiptVerificationError, verify_receipts_dyn,
-};
+use crate::economy::receipt::{ReceiptVerification, ReceiptVerificationError};
 
 use super::ContextManager;
 
@@ -173,84 +169,12 @@ fn validate_spending_ucan_or_error(
 pub(super) struct PaidActionAuthorization {
     /// The prepared action containing the authorization envelope.
     prepared: integration::PreparedAction,
-    /// The adapter bridge for capture/void.
-    bridge: DynAdapterBridge,
+    /// The payment adapter for capture/void.
+    adapter: Arc<dyn PaymentAdapterDyn>,
     /// The economic policy used for evaluation.
     policy: scp_protocol::economy::types::EconomicPolicy,
     /// Metrics snapshot for `process_paid_action`.
     metrics: ObservableMetrics,
-}
-
-/// Wrapper that delegates [`crate::economy::adapter::PaymentAdapter`] methods
-/// to a `dyn PaymentAdapterDyn` behind an `Arc`.
-///
-/// The generic functions `prepare_paid_action` and `process_paid_action` require
-/// `A: PaymentAdapter`. This wrapper implements `PaymentAdapter` by forwarding
-/// through the boxed-future `PaymentAdapterDyn` methods, bridging the generic
-/// and trait-object worlds.
-struct DynAdapterBridge(Arc<dyn PaymentAdapterDyn>);
-
-#[allow(clippy::similar_names)] // payer/payee is the domain language
-impl crate::economy::adapter::PaymentAdapter for DynAdapterBridge {
-    fn adapter_id(&self) -> &str {
-        self.0.adapter_id()
-    }
-
-    fn capabilities(&self) -> crate::economy::adapter::AdapterCapabilities {
-        self.0.capabilities()
-    }
-
-    async fn authorize(
-        &self,
-        payer: &DID,
-        payee: &DID,
-        amount: scp_protocol::economy::types::Amount,
-        currency: scp_protocol::economy::types::CurrencyCode,
-        metadata: PaymentMetadata,
-    ) -> Result<crate::economy::adapter::PaymentAuthorization, crate::economy::adapter::PaymentError>
-    {
-        self.0
-            .authorize_dyn(payer, payee, amount, currency, metadata)
-            .await
-    }
-
-    async fn capture(
-        &self,
-        auth: &crate::economy::adapter::PaymentAuthorization,
-    ) -> Result<PaymentReceipt, crate::economy::adapter::PaymentError> {
-        self.0.capture_dyn(auth).await
-    }
-
-    async fn void(
-        &self,
-        auth: &crate::economy::adapter::PaymentAuthorization,
-    ) -> Result<(), crate::economy::adapter::PaymentError> {
-        self.0.void_dyn(auth).await
-    }
-
-    async fn verify_authorization(
-        &self,
-        auth: &crate::economy::adapter::PaymentAuthorization,
-    ) -> Result<(), crate::economy::adapter::PaymentError> {
-        self.0.verify_authorization_dyn(auth).await
-    }
-
-    async fn verify(
-        &self,
-        receipt: &PaymentReceipt,
-    ) -> Result<crate::economy::adapter::VerificationResult, crate::economy::adapter::PaymentError>
-    {
-        self.0.verify_dyn(receipt).await
-    }
-
-    async fn refund(
-        &self,
-        receipt: &PaymentReceipt,
-        amount: Option<scp_protocol::economy::types::Amount>,
-    ) -> Result<crate::economy::adapter::RefundConfirmation, crate::economy::adapter::PaymentError>
-    {
-        self.0.refund_dyn(receipt, amount).await
-    }
 }
 
 /// Maps an [`IntegrationError`] to a [`ContextError`] with proper SCP error codes.
@@ -290,35 +214,18 @@ fn integration_error_to_context(err: IntegrationError) -> ContextError {
 
 /// Verifies a receipt and checks it is valid.
 async fn verify_and_check_receipt(
-    bridge: &DynAdapterBridge,
+    adapter: &dyn PaymentAdapterDyn,
     receipt: &PaymentReceipt,
 ) -> Result<(), ContextError> {
-    let verifier = AdapterAsVerifier(&*bridge.0);
-    let verification_results = verify_receipts_dyn(
-        &[&verifier as &dyn PaymentVerifierDyn],
-        std::slice::from_ref(receipt),
-    )
-    .await;
-    if verification_results.is_empty() {
+    // Call verify_dyn directly — we have one adapter and one receipt, so
+    // the multi-verifier dispatch in `verify_receipts_dyn` adds no value here.
+    let result = adapter.verify_dyn(receipt).await.map_err(|e| {
+        ContextError::PermissionDenied(format!("SCP-ECON-12049: receipt verification error: {e}"))
+    })?;
+    if !result.valid {
         return Err(ContextError::PermissionDenied(
-            "SCP-ECON-12050: receipt verification returned no results (vacuous pass)".to_owned(),
+            "SCP-ECON-12048: receipt verification failed: receipt marked invalid".to_owned(),
         ));
-    }
-    for result in &verification_results {
-        match result {
-            Ok(v) if !v.result.valid => {
-                return Err(ContextError::PermissionDenied(
-                    "SCP-ECON-12048: receipt verification failed: receipt marked invalid"
-                        .to_owned(),
-                ));
-            }
-            Err(e) => {
-                return Err(ContextError::PermissionDenied(format!(
-                    "SCP-ECON-12049: receipt verification error: {e}"
-                )));
-            }
-            _ => {}
-        }
     }
     Ok(())
 }
@@ -492,8 +399,8 @@ pub(super) fn enforce_economy(
     )
     .map_err(|e| ContextError::PermissionDenied(format!("SCP-ECON-12061: {e}")))?;
 
-    // Cryptographic + replay + scope + expiry + attenuation validation of
-    // the spending UCAN. `spending_ucan` is guaranteed `Some` by the guard
+    // Cryptographic + replay probe + scope + expiry + attenuation validation
+    // of the spending UCAN. `spending_ucan` is guaranteed `Some` by the guard
     // above.
     //
     // C1 (PR #1606): before this call landed, only `validate_spending_ucan`
@@ -503,11 +410,14 @@ pub(super) fn enforce_economy(
     // below. A fabricated `UcanToken` with attacker-chosen fields and
     // `signature: vec![]` passed enforcement. The combined entry point
     // `validate_spending_ucan_signed` runs the full pipeline — signature,
-    // chain, key scope, expiry, revocation, nonce, scope, capability,
-    // attenuation — in one call, with the per-context nonce tracker and
-    // revocation set wired in. The previous separate `nonce_tracker.check_and_record`
-    // call is now performed inside the combined validator (step G), so it
-    // is no longer issued here.
+    // chain, key scope, expiry, revocation, nonce probe (check_replay only),
+    // scope, capability, attenuation — in one call, with the per-context
+    // nonce tracker and revocation set wired in.
+    //
+    // H11: the nonce is only PROBED here (check_replay), not recorded.
+    // Recording happens below, after the budget gate, via
+    // `commit_spending_ucan_nonce`. This prevents nonce-burn DoS: a
+    // budget-rejected request must not exhaust tracker capacity.
     if let Some(spending) = spending_ucan {
         validate_spending_ucan_or_error(
             spending,
@@ -531,6 +441,20 @@ pub(super) fn enforce_economy(
     budget_tracker.record_spend(actor_did, cost).map_err(|e| {
         ContextError::PermissionDenied(format!("SCP-ECON-12010: budget exceeded: {e}"))
     })?;
+
+    // H11: commit the nonce AFTER the budget gate passes. This is the
+    // second phase of the split-phase nonce protocol — the read-only probe
+    // (check_replay) ran inside validate_spending_ucan_or_error above;
+    // the durable insertion (record) happens here so that budget-rejected
+    // requests cannot burn nonce tracker capacity.
+    if let Some(spending) = spending_ucan {
+        scp_protocol::crypto::ucan::spending::commit_spending_ucan_nonce(spending, nonce_tracker)
+            .map_err(|e| {
+            ContextError::PermissionDenied(format!(
+                "SCP-ECON-12066: nonce commit failed after budget acceptance: {e}"
+            ))
+        })?;
+    }
 
     Ok(Some(cost))
 }
@@ -641,28 +565,16 @@ impl ContextManager {
     /// action, then calls `complete_paid_action` or `void_paid_action`.
     ///
     /// Returns `Ok(None)` when no payment adapter is configured or cost is zero.
-    /// M3: accepts an optional `pre_evaluated_cost` to avoid re-evaluating
-    /// the pricing formula when cost was already computed by `enforce_economy`.
-    /// When `Some`, the adapter escrow uses the same cost the budget saw.
-    /// When `None`, cost is evaluated fresh (backward-compatible path).
     pub(super) async fn authorize_paid_action(
         &self,
         action_type: PaidActionType,
         payer_did: &DID,
         context_id: &str,
-        pre_evaluated_cost: Option<scp_protocol::economy::types::Amount>,
     ) -> Result<Option<PaidActionAuthorization>, ContextError> {
         // Early exit: no adapter means no payment flow.
         let Some(adapter_arc) = self.payment_adapter.as_ref().map(Arc::clone) else {
             return Ok(None);
         };
-
-        // If caller already evaluated cost and it was zero/absent, skip.
-        if let Some(cost) = pre_evaluated_cost
-            && cost.0 == 0
-        {
-            return Ok(None);
-        }
 
         // Phase 1: Extract policy + metrics under lock, then drop.
         let (policy, metrics) = {
@@ -695,19 +607,15 @@ impl ContextManager {
             return Ok(None);
         };
 
-        // M3: skip re-evaluation if cost was already computed upstream.
-        if pre_evaluated_cost.is_none() {
-            // Evaluate cost — zero cost means no payment needed.
-            if scp_protocol::economy::policy::evaluate_cost(&policy, &action_type, &metrics)
-                .filter(|c| c.0 > 0)
-                .is_none()
-            {
-                return Ok(None);
-            }
+        // Evaluate cost — zero cost means no payment needed.
+        if scp_protocol::economy::policy::evaluate_cost(&policy, &action_type, &metrics)
+            .filter(|c| c.0 > 0)
+            .is_none()
+        {
+            return Ok(None);
         }
 
         // Phase 2: Authorize (escrow) via adapter (no lock held).
-        let bridge = DynAdapterBridge(adapter_arc);
         let metadata = PaymentMetadata {
             action_type: action_type.clone(),
             context_id: Some(context_id.to_owned()),
@@ -715,7 +623,7 @@ impl ContextManager {
         };
 
         let prepared = integration::prepare_paid_action(
-            &bridge,
+            adapter_arc.as_ref(),
             Some(&policy),
             action_type,
             payer_did,
@@ -729,7 +637,7 @@ impl ContextManager {
 
         Ok(Some(PaidActionAuthorization {
             prepared,
-            bridge,
+            adapter: adapter_arc,
             policy,
             metrics,
         }))
@@ -747,7 +655,7 @@ impl ContextManager {
     ) -> Result<Option<PaymentReceipt>, ContextError> {
         // Capture the escrowed authorization via process_paid_action.
         let processed = integration::process_paid_action(
-            &auth.bridge,
+            auth.adapter.as_ref(),
             Some(&auth.policy),
             &auth.prepared.envelope,
             &auth.metrics,
@@ -761,7 +669,7 @@ impl ContextManager {
         };
 
         // Verify the receipt.
-        verify_and_check_receipt(&auth.bridge, &receipt).await?;
+        verify_and_check_receipt(auth.adapter.as_ref(), &receipt).await?;
 
         // Store receipt in event log.
         let context_id_bytes = super::context_id_to_bytes(context_id);
@@ -789,7 +697,7 @@ impl ContextManager {
     /// action → complete on success / void on failure).
     pub(super) async fn void_paid_action(&self, auth: PaidActionAuthorization, context_id: &str) {
         if let Some(ref authorization) = auth.prepared.envelope.authorization
-            && let Err(e) = auth.bridge.void(authorization).await
+            && let Err(e) = auth.adapter.void_dyn(authorization).await
         {
             tracing::warn!(context_id, "failed to void payment authorization: {e}");
         }
@@ -797,30 +705,39 @@ impl ContextManager {
 
     /// Verifies payment receipts using the configured payment adapter.
     ///
-    /// Wraps [`verify_receipts_dyn`] using the payment adapter as verifier.
-    /// Returns per-receipt results (no fail-fast).
+    /// For each receipt whose `adapter_id` matches the configured adapter,
+    /// calls `verify_dyn` directly. Receipts whose `adapter_id` does not
+    /// match the configured adapter return
+    /// [`ReceiptVerificationError::NoVerifierForAdapter`].
     ///
-    /// If no payment adapter is configured, returns
-    /// [`ReceiptVerificationError::NoVerifierForAdapter`] for each receipt.
+    /// If no payment adapter is configured, all receipts return
+    /// [`ReceiptVerificationError::NoVerifierForAdapter`].
     pub async fn verify_payment_receipts(
         &self,
         receipts: &[PaymentReceipt],
     ) -> Vec<Result<ReceiptVerification, ReceiptVerificationError>> {
-        match &self.payment_adapter {
-            Some(adapter) => {
-                let verifier = AdapterAsVerifier(adapter.as_ref());
-                verify_receipts_dyn(&[&verifier as &dyn PaymentVerifierDyn], receipts).await
-            }
-            None => receipts
-                .iter()
-                .map(|r| {
-                    Err(ReceiptVerificationError::NoVerifierForAdapter {
-                        receipt_id: r.receipt_id,
-                        adapter_id: r.adapter_id.clone(),
+        let mut results = Vec::with_capacity(receipts.len());
+        for receipt in receipts {
+            let result = match &self.payment_adapter {
+                Some(adapter) if adapter.adapter_id() == receipt.adapter_id => adapter
+                    .verify_dyn(receipt)
+                    .await
+                    .map(|r| ReceiptVerification {
+                        receipt_id: receipt.receipt_id,
+                        result: r,
                     })
-                })
-                .collect(),
+                    .map_err(|e| ReceiptVerificationError::VerificationFailed {
+                        receipt_id: receipt.receipt_id,
+                        error: e,
+                    }),
+                _ => Err(ReceiptVerificationError::NoVerifierForAdapter {
+                    receipt_id: receipt.receipt_id,
+                    adapter_id: receipt.adapter_id.clone(),
+                }),
+            };
+            results.push(result);
         }
+        results
     }
 }
 

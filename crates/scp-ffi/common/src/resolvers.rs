@@ -557,8 +557,12 @@ pub struct BridgeNonceTracker<'a, C: Clock> {
 }
 
 impl<C: Clock> NonceTrackerTrait for BridgeNonceTracker<'_, C> {
-    fn check_and_record(&mut self, nonce: &str, token_expiry: u64) -> Result<(), CoreUcanError> {
-        self.inner.check_and_record(nonce, token_expiry)
+    fn check_replay(&self, nonce: &str, token_expiry: u64) -> Result<(), CoreUcanError> {
+        self.inner.check_replay(nonce, token_expiry)
+    }
+
+    fn record(&mut self, nonce: &str, token_expiry: u64) -> Result<(), CoreUcanError> {
+        self.inner.record(nonce, token_expiry)
     }
 }
 

@@ -527,28 +527,6 @@ impl<T: PaymentAdapter> PaymentAdapterDyn for T {
     }
 }
 
-/// Wrapper that bridges [`PaymentAdapterDyn`] to [`super::receipt::PaymentVerifierDyn`].
-///
-/// Since `dyn PaymentAdapterDyn` cannot directly implement `PaymentVerifierDyn`
-/// (blanket impls would conflict for concrete types), this newtype wrapper
-/// provides the bridge. Used by [`super::super::context::manager::ContextManager::verify_payment_receipts`].
-pub struct AdapterAsVerifier<'a>(pub &'a dyn PaymentAdapterDyn);
-
-impl super::receipt::PaymentVerifierDyn for AdapterAsVerifier<'_> {
-    fn adapter_id(&self) -> &str {
-        self.0.adapter_id()
-    }
-
-    fn verify_dyn<'a>(
-        &'a self,
-        receipt: &'a PaymentReceipt,
-    ) -> std::pin::Pin<
-        Box<dyn std::future::Future<Output = Result<VerificationResult, PaymentError>> + Send + 'a>,
-    > {
-        self.0.verify_dyn(receipt)
-    }
-}
-
 // ---------------------------------------------------------------------------
 // NoOpPaymentAdapter — test-only no-op implementation.
 // ---------------------------------------------------------------------------

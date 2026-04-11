@@ -8319,7 +8319,6 @@ async fn paid_join_end_to_end_with_adapter() {
             scp_protocol::economy::types::PaidActionType::ContextJoin,
             &"did:key:joiner".into(),
             "paid-join-ctx",
-            None,
         )
         .await;
     assert!(auth.is_ok(), "authorize should succeed");
@@ -9237,7 +9236,6 @@ async fn test_execute_paid_action_skips_without_adapter() {
             scp_protocol::economy::types::PaidActionType::MessageSend,
             &"did:key:admin".into(),
             "no-adpt2-ctx",
-            None,
         )
         .await;
     assert!(
@@ -9304,7 +9302,6 @@ async fn test_execute_paid_action_full_flow_with_adapter() {
             scp_protocol::economy::types::PaidActionType::MessageSend,
             &"did:key:admin".into(),
             "adpt2-ctx",
-            None,
         )
         .await;
     assert!(auth.is_ok(), "authorize should succeed");
@@ -11967,7 +11964,6 @@ async fn execute_paid_action_skips_zero_cost() {
             scp_protocol::economy::types::PaidActionType::MessageSend,
             &"did:key:sender".into(),
             "zero-paid-ctx",
-            None,
         )
         .await;
     assert!(

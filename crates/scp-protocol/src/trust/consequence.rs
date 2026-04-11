@@ -648,6 +648,195 @@ pub fn evaluate_consequence_rules(
     triggered
 }
 
+// ---------------------------------------------------------------------------
+// ConsequenceDispatcher — shared enforcement trait
+// ---------------------------------------------------------------------------
+
+/// Abstracts over the mutable context state needed to enforce triggered
+/// consequences, enabling a single shared loop body for both the runtime
+/// (`scp-runtime`) and WASM (`scp-ffi-wasm`) implementations.
+///
+/// Each implementation mutates its own per-context state structure:
+///
+/// - **Runtime**: `ContextManager`'s `PerContextState` (uses `ContextRoleState`
+///   for capability suspension, `ReceiveBuffer` for events, and the governance
+///   `cooldown_until` map).
+/// - **WASM**: `WasmContextManager`'s `PerContextState` (uses a flat
+///   `suspended_capabilities` hash map, an in-memory event ring, and a
+///   flat `cooldown_until` map).
+///
+/// The methods use `&str` for DIDs to avoid cross-crate type dependencies,
+/// and `ContextEvent` from `scp_protocol::context::membership` (which both
+/// implementations already construct).
+///
+/// See Simp-2, ADR-017.
+pub trait ConsequenceDispatcher {
+    /// Returns `true` if `subject_did` is currently a member of the context.
+    fn is_member_present(&self, subject_did: &str) -> bool;
+
+    /// Suspends the listed capabilities for `subject_did`.
+    ///
+    /// Returns `true` if at least one capability was successfully applied.
+    fn suspend_capabilities(
+        &mut self,
+        subject_did: &str,
+        caps: &[crate::context::roles::Capability],
+    ) -> bool;
+
+    /// Suspends ALL capabilities for `subject_did` (full access suspension).
+    ///
+    /// Returns `true` if the suspension was applied.
+    fn suspend_all(&mut self, subject_did: &str) -> bool;
+
+    /// Assigns `to_role` to `subject_did`.
+    ///
+    /// Returns `true` if the subject is a known member and the role was
+    /// updated.
+    fn assign_role(&mut self, subject_did: &str, to_role: &str) -> bool;
+
+    /// Pushes a `ContextEvent` to the context's receive buffer (for SDK
+    /// observability).
+    fn push_event(&mut self, event: crate::context::membership::ContextEvent);
+
+    /// Returns the Unix-second timestamp until which rule `rule_index` is
+    /// on cooldown, or `None` if there is no active cooldown.
+    fn get_cooldown(&self, rule_index: usize) -> Option<u64>;
+
+    /// Records a cooldown for rule `rule_index` that expires at `until`
+    /// (Unix seconds).
+    fn set_cooldown(&mut self, rule_index: usize, until: u64);
+}
+
+/// Enforces a pre-evaluated set of triggered consequences using a
+/// [`ConsequenceDispatcher`].
+///
+/// This is the shared enforcement loop used by both the runtime and WASM
+/// bridges. Callers supply:
+///
+/// - `dispatcher` — mutable reference to the per-context state (implements
+///   [`ConsequenceDispatcher`]).
+/// - `context_id` — embedded in emitted `ContextEvent`s.
+/// - `subject_did` — the participant being evaluated.
+/// - `now_secs` — current Unix second (for cooldown arithmetic).
+/// - `triggered` — output of [`evaluate_consequence_rules`].
+/// - `rules` — the same slice that was passed to `evaluate_consequence_rules`
+///   (used to look up each rule's window for cooldown recording).
+///
+/// Returns the count of consequences that were dispatched (i.e., passed
+/// cooldown and ghost-DID guards).
+pub fn enforce_triggered<D: ConsequenceDispatcher>(
+    dispatcher: &mut D,
+    context_id: &str,
+    subject_did: &str,
+    now_secs: u64,
+    triggered: &[TriggeredConsequence],
+    rules: &[ConsequenceRule],
+) -> usize {
+    let mut count = 0usize;
+
+    for consequence in triggered {
+        // Cooldown: skip if this rule fired within its window.
+        if let Some(last_fired) = dispatcher.get_cooldown(consequence.rule_index)
+            && now_secs < last_fired
+        {
+            continue;
+        }
+
+        // Ghost DID guard: if the subject is absent AND there is no evidence
+        // of prior participation, skip entirely.
+        let member_present = dispatcher.is_member_present(subject_did);
+        if !member_present && consequence.evidence.is_empty() {
+            continue;
+        }
+
+        let action_type = match &consequence.action {
+            ConsequenceAction::Enforcement(sev) => sev.variant_name(),
+            ConsequenceAction::AssignRole { .. } => "AssignRole",
+        };
+        let trigger_type = rules
+            .get(consequence.rule_index)
+            .map_or_else(|| "Unknown".to_owned(), |r| format!("{:?}", r.trigger));
+
+        dispatcher.push_event(
+            crate::context::membership::ContextEvent::ConsequenceTriggered {
+                context_id: context_id.to_owned(),
+                member_did: DID::from(subject_did.to_owned()),
+                rule_index: consequence.rule_index,
+                trigger_type,
+                action_type: action_type.to_owned(),
+            },
+        );
+
+        // Emit-and-skip for absent members with evidence.
+        if !member_present {
+            dispatcher.push_event(
+                crate::context::membership::ContextEvent::ConsequenceEnforced {
+                    context_id: context_id.to_owned(),
+                    member_did: DID::from(subject_did.to_owned()),
+                    action_type: action_type.to_owned(),
+                    success: false,
+                },
+            );
+            count += 1;
+            continue;
+        }
+
+        let success = match &consequence.action {
+            ConsequenceAction::Enforcement(severity) => match severity {
+                EnforcementSeverity::SuspendCapability { capabilities } => {
+                    dispatcher.suspend_capabilities(subject_did, capabilities)
+                }
+                EnforcementSeverity::SuspendAccess => dispatcher.suspend_all(subject_did),
+                EnforcementSeverity::RevokeAccess { .. }
+                | EnforcementSeverity::RemoveMember { .. } => {
+                    // Cryptographic tiers must not reach consequence dispatch
+                    // without the opt-in flag. Fail here; escalation to
+                    // SuspendAll happens below.
+                    false
+                }
+            },
+            ConsequenceAction::AssignRole { to_role } => {
+                dispatcher.assign_role(subject_did, to_role)
+            }
+        };
+
+        if !success {
+            // Escalate to SuspendAll on enforcement failure.
+            let _ = dispatcher.suspend_all(subject_did);
+            dispatcher.push_event(
+                crate::context::membership::ContextEvent::ConsequenceEnforced {
+                    context_id: context_id.to_owned(),
+                    member_did: DID::from(subject_did.to_owned()),
+                    action_type: "SuspendAll(escalated)".to_owned(),
+                    success: true,
+                },
+            );
+            count += 1;
+            continue;
+        }
+
+        // Record cooldown.
+        if let Some(rule) = rules.get(consequence.rule_index) {
+            dispatcher.set_cooldown(
+                consequence.rule_index,
+                now_secs.saturating_add(rule.window.as_secs()),
+            );
+        }
+
+        dispatcher.push_event(
+            crate::context::membership::ContextEvent::ConsequenceEnforced {
+                context_id: context_id.to_owned(),
+                member_did: DID::from(subject_did.to_owned()),
+                action_type: action_type.to_owned(),
+                success,
+            },
+        );
+        count += 1;
+    }
+
+    count
+}
+
 /// Checks whether an event matches a trigger condition for the given subject.
 fn matches_trigger(trigger: &ConsequenceTrigger, event: &Event, subject_did: &str) -> bool {
     match trigger {

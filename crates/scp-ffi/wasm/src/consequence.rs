@@ -34,7 +34,7 @@
 //!   fire.
 
 use scp_protocol::trust::consequence::{
-    ConsequenceAction, ConsequenceRule, EnforcementSeverity, TriggeredConsequence,
+    ConsequenceDispatcher, ConsequenceRule, TriggeredConsequence, enforce_triggered,
     evaluate_consequence_rules,
 };
 
@@ -86,126 +86,62 @@ pub fn dispatch_consequences_for_subject(
         evaluate_consequence_rules(&rules, events, subject_did, now_secs)
     };
 
-    enforce_triggered(ctx, context_id, subject_did, now_secs, &triggered, &rules)
+    let mut dispatcher = WasmConsequenceDispatcher { ctx };
+    enforce_triggered(
+        &mut dispatcher,
+        context_id,
+        subject_did,
+        now_secs,
+        &triggered,
+        &rules,
+    )
 }
 
-/// Enforces a pre-evaluated set of triggered consequences against the WASM
-/// per-context state.
+// ---------------------------------------------------------------------------
+// WasmConsequenceDispatcher — bridges PerContextState to the shared trait
+// ---------------------------------------------------------------------------
+
+/// Implements [`ConsequenceDispatcher`] for the WASM bridge's `PerContextState`.
 ///
-/// Mirrors `scp_runtime::context::manager::governance::
-/// enforce_triggered_consequences`, adapted to WASM's flat
-/// `suspended_capabilities: HashMap<String, HashSet<String>>` layout and
-/// simple member role model (no `ContextRoleState`).
-///
-/// Returns the count of triggered rules that were actually dispatched (i.e.,
-/// passed the cooldown and ghost-DID guards).
-fn enforce_triggered(
-    ctx: &mut PerContextState,
-    context_id: &str,
-    subject_did: &str,
-    now_secs: u64,
-    triggered: &[TriggeredConsequence],
-    rules: &[ConsequenceRule],
-) -> usize {
-    use scp_event_log::DID;
-    use scp_protocol::context::membership::ContextEvent;
+/// The WASM bridge uses a flat `suspended_capabilities: HashMap<String, HashSet<String>>`
+/// rather than the runtime's `ContextRoleState`, and a simple member role
+/// model (role stored as a string on `MemberEntry`).
+struct WasmConsequenceDispatcher<'a> {
+    ctx: &'a mut PerContextState,
+}
 
-    let mut dispatched = 0usize;
-
-    for consequence in triggered {
-        // Cooldown: skip if this rule fired within its window.
-        if let Some(&last_fired) = ctx.cooldown_until_get(consequence.rule_index)
-            && now_secs < last_fired
-        {
-            continue;
-        }
-
-        // Ghost DID guard: if the subject is absent AND there is no evidence
-        // of prior participation, skip entirely. Mirrors runtime.
-        let member_present = ctx.members_contains(subject_did);
-        if !member_present && consequence.evidence.is_empty() {
-            continue;
-        }
-
-        let action_type = match &consequence.action {
-            ConsequenceAction::Enforcement(sev) => sev.variant_name(),
-            ConsequenceAction::AssignRole { .. } => "AssignRole",
-        };
-        let trigger_type = rules
-            .get(consequence.rule_index)
-            .map_or_else(|| "Unknown".to_owned(), |r| format!("{:?}", r.trigger));
-
-        ctx.push_event_pub(ContextEvent::ConsequenceTriggered {
-            context_id: context_id.to_owned(),
-            member_did: DID::from(subject_did.to_owned()),
-            rule_index: consequence.rule_index,
-            trigger_type,
-            action_type: action_type.to_owned(),
-        });
-
-        // Emit-and-skip for absent members, mirroring runtime behavior.
-        if !member_present {
-            ctx.push_event_pub(ContextEvent::ConsequenceEnforced {
-                context_id: context_id.to_owned(),
-                member_did: DID::from(subject_did.to_owned()),
-                action_type: action_type.to_owned(),
-                success: false,
-            });
-            dispatched += 1;
-            continue;
-        }
-
-        let success = match &consequence.action {
-            ConsequenceAction::Enforcement(severity) => match severity {
-                EnforcementSeverity::SuspendCapability { capabilities } => {
-                    apply_suspend(ctx, subject_did, capabilities)
-                }
-                EnforcementSeverity::SuspendAccess => apply_suspend_all(ctx, subject_did),
-                EnforcementSeverity::RevokeAccess { .. }
-                | EnforcementSeverity::RemoveMember { .. } => {
-                    // Cryptographic tiers should not reach consequence dispatch
-                    // without the opt-in flag. Log error and fail (escalation
-                    // to SuspendAll happens below).
-                    false
-                }
-            },
-            ConsequenceAction::AssignRole { to_role } => {
-                apply_assign_role(ctx, subject_did, to_role)
-            }
-        };
-
-        if !success {
-            // Escalate to SuspendAll on enforcement failure, matching runtime.
-            // Skip cooldown so the escalation fires immediately.
-            let _ = apply_suspend_all(ctx, subject_did);
-            ctx.push_event_pub(ContextEvent::ConsequenceEnforced {
-                context_id: context_id.to_owned(),
-                member_did: DID::from(subject_did.to_owned()),
-                action_type: "SuspendAll(escalated)".to_owned(),
-                success: true,
-            });
-            dispatched += 1;
-            continue;
-        }
-
-        // Record cooldown: prevent re-firing within the rule's window.
-        if let Some(rule) = rules.get(consequence.rule_index) {
-            ctx.cooldown_until_insert(
-                consequence.rule_index,
-                now_secs.saturating_add(rule.window.as_secs()),
-            );
-        }
-
-        ctx.push_event_pub(ContextEvent::ConsequenceEnforced {
-            context_id: context_id.to_owned(),
-            member_did: DID::from(subject_did.to_owned()),
-            action_type: action_type.to_owned(),
-            success,
-        });
-        dispatched += 1;
+impl ConsequenceDispatcher for WasmConsequenceDispatcher<'_> {
+    fn is_member_present(&self, subject_did: &str) -> bool {
+        self.ctx.members_contains(subject_did)
     }
 
-    dispatched
+    fn suspend_capabilities(
+        &mut self,
+        subject_did: &str,
+        caps: &[scp_protocol::context::roles::Capability],
+    ) -> bool {
+        apply_suspend(self.ctx, subject_did, caps)
+    }
+
+    fn suspend_all(&mut self, subject_did: &str) -> bool {
+        apply_suspend_all(self.ctx, subject_did)
+    }
+
+    fn assign_role(&mut self, subject_did: &str, to_role: &str) -> bool {
+        apply_assign_role(self.ctx, subject_did, to_role)
+    }
+
+    fn push_event(&mut self, event: scp_protocol::context::membership::ContextEvent) {
+        self.ctx.push_event_pub(event);
+    }
+
+    fn get_cooldown(&self, rule_index: usize) -> Option<u64> {
+        self.ctx.cooldown_until_get(rule_index).copied()
+    }
+
+    fn set_cooldown(&mut self, rule_index: usize, until: u64) {
+        self.ctx.cooldown_until_insert(rule_index, until);
+    }
 }
 
 /// Enforces `EnforcementSeverity::SuspendCapability` by adding each
@@ -284,8 +220,8 @@ fn apply_assign_role(ctx: &mut PerContextState, subject_did: &str, to_role: &str
 // Tests
 // ---------------------------------------------------------------------------
 //
-// Covers `dispatch_consequences_for_subject` and the private `enforce_triggered`
-// / `apply_*` helpers. Tests run on the native target via
+// Covers `dispatch_consequences_for_subject`, the shared `enforce_triggered`
+// (via `WasmConsequenceDispatcher`), and the `apply_*` helpers. Tests run on the native target via
 // `make_bare_per_context_state` (in `manager.rs`), which avoids
 // `crate::time::now_secs` — that function requires the WASM JS runtime and
 // panics on native. Where timestamps matter (event log entries, `now_secs`
@@ -303,15 +239,15 @@ fn apply_assign_role(ctx: &mut PerContextState, subject_did: &str, to_role: &str
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::{
-        apply_assign_role, apply_suspend, apply_suspend_all, dispatch_consequences_for_subject,
-        enforce_triggered,
+        WasmConsequenceDispatcher, apply_assign_role, apply_suspend, apply_suspend_all,
+        dispatch_consequences_for_subject,
     };
     use crate::manager::make_bare_per_context_state;
     use scp_event_log::{DID as LogDID, EventType};
     use scp_protocol::context::roles::Capability;
     use scp_protocol::trust::consequence::{
         ConsequenceAction, ConsequenceEvidence, ConsequenceRule, ConsequenceTrigger,
-        EnforcementSeverity, TriggeredConsequence,
+        EnforcementSeverity, TriggeredConsequence, enforce_triggered,
     };
     use std::time::Duration;
 
@@ -422,8 +358,17 @@ mod tests {
             evidence: vec![make_evidence(0, "did:test:admin")],
         }];
 
-        let dispatched =
-            enforce_triggered(&mut ctx, "ctx", "did:test:admin", 1000, &triggered, &rules);
+        let dispatched = {
+            let mut dispatcher = WasmConsequenceDispatcher { ctx: &mut ctx };
+            enforce_triggered(
+                &mut dispatcher,
+                "ctx",
+                "did:test:admin",
+                1000,
+                &triggered,
+                &rules,
+            )
+        };
         assert_eq!(dispatched, 1);
         assert!(!ctx.member_has_capability_pub("did:test:admin", "messages:write"));
         assert!(!ctx.member_has_capability_pub("did:test:admin", "messages:read"));
@@ -455,8 +400,17 @@ mod tests {
             evidence: vec![make_evidence(0, "did:test:admin")],
         }];
 
-        let dispatched =
-            enforce_triggered(&mut ctx, "ctx", "did:test:admin", 1000, &triggered, &rules);
+        let dispatched = {
+            let mut dispatcher = WasmConsequenceDispatcher { ctx: &mut ctx };
+            enforce_triggered(
+                &mut dispatcher,
+                "ctx",
+                "did:test:admin",
+                1000,
+                &triggered,
+                &rules,
+            )
+        };
         assert_eq!(dispatched, 1);
         // All candidate caps must now return false.
         for cap in [
@@ -491,8 +445,17 @@ mod tests {
         }];
 
         assert_eq!(ctx.test_member_role("did:test:bob"), Some("member"));
-        let dispatched =
-            enforce_triggered(&mut ctx, "ctx", "did:test:bob", 1000, &triggered, &rules);
+        let dispatched = {
+            let mut dispatcher = WasmConsequenceDispatcher { ctx: &mut ctx };
+            enforce_triggered(
+                &mut dispatcher,
+                "ctx",
+                "did:test:bob",
+                1000,
+                &triggered,
+                &rules,
+            )
+        };
         assert_eq!(dispatched, 1);
         assert_eq!(ctx.test_member_role("did:test:bob"), Some("observer"));
     }
@@ -519,18 +482,45 @@ mod tests {
 
         // First dispatch at t=1000 — fires and records cooldown_until =
         // 1000 + 60 = 1060.
-        let dispatched1 =
-            enforce_triggered(&mut ctx, "ctx", "did:test:admin", 1000, &triggered, &rules);
+        let dispatched1 = {
+            let mut dispatcher = WasmConsequenceDispatcher { ctx: &mut ctx };
+            enforce_triggered(
+                &mut dispatcher,
+                "ctx",
+                "did:test:admin",
+                1000,
+                &triggered,
+                &rules,
+            )
+        };
         assert_eq!(dispatched1, 1);
 
         // Second dispatch at t=1030 — inside the cooldown window → skipped.
-        let dispatched2 =
-            enforce_triggered(&mut ctx, "ctx", "did:test:admin", 1030, &triggered, &rules);
+        let dispatched2 = {
+            let mut dispatcher = WasmConsequenceDispatcher { ctx: &mut ctx };
+            enforce_triggered(
+                &mut dispatcher,
+                "ctx",
+                "did:test:admin",
+                1030,
+                &triggered,
+                &rules,
+            )
+        };
         assert_eq!(dispatched2, 0);
 
         // Third dispatch at t=1100 — cooldown expired → fires again.
-        let dispatched3 =
-            enforce_triggered(&mut ctx, "ctx", "did:test:admin", 1100, &triggered, &rules);
+        let dispatched3 = {
+            let mut dispatcher = WasmConsequenceDispatcher { ctx: &mut ctx };
+            enforce_triggered(
+                &mut dispatcher,
+                "ctx",
+                "did:test:admin",
+                1100,
+                &triggered,
+                &rules,
+            )
+        };
         assert_eq!(dispatched3, 1);
     }
 
@@ -550,8 +540,17 @@ mod tests {
 
         // Subject "ghost" is not in members, and the evidence vec is empty —
         // so the ghost-DID guard fires and the consequence is skipped entirely.
-        let dispatched =
-            enforce_triggered(&mut ctx, "ctx", "did:test:ghost", 1000, &triggered, &rules);
+        let dispatched = {
+            let mut dispatcher = WasmConsequenceDispatcher { ctx: &mut ctx };
+            enforce_triggered(
+                &mut dispatcher,
+                "ctx",
+                "did:test:ghost",
+                1000,
+                &triggered,
+                &rules,
+            )
+        };
         assert_eq!(dispatched, 0);
         assert!(ctx.test_suspended_capabilities("did:test:ghost").is_none());
     }
@@ -586,8 +585,17 @@ mod tests {
             },
         ];
 
-        let dispatched =
-            enforce_triggered(&mut ctx, "ctx", "did:test:ghost", 1000, &triggered, &rules);
+        let dispatched = {
+            let mut dispatcher = WasmConsequenceDispatcher { ctx: &mut ctx };
+            enforce_triggered(
+                &mut dispatcher,
+                "ctx",
+                "did:test:ghost",
+                1000,
+                &triggered,
+                &rules,
+            )
+        };
         // Both consequences are counted (ghost-with-evidence takes the
         // emit-and-skip branch which still increments `dispatched`).
         assert_eq!(dispatched, 2);

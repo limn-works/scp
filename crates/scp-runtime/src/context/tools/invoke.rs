@@ -951,72 +951,11 @@ async fn void_escrow_and_rollback<S: BuildHasher>(
 // Escrow payment flow for tool invocations (#1537)
 // ---------------------------------------------------------------------------
 
-/// Wrapper that bridges `&dyn PaymentAdapterDyn` to `PaymentAdapter` for the
-/// generic `prepare_paid_action` / `process_paid_action` functions.
-struct ToolPaymentBridge<'a>(&'a dyn crate::economy::adapter::PaymentAdapterDyn);
-
-#[allow(clippy::similar_names)] // payer/payee is the domain language
-impl crate::economy::adapter::PaymentAdapter for ToolPaymentBridge<'_> {
-    fn adapter_id(&self) -> &str {
-        self.0.adapter_id()
-    }
-    fn capabilities(&self) -> crate::economy::adapter::AdapterCapabilities {
-        self.0.capabilities()
-    }
-    async fn authorize(
-        &self,
-        payer: &DID,
-        payee: &DID,
-        amount: scp_protocol::economy::types::Amount,
-        currency: scp_protocol::economy::types::CurrencyCode,
-        metadata: crate::economy::adapter::PaymentMetadata,
-    ) -> Result<crate::economy::adapter::PaymentAuthorization, crate::economy::adapter::PaymentError>
-    {
-        self.0
-            .authorize_dyn(payer, payee, amount, currency, metadata)
-            .await
-    }
-    async fn capture(
-        &self,
-        auth: &crate::economy::adapter::PaymentAuthorization,
-    ) -> Result<crate::economy::adapter::PaymentReceipt, crate::economy::adapter::PaymentError>
-    {
-        self.0.capture_dyn(auth).await
-    }
-    async fn void(
-        &self,
-        auth: &crate::economy::adapter::PaymentAuthorization,
-    ) -> Result<(), crate::economy::adapter::PaymentError> {
-        self.0.void_dyn(auth).await
-    }
-    async fn verify_authorization(
-        &self,
-        auth: &crate::economy::adapter::PaymentAuthorization,
-    ) -> Result<(), crate::economy::adapter::PaymentError> {
-        self.0.verify_authorization_dyn(auth).await
-    }
-    async fn verify(
-        &self,
-        receipt: &crate::economy::adapter::PaymentReceipt,
-    ) -> Result<crate::economy::adapter::VerificationResult, crate::economy::adapter::PaymentError>
-    {
-        self.0.verify_dyn(receipt).await
-    }
-    async fn refund(
-        &self,
-        receipt: &crate::economy::adapter::PaymentReceipt,
-        amount: Option<scp_protocol::economy::types::Amount>,
-    ) -> Result<crate::economy::adapter::RefundConfirmation, crate::economy::adapter::PaymentError>
-    {
-        self.0.refund_dyn(receipt, amount).await
-    }
-}
-
 /// Authorizes a tool payment (escrow step 1).
 ///
-/// Creates an escrow hold via `prepare_paid_action`. Returns the bridge
-/// and prepared action for later completion or voiding. Returns `None`
-/// when cost is zero or no payment is needed.
+/// Creates an escrow hold via `prepare_paid_action`. Returns the prepared
+/// action for later completion or voiding. Returns `None` when cost is zero
+/// or no payment is needed.
 ///
 /// Called BEFORE tool execution. On success, the caller must eventually call
 /// `complete_tool_payment` or `void_tool_escrow`.
@@ -1036,7 +975,6 @@ pub(crate) async fn authorize_tool_payment(
         return Ok(None);
     };
 
-    let bridge = ToolPaymentBridge(adapter);
     let metadata = crate::economy::adapter::PaymentMetadata {
         action_type: scp_protocol::economy::types::PaidActionType::ToolInvoke,
         context_id: Some(context_id.to_owned()),
@@ -1044,7 +982,7 @@ pub(crate) async fn authorize_tool_payment(
     };
 
     let prepared = crate::economy::integration::prepare_paid_action(
-        &bridge,
+        adapter,
         Some(policy),
         scp_protocol::economy::types::PaidActionType::ToolInvoke,
         invoker_did,
@@ -1073,9 +1011,8 @@ pub(crate) async fn complete_tool_payment(
     prepared: &crate::economy::integration::PreparedAction,
     metrics: &scp_protocol::economy::policy::ObservableMetrics,
 ) -> Result<Option<crate::economy::adapter::PaymentReceipt>, InvocationError> {
-    let bridge = ToolPaymentBridge(adapter);
     let processed = crate::economy::integration::process_paid_action(
-        &bridge,
+        adapter,
         policy,
         &prepared.envelope,
         metrics,
@@ -1106,12 +1043,10 @@ pub(crate) async fn void_tool_escrow(
     adapter: &dyn crate::economy::adapter::PaymentAdapterDyn,
     prepared: &crate::economy::integration::PreparedAction,
 ) {
-    if let Some(ref authorization) = prepared.envelope.authorization {
-        let bridge = ToolPaymentBridge(adapter);
-        if let Err(e) = crate::economy::adapter::PaymentAdapter::void(&bridge, authorization).await
-        {
-            tracing::warn!("failed to void tool payment escrow: {e}");
-        }
+    if let Some(ref authorization) = prepared.envelope.authorization
+        && let Err(e) = adapter.void_dyn(authorization).await
+    {
+        tracing::warn!("failed to void tool payment escrow: {e}");
     }
 }
 

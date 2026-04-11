@@ -1099,16 +1099,50 @@ where
         return Err(SpendingError::Ucan(UcanError::TokenRevoked(revocation_cid)));
     }
 
-    // Step G: Nonce reservation. Rejects format/freshness violations and
-    // replays. Records the nonce on success so subsequent presentations
-    // of the same UCAN are caught at step G on the second call.
-    nonce_tracker.check_and_record(&token.payload.nnc, token.payload.exp)?;
+    // Step G: Nonce probe (read-only). Rejects format/freshness violations and
+    // replays WITHOUT recording the nonce. The nonce is committed only after
+    // all downstream gates — including the budget check — pass, via a
+    // separate `commit_spending_ucan_nonce` call (H11 split-phase). This
+    // prevents nonce-burn DoS: a budget-rejected request must not exhaust
+    // tracker capacity.
+    nonce_tracker.check_replay(&token.payload.nnc, token.payload.exp)?;
 
     // Step H: Spending-specific validation. Delegates to the partial
     // helper, which is now `pub(crate)` and unreachable from outside the
     // crate. Validates the spending attestation scope, lifetime cap,
     // capability extraction, and (if a parent is supplied) attenuation.
     validate_spending_ucan(token, context_id, parent_capability, clock)
+}
+
+/// Commits the nonce from a previously validated spending UCAN into the
+/// nonce tracker.
+///
+/// This is the second phase of the H11 split-phase nonce protocol.
+/// [`validate_spending_ucan_signed`] calls
+/// [`check_replay`](super::validate::NonceTracker::check_replay) — a
+/// read-only probe that rejects replays and format/freshness violations but
+/// does NOT record the nonce. After all downstream gates pass (including the
+/// budget check), the caller MUST invoke `commit_spending_ucan_nonce` to
+/// durably record the nonce and prevent future replays.
+///
+/// Splitting the phases prevents nonce-burn denial-of-service: a valid UCAN
+/// that fails the budget gate cannot exhaust tracker capacity by consuming a
+/// nonce slot.
+///
+/// # Errors
+///
+/// Returns [`SpendingError`] if the defensive re-check inside `record` fails
+/// (e.g., a concurrent caller raced to record the same nonce).
+pub fn commit_spending_ucan_nonce<N>(
+    token: &UcanToken,
+    nonce_tracker: &mut N,
+) -> Result<(), SpendingError>
+where
+    N: super::validate::NonceTracker,
+{
+    nonce_tracker
+        .record(&token.payload.nnc, token.payload.exp)
+        .map_err(SpendingError::Ucan)
 }
 
 // ---------------------------------------------------------------------------

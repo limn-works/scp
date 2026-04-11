@@ -1342,7 +1342,18 @@ impl scp_core::crypto::ucan::validate::DidResolver for NoOpDidResolver {
 /// `None`, but rejects by default if accidentally called.
 struct RejectAllNonceTracker;
 impl scp_core::crypto::ucan::validate::NonceTracker for RejectAllNonceTracker {
-    fn check_and_record(
+    fn check_replay(
+        &self,
+        nonce: &str,
+        _token_expiry: u64,
+    ) -> Result<(), scp_core::crypto::ucan::UcanError> {
+        // Fail-closed: reject all nonces when no real tracker is available.
+        Err(scp_core::crypto::ucan::UcanError::NonceReused(
+            nonce.to_owned(),
+        ))
+    }
+
+    fn record(
         &mut self,
         nonce: &str,
         _token_expiry: u64,

@@ -52,7 +52,11 @@ use scp_identity::DID;
 struct DummyNonceTracker;
 
 impl NonceTracker for DummyNonceTracker {
-    fn check_and_record(&mut self, _nonce: &str, _token_expiry: u64) -> Result<(), UcanError> {
+    fn check_replay(&self, _nonce: &str, _token_expiry: u64) -> Result<(), UcanError> {
+        Ok(())
+    }
+
+    fn record(&mut self, _nonce: &str, _token_expiry: u64) -> Result<(), UcanError> {
         Ok(())
     }
 }
