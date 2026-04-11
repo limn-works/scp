@@ -663,10 +663,14 @@ class Context:
             else promotion_policy
         )
 
+        # Distinguish "explicit empty collection" from "absent" for parameters
+        # whose semantics differ between the two: passing `roles={}` declares
+        # the context has no roles, while omitting the key falls back to the
+        # bridge default. Use `is not None` -- never the falsy form.
         params: dict[str, Any] = {
             "ceiling": ceiling_strs,
-            "roles": roles or {},
-            "tools": [t.name for t in tools] if tools else [],
+            "roles": roles if roles is not None else {},
+            "tools": [t.name for t in tools] if tools is not None else [],
             "ttl": ttl,
             "memory_scope": scope_str,
             "governance": governance,
@@ -1641,7 +1645,11 @@ def evaluate_invitation(
 
     import _scp_core
 
-    trusted_dids_json = json.dumps(trusted_dids) if trusted_dids else None
+    # H14: Distinguish "explicit empty trusted set" (auto-reject everyone) from
+    # "no trusted-DID policy provided" (fall through to other rules). Empty list
+    # `[]` must round-trip as `"[]"`, NOT collapse to None. Never use the falsy
+    # form on Optional collections at FFI boundaries.
+    trusted_dids_json = json.dumps(trusted_dids) if trusted_dids is not None else None
     return _scp_core.evaluate_invitation(
         params_json,
         inviter_did,

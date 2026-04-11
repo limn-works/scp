@@ -311,6 +311,15 @@ class EventLog:
         )
 
         bridge = _bridge()
+        # `filter_dict` is built locally above from explicit `is not None`
+        # checks on each filter argument. If no filters are set, the dict is
+        # legitimately empty and "no filters" is the only intended meaning,
+        # so collapsing `{}` to `None` here is the SAME signal: query all
+        # events. The bridge accepts both forms. This is NOT the same falsy
+        # bug as Optional collection parameters at the FFI boundary -- see
+        # context.py:trusted_dids and trust.py for the correct
+        # `is not None` pattern when empty and absent differ semantically.
+        # falsy-ok: locally built dict, empty == no filters == None
         raw_events = await asyncio.to_thread(
             bridge.event_log_query,
             self._context_id,

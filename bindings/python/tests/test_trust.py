@@ -912,3 +912,136 @@ class TestU64UpperBoundValidation:
         kwargs: dict[str, Any] = {"subject_did": "did:dht:zAlice", field_name: _U64_OVERFLOW}
         with pytest.raises(ValueError, match="must be <= 18446744073709551615"):
             ParticipationProfile(**kwargs)
+
+
+class TestAggregateTrustInputFalsy:
+    """H14 / M16 regression: aggregate_trust_input must distinguish
+    explicit empty collections from `None` for every Optional parameter.
+    Empty collections must serialize as `[]` / `{}`, never collapse to
+    the default branch.
+    """
+
+    @staticmethod
+    def _mock_bridge() -> MagicMock:
+        bridge = MagicMock()
+        bridge.aggregate_trust_input.return_value = "{}"
+        return bridge
+
+    def test_empty_consequence_rules_serializes_as_empty_array(self) -> None:
+        from scp_sdk.trust import aggregate_trust_input
+
+        bridge = self._mock_bridge()
+        with patch("scp_sdk.trust._bridge", return_value=bridge):
+            aggregate_trust_input(
+                context_id="ctx-1",
+                subject_did="did:dht:zAlice",
+                events=[],
+                merkle_root=[0] * 32,
+                consequence_rules=[],
+            )
+        # Positional args: context_id, subject_did, events_json,
+        # merkle_root_json, consequence_rules_json, threshold_json,
+        # attestor_sets_json, cached_attestations_json,
+        # challenge_results_json
+        call_args = bridge.aggregate_trust_input.call_args[0]
+        assert call_args[4] == "[]"
+
+    def test_none_consequence_rules_still_serializes_as_empty_array(self) -> None:
+        # `None` and absent both fall back to `[]` here -- the bridge
+        # needs SOMETHING to deserialize. The point of `is not None` is
+        # that an *explicit empty* list is not silently lost; this test
+        # documents that the None branch still produces a valid value.
+        from scp_sdk.trust import aggregate_trust_input
+
+        bridge = self._mock_bridge()
+        with patch("scp_sdk.trust._bridge", return_value=bridge):
+            aggregate_trust_input(
+                context_id="ctx-1",
+                subject_did="did:dht:zAlice",
+                events=[],
+                merkle_root=[0] * 32,
+                consequence_rules=None,
+            )
+        call_args = bridge.aggregate_trust_input.call_args[0]
+        assert call_args[4] == "[]"
+
+    def test_empty_threshold_requirements_serializes_as_empty_object(self) -> None:
+        from scp_sdk.trust import aggregate_trust_input
+
+        bridge = self._mock_bridge()
+        with patch("scp_sdk.trust._bridge", return_value=bridge):
+            aggregate_trust_input(
+                context_id="ctx-1",
+                subject_did="did:dht:zAlice",
+                events=[],
+                merkle_root=[0] * 32,
+                threshold_requirements={},
+            )
+        call_args = bridge.aggregate_trust_input.call_args[0]
+        assert call_args[5] == "{}"
+
+    def test_empty_attestor_sets_serializes_as_empty_object(self) -> None:
+        from scp_sdk.trust import aggregate_trust_input
+
+        bridge = self._mock_bridge()
+        with patch("scp_sdk.trust._bridge", return_value=bridge):
+            aggregate_trust_input(
+                context_id="ctx-1",
+                subject_did="did:dht:zAlice",
+                events=[],
+                merkle_root=[0] * 32,
+                attestor_sets={},
+            )
+        call_args = bridge.aggregate_trust_input.call_args[0]
+        assert call_args[6] == "{}"
+
+    def test_empty_cached_attestations_serializes_as_empty_array(self) -> None:
+        from scp_sdk.trust import aggregate_trust_input
+
+        bridge = self._mock_bridge()
+        with patch("scp_sdk.trust._bridge", return_value=bridge):
+            aggregate_trust_input(
+                context_id="ctx-1",
+                subject_did="did:dht:zAlice",
+                events=[],
+                merkle_root=[0] * 32,
+                cached_attestations=[],
+            )
+        call_args = bridge.aggregate_trust_input.call_args[0]
+        assert call_args[7] == "[]"
+
+    def test_empty_challenge_results_serializes_as_empty_array(self) -> None:
+        from scp_sdk.trust import aggregate_trust_input
+
+        bridge = self._mock_bridge()
+        with patch("scp_sdk.trust._bridge", return_value=bridge):
+            aggregate_trust_input(
+                context_id="ctx-1",
+                subject_did="did:dht:zAlice",
+                events=[],
+                merkle_root=[0] * 32,
+                challenge_results=[],
+            )
+        call_args = bridge.aggregate_trust_input.call_args[0]
+        assert call_args[8] == "[]"
+
+    def test_populated_inputs_round_trip(self) -> None:
+        import json as _json
+
+        from scp_sdk.trust import aggregate_trust_input
+
+        bridge = self._mock_bridge()
+        rules = [{"name": "rate-limit", "trigger": "velocity"}]
+        thresholds = {"WebAuthn": {"min_attestors": 2}}
+        with patch("scp_sdk.trust._bridge", return_value=bridge):
+            aggregate_trust_input(
+                context_id="ctx-1",
+                subject_did="did:dht:zAlice",
+                events=[],
+                merkle_root=[0] * 32,
+                consequence_rules=rules,
+                threshold_requirements=thresholds,
+            )
+        call_args = bridge.aggregate_trust_input.call_args[0]
+        assert _json.loads(call_args[4]) == rules
+        assert _json.loads(call_args[5]) == thresholds

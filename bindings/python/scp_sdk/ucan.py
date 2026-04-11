@@ -169,12 +169,16 @@ async def mint(
         ``creator_did`` and does not accept an explicit issuer parameter.
     """
     try:
+        # Distinguish "no proofs param provided" (None -- root token) from
+        # "explicit empty proof chain" (still root, but the caller asked for it).
+        # Use `is not None` so the FFI layer can ratchet the distinction later
+        # if needed; never the falsy form on Optional collections.
         bridge_token = await asyncio.to_thread(
             _scp_core.ucan_mint,
             context,
             audience,
             list(capabilities),
-            list(proofs) if proofs else None,
+            list(proofs) if proofs is not None else None,
         )
     except Exception as exc:
         raise UcanPermissionError(str(exc)) from exc

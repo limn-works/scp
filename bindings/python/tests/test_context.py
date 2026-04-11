@@ -320,6 +320,80 @@ class TestContextCreate:
         params = mock_bridge.py_context_create.call_args[0][1]
         assert params["consequence_config"] is None
 
+    async def test_create_accepts_empty_consequence_rules(self) -> None:
+        """H14 / M16 regression: an explicit empty consequence_rules list
+        must round-trip as `"[]"`, NOT collapse to None.  An empty rules
+        list declares "no rules apply", which is distinct from "no rules
+        configured -- use defaults" (None)."""
+        import json as _json
+
+        mock_bridge = MagicMock()
+        mock_bridge.py_context_create.return_value = _MockHandle()
+
+        with patch.dict("sys.modules", {"_scp_core": mock_bridge}):
+            await Context.create(
+                creator=_MockIdentity(),
+                ceiling=["messages:read"],
+                consequence_rules=[],
+            )
+
+        params = mock_bridge.py_context_create.call_args[0][1]
+        assert params["consequence_rules"] == _json.dumps([]), (
+            f"empty consequence_rules must serialize as `[]`, got {params['consequence_rules']!r}"
+        )
+
+    async def test_create_consequence_rules_none_default(self) -> None:
+        """When consequence_rules is None, the bridge param must also
+        be None so the bridge falls back to the protocol default."""
+        mock_bridge = MagicMock()
+        mock_bridge.py_context_create.return_value = _MockHandle()
+
+        with patch.dict("sys.modules", {"_scp_core": mock_bridge}):
+            await Context.create(
+                creator=_MockIdentity(),
+                ceiling=["messages:read"],
+            )
+
+        params = mock_bridge.py_context_create.call_args[0][1]
+        assert params["consequence_rules"] is None
+
+    async def test_create_accepts_empty_roles(self) -> None:
+        """H14: an explicit empty roles dict must round-trip to the
+        bridge as an empty dict, not be lost. The PyO3 bridge accepts
+        an empty HashMap; the SDK must not silently drop the param."""
+        mock_bridge = MagicMock()
+        mock_bridge.py_context_create.return_value = _MockHandle()
+
+        with patch.dict("sys.modules", {"_scp_core": mock_bridge}):
+            await Context.create(
+                creator=_MockIdentity(),
+                ceiling=["messages:read"],
+                roles={},
+            )
+
+        params = mock_bridge.py_context_create.call_args[0][1]
+        assert params["roles"] == {}, (
+            f"empty roles must round-trip as `{{}}`, got {params['roles']!r}"
+        )
+
+    async def test_create_accepts_empty_tools(self) -> None:
+        """H14: an explicit empty tools list must round-trip to the
+        bridge as an empty list, not be lost."""
+        mock_bridge = MagicMock()
+        mock_bridge.py_context_create.return_value = _MockHandle()
+
+        with patch.dict("sys.modules", {"_scp_core": mock_bridge}):
+            await Context.create(
+                creator=_MockIdentity(),
+                ceiling=["messages:read"],
+                tools=[],
+            )
+
+        params = mock_bridge.py_context_create.call_args[0][1]
+        assert params["tools"] == [], (
+            f"empty tools must round-trip as `[]`, got {params['tools']!r}"
+        )
+
     async def test_create_default_new_fields(self) -> None:
         mock_bridge = MagicMock()
         mock_bridge.py_context_create.return_value = _MockHandle()
@@ -1077,6 +1151,72 @@ class TestEvaluateInvitationSpending:
 
         call_args = mock_bridge.evaluate_invitation.call_args[0]
         assert call_args[4] is None
+
+    def test_evaluate_invitation_accepts_empty_trusted_dids(self) -> None:
+        """H14: trusted_dids=[] must round-trip as a JSON-encoded empty
+        array, NOT collapse to None. Empty list = "auto-reject everyone";
+        None = "no trusted-DID policy".  These are distinct policies
+        and the SDK must preserve the distinction at the FFI boundary.
+        """
+        mock_bridge = MagicMock()
+        mock_bridge.evaluate_invitation.return_value = "prompt_agent"
+
+        with patch.dict("sys.modules", {"_scp_core": mock_bridge}):
+            from scp_sdk.context import evaluate_invitation
+
+            evaluate_invitation(
+                params_json='{"ceiling":[]}',
+                inviter_did="did:dht:z6MkBob",
+                identity_did="did:dht:z6MkLocal",
+                trusted_dids=[],
+            )
+
+        call_args = mock_bridge.evaluate_invitation.call_args[0]
+        # trusted_dids_json is the 6th positional argument (index 5).
+        assert call_args[5] == "[]", (
+            f"empty trusted_dids must serialize as `[]`, got {call_args[5]!r}"
+        )
+
+    def test_evaluate_invitation_none_trusted_dids_passes_none(self) -> None:
+        """H14: trusted_dids=None must pass None to the bridge."""
+        mock_bridge = MagicMock()
+        mock_bridge.evaluate_invitation.return_value = "prompt_agent"
+
+        with patch.dict("sys.modules", {"_scp_core": mock_bridge}):
+            from scp_sdk.context import evaluate_invitation
+
+            evaluate_invitation(
+                params_json='{"ceiling":[]}',
+                inviter_did="did:dht:z6MkBob",
+                identity_did="did:dht:z6MkLocal",
+                trusted_dids=None,
+            )
+
+        call_args = mock_bridge.evaluate_invitation.call_args[0]
+        assert call_args[5] is None
+
+    def test_evaluate_invitation_populated_trusted_dids(self) -> None:
+        """H14: a populated trusted_dids list must serialize as JSON."""
+        import json as _json
+
+        mock_bridge = MagicMock()
+        mock_bridge.evaluate_invitation.return_value = "auto_accept"
+
+        with patch.dict("sys.modules", {"_scp_core": mock_bridge}):
+            from scp_sdk.context import evaluate_invitation
+
+            evaluate_invitation(
+                params_json='{"ceiling":[]}',
+                inviter_did="did:dht:z6MkBob",
+                identity_did="did:dht:z6MkLocal",
+                trusted_dids=["did:dht:z6MkBob", "did:dht:z6MkCarol"],
+            )
+
+        call_args = mock_bridge.evaluate_invitation.call_args[0]
+        assert _json.loads(call_args[5]) == [
+            "did:dht:z6MkBob",
+            "did:dht:z6MkCarol",
+        ]
 
 
 class TestConsequenceEventConversion:

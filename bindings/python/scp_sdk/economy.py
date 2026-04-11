@@ -58,7 +58,14 @@ def estimate_cost(
         Estimated cost (smallest currency unit), or ``None`` on overflow.
     """
     bridge = _bridge()
-    m = metrics or {}
+    # The bridge takes a non-Optional dict and defaults all observable metric
+    # keys to 0 internally, so `metrics={}` and `metrics=None` are
+    # observationally identical for this call. Normalise to `{}` rather than
+    # `is not None` because there is no semantic difference at the boundary;
+    # both branches produce the same Rust input. Do NOT generalise this
+    # pattern -- callers operating on Optional collections at FFI boundaries
+    # MUST use `is not None` (see context.py:trusted_dids and trust.py).
+    m = metrics if metrics is not None else {}
     return bridge.economy_estimate_cost(policy_json, action_type, m)
 
 
@@ -131,7 +138,10 @@ def evaluate_formula(formula_json: str, metrics: dict[str, int] | None = None) -
         Computed cost (smallest currency unit), or ``None`` on overflow.
     """
     bridge = _bridge()
-    m = metrics or {}
+    # See estimate_cost above: empty/None are observationally identical at
+    # the bridge but use `is not None` to keep the FFI-boundary discipline
+    # consistent across the SDK.
+    m = metrics if metrics is not None else {}
     return bridge.economy_evaluate_formula(formula_json, m)
 
 
