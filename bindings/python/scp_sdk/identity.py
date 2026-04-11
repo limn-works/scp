@@ -409,11 +409,13 @@ class Identity:
 
         import _scp_core
 
+        # Use `is not None` -- never the falsy form -- so callers can ratchet
+        # the empty-vs-absent distinction at the FFI boundary later if needed.
         result_json = await asyncio.to_thread(
             _scp_core.identity_execute_recovery,
             self.did,
             tier,
-            context_ids or [],
+            context_ids if context_ids is not None else [],
         )
         return json.loads(result_json)
 
@@ -448,11 +450,13 @@ class Identity:
 
         import _scp_core
 
+        # Use `is not None` -- never the falsy form -- so callers can ratchet
+        # the empty-vs-absent distinction at the FFI boundary later if needed.
         result_json = await asyncio.to_thread(
             _scp_core.identity_execute_custody_migration,
             self.did,
             target,
-            context_ids or [],
+            context_ids if context_ids is not None else [],
         )
         return json.loads(result_json)
 

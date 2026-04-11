@@ -277,6 +277,12 @@ jobs:
       - run: pip install ruff
       - run: ruff format --check .
       - run: ruff check .
+      # H14 / M16: enforce `is not None` over falsy checks on Optional
+      # collection parameters at the FFI boundary. Run from the repo root
+      # because the script resolves paths relative to its own location.
+      - name: Falsy-Optional check
+        working-directory: ${{ github.workspace }}
+        run: python3.12 scripts/check-python-falsy-optionals.py
 
   python-test:
     needs: changes
