@@ -648,6 +648,41 @@ impl ContextManager {
                 None
             };
 
+            // H11 split-phase nonce commit: `validate_spending_ucan_or_error`
+            // above only ran `check_replay` (read-only probe). The durable
+            // `record` happens here — AFTER the budget gate passes — so that
+            // budget-rejected requests cannot burn nonce tracker capacity
+            // (nonce-burn DoS). Mirror of the `enforce_economy` nonce-commit
+            // path in economy.rs.
+            //
+            // `deducted_cost.is_some()` implies `action_cost.0 > 0` which
+            // implies the `let Some(spending) = spending_ucan` guard above
+            // already passed (otherwise we returned early). Only evaluate
+            // when both conditions hold to avoid a redundant Some-unwrap.
+            if deducted_cost.is_some()
+                && let Some(spending) = spending_ucan
+                && let Err(e) = scp_protocol::crypto::ucan::spending::commit_spending_ucan_nonce(
+                    spending,
+                    &mut ctx.governance.spending_nonce_tracker,
+                )
+            {
+                // Nonce commit failed — reverse the budget deduction
+                // and roll back velocity + hard-rate-limit before
+                // surfacing the error.
+                if let Some(cost) = deducted_cost {
+                    ctx.governance
+                        .budget_tracker
+                        .reverse_spend(invoker_did, cost);
+                }
+                ctx.governance
+                    .velocity_tracker
+                    .rollback(invoker_did, velocity_token);
+                ctx.governance.hard_rate_limit.refund(invoker_did);
+                return Err(ContextError::PermissionDenied(format!(
+                    "SCP-ECON-12066: nonce commit failed after budget acceptance: {e}"
+                )));
+            }
+
             // Payment escrow (authorize hold). Must run under the lock
             // because the adapter call needs the per-context policy and
             // metrics snapshot we just computed; re-acquiring the lock

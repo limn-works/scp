@@ -1364,11 +1364,16 @@ pub(super) async fn setup_failing_capture_manager_with_context(
 
     let event_log = Arc::new(MockEventLogWithActorDid::default());
 
+    // C1b: spending UCANs on the send_message path are cryptographically
+    // validated. The mock_key_resolver resolves keys deterministically from
+    // the DID, matching dummy_spending_ucan_for's signing key — required for
+    // validate_spending_ucan_signed to pass the signature check.
     let manager = ContextManager::builder()
         .crypto(Box::new(MockCrypto::default()))
         .transport(Box::new(MockTransport::connected()))
         .event_log(Box::new(ArcEventLog(event_log.clone())))
         .payment_adapter(Arc::new(FailingCapturePaymentAdapter))
+        .key_resolver(mock_key_resolver())
         .build()
         .unwrap();
 

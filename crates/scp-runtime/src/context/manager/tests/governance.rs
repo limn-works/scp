@@ -16029,13 +16029,15 @@ async fn h10_import_context_resets_next_proposal_seq() {
         .await
         .expect("import must succeed");
 
-    // After import, `next_proposal_seq` MUST be reset to
-    // `approved_proposals.len() as u64` (= 2), NOT u64::MAX.
+    // After import, `next_proposal_seq` MUST be reset to 0. C3 wipes
+    // `approved_proposals` on import (security: prevents pre-loaded forged
+    // RemoveMember entries), so the seq is always reset to 0 — the len of
+    // the wiped (empty) map — NOT to the exporter's value or u64::MAX.
     let contexts = importer.contexts.lock().await;
     let ctx = contexts.get("h10-source-ctx").unwrap();
     assert_eq!(
-        ctx.governance.next_proposal_seq, 2,
-        "import_context must reset next_proposal_seq to approved_proposals.len(), \
+        ctx.governance.next_proposal_seq, 0,
+        "import_context must reset next_proposal_seq to 0 (C3 wipes approved_proposals), \
          not trust the exporter (got {})",
         ctx.governance.next_proposal_seq
     );

@@ -1757,7 +1757,7 @@ async fn tool_invoke_escalation_via_managed_wrapper() {
         Box::new(MockCrypto::default()),
         Box::new(MockTransport::connected()),
         Box::new(MockEventLog::default()),
-        noop_key_resolver(),
+        mock_key_resolver(),
     );
 
     let mut params = governance_params();
@@ -1791,10 +1791,10 @@ async fn tool_invoke_escalation_via_managed_wrapper() {
     let mut registry = ToolRegistry::new();
     registry.insert(test_tool_registration("echo"));
 
-    // Tool invoke path uses `check_tool_spending_capability` (cap-only),
-    // not `enforce_economy`, so the unsigned `dummy_spending_ucan()` is
-    // still accepted here. Tracked separately from C1.
-    let ucan = dummy_spending_ucan();
+    // C1b: spending UCANs on the tool-invoke path are now cryptographically
+    // validated (iss == actor_did + signature). Use a properly-signed token
+    // bound to the invoking DID so the C1b pipeline passes.
+    let ucan = dummy_spending_ucan_for(&"did:key:invoker".into());
 
     let before = {
         let contexts = manager.contexts.lock().await;
@@ -2054,7 +2054,7 @@ async fn tool_invoke_respects_hard_rate_limit() {
         Box::new(MockCrypto::default()),
         Box::new(MockTransport::connected()),
         Box::new(MockEventLog::default()),
-        noop_key_resolver(),
+        mock_key_resolver(),
     );
 
     let mut params = governance_params();
@@ -2083,21 +2083,23 @@ async fn tool_invoke_respects_hard_rate_limit() {
     // A spending UCAN is required because the default message pricing
     // gives `tool:invoke` a base cost of 1, even without a configured
     // economic policy (`derive_message_pricing` returns `spec_default`).
-    // This isolates the hard-rate-limit behavior from UCAN machinery.
-    //
-    // Tool invoke path uses `check_tool_spending_capability` (cap-only),
-    // not `enforce_economy`, so the unsigned helper still works here.
-    let ucan = dummy_spending_ucan();
+    // C1b: spending UCANs are cryptographically validated on the tool-invoke
+    // path; use a signed token bound to the invoking DID with mock_key_resolver.
+    // Each call generates a fresh UCAN so nonce replay does not interfere
+    // with the rate-limit assertion — the test verifies bucket exhaustion,
+    // not nonce semantics.
+    let spammer: DID = "did:key:spammer".into();
 
     // Burst of 10 should all succeed (default burst capacity).
     for i in 0..10u8 {
+        let ucan = dummy_spending_ucan_for(&spammer);
         let result = manager
             .invoke_tool_with_economy(
                 "tool-rl-ctx",
                 &registry,
                 &ToolId::from("echo"),
                 serde_json::json!({"n": i}),
-                &"did:key:spammer".into(),
+                &spammer,
                 Some(&ucan),
                 None,
                 |_input| async { Ok(serde_json::json!({})) },
@@ -2110,13 +2112,14 @@ async fn tool_invoke_respects_hard_rate_limit() {
     }
 
     // The 11th in the same tick should be rejected by the token bucket.
+    let ucan = dummy_spending_ucan_for(&spammer);
     let result = manager
         .invoke_tool_with_economy(
             "tool-rl-ctx",
             &registry,
             &ToolId::from("echo"),
             serde_json::json!({"n": 11}),
-            &"did:key:spammer".into(),
+            &spammer,
             Some(&ucan),
             None,
             |_input| async { Ok(serde_json::json!({})) },
@@ -2478,7 +2481,7 @@ async fn tool_invoke_output_validation_failure_voids_escrow_and_refunds_budget()
         Box::new(MockCrypto::default()),
         Box::new(MockTransport::connected()),
         Box::new(MockEventLog::default()),
-        noop_key_resolver(),
+        mock_key_resolver(),
     );
 
     // Wire the recording payment adapter so authorize/capture/void are
@@ -2519,7 +2522,8 @@ async fn tool_invoke_output_validation_failure_voids_escrow_and_refunds_budget()
     let mut registry = ToolRegistry::new();
     registry.insert(strict_output_tool_registration("strict-tool"));
 
-    let ucan = dummy_spending_ucan();
+    // C1b: use a properly-signed spending UCAN bound to the invoking DID.
+    let ucan = dummy_spending_ucan_for(&invoker);
 
     // Snapshot pre-invoke state.
     let (budget_before, velocity_before) = {
@@ -2663,7 +2667,7 @@ async fn tool_invoke_happy_path_captures_escrow_and_deducts_budget() {
         Box::new(MockCrypto::default()),
         Box::new(MockTransport::connected()),
         Box::new(MockEventLog::default()),
-        noop_key_resolver(),
+        mock_key_resolver(),
     );
 
     let adapter = RecordingPaymentAdapter::new();
@@ -2692,7 +2696,8 @@ async fn tool_invoke_happy_path_captures_escrow_and_deducts_budget() {
     let mut registry = ToolRegistry::new();
     registry.insert(strict_output_tool_registration("strict-tool"));
 
-    let ucan = dummy_spending_ucan();
+    // C1b: use a properly-signed spending UCAN bound to the invoking DID.
+    let ucan = dummy_spending_ucan_for(&invoker);
 
     let budget_before = {
         let contexts = manager.contexts.lock().await;
@@ -3110,7 +3115,8 @@ async fn capture_send_payment_failure_appends_event_log_entry() {
         setup_failing_capture_manager_with_context("h19-send-ctx", "did:key:sender").await;
 
     let sk = ed25519_dalek::SigningKey::from_bytes(&[1u8; 32]);
-    let ucan = dummy_spending_ucan();
+    // C1b: use a properly-signed spending UCAN bound to the sending DID.
+    let ucan = dummy_spending_ucan_for(&"did:key:sender".into());
 
     // send_message must succeed — capture failure must NOT fail the send.
     manager
@@ -3168,7 +3174,8 @@ async fn capture_send_payment_failure_still_delivers_message() {
         setup_failing_capture_manager_with_context("h19-send-del-ctx", "did:key:sender").await;
 
     let sk = ed25519_dalek::SigningKey::from_bytes(&[1u8; 32]);
-    let ucan = dummy_spending_ucan();
+    // C1b: use a properly-signed spending UCAN bound to the sending DID.
+    let ucan = dummy_spending_ucan_for(&"did:key:sender".into());
 
     let result = manager
         .send_message(
@@ -3231,11 +3238,14 @@ async fn capture_send_payment_success_no_failure_event() {
         }
     };
 
+    // C1b: spending UCANs are cryptographically validated on send_message.
+    // Wire mock_key_resolver so the Ed25519 signature check can pass.
     let manager = ContextManager::builder()
         .crypto(Box::new(MockCrypto::default()))
         .transport(Box::new(MockTransport::connected()))
         .event_log(Box::new(ArcEventLog(event_log.clone())))
         .payment_adapter(StdArc::new(NoOpPaymentAdapter))
+        .key_resolver(mock_key_resolver())
         .build()
         .unwrap();
 
@@ -3263,7 +3273,8 @@ async fn capture_send_payment_success_no_failure_event() {
     }
 
     let sk = ed25519_dalek::SigningKey::from_bytes(&[1u8; 32]);
-    let ucan = dummy_spending_ucan();
+    // C1b: use a properly-signed spending UCAN bound to the sending DID.
+    let ucan = dummy_spending_ucan_for(&"did:key:sender".into());
 
     manager
         .send_message(
