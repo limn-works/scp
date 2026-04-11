@@ -211,6 +211,10 @@ pub struct PyContextParams {
     /// Optional consequence rules as a JSON string (ADR-017, #1531).
     /// When `None`, defaults to an empty list (no consequences).
     consequence_rules: Option<String>,
+    /// Optional consequence config as a JSON string (ADR-017, #1531).
+    /// When `None`, defaults to `ConsequenceConfig::default()` (all severe
+    /// enforcement tiers gated to governance only).
+    consequence_config: Option<String>,
 }
 
 #[pymethods]
@@ -335,13 +339,21 @@ impl PyContextParams {
         self.consequence_rules.as_deref()
     }
 
+    /// Returns the consequence config as a JSON string, or `None` if the
+    /// context inherits the default config (ADR-017, #1531).
+    #[getter]
+    fn consequence_config(&self) -> Option<&str> {
+        self.consequence_config.as_deref()
+    }
+
     fn __repr__(&self) -> String {
         format!(
             "PyContextParams(ceiling={:?}, roles={:?}, tools={:?}, ttl={:?}, \
              memory_scope='{}', governance='{}', mode='{}', ceiling_policy='{}', \
              promotion_policy='{}', template_id={:?}, economic_policy={:?}, \
              min_protocol_version={:?}, max_chain_depth={:?}, \
-             max_nesting_depth={:?}, session_cap={:?})",
+             max_nesting_depth={:?}, session_cap={:?}, \
+             consequence_rules={:?}, consequence_config={:?})",
             self.ceiling,
             self.roles,
             self.tools,
@@ -357,6 +369,8 @@ impl PyContextParams {
             self.max_chain_depth,
             self.max_nesting_depth,
             self.session_cap,
+            self.consequence_rules,
+            self.consequence_config,
         )
     }
 }
@@ -564,6 +578,16 @@ impl PyContextParams {
             None => None,
         };
 
+        // consequence_config: Optional[str] (JSON string, default: None) -- ADR-017, #1531
+        let consequence_config: Option<String> = match dict.get_item("consequence_config")? {
+            Some(val) if val.is_none() => None,
+            Some(val) => {
+                let cc: String = val.extract()?;
+                Some(cc)
+            }
+            None => None,
+        };
+
         Ok(Self {
             ceiling,
             roles,
@@ -581,6 +605,7 @@ impl PyContextParams {
             max_nesting_depth,
             session_cap,
             consequence_rules,
+            consequence_config,
         })
     }
 }
@@ -1651,14 +1676,37 @@ fn build_core_context_params(
                 })
                 .transpose()?
                 .unwrap_or_default();
+            // Parse the per-context consequence config so RevokeAccess gating
+            // is enforced before the core constructs the context. The parsed
+            // value is consumed below in `consequence_config:` — re-parse for
+            // local validation here. Doing both reads is cheap (small JSON).
+            let local_config: scp_core::context::params::ConsequenceConfig = py_params
+                .consequence_config
+                .as_deref()
+                .map(|cc_json| {
+                    serde_json::from_str(cc_json).map_err(|e| {
+                        PyRuntimeError::new_err(format!("invalid consequence_config JSON: {e}"))
+                    })
+                })
+                .transpose()?
+                .unwrap_or_default();
             for rule in &parsed_consequence_rules {
-                rule.validate().map_err(|e| {
+                rule.validate_against_config(&local_config).map_err(|e| {
                     PyRuntimeError::new_err(format!("consequence_rules validation failed: {e}"))
                 })?;
             }
             parsed_consequence_rules
         },
-        consequence_config: scp_core::context::params::ConsequenceConfig::default(),
+        consequence_config: py_params
+            .consequence_config
+            .as_deref()
+            .map(|cc_json| {
+                serde_json::from_str(cc_json).map_err(|e| {
+                    PyRuntimeError::new_err(format!("invalid consequence_config JSON: {e}"))
+                })
+            })
+            .transpose()?
+            .unwrap_or_default(),
         sybil_policy: None,
     })
 }
@@ -4385,6 +4433,7 @@ mod tests {
             max_nesting_depth: None,
             session_cap: None,
             consequence_rules: None,
+            consequence_config: None,
         }
     }
 
@@ -5088,6 +5137,100 @@ mod tests {
         assert!(
             result.is_err(),
             "invalid consequence_rules JSON should be rejected"
+        );
+    }
+
+    /// C5: `PyContextParams` must accept a `consequence_config` JSON string
+    /// and thread it into the core `ContextParams` instead of always falling
+    /// back to `ConsequenceConfig::default()`.
+    #[test]
+    fn consequence_config_threaded_into_core_params() {
+        let p = PyContextParams {
+            consequence_config: Some(r#"{"allow_automatic_access_revocation":true}"#.to_owned()),
+            ..default_params()
+        };
+
+        let core_params = super::build_core_context_params(&p)
+            .expect("build_core_context_params should accept a valid consequence_config");
+
+        assert!(
+            core_params
+                .consequence_config
+                .allow_automatic_access_revocation,
+            "consequence_config.allow_automatic_access_revocation should round-trip true into core ContextParams"
+        );
+    }
+
+    /// C5: invalid `consequence_config` JSON must be rejected by
+    /// `build_core_context_params` with a clear error.
+    #[test]
+    fn consequence_config_invalid_json_rejected() {
+        let p = PyContextParams {
+            consequence_config: Some("not valid json".to_owned()),
+            ..default_params()
+        };
+
+        let result = super::build_core_context_params(&p);
+        assert!(
+            result.is_err(),
+            "invalid consequence_config JSON should be rejected at the bridge boundary"
+        );
+    }
+
+    /// C5: a `RevokeAccess` rule must be rejected by
+    /// `build_core_context_params` when the per-context config does not
+    /// opt in to `allow_automatic_access_revocation`.
+    #[test]
+    fn consequence_rules_revoke_access_rejected_without_config_opt_in() {
+        let bad_rules = r#"[{
+            "trigger": "MessageVelocity",
+            "action": { "Enforcement": { "RevokeAccess": {
+                "did": "did:dht:z6MkSubject",
+                "access": "Both"
+            } } },
+            "threshold": 5,
+            "window": { "secs": 60, "nanos": 0 }
+        }]"#;
+        let p = PyContextParams {
+            consequence_rules: Some(bad_rules.to_owned()),
+            // consequence_config left None -> default disallows RevokeAccess.
+            ..default_params()
+        };
+
+        let result = super::build_core_context_params(&p);
+        assert!(
+            result.is_err(),
+            "RevokeAccess rule must be rejected when consequence_config is missing or disallows it"
+        );
+    }
+
+    /// C5: a `RevokeAccess` rule must be accepted when the per-context
+    /// config opts into `allow_automatic_access_revocation`.
+    #[test]
+    fn consequence_rules_revoke_access_accepted_with_config_opt_in() {
+        let rules = r#"[{
+            "trigger": "MessageVelocity",
+            "action": { "Enforcement": { "RevokeAccess": {
+                "did": "did:dht:z6MkSubject",
+                "access": "Both"
+            } } },
+            "threshold": 5,
+            "window": { "secs": 3600, "nanos": 0 }
+        }]"#;
+        let config = r#"{"allow_automatic_access_revocation":true}"#;
+        let p = PyContextParams {
+            consequence_rules: Some(rules.to_owned()),
+            consequence_config: Some(config.to_owned()),
+            ..default_params()
+        };
+
+        let core_params = super::build_core_context_params(&p)
+            .expect("RevokeAccess rule should be accepted when config opts in");
+        assert_eq!(core_params.consequence_rules.len(), 1);
+        assert!(
+            core_params
+                .consequence_config
+                .allow_automatic_access_revocation
         );
     }
 

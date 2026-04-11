@@ -497,6 +497,8 @@ class StubEventContextBindings : EventContextBindings {
     override fun contextCreate(
         identityHandle: Long,
         paramsJson: String,
+        consequenceRulesJson: String?,
+        consequenceConfigJson: String?,
     ): Long = contextCreateResult
 
     override fun contextJoin(

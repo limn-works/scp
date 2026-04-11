@@ -99,6 +99,42 @@ class CoroutineBridgeTest {
                 assertEquals(10L, result)
             }
 
+        // C5: contextCreate must accept and forward consequenceRulesJson and
+        // consequenceConfigJson to the bridge so the per-context opt-in for
+        // RevokeAccess flows through to the manager (ADR-017, #1531).
+        @Test
+        fun `contextCreate forwards consequenceRulesJson and consequenceConfigJson`() =
+            runTest(ioDispatcher) {
+                stubBindings.contextCreateResult = 11L
+                val rules =
+                    """[{"trigger":"MessageVelocity","action":{"Enforcement":"SuspendAccess"},""" +
+                        """"threshold":5,"window":{"secs":3600,"nanos":0}}]"""
+                val config = """{"allow_automatic_access_revocation":true}"""
+                val result =
+                    bridge.context.create(
+                        identityHandle = 1L,
+                        paramsJson = """{"ceiling":["read"]}""",
+                        consequenceRulesJson = rules,
+                        consequenceConfigJson = config,
+                    )
+                assertEquals(11L, result)
+                assertEquals(rules, stubBindings.lastConsequenceRulesJson)
+                assertEquals(config, stubBindings.lastConsequenceConfigJson)
+            }
+
+        // C5: when both consequence params are null, the stub captures null
+        // for both — proves the historical default path still works.
+        @Test
+        fun `contextCreate with null consequence params yields null on stub`() =
+            runTest(ioDispatcher) {
+                stubBindings.contextCreateResult = 12L
+                stubBindings.lastConsequenceRulesJson = "preset"
+                stubBindings.lastConsequenceConfigJson = "preset"
+                bridge.context.create(1L, """{"ceiling":["read"]}""")
+                assertEquals(null, stubBindings.lastConsequenceRulesJson)
+                assertEquals(null, stubBindings.lastConsequenceConfigJson)
+            }
+
         @Test
         fun `contextJoin dispatches on IO`() =
             runTest(ioDispatcher) {
@@ -776,6 +812,8 @@ class StubNativeBindings : NativeBindings {
     var identityResolveResult = ""
     var contextCreateResult = 0L
     var contextSubscribeResult = 0L
+    var lastConsequenceRulesJson: String? = null
+    var lastConsequenceConfigJson: String? = null
     var toolRegisterResult = ""
     var toolInvokeResult = ""
     var toolVerifyResult = """{"tool_id":"stub","passed":true,"failures":[]}"""
@@ -808,7 +846,13 @@ class StubNativeBindings : NativeBindings {
     override fun contextCreate(
         identityHandle: Long,
         paramsJson: String,
-    ): Long = contextCreateResult
+        consequenceRulesJson: String?,
+        consequenceConfigJson: String?,
+    ): Long {
+        lastConsequenceRulesJson = consequenceRulesJson
+        lastConsequenceConfigJson = consequenceConfigJson
+        return contextCreateResult
+    }
 
     override fun contextJoin(
         contextHandle: Long,

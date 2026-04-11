@@ -102,7 +102,9 @@ private func makeTestParams(
         maxChainDepth: nil,
         maxNestingDepth: nil,
         sessionCap: nil,
-        economicPolicy: nil
+        economicPolicy: nil,
+        consequenceRulesJson: nil,
+        consequenceConfigJson: nil
     )
 }
 

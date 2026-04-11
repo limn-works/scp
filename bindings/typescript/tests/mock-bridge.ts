@@ -67,6 +67,10 @@ interface MockContext {
   broadcastBlockedSubscribers: Set<string>;
   broadcastAdmission: BroadcastAdmissionPolicy | null;
   sessions: Map<string, MockSession>;
+  /** Raw paramsJson string passed to contextCreate (for SDK round-trip tests). */
+  rawParamsJson: string;
+  /** Last spendingUcanJwt passed to contextJoin (for SDK round-trip tests). */
+  lastJoinSpendingUcanJwt?: string | null;
 }
 
 interface MockTransport {
@@ -254,6 +258,7 @@ export function createMockBridge(): Bridge & {
         broadcastBlockedSubscribers: new Set(),
         broadcastAdmission: mode === "Broadcast" ? "Open" : null,
         sessions: new Map(),
+        rawParamsJson: paramsJson,
       };
 
       // Record ContextCreated event
@@ -274,9 +279,10 @@ export function createMockBridge(): Bridge & {
     async contextJoin(
       handle: BridgeContextHandle,
       identityDid: string,
-      _spendingUcanJwt?: string | null,
+      spendingUcanJwt?: string | null,
     ): Promise<void> {
       const ctx = getContext(handle);
+      ctx.lastJoinSpendingUcanJwt = spendingUcanJwt ?? null;
       ctx.members.add(identityDid);
       const joinedEvent: Event = {
         eventType: "MemberJoined",
@@ -958,6 +964,7 @@ export function createMockBridge(): Bridge & {
         broadcastBlockedSubscribers: new Set(snapshot.broadcast_blocked_subscribers ?? []),
         broadcastAdmission: snapshot.broadcast_admission ?? (mode === "Broadcast" ? "Open" : null),
         sessions: new Map(),
+        rawParamsJson: "",
       };
       const importedEvent: Event = {
         eventType: "ContextImported",

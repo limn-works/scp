@@ -2197,3 +2197,66 @@ context 'ctx-paid' has an economic policy requiring payment",
     expect(captured).toBeInstanceOf(WasmCannotValidateSpendingUcan);
   });
 });
+
+// C5: SDK Context.create — consequenceConfig parameter parity
+// ---------------------------------------------------------------------------
+
+describe("Context.create consequenceConfig parameter (C5 / SDK round-trip)", () => {
+  it("forwards consequenceConfig to the bridge as a JSON string field", async () => {
+    _setBridge(mockBridge);
+    const { Identity } = await import("../src/identity");
+    const { Context } = await import("../src/context");
+
+    const identity = await Identity.create({ custody: "in_memory" });
+    const ctx = await Context.create(identity, {
+      ceiling: ["messages:read"],
+      consequenceConfig: { allow_automatic_access_revocation: true },
+    });
+    expect(ctx).toBeDefined();
+
+    const stored = mockBridge._contexts.get(ctx.contextId);
+    expect(stored).toBeDefined();
+    const parsed = JSON.parse(stored?.rawParamsJson ?? "{}") as {
+      consequenceConfig?: string;
+    };
+    expect(parsed.consequenceConfig).toBeDefined();
+    const inner = JSON.parse(parsed.consequenceConfig ?? "{}") as {
+      allow_automatic_access_revocation?: boolean;
+    };
+    expect(inner.allow_automatic_access_revocation).toBe(true);
+  });
+
+  it("omits consequenceConfig when caller does not provide one", async () => {
+    _setBridge(mockBridge);
+    const { Identity } = await import("../src/identity");
+    const { Context } = await import("../src/context");
+
+    const identity = await Identity.create({ custody: "in_memory" });
+    const ctx = await Context.create(identity, {
+      ceiling: ["messages:read"],
+    });
+
+    const stored = mockBridge._contexts.get(ctx.contextId);
+    const parsed = JSON.parse(stored?.rawParamsJson ?? "{}") as {
+      consequenceConfig?: string;
+    };
+    expect(parsed.consequenceConfig).toBeUndefined();
+  });
+
+  it("forwards spendingUcanJwt to the bridge on Context.join", async () => {
+    _setBridge(mockBridge);
+    const { Identity } = await import("../src/identity");
+    const { Context } = await import("../src/context");
+
+    const creator = await Identity.create({ custody: "in_memory" });
+    const joiner = await Identity.create({ custody: "in_memory" });
+    const ctx = await Context.create(creator, {
+      ceiling: ["messages:read"],
+    });
+
+    await ctx.join(joiner, "synthetic.spending.jwt");
+
+    const stored = mockBridge._contexts.get(ctx.contextId);
+    expect(stored?.lastJoinSpendingUcanJwt).toBe("synthetic.spending.jwt");
+  });
+});

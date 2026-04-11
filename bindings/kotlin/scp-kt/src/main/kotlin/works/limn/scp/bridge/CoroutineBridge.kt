@@ -186,6 +186,8 @@ interface ContextBindings {
     fun contextCreate(
         identityHandle: Long,
         paramsJson: String,
+        consequenceRulesJson: String? = null,
+        consequenceConfigJson: String? = null,
     ): Long
 
     /**
@@ -1477,12 +1479,30 @@ class ContextBridge internal constructor(
      *
      * @param identityHandle Handle from identity create or load.
      * @param paramsJson JSON-encoded context parameters.
+     * @param consequenceRulesJson Optional JSON-encoded array of consequence
+     *   rules (ADR-017, #1531). When non-null, parsed by the bridge into the
+     *   stored `ContextParams.consequence_rules`.
+     * @param consequenceConfigJson Optional JSON-encoded
+     *   `ConsequenceConfig` document (ADR-017, #1531). When non-null, parsed
+     *   by the bridge into the stored `ContextParams.consequence_config`.
+     *   Defaults to the protocol default
+     *   (`allow_automatic_access_revocation = false`) when omitted.
      * @return Opaque context handle.
      */
     suspend fun create(
         identityHandle: Long,
         paramsJson: String,
-    ): Long = bridge.ffiCall { bindings.contextCreate(identityHandle, paramsJson) }
+        consequenceRulesJson: String? = null,
+        consequenceConfigJson: String? = null,
+    ): Long =
+        bridge.ffiCall {
+            bindings.contextCreate(
+                identityHandle,
+                paramsJson,
+                consequenceRulesJson,
+                consequenceConfigJson,
+            )
+        }
 
     /**
      * Join an existing context.

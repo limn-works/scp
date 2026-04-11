@@ -358,6 +358,9 @@ export class Context implements AsyncDisposable {
         consequenceRules: params.consequenceRules
           ? JSON.stringify(params.consequenceRules)
           : undefined,
+        consequenceConfig: params.consequenceConfig
+          ? JSON.stringify(params.consequenceConfig)
+          : undefined,
       });
 
       const handle = await bridge.contextCreate(identity._handle, paramsJson);

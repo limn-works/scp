@@ -3002,6 +3002,23 @@ public struct ContextParams {
      * `None` means no economic policy (free context).
      */
     public var economicPolicy: String?
+    /**
+     * Optional consequence rules as a JSON-encoded array (ADR-017, #1531).
+     * `None` means no consequence rules.
+     *
+     * Stored as a JSON string rather than a typed Record to avoid extending
+     * the UDL surface with the full `ConsequenceRule` type tree (mirrors the
+     * `aggregate_trust_input` JSON-string pattern). The string is parsed
+     * inside `bridge_params_to_core` and validated against
+     * `consequence_config_json` before the manager is called.
+     */
+    public var consequenceRulesJson: String?
+    /**
+     * Optional consequence config as a JSON-encoded object (ADR-017, #1531).
+     * `None` means the default config (severe enforcement tiers gated to
+     * governance only).
+     */
+    public var consequenceConfigJson: String?
 
     // Default memberwise initializers are never public by default, so we
     // declare one manually.
@@ -3051,6 +3068,22 @@ public struct ContextParams {
          * Optional economic policy as a JSON string (spec §19, ADR-033).
          * `None` means no economic policy (free context).
          */economicPolicy: String?) {
+         */economicPolicy: String?, 
+        /**
+         * Optional consequence rules as a JSON-encoded array (ADR-017, #1531).
+         * `None` means no consequence rules.
+         *
+         * Stored as a JSON string rather than a typed Record to avoid extending
+         * the UDL surface with the full `ConsequenceRule` type tree (mirrors the
+         * `aggregate_trust_input` JSON-string pattern). The string is parsed
+         * inside `bridge_params_to_core` and validated against
+         * `consequence_config_json` before the manager is called.
+         */consequenceRulesJson: String?, 
+        /**
+         * Optional consequence config as a JSON-encoded object (ADR-017, #1531).
+         * `None` means the default config (severe enforcement tiers gated to
+         * governance only).
+         */consequenceConfigJson: String?) {
         self.mode = mode
         self.ceiling = ceiling
         self.ceilingPolicy = ceilingPolicy
@@ -3063,6 +3096,8 @@ public struct ContextParams {
         self.maxNestingDepth = maxNestingDepth
         self.sessionCap = sessionCap
         self.economicPolicy = economicPolicy
+        self.consequenceRulesJson = consequenceRulesJson
+        self.consequenceConfigJson = consequenceConfigJson
     }
 }
 
@@ -3109,6 +3144,21 @@ extension ContextParams: Equatable, Hashable {
         if lhs.economicPolicy != rhs.economicPolicy {
             return false
         }
+        if lhs.maxNestingDepth != rhs.maxNestingDepth {
+            return false
+        }
+        if lhs.sessionCap != rhs.sessionCap {
+            return false
+        }
+        if lhs.economicPolicy != rhs.economicPolicy {
+            return false
+        }
+        if lhs.consequenceRulesJson != rhs.consequenceRulesJson {
+            return false
+        }
+        if lhs.consequenceConfigJson != rhs.consequenceConfigJson {
+            return false
+        }
         return true
     }
 
@@ -3125,6 +3175,8 @@ extension ContextParams: Equatable, Hashable {
         hasher.combine(maxNestingDepth)
         hasher.combine(sessionCap)
         hasher.combine(economicPolicy)
+        hasher.combine(consequenceRulesJson)
+        hasher.combine(consequenceConfigJson)
     }
 }
 
@@ -3149,6 +3201,9 @@ public struct FfiConverterTypeContextParams: FfiConverterRustBuffer {
                 maxNestingDepth: FfiConverterOptionUInt32.read(from: &buf), 
                 sessionCap: FfiConverterOptionUInt32.read(from: &buf), 
                 economicPolicy: FfiConverterOptionString.read(from: &buf)
+                economicPolicy: FfiConverterOptionString.read(from: &buf), 
+                consequenceRulesJson: FfiConverterOptionString.read(from: &buf), 
+                consequenceConfigJson: FfiConverterOptionString.read(from: &buf)
         )
     }
 
@@ -3165,6 +3220,8 @@ public struct FfiConverterTypeContextParams: FfiConverterRustBuffer {
         FfiConverterOptionUInt32.write(value.maxNestingDepth, into: &buf)
         FfiConverterOptionUInt32.write(value.sessionCap, into: &buf)
         FfiConverterOptionString.write(value.economicPolicy, into: &buf)
+        FfiConverterOptionString.write(value.consequenceRulesJson, into: &buf)
+        FfiConverterOptionString.write(value.consequenceConfigJson, into: &buf)
     }
 }
 
@@ -9455,13 +9512,19 @@ public func contextIsMember(handle: ContextHandle, did: String)async  -> Bool  {
  *
  * * `handle` — The context to join.
  * * `identity` — The identity joining the context.
+ * * `spending_ucan_jwt` — Optional encoded UCAN JWT authorising the join
+ * cost. Forwarded to the manager for AND-composition with the context's
+ * per-join economic policy (spec §19, ADR-033).
  *
  * # Errors
  *
  * Returns `ScpError::Context` if the context is not in active state or
- * if the join operation fails (key package, MLS add, event log).
+ * if the join operation fails (key package, MLS add, event log). Returns
+ * `ScpError::Context` with code `SCP-ECON-12061` if `spending_ucan_jwt` is
+ * not a valid UCAN JWT.
  */
 public func contextJoin(handle: ContextHandle, identity: Identity)async throws   {
+public func contextJoin(handle: ContextHandle, identity: Identity, spendingUcanJwt: String?)async throws   {
     return
         try  await uniffiRustCallAsync(
             rustFutureFunc: {
@@ -12621,7 +12684,7 @@ private let initializationResult: InitializationResult = {
     if (uniffi_scp_ffi_uniffi_checksum_func_context_is_member() != 64785) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_scp_ffi_uniffi_checksum_func_context_join() != 63640) {
+    if (uniffi_scp_ffi_uniffi_checksum_func_context_join() != 30234) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_scp_ffi_uniffi_checksum_func_context_leave() != 33485) {

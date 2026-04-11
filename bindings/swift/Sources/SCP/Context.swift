@@ -593,6 +593,37 @@ public actor Context {
         streamContinuation?.finish()
         streamContinuation = nil
     }
+
+    /// Adds another identity to this context as a member.
+    ///
+    /// Convenience instance method that mirrors the free
+    /// ``joinContext(handle:identity:spendingUcanJwt:joinFn:)`` function while
+    /// keeping the call site close to the `Context` actor that owns the
+    /// handle. Delegates to the injected ``ContextBridge/JoinFn`` so tests
+    /// can stub it without requiring the live UniFFI binding.
+    ///
+    /// - Parameters:
+    ///   - identity: The ``Identity`` joining the context.
+    ///   - spendingUcanJwt: Optional encoded UCAN JWT authorising the join
+    ///     cost (spec §19, ADR-033). Forwarded to the manager for
+    ///     AND-composition with any per-join economic policy.
+    ///   - joinFn: Bridge function override for testing. Defaults to
+    ///     ``ContextBridge/defaultJoin``.
+    /// - Throws: ``ScpError/Context(msg:code:)`` if the context is not in
+    ///   active state, or if the bridge join operation fails.
+    public func join(
+        _ identity: Identity,
+        spendingUcanJwt: String? = nil,
+        joinFn: ContextBridge.JoinFn = ContextBridge.defaultJoin
+    ) async throws {
+        guard state == .active else {
+            throw ScpError.Context(
+                msg: "Context is not active",
+                code: "SCP-CTX-2013"
+            )
+        }
+        try await joinFn(handle, identity, spendingUcanJwt)
+    }
 }
 
 // MARK: - Context Join (free function)
