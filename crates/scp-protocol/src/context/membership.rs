@@ -690,6 +690,58 @@ pub enum ContextEvent {
         /// Whether the enforcement was successfully applied.
         success: bool,
     },
+    /// An MLS Commit broadcast attempt failed and the commit has been
+    /// enqueued for persistent retry (PR #1606 C6).
+    ///
+    /// Emitted by `execute_remove_member`, `execute_rotate_content_keys`,
+    /// `execute_reset_member`, and `leave_context` when the post-MLS
+    /// `transport.send_message` call fails. The commit is durably queued in
+    /// `PerContextState::pending_commits` and will be retried by the
+    /// governance timeout task with exponential backoff.
+    ///
+    /// SDK consumers SHOULD surface this to the application layer because the
+    /// local state mutation (member removed, key rotated) has happened but
+    /// remote members will not advance their MLS epoch until the commit
+    /// successfully reaches the relay.
+    CommitBroadcastPending {
+        /// Human-readable label for the operation that produced the commit
+        /// (e.g., `"RemoveMember"`, `"RotateContentKeys"`, `"ResetMember"`,
+        /// `"LeaveContext"`).
+        operation: String,
+        /// Human-readable transport error from the failed send attempt.
+        error: String,
+        /// 1-based attempt count after this failure (i.e., 1 on first failure).
+        attempt: u32,
+    },
+    /// A previously enqueued MLS Commit was successfully delivered on a retry
+    /// and dequeued from `pending_commits` (PR #1606 C6).
+    ///
+    /// Emitted by the governance timeout task's commit retry phase after a
+    /// successful `transport.send_message`.
+    CommitBroadcastSucceeded {
+        /// Human-readable label for the operation that produced the commit.
+        operation: String,
+        /// Total number of send attempts (including the successful one).
+        attempts: u32,
+    },
+    /// An MLS Commit broadcast exceeded `MAX_COMMIT_RETRIES` or `MAX_COMMIT_AGE_SECS`
+    /// and the context has been placed in fault-marker fail-close state
+    /// (PR #1606 C6).
+    ///
+    /// Once this event fires, subsequent context-mutating operations on the
+    /// context will return `ContextError::CommitBroadcastFault` until an
+    /// operator clears the marker via
+    /// [`super::super::ContextManager::acknowledge_commit_fault`].
+    /// SDK consumers MUST surface this prominently — local state has
+    /// permanently diverged from any peers that never received the commit.
+    CommitBroadcastFailed {
+        /// Human-readable label for the operation that produced the commit.
+        operation: String,
+        /// Final transport error returned by the last attempt, or `"max age exceeded"`.
+        reason: String,
+        /// Total attempt count.
+        attempts: u32,
+    },
 }
 
 // ---------------------------------------------------------------------------

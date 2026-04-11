@@ -357,6 +357,12 @@ fn strip_snapshot_for_public(snapshot: &ContextSnapshot) -> ContextSnapshot {
         // to a joiner and could leak activity patterns. Always empty
         // in public scope.
         spending_nonce_tracker_state: HashMap::new(),
+        // PR #1606 C6: pending commits and the fail-close marker are
+        // strictly local node state. They reference the local MLS group
+        // and have no meaning to a public observer. Always empty in
+        // public scope.
+        pending_commits: std::collections::VecDeque::new(),
+        commit_fault: None,
     }
 }
 
@@ -474,6 +480,8 @@ mod tests {
             hard_rate_limit_config: None,
             hard_rate_limit_state: std::collections::HashMap::new(),
             spending_nonce_tracker_state: std::collections::HashMap::new(),
+            pending_commits: std::collections::VecDeque::new(),
+            commit_fault: None,
         }
     }
 

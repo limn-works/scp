@@ -7,6 +7,7 @@ use scp_protocol::context::{ContextMode, ContextState};
 use scp_protocol::crypto::ucan::UcanToken;
 
 mod broadcast;
+mod commit_retry;
 mod governance;
 mod lifecycle;
 mod messaging;
@@ -246,7 +247,13 @@ impl ContextCryptoProvider for MockCrypto {
             .lock()
             .unwrap()
             .push(("remove_member".to_owned(), member_did.to_owned()));
-        Ok(scp_protocol::context::builder::RemoveMemberOutput::default())
+        // Return a non-empty stub commit so the broadcast retry path
+        // (PR #1606 C6 helpers) is exercised by the manager. Production
+        // MLS providers always return non-empty `commit_bytes` here.
+        Ok(scp_protocol::context::builder::RemoveMemberOutput {
+            commit_bytes: vec![0xC0, 0x6E, 0x57],
+            group_info_bytes: Vec::new(),
+        })
     }
 
     fn distribute_sender_key(
@@ -341,7 +348,11 @@ impl ContextCryptoProvider for MockCrypto {
             .lock()
             .unwrap()
             .push(*context_id);
-        Ok(scp_protocol::context::builder::AdvanceEpochOutput::default())
+        // Return a non-empty stub commit so the broadcast retry path
+        // (PR #1606 C6 helpers) is exercised by the manager.
+        Ok(scp_protocol::context::builder::AdvanceEpochOutput {
+            commit_bytes: vec![0xEA, 0xC0, 0x06],
+        })
     }
 }
 
@@ -585,6 +596,96 @@ impl ContextTransportProvider for FailingTransport {
         Err(ContextError::TransportFailed(
             "mock transport failure".into(),
         ))
+    }
+}
+
+/// Configurable transport mock used by PR #1606 C6 commit retry tests.
+///
+/// Each `send_message` call increments a counter and returns either an error
+/// or `Ok` based on the remaining `fail_count`. Setting `fail_count = 0`
+/// makes the transport always succeed; setting `fail_count = u32::MAX` makes
+/// it always fail; any positive value fails that many times then succeeds.
+pub(super) struct RetriableMockTransport {
+    pub(super) fail_count: std::sync::atomic::AtomicU32,
+    pub(super) total_calls: std::sync::atomic::AtomicU32,
+    pub(super) last_payload: std::sync::Mutex<Vec<u8>>,
+}
+
+impl Default for RetriableMockTransport {
+    fn default() -> Self {
+        Self {
+            fail_count: std::sync::atomic::AtomicU32::new(0),
+            total_calls: std::sync::atomic::AtomicU32::new(0),
+            last_payload: std::sync::Mutex::new(Vec::new()),
+        }
+    }
+}
+
+impl ContextTransportProvider for RetriableMockTransport {
+    fn is_connected(&self) -> bool {
+        true
+    }
+
+    fn publish_context(
+        &self,
+        _id: &[u8; 32],
+        _params: &ContextParams,
+    ) -> Result<(), ContextCreationError> {
+        Ok(())
+    }
+
+    fn delete_published(&self, _id: &[u8; 32]) -> Result<(), ContextCreationError> {
+        Ok(())
+    }
+
+    fn send_message(
+        &self,
+        _context_id: &[u8; 32],
+        encrypted_payload: &[u8],
+    ) -> Result<(), ContextError> {
+        self.total_calls.fetch_add(1, Ordering::Relaxed);
+        let remaining = self.fail_count.load(Ordering::Relaxed);
+        if remaining > 0 {
+            // Decrement only if not at sentinel u32::MAX (always-fail).
+            if remaining != u32::MAX {
+                self.fail_count.store(remaining - 1, Ordering::Relaxed);
+            }
+            return Err(ContextError::TransportFailed(format!(
+                "retriable mock failure (remaining={remaining})"
+            )));
+        }
+        *self.last_payload.lock().unwrap() = encrypted_payload.to_vec();
+        Ok(())
+    }
+}
+
+/// Wrapper that delegates to an `Arc<RetriableMockTransport>` so tests can
+/// reach in and tweak `fail_count` after the manager has been constructed.
+pub(super) struct ArcRetriableTransport(pub(super) std::sync::Arc<RetriableMockTransport>);
+
+impl ContextTransportProvider for ArcRetriableTransport {
+    fn is_connected(&self) -> bool {
+        self.0.is_connected()
+    }
+
+    fn publish_context(
+        &self,
+        id: &[u8; 32],
+        params: &ContextParams,
+    ) -> Result<(), ContextCreationError> {
+        self.0.publish_context(id, params)
+    }
+
+    fn delete_published(&self, id: &[u8; 32]) -> Result<(), ContextCreationError> {
+        self.0.delete_published(id)
+    }
+
+    fn send_message(
+        &self,
+        context_id: &[u8; 32],
+        encrypted_payload: &[u8],
+    ) -> Result<(), ContextError> {
+        self.0.send_message(context_id, encrypted_payload)
     }
 }
 

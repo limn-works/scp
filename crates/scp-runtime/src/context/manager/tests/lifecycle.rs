@@ -768,6 +768,8 @@ async fn persist_drop_restore_roundtrip() {
         hard_rate_limit_config: None,
         hard_rate_limit_state: std::collections::HashMap::new(),
         spending_nonce_tracker_state: std::collections::HashMap::new(),
+        pending_commits: std::collections::VecDeque::new(),
+        commit_fault: None,
     };
 
     let bc_snapshot = test_broadcast_snapshot("persist-ctx-2");
@@ -888,6 +890,8 @@ async fn restore_preserves_executed_proposals() {
         hard_rate_limit_config: None,
         hard_rate_limit_state: std::collections::HashMap::new(),
         spending_nonce_tracker_state: std::collections::HashMap::new(),
+        pending_commits: std::collections::VecDeque::new(),
+        commit_fault: None,
     };
 
     persistence
@@ -996,6 +1000,8 @@ async fn restore_respawns_ttl_timer() {
         hard_rate_limit_config: None,
         hard_rate_limit_state: std::collections::HashMap::new(),
         spending_nonce_tracker_state: std::collections::HashMap::new(),
+        pending_commits: std::collections::VecDeque::new(),
+        commit_fault: None,
     };
 
     persistence.persist_context("ttl-ctx", &snapshot).unwrap();
@@ -1083,6 +1089,8 @@ async fn restore_all_contexts_restores_persisted() {
             hard_rate_limit_config: None,
             hard_rate_limit_state: std::collections::HashMap::new(),
             spending_nonce_tracker_state: std::collections::HashMap::new(),
+            pending_commits: std::collections::VecDeque::new(),
+            commit_fault: None,
         };
         persistence.persist_context(ctx_name, &snapshot).unwrap();
     }
@@ -1169,6 +1177,8 @@ async fn restore_context_rejects_duplicate() {
         hard_rate_limit_config: None,
         hard_rate_limit_state: std::collections::HashMap::new(),
         spending_nonce_tracker_state: std::collections::HashMap::new(),
+        pending_commits: std::collections::VecDeque::new(),
+        commit_fault: None,
     };
 
     let bc_snapshot = test_broadcast_snapshot("dup-ctx");
@@ -1277,6 +1287,8 @@ async fn restore_context_sets_needs_reconnect_on_grace_inconsistency() {
         hard_rate_limit_config: None,
         hard_rate_limit_state: std::collections::HashMap::new(),
         spending_nonce_tracker_state: std::collections::HashMap::new(),
+        pending_commits: std::collections::VecDeque::new(),
+        commit_fault: None,
     };
 
     let bc_snapshot = test_broadcast_snapshot("grace-incon-ctx");
@@ -1392,6 +1404,8 @@ async fn restore_context_no_reconnect_when_grace_consistent() {
         hard_rate_limit_config: None,
         hard_rate_limit_state: std::collections::HashMap::new(),
         spending_nonce_tracker_state: std::collections::HashMap::new(),
+        pending_commits: std::collections::VecDeque::new(),
+        commit_fault: None,
     };
 
     let bc_snapshot = test_broadcast_snapshot("grace-ok-ctx");
@@ -1522,6 +1536,8 @@ async fn restore_preserves_spending_nonce_tracker_across_restart() {
         hard_rate_limit_config: None,
         hard_rate_limit_state: std::collections::HashMap::new(),
         spending_nonce_tracker_state,
+        pending_commits: std::collections::VecDeque::new(),
+        commit_fault: None,
     };
 
     persistence
@@ -1650,6 +1666,8 @@ fn reconnect_test_snapshot(
         hard_rate_limit_config: None,
         hard_rate_limit_state: std::collections::HashMap::new(),
         spending_nonce_tracker_state: std::collections::HashMap::new(),
+        pending_commits: std::collections::VecDeque::new(),
+        commit_fault: None,
     }
 }
 

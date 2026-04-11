@@ -1,16 +1,18 @@
 //! Context lifecycle: create, join, leave, restore, export, import.
 
+use std::collections::VecDeque;
+
 use super::{
     AccessControlState, Arc, BroadcastAdmission, BroadcastContext, Capability, CapabilityCeiling,
-    ContextCreationError, ContextError, ContextEvent, ContextHandle, ContextManager, ContextMode,
-    ContextParams, ContextRoleState, ContextSnapshot, ContextState, DID, DeadlockDetectionState,
-    EpochCoordinator, EpochState, GovernanceModel, GovernanceModelConfig, GovernanceState,
-    GovernanceTimeoutTask, HashMap, HashSet, KeyPackage, MemberBudgetTracker, MembershipState,
-    PerContextState, ReceiveBuffer, TemplateId, TtlState, TtlTimer, build_governance_engine,
-    builder_create_context, context_id_to_bytes, create_governance_engine, instrument,
-    mint_governance_tokens, push_welcome_event, require_active,
-    restore_governance_engine_from_snapshot, restore_grace_store_from_snapshot, roles,
-    validate_governance_consistency, validate_governance_model,
+    CommitOperation, ContextCreationError, ContextError, ContextEvent, ContextHandle,
+    ContextManager, ContextMode, ContextParams, ContextRoleState, ContextSnapshot, ContextState,
+    DID, DeadlockDetectionState, EpochCoordinator, EpochState, GovernanceModel,
+    GovernanceModelConfig, GovernanceState, GovernanceTimeoutTask, HashMap, HashSet, KeyPackage,
+    MemberBudgetTracker, MembershipState, PerContextState, ReceiveBuffer, TemplateId, TtlState,
+    TtlTimer, build_governance_engine, builder_create_context, context_id_to_bytes,
+    create_governance_engine, instrument, mint_governance_tokens, push_welcome_event,
+    require_active, restore_governance_engine_from_snapshot, restore_grace_store_from_snapshot,
+    roles, validate_governance_consistency, validate_governance_model,
 };
 
 /// Builds an [`IdentityDepthAssessment`] for a member in a context.
@@ -406,6 +408,10 @@ impl ContextManager {
             },
             sequence_tracker: scp_protocol::envelope::SequenceTracker::new(),
             reorder_buffer: scp_protocol::envelope::ReorderBuffer::default(),
+            // PR #1606 C6: restore the persistent commit retry queue and
+            // fail-close marker so retries continue across process restart.
+            pending_commits: ctx_snapshot.pending_commits,
+            commit_fault: ctx_snapshot.commit_fault,
         };
 
         {
@@ -989,6 +995,12 @@ impl ContextManager {
             },
             sequence_tracker: scp_protocol::envelope::SequenceTracker::new(),
             reorder_buffer: scp_protocol::envelope::ReorderBuffer::default(),
+            // PR #1606 C6: import path starts with an empty commit retry
+            // queue and no fail-close marker. Pending commits in the source
+            // export are not portable across instances — they reference the
+            // exporter's MLS state which is not transferred via import.
+            pending_commits: VecDeque::new(),
+            commit_fault: None,
         };
 
         // 7. Register the context.
@@ -1171,6 +1183,10 @@ impl ContextManager {
             },
             sequence_tracker: scp_protocol::envelope::SequenceTracker::new(),
             reorder_buffer: scp_protocol::envelope::ReorderBuffer::default(),
+            // PR #1606 C6: fresh contexts start with an empty commit retry
+            // queue and no fail-close marker.
+            pending_commits: VecDeque::new(),
+            commit_fault: None,
         };
 
         {
@@ -1488,6 +1504,10 @@ impl ContextManager {
             },
             sequence_tracker: scp_protocol::envelope::SequenceTracker::new(),
             reorder_buffer: scp_protocol::envelope::ReorderBuffer::default(),
+            // PR #1606 C6: fresh contexts start with an empty commit retry
+            // queue and no fail-close marker.
+            pending_commits: VecDeque::new(),
+            commit_fault: None,
         })
     }
 
@@ -1863,6 +1883,9 @@ impl ContextManager {
         let context_id_bytes = context_id_to_bytes(&context_id);
 
         // Determine broadcast mode + authorization in a single lock acquire.
+        // PR #1606 C6: also check the commit fault marker so a fail-closed
+        // context refuses further leave operations until an operator
+        // acknowledges the fault.
         let is_broadcast = {
             let contexts = self.contexts.lock().await;
             let ctx = contexts
@@ -1878,6 +1901,7 @@ impl ContextManager {
                     "caller lacks permission to remove this member".into(),
                 ));
             }
+            Self::check_commit_fault(ctx)?;
             ctx.broadcast_context.is_some()
         };
 
@@ -1901,20 +1925,17 @@ impl ContextManager {
             }
 
             // Broadcast the MLS Commit to remaining members so they can
-            // advance their group epoch and ratchet key material.
-            if !remove_output.commit_bytes.is_empty()
-                && let Err(e) = self.transport.send_message(
-                    &scp_protocol::context::context_routing_id(&context_id),
-                    &remove_output.commit_bytes,
-                )
-            {
-                tracing::warn!(
-                    context_id = %context_id,
-                    error = %e,
-                    "failed to broadcast remove_member MLS Commit — \
-                     remaining members may not advance epoch"
-                );
-            }
+            // advance their group epoch and ratchet key material. PR #1606 C6:
+            // on transport failure, the commit is durably enqueued for retry.
+            self.try_broadcast_commit_or_enqueue(
+                &context_id,
+                remove_output.commit_bytes,
+                CommitOperation::LeaveContext {
+                    member_did: member_did.clone(),
+                },
+                member_did.as_ref(),
+            )
+            .await?;
 
             // Rotate the local sender key and distribute to remaining members (§9.16.4).
             // M23: Non-fatal — MLS removal above is the hard security boundary.

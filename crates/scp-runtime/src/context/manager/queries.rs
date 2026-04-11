@@ -1,8 +1,9 @@
 //! Simple queries and local DID management.
 
 use super::{
-    Arc, Capability, ContextError, ContextEvent, ContextEventLogProvider, ContextManager,
-    ContextParams, ContextRoleState, DID, RoleAssignment, Zeroizing, instrument,
+    Arc, Capability, CommitFaultMarker, ContextError, ContextEvent, ContextEventLogProvider,
+    ContextManager, ContextParams, ContextRoleState, DID, PendingCommit, RoleAssignment, Zeroizing,
+    instrument,
 };
 
 #[allow(clippy::significant_drop_tightening)]
@@ -493,5 +494,46 @@ impl ContextManager {
             .get(context_id)
             .map(|ctx| ctx.access.access_key_store.get_all(context_id))
             .unwrap_or_default()
+    }
+
+    /// Returns a clone of the persistent MLS Commit retry queue for a context
+    /// (PR #1606 C6).
+    ///
+    /// Each entry represents an MLS Commit (`RemoveMember`,
+    /// `RotateContentKeys`, `ResetMember`, or `LeaveContext`) whose
+    /// `transport.send_message` call previously failed and which is being
+    /// retried by the governance timeout task with exponential backoff.
+    /// SDK consumers SHOULD surface non-empty queues to the application
+    /// layer because the local state mutation has happened but at least one
+    /// remote member has not yet seen the commit.
+    ///
+    /// Returns an empty `Vec` if the context is not registered or has no
+    /// pending commits.
+    #[instrument(skip_all, fields(context_id))]
+    pub async fn pending_commits(&self, context_id: &str) -> Vec<PendingCommit> {
+        self.contexts
+            .lock()
+            .await
+            .get(context_id)
+            .map(|ctx| ctx.pending_commits.iter().cloned().collect())
+            .unwrap_or_default()
+    }
+
+    /// Returns the active commit fault marker for a context, if any (PR #1606 C6).
+    ///
+    /// `Some(marker)` indicates that a previous MLS Commit broadcast exhausted
+    /// its retry budget and the context is in fail-close state — subsequent
+    /// `execute_governance_action` and `leave_context` calls return
+    /// [`ContextError::CommitBroadcastFault`] until the marker is cleared via
+    /// [`acknowledge_commit_fault`](Self::acknowledge_commit_fault).
+    ///
+    /// Returns `None` if the context is not registered or has no fault marker.
+    #[instrument(skip_all, fields(context_id))]
+    pub async fn commit_fault(&self, context_id: &str) -> Option<CommitFaultMarker> {
+        self.contexts
+            .lock()
+            .await
+            .get(context_id)
+            .and_then(|ctx| ctx.commit_fault.clone())
     }
 }
