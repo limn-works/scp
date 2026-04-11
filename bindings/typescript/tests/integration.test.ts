@@ -16,6 +16,7 @@ import { Identity } from "../src/identity";
 import { _resetBridge, _setBridge } from "../src/internal/bridge";
 import { defineToolDefinition } from "../src/tools";
 import { Transport } from "../src/transport";
+import type { ConsequenceRule as ConsequenceRuleTypeAlias } from "../src/types";
 import { delegateUcan, mintUcan } from "../src/ucan";
 import { createMockBridge } from "./mock-bridge";
 
@@ -2009,7 +2010,7 @@ describe("Consequence event types (SDK)", () => {
 });
 
 describe("Trust aggregation with consequence rules (mock bridge)", () => {
-  it("aggregateTrustInput accepts consequenceRules parameter", async () => {
+  it("aggregateTrustInput accepts typed consequenceRules parameter", async () => {
     _setBridge(mockBridge);
     const { aggregateTrustInput } = await import("../src/trust");
 
@@ -2020,10 +2021,10 @@ describe("Trust aggregation with consequence rules (mock bridge)", () => {
       merkleRoot: new Array(32).fill(0),
       consequenceRules: [
         {
-          trigger: "MessageVelocity",
-          action: "SuspendAll",
+          trigger: { kind: "MessageVelocity" },
+          action: { kind: "Enforcement", severity: { kind: "SuspendAccess" } },
           threshold: 5,
-          window: { secs: 3600, nanos: 0 },
+          windowSecs: 3600,
         },
       ],
     });
@@ -2210,7 +2211,7 @@ describe("Context.create consequenceConfig parameter (C5 / SDK round-trip)", () 
     const identity = await Identity.create({ custody: "in_memory" });
     const ctx = await Context.create(identity, {
       ceiling: ["messages:read"],
-      consequenceConfig: { allow_automatic_access_revocation: true },
+      consequenceConfig: { allowAutomaticAccessRevocation: true },
     });
     expect(ctx).toBeDefined();
 
@@ -2258,5 +2259,169 @@ describe("Context.create consequenceConfig parameter (C5 / SDK round-trip)", () 
 
     const stored = mockBridge._contexts.get(ctx.contextId);
     expect(stored?.lastJoinSpendingUcanJwt).toBe("synthetic.spending.jwt");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// H15: typed ConsequenceRule discriminated union round-trip
+// ---------------------------------------------------------------------------
+
+describe("Context.create consequenceRules typed discriminated union (H15)", () => {
+  it("encodes a typed ConsequenceRule[] to the Rust serde wire format", async () => {
+    _setBridge(mockBridge);
+    const { Identity } = await import("../src/identity");
+    const { Context } = await import("../src/context");
+
+    const identity = await Identity.create({ custody: "in_memory" });
+    const rules: ConsequenceRuleTypeAlias[] = [
+      {
+        trigger: { kind: "MessageVelocity" },
+        action: {
+          kind: "Enforcement",
+          severity: {
+            kind: "SuspendCapability",
+            capabilities: [
+              "MessagesWrite",
+              { kind: "ToolInvoke", toolId: "calculator" },
+              { kind: "Custom", name: "my-custom-cap" },
+            ],
+          },
+        },
+        threshold: 5,
+        windowSecs: 3600,
+      },
+      {
+        trigger: { kind: "Custom", key: "spammy" },
+        action: { kind: "AssignRole", toRole: "viewer" },
+        threshold: 3,
+        windowSecs: 600,
+      },
+      {
+        trigger: { kind: "WarningCount" },
+        action: {
+          kind: "Enforcement",
+          severity: {
+            kind: "RevokeAccess",
+            did: "did:dht:z6MkSubject",
+            access: "Both",
+          },
+        },
+        threshold: 10,
+        windowSecs: 86_400,
+      },
+    ];
+
+    const ctx = await Context.create(identity, {
+      ceiling: ["messages:read"],
+      consequenceConfig: { allowAutomaticAccessRevocation: true },
+      consequenceRules: rules,
+    });
+
+    const stored = mockBridge._contexts.get(ctx.contextId);
+    const parsed = JSON.parse(stored?.rawParamsJson ?? "{}") as {
+      consequenceRules?: string;
+    };
+    expect(parsed.consequenceRules).toBeDefined();
+
+    const decoded = JSON.parse(parsed.consequenceRules ?? "[]") as Array<{
+      trigger: unknown;
+      action: unknown;
+      threshold: number;
+      window: { secs: number; nanos: number };
+    }>;
+    expect(decoded).toHaveLength(3);
+
+    // Rule 0: MessageVelocity / Enforcement(SuspendCapability { ToolInvoke + Custom + unit })
+    expect(decoded[0]?.trigger).toBe("MessageVelocity");
+    expect(decoded[0]?.threshold).toBe(5);
+    expect(decoded[0]?.window).toEqual({ secs: 3600, nanos: 0 });
+    const action0 = decoded[0]?.action as {
+      Enforcement?: { SuspendCapability?: { capabilities: unknown[] } };
+    };
+    expect(action0.Enforcement?.SuspendCapability?.capabilities).toEqual([
+      "MessagesWrite",
+      { ToolInvoke: "calculator" },
+      { Custom: "my-custom-cap" },
+    ]);
+
+    // Rule 1: Custom trigger / AssignRole
+    expect(decoded[1]?.trigger).toEqual({ Custom: "spammy" });
+    expect(decoded[1]?.action).toEqual({ AssignRole: { to_role: "viewer" } });
+
+    // Rule 2: WarningCount / Enforcement(RevokeAccess)
+    expect(decoded[2]?.trigger).toBe("WarningCount");
+    const action2 = decoded[2]?.action as {
+      Enforcement?: { RevokeAccess?: { did: string; access: string } };
+    };
+    expect(action2.Enforcement?.RevokeAccess).toEqual({
+      did: "did:dht:z6MkSubject",
+      access: "Both",
+    });
+  });
+
+  it("encodes RemoveMember severity with optional reason field", async () => {
+    const { encodeConsequenceRules } = await import("../src/types");
+    const json = encodeConsequenceRules([
+      {
+        trigger: { kind: "WarningCount" },
+        action: {
+          kind: "Enforcement",
+          severity: {
+            kind: "RemoveMember",
+            did: "did:dht:z6MkBad",
+            reason: "spam",
+          },
+        },
+        threshold: 100,
+        windowSecs: 60,
+      },
+    ]);
+    const decoded = JSON.parse(json) as Array<{
+      action: { Enforcement: { RemoveMember: { did: string; reason: string | null } } };
+    }>;
+    expect(decoded[0]?.action.Enforcement.RemoveMember).toEqual({
+      did: "did:dht:z6MkBad",
+      reason: "spam",
+    });
+
+    // Reason omitted serializes to explicit null (matches Rust Option<String>).
+    const jsonNoReason = encodeConsequenceRules([
+      {
+        trigger: { kind: "WarningCount" },
+        action: {
+          kind: "Enforcement",
+          severity: { kind: "RemoveMember", did: "did:dht:z6MkBad" },
+        },
+        threshold: 100,
+        windowSecs: 60,
+      },
+    ]);
+    const decodedNoReason = JSON.parse(jsonNoReason) as Array<{
+      action: { Enforcement: { RemoveMember: { did: string; reason: string | null } } };
+    }>;
+    expect(decodedNoReason[0]?.action.Enforcement.RemoveMember.reason).toBeNull();
+  });
+
+  it("pins the discriminated-union variant names so renames trip a compile error", async () => {
+    const types = await import("../src/types");
+    expect(types.CONSEQUENCE_TRIGGER_VARIANTS).toEqual([
+      "MessageVelocity",
+      "ToolRateExceeded",
+      "WarningCount",
+      "Custom",
+    ]);
+    expect(types.CONSEQUENCE_ACTION_VARIANTS).toEqual(["Enforcement", "AssignRole"]);
+    expect(types.ENFORCEMENT_SEVERITY_VARIANTS).toEqual([
+      "SuspendCapability",
+      "SuspendAccess",
+      "RevokeAccess",
+      "RemoveMember",
+    ]);
+  });
+
+  it("encodeConsequenceConfig snake-cases the wire field", async () => {
+    const { encodeConsequenceConfig } = await import("../src/types");
+    const encoded = encodeConsequenceConfig({ allowAutomaticAccessRevocation: true });
+    expect(JSON.parse(encoded)).toEqual({ allow_automatic_access_revocation: true });
   });
 });

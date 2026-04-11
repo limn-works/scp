@@ -994,4 +994,142 @@ struct ContextTests {
             try await context.join(joiner, joinFn: joinFn)
         }
     }
+
+    // MARK: - H15: typed ConsequenceRule / ConsequenceConfig
+
+    /// Shared assertion helper used by h15TypedRulesEncoding.
+    private func assertConsequenceRulesJsonShape(_ array: [[String: Any]]) throws {
+        #expect(array.count == 3)
+        // Rule 0 — MessageVelocity / SuspendCapability with mixed capabilities.
+        #expect(array[0]["trigger"] as? String == "MessageVelocity")
+        let action0 = try #require(array[0]["action"] as? [String: Any])
+        let enforce0 = try #require(action0["Enforcement"] as? [String: Any])
+        let suspend0 = try #require(enforce0["SuspendCapability"] as? [String: Any])
+        let caps0 = try #require(suspend0["capabilities"] as? [Any])
+        #expect(caps0.count == 3)
+        #expect(caps0[0] as? String == "MessagesWrite")
+        let toolCap = try #require(caps0[1] as? [String: String])
+        #expect(toolCap == ["ToolInvoke": "calculator"])
+        let customCap = try #require(caps0[2] as? [String: String])
+        #expect(customCap == ["Custom": "my-custom-cap"])
+        let window0 = try #require(array[0]["window"] as? [String: Int])
+        #expect(window0 == ["secs": 3600, "nanos": 0])
+        // Rule 1 — Custom trigger / AssignRole.
+        let trigger1 = try #require(array[1]["trigger"] as? [String: String])
+        #expect(trigger1 == ["Custom": "spammy"])
+        let action1 = try #require(array[1]["action"] as? [String: Any])
+        let assignRole = try #require(action1["AssignRole"] as? [String: String])
+        #expect(assignRole == ["to_role": "viewer"])
+        // Rule 2 — WarningCount / RevokeAccess.
+        #expect(array[2]["trigger"] as? String == "WarningCount")
+        let action2 = try #require(array[2]["action"] as? [String: Any])
+        let enforce2 = try #require(action2["Enforcement"] as? [String: Any])
+        let revoke = try #require(enforce2["RevokeAccess"] as? [String: String])
+        #expect(revoke == ["did": "did:dht:z6MkSubject", "access": "Both"])
+    }
+
+    @Test("encodeConsequenceRulesJson encodes the discriminated union to Rust serde wire format")
+    func h15TypedRulesEncoding() throws {
+        let rules: [ConsequenceRule] = [
+            ConsequenceRule(
+                trigger: .messageVelocity,
+                action: .enforcement(.suspendCapability(capabilities: [
+                    .unit(name: "MessagesWrite"),
+                    .toolInvoke(toolId: "calculator"),
+                    .custom(name: "my-custom-cap")
+                ])),
+                threshold: 5,
+                windowSecs: 3600
+            ),
+            ConsequenceRule(
+                trigger: .custom(key: "spammy"),
+                action: .assignRole(toRole: "viewer"),
+                threshold: 3,
+                windowSecs: 600
+            ),
+            ConsequenceRule(
+                trigger: .warningCount,
+                action: .enforcement(.revokeAccess(did: "did:dht:z6MkSubject", access: .both)),
+                threshold: 10,
+                windowSecs: 86400
+            )
+        ]
+        let json = try encodeConsequenceRulesJson(rules)
+        let raw = try #require(json.data(using: .utf8))
+        let any = try JSONSerialization.jsonObject(with: raw)
+        let array = try #require(any as? [[String: Any]])
+        try assertConsequenceRulesJsonShape(array)
+    }
+
+    @Test("encodeConsequenceConfigJson snake_cases the wire field")
+    func h15TypedConfigEncoding() throws {
+        let json = try encodeConsequenceConfigJson(
+            ConsequenceConfig(allowAutomaticAccessRevocation: true)
+        )
+        let raw = try #require(json.data(using: .utf8))
+        let parsed = try #require(
+            try JSONSerialization.jsonObject(with: raw) as? [String: Bool]
+        )
+        #expect(parsed == ["allow_automatic_access_revocation": true])
+    }
+
+    @Test("ContextParams typed convenience init forwards JSON-encoded consequence values")
+    func h15ContextParamsTypedInit() throws {
+        let params = try ContextParams(
+            mode: .encrypted,
+            ceiling: ["messages:read"],
+            ceilingPolicy: .immutable,
+            governance: .singleAdmin,
+            memoryScope: .ephemeral,
+            ttlSeconds: 3600,
+            promotable: false,
+            consequenceRules: [
+                ConsequenceRule(
+                    trigger: .messageVelocity,
+                    action: .enforcement(.suspendAccess),
+                    threshold: 1,
+                    windowSecs: 60
+                )
+            ],
+            consequenceConfig: ConsequenceConfig(allowAutomaticAccessRevocation: true)
+        )
+        let rulesJson = try #require(params.consequenceRulesJson)
+        #expect(rulesJson.contains("\"trigger\":\"MessageVelocity\""))
+        #expect(rulesJson.contains("\"Enforcement\":\"SuspendAccess\""))
+        let configJson = try #require(params.consequenceConfigJson)
+        #expect(configJson.contains("\"allow_automatic_access_revocation\":true"))
+    }
+
+    @Test("ConsequenceRule round-trips through JSONEncoder/JSONDecoder")
+    func h15TypedRulesRoundTrip() throws {
+        let original: [ConsequenceRule] = [
+            ConsequenceRule(
+                trigger: .toolRateExceeded,
+                action: .enforcement(.removeMember(did: "did:dht:z6MkBad", reason: "spam")),
+                threshold: 100,
+                windowSecs: 60
+            ),
+            ConsequenceRule(
+                trigger: .messageVelocity,
+                action: .enforcement(.suspendAccess),
+                threshold: 1,
+                windowSecs: 30
+            )
+        ]
+        let json = try encodeConsequenceRulesJson(original)
+        let data = try #require(json.data(using: .utf8))
+        let decoded = try JSONDecoder().decode([ConsequenceRule].self, from: data)
+        #expect(decoded == original)
+    }
+
+    @Test("ConsequenceTrigger / Action / EnforcementSeverity variant names are pinned")
+    func h15VariantNamePins() {
+        #expect(consequenceTriggerVariantNames == [
+            "MessageVelocity", "ToolRateExceeded", "WarningCount", "Custom"
+        ])
+        #expect(consequenceActionVariantNames == ["Enforcement", "AssignRole"])
+        #expect(enforcementSeverityVariantNames == [
+            "SuspendCapability", "SuspendAccess", "RevokeAccess", "RemoveMember"
+        ])
+    }
 } // end ContextTests

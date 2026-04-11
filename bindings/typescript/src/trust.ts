@@ -15,10 +15,12 @@ import { getBridge, getBridgeSync } from "./internal/bridge";
 import type {
   AttestationSummary,
   BehavioralRecord,
+  ConsequenceRule,
   ParticipationProfile,
   RequireParticipation,
   TrustEvaluation,
 } from "./types";
+import { encodeConsequenceRules } from "./types";
 
 // ---------------------------------------------------------------------------
 // Trust evaluation
@@ -104,8 +106,14 @@ export interface AggregationInput {
   events: readonly Record<string, unknown>[];
   /** 32-byte Merkle root as an array of numbers. */
   merkleRoot: readonly number[];
-  /** Consequence rules declared at context creation. */
-  consequenceRules?: readonly Record<string, unknown>[];
+  /**
+   * Consequence rules declared at context creation (ADR-017, #1531).
+   *
+   * Typed {@link ConsequenceRule} array — the SDK serializes to the JSON
+   * wire shape via {@link encodeConsequenceRules} before forwarding to the
+   * bridge.
+   */
+  consequenceRules?: readonly ConsequenceRule[];
   /** Threshold requirements per attestation type. */
   thresholdRequirements?: Readonly<Record<string, unknown>>;
   /** Attestor information per attestation type. */
@@ -156,7 +164,7 @@ export async function aggregateTrustInput(input: AggregationInput): Promise<Aggr
       input.subjectDid,
       JSON.stringify(input.events),
       JSON.stringify(input.merkleRoot),
-      JSON.stringify(input.consequenceRules ?? []),
+      input.consequenceRules ? encodeConsequenceRules(input.consequenceRules) : "[]",
       JSON.stringify(input.thresholdRequirements ?? {}),
       JSON.stringify(input.attestorSets ?? {}),
       JSON.stringify(input.cachedAttestations ?? []),
