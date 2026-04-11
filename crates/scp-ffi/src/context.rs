@@ -1868,7 +1868,15 @@ impl scp_core::crypto::ucan::validate::DidResolver for NoOpDidResolver {
 
 struct NoOpNonceTracker;
 impl scp_core::crypto::ucan::validate::NonceTracker for NoOpNonceTracker {
-    fn check_and_record(
+    fn check_replay(
+        &self,
+        _nonce: &str,
+        _token_expiry: u64,
+    ) -> Result<(), scp_core::crypto::ucan::UcanError> {
+        Ok(())
+    }
+
+    fn record(
         &mut self,
         _nonce: &str,
         _token_expiry: u64,

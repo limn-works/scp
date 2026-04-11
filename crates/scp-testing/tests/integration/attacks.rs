@@ -73,7 +73,11 @@ use scp_testing::relay::{BehaviorMode, InMemoryRelay};
 struct StubNonceTracker;
 
 impl NonceTracker for StubNonceTracker {
-    fn check_and_record(&mut self, _nonce: &str, _token_expiry: u64) -> Result<(), UcanError> {
+    fn check_replay(&self, _nonce: &str, _token_expiry: u64) -> Result<(), UcanError> {
+        Ok(())
+    }
+
+    fn record(&mut self, _nonce: &str, _token_expiry: u64) -> Result<(), UcanError> {
         Ok(())
     }
 }
@@ -950,10 +954,15 @@ async fn ucan_nonce_replay_rejected() {
         seen: HashSet<String>,
     }
     impl NonceTracker for ReplayNonceTracker {
-        fn check_and_record(&mut self, nonce: &str, _token_expiry: u64) -> Result<(), UcanError> {
+        fn check_replay(&self, nonce: &str, _token_expiry: u64) -> Result<(), UcanError> {
             if self.seen.contains(nonce) {
                 return Err(UcanError::NonceReused(nonce.to_owned()));
             }
+            Ok(())
+        }
+
+        fn record(&mut self, nonce: &str, token_expiry: u64) -> Result<(), UcanError> {
+            self.check_replay(nonce, token_expiry)?;
             self.seen.insert(nonce.to_owned());
             Ok(())
         }
@@ -1532,10 +1541,15 @@ async fn ucan_kid_scope_mismatch_rejected() {
 
     struct KidMismatchNonceTracker(HashSet<String>);
     impl NonceTracker for KidMismatchNonceTracker {
-        fn check_and_record(&mut self, nonce: &str, _: u64) -> Result<(), UcanError> {
+        fn check_replay(&self, nonce: &str, _: u64) -> Result<(), UcanError> {
             if self.0.contains(nonce) {
                 return Err(UcanError::NonceReused(nonce.to_owned()));
             }
+            Ok(())
+        }
+
+        fn record(&mut self, nonce: &str, token_expiry: u64) -> Result<(), UcanError> {
+            self.check_replay(nonce, token_expiry)?;
             self.0.insert(nonce.to_owned());
             Ok(())
         }
@@ -1586,10 +1600,15 @@ async fn ucan_kid_scope_mismatch_rejected() {
 
     struct KidMismatchNonceTracker2(HashSet<String>);
     impl NonceTracker for KidMismatchNonceTracker2 {
-        fn check_and_record(&mut self, nonce: &str, _: u64) -> Result<(), UcanError> {
+        fn check_replay(&self, nonce: &str, _: u64) -> Result<(), UcanError> {
             if self.0.contains(nonce) {
                 return Err(UcanError::NonceReused(nonce.to_owned()));
             }
+            Ok(())
+        }
+
+        fn record(&mut self, nonce: &str, token_expiry: u64) -> Result<(), UcanError> {
+            self.check_replay(nonce, token_expiry)?;
             self.0.insert(nonce.to_owned());
             Ok(())
         }

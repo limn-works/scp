@@ -179,15 +179,17 @@ impl<C: Clock> NonceTracker<C> {
         self.seen.is_empty()
     }
 
-    /// Validates a nonce and records it if new.
+    /// Read-only probe: validates nonce format, freshness, and replay without
+    /// recording.
     ///
     /// Performs the following checks in order:
     /// 1. **Format** — The nonce must match `{unix_millis}-{32_hex_chars}`.
     /// 2. **Freshness** — The timestamp must be within +/- 5 minutes of now.
-    /// 3. **Uniqueness** — The nonce must not have been seen before.
+    /// 3. **Uniqueness** — The nonce must not be in the seen-set.
     ///
-    /// If all checks pass, the nonce is recorded with `(now_secs, token_expiry)`
-    /// and automatic pruning is triggered if the check/time threshold is reached.
+    /// Does NOT insert the nonce into `seen`. Callers MUST call
+    /// [`record`](NonceTracker::record) after all downstream gates pass to
+    /// durably commit the nonce (H11 split-phase protocol).
     ///
     /// # Errors
     ///
@@ -195,7 +197,7 @@ impl<C: Clock> NonceTracker<C> {
     /// Returns [`UcanError::NonceTooOld`] if the timestamp is too far in the past.
     /// Returns [`UcanError::NonceFuture`] if the timestamp is too far in the future.
     /// Returns [`UcanError::NonceReused`] if the nonce was already recorded.
-    pub fn check_and_record(&mut self, nonce: &str, token_expiry: u64) -> Result<(), UcanError> {
+    pub fn check_replay(&self, nonce: &str, _token_expiry: u64) -> Result<(), UcanError> {
         // 1. Validate nonce format: {unix_millis}-{32_hex_chars}
         let (ts_part, hex_part) = nonce.split_once('-').ok_or_else(|| {
             UcanError::NonceFormatInvalid(format!("missing '-' separator in nonce: {nonce}"))
@@ -228,13 +230,34 @@ impl<C: Clock> NonceTracker<C> {
             return Err(UcanError::NonceReused(nonce.to_owned()));
         }
 
-        // 4. Capacity check: if at capacity, attempt a prune to free space.
+        Ok(())
+    }
+
+    /// Records a nonce after all validation gates pass.
+    ///
+    /// Defensively re-runs [`check_replay`](NonceTracker::check_replay), then
+    /// inserts the nonce into the seen-set. Also enforces capacity limits and
+    /// triggers automatic pruning.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same errors as `check_replay` if the defensive re-check fails.
+    /// Returns [`UcanError::NonceTrackerFull`] if the tracker is at capacity
+    /// and cannot be pruned.
+    pub fn record(&mut self, nonce: &str, token_expiry: u64) -> Result<(), UcanError> {
+        // Defensive re-check before inserting (guards against races and
+        // callers that skipped check_replay).
+        self.check_replay(nonce, token_expiry)?;
+
+        // Capacity check: if at capacity, attempt a prune to free space.
         if self.seen.len() >= self.max_capacity {
             self.prune();
             if self.seen.len() >= self.max_capacity {
                 return Err(UcanError::NonceTrackerFull(self.max_capacity));
             }
         }
+
+        let now_secs = self.clock.now_secs();
 
         // Record the nonce.
         self.seen.insert(nonce.to_owned(), (now_secs, token_expiry));
@@ -248,6 +271,24 @@ impl<C: Clock> NonceTracker<C> {
         }
 
         Ok(())
+    }
+
+    /// Validates a nonce and records it if new.
+    ///
+    /// Convenience method that calls `check_replay` then `record` in one step.
+    /// For callers that need the split-phase protocol (H11), call `check_replay`
+    /// and `record` separately.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`UcanError::NonceFormatInvalid`] if the format is wrong.
+    /// Returns [`UcanError::NonceTooOld`] if the timestamp is too far in the past.
+    /// Returns [`UcanError::NonceFuture`] if the timestamp is too far in the future.
+    /// Returns [`UcanError::NonceReused`] if the nonce was already recorded.
+    /// Returns [`UcanError::NonceTrackerFull`] if the tracker is at capacity.
+    pub fn check_and_record(&mut self, nonce: &str, token_expiry: u64) -> Result<(), UcanError> {
+        self.check_replay(nonce, token_expiry)?;
+        self.record(nonce, token_expiry)
     }
 
     /// Removes expired nonce entries.
@@ -453,12 +494,16 @@ impl<C: Clock> NonceTracker<C> {
 /// [`super::validate::InMemoryNonceTracker`] alongside the production
 /// tracker — that is the bug the C1 finding describes (a fabricated
 /// spending UCAN's nonce was never checked against the per-context
-/// tracker because no shared trait existed). The impl is intentionally
-/// trivial: it forwards directly to the inherent `check_and_record`,
-/// preserving capacity limits, pruning, and persistence semantics.
+/// tracker because no shared trait existed). The impl forwards directly to
+/// the inherent split-phase methods, preserving capacity limits, pruning,
+/// and persistence semantics.
 impl<C: Clock> super::validate::NonceTracker for NonceTracker<C> {
-    fn check_and_record(&mut self, nonce: &str, token_expiry: u64) -> Result<(), UcanError> {
-        Self::check_and_record(self, nonce, token_expiry)
+    fn check_replay(&self, nonce: &str, token_expiry: u64) -> Result<(), UcanError> {
+        Self::check_replay(self, nonce, token_expiry)
+    }
+
+    fn record(&mut self, nonce: &str, token_expiry: u64) -> Result<(), UcanError> {
+        Self::record(self, nonce, token_expiry)
     }
 }
 

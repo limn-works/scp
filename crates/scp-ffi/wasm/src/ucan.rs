@@ -127,7 +127,7 @@ impl WasmNonceTracker {
 const NONCE_FRESHNESS_TOLERANCE_MS: u64 = 5 * 60 * 1000;
 
 impl ValidationNonceTracker for WasmNonceTracker {
-    fn check_and_record(&mut self, nonce: &str, _token_expiry: u64) -> Result<(), UcanError> {
+    fn check_replay(&self, nonce: &str, _token_expiry: u64) -> Result<(), UcanError> {
         // 1. Format: split into timestamp and hex suffix.
         if nonce.is_empty() {
             return Err(UcanError::NonceFormatInvalid("nonce is empty".to_owned()));
@@ -163,8 +163,16 @@ impl ValidationNonceTracker for WasmNonceTracker {
             return Err(UcanError::NonceReused(nonce.to_owned()));
         }
 
-        // Record for writeback (don't actually insert into the HashSet — the
-        // real recording happens via WasmContextManager::ucan_record_nonce).
+        Ok(())
+    }
+
+    fn record(&mut self, nonce: &str, token_expiry: u64) -> Result<(), UcanError> {
+        // Defensive re-check before committing (H11 split-phase protocol).
+        self.check_replay(nonce, token_expiry)?;
+
+        // Stage for writeback — don't insert into seen_nonces directly, as
+        // the real recording happens via WasmContextManager::ucan_record_nonce
+        // (extract-validate-writeback pattern).
         self.validated_nonce = Some(nonce.to_owned());
 
         Ok(())

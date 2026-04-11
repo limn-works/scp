@@ -42,7 +42,10 @@ use scp_protocol::crypto::sender_keys::{
 
 /// Maximum allowed epoch advance in a single sender key distribution.
 /// Prevents epoch poisoning attacks where an attacker sets `epoch=u64::MAX`.
-const MAX_EPOCH_ADVANCE: u64 = 1000;
+///
+/// Also used by `import_context` (§23.17 Invariant 3) to bound incoming
+/// snapshot epoch values against the local per-sender floors.
+pub(crate) const MAX_EPOCH_ADVANCE: u64 = 1000;
 
 // ---------------------------------------------------------------------------
 // MlsCryptoSnapshot — serializable per-context crypto state for persistence
@@ -1594,6 +1597,80 @@ impl ContextCryptoProvider for MlsCryptoProvider {
             .lock()
             .map_err(|e| ContextError::CryptoFailed(format!("lock poisoned: {e}")))?;
         contexts.insert(*context_id, crypto_state);
+
+        Ok(())
+    }
+
+    fn export_sender_key_epochs(&self, context_id: &[u8; 32]) -> Vec<(String, u64)> {
+        let Ok(contexts) = self.contexts.lock() else {
+            return Vec::new();
+        };
+        let Some(state) = contexts.get(context_id) else {
+            return Vec::new();
+        };
+        let ctx_id_hex = hex::encode(context_id);
+        state.sender_key_store.epochs_for_context(&ctx_id_hex)
+    }
+
+    fn validate_and_merge_epoch_floors(
+        &self,
+        context_id: &[u8; 32],
+        local_floors: Vec<(String, u64)>,
+        max_advance_per_sender: u64,
+    ) -> Result<(), ContextError> {
+        if local_floors.is_empty() {
+            return Ok(());
+        }
+
+        let ctx_id_hex = hex::encode(context_id);
+
+        // Step 1: read the imported (restored) epoch floors.
+        let import_floors: Vec<(String, u64)> = {
+            let contexts = self
+                .contexts
+                .lock()
+                .map_err(|e| ContextError::CryptoFailed(format!("lock poisoned: {e}")))?;
+            // No restored state (mls_state was empty): no incoming floors.
+            // Local floors are trivially dominant; merge them in below.
+            contexts.get(context_id).map_or_else(Vec::new, |state| {
+                state.sender_key_store.epochs_for_context(&ctx_id_hex)
+            })
+        };
+
+        // Step 2: build a temporary store seeded with local floors, then
+        // validate the import floors against them via the atomic-reject helper.
+        // Rejects if any import floor regresses below a local floor, or
+        // overshoots local + max_advance (epoch-poisoning guard).
+        let mut temp_store = SenderKeyStore::new();
+        for (did, floor) in &local_floors {
+            temp_store.restore_epoch_high_water(&ctx_id_hex, did, *floor);
+        }
+        temp_store
+            .merge_incoming_epochs_with_atomic_reject(
+                &ctx_id_hex,
+                import_floors,
+                max_advance_per_sender,
+            )
+            .map_err(|per_sender_deltas| ContextError::SnapshotFloorRegression {
+                resource: "sender_key_epoch".to_owned(),
+                per_sender_deltas,
+            })?;
+
+        // Step 3: apply the merged floors (max of local and import) back into
+        // the real store. Ensures local-only senders (absent from the import
+        // snapshot) retain their floor (Invariant 4 append-only dominance).
+        let merged = temp_store.epochs_for_context(&ctx_id_hex);
+        let mut contexts = self
+            .contexts
+            .lock()
+            .map_err(|e| ContextError::CryptoFailed(format!("lock poisoned: {e}")))?;
+        if let Some(state) = contexts.get_mut(context_id) {
+            for (did, epoch) in merged {
+                state
+                    .sender_key_store
+                    .restore_epoch_high_water(&ctx_id_hex, &did, epoch);
+            }
+        }
 
         Ok(())
     }

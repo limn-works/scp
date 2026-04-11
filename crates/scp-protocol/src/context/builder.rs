@@ -659,6 +659,52 @@ pub trait ContextCryptoProvider: Send + Sync {
         Ok(())
     }
 
+    /// Returns the per-sender epoch high-water marks for a given context.
+    ///
+    /// Each `(sender_did, epoch)` pair represents the highest sender key epoch
+    /// seen from that participant.  Used by [`ContextManager::import_context`]
+    /// to capture the local floors **before** destroying existing crypto state
+    /// so the incoming snapshot can be validated against them.
+    ///
+    /// Returns an empty `Vec` when the context has no epoch state (mock
+    /// providers, broadcast-only contexts, or providers that do not track
+    /// epochs).
+    ///
+    /// The default implementation returns an empty `Vec`.  Production
+    /// providers that maintain a `SenderKeyStore` MUST override this.
+    fn export_sender_key_epochs(&self, _context_id: &[u8; 32]) -> Vec<(String, u64)> {
+        Vec::new()
+    }
+
+    /// Validates that the per-sender epoch floors in the just-restored crypto
+    /// state do not regress any entry in `local_floors`, then applies a
+    /// max-merge so `max(local, imported)` is the effective floor for every
+    /// sender (spec §23.17 Invariant 3 + Invariant 4).
+    ///
+    /// Call this AFTER `restore_crypto_state` during `import_context`, passing
+    /// the floors captured via `export_sender_key_epochs` **before** the
+    /// destroy+restore cycle.
+    ///
+    /// Rejects (returns `Err`) if any imported epoch is below its local floor
+    /// (regression) **or** exceeds `local_floor + max_advance_per_sender`
+    /// (epoch-poisoning guard). No state is mutated on failure.
+    ///
+    /// The default implementation is a no-op (`Ok`). Production providers MUST
+    /// override this.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ContextError::SnapshotFloorRegression`] on regression or
+    /// ceiling violation.
+    fn validate_and_merge_epoch_floors(
+        &self,
+        _context_id: &[u8; 32],
+        _local_floors: Vec<(String, u64)>,
+        _max_advance_per_sender: u64,
+    ) -> Result<(), ContextError> {
+        Ok(())
+    }
+
     // -- Welcome delivery operations (§5.12.3, issue #1311) ------------------
 
     /// Generates a key package for joining a group via Welcome.

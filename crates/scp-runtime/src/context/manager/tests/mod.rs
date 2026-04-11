@@ -286,6 +286,13 @@ pub(super) struct MockCrypto {
     /// Used by `sender_key_before_mls_removal_ordering` to verify that
     /// `remove_member_sender_key` is called before `remove_member`.
     pub(super) call_order: Arc<std::sync::Mutex<Vec<(String, String)>>>,
+    /// Per-context per-sender epoch floors, keyed by `hex(context_id)`.
+    /// Tests seed this to simulate pre-existing epoch state before import.
+    pub(super) epoch_floors:
+        std::sync::Mutex<std::collections::HashMap<String, Vec<(String, u64)>>>,
+    /// Epoch floors to be installed by `restore_crypto_state` for the NEXT
+    /// call. Tests pre-populate this to simulate incoming snapshot epochs.
+    pub(super) pending_restore_epochs: std::sync::Mutex<Option<Vec<(String, u64)>>>,
 }
 
 impl ContextCryptoProvider for MockCrypto {
@@ -486,6 +493,80 @@ impl ContextCryptoProvider for MockCrypto {
         Ok(scp_protocol::context::builder::AdvanceEpochOutput {
             commit_bytes: vec![0xEA, 0xC0, 0x06],
         })
+    }
+
+    fn export_sender_key_epochs(&self, context_id: &[u8; 32]) -> Vec<(String, u64)> {
+        let ctx_key = hex::encode(context_id);
+        self.epoch_floors
+            .lock()
+            .unwrap()
+            .get(&ctx_key)
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    fn restore_crypto_state(
+        &self,
+        context_id: &[u8; 32],
+        _data: &[u8],
+    ) -> Result<(), ContextError> {
+        // If the test staged a set of incoming epoch floors, install them as
+        // the restored state for this context (simulating what a real provider
+        // does after deserializing an MLS crypto blob).
+        let taken = self.pending_restore_epochs.lock().unwrap().take();
+        if let Some(epochs) = taken {
+            let ctx_key = hex::encode(context_id);
+            self.epoch_floors.lock().unwrap().insert(ctx_key, epochs);
+        }
+        Ok(())
+    }
+
+    fn validate_and_merge_epoch_floors(
+        &self,
+        context_id: &[u8; 32],
+        local_floors: Vec<(String, u64)>,
+        max_advance_per_sender: u64,
+    ) -> Result<(), ContextError> {
+        use scp_protocol::crypto::sender_keys::SenderKeyStore;
+
+        if local_floors.is_empty() {
+            return Ok(());
+        }
+
+        let ctx_id_hex = hex::encode(context_id);
+
+        // Read the import floors installed by `restore_crypto_state`.
+        let import_floors = self
+            .epoch_floors
+            .lock()
+            .unwrap()
+            .get(&ctx_id_hex)
+            .cloned()
+            .unwrap_or_default();
+
+        // Validate: seed a temp store with local floors, merge in import floors.
+        // Rejects if any import floor regresses below a local floor, or
+        // exceeds local + max_advance (epoch-poisoning guard).
+        let mut temp_store = SenderKeyStore::new();
+        for (did, floor) in &local_floors {
+            temp_store.restore_epoch_high_water(&ctx_id_hex, did, *floor);
+        }
+        temp_store
+            .merge_incoming_epochs_with_atomic_reject(
+                &ctx_id_hex,
+                import_floors,
+                max_advance_per_sender,
+            )
+            .map_err(|per_sender_deltas| ContextError::SnapshotFloorRegression {
+                resource: "sender_key_epoch".to_owned(),
+                per_sender_deltas,
+            })?;
+
+        // Apply merged result (max of local and import) back to the mock.
+        let merged = temp_store.epochs_for_context(&ctx_id_hex);
+        self.epoch_floors.lock().unwrap().insert(ctx_id_hex, merged);
+
+        Ok(())
     }
 }
 

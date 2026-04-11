@@ -37,7 +37,11 @@ fn did(s: &str) -> DID {
 struct StubNonceTracker;
 
 impl NonceTracker for StubNonceTracker {
-    fn check_and_record(&mut self, _nonce: &str, _token_expiry: u64) -> Result<(), UcanError> {
+    fn check_replay(&self, _nonce: &str, _token_expiry: u64) -> Result<(), UcanError> {
+        Ok(())
+    }
+
+    fn record(&mut self, _nonce: &str, _token_expiry: u64) -> Result<(), UcanError> {
         Ok(())
     }
 }

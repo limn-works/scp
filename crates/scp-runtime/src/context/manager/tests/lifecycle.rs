@@ -3525,3 +3525,294 @@ async fn restore_context_validates_consequence_rules() {
         "expected ImportRejected, got {err:?}"
     );
 }
+
+// -----------------------------------------------------------------------
+// import_context epoch-floor regression guard tests (§23.17 Invariant 3)
+// -----------------------------------------------------------------------
+
+/// Builds a minimal but valid [`crate::context::export_import::ContextExport`]
+/// for use in `import_context` epoch-regression tests.
+///
+/// The export has an empty event log (Merkle root = `[0u8; 32]`), which
+/// `validate_export_for_import` accepts. The snapshot's `state` is `Active`
+/// so `import_context` proceeds past the state guard.
+///
+/// `mls_state` is set to `b"trigger-restore"` (non-empty) so the
+/// lifecycle code enters the `restore_crypto_state` / epoch-merge path.
+fn make_epoch_test_export(context_id: &str) -> crate::context::export_import::ContextExport {
+    use scp_protocol::context::roles::{ContextRoleState, default_ceiling};
+
+    let ceiling = default_ceiling();
+    let role_state = ContextRoleState::new(
+        context_id,
+        "did:key:test-creator",
+        ceiling,
+        vec![],
+        &scp_primitives::SystemClock,
+    )
+    .expect("ContextRoleState::new should succeed for test snapshot");
+
+    let snapshot = super::ContextSnapshot {
+        context_id: context_id.to_owned(),
+        state: ContextState::Active,
+        context_params: ContextParams::default(),
+        membership: MembershipState::new(),
+        role_state,
+        executed_proposals: HashSet::new(),
+        ttl_remaining_secs: None,
+        registered_tools: Vec::new(),
+        read_exclusion_list: HashSet::new(),
+        tool_interfaces: Vec::new(),
+        threshold_signers: Vec::new(),
+        threshold_value: 0,
+        pruning_policy: None,
+        governance_model_config: None,
+        economic_policy: None,
+        budget_tracker: scp_protocol::economy::budget::MemberBudgetTracker::new(),
+        approved_proposals: HashMap::new(),
+        next_proposal_seq: 0,
+        governance_freeze: None,
+        pending_ceiling_modification: None,
+        pending_economic_policy_change: None,
+        mls_epoch: 0,
+        epoch_coordination_records: Vec::new(),
+        grace_entries: Vec::new(),
+        needs_reconnect: false,
+        migration_state: None,
+        mls_crypto_state: Vec::new(),
+        access_key_store: scp_protocol::crypto::access_keys::AccessKeyStore::new(),
+        consequence_rules: Vec::new(),
+        participation_cache: std::collections::HashMap::new(),
+        velocity_tracker: None,
+        velocity_tracker_state: None,
+        cooldown_until: std::collections::HashMap::new(),
+        proposal_timestamps: std::collections::HashMap::new(),
+        message_pricing: None,
+        hard_rate_limit_config: None,
+        hard_rate_limit_state: std::collections::HashMap::new(),
+        spending_nonce_tracker_state: std::collections::HashMap::new(),
+        pending_commits: std::collections::VecDeque::new(),
+        commit_fault: None,
+    };
+
+    crate::context::export_import::ContextExport {
+        snapshot,
+        event_log_data: Vec::new(),
+        // Non-empty so the lifecycle code enters the restore_crypto_state path
+        // (and therefore the validate_and_merge_epoch_floors call).
+        mls_state: b"trigger-restore".to_vec(),
+        version: crate::context::export_import::CURRENT_EXPORT_VERSION,
+        exported_at: 0,
+        exporter_did: DID::from("did:key:test-exporter"),
+        merkle_root: [0u8; 32], // valid for empty event log
+        scope: crate::context::export_import::ExportScope::Full,
+    }
+}
+
+/// §23.17 Invariant 3: `import_context` rejects a snapshot that lowers a
+/// per-sender epoch floor below the pre-import local high-water mark.
+///
+/// Setup: context slot exists (Closing), local floor for Alice = 100.
+/// Import carries Alice's epoch = 50 (below 100). Expected: `SnapshotFloorRegression`.
+#[tokio::test]
+async fn import_context_rejects_epoch_floor_regression() {
+    let ctx_id = "epoch-regression-test-ctx";
+    let alice_did = "did:key:alice-epoch-regression";
+    let ctx_id_bytes = scp_protocol::context::context_id_bytes(ctx_id);
+    let ctx_id_hex = hex::encode(ctx_id_bytes);
+
+    // Build mock with Alice's local floor = 100.
+    let mock = MockCrypto::default();
+    mock.epoch_floors
+        .lock()
+        .unwrap()
+        .insert(ctx_id_hex, vec![(alice_did.to_owned(), 100)]);
+    // Stage incoming epochs: Alice at 50 (regression).
+    *mock.pending_restore_epochs.lock().unwrap() = Some(vec![(alice_did.to_owned(), 50)]);
+
+    let manager = ContextManager::new(
+        Box::new(mock),
+        Box::new(MockTransport::connected()),
+        Box::new(MockEventLog::default()),
+        noop_key_resolver(),
+    );
+
+    // Use create_context (not create_context_bare) so the context slot is
+    // registered in the manager's contexts map.  import_context checks the
+    // map to determine whether this is a re-import of an existing slot vs. a
+    // fresh import; create_context_bare only returns a handle without
+    // registering it.
+    let handle = manager
+        .create_context(
+            ctx_id.to_owned(),
+            ContextParams::default(),
+            DID::from("did:key:test-creator"),
+        )
+        .await
+        .expect("create_context should succeed");
+
+    // Transition to Closing so the slot is replaceable.
+    handle
+        .transition_to(&ContextState::Closing)
+        .await
+        .expect("transition to Closing should succeed");
+
+    let export = make_epoch_test_export(ctx_id);
+    let result = manager.import_context(export).await;
+
+    assert!(
+        result.is_err(),
+        "import should fail when incoming epoch regresses local floor"
+    );
+    assert!(
+        matches!(
+            result.unwrap_err(),
+            ContextError::SnapshotFloorRegression { .. }
+        ),
+        "error should be SnapshotFloorRegression"
+    );
+}
+
+/// §23.17 Invariant 3: `import_context` accepts a snapshot where the
+/// per-sender epoch advances within `MAX_EPOCH_ADVANCE` of the local floor.
+///
+/// Setup: context slot exists (Closing), local floor for Alice = 100.
+/// Import carries Alice's epoch = 200 (advance of 100, within `MAX_EPOCH_ADVANCE` = 1000).
+/// Expected: success.
+#[tokio::test]
+async fn import_context_accepts_epoch_advance_within_ceiling() {
+    let ctx_id = "epoch-advance-within-ceiling-ctx";
+    let alice_did = "did:key:alice-epoch-advance-ok";
+    let ctx_id_bytes = scp_protocol::context::context_id_bytes(ctx_id);
+    let ctx_id_hex = hex::encode(ctx_id_bytes);
+
+    let mock = MockCrypto::default();
+    mock.epoch_floors
+        .lock()
+        .unwrap()
+        .insert(ctx_id_hex, vec![(alice_did.to_owned(), 100)]);
+    // Stage incoming epochs: Alice at 200 (advance of 100, within ceiling).
+    *mock.pending_restore_epochs.lock().unwrap() = Some(vec![(alice_did.to_owned(), 200)]);
+
+    let manager = ContextManager::new(
+        Box::new(mock),
+        Box::new(MockTransport::connected()),
+        Box::new(MockEventLog::default()),
+        noop_key_resolver(),
+    );
+
+    // Use create_context so the slot is registered in the manager's contexts map.
+    let handle = manager
+        .create_context(
+            ctx_id.to_owned(),
+            ContextParams::default(),
+            DID::from("did:key:test-creator"),
+        )
+        .await
+        .expect("create_context should succeed");
+    handle
+        .transition_to(&ContextState::Closing)
+        .await
+        .expect("transition to Closing should succeed");
+
+    let export = make_epoch_test_export(ctx_id);
+    let result = manager.import_context(export).await;
+
+    assert!(
+        result.is_ok(),
+        "import should succeed when incoming epoch is within ceiling: {:?}",
+        result.err()
+    );
+}
+
+/// §23.17 Invariant 3: `import_context` rejects a snapshot where the
+/// per-sender epoch advance exceeds `MAX_EPOCH_ADVANCE` (epoch-poisoning guard).
+///
+/// Setup: context slot exists (Closing), local floor for Alice = 100.
+/// Import carries Alice's epoch = 2000 (advance of 1900 > `MAX_EPOCH_ADVANCE` = 1000).
+/// Expected: `SnapshotFloorRegression` (epoch-poisoning rejection).
+#[tokio::test]
+async fn import_context_rejects_epoch_advance_beyond_ceiling() {
+    let ctx_id = "epoch-advance-beyond-ceiling-ctx";
+    let alice_did = "did:key:alice-epoch-poisoning";
+    let ctx_id_bytes = scp_protocol::context::context_id_bytes(ctx_id);
+    let ctx_id_hex = hex::encode(ctx_id_bytes);
+
+    let mock = MockCrypto::default();
+    mock.epoch_floors
+        .lock()
+        .unwrap()
+        .insert(ctx_id_hex, vec![(alice_did.to_owned(), 100)]);
+    // Stage incoming epochs: Alice at 2000 (100 + 1900 > MAX_EPOCH_ADVANCE=1000).
+    *mock.pending_restore_epochs.lock().unwrap() = Some(vec![(alice_did.to_owned(), 2000)]);
+
+    let manager = ContextManager::new(
+        Box::new(mock),
+        Box::new(MockTransport::connected()),
+        Box::new(MockEventLog::default()),
+        noop_key_resolver(),
+    );
+
+    // Use create_context so the slot is registered in the manager's contexts map.
+    let handle = manager
+        .create_context(
+            ctx_id.to_owned(),
+            ContextParams::default(),
+            DID::from("did:key:test-creator"),
+        )
+        .await
+        .expect("create_context should succeed");
+    handle
+        .transition_to(&ContextState::Closing)
+        .await
+        .expect("transition to Closing should succeed");
+
+    let export = make_epoch_test_export(ctx_id);
+    let result = manager.import_context(export).await;
+
+    assert!(
+        result.is_err(),
+        "import should fail when incoming epoch exceeds MAX_EPOCH_ADVANCE ceiling"
+    );
+    assert!(
+        matches!(
+            result.unwrap_err(),
+            ContextError::SnapshotFloorRegression { .. }
+        ),
+        "error should be SnapshotFloorRegression (epoch-poisoning rejection)"
+    );
+}
+
+/// §23.17 Invariant 3: `import_context` into a fresh context slot (no prior
+/// state) accepts any incoming epoch within `MAX_EPOCH_ADVANCE` of zero.
+///
+/// Setup: no prior context (fresh import, no local floors to defend).
+/// Import carries Alice's epoch = 500 (within `MAX_EPOCH_ADVANCE` = 1000 of 0).
+/// Expected: success — no local floor to regress.
+#[tokio::test]
+async fn import_context_fresh_context_accepts_any_epoch_within_ceiling() {
+    let ctx_id = "epoch-fresh-ctx";
+    let alice_did = "did:key:alice-epoch-fresh";
+
+    let mock = MockCrypto::default();
+    // No epoch_floors seeded — fresh context.
+    // Stage incoming epochs: Alice at 500.
+    *mock.pending_restore_epochs.lock().unwrap() = Some(vec![(alice_did.to_owned(), 500)]);
+
+    let manager = ContextManager::new(
+        Box::new(mock),
+        Box::new(MockTransport::connected()),
+        Box::new(MockEventLog::default()),
+        noop_key_resolver(),
+    );
+
+    // No create_context_bare call — fresh slot (no prior context).
+    let export = make_epoch_test_export(ctx_id);
+    let result = manager.import_context(export).await;
+
+    assert!(
+        result.is_ok(),
+        "fresh import (no prior state) should succeed for any epoch within ceiling: {:?}",
+        result.err()
+    );
+}

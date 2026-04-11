@@ -399,8 +399,8 @@ pub(super) fn enforce_economy(
     )
     .map_err(|e| ContextError::PermissionDenied(format!("SCP-ECON-12061: {e}")))?;
 
-    // Cryptographic + replay + scope + expiry + attenuation validation of
-    // the spending UCAN. `spending_ucan` is guaranteed `Some` by the guard
+    // Cryptographic + replay probe + scope + expiry + attenuation validation
+    // of the spending UCAN. `spending_ucan` is guaranteed `Some` by the guard
     // above.
     //
     // C1 (PR #1606): before this call landed, only `validate_spending_ucan`
@@ -410,11 +410,14 @@ pub(super) fn enforce_economy(
     // below. A fabricated `UcanToken` with attacker-chosen fields and
     // `signature: vec![]` passed enforcement. The combined entry point
     // `validate_spending_ucan_signed` runs the full pipeline — signature,
-    // chain, key scope, expiry, revocation, nonce, scope, capability,
-    // attenuation — in one call, with the per-context nonce tracker and
-    // revocation set wired in. The previous separate `nonce_tracker.check_and_record`
-    // call is now performed inside the combined validator (step G), so it
-    // is no longer issued here.
+    // chain, key scope, expiry, revocation, nonce probe (check_replay only),
+    // scope, capability, attenuation — in one call, with the per-context
+    // nonce tracker and revocation set wired in.
+    //
+    // H11: the nonce is only PROBED here (check_replay), not recorded.
+    // Recording happens below, after the budget gate, via
+    // `commit_spending_ucan_nonce`. This prevents nonce-burn DoS: a
+    // budget-rejected request must not exhaust tracker capacity.
     if let Some(spending) = spending_ucan {
         validate_spending_ucan_or_error(
             spending,
@@ -438,6 +441,20 @@ pub(super) fn enforce_economy(
     budget_tracker.record_spend(actor_did, cost).map_err(|e| {
         ContextError::PermissionDenied(format!("SCP-ECON-12011: budget exceeded: {e}"))
     })?;
+
+    // H11: commit the nonce AFTER the budget gate passes. This is the
+    // second phase of the split-phase nonce protocol — the read-only probe
+    // (check_replay) ran inside validate_spending_ucan_or_error above;
+    // the durable insertion (record) happens here so that budget-rejected
+    // requests cannot burn nonce tracker capacity.
+    if let Some(spending) = spending_ucan {
+        scp_protocol::crypto::ucan::spending::commit_spending_ucan_nonce(spending, nonce_tracker)
+            .map_err(|e| {
+            ContextError::PermissionDenied(format!(
+                "SCP-ECON-12066: nonce commit failed after budget acceptance: {e}"
+            ))
+        })?;
+    }
 
     Ok(Some(cost))
 }
