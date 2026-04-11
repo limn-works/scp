@@ -50,7 +50,7 @@ const WASM_CONSEQUENCE_SRC: &str =
 // RATCHET CONSTANTS — may only increase
 // Any decrease requires human approval
 // =========================================================================
-const MIN_ACTIVE_PIPELINE_ASSERTIONS: usize = 30;
+const MIN_ACTIVE_PIPELINE_ASSERTIONS: usize = 33;
 
 // ---------------------------------------------------------------------------
 // Function body extraction — brace-matching parser
@@ -310,6 +310,61 @@ fn execute_add_member_calls_generate_access_key() {
     assert!(
         fn_body_contains(MANAGER_SRC, "execute_add_member", "generate_access_key"),
         "execute_add_member must call generate_access_key"
+    );
+}
+
+// --- Join-time sender key MLS framing (H3) ---
+//
+// `join_context` must MLS-wrap pending HPKE-sealed sender key distributions
+// via the shared `drain_and_deliver_sender_keys` helper before posting them
+// to transport. The helper calls `mls_encrypt_management`, which prepends
+// the SCPM management magic and wraps the bytes in an OuterEnvelope so the
+// receive-side dispatcher routes them through `OpenResult::Management`.
+//
+// The original join path called `transport.send_message` directly with the
+// raw HPKE bytes, which the joiner could not deserialize as an OuterEnvelope.
+// This regression silently dropped sender key distributions on join.
+
+#[test]
+fn join_context_calls_drain_and_deliver_sender_keys() {
+    assert!(
+        fn_body_contains(MANAGER_SRC, "join_context", "drain_and_deliver_sender_keys"),
+        "join_context must delegate sender key distribution to \
+         drain_and_deliver_sender_keys so distributions are MLS-wrapped (H3). \
+         Sending raw HPKE-sealed bytes via transport.send_message bypasses the \
+         OuterEnvelope/SCPM framing the receive-side dispatcher requires."
+    );
+}
+
+#[test]
+fn join_context_does_not_send_raw_drained_sender_keys() {
+    // Negative assertion: the join path must NOT loop over the drained
+    // pending messages and call transport.send_message directly. The
+    // bug shape was a `for ... in drain_pending_sender_key_messages`
+    // loop posting raw bytes. The fix uses the helper exclusively.
+    let body = extract_fn_body(MANAGER_SRC, "join_context")
+        .expect("join_context body must exist for H3 negative assertion");
+    assert!(
+        !body.contains(".drain_pending_sender_key_messages("),
+        "join_context must NOT call drain_pending_sender_key_messages directly — \
+         use drain_and_deliver_sender_keys so distributions are MLS-wrapped (H3)"
+    );
+}
+
+#[test]
+fn drain_and_deliver_sender_keys_calls_mls_encrypt_management() {
+    // The helper itself must MLS-wrap each distribution. This is the
+    // root invariant — without it, callers (including join_context and
+    // the rotation paths) would still post raw HPKE bytes.
+    assert!(
+        fn_body_contains(
+            MANAGER_SRC,
+            "drain_and_deliver_sender_keys",
+            "mls_encrypt_management"
+        ),
+        "drain_and_deliver_sender_keys must call mls_encrypt_management so \
+         pending sender key distributions are wrapped in the management channel \
+         framing the receive-side dispatcher recognizes (H3, §9.16.2)"
     );
 }
 
