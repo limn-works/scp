@@ -436,8 +436,11 @@ if (bridge === null || serverAddon === null) {
         outputSchema: { type: "object" },
         operator: admin.did,
       });
-      // Mint UCAN for the member (not self-delegation).
+      // Mint action UCAN for the member (not self-delegation).
       const ucan = await napi.ucanMint(ctx, member.did, ["tool:invoke:*"]);
+      // Mint spending UCAN — per-DID pricing (§19.7) charges a floor of 1
+      // even on contexts with no explicit economic policy.
+      const spendingUcan = await napi.ucanMint(ctx, member.did, ["spending:*"]);
       const resultJson = await napi.toolInvoke(
         ctx,
         toolId,
@@ -445,7 +448,7 @@ if (bridge === null || serverAddon === null) {
         member.did,
         ucan.encoded,
         undefined, // proofTokens
-        undefined, // spendingUcan
+        spendingUcan.encoded,
       );
       expect(typeof resultJson).toBe("string");
       const parsed = JSON.parse(resultJson);
@@ -1057,6 +1060,8 @@ if (bridge === null || serverAddon === null) {
 
       // Invoke (mint for member, not self-delegation).
       const ucan = await napi.ucanMint(ctx, member.did, ["tool:invoke:*"]);
+      // Spending UCAN — per-DID pricing (§19.7) charges a floor of 1.
+      const spendingUcan = await napi.ucanMint(ctx, member.did, ["spending:*"]);
       const resultJson = await napi.toolInvoke(
         ctx,
         toolId,
@@ -1064,7 +1069,7 @@ if (bridge === null || serverAddon === null) {
         member.did,
         ucan.encoded,
         undefined, // proofTokens
-        undefined, // spendingUcan
+        spendingUcan.encoded,
       );
       expect(typeof resultJson).toBe("string");
       const result = JSON.parse(resultJson);
