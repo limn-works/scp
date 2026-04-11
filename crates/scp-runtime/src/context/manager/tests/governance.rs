@@ -14758,3 +14758,304 @@ async fn consequence_evaluation_caps_buffer_events() {
         buffer_derived.len()
     );
 }
+
+// -----------------------------------------------------------------------
+// H1 (PR #1606): create_context_with_governance must validate
+// consequence rules with the same defense-in-depth check that
+// create_context applies. The two entry points share a single
+// helper (`validate_consequence_rules`) so the multi-admin path
+// cannot be used to slip through threshold==0, empty Custom triggers,
+// RemoveMember severities, or RevokeAccess without per-context opt-in.
+// =======================================================================
+
+/// Helper: builds a default Threshold(1) governance config with the
+/// creator as the sole signer. The H1 tests don't care about the
+/// governance shape — only the consequence-rule validation gate.
+fn h1_threshold_config(creator: &DID) -> (GovernanceModel, GovernanceModelConfig) {
+    let model = GovernanceModel::Threshold {
+        threshold: 1,
+        signers: vec![creator.clone()],
+    };
+    let config = GovernanceModelConfig::Threshold {
+        signers: vec![creator.clone()],
+        threshold: 1,
+        voting_window_secs: 86_400,
+    };
+    (model, config)
+}
+
+/// H1: `create_context_with_governance` rejects a `ConsequenceRule`
+/// with `threshold: 0`. Mirrors the M5 check `create_context` already
+/// performs via `validate_consequence_rules`.
+#[tokio::test]
+async fn create_with_governance_rejects_threshold_zero() {
+    use scp_protocol::trust::consequence::{
+        ConsequenceAction, ConsequenceRule, ConsequenceTrigger, EnforcementSeverity,
+    };
+    use std::time::Duration;
+
+    let manager = ContextManager::new(
+        Box::new(MockCrypto::default()),
+        Box::new(MockTransport::connected()),
+        Box::new(MockEventLog::default()),
+        noop_key_resolver(),
+    );
+    let creator: DID = "did:key:admin1".into();
+    let (governance, governance_config) = h1_threshold_config(&creator);
+    let params = ContextParams {
+        governance,
+        consequence_rules: vec![ConsequenceRule {
+            trigger: ConsequenceTrigger::MessageVelocity,
+            threshold: 0, // M5: must be > 0
+            action: ConsequenceAction::Enforcement(EnforcementSeverity::SuspendCapability {
+                capabilities: vec![Capability::MessagesWrite],
+            }),
+            window: Duration::from_secs(3600),
+        }],
+        ..ContextParams::default()
+    };
+    let result = manager
+        .create_context_with_governance("h1-thresh-zero".into(), params, creator, governance_config)
+        .await;
+    let err = result.expect_err("threshold == 0 must be rejected");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("threshold must be > 0"),
+        "expected M5 threshold rejection, got: {msg}"
+    );
+}
+
+/// H1: `create_context_with_governance` rejects a `ConsequenceRule`
+/// with an empty `Custom` trigger key (M6).
+#[tokio::test]
+async fn create_with_governance_rejects_empty_custom_trigger() {
+    use scp_protocol::trust::consequence::{
+        ConsequenceAction, ConsequenceRule, ConsequenceTrigger, EnforcementSeverity,
+    };
+    use std::time::Duration;
+
+    let manager = ContextManager::new(
+        Box::new(MockCrypto::default()),
+        Box::new(MockTransport::connected()),
+        Box::new(MockEventLog::default()),
+        noop_key_resolver(),
+    );
+    let creator: DID = "did:key:admin1".into();
+    let (governance, governance_config) = h1_threshold_config(&creator);
+    let params = ContextParams {
+        governance,
+        consequence_rules: vec![ConsequenceRule {
+            trigger: ConsequenceTrigger::Custom(String::new()), // M6: empty key
+            threshold: 1,
+            action: ConsequenceAction::Enforcement(EnforcementSeverity::SuspendCapability {
+                capabilities: vec![Capability::MessagesWrite],
+            }),
+            window: Duration::from_secs(3600),
+        }],
+        ..ContextParams::default()
+    };
+    let result = manager
+        .create_context_with_governance(
+            "h1-empty-custom".into(),
+            params,
+            creator,
+            governance_config,
+        )
+        .await;
+    let err = result.expect_err("empty Custom trigger key must be rejected");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("Custom trigger key must not be empty"),
+        "expected M6 empty Custom rejection, got: {msg}"
+    );
+}
+
+/// H1: `create_context_with_governance` rejects a `ConsequenceRule`
+/// referencing `EnforcementSeverity::RemoveMember`. MLS ejection is
+/// governance-only and never permitted in a consequence rule, even with
+/// `allow_automatic_access_revocation = true`.
+#[tokio::test]
+async fn create_with_governance_rejects_remove_member_action() {
+    use scp_protocol::trust::consequence::{
+        ConsequenceAction, ConsequenceRule, ConsequenceTrigger, EnforcementSeverity,
+    };
+    use std::time::Duration;
+
+    let manager = ContextManager::new(
+        Box::new(MockCrypto::default()),
+        Box::new(MockTransport::connected()),
+        Box::new(MockEventLog::default()),
+        noop_key_resolver(),
+    );
+    let creator: DID = "did:key:admin1".into();
+    let target: DID = "did:key:victim".into();
+    let (governance, governance_config) = h1_threshold_config(&creator);
+    let mut params = ContextParams {
+        governance,
+        consequence_rules: vec![ConsequenceRule {
+            trigger: ConsequenceTrigger::MessageVelocity,
+            threshold: 5,
+            action: ConsequenceAction::Enforcement(EnforcementSeverity::RemoveMember {
+                did: target,
+                reason: Some("test".to_owned()),
+            }),
+            window: Duration::from_secs(3600),
+        }],
+        ..ContextParams::default()
+    };
+    // Even with the config opt-in, RemoveMember must remain rejected.
+    params.consequence_config.allow_automatic_access_revocation = true;
+    let result = manager
+        .create_context_with_governance(
+            "h1-remove-member".into(),
+            params,
+            creator,
+            governance_config,
+        )
+        .await;
+    let err = result.expect_err("RemoveMember severity must be rejected");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("RemoveMember may not be referenced from a consequence rule"),
+        "expected RemoveMember rejection, got: {msg}"
+    );
+}
+
+/// H1: `create_context_with_governance` rejects a `ConsequenceRule`
+/// referencing `EnforcementSeverity::RevokeAccess` when the per-context
+/// `ConsequenceConfig::allow_automatic_access_revocation` flag is the
+/// default `false`.
+#[tokio::test]
+async fn create_with_governance_rejects_revoke_access_without_config_opt_in() {
+    use scp_protocol::context::governance::AccessScope;
+    use scp_protocol::trust::consequence::{
+        ConsequenceAction, ConsequenceRule, ConsequenceTrigger, EnforcementSeverity,
+    };
+    use std::time::Duration;
+
+    let manager = ContextManager::new(
+        Box::new(MockCrypto::default()),
+        Box::new(MockTransport::connected()),
+        Box::new(MockEventLog::default()),
+        noop_key_resolver(),
+    );
+    let creator: DID = "did:key:admin1".into();
+    let target: DID = "did:key:victim".into();
+    let (governance, governance_config) = h1_threshold_config(&creator);
+    let params = ContextParams {
+        governance,
+        consequence_rules: vec![ConsequenceRule {
+            trigger: ConsequenceTrigger::MessageVelocity,
+            threshold: 3,
+            action: ConsequenceAction::Enforcement(EnforcementSeverity::RevokeAccess {
+                did: target,
+                access: AccessScope::Both,
+            }),
+            window: Duration::from_secs(3600),
+        }],
+        // consequence_config defaults to allow_automatic_access_revocation = false.
+        ..ContextParams::default()
+    };
+    let result = manager
+        .create_context_with_governance(
+            "h1-revoke-no-opt-in".into(),
+            params,
+            creator,
+            governance_config,
+        )
+        .await;
+    let err = result.expect_err("RevokeAccess without opt-in must be rejected");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("RevokeAccess")
+            && msg.contains("not eligible for automatic consequence dispatch"),
+        "expected RevokeAccess opt-in rejection, got: {msg}"
+    );
+}
+
+/// H1: `create_context_with_governance` ACCEPTS a `ConsequenceRule`
+/// referencing `EnforcementSeverity::RevokeAccess` when the per-context
+/// `ConsequenceConfig::allow_automatic_access_revocation` flag is `true`.
+#[tokio::test]
+async fn create_with_governance_accepts_revoke_access_with_config_opt_in() {
+    use scp_protocol::context::governance::AccessScope;
+    use scp_protocol::trust::consequence::{
+        ConsequenceAction, ConsequenceRule, ConsequenceTrigger, EnforcementSeverity,
+    };
+    use std::time::Duration;
+
+    let manager = ContextManager::new(
+        Box::new(MockCrypto::default()),
+        Box::new(MockTransport::connected()),
+        Box::new(MockEventLog::default()),
+        noop_key_resolver(),
+    );
+    let creator: DID = "did:key:admin1".into();
+    let target: DID = "did:key:victim".into();
+    let (governance, governance_config) = h1_threshold_config(&creator);
+    let mut params = ContextParams {
+        governance,
+        consequence_rules: vec![ConsequenceRule {
+            trigger: ConsequenceTrigger::MessageVelocity,
+            threshold: 3,
+            action: ConsequenceAction::Enforcement(EnforcementSeverity::RevokeAccess {
+                did: target,
+                access: AccessScope::Both,
+            }),
+            window: Duration::from_secs(3600),
+        }],
+        ..ContextParams::default()
+    };
+    params.consequence_config.allow_automatic_access_revocation = true;
+    let handle = manager
+        .create_context_with_governance(
+            "h1-revoke-opt-in".into(),
+            params,
+            creator,
+            governance_config,
+        )
+        .await
+        .expect("RevokeAccess with opt-in must be accepted");
+    assert_eq!(handle.state().await, ContextState::Active);
+}
+
+/// H1: `create_context_with_governance` accepts a well-formed
+/// consequence rule with `MessageVelocity` + `SuspendCapability` —
+/// the happy path that should be unaffected by the new validation gate.
+#[tokio::test]
+async fn create_with_governance_accepts_valid_rules() {
+    use scp_protocol::trust::consequence::{
+        ConsequenceAction, ConsequenceRule, ConsequenceTrigger, EnforcementSeverity,
+    };
+    use std::time::Duration;
+
+    let manager = ContextManager::new(
+        Box::new(MockCrypto::default()),
+        Box::new(MockTransport::connected()),
+        Box::new(MockEventLog::default()),
+        noop_key_resolver(),
+    );
+    let creator: DID = "did:key:admin1".into();
+    let (governance, governance_config) = h1_threshold_config(&creator);
+    let params = ContextParams {
+        governance,
+        ceiling: vec![
+            scp_protocol::context::params::Capability::new("messages:read"),
+            scp_protocol::context::params::Capability::new("messages:write"),
+        ],
+        consequence_rules: vec![ConsequenceRule {
+            trigger: ConsequenceTrigger::MessageVelocity,
+            threshold: 5,
+            action: ConsequenceAction::Enforcement(EnforcementSeverity::SuspendCapability {
+                capabilities: vec![Capability::MessagesWrite],
+            }),
+            window: Duration::from_secs(3600),
+        }],
+        ..ContextParams::default()
+    };
+    let handle = manager
+        .create_context_with_governance("h1-valid-rules".into(), params, creator, governance_config)
+        .await
+        .expect("well-formed rules must be accepted");
+    assert_eq!(handle.state().await, ContextState::Active);
+}

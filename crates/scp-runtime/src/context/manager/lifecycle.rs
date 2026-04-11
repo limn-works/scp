@@ -1460,6 +1460,13 @@ impl ContextManager {
         )
         .map_err(|e| ContextCreationError::CreationFailed(e.to_string()))?;
 
+        // H1 (PR #1606): mirror create_context's defense-in-depth check so
+        // multi-admin contexts cannot bypass consequence-rule validation by
+        // taking the with_governance entry point. Rejects threshold == 0,
+        // empty Custom triggers, RemoveMember severities (governance-only),
+        // and RevokeAccess without `allow_automatic_access_revocation` opt-in.
+        validate_consequence_rules(&params.consequence_rules, &params.consequence_config)?;
+
         // Phase 1+2: builder performs validation and creation (async, no lock held).
         let handle = builder_create_context(
             context_id.clone(),
