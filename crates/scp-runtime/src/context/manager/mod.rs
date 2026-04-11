@@ -597,9 +597,37 @@ pub struct ContextSnapshot {
     #[serde(default)]
     pub budget_tracker: MemberBudgetTracker,
     /// Approved proposals pending execution, tracked for conflict detection (ADR-031 §7).
-    /// Maps proposal ID to (proposal, `sequence_number`, timestamp).
+    ///
+    /// Maps proposal ID to a tuple `(proposal, monotonic_seq, approved_at_unix_secs)`:
+    /// - `monotonic_seq` — the local monotonic sequence number assigned by
+    ///   [`GovernanceState::next_proposal_seq`] at conflict-detection time.
+    ///   Used by `detect_and_handle_conflicts` for sequential conflict
+    ///   resolution (lower seq wins). Strictly monotonic across the
+    ///   lifetime of a context, persisted in this snapshot, so two
+    ///   proposals can never share a seq even within the same wall-clock
+    ///   second (H10 fix).
+    /// - `approved_at_unix_secs` — the wall-clock Unix timestamp at
+    ///   approval, retained for audit / event-emission purposes only.
+    ///   Never used for conflict ordering.
     #[serde(default)]
     pub approved_proposals: HashMap<ProposalId, (GovernanceProposal, u64, u64)>,
+    /// Monotonic counter for assigning proposal sequence numbers to
+    /// approved proposals (H10, ADR-031 §7).
+    ///
+    /// Incremented every time a new approved proposal is inserted into
+    /// [`approved_proposals`](Self::approved_proposals). Persisted across
+    /// process restarts so two proposals can never share a sequence number
+    /// within the same context — eliminating the wall-clock collision
+    /// window that previously let an attacker race a conflicting proposal
+    /// against any defensive admin action and force a 48-hour governance
+    /// freeze.
+    ///
+    /// Backward compatible with legacy snapshots: missing field
+    /// deserializes as `0`. On `import_context` (untrusted exporter), the
+    /// counter is conservatively reset to `approved_proposals.len() as u64`
+    /// — see `lifecycle::import_context`.
+    #[serde(default)]
+    pub next_proposal_seq: u64,
     /// Governance freeze state due to simultaneous conflicts (ADR-031 §7).
     /// Contains the conflicting proposal IDs and freeze start timestamp.
     #[serde(default)]
@@ -878,8 +906,27 @@ struct GovernanceState {
     /// [`EXECUTED_PROPOSALS_TTL_SECS`] are evicted on each insert.
     executed_proposals: HashMap<ProposalId, u64>,
     /// Approved proposals pending execution, tracked for conflict detection (ADR-031 §7).
-    /// Maps proposal ID to (proposal, `sequence_number`, timestamp).
+    ///
+    /// Maps proposal ID to a tuple `(proposal, monotonic_seq, approved_at_unix_secs)`:
+    /// - `monotonic_seq` — the value of [`Self::next_proposal_seq`] at
+    ///   the moment the proposal was inserted. Strictly monotonic across
+    ///   the context lifetime; used by `detect_and_handle_conflicts` for
+    ///   sequential conflict resolution (lower seq wins). H10 fix —
+    ///   replaces wall-clock timestamps which collide within a 1-second
+    ///   window and can be raced into a 48-hour governance freeze.
+    /// - `approved_at_unix_secs` — wall-clock Unix timestamp at approval,
+    ///   retained for audit / event emission only. Never used for
+    ///   conflict ordering.
     approved_proposals: HashMap<ProposalId, (GovernanceProposal, u64, u64)>,
+    /// Monotonic counter for assigning proposal sequence numbers (H10, ADR-031 §7).
+    ///
+    /// Incremented every time `detect_and_handle_conflicts` inserts a new
+    /// approved proposal. Persisted in [`ContextSnapshot::next_proposal_seq`]
+    /// so two proposals can never share a sequence number even across
+    /// process restarts. On `import_context` (untrusted), reset
+    /// conservatively to `approved_proposals.len() as u64` — see
+    /// `lifecycle::import_context`.
+    next_proposal_seq: u64,
     /// Governance freeze state due to simultaneous conflicts (ADR-031 §7).
     /// Contains the conflicting proposal IDs and freeze start timestamp.
     freeze: Option<(ProposalId, ProposalId, u64)>,
@@ -2030,6 +2077,7 @@ impl ContextManager {
             economic_policy: ctx.governance.economic_policy.clone(),
             budget_tracker: ctx.governance.budget_tracker.clone(),
             approved_proposals: ctx.governance.approved_proposals.clone(),
+            next_proposal_seq: ctx.governance.next_proposal_seq,
             governance_freeze: ctx.governance.freeze,
             pending_ceiling_modification: ctx.governance.pending_ceiling_modification.clone(),
             pending_economic_policy_change: ctx.governance.pending_economic_policy_change.clone(),
