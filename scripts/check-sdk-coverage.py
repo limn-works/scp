@@ -347,6 +347,87 @@ ALIASES: dict[tuple[str, str], dict[str, list[str]]] = {
     ("Context", "receive"): {
         "kotlin": ["contextSubscribe"],
     },
+    # Context -- consequence_rules surfaced via the existing create() and
+    # context_create wrappers (parameter, not a separate function).
+    ("Context", "create_with_consequence_rules"): {
+        "python": ["create"],
+        "typescript": ["create"],
+        "swift": ["contextCreate"],
+    },
+    # Messaging -- spending_ucan_jwt is a parameter on send() / context_send
+    # exposed via existing wrappers in all four SDKs.
+    ("Messaging", "send_with_spending_ucan"): {
+        "python": ["send"],
+        "typescript": ["send"],
+        "kotlin": ["contextSend"],
+        "swift": ["send"],
+    },
+    # Messaging -- spending_ucan_jwt parameter on join() / context_join.
+    # Bridge drift documented in matrix notes; tree-sitter sees the wrapper
+    # signature in PyO3, NAPI TS, and Swift surfaces.
+    ("Messaging", "join_with_spending_ucan"): {
+        "python": ["join"],
+        "typescript": ["join"],
+        "swift": ["joinContext"],
+    },
+    # Trust -- consequence rule validation is exercised via aggregate_trust_input
+    # (consequenceRulesJson parameter is parsed and validated in all four SDKs).
+    ("Trust", "consequence_rule_validate"): {
+        "python": ["aggregate_trust_input"],
+        "typescript": ["aggregateTrustInput"],
+        "kotlin": ["aggregateTrustInput"],
+        "swift": ["aggregateTrustInput"],
+    },
+    ("Trust", "evaluate_consequence_rules"): {
+        "python": ["aggregate_trust_input"],
+        "typescript": ["aggregateTrustInput"],
+        "kotlin": ["aggregateTrustInput"],
+        "swift": ["aggregateTrustInput"],
+    },
+    # Governance -- new GovernanceAction variants dispatched via the existing
+    # execute_action / propose_action entry points.
+    ("Governance", "execute_suspend_capability"): {
+        "python": ["execute_governance_action"],
+        "typescript": ["executeGovernanceAction"],
+        "kotlin": ["governanceExecute"],
+        "swift": ["executeGovernanceAction"],
+    },
+    ("Governance", "execute_suspend_access"): {
+        "python": ["execute_governance_action"],
+        "typescript": ["executeGovernanceAction"],
+        "kotlin": ["governanceExecute"],
+        "swift": ["executeGovernanceAction"],
+    },
+    ("Governance", "execute_revoke_access"): {
+        "python": ["execute_governance_action"],
+        "typescript": ["executeGovernanceAction"],
+        "kotlin": ["governanceExecute"],
+        "swift": ["executeGovernanceAction"],
+    },
+    ("Governance", "execute_restore_access"): {
+        "python": ["execute_governance_action"],
+        "typescript": ["executeGovernanceAction"],
+        "kotlin": ["governanceExecute"],
+        "swift": ["executeGovernanceAction"],
+    },
+    ("Governance", "execute_remove_member"): {
+        "python": ["execute_governance_action"],
+        "typescript": ["executeGovernanceAction"],
+        "kotlin": ["governanceExecute"],
+        "swift": ["executeGovernanceAction"],
+    },
+    ("Governance", "execute_rotate_content_keys"): {
+        "python": ["execute_governance_action"],
+        "typescript": ["executeGovernanceAction"],
+        "kotlin": ["governanceExecute"],
+        "swift": ["executeGovernanceAction"],
+    },
+    ("Governance", "propose_governance_action_checked"): {
+        "python": ["propose_governance_action"],
+        "typescript": ["proposeGovernanceAction"],
+        "kotlin": ["governancePropose"],
+        "swift": ["proposeGovernanceAction"],
+    },
 }
 
 
