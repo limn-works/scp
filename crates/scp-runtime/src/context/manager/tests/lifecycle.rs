@@ -2962,3 +2962,536 @@ async fn capture_join_payment_failure_pushes_receive_buffer_event() {
         "PaymentCaptureFailed event must be in receive buffer; events: {events:?}"
     );
 }
+
+// -----------------------------------------------------------------------
+// C3: snapshot import / restore validation tests
+// -----------------------------------------------------------------------
+//
+// These tests cover the C3 fix for `import_context` and `restore_context`:
+// untrusted exports must wipe per-instance authorization state and the
+// fields they keep must be revalidated. See `lifecycle::sanitize_cooldown_until`,
+// `validate_consequence_rules_for_import`, and the wipe assignments in
+// `import_context`. Mirror the WASM bridge `validate_imported_snapshot`
+// policy at the runtime layer.
+
+/// Builds a minimal valid `ContextSnapshot` for C3 import tests.
+///
+/// Defaults: empty membership, empty event log, empty trackers, empty
+/// `approved_proposals`. Tests mutate the returned snapshot to inject
+/// the specific attacker payload they want to exercise.
+#[allow(clippy::too_many_lines)]
+fn c3_test_snapshot(context_id: &str) -> super::ContextSnapshot {
+    use scp_protocol::context::roles::{ContextRoleState, default_ceiling};
+
+    let params = ContextParams::default();
+    let ceiling = default_ceiling();
+    let role_state = ContextRoleState::new(
+        context_id,
+        "did:key:c3-creator",
+        ceiling,
+        vec![],
+        &scp_primitives::SystemClock,
+    )
+    .unwrap();
+    let membership = MembershipState::new();
+
+    super::ContextSnapshot {
+        context_id: context_id.to_owned(),
+        state: ContextState::Active,
+        context_params: params,
+        membership,
+        role_state,
+        executed_proposals: HashSet::new(),
+        ttl_remaining_secs: None,
+        registered_tools: Vec::new(),
+        read_exclusion_list: HashSet::new(),
+        tool_interfaces: Vec::new(),
+        threshold_signers: Vec::new(),
+        threshold_value: 0,
+        pruning_policy: None,
+        governance_model_config: None,
+        economic_policy: None,
+        budget_tracker: scp_protocol::economy::budget::MemberBudgetTracker::new(),
+        approved_proposals: HashMap::new(),
+        governance_freeze: None,
+        pending_ceiling_modification: None,
+        pending_economic_policy_change: None,
+        mls_epoch: 0,
+        epoch_coordination_records: Vec::new(),
+        grace_entries: Vec::new(),
+        needs_reconnect: false,
+        migration_state: None,
+        mls_crypto_state: Vec::new(),
+        access_key_store: scp_protocol::crypto::access_keys::AccessKeyStore::new(),
+        consequence_rules: Vec::new(),
+        participation_cache: std::collections::HashMap::new(),
+        velocity_tracker: None,
+        velocity_tracker_state: None,
+        cooldown_until: std::collections::HashMap::new(),
+        proposal_timestamps: std::collections::HashMap::new(),
+        message_pricing: None,
+        hard_rate_limit_config: None,
+        hard_rate_limit_state: std::collections::HashMap::new(),
+        spending_nonce_tracker_state: std::collections::HashMap::new(),
+    }
+}
+
+/// Wraps a snapshot in a `ContextExport` for importing via
+/// `manager.import_context`. Uses the canonical `create_export` factory so
+/// the Merkle root and version fields stay consistent with the production
+/// path.
+fn c3_export_from_snapshot(
+    snapshot: super::ContextSnapshot,
+) -> crate::context::export_import::ContextExport {
+    crate::context::export_import::create_export(
+        snapshot,
+        Vec::new(), // empty event log — C3 wipe paths don't depend on it
+        Vec::new(),
+        DID::from("did:key:c3-exporter"),
+        crate::context::export_import::ExportScope::Full,
+        &scp_primitives::SystemClock,
+    )
+    .unwrap()
+}
+
+fn c3_manager() -> ContextManager {
+    ContextManager::new(
+        Box::new(MockCrypto::default()),
+        Box::new(MockTransport::connected()),
+        Box::new(MockEventLog::default()),
+        noop_key_resolver(),
+    )
+}
+
+/// C3 test 1: an attacker-crafted snapshot with `approved_proposals`
+/// containing `RemoveMember { did: victim }` must NOT block the victim
+/// from proposing after import. The pre-fix code carried the forged
+/// `approved_proposals` straight into `PerContextState`, and
+/// `check_proposer_eligibility` then refused every proposal from the
+/// victim because `approved_proposals` contained a pending ejection
+/// against them.
+#[tokio::test]
+async fn import_context_rejects_forged_approved_proposals() {
+    use scp_protocol::context::governance::{GovernanceAction, GovernanceProposal, ProposalStatus};
+
+    let manager = c3_manager();
+    let mut snapshot = c3_test_snapshot("c3-forged-approvals");
+
+    let victim = DID::from("did:key:c3-victim");
+    let forged_id = [0xAA_u8; 32];
+    let forged_proposal = GovernanceProposal {
+        proposal_id: forged_id,
+        context_id: "c3-forged-approvals".to_owned(),
+        proposer_did: DID::from("did:key:c3-attacker"),
+        action: GovernanceAction::RemoveMember {
+            did: victim.clone(),
+            reason: Some("forged".to_owned()),
+        },
+        status: ProposalStatus::Approved,
+        created_at: 0,
+        voting_deadline: u64::MAX,
+        approvals: vec![],
+        rejections: vec![],
+        created_at_epoch: Some(0),
+    };
+    snapshot
+        .approved_proposals
+        .insert(forged_id, (forged_proposal, 0, 0));
+
+    let export = c3_export_from_snapshot(snapshot);
+    let _handle = manager.import_context(export).await.unwrap();
+
+    // After import the per-context governance state must NOT contain
+    // the forged approval — wipe-on-import is the entire fix for C3.
+    let contexts = manager.contexts.lock().await;
+    let ctx = contexts.get("c3-forged-approvals").unwrap();
+    assert!(
+        ctx.governance.approved_proposals.is_empty(),
+        "import_context must wipe approved_proposals (had {} entries)",
+        ctx.governance.approved_proposals.len()
+    );
+    // Victim DID must not appear in any pending-ejection slot — and
+    // since the entire map is empty, that's trivially true.
+    for (proposal, _seq, _ts) in ctx.governance.approved_proposals.values() {
+        if let GovernanceAction::RemoveMember { did, .. } = &proposal.action {
+            assert_ne!(
+                did, &victim,
+                "victim must not have a pending ejection after import"
+            );
+        }
+    }
+}
+
+/// C3 test 2: imported `budget_tracker` must be wiped. Per-instance
+/// economic grants are not transferable across nodes — inheriting an
+/// attacker's pre-loaded budgets gives the attacker arbitrary spend
+/// authority on the importing node.
+#[tokio::test]
+async fn import_context_wipes_budget_tracker() {
+    use scp_protocol::economy::types::Amount;
+
+    let manager = c3_manager();
+    let mut snapshot = c3_test_snapshot("c3-wipe-budget");
+
+    let attacker = DID::from("did:key:c3-attacker-budget");
+    snapshot
+        .budget_tracker
+        .grant(&attacker, Amount::new(1_000_000));
+    assert!(
+        snapshot.budget_tracker.has_budget(&attacker),
+        "precondition: snapshot carries attacker budget"
+    );
+
+    let export = c3_export_from_snapshot(snapshot);
+    manager.import_context(export).await.unwrap();
+
+    let contexts = manager.contexts.lock().await;
+    let ctx = contexts.get("c3-wipe-budget").unwrap();
+    assert!(
+        !ctx.governance.budget_tracker.has_budget(&attacker),
+        "import_context must wipe budget_tracker entries"
+    );
+    assert_eq!(
+        ctx.governance.budget_tracker.remaining(&attacker),
+        Amount::new(0),
+        "wiped budget must report zero remaining"
+    );
+}
+
+/// C3 test 3: imported `participation_cache` must be wiped. The cache
+/// is rebuilt lazily from the imported event log on next proposer
+/// eligibility check (`check_proposer_eligibility`); inheriting it
+/// lets the exporter forge low-participation verdicts against any
+/// DID it picks.
+#[tokio::test]
+async fn import_context_wipes_participation_cache() {
+    use scp_protocol::trust::GovernanceActionSummary;
+    use scp_protocol::trust::participation::ParticipationRecord;
+
+    let manager = c3_manager();
+    let mut snapshot = c3_test_snapshot("c3-wipe-participation");
+
+    let victim = "did:key:c3-victim-participation";
+    // Pre-load 100 actions-against against the victim. After import,
+    // a non-wiping implementation would feed this straight into
+    // `meets_threshold` (governance_actions_against >
+    // governance_actions_by → blocked) and lock the victim out of
+    // governance forever.
+    let attacker = DID::from("did:key:c3-participation-attacker");
+    let against: Vec<GovernanceActionSummary> = (0..100u64)
+        .map(|i| GovernanceActionSummary {
+            timestamp: 1_700_000_000 + i,
+            actor_did: attacker.clone(),
+            target_did: Some(DID::from(victim)),
+            event_sequence: i,
+        })
+        .collect();
+    let victim_record = ParticipationRecord {
+        subject_did: DID::from(victim),
+        context_id: "c3-wipe-participation".to_owned(),
+        participation_count: 5,
+        participation_duration_seconds: 3600,
+        tool_invocations: HashMap::new(),
+        governance_actions_by: Vec::new(),
+        governance_actions_against: against,
+        role_history: Vec::new(),
+        attestation_history: Vec::new(),
+        context_creation_count: 0,
+        computed_at: 1_700_000_100,
+        event_log_root: [0u8; 32],
+    };
+    snapshot
+        .participation_cache
+        .insert(victim.to_owned(), victim_record);
+
+    let export = c3_export_from_snapshot(snapshot);
+    manager.import_context(export).await.unwrap();
+
+    let contexts = manager.contexts.lock().await;
+    let ctx = contexts.get("c3-wipe-participation").unwrap();
+    assert!(
+        ctx.governance.participation_cache.is_empty(),
+        "import_context must wipe participation_cache (had {} entries)",
+        ctx.governance.participation_cache.len()
+    );
+}
+
+/// C3 test 4: a consequence rule with `threshold = 0` must be rejected
+/// at import time. `validate` already rejects this in the create-time
+/// path; the import path now uses the same `validate_against_config`
+/// gate via `validate_consequence_rules_for_import`.
+#[tokio::test]
+async fn import_context_rejects_threshold_zero_in_rules() {
+    use scp_protocol::trust::consequence::{
+        ConsequenceAction, ConsequenceRule, ConsequenceTrigger, EnforcementSeverity,
+    };
+
+    let manager = c3_manager();
+    let mut snapshot = c3_test_snapshot("c3-threshold-zero");
+    snapshot.consequence_rules.push(ConsequenceRule {
+        trigger: ConsequenceTrigger::MessageVelocity,
+        action: ConsequenceAction::Enforcement(EnforcementSeverity::SuspendAccess),
+        threshold: 0, // invalid — `validate()` rejects this
+        window: std::time::Duration::from_secs(60),
+    });
+
+    let export = c3_export_from_snapshot(snapshot);
+    let result = manager.import_context(export).await;
+    let err = result.expect_err("import must reject threshold == 0");
+    match err {
+        ContextError::ImportRejected { reason } => {
+            assert!(
+                reason.contains("consequence_rules[0]") && reason.contains("threshold"),
+                "ImportRejected reason should mention rule index and threshold: {reason}"
+            );
+        }
+        other => panic!("expected ImportRejected, got {other:?}"),
+    }
+}
+
+/// C3 test 5: a `RevokeAccess` consequence rule must be rejected when
+/// the imported `consequence_config.allow_automatic_access_revocation`
+/// is `false` (the default). The pre-fix code only ran shape
+/// validation, not the config gate — meaning a malicious export with
+/// the opt-in flag silently flipped on its local copy could install a
+/// `RevokeAccess` rule on the importing node where the flag was off.
+#[tokio::test]
+async fn import_context_rejects_revokeaccess_without_config_opt_in() {
+    use scp_protocol::context::AccessScope;
+    use scp_protocol::trust::consequence::{
+        ConsequenceAction, ConsequenceRule, ConsequenceTrigger, EnforcementSeverity,
+    };
+
+    let manager = c3_manager();
+    let mut snapshot = c3_test_snapshot("c3-revoke-no-opt-in");
+    // Default consequence_config has allow_automatic_access_revocation = false.
+    assert!(
+        !snapshot
+            .context_params
+            .consequence_config
+            .allow_automatic_access_revocation,
+        "precondition: default config must not opt in"
+    );
+    snapshot.consequence_rules.push(ConsequenceRule {
+        trigger: ConsequenceTrigger::WarningCount,
+        action: ConsequenceAction::Enforcement(EnforcementSeverity::RevokeAccess {
+            did: DID::from("did:key:c3-victim-revoke"),
+            access: AccessScope::Both,
+        }),
+        threshold: 3,
+        window: std::time::Duration::from_secs(3600),
+    });
+
+    let export = c3_export_from_snapshot(snapshot);
+    let result = manager.import_context(export).await;
+    let err = result.expect_err("import must reject RevokeAccess without opt-in");
+    match err {
+        ContextError::ImportRejected { reason } => {
+            assert!(
+                reason.contains("RevokeAccess") || reason.contains("allow_automatic"),
+                "ImportRejected reason should mention the missing opt-in: {reason}"
+            );
+        }
+        other => panic!("expected ImportRejected, got {other:?}"),
+    }
+}
+
+/// C3 test 6: `cooldown_until[i] = u64::MAX` must be clamped to
+/// `now + MAX_COOLDOWN_SECS`. Without clamping, an attacker can ship
+/// a snapshot that permanently disables a consequence rule by parking
+/// its cooldown beyond any plausible wall-clock horizon.
+#[tokio::test]
+async fn import_context_clamps_cooldown_until() {
+    use scp_protocol::trust::consequence::{
+        ConsequenceAction, ConsequenceRule, ConsequenceTrigger, EnforcementSeverity,
+    };
+
+    let manager = c3_manager();
+    let mut snapshot = c3_test_snapshot("c3-clamp-cooldown");
+    // Need at least one rule so cooldown_until[0] is in-range.
+    snapshot.consequence_rules.push(ConsequenceRule {
+        trigger: ConsequenceTrigger::MessageVelocity,
+        action: ConsequenceAction::Enforcement(EnforcementSeverity::SuspendAccess),
+        threshold: 5,
+        window: std::time::Duration::from_secs(60),
+    });
+    snapshot.cooldown_until.insert(0, u64::MAX);
+    // Also include an out-of-range index so we exercise the drop path.
+    snapshot.cooldown_until.insert(99, 1_700_000_000);
+
+    let now_before = scp_primitives::SystemClock.now_secs();
+    let export = c3_export_from_snapshot(snapshot);
+    manager.import_context(export).await.unwrap();
+
+    let contexts = manager.contexts.lock().await;
+    let ctx = contexts.get("c3-clamp-cooldown").unwrap();
+    let clamped = ctx
+        .governance
+        .cooldown_until
+        .get(&0)
+        .copied()
+        .expect("cooldown_until[0] should remain after clamp");
+    let expected_max = now_before
+        .saturating_add(super::super::lifecycle::MAX_COOLDOWN_SECS)
+        // tolerate a few seconds of drift between the snapshot and the import
+        .saturating_add(60);
+    assert!(
+        clamped <= expected_max,
+        "cooldown_until[0] = {clamped} should be clamped to <= {expected_max}"
+    );
+    assert!(
+        clamped > 0,
+        "clamp horizon should be a future timestamp, not zero"
+    );
+    assert!(
+        !ctx.governance.cooldown_until.contains_key(&99),
+        "out-of-range cooldown index 99 must be dropped"
+    );
+}
+
+/// C3 test 7 (regression): `restore_context` is the local-trusted
+/// path. Budgets are authoritative there and MUST survive a restart —
+/// the C3 wipe policy applies only to `import_context`.
+#[tokio::test]
+async fn restore_context_preserves_budget_tracker() {
+    use scp_protocol::context::roles::{ContextRoleState, default_ceiling};
+    use scp_protocol::economy::types::Amount;
+
+    let persistence = Arc::new(MockContextPersistence::default());
+
+    let params = ContextParams {
+        ceiling: vec![
+            scp_protocol::context::params::Capability::new("messages:read"),
+            scp_protocol::context::params::Capability::new("messages:write"),
+        ],
+        ..ContextParams::default()
+    };
+
+    let ceiling = default_ceiling();
+    let role_state = ContextRoleState::new(
+        "c3-restore-budget",
+        "did:key:creator",
+        ceiling,
+        vec![],
+        &scp_primitives::SystemClock,
+    )
+    .unwrap();
+    let mut membership = MembershipState::new();
+    membership.add_member("did:key:creator".into(), "admin".into(), vec![]);
+
+    let mut budget_tracker = scp_protocol::economy::budget::MemberBudgetTracker::new();
+    let alice = DID::from("did:key:alice");
+    budget_tracker.grant(&alice, Amount::new(500));
+
+    let mut snapshot = c3_test_snapshot("c3-restore-budget");
+    snapshot.context_params = params.clone();
+    snapshot.membership = membership;
+    snapshot.role_state = role_state;
+    snapshot.budget_tracker = budget_tracker;
+
+    persistence
+        .persist_context("c3-restore-budget", &snapshot)
+        .unwrap();
+
+    let manager = ContextManager::with_persistence(
+        Box::new(MockCrypto::default()),
+        Box::new(MockTransport::connected()),
+        Box::new(MockEventLog::default()),
+        Box::new(MockContextPersistence {
+            contexts: std::sync::Mutex::new(persistence.contexts.lock().unwrap().clone()),
+            broadcasts: std::sync::Mutex::new(HashMap::new()),
+        }),
+        noop_key_resolver(),
+    );
+
+    let handle = ContextHandle::new("c3-restore-budget".to_owned(), params);
+    handle.transition_to(&ContextState::Active).await.unwrap();
+    manager
+        .restore_context("c3-restore-budget", &handle)
+        .await
+        .unwrap();
+
+    let contexts = manager.contexts.lock().await;
+    let ctx = contexts.get("c3-restore-budget").unwrap();
+    assert_eq!(
+        ctx.governance.budget_tracker.remaining(&alice),
+        Amount::new(500),
+        "restore_context must preserve local budget grants"
+    );
+}
+
+/// C3 test 8: `restore_context` must still reject inconsistent
+/// `consequence_rules` + `consequence_config` combinations. Local
+/// restore is "trusted" for authorization state, but a config
+/// regression (e.g., the user toggled `allow_automatic_access_revocation`
+/// off between snapshots) MUST not silently load `RevokeAccess` rules.
+#[tokio::test]
+async fn restore_context_validates_consequence_rules() {
+    use scp_protocol::context::AccessScope;
+    use scp_protocol::context::roles::{ContextRoleState, default_ceiling};
+    use scp_protocol::trust::consequence::{
+        ConsequenceAction, ConsequenceRule, ConsequenceTrigger, EnforcementSeverity,
+    };
+
+    let persistence = Arc::new(MockContextPersistence::default());
+
+    let params = ContextParams {
+        ceiling: vec![
+            scp_protocol::context::params::Capability::new("messages:read"),
+            scp_protocol::context::params::Capability::new("messages:write"),
+        ],
+        ..ContextParams::default()
+    };
+    // Default consequence_config has allow_automatic_access_revocation = false.
+    let ceiling = default_ceiling();
+    let role_state = ContextRoleState::new(
+        "c3-restore-bad-rules",
+        "did:key:creator",
+        ceiling,
+        vec![],
+        &scp_primitives::SystemClock,
+    )
+    .unwrap();
+    let mut membership = MembershipState::new();
+    membership.add_member("did:key:creator".into(), "admin".into(), vec![]);
+
+    let mut snapshot = c3_test_snapshot("c3-restore-bad-rules");
+    snapshot.context_params = params.clone();
+    snapshot.membership = membership;
+    snapshot.role_state = role_state;
+    snapshot.consequence_rules.push(ConsequenceRule {
+        trigger: ConsequenceTrigger::WarningCount,
+        action: ConsequenceAction::Enforcement(EnforcementSeverity::RevokeAccess {
+            did: DID::from("did:key:victim"),
+            access: AccessScope::Both,
+        }),
+        threshold: 3,
+        window: std::time::Duration::from_secs(3600),
+    });
+
+    persistence
+        .persist_context("c3-restore-bad-rules", &snapshot)
+        .unwrap();
+
+    let manager = ContextManager::with_persistence(
+        Box::new(MockCrypto::default()),
+        Box::new(MockTransport::connected()),
+        Box::new(MockEventLog::default()),
+        Box::new(MockContextPersistence {
+            contexts: std::sync::Mutex::new(persistence.contexts.lock().unwrap().clone()),
+            broadcasts: std::sync::Mutex::new(HashMap::new()),
+        }),
+        noop_key_resolver(),
+    );
+
+    let handle = ContextHandle::new("c3-restore-bad-rules".to_owned(), params);
+    handle.transition_to(&ContextState::Active).await.unwrap();
+    let result = manager
+        .restore_context("c3-restore-bad-rules", &handle)
+        .await;
+    let err = result.expect_err("restore must reject inconsistent consequence_rules");
+    assert!(
+        matches!(err, ContextError::ImportRejected { .. }),
+        "expected ImportRejected, got {err:?}"
+    );
+}
