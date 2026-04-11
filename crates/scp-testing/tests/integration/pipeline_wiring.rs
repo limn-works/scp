@@ -588,6 +588,125 @@ fn wasm_dispatch_consequences_calls_evaluate_consequence_rules() {
     );
 }
 
+// ---------------------------------------------------------------------------
+// C2 — WASM economy fail-closed gate (PR #1606 follow-up)
+//
+// The WASM bridge cannot run scp-runtime's `enforce_economy` pipeline (no
+// payment adapter, no budget tracker, no velocity tracker, no hard rate
+// limit token bucket — see ADR-034). Without a fail-closed gate, paid
+// contexts would silently bypass economic enforcement on every send / join.
+//
+// These assertions verify the gate exists at the AST level so a future
+// refactor cannot silently delete the spending_ucan_jwt parameter wiring
+// or the economic_policy inspection branch.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn wasm_send_message_inspects_spending_ucan_and_economic_policy() {
+    let body = extract_fn_body(WASM_MANAGER_SRC, "send_message")
+        .expect("WASM send_message body must exist");
+
+    // The parameter must NOT be underscore-prefixed: that name silently
+    // discards the JWT and was the original C2 bug. The C2 fix renames
+    // it to `spending_ucan_jwt` and references it in the rejection
+    // branch so the parameter is no longer dropped.
+    assert!(
+        body.contains("spending_ucan_jwt"),
+        "WASM send_message body must reference `spending_ucan_jwt` so the \
+         parameter is no longer silently discarded (C2 fail-closed gate)"
+    );
+
+    // The body must inspect the context's economic_policy to drive the
+    // fail-closed rejection branch.
+    assert!(
+        body.contains("economic_policy"),
+        "WASM send_message body must reference `economic_policy` to drive \
+         the fail-closed rejection (C2 — paid policies cannot be enforced \
+         on the WASM bridge per ADR-034)"
+    );
+
+    // The reject branch must surface the SCP-ECON-12096 code so the SDK
+    // layer can convert it to a typed `WasmCannotValidateSpendingUcan`
+    // error.
+    assert!(
+        body.contains("SCP_ECON_WASM_CANNOT_VALIDATE_SPENDING_UCAN")
+            || body.contains("SCP-ECON-12096"),
+        "WASM send_message must emit SCP-ECON-12096 in the C2 rejection branch"
+    );
+}
+
+#[test]
+fn wasm_join_context_inspects_spending_ucan_and_economic_policy() {
+    let body = extract_fn_body(WASM_MANAGER_SRC, "join_context")
+        .expect("WASM join_context body must exist");
+
+    assert!(
+        body.contains("spending_ucan_jwt"),
+        "WASM join_context body must reference `spending_ucan_jwt` so the \
+         parameter is no longer silently discarded (C2 fail-closed gate)"
+    );
+
+    assert!(
+        body.contains("economic_policy"),
+        "WASM join_context body must reference `economic_policy` to drive \
+         the fail-closed rejection (C2 — paid policies cannot be enforced \
+         on the WASM bridge per ADR-034)"
+    );
+
+    assert!(
+        body.contains("SCP_ECON_WASM_CANNOT_VALIDATE_SPENDING_UCAN")
+            || body.contains("SCP-ECON-12096"),
+        "WASM join_context must emit SCP-ECON-12096 in the C2 rejection branch"
+    );
+}
+
+#[test]
+fn wasm_create_context_rejects_paid_economic_policy() {
+    let body = extract_fn_body(WASM_MANAGER_SRC, "create_context")
+        .expect("WASM create_context body must exist");
+
+    // The gate is implemented via the `stored_policy_requires_payment`
+    // helper so the gate logic can be unit-tested independently. The
+    // create-time gate ALSO references `economic_policy` (because that
+    // is the field whose paid-ness is being checked) and surfaces the
+    // SCP-ECON-12095 code in the rejection.
+    assert!(
+        body.contains("stored_policy_requires_payment"),
+        "WASM create_context must call `stored_policy_requires_payment` to \
+         drive the C2 fail-closed rejection of paid economic policies"
+    );
+
+    assert!(
+        body.contains("SCP_ECON_PAID_POLICY_UNSUPPORTED_ON_WASM")
+            || body.contains("SCP-ECON-12095"),
+        "WASM create_context must emit SCP-ECON-12095 in the C2 rejection branch"
+    );
+}
+
+#[test]
+fn wasm_set_economic_policy_governance_rejects_paid_policy() {
+    // The C2 gate also fires through governance dispatch so a paid
+    // policy cannot enter WASM state via the back door. The dispatch
+    // path was extracted to `dispatch_set_economic_policy` to keep the
+    // parent match arm under `clippy::too_many_lines`.
+    let body = extract_fn_body(WASM_MANAGER_SRC, "dispatch_set_economic_policy")
+        .expect("WASM dispatch_set_economic_policy body must exist");
+
+    assert!(
+        body.contains("policy_requires_payment"),
+        "WASM dispatch_set_economic_policy must call `policy_requires_payment` \
+         to drive the C2 fail-closed rejection of paid economic policies via \
+         governance"
+    );
+
+    assert!(
+        body.contains("SCP_ECON_PAID_POLICY_UNSUPPORTED_ON_WASM")
+            || body.contains("SCP-ECON-12095"),
+        "WASM dispatch_set_economic_policy must emit SCP-ECON-12095 in the \
+         C2 rejection branch"
+    );
+}
+
 // ===========================================================================
 // Meta-tests — ratchet and tamper detection
 // ===========================================================================

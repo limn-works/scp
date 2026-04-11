@@ -19,6 +19,8 @@
  * | `SCP-STORAGE-`  | 8000-8999   | Storage errors      |
  * | `SCP-ATTEST-`   | 9000-9999   | Attestation errors  |
  * | `SCP-MCP-`      | 10000-10999 | MCP errors          |
+ * | `SCP-GOV-`      | 11000-11999 | Governance errors   |
+ * | `SCP-ECON-`     | 12000-12999 | Economy errors      |
  *
  * See ADR-022 in `.docs/adrs/phase-4.md`.
  */
@@ -145,6 +147,62 @@ export class McpError extends ScpError {
   }
 }
 
+/** Governance proposal, vote, or dispatch failures (SCP-GOV-* range). */
+export class GovernanceError extends ScpError {
+  constructor(message: string, code: string) {
+    super(message, code);
+    this.name = "GovernanceError";
+  }
+}
+
+/** Economy / payment / spending UCAN / budget failures (SCP-ECON-* range). */
+export class EconomyError extends ScpError {
+  constructor(message: string, code: string) {
+    super(message, code);
+    this.name = "EconomyError";
+  }
+}
+
+/**
+ * The browser (WASM) bridge cannot enforce a paid context's economic policy
+ * because `scp-runtime`'s `enforce_economy` pipeline (payment adapter, budget
+ * tracker, velocity tracker, hard rate limit token bucket) does not compile
+ * to `wasm32` per ADR-034. Creating a paid context — or running a
+ * `SetEconomicPolicy` governance action with a paid policy — from the WASM
+ * bridge is rejected fail-closed with `SCP-ECON-12095`.
+ *
+ * To create paid contexts, use a native (Python / Node.js / Swift / Kotlin)
+ * client whose bridge does run `enforce_economy`.
+ *
+ * Subclass of [`EconomyError`].
+ */
+export class EconomicPolicyUnsupportedOnWasm extends EconomyError {
+  constructor(message: string, code: string) {
+    super(message, code);
+    this.name = "EconomicPolicyUnsupportedOnWasm";
+  }
+}
+
+/**
+ * The browser (WASM) bridge cannot cryptographically validate a spending
+ * UCAN against a payment adapter, budget tracker, velocity tracker, or hard
+ * rate limit token bucket because `scp-runtime`'s `enforce_economy` pipeline
+ * does not compile to `wasm32` per ADR-034. Joining or sending into a paid
+ * context from the WASM bridge is rejected fail-closed with
+ * `SCP-ECON-12096`, regardless of whether `spending_ucan_jwt` is supplied.
+ *
+ * To join or send messages in paid contexts, use a native (Python / Node.js
+ * / Swift / Kotlin) client whose bridge does run `enforce_economy`.
+ *
+ * Subclass of [`EconomyError`].
+ */
+export class WasmCannotValidateSpendingUcan extends EconomyError {
+  constructor(message: string, code: string) {
+    super(message, code);
+    this.name = "WasmCannotValidateSpendingUcan";
+  }
+}
+
 // ---------------------------------------------------------------------------
 // Error parsing — bridge error message to typed ScpError
 // ---------------------------------------------------------------------------
@@ -169,7 +227,28 @@ const ERROR_PREFIX_MAP: ReadonlyArray<readonly [string, ScpErrorConstructor]> = 
   ["SCP-STORAGE-", StorageError],
   ["SCP-ATTEST-", AttestationError],
   ["SCP-MCP-", McpError],
+  ["SCP-GOV-", GovernanceError],
+  ["SCP-ECON-", EconomyError],
 ];
+
+/**
+ * Per-code overrides used when a specific error code maps to a more
+ * specific subclass than its category prefix would suggest. The map is
+ * checked BEFORE the prefix walk so a single ECON code can resolve to
+ * `EconomicPolicyUnsupportedOnWasm` rather than the generic
+ * `EconomyError`.
+ *
+ * Today this only carries the C2 fail-closed gate codes (SCP-ECON-12095
+ * and SCP-ECON-12096). Add new entries when a code needs an inheritance-
+ * specific subclass that the bracketed prefix alone cannot select.
+ */
+const ERROR_CODE_OVERRIDES: ReadonlyMap<string, ScpErrorConstructor> = new Map<
+  string,
+  ScpErrorConstructor
+>([
+  ["SCP-ECON-12095", EconomicPolicyUnsupportedOnWasm],
+  ["SCP-ECON-12096", WasmCannotValidateSpendingUcan],
+]);
 
 /**
  * Parses a bridge error message and constructs the appropriate `ScpError`
@@ -177,7 +256,8 @@ const ERROR_PREFIX_MAP: ReadonlyArray<readonly [string, ScpErrorConstructor]> = 
  *
  * Bridge errors follow the format `"[SCP-CATEGORY-NUMBER] description"`.
  * If the error message does not match any known prefix, a generic `ScpError`
- * is returned.
+ * is returned. Specific error codes may be promoted to a finer-grained
+ * subclass via [`ERROR_CODE_OVERRIDES`].
  *
  * @param error - The raw error from the bridge layer (Error, string, or unknown).
  * @returns A typed `ScpError` subclass instance.
@@ -188,6 +268,12 @@ export function mapBridgeError(error: unknown): ScpError {
   // Try to extract the bracketed error code: "[SCP-IDENT-1001]"
   const codeMatch = /\[([A-Z]+-[A-Z]+-\d+)\]/.exec(message);
   const code = codeMatch?.[1] ?? "SCP-UNKNOWN-0000";
+
+  // Code-specific override (e.g. C2 fail-closed gate).
+  const Override = ERROR_CODE_OVERRIDES.get(code);
+  if (Override !== undefined) {
+    return new Override(message, code);
+  }
 
   for (const [prefix, ErrorClass] of ERROR_PREFIX_MAP) {
     if (code.startsWith(prefix)) {

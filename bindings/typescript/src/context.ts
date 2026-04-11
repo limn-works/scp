@@ -328,10 +328,18 @@ export class Context implements AsyncDisposable {
    * becomes the first member (and admin under `"single_admin"` governance).
    *
    * @param identity - The identity creating the context.
-   * @param params - Context creation parameters.
+   * @param params - Context creation parameters. Setting an `economicPolicy`
+   *   that requires payment is supported only on the native bridges
+   *   (Node.js, Python, Swift, Kotlin). The browser (WASM) bridge rejects
+   *   paid policies fail-closed with {@link EconomicPolicyUnsupportedOnWasm}
+   *   (`SCP-ECON-12095`) because it cannot run `scp-runtime`'s
+   *   `enforce_economy` pipeline per ADR-034. Use a free policy or omit
+   *   `economicPolicy` for browser-side contexts.
    * @returns A new `Context` instance in the `"active"` state.
    * @throws {ContextError} If context creation fails.
    * @throws {ValidationError} If parameters are invalid.
+   * @throws {EconomicPolicyUnsupportedOnWasm} On the WASM bridge, when
+   *   `economicPolicy` requires payment.
    */
   static async create(identity: Identity, params: ContextParams): Promise<Context> {
     try {
@@ -363,7 +371,16 @@ export class Context implements AsyncDisposable {
    * Joins an existing context.
    *
    * @param identity - The identity joining the context.
+   * @param spendingUcanJwt - Optional spending UCAN JWT for paid contexts.
+   *   On native bridges (Node.js, Python, Swift, Kotlin) this is validated
+   *   against the configured payment adapter and budget tracker. On the
+   *   browser (WASM) bridge, paid contexts are rejected fail-closed with
+   *   {@link WasmCannotValidateSpendingUcan} (`SCP-ECON-12096`) — the
+   *   browser SDK cannot run `scp-runtime`'s `enforce_economy` pipeline
+   *   per ADR-034. Omit `spendingUcanJwt` for free contexts.
    * @throws {ContextError} If the context is not in `"active"` state.
+   * @throws {WasmCannotValidateSpendingUcan} On the WASM bridge, when the
+   *   target context's economic policy requires payment.
    */
   async join(identity: Identity, spendingUcanJwt?: string): Promise<void> {
     this.assertActive();
@@ -381,7 +398,16 @@ export class Context implements AsyncDisposable {
    * Accepts either a string (encoded as UTF-8) or a `Uint8Array` payload.
    *
    * @param payload - The message content.
+   * @param spendingUcanJwt - Optional spending UCAN JWT for paid contexts.
+   *   On native bridges (Node.js, Python, Swift, Kotlin) this is validated
+   *   against the configured payment adapter and budget tracker. On the
+   *   browser (WASM) bridge, paid contexts are rejected fail-closed with
+   *   {@link WasmCannotValidateSpendingUcan} (`SCP-ECON-12096`) — the
+   *   browser SDK cannot run `scp-runtime`'s `enforce_economy` pipeline
+   *   per ADR-034. Omit `spendingUcanJwt` for free contexts.
    * @throws {ContextError} If the context is not `"active"` or send fails.
+   * @throws {WasmCannotValidateSpendingUcan} On the WASM bridge, when the
+   *   target context's economic policy requires payment.
    */
   async send(payload: string | Uint8Array, spendingUcanJwt?: string): Promise<void> {
     this.assertActive();
