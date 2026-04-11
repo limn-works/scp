@@ -512,25 +512,23 @@ pub(crate) fn economy_pre_check<S: BuildHasher>(
     economy: &ToolEconomyContext<'_, S>,
     invoker_did: &DID,
 ) -> Result<scp_protocol::economy::types::Amount, InvocationError> {
-    // Step 1: derive a base cost. Policy formula takes precedence; otherwise
-    // fall back to the per-DID pricing baseline. With neither, the action is
-    // free.
-    let base_cost = if let Some(policy) = economy.economic_policy {
-        scp_protocol::economy::policy::evaluate_cost(
-            policy,
-            &scp_protocol::economy::types::PaidActionType::ToolInvoke,
-            &economy.metrics,
-        )
-        .ok_or_else(|| InvocationError::BudgetExceeded {
-            did: invoker_did.to_string(),
-            cost: u64::MAX,
-            remaining: 0,
-        })?
-    } else if let Some(pricing) = economy.message_pricing {
-        pricing.base_cost
-    } else {
+    // Step 1: derive a base cost from the economic policy. Consistent with
+    // `enforce_economy` (messages/joins): no economic policy → free action.
+    // Anti-spam for free contexts is provided by the token-bucket hard rate
+    // limit, which runs independently of the cost layer.
+    let Some(policy) = economy.economic_policy else {
         return Ok(scp_protocol::economy::types::Amount::new(0));
     };
+    let base_cost = scp_protocol::economy::policy::evaluate_cost(
+        policy,
+        &scp_protocol::economy::types::PaidActionType::ToolInvoke,
+        &economy.metrics,
+    )
+    .ok_or_else(|| InvocationError::BudgetExceeded {
+        did: invoker_did.to_string(),
+        cost: u64::MAX,
+        remaining: 0,
+    })?;
 
     // Step 2: apply per-DID escalation (§19.7) when both the velocity tracker
     // and the pricing config are wired through. This mirrors `enforce_economy`

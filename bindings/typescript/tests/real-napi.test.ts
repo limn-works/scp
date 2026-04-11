@@ -424,7 +424,7 @@ if (bridge === null || serverAddon === null) {
       const member = await napi.identityCreate("in_memory");
       const ctx = await napi.contextCreate(
         admin,
-        JSON.stringify({ ceiling: ["tool:register", "tool:invoke:*", "spending:*"] }),
+        JSON.stringify({ ceiling: ["tool:register", "tool:invoke:*"] }),
       );
       const toolId = await napi.toolRegister(ctx, {
         name: "test-tool",
@@ -436,19 +436,14 @@ if (bridge === null || serverAddon === null) {
         outputSchema: { type: "object" },
         operator: admin.did,
       });
-      // Mint action UCAN for the member (not self-delegation).
+      // Mint UCAN for the member (not self-delegation).
       const ucan = await napi.ucanMint(ctx, member.did, ["tool:invoke:*"]);
-      // Mint spending UCAN — per-DID pricing (§19.7) charges a floor of 1
-      // even on contexts with no explicit economic policy.
-      const spendingUcan = await napi.ucanMint(ctx, member.did, ["spending:*"]);
       const resultJson = await napi.toolInvoke(
         ctx,
         toolId,
         JSON.stringify({ x: 42, y: 7 }),
         member.did,
         ucan.encoded,
-        undefined, // proofTokens
-        spendingUcan.encoded,
       );
       expect(typeof resultJson).toBe("string");
       const parsed = JSON.parse(resultJson);
@@ -1038,7 +1033,7 @@ if (bridge === null || serverAddon === null) {
       const ctx = await napi.contextCreate(
         admin,
         JSON.stringify({
-          ceiling: ["tool:register", "tool:invoke:*", "spending:*"],
+          ceiling: ["tool:register", "tool:invoke:*"],
         }),
       );
 
@@ -1060,16 +1055,12 @@ if (bridge === null || serverAddon === null) {
 
       // Invoke (mint for member, not self-delegation).
       const ucan = await napi.ucanMint(ctx, member.did, ["tool:invoke:*"]);
-      // Spending UCAN — per-DID pricing (§19.7) charges a floor of 1.
-      const spendingUcan = await napi.ucanMint(ctx, member.did, ["spending:*"]);
       const resultJson = await napi.toolInvoke(
         ctx,
         toolId,
         JSON.stringify({ value: 21 }),
         member.did,
         ucan.encoded,
-        undefined, // proofTokens
-        spendingUcan.encoded,
       );
       expect(typeof resultJson).toBe("string");
       const result = JSON.parse(resultJson);
