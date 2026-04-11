@@ -2432,3 +2432,185 @@ async fn budget_exceeded_on_join_rejects() {
         "join should fail: paid context auto_accept blocked"
     );
 }
+
+// -----------------------------------------------------------------------
+// H8: spawn_ttl_timer must decay governance state on automatic expiry
+//
+// Regression test for the H8 finding in PR #1606. The synchronous
+// `handle_ttl_expiry` and `close_context` paths both call
+// `governance.decay_participation()` and `governance.timeout_task.cancel()`,
+// but the tokio-spawned timer in `spawn_ttl_timer` was missing both
+// calls. As a result, participation cache, cooldown_until,
+// proposal_timestamps, and the velocity_tracker persisted in memory after
+// auto-expiry, and the governance timeout loop kept running for a context
+// that had already transitioned out of `Active`.
+// -----------------------------------------------------------------------
+
+/// Populates governance state, spawns a short-fuse TTL timer via the
+/// normal `create_context` path, waits for the timer to fire, and asserts
+/// that `participation_cache`, `cooldown_until`, `proposal_timestamps`, and
+/// `velocity_tracker` are all cleared (matches the synchronous path).
+#[tokio::test]
+async fn test_spawn_ttl_timer_decays_governance_on_expiry() {
+    use scp_protocol::context::params::Capability;
+
+    let manager = ContextManager::new(
+        Box::new(MockCrypto::default()),
+        Box::new(MockTransport::connected()),
+        Box::new(MockEventLog::default()),
+        noop_key_resolver(),
+    );
+
+    // Use a short-fuse TTL so the spawned timer fires quickly. Pair the
+    // governance close capability so the context is otherwise valid.
+    let params = ContextParams {
+        ttl: Some(std::time::Duration::from_millis(50)),
+        ceiling: vec![
+            Capability::new("messages:read"),
+            Capability::new("messages:write"),
+            Capability::new("role:assign"),
+            Capability::new("context:close"),
+        ],
+        ..ContextParams::default()
+    };
+
+    let admin: DID = "did:key:h8-admin".into();
+    let handle = manager
+        .create_context("h8-ttl-decay-ctx".into(), params, admin.clone())
+        .await
+        .unwrap();
+    let context_id = handle.context_id().to_owned();
+
+    // Inject governance state under lock: participation cache, cooldown,
+    // proposal timestamps, and velocity tracker. The timer must clear
+    // ALL four when it fires.
+    {
+        let mut contexts = manager.contexts.lock().await;
+        let ctx = contexts.get_mut(&context_id).unwrap();
+        ctx.governance.participation_cache.insert(
+            "did:key:h8-admin".to_owned(),
+            scp_protocol::trust::participation::ParticipationRecord {
+                subject_did: "did:key:h8-admin".into(),
+                context_id: context_id.clone(),
+                participation_count: 7,
+                participation_duration_seconds: 200,
+                tool_invocations: std::collections::HashMap::new(),
+                governance_actions_by: Vec::new(),
+                governance_actions_against: Vec::new(),
+                role_history: Vec::new(),
+                attestation_history: Vec::new(),
+                context_creation_count: 0,
+                computed_at: 300,
+                event_log_root: [0u8; 32],
+            },
+        );
+        ctx.governance.cooldown_until.insert(0, 999_999);
+        ctx.governance
+            .proposal_timestamps
+            .insert("did:key:h8-admin".to_owned(), vec![100, 200, 300]);
+        ctx.governance.velocity_tracker.record_message(&admin, 100);
+        // Sanity-check the precondition.
+        assert!(!ctx.governance.participation_cache.is_empty());
+        assert!(!ctx.governance.cooldown_until.is_empty());
+        assert!(!ctx.governance.proposal_timestamps.is_empty());
+        assert!(ctx.governance.velocity_tracker.get_velocity(&admin, 100) > 0);
+    }
+
+    // Wait for the spawned timer to fire and the post-expiry cleanup to
+    // run under the manager lock. The TTL is 50ms; we poll up to 5s to
+    // avoid CI flakiness.
+    let mut decayed = false;
+    for _ in 0..50 {
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        let contexts = manager.contexts.lock().await;
+        let ctx = contexts.get(&context_id).unwrap();
+        if ctx.governance.participation_cache.is_empty()
+            && ctx.governance.cooldown_until.is_empty()
+            && ctx.governance.proposal_timestamps.is_empty()
+            && ctx.governance.velocity_tracker.get_velocity(&admin, 100) == 0
+        {
+            decayed = true;
+            break;
+        }
+    }
+
+    // Snapshot the final state for assertion diagnostics.
+    let (pc_empty, cu_empty, pt_empty, vt_zero) = {
+        let contexts = manager.contexts.lock().await;
+        let ctx = contexts.get(&context_id).unwrap();
+        (
+            ctx.governance.participation_cache.is_empty(),
+            ctx.governance.cooldown_until.is_empty(),
+            ctx.governance.proposal_timestamps.is_empty(),
+            ctx.governance.velocity_tracker.get_velocity(&admin, 100) == 0,
+        )
+    };
+    assert!(
+        decayed,
+        "spawn_ttl_timer must decay all four governance fields after \
+         automatic expiry (H8); participation_cache cleared = {pc_empty}, \
+         cooldown_until cleared = {cu_empty}, proposal_timestamps cleared \
+         = {pt_empty}, velocity cleared = {vt_zero}"
+    );
+}
+
+/// Verifies that `spawn_ttl_timer` cancels the governance timeout task
+/// after the timer fires. Without the H8 fix the timeout loop kept
+/// ticking on an expired context.
+#[tokio::test]
+async fn test_spawn_ttl_timer_cancels_governance_timeout_task() {
+    use scp_protocol::context::params::Capability;
+
+    let manager = ContextManager::new(
+        Box::new(MockCrypto::default()),
+        Box::new(MockTransport::connected()),
+        Box::new(MockEventLog::default()),
+        noop_key_resolver(),
+    );
+
+    let params = ContextParams {
+        ttl: Some(std::time::Duration::from_millis(50)),
+        ceiling: vec![
+            Capability::new("messages:read"),
+            Capability::new("messages:write"),
+            Capability::new("role:assign"),
+            Capability::new("context:close"),
+        ],
+        ..ContextParams::default()
+    };
+
+    let admin: DID = "did:key:h8-cancel-admin".into();
+    let handle = manager
+        .create_context("h8-ttl-cancel-ctx".into(), params, admin)
+        .await
+        .unwrap();
+    let context_id = handle.context_id().to_owned();
+
+    // The governance timeout task should be active immediately after
+    // create_context (started by finalize_create).
+    {
+        let contexts = manager.contexts.lock().await;
+        let ctx = contexts.get(&context_id).unwrap();
+        assert!(
+            ctx.governance.timeout_task.is_active(),
+            "governance timeout task should be active after create_context"
+        );
+    }
+
+    // Wait for the spawned TTL timer to fire and run cleanup.
+    let mut cancelled = false;
+    for _ in 0..50 {
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        let contexts = manager.contexts.lock().await;
+        let ctx = contexts.get(&context_id).unwrap();
+        if !ctx.governance.timeout_task.is_active() {
+            cancelled = true;
+            break;
+        }
+    }
+    assert!(
+        cancelled,
+        "spawn_ttl_timer must cancel the governance timeout task on \
+         automatic expiry (H8)"
+    );
+}
