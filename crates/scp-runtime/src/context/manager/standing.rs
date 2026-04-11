@@ -12,6 +12,22 @@
 //! See `.docs/standards/sdk-common.md` section "Standing contexts (contact
 //! graph)" for the authoritative specification.
 //!
+//! # Lock ordering
+//!
+//! When acquiring multiple `ContextManager` mutexes inside this module the
+//! canonical order is **`contexts` first, then `standing_contexts`** (most
+//! frequently contended lock acquired innermost). All call sites in this file
+//! follow this order; any new code touching both mutexes must do the same to
+//! preserve a global lock-order graph free of cycles.
+//!
+//! Additionally, [`ContextHandle`] interior `RwLock` reads MUST use
+//! [`ContextHandle::try_read_state`] (sync, fail-fast) when performed inside
+//! a held `Mutex` guard. The async [`ContextHandle::state`] would await on
+//! the handle's `RwLock` while holding `contexts.lock()`, which deadlocks
+//! against any concurrent path that already holds the handle's `RwLock` as
+//! writer and is waiting on `contexts.lock()`. See [`super::lifecycle`] and
+//! [`super::mod`]'s `require_active` for the same pattern.
+//!
 //! # SCP-138
 
 use scp_identity::DID;
@@ -86,34 +102,49 @@ impl ContextManager {
         let context_id = generate_standing_context_id(local_did, peer_did);
 
         // Step 1: Check if the context exists and is Active/Creating.
-        // Hold the standing_contexts lock only for the check, then drop
-        // before the async create_context call to avoid holding the lock
-        // across an await point.
+        //
+        // Lock ordering: `contexts` -> `standing_contexts` (see module docs).
+        //
+        // The handle's interior `RwLock` is read via the synchronous
+        // `try_read_state()` to avoid awaiting on it while holding the
+        // `contexts` mutex. Awaiting `state()` here would form a deadlock
+        // cycle with any task that holds the handle's `RwLock` as writer
+        // (e.g. `transition_to`) and is waiting on `contexts.lock()`.
+        //
+        // If `try_read_state()` returns `None` (writer currently holds the
+        // lock), we treat the context as transient/terminal and fall through
+        // to the create-new-context path; the TOCTOU re-check below will
+        // resolve any race idempotently.
         {
-            let mut standing = self.standing_contexts.lock().await;
             let contexts = self.contexts.lock().await;
+            let mut standing = self.standing_contexts.lock().await;
             if let Some(ctx) = contexts.get(&context_id) {
-                let state = ctx.handle.state().await;
+                let state = ctx.handle.try_read_state();
                 match state {
                     // Step 2: Active or still being set up -- return immediately.
-                    ContextState::Active | ContextState::Creating => {
+                    Some(ContextState::Active | ContextState::Creating) => {
                         standing.insert(peer_did.to_string(), peer_did.clone());
                         return Ok(context_id);
                     }
-                    // Step 4: Peer has left or context ended -- fall through to
-                    // create a new one.
-                    ContextState::Closed
-                    | ContextState::Expired
-                    | ContextState::Closing
-                    | ContextState::MigratingOut
-                    | ContextState::Tombstoned => {
+                    // Step 4: Peer has left, context ended, or the handle's
+                    // state lock is currently contended -- fall through to
+                    // create a new one. The post-create TOCTOU re-check
+                    // handles any race with concurrent callers.
+                    Some(
+                        ContextState::Closed
+                        | ContextState::Expired
+                        | ContextState::Closing
+                        | ContextState::MigratingOut
+                        | ContextState::Tombstoned,
+                    )
+                    | None => {
                         // Will create a new context below.
                     }
                 }
             }
             // Drop both locks before async creation.
-            drop(contexts);
             drop(standing);
+            drop(contexts);
         }
 
         // Step 3/4: Create a new bilateral-persistent context via the full
@@ -129,10 +160,17 @@ impl ContextManager {
                 // between our check and this create attempt. If the context
                 // now exists and is Active/Creating, use it idempotently.
                 // Otherwise propagate the original error.
+                //
+                // Use `try_read_state()` (sync) to avoid awaiting on the
+                // handle's `RwLock` while holding `contexts.lock()`. A
+                // contended state lock is treated as "not idempotent" and
+                // surfaces the original create error rather than masking it.
                 let contexts = self.contexts.lock().await;
                 if let Some(ctx) = contexts.get(&context_id) {
-                    let state = ctx.handle.state().await;
-                    if matches!(state, ContextState::Active | ContextState::Creating) {
+                    if matches!(
+                        ctx.handle.try_read_state(),
+                        Some(ContextState::Active | ContextState::Creating)
+                    ) {
                         drop(contexts);
                         // Concurrent creation succeeded — fall through.
                     } else {
@@ -197,10 +235,15 @@ impl ContextManager {
     pub async fn reconnect_all_standing(&self) -> Result<usize, ContextError> {
         // Phase 1: Collect (context_id, handle) pairs under locks, then release.
         // This avoids holding any locks across await points.
+        //
+        // Lock ordering: `contexts` -> `standing_contexts` -> `local_dids`
+        // (see module docs). `local_dids` is an `RwLock` and is acquired
+        // last (innermost) since it is the smallest, read-only-during-this-
+        // scope structure.
         let handles: Vec<(String, super::super::ContextHandle)> = {
+            let contexts = self.contexts.lock().await;
             let standing = self.standing_contexts.lock().await;
             let local_dids = self.local_dids.read().await;
-            let contexts = self.contexts.lock().await;
 
             let mut out = Vec::new();
             for peer_did in standing.values() {

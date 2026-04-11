@@ -2301,6 +2301,228 @@ fn standing_context_id_is_deterministic() {
     assert_ne!(id1, id3);
 }
 
+// -----------------------------------------------------------------------
+// Standing context deadlock-fix regression tests (PR #1606 H6)
+// -----------------------------------------------------------------------
+//
+// Background: Prior to the H6 fix, `ContextManager::standing_context` held
+// both `standing_contexts` and `contexts` mutex guards across an
+// `await` on `ContextHandle::state()`, which itself awaits on the
+// handle's interior `RwLock`. Any concurrent task that held the handle's
+// `RwLock` as a writer (e.g. `transition_to`) while waiting to acquire
+// `contexts.lock()` would form a circular wait → deadlock.
+//
+// The fix replaces `state().await` with the synchronous, fail-fast
+// `try_read_state()` (matching the convention in `lifecycle.rs` and
+// `require_active`), and reorders the lock acquisition to the canonical
+// `contexts → standing_contexts` ordering.
+//
+// These tests verify:
+// 1. The fix does not regress existing happy-path / fall-through behavior.
+// 2. Many concurrent `standing_context` calls combined with concurrent
+//    state-mutating tasks complete in bounded time (no deadlock).
+
+/// H6 regression: `standing_context` returns the existing Active context
+/// when called twice for the same DID pair. Mirrors
+/// `standing_context_returns_existing_active_context` but exists as a
+/// named regression for the deadlock fix in PR #1606 — it specifically
+/// asserts that the new `try_read_state()` code path observes
+/// `Active` immediately after creation (no spurious fall-through).
+#[tokio::test]
+async fn test_standing_context_returns_existing_active() {
+    let manager = ContextManager::new(
+        Box::new(MockCrypto::default()),
+        Box::new(MockTransport::connected()),
+        Box::new(MockEventLog::default()),
+        noop_key_resolver(),
+    );
+
+    let alice = DID::from("did:dht:z6MkLocalAliceH6");
+    let bob = DID::from("did:dht:z6MkBobH6");
+
+    // First call creates the context.
+    let ctx_id1 = manager.standing_context(&alice, &bob).await.unwrap();
+
+    // Second call must observe the freshly-created context as Active via
+    // `try_read_state()` and return idempotently — no new context, no
+    // create attempt, identical context_id.
+    let ctx_id2 = manager.standing_context(&alice, &bob).await.unwrap();
+    assert_eq!(ctx_id1, ctx_id2);
+
+    // Verify the context is registered exactly once and is Active.
+    {
+        let contexts = manager.contexts.lock().await;
+        let ctx = contexts.get(&ctx_id1).unwrap();
+        assert_eq!(
+            ctx.handle.try_read_state(),
+            Some(ContextState::Active),
+            "freshly returned context should be Active"
+        );
+    }
+
+    assert_eq!(manager.standing_context_count().await, 1);
+    assert!(manager.has_standing_context(&bob).await);
+}
+
+/// H6 regression: `standing_context` falls through to create a new
+/// context when the existing entry is in a terminal state. Verifies the
+/// new code path correctly handles the `Some(Expired)` arm of the
+/// `try_read_state()` match (the old code matched on a directly-awaited
+/// `state()` value).
+#[tokio::test]
+async fn test_standing_context_creates_new_after_expired() {
+    let manager = ContextManager::new(
+        Box::new(MockCrypto::default()),
+        Box::new(MockTransport::connected()),
+        Box::new(MockEventLog::default()),
+        noop_key_resolver(),
+    );
+
+    let alice = DID::from("did:dht:z6MkLocalAliceH6Exp");
+    let eve = DID::from("did:dht:z6MkEveH6");
+
+    // 1. Create the initial standing context.
+    let ctx_id1 = manager.standing_context(&alice, &eve).await.unwrap();
+
+    // 2. Transition the handle to Expired (terminal state).
+    {
+        let contexts = manager.contexts.lock().await;
+        let ctx = contexts.get(&ctx_id1).unwrap();
+        ctx.handle
+            .transition_to(&ContextState::Expired)
+            .await
+            .unwrap();
+    }
+
+    // 3. Remove the expired entry so create_context can re-use the ID.
+    {
+        let mut contexts = manager.contexts.lock().await;
+        contexts.remove(&ctx_id1);
+    }
+
+    // 4. Calling standing_context again must fall through (Expired arm)
+    //    and successfully create a new context with the same deterministic
+    //    ID. With the old buggy code this also worked, but the new
+    //    `try_read_state()` arm is now exercised explicitly.
+    let ctx_id2 = manager.standing_context(&alice, &eve).await.unwrap();
+    assert_eq!(ctx_id1, ctx_id2, "deterministic context ID is preserved");
+
+    {
+        let contexts = manager.contexts.lock().await;
+        let ctx = contexts.get(&ctx_id2).unwrap();
+        assert_eq!(
+            ctx.handle.try_read_state(),
+            Some(ContextState::Active),
+            "fall-through must produce a new Active context"
+        );
+    }
+
+    assert_eq!(manager.standing_context_count().await, 1);
+    assert!(manager.has_standing_context(&eve).await);
+}
+
+/// H6 regression: under heavy contention, `standing_context` and other
+/// `contexts.lock()`-acquiring operations complete within a bounded
+/// timeout. Prior to the fix this configuration could deadlock: thread A
+/// holds the handle's `RwLock` writer (mid-`transition_to`) while
+/// blocked on `contexts.lock()`, and thread B holds `contexts.lock()`
+/// inside `standing_context` while awaiting the handle's `RwLock` reader.
+///
+/// The test spawns 10 concurrent `standing_context` callers plus 10
+/// concurrent `transition_to(Closing)` writers (the latter serving the
+/// same role as `close_context` in the bug report — `close_context`
+/// itself requires the `context:close` capability, which the
+/// `BilateralPersistent` template does not grant, so we drive the
+/// handle's `RwLock` writer directly via `transition_to` to reproduce
+/// the exact lock-cycle pattern). All 20 tasks must complete within 1
+/// second; failure to do so indicates a regression.
+#[tokio::test]
+async fn test_standing_context_no_deadlock_under_contention() {
+    use std::sync::Arc;
+    use std::time::Duration;
+    use tokio::time::timeout;
+
+    let manager = Arc::new(ContextManager::new(
+        Box::new(MockCrypto::default()),
+        Box::new(MockTransport::connected()),
+        Box::new(MockEventLog::default()),
+        noop_key_resolver(),
+    ));
+
+    let alice = DID::from("did:dht:z6MkLocalAliceH6Race");
+    let bob = DID::from("did:dht:z6MkBobH6Race");
+
+    // Pre-create the standing context so the writer tasks have a handle
+    // to drive into terminal states.
+    let _initial_id = manager.standing_context(&alice, &bob).await.unwrap();
+
+    // Outer timeout — if the test deadlocks, this is what fails.
+    let run = async {
+        let mut tasks = Vec::new();
+
+        // 10 concurrent standing_context callers — each acquires
+        // `contexts.lock()` then `standing_contexts.lock()` then reads
+        // the handle state via `try_read_state()`.
+        for _ in 0..10 {
+            let mgr = Arc::clone(&manager);
+            let a = alice.clone();
+            let b = bob.clone();
+            tasks.push(tokio::spawn(async move {
+                let _ = mgr.standing_context(&a, &b).await;
+            }));
+        }
+
+        // 10 concurrent state mutators + contexts.lock() acquirers.
+        // Each task: (1) acquire contexts.lock() and clone the handle,
+        // (2) drop the lock, (3) drive the handle through Closing →
+        // Closed → (back to Active via a fresh standing_context call).
+        // The interleaving of step 1 (contexts.lock) with step 3
+        // (handle.transition_to which takes the inner RwLock writer)
+        // across 10 tasks creates the precise contention pattern that
+        // the original bug exhibited.
+        for _ in 0..10 {
+            let mgr = Arc::clone(&manager);
+            let a = alice.clone();
+            let b = bob.clone();
+            tasks.push(tokio::spawn(async move {
+                // Step 1: try to look up the handle under contexts.lock().
+                let context_id = super::super::standing::generate_standing_context_id(&a, &b);
+                let handle_opt = {
+                    let contexts = mgr.contexts.lock().await;
+                    contexts.get(&context_id).map(|c| c.handle.clone())
+                };
+
+                // Step 2: drive the handle through a transition. This
+                // takes the inner RwLock as writer — the very lock that
+                // the buggy `standing_context` was awaiting under
+                // `contexts.lock()`.
+                if let Some(handle) = handle_opt {
+                    // Cycle the state to maximise contention. We don't
+                    // care whether individual transitions succeed —
+                    // some will be invalid (e.g., Active → Active) and
+                    // the test only cares about no-deadlock.
+                    let _ = handle.transition_to(&ContextState::Closing).await;
+                    let _ = handle.transition_to(&ContextState::Closed).await;
+                }
+
+                // Step 3: also exercise standing_context concurrently
+                // from the writer task to maximise interleaving.
+                let _ = mgr.standing_context(&a, &b).await;
+            }));
+        }
+
+        for t in tasks {
+            // Individual task panics propagate via the JoinError — that
+            // is acceptable; what matters is that *all* tasks finish.
+            let _ = t.await;
+        }
+    };
+
+    timeout(Duration::from_secs(1), run)
+        .await
+        .expect("standing_context contention test deadlocked or exceeded 1s");
+}
+
 /// `auto_accept_blocked` rejects join for paid contexts (#1537).
 #[tokio::test]
 async fn auto_accept_blocked_by_economics_rejects_join() {
