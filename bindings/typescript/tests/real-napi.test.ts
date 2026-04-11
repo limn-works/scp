@@ -444,6 +444,8 @@ if (bridge === null || serverAddon === null) {
         JSON.stringify({ x: 42, y: 7 }),
         member.did,
         ucan.encoded,
+        undefined, // proofTokens
+        undefined, // spendingUcan
       );
       expect(typeof resultJson).toBe("string");
       const parsed = JSON.parse(resultJson);
@@ -1061,6 +1063,8 @@ if (bridge === null || serverAddon === null) {
         JSON.stringify({ value: 21 }),
         member.did,
         ucan.encoded,
+        undefined, // proofTokens
+        undefined, // spendingUcan
       );
       expect(typeof resultJson).toBe("string");
       const result = JSON.parse(resultJson);

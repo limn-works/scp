@@ -257,6 +257,7 @@ private class TestNativeBindings : NativeBindings {
         identityHandle: Long,
         ucanToken: String?,
         proofTokens: List<String>?,
+        spendingUcan: String?,
     ): String = ""
     @Suppress("LongParameterList")
     override fun toolInvokeCrossContext(
