@@ -90,23 +90,25 @@ pub(super) async fn test_custody_from_seed(
 /// For tests that need to exercise specific spending limits, use
 /// [`dummy_spending_ucan_with_cap`].
 ///
-/// C1 (PR #1606) follow-up: spending UCANs are now cryptographically
-/// validated end-to-end on the `send_message` and `join_context` paths.
-/// This zero-arg helper produces an UNSIGNED token bound to the
-/// placeholder DID `did:key:test-spender` — sufficient for tests that
-/// (a) only exercise the tool-invoke path (which uses
-/// `check_tool_spending_capability`, the cap-only check that does NOT
-/// run signature verification) or (b) only assert that a paid send is
-/// rejected (the rejection now happens at signature validation rather
-/// than at the previous attestation/scope check, but the visible
-/// outcome is identical: `Result::is_err()`).
+/// C1/C1b (PR #1606) follow-up: spending UCANs are now cryptographically
+/// validated end-to-end on the `send_message`, `join_context`, and
+/// `invoke_tool_with_economy` paths. This zero-arg helper produces an
+/// UNSIGNED token bound to the placeholder DID `did:key:test-spender` —
+/// sufficient ONLY for tests that (a) use the direct free-function
+/// `invoke_tool` helper (which does NOT run signature validation —
+/// that's a caller-side escape hatch with no bridge exposure) or
+/// (b) only assert that a paid action is rejected (the rejection now
+/// happens at signature validation rather than at the previous
+/// attestation/scope check, but the visible outcome is identical:
+/// `Result::is_err()`).
 ///
-/// Tests that exercise the `send_message` / `join_context` HAPPY PATH
-/// with a paid policy MUST use [`dummy_spending_ucan_for`] (which signs
-/// the token with the deterministic test key matching `mock_key_resolver`).
-/// Pairing the unsigned helper with a paid happy-path send will fail
+/// Tests that exercise the `send_message` / `join_context` /
+/// `ContextManager::invoke_tool_with_economy` HAPPY PATH with a paid
+/// policy MUST use [`dummy_spending_ucan_for`] (which signs the token
+/// with the deterministic test key matching `mock_key_resolver`).
+/// Pairing the unsigned helper with a paid happy-path call will fail
 /// signature validation — that is the correct fail-closed behavior
-/// introduced by the C1 fix.
+/// introduced by the C1/C1b fix.
 pub(super) fn dummy_spending_ucan() -> UcanToken {
     // Unsigned token bound to a placeholder DID. Used by tests where
     // the spending UCAN does not need to pass signature verification

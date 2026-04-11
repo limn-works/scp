@@ -579,6 +579,47 @@ impl ContextManager {
                 }
             };
 
+            // C1b (PR #1606): cryptographically validate the spending UCAN
+            // before mutating per-context economy state. Without this call
+            // the attacker could present a fabricated `UcanToken` with a
+            // valid-looking spending capability — `economy_pre_check` only
+            // verifies the capability shape, not the signature, iss/aud
+            // binding, expiry, revocation, or replay nonce. `enforce_economy`
+            // (used by send/join) already runs this pipeline; `invoke_tool_with_economy`
+            // must match. For free actions (`action_cost == 0`) spending UCANs
+            // are not required — mirroring `enforce_economy` and `check_spending_capability`.
+            if action_cost.0 > 0 {
+                let Some(spending) = spending_ucan else {
+                    // Paid action reached this point without a spending UCAN:
+                    // `economy_pre_check` would normally reject this via
+                    // `check_tool_spending_capability`, so reaching here is
+                    // a defense-in-depth branch. Roll back and surface the
+                    // canonical SCP-ECON-12060 error.
+                    ctx.governance
+                        .velocity_tracker
+                        .rollback(invoker_did, velocity_token);
+                    ctx.governance.hard_rate_limit.refund(invoker_did);
+                    return Err(ContextError::PermissionDenied(
+                        "SCP-ECON-12060: paid action requires spending UCAN".to_owned(),
+                    ));
+                };
+                if let Err(err) = super::economy::validate_spending_ucan_or_error(
+                    spending,
+                    invoker_did,
+                    context_id,
+                    &mut ctx.governance.spending_nonce_tracker,
+                    &ctx.governance.revoked_spending_ucan_cids,
+                    &self.key_resolver,
+                    &*self.clock,
+                ) {
+                    ctx.governance
+                        .velocity_tracker
+                        .rollback(invoker_did, velocity_token);
+                    ctx.governance.hard_rate_limit.refund(invoker_did);
+                    return Err(err);
+                }
+            }
+
             // Strategy B: the caller does the deduction explicitly so
             // the mutation point is visible and the pre-check function
             // stays pure.

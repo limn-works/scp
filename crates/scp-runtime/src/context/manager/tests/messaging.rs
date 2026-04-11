@@ -3777,3 +3777,437 @@ async fn deliver_incoming_event_log_append_failure_still_delivers() {
          event log append fails. Drained events: {events:?}"
     );
 }
+
+// -----------------------------------------------------------------------
+// C1b (PR #1606): full cryptographic spending UCAN validation on the
+// tool-invoke path.
+//
+// C1 closed the gap for `send_message` and `join_context` by routing their
+// spending UCANs through `validate_spending_ucan_signed`. C4 then routed
+// the PyO3/NAPI/UniFFI bridge tool_invoke exports through
+// `ContextManager::invoke_tool_with_economy`. C1b closes the intersection:
+// signature + actor-binding + expiry + revocation + nonce replay validation
+// inside `invoke_tool_with_economy`, so that a fabricated or replayed
+// spending UCAN can no longer buy a paid tool invocation.
+//
+// These tests mirror the C1 send-path tests (see `tests/governance.rs`:
+// `test_fabricated_spending_ucan_rejected_by_signature`,
+// `test_spending_ucan_iss_must_match_actor_did`, etc.) on the tool path.
+// Each test sets up a paid context, grants budget, and presents a broken
+// spending UCAN — every failure mode MUST be rejected with SCP-ECON-12065.
+// -----------------------------------------------------------------------
+
+/// Builds a paid context wired for tool invocation: `per_tool_invoke=10`,
+/// `mock_key_resolver` so the C1b signature pipeline has a key to resolve,
+/// invoker granted `ToolInvokeAll`, a registered `echo` tool, and 1000 budget.
+async fn c1b_paid_tool_context(
+    name: &str,
+    invoker: &DID,
+) -> (
+    ContextManager,
+    scp_protocol::context::tools::registry::ToolRegistry,
+) {
+    use scp_protocol::context::tools::registry::ToolRegistry;
+    use scp_protocol::economy::types::{Amount, CostSchedule, CurrencyCode, EconomicPolicy};
+
+    let manager = ContextManager::new(
+        Box::new(MockCrypto::default()),
+        Box::new(MockTransport::connected()),
+        Box::new(MockEventLog::default()),
+        mock_key_resolver(),
+    );
+
+    let mut params = governance_params();
+    params
+        .ceiling
+        .push(scp_protocol::context::params::Capability::ToolInvokeAll);
+    params.economic_policy = Some(EconomicPolicy {
+        locked: false,
+        cost_schedule: CostSchedule {
+            currency: CurrencyCode([85, 83, 68, 0]),
+            per_message: None,
+            per_tool_invoke: Some(Amount::new(10)),
+            per_join: None,
+            per_period: None,
+            per_byte_stored: None,
+        },
+        payment_adapters: vec![],
+        pricing_formula: None,
+        payee: DID::from("did:key:payee"),
+    });
+
+    let _handle = manager
+        .create_context(name.to_owned(), params, invoker.clone())
+        .await
+        .unwrap();
+
+    {
+        let mut contexts = manager.contexts.lock().await;
+        let ctx = contexts.get_mut(name).unwrap();
+        ctx.governance
+            .budget_tracker
+            .grant(invoker, Amount::new(1_000));
+    }
+
+    let mut registry = ToolRegistry::new();
+    registry.insert(test_tool_registration("echo"));
+
+    (manager, registry)
+}
+
+/// C1b #1: a spending UCAN with a tampered signature is rejected by
+/// Ed25519 verification when the invoker tries to call a paid tool.
+#[tokio::test]
+async fn tool_invoke_fabricated_spending_ucan_rejected_by_signature() {
+    use scp_protocol::context::tools::ToolId;
+
+    let invoker: DID = "did:key:c1b-sig-invoker".into();
+    let (manager, registry) = c1b_paid_tool_context("c1b-sig-ctx", &invoker).await;
+
+    // Mint a fully signed token, then flip every bit in the signature.
+    // `encoded` stays intact, so the validator recomputes the signing
+    // input from the base64url segments and fails closed.
+    let mut ucan = dummy_spending_ucan_for(&invoker);
+    for byte in &mut ucan.signature {
+        *byte ^= 0xFF;
+    }
+
+    let result = manager
+        .invoke_tool_with_economy(
+            "c1b-sig-ctx",
+            &registry,
+            &ToolId::from("echo"),
+            serde_json::json!({}),
+            &invoker,
+            Some(&ucan),
+            None,
+            |_input| async { Ok(serde_json::json!({})) },
+        )
+        .await;
+
+    assert!(
+        result.is_err(),
+        "tool invoke with fabricated signature must be rejected"
+    );
+    let err = format!("{}", result.unwrap_err());
+    assert!(
+        err.contains("SCP-ECON-12065"),
+        "rejection should be from C1b signature pipeline (SCP-ECON-12065): {err}"
+    );
+    assert!(
+        err.to_lowercase().contains("signature") || err.to_lowercase().contains("invalid"),
+        "error should mention signature/invalid: {err}"
+    );
+
+    // Budget MUST be untouched — signature check runs before record_spend.
+    let remaining = {
+        let contexts = manager.contexts.lock().await;
+        contexts
+            .get("c1b-sig-ctx")
+            .unwrap()
+            .governance
+            .budget_tracker
+            .remaining(&invoker)
+            .value()
+    };
+    assert_eq!(
+        remaining, 1_000,
+        "budget must not be deducted on signature failure: {remaining}"
+    );
+}
+
+/// C1b #2: a spending UCAN whose `iss` does not match the invoker is
+/// rejected by the actor-binding check. The attacker's token is fully
+/// signed by the attacker, but presenting it on behalf of the invoker
+/// fails because `iss == attacker != invoker`.
+#[tokio::test]
+async fn tool_invoke_spending_ucan_iss_must_match_invoker() {
+    use scp_protocol::context::tools::ToolId;
+
+    let invoker: DID = "did:key:c1b-iss-invoker".into();
+    let attacker: DID = "did:key:c1b-iss-attacker".into();
+    let (manager, registry) = c1b_paid_tool_context("c1b-iss-ctx", &invoker).await;
+
+    // Perfectly valid token — but bound to the attacker, not the invoker.
+    let attacker_ucan = dummy_spending_ucan_for(&attacker);
+
+    let result = manager
+        .invoke_tool_with_economy(
+            "c1b-iss-ctx",
+            &registry,
+            &ToolId::from("echo"),
+            serde_json::json!({}),
+            &invoker,
+            Some(&attacker_ucan),
+            None,
+            |_input| async { Ok(serde_json::json!({})) },
+        )
+        .await;
+
+    assert!(
+        result.is_err(),
+        "spending UCAN with iss != invoker must be rejected"
+    );
+    let err = format!("{}", result.unwrap_err());
+    assert!(
+        err.contains("SCP-ECON-12065"),
+        "rejection should be from C1b signature pipeline (SCP-ECON-12065): {err}"
+    );
+    assert!(
+        err.to_lowercase().contains("issuer") || err.to_lowercase().contains("iss"),
+        "error should mention issuer mismatch: {err}"
+    );
+}
+
+/// C1b #3: replaying the same signed spending UCAN twice is rejected by
+/// the per-context nonce tracker. The first invoke succeeds; the second
+/// reuses the nonce and must fail fail-closed.
+#[tokio::test]
+async fn tool_invoke_spending_ucan_replay_via_nonce_tracker() {
+    use scp_protocol::context::tools::ToolId;
+
+    let invoker: DID = "did:key:c1b-replay-invoker".into();
+    let (manager, registry) = c1b_paid_tool_context("c1b-replay-ctx", &invoker).await;
+
+    let ucan = dummy_spending_ucan_for(&invoker);
+
+    // First invoke — fresh nonce, should succeed.
+    let first = manager
+        .invoke_tool_with_economy(
+            "c1b-replay-ctx",
+            &registry,
+            &ToolId::from("echo"),
+            serde_json::json!({"call": 1}),
+            &invoker,
+            Some(&ucan),
+            None,
+            |_input| async { Ok(serde_json::json!({})) },
+        )
+        .await;
+    assert!(
+        first.is_ok(),
+        "first invoke with fresh nonce should succeed: {first:?}"
+    );
+
+    // Second invoke — SAME ucan, SAME nonce — must be rejected.
+    let second = manager
+        .invoke_tool_with_economy(
+            "c1b-replay-ctx",
+            &registry,
+            &ToolId::from("echo"),
+            serde_json::json!({"call": 2}),
+            &invoker,
+            Some(&ucan),
+            None,
+            |_input| async { Ok(serde_json::json!({})) },
+        )
+        .await;
+
+    assert!(
+        second.is_err(),
+        "replayed spending UCAN must be rejected by nonce tracker"
+    );
+    let err = format!("{}", second.unwrap_err());
+    assert!(
+        err.contains("SCP-ECON-12065"),
+        "rejection should be from C1b signature pipeline (SCP-ECON-12065): {err}"
+    );
+    assert!(
+        err.to_lowercase().contains("nonce") || err.to_lowercase().contains("reused"),
+        "error should mention nonce replay: {err}"
+    );
+}
+
+/// C1b #4: a spending UCAN whose `exp` is already in the past is rejected
+/// by the expiry check. Without C1b wiring the legacy cap-only check would
+/// happily accept this token.
+#[tokio::test]
+async fn tool_invoke_spending_ucan_expired() {
+    use base64::Engine;
+    use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+    use scp_protocol::context::tools::ToolId;
+    use scp_protocol::crypto::ucan::spending::{
+        Amount as SpendAmount, CurrencyCode as SpendCcy, SpendingCapability,
+    };
+
+    let invoker: DID = "did:key:c1b-exp-invoker".into();
+    let (manager, registry) = c1b_paid_tool_context("c1b-exp-ctx", &invoker).await;
+
+    let cap = SpendingCapability {
+        max_per_action: SpendAmount(u64::MAX),
+        max_total: SpendAmount(u64::MAX),
+        currency: SpendCcy::from_code("USD").unwrap(),
+        time_window: std::time::Duration::from_secs(3600),
+        allowed_adapters: vec![],
+    };
+    let mut fct = serde_json::Map::new();
+    fct.insert(
+        "spending_capability".to_owned(),
+        cap.to_fact_value().unwrap(),
+    );
+    fct.insert(
+        "scp_key_scope".to_owned(),
+        serde_json::Value::String("#agent".to_owned()),
+    );
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    let header = scp_protocol::crypto::ucan::UcanHeader::with_kid("#agent".to_owned());
+    let payload = scp_protocol::crypto::ucan::UcanPayload {
+        iss: invoker.as_ref().to_owned(),
+        aud: invoker.as_ref().to_owned(),
+        // exp 1 hour in the past, well outside the 5-minute clock-skew tolerance.
+        exp: now.saturating_sub(3600),
+        nbf: Some(now.saturating_sub(7200)),
+        nnc: scp_protocol::crypto::ucan::nonce::generate_nonce(&scp_primitives::SystemClock),
+        att: vec![scp_protocol::crypto::ucan::Attenuation {
+            with: "scp:spending:*".to_owned(),
+            can: "spend".to_owned(),
+        }],
+        prf: vec![],
+        fct: Some(serde_json::Value::Object(fct)),
+    };
+    let header_b64 = URL_SAFE_NO_PAD.encode(serde_json::to_vec(&header).unwrap());
+    let payload_b64 = URL_SAFE_NO_PAD.encode(serde_json::to_vec(&payload).unwrap());
+    let signing_input = format!("{header_b64}.{payload_b64}");
+    let signing_key = signing_key_for_did(&invoker);
+    let signature = ed25519_dalek::Signer::sign(&signing_key, signing_input.as_bytes());
+    let sig_b64 = URL_SAFE_NO_PAD.encode(signature.to_bytes());
+    let encoded = format!("{signing_input}.{sig_b64}");
+    let expired_ucan = scp_protocol::crypto::ucan::UcanToken {
+        header,
+        payload,
+        signature: signature.to_bytes().to_vec(),
+        encoded,
+    };
+
+    let result = manager
+        .invoke_tool_with_economy(
+            "c1b-exp-ctx",
+            &registry,
+            &ToolId::from("echo"),
+            serde_json::json!({}),
+            &invoker,
+            Some(&expired_ucan),
+            None,
+            |_input| async { Ok(serde_json::json!({})) },
+        )
+        .await;
+
+    assert!(result.is_err(), "expired spending UCAN must be rejected");
+    let err = format!("{}", result.unwrap_err());
+    assert!(
+        err.contains("SCP-ECON-12065"),
+        "rejection should be from C1b signature pipeline (SCP-ECON-12065): {err}"
+    );
+    assert!(
+        err.to_lowercase().contains("expired"),
+        "error should mention expiry: {err}"
+    );
+}
+
+/// C1b #5: a spending UCAN whose CID has been added to the per-context
+/// revoked set is rejected even though every other check would pass.
+#[tokio::test]
+async fn tool_invoke_spending_ucan_revoked() {
+    use scp_protocol::context::tools::ToolId;
+
+    let invoker: DID = "did:key:c1b-revoke-invoker".into();
+    let (manager, registry) = c1b_paid_tool_context("c1b-revoke-ctx", &invoker).await;
+
+    let ucan = dummy_spending_ucan_for(&invoker);
+    let revocation_cid = scp_protocol::crypto::ucan::revoke::compute_revocation_cid(&ucan.encoded);
+
+    // Insert the CID into the per-context revoked set BEFORE the invoke.
+    {
+        let mut contexts = manager.contexts.lock().await;
+        let ctx = contexts.get_mut("c1b-revoke-ctx").unwrap();
+        ctx.governance
+            .revoked_spending_ucan_cids
+            .insert(revocation_cid);
+    }
+
+    let result = manager
+        .invoke_tool_with_economy(
+            "c1b-revoke-ctx",
+            &registry,
+            &ToolId::from("echo"),
+            serde_json::json!({}),
+            &invoker,
+            Some(&ucan),
+            None,
+            |_input| async { Ok(serde_json::json!({})) },
+        )
+        .await;
+
+    assert!(result.is_err(), "revoked spending UCAN must be rejected");
+    let err = format!("{}", result.unwrap_err());
+    assert!(
+        err.contains("SCP-ECON-12065"),
+        "rejection should be from C1b signature pipeline (SCP-ECON-12065): {err}"
+    );
+    assert!(
+        err.to_lowercase().contains("revoked"),
+        "error should mention revocation: {err}"
+    );
+}
+
+/// C1b #6: happy path. A fully signed, in-window, fresh-nonce spending
+/// UCAN bound to the invoker passes the entire pipeline and the tool
+/// invocation succeeds AND deducts budget.
+#[tokio::test]
+async fn tool_invoke_happy_path_with_valid_spending_ucan() {
+    use scp_protocol::context::tools::ToolId;
+
+    let invoker: DID = "did:key:c1b-happy-invoker".into();
+    let (manager, registry) = c1b_paid_tool_context("c1b-happy-ctx", &invoker).await;
+
+    let before = {
+        let contexts = manager.contexts.lock().await;
+        contexts
+            .get("c1b-happy-ctx")
+            .unwrap()
+            .governance
+            .budget_tracker
+            .remaining(&invoker)
+            .value()
+    };
+
+    let ucan = dummy_spending_ucan_for(&invoker);
+    let result = manager
+        .invoke_tool_with_economy(
+            "c1b-happy-ctx",
+            &registry,
+            &ToolId::from("echo"),
+            serde_json::json!({}),
+            &invoker,
+            Some(&ucan),
+            None,
+            |_input| async { Ok(serde_json::json!({})) },
+        )
+        .await;
+
+    assert!(
+        result.is_ok(),
+        "fully signed in-window fresh-nonce spending UCAN must succeed: {result:?}"
+    );
+
+    // Budget MUST have been deducted by at least per_tool_invoke=10.
+    // (escalation may add more; the `tool_invoke_escalation_via_managed_wrapper`
+    // test covers escalation specifically.)
+    let after = {
+        let contexts = manager.contexts.lock().await;
+        contexts
+            .get("c1b-happy-ctx")
+            .unwrap()
+            .governance
+            .budget_tracker
+            .remaining(&invoker)
+            .value()
+    };
+    assert!(
+        before - after >= 10,
+        "happy-path invoke must deduct at least per_tool_invoke=10: before={before} after={after}"
+    );
+}

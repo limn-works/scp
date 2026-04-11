@@ -194,6 +194,33 @@ fn noop_key_resolver() -> KeyResolver {
     std::sync::Arc::new(|_did: &DID| None)
 }
 
+/// Derives a deterministic Ed25519 seed from a DID string by XOR-folding
+/// the DID bytes into a 32-byte array. Matches the algorithm used by
+/// the in-crate `mock_key_resolver` so signing and verification are consistent.
+fn did_to_seed(did: &DID) -> [u8; 32] {
+    let mut s = [0u8; 32];
+    let bytes = did.as_ref().as_bytes();
+    for (i, b) in bytes.iter().enumerate() {
+        s[i % 32] ^= *b;
+    }
+    s
+}
+
+/// Mock key resolver that returns a deterministic verifying key derived from
+/// the DID string. Used by happy-path tests that need real signature verification.
+fn mock_key_resolver() -> KeyResolver {
+    std::sync::Arc::new(|did| {
+        let seed = did_to_seed(did);
+        Some(ed25519_dalek::SigningKey::from_bytes(&seed).verifying_key())
+    })
+}
+
+/// Returns the signing key corresponding to what `mock_key_resolver` resolves
+/// for the given DID. Used to produce tokens that pass end-to-end validation.
+fn signing_key_for_did(did: &DID) -> ed25519_dalek::SigningKey {
+    ed25519_dalek::SigningKey::from_bytes(&did_to_seed(did))
+}
+
 // ---------------------------------------------------------------------------
 // Helpers — fixture builders.
 // ---------------------------------------------------------------------------
@@ -258,6 +285,10 @@ fn echo_tool() -> ToolRegistration {
 /// covers any per-action cost the test will exercise. The signature
 /// field is empty because `economy_pre_check` only consults
 /// `payload.fct.spending_capability` for the AND-composition check.
+///
+/// Suitable ONLY for tests that assert rejection (budget exceeded, etc.)
+/// where the rejection happens before C1b signature validation. For happy-path
+/// invocations that must pass the full C1b pipeline, use `signed_spending_ucan_for`.
 fn dummy_spending_ucan() -> scp_core::crypto::ucan::UcanToken {
     use scp_core::crypto::ucan::spending::{
         Amount as SpendAmount, CurrencyCode as SpendCurrency, SpendingCapability,
@@ -302,17 +333,92 @@ fn dummy_spending_ucan() -> scp_core::crypto::ucan::UcanToken {
     }
 }
 
+/// Build a fully-signed `UcanToken` bound to `actor_did` for happy-path tests
+/// that exercise the complete C1b validation pipeline (signature, iss/aud
+/// binding, expiry, nonce). The token is signed with the deterministic Ed25519
+/// key produced by `signing_key_for_did`, which `mock_key_resolver` resolves for
+/// the same DID.
+fn signed_spending_ucan_for(actor_did: &DID) -> scp_core::crypto::ucan::UcanToken {
+    use base64::Engine;
+    use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+    use scp_core::crypto::ucan::spending::{
+        Amount as SpendAmount, CurrencyCode as SpendCurrency, SpendingCapability,
+    };
+    use scp_core::crypto::ucan::{
+        Attenuation, UcanHeader, UcanPayload, UcanToken, nonce::generate_nonce,
+    };
+
+    let cap = SpendingCapability {
+        max_per_action: SpendAmount(u64::MAX),
+        max_total: SpendAmount(u64::MAX),
+        currency: SpendCurrency::from_code("USD").unwrap_or(SpendCurrency(*b"USD\0")),
+        time_window: std::time::Duration::from_secs(3600),
+        allowed_adapters: vec![],
+    };
+    let mut fct = serde_json::Map::new();
+    fct.insert(
+        "spending_capability".to_owned(),
+        cap.to_fact_value().unwrap_or(serde_json::Value::Null),
+    );
+    fct.insert(
+        "scp_key_scope".to_owned(),
+        serde_json::Value::String("#agent".to_owned()),
+    );
+
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+
+    let header = UcanHeader::with_kid("#agent".to_owned());
+    let payload = UcanPayload {
+        iss: actor_did.as_ref().to_owned(),
+        aud: actor_did.as_ref().to_owned(),
+        exp: now + 3600,
+        nbf: Some(now.saturating_sub(60)),
+        nnc: generate_nonce(&scp_primitives::SystemClock),
+        att: vec![Attenuation {
+            with: "scp:spending:*".to_owned(),
+            can: "spend".to_owned(),
+        }],
+        prf: vec![],
+        fct: Some(serde_json::Value::Object(fct)),
+    };
+
+    let header_json = serde_json::to_vec(&header).expect("header serializes");
+    let payload_json = serde_json::to_vec(&payload).expect("payload serializes");
+    let header_b64 = URL_SAFE_NO_PAD.encode(&header_json);
+    let payload_b64 = URL_SAFE_NO_PAD.encode(&payload_json);
+    let signing_input = format!("{header_b64}.{payload_b64}");
+
+    let signing_key = signing_key_for_did(actor_did);
+    let signature = ed25519_dalek::Signer::sign(&signing_key, signing_input.as_bytes());
+    let sig_b64 = URL_SAFE_NO_PAD.encode(signature.to_bytes());
+    let encoded = format!("{signing_input}.{sig_b64}");
+
+    UcanToken {
+        header,
+        payload,
+        signature: signature.to_bytes().to_vec(),
+        encoded,
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Test 1: invoke_tool_with_economy deducts budget and records velocity
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
 async fn invoke_tool_with_economy_deducts_budget_and_records_velocity() {
+    // C1b: happy-path invocations now require a fully signed spending UCAN
+    // bound to the invoker DID. Use mock_key_resolver so validate_spending_ucan_signed
+    // can resolve the verifying key, and signed_spending_ucan_for to produce a
+    // token signed by the matching private key.
     let manager = ContextManager::new(
         Box::new(MockCrypto),
         Box::new(MockTransport::connected()),
         Box::new(MockEventLog::default()),
-        noop_key_resolver(),
+        mock_key_resolver(),
     );
 
     let invoker = DID::from("did:key:invoker");
@@ -334,7 +440,8 @@ async fn invoke_tool_with_economy_deducts_budget_and_records_velocity() {
     let mut registry = ToolRegistry::new();
     registry.insert(echo_tool());
 
-    let spending_ucan = dummy_spending_ucan();
+    // Fully signed UCAN bound to the invoker, matching mock_key_resolver.
+    let spending_ucan = signed_spending_ucan_for(&invoker);
 
     // Snapshot pre-call state.
     let budget_before = manager
