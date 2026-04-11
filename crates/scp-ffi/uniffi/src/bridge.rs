@@ -469,10 +469,10 @@ impl From<scp_identity::IdentityError> for ScpError {
 /// Extracts a leading `SCP-XXX-NNNN` error code from a message body, if any.
 ///
 /// Mirrors the `PyO3` / NAPI bridge helpers. Used to recover
-/// `SCP-ECON-120xx` / `SCP-TOOL-60xx` / `SCP-PERM-30xx` codes embedded
-/// inside `ContextError::PermissionDenied(String)` so Swift / Kotlin
-/// callers can detect specific failures without string-matching the
-/// message body.
+/// economy (12xxx), tool-invocation (6xxx), and permission (3xxx) codes
+/// embedded inside `ContextError::PermissionDenied(String)` so Swift /
+/// Kotlin callers can detect specific failures without string-matching
+/// the message body.
 pub(crate) fn extract_scp_code(message: &str) -> Option<String> {
     let trimmed = message.trim_start();
     let rest = trimmed.strip_prefix("SCP-")?;
@@ -3587,7 +3587,7 @@ pub async fn tool_register(
 ///
 /// # Errors
 ///
-/// - `ScpError::Tool` (`SCP-TOOL-60xx`) — tool not found, schema
+/// - `ScpError::Tool` (tool-invocation error range) — tool not found, schema
 ///   mismatch, execution failure.
 /// - `ScpError::Permission` (`SCP-PERM-3001`) — invalid, expired,
 ///   revoked, or capability-deficient UCAN token.

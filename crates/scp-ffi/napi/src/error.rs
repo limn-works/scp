@@ -136,7 +136,7 @@ impl From<scp_identity::IdentityError> for ScpNapiError {
 /// Extracts a leading `SCP-XXX-NNNN` error code from a message body, if any.
 ///
 /// Mirrors the `PyO3` bridge's `extract_scp_code` helper. Used to recover
-/// `SCP-ECON-120xx` / `SCP-TOOL-60xx` codes embedded inside
+/// economy (12xxx) and tool-invocation (6xxx) codes embedded inside
 /// `ContextError::PermissionDenied(String)` so TypeScript callers can
 /// check `.code` instead of string-matching the message body.
 pub(crate) fn extract_scp_code(message: &str) -> Option<String> {

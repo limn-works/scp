@@ -12007,7 +12007,7 @@ public func toolInterfaceRevoke(handle: ContextHandle, interfaceIdHex: String)as
  *
  * # Errors
  *
- * - `ScpError::Tool` (`SCP-TOOL-60xx`) — tool not found, schema
+ * - `ScpError::Tool` (tool-invocation error range) — tool not found, schema
  * mismatch, execution failure.
  * - `ScpError::Permission` (`SCP-PERM-3001`) — invalid, expired,
  * revoked, or capability-deficient UCAN token.

@@ -366,7 +366,7 @@ fn validate_tool_ucan(
 /// Raises `UcanError` if the UCAN token is invalid, expired, revoked,
 /// or lacks the required tool invocation capability.
 /// Raises `ContextError` (with embedded `SCP-ECON-12010` /
-/// `SCP-ECON-12061` / `SCP-ECON-12090` / `SCP-TOOL-60xx` codes) if the
+/// `SCP-ECON-12061` / `SCP-ECON-12090` / tool-invocation codes) if the
 /// economy pre-check, budget, payment escrow, hard rate limit, or
 /// underlying tool dispatch fails. Callers should consult `.code` rather
 /// than string-matching `.message`.

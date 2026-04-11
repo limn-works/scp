@@ -328,7 +328,7 @@ pub async fn tool_register(
 /// - Rejects with `SCP-ECON-12010` if the per-DID budget is insufficient.
 /// - Rejects with `SCP-ECON-12061` if `spending_ucan_jwt` is missing or
 ///   malformed for a paid action.
-/// - Rejects with `SCP-TOOL-60xx` if invocation fails (tool not found,
+/// - Rejects with a tool-invocation error (6xxx range) if invocation fails (tool not found,
 ///   schema mismatch, etc.).
 ///
 /// See spec §6.2, §8, §19.5, §19.7, ADR-016, and issue #319.

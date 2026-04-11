@@ -326,7 +326,7 @@ impl From<scp_core::context::ContextError> for ScpPyError {
             },
             // `PermissionDenied(String)` is the catch-all the runtime
             // uses for tool-economy and tool-invocation failures
-            // (`SCP-ECON-120xx`, `SCP-TOOL-60xx`). Recover the embedded
+            // (economy 12xxx, tool-invocation 6xxx). Recover the embedded
             // code prefix so callers can detect specific failures
             // (budget exceeded, spending UCAN missing, tool not active,
             // etc.) without string-matching the message body.
