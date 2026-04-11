@@ -2243,10 +2243,18 @@ impl ContextManager {
 
             // Add to role state.
             ctx.role_state.members.insert(did.to_string());
+            // H2: Use system_assign_role to bypass the RoleAssign capability
+            // check. The governance engine has already authorized this action
+            // via quorum — re-checking RoleAssign against the creator would
+            // silently 500-out approved proposals whenever the creator has
+            // been demoted, removed, or never held RoleAssign. See
+            // `enforce_assign_role` (line 74) for the matching consequence
+            // path that already uses this pattern.
+            let tokens = roles::system_assign_role(&mut ctx.role_state, did, role, &*self.clock)
+                .map_err(|e| ContextError::MembershipFailed(e.to_string()))?;
+            // creator_did is still consumed below by push_welcome_event for
+            // the WelcomeGenerated provenance field.
             let creator_did = ctx.role_state.creator_did.clone();
-            let tokens =
-                roles::assign_role(&mut ctx.role_state, did, role, &creator_did, &*self.clock)
-                    .map_err(|e| ContextError::MembershipFailed(e.to_string()))?;
 
             // Add to membership tracking.
             ctx.membership
@@ -2429,15 +2437,17 @@ impl ContextManager {
 
             // Re-assign via the role engine (validates role exists, updates
             // assignments and member_capabilities).
-            let creator_did = ctx.role_state.creator_did.clone();
-            let tokens = roles::assign_role(
-                &mut ctx.role_state,
-                did,
-                new_role,
-                &creator_did,
-                &*self.clock,
-            )
-            .map_err(|e| ContextError::MembershipFailed(e.to_string()))?;
+            //
+            // H2: Use system_assign_role to bypass the RoleAssign capability
+            // check. The governance engine has already authorized this action
+            // via quorum — re-checking RoleAssign against the creator would
+            // silently 500-out approved proposals whenever the creator has
+            // been demoted, removed, or never held RoleAssign. See
+            // `enforce_assign_role` (line 74) for the matching consequence
+            // path that already uses this pattern.
+            let tokens =
+                roles::system_assign_role(&mut ctx.role_state, did, new_role, &*self.clock)
+                    .map_err(|e| ContextError::MembershipFailed(e.to_string()))?;
 
             // Update membership tracking with new role.
             if let Some(info) = ctx.membership.get_mut(did) {
@@ -2861,7 +2871,17 @@ impl ContextManager {
             }
 
             // Demote current admins, promote new admin via role engine.
-            let creator_did = ctx.role_state.creator_did.clone();
+            //
+            // H2: Use system_assign_role to bypass the RoleAssign capability
+            // check. The governance engine has already authorized this action
+            // via quorum, and TransferAdmin is structurally a self-modifying
+            // operation: even when the creator is the current admin, the
+            // first iteration below demotes them — causing the *second*
+            // iteration (or the new-admin promotion) to fail
+            // `AssignerNotAuthorized` if it still required `RoleAssign` on the
+            // creator. The same root cause applies as in execute_change_role
+            // and execute_add_member; see `enforce_assign_role` for the
+            // matching consequence path.
             // Find and demote current admin(s).
             let current_admins: Vec<String> = ctx
                 .role_state
@@ -2871,27 +2891,16 @@ impl ContextManager {
                 .map(|(did, _)| did.clone())
                 .collect();
             for admin_did in &current_admins {
-                roles::assign_role(
-                    &mut ctx.role_state,
-                    admin_did,
-                    "member",
-                    &creator_did,
-                    &*self.clock,
-                )
-                .map_err(|e| ContextError::MembershipFailed(e.to_string()))?;
+                roles::system_assign_role(&mut ctx.role_state, admin_did, "member", &*self.clock)
+                    .map_err(|e| ContextError::MembershipFailed(e.to_string()))?;
                 if let Some(info) = ctx.membership.get_mut(admin_did) {
                     "member".clone_into(&mut info.role_name);
                 }
             }
             // Promote new admin.
-            let tokens = roles::assign_role(
-                &mut ctx.role_state,
-                new_admin,
-                "admin",
-                &creator_did,
-                &*self.clock,
-            )
-            .map_err(|e| ContextError::MembershipFailed(e.to_string()))?;
+            let tokens =
+                roles::system_assign_role(&mut ctx.role_state, new_admin, "admin", &*self.clock)
+                    .map_err(|e| ContextError::MembershipFailed(e.to_string()))?;
             if let Some(info) = ctx.membership.get_mut(new_admin) {
                 "admin".clone_into(&mut info.role_name);
                 info.tokens = tokens;

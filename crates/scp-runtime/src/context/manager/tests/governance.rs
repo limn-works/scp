@@ -15012,3 +15012,331 @@ async fn earned_capacity_evicts_stale_timestamps() {
         result.err()
     );
 }
+
+// -----------------------------------------------------------------------
+// H2: governance dispatch must use system_assign_role (PR #1606)
+// -----------------------------------------------------------------------
+//
+// `execute_change_role` and `execute_add_member` previously called
+// `roles::assign_role(... &creator_did ...)`. That path enforces the
+// `RoleAssign` capability against the creator. Whenever the creator was
+// later demoted, removed, or never held `RoleAssign` to begin with, every
+// subsequent governance-approved role mutation silently failed with
+// `AssignerNotAuthorized`. The fix routes through `system_assign_role`,
+// which the consequence engine has used at `governance.rs:74` since #1531.
+// These tests pin that fix in place.
+
+/// H2 regression: `execute_change_role` must succeed even when the
+/// creator no longer holds `RoleAssign`. Previously failed with
+/// `AssignerNotAuthorized` because the dispatch path passed `creator_did`
+/// to `roles::assign_role`.
+#[tokio::test]
+async fn h2_execute_change_role_works_when_creator_demoted() {
+    use scp_protocol::context::roles::Capability as RoleCapability;
+
+    let manager = ContextManager::new(
+        Box::new(MockCrypto::default()),
+        Box::new(MockTransport::connected()),
+        Box::new(MockEventLog::default()),
+        noop_key_resolver(),
+    );
+    let params = governance_params();
+    let _handle = manager
+        .create_context(
+            "h2-change-role-ctx".into(),
+            params,
+            "did:key:creator".into(),
+        )
+        .await
+        .unwrap();
+
+    // Pre-populate Bob as a member of the context.
+    let add_bob = approved_proposal(
+        [200u8; 32],
+        "h2-change-role-ctx",
+        GovernanceAction::AddMember {
+            did: "did:key:bob".into(),
+            role: "member".to_owned(),
+        },
+        &["did:key:creator"],
+    );
+    manager
+        .execute_governance_action("h2-change-role-ctx", &add_bob)
+        .await
+        .expect("AddMember should seed Bob");
+
+    // Simulate creator losing RoleAssign — analogous to a governance
+    // demotion that swapped the creator from admin to a role without
+    // `RoleAssign`. We strip the capability directly from the creator's
+    // member_capabilities to model the post-demotion state without
+    // depending on the (admittedly slow) full demote-the-admin path.
+    {
+        let mut contexts = manager.contexts.lock().await;
+        let ctx = contexts.get_mut("h2-change-role-ctx").unwrap();
+        let caps = ctx
+            .role_state
+            .member_capabilities
+            .get_mut("did:key:creator")
+            .expect("creator should have capabilities entry");
+        caps.remove(&RoleCapability::RoleAssign);
+        assert!(
+            !ctx.role_state
+                .member_has_capability("did:key:creator", &RoleCapability::RoleAssign),
+            "precondition: creator must lack RoleAssign for the regression to be meaningful"
+        );
+    }
+
+    // Governance now approves a ChangeRole on Bob. Pre-fix this would
+    // bubble `AssignerNotAuthorized("did:key:creator")` up through
+    // `MembershipFailed`. Post-fix, it must succeed.
+    let change_bob = approved_proposal(
+        [201u8; 32],
+        "h2-change-role-ctx",
+        GovernanceAction::ChangeRole {
+            did: "did:key:bob".into(),
+            new_role: "observer".into(),
+        },
+        &["did:key:creator"],
+    );
+    let result = manager
+        .execute_governance_action("h2-change-role-ctx", &change_bob)
+        .await;
+    assert!(
+        result.is_ok(),
+        "ChangeRole must dispatch through system_assign_role, \
+         not re-check RoleAssign on the (now-demoted) creator: {result:?}"
+    );
+
+    // Verify Bob's role actually changed.
+    let contexts = manager.contexts.lock().await;
+    let ctx = contexts.get("h2-change-role-ctx").unwrap();
+    let assignment = ctx
+        .role_state
+        .assignments
+        .get("did:key:bob")
+        .expect("Bob should still have an assignment after ChangeRole");
+    assert_eq!(
+        assignment.role_name, "observer",
+        "Bob's role should reflect the ChangeRole proposal"
+    );
+}
+
+/// H2 regression: `execute_add_member` must succeed even when the creator
+/// no longer holds `RoleAssign`. Same root cause as
+/// `h2_execute_change_role_works_when_creator_demoted`.
+#[tokio::test]
+async fn h2_execute_add_member_works_when_creator_demoted() {
+    use scp_protocol::context::roles::Capability as RoleCapability;
+
+    let manager = ContextManager::new(
+        Box::new(MockCrypto::default()),
+        Box::new(MockTransport::connected()),
+        Box::new(MockEventLog::default()),
+        noop_key_resolver(),
+    );
+    let params = governance_params();
+    let _handle = manager
+        .create_context("h2-add-member-ctx".into(), params, "did:key:creator".into())
+        .await
+        .unwrap();
+
+    // Strip RoleAssign from the creator before any AddMember proposal.
+    {
+        let mut contexts = manager.contexts.lock().await;
+        let ctx = contexts.get_mut("h2-add-member-ctx").unwrap();
+        let caps = ctx
+            .role_state
+            .member_capabilities
+            .get_mut("did:key:creator")
+            .expect("creator should have capabilities entry");
+        caps.remove(&RoleCapability::RoleAssign);
+        assert!(
+            !ctx.role_state
+                .member_has_capability("did:key:creator", &RoleCapability::RoleAssign),
+            "precondition: creator must lack RoleAssign for the regression to be meaningful"
+        );
+    }
+
+    // Approve an AddMember on Carol.
+    let add_carol = approved_proposal(
+        [210u8; 32],
+        "h2-add-member-ctx",
+        GovernanceAction::AddMember {
+            did: "did:key:carol".into(),
+            role: "member".to_owned(),
+        },
+        &["did:key:creator"],
+    );
+    let result = manager
+        .execute_governance_action("h2-add-member-ctx", &add_carol)
+        .await;
+    assert!(
+        result.is_ok(),
+        "AddMember must dispatch through system_assign_role, \
+         not re-check RoleAssign on the (now-demoted) creator: {result:?}"
+    );
+
+    // Verify Carol is in the context.
+    let contexts = manager.contexts.lock().await;
+    let ctx = contexts.get("h2-add-member-ctx").unwrap();
+    assert!(
+        ctx.membership.contains("did:key:carol"),
+        "Carol must be in membership tracking after a successful AddMember"
+    );
+    assert!(
+        ctx.role_state.members.contains("did:key:carol"),
+        "Carol must be in role_state members after a successful AddMember"
+    );
+    let carol_assignment = ctx
+        .role_state
+        .assignments
+        .get("did:key:carol")
+        .expect("Carol should have a role assignment");
+    assert_eq!(
+        carol_assignment.role_name, "member",
+        "Carol's role assignment should match the AddMember proposal"
+    );
+}
+
+/// H2 regression: tokens returned by `system_assign_role` from
+/// `execute_change_role` must be propagated into the
+/// `MembershipState` info entry. Guards against a refactor that drops
+/// the token plumbing while migrating to the system path.
+#[tokio::test]
+async fn h2_execute_change_role_updates_tokens_correctly() {
+    let manager = ContextManager::new(
+        Box::new(MockCrypto::default()),
+        Box::new(MockTransport::connected()),
+        Box::new(MockEventLog::default()),
+        noop_key_resolver(),
+    );
+    let params = governance_params();
+    let _handle = manager
+        .create_context(
+            "h2-change-tokens-ctx".into(),
+            params,
+            "did:key:creator".into(),
+        )
+        .await
+        .unwrap();
+
+    // Seed Bob as a member.
+    manager
+        .execute_governance_action(
+            "h2-change-tokens-ctx",
+            &approved_proposal(
+                [220u8; 32],
+                "h2-change-tokens-ctx",
+                GovernanceAction::AddMember {
+                    did: "did:key:bob".into(),
+                    role: "member".to_owned(),
+                },
+                &["did:key:creator"],
+            ),
+        )
+        .await
+        .unwrap();
+
+    // Snapshot Bob's role tokens prior to ChangeRole.
+    let initial_tokens = {
+        let contexts = manager.contexts.lock().await;
+        let ctx = contexts.get("h2-change-tokens-ctx").unwrap();
+        ctx.membership
+            .get("did:key:bob")
+            .expect("Bob should be in membership")
+            .tokens
+            .clone()
+    };
+
+    // Promote Bob to admin.
+    manager
+        .execute_governance_action(
+            "h2-change-tokens-ctx",
+            &approved_proposal(
+                [221u8; 32],
+                "h2-change-tokens-ctx",
+                GovernanceAction::ChangeRole {
+                    did: "did:key:bob".into(),
+                    new_role: "admin".into(),
+                },
+                &["did:key:creator"],
+            ),
+        )
+        .await
+        .unwrap();
+
+    let contexts = manager.contexts.lock().await;
+    let ctx = contexts.get("h2-change-tokens-ctx").unwrap();
+    let info = ctx
+        .membership
+        .get("did:key:bob")
+        .expect("Bob should still be present after ChangeRole");
+
+    // Role label updated.
+    assert_eq!(info.role_name, "admin");
+
+    // Tokens were re-minted by system_assign_role and propagated into
+    // membership. They must match the role_state assignment exactly,
+    // and must differ from the initial member-role token set (admin
+    // grants more capabilities than member).
+    let assignment = ctx
+        .role_state
+        .assignments
+        .get("did:key:bob")
+        .expect("Bob should have a role_state assignment");
+    assert_eq!(
+        info.tokens, assignment.tokens,
+        "membership tokens must mirror role_state tokens after ChangeRole"
+    );
+    assert_ne!(
+        info.tokens, initial_tokens,
+        "ChangeRole admin grants different capabilities than member — \
+         re-minted tokens must replace the prior set"
+    );
+    assert!(
+        !info.tokens.is_empty(),
+        "admin role must mint at least one capability token"
+    );
+}
+
+/// H2 structural regression: neither `execute_change_role` nor
+/// `execute_add_member` may pass `creator_did` to `assign_role`. This
+/// test asserts the textual invariant directly so that any future
+/// reintroduction of the bug fails CI before runtime.
+#[test]
+fn h2_dispatch_paths_do_not_pass_creator_did_to_assign_role() {
+    // The governance.rs source is colocated next to this tests/ tree
+    // (path: `crates/scp-runtime/src/context/manager/governance.rs`).
+    let source = include_str!("../governance.rs");
+
+    // 1. The non-system `roles::assign_role(` call MUST be absent from
+    //    the dispatch path. Only `system_assign_role` is allowed in
+    //    governance.rs (used by both the consequence engine helper and
+    //    the membership/role dispatch paths).
+    assert!(
+        !source.contains("roles::assign_role("),
+        "governance.rs must not call roles::assign_role; \
+         the governance dispatch path must use roles::system_assign_role \
+         to avoid double-authorizing already-quorum-approved proposals (H2)"
+    );
+
+    // 2. Sanity: the system path is the one we expect. If this assertion
+    //    starts failing, the file has been refactored beyond what this
+    //    structural test understands and it should be revisited.
+    assert!(
+        source.contains("roles::system_assign_role("),
+        "governance.rs must call roles::system_assign_role from both \
+         enforce_assign_role and the membership/role dispatch paths (H2)"
+    );
+
+    // 3. The two functions must still exist with the expected signatures
+    //    so this test can't be neutralized by deleting them.
+    assert!(
+        source.contains("async fn execute_change_role"),
+        "execute_change_role must still exist as the ChangeRole dispatcher"
+    );
+    assert!(
+        source.contains("async fn execute_add_member"),
+        "execute_add_member must still exist as the AddMember dispatcher"
+    );
+}
