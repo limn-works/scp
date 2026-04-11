@@ -346,7 +346,9 @@ impl ContextManager {
                         &cancel,
                     ).await;
 
-                    // Emit event to the receive buffer (lock, push, drop).
+                    // Emit event to the receive buffer and decay governance
+                    // state under a single lock acquisition (matches the
+                    // synchronous handle_ttl_expiry path; H8 fix).
                     let mut contexts = contexts_ref.lock().await;
                     if let Some(ctx) = contexts.get_mut(&context_id_owned) {
                         if result.is_complete() {
@@ -360,7 +362,18 @@ impl ContextManager {
                                 event_logged: result.event_logged(),
                             });
                         }
+                        // Cancel the governance timeout task and clear
+                        // participation cache, cooldown, proposal timestamps,
+                        // and velocity tracker. Without this the in-memory
+                        // governance state would persist after auto-expiry
+                        // (#1530, H8). Mirrors handle_ttl_expiry and
+                        // close_context. Must run under the same lock so the
+                        // state is fully cleared before any other observer
+                        // sees the Expired/ExpiryFailed event.
+                        ctx.governance.timeout_task.cancel();
+                        ctx.governance.decay_participation();
                     }
+                    drop(contexts);
                 }
                 () = cancel.notified() => {
                     // Timer was cancelled.
