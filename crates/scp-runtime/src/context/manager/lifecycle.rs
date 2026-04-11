@@ -1958,15 +1958,20 @@ impl ContextManager {
         ctx.role_state.members.insert(member_did.to_string());
 
         // Assign default "member" role.
+        //
+        // H2 (related): Use system_assign_role to bypass the RoleAssign
+        // capability check. The join handshake is a self-service flow that
+        // already passed economy / sybil / capacity / version gates above —
+        // re-checking `RoleAssign` against the creator would silently fail
+        // every join after the creator has been demoted out of an admin
+        // role. The default "member" role assignment carries no ambient
+        // authority (it's the protocol-defined floor), so there is nothing
+        // to authorize a second time. See `enforce_assign_role` and the
+        // governance dispatch path in governance.rs for the same pattern.
         let creator_did = ctx.role_state.creator_did.clone();
-        let tokens = roles::assign_role(
-            &mut ctx.role_state,
-            member_did,
-            "member",
-            &creator_did,
-            &*self.clock,
-        )
-        .map_err(|e| ContextError::MembershipFailed(e.to_string()))?;
+        let tokens =
+            roles::system_assign_role(&mut ctx.role_state, member_did, "member", &*self.clock)
+                .map_err(|e| ContextError::MembershipFailed(e.to_string()))?;
 
         // Add to membership tracking.
         ctx.membership
