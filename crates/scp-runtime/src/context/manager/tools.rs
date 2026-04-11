@@ -757,12 +757,15 @@ impl ContextManager {
             // reported in the output).
             super::governance::enforce_triggered_consequences(
                 ctx,
-                context_id,
-                invoker_did,
-                now,
-                &triggered,
-                &consequence_rules,
-                &*self.clock,
+                &super::governance::EnforceConsequencesCtx {
+                    context_id,
+                    member_did: invoker_did,
+                    now,
+                    triggered: &triggered,
+                    rules: &consequence_rules,
+                    clock: &*self.clock,
+                    event_log: self.event_log.as_ref(),
+                },
             );
 
             (triggered, ticket)

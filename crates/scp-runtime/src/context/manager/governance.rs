@@ -119,7 +119,123 @@ pub(super) fn dispatch_consequences(
 
     // Enforce the triggered consequences, passing the already-cloned rules
     // to avoid cloning again inside enforce_triggered_consequences.
-    enforce_triggered_consequences(ctx, context_id, member_did, now, &triggered, &rules, clock);
+    enforce_triggered_consequences(
+        ctx,
+        &EnforceConsequencesCtx {
+            context_id,
+            member_did,
+            now,
+            triggered: &triggered,
+            rules: &rules,
+            clock,
+            event_log,
+        },
+    );
+}
+
+/// Synthetic actor DID recorded for durable consequence event log entries
+/// (H4, PR #1606). Consequence enforcement is performed by the local node's
+/// governance engine, not by any specific member, so the actor field is set
+/// to a stable system sentinel rather than the affected member's DID. This
+/// also satisfies the `WarningCount` trigger's `actor_did != subject_did`
+/// requirement so subsequent rule evaluation can match prior enforcements
+/// against the same target.
+pub(super) const CONSEQUENCE_ACTOR_DID: &str = "system";
+
+/// Formats a [`ConsequenceTrigger`] into the canonical wire-stable string
+/// used both in `ContextEvent::ConsequenceTriggered.trigger_type` and in the
+/// structured durable event log payload (H4, PR #1606).
+///
+/// The format is intentionally simple and forward-compatible:
+/// `MessageVelocity`, `ToolRateExceeded`, `WarningCount`, or `Custom:<key>`.
+/// Downstream rules and audit consumers parse on the `Custom:` prefix.
+fn trigger_kind_str(trigger: &scp_protocol::trust::consequence::ConsequenceTrigger) -> String {
+    use scp_protocol::trust::consequence::ConsequenceTrigger;
+    match trigger {
+        ConsequenceTrigger::MessageVelocity => "MessageVelocity".to_owned(),
+        ConsequenceTrigger::ToolRateExceeded => "ToolRateExceeded".to_owned(),
+        ConsequenceTrigger::WarningCount => "WarningCount".to_owned(),
+        ConsequenceTrigger::Custom(key) => format!("Custom:{key}"),
+    }
+}
+
+/// Builds the structured JSON payload for a `ConsequenceTriggered` /
+/// `ConsequenceEnforced` / `ConsequenceEnforcementFailed` /
+/// `ConsequenceEscalatedToSuspendAll` durable event log entry (H4, PR #1606).
+///
+/// The shape matches the H4 spec:
+/// ```json
+/// {
+///   "target_did": "did:key:alice",
+///   "rule_index": 3,
+///   "trigger_kind": "MessageVelocity" | "WarningCount" | "Custom:..."
+///                   | "ToolRateExceeded",
+///   "action_type": "SuspendCapability" | "SuspendAccess" | "SuspendAll"
+///                  | "RevokeAccess" | "RemoveMember" | "AssignRole"
+/// }
+/// ```
+///
+/// `target_did` mirrors the `payload_target_is` convention used by the
+/// `WarningCount` trigger so subsequent rule evaluation can match these
+/// entries against the affected member, closing the recursive blind spot
+/// from the white-hat review.
+fn consequence_event_payload(
+    target_did: &DID,
+    rule_index: usize,
+    trigger_kind: &str,
+    action_type: &str,
+) -> serde_json::Value {
+    serde_json::json!({
+        "target_did": target_did.as_ref(),
+        "rule_index": rule_index,
+        "trigger_kind": trigger_kind,
+        "action_type": action_type,
+    })
+}
+
+/// Best-effort durable append of one consequence event log entry. A failed
+/// append is logged via `tracing::warn!` but never blocks the matching
+/// `receive_buffer.push(...)` call — the receive buffer remains a useful
+/// in-session signal even when the durable log is unavailable. Returns
+/// nothing because the failure mode is observed via tracing, not callers.
+fn append_consequence_event(
+    event_log: &dyn super::super::builder::ContextEventLogProvider,
+    context_id: &str,
+    context_id_bytes: &[u8; 32],
+    event_name: &'static str,
+    member_did: &DID,
+    payload: &serde_json::Value,
+) {
+    if let Err(e) = event_log.append_context_event_with_payload(
+        context_id_bytes,
+        event_name,
+        CONSEQUENCE_ACTOR_DID,
+        Some(payload),
+    ) {
+        tracing::warn!(
+            context_id,
+            member = %member_did,
+            event = event_name,
+            error = %e,
+            "failed to append consequence event to durable event log"
+        );
+    }
+}
+
+/// Borrowed inputs for `enforce_triggered_consequences`. Bundling the
+/// providers, scope identifiers, and pre-evaluated rule data into one
+/// struct keeps the public function signature within the
+/// `clippy::too_many_arguments` budget while preserving the explicit
+/// names that callers (`messaging.rs`, `tools.rs`, `governance.rs`,
+/// the periodic timer) need at construction time.
+pub(super) struct EnforceConsequencesCtx<'a> {
+    pub context_id: &'a str,
+    pub member_did: &'a DID,
+    pub now: u64,
+    pub triggered: &'a [TriggeredConsequence],
+    pub rules: &'a [ConsequenceRule],
+    pub clock: &'a dyn scp_primitives::Clock,
+    pub event_log: &'a dyn super::super::builder::ContextEventLogProvider,
 }
 
 /// Enforces a set of pre-evaluated triggered consequences.
@@ -128,149 +244,343 @@ pub(super) fn dispatch_consequences(
 /// `evaluate_consequence_rules` visible in their own file (for pipeline
 /// wiring AST gates) can call evaluate + enforce as two distinct steps.
 ///
-/// The `rules` parameter should be the same slice used for evaluation.
-/// When called from `dispatch_consequences`, the already-cloned rules are
-/// passed to avoid a second clone.
+/// The `rules` field on [`EnforceConsequencesCtx`] should be the same slice
+/// used for evaluation. When called from `dispatch_consequences`, the
+/// already-cloned rules are passed to avoid a second clone.
+///
+/// **Durability invariant (H4, PR #1606):** Every consequence event is
+/// appended to the durable Merkle event log via `event_log` BEFORE the
+/// matching `ctx.receive_buffer.push(...)` call. The order matters: a crash
+/// between the append and the buffer push leaves the Merkle-anchored record
+/// intact (the buffer is in-memory and capped at 1000, so its loss is not a
+/// non-repudiation gap; the durable log is the system of record). The
+/// receive buffer pushes remain because they are still useful for
+/// in-session SDK observation.
 pub(super) fn enforce_triggered_consequences(
     ctx: &mut PerContextState,
-    context_id: &str,
-    member_did: &DID,
-    now: u64,
-    triggered: &[TriggeredConsequence],
-    rules: &[ConsequenceRule],
-    clock: &dyn scp_primitives::Clock,
+    args: &EnforceConsequencesCtx<'_>,
 ) {
-    for consequence in triggered {
-        // Cooldown tracking: skip if this rule fired within its window.
-        if let Some(&last_fired) = ctx.governance.cooldown_until.get(&consequence.rule_index)
-            && now < last_fired
-        {
-            continue;
-        }
+    let context_id_bytes = context_id_to_bytes(args.context_id);
+    for consequence in args.triggered {
+        process_one_triggered_consequence(ctx, args, &context_id_bytes, consequence);
+    }
+}
 
-        // TOCTOU/ghost guard: skip entirely if the member is absent AND
-        // there is no evidence that the member ever participated. Members
-        // who left mid-flight after accumulating real evidence (e.g.,
-        // WarningCount triggered by prior governance actions against
-        // them) still emit ConsequenceTriggered so observers see the
-        // behavioral signal.
-        let member_present = ctx.membership.contains(member_did);
-        if !member_present && consequence.evidence.is_empty() {
-            tracing::debug!(
-                member = %member_did,
-                "skipping consequence: ghost DID with no evidence"
-            );
-            continue;
-        }
+/// Single-consequence body of [`enforce_triggered_consequences`].
+/// Extracted so the public function stays under `clippy::too_many_lines`.
+fn process_one_triggered_consequence(
+    ctx: &mut PerContextState,
+    args: &EnforceConsequencesCtx<'_>,
+    context_id_bytes: &[u8; 32],
+    consequence: &TriggeredConsequence,
+) {
+    let member_did = args.member_did;
+    let now = args.now;
 
-        let action_type = match &consequence.action {
-            scp_protocol::trust::consequence::ConsequenceAction::Enforcement(sev) => {
-                sev.variant_name()
-            }
-            scp_protocol::trust::consequence::ConsequenceAction::AssignRole { .. } => "AssignRole",
-        };
-        let trigger_type = rules
-            .get(consequence.rule_index)
-            .map_or_else(|| "Unknown".to_owned(), |r| format!("{:?}", r.trigger));
+    // Cooldown tracking: skip if this rule fired within its window.
+    if let Some(&last_fired) = ctx.governance.cooldown_until.get(&consequence.rule_index)
+        && now < last_fired
+    {
+        return;
+    }
 
-        ctx.receive_buffer.push(ContextEvent::ConsequenceTriggered {
-            context_id: context_id.to_owned(),
-            member_did: member_did.clone(),
-            rule_index: consequence.rule_index,
-            trigger_type,
-            action_type: action_type.to_owned(),
-        });
+    // TOCTOU/ghost guard: skip entirely if the member is absent AND
+    // there is no evidence that the member ever participated. Members
+    // who left mid-flight after accumulating real evidence still emit
+    // `ConsequenceTriggered` so observers see the behavioral signal.
+    let member_present = ctx.membership.contains(member_did);
+    if !member_present && consequence.evidence.is_empty() {
+        tracing::debug!(
+            member = %member_did,
+            "skipping consequence: ghost DID with no evidence"
+        );
+        return;
+    }
 
-        // If the member has left between evaluation and enforcement,
-        // emit a failed Enforced event and skip the actual mutation —
-        // suspending capabilities for an absent member is a no-op.
-        if !member_present {
-            tracing::debug!(
-                member = %member_did,
-                "skipping consequence enforcement: member is no longer present"
-            );
-            ctx.receive_buffer.push(ContextEvent::ConsequenceEnforced {
-                context_id: context_id.to_owned(),
-                member_did: member_did.clone(),
-                action_type: action_type.to_owned(),
-                success: false,
-            });
-            continue;
-        }
+    let action_type = consequence_action_type(&consequence.action);
+    let trigger_kind = args
+        .rules
+        .get(consequence.rule_index)
+        .map_or_else(|| "Unknown".to_owned(), |r| trigger_kind_str(&r.trigger));
 
-        // Dispatch enforcement action via extracted helpers. Each match arm
-        // calls a named function as an expression_statement so the pipeline
-        // wiring gates can detect the call_expression per-variant.
-        let success = match &consequence.action {
-            scp_protocol::trust::consequence::ConsequenceAction::Enforcement(severity) => {
-                use scp_protocol::trust::consequence::EnforcementSeverity;
-                match severity {
-                    EnforcementSeverity::SuspendCapability { capabilities } => {
-                        enforce_suspend(ctx, member_did, capabilities)
-                    }
-                    EnforcementSeverity::SuspendAccess => {
-                        // SuspendAccess: suspend all capabilities via role_state.
-                        ctx.role_state.suspend_all(member_did.as_ref());
-                        true
-                    }
-                    EnforcementSeverity::RevokeAccess { .. }
-                    | EnforcementSeverity::RemoveMember { .. } => {
-                        // RevokeAccess and RemoveMember should not reach the
-                        // consequence dispatch path without the opt-in flag.
-                        // If they do, escalate to SuspendAccess as a safe
-                        // fallback.
-                        tracing::error!(
-                            context_id,
-                            member = %member_did,
-                            severity = ?severity,
-                            "RevokeAccess/RemoveMember reached consequence dispatch; \
-                             this should have been rejected at validation time"
-                        );
-                        false
-                    }
+    // Always emit `ConsequenceTriggered` (durable + buffer) regardless
+    // of whether the member is still present.
+    emit_consequence_triggered(
+        ctx,
+        args,
+        context_id_bytes,
+        consequence,
+        &trigger_kind,
+        action_type,
+    );
+
+    if !member_present {
+        // Member left between evaluation and enforcement: emit a failed
+        // Enforced record and skip the actual mutation.
+        tracing::debug!(
+            member = %member_did,
+            "skipping consequence enforcement: member is no longer present"
+        );
+        emit_absent_member_enforcement_failed(
+            ctx,
+            args,
+            context_id_bytes,
+            consequence,
+            &trigger_kind,
+            action_type,
+        );
+        return;
+    }
+
+    let success =
+        dispatch_enforcement_action(ctx, member_did, consequence, args.clock, args.context_id);
+
+    if !success {
+        emit_failure_escalation(
+            ctx,
+            args,
+            context_id_bytes,
+            consequence,
+            &trigger_kind,
+            action_type,
+        );
+        return; // skip cooldown recording — failed action doesn't count
+    }
+
+    // Record cooldown: prevent re-firing within the rule's window.
+    if let Some(rule) = args.rules.get(consequence.rule_index) {
+        ctx.governance.cooldown_until.insert(
+            consequence.rule_index,
+            now.saturating_add(rule.window.as_secs()),
+        );
+    }
+
+    emit_consequence_enforced_success(
+        ctx,
+        args,
+        context_id_bytes,
+        consequence,
+        &trigger_kind,
+        action_type,
+    );
+}
+
+/// Resolves the `action_type` string label for a [`TriggeredConsequence`].
+const fn consequence_action_type(
+    action: &scp_protocol::trust::consequence::ConsequenceAction,
+) -> &'static str {
+    match action {
+        scp_protocol::trust::consequence::ConsequenceAction::Enforcement(sev) => sev.variant_name(),
+        scp_protocol::trust::consequence::ConsequenceAction::AssignRole { .. } => "AssignRole",
+    }
+}
+
+/// Emits a `ConsequenceTriggered` durable event log entry followed by
+/// the matching receive-buffer push (H4 ordering invariant).
+fn emit_consequence_triggered(
+    ctx: &mut PerContextState,
+    args: &EnforceConsequencesCtx<'_>,
+    context_id_bytes: &[u8; 32],
+    consequence: &TriggeredConsequence,
+    trigger_kind: &str,
+    action_type: &str,
+) {
+    let payload = consequence_event_payload(
+        args.member_did,
+        consequence.rule_index,
+        trigger_kind,
+        action_type,
+    );
+    append_consequence_event(
+        args.event_log,
+        args.context_id,
+        context_id_bytes,
+        "ConsequenceTriggered",
+        args.member_did,
+        &payload,
+    );
+    ctx.receive_buffer.push(ContextEvent::ConsequenceTriggered {
+        context_id: args.context_id.to_owned(),
+        member_did: args.member_did.clone(),
+        rule_index: consequence.rule_index,
+        trigger_type: trigger_kind.to_owned(),
+        action_type: action_type.to_owned(),
+    });
+}
+
+/// Emits a `ConsequenceEnforcementFailed` durable entry plus the matching
+/// `ConsequenceEnforced { success: false }` receive-buffer push for the
+/// "member-departed-mid-flight" path. Separate from
+/// [`emit_failure_escalation`] because no escalation is applied when the
+/// member is absent — there is nothing to escalate against.
+fn emit_absent_member_enforcement_failed(
+    ctx: &mut PerContextState,
+    args: &EnforceConsequencesCtx<'_>,
+    context_id_bytes: &[u8; 32],
+    consequence: &TriggeredConsequence,
+    trigger_kind: &str,
+    action_type: &str,
+) {
+    let payload = consequence_event_payload(
+        args.member_did,
+        consequence.rule_index,
+        trigger_kind,
+        action_type,
+    );
+    append_consequence_event(
+        args.event_log,
+        args.context_id,
+        context_id_bytes,
+        "ConsequenceEnforcementFailed",
+        args.member_did,
+        &payload,
+    );
+    ctx.receive_buffer.push(ContextEvent::ConsequenceEnforced {
+        context_id: args.context_id.to_owned(),
+        member_did: args.member_did.clone(),
+        action_type: action_type.to_owned(),
+        success: false,
+    });
+}
+
+/// Emits a `ConsequenceEnforced { success: true }` durable entry plus the
+/// matching receive-buffer push for the success path.
+fn emit_consequence_enforced_success(
+    ctx: &mut PerContextState,
+    args: &EnforceConsequencesCtx<'_>,
+    context_id_bytes: &[u8; 32],
+    consequence: &TriggeredConsequence,
+    trigger_kind: &str,
+    action_type: &str,
+) {
+    let payload = consequence_event_payload(
+        args.member_did,
+        consequence.rule_index,
+        trigger_kind,
+        action_type,
+    );
+    append_consequence_event(
+        args.event_log,
+        args.context_id,
+        context_id_bytes,
+        "ConsequenceEnforced",
+        args.member_did,
+        &payload,
+    );
+    ctx.receive_buffer.push(ContextEvent::ConsequenceEnforced {
+        context_id: args.context_id.to_owned(),
+        member_did: args.member_did.clone(),
+        action_type: action_type.to_owned(),
+        success: true,
+    });
+}
+
+/// Per-arm enforcement dispatch. Each match arm calls a named function as
+/// an `expression_statement` so the pipeline wiring gates can detect the
+/// `call_expression` per-variant.
+fn dispatch_enforcement_action(
+    ctx: &mut PerContextState,
+    member_did: &DID,
+    consequence: &TriggeredConsequence,
+    clock: &dyn scp_primitives::Clock,
+    context_id: &str,
+) -> bool {
+    match &consequence.action {
+        scp_protocol::trust::consequence::ConsequenceAction::Enforcement(severity) => {
+            use scp_protocol::trust::consequence::EnforcementSeverity;
+            match severity {
+                EnforcementSeverity::SuspendCapability { capabilities } => {
+                    enforce_suspend(ctx, member_did, capabilities)
+                }
+                EnforcementSeverity::SuspendAccess => {
+                    // SuspendAccess: suspend all capabilities via role_state.
+                    ctx.role_state.suspend_all(member_did.as_ref());
+                    true
+                }
+                EnforcementSeverity::RevokeAccess { .. }
+                | EnforcementSeverity::RemoveMember { .. } => {
+                    // RevokeAccess and RemoveMember should not reach the
+                    // consequence dispatch path without the opt-in flag.
+                    // If they do, escalate to SuspendAccess as a safe
+                    // fallback.
+                    tracing::error!(
+                        context_id,
+                        member = %member_did,
+                        severity = ?severity,
+                        "RevokeAccess/RemoveMember reached consequence dispatch; \
+                         this should have been rejected at validation time"
+                    );
+                    false
                 }
             }
-            scp_protocol::trust::consequence::ConsequenceAction::AssignRole { to_role } => {
-                enforce_assign_role(ctx, member_did, to_role, clock)
-            }
-        };
-
-        if !success {
-            tracing::warn!(
-                context_id,
-                member = %member_did,
-                action_type,
-                "consequence enforcement failed — escalating to SuspendAll"
-            );
-
-            // H10: escalate to SuspendAll when enforcement fails.
-            // Skip cooldown on failure so the escalation fires immediately.
-            ctx.role_state.suspend_all(member_did.as_ref());
-
-            ctx.receive_buffer.push(ContextEvent::ConsequenceEnforced {
-                context_id: context_id.to_owned(),
-                member_did: member_did.clone(),
-                action_type: "SuspendAll(escalated)".to_owned(),
-                success: true,
-            });
-            continue; // skip cooldown recording — failed action doesn't count
         }
-
-        // Record cooldown: prevent re-firing within the rule's window.
-        if let Some(rule) = rules.get(consequence.rule_index) {
-            ctx.governance.cooldown_until.insert(
-                consequence.rule_index,
-                now.saturating_add(rule.window.as_secs()),
-            );
+        scp_protocol::trust::consequence::ConsequenceAction::AssignRole { to_role } => {
+            enforce_assign_role(ctx, member_did, to_role, clock)
         }
-
-        ctx.receive_buffer.push(ContextEvent::ConsequenceEnforced {
-            context_id: context_id.to_owned(),
-            member_did: member_did.clone(),
-            action_type: action_type.to_owned(),
-            success,
-        });
     }
+}
+
+/// H10 + H4: when enforcement fails, escalate to `SuspendAll` AND emit two
+/// durable event log entries (`ConsequenceEnforcementFailed` then
+/// `ConsequenceEscalatedToSuspendAll`) so an audit can reconstruct
+/// (a) which action failed and (b) that escalation was applied.
+fn emit_failure_escalation(
+    ctx: &mut PerContextState,
+    args: &EnforceConsequencesCtx<'_>,
+    context_id_bytes: &[u8; 32],
+    consequence: &TriggeredConsequence,
+    trigger_kind: &str,
+    action_type: &str,
+) {
+    let context_id = args.context_id;
+    let member_did = args.member_did;
+    tracing::warn!(
+        context_id,
+        member = %member_did,
+        action_type,
+        "consequence enforcement failed — escalating to SuspendAll"
+    );
+
+    // H10: escalate to SuspendAll when enforcement fails.
+    // Skip cooldown on failure so the escalation fires immediately.
+    ctx.role_state.suspend_all(member_did.as_ref());
+
+    // First the failure record, then the escalation record. Both go to
+    // the durable log before the receive buffer push.
+    let failed_payload = consequence_event_payload(
+        member_did,
+        consequence.rule_index,
+        trigger_kind,
+        action_type,
+    );
+    append_consequence_event(
+        args.event_log,
+        context_id,
+        context_id_bytes,
+        "ConsequenceEnforcementFailed",
+        member_did,
+        &failed_payload,
+    );
+    let escalation_payload = consequence_event_payload(
+        member_did,
+        consequence.rule_index,
+        trigger_kind,
+        "SuspendAll",
+    );
+    append_consequence_event(
+        args.event_log,
+        context_id,
+        context_id_bytes,
+        "ConsequenceEscalatedToSuspendAll",
+        member_did,
+        &escalation_payload,
+    );
+    ctx.receive_buffer.push(ContextEvent::ConsequenceEnforced {
+        context_id: context_id.to_owned(),
+        member_did: member_did.clone(),
+        action_type: "SuspendAll(escalated)".to_owned(),
+        success: true,
+    });
 }
 
 /// Converts receive buffer events into `scp_event_log::Event` format for
@@ -341,6 +651,14 @@ pub(super) fn event_log_entries_for_consequences(
                 "ToolRegistered" | "ToolRemoved" | "ToolInvoked" => {
                     scp_event_log::EventType::ToolInvoked
                 }
+                // Governance actions and consequence enforcement records
+                // both feed the WarningCount trigger via the
+                // EventType::GovernanceAction match arm in
+                // `matches_trigger`. Mapping consequence events to this
+                // bucket closes the recursive blind spot from the
+                // white-hat review (H4): subsequent rule evaluation can
+                // see prior consequence enforcement, enabling rules like
+                // "if member has been auto-suspended N times, demote".
                 "GovernanceAction"
                 | "GovernanceProposalCreated"
                 | "GovernanceVoteCast"
@@ -349,7 +667,11 @@ pub(super) fn event_log_entries_for_consequences(
                 | "GovernanceDeadlockRecovery"
                 | "GovernanceConflictDetected"
                 | "GovernanceConflictResolved"
-                | "GovernanceActionExecuted" => scp_event_log::EventType::GovernanceAction,
+                | "GovernanceActionExecuted"
+                | "ConsequenceTriggered"
+                | "ConsequenceEnforced"
+                | "ConsequenceEnforcementFailed"
+                | "ConsequenceEscalatedToSuspendAll" => scp_event_log::EventType::GovernanceAction,
                 _ => continue, // Skip event types not relevant to consequence evaluation
             };
             // Convert structured JSON payload to EventPayload bytes.
@@ -4778,7 +5100,18 @@ impl ContextManager {
             return;
         };
         for (member_did, triggered) in &results {
-            enforce_triggered_consequences(ctx, ctx_id, member_did, now, triggered, &rules, clock);
+            enforce_triggered_consequences(
+                ctx,
+                &EnforceConsequencesCtx {
+                    context_id: ctx_id,
+                    member_did,
+                    now,
+                    triggered,
+                    rules: &rules,
+                    clock,
+                    event_log,
+                },
+            );
         }
     }
 
