@@ -2965,3 +2965,250 @@ async fn restore_context_validates_consequence_rules() {
         "expected ImportRejected, got {err:?}"
     );
 }
+
+// -----------------------------------------------------------------------
+// H12 tests: merge_incoming_epochs_with_atomic_reject wiring
+// (§23.17 Invariant 3 — atomic reject on epoch floor regression)
+// -----------------------------------------------------------------------
+
+/// Build a `ContextExport` whose `mls_state` is non-empty so that
+/// `import_context` triggers the `restore_crypto_state` path (which
+/// causes the mock to install `pending_restore_epochs` into its
+/// `epoch_floors` map).  All other fields are minimal-valid.
+fn h12_export(context_id: &str) -> crate::context::export_import::ContextExport {
+    use crate::context::export_import::{ExportScope, create_export};
+
+    let snapshot = c3_test_snapshot(context_id);
+    // validate_export_for_import accepts an empty event log only when the
+    // Merkle root is the zero hash — create_export already sets this
+    // correctly when `event_log_data` is empty.
+    create_export(
+        snapshot,
+        Vec::new(),
+        b"trigger-restore".to_vec(), // non-empty mls_state triggers restore path
+        DID::from("did:key:h12-exporter"),
+        ExportScope::Full,
+        &scp_primitives::SystemClock,
+    )
+    .unwrap()
+}
+
+/// Returns the hex-encoded SHA-256 of `context_id`, which is the key that
+/// `MockCrypto` uses for its `epoch_floors` map (mirrors the production
+/// provider's `hex::encode(context_id_bytes)`).
+fn ctx_hex(context_id: &str) -> String {
+    hex::encode(scp_protocol::context::context_id_bytes(context_id))
+}
+
+/// H12 test 1: `import_context` MUST reject an incoming snapshot whose
+/// sender-key epoch floor regresses below the local floor.
+///
+/// §23.17 Invariant 3: if any per-sender epoch in the snapshot is strictly
+/// less than the local high-water mark, the entire import is atomically
+/// rejected with `SnapshotFloorRegression`.
+#[tokio::test]
+async fn import_context_rejects_epoch_floor_regression() {
+    const CTX: &str = "h12-regression";
+    let alice_did = "did:key:h12-alice".to_owned();
+
+    // Pre-seed local floors: Alice is at epoch 100.
+    let mock = MockCrypto {
+        epoch_floors: std::sync::Mutex::new(std::collections::HashMap::from([(
+            ctx_hex(CTX),
+            vec![(alice_did.clone(), 100u64)],
+        )])),
+        // Incoming snapshot carries Alice at epoch 50 — a regression.
+        pending_restore_epochs: std::sync::Mutex::new(Some(vec![(alice_did, 50u64)])),
+        ..MockCrypto::default()
+    };
+
+    let manager = ContextManager::new(
+        Box::new(mock),
+        Box::new(MockTransport::connected()),
+        Box::new(MockEventLog::default()),
+        noop_key_resolver(),
+    );
+
+    // Create an Active context so `import_context` sees an "existing" slot.
+    manager
+        .create_context(
+            CTX.into(),
+            ContextParams::default(),
+            DID::from("did:key:h12-creator"),
+        )
+        .await
+        .unwrap();
+
+    // Transition the existing context to Closed (a replaceable state).
+    {
+        let contexts = manager.contexts.lock().await;
+        let ctx = contexts
+            .get(CTX)
+            .expect("context must be registered after create_context");
+        ctx.handle
+            .transition_to(&ContextState::Closing)
+            .await
+            .unwrap();
+        ctx.handle
+            .transition_to(&ContextState::Closed)
+            .await
+            .unwrap();
+    }
+
+    let export = h12_export(CTX);
+    let result = manager.import_context(export).await;
+    let err = result.expect_err("import must reject epoch floor regression");
+    assert!(
+        matches!(err, ContextError::SnapshotFloorRegression { .. }),
+        "expected SnapshotFloorRegression, got {err:?}"
+    );
+}
+
+/// H12 test 2: `import_context` MUST accept an incoming snapshot whose
+/// sender-key epoch advances within the `MAX_EPOCH_ADVANCE = 1000` ceiling.
+///
+/// Alice is at local epoch 100; the snapshot carries Alice at 200 — an
+/// advance of 100, well within the 1000 ceiling.
+#[tokio::test]
+async fn import_context_accepts_epoch_advance_within_ceiling() {
+    const CTX: &str = "h12-advance-ok";
+    let alice_did = "did:key:h12-alice".to_owned();
+
+    let mock = MockCrypto {
+        epoch_floors: std::sync::Mutex::new(std::collections::HashMap::from([(
+            ctx_hex(CTX),
+            vec![(alice_did.clone(), 100u64)],
+        )])),
+        // Incoming snapshot carries Alice at epoch 200 — within ceiling.
+        pending_restore_epochs: std::sync::Mutex::new(Some(vec![(alice_did, 200u64)])),
+        ..MockCrypto::default()
+    };
+
+    let manager = ContextManager::new(
+        Box::new(mock),
+        Box::new(MockTransport::connected()),
+        Box::new(MockEventLog::default()),
+        noop_key_resolver(),
+    );
+
+    manager
+        .create_context(
+            CTX.into(),
+            ContextParams::default(),
+            DID::from("did:key:h12-creator"),
+        )
+        .await
+        .unwrap();
+
+    {
+        let contexts = manager.contexts.lock().await;
+        let ctx = contexts
+            .get(CTX)
+            .expect("context must be registered after create_context");
+        ctx.handle
+            .transition_to(&ContextState::Closing)
+            .await
+            .unwrap();
+        ctx.handle
+            .transition_to(&ContextState::Closed)
+            .await
+            .unwrap();
+    }
+
+    let export = h12_export(CTX);
+    let result = manager.import_context(export).await;
+    assert!(
+        result.is_ok(),
+        "import must accept epoch advance within ceiling, got {result:?}"
+    );
+}
+
+/// H12 test 3: `import_context` MUST reject an incoming snapshot whose
+/// sender-key epoch advance exceeds `MAX_EPOCH_ADVANCE = 1000`.
+///
+/// Alice is at local epoch 100; the snapshot carries Alice at 2000 — an
+/// advance of 1900, far beyond the 1000 ceiling (epoch-poisoning guard).
+#[tokio::test]
+async fn import_context_rejects_epoch_advance_beyond_ceiling() {
+    const CTX: &str = "h12-advance-ceiling";
+    let alice_did = "did:key:h12-alice".to_owned();
+
+    let mock = MockCrypto {
+        epoch_floors: std::sync::Mutex::new(std::collections::HashMap::from([(
+            ctx_hex(CTX),
+            vec![(alice_did.clone(), 100u64)],
+        )])),
+        // Incoming snapshot carries Alice at epoch 2000 — exceeds MAX_EPOCH_ADVANCE.
+        pending_restore_epochs: std::sync::Mutex::new(Some(vec![(alice_did, 2000u64)])),
+        ..MockCrypto::default()
+    };
+
+    let manager = ContextManager::new(
+        Box::new(mock),
+        Box::new(MockTransport::connected()),
+        Box::new(MockEventLog::default()),
+        noop_key_resolver(),
+    );
+
+    manager
+        .create_context(
+            CTX.into(),
+            ContextParams::default(),
+            DID::from("did:key:h12-creator"),
+        )
+        .await
+        .unwrap();
+
+    {
+        let contexts = manager.contexts.lock().await;
+        let ctx = contexts
+            .get(CTX)
+            .expect("context must be registered after create_context");
+        ctx.handle
+            .transition_to(&ContextState::Closing)
+            .await
+            .unwrap();
+        ctx.handle
+            .transition_to(&ContextState::Closed)
+            .await
+            .unwrap();
+    }
+
+    let export = h12_export(CTX);
+    let result = manager.import_context(export).await;
+    let err = result.expect_err("import must reject epoch advance beyond MAX_EPOCH_ADVANCE");
+    assert!(
+        matches!(err, ContextError::SnapshotFloorRegression { .. }),
+        "expected SnapshotFloorRegression (epoch-poisoning guard), got {err:?}"
+    );
+}
+
+/// H12 test 4: `import_context` into a FRESH slot (no prior context) MUST
+/// accept any epoch within the ceiling without regression checks — there
+/// are no local floors to protect.
+#[tokio::test]
+async fn import_context_fresh_context_accepts_any_epoch_within_ceiling() {
+    const CTX: &str = "h12-fresh";
+    let alice_did = "did:key:h12-alice".to_owned();
+
+    // No pre-seeded floors — fresh slot.
+    let mock = MockCrypto {
+        pending_restore_epochs: std::sync::Mutex::new(Some(vec![(alice_did, 500u64)])),
+        ..MockCrypto::default()
+    };
+
+    let manager = ContextManager::new(
+        Box::new(mock),
+        Box::new(MockTransport::connected()),
+        Box::new(MockEventLog::default()),
+        noop_key_resolver(),
+    );
+
+    // No prior `create_context_bare` — this is a truly fresh import.
+    let export = h12_export(CTX);
+    let result = manager.import_context(export).await;
+    assert!(
+        result.is_ok(),
+        "import into fresh slot must succeed regardless of incoming epoch, got {result:?}"
+    );
+}

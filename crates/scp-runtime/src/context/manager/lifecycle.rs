@@ -917,9 +917,53 @@ impl ContextManager {
                         "context '{context_id}' already exists — cannot import"
                     )));
                 }
-                // Clean up old crypto state before reimport
+                // Capture local epoch floors BEFORE destroying old state so
+                // we can validate the incoming snapshot's floors against them
+                // (§23.17 Invariant 3 — atomic reject on regression).
+                let local_epoch_floors = self.crypto.export_sender_key_epochs(&ctx_id_bytes);
+
+                // Clean up old crypto state before reimport.
                 let _ = self.crypto.destroy_mls_group(&ctx_id_bytes);
                 let _ = self.crypto.destroy_sender_key(&ctx_id_bytes);
+
+                // Restore incoming MLS crypto state (if the export carries
+                // any).  This installs the incoming sender-key epoch map into
+                // the provider so `validate_and_merge_epoch_floors` can read
+                // it for the regression / advance-bound check below.
+                if !export.mls_state.is_empty() {
+                    self.crypto
+                        .restore_crypto_state(&ctx_id_bytes, &export.mls_state)
+                        .map_err(|e| {
+                            ContextError::PersistenceFailed(format!(
+                                "import: crypto state restore failed: {e}"
+                            ))
+                        })?;
+                }
+
+                // §23.17 Invariant 3: reject the entire import if any
+                // sender's floor regresses or overshoots by more than
+                // MAX_EPOCH_ADVANCE, then rollback on failure.
+                if let Err(e) = self.crypto.validate_and_merge_epoch_floors(
+                    &ctx_id_bytes,
+                    local_epoch_floors,
+                    crate::crypto::mls::provider::MAX_EPOCH_ADVANCE,
+                ) {
+                    // Rollback: destroy the just-restored crypto state so the
+                    // provider is not left with partially-merged floors.
+                    let _ = self.crypto.destroy_mls_group(&ctx_id_bytes);
+                    let _ = self.crypto.destroy_sender_key(&ctx_id_bytes);
+                    return Err(e);
+                }
+            } else if !export.mls_state.is_empty() {
+                // Fresh slot — no prior floors to protect, but still restore
+                // the incoming crypto state if the export carries any.
+                self.crypto
+                    .restore_crypto_state(&ctx_id_bytes, &export.mls_state)
+                    .map_err(|e| {
+                        ContextError::PersistenceFailed(format!(
+                            "import: crypto state restore failed: {e}"
+                        ))
+                    })?;
             }
         }
         // Lock dropped — safe to proceed with event log import.
