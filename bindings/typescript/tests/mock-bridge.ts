@@ -397,6 +397,8 @@ export function createMockBridge(): Bridge & {
       inputJson: string,
       identityDid: string,
       ucanToken?: string,
+      _proofTokens?: readonly string[],
+      spendingUcan?: string,
     ): Promise<string> {
       const ctx = getContext(handle);
       const tool = ctx.tools.get(toolId) as
@@ -416,6 +418,14 @@ export function createMockBridge(): Bridge & {
         throw new Error("[SCP-PERM-3001] Token has been revoked");
       }
 
+      // C4 (#1606): the runtime now routes paid tool invocations
+      // through ContextManager.invoke_tool_with_economy. The mock
+      // doesn't simulate the full economy pipeline but it does
+      // validate that callers passing a spending UCAN are propagating
+      // it through the bridge interface (the real NAPI / UniFFI / PyO3
+      // bridges parse and forward it).
+      const spendingUcanProvided = spendingUcan !== undefined && spendingUcan !== "";
+
       const input = JSON.parse(inputJson) as unknown;
       let result: unknown;
 
@@ -430,7 +440,12 @@ export function createMockBridge(): Bridge & {
         eventType: "ToolInvoked",
         actorDid: identityDid,
         timestamp: Math.floor(Date.now() / 1000),
-        payload: { toolId, toolName: tool.name, ucanProvided: true },
+        payload: {
+          toolId,
+          toolName: tool.name,
+          ucanProvided: true,
+          spendingUcanProvided,
+        },
         sequence: ctx.eventLog.length,
       };
       ctx.receiveBuffer.push(invokedEvent);

@@ -470,6 +470,12 @@ export class Context implements AsyncDisposable {
   /**
    * Invokes a tool within this context.
    *
+   * Tool invocation flows through the runtime's full economy pipeline
+   * (`ContextManager::invoke_tool_with_economy`): per-invocation
+   * pricing, per-DID velocity tracking, escalation, budget enforcement,
+   * payment escrow, and the Matrix-style hard rate limit are all
+   * enforced inside the runtime.
+   *
    * @param toolId - The ID of the tool to invoke.
    * @param input - Tool input parameters.
    * @param identity - The invoking identity.
@@ -478,6 +484,9 @@ export class Context implements AsyncDisposable {
    *   to this context. Required per spec section 7.2: every capability-gated
    *   action requires a valid UCAN token. See also section 6.2, section 8,
    *   and ADR-016.
+   * @param options - Optional `proofTokens` for delegation chain
+   *   resolution and `spendingUcan` for paid tool invocations
+   *   (`SpendingCapability` AND-composition per spec section 19.5).
    * @returns The tool output as a parsed JSON object.
    * @throws {ToolError} If invocation fails or the tool is not found.
    * @throws {UcanPermissionError} If the UCAN token is invalid, expired,
@@ -488,6 +497,10 @@ export class Context implements AsyncDisposable {
     input: Readonly<Record<string, unknown>>,
     identity: Identity,
     ucanToken: string,
+    options?: {
+      readonly proofTokens?: readonly string[];
+      readonly spendingUcan?: string;
+    },
   ): Promise<unknown> {
     this.assertActive();
     try {
@@ -498,6 +511,8 @@ export class Context implements AsyncDisposable {
         JSON.stringify(input),
         identity.did,
         ucanToken,
+        options?.proofTokens,
+        options?.spendingUcan,
       );
       return safeJsonParse(resultJson, "toolInvoke") as unknown;
     } catch (error) {

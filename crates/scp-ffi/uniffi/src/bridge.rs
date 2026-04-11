@@ -466,6 +466,29 @@ impl From<scp_identity::IdentityError> for ScpError {
     }
 }
 
+/// Extracts a leading `SCP-XXX-NNNN` error code from a message body, if any.
+///
+/// Mirrors the `PyO3` / NAPI bridge helpers. Used to recover
+/// `SCP-ECON-120xx` / `SCP-TOOL-60xx` / `SCP-PERM-30xx` codes embedded
+/// inside `ContextError::PermissionDenied(String)` so Swift / Kotlin
+/// callers can detect specific failures without string-matching the
+/// message body.
+pub(crate) fn extract_scp_code(message: &str) -> Option<String> {
+    let trimmed = message.trim_start();
+    let rest = trimmed.strip_prefix("SCP-")?;
+    let end = rest.find(|c: char| c == ':' || c.is_whitespace())?;
+    let suffix = &rest[..end];
+    let (category, number) = suffix.split_once('-')?;
+    if category.is_empty()
+        || !category.chars().all(|c| c.is_ascii_alphabetic())
+        || number.is_empty()
+        || !number.chars().all(|c| c.is_ascii_digit())
+    {
+        return None;
+    }
+    Some(format!("SCP-{category}-{number}"))
+}
+
 impl From<scp_core::context::ContextError> for ScpError {
     fn from(e: scp_core::context::ContextError) -> Self {
         use scp_core::context::ContextError as CE;
@@ -483,6 +506,28 @@ impl From<scp_core::context::ContextError> for ScpError {
                 msg: format!("{e}"),
                 code: "SCP-CTX-2091".to_owned(),
             },
+            // Recover embedded SCP-ECON-/SCP-TOOL-/SCP-PERM- codes from
+            // the runtime's `PermissionDenied(String)` catch-all so the
+            // typed-envelope contract holds for tool-economy failures.
+            CE::PermissionDenied(msg) => {
+                let code = extract_scp_code(msg).unwrap_or_else(|| "SCP-PERM-3001".to_owned());
+                if code.starts_with("SCP-PERM-") {
+                    Self::Permission {
+                        msg: format!("{e}"),
+                        code,
+                    }
+                } else if code.starts_with("SCP-TOOL-") {
+                    Self::Tool {
+                        msg: format!("{e}"),
+                        code,
+                    }
+                } else {
+                    Self::Context {
+                        msg: format!("{e}"),
+                        code,
+                    }
+                }
+            }
             _ => Self::Context {
                 msg: format!("{e} — verify context state, membership, and permissions"),
                 code: "SCP-CTX-2001".to_owned(),
@@ -3469,7 +3514,16 @@ pub async fn tool_register(
         })?
 }
 
-/// Invokes a tool within an SCP context.
+/// Invokes a tool within an SCP context, fully wired through the
+/// `ContextManager::invoke_tool_with_economy` pipeline.
+///
+/// This is the SINGLE entry point for tool invocation through the
+/// `UniFFI` bridge (Swift + Kotlin). Per-invocation pricing, spending
+/// UCAN AND-composition (§19.5), per-DID velocity tracking, escalation
+/// (§19.7), budget enforcement, payment escrow, the Matrix-style hard
+/// rate limit, and `ToolEconomyTicket` rollback are all enforced inside
+/// the runtime wrapper. The `UniFFI` bridge no longer reimplements any
+/// of those concerns.
 ///
 /// # Arguments
 ///
@@ -3477,13 +3531,16 @@ pub async fn tool_register(
 /// * `tool_id` — The ID of the tool to invoke.
 /// * `input_json` — Tool input parameters as a JSON string.
 /// * `identity` — The identity of the invoker (used for capability checking).
-/// * `ucan_token` — Optional JWT-encoded UCAN token authorizing the invocation.
-///   Must contain `tool_invoke:{tool_id}` or `tool_invoke:*` capability. When
-///   present, the full 11-step ADR-016 validation pipeline is executed before
+/// * `ucan_token` — JWT-encoded UCAN token authorizing the invocation.
+///   Must contain `tool_invoke:{tool_id}` or `tool_invoke:*` capability.
+///   The full 11-step ADR-016 validation pipeline is executed before
 ///   tool dispatch. See spec §6.2, §8, ADR-016, and issue #319.
 /// * `proof_tokens` — Optional list of encoded parent UCAN tokens for
-///   delegation chain traversal (ADR-016 step 3). Only relevant when
-///   `ucan_token` is `Some`.
+///   delegation chain traversal (ADR-016 step 3).
+/// * `spending_ucan_jwt` — Optional JWT-encoded spending UCAN
+///   (`SpendingCapability`) for paid tool invocations. Required when an
+///   `EconomicPolicy` priced the tool above zero (§19.5
+///   AND-composition). May be `nil`/`null` for free tools.
 ///
 /// # Returns
 ///
@@ -3491,11 +3548,15 @@ pub async fn tool_register(
 ///
 /// # Errors
 ///
-/// Returns `ScpError::Tool` if the tool is not found, invocation fails,
-/// input fails schema validation, or the invoker lacks capability.
-/// Returns `ScpError::Permission` if the UCAN token is invalid, expired,
-/// revoked, or lacks the required tool invocation capability.
+/// - `ScpError::Tool` (`SCP-TOOL-60xx`) — tool not found, schema
+///   mismatch, execution failure.
+/// - `ScpError::Permission` (`SCP-PERM-3001`) — invalid, expired,
+///   revoked, or capability-deficient UCAN token.
+/// - `ScpError::Context` (`SCP-ECON-12090`) — hard rate limit exceeded.
+/// - `ScpError::Context` (`SCP-ECON-12010`) — per-DID budget exceeded.
+/// - `ScpError::Context` (`SCP-ECON-12061`) — invalid spending UCAN.
 #[uniffi::export]
+#[allow(clippy::too_many_arguments)] // Mirrors the runtime's economy entry point.
 pub async fn tool_invoke(
     handle: Arc<ContextHandle>,
     tool_id: String,
@@ -3503,6 +3564,7 @@ pub async fn tool_invoke(
     identity: Arc<Identity>,
     ucan_token: Option<String>,
     proof_tokens: Option<Vec<String>>,
+    spending_ucan_jwt: Option<String>,
 ) -> Result<String, ScpError> {
     runtime()
         .spawn(async move {
@@ -3519,6 +3581,9 @@ pub async fn tool_invoke(
                 code: "SCP-PERM-3001".to_owned(),
             })?;
             validate_ucan_token(&ucan_token)?;
+            if let Some(jwt) = spending_ucan_jwt.as_deref() {
+                validate_ucan_token(jwt)?;
+            }
 
             let state = handle.state.lock().await;
 
@@ -3533,8 +3598,10 @@ pub async fn tool_invoke(
             }
             drop(state);
 
-            // Primary authorization: UCAN token validation via the full 11-step
-            // ADR-016 pipeline. See spec §6.2, §8, ADR-016, and issue #319.
+            // Primary authorization: UCAN token validation via the full
+            // 11-step ADR-016 pipeline. Bridge-owned because the proof
+            // resolver, revocation list, and nonce tracker live in the
+            // bridge UCAN registry, not in the runtime.
             validate_tool_ucan_uniffi(
                 &handle,
                 &tool_id,
@@ -3543,120 +3610,101 @@ pub async fn tool_invoke(
                 proof_tokens.as_ref(),
             )?;
 
-            // Consume a hard-rate-limit token BEFORE dispatching.
-            // The UniFFI bridge owns its own `tool_registry` +
-            // `tool_handlers` on `ContextHandle` and does not go
-            // through `ContextManager::invoke_tool_with_economy`, so
-            // this explicit hook is load-bearing for cap enforcement
-            // on tool calls.
-            let invoker_did_typed: scp_primitives::DID = identity.did.clone().into();
-            let now_secs = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_secs())
-                .unwrap_or(0);
-            let manager = crate::runtime::context_manager_expect();
-            if !manager
-                .try_consume_hard_rate_limit(&handle.context_id, &invoker_did_typed, now_secs)
-                .await
-            {
-                return Err(ScpError::Tool {
-                    msg: "SCP-ECON-12090: rate limit exceeded on tool_invoke: hard rate limit exceeded for invoker".to_owned(),
-                    code: "SCP-ECON-12090".to_owned(),
-                });
-            }
+            // Parse the optional spending UCAN JWT (§19.5
+            // AND-composition). Mirrors `context_send`. An invalid JWT
+            // surfaces as `SCP-ECON-12061` before the manager call.
+            let spending_ucan_token = spending_ucan_jwt
+                .as_deref()
+                .map(scp_core::crypto::ucan::validate::parse_ucan)
+                .transpose()
+                .map_err(|e| ScpError::Context {
+                    msg: format!("invalid spending UCAN: {e}"),
+                    code: "SCP-ECON-12061".to_owned(),
+                })?;
 
-            // Wrap the rest of the dispatch in an inner async block
-            // so we can refund the hard-rate-limit token on any
-            // failure path via a single match at the end. Every
-            // error path inside the block propagates via `?` as
-            // before; only the outer match converts Err into a
-            // refund + re-raise.
-            let ctx_id_for_refund = handle.context_id.clone();
-            let invoker_for_refund = invoker_did_typed.clone();
-            let handle_for_dispatch = Arc::clone(&handle);
-            let tool_id_owned = tool_id.clone();
-            let identity_did_owned = identity.did.clone();
+            // Snapshot the bridge-owned tool registry and (optionally) the
+            // registered handler closure BEFORE entering the runtime call.
+            // The runtime requires a `&ToolRegistry` so we clone the
+            // registry once (cheap — Vec of registrations); the handler
+            // is an `Arc<dyn Fn>` so cloning is a refcount bump. Doing
+            // this OUTSIDE the manager call means the bridge handle's
+            // `tool_registry` mutex is released before Phase 1 of
+            // `invoke_tool_with_economy` acquires the manager mutex.
+            let registry = {
+                let reg = handle.tool_registry.lock().await;
+                reg.clone()
+            };
+            let handler = {
+                let handlers = handle.tool_handlers.lock().await;
+                handlers.get(&tool_id).cloned()
+            };
 
-            let dispatch_result: Result<String, ScpError> = async {
-                let registry = handle_for_dispatch.tool_registry.lock().await;
-                let registration =
-                    registry.get(&tool_id_owned).ok_or_else(|| ScpError::Tool {
-                        msg: format!(
-                            "tool '{tool_id_owned}' not found in context '{}'",
-                            handle_for_dispatch.context_id
-                        ),
-                        code: "SCP-TOOL-6002".to_owned(),
-                    })?;
-
-                let input_value: serde_json::Value = serde_json::from_str(&input_json)
-                    .map_err(|e| ScpError::Tool {
-                        msg: format!("invalid input JSON: {e}"),
-                        code: "SCP-TOOL-6002".to_owned(),
-                    })?;
-                scp_core::context::tools::validate_value_against_schema(
-                    &input_value,
-                    &registration.schema.input_schema,
-                )
-                .map_err(|e| ScpError::Tool {
-                    msg: format!("input validation failed for tool '{tool_id_owned}': {e}"),
+            // Parse input JSON once (the runtime expects
+            // `serde_json::Value`).
+            let input_value: serde_json::Value =
+                serde_json::from_str(&input_json).map_err(|e| ScpError::Tool {
+                    msg: format!("invalid input JSON: {e}"),
                     code: "SCP-TOOL-6002".to_owned(),
                 })?;
 
-                let output_schema = registration.schema.output_schema.clone();
-                drop(registry);
+            let context_id = handle.context_id.clone();
+            let identity_did_for_executor = identity.did.clone();
+            let tool_id_for_executor = tool_id.clone();
+            let context_id_for_executor = context_id.clone();
 
-                let handlers = handle_for_dispatch.tool_handlers.lock().await;
-                let output = if let Some(handler) = handlers.get(&tool_id_owned) {
-                    let handler = handler.clone();
-                    drop(handlers);
-                    let out =
-                        handler(input_value.clone()).map_err(|e| ScpError::Tool {
-                            msg: format!("tool handler for '{tool_id_owned}' failed: {e}"),
-                            code: "SCP-TOOL-6002".to_owned(),
-                        })?;
-                    scp_core::context::tools::validate_value_against_schema(
-                        &out,
-                        &output_schema,
+            // Build the executor closure. Phase 2 of
+            // `invoke_tool_with_economy` runs WITHOUT holding the
+            // `contexts` mutex; the runtime calls the executor exactly
+            // once with the validated input value.
+            let executor = move |input: serde_json::Value| {
+                let handler = handler.clone();
+                let input_for_echo = input.clone();
+                async move {
+                    handler.map_or_else(
+                        || {
+                            Ok(serde_json::json!({
+                                "tool": tool_id_for_executor,
+                                "context": context_id_for_executor,
+                                "status": "validated",
+                                "input_valid": true,
+                                "invoker_did": identity_did_for_executor,
+                                "validated_input": input_for_echo,
+                            }))
+                        },
+                        |h| {
+                            h(input).map_err(|e| {
+                                format!("tool handler for '{tool_id_for_executor}' failed: {e}")
+                            })
+                        },
                     )
-                    .map_err(|msg| ScpError::Tool {
-                        msg: format!(
-                            "output validation failed for tool '{tool_id_owned}': {msg}"
-                        ),
-                        code: "SCP-TOOL-6002".to_owned(),
-                    })?;
-                    out
-                } else {
-                    drop(handlers);
-                    serde_json::json!({
-                        "tool": tool_id_owned,
-                        "context": handle_for_dispatch.context_id,
-                        "status": "validated",
-                        "input_valid": true,
-                        "invoker_did": identity_did_owned,
-                        "validated_input": input_value,
-                    })
-                };
-
-                serde_json::to_string(&output).map_err(|e| ScpError::Tool {
-                    msg: format!("failed to serialize tool output: {e}"),
-                    code: "SCP-TOOL-6006".to_owned(),
-                })
-            }
-            .await;
-
-            match dispatch_result {
-                Ok(s) => Ok(s),
-                Err(e) => {
-                    // Refund the hard-rate-limit token so a rejected
-                    // dispatch does not permanently burn bucket
-                    // capacity. Matches the refund discipline in
-                    // `invoke_tool_with_economy`.
-                    manager
-                        .refund_hard_rate_limit(&ctx_id_for_refund, &invoker_for_refund)
-                        .await;
-                    Err(e)
                 }
-            }
+            };
+
+            let manager = crate::runtime::context_manager_expect();
+            let invoker_did_typed: scp_primitives::DID = identity.did.clone().into();
+            let tool_id_typed = scp_core::context::tools::ToolId::from(tool_id.as_str());
+            let outcome = manager
+                .invoke_tool_with_economy(
+                    &context_id,
+                    &registry,
+                    &tool_id_typed,
+                    input_value,
+                    &invoker_did_typed,
+                    spending_ucan_token.as_ref(),
+                    None,
+                    executor,
+                )
+                .await
+                .map_err(ScpError::from)?;
+
+            // The runtime built the canonical `ToolInvokedEvent`; the
+            // transport / event-log layer is responsible for signing
+            // and appending it. Pull the JSON output back out for the
+            // Swift / Kotlin caller.
+            serde_json::to_string(&outcome.output).map_err(|e| ScpError::Tool {
+                msg: format!("failed to serialize tool output: {e}"),
+                code: "SCP-TOOL-6006".to_owned(),
+            })
         })
         .await
         .map_err(|e| ScpError::Tool {
@@ -12793,6 +12841,7 @@ mod tests {
             test_identity(),
             None, // No UCAN token
             None,
+            None, // spending_ucan_jwt
         )
         .await;
 

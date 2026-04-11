@@ -1153,7 +1153,23 @@ export function createWasmBridge(): Bridge {
       inputJson: string,
       identityDid: string,
       ucanToken: string,
+      _proofTokens?: readonly string[],
+      spendingUcan?: string,
     ): Promise<string> {
+      // C4 (#1606): the WASM bridge has its own tool dispatch path
+      // (ADR-034) and does NOT route through
+      // ContextManager.invoke_tool_with_economy. Reject any
+      // spendingUcan argument with a clear error rather than
+      // silently dropping it — paid tool invocations require the
+      // native (NAPI) bridge until the WASM economy path lands.
+      if (spendingUcan !== undefined && spendingUcan !== null) {
+        throw new ToolError(
+          "spendingUcan is not supported by the WASM bridge — paid tool " +
+            "invocations require the native (NAPI) bridge or the Python / " +
+            "Swift / Kotlin SDKs (ADR-034). See issue #1606.",
+          "SCP-TOOL-6041",
+        );
+      }
       const wasm = getWasm();
       return await wasm.tool_invoke(handle, toolId, inputJson, identityDid, ucanToken);
     },

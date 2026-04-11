@@ -193,7 +193,7 @@ struct ToolsTests {
             closeFn: closeFn
         )
 
-        let mockInvoke: ToolBridge.InvokeFn = { _, toolId, inputJson, _, _, _ in
+        let mockInvoke: ToolBridge.InvokeFn = { _, toolId, inputJson, _, _, _, _ in
             #expect(toolId == "calculator")
             #expect(inputJson == "{}")
             return #"{"result": 42}"#

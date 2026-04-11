@@ -270,6 +270,38 @@ impl From<scp_identity::IdentityError> for ScpPyError {
 // error codes so callers can `except ScpError` + `.code` check
 // without string-matching on the message body.
 
+/// Extracts a leading `SCP-XXX-NNNN` error code from a message body, if any.
+///
+/// `ContextManager::invoke_tool_with_economy` and several other paths
+/// surface category-specific error codes inside `PermissionDenied(String)`
+/// (e.g. `"SCP-ECON-12010: budget exceeded for ..."`,
+/// `"SCP-TOOL-6080: context not active: ..."`). Without this parser the
+/// bridge would bucket every such error under the generic `SCP-CTX-2001`
+/// envelope and Python callers would have to string-match the message
+/// body. This helper preserves the existing typed-envelope contract by
+/// recovering the embedded code prefix.
+///
+/// Returns `None` when the message does not start with a recognizable
+/// `SCP-` prefix or the prefix does not parse as `LETTERS-DIGITS`.
+pub(crate) fn extract_scp_code(message: &str) -> Option<String> {
+    let trimmed = message.trim_start();
+    let rest = trimmed.strip_prefix("SCP-")?;
+    // Find the first ':' or whitespace that terminates the code.
+    let end = rest.find(|c: char| c == ':' || c.is_whitespace())?;
+    let suffix = &rest[..end];
+    // Suffix shape: `<LETTERS>-<DIGITS>`. Reject any other shape so the
+    // parser is conservative.
+    let (category, number) = suffix.split_once('-')?;
+    if category.is_empty()
+        || !category.chars().all(|c| c.is_ascii_alphabetic())
+        || number.is_empty()
+        || !number.chars().all(|c| c.is_ascii_digit())
+    {
+        return None;
+    }
+    Some(format!("SCP-{category}-{number}"))
+}
+
 impl From<scp_core::context::ContextError> for ScpPyError {
     fn from(e: scp_core::context::ContextError) -> Self {
         use scp_core::context::ContextError as CE;
@@ -287,6 +319,30 @@ impl From<scp_core::context::ContextError> for ScpPyError {
                 message: format!("{e}"),
                 code: "SCP-CTX-2091".to_owned(),
             },
+            // `PermissionDenied(String)` is the catch-all the runtime
+            // uses for tool-economy and tool-invocation failures
+            // (`SCP-ECON-120xx`, `SCP-TOOL-60xx`). Recover the embedded
+            // code prefix so callers can detect specific failures
+            // (budget exceeded, spending UCAN missing, tool not active,
+            // etc.) without string-matching the message body.
+            CE::PermissionDenied(msg) => {
+                let code = extract_scp_code(msg).unwrap_or_else(|| "SCP-PERM-3001".to_owned());
+                // Permission/UCAN-class codes raise UcanError; everything
+                // else (tool, economy, context) raises ContextError so
+                // existing call sites that catch ContextError keep
+                // working.
+                if code.starts_with("SCP-PERM-") {
+                    Self::UcanError {
+                        message: format!("{e}"),
+                        code,
+                    }
+                } else {
+                    Self::ContextError {
+                        message: format!("{e}"),
+                        code,
+                    }
+                }
+            }
             _ => Self::ContextError {
                 message: format!("{e} — verify context state, membership, and permissions"),
                 code: "SCP-CTX-2001".to_owned(),

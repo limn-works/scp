@@ -227,6 +227,8 @@ export interface Bridge {
     inputJson: string,
     identityDid: string,
     ucanToken: string,
+    proofTokens?: readonly string[],
+    spendingUcan?: string,
   ): Promise<string>;
   toolVerify(handle: BridgeContextHandle, toolId: string): Promise<ToolVerificationResult>;
 

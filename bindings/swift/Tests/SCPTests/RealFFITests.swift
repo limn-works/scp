@@ -1001,7 +1001,8 @@ struct RealFFIIdentityAndContextTests {
                 inputJson: "{\"message\": \"test\"}",
                 identity: identity,
                 ucanToken: nil,
-                proofTokens: nil
+                proofTokens: nil,
+                spendingUcanJwt: nil
             )
             Issue.record("Expected tool invoke to require UCAN")
         } catch let error as ScpError {

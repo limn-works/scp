@@ -318,6 +318,7 @@ class ConformanceStubBindings : NativeBindings {
         return toolRegisterResult
     }
 
+    @Suppress("LongParameterList")
     override fun toolInvoke(
         contextHandle: Long,
         toolId: String,
@@ -325,6 +326,7 @@ class ConformanceStubBindings : NativeBindings {
         identityHandle: Long,
         ucanToken: String?,
         proofTokens: List<String>?,
+        spendingUcan: String?,
     ): String {
         toolInvokeError?.let { throw it }
         return toolInvokeResult

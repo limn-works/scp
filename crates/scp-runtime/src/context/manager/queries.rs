@@ -494,4 +494,66 @@ impl ContextManager {
             .map(|ctx| ctx.access.access_key_store.get_all(context_id))
             .unwrap_or_default()
     }
+
+    /// Grants budget to a member in a context.
+    ///
+    /// Test-only method for seeding `MemberBudgetTracker` grants
+    /// without going through the full `ApproveSpend` governance
+    /// proposal pipeline. Used by integration tests to verify the
+    /// runtime's `invoke_tool_with_economy` deducts budget correctly
+    /// (PR #1606 / C4 — bridge tool-invoke economy wiring). Production
+    /// code MUST use the `ApproveSpend` governance action.
+    #[cfg(feature = "testing")]
+    pub async fn grant_budget_for_test(
+        &self,
+        context_id: &str,
+        member_did: &scp_identity::DID,
+        amount: scp_protocol::economy::types::Amount,
+    ) {
+        if let Some(ctx) = self.contexts.lock().await.get_mut(context_id) {
+            ctx.governance.budget_tracker.grant(member_did, amount);
+        }
+    }
+
+    /// Returns the remaining budget for a member in a context.
+    ///
+    /// Test-only accessor for asserting the post-call state of the
+    /// per-DID budget after `invoke_tool_with_economy` runs. Returns
+    /// zero if the context is unknown.
+    #[cfg(feature = "testing")]
+    pub async fn remaining_budget_for_test(
+        &self,
+        context_id: &str,
+        member_did: &scp_identity::DID,
+    ) -> scp_protocol::economy::types::Amount {
+        let contexts = self.contexts.lock().await;
+        contexts
+            .get(context_id)
+            .map_or(scp_protocol::economy::types::Amount::new(0), |ctx| {
+                ctx.governance.budget_tracker.remaining(member_did)
+            })
+    }
+
+    /// Returns the per-DID velocity (number of recent paid actions) for
+    /// a member in a context within the velocity window.
+    ///
+    /// Test-only accessor for verifying that
+    /// `invoke_tool_with_economy` records the invocation in the
+    /// per-DID velocity tracker. The bridges' previous bypass path
+    /// did not record velocity at all, so the assertion in PR #1606
+    /// C4 needs this hook to fail loudly on regression.
+    #[cfg(feature = "testing")]
+    pub async fn velocity_for_test(
+        &self,
+        context_id: &str,
+        member_did: &scp_identity::DID,
+        now_secs: u64,
+    ) -> u64 {
+        let contexts = self.contexts.lock().await;
+        contexts.get(context_id).map_or(0, |ctx| {
+            ctx.governance
+                .velocity_tracker
+                .get_velocity(member_did, now_secs)
+        })
+    }
 }

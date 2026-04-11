@@ -179,5 +179,9 @@ path = "tests/integration/welcome_delivery.rs"
 name = "pipeline_wiring"
 path = "tests/integration/pipeline_wiring.rs"
 
+[[test]]
+name = "tool_economy_wiring"
+path = "tests/integration/tool_economy_wiring.rs"
+
 [lints]
 workspace = true

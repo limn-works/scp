@@ -555,6 +555,38 @@ class TestContextInvoke:
         call_args = mock_bridge.tool_invoke.call_args[0]
         assert call_args[5] is None
 
+    async def test_invoke_spending_ucan_defaults_to_none(self) -> None:
+        """spending_ucan defaults to None when not provided (free tools)."""
+        mock_bridge = MagicMock()
+        mock_bridge.tool_invoke.return_value = {}
+
+        with patch.dict("sys.modules", {"_scp_core": mock_bridge}):
+            ctx = _make_context()
+            await ctx.invoke("tool", {}, ucan_token="tok")
+
+        call_args = mock_bridge.tool_invoke.call_args[0]
+        # Position 6 is the new spending_ucan parameter (C4 fix —
+        # routes through ContextManager.invoke_tool_with_economy).
+        assert call_args[6] is None
+
+    async def test_invoke_passes_spending_ucan(self) -> None:
+        """spending_ucan is forwarded as the 7th positional arg (#1606 C4)."""
+        mock_bridge = MagicMock()
+        mock_bridge.tool_invoke.return_value = {}
+
+        spending = "eyJ0eXAiOiJKV1QiLCJhbGciOiJFZERTQSJ9.spending.sig"
+        with patch.dict("sys.modules", {"_scp_core": mock_bridge}):
+            ctx = _make_context()
+            await ctx.invoke(
+                "paid_tool",
+                {"amount": 100},
+                ucan_token="tok",
+                spending_ucan=spending,
+            )
+
+        call_args = mock_bridge.tool_invoke.call_args[0]
+        assert call_args[6] == spending
+
     async def test_invoke_returns_dict(self) -> None:
         mock_bridge = MagicMock()
         expected = {"recipes": ["cake", "pie"], "count": 2}
