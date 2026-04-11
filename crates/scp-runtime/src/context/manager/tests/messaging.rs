@@ -2532,3 +2532,197 @@ async fn restored_velocity_tracker_uses_60_second_window() {
         "fresh-context velocity tracker must use spec §19.4 60s window, got: {window}"
     );
 }
+
+// =======================================================================
+// H19: PaymentCaptureFailed audit-trail tests
+// =======================================================================
+
+/// H19-S1: When `capture_send_payment` fails, a `PaymentCaptureFailed`
+/// entry is appended to the event log with `action = "send_message"` and
+/// the error string. The event log is the durable audit trail.
+#[tokio::test]
+async fn capture_send_payment_failure_appends_event_log_entry() {
+    let (manager, handle, event_log) =
+        setup_failing_capture_manager_with_context("h19-send-ctx", "did:key:sender").await;
+
+    let sk = ed25519_dalek::SigningKey::from_bytes(&[1u8; 32]);
+    let ucan = dummy_spending_ucan();
+
+    // send_message must succeed — capture failure must NOT fail the send.
+    manager
+        .send_message(
+            &handle,
+            &"did:key:sender".into(),
+            b"hello",
+            Some(&sk),
+            None,
+            Some(&ucan),
+        )
+        .await
+        .expect("send_message must succeed despite capture failure");
+
+    // The event log must contain a PaymentCaptureFailed entry.
+    let context_id_bytes = scp_protocol::context::context_id_bytes("h19-send-ctx");
+    let entries = event_log.entries.lock().unwrap();
+    let capture_failed: Vec<_> = entries
+        .iter()
+        .filter(|(cid, event, _, _, _)| *cid == context_id_bytes && event == "PaymentCaptureFailed")
+        .collect();
+
+    assert!(
+        !capture_failed.is_empty(),
+        "expected at least one PaymentCaptureFailed event log entry, got none; \
+         all entries: {entries:?}"
+    );
+
+    let (_, _, actor_did, _, payload) = &capture_failed[0];
+    assert_eq!(
+        actor_did, "did:key:sender",
+        "PaymentCaptureFailed actor_did must be the sender"
+    );
+
+    let payload = payload
+        .as_ref()
+        .expect("PaymentCaptureFailed must carry a payload");
+    assert_eq!(
+        payload["action"].as_str(),
+        Some("send_message"),
+        "payload action must be 'send_message'"
+    );
+    assert!(
+        payload["error"].as_str().is_some(),
+        "payload must include an error string"
+    );
+}
+
+/// H19-S2: When `capture_send_payment` fails, the message is still
+/// delivered — `send_message` returns `Ok` and the `MessageSent` event is
+/// in the receive buffer. The capture failure must not suppress the message.
+#[tokio::test]
+async fn capture_send_payment_failure_still_delivers_message() {
+    let (manager, handle, _event_log) =
+        setup_failing_capture_manager_with_context("h19-send-del-ctx", "did:key:sender").await;
+
+    let sk = ed25519_dalek::SigningKey::from_bytes(&[1u8; 32]);
+    let ucan = dummy_spending_ucan();
+
+    let result = manager
+        .send_message(
+            &handle,
+            &"did:key:sender".into(),
+            b"hello",
+            Some(&sk),
+            None,
+            Some(&ucan),
+        )
+        .await;
+
+    assert!(result.is_ok(), "send_message must succeed: {result:?}");
+
+    // The receive buffer must contain both MessageSent and PaymentCaptureFailed.
+    let events = manager.drain_events("h19-send-del-ctx").await;
+    let message_sent = events
+        .iter()
+        .any(|e| matches!(e, ContextEvent::MessageSent { .. }));
+    let capture_failed = events
+        .iter()
+        .any(|e| matches!(e, ContextEvent::PaymentCaptureFailed { action, .. } if action == "send_message"));
+
+    assert!(
+        message_sent,
+        "MessageSent must be in receive buffer despite capture failure; events: {events:?}"
+    );
+    assert!(
+        capture_failed,
+        "PaymentCaptureFailed must be in receive buffer; events: {events:?}"
+    );
+}
+
+/// H19-S3: When `capture_send_payment` succeeds, no `PaymentCaptureFailed`
+/// event is emitted. The happy path must stay clean.
+///
+/// Uses the `NoOpPaymentAdapter` (authorizes and captures successfully).
+#[tokio::test]
+async fn capture_send_payment_success_no_failure_event() {
+    use crate::economy::adapter::NoOpPaymentAdapter;
+    use std::sync::Arc as StdArc;
+
+    let event_log = StdArc::new(MockEventLogWithActorDid::default());
+
+    let policy = {
+        use scp_protocol::economy::types::{Amount, CostSchedule, CurrencyCode, EconomicPolicy};
+        EconomicPolicy {
+            locked: false,
+            cost_schedule: CostSchedule {
+                currency: CurrencyCode([85, 83, 68, 0]),
+                per_message: Some(Amount::new(1)),
+                per_tool_invoke: None,
+                per_join: None,
+                per_period: None,
+                per_byte_stored: None,
+            },
+            payment_adapters: vec!["noop".to_owned()],
+            pricing_formula: None,
+            payee: DID::from("did:key:payee"),
+        }
+    };
+
+    let manager = ContextManager::builder()
+        .crypto(Box::new(MockCrypto::default()))
+        .transport(Box::new(MockTransport::connected()))
+        .event_log(Box::new(ArcEventLog(event_log.clone())))
+        .payment_adapter(StdArc::new(NoOpPaymentAdapter))
+        .build()
+        .unwrap();
+
+    let params = ContextParams {
+        ceiling: vec![
+            scp_protocol::context::params::Capability::new("messages:read"),
+            scp_protocol::context::params::Capability::new("messages:write"),
+        ],
+        economic_policy: Some(policy),
+        ..ContextParams::default()
+    };
+    let handle = manager
+        .create_context("h19-success-ctx".into(), params, "did:key:sender".into())
+        .await
+        .unwrap();
+
+    // Grant budget.
+    {
+        let mut contexts = manager.contexts.lock().await;
+        let ctx = contexts.get_mut("h19-success-ctx").unwrap();
+        ctx.governance.budget_tracker.grant(
+            &DID::from("did:key:sender"),
+            scp_protocol::economy::types::Amount::new(1_000_000),
+        );
+    }
+
+    let sk = ed25519_dalek::SigningKey::from_bytes(&[1u8; 32]);
+    let ucan = dummy_spending_ucan();
+
+    manager
+        .send_message(
+            &handle,
+            &"did:key:sender".into(),
+            b"hello",
+            Some(&sk),
+            None,
+            Some(&ucan),
+        )
+        .await
+        .expect("send_message should succeed with NoOpPaymentAdapter");
+
+    let context_id_bytes = scp_protocol::context::context_id_bytes("h19-success-ctx");
+    let entries = event_log.entries.lock().unwrap();
+    let capture_failed: Vec<_> = entries
+        .iter()
+        .filter(|(cid, event, _, _, _)| *cid == context_id_bytes && event == "PaymentCaptureFailed")
+        .collect();
+
+    assert!(
+        capture_failed.is_empty(),
+        "PaymentCaptureFailed must NOT be emitted on successful capture; \
+         entries: {capture_failed:?}"
+    );
+}

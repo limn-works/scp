@@ -1883,6 +1883,57 @@ impl ContextManager {
             spending_nonce_tracker_state: ctx.governance.spending_nonce_tracker.snapshot_entries(),
         }
     }
+
+    /// Appends a `PaymentCaptureFailed` entry to the event log and pushes a
+    /// matching [`ContextEvent::PaymentCaptureFailed`] to the receive buffer.
+    ///
+    /// Called by `capture_send_payment` and `capture_join_payment` when the
+    /// payment adapter returns an error after a successful action (H19 audit
+    /// trail). The budget deduction is NOT reversed — service was rendered (H8).
+    ///
+    /// # Errors on event-log append
+    ///
+    /// If the event log append fails, a warning is logged but the method
+    /// does not propagate the error (best-effort, same as the outer capture).
+    ///
+    /// The method is `pub(crate)` so that unit tests can invoke it directly
+    /// without needing to construct the internal `PaidActionAuthorization`
+    /// type. Not part of the public API.
+    pub(crate) async fn record_payment_capture_failure(
+        &self,
+        context_id: &str,
+        action: &str,
+        actor_did: &DID,
+        error_msg: &str,
+        cost: Option<scp_protocol::economy::types::Amount>,
+    ) {
+        let context_id_bytes = context_id_to_bytes(context_id);
+        let payload = serde_json::json!({
+            "action": action,
+            "error": error_msg,
+            "cost": cost.map(scp_protocol::economy::types::Amount::value),
+        });
+        if let Err(log_err) = self.event_log.append_context_event_with_payload(
+            &context_id_bytes,
+            "PaymentCaptureFailed",
+            actor_did.as_ref(),
+            Some(&payload),
+        ) {
+            tracing::warn!(
+                context_id,
+                "failed to append PaymentCaptureFailed to event log: {log_err}"
+            );
+        }
+        let mut contexts = self.contexts.lock().await;
+        if let Some(ctx) = contexts.get_mut(context_id) {
+            ctx.receive_buffer.push(ContextEvent::PaymentCaptureFailed {
+                action: action.to_owned(),
+                actor_did: actor_did.clone(),
+                error: error_msg.to_owned(),
+                cost: cost.map(scp_protocol::economy::types::Amount::value),
+            });
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------

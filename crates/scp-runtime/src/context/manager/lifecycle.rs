@@ -1813,14 +1813,18 @@ impl ContextManager {
 
     /// Captures the escrow hold after a successful join (Phase 5 of `join_context`).
     ///
-    /// Best-effort: if capture fails, rolls back the budget and logs a warning
-    /// but does NOT fail the join (the member was already added).
+    /// Best-effort: if capture fails, logs a warning but does NOT roll back
+    /// the budget and does NOT fail the join (the member was already added).
+    /// The service was rendered, so the budget deduction stands (H8).
+    ///
+    /// On failure a `PaymentCaptureFailed` entry is appended to the event log
+    /// and pushed to the receive buffer to provide a durable audit trail (H19).
     async fn capture_join_payment(
         &self,
         auth: Option<super::economy::PaidActionAuthorization>,
         member_did: &DID,
         context_id: &str,
-        _deducted_cost: Option<scp_protocol::economy::types::Amount>,
+        deducted_cost: Option<scp_protocol::economy::types::Amount>,
     ) {
         if let Some(a) = auth
             && let Err(e) = self.complete_paid_action(a, member_did, context_id).await
@@ -1830,6 +1834,15 @@ impl ContextManager {
                 context_id,
                 "payment capture failed after successful join: {e}"
             );
+            // H19: append durable audit record to event log + receive buffer.
+            self.record_payment_capture_failure(
+                context_id,
+                "join_context",
+                member_did,
+                &e.to_string(),
+                deducted_cost,
+            )
+            .await;
         }
     }
 

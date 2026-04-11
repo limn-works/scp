@@ -722,15 +722,10 @@ impl ContextManager {
         // (H18: standing-deflation filter).
         let context_id_bytes = context_id_to_bytes(context_id);
         let action_variant = proposal.action.variant_name();
-        let payload = Some(
-            proposal
-                .action
-                .target_did()
-                .map_or_else(
-                    || serde_json::json!({"action_type": action_variant}),
-                    |d| serde_json::json!({"target_did": d.as_ref(), "action_type": action_variant}),
-                ),
-        );
+        let payload = Some(proposal.action.target_did().map_or_else(
+            || serde_json::json!({"action_type": action_variant}),
+            |d| serde_json::json!({"target_did": d.as_ref(), "action_type": action_variant}),
+        ));
         self.event_log.append_context_event_with_payload(
             &context_id_bytes,
             Self::governance_event_label(&executed_event),
