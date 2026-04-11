@@ -14247,6 +14247,273 @@ async fn deliver_incoming_no_consequence_rules_skips_eval() {
 }
 
 // -----------------------------------------------------------------------
+// H7: execute_revoke sender key rotation
+// -----------------------------------------------------------------------
+
+/// Verify that `rotate_sender_key` is called after `execute_revoke` with
+/// `AccessScope::Write`. The revoked member must not be able to decrypt
+/// future messages at the sender-key layer (§9.17 defense-in-depth).
+#[tokio::test]
+async fn execute_revoke_write_rotates_sender_key() {
+    use scp_protocol::context::governance::{AccessScope, GovernanceAction};
+
+    let crypto = MockCrypto::default();
+    let call_order = Arc::clone(&crypto.call_order);
+
+    let manager = ContextManager::new(
+        Box::new(crypto),
+        Box::new(MockTransport::connected()),
+        Box::new(MockEventLog::default()),
+        noop_key_resolver(),
+    );
+
+    let alice = DID::from("did:dht:z6MkAlice");
+    let bob = DID::from("did:dht:z6MkBob");
+
+    let params = ContextParams {
+        ceiling: vec![
+            Capability::MessagesRead,
+            Capability::MessagesWrite,
+            Capability::MemberBan,
+        ],
+        ..ContextParams::default()
+    };
+
+    let handle = manager
+        .create_context("h7-write-ctx".into(), params, alice.clone())
+        .await
+        .unwrap();
+    let context_id = handle.context_id().to_owned();
+    manager
+        .join_context(&handle, KeyPackage::mock(bob.clone()), None)
+        .await
+        .unwrap();
+
+    // Clear prior call log from context creation / join.
+    call_order.lock().unwrap().clear();
+
+    let proposal = approved_proposal(
+        [10u8; 32],
+        &context_id,
+        GovernanceAction::RevokeAccess {
+            did: bob.clone(),
+            access: AccessScope::Write,
+        },
+        &[alice.as_ref()],
+    );
+    let result = manager
+        .execute_governance_action(&context_id, &proposal)
+        .await;
+    assert!(result.is_ok(), "revoke Write should succeed: {result:?}");
+
+    let calls = call_order.lock().unwrap();
+    let rotate_called = calls
+        .iter()
+        .any(|(method, _)| method == "rotate_sender_key");
+    assert!(
+        rotate_called,
+        "rotate_sender_key must be called after revoking Write access. Calls: {calls:?}"
+    );
+}
+
+/// Verify that `rotate_sender_key` is called after `execute_revoke` with
+/// `AccessScope::Both` (symmetric with `execute_reset_member`).
+#[tokio::test]
+async fn execute_revoke_both_rotates_sender_key() {
+    use scp_protocol::context::governance::{AccessScope, GovernanceAction};
+
+    let crypto = MockCrypto::default();
+    let call_order = Arc::clone(&crypto.call_order);
+
+    let manager = ContextManager::new(
+        Box::new(crypto),
+        Box::new(MockTransport::connected()),
+        Box::new(MockEventLog::default()),
+        noop_key_resolver(),
+    );
+
+    let alice = DID::from("did:dht:z6MkAlice");
+    let bob = DID::from("did:dht:z6MkBob");
+
+    let params = ContextParams {
+        ceiling: vec![
+            Capability::MessagesRead,
+            Capability::MessagesWrite,
+            Capability::MemberBan,
+        ],
+        ..ContextParams::default()
+    };
+
+    let handle = manager
+        .create_context("h7-both-ctx".into(), params, alice.clone())
+        .await
+        .unwrap();
+    let context_id = handle.context_id().to_owned();
+    manager
+        .join_context(&handle, KeyPackage::mock(bob.clone()), None)
+        .await
+        .unwrap();
+
+    call_order.lock().unwrap().clear();
+
+    let proposal = approved_proposal(
+        [11u8; 32],
+        &context_id,
+        GovernanceAction::RevokeAccess {
+            did: bob.clone(),
+            access: AccessScope::Both,
+        },
+        &[alice.as_ref()],
+    );
+    let result = manager
+        .execute_governance_action(&context_id, &proposal)
+        .await;
+    assert!(result.is_ok(), "revoke Both should succeed: {result:?}");
+
+    let calls = call_order.lock().unwrap();
+    let rotate_called = calls
+        .iter()
+        .any(|(method, _)| method == "rotate_sender_key");
+    assert!(
+        rotate_called,
+        "rotate_sender_key must be called after revoking Both access. Calls: {calls:?}"
+    );
+}
+
+/// Verify that `rotate_sender_key` is NOT called after `execute_revoke` with
+/// `AccessScope::Read`. Read-only revocations do not need sender key rotation
+/// because the member was never an encryptor on the write path.
+#[tokio::test]
+async fn execute_revoke_read_does_not_rotate_sender_key() {
+    use scp_protocol::context::governance::{AccessScope, GovernanceAction};
+
+    let crypto = MockCrypto::default();
+    let call_order = Arc::clone(&crypto.call_order);
+
+    let manager = ContextManager::new(
+        Box::new(crypto),
+        Box::new(MockTransport::connected()),
+        Box::new(MockEventLog::default()),
+        noop_key_resolver(),
+    );
+
+    let alice = DID::from("did:dht:z6MkAlice");
+    let bob = DID::from("did:dht:z6MkBob");
+
+    let params = ContextParams {
+        ceiling: vec![
+            Capability::MessagesRead,
+            Capability::MessagesWrite,
+            Capability::MemberBan,
+        ],
+        ..ContextParams::default()
+    };
+
+    let handle = manager
+        .create_context("h7-read-ctx".into(), params, alice.clone())
+        .await
+        .unwrap();
+    let context_id = handle.context_id().to_owned();
+    manager
+        .join_context(&handle, KeyPackage::mock(bob.clone()), None)
+        .await
+        .unwrap();
+
+    call_order.lock().unwrap().clear();
+
+    let proposal = approved_proposal(
+        [12u8; 32],
+        &context_id,
+        GovernanceAction::RevokeAccess {
+            did: bob.clone(),
+            access: AccessScope::Read,
+        },
+        &[alice.as_ref()],
+    );
+    let result = manager
+        .execute_governance_action(&context_id, &proposal)
+        .await;
+    assert!(result.is_ok(), "revoke Read should succeed: {result:?}");
+
+    let calls = call_order.lock().unwrap();
+    let rotate_called = calls
+        .iter()
+        .any(|(method, _)| method == "rotate_sender_key");
+    assert!(
+        !rotate_called,
+        "rotate_sender_key must NOT be called after revoking Read-only access. Calls: {calls:?}"
+    );
+}
+
+/// Verify that a `rotate_sender_key` failure does not abort `execute_revoke`.
+/// The capability suspension and access key removal must succeed even when
+/// sender key rotation fails (non-fatal, warn and continue).
+#[tokio::test]
+async fn execute_revoke_rotation_failure_still_completes() {
+    use scp_protocol::context::governance::{AccessScope, GovernanceAction};
+    use std::sync::atomic::Ordering;
+
+    let crypto = MockCrypto::default();
+    // Inject rotation failure before the action runs.
+    crypto.fail_rotate_sender_key.store(true, Ordering::Relaxed);
+
+    let manager = ContextManager::new(
+        Box::new(crypto),
+        Box::new(MockTransport::connected()),
+        Box::new(MockEventLog::default()),
+        noop_key_resolver(),
+    );
+
+    let alice = DID::from("did:dht:z6MkAlice");
+    let bob = DID::from("did:dht:z6MkBob");
+
+    let params = ContextParams {
+        ceiling: vec![
+            Capability::MessagesRead,
+            Capability::MessagesWrite,
+            Capability::MemberBan,
+        ],
+        ..ContextParams::default()
+    };
+
+    let handle = manager
+        .create_context("h7-fail-ctx".into(), params, alice.clone())
+        .await
+        .unwrap();
+    let context_id = handle.context_id().to_owned();
+    manager
+        .join_context(&handle, KeyPackage::mock(bob.clone()), None)
+        .await
+        .unwrap();
+
+    let proposal = approved_proposal(
+        [13u8; 32],
+        &context_id,
+        GovernanceAction::RevokeAccess {
+            did: bob.clone(),
+            access: AccessScope::Write,
+        },
+        &[alice.as_ref()],
+    );
+    let result = manager
+        .execute_governance_action(&context_id, &proposal)
+        .await;
+    assert!(
+        result.is_ok(),
+        "revoke must complete even when rotate_sender_key fails: {result:?}"
+    );
+
+    // Verify capabilities were suspended despite rotation failure.
+    let contexts = manager.contexts.lock().await;
+    let ctx = contexts.get(&context_id).unwrap();
+    assert!(
+        !ctx.role_state
+            .member_has_capability(bob.as_ref(), &Capability::MessagesWrite),
+        "MessagesWrite must be suspended even when sender key rotation fails"
+    );
+}
+
+// -----------------------------------------------------------------------
 // M26: decay_participation clears velocity_tracker
 // -----------------------------------------------------------------------
 
