@@ -2328,7 +2328,7 @@ impl ContextManager {
     ) -> Result<usize, ContextError> {
         let context_id_bytes = context_id_to_bytes(context_id);
 
-        let (rotated_count, ctx_snapshot, bc_snapshot) = {
+        let (rotated_count, ctx_snapshot, bc_snapshot, needs_sender_key_rotation) = {
             let mut contexts = self.contexts.lock().await;
             let ctx = contexts
                 .get_mut(context_id)
@@ -2405,12 +2405,22 @@ impl ContextManager {
                     .push(ContextEvent::AccessKeyRevoked { did: did.clone() });
             }
 
+            // Encrypted non-broadcast mode: Write and Both revocations need a
+            // sender key rotation so the revoked member cannot decrypt future
+            // messages at the sender-key layer (defense-in-depth per §9.17).
+            // Broadcast mode handles key rotation through its own block_author /
+            // governance_ban_subscriber paths above, so we only rotate here for
+            // encrypted contexts. Read-only revocations do not need rotation
+            // because the member was never an encryptor.
+            let rotate = matches!(access, AccessScope::Write | AccessScope::Both)
+                && ctx.broadcast_context.is_none();
+
             let snap = if self.has_persistence() {
                 Some(Self::snapshot_context(ctx))
             } else {
                 None
             };
-            (rotated, snap, bc_snap)
+            (rotated, snap, bc_snap, rotate)
         };
 
         if let Some(ctx_snapshot) = ctx_snapshot {
@@ -2421,6 +2431,28 @@ impl ContextManager {
         }
         self.event_log
             .append_context_event(&context_id_bytes, "AccessRevoked", actor_did)?;
+
+        // H7: Rotate sender key after write-side revocation so the revoked
+        // member cannot decrypt future messages at the sender-key layer
+        // (defense-in-depth per §9.17). Non-fatal: MLS membership is unchanged
+        // during revoke, so rotation failure does not leave the group in an
+        // inconsistent state — warn and continue.
+        if needs_sender_key_rotation {
+            if let Err(e) = self.crypto.rotate_sender_key(&context_id_bytes) {
+                tracing::warn!(
+                    context_id = %context_id,
+                    error = %e,
+                    "rotate_sender_key failed after access revocation"
+                );
+            }
+            if let Err(e) = self.drain_and_deliver_sender_keys(context_id, &context_id_bytes) {
+                tracing::warn!(
+                    context_id = %context_id,
+                    error = %e,
+                    "drain_and_deliver_sender_keys failed after access revocation"
+                );
+            }
+        }
 
         Ok(rotated_count)
     }
