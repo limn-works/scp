@@ -235,6 +235,9 @@ export {
   AttestationError,
   ContextError,
   CryptoError,
+  EconomicPolicyUnsupportedOnWasm,
+  EconomyError,
+  GovernanceError,
   IdentityError,
   McpError,
   mapBridgeError,
@@ -245,6 +248,7 @@ export {
   TransportError,
   UcanPermissionError,
   ValidationError,
+  WasmCannotValidateSpendingUcan,
 } from "./errors";
 
 // ---------------------------------------------------------------------------

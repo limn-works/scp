@@ -301,6 +301,19 @@ pub fn context_create(identity_did: String, params_json: String) -> Promise {
 /// Joins an existing SCP context.
 ///
 /// Delegates to `WasmContextManager::join_context`.
+///
+/// # Fail-closed economy gate (C2)
+///
+/// The WASM bridge **cannot** validate a `spending_ucan_jwt` against a
+/// payment adapter, budget tracker, velocity tracker, or hard rate limit
+/// token bucket because `scp-runtime`'s `enforce_economy` pipeline does not
+/// compile to `wasm32` (ADR-034). If the target context has an economic
+/// policy that requires payment for any action, this function rejects with
+/// `SCP-ECON-12096` (`WasmCannotValidateSpendingUcan`) regardless of whether
+/// `spending_ucan_jwt` is `Some` or `None`. Free contexts are unaffected.
+///
+/// To join paid contexts, use a native (Python / Node.js / Swift / Kotlin)
+/// client whose bridge does run `enforce_economy`.
 #[wasm_bindgen]
 pub fn context_join(
     handle: &WasmContextHandle,
@@ -313,8 +326,14 @@ pub fn context_join(
     let context_id = handle.context_id();
 
     future_to_promise(async move {
-        // Validate spending UCAN JWT if provided (parse-only; actual budget
-        // enforcement is performed by the WasmContextManager).
+        // Parse-only validation of the spending UCAN JWT, if provided.
+        //
+        // The WASM bridge cannot enforce the *budget* (no payment adapter,
+        // no `enforce_economy` — see ADR-034 and the C2 fail-closed gate
+        // in `WasmContextManager::join_context`). For free contexts, the
+        // JWT is parsed only to surface a clear `SCP-ECON-12061` to the
+        // caller if the token is structurally invalid; for paid contexts
+        // the manager rejects with `SCP-ECON-12096` regardless.
         if let Some(ref jwt) = spending_ucan_jwt {
             let _ = scp_protocol::crypto::ucan::validate::parse_ucan(jwt).map_err(|e| {
                 ScpWasmError::Context {
@@ -325,6 +344,10 @@ pub fn context_join(
             })?;
         }
 
+        // C2: WasmContextManager::join_context inspects both the context's
+        // economic policy AND the spending UCAN, and rejects fail-closed if
+        // the policy requires payment (SCP-ECON-12096). For free contexts
+        // it proceeds normally.
         with_manager(|mgr| {
             mgr.join_context(&context_id, &identity_did, spending_ucan_jwt.as_deref())
         })
@@ -379,6 +402,19 @@ pub fn context_close(handle: &WasmContextHandle, identity_did: String) -> Promis
 /// Sends a message to an SCP context.
 ///
 /// Delegates to `WasmContextManager::send_message`.
+///
+/// # Fail-closed economy gate (C2)
+///
+/// The WASM bridge **cannot** validate a `spending_ucan_jwt` against a
+/// payment adapter, budget tracker, velocity tracker, or hard rate limit
+/// token bucket because `scp-runtime`'s `enforce_economy` pipeline does not
+/// compile to `wasm32` (ADR-034). If the target context has an economic
+/// policy that requires payment for any action, this function rejects with
+/// `SCP-ECON-12096` (`WasmCannotValidateSpendingUcan`) regardless of whether
+/// `spending_ucan_jwt` is `Some` or `None`. Free contexts are unaffected.
+///
+/// To send messages in paid contexts, use a native (Python / Node.js /
+/// Swift / Kotlin) client whose bridge does run `enforce_economy`.
 #[wasm_bindgen]
 pub fn context_send(
     handle: &WasmContextHandle,
@@ -403,8 +439,14 @@ pub fn context_send(
             .into());
         }
 
-        // Validate spending UCAN JWT if provided (parse-only; actual budget
-        // enforcement is performed by the WasmContextManager).
+        // Parse-only validation of the spending UCAN JWT, if provided.
+        //
+        // The WASM bridge cannot enforce the *budget* (no payment adapter,
+        // no `enforce_economy` — see ADR-034 and the C2 fail-closed gate
+        // in `WasmContextManager::send_message`). For free contexts, the
+        // JWT is parsed only to surface a clear `SCP-ECON-12061` to the
+        // caller if the token is structurally invalid; for paid contexts
+        // the manager rejects with `SCP-ECON-12096` regardless.
         if let Some(ref jwt) = spending_ucan_jwt {
             let _ = scp_protocol::crypto::ucan::validate::parse_ucan(jwt).map_err(|e| {
                 ScpWasmError::Context {
@@ -415,7 +457,10 @@ pub fn context_send(
             })?;
         }
 
-        // H13: Thread spending UCAN through to WasmContextManager.
+        // C2: WasmContextManager::send_message inspects both the context's
+        // economic policy AND the spending UCAN, and rejects fail-closed if
+        // the policy requires payment (SCP-ECON-12096). For free contexts
+        // it proceeds normally.
         with_manager(|mgr| {
             mgr.send_message(
                 &context_id,

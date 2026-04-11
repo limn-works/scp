@@ -1908,3 +1908,169 @@ describe("Trust aggregation with consequence rules (mock bridge)", () => {
     expect(result).toBeDefined();
   });
 });
+
+// ---------------------------------------------------------------------------
+// 14. C2 — WASM economy fail-closed gate (PR #1606 follow-up)
+//
+// The browser (WASM) bridge cannot run scp-runtime's `enforce_economy`
+// pipeline (no payment adapter, no budget tracker, no velocity tracker, no
+// hard rate limit token bucket — see ADR-034). To prevent silent bypass,
+// the bridge rejects:
+//
+//   - context_create with a paid economic policy → SCP-ECON-12095
+//   - context_join against a paid context        → SCP-ECON-12096
+//   - context_send into a paid context           → SCP-ECON-12096
+//
+// These tests simulate the rejection at the bridge boundary using a
+// stub bridge and verify the SDK layer surfaces the typed subclasses
+// (`EconomicPolicyUnsupportedOnWasm`, `WasmCannotValidateSpendingUcan`)
+// via `mapBridgeError`. End-to-end validation runs under real-wasm.test.ts.
+// ---------------------------------------------------------------------------
+
+describe("WASM economy fail-closed (C2 — typed error surfacing)", () => {
+  it("Context.create surfaces EconomicPolicyUnsupportedOnWasm for SCP-ECON-12095", async () => {
+    const { EconomicPolicyUnsupportedOnWasm, EconomyError, ScpError } = await import(
+      "../src/errors"
+    );
+
+    // Stub bridge that rejects contextCreate with the C2 fail-closed code,
+    // mirroring `WasmContextManager::create_context` after the gate fires.
+    const failClosedBridge = {
+      ...mockBridge,
+      contextCreate: async () => {
+        throw new Error(
+          "[SCP-ECON-12095] context error: EconomicPolicyUnsupportedOnWasm: \
+paid contexts cannot be created from the WASM bridge — the browser SDK \
+cannot run the full economy enforcement pipeline (ADR-034). Use a native \
+(Python / Node.js / Swift / Kotlin) client for paid contexts.",
+        );
+      },
+    };
+    _setBridge(failClosedBridge);
+
+    const identity = await Identity.create();
+    let captured: unknown = null;
+    try {
+      await Context.create(identity, {
+        ceiling: [],
+        tools: [],
+        roles: {},
+        ttl: 3600,
+        memoryScope: "ephemeral",
+        // The mock returns the rejection regardless; the policy shape
+        // here only documents intent.
+        economicPolicy:
+          '{"locked":false,"cost_schedule":{"currency":[85,83,68,0],"per_message":100,"per_tool_invoke":null,"per_join":null,"per_period":null,"per_byte_stored":null},"payment_adapters":[],"pricing_formula":null,"payee":"did:dht:zpayee"}',
+      });
+    } catch (e) {
+      captured = e;
+    }
+
+    expect(captured).toBeInstanceOf(EconomicPolicyUnsupportedOnWasm);
+    expect(captured).toBeInstanceOf(EconomyError);
+    expect(captured).toBeInstanceOf(ScpError);
+    if (captured instanceof ScpError) {
+      expect(captured.code).toBe("SCP-ECON-12095");
+      expect(captured.message).toContain("EconomicPolicyUnsupportedOnWasm");
+    }
+  });
+
+  it("Context.join surfaces WasmCannotValidateSpendingUcan for SCP-ECON-12096", async () => {
+    const { EconomyError, ScpError, WasmCannotValidateSpendingUcan } = await import(
+      "../src/errors"
+    );
+
+    // Stub bridge that lets context_create succeed (so we get a Context
+    // handle) but rejects contextJoin with the C2 fail-closed code,
+    // mirroring `WasmContextManager::join_context` after the gate fires.
+    const failClosedBridge = {
+      ...mockBridge,
+      contextJoin: async () => {
+        throw new Error(
+          "[SCP-ECON-12096] context error: WasmCannotValidateSpendingUcan: \
+context 'ctx-paid' has an economic policy requiring payment, but the WASM \
+bridge cannot cryptographically validate spending UCANs against a payment \
+adapter (ADR-034). Use a native (Python / Node.js / Swift / Kotlin) client \
+to join paid contexts.",
+        );
+      },
+    };
+    _setBridge(failClosedBridge);
+
+    const identity = await Identity.create();
+    const ctx = await Context.create(identity, {
+      ceiling: [],
+      tools: [],
+      roles: {},
+      ttl: 3600,
+      memoryScope: "ephemeral",
+    });
+
+    let captured: unknown = null;
+    try {
+      // Both with and without a spending UCAN — the WASM bridge rejects
+      // either way; the test verifies the typed subclass propagates.
+      await ctx.join(identity, "eyJqd3QtcGxhY2Vob2xkZXIifQ");
+    } catch (e) {
+      captured = e;
+    }
+
+    expect(captured).toBeInstanceOf(WasmCannotValidateSpendingUcan);
+    expect(captured).toBeInstanceOf(EconomyError);
+    expect(captured).toBeInstanceOf(ScpError);
+    if (captured instanceof ScpError) {
+      expect(captured.code).toBe("SCP-ECON-12096");
+      expect(captured.message).toContain("WasmCannotValidateSpendingUcan");
+    }
+  });
+
+  it("Context.send surfaces WasmCannotValidateSpendingUcan for SCP-ECON-12096", async () => {
+    const { EconomyError, ScpError, WasmCannotValidateSpendingUcan } = await import(
+      "../src/errors"
+    );
+
+    // Stub bridge that rejects contextSend with the C2 fail-closed code.
+    const failClosedBridge = {
+      ...mockBridge,
+      contextSend: async () => {
+        throw new Error(
+          "[SCP-ECON-12096] context error: WasmCannotValidateSpendingUcan: \
+context 'ctx-paid' has an economic policy requiring payment",
+        );
+      },
+    };
+    _setBridge(failClosedBridge);
+
+    const identity = await Identity.create();
+    const ctx = await Context.create(identity, {
+      ceiling: [],
+      tools: [],
+      roles: {},
+      ttl: 3600,
+      memoryScope: "ephemeral",
+    });
+
+    let captured: unknown = null;
+    try {
+      await ctx.send("hello", "eyJqd3QtcGxhY2Vob2xkZXIifQ");
+    } catch (e) {
+      captured = e;
+    }
+
+    expect(captured).toBeInstanceOf(WasmCannotValidateSpendingUcan);
+    expect(captured).toBeInstanceOf(EconomyError);
+    expect(captured).toBeInstanceOf(ScpError);
+    if (captured instanceof ScpError) {
+      expect(captured.code).toBe("SCP-ECON-12096");
+    }
+
+    // Same expectation when no spending UCAN is supplied.
+    captured = null;
+    try {
+      await ctx.send("hello");
+    } catch (e) {
+      captured = e;
+    }
+    expect(captured).toBeInstanceOf(WasmCannotValidateSpendingUcan);
+  });
+});
