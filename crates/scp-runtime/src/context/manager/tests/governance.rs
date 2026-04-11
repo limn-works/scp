@@ -12870,43 +12870,457 @@ async fn test_governance_close_decays_participation() {
 }
 
 // -----------------------------------------------------------------------
-// H16: deliver_incoming consequence evaluation wiring
+// H16/H17: deliver_incoming consequence evaluation wiring (behavioral)
 // -----------------------------------------------------------------------
+//
+// The previous test in this slot only asserted
+// `consequence_rules.len() == 1` after `create_context` and never called
+// `deliver_incoming`. The wiring at messaging.rs:1090-1116 was therefore
+// uncovered. The two tests below replace it with end-to-end behavioral
+// coverage:
+//
+// 1. `deliver_incoming_evaluates_consequences_behavioral` — Alice and
+//    Bob run on independent `ContextManager`s. Alice's context has NO
+//    consequence rules so her send-side enforcement cannot fire.
+//    Bob's context has a `MessageVelocity` rule with threshold=3.
+//    Alice sends 3 messages; Bob delivers them. After delivery #3 we
+//    assert that Bob's H16 wiring fired the consequence: a
+//    `ConsequenceTriggered` event is in Bob's receive buffer, Bob's
+//    velocity tracker recorded all three sends, and Bob's
+//    `role_state.suspended_capabilities` for Alice contains
+//    `MessagesWrite`.
+//
+// 2. `deliver_incoming_no_consequence_rules_skips_eval` — same shape
+//    but Bob's context has `consequence_rules: vec![]`. After delivery
+//    Bob's velocity tracker is still ticked (the H16 `record_message`
+//    call is unconditional, providing defense-in-depth even when
+//    rules are absent), but no `ConsequenceTriggered` event is pushed
+//    and no capability is suspended. This proves the
+//    `if !consequence_rules.is_empty()` early-exit at messaging.rs:1100.
 
+/// Builds a fresh `ContextManager` configured for the H16 receive-path
+/// test: real signature verification via `mock_key_resolver`, no
+/// payment adapter, no persistent storage. Returns the manager + a
+/// shared transport sent-buffer handle so the caller can capture
+/// encrypted bytes after `send_message`.
+fn h17_h16_make_manager() -> (
+    ContextManager,
+    std::sync::Arc<std::sync::Mutex<Vec<Vec<u8>>>>,
+) {
+    let transport = MockTransport::connected();
+    let sent = transport.sent_messages_handle();
+    let manager = ContextManager::new(
+        Box::new(MockCrypto::default()),
+        Box::new(transport),
+        Box::new(MockEventLog::default()),
+        mock_key_resolver(),
+    );
+    (manager, sent)
+}
+
+/// Wires Alice (sender) and Bob (receiver) into independent managers
+/// that share a context id and a deterministic access key for Bob.
+///
+/// `bob_consequence_rules` is plumbed through to Bob's context only —
+/// Alice's manager always has an empty rules vector so her send-side
+/// enforcement cannot fire and the test isolates the H16 receive-path
+/// wiring.
+///
+/// Returns:
+///   * `alice_manager` (with sent transport buffer)
+///   * Alice's `ContextHandle`
+///   * the captured sent buffer
+///   * `bob_manager` for delivery + assertions
+async fn h17_setup_alice_and_bob(
+    context_id: &str,
+    bob_consequence_rules: Vec<super::ConsequenceRule>,
+) -> (
+    ContextManager,
+    super::ContextHandle,
+    std::sync::Arc<std::sync::Mutex<Vec<Vec<u8>>>>,
+    ContextManager,
+) {
+    let alice_did_str = "did:key:alice";
+    let bob_did_str = "did:key:bob";
+
+    // Deterministic access key for Bob — both managers must use the
+    // SAME key bytes so the wrapped CEK Alice produces is unwrappable
+    // on Bob's side. `generate_access_key` is random; we construct via
+    // `from_parts` to make the key cross-manager-stable.
+    let bob_access_key = scp_protocol::crypto::access_keys::AccessKey::from_parts(
+        [42u8; 32],
+        context_id.to_owned(),
+        bob_did_str.to_owned(),
+        0,
+    );
+
+    // -- Alice's manager --
+    let (alice_manager, sent) = h17_h16_make_manager();
+    alice_manager.register_local_did(alice_did_str.into()).await;
+
+    let alice_params = ContextParams {
+        ceiling: vec![
+            scp_protocol::context::params::Capability::new("messages:read"),
+            scp_protocol::context::params::Capability::new("messages:write"),
+            scp_protocol::context::params::Capability::new("role:assign"),
+            Capability::MemberBan,
+        ],
+        // EMPTY rules on Alice's side — her send-side enforcement
+        // must NOT fire so all 3 sends succeed and we can capture
+        // their bytes for delivery to Bob.
+        consequence_rules: vec![],
+        ..ContextParams::default()
+    };
+    let alice_handle = alice_manager
+        .create_context(context_id.to_owned(), alice_params, alice_did_str.into())
+        .await
+        .unwrap();
+
+    {
+        let mut contexts = alice_manager.contexts.lock().await;
+        let ctx = contexts.get_mut(context_id).unwrap();
+        ctx.membership
+            .add_member(bob_did_str.into(), "member".into(), vec![]);
+        ctx.role_state.members.insert(bob_did_str.to_owned());
+        ctx.access
+            .access_key_store
+            .set(context_id, bob_did_str, bob_access_key.clone());
+    }
+
+    // -- Bob's manager --
+    let (bob_manager, _bob_sent) = h17_h16_make_manager();
+    bob_manager.register_local_did(bob_did_str.into()).await;
+
+    let bob_params = ContextParams {
+        ceiling: vec![
+            scp_protocol::context::params::Capability::new("messages:read"),
+            scp_protocol::context::params::Capability::new("messages:write"),
+            scp_protocol::context::params::Capability::new("role:assign"),
+            Capability::MemberBan,
+        ],
+        consequence_rules: bob_consequence_rules,
+        ..ContextParams::default()
+    };
+    let _bob_handle = bob_manager
+        .create_context(context_id.to_owned(), bob_params, bob_did_str.into())
+        .await
+        .unwrap();
+
+    {
+        let mut contexts = bob_manager.contexts.lock().await;
+        let ctx = contexts.get_mut(context_id).unwrap();
+        // Add Alice as a member so deliver_incoming's membership check
+        // passes for incoming messages from Alice.
+        ctx.membership
+            .add_member(alice_did_str.into(), "admin".into(), vec![]);
+        ctx.role_state.members.insert(alice_did_str.to_owned());
+        // Alice needs MessagesWrite on Bob's role_state so the
+        // deliver_message_and_drain_buffered cap check passes; the
+        // default member capabilities only grant MessagesRead.
+        ctx.role_state
+            .member_capabilities
+            .entry(alice_did_str.to_owned())
+            .or_default()
+            .insert(Capability::MessagesWrite);
+        // Bob's own access key (mirrored from Alice's manager).
+        ctx.access
+            .access_key_store
+            .set(context_id, bob_did_str, bob_access_key.clone());
+    }
+
+    (alice_manager, alice_handle, sent, bob_manager)
+}
+
+/// H16 receive-path wiring (behavioral). Replaces the prior tautological
+/// `test_deliver_incoming_evaluates_consequences` that only asserted
+/// `consequence_rules.len() == 1`.
+#[allow(clippy::too_many_lines)] // exhaustive multi-stage assertion test
 #[tokio::test]
-async fn test_deliver_incoming_evaluates_consequences() {
+async fn deliver_incoming_evaluates_consequences_behavioral() {
     use scp_protocol::trust::consequence::{
         ConsequenceAction, ConsequenceRule, ConsequenceTrigger, EnforcementSeverity,
     };
     use std::time::Duration;
 
-    let manager = ContextManager::new(
-        Box::new(MockCrypto::default()),
-        Box::new(MockTransport::connected()),
-        Box::new(MockEventLog::default()),
-        noop_key_resolver(),
-    );
+    let context_id = "h17-h16-behavioral-ctx";
 
-    let alice = DID::from("did:dht:z6MkAlice");
-    let params = ContextParams {
-        consequence_rules: vec![ConsequenceRule {
-            trigger: ConsequenceTrigger::MessageVelocity,
-            action: ConsequenceAction::Enforcement(EnforcementSeverity::SuspendAccess),
-            threshold: 9999,
-            window: Duration::from_secs(3600),
-        }],
-        ..ContextParams::default()
+    // MessageVelocity rule: 3 messages from the same sender within
+    // an hour → suspend MessagesWrite for that sender.
+    let rule = ConsequenceRule {
+        trigger: ConsequenceTrigger::MessageVelocity,
+        action: ConsequenceAction::Enforcement(EnforcementSeverity::SuspendCapability {
+            capabilities: vec![Capability::MessagesWrite],
+        }),
+        threshold: 3,
+        window: Duration::from_secs(3600),
     };
 
-    let handle = manager
-        .create_context("h16-ctx".into(), params, alice.clone())
-        .await
-        .unwrap();
-    let context_id = handle.context_id().to_owned();
+    let (alice_manager, alice_handle, sent, bob_manager) =
+        h17_setup_alice_and_bob(context_id, vec![rule.clone()]).await;
 
-    let contexts = manager.contexts.lock().await;
-    let ctx = contexts.get(&context_id).unwrap();
-    assert_eq!(ctx.governance.consequence_rules.len(), 1);
+    let alice_did: DID = "did:key:alice".into();
+    let alice_sk = signing_key_for_did(&alice_did);
+
+    // Pre-flight: Bob's velocity for Alice is zero, no suspension.
+    {
+        let contexts = bob_manager.contexts.lock().await;
+        let ctx = contexts.get(context_id).unwrap();
+        assert_eq!(
+            ctx.governance
+                .velocity_tracker
+                .get_velocity(&alice_did, bob_manager.clock.now_secs()),
+            0,
+            "pre-flight: Bob's velocity tracker for Alice must be 0"
+        );
+        assert!(
+            !ctx.role_state
+                .suspended_capabilities
+                .contains_key("did:key:alice"),
+            "pre-flight: Alice must not be suspended on Bob's role_state"
+        );
+        assert!(
+            ctx.role_state
+                .member_has_capability("did:key:alice", &Capability::MessagesWrite),
+            "pre-flight: Alice must hold MessagesWrite on Bob's role_state"
+        );
+    }
+
+    // Alice sends 3 messages. Each successful send pushes a fresh
+    // encrypted blob into the shared transport buffer. Alice has NO
+    // consequence rules so her send-side enforcement is a no-op.
+    for i in 0..3u8 {
+        alice_manager
+            .send_message(
+                &alice_handle,
+                &alice_did,
+                &[i; 4],
+                Some(&alice_sk),
+                None,
+                None,
+            )
+            .await
+            .unwrap_or_else(|e| panic!("alice send #{i} must succeed: {e:?}"));
+    }
+
+    // Capture the 3 encrypted blobs in send order.
+    let captured: Vec<Vec<u8>> = {
+        let buf = sent.lock().unwrap();
+        assert_eq!(
+            buf.len(),
+            3,
+            "alice's transport must have captured exactly 3 encrypted blobs"
+        );
+        buf.clone()
+    };
+
+    // Deliver each encrypted blob to Bob in send order.
+    for (i, blob) in captured.iter().enumerate() {
+        bob_manager
+            .deliver_incoming(context_id, blob)
+            .await
+            .unwrap_or_else(|e| panic!("bob deliver_incoming #{i} must succeed: {e:?}"));
+    }
+
+    // Post-condition (a): Bob's velocity tracker recorded all 3 messages
+    // from Alice. The H16 wiring at messaging.rs:1095-1097 calls
+    // `record_message` UNCONDITIONALLY on every successful delivery,
+    // so the tracker reflects all three sends regardless of whether
+    // the consequence fired.
+    {
+        let contexts = bob_manager.contexts.lock().await;
+        let ctx = contexts.get(context_id).unwrap();
+        let velocity = ctx
+            .governance
+            .velocity_tracker
+            .get_velocity(&alice_did, bob_manager.clock.now_secs());
+        assert_eq!(
+            velocity, 3,
+            "Bob's velocity tracker must record 3 messages from Alice via H16, got {velocity}"
+        );
+
+        // Post-condition (c): Bob's role_state.suspended_capabilities
+        // for Alice contains MessagesWrite. This is the actual
+        // application of the consequence — H16's
+        // `enforce_triggered_consequences` → `enforce_suspend` →
+        // `role_state.suspend_capabilities` chain.
+        let suspended = ctx
+            .role_state
+            .suspended_capabilities
+            .get("did:key:alice")
+            .unwrap_or_else(|| {
+                panic!(
+                    "Bob's role_state.suspended_capabilities must contain an entry for Alice; \
+                     present keys: {:?}",
+                    ctx.role_state
+                        .suspended_capabilities
+                        .keys()
+                        .collect::<Vec<_>>()
+                )
+            });
+        assert!(
+            suspended.contains(&Capability::MessagesWrite),
+            "Alice's MessagesWrite must be suspended on Bob's role_state, got: {suspended:?}"
+        );
+        // The suspension-aware fold must reflect the suspension.
+        assert!(
+            !ctx.role_state
+                .member_has_capability("did:key:alice", &Capability::MessagesWrite),
+            "member_has_capability must return false for suspended capability"
+        );
+    }
+
+    // Post-condition (b): Bob's receive buffer carries a
+    // `ConsequenceTriggered` event for Alice referencing the
+    // `MessageVelocity` rule, plus a `ConsequenceEnforced` success
+    // event. Both are pushed by `enforce_triggered_consequences`.
+    let events = bob_manager.drain_events(context_id).await;
+    let triggered: Vec<_> = events
+        .iter()
+        .filter_map(|e| match e {
+            ContextEvent::ConsequenceTriggered {
+                member_did,
+                trigger_type,
+                action_type,
+                ..
+            } if member_did.as_ref() == "did:key:alice" => {
+                Some((trigger_type.clone(), action_type.clone()))
+            }
+            _ => None,
+        })
+        .collect();
+    assert!(
+        !triggered.is_empty(),
+        "Bob must observe a ConsequenceTriggered event for Alice; got events: {events:?}"
+    );
+    let (trigger_type, action_type) = &triggered[0];
+    assert!(
+        trigger_type.contains("MessageVelocity"),
+        "trigger_type should reference MessageVelocity, got: {trigger_type}"
+    );
+    assert!(
+        action_type.contains("SuspendCapability"),
+        "action_type should reference SuspendCapability, got: {action_type}"
+    );
+    let enforced: Vec<_> = events
+        .iter()
+        .filter(|e| {
+            matches!(
+                e,
+                ContextEvent::ConsequenceEnforced { member_did, success: true, .. }
+                    if member_did.as_ref() == "did:key:alice"
+            )
+        })
+        .collect();
+    assert!(
+        !enforced.is_empty(),
+        "Bob must observe a ConsequenceEnforced(success=true) for Alice; got events: {events:?}"
+    );
+
+    // Sanity: Alice's own role_state on her manager is NOT suspended
+    // because Alice's context has no consequence rules. This isolates
+    // the test to the H16 receive path on Bob's side.
+    {
+        let contexts = alice_manager.contexts.lock().await;
+        let ctx = contexts.get(context_id).unwrap();
+        assert!(
+            !ctx.role_state
+                .suspended_capabilities
+                .contains_key("did:key:alice"),
+            "Alice's own manager has no rules — she must NOT be suspended on her side"
+        );
+    }
+}
+
+/// Verifies the H16 early-exit at `messaging.rs:1100`:
+/// `if !consequence_rules.is_empty()` skips
+/// `event_log_entries_for_consequences` + `enforce_triggered_consequences`
+/// when no rules are configured. The unconditional `record_message`
+/// at line 1095-1097 still runs (defense-in-depth velocity tracking).
+#[tokio::test]
+async fn deliver_incoming_no_consequence_rules_skips_eval() {
+    let context_id = "h17-h16-no-rules-ctx";
+
+    let (alice_manager, alice_handle, sent, bob_manager) =
+        h17_setup_alice_and_bob(context_id, vec![]).await;
+
+    let alice_did: DID = "did:key:alice".into();
+    let alice_sk = signing_key_for_did(&alice_did);
+
+    // Send a few messages so the H16 unconditional record_message has
+    // multiple ticks to land.
+    for i in 0..3u8 {
+        alice_manager
+            .send_message(
+                &alice_handle,
+                &alice_did,
+                &[i; 4],
+                Some(&alice_sk),
+                None,
+                None,
+            )
+            .await
+            .unwrap_or_else(|e| panic!("alice send #{i} must succeed: {e:?}"));
+    }
+    let captured: Vec<Vec<u8>> = sent.lock().unwrap().clone();
+    assert_eq!(
+        captured.len(),
+        3,
+        "alice's transport must capture all 3 sends"
+    );
+    for (i, blob) in captured.iter().enumerate() {
+        bob_manager
+            .deliver_incoming(context_id, blob)
+            .await
+            .unwrap_or_else(|e| panic!("bob deliver_incoming #{i} must succeed: {e:?}"));
+    }
+
+    // Velocity tracker IS ticked unconditionally — H16's record_message
+    // runs even when consequence_rules is empty. This is the
+    // defense-in-depth guarantee: a receiver always observes the
+    // sender's velocity, even if it has no enforcement rules.
+    {
+        let contexts = bob_manager.contexts.lock().await;
+        let ctx = contexts.get(context_id).unwrap();
+        let velocity = ctx
+            .governance
+            .velocity_tracker
+            .get_velocity(&alice_did, bob_manager.clock.now_secs());
+        assert_eq!(
+            velocity, 3,
+            "H16 record_message is unconditional; Bob must still record 3 ticks for Alice"
+        );
+
+        // No suspension may have been applied — without rules there is
+        // nothing to evaluate.
+        assert!(
+            !ctx.role_state
+                .suspended_capabilities
+                .contains_key("did:key:alice"),
+            "no rules → no suspension; Alice must remain unsuspended on Bob's role_state"
+        );
+        assert!(
+            ctx.role_state
+                .member_has_capability("did:key:alice", &Capability::MessagesWrite),
+            "Alice must still hold MessagesWrite when no rules are configured"
+        );
+    }
+
+    // Receive buffer must NOT contain any consequence events.
+    let events = bob_manager.drain_events(context_id).await;
+    let consequence_events: Vec<_> = events
+        .iter()
+        .filter(|e| {
+            matches!(
+                e,
+                ContextEvent::ConsequenceTriggered { .. }
+                    | ContextEvent::ConsequenceEnforced { .. }
+            )
+        })
+        .collect();
+    assert!(
+        consequence_events.is_empty(),
+        "no rules → no consequence events; got: {consequence_events:?}"
+    );
 }
 
 // -----------------------------------------------------------------------

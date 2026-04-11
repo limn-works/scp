@@ -2210,6 +2210,549 @@ async fn tool_invoke_failure_refunds_hard_rate_limit_token() {
     );
 }
 
+// -----------------------------------------------------------------------
+// H17 Gap A: Output validation failure voids escrow + refunds budget
+// -----------------------------------------------------------------------
+//
+// Covers crates/scp-runtime/src/context/tools/invoke.rs Phase 2 →
+// rollback_tool_economy_ticket → void_tool_escrow path. The closest
+// pre-existing test (`tool_invoke_failure_refunds_hard_rate_limit_token`)
+// uses an executor failure but no payment adapter, so the escrow void
+// branch was structurally uncovered before this test landed.
+//
+// Two tests are needed to PROVE the branch:
+//   1. `tool_invoke_output_validation_failure_voids_escrow_and_refunds_budget`
+//      — failing path: authorize → void → no capture → budget refunded.
+//   2. `tool_invoke_happy_path_captures_escrow_and_deducts_budget`
+//      — happy path: authorize → capture → no void → budget deducted.
+
+/// A `PaymentAdapter` that records every authorize/capture/void/verify
+/// call into a shared `Vec<AdapterCall>` so tests can assert the exact
+/// adapter call sequence after a tool invocation.
+///
+/// Mirrors `TestAdapter` from `tests/economy_integration.rs` but exposes
+/// a recorded call log instead of failure injection.
+#[derive(Clone, Debug)]
+#[allow(dead_code)] // `payer` and `Capture::auth_id` are inspected via Debug-printed assertion failures.
+enum AdapterCall {
+    Authorize {
+        payer: DID,
+        amount: scp_protocol::economy::types::Amount,
+    },
+    Capture {
+        auth_id: [u8; 32],
+    },
+    Void {
+        auth_id: [u8; 32],
+    },
+}
+
+struct RecordingPaymentAdapter {
+    calls: Arc<std::sync::Mutex<Vec<AdapterCall>>>,
+    next_auth_id: std::sync::atomic::AtomicU8,
+}
+
+impl RecordingPaymentAdapter {
+    fn new() -> Self {
+        Self {
+            calls: Arc::new(std::sync::Mutex::new(Vec::new())),
+            next_auth_id: std::sync::atomic::AtomicU8::new(1),
+        }
+    }
+
+    fn calls_handle(&self) -> Arc<std::sync::Mutex<Vec<AdapterCall>>> {
+        Arc::clone(&self.calls)
+    }
+}
+
+impl crate::economy::adapter::PaymentAdapter for RecordingPaymentAdapter {
+    #[allow(clippy::unnecessary_literal_bound)] // matches NoOpPaymentAdapter pattern
+    fn adapter_id(&self) -> &str {
+        "recording"
+    }
+
+    fn capabilities(&self) -> crate::economy::adapter::AdapterCapabilities {
+        crate::economy::adapter::AdapterCapabilities {
+            supported_currencies: vec![scp_protocol::economy::types::CurrencyCode([85, 83, 68, 0])],
+            supports_streaming: false,
+            supports_batch_auth: false,
+            supports_single_step: false,
+            min_amount: None,
+            max_amount: None,
+            typical_settlement_ms: 0,
+            requires_facilitator: false,
+        }
+    }
+
+    async fn authorize(
+        &self,
+        payer: &DID,
+        payee: &DID,
+        amount: scp_protocol::economy::types::Amount,
+        currency: scp_protocol::economy::types::CurrencyCode,
+        _metadata: crate::economy::adapter::PaymentMetadata,
+    ) -> Result<crate::economy::adapter::PaymentAuthorization, crate::economy::adapter::PaymentError>
+    {
+        let id_byte = self
+            .next_auth_id
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let auth_id = [id_byte; 32];
+        self.calls.lock().unwrap().push(AdapterCall::Authorize {
+            payer: payer.clone(),
+            amount,
+        });
+        Ok(crate::economy::adapter::PaymentAuthorization {
+            auth_id,
+            payer: payer.clone(),
+            payee: payee.clone(),
+            amount,
+            currency,
+            adapter_id: "recording".to_owned(),
+            created_at: 1_000_000,
+            expires_at: 2_000_000,
+            adapter_state: vec![],
+        })
+    }
+
+    async fn capture(
+        &self,
+        auth: &crate::economy::adapter::PaymentAuthorization,
+    ) -> Result<crate::economy::adapter::PaymentReceipt, crate::economy::adapter::PaymentError>
+    {
+        self.calls.lock().unwrap().push(AdapterCall::Capture {
+            auth_id: auth.auth_id,
+        });
+        Ok(crate::economy::adapter::PaymentReceipt {
+            receipt_id: [0xFE; 32],
+            payer: auth.payer.clone(),
+            payee: auth.payee.clone(),
+            amount: auth.amount,
+            currency: auth.currency,
+            action_type: scp_protocol::economy::types::PaidActionType::ToolInvoke,
+            context_id: Some("h17-output-fail-ctx".to_owned()),
+            adapter_id: "recording".to_owned(),
+            adapter_proof: vec![0xAB],
+            timestamp: 1_000_001,
+            signature: vec![0xCD],
+        })
+    }
+
+    async fn void(
+        &self,
+        auth: &crate::economy::adapter::PaymentAuthorization,
+    ) -> Result<(), crate::economy::adapter::PaymentError> {
+        self.calls.lock().unwrap().push(AdapterCall::Void {
+            auth_id: auth.auth_id,
+        });
+        Ok(())
+    }
+
+    async fn verify(
+        &self,
+        _receipt: &crate::economy::adapter::PaymentReceipt,
+    ) -> Result<crate::economy::adapter::VerificationResult, crate::economy::adapter::PaymentError>
+    {
+        Ok(crate::economy::adapter::VerificationResult {
+            valid: true,
+            adapter_id: "recording".to_owned(),
+            verified_amount: scp_protocol::economy::types::Amount(0),
+            verified_currency: scp_protocol::economy::types::CurrencyCode([85, 83, 68, 0]),
+            verification_timestamp: 1_000_002,
+        })
+    }
+
+    async fn verify_authorization(
+        &self,
+        _auth: &crate::economy::adapter::PaymentAuthorization,
+    ) -> Result<(), crate::economy::adapter::PaymentError> {
+        Ok(())
+    }
+
+    async fn refund(
+        &self,
+        _receipt: &crate::economy::adapter::PaymentReceipt,
+        _amount: Option<scp_protocol::economy::types::Amount>,
+    ) -> Result<crate::economy::adapter::RefundConfirmation, crate::economy::adapter::PaymentError>
+    {
+        Ok(crate::economy::adapter::RefundConfirmation {
+            refund_id: [0xAA; 32],
+            original_receipt_id: [0xFE; 32],
+            refunded_amount: scp_protocol::economy::types::Amount(0),
+            currency: scp_protocol::economy::types::CurrencyCode([85, 83, 68, 0]),
+            adapter_proof: vec![],
+        })
+    }
+}
+
+/// Builds a `ToolRegistration` whose output schema requires an object
+/// with a numeric `result` field. An executor returning a string fails
+/// schema validation in `invoke_tool_execute_and_validate` step 6.
+fn strict_output_tool_registration(id: &str) -> ToolRegistration {
+    use scp_protocol::context::tools::registry::{TestVector, ToolSchema};
+    ToolRegistration {
+        tool_id: id.to_owned(),
+        name: id.to_owned(),
+        description: "strict-output test tool".to_owned(),
+        schema: ToolSchema {
+            input_schema: serde_json::json!({"type": "object"}),
+            output_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "result": {"type": "number"}
+                },
+                "required": ["result"]
+            }),
+        },
+        implementation_hash: [0u8; 32],
+        test_vectors: vec![TestVector {
+            input: serde_json::json!({}),
+            expected_output: serde_json::json!({"result": 42}),
+            description: "noop".to_owned(),
+        }],
+        operator_did: "did:key:test-operator".into(),
+        cost: None,
+        registered_at: 0,
+        signature: Vec::new(),
+    }
+}
+
+/// Builds an `EconomicPolicy` with a non-zero `per_tool_invoke` cost so
+/// the escrow path is exercised. Same shape as `escalation_test_policy`,
+/// but isolated to keep this test self-contained.
+fn h17_priced_tool_policy() -> scp_protocol::economy::types::EconomicPolicy {
+    use scp_protocol::economy::types::{Amount, CostSchedule, CurrencyCode, EconomicPolicy};
+    EconomicPolicy {
+        locked: false,
+        cost_schedule: CostSchedule {
+            currency: CurrencyCode([85, 83, 68, 0]),
+            per_message: None,
+            per_tool_invoke: Some(Amount::new(5)),
+            per_join: None,
+            per_period: None,
+            per_byte_stored: None,
+        },
+        payment_adapters: vec![],
+        pricing_formula: None,
+        payee: DID::from("did:key:h17-payee"),
+    }
+}
+
+/// H17 Gap A — failing path:
+///
+/// Output schema validation failure inside `invoke_tool_execute_and_validate`
+/// must drive the manager wrapper through `rollback_tool_economy_ticket`
+/// which calls `void_tool_escrow` AND restores the per-context budget.
+///
+/// Adapter call expectations:
+///   * EXACTLY ONE `Authorize` (Phase 1)
+///   * EXACTLY ONE `Void`     (Phase 2 rollback)
+///   * ZERO `Capture` calls
+///
+/// State expectations:
+///   * `budget_tracker.remaining(invoker)` is unchanged (refund == debit)
+///   * `velocity_tracker.get_velocity(invoker)` is back to its pre-invoke
+///     value (rollback erased the entry recorded in Phase 1)
+#[allow(clippy::too_many_lines)] // exhaustive adapter-call + state assertions
+#[tokio::test]
+async fn tool_invoke_output_validation_failure_voids_escrow_and_refunds_budget() {
+    use scp_protocol::context::tools::ToolId;
+    use scp_protocol::context::tools::registry::ToolRegistry;
+    use scp_protocol::economy::types::Amount;
+
+    let mut manager = ContextManager::new(
+        Box::new(MockCrypto::default()),
+        Box::new(MockTransport::connected()),
+        Box::new(MockEventLog::default()),
+        noop_key_resolver(),
+    );
+
+    // Wire the recording payment adapter so authorize/capture/void are
+    // observable. The Arc handle is cloned BEFORE the adapter is moved
+    // into the manager so the test can read the call log after invocation.
+    let adapter = RecordingPaymentAdapter::new();
+    let calls_handle = adapter.calls_handle();
+    manager.set_payment_adapter(Arc::new(adapter));
+
+    // Build a context with a paid economic policy and ToolInvokeAll in the
+    // ceiling so the creator can invoke tools.
+    let mut params = governance_params();
+    params
+        .ceiling
+        .push(scp_protocol::context::params::Capability::ToolInvokeAll);
+    params.economic_policy = Some(h17_priced_tool_policy());
+    let _handle = manager
+        .create_context(
+            "h17-output-fail-ctx".into(),
+            params,
+            "did:key:invoker".into(),
+        )
+        .await
+        .unwrap();
+
+    // Grant a generous budget so a single per_tool_invoke=5 deduction
+    // doesn't exhaust it. The post-invoke assertion compares before/after
+    // remainders to detect any net change.
+    let invoker: DID = "did:key:invoker".into();
+    {
+        let mut contexts = manager.contexts.lock().await;
+        let ctx = contexts.get_mut("h17-output-fail-ctx").unwrap();
+        ctx.governance
+            .budget_tracker
+            .grant(&invoker, Amount::new(1_000));
+    }
+
+    let mut registry = ToolRegistry::new();
+    registry.insert(strict_output_tool_registration("strict-tool"));
+
+    let ucan = dummy_spending_ucan();
+
+    // Snapshot pre-invoke state.
+    let (budget_before, velocity_before) = {
+        let contexts = manager.contexts.lock().await;
+        let ctx = contexts.get("h17-output-fail-ctx").unwrap();
+        let budget = ctx.governance.budget_tracker.remaining(&invoker).value();
+        let velocity = ctx
+            .governance
+            .velocity_tracker
+            .get_velocity(&invoker, manager.clock.now_secs());
+        (budget, velocity)
+    };
+
+    // Invoke the tool. The executor returns a JSON string ("not an object"),
+    // which fails the strict output schema → Phase 2 fails →
+    // rollback_tool_economy_ticket → void_tool_escrow.
+    let result = manager
+        .invoke_tool_with_economy(
+            "h17-output-fail-ctx",
+            &registry,
+            &ToolId::from("strict-tool"),
+            serde_json::json!({}),
+            &invoker,
+            Some(&ucan),
+            None,
+            |_input| async { Ok(serde_json::json!("not an object")) },
+        )
+        .await;
+
+    // The manager wraps the OutputValidationFailed inner error as a
+    // PermissionDenied(SCP-TOOL-6084: ...) ContextError.
+    let err = result.expect_err("output validation failure must propagate");
+    let err_msg = err.to_string();
+    assert!(
+        err_msg.contains("SCP-TOOL-6084") && err_msg.contains("output schema validation failed"),
+        "expected SCP-TOOL-6084 output schema failure, got: {err_msg}"
+    );
+
+    // Adapter call sequence assertions: authorize → void, no capture.
+    let calls = calls_handle.lock().unwrap().clone();
+    let authorize_count = calls
+        .iter()
+        .filter(|c| matches!(c, AdapterCall::Authorize { .. }))
+        .count();
+    let void_count = calls
+        .iter()
+        .filter(|c| matches!(c, AdapterCall::Void { .. }))
+        .count();
+    let capture_count = calls
+        .iter()
+        .filter(|c| matches!(c, AdapterCall::Capture { .. }))
+        .count();
+    assert_eq!(
+        authorize_count, 1,
+        "exactly one authorize call expected (Phase 1), got {authorize_count}: {calls:?}"
+    );
+    assert_eq!(
+        void_count, 1,
+        "exactly one void call expected (Phase 2 rollback), got {void_count}: {calls:?}"
+    );
+    assert_eq!(
+        capture_count, 0,
+        "capture must NOT be called when output validation fails, got {capture_count}: {calls:?}"
+    );
+
+    // The authorize and void must reference the same escrow handle.
+    // The recording adapter assigns auth_ids monotonically starting at
+    // [1u8; 32], so the first authorize on a fresh adapter produces
+    // [1u8; 32] and the matching void must carry the same id.
+    let mut void_id: Option<[u8; 32]> = None;
+    let mut authorize_amount: Option<scp_protocol::economy::types::Amount> = None;
+    for call in &calls {
+        match call {
+            AdapterCall::Authorize { amount, .. } => {
+                authorize_amount = Some(*amount);
+            }
+            AdapterCall::Void { auth_id } => {
+                void_id = Some(*auth_id);
+            }
+            AdapterCall::Capture { .. } => {}
+        }
+    }
+    // Authorize amount must equal the policy's per_tool_invoke cost (5).
+    assert_eq!(
+        authorize_amount.map(scp_protocol::economy::Amount::value),
+        Some(5),
+        "authorize amount should equal per_tool_invoke=5, got: {authorize_amount:?}"
+    );
+    assert_eq!(
+        void_id,
+        Some([1u8; 32]),
+        "void must reference the first-issued auth_id ([1u8; 32]), got: {void_id:?}"
+    );
+
+    // Post-invoke state: budget refunded (==before) and velocity rolled back.
+    let (budget_after, velocity_after) = {
+        let contexts = manager.contexts.lock().await;
+        let ctx = contexts.get("h17-output-fail-ctx").unwrap();
+        let budget = ctx.governance.budget_tracker.remaining(&invoker).value();
+        let velocity = ctx
+            .governance
+            .velocity_tracker
+            .get_velocity(&invoker, manager.clock.now_secs());
+        (budget, velocity)
+    };
+    assert_eq!(
+        budget_before, budget_after,
+        "budget must be refunded on output validation failure: before={budget_before}, after={budget_after}"
+    );
+    assert_eq!(
+        velocity_before, velocity_after,
+        "velocity entry must be rolled back: before={velocity_before}, after={velocity_after}"
+    );
+
+    // The wrapper returns the `ToolInvokedEvent` only via the
+    // `ManagedToolInvocationOutput` success branch (not as a
+    // `ContextEvent` variant), so a failed invocation cannot leak a
+    // success event into the receive buffer. We do, however, drain the
+    // receive buffer to confirm no MessageReceived/MessageSent or other
+    // event was wrongly synthesized as a side-effect of the rolled-back
+    // invocation.
+    let events = manager.drain_events("h17-output-fail-ctx").await;
+    assert!(
+        events.is_empty(),
+        "receive buffer should be empty after a rolled-back tool invocation, got: {events:?}"
+    );
+}
+
+/// H17 Gap A — happy-path regression: with a valid output the same
+/// pipeline must run authorize → capture (no void) and the budget must
+/// actually decrement. Pairing this against
+/// `tool_invoke_output_validation_failure_voids_escrow_and_refunds_budget`
+/// proves the void/capture branch is wired both ways.
+#[tokio::test]
+async fn tool_invoke_happy_path_captures_escrow_and_deducts_budget() {
+    use scp_protocol::context::tools::ToolId;
+    use scp_protocol::context::tools::registry::ToolRegistry;
+    use scp_protocol::economy::types::Amount;
+
+    let mut manager = ContextManager::new(
+        Box::new(MockCrypto::default()),
+        Box::new(MockTransport::connected()),
+        Box::new(MockEventLog::default()),
+        noop_key_resolver(),
+    );
+
+    let adapter = RecordingPaymentAdapter::new();
+    let calls_handle = adapter.calls_handle();
+    manager.set_payment_adapter(Arc::new(adapter));
+
+    let mut params = governance_params();
+    params
+        .ceiling
+        .push(scp_protocol::context::params::Capability::ToolInvokeAll);
+    params.economic_policy = Some(h17_priced_tool_policy());
+    let _handle = manager
+        .create_context("h17-happy-ctx".into(), params, "did:key:invoker".into())
+        .await
+        .unwrap();
+
+    let invoker: DID = "did:key:invoker".into();
+    {
+        let mut contexts = manager.contexts.lock().await;
+        let ctx = contexts.get_mut("h17-happy-ctx").unwrap();
+        ctx.governance
+            .budget_tracker
+            .grant(&invoker, Amount::new(1_000));
+    }
+
+    let mut registry = ToolRegistry::new();
+    registry.insert(strict_output_tool_registration("strict-tool"));
+
+    let ucan = dummy_spending_ucan();
+
+    let budget_before = {
+        let contexts = manager.contexts.lock().await;
+        contexts
+            .get("h17-happy-ctx")
+            .unwrap()
+            .governance
+            .budget_tracker
+            .remaining(&invoker)
+            .value()
+    };
+
+    // Executor returns a valid {result: 42} object — output schema passes.
+    let result = manager
+        .invoke_tool_with_economy(
+            "h17-happy-ctx",
+            &registry,
+            &ToolId::from("strict-tool"),
+            serde_json::json!({}),
+            &invoker,
+            Some(&ucan),
+            None,
+            |_input| async { Ok(serde_json::json!({"result": 42})) },
+        )
+        .await;
+    assert!(
+        result.is_ok(),
+        "happy-path tool invocation must succeed: {result:?}"
+    );
+
+    // Adapter call sequence: authorize → capture, no void.
+    let calls = calls_handle.lock().unwrap().clone();
+    let authorize_count = calls
+        .iter()
+        .filter(|c| matches!(c, AdapterCall::Authorize { .. }))
+        .count();
+    let void_count = calls
+        .iter()
+        .filter(|c| matches!(c, AdapterCall::Void { .. }))
+        .count();
+    let capture_count = calls
+        .iter()
+        .filter(|c| matches!(c, AdapterCall::Capture { .. }))
+        .count();
+    assert_eq!(
+        authorize_count, 1,
+        "exactly one authorize call expected, got {authorize_count}: {calls:?}"
+    );
+    assert_eq!(
+        capture_count, 1,
+        "exactly one capture call expected on success, got {capture_count}: {calls:?}"
+    );
+    assert_eq!(
+        void_count, 0,
+        "void must NOT be called on success, got {void_count}: {calls:?}"
+    );
+
+    // Budget actually deducted by the per_tool_invoke=5 cost.
+    let budget_after = {
+        let contexts = manager.contexts.lock().await;
+        contexts
+            .get("h17-happy-ctx")
+            .unwrap()
+            .governance
+            .budget_tracker
+            .remaining(&invoker)
+            .value()
+    };
+    assert_eq!(
+        budget_before - budget_after,
+        5,
+        "happy-path must deduct exactly per_tool_invoke=5, before={budget_before}, after={budget_after}"
+    );
+}
+
 /// Test D: `join_context` ticks the velocity tracker for the joiner
 /// so that a second join attempt would see non-zero velocity. The join
 /// counts toward per-DID anti-spam tracking the same way message sends do.
