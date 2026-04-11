@@ -161,7 +161,12 @@ private class TestNativeBindings : NativeBindings {
     override fun identityCreate(custody: String): Long = 0L
     override fun identityLoad(did: String): Long = 0L
     override fun identityResolve(did: String): String = ""
-    override fun contextCreate(identityHandle: Long, paramsJson: String): Long = 0L
+    override fun contextCreate(
+        identityHandle: Long,
+        paramsJson: String,
+        consequenceRulesJson: String?,
+        consequenceConfigJson: String?,
+    ): Long = 0L
     override fun contextJoin(
         contextHandle: Long,
         identityHandle: Long,

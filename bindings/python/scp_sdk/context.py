@@ -592,6 +592,7 @@ class Context:
         template_id: str | None = None,
         economic_policy: str | None = None,
         consequence_rules: list | None = None,
+        consequence_config: dict | None = None,
     ) -> Context:
         """Create a new SCP context.
 
@@ -629,6 +630,11 @@ class Context:
             consequence_rules: Optional list of consequence rule
                 dictionaries (spec section 9.3, issue #1531).
                 ``None`` means no consequence rules.
+            consequence_config: Optional consequence config mapping
+                governing which enforcement severities the rules may
+                reference (ADR-017, issue #1531). ``None`` falls back to
+                the protocol default
+                (``allow_automatic_access_revocation = false``).
 
         Returns:
             A new :class:`Context` in the ``'active'`` state.
@@ -671,6 +677,9 @@ class Context:
             "economic_policy": economic_policy,
             "consequence_rules": json.dumps(consequence_rules)
             if consequence_rules is not None
+            else None,
+            "consequence_config": json.dumps(consequence_config)
+            if consequence_config is not None
             else None,
         }
 

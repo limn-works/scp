@@ -501,6 +501,57 @@ pub async fn context_create(
         })
         .transpose()?;
 
+    // Parse consequence_rules from params (ADR-017, #1531). Accepts either a
+    // JSON array (preferred) or a JSON-encoded string for legacy callers.
+    // Mirrors the WASM bridge pattern in crates/scp-ffi/wasm/src/manager.rs.
+    let core_consequence_rules: Vec<scp_core::trust::ConsequenceRule> = match &params["consequenceRules"]
+    {
+        serde_json::Value::Null => Vec::new(),
+        serde_json::Value::String(s) => serde_json::from_str(s).map_err(|e| {
+            NapiError::from(ScpNapiError::Validation {
+                message: format!("invalid consequenceRules JSON string: {e}"),
+                code: "SCP-VALID-7000".to_owned(),
+            })
+        })?,
+        other => serde_json::from_value(other.clone()).map_err(|e| {
+            NapiError::from(ScpNapiError::Validation {
+                message: format!("invalid consequenceRules: {e}"),
+                code: "SCP-VALID-7000".to_owned(),
+            })
+        })?,
+    };
+
+    // Parse consequence_config from params (ADR-017, #1531). Accepts a JSON
+    // object (preferred) or a JSON-encoded string for legacy callers.
+    let core_consequence_config: scp_core::context::params::ConsequenceConfig = match &params["consequenceConfig"]
+    {
+        serde_json::Value::Null => scp_core::context::params::ConsequenceConfig::default(),
+        serde_json::Value::String(s) => serde_json::from_str(s).map_err(|e| {
+            NapiError::from(ScpNapiError::Validation {
+                message: format!("invalid consequenceConfig JSON string: {e}"),
+                code: "SCP-VALID-7000".to_owned(),
+            })
+        })?,
+        other => serde_json::from_value(other.clone()).map_err(|e| {
+            NapiError::from(ScpNapiError::Validation {
+                message: format!("invalid consequenceConfig: {e}"),
+                code: "SCP-VALID-7000".to_owned(),
+            })
+        })?,
+    };
+
+    // Validate each consequence rule against the per-context config so the
+    // bridge fails closed at creation time rather than deferring to runtime.
+    for rule in &core_consequence_rules {
+        rule.validate_against_config(&core_consequence_config)
+            .map_err(|e| {
+                NapiError::from(ScpNapiError::Validation {
+                    message: format!("consequence rule validation failed: {e}"),
+                    code: "SCP-VALID-7000".to_owned(),
+                })
+            })?;
+    }
+
     let context_params = ContextParams {
         mode,
         ceiling: core_ceiling,
@@ -514,6 +565,8 @@ pub async fn context_create(
         max_nesting_depth,
         session_cap,
         economic_policy: core_economic_policy,
+        consequence_rules: core_consequence_rules,
+        consequence_config: core_consequence_config,
         ..ContextParams::default()
     };
 
@@ -563,14 +616,22 @@ pub async fn context_create(
 /// Joins an existing SCP context.
 ///
 /// Delegates to `ContextManager::join_context` for MLS group membership
-/// establishment.
+/// establishment. The optional `spending_ucan_jwt` is parsed (header, payload,
+/// signature) and forwarded to the manager for AND-composition with any
+/// per-join cost defined by the context's economic policy (spec §19, ADR-033,
+/// `PyO3` reference parity).
 ///
 /// # Errors
 ///
-/// Rejects with `SCP-CTX-2013` if the context is not in `"active"` state.
+/// Rejects with `SCP-CTX-2013` if the context is not in `"active"` state, or
+/// with `SCP-ECON-12061` if `spending_ucan_jwt` is not a valid UCAN JWT.
 #[napi]
 #[allow(clippy::needless_pass_by_value)] // napi-rs requires owned String
-pub async fn context_join(handle: &NapiContextHandle, identity_did: String) -> napi::Result<()> {
+pub async fn context_join(
+    handle: &NapiContextHandle,
+    identity_did: String,
+    spending_ucan_jwt: Option<String>,
+) -> napi::Result<()> {
     validate_did(&identity_did).map_err(|e| napi::Error::from(ScpNapiError::from(e)))?;
 
     let state_str = handle.current_state_str().map_err(NapiError::from)?;
@@ -581,6 +642,21 @@ pub async fn context_join(handle: &NapiContextHandle, identity_did: String) -> n
         }
         .into());
     }
+
+    // Parse the optional spending UCAN JWT once at the bridge boundary so
+    // malformed tokens are rejected before any expensive crypto work. Mirrors
+    // the PyO3 bridge's parse-and-thread pattern at scp-ffi/src/context.rs.
+    let spending_ucan = spending_ucan_jwt
+        .as_deref()
+        .map(|jwt| {
+            scp_core::crypto::ucan::validate::parse_ucan(jwt).map_err(|e| {
+                NapiError::from(ScpNapiError::Context {
+                    message: format!("invalid spending UCAN: {e}"),
+                    code: "SCP-ECON-12061".to_owned(),
+                })
+            })
+        })
+        .transpose()?;
 
     // Ensure the ContextManager is initialized — context_join is a valid
     // first operation (e.g. a device joining a context without creating one).
@@ -603,7 +679,7 @@ pub async fn context_join(handle: &NapiContextHandle, identity_did: String) -> n
 
     let manager = context_manager()?;
     manager
-        .join_context(core_handle, key_package, None)
+        .join_context(core_handle, key_package, spending_ucan.as_ref())
         .await
         .map_err(|e| NapiError::from(ScpNapiError::from(e)))?;
 
@@ -3800,5 +3876,178 @@ mod tests {
 
         assert!(result.is_ok(), "None spending should be accepted");
         assert_eq!(result.unwrap().decision, "prompt_agent");
+    }
+
+    // -------------------------------------------------------------------
+    // C5: context_create consequence_rules / consequence_config + parity
+    // tests for context_join spending_ucan_jwt threading.
+    // -------------------------------------------------------------------
+
+    /// Verifies that `context_create` parses both `consequenceRules` and
+    /// `consequenceConfig` from `params_json` and surfaces a created context
+    /// whose stored `ContextParams` reflect both fields.
+    #[cfg(feature = "allow_in_memory_custody")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn context_create_threads_consequence_rules_and_config() {
+        crate::runtime::init_context_manager_for_test();
+
+        let identity = crate::identity::identity_create("in_memory".to_owned())
+            .await
+            .expect("identity_create should succeed");
+
+        let params_json = serde_json::json!({
+            "ceiling": ["messages:read", "messages:write"],
+            "ceilingPolicy": "immutable",
+            "memoryScope": "ephemeral",
+            "governance": "single_admin",
+            "consequenceConfig": { "allow_automatic_access_revocation": true },
+            "consequenceRules": [
+                {
+                    "trigger": "MessageVelocity",
+                    "action": { "Enforcement": { "RevokeAccess": {
+                        "did": "did:dht:z6MkSubject",
+                        "access": "Both"
+                    } } },
+                    "threshold": 5,
+                    "window": { "secs": 3600, "nanos": 0 }
+                }
+            ]
+        })
+        .to_string();
+
+        let handle = super::context_create(&identity, params_json)
+            .await
+            .expect("context_create should succeed");
+
+        let manager = context_manager().expect("manager should be initialized");
+        let stored = manager
+            .context_params(&handle.context_id)
+            .await
+            .expect("stored params should be retrievable");
+
+        assert_eq!(
+            stored.consequence_rules.len(),
+            1,
+            "consequence_rules should be threaded into stored ContextParams"
+        );
+        assert!(
+            stored.consequence_config.allow_automatic_access_revocation,
+            "consequence_config.allow_automatic_access_revocation should round-trip true"
+        );
+    }
+
+    /// Verifies that `context_create` rejects a `RevokeAccess` consequence
+    /// rule when `consequenceConfig.allow_automatic_access_revocation` is
+    /// `false` (the default), proving the bridge fails closed at create
+    /// time rather than deferring to runtime evaluation.
+    #[cfg(feature = "allow_in_memory_custody")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn context_create_rejects_revoke_access_when_config_disallows() {
+        crate::runtime::init_context_manager_for_test();
+
+        let identity = crate::identity::identity_create("in_memory".to_owned())
+            .await
+            .expect("identity_create should succeed");
+
+        let params_json = serde_json::json!({
+            "ceiling": ["messages:read"],
+            "memoryScope": "ephemeral",
+            "governance": "single_admin",
+            // consequenceConfig omitted -> default (false) -> RevokeAccess illegal.
+            "consequenceRules": [
+                {
+                    "trigger": "MessageVelocity",
+                    "action": { "Enforcement": { "RevokeAccess": {
+                        "did": "did:dht:z6MkSubject",
+                        "access": "Both"
+                    } } },
+                    "threshold": 5,
+                    "window": { "secs": 60, "nanos": 0 }
+                }
+            ]
+        })
+        .to_string();
+
+        let result = super::context_create(&identity, params_json).await;
+        assert!(
+            result.is_err(),
+            "RevokeAccess rule must be rejected when config.allow_automatic_access_revocation is false"
+        );
+    }
+
+    /// Verifies that `context_join` parses `spending_ucan_jwt` and rejects
+    /// malformed tokens at the bridge boundary with the SCP-ECON-12061 code.
+    #[cfg(feature = "allow_in_memory_custody")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn context_join_rejects_malformed_spending_ucan_jwt() {
+        crate::runtime::init_context_manager_for_test();
+
+        let identity = crate::identity::identity_create("in_memory".to_owned())
+            .await
+            .expect("identity_create should succeed");
+
+        let params_json = serde_json::json!({
+            "ceiling": ["messages:read"],
+            "memoryScope": "ephemeral",
+            "governance": "single_admin",
+        })
+        .to_string();
+        let handle = super::context_create(&identity, params_json)
+            .await
+            .expect("context_create should succeed");
+
+        let result = super::context_join(
+            &handle,
+            identity.inner.did.clone(),
+            Some("not.a.jwt".to_owned()),
+        )
+        .await;
+        assert!(
+            result.is_err(),
+            "malformed spending UCAN JWT should be rejected"
+        );
+        let err = result.unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("SCP-ECON-12061") || msg.contains("invalid spending UCAN"),
+            "error should mention SCP-ECON-12061 or invalid spending UCAN, got: {msg}"
+        );
+    }
+
+    /// Verifies that `context_join` accepts `None` `spending_ucan_jwt` and
+    /// reaches the manager (the historical default behaviour stays intact).
+    #[cfg(feature = "allow_in_memory_custody")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn context_join_accepts_none_spending_ucan_jwt() {
+        crate::runtime::init_context_manager_for_test();
+
+        let identity = crate::identity::identity_create("in_memory".to_owned())
+            .await
+            .expect("identity_create should succeed");
+
+        let params_json = serde_json::json!({
+            "ceiling": ["messages:read"],
+            "memoryScope": "ephemeral",
+            "governance": "single_admin",
+        })
+        .to_string();
+        let handle = super::context_create(&identity, params_json)
+            .await
+            .expect("context_create should succeed");
+
+        // Same identity rejoining is fine for the smoke check — the
+        // important assertion is that the bridge reaches the manager
+        // instead of erroring on parameter handling.
+        let result = super::context_join(&handle, identity.inner.did.clone(), None).await;
+        // Manager may or may not error depending on duplicate-member rules.
+        // We only verify the bridge accepted the call shape (no
+        // SCP-ECON-12061 / SCP-VALID parsing failure).
+        if let Err(e) = &result {
+            let msg = e.to_string();
+            assert!(
+                !msg.contains("SCP-ECON-12061") && !msg.contains("invalid spending UCAN"),
+                "None spending_ucan_jwt must not trigger UCAN parse errors, got: {msg}"
+            );
+        }
     }
 }

@@ -139,7 +139,9 @@ struct ContextTests {
             maxChainDepth: nil,
             maxNestingDepth: nil,
             sessionCap: nil,
-            economicPolicy: nil
+            economicPolicy: nil,
+            consequenceRulesJson: nil,
+            consequenceConfigJson: nil
         )
 
         let context = try await Context.create(
@@ -193,7 +195,9 @@ struct ContextTests {
             maxChainDepth: nil,
             maxNestingDepth: nil,
             sessionCap: nil,
-            economicPolicy: nil
+            economicPolicy: nil,
+            consequenceRulesJson: nil,
+            consequenceConfigJson: nil
         )
 
         await #expect(throws: ScpError.self) {
@@ -909,5 +913,85 @@ struct ContextTests {
         let payload = "consequence_enforced: member=did:dht:z6MkAlice action=restrict_write success=true context=ctx-456"
         #expect(payload.contains("consequence_enforced:"))
         #expect(payload.contains("success=true"))
+    }
+
+    // MARK: - C5: typed consequenceConfig + Context.join instance method
+
+    @Test("Context.create forwards consequenceRulesJson and consequenceConfigJson to the bridge")
+    func createForwardsConsequenceRulesAndConfig() async throws {
+        let capturedParams = Locked<ContextParams?>(nil)
+        let createFn: ContextBridge.CreateFn = { _, params in
+            capturedParams.withLock { $0 = params }
+            return ContextHandle(noPointer: .init())
+        }
+        let noOpSend: ContextBridge.SendFn = { _, _, _, _ in }
+        let noOpSubscribe: ContextBridge.SubscribeFn = { _, _ in }
+        let noOpLeave: ContextBridge.LeaveFn = { _, _ in }
+        let noOpClose: ContextBridge.CloseFn = { _, _ in }
+
+        let identity = Identity(noPointer: .init())
+        let rulesJson = """
+        [{"trigger":"MessageVelocity","action":{"Enforcement":{"RevokeAccess":{"did":"did:dht:z6MkSubject","access":"Both"}}},"threshold":5,"window":{"secs":3600,"nanos":0}}]
+        """
+        let configJson = #"{"allow_automatic_access_revocation":true}"#
+        let params = ContextParams(
+            mode: .encrypted,
+            ceiling: ["messages:read"],
+            ceilingPolicy: .immutable,
+            governance: .singleAdmin,
+            memoryScope: .ephemeral,
+            ttlSeconds: 3600,
+            promotable: false,
+            minProtocolVersion: 0,
+            maxChainDepth: nil,
+            maxNestingDepth: nil,
+            sessionCap: nil,
+            economicPolicy: nil,
+            consequenceRulesJson: rulesJson,
+            consequenceConfigJson: configJson
+        )
+
+        _ = try await Context.create(
+            identity: identity,
+            params: params,
+            createFn: createFn,
+            sendFn: noOpSend,
+            subscribeFn: noOpSubscribe,
+            leaveFn: noOpLeave,
+            closeFn: noOpClose,
+            contextId: "ctx-c5-rules-config",
+            creatorDid: "did:dht:z6MkTestCreator",
+            initialState: .active
+        )
+
+        let forwarded = capturedParams.current
+        #expect(forwarded?.consequenceRulesJson == rulesJson)
+        #expect(forwarded?.consequenceConfigJson == configJson)
+    }
+
+    @Test("Context.join instance method forwards spendingUcanJwt to the bridge")
+    func joinInstanceForwardsSpendingUcan() async throws {
+        let capturedJwt = Locked<String?>(nil)
+        let context = makeTestContext()
+        let joiner = Identity(noPointer: .init())
+
+        let joinFn: ContextBridge.JoinFn = { _, _, jwt in
+            capturedJwt.withLock { $0 = jwt }
+        }
+
+        try await context.join(joiner, spendingUcanJwt: "synthetic.spending.jwt", joinFn: joinFn)
+        #expect(capturedJwt.current == "synthetic.spending.jwt")
+    }
+
+    @Test("Context.join instance method throws when context is not active")
+    func joinInstanceThrowsOnInactive() async throws {
+        let context = makeTestContext(initialState: .closed)
+        let joiner = Identity(noPointer: .init())
+
+        let joinFn: ContextBridge.JoinFn = { _, _, _ in }
+
+        await #expect(throws: ScpError.self) {
+            try await context.join(joiner, joinFn: joinFn)
+        }
     }
 } // end ContextTests

@@ -283,6 +283,43 @@ class TestContextCreate:
         params = mock_bridge.py_context_create.call_args[0][1]
         assert params["economic_policy"] == ep_json
 
+    async def test_create_passes_consequence_config(self) -> None:
+        """C5: Context.create must serialize consequence_config to JSON
+        and forward it to the bridge so the per-context opt-in for
+        RevokeAccess flows through to the manager (ADR-017, #1531)."""
+        import json as _json
+
+        mock_bridge = MagicMock()
+        mock_bridge.py_context_create.return_value = _MockHandle()
+
+        config = {"allow_automatic_access_revocation": True}
+        with patch.dict("sys.modules", {"_scp_core": mock_bridge}):
+            await Context.create(
+                creator=_MockIdentity(),
+                ceiling=["messages:read"],
+                consequence_config=config,
+            )
+
+        params = mock_bridge.py_context_create.call_args[0][1]
+        assert params["consequence_config"] == _json.dumps(config), (
+            "consequence_config must be JSON-serialized and forwarded to the bridge"
+        )
+
+    async def test_create_consequence_config_none_default(self) -> None:
+        """C5: when consequence_config is None, the bridge param must
+        also be None so the bridge falls back to the protocol default."""
+        mock_bridge = MagicMock()
+        mock_bridge.py_context_create.return_value = _MockHandle()
+
+        with patch.dict("sys.modules", {"_scp_core": mock_bridge}):
+            await Context.create(
+                creator=_MockIdentity(),
+                ceiling=["messages:read"],
+            )
+
+        params = mock_bridge.py_context_create.call_args[0][1]
+        assert params["consequence_config"] is None
+
     async def test_create_default_new_fields(self) -> None:
         mock_bridge = MagicMock()
         mock_bridge.py_context_create.return_value = _MockHandle()

@@ -885,6 +885,19 @@ pub struct ContextParams {
     /// Optional economic policy as a JSON string (spec §19, ADR-033).
     /// `None` means no economic policy (free context).
     pub economic_policy: Option<String>,
+    /// Optional consequence rules as a JSON-encoded array (ADR-017, #1531).
+    /// `None` means no consequence rules.
+    ///
+    /// Stored as a JSON string rather than a typed Record to avoid extending
+    /// the UDL surface with the full `ConsequenceRule` type tree (mirrors the
+    /// `aggregate_trust_input` JSON-string pattern). The string is parsed
+    /// inside `bridge_params_to_core` and validated against
+    /// `consequence_config_json` before the manager is called.
+    pub consequence_rules_json: Option<String>,
+    /// Optional consequence config as a JSON-encoded object (ADR-017, #1531).
+    /// `None` means the default config (severe enforcement tiers gated to
+    /// governance only).
+    pub consequence_config_json: Option<String>,
 }
 
 /// A message received from an SCP context.
@@ -2874,15 +2887,21 @@ pub async fn context_create(
 ///
 /// * `handle` — The context to join.
 /// * `identity` — The identity joining the context.
+/// * `spending_ucan_jwt` — Optional encoded UCAN JWT authorising the join
+///   cost. Forwarded to the manager for AND-composition with the context's
+///   per-join economic policy (spec §19, ADR-033).
 ///
 /// # Errors
 ///
 /// Returns `ScpError::Context` if the context is not in active state or
-/// if the join operation fails (key package, MLS add, event log).
+/// if the join operation fails (key package, MLS add, event log). Returns
+/// `ScpError::Context` with code `SCP-ECON-12061` if `spending_ucan_jwt` is
+/// not a valid UCAN JWT.
 #[uniffi::export]
 pub async fn context_join(
     handle: Arc<ContextHandle>,
     identity: Arc<Identity>,
+    spending_ucan_jwt: Option<String>,
 ) -> Result<(), ScpError> {
     runtime()
         .spawn(async move {
@@ -2900,6 +2919,21 @@ pub async fn context_join(
                 });
             }
             drop(state);
+
+            // Parse the optional spending UCAN JWT once at the bridge boundary
+            // so malformed tokens are rejected before the manager is touched.
+            // Mirrors PyO3 (`scp-ffi/src/context.rs`) and NAPI parity.
+            let spending_ucan = spending_ucan_jwt
+                .as_deref()
+                .map(|jwt| {
+                    scp_core::crypto::ucan::validate::parse_ucan(jwt).map_err(|e| {
+                        ScpError::Context {
+                            msg: format!("invalid spending UCAN: {e}"),
+                            code: "SCP-ECON-12061".to_owned(),
+                        }
+                    })
+                })
+                .transpose()?;
 
             // Ensure the ContextManager is initialized — context_join is a valid
             // first operation (e.g. a device joining a context without creating
@@ -2928,7 +2962,7 @@ pub async fn context_join(
             };
 
             manager
-                .join_context(&core_handle, key_package, None)
+                .join_context(&core_handle, key_package, spending_ucan.as_ref())
                 .await
                 .map_err(ScpError::from)?;
 
@@ -8866,6 +8900,44 @@ fn bridge_params_to_core(
         })
         .transpose()?;
 
+    // Parse consequence_rules_json (ADR-017, #1531) into the typed core
+    // representation. Empty when omitted.
+    let consequence_rules: Vec<scp_core::trust::ConsequenceRule> = params
+        .consequence_rules_json
+        .as_deref()
+        .map(|cr_json| {
+            serde_json::from_str(cr_json).map_err(|e| ScpError::Validation {
+                msg: format!("invalid consequence_rules JSON: {e}"),
+                code: "SCP-VALID-7000".to_owned(),
+            })
+        })
+        .transpose()?
+        .unwrap_or_default();
+
+    // Parse consequence_config_json (ADR-017, #1531) into the typed core
+    // representation. Default config when omitted.
+    let consequence_config: scp_core::context::params::ConsequenceConfig = params
+        .consequence_config_json
+        .as_deref()
+        .map(|cc_json| {
+            serde_json::from_str(cc_json).map_err(|e| ScpError::Validation {
+                msg: format!("invalid consequence_config JSON: {e}"),
+                code: "SCP-VALID-7000".to_owned(),
+            })
+        })
+        .transpose()?
+        .unwrap_or_default();
+
+    // Validate each consequence rule against the per-context config so the
+    // bridge fails closed at creation time rather than deferring to runtime.
+    for rule in &consequence_rules {
+        rule.validate_against_config(&consequence_config)
+            .map_err(|e| ScpError::Validation {
+                msg: format!("consequence rule validation failed: {e}"),
+                code: "SCP-VALID-7000".to_owned(),
+            })?;
+    }
+
     Ok(scp_core::context::ContextParams {
         mode,
         ceiling,
@@ -8879,6 +8951,8 @@ fn bridge_params_to_core(
         max_nesting_depth: params.max_nesting_depth,
         session_cap: params.session_cap,
         economic_policy,
+        consequence_rules,
+        consequence_config,
         ..scp_core::context::ContextParams::default()
     })
 }

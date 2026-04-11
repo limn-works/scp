@@ -47,6 +47,15 @@ export interface ContextParams {
   readonly sessionCap?: number;
   /** Consequence rules for automated governance enforcement (§9.3, #1531). */
   readonly consequenceRules?: readonly Record<string, unknown>[];
+  /**
+   * Per-context consequence config governing which enforcement severities
+   * the rules may reference (ADR-017, #1531).
+   *
+   * When omitted, the protocol default applies
+   * (`allow_automatic_access_revocation = false`). Must opt in explicitly to
+   * permit `RevokeAccess` rules.
+   */
+  readonly consequenceConfig?: Readonly<Record<string, unknown>>;
 }
 
 // ---------------------------------------------------------------------------

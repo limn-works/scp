@@ -110,6 +110,8 @@ class ConformanceStubBindings : NativeBindings {
     override fun contextCreate(
         identityHandle: Long,
         paramsJson: String,
+        consequenceRulesJson: String?,
+        consequenceConfigJson: String?,
     ): Long {
         contextCreateError?.let { throw it }
         return contextCreateResult
