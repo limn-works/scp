@@ -2532,3 +2532,152 @@ async fn restored_velocity_tracker_uses_60_second_window() {
         "fresh-context velocity tracker must use spec §19.4 60s window, got: {window}"
     );
 }
+
+// -----------------------------------------------------------------------
+// M3: deliver_message_and_drain_buffered skips velocity for local senders
+// -----------------------------------------------------------------------
+
+/// Helper: construct a minimal `InnerEnvelope` for unit tests.
+/// The produced envelope will fail signature verification (zero signature)
+/// but is sufficient for tests that only check velocity tracking.
+fn minimal_inner_envelope(
+    context_id: &str,
+    sender_did: &str,
+    seq: u64,
+) -> scp_protocol::envelope::inner::InnerEnvelope {
+    use scp_protocol::envelope::inner::{InnerEnvelope, MessageType};
+    use std::collections::HashMap;
+    InnerEnvelope {
+        version: scp_protocol::envelope::inner::SCP_INNER_ENVELOPE_VERSION,
+        context_id: context_id.to_owned(),
+        sender_did: sender_did.to_owned(),
+        epoch: 0,
+        generation: 0,
+        sequence: seq,
+        timestamp: 0,
+        message_type: MessageType::Content,
+        payload_hash: [0u8; 32],
+        payload: vec![],
+        provenance: None,
+        provenance_hash: [0u8; 32],
+        signing_key_id: scp_primitives::SigningKeyId::Active,
+        signature: [0u8; 64],
+        extensions: HashMap::new(),
+    }
+}
+
+/// Verifies that `deliver_message_and_drain_buffered` does NOT double-count
+/// velocity when `skip_velocity = true` (i.e. sender is locally controlled).
+///
+/// On a single-node setup, the send path already records velocity. Calling it
+/// again in the receive path would double-count and inflate consequence counters.
+/// The fix passes `skip_velocity = true` when `sender_did == local_member_did`.
+///
+/// We test this by calling the internal method directly (it is `pub(super)`)
+/// and verifying that velocity remains 0 when the flag is set.
+#[tokio::test]
+async fn deliver_message_skips_velocity_for_local_sender() {
+    let manager = ContextManager::new(
+        Box::new(MockCrypto::default()),
+        Box::new(MockTransport::connected()),
+        Box::new(MockEventLog::default()),
+        noop_key_resolver(),
+    );
+
+    manager
+        .register_local_did("did:key:local-sender".into())
+        .await;
+
+    let params = governance_params();
+    manager
+        .create_context("vel-skip-ctx".into(), params, "did:key:local-sender".into())
+        .await
+        .unwrap();
+
+    // Confirm velocity starts at 0.
+    let before = {
+        let contexts = manager.contexts.lock().await;
+        contexts
+            .get("vel-skip-ctx")
+            .unwrap()
+            .governance
+            .velocity_tracker
+            .get_velocity(&"did:key:local-sender".into(), manager.clock.now_secs())
+    };
+    assert_eq!(before, 0, "initial velocity should be 0");
+
+    let context_id_bytes = scp_protocol::context::context_id_bytes("vel-skip-ctx");
+
+    // The creator is already a member (added by create_context), so we
+    // only need to ensure the capability check passes. The creator's role_state
+    // already grants MessagesWrite to the admin role.
+
+    let inner = minimal_inner_envelope("vel-skip-ctx", "did:key:local-sender", 1);
+
+    // Deliver with skip_velocity = true (simulates local sender on same node).
+    // The call may fail (e.g. sequence tracker state), but velocity must stay 0.
+    let _ = manager
+        .deliver_message_and_drain_buffered(
+            "vel-skip-ctx",
+            &context_id_bytes,
+            "did:key:local-sender",
+            &inner,
+            b"payload",
+            true, // skip_velocity = local sender
+        )
+        .await;
+
+    let after_skip = {
+        let contexts = manager.contexts.lock().await;
+        contexts
+            .get("vel-skip-ctx")
+            .unwrap()
+            .governance
+            .velocity_tracker
+            .get_velocity(&"did:key:local-sender".into(), manager.clock.now_secs())
+    };
+    assert_eq!(
+        after_skip, 0,
+        "velocity must not be incremented when skip_velocity = true (local sender), got {after_skip}"
+    );
+
+    // Also verify with skip_velocity = false to confirm tracking works when enabled.
+    let inner2 = minimal_inner_envelope("vel-skip-ctx", "did:key:local-sender", 2);
+
+    let _ = manager
+        .deliver_message_and_drain_buffered(
+            "vel-skip-ctx",
+            &context_id_bytes,
+            "did:key:local-sender",
+            &inner2,
+            b"payload2",
+            false, // skip_velocity = false → should record velocity
+        )
+        .await;
+
+    let after_no_skip = {
+        let contexts = manager.contexts.lock().await;
+        contexts
+            .get("vel-skip-ctx")
+            .unwrap()
+            .governance
+            .velocity_tracker
+            .get_velocity(&"did:key:local-sender".into(), manager.clock.now_secs())
+    };
+    assert_eq!(
+        after_no_skip, 1,
+        "velocity must be incremented when skip_velocity = false (remote sender), got {after_no_skip}"
+    );
+}
+
+// M-O is a doc-only fix (no runtime behavior to test), verified at compile time
+// by ensuring MAX_ROLE_NAME_LENGTH = 64 matches the doc claim.
+#[test]
+fn role_name_max_length_matches_doc() {
+    // Ensures the constant value matches what consequence.rs now documents (64).
+    assert_eq!(
+        scp_protocol::context::roles::MAX_ROLE_NAME_LENGTH,
+        64,
+        "MAX_ROLE_NAME_LENGTH must be 64 (doc in consequence.rs was corrected to match)"
+    );
+}

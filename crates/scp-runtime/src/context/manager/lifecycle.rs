@@ -1448,7 +1448,7 @@ impl ContextManager {
                 ),
                 economic_policy: params.economic_policy.clone(),
                 budget_tracker: MemberBudgetTracker::new(),
-                last_known_members: HashSet::new(),
+                last_known_members: HashSet::from([creator_did.clone()]),
                 pending_epoch_resets: Vec::new(),
                 consequence_rules: params.consequence_rules.clone(),
                 velocity_tracker: scp_protocol::economy::antispam::SenderVelocityTracker::new(60),

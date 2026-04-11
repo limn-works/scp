@@ -12881,7 +12881,7 @@ async fn buffer_event_timestamp_bounds_m18() {
         );
     }
 
-    // --- Test stale event rejection ---
+    // --- Test stale event rejection and M-R buffer cap ---
     // Replace buffer with larger capacity (5000) and push 3602 events.
     // Oldest event gets estimated_ts = now - 3601, age = 3601 > 3600.
     {
@@ -12904,19 +12904,24 @@ async fn buffer_event_timestamp_bounds_m18() {
         let ctx = contexts.get("bounds-ctx").unwrap();
         let events = event_log_entries_for_consequences(ctx, "bounds-ctx", now_normal, &event_log);
 
-        // Oldest event (age 3601s) rejected, rest (3601 events) pass.
+        // Oldest event (age 3601s) is rejected by the M18 timestamp filter.
+        // Of the remaining 3601 valid events, the M-R cap (MAX_BUFFER_EVENTS_FOR_EVAL = 100)
+        // limits the output to 100 events. The stale-event rejection is verified by the
+        // fact that 100 < 101 (which would be returned if the oldest event were included
+        // without the cap — but it is rejected before counting).
         assert_eq!(
             events.len(),
-            3601,
-            "oldest buffer event (age 3601s) should be rejected, rest included"
+            100,
+            "M-R cap limits output to 100 buffer events even when more pass timestamp filter"
         );
 
-        // Oldest included event should be at now - 3600.
+        // All included events must be within the 1-hour window (M18 still enforced).
         let oldest_ts = events.iter().map(|e| e.timestamp).min().unwrap();
-        assert_eq!(
-            oldest_ts,
-            now_normal - 3600,
-            "oldest included event should be at now - 3600"
+        assert!(
+            now_normal.saturating_sub(oldest_ts) <= 3600,
+            "all included buffer events must be within MAX_BUFFER_EVENT_AGE_SECS (1 hour); \
+             oldest event is {}s old",
+            now_normal.saturating_sub(oldest_ts)
         );
     }
 
@@ -15004,5 +15009,194 @@ async fn earned_capacity_evicts_stale_timestamps() {
         result.is_ok(),
         "stale timestamps should be evicted, allowing new proposals: {:?}",
         result.err()
+    );
+}
+
+// -----------------------------------------------------------------------
+// M4: build_governed_context_state seeds last_known_members with creator
+// -----------------------------------------------------------------------
+
+/// Verifies that `build_governed_context_state` (called by
+/// `create_context_with_governance`) seeds `last_known_members` with the
+/// creator DID. Previously the field was initialised as empty, causing the
+/// governance-timeout departure-detection logic to treat the creator as a
+/// "newly joined" member on the first tick instead of a stable member.
+#[tokio::test]
+async fn governed_context_seeds_last_known_members_with_creator() {
+    let manager = ContextManager::new(
+        Box::new(MockCrypto::default()),
+        Box::new(MockTransport::connected()),
+        Box::new(MockEventLog::default()),
+        noop_key_resolver(),
+    );
+
+    let creator: DID = "did:key:creator-seed".into();
+    let params = ContextParams {
+        governance: scp_protocol::context::params::GovernanceModel::SingleAdmin,
+        ..ContextParams::default()
+    };
+    let config = GovernanceModelConfig::SingleAdmin {
+        admin_did: creator.clone(),
+    };
+
+    manager
+        .create_context_with_governance("seed-members-ctx".into(), params, creator.clone(), config)
+        .await
+        .unwrap();
+
+    let contexts = manager.contexts.lock().await;
+    let ctx = contexts.get("seed-members-ctx").unwrap();
+
+    assert!(
+        ctx.governance.last_known_members.contains(&creator),
+        "last_known_members must contain creator after context creation, got: {:?}",
+        ctx.governance.last_known_members
+    );
+}
+
+// -----------------------------------------------------------------------
+// M5: execute_revoke appends AccessRevoked event with target_did payload
+// -----------------------------------------------------------------------
+
+/// Verifies that `execute_revoke` (via `execute_governance_action`) appends
+/// an `AccessRevoked` event to the event log that includes a
+/// `{"target_did": "<did>"}` payload, matching the governance dispatch pattern.
+/// Without the payload, consequence triggers keyed on `target_did` cannot
+/// identify who was revoked.
+#[tokio::test]
+async fn revoke_access_event_carries_target_did_payload() {
+    let event_log = std::sync::Arc::new(MockEventLogWithActorDid::default());
+    let manager = ContextManager::new(
+        Box::new(MockCrypto::default()),
+        Box::new(MockTransport::connected()),
+        Box::new(ArcEventLog(event_log.clone())),
+        mock_key_resolver(),
+    );
+
+    let admin: DID = "did:key:rev-admin".into();
+    let target: DID = "did:key:rev-target".into();
+    let key_admin = signing_key_for_did(&admin);
+
+    let mut params = governance_params();
+    params.ceiling.push(Capability::MemberBan);
+    params.consequence_rules = vec![];
+
+    let handle = manager
+        .create_context("rev-payload-ctx".into(), params, admin.clone())
+        .await
+        .unwrap();
+
+    // Add target as member.
+    let kp = scp_protocol::context::membership::KeyPackage {
+        owner_did: target.clone(),
+        mls_key_package_bytes: None,
+    };
+    manager.join_context(&handle, kp, None).await.unwrap();
+
+    // Propose + auto-approve (SingleAdmin) a RevokeAccess governance action.
+    let action = scp_protocol::context::governance::GovernanceAction::RevokeAccess {
+        did: target.clone(),
+        access: scp_protocol::context::governance::AccessScope::Write,
+    };
+    manager
+        .propose_governance_action("rev-payload-ctx", &admin, action, &key_admin)
+        .await
+        .unwrap();
+
+    // Verify the event log entry for AccessRevoked has the target_did payload.
+    let context_id_bytes = scp_protocol::context::context_id_bytes("rev-payload-ctx");
+    let entries = event_log.entries.lock().unwrap();
+    let revoke_entries: Vec<_> = entries
+        .iter()
+        .filter(|(cid, event, _, _, _)| cid == &context_id_bytes && event == "AccessRevoked")
+        .collect();
+
+    assert!(
+        !revoke_entries.is_empty(),
+        "AccessRevoked entry must appear in event log after RevokeAccess governance action"
+    );
+    let (_, _, _, _, payload) = &revoke_entries[0];
+    let payload = payload
+        .as_ref()
+        .expect("AccessRevoked event must carry a payload with target_did");
+    assert_eq!(
+        payload.get("target_did").and_then(|v| v.as_str()),
+        Some(target.as_ref()),
+        "AccessRevoked payload must contain target_did matching the revoked member"
+    );
+}
+
+// -----------------------------------------------------------------------
+// M-R: receive-buffer cap for consequence evaluation
+// -----------------------------------------------------------------------
+
+/// Verifies that `event_log_entries_for_consequences` caps the number of
+/// receive-buffer events consumed per evaluation cycle at
+/// `MAX_BUFFER_EVENTS_FOR_EVAL` (100). This prevents an attacker from
+/// flooding the receive buffer to inflate synthetic event counts and
+/// trigger consequences prematurely.
+#[tokio::test]
+async fn consequence_evaluation_caps_buffer_events() {
+    let manager = ContextManager::new(
+        Box::new(MockCrypto::default()),
+        Box::new(MockTransport::connected()),
+        Box::new(MockEventLog::default()),
+        noop_key_resolver(),
+    );
+
+    let creator: DID = "did:key:cap-creator".into();
+    let params = ContextParams {
+        governance: scp_protocol::context::params::GovernanceModel::SingleAdmin,
+        ..ContextParams::default()
+    };
+    manager
+        .create_context("cap-buf-ctx".into(), params, creator.clone())
+        .await
+        .unwrap();
+
+    // Manually populate the receive buffer with >100 events.
+    const FLOOD_COUNT: usize = 150;
+    {
+        let mut contexts = manager.contexts.lock().await;
+        let ctx = contexts.get_mut("cap-buf-ctx").unwrap();
+        for _ in 0..FLOOD_COUNT {
+            ctx.receive_buffer.push(
+                scp_protocol::context::membership::ContextEvent::MessageReceived {
+                    sender_did: creator.clone(),
+                    payload: vec![],
+                },
+            );
+        }
+    }
+
+    // Call event_log_entries_for_consequences directly and check the count.
+    let events = {
+        let contexts = manager.contexts.lock().await;
+        let ctx = contexts.get("cap-buf-ctx").unwrap();
+        super::super::governance::event_log_entries_for_consequences(
+            ctx,
+            "cap-buf-ctx",
+            manager.clock.now_secs(),
+            &*manager.event_log,
+        )
+    };
+
+    // All 150 buffer events are MessageReceived, which map to MessageSent
+    // event type. The cap is 100 so at most 100 should appear.
+    let buffer_derived: Vec<_> = events
+        .iter()
+        .filter(|e| matches!(e.event_type, scp_event_log::EventType::MessageSent))
+        .collect();
+
+    assert!(
+        buffer_derived.len() <= 100,
+        "consequence evaluator must not consume more than 100 buffer events; got {}",
+        buffer_derived.len()
+    );
+    assert_eq!(
+        buffer_derived.len(),
+        100,
+        "consequence evaluator should consume exactly MAX_BUFFER_EVENTS_FOR_EVAL (100) buffer events; got {}",
+        buffer_derived.len()
     );
 }

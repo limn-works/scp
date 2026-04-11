@@ -293,6 +293,14 @@ const MAX_BUFFER_EVENT_AGE_SECS: u64 = 3600; // 1 hour
 /// discarded.
 const MAX_FUTURE_TOLERANCE_SECS: u64 = 5;
 
+/// Maximum number of receive-buffer events consumed per consequence evaluation
+/// cycle. Caps the cost of evaluation and prevents an attacker from flooding
+/// the buffer to drive synthetic high event counts (e.g. inflating a
+/// `WarningCount` trigger by queuing thousands of messages before governance
+/// runs). Events beyond this cap are simply not fed into the evaluator;
+/// the persisted event log (Source 1) covers all durable history.
+const MAX_BUFFER_EVENTS_FOR_EVAL: usize = 100;
+
 pub(super) fn event_log_entries_for_consequences(
     ctx: &PerContextState,
     context_id: &str,
@@ -350,11 +358,19 @@ pub(super) fn event_log_entries_for_consequences(
     // only add buffer events whose estimated timestamp is newer than the
     // last event log entry.
     let last_log_ts = events.last().map_or(0, |e| e.timestamp);
-    let buffer_events = ctx.receive_buffer.event_log_entries();
-    let buffer_len = buffer_events.len() as u64;
+    let all_buffer_events = ctx.receive_buffer.event_log_entries();
+    let buffer_len = all_buffer_events.len() as u64;
     let next_seq = events.len() as u64;
 
-    for (idx, ctx_event) in buffer_events.iter().enumerate() {
+    // Track how many buffer-derived events we've accepted so far. Once
+    // MAX_BUFFER_EVENTS_FOR_EVAL is reached, stop adding more.
+    // This cap prevents an attacker from flooding the buffer to inflate
+    // synthetic event counts (e.g. triggering a `WarningCount` consequence
+    // prematurely). The persisted event log (Source 1) covers all durable
+    // history; the buffer is only a short-term supplement.
+    let mut buffer_events_accepted: usize = 0;
+
+    for (idx, ctx_event) in all_buffer_events.iter().enumerate() {
         let (event_type, actor_did, payload_data) = match ctx_event {
             ContextEvent::MessageSent { sender_did, .. }
             | ContextEvent::MessageReceived { sender_did, .. } => (
@@ -404,6 +420,13 @@ pub(super) fn event_log_entries_for_consequences(
         if now.saturating_sub(estimated_ts) > MAX_BUFFER_EVENT_AGE_SECS {
             continue;
         }
+
+        // M-R cap: stop once we've accepted MAX_BUFFER_EVENTS_FOR_EVAL events
+        // from the buffer. Additional events are not fed to the evaluator.
+        if buffer_events_accepted >= MAX_BUFFER_EVENTS_FOR_EVAL {
+            break;
+        }
+        buffer_events_accepted += 1;
 
         events.push(scp_event_log::Event {
             event_type,
@@ -2057,8 +2080,12 @@ impl ContextManager {
         if let Some(ref bc_snap) = bc_snapshot {
             self.persist_broadcast_snapshot(context_id, bc_snap);
         }
-        self.event_log
-            .append_context_event(&context_id_bytes, "AccessRevoked", actor_did)?;
+        self.event_log.append_context_event_with_payload(
+            &context_id_bytes,
+            "AccessRevoked",
+            actor_did,
+            Some(&serde_json::json!({"target_did": did.as_ref()})),
+        )?;
 
         Ok(rotated_count)
     }

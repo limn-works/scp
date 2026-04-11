@@ -347,7 +347,7 @@ impl ConsequenceRule {
     /// - `Enforcement(RemoveMember { .. })`: always rejected — MLS ejection
     ///   is governance-only
     /// - `AssignRole { to_role }`: role name with control/HTML chars or
-    ///   length > 128
+    ///   length > 64
     ///
     /// Other trigger variants have no user-supplied strings and always pass
     /// validation.
