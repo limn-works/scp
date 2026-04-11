@@ -716,14 +716,21 @@ impl ContextManager {
 
         // Append to Merkle event log using the standard governance event
         // label path (same pattern as propose/approve/reject/withdraw).
-        // Include structured payload with target_did so consequence triggers
-        // (WarningCount, Custom) and participation records can identify the
-        // target from event log entries.
+        // Include structured payload with target_did and action_type so
+        // consequence triggers (WarningCount, Custom) and participation records
+        // can identify the target and classify whether the action is adverse
+        // (H18: standing-deflation filter).
         let context_id_bytes = context_id_to_bytes(context_id);
-        let payload = proposal
-            .action
-            .target_did()
-            .map(|d| serde_json::json!({"target_did": d.as_ref()}));
+        let action_variant = proposal.action.variant_name();
+        let payload = Some(
+            proposal
+                .action
+                .target_did()
+                .map_or_else(
+                    || serde_json::json!({"action_type": action_variant}),
+                    |d| serde_json::json!({"target_did": d.as_ref(), "action_type": action_variant}),
+                ),
+        );
         self.event_log.append_context_event_with_payload(
             &context_id_bytes,
             Self::governance_event_label(&executed_event),
