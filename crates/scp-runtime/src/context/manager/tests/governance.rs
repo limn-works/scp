@@ -15756,18 +15756,22 @@ async fn consequence_events_visible_to_subsequent_rule_evaluation() {
 /// enforcement path.
 ///
 /// Layout after the H4 refactor:
-///   * `enforce_triggered_consequences` — thin wrapper that constructs
-///     the per-context state and dispatches to
+///   * `enforce_triggered_consequences` — thin wrapper that dispatches to
 ///     `process_one_triggered_consequence` for each consequence.
-///   * `process_one_triggered_consequence` — the cooldown / TOCTOU /
-///     dispatch / enforcement logic. Contains the `Triggered`, `Enforced`,
-///     and (member-absent) `EnforcementFailed` appends.
-///   * `emit_failure_escalation` — H10 escalation path. Contains the
-///     `EnforcementFailed` and `EscalatedToSuspendAll` appends.
-///   * `append_consequence_event` — single helper that wraps the
-///     `append_context_event_with_payload` call. The structural test
-///     verifies that this helper exists AND is invoked from the
-///     consequence-emission helpers above.
+///   * `process_one_triggered_consequence` — cooldown / TOCTOU / dispatch
+///     logic. Delegates emission to the four helpers below.
+///   * `emit_consequence_triggered` — appends + pushes `ConsequenceTriggered`.
+///   * `emit_absent_member_enforcement_failed` — appends + pushes
+///     `ConsequenceEnforcementFailed` (member-departed path, no escalation).
+///   * `emit_consequence_enforced_success` — appends + pushes
+///     `ConsequenceEnforced` on the success path.
+///   * `emit_failure_escalation` — H10 escalation path. Appends
+///     `ConsequenceEnforcementFailed` + `ConsequenceEscalatedToSuspendAll`,
+///     then pushes a single `ConsequenceEnforced` to the receive buffer.
+///   * `append_consequence_event` — single canonical helper that wraps the
+///     `append_context_event_with_payload` call. Every emission helper
+///     calls this; the structural test verifies that invariant.
+#[allow(clippy::too_many_lines)]
 #[test]
 fn consequence_event_log_append_ordering() {
     let source = include_str!("../governance.rs");
@@ -15812,17 +15816,23 @@ fn consequence_event_log_append_ordering() {
         "append_consequence_event helper must use the CONSEQUENCE_ACTOR_DID sentinel"
     );
 
-    // 2. The two helpers that emit consequence events MUST each call
-    //    append_consequence_event AND must call it before pushing to
-    //    the receive buffer.
+    // 2. Each leaf-level emission helper must reference the event type it
+    //    emits AND must call append_consequence_event before any
+    //    receive_buffer.push(ContextEvent::Consequence...) call.
+    //    This verifies the H4 durability ordering invariant at the source
+    //    level for each event type.
     for (helper_name, expected_events) in [
         (
-            "fn process_one_triggered_consequence(",
-            &[
-                "ConsequenceTriggered",
-                "ConsequenceEnforced",
-                "ConsequenceEnforcementFailed",
-            ][..],
+            "fn emit_consequence_triggered(",
+            &["ConsequenceTriggered"][..],
+        ),
+        (
+            "fn emit_absent_member_enforcement_failed(",
+            &["ConsequenceEnforcementFailed", "ConsequenceEnforced"][..],
+        ),
+        (
+            "fn emit_consequence_enforced_success(",
+            &["ConsequenceEnforced"][..],
         ),
         (
             "fn emit_failure_escalation(",
@@ -15871,13 +15881,34 @@ fn consequence_event_log_append_ordering() {
         );
     }
 
-    // 3. Aggregate sanity: across the consequence-emission surface there
-    //    are at least four append calls (one per canonical event type).
-    //    This is a coarse anti-regression that catches accidental
-    //    deletion of an entire helper.
+    // 3. `process_one_triggered_consequence` must delegate to all four
+    //    emission helpers — verifying that none were accidentally removed
+    //    from the dispatch path.
     let process_body = extract_body(source, "fn process_one_triggered_consequence(");
+    for helper in [
+        "emit_consequence_triggered(",
+        "emit_absent_member_enforcement_failed(",
+        "emit_consequence_enforced_success(",
+        "emit_failure_escalation(",
+    ] {
+        assert!(
+            process_body.contains(helper),
+            "process_one_triggered_consequence must call {helper} (H4 dispatch completeness)"
+        );
+    }
+
+    // 4. Aggregate sanity: across the four leaf-level emission helpers there
+    //    are at least four append_consequence_event calls (one per canonical
+    //    event string: Triggered, Enforced, EnforcementFailed,
+    //    EscalatedToSuspendAll). This is a coarse anti-regression that
+    //    catches accidental deletion of an entire helper.
+    let triggered_body = extract_body(source, "fn emit_consequence_triggered(");
+    let absent_body = extract_body(source, "fn emit_absent_member_enforcement_failed(");
+    let success_body = extract_body(source, "fn emit_consequence_enforced_success(");
     let escalate_body = extract_body(source, "fn emit_failure_escalation(");
-    let total_appends = process_body.matches("append_consequence_event(").count()
+    let total_appends = triggered_body.matches("append_consequence_event(").count()
+        + absent_body.matches("append_consequence_event(").count()
+        + success_body.matches("append_consequence_event(").count()
         + escalate_body.matches("append_consequence_event(").count();
     assert!(
         total_appends >= 4,
