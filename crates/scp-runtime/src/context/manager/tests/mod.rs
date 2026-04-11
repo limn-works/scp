@@ -589,6 +589,196 @@ impl ContextTransportProvider for FailingTransport {
 }
 
 // -----------------------------------------------------------------------
+// FailingCapturePaymentAdapter — authorizes OK, always fails on capture.
+// Used by H19 audit-trail tests.
+// -----------------------------------------------------------------------
+
+/// A payment adapter that authorizes successfully but always fails on
+/// `capture`. Used to exercise the `PaymentCaptureFailed` audit trail path
+/// without requiring a real payment backend (H19).
+#[cfg(test)]
+pub(super) struct FailingCapturePaymentAdapter;
+
+#[cfg(test)]
+impl crate::economy::adapter::PaymentAdapter for FailingCapturePaymentAdapter {
+    fn adapter_id(&self) -> &'static str {
+        "failing-capture"
+    }
+
+    fn capabilities(&self) -> crate::economy::adapter::AdapterCapabilities {
+        crate::economy::adapter::AdapterCapabilities {
+            supported_currencies: vec![scp_protocol::economy::types::CurrencyCode([85, 83, 68, 0])],
+            supports_streaming: false,
+            supports_batch_auth: false,
+            supports_single_step: true,
+            min_amount: None,
+            max_amount: None,
+            typical_settlement_ms: 0,
+            requires_facilitator: false,
+        }
+    }
+
+    async fn authorize(
+        &self,
+        payer: &scp_identity::DID,
+        payee: &scp_identity::DID,
+        amount: scp_protocol::economy::types::Amount,
+        currency: scp_protocol::economy::types::CurrencyCode,
+        _metadata: crate::economy::adapter::PaymentMetadata,
+    ) -> Result<crate::economy::adapter::PaymentAuthorization, crate::economy::adapter::PaymentError>
+    {
+        Ok(crate::economy::adapter::PaymentAuthorization {
+            auth_id: [0u8; 32],
+            payer: payer.clone(),
+            payee: payee.clone(),
+            amount,
+            currency,
+            adapter_id: "failing-capture".to_owned(),
+            created_at: 0,
+            expires_at: u64::MAX,
+            adapter_state: Vec::new(),
+        })
+    }
+
+    async fn capture(
+        &self,
+        _auth: &crate::economy::adapter::PaymentAuthorization,
+    ) -> Result<crate::economy::adapter::PaymentReceipt, crate::economy::adapter::PaymentError>
+    {
+        Err(crate::economy::adapter::PaymentError::AdapterError(
+            "simulated capture failure".into(),
+        ))
+    }
+
+    async fn void(
+        &self,
+        _auth: &crate::economy::adapter::PaymentAuthorization,
+    ) -> Result<(), crate::economy::adapter::PaymentError> {
+        Ok(())
+    }
+
+    async fn verify_authorization(
+        &self,
+        _auth: &crate::economy::adapter::PaymentAuthorization,
+    ) -> Result<(), crate::economy::adapter::PaymentError> {
+        Ok(())
+    }
+
+    async fn verify(
+        &self,
+        _receipt: &crate::economy::adapter::PaymentReceipt,
+    ) -> Result<crate::economy::adapter::VerificationResult, crate::economy::adapter::PaymentError>
+    {
+        Ok(crate::economy::adapter::VerificationResult {
+            valid: true,
+            adapter_id: "failing-capture".to_owned(),
+            verified_amount: scp_protocol::economy::types::Amount(0),
+            verified_currency: scp_protocol::economy::types::CurrencyCode([85, 83, 68, 0]),
+            verification_timestamp: 0,
+        })
+    }
+
+    async fn refund(
+        &self,
+        _receipt: &crate::economy::adapter::PaymentReceipt,
+        _amount: Option<scp_protocol::economy::types::Amount>,
+    ) -> Result<crate::economy::adapter::RefundConfirmation, crate::economy::adapter::PaymentError>
+    {
+        Ok(crate::economy::adapter::RefundConfirmation {
+            refund_id: [0u8; 32],
+            original_receipt_id: [0u8; 32],
+            refunded_amount: scp_protocol::economy::types::Amount(0),
+            currency: scp_protocol::economy::types::CurrencyCode([85, 83, 68, 0]),
+            adapter_proof: Vec::new(),
+        })
+    }
+}
+
+// -----------------------------------------------------------------------
+// Helper: build a ContextManager with FailingCapturePaymentAdapter and a
+// priced EconomicPolicy. Used by H19 audit-trail tests.
+// -----------------------------------------------------------------------
+
+/// Builds a [`ContextManager`] backed by the `FailingCapturePaymentAdapter`
+/// and an event log that can be inspected post-run (H19 tests).
+///
+/// The returned `Arc<MockEventLogWithActorDid>` is the shared handle to the
+/// event log; the handle to the newly created context is also returned.
+///
+/// The manager includes a `MessageSend` and `JoinContext` economic policy
+/// with a cost of 1 USD so that `authorize_paid_action` → `capture` actually
+/// runs (free contexts skip the capture path).
+#[cfg(test)]
+pub(super) async fn setup_failing_capture_manager_with_context(
+    context_id: &str,
+    creator_did: &str,
+) -> (
+    ContextManager,
+    ContextHandle,
+    std::sync::Arc<MockEventLogWithActorDid>,
+) {
+    use std::sync::Arc;
+
+    let event_log = Arc::new(MockEventLogWithActorDid::default());
+
+    let manager = ContextManager::builder()
+        .crypto(Box::new(MockCrypto::default()))
+        .transport(Box::new(MockTransport::connected()))
+        .event_log(Box::new(ArcEventLog(event_log.clone())))
+        .payment_adapter(Arc::new(FailingCapturePaymentAdapter))
+        .build()
+        .unwrap();
+
+    // Grant the creator enough budget for the operations under test.
+    // We use a non-zero EconomicPolicy so the capture path actually runs.
+    let policy = {
+        use scp_protocol::economy::types::{Amount, CostSchedule, CurrencyCode, EconomicPolicy};
+        EconomicPolicy {
+            locked: false,
+            cost_schedule: CostSchedule {
+                currency: CurrencyCode([85, 83, 68, 0]),
+                per_message: Some(Amount::new(1)),
+                per_tool_invoke: None,
+                per_join: Some(Amount::new(1)),
+                per_period: None,
+                per_byte_stored: None,
+            },
+            payment_adapters: vec!["failing-capture".to_owned()],
+            pricing_formula: None,
+            payee: DID::from("did:key:payee"),
+        }
+    };
+
+    let params = ContextParams {
+        ceiling: vec![
+            scp_protocol::context::params::Capability::new("messages:read"),
+            scp_protocol::context::params::Capability::new("messages:write"),
+            scp_protocol::context::params::Capability::new("role:assign"),
+            Capability::MemberBan,
+        ],
+        economic_policy: Some(policy),
+        ..ContextParams::default()
+    };
+
+    let handle = manager
+        .create_context(context_id.into(), params, creator_did.into())
+        .await
+        .unwrap();
+
+    // Grant a generous budget so economy enforcement passes.
+    {
+        let mut contexts = manager.contexts.lock().await;
+        let ctx = contexts.get_mut(context_id).unwrap();
+        ctx.governance.budget_tracker.grant(
+            &DID::from(creator_did),
+            scp_protocol::economy::types::Amount::new(1_000_000),
+        );
+    }
+
+    (manager, handle, event_log)
+}
+
+// -----------------------------------------------------------------------
 // Helper: create a manager with default mocks and a registered context
 // -----------------------------------------------------------------------
 

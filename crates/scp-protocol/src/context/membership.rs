@@ -690,6 +690,30 @@ pub enum ContextEvent {
         /// Whether the enforcement was successfully applied.
         success: bool,
     },
+    /// Payment capture failed after a successful action (H19).
+    ///
+    /// Emitted when `complete_paid_action` fails after `send_message` or
+    /// `join_context` has already completed successfully. The budget
+    /// deduction stands (service was rendered — H8), but the external
+    /// payment adapter could not capture the escrow hold. This event
+    /// provides a durable audit trail so operators can reconcile the
+    /// discrepancy between the internal budget ledger and the external
+    /// payment system.
+    ///
+    /// SDK consumers should surface this to the context administrator
+    /// for manual reconciliation.
+    PaymentCaptureFailed {
+        /// The action during which the capture failed
+        /// (`"send_message"` or `"join_context"`).
+        action: String,
+        /// The DID of the actor whose payment capture failed.
+        actor_did: DID,
+        /// Human-readable description of the adapter error.
+        error: String,
+        /// The amount that was deducted from the budget but not captured,
+        /// if known. `None` when no cost was charged (free context).
+        cost: Option<u64>,
+    },
 }
 
 // ---------------------------------------------------------------------------

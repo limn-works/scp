@@ -2432,3 +2432,129 @@ async fn budget_exceeded_on_join_rejects() {
         "join should fail: paid context auto_accept blocked"
     );
 }
+
+// =======================================================================
+// H19: PaymentCaptureFailed audit-trail tests (join path)
+//
+// NOTE: The `capture_join_payment` failure path is only reachable in
+// production via the future explicit-acceptance flow (SCP-ECON-12030)
+// because `auto_accept_blocked_by_economics` prevents `join_context` from
+// reaching Phase 5 on paid contexts. These tests exercise the underlying
+// `record_payment_capture_failure` helper that `capture_join_payment`
+// delegates to, providing full coverage of the audit-trail logic.
+// =======================================================================
+
+/// H19-J1: `record_payment_capture_failure` for the join action appends a
+/// `PaymentCaptureFailed` entry to the event log with `action = "join_context"`
+/// and the error string.
+#[tokio::test]
+async fn capture_join_payment_failure_appends_event_log_entry() {
+    use std::sync::Arc;
+
+    let event_log = Arc::new(MockEventLogWithActorDid::default());
+    let manager = ContextManager::new(
+        Box::new(MockCrypto::default()),
+        Box::new(MockTransport::connected()),
+        Box::new(ArcEventLog(event_log.clone())),
+        noop_key_resolver(),
+    );
+
+    let params = ContextParams {
+        ceiling: vec![
+            scp_protocol::context::params::Capability::new("messages:read"),
+            scp_protocol::context::params::Capability::new("messages:write"),
+        ],
+        ..ContextParams::default()
+    };
+    manager
+        .create_context("h19-join-ctx".into(), params, "did:key:admin".into())
+        .await
+        .unwrap();
+
+    // Simulate what capture_join_payment would do on failure.
+    manager
+        .record_payment_capture_failure(
+            "h19-join-ctx",
+            "join_context",
+            &DID::from("did:key:joiner"),
+            "simulated capture failure",
+            Some(scp_protocol::economy::types::Amount::new(1)),
+        )
+        .await;
+
+    // Verify event log entry.
+    let context_id_bytes = scp_protocol::context::context_id_bytes("h19-join-ctx");
+    let entries = event_log.entries.lock().unwrap();
+    let capture_failed: Vec<_> = entries
+        .iter()
+        .filter(|(cid, event, _, _, _)| *cid == context_id_bytes && event == "PaymentCaptureFailed")
+        .collect();
+
+    assert!(
+        !capture_failed.is_empty(),
+        "expected PaymentCaptureFailed event log entry, got none; all: {entries:?}"
+    );
+
+    let (_, _, actor_did, _, payload) = &capture_failed[0];
+    assert_eq!(
+        actor_did, "did:key:joiner",
+        "PaymentCaptureFailed actor_did must be the joining member"
+    );
+
+    let payload = payload
+        .as_ref()
+        .expect("PaymentCaptureFailed must have payload");
+    assert_eq!(
+        payload["action"].as_str(),
+        Some("join_context"),
+        "payload action must be 'join_context'"
+    );
+    assert!(
+        payload["error"].as_str().is_some(),
+        "payload must include an error string"
+    );
+    assert_eq!(
+        payload["cost"].as_u64(),
+        Some(1),
+        "payload cost must match the deducted amount"
+    );
+}
+
+/// H19-J2: `record_payment_capture_failure` for the join action pushes a
+/// `PaymentCaptureFailed` event to the receive buffer, ensuring SDK consumers
+/// can observe the failure in the event stream.
+#[tokio::test]
+async fn capture_join_payment_failure_pushes_receive_buffer_event() {
+    let (manager, _handle) = setup_active_context().await;
+
+    // Simulate capture_join_payment failure on the existing "test-ctx".
+    manager
+        .record_payment_capture_failure(
+            "test-ctx",
+            "join_context",
+            &DID::from("did:key:joiner"),
+            "simulated capture failure",
+            Some(scp_protocol::economy::types::Amount::new(5)),
+        )
+        .await;
+
+    // Drain events and verify PaymentCaptureFailed is present.
+    let events = manager.drain_events("test-ctx").await;
+    let found = events.iter().any(|e| {
+        matches!(
+            e,
+            ContextEvent::PaymentCaptureFailed {
+                action,
+                actor_did,
+                cost: Some(5),
+                ..
+            }
+            if action == "join_context" && actor_did.as_ref() == "did:key:joiner"
+        )
+    });
+
+    assert!(
+        found,
+        "PaymentCaptureFailed event must be in receive buffer; events: {events:?}"
+    );
+}

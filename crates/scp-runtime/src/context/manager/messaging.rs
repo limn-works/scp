@@ -582,12 +582,15 @@ impl ContextManager {
     /// delivered -- the service was rendered, so the budget deduction stands.
     /// Rolling back on capture failure would let senders consume the service
     /// for free whenever the payment adapter is flaky (H8).
+    ///
+    /// On failure a `PaymentCaptureFailed` entry is appended to the event log
+    /// and pushed to the receive buffer to provide a durable audit trail (H19).
     async fn capture_send_payment(
         &self,
         auth: Option<super::economy::PaidActionAuthorization>,
         sender_did: &DID,
         context_id: &str,
-        _deducted_cost: Option<scp_protocol::economy::types::Amount>,
+        deducted_cost: Option<scp_protocol::economy::types::Amount>,
     ) {
         if let Some(a) = auth
             && let Err(e) = self.complete_paid_action(a, sender_did, context_id).await
@@ -597,6 +600,15 @@ impl ContextManager {
                 context_id,
                 "payment capture failed after successful send: {e}"
             );
+            // H19: append durable audit record to event log + receive buffer.
+            self.record_payment_capture_failure(
+                context_id,
+                "send_message",
+                sender_did,
+                &e.to_string(),
+                deducted_cost,
+            )
+            .await;
         }
     }
 
