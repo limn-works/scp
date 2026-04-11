@@ -150,6 +150,11 @@ impl From<scp_core::context::ContextError> for ScpNapiError {
                 message: format!("{e}"),
                 code: "SCP-CTX-2091".to_owned(),
             },
+            // C3: snapshot import structural/semantic rejection.
+            CE::ImportRejected { .. } => Self::Context {
+                message: format!("{e}"),
+                code: "SCP-CTX-2092".to_owned(),
+            },
             _ => Self::Context {
                 message: format!("{e} — verify context state, membership, and permissions"),
                 code: "SCP-CTX-2001".to_owned(),

@@ -376,6 +376,26 @@ pub enum ContextError {
         /// where `incoming_floor < local_floor`.
         per_sender_deltas: Vec<(String, u64, u64)>,
     },
+
+    /// An imported snapshot was rejected for carrying authorization or
+    /// trust-state fields that failed validation against the importing
+    /// node's policy.
+    ///
+    /// Distinct from [`Self::SnapshotFloorRegression`], which covers
+    /// monotonic per-sender floors. `ImportRejected` covers structural
+    /// or semantic violations: tampered consequence rules, attacker-
+    /// chosen budget grants, forged approved-proposal entries, cooldown
+    /// indices that point at nonexistent rules, etc.
+    ///
+    /// The `reason` string carries a human-readable explanation suitable
+    /// for logging and SDK error messages. Mapped to canonical code
+    /// `SCP-CTX-2092` through every FFI bridge translator so callers can
+    /// switch on `.code` instead of string-matching.
+    #[error("SCP-CTX-2092: snapshot import rejected: {reason}")]
+    ImportRejected {
+        /// Human-readable explanation of why the import was rejected.
+        reason: String,
+    },
 }
 
 // ---------------------------------------------------------------------------

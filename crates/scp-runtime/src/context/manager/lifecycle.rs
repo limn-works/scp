@@ -45,6 +45,80 @@ fn validate_consequence_rules(
     Ok(())
 }
 
+/// Maximum permitted future cooldown horizon, in seconds.
+///
+/// Cooldown timestamps in an imported or restored snapshot are clamped
+/// to `now + MAX_COOLDOWN_SECS`. A malicious snapshot that injects
+/// `cooldown_until[i] = u64::MAX` would otherwise permanently disable
+/// the targeted consequence rule. 30 days is well above any legitimate
+/// cooldown window — the longest spec-defined consequence cooldowns are
+/// measured in hours — so the clamp is non-disruptive in practice.
+pub(super) const MAX_COOLDOWN_SECS: u64 = 30 * 24 * 60 * 60;
+
+/// Sanitizes an imported or restored `cooldown_until` map in place.
+///
+/// Drops every entry whose key (rule index) is out of bounds for the
+/// supplied `consequence_rules` vector — these would otherwise let an
+/// attacker inject cooldown state for nonexistent rules and influence
+/// future rule evaluation. Clamps every remaining timestamp to
+/// `now + MAX_COOLDOWN_SECS`. Both events emit a warning so anomalies
+/// are visible at runtime.
+///
+/// Mirrors the WASM bridge `validate_imported_snapshot` policy
+/// (`crates/scp-ffi/wasm/src/manager.rs`), but applied to the runtime
+/// `ContextManager` paths that the WASM bridge does not exercise.
+fn sanitize_cooldown_until(
+    cooldown_until: &mut HashMap<usize, u64>,
+    consequence_rules: &[scp_protocol::trust::consequence::ConsequenceRule],
+    now: u64,
+    source: &str,
+) {
+    let max_ts = now.saturating_add(MAX_COOLDOWN_SECS);
+    let rule_count = consequence_rules.len();
+    cooldown_until.retain(|&rule_index, ts| {
+        if rule_index >= rule_count {
+            tracing::warn!(
+                source = source,
+                rule_index,
+                rule_count,
+                "dropping cooldown_until entry: rule_index out of bounds"
+            );
+            return false;
+        }
+        if *ts > max_ts {
+            tracing::warn!(
+                source = source,
+                rule_index,
+                original_ts = *ts,
+                clamped_ts = max_ts,
+                "clamping cooldown_until entry to MAX_COOLDOWN_SECS horizon"
+            );
+            *ts = max_ts;
+        }
+        true
+    });
+}
+
+/// Validates imported `consequence_rules` against `consequence_config` and
+/// returns [`ContextError::ImportRejected`] on failure.
+///
+/// Distinct from [`validate_consequence_rules`] which targets the
+/// create-time path and returns [`ContextCreationError`]. This variant
+/// is used by `import_context` and `restore_context` so the bridge
+/// translators surface the canonical `SCP-CTX-2092` code.
+fn validate_consequence_rules_for_import(
+    rules: &[scp_protocol::trust::consequence::ConsequenceRule],
+    config: &scp_protocol::context::params::ConsequenceConfig,
+) -> Result<(), ContextError> {
+    for (idx, rule) in rules.iter().enumerate() {
+        rule.validate_against_config(config)
+            .map_err(|e| ContextError::ImportRejected {
+                reason: format!("consequence_rules[{idx}] invalid: {e}"),
+            })?;
+    }
+    Ok(())
+}
+
 /// Performs sybil resistance evaluation for a join candidate (#1530).
 ///
 /// Reads the `sybil_policy` from `ContextParams`. When `None`, passes
@@ -242,19 +316,32 @@ impl ContextManager {
         context_id: &str,
         handle: &ContextHandle,
     ) -> Result<(), ContextError> {
-        let (ctx_snapshot, broadcast_ctx) = self.load_persisted_context_state(context_id)?;
+        let (mut ctx_snapshot, broadcast_ctx) = self.load_persisted_context_state(context_id)?;
         self.restore_event_log_best_effort(context_id);
-        // Validate consequence rules on restore — reject tampered
+        // C3: Validate consequence rules on restore — reject tampered
         // rules. Uses validate_against_config to enforce the opt-in
-        // gate for RevokeAccess even on restore from persistence.
-        for rule in &ctx_snapshot.consequence_rules {
-            rule.validate_against_config(&ctx_snapshot.context_params.consequence_config)
-                .map_err(|e| {
-                    ContextError::MembershipFailed(format!(
-                        "consequence rule validation failed on restore: {e}"
-                    ))
-                })?;
-        }
+        // gate for RevokeAccess even on restore from persistence and
+        // catches any consequence_config regression that snuck in
+        // between snapshots. Local restore is "trusted" enough to
+        // preserve budgets / participation_cache / proposal_timestamps
+        // / approved_proposals as-is — but we still refuse to load
+        // structurally inconsistent rules, since that path was the
+        // entire vector of CVE C3.
+        validate_consequence_rules_for_import(
+            &ctx_snapshot.consequence_rules,
+            &ctx_snapshot.context_params.consequence_config,
+        )?;
+        // C3: Clamp `cooldown_until` to bounded horizon and drop
+        // entries with out-of-range rule indices. Even local snapshots
+        // can drift after a crash mid-write or after a config change
+        // shrinks `consequence_rules`.
+        let now_for_cooldown = self.clock.now_secs();
+        sanitize_cooldown_until(
+            &mut ctx_snapshot.cooldown_until,
+            &ctx_snapshot.consequence_rules,
+            now_for_cooldown,
+            "restore",
+        );
         let ttl_remaining = ctx_snapshot.ttl_remaining_secs;
         // Reconstruct the governance engine from the persisted snapshot.
         let governance_engine =
@@ -757,6 +844,37 @@ impl ContextManager {
     ///
     /// Returns [`ContextError`] if validation fails (unsupported version,
     /// Merkle mismatch, tampered events) or the context already exists.
+    ///
+    /// # Per-instance authorization-state wipe policy (C3)
+    ///
+    /// Imports come from an UNTRUSTED source — a peer's exported snapshot.
+    /// A malicious or buggy export can carry attacker-chosen authorization
+    /// state that has no meaning on the importing node and would expand
+    /// the attacker's authority on import. To preclude that, this method
+    /// wipes the following per-instance fields entirely after the snapshot
+    /// is validated and never re-uses the imported value:
+    ///
+    /// - `budget_tracker` — wiped. Budgets are local economic grants that
+    ///   stack across votes; inheriting them lets a peer pre-load arbitrary
+    ///   spend headroom for any DID it picks.
+    /// - `participation_cache` — wiped. Cache is rebuilt lazily from the
+    ///   imported event log via [`check_proposer_eligibility`]; carrying
+    ///   the exporter's cache lets it forge "low-participation" verdicts
+    ///   against victims.
+    /// - `proposal_timestamps` — wiped. Earned-capacity rate limits are
+    ///   per-instance counters; importing pre-populated entries lets the
+    ///   exporter starve a victim of proposal slots.
+    /// - `approved_proposals` — wiped. Re-derived implicitly from the
+    ///   imported event log on next governance evaluation; importing
+    ///   forged `RemoveMember` entries would let an attacker permanently
+    ///   block a victim from proposing.
+    /// - `spending_nonce_tracker` — already wiped (see in-line comment in
+    ///   the construction below). C3 extends the same policy class.
+    ///
+    /// Fields that are kept across import (but validated): `consequence_
+    /// rules`, `consequence_config`, `cooldown_until`. The latter is
+    /// clamped to a bounded horizon and out-of-bound rule indices are
+    /// dropped.
     #[instrument(skip_all)]
     #[allow(clippy::too_many_lines)] // Reimport guard adds 10 lines to an already-100-line function.
     pub async fn import_context(
@@ -765,17 +883,15 @@ impl ContextManager {
     ) -> Result<ContextHandle, ContextError> {
         // 1. Validate export.
         crate::context::export_import::validate_export_for_import(&export)?;
-        // Validate consequence rules on import — reject tampered
-        // rules. Uses validate_against_config to enforce the opt-in
-        // gate for RevokeAccess even on imported snapshots.
-        for rule in &export.snapshot.consequence_rules {
-            rule.validate_against_config(&export.snapshot.context_params.consequence_config)
-                .map_err(|e| {
-                    ContextError::MembershipFailed(format!(
-                        "consequence rule validation failed on import: {e}"
-                    ))
-                })?;
-        }
+        // C3: Validate consequence rules on import. Uses
+        // validate_against_config to enforce the opt-in gate for
+        // RevokeAccess even on imported snapshots and rejects with the
+        // canonical SCP-CTX-2092 envelope so SDK callers can detect
+        // structural rejection by `.code` rather than message body.
+        validate_consequence_rules_for_import(
+            &export.snapshot.consequence_rules,
+            &export.snapshot.context_params.consequence_config,
+        )?;
 
         let context_id = export.snapshot.context_id.clone();
         let ctx_id_bytes = scp_protocol::context::context_id_bytes(&context_id);
@@ -904,6 +1020,19 @@ impl ContextManager {
             })?;
         }
 
+        // C3: Clamp imported `cooldown_until` to a bounded horizon and
+        // drop entries with out-of-range rule indices, mirroring the
+        // WASM bridge `validate_imported_snapshot` policy. Without
+        // this, an attacker can ship `cooldown_until[i] = u64::MAX` and
+        // permanently disable a consequence rule.
+        let mut sanitized_cooldown_until = export.snapshot.cooldown_until.clone();
+        sanitize_cooldown_until(
+            &mut sanitized_cooldown_until,
+            &export.snapshot.consequence_rules,
+            now_for_validation,
+            "import",
+        );
+
         let per_context = PerContextState {
             handle: handle.clone(),
             membership: export.snapshot.membership,
@@ -922,7 +1051,14 @@ impl ContextManager {
                         .map(|id| (id, now))
                         .collect()
                 },
-                approved_proposals: export.snapshot.approved_proposals,
+                // C3: Wipe `approved_proposals`. Importing the
+                // exporter's approved-but-not-yet-executed proposals
+                // lets a malicious snapshot pre-load forged
+                // `RemoveMember` entries — `check_proposer_eligibility`
+                // would then permanently block the victim from
+                // proposing. The legitimate set is rebuilt from the
+                // imported event log on next governance evaluation.
+                approved_proposals: HashMap::new(),
                 freeze: export.snapshot.governance_freeze,
                 timeout_task: GovernanceTimeoutTask::new(),
                 deadlock: DeadlockDetectionState::default(),
@@ -938,13 +1074,23 @@ impl ContextManager {
                     hrl_config, hrl_state,
                 ),
                 economic_policy: export.snapshot.economic_policy,
-                budget_tracker: export.snapshot.budget_tracker,
+                // C3: Wipe `budget_tracker`. Budgets are per-instance
+                // economic grants from `ApproveSpend` actions; a peer
+                // import that carried `budget_tracker` could pre-fund
+                // any DID for arbitrary spend on the importing node.
+                budget_tracker: scp_protocol::economy::budget::MemberBudgetTracker::new(),
                 last_known_members: initial_members,
                 pending_epoch_resets: Vec::new(),
                 consequence_rules: export.snapshot.consequence_rules,
                 velocity_tracker: validated_velocity_tracker,
-                participation_cache: export.snapshot.participation_cache,
-                cooldown_until: export.snapshot.cooldown_until,
+                // C3: Wipe `participation_cache`. The cache is
+                // rebuilt lazily from the imported event log on
+                // next proposer-eligibility check (see
+                // `check_proposer_eligibility`). Inheriting the
+                // exporter's cache lets it forge low-participation
+                // verdicts against any DID it picks.
+                participation_cache: HashMap::new(),
+                cooldown_until: sanitized_cooldown_until,
                 // IMPORT path (not restore): start with a FRESH
                 // spending-nonce tracker regardless of what the
                 // export carries. Three reasons:
@@ -968,7 +1114,12 @@ impl ContextManager {
                     context_id.clone(),
                     Arc::clone(&self.clock),
                 ),
-                proposal_timestamps: export.snapshot.proposal_timestamps,
+                // C3: Wipe `proposal_timestamps`. Earned-capacity rate
+                // limits (§9.3) are per-instance counters. Inheriting
+                // the exporter's history lets it starve victims of
+                // proposal slots — every imported timestamp is a free
+                // bite out of the importing node's enforcement window.
+                proposal_timestamps: HashMap::new(),
             },
             epoch: EpochState {
                 mls_epoch: export.snapshot.mls_epoch,
