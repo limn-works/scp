@@ -424,7 +424,7 @@ if (bridge === null || serverAddon === null) {
       const member = await napi.identityCreate("in_memory");
       const ctx = await napi.contextCreate(
         admin,
-        JSON.stringify({ ceiling: ["tool:register", "tool:invoke:*"] }),
+        JSON.stringify({ ceiling: ["tool:register", "tool:invoke:*", "spending:*"] }),
       );
       const toolId = await napi.toolRegister(ctx, {
         name: "test-tool",
@@ -1038,7 +1038,7 @@ if (bridge === null || serverAddon === null) {
       const ctx = await napi.contextCreate(
         admin,
         JSON.stringify({
-          ceiling: ["tool:register", "tool:invoke:*"],
+          ceiling: ["tool:register", "tool:invoke:*", "spending:*"],
         }),
       );
 
