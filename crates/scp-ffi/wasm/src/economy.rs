@@ -129,19 +129,28 @@ pub fn economy_estimate_cost(
 
         // Evaluate formula if present — delegates to scp-protocol's
         // evaluate_formula (shared implementation).
-        let formula_cost = policy.get("pricing_formula").and_then(|f| {
-            if f.is_null() {
-                return Some(0);
-            }
-            // Deserialize the pricing formula JSON into the typed struct.
-            let formula: PricingFormula = serde_json::from_value(f.clone()).ok()?;
-            let observable = metrics_from_json(&metrics);
-            // evaluate_formula returns Option<Amount>; None means overflow.
-            evaluate_formula(&formula, &observable).map(scp_protocol::economy::Amount::value)
-        });
+        // N4: "key absent" (no formula configured) → formula contributes 0.
+        //     "key present, evaluation overflow" → propagate as null so callers
+        //     know the estimate failed, matching the doc comment and native
+        //     SCP-ECON-12040 behavior.
+        let formula_cost = policy
+            .get("pricing_formula")
+            .filter(|f| !f.is_null())
+            .map_or(Some(0), |f| {
+                // N4: evaluate_formula returns Option<Amount>; None means
+                // overflow → propagate as null (not 0) so callers know the
+                // estimate failed, matching the doc comment and native
+                // SCP-ECON-12040 behavior. Key-absent and null-key both
+                // contribute 0 via the `map_or(Some(0), ...)` default.
+                serde_json::from_value::<PricingFormula>(f.clone())
+                    .ok()
+                    .and_then(|formula| {
+                        let observable = metrics_from_json(&metrics);
+                        evaluate_formula(&formula, &observable)
+                            .map(scp_protocol::economy::Amount::value)
+                    })
+            });
 
-        // N4: propagate overflow as null (not 0) so callers know the estimate
-        // failed, matching the doc comment and native SCP-ECON-12040 behavior.
         let result = formula_cost.map_or_else(
             || serde_json::json!({ "cost": null }),
             |fc| serde_json::json!({ "cost": schedule_cost.saturating_add(fc) }),
