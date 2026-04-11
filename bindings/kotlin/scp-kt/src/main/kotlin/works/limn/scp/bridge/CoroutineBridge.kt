@@ -41,6 +41,10 @@ import kotlinx.serialization.json.jsonPrimitive
 import kotlinx.serialization.json.put
 import works.limn.scp.AssetEntry
 import works.limn.scp.BatchPublishResult
+import works.limn.scp.ConsequenceConfig
+import works.limn.scp.ConsequenceRule
+import works.limn.scp.encodeConsequenceConfigJson
+import works.limn.scp.encodeConsequenceRulesJson
 import works.limn.scp.validateContentPath
 import works.limn.scp.validateDeployId
 import works.limn.scp.validateMimeType
@@ -1502,6 +1506,41 @@ class ContextBridge internal constructor(
                 consequenceConfigJson,
             )
         }
+
+    /**
+     * Create a new context using typed [ConsequenceRule] / [ConsequenceConfig]
+     * shapes (H15).
+     *
+     * Encodes the typed values to the Rust serde wire format internally via
+     * [encodeConsequenceRulesJson] / [encodeConsequenceConfigJson], then
+     * delegates to the JSON-string overload above. This is the preferred
+     * SDK entry point — call sites should not hand-roll JSON for consequence
+     * rules.
+     *
+     * @param identityHandle Handle from identity create or load.
+     * @param paramsJson JSON-encoded base context parameters (ceiling,
+     *   governance, etc). Consequence rules and config travel in the typed
+     *   parameters below, NOT in this JSON blob.
+     * @param consequenceRules Typed list of consequence rules; `null` omits.
+     * @param consequenceConfig Typed per-context config; `null` omits and the
+     *   protocol default applies (`allowAutomaticAccessRevocation = false`).
+     * @return Opaque context handle.
+     */
+    suspend fun create(
+        identityHandle: Long,
+        paramsJson: String,
+        consequenceRules: List<ConsequenceRule>?,
+        consequenceConfig: ConsequenceConfig?,
+    ): Long {
+        val rulesJson = consequenceRules?.let { encodeConsequenceRulesJson(it) }
+        val configJson = consequenceConfig?.let { encodeConsequenceConfigJson(it) }
+        return create(
+            identityHandle = identityHandle,
+            paramsJson = paramsJson,
+            consequenceRulesJson = rulesJson,
+            consequenceConfigJson = configJson,
+        )
+    }
 
     /**
      * Join an existing context.

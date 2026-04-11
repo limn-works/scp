@@ -28,6 +28,7 @@ import type {
   ToolDefinition,
   ToolVerificationResult,
 } from "./types";
+import { encodeConsequenceConfig, encodeConsequenceRules } from "./types";
 
 // ---------------------------------------------------------------------------
 // EconomicPolicy schema validation (§19.3, ADR-034)
@@ -347,12 +348,17 @@ export class Context implements AsyncDisposable {
         ceilingPolicy: params.ceilingPolicy ?? "immutable",
         promotionPolicy: params.promotionPolicy,
         economicPolicy: params.economicPolicy,
-        consequenceRules: params.consequenceRules
-          ? JSON.stringify(params.consequenceRules)
-          : undefined,
-        consequenceConfig: params.consequenceConfig
-          ? JSON.stringify(params.consequenceConfig)
-          : undefined,
+        // Typed -> JSON conversion happens at the SDK boundary so the public
+        // API exposes a discriminated union and the bridge sees the wire shape
+        // it expects. See ADR-017 / #1531 and the C5 bridge work.
+        consequenceRules:
+          params.consequenceRules !== undefined
+            ? encodeConsequenceRules(params.consequenceRules)
+            : undefined,
+        consequenceConfig:
+          params.consequenceConfig !== undefined
+            ? encodeConsequenceConfig(params.consequenceConfig)
+            : undefined,
       });
 
       const handle = await bridge.contextCreate(identity._handle, paramsJson);

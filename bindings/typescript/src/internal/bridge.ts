@@ -69,6 +69,19 @@ export interface Bridge {
    * still accepts a DID string — extract `identity.did` before calling it.
    */
   contextCreate(identity: BridgeIdentityHandle, paramsJson: string): Promise<BridgeContextHandle>;
+  /**
+   * Joins an existing context.
+   *
+   * `spendingUcanJwt` is optional and may be omitted, `undefined`, or
+   * explicitly `null`. The bridge implementations (NAPI, WASM, mock) all
+   * normalize the absent case so consumers can call without a third argument
+   * for the common no-payment join. See ADR-033 §19 and #1531 for the
+   * join-cost AND-composition flow.
+   *
+   * Note: this is the SDK's internal contract — SDK wrappers always normalize
+   * to `null` before calling, so bridge implementations should treat
+   * `undefined` and `null` as equivalent.
+   */
   contextJoin(
     handle: BridgeContextHandle,
     identityDid: string,
@@ -76,6 +89,14 @@ export interface Bridge {
   ): Promise<void>;
   contextLeave(handle: BridgeContextHandle, identityDid: string): Promise<void>;
   contextClose(handle: BridgeContextHandle, identityDid: string): Promise<void>;
+  /**
+   * Sends a message to a context.
+   *
+   * `spendingUcanJwt` is optional and may be omitted, `undefined`, or
+   * explicitly `null`. SDK wrappers always normalize to `null`; bridge
+   * implementations treat `undefined` and `null` as equivalent. See ADR-033
+   * §19 for the per-send spending UCAN flow.
+   */
   contextSend(
     handle: BridgeContextHandle,
     identityDid: string,

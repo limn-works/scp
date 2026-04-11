@@ -45,8 +45,15 @@ export interface ContextParams {
   readonly maxNestingDepth?: number;
   /** Per-caller session cap (§6.2.1). Default 1000. */
   readonly sessionCap?: number;
-  /** Consequence rules for automated governance enforcement (§9.3, #1531). */
-  readonly consequenceRules?: readonly Record<string, unknown>[];
+  /**
+   * Consequence rules for automated governance enforcement (ADR-017, §9.3, #1531).
+   *
+   * Each rule is a typed {@link ConsequenceRule} discriminated union (no
+   * stringly-typed JSON). The SDK serializes the array to JSON at the bridge
+   * boundary; bridge implementations parse and validate before forwarding to
+   * `ContextManager`.
+   */
+  readonly consequenceRules?: readonly ConsequenceRule[];
   /**
    * Per-context consequence config governing which enforcement severities
    * the rules may reference (ADR-017, #1531).
@@ -55,7 +62,319 @@ export interface ContextParams {
    * (`allow_automatic_access_revocation = false`). Must opt in explicitly to
    * permit `RevokeAccess` rules.
    */
-  readonly consequenceConfig?: Readonly<Record<string, unknown>>;
+  readonly consequenceConfig?: ConsequenceConfig;
+}
+
+// ---------------------------------------------------------------------------
+// Consequence rules (ADR-017, §9.3, #1531)
+// ---------------------------------------------------------------------------
+
+/**
+ * A registered tool capability (`tool:invoke:<id>`) within a context.
+ *
+ * Mirrors the `Capability::ToolInvoke(ToolId)` newtype. Carries the tool ID
+ * (an opaque string) and serializes as `{"ToolInvoke": "id"}` to match the
+ * Rust serde tagging.
+ */
+export interface ToolInvokeCapability {
+  /** Discriminant. */
+  readonly kind: "ToolInvoke";
+  /** Opaque tool identifier matching a registered ToolDefinition. */
+  readonly toolId: string;
+}
+
+/**
+ * A custom (context-specific) capability not enumerated by the protocol.
+ *
+ * Mirrors the `Capability::Custom(String)` newtype variant. Serializes as
+ * `{"Custom": "name"}` to match the Rust serde tagging.
+ */
+export interface CustomCapability {
+  /** Discriminant. */
+  readonly kind: "Custom";
+  /** Custom capability name. */
+  readonly name: string;
+}
+
+/**
+ * The unit-variant capabilities defined by the protocol (no payload).
+ *
+ * Each member matches a `scp_protocol::context::roles::Capability` unit
+ * variant. The string values use the canonical PascalCase variant names —
+ * NOT the colon-separated wire names like `"messages:read"` — because the
+ * Rust enum serializes via default serde, which preserves variant names.
+ */
+export type UnitCapability =
+  | "MessagesRead"
+  | "MessagesWrite"
+  | "ToolInvokeAll"
+  | "ToolRegister"
+  | "MemberInvite"
+  | "MemberRemove"
+  | "RoleAssign"
+  | "GovernancePropose"
+  | "GovernanceVote"
+  | "ContextClose"
+  | "ChildContextCreate"
+  | "ToolInterface"
+  | "Bridging"
+  | "MediaVoice"
+  | "MediaVideo"
+  | "MediaScreenShare"
+  | "MemberBan"
+  | "MetadataEdit";
+
+/**
+ * Typed capability matching `scp_protocol::context::roles::Capability`.
+ *
+ * Either a unit-variant string or an object discriminated by `kind` for
+ * payload-bearing variants (`ToolInvoke`, `Custom`). The SDK encoder converts
+ * each variant to the matching Rust serde JSON shape:
+ *
+ * - `"MessagesRead"` → `"MessagesRead"`
+ * - `{ kind: "ToolInvoke", toolId: "calculator" }` → `{"ToolInvoke": "calculator"}`
+ * - `{ kind: "Custom", name: "foo" }` → `{"Custom": "foo"}`
+ */
+export type ConsequenceCapability = UnitCapability | ToolInvokeCapability | CustomCapability;
+
+/**
+ * The condition that triggers a consequence rule (ADR-017 §6).
+ *
+ * Mirrors `scp_protocol::trust::consequence::ConsequenceTrigger`. Three
+ * unit variants count event-log entries; `Custom` carries a string key.
+ *
+ * Variant names match the Rust enum exactly. Renaming any variant breaks
+ * wire compatibility — the {@link CONSEQUENCE_TRIGGER_VARIANTS} pin freezes
+ * the set so future renames produce a type error here.
+ */
+export type ConsequenceTrigger =
+  | { readonly kind: "MessageVelocity" }
+  | { readonly kind: "ToolRateExceeded" }
+  | { readonly kind: "WarningCount" }
+  | { readonly kind: "Custom"; readonly key: string };
+
+/**
+ * Frozen set of {@link ConsequenceTrigger} variant names. Imported by the
+ * SDK round-trip tests so renaming a variant trips a compile error.
+ */
+export const CONSEQUENCE_TRIGGER_VARIANTS = [
+  "MessageVelocity",
+  "ToolRateExceeded",
+  "WarningCount",
+  "Custom",
+] as const satisfies readonly ConsequenceTrigger["kind"][];
+
+/**
+ * Read/Write/Both scope for `RevokeAccess` enforcement.
+ *
+ * Mirrors `scp_protocol::context::governance::AccessScope`.
+ */
+export type AccessScope = "Read" | "Write" | "Both";
+
+/**
+ * Unified enforcement severity for consequence rules and governance actions
+ * (ADR-017, ADR-031).
+ *
+ * Mirrors `scp_protocol::trust::consequence::EnforcementSeverity`. Four tiers
+ * ordered from least to most severe:
+ *
+ * 1. `SuspendCapability` — application-level block on a specific capability set
+ * 2. `SuspendAccess` — application-level block on all member capabilities
+ * 3. `RevokeAccess` — cryptographic revocation (forward-only)
+ * 4. `RemoveMember` — MLS group ejection (governance-only)
+ *
+ * Consequence rules may only reference `SuspendCapability` and `SuspendAccess`
+ * by default. `RevokeAccess` requires
+ * `consequenceConfig.allowAutomaticAccessRevocation = true`. `RemoveMember` is
+ * never allowed in a consequence rule.
+ */
+export type EnforcementSeverity =
+  | { readonly kind: "SuspendCapability"; readonly capabilities: readonly ConsequenceCapability[] }
+  | { readonly kind: "SuspendAccess" }
+  | { readonly kind: "RevokeAccess"; readonly did: string; readonly access: AccessScope }
+  | { readonly kind: "RemoveMember"; readonly did: string; readonly reason?: string };
+
+/**
+ * Frozen set of {@link EnforcementSeverity} variant names. Imported by the
+ * SDK round-trip tests so renaming a variant trips a compile error.
+ */
+export const ENFORCEMENT_SEVERITY_VARIANTS = [
+  "SuspendCapability",
+  "SuspendAccess",
+  "RevokeAccess",
+  "RemoveMember",
+] as const satisfies readonly EnforcementSeverity["kind"][];
+
+/**
+ * The action taken when a {@link ConsequenceRule} fires.
+ *
+ * Mirrors `scp_protocol::trust::consequence::ConsequenceAction`. Two
+ * families:
+ *
+ * - `Enforcement` — apply an {@link EnforcementSeverity} tier to the subject.
+ * - `AssignRole` — replace the subject's role.
+ */
+export type ConsequenceAction =
+  | { readonly kind: "Enforcement"; readonly severity: EnforcementSeverity }
+  | { readonly kind: "AssignRole"; readonly toRole: string };
+
+/**
+ * Frozen set of {@link ConsequenceAction} variant names. Imported by the
+ * SDK round-trip tests so renaming a variant trips a compile error.
+ */
+export const CONSEQUENCE_ACTION_VARIANTS = [
+  "Enforcement",
+  "AssignRole",
+] as const satisfies readonly ConsequenceAction["kind"][];
+
+/**
+ * A declared consequence rule (ADR-017 §1).
+ *
+ * Mirrors `scp_protocol::trust::consequence::ConsequenceRule`. Each rule
+ * specifies a trigger condition, an enforcement action, a numeric threshold,
+ * and a time window (in seconds) for counting events.
+ *
+ * Rules are visible to all participants before they join — the opt-in
+ * contract for consequences. The SDK serializes the array to the wire JSON
+ * shape expected by the Rust bridge.
+ */
+export interface ConsequenceRule {
+  /** Trigger condition discriminated by `kind`. */
+  readonly trigger: ConsequenceTrigger;
+  /** Enforcement action discriminated by `kind`. */
+  readonly action: ConsequenceAction;
+  /**
+   * Threshold count: when matching events within the time window meet or
+   * exceed this value, the consequence fires. Must be > 0.
+   */
+  readonly threshold: number;
+  /** Time window in seconds. Only events in `[now - windowSecs, now]` count. */
+  readonly windowSecs: number;
+}
+
+/**
+ * Per-context configuration governing which enforcement severities
+ * consequence rules may reference (ADR-017, #1531).
+ *
+ * Mirrors `scp_protocol::context::params::ConsequenceConfig`. Defaults to
+ * `allowAutomaticAccessRevocation = false`: contexts must explicitly opt in
+ * to permit `RevokeAccess` rules. `RemoveMember` is never allowed in
+ * consequence rules regardless of this flag.
+ */
+export interface ConsequenceConfig {
+  /**
+   * If `true`, consequence rules may reference
+   * `EnforcementSeverity.RevokeAccess` — i.e., automatic cryptographic
+   * revocation of a member's access keys. Defaults to `false`.
+   */
+  readonly allowAutomaticAccessRevocation: boolean;
+}
+
+/**
+ * Encodes a typed {@link ConsequenceRule} array to the JSON wire shape
+ * expected by the Rust bridge.
+ *
+ * Public for SDK call sites that need to forward pre-serialized rules
+ * (e.g. invitation evaluation) and for tests that pin the discriminated
+ * union shapes against the Rust serde format.
+ *
+ * @throws {Error} If a variant has an unknown `kind`.
+ */
+export function encodeConsequenceRules(rules: readonly ConsequenceRule[]): string {
+  return JSON.stringify(rules.map(encodeConsequenceRule));
+}
+
+/**
+ * Encodes a typed {@link ConsequenceConfig} to the JSON wire shape expected
+ * by the Rust bridge. Field names are snake_cased to match
+ * `serde_json::to_string(&ConsequenceConfig)`.
+ */
+export function encodeConsequenceConfig(config: ConsequenceConfig): string {
+  return JSON.stringify({
+    allow_automatic_access_revocation: config.allowAutomaticAccessRevocation,
+  });
+}
+
+function encodeConsequenceRule(rule: ConsequenceRule): Record<string, unknown> {
+  return {
+    trigger: encodeConsequenceTrigger(rule.trigger),
+    action: encodeConsequenceAction(rule.action),
+    threshold: rule.threshold,
+    window: { secs: rule.windowSecs, nanos: 0 },
+  };
+}
+
+function encodeConsequenceTrigger(trigger: ConsequenceTrigger): unknown {
+  switch (trigger.kind) {
+    case "MessageVelocity":
+    case "ToolRateExceeded":
+    case "WarningCount":
+      return trigger.kind;
+    case "Custom":
+      return { Custom: trigger.key };
+    default: {
+      const exhaustive: never = trigger;
+      throw new Error(`unknown ConsequenceTrigger kind: ${JSON.stringify(exhaustive)}`);
+    }
+  }
+}
+
+function encodeConsequenceAction(action: ConsequenceAction): unknown {
+  switch (action.kind) {
+    case "Enforcement":
+      return { Enforcement: encodeEnforcementSeverity(action.severity) };
+    case "AssignRole":
+      return { AssignRole: { to_role: action.toRole } };
+    default: {
+      const exhaustive: never = action;
+      throw new Error(`unknown ConsequenceAction kind: ${JSON.stringify(exhaustive)}`);
+    }
+  }
+}
+
+function encodeEnforcementSeverity(severity: EnforcementSeverity): unknown {
+  switch (severity.kind) {
+    case "SuspendAccess":
+      return "SuspendAccess";
+    case "SuspendCapability":
+      return {
+        SuspendCapability: {
+          capabilities: severity.capabilities.map(encodeConsequenceCapability),
+        },
+      };
+    case "RevokeAccess":
+      return {
+        RevokeAccess: {
+          did: severity.did,
+          access: severity.access,
+        },
+      };
+    case "RemoveMember":
+      return {
+        RemoveMember: {
+          did: severity.did,
+          reason: severity.reason ?? null,
+        },
+      };
+    default: {
+      const exhaustive: never = severity;
+      throw new Error(`unknown EnforcementSeverity kind: ${JSON.stringify(exhaustive)}`);
+    }
+  }
+}
+
+function encodeConsequenceCapability(capability: ConsequenceCapability): unknown {
+  if (typeof capability === "string") {
+    return capability;
+  }
+  if (capability.kind === "ToolInvoke") {
+    return { ToolInvoke: capability.toolId };
+  }
+  if (capability.kind === "Custom") {
+    return { Custom: capability.name };
+  }
+  const exhaustive: never = capability;
+  throw new Error(`unknown ConsequenceCapability variant: ${JSON.stringify(exhaustive)}`);
 }
 
 // ---------------------------------------------------------------------------

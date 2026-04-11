@@ -727,7 +727,7 @@ export function createWasmBridge(): Bridge {
     async contextJoin(
       handle: BridgeContextHandle,
       identityDid: string,
-      spendingUcanJwt: string | null,
+      spendingUcanJwt?: string | null,
     ): Promise<void> {
       const wasm = getWasm();
       await wasm.context_join(handle, identityDid, spendingUcanJwt ?? undefined);
@@ -747,7 +747,7 @@ export function createWasmBridge(): Bridge {
       handle: BridgeContextHandle,
       identityDid: string,
       payload: Uint8Array,
-      spendingUcanJwt: string | null,
+      spendingUcanJwt?: string | null,
     ): Promise<void> {
       const wasm = getWasm();
       const payloadBase64 = uint8ToBase64(payload);
