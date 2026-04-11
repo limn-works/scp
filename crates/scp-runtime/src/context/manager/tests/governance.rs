@@ -15882,3 +15882,665 @@ async fn h10_conflict_resolution_uses_seq_not_timestamp() {
         );
     }
 }
+// H20: Suspend* consequences MUST NOT touch MLS membership
+// ===========================================================================
+//
+// Spec §7.3.7 / §5.9: consequence-tier `Suspend*` actions
+// (`SuspendCapability` and `SuspendAccess` — the latter being the "suspend
+// every capability the member holds" variant historically referred to as
+// "SuspendAll") are pure capability-layer enforcement. They MUST NOT evict
+// the victim from MLS membership: that would conflate access control with
+// group membership and break cryptographic access if the suspension is
+// later lifted (the victim still needs to be in the MLS group to decrypt
+// historical messages once `RestoreAccess` runs). Membership eviction is
+// the exclusive job of `RemoveMember` / `RevokeAccess` governance actions.
+//
+// PR #1606 (H17 / behavioral coverage) claimed two F-group tests proving
+// this invariant; on review the existing tests only checked
+// `suspended_capabilities` non-emptiness and never asserted that
+// `MockCrypto::remove_member` was uncalled or that the victim was still in
+// `ctx.membership`. A future refactor could quietly start calling
+// `remove_member` from `enforce_triggered_consequences` and every existing
+// test would still pass while the cryptographic invariant silently broke.
+// These three regression tests pin the contract end-to-end through
+// `ContextManager::enforce_triggered_consequences` (the same code path the
+// production receive-side hook in `messaging.rs` uses).
+//
+// Pre-fix verification protocol (executed once before push, see commit
+// message): a temporary edit added
+// `ctx.membership.remove(member_did.as_ref());` immediately before the
+// `match severity` block in `governance.rs::enforce_triggered_consequences`
+// to simulate the invariant being broken. Each of the three tests below
+// failed with the expected assertion message. Reverting the production
+// code restored green.
+
+/// H20.1 — `EnforcementSeverity::SuspendAccess` (the "suspend every
+/// capability" variant) is pure capability-layer enforcement. It MUST
+/// NOT call `MockCrypto::remove_member`, MUST NOT evict the victim from
+/// `ctx.membership`, and MUST NOT destroy the victim's sender key entry.
+/// All capabilities the victim's role grants must end up in
+/// `suspended_capabilities` so the suspension-aware
+/// `member_has_capability` fold returns `false` for every one of them.
+#[allow(clippy::too_many_lines)] // exhaustive multi-stage regression assertion
+#[tokio::test]
+async fn suspend_all_consequence_preserves_mls_membership() {
+    use scp_event_log::EventType;
+    use scp_protocol::trust::consequence::{
+        ConsequenceAction, ConsequenceEvidence, ConsequenceRule, ConsequenceTrigger,
+        EnforcementSeverity, TriggeredConsequence,
+    };
+    use std::time::Duration;
+
+    // Build a manager whose crypto provider's `call_order` we can observe
+    // after construction (mirrors the H9 sender-key ordering test pattern
+    // at governance.rs:5851). `members_removed` is captured via the same
+    // shared handle by scanning `call_order` for `remove_member` entries.
+    let crypto = MockCrypto::default();
+    let call_order = Arc::clone(&crypto.call_order);
+
+    let manager = ContextManager::new(
+        Box::new(crypto),
+        Box::new(MockTransport::connected()),
+        Box::new(MockEventLog::default()),
+        mock_key_resolver(),
+    );
+
+    let admin: DID = "did:dht:z6MkAdminH20A".into();
+    let alice: DID = "did:dht:z6MkAliceH20A".into();
+
+    // WarningCount rule with threshold=1 + SuspendAccess action — the rule
+    // itself is not what we're testing (we feed `enforce_triggered_consequences`
+    // a hand-built `TriggeredConsequence` directly), but it must exist on
+    // the context so the dispatch path is realistic and `rules` indexing
+    // resolves cleanly.
+    let mut params = governance_params();
+    params.consequence_rules = vec![ConsequenceRule {
+        trigger: ConsequenceTrigger::WarningCount,
+        threshold: 1,
+        action: ConsequenceAction::Enforcement(EnforcementSeverity::SuspendAccess),
+        window: Duration::from_secs(3600),
+    }];
+
+    let handle = manager
+        .create_context("h20a-ctx".into(), params, admin.clone())
+        .await
+        .unwrap();
+
+    // Add Alice via the real `join_context` flow so `assign_role`
+    // populates `member_capabilities` with the full `member` builtin role
+    // grant set (MessagesRead + MessagesWrite + ToolInvokeAll). Without
+    // this, `suspend_all` would have nothing to copy into the suspended
+    // set and the assertions would be vacuous.
+    let alice_kp = scp_protocol::context::membership::KeyPackage::mock(alice.clone());
+    manager.join_context(&handle, alice_kp, None).await.unwrap();
+
+    // Snapshot Alice's pre-condition state — she must be in membership,
+    // hold the role-granted caps, and have a sender-key store entry.
+    {
+        let contexts = manager.contexts.lock().await;
+        let ctx = contexts.get("h20a-ctx").unwrap();
+        assert!(
+            ctx.membership.contains(alice.as_ref()),
+            "pre-flight: Alice must be a member after join"
+        );
+        assert!(
+            ctx.role_state
+                .member_capabilities
+                .contains_key(alice.as_ref()),
+            "pre-flight: Alice must have role-granted capabilities after join"
+        );
+        assert!(
+            ctx.role_state
+                .member_has_capability(alice.as_ref(), &Capability::MessagesWrite),
+            "pre-flight: Alice must hold MessagesWrite via the member role"
+        );
+        assert!(
+            ctx.role_state
+                .member_has_capability(alice.as_ref(), &Capability::MessagesRead),
+            "pre-flight: Alice must hold MessagesRead via the member role"
+        );
+        assert!(
+            !ctx.role_state
+                .suspended_capabilities
+                .contains_key(alice.as_ref()),
+            "pre-flight: Alice must not have any suspended capabilities yet"
+        );
+    }
+
+    // Clear the call log so any `add_member` / `distribute_sender_key`
+    // calls from the join phase don't pollute the post-condition scan.
+    call_order.lock().unwrap().clear();
+
+    // Hand-build the triggered consequence and invoke
+    // `enforce_triggered_consequences` directly — same entry point used
+    // by the existing TOCTOU test at governance.rs:13418. Evidence is
+    // non-empty so the ghost-DID guard does not apply (and Alice is
+    // present anyway).
+    let rules = vec![ConsequenceRule {
+        trigger: ConsequenceTrigger::WarningCount,
+        threshold: 1,
+        action: ConsequenceAction::Enforcement(EnforcementSeverity::SuspendAccess),
+        window: Duration::from_secs(3600),
+    }];
+    let triggered = vec![TriggeredConsequence {
+        rule_index: 0,
+        action: ConsequenceAction::Enforcement(EnforcementSeverity::SuspendAccess),
+        evidence: vec![ConsequenceEvidence {
+            event_sequence: 1,
+            timestamp: 1000,
+            actor_did: admin.clone(),
+            event_type: EventType::GovernanceAction,
+        }],
+    }];
+
+    {
+        let mut contexts = manager.contexts.lock().await;
+        let ctx = contexts.get_mut("h20a-ctx").unwrap();
+        super::super::governance::enforce_triggered_consequences(
+            ctx,
+            "h20a-ctx",
+            &alice,
+            2000,
+            &triggered,
+            &rules,
+            &scp_primitives::SystemClock,
+        );
+    }
+
+    // Post-conditions.
+    {
+        let contexts = manager.contexts.lock().await;
+        let ctx = contexts.get("h20a-ctx").unwrap();
+
+        // (1) Membership preserved — the consequence path MUST NOT remove
+        //     Alice from the membership map. Removing here would orphan
+        //     the MLS group from the role state and break the suspension
+        //     contract.
+        assert!(
+            ctx.membership.contains(alice.as_ref()),
+            "H20.1 INVARIANT: SuspendAccess must NOT evict Alice from \
+             ctx.membership; that is the job of RemoveMember"
+        );
+
+        // (2) Role-granted capability set preserved — suspension is an
+        //     overlay, not a role mutation. `restore_capabilities` must
+        //     be able to revive Alice's role-granted caps unchanged.
+        assert!(
+            ctx.role_state
+                .member_capabilities
+                .contains_key(alice.as_ref()),
+            "H20.1 INVARIANT: SuspendAccess must NOT purge \
+             member_capabilities; suspension is an overlay"
+        );
+
+        // (3) Suspension applied at the capability layer for every
+        //     capability the role grants. `suspend_all` copies the entire
+        //     `member_capabilities[alice]` set into
+        //     `suspended_capabilities[alice]`.
+        let granted = ctx
+            .role_state
+            .member_capabilities
+            .get(alice.as_ref())
+            .cloned()
+            .expect("Alice's role-granted caps must still be present");
+        let suspended = ctx
+            .role_state
+            .suspended_capabilities
+            .get(alice.as_ref())
+            .unwrap_or_else(|| {
+                panic!(
+                    "H20.1: Alice must appear in suspended_capabilities after \
+                     SuspendAccess; present keys: {:?}",
+                    ctx.role_state
+                        .suspended_capabilities
+                        .keys()
+                        .collect::<Vec<_>>()
+                )
+            });
+        assert_eq!(
+            suspended, &granted,
+            "H20.1: SuspendAccess must suspend every capability Alice's role \
+             grants. granted={granted:?} suspended={suspended:?}"
+        );
+
+        // (4) Suspension-aware fold reflects the suspension for every cap.
+        for cap in &granted {
+            assert!(
+                !ctx.role_state.member_has_capability(alice.as_ref(), cap),
+                "H20.1: member_has_capability({cap:?}) must return false \
+                 after SuspendAccess"
+            );
+        }
+        // Belt-and-braces: messaging caps specifically.
+        assert!(
+            !ctx.role_state
+                .member_has_capability(alice.as_ref(), &Capability::MessagesRead),
+            "H20.1: MessagesRead must be blocked after SuspendAccess"
+        );
+        assert!(
+            !ctx.role_state
+                .member_has_capability(alice.as_ref(), &Capability::MessagesWrite),
+            "H20.1: MessagesWrite must be blocked after SuspendAccess"
+        );
+    }
+
+    // (5) MLS-side: the crypto provider's `remove_member` and
+    //     `remove_member_sender_key` MUST NOT have been called for Alice.
+    //     This is the regression bite — a future refactor that adds
+    //     `remove_member` to the suspend path will fail here even if
+    //     every role-state assertion above continues to pass.
+    let calls = call_order.lock().unwrap();
+    let remove_member_for_alice: Vec<_> = calls
+        .iter()
+        .filter(|(method, did)| method == "remove_member" && did == alice.as_ref())
+        .collect();
+    assert!(
+        remove_member_for_alice.is_empty(),
+        "H20.1 INVARIANT: MockCrypto::remove_member MUST NOT be called \
+         during SuspendAccess enforcement. Recorded calls: {calls:?}"
+    );
+    let sender_key_removed_for_alice: Vec<_> = calls
+        .iter()
+        .filter(|(method, did)| method == "remove_member_sender_key" && did == alice.as_ref())
+        .collect();
+    assert!(
+        sender_key_removed_for_alice.is_empty(),
+        "H20.1 INVARIANT: MockCrypto::remove_member_sender_key MUST NOT \
+         be called during SuspendAccess enforcement — Alice must be able \
+         to decrypt historical messages after RestoreAccess. Recorded \
+         calls: {calls:?}"
+    );
+}
+
+/// H20.2 — `EnforcementSeverity::SuspendCapability` is the narrower
+/// variant: it suspends only the listed capabilities. Same MLS-membership
+/// invariant applies; additionally, capabilities NOT in the suspend list
+/// must remain functional. This pins the partial-suspension path
+/// alongside the full-suspension path covered by H20.1.
+#[allow(clippy::too_many_lines)] // exhaustive multi-stage regression assertion
+#[tokio::test]
+async fn suspend_capability_consequence_preserves_mls_membership() {
+    use scp_event_log::EventType;
+    use scp_protocol::trust::consequence::{
+        ConsequenceAction, ConsequenceEvidence, ConsequenceRule, ConsequenceTrigger,
+        EnforcementSeverity, TriggeredConsequence,
+    };
+    use std::time::Duration;
+
+    let crypto = MockCrypto::default();
+    let call_order = Arc::clone(&crypto.call_order);
+
+    let manager = ContextManager::new(
+        Box::new(crypto),
+        Box::new(MockTransport::connected()),
+        Box::new(MockEventLog::default()),
+        mock_key_resolver(),
+    );
+
+    let admin: DID = "did:dht:z6MkAdminH20B".into();
+    let alice: DID = "did:dht:z6MkAliceH20B".into();
+
+    let mut params = governance_params();
+    params.consequence_rules = vec![ConsequenceRule {
+        trigger: ConsequenceTrigger::WarningCount,
+        threshold: 1,
+        action: ConsequenceAction::Enforcement(EnforcementSeverity::SuspendCapability {
+            capabilities: vec![Capability::MessagesWrite],
+        }),
+        window: Duration::from_secs(3600),
+    }];
+
+    let handle = manager
+        .create_context("h20b-ctx".into(), params, admin.clone())
+        .await
+        .unwrap();
+
+    let alice_kp = scp_protocol::context::membership::KeyPackage::mock(alice.clone());
+    manager.join_context(&handle, alice_kp, None).await.unwrap();
+
+    // Pre-flight: Alice has both MessagesRead and MessagesWrite via the
+    // member role.
+    {
+        let contexts = manager.contexts.lock().await;
+        let ctx = contexts.get("h20b-ctx").unwrap();
+        assert!(ctx.membership.contains(alice.as_ref()));
+        assert!(
+            ctx.role_state
+                .member_has_capability(alice.as_ref(), &Capability::MessagesWrite),
+            "pre-flight: Alice has MessagesWrite"
+        );
+        assert!(
+            ctx.role_state
+                .member_has_capability(alice.as_ref(), &Capability::MessagesRead),
+            "pre-flight: Alice has MessagesRead"
+        );
+    }
+
+    call_order.lock().unwrap().clear();
+
+    let rules = vec![ConsequenceRule {
+        trigger: ConsequenceTrigger::WarningCount,
+        threshold: 1,
+        action: ConsequenceAction::Enforcement(EnforcementSeverity::SuspendCapability {
+            capabilities: vec![Capability::MessagesWrite],
+        }),
+        window: Duration::from_secs(3600),
+    }];
+    let triggered = vec![TriggeredConsequence {
+        rule_index: 0,
+        action: ConsequenceAction::Enforcement(EnforcementSeverity::SuspendCapability {
+            capabilities: vec![Capability::MessagesWrite],
+        }),
+        evidence: vec![ConsequenceEvidence {
+            event_sequence: 1,
+            timestamp: 1000,
+            actor_did: admin.clone(),
+            event_type: EventType::GovernanceAction,
+        }],
+    }];
+
+    {
+        let mut contexts = manager.contexts.lock().await;
+        let ctx = contexts.get_mut("h20b-ctx").unwrap();
+        super::super::governance::enforce_triggered_consequences(
+            ctx,
+            "h20b-ctx",
+            &alice,
+            2000,
+            &triggered,
+            &rules,
+            &scp_primitives::SystemClock,
+        );
+    }
+
+    {
+        let contexts = manager.contexts.lock().await;
+        let ctx = contexts.get("h20b-ctx").unwrap();
+
+        // Membership and role state preserved.
+        assert!(
+            ctx.membership.contains(alice.as_ref()),
+            "H20.2 INVARIANT: SuspendCapability must NOT evict Alice"
+        );
+        assert!(
+            ctx.role_state
+                .member_capabilities
+                .contains_key(alice.as_ref()),
+            "H20.2 INVARIANT: SuspendCapability must NOT purge \
+             member_capabilities"
+        );
+
+        // Only MessagesWrite is suspended; MessagesRead is untouched.
+        let suspended = ctx
+            .role_state
+            .suspended_capabilities
+            .get(alice.as_ref())
+            .expect("H20.2: Alice must have a suspended_capabilities entry");
+        assert!(
+            suspended.contains(&Capability::MessagesWrite),
+            "H20.2: MessagesWrite must be in the suspended set, got {suspended:?}"
+        );
+        assert!(
+            !suspended.contains(&Capability::MessagesRead),
+            "H20.2: SuspendCapability must NOT suspend MessagesRead — only \
+             the listed capabilities. Got {suspended:?}"
+        );
+
+        // Suspension-aware capability check: MessagesWrite blocked,
+        // MessagesRead still works.
+        assert!(
+            !ctx.role_state
+                .member_has_capability(alice.as_ref(), &Capability::MessagesWrite),
+            "H20.2: MessagesWrite must be blocked after SuspendCapability"
+        );
+        assert!(
+            ctx.role_state
+                .member_has_capability(alice.as_ref(), &Capability::MessagesRead),
+            "H20.2: MessagesRead must still work — it was not in the \
+             suspend list"
+        );
+    }
+
+    // MLS untouched — no remove_member, no remove_member_sender_key.
+    let calls = call_order.lock().unwrap();
+    let remove_for_alice: Vec<_> = calls
+        .iter()
+        .filter(|(method, did)| {
+            (method == "remove_member" || method == "remove_member_sender_key")
+                && did == alice.as_ref()
+        })
+        .collect();
+    assert!(
+        remove_for_alice.is_empty(),
+        "H20.2 INVARIANT: SuspendCapability must NOT call any MLS \
+         membership-affecting crypto provider methods. Recorded calls: \
+         {calls:?}"
+    );
+}
+
+/// H20.3 — Roundtrip: after `SuspendAccess` blocks Alice, a `RestoreAccess`
+/// governance action must regrant her capabilities at the role-state
+/// layer. This proves the suspension is genuinely reversible (the whole
+/// point of *not* touching MLS — if `SuspendAccess` had evicted Alice from
+/// the group, `RestoreAccess` could not put her back). MLS membership must
+/// remain untouched throughout the entire roundtrip.
+#[allow(clippy::too_many_lines)] // exhaustive multi-stage regression assertion
+#[tokio::test]
+async fn restore_access_after_suspend_all_regrants_capabilities() {
+    use scp_event_log::EventType;
+    use scp_protocol::trust::consequence::{
+        ConsequenceAction, ConsequenceEvidence, ConsequenceRule, ConsequenceTrigger,
+        EnforcementSeverity, TriggeredConsequence,
+    };
+    use std::time::Duration;
+
+    let crypto = MockCrypto::default();
+    let call_order = Arc::clone(&crypto.call_order);
+
+    let manager = ContextManager::new(
+        Box::new(crypto),
+        Box::new(MockTransport::connected()),
+        Box::new(MockEventLog::default()),
+        mock_key_resolver(),
+    );
+
+    let admin: DID = "did:dht:z6MkAdminH20C".into();
+    let alice: DID = "did:dht:z6MkAliceH20C".into();
+
+    // No consequence rules on the context. We invoke
+    // `enforce_triggered_consequences` directly with a hand-built
+    // `TriggeredConsequence`, so the on-context rule list is irrelevant
+    // for the suspend phase. Critically, leaving the rule list empty
+    // prevents `execute_governance_action` from re-running
+    // `dispatch_consequences` after RestoreAccess and immediately
+    // re-suspending Alice (the proposal itself is a governance action
+    // against her, which a `WarningCount` rule with threshold=1 would
+    // re-fire on).
+    let params = governance_params();
+
+    let handle = manager
+        .create_context("h20c-ctx".into(), params, admin.clone())
+        .await
+        .unwrap();
+
+    let alice_kp = scp_protocol::context::membership::KeyPackage::mock(alice.clone());
+    manager.join_context(&handle, alice_kp, None).await.unwrap();
+
+    // Snapshot Alice's role-granted capability set BEFORE suspension so
+    // we can compare it after RestoreAccess.
+    let pre_caps = {
+        let contexts = manager.contexts.lock().await;
+        let ctx = contexts.get("h20c-ctx").unwrap();
+        ctx.role_state
+            .member_capabilities
+            .get(alice.as_ref())
+            .cloned()
+            .expect("Alice must have role-granted capabilities after join")
+    };
+    assert!(
+        pre_caps.contains(&Capability::MessagesWrite),
+        "pre-flight: pre_caps must contain MessagesWrite"
+    );
+    assert!(
+        pre_caps.contains(&Capability::MessagesRead),
+        "pre-flight: pre_caps must contain MessagesRead"
+    );
+
+    call_order.lock().unwrap().clear();
+
+    // ----- Phase 1: SuspendAccess via consequence dispatch -----
+    let rules = vec![ConsequenceRule {
+        trigger: ConsequenceTrigger::WarningCount,
+        threshold: 1,
+        action: ConsequenceAction::Enforcement(EnforcementSeverity::SuspendAccess),
+        window: Duration::from_secs(3600),
+    }];
+    let triggered = vec![TriggeredConsequence {
+        rule_index: 0,
+        action: ConsequenceAction::Enforcement(EnforcementSeverity::SuspendAccess),
+        evidence: vec![ConsequenceEvidence {
+            event_sequence: 1,
+            timestamp: 1000,
+            actor_did: admin.clone(),
+            event_type: EventType::GovernanceAction,
+        }],
+    }];
+
+    {
+        let mut contexts = manager.contexts.lock().await;
+        let ctx = contexts.get_mut("h20c-ctx").unwrap();
+        super::super::governance::enforce_triggered_consequences(
+            ctx,
+            "h20c-ctx",
+            &alice,
+            2000,
+            &triggered,
+            &rules,
+            &scp_primitives::SystemClock,
+        );
+    }
+
+    // Mid-roundtrip assertion: Alice is fully suspended but still a member.
+    {
+        let contexts = manager.contexts.lock().await;
+        let ctx = contexts.get("h20c-ctx").unwrap();
+        assert!(
+            ctx.membership.contains(alice.as_ref()),
+            "H20.3 mid-roundtrip: Alice must still be in membership after \
+             SuspendAccess"
+        );
+        assert!(
+            !ctx.role_state
+                .member_has_capability(alice.as_ref(), &Capability::MessagesWrite),
+            "H20.3 mid-roundtrip: MessagesWrite must be blocked"
+        );
+        assert!(
+            !ctx.role_state
+                .member_has_capability(alice.as_ref(), &Capability::MessagesRead),
+            "H20.3 mid-roundtrip: MessagesRead must be blocked"
+        );
+    }
+
+    // ----- Phase 2: RestoreAccess via the governance path -----
+    // Use the same approved-proposal helper the existing trust-recovery
+    // tests use (trust_recovery.rs:70). RestoreAccess executes through
+    // `execute_restore_access` and calls `role_state.restore_capabilities`
+    // for the listed capabilities.
+    let restore = approved_governance_proposal(
+        &admin,
+        "h20c-ctx",
+        &alice,
+        GovernanceAction::RestoreAccess {
+            did: alice.clone(),
+            capabilities: vec![Capability::MessagesRead, Capability::MessagesWrite],
+        },
+    );
+    let result = manager
+        .execute_governance_action("h20c-ctx", &restore)
+        .await;
+    assert!(
+        result.is_ok(),
+        "H20.3: RestoreAccess governance action must succeed: {result:?}"
+    );
+
+    // Post-restore assertions.
+    {
+        let contexts = manager.contexts.lock().await;
+        let ctx = contexts.get("h20c-ctx").unwrap();
+
+        // Alice is still a member — MLS membership untouched throughout.
+        assert!(
+            ctx.membership.contains(alice.as_ref()),
+            "H20.3: Alice must remain a member after the SuspendAccess + \
+             RestoreAccess roundtrip"
+        );
+
+        // The two restored capabilities are no longer in the suspended set.
+        let still_suspended = ctx.role_state.suspended_capabilities.get(alice.as_ref());
+        match still_suspended {
+            None => {
+                // Best case: empty set was pruned. This is what
+                // `restore_capabilities` does when the set becomes empty.
+            }
+            Some(set) => {
+                assert!(
+                    !set.contains(&Capability::MessagesWrite),
+                    "H20.3: MessagesWrite must be removed from suspended set \
+                     after RestoreAccess, got {set:?}"
+                );
+                assert!(
+                    !set.contains(&Capability::MessagesRead),
+                    "H20.3: MessagesRead must be removed from suspended set \
+                     after RestoreAccess, got {set:?}"
+                );
+            }
+        }
+
+        // Suspension-aware capability check: Alice can write and read again.
+        // This is the regrant proof — if SuspendAccess had evicted Alice
+        // from MLS, no role-state mutation could restore her ability to
+        // decrypt and send within the existing group.
+        assert!(
+            ctx.role_state
+                .member_has_capability(alice.as_ref(), &Capability::MessagesWrite),
+            "H20.3: Alice must hold MessagesWrite again after RestoreAccess"
+        );
+        assert!(
+            ctx.role_state
+                .member_has_capability(alice.as_ref(), &Capability::MessagesRead),
+            "H20.3: Alice must hold MessagesRead again after RestoreAccess"
+        );
+
+        // The role-granted set is the same one she joined with — restore
+        // is a pure overlay removal, not a role mutation.
+        let post_caps = ctx
+            .role_state
+            .member_capabilities
+            .get(alice.as_ref())
+            .expect("Alice's role-granted caps must still be present");
+        assert_eq!(
+            post_caps, &pre_caps,
+            "H20.3: role-granted member_capabilities must be unchanged \
+             across the SuspendAccess + RestoreAccess roundtrip"
+        );
+    }
+
+    // Across the entire roundtrip, MockCrypto::remove_member and
+    // remove_member_sender_key must NEVER have been called for Alice.
+    // RestoreAccess does not touch MLS at all (mls_integration.rs labels
+    // it `NoMlsChange`); SuspendAccess must not either.
+    let calls = call_order.lock().unwrap();
+    let mls_calls_for_alice: Vec<_> = calls
+        .iter()
+        .filter(|(method, did)| {
+            (method == "remove_member" || method == "remove_member_sender_key")
+                && did == alice.as_ref()
+        })
+        .collect();
+    assert!(
+        mls_calls_for_alice.is_empty(),
+        "H20.3 INVARIANT: no MLS membership-affecting calls may target \
+         Alice during the SuspendAccess + RestoreAccess roundtrip. \
+         Recorded calls: {calls:?}"
+    );
+}
