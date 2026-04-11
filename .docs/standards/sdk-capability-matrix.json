@@ -51,7 +51,19 @@
         {"name": "import_context", "python": false, "typescript": false, "kotlin": false, "swift": true,
          "exemptions": {"python": "not exported in Python SDK", "typescript": "not exported in TypeScript SDK", "kotlin": "not exported in Kotlin SDK"}},
         {"name": "restore_context", "python": true, "typescript": true, "kotlin": true, "swift": true},
-        {"name": "restore_all_contexts", "python": true, "typescript": true, "kotlin": true, "swift": true}
+        {"name": "restore_all_contexts", "python": true, "typescript": true, "kotlin": true, "swift": true},
+        {"name": "create_with_consequence_rules", "python": true, "typescript": true, "kotlin": false, "swift": true,
+         "notes": "ContextParams now carries optional consequence_rules JSON field (ADR-017, #1531). PyO3, NAPI, UniFFI, and WASM bridges parse and persist the field; PyO3/NAPI/UniFFI Swift SDK wrappers expose it via params struct field. Kotlin SDK has no Context wrapper that surfaces ContextParams construction.",
+         "exemptions": {"kotlin": "Kotlin SDK exposes ContextParams via UniFFI generated bindings only; no idiomatic wrapper accepts consequence_rules"}},
+        {"name": "import_context_validates_snapshots", "python": false, "typescript": false, "kotlin": false, "swift": false,
+         "notes": "Internal: ContextManager::import_context now calls validate_and_sanitize_snapshot on velocity tracker, hard-rate-limit token bucket, and spending nonce tracker (lifecycle.rs:864/879, batch-2 wiring). No direct SDK call site — invoked transitively from import_context.",
+         "exemptions": {"python": "internal wiring inside import_context, not a separate SDK operation", "typescript": "internal wiring inside import_context, not a separate SDK operation", "kotlin": "internal wiring inside import_context, not a separate SDK operation", "swift": "internal wiring inside import_context, not a separate SDK operation"}},
+        {"name": "snapshot_context_includes_consequence_state", "python": false, "typescript": false, "kotlin": false, "swift": false,
+         "notes": "Internal: ContextSnapshot now serializes consequence_rules, velocity_tracker_snapshot, hard_rate_limit_snapshot, spending_nonce_state. No direct SDK call site — invoked transitively from export_context/snapshot_context.",
+         "exemptions": {"python": "internal wiring inside export_context, not a separate SDK operation", "typescript": "internal wiring inside export_context, not a separate SDK operation", "kotlin": "internal wiring inside export_context, not a separate SDK operation", "swift": "internal wiring inside export_context, not a separate SDK operation"}},
+        {"name": "restore_context_includes_consequence_state", "python": false, "typescript": false, "kotlin": false, "swift": false,
+         "notes": "Internal: ContextManager::restore_context rebuilds consequence_rules, velocity_tracker, hard_rate_limit, spending_nonce_tracker from snapshot. No direct SDK call site — invoked transitively from restore_context.",
+         "exemptions": {"python": "internal wiring inside restore_context, not a separate SDK operation", "typescript": "internal wiring inside restore_context, not a separate SDK operation", "kotlin": "internal wiring inside restore_context, not a separate SDK operation", "swift": "internal wiring inside restore_context, not a separate SDK operation"}}
       ]
     },
     {
@@ -67,7 +79,12 @@
         {"name": "broadcast_block_subscriber", "python": true, "typescript": true, "kotlin": true, "swift": true},
         {"name": "broadcast_unblock_subscriber", "python": true, "typescript": true, "kotlin": true, "swift": true},
         {"name": "broadcast_handle_key_request", "python": true, "typescript": true, "kotlin": true, "swift": true},
-        {"name": "validate_broadcast_key", "python": true, "typescript": true, "kotlin": true, "swift": true}
+        {"name": "validate_broadcast_key", "python": true, "typescript": true, "kotlin": true, "swift": true},
+        {"name": "send_with_spending_ucan", "python": true, "typescript": true, "kotlin": true, "swift": true,
+         "notes": "context_send / Context.send accepts an optional spending_ucan_jwt parameter that AND-composes the per-action UCAN with a spending UCAN authorizing the message cost (#1537, batch-2 wiring). PyO3 bridge wires it through send_message. NAPI bridge accepts the parameter and threads it to ContextManager::send_message. UniFFI bridge: regenerated Swift/Kotlin bindings expose spendingUcanJwt; the Rust UniFFI bridge source still passes None to ContextManager::send_message — drift to be reconciled before the spending UCAN path is enforced on UniFFI consumers. WASM bridge accepts the parameter but ignores it (underscore-prefixed in manager.rs:1356)."},
+        {"name": "join_with_spending_ucan", "python": true, "typescript": true, "kotlin": false, "swift": true,
+         "notes": "context_join accepts an optional spending_ucan_jwt parameter for join-cost authorization (#1537, batch-2 wiring). PyO3 bridge wires it through join_context (scp-ffi/src/context.rs context_join). Swift wrapper Context.join exposes spendingUcanJwt via the regenerated UniFFI bindings (Context.swift:620). TypeScript wrapper Context.join exposes spendingUcanJwt (typescript/src/context.ts:368). HOWEVER: the underlying NAPI bridge context_join hard-codes None (napi/src/context.rs:606), the UniFFI bridge context_join hard-codes None (uniffi/src/bridge.rs:2931), and WASM ignores the parameter (manager.rs:1265 _spending_ucan_jwt). Only the PyO3 bridge actually threads the spending UCAN through to ContextManager::join_context. The wrapper-level marks reflect the SDK surface visible to users; bridge drift is tracked here as a known follow-up.",
+         "exemptions": {"kotlin": "Kotlin SDK has no idiomatic Context.join wrapper exposing spendingUcanJwt"}}
       ]
     },
     {
@@ -91,7 +108,40 @@
         {"name": "evaluate_trust", "python": true, "typescript": true, "kotlin": false, "swift": true,
          "exemptions": {"kotlin": "SDK does not expose evaluate_trust wrapper, only aggregate_trust_input"}},
         {"name": "aggregate_trust_input", "python": true, "typescript": true, "kotlin": true, "swift": true},
-        {"name": "verify_participation_requirements", "python": true, "typescript": true, "kotlin": true, "swift": true}
+        {"name": "verify_participation_requirements", "python": true, "typescript": true, "kotlin": true, "swift": true},
+        {"name": "consequence_rule_validate", "python": true, "typescript": true, "kotlin": true, "swift": true,
+         "notes": "ConsequenceRule::validate / validate_against_config (scp-protocol trust/consequence.rs) is invoked at every consequence-rule ingestion path: ContextParams construction in all four bridges, aggregate_trust_input across all four SDKs (consequenceRulesJson is parsed and validated). PyO3, NAPI, UniFFI, and WASM bridges all call validate_against_config when consequence rules are submitted. Error responses surface as ScpError::Validation."},
+        {"name": "evaluate_consequence_rules", "python": true, "typescript": true, "kotlin": true, "swift": true,
+         "notes": "scp_protocol::trust::consequence::evaluate_consequence_rules is invoked transitively from aggregate_trust_input (already exposed across all four SDKs) and from the consequence dispatch path inside ContextManager::send_message and ContextManager::execute_governance_action. The pure-sync evaluator is not exposed as a standalone SDK call; the matrix tracks behavioral coverage via the existing aggregate_trust_input row."},
+        {"name": "dispatch_consequences_for_subject", "python": false, "typescript": false, "kotlin": false, "swift": false,
+         "notes": "Internal: ContextManager::dispatch_consequences (scp-runtime/src/context/manager/governance.rs:70) and the WASM bridge dispatch_consequences_for_subject (scp-ffi-wasm/src/consequence.rs) are invoked transitively from send_message and execute_governance_action. No SDK-level wrapper exposes the dispatcher directly — consequence enforcement is automatic on send and governance dispatch.",
+         "exemptions": {"python": "internal pipeline wiring; consequences are dispatched automatically during send and governance — no separate SDK operation", "typescript": "internal pipeline wiring; consequences are dispatched automatically during send and governance — no separate SDK operation", "kotlin": "internal pipeline wiring; consequences are dispatched automatically during send and governance — no separate SDK operation", "swift": "internal pipeline wiring; consequences are dispatched automatically during send and governance — no separate SDK operation"}}
+      ]
+    },
+    {
+      "domain": "Standing",
+      "operations": [
+        {"name": "standing_context_get_or_create", "python": false, "typescript": false, "kotlin": false, "swift": false,
+         "notes": "ContextManager::standing_context (scp-runtime/src/context/manager/standing.rs:81) is the get-or-create operation for bilateral-persistent contact graph contexts (spec section 5.12.4, SCP-138). The submodule is internal — no FFI bridge or SDK wrapper currently exposes standing_context() to applications. The contact-graph API is a pending follow-up to wire end-to-end.",
+         "exemptions": {"python": "ContextManager submodule not yet exposed via PyO3 bridge", "typescript": "ContextManager submodule not yet exposed via NAPI or WASM bridges", "kotlin": "ContextManager submodule not yet exposed via UniFFI bridge", "swift": "ContextManager submodule not yet exposed via UniFFI bridge"}},
+        {"name": "standing_context_count", "python": false, "typescript": false, "kotlin": false, "swift": false,
+         "notes": "ContextManager::standing_context_count (standing.rs:155). Internal query — no SDK exposure pending the contact-graph follow-up.",
+         "exemptions": {"python": "internal query, not yet exposed", "typescript": "internal query, not yet exposed", "kotlin": "internal query, not yet exposed", "swift": "internal query, not yet exposed"}},
+        {"name": "standing_context_has", "python": false, "typescript": false, "kotlin": false, "swift": false,
+         "notes": "ContextManager::has_standing_context (standing.rs:160). Internal query — no SDK exposure pending the contact-graph follow-up.",
+         "exemptions": {"python": "internal query, not yet exposed", "typescript": "internal query, not yet exposed", "kotlin": "internal query, not yet exposed", "swift": "internal query, not yet exposed"}},
+        {"name": "register_standing_context", "python": false, "typescript": false, "kotlin": false, "swift": false,
+         "notes": "ContextManager::register_standing_context (standing.rs:172). Used during startup to restore standing contexts from persisted state — invoked by SDK init flows when standing-context persistence lands.",
+         "exemptions": {"python": "startup-only registration, not yet exposed", "typescript": "startup-only registration, not yet exposed", "kotlin": "startup-only registration, not yet exposed", "swift": "startup-only registration, not yet exposed"}},
+        {"name": "reconnect_all_standing", "python": false, "typescript": false, "kotlin": false, "swift": false,
+         "notes": "ContextManager::reconnect_all_standing (standing.rs:197). Reconnects transport for all active standing contexts during SDK initialization. Pending FFI exposure once the contact-graph SDK API is wired.",
+         "exemptions": {"python": "startup-only reconnect, not yet exposed", "typescript": "startup-only reconnect, not yet exposed", "kotlin": "startup-only reconnect, not yet exposed", "swift": "startup-only reconnect, not yet exposed"}},
+        {"name": "compute_participation_record", "python": false, "typescript": false, "kotlin": false, "swift": false,
+         "notes": "scp_protocol::trust::participation::compute_participation_record is the pure-sync function that derives participation snapshots from event-log entries. Invoked transitively from the proposer-eligibility check (#1530) and from aggregate_trust_input. No standalone SDK wrapper.",
+         "exemptions": {"python": "transitively invoked via aggregate_trust_input and propose_governance_action_checked", "typescript": "transitively invoked via aggregate_trust_input and propose_governance_action_checked", "kotlin": "transitively invoked via aggregate_trust_input and propose_governance_action_checked", "swift": "transitively invoked via aggregate_trust_input and propose_governance_action_checked"}},
+        {"name": "decay_participation", "python": false, "typescript": false, "kotlin": false, "swift": false,
+         "notes": "scp_protocol::trust::participation::decay_participation applies time-decay to participation scores. Invoked transitively inside the participation evaluation pipeline; not a standalone SDK call.",
+         "exemptions": {"python": "transitively invoked from participation evaluation, not a standalone SDK operation", "typescript": "transitively invoked from participation evaluation, not a standalone SDK operation", "kotlin": "transitively invoked from participation evaluation, not a standalone SDK operation", "swift": "transitively invoked from participation evaluation, not a standalone SDK operation"}}
       ]
     },
     {
@@ -114,7 +164,21 @@
          "exemptions": {"kotlin": "no SDK convenience wrapper for TTL expiry"}},
         {"name": "member_count", "python": true, "typescript": true, "kotlin": true, "swift": true},
         {"name": "is_member", "python": true, "typescript": true, "kotlin": true, "swift": true},
-        {"name": "member_role", "python": true, "typescript": true, "kotlin": true, "swift": true}
+        {"name": "member_role", "python": true, "typescript": true, "kotlin": true, "swift": true},
+        {"name": "execute_suspend_capability", "python": true, "typescript": true, "kotlin": true, "swift": true,
+         "notes": "GovernanceAction::SuspendCapability variant dispatched via the existing execute_action / propose_action entry points (PyO3 py_governance_execute, NAPI context_execute_governance_action, UniFFI governance_execute, WASM execute_governance_action). The wiring of cross-type enforcement conflict detection (#1530, batch-2) is invoked transitively from execute_governance_action."},
+        {"name": "execute_suspend_access", "python": true, "typescript": true, "kotlin": true, "swift": true,
+         "notes": "GovernanceAction::SuspendAccess variant dispatched via execute_action / propose_action across all four bridges (B1 enforcement model unification, batch-2)."},
+        {"name": "execute_revoke_access", "python": true, "typescript": true, "kotlin": true, "swift": true,
+         "notes": "GovernanceAction::RevokeAccess variant (renamed from MemberRevoke per commit 31885c7e) dispatched via execute_action / propose_action across all four bridges. Triggers content access key revocation through the existing access-key pipeline (#1529, batch-2 wiring)."},
+        {"name": "execute_restore_access", "python": true, "typescript": true, "kotlin": true, "swift": true,
+         "notes": "GovernanceAction::RestoreAccess variant dispatched via execute_action / propose_action across all four bridges. Inverse of RevokeAccess; restores access keys for a previously revoked member (B1 enforcement model unification)."},
+        {"name": "execute_remove_member", "python": true, "typescript": true, "kotlin": true, "swift": true,
+         "notes": "GovernanceAction::RemoveMember variant (also known as MLS ejection) dispatched via execute_action / propose_action across all four bridges. Internal wiring (#1541, batch-2) calls remove_member_sender_key and rotate_sender_key on the crypto provider after a successful member ejection — see the Crypto domain rows."},
+        {"name": "execute_rotate_content_keys", "python": true, "typescript": true, "kotlin": true, "swift": true,
+         "notes": "GovernanceAction::RotateContentKeys variant dispatched via execute_action / propose_action across all four bridges. Wired to the crypto provider's advance_epoch / propose_update flow inside execute_rotate_content_keys (#1548, batch-2 wiring)."},
+        {"name": "propose_governance_action_checked", "python": true, "typescript": true, "kotlin": true, "swift": true,
+         "notes": "ContextManager::propose_governance_action_checked validates the proposer's GovernancePropose capability and the proposer eligibility (pending removal + participation threshold) before submitting the proposal (#1530, batch-2 wiring). All four bridges' propose_action entry points delegate to this checked variant: PyO3 py_governance_propose, NAPI context_governance_propose, UniFFI propose_governance_action, WASM propose_governance_action. Already covered structurally by the existing propose_action row; this row makes the wiring explicit."}
       ]
     },
     {
@@ -198,7 +262,46 @@
         {"name": "budget_record_spend", "python": true, "typescript": true, "kotlin": true, "swift": true},
         {"name": "antispam_record", "python": true, "typescript": true, "kotlin": true, "swift": true},
         {"name": "antispam_velocity", "python": true, "typescript": true, "kotlin": true, "swift": true},
-        {"name": "antispam_escalated_cost", "python": true, "typescript": true, "kotlin": true, "swift": true}
+        {"name": "antispam_escalated_cost", "python": true, "typescript": true, "kotlin": true, "swift": true},
+        {"name": "enforce_economy_send_path", "python": false, "typescript": false, "kotlin": false, "swift": false,
+         "notes": "Internal: ContextManager::enforce_send_economy delegates to enforce_economy (scp-runtime/src/context/manager/economy.rs:242, F9 refactor) which calls evaluate_cost, records anti-spam velocity, and authorizes the spending UCAN. Invoked transitively from send_message — no separate SDK operation. Pipeline-wiring assertion enforce_send_economy_calls_enforce_economy in pipeline_wiring.rs.",
+         "exemptions": {"python": "internal pipeline wiring inside send_message; not a standalone SDK operation", "typescript": "internal pipeline wiring inside send_message; not a standalone SDK operation", "kotlin": "internal pipeline wiring inside send_message; not a standalone SDK operation", "swift": "internal pipeline wiring inside send_message; not a standalone SDK operation"}},
+        {"name": "enforce_economy_join_path", "python": false, "typescript": false, "kotlin": false, "swift": false,
+         "notes": "Internal: ContextManager::enforce_join_economy delegates to enforce_economy with EnforceEconomyRequest. Invoked transitively from join_context — no separate SDK operation. Currently effective only on the PyO3 bridge because UniFFI and NAPI hard-code spending_ucan to None on the join path (drift documented in Messaging/join_with_spending_ucan).",
+         "exemptions": {"python": "internal pipeline wiring inside join_context; not a standalone SDK operation", "typescript": "internal pipeline wiring inside join_context; not a standalone SDK operation", "kotlin": "internal pipeline wiring inside join_context; not a standalone SDK operation", "swift": "internal pipeline wiring inside join_context; not a standalone SDK operation"}},
+        {"name": "invoke_tool_with_economy", "python": false, "typescript": false, "kotlin": false, "swift": false,
+         "notes": "Internal: ContextManager::invoke_tool_with_economy (scp-runtime/src/context/manager/tools.rs:442) wraps tool invocation with hard-rate-limit consume/refund, anti-spam velocity record/rollback, and the EconomyTicket authorize/capture/void lifecycle (F1-F5, D4 wiring). Invoked transitively from the tool invocation entry points; not a standalone SDK operation.",
+         "exemptions": {"python": "internal pipeline wiring inside tool_invoke; not a standalone SDK operation", "typescript": "internal pipeline wiring inside tool_invoke; not a standalone SDK operation", "kotlin": "internal pipeline wiring inside tool_invoke; not a standalone SDK operation", "swift": "internal pipeline wiring inside tool_invoke; not a standalone SDK operation"}},
+        {"name": "authorize_paid_action", "python": false, "typescript": false, "kotlin": false, "swift": false,
+         "notes": "Internal: ContextManager::authorize_paid_action (economy.rs:488) issues a PaidActionAuthorization handle through the configured payment adapter. Invoked transitively from enforce_economy and invoke_tool_with_economy.",
+         "exemptions": {"python": "internal sub-operation of enforce_economy", "typescript": "internal sub-operation of enforce_economy", "kotlin": "internal sub-operation of enforce_economy", "swift": "internal sub-operation of enforce_economy"}},
+        {"name": "capture_paid_action", "python": false, "typescript": false, "kotlin": false, "swift": false,
+         "notes": "Internal: ContextManager::complete_paid_action (economy.rs:582) captures (commits) a previously authorized payment after the action succeeds.",
+         "exemptions": {"python": "internal sub-operation of enforce_economy", "typescript": "internal sub-operation of enforce_economy", "kotlin": "internal sub-operation of enforce_economy", "swift": "internal sub-operation of enforce_economy"}},
+        {"name": "void_paid_action", "python": false, "typescript": false, "kotlin": false, "swift": false,
+         "notes": "Internal: ContextManager::void_paid_action (economy.rs:630) reverses an authorized payment when the action fails. EconomyTicket #[must_use] guard ensures every authorize is paired with capture or void.",
+         "exemptions": {"python": "internal sub-operation of enforce_economy", "typescript": "internal sub-operation of enforce_economy", "kotlin": "internal sub-operation of enforce_economy", "swift": "internal sub-operation of enforce_economy"}},
+        {"name": "velocity_tracker_record_message", "python": false, "typescript": false, "kotlin": false, "swift": false,
+         "notes": "Internal: SenderVelocityTracker::record_message (scp-protocol/src/economy/antispam.rs:438) records a per-DID send timestamp and returns a VelocityRollbackToken for failure recovery. Invoked transitively from enforce_economy on the send path.",
+         "exemptions": {"python": "internal anti-spam state mutation, not a standalone SDK operation", "typescript": "internal anti-spam state mutation, not a standalone SDK operation", "kotlin": "internal anti-spam state mutation, not a standalone SDK operation", "swift": "internal anti-spam state mutation, not a standalone SDK operation"}},
+        {"name": "velocity_tracker_record_tool_invocation", "python": false, "typescript": false, "kotlin": false, "swift": false,
+         "notes": "Internal: invoke_tool_with_economy threads SenderVelocityTracker::record_message into the tool path so the per-DID anti-spam escalation (spec section 19.7) applies to tool invocations as well as messages. Pipeline-wiring assertion invoke_tool_with_economy_wires_escalation_and_rollback covers this.",
+         "exemptions": {"python": "internal anti-spam state mutation invoked from invoke_tool_with_economy", "typescript": "internal anti-spam state mutation invoked from invoke_tool_with_economy", "kotlin": "internal anti-spam state mutation invoked from invoke_tool_with_economy", "swift": "internal anti-spam state mutation invoked from invoke_tool_with_economy"}},
+        {"name": "validate_spending_ucan", "python": false, "typescript": false, "kotlin": false, "swift": false,
+         "notes": "scp_protocol::crypto::ucan::spending::validate_spending_ucan validates a spending UCAN payload and its capability scope. Invoked transitively from enforce_economy when a spending_ucan_jwt is supplied; not exposed as a standalone SDK call.",
+         "exemptions": {"python": "transitively invoked inside enforce_economy", "typescript": "transitively invoked inside enforce_economy", "kotlin": "transitively invoked inside enforce_economy", "swift": "transitively invoked inside enforce_economy"}},
+        {"name": "check_spending_capability", "python": false, "typescript": false, "kotlin": false, "swift": false,
+         "notes": "scp_protocol::crypto::ucan::spending::check_spending_capability (renamed from check_action_with_spending in commit 8dcc3306). Validates that a spending UCAN authorizes the requested amount and currency. Invoked transitively from validate_spending_ucan.",
+         "exemptions": {"python": "transitively invoked inside validate_spending_ucan", "typescript": "transitively invoked inside validate_spending_ucan", "kotlin": "transitively invoked inside validate_spending_ucan", "swift": "transitively invoked inside validate_spending_ucan"}},
+        {"name": "spending_nonce_tracker_check", "python": false, "typescript": false, "kotlin": false, "swift": false,
+         "notes": "Internal: per-context SpendingNonceTracker enforces single-use nonces on spending UCANs (C1, C2 wiring). Persisted across snapshots so a restored context cannot replay spent nonces. Invoked transitively from validate_spending_ucan.",
+         "exemptions": {"python": "internal nonce-replay defense, not a standalone SDK operation", "typescript": "internal nonce-replay defense, not a standalone SDK operation", "kotlin": "internal nonce-replay defense, not a standalone SDK operation", "swift": "internal nonce-replay defense, not a standalone SDK operation"}},
+        {"name": "hard_rate_limit_consume", "python": false, "typescript": false, "kotlin": false, "swift": false,
+         "notes": "Internal: TokenBucketLimiter::try_consume (scp-protocol/src/economy/antispam.rs:724) is the Matrix Synapse-style defense-in-depth cap. ContextManager wires it into enforce_send_economy and invoke_tool_with_economy (D4 wiring). Pipeline-wiring assertion invoke_tool_with_economy_enforces_hard_rate_limit covers this.",
+         "exemptions": {"python": "internal rate-limit gate inside send and tool paths, not a standalone SDK operation", "typescript": "internal rate-limit gate inside send and tool paths, not a standalone SDK operation", "kotlin": "internal rate-limit gate inside send and tool paths, not a standalone SDK operation", "swift": "internal rate-limit gate inside send and tool paths, not a standalone SDK operation"}},
+        {"name": "hard_rate_limit_refund", "python": false, "typescript": false, "kotlin": false, "swift": false,
+         "notes": "Internal: TokenBucketLimiter::refund (antispam.rs:802) is invoked at every Phase 1 failure branch in invoke_tool_with_economy and enforce_send_economy. Dropping any branch leaks a token; pipeline-wiring assertion invoke_tool_with_economy_refunds_hard_rate_limit_on_every_phase1_failure ensures at least 3 refund sites exist on the tool path.",
+         "exemptions": {"python": "internal rate-limit recovery inside send and tool paths, not a standalone SDK operation", "typescript": "internal rate-limit recovery inside send and tool paths, not a standalone SDK operation", "kotlin": "internal rate-limit recovery inside send and tool paths, not a standalone SDK operation", "swift": "internal rate-limit recovery inside send and tool paths, not a standalone SDK operation"}}
       ]
     },
     {
@@ -214,6 +317,23 @@
         {"name": "evaluate_quality", "python": true, "typescript": true, "kotlin": true, "swift": true},
         {"name": "attach", "python": true, "typescript": true, "kotlin": true, "swift": true},
         {"name": "check_chain_depth", "python": true, "typescript": true, "kotlin": true, "swift": true}
+      ]
+    },
+    {
+      "domain": "Crypto",
+      "operations": [
+        {"name": "rotate_sender_key", "python": false, "typescript": false, "kotlin": false, "swift": false,
+         "notes": "Internal: ContextCryptoProvider::rotate_sender_key (MlsCryptoProvider impl at scp-runtime/src/crypto/mls/provider.rs:739) generates a fresh sender key after a member is removed or leaves (#1541, batch-2 wiring). Invoked transitively from execute_remove_member and leave_context. Pipeline-wiring assertions execute_remove_member_calls_rotate_sender_key and leave_context_calls_rotate_sender_key cover this.",
+         "exemptions": {"python": "internal crypto-provider trait method, not a standalone SDK operation", "typescript": "internal crypto-provider trait method, not a standalone SDK operation", "kotlin": "internal crypto-provider trait method, not a standalone SDK operation", "swift": "internal crypto-provider trait method, not a standalone SDK operation"}},
+        {"name": "remove_member_sender_key", "python": false, "typescript": false, "kotlin": false, "swift": false,
+         "notes": "Internal: ContextCryptoProvider::remove_member_sender_key (MlsCryptoProvider impl at provider.rs:706) deletes the removed member's sender key from the local store. Invoked transitively from execute_remove_member alongside rotate_sender_key. Pipeline-wiring assertion execute_remove_member_calls_remove_member_sender_key covers this.",
+         "exemptions": {"python": "internal crypto-provider trait method, not a standalone SDK operation", "typescript": "internal crypto-provider trait method, not a standalone SDK operation", "kotlin": "internal crypto-provider trait method, not a standalone SDK operation", "swift": "internal crypto-provider trait method, not a standalone SDK operation"}},
+        {"name": "advance_epoch", "python": false, "typescript": false, "kotlin": false, "swift": false,
+         "notes": "Internal: ContextCryptoProvider::advance_epoch (MlsCryptoProvider impl at provider.rs:1240) is the MLS commit/welcome processing entry point used by execute_rotate_content_keys (#1548, batch-2 wiring). Invoked transitively from the governance dispatch path; not a standalone SDK operation.",
+         "exemptions": {"python": "internal MLS state advance, not a standalone SDK operation", "typescript": "internal MLS state advance, not a standalone SDK operation", "kotlin": "internal MLS state advance, not a standalone SDK operation", "swift": "internal MLS state advance, not a standalone SDK operation"}},
+        {"name": "drain_and_deliver_sender_keys", "python": false, "typescript": false, "kotlin": false, "swift": false,
+         "notes": "Internal: ContextManager::drain_and_deliver_sender_keys (scp-runtime/src/context/manager/lifecycle.rs:2015) drains pending HPKE-wrapped sender-key distributions and delivers them through transport. Invoked transitively from join_context and create_context after MLS commits.",
+         "exemptions": {"python": "internal sender-key delivery loop, not a standalone SDK operation", "typescript": "internal sender-key delivery loop, not a standalone SDK operation", "kotlin": "internal sender-key delivery loop, not a standalone SDK operation", "swift": "internal sender-key delivery loop, not a standalone SDK operation"}}
       ]
     },
     {
