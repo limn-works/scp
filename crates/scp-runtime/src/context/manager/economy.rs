@@ -290,7 +290,7 @@ pub(super) fn enforce_economy(
         scp_protocol::economy::policy::evaluate_cost(policy, &action_type, &metrics)
     else {
         return Err(ContextError::PermissionDenied(
-            "SCP-ECON-12063: cost evaluation overflow".to_owned(),
+            "SCP-ECON-12040: cost evaluation overflow".to_owned(),
         ));
     };
 
@@ -369,7 +369,7 @@ pub(super) fn enforce_economy(
         )));
     }
     budget_tracker.record_spend(actor_did, cost).map_err(|e| {
-        ContextError::PermissionDenied(format!("SCP-ECON-12010: budget exceeded: {e}"))
+        ContextError::PermissionDenied(format!("SCP-ECON-12011: budget exceeded: {e}"))
     })?;
 
     Ok(Some(cost))

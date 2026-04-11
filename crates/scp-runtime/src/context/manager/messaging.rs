@@ -867,6 +867,10 @@ impl ContextManager {
             .validate_and_drain_timeouts(context_id, &inner, now_ms)
             .await?;
 
+        // A locally-controlled sender was already counted on the send path;
+        // skip velocity re-recording to prevent double-counting on single-node setups.
+        let is_local_sender = sender_did == local_member_did;
+
         match sequence_check {
             SequenceCheck::Expected => {
                 // Message is in order — deliver immediately.
@@ -876,6 +880,7 @@ impl ContextManager {
                     &sender_did,
                     &inner,
                     &plaintext,
+                    is_local_sender,
                 )
                 .await?;
                 Ok(Some((plaintext, sender_did)))
@@ -1021,13 +1026,19 @@ impl ContextManager {
     /// Delivers a message that is in sequence order, advances the tracker,
     /// checks membership and capability, pushes the event, and then drains
     /// any consecutive buffered messages that are now unblocked.
-    async fn deliver_message_and_drain_buffered(
+    ///
+    /// `skip_velocity` is `true` when the sender is a locally-controlled DID
+    /// (i.e. the same node that sent the message). In that case velocity is
+    /// already recorded on the send path and must not be counted again here,
+    /// otherwise a single message would be double-counted on single-node setups.
+    pub(super) async fn deliver_message_and_drain_buffered(
         &self,
         context_id: &str,
         context_id_bytes: &[u8; 32],
         sender_did: &str,
         inner: &scp_protocol::envelope::inner::InnerEnvelope,
         plaintext: &[u8],
+        skip_velocity: bool,
     ) -> Result<(), ContextError> {
         let sender_did_obj = DID(sender_did.to_owned());
 
@@ -1103,10 +1114,17 @@ impl ContextManager {
         // for the sender on the receive path. This ensures that even if the
         // sender's node doesn't enforce consequences, the receiver still
         // evaluates rules against incoming messages.
+        //
+        // Skip velocity recording when `skip_velocity` is true — this happens
+        // when the sender is a locally-controlled DID. On single-node setups
+        // the send path already recorded velocity; counting it again here would
+        // double-count the message and inflate consequence trigger counters.
         let now = self.clock.now_secs();
-        ctx.governance
-            .velocity_tracker
-            .record_message(&DID(sender_did.to_owned()), now);
+        if !skip_velocity {
+            ctx.governance
+                .velocity_tracker
+                .record_message(&DID(sender_did.to_owned()), now);
+        }
         let consequence_rules: Vec<super::ConsequenceRule> =
             ctx.governance.consequence_rules.clone();
         if !consequence_rules.is_empty() {

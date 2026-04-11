@@ -870,7 +870,6 @@ struct TtlState {
     /// TTL timer management (SCP-021).
     timer: TtlTimer,
     /// Active TTL extension proposal, if any (SCP-021).
-    #[allow(dead_code)]
     extension: Option<TtlExtension>,
 }
 
