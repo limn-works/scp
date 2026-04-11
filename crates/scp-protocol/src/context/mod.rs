@@ -396,6 +396,28 @@ pub enum ContextError {
         /// Human-readable explanation of why the import was rejected.
         reason: String,
     },
+    /// A previously broadcasted MLS Commit (`RemoveMember`, `RotateContentKeys`,
+    /// `ResetMember`, or `LeaveContext`) exceeded the persistent retry budget
+    /// and the context is in fail-close state (PR #1606 C6).
+    ///
+    /// Subsequent context-mutating operations on the affected context return
+    /// this error until an operator acknowledges the fault via
+    /// `ContextManager::acknowledge_commit_fault`. The local state mutation
+    /// already happened, but at least one remote member did not advance
+    /// their MLS epoch — preventing further governance from a divergent
+    /// epoch is required to avoid silently retaining ejected members.
+    #[error(
+        "SCP-CTX-2120: commit broadcast fault for operation {operation}: \
+         {reason} ({attempts} attempts)"
+    )]
+    CommitBroadcastFault {
+        /// Human-readable label for the operation that failed to broadcast.
+        operation: String,
+        /// Final transport error or `"max age exceeded"`.
+        reason: String,
+        /// Total number of send attempts.
+        attempts: u32,
+    },
 }
 
 // ---------------------------------------------------------------------------

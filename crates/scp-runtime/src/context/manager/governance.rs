@@ -2,22 +2,50 @@
 
 use super::{
     AccessScope, Arc, CEILING_CHANGE_NOTIFICATION_PERIOD_SECS, Capability, CapabilityCeiling,
-    Clock, ConsequenceRule, ContentKeysRotatedResult, ContextError, ContextEvent, ContextManager,
-    ContextParams, ContextState, DID, ECONOMIC_POLICY_NOTIFICATION_PERIOD_SECS,
-    EXECUTED_PROPOSALS_TTL_SECS, EconomicPolicy, GovernanceAction, GovernanceActionResult,
-    GovernanceContext, GovernanceEvent, GovernanceProposal, GovernanceReconfiguredResult, HashSet,
-    MAX_REGISTERED_TOOLS, MAX_THRESHOLD_SIGNERS, MAX_TOOL_INTERFACES, MigrationProposedResult,
-    MigrationState, MlsImpact, PendingCeilingModification, PendingEconomicPolicyChange,
-    PerContextState, ProposalId, ProposalOutcome, ProposalStatus, PruningPolicy,
-    RestoreAccessResult, RevokeResult, SuspendMemberResult, ToolInterface, ToolRegistration,
-    TriggeredConsequence, classify_action, collect_active_voters, context_id_to_bytes,
-    evaluate_consequence_rules, generate_mls_operations, instrument, process_pending_proposals,
-    push_welcome_event, require_active, require_migrating_out, roles, update_detection_state,
+    Clock, CommitFaultMarker, CommitOperation, ConsequenceRule, ContentKeysRotatedResult,
+    ContextError, ContextEvent, ContextManager, ContextParams, ContextState, DID,
+    ECONOMIC_POLICY_NOTIFICATION_PERIOD_SECS, EXECUTED_PROPOSALS_TTL_SECS, EconomicPolicy,
+    GovernanceAction, GovernanceActionResult, GovernanceContext, GovernanceEvent,
+    GovernanceProposal, GovernanceReconfiguredResult, HashSet, MAX_COMMIT_AGE_SECS,
+    MAX_COMMIT_RETRIES, MAX_REGISTERED_TOOLS, MAX_THRESHOLD_SIGNERS, MAX_TOOL_INTERFACES,
+    MigrationProposedResult, MigrationState, MlsImpact, PendingCeilingModification, PendingCommit,
+    PendingEconomicPolicyChange, PerContextState, ProposalId, ProposalOutcome, ProposalStatus,
+    PruningPolicy, RestoreAccessResult, RevokeResult, SuspendMemberResult, ToolInterface,
+    ToolRegistration, TriggeredConsequence, classify_action, collect_active_voters,
+    commit_retry_backoff, context_id_to_bytes, evaluate_consequence_rules, generate_mls_operations,
+    instrument, process_pending_proposals, push_welcome_event, require_active,
+    require_migrating_out, roles, update_detection_state,
 };
 
 // ---------------------------------------------------------------------------
 // RuntimeConsequenceDispatcher — bridges PerContextState to the shared trait
 // ---------------------------------------------------------------------------
+
+// PR #1606 C6 helper types — outcome of attempting to retry a single
+// pending commit. Lifted out of `process_pending_commits_static` to satisfy
+// `clippy::items_after_statements`.
+struct CommitRetryOutcome {
+    index: usize,
+    kind: CommitRetryOutcomeKind,
+}
+
+enum CommitRetryOutcomeKind {
+    Success {
+        attempts: u32,
+        operation: CommitOperation,
+    },
+    Retry {
+        error: String,
+        next_attempt_at: u64,
+        new_retry_count: u32,
+        operation: CommitOperation,
+    },
+    Failed {
+        reason: String,
+        attempts: u32,
+        operation: CommitOperation,
+    },
+}
 
 /// Implements [`scp_protocol::trust::consequence::ConsequenceDispatcher`] for
 /// the runtime `PerContextState`, delegating to `ContextRoleState` for
@@ -511,6 +539,18 @@ impl ContextManager {
                 "governance proposal targets context '{}' but was submitted to '{}'",
                 proposal.context_id, context_id
             )));
+        }
+
+        // PR #1606 C6 fail-close gate: if the persistent commit retry queue
+        // exhausted its budget for a previous mutation, refuse new governance
+        // actions until an operator acknowledges the fault. Without this
+        // gate, an ejected member could remain in the MLS group while local
+        // governance keeps advancing on a divergent epoch.
+        {
+            let contexts = self.contexts.lock().await;
+            if let Some(ctx) = contexts.get(context_id) {
+                Self::check_commit_fault(ctx)?;
+            }
         }
 
         // Atomically check replay AND mark as executed before dispatch.
@@ -2263,21 +2303,19 @@ impl ContextManager {
         };
 
         // Broadcast the MLS Commit to remaining members so they can
-        // advance their group epoch and ratchet key material.
-        if !remove_output.commit_bytes.is_empty() {
-            let routing_id = scp_protocol::context::context_routing_id(context_id);
-            if let Err(e) = self
-                .transport
-                .send_message(&routing_id, &remove_output.commit_bytes)
-            {
-                tracing::warn!(
-                    context_id = %context_id,
-                    error = %e,
-                    "failed to broadcast remove_member MLS Commit — \
-                     remaining members may not advance epoch"
-                );
-            }
-        }
+        // advance their group epoch and ratchet key material. PR #1606 C6:
+        // on transport failure, the commit is durably enqueued for retry
+        // and the context fail-closes only after MAX_COMMIT_RETRIES /
+        // MAX_COMMIT_AGE_SECS exhaust.
+        self.try_broadcast_commit_or_enqueue(
+            context_id,
+            remove_output.commit_bytes,
+            CommitOperation::RemoveMember {
+                target_did: did.clone(),
+            },
+            actor_did,
+        )
+        .await?;
 
         // Drain pending sender key distribution messages queued by
         // rotate_sender_key, MLS-encrypt, and deliver via transport (§9.16.2).
@@ -3186,19 +3224,29 @@ impl ContextManager {
             .map_err(|e| ContextError::MembershipFailed(e.to_string()))?;
 
         // Broadcast the MLS Commits so remaining members can process
-        // the remove and re-add epoch changes.
-        let routing_id = scp_protocol::context::context_routing_id(context_id);
-        for commit_bytes in [&remove_output.commit_bytes, &add_output.commit_bytes] {
-            if !commit_bytes.is_empty()
-                && let Err(e) = self.transport.send_message(&routing_id, commit_bytes)
-            {
-                tracing::warn!(
-                    context_id = %context_id,
-                    error = %e,
-                    "failed to broadcast member reset MLS Commit"
-                );
-            }
-        }
+        // the remove and re-add epoch changes. PR #1606 C6: each commit
+        // is enqueued on transport failure and retried by the governance
+        // timeout task with exponential backoff.
+        self.try_broadcast_commit_or_enqueue(
+            context_id,
+            remove_output.commit_bytes,
+            CommitOperation::ResetMember {
+                target_did: did.clone(),
+                is_remove: true,
+            },
+            actor_did,
+        )
+        .await?;
+        self.try_broadcast_commit_or_enqueue(
+            context_id,
+            add_output.commit_bytes,
+            CommitOperation::ResetMember {
+                target_did: did.clone(),
+                is_remove: false,
+            },
+            actor_did,
+        )
+        .await?;
 
         // H5: Sender key rotation after MLS reset — remove the reset
         // member's stale sender key, rotate our own key, and distribute
@@ -3539,20 +3587,17 @@ impl ContextManager {
         };
 
         // Broadcast the MLS epoch advance Commit to all members (encrypted mode).
-        if let Some(ref epoch_out) = epoch_output
-            && !epoch_out.commit_bytes.is_empty()
-        {
-            let routing_id = scp_protocol::context::context_routing_id(context_id);
-            if let Err(e) = self
-                .transport
-                .send_message(&routing_id, &epoch_out.commit_bytes)
-            {
-                tracing::warn!(
-                    context_id = %context_id,
-                    error = %e,
-                    "failed to broadcast epoch advance MLS Commit for content key rotation"
-                );
-            }
+        // PR #1606 C6: enqueue for persistent retry on transport failure.
+        if let Some(epoch_out) = epoch_output {
+            self.try_broadcast_commit_or_enqueue(
+                context_id,
+                epoch_out.commit_bytes,
+                CommitOperation::RotateContentKeys {
+                    reason: reason.map(String::from),
+                },
+                actor_did,
+            )
+            .await?;
         }
 
         if let Some(snapshot) = snapshot {
@@ -4440,13 +4485,19 @@ impl ContextManager {
     /// 2. Detects proposer/voter departures and adjusts tallies.
     /// 3. Detects deadlock conditions and emits recovery events.
     /// 4. Evaluates consequence rules for all members (#1531).
+    /// 5. Drains the persistent MLS commit broadcast retry queue (PR #1606 C6).
     ///
     /// The task stops when the context is no longer `Active` or when
     /// cancelled via [`GovernanceTimeoutTask::cancel()`].
+    #[allow(clippy::too_many_lines)] // Five-phase task spawn closure; phases are factored into helper methods.
     pub(super) async fn start_governance_timeout_task(&self, context_id: &str) {
         let contexts = Arc::clone(&self.contexts);
         let clock = Arc::clone(&self.clock);
         let event_log = Arc::clone(&self.event_log);
+        // PR #1606 C6: capture the transport so the commit retry phase can
+        // re-attempt MLS Commit broadcasts without needing a `&self` reference
+        // (the spawned task does not own the manager).
+        let transport = Arc::clone(&self.transport);
         let ctx_id = context_id.to_owned();
 
         let mut contexts_guard = self.contexts.lock().await;
@@ -4458,10 +4509,14 @@ impl ContextManager {
             let ctx_id = ctx_id.clone();
             let clock = Arc::clone(&clock);
             let event_log = Arc::clone(&event_log);
+            let transport = Arc::clone(&transport);
             move || {
                 let contexts = Arc::clone(&contexts);
                 let clock = Arc::clone(&clock);
                 let event_log = Arc::clone(&event_log);
+                let transport_for_retry = Arc::clone(&transport);
+                let event_log_for_retry = Arc::clone(&event_log);
+                let clock_for_retry = Arc::clone(&clock);
                 let ctx_id = ctx_id.clone();
                 async move {
                     // Phase 1: Acquire lock, snapshot data, process proposals,
@@ -4569,6 +4624,27 @@ impl ContextManager {
                     // Phase 4: Periodic consequence evaluation (#1531).
                     Self::evaluate_periodic_consequences(&contexts, &ctx_id, &*clock, &*event_log)
                         .await;
+
+                    // Phase 5 (PR #1606 C6): drain the persistent MLS
+                    // commit retry queue. Retries any pending commits
+                    // whose backoff timer has elapsed and either dequeues
+                    // them on success or marks the context fail-closed
+                    // when the retry budget is exhausted.
+                    //
+                    // Note: this phase needs `&self` (transport, event log,
+                    // clock) which the closure captures via Self in the
+                    // outer task. The outer task does not have a `self`
+                    // reference, so we delegate to the static helper
+                    // `process_pending_commits_static` that takes the same
+                    // bag of providers the closure already captures.
+                    Self::process_pending_commits_static(
+                        &contexts,
+                        &ctx_id,
+                        Arc::clone(&transport_for_retry),
+                        Arc::clone(&event_log_for_retry),
+                        Arc::clone(&clock_for_retry),
+                    )
+                    .await;
 
                     true // Continue the loop.
                 }
@@ -4778,5 +4854,389 @@ impl ContextManager {
             GovernanceEvent::ConflictResolved { .. } => "GovernanceConflictResolved",
             GovernanceEvent::GovernanceActionExecuted { .. } => "GovernanceActionExecuted",
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // PR #1606 C6: persistent MLS Commit broadcast retry queue
+    // -----------------------------------------------------------------------
+
+    /// Returns `Err(CommitBroadcastFault)` if the context has an active
+    /// commit fault marker (PR #1606 C6), otherwise `Ok(())`.
+    ///
+    /// Called by every governance executor that mutates context state. While
+    /// the marker is set, the context is fail-closed: no further mutations
+    /// are accepted until an operator clears the marker via
+    /// [`acknowledge_commit_fault`](Self::acknowledge_commit_fault).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ContextError::CommitBroadcastFault`] if the context has an
+    /// active fault marker.
+    pub(super) fn check_commit_fault(ctx: &PerContextState) -> Result<(), ContextError> {
+        if let Some(ref marker) = ctx.commit_fault {
+            return Err(ContextError::CommitBroadcastFault {
+                operation: marker.operation.label(),
+                reason: marker.reason.clone(),
+                attempts: marker.retry_count,
+            });
+        }
+        Ok(())
+    }
+
+    /// Attempts to broadcast an MLS Commit and, on transport failure,
+    /// enqueues the commit in the persistent retry queue (PR #1606 C6).
+    ///
+    /// On success: appends `CommitBroadcasted` to the durable event log.
+    /// On failure: appends a `PendingCommit` to `ctx.pending_commits`,
+    /// emits [`ContextEvent::CommitBroadcastPending`] to the receive
+    /// buffer, and writes `CommitBroadcastPending` to the durable event log.
+    ///
+    /// Acquires the contexts mutex internally — callers must NOT hold it.
+    /// Returns `Ok(())` even on transport failure: the persistent queue
+    /// makes broadcast loss recoverable, so callers should not abort the
+    /// caller-visible operation. The mutation that produced this commit
+    /// has already been applied locally.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ContextError::ContextNotRegistered`] if the context is
+    /// not registered.
+    /// Returns [`ContextError::EventLogFailed`] if the durable event log
+    /// append fails (rare; persistence is best-effort, but a failed log
+    /// append indicates a deeper subsystem fault).
+    pub(super) async fn try_broadcast_commit_or_enqueue(
+        &self,
+        context_id: &str,
+        commit_bytes: Vec<u8>,
+        operation: CommitOperation,
+        actor_did: &str,
+    ) -> Result<(), ContextError> {
+        if commit_bytes.is_empty() {
+            // No-op: nothing to broadcast (e.g., broadcast-mode contexts).
+            return Ok(());
+        }
+        let routing_id = scp_protocol::context::context_routing_id(context_id);
+        // First attempt: try to send immediately.
+        match self.transport.send_message(&routing_id, &commit_bytes) {
+            Ok(()) => {
+                let context_id_bytes = context_id_to_bytes(context_id);
+                self.event_log.append_context_event(
+                    &context_id_bytes,
+                    "CommitBroadcasted",
+                    actor_did,
+                )?;
+                Ok(())
+            }
+            Err(e) => {
+                let now = self.clock.now_secs();
+                let error_str = e.to_string();
+                let backoff = commit_retry_backoff(1);
+                let pending = PendingCommit {
+                    commit_bytes,
+                    routing_id,
+                    operation: operation.clone(),
+                    first_attempt_at: now,
+                    retry_count: 1,
+                    last_error: Some(error_str.clone()),
+                    next_attempt_at: now.saturating_add(backoff),
+                };
+                let label = operation.label();
+                let context_id_bytes = context_id_to_bytes(context_id);
+                {
+                    let mut contexts = self.contexts.lock().await;
+                    let ctx = contexts
+                        .get_mut(context_id)
+                        .ok_or_else(|| ContextError::ContextNotRegistered(context_id.to_owned()))?;
+                    ctx.pending_commits.push_back(pending);
+                    ctx.receive_buffer
+                        .push(ContextEvent::CommitBroadcastPending {
+                            operation: label.clone(),
+                            error: error_str.clone(),
+                            attempt: 1,
+                        });
+                }
+                self.event_log.append_context_event(
+                    &context_id_bytes,
+                    "CommitBroadcastPending",
+                    actor_did,
+                )?;
+                tracing::warn!(
+                    context_id = %context_id,
+                    operation = %label,
+                    error = %error_str,
+                    "MLS commit broadcast failed; enqueued for persistent retry (PR #1606 C6)"
+                );
+                Ok(())
+            }
+        }
+    }
+
+    /// Instance-method wrapper around
+    /// [`process_pending_commits_static`](Self::process_pending_commits_static)
+    /// that uses the manager's own providers.
+    ///
+    /// Called from tests and from any path that holds a `&self` reference.
+    /// The spawned governance timeout task uses the static helper directly
+    /// because it does not own the manager.
+    #[allow(dead_code)] // Used by tests; production path uses the static helper.
+    pub(super) async fn process_pending_commits(&self, context_id: &str) {
+        Self::process_pending_commits_static(
+            &self.contexts,
+            context_id,
+            Arc::clone(&self.transport),
+            Arc::clone(&self.event_log),
+            Arc::clone(&self.clock),
+        )
+        .await;
+    }
+
+    /// Processes the per-context MLS Commit retry queue (PR #1606 C6).
+    ///
+    /// Called periodically from
+    /// [`start_governance_timeout_task`](Self::start_governance_timeout_task).
+    /// Walks `ctx.pending_commits`, retries any commits whose
+    /// `next_attempt_at <= now`, and either:
+    /// 1. Dequeues on success (emits `CommitBroadcastSucceeded`).
+    /// 2. Updates retry count + next attempt on failure (emits
+    ///    `CommitBroadcastPending` with the new attempt count).
+    /// 3. Marks the context fail-closed and emits `CommitBroadcastFailed`
+    ///    when `retry_count >= MAX_COMMIT_RETRIES` or
+    ///    `now - first_attempt_at >= MAX_COMMIT_AGE_SECS`.
+    ///
+    /// All transport sends happen with the contexts lock RELEASED to
+    /// avoid holding the lock across I/O.
+    pub(super) async fn process_pending_commits_static(
+        contexts: &Arc<super::Mutex<super::HashMap<String, PerContextState>>>,
+        context_id: &str,
+        transport: Arc<dyn super::ContextTransportProvider>,
+        event_log: Arc<dyn super::ContextEventLogProvider>,
+        clock: Arc<dyn Clock>,
+    ) {
+        // Snapshot the queue under lock.
+        let snapshot: Vec<PendingCommit> = {
+            let contexts_guard = contexts.lock().await;
+            let Some(ctx) = contexts_guard.get(context_id) else {
+                return;
+            };
+            // If a fault marker is already set, do not retry — the queue
+            // is frozen until an operator acknowledges.
+            if ctx.commit_fault.is_some() {
+                return;
+            }
+            ctx.pending_commits.iter().cloned().collect()
+        };
+        if snapshot.is_empty() {
+            return;
+        }
+        let now = clock.now_secs();
+        // Phase A (no lock held): retry each pending entry whose backoff has
+        // elapsed and classify the outcome.
+        let outcomes = Self::compute_commit_retry_outcomes(&snapshot, now, transport.as_ref());
+        if outcomes.is_empty() {
+            return;
+        }
+        // Phase B (lock held): apply the outcomes to the queue.
+        let context_id_bytes = context_id_to_bytes(context_id);
+        let event_log_writes =
+            Self::apply_commit_retry_outcomes(contexts, context_id, outcomes, &*clock).await;
+        // Phase C (no lock held): append durable event log entries.
+        for label in event_log_writes {
+            if let Err(e) = event_log.append_context_event(&context_id_bytes, label, "system") {
+                tracing::warn!(
+                    context_id = %context_id,
+                    error = %e,
+                    "failed to append commit retry event to durable log"
+                );
+            }
+        }
+    }
+
+    /// Phase A of [`process_pending_commits_static`]: classifies each
+    /// pending commit whose backoff has elapsed as `Success`, `Retry`,
+    /// or `Failed`. Returns one outcome per processed entry (entries whose
+    /// `next_attempt_at` is still in the future are skipped).
+    fn compute_commit_retry_outcomes(
+        snapshot: &[PendingCommit],
+        now: u64,
+        transport: &dyn super::ContextTransportProvider,
+    ) -> Vec<CommitRetryOutcome> {
+        let mut outcomes: Vec<CommitRetryOutcome> = Vec::new();
+        for (idx, pending) in snapshot.iter().enumerate() {
+            if now < pending.next_attempt_at {
+                continue;
+            }
+            // Age budget check. If we're past MAX_COMMIT_AGE_SECS, force-fail
+            // without making another network call.
+            let age = now.saturating_sub(pending.first_attempt_at);
+            if age >= MAX_COMMIT_AGE_SECS {
+                outcomes.push(CommitRetryOutcome {
+                    index: idx,
+                    kind: CommitRetryOutcomeKind::Failed {
+                        reason: format!("max age exceeded ({age}s >= {MAX_COMMIT_AGE_SECS}s)"),
+                        attempts: pending.retry_count,
+                        operation: pending.operation.clone(),
+                    },
+                });
+                continue;
+            }
+            // Attempt the send.
+            match transport.send_message(&pending.routing_id, &pending.commit_bytes) {
+                Ok(()) => {
+                    outcomes.push(CommitRetryOutcome {
+                        index: idx,
+                        kind: CommitRetryOutcomeKind::Success {
+                            attempts: pending.retry_count,
+                            operation: pending.operation.clone(),
+                        },
+                    });
+                }
+                Err(e) => {
+                    let new_retry_count = pending.retry_count.saturating_add(1);
+                    if new_retry_count > MAX_COMMIT_RETRIES {
+                        outcomes.push(CommitRetryOutcome {
+                            index: idx,
+                            kind: CommitRetryOutcomeKind::Failed {
+                                reason: e.to_string(),
+                                attempts: new_retry_count,
+                                operation: pending.operation.clone(),
+                            },
+                        });
+                    } else {
+                        let backoff = commit_retry_backoff(new_retry_count);
+                        outcomes.push(CommitRetryOutcome {
+                            index: idx,
+                            kind: CommitRetryOutcomeKind::Retry {
+                                error: e.to_string(),
+                                next_attempt_at: now.saturating_add(backoff),
+                                new_retry_count,
+                                operation: pending.operation.clone(),
+                            },
+                        });
+                    }
+                }
+            }
+        }
+        outcomes
+    }
+
+    /// Phase B of [`process_pending_commits_static`]: applies the outcomes
+    /// to `PerContextState::pending_commits` under lock. Pushes receive
+    /// buffer events and returns the labels that should be appended to
+    /// the durable event log.
+    async fn apply_commit_retry_outcomes(
+        contexts: &Arc<super::Mutex<super::HashMap<String, PerContextState>>>,
+        context_id: &str,
+        outcomes: Vec<CommitRetryOutcome>,
+        clock: &dyn Clock,
+    ) -> Vec<&'static str> {
+        let mut event_log_writes: Vec<&'static str> = Vec::new();
+        let mut contexts_guard = contexts.lock().await;
+        let Some(ctx) = contexts_guard.get_mut(context_id) else {
+            return event_log_writes;
+        };
+        let queue_len = ctx.pending_commits.len();
+        // Apply outcomes by their snapshot index. The queue is only mutated
+        // by this task (success/failed removals) and by new enqueue calls
+        // (which append to the end), so prefix indices remain stable
+        // between Phase A and Phase B.
+        let mut to_remove: Vec<usize> = Vec::new();
+        for outcome in outcomes {
+            if outcome.index >= queue_len {
+                continue;
+            }
+            match outcome.kind {
+                CommitRetryOutcomeKind::Success {
+                    attempts,
+                    operation,
+                } => {
+                    ctx.receive_buffer
+                        .push(ContextEvent::CommitBroadcastSucceeded {
+                            operation: operation.label(),
+                            attempts,
+                        });
+                    event_log_writes.push("CommitBroadcastSucceeded");
+                    to_remove.push(outcome.index);
+                }
+                CommitRetryOutcomeKind::Retry {
+                    error,
+                    next_attempt_at,
+                    new_retry_count,
+                    operation,
+                } => {
+                    if let Some(entry) = ctx.pending_commits.get_mut(outcome.index) {
+                        entry.retry_count = new_retry_count;
+                        entry.next_attempt_at = next_attempt_at;
+                        entry.last_error = Some(error.clone());
+                    }
+                    ctx.receive_buffer
+                        .push(ContextEvent::CommitBroadcastPending {
+                            operation: operation.label(),
+                            error,
+                            attempt: new_retry_count,
+                        });
+                    event_log_writes.push("CommitBroadcastPending");
+                }
+                CommitRetryOutcomeKind::Failed {
+                    reason,
+                    attempts,
+                    operation,
+                } => {
+                    let now_failed = clock.now_secs();
+                    ctx.commit_fault = Some(CommitFaultMarker {
+                        operation: operation.clone(),
+                        reason: reason.clone(),
+                        failed_at: now_failed,
+                        retry_count: attempts,
+                    });
+                    ctx.receive_buffer
+                        .push(ContextEvent::CommitBroadcastFailed {
+                            operation: operation.label(),
+                            reason,
+                            attempts,
+                        });
+                    event_log_writes.push("CommitBroadcastFailed");
+                    to_remove.push(outcome.index);
+                }
+            }
+        }
+        // Remove successful/failed entries in reverse-index order so earlier
+        // indices stay valid.
+        to_remove.sort_unstable_by(|a, b| b.cmp(a));
+        for idx in to_remove {
+            ctx.pending_commits.remove(idx);
+        }
+        event_log_writes
+    }
+
+    /// Acknowledges a commit broadcast fault and clears the fail-close
+    /// marker so the context can accept further mutations (PR #1606 C6).
+    ///
+    /// This is the operator-driven recovery path. It does NOT re-attempt
+    /// the failed commit — that data is already lost (or unrecoverable
+    /// from the local node's perspective). Callers SHOULD reach out to
+    /// remaining members through an out-of-band channel to verify whether
+    /// the failed commit's effect (member removal, key rotation) needs to
+    /// be re-applied.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ContextError::ContextNotRegistered`] if the context is not
+    /// registered. Returns [`ContextError::InvalidState`] if no fault
+    /// marker is set.
+    #[instrument(skip_all, fields(context_id))]
+    pub async fn acknowledge_commit_fault(
+        &self,
+        context_id: &str,
+    ) -> Result<CommitFaultMarker, ContextError> {
+        let mut contexts = self.contexts.lock().await;
+        let ctx = contexts
+            .get_mut(context_id)
+            .ok_or_else(|| ContextError::ContextNotRegistered(context_id.to_owned()))?;
+        let marker = ctx.commit_fault.take().ok_or_else(|| {
+            ContextError::InvalidState(format!(
+                "context {context_id} has no commit fault to acknowledge"
+            ))
+        })?;
+        Ok(marker)
     }
 }

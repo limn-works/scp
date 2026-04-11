@@ -8,7 +8,7 @@
 //! testable with mock implementations. See ADR-008 in
 //! `.docs/adrs/phase-2.md` for the full context lifecycle specification.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::hash::BuildHasher;
 use std::sync::Arc;
 
@@ -103,6 +103,150 @@ const CEILING_CHANGE_NOTIFICATION_PERIOD_SECS: u64 = 259_200; // 72 hours
 /// growth. 14 days is generous — governance proposals are typically resolved
 /// within hours, so a 14-day window provides ample replay protection.
 const EXECUTED_PROPOSALS_TTL_SECS: u64 = 14 * 24 * 60 * 60; // 14 days
+
+// ---------------------------------------------------------------------------
+// MLS commit broadcast retry queue (PR #1606 C6)
+// ---------------------------------------------------------------------------
+
+/// Maximum number of times the persistent commit retry queue will re-attempt
+/// a single MLS Commit broadcast before marking it `CommitBroadcastFailed`
+/// and putting the context in fail-close state.
+pub const MAX_COMMIT_RETRIES: u32 = 20;
+
+/// Maximum age (in seconds) of a pending commit before it is force-failed
+/// regardless of how many attempts have been made (1 hour).
+///
+/// Bounds the worst-case window during which a commit can sit unrecoverable
+/// in the queue. After this elapses the context fail-closes so the operator
+/// can intervene rather than wait for retry-count exhaustion.
+pub const MAX_COMMIT_AGE_SECS: u64 = 3600; // 1 hour
+
+/// Exponential backoff schedule (in seconds) for commit retry attempts.
+///
+/// `COMMIT_RETRY_BACKOFFS[i]` is the delay before attempt `i + 1` (i.e., the
+/// delay applied after the i-th failure). Indexing past the end of the array
+/// reuses the final value (300 s). Designed to give transient network outages
+/// fast retries (1 s, 2 s, 5 s) and longer outages slower retries that fit
+/// within `MAX_COMMIT_AGE_SECS`.
+pub const COMMIT_RETRY_BACKOFFS: [u64; 8] = [1, 2, 5, 15, 60, 120, 300, 300];
+
+/// Returns the delay (in seconds) before the next retry attempt given the
+/// number of failed attempts so far.
+#[must_use]
+#[inline]
+pub fn commit_retry_backoff(failed_attempts: u32) -> u64 {
+    let idx = (failed_attempts as usize).saturating_sub(1);
+    let clamped = idx.min(COMMIT_RETRY_BACKOFFS.len() - 1);
+    COMMIT_RETRY_BACKOFFS[clamped]
+}
+
+/// Logical operation that produced an MLS Commit, used by the persistent
+/// retry queue (PR #1606 C6) for observability and event labelling.
+///
+/// The variant identifies which mutation produced the commit so that the
+/// `CommitBroadcastPending` / `CommitBroadcastSucceeded` / `CommitBroadcastFailed`
+/// events emitted by the retry queue carry meaningful labels for SDK
+/// consumers and the durable event log.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum CommitOperation {
+    /// Commit produced by `execute_remove_member` for the given target DID.
+    RemoveMember {
+        /// The DID that was removed from the MLS group.
+        target_did: DID,
+    },
+    /// Commit produced by `execute_rotate_content_keys` (epoch advance for
+    /// content key rotation).
+    RotateContentKeys {
+        /// Optional human-readable reason recorded with the rotation.
+        reason: Option<String>,
+    },
+    /// Commit produced by `execute_reset_member` (remove + re-add for MLS
+    /// state reset). The variant carries which sub-step the commit corresponds
+    /// to so that retries do not conflate the two distinct commits in
+    /// observability events.
+    ResetMember {
+        /// The DID being reset.
+        target_did: DID,
+        /// `true` for the remove half of the reset, `false` for the re-add.
+        is_remove: bool,
+    },
+    /// Commit produced by `leave_context` for the local member's departure.
+    LeaveContext {
+        /// The DID of the member who left.
+        member_did: DID,
+    },
+}
+
+impl CommitOperation {
+    /// Human-readable label used in events and the durable event log.
+    #[must_use]
+    pub fn label(&self) -> String {
+        match self {
+            Self::RemoveMember { .. } => "RemoveMember".to_owned(),
+            Self::RotateContentKeys { .. } => "RotateContentKeys".to_owned(),
+            Self::ResetMember {
+                is_remove: true, ..
+            } => "ResetMemberRemove".to_owned(),
+            Self::ResetMember {
+                is_remove: false, ..
+            } => "ResetMemberAdd".to_owned(),
+            Self::LeaveContext { .. } => "LeaveContext".to_owned(),
+        }
+    }
+}
+
+/// A persistent entry in the MLS Commit retry queue (PR #1606 C6).
+///
+/// Each `PendingCommit` is created when a `transport.send_message` call
+/// for an MLS Commit fails after the local state has already been mutated.
+/// The entry is enqueued in [`PerContextState::pending_commits`] and
+/// retried by the governance timeout task with exponential backoff.
+///
+/// Persisted via [`ContextSnapshot::pending_commits`] so retries survive
+/// process restart.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PendingCommit {
+    /// TLS-serialized MLS Commit message bytes (output of
+    /// `crypto.remove_member()` / `crypto.advance_epoch()`).
+    #[serde(with = "serde_bytes")]
+    pub commit_bytes: Vec<u8>,
+    /// SHA-256 routing ID derived from the context ID via
+    /// `scp_protocol::context::context_routing_id`. Stored as a fixed-size
+    /// array because `transport.send_message` requires `&[u8; 32]`.
+    pub routing_id: [u8; 32],
+    /// Logical operation that produced this commit (for observability +
+    /// event labelling).
+    pub operation: CommitOperation,
+    /// Unix timestamp (seconds) when the commit first failed to broadcast.
+    pub first_attempt_at: u64,
+    /// Number of failed send attempts so far. Starts at 1 (the initial
+    /// failure that caused enqueueing).
+    pub retry_count: u32,
+    /// Human-readable transport error from the most recent failed attempt.
+    pub last_error: Option<String>,
+    /// Unix timestamp (seconds) at which the next retry should be attempted.
+    /// Set when the commit is enqueued and after each failed retry.
+    pub next_attempt_at: u64,
+}
+
+/// Marker indicating that the persistent commit retry queue exhausted its
+/// budget for a particular operation and the context is now fail-closed
+/// (PR #1606 C6).
+///
+/// While `commit_fault` is set, all governance and lifecycle mutations on
+/// the context return [`ContextError::CommitBroadcastFault`]. Cleared by an
+/// operator via [`ContextManager::acknowledge_commit_fault`].
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CommitFaultMarker {
+    /// Logical operation whose commit failed permanently.
+    pub operation: CommitOperation,
+    /// Final transport error or `"max age exceeded"`.
+    pub reason: String,
+    /// Unix timestamp (seconds) when the marker was set.
+    pub failed_at: u64,
+    /// Total number of send attempts that were made.
+    pub retry_count: u32,
+}
 
 // ---------------------------------------------------------------------------
 // Welcome event helper
@@ -592,6 +736,27 @@ pub struct ContextSnapshot {
     /// does not introduce any new risk.
     #[serde(default)]
     pub spending_nonce_tracker_state: HashMap<String, (u64, u64)>,
+    /// Persistent MLS Commit broadcast retry queue (PR #1606 C6).
+    ///
+    /// Captures pending commits whose `transport.send_message` calls failed
+    /// after the local state mutation. Restored on process restart so that
+    /// the governance timeout task continues retrying after a crash.
+    ///
+    /// MIGRATION: `#[serde(default)]` — legacy snapshots deserialize as
+    /// an empty queue, matching pre-feature behavior.
+    #[serde(default)]
+    pub pending_commits: VecDeque<PendingCommit>,
+    /// Fail-close marker for the persistent commit retry queue (PR #1606 C6).
+    ///
+    /// `Some` when a pending commit exhausted `MAX_COMMIT_RETRIES` or
+    /// `MAX_COMMIT_AGE_SECS`. Persisted so the fail-close state survives
+    /// restart and an operator must explicitly acknowledge the fault before
+    /// further mutations are accepted.
+    ///
+    /// MIGRATION: `#[serde(default)]` — legacy snapshots deserialize as
+    /// `None`, matching pre-feature behavior.
+    #[serde(default)]
+    pub commit_fault: Option<CommitFaultMarker>,
 }
 
 /// Serializable snapshot of [`SenderVelocityTracker`](scp_protocol::economy::antispam::SenderVelocityTracker)
@@ -917,6 +1082,15 @@ struct PerContextState {
     /// Buffers messages arriving ahead of their expected sequence number and
     /// delivers them when the gap fills or a 30-second timeout expires.
     reorder_buffer: scp_protocol::envelope::ReorderBuffer,
+    /// Persistent retry queue for MLS Commit broadcasts that failed at the
+    /// transport layer after the local state mutation already happened
+    /// (PR #1606 C6). Drained by the governance timeout task.
+    pending_commits: VecDeque<PendingCommit>,
+    /// Fail-close marker set when a `PendingCommit` exhausts its retry
+    /// budget. While `Some`, all context-mutating operations return
+    /// [`ContextError::CommitBroadcastFault`] until cleared via
+    /// [`ContextManager::acknowledge_commit_fault`].
+    commit_fault: Option<CommitFaultMarker>,
 }
 
 /// Creates a governance engine from a [`GovernanceModel`] selector and
@@ -1891,6 +2065,8 @@ impl ContextManager {
             hard_rate_limit_config: Some(ctx.governance.hard_rate_limit.config().clone()),
             hard_rate_limit_state: ctx.governance.hard_rate_limit.snapshot_entries(),
             spending_nonce_tracker_state: ctx.governance.spending_nonce_tracker.snapshot_entries(),
+            pending_commits: ctx.pending_commits.clone(),
+            commit_fault: ctx.commit_fault.clone(),
         }
     }
 

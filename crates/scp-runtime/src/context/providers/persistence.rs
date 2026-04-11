@@ -205,6 +205,8 @@ mod tests {
             hard_rate_limit_config: None,
             hard_rate_limit_state: std::collections::HashMap::new(),
             spending_nonce_tracker_state: std::collections::HashMap::new(),
+            pending_commits: std::collections::VecDeque::new(),
+            commit_fault: None,
         }
     }
 
