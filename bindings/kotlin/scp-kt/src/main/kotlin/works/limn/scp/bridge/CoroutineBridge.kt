@@ -803,6 +803,7 @@ interface ToolBindings {
         identityHandle: Long,
         ucanToken: String?,
         proofTokens: List<String>?,
+        spendingUcan: String?,
     ): String
 
     /**
@@ -1633,12 +1634,22 @@ class ToolBridge internal constructor(
     /**
      * Invoke a registered tool in a context.
      *
+     * Tool invocation flows through the runtime's full economy
+     * pipeline (`ContextManager::invoke_tool_with_economy`):
+     * per-invocation pricing, per-DID velocity tracking, escalation,
+     * budget enforcement, payment escrow, and the Matrix-style hard
+     * rate limit are all enforced inside the runtime. See PR #1606 / C4.
+     *
      * @param contextHandle Handle from context create or join.
      * @param toolId The tool's assigned ID.
      * @param inputJson JSON-encoded tool input.
      * @param identityHandle Handle for the invoker's identity.
      * @param ucanToken Optional UCAN token authorizing the invocation.
      * @param proofTokens Optional parent UCAN tokens for delegation chain.
+     * @param spendingUcan Optional JWT-encoded `SpendingCapability` UCAN
+     *   for paid tool invocations under spec section 19.5
+     *   (AND-composition with the action UCAN). May be `null` for free
+     *   tools.
      * @return JSON-encoded tool output.
      */
     @Suppress("LongParameterList") // FFI bridge — must match UniFFI export signature
@@ -1649,6 +1660,7 @@ class ToolBridge internal constructor(
         identityHandle: Long,
         ucanToken: String?,
         proofTokens: List<String>? = null,
+        spendingUcan: String? = null,
     ): String =
         bridge.ffiCall {
             bindings.toolInvoke(
@@ -1658,6 +1670,7 @@ class ToolBridge internal constructor(
                 identityHandle,
                 ucanToken,
                 proofTokens,
+                spendingUcan,
             )
         }
 

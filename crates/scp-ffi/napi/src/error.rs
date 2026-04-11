@@ -133,6 +133,28 @@ impl From<scp_identity::IdentityError> for ScpNapiError {
     }
 }
 
+/// Extracts a leading `SCP-XXX-NNNN` error code from a message body, if any.
+///
+/// Mirrors the `PyO3` bridge's `extract_scp_code` helper. Used to recover
+/// `SCP-ECON-120xx` / `SCP-TOOL-60xx` codes embedded inside
+/// `ContextError::PermissionDenied(String)` so TypeScript callers can
+/// check `.code` instead of string-matching the message body.
+pub(crate) fn extract_scp_code(message: &str) -> Option<String> {
+    let trimmed = message.trim_start();
+    let rest = trimmed.strip_prefix("SCP-")?;
+    let end = rest.find(|c: char| c == ':' || c.is_whitespace())?;
+    let suffix = &rest[..end];
+    let (category, number) = suffix.split_once('-')?;
+    if category.is_empty()
+        || !category.chars().all(|c| c.is_ascii_alphabetic())
+        || number.is_empty()
+        || !number.chars().all(|c| c.is_ascii_digit())
+    {
+        return None;
+    }
+    Some(format!("SCP-{category}-{number}"))
+}
+
 impl From<scp_core::context::ContextError> for ScpNapiError {
     fn from(e: scp_core::context::ContextError) -> Self {
         use scp_core::context::ContextError as CE;
@@ -155,6 +177,28 @@ impl From<scp_core::context::ContextError> for ScpNapiError {
                 message: format!("{e}"),
                 code: "SCP-CTX-2092".to_owned(),
             },
+            // Recover embedded SCP-ECON-/SCP-TOOL-/SCP-PERM- codes from
+            // the runtime's `PermissionDenied(String)` catch-all so the
+            // typed-envelope contract holds for tool-economy failures.
+            CE::PermissionDenied(msg) => {
+                let code = extract_scp_code(msg).unwrap_or_else(|| "SCP-PERM-3001".to_owned());
+                if code.starts_with("SCP-PERM-") {
+                    Self::Permission {
+                        message: format!("{e}"),
+                        code,
+                    }
+                } else if code.starts_with("SCP-TOOL-") {
+                    Self::Tool {
+                        message: format!("{e}"),
+                        code,
+                    }
+                } else {
+                    Self::Context {
+                        message: format!("{e}"),
+                        code,
+                    }
+                }
+            }
             _ => Self::Context {
                 message: format!("{e} — verify context state, membership, and permissions"),
                 code: "SCP-CTX-2001".to_owned(),

@@ -46,6 +46,17 @@ const WASM_MANAGER_SRC: &str = include_str!("../../../../crates/scp-ffi/wasm/src
 const WASM_CONSEQUENCE_SRC: &str =
     include_str!("../../../../crates/scp-ffi/wasm/src/consequence.rs");
 
+// Non-WASM FFI bridge sources. PR #1606 / C4 wired all 3 of these to
+// `ContextManager::invoke_tool_with_economy` so per-invocation pricing,
+// spending UCAN, velocity tracking, budget enforcement, and the hard
+// rate limit are enforced for Python / Node / Swift / Kotlin clients.
+// The structural assertions in `c4_tool_invoke_economy_*` below pin
+// the bridge → runtime delegation so a future refactor cannot silently
+// regress to the bypass path.
+const PYO3_TOOLS_SRC: &str = include_str!("../../../../crates/scp-ffi/src/tools.rs");
+const NAPI_TOOLS_SRC: &str = include_str!("../../../../crates/scp-ffi/napi/src/tools.rs");
+const UNIFFI_BRIDGE_SRC: &str = include_str!("../../../../crates/scp-ffi/uniffi/src/bridge.rs");
+
 // =========================================================================
 // RATCHET CONSTANTS — may only increase
 // Any decrease requires human approval
@@ -635,6 +646,83 @@ fn wasm_send_message_inspects_spending_ucan_and_economic_policy() {
     );
 }
 
+// C4 (#1606) — Bridge tool-invoke economy wiring
+//
+// All 3 non-WASM FFI bridges (PyO3, NAPI, UniFFI) MUST route tool
+// invocation through `ContextManager::invoke_tool_with_economy`. The
+// previous bypass path called `try_consume_hard_rate_limit_*` directly
+// against the bridge-owned tool registry, which disabled per-invocation
+// pricing, spending UCAN AND-composition, velocity tracking, budget
+// enforcement, and the `ToolEconomyTicket` lifecycle for Python /
+// Node / Swift / Kotlin clients.
+//
+// These structural assertions catch any future regression to the
+// bypass path. Each assertion is `fn_body_contains` against the actual
+// bridge function source — calling the runtime helper from a different
+// function would fail the test.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn c4_pyo3_tool_invoke_routes_through_invoke_tool_with_economy() {
+    assert!(
+        fn_body_contains(PYO3_TOOLS_SRC, "py_tool_invoke", "invoke_tool_with_economy"),
+        "PyO3 py_tool_invoke must call ContextManager::invoke_tool_with_economy \
+         (PR #1606 / C4). Calling try_consume_hard_rate_limit_blocking against \
+         a bridge-owned registry instead disables per-invocation pricing, \
+         spending UCAN, velocity tracking, and budget enforcement for Python \
+         clients."
+    );
+}
+
+#[test]
+fn c4_pyo3_tool_invoke_accepts_spending_ucan() {
+    // The bridge MUST accept the spending UCAN parameter — the
+    // runtime's `invoke_tool_with_economy` requires it for §19.5
+    // AND-composition on paid actions.
+    let body =
+        extract_fn_body(PYO3_TOOLS_SRC, "py_tool_invoke").expect("py_tool_invoke body must exist");
+    assert!(
+        body.contains("spending_ucan"),
+        "PyO3 py_tool_invoke must accept and forward a spending UCAN argument \
+         (PR #1606 / C4). Without it, paid tool invocations skip the §19.5 \
+         AND-composition check."
+    );
+    assert!(
+        body.contains("parse_ucan"),
+        "PyO3 py_tool_invoke must parse the spending UCAN JWT into a UcanToken \
+         before passing it to invoke_tool_with_economy."
+    );
+}
+
+#[test]
+fn c4_napi_tool_invoke_routes_through_invoke_tool_with_economy() {
+    assert!(
+        fn_body_contains(NAPI_TOOLS_SRC, "tool_invoke", "invoke_tool_with_economy"),
+        "NAPI tool_invoke must call ContextManager::invoke_tool_with_economy \
+         (PR #1606 / C4). The previous bypass path called \
+         try_consume_hard_rate_limit against the bridge-owned tool registry, \
+         disabling per-invocation pricing, spending UCAN, velocity tracking, \
+         and budget enforcement for Node clients."
+    );
+}
+
+#[test]
+fn c4_napi_tool_invoke_accepts_spending_ucan() {
+    let body =
+        extract_fn_body(NAPI_TOOLS_SRC, "tool_invoke").expect("NAPI tool_invoke body must exist");
+    assert!(
+        body.contains("spending_ucan_jwt"),
+        "NAPI tool_invoke must accept and forward a spending_ucan_jwt argument \
+         (PR #1606 / C4). Without it, paid tool invocations skip the §19.5 \
+         AND-composition check."
+    );
+    assert!(
+        body.contains("parse_ucan"),
+        "NAPI tool_invoke must parse the spending UCAN JWT into a UcanToken \
+         before passing it to invoke_tool_with_economy."
+    );
+}
+
 #[test]
 fn wasm_join_context_inspects_spending_ucan_and_economic_policy() {
     let body = extract_fn_body(WASM_MANAGER_SRC, "join_context")
@@ -704,6 +792,37 @@ fn wasm_set_economic_policy_governance_rejects_paid_policy() {
             || body.contains("SCP-ECON-12095"),
         "WASM dispatch_set_economic_policy must emit SCP-ECON-12095 in the \
          C2 rejection branch"
+    );
+}
+
+#[test]
+fn c4_uniffi_tool_invoke_routes_through_invoke_tool_with_economy() {
+    // `extract_fn_body` returns the first match, which is the
+    // top-level `tool_invoke` (not `tool_invoke_cross_context`).
+    assert!(
+        fn_body_contains(UNIFFI_BRIDGE_SRC, "tool_invoke", "invoke_tool_with_economy"),
+        "UniFFI tool_invoke must call ContextManager::invoke_tool_with_economy \
+         (PR #1606 / C4). The previous bypass path called \
+         try_consume_hard_rate_limit against the bridge-owned tool registry, \
+         disabling per-invocation pricing, spending UCAN, velocity tracking, \
+         and budget enforcement for Swift / Kotlin clients."
+    );
+}
+
+#[test]
+fn c4_uniffi_tool_invoke_accepts_spending_ucan() {
+    let body = extract_fn_body(UNIFFI_BRIDGE_SRC, "tool_invoke")
+        .expect("UniFFI tool_invoke body must exist");
+    assert!(
+        body.contains("spending_ucan_jwt"),
+        "UniFFI tool_invoke must accept and forward a spending_ucan_jwt argument \
+         (PR #1606 / C4). Without it, paid tool invocations skip the §19.5 \
+         AND-composition check."
+    );
+    assert!(
+        body.contains("parse_ucan"),
+        "UniFFI tool_invoke must parse the spending UCAN JWT into a UcanToken \
+         before passing it to invoke_tool_with_economy."
     );
 }
 

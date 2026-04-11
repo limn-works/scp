@@ -410,6 +410,129 @@ describe("Tool runtime (mock bridge)", () => {
       mockBridge.toolInvoke(ctx, "tool-nonexistent", "{}", identity.did, ucan.encoded),
     ).rejects.toThrow(/SCP-TOOL-6001/);
   });
+
+  // C4 (#1606): paid tool invocations now route through
+  // ContextManager.invoke_tool_with_economy via the NAPI bridge.
+  // The TS bridge interface exposes `spendingUcan` as the 7th
+  // toolInvoke argument; verify it round-trips through the bridge
+  // and is recorded in the mock bridge's ToolInvoked event payload.
+  it("forwards spendingUcan through bridge.toolInvoke", async () => {
+    const identity = await mockBridge.identityCreate("in_memory");
+    const ctx = await mockBridge.contextCreate(
+      identity,
+      JSON.stringify({
+        ceiling: ["tools:register", "tools:invoke"],
+      }),
+    );
+
+    const def = defineToolDefinition({
+      name: "paid-echo",
+      description: "Paid echo tool for C4 wiring test",
+      inputSchema: { type: "object" },
+      outputSchema: { type: "object" },
+      operator: identity.did,
+    });
+    const toolId = await mockBridge.toolRegister(ctx, def);
+    mockBridge._registerToolHandler(ctx.contextId, toolId, (input) => ({ echoed: input }));
+
+    const ucan = await mockBridge.ucanMint(ctx, identity.did, ["tool_invoke:*"]);
+    const spending = "eyJ0eXAiOiJKV1QiLCJhbGciOiJFZERTQSJ9.spending.sig";
+
+    const resultJson = await mockBridge.toolInvoke(
+      ctx,
+      toolId,
+      JSON.stringify({ hello: "world" }),
+      identity.did,
+      ucan.encoded,
+      undefined,
+      spending,
+    );
+    expect(JSON.parse(resultJson)).toEqual({ echoed: { hello: "world" } });
+
+    // The mock bridge records `spendingUcanProvided: true` in the
+    // ToolInvoked event payload when a non-empty spending UCAN is
+    // forwarded through the bridge interface. This is the structural
+    // assertion that the bridge layer accepts the new param.
+    const ctxState = mockBridge._contexts.get(ctx.contextId);
+    const toolInvokedEvents =
+      ctxState?.eventLog.filter((e: { eventType: string }) => e.eventType === "ToolInvoked") ?? [];
+    expect(toolInvokedEvents.length).toBe(1);
+    const payload = toolInvokedEvents[0]?.payload as { spendingUcanProvided?: boolean };
+    expect(payload.spendingUcanProvided).toBe(true);
+  });
+
+  // C4 (#1606): the SDK Context.invokeTool wrapper exposes
+  // `spendingUcan` as a named option. Verify the SDK forwards it to
+  // the bridge layer when set.
+  it("Context.invokeTool forwards options.spendingUcan to the bridge", async () => {
+    _setBridge(mockBridge);
+    const identity = await Identity.create({ custody: "in_memory" });
+    const ctx = await Context.create(identity, {
+      ceiling: ["tools:register", "tools:invoke"],
+    });
+
+    const def = defineToolDefinition({
+      name: "sdk-paid-echo",
+      description: "SDK paid echo tool for C4 wiring test",
+      inputSchema: { type: "object" },
+      outputSchema: { type: "object" },
+      operator: identity.did,
+    });
+    const toolId = await ctx.registerTool(def);
+    mockBridge._registerToolHandler(ctx.contextId, toolId, (input) => ({ echoed: input }));
+
+    // Find the bridge handle for this context (mockBridge stores by
+    // contextId; build a stub handle matching the BridgeContextHandle
+    // shape that the bridge interface uses internally).
+    const stubHandle = { contextId: ctx.contextId, state: "active", creatorDid: identity.did };
+    const ucan = await mockBridge.ucanMint(stubHandle, identity.did, ["tool_invoke:*"]);
+    const spending = "eyJ0eXAiOiJKV1QiLCJhbGciOiJFZERTQSJ9.spending.sig";
+
+    const result = await ctx.invokeTool(toolId, { hello: "world" }, identity, ucan.encoded, {
+      spendingUcan: spending,
+    });
+    expect(result).toEqual({ echoed: { hello: "world" } });
+
+    const ctxState = mockBridge._contexts.get(ctx.contextId);
+    const toolInvokedEvents =
+      ctxState?.eventLog.filter((e: { eventType: string }) => e.eventType === "ToolInvoked") ?? [];
+    expect(toolInvokedEvents.length).toBe(1);
+    const payload = toolInvokedEvents[0]?.payload as { spendingUcanProvided?: boolean };
+    expect(payload.spendingUcanProvided).toBe(true);
+  });
+
+  // C4 (#1606): when no spendingUcan option is passed, the SDK must
+  // pass undefined through to the bridge (free-tool path).
+  it("Context.invokeTool defaults spendingUcan to undefined for free tools", async () => {
+    _setBridge(mockBridge);
+    const identity = await Identity.create({ custody: "in_memory" });
+    const ctx = await Context.create(identity, {
+      ceiling: ["tools:register", "tools:invoke"],
+    });
+
+    const def = defineToolDefinition({
+      name: "sdk-free-echo",
+      description: "SDK free echo tool",
+      inputSchema: { type: "object" },
+      outputSchema: { type: "object" },
+      operator: identity.did,
+    });
+    const toolId = await ctx.registerTool(def);
+    mockBridge._registerToolHandler(ctx.contextId, toolId, (input) => ({ echoed: input }));
+
+    const stubHandle = { contextId: ctx.contextId, state: "active", creatorDid: identity.did };
+    const ucan = await mockBridge.ucanMint(stubHandle, identity.did, ["tool_invoke:*"]);
+
+    // No options arg — spending UCAN must default to undefined.
+    await ctx.invokeTool(toolId, { hello: "world" }, identity, ucan.encoded);
+
+    const ctxState = mockBridge._contexts.get(ctx.contextId);
+    const toolInvokedEvents =
+      ctxState?.eventLog.filter((e: { eventType: string }) => e.eventType === "ToolInvoked") ?? [];
+    expect(toolInvokedEvents.length).toBe(1);
+    const payload = toolInvokedEvents[0]?.payload as { spendingUcanProvided?: boolean };
+    expect(payload.spendingUcanProvided).toBe(false);
+  });
 });
 
 // ---------------------------------------------------------------------------

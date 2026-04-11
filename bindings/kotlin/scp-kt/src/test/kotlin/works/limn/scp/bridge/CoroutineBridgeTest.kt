@@ -767,6 +767,7 @@ class StubNativeBindings : NativeBindings {
     var lastToolInvokeIdentityHandle: Long? = null
     var lastToolInvokeUcanToken: String? = null
     var lastToolInvokeProofTokens: List<String>? = null
+    var lastToolInvokeSpendingUcan: String? = null
 
     // Configurable results
     var identityCreateResult = 0L
@@ -1087,6 +1088,7 @@ class StubNativeBindings : NativeBindings {
         definitionJson: String,
     ): String = toolRegisterResult
 
+    @Suppress("LongParameterList")
     override fun toolInvoke(
         contextHandle: Long,
         toolId: String,
@@ -1094,10 +1096,12 @@ class StubNativeBindings : NativeBindings {
         identityHandle: Long,
         ucanToken: String?,
         proofTokens: List<String>?,
+        spendingUcan: String?,
     ): String {
         lastToolInvokeIdentityHandle = identityHandle
         lastToolInvokeUcanToken = ucanToken
         lastToolInvokeProofTokens = proofTokens
+        lastToolInvokeSpendingUcan = spendingUcan
         return toolInvokeResult
     }
 

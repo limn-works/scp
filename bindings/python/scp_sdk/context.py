@@ -829,6 +829,7 @@ class Context:
         ucan_token: str,
         identity: Identity | None = None,
         proof_tokens: list[str] | None = None,
+        spending_ucan: str | None = None,
     ) -> dict[str, Any]:
         """Invoke a tool registered in this context.
 
@@ -836,6 +837,12 @@ class Context:
         token must contain a ``tool_invoke:{tool_id}`` or
         ``tool_invoke:*`` capability scoped to this context.  See
         spec section 6.2, section 8, and ADR-016 for UCAN enforcement.
+
+        Tool invocation flows through the runtime's full economy
+        pipeline (``ContextManager.invoke_tool_with_economy``):
+        per-invocation pricing, per-DID velocity tracking, escalation,
+        budget enforcement, payment escrow, and the Matrix-style hard
+        rate limit are all enforced by the runtime.
 
         .. versionchanged:: 0.2.0
             ``ucan_token`` is now a required positional parameter
@@ -848,6 +855,13 @@ class Context:
             ``proof_tokens`` was also added as an optional keyword
             argument for delegation chain resolution.
 
+        .. versionchanged:: 0.3.0
+            Added ``spending_ucan`` keyword argument carrying the
+            JWT-encoded ``SpendingCapability`` UCAN required by paid
+            tool invocations under spec section 19.5
+            (AND-composition of action UCAN + spending UCAN). May be
+            ``None`` for free tools.
+
         Args:
             tool: The tool identifier.
             input: Input data as a JSON-compatible dict.
@@ -858,13 +872,21 @@ class Context:
                 creator if not specified.
             proof_tokens: Optional list of additional UCAN proof
                 tokens for delegation chain resolution.
+            spending_ucan: Optional JWT-encoded spending UCAN.
+                Required when an ``EconomicPolicy`` priced this tool
+                above zero (spec section 19.5). The runtime checks
+                that the spending capability covers the per-action
+                cost, currency, and any allowed adapters.
 
         Returns:
             The tool's output as a JSON-compatible dict.
 
         Raises:
             ContextError: If the context is not active or the tool is
-                not found.
+                not found.  Specific failure modes carry their canonical
+                error code in ``.code``: ``SCP-ECON-12010`` (budget
+                exceeded), ``SCP-ECON-12061`` (invalid spending UCAN),
+                ``SCP-ECON-12090`` (rate limit exceeded).
             ToolError: If tool execution fails.
             UcanError: If the UCAN token is invalid, expired, revoked,
                 or lacks the required tool invocation capability.
@@ -886,6 +908,7 @@ class Context:
             invoker_did,
             ucan_token,
             proof_tokens,
+            spending_ucan,
         )
         return result
 

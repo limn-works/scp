@@ -604,12 +604,18 @@ def tool_invoke(
     identity_did: str,
     ucan_token: str,
     proof_tokens: list[str] | None = None,
+    spending_ucan: str | None = None,
 ) -> Any:
     """Invoke a tool within an SCP context.
 
     Validates the UCAN token for tool invocation authorization before
     dispatching. The UCAN must contain a ``tool_invoke:{tool_id}`` or
-    ``tool_invoke:*`` capability scoped to the context.
+    ``tool_invoke:*`` capability scoped to the context. Tool invocation
+    flows through the runtime's full economy pipeline
+    (``ContextManager.invoke_tool_with_economy``): per-invocation
+    pricing, velocity tracking, escalation, budget enforcement, payment
+    escrow, and the Matrix-style hard rate limit are all enforced
+    inside the runtime.
 
     Args:
         context_id: The ID of the context containing the tool.
@@ -621,6 +627,11 @@ def tool_invoke(
             capability.
         proof_tokens: Optional list of encoded parent UCAN token strings
             for delegation chain verification.
+        spending_ucan: Optional JWT-encoded spending UCAN
+            (``SpendingCapability``). Required when the context's
+            ``EconomicPolicy`` prices this tool above zero
+            (AND-composition per spec section 19.5). May be ``None`` for
+            free tools.
 
     Returns:
         A dict containing the tool's JSON-compatible output.
@@ -629,7 +640,10 @@ def tool_invoke(
         UcanError: If the UCAN token is invalid, expired, revoked, or
             lacks the required tool invocation capability.
         ContextError: If the context is not connected, the tool is not
-            found, or input/output validation fails.
+            found, or input/output validation fails. Carries embedded
+            ``SCP-ECON-12010`` (budget exceeded), ``SCP-ECON-12061``
+            (invalid spending UCAN), or ``SCP-ECON-12090`` (rate limit
+            exceeded) codes for paid-action failures.
     """
     ...
 
