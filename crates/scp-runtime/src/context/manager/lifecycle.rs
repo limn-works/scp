@@ -972,6 +972,8 @@ impl ContextManager {
                     local_epoch_floors,
                     crate::crypto::mls::provider::MAX_EPOCH_ADVANCE,
                 ) {
+                    // Rollback: destroy the just-restored crypto state so the
+                    // provider is not left with partially-merged floors.
                     let _ = self.crypto.destroy_mls_group(&ctx_id_bytes);
                     let _ = self.crypto.destroy_sender_key(&ctx_id_bytes);
                     return Err(e);
