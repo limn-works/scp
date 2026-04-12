@@ -128,29 +128,8 @@ pub(crate) fn with_transport_manager<T>(
 pub(crate) fn with_transport_manager_mut<T>(
     f: impl FnOnce(&mut scp_transport::TransportManager) -> napi::Result<T>,
 ) -> napi::Result<T> {
-    let guard = transport_state()
-        .write()
-        .map_err(|_| ScpNapiError::Transport {
-            message: "transport manager lock is poisoned".to_owned(),
-            code: "SCP-TRANS-5002".to_owned(),
-        })?;
-    // Arc::get_mut won't work here because there may be cloned references
-    // held by async subscription tasks. Use Arc::make_mut which is
-    // Clone-only. Instead, we downcast through the Option.
-    //
-    // Since TransportManager uses interior mutability for most operations
-    // (relay_assignments: RwLock, reliability_scores: Arc<Mutex>, etc.),
-    // `add_adapter` is the only method requiring &mut self. We obtain it
-    // by temporarily taking the Arc out and using Arc::get_mut or
-    // reconstructing.
-    //
-    // Actually, `add_adapter(&mut self)` needs exclusive access. If other
-    // async tasks hold Arc clones, we can't get &mut. We use a write lock
-    // on the outer RwLock to serialize, but the Arc prevents &mut access.
-    // Solution: use `Arc::get_mut` which succeeds only when refcount == 1.
-    // If it fails (subscription in progress), we error out.
-    drop(guard);
-
+    // Arc::get_mut requires refcount == 1. If subscriptions hold cloned
+    // Arc references, this fails with a clear error rather than deadlocking.
     let mut guard = transport_state()
         .write()
         .map_err(|_| ScpNapiError::Transport {
