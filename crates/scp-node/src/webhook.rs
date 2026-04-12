@@ -61,6 +61,7 @@ pub struct WebhookResult {
 /// # Errors
 /// Returns `WebhookResult` with `success=false` if all retries fail.
 pub async fn dispatch_webhook(
+    client: &reqwest::Client,
     url: &str,
     event: &WebhookEvent,
     signing_key: &SigningKey,
@@ -100,10 +101,18 @@ pub async fn dispatch_webhook(
         }
     };
 
-    let timestamp = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs();
+    let timestamp = match SystemTime::now().duration_since(UNIX_EPOCH) {
+        Ok(d) => d.as_secs(),
+        Err(_) => {
+            return WebhookResult {
+                url: url.to_owned(),
+                success: false,
+                attempts: 0,
+                status_code: None,
+                error: Some("system clock is before Unix epoch".to_owned()),
+            };
+        }
+    };
 
     // Sign: Ed25519(timestamp_be_bytes || body)
     let mut signing_payload = Vec::with_capacity(8 + body.len());
@@ -111,8 +120,6 @@ pub async fn dispatch_webhook(
     signing_payload.extend_from_slice(&body);
     let signature = signing_key.sign(&signing_payload);
     let sig_hex = hex::encode(signature.to_bytes());
-
-    let client = reqwest::Client::new();
     let mut delay = INITIAL_RETRY_DELAY_MS;
 
     for attempt in 1..=MAX_RETRIES {
@@ -160,7 +167,8 @@ pub async fn dispatch_webhook(
     }
 }
 
-/// Basic SSRF prevention: reject private/loopback IP addresses.
+/// SSRF prevention: reject private, loopback, link-local, unspecified, and
+/// cloud-metadata IP addresses. Also rejects IPv6-mapped IPv4 embeddings.
 fn validate_webhook_url(raw_url: &str) -> Option<String> {
     let parsed = match url::Url::parse(raw_url) {
         Ok(u) => u,
@@ -177,22 +185,79 @@ fn validate_webhook_url(raw_url: &str) -> Option<String> {
     }
 
     // Check for private IP ranges.
-    if let Ok(ip) = host.parse::<std::net::IpAddr>() {
-        match ip {
-            std::net::IpAddr::V4(v4) => {
-                if v4.is_private() || v4.is_loopback() || v4.is_link_local() {
-                    return Some(format!("webhook URL must not target private IP: {v4}"));
-                }
-            }
-            std::net::IpAddr::V6(v6) => {
-                if v6.is_loopback() {
-                    return Some(format!("webhook URL must not target loopback IPv6: {v6}"));
-                }
-            }
-        }
+    if let Ok(ip) = host.parse::<std::net::IpAddr>()
+        && let Some(reason) = check_ip_blocked(ip)
+    {
+        return Some(reason);
+    }
+
+    // Also strip brackets for IPv6 literals like [::ffff:127.0.0.1].
+    let stripped = host.trim_start_matches('[').trim_end_matches(']');
+    if stripped != host
+        && let Ok(ip) = stripped.parse::<std::net::IpAddr>()
+        && let Some(reason) = check_ip_blocked(ip)
+    {
+        return Some(reason);
     }
 
     None
+}
+
+/// Returns `Some(reason)` if the IP address must be blocked for SSRF prevention.
+fn check_ip_blocked(ip: std::net::IpAddr) -> Option<String> {
+    match ip {
+        std::net::IpAddr::V4(v4) => {
+            if v4.is_loopback() {
+                return Some(format!("webhook URL must not target loopback IP: {v4}"));
+            }
+            if v4.is_private() {
+                return Some(format!("webhook URL must not target private IP: {v4}"));
+            }
+            if v4.is_link_local() {
+                return Some(format!("webhook URL must not target link-local IP: {v4}"));
+            }
+            if v4.is_unspecified() {
+                return Some(format!("webhook URL must not target unspecified IP: {v4}"));
+            }
+            if v4.is_broadcast() {
+                return Some(format!("webhook URL must not target broadcast IP: {v4}"));
+            }
+            // Reject 0.0.0.0/8 (current network) — octets[0] == 0 but not 0.0.0.0
+            // (0.0.0.0 already caught by is_unspecified).
+            if v4.octets()[0] == 0 {
+                return Some(format!("webhook URL must not target zero-network IP: {v4}"));
+            }
+            None
+        }
+        std::net::IpAddr::V6(v6) => {
+            if v6.is_loopback() {
+                return Some(format!("webhook URL must not target loopback IPv6: {v6}"));
+            }
+            if v6.is_unspecified() {
+                return Some(format!(
+                    "webhook URL must not target unspecified IPv6: {v6}"
+                ));
+            }
+            let segments = v6.segments();
+            // fc00::/7 — unique local addresses (segments[0] & 0xfe00 == 0xfc00).
+            if segments[0] & 0xfe00 == 0xfc00 {
+                return Some(format!(
+                    "webhook URL must not target unique-local IPv6: {v6}"
+                ));
+            }
+            // fe80::/10 — link-local addresses (segments[0] & 0xffc0 == 0xfe80).
+            if segments[0] & 0xffc0 == 0xfe80 {
+                return Some(format!("webhook URL must not target link-local IPv6: {v6}"));
+            }
+            // ::ffff:x.x.x.x — IPv6-mapped IPv4. Check the embedded IPv4.
+            if let Some(v4) = v6.to_ipv4_mapped()
+                && let Some(reason) = check_ip_blocked(std::net::IpAddr::V4(v4))
+            {
+                return Some(format!("webhook URL must not target IPv6-mapped {reason}"));
+            }
+            None
+        }
+    }
 }
 
 #[cfg(test)]
@@ -211,7 +276,8 @@ mod tests {
             timestamp: 1_700_000_000,
             payload: serde_json::json!({}),
         };
-        let result = dispatch_webhook("http://example.com/hook", &event, &key).await;
+        let client = reqwest::Client::new();
+        let result = dispatch_webhook(&client, "http://example.com/hook", &event, &key).await;
         assert!(!result.success);
         assert_eq!(result.attempts, 0);
         assert!(
@@ -232,7 +298,8 @@ mod tests {
             payload: serde_json::json!({}),
         };
 
-        let result = dispatch_webhook("https://localhost/hook", &event, &key).await;
+        let client = reqwest::Client::new();
+        let result = dispatch_webhook(&client, "https://localhost/hook", &event, &key).await;
         assert!(!result.success);
         assert!(
             result
@@ -243,7 +310,7 @@ mod tests {
             result.error,
         );
 
-        let result = dispatch_webhook("https://127.0.0.1/hook", &event, &key).await;
+        let result = dispatch_webhook(&client, "https://127.0.0.1/hook", &event, &key).await;
         assert!(!result.success);
         assert!(
             result
@@ -266,8 +333,10 @@ mod tests {
             payload: serde_json::json!({}),
         };
 
+        let client = reqwest::Client::new();
+
         // 10.x.x.x
-        let result = dispatch_webhook("https://10.0.0.1/hook", &event, &key).await;
+        let result = dispatch_webhook(&client, "https://10.0.0.1/hook", &event, &key).await;
         assert!(!result.success);
         assert!(
             result
@@ -279,7 +348,7 @@ mod tests {
         );
 
         // 192.168.x.x
-        let result = dispatch_webhook("https://192.168.1.1/hook", &event, &key).await;
+        let result = dispatch_webhook(&client, "https://192.168.1.1/hook", &event, &key).await;
         assert!(!result.success);
         assert!(
             result
@@ -291,7 +360,7 @@ mod tests {
         );
 
         // 172.16.x.x
-        let result = dispatch_webhook("https://172.16.0.1/hook", &event, &key).await;
+        let result = dispatch_webhook(&client, "https://172.16.0.1/hook", &event, &key).await;
         assert!(!result.success);
         assert!(
             result
@@ -361,8 +430,82 @@ mod tests {
     fn validate_webhook_url_rejects_link_local() {
         let result = validate_webhook_url("https://169.254.1.1/hook");
         assert!(
-            result.is_some_and(|e| e.contains("private IP")),
+            result.is_some_and(|e| e.contains("link-local")),
             "link-local IP should be rejected"
+        );
+    }
+
+    #[test]
+    fn validate_webhook_url_rejects_unspecified() {
+        let result = validate_webhook_url("https://0.0.0.0/hook");
+        assert!(
+            result.is_some_and(|e| e.contains("unspecified")),
+            "0.0.0.0 should be rejected"
+        );
+    }
+
+    #[test]
+    fn validate_webhook_url_rejects_cloud_metadata() {
+        // AWS metadata endpoint
+        let result = validate_webhook_url("https://169.254.169.254/latest/meta-data");
+        assert!(
+            result.is_some_and(|e| e.contains("link-local")),
+            "169.254.169.254 (AWS metadata) should be rejected"
+        );
+    }
+
+    #[test]
+    fn validate_webhook_url_rejects_zero_network() {
+        // 0.x.x.x — "this network" addresses
+        let result = validate_webhook_url("https://0.1.2.3/hook");
+        assert!(
+            result.is_some_and(|e| e.contains("zero-network")),
+            "0.x.x.x should be rejected"
+        );
+    }
+
+    #[test]
+    fn validate_webhook_url_rejects_ipv6_unique_local() {
+        let result = validate_webhook_url("https://[fd00::1]/hook");
+        assert!(
+            result.is_some_and(|e| e.contains("unique-local")),
+            "fd00::1 (unique local) should be rejected"
+        );
+    }
+
+    #[test]
+    fn validate_webhook_url_rejects_ipv6_link_local() {
+        let result = validate_webhook_url("https://[fe80::1]/hook");
+        assert!(
+            result.is_some_and(|e| e.contains("link-local IPv6")),
+            "fe80::1 (link-local) should be rejected"
+        );
+    }
+
+    #[test]
+    fn validate_webhook_url_rejects_ipv6_mapped_ipv4_loopback() {
+        let result = validate_webhook_url("https://[::ffff:127.0.0.1]/hook");
+        assert!(
+            result.is_some_and(|e| e.contains("IPv6-mapped")),
+            "::ffff:127.0.0.1 should be rejected"
+        );
+    }
+
+    #[test]
+    fn validate_webhook_url_rejects_ipv6_mapped_ipv4_private() {
+        let result = validate_webhook_url("https://[::ffff:10.0.0.1]/hook");
+        assert!(
+            result.is_some_and(|e| e.contains("IPv6-mapped")),
+            "::ffff:10.0.0.1 should be rejected"
+        );
+    }
+
+    #[test]
+    fn validate_webhook_url_rejects_ipv6_unspecified() {
+        let result = validate_webhook_url("https://[::]/hook");
+        assert!(
+            result.is_some_and(|e| e.contains("unspecified")),
+            ":: (unspecified IPv6) should be rejected"
         );
     }
 }
