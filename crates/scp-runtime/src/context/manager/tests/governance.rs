@@ -14713,6 +14713,12 @@ async fn earned_capacity_limits_governance_proposals() {
     let key_admin = signing_key_for_did(&admin);
 
     let mut params = governance_params();
+    // Earned capacity is a multi-party governance concept — use Threshold
+    // so the eligibility check isn't bypassed (SingleAdmin skips it).
+    params.governance = GovernanceModel::Threshold {
+        threshold: 1,
+        signers: vec![admin.clone()],
+    };
     params.sybil_policy = Some(ContextSybilPolicy::casual());
 
     let _handle = manager

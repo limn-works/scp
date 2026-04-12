@@ -858,12 +858,10 @@ fn check_proposer_eligibility(
         }
     }
 
-    // SingleAdmin without sybil_policy: skip participation and earned capacity
-    // checks — the sole authority is always eligible. When a sybil_policy IS
-    // set, earned capacity limits still apply (even to the admin).
-    if matches!(ctx.handle.params().governance, GovernanceModel::SingleAdmin)
-        && ctx.handle.params().sybil_policy.is_none()
-    {
+    // SingleAdmin: the sole authority is always eligible. Participation
+    // thresholds and earned capacity limits are multi-party governance
+    // concepts — rate-limiting the only admin is nonsensical.
+    if matches!(ctx.handle.params().governance, GovernanceModel::SingleAdmin) {
         return Ok(());
     }
 
