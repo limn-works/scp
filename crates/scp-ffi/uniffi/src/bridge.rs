@@ -1943,24 +1943,57 @@ impl Drop for UcanToken {
 
 /// Opaque handle to the transport layer.
 ///
-/// Exposes connection status and relay URL without leaking connection state.
-/// The actual transport (WebSocket, multi-relay routing) is managed internally.
-///
-/// Holds a reference to the underlying `NativeRelayAdapter` established by
-/// `transport_connect`. The adapter represents a live WebSocket connection
-/// to an SCP relay.
+/// Wraps a real [`scp_transport::TransportManager`] that supports multi-relay
+/// routing, per-context relay set assignment, suppression detection, and
+/// reliability scoring (ADR-012). Swift/Kotlin callers get the full multi-relay
+/// API: `addRelay`, `assignRelaySet`, `adapterCount`, `reliabilityScore`.
 ///
 /// Generated as `class TransportManager` in both Swift and Kotlin.
 ///
-/// See ADR-005 (Transport Abstraction).
-#[derive(Debug, uniffi::Object)]
+/// See ADR-005 (Transport Abstraction) and ADR-012 (Multi-transport routing).
+#[derive(uniffi::Object)]
 pub struct TransportManager {
-    /// Current connection state.
+    /// Current connection state (relay URL, latency).
     pub(crate) status: std::sync::Mutex<TransportStatus>,
-    /// The underlying relay adapter (live WebSocket connection).
-    /// `None` after `transport_disconnect` is called.
-    pub(crate) adapter:
-        std::sync::Mutex<Option<Arc<scp_transport::native::adapter::NativeRelayAdapter>>>,
+    /// The real multi-relay transport manager.
+    /// Wrapped in `RwLock` for concurrent read access (status, adapter count)
+    /// with exclusive write access (add relay, disconnect).
+    pub(crate) inner: std::sync::RwLock<scp_transport::TransportManager>,
+}
+
+impl fmt::Debug for TransportManager {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let adapter_count = self
+            .inner
+            .read()
+            .map(|mgr| mgr.adapter_count())
+            .unwrap_or(0);
+        f.debug_struct("TransportManager")
+            .field("adapter_count", &adapter_count)
+            .finish_non_exhaustive()
+    }
+}
+
+/// Per-adapter reliability score record exposed to Swift/Kotlin.
+///
+/// Contains the key fields from [`scp_transport::scoring::ReliabilityScore`]
+/// needed for relay health monitoring and selection decisions.
+///
+/// See ADR-012 acceptance criterion 5.
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct ReliabilityScoreRecord {
+    /// The relay URL this score tracks.
+    pub relay_url: String,
+    /// Delivery success rate (0.0 to 1.0).
+    pub delivery_success_rate: f64,
+    /// Average latency in milliseconds.
+    pub average_latency_ms: u64,
+    /// Deletion compliance rate (0.0 to 1.0).
+    pub deletion_compliance_rate: f64,
+    /// Total number of send attempts.
+    pub total_sends: u64,
+    /// Total number of send failures.
+    pub total_failures: u64,
 }
 
 #[uniffi::export]
@@ -1968,9 +2001,13 @@ impl TransportManager {
     /// Returns the current transport connection status record.
     ///
     /// Reflects actual connection state: `connected` is `true` only if the
-    /// underlying relay adapter is still held.
+    /// inner transport manager has at least one adapter registered.
     pub fn status(&self) -> TransportStatus {
-        let has_adapter = self.adapter.lock().map(|a| a.is_some()).unwrap_or(false);
+        let has_adapters = self
+            .inner
+            .read()
+            .map(|mgr| mgr.adapter_count() > 0)
+            .unwrap_or(false);
         let status = self
             .status
             .lock()
@@ -1981,15 +2018,117 @@ impl TransportManager {
                 latency_ms: None,
             });
         TransportStatus {
-            connected: has_adapter && status.connected,
-            relay_url: if has_adapter { status.relay_url } else { None },
+            connected: has_adapters && status.connected,
+            relay_url: if has_adapters { status.relay_url } else { None },
             latency_ms: status.latency_ms,
         }
     }
 
-    /// Returns `true` if the transport is currently connected.
+    /// Returns `true` if the transport is currently connected (has adapters).
     pub fn is_connected(&self) -> bool {
-        self.adapter.lock().map(|a| a.is_some()).unwrap_or(false)
+        self.inner
+            .read()
+            .map(|mgr| mgr.adapter_count() > 0)
+            .unwrap_or(false)
+    }
+
+    /// Returns the number of adapters registered in the transport manager.
+    #[allow(clippy::cast_possible_truncation)] // Adapter count is bounded by connection budget (<<u32::MAX).
+    pub fn adapter_count(&self) -> u32 {
+        self.inner
+            .read()
+            .map(|mgr| mgr.adapter_count() as u32)
+            .unwrap_or(0)
+    }
+
+    /// Registers an additional relay adapter with the transport manager.
+    ///
+    /// Connects to the specified relay URL and adds the resulting adapter to
+    /// the manager. Returns the total adapter count after adding.
+    ///
+    /// # Arguments
+    ///
+    /// * `relay_url` -- The URL of the additional SCP relay to connect to.
+    ///
+    /// # Errors
+    ///
+    /// Returns `ScpError::Transport` if the URL is invalid or the connection
+    /// fails.
+    pub fn add_relay(&self, relay_url: String) -> Result<u32, ScpError> {
+        use scp_transport::native::adapter::NativeRelayAdapter;
+        use scp_transport::relay::connection::{RelayUrlSource, SourcedRelayUrl};
+
+        validate_relay_url(&relay_url)?;
+
+        let rt = runtime();
+        let sourced = SourcedRelayUrl {
+            url: relay_url,
+            source: RelayUrlSource::Explicit,
+        };
+        let profile = scp_transport::profile::TransportProfile::platform_default();
+        let adapter = rt
+            .block_on(async { NativeRelayAdapter::connect_sourced(&sourced, Some(&profile)).await })
+            .map_err(ScpError::from)?;
+
+        let mut mgr = self.inner.write().map_err(|_| ScpError::Transport {
+            msg: "transport manager lock is poisoned".to_owned(),
+            code: "SCP-TRANS-5003".to_owned(),
+        })?;
+        let _eviction = mgr.add_adapter(Box::new(adapter));
+        #[allow(clippy::cast_possible_truncation)] // Bounded by connection budget.
+        Ok(mgr.adapter_count() as u32)
+    }
+
+    /// Assigns a relay set for the given context.
+    ///
+    /// Delegates to [`scp_transport::TransportManager::assign_relay_set`]
+    /// which selects adapters using round-robin spread to minimize overlap.
+    ///
+    /// # Arguments
+    ///
+    /// * `context_id` -- The context to assign relays for.
+    ///
+    /// # Returns
+    ///
+    /// A list of adapter indices assigned to this context.
+    ///
+    /// # Errors
+    ///
+    /// Returns `ScpError::Transport` if no adapters are registered.
+    pub fn assign_relay_set(&self, context_id: String) -> Result<Vec<u32>, ScpError> {
+        validate_context_id(&context_id)?;
+        let mgr = self.inner.read().map_err(|_| ScpError::Transport {
+            msg: "transport manager lock is poisoned".to_owned(),
+            code: "SCP-TRANS-5003".to_owned(),
+        })?;
+        let indices = mgr
+            .assign_relay_set(&context_id)
+            .map_err(|e| ScpError::Transport {
+                msg: format!("relay set assignment failed: {e}"),
+                code: "SCP-TRANS-5004".to_owned(),
+            })?;
+        #[allow(clippy::cast_possible_truncation)] // Adapter indices bounded by adapter count.
+        Ok(indices.into_iter().map(|i| i as u32).collect())
+    }
+
+    /// Returns the reliability score for an adapter by index.
+    ///
+    /// Returns `None` if no score exists for the given adapter index.
+    ///
+    /// # Arguments
+    ///
+    /// * `adapter_index` -- The adapter index (0-based) to query.
+    pub fn reliability_score(&self, adapter_index: u32) -> Option<ReliabilityScoreRecord> {
+        let mgr = self.inner.read().ok()?;
+        let score = mgr.get_reliability_score(adapter_index as usize)?;
+        Some(ReliabilityScoreRecord {
+            relay_url: score.relay_url.clone(),
+            delivery_success_rate: score.delivery_success_rate,
+            average_latency_ms: score.average_latency_ms,
+            deletion_compliance_rate: score.deletion_compliance_rate,
+            total_sends: score.total_sends,
+            total_failures: score.total_failures,
+        })
     }
 }
 
@@ -4589,7 +4728,10 @@ pub async fn transport_connect(relay_url: String) -> Result<Arc<TransportManager
                 .await
                 .map_err(ScpError::from)?;
 
-            let arc_adapter = Arc::new(adapter);
+            // Wrap the adapter in a real TransportManager for multi-relay
+            // support (ADR-012). The manager provides relay set assignment,
+            // reliability scoring, and suppression detection.
+            let manager = scp_transport::TransportManager::new(Box::new(adapter));
 
             let handle = Arc::new(TransportManager {
                 status: std::sync::Mutex::new(TransportStatus {
@@ -4597,7 +4739,7 @@ pub async fn transport_connect(relay_url: String) -> Result<Arc<TransportManager
                     relay_url: Some(relay_url),
                     latency_ms: None,
                 }),
-                adapter: std::sync::Mutex::new(Some(arc_adapter)),
+                inner: std::sync::RwLock::new(manager),
             });
             increment_handle_count();
             Ok(handle)
@@ -4624,9 +4766,9 @@ pub async fn transport_status(manager: Arc<TransportManager>) -> Result<Transpor
 
 /// Disconnects from the current SCP relay.
 ///
-/// Clears the relay adapter from the `TransportManager` handle. After this
-/// call, the `TransportManager` reports `connected: false` and the adapter's
-/// WebSocket connection is released when the last reference is dropped.
+/// Replaces the inner `TransportManager` with an empty builder, releasing
+/// all adapter connections. After this call, the `TransportManager` reports
+/// `connected: false` and `adapter_count() == 0`.
 ///
 /// This is idempotent — calling it when already disconnected is a no-op.
 ///
@@ -4636,19 +4778,18 @@ pub async fn transport_status(manager: Arc<TransportManager>) -> Result<Transpor
 ///
 /// # Errors
 ///
-/// Returns `ScpError::Transport` if the internal mutex is poisoned.
+/// Returns `ScpError::Transport` if the internal lock is poisoned.
 #[uniffi::export]
 pub async fn transport_disconnect(manager: Arc<TransportManager>) -> Result<(), ScpError> {
     runtime()
         .spawn(async move {
-            // Clear the adapter from the manager.
+            // Replace the inner manager with an empty one, dropping all adapters.
             {
-                let mut adapter_guard =
-                    manager.adapter.lock().map_err(|_| ScpError::Transport {
-                        msg: "adapter mutex is poisoned — cannot clear relay adapter".to_owned(),
-                        code: "SCP-TRANS-5003".to_owned(),
-                    })?;
-                *adapter_guard = None;
+                let mut inner_guard = manager.inner.write().map_err(|_| ScpError::Transport {
+                    msg: "transport manager lock is poisoned — cannot disconnect".to_owned(),
+                    code: "SCP-TRANS-5003".to_owned(),
+                })?;
+                *inner_guard = scp_transport::TransportManager::builder();
             }
 
             // Update the status to disconnected.
