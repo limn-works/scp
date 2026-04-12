@@ -1305,6 +1305,97 @@ mod tests {
         );
     }
 
+    /// Integration test: verifies that suppression is detected and reported
+    /// on the `suppression_events()` channel when no heartbeats are received
+    /// for longer than the threshold (spec §9.9.2, #1533 AC8).
+    ///
+    /// Uses `tokio::time::pause()` to control time without waiting real seconds.
+    /// The Server profile uses a 60s heartbeat interval with 2x multiplier,
+    /// so suppression fires after 120s of silence. We advance 130s to ensure
+    /// the heartbeat check loop has ticked past the threshold.
+    #[tokio::test(start_paused = true)]
+    async fn suppression_detected_after_threshold() {
+        use crate::native::server::{RelayConfig, RelayServer};
+        use crate::native::storage::BlobStorageBackend;
+        use crate::profile::TransportProfile;
+        use crate::relay::connection::{RelayUrlSource, SourcedRelayUrl};
+        use std::net::SocketAddr;
+        use std::sync::Arc;
+        use std::time::Duration;
+
+        // Start a local relay server so the adapter can connect.
+        let config = RelayConfig {
+            bind_addr: SocketAddr::from(([127, 0, 0, 1], 0)),
+            ttl_check_interval: Duration::from_millis(100),
+            delivery_jitter_ms: 0,
+            ..RelayConfig::default()
+        };
+        let storage = Arc::new(BlobStorageBackend::in_memory());
+        let server = RelayServer::new(config, storage);
+        let (_handle, addr) = server.start().await.unwrap();
+        let url = format!("ws://{addr}/scp/v1");
+
+        let sourced = SourcedRelayUrl {
+            url,
+            source: RelayUrlSource::DhtResolved,
+        };
+
+        // Connect with Server profile (60s heartbeat, 2x threshold = 120s).
+        let mut adapter =
+            NativeRelayAdapter::connect_sourced(&sourced, Some(&TransportProfile::Server))
+                .await
+                .unwrap();
+
+        assert!(
+            adapter.has_heartbeat_monitor(),
+            "Server profile must have a heartbeat monitor"
+        );
+
+        // Do NOT call record_heartbeat_received — simulate silence.
+        //
+        // First, yield to let the spawned heartbeat task start and
+        // consume its initial timer tick + record_heartbeat_sent.
+        tokio::task::yield_now().await;
+        tokio::task::yield_now().await;
+
+        // Now advance time past the suppression threshold (120s) in
+        // steps of the heartbeat interval (60s). Each advance fires
+        // the pending timer tick; yielding lets the background task
+        // process the tick, acquire the monitor lock, check for
+        // suppression, and push to the channel.
+        for _ in 0..3 {
+            tokio::time::advance(Duration::from_secs(61)).await;
+            // Yield enough times for the background task to run.
+            for _ in 0..20 {
+                tokio::task::yield_now().await;
+            }
+        }
+
+        // Read from the suppression events channel.
+        let rx = adapter
+            .suppression_events()
+            .expect("suppression_events() must return Some for Server profile");
+
+        let event = rx.try_recv();
+        assert!(
+            event.is_ok(),
+            "expected SuppressionSuspected event on the channel after 130s of silence"
+        );
+
+        let suppression = event.unwrap();
+        assert!(
+            !suppression.relay_url.is_empty(),
+            "suppression event should include the relay URL"
+        );
+        // The gap_duration will be small (1-2s) because suppression fires on
+        // the first tick after the threshold is exceeded.
+        assert!(
+            suppression.gap_duration > Duration::ZERO,
+            "gap_duration should be positive, got {:?}",
+            suppression.gap_duration,
+        );
+    }
+
     /// Verifies that `TransportProfile::Mobile` creates a heartbeat monitor
     /// (profile-driven config selects Mobile → 120s interval).
     #[tokio::test]
