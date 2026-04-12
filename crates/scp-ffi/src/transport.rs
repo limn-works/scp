@@ -5,24 +5,31 @@
 //! - [`py_transport_connect`] -- Connect to an SCP relay.
 //! - [`py_transport_disconnect`] -- Disconnect from the current relay.
 //! - [`py_transport_status`] -- Query transport connection status.
+//! - [`py_transport_add_relay`] -- Register an additional relay adapter.
+//! - [`py_transport_assign_relay_set`] -- Assign a relay set for a context.
+//! - [`py_transport_adapter_count`] -- Number of registered adapters.
+//! - [`py_transport_reliability`] -- Per-adapter reliability score.
 //!
 //! # Types
 //!
 //! - [`PyTransportStatus`] -- Connection status (connected, relay URL, latency).
 //!
-//! # Transport Wiring (SCP-213)
+//! # Transport Wiring (SCP-213, #1490)
 //!
 //! `py_transport_connect` creates a [`NativeRelayAdapter`] connected to the
-//! given relay URL and stores it in the global relay connection state (see
-//! [`crate::runtime`]). This adapter is shared with `py_mcp_load_contexts`
-//! for relay-based context discovery.
+//! given relay URL, wraps it in a [`scp_transport::TransportManager`], and
+//! stores the manager in the global transport state (see
+//! [`crate::runtime`]). The manager provides multi-relay fanout,
+//! per-context relay set assignment, suppression detection, and reliability
+//! scoring. This manager is shared with `py_mcp_load_contexts` for
+//! relay-based context discovery.
 //!
 //! The relay URL is tracked in a module-level `RwLock` so that
 //! `py_transport_status` can report it without querying the adapter.
 //!
 //! See ADR-013 in `.docs/adrs/phase-3.md` section 5 for the bridge specification.
 
-use std::sync::{Arc, OnceLock, RwLock};
+use std::sync::{OnceLock, RwLock};
 
 use pyo3::prelude::*;
 use scp_transport::native::adapter::NativeRelayAdapter;
@@ -148,10 +155,9 @@ pub fn py_transport_connect(relay_url: &str, source: &str) -> PyResult<()> {
 
     match adapter {
         Ok(adapter) => {
-            let arc_adapter = Arc::new(adapter);
-
-            // Store the adapter in the global relay connection state.
-            crate::runtime::set_relay_connection(Arc::clone(&arc_adapter))?;
+            // Wrap the adapter in a TransportManager for multi-relay support.
+            let manager = scp_transport::TransportManager::new(Box::new(adapter));
+            crate::runtime::set_transport_manager(manager)?;
 
             // Track the URL for status queries.
             *connected_url_state().write().map_err(|_| {
@@ -177,7 +183,7 @@ pub fn py_transport_connect(relay_url: &str, source: &str) -> PyResult<()> {
 #[pyfunction]
 #[pyo3(name = "transport_disconnect")]
 pub fn py_transport_disconnect() -> PyResult<()> {
-    crate::runtime::clear_relay_connection()?;
+    crate::runtime::clear_transport_manager()?;
 
     *connected_url_state()
         .write()
@@ -201,9 +207,7 @@ pub fn py_transport_disconnect() -> PyResult<()> {
 #[pyfunction]
 #[pyo3(name = "transport_status")]
 pub fn py_transport_status() -> PyResult<PyTransportStatus> {
-    let has_connection = crate::runtime::get_relay_connection()
-        .map(|opt| opt.is_some())
-        .unwrap_or(false);
+    let has_connection = crate::runtime::has_transport_manager();
 
     let relay_url = connected_url_state()
         .read()
@@ -270,6 +274,149 @@ pub fn py_configure_relay_transport(relay_url: &str, local_did: &str) -> PyResul
 }
 
 // ---------------------------------------------------------------------------
+// Multi-relay management functions
+// ---------------------------------------------------------------------------
+
+/// Registers an additional relay adapter with the transport manager.
+///
+/// Connects to the specified relay URL and adds the resulting adapter to
+/// the global [`TransportManager`]. The `transport_connect` function must
+/// have been called first to initialize the manager.
+///
+/// # Arguments
+///
+/// * `relay_url` -- The URL of the additional SCP relay to connect to.
+/// * `source` -- How the URL was discovered (default: `"explicit"`).
+///
+/// # Returns
+///
+/// The total number of adapters after adding (i.e. the new adapter count).
+///
+/// # Errors
+///
+/// Raises `TransportError` if no transport manager exists, the URL is
+/// invalid, or the connection fails.
+#[pyfunction]
+#[pyo3(name = "transport_add_relay", signature = (relay_url, source = "explicit"))]
+pub fn py_transport_add_relay(relay_url: &str, source: &str) -> PyResult<usize> {
+    validate::validate_relay_url(relay_url)?;
+    let rt = crate::runtime()?;
+
+    let relay_source = match source {
+        "dht_resolved" => RelayUrlSource::DhtResolved,
+        "well_known" => RelayUrlSource::WellKnown,
+        "explicit" => RelayUrlSource::Explicit,
+        "peer_discovered" => RelayUrlSource::PeerDiscovered,
+        other => {
+            return Err(ScpPyError::validation(format!(
+                "invalid relay URL source: {other:?}. Expected one of: \
+                 \"dht_resolved\", \"well_known\", \"explicit\", \"peer_discovered\""
+            ))
+            .into());
+        }
+    };
+
+    let sourced = SourcedRelayUrl {
+        url: relay_url.to_owned(),
+        source: relay_source,
+    };
+    let profile = scp_transport::profile::TransportProfile::platform_default();
+    let adapter = rt
+        .block_on(async { NativeRelayAdapter::connect_sourced(&sourced, Some(&profile)).await })
+        .map_err(ScpPyError::from)?;
+
+    crate::runtime::with_transport_manager_mut(|manager| {
+        let _eviction = manager.add_adapter(Box::new(adapter));
+        Ok(manager.adapter_count())
+    })
+    .map_err(Into::into)
+}
+
+/// Assigns a relay set for the given context.
+///
+/// Delegates to [`TransportManager::assign_relay_set`] which selects at
+/// least `min_relays` adapters per context using round-robin spread to
+/// minimize overlap.
+///
+/// # Arguments
+///
+/// * `context_id` -- The context to assign relays for.
+///
+/// # Returns
+///
+/// A list of adapter indices assigned to this context.
+///
+/// # Errors
+///
+/// Raises `TransportError` if no transport manager exists or no adapters
+/// are registered.
+#[pyfunction]
+#[pyo3(name = "transport_assign_relay_set")]
+pub fn py_transport_assign_relay_set(context_id: &str) -> PyResult<Vec<usize>> {
+    validate::validate_context_id(context_id)?;
+    crate::runtime::with_transport_manager(|manager| {
+        manager
+            .assign_relay_set(&context_id.to_owned())
+            .map_err(|e| ScpPyError::transport(format!("relay set assignment failed: {e}")))
+    })
+    .map_err(Into::into)
+}
+
+/// Returns the number of adapters registered in the transport manager.
+///
+/// # Errors
+///
+/// Raises `TransportError` if no transport manager has been initialized.
+#[pyfunction]
+#[pyo3(name = "transport_adapter_count")]
+pub fn py_transport_adapter_count() -> PyResult<usize> {
+    crate::runtime::with_transport_manager(|manager| Ok(manager.adapter_count()))
+        .map_err(Into::into)
+}
+
+/// Returns the reliability score for an adapter by index.
+///
+/// Returns a dict with the score fields, or `None` if no score exists
+/// for the given adapter index.
+///
+/// # Arguments
+///
+/// * `adapter_index` -- The adapter index (0-based) to query.
+///
+/// # Errors
+///
+/// Raises `TransportError` if no transport manager has been initialized.
+#[pyfunction]
+#[pyo3(name = "transport_reliability")]
+pub fn py_transport_reliability(
+    py: Python<'_>,
+    adapter_index: usize,
+) -> PyResult<Option<PyObject>> {
+    crate::runtime::with_transport_manager(|manager| {
+        match manager.get_reliability_score(adapter_index) {
+            Some(score) => {
+                let dict = pyo3::types::PyDict::new(py);
+                dict.set_item("relay_url", &score.relay_url)
+                    .map_err(|e| ScpPyError::transport(format!("dict build failed: {e}")))?;
+                dict.set_item("delivery_success_rate", score.delivery_success_rate)
+                    .map_err(|e| ScpPyError::transport(format!("dict build failed: {e}")))?;
+                dict.set_item("average_latency_ms", score.average_latency_ms)
+                    .map_err(|e| ScpPyError::transport(format!("dict build failed: {e}")))?;
+                dict.set_item("deletion_compliance_rate", score.deletion_compliance_rate)
+                    .map_err(|e| ScpPyError::transport(format!("dict build failed: {e}")))?;
+                dict.set_item("total_sends", score.total_sends)
+                    .map_err(|e| ScpPyError::transport(format!("dict build failed: {e}")))?;
+                dict.set_item("total_failures", score.total_failures)
+                    .map_err(|e| ScpPyError::transport(format!("dict build failed: {e}")))?;
+                Ok(Some(dict.into()))
+            }
+            None => Ok(None),
+        }
+    })
+    .map_err(Into::into)
+}
+
+// ---------------------------------------------------------------------------
 // Module registration
 // ---------------------------------------------------------------------------
 
@@ -286,6 +433,10 @@ pub fn register_transport(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(py_transport_disconnect, m)?)?;
     m.add_function(wrap_pyfunction!(py_transport_status, m)?)?;
     m.add_function(wrap_pyfunction!(py_configure_relay_transport, m)?)?;
+    m.add_function(wrap_pyfunction!(py_transport_add_relay, m)?)?;
+    m.add_function(wrap_pyfunction!(py_transport_assign_relay_set, m)?)?;
+    m.add_function(wrap_pyfunction!(py_transport_adapter_count, m)?)?;
+    m.add_function(wrap_pyfunction!(py_transport_reliability, m)?)?;
     Ok(())
 }
 
