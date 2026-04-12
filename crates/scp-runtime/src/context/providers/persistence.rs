@@ -208,6 +208,8 @@ mod tests {
             spending_nonce_tracker_state: std::collections::HashMap::new(),
             pending_commits: std::collections::VecDeque::new(),
             commit_fault: None,
+            checkpoint_events_since: 0,
+            checkpoint_last_time_secs: 0,
         }
     }
 

@@ -569,6 +569,10 @@ impl ContextManager {
             // fail-close marker so retries continue across process restart.
             pending_commits: ctx_snapshot.pending_commits,
             commit_fault: ctx_snapshot.commit_fault,
+            // Checkpoint tracking (§9.9.3): restore counters from snapshot.
+            checkpoint_events_since: ctx_snapshot.checkpoint_events_since,
+            checkpoint_last_time_secs: ctx_snapshot.checkpoint_last_time_secs,
+            checkpoints: Vec::new(),
         };
 
         {
@@ -1273,6 +1277,10 @@ impl ContextManager {
             // exporter's MLS state which is not transferred via import.
             pending_commits: VecDeque::new(),
             commit_fault: None,
+            // Checkpoint tracking (§9.9.3): fresh counters for imported contexts.
+            checkpoint_events_since: 0,
+            checkpoint_last_time_secs: self.clock.now_secs(),
+            checkpoints: Vec::new(),
         };
 
         // 7. Register the context.
@@ -1462,6 +1470,10 @@ impl ContextManager {
             // queue and no fail-close marker.
             pending_commits: VecDeque::new(),
             commit_fault: None,
+            // Checkpoint tracking (§9.9.3): fresh counters for new contexts.
+            checkpoint_events_since: 0,
+            checkpoint_last_time_secs: self.clock.now_secs(),
+            checkpoints: Vec::new(),
         };
 
         {
@@ -1667,7 +1679,7 @@ impl ContextManager {
     /// Builds a [`PerContextState`] with governance engine, tokens, and threshold
     /// signers extracted from the governance config. Helper for
     /// [`create_context_with_governance`] to stay under the line-count lint.
-    #[allow(clippy::too_many_arguments)] // internal helper, not public API
+    #[allow(clippy::too_many_arguments, clippy::too_many_lines)] // internal helper, not public API
     fn build_governed_context_state(
         &self,
         handle: ContextHandle,
@@ -1793,6 +1805,10 @@ impl ContextManager {
             // queue and no fail-close marker.
             pending_commits: VecDeque::new(),
             commit_fault: None,
+            // Checkpoint tracking (§9.9.3): fresh counters for new contexts.
+            checkpoint_events_since: 0,
+            checkpoint_last_time_secs: self.clock.now_secs(),
+            checkpoints: Vec::new(),
         })
     }
 

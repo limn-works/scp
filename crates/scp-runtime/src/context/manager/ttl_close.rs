@@ -34,6 +34,30 @@ impl ContextManager {
         handle: &ContextHandle,
         initiator_did: &DID,
     ) -> Result<CloseResult, ContextError> {
+        self.close_context_with_key(handle, initiator_did, None)
+            .await
+    }
+
+    /// Closes a context with an optional signing key for final checkpoint
+    /// generation (§9.9.3).
+    ///
+    /// When `signing_key` is provided, a final consistency checkpoint is
+    /// force-created before the context transitions to `Closing`. When `None`,
+    /// checkpoint creation is skipped (best-effort: the send path will have
+    /// already created periodic checkpoints).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ContextError::ContextNotActive`] if the context is not
+    /// `Active`. Returns [`ContextError::PermissionDenied`] if the context
+    /// uses a multi-admin governance model or the initiator lacks
+    /// `ContextClose` capability.
+    pub async fn close_context_with_key(
+        &self,
+        handle: &ContextHandle,
+        initiator_did: &DID,
+        signing_key: Option<&ed25519_dalek::SigningKey>,
+    ) -> Result<CloseResult, ContextError> {
         let context_id = handle.context_id().to_owned();
 
         // Check governance model: multi-admin contexts must route through
@@ -81,6 +105,19 @@ impl ContextManager {
                 // Participation decay: clear participation cache and cooldown
                 // state on context close (#1530).
                 ctx.governance.decay_participation();
+
+                // Final checkpoint before close (§9.9.3): force-create a
+                // checkpoint to capture the terminal event log state. This
+                // ensures equivocation detection covers the full context
+                // lifetime. Best-effort: skip if no signing key is available.
+                if let Some(sk) = signing_key {
+                    let cp = self.force_create_checkpoint(&context_id, ctx, initiator_did, sk);
+                    tracing::debug!(
+                        context_id = %context_id,
+                        event_count = cp.event_count,
+                        "final checkpoint created on close (§9.9.3)"
+                    );
+                }
 
                 ctx.receive_buffer.push(ContextEvent::SystemClose {
                     initiator_did: initiator_did.clone(),

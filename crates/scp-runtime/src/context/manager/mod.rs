@@ -793,6 +793,14 @@ pub struct ContextSnapshot {
     /// `None`, matching pre-feature behavior.
     #[serde(default)]
     pub commit_fault: Option<CommitFaultMarker>,
+    /// Number of event log appends since the last consistency checkpoint (§9.9.3).
+    /// Persisted so the checkpoint interval counter survives process restarts.
+    #[serde(default)]
+    pub checkpoint_events_since: u64,
+    /// Unix timestamp (seconds) of the last consistency checkpoint (§9.9.3).
+    /// Persisted so the time-based checkpoint trigger survives restarts.
+    #[serde(default)]
+    pub checkpoint_last_time_secs: u64,
 }
 
 /// Serializable snapshot of [`SenderVelocityTracker`](scp_protocol::economy::antispam::SenderVelocityTracker)
@@ -1146,6 +1154,12 @@ struct PerContextState {
     /// [`ContextError::CommitBroadcastFault`] until cleared via
     /// [`ContextManager::acknowledge_commit_fault`].
     commit_fault: Option<CommitFaultMarker>,
+    /// Number of event log appends since the last consistency checkpoint (§9.9.3).
+    checkpoint_events_since: u64,
+    /// Unix timestamp (seconds) of the last consistency checkpoint (§9.9.3).
+    checkpoint_last_time_secs: u64,
+    /// Locally generated consistency checkpoints for equivocation detection (§9.9.3).
+    checkpoints: Vec<scp_event_log::checkpoint::ConsistencyCheckpoint>,
 }
 
 /// Creates a governance engine from a [`GovernanceModel`] selector and
@@ -2123,6 +2137,8 @@ impl ContextManager {
             spending_nonce_tracker_state: ctx.governance.spending_nonce_tracker.snapshot_entries(),
             pending_commits: ctx.pending_commits.clone(),
             commit_fault: ctx.commit_fault.clone(),
+            checkpoint_events_since: ctx.checkpoint_events_since,
+            checkpoint_last_time_secs: ctx.checkpoint_last_time_secs,
         }
     }
 

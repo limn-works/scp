@@ -636,6 +636,8 @@ fn governance_snapshot_serde_roundtrip() {
         spending_nonce_tracker_state: HashMap::new(),
         pending_commits: std::collections::VecDeque::new(),
         commit_fault: None,
+        checkpoint_events_since: 0,
+        checkpoint_last_time_secs: 0,
     };
 
     let json = serde_json::to_string(&snapshot).expect("serialize");
@@ -12119,6 +12121,8 @@ fn velocity_tracker_state_in_context_snapshot_roundtrip() {
         spending_nonce_tracker_state: HashMap::new(),
         pending_commits: std::collections::VecDeque::new(),
         commit_fault: None,
+        checkpoint_events_since: 0,
+        checkpoint_last_time_secs: 0,
     };
 
     let json = serde_json::to_string(&snapshot).expect("serialize");
@@ -12202,6 +12206,8 @@ fn velocity_tracker_backward_compat_deserialization() {
         spending_nonce_tracker_state: HashMap::new(),
         pending_commits: std::collections::VecDeque::new(),
         commit_fault: None,
+        checkpoint_events_since: 0,
+        checkpoint_last_time_secs: 0,
     };
 
     let mut json_value: serde_json::Value =

@@ -598,4 +598,226 @@ impl ContextManager {
             .get(context_id)
             .and_then(|ctx| ctx.commit_fault.clone())
     }
+
+    // -------------------------------------------------------------------------
+    // Checkpoint operations (§9.9.3, ADR-011 AC-8)
+    // -------------------------------------------------------------------------
+
+    /// Creates a consistency checkpoint if one is due based on event count
+    /// or time interval thresholds.
+    ///
+    /// A checkpoint is due when either:
+    /// - 50 events have been appended since the last checkpoint, or
+    /// - 10 minutes have elapsed since the last checkpoint.
+    ///
+    /// The checkpoint captures the Merkle root, event count, and MLS epoch at
+    /// the current point in time, then signs a canonical hash over those fields
+    /// using Ed25519. The signature commits to a domain-separated canonical
+    /// hash (see [`scp_event_log::checkpoint::compute_checkpoint_canonical_hash`]).
+    ///
+    /// Returns `Ok(Some(checkpoint))` if one was created, `Ok(None)` if not yet due.
+    ///
+    /// Called from `finalize_send` and `deliver_message_and_drain_buffered` after
+    /// each event log append.
+    pub(super) fn create_checkpoint_if_due(
+        &self,
+        context_id: &str,
+        ctx: &mut super::PerContextState,
+        sender_did: &DID,
+        signing_key: &ed25519_dalek::SigningKey,
+    ) -> Option<scp_event_log::checkpoint::ConsistencyCheckpoint> {
+        let now = self.clock.now_secs();
+        let events_due = ctx.checkpoint_events_since >= 50;
+        let time_due = now.saturating_sub(ctx.checkpoint_last_time_secs) >= 600;
+
+        if !events_due && !time_due {
+            return None;
+        }
+
+        let cp = Self::build_checkpoint(
+            context_id,
+            ctx,
+            sender_did,
+            signing_key,
+            now,
+            &*self.event_log,
+        );
+
+        ctx.checkpoint_events_since = 0;
+        ctx.checkpoint_last_time_secs = now;
+        ctx.checkpoints.push(cp.clone());
+
+        tracing::debug!(
+            context_id,
+            event_count = cp.event_count,
+            "consistency checkpoint created (§9.9.3)"
+        );
+
+        Some(cp)
+    }
+
+    /// Unconditionally creates a consistency checkpoint regardless of whether
+    /// the event/time thresholds have been reached.
+    ///
+    /// Used by `close_context` to ensure a final checkpoint is always
+    /// generated before context archival (§9.9.3).
+    pub(super) fn force_create_checkpoint(
+        &self,
+        context_id: &str,
+        ctx: &mut super::PerContextState,
+        sender_did: &DID,
+        signing_key: &ed25519_dalek::SigningKey,
+    ) -> scp_event_log::checkpoint::ConsistencyCheckpoint {
+        let now = self.clock.now_secs();
+        let cp = Self::build_checkpoint(
+            context_id,
+            ctx,
+            sender_did,
+            signing_key,
+            now,
+            &*self.event_log,
+        );
+
+        ctx.checkpoint_events_since = 0;
+        ctx.checkpoint_last_time_secs = now;
+        ctx.checkpoints.push(cp.clone());
+
+        tracing::info!(
+            context_id,
+            event_count = cp.event_count,
+            "forced final checkpoint on context close (§9.9.3)"
+        );
+
+        cp
+    }
+
+    /// Builds a signed checkpoint from the current event log and context state.
+    fn build_checkpoint(
+        context_id: &str,
+        ctx: &super::PerContextState,
+        sender_did: &DID,
+        signing_key: &ed25519_dalek::SigningKey,
+        now: u64,
+        event_log: &dyn super::ContextEventLogProvider,
+    ) -> scp_event_log::checkpoint::ConsistencyCheckpoint {
+        let context_id_bytes = super::context_id_to_bytes(context_id);
+        let merkle_root = event_log
+            .event_log_merkle_root(&context_id_bytes)
+            .unwrap_or([0u8; 32]);
+        let event_count = event_log
+            .event_log_entries(&context_id_bytes)
+            .ok()
+            .flatten()
+            .map_or(0, |entries| entries.len() as u64);
+
+        // Encrypted contexts (no broadcast_context) use MLS epochs; broadcast
+        // contexts do not use MLS and have no meaningful epoch.
+        let epoch = if ctx.broadcast_context.is_none() {
+            Some(ctx.epoch.mls_epoch)
+        } else {
+            None
+        };
+
+        let canonical_hash = scp_event_log::checkpoint::compute_checkpoint_canonical_hash(
+            context_id,
+            sender_did.as_ref(),
+            event_count,
+            &merkle_root,
+            epoch,
+            now,
+        );
+
+        let signature = ed25519_dalek::Signer::sign(signing_key, &canonical_hash);
+
+        scp_event_log::checkpoint::ConsistencyCheckpoint {
+            context_id: context_id.to_owned(),
+            sender_did: sender_did.clone(),
+            event_count,
+            merkle_root,
+            epoch,
+            timestamp: now,
+            signature: signature.to_bytes().to_vec(),
+        }
+    }
+
+    /// Compares a remote checkpoint against local event log state for
+    /// equivocation detection (§9.9.3, ADR-011 AC-8).
+    ///
+    /// When the comparison returns `Divergent`, emits an
+    /// [`ContextEvent::EquivocationDetected`] event on the receive buffer
+    /// and appends a durable event log entry.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ContextError::ContextNotRegistered`] if the context is
+    /// not registered.
+    #[instrument(skip_all, fields(context_id))]
+    pub async fn compare_remote_checkpoint(
+        &self,
+        context_id: &str,
+        remote: &scp_event_log::checkpoint::ConsistencyCheckpoint,
+    ) -> Result<scp_event_log::checkpoint::CheckpointComparison, ContextError> {
+        let context_id_bytes = super::context_id_to_bytes(context_id);
+        let local_root = self
+            .event_log
+            .event_log_merkle_root(&context_id_bytes)
+            .unwrap_or([0u8; 32]);
+        let local_count = self
+            .event_log
+            .event_log_entries(&context_id_bytes)
+            .ok()
+            .flatten()
+            .map_or(0, |e| e.len() as u64);
+
+        let comparison = match local_count.cmp(&remote.event_count) {
+            std::cmp::Ordering::Equal => {
+                if local_root == remote.merkle_root {
+                    scp_event_log::checkpoint::CheckpointComparison::Consistent
+                } else {
+                    scp_event_log::checkpoint::CheckpointComparison::Divergent {
+                        first_divergent_event: None,
+                    }
+                }
+            }
+            std::cmp::Ordering::Less => scp_event_log::checkpoint::CheckpointComparison::Behind {
+                missing_events: remote.event_count - local_count,
+            },
+            std::cmp::Ordering::Greater => scp_event_log::checkpoint::CheckpointComparison::Ahead {
+                extra_events: local_count - remote.event_count,
+            },
+        };
+
+        // Emit EquivocationDetected event when divergent.
+        if matches!(
+            comparison,
+            scp_event_log::checkpoint::CheckpointComparison::Divergent { .. }
+        ) {
+            tracing::warn!(
+                context_id,
+                remote_sender = %remote.sender_did,
+                event_count = remote.event_count,
+                "relay equivocation detected — divergent Merkle roots at same event count (§9.9.3)"
+            );
+            if let Err(e) = self.event_log.append_context_event(
+                &context_id_bytes,
+                "EquivocationDetected",
+                remote.sender_did.as_ref(),
+            ) {
+                tracing::warn!(
+                    context_id,
+                    "failed to append EquivocationDetected to event log: {e}"
+                );
+            }
+            let mut contexts = self.contexts.lock().await;
+            if let Some(ctx) = contexts.get_mut(context_id) {
+                ctx.receive_buffer.push(ContextEvent::EquivocationDetected {
+                    context_id: context_id.to_owned(),
+                    remote_sender_did: remote.sender_did.clone(),
+                    event_count: remote.event_count,
+                });
+            }
+        }
+
+        Ok(comparison)
+    }
 }
