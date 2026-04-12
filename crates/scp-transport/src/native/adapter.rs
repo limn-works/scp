@@ -346,6 +346,23 @@ impl NativeRelayAdapter {
         self.suppression_rx.as_mut()
     }
 
+    /// Takes ownership of the suppression event receiver, leaving `None` in
+    /// its place.
+    ///
+    /// After this call, [`suppression_events`](Self::suppression_events)
+    /// returns `None`. This is used by the FFI bridge layer to extract the
+    /// receiver before moving the adapter into [`TransportManager`] — the
+    /// bridge spawns a background task that drains the receiver and feeds
+    /// suppression events into the manager's reliability scoring (#1533 AC5).
+    ///
+    /// Returns `None` if heartbeat monitoring is not active (no profile or
+    /// constrained profile) or if the receiver was already taken.
+    pub const fn take_suppression_receiver(
+        &mut self,
+    ) -> Option<tokio::sync::mpsc::Receiver<crate::heartbeat::SuppressionSuspected>> {
+        self.suppression_rx.take()
+    }
+
     /// Records that a heartbeat was received from the relay.
     ///
     /// Called by subscription message processing when heartbeat-like

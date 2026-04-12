@@ -154,10 +154,22 @@ pub fn py_transport_connect(relay_url: &str, source: &str) -> PyResult<()> {
         rt.block_on(async { NativeRelayAdapter::connect_sourced(&sourced, Some(&profile)).await });
 
     match adapter {
-        Ok(adapter) => {
+        Ok(mut adapter) => {
+            // Extract the suppression event receiver BEFORE moving the adapter
+            // into the TransportManager. The spawned task drains suppression
+            // events and downgrades the relay's reliability score (#1533 AC5).
+            let suppression_rx = adapter.take_suppression_receiver();
+
             // Wrap the adapter in a TransportManager for multi-relay support.
+            // Cover traffic is already running — `connect_sourced` with a
+            // profile auto-starts it via `finalize_connection` (#1532 AC6).
             let manager = scp_transport::TransportManager::new(Box::new(adapter));
             crate::runtime::set_transport_manager(manager)?;
+
+            // Spawn suppression → scoring bridge task.
+            if let Some(suppression_rx) = suppression_rx {
+                spawn_suppression_scoring_task(suppression_rx, url.clone());
+            }
 
             // Track the URL for status queries.
             *connected_url_state().write().map_err(|_| {
@@ -321,15 +333,30 @@ pub fn py_transport_add_relay(relay_url: &str, source: &str) -> PyResult<usize> 
         source: relay_source,
     };
     let profile = scp_transport::profile::TransportProfile::platform_default();
-    let adapter = rt
+    // Cover traffic auto-starts per adapter via `connect_sourced` with a
+    // profile — `finalize_connection` launches the cover traffic background
+    // task based on the profile's tier (#1532 AC6).
+    let mut adapter = rt
         .block_on(async { NativeRelayAdapter::connect_sourced(&sourced, Some(&profile)).await })
         .map_err(ScpPyError::from)?;
 
-    crate::runtime::with_transport_manager_mut(|manager| {
+    // Extract the suppression event receiver BEFORE moving the adapter into
+    // the TransportManager. The spawned task drains suppression events and
+    // downgrades the relay's reliability score (#1533 AC5).
+    let suppression_rx = adapter.take_suppression_receiver();
+    let scoring_url = relay_url.to_owned();
+
+    let count = crate::runtime::with_transport_manager_mut(|manager| {
         let _eviction = manager.add_adapter(Box::new(adapter));
         Ok(manager.adapter_count())
-    })
-    .map_err(Into::into)
+    })?;
+
+    // Spawn suppression → scoring bridge task.
+    if let Some(suppression_rx) = suppression_rx {
+        spawn_suppression_scoring_task(suppression_rx, scoring_url);
+    }
+
+    Ok(count)
 }
 
 /// Assigns a relay set for the given context.
@@ -414,6 +441,40 @@ pub fn py_transport_reliability(
         }
     })
     .map_err(Into::into)
+}
+
+// ---------------------------------------------------------------------------
+// Suppression → scoring bridge task
+// ---------------------------------------------------------------------------
+
+/// Spawns a background task that drains heartbeat suppression events from a
+/// per-adapter receiver and records each as a delivery failure in the global
+/// transport manager's reliability scoring.
+///
+/// This bridges the per-adapter heartbeat monitor (spec §9.9.2) with the
+/// `TransportManager`'s cross-relay `SuppressionTracker` (spec §9.9.4,
+/// #1533 AC5). Each suppression event downgrades the relay's reliability
+/// score via `DeliveryOutcome::Failure`.
+///
+/// The task exits gracefully when the sender half is dropped (adapter
+/// dropped or disconnected).
+fn spawn_suppression_scoring_task(
+    mut rx: tokio::sync::mpsc::Receiver<scp_transport::heartbeat::SuppressionSuspected>,
+    relay_url: String,
+) {
+    tokio::spawn(async move {
+        while let Some(_suppression) = rx.recv().await {
+            tracing::debug!(
+                relay_url = %relay_url,
+                "heartbeat suppression → downgrading relay reliability score"
+            );
+            crate::runtime::record_suppression(&relay_url);
+        }
+        tracing::debug!(
+            relay_url = %relay_url,
+            "suppression scoring task exited — adapter disconnected"
+        );
+    });
 }
 
 // ---------------------------------------------------------------------------

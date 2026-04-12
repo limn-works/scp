@@ -1179,6 +1179,22 @@ pub fn has_transport_manager() -> bool {
         .is_some_and(|guard| guard.is_some())
 }
 
+/// Records a heartbeat suppression event for a relay, downgrading its
+/// reliability score.
+///
+/// Called from the background task spawned by `transport_add_relay` /
+/// `transport_connect` that drains the per-adapter suppression receiver
+/// (#1533 AC5). Silently no-ops if the transport manager has been cleared
+/// (e.g., after disconnect).
+pub fn record_suppression(relay_url: &str) {
+    let Ok(guard) = transport_state().read() else {
+        return;
+    };
+    if let Some(manager) = guard.as_ref() {
+        manager.update_score(relay_url, scp_transport::scoring::DeliveryOutcome::Failure);
+    }
+}
+
 /// Clears the transport manager (called by `py_transport_disconnect`).
 ///
 /// After this, relay-based context discovery in `py_mcp_load_contexts`

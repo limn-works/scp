@@ -339,16 +339,28 @@ pub async fn transport_connect(relay_url: String) -> napi::Result<NapiTransportM
         scp_transport::native::NativeRelayAdapter::connect_sourced(&sourced, Some(&profile)).await;
 
     match adapter_result {
-        Ok(adapter) => {
+        Ok(mut adapter) => {
             // Connection succeeded. Measure latency.
             #[allow(clippy::cast_precision_loss)]
             let latency = start.elapsed().as_millis() as f64;
 
+            // Extract the suppression event receiver BEFORE moving the adapter
+            // into the TransportManager. The spawned task drains suppression
+            // events and downgrades the relay's reliability score (#1533 AC5).
+            let suppression_rx = adapter.take_suppression_receiver();
+
             // Wrap the adapter in a TransportManager for multi-relay support,
             // then store it in the process-global state. Same pattern as the
             // PyO3 bridge's `py_transport_connect`.
+            // Cover traffic is already running — `connect_sourced` with a
+            // profile auto-starts it via `finalize_connection` (#1532 AC6).
             let manager = scp_transport::TransportManager::new(Box::new(adapter));
             set_transport_manager(manager)?;
+
+            // Spawn suppression → scoring bridge task.
+            if let Some(rx) = suppression_rx {
+                spawn_suppression_scoring_task(rx, relay_url.clone());
+            }
 
             let handle = NapiTransportManager {
                 status: std::sync::Mutex::new(NapiTransportStatus {
@@ -572,7 +584,10 @@ pub async fn transport_add_relay(relay_url: String) -> napi::Result<u32> {
         source: scp_transport::relay::connection::RelayUrlSource::Explicit,
     };
     let profile = scp_transport::profile::TransportProfile::platform_default();
-    let adapter =
+    // Cover traffic auto-starts per adapter via `connect_sourced` with a
+    // profile — `finalize_connection` launches the cover traffic background
+    // task based on the profile's tier (#1532 AC6).
+    let mut adapter =
         scp_transport::native::NativeRelayAdapter::connect_sourced(&sourced, Some(&profile))
             .await
             .map_err(|e| ScpNapiError::Transport {
@@ -580,11 +595,23 @@ pub async fn transport_add_relay(relay_url: String) -> napi::Result<u32> {
                 code: "SCP-TRANS-5001".to_owned(),
             })?;
 
-    with_transport_manager_mut(|manager| {
+    // Extract the suppression event receiver BEFORE moving the adapter into
+    // the TransportManager. The spawned task drains suppression events and
+    // downgrades the relay's reliability score (#1533 AC5).
+    let suppression_rx = adapter.take_suppression_receiver();
+
+    let count = with_transport_manager_mut(|manager| {
         let _eviction = manager.add_adapter(Box::new(adapter));
         #[allow(clippy::cast_possible_truncation)]
         Ok(manager.adapter_count() as u32)
-    })
+    })?;
+
+    // Spawn suppression → scoring bridge task.
+    if let Some(rx) = suppression_rx {
+        spawn_suppression_scoring_task(rx, relay_url);
+    }
+
+    Ok(count)
 }
 
 /// Assigns a relay set for the given context.
@@ -676,6 +703,46 @@ pub fn transport_reliability(adapter_index: u32) -> napi::Result<Option<NapiReli
                 }
             }))
     })
+}
+
+// ---------------------------------------------------------------------------
+// Suppression → scoring bridge task
+// ---------------------------------------------------------------------------
+
+/// Spawns a background task that drains heartbeat suppression events from a
+/// per-adapter receiver and records each as a delivery failure in the global
+/// transport manager's reliability scoring.
+///
+/// This bridges the per-adapter heartbeat monitor (spec §9.9.2) with the
+/// `TransportManager`'s cross-relay `SuppressionTracker` (spec §9.9.4,
+/// #1533 AC5). Each suppression event downgrades the relay's reliability
+/// score via `DeliveryOutcome::Failure`.
+///
+/// The task exits gracefully when the sender half is dropped (adapter
+/// dropped or disconnected).
+fn spawn_suppression_scoring_task(
+    mut rx: tokio::sync::mpsc::Receiver<scp_transport::heartbeat::SuppressionSuspected>,
+    relay_url: String,
+) {
+    tokio::spawn(async move {
+        while let Some(_suppression) = rx.recv().await {
+            tracing::debug!(
+                relay_url = %relay_url,
+                "heartbeat suppression → downgrading relay reliability score"
+            );
+            // Read-lock the global transport manager to update the score.
+            // If the manager was cleared (disconnect), we silently stop.
+            if let Ok(guard) = transport_state().read()
+                && let Some(ref arc_mgr) = *guard
+            {
+                arc_mgr.update_score(&relay_url, scp_transport::scoring::DeliveryOutcome::Failure);
+            }
+        }
+        tracing::debug!(
+            relay_url = %relay_url,
+            "suppression scoring task exited — adapter disconnected"
+        );
+    });
 }
 
 #[cfg(test)]

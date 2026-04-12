@@ -2054,7 +2054,7 @@ impl TransportManager {
     ///
     /// Returns `ScpError::Transport` if the URL is invalid or the connection
     /// fails.
-    pub fn add_relay(&self, relay_url: String) -> Result<u32, ScpError> {
+    pub fn add_relay(self: Arc<Self>, relay_url: String) -> Result<u32, ScpError> {
         use scp_transport::native::adapter::NativeRelayAdapter;
         use scp_transport::relay::connection::{RelayUrlSource, SourcedRelayUrl};
 
@@ -2062,13 +2062,21 @@ impl TransportManager {
 
         let rt = runtime();
         let sourced = SourcedRelayUrl {
-            url: relay_url,
+            url: relay_url.clone(),
             source: RelayUrlSource::Explicit,
         };
+        // Cover traffic auto-starts per adapter via `connect_sourced` with a
+        // profile — `finalize_connection` launches the cover traffic background
+        // task based on the profile's tier (#1532 AC6).
         let profile = scp_transport::profile::TransportProfile::platform_default();
-        let adapter = rt
+        let mut adapter = rt
             .block_on(async { NativeRelayAdapter::connect_sourced(&sourced, Some(&profile)).await })
             .map_err(ScpError::from)?;
+
+        // Extract the suppression event receiver BEFORE moving the adapter
+        // into the TransportManager. The spawned task drains suppression
+        // events and downgrades the relay's reliability score (#1533 AC5).
+        let suppression_rx = adapter.take_suppression_receiver();
 
         let mut mgr = self.inner.write().map_err(|_| ScpError::Transport {
             msg: "transport manager lock is poisoned".to_owned(),
@@ -2076,7 +2084,15 @@ impl TransportManager {
         })?;
         let _eviction = mgr.add_adapter(Box::new(adapter));
         #[allow(clippy::cast_possible_truncation)] // Bounded by connection budget.
-        Ok(mgr.adapter_count() as u32)
+        let count = mgr.adapter_count() as u32;
+        drop(mgr);
+
+        // Spawn suppression → scoring bridge task.
+        if let Some(rx) = suppression_rx {
+            spawn_suppression_scoring_task(rx, relay_url, Arc::downgrade(&self));
+        }
+
+        Ok(count)
     }
 
     /// Assigns a relay set for the given context.
@@ -2141,6 +2157,47 @@ impl Drop for TransportManager {
     fn drop(&mut self) {
         decrement_handle_count();
     }
+}
+
+// ---------------------------------------------------------------------------
+// Suppression → scoring bridge task
+// ---------------------------------------------------------------------------
+
+/// Spawns a background task that drains heartbeat suppression events from a
+/// per-adapter receiver and records each as a delivery failure in the
+/// `TransportManager`'s reliability scoring.
+///
+/// This bridges the per-adapter heartbeat monitor (spec §9.9.2) with the
+/// `TransportManager`'s cross-relay `SuppressionTracker` (spec §9.9.4,
+/// #1533 AC5). Each suppression event downgrades the relay's reliability
+/// score via `DeliveryOutcome::Failure`.
+///
+/// Uses a `Weak` reference so the task exits gracefully when the
+/// `TransportManager` is dropped (no prevent-drop cycles).
+fn spawn_suppression_scoring_task(
+    mut rx: tokio::sync::mpsc::Receiver<scp_transport::heartbeat::SuppressionSuspected>,
+    relay_url: String,
+    manager: std::sync::Weak<TransportManager>,
+) {
+    tokio::spawn(async move {
+        while let Some(_suppression) = rx.recv().await {
+            let Some(mgr) = manager.upgrade() else {
+                // TransportManager dropped — exit gracefully.
+                break;
+            };
+            tracing::debug!(
+                relay_url = %relay_url,
+                "heartbeat suppression → downgrading relay reliability score"
+            );
+            if let Ok(inner) = mgr.inner.read() {
+                inner.update_score(&relay_url, scp_transport::scoring::DeliveryOutcome::Failure);
+            }
+        }
+        tracing::debug!(
+            relay_url = %relay_url,
+            "suppression scoring task exited — adapter disconnected"
+        );
+    });
 }
 
 // ---------------------------------------------------------------------------
@@ -4723,10 +4780,18 @@ pub async fn transport_connect(relay_url: String) -> Result<Arc<TransportManager
             };
 
             // Establish a real WebSocket connection to the relay.
+            // Cover traffic auto-starts per adapter via `connect_sourced`
+            // with a profile — `finalize_connection` launches the cover
+            // traffic background task based on the profile's tier (#1532 AC6).
             let profile = scp_transport::profile::TransportProfile::platform_default();
-            let adapter = NativeRelayAdapter::connect_sourced(&sourced, Some(&profile))
+            let mut adapter = NativeRelayAdapter::connect_sourced(&sourced, Some(&profile))
                 .await
                 .map_err(ScpError::from)?;
+
+            // Extract the suppression event receiver BEFORE moving the adapter
+            // into the TransportManager. The spawned task drains suppression
+            // events and downgrades the relay's reliability score (#1533 AC5).
+            let suppression_rx = adapter.take_suppression_receiver();
 
             // Wrap the adapter in a real TransportManager for multi-relay
             // support (ADR-012). The manager provides relay set assignment,
@@ -4736,12 +4801,18 @@ pub async fn transport_connect(relay_url: String) -> Result<Arc<TransportManager
             let handle = Arc::new(TransportManager {
                 status: std::sync::Mutex::new(TransportStatus {
                     connected: true,
-                    relay_url: Some(relay_url),
+                    relay_url: Some(relay_url.clone()),
                     latency_ms: None,
                 }),
                 inner: std::sync::RwLock::new(manager),
             });
             increment_handle_count();
+
+            // Spawn suppression → scoring bridge task.
+            if let Some(rx) = suppression_rx {
+                spawn_suppression_scoring_task(rx, relay_url, Arc::downgrade(&handle));
+            }
+
             Ok(handle)
         })
         .await
