@@ -70,7 +70,7 @@ async fn auto_wire_context_manager(did: &str, relay_url: &str, bridge_token: Zer
         Ok(adapter) => {
             crate::runtime::init_context_manager_with_relay_transport(did, adapter);
 
-            // Also populate the RELAY_ADAPTER global so that broadcast
+            // Also populate the TRANSPORT_MANAGER global so that broadcast
             // publish, context subscribe, and discovery probing work without
             // a separate `transportConnect` call. This requires a second
             // WebSocket connection because NativeRelayAdapter is not Clone
@@ -83,14 +83,16 @@ async fn auto_wire_context_manager(did: &str, relay_url: &str, bridge_token: Zer
             .await
             {
                 Ok(relay_adapter) => {
-                    let _ = crate::transport::set_relay_adapter(std::sync::Arc::new(relay_adapter));
+                    let manager = scp_transport::TransportManager::new(Box::new(relay_adapter));
+                    let _ =
+                        crate::transport::set_transport_manager_arc(std::sync::Arc::new(manager));
                 }
                 Err(e) => {
                     tracing::warn!(
                         error = %e,
                         relay_url = %relay_url,
                         "auto_wire_context_manager: ContextManager wired but failed to \
-                         populate RELAY_ADAPTER — broadcast publish and discovery may \
+                         populate TRANSPORT_MANAGER — broadcast publish and discovery may \
                          require a manual transportConnect call"
                     );
                 }

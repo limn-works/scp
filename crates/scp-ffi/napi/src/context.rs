@@ -942,7 +942,7 @@ pub fn context_subscribe(
     validate_did(&identity_did).map_err(|e| napi::Error::from(ScpNapiError::from(e)))?;
     drop(identity_did);
 
-    let Some(adapter) = crate::transport::get_relay_adapter() else {
+    let Some(transport_mgr) = crate::transport::get_transport_manager() else {
         // Reset the guard so the caller can retry after connecting a relay.
         handle
             .subscription_active
@@ -988,9 +988,8 @@ pub fn context_subscribe(
     // which has no active tokio runtime context.
     crate::runtime().spawn(async move {
         use futures::StreamExt;
-        use scp_transport::TransportAdapter;
 
-        let stream_result = adapter.subscribe(&routing_id, None).await;
+        let stream_result = transport_mgr.subscribe(&routing_id, None).await;
         let mut stream = match stream_result {
             Ok(s) => s,
             Err(e) => {
