@@ -6252,6 +6252,30 @@ async fn consequence_triggers_after_governance_action() {
             sequence_number: 1,
             payload: vec![],
         });
+        // Seed sufficient participation so propose_governance_action passes
+        // the #1530 eligibility check.
+        ctx.governance.participation_cache.insert(
+            admin.to_string(),
+            scp_protocol::trust::ParticipationRecord {
+                subject_did: admin.clone(),
+                context_id: "gov-conseq-ctx".to_owned(),
+                participation_count: 5,
+                participation_duration_seconds: 300,
+                tool_invocations: std::collections::HashMap::new(),
+                governance_actions_by: vec![scp_protocol::trust::GovernanceActionSummary {
+                    timestamp: 100,
+                    actor_did: admin.clone(),
+                    target_did: None,
+                    event_sequence: 1,
+                }],
+                governance_actions_against: Vec::new(),
+                role_history: Vec::new(),
+                attestation_history: Vec::new(),
+                context_creation_count: 1,
+                computed_at: 100,
+                event_log_root: [0u8; 32],
+            },
+        );
     }
 
     // Execute a governance action — finalize_governance_action calls
