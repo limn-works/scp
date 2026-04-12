@@ -12,10 +12,12 @@ use std::time::Duration;
 
 use napi_derive::napi;
 
+#[cfg(feature = "allow_in_memory_custody")]
+use scp_core::identity::scpid_sign as core_sign;
 use scp_core::identity::{
-    ScpIdChallenge, ScpIdResponse, scpid_challenge as core_challenge, scpid_sign as core_sign,
-    scpid_verify as core_verify,
+    ScpIdChallenge, ScpIdResponse, scpid_challenge as core_challenge, scpid_verify as core_verify,
 };
+#[cfg(feature = "allow_in_memory_custody")]
 use scp_identity::SigningKeyId;
 
 use crate::error::ScpNapiError;
@@ -171,6 +173,7 @@ pub fn scpid_verify(response_json: String, challenge_json: String) -> napi::Resu
 
 /// Parses a signing key ID string (`"#active"` or `"#agent"`) into a
 /// [`SigningKeyId`] enum.
+#[cfg(feature = "allow_in_memory_custody")]
 fn parse_signing_key_id(s: &str) -> napi::Result<SigningKeyId> {
     match s {
         "#active" => Ok(SigningKeyId::Active),
@@ -241,6 +244,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "allow_in_memory_custody")]
     fn parse_signing_key_id_valid() {
         assert_eq!(
             parse_signing_key_id("#active").unwrap(),
@@ -250,6 +254,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "allow_in_memory_custody")]
     fn parse_signing_key_id_invalid() {
         assert!(parse_signing_key_id("active").is_err());
         assert!(parse_signing_key_id("#owner").is_err());
@@ -341,6 +346,7 @@ mod tests {
     /// type used by the bridge function). Proves that the resolver impl
     /// works end-to-end for SCPID verification.
     #[tokio::test]
+    #[cfg(feature = "allow_in_memory_custody")]
     async fn sign_verify_roundtrip_via_identity_backed_resolver() {
         use scp_identity::DidMethod;
 
