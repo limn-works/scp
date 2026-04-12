@@ -134,6 +134,9 @@ pub async fn dispatch_webhook(
     let mut delay = INITIAL_RETRY_DELAY_MS;
 
     for attempt in 1..=MAX_RETRIES {
+        // SAFETY: URL was validated as HTTPS-only at the top of this function.
+        // Assert here so CodeQL's data-flow analysis can verify.
+        debug_assert!(url.starts_with("https://"), "webhook URL must be HTTPS");
         match client
             .post(url)
             .header("Content-Type", "application/json")
