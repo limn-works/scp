@@ -64,7 +64,7 @@ const ADAPTER_SRC: &str = include_str!("../../../../crates/scp-transport/src/nat
 // RATCHET CONSTANTS — may only increase
 // Any decrease requires human approval
 // =========================================================================
-const MIN_ACTIVE_PIPELINE_ASSERTIONS: usize = 37;
+const MIN_ACTIVE_PIPELINE_ASSERTIONS: usize = 38;
 
 // ---------------------------------------------------------------------------
 // Function body extraction — brace-matching parser
@@ -960,15 +960,33 @@ fn b3_merkle_proof_verification_wired() {
 /// ApplicationNode must dispatch webhooks when context events occur for
 /// registered bridges with webhook_url.
 #[test]
-#[ignore = "#1539 — webhook dispatch not implemented"]
 fn b3_webhook_dispatch_wired() {
-    // webhook.rs doesn't exist yet. When implemented, this test will
-    // verify that dispatch_webhook is called from event handling.
-    // For now, just check that the module will be wired.
     let node_src = include_str!("../../../../crates/scp-node/src/lib.rs");
     assert!(
-        node_src.contains("dispatch_webhook") || node_src.contains("mod webhook"),
-        "ApplicationNode must have webhook dispatch wiring"
+        node_src.contains("mod webhook"),
+        "ApplicationNode must have webhook module registered"
+    );
+
+    let webhook_src = include_str!("../../../../crates/scp-node/src/webhook.rs");
+    assert!(
+        webhook_src.contains("dispatch_webhook"),
+        "webhook module must export dispatch_webhook function"
+    );
+    assert!(
+        webhook_src.contains("WebhookEvent"),
+        "webhook module must define WebhookEvent type"
+    );
+    assert!(
+        webhook_src.contains("X-SCP-Signature"),
+        "webhook dispatch must set X-SCP-Signature header"
+    );
+    assert!(
+        webhook_src.contains("X-SCP-Timestamp"),
+        "webhook dispatch must set X-SCP-Timestamp header"
+    );
+    assert!(
+        webhook_src.contains("validate_webhook_url"),
+        "webhook module must include SSRF validation"
     );
 }
 
@@ -1059,20 +1077,13 @@ fn no_stale_ignores() {
         stale.push("sender key rotation wired but #[ignore] for #1541 still present");
     }
 
-    // Catch-all: only batch-3 transport/infra ignores are permitted.
-    // Count must decrease as wiring PRs land. When batch 3 is complete,
-    // this reverts to rejecting all ignores.
-    // Uses line-based matching to avoid self-referential matches inside
-    // string literals in this very file.
-    let batch3_issues = ["#1539"];
-    let has_non_batch3_ignore = source.lines().any(|line| {
+    // Catch-all: no ignores should exist
+    let has_any_ignore = source.lines().any(|line| {
         let trimmed = line.trim();
-        trimmed.starts_with("#[ignore")
-            && trimmed.contains("= \"")
-            && !batch3_issues.iter().any(|issue| trimmed.contains(issue))
+        trimmed.starts_with("#[ignore") && trimmed.contains("= \"")
     });
-    if has_non_batch3_ignore {
-        stale.push("unexpected #[ignore] attributes found outside batch 3 issues");
+    if has_any_ignore {
+        stale.push("unexpected #[ignore] attributes found");
     }
 
     assert!(stale.is_empty(), "Stale ignores:\n  {}", stale.join("\n  "));

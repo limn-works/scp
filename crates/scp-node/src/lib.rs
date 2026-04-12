@@ -19,6 +19,7 @@ pub(crate) mod error;
 pub mod http;
 pub mod projection;
 pub mod tls;
+pub mod webhook;
 mod well_known;
 
 use std::collections::HashMap;
