@@ -107,7 +107,14 @@ async fn auto_wire_context_manager(did: &str, relay_url: &str, bridge_token: Zer
         url: relay_url.to_owned(),
         source: RelayUrlSource::Explicit,
     };
-    match NativeRelayAdapter::connect_sourced_with_bearer(&sourced, Some(bridge_token)).await {
+    let profile = scp_transport::profile::TransportProfile::platform_default();
+    match NativeRelayAdapter::connect_sourced_with_bearer(
+        &sourced,
+        Some(bridge_token),
+        Some(&profile),
+    )
+    .await
+    {
         Ok(adapter) => {
             crate::runtime::init_context_manager_with_relay_transport(did, adapter);
         }

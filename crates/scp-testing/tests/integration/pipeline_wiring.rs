@@ -64,7 +64,7 @@ const ADAPTER_SRC: &str = include_str!("../../../../crates/scp-transport/src/nat
 // RATCHET CONSTANTS — may only increase
 // Any decrease requires human approval
 // =========================================================================
-const MIN_ACTIVE_PIPELINE_ASSERTIONS: usize = 33;
+const MIN_ACTIVE_PIPELINE_ASSERTIONS: usize = 34;
 
 // ---------------------------------------------------------------------------
 // Function body extraction — brace-matching parser
@@ -892,7 +892,6 @@ fn c4_uniffi_tool_invoke_accepts_spending_ucan() {
 /// NativeRelayAdapter::connect_sourced (or a post-connect hook) must call
 /// start_cover_traffic based on the TransportProfile tier.
 #[test]
-#[ignore = "#1532 — cover traffic not auto-started on relay connection"]
 fn b3_cover_traffic_auto_start() {
     let body = extract_fn_body(ADAPTER_SRC, "connect_sourced")
         .or_else(|| extract_fn_body(ADAPTER_SRC, "connect_sourced_with_bearer"))
@@ -1061,7 +1060,7 @@ fn no_stale_ignores() {
     // this reverts to rejecting all ignores.
     // Uses line-based matching to avoid self-referential matches inside
     // string literals in this very file.
-    let batch3_issues = ["#1532", "#1533", "#1535", "#1539", "#1540"];
+    let batch3_issues = ["#1533", "#1535", "#1539", "#1540"];
     let has_non_batch3_ignore = source.lines().any(|line| {
         let trimmed = line.trim();
         trimmed.starts_with("#[ignore")

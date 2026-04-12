@@ -405,12 +405,16 @@ async fn alice_bob_encrypted_message_via_relay() {
     };
 
     // Bob subscribes first so the relay delivers the message when Alice sends.
-    let bob_adapter = NativeRelayAdapter::connect_sourced(&sourced).await.unwrap();
+    let bob_adapter = NativeRelayAdapter::connect_sourced(&sourced, None)
+        .await
+        .unwrap();
     let bob_routing = RoutingId::new(routing_arr);
     let mut stream = bob_adapter.subscribe(&bob_routing, None).await.unwrap();
 
     // Alice connects and sends.
-    let alice_adapter = NativeRelayAdapter::connect_sourced(&sourced).await.unwrap();
+    let alice_adapter = NativeRelayAdapter::connect_sourced(&sourced, None)
+        .await
+        .unwrap();
     let _blob_id = alice_adapter.send(&outer_env).await.unwrap();
 
     let received_outer = receive_envelope(&mut stream).await;
@@ -524,8 +528,12 @@ async fn native_relay_adapter_send_receive_roundtrip() {
         url: relay_url,
         source: RelayUrlSource::DhtResolved,
     };
-    let send_adapter = NativeRelayAdapter::connect_sourced(&sourced).await.unwrap();
-    let recv_adapter = NativeRelayAdapter::connect_sourced(&sourced).await.unwrap();
+    let send_adapter = NativeRelayAdapter::connect_sourced(&sourced, None)
+        .await
+        .unwrap();
+    let recv_adapter = NativeRelayAdapter::connect_sourced(&sourced, None)
+        .await
+        .unwrap();
 
     // Subscribe first, then send.
     let routing = RoutingId::new(routing_id);
@@ -563,10 +571,10 @@ async fn ws_relay_connect_sourced_validation_scp234() {
         source: RelayUrlSource::DhtResolved,
     };
 
-    let send_adapter = NativeRelayAdapter::connect_sourced(&dht_sourced)
+    let send_adapter = NativeRelayAdapter::connect_sourced(&dht_sourced, None)
         .await
         .expect("ws:// from DhtResolved should be permitted");
-    let recv_adapter = NativeRelayAdapter::connect_sourced(&dht_sourced)
+    let recv_adapter = NativeRelayAdapter::connect_sourced(&dht_sourced, None)
         .await
         .expect("ws:// from DhtResolved should be permitted");
 
@@ -603,7 +611,7 @@ async fn ws_relay_connect_sourced_validation_scp234() {
             url: relay_url.clone(),
             source,
         };
-        NativeRelayAdapter::connect_sourced(&sourced)
+        NativeRelayAdapter::connect_sourced(&sourced, None)
             .await
             .unwrap_or_else(|e| {
                 panic!("ws:// to loopback from {label} should be permitted (loopback exemption), got: {e}")

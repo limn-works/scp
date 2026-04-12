@@ -80,7 +80,8 @@ async fn main() {
         url: url.to_owned(),
         source: RelayUrlSource::DhtResolved,
     };
-    let adapter = NativeRelayAdapter::connect_sourced(&sourced)
+    let profile = scp_transport::profile::TransportProfile::platform_default();
+    let adapter = NativeRelayAdapter::connect_sourced(&sourced, Some(&profile))
         .await
         .unwrap_or_else(|e| {
             eprintln!("connection failed: {e}");

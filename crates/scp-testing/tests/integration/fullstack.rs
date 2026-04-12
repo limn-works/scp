@@ -579,11 +579,15 @@ async fn full_stack_relay_encrypted_roundtrip() {
         url: relay_url,
         source: RelayUrlSource::DhtResolved,
     };
-    let bob_adapter = NativeRelayAdapter::connect_sourced(&sourced).await.unwrap();
+    let bob_adapter = NativeRelayAdapter::connect_sourced(&sourced, None)
+        .await
+        .unwrap();
     let bob_routing = RoutingId::new(routing_id);
     let mut stream = bob_adapter.subscribe(&bob_routing, None).await.unwrap();
 
-    let alice_adapter = NativeRelayAdapter::connect_sourced(&sourced).await.unwrap();
+    let alice_adapter = NativeRelayAdapter::connect_sourced(&sourced, None)
+        .await
+        .unwrap();
     let blob_id = alice_adapter.send(&outer_envelope).await.unwrap();
     assert_eq!(blob_id.as_bytes().len(), 32, "blob_id must be 32 bytes");
     println!(
@@ -680,8 +684,12 @@ async fn full_stack_relay_multiple_messages() {
         url: relay_url,
         source: RelayUrlSource::DhtResolved,
     };
-    let bob_adapter = NativeRelayAdapter::connect_sourced(&sourced).await.unwrap();
-    let alice_adapter = NativeRelayAdapter::connect_sourced(&sourced).await.unwrap();
+    let bob_adapter = NativeRelayAdapter::connect_sourced(&sourced, None)
+        .await
+        .unwrap();
+    let alice_adapter = NativeRelayAdapter::connect_sourced(&sourced, None)
+        .await
+        .unwrap();
 
     let routing_id = context_routing_id(ctx_id);
     let bob_routing = RoutingId::new(routing_id);
@@ -796,14 +804,20 @@ async fn full_stack_relay_three_party() {
     };
 
     // Both Bob and Carol subscribe to the same routing ID.
-    let bob_adapter = NativeRelayAdapter::connect_sourced(&sourced).await.unwrap();
-    let carol_adapter = NativeRelayAdapter::connect_sourced(&sourced).await.unwrap();
+    let bob_adapter = NativeRelayAdapter::connect_sourced(&sourced, None)
+        .await
+        .unwrap();
+    let carol_adapter = NativeRelayAdapter::connect_sourced(&sourced, None)
+        .await
+        .unwrap();
     let routing = RoutingId::new(routing_id);
     let mut bob_stream = bob_adapter.subscribe(&routing, None).await.unwrap();
     let mut carol_stream = carol_adapter.subscribe(&routing, None).await.unwrap();
 
     // Alice publishes to the relay.
-    let alice_adapter = NativeRelayAdapter::connect_sourced(&sourced).await.unwrap();
+    let alice_adapter = NativeRelayAdapter::connect_sourced(&sourced, None)
+        .await
+        .unwrap();
     alice_adapter.send(&outer).await.unwrap();
     println!("  [2] Published to relay");
 

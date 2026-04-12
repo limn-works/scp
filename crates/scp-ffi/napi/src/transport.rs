@@ -221,7 +221,9 @@ pub async fn transport_connect(relay_url: String) -> napi::Result<NapiTransportM
     };
 
     let start = std::time::Instant::now();
-    let adapter_result = scp_transport::native::NativeRelayAdapter::connect_sourced(&sourced).await;
+    let profile = scp_transport::profile::TransportProfile::platform_default();
+    let adapter_result =
+        scp_transport::native::NativeRelayAdapter::connect_sourced(&sourced, Some(&profile)).await;
 
     match adapter_result {
         Ok(adapter) => {
@@ -385,12 +387,14 @@ pub async fn configure_relay_transport(relay_url: String, local_did: String) -> 
         source: scp_transport::relay::connection::RelayUrlSource::Explicit,
     };
 
-    let adapter = scp_transport::native::NativeRelayAdapter::connect_sourced(&sourced)
-        .await
-        .map_err(|e| ScpNapiError::Transport {
-            message: format!("failed to connect to relay '{relay_url}': {e}"),
-            code: "SCP-TRANS-5001".to_owned(),
-        })?;
+    let profile = scp_transport::profile::TransportProfile::platform_default();
+    let adapter =
+        scp_transport::native::NativeRelayAdapter::connect_sourced(&sourced, Some(&profile))
+            .await
+            .map_err(|e| ScpNapiError::Transport {
+                message: format!("failed to connect to relay '{relay_url}': {e}"),
+                code: "SCP-TRANS-5001".to_owned(),
+            })?;
 
     crate::runtime::init_context_manager_with_relay_transport(&local_did, adapter);
     Ok(())

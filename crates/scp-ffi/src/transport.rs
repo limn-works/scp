@@ -142,7 +142,9 @@ pub fn py_transport_connect(relay_url: &str, source: &str) -> PyResult<()> {
         url: url.clone(),
         source: relay_source,
     };
-    let adapter = rt.block_on(async { NativeRelayAdapter::connect_sourced(&sourced).await });
+    let profile = scp_transport::profile::TransportProfile::platform_default();
+    let adapter =
+        rt.block_on(async { NativeRelayAdapter::connect_sourced(&sourced, Some(&profile)).await });
 
     match adapter {
         Ok(adapter) => {
@@ -249,8 +251,9 @@ pub fn py_configure_relay_transport(relay_url: &str, local_did: &str) -> PyResul
         url: relay_url.to_owned(),
         source: RelayUrlSource::Explicit,
     };
+    let profile = scp_transport::profile::TransportProfile::platform_default();
     let adapter = rt
-        .block_on(async { NativeRelayAdapter::connect_sourced(&sourced).await })
+        .block_on(async { NativeRelayAdapter::connect_sourced(&sourced, Some(&profile)).await })
         .map_err(|e| {
             ScpPyError::transport(format!("failed to connect to relay '{relay_url}': {e}"))
         })?;

@@ -323,7 +323,7 @@ async fn native_relay_adapter_roundtrip_through_relay() {
         url: format!("ws://{relay_addr}/scp/v1"),
         source: RelayUrlSource::DhtResolved,
     };
-    let adapter = NativeRelayAdapter::connect_sourced(&sourced)
+    let adapter = NativeRelayAdapter::connect_sourced(&sourced, None)
         .await
         .expect("NativeRelayAdapter should connect");
     println!("  Adapter connected");
@@ -390,7 +390,7 @@ async fn sender_key_encrypt_relay_decrypt_roundtrip() {
         url: format!("ws://{relay_addr}/scp/v1"),
         source: RelayUrlSource::DhtResolved,
     };
-    let adapter = NativeRelayAdapter::connect_sourced(&sourced)
+    let adapter = NativeRelayAdapter::connect_sourced(&sourced, None)
         .await
         .expect("connect");
 

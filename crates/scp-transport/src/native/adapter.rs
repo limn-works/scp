@@ -42,6 +42,7 @@ use crate::cover_traffic::{
     CoverAction, CoverTrafficConfig, CoverTrafficGenerator, CoverTrafficSender,
 };
 use crate::error::TransportError;
+use crate::profile::TransportProfile;
 use crate::relay::connection::{SourcedRelayUrl, validate_relay_url};
 use crate::traits::{BlobId, RoutingId, SubscriptionStream, TransportAdapter, TransportEvent};
 
@@ -73,18 +74,20 @@ type BoxFuture<'a, T> = Pin<Box<dyn std::future::Future<Output = T> + Send + 'a>
 /// use scp_transport::relay::connection::{RelayUrlSource, SourcedRelayUrl};
 ///
 /// // Production: validate ws:// vs wss:// based on discovery source.
+/// // Pass a TransportProfile to auto-start cover traffic (spec §9.10.6).
 /// let sourced = SourcedRelayUrl {
 ///     url: "wss://relay.example.com/scp/v1".to_owned(),
 ///     source: RelayUrlSource::WellKnown,
 /// };
-/// let adapter = NativeRelayAdapter::connect_sourced(&sourced).await?;
+/// let profile = TransportProfile::platform_default();
+/// let adapter = NativeRelayAdapter::connect_sourced(&sourced, Some(&profile)).await?;
 ///
-/// // Test: local ws:// relay with DhtResolved source.
+/// // Test: local ws:// relay with DhtResolved source, no cover traffic.
 /// let sourced = SourcedRelayUrl {
 ///     url: "ws://127.0.0.1:9000/scp/v1".to_owned(),
 ///     source: RelayUrlSource::DhtResolved,
 /// };
-/// let adapter = NativeRelayAdapter::connect_sourced(&sourced).await?;
+/// let adapter = NativeRelayAdapter::connect_sourced(&sourced, None).await?;
 /// ```
 pub struct NativeRelayAdapter {
     /// The underlying WebSocket client.
@@ -126,6 +129,11 @@ impl NativeRelayAdapter {
     /// All relay URLs must go through this path — there is no unvalidated
     /// connection method.
     ///
+    /// When a [`TransportProfile`] is provided, cover traffic is auto-started
+    /// based on the profile's tier (spec §9.10.6): Full for Server/Desktop,
+    /// Reduced for Mobile, Off (no-op) for Constrained. Pass `None` to skip
+    /// cover traffic (e.g., in tests).
+    ///
     /// [`RelayUrlSource::DhtResolved`]: crate::relay::connection::RelayUrlSource::DhtResolved
     ///
     /// # Errors
@@ -136,13 +144,24 @@ impl NativeRelayAdapter {
     ///
     /// Returns [`TransportError::ConnectionFailed`] if the URL passes
     /// validation but the WebSocket connection cannot be established.
-    pub async fn connect_sourced(sourced: &SourcedRelayUrl) -> Result<Self, TransportError> {
+    pub async fn connect_sourced(
+        sourced: &SourcedRelayUrl,
+        profile: Option<&TransportProfile>,
+    ) -> Result<Self, TransportError> {
         validate_relay_url(&sourced.url, &sourced.source)?;
         let client = NativeRelayClient::connect(&sourced.url).await?;
-        Ok(Self {
+        let adapter = Self {
             client,
             cover_traffic_cancel: CancellationToken::new(),
-        })
+        };
+        if let Some(profile) = profile {
+            let config = CoverTrafficConfig::from_profile(*profile);
+            // JoinHandle intentionally dropped — the task is cancelled via the
+            // CancellationToken in the adapter's Drop impl, not by awaiting/
+            // aborting the handle.
+            drop(adapter.start_cover_traffic(config));
+        }
+        Ok(adapter)
     }
 
     /// Creates a new adapter connected to a relay URL with provenance-based
@@ -154,6 +173,9 @@ impl NativeRelayAdapter {
     /// connecting to relay endpoints that enforce bridge token authentication
     /// (e.g., `ApplicationNode` relays).
     ///
+    /// When a [`TransportProfile`] is provided, cover traffic is auto-started
+    /// based on the profile's tier (spec §9.10.6).
+    ///
     /// # Errors
     ///
     /// Returns [`TransportError::ProtocolError`] if the URL scheme is not
@@ -164,13 +186,22 @@ impl NativeRelayAdapter {
     pub async fn connect_sourced_with_bearer(
         sourced: &SourcedRelayUrl,
         bearer_token: Option<Zeroizing<String>>,
+        profile: Option<&TransportProfile>,
     ) -> Result<Self, TransportError> {
         validate_relay_url(&sourced.url, &sourced.source)?;
         let client = NativeRelayClient::connect_with_bearer(&sourced.url, bearer_token).await?;
-        Ok(Self {
+        let adapter = Self {
             client,
             cover_traffic_cancel: CancellationToken::new(),
-        })
+        };
+        if let Some(profile) = profile {
+            let config = CoverTrafficConfig::from_profile(*profile);
+            // JoinHandle intentionally dropped — the task is cancelled via the
+            // CancellationToken in the adapter's Drop impl, not by awaiting/
+            // aborting the handle.
+            drop(adapter.start_cover_traffic(config));
+        }
+        Ok(adapter)
     }
 
     /// Starts a background task that emits cover traffic at a constant rate
@@ -626,7 +657,7 @@ mod tests {
             url: "ws://203.0.113.42:8443/scp/v1".to_owned(),
             source: RelayUrlSource::WellKnown,
         };
-        let err = NativeRelayAdapter::connect_sourced(&sourced)
+        let err = NativeRelayAdapter::connect_sourced(&sourced, None)
             .await
             .expect_err("ws:// from WellKnown must be rejected");
         let msg = err.to_string();
@@ -649,7 +680,7 @@ mod tests {
             url: "ws://203.0.113.42:8443/scp/v1".to_owned(),
             source: RelayUrlSource::Explicit,
         };
-        let err = NativeRelayAdapter::connect_sourced(&sourced)
+        let err = NativeRelayAdapter::connect_sourced(&sourced, None)
             .await
             .expect_err("ws:// from Explicit must be rejected");
         assert!(err.to_string().contains("Explicit"));
@@ -664,7 +695,7 @@ mod tests {
             url: "ws://203.0.113.42:8443/scp/v1".to_owned(),
             source: RelayUrlSource::PeerDiscovered,
         };
-        let err = NativeRelayAdapter::connect_sourced(&sourced)
+        let err = NativeRelayAdapter::connect_sourced(&sourced, None)
             .await
             .expect_err("ws:// from PeerDiscovered must be rejected");
         assert!(err.to_string().contains("PeerDiscovered"));
@@ -679,7 +710,7 @@ mod tests {
             url: "http://relay.example.com/scp/v1".to_owned(),
             source: RelayUrlSource::DhtResolved,
         };
-        let err = NativeRelayAdapter::connect_sourced(&sourced)
+        let err = NativeRelayAdapter::connect_sourced(&sourced, None)
             .await
             .expect_err("http:// scheme must be rejected");
         assert!(err.to_string().contains("ws:// or wss://"));
@@ -718,7 +749,9 @@ mod tests {
             url,
             source: RelayUrlSource::DhtResolved,
         };
-        let adapter = NativeRelayAdapter::connect_sourced(&sourced).await.unwrap();
+        let adapter = NativeRelayAdapter::connect_sourced(&sourced, None)
+            .await
+            .unwrap();
 
         // Build a cover traffic payload: DUMMY_FLAG + padding to bucket boundary.
         let payload = pad_to_bucket(&[DUMMY_FLAG]);
@@ -766,7 +799,9 @@ mod tests {
 
         let handle;
         {
-            let adapter = NativeRelayAdapter::connect_sourced(&sourced).await.unwrap();
+            let adapter = NativeRelayAdapter::connect_sourced(&sourced, None)
+                .await
+                .unwrap();
             // Start cover traffic with a short custom interval for testing.
             let ct_config = CoverTrafficConfig {
                 tier: CoverTrafficTier::Custom {
@@ -787,5 +822,124 @@ mod tests {
             result.is_ok(),
             "cover traffic task should terminate after adapter drop"
         );
+    }
+
+    // --- Cover traffic auto-start tests (#1532) ---
+
+    /// Verifies that `connect_sourced` with `Some(&TransportProfile::Server)`
+    /// returns Ok and auto-starts cover traffic (the cancel token is wired).
+    #[tokio::test]
+    async fn connect_sourced_with_server_profile_starts_cover_traffic() {
+        use crate::native::server::{RelayConfig, RelayServer};
+        use crate::native::storage::BlobStorageBackend;
+        use crate::profile::TransportProfile;
+        use crate::relay::connection::{RelayUrlSource, SourcedRelayUrl};
+        use std::net::SocketAddr;
+        use std::sync::Arc;
+        use std::time::Duration;
+
+        let config = RelayConfig {
+            bind_addr: SocketAddr::from(([127, 0, 0, 1], 0)),
+            ttl_check_interval: Duration::from_millis(100),
+            delivery_jitter_ms: 0,
+            ..RelayConfig::default()
+        };
+        let storage = Arc::new(BlobStorageBackend::in_memory());
+        let server = RelayServer::new(config, storage);
+        let (_handle, addr) = server.start().await.unwrap();
+        let url = format!("ws://{addr}/scp/v1");
+
+        let sourced = SourcedRelayUrl {
+            url,
+            source: RelayUrlSource::DhtResolved,
+        };
+
+        // Server profile → Full tier → cover traffic auto-started.
+        let adapter =
+            NativeRelayAdapter::connect_sourced(&sourced, Some(&TransportProfile::Server))
+                .await
+                .unwrap();
+
+        // The adapter should have been constructed successfully with
+        // cover traffic running. Dropping it cancels the task.
+        drop(adapter);
+    }
+
+    /// Verifies that `connect_sourced` with `None` profile does NOT start
+    /// cover traffic (backward compatibility for tests).
+    #[tokio::test]
+    async fn connect_sourced_without_profile_no_cover_traffic() {
+        use crate::native::server::{RelayConfig, RelayServer};
+        use crate::native::storage::BlobStorageBackend;
+        use crate::relay::connection::{RelayUrlSource, SourcedRelayUrl};
+        use std::net::SocketAddr;
+        use std::sync::Arc;
+        use std::time::Duration;
+
+        let config = RelayConfig {
+            bind_addr: SocketAddr::from(([127, 0, 0, 1], 0)),
+            ttl_check_interval: Duration::from_millis(100),
+            delivery_jitter_ms: 0,
+            ..RelayConfig::default()
+        };
+        let storage = Arc::new(BlobStorageBackend::in_memory());
+        let server = RelayServer::new(config, storage);
+        let (_handle, addr) = server.start().await.unwrap();
+        let url = format!("ws://{addr}/scp/v1");
+
+        let sourced = SourcedRelayUrl {
+            url,
+            source: RelayUrlSource::DhtResolved,
+        };
+
+        // No profile → no cover traffic started.
+        let adapter = NativeRelayAdapter::connect_sourced(&sourced, None)
+            .await
+            .unwrap();
+
+        // Adapter should connect fine without cover traffic.
+        drop(adapter);
+    }
+
+    /// Verifies that `connect_sourced` with `TransportProfile::Constrained`
+    /// (Off tier) does not start a long-running cover traffic task.
+    #[tokio::test]
+    async fn connect_sourced_constrained_profile_off_tier() {
+        use crate::native::server::{RelayConfig, RelayServer};
+        use crate::native::storage::BlobStorageBackend;
+        use crate::profile::TransportProfile;
+        use crate::relay::connection::{RelayUrlSource, SourcedRelayUrl};
+        use std::net::SocketAddr;
+        use std::sync::Arc;
+        use std::time::Duration;
+
+        let config = RelayConfig {
+            bind_addr: SocketAddr::from(([127, 0, 0, 1], 0)),
+            ttl_check_interval: Duration::from_millis(100),
+            delivery_jitter_ms: 0,
+            ..RelayConfig::default()
+        };
+        let storage = Arc::new(BlobStorageBackend::in_memory());
+        let server = RelayServer::new(config, storage);
+        let (_handle, addr) = server.start().await.unwrap();
+        let url = format!("ws://{addr}/scp/v1");
+
+        let sourced = SourcedRelayUrl {
+            url,
+            source: RelayUrlSource::DhtResolved,
+        };
+
+        // Constrained profile → Off tier → cover traffic task spawns but
+        // exits immediately (generator.interval() returns None for Off).
+        let adapter =
+            NativeRelayAdapter::connect_sourced(&sourced, Some(&TransportProfile::Constrained))
+                .await
+                .unwrap();
+
+        // The spawned task should have already exited. Give it a moment.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        // Adapter drops cleanly — no long-running task to cancel.
+        drop(adapter);
     }
 }

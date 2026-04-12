@@ -59,9 +59,11 @@ async fn auto_wire_context_manager(did: &str, relay_url: &str, bridge_token: Zer
         source: scp_transport::relay::connection::RelayUrlSource::Explicit,
     };
     let token2 = bridge_token.clone();
+    let profile = scp_transport::profile::TransportProfile::platform_default();
     match scp_transport::native::NativeRelayAdapter::connect_sourced_with_bearer(
         &sourced,
         Some(bridge_token),
+        Some(&profile),
     )
     .await
     {
@@ -76,6 +78,7 @@ async fn auto_wire_context_manager(did: &str, relay_url: &str, bridge_token: Zer
             match scp_transport::native::NativeRelayAdapter::connect_sourced_with_bearer(
                 &sourced,
                 Some(token2),
+                Some(&profile),
             )
             .await
             {
