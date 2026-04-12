@@ -57,6 +57,9 @@ const PYO3_TOOLS_SRC: &str = include_str!("../../../../crates/scp-ffi/src/tools.
 const NAPI_TOOLS_SRC: &str = include_str!("../../../../crates/scp-ffi/napi/src/tools.rs");
 const UNIFFI_BRIDGE_SRC: &str = include_str!("../../../../crates/scp-ffi/uniffi/src/bridge.rs");
 
+// Transport layer sources for Batch 3 assertions
+const ADAPTER_SRC: &str = include_str!("../../../../crates/scp-transport/src/native/adapter.rs");
+
 // =========================================================================
 // RATCHET CONSTANTS — may only increase
 // Any decrease requires human approval
@@ -882,6 +885,91 @@ fn c4_uniffi_tool_invoke_accepts_spending_ucan() {
 }
 
 // ===========================================================================
+// Batch 3 — Transport/infra wiring (all #[ignore] until implemented)
+// ===========================================================================
+
+/// Cover traffic must auto-start when a relay connection is established.
+/// NativeRelayAdapter::connect_sourced (or a post-connect hook) must call
+/// start_cover_traffic based on the TransportProfile tier.
+#[test]
+#[ignore = "#1532 — cover traffic not auto-started on relay connection"]
+fn b3_cover_traffic_auto_start() {
+    let body = extract_fn_body(ADAPTER_SRC, "connect_sourced")
+        .or_else(|| extract_fn_body(ADAPTER_SRC, "connect_sourced_with_bearer"))
+        .expect("connect_sourced or connect_sourced_with_bearer must exist in adapter.rs");
+    assert!(
+        body.contains("start_cover_traffic"),
+        "NativeRelayAdapter connection must auto-start cover traffic"
+    );
+}
+
+/// HeartbeatMonitor must be created when a relay connection is established.
+/// The adapter (or client) must instantiate HeartbeatMonitor and start
+/// a background heartbeat send/check loop.
+#[test]
+#[ignore = "#1533 — heartbeat monitor not instantiated on relay connection"]
+fn b3_heartbeat_monitor_instantiated() {
+    let body = extract_fn_body(ADAPTER_SRC, "connect_sourced")
+        .or_else(|| extract_fn_body(ADAPTER_SRC, "connect_sourced_with_bearer"))
+        .expect("connect_sourced or connect_sourced_with_bearer must exist in adapter.rs");
+    assert!(
+        body.contains("HeartbeatMonitor") || body.contains("heartbeat"),
+        "NativeRelayAdapter connection must create a HeartbeatMonitor"
+    );
+}
+
+/// Checkpoint generation must be wired into the context lifecycle.
+/// close_context must call force_create_checkpoint for archival.
+/// send_message/deliver_incoming should call maybe_create_checkpoint periodically.
+#[test]
+#[ignore = "#1540 — checkpoint generation not wired into context lifecycle"]
+fn b3_checkpoint_generation_wired() {
+    let body = extract_fn_body(MANAGER_SRC, "close_context")
+        .expect("close_context must exist in manager source");
+    assert!(
+        body.contains("force_create_checkpoint") || body.contains("create_checkpoint"),
+        "close_context must generate a final checkpoint"
+    );
+}
+
+/// Merkle proof verification must be wired into the sync/reconnection path.
+/// When reconnecting, compare_checkpoints must be called to detect equivocation.
+#[test]
+#[ignore = "#1535 — merkle proof verification not wired into sync path"]
+fn b3_merkle_proof_verification_wired() {
+    // Check that reconnection or sync path calls compare_checkpoints
+    let body = extract_fn_body(MANAGER_SRC, "execute_reconnection")
+        .or_else(|| extract_fn_body(MANAGER_SRC, "handle_reconnection"))
+        .or_else(|| extract_fn_body(MANAGER_SRC, "prepare_reconnection"));
+    // Function may not exist yet — that's OK for an ignored test.
+    // When wired, it must call compare_checkpoints or verify_consistency.
+    if let Some(body) = body {
+        assert!(
+            body.contains("compare_checkpoint") || body.contains("verify_consistency"),
+            "Reconnection path must verify Merkle consistency"
+        );
+    } else {
+        panic!("No reconnection function found — implement execute_reconnection in lifecycle.rs");
+    }
+}
+
+/// Webhook dispatch must exist and be wired into bridge event handling.
+/// ApplicationNode must dispatch webhooks when context events occur for
+/// registered bridges with webhook_url.
+#[test]
+#[ignore = "#1539 — webhook dispatch not implemented"]
+fn b3_webhook_dispatch_wired() {
+    // webhook.rs doesn't exist yet. When implemented, this test will
+    // verify that dispatch_webhook is called from event handling.
+    // For now, just check that the module will be wired.
+    let node_src = include_str!("../../../../crates/scp-node/src/lib.rs");
+    assert!(
+        node_src.contains("dispatch_webhook") || node_src.contains("mod webhook"),
+        "ApplicationNode must have webhook dispatch wiring"
+    );
+}
+
+// ===========================================================================
 // Meta-tests — ratchet and tamper detection
 // ===========================================================================
 
@@ -919,21 +1007,25 @@ fn no_stale_ignores() {
     let mut stale: Vec<&str> = vec![];
     let source = include_str!("pipeline_wiring.rs");
 
+    // Helper: returns true if source has an #[ignore = "..."] line mentioning `issue`.
+    let has_ignore_for = |issue: &str| {
+        source
+            .lines()
+            .any(|l| l.contains("#[ignore = \"") && l.contains(issue))
+    };
+
     // #1531 — consequence evaluation wired in dispatch_consequences
     if fn_body_contains(
         MANAGER_SRC,
         "dispatch_consequences",
         "evaluate_consequence_rules",
-    ) && source.contains("#[ignore = \"")
-        && source.contains("1531")
+    ) && has_ignore_for("#1531")
     {
         stale.push("consequence evaluation wired but #[ignore] for #1531 still present");
     }
 
     // #1537 — economy enforcement wired in enforce_economy
-    if fn_body_contains(MANAGER_SRC, "enforce_economy", "evaluate_cost")
-        && source.contains("#[ignore = \"")
-        && source.contains("1537")
+    if fn_body_contains(MANAGER_SRC, "enforce_economy", "evaluate_cost") && has_ignore_for("#1537")
     {
         stale.push("economy enforcement wired but #[ignore] for #1537 still present");
     }
@@ -943,8 +1035,7 @@ fn no_stale_ignores() {
         MANAGER_SRC,
         "propose_governance_action_inner",
         "check_proposer_eligibility",
-    ) && source.contains("#[ignore = \"")
-        && source.contains("1530")
+    ) && has_ignore_for("#1530")
     {
         stale.push("proposer eligibility check wired but #[ignore] for #1530 still present");
     }
@@ -952,8 +1043,7 @@ fn no_stale_ignores() {
     // #1548 — content key rotation wired in execute_rotate_content_keys
     if (fn_body_contains(MANAGER_SRC, "execute_rotate_content_keys", "advance_epoch")
         || fn_body_contains(MANAGER_SRC, "execute_rotate_content_keys", "propose_update"))
-        && source.contains("#[ignore = \"")
-        && source.contains("1548")
+        && has_ignore_for("#1548")
     {
         stale.push("content key rotation wired but #[ignore] for #1548 still present");
     }
@@ -961,15 +1051,25 @@ fn no_stale_ignores() {
     // #1541 — sender key rotation wired in execute_remove_member and leave_context
     if fn_body_contains(MANAGER_SRC, "execute_remove_member", "rotate_sender_key")
         && fn_body_contains(MANAGER_SRC, "leave_context", "rotate_sender_key")
-        && source.contains("#[ignore = \"")
-        && source.contains("1541")
+        && has_ignore_for("#1541")
     {
         stale.push("sender key rotation wired but #[ignore] for #1541 still present");
     }
 
-    // Catch-all: no ignores should exist at all
-    if source.matches("#[ignore = \"").count() > 0 {
-        stale.push("unexpected #[ignore] attributes found");
+    // Catch-all: only batch-3 transport/infra ignores are permitted.
+    // Count must decrease as wiring PRs land. When batch 3 is complete,
+    // this reverts to rejecting all ignores.
+    // Uses line-based matching to avoid self-referential matches inside
+    // string literals in this very file.
+    let batch3_issues = ["#1532", "#1533", "#1535", "#1539", "#1540"];
+    let has_non_batch3_ignore = source.lines().any(|line| {
+        let trimmed = line.trim();
+        trimmed.starts_with("#[ignore")
+            && trimmed.contains("= \"")
+            && !batch3_issues.iter().any(|issue| trimmed.contains(issue))
+    });
+    if has_non_batch3_ignore {
+        stale.push("unexpected #[ignore] attributes found outside batch 3 issues");
     }
 
     assert!(stale.is_empty(), "Stale ignores:\n  {}", stale.join("\n  "));
