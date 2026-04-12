@@ -6,6 +6,10 @@ use super::{
     instrument,
 };
 
+/// Maximum number of checkpoints retained per context. Older checkpoints
+/// are drained when this limit is exceeded to prevent unbounded growth.
+const MAX_RETAINED_CHECKPOINTS: usize = 100;
+
 #[allow(clippy::significant_drop_tightening)]
 impl ContextManager {
     /// Registers a DID as controlled by the local node/SDK.
@@ -628,7 +632,11 @@ impl ContextManager {
     ) -> Option<scp_event_log::checkpoint::ConsistencyCheckpoint> {
         let now = self.clock.now_secs();
         let events_due = ctx.checkpoint_events_since >= 50;
-        let time_due = now.saturating_sub(ctx.checkpoint_last_time_secs) >= 600;
+        // Time-based checkpoints require at least one event — creating a
+        // checkpoint for zero events is wasteful and indistinguishable from
+        // the previous checkpoint.
+        let time_due = ctx.checkpoint_events_since > 0
+            && now.saturating_sub(ctx.checkpoint_last_time_secs) >= 600;
 
         if !events_due && !time_due {
             return None;
@@ -646,6 +654,11 @@ impl ContextManager {
         ctx.checkpoint_events_since = 0;
         ctx.checkpoint_last_time_secs = now;
         ctx.checkpoints.push(cp.clone());
+
+        if ctx.checkpoints.len() > MAX_RETAINED_CHECKPOINTS {
+            ctx.checkpoints
+                .drain(..ctx.checkpoints.len() - MAX_RETAINED_CHECKPOINTS);
+        }
 
         tracing::debug!(
             context_id,
@@ -681,6 +694,11 @@ impl ContextManager {
         ctx.checkpoint_events_since = 0;
         ctx.checkpoint_last_time_secs = now;
         ctx.checkpoints.push(cp.clone());
+
+        if ctx.checkpoints.len() > MAX_RETAINED_CHECKPOINTS {
+            ctx.checkpoints
+                .drain(..ctx.checkpoints.len() - MAX_RETAINED_CHECKPOINTS);
+        }
 
         tracing::info!(
             context_id,
@@ -743,6 +761,10 @@ impl ContextManager {
     /// Compares a remote checkpoint against local event log state for
     /// equivocation detection (§9.9.3, ADR-011 AC-8).
     ///
+    /// Before comparing Merkle roots, verifies:
+    /// 1. The checkpoint sender is a member of this context.
+    /// 2. The checkpoint's Ed25519 signature is valid (via key resolver).
+    ///
     /// When the comparison returns `Divergent`, emits an
     /// [`ContextEvent::EquivocationDetected`] event on the receive buffer
     /// and appends a durable event log entry.
@@ -751,12 +773,45 @@ impl ContextManager {
     ///
     /// Returns [`ContextError::ContextNotRegistered`] if the context is
     /// not registered.
+    /// Returns [`ContextError::MemberNotFound`] if the checkpoint sender
+    /// is not a member of the context.
+    /// Returns [`ContextError::CryptoFailed`] if the public key cannot be
+    /// resolved or the Ed25519 signature verification fails.
     #[instrument(skip_all, fields(context_id))]
     pub async fn compare_remote_checkpoint(
         &self,
         context_id: &str,
         remote: &scp_event_log::checkpoint::ConsistencyCheckpoint,
     ) -> Result<scp_event_log::checkpoint::CheckpointComparison, ContextError> {
+        // Verify the sender is a member of this context.
+        {
+            let contexts = self.contexts.lock().await;
+            let ctx = contexts
+                .get(context_id)
+                .ok_or_else(|| ContextError::ContextNotRegistered(context_id.to_owned()))?;
+            if !ctx.membership.contains(remote.sender_did.as_ref()) {
+                return Err(ContextError::MemberNotFound(format!(
+                    "checkpoint sender {} is not a member of context {context_id}",
+                    remote.sender_did
+                )));
+            }
+        }
+
+        // Verify checkpoint Ed25519 signature.
+        let sender_pk = (self.key_resolver)(&remote.sender_did).ok_or_else(|| {
+            ContextError::CryptoFailed(format!(
+                "cannot resolve public key for checkpoint sender {}",
+                remote.sender_did
+            ))
+        })?;
+        scp_event_log::checkpoint::verify_checkpoint_signature(remote, &sender_pk).map_err(
+            |reason| {
+                ContextError::CryptoFailed(format!(
+                    "checkpoint signature verification failed: {reason}"
+                ))
+            },
+        )?;
+
         let context_id_bytes = super::context_id_to_bytes(context_id);
         let local_root = self
             .event_log

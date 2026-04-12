@@ -890,29 +890,53 @@ fn c4_uniffi_tool_invoke_accepts_spending_ucan() {
 
 /// Cover traffic must auto-start when a relay connection is established.
 /// NativeRelayAdapter::connect_sourced (or a post-connect hook) must call
-/// start_cover_traffic based on the TransportProfile tier.
+/// start_cover_traffic based on the TransportProfile tier. After the
+/// finalize_connection refactor, the logic may live in `finalize_connection`.
 #[test]
 fn b3_cover_traffic_auto_start() {
-    let body = extract_fn_body(ADAPTER_SRC, "connect_sourced")
-        .or_else(|| extract_fn_body(ADAPTER_SRC, "connect_sourced_with_bearer"))
-        .expect("connect_sourced or connect_sourced_with_bearer must exist in adapter.rs");
+    // Check connect_sourced, connect_sourced_with_bearer, AND finalize_connection —
+    // the logic may be in any of them (including after refactor to a shared helper).
+    let bodies: String = [
+        extract_fn_body(ADAPTER_SRC, "connect_sourced"),
+        extract_fn_body(ADAPTER_SRC, "connect_sourced_with_bearer"),
+        extract_fn_body(ADAPTER_SRC, "finalize_connection"),
+    ]
+    .into_iter()
+    .flatten()
+    .collect::<Vec<_>>()
+    .join("\n");
     assert!(
-        body.contains("start_cover_traffic"),
-        "NativeRelayAdapter connection must auto-start cover traffic"
+        !bodies.is_empty(),
+        "connect_sourced, connect_sourced_with_bearer, or finalize_connection must exist in adapter.rs"
+    );
+    assert!(
+        bodies.contains("start_cover_traffic"),
+        "NativeRelayAdapter connection path must auto-start cover traffic"
     );
 }
 
 /// HeartbeatMonitor must be created when a relay connection is established.
 /// The adapter (or client) must instantiate HeartbeatMonitor and start
-/// a background heartbeat send/check loop.
+/// a background heartbeat send/check loop. After the finalize_connection
+/// refactor, the logic may live in `finalize_connection`.
 #[test]
 fn b3_heartbeat_monitor_instantiated() {
-    let body = extract_fn_body(ADAPTER_SRC, "connect_sourced")
-        .or_else(|| extract_fn_body(ADAPTER_SRC, "connect_sourced_with_bearer"))
-        .expect("connect_sourced or connect_sourced_with_bearer must exist in adapter.rs");
+    let bodies: String = [
+        extract_fn_body(ADAPTER_SRC, "connect_sourced"),
+        extract_fn_body(ADAPTER_SRC, "connect_sourced_with_bearer"),
+        extract_fn_body(ADAPTER_SRC, "finalize_connection"),
+    ]
+    .into_iter()
+    .flatten()
+    .collect::<Vec<_>>()
+    .join("\n");
     assert!(
-        body.contains("HeartbeatMonitor") || body.contains("heartbeat"),
-        "NativeRelayAdapter connection must create a HeartbeatMonitor"
+        !bodies.is_empty(),
+        "connect_sourced, connect_sourced_with_bearer, or finalize_connection must exist in adapter.rs"
+    );
+    assert!(
+        bodies.contains("HeartbeatMonitor") || bodies.contains("heartbeat"),
+        "NativeRelayAdapter connection path must create a HeartbeatMonitor"
     );
 }
 

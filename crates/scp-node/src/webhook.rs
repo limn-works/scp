@@ -61,7 +61,6 @@ pub struct WebhookResult {
 /// # Errors
 /// Returns `WebhookResult` with `success=false` if all retries fail.
 pub async fn dispatch_webhook(
-    client: &reqwest::Client,
     url: &str,
     event: &WebhookEvent,
     signing_key: &SigningKey,
@@ -87,6 +86,15 @@ pub async fn dispatch_webhook(
             error: Some(error),
         };
     }
+
+    // Build a hardened HTTP client internally — callers must not inject a
+    // pre-configured client that might follow redirects (SSRF via 3xx to
+    // internal endpoints).
+    let client = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .timeout(std::time::Duration::from_secs(10))
+        .build()
+        .unwrap_or_else(|_| reqwest::Client::new());
 
     let body = match serde_json::to_vec(event) {
         Ok(b) => b,
@@ -114,8 +122,11 @@ pub async fn dispatch_webhook(
         }
     };
 
-    // Sign: Ed25519(timestamp_be_bytes || body)
-    let mut signing_payload = Vec::with_capacity(8 + body.len());
+    // Sign: Ed25519("SCP-WEBHOOK-V1:" || timestamp_be_bytes || body)
+    // The domain separator prevents cross-protocol signature confusion.
+    let domain_separator = b"SCP-WEBHOOK-V1:";
+    let mut signing_payload = Vec::with_capacity(domain_separator.len() + 8 + body.len());
+    signing_payload.extend_from_slice(domain_separator);
     signing_payload.extend_from_slice(&timestamp.to_be_bytes());
     signing_payload.extend_from_slice(&body);
     let signature = signing_key.sign(&signing_payload);
@@ -276,8 +287,7 @@ mod tests {
             timestamp: 1_700_000_000,
             payload: serde_json::json!({}),
         };
-        let client = reqwest::Client::new();
-        let result = dispatch_webhook(&client, "http://example.com/hook", &event, &key).await;
+        let result = dispatch_webhook("http://example.com/hook", &event, &key).await;
         assert!(!result.success);
         assert_eq!(result.attempts, 0);
         assert!(
@@ -298,8 +308,7 @@ mod tests {
             payload: serde_json::json!({}),
         };
 
-        let client = reqwest::Client::new();
-        let result = dispatch_webhook(&client, "https://localhost/hook", &event, &key).await;
+        let result = dispatch_webhook("https://localhost/hook", &event, &key).await;
         assert!(!result.success);
         assert!(
             result
@@ -310,7 +319,7 @@ mod tests {
             result.error,
         );
 
-        let result = dispatch_webhook(&client, "https://127.0.0.1/hook", &event, &key).await;
+        let result = dispatch_webhook("https://127.0.0.1/hook", &event, &key).await;
         assert!(!result.success);
         assert!(
             result
@@ -333,10 +342,8 @@ mod tests {
             payload: serde_json::json!({}),
         };
 
-        let client = reqwest::Client::new();
-
         // 10.x.x.x
-        let result = dispatch_webhook(&client, "https://10.0.0.1/hook", &event, &key).await;
+        let result = dispatch_webhook("https://10.0.0.1/hook", &event, &key).await;
         assert!(!result.success);
         assert!(
             result
@@ -348,7 +355,7 @@ mod tests {
         );
 
         // 192.168.x.x
-        let result = dispatch_webhook(&client, "https://192.168.1.1/hook", &event, &key).await;
+        let result = dispatch_webhook("https://192.168.1.1/hook", &event, &key).await;
         assert!(!result.success);
         assert!(
             result
@@ -360,7 +367,7 @@ mod tests {
         );
 
         // 172.16.x.x
-        let result = dispatch_webhook(&client, "https://172.16.0.1/hook", &event, &key).await;
+        let result = dispatch_webhook("https://172.16.0.1/hook", &event, &key).await;
         assert!(!result.success);
         assert!(
             result
@@ -397,7 +404,9 @@ mod tests {
         let body = b"test payload";
         let timestamp: u64 = 1_700_000_000;
 
-        let mut payload = Vec::with_capacity(8 + body.len());
+        let domain_separator = b"SCP-WEBHOOK-V1:";
+        let mut payload = Vec::with_capacity(domain_separator.len() + 8 + body.len());
+        payload.extend_from_slice(domain_separator);
         payload.extend_from_slice(&timestamp.to_be_bytes());
         payload.extend_from_slice(body);
 

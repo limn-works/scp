@@ -172,23 +172,7 @@ impl NativeRelayAdapter {
     ) -> Result<Self, TransportError> {
         validate_relay_url(&sourced.url, &sourced.source)?;
         let client = NativeRelayClient::connect(&sourced.url).await?;
-        let heartbeat_cancel = CancellationToken::new();
-        let heartbeat_monitor =
-            Self::maybe_start_heartbeat(profile, &sourced.url, &heartbeat_cancel);
-        let adapter = Self {
-            client,
-            cover_traffic_cancel: CancellationToken::new(),
-            heartbeat_cancel,
-            heartbeat_monitor,
-        };
-        if let Some(profile) = profile {
-            let config = CoverTrafficConfig::from_profile(*profile);
-            // JoinHandle intentionally dropped — the task is cancelled via the
-            // CancellationToken in the adapter's Drop impl, not by awaiting/
-            // aborting the handle.
-            drop(adapter.start_cover_traffic(config));
-        }
-        Ok(adapter)
+        Ok(Self::finalize_connection(client, profile, &sourced.url))
     }
 
     /// Creates a new adapter connected to a relay URL with provenance-based
@@ -217,9 +201,17 @@ impl NativeRelayAdapter {
     ) -> Result<Self, TransportError> {
         validate_relay_url(&sourced.url, &sourced.source)?;
         let client = NativeRelayClient::connect_with_bearer(&sourced.url, bearer_token).await?;
+        Ok(Self::finalize_connection(client, profile, &sourced.url))
+    }
+
+    /// Common post-connection setup: heartbeat monitor, cover traffic auto-start.
+    fn finalize_connection(
+        client: NativeRelayClient,
+        profile: Option<&TransportProfile>,
+        relay_url: &str,
+    ) -> Self {
         let heartbeat_cancel = CancellationToken::new();
-        let heartbeat_monitor =
-            Self::maybe_start_heartbeat(profile, &sourced.url, &heartbeat_cancel);
+        let heartbeat_monitor = Self::maybe_start_heartbeat(profile, relay_url, &heartbeat_cancel);
         let adapter = Self {
             client,
             cover_traffic_cancel: CancellationToken::new(),
@@ -233,7 +225,7 @@ impl NativeRelayAdapter {
             // aborting the handle.
             drop(adapter.start_cover_traffic(config));
         }
-        Ok(adapter)
+        adapter
     }
 
     /// Conditionally creates a [`HeartbeatMonitor`] and spawns a background
@@ -268,6 +260,22 @@ impl NativeRelayAdapter {
             let mut timer = tokio::time::interval(interval_duration);
             // Consume the first immediate tick.
             timer.tick().await;
+
+            // Record a single baseline "sent" timestamp so that suppression
+            // detection has a reference point. Without this, check_suppression
+            // has no `last_sent` to compare against and cannot fire for the
+            // initial case (no messages received yet).
+            //
+            // We intentionally do NOT record_heartbeat_sent on every tick —
+            // doing so resets the baseline each interval, which prevents the
+            // initial-case suppression from ever firing (the gap between
+            // last_sent and now can never exceed the threshold because
+            // last_sent is refreshed every tick).
+            {
+                let mut mon = monitor_clone.lock().await;
+                mon.record_heartbeat_sent(tokio::time::Instant::now());
+            }
+
             loop {
                 tokio::select! {
                     () = cancel.cancelled() => {
@@ -275,13 +283,12 @@ impl NativeRelayAdapter {
                         return;
                     }
                     _ = timer.tick() => {
-                        let mut mon = monitor_clone.lock().await;
-                        mon.record_heartbeat_sent(tokio::time::Instant::now());
+                        let mon = monitor_clone.lock().await;
                         if let Some(suppression) = mon.check_suppression(tokio::time::Instant::now()) {
                             tracing::warn!(
                                 relay_url = %url,
                                 gap_secs = suppression.gap_duration.as_secs(),
-                                "suppression suspected — no heartbeat received"
+                                "suppression suspected — no messages received from relay"
                             );
                         }
                     }

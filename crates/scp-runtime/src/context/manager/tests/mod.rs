@@ -1459,6 +1459,72 @@ pub(super) async fn setup_active_context() -> (ContextManager, ContextHandle) {
     (manager, handle)
 }
 
+/// Like `setup_active_context` but uses `mock_key_resolver()` so that
+/// checkpoint signature verification succeeds in tests. Use with
+/// `signing_key_for_did` to produce correctly-signed checkpoints.
+pub(super) async fn setup_active_context_with_key_resolver() -> (ContextManager, ContextHandle) {
+    let manager = ContextManager::new(
+        Box::new(MockCrypto::default()),
+        Box::new(MockTransport::connected()),
+        Box::new(MockEventLog::default()),
+        mock_key_resolver(),
+    );
+
+    let params = ContextParams {
+        ceiling: vec![
+            scp_protocol::context::params::Capability::new("messages:read"),
+            scp_protocol::context::params::Capability::new("messages:write"),
+            scp_protocol::context::params::Capability::new("role:assign"),
+            Capability::ToolRegister,
+            Capability::ToolInterface,
+            Capability::ChildContextCreate,
+            Capability::MemberBan,
+        ],
+        ..ContextParams::default()
+    };
+
+    let handle = manager
+        .create_context("test-ctx".into(), params, "did:key:creator".into())
+        .await
+        .unwrap();
+
+    (manager, handle)
+}
+
+/// Creates a properly signed [`ConsistencyCheckpoint`] for use in tests.
+///
+/// The checkpoint is signed using the `signing_key_for_did` helper so
+/// that its signature passes `verify_checkpoint_signature` when the
+/// manager uses `mock_key_resolver`.
+pub(super) fn signed_checkpoint(
+    context_id: &str,
+    sender_did: &DID,
+    event_count: u64,
+    merkle_root: [u8; 32],
+    epoch: Option<u64>,
+    timestamp: u64,
+) -> scp_event_log::checkpoint::ConsistencyCheckpoint {
+    let sk = signing_key_for_did(sender_did);
+    let canonical = scp_event_log::checkpoint::compute_checkpoint_canonical_hash(
+        context_id,
+        sender_did.as_ref(),
+        event_count,
+        &merkle_root,
+        epoch,
+        timestamp,
+    );
+    let sig = ed25519_dalek::Signer::sign(&sk, &canonical);
+    scp_event_log::checkpoint::ConsistencyCheckpoint {
+        context_id: context_id.to_owned(),
+        sender_did: sender_did.clone(),
+        event_count,
+        merkle_root,
+        epoch,
+        timestamp,
+        signature: sig.to_bytes().to_vec(),
+    }
+}
+
 // -----------------------------------------------------------------------
 // Shared helpers used across multiple test files
 // -----------------------------------------------------------------------

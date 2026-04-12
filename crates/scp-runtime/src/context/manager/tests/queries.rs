@@ -587,6 +587,28 @@ async fn checkpoint_created_after_10_minutes() {
     assert!(ctx.checkpoint_last_time_secs > 0);
 }
 
+/// Time-based checkpoint is NOT created when zero events have occurred,
+/// even if 10+ minutes have elapsed.
+#[tokio::test]
+async fn checkpoint_not_created_with_zero_events_and_elapsed_time() {
+    let (manager, _handle) = setup_active_context().await;
+    let signing_key = ed25519_dalek::SigningKey::from_bytes(&[42u8; 32]);
+    let sender_did = DID("did:key:creator".into());
+
+    let mut contexts = manager.contexts.lock().await;
+    let ctx = contexts.get_mut("test-ctx").unwrap();
+
+    // Simulate 10+ minutes elapsed but zero events.
+    ctx.checkpoint_events_since = 0;
+    ctx.checkpoint_last_time_secs = manager.clock.now_secs().saturating_sub(601);
+
+    let result = manager.create_checkpoint_if_due("test-ctx", ctx, &sender_did, &signing_key);
+    assert!(
+        result.is_none(),
+        "checkpoint should NOT be created when zero events have occurred, even after time elapsed"
+    );
+}
+
 /// Force checkpoint always creates regardless of thresholds.
 #[tokio::test]
 async fn force_checkpoint_always_creates() {
@@ -612,7 +634,8 @@ async fn force_checkpoint_always_creates() {
 /// `compare_remote_checkpoint` — consistent (same root and count).
 #[tokio::test]
 async fn compare_checkpoint_consistent() {
-    let (manager, _handle) = setup_active_context().await;
+    let (manager, _handle) = setup_active_context_with_key_resolver().await;
+    let sender_did = DID("did:key:creator".into());
     let context_id_bytes = scp_protocol::context::context_id_bytes("test-ctx");
     let local_root = manager
         .event_log
@@ -625,15 +648,14 @@ async fn compare_checkpoint_consistent() {
         .flatten()
         .map_or(0, |e| e.len() as u64);
 
-    let remote = scp_event_log::checkpoint::ConsistencyCheckpoint {
-        context_id: "test-ctx".into(),
-        sender_did: DID("did:key:remote".into()),
-        event_count: local_count,
-        merkle_root: local_root,
-        epoch: Some(0),
-        timestamp: 1000,
-        signature: vec![0u8; 64],
-    };
+    let remote = signed_checkpoint(
+        "test-ctx",
+        &sender_did,
+        local_count,
+        local_root,
+        Some(0),
+        1000,
+    );
 
     let result = manager
         .compare_remote_checkpoint("test-ctx", &remote)
@@ -648,17 +670,17 @@ async fn compare_checkpoint_consistent() {
 /// `compare_remote_checkpoint` — divergent (same count, different root).
 #[tokio::test]
 async fn compare_checkpoint_divergent() {
-    let (manager, _handle) = setup_active_context().await;
+    let (manager, _handle) = setup_active_context_with_key_resolver().await;
+    let sender_did = DID("did:key:creator".into());
 
-    let remote = scp_event_log::checkpoint::ConsistencyCheckpoint {
-        context_id: "test-ctx".into(),
-        sender_did: DID("did:key:remote".into()),
-        event_count: 0,
-        merkle_root: [0xFFu8; 32], // different from empty log root
-        epoch: Some(0),
-        timestamp: 1000,
-        signature: vec![0u8; 64],
-    };
+    let remote = signed_checkpoint(
+        "test-ctx",
+        &sender_did,
+        0,
+        [0xFFu8; 32], // different from empty log root
+        Some(0),
+        1000,
+    );
 
     let result = manager
         .compare_remote_checkpoint("test-ctx", &remote)
@@ -680,17 +702,17 @@ async fn compare_checkpoint_divergent() {
 /// `compare_remote_checkpoint` — behind (remote has more events).
 #[tokio::test]
 async fn compare_checkpoint_behind() {
-    let (manager, _handle) = setup_active_context().await;
+    let (manager, _handle) = setup_active_context_with_key_resolver().await;
+    let sender_did = DID("did:key:creator".into());
 
-    let remote = scp_event_log::checkpoint::ConsistencyCheckpoint {
-        context_id: "test-ctx".into(),
-        sender_did: DID("did:key:remote".into()),
-        event_count: 100, // remote has 100, local has 0
-        merkle_root: [0u8; 32],
-        epoch: Some(0),
-        timestamp: 1000,
-        signature: vec![0u8; 64],
-    };
+    let remote = signed_checkpoint(
+        "test-ctx",
+        &sender_did,
+        100, // remote has 100, local has 0
+        [0u8; 32],
+        Some(0),
+        1000,
+    );
 
     let result = manager
         .compare_remote_checkpoint("test-ctx", &remote)
@@ -724,17 +746,17 @@ async fn compare_checkpoint_ahead_verified_by_symmetry() {
     // The Ahead branch is exercised when local_count > remote.event_count.
     // With MockEventLog, local_count is always 0, so we verify that
     // remote.event_count = 0 yields Consistent (both at 0 events).
-    let (manager, _handle) = setup_active_context().await;
+    let (manager, _handle) = setup_active_context_with_key_resolver().await;
+    let sender_did = DID("did:key:creator".into());
 
-    let remote = scp_event_log::checkpoint::ConsistencyCheckpoint {
-        context_id: "test-ctx".into(),
-        sender_did: DID("did:key:remote".into()),
-        event_count: 0,
-        merkle_root: [0u8; 32], // empty log root
-        epoch: Some(0),
-        timestamp: 1000,
-        signature: vec![0u8; 64],
-    };
+    let remote = signed_checkpoint(
+        "test-ctx",
+        &sender_did,
+        0,
+        [0u8; 32], // empty log root
+        Some(0),
+        1000,
+    );
 
     let result = manager
         .compare_remote_checkpoint("test-ctx", &remote)
@@ -748,5 +770,39 @@ async fn compare_checkpoint_ahead_verified_by_symmetry() {
                 | scp_event_log::checkpoint::CheckpointComparison::Divergent { .. }
         ),
         "same event count should yield Consistent or Divergent, got {result:?}"
+    );
+}
+
+/// `compare_remote_checkpoint` — rejects non-member sender.
+#[tokio::test]
+async fn compare_checkpoint_rejects_non_member() {
+    let (manager, _handle) = setup_active_context_with_key_resolver().await;
+    let non_member = DID("did:key:outsider".into());
+
+    let remote = signed_checkpoint("test-ctx", &non_member, 0, [0u8; 32], Some(0), 1000);
+
+    let result = manager.compare_remote_checkpoint("test-ctx", &remote).await;
+    assert!(result.is_err(), "should reject non-member sender");
+    assert!(
+        matches!(result.unwrap_err(), ContextError::MemberNotFound(_)),
+        "error should be MemberNotFound"
+    );
+}
+
+/// `compare_remote_checkpoint` — rejects tampered signature.
+#[tokio::test]
+async fn compare_checkpoint_rejects_invalid_signature() {
+    let (manager, _handle) = setup_active_context_with_key_resolver().await;
+    let sender_did = DID("did:key:creator".into());
+
+    let mut remote = signed_checkpoint("test-ctx", &sender_did, 0, [0u8; 32], Some(0), 1000);
+    // Tamper with the signature.
+    remote.signature[0] ^= 0xFF;
+
+    let result = manager.compare_remote_checkpoint("test-ctx", &remote).await;
+    assert!(result.is_err(), "should reject tampered signature");
+    assert!(
+        matches!(result.unwrap_err(), ContextError::CryptoFailed(_)),
+        "error should be CryptoFailed"
     );
 }
