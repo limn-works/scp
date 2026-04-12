@@ -636,6 +636,8 @@ fn governance_snapshot_serde_roundtrip() {
         spending_nonce_tracker_state: HashMap::new(),
         pending_commits: std::collections::VecDeque::new(),
         commit_fault: None,
+        checkpoint_events_since: 0,
+        checkpoint_last_time_secs: 0,
     };
 
     let json = serde_json::to_string(&snapshot).expect("serialize");
@@ -6239,6 +6241,7 @@ async fn consequence_triggers_after_governance_action() {
     // Clear write revocation from the first send's consequence.
     // Re-inject a MessageSent event so the rule (threshold=1) can fire
     // during governance finalization.
+    //
     {
         let mut contexts = manager.contexts.lock().await;
         let ctx = contexts.get_mut("gov-conseq-ctx").unwrap();
@@ -12119,6 +12122,8 @@ fn velocity_tracker_state_in_context_snapshot_roundtrip() {
         spending_nonce_tracker_state: HashMap::new(),
         pending_commits: std::collections::VecDeque::new(),
         commit_fault: None,
+        checkpoint_events_since: 0,
+        checkpoint_last_time_secs: 0,
     };
 
     let json = serde_json::to_string(&snapshot).expect("serialize");
@@ -12202,6 +12207,8 @@ fn velocity_tracker_backward_compat_deserialization() {
         spending_nonce_tracker_state: HashMap::new(),
         pending_commits: std::collections::VecDeque::new(),
         commit_fault: None,
+        checkpoint_events_since: 0,
+        checkpoint_last_time_secs: 0,
     };
 
     let mut json_value: serde_json::Value =
@@ -14706,6 +14713,12 @@ async fn earned_capacity_limits_governance_proposals() {
     let key_admin = signing_key_for_did(&admin);
 
     let mut params = governance_params();
+    // Earned capacity is a multi-party governance concept — use Threshold
+    // so the eligibility check isn't bypassed (SingleAdmin skips it).
+    params.governance = GovernanceModel::Threshold {
+        threshold: 1,
+        signers: vec![admin.clone()],
+    };
     params.sybil_policy = Some(ContextSybilPolicy::casual());
 
     let _handle = manager

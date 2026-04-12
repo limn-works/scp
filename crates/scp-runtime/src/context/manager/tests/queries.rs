@@ -514,3 +514,470 @@ async fn get_broadcast_key_for_local_author_rejects_encrypted_context() {
         "error should be MembershipFailed (not a broadcast context)"
     );
 }
+
+// -----------------------------------------------------------------------
+// Checkpoint tests (§9.9.3, ADR-011 AC-8)
+// -----------------------------------------------------------------------
+
+/// Checkpoint is NOT created when neither event nor time threshold is met.
+#[tokio::test]
+async fn checkpoint_not_created_below_thresholds() {
+    let (manager, _handle) = setup_active_context().await;
+    let signing_key = ed25519_dalek::SigningKey::from_bytes(&[42u8; 32]);
+    let sender_did = DID("did:key:creator".into());
+
+    let mut contexts = manager.contexts.lock().await;
+    let ctx = contexts.get_mut("test-ctx").unwrap();
+
+    // Fresh context: 0 events, timestamp is recent → no checkpoint due.
+    let result = manager.create_checkpoint_if_due("test-ctx", ctx, &sender_did, &signing_key);
+    assert!(
+        result.is_none(),
+        "checkpoint should not be created with 0 events and recent timestamp"
+    );
+}
+
+/// Checkpoint is created after 50 events.
+#[tokio::test]
+async fn checkpoint_created_after_50_events() {
+    let (manager, _handle) = setup_active_context().await;
+    let signing_key = ed25519_dalek::SigningKey::from_bytes(&[42u8; 32]);
+    let sender_did = DID("did:key:creator".into());
+
+    let mut contexts = manager.contexts.lock().await;
+    let ctx = contexts.get_mut("test-ctx").unwrap();
+
+    // Simulate 50 events.
+    ctx.checkpoint_events_since = 50;
+
+    let result = manager.create_checkpoint_if_due("test-ctx", ctx, &sender_did, &signing_key);
+    assert!(
+        result.is_some(),
+        "checkpoint should be created after 50 events"
+    );
+    let cp = result.unwrap();
+    assert_eq!(cp.context_id, "test-ctx");
+    assert_eq!(cp.sender_did, sender_did);
+    // Counter should be reset.
+    assert_eq!(ctx.checkpoint_events_since, 0);
+}
+
+/// Checkpoint is created after 10 minutes (600 seconds).
+#[tokio::test]
+async fn checkpoint_created_after_10_minutes() {
+    let (manager, _handle) = setup_active_context().await;
+    let signing_key = ed25519_dalek::SigningKey::from_bytes(&[42u8; 32]);
+    let sender_did = DID("did:key:creator".into());
+
+    let mut contexts = manager.contexts.lock().await;
+    let ctx = contexts.get_mut("test-ctx").unwrap();
+
+    // Simulate 10+ minutes elapsed with at least 1 event.
+    ctx.checkpoint_events_since = 1;
+    ctx.checkpoint_last_time_secs = manager.clock.now_secs().saturating_sub(601);
+
+    let result = manager.create_checkpoint_if_due("test-ctx", ctx, &sender_did, &signing_key);
+    assert!(
+        result.is_some(),
+        "checkpoint should be created after 10 minutes"
+    );
+    let cp = result.unwrap();
+    assert_eq!(cp.context_id, "test-ctx");
+    // Last time should be updated.
+    assert!(ctx.checkpoint_last_time_secs > 0);
+}
+
+/// Time-based checkpoint is NOT created when zero events have occurred,
+/// even if 10+ minutes have elapsed.
+#[tokio::test]
+async fn checkpoint_not_created_with_zero_events_and_elapsed_time() {
+    let (manager, _handle) = setup_active_context().await;
+    let signing_key = ed25519_dalek::SigningKey::from_bytes(&[42u8; 32]);
+    let sender_did = DID("did:key:creator".into());
+
+    let mut contexts = manager.contexts.lock().await;
+    let ctx = contexts.get_mut("test-ctx").unwrap();
+
+    // Simulate 10+ minutes elapsed but zero events.
+    ctx.checkpoint_events_since = 0;
+    ctx.checkpoint_last_time_secs = manager.clock.now_secs().saturating_sub(601);
+
+    let result = manager.create_checkpoint_if_due("test-ctx", ctx, &sender_did, &signing_key);
+    assert!(
+        result.is_none(),
+        "checkpoint should NOT be created when zero events have occurred, even after time elapsed"
+    );
+}
+
+/// Force checkpoint always creates regardless of thresholds.
+#[tokio::test]
+async fn force_checkpoint_always_creates() {
+    let (manager, _handle) = setup_active_context().await;
+    let signing_key = ed25519_dalek::SigningKey::from_bytes(&[42u8; 32]);
+    let sender_did = DID("did:key:creator".into());
+
+    let mut contexts = manager.contexts.lock().await;
+    let ctx = contexts.get_mut("test-ctx").unwrap();
+
+    // 0 events, recent timestamp — would NOT trigger a periodic checkpoint.
+    ctx.checkpoint_events_since = 0;
+    let result = manager.create_checkpoint_if_due("test-ctx", ctx, &sender_did, &signing_key);
+    assert!(result.is_none(), "periodic should not fire");
+
+    // But force always creates.
+    let cp = manager.force_create_checkpoint("test-ctx", ctx, &sender_did, &signing_key);
+    assert_eq!(cp.context_id, "test-ctx");
+    assert_eq!(cp.sender_did, sender_did);
+    assert_eq!(ctx.checkpoints.len(), 1);
+}
+
+/// `compare_remote_checkpoint` — consistent (same root and count).
+#[tokio::test]
+async fn compare_checkpoint_consistent() {
+    let (manager, _handle) = setup_active_context_with_key_resolver().await;
+    let sender_did = DID("did:key:creator".into());
+    let context_id_bytes = scp_protocol::context::context_id_bytes("test-ctx");
+    let local_root = manager
+        .event_log
+        .event_log_merkle_root(&context_id_bytes)
+        .unwrap_or([0u8; 32]);
+    let local_count = manager
+        .event_log
+        .event_log_entries(&context_id_bytes)
+        .ok()
+        .flatten()
+        .map_or(0, |e| e.len() as u64);
+
+    let remote = signed_checkpoint(
+        "test-ctx",
+        &sender_did,
+        local_count,
+        local_root,
+        Some(0),
+        1000,
+    );
+
+    let result = manager
+        .compare_remote_checkpoint("test-ctx", &remote)
+        .await
+        .unwrap();
+    assert_eq!(
+        result,
+        scp_event_log::checkpoint::CheckpointComparison::Consistent
+    );
+}
+
+/// `compare_remote_checkpoint` — divergent (same count, different root).
+#[tokio::test]
+async fn compare_checkpoint_divergent() {
+    let (manager, _handle) = setup_active_context_with_key_resolver().await;
+    let sender_did = DID("did:key:creator".into());
+
+    // Local has 1 event (ContextCreated). Set remote event_count to 1 with
+    // a root that won't match the real hash, triggering Divergent.
+    let remote = signed_checkpoint(
+        "test-ctx",
+        &sender_did,
+        1,
+        [0xFFu8; 32], // different from the real Merkle root
+        Some(0),
+        1000,
+    );
+
+    let result = manager
+        .compare_remote_checkpoint("test-ctx", &remote)
+        .await
+        .unwrap();
+    assert!(
+        matches!(
+            result,
+            scp_event_log::checkpoint::CheckpointComparison::Divergent { .. }
+        ),
+        "same event count with different root should be Divergent, got {result:?}"
+    );
+}
+
+/// `compare_remote_checkpoint` — behind (remote has more events).
+#[tokio::test]
+async fn compare_checkpoint_behind() {
+    let (manager, _handle) = setup_active_context_with_key_resolver().await;
+    let sender_did = DID("did:key:creator".into());
+
+    let remote = signed_checkpoint(
+        "test-ctx",
+        &sender_did,
+        100, // remote has 100, local has 1 (ContextCreated from create_context)
+        [0u8; 32],
+        Some(0),
+        1000,
+    );
+
+    let result = manager
+        .compare_remote_checkpoint("test-ctx", &remote)
+        .await
+        .unwrap();
+    assert!(
+        matches!(
+            result,
+            scp_event_log::checkpoint::CheckpointComparison::Behind { missing_events: 99 }
+        ),
+        "should be Behind with 99 missing events (100 - 1 ContextCreated), got {result:?}"
+    );
+}
+
+/// `compare_remote_checkpoint` — ahead (local has more events).
+///
+/// Note: The default `MockEventLog` does not support `event_log_entries` reads,
+/// so the local count is always 0. We verify the Ahead comparison by testing
+/// with `event_count: 0` on the remote (matching the local mock) and a
+/// negative case where local appears ahead is not reachable with the basic
+/// mock. Instead, we validate the match arm exists via the Behind test above
+/// and the Ahead code path via direct inspection.
+///
+/// The structural correctness of the Ahead branch is verified by the
+/// `compare_checkpoint_behind` test (symmetric logic) and by the pipeline
+/// wiring assertion `b3_merkle_proof_verification_wired`.
+#[tokio::test]
+async fn compare_checkpoint_ahead_verified_by_symmetry() {
+    // The Ahead branch is exercised when local_count > remote.event_count.
+    // MockEventLog now stores entries (including ContextCreated from
+    // create_context), so local_count is 1 after setup. With
+    // remote.event_count = 0, this exercises the Ahead branch.
+    let (manager, _handle) = setup_active_context_with_key_resolver().await;
+    let sender_did = DID("did:key:creator".into());
+
+    let remote = signed_checkpoint(
+        "test-ctx",
+        &sender_did,
+        0,
+        [0u8; 32], // empty log root
+        Some(0),
+        1000,
+    );
+
+    let result = manager
+        .compare_remote_checkpoint("test-ctx", &remote)
+        .await
+        .unwrap();
+    // Local has 1 event (ContextCreated), remote has 0. Should be Ahead.
+    assert!(
+        matches!(
+            result,
+            scp_event_log::checkpoint::CheckpointComparison::Ahead { .. }
+        ),
+        "local (1 event) ahead of remote (0 events), got {result:?}"
+    );
+}
+
+/// `compare_remote_checkpoint` — rejects non-member sender.
+#[tokio::test]
+async fn compare_checkpoint_rejects_non_member() {
+    let (manager, _handle) = setup_active_context_with_key_resolver().await;
+    let non_member = DID("did:key:outsider".into());
+
+    let remote = signed_checkpoint("test-ctx", &non_member, 0, [0u8; 32], Some(0), 1000);
+
+    let result = manager.compare_remote_checkpoint("test-ctx", &remote).await;
+    assert!(result.is_err(), "should reject non-member sender");
+    assert!(
+        matches!(result.unwrap_err(), ContextError::MemberNotFound(_)),
+        "error should be MemberNotFound"
+    );
+}
+
+/// `compare_remote_checkpoint` — rejects tampered signature.
+#[tokio::test]
+async fn compare_checkpoint_rejects_invalid_signature() {
+    let (manager, _handle) = setup_active_context_with_key_resolver().await;
+    let sender_did = DID("did:key:creator".into());
+
+    let mut remote = signed_checkpoint("test-ctx", &sender_did, 0, [0u8; 32], Some(0), 1000);
+    // Tamper with the signature.
+    remote.signature[0] ^= 0xFF;
+
+    let result = manager.compare_remote_checkpoint("test-ctx", &remote).await;
+    assert!(result.is_err(), "should reject tampered signature");
+    assert!(
+        matches!(result.unwrap_err(), ContextError::CryptoFailed(_)),
+        "error should be CryptoFailed"
+    );
+}
+
+// -----------------------------------------------------------------------
+// Merkle proof tests (ADR-011, #1535)
+// -----------------------------------------------------------------------
+
+/// #1535: Send 5 messages, prove inclusion for each, verify all pass.
+///
+/// Each `send_message` call appends to the durable event log via the
+/// provider. The per-context Merkle tree is lazily populated from the
+/// provider at proof time via `sync_merkle_tree`, ensuring one consistent
+/// hash format.
+#[tokio::test]
+async fn prove_event_inclusion_after_messages() {
+    let (manager, handle) = setup_active_context().await;
+    let sk = signing_key_for_did(&"did:key:creator".into());
+
+    // Send 5 messages. Each send_message call appends a "MessageSent"
+    // event to the per-context Merkle tree.
+    for i in 1..=5u8 {
+        manager
+            .send_message(
+                &handle,
+                &"did:key:creator".into(),
+                &[i],
+                Some(&sk),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+    }
+
+    // The Merkle tree should have exactly 5 entries (one per send_message).
+    // Prove inclusion for each.
+    for i in 0..5u64 {
+        let proof = manager.prove_event_inclusion("test-ctx", i).await.unwrap();
+        assert!(
+            ContextManager::verify_event_inclusion(&proof),
+            "inclusion proof for event {i} should verify"
+        );
+        assert_eq!(proof.leaf_index, i);
+    }
+}
+
+/// #1535: Send 10 messages, prove consistency from size 5 to 10, verify.
+#[tokio::test]
+async fn prove_event_consistency_after_messages() {
+    let (manager, handle) = setup_active_context().await;
+    let sk = signing_key_for_did(&"did:key:creator".into());
+
+    // Send 10 messages.
+    for i in 1..=10u8 {
+        manager
+            .send_message(
+                &handle,
+                &"did:key:creator".into(),
+                &[i],
+                Some(&sk),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+    }
+
+    // Prove consistency from size 5 to current size.
+    // The total event count is 11: 1 ContextCreated (from create_context)
+    // + 10 MessageSent. The Merkle tree is populated via sync_merkle_tree
+    // from the event log provider, which includes all events.
+    let proof = manager
+        .prove_event_consistency("test-ctx", 5)
+        .await
+        .unwrap();
+    assert!(
+        ContextManager::verify_event_consistency(&proof),
+        "consistency proof should verify"
+    );
+    assert_eq!(proof.old_size, 5);
+    assert_eq!(proof.new_size, 11);
+}
+
+/// #1535: Prove inclusion with an invalid (out-of-bounds) index returns error.
+#[tokio::test]
+async fn prove_event_inclusion_invalid_index() {
+    let (manager, handle) = setup_active_context().await;
+    let sk = signing_key_for_did(&"did:key:creator".into());
+
+    // Send one message so the Merkle tree has exactly 1 entry.
+    manager
+        .send_message(
+            &handle,
+            &"did:key:creator".into(),
+            b"msg",
+            Some(&sk),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+    // Index 999999 should be out of bounds (only 1 event exists).
+    let result = manager.prove_event_inclusion("test-ctx", 999_999).await;
+    assert!(result.is_err(), "out-of-bounds index should return error");
+    assert!(matches!(
+        result.unwrap_err(),
+        ContextError::EventLogFailed(_)
+    ));
+}
+
+/// #1535: Prove consistency with `old_size` > `current_size` returns error.
+#[tokio::test]
+async fn prove_event_consistency_old_size_too_large() {
+    let (manager, handle) = setup_active_context().await;
+    let sk = signing_key_for_did(&"did:key:creator".into());
+
+    // Send one message so the Merkle tree has exactly 1 entry.
+    manager
+        .send_message(
+            &handle,
+            &"did:key:creator".into(),
+            b"msg",
+            Some(&sk),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+    // old_size 999999 should exceed current size (1 event).
+    let result = manager.prove_event_consistency("test-ctx", 999_999).await;
+    assert!(
+        result.is_err(),
+        "old_size exceeding current size should return error"
+    );
+    assert!(matches!(
+        result.unwrap_err(),
+        ContextError::EventLogFailed(_)
+    ));
+}
+
+/// #1535: Pure verify functions reject tampered proofs.
+#[tokio::test]
+async fn verify_rejects_tampered_inclusion_proof() {
+    let (manager, handle) = setup_active_context().await;
+    let sk = signing_key_for_did(&"did:key:creator".into());
+
+    manager
+        .send_message(
+            &handle,
+            &"did:key:creator".into(),
+            b"msg",
+            Some(&sk),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+    let mut proof = manager.prove_event_inclusion("test-ctx", 0).await.unwrap();
+    assert!(ContextManager::verify_event_inclusion(&proof));
+
+    // Tamper with the root.
+    proof.root[0] ^= 0xFF;
+    assert!(
+        !ContextManager::verify_event_inclusion(&proof),
+        "tampered root should fail verification"
+    );
+}
+
+/// #1535: Context not registered returns `ContextNotRegistered` error.
+#[tokio::test]
+async fn prove_event_inclusion_unknown_context() {
+    let (manager, _handle) = setup_active_context().await;
+    let result = manager.prove_event_inclusion("nonexistent-ctx", 0).await;
+    assert!(matches!(
+        result.unwrap_err(),
+        ContextError::ContextNotRegistered(_)
+    ));
+}

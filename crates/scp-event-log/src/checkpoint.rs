@@ -1129,7 +1129,8 @@ fn hash_pair(left: &[u8; 32], right: &[u8; 32]) -> [u8; 32] {
 ///
 /// The `epoch_flag` byte is `0x01` if epoch is `Some`, `0x00` if `None`.
 /// When `Some`, the epoch value follows as 8 big-endian bytes.
-fn compute_checkpoint_canonical_hash(
+#[must_use]
+pub fn compute_checkpoint_canonical_hash(
     context_id: &str,
     sender_did: &str,
     event_count: u64,

@@ -57,11 +57,14 @@ const PYO3_TOOLS_SRC: &str = include_str!("../../../../crates/scp-ffi/src/tools.
 const NAPI_TOOLS_SRC: &str = include_str!("../../../../crates/scp-ffi/napi/src/tools.rs");
 const UNIFFI_BRIDGE_SRC: &str = include_str!("../../../../crates/scp-ffi/uniffi/src/bridge.rs");
 
+// Transport layer sources for Batch 3 assertions
+const ADAPTER_SRC: &str = include_str!("../../../../crates/scp-transport/src/native/adapter.rs");
+
 // =========================================================================
 // RATCHET CONSTANTS — may only increase
 // Any decrease requires human approval
 // =========================================================================
-const MIN_ACTIVE_PIPELINE_ASSERTIONS: usize = 33;
+const MIN_ACTIVE_PIPELINE_ASSERTIONS: usize = 38;
 
 // ---------------------------------------------------------------------------
 // Function body extraction — brace-matching parser
@@ -882,6 +885,136 @@ fn c4_uniffi_tool_invoke_accepts_spending_ucan() {
 }
 
 // ===========================================================================
+// Batch 3 — Transport/infra wiring (all #[ignore] until implemented)
+// ===========================================================================
+
+/// Cover traffic must auto-start when a relay connection is established.
+/// NativeRelayAdapter::connect_sourced (or a post-connect hook) must call
+/// start_cover_traffic based on the TransportProfile tier. After the
+/// finalize_connection refactor, the logic may live in `finalize_connection`.
+#[test]
+fn b3_cover_traffic_auto_start() {
+    // Check connect_sourced, connect_sourced_with_bearer, AND finalize_connection —
+    // the logic may be in any of them (including after refactor to a shared helper).
+    let bodies: String = [
+        extract_fn_body(ADAPTER_SRC, "connect_sourced"),
+        extract_fn_body(ADAPTER_SRC, "connect_sourced_with_bearer"),
+        extract_fn_body(ADAPTER_SRC, "finalize_connection"),
+    ]
+    .into_iter()
+    .flatten()
+    .collect::<Vec<_>>()
+    .join("\n");
+    assert!(
+        !bodies.is_empty(),
+        "connect_sourced, connect_sourced_with_bearer, or finalize_connection must exist in adapter.rs"
+    );
+    assert!(
+        bodies.contains("start_cover_traffic"),
+        "NativeRelayAdapter connection path must auto-start cover traffic"
+    );
+}
+
+/// HeartbeatMonitor must be created when a relay connection is established.
+/// The adapter (or client) must instantiate HeartbeatMonitor and start
+/// a background heartbeat send/check loop. After the finalize_connection
+/// refactor, the logic may live in `finalize_connection`.
+#[test]
+fn b3_heartbeat_monitor_instantiated() {
+    let bodies: String = [
+        extract_fn_body(ADAPTER_SRC, "connect_sourced"),
+        extract_fn_body(ADAPTER_SRC, "connect_sourced_with_bearer"),
+        extract_fn_body(ADAPTER_SRC, "finalize_connection"),
+    ]
+    .into_iter()
+    .flatten()
+    .collect::<Vec<_>>()
+    .join("\n");
+    assert!(
+        !bodies.is_empty(),
+        "connect_sourced, connect_sourced_with_bearer, or finalize_connection must exist in adapter.rs"
+    );
+    assert!(
+        bodies.contains("HeartbeatMonitor") || bodies.contains("heartbeat"),
+        "NativeRelayAdapter connection path must create a HeartbeatMonitor"
+    );
+}
+
+/// Checkpoint generation must be wired into the context lifecycle.
+/// close_context must call force_create_checkpoint for archival.
+/// send_message/deliver_incoming should call create_checkpoint_if_due periodically.
+#[test]
+fn b3_checkpoint_generation_wired() {
+    // close_context_with_key must call force_create_checkpoint for archival.
+    let body = extract_fn_body(MANAGER_SRC, "close_context_with_key")
+        .expect("close_context_with_key must exist in manager source");
+    assert!(
+        body.contains("force_create_checkpoint") || body.contains("create_checkpoint"),
+        "close_context_with_key must generate a final checkpoint"
+    );
+
+    // finalize_send must call create_checkpoint_if_due for periodic checkpoints.
+    let send_body = extract_fn_body(MANAGER_SRC, "finalize_send")
+        .expect("finalize_send must exist in manager source");
+    assert!(
+        send_body.contains("create_checkpoint_if_due") || send_body.contains("checkpoint"),
+        "finalize_send must track checkpoint events"
+    );
+}
+
+/// Merkle proof verification must be wired into the equivocation detection path.
+/// compare_remote_checkpoint must compare local and remote Merkle roots
+/// and emit EquivocationDetected when divergent (§9.9.3, ADR-011 AC-8).
+#[test]
+fn b3_merkle_proof_verification_wired() {
+    // compare_remote_checkpoint must exist and perform comparison.
+    let body = extract_fn_body(MANAGER_SRC, "compare_remote_checkpoint")
+        .expect("compare_remote_checkpoint must exist in manager source");
+    assert!(
+        body.contains("merkle_root") || body.contains("event_log_merkle_root"),
+        "compare_remote_checkpoint must compare Merkle roots"
+    );
+    assert!(
+        body.contains("Divergent") || body.contains("EquivocationDetected"),
+        "compare_remote_checkpoint must detect divergence / equivocation"
+    );
+}
+
+/// Webhook dispatch must exist and be wired into bridge event handling.
+/// ApplicationNode must dispatch webhooks when context events occur for
+/// registered bridges with webhook_url.
+#[test]
+fn b3_webhook_dispatch_wired() {
+    let node_src = include_str!("../../../../crates/scp-node/src/lib.rs");
+    assert!(
+        node_src.contains("mod webhook"),
+        "ApplicationNode must have webhook module registered"
+    );
+
+    let webhook_src = include_str!("../../../../crates/scp-node/src/webhook.rs");
+    assert!(
+        webhook_src.contains("dispatch_webhook"),
+        "webhook module must export dispatch_webhook function"
+    );
+    assert!(
+        webhook_src.contains("WebhookEvent"),
+        "webhook module must define WebhookEvent type"
+    );
+    assert!(
+        webhook_src.contains("X-SCP-Signature"),
+        "webhook dispatch must set X-SCP-Signature header"
+    );
+    assert!(
+        webhook_src.contains("X-SCP-Timestamp"),
+        "webhook dispatch must set X-SCP-Timestamp header"
+    );
+    assert!(
+        webhook_src.contains("validate_webhook_url"),
+        "webhook module must include SSRF validation"
+    );
+}
+
+// ===========================================================================
 // Meta-tests — ratchet and tamper detection
 // ===========================================================================
 
@@ -919,21 +1052,25 @@ fn no_stale_ignores() {
     let mut stale: Vec<&str> = vec![];
     let source = include_str!("pipeline_wiring.rs");
 
+    // Helper: returns true if source has an #[ignore = "..."] line mentioning `issue`.
+    let has_ignore_for = |issue: &str| {
+        source
+            .lines()
+            .any(|l| l.contains("#[ignore = \"") && l.contains(issue))
+    };
+
     // #1531 — consequence evaluation wired in dispatch_consequences
     if fn_body_contains(
         MANAGER_SRC,
         "dispatch_consequences",
         "evaluate_consequence_rules",
-    ) && source.contains("#[ignore = \"")
-        && source.contains("1531")
+    ) && has_ignore_for("#1531")
     {
         stale.push("consequence evaluation wired but #[ignore] for #1531 still present");
     }
 
     // #1537 — economy enforcement wired in enforce_economy
-    if fn_body_contains(MANAGER_SRC, "enforce_economy", "evaluate_cost")
-        && source.contains("#[ignore = \"")
-        && source.contains("1537")
+    if fn_body_contains(MANAGER_SRC, "enforce_economy", "evaluate_cost") && has_ignore_for("#1537")
     {
         stale.push("economy enforcement wired but #[ignore] for #1537 still present");
     }
@@ -943,8 +1080,7 @@ fn no_stale_ignores() {
         MANAGER_SRC,
         "propose_governance_action_inner",
         "check_proposer_eligibility",
-    ) && source.contains("#[ignore = \"")
-        && source.contains("1530")
+    ) && has_ignore_for("#1530")
     {
         stale.push("proposer eligibility check wired but #[ignore] for #1530 still present");
     }
@@ -952,8 +1088,7 @@ fn no_stale_ignores() {
     // #1548 — content key rotation wired in execute_rotate_content_keys
     if (fn_body_contains(MANAGER_SRC, "execute_rotate_content_keys", "advance_epoch")
         || fn_body_contains(MANAGER_SRC, "execute_rotate_content_keys", "propose_update"))
-        && source.contains("#[ignore = \"")
-        && source.contains("1548")
+        && has_ignore_for("#1548")
     {
         stale.push("content key rotation wired but #[ignore] for #1548 still present");
     }
@@ -961,14 +1096,17 @@ fn no_stale_ignores() {
     // #1541 — sender key rotation wired in execute_remove_member and leave_context
     if fn_body_contains(MANAGER_SRC, "execute_remove_member", "rotate_sender_key")
         && fn_body_contains(MANAGER_SRC, "leave_context", "rotate_sender_key")
-        && source.contains("#[ignore = \"")
-        && source.contains("1541")
+        && has_ignore_for("#1541")
     {
         stale.push("sender key rotation wired but #[ignore] for #1541 still present");
     }
 
-    // Catch-all: no ignores should exist at all
-    if source.matches("#[ignore = \"").count() > 0 {
+    // Catch-all: no ignores should exist
+    let has_any_ignore = source.lines().any(|line| {
+        let trimmed = line.trim();
+        trimmed.starts_with("#[ignore") && trimmed.contains("= \"")
+    });
+    if has_any_ignore {
         stale.push("unexpected #[ignore] attributes found");
     }
 

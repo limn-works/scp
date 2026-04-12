@@ -391,6 +391,8 @@ fn test_pending_commits_persist_across_snapshot_roundtrip() {
         spending_nonce_tracker_state: std::collections::HashMap::new(),
         pending_commits: queue,
         commit_fault: Some(fault),
+        checkpoint_events_since: 0,
+        checkpoint_last_time_secs: 0,
     };
 
     // Round-trip via JSON to ensure serde derive works for both new types.

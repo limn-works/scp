@@ -68,10 +68,12 @@ fn auto_wire_context_manager(
     };
     let did_owned = did.to_owned();
     let token2 = bridge_token.clone();
+    let profile = scp_transport::profile::TransportProfile::platform_default();
     match py.allow_threads(|| {
         rt.block_on(NativeRelayAdapter::connect_sourced_with_bearer(
             &sourced,
             Some(bridge_token),
+            Some(&profile),
         ))
     }) {
         Ok(adapter) => {
@@ -92,6 +94,7 @@ fn auto_wire_context_manager(
                 rt.block_on(NativeRelayAdapter::connect_sourced_with_bearer(
                     &sourced,
                     Some(token2),
+                    Some(&profile),
                 ))
             }) {
                 Ok(relay_adapter) => {
@@ -882,7 +885,7 @@ mod tests {
             source: RelayUrlSource::Explicit,
         };
         let adapter = rt()
-            .block_on(NativeRelayAdapter::connect_sourced(&sourced))
+            .block_on(NativeRelayAdapter::connect_sourced(&sourced, None))
             .expect("should connect to the relay");
         crate::runtime::set_relay_connection(Arc::new(adapter))
             .expect("should store adapter in global");

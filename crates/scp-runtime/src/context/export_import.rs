@@ -366,6 +366,10 @@ fn strip_snapshot_for_public(snapshot: &ContextSnapshot) -> ContextSnapshot {
         // public scope.
         pending_commits: std::collections::VecDeque::new(),
         commit_fault: None,
+        // Checkpoint counters are local runtime state — no meaning to a
+        // public observer. Always zero in public scope.
+        checkpoint_events_since: 0,
+        checkpoint_last_time_secs: 0,
     }
 }
 
@@ -486,6 +490,8 @@ mod tests {
             spending_nonce_tracker_state: std::collections::HashMap::new(),
             pending_commits: std::collections::VecDeque::new(),
             commit_fault: None,
+            checkpoint_events_since: 0,
+            checkpoint_last_time_secs: 0,
         }
     }
 

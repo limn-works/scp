@@ -684,6 +684,14 @@ impl ContextManager {
             );
         }
 
+        // Checkpoint tracking: count this event for threshold-based checkpoints.
+        {
+            let mut contexts = self.contexts.lock().await;
+            if let Some(ctx) = contexts.get_mut(context_id) {
+                ctx.checkpoint_events_since += 1;
+            }
+        }
+
         Ok(Some(receipt))
     }
 

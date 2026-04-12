@@ -651,6 +651,10 @@ impl ContextTransportProvider for MockTransport {
 pub(super) struct MockEventLog {
     pub(super) inited: std::sync::Mutex<Vec<[u8; 32]>>,
     pub(super) events: std::sync::Mutex<Vec<([u8; 32], String)>>,
+    /// Full entries for `event_log_entries()` — supports `sync_merkle_tree`.
+    full_entries: std::sync::Mutex<Vec<crate::context::providers::event_log::EventLogEntry>>,
+    /// Context ID for the current `full_entries` log.
+    full_entries_context: std::sync::Mutex<Option<[u8; 32]>>,
     pub(super) destroyed: std::sync::Mutex<Vec<[u8; 32]>>,
 }
 
@@ -664,16 +668,56 @@ impl ContextEventLogProvider for MockEventLog {
         &self,
         id: &[u8; 32],
         event: &str,
-        _actor_did: &str,
-        _payload: Option<&serde_json::Value>,
+        actor_did: &str,
+        payload: Option<&serde_json::Value>,
     ) -> Result<(), ContextCreationError> {
         self.events.lock().unwrap().push((*id, event.to_owned()));
+        // Build a proper EventLogEntry for sync_merkle_tree support.
+        let mut full = self.full_entries.lock().unwrap();
+        let mut ctx_id = self.full_entries_context.lock().unwrap();
+        // Reset if context changes (simple single-context mock).
+        if ctx_id.is_none_or(|c| c != *id) {
+            full.clear();
+            *ctx_id = Some(*id);
+        }
+        let prev_hash = full.last().map_or([0u8; 32], |e| e.hash);
+        let timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        let hash = crate::context::providers::event_log::entry_hash(
+            event, actor_did, timestamp, &prev_hash, payload,
+        );
+        full.push(crate::context::providers::event_log::EventLogEntry {
+            event: event.to_owned(),
+            actor_did: actor_did.to_owned(),
+            timestamp,
+            prev_hash,
+            hash,
+            payload: payload.cloned(),
+        });
         Ok(())
     }
 
     fn destroy_event_log(&self, id: &[u8; 32]) -> Result<(), ContextCreationError> {
         self.destroyed.lock().unwrap().push(*id);
         Ok(())
+    }
+
+    fn event_log_entries(
+        &self,
+        context_id: &[u8; 32],
+    ) -> Result<
+        Option<Vec<crate::context::providers::event_log::EventLogEntry>>,
+        scp_protocol::context::ContextError,
+    > {
+        let full = self.full_entries.lock().unwrap();
+        let ctx_id = self.full_entries_context.lock().unwrap();
+        if ctx_id.is_some_and(|c| c == *context_id) && !full.is_empty() {
+            Ok(Some(full.clone()))
+        } else {
+            Ok(None)
+        }
     }
 }
 
@@ -1457,6 +1501,72 @@ pub(super) async fn setup_active_context() -> (ContextManager, ContextHandle) {
         .unwrap();
 
     (manager, handle)
+}
+
+/// Like `setup_active_context` but uses `mock_key_resolver()` so that
+/// checkpoint signature verification succeeds in tests. Use with
+/// `signing_key_for_did` to produce correctly-signed checkpoints.
+pub(super) async fn setup_active_context_with_key_resolver() -> (ContextManager, ContextHandle) {
+    let manager = ContextManager::new(
+        Box::new(MockCrypto::default()),
+        Box::new(MockTransport::connected()),
+        Box::new(MockEventLog::default()),
+        mock_key_resolver(),
+    );
+
+    let params = ContextParams {
+        ceiling: vec![
+            scp_protocol::context::params::Capability::new("messages:read"),
+            scp_protocol::context::params::Capability::new("messages:write"),
+            scp_protocol::context::params::Capability::new("role:assign"),
+            Capability::ToolRegister,
+            Capability::ToolInterface,
+            Capability::ChildContextCreate,
+            Capability::MemberBan,
+        ],
+        ..ContextParams::default()
+    };
+
+    let handle = manager
+        .create_context("test-ctx".into(), params, "did:key:creator".into())
+        .await
+        .unwrap();
+
+    (manager, handle)
+}
+
+/// Creates a properly signed [`ConsistencyCheckpoint`] for use in tests.
+///
+/// The checkpoint is signed using the `signing_key_for_did` helper so
+/// that its signature passes `verify_checkpoint_signature` when the
+/// manager uses `mock_key_resolver`.
+pub(super) fn signed_checkpoint(
+    context_id: &str,
+    sender_did: &DID,
+    event_count: u64,
+    merkle_root: [u8; 32],
+    epoch: Option<u64>,
+    timestamp: u64,
+) -> scp_event_log::checkpoint::ConsistencyCheckpoint {
+    let sk = signing_key_for_did(sender_did);
+    let canonical = scp_event_log::checkpoint::compute_checkpoint_canonical_hash(
+        context_id,
+        sender_did.as_ref(),
+        event_count,
+        &merkle_root,
+        epoch,
+        timestamp,
+    );
+    let sig = ed25519_dalek::Signer::sign(&sk, &canonical);
+    scp_event_log::checkpoint::ConsistencyCheckpoint {
+        context_id: context_id.to_owned(),
+        sender_did: sender_did.clone(),
+        event_count,
+        merkle_root,
+        epoch,
+        timestamp,
+        signature: sig.to_bytes().to_vec(),
+    }
 }
 
 // -----------------------------------------------------------------------

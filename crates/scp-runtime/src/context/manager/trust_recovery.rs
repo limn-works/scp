@@ -301,6 +301,12 @@ impl ContextManager {
                 "failed to append recovery epoch advancement event to event log"
             );
         }
+        {
+            let mut contexts = self.contexts.lock().await;
+            if let Some(ctx) = contexts.get_mut(context_id) {
+                ctx.checkpoint_events_since += 1;
+            }
+        }
 
         // 5. Persist if configured (best-effort).
         if self.has_persistence() {

@@ -40,7 +40,9 @@ async fn connect_adapter(addr: std::net::SocketAddr) -> NativeRelayAdapter {
         url: format!("ws://127.0.0.1:{}/scp/v1", addr.port()),
         source: RelayUrlSource::DhtResolved,
     };
-    NativeRelayAdapter::connect_sourced(&sourced).await.unwrap()
+    NativeRelayAdapter::connect_sourced(&sourced, None)
+        .await
+        .unwrap()
 }
 
 // -----------------------------------------------------------------------

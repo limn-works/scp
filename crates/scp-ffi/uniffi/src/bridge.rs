@@ -4584,7 +4584,8 @@ pub async fn transport_connect(relay_url: String) -> Result<Arc<TransportManager
             };
 
             // Establish a real WebSocket connection to the relay.
-            let adapter = NativeRelayAdapter::connect_sourced(&sourced)
+            let profile = scp_transport::profile::TransportProfile::platform_default();
+            let adapter = NativeRelayAdapter::connect_sourced(&sourced, Some(&profile))
                 .await
                 .map_err(ScpError::from)?;
 
@@ -4710,12 +4711,14 @@ pub async fn configure_relay_transport(
         source: scp_transport::relay::connection::RelayUrlSource::Explicit,
     };
 
-    let adapter = scp_transport::native::NativeRelayAdapter::connect_sourced(&sourced)
-        .await
-        .map_err(|e| ScpError::Transport {
-            msg: format!("failed to connect to relay '{relay_url}': {e}"),
-            code: "SCP-TRANS-5001".to_owned(),
-        })?;
+    let profile = scp_transport::profile::TransportProfile::platform_default();
+    let adapter =
+        scp_transport::native::NativeRelayAdapter::connect_sourced(&sourced, Some(&profile))
+            .await
+            .map_err(|e| ScpError::Transport {
+                msg: format!("failed to connect to relay '{relay_url}': {e}"),
+                code: "SCP-TRANS-5001".to_owned(),
+            })?;
 
     crate::runtime::init_context_manager_with_relay_transport(&local_did, adapter);
     Ok(())

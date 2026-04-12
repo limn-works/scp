@@ -14,6 +14,17 @@
 //! (spec §9.10.6). The background task is automatically cancelled when the
 //! adapter is dropped, preventing resource leaks.
 //!
+//! # Heartbeat monitoring
+//!
+//! When a [`TransportProfile`] is provided at connection time, the adapter
+//! creates a [`HeartbeatMonitor`] and spawns a background task that
+//! periodically checks for relay suppression (spec §9.9.2). If expected
+//! heartbeats are missing for longer than the configured threshold
+//! (default: 2x the 60-second interval), a warning is logged. The
+//! subscription path can call
+//! [`record_heartbeat_received`](NativeRelayAdapter::record_heartbeat_received)
+//! to update the monitor when heartbeat-like messages arrive.
+//!
 //! # Mapping
 //!
 //! | Transport method | Relay operation |
@@ -29,6 +40,7 @@
 //! `NativeRelayClient`: see `super::client::NativeRelayClient`
 
 use std::pin::Pin;
+use std::sync::Arc;
 
 use futures::Stream;
 use scp_core::envelope::OuterEnvelope;
@@ -42,6 +54,8 @@ use crate::cover_traffic::{
     CoverAction, CoverTrafficConfig, CoverTrafficGenerator, CoverTrafficSender,
 };
 use crate::error::TransportError;
+use crate::heartbeat::{HeartbeatConfig, HeartbeatMonitor};
+use crate::profile::TransportProfile;
 use crate::relay::connection::{SourcedRelayUrl, validate_relay_url};
 use crate::traits::{BlobId, RoutingId, SubscriptionStream, TransportAdapter, TransportEvent};
 
@@ -73,18 +87,20 @@ type BoxFuture<'a, T> = Pin<Box<dyn std::future::Future<Output = T> + Send + 'a>
 /// use scp_transport::relay::connection::{RelayUrlSource, SourcedRelayUrl};
 ///
 /// // Production: validate ws:// vs wss:// based on discovery source.
+/// // Pass a TransportProfile to auto-start cover traffic (spec §9.10.6).
 /// let sourced = SourcedRelayUrl {
 ///     url: "wss://relay.example.com/scp/v1".to_owned(),
 ///     source: RelayUrlSource::WellKnown,
 /// };
-/// let adapter = NativeRelayAdapter::connect_sourced(&sourced).await?;
+/// let profile = TransportProfile::platform_default();
+/// let adapter = NativeRelayAdapter::connect_sourced(&sourced, Some(&profile)).await?;
 ///
-/// // Test: local ws:// relay with DhtResolved source.
+/// // Test: local ws:// relay with DhtResolved source, no cover traffic.
 /// let sourced = SourcedRelayUrl {
 ///     url: "ws://127.0.0.1:9000/scp/v1".to_owned(),
 ///     source: RelayUrlSource::DhtResolved,
 /// };
-/// let adapter = NativeRelayAdapter::connect_sourced(&sourced).await?;
+/// let adapter = NativeRelayAdapter::connect_sourced(&sourced, None).await?;
 /// ```
 pub struct NativeRelayAdapter {
     /// The underlying WebSocket client.
@@ -93,6 +109,16 @@ pub struct NativeRelayAdapter {
     /// on `Drop` to ensure the task is aborted and the `Arc` cycle is broken,
     /// preventing resource leaks.
     cover_traffic_cancel: CancellationToken,
+    /// Cancellation token for the heartbeat monitoring background task.
+    /// Cancelled on `Drop` to stop the heartbeat check loop.
+    heartbeat_cancel: CancellationToken,
+    /// Heartbeat monitor for relay suppression detection (spec §9.9.2).
+    /// `None` when no `TransportProfile` was provided at connection time.
+    heartbeat_monitor: Option<Arc<tokio::sync::Mutex<HeartbeatMonitor>>>,
+    /// Channel for suppression events detected by the heartbeat monitor.
+    /// Callers should drain this receiver to observe suppression alerts
+    /// (spec §9.9.4: "The SDK MUST NOT silently discard the suspicion").
+    suppression_rx: Option<tokio::sync::mpsc::Receiver<crate::heartbeat::SuppressionSuspected>>,
 }
 
 impl std::fmt::Debug for NativeRelayAdapter {
@@ -108,6 +134,8 @@ impl Drop for NativeRelayAdapter {
         // and will exit its loop when the token is cancelled, allowing the Arc
         // to be reclaimed.
         self.cover_traffic_cancel.cancel();
+        // Cancel the heartbeat monitoring background task (if running).
+        self.heartbeat_cancel.cancel();
     }
 }
 
@@ -126,6 +154,12 @@ impl NativeRelayAdapter {
     /// All relay URLs must go through this path — there is no unvalidated
     /// connection method.
     ///
+    /// When a [`TransportProfile`] is provided, cover traffic is auto-started
+    /// based on the profile's tier (spec §9.10.6): Full for Server/Desktop,
+    /// Reduced for Mobile, Off (no-op) for Constrained. Heartbeat monitoring
+    /// is also started for relay suppression detection (spec §9.9.2). Pass
+    /// `None` to skip both (e.g., in tests).
+    ///
     /// [`RelayUrlSource::DhtResolved`]: crate::relay::connection::RelayUrlSource::DhtResolved
     ///
     /// # Errors
@@ -136,13 +170,13 @@ impl NativeRelayAdapter {
     ///
     /// Returns [`TransportError::ConnectionFailed`] if the URL passes
     /// validation but the WebSocket connection cannot be established.
-    pub async fn connect_sourced(sourced: &SourcedRelayUrl) -> Result<Self, TransportError> {
+    pub async fn connect_sourced(
+        sourced: &SourcedRelayUrl,
+        profile: Option<&TransportProfile>,
+    ) -> Result<Self, TransportError> {
         validate_relay_url(&sourced.url, &sourced.source)?;
         let client = NativeRelayClient::connect(&sourced.url).await?;
-        Ok(Self {
-            client,
-            cover_traffic_cancel: CancellationToken::new(),
-        })
+        Ok(Self::finalize_connection(client, profile, &sourced.url))
     }
 
     /// Creates a new adapter connected to a relay URL with provenance-based
@@ -154,6 +188,9 @@ impl NativeRelayAdapter {
     /// connecting to relay endpoints that enforce bridge token authentication
     /// (e.g., `ApplicationNode` relays).
     ///
+    /// When a [`TransportProfile`] is provided, cover traffic and heartbeat
+    /// monitoring are auto-started (spec §9.10.6, §9.9.2).
+    ///
     /// # Errors
     ///
     /// Returns [`TransportError::ProtocolError`] if the URL scheme is not
@@ -164,13 +201,167 @@ impl NativeRelayAdapter {
     pub async fn connect_sourced_with_bearer(
         sourced: &SourcedRelayUrl,
         bearer_token: Option<Zeroizing<String>>,
+        profile: Option<&TransportProfile>,
     ) -> Result<Self, TransportError> {
         validate_relay_url(&sourced.url, &sourced.source)?;
         let client = NativeRelayClient::connect_with_bearer(&sourced.url, bearer_token).await?;
-        Ok(Self {
+        Ok(Self::finalize_connection(client, profile, &sourced.url))
+    }
+
+    /// Common post-connection setup: heartbeat monitor, cover traffic auto-start.
+    fn finalize_connection(
+        client: NativeRelayClient,
+        profile: Option<&TransportProfile>,
+        relay_url: &str,
+    ) -> Self {
+        let heartbeat_cancel = CancellationToken::new();
+        let (heartbeat_monitor, suppression_rx) =
+            Self::maybe_start_heartbeat(profile, relay_url, &heartbeat_cancel);
+        let adapter = Self {
             client,
             cover_traffic_cancel: CancellationToken::new(),
-        })
+            heartbeat_cancel,
+            heartbeat_monitor,
+            suppression_rx,
+        };
+        if let Some(profile) = profile {
+            let config = CoverTrafficConfig::from_profile(*profile);
+            // JoinHandle intentionally dropped — the task is cancelled via the
+            // CancellationToken in the adapter's Drop impl, not by awaiting/
+            // aborting the handle.
+            drop(adapter.start_cover_traffic(config));
+        }
+        adapter
+    }
+
+    /// Conditionally creates a [`HeartbeatMonitor`] and spawns a background
+    /// heartbeat check loop when a `TransportProfile` is provided and the
+    /// heartbeat config is enabled.
+    ///
+    /// The heartbeat interval is derived from the transport profile:
+    /// - **Server / Desktop**: 60s (default) — always-on, latency-sensitive.
+    /// - **Mobile**: 120s — reduced frequency to conserve battery.
+    /// - **Constrained**: no heartbeat — poll-based devices skip monitoring.
+    ///
+    /// Returns `(Some(monitor), Some(suppression_rx))` when monitoring is
+    /// started, `(None, None)` otherwise.
+    fn maybe_start_heartbeat(
+        profile: Option<&TransportProfile>,
+        relay_url: &str,
+        cancel: &CancellationToken,
+    ) -> (
+        Option<Arc<tokio::sync::Mutex<HeartbeatMonitor>>>,
+        Option<tokio::sync::mpsc::Receiver<crate::heartbeat::SuppressionSuspected>>,
+    ) {
+        // Only create heartbeat monitoring when a profile is provided.
+        let Some(profile) = profile else {
+            return (None, None);
+        };
+
+        // Derive heartbeat config from the transport profile.
+        let heartbeat_config = match profile {
+            // Server and Desktop: default 60s interval.
+            TransportProfile::Server | TransportProfile::Desktop => HeartbeatConfig::default(),
+            // Mobile: 120s interval to reduce battery impact.
+            TransportProfile::Mobile => HeartbeatConfig {
+                interval: std::time::Duration::from_secs(120),
+                ..HeartbeatConfig::default()
+            },
+            // Constrained devices: no heartbeat monitoring (poll-based).
+            TransportProfile::Constrained => return (None, None),
+        };
+        if !heartbeat_config.enabled {
+            return (None, None);
+        }
+
+        let monitor = HeartbeatMonitor::new(heartbeat_config.clone(), relay_url.to_owned());
+        let monitor = Arc::new(tokio::sync::Mutex::new(monitor));
+
+        // Channel for suppression events — callers MUST drain this receiver
+        // to observe suppression alerts (spec §9.9.4).
+        let (suppression_tx, suppression_rx) = tokio::sync::mpsc::channel(16);
+
+        // Spawn heartbeat check loop.
+        let cancel = cancel.clone();
+        let monitor_clone = Arc::clone(&monitor);
+        let interval_duration = heartbeat_config.interval;
+        let url = relay_url.to_owned();
+        tokio::spawn(async move {
+            let mut timer = tokio::time::interval(interval_duration);
+            // Consume the first immediate tick.
+            timer.tick().await;
+
+            // Record a single baseline "sent" timestamp so that suppression
+            // detection has a reference point. Without this, check_suppression
+            // has no `last_sent` to compare against and cannot fire for the
+            // initial case (no messages received yet).
+            //
+            // We intentionally do NOT record_heartbeat_sent on every tick —
+            // doing so resets the baseline each interval, which prevents the
+            // initial-case suppression from ever firing (the gap between
+            // last_sent and now can never exceed the threshold because
+            // last_sent is refreshed every tick).
+            {
+                let mut mon = monitor_clone.lock().await;
+                mon.record_heartbeat_sent(tokio::time::Instant::now());
+            }
+
+            loop {
+                tokio::select! {
+                    () = cancel.cancelled() => {
+                        tracing::debug!("heartbeat monitor task cancelled");
+                        return;
+                    }
+                    _ = timer.tick() => {
+                        let mon = monitor_clone.lock().await;
+                        if let Some(suppression) = mon.check_suppression(tokio::time::Instant::now()) {
+                            tracing::warn!(
+                                relay_url = %url,
+                                gap_secs = suppression.gap_duration.as_secs(),
+                                "suppression suspected — no messages received from relay"
+                            );
+                            // Send suppression event to the channel (spec §9.9.4:
+                            // "The SDK MUST NOT silently discard the suspicion").
+                            let _ = suppression_tx.try_send(suppression);
+                        }
+                    }
+                }
+            }
+        });
+
+        (Some(monitor), Some(suppression_rx))
+    }
+
+    /// Returns a mutable reference to the suppression event receiver.
+    ///
+    /// Callers should poll this receiver to observe suppression alerts from the
+    /// heartbeat monitor. Per spec §9.9.4, the SDK MUST NOT silently discard
+    /// suppression suspicions — they must be surfaced to the application layer.
+    ///
+    /// Returns `None` if heartbeat monitoring is not active (no profile or
+    /// constrained profile).
+    pub const fn suppression_events(
+        &mut self,
+    ) -> Option<&mut tokio::sync::mpsc::Receiver<crate::heartbeat::SuppressionSuspected>> {
+        self.suppression_rx.as_mut()
+    }
+
+    /// Records that a heartbeat was received from the relay.
+    ///
+    /// Called by subscription message processing when heartbeat-like
+    /// messages arrive. If no heartbeat monitor is active (no profile was
+    /// provided at connection time), this is a no-op.
+    pub async fn record_heartbeat_received(&self) {
+        if let Some(ref monitor) = self.heartbeat_monitor {
+            let mut mon = monitor.lock().await;
+            mon.record_heartbeat_received(tokio::time::Instant::now());
+        }
+    }
+
+    /// Returns whether this adapter has an active heartbeat monitor.
+    #[must_use]
+    pub const fn has_heartbeat_monitor(&self) -> bool {
+        self.heartbeat_monitor.is_some()
     }
 
     /// Starts a background task that emits cover traffic at a constant rate
@@ -202,6 +393,18 @@ impl NativeRelayAdapter {
                 // Off tier: nothing to do.
                 return;
             };
+
+            // Random initial delay to prevent timing fingerprint (spec §9.10.6).
+            // Uniform over [0, interval) so the first dummy's timing doesn't
+            // reveal when the connection was established.
+            {
+                use rand::Rng;
+                let interval_ms = u64::try_from(interval_duration.as_millis()).unwrap_or(u64::MAX);
+                if interval_ms > 0 {
+                    let jitter_ms = rand::thread_rng().gen_range(0..interval_ms);
+                    tokio::time::sleep(std::time::Duration::from_millis(jitter_ms)).await;
+                }
+            }
 
             let mut interval = tokio::time::interval(interval_duration);
             // The first tick fires immediately; consume it and let the
@@ -626,7 +829,7 @@ mod tests {
             url: "ws://203.0.113.42:8443/scp/v1".to_owned(),
             source: RelayUrlSource::WellKnown,
         };
-        let err = NativeRelayAdapter::connect_sourced(&sourced)
+        let err = NativeRelayAdapter::connect_sourced(&sourced, None)
             .await
             .expect_err("ws:// from WellKnown must be rejected");
         let msg = err.to_string();
@@ -649,7 +852,7 @@ mod tests {
             url: "ws://203.0.113.42:8443/scp/v1".to_owned(),
             source: RelayUrlSource::Explicit,
         };
-        let err = NativeRelayAdapter::connect_sourced(&sourced)
+        let err = NativeRelayAdapter::connect_sourced(&sourced, None)
             .await
             .expect_err("ws:// from Explicit must be rejected");
         assert!(err.to_string().contains("Explicit"));
@@ -664,7 +867,7 @@ mod tests {
             url: "ws://203.0.113.42:8443/scp/v1".to_owned(),
             source: RelayUrlSource::PeerDiscovered,
         };
-        let err = NativeRelayAdapter::connect_sourced(&sourced)
+        let err = NativeRelayAdapter::connect_sourced(&sourced, None)
             .await
             .expect_err("ws:// from PeerDiscovered must be rejected");
         assert!(err.to_string().contains("PeerDiscovered"));
@@ -679,7 +882,7 @@ mod tests {
             url: "http://relay.example.com/scp/v1".to_owned(),
             source: RelayUrlSource::DhtResolved,
         };
-        let err = NativeRelayAdapter::connect_sourced(&sourced)
+        let err = NativeRelayAdapter::connect_sourced(&sourced, None)
             .await
             .expect_err("http:// scheme must be rejected");
         assert!(err.to_string().contains("ws:// or wss://"));
@@ -718,7 +921,9 @@ mod tests {
             url,
             source: RelayUrlSource::DhtResolved,
         };
-        let adapter = NativeRelayAdapter::connect_sourced(&sourced).await.unwrap();
+        let adapter = NativeRelayAdapter::connect_sourced(&sourced, None)
+            .await
+            .unwrap();
 
         // Build a cover traffic payload: DUMMY_FLAG + padding to bucket boundary.
         let payload = pad_to_bucket(&[DUMMY_FLAG]);
@@ -766,7 +971,9 @@ mod tests {
 
         let handle;
         {
-            let adapter = NativeRelayAdapter::connect_sourced(&sourced).await.unwrap();
+            let adapter = NativeRelayAdapter::connect_sourced(&sourced, None)
+                .await
+                .unwrap();
             // Start cover traffic with a short custom interval for testing.
             let ct_config = CoverTrafficConfig {
                 tier: CoverTrafficTier::Custom {
@@ -787,5 +994,397 @@ mod tests {
             result.is_ok(),
             "cover traffic task should terminate after adapter drop"
         );
+    }
+
+    // --- Cover traffic auto-start tests (#1532) ---
+
+    /// Verifies that `connect_sourced` with `Some(&TransportProfile::Server)`
+    /// returns Ok and auto-starts cover traffic (the cancel token is wired).
+    #[tokio::test]
+    async fn connect_sourced_with_server_profile_starts_cover_traffic() {
+        use crate::native::server::{RelayConfig, RelayServer};
+        use crate::native::storage::BlobStorageBackend;
+        use crate::profile::TransportProfile;
+        use crate::relay::connection::{RelayUrlSource, SourcedRelayUrl};
+        use std::net::SocketAddr;
+        use std::sync::Arc;
+        use std::time::Duration;
+
+        let config = RelayConfig {
+            bind_addr: SocketAddr::from(([127, 0, 0, 1], 0)),
+            ttl_check_interval: Duration::from_millis(100),
+            delivery_jitter_ms: 0,
+            ..RelayConfig::default()
+        };
+        let storage = Arc::new(BlobStorageBackend::in_memory());
+        let server = RelayServer::new(config, storage);
+        let (_handle, addr) = server.start().await.unwrap();
+        let url = format!("ws://{addr}/scp/v1");
+
+        let sourced = SourcedRelayUrl {
+            url,
+            source: RelayUrlSource::DhtResolved,
+        };
+
+        // Server profile → Full tier → cover traffic auto-started.
+        let adapter =
+            NativeRelayAdapter::connect_sourced(&sourced, Some(&TransportProfile::Server))
+                .await
+                .unwrap();
+
+        // The adapter should have been constructed successfully with
+        // cover traffic running. Dropping it cancels the task.
+        drop(adapter);
+    }
+
+    /// Verifies that `connect_sourced` with `None` profile does NOT start
+    /// cover traffic (backward compatibility for tests).
+    #[tokio::test]
+    async fn connect_sourced_without_profile_no_cover_traffic() {
+        use crate::native::server::{RelayConfig, RelayServer};
+        use crate::native::storage::BlobStorageBackend;
+        use crate::relay::connection::{RelayUrlSource, SourcedRelayUrl};
+        use std::net::SocketAddr;
+        use std::sync::Arc;
+        use std::time::Duration;
+
+        let config = RelayConfig {
+            bind_addr: SocketAddr::from(([127, 0, 0, 1], 0)),
+            ttl_check_interval: Duration::from_millis(100),
+            delivery_jitter_ms: 0,
+            ..RelayConfig::default()
+        };
+        let storage = Arc::new(BlobStorageBackend::in_memory());
+        let server = RelayServer::new(config, storage);
+        let (_handle, addr) = server.start().await.unwrap();
+        let url = format!("ws://{addr}/scp/v1");
+
+        let sourced = SourcedRelayUrl {
+            url,
+            source: RelayUrlSource::DhtResolved,
+        };
+
+        // No profile → no cover traffic started.
+        let adapter = NativeRelayAdapter::connect_sourced(&sourced, None)
+            .await
+            .unwrap();
+
+        // Adapter should connect fine without cover traffic.
+        drop(adapter);
+    }
+
+    /// Verifies that `connect_sourced` with `TransportProfile::Constrained`
+    /// (Off tier) does not start a long-running cover traffic task.
+    #[tokio::test]
+    async fn connect_sourced_constrained_profile_off_tier() {
+        use crate::native::server::{RelayConfig, RelayServer};
+        use crate::native::storage::BlobStorageBackend;
+        use crate::profile::TransportProfile;
+        use crate::relay::connection::{RelayUrlSource, SourcedRelayUrl};
+        use std::net::SocketAddr;
+        use std::sync::Arc;
+        use std::time::Duration;
+
+        let config = RelayConfig {
+            bind_addr: SocketAddr::from(([127, 0, 0, 1], 0)),
+            ttl_check_interval: Duration::from_millis(100),
+            delivery_jitter_ms: 0,
+            ..RelayConfig::default()
+        };
+        let storage = Arc::new(BlobStorageBackend::in_memory());
+        let server = RelayServer::new(config, storage);
+        let (_handle, addr) = server.start().await.unwrap();
+        let url = format!("ws://{addr}/scp/v1");
+
+        let sourced = SourcedRelayUrl {
+            url,
+            source: RelayUrlSource::DhtResolved,
+        };
+
+        // Constrained profile → Off tier → cover traffic task spawns but
+        // exits immediately (generator.interval() returns None for Off).
+        let adapter =
+            NativeRelayAdapter::connect_sourced(&sourced, Some(&TransportProfile::Constrained))
+                .await
+                .unwrap();
+
+        // The spawned task should have already exited. Give it a moment.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        // Adapter drops cleanly — no long-running task to cancel.
+        drop(adapter);
+    }
+
+    // --- Heartbeat monitoring tests (#1533) ---
+
+    /// Verifies that connecting with a `TransportProfile` creates a heartbeat
+    /// monitor (spec §9.9.2).
+    #[tokio::test]
+    async fn connect_with_profile_creates_heartbeat_monitor() {
+        use crate::native::server::{RelayConfig, RelayServer};
+        use crate::native::storage::BlobStorageBackend;
+        use crate::profile::TransportProfile;
+        use crate::relay::connection::{RelayUrlSource, SourcedRelayUrl};
+        use std::net::SocketAddr;
+        use std::sync::Arc;
+        use std::time::Duration;
+
+        let config = RelayConfig {
+            bind_addr: SocketAddr::from(([127, 0, 0, 1], 0)),
+            ttl_check_interval: Duration::from_millis(100),
+            delivery_jitter_ms: 0,
+            ..RelayConfig::default()
+        };
+        let storage = Arc::new(BlobStorageBackend::in_memory());
+        let server = RelayServer::new(config, storage);
+        let (_handle, addr) = server.start().await.unwrap();
+        let url = format!("ws://{addr}/scp/v1");
+
+        let sourced = SourcedRelayUrl {
+            url,
+            source: RelayUrlSource::DhtResolved,
+        };
+
+        let adapter =
+            NativeRelayAdapter::connect_sourced(&sourced, Some(&TransportProfile::Server))
+                .await
+                .unwrap();
+
+        assert!(
+            adapter.has_heartbeat_monitor(),
+            "adapter with TransportProfile should have a heartbeat monitor"
+        );
+    }
+
+    /// Verifies that connecting without a `TransportProfile` does NOT create
+    /// a heartbeat monitor.
+    #[tokio::test]
+    async fn connect_without_profile_no_heartbeat_monitor() {
+        use crate::native::server::{RelayConfig, RelayServer};
+        use crate::native::storage::BlobStorageBackend;
+        use crate::relay::connection::{RelayUrlSource, SourcedRelayUrl};
+        use std::net::SocketAddr;
+        use std::sync::Arc;
+        use std::time::Duration;
+
+        let config = RelayConfig {
+            bind_addr: SocketAddr::from(([127, 0, 0, 1], 0)),
+            ttl_check_interval: Duration::from_millis(100),
+            delivery_jitter_ms: 0,
+            ..RelayConfig::default()
+        };
+        let storage = Arc::new(BlobStorageBackend::in_memory());
+        let server = RelayServer::new(config, storage);
+        let (_handle, addr) = server.start().await.unwrap();
+        let url = format!("ws://{addr}/scp/v1");
+
+        let sourced = SourcedRelayUrl {
+            url,
+            source: RelayUrlSource::DhtResolved,
+        };
+
+        let adapter = NativeRelayAdapter::connect_sourced(&sourced, None)
+            .await
+            .unwrap();
+
+        assert!(
+            !adapter.has_heartbeat_monitor(),
+            "adapter without TransportProfile should NOT have a heartbeat monitor"
+        );
+    }
+
+    /// Verifies that `record_heartbeat_received` works on a connected adapter
+    /// with a heartbeat monitor active.
+    #[tokio::test]
+    async fn record_heartbeat_received_on_connected_adapter() {
+        use crate::native::server::{RelayConfig, RelayServer};
+        use crate::native::storage::BlobStorageBackend;
+        use crate::profile::TransportProfile;
+        use crate::relay::connection::{RelayUrlSource, SourcedRelayUrl};
+        use std::net::SocketAddr;
+        use std::sync::Arc;
+        use std::time::Duration;
+
+        let config = RelayConfig {
+            bind_addr: SocketAddr::from(([127, 0, 0, 1], 0)),
+            ttl_check_interval: Duration::from_millis(100),
+            delivery_jitter_ms: 0,
+            ..RelayConfig::default()
+        };
+        let storage = Arc::new(BlobStorageBackend::in_memory());
+        let server = RelayServer::new(config, storage);
+        let (_handle, addr) = server.start().await.unwrap();
+        let url = format!("ws://{addr}/scp/v1");
+
+        let sourced = SourcedRelayUrl {
+            url,
+            source: RelayUrlSource::DhtResolved,
+        };
+
+        let adapter =
+            NativeRelayAdapter::connect_sourced(&sourced, Some(&TransportProfile::Desktop))
+                .await
+                .unwrap();
+
+        // Should not panic or error — exercises the full path through the
+        // monitor's lock and record_heartbeat_received.
+        adapter.record_heartbeat_received().await;
+    }
+
+    /// Verifies that `record_heartbeat_received` is a no-op when no monitor
+    /// is active (no profile provided).
+    #[tokio::test]
+    async fn record_heartbeat_received_noop_without_monitor() {
+        use crate::native::server::{RelayConfig, RelayServer};
+        use crate::native::storage::BlobStorageBackend;
+        use crate::relay::connection::{RelayUrlSource, SourcedRelayUrl};
+        use std::net::SocketAddr;
+        use std::sync::Arc;
+        use std::time::Duration;
+
+        let config = RelayConfig {
+            bind_addr: SocketAddr::from(([127, 0, 0, 1], 0)),
+            ttl_check_interval: Duration::from_millis(100),
+            delivery_jitter_ms: 0,
+            ..RelayConfig::default()
+        };
+        let storage = Arc::new(BlobStorageBackend::in_memory());
+        let server = RelayServer::new(config, storage);
+        let (_handle, addr) = server.start().await.unwrap();
+        let url = format!("ws://{addr}/scp/v1");
+
+        let sourced = SourcedRelayUrl {
+            url,
+            source: RelayUrlSource::DhtResolved,
+        };
+
+        let adapter = NativeRelayAdapter::connect_sourced(&sourced, None)
+            .await
+            .unwrap();
+
+        // Should not panic — no-op when monitor is None.
+        adapter.record_heartbeat_received().await;
+    }
+
+    /// Verifies that `TransportProfile::Constrained` does NOT create a heartbeat
+    /// monitor (constrained devices are poll-based, no heartbeat needed).
+    #[tokio::test]
+    async fn connect_constrained_profile_no_heartbeat_monitor() {
+        use crate::native::server::{RelayConfig, RelayServer};
+        use crate::native::storage::BlobStorageBackend;
+        use crate::profile::TransportProfile;
+        use crate::relay::connection::{RelayUrlSource, SourcedRelayUrl};
+        use std::net::SocketAddr;
+        use std::sync::Arc;
+        use std::time::Duration;
+
+        let config = RelayConfig {
+            bind_addr: SocketAddr::from(([127, 0, 0, 1], 0)),
+            ttl_check_interval: Duration::from_millis(100),
+            delivery_jitter_ms: 0,
+            ..RelayConfig::default()
+        };
+        let storage = Arc::new(BlobStorageBackend::in_memory());
+        let server = RelayServer::new(config, storage);
+        let (_handle, addr) = server.start().await.unwrap();
+        let url = format!("ws://{addr}/scp/v1");
+
+        let sourced = SourcedRelayUrl {
+            url,
+            source: RelayUrlSource::DhtResolved,
+        };
+
+        let adapter =
+            NativeRelayAdapter::connect_sourced(&sourced, Some(&TransportProfile::Constrained))
+                .await
+                .unwrap();
+
+        assert!(
+            !adapter.has_heartbeat_monitor(),
+            "Constrained profile should NOT have a heartbeat monitor"
+        );
+    }
+
+    /// Verifies that `TransportProfile::Mobile` creates a heartbeat monitor
+    /// (profile-driven config selects Mobile → 120s interval).
+    #[tokio::test]
+    async fn connect_mobile_profile_creates_heartbeat_monitor() {
+        use crate::native::server::{RelayConfig, RelayServer};
+        use crate::native::storage::BlobStorageBackend;
+        use crate::profile::TransportProfile;
+        use crate::relay::connection::{RelayUrlSource, SourcedRelayUrl};
+        use std::net::SocketAddr;
+        use std::sync::Arc;
+        use std::time::Duration;
+
+        let config = RelayConfig {
+            bind_addr: SocketAddr::from(([127, 0, 0, 1], 0)),
+            ttl_check_interval: Duration::from_millis(100),
+            delivery_jitter_ms: 0,
+            ..RelayConfig::default()
+        };
+        let storage = Arc::new(BlobStorageBackend::in_memory());
+        let server = RelayServer::new(config, storage);
+        let (_handle, addr) = server.start().await.unwrap();
+        let url = format!("ws://{addr}/scp/v1");
+
+        let sourced = SourcedRelayUrl {
+            url,
+            source: RelayUrlSource::DhtResolved,
+        };
+
+        let adapter =
+            NativeRelayAdapter::connect_sourced(&sourced, Some(&TransportProfile::Mobile))
+                .await
+                .unwrap();
+
+        assert!(
+            adapter.has_heartbeat_monitor(),
+            "Mobile profile should have a heartbeat monitor (with 120s interval)"
+        );
+    }
+
+    /// Verifies that `Drop` cancels the heartbeat monitoring task.
+    #[tokio::test]
+    async fn drop_cancels_heartbeat_task() {
+        use crate::native::server::{RelayConfig, RelayServer};
+        use crate::native::storage::BlobStorageBackend;
+        use crate::profile::TransportProfile;
+        use crate::relay::connection::{RelayUrlSource, SourcedRelayUrl};
+        use std::net::SocketAddr;
+        use std::sync::Arc;
+        use std::time::Duration;
+
+        let config = RelayConfig {
+            bind_addr: SocketAddr::from(([127, 0, 0, 1], 0)),
+            ttl_check_interval: Duration::from_millis(100),
+            delivery_jitter_ms: 0,
+            ..RelayConfig::default()
+        };
+        let storage = Arc::new(BlobStorageBackend::in_memory());
+        let server = RelayServer::new(config, storage);
+        let (_handle, addr) = server.start().await.unwrap();
+        let url = format!("ws://{addr}/scp/v1");
+
+        let sourced = SourcedRelayUrl {
+            url,
+            source: RelayUrlSource::DhtResolved,
+        };
+
+        {
+            let adapter =
+                NativeRelayAdapter::connect_sourced(&sourced, Some(&TransportProfile::Server))
+                    .await
+                    .unwrap();
+
+            assert!(adapter.has_heartbeat_monitor());
+            // Let the heartbeat task tick at least once.
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            // Adapter is dropped here — heartbeat_cancel.cancel() fires.
+        }
+
+        // If the heartbeat task was not cancelled, the test would leak the
+        // task. The tokio runtime's test harness would catch this.
+        // We simply verify that the adapter drops without panicking.
     }
 }

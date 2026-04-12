@@ -6,6 +6,10 @@ use super::{
     instrument,
 };
 
+/// Maximum number of checkpoints retained per context. Older checkpoints
+/// are drained when this limit is exceeded to prevent unbounded growth.
+const MAX_RETAINED_CHECKPOINTS: usize = 100;
+
 #[allow(clippy::significant_drop_tightening)]
 impl ContextManager {
     /// Registers a DID as controlled by the local node/SDK.
@@ -597,5 +601,400 @@ impl ContextManager {
             .await
             .get(context_id)
             .and_then(|ctx| ctx.commit_fault.clone())
+    }
+
+    // -------------------------------------------------------------------------
+    // Checkpoint operations (§9.9.3, ADR-011 AC-8)
+    // -------------------------------------------------------------------------
+
+    /// Creates a consistency checkpoint if one is due based on event count
+    /// or time interval thresholds.
+    ///
+    /// A checkpoint is due when either:
+    /// - 50 events have been appended since the last checkpoint, or
+    /// - 10 minutes have elapsed since the last checkpoint.
+    ///
+    /// The checkpoint captures the Merkle root, event count, and MLS epoch at
+    /// the current point in time, then signs a canonical hash over those fields
+    /// using Ed25519. The signature commits to a domain-separated canonical
+    /// hash (see [`scp_event_log::checkpoint::compute_checkpoint_canonical_hash`]).
+    ///
+    /// Returns `Ok(Some(checkpoint))` if one was created, `Ok(None)` if not yet due.
+    ///
+    /// Called from `finalize_send` and `deliver_message_and_drain_buffered` after
+    /// each event log append.
+    pub(super) fn create_checkpoint_if_due(
+        &self,
+        context_id: &str,
+        ctx: &mut super::PerContextState,
+        sender_did: &DID,
+        signing_key: &ed25519_dalek::SigningKey,
+    ) -> Option<scp_event_log::checkpoint::ConsistencyCheckpoint> {
+        let now = self.clock.now_secs();
+        let events_due = ctx.checkpoint_events_since >= 50;
+        // Time-based checkpoints require at least one event — creating a
+        // checkpoint for zero events is wasteful and indistinguishable from
+        // the previous checkpoint.
+        let time_due = ctx.checkpoint_events_since > 0
+            && now.saturating_sub(ctx.checkpoint_last_time_secs) >= 600;
+
+        if !events_due && !time_due {
+            return None;
+        }
+
+        let cp = Self::build_checkpoint(
+            context_id,
+            ctx,
+            sender_did,
+            signing_key,
+            now,
+            &*self.event_log,
+        );
+
+        ctx.checkpoint_events_since = 0;
+        ctx.checkpoint_last_time_secs = now;
+        ctx.checkpoints.push(cp.clone());
+
+        if ctx.checkpoints.len() > MAX_RETAINED_CHECKPOINTS {
+            ctx.checkpoints
+                .drain(..ctx.checkpoints.len() - MAX_RETAINED_CHECKPOINTS);
+        }
+
+        tracing::debug!(
+            context_id,
+            event_count = cp.event_count,
+            "consistency checkpoint created (§9.9.3)"
+        );
+
+        Some(cp)
+    }
+
+    /// Unconditionally creates a consistency checkpoint regardless of whether
+    /// the event/time thresholds have been reached.
+    ///
+    /// Used by `close_context` to ensure a final checkpoint is always
+    /// generated before context archival (§9.9.3).
+    pub(super) fn force_create_checkpoint(
+        &self,
+        context_id: &str,
+        ctx: &mut super::PerContextState,
+        sender_did: &DID,
+        signing_key: &ed25519_dalek::SigningKey,
+    ) -> scp_event_log::checkpoint::ConsistencyCheckpoint {
+        let now = self.clock.now_secs();
+        let cp = Self::build_checkpoint(
+            context_id,
+            ctx,
+            sender_did,
+            signing_key,
+            now,
+            &*self.event_log,
+        );
+
+        ctx.checkpoint_events_since = 0;
+        ctx.checkpoint_last_time_secs = now;
+        ctx.checkpoints.push(cp.clone());
+
+        if ctx.checkpoints.len() > MAX_RETAINED_CHECKPOINTS {
+            ctx.checkpoints
+                .drain(..ctx.checkpoints.len() - MAX_RETAINED_CHECKPOINTS);
+        }
+
+        tracing::info!(
+            context_id,
+            event_count = cp.event_count,
+            "forced final checkpoint on context close (§9.9.3)"
+        );
+
+        cp
+    }
+
+    /// Builds a signed checkpoint from the current event log and context state.
+    fn build_checkpoint(
+        context_id: &str,
+        ctx: &super::PerContextState,
+        sender_did: &DID,
+        signing_key: &ed25519_dalek::SigningKey,
+        now: u64,
+        event_log: &dyn super::ContextEventLogProvider,
+    ) -> scp_event_log::checkpoint::ConsistencyCheckpoint {
+        let context_id_bytes = super::context_id_to_bytes(context_id);
+        let merkle_root = event_log
+            .event_log_merkle_root(&context_id_bytes)
+            .unwrap_or([0u8; 32]);
+        let event_count = event_log
+            .event_log_entries(&context_id_bytes)
+            .ok()
+            .flatten()
+            .map_or(0, |entries| entries.len() as u64);
+
+        // Encrypted contexts (no broadcast_context) use MLS epochs; broadcast
+        // contexts do not use MLS and have no meaningful epoch.
+        let epoch = if ctx.broadcast_context.is_none() {
+            Some(ctx.epoch.mls_epoch)
+        } else {
+            None
+        };
+
+        let canonical_hash = scp_event_log::checkpoint::compute_checkpoint_canonical_hash(
+            context_id,
+            sender_did.as_ref(),
+            event_count,
+            &merkle_root,
+            epoch,
+            now,
+        );
+
+        let signature = ed25519_dalek::Signer::sign(signing_key, &canonical_hash);
+
+        scp_event_log::checkpoint::ConsistencyCheckpoint {
+            context_id: context_id.to_owned(),
+            sender_did: sender_did.clone(),
+            event_count,
+            merkle_root,
+            epoch,
+            timestamp: now,
+            signature: signature.to_bytes().to_vec(),
+        }
+    }
+
+    /// Compares a remote checkpoint against local event log state for
+    /// equivocation detection (§9.9.3, ADR-011 AC-8).
+    ///
+    /// Before comparing Merkle roots, verifies:
+    /// 1. The checkpoint sender is a member of this context.
+    /// 2. The checkpoint's Ed25519 signature is valid (via key resolver).
+    ///
+    /// When the comparison returns `Divergent`, emits an
+    /// [`ContextEvent::EquivocationDetected`] event on the receive buffer
+    /// and appends a durable event log entry.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ContextError::ContextNotRegistered`] if the context is
+    /// not registered.
+    /// Returns [`ContextError::MemberNotFound`] if the checkpoint sender
+    /// is not a member of the context.
+    /// Returns [`ContextError::CryptoFailed`] if the public key cannot be
+    /// resolved or the Ed25519 signature verification fails.
+    #[instrument(skip_all, fields(context_id))]
+    pub async fn compare_remote_checkpoint(
+        &self,
+        context_id: &str,
+        remote: &scp_event_log::checkpoint::ConsistencyCheckpoint,
+    ) -> Result<scp_event_log::checkpoint::CheckpointComparison, ContextError> {
+        // Verify the sender is a member of this context.
+        {
+            let contexts = self.contexts.lock().await;
+            let ctx = contexts
+                .get(context_id)
+                .ok_or_else(|| ContextError::ContextNotRegistered(context_id.to_owned()))?;
+            if !ctx.membership.contains(remote.sender_did.as_ref()) {
+                return Err(ContextError::MemberNotFound(format!(
+                    "checkpoint sender {} is not a member of context {context_id}",
+                    remote.sender_did
+                )));
+            }
+        }
+
+        // Verify checkpoint Ed25519 signature.
+        let sender_pk = (self.key_resolver)(&remote.sender_did).ok_or_else(|| {
+            ContextError::CryptoFailed(format!(
+                "cannot resolve public key for checkpoint sender {}",
+                remote.sender_did
+            ))
+        })?;
+        scp_event_log::checkpoint::verify_checkpoint_signature(remote, &sender_pk).map_err(
+            |reason| {
+                ContextError::CryptoFailed(format!(
+                    "checkpoint signature verification failed: {reason}"
+                ))
+            },
+        )?;
+
+        let context_id_bytes = super::context_id_to_bytes(context_id);
+        let local_root = self
+            .event_log
+            .event_log_merkle_root(&context_id_bytes)
+            .unwrap_or([0u8; 32]);
+        let local_count = self
+            .event_log
+            .event_log_entries(&context_id_bytes)
+            .ok()
+            .flatten()
+            .map_or(0, |e| e.len() as u64);
+
+        // Note: `prove_consistency` is NOT used here because consistency
+        // proofs prove that a smaller version of the SAME log is a prefix
+        // of a larger version. Cross-member equivocation detection compares
+        // two DIFFERENT logs from different members — Merkle root comparison
+        // is the correct mechanism (identical roots ⇒ identical event
+        // sequences, per second-preimage resistance of SHA-256).
+        let comparison = match local_count.cmp(&remote.event_count) {
+            std::cmp::Ordering::Equal => {
+                if local_root == remote.merkle_root {
+                    scp_event_log::checkpoint::CheckpointComparison::Consistent
+                } else {
+                    scp_event_log::checkpoint::CheckpointComparison::Divergent {
+                        first_divergent_event: None,
+                    }
+                }
+            }
+            std::cmp::Ordering::Less => scp_event_log::checkpoint::CheckpointComparison::Behind {
+                missing_events: remote.event_count - local_count,
+            },
+            std::cmp::Ordering::Greater => scp_event_log::checkpoint::CheckpointComparison::Ahead {
+                extra_events: local_count - remote.event_count,
+            },
+        };
+
+        // Emit EquivocationDetected event when divergent.
+        if matches!(
+            comparison,
+            scp_event_log::checkpoint::CheckpointComparison::Divergent { .. }
+        ) {
+            tracing::warn!(
+                context_id,
+                remote_sender = %remote.sender_did,
+                event_count = remote.event_count,
+                "relay equivocation detected — divergent Merkle roots at same event count (§9.9.3)"
+            );
+            if let Err(e) = self.event_log.append_context_event(
+                &context_id_bytes,
+                "EquivocationDetected",
+                remote.sender_did.as_ref(),
+            ) {
+                tracing::warn!(
+                    context_id,
+                    "failed to append EquivocationDetected to event log: {e}"
+                );
+            }
+            let mut contexts = self.contexts.lock().await;
+            if let Some(ctx) = contexts.get_mut(context_id) {
+                ctx.checkpoint_events_since += 1;
+                ctx.receive_buffer.push(ContextEvent::EquivocationDetected {
+                    context_id: context_id.to_owned(),
+                    remote_sender_did: remote.sender_did.clone(),
+                    event_count: remote.event_count,
+                });
+            }
+        }
+
+        Ok(comparison)
+    }
+
+    // -------------------------------------------------------------------
+    // Merkle tree synchronization
+    // -------------------------------------------------------------------
+
+    /// Synchronizes the per-context Merkle tree with the `MerkleEventLogProvider`.
+    ///
+    /// Compares the Merkle tree's event count with the provider's entry count
+    /// and replays any missing entries via `push_leaf_raw`. This is the ONLY
+    /// path that populates the Merkle tree — the provider is the single source
+    /// of truth with one consistent hash format (`SCP-EXPORT-ENTRY:` domain
+    /// separator). This eliminates the dual-path inconsistency that existed
+    /// when `append_to_merkle_tree` used a different domain separator
+    /// (`SCP-EVENT-V1:`), producing incorrect proofs.
+    ///
+    /// Called by [`prove_event_inclusion`] and [`prove_event_consistency`]
+    /// before generating proofs.
+    fn sync_merkle_tree(&self, context_id: &str, ctx: &mut super::PerContextState) {
+        let context_id_bytes = super::context_id_to_bytes(context_id);
+        // event_count returns u64; on 32-bit targets the log size is bounded
+        // by available memory well below u32::MAX, so saturating is safe.
+        let tree_count = usize::try_from(scp_event_log::tree::event_count(&ctx.merkle_tree))
+            .unwrap_or(usize::MAX);
+
+        if let Ok(Some(entries)) = self.event_log.event_log_entries(&context_id_bytes)
+            && entries.len() > tree_count
+        {
+            // Replay missing entries. Each entry's pre-computed hash is
+            // pushed as a raw leaf — the internal tree structure (RFC 6962
+            // interior nodes) is rebuilt automatically by `push_leaf_raw`.
+            for entry in entries.iter().skip(tree_count) {
+                ctx.merkle_tree.push_leaf_raw(entry.hash);
+            }
+        }
+    }
+
+    // -------------------------------------------------------------------
+    // Merkle proof operations (ADR-011, #1535)
+    // -------------------------------------------------------------------
+
+    /// Returns a Merkle inclusion proof for the event at the given index
+    /// in the per-context RFC 6962 event log.
+    ///
+    /// The proof consists of sibling hashes at each tree level from the leaf
+    /// up to the root. Proof size is O(log n). Verifiable via
+    /// [`verify_event_inclusion`](Self::verify_event_inclusion).
+    ///
+    /// See ADR-011 acceptance criterion 3.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ContextError::ContextNotRegistered`] if the context is unknown.
+    /// Returns [`ContextError::EventLogFailed`] if the leaf index is out of
+    /// bounds or the log is empty.
+    pub async fn prove_event_inclusion(
+        &self,
+        context_id: &str,
+        leaf_index: u64,
+    ) -> Result<scp_event_log::proof::InclusionProof, ContextError> {
+        let mut contexts = self.contexts.lock().await;
+        let ctx = contexts
+            .get_mut(context_id)
+            .ok_or_else(|| ContextError::ContextNotRegistered(context_id.to_owned()))?;
+        self.sync_merkle_tree(context_id, ctx);
+        scp_event_log::proof::prove_inclusion(&ctx.merkle_tree, leaf_index)
+            .map_err(|e| ContextError::EventLogFailed(e.to_string()))
+    }
+
+    /// Returns a Merkle consistency proof between the tree at `old_size` and
+    /// the current tree size, proving that the old tree is a prefix of the
+    /// current tree (CT-style per RFC 6962).
+    ///
+    /// See ADR-011 acceptance criterion 5.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ContextError::ContextNotRegistered`] if the context is unknown.
+    /// Returns [`ContextError::EventLogFailed`] if `old_size` is 0, exceeds
+    /// the current size, or the log is empty.
+    pub async fn prove_event_consistency(
+        &self,
+        context_id: &str,
+        old_size: u64,
+    ) -> Result<scp_event_log::proof::ConsistencyProof, ContextError> {
+        let mut contexts = self.contexts.lock().await;
+        let ctx = contexts
+            .get_mut(context_id)
+            .ok_or_else(|| ContextError::ContextNotRegistered(context_id.to_owned()))?;
+        self.sync_merkle_tree(context_id, ctx);
+        let current_size = scp_event_log::tree::event_count(&ctx.merkle_tree);
+        scp_event_log::proof::prove_consistency(&ctx.merkle_tree, old_size, current_size)
+            .map_err(|e| ContextError::EventLogFailed(e.to_string()))
+    }
+
+    /// Verifies a Merkle inclusion proof. Pure function — no state needed.
+    ///
+    /// Recomputes the root hash from the proof path and compares against the
+    /// stated root using constant-time comparison.
+    ///
+    /// See ADR-011 acceptance criterion 5.
+    #[must_use]
+    pub fn verify_event_inclusion(proof: &scp_event_log::proof::InclusionProof) -> bool {
+        scp_event_log::proof::verify_inclusion(proof)
+    }
+
+    /// Verifies a Merkle consistency proof. Pure function — no state needed.
+    ///
+    /// Reconstructs both the old and new roots from the stored leaf hashes
+    /// and verifies they match the stated roots.
+    ///
+    /// See RFC 6962 Section 2.1.2.
+    #[must_use]
+    pub fn verify_event_consistency(proof: &scp_event_log::proof::ConsistencyProof) -> bool {
+        scp_event_log::proof::verify_consistency(proof)
     }
 }

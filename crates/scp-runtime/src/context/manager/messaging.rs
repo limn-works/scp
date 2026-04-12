@@ -516,6 +516,7 @@ impl ContextManager {
             sender_did,
             sequence,
             payload,
+            signing_key,
         )
         .await
     }
@@ -627,6 +628,7 @@ impl ContextManager {
     ///
     /// Extracted from `send_message` Phase 3 to keep the outer function
     /// within the clippy `too_many_lines` limit.
+    #[allow(clippy::too_many_arguments)]
     async fn finalize_send(
         &self,
         context_id: &str,
@@ -634,6 +636,7 @@ impl ContextManager {
         sender_did: &DID,
         sequence: u64,
         payload: &[u8],
+        signing_key: Option<&ed25519_dalek::SigningKey>,
     ) -> Result<(), ContextError> {
         // M12: Append event log BEFORE consequence evaluation so that
         // event_log_entries_for_consequences sees the current event.
@@ -715,6 +718,13 @@ impl ContextManager {
                     ctx.governance
                         .participation_cache
                         .insert(sender_did.to_string(), record);
+                }
+
+                // Checkpoint tracking (§9.9.3): increment event counter and
+                // create a checkpoint if the event or time threshold is met.
+                ctx.checkpoint_events_since += 1;
+                if let Some(sk) = signing_key {
+                    self.create_checkpoint_if_due(context_id, ctx, sender_did, sk);
                 }
             }
         }
@@ -1161,7 +1171,6 @@ impl ContextManager {
                 "failed to append MessageReceived to event log on receive path: {e}"
             );
         }
-
         // H16: Defense-in-depth velocity tracking and consequence evaluation
         // for the sender on the receive path. This ensures that even if the
         // sender's node doesn't enforce consequences, the receiver still
@@ -1202,6 +1211,12 @@ impl ContextManager {
                 },
             );
         }
+
+        // Checkpoint tracking (§9.9.3): increment event counter on receive.
+        // Checkpoints are only created on the send path (where a signing key
+        // is available), but the counter must reflect all event log appends
+        // including received messages to maintain accurate thresholds.
+        ctx.checkpoint_events_since += 1;
 
         drop(contexts);
 

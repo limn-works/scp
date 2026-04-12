@@ -748,6 +748,20 @@ pub enum ContextEvent {
         /// Total number of send attempts (including the successful one).
         attempts: u32,
     },
+    /// Relay equivocation detected: a remote checkpoint reports the same event
+    /// count but a different Merkle root (§9.9.3, ADR-011 AC-8).
+    ///
+    /// Emitted by [`super::super::ContextManager::compare_remote_checkpoint`]
+    /// when the comparison returns [`scp_event_log::checkpoint::CheckpointComparison::Divergent`].
+    /// The relay is showing different histories to different members.
+    EquivocationDetected {
+        /// The context where equivocation was detected.
+        context_id: String,
+        /// The DID that generated the divergent remote checkpoint.
+        remote_sender_did: DID,
+        /// Event count at which the divergence was detected.
+        event_count: u64,
+    },
     /// An MLS Commit broadcast exceeded `MAX_COMMIT_RETRIES` or `MAX_COMMIT_AGE_SECS`
     /// and the context has been placed in fault-marker fail-close state
     /// (PR #1606 C6).
