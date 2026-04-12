@@ -5,7 +5,7 @@ use super::{
     Clock, CommitFaultMarker, CommitOperation, ConsequenceRule, ContentKeysRotatedResult,
     ContextError, ContextEvent, ContextManager, ContextParams, ContextState, DID,
     ECONOMIC_POLICY_NOTIFICATION_PERIOD_SECS, EXECUTED_PROPOSALS_TTL_SECS, EconomicPolicy,
-    GovernanceAction, GovernanceActionResult, GovernanceContext, GovernanceEvent,
+    GovernanceAction, GovernanceActionResult, GovernanceContext, GovernanceEvent, GovernanceModel,
     GovernanceProposal, GovernanceReconfiguredResult, HashSet, MAX_COMMIT_AGE_SECS,
     MAX_COMMIT_RETRIES, MAX_PENDING_COMMITS, MAX_REGISTERED_TOOLS, MAX_THRESHOLD_SIGNERS,
     MAX_TOOL_INTERFACES, MigrationProposedResult, MigrationState, MlsImpact,
@@ -856,6 +856,12 @@ fn check_proposer_eligibility(
                 "member has a pending ejection — cannot propose governance actions".into(),
             ));
         }
+    }
+
+    // SingleAdmin: skip participation threshold for the admin — they are the
+    // sole authority and participation-based gating doesn't apply (#1530).
+    if matches!(ctx.handle.params().governance, GovernanceModel::SingleAdmin) {
+        return Ok(());
     }
 
     // Refresh participation record from recent events before checking the
