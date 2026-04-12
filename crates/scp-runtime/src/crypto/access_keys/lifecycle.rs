@@ -288,13 +288,13 @@ pub fn handle_block_as_blocker(
 // ContentAccessState transition helpers (§9.17, ADR-038)
 // ---------------------------------------------------------------------------
 
-/// Result of a `RevokeReadAccess` governance action on the content access
-/// key layer.
+/// Result of a `Revoke { access: AccessScope::Read }` governance action on
+/// the content access key layer.
 ///
 /// Contains metadata about what was destroyed so the caller can log and
 /// propagate the revocation.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct RevokeReadAccessResult {
+pub struct RevokeReadResult {
     /// The DID whose read access was revoked.
     pub member_did: String,
     /// The context where the revocation applies.
@@ -305,7 +305,7 @@ pub struct RevokeReadAccessResult {
     pub new_state: ContentAccessState,
 }
 
-/// Executes `RevokeReadAccess` for a member: destroys their access key
+/// Executes `Revoke { access: AccessScope::Read }` for a member: destroys their access key
 /// and transitions their state to [`ContentAccessState::PresenceOnly`].
 ///
 /// **Destruction (§9.17.2 step 3):**
@@ -331,11 +331,11 @@ pub fn revoke_read_access(
     context_id: &str,
     member_did: &str,
     current_state: ContentAccessState,
-) -> Result<RevokeReadAccessResult, ContentAccessState> {
+) -> Result<RevokeReadResult, ContentAccessState> {
     let new_state = current_state.transition_to(ContentAccessState::PresenceOnly)?;
     let access_key_deleted = access_key_store.remove(context_id, member_did).is_some();
 
-    Ok(RevokeReadAccessResult {
+    Ok(RevokeReadResult {
         member_did: member_did.to_owned(),
         context_id: context_id.to_owned(),
         access_key_deleted,
@@ -343,10 +343,10 @@ pub fn revoke_read_access(
     })
 }
 
-/// Result of a `RevokeWriteAccess` governance action on the content access
+/// Result of a `Revoke { access: AccessScope::Write }` governance action on the content access
 /// key layer.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct RevokeWriteAccessResult {
+pub struct RevokeWriteResult {
     /// The DID whose write access was revoked.
     pub member_did: String,
     /// The context where the revocation applies.
@@ -355,7 +355,7 @@ pub struct RevokeWriteAccessResult {
     pub new_state: ContentAccessState,
 }
 
-/// Executes `RevokeWriteAccess` for a member: transitions their state
+/// Executes `Revoke { access: AccessScope::Write }` for a member: transitions their state
 /// to [`ContentAccessState::ReadOnly`].
 ///
 /// **Sender key exclusion:** The caller is responsible for excluding
@@ -378,10 +378,10 @@ pub fn revoke_write_access(
     context_id: &str,
     member_did: &str,
     current_state: ContentAccessState,
-) -> Result<RevokeWriteAccessResult, ContentAccessState> {
+) -> Result<RevokeWriteResult, ContentAccessState> {
     let new_state = current_state.transition_to(ContentAccessState::ReadOnly)?;
 
-    Ok(RevokeWriteAccessResult {
+    Ok(RevokeWriteResult {
         member_did: member_did.to_owned(),
         context_id: context_id.to_owned(),
         new_state,
@@ -596,7 +596,7 @@ mod tests {
 
             // Set up Dave's stores with Alice's sender key.
             let mut sender_store = SenderKeyStore::new();
-            sender_store.set("ctx-1", "did:dht:alice", generate_sender_key());
+            sender_store.set_unchecked("ctx-1", "did:dht:alice", generate_sender_key());
             let mut access_store = AccessKeyStore::new();
 
             let result = handle_block_as_blocked_party(
@@ -662,7 +662,7 @@ mod tests {
                     .await;
 
             let mut sender_store = SenderKeyStore::new();
-            sender_store.set("ctx-1", "did:dht:alice", generate_sender_key());
+            sender_store.set_unchecked("ctx-1", "did:dht:alice", generate_sender_key());
             let mut access_store = AccessKeyStore::new();
             access_store.set(
                 "ctx-1",
@@ -722,7 +722,7 @@ mod tests {
                     .await;
 
             let mut sender_store = SenderKeyStore::new();
-            sender_store.set("ctx-1", "did:dht:alice", generate_sender_key());
+            sender_store.set_unchecked("ctx-1", "did:dht:alice", generate_sender_key());
             let mut access_store = AccessKeyStore::new();
             access_store.set(
                 "ctx-1",
@@ -753,7 +753,7 @@ mod tests {
                     .await;
 
             let mut sender_store = SenderKeyStore::new();
-            sender_store.set("ctx-1", "did:dht:alice", generate_sender_key());
+            sender_store.set_unchecked("ctx-1", "did:dht:alice", generate_sender_key());
             let mut access_store = AccessKeyStore::new();
             access_store.set(
                 "ctx-1",
@@ -786,7 +786,7 @@ mod tests {
                     .await;
 
             let mut sender_store = SenderKeyStore::new();
-            sender_store.set("ctx-1", "did:dht:alice", generate_sender_key());
+            sender_store.set_unchecked("ctx-1", "did:dht:alice", generate_sender_key());
             let mut access_store = AccessKeyStore::new();
             access_store.set(
                 "ctx-1",
@@ -863,9 +863,9 @@ mod tests {
                     .await;
 
             let mut sender_store = SenderKeyStore::new();
-            sender_store.set("ctx-1", "did:dht:alice", generate_sender_key());
+            sender_store.set_unchecked("ctx-1", "did:dht:alice", generate_sender_key());
             // Also have a sender key for another context — should NOT be affected.
-            sender_store.set("ctx-2", "did:dht:alice", generate_sender_key());
+            sender_store.set_unchecked("ctx-2", "did:dht:alice", generate_sender_key());
             let mut access_store = AccessKeyStore::new();
 
             let result = handle_block_as_blocked_party(
@@ -913,13 +913,13 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // RevokeReadAccess / RevokeWriteAccess tests (SCP-CAC-006 AC-14, AC-15)
+    // Revoke { AccessScope::Read } / Revoke { AccessScope::Write } tests (SCP-CAC-006 AC-14, AC-15)
     // -----------------------------------------------------------------------
 
     mod revocation_tests {
         use super::*;
 
-        // AC-14: RevokeReadAccess triggers plaintext + access key destruction
+        // AC-14: Revoke { AccessScope::Read } triggers plaintext + access key destruction
         #[test]
         fn revoke_read_access_deletes_access_key() {
             let mut store = AccessKeyStore::new();
@@ -990,7 +990,7 @@ mod tests {
             assert!(result.is_err());
         }
 
-        // AC-15: RevokeWriteAccess triggers sender key exclusion
+        // AC-15: Revoke { AccessScope::Write } triggers sender key exclusion
         #[test]
         fn revoke_write_access_transitions_to_read_only() {
             let result = revoke_write_access("ctx-1", "did:dht:dave", ContentAccessState::Full);
@@ -1017,7 +1017,7 @@ mod tests {
 
         #[test]
         fn revoke_write_access_does_not_delete_access_key() {
-            // RevokeWriteAccess only changes state — the member retains
+            // Revoke { AccessScope::Write } only changes state — the member retains
             // their access key for reading.
             let mut store = AccessKeyStore::new();
             store.set(

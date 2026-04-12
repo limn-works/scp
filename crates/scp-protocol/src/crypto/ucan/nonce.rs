@@ -179,15 +179,17 @@ impl<C: Clock> NonceTracker<C> {
         self.seen.is_empty()
     }
 
-    /// Validates a nonce and records it if new.
+    /// Read-only probe: validates nonce format, freshness, and replay without
+    /// recording.
     ///
     /// Performs the following checks in order:
     /// 1. **Format** — The nonce must match `{unix_millis}-{32_hex_chars}`.
     /// 2. **Freshness** — The timestamp must be within +/- 5 minutes of now.
-    /// 3. **Uniqueness** — The nonce must not have been seen before.
+    /// 3. **Uniqueness** — The nonce must not be in the seen-set.
     ///
-    /// If all checks pass, the nonce is recorded with `(now_secs, token_expiry)`
-    /// and automatic pruning is triggered if the check/time threshold is reached.
+    /// Does NOT insert the nonce into `seen`. Callers MUST call
+    /// [`record`](NonceTracker::record) after all downstream gates pass to
+    /// durably commit the nonce (H11 split-phase protocol).
     ///
     /// # Errors
     ///
@@ -195,7 +197,7 @@ impl<C: Clock> NonceTracker<C> {
     /// Returns [`UcanError::NonceTooOld`] if the timestamp is too far in the past.
     /// Returns [`UcanError::NonceFuture`] if the timestamp is too far in the future.
     /// Returns [`UcanError::NonceReused`] if the nonce was already recorded.
-    pub fn check_and_record(&mut self, nonce: &str, token_expiry: u64) -> Result<(), UcanError> {
+    pub fn check_replay(&self, nonce: &str, _token_expiry: u64) -> Result<(), UcanError> {
         // 1. Validate nonce format: {unix_millis}-{32_hex_chars}
         let (ts_part, hex_part) = nonce.split_once('-').ok_or_else(|| {
             UcanError::NonceFormatInvalid(format!("missing '-' separator in nonce: {nonce}"))
@@ -228,13 +230,34 @@ impl<C: Clock> NonceTracker<C> {
             return Err(UcanError::NonceReused(nonce.to_owned()));
         }
 
-        // 4. Capacity check: if at capacity, attempt a prune to free space.
+        Ok(())
+    }
+
+    /// Records a nonce after all validation gates pass.
+    ///
+    /// Defensively re-runs [`check_replay`](NonceTracker::check_replay), then
+    /// inserts the nonce into the seen-set. Also enforces capacity limits and
+    /// triggers automatic pruning.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same errors as `check_replay` if the defensive re-check fails.
+    /// Returns [`UcanError::NonceTrackerFull`] if the tracker is at capacity
+    /// and cannot be pruned.
+    pub fn record(&mut self, nonce: &str, token_expiry: u64) -> Result<(), UcanError> {
+        // Defensive re-check before inserting (guards against races and
+        // callers that skipped check_replay).
+        self.check_replay(nonce, token_expiry)?;
+
+        // Capacity check: if at capacity, attempt a prune to free space.
         if self.seen.len() >= self.max_capacity {
             self.prune();
             if self.seen.len() >= self.max_capacity {
                 return Err(UcanError::NonceTrackerFull(self.max_capacity));
             }
         }
+
+        let now_secs = self.clock.now_secs();
 
         // Record the nonce.
         self.seen.insert(nonce.to_owned(), (now_secs, token_expiry));
@@ -248,6 +271,24 @@ impl<C: Clock> NonceTracker<C> {
         }
 
         Ok(())
+    }
+
+    /// Validates a nonce and records it if new.
+    ///
+    /// Convenience method that calls `check_replay` then `record` in one step.
+    /// For callers that need the split-phase protocol (H11), call `check_replay`
+    /// and `record` separately.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`UcanError::NonceFormatInvalid`] if the format is wrong.
+    /// Returns [`UcanError::NonceTooOld`] if the timestamp is too far in the past.
+    /// Returns [`UcanError::NonceFuture`] if the timestamp is too far in the future.
+    /// Returns [`UcanError::NonceReused`] if the nonce was already recorded.
+    /// Returns [`UcanError::NonceTrackerFull`] if the tracker is at capacity.
+    pub fn check_and_record(&mut self, nonce: &str, token_expiry: u64) -> Result<(), UcanError> {
+        self.check_replay(nonce, token_expiry)?;
+        self.record(nonce, token_expiry)
     }
 
     /// Removes expired nonce entries.
@@ -339,6 +380,130 @@ impl<C: Clock> NonceTracker<C> {
     #[must_use]
     pub fn storage_key(&self) -> String {
         format!("nonce_tracker/{}", self.context_id)
+    }
+
+    /// Exports the tracker's current entries as a `HashMap<nonce,
+    /// (first_seen_secs, token_expiry_secs)>` for embedding in a
+    /// `ContextSnapshot`.
+    ///
+    /// Unlike [`to_bytes`], this returns strongly-typed data that can
+    /// be serialized directly as a struct field, avoiding a JSON blob
+    /// round-trip inside the snapshot.
+    #[must_use]
+    pub fn snapshot_entries(&self) -> HashMap<String, (u64, u64)> {
+        self.seen.clone()
+    }
+
+    /// Reconstructs a tracker from a persisted snapshot of entries.
+    ///
+    /// Used by the context-restore path so spending-UCAN nonce state
+    /// survives process restarts (closes the replay window where a
+    /// captured spending UCAN could be replayed after a restart, up to
+    /// the `max_total` budget per spec §19.5).
+    ///
+    /// Any restored entry whose `token_expiry` is already in the past
+    /// beyond the prune grace period is dropped on restore so the
+    /// tracker starts in a normalized state. The restored tracker
+    /// uses the supplied capacity limit (defaulting to
+    /// `DEFAULT_MAX_CAPACITY` via [`from_snapshot`]).
+    #[must_use]
+    pub fn from_snapshot(
+        context_id: String,
+        clock: C,
+        entries: HashMap<String, (u64, u64)>,
+    ) -> Self {
+        Self::from_snapshot_with_capacity(context_id, clock, entries, DEFAULT_MAX_CAPACITY)
+    }
+
+    /// Like [`from_snapshot`] but with an explicit capacity limit.
+    ///
+    /// If the snapshot contains more entries than `max_capacity`, the
+    /// excess is truncated after the post-restore prune pass — this
+    /// protects against a poisoned snapshot attempting to force an
+    /// unbounded `HashMap` allocation.
+    #[must_use]
+    pub fn from_snapshot_with_capacity(
+        context_id: String,
+        clock: C,
+        entries: HashMap<String, (u64, u64)>,
+        max_capacity: usize,
+    ) -> Self {
+        let now = clock.now_secs();
+        let mut tracker = Self {
+            seen: entries,
+            context_id,
+            clock,
+            checks_since_prune: 0,
+            last_prune_time: now,
+            max_capacity,
+        };
+
+        // Drop stale entries so the tracker starts normalized.
+        tracker.prune();
+
+        // Defense-in-depth: if a poisoned snapshot somehow exceeded
+        // capacity after pruning, truncate deterministically to the
+        // capacity bound.
+        //
+        // Keep policy: retain the entries with the latest
+        // `token_expiry` (tie-break by latest `first_seen`, then by
+        // nonce string lexicographic order for full determinism).
+        // This is strictly better than `HashMap::drain().take()`'s
+        // non-deterministic iteration:
+        //   - "latest expiry first" keeps the entries most likely
+        //     to still correspond to unexpired tokens, which is the
+        //     only state that still carries anti-replay value.
+        //   - Full determinism eliminates audit ambiguity: two
+        //     instances restoring the same oversized snapshot
+        //     converge to the same surviving set.
+        //
+        // In normal operation this path is unreachable: a tracker
+        // produced by this codebase never exceeds `max_capacity`
+        // (`check_and_record` rejects inserts at capacity), so the
+        // sort cost is only ever paid on a snapshot that was tampered
+        // or corrupted.
+        if tracker.seen.len() > max_capacity {
+            let mut all: Vec<(String, (u64, u64))> = tracker.seen.drain().collect();
+            all.sort_by(|a, b| {
+                // Primary: descending token_expiry.
+                b.1.1
+                    .cmp(&a.1.1)
+                    // Secondary: descending first_seen.
+                    .then_with(|| b.1.0.cmp(&a.1.0))
+                    // Tertiary: ascending nonce string for total order.
+                    .then_with(|| a.0.cmp(&b.0))
+            });
+            all.truncate(max_capacity);
+            tracker.seen = all.into_iter().collect();
+        }
+
+        tracker
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Trait wiring: production NonceTracker satisfies the validate-pipeline trait
+// ---------------------------------------------------------------------------
+
+/// Adapts the production [`NonceTracker`] to the validate-pipeline
+/// [`super::validate::NonceTracker`] trait so the same per-context tracker
+/// used by the runtime is also the one consulted by `validate_ucan` /
+/// `validate_spending_ucan_signed`.
+///
+/// Without this impl, callers would have to maintain a separate
+/// [`super::validate::InMemoryNonceTracker`] alongside the production
+/// tracker — that is the bug the C1 finding describes (a fabricated
+/// spending UCAN's nonce was never checked against the per-context
+/// tracker because no shared trait existed). The impl forwards directly to
+/// the inherent split-phase methods, preserving capacity limits, pruning,
+/// and persistence semantics.
+impl<C: Clock> super::validate::NonceTracker for NonceTracker<C> {
+    fn check_replay(&self, nonce: &str, token_expiry: u64) -> Result<(), UcanError> {
+        Self::check_replay(self, nonce, token_expiry)
+    }
+
+    fn record(&mut self, nonce: &str, token_expiry: u64) -> Result<(), UcanError> {
+        Self::record(self, nonce, token_expiry)
     }
 }
 
@@ -671,6 +836,108 @@ mod tests {
         let clock = Arc::new(TestClock::new(BASE_SECS));
         let result = NonceTracker::from_bytes(b"not json", clock);
         assert!(result.is_err());
+    }
+
+    // -------------------------------------------------------------------
+    // snapshot_entries / from_snapshot (ContextSnapshot persistence path)
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn snapshot_entries_captures_all_recorded_nonces() {
+        let (mut tracker, clock) = setup();
+        let now_millis = u128::from(clock.now_secs()) * 1000;
+        let n1 = make_nonce(now_millis, "aabbccdd11223344aabbccdd11223344");
+        let n2 = make_nonce(now_millis, "11223344aabbccdd11223344aabbccdd");
+        let expiry = clock.now_secs() + 3600;
+        tracker.check_and_record(&n1, expiry).unwrap();
+        tracker.check_and_record(&n2, expiry).unwrap();
+
+        let entries = tracker.snapshot_entries();
+        assert_eq!(entries.len(), 2);
+        assert!(entries.contains_key(&n1));
+        assert!(entries.contains_key(&n2));
+    }
+
+    #[test]
+    fn snapshot_entries_empty_for_new_tracker() {
+        let (tracker, _clock) = setup();
+        assert!(tracker.snapshot_entries().is_empty());
+    }
+
+    #[test]
+    fn from_snapshot_restores_nonce_set_and_rejects_replay() {
+        // #1608 follow-up: a captured spending UCAN nonce must not be
+        // replayable after a process restart.
+        let (mut tracker, clock) = setup();
+        let nonce = make_nonce_now(&clock);
+        let expiry = clock.now_secs() + 3600;
+        tracker.check_and_record(&nonce, expiry).unwrap();
+
+        // Simulate restart: serialize state, drop tracker, restore.
+        let entries = tracker.snapshot_entries();
+        drop(tracker);
+        let mut restored = NonceTracker::from_snapshot("ctx-test".to_owned(), clock, entries);
+
+        assert_eq!(restored.len(), 1, "restored tracker must retain the nonce");
+
+        // Replay the same nonce — must be rejected as a replay attempt.
+        let err = restored
+            .check_and_record(&nonce, expiry)
+            .expect_err("replay of captured nonce must be rejected post-restart");
+        assert!(
+            matches!(err, UcanError::NonceReused(_)),
+            "expected NonceReused, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn from_snapshot_prunes_expired_entries() {
+        let (mut tracker, clock) = setup();
+        let nonce = make_nonce_now(&clock);
+        let short_expiry = clock.now_secs() + 1;
+        tracker.check_and_record(&nonce, short_expiry).unwrap();
+
+        let entries = tracker.snapshot_entries();
+        drop(tracker);
+
+        // Advance past the retention window before restoring.
+        clock.advance(PRUNE_MIN_RETENTION_SECS + 1);
+
+        let restored =
+            NonceTracker::from_snapshot("ctx-test".to_owned(), Arc::clone(&clock), entries);
+        assert_eq!(
+            restored.len(),
+            0,
+            "stale entries must be pruned on from_snapshot"
+        );
+    }
+
+    #[test]
+    fn from_snapshot_truncates_oversized_snapshot() {
+        // A poisoned snapshot attempting to force an unbounded HashMap
+        // allocation must be bounded by `max_capacity`.
+        let clock = Arc::new(TestClock::new(BASE_SECS));
+        let mut oversized: HashMap<String, (u64, u64)> = HashMap::new();
+        let now_secs = clock.now_secs();
+        let expiry = now_secs + 86_400; // 24h — past the prune min retention floor
+        for i in 0..50 {
+            // Use a far-future first_seen so the prune pass retains the
+            // entry (prune eligibility is based on first_seen + 86_400).
+            let key = format!("nonce-{i:04}");
+            oversized.insert(key, (now_secs, expiry));
+        }
+
+        let restored = NonceTracker::from_snapshot_with_capacity(
+            "ctx-test".to_owned(),
+            clock,
+            oversized,
+            /* max_capacity = */ 10,
+        );
+        assert!(
+            restored.len() <= 10,
+            "poisoned snapshot must be truncated to max_capacity, got {}",
+            restored.len()
+        );
     }
 
     // -------------------------------------------------------------------

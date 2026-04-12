@@ -284,7 +284,16 @@ pub async fn tool_register(
     Ok(registered_id)
 }
 
-/// Invokes a tool within an SCP context.
+/// Invokes a tool within an SCP context, fully wired through the
+/// `ContextManager::invoke_tool_with_economy` pipeline.
+///
+/// This is the SINGLE entry point for tool invocation through the NAPI
+/// bridge. Per-invocation pricing, spending UCAN AND-composition
+/// (§19.5), per-DID velocity tracking, escalation (§19.7), budget
+/// enforcement, payment escrow, the Matrix-style hard rate limit, and
+/// `ToolEconomyTicket` rollback are all enforced inside the runtime
+/// wrapper. The NAPI bridge no longer reimplements any of those
+/// concerns.
 ///
 /// Validates the UCAN token for tool invocation authorization before
 /// dispatching. The UCAN must contain a `tool_invoke:{tool_id}` or
@@ -299,6 +308,12 @@ pub async fn tool_register(
 /// * `ucan_token` — JWT-encoded UCAN token authorizing the invocation.
 ///   Must contain `tool_invoke:{tool_id}` or `tool_invoke:*` capability.
 ///   Validated using the full 11-step ADR-016 pipeline.
+/// * `proof_tokens` — Optional encoded parent UCAN tokens for the
+///   delegation chain (ADR-016 step 3).
+/// * `spending_ucan_jwt` — Optional JWT-encoded spending UCAN
+///   (`SpendingCapability`) for paid tool invocations. Required when an
+///   `EconomicPolicy` priced the tool above zero (§19.5). May be
+///   `null`/`undefined` for free tools.
 ///
 /// # Returns
 ///
@@ -309,13 +324,17 @@ pub async fn tool_register(
 /// - Rejects with `SCP-TOOL-6005` if the context is not `"active"`.
 /// - Rejects with `SCP-PERM-3001` if the UCAN token is invalid, expired,
 ///   revoked, or lacks the required tool invocation capability.
-/// - Rejects with `SCP-TOOL-6002` if invocation fails (tool not found,
-///   input fails schema validation, invoker lacks role-based capability).
+/// - Rejects with `SCP-ECON-12090` if the hard rate limit is exceeded.
+/// - Rejects with `SCP-ECON-12010` if the per-DID budget is insufficient.
+/// - Rejects with `SCP-ECON-12061` if `spending_ucan_jwt` is missing or
+///   malformed for a paid action.
+/// - Rejects with a tool-invocation error (6xxx range) if invocation fails (tool not found,
+///   schema mismatch, etc.).
 ///
-/// See spec §6.2, §8, ADR-016, and issue #319 for UCAN enforcement.
+/// See spec §6.2, §8, §19.5, §19.7, ADR-016, and issue #319.
 #[napi]
-#[allow(clippy::unused_async)] // napi-rs requires async for Promise return
 #[allow(clippy::needless_pass_by_value)] // napi-rs requires owned String
+#[allow(clippy::too_many_arguments)] // mirrors the runtime's economy entry point
 pub async fn tool_invoke(
     handle: &NapiContextHandle,
     tool_id: String,
@@ -323,10 +342,14 @@ pub async fn tool_invoke(
     identity_did: String,
     ucan_token: String,
     proof_tokens: Option<Vec<String>>,
+    spending_ucan_jwt: Option<String>,
 ) -> napi::Result<String> {
     validate_tool_id(&tool_id).map_err(|e| napi::Error::from(ScpNapiError::from(e)))?;
     validate_did(&identity_did).map_err(|e| napi::Error::from(ScpNapiError::from(e)))?;
     validate_ucan_token(&ucan_token).map_err(|e| napi::Error::from(ScpNapiError::from(e)))?;
+    if let Some(jwt) = spending_ucan_jwt.as_deref() {
+        validate_ucan_token(jwt).map_err(|e| napi::Error::from(ScpNapiError::from(e)))?;
+    }
 
     let state_str = handle.state()?;
     if state_str != "active" {
@@ -342,7 +365,9 @@ pub async fn tool_invoke(
     let context_id = handle.context_id();
     crate::runtime::ensure_registered(handle)?;
 
-    // UCAN authorization (full 11-step ADR-016 pipeline).
+    // UCAN authorization (full 11-step ADR-016 pipeline). Bridge-owned
+    // because the proof resolver, revocation list, and nonce tracker
+    // live in the bridge UCAN registry, not in the runtime.
     let proof_resolver = crate::ucan::build_proof_resolver_from_tokens(proof_tokens.as_deref())
         .map_err(|e| {
             napi::Error::from(ScpNapiError::Permission {
@@ -359,70 +384,96 @@ pub async fn tool_invoke(
     )
     .map_err(napi::Error::from)?;
 
-    // Validate tool existence, input schema, and dispatch (matching PyO3 pattern).
-    let output_json = crate::runtime::with_context(&context_id, |rt| {
-        let registration = rt
-            .tool_registry
-            .get(&tool_id)
-            .ok_or_else(|| ScpNapiError::Tool {
-                message: format!("tool '{tool_id}' not found in context '{context_id}'"),
-                code: "SCP-TOOL-6002".to_owned(),
-            })?;
-
-        // Validate input against the tool's input schema.
-        let input_value: serde_json::Value =
-            serde_json::from_str(&input_json).map_err(|e| ScpNapiError::Tool {
-                message: format!("invalid input JSON: {e}"),
-                code: "SCP-TOOL-6002".to_owned(),
-            })?;
-        scp_core::context::tools::validate_value_against_schema(
-            &input_value,
-            &registration.schema.input_schema,
-        )
-        .map_err(|e| ScpNapiError::Tool {
-            message: format!("input validation failed: {e}"),
-            code: "SCP-TOOL-6002".to_owned(),
+    // Parse the optional spending UCAN JWT (§19.5 AND-composition).
+    // Mirrors `context_send`. An invalid JWT surfaces as
+    // `SCP-ECON-12061` before the manager call.
+    let spending_ucan_token = spending_ucan_jwt
+        .as_deref()
+        .map(scp_core::crypto::ucan::validate::parse_ucan)
+        .transpose()
+        .map_err(|e| {
+            napi::Error::from(ScpNapiError::Context {
+                message: format!("invalid spending UCAN: {e}"),
+                code: "SCP-ECON-12061".to_owned(),
+            })
         })?;
 
-        // Dispatch to registered handler if available.
-        let output = if let Some(handler) = rt.tool_handlers.get(&tool_id) {
-            let handler = handler.clone();
-            let out = handler(input_value).map_err(|e| ScpNapiError::Tool {
-                message: format!("tool handler for '{tool_id}' failed: {e}"),
-                code: "SCP-TOOL-6002".to_owned(),
-            })?;
-
-            // Validate output against the tool's output schema (defense-in-depth).
-            scp_core::context::tools::validate_value_against_schema(
-                &out,
-                &registration.schema.output_schema,
-            )
-            .map_err(|msg| ScpNapiError::Tool {
-                message: format!("output validation failed for tool '{tool_id}': {msg}"),
-                code: "SCP-TOOL-6002".to_owned(),
-            })?;
-
-            out
-        } else {
-            // No handler registered — fall back to echo mode with metadata.
-            serde_json::json!({
-                "tool": tool_id,
-                "context": context_id,
-                "status": "validated",
-                "input_valid": true,
-                "invoker_did": identity_did,
-                "validated_input": input_value,
-            })
-        };
-
-        Ok(output)
+    // Snapshot the bridge-owned tool registry and (optionally) the
+    // registered handler closure BEFORE entering the runtime call. The
+    // runtime requires `&ToolRegistry`; cloning the registry once is
+    // cheap and avoids holding the bridge UCAN-state DashMap shard
+    // lock across the runtime's three-phase lock split.
+    let context_id_for_executor = context_id.clone();
+    let tool_id_for_executor = tool_id.clone();
+    let identity_for_executor = identity_did.clone();
+    let (registry, handler) = crate::runtime::with_context(&context_id, |rt| {
+        Ok((
+            rt.tool_registry.clone(),
+            rt.tool_handlers.get(&tool_id).cloned(),
+        ))
     })
     .map_err(napi::Error::from)?;
 
-    serde_json::to_string(&output_json).map_err(|e| {
+    // Build the executor closure. Phase 2 of `invoke_tool_with_economy`
+    // runs WITHOUT holding the `contexts` mutex; the runtime calls the
+    // executor exactly once with the validated input value.
+    let executor = move |input: serde_json::Value| {
+        let handler = handler.clone();
+        let input_for_echo = input.clone();
+        async move {
+            handler.map_or_else(
+                || {
+                    Ok(serde_json::json!({
+                        "tool": tool_id_for_executor,
+                        "context": context_id_for_executor,
+                        "status": "validated",
+                        "input_valid": true,
+                        "invoker_did": identity_for_executor,
+                        "validated_input": input_for_echo,
+                    }))
+                },
+                |h| {
+                    h(input).map_err(|e| {
+                        format!("tool handler for '{tool_id_for_executor}' failed: {e}")
+                    })
+                },
+            )
+        }
+    };
+
+    // Parse input JSON once (the runtime expects `serde_json::Value`).
+    let input_value: serde_json::Value = serde_json::from_str(&input_json).map_err(|e| {
+        napi::Error::from(ScpNapiError::Tool {
+            message: format!("invalid input JSON: {e}"),
+            code: "SCP-TOOL-6002".to_owned(),
+        })
+    })?;
+
+    let manager = crate::runtime::context_manager()?;
+    let invoker_did_typed: scp_primitives::DID = identity_did.into();
+    let tool_id_typed = scp_core::context::tools::ToolId::from(tool_id.as_str());
+    let outcome = manager
+        .invoke_tool_with_economy(
+            &context_id,
+            &registry,
+            &tool_id_typed,
+            input_value,
+            &invoker_did_typed,
+            spending_ucan_token.as_ref(),
+            None,
+            executor,
+        )
+        .await
+        .map_err(|e| napi::Error::from(ScpNapiError::from(e)))?;
+
+    // The runtime built the canonical `ToolInvokedEvent`; the
+    // transport / event-log layer is the one responsible for signing
+    // and appending it. Pull the JSON output back out for the JS
+    // caller.
+    serde_json::to_string(&outcome.output).map_err(|e| {
         napi::Error::from(ScpNapiError::Tool {
             message: format!("failed to serialize tool output: {e}"),
-            code: "SCP-TOOL-6002".to_owned(),
+            code: "SCP-TOOL-6006".to_owned(),
         })
     })
 }

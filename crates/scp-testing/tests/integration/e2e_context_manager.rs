@@ -52,7 +52,11 @@ use scp_identity::DID;
 struct DummyNonceTracker;
 
 impl NonceTracker for DummyNonceTracker {
-    fn check_and_record(&mut self, _nonce: &str, _token_expiry: u64) -> Result<(), UcanError> {
+    fn check_replay(&self, _nonce: &str, _token_expiry: u64) -> Result<(), UcanError> {
+        Ok(())
+    }
+
+    fn record(&mut self, _nonce: &str, _token_expiry: u64) -> Result<(), UcanError> {
         Ok(())
     }
 }
@@ -101,8 +105,12 @@ impl ContextCryptoProvider for MockCrypto {
     ) -> Result<scp_core::context::AddMemberOutput, ContextError> {
         Ok(scp_core::context::AddMemberOutput::default())
     }
-    fn remove_member(&self, _ctx_id: &[u8; 32], _member_did: &str) -> Result<(), ContextError> {
-        Ok(())
+    fn remove_member(
+        &self,
+        _ctx_id: &[u8; 32],
+        _member_did: &str,
+    ) -> Result<scp_core::context::RemoveMemberOutput, ContextError> {
+        Ok(scp_core::context::RemoveMemberOutput::default())
     }
     fn distribute_sender_key(
         &self,
@@ -139,16 +147,13 @@ impl ContextCryptoProvider for MockCrypto {
         &self,
         _context_id: &[u8; 32],
         outer_bytes: &[u8],
-    ) -> Result<Option<scp_core::context::builder::OpenedEnvelope>, ContextError> {
+    ) -> Result<scp_core::context::builder::OpenResult, ContextError> {
         // Mock: deserialize directly as InnerEnvelope (no decryption).
         let inner: scp_core::envelope::inner::InnerEnvelope =
             rmp_serde::from_slice(outer_bytes)
                 .map_err(|e| ContextError::CryptoFailed(format!("mock open: {e}")))?;
         let sender_did = inner.sender_did.clone();
-        Ok(Some(scp_core::context::builder::OpenedEnvelope {
-            inner,
-            sender_did,
-        }))
+        Ok(scp_core::context::builder::OpenResult::Application(Box::new(scp_core::context::builder::OpenedEnvelope { inner, sender_did })))
     }
 }
 
@@ -202,7 +207,7 @@ impl ContextEventLogProvider for MockEventLog {
     fn init_event_log(&self, _id: &[u8; 32]) -> Result<(), ContextCreationError> {
         Ok(())
     }
-    fn append_event(&self, id: &[u8; 32], event: &str) -> Result<(), ContextCreationError> {
+    fn append_event(&self, id: &[u8; 32], event: &str, _actor_did: &str, _payload: Option<&serde_json::Value>) -> Result<(), ContextCreationError> {
         self.events.lock().unwrap().push((*id, event.to_owned()));
         Ok(())
     }
@@ -438,7 +443,7 @@ async fn e2e_message_round_trip_encrypted() {
         owner_did: bob_did.clone(),
         mls_key_package_bytes: None,
     };
-    manager.join_context(&handle, kp).await.unwrap();
+    manager.join_context(&handle, kp, None).await.unwrap();
 
     // Verify MLS group membership.
     assert_eq!(manager.member_count(ctx_id).await, Some(2));
@@ -449,7 +454,7 @@ async fn e2e_message_round_trip_encrypted() {
     let original_msg = b"Hello Bob, this is a secret message from Alice!";
     let alice_sk = signing_key_for(&alice_did);
     manager
-        .send_message(&handle, &alice_did, original_msg, Some(&alice_sk), None)
+        .send_message(&handle, &alice_did, original_msg, Some(&alice_sk), None, None)
         .await
         .unwrap();
 
@@ -499,7 +504,7 @@ async fn e2e_governance_role_change_and_unauthorized_rejection() {
         owner_did: member_did.clone(),
         mls_key_package_bytes: None,
     };
-    manager.join_context(&handle, kp).await.unwrap();
+    manager.join_context(&handle, kp, None).await.unwrap();
     assert_eq!(manager.member_count(ctx_id).await, Some(2));
 
     // Verify initial role is "member".
@@ -722,13 +727,13 @@ async fn e2e_persistence_drop_and_restore() {
             owner_did: member_did.clone(),
             mls_key_package_bytes: None,
         };
-        manager.join_context(&handle, kp).await.unwrap();
+        manager.join_context(&handle, kp, None).await.unwrap();
         assert_eq!(manager.member_count(ctx_id).await, Some(2));
 
         // Send a message to advance sequence numbers.
         let admin_sk = signing_key_for(&admin_did);
         manager
-            .send_message(&handle, &admin_did, b"pre-restart message", Some(&admin_sk), None)
+            .send_message(&handle, &admin_did, b"pre-restart message", Some(&admin_sk), None, None)
             .await
             .unwrap();
     }
@@ -969,7 +974,7 @@ async fn e2e_governance_replay_protection() {
         owner_did: member_did.clone(),
         mls_key_package_bytes: None,
     };
-    manager.join_context(&handle, kp).await.unwrap();
+    manager.join_context(&handle, kp, None).await.unwrap();
 
     // Execute first governance action.
     let action1 = GovernanceAction::ChangeRole {
@@ -1041,13 +1046,13 @@ async fn e2e_full_lifecycle_create_join_send_leave_close() {
         owner_did: member_did.clone(),
         mls_key_package_bytes: None,
     };
-    manager.join_context(&handle, kp).await.unwrap();
+    manager.join_context(&handle, kp, None).await.unwrap();
     assert_eq!(manager.member_count(ctx_id).await, Some(2));
 
     // Send message.
     let admin_sk = signing_key_for(&admin_did);
     manager
-        .send_message(&handle, &admin_did, b"lifecycle test message", Some(&admin_sk), None)
+        .send_message(&handle, &admin_did, b"lifecycle test message", Some(&admin_sk), None, None)
         .await
         .unwrap();
 
@@ -1148,7 +1153,7 @@ async fn e2e_multi_bridge_api_surface_verification() {
     // send_message
     let alice_sk = signing_key_for(&alice);
     manager
-        .send_message(&enc_handle, &alice, b"bridge test", Some(&alice_sk), None)
+        .send_message(&enc_handle, &alice, b"bridge test", Some(&alice_sk), None, None)
         .await
         .unwrap();
 

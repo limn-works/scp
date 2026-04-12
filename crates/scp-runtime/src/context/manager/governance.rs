@@ -1,20 +1,957 @@
 //! Governance proposal, vote, execute, and dispatch operations.
 
 use super::{
-    Arc, CEILING_CHANGE_NOTIFICATION_PERIOD_SECS, Capability, CapabilityCeiling, Clock,
-    ContentKeysRotatedResult, ContextError, ContextEvent, ContextManager, ContextParams,
-    ContextState, DID, ECONOMIC_POLICY_NOTIFICATION_PERIOD_SECS, EXECUTED_PROPOSALS_TTL_SECS,
-    EconomicPolicy, GovernanceAction, GovernanceActionResult, GovernanceBanResult,
-    GovernanceContext, GovernanceEvent, GovernanceProposal, GovernanceReconfiguredResult, HashSet,
-    MAX_REGISTERED_TOOLS, MAX_THRESHOLD_SIGNERS, MAX_TOOL_INTERFACES, MigrationProposedResult,
-    MigrationState, MlsImpact, PendingCeilingModification, PendingEconomicPolicyChange,
-    PerContextState, ProposalId, ProposalOutcome, ProposalStatus, PruningPolicy,
-    ReadAccessRestoredResult, ReadAccessRevokedResult, RevocationScope, ToolInterface,
-    ToolRegistration, WriteAccessRestoredResult, WriteAccessRevokedResult, classify_action,
-    collect_active_voters, context_id_to_bytes, generate_mls_operations, instrument,
-    process_pending_proposals, push_welcome_event, require_active, require_migrating_out, roles,
-    update_detection_state,
+    AccessScope, Arc, CEILING_CHANGE_NOTIFICATION_PERIOD_SECS, Capability, CapabilityCeiling,
+    Clock, CommitFaultMarker, CommitOperation, ConsequenceRule, ContentKeysRotatedResult,
+    ContextError, ContextEvent, ContextManager, ContextParams, ContextState, DID,
+    ECONOMIC_POLICY_NOTIFICATION_PERIOD_SECS, EXECUTED_PROPOSALS_TTL_SECS, EconomicPolicy,
+    GovernanceAction, GovernanceActionResult, GovernanceContext, GovernanceEvent,
+    GovernanceProposal, GovernanceReconfiguredResult, HashSet, MAX_COMMIT_AGE_SECS,
+    MAX_COMMIT_RETRIES, MAX_PENDING_COMMITS, MAX_REGISTERED_TOOLS, MAX_THRESHOLD_SIGNERS,
+    MAX_TOOL_INTERFACES, MigrationProposedResult, MigrationState, MlsImpact,
+    PendingCeilingModification, PendingCommit, PendingEconomicPolicyChange, PerContextState,
+    ProposalId, ProposalOutcome, ProposalStatus, PruningPolicy, RestoreAccessResult, RevokeResult,
+    SuspendMemberResult, ToolInterface, ToolRegistration, TriggeredConsequence, classify_action,
+    collect_active_voters, commit_retry_backoff, context_id_to_bytes, evaluate_consequence_rules,
+    generate_mls_operations, instrument, process_pending_proposals, push_welcome_event,
+    require_active, require_migrating_out, roles, update_detection_state,
 };
+
+// ---------------------------------------------------------------------------
+// RuntimeConsequenceDispatcher — bridges PerContextState to the shared trait
+// ---------------------------------------------------------------------------
+
+// PR #1606 C6 helper types — outcome of attempting to retry a single
+// pending commit. Lifted out of `process_pending_commits_static` to satisfy
+// `clippy::items_after_statements`.
+struct CommitRetryOutcome {
+    index: usize,
+    kind: CommitRetryOutcomeKind,
+}
+
+enum CommitRetryOutcomeKind {
+    Success {
+        attempts: u32,
+        operation: CommitOperation,
+    },
+    Retry {
+        error: String,
+        next_attempt_at: u64,
+        new_retry_count: u32,
+        operation: CommitOperation,
+    },
+    Failed {
+        reason: String,
+        attempts: u32,
+        operation: CommitOperation,
+    },
+}
+
+/// Evaluates consequence rules against a member and dispatches enforcement
+/// actions (capability suspension, access revocation, role demotion).
+///
+/// Emits `ConsequenceTriggered` and `ConsequenceEnforced` events to the
+/// receive buffer for SDK observability (ADR-017, #1531).
+///
+/// This is a convenience entry point that evaluates rules and enforces the
+/// results. For callers that need the evaluate step visible in their own
+/// file (pipeline wiring gates), use [`evaluate_consequence_rules`] +
+/// [`enforce_triggered_consequences`] directly.
+///
+/// Time-based consequences (rules that should trigger after a duration of
+/// inactivity) are also evaluated by the governance timeout task's periodic
+/// tick (Phase 4 in [`start_governance_timeout_task`](ContextManager::start_governance_timeout_task)),
+/// so they fire even when no user action occurs (#1531).
+pub(super) fn dispatch_consequences(
+    ctx: &mut PerContextState,
+    context_id: &str,
+    member_did: &DID,
+    now: u64,
+    clock: &dyn scp_primitives::Clock,
+    event_log: &dyn super::super::builder::ContextEventLogProvider,
+) {
+    if ctx.governance.consequence_rules.is_empty() {
+        return;
+    }
+
+    // Clone rules to release the borrow on ctx before mutating it.
+    let rules: Vec<ConsequenceRule> = ctx.governance.consequence_rules.clone();
+
+    // Collect event log entries for consequence evaluation (ADR-017).
+    let events = event_log_entries_for_consequences(ctx, context_id, now, event_log);
+
+    // Evaluate which consequences are triggered.
+    let triggered: Vec<TriggeredConsequence> =
+        evaluate_consequence_rules(&rules, &events, member_did.as_ref(), now);
+
+    // Enforce the triggered consequences, passing the already-cloned rules
+    // to avoid cloning again inside enforce_triggered_consequences.
+    enforce_triggered_consequences(
+        ctx,
+        &EnforceConsequencesCtx {
+            context_id,
+            member_did,
+            now,
+            triggered: &triggered,
+            rules: &rules,
+            clock,
+            event_log,
+        },
+    );
+}
+
+/// Synthetic actor DID recorded for durable consequence event log entries
+/// (H4, PR #1606). Consequence enforcement is performed by the local node's
+/// governance engine, not by any specific member, so the actor field is set
+/// to a stable system sentinel rather than the affected member's DID. This
+/// also satisfies the `WarningCount` trigger's `actor_did != subject_did`
+/// requirement so subsequent rule evaluation can match prior enforcements
+/// against the same target.
+pub(super) const CONSEQUENCE_ACTOR_DID: &str = "system";
+
+/// Formats a [`ConsequenceTrigger`] into the canonical wire-stable string
+/// used both in `ContextEvent::ConsequenceTriggered.trigger_type` and in the
+/// structured durable event log payload (H4, PR #1606).
+///
+/// The format is intentionally simple and forward-compatible:
+/// `MessageVelocity`, `ToolRateExceeded`, `WarningCount`, or `Custom:<key>`.
+/// Downstream rules and audit consumers parse on the `Custom:` prefix.
+fn trigger_kind_str(trigger: &scp_protocol::trust::consequence::ConsequenceTrigger) -> String {
+    use scp_protocol::trust::consequence::ConsequenceTrigger;
+    match trigger {
+        ConsequenceTrigger::MessageVelocity => "MessageVelocity".to_owned(),
+        ConsequenceTrigger::ToolRateExceeded => "ToolRateExceeded".to_owned(),
+        ConsequenceTrigger::WarningCount => "WarningCount".to_owned(),
+        ConsequenceTrigger::Custom(key) => format!("Custom:{key}"),
+    }
+}
+
+/// Builds the structured JSON payload for a `ConsequenceTriggered` /
+/// `ConsequenceEnforced` / `ConsequenceEnforcementFailed` /
+/// `ConsequenceEscalatedToSuspendAll` durable event log entry (H4, PR #1606).
+///
+/// The shape matches the H4 spec:
+/// ```json
+/// {
+///   "target_did": "did:key:alice",
+///   "rule_index": 3,
+///   "trigger_kind": "MessageVelocity" | "WarningCount" | "Custom:..."
+///                   | "ToolRateExceeded",
+///   "action_type": "SuspendCapability" | "SuspendAccess" | "SuspendAll"
+///                  | "RevokeAccess" | "RemoveMember" | "AssignRole"
+/// }
+/// ```
+///
+/// `target_did` mirrors the `payload_target_is` convention used by the
+/// `WarningCount` trigger so subsequent rule evaluation can match these
+/// entries against the affected member, closing the recursive blind spot
+/// from the white-hat review.
+fn consequence_event_payload(
+    target_did: &DID,
+    rule_index: usize,
+    trigger_kind: &str,
+    action_type: &str,
+) -> serde_json::Value {
+    serde_json::json!({
+        "target_did": target_did.as_ref(),
+        "rule_index": rule_index,
+        "trigger_kind": trigger_kind,
+        "action_type": action_type,
+    })
+}
+
+/// Best-effort durable append of one consequence event log entry. A failed
+/// append is logged via `tracing::warn!` but never blocks the matching
+/// `receive_buffer.push(...)` call — the receive buffer remains a useful
+/// in-session signal even when the durable log is unavailable. Returns
+/// nothing because the failure mode is observed via tracing, not callers.
+fn append_consequence_event(
+    event_log: &dyn super::super::builder::ContextEventLogProvider,
+    context_id: &str,
+    context_id_bytes: &[u8; 32],
+    event_name: &'static str,
+    member_did: &DID,
+    payload: &serde_json::Value,
+) {
+    if let Err(e) = event_log.append_context_event_with_payload(
+        context_id_bytes,
+        event_name,
+        CONSEQUENCE_ACTOR_DID,
+        Some(payload),
+    ) {
+        tracing::warn!(
+            context_id,
+            member = %member_did,
+            event = event_name,
+            error = %e,
+            "failed to append consequence event to durable event log"
+        );
+    }
+}
+
+/// Borrowed inputs for `enforce_triggered_consequences`. Bundling the
+/// providers, scope identifiers, and pre-evaluated rule data into one
+/// struct keeps the public function signature within the
+/// `clippy::too_many_arguments` budget while preserving the explicit
+/// names that callers (`messaging.rs`, `tools.rs`, `governance.rs`,
+/// the periodic timer) need at construction time.
+pub(super) struct EnforceConsequencesCtx<'a> {
+    pub context_id: &'a str,
+    pub member_did: &'a DID,
+    pub now: u64,
+    pub triggered: &'a [TriggeredConsequence],
+    pub rules: &'a [ConsequenceRule],
+    pub clock: &'a dyn scp_primitives::Clock,
+    pub event_log: &'a dyn super::super::builder::ContextEventLogProvider,
+}
+
+/// Enforces a set of pre-evaluated triggered consequences.
+///
+/// Separated from [`dispatch_consequences`] so callers that need
+/// `evaluate_consequence_rules` visible in their own file (for pipeline
+/// wiring AST gates) can call evaluate + enforce as two distinct steps.
+///
+/// The `rules` field on [`EnforceConsequencesCtx`] should be the same slice
+/// used for evaluation. When called from `dispatch_consequences`, the
+/// already-cloned rules are passed to avoid a second clone.
+///
+/// **Durability invariant (H4, PR #1606):** Every consequence event is
+/// appended to the durable Merkle event log via `event_log` BEFORE the
+/// matching `ctx.receive_buffer.push(...)` call. The order matters: a crash
+/// between the append and the buffer push leaves the Merkle-anchored record
+/// intact (the buffer is in-memory and capped at 1000, so its loss is not a
+/// non-repudiation gap; the durable log is the system of record). The
+/// receive buffer pushes remain because they are still useful for
+/// in-session SDK observation.
+pub(super) fn enforce_triggered_consequences(
+    ctx: &mut PerContextState,
+    args: &EnforceConsequencesCtx<'_>,
+) {
+    let context_id_bytes = context_id_to_bytes(args.context_id);
+    for consequence in args.triggered {
+        process_one_triggered_consequence(ctx, args, &context_id_bytes, consequence);
+    }
+}
+
+/// Single-consequence body of [`enforce_triggered_consequences`].
+/// Extracted so the public function stays under `clippy::too_many_lines`.
+fn process_one_triggered_consequence(
+    ctx: &mut PerContextState,
+    args: &EnforceConsequencesCtx<'_>,
+    context_id_bytes: &[u8; 32],
+    consequence: &TriggeredConsequence,
+) {
+    let member_did = args.member_did;
+    let now = args.now;
+
+    // Cooldown tracking: skip if this rule fired within its window.
+    if let Some(&last_fired) = ctx.governance.cooldown_until.get(&consequence.rule_index)
+        && now < last_fired
+    {
+        return;
+    }
+
+    // TOCTOU/ghost guard: skip entirely if the member is absent AND
+    // there is no evidence that the member ever participated. Members
+    // who left mid-flight after accumulating real evidence still emit
+    // `ConsequenceTriggered` so observers see the behavioral signal.
+    let member_present = ctx.membership.contains(member_did);
+    if !member_present && consequence.evidence.is_empty() {
+        tracing::debug!(
+            member = %member_did,
+            "skipping consequence: ghost DID with no evidence"
+        );
+        return;
+    }
+
+    let action_type = consequence_action_type(&consequence.action);
+    let trigger_kind = args
+        .rules
+        .get(consequence.rule_index)
+        .map_or_else(|| "Unknown".to_owned(), |r| trigger_kind_str(&r.trigger));
+
+    // Always emit `ConsequenceTriggered` (durable + buffer) regardless
+    // of whether the member is still present.
+    emit_consequence_triggered(
+        ctx,
+        args,
+        context_id_bytes,
+        consequence,
+        &trigger_kind,
+        action_type,
+    );
+
+    if !member_present {
+        // Member left between evaluation and enforcement: emit a failed
+        // Enforced record and skip the actual mutation.
+        tracing::debug!(
+            member = %member_did,
+            "skipping consequence enforcement: member is no longer present"
+        );
+        emit_absent_member_enforcement_failed(
+            ctx,
+            args,
+            context_id_bytes,
+            consequence,
+            &trigger_kind,
+            action_type,
+        );
+        return;
+    }
+
+    let success =
+        dispatch_enforcement_action(ctx, member_did, consequence, args.clock, args.context_id);
+
+    if !success {
+        emit_failure_escalation(
+            ctx,
+            args,
+            context_id_bytes,
+            consequence,
+            &trigger_kind,
+            action_type,
+        );
+        return; // skip cooldown recording — failed action doesn't count
+    }
+
+    // Record cooldown: prevent re-firing within the rule's window.
+    if let Some(rule) = args.rules.get(consequence.rule_index) {
+        ctx.governance.cooldown_until.insert(
+            consequence.rule_index,
+            now.saturating_add(rule.window.as_secs()),
+        );
+    }
+
+    emit_consequence_enforced_success(
+        ctx,
+        args,
+        context_id_bytes,
+        consequence,
+        &trigger_kind,
+        action_type,
+    );
+}
+
+/// Resolves the `action_type` string label for a [`TriggeredConsequence`].
+const fn consequence_action_type(
+    action: &scp_protocol::trust::consequence::ConsequenceAction,
+) -> &'static str {
+    match action {
+        scp_protocol::trust::consequence::ConsequenceAction::Enforcement(sev) => sev.variant_name(),
+        scp_protocol::trust::consequence::ConsequenceAction::AssignRole { .. } => "AssignRole",
+    }
+}
+
+/// Emits a `ConsequenceTriggered` durable event log entry followed by
+/// the matching receive-buffer push (H4 ordering invariant).
+fn emit_consequence_triggered(
+    ctx: &mut PerContextState,
+    args: &EnforceConsequencesCtx<'_>,
+    context_id_bytes: &[u8; 32],
+    consequence: &TriggeredConsequence,
+    trigger_kind: &str,
+    action_type: &str,
+) {
+    let payload = consequence_event_payload(
+        args.member_did,
+        consequence.rule_index,
+        trigger_kind,
+        action_type,
+    );
+    append_consequence_event(
+        args.event_log,
+        args.context_id,
+        context_id_bytes,
+        "ConsequenceTriggered",
+        args.member_did,
+        &payload,
+    );
+    ctx.receive_buffer.push(ContextEvent::ConsequenceTriggered {
+        context_id: args.context_id.to_owned(),
+        member_did: args.member_did.clone(),
+        rule_index: consequence.rule_index,
+        trigger_type: trigger_kind.to_owned(),
+        action_type: action_type.to_owned(),
+    });
+}
+
+/// Emits a `ConsequenceEnforcementFailed` durable entry plus the matching
+/// `ConsequenceEnforced { success: false }` receive-buffer push for the
+/// "member-departed-mid-flight" path. Separate from
+/// [`emit_failure_escalation`] because no escalation is applied when the
+/// member is absent — there is nothing to escalate against.
+fn emit_absent_member_enforcement_failed(
+    ctx: &mut PerContextState,
+    args: &EnforceConsequencesCtx<'_>,
+    context_id_bytes: &[u8; 32],
+    consequence: &TriggeredConsequence,
+    trigger_kind: &str,
+    action_type: &str,
+) {
+    let payload = consequence_event_payload(
+        args.member_did,
+        consequence.rule_index,
+        trigger_kind,
+        action_type,
+    );
+    append_consequence_event(
+        args.event_log,
+        args.context_id,
+        context_id_bytes,
+        "ConsequenceEnforcementFailed",
+        args.member_did,
+        &payload,
+    );
+    ctx.receive_buffer.push(ContextEvent::ConsequenceEnforced {
+        context_id: args.context_id.to_owned(),
+        member_did: args.member_did.clone(),
+        action_type: action_type.to_owned(),
+        success: false,
+    });
+}
+
+/// Emits a `ConsequenceEnforced { success: true }` durable entry plus the
+/// matching receive-buffer push for the success path.
+fn emit_consequence_enforced_success(
+    ctx: &mut PerContextState,
+    args: &EnforceConsequencesCtx<'_>,
+    context_id_bytes: &[u8; 32],
+    consequence: &TriggeredConsequence,
+    trigger_kind: &str,
+    action_type: &str,
+) {
+    let payload = consequence_event_payload(
+        args.member_did,
+        consequence.rule_index,
+        trigger_kind,
+        action_type,
+    );
+    append_consequence_event(
+        args.event_log,
+        args.context_id,
+        context_id_bytes,
+        "ConsequenceEnforced",
+        args.member_did,
+        &payload,
+    );
+    ctx.receive_buffer.push(ContextEvent::ConsequenceEnforced {
+        context_id: args.context_id.to_owned(),
+        member_did: args.member_did.clone(),
+        action_type: action_type.to_owned(),
+        success: true,
+    });
+}
+
+/// Per-arm enforcement dispatch. Each match arm calls a named function as
+/// an `expression_statement` so the pipeline wiring gates can detect the
+/// `call_expression` per-variant.
+fn dispatch_enforcement_action(
+    ctx: &mut PerContextState,
+    member_did: &DID,
+    consequence: &TriggeredConsequence,
+    clock: &dyn scp_primitives::Clock,
+    context_id: &str,
+) -> bool {
+    match &consequence.action {
+        scp_protocol::trust::consequence::ConsequenceAction::Enforcement(severity) => {
+            use scp_protocol::trust::consequence::EnforcementSeverity;
+            match severity {
+                EnforcementSeverity::SuspendCapability { capabilities } => {
+                    enforce_suspend(ctx, member_did, capabilities)
+                }
+                EnforcementSeverity::SuspendAccess => {
+                    // SuspendAccess: suspend all capabilities via role_state.
+                    ctx.role_state.suspend_all(member_did.as_ref());
+                    true
+                }
+                EnforcementSeverity::RevokeAccess { .. }
+                | EnforcementSeverity::RemoveMember { .. } => {
+                    // RevokeAccess and RemoveMember should not reach the
+                    // consequence dispatch path without the opt-in flag.
+                    // If they do, escalate to SuspendAccess as a safe
+                    // fallback.
+                    tracing::error!(
+                        context_id,
+                        member = %member_did,
+                        severity = ?severity,
+                        "RevokeAccess/RemoveMember reached consequence dispatch; \
+                         this should have been rejected at validation time"
+                    );
+                    false
+                }
+            }
+        }
+        scp_protocol::trust::consequence::ConsequenceAction::AssignRole { to_role } => {
+            enforce_assign_role(ctx, member_did, to_role, clock)
+        }
+    }
+}
+
+/// Enforces a `SuspendCapability` consequence action on a member.
+///
+/// Suspends typed capabilities by adding them to the member's suspended set
+/// in `ContextRoleState`. The suspension-aware `member_has_capability`
+/// check in the `send_message` and `deliver_incoming` gates will then
+/// reject operations requiring those capabilities.
+///
+/// With the B1 unification, capabilities are typed [`Capability`] values
+/// (no string parsing needed). The previous string-based
+/// `parse_suspension_capability` round-trip is eliminated.
+fn enforce_suspend(ctx: &mut PerContextState, member_did: &DID, caps: &[Capability]) -> bool {
+    if caps.is_empty() {
+        return false;
+    }
+    ctx.role_state
+        .suspend_capabilities(member_did.as_ref(), caps.iter().cloned());
+    true
+}
+
+/// Enforces an `AssignRole` consequence action on a member.
+///
+/// Assigns the member to the specified role (best-effort — role may not exist).
+/// Uses the injected clock (via `now` parameter) instead of `SystemClock` to
+/// keep all governance timing consistent with the `ContextManager`'s clock.
+///
+/// Uses [`roles::system_assign_role`] which bypasses the `RoleAssign`
+/// capability check — the governance engine must be able to demote members
+/// regardless of which member (if any) currently holds `RoleAssign`.
+fn enforce_assign_role(
+    ctx: &mut PerContextState,
+    member_did: &DID,
+    to_role: &str,
+    clock: &dyn scp_primitives::Clock,
+) -> bool {
+    roles::system_assign_role(&mut ctx.role_state, member_did, to_role, clock).is_ok()
+}
+
+/// H10 + H4: when enforcement fails, escalate to `SuspendAll` AND emit two
+/// durable event log entries (`ConsequenceEnforcementFailed` then
+/// `ConsequenceEscalatedToSuspendAll`) so an audit can reconstruct
+/// (a) which action failed and (b) that escalation was applied.
+fn emit_failure_escalation(
+    ctx: &mut PerContextState,
+    args: &EnforceConsequencesCtx<'_>,
+    context_id_bytes: &[u8; 32],
+    consequence: &TriggeredConsequence,
+    trigger_kind: &str,
+    action_type: &str,
+) {
+    let context_id = args.context_id;
+    let member_did = args.member_did;
+    tracing::warn!(
+        context_id,
+        member = %member_did,
+        action_type,
+        "consequence enforcement failed — escalating to SuspendAll"
+    );
+
+    // H10: escalate to SuspendAll when enforcement fails.
+    // Skip cooldown on failure so the escalation fires immediately.
+    ctx.role_state.suspend_all(member_did.as_ref());
+
+    // First the failure record, then the escalation record. Both go to
+    // the durable log before the receive buffer push.
+    let failed_payload = consequence_event_payload(
+        member_did,
+        consequence.rule_index,
+        trigger_kind,
+        action_type,
+    );
+    append_consequence_event(
+        args.event_log,
+        context_id,
+        context_id_bytes,
+        "ConsequenceEnforcementFailed",
+        member_did,
+        &failed_payload,
+    );
+    let escalation_payload = consequence_event_payload(
+        member_did,
+        consequence.rule_index,
+        trigger_kind,
+        "SuspendAll",
+    );
+    append_consequence_event(
+        args.event_log,
+        context_id,
+        context_id_bytes,
+        "ConsequenceEscalatedToSuspendAll",
+        member_did,
+        &escalation_payload,
+    );
+    ctx.receive_buffer.push(ContextEvent::ConsequenceEnforced {
+        context_id: context_id.to_owned(),
+        member_did: member_did.clone(),
+        action_type: "SuspendAll(escalated)".to_owned(),
+        success: true,
+    });
+}
+
+/// Converts receive buffer events into `scp_event_log::Event` format for
+/// consequence rule evaluation and participation record computation.
+///
+/// This bridges the gap between the in-memory receive buffer (which tracks
+/// recent context events) and the event log types expected by the trust
+/// evaluation functions.
+///
+/// **Known limitation (#1594):** The receive buffer is capped at 1000 events
+/// (`ReceiveBuffer::DEFAULT_BUFFER_CAPACITY`). Long-running contexts lose
+/// older history, which means participation records and consequence evaluation
+/// only reflect recent activity.
+///
+/// **Why the Merkle event log cannot be used as a replacement:**
+/// `ContextEventLogProvider::event_log_entries()` returns `EventLogEntry`,
+/// Collects event history for consequence evaluation and participation
+/// record computation (ADR-017, #1530, #1531, #1594).
+///
+/// Combines two sources:
+/// 1. **Event log history** — full persisted history from the
+///    `ContextEventLogProvider`. Each `EventLogEntry` includes `actor_did`
+///    (#1594), enabling proper attribution.
+/// 2. **Receive buffer events** — recent in-memory events that may not
+///    yet be in the event log (the event log is appended after the
+///    operation, but the receive buffer is updated inside the lock).
+///
+/// Events from the event log use their real timestamps. Receive buffer
+/// events use estimated timestamps (spaced 1 second apart backwards from
+/// `now`). The merge deduplicates by preferring event log entries (which
+/// have accurate timestamps and hashes) over buffer estimates.
+/// Serializes an optional target DID into JSON payload bytes for event log
+/// consumption by consequence triggers and participation records.
+fn target_did_to_payload(did: Option<&DID>) -> Vec<u8> {
+    did.map(|d| {
+        serde_json::to_vec(&serde_json::json!({"target_did": d.as_ref()})).unwrap_or_default()
+    })
+    .unwrap_or_default()
+}
+
+/// Maximum age (in seconds) for receive-buffer events used in consequence
+/// evaluation. Events estimated to be older than this are discarded as
+/// stale, preventing manipulation via timestamp back-dating.
+const MAX_BUFFER_EVENT_AGE_SECS: u64 = 3600; // 1 hour
+
+/// Maximum clock skew tolerance (in seconds) for buffer event timestamps.
+/// Events with estimated timestamps more than this far in the future are
+/// discarded.
+const MAX_FUTURE_TOLERANCE_SECS: u64 = 5;
+
+/// Maximum number of receive-buffer events consumed per consequence evaluation
+/// cycle. Caps the cost of evaluation and prevents an attacker from flooding
+/// the buffer to drive synthetic high event counts (e.g. inflating a
+/// `WarningCount` trigger by queuing thousands of messages before governance
+/// runs). Events beyond this cap are simply not fed into the evaluator;
+/// the persisted event log (Source 1) covers all durable history.
+const MAX_BUFFER_EVENTS_FOR_EVAL: usize = 100;
+
+/// Collects event history for consequence evaluation and participation
+/// record computation (ADR-017, #1530, #1531, #1594).
+///
+/// Combines two sources:
+/// 1. **Event log history** — full persisted history from the
+///    `ContextEventLogProvider`. Each `EventLogEntry` includes `actor_did`
+///    (#1594), enabling proper attribution.
+/// 2. **Receive buffer events** — recent in-memory events that may not
+///    yet be in the event log (the event log is appended after the
+///    operation, but the receive buffer is updated inside the lock).
+///
+/// Events from the event log use their real timestamps. Receive buffer
+/// events use estimated timestamps (spaced 1 second apart backwards from
+/// `now`). The merge deduplicates by preferring event log entries (which
+/// have accurate timestamps and hashes) over buffer estimates.
+///
+/// **Known limitation (#1594):** The receive buffer is capped at 1000 events
+/// (`ReceiveBuffer::DEFAULT_BUFFER_CAPACITY`). Long-running contexts lose
+/// older history, which means participation records and consequence evaluation
+/// only reflect recent activity.
+///
+/// **Why the Merkle event log cannot be used as a replacement:**
+/// `ContextEventLogProvider::event_log_entries()` returns `EventLogEntry`,
+/// not the raw `scp_event_log::Event` that consequence rules consume. The
+/// conversion is done here, bridging the gap between the two formats.
+#[allow(clippy::too_many_lines)]
+pub(super) fn event_log_entries_for_consequences(
+    ctx: &PerContextState,
+    context_id: &str,
+    now: u64,
+    event_log: &dyn super::super::builder::ContextEventLogProvider,
+) -> Vec<scp_event_log::Event> {
+    let mut events = Vec::new();
+
+    // Source 1: Full event log history (persisted, with real timestamps and actor_did).
+    let context_id_bytes = scp_protocol::context::context_id_bytes(context_id);
+    if let Ok(Some(entries)) = event_log.event_log_entries(&context_id_bytes) {
+        for (seq, entry) in entries.iter().enumerate() {
+            let event_type = match entry.event.as_str() {
+                "MessageSent" | "MessageReceived" => scp_event_log::EventType::MessageSent,
+                "MemberJoined" => scp_event_log::EventType::MemberJoined,
+                "MemberLeft" => scp_event_log::EventType::MemberLeft,
+                "RoleAssigned" => scp_event_log::EventType::RoleAssigned,
+                "ToolRegistered" | "ToolRemoved" | "ToolInvoked" => {
+                    scp_event_log::EventType::ToolInvoked
+                }
+                // Governance actions and consequence enforcement records
+                // both feed the WarningCount trigger via the
+                // EventType::GovernanceAction match arm in
+                // `matches_trigger`. Mapping consequence events to this
+                // bucket closes the recursive blind spot from the
+                // white-hat review (H4): subsequent rule evaluation can
+                // see prior consequence enforcement, enabling rules like
+                // "if member has been auto-suspended N times, demote".
+                "GovernanceAction"
+                | "GovernanceProposalCreated"
+                | "GovernanceVoteCast"
+                | "GovernanceVoteWithdrawn"
+                | "GovernanceProposalResolved"
+                | "GovernanceDeadlockRecovery"
+                | "GovernanceConflictDetected"
+                | "GovernanceConflictResolved"
+                | "GovernanceActionExecuted"
+                | "ConsequenceTriggered"
+                | "ConsequenceEnforced"
+                | "ConsequenceEnforcementFailed"
+                | "ConsequenceEscalatedToSuspendAll" => scp_event_log::EventType::GovernanceAction,
+                _ => continue, // Skip event types not relevant to consequence evaluation
+            };
+            // Convert structured JSON payload to EventPayload bytes.
+            // The payload is serialized as JSON bytes for consumption by
+            // extract_target_did_from_payload and payload_target_is.
+            let payload_data = entry
+                .payload
+                .as_ref()
+                .and_then(|v| serde_json::to_vec(v).ok())
+                .unwrap_or_default();
+            events.push(scp_event_log::Event {
+                event_type,
+                actor_did: DID(entry.actor_did.clone()),
+                timestamp: entry.timestamp,
+                sequence: seq as u64,
+                payload: scp_event_log::EventPayload { data: payload_data },
+                prev_hash: [0u8; 32],
+                signature: Vec::new(),
+            });
+        }
+    }
+
+    // Source 2: Receive buffer events (recent, may not be in event log yet).
+    // Only add buffer events that are not already covered by the event log.
+    // We use a simple heuristic: if the event log already has events, we
+    // only add buffer events whose estimated timestamp is newer than the
+    // last event log entry.
+    let last_log_ts = events.last().map_or(0, |e| e.timestamp);
+    let all_buffer_events = ctx.receive_buffer.event_log_entries();
+    let buffer_len = all_buffer_events.len() as u64;
+    let next_seq = events.len() as u64;
+
+    // Track how many buffer-derived events we've accepted so far. Once
+    // MAX_BUFFER_EVENTS_FOR_EVAL is reached, stop adding more.
+    // This cap prevents an attacker from flooding the buffer to inflate
+    // synthetic event counts (e.g. triggering a `WarningCount` consequence
+    // prematurely). The persisted event log (Source 1) covers all durable
+    // history; the buffer is only a short-term supplement.
+    let mut buffer_events_accepted: usize = 0;
+
+    for (idx, ctx_event) in all_buffer_events.iter().enumerate() {
+        let (event_type, actor_did, payload_data) = match ctx_event {
+            ContextEvent::MessageSent { sender_did, .. }
+            | ContextEvent::MessageReceived { sender_did, .. } => (
+                scp_event_log::EventType::MessageSent,
+                sender_did.clone(),
+                Vec::new(),
+            ),
+            ContextEvent::MemberJoined { member_did, .. } => (
+                scp_event_log::EventType::MemberJoined,
+                member_did.clone(),
+                Vec::new(),
+            ),
+            ContextEvent::MemberLeft { member_did } => (
+                scp_event_log::EventType::MemberLeft,
+                member_did.clone(),
+                Vec::new(),
+            ),
+            ContextEvent::GovernanceActionExecuted {
+                executor_did,
+                target_did,
+                ..
+            } => (
+                scp_event_log::EventType::GovernanceAction,
+                executor_did.clone(),
+                target_did_to_payload(target_did.as_ref()),
+            ),
+            _ => continue,
+        };
+        // Oldest event gets `now - (buffer_len - 1)`, newest gets `now`.
+        let estimated_ts =
+            now.saturating_sub(buffer_len.saturating_sub(1).saturating_sub(idx as u64));
+
+        // Skip buffer events that are likely already covered by the event log.
+        if estimated_ts <= last_log_ts && last_log_ts > 0 {
+            continue;
+        }
+
+        // Defense in depth: reject buffer events with estimated timestamps too far
+        // in the future. Currently the estimation formula guarantees
+        // estimated_ts <= now, so this never triggers — but it guards against
+        // future changes to the formula.
+        if estimated_ts > now.saturating_add(MAX_FUTURE_TOLERANCE_SECS) {
+            continue;
+        }
+
+        // Reject buffer events with timestamps too far in the past (M18).
+        if now.saturating_sub(estimated_ts) > MAX_BUFFER_EVENT_AGE_SECS {
+            continue;
+        }
+
+        // M-R cap: stop once we've accepted MAX_BUFFER_EVENTS_FOR_EVAL events
+        // from the buffer. Additional events are not fed to the evaluator.
+        if buffer_events_accepted >= MAX_BUFFER_EVENTS_FOR_EVAL {
+            break;
+        }
+        buffer_events_accepted += 1;
+
+        events.push(scp_event_log::Event {
+            event_type,
+            actor_did,
+            timestamp: estimated_ts,
+            sequence: next_seq + idx as u64,
+            payload: scp_event_log::EventPayload { data: payload_data },
+            prev_hash: [0u8; 32],
+            signature: Vec::new(),
+        });
+    }
+    events
+}
+
+/// Checks whether a proposer is eligible to submit a governance proposal.
+///
+/// Composite gate combining independent eligibility signals:
+/// 1. **Pending removal** — defense-in-depth: members with an approved
+///    `RemoveMember` proposal targeting them cannot submit new proposals.
+/// 2. **Participation threshold** — members whose participation record
+///    shows a net-negative governance ratio (more actions against than by)
+///    are blocked. See [`scp_protocol::trust::participation::meets_threshold`].
+///
+/// Refreshes the participation cache before checking by calling
+/// `compute_participation_record` with recent events from the receive buffer.
+///
+/// Note: "standing" in the spec refers to persistent bilateral contact-graph
+/// contexts (§5.12.4-6), which is unrelated to this check. Do not reuse the
+/// word for the participation/eligibility model.
+fn check_proposer_eligibility(
+    ctx: &mut PerContextState,
+    proposer_did: &DID,
+    now: u64,
+    event_log: &dyn super::super::builder::ContextEventLogProvider,
+) -> Result<(), ContextError> {
+    // Check for pending ejection (existing defense-in-depth).
+    for (proposal, _seq, _ts) in ctx.governance.approved_proposals.values() {
+        if let GovernanceAction::RemoveMember { did, .. } = &proposal.action
+            && did == proposer_did
+        {
+            return Err(ContextError::PermissionDenied(
+                "member has a pending ejection — cannot propose governance actions".into(),
+            ));
+        }
+    }
+
+    // Refresh participation record from recent events before checking the
+    // participation threshold (#1530).
+    let context_id = ctx.handle.context_id().to_owned();
+    let context_id_bytes = context_id_to_bytes(&context_id);
+    let merkle_root = event_log
+        .event_log_merkle_root(&context_id_bytes)
+        .unwrap_or([0u8; 32]);
+    let events = event_log_entries_for_consequences(ctx, &context_id, now, event_log);
+    if !events.is_empty() {
+        match scp_protocol::trust::participation::compute_participation_record(
+            &events,
+            proposer_did.as_ref(),
+            &context_id,
+            merkle_root,
+            now,
+        ) {
+            Err(e) => {
+                // Fail-closed: if participation record computation fails,
+                // log a warning and deny the proposal. This prevents
+                // silently passing members with corrupted participation data.
+                tracing::warn!(
+                    proposer = %proposer_did,
+                    error = %e,
+                    "compute_participation_record failed — denying proposal"
+                );
+                return Err(ContextError::PermissionDenied(
+                    "SCP-GOV-11021: participation record computation failed — cannot verify proposer eligibility"
+                        .into(),
+                ));
+            }
+            Ok(record) => {
+                // Participation evaluation uses participation_count and
+                // governance_actions to determine eligibility (#1530).
+                // Only cache records with actual participation — new members
+                // with zero participation should not be blocked before they
+                // participate.
+                if record.participation_count > 0 {
+                    tracing::trace!(
+                        participation_count = record.participation_count,
+                        governance_actions_by = record.governance_actions_by.len(),
+                        governance_actions_against = record.governance_actions_against.len(),
+                        "participation evaluation for proposer"
+                    );
+                    ctx.governance
+                        .participation_cache
+                        .insert(proposer_did.to_string(), record);
+                }
+            }
+        }
+    }
+
+    // Check participation records for eligibility (#1530).
+    if let Some(record) = ctx
+        .governance
+        .participation_cache
+        .get(proposer_did.as_ref())
+        && !scp_protocol::trust::participation::meets_threshold(record)
+    {
+        return Err(ContextError::PermissionDenied(
+            "member participation below threshold — cannot propose governance actions (SCP-GOV-11020)"
+                .into(),
+        ));
+    }
+
+    // Earned capacity enforcement (§9.3): when the context has a sybil_policy,
+    // evaluate the proposer's identity depth to determine their governance
+    // proposal rate limit, then check recent proposals against that limit.
+    if let Some(sybil_policy) = ctx.handle.params().sybil_policy.as_ref() {
+        let assessment =
+            super::lifecycle::build_identity_assessment(proposer_did, &ctx.governance, now);
+        let (_level, capacity) =
+            scp_protocol::trust::sybil::evaluate_earned_capacity(&assessment, sybil_policy, now);
+
+        let window_secs = capacity.governance_proposal_window_secs;
+        let max_proposals = capacity.max_governance_proposals_per_window;
+        let window_start = now.saturating_sub(window_secs);
+
+        // Count proposals within the sliding window for this member.
+        let timestamps = ctx
+            .governance
+            .proposal_timestamps
+            .entry(proposer_did.to_string())
+            .or_default();
+
+        // Evict stale entries outside the window.
+        timestamps.retain(|&ts| ts > window_start);
+
+        #[allow(clippy::cast_possible_truncation)]
+        let recent_count = timestamps.len() as u32;
+        if recent_count >= max_proposals {
+            return Err(ContextError::PermissionDenied(format!(
+                "earned capacity limit reached: {recent_count}/{max_proposals} governance proposals \
+                 in {window_secs}s window (SCP-GOV-11030)"
+            )));
+        }
+    }
+
+    Ok(())
+}
 
 #[allow(clippy::significant_drop_tightening)]
 impl ContextManager {
@@ -25,19 +962,16 @@ impl ContextManager {
     /// context's governance model (e.g., `SingleAdminEngine::propose()` for
     /// single-admin contexts, or `ThresholdEngine::approve()` reaching quorum).
     ///
-    /// Supports all 25 [`GovernanceAction`] variants (24 from ADR-031 + legacy `BlockAuthor`).
-    /// Actions that modify context state do so under the context write lock
-    /// and emit appropriate events.
+    /// Supports all [`GovernanceAction`] variants. Actions that modify context
+    /// state do so under the context write lock and emit appropriate events.
     ///
     /// # Errors
     ///
     /// - [`ContextError::PermissionDenied`] if the proposal is not in
     ///   `Approved` status.
     /// - [`ContextError::PermissionDenied`] if the context's ceiling does not
-    ///   include `MemberBan` (for `RevokeReadAccess`/`RestoreReadAccess`).
+    ///   include `MemberBan` (for `Revoke`/`RestoreAccess`/`SuspendMember`).
     /// - [`ContextError::ContextNotActive`] if the context is not `Active`.
-    /// - [`ContextError::MembershipFailed`] if the context is not a broadcast
-    ///   context (for `BlockAuthor`, `RevokeReadAccess`, `RestoreReadAccess`).
     #[instrument(skip_all, fields(context_id))]
     pub async fn execute_governance_action(
         &self,
@@ -58,6 +992,18 @@ impl ContextManager {
                 "governance proposal targets context '{}' but was submitted to '{}'",
                 proposal.context_id, context_id
             )));
+        }
+
+        // PR #1606 C6 fail-close gate: if the persistent commit retry queue
+        // exhausted its budget for a previous mutation, refuse new governance
+        // actions until an operator acknowledges the fault. Without this
+        // gate, an ejected member could remain in the MLS group while local
+        // governance keeps advancing on a divergent epoch.
+        {
+            let contexts = self.contexts.lock().await;
+            if let Some(ctx) = contexts.get(context_id) {
+                Self::check_commit_fault(ctx)?;
+            }
         }
 
         // Atomically check replay AND mark as executed before dispatch.
@@ -87,6 +1033,10 @@ impl ContextManager {
                 return Err(ContextError::ContextNotRegistered(context_id.to_owned()));
             }
         }
+
+        // Governance action costing: no PaidActionType::GovernanceAction
+        // variant exists yet. Governance actions are free until the economy
+        // spec adds a governance cost tier. Tracked by #1537.
 
         let result = match self.dispatch_governance_action(context_id, proposal).await {
             Ok(r) => r,
@@ -119,12 +1069,13 @@ impl ContextManager {
     ///
     /// Extracted from [`execute_governance_action`] to keep that method
     /// focused on validation and dispatch.
+    #[allow(clippy::too_many_lines)]
     async fn finalize_governance_action(
         &self,
         context_id: &str,
         proposal: &GovernanceProposal,
     ) -> Result<(), ContextError> {
-        // For MLS-mutating actions (AddMember, RemoveMember, RevokeReadAccess,
+        // For MLS-mutating actions (AddMember, RemoveMember, Revoke,
         // ResetMember), increment the epoch counter, place the old epoch into
         // the grace store (§23.11), record the coordination in the
         // EpochCoordinator (ADR-031 §8, issue #630), and report the new epoch.
@@ -181,16 +1132,28 @@ impl ContextManager {
 
         // Append to Merkle event log using the standard governance event
         // label path (same pattern as propose/approve/reject/withdraw).
+        // Include structured payload with target_did and action_type so
+        // consequence triggers (WarningCount, Custom) and participation records
+        // can identify the target and classify whether the action is adverse
+        // (H18: standing-deflation filter).
         let context_id_bytes = context_id_to_bytes(context_id);
-        self.event_log.append_context_event(
+        let action_variant = proposal.action.variant_name();
+        let payload = Some(proposal.action.target_did().map_or_else(
+            || serde_json::json!({"action_type": action_variant}),
+            |d| serde_json::json!({"target_did": d.as_ref(), "action_type": action_variant}),
+        ));
+        self.event_log.append_context_event_with_payload(
             &context_id_bytes,
             Self::governance_event_label(&executed_event),
+            proposal.proposer_did.as_ref(),
+            payload.as_ref(),
         )?;
 
         // Single lock acquisition for all post-event-log state mutations
         // (#1428 — eliminates TOCTOU window from multiple lock acquisitions).
         {
             let action_summary = proposal.action.variant_name().to_owned();
+            let target_did = proposal.action.target_did().cloned();
             let mut contexts = self.contexts.lock().await;
             if let Some(ctx) = contexts.get_mut(context_id) {
                 // 1. Push GovernanceActionExecuted to receive buffer so SDK
@@ -201,6 +1164,7 @@ impl ContextManager {
                         action_summary,
                         executor_did: proposal.proposer_did.clone(),
                         resulting_epoch,
+                        target_did,
                     });
 
                 // 2. Trigger checkpoint cosignature collection for multi-admin
@@ -227,6 +1191,60 @@ impl ContextManager {
                     .approved_proposals
                     .remove(&proposal.proposal_id);
 
+                // Evaluate consequence rules after governance action (ADR-017, #1531).
+                // Evaluate for both the proposer and the target (if different).
+                // WarningCount triggers match events where the *target* DID
+                // appears in the payload, so skipping the target would miss
+                // accumulating warnings against them.
+                dispatch_consequences(
+                    ctx,
+                    context_id,
+                    &proposal.proposer_did,
+                    self.clock.now_secs(),
+                    &*self.clock,
+                    &*self.event_log,
+                );
+                if let Some(target) = proposal.action.target_did()
+                    && target != &proposal.proposer_did
+                {
+                    dispatch_consequences(
+                        ctx,
+                        context_id,
+                        target,
+                        self.clock.now_secs(),
+                        &*self.clock,
+                        &*self.event_log,
+                    );
+                }
+
+                // Update participation record after governance action (#1530).
+                // Reuse the same event log entries for participation (finding #46).
+                let gov_events = event_log_entries_for_consequences(
+                    ctx,
+                    context_id,
+                    self.clock.now_secs(),
+                    &*self.event_log,
+                );
+                let gov_merkle = self
+                    .event_log
+                    .event_log_merkle_root(&context_id_bytes)
+                    .unwrap_or([0u8; 32]);
+                if !gov_events.is_empty()
+                    && let Ok(record) =
+                        scp_protocol::trust::participation::compute_participation_record(
+                            &gov_events,
+                            proposal.proposer_did.as_ref(),
+                            context_id,
+                            gov_merkle,
+                            self.clock.now_secs(),
+                        )
+                    && record.participation_count > 0
+                {
+                    ctx.governance
+                        .participation_cache
+                        .insert(proposal.proposer_did.to_string(), record);
+                }
+
                 // 4. Persist the updated context state (best-effort).
                 if self.has_persistence() {
                     let snapshot = Self::snapshot_context(ctx);
@@ -244,60 +1262,109 @@ impl ContextManager {
     /// Separated from [`execute_governance_action`] to keep the public entry
     /// point focused on validation while this method handles the 28-action
     /// dispatch.
+    #[allow(clippy::too_many_lines)]
     async fn dispatch_governance_action(
         &self,
         context_id: &str,
         proposal: &GovernanceProposal,
     ) -> Result<GovernanceActionResult, ContextError> {
         let pid = proposal.proposal_id;
+        let actor = proposal.proposer_did.as_ref();
         match &proposal.action {
-            GovernanceAction::BlockAuthor { did, .. } => {
-                // Delegate to RevokeWriteAccess with Full scope (SCP-RG-016,
-                // ADR-038). BlockAuthor is a legacy action; the content access
-                // key layer provides the proper mechanism for revoking write
-                // access. Delegation ensures key rotation and access tracking
-                // are handled consistently.
-                self.execute_revoke_write_access(context_id, did, RevocationScope::Full, pid)
+            GovernanceAction::SuspendCapability { did, capabilities } => {
+                self.execute_suspend_member(context_id, did, capabilities, pid, actor)
                     .await?;
-                Ok(GovernanceActionResult::WriteAccessRevoked(
-                    WriteAccessRevokedResult {
+                Ok(GovernanceActionResult::MemberSuspended(
+                    SuspendMemberResult {
                         did: did.clone(),
-                        scope: RevocationScope::Full,
+                        capabilities: capabilities.clone(),
                     },
                 ))
             }
-            GovernanceAction::RevokeReadAccess { did, scope } => {
+            GovernanceAction::SuspendAccess { did } => {
+                // Suspend all capabilities for the member.
+                let snapshot = {
+                    let mut contexts = self.contexts.lock().await;
+                    let ctx = contexts
+                        .get_mut(context_id)
+                        .ok_or_else(|| ContextError::ContextNotRegistered(context_id.to_owned()))?;
+                    require_active(&ctx.handle)?;
+
+                    if !ctx.role_state.ceiling.contains(&Capability::MemberBan) {
+                        return Err(ContextError::PermissionDenied(
+                            "member:ban (MemberBan) capability not in ceiling".to_owned(),
+                        ));
+                    }
+                    if !ctx.membership.contains(did) {
+                        return Err(ContextError::MemberNotFound(did.to_string()));
+                    }
+
+                    ctx.role_state.suspend_all(did.as_ref());
+
+                    ctx.receive_buffer
+                        .push(ContextEvent::CapabilitiesSuspended {
+                            did: did.clone(),
+                            capabilities: vec![], // all — indicated by empty
+                        });
+
+                    if self.has_persistence() {
+                        Some(Self::snapshot_context(ctx))
+                    } else {
+                        None
+                    }
+                };
+
+                if let Some(snapshot) = snapshot {
+                    self.persist_context_snapshot(context_id, snapshot);
+                }
+                let context_id_bytes = context_id_to_bytes(context_id);
+                self.event_log.append_context_event(
+                    &context_id_bytes,
+                    "MemberSuspendedAll",
+                    actor,
+                )?;
+                Ok(GovernanceActionResult::Executed)
+            }
+            GovernanceAction::RevokeAccess { did, access } => {
                 let r = self
-                    .revoke_read_access_internal(context_id, did, *scope)
+                    .execute_revoke(context_id, did, *access, pid, actor)
                     .await?;
-                Ok(GovernanceActionResult::ReadAccessRevoked(
-                    ReadAccessRevokedResult {
-                        did: did.clone(),
-                        scope: *scope,
-                        rotated_author_count: r.rotated_authors.len(),
-                    },
-                ))
+                Ok(GovernanceActionResult::AccessRevoked(RevokeResult {
+                    did: did.clone(),
+                    access: *access,
+                    rotated_author_count: r,
+                }))
             }
-            GovernanceAction::RestoreReadAccess { did } => {
-                self.restore_read_access_internal(context_id, did).await?;
-                Ok(GovernanceActionResult::ReadAccessRestored(
-                    ReadAccessRestoredResult { did: did.clone() },
+            GovernanceAction::RestoreAccess { did, capabilities } => {
+                self.execute_restore_access(context_id, did, capabilities, pid, actor)
+                    .await?;
+                Ok(GovernanceActionResult::AccessRestored(
+                    RestoreAccessResult {
+                        did: did.clone(),
+                        capabilities: capabilities.clone(),
+                    },
                 ))
             }
             GovernanceAction::PromoteContext => {
-                self.execute_promote_context(context_id, &proposal.approvals, pid)
+                self.execute_promote_context(context_id, &proposal.approvals, pid, actor)
                     .await?;
                 Ok(GovernanceActionResult::ContextPromoted)
             }
             // ExtendTtl needs proposal.approvals for unanimity override
             // (ADR-031 §4d, spec §5.10).
             GovernanceAction::ExtendTtl { additional_secs } => {
-                self.execute_extend_ttl(context_id, *additional_secs, &proposal.approvals, pid)
-                    .await?;
+                self.execute_extend_ttl(
+                    context_id,
+                    *additional_secs,
+                    &proposal.approvals,
+                    pid,
+                    actor,
+                )
+                .await?;
                 Ok(GovernanceActionResult::TtlExtended)
             }
             GovernanceAction::SetEconomicPolicy { policy } => {
-                self.execute_set_economic_policy(context_id, policy, pid)
+                self.execute_set_economic_policy(context_id, policy, pid, actor)
                     .await?;
                 Ok(GovernanceActionResult::Executed)
             }
@@ -306,14 +1373,21 @@ impl ContextManager {
                 amount,
                 purpose,
             } => {
-                self.execute_approve_spend(context_id, spender, *amount, purpose, pid)
+                self.execute_approve_spend(context_id, spender, *amount, purpose, pid, actor)
                     .await?;
                 Ok(GovernanceActionResult::Executed)
             }
             GovernanceAction::LockEconomicPolicy => {
-                self.execute_lock_economic_policy(context_id, pid).await?;
+                self.execute_lock_economic_policy(context_id, pid, actor)
+                    .await?;
                 Ok(GovernanceActionResult::Executed)
             }
+            GovernanceAction::ModifyHardRateLimit { new_config } => {
+                self.execute_modify_hard_rate_limit(context_id, new_config, pid, actor)
+                    .await?;
+                Ok(GovernanceActionResult::Executed)
+            }
+            // SuspendCapability, SuspendAccess, RevokeAccess are handled above.
             // Remaining actions dispatched to context-level handler.
             GovernanceAction::AddMember { .. }
             | GovernanceAction::RemoveMember { .. }
@@ -331,13 +1405,11 @@ impl ContextManager {
             | GovernanceAction::EstablishToolInterface { .. }
             | GovernanceAction::ResetMember { .. }
             | GovernanceAction::ResolveConflict { .. }
-            | GovernanceAction::RevokeWriteAccess { .. }
-            | GovernanceAction::RestoreWriteAccess { .. }
             | GovernanceAction::RotateContentKeys { .. }
             | GovernanceAction::ReconfigureGovernance { .. }
             | GovernanceAction::ProposeContextMigration { .. }
             | GovernanceAction::CancelContextMigration => {
-                self.dispatch_context_governance_action(context_id, &proposal.action, pid)
+                self.dispatch_context_governance_action(context_id, &proposal.action, pid, actor)
                     .await
             }
         }
@@ -351,57 +1423,62 @@ impl ContextManager {
     ///   actions (13 variants).
     /// - [`dispatch_content_governance_action`] handles content access,
     ///   key rotation, conflict resolution, and reconfiguration (9 variants).
+    #[allow(clippy::too_many_lines)]
     async fn dispatch_context_governance_action(
         &self,
         context_id: &str,
         action: &GovernanceAction,
         pid: ProposalId,
+        actor_did: &str,
     ) -> Result<GovernanceActionResult, ContextError> {
         match action {
             GovernanceAction::AddMember { did, role } => {
-                self.execute_add_member(context_id, did, role, pid).await?;
+                self.execute_add_member(context_id, did, role, pid, actor_did)
+                    .await?;
                 Ok(GovernanceActionResult::MemberAdded)
             }
             GovernanceAction::RemoveMember { did, .. } => {
-                self.execute_remove_member(context_id, did, pid).await?;
+                self.execute_remove_member(context_id, did, pid, actor_did)
+                    .await?;
                 Ok(GovernanceActionResult::MemberRemoved)
             }
             GovernanceAction::ChangeRole { did, new_role } => {
-                self.execute_change_role(context_id, did, new_role, pid)
+                self.execute_change_role(context_id, did, new_role, pid, actor_did)
                     .await?;
                 Ok(GovernanceActionResult::RoleChanged)
             }
             GovernanceAction::RegisterTool { registration } => {
-                self.execute_register_tool(context_id, registration, pid)
+                self.execute_register_tool(context_id, registration, pid, actor_did)
                     .await?;
                 Ok(GovernanceActionResult::ToolRegistered)
             }
             GovernanceAction::RemoveTool { tool_id } => {
-                self.execute_remove_tool(context_id, tool_id, pid).await?;
+                self.execute_remove_tool(context_id, tool_id, pid, actor_did)
+                    .await?;
                 Ok(GovernanceActionResult::ToolRemoved)
             }
             GovernanceAction::ModifyCeiling { new_ceiling } => {
-                self.execute_modify_ceiling(context_id, new_ceiling, pid)
+                self.execute_modify_ceiling(context_id, new_ceiling, pid, actor_did)
                     .await?;
                 Ok(GovernanceActionResult::CeilingModified)
             }
             GovernanceAction::CloseContext { reason } => {
-                self.execute_close_context(context_id, reason.as_deref(), pid)
+                self.execute_close_context(context_id, reason.as_deref(), pid, actor_did)
                     .await?;
                 Ok(GovernanceActionResult::ContextClosed)
             }
             GovernanceAction::TransferAdmin { new_admin } => {
-                self.execute_transfer_admin(context_id, new_admin, pid)
+                self.execute_transfer_admin(context_id, new_admin, pid, actor_did)
                     .await?;
                 Ok(GovernanceActionResult::AdminTransferred)
             }
             GovernanceAction::CreateChildContext { params } => {
-                self.execute_create_child_context(context_id, params, pid)
+                self.execute_create_child_context(context_id, params, pid, actor_did)
                     .await?;
                 Ok(GovernanceActionResult::ChildContextCreated)
             }
             GovernanceAction::ModifyPruningPolicy { new_policy } => {
-                self.execute_modify_pruning_policy(context_id, new_policy, pid)
+                self.execute_modify_pruning_policy(context_id, new_policy, pid, actor_did)
                     .await?;
                 Ok(GovernanceActionResult::PruningPolicyModified)
             }
@@ -419,12 +1496,13 @@ impl ContextManager {
                         *grace_period_secs,
                         *auto_invite,
                         pid,
+                        actor_did,
                     )
                     .await?;
                 Ok(GovernanceActionResult::MigrationProposed(result))
             }
             GovernanceAction::CancelContextMigration => {
-                self.execute_cancel_context_migration(context_id, pid)
+                self.execute_cancel_context_migration(context_id, pid, actor_did)
                     .await?;
                 Ok(GovernanceActionResult::MigrationCancelled)
             }
@@ -436,24 +1514,24 @@ impl ContextManager {
             | GovernanceAction::EstablishToolInterface { .. }
             | GovernanceAction::ResetMember { .. }
             | GovernanceAction::ResolveConflict { .. }
-            | GovernanceAction::RevokeWriteAccess { .. }
-            | GovernanceAction::RestoreWriteAccess { .. }
             | GovernanceAction::RotateContentKeys { .. }
             | GovernanceAction::ReconfigureGovernance { .. } => {
-                self.dispatch_content_governance_action(context_id, action, pid)
+                self.dispatch_content_governance_action(context_id, action, pid, actor_did)
                     .await
             }
-            // PromoteContext, ExtendTtl, BlockAuthor, RevokeReadAccess,
-            // RestoreReadAccess, and economic actions are handled in
+            // SuspendMember, Revoke, RestoreAccess, PromoteContext, ExtendTtl,
+            // economic, and rate-limit actions are handled in
             // dispatch_governance_action.
             GovernanceAction::PromoteContext
             | GovernanceAction::ExtendTtl { .. }
-            | GovernanceAction::BlockAuthor { .. }
-            | GovernanceAction::RevokeReadAccess { .. }
-            | GovernanceAction::RestoreReadAccess { .. }
+            | GovernanceAction::SuspendCapability { .. }
+            | GovernanceAction::SuspendAccess { .. }
+            | GovernanceAction::RevokeAccess { .. }
+            | GovernanceAction::RestoreAccess { .. }
             | GovernanceAction::SetEconomicPolicy { .. }
             | GovernanceAction::ApproveSpend { .. }
-            | GovernanceAction::LockEconomicPolicy => {
+            | GovernanceAction::LockEconomicPolicy
+            | GovernanceAction::ModifyHardRateLimit { .. } => {
                 unreachable!("handled in dispatch_governance_action")
             }
         }
@@ -461,33 +1539,37 @@ impl ContextManager {
 
     /// Dispatches content access, structural, and reconfiguration governance
     /// actions. Companion to [`dispatch_context_governance_action`].
+    #[allow(clippy::too_many_lines)]
     async fn dispatch_content_governance_action(
         &self,
         context_id: &str,
         action: &GovernanceAction,
         pid: ProposalId,
+        actor_did: &str,
     ) -> Result<GovernanceActionResult, ContextError> {
         match action {
             GovernanceAction::AddSigner { did } => {
-                self.execute_add_signer(context_id, did, pid).await?;
+                self.execute_add_signer(context_id, did, pid, actor_did)
+                    .await?;
                 Ok(GovernanceActionResult::SignerAdded)
             }
             GovernanceAction::RemoveSigner { did } => {
-                self.execute_remove_signer(context_id, did, pid).await?;
+                self.execute_remove_signer(context_id, did, pid, actor_did)
+                    .await?;
                 Ok(GovernanceActionResult::SignerRemoved)
             }
             GovernanceAction::ModifyThreshold { new_threshold } => {
-                self.execute_modify_threshold(context_id, *new_threshold, pid)
+                self.execute_modify_threshold(context_id, *new_threshold, pid, actor_did)
                     .await?;
                 Ok(GovernanceActionResult::ThresholdModified)
             }
             GovernanceAction::EstablishToolInterface { interface } => {
-                self.execute_establish_tool_interface(context_id, interface, pid)
+                self.execute_establish_tool_interface(context_id, interface, pid, actor_did)
                     .await?;
                 Ok(GovernanceActionResult::ToolInterfaceEstablished)
             }
             GovernanceAction::ResetMember { did, reason } => {
-                self.execute_reset_member(context_id, did, reason, pid)
+                self.execute_reset_member(context_id, did, reason, pid, actor_did)
                     .await?;
                 Ok(GovernanceActionResult::MemberReset)
             }
@@ -496,29 +1578,14 @@ impl ContextManager {
                 proposal_b,
                 resolution,
             } => {
-                self.execute_resolve_conflict(context_id, proposal_a, proposal_b, resolution, pid)
-                    .await?;
+                self.execute_resolve_conflict(
+                    context_id, proposal_a, proposal_b, resolution, pid, actor_did,
+                )
+                .await?;
                 Ok(GovernanceActionResult::ConflictResolved)
             }
-            GovernanceAction::RevokeWriteAccess { did, scope } => {
-                self.execute_revoke_write_access(context_id, did, *scope, pid)
-                    .await?;
-                Ok(GovernanceActionResult::WriteAccessRevoked(
-                    WriteAccessRevokedResult {
-                        did: did.clone(),
-                        scope: *scope,
-                    },
-                ))
-            }
-            GovernanceAction::RestoreWriteAccess { did } => {
-                self.execute_restore_write_access(context_id, did, pid)
-                    .await?;
-                Ok(GovernanceActionResult::WriteAccessRestored(
-                    WriteAccessRestoredResult { did: did.clone() },
-                ))
-            }
             GovernanceAction::RotateContentKeys { reason } => {
-                self.execute_rotate_content_keys(context_id, reason.as_deref(), pid)
+                self.execute_rotate_content_keys(context_id, reason.as_deref(), pid, actor_did)
                     .await?;
                 Ok(GovernanceActionResult::ContentKeysRotated(
                     ContentKeysRotatedResult {
@@ -530,8 +1597,14 @@ impl ContextManager {
                 changes,
                 justification,
             } => {
-                self.execute_reconfigure_governance(context_id, changes, justification, pid)
-                    .await?;
+                self.execute_reconfigure_governance(
+                    context_id,
+                    changes,
+                    justification,
+                    pid,
+                    actor_did,
+                )
+                .await?;
                 Ok(GovernanceActionResult::GovernanceReconfigured(
                     GovernanceReconfiguredResult {
                         changes_applied: changes.len(),
@@ -543,9 +1616,10 @@ impl ContextManager {
             // for compile-time coverage (no wildcard).
             GovernanceAction::PromoteContext
             | GovernanceAction::ExtendTtl { .. }
-            | GovernanceAction::BlockAuthor { .. }
-            | GovernanceAction::RevokeReadAccess { .. }
-            | GovernanceAction::RestoreReadAccess { .. }
+            | GovernanceAction::SuspendCapability { .. }
+            | GovernanceAction::SuspendAccess { .. }
+            | GovernanceAction::RevokeAccess { .. }
+            | GovernanceAction::RestoreAccess { .. }
             | GovernanceAction::SetEconomicPolicy { .. }
             | GovernanceAction::ApproveSpend { .. }
             | GovernanceAction::LockEconomicPolicy
@@ -560,7 +1634,8 @@ impl ContextManager {
             | GovernanceAction::CreateChildContext { .. }
             | GovernanceAction::ModifyPruningPolicy { .. }
             | GovernanceAction::ProposeContextMigration { .. }
-            | GovernanceAction::CancelContextMigration => {
+            | GovernanceAction::CancelContextMigration
+            | GovernanceAction::ModifyHardRateLimit { .. } => {
                 unreachable!(
                     "action variant handled by dispatch_governance_action \
                      or dispatch_context_governance_action"
@@ -623,12 +1698,16 @@ impl ContextManager {
         proposer_did: &DID,
         action: GovernanceAction,
         signing_key: &ed25519_dalek::SigningKey,
-    ) -> Result<(GovernanceProposal, Vec<GovernanceEvent>), ContextError> {
-        let (proposal, events, execution_result) = self
-            .propose_governance_action_inner(context_id, proposer_did, action, signing_key)
-            .await?;
-        let _ = execution_result; // Callers of the old API don't use it.
-        Ok((proposal, events))
+    ) -> Result<
+        (
+            GovernanceProposal,
+            Vec<GovernanceEvent>,
+            Option<GovernanceActionResult>,
+        ),
+        ContextError,
+    > {
+        self.propose_governance_action_inner(context_id, proposer_did, action, signing_key)
+            .await
     }
 
     /// Inner implementation of proposal submission with auto-execution.
@@ -636,6 +1715,7 @@ impl ContextManager {
     /// Returns the proposal, events, and optional execution result. The
     /// execution result is `Some` when the proposal was auto-approved
     /// (`SingleAdmin`) and the action was successfully executed.
+    #[allow(clippy::too_many_lines)]
     async fn propose_governance_action_inner(
         &self,
         context_id: &str,
@@ -664,15 +1744,29 @@ impl ContextManager {
                 require_active(&ctx.handle)?;
             }
 
-            // Presence-only members (read + write revoked) lose
-            // GovernancePropose capability (§5.9, ADR-038).
-            if ctx.access.read_revoked_members.contains(proposer_did)
-                && ctx.access.write_revoked_members.contains(proposer_did)
+            // Presence-only members (read + write both suspended) lose
+            // GovernancePropose capability (§5.9, ADR-038, spec §05-contexts).
+            // Eligibility for the specific governance role/signer set is
+            // checked by the governance engine itself; this layer only
+            // enforces the presence-only state — a member who can neither
+            // read nor write content cannot propose governance actions on
+            // content they cannot see.
+            if ctx
+                .role_state
+                .suspended_capabilities
+                .get(proposer_did.as_ref())
+                .is_some_and(|s| {
+                    s.contains(&Capability::MessagesRead) && s.contains(&Capability::MessagesWrite)
+                })
             {
                 return Err(ContextError::PermissionDenied(
                     "presence-only members cannot propose governance actions".into(),
                 ));
             }
+
+            // Eligibility check: verify proposer satisfies pending-removal
+            // and participation gates before allowing new proposals (#1530).
+            check_proposer_eligibility(ctx, proposer_did, self.clock.now_secs(), &*self.event_log)?;
 
             // SCP-272: Check and auto-resolve expired governance freezes (48-hour timeout).
             let freeze_events = self.check_and_resolve_expired_freezes(ctx);
@@ -680,8 +1774,11 @@ impl ContextManager {
                 let cid_bytes = context_id_to_bytes(context_id);
                 for event in &freeze_events {
                     if let GovernanceEvent::ConflictResolved { .. } = event {
-                        self.event_log
-                            .append_context_event(&cid_bytes, "GovernanceFreezeExpired")?;
+                        self.event_log.append_context_event(
+                            &cid_bytes,
+                            "GovernanceFreezeExpired",
+                            proposer_did.as_ref(),
+                        )?;
                     }
                 }
             }
@@ -702,6 +1799,13 @@ impl ContextManager {
                 .engine
                 .propose(proposer_did, action, &gov_ctx, signing_key)
                 .map_err(|e| ContextError::GovernanceFailed(e.to_string()))?;
+
+            // Record proposal timestamp for earned capacity rate limiting (§9.3).
+            ctx.governance
+                .proposal_timestamps
+                .entry(proposer_did.to_string())
+                .or_default()
+                .push(self.clock.now_secs());
 
             let should_execute = proposal.status == ProposalStatus::Approved;
 
@@ -738,12 +1842,14 @@ impl ContextManager {
                         self.event_log.append_context_event(
                             &context_id_bytes,
                             "GovernanceConflictDetected",
+                            proposer_did.as_ref(),
                         )?;
                     }
                     GovernanceEvent::ConflictResolved { .. } => {
                         self.event_log.append_context_event(
                             &context_id_bytes,
                             "GovernanceConflictResolved",
+                            proposer_did.as_ref(),
                         )?;
                     }
                     _ => {}
@@ -816,11 +1922,26 @@ impl ContextManager {
 
             require_active(&ctx.handle)?;
 
-            // Presence-only members (read + write revoked) lose
-            // GovernanceVote capability (§5.9, ADR-038).
-            if ctx.access.read_revoked_members.contains(voter_did)
-                && ctx.access.write_revoked_members.contains(voter_did)
-            {
+            // Suspended members lose GovernanceVote capability (§5.9,
+            // ADR-038). The runtime layer only enforces the suspension
+            // overlay here; role-based eligibility (signer set, admin
+            // status) is checked by the governance engine itself, which
+            // returns `GovernanceFailed` for non-eligible voters.
+            //
+            // Presence-only members (both MessagesRead and MessagesWrite
+            // suspended) also lose GovernanceVote per spec §05-contexts.
+            let suspended = ctx
+                .role_state
+                .suspended_capabilities
+                .get(voter_did.as_ref());
+            if suspended.is_some_and(|s| s.contains(&Capability::GovernanceVote)) {
+                return Err(ContextError::PermissionDenied(
+                    "member does not have governance:vote capability".into(),
+                ));
+            }
+            if suspended.is_some_and(|s| {
+                s.contains(&Capability::MessagesRead) && s.contains(&Capability::MessagesWrite)
+            }) {
                 return Err(ContextError::PermissionDenied(
                     "presence-only members cannot vote on governance proposals".into(),
                 ));
@@ -867,12 +1988,14 @@ impl ContextManager {
                         self.event_log.append_context_event(
                             &context_id_bytes,
                             "GovernanceConflictDetected",
+                            voter_did.as_ref(),
                         )?;
                     }
                     GovernanceEvent::ConflictResolved { .. } => {
                         self.event_log.append_context_event(
                             &context_id_bytes,
                             "GovernanceConflictResolved",
+                            voter_did.as_ref(),
                         )?;
                     }
                     _ => {}
@@ -969,9 +2092,12 @@ impl ContextManager {
     /// Submits a new governance proposal with capability validation.
     ///
     /// Validates that the proposer holds the `GovernancePropose` capability
-    /// (UCAN) before delegating to the governance engine. Returns a
-    /// [`ProposalOutcome`] containing the proposal, its status, and an
-    /// optional execution result.
+    /// (UCAN) before delegating to the governance engine. The
+    /// suspension-aware `member_has_capability` check rejects both members
+    /// whose role does not grant the capability AND members whose
+    /// capability is currently suspended (e.g., presence-only members per
+    /// spec §05-contexts and ADR-038). Returns a [`ProposalOutcome`]
+    /// containing the proposal, its status, and an optional execution result.
     ///
     /// For `SingleAdmin`, the proposal is simultaneously created and approved
     /// (ADR-031 section 4a). The action is auto-executed and the result is
@@ -993,7 +2119,9 @@ impl ContextManager {
         action: GovernanceAction,
         signing_key: &ed25519_dalek::SigningKey,
     ) -> Result<ProposalOutcome, ContextError> {
-        // Validate capability before delegating.
+        // Validate capability before delegating. The suspension-aware
+        // member_has_capability also rejects presence-only members whose
+        // GovernancePropose capability has been suspended (§5.9, ADR-038).
         {
             let contexts = self.contexts.lock().await;
             let ctx = contexts
@@ -1148,8 +2276,11 @@ impl ContextManager {
 
         let context_id_bytes = context_id_to_bytes(context_id);
         for event in &events {
-            self.event_log
-                .append_context_event(&context_id_bytes, Self::governance_event_label(event))?;
+            self.event_log.append_context_event(
+                &context_id_bytes,
+                Self::governance_event_label(event),
+                voter_did.as_ref(),
+            )?;
         }
 
         // Persist context state after withdrawal.
@@ -1165,168 +2296,245 @@ impl ContextManager {
         Ok(status)
     }
 
-    /// Internal implementation of read access revocation. Only callable within
-    /// the crate -- external callers must go through [`execute_governance_action`]
-    /// with an approved [`GovernanceProposal`] containing a
-    /// [`GovernanceAction::RevokeReadAccess`] action.
+    /// Executes a `SuspendMember` governance action.
     ///
-    /// Works in both broadcast and encrypted contexts (ADR-038, §9.17):
-    /// - **Broadcast mode**: bans subscriber via
-    ///   [`BroadcastContext::governance_ban_subscriber`], rotating all
-    ///   author keys to exclude the target.
-    /// - **Encrypted mode**: tracks revocation in `read_revoked_members`
-    ///   and emits event so the MLS/crypto layer can act.
-    ///
-    /// Scope differentiation (§5.9):
-    /// - `Full`: target loses access to both historical and future content.
-    ///   Tracked in `read_revoked_members`.
-    /// - `FutureOnly`: target retains historical access but is excluded
-    ///   from future CEK wrapping. Tracked in `read_exclusion_list`.
-    ///
-    /// Redundancy handling: revoke-when-already-revoked is a no-op (§5.9).
-    /// The member remains in the context (membership/access decoupling).
+    /// Suspends specific capabilities for a member via the role state's
+    /// `suspend_capabilities` method. The member remains in the context
+    /// but the suspended capabilities are blocked at the application-level
+    /// gates (`send_message`, `deliver_incoming`, etc.).
     ///
     /// Requires the `MemberBan` capability in the context's ceiling (§5.3).
-    ///
-    /// # Errors
-    ///
-    /// - [`ContextError::PermissionDenied`] if the ceiling lacks `MemberBan`.
-    /// - [`ContextError::ContextNotActive`] if the context is not `Active`.
-    /// - [`ContextError::MemberNotFound`] if the DID is not a member.
-    async fn revoke_read_access_internal(
+    async fn execute_suspend_member(
         &self,
         context_id: &str,
         did: &DID,
-        scope: RevocationScope,
-    ) -> Result<GovernanceBanResult, ContextError> {
+        capabilities: &[Capability],
+        _proposal_id: ProposalId,
+        actor_did: &str,
+    ) -> Result<(), ContextError> {
         let context_id_bytes = context_id_to_bytes(context_id);
 
-        // Replay check and executed_proposals tracking are handled by the
-        // outer execute_governance_action wrapper — not duplicated here.
-        let (result, ctx_snapshot, bc_snapshot) = {
+        let snapshot = {
             let mut contexts = self.contexts.lock().await;
             let ctx = contexts
                 .get_mut(context_id)
                 .ok_or_else(|| ContextError::ContextNotRegistered(context_id.to_owned()))?;
             require_active(&ctx.handle)?;
 
-            // Gate: ceiling must include MemberBan (§5.3, ADR-031).
             if !ctx.role_state.ceiling.contains(&Capability::MemberBan) {
                 return Err(ContextError::PermissionDenied(
-                    "context ceiling does not include member:ban capability".into(),
+                    "member:ban (MemberBan) capability not in ceiling".to_owned(),
                 ));
             }
-
-            // Gate: target must be a member (membership/access decoupling
-            // still requires context membership).
             if !ctx.membership.contains(did) {
                 return Err(ContextError::MemberNotFound(did.to_string()));
             }
 
-            // Redundant operation handling (§5.9):
-            // Already read-revoked → no-op that returns success.
-            if ctx.access.read_revoked_members.contains(did) {
-                return Ok(GovernanceBanResult {
-                    banned_did: did.0.clone(),
-                    rotated_authors: Vec::new(),
-                    scope,
+            ctx.role_state
+                .suspend_capabilities(did.as_ref(), capabilities.iter().cloned());
+
+            // Emit a capability-precise suspension event carrying the
+            // exact capability list so consumers can render accurate
+            // UI and so the event payload matches the underlying
+            // role_state mutation.
+            ctx.receive_buffer
+                .push(ContextEvent::CapabilitiesSuspended {
+                    did: did.clone(),
+                    capabilities: capabilities.to_vec(),
                 });
-            }
 
-            // Track read-revoked state. The member remains in the context
-            // for governance/presence (membership/access decoupling §5.9).
-            ctx.access.read_revoked_members.insert(did.clone());
-            // FutureOnly also needs exclusion list tracking.
-            // Full revocation implies exclusion from future content too.
-            ctx.access.read_exclusion_list.insert(did.clone());
-
-            // Presence-only check: if both read AND write are revoked,
-            // strip GovernanceVote and GovernancePropose capabilities (§5.9).
-            if ctx.access.write_revoked_members.contains(did) {
-                ctx.role_state.revoke_governance_capabilities(did);
-            }
-
-            // Broadcast mode: also ban via broadcast-specific subscriber registry.
-            let (ban_result, bc_snap) = if let Some(ref mut bc) = ctx.broadcast_context {
-                let r = bc.governance_ban_subscriber(&did.0, scope)?;
-                let snap = if self.has_persistence() {
-                    Some(bc.to_snapshot())
-                } else {
-                    None
-                };
-                (r, snap)
+            if self.has_persistence() {
+                Some(Self::snapshot_context(ctx))
             } else {
-                // Encrypted mode: destroy the member's access key so they
-                // cannot decrypt future content (§9.17.2 step 3, ADR-038).
-                ctx.access.access_key_store.remove(context_id, did.as_ref());
-                (
-                    GovernanceBanResult {
-                        banned_did: did.0.clone(),
-                        rotated_authors: Vec::new(),
-                        scope,
-                    },
-                    None,
-                )
-            };
+                None
+            }
+        };
 
-            // Emit revocation events to receive buffer.
-            ctx.receive_buffer
-                .push(ContextEvent::ReadAccessRevoked { did: did.clone() });
-            ctx.receive_buffer
-                .push(ContextEvent::AccessKeyRevoked { did: did.clone() });
+        if let Some(snapshot) = snapshot {
+            self.persist_context_snapshot(context_id, snapshot);
+        }
+        self.event_log
+            .append_context_event(&context_id_bytes, "MemberSuspended", actor_did)?;
+        Ok(())
+    }
+
+    /// Executes a `Revoke` governance action — cryptographic key destruction.
+    ///
+    /// Works in both broadcast and encrypted contexts (ADR-038, §9.17):
+    /// - **Write scope**: suspends write capabilities and destroys sender/broadcast
+    ///   keys so the member cannot publish. In broadcast mode, also calls
+    ///   `block_author` for key rotation.
+    /// - **Read scope**: destroys access keys and adds to CEK exclusion list.
+    ///   In broadcast mode, bans the subscriber with key rotation.
+    /// - **Both scope**: applies both write and read revocation.
+    ///
+    /// Additionally suspends the corresponding capabilities via `role_state`
+    /// so application-level gates also block the member.
+    ///
+    /// Requires the `MemberBan` capability in the context's ceiling (§5.3).
+    ///
+    /// Returns the number of rotated authors (for broadcast contexts).
+    async fn execute_revoke(
+        &self,
+        context_id: &str,
+        did: &DID,
+        access: AccessScope,
+        _proposal_id: ProposalId,
+        actor_did: &str,
+    ) -> Result<usize, ContextError> {
+        let context_id_bytes = context_id_to_bytes(context_id);
+
+        let (rotated_count, ctx_snapshot, bc_snapshot, needs_sender_key_rotation) = {
+            let mut contexts = self.contexts.lock().await;
+            let ctx = contexts
+                .get_mut(context_id)
+                .ok_or_else(|| ContextError::ContextNotRegistered(context_id.to_owned()))?;
+            require_active(&ctx.handle)?;
+
+            if !ctx.role_state.ceiling.contains(&Capability::MemberBan) {
+                return Err(ContextError::PermissionDenied(
+                    "member:ban (MemberBan) capability not in ceiling".to_owned(),
+                ));
+            }
+            if !ctx.membership.contains(did) {
+                return Err(ContextError::MemberNotFound(did.to_string()));
+            }
+
+            let mut rotated = 0usize;
+            let mut bc_snap = None;
+
+            // Write revocation: suspend write capabilities and, in
+            // broadcast contexts, block the author so the BroadcastContext
+            // also rejects new publishes and key requests for the blocked
+            // author. Spec §05-contexts §5.9: revocation removes publishing
+            // authority. Historical messages remain decryptable by
+            // subscribers who already cached the broadcast key.
+            if matches!(access, AccessScope::Write | AccessScope::Both) {
+                ctx.role_state
+                    .suspend_capabilities(did.as_ref(), [Capability::MessagesWrite]);
+
+                if let Some(ref mut bc) = ctx.broadcast_context {
+                    match bc.block_author(&did.0) {
+                        Ok(_) | Err(ContextError::MemberNotFound(_)) => {}
+                        Err(e) => return Err(e),
+                    }
+                    if self.has_persistence() {
+                        bc_snap = Some(bc.to_snapshot());
+                    }
+                }
+
+                ctx.receive_buffer
+                    .push(ContextEvent::WriteAccessRevoked { did: did.clone() });
+            }
+
+            // Read revocation: suspend read capabilities + destroy access keys.
+            if matches!(access, AccessScope::Read | AccessScope::Both) {
+                ctx.role_state
+                    .suspend_capabilities(did.as_ref(), [Capability::MessagesRead]);
+
+                // CEK exclusion list for cryptographic enforcement.
+                ctx.access.read_exclusion_list.insert(did.clone());
+
+                // Broadcast mode: ban subscriber with key rotation. The
+                // target may be an author rather than a subscriber — in
+                // that case the read-side ban is a no-op (authors are
+                // handled by `block_author` under `Both`).
+                if let Some(ref mut bc) = ctx.broadcast_context {
+                    match bc.governance_ban_subscriber(&did.0, access) {
+                        Ok(r) => {
+                            rotated = r.rotated_authors.len();
+                        }
+                        Err(ContextError::MemberNotFound(_)) => {}
+                        Err(e) => return Err(e),
+                    }
+                    if self.has_persistence() {
+                        bc_snap = Some(bc.to_snapshot());
+                    }
+                } else {
+                    // Encrypted mode: destroy the member's access key.
+                    ctx.access.access_key_store.remove(context_id, did.as_ref());
+                }
+
+                ctx.receive_buffer
+                    .push(ContextEvent::ReadAccessRevoked { did: did.clone() });
+                ctx.receive_buffer
+                    .push(ContextEvent::AccessKeyRevoked { did: did.clone() });
+            }
+
+            // Encrypted non-broadcast mode: Write and Both revocations need a
+            // sender key rotation so the revoked member cannot decrypt future
+            // messages at the sender-key layer (defense-in-depth per §9.17).
+            // Broadcast mode handles key rotation through its own block_author /
+            // governance_ban_subscriber paths above, so we only rotate here for
+            // encrypted contexts. Read-only revocations do not need rotation
+            // because the member was never an encryptor.
+            let rotate = matches!(access, AccessScope::Write | AccessScope::Both)
+                && ctx.broadcast_context.is_none();
 
             let snap = if self.has_persistence() {
                 Some(Self::snapshot_context(ctx))
             } else {
                 None
             };
-            (ban_result, snap, bc_snap)
+            (rotated, snap, bc_snap, rotate)
         };
 
-        // Persist context and broadcast state for crash recovery.
         if let Some(ctx_snapshot) = ctx_snapshot {
             self.persist_context_snapshot(context_id, ctx_snapshot);
         }
         if let Some(ref bc_snap) = bc_snapshot {
             self.persist_broadcast_snapshot(context_id, bc_snap);
         }
+        self.event_log.append_context_event_with_payload(
+            &context_id_bytes,
+            "AccessRevoked",
+            actor_did,
+            Some(&serde_json::json!({"target_did": did.as_ref()})),
+        )?;
 
-        self.event_log
-            .append_context_event(&context_id_bytes, "ReadAccessRevoked")?;
+        // H7: Rotate sender key after write-side revocation so the revoked
+        // member cannot decrypt future messages at the sender-key layer
+        // (defense-in-depth per §9.17). Non-fatal: MLS membership is unchanged
+        // during revoke, so rotation failure does not leave the group in an
+        // inconsistent state — warn and continue.
+        if needs_sender_key_rotation {
+            if let Err(e) = self.crypto.rotate_sender_key(&context_id_bytes) {
+                tracing::warn!(
+                    context_id = %context_id,
+                    error = %e,
+                    "rotate_sender_key failed after access revocation"
+                );
+            }
+            if let Err(e) = self.drain_and_deliver_sender_keys(context_id, &context_id_bytes) {
+                tracing::warn!(
+                    context_id = %context_id,
+                    error = %e,
+                    "drain_and_deliver_sender_keys failed after access revocation"
+                );
+            }
+        }
 
-        Ok(result)
+        Ok(rotated_count)
     }
 
-    /// Internal implementation of read access restoration (§5.9, ADR-038).
+    /// Executes a `RestoreAccess` governance action.
     ///
-    /// Works for both broadcast and encrypted contexts. Removes the member
-    /// from the read-revoked set. In broadcast mode, also unbans the
-    /// subscriber. Generates a new access key (new epoch) and emits
-    /// `AccessKeyRestored` event. Restoration is always forward-only
-    /// (§9.16.8): content encrypted during the revocation period remains
-    /// permanently inaccessible.
-    ///
-    /// If the member was presence-only (both read + write revoked), restoring
-    /// read access brings them to read-only state and restores governance
-    /// capabilities (they can see content again → can vote meaningfully).
+    /// Restores previously suspended capabilities and, for read revocations,
+    /// generates a new access key (forward-only restoration, §9.16.8).
+    /// Content encrypted during the revocation period remains permanently
+    /// inaccessible.
     ///
     /// Requires the `MemberBan` capability in the context's ceiling (§5.3).
-    ///
-    /// # Errors
-    ///
-    /// - [`ContextError::PermissionDenied`] if the ceiling lacks `MemberBan`.
-    /// - [`ContextError::ContextNotActive`] if the context is not `Active`.
-    /// - [`ContextError::NothingToRestore`] if the member's read access was
-    ///   never revoked.
-    async fn restore_read_access_internal(
+    async fn execute_restore_access(
         &self,
         context_id: &str,
         did: &DID,
+        capabilities: &[Capability],
+        _proposal_id: ProposalId,
+        actor_did: &str,
     ) -> Result<(), ContextError> {
         let context_id_bytes = context_id_to_bytes(context_id);
 
-        // Replay check and executed_proposals tracking are handled by the
-        // outer execute_governance_action wrapper — not duplicated here.
         let (ctx_snapshot, bc_snapshot) = {
             let mut contexts = self.contexts.lock().await;
             let ctx = contexts
@@ -1334,64 +2542,74 @@ impl ContextManager {
                 .ok_or_else(|| ContextError::ContextNotRegistered(context_id.to_owned()))?;
             require_active(&ctx.handle)?;
 
-            // Gate: ceiling must include MemberBan (§5.3, ADR-031).
             if !ctx.role_state.ceiling.contains(&Capability::MemberBan) {
                 return Err(ContextError::PermissionDenied(
-                    "context ceiling does not include member:ban capability".into(),
+                    "member:ban (MemberBan) capability not in ceiling".to_owned(),
                 ));
             }
 
-            // Redundant operation handling (§5.9):
-            // Restoring access that was never revoked → NothingToRestore.
-            if !ctx.access.read_revoked_members.contains(did) {
+            // Determine whether anything is actually suspended for this member.
+            // Per spec §05-contexts §5.9: restore on a never-revoked member is
+            // an error (NothingToRestore).
+            let suspended_set = ctx.role_state.suspended_capabilities.get(did.as_ref());
+            let nothing_suspended_for_request =
+                suspended_set.is_none_or(|set| !capabilities.iter().any(|c| set.contains(c)));
+            // Read-side: also check exclusion list (CEK exclusion).
+            let read_excluded = ctx.access.read_exclusion_list.contains(did);
+            let read_requested = capabilities.contains(&Capability::MessagesRead);
+            if nothing_suspended_for_request && !(read_requested && read_excluded) {
                 return Err(ContextError::NothingToRestore(format!(
-                    "read access was never revoked for {did}"
+                    "no suspended capabilities to restore for {did}"
                 )));
             }
 
-            // Clear read revocation state.
-            ctx.access.read_revoked_members.remove(did);
-            ctx.access.read_exclusion_list.remove(did);
+            // Restore the specified capabilities.
+            ctx.role_state
+                .restore_capabilities(did.as_ref(), capabilities);
 
-            // If the member was presence-only (both read + write revoked),
-            // restoring read access means they're now write-revoked-only.
-            // Restore governance capabilities only if write is NOT revoked
-            // (i.e., they go back to full member state).
-            if !ctx.access.write_revoked_members.contains(did) {
-                ctx.role_state.restore_governance_capabilities(did);
-            }
+            // If read capability is being restored, also restore access keys
+            // and remove from exclusion list.
+            let has_read = capabilities.contains(&Capability::MessagesRead);
+            let bc_snap = if has_read {
+                ctx.access.read_exclusion_list.remove(did);
 
-            // Broadcast mode: also unban via broadcast-specific subscriber registry.
-            let bc_snap = ctx.broadcast_context.as_mut().and_then(|bc| {
-                bc.governance_unban_subscriber(&did.0);
-                if self.has_persistence() {
-                    Some(bc.to_snapshot())
-                } else {
-                    None
+                // Broadcast mode: unban subscriber.
+                let snap = ctx.broadcast_context.as_mut().and_then(|bc| {
+                    bc.governance_unban_subscriber(&did.0);
+                    if self.has_persistence() {
+                        Some(bc.to_snapshot())
+                    } else {
+                        None
+                    }
+                });
+
+                // Encrypted mode: generate new access key (forward-only).
+                if ctx.broadcast_context.is_none() {
+                    let restored_key = scp_protocol::crypto::access_keys::generate_access_key(
+                        context_id,
+                        did.as_ref(),
+                    );
+                    ctx.access
+                        .access_key_store
+                        .set(context_id, did.as_ref(), restored_key);
                 }
-            });
 
-            // Encrypted mode: generate a new access key at epoch 1 so the
-            // restored member can decrypt future content. Historical content
-            // from the revocation period is permanently inaccessible
-            // (forward-only restoration, §9.16.8, ADR-038).
-            if ctx.broadcast_context.is_none() {
-                let restored_key = scp_protocol::crypto::access_keys::generate_access_key(
-                    context_id,
-                    did.as_ref(),
-                );
-                ctx.access
-                    .access_key_store
-                    .set(context_id, did.as_ref(), restored_key);
+                ctx.receive_buffer
+                    .push(ContextEvent::ReadAccessRestored { did: did.clone() });
+                ctx.receive_buffer.push(ContextEvent::AccessKeyRestored {
+                    did: did.clone(),
+                    new_epoch: 1,
+                });
+
+                snap
+            } else {
+                None
+            };
+
+            if capabilities.contains(&Capability::MessagesWrite) {
+                ctx.receive_buffer
+                    .push(ContextEvent::WriteAccessRestored { did: did.clone() });
             }
-
-            // Emit restoration events to receive buffer.
-            ctx.receive_buffer
-                .push(ContextEvent::ReadAccessRestored { did: did.clone() });
-            ctx.receive_buffer.push(ContextEvent::AccessKeyRestored {
-                did: did.clone(),
-                new_epoch: 1,
-            });
 
             let snap = if self.has_persistence() {
                 Some(Self::snapshot_context(ctx))
@@ -1401,16 +2619,14 @@ impl ContextManager {
             (snap, bc_snap)
         };
 
-        // Persist context and broadcast state for crash recovery.
         if let Some(ctx_snapshot) = ctx_snapshot {
             self.persist_context_snapshot(context_id, ctx_snapshot);
         }
         if let Some(ref bc_snap) = bc_snapshot {
             self.persist_broadcast_snapshot(context_id, bc_snap);
         }
-
         self.event_log
-            .append_context_event(&context_id_bytes, "ReadAccessRestored")?;
+            .append_context_event(&context_id_bytes, "AccessRestored", actor_did)?;
 
         Ok(())
     }
@@ -1421,6 +2637,7 @@ impl ContextManager {
         did: &DID,
         role: &str,
         _proposal_id: ProposalId,
+        actor_did: &str,
     ) -> Result<(), ContextError> {
         let context_id_bytes = context_id_to_bytes(context_id);
 
@@ -1440,10 +2657,18 @@ impl ContextManager {
 
             // Add to role state.
             ctx.role_state.members.insert(did.to_string());
+            // H2: Use system_assign_role to bypass the RoleAssign capability
+            // check. The governance engine has already authorized this action
+            // via quorum — re-checking RoleAssign against the creator would
+            // silently 500-out approved proposals whenever the creator has
+            // been demoted, removed, or never held RoleAssign. See
+            // `enforce_assign_role` (line 74) for the matching consequence
+            // path that already uses this pattern.
+            let tokens = roles::system_assign_role(&mut ctx.role_state, did, role, &*self.clock)
+                .map_err(|e| ContextError::MembershipFailed(e.to_string()))?;
+            // creator_did is still consumed below by push_welcome_event for
+            // the WelcomeGenerated provenance field.
             let creator_did = ctx.role_state.creator_did.clone();
-            let tokens =
-                roles::assign_role(&mut ctx.role_state, did, role, &creator_did, &*self.clock)
-                    .map_err(|e| ContextError::MembershipFailed(e.to_string()))?;
 
             // Add to membership tracking.
             ctx.membership
@@ -1481,7 +2706,7 @@ impl ContextManager {
             self.persist_context_snapshot(context_id, snapshot);
         }
         self.event_log
-            .append_context_event(&context_id_bytes, "MemberJoined")?;
+            .append_context_event(&context_id_bytes, "MemberJoined", actor_did)?;
         Ok(())
     }
 
@@ -1490,10 +2715,11 @@ impl ContextManager {
         context_id: &str,
         did: &DID,
         _proposal_id: ProposalId,
+        actor_did: &str,
     ) -> Result<(), ContextError> {
         let context_id_bytes = context_id_to_bytes(context_id);
 
-        let snapshot = {
+        let (remove_output, snapshot) = {
             let mut contexts = self.contexts.lock().await;
             let ctx = contexts
                 .get_mut(context_id)
@@ -1504,11 +2730,48 @@ impl ContextManager {
                 return Err(ContextError::MemberNotFound(did.to_string()));
             }
 
-            // Crypto: remove from MLS group under lock to prevent TOCTOU
-            // race (concurrent remove of same DID).
-            self.crypto
+            // H9: MLS group removal FIRST (hard security boundary). If this
+            // fails, we abort without touching sender keys. MLS removal is
+            // the cryptographic enforcement that prevents the removed member
+            // from decrypting future group messages.
+            let remove_output = self
+                .crypto
                 .remove_member(&context_id_bytes, did)
                 .map_err(|e| ContextError::MembershipFailed(e.to_string()))?;
+
+            // Sender key cleanup is best-effort: log failures but do not
+            // propagate. The MLS removal above is the hard boundary; sender
+            // key removal is defense-in-depth for the independent sender key
+            // confidentiality layer (§9.16).
+            if let Err(e) = self
+                .crypto
+                .remove_member_sender_key(&context_id_bytes, did.as_ref())
+            {
+                tracing::warn!(
+                    context_id,
+                    member = %did,
+                    error = %e,
+                    "remove_member_sender_key failed after MLS removal — \
+                     sender key layer may retain stale key"
+                );
+            }
+
+            // Rotate the local sender key so the removed member cannot
+            // decrypt future messages (§9.16.4). Generates a fresh key,
+            // increments the epoch, and HPKE-seals to remaining members.
+            //
+            // Non-fatal: MLS removal above is the hard security boundary.
+            // If rotation fails after MLS removal succeeded, returning Err
+            // would leave the system inconsistent (member removed from MLS
+            // but governance action appears to have failed).
+            if let Err(e) = self.crypto.rotate_sender_key(&context_id_bytes) {
+                tracing::warn!(
+                    context_id,
+                    error = %e,
+                    "rotate_sender_key failed after member removal — \
+                     remaining members retain old sender key"
+                );
+            }
 
             ctx.membership.remove_member(did);
             ctx.role_state.members.remove(did.as_ref());
@@ -1522,18 +2785,46 @@ impl ContextManager {
                 member_did: did.clone(),
             });
 
-            if self.has_persistence() {
-                Some(Self::snapshot_context(ctx))
-            } else {
-                None
-            }
+            (
+                remove_output,
+                if self.has_persistence() {
+                    Some(Self::snapshot_context(ctx))
+                } else {
+                    None
+                },
+            )
         };
+
+        // Broadcast the MLS Commit to remaining members so they can
+        // advance their group epoch and ratchet key material. PR #1606 C6:
+        // on transport failure, the commit is durably enqueued for retry
+        // and the context fail-closes only after MAX_COMMIT_RETRIES /
+        // MAX_COMMIT_AGE_SECS exhaust.
+        self.try_broadcast_commit_or_enqueue(
+            context_id,
+            remove_output.commit_bytes,
+            CommitOperation::RemoveMember {
+                target_did: did.clone(),
+            },
+            actor_did,
+        )
+        .await?;
+
+        // Drain pending sender key distribution messages queued by
+        // rotate_sender_key, MLS-encrypt, and deliver via transport (§9.16.2).
+        if let Err(e) = self.drain_and_deliver_sender_keys(context_id, &context_id_bytes) {
+            tracing::warn!(
+                context_id = %context_id,
+                error = %e,
+                "failed to deliver rotated sender keys after member removal"
+            );
+        }
 
         if let Some(snapshot) = snapshot {
             self.persist_context_snapshot(context_id, snapshot);
         }
         self.event_log
-            .append_context_event(&context_id_bytes, "MemberLeft")?;
+            .append_context_event(&context_id_bytes, "MemberLeft", actor_did)?;
         Ok(())
     }
 
@@ -1543,6 +2834,7 @@ impl ContextManager {
         did: &DID,
         new_role: &str,
         _proposal_id: ProposalId,
+        actor_did: &str,
     ) -> Result<(), ContextError> {
         let context_id_bytes = context_id_to_bytes(context_id);
 
@@ -1559,15 +2851,17 @@ impl ContextManager {
 
             // Re-assign via the role engine (validates role exists, updates
             // assignments and member_capabilities).
-            let creator_did = ctx.role_state.creator_did.clone();
-            let tokens = roles::assign_role(
-                &mut ctx.role_state,
-                did,
-                new_role,
-                &creator_did,
-                &*self.clock,
-            )
-            .map_err(|e| ContextError::MembershipFailed(e.to_string()))?;
+            //
+            // H2: Use system_assign_role to bypass the RoleAssign capability
+            // check. The governance engine has already authorized this action
+            // via quorum — re-checking RoleAssign against the creator would
+            // silently 500-out approved proposals whenever the creator has
+            // been demoted, removed, or never held RoleAssign. See
+            // `enforce_assign_role` (line 74) for the matching consequence
+            // path that already uses this pattern.
+            let tokens =
+                roles::system_assign_role(&mut ctx.role_state, did, new_role, &*self.clock)
+                    .map_err(|e| ContextError::MembershipFailed(e.to_string()))?;
 
             // Update membership tracking with new role.
             if let Some(info) = ctx.membership.get_mut(did) {
@@ -1586,7 +2880,7 @@ impl ContextManager {
             self.persist_context_snapshot(context_id, snapshot);
         }
         self.event_log
-            .append_context_event(&context_id_bytes, "RoleAssigned")?;
+            .append_context_event(&context_id_bytes, "RoleAssigned", actor_did)?;
         Ok(())
     }
 
@@ -1598,6 +2892,7 @@ impl ContextManager {
         context_id: &str,
         registration: &ToolRegistration,
         _proposal_id: ProposalId,
+        actor_did: &str,
     ) -> Result<(), ContextError> {
         let context_id_bytes = context_id_to_bytes(context_id);
 
@@ -1632,7 +2927,7 @@ impl ContextManager {
             self.persist_context_snapshot(context_id, snapshot);
         }
         self.event_log
-            .append_context_event(&context_id_bytes, "ToolRegistered")?;
+            .append_context_event(&context_id_bytes, "ToolRegistered", actor_did)?;
         Ok(())
     }
 
@@ -1641,6 +2936,7 @@ impl ContextManager {
         context_id: &str,
         tool_id: &str,
         _proposal_id: ProposalId,
+        actor_did: &str,
     ) -> Result<(), ContextError> {
         let context_id_bytes = context_id_to_bytes(context_id);
 
@@ -1665,7 +2961,7 @@ impl ContextManager {
             self.persist_context_snapshot(context_id, snapshot);
         }
         self.event_log
-            .append_context_event(&context_id_bytes, "ToolRemoved")?;
+            .append_context_event(&context_id_bytes, "ToolRemoved", actor_did)?;
         Ok(())
     }
 
@@ -1674,6 +2970,7 @@ impl ContextManager {
         context_id: &str,
         new_ceiling: &[Capability],
         proposal_id: ProposalId,
+        actor_did: &str,
     ) -> Result<(), ContextError> {
         let context_id_bytes = context_id_to_bytes(context_id);
 
@@ -1731,8 +3028,11 @@ impl ContextManager {
         if let Some(snapshot) = snapshot {
             self.persist_context_snapshot(context_id, snapshot);
         }
-        self.event_log
-            .append_context_event(&context_id_bytes, "CeilingModificationPending")?;
+        self.event_log.append_context_event(
+            &context_id_bytes,
+            "CeilingModificationPending",
+            actor_did,
+        )?;
         Ok(())
     }
 
@@ -1785,7 +3085,7 @@ impl ContextManager {
                 self.persist_context_snapshot(context_id, snapshot);
             }
             self.event_log
-                .append_context_event(&context_id_bytes, "CeilingModified")?;
+                .append_context_event(&context_id_bytes, "CeilingModified", "")?;
         }
 
         Ok(applied)
@@ -1796,6 +3096,7 @@ impl ContextManager {
         context_id: &str,
         _reason: Option<&str>,
         _proposal_id: ProposalId,
+        actor_did: &str,
     ) -> Result<(), ContextError> {
         let context_id_bytes = context_id_to_bytes(context_id);
 
@@ -1831,6 +3132,9 @@ impl ContextManager {
             // Drop broadcast context state -- keys are zeroed by Zeroize.
             ctx.broadcast_context = None;
 
+            // M7: Participation decay on governance-driven close (#1530).
+            ctx.governance.decay_participation();
+
             if self.has_persistence() {
                 Some(Self::snapshot_context(ctx))
             } else {
@@ -1842,7 +3146,7 @@ impl ContextManager {
             self.persist_context_snapshot(context_id, snapshot);
         }
         self.event_log
-            .append_context_event(&context_id_bytes, "ContextClosing")?;
+            .append_context_event(&context_id_bytes, "ContextClosing", actor_did)?;
         Ok(())
     }
 
@@ -1855,6 +3159,7 @@ impl ContextManager {
         additional_secs: u64,
         approvals: &[scp_protocol::context::governance::SignedVote],
         proposal_id: ProposalId,
+        actor_did: &str,
     ) -> Result<(), ContextError> {
         let context_id_bytes = context_id_to_bytes(context_id);
 
@@ -1883,8 +3188,11 @@ impl ContextManager {
                     "proposal_id": hex::encode(proposal_id),
                     "rejecting_members": rejecting_members,
                 });
-                self.event_log
-                    .append_context_event(&context_id_bytes, &rejected_payload.to_string())?;
+                self.event_log.append_context_event(
+                    &context_id_bytes,
+                    &rejected_payload.to_string(),
+                    actor_did,
+                )?;
                 return Err(ContextError::PermissionDenied(format!(
                     "TTL extension requires unanimous consent — {} of {} members have not approved",
                     missing.len(),
@@ -1948,8 +3256,11 @@ impl ContextManager {
             "proposal_id": hex::encode(proposal_id),
             "consenting_members": consenting_members,
         });
-        self.event_log
-            .append_context_event(&context_id_bytes, &extended_payload.to_string())?;
+        self.event_log.append_context_event(
+            &context_id_bytes,
+            &extended_payload.to_string(),
+            actor_did,
+        )?;
         Ok(())
     }
 
@@ -1958,6 +3269,7 @@ impl ContextManager {
         context_id: &str,
         new_admin: &DID,
         _proposal_id: ProposalId,
+        actor_did: &str,
     ) -> Result<(), ContextError> {
         let context_id_bytes = context_id_to_bytes(context_id);
 
@@ -1973,7 +3285,17 @@ impl ContextManager {
             }
 
             // Demote current admins, promote new admin via role engine.
-            let creator_did = ctx.role_state.creator_did.clone();
+            //
+            // H2: Use system_assign_role to bypass the RoleAssign capability
+            // check. The governance engine has already authorized this action
+            // via quorum, and TransferAdmin is structurally a self-modifying
+            // operation: even when the creator is the current admin, the
+            // first iteration below demotes them — causing the *second*
+            // iteration (or the new-admin promotion) to fail
+            // `AssignerNotAuthorized` if it still required `RoleAssign` on the
+            // creator. The same root cause applies as in execute_change_role
+            // and execute_add_member; see `enforce_assign_role` for the
+            // matching consequence path.
             // Find and demote current admin(s).
             let current_admins: Vec<String> = ctx
                 .role_state
@@ -1983,27 +3305,16 @@ impl ContextManager {
                 .map(|(did, _)| did.clone())
                 .collect();
             for admin_did in &current_admins {
-                roles::assign_role(
-                    &mut ctx.role_state,
-                    admin_did,
-                    "member",
-                    &creator_did,
-                    &*self.clock,
-                )
-                .map_err(|e| ContextError::MembershipFailed(e.to_string()))?;
+                roles::system_assign_role(&mut ctx.role_state, admin_did, "member", &*self.clock)
+                    .map_err(|e| ContextError::MembershipFailed(e.to_string()))?;
                 if let Some(info) = ctx.membership.get_mut(admin_did) {
                     "member".clone_into(&mut info.role_name);
                 }
             }
             // Promote new admin.
-            let tokens = roles::assign_role(
-                &mut ctx.role_state,
-                new_admin,
-                "admin",
-                &creator_did,
-                &*self.clock,
-            )
-            .map_err(|e| ContextError::MembershipFailed(e.to_string()))?;
+            let tokens =
+                roles::system_assign_role(&mut ctx.role_state, new_admin, "admin", &*self.clock)
+                    .map_err(|e| ContextError::MembershipFailed(e.to_string()))?;
             if let Some(info) = ctx.membership.get_mut(new_admin) {
                 "admin".clone_into(&mut info.role_name);
                 info.tokens = tokens;
@@ -2020,7 +3331,7 @@ impl ContextManager {
             self.persist_context_snapshot(context_id, snapshot);
         }
         self.event_log
-            .append_context_event(&context_id_bytes, "AdminTransferred")?;
+            .append_context_event(&context_id_bytes, "AdminTransferred", actor_did)?;
         Ok(())
     }
 
@@ -2031,6 +3342,7 @@ impl ContextManager {
         context_id: &str,
         _params: &ContextParams,
         _proposal_id: ProposalId,
+        actor_did: &str,
     ) -> Result<(), ContextError> {
         let context_id_bytes = context_id_to_bytes(context_id);
         // Validate parent context is active and ceiling allows child creation.
@@ -2056,7 +3368,7 @@ impl ContextManager {
         // caller with the parent_context_id field set. This method records
         // the governance event on the parent.
         self.event_log
-            .append_context_event(&context_id_bytes, "ChildContextCreated")?;
+            .append_context_event(&context_id_bytes, "ChildContextCreated", actor_did)?;
         Ok(())
     }
 
@@ -2065,6 +3377,7 @@ impl ContextManager {
         context_id: &str,
         new_policy: &PruningPolicy,
         _proposal_id: ProposalId,
+        actor_did: &str,
     ) -> Result<(), ContextError> {
         let context_id_bytes = context_id_to_bytes(context_id);
 
@@ -2127,8 +3440,11 @@ impl ContextManager {
         if let Some(snapshot) = snapshot {
             self.persist_context_snapshot(context_id, snapshot);
         }
-        self.event_log
-            .append_context_event(&context_id_bytes, "PruningPolicyModified")?;
+        self.event_log.append_context_event(
+            &context_id_bytes,
+            "PruningPolicyModified",
+            actor_did,
+        )?;
         Ok(())
     }
 
@@ -2139,6 +3455,7 @@ impl ContextManager {
         context_id: &str,
         did: &DID,
         _proposal_id: ProposalId,
+        actor_did: &str,
     ) -> Result<(), ContextError> {
         let context_id_bytes = context_id_to_bytes(context_id);
 
@@ -2203,7 +3520,7 @@ impl ContextManager {
             self.persist_context_snapshot(context_id, snapshot);
         }
         self.event_log
-            .append_context_event(&context_id_bytes, "SignerAdded")?;
+            .append_context_event(&context_id_bytes, "SignerAdded", actor_did)?;
         Ok(())
     }
 
@@ -2214,6 +3531,7 @@ impl ContextManager {
         context_id: &str,
         did: &DID,
         _proposal_id: ProposalId,
+        actor_did: &str,
     ) -> Result<(), ContextError> {
         let context_id_bytes = context_id_to_bytes(context_id);
 
@@ -2274,7 +3592,7 @@ impl ContextManager {
             self.persist_context_snapshot(context_id, snapshot);
         }
         self.event_log
-            .append_context_event(&context_id_bytes, "SignerRemoved")?;
+            .append_context_event(&context_id_bytes, "SignerRemoved", actor_did)?;
         Ok(())
     }
 
@@ -2283,6 +3601,7 @@ impl ContextManager {
         context_id: &str,
         new_threshold: u32,
         _proposal_id: ProposalId,
+        actor_did: &str,
     ) -> Result<(), ContextError> {
         let context_id_bytes = context_id_to_bytes(context_id);
 
@@ -2312,7 +3631,7 @@ impl ContextManager {
             self.persist_context_snapshot(context_id, snapshot);
         }
         self.event_log
-            .append_context_event(&context_id_bytes, "ThresholdModified")?;
+            .append_context_event(&context_id_bytes, "ThresholdModified", actor_did)?;
         Ok(())
     }
 
@@ -2324,6 +3643,7 @@ impl ContextManager {
         context_id: &str,
         interface: &ToolInterface,
         _proposal_id: ProposalId,
+        actor_did: &str,
     ) -> Result<(), ContextError> {
         let context_id_bytes = context_id_to_bytes(context_id);
 
@@ -2357,8 +3677,11 @@ impl ContextManager {
         if let Some(snapshot) = snapshot {
             self.persist_context_snapshot(context_id, snapshot);
         }
-        self.event_log
-            .append_context_event(&context_id_bytes, "ToolInterfaceEstablished")?;
+        self.event_log.append_context_event(
+            &context_id_bytes,
+            "ToolInterfaceEstablished",
+            actor_did,
+        )?;
         Ok(())
     }
 
@@ -2368,6 +3691,7 @@ impl ContextManager {
         did: &DID,
         _reason: &str,
         _proposal_id: ProposalId,
+        actor_did: &str,
     ) -> Result<(), ContextError> {
         let context_id_bytes = context_id_to_bytes(context_id);
         {
@@ -2383,15 +3707,77 @@ impl ContextManager {
         }
         // Member reset = leave + immediately re-join (ADR-029 §Tier 3).
         // Step 1: Remove from MLS group (destroys stale leaf node).
-        self.crypto
+        let remove_output = self
+            .crypto
             .remove_member(&context_id_bytes, did)
             .map_err(|e| ContextError::MembershipFailed(e.to_string()))?;
         // Step 2: Re-add to MLS group with fresh key material.
-        self.crypto
+        let add_output = self
+            .crypto
             .add_member(&context_id_bytes, did, None)
             .map_err(|e| ContextError::MembershipFailed(e.to_string()))?;
+
+        // Broadcast the MLS Commits so remaining members can process
+        // the remove and re-add epoch changes. PR #1606 C6: each commit
+        // is enqueued on transport failure and retried by the governance
+        // timeout task with exponential backoff.
+        self.try_broadcast_commit_or_enqueue(
+            context_id,
+            remove_output.commit_bytes,
+            CommitOperation::ResetMember {
+                target_did: did.clone(),
+                is_remove: true,
+            },
+            actor_did,
+        )
+        .await?;
+        self.try_broadcast_commit_or_enqueue(
+            context_id,
+            add_output.commit_bytes,
+            CommitOperation::ResetMember {
+                target_did: did.clone(),
+                is_remove: false,
+            },
+            actor_did,
+        )
+        .await?;
+
+        // H5: Sender key rotation after MLS reset — remove the reset
+        // member's stale sender key, rotate our own key, and distribute
+        // new key material to remaining members (§9.16.4). This ensures
+        // the reset member cannot decrypt messages sent with the old key.
+        if let Err(e) = self
+            .crypto
+            .remove_member_sender_key(&context_id_bytes, did.as_ref())
+        {
+            tracing::warn!(
+                context_id,
+                member = %did,
+                error = %e,
+                "remove_member_sender_key failed after MLS reset — \
+                 sender key layer may retain stale key"
+            );
+        }
+        if let Err(e) = self.crypto.rotate_sender_key(&context_id_bytes) {
+            tracing::warn!(
+                context_id,
+                error = %e,
+                "rotate_sender_key failed after MLS reset"
+            );
+        }
+
+        // Drain pending sender key distribution messages, MLS-encrypt,
+        // and deliver via transport (same pattern as lifecycle leave).
+        if let Err(e) = self.drain_and_deliver_sender_keys(context_id, &context_id_bytes) {
+            tracing::warn!(
+                context_id = %context_id,
+                error = %e,
+                "failed to deliver rotated sender keys after member reset"
+            );
+        }
+
         self.event_log
-            .append_context_event(&context_id_bytes, "MemberReset")?;
+            .append_context_event(&context_id_bytes, "MemberReset", actor_did)?;
 
         // Track the epoch reset so the governance timeout task can invalidate
         // this member's votes on pending proposals (ADR-031 §5, ADR-029 Tier 3).
@@ -2412,6 +3798,7 @@ impl ContextManager {
         proposal_b: &ProposalId,
         resolution: &scp_protocol::context::governance::ConflictResolution,
         _proposal_id: ProposalId,
+        actor_did: &str,
     ) -> Result<(), ContextError> {
         let context_id_bytes = context_id_to_bytes(context_id);
 
@@ -2521,8 +3908,11 @@ impl ContextManager {
         if let Some(snapshot) = snapshot {
             self.persist_context_snapshot(context_id, snapshot);
         }
-        self.event_log
-            .append_context_event(&context_id_bytes, "GovernanceConflictResolved")?;
+        self.event_log.append_context_event(
+            &context_id_bytes,
+            "GovernanceConflictResolved",
+            actor_did,
+        )?;
         Ok(())
     }
 
@@ -2541,6 +3931,7 @@ impl ContextManager {
         context_id: &str,
         approvals: &[scp_protocol::context::governance::SignedVote],
         _proposal_id: ProposalId,
+        actor_did: &str,
     ) -> Result<(), ContextError> {
         let context_id_bytes = context_id_to_bytes(context_id);
 
@@ -2596,174 +3987,21 @@ impl ContextManager {
             self.persist_context_snapshot(context_id, snapshot);
         }
         self.event_log
-            .append_context_event(&context_id_bytes, "ContextPromoted")?;
+            .append_context_event(&context_id_bytes, "ContextPromoted", actor_did)?;
         Ok(())
     }
 
     /// Revokes a member's write access per §9.17 and ADR-038.
     ///
     /// Scope differentiation:
-    /// - `Full`: destroys the target's sender/broadcast key AND revokes
+    /// - `AccessScope::Both`: destroys the target's sender/broadcast key AND revokes
     ///   write capability. Historical content by the target may be
     ///   suppressed by the access key layer.
-    /// - `FutureOnly`: revokes write capability only. No key destruction
+    /// - `AccessScope::Write`: revokes write capability only. No key destruction
     ///   — existing broadcast keys remain for historical decryption.
     ///
     /// Redundancy: revoke-when-already-revoked is a no-op (§5.9).
     /// The member remains in the context (membership/access decoupling).
-    async fn execute_revoke_write_access(
-        &self,
-        context_id: &str,
-        did: &DID,
-        scope: RevocationScope,
-        _proposal_id: ProposalId,
-    ) -> Result<(), ContextError> {
-        let context_id_bytes = context_id_to_bytes(context_id);
-
-        let (snapshot, bc_snapshot) = {
-            let mut contexts = self.contexts.lock().await;
-            let ctx = contexts
-                .get_mut(context_id)
-                .ok_or_else(|| ContextError::ContextNotRegistered(context_id.to_owned()))?;
-            require_active(&ctx.handle)?;
-
-            if !ctx.role_state.ceiling.contains(&Capability::MemberBan) {
-                return Err(ContextError::PermissionDenied(
-                    "MemberBan capability not in ceiling".to_owned(),
-                ));
-            }
-            if !ctx.membership.contains(did) {
-                return Err(ContextError::MemberNotFound(did.to_string()));
-            }
-
-            // Redundant operation handling (§5.9):
-            // Already write-revoked → no-op that returns success.
-            if ctx.access.write_revoked_members.contains(did) {
-                return Ok(());
-            }
-
-            // Mark member as write-revoked. The member remains present but
-            // their messages will be rejected by the send path.
-            ctx.access.write_revoked_members.insert(did.clone());
-
-            // Presence-only check: if both read AND write are revoked,
-            // strip GovernanceVote and GovernancePropose capabilities (§5.9).
-            if ctx.access.read_revoked_members.contains(did) {
-                ctx.role_state.revoke_governance_capabilities(did);
-            }
-
-            // Full scope: destroy the author's sender/broadcast key so
-            // historical content is suppressed and key requests return Deny.
-            // FutureOnly scope: only block future writes via write_revoked_members.
-            let bc_snap = match scope {
-                RevocationScope::Full => ctx
-                    .broadcast_context
-                    .as_mut()
-                    .map(|bc| {
-                        match bc.block_author(&did.0) {
-                            Ok(_) | Err(ContextError::MemberNotFound(_)) => {}
-                            Err(e) => return Err(e),
-                        }
-                        Ok(if self.has_persistence() {
-                            Some(bc.to_snapshot())
-                        } else {
-                            None
-                        })
-                    })
-                    .transpose()?
-                    .flatten(),
-                RevocationScope::FutureOnly => None,
-            };
-
-            // Emit write access revoked event to receive buffer.
-            ctx.receive_buffer
-                .push(ContextEvent::WriteAccessRevoked { did: did.clone() });
-
-            let snap = if self.has_persistence() {
-                Some(Self::snapshot_context(ctx))
-            } else {
-                None
-            };
-            (snap, bc_snap)
-        };
-
-        if let Some(snapshot) = snapshot {
-            self.persist_context_snapshot(context_id, snapshot);
-        }
-        if let Some(ref bc_snap) = bc_snapshot {
-            self.persist_broadcast_snapshot(context_id, bc_snap);
-        }
-        self.event_log
-            .append_context_event(&context_id_bytes, "WriteAccessRevoked")?;
-        Ok(())
-    }
-
-    /// Restores a member's write access per §9.17 and ADR-038.
-    ///
-    /// Restoration is always forward-only (§9.16.8): the member can
-    /// publish new messages but previously suppressed content remains
-    /// suppressed. The member gets a new sender key (in broadcast mode,
-    /// new broadcast key at new epoch; in encrypted mode, re-inclusion
-    /// in MLS group key distribution).
-    ///
-    /// Redundancy: restore-when-never-revoked returns
-    /// [`ContextError::NothingToRestore`] (§5.9).
-    async fn execute_restore_write_access(
-        &self,
-        context_id: &str,
-        did: &DID,
-        _proposal_id: ProposalId,
-    ) -> Result<(), ContextError> {
-        let context_id_bytes = context_id_to_bytes(context_id);
-
-        let snapshot = {
-            let mut contexts = self.contexts.lock().await;
-            let ctx = contexts
-                .get_mut(context_id)
-                .ok_or_else(|| ContextError::ContextNotRegistered(context_id.to_owned()))?;
-            require_active(&ctx.handle)?;
-
-            if !ctx.role_state.ceiling.contains(&Capability::MemberBan) {
-                return Err(ContextError::PermissionDenied(
-                    "MemberBan capability not in ceiling".to_owned(),
-                ));
-            }
-
-            // Redundant operation handling (§5.9):
-            // Restoring access that was never revoked → NothingToRestore.
-            if !ctx.access.write_revoked_members.contains(did) {
-                return Err(ContextError::NothingToRestore(format!(
-                    "write access was never revoked for {did}"
-                )));
-            }
-
-            ctx.access.write_revoked_members.remove(did);
-
-            // Restore governance capabilities if member is no longer
-            // presence-only (i.e., read access is not also revoked).
-            if !ctx.access.read_revoked_members.contains(did) {
-                ctx.role_state.restore_governance_capabilities(did);
-            }
-
-            // Emit write access restored event to receive buffer.
-            ctx.receive_buffer
-                .push(ContextEvent::WriteAccessRestored { did: did.clone() });
-
-            if self.has_persistence() {
-                Some(Self::snapshot_context(ctx))
-            } else {
-                None
-            }
-        };
-
-        if let Some(snapshot) = snapshot {
-            self.persist_context_snapshot(context_id, snapshot);
-        }
-        self.event_log
-            .append_context_event(&context_id_bytes, "WriteAccessRestored")?;
-        Ok(())
-    }
-
     /// Rotates all access keys context-wide per §9.17 and ADR-038.
     ///
     /// In broadcast mode: rotates every author's broadcast key (epoch
@@ -2777,25 +4015,30 @@ impl ContextManager {
         context_id: &str,
         reason: Option<&str>,
         _proposal_id: ProposalId,
+        actor_did: &str,
     ) -> Result<(), ContextError> {
         let context_id_bytes = context_id_to_bytes(context_id);
 
-        let (snapshot, bc_snapshot) = {
+        let (epoch_output, snapshot, bc_snapshot) = {
             let mut contexts = self.contexts.lock().await;
             let ctx = contexts
                 .get_mut(context_id)
                 .ok_or_else(|| ContextError::ContextNotRegistered(context_id.to_owned()))?;
             require_active(&ctx.handle)?;
 
-            let bc_snap = if let Some(ref mut bc) = ctx.broadcast_context {
+            let (epoch_out, bc_snap) = if let Some(ref mut bc) = ctx.broadcast_context {
                 // Rotate every author's broadcast key (epoch advance + new key).
                 bc.rotate_all_author_keys()?;
-                if self.has_persistence() {
+                let snap = if self.has_persistence() {
                     Some(bc.to_snapshot())
                 } else {
                     None
-                }
+                };
+                (None, snap)
             } else {
+                // Encrypted mode: advance MLS epoch via propose_update (#1548).
+                let epoch_out = self.crypto.advance_epoch(&context_id_bytes)?;
+
                 // Encrypted mode: regenerate per-member access keys at a new
                 // epoch (§9.17.2 step 6, ADR-038). MLS key rotation and access
                 // key rotation are independent — MLS handles group secrets,
@@ -2821,7 +4064,7 @@ impl ContextManager {
                     let did = new_key.member_did().to_owned();
                     ctx.access.access_key_store.set(context_id, &did, new_key);
                 }
-                None
+                (Some(epoch_out), None)
             };
 
             // Emit content keys rotated event to receive buffer.
@@ -2834,8 +4077,22 @@ impl ContextManager {
             } else {
                 None
             };
-            (snap, bc_snap)
+            (epoch_out, snap, bc_snap)
         };
+
+        // Broadcast the MLS epoch advance Commit to all members (encrypted mode).
+        // PR #1606 C6: enqueue for persistent retry on transport failure.
+        if let Some(epoch_out) = epoch_output {
+            self.try_broadcast_commit_or_enqueue(
+                context_id,
+                epoch_out.commit_bytes,
+                CommitOperation::RotateContentKeys {
+                    reason: reason.map(String::from),
+                },
+                actor_did,
+            )
+            .await?;
+        }
 
         if let Some(snapshot) = snapshot {
             self.persist_context_snapshot(context_id, snapshot);
@@ -2845,7 +4102,7 @@ impl ContextManager {
         }
 
         self.event_log
-            .append_context_event(&context_id_bytes, "ContentKeysRotated")?;
+            .append_context_event(&context_id_bytes, "ContentKeysRotated", actor_did)?;
         Ok(())
     }
 
@@ -2855,6 +4112,7 @@ impl ContextManager {
         changes: &[scp_protocol::context::governance::GovernanceReconfigAction],
         justification: &scp_protocol::context::governance::DeadlockJustification,
         _proposal_id: ProposalId,
+        actor_did: &str,
     ) -> Result<(), ContextError> {
         if changes.is_empty() {
             return Err(ContextError::PermissionDenied(
@@ -2940,8 +4198,11 @@ impl ContextManager {
         if let Some(snapshot) = snapshot {
             self.persist_context_snapshot(context_id, snapshot);
         }
-        self.event_log
-            .append_context_event(&context_id_bytes, "GovernanceReconfigured")?;
+        self.event_log.append_context_event(
+            &context_id_bytes,
+            "GovernanceReconfigured",
+            actor_did,
+        )?;
         Ok(())
     }
 
@@ -2967,7 +4228,12 @@ impl ContextManager {
         context_id: &str,
         policy: &EconomicPolicy,
         proposal_id: ProposalId,
+        actor_did: &str,
     ) -> Result<(), ContextError> {
+        // Validate that pricing formula only references available metrics.
+        scp_protocol::economy::policy::validate_economic_policy_metrics(Some(policy))
+            .map_err(|e| ContextError::PermissionDenied(format!("invalid economic policy: {e}")))?;
+
         let context_id_bytes = context_id_to_bytes(context_id);
 
         let snapshot = {
@@ -3021,8 +4287,11 @@ impl ContextManager {
         if let Some(snapshot) = snapshot {
             self.persist_context_snapshot(context_id, snapshot);
         }
-        self.event_log
-            .append_context_event(&context_id_bytes, "EconomicPolicyChanged")?;
+        self.event_log.append_context_event(
+            &context_id_bytes,
+            "EconomicPolicyChanged",
+            actor_did,
+        )?;
         Ok(())
     }
 
@@ -3072,7 +4341,7 @@ impl ContextManager {
                 self.persist_context_snapshot(context_id, snapshot);
             }
             self.event_log
-                .append_context_event(&context_id_bytes, "EconomicPolicyApplied")?;
+                .append_context_event(&context_id_bytes, "EconomicPolicyApplied", "")?;
         }
 
         Ok(applied)
@@ -3097,6 +4366,7 @@ impl ContextManager {
         amount: scp_protocol::economy::types::Amount,
         purpose: &str,
         _proposal_id: ProposalId,
+        actor_did: &str,
     ) -> Result<(), ContextError> {
         let context_id_bytes = context_id_to_bytes(context_id);
 
@@ -3132,7 +4402,7 @@ impl ContextManager {
             "purpose": purpose,
         });
         self.event_log
-            .append_context_event(&context_id_bytes, &payload.to_string())?;
+            .append_context_event(&context_id_bytes, &payload.to_string(), actor_did)?;
         Ok(())
     }
 
@@ -3148,6 +4418,7 @@ impl ContextManager {
         &self,
         context_id: &str,
         _proposal_id: ProposalId,
+        actor_did: &str,
     ) -> Result<(), ContextError> {
         let context_id_bytes = context_id_to_bytes(context_id);
 
@@ -3184,8 +4455,92 @@ impl ContextManager {
         if let Some(snapshot) = snapshot {
             self.persist_context_snapshot(context_id, snapshot);
         }
-        self.event_log
-            .append_context_event(&context_id_bytes, "EconomicPolicyLocked")?;
+        self.event_log.append_context_event(
+            &context_id_bytes,
+            "EconomicPolicyLocked",
+            actor_did,
+        )?;
+        Ok(())
+    }
+
+    /// Executes a `ModifyHardRateLimit` governance action (D4, §19.7).
+    ///
+    /// Replaces the context's `TokenBucketLimiter` configuration with a
+    /// new `HardRateLimitConfig`, preserving per-sender bucket state so
+    /// active senders are not given a spurious free burst. The new
+    /// config is validated at execution time to prevent a malformed
+    /// config from reaching the limiter hot path.
+    ///
+    /// # Errors
+    ///
+    /// - [`ContextError::ContextNotRegistered`] if the context is not registered.
+    /// - [`ContextError::ContextNotActive`] if the context is not active.
+    /// - [`ContextError::GovernanceFailed`] if `new_config` fails validation.
+    async fn execute_modify_hard_rate_limit(
+        &self,
+        context_id: &str,
+        new_config: &scp_protocol::economy::antispam::HardRateLimitConfig,
+        _proposal_id: ProposalId,
+        actor_did: &str,
+    ) -> Result<(), ContextError> {
+        let context_id_bytes = context_id_to_bytes(context_id);
+
+        // Validate BEFORE touching per-context state so a malformed
+        // proposal cannot corrupt the active limiter.
+        new_config.validate().map_err(|e| {
+            ContextError::GovernanceFailed(format!(
+                "ModifyHardRateLimit: new config failed validation: {e}"
+            ))
+        })?;
+
+        let snapshot = {
+            let mut contexts = self.contexts.lock().await;
+            let ctx = contexts
+                .get_mut(context_id)
+                .ok_or_else(|| ContextError::ContextNotRegistered(context_id.to_owned()))?;
+            require_active(&ctx.handle)?;
+
+            // Preserve per-sender bucket state across the reconfigure
+            // and eagerly clamp `tokens_milli > new_burst_milli` before
+            // handing the state to `from_snapshot`. `from_snapshot`
+            // itself does not clamp; without this sanitize step a
+            // sender holding more tokens than the NEW burst could
+            // consume them before refill applies `.min(burst_milli)`,
+            // granting a free burst up to the old cap when the limit
+            // tightens.
+            let mut preserved_state = ctx.governance.hard_rate_limit.snapshot_entries();
+            scp_protocol::economy::antispam::TokenBucketLimiter::validate_and_sanitize_snapshot(
+                &mut preserved_state,
+                new_config,
+                self.clock.now_secs(),
+                scp_protocol::economy::antispam::SNAPSHOT_CLOCK_SKEW_TOLERANCE_SECS,
+            )
+            .map_err(|e| {
+                ContextError::GovernanceFailed(format!(
+                    "ModifyHardRateLimit: preserved state sanitization failed: {e}"
+                ))
+            })?;
+            ctx.governance.hard_rate_limit =
+                scp_protocol::economy::antispam::TokenBucketLimiter::from_snapshot(
+                    new_config.clone(),
+                    preserved_state,
+                );
+
+            if self.has_persistence() {
+                Some(Self::snapshot_context(ctx))
+            } else {
+                None
+            }
+        };
+
+        if let Some(snapshot) = snapshot {
+            self.persist_context_snapshot(context_id, snapshot);
+        }
+        self.event_log.append_context_event(
+            &context_id_bytes,
+            "HardRateLimitModified",
+            actor_did,
+        )?;
         Ok(())
     }
 
@@ -3200,6 +4555,7 @@ impl ContextManager {
     /// - [`ContextError::ContextNotRegistered`] if the context is not registered.
     /// - [`ContextError::ContextNotActive`] if the context is not active.
     /// - [`ContextError::InvalidTransition`] if the state transition fails.
+    #[allow(clippy::too_many_arguments)]
     async fn execute_propose_context_migration(
         &self,
         context_id: &str,
@@ -3208,6 +4564,7 @@ impl ContextManager {
         grace_period_secs: u64,
         auto_invite: bool,
         proposal_id: ProposalId,
+        actor_did: &str,
     ) -> Result<MigrationProposedResult, ContextError> {
         let context_id_bytes = context_id_to_bytes(context_id);
 
@@ -3335,8 +4692,11 @@ impl ContextManager {
         if let Some(snapshot) = snapshot {
             self.persist_context_snapshot(context_id, snapshot);
         }
-        self.event_log
-            .append_context_event(&context_id_bytes, "ContextMigrationStarted")?;
+        self.event_log.append_context_event(
+            &context_id_bytes,
+            "ContextMigrationStarted",
+            actor_did,
+        )?;
 
         Ok(MigrationProposedResult {
             destination_context_id,
@@ -3358,6 +4718,7 @@ impl ContextManager {
         &self,
         context_id: &str,
         _proposal_id: ProposalId,
+        actor_did: &str,
     ) -> Result<(), ContextError> {
         let context_id_bytes = context_id_to_bytes(context_id);
 
@@ -3420,6 +4781,7 @@ impl ContextManager {
                 "ContextMigrationCancelled:{}",
                 hex::encode(original_proposal_id)
             ),
+            actor_did,
         )?;
         Ok(())
     }
@@ -3501,6 +4863,8 @@ impl ContextManager {
             ctx.broadcast_context = None;
             // Clear migration state.
             ctx.migration_state = None;
+            // M7: Participation decay on tombstone (#1530).
+            ctx.governance.decay_participation();
 
             let snapshot = if self.has_persistence() {
                 Some(Self::snapshot_context(ctx))
@@ -3520,6 +4884,7 @@ impl ContextManager {
                 destination_id,
                 hex::encode(migration_pid)
             ),
+            "",
         )?;
         Ok(())
     }
@@ -3571,6 +4936,7 @@ impl ContextManager {
                     action_summary: action.variant_name().to_owned(),
                     executor_did: executor_did.clone(),
                     resulting_epoch: *resulting_epoch,
+                    target_did: action.target_did().cloned(),
                 },
                 // These variants are not expected from timeout processing;
                 // listed explicitly so the compiler warns on new variants.
@@ -3612,12 +4978,20 @@ impl ContextManager {
     /// 1. Checks active proposals for timeout expiry via `resolve()`.
     /// 2. Detects proposer/voter departures and adjusts tallies.
     /// 3. Detects deadlock conditions and emits recovery events.
+    /// 4. Evaluates consequence rules for all members (#1531).
+    /// 5. Drains the persistent MLS commit broadcast retry queue (PR #1606 C6).
     ///
     /// The task stops when the context is no longer `Active` or when
     /// cancelled via [`GovernanceTimeoutTask::cancel()`].
+    #[allow(clippy::too_many_lines)] // Five-phase task spawn closure; phases are factored into helper methods.
     pub(super) async fn start_governance_timeout_task(&self, context_id: &str) {
         let contexts = Arc::clone(&self.contexts);
         let clock = Arc::clone(&self.clock);
+        let event_log = Arc::clone(&self.event_log);
+        // PR #1606 C6: capture the transport so the commit retry phase can
+        // re-attempt MLS Commit broadcasts without needing a `&self` reference
+        // (the spawned task does not own the manager).
+        let transport = Arc::clone(&self.transport);
         let ctx_id = context_id.to_owned();
 
         let mut contexts_guard = self.contexts.lock().await;
@@ -3628,9 +5002,15 @@ impl ContextManager {
         ctx.governance.timeout_task.start({
             let ctx_id = ctx_id.clone();
             let clock = Arc::clone(&clock);
+            let event_log = Arc::clone(&event_log);
+            let transport = Arc::clone(&transport);
             move || {
                 let contexts = Arc::clone(&contexts);
                 let clock = Arc::clone(&clock);
+                let event_log = Arc::clone(&event_log);
+                let transport_for_retry = Arc::clone(&transport);
+                let event_log_for_retry = Arc::clone(&event_log);
+                let clock_for_retry = Arc::clone(&clock);
                 let ctx_id = ctx_id.clone();
                 async move {
                     // Phase 1: Acquire lock, snapshot data, process proposals,
@@ -3662,6 +5042,10 @@ impl ContextManager {
                             .cloned()
                             .collect();
                         ctx.governance.last_known_members = current_members;
+
+                        // Evict stale cache entries to prevent unbounded growth
+                        // of participation_cache and cooldown_until (#1530).
+                        ctx.governance.evict_stale_entries(clock.now_secs());
 
                         // Drain epoch-reset members accumulated since last tick
                         // (ADR-031 §5: votes from reset members are invalidated).
@@ -3731,17 +5115,124 @@ impl ContextManager {
                         }
                     }
 
+                    // Phase 4: Periodic consequence evaluation (#1531).
+                    Self::evaluate_periodic_consequences(&contexts, &ctx_id, &*clock, &*event_log)
+                        .await;
+
+                    // Phase 5 (PR #1606 C6): drain the persistent MLS
+                    // commit retry queue. Retries any pending commits
+                    // whose backoff timer has elapsed and either dequeues
+                    // them on success or marks the context fail-closed
+                    // when the retry budget is exhausted.
+                    //
+                    // Note: this phase needs `&self` (transport, event log,
+                    // clock) which the closure captures via Self in the
+                    // outer task. The outer task does not have a `self`
+                    // reference, so we delegate to the static helper
+                    // `process_pending_commits_static` that takes the same
+                    // bag of providers the closure already captures.
+                    Self::process_pending_commits_static(
+                        &contexts,
+                        &ctx_id,
+                        Arc::clone(&transport_for_retry),
+                        Arc::clone(&event_log_for_retry),
+                        Arc::clone(&clock_for_retry),
+                    )
+                    .await;
+
                     true // Continue the loop.
                 }
             }
         });
     }
 
+    /// Phase 4 of the governance timeout task: evaluates consequence rules for
+    /// all members (#1531).
+    ///
+    /// Time-based rules (e.g., "if no messages in 1 hour, downgrade role") must
+    /// fire even when no user action occurs. Evaluates all members on every
+    /// tick. Early return when no rules are configured (the common case).
+    async fn evaluate_periodic_consequences(
+        contexts: &Arc<super::Mutex<super::HashMap<String, PerContextState>>>,
+        ctx_id: &str,
+        clock: &dyn Clock,
+        event_log: &dyn super::super::builder::ContextEventLogProvider,
+    ) {
+        // M9: Clone data under lock, drop lock for evaluation, reacquire
+        // for enforcement. This prevents holding the contexts lock for
+        // the entire evaluation duration (which includes event log I/O).
+        let now = clock.now_secs();
+        let (rules, member_dids, events) = {
+            let contexts_guard = contexts.lock().await;
+            let Some(ctx) = contexts_guard.get(ctx_id) else {
+                return;
+            };
+            let rules = ctx.governance.consequence_rules.clone();
+            if rules.is_empty() {
+                return;
+            }
+            let member_dids: Vec<DID> = ctx.membership.members().map(|m| m.did.clone()).collect();
+            let events = event_log_entries_for_consequences(ctx, ctx_id, now, event_log);
+            (rules, member_dids, events)
+        };
+        // Lock dropped — pure evaluation with no lock held.
+        let mut results: Vec<(DID, Vec<TriggeredConsequence>)> = Vec::new();
+        for member_did in member_dids {
+            let triggered = evaluate_consequence_rules(&rules, &events, member_did.as_ref(), now);
+            if !triggered.is_empty() {
+                results.push((member_did, triggered));
+            }
+        }
+        if results.is_empty() {
+            return;
+        }
+        // Reacquire lock for enforcement.
+        let mut contexts_guard = contexts.lock().await;
+        let Some(ctx) = contexts_guard.get_mut(ctx_id) else {
+            return;
+        };
+        for (member_did, triggered) in &results {
+            enforce_triggered_consequences(
+                ctx,
+                &EnforceConsequencesCtx {
+                    context_id: ctx_id,
+                    member_did,
+                    now,
+                    triggered,
+                    rules: &rules,
+                    clock,
+                    event_log,
+                },
+            );
+        }
+    }
+
     /// Detects and handles conflicts when a proposal becomes approved (ADR-031 §7).
     ///
     /// Checks if the newly approved proposal conflicts with any other approved
-    /// proposals. Handles sequential conflicts (lower sequence number wins) and
-    /// simultaneous conflicts (governance freeze).
+    /// proposals. Handles sequential conflicts (lower monotonic sequence
+    /// number wins) and simultaneous conflicts (governance freeze).
+    ///
+    /// # H10: monotonic seq, not wall-clock timestamp
+    ///
+    /// Sequence numbers come from
+    /// [`GovernanceState::next_proposal_seq`], a strictly monotonic
+    /// per-context counter persisted in the snapshot. Previously this
+    /// function used `clock.now_secs()` (1-second granularity) as the
+    /// sequence. Two proposals approved within the same wall-clock
+    /// second compared as `Equal`, which routed them into a 48-hour
+    /// governance freeze. With `GovernancePropose` capability, an
+    /// attacker could race a conflicting proposal against any defensive
+    /// admin action and brick governance for two days. The monotonic
+    /// counter eliminates that collision window: every approved
+    /// proposal receives a strictly unique seq, even within the same
+    /// wall-clock second and even across process restarts (the counter
+    /// is persisted).
+    ///
+    /// The wall-clock timestamp is still recorded in the third tuple
+    /// slot (`approved_at_unix_secs`) and on the freeze record so audit
+    /// consumers and the 48-hour freeze-expiry timer continue to work
+    /// against real time.
     ///
     /// # Arguments
     /// * `ctx` - The context state containing approved proposals
@@ -3758,7 +5249,20 @@ impl ContextManager {
         use scp_protocol::context::governance::{GovernanceEvent, actions_conflict};
 
         let mut events = Vec::new();
+        // Wall-clock timestamp — used ONLY for the audit slot of
+        // `approved_proposals` and for the freeze start time. Never
+        // used for sequence comparison (H10).
         let current_timestamp = self.clock.now_secs();
+
+        // H10: assign the monotonic seq for the new proposal up front,
+        // and bump the counter immediately so any nested or concurrent
+        // call cannot reuse it. `saturating_add` matches the rest of
+        // the runtime — wraparound is impossible in practice (u64 at
+        // 1 proposal/sec exceeds the heat death of the universe), and
+        // saturating semantics prevent any DoS vector even under
+        // pathological forged input.
+        let new_seq = ctx.governance.next_proposal_seq;
+        ctx.governance.next_proposal_seq = ctx.governance.next_proposal_seq.saturating_add(1);
 
         // Check for conflicts with existing approved proposals
         let mut conflicts = Vec::new();
@@ -3780,16 +5284,26 @@ impl ContextManager {
             }
         }
 
-        // Handle conflicts
+        // Handle conflicts. `new_seq` is strictly greater than every
+        // existing `existing_seq` (the counter is monotonic and we
+        // bumped it above), so the `Equal` arm is now mathematically
+        // unreachable from a real call site. The only way it could
+        // fire is via a synthesized `existing_seq` equal to the
+        // pre-bump counter — i.e. via tampered persistence. We keep
+        // the arm as defense-in-depth: a corrupted snapshot still
+        // routes into the freeze rather than silently dropping a
+        // proposal, which preserves the existing 48-hour
+        // resolution-window invariant for that pathological case.
         for (conflicting_id, conflicting_seq, _conflicting_timestamp, _conflicting_proposal) in
             conflicts
         {
-            // Assign sequence numbers - for now, use timestamp as sequence
-            let new_seq = current_timestamp;
-
             match new_seq.cmp(&conflicting_seq) {
                 std::cmp::Ordering::Equal => {
-                    // Simultaneous conflict - enter governance freeze
+                    // Simultaneous conflict — only reachable via
+                    // tampered persistence (see above). Enter
+                    // governance freeze with the wall-clock start
+                    // time so the 48-hour expiry works against real
+                    // time, not the monotonic counter.
                     ctx.governance.freeze =
                         Some((new_proposal.proposal_id, conflicting_id, current_timestamp));
                     events.push(GovernanceEvent::ConflictDetected {
@@ -3798,7 +5312,16 @@ impl ContextManager {
                     });
                 }
                 std::cmp::Ordering::Less => {
-                    // New proposal wins - invalidate the conflicting one
+                    // Lower seq wins — the new proposal supersedes
+                    // the existing one. With the monotonic counter,
+                    // `new_seq` is always strictly greater than
+                    // every `existing_seq` produced by this code
+                    // path, so this branch is only reachable via
+                    // tampered persistence (an attacker-supplied
+                    // snapshot with `existing_seq > next_proposal_seq`).
+                    // Behavior is preserved as-is for spec
+                    // consistency — the runtime always honors
+                    // "lower seq wins" regardless of source.
                     ctx.governance.approved_proposals.remove(&conflicting_id);
                     events.push(GovernanceEvent::ConflictResolved {
                         winner_id: new_proposal.proposal_id,
@@ -3806,8 +5329,16 @@ impl ContextManager {
                     });
                 }
                 std::cmp::Ordering::Greater => {
-                    // Existing proposal wins - invalidate the new one
-                    // Don't add the new proposal to approved_proposals
+                    // The normal sequential-conflict case: an earlier
+                    // proposal already exists (lower seq → earlier),
+                    // so it wins and the new proposal is invalidated.
+                    // We do NOT add the new proposal to
+                    // `approved_proposals`, but the monotonic counter
+                    // has already been bumped — by design, every
+                    // conflict-detection invocation consumes a seq
+                    // slot regardless of outcome, so sequence
+                    // numbers are stable across retries and never
+                    // reused.
                     events.push(GovernanceEvent::ConflictResolved {
                         winner_id: conflicting_id,
                         loser_id: new_proposal.proposal_id,
@@ -3817,11 +5348,15 @@ impl ContextManager {
             }
         }
 
-        // Add the new proposal to approved proposals if not invalidated
+        // Add the new proposal to approved proposals if not invalidated.
+        // Tuple layout (see `GovernanceState::approved_proposals` doc):
+        //   .0 = the proposal itself
+        //   .1 = monotonic seq (for conflict resolution — H10)
+        //   .2 = wall-clock unix seconds at approval (audit only)
         if !events.iter().any(|e| matches!(e, GovernanceEvent::ConflictResolved { loser_id, .. } if *loser_id == new_proposal.proposal_id)) {
             ctx.governance.approved_proposals.insert(
                 new_proposal.proposal_id,
-                (new_proposal.clone(), current_timestamp, current_timestamp)
+                (new_proposal.clone(), new_seq, current_timestamp)
             );
         }
 
@@ -3889,5 +5424,408 @@ impl ContextManager {
             GovernanceEvent::ConflictResolved { .. } => "GovernanceConflictResolved",
             GovernanceEvent::GovernanceActionExecuted { .. } => "GovernanceActionExecuted",
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // PR #1606 C6: persistent MLS Commit broadcast retry queue
+    // -----------------------------------------------------------------------
+
+    /// Returns `Err(CommitBroadcastFault)` if the context has an active
+    /// commit fault marker (PR #1606 C6), otherwise `Ok(())`.
+    ///
+    /// Called by every governance executor that mutates context state. While
+    /// the marker is set, the context is fail-closed: no further mutations
+    /// are accepted until an operator clears the marker via
+    /// [`acknowledge_commit_fault`](Self::acknowledge_commit_fault).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ContextError::CommitBroadcastFault`] if the context has an
+    /// active fault marker.
+    pub(super) fn check_commit_fault(ctx: &PerContextState) -> Result<(), ContextError> {
+        if let Some(ref marker) = ctx.commit_fault {
+            return Err(ContextError::CommitBroadcastFault {
+                operation: marker.operation.label(),
+                reason: marker.reason.clone(),
+                attempts: marker.retry_count,
+            });
+        }
+        Ok(())
+    }
+
+    /// Attempts to broadcast an MLS Commit and, on transport failure,
+    /// enqueues the commit in the persistent retry queue (PR #1606 C6).
+    ///
+    /// On success: appends `CommitBroadcasted` to the durable event log.
+    /// On failure: appends a `PendingCommit` to `ctx.pending_commits`,
+    /// emits [`ContextEvent::CommitBroadcastPending`] to the receive
+    /// buffer, and writes `CommitBroadcastPending` to the durable event log.
+    ///
+    /// Acquires the contexts mutex internally — callers must NOT hold it.
+    /// Returns `Ok(())` even on transport failure: the persistent queue
+    /// makes broadcast loss recoverable, so callers should not abort the
+    /// caller-visible operation. The mutation that produced this commit
+    /// has already been applied locally.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ContextError::ContextNotRegistered`] if the context is
+    /// not registered.
+    /// Returns [`ContextError::EventLogFailed`] if the durable event log
+    /// append fails (rare; persistence is best-effort, but a failed log
+    /// append indicates a deeper subsystem fault).
+    pub(super) async fn try_broadcast_commit_or_enqueue(
+        &self,
+        context_id: &str,
+        commit_bytes: Vec<u8>,
+        operation: CommitOperation,
+        actor_did: &str,
+    ) -> Result<(), ContextError> {
+        if commit_bytes.is_empty() {
+            // No-op: nothing to broadcast (e.g., broadcast-mode contexts).
+            return Ok(());
+        }
+        let routing_id = scp_protocol::context::context_routing_id(context_id);
+        // First attempt: try to send immediately.
+        match self.transport.send_message(&routing_id, &commit_bytes) {
+            Ok(()) => {
+                let context_id_bytes = context_id_to_bytes(context_id);
+                self.event_log.append_context_event(
+                    &context_id_bytes,
+                    "CommitBroadcasted",
+                    actor_did,
+                )?;
+                Ok(())
+            }
+            Err(e) => {
+                let now = self.clock.now_secs();
+                let error_str = e.to_string();
+                let backoff = commit_retry_backoff(1);
+                let pending = PendingCommit {
+                    commit_bytes,
+                    routing_id,
+                    operation: operation.clone(),
+                    first_attempt_at: now,
+                    retry_count: 1,
+                    last_error: Some(error_str.clone()),
+                    next_attempt_at: now.saturating_add(backoff),
+                };
+                let label = operation.label();
+                let context_id_bytes = context_id_to_bytes(context_id);
+                {
+                    let mut contexts = self.contexts.lock().await;
+                    let ctx = contexts
+                        .get_mut(context_id)
+                        .ok_or_else(|| ContextError::ContextNotRegistered(context_id.to_owned()))?;
+                    // N2: Cap the pending commits queue to prevent unbounded
+                    // memory growth during sustained transport outages.
+                    if ctx.pending_commits.len() >= MAX_PENDING_COMMITS {
+                        ctx.commit_fault = Some(CommitFaultMarker {
+                            operation: operation.clone(),
+                            reason: format!(
+                                "pending commit queue full ({MAX_PENDING_COMMITS} entries)"
+                            ),
+                            retry_count: 1,
+                            failed_at: now,
+                        });
+                        ctx.receive_buffer
+                            .push(ContextEvent::CommitBroadcastFailed {
+                                operation: label.clone(),
+                                reason: format!("queue full ({MAX_PENDING_COMMITS}): {error_str}"),
+                                attempts: 1,
+                            });
+                        return Ok(());
+                    }
+                    ctx.pending_commits.push_back(pending);
+                    ctx.receive_buffer
+                        .push(ContextEvent::CommitBroadcastPending {
+                            operation: label.clone(),
+                            error: error_str.clone(),
+                            attempt: 1,
+                        });
+                }
+                self.event_log.append_context_event(
+                    &context_id_bytes,
+                    "CommitBroadcastPending",
+                    actor_did,
+                )?;
+                tracing::warn!(
+                    context_id = %context_id,
+                    operation = %label,
+                    error = %error_str,
+                    "MLS commit broadcast failed; enqueued for persistent retry (PR #1606 C6)"
+                );
+                Ok(())
+            }
+        }
+    }
+
+    /// Instance-method wrapper around
+    /// [`process_pending_commits_static`](Self::process_pending_commits_static)
+    /// that uses the manager's own providers.
+    ///
+    /// Called from tests and from any path that holds a `&self` reference.
+    /// The spawned governance timeout task uses the static helper directly
+    /// because it does not own the manager.
+    #[allow(dead_code)] // Used by tests; production path uses the static helper.
+    pub(super) async fn process_pending_commits(&self, context_id: &str) {
+        Self::process_pending_commits_static(
+            &self.contexts,
+            context_id,
+            Arc::clone(&self.transport),
+            Arc::clone(&self.event_log),
+            Arc::clone(&self.clock),
+        )
+        .await;
+    }
+
+    /// Processes the per-context MLS Commit retry queue (PR #1606 C6).
+    ///
+    /// Called periodically from
+    /// [`start_governance_timeout_task`](Self::start_governance_timeout_task).
+    /// Walks `ctx.pending_commits`, retries any commits whose
+    /// `next_attempt_at <= now`, and either:
+    /// 1. Dequeues on success (emits `CommitBroadcastSucceeded`).
+    /// 2. Updates retry count + next attempt on failure (emits
+    ///    `CommitBroadcastPending` with the new attempt count).
+    /// 3. Marks the context fail-closed and emits `CommitBroadcastFailed`
+    ///    when `retry_count >= MAX_COMMIT_RETRIES` or
+    ///    `now - first_attempt_at >= MAX_COMMIT_AGE_SECS`.
+    ///
+    /// All transport sends happen with the contexts lock RELEASED to
+    /// avoid holding the lock across I/O.
+    pub(super) async fn process_pending_commits_static(
+        contexts: &Arc<super::Mutex<super::HashMap<String, PerContextState>>>,
+        context_id: &str,
+        transport: Arc<dyn super::ContextTransportProvider>,
+        event_log: Arc<dyn super::ContextEventLogProvider>,
+        clock: Arc<dyn Clock>,
+    ) {
+        // Snapshot the queue under lock.
+        let snapshot: Vec<PendingCommit> = {
+            let contexts_guard = contexts.lock().await;
+            let Some(ctx) = contexts_guard.get(context_id) else {
+                return;
+            };
+            // If a fault marker is already set, do not retry — the queue
+            // is frozen until an operator acknowledges.
+            if ctx.commit_fault.is_some() {
+                return;
+            }
+            ctx.pending_commits.iter().cloned().collect()
+        };
+        if snapshot.is_empty() {
+            return;
+        }
+        let now = clock.now_secs();
+        // Phase A (no lock held): retry each pending entry whose backoff has
+        // elapsed and classify the outcome.
+        let outcomes = Self::compute_commit_retry_outcomes(&snapshot, now, transport.as_ref());
+        if outcomes.is_empty() {
+            return;
+        }
+        // Phase B (lock held): apply the outcomes to the queue.
+        let context_id_bytes = context_id_to_bytes(context_id);
+        let event_log_writes =
+            Self::apply_commit_retry_outcomes(contexts, context_id, outcomes, &*clock).await;
+        // Phase C (no lock held): append durable event log entries.
+        for label in event_log_writes {
+            if let Err(e) = event_log.append_context_event(&context_id_bytes, label, "system") {
+                tracing::warn!(
+                    context_id = %context_id,
+                    error = %e,
+                    "failed to append commit retry event to durable log"
+                );
+            }
+        }
+    }
+
+    /// Phase A of [`process_pending_commits_static`]: classifies each
+    /// pending commit whose backoff has elapsed as `Success`, `Retry`,
+    /// or `Failed`. Returns one outcome per processed entry (entries whose
+    /// `next_attempt_at` is still in the future are skipped).
+    fn compute_commit_retry_outcomes(
+        snapshot: &[PendingCommit],
+        now: u64,
+        transport: &dyn super::ContextTransportProvider,
+    ) -> Vec<CommitRetryOutcome> {
+        let mut outcomes: Vec<CommitRetryOutcome> = Vec::new();
+        for (idx, pending) in snapshot.iter().enumerate() {
+            if now < pending.next_attempt_at {
+                continue;
+            }
+            // Age budget check. If we're past MAX_COMMIT_AGE_SECS, force-fail
+            // without making another network call.
+            let age = now.saturating_sub(pending.first_attempt_at);
+            if age >= MAX_COMMIT_AGE_SECS {
+                outcomes.push(CommitRetryOutcome {
+                    index: idx,
+                    kind: CommitRetryOutcomeKind::Failed {
+                        reason: format!("max age exceeded ({age}s >= {MAX_COMMIT_AGE_SECS}s)"),
+                        attempts: pending.retry_count,
+                        operation: pending.operation.clone(),
+                    },
+                });
+                continue;
+            }
+            // Attempt the send.
+            match transport.send_message(&pending.routing_id, &pending.commit_bytes) {
+                Ok(()) => {
+                    outcomes.push(CommitRetryOutcome {
+                        index: idx,
+                        kind: CommitRetryOutcomeKind::Success {
+                            attempts: pending.retry_count,
+                            operation: pending.operation.clone(),
+                        },
+                    });
+                }
+                Err(e) => {
+                    let new_retry_count = pending.retry_count.saturating_add(1);
+                    if new_retry_count > MAX_COMMIT_RETRIES {
+                        outcomes.push(CommitRetryOutcome {
+                            index: idx,
+                            kind: CommitRetryOutcomeKind::Failed {
+                                reason: e.to_string(),
+                                attempts: new_retry_count,
+                                operation: pending.operation.clone(),
+                            },
+                        });
+                    } else {
+                        let backoff = commit_retry_backoff(new_retry_count);
+                        outcomes.push(CommitRetryOutcome {
+                            index: idx,
+                            kind: CommitRetryOutcomeKind::Retry {
+                                error: e.to_string(),
+                                next_attempt_at: now.saturating_add(backoff),
+                                new_retry_count,
+                                operation: pending.operation.clone(),
+                            },
+                        });
+                    }
+                }
+            }
+        }
+        outcomes
+    }
+
+    /// Phase B of [`process_pending_commits_static`]: applies the outcomes
+    /// to `PerContextState::pending_commits` under lock. Pushes receive
+    /// buffer events and returns the labels that should be appended to
+    /// the durable event log.
+    async fn apply_commit_retry_outcomes(
+        contexts: &Arc<super::Mutex<super::HashMap<String, PerContextState>>>,
+        context_id: &str,
+        outcomes: Vec<CommitRetryOutcome>,
+        clock: &dyn Clock,
+    ) -> Vec<&'static str> {
+        let mut event_log_writes: Vec<&'static str> = Vec::new();
+        let mut contexts_guard = contexts.lock().await;
+        let Some(ctx) = contexts_guard.get_mut(context_id) else {
+            return event_log_writes;
+        };
+        let queue_len = ctx.pending_commits.len();
+        // Apply outcomes by their snapshot index. The queue is only mutated
+        // by this task (success/failed removals) and by new enqueue calls
+        // (which append to the end), so prefix indices remain stable
+        // between Phase A and Phase B.
+        let mut to_remove: Vec<usize> = Vec::new();
+        for outcome in outcomes {
+            if outcome.index >= queue_len {
+                continue;
+            }
+            match outcome.kind {
+                CommitRetryOutcomeKind::Success {
+                    attempts,
+                    operation,
+                } => {
+                    ctx.receive_buffer
+                        .push(ContextEvent::CommitBroadcastSucceeded {
+                            operation: operation.label(),
+                            attempts,
+                        });
+                    event_log_writes.push("CommitBroadcastSucceeded");
+                    to_remove.push(outcome.index);
+                }
+                CommitRetryOutcomeKind::Retry {
+                    error,
+                    next_attempt_at,
+                    new_retry_count,
+                    operation,
+                } => {
+                    if let Some(entry) = ctx.pending_commits.get_mut(outcome.index) {
+                        entry.retry_count = new_retry_count;
+                        entry.next_attempt_at = next_attempt_at;
+                        entry.last_error = Some(error.clone());
+                    }
+                    ctx.receive_buffer
+                        .push(ContextEvent::CommitBroadcastPending {
+                            operation: operation.label(),
+                            error,
+                            attempt: new_retry_count,
+                        });
+                    event_log_writes.push("CommitBroadcastPending");
+                }
+                CommitRetryOutcomeKind::Failed {
+                    reason,
+                    attempts,
+                    operation,
+                } => {
+                    let now_failed = clock.now_secs();
+                    ctx.commit_fault = Some(CommitFaultMarker {
+                        operation: operation.clone(),
+                        reason: reason.clone(),
+                        failed_at: now_failed,
+                        retry_count: attempts,
+                    });
+                    ctx.receive_buffer
+                        .push(ContextEvent::CommitBroadcastFailed {
+                            operation: operation.label(),
+                            reason,
+                            attempts,
+                        });
+                    event_log_writes.push("CommitBroadcastFailed");
+                    to_remove.push(outcome.index);
+                }
+            }
+        }
+        // Remove successful/failed entries in reverse-index order so earlier
+        // indices stay valid.
+        to_remove.sort_unstable_by(|a, b| b.cmp(a));
+        for idx in to_remove {
+            ctx.pending_commits.remove(idx);
+        }
+        event_log_writes
+    }
+
+    /// Acknowledges a commit broadcast fault and clears the fail-close
+    /// marker so the context can accept further mutations (PR #1606 C6).
+    ///
+    /// This is the operator-driven recovery path. It does NOT re-attempt
+    /// the failed commit — that data is already lost (or unrecoverable
+    /// from the local node's perspective). Callers SHOULD reach out to
+    /// remaining members through an out-of-band channel to verify whether
+    /// the failed commit's effect (member removal, key rotation) needs to
+    /// be re-applied.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ContextError::ContextNotRegistered`] if the context is not
+    /// registered. Returns [`ContextError::InvalidState`] if no fault
+    /// marker is set.
+    #[instrument(skip_all, fields(context_id))]
+    pub async fn acknowledge_commit_fault(
+        &self,
+        context_id: &str,
+    ) -> Result<CommitFaultMarker, ContextError> {
+        let mut contexts = self.contexts.lock().await;
+        let ctx = contexts
+            .get_mut(context_id)
+            .ok_or_else(|| ContextError::ContextNotRegistered(context_id.to_owned()))?;
+        let marker = ctx.commit_fault.take().ok_or_else(|| {
+            ContextError::InvalidState(format!(
+                "context {context_id} has no commit fault to acknowledge"
+            ))
+        })?;
+        Ok(marker)
     }
 }

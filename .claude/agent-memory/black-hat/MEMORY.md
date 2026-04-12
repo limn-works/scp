@@ -202,3 +202,44 @@ Notes:
 - See [refactor-plan-adversarial-analysis.md](refactor-plan-adversarial-analysis.md)
 - BLACK-301 through BLACK-311: facade divergence, Phase B TOCTOU, asymmetric wiring, BridgeInstance split-brain
 - Key mitigations: generation counter, atomic send+receive wiring, CI mod/re-export check, feature-flagged BridgeInstance
+
+## PR #1606 -- Sender Key AAD, SCPM Magic, Timestamp Bounds (2026-03-31)
+
+### HIGH: SCPM magic prefix injection by any group member (BLACK-1601)
+### HIGH: No receive-side sequence tracking (BLACK-1602)
+### MEDIUM: Access key freshness widened 30s->300s (BLACK-1603)
+### MEDIUM: Buffer event timestamp estimation exploitable (BLACK-1604)
+### Testing gap: E2eCryptoProvider hardcodes epoch=0, seq=0
+
+## Complete Branch Review (2026-04-01) -- consequence/economy/FFI
+
+### CRITICAL: Consequence WarningCount weaponized against innocents (BLACK-1706)
+- Counts GovernanceAction events TARGETING a DID, not actions BY that DID
+- Admin can manufacture governance proposals to trigger automated eviction
+- system_assign_role bypasses RoleAssign capability check
+- No recovery mechanism exists; enforcement is permanent
+
+### HIGH: FFI string injection on NAPI+UniFFI (BLACK-1705)
+- All input-side HTML validation removed from validate.rs
+- Output escaping applied to consequence events only
+- NAPI line 1215 + UniFFI line 8480: `format!("{other:?}")` unescaped
+- PyO3 line 1457 correctly escapes; bridge parity gap
+
+### HIGH: Standing score inflation via message flooding (BLACK-1701)
+- evaluate_sybil_resistance remains a no-op stub
+- Participation record is count-based, no quality gate
+- Inflation computed BEFORE consequence evaluation
+
+### HIGH: Relay pricing manipulation via velocity flooding (BLACK-1702)
+- EIP-1559 base_fee driven by aggregate_velocity
+- Attacker flood drives up cost for all members
+- No per-member velocity contribution cap
+
+### MEDIUM: Escrow capture failure harms operator (BLACK-1703)
+- Budget enforcement prevents free rides for members
+- Capture failure = operator revenue loss (deliberate H8 tradeoff)
+
+### MEDIUM: check_and_composition latent bypass risk (BLACK-1704)
+- action_ucan=None now means "already verified"
+- Current callers correct; future callers may skip capability check
+- No compile-time enforcement of precondition

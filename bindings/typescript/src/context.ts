@@ -28,6 +28,7 @@ import type {
   ToolDefinition,
   ToolVerificationResult,
 } from "./types";
+import { encodeConsequenceConfig, encodeConsequenceRules } from "./types";
 
 // ---------------------------------------------------------------------------
 // EconomicPolicy schema validation (§19.3, ADR-034)
@@ -328,10 +329,18 @@ export class Context implements AsyncDisposable {
    * becomes the first member (and admin under `"single_admin"` governance).
    *
    * @param identity - The identity creating the context.
-   * @param params - Context creation parameters.
+   * @param params - Context creation parameters. Setting an `economicPolicy`
+   *   that requires payment is supported only on the native bridges
+   *   (Node.js, Python, Swift, Kotlin). The browser (WASM) bridge rejects
+   *   paid policies fail-closed with {@link EconomicPolicyUnsupportedOnWasm}
+   *   (`SCP-ECON-12095`) because it cannot run `scp-runtime`'s
+   *   `enforce_economy` pipeline per ADR-034. Use a free policy or omit
+   *   `economicPolicy` for browser-side contexts.
    * @returns A new `Context` instance in the `"active"` state.
    * @throws {ContextError} If context creation fails.
    * @throws {ValidationError} If parameters are invalid.
+   * @throws {EconomicPolicyUnsupportedOnWasm} On the WASM bridge, when
+   *   `economicPolicy` requires payment.
    */
   static async create(identity: Identity, params: ContextParams): Promise<Context> {
     try {
@@ -347,6 +356,17 @@ export class Context implements AsyncDisposable {
         ceilingPolicy: params.ceilingPolicy ?? "immutable",
         promotionPolicy: params.promotionPolicy,
         economicPolicy: params.economicPolicy,
+        // Typed -> JSON conversion happens at the SDK boundary so the public
+        // API exposes a discriminated union and the bridge sees the wire shape
+        // it expects. See ADR-017 / #1531 and the C5 bridge work.
+        consequenceRules:
+          params.consequenceRules !== undefined
+            ? encodeConsequenceRules(params.consequenceRules)
+            : undefined,
+        consequenceConfig:
+          params.consequenceConfig !== undefined
+            ? encodeConsequenceConfig(params.consequenceConfig)
+            : undefined,
       });
 
       const handle = await bridge.contextCreate(identity._handle, paramsJson);
@@ -360,13 +380,22 @@ export class Context implements AsyncDisposable {
    * Joins an existing context.
    *
    * @param identity - The identity joining the context.
+   * @param spendingUcanJwt - Optional spending UCAN JWT for paid contexts.
+   *   On native bridges (Node.js, Python, Swift, Kotlin) this is validated
+   *   against the configured payment adapter and budget tracker. On the
+   *   browser (WASM) bridge, paid contexts are rejected fail-closed with
+   *   {@link WasmCannotValidateSpendingUcan} (`SCP-ECON-12096`) — the
+   *   browser SDK cannot run `scp-runtime`'s `enforce_economy` pipeline
+   *   per ADR-034. Omit `spendingUcanJwt` for free contexts.
    * @throws {ContextError} If the context is not in `"active"` state.
+   * @throws {WasmCannotValidateSpendingUcan} On the WASM bridge, when the
+   *   target context's economic policy requires payment.
    */
-  async join(identity: Identity): Promise<void> {
+  async join(identity: Identity, spendingUcanJwt?: string): Promise<void> {
     this.assertActive();
     try {
       const bridge = await getBridge();
-      await bridge.contextJoin(this._handle, identity.did);
+      await bridge.contextJoin(this._handle, identity.did, spendingUcanJwt ?? null);
     } catch (error) {
       throw mapBridgeError(error);
     }
@@ -378,14 +407,23 @@ export class Context implements AsyncDisposable {
    * Accepts either a string (encoded as UTF-8) or a `Uint8Array` payload.
    *
    * @param payload - The message content.
+   * @param spendingUcanJwt - Optional spending UCAN JWT for paid contexts.
+   *   On native bridges (Node.js, Python, Swift, Kotlin) this is validated
+   *   against the configured payment adapter and budget tracker. On the
+   *   browser (WASM) bridge, paid contexts are rejected fail-closed with
+   *   {@link WasmCannotValidateSpendingUcan} (`SCP-ECON-12096`) — the
+   *   browser SDK cannot run `scp-runtime`'s `enforce_economy` pipeline
+   *   per ADR-034. Omit `spendingUcanJwt` for free contexts.
    * @throws {ContextError} If the context is not `"active"` or send fails.
+   * @throws {WasmCannotValidateSpendingUcan} On the WASM bridge, when the
+   *   target context's economic policy requires payment.
    */
-  async send(payload: string | Uint8Array): Promise<void> {
+  async send(payload: string | Uint8Array, spendingUcanJwt?: string): Promise<void> {
     this.assertActive();
     try {
       const bridge = await getBridge();
       const bytes = typeof payload === "string" ? new TextEncoder().encode(payload) : payload;
-      await bridge.contextSend(this._handle, this._identityDid, bytes);
+      await bridge.contextSend(this._handle, this._identityDid, bytes, spendingUcanJwt ?? null);
     } catch (error) {
       throw mapBridgeError(error);
     }
@@ -467,6 +505,12 @@ export class Context implements AsyncDisposable {
   /**
    * Invokes a tool within this context.
    *
+   * Tool invocation flows through the runtime's full economy pipeline
+   * (`ContextManager::invoke_tool_with_economy`): per-invocation
+   * pricing, per-DID velocity tracking, escalation, budget enforcement,
+   * payment escrow, and the Matrix-style hard rate limit are all
+   * enforced inside the runtime.
+   *
    * @param toolId - The ID of the tool to invoke.
    * @param input - Tool input parameters.
    * @param identity - The invoking identity.
@@ -475,6 +519,9 @@ export class Context implements AsyncDisposable {
    *   to this context. Required per spec section 7.2: every capability-gated
    *   action requires a valid UCAN token. See also section 6.2, section 8,
    *   and ADR-016.
+   * @param options - Optional `proofTokens` for delegation chain
+   *   resolution and `spendingUcan` for paid tool invocations
+   *   (`SpendingCapability` AND-composition per spec section 19.5).
    * @returns The tool output as a parsed JSON object.
    * @throws {ToolError} If invocation fails or the tool is not found.
    * @throws {UcanPermissionError} If the UCAN token is invalid, expired,
@@ -485,6 +532,10 @@ export class Context implements AsyncDisposable {
     input: Readonly<Record<string, unknown>>,
     identity: Identity,
     ucanToken: string,
+    options?: {
+      readonly proofTokens?: readonly string[];
+      readonly spendingUcan?: string;
+    },
   ): Promise<unknown> {
     this.assertActive();
     try {
@@ -495,6 +546,8 @@ export class Context implements AsyncDisposable {
         JSON.stringify(input),
         identity.did,
         ucanToken,
+        options?.proofTokens,
+        options?.spendingUcan,
       );
       return safeJsonParse(resultJson, "toolInvoke") as unknown;
     } catch (error) {

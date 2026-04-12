@@ -25,7 +25,7 @@ use scp_platform::traits::{KeyCustody, KeyType};
 use scp_protocol::context::ContextError;
 use scp_protocol::context::builder::{ContextCreationError, ContextCryptoProvider};
 use scp_protocol::context::governance::{
-    GovernanceAction, KeyResolver, ProposalStatus, RevocationScope,
+    AccessScope, GovernanceAction, KeyResolver, ProposalStatus,
 };
 use scp_protocol::context::params::{Capability, ContextParams, GovernanceModel};
 use scp_protocol::crypto::access_keys::wrapping::{Recipient, unwrap_content, wrap_content};
@@ -127,8 +127,12 @@ impl ContextCryptoProvider for MockCrypto {
     ) -> Result<scp_protocol::context::builder::AddMemberOutput, ContextError> {
         Ok(scp_protocol::context::builder::AddMemberOutput::default())
     }
-    fn remove_member(&self, _id: &[u8; 32], _member_did: &str) -> Result<(), ContextError> {
-        Ok(())
+    fn remove_member(
+        &self,
+        _id: &[u8; 32],
+        _member_did: &str,
+    ) -> Result<scp_protocol::context::builder::RemoveMemberOutput, ContextError> {
+        Ok(scp_protocol::context::builder::RemoveMemberOutput::default())
     }
     fn distribute_sender_key(&self, _id: &[u8; 32], _member_did: &str) -> Result<(), ContextError> {
         Ok(())
@@ -193,7 +197,13 @@ impl ContextEventLogProvider for MockEventLog {
     fn init_event_log(&self, _id: &[u8; 32]) -> Result<(), ContextCreationError> {
         Ok(())
     }
-    fn append_event(&self, _id: &[u8; 32], _event: &str) -> Result<(), ContextCreationError> {
+    fn append_event(
+        &self,
+        _id: &[u8; 32],
+        _event: &str,
+        _actor_did: &str,
+        _payload: Option<&serde_json::Value>,
+    ) -> Result<(), ContextCreationError> {
         Ok(())
     }
     fn destroy_event_log(&self, _id: &[u8; 32]) -> Result<(), ContextCreationError> {
@@ -252,42 +262,49 @@ fn governance_ceiling() -> Vec<Capability> {
 
 /// Helper: propose a governance action with Threshold(2-of-N) approval.
 /// Alice proposes, Bob approves.
-async fn propose_and_approve_threshold(
-    manager: &ContextManager,
-    ctx_id: &str,
+///
+/// Returns a boxed future because the composed state machine inside
+/// `ContextManager::propose_governance_action_checked` +
+/// `vote_on_proposal` exceeds clippy's `large_futures` threshold
+/// (~16 KB) when inlined at many call sites.
+fn propose_and_approve_threshold<'a>(
+    manager: &'a ContextManager,
+    ctx_id: &'a str,
     action: GovernanceAction,
-) -> ProposalOutcome {
-    let sk_alice = signing_key_for_did(&alice());
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = ProposalOutcome> + Send + 'a>> {
+    Box::pin(async move {
+        let sk_alice = signing_key_for_did(&alice());
 
-    let outcome = manager
-        .propose_governance_action_checked(ctx_id, &alice(), action, &sk_alice)
-        .await
-        .unwrap();
-
-    if outcome.status == ProposalStatus::Pending {
-        let sk_bob = signing_key_for_did(&bob());
-        let (status, _events) = manager
-            .vote_on_proposal(ctx_id, &outcome.proposal.proposal_id, &bob(), true, &sk_bob)
+        let outcome = manager
+            .propose_governance_action_checked(ctx_id, &alice(), action, &sk_alice)
             .await
             .unwrap();
-        assert_eq!(
-            status,
-            ProposalStatus::Approved,
-            "threshold proposal should be approved after 2/2 votes"
-        );
 
-        let fetched = manager
-            .get_proposal(ctx_id, &outcome.proposal.proposal_id)
-            .await
-            .unwrap();
-        ProposalOutcome {
-            proposal: fetched,
-            status,
-            execution_result: None,
+        if outcome.status == ProposalStatus::Pending {
+            let sk_bob = signing_key_for_did(&bob());
+            let (status, _events) = manager
+                .vote_on_proposal(ctx_id, &outcome.proposal.proposal_id, &bob(), true, &sk_bob)
+                .await
+                .unwrap();
+            assert_eq!(
+                status,
+                ProposalStatus::Approved,
+                "threshold proposal should be approved after 2/2 votes"
+            );
+
+            let fetched = manager
+                .get_proposal(ctx_id, &outcome.proposal.proposal_id)
+                .await
+                .unwrap();
+            ProposalOutcome {
+                proposal: fetched,
+                status,
+                execution_result: None,
+            }
+        } else {
+            outcome
         }
-    } else {
-        outcome
-    }
+    })
 }
 
 // =========================================================================
@@ -755,15 +772,15 @@ async fn tier2_global_block_propagation() {
 }
 
 // =========================================================================
-// Test 3: Tier 3 governance RevokeWriteAccess in broadcast
+// Test 3: Tier 3 governance write revocation in broadcast
 // =========================================================================
 
 /// Tier 3 governance-gated content access control in broadcast context.
 ///
 /// Creates a context with Author as a member.
-/// - Governance RevokeWriteAccess(Full) on Author.
+/// - Governance `Revoke { access: AccessScope::Both }` on Author.
 /// - Verify Author cannot publish new messages.
-/// - `RestoreWriteAccess` -> Author can publish again (forward-only).
+/// - `RestoreAccess { access: AccessScope::Write }` -> Author can publish again (forward-only).
 #[tokio::test]
 async fn tier3_governance_revoke_write_access_broadcast() {
     let manager = new_manager();
@@ -786,7 +803,7 @@ async fn tier3_governance_revoke_write_access_broadcast() {
     let sk_alice = signing_key_for_did(&alice());
     let sk_bob = signing_key_for_did(&bob());
 
-    let (add_author, _) = manager
+    let (add_author, _, _) = manager
         .propose_governance_action(
             ctx_id,
             &alice(),
@@ -805,11 +822,11 @@ async fn tier3_governance_revoke_write_access_broadcast() {
     assert_eq!(status, ProposalStatus::Approved);
     assert!(manager.is_member(ctx_id, AUTHOR).await);
 
-    // --- Governance RevokeWriteAccess(Full) on Author ---
+    // --- Governance Revoke { access: AccessScope::Both } on Author ---
 
-    let revoke = GovernanceAction::RevokeWriteAccess {
+    let revoke = GovernanceAction::RevokeAccess {
         did: author_did(),
-        scope: RevocationScope::Full,
+        access: AccessScope::Both,
     };
     let outcome = propose_and_approve_threshold(&manager, ctx_id, revoke).await;
     assert_eq!(outcome.status, ProposalStatus::Approved);
@@ -823,11 +840,12 @@ async fn tier3_governance_revoke_write_access_broadcast() {
             b"blocked message",
             Some(&signing_key_for_did(&author_did())),
             None,
+            None,
         )
         .await;
     assert!(
         send_result.is_err(),
-        "Author should not be able to publish after RevokeWriteAccess"
+        "Author should not be able to publish after write revocation"
     );
     match send_result.unwrap_err() {
         ContextError::PermissionDenied(msg) => {
@@ -845,10 +863,13 @@ async fn tier3_governance_revoke_write_access_broadcast() {
         "Author should remain a member after write revocation"
     );
 
-    // --- RestoreWriteAccess -> Author can publish again ---
+    // --- RestoreAccess { access: AccessScope::Write } -> Author can publish again ---
 
     let _ = manager.drain_events(ctx_id).await;
-    let restore = GovernanceAction::RestoreWriteAccess { did: author_did() };
+    let restore = GovernanceAction::RestoreAccess {
+        did: author_did(),
+        capabilities: vec![Capability::MessagesWrite],
+    };
     let outcome = propose_and_approve_threshold(&manager, ctx_id, restore).await;
     assert_eq!(outcome.status, ProposalStatus::Approved);
 
@@ -874,11 +895,12 @@ async fn tier3_governance_revoke_write_access_broadcast() {
             b"restored message",
             Some(&signing_key_for_did(&author_did())),
             None,
+            None,
         )
         .await;
     assert!(
         send_result.is_ok(),
-        "Author should be able to publish after RestoreWriteAccess: {:?}",
+        "Author should be able to publish after write restore: {:?}",
         send_result.err()
     );
 }
@@ -961,7 +983,7 @@ async fn three_layer_enforcement_after_full_revocation() {
 
     // Set up Dave's stores with Alice's cached material.
     let mut dave_sender_store = SenderKeyStore::new();
-    dave_sender_store.set(context_id, ALICE, generate_sender_key());
+    dave_sender_store.set_unchecked(context_id, ALICE, generate_sender_key());
     let mut dave_access_store = AccessKeyStore::new();
     dave_access_store.set(context_id, ALICE, generate_access_key(context_id, ALICE));
 
@@ -1281,7 +1303,7 @@ async fn invalid_block_notification_no_destruction() {
 
     // Dave's stores with Alice's cached material.
     let mut sender_store = SenderKeyStore::new();
-    sender_store.set(context_id, ALICE, generate_sender_key());
+    sender_store.set_unchecked(context_id, ALICE, generate_sender_key());
     let mut access_store = AccessKeyStore::new();
     access_store.set(context_id, ALICE, generate_access_key(context_id, ALICE));
 
@@ -1464,7 +1486,7 @@ fn wrapping_excludes_blocked_member_even_with_cached_key() {
 /// End-to-end tier stacking test through the `ContextManager` governance path.
 ///
 /// Alice (Tier 1, via block list) AND governance (Tier 3, via
-/// `RevokeWriteAccess`) both revoke Dave.
+/// write revocation) both revoke Dave.
 /// - Reverse only Alice's block -> Dave still revoked (governance block active).
 /// - Reverse governance block too -> Dave restored.
 #[tokio::test]
@@ -1489,7 +1511,7 @@ async fn governance_tier_stacking_via_context_manager() {
     let sk_alice = signing_key_for_did(&alice());
     let sk_bob = signing_key_for_did(&bob());
 
-    let (add_dave, _) = manager
+    let (add_dave, _, _) = manager
         .propose_governance_action(
             ctx_id,
             &alice(),
@@ -1508,11 +1530,11 @@ async fn governance_tier_stacking_via_context_manager() {
     assert_eq!(status, ProposalStatus::Approved);
     assert!(manager.is_member(ctx_id, DAVE).await);
 
-    // --- Governance (Tier 3): RevokeWriteAccess on Dave ---
+    // --- Governance (Tier 3): write revocation on Dave ---
 
-    let revoke = GovernanceAction::RevokeWriteAccess {
+    let revoke = GovernanceAction::RevokeAccess {
         did: dave(),
-        scope: RevocationScope::Full,
+        access: AccessScope::Both,
     };
     let outcome = propose_and_approve_threshold(&manager, ctx_id, revoke).await;
     assert_eq!(outcome.status, ProposalStatus::Approved);
@@ -1525,6 +1547,7 @@ async fn governance_tier_stacking_via_context_manager() {
             &dave(),
             b"should fail",
             Some(&signing_key_for_did(&dave())),
+            None,
             None,
         )
         .await;
@@ -1553,6 +1576,7 @@ async fn governance_tier_stacking_via_context_manager() {
             b"still blocked",
             Some(&signing_key_for_did(&dave())),
             None,
+            None,
         )
         .await;
     assert!(
@@ -1560,10 +1584,13 @@ async fn governance_tier_stacking_via_context_manager() {
         "Dave should still not write (governance Tier 3 active)"
     );
 
-    // --- Reverse Tier 3 too: RestoreWriteAccess ---
+    // --- Reverse Tier 3 too: RestoreAccess (write) ---
 
     let _ = manager.drain_events(ctx_id).await;
-    let restore = GovernanceAction::RestoreWriteAccess { did: dave() };
+    let restore = GovernanceAction::RestoreAccess {
+        did: dave(),
+        capabilities: vec![Capability::MessagesWrite],
+    };
     let outcome = propose_and_approve_threshold(&manager, ctx_id, restore).await;
     assert_eq!(outcome.status, ProposalStatus::Approved);
 
@@ -1574,6 +1601,7 @@ async fn governance_tier_stacking_via_context_manager() {
             &dave(),
             b"success",
             Some(&signing_key_for_did(&dave())),
+            None,
             None,
         )
         .await;

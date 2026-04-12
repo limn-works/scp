@@ -31,10 +31,7 @@
 //! construction using a length-prefixed binary format:
 //! `[4-byte context_id len (BE)][context_id bytes][4-byte DID len (BE)][DID bytes][8-byte epoch (BE)][8-byte sequence (BE)]`.
 //! This prevents attribution forgery by context members who possess the
-//! broadcast key (issue #228, cryptographer review finding 1, RED-210).
-//!
-//! **BREAKING**: This changes the wire format. Envelopes sealed without AAD
-//! cannot be opened by this version (and vice versa).
+//! broadcast key.
 
 use aes_gcm::aead::Payload;
 use aes_gcm::{Aes256Gcm, KeyInit, Nonce, aead::Aead};
@@ -297,11 +294,9 @@ pub fn rotate_broadcast_key(
 /// manipulation by context members who possess the broadcast key. Both
 /// [`seal_broadcast`] and [`open_broadcast`] use this identical construction.
 ///
-/// The binary format is canonically parseable by construction. The previous
-/// colon-delimited string format (`"{did}:{epoch}"`) was ambiguous because
-/// DIDs themselves contain colons (e.g., `did:dht:abc`, `did:web:host:path`).
-///
-/// See issue #228, #396, cryptographer review finding 1, RED-210.
+/// The binary format is canonically parseable by construction — a
+/// colon-delimited string format would be ambiguous because DIDs
+/// themselves contain colons (e.g., `did:dht:abc`, `did:web:host:path`).
 #[allow(clippy::cast_possible_truncation)] // String lengths are always < 4 GiB
 fn build_broadcast_aad(
     context_id: &str,

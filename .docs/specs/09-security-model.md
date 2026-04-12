@@ -96,13 +96,13 @@ These constraints don't prevent a sufficiently creative attacker from encoding a
 
 *Concern:* Agents that need to coordinate must share a context. This creates pressure to join or create many contexts solely for connectivity, degenerating into thin wrappers around bilateral communication.
 
-*Resolution — standing channels make this a non-problem.*
+*Resolution — standing contexts make this a non-problem.*
 
 Standing bilateral contexts (§5.12.4-§5.12.6) are the protocol's answer to this concern. They are designed for exactly this purpose: persistent, low-overhead communication channels between two agents, created once and maintained indefinitely. Context creation is a runtime operation (~200ms, §5.12.4) — not infrastructure provisioning.
 
-The "proliferation" concern assumes context creation is heavy enough to be problematic at scale. It is not. An agent with 100 standing channels has ~200-500KB of local storage overhead and zero network cost when idle. The proliferation is the feature — a rich contact graph of standing channels is the desired state, not a degenerate one.
+The "proliferation" concern assumes context creation is heavy enough to be problematic at scale. It is not. An agent with 100 standing contexts has ~200-500KB of local storage overhead and zero network cost when idle. The proliferation is the feature — a rich contact graph of standing contexts is the desired state, not a degenerate one.
 
-The distinction that matters is between **meaningful proliferation** (standing channels representing real relationships) and **wasteful proliferation** (ephemeral contexts created and immediately discarded for a single exchange). Templates and TTL address the latter: ephemeral contexts are cheap to create, automatically cleaned up, and their ephemerality is declared upfront. There is no accumulation of dead contexts.
+The distinction that matters is between **meaningful proliferation** (standing contexts representing real relationships) and **wasteful proliferation** (ephemeral contexts created and immediately discarded for a single exchange). Templates and TTL address the latter: ephemeral contexts are cheap to create, automatically cleaned up, and their ephemerality is declared upfront. There is no accumulation of dead contexts.
 
 **6. Human coordination bottleneck.**
 
@@ -135,26 +135,26 @@ This is not a flaw — it is correct role assignment. Tool calls are inherently 
 
 The protocol provides both patterns:
 
-- **Symmetric interaction:** Create a shared context (standing channel or ephemeral). Both agents have messaging capability. Both can read and write. No caller/tool asymmetry.
+- **Symmetric interaction:** Create a shared context (standing context or ephemeral). Both agents have messaging capability. Both can read and write. No caller/tool asymmetry.
 - **Asymmetric interaction:** One context exposes a tool to another. The tool provider is a service; the caller is a consumer. The asymmetry reflects the actual relationship.
 
 Stateful tool sessions (§6.2.1) partially bridge this: a multi-turn session allows both sides to influence the outcome iteratively. The tool provider responds with counterproposals; the caller adjusts. This isn't true symmetry, but it covers negotiation patterns within the governed tool call framework.
 
-If two agents need truly symmetric, ongoing interaction, the answer is unambiguous: share a context. Context creation is a runtime operation (§5.12.4). Standing channels exist for exactly this purpose (§5.12.6).
+If two agents need truly symmetric, ongoing interaction, the answer is unambiguous: share a context. Context creation is a runtime operation (§5.12.4). Standing contexts exist for exactly this purpose (§5.12.6).
 
 **9. Shadow channel incentivization.**
 
 *Concern:* The overhead of governed tool interfaces (mutual opt-in, schema declaration, governance approval, rate limits, provenance, audit logging) may be disproportionate for lightweight coordination, pushing agents to communicate through ungoverned channels (HTTP, direct API calls).
 
-*Resolution — the overhead concern dissolves with standing channels.*
+*Resolution — the overhead concern dissolves with standing contexts.*
 
-Lightweight coordination ("is your agent available?", "can you check something?", "here's a quick update") does not flow through tool interfaces. It flows through standing bilateral contexts — which have no per-message overhead beyond standard context messaging (encrypt, send, decrypt). There is no schema declaration, no governance approval, no tool registration. A message in a standing channel is as lightweight as a message in any context.
+Lightweight coordination ("is your agent available?", "can you check something?", "here's a quick update") does not flow through tool interfaces. It flows through standing bilateral contexts — which have no per-message overhead beyond standard context messaging (encrypt, send, decrypt). There is no schema declaration, no governance approval, no tool registration. A message in a standing context is as lightweight as a message in any context.
 
 The governed tool interface overhead applies to formal cross-context data flow — where one context's tool is invoked by another context's agent. This overhead is appropriate for that use case because cross-context data flow carries real risk (§6.2) and should be auditable, rate-limited, and governed.
 
 The two-tier model:
 
-- **Standing channels** for lightweight, symmetric, low-ceremony communication. All the protocol's trust and encryption properties. No tool interface overhead.
+- **Standing contexts** for lightweight, symmetric, low-ceremony communication. All the protocol's trust and encryption properties. No tool interface overhead.
 - **Tool interfaces** for formal, structured, asymmetric cross-context data exchange. Full governance, provenance, and auditability.
 
 This is analogous to the distinction between a text message and an API call. Both are communication; they have different overhead appropriate to their different risk profiles. The protocol provides both, and agents use whichever fits the interaction.
@@ -1151,6 +1151,36 @@ Each participant in a context holds one AES-256 symmetric sender key. All messag
 - **Key size:** 32 bytes per sender key per context member. Storage is trivial.
 - **Encryption order:** Sender-first (AES-256-GCM), then MLS. Recipients decrypt MLS layer, then decrypt sender layer with the cached sender key.
 
+**Sender-key plaintext wire format.** The MLS application message plaintext for application messages is structured as:
+
+```
+epoch (8 bytes BE) || sequence (8 bytes BE) || sender_key_ciphertext
+```
+
+Where `epoch` is the sender's current `sender_key_epoch` and `sequence` is a per-sender monotonic send counter (incremented after each successful encryption). The epoch and sequence are bound into the AES-256-GCM AAD (§9.16.1 AAD format below) alongside `context_id` and `sender_did`, preventing ciphertext relocation across epochs, reordering within an epoch, and cross-sender attribution forgery. The 16-byte header is inside the MLS ciphertext envelope and therefore protected by MLS confidentiality and integrity.
+
+**Sender-key AAD format.** The AAD for sender-key AES-256-GCM encryption is:
+
+```
+BE32(len(context_id)) || context_id || BE32(len(sender_did)) || sender_did || epoch (8 bytes BE) || sequence (8 bytes BE)
+```
+
+Variable-length fields use 4-byte big-endian length prefixes to prevent boundary-shift collisions (§9.5.1). Recipients reconstruct the AAD from the 16-byte header and MLS credential, then verify it during AEAD decryption.
+
+**Receive-side replay detection.** Recipients MUST maintain a per-sender `(last_epoch, last_sequence)` tracker. Messages with `epoch < last_epoch` or `(epoch == last_epoch && sequence <= last_sequence)` MUST be rejected as replays. This provides defense-in-depth alongside MLS-layer replay protection. The tracker is persisted in the crypto state snapshot.
+
+**Epoch poisoning defense.** Recipients MUST reject sender key distributions with `epoch > current_epoch + 1000`. This prevents an attacker from setting an artificially high epoch (e.g., `u64::MAX`) to permanently block future legitimate key rotations via the epoch monotonicity check.
+
+**Management messages.** MLS application messages may carry management payloads (e.g., sender key distributions during key rotation) instead of application content. Management messages are distinguished by a 4-byte ASCII magic prefix:
+
+```
+SCPM_MAGIC = [0x53, 0x43, 0x50, 0x4D]  ("SCPM" — Shared Context Protocol Management)
+```
+
+Management message MLS plaintext format: `SCPM_MAGIC (4 bytes) || management_payload`. Management messages bypass the sender-key encryption layer entirely — they are MLS-encrypted only, with authentication provided by MLS group membership. Recipients check the first 4 bytes of the MLS plaintext after decryption: if they match `SCPM_MAGIC`, the message is routed to management message processing; otherwise, it is parsed as a sender-key-encrypted application message (16-byte header + ciphertext). The epoch value in an application message header starts at 1 and increments monotonically, so the first 4 bytes (`0x00000000` for epoch ≤ 255) can never collide with `SCPM_MAGIC` (`0x5343504D`). Management payloads MUST NOT exceed 65,536 bytes (64 KiB).
+
+**Management prefix exclusivity.** The `SCPM_MAGIC` check MUST occur **exactly once** per incoming message, at the MLS plaintext → application message boundary described above. No other layer — transport, relay, outer-envelope processing, sender-key decryption, or any post-dispatch application code — is permitted to strip, test, or otherwise depend on the magic prefix. Implementations MUST centralize this check to a single call site to preserve the single-responsibility invariant that motivates the framing: message type is a property of MLS plaintext, not of any other layer. Conformance implementations MAY share the check between a production crypto provider and a test-equivalent provider, provided both invoke the same canonical helper. Duplicating the check elsewhere in the pipeline is a protocol violation.
+
 **Wrapping key terminology.** The sender-side key layer uses two distinct wrapping keys, both HPKE-based (RFC 9180 Base mode, §9.5) but serving different roles: (1) the **stable wrapping keypair** (below) protects the persistent per-sender AES-256 symmetric key during key distribution — it is long-lived and published in the MLS LeafNode; (2) the **ephemeral wrapping keypair** (§9.16.2) protects per-request key material during individual key exchanges — it is generated fresh for each `SenderKeyRequest` and discarded after use. Both use X25519 DHKEM + HPKE for key encapsulation, but the stable key enables offline key distribution while the ephemeral key provides forward secrecy for individual key exchanges.
 
 **Stable wrapping keypair.** Each member maintains a single dedicated X25519 keypair per context (one per DID, shared by human and agent — ADR-039), used exclusively for HPKE wrapping of sender key distributions (§9.16.2). This keypair is published as an MLS LeafNode extension (`scp_wrapping_key`) and is distinct from the MLS leaf HPKE key used for MLS key agreement. The wrapping keypair does NOT rotate on MLS Updates (epoch advances) — it remains stable across epochs so that sender key distributions can always be unwrapped, even by members who are offline during epoch transitions or who join after an epoch advance. The wrapping keypair rotates only on: (1) identity key rotation (§9.12), or (2) suspected compromise. On rotation, the member publishes the new wrapping public key in their LeafNode extension via an MLS Update and re-distributes their current sender key to all non-blocked members using the new wrapping keys.
@@ -1297,7 +1327,7 @@ Unblocking reverses the key distribution denial (Layer 1) but does NOT restore h
 
 Layer 2 is a compliance requirement for already-decrypted plaintext, not a cryptographic guarantee — a non-compliant SDK can retain cached plaintext. Layers 1 and 3 provide cryptographic enforcement. All three together make the guarantee robust against distinct failure modes.
 
-**Stacking with governance.** If governance (Tier 3) has also revoked the target's access via `RevokeReadAccess` or `RevokeWriteAccess`, the identity-level unblock (Tier 1 or 2) does NOT restore access. Both the identity-level block and the governance revocation must be independently reversed. The target's effective access is the intersection (most restrictive) of all active tiers.
+**Stacking with governance.** If governance (Tier 3) has also revoked the target's access via `RevokeAccess { access: Read }` or `RevokeAccess { access: Write }`, the identity-level unblock (Tier 1 or 2) does NOT restore access. Both the identity-level block and the governance revocation must be independently reversed. The target's effective access is the intersection (most restrictive) of all active tiers.
 
 ## 9.17 Content Access Key Layer
 
@@ -1318,12 +1348,12 @@ Content Encryption:
 
 **Key types:**
 - **Content Encryption Key (CEK):** AES-256, generated per message (or per message batch). Encrypts the actual content. Ephemeral — not stored after wrapping.
-- **Access Key:** AES-256, per member per context. Generated at join time. Used to wrap/unwrap CEKs. Stored in the member's local key store and distributed via HPKE Base mode (RFC 9180), using the same suite as sender key distribution (§9.16.2): DHKEM(X25519, HKDF-SHA256), HKDF-SHA256, AES-128-GCM. The HPKE `info` string for access key distribution MUST use a distinct domain separator: `info = "scp-access-key-v1" || context_id || member_did || epoch_bytes` (vs `"scp-sender-key-v1"` for sender keys). The `aad` is: `aad = context_id || member_did || epoch_bytes`. Where `epoch_bytes` is the 8-byte big-endian encoding of the access key epoch. This prevents cross-protocol key confusion — an HPKE ciphertext produced for sender key distribution cannot be substituted for an access key distribution response (different `info` produces different derived keys).
+- **Access Key:** AES-256, per member per context. Generated at join time. Used to wrap/unwrap CEKs. Stored in the member's local key store and distributed via HPKE Base mode (RFC 9180), using the same suite as sender key distribution (§9.16.2): DHKEM(X25519, HKDF-SHA256), HKDF-SHA256, AES-128-GCM. The HPKE `info` string for access key distribution MUST use a distinct domain separator: `info = "scp-access-key-v1" || BE32(len(context_id)) || context_id || BE32(len(member_did)) || member_did || epoch_bytes` (vs `"scp-sender-key-v1"` for sender keys). The `aad` is: `aad = BE32(len(context_id)) || context_id || BE32(len(member_did)) || member_did || epoch_bytes`. Where `epoch_bytes` is the 8-byte big-endian encoding of the access key epoch. This prevents cross-protocol key confusion — an HPKE ciphertext produced for sender key distribution cannot be substituted for an access key distribution response (different `info` produces different derived keys).
 - **Key Wrapping:** AES-256-KW (RFC 3394). Deterministic, no IV needed. The wrapped CEK is stored alongside the ciphertext.
 
 **AES-256-GCM additional authenticated data (AAD).** Content encryption MUST bind `context_id` as AAD: `AAD = context_id || sender_did || sequence_number`. This prevents ciphertext from being moved between contexts or reordered within a context. The AEAD authentication tag provides integrity verification — no separate content hash is needed.
 
-**Access key request protocol.** `AccessKeyRequest` messages MUST include a signed payload: `{ context_id, requester_did, epoch, timestamp, nonce }` signed with the requester's Active Signing Key or Agent Signing Key (either `#active` or `#agent` is valid — ADR-039). The `nonce` is a 16-byte random value, unique per request. The responder verifies the signature, checks the block list and revocation list, and responds with the HPKE-encrypted access key only if the requester is authorized. **Replay prevention:** The responder validates that the request timestamp is within 5 minutes of local time (consistent with the protocol-wide clock skew tolerance, §9.14) and that the `nonce` has not been previously seen. The responder maintains a nonce deduplication cache with a 5-minute TTL — nonces are single-use and cached for the duration of the validity window. Requests with expired timestamps or duplicate nonces are rejected. This replaces the previous 30-second window, which was inconsistent with the 5-minute clock skew tolerance (§9.14) — a 30-second window with 5-minute skew would reject legitimate requests from slightly-skewed clocks.
+**Access key request protocol.** `AccessKeyRequest` messages MUST include a signed payload: `{ context_id, requester_did, epoch, timestamp, nonce }` signed with the requester's Active Signing Key or Agent Signing Key (either `#active` or `#agent` is valid — ADR-039). The `nonce` is a 16-byte random value, unique per request. The responder verifies the signature, checks the block list and revocation list, and responds with the HPKE-encrypted access key only if the requester is authorized. **Replay prevention:** The responder validates that the request timestamp is not older than 300 seconds (5 minutes, consistent with the protocol-wide clock skew tolerance §9.14) and not more than 30 seconds in the future (tighter bound — future timestamps indicate clock manipulation rather than legitimate network delay). The responder also verifies that the `nonce` has not been previously seen. The responder maintains a nonce deduplication cache with a 5-minute TTL — nonces are single-use and cached for the duration of the validity window. Requests with expired timestamps or duplicate nonces are rejected.
 
 ### 9.17.2 Access Key Lifecycle
 
@@ -1331,11 +1361,11 @@ Content Encryption:
 
 2. **Normal operation.** Each message sender generates a fresh CEK, encrypts the content, wraps the CEK with each intended recipient's access key, and publishes the wrapped CEKs alongside the ciphertext. In encrypted contexts, this wrapping occurs BEFORE the MLS encryption layer. In broadcast contexts, it occurs before the sender key encryption.
 
-3. **Revocation.** On `RevokeReadAccess { did, scope: Full }` (governance, Tier 3) or on block (Tiers 1-2): the target's access key is deleted from all members who hold it. Without the access key, the target cannot unwrap CEKs for any stored content. This is retroactive — previously decryptable content becomes undecryptable.
+3. **Revocation.** On `RevokeAccess { did, access: Both }` (governance, Tier 3) or on block (Tiers 1-2): the target's access key is deleted from all members who hold it. Without the access key, the target cannot unwrap CEKs for any stored content. This is retroactive — previously decryptable content becomes undecryptable.
 
-4. **Revocation (FutureOnly).** On `RevokeReadAccess { did, scope: FutureOnly }`: the target is excluded from future CEK wrapping (their access key is no longer used for new messages) but existing wrapped CEKs are not deleted. The target can still decrypt historical content with their cached access key.
+4. **Revocation (Write-only).** On `RevokeAccess { did, access: Write }`: the target is excluded from future CEK wrapping (their access key is no longer used for new messages) but existing wrapped CEKs are not deleted. The target can still decrypt historical content with their cached access key.
 
-5. **Restoration.** On `RestoreReadAccess { did }` or unblock: a NEW access key is generated for the target. The new key is used for future CEK wrapping only. Historical wrapped CEKs used the old (deleted) access key — they are permanently inaccessible. This enforces the forward-only restoration guarantee.
+5. **Restoration.** On `RestoreAccess { did, capabilities }` or unblock: a NEW access key is generated for the target. The new key is used for future CEK wrapping only. Historical wrapped CEKs used the old (deleted) access key — they are permanently inaccessible. This enforces the forward-only restoration guarantee.
 
 6. **Context-wide rotation.** On `RotateContentKeys { reason }`: all access keys are rotated. Every member receives a new access key. Future content uses new CEKs wrapped with new access keys. Historical content remains accessible with old access keys (which members retain locally). This is for periodic hygiene or post-compromise recovery, not for targeted revocation.
 
@@ -1383,9 +1413,9 @@ Because `WrappedContent` (including the `wrapped_ceks` entries) is inside the br
 
 ### 9.17.5 Revocation Mechanics
 
-**Full revocation (retroactive):**
+**Both-scope revocation (retroactive):**
 
-1. The revoker publishes an `AccessKeyRevoked { did, scope: Full, revocation_id, timestamp, signature }` event as an MLS application message. The `revocation_id` is a unique identifier (`SHA-256(context_id || target_did || "access-key-revoke" || timestamp)`). The signature covers `context_id || target_did || scope || revocation_id || timestamp` using the revoker's signing key.
+1. The revoker publishes an `AccessKeyRevoked { did, scope: Both, revocation_id, timestamp, signature }` event as an MLS application message. The `revocation_id` is a unique identifier (`SHA-256(context_id || target_did || "access-key-revoke" || timestamp)`). The signature covers `context_id || target_did || scope || revocation_id || timestamp` using the revoker's signing key.
 2. Each member's SDK, upon receiving and verifying the `AccessKeyRevoked` event:
    a. Deletes the target's access key from the local key store.
    b. Adds the target's DID to the local access key revocation list.
@@ -1487,7 +1517,7 @@ All domain separators are UTF-8 strings used as prefixes in canonical hash const
 | `"SCP-ABSENT-AGENT-KEY"` | Sentinel for absent `#agent` key in continuity fingerprint — `SHA-256("SCP-ABSENT-AGENT-KEY")` | §9.11 |
 | `"SCP-CHECKPOINT-V1:"` | Event log checkpoint hash | §11 |
 | `"SCP-EVENT-V1:"` | Event log entry hash | §11 |
-| `"SCP-EXPORT-ENTRY-V1:"` | Context export chain hash | §5.13 |
+| `"SCP-EXPORT-ENTRY:"` | Context export chain hash | §5.13 |
 | `"SCP-TOOL-REGISTRATION-V1:"` | Tool registration integrity hash | §6.2 |
 | `"SCP-KEY-DESTRUCTION-V1:"` | Key destruction proof | §9.15 |
 | `"SCP-CLAIM-V1:"` | Shadow identity claim validation | §12.3 |
@@ -1605,7 +1635,14 @@ This section consolidates all HKDF labels, HPKE info prefixes, HMAC domain strin
 | Sender key request freshness | 300s (5 min) | Request freshness window (synchronized with nonce expiry) | §9.16.2 |
 | Block notification freshness | 30,000ms (30s) | Maximum age for block notification messages | §9.16.4 |
 | Sender key nonce dedup capacity | 10,000 | Maximum nonces tracked for sender key replay prevention | §9.16.2 |
-| Access key request freshness | 30s | Freshness window for access key request messages | §9.17.1 |
+| Access key request max age | 300s (5 min) | Maximum age for access key request messages (past window). Aligned with protocol-wide clock skew tolerance (§9.14). | §9.17.1 |
+| Access key request max future | 30s | Maximum future tolerance for access key request timestamps. Tighter than past window — future timestamps indicate clock manipulation, not network delay. | §9.17.1 |
+| Sender key header size | 16 bytes | `epoch (8B BE) \|\| sequence (8B BE)` prepended to sender-key ciphertext inside MLS plaintext | §9.16.1 |
+| SCPM management magic | `[0x53, 0x43, 0x50, 0x4D]` | 4-byte ASCII prefix distinguishing management from application messages in MLS plaintext | §9.16.1 |
+| Management payload max size | 65,536 bytes (64 KiB) | Maximum management message payload after SCPM prefix | §9.16.1 |
+| Epoch poisoning max advance | 1,000 | Maximum allowed epoch jump in a single sender key distribution | §9.16.1 |
+| Buffer event max age | 3,600s (1h) | Maximum estimated age for buffer events in consequence evaluation | §7.3.7 |
+| Buffer event future tolerance | 5s | Maximum future tolerance for buffer event timestamps | §7.3.7 |
 | Broadcast replay max authors | 10,000 | Maximum unique senders tracked in broadcast replay detector | §9.16.5 |
 
 #### 9.18.9 Sync and Offline Recovery (Invariants)

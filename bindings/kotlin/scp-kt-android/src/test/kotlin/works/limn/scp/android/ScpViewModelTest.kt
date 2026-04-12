@@ -161,10 +161,24 @@ private class TestNativeBindings : NativeBindings {
     override fun identityCreate(custody: String): Long = 0L
     override fun identityLoad(did: String): Long = 0L
     override fun identityResolve(did: String): String = ""
-    override fun contextCreate(identityHandle: Long, paramsJson: String): Long = 0L
-    override fun contextJoin(contextHandle: Long, identityHandle: Long) { /* no-op */ }
+    override fun contextCreate(
+        identityHandle: Long,
+        paramsJson: String,
+        consequenceRulesJson: String?,
+        consequenceConfigJson: String?,
+    ): Long = 0L
+    override fun contextJoin(
+        contextHandle: Long,
+        identityHandle: Long,
+        spendingUcanJwt: String?,
+    ) { /* no-op */ }
     override fun contextClose(contextHandle: Long, identityHandle: Long) { /* no-op */ }
-    override fun contextSend(contextHandle: Long, identityHandle: Long, payload: ByteArray) { /* no-op */ }
+    override fun contextSend(
+        contextHandle: Long,
+        identityHandle: Long,
+        payload: ByteArray,
+        spendingUcanJwt: String?,
+    ) { /* no-op */ }
     override fun contextSubscribe(contextHandle: Long, callback: MessageCallback): Long = 0L
     override fun contextUnsubscribe(subscriptionHandle: Long) { /* no-op */ }
     override fun contextSetEconomicPolicy(contextHandle: Long, policyJson: String) { /* no-op */ }
@@ -243,6 +257,7 @@ private class TestNativeBindings : NativeBindings {
         identityHandle: Long,
         ucanToken: String?,
         proofTokens: List<String>?,
+        spendingUcan: String?,
     ): String = ""
     @Suppress("LongParameterList")
     override fun toolInvokeCrossContext(

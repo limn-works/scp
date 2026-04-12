@@ -102,7 +102,9 @@ private func makeTestParams(
         maxChainDepth: nil,
         maxNestingDepth: nil,
         sessionCap: nil,
-        economicPolicy: nil
+        economicPolicy: nil,
+        consequenceRulesJson: nil,
+        consequenceConfigJson: nil
     )
 }
 
@@ -1001,7 +1003,8 @@ struct RealFFIIdentityAndContextTests {
                 inputJson: "{\"message\": \"test\"}",
                 identity: identity,
                 ucanToken: nil,
-                proofTokens: nil
+                proofTokens: nil,
+                spendingUcanJwt: nil
             )
             Issue.record("Expected tool invoke to require UCAN")
         } catch let error as ScpError {
@@ -1283,9 +1286,9 @@ struct RealFFIUcanAndGovernanceTests {
         }
     }
 
-    @Test("FFI: GovernanceActionResult enum covers all 28 variants")
+    @Test("FFI: GovernanceActionResult enum covers all 26 variants")
     func ffiGovernanceActionResultVariants() {
-        // Verify all 28 governance action variants are present
+        // Verify all 26 governance action variants are present
         let allCases: [GovernanceActionResult] = [
             .memberAdded, .memberRemoved, .roleChanged,
             .toolRegistered, .toolRemoved, .ceilingModified,
@@ -1294,13 +1297,12 @@ struct RealFFIUcanAndGovernanceTests {
             .thresholdModified, .childContextCreated,
             .toolInterfaceEstablished, .memberReset,
             .conflictResolved, .contextPromoted,
-            .readAccessRevoked, .readAccessRestored,
-            .writeAccessRevoked, .writeAccessRestored,
+            .memberSuspended, .accessRevoked, .accessRestored,
             .contentKeysRotated, .governanceReconfigured,
-            .authorBlocked, .subscriberBanned, .subscriberUnbanned,
+            .subscriberBanned, .subscriberUnbanned,
             .executed
         ]
-        #expect(allCases.count == 28)
+        #expect(allCases.count == 26)
     }
 
     @Test("FFI: MemberRole fromBridge parsing")

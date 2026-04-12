@@ -399,8 +399,8 @@ impl scp_core::context::builder::ContextCryptoProvider for TestNoOpCryptoProvide
         &self,
         _context_id: &[u8; 32],
         _member_did: &str,
-    ) -> Result<(), scp_core::context::ContextError> {
-        Ok(())
+    ) -> Result<scp_core::context::RemoveMemberOutput, scp_core::context::ContextError> {
+        Ok(scp_core::context::RemoveMemberOutput::default())
     }
     fn distribute_sender_key(
         &self,

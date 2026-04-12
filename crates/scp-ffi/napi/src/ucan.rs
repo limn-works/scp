@@ -4,7 +4,7 @@
 //!
 //! - [`ucan_validate`] — Validate a UCAN token for a required capability.
 //! - [`ucan_mint`] — Mint a new UCAN token for a context member with real
-//!   Ed25519 signing via `InMemoryKeyCustody` (RED-102).
+//!   Ed25519 signing via `InMemoryKeyCustody`.
 //! - [`ucan_revoke`] — Revoke a UCAN token.
 //!
 //! # Validation pipeline
@@ -311,8 +311,6 @@ pub async fn ucan_validate(
 /// - Rejects with `SCP-PERM-3023` if the context does not have key custody
 ///   (created from an `identity_load` handle without key material).
 /// - Rejects with `SCP-PERM-3023` if signing or token construction fails.
-///
-/// See RED-102 for the `KeyCustody` wiring story.
 #[napi]
 #[allow(clippy::needless_pass_by_value)] // napi-rs requires owned String/Vec/Option<Vec>
 pub async fn ucan_mint(
@@ -340,7 +338,7 @@ pub async fn ucan_mint(
 
     #[cfg(feature = "allow_in_memory_custody")]
     {
-        // Extract key custody and signing key from the context handle (RED-102).
+        // Extract key custody and signing key from the context handle.
         let custody = handle.in_memory_custody.as_ref().ok_or_else(|| {
             napi::Error::from(ScpNapiError::Permission {
                 message: "UCAN minting requires key custody — create the context with an \
@@ -1240,10 +1238,6 @@ mod tests {
         runtime::remove_identity(&did_a);
         runtime::remove_identity(&did_b);
     }
-
-    // -----------------------------------------------------------------------
-    // remove_identity cleanup (#771 review finding 4)
-    // -----------------------------------------------------------------------
 
     #[cfg(feature = "allow_in_memory_custody")]
     #[test]

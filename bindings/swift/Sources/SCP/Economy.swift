@@ -92,22 +92,6 @@ public enum Economy {
         )
     }
 
-    /// Computes an EIP-1559-style relay price adjustment.
-    ///
-    /// - Parameters:
-    ///   - configJson: Relay pricing config JSON string.
-    ///   - utilizationPct: Current utilization percentage (0-100).
-    /// - Returns: JSON string with new_base_price, previous_base_price, direction.
-    public static func adjustRelayPrice(
-        configJson: String,
-        utilizationPct: UInt64
-    ) async throws -> String {
-        try await economyAdjustRelayPrice(
-            configJson: configJson,
-            actualUtilizationPct: utilizationPct
-        )
-    }
-
     // MARK: - Budget Tracking
 
     /// Queries the remaining budget for a member.

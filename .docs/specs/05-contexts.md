@@ -58,7 +58,7 @@ Every context declares a capability ceiling at creation: the maximum set of thin
 - **`bridging`** — bridge connector participation (§12)
 - **`tool:interface`** — cross-context tool interface exposure (§6.2)
 - **`context:child:create`** — creating child contexts (§5.13)
-- **`member:ban`** — governance-level member removal (ban/unban). Gates whether governance can execute `RevokeReadAccess` / `RestoreReadAccess` against members (§5.9). Without this capability in the ceiling, governance cannot ban members regardless of governance model.
+- **`member:ban`** — governance-level member removal (ban/unban). Gates whether governance can execute `RevokeAccess` / `RestoreAccess` against members (§5.9). Without this capability in the ceiling, governance cannot ban members regardless of governance model.
 
 Media capabilities (`media:*`) enable the delegated media transport model (§10.9.1) where the context establishes identity, trust, and governance while media flows over WebRTC/DTLS-SRTP. A context without media capabilities in its ceiling cannot initiate voice or video sessions regardless of participant roles.
 
@@ -385,10 +385,9 @@ The governance model is declared at creation and visible to all. Governance impl
 
 | Action | Effect | Scope |
 |--------|--------|-------|
-| `RevokeReadAccess { did, scope }` | Revoke decryption access to context content | `Full` (retroactive + future) or `FutureOnly` |
-| `RestoreReadAccess { did }` | Restore decryption access, forward-only | Future content only — historical gap permanent |
-| `RevokeWriteAccess { did, scope }` | Revoke publishing authority | `Full` (stop + suppress historical) or `FutureOnly` |
-| `RestoreWriteAccess { did }` | Restore publishing authority, forward-only | Future content only |
+| `RevokeAccess { did, access: Read }` | Revoke decryption access to context content | `AccessScope::Both` (retroactive + future) or `AccessScope::Read` (read-only) |
+| `RestoreAccess { did, capabilities }` | Restore access, forward-only | Future content only — historical gap permanent |
+| `RevokeAccess { did, access: Write }` | Revoke publishing authority | `AccessScope::Both` or `AccessScope::Write` |
 | `RotateContentKeys { reason }` | Context-wide key rotation | All members, not DID-targeted |
 
 **Membership/access decoupling.** These actions do NOT remove the target from the context. A member with revoked read access remains a member for governance participation and presence but cannot decrypt content. Member states:
@@ -402,7 +401,7 @@ The governance model is declared at creation and visible to all. Governance impl
 
 Presence-only members lose `governance:vote` and `governance:propose` capabilities alongside content access. A member who can neither read nor write content should not influence governance decisions about content they cannot see. Read-only members retain governance capabilities — they can still observe content and participate meaningfully in governance.
 
-**Redundant operations.** Revoking access for a member whose access is already revoked (same scope) is a no-op that returns success. Restoring access for a member who was never revoked returns `GovernanceError::NothingToRestore`. Revoking with `FutureOnly` scope when a `Full` revocation is already active is a no-op (Full subsumes FutureOnly). Revoking with `Full` scope when `FutureOnly` is active upgrades to Full.
+**Redundant operations.** Revoking access for a member whose access is already revoked (same scope) is a no-op that returns success. Restoring access for a member who was never revoked returns `GovernanceError::NothingToRestore`. Revoking with `Write` scope when a `Both` revocation is already active is a no-op (Both subsumes Write). Revoking with `Both` scope when `Write` is active upgrades to Both.
 
 Content access actions go through the context's governance model (propose/vote/execute). In SingleAdmin contexts, the admin's proposal auto-executes. In multi-admin contexts, the action requires the configured quorum. Tiers 1-2 (DID-to-DID blocking) are unilateral identity-layer operations and do NOT go through governance.
 
@@ -415,7 +414,8 @@ Content access actions go through the context's governance model (propose/vote/e
 | `registered_tools` | 256 per context | Tools are heavyweight registrations; 256 exceeds any practical context |
 | `tool_interfaces` | 256 per context | Cross-context interfaces are bilateral agreements; 256 exceeds any practical context |
 | `threshold_signers` | 64 per context | Signers participate in quorum; >64 is operationally impractical |
-| `write_revoked_members` | No artificial cap | Naturally bounded by membership count — cannot revoke write for non-members |
+| `suspended_capabilities[did]` | No artificial cap | Naturally bounded by ceiling cardinality — at most one entry per capability per member |
+| `read_exclusion_list` | No artificial cap | Naturally bounded by membership count — cannot exclude non-members from CEK wrapping |
 
 Implementations MUST return an error (e.g., `LimitExceeded`) when an append would exceed the limit. The error message MUST include the limit value for debuggability.
 
@@ -911,7 +911,7 @@ Contexts are runtime objects. They are created, used, and destroyed during norma
    ├── Reconnect transport for all Active contexts (background, non-blocking)
    └── Begin processing queued invitations
 
-2. Standing channels are immediately available.
+2. Standing contexts are immediately available.
    Messages sent before transport reconnects are queued locally.
    Messages received while offline are retrieved from relay on reconnect.
 ```
@@ -923,7 +923,7 @@ Agent lifecycle                              Context operations
 ──────────────────────────────────────────────────────────────────
 
 Receives task: "coordinate with Bob"
-  └── sdk.standing_channel(bob_did)          [get-or-create, ~0ms or ~200ms]
+  └── sdk.standing_context(bob_did)          [get-or-create, ~0ms or ~200ms]
       └── channel.send("sync on project?")   [send, 1 hop]
 
 Receives task: "negotiate contract terms"
@@ -950,15 +950,15 @@ Application shutdown:
       // Contexts survive. On next startup, they reconnect.
 ```
 
-**Key property: contexts survive process restarts.** Context state (MLS group state, sender keys, event log position) is persisted to secure storage on every state transition (ADR-008). When the application restarts, all Active contexts are restored and transport is reconnected. No re-creation, no re-invitation, no re-negotiation. This is why standing channels work — they persist across application sessions, device reboots, and network interruptions.
+**Key property: contexts survive process restarts.** Context state (MLS group state, sender keys, event log position) is persisted to secure storage on every state transition (ADR-008). When the application restarts, all Active contexts are restored and transport is reconnected. No re-creation, no re-invitation, no re-negotiation. This is why standing contexts work — they persist across application sessions, device reboots, and network interruptions.
 
 **Contexts are not connections.** A TCP connection dies when the process exits. A context does not. A context is a durable cryptographic group that happens to use connections for transport. The transport layer is replaceable (§8, ADR-012) and reconnectable. The context is the stable entity; the transport is ephemeral plumbing underneath.
 
 ### 5.12.6 The Contact Graph
 
-Agents that coordinate regularly maintain **standing bilateral contexts** — the agent's contact graph. A standing channel is a `bilateral-persistent` context with no TTL, created once and kept alive for the duration of the relationship.
+Agents that coordinate regularly maintain **standing bilateral contexts** — the agent's contact graph. A standing context is a `bilateral-persistent` context with no TTL, created once and kept alive for the duration of the relationship.
 
-**Lifecycle of a standing channel:**
+**Lifecycle of a standing context:**
 
 ```
 Relationship stage        Protocol action                Cost
@@ -970,11 +970,11 @@ Reconnect after offline   transport reconnect            background, automatic
 Relationship ends         close_context                  one-time, keys preserved or destroyed per memory scope
 ```
 
-**Standing channels have zero idle cost.** No keepalives, no heartbeats, no periodic key rotation (MLS key updates happen on message send, not on a timer). An agent with 500 standing channels and no active conversations uses zero network bandwidth. The only cost is local storage for persisted MLS state — approximately 2-5KB per bilateral context (two-leaf ratchet tree, sender key material, minimal event log metadata).
+**Standing contexts have zero idle cost.** No keepalives, no heartbeats, no periodic key rotation (MLS key updates happen on message send, not on a timer). An agent with 500 standing contexts and no active conversations uses zero network bandwidth. The only cost is local storage for persisted MLS state — approximately 2-5KB per bilateral context (two-leaf ratchet tree, sender key material, minimal event log metadata).
 
-**Standing channels vs. ephemeral contexts — when to use which:**
+**Standing contexts vs. ephemeral contexts — when to use which:**
 
-| | Standing channel | Ephemeral context |
+| | Standing context | Ephemeral context |
 |---|---|---|
 | Template | `bilateral-persistent` | `bilateral-ephemeral` |
 | TTL | None (lives indefinitely) | Required (forces intentionality) |
@@ -983,9 +983,9 @@ Relationship ends         close_context                  one-time, keys preserve
 | Analogy | Phone contact | Phone call |
 | Creation | Once per relationship | Once per interaction |
 
-An agent typically has a standing channel with every peer it communicates with regularly, and creates ephemeral contexts on top of that for specific bounded tasks — especially tasks involving sensitive data that should not persist.
+An agent typically has a standing context with every peer it communicates with regularly, and creates ephemeral contexts on top of that for specific bounded tasks — especially tasks involving sensitive data that should not persist.
 
-**First-contact optimization.** When two agents already share a context (e.g., both are members of a group), creating a standing channel between them is faster: both agents already have each other's DID documents and MLS key packages cached from the shared context. The SDK SHOULD use this cached key material to skip DID resolution, reducing first-contact setup to a single relay roundtrip.
+**First-contact optimization.** When two agents already share a context (e.g., both are members of a group), creating a standing context between them is faster: both agents already have each other's DID documents and MLS key packages cached from the shared context. The SDK SHOULD use this cached key material to skip DID resolution, reducing first-contact setup to a single relay roundtrip.
 
 ## 5.13 Context Nesting
 
@@ -1328,7 +1328,7 @@ Full legibility before opt-in applies to nesting relationships the same as every
 
 **Templates.** Well-known templates (§5.12.1) can be used for child contexts. The template constrains the child's params as usual; the parent relationship adds the ceiling intersection and lifecycle coupling on top. A child created from `bilateral-ephemeral` with two parents is an ephemeral bridge — TTL'd, keys destroyed on close, ceiling ≤ intersection.
 
-**Standing channels.** A standing channel (§5.12.6) between Alice and Bob can be modeled as a multi-parent child of whatever context(s) Alice and Bob share. This is not required — standing channels remain lightweight bilateral contexts that work without nesting. But if structural governance over the standing channel is desired (a parent context's governance should have authority over the channel), nesting provides that.
+**Standing contexts.** A standing context (§5.12.6) between Alice and Bob can be modeled as a multi-parent child of whatever context(s) Alice and Bob share. This is not required — standing contexts remain lightweight bilateral contexts that work without nesting. But if structural governance over the standing context is desired (a parent context's governance should have authority over the channel), nesting provides that.
 
 **Tool interfaces.** Tool interfaces (§6.2) and multi-parent children serve different purposes and coexist:
 
@@ -1516,22 +1516,22 @@ Author-level, cryptographic, pull-based — the same protocol as encrypted conte
 
 Blocking is per-author. Author A blocking a subscriber does not affect the subscriber's access to Author B's content.
 
-**Governance-level subscriber ban.** When the context's capability ceiling includes `member:ban` (§5.3), governance can execute `RevokeReadAccess` (§5.9, ADR-031) against broadcast subscribers. Unlike per-author blocking (which is unilateral and affects only one author's content), a governance ban removes the subscriber from the registry AND adds them to ALL authors' block lists simultaneously. All authors MUST rotate keys after a governance ban (mandatory `KeyEpochAdvance`). This mirrors `RevokeReadAccess` semantics in encrypted contexts (MLS group removal), adapted for broadcast's per-author key model.
+**Governance-level subscriber ban.** When the context's capability ceiling includes `member:ban` (§5.3), governance can execute `RevokeAccess { did, access: Read }` (§5.9, ADR-031) against broadcast subscribers. Unlike per-author blocking (which is unilateral and affects only one author's content), a governance ban removes the subscriber from the registry AND adds them to ALL authors' block lists simultaneously. All authors MUST rotate keys after a governance ban (mandatory `KeyEpochAdvance`). This mirrors `RevokeAccess` semantics in encrypted contexts (MLS group removal), adapted for broadcast's per-author key model.
 
 Governance ban lifecycle:
 
-1. Governance proposal: `RevokeReadAccess { did, scope }` — proposed via the standard governance flow (§5.9).
+1. Governance proposal: `RevokeAccess { did, access: Read }` — proposed via the standard governance flow (§5.9).
 2. Context manager verifies `member:ban` capability in ceiling — rejects with `PermissionDenied` if absent.
 3. On approval: subscriber removed from registry, added to all authors' block lists.
 4. All authors rotate keys — mandatory `KeyEpochAdvance` per author.
 5. `ReadAccessRevoked` event emitted to event log.
 6. Future `handle_key_request` from banned subscriber returns `Deny` for all authors.
 
-`RestoreReadAccess { did }` reverses the ban: subscriber removed from all authors' block lists, but NOT re-registered (they must re-register manually). No key rotation on restore (forward-only — unban grants future access, the registration gap is permanent). `ReadAccessRestored` event emitted.
+`RestoreAccess { did, capabilities }` reverses the ban: subscriber removed from all authors' block lists, but NOT re-registered (they must re-register manually). No key rotation on restore (forward-only — unban grants future access, the registration gap is permanent). `ReadAccessRestored` event emitted.
 
 Default template configuration: encrypted templates include `member:ban` in their ceiling by default (§5.12.1); broadcast templates do not. Broadcast contexts can add `member:ban` via explicit `ContextParams` at creation or via `ModifyCeiling` governance action if `CeilingPolicy::Governed`.
 
-**Author removal.** Removing an author from a broadcast context (revoking their broadcast key and preventing future publishing) is a governance-gated action. Author removal uses `GovernanceAction::RevokeWriteAccess { did, scope }` — the general content access revocation mechanism (§5.9, ADR-031). `RevokeWriteAccess` with `scope: Full` stops publishing AND suppresses historical content; `scope: FutureOnly` stops future publishing only. There is no standalone API to remove an author without governance approval. This enforces the protocol tenet: "Agents are participants, not enforcers." When the governance proposal is approved and executed: the author's broadcast key is destroyed, `publish()` returns `PermissionDenied`, key requests for the author return `Deny`, and a `WriteAccessRevoked` event is emitted. Subscribers who cached the author's old key can still decrypt historical messages (unless `scope: Full` was used, in which case access keys are also destroyed per §9.17).
+**Author removal.** Removing an author from a broadcast context (revoking their broadcast key and preventing future publishing) is a governance-gated action. Author removal uses `GovernanceAction::RevokeAccess { did, access: Write }` — the general content access revocation mechanism (§5.9, ADR-031). `RevokeAccess` with `access: Both` stops publishing AND suppresses historical content; `access: Write` stops future publishing only. There is no standalone API to remove an author without governance approval. This enforces the protocol tenet: "Agents are participants, not enforcers." When the governance proposal is approved and executed: the author's broadcast key is destroyed, `publish()` returns `PermissionDenied`, key requests for the author return `Deny`, and a `WriteAccessRevoked` event is emitted. Subscribers who cached the author's old key can still decrypt historical messages (unless `access: Both` was used, in which case access keys are also destroyed per §9.17).
 
 **Sybil resistance.** Broadcast contexts are the primary target for Sybil block bypass because key requests travel as relay messages (not MLS application messages). The membership gate in `handle_sender_key_request` verifies that the requester is a registered subscriber before distributing keys. Identity-linked block expansion and group blocking further mitigate Sybil attacks. See §9.16.6 for the full mitigation specification.
 

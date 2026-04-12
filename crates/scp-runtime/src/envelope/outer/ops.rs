@@ -555,8 +555,8 @@ mod seal_open_tests {
             *byte ^= 0xFF;
         }
 
-        // Previously OpenMLS panicked on AEAD decryption failure; the
-        // catch_unwind guard now converts the panic to an error.
+        // OpenMLS can panic on AEAD decryption failure; the
+        // catch_unwind guard converts the panic to an error.
         let result = open_envelope(
             &outer,
             &mut bob_group,

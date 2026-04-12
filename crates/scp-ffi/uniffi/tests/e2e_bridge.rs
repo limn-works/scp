@@ -111,6 +111,8 @@ fn full_capability_params() -> ContextParams {
         max_nesting_depth: None,
         session_cap: None,
         economic_policy: None,
+        consequence_rules_json: None,
+        consequence_config_json: None,
     }
 }
 
@@ -132,6 +134,8 @@ fn default_encrypted_params() -> ContextParams {
         max_nesting_depth: None,
         session_cap: None,
         economic_policy: None,
+        consequence_rules_json: None,
+        consequence_config_json: None,
     }
 }
 
@@ -331,7 +335,9 @@ async fn context_join_and_leave() {
         .unwrap();
 
     // Bob joins
-    context_join(handle.clone(), bob.clone()).await.unwrap();
+    context_join(handle.clone(), bob.clone(), None)
+        .await
+        .unwrap();
 
     // Check membership
     let count = context_member_count(handle.clone()).await;
@@ -352,6 +358,118 @@ async fn context_join_and_leave() {
     assert!(!context_is_member(handle.clone(), bob.did()).await);
 }
 
+/// C5 parity: `context_join` must accept the optional `spending_ucan_jwt`
+/// parameter and reject malformed JWTs at the bridge boundary with the
+/// SCP-ECON-12061 code (mirrors PyO3/NAPI/WASM bridges).
+#[tokio::test]
+async fn context_join_rejects_malformed_spending_ucan_jwt() {
+    let alice = identity_create("in_memory".to_owned()).await.unwrap();
+    let bob = identity_create("in_memory".to_owned()).await.unwrap();
+
+    let handle = context_create(alice.clone(), full_capability_params())
+        .await
+        .unwrap();
+
+    let result = context_join(handle, bob, Some("not.a.jwt".to_owned())).await;
+    assert!(
+        result.is_err(),
+        "malformed spending UCAN JWT must be rejected at the bridge boundary"
+    );
+    let err = result.unwrap_err();
+    let msg = err.to_string();
+    assert!(
+        msg.contains("SCP-ECON-12061") || msg.contains("invalid spending UCAN"),
+        "error should reference SCP-ECON-12061 / invalid spending UCAN, got: {msg}"
+    );
+}
+
+/// C5 parity: `context_join` must accept the optional `spending_ucan_jwt`
+/// as `None` (the historical default) and continue to delegate to the
+/// manager.
+#[tokio::test]
+async fn context_join_accepts_none_spending_ucan_jwt() {
+    let alice = identity_create("in_memory".to_owned()).await.unwrap();
+    let bob = identity_create("in_memory".to_owned()).await.unwrap();
+
+    let handle = context_create(alice.clone(), full_capability_params())
+        .await
+        .unwrap();
+
+    // None must reach the manager — assert by joining successfully and
+    // observing membership growth from 1 to 2.
+    context_join(handle.clone(), bob.clone(), None)
+        .await
+        .unwrap();
+    let count = context_member_count(handle).await;
+    assert_eq!(count, Some(2), "join with None spending UCAN must succeed");
+}
+
+/// C5 parity: `context_create` must thread `consequence_rules_json` and
+/// `consequence_config_json` from the bridge `ContextParams` Record through
+/// to the stored `ContextParams` and fail closed when a `RevokeAccess` rule
+/// is declared without the matching opt-in flag.
+#[tokio::test]
+async fn context_create_rejects_revoke_access_when_config_disallows() {
+    let alice = identity_create("in_memory".to_owned()).await.unwrap();
+
+    let bad_rules = serde_json::json!([
+        {
+            "trigger": "MessageVelocity",
+            "action": { "Enforcement": { "RevokeAccess": {
+                "did": "did:dht:z6MkSubject",
+                "access": "Both"
+            } } },
+            "threshold": 5,
+            "window": { "secs": 60, "nanos": 0 }
+        }
+    ])
+    .to_string();
+
+    let mut params = default_encrypted_params();
+    params.consequence_rules_json = Some(bad_rules);
+    // consequence_config_json left None -> default disallows RevokeAccess.
+
+    let result = context_create(alice, params).await;
+    assert!(
+        result.is_err(),
+        "RevokeAccess rule must be rejected when config.allow_automatic_access_revocation is false"
+    );
+}
+
+/// C5 parity: when `consequence_config_json` opts in to
+/// `allow_automatic_access_revocation`, the same rule must be accepted and
+/// the context creation must succeed.
+#[tokio::test]
+async fn context_create_threads_consequence_rules_and_config() {
+    let alice = identity_create("in_memory".to_owned()).await.unwrap();
+
+    let rules = serde_json::json!([
+        {
+            "trigger": "MessageVelocity",
+            "action": { "Enforcement": { "RevokeAccess": {
+                "did": "did:dht:z6MkSubject",
+                "access": "Both"
+            } } },
+            "threshold": 5,
+            "window": { "secs": 3600, "nanos": 0 }
+        }
+    ])
+    .to_string();
+    let config = serde_json::json!({
+        "allow_automatic_access_revocation": true
+    })
+    .to_string();
+
+    let mut params = full_capability_params();
+    params.consequence_rules_json = Some(rules);
+    params.consequence_config_json = Some(config);
+
+    let handle = context_create(alice, params)
+        .await
+        .expect("context_create should succeed when config opts into RevokeAccess");
+    assert_eq!(handle.state().unwrap(), "active");
+}
+
 #[tokio::test]
 async fn context_send_message() {
     let alice = identity_create("in_memory".to_owned()).await.unwrap();
@@ -360,7 +478,7 @@ async fn context_send_message() {
         .unwrap();
 
     // Send a message (no real recipient, just validates the API path)
-    let result = context_send(handle, alice, b"Hello, world!".to_vec()).await;
+    let result = context_send(handle, alice, b"Hello, world!".to_vec(), None).await;
     // Send may succeed or fail depending on crypto provider wiring.
     // The important thing is it doesn't panic.
     let _ = result;
@@ -860,6 +978,8 @@ async fn context_create_with_all_governance_models() {
             max_nesting_depth: None,
             session_cap: None,
             economic_policy: None,
+            consequence_rules_json: None,
+            consequence_config_json: None,
         };
         let handle = context_create(identity.clone(), params).await.unwrap();
         assert_eq!(handle.state().unwrap(), "active");
@@ -888,6 +1008,8 @@ async fn context_create_with_all_memory_scopes() {
             max_nesting_depth: None,
             session_cap: None,
             economic_policy: None,
+            consequence_rules_json: None,
+            consequence_config_json: None,
         };
         let handle = context_create(identity.clone(), params).await.unwrap();
         assert_eq!(handle.state().unwrap(), "active");

@@ -158,9 +158,14 @@ pub fn compute_participation_record(
                         event_sequence: event.sequence,
                     });
                 } else {
-                    // Check if the subject is the target of this governance action.
+                    // Check if the subject is the target of this governance action
+                    // AND the action is adverse (H18: filter out beneficial actions
+                    // such as RestoreAccess that could otherwise be used to deflate
+                    // the target's standing score).
                     let target = extract_target_did_from_payload(&event.payload.data);
-                    if target.as_deref() == Some(subject_did) {
+                    if target.as_deref() == Some(subject_did)
+                        && is_adverse_governance_action(&event.payload.data)
+                    {
                         governance_actions_against.push(GovernanceActionSummary {
                             timestamp: event.timestamp,
                             actor_did: event.actor_did.clone(),
@@ -225,6 +230,30 @@ pub fn compute_participation_record(
 }
 
 // ---------------------------------------------------------------------------
+// Participation threshold check
+// ---------------------------------------------------------------------------
+
+/// Returns `true` if the participation record meets the minimum participation
+/// threshold required for governance actions (#1530).
+///
+/// The threshold is based on `participation_count` — a member must have
+/// at least one event (i.e., any prior participation) AND must not have
+/// more governance actions against them than by them (net-positive governance
+/// ratio).
+///
+/// This is a simple, deterministic check that any agent can reproduce
+/// from the same event log data.
+#[must_use]
+pub const fn meets_threshold(record: &ParticipationRecord) -> bool {
+    // Must have at least one participation event.
+    if record.participation_count == 0 {
+        return false;
+    }
+    // Net-positive governance ratio: actions by >= actions against.
+    record.governance_actions_by.len() >= record.governance_actions_against.len()
+}
+
+// ---------------------------------------------------------------------------
 // Payload extraction helpers
 // ---------------------------------------------------------------------------
 
@@ -240,15 +269,80 @@ fn extract_tool_id_from_payload(data: &[u8]) -> ToolId {
         .to_owned()
 }
 
+/// Adverse governance action types counted against the target in
+/// `governance_actions_against`.
+///
+/// Only these action types represent punitive or restrictive measures that
+/// should weigh against the target member's standing score. All other action
+/// types (e.g., `RestoreAccess`, `AssignRole`, `ApproveSpend`) are beneficial
+/// or neutral and MUST NOT be counted, as a hostile admin could otherwise
+/// issue many beneficial-looking actions to deflate a member's standing
+/// (H18: standing-deflation attack).
+///
+/// When `action_type` is absent from the payload (legacy events written before
+/// H18), the action is conservatively counted as adverse to preserve the
+/// pre-fix behavior.
+const ADVERSE_ACTION_TYPES: &[&str] = &[
+    "SuspendCapability",
+    "SuspendAccess",
+    "RevokeAccess",
+    "RemoveMember",
+    "ResetMember",
+];
+
+/// Returns `true` if the governance action described by `payload` is adverse
+/// toward its target and should therefore be counted in
+/// `governance_actions_against`.
+///
+/// An action is adverse if its `action_type` field matches one of the
+/// [`ADVERSE_ACTION_TYPES`]. Actions with no `action_type` in the payload
+/// (legacy entries) are conservatively treated as adverse.
+fn is_adverse_governance_action(data: &[u8]) -> bool {
+    let action_type = extract_action_type_from_payload(data);
+    // No action_type present — legacy event, treat conservatively as adverse.
+    action_type
+        .as_deref()
+        .is_none_or(|t| ADVERSE_ACTION_TYPES.contains(&t))
+}
+
+/// Extracts the `action_type` string from a governance action payload.
+///
+/// The payload is a JSON object with an optional `"action_type"` field
+/// introduced by H18. Returns `None` if absent (legacy payloads).
+fn extract_action_type_from_payload(data: &[u8]) -> Option<String> {
+    if data.is_empty() {
+        return None;
+    }
+    let val = serde_json::from_slice::<serde_json::Value>(data).ok()?;
+    val.get("action_type")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .map(str::to_owned)
+}
+
 /// Extracts a target DID from a governance action or role assignment payload.
 ///
-/// Convention: the payload data starts with a UTF-8 target DID string,
-/// terminated by a null byte or the end of data. Returns `None` if the
-/// payload is empty.
+/// The payload data is a JSON object with an optional `"target_did"` field.
+/// Falls back to the legacy null-terminated string convention for backward
+/// compatibility with entries created before structured payloads were
+/// introduced. Returns `None` if the payload is empty or has no target.
 fn extract_target_did_from_payload(data: &[u8]) -> Option<DID> {
     if data.is_empty() {
         return None;
     }
+    // Try structured JSON first.
+    if let Ok(val) = serde_json::from_slice::<serde_json::Value>(data) {
+        if let Some(did_str) = val
+            .get("target_did")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+        {
+            return Some(did_str.into());
+        }
+        // JSON parsed but no target_did field — no target.
+        return None;
+    }
+    // Legacy fallback: null-terminated UTF-8 string.
     let end = data.iter().position(|&b| b == 0).unwrap_or(data.len());
     let s = std::str::from_utf8(&data[..end]).ok()?;
     if s.is_empty() {
@@ -1014,6 +1108,151 @@ mod tests {
             "did:key:admin"
         );
         assert_eq!(record.governance_actions_against[0].event_sequence, 0);
+    }
+
+    /// Helper: create a governance action event payload with both `target_did`
+    /// and `action_type` encoded as JSON (the H18 structured format).
+    fn make_gov_payload(target_did: &str, action_type: &str) -> Vec<u8> {
+        serde_json::to_vec(&serde_json::json!({
+            "target_did": target_did,
+            "action_type": action_type,
+        }))
+        .unwrap()
+    }
+
+    // --- H18: standing-deflation filter tests ---
+
+    #[test]
+    fn restore_access_does_not_count_against_victim() {
+        // A hostile admin issues 5 RestoreAccess { did: victim } actions.
+        // These are beneficial — they MUST NOT inflate governance_actions_against.
+        let victim = "did:key:victim";
+        let events: Vec<Event> = (0..5)
+            .map(|i| {
+                make_event(
+                    EventType::GovernanceAction,
+                    "did:key:admin",
+                    1000 + i,
+                    i,
+                    make_gov_payload(victim, "RestoreAccess"),
+                )
+            })
+            .collect();
+
+        let record =
+            compute_participation_record(&events, victim, "ctx-h18", [0u8; 32], 9000).unwrap();
+
+        assert_eq!(
+            record.governance_actions_against.len(),
+            0,
+            "RestoreAccess must not count against the victim (H18)"
+        );
+    }
+
+    #[test]
+    fn suspend_capability_counts_against_victim() {
+        // A SuspendCapability action targeting the victim IS adverse and must
+        // be counted.
+        let victim = "did:key:victim";
+        let events = vec![make_event(
+            EventType::GovernanceAction,
+            "did:key:admin",
+            1000,
+            0,
+            make_gov_payload(victim, "SuspendCapability"),
+        )];
+
+        let record =
+            compute_participation_record(&events, victim, "ctx-h18", [0u8; 32], 9000).unwrap();
+
+        assert_eq!(
+            record.governance_actions_against.len(),
+            1,
+            "SuspendCapability must count against the victim"
+        );
+    }
+
+    #[test]
+    fn mixed_actions_only_counts_adverse() {
+        // 3 RestoreAccess + 2 SuspendCapability + 1 RemoveMember against victim.
+        // Only the 3 adverse ones (2 SuspendCapability + 1 RemoveMember) count.
+        let victim = "did:key:victim";
+        let events = vec![
+            make_event(
+                EventType::GovernanceAction,
+                "did:key:admin",
+                1000,
+                0,
+                make_gov_payload(victim, "RestoreAccess"),
+            ),
+            make_event(
+                EventType::GovernanceAction,
+                "did:key:admin",
+                1001,
+                1,
+                make_gov_payload(victim, "RestoreAccess"),
+            ),
+            make_event(
+                EventType::GovernanceAction,
+                "did:key:admin",
+                1002,
+                2,
+                make_gov_payload(victim, "RestoreAccess"),
+            ),
+            make_event(
+                EventType::GovernanceAction,
+                "did:key:admin",
+                1003,
+                3,
+                make_gov_payload(victim, "SuspendCapability"),
+            ),
+            make_event(
+                EventType::GovernanceAction,
+                "did:key:admin",
+                1004,
+                4,
+                make_gov_payload(victim, "SuspendCapability"),
+            ),
+            make_event(
+                EventType::GovernanceAction,
+                "did:key:admin",
+                1005,
+                5,
+                make_gov_payload(victim, "RemoveMember"),
+            ),
+        ];
+
+        let record =
+            compute_participation_record(&events, victim, "ctx-h18", [0u8; 32], 9000).unwrap();
+
+        assert_eq!(
+            record.governance_actions_against.len(),
+            3,
+            "only adverse actions (2 SuspendCapability + 1 RemoveMember) should count (H18)"
+        );
+    }
+
+    #[test]
+    fn approve_spend_does_not_count_against_beneficiary() {
+        // ApproveSpend is beneficial. Even when its target_did is the victim,
+        // it must not count against them.
+        let victim = "did:key:victim";
+        let events = vec![make_event(
+            EventType::GovernanceAction,
+            "did:key:admin",
+            1000,
+            0,
+            make_gov_payload(victim, "ApproveSpend"),
+        )];
+
+        let record =
+            compute_participation_record(&events, victim, "ctx-h18", [0u8; 32], 9000).unwrap();
+
+        assert_eq!(
+            record.governance_actions_against.len(),
+            0,
+            "ApproveSpend must not count against the beneficiary (H18)"
+        );
     }
 
     #[test]
@@ -2204,4 +2443,63 @@ mod tests {
 
     // SCP-BA-006 tests moved to scp-runtime::trust::participation_service (they
     // depend on scp_identity::document::DidDocument).
+
+    // -----------------------------------------------------------------------
+    // Structured JSON payload tests (H11-H12)
+    // -----------------------------------------------------------------------
+
+    /// `governance_actions_against` is populated when structured JSON payloads
+    /// carry `target_did` matching the subject.
+    #[test]
+    fn test_participation_actions_against_populated() {
+        let payload =
+            serde_json::to_vec(&serde_json::json!({"target_did": "did:key:alice"})).unwrap();
+
+        let events = vec![
+            make_event(
+                EventType::GovernanceAction,
+                "did:key:admin",
+                1000,
+                0,
+                payload.clone(),
+            ),
+            make_event(
+                EventType::GovernanceAction,
+                "did:key:moderator",
+                1001,
+                1,
+                payload,
+            ),
+            // Action targeting bob — should not count against alice.
+            make_event(
+                EventType::GovernanceAction,
+                "did:key:admin",
+                1002,
+                2,
+                serde_json::to_vec(&serde_json::json!({"target_did": "did:key:bob"})).unwrap(),
+            ),
+        ];
+
+        let record =
+            compute_participation_record(&events, "did:key:alice", "ctx-1", [0u8; 32], 2000)
+                .unwrap();
+
+        assert_eq!(
+            record.governance_actions_against.len(),
+            2,
+            "both governance actions targeting alice should be recorded"
+        );
+        assert_eq!(
+            record.governance_actions_against[0].actor_did,
+            "did:key:admin"
+        );
+        assert_eq!(
+            record.governance_actions_against[0].target_did,
+            Some("did:key:alice".into())
+        );
+        assert_eq!(
+            record.governance_actions_against[1].actor_did,
+            "did:key:moderator"
+        );
+    }
 }

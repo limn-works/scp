@@ -12,7 +12,13 @@
  */
 
 import type { BridgeMode, ShadowStatus } from "../bridge";
-import { IdentityError, ToolError, TransportError } from "../errors";
+import {
+  EconomicPolicyUnsupportedOnWasm,
+  IdentityError,
+  ToolError,
+  TransportError,
+  WasmCannotValidateSpendingUcan,
+} from "../errors";
 import type {
   BroadcastAdmissionPolicy,
   Checkpoint,
@@ -63,13 +69,18 @@ interface WasmModule {
     identityDid: string,
     paramsJson: string,
   ) => Promise<{ contextId: string; state: string; creatorDid: string }>;
-  context_join: (handle: BridgeContextHandle, identityDid: string) => Promise<void>;
+  context_join: (
+    handle: BridgeContextHandle,
+    identityDid: string,
+    spendingUcanJwt?: string,
+  ) => Promise<void>;
   context_leave: (handle: BridgeContextHandle, identityDid: string) => Promise<void>;
   context_close: (handle: BridgeContextHandle, identityDid: string) => Promise<void>;
   context_send: (
     handle: BridgeContextHandle,
     identityDid: string,
     payloadBase64: string,
+    spendingUcanJwt?: string,
   ) => Promise<void>;
   context_subscribe: (
     handle: BridgeContextHandle,
@@ -458,10 +469,6 @@ interface WasmModule {
   economy_check_policy_lock: (policyJson: string) => boolean;
   economy_validate_policy_change: (currentJson: string, proposedJson: string) => boolean;
   economy_evaluate_formula: (formulaJson: string, metricsJson: string) => number;
-  economy_adjust_relay_price: (
-    configJson: string,
-    utilizationPct: number,
-  ) => { newBasePrice: number; previousBasePrice: number; direction: string };
   economy_budget_remaining: (contextId: string, did: string) => number;
   economy_budget_grant: (contextId: string, did: string, amount: number) => void;
   economy_budget_record_spend: (contextId: string, did: string, amount: number) => void;
@@ -640,6 +647,42 @@ function generateProposalIdHex(): string {
   return hex;
 }
 
+/**
+ * Re-throws a WASM bridge rejection as a typed error when it carries one of
+ * the C2 fail-closed economy gate codes (`SCP-ECON-12095` /
+ * `SCP-ECON-12096`).
+ *
+ * The Rust `WasmContextManager` rejects paid contexts at create / join /
+ * send because the WASM bridge cannot run `scp-runtime`'s `enforce_economy`
+ * pipeline (no payment adapter, no budget tracker, no velocity tracker, no
+ * hard rate limit token bucket — see ADR-034). The rejection arrives here
+ * as a generic `Error` whose `.message` carries the bracketed
+ * `[SCP-ECON-12095]` / `[SCP-ECON-12096]` prefix.
+ *
+ * Most callers route through `mapBridgeError` upstream, which handles the
+ * mapping uniformly. This helper exists so the WASM bridge layer ALSO emits
+ * the typed subclass directly, even when callers do not pass through the
+ * SDK error mapper. Returning the original error if no code matches keeps
+ * the regular error flow intact.
+ */
+function rethrowEconomyFailClosed(error: unknown): unknown {
+  if (!(error instanceof Error)) {
+    return error;
+  }
+  const codeMatch = /\[(SCP-ECON-\d+)\]/.exec(error.message);
+  if (codeMatch === null) {
+    return error;
+  }
+  const code = codeMatch[1] ?? "SCP-ECON-0000";
+  if (code === "SCP-ECON-12095") {
+    return new EconomicPolicyUnsupportedOnWasm(error.message, code);
+  }
+  if (code === "SCP-ECON-12096") {
+    return new WasmCannotValidateSpendingUcan(error.message, code);
+  }
+  return error;
+}
+
 // ---------------------------------------------------------------------------
 // Bridge factory
 // ---------------------------------------------------------------------------
@@ -715,17 +758,41 @@ export function createWasmBridge(): Bridge {
     ): Promise<BridgeContextHandle> {
       const wasm = getWasm();
       // WASM bridge uses identity.did since wasm_bindgen context_create takes a DID string.
-      const handle = await wasm.context_create(identity.did, paramsJson);
-      return {
-        contextId: handle.contextId,
-        state: handle.state,
-        creatorDid: handle.creatorDid,
-      };
+      //
+      // C2 fail-closed: if `paramsJson` carries an `economicPolicy` that
+      // requires payment for any action, the underlying Rust manager rejects
+      // with `SCP-ECON-12095` (`EconomicPolicyUnsupportedOnWasm`). The
+      // bracketed code in the rejection message is parsed by `mapBridgeError`
+      // upstream into the typed subclass — it is intentionally NOT caught
+      // here so the SDK layer can handle it via its own try/catch.
+      try {
+        const handle = await wasm.context_create(identity.did, paramsJson);
+        return {
+          contextId: handle.contextId,
+          state: handle.state,
+          creatorDid: handle.creatorDid,
+        };
+      } catch (e) {
+        throw rethrowEconomyFailClosed(e);
+      }
     },
 
-    async contextJoin(handle: BridgeContextHandle, identityDid: string): Promise<void> {
+    async contextJoin(
+      handle: BridgeContextHandle,
+      identityDid: string,
+      spendingUcanJwt?: string | null,
+    ): Promise<void> {
       const wasm = getWasm();
-      await wasm.context_join(handle, identityDid);
+      // C2 fail-closed: if the target context's stored economic policy
+      // requires payment, the underlying Rust manager rejects with
+      // `SCP-ECON-12096` (`WasmCannotValidateSpendingUcan`) regardless of
+      // whether `spendingUcanJwt` is supplied. See ADR-034 and
+      // `crates/scp-ffi/wasm/src/manager.rs` for details.
+      try {
+        await wasm.context_join(handle, identityDid, spendingUcanJwt ?? undefined);
+      } catch (e) {
+        throw rethrowEconomyFailClosed(e);
+      }
     },
 
     async contextLeave(handle: BridgeContextHandle, identityDid: string): Promise<void> {
@@ -742,10 +809,20 @@ export function createWasmBridge(): Bridge {
       handle: BridgeContextHandle,
       identityDid: string,
       payload: Uint8Array,
+      spendingUcanJwt?: string | null,
     ): Promise<void> {
       const wasm = getWasm();
       const payloadBase64 = uint8ToBase64(payload);
-      await wasm.context_send(handle, identityDid, payloadBase64);
+      // C2 fail-closed: if the target context's stored economic policy
+      // requires payment, the underlying Rust manager rejects with
+      // `SCP-ECON-12096` (`WasmCannotValidateSpendingUcan`) regardless of
+      // whether `spendingUcanJwt` is supplied. See ADR-034 and
+      // `crates/scp-ffi/wasm/src/manager.rs` for details.
+      try {
+        await wasm.context_send(handle, identityDid, payloadBase64, spendingUcanJwt ?? undefined);
+      } catch (e) {
+        throw rethrowEconomyFailClosed(e);
+      }
     },
 
     contextSubscribe(
@@ -1147,7 +1224,23 @@ export function createWasmBridge(): Bridge {
       inputJson: string,
       identityDid: string,
       ucanToken: string,
+      _proofTokens?: readonly string[],
+      spendingUcan?: string,
     ): Promise<string> {
+      // C4 (#1606): the WASM bridge has its own tool dispatch path
+      // (ADR-034) and does NOT route through
+      // ContextManager.invoke_tool_with_economy. Reject any
+      // spendingUcan argument with a clear error rather than
+      // silently dropping it — paid tool invocations require the
+      // native (NAPI) bridge until the WASM economy path lands.
+      if (spendingUcan !== undefined && spendingUcan !== null) {
+        throw new ToolError(
+          "spendingUcan is not supported by the WASM bridge — paid tool " +
+            "invocations require the native (NAPI) bridge or the Python / " +
+            "Swift / Kotlin SDKs (ADR-034). See issue #1606.",
+          "SCP-TOOL-6041",
+        );
+      }
       const wasm = getWasm();
       return await wasm.tool_invoke(handle, toolId, inputJson, identityDid, ucanToken);
     },
@@ -1916,11 +2009,6 @@ export function createWasmBridge(): Bridge {
     economyEvaluateFormula(formulaJson: string, metricsJson: string): number {
       const wasm = getWasm();
       return wasm.economy_evaluate_formula(formulaJson, metricsJson);
-    },
-
-    economyAdjustRelayPrice(configJson: string, utilizationPct: number) {
-      const wasm = getWasm();
-      return wasm.economy_adjust_relay_price(configJson, utilizationPct);
     },
 
     economyBudgetRemaining(contextId: string, did: string): number {

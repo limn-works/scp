@@ -1,8 +1,9 @@
 //! Simple queries and local DID management.
 
 use super::{
-    Capability, ContextError, ContextEvent, ContextEventLogProvider, ContextManager, ContextParams,
-    ContextRoleState, DID, RoleAssignment, Zeroizing, instrument,
+    Arc, Capability, CommitFaultMarker, ContextError, ContextEvent, ContextEventLogProvider,
+    ContextManager, ContextParams, ContextRoleState, DID, PendingCommit, RoleAssignment, Zeroizing,
+    instrument,
 };
 
 #[allow(clippy::significant_drop_tightening)]
@@ -20,6 +21,21 @@ impl ContextManager {
     #[instrument(skip_all)]
     pub async fn register_local_did(&self, did: DID) {
         self.local_dids.write().await.insert(did);
+    }
+
+    /// Sets the payment adapter for the 9-step paid action flow (spec §19.2.2).
+    ///
+    /// When set, `authorize_paid_action`→`complete_paid_action` runs the
+    /// full escrow sequence for each paid entry point (`send_message`,
+    /// `join_context`, `invoke_tool`). When `None`, those entry points
+    /// still enforce budget tracking but skip the payment rail integration.
+    ///
+    /// Can be called at any time; takes effect for subsequent actions.
+    pub fn set_payment_adapter(
+        &mut self,
+        adapter: Arc<dyn crate::economy::adapter::PaymentAdapterDyn>,
+    ) {
+        self.payment_adapter = Some(adapter);
     }
 
     /// Returns `true` if the given DID is registered as locally controlled.
@@ -307,7 +323,7 @@ impl ContextManager {
     /// member's local key material is destroyed.
     ///
     /// This is the explicit counterpart to the implicit key removal that
-    /// happens during `RevokeReadAccess` governance action execution
+    /// happens during `Revoke` governance action execution
     /// (§9.17.2 step 3, ADR-038).
     ///
     /// # Errors
@@ -357,7 +373,7 @@ impl ContextManager {
     /// re-distributed (forward-only restoration, §9.16.8, ADR-038).
     ///
     /// This is the explicit counterpart to the implicit key restoration
-    /// that happens during `RestoreReadAccess` governance action execution
+    /// that happens during `RestoreAccess` governance action execution
     /// (§9.17.2 step 5).
     ///
     /// # Errors
@@ -478,5 +494,108 @@ impl ContextManager {
             .get(context_id)
             .map(|ctx| ctx.access.access_key_store.get_all(context_id))
             .unwrap_or_default()
+    }
+
+    /// Grants budget to a member in a context.
+    ///
+    /// Test-only method for seeding `MemberBudgetTracker` grants
+    /// without going through the full `ApproveSpend` governance
+    /// proposal pipeline. Used by integration tests to verify the
+    /// runtime's `invoke_tool_with_economy` deducts budget correctly
+    /// (PR #1606 / C4 — bridge tool-invoke economy wiring). Production
+    /// code MUST use the `ApproveSpend` governance action.
+    #[cfg(feature = "testing")]
+    pub async fn grant_budget_for_test(
+        &self,
+        context_id: &str,
+        member_did: &scp_identity::DID,
+        amount: scp_protocol::economy::types::Amount,
+    ) {
+        if let Some(ctx) = self.contexts.lock().await.get_mut(context_id) {
+            ctx.governance.budget_tracker.grant(member_did, amount);
+        }
+    }
+
+    /// Returns the remaining budget for a member in a context.
+    ///
+    /// Test-only accessor for asserting the post-call state of the
+    /// per-DID budget after `invoke_tool_with_economy` runs. Returns
+    /// zero if the context is unknown.
+    #[cfg(feature = "testing")]
+    pub async fn remaining_budget_for_test(
+        &self,
+        context_id: &str,
+        member_did: &scp_identity::DID,
+    ) -> scp_protocol::economy::types::Amount {
+        let contexts = self.contexts.lock().await;
+        contexts
+            .get(context_id)
+            .map_or(scp_protocol::economy::types::Amount::new(0), |ctx| {
+                ctx.governance.budget_tracker.remaining(member_did)
+            })
+    }
+
+    /// Returns the per-DID velocity (number of recent paid actions) for
+    /// a member in a context within the velocity window.
+    ///
+    /// Test-only accessor for verifying that
+    /// `invoke_tool_with_economy` records the invocation in the
+    /// per-DID velocity tracker. The bridges' previous bypass path
+    /// did not record velocity at all, so the assertion in PR #1606
+    /// C4 needs this hook to fail loudly on regression.
+    #[cfg(feature = "testing")]
+    pub async fn velocity_for_test(
+        &self,
+        context_id: &str,
+        member_did: &scp_identity::DID,
+        now_secs: u64,
+    ) -> u64 {
+        let contexts = self.contexts.lock().await;
+        contexts.get(context_id).map_or(0, |ctx| {
+            ctx.governance
+                .velocity_tracker
+                .get_velocity(member_did, now_secs)
+        })
+    }
+
+    /// Returns a clone of the persistent MLS Commit retry queue for a context
+    /// (PR #1606 C6).
+    ///
+    /// Each entry represents an MLS Commit (`RemoveMember`,
+    /// `RotateContentKeys`, `ResetMember`, or `LeaveContext`) whose
+    /// `transport.send_message` call previously failed and which is being
+    /// retried by the governance timeout task with exponential backoff.
+    /// SDK consumers SHOULD surface non-empty queues to the application
+    /// layer because the local state mutation has happened but at least one
+    /// remote member has not yet seen the commit.
+    ///
+    /// Returns an empty `Vec` if the context is not registered or has no
+    /// pending commits.
+    #[instrument(skip_all, fields(context_id))]
+    pub async fn pending_commits(&self, context_id: &str) -> Vec<PendingCommit> {
+        self.contexts
+            .lock()
+            .await
+            .get(context_id)
+            .map(|ctx| ctx.pending_commits.iter().cloned().collect())
+            .unwrap_or_default()
+    }
+
+    /// Returns the active commit fault marker for a context, if any (PR #1606 C6).
+    ///
+    /// `Some(marker)` indicates that a previous MLS Commit broadcast exhausted
+    /// its retry budget and the context is in fail-close state — subsequent
+    /// `execute_governance_action` and `leave_context` calls return
+    /// [`ContextError::CommitBroadcastFault`] until the marker is cleared via
+    /// [`acknowledge_commit_fault`](Self::acknowledge_commit_fault).
+    ///
+    /// Returns `None` if the context is not registered or has no fault marker.
+    #[instrument(skip_all, fields(context_id))]
+    pub async fn commit_fault(&self, context_id: &str) -> Option<CommitFaultMarker> {
+        self.contexts
+            .lock()
+            .await
+            .get(context_id)
+            .and_then(|ctx| ctx.commit_fault.clone())
     }
 }

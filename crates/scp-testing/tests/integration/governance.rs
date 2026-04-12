@@ -15,10 +15,10 @@ use scp_core::context::governance::timeout::{
 };
 use scp_core::context::governance::unanimity::UnanimityEngine;
 use scp_core::context::governance::{
-    ConflictResolution, DeadlockJustification, GovernanceAction, GovernanceContext,
+    AccessScope, ConflictResolution, DeadlockJustification, GovernanceAction, GovernanceContext,
     GovernanceEngine, GovernanceError, GovernanceEvent, GovernanceReconfigAction, KeyResolver,
-    ProposalStatus, PruningPolicy, RevocationScope, SingleAdminEngine, VoteType, actions_conflict,
-    sign_vote, verify_vote,
+    ProposalStatus, PruningPolicy, SingleAdminEngine, VoteType, actions_conflict, sign_vote,
+    verify_vote,
 };
 use scp_core::context::params::{Capability, ContextParams};
 use scp_core::context::tools::ToolSchema;
@@ -132,11 +132,16 @@ fn simple_tool_registration() -> scp_core::context::params::ToolRegistration {
 }
 
 // ---------------------------------------------------------------------------
-// 1. all_30_governance_action_variants_roundtrip
+// 1. all_governance_action_variants_roundtrip
 // ---------------------------------------------------------------------------
 
-/// Builds all 30 `GovernanceAction` variants for exhaustive testing.
+/// Builds governance action fixtures covering every variant (plus a
+/// few variants with multiple `AccessScope` values) for exhaustive
+/// serde round-trip testing. The assertion below pins the fixture
+/// count so adding a new variant to the enum without updating this
+/// helper breaks the test loudly.
 /// Split into a helper to keep the test function within the line limit.
+#[allow(clippy::too_many_lines)]
 fn all_governance_actions_for_test() -> Vec<GovernanceAction> {
     vec![
         GovernanceAction::AddMember {
@@ -170,15 +175,14 @@ fn all_governance_actions_for_test() -> Vec<GovernanceAction> {
         GovernanceAction::CreateChildContext {
             params: Box::new(ContextParams::default()),
         },
-        GovernanceAction::BlockAuthor {
+        GovernanceAction::RevokeAccess {
             did: bob(),
-            reason: Some("spam".to_owned()),
+            access: AccessScope::Read,
         },
-        GovernanceAction::RevokeReadAccess {
+        GovernanceAction::RestoreAccess {
             did: bob(),
-            scope: RevocationScope::Full,
+            capabilities: vec![Capability::MessagesRead],
         },
-        GovernanceAction::RestoreReadAccess { did: bob() },
         GovernanceAction::ModifyPruningPolicy {
             new_policy: PruningPolicy::default(),
         },
@@ -200,11 +204,14 @@ fn all_governance_actions_for_test() -> Vec<GovernanceAction> {
             },
         },
         GovernanceAction::PromoteContext,
-        GovernanceAction::RevokeWriteAccess {
+        GovernanceAction::RevokeAccess {
             did: bob(),
-            scope: RevocationScope::FutureOnly,
+            access: AccessScope::Write,
         },
-        GovernanceAction::RestoreWriteAccess { did: bob() },
+        GovernanceAction::RestoreAccess {
+            did: bob(),
+            capabilities: vec![Capability::MessagesWrite],
+        },
         GovernanceAction::RotateContentKeys {
             reason: Some("periodic hygiene".to_owned()),
         },
@@ -232,17 +239,29 @@ fn all_governance_actions_for_test() -> Vec<GovernanceAction> {
             auto_invite: true,
         },
         GovernanceAction::CancelContextMigration,
+        GovernanceAction::SuspendCapability {
+            did: bob(),
+            capabilities: vec![Capability::GovernanceVote],
+        },
+        GovernanceAction::ModifyHardRateLimit {
+            new_config: scp_core::economy::antispam::HardRateLimitConfig::matrix_defaults(),
+        },
     ]
 }
 
 #[tokio::test]
-async fn all_30_governance_action_variants_roundtrip() {
+async fn all_governance_action_variants_roundtrip() {
     let actions = all_governance_actions_for_test();
 
+    // The fixture count is pinned to catch enum growth. When adding
+    // a new GovernanceAction variant, extend `all_governance_actions_for_test`
+    // and bump this number. Not equal to the raw variant count —
+    // Revoke / RestoreAccess appear twice with different AccessScope
+    // values to exercise both scopes of the AccessScope enum.
     assert_eq!(
         actions.len(),
-        30,
-        "must cover all 30 GovernanceAction variants"
+        31,
+        "fixture must cover every GovernanceAction variant; bump when adding a new variant"
     );
 
     for action in &actions {
@@ -858,26 +877,32 @@ async fn conflict_detection() {
         "competing ModifyCeiling should conflict"
     );
 
-    // RevokeReadAccess vs RestoreReadAccess.
-    let revoke = GovernanceAction::RevokeReadAccess {
+    // Revoke (read) vs RestoreAccess (read).
+    let revoke = GovernanceAction::RevokeAccess {
         did: bob(),
-        scope: RevocationScope::Full,
+        access: AccessScope::Read,
     };
-    let restore = GovernanceAction::RestoreReadAccess { did: bob() };
+    let restore = GovernanceAction::RestoreAccess {
+        did: bob(),
+        capabilities: vec![Capability::MessagesRead],
+    };
     assert!(
         actions_conflict(&revoke, &alice(), &restore, &carol()),
-        "RevokeReadAccess vs RestoreReadAccess should conflict"
+        "Revoke (read) vs RestoreAccess (read) should conflict"
     );
 
-    // RevokeWriteAccess vs RestoreWriteAccess.
-    let revoke_w = GovernanceAction::RevokeWriteAccess {
+    // Revoke (write) vs RestoreAccess (write).
+    let revoke_w = GovernanceAction::RevokeAccess {
         did: bob(),
-        scope: RevocationScope::FutureOnly,
+        access: AccessScope::Write,
     };
-    let restore_w = GovernanceAction::RestoreWriteAccess { did: bob() };
+    let restore_w = GovernanceAction::RestoreAccess {
+        did: bob(),
+        capabilities: vec![Capability::MessagesWrite],
+    };
     assert!(
         actions_conflict(&revoke_w, &alice(), &restore_w, &carol()),
-        "RevokeWriteAccess vs RestoreWriteAccess should conflict"
+        "Revoke (write) vs RestoreAccess (write) should conflict"
     );
 }
 
@@ -1036,49 +1061,51 @@ async fn governance_event_variants() {
 
 #[tokio::test]
 async fn revocation_scope_variants() {
-    // Verify the two RevocationScope variants for content access actions.
-    let full = RevocationScope::Full;
-    let future_only = RevocationScope::FutureOnly;
+    // Verify the three AccessScope variants for content access actions.
+    let read = AccessScope::Read;
+    let write = AccessScope::Write;
+    let both = AccessScope::Both;
 
-    assert_ne!(full, future_only);
+    assert_ne!(read, write);
+    assert_ne!(read, both);
 
-    // RevokeReadAccess with Full.
-    let action_full = GovernanceAction::RevokeReadAccess {
+    // Revoke with Read scope.
+    let action_read = GovernanceAction::RevokeAccess {
         did: bob(),
-        scope: RevocationScope::Full,
+        access: AccessScope::Read,
     };
-    let json_full = serde_json::to_string(&action_full).unwrap();
-    let deser_full: GovernanceAction = serde_json::from_str(&json_full).unwrap();
+    let json_read = serde_json::to_string(&action_read).unwrap();
+    let deser_read: GovernanceAction = serde_json::from_str(&json_read).unwrap();
     assert_eq!(
-        serde_json::to_string(&deser_full).unwrap(),
-        json_full,
-        "Full scope roundtrip"
+        serde_json::to_string(&deser_read).unwrap(),
+        json_read,
+        "Read scope roundtrip"
     );
 
-    // RevokeReadAccess with FutureOnly.
-    let action_fo = GovernanceAction::RevokeReadAccess {
+    // Revoke with Write scope.
+    let action_write = GovernanceAction::RevokeAccess {
         did: bob(),
-        scope: RevocationScope::FutureOnly,
+        access: AccessScope::Write,
     };
-    let json_fo = serde_json::to_string(&action_fo).unwrap();
-    let deser_fo: GovernanceAction = serde_json::from_str(&json_fo).unwrap();
+    let json_write = serde_json::to_string(&action_write).unwrap();
+    let deser_write: GovernanceAction = serde_json::from_str(&json_write).unwrap();
     assert_eq!(
-        serde_json::to_string(&deser_fo).unwrap(),
-        json_fo,
-        "FutureOnly scope roundtrip"
+        serde_json::to_string(&deser_write).unwrap(),
+        json_write,
+        "Write scope roundtrip"
     );
 
     // Conflicting scopes on same DID.
-    let revoke_full = GovernanceAction::RevokeReadAccess {
+    let revoke_both = GovernanceAction::RevokeAccess {
         did: bob(),
-        scope: RevocationScope::Full,
+        access: AccessScope::Both,
     };
-    let revoke_fo = GovernanceAction::RevokeReadAccess {
+    let revoke_write = GovernanceAction::RevokeAccess {
         did: bob(),
-        scope: RevocationScope::FutureOnly,
+        access: AccessScope::Write,
     };
     assert!(
-        actions_conflict(&revoke_full, &alice(), &revoke_fo, &carol()),
+        actions_conflict(&revoke_both, &alice(), &revoke_write, &carol()),
         "same DID + different scopes should conflict"
     );
 }

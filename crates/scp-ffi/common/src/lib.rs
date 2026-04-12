@@ -21,6 +21,63 @@ pub mod validate;
 mod bridge_id;
 pub use bridge_id::generate_bridge_id;
 
+// ---------------------------------------------------------------------------
+// HTML escaping for event output (XSS prevention)
+// ---------------------------------------------------------------------------
+
+/// Escapes HTML-special characters in event output strings.
+///
+/// Prevents XSS when event output (which may contain attacker-controlled
+/// strings from consequence rules, capability names, or member DIDs) is
+/// inserted into DOM via `innerHTML` or similar mechanisms.
+///
+/// Replaces:
+/// - `&` → `&amp;`
+/// - `<` → `&lt;`
+/// - `>` → `&gt;`
+/// - `"` → `&quot;`
+/// - `'` → `&#x27;`
+///
+/// This function is used by all FFI bridges (`PyO3`, napi-rs, `UniFFI`, WASM)
+/// to sanitize event strings before returning them to callers.
+#[inline]
+#[must_use]
+pub fn html_escape_event_string(s: &str) -> String {
+    let mut result = String::with_capacity(s.len());
+    for ch in s.chars() {
+        match ch {
+            '&' => result.push_str("&amp;"),
+            '<' => result.push_str("&lt;"),
+            '>' => result.push_str("&gt;"),
+            '"' => result.push_str("&quot;"),
+            '\'' => result.push_str("&#x27;"),
+            _ => result.push(ch),
+        }
+    }
+    result
+}
+
+/// Escapes HTML-special characters in a JSON string using JSON unicode
+/// escapes.
+///
+/// This variant is for the WASM bridge where output is JSON. Using JSON
+/// unicode escapes (`\u003c` etc.) keeps the output valid JSON while
+/// preventing XSS when the JSON is inserted into HTML.
+///
+/// Replaces:
+/// - `<` → `\u003c`
+/// - `>` → `\u003e`
+/// - `&` → `\u0026`
+/// - `'` → `\u0027`
+#[inline]
+#[must_use]
+pub fn html_escape_json(json: &str) -> String {
+    json.replace('<', "\\u003c")
+        .replace('>', "\\u003e")
+        .replace('&', "\\u0026")
+        .replace('\'', "\\u0027")
+}
+
 // Trust store shared across PyO3, napi-rs, and UniFFI bridges.
 // Requires scp-core (behind `resolvers` feature). Not available for WASM.
 #[cfg(feature = "resolvers")]

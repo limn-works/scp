@@ -11,7 +11,6 @@ from __future__ import annotations
 
 import json
 import logging
-from dataclasses import dataclass
 from typing import Any
 
 from scp_sdk.errors import ScpError
@@ -59,7 +58,14 @@ def estimate_cost(
         Estimated cost (smallest currency unit), or ``None`` on overflow.
     """
     bridge = _bridge()
-    m = metrics or {}
+    # The bridge takes a non-Optional dict and defaults all observable metric
+    # keys to 0 internally, so `metrics={}` and `metrics=None` are
+    # observationally identical for this call. Normalise to `{}` rather than
+    # `is not None` because there is no semantic difference at the boundary;
+    # both branches produce the same Rust input. Do NOT generalise this
+    # pattern -- callers operating on Optional collections at FFI boundaries
+    # MUST use `is not None` (see context.py:trusted_dids and trust.py).
+    m = metrics if metrics is not None else {}
     return bridge.economy_estimate_cost(policy_json, action_type, m)
 
 
@@ -132,48 +138,11 @@ def evaluate_formula(formula_json: str, metrics: dict[str, int] | None = None) -
         Computed cost (smallest currency unit), or ``None`` on overflow.
     """
     bridge = _bridge()
-    m = metrics or {}
+    # See estimate_cost above: empty/None are observationally identical at
+    # the bridge but use `is not None` to keep the FFI-boundary discipline
+    # consistent across the SDK.
+    m = metrics if metrics is not None else {}
     return bridge.economy_evaluate_formula(formula_json, m)
-
-
-# ---------------------------------------------------------------------------
-# Relay pricing
-# ---------------------------------------------------------------------------
-
-
-@dataclass
-class RelayPriceAdjustment:
-    """Result of an EIP-1559-style relay price adjustment."""
-
-    #: New base price (smallest currency unit).
-    new_base_price: int
-
-    #: Previous base price before adjustment.
-    previous_base_price: int
-
-    #: Direction: ``"Increased"``, ``"Decreased"``, or ``"Unchanged"``.
-    direction: str
-
-
-def adjust_relay_price(config_json: str, utilization_pct: int) -> RelayPriceAdjustment:
-    """Compute an EIP-1559-style relay price adjustment.
-
-    Args:
-        config_json: Relay pricing config as JSON string with fields:
-            ``target_utilization_pct``, ``current_base_price``,
-            ``max_change_per_mille``, ``floor``, ``cap``.
-        utilization_pct: Current utilization percentage (0-100).
-
-    Returns:
-        A :class:`RelayPriceAdjustment` with the new price and direction.
-    """
-    bridge = _bridge()
-    result = bridge.economy_adjust_relay_price(config_json, utilization_pct)
-    return RelayPriceAdjustment(
-        new_base_price=result["new_base_price"],
-        previous_base_price=result["previous_base_price"],
-        direction=result["direction"],
-    )
 
 
 # ---------------------------------------------------------------------------
@@ -288,8 +257,6 @@ def antispam_escalated_cost(
 
 
 __all__ = [
-    "RelayPriceAdjustment",
-    "adjust_relay_price",
     "antispam_escalated_cost",
     "antispam_record",
     "antispam_velocity",

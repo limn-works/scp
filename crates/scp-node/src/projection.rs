@@ -318,7 +318,7 @@ const UCAN_CACHE_TTL_SECS: u64 = 60;
 ///
 /// Stores the context's [`BroadcastAdmission`] mode and optional
 /// [`ProjectionPolicy`] so projection handlers can enforce authentication
-/// requirements (SCP-GG-007, SCP-GG-008).
+/// requirements.
 ///
 /// For gated contexts, also stores member public keys, context creator DID,
 /// and a revocation set for full UCAN cryptographic verification
@@ -642,7 +642,7 @@ impl ProjectedContext {
     /// If pruning becomes necessary, add a `prune_before(epoch)` method
     /// keyed to the relay's `max_blob_ttl`.
     ///
-    /// **Important:** After a governance ban (`RevokeReadAccess` /
+    /// **Important:** After a governance ban (`Revoke` /
     /// `governance_ban_subscriber`), all author keys are rotated in the
     /// `ContextManager`. The caller MUST propagate the new-epoch keys to
     /// the projection registry via this method; otherwise the projection
@@ -1603,13 +1603,12 @@ pub async fn feed_handler(
     // author's content Gated (or stricter than the default rule), filter
     // out their messages when the request lacks valid auth. This prevents
     // the feed from leaking per-author-gated content to unauthenticated
-    // clients (RED-302).
+    // clients.
     //
-    // Optimization (#355): pre-compute auth decisions for each distinct
-    // ProjectionRule found in the overrides. This parses the UCAN at most
-    // once per distinct rule instead of re-parsing per message in the
-    // retain loop. ProjectionRule has only 3 variants, so we check each
-    // at most once.
+    // Pre-compute auth decisions for each distinct ProjectionRule found
+    // in the overrides. This parses the UCAN at most once per distinct
+    // rule instead of re-parsing per message in the retain loop.
+    // ProjectionRule has only 3 variants, so we check each at most once.
     if let Some(ref policy) = projection_policy
         && !policy.overrides.is_empty()
     {
@@ -3864,7 +3863,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // SCP-GG-008: UCAN validation for gated projection endpoints
+    // UCAN validation for gated projection endpoints
     // -----------------------------------------------------------------------
 
     use scp_core::context::params::{ProjectionOverride, ProjectionPolicy, ProjectionRule};
@@ -4136,7 +4135,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // SCP-GG-008: effective_projection_rule unit tests
+    // effective_projection_rule unit tests
     // -----------------------------------------------------------------------
 
     #[test]
@@ -4202,7 +4201,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // SCP-GG-008: validate_projection_policy tests
+    // validate_projection_policy tests
     // -----------------------------------------------------------------------
 
     #[test]
@@ -4260,7 +4259,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // SCP-GG-008: feed per-author override filtering (RED-302)
+    // Feed per-author override filtering
     // -----------------------------------------------------------------------
 
     #[tokio::test]
@@ -4389,7 +4388,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // SCP-GG-008: UCAN temporal validation tests
+    // UCAN temporal validation tests
     // -----------------------------------------------------------------------
 
     #[test]
@@ -4470,7 +4469,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // SCP-GG-008: per-author override handler integration test
+    // Per-author override handler integration test
     // -----------------------------------------------------------------------
 
     #[tokio::test]

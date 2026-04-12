@@ -254,18 +254,18 @@ For multi-parent children, governance approval from every parent is required. Th
 
 Members must be in at least one parent to join the child. Eligibility is continuous: lose your last parent, lose the child.
 
-### Standing Channel (contact graph, §5.12.6)
+### Standing Context (contact graph, §5.12.6)
 
 ```
 // Get-or-create a bilateral-persistent context with a peer.
 // Idempotent: returns existing if one exists.
-SCP.Context.standingChannel(
+SCP.Context.standingContext(
   identity: Identity,
   peer: DID
 ) → Context { contextID, peer, template: .bilateralPersistent }
 ```
 
-Standing channels are bilateral-persistent contexts used for ongoing direct communication. Zero idle cost (no keepalives, ~2-5KB storage each). Persist across restarts. The agent's contact graph.
+Standing contexts are bilateral-persistent contexts used for ongoing direct communication. Zero idle cost (no keepalives, ~2-5KB storage each). Persist across restarts. The agent's contact graph.
 
 ### Auto-Accept Policies (§5.12.2)
 

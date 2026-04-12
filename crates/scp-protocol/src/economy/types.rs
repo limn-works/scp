@@ -296,6 +296,19 @@ pub enum PricingMetric {
     StorageUsage,
 }
 
+impl std::fmt::Display for PricingMetric {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::ContextMessageRate => f.write_str("ContextMessageRate"),
+            Self::MemberCount => f.write_str("MemberCount"),
+            Self::RelayQueueDepth => f.write_str("RelayQueueDepth"),
+            Self::TimeOfDay => f.write_str("TimeOfDay"),
+            Self::SenderVelocity => f.write_str("SenderVelocity"),
+            Self::StorageUsage => f.write_str("StorageUsage"),
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // PricingVariable
 // ---------------------------------------------------------------------------

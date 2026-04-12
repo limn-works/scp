@@ -70,7 +70,7 @@
 ### Critical Findings
 - claim_shadow() does NOT verify Ed25519 signatures - caller responsibility
 - BudgetTracker in spending.rs not thread-safe for concurrent async
-- StandingChannelManager TOCTOU race between lock drop and re-acquire
+- ContextManager standing context (contact graph, manager/standing.rs) TOCTOU race between lock drop and re-acquire
 - SenderVelocityTracker unbounded HashMap growth (Sybil DID exhaustion)
 
 ### Well-Defended
@@ -92,6 +92,53 @@
 - lib.rs L747: No jitter on 30-min tier re-eval interval
 - lib.rs L802-831: apply_tier_change should validate exactly one SCPRelay
 
+## Economy/Consequences Feature Review (2026-03-31)
+
+### P0 Findings
+- validate_governance_action_strings + reject_html_special_chars + all user-string validators DELETED from FFI common. No input-side length/content validation on role names, context names, descriptions, reasons, payment adapter refs. Output-escaping is NOT replacement.
+- check_and_composition now allows (None, None, Amount::ZERO) -- any caller can bypass AND-composition for "free" actions without any UCAN proof.
+
+### P1 Findings
+- send_sequence wrapping_add(1) -- wraps to 0 after u64::MAX, all subsequent messages rejected as replays
+- SenderKeyStore::set() remains pub, bypasses epoch monotonicity
+- system_assign_role is pub (not pub(crate)), bypasses RoleAssign capability
+- Escrow capture failure keeps budget deducted but no payment captured
+- html_escape_json doesn't escape double-quote (inconsistent with html_escape_event_string)
+- EpochNotMonotonic error leaks sender_did + epoch values
+- request_nonce: [0u8;16] in rotated sender key distributions may trigger nonce dedup
+
+### Well-Defended
+- Epoch poisoning defense (MAX_EPOCH_ADVANCE=1000 + set_checked monotonicity)
+- Blocked DID check on sender key requests
+- Management message 64KiB size limits (both send+receive)
+- Join economy ordering: sybil -> budget -> payment -> crypto
+- Cost evaluation overflow fails closed (tested)
+- Asymmetric timestamp freshness (300s past, 30s future)
+- HTML escaping on all event output strings across all 4 FFI bridges
+
+## Branch claude/complete-pr-work-review-0TQtO Review (2026-04-04)
+
+### P1 Findings
+- VALID_SUSPENSION_CAPABILITIES covers only MessagesRead/Write (6 aliases). 19 other Capability variants (ToolInvoke, GovernancePropose, MemberRemove, etc.) cannot be suspended via consequence rules -- Suspend silently logs unknown and skips.
+- Standing context ID changed from 8-byte truncated hash to full 32-byte hash (good), but old standing contexts using truncated IDs will not be found on reconnect (no migration path).
+- SuspendAll is app-layer only (role_state.suspend_all). No automatic MLS removal or sender key rotation. Comment says "dispatch RemoveMember governance action" but no code actually dispatches it. Gap between Suspend (app) and RemoveMember (crypto) layers.
+- enforce_assign_role returns bool but does not escalate on false except in the outer loop. If role doesn't exist, enforce_assign_role returns false -> SuspendAll escalation is correct, but the role existence isn't validated at rule creation time.
+
+### P2 Findings
+- event_log_entries_for_consequences estimated timestamps (1-second spacing) are approximations. High-throughput senders could have multiple events within same second, collapsing their timestamps and potentially under-counting velocity.
+- cooldown_until HashMap unbounded -- one entry per rule_index forever. No eviction of stale cooldowns.
+
+### Well-Defended
+- Consequence TOCTOU guard: membership check inside enforce loop, break on member departure
+- Fail-closed on participation record computation failure (denies proposal)
+- Budget rollback uses reverse_spend (decrements spent) not grant (inflates limit)
+- Cost evaluation overflow returns Err, not Ok(None) -- fail-closed
+- threshold=0 rejected at validation time
+- Escrow pattern: authorize -> action -> capture/void with proper rollback
+- H7: capability check BEFORE budget deduction prevents budget leak on permission failure
+- M4: velocity recorded BEFORE economy enforcement for accurate pricing
+- Nonce replay prevention on spending UCANs
+
 ## Recurring Patterns
 - TOCTOU races in check-then-act patterns (nonce replay, standing channels, budget)
 - Missing zeroization on crypto key material
@@ -99,3 +146,4 @@
 - unwrap_or_default on serialization hides failures
 - Manual string parsing where URL parser should be used
 - Projection UCAN validation is structural-only (parse not validate) -- recurring weakness
+- Input validation removals justified by output escaping -- defense regression pattern

@@ -253,7 +253,23 @@ impl ContextManager {
 
         // 2. Perform the MLS epoch advance (Update + self-Commit).
         //    If this fails the counter is NOT incremented.
-        self.crypto.advance_epoch(&context_id_bytes)?;
+        let epoch_output = self.crypto.advance_epoch(&context_id_bytes)?;
+
+        // 2b. Broadcast the MLS Commit to all members so they can advance
+        //     their group epoch and ratchet key material.
+        if !epoch_output.commit_bytes.is_empty() {
+            let routing_id = scp_protocol::context::context_routing_id(context_id);
+            if let Err(e) = self
+                .transport
+                .send_message(&routing_id, &epoch_output.commit_bytes)
+            {
+                tracing::warn!(
+                    context_id = %context_id,
+                    error = %e,
+                    "failed to broadcast recovery epoch advance MLS Commit"
+                );
+            }
+        }
 
         // 3. Increment bookkeeping counter and manage grace store.
         let new_epoch = {
@@ -274,10 +290,11 @@ impl ContextManager {
 
         // 4. Emit epoch advancement event to event log. Event log failures
         //    are non-fatal — recovery must not be blocked by logging issues.
-        if let Err(e) = self
-            .event_log
-            .append_context_event(&context_id_bytes, "recovery/epoch_advanced")
-        {
+        if let Err(e) = self.event_log.append_context_event(
+            &context_id_bytes,
+            "recovery/epoch_advanced",
+            "system:recovery",
+        ) {
             tracing::warn!(
                 context_id = %context_id,
                 error = %e,

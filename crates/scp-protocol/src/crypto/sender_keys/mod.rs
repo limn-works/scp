@@ -37,6 +37,8 @@ pub use broadcast::{
     open_broadcast_trusted, rotate_broadcast_key, seal_broadcast, validate_broadcast_version,
 };
 pub use encrypt::{decrypt_sender_layer, encrypt_sender_layer};
+// build_sender_header, parse_sender_header, and SENDER_HEADER_SIZE are wire-format
+// internals used by crypto providers — access via encrypt:: submodule directly.
 pub use key_protocol_verify::{
     BlockNotification, BridgeShadowKeyParams, HandleRequestParams, NonceDedup,
     RotateForBlockParams, RotateForBlockResult, SenderKeyDistributionMessage,
@@ -189,6 +191,21 @@ pub enum SenderKeyError {
     #[error("epoch counter overflow: already at u64::MAX")]
     EpochOverflow,
 
+    /// A received sender key has an epoch ≤ the current stored epoch.
+    ///
+    /// Indicates a rollback attempt or replay of an old key distribution.
+    #[error(
+        "sender key epoch not monotonic for {sender_did}: current={current}, received={received}"
+    )]
+    EpochNotMonotonic {
+        /// The DID of the sender whose key was rejected.
+        sender_did: String,
+        /// The epoch currently stored.
+        current: u64,
+        /// The epoch in the rejected distribution.
+        received: u64,
+    },
+
     /// The broadcast key epoch does not match the envelope epoch.
     ///
     /// The caller must provide a key whose epoch matches the envelope's
@@ -240,6 +257,9 @@ pub enum SenderKeyError {
 pub struct SenderKeyStore {
     /// Maps `context_id -> (sender_did -> SenderKey)`.
     keys: HashMap<String, HashMap<String, SenderKey>>,
+    /// Maps `context_id -> (sender_did -> epoch)`.
+    /// Tracked separately from `keys` to avoid changing the `SenderKey` type.
+    epochs: HashMap<String, HashMap<String, u64>>,
 }
 
 impl SenderKeyStore {
@@ -258,23 +278,241 @@ impl SenderKeyStore {
         self.keys.get(context_id)?.get(sender_did)
     }
 
-    /// Stores or updates the sender key for a given context and sender DID.
-    pub fn set(&mut self, context_id: &str, sender_did: &str, key: SenderKey) {
+    /// Sets a sender key WITHOUT enforcing epoch monotonicity.
+    ///
+    /// Use [`set_checked`] when accepting keys from other members to prevent
+    /// epoch rollback attacks. This method is intended only for the local
+    /// member's own key rotation.
+    pub fn set_unchecked(&mut self, context_id: &str, sender_did: &str, key: SenderKey) {
         self.keys
             .entry(context_id.to_owned())
             .or_default()
             .insert(sender_did.to_owned(), key);
     }
 
+    /// Stores a sender key with epoch monotonicity enforcement (#1608).
+    ///
+    /// Rejects the key if `epoch` is not strictly greater than the
+    /// currently stored epoch for this `(context_id, sender_did)` pair.
+    /// A sender with no prior epoch is treated as epoch 0.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` with a message if the epoch is not monotonically
+    /// increasing (rollback attempt or replay).
+    pub fn set_checked(
+        &mut self,
+        context_id: &str,
+        sender_did: &str,
+        key: SenderKey,
+        epoch: u64,
+    ) -> Result<(), SenderKeyError> {
+        let current_epoch = self
+            .epochs
+            .get(context_id)
+            .and_then(|m| m.get(sender_did))
+            .copied()
+            .unwrap_or(0);
+        if epoch <= current_epoch {
+            return Err(SenderKeyError::EpochNotMonotonic {
+                sender_did: sender_did.to_owned(),
+                current: current_epoch,
+                received: epoch,
+            });
+        }
+        self.keys
+            .entry(context_id.to_owned())
+            .or_default()
+            .insert(sender_did.to_owned(), key);
+        self.epochs
+            .entry(context_id.to_owned())
+            .or_default()
+            .insert(sender_did.to_owned(), epoch);
+        Ok(())
+    }
+
+    /// Returns the stored epoch for a given context and sender DID.
+    #[must_use]
+    pub fn epoch(&self, context_id: &str, sender_did: &str) -> u64 {
+        self.epochs
+            .get(context_id)
+            .and_then(|m| m.get(sender_did))
+            .copied()
+            .unwrap_or(0)
+    }
+
+    /// Exports the per-sender epoch high-water map for a given context as
+    /// a `(sender_did, epoch)` list. Used by the crypto-provider snapshot
+    /// path to persist the map so the `#1608` rollback-protection
+    /// invariant (`set_checked` rejects epoch regressions) survives a
+    /// restart. Returns an empty vector when the context has no entries.
+    #[must_use]
+    pub fn epochs_for_context(&self, context_id: &str) -> Vec<(String, u64)> {
+        self.epochs
+            .get(context_id)
+            .map(|inner| {
+                inner
+                    .iter()
+                    .map(|(did, &epoch)| (did.clone(), epoch))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// Restores a previously-observed epoch high-water mark for a
+    /// `(context_id, sender_did)` pair without enforcing monotonicity.
+    ///
+    /// Used exclusively by the crypto-provider snapshot restore path to
+    /// repopulate the epoch map from a persisted snapshot — the restored
+    /// values ARE the authoritative high-water marks, so `set_checked`
+    /// must not reject them. After restore, subsequent [`set_checked`]
+    /// calls continue to enforce monotonicity against the restored
+    /// values.
+    ///
+    /// This method does NOT touch the `keys` map — the matching
+    /// [`set_unchecked`] or [`set_checked`] call is still required to
+    /// install the key material itself.
+    pub fn restore_epoch_high_water(&mut self, context_id: &str, sender_did: &str, epoch: u64) {
+        self.epochs
+            .entry(context_id.to_owned())
+            .or_default()
+            .insert(sender_did.to_owned(), epoch);
+    }
+
+    /// Merge an incoming per-sender epoch map into the local store
+    /// with spec §23.17 invariants 3 + 4 enforcement:
+    ///
+    /// - **Invariant 3 (atomic reject on regression):** if ANY
+    ///   incoming floor is strictly less than the local floor for
+    ///   the same `(context_id, sender_did)`, the entire merge is
+    ///   rejected and no state is modified.
+    /// - **Invariant 4 (append-only dominance):** accepted merges
+    ///   produce `local = max(local, incoming)` per sender, never
+    ///   lowering the floor.
+    ///
+    /// # Epoch advance bounds
+    ///
+    /// `max_advance_per_sender` bounds how far an incoming epoch may
+    /// exceed the local floor for a given sender. This mirrors the
+    /// `set_checked` receive-path guard (`MAX_EPOCH_ADVANCE = 1000`
+    /// in the MLS crypto provider) which prevents epoch-poisoning
+    /// attacks where a malicious peer sets `epoch = u64::MAX`,
+    /// permanently blocking that sender's future legitimate
+    /// rotations against `set_checked`'s monotonicity guard.
+    ///
+    /// The bound is applied to BOTH:
+    /// - Senders the local store already knows: `incoming > local + max_advance` → reject
+    /// - Senders not in the local store (first-merge case): `incoming > max_advance` → reject
+    ///   (the first-merge ceiling is the same bound, treating "no local entry" as "local floor = 0")
+    ///
+    /// Pass `max_advance_per_sender = u64::MAX` to disable the bound
+    /// for trusted-source merges (e.g., cross-node replication where
+    /// the source is cryptographically authenticated).
+    ///
+    /// Returns `Ok(())` on successful max-merge. Returns
+    /// `Err(Vec<(String, u64, u64)>)` carrying
+    /// `(sender_did, local_floor, incoming_floor)` tuples for every
+    /// regression OR out-of-bounds advance found. The caller wraps
+    /// this in `ContextError::SnapshotFloorRegression`.
+    ///
+    /// # When to use this vs [`Self::restore_epoch_high_water`]
+    ///
+    /// - Use `restore_epoch_high_water` on the LOCAL RESTORE path
+    ///   (fresh in-memory state being rehydrated from a local
+    ///   snapshot). The snapshot IS the authoritative source of truth
+    ///   for the local node — no regression check is needed because
+    ///   there is no prior state to regress against.
+    /// - Use `merge_incoming_epochs_with_atomic_reject` on any path
+    ///   that INCORPORATES external state (snapshot received from a
+    ///   peer, cross-node replication, import that retains prior
+    ///   crypto state) into ALREADY-POPULATED or fresh local state.
+    ///   Today's `import_context` destroys prior crypto state before
+    ///   reimport, so this helper is defense-in-depth — but the
+    ///   invariant is enforceable from this single point so any
+    ///   future code path that adds a merge case is forced through
+    ///   the check, satisfying spec §23.17 structurally.
+    ///
+    /// **WARNING**: Callers MUST pass a realistic `max_advance_per_sender`
+    /// bound (typically matching the provider's `MAX_EPOCH_ADVANCE`)
+    /// unless the merge source is cryptographically authenticated as
+    /// trusted. The first-merge branch (empty local state) has no
+    /// regression to check against, so the bound is the only defense
+    /// against epoch-poisoning by a malicious incoming snapshot.
+    ///
+    /// # Errors
+    ///
+    /// Returns the per-sender regression/overshoot deltas via `Err`.
+    /// The store is NOT mutated if any entry fails validation — the
+    /// merge is strictly atomic (invariant 3).
+    pub fn merge_incoming_epochs_with_atomic_reject(
+        &mut self,
+        context_id: &str,
+        incoming: impl IntoIterator<Item = (String, u64)>,
+        max_advance_per_sender: u64,
+    ) -> Result<(), Vec<(String, u64, u64)>> {
+        // First pass: materialize the incoming iterator and detect
+        // any regression OR out-of-bounds advance against the current
+        // local state. We scan twice (detect, apply); the caller may
+        // have passed a one-shot iterator.
+        let incoming: Vec<(String, u64)> = incoming.into_iter().collect();
+        let mut regressions: Vec<(String, u64, u64)> = Vec::new();
+        let local_map = self.epochs.get(context_id);
+        for (did, incoming_epoch) in &incoming {
+            let local_epoch = local_map.and_then(|m| m.get(did)).copied().unwrap_or(0);
+
+            // Invariant 3: strict regression.
+            if *incoming_epoch < local_epoch {
+                regressions.push((did.clone(), local_epoch, *incoming_epoch));
+                continue;
+            }
+
+            // Epoch-poisoning guard: reject if the incoming value
+            // overshoots the local floor by more than
+            // `max_advance_per_sender`. `saturating_add` clamps the
+            // comparison at u64::MAX so passing u64::MAX disables
+            // the bound entirely.
+            let max_allowed = local_epoch.saturating_add(max_advance_per_sender);
+            if *incoming_epoch > max_allowed {
+                regressions.push((did.clone(), local_epoch, *incoming_epoch));
+            }
+        }
+        if !regressions.is_empty() {
+            return Err(regressions);
+        }
+
+        // Second pass: apply max-merge. Local entries not present in
+        // `incoming` are retained (invariant 4 append-only dominance
+        // for sender DIDs the incoming snapshot doesn't mention).
+        // Incoming entries strictly higher than local replace the
+        // local value; equal entries are no-ops (strictly-lower
+        // entries were already rejected above).
+        let local = self.epochs.entry(context_id.to_owned()).or_default();
+        for (did, incoming_epoch) in incoming {
+            let entry = local.entry(did).or_insert(0);
+            if incoming_epoch > *entry {
+                *entry = incoming_epoch;
+            }
+        }
+        Ok(())
+    }
+
     /// Removes the sender key for a given context and sender DID.
     ///
     /// Returns the removed key if it existed, or `None` otherwise.
+    ///
+    /// The epoch high-water mark is deliberately preserved so that
+    /// `set_checked()` continues to reject epochs ≤ the previously seen
+    /// maximum even after the key is removed and later re-added.
     pub fn remove(&mut self, context_id: &str, sender_did: &str) -> Option<SenderKey> {
         let inner = self.keys.get_mut(context_id)?;
         let removed = inner.remove(sender_did);
         if inner.is_empty() {
             self.keys.remove(context_id);
         }
+        // Deliberately preserve the epoch high-water mark. If this sender key
+        // is removed (e.g., member leaves) and later re-added, set_checked()
+        // must still reject epochs <= the previously seen maximum. Clearing
+        // the epoch would allow a replayed old-epoch key to be accepted.
         removed
     }
 
@@ -331,7 +569,7 @@ mod tests {
         let key = generate_sender_key();
         let expected = *key.as_bytes();
 
-        store.set("ctx-1", "did:example:alice", key);
+        store.set_unchecked("ctx-1", "did:example:alice", key);
 
         let retrieved = store.get("ctx-1", "did:example:alice");
         assert!(retrieved.is_some());
@@ -348,7 +586,7 @@ mod tests {
     fn sender_key_store_remove() {
         let mut store = SenderKeyStore::new();
         let key = generate_sender_key();
-        store.set("ctx-1", "did:example:alice", key);
+        store.set_unchecked("ctx-1", "did:example:alice", key);
 
         let removed = store.remove("ctx-1", "did:example:alice");
         assert!(removed.is_some());
@@ -369,10 +607,10 @@ mod tests {
         let alice_bytes = *key_alice.as_bytes();
         let bob_bytes = *key_bob.as_bytes();
 
-        store.set("ctx-1", "did:example:alice", key_alice);
-        store.set("ctx-1", "did:example:bob", key_bob);
+        store.set_unchecked("ctx-1", "did:example:alice", key_alice);
+        store.set_unchecked("ctx-1", "did:example:bob", key_bob);
         // Different context — should not appear in ctx-1 results.
-        store.set("ctx-2", "did:example:charlie", generate_sender_key());
+        store.set_unchecked("ctx-2", "did:example:charlie", generate_sender_key());
 
         let all = store.get_all("ctx-1");
         assert_eq!(all.len(), 2);
@@ -400,8 +638,8 @@ mod tests {
         let key2 = generate_sender_key();
         let key2_bytes = *key2.as_bytes();
 
-        store.set("ctx-1", "did:example:alice", key1);
-        store.set("ctx-1", "did:example:alice", key2);
+        store.set_unchecked("ctx-1", "did:example:alice", key1);
+        store.set_unchecked("ctx-1", "did:example:alice", key2);
 
         let retrieved = store.get("ctx-1", "did:example:alice");
         assert_eq!(retrieved.map(SenderKey::as_bytes), Some(&key2_bytes));
@@ -417,7 +655,7 @@ mod tests {
         let key = generate_sender_key();
         let expected_ptr = std::ptr::from_ref::<[u8; 32]>(key.as_bytes());
 
-        store.set("ctx-1", "did:example:alice", key);
+        store.set_unchecked("ctx-1", "did:example:alice", key);
 
         let retrieved = store.get("ctx-1", "did:example:alice");
         assert!(retrieved.is_some());
@@ -445,11 +683,382 @@ mod tests {
     #[test]
     fn sender_key_store_remove_cleans_up_empty_context() {
         let mut store = SenderKeyStore::new();
-        store.set("ctx-1", "did:example:alice", generate_sender_key());
+        store.set_unchecked("ctx-1", "did:example:alice", generate_sender_key());
 
         let removed = store.remove("ctx-1", "did:example:alice");
         assert!(removed.is_some());
         // The inner map for ctx-1 should be cleaned up entirely.
         assert!(store.keys.is_empty());
+    }
+
+    #[test]
+    fn set_checked_accepts_monotonically_increasing_epoch() {
+        let mut store = SenderKeyStore::new();
+        let key1 = generate_sender_key();
+        let key2 = generate_sender_key();
+        assert!(store.set_checked("ctx", "did:a", key1, 1).is_ok());
+        assert_eq!(store.epoch("ctx", "did:a"), 1);
+        assert!(store.set_checked("ctx", "did:a", key2, 2).is_ok());
+        assert_eq!(store.epoch("ctx", "did:a"), 2);
+    }
+
+    #[test]
+    fn set_checked_rejects_same_epoch() {
+        let mut store = SenderKeyStore::new();
+        let key1 = generate_sender_key();
+        let key2 = generate_sender_key();
+        store.set_checked("ctx", "did:a", key1, 5).unwrap();
+        let err = store.set_checked("ctx", "did:a", key2, 5).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                SenderKeyError::EpochNotMonotonic {
+                    current: 5,
+                    received: 5,
+                    ..
+                }
+            ),
+            "expected EpochNotMonotonic, got: {err}"
+        );
+    }
+
+    #[test]
+    fn set_checked_rejects_older_epoch() {
+        let mut store = SenderKeyStore::new();
+        let key1 = generate_sender_key();
+        let key2 = generate_sender_key();
+        store.set_checked("ctx", "did:a", key1, 10).unwrap();
+        let err = store.set_checked("ctx", "did:a", key2, 3).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                SenderKeyError::EpochNotMonotonic {
+                    current: 10,
+                    received: 3,
+                    ..
+                }
+            ),
+            "expected EpochNotMonotonic, got: {err}"
+        );
+        // Key should not have been replaced.
+        assert_eq!(store.epoch("ctx", "did:a"), 10);
+    }
+
+    #[test]
+    fn set_checked_first_key_requires_epoch_gt_zero() {
+        let mut store = SenderKeyStore::new();
+        let key = generate_sender_key();
+        // Epoch 0 is the default — a new key must be at least epoch 1.
+        let err = store.set_checked("ctx", "did:a", key, 0).unwrap_err();
+        assert!(matches!(err, SenderKeyError::EpochNotMonotonic { .. }));
+    }
+
+    #[test]
+    fn remove_preserves_epoch_high_water_mark() {
+        let mut store = SenderKeyStore::new();
+
+        // 1. Set a key with set_checked at epoch 5.
+        store
+            .set_checked("ctx", "did:a", generate_sender_key(), 5)
+            .unwrap();
+        assert_eq!(store.epoch("ctx", "did:a"), 5);
+
+        // 2. Remove the key.
+        let removed = store.remove("ctx", "did:a");
+        assert!(removed.is_some());
+
+        // 3. Verify get() returns None (key gone).
+        assert!(store.get("ctx", "did:a").is_none());
+
+        // 4. Verify set_checked at epoch 3 fails (epoch preserved).
+        let err = store
+            .set_checked("ctx", "did:a", generate_sender_key(), 3)
+            .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                SenderKeyError::EpochNotMonotonic {
+                    current: 5,
+                    received: 3,
+                    ..
+                }
+            ),
+            "expected EpochNotMonotonic(current=5, received=3), got: {err}"
+        );
+
+        // 5. Verify set_checked at epoch 5 fails (epoch preserved — must be strictly greater).
+        let err = store
+            .set_checked("ctx", "did:a", generate_sender_key(), 5)
+            .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                SenderKeyError::EpochNotMonotonic {
+                    current: 5,
+                    received: 5,
+                    ..
+                }
+            ),
+            "expected EpochNotMonotonic(current=5, received=5), got: {err}"
+        );
+
+        // 6. Verify set_checked at epoch 6 succeeds.
+        assert!(
+            store
+                .set_checked("ctx", "did:a", generate_sender_key(), 6)
+                .is_ok()
+        );
+        assert_eq!(store.epoch("ctx", "did:a"), 6);
+    }
+
+    // -----------------------------------------------------------------------
+    // merge_incoming_epochs_with_atomic_reject — §23.17 invariants 3 + 4
+    // -----------------------------------------------------------------------
+
+    /// Default bound for merge tests — matches the production
+    /// `MAX_EPOCH_ADVANCE = 1000` from the `scp-runtime` crypto provider.
+    const TEST_MAX_ADVANCE: u64 = 1000;
+
+    #[test]
+    fn merge_empty_incoming_is_noop() {
+        let mut store = SenderKeyStore::new();
+        store
+            .set_checked("ctx", "did:a", generate_sender_key(), 5)
+            .unwrap();
+        let incoming: Vec<(String, u64)> = vec![];
+        let result =
+            store.merge_incoming_epochs_with_atomic_reject("ctx", incoming, TEST_MAX_ADVANCE);
+        assert!(result.is_ok());
+        assert_eq!(store.epoch("ctx", "did:a"), 5, "local floor unchanged");
+    }
+
+    #[test]
+    fn merge_incoming_higher_epoch_advances_floor() {
+        let mut store = SenderKeyStore::new();
+        store
+            .set_checked("ctx", "did:a", generate_sender_key(), 5)
+            .unwrap();
+
+        // Incoming floor is strictly higher → accepted, local advances.
+        let incoming = vec![("did:a".to_owned(), 10)];
+        let result =
+            store.merge_incoming_epochs_with_atomic_reject("ctx", incoming, TEST_MAX_ADVANCE);
+        assert!(result.is_ok());
+        assert_eq!(
+            store.epoch("ctx", "did:a"),
+            10,
+            "floor must advance to the incoming value"
+        );
+    }
+
+    #[test]
+    fn merge_incoming_equal_epoch_is_noop() {
+        let mut store = SenderKeyStore::new();
+        store
+            .set_checked("ctx", "did:a", generate_sender_key(), 5)
+            .unwrap();
+
+        let incoming = vec![("did:a".to_owned(), 5)];
+        let result =
+            store.merge_incoming_epochs_with_atomic_reject("ctx", incoming, TEST_MAX_ADVANCE);
+        assert!(result.is_ok(), "equal epoch is not a regression");
+        assert_eq!(store.epoch("ctx", "did:a"), 5, "floor unchanged");
+    }
+
+    #[test]
+    fn merge_incoming_lower_epoch_rejects_atomically() {
+        // §23.17 invariant 3: if ANY incoming floor is strictly less
+        // than the local floor, the entire merge is rejected and no
+        // state is modified.
+        let mut store = SenderKeyStore::new();
+        store
+            .set_checked("ctx", "did:a", generate_sender_key(), 10)
+            .unwrap();
+        store
+            .set_checked("ctx", "did:b", generate_sender_key(), 7)
+            .unwrap();
+
+        // Incoming: b's epoch legitimately advances, but a tries to
+        // regress. The merge MUST reject both — b is NOT advanced.
+        let incoming = vec![
+            ("did:a".to_owned(), 5), // regression: 5 < 10
+            ("did:b".to_owned(), 15),
+        ];
+        let err = store
+            .merge_incoming_epochs_with_atomic_reject("ctx", incoming, TEST_MAX_ADVANCE)
+            .expect_err("regression must reject the entire merge");
+        assert_eq!(err.len(), 1, "exactly one regression reported");
+        assert_eq!(err[0], ("did:a".to_owned(), 10, 5));
+
+        // Atomic-reject invariant: did:b must NOT have been advanced
+        // to 15 despite being a legitimate promotion, because the
+        // merge as a whole was rejected.
+        assert_eq!(
+            store.epoch("ctx", "did:b"),
+            7,
+            "atomic reject — did:b must remain at the pre-merge floor"
+        );
+        assert_eq!(
+            store.epoch("ctx", "did:a"),
+            10,
+            "atomic reject — did:a must remain at the pre-merge floor"
+        );
+    }
+
+    #[test]
+    fn merge_append_only_retains_local_entries_not_in_incoming() {
+        // §23.17 invariant 4: the local floor is append-only. A
+        // merge must NEVER drop entries that the incoming map does
+        // not mention.
+        let mut store = SenderKeyStore::new();
+        store
+            .set_checked("ctx", "did:a", generate_sender_key(), 10)
+            .unwrap();
+        store
+            .set_checked("ctx", "did:b", generate_sender_key(), 7)
+            .unwrap();
+
+        // Incoming only mentions did:c. did:a and did:b must be
+        // retained.
+        let incoming = vec![("did:c".to_owned(), 3)];
+        store
+            .merge_incoming_epochs_with_atomic_reject("ctx", incoming, TEST_MAX_ADVANCE)
+            .unwrap();
+
+        assert_eq!(store.epoch("ctx", "did:a"), 10);
+        assert_eq!(store.epoch("ctx", "did:b"), 7);
+        assert_eq!(store.epoch("ctx", "did:c"), 3);
+    }
+
+    #[test]
+    fn merge_incoming_into_empty_context_accepts_all_within_bound() {
+        // First-merge case: no local state exists for this context.
+        // Every incoming entry within `max_advance_per_sender` of
+        // zero is accepted.
+        let mut store = SenderKeyStore::new();
+        let incoming = vec![("did:a".to_owned(), 5), ("did:b".to_owned(), 12)];
+        store
+            .merge_incoming_epochs_with_atomic_reject("ctx", incoming, TEST_MAX_ADVANCE)
+            .unwrap();
+        assert_eq!(store.epoch("ctx", "did:a"), 5);
+        assert_eq!(store.epoch("ctx", "did:b"), 12);
+    }
+
+    #[test]
+    fn merge_reports_all_regressions_not_just_first() {
+        // When multiple senders would regress, the error reports all
+        // of them so the caller can emit a complete diagnostic.
+        let mut store = SenderKeyStore::new();
+        store
+            .set_checked("ctx", "did:a", generate_sender_key(), 10)
+            .unwrap();
+        store
+            .set_checked("ctx", "did:b", generate_sender_key(), 20)
+            .unwrap();
+
+        let incoming = vec![("did:a".to_owned(), 5), ("did:b".to_owned(), 15)];
+        let err = store
+            .merge_incoming_epochs_with_atomic_reject("ctx", incoming, TEST_MAX_ADVANCE)
+            .unwrap_err();
+        assert_eq!(err.len(), 2, "both regressions must be reported");
+        // Order is insertion-order of the incoming iterator, which
+        // is deterministic because we built a Vec above.
+        assert!(err.contains(&("did:a".to_owned(), 10, 5)));
+        assert!(err.contains(&("did:b".to_owned(), 20, 15)));
+    }
+
+    #[test]
+    fn merge_first_branch_rejects_epoch_above_max_advance() {
+        // Empty local context + an incoming snapshot from a
+        // malicious peer that tries to poison a sender's floor at a
+        // huge epoch. Without the bound, this would permanently DoS
+        // the sender's future rotations via set_checked's
+        // monotonicity guard.
+        let mut store = SenderKeyStore::new();
+        let incoming = vec![("did:malicious".to_owned(), u64::MAX - 1)];
+        let err = store
+            .merge_incoming_epochs_with_atomic_reject("ctx", incoming, TEST_MAX_ADVANCE)
+            .expect_err("epoch above max_advance must be rejected");
+        assert_eq!(err.len(), 1);
+        assert_eq!(err[0].0, "did:malicious");
+        assert_eq!(err[0].1, 0, "local floor reported as 0 (no prior entry)");
+        assert_eq!(err[0].2, u64::MAX - 1);
+        // Atomic reject — no state was modified.
+        assert_eq!(store.epoch("ctx", "did:malicious"), 0);
+    }
+
+    #[test]
+    fn merge_existing_sender_rejects_epoch_above_max_advance() {
+        // Already-populated local floor at 10. Incoming tries
+        // 10 + MAX_ADVANCE + 1 — must be rejected even though it is
+        // strictly greater than local (not a regression), because it
+        // overshoots the poisoning guard.
+        let mut store = SenderKeyStore::new();
+        store
+            .set_checked("ctx", "did:a", generate_sender_key(), 10)
+            .unwrap();
+
+        let overshoot = 10 + TEST_MAX_ADVANCE + 1;
+        let incoming = vec![("did:a".to_owned(), overshoot)];
+        let err = store
+            .merge_incoming_epochs_with_atomic_reject("ctx", incoming, TEST_MAX_ADVANCE)
+            .expect_err("epoch overshoot must be rejected");
+        assert_eq!(err[0], ("did:a".to_owned(), 10, overshoot));
+        assert_eq!(
+            store.epoch("ctx", "did:a"),
+            10,
+            "atomic reject — floor unchanged"
+        );
+
+        // A value EXACTLY at local + MAX_ADVANCE is still acceptable.
+        let at_bound = 10 + TEST_MAX_ADVANCE;
+        let incoming = vec![("did:a".to_owned(), at_bound)];
+        store
+            .merge_incoming_epochs_with_atomic_reject("ctx", incoming, TEST_MAX_ADVANCE)
+            .expect("epoch exactly at local + max_advance must be accepted");
+        assert_eq!(store.epoch("ctx", "did:a"), at_bound);
+    }
+
+    #[test]
+    fn merge_with_u64_max_disables_bound_for_trusted_sources() {
+        // Passing `u64::MAX` disables the bound via saturating_add,
+        // allowing huge incoming epochs. Use only when the source is
+        // cryptographically authenticated as trusted.
+        let mut store = SenderKeyStore::new();
+        let incoming = vec![("did:trusted".to_owned(), u64::MAX - 1)];
+        store
+            .merge_incoming_epochs_with_atomic_reject("ctx", incoming, u64::MAX)
+            .expect("u64::MAX bound must disable the guard entirely");
+        assert_eq!(store.epoch("ctx", "did:trusted"), u64::MAX - 1);
+    }
+
+    #[test]
+    fn merge_mixed_regressions_and_overshoots_reports_all() {
+        // A single merge with one regression AND one overshoot.
+        // Both must be reported in the error, neither mutation
+        // applied (atomic reject). Proves the first-pass scan is
+        // comprehensive: a caller seeing one finding does not lose
+        // sight of the other.
+        let mut store = SenderKeyStore::new();
+        store
+            .set_checked("ctx", "did:reg", generate_sender_key(), 50)
+            .unwrap();
+        store
+            .set_checked("ctx", "did:ok", generate_sender_key(), 10)
+            .unwrap();
+
+        let incoming = vec![
+            ("did:reg".to_owned(), 20),          // regression: 20 < 50
+            ("did:ok".to_owned(), 15),           // legitimate advance
+            ("did:poison".to_owned(), u64::MAX), // first-merge overshoot
+        ];
+        let err = store
+            .merge_incoming_epochs_with_atomic_reject("ctx", incoming, TEST_MAX_ADVANCE)
+            .expect_err("mixed failures must reject the entire merge");
+        assert_eq!(err.len(), 2, "regression + overshoot both reported");
+        assert!(err.iter().any(|(d, _, _)| d == "did:reg"));
+        assert!(err.iter().any(|(d, _, _)| d == "did:poison"));
+        // did:ok must NOT have been advanced (atomic reject).
+        assert_eq!(store.epoch("ctx", "did:ok"), 10);
     }
 }

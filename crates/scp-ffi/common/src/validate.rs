@@ -601,9 +601,6 @@ pub fn validate_governance_action_strings(
         | GovernanceAction::CloseContext {
             reason: Some(r), ..
         }
-        | GovernanceAction::BlockAuthor {
-            reason: Some(r), ..
-        }
         | GovernanceAction::RotateContentKeys {
             reason: Some(r), ..
         } => {
@@ -636,14 +633,13 @@ pub fn validate_governance_action_strings(
         // Variants without user-controlled string fields.
         GovernanceAction::RemoveMember { reason: None, .. }
         | GovernanceAction::CloseContext { reason: None, .. }
-        | GovernanceAction::BlockAuthor { reason: None, .. }
         | GovernanceAction::RotateContentKeys { reason: None, .. }
         | GovernanceAction::RemoveTool { .. }
         | GovernanceAction::ModifyCeiling { .. }
         | GovernanceAction::ExtendTtl { .. }
         | GovernanceAction::TransferAdmin { .. }
-        | GovernanceAction::RevokeReadAccess { .. }
-        | GovernanceAction::RestoreReadAccess { .. }
+        | GovernanceAction::RevokeAccess { .. }
+        | GovernanceAction::RestoreAccess { .. }
         | GovernanceAction::ModifyPruningPolicy { .. }
         | GovernanceAction::AddSigner { .. }
         | GovernanceAction::RemoveSigner { .. }
@@ -651,10 +647,11 @@ pub fn validate_governance_action_strings(
         | GovernanceAction::EstablishToolInterface { .. }
         | GovernanceAction::ResolveConflict { .. }
         | GovernanceAction::PromoteContext
-        | GovernanceAction::RevokeWriteAccess { .. }
-        | GovernanceAction::RestoreWriteAccess { .. }
+        | GovernanceAction::SuspendCapability { .. }
+        | GovernanceAction::SuspendAccess { .. }
         | GovernanceAction::ReconfigureGovernance { .. }
         | GovernanceAction::LockEconomicPolicy
+        | GovernanceAction::ModifyHardRateLimit { .. }
         | GovernanceAction::CancelContextMigration => {}
     }
     Ok(())

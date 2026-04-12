@@ -61,8 +61,12 @@ impl ContextCryptoProvider for MockCrypto {
     ) -> Result<scp_protocol::context::builder::AddMemberOutput, ContextError> {
         Ok(scp_protocol::context::builder::AddMemberOutput::default())
     }
-    fn remove_member(&self, _id: &[u8; 32], _member_did: &str) -> Result<(), ContextError> {
-        Ok(())
+    fn remove_member(
+        &self,
+        _id: &[u8; 32],
+        _member_did: &str,
+    ) -> Result<scp_protocol::context::builder::RemoveMemberOutput, ContextError> {
+        Ok(scp_protocol::context::builder::RemoveMemberOutput::default())
     }
     fn distribute_sender_key(&self, _id: &[u8; 32], _member_did: &str) -> Result<(), ContextError> {
         Ok(())
@@ -91,16 +95,15 @@ impl ContextCryptoProvider for MockCrypto {
         &self,
         _context_id: &[u8; 32],
         outer_bytes: &[u8],
-    ) -> Result<Option<scp_protocol::context::builder::OpenedEnvelope>, ContextError> {
+    ) -> Result<scp_protocol::context::builder::OpenResult, ContextError> {
         // Mock: deserialize directly as InnerEnvelope (no decryption).
         let inner: scp_protocol::envelope::inner::InnerEnvelope =
             rmp_serde::from_slice(outer_bytes)
                 .map_err(|e| ContextError::CryptoFailed(format!("mock open: {e}")))?;
         let sender_did = inner.sender_did.clone();
-        Ok(Some(scp_protocol::context::builder::OpenedEnvelope {
-            inner,
-            sender_did,
-        }))
+        Ok(scp_protocol::context::builder::OpenResult::Application(
+            Box::new(scp_protocol::context::builder::OpenedEnvelope { inner, sender_did }),
+        ))
     }
 }
 
@@ -133,7 +136,13 @@ impl ContextEventLogProvider for MockEventLog {
     fn init_event_log(&self, _id: &[u8; 32]) -> Result<(), ContextCreationError> {
         Ok(())
     }
-    fn append_event(&self, _id: &[u8; 32], _event: &str) -> Result<(), ContextCreationError> {
+    fn append_event(
+        &self,
+        _id: &[u8; 32],
+        _event: &str,
+        _actor_did: &str,
+        _payload: Option<&serde_json::Value>,
+    ) -> Result<(), ContextCreationError> {
         Ok(())
     }
     fn destroy_event_log(&self, _id: &[u8; 32]) -> Result<(), ContextCreationError> {

@@ -8,7 +8,7 @@
 //! testable with mock implementations. See ADR-008 in
 //! `.docs/adrs/phase-2.md` for the full context lifecycle specification.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::hash::BuildHasher;
 use std::sync::Arc;
 
@@ -27,16 +27,15 @@ use super::ttl::{self, CloseResult, TtlExtension, TtlTimer};
 use scp_identity::DID;
 use scp_primitives::Clock;
 use scp_protocol::context::broadcast::{
-    AuthorBlockResult, BlockResult, BroadcastAdmission, BroadcastContext, BroadcastContextSnapshot,
+    BlockResult, BroadcastAdmission, BroadcastContext, BroadcastContextSnapshot,
     GovernanceBanResult, KeyRequestDecision, SubscriptionResult, UnsubscribeResult,
 };
 use scp_protocol::context::broadcast_content::{BroadcastContent, serialize_broadcast_content};
 use scp_protocol::context::builder::{ContextCreationError, ContextCryptoProvider};
 use scp_protocol::context::governance::{
-    CheckpointAttestationStatus, ContextCheckpoint, CosignedCheckpoint, GovernanceAction,
-    GovernanceContext, GovernanceEngine, GovernanceEvent, GovernanceModelConfig,
-    GovernanceProposal, KeyResolver, ProposalId, ProposalStatus, PruningPolicy, RevocationScope,
-    SingleAdminEngine,
+    AccessScope, CheckpointAttestationStatus, ContextCheckpoint, CosignedCheckpoint,
+    GovernanceAction, GovernanceContext, GovernanceEngine, GovernanceEvent, GovernanceModelConfig,
+    GovernanceProposal, KeyResolver, ProposalId, ProposalStatus, PruningPolicy, SingleAdminEngine,
     majority::MajorityVoteEngine,
     mls_integration::{
         CoordinationRecord, EpochCoordinator, MlsImpact, classify_action, generate_mls_operations,
@@ -59,14 +58,20 @@ use scp_protocol::crypto::ucan::validate::{
 };
 use scp_protocol::economy::budget::MemberBudgetTracker;
 use scp_protocol::economy::types::EconomicPolicy;
+use scp_protocol::trust::consequence::{
+    ConsequenceRule, TriggeredConsequence, evaluate_consequence_rules,
+};
 use tracing::instrument;
 use zeroize::Zeroizing;
 
 mod broadcast;
+mod economy;
 mod governance;
 mod lifecycle;
 mod messaging;
 mod queries;
+pub(crate) mod standing;
+mod tools;
 mod trust_recovery;
 mod ttl_close;
 
@@ -98,6 +103,158 @@ const CEILING_CHANGE_NOTIFICATION_PERIOD_SECS: u64 = 259_200; // 72 hours
 /// growth. 14 days is generous — governance proposals are typically resolved
 /// within hours, so a 14-day window provides ample replay protection.
 const EXECUTED_PROPOSALS_TTL_SECS: u64 = 14 * 24 * 60 * 60; // 14 days
+
+// ---------------------------------------------------------------------------
+// MLS commit broadcast retry queue (PR #1606 C6)
+// ---------------------------------------------------------------------------
+
+/// Maximum number of times the persistent commit retry queue will re-attempt
+/// a single MLS Commit broadcast before marking it `CommitBroadcastFailed`
+/// and putting the context in fail-close state.
+pub const MAX_COMMIT_RETRIES: u32 = 20;
+
+/// Maximum age (in seconds) of a pending commit before it is force-failed
+/// regardless of how many attempts have been made (1 hour).
+///
+/// Bounds the worst-case window during which a commit can sit unrecoverable
+/// in the queue. After this elapses the context fail-closes so the operator
+/// can intervene rather than wait for retry-count exhaustion.
+pub const MAX_COMMIT_AGE_SECS: u64 = 3600; // 1 hour
+
+/// Maximum number of pending commits allowed in the retry queue per context.
+///
+/// Prevents unbounded memory growth during sustained transport outages.
+/// When this cap is reached, [`try_broadcast_commit_or_enqueue`] sets the
+/// `commit_fault` marker immediately rather than enqueuing, fail-closing
+/// the context for operator attention.
+pub const MAX_PENDING_COMMITS: usize = 50;
+
+/// Exponential backoff schedule (in seconds) for commit retry attempts.
+///
+/// `COMMIT_RETRY_BACKOFFS[i]` is the delay before attempt `i + 1` (i.e., the
+/// delay applied after the i-th failure). Indexing past the end of the array
+/// reuses the final value (300 s). Designed to give transient network outages
+/// fast retries (1 s, 2 s, 5 s) and longer outages slower retries that fit
+/// within `MAX_COMMIT_AGE_SECS`.
+pub const COMMIT_RETRY_BACKOFFS: [u64; 8] = [1, 2, 5, 15, 60, 120, 300, 300];
+
+/// Returns the delay (in seconds) before the next retry attempt given the
+/// number of failed attempts so far.
+#[must_use]
+#[inline]
+pub fn commit_retry_backoff(failed_attempts: u32) -> u64 {
+    let idx = (failed_attempts as usize).saturating_sub(1);
+    let clamped = idx.min(COMMIT_RETRY_BACKOFFS.len() - 1);
+    COMMIT_RETRY_BACKOFFS[clamped]
+}
+
+/// Logical operation that produced an MLS Commit, used by the persistent
+/// retry queue (PR #1606 C6) for observability and event labelling.
+///
+/// The variant identifies which mutation produced the commit so that the
+/// `CommitBroadcastPending` / `CommitBroadcastSucceeded` / `CommitBroadcastFailed`
+/// events emitted by the retry queue carry meaningful labels for SDK
+/// consumers and the durable event log.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum CommitOperation {
+    /// Commit produced by `execute_remove_member` for the given target DID.
+    RemoveMember {
+        /// The DID that was removed from the MLS group.
+        target_did: DID,
+    },
+    /// Commit produced by `execute_rotate_content_keys` (epoch advance for
+    /// content key rotation).
+    RotateContentKeys {
+        /// Optional human-readable reason recorded with the rotation.
+        reason: Option<String>,
+    },
+    /// Commit produced by `execute_reset_member` (remove + re-add for MLS
+    /// state reset). The variant carries which sub-step the commit corresponds
+    /// to so that retries do not conflate the two distinct commits in
+    /// observability events.
+    ResetMember {
+        /// The DID being reset.
+        target_did: DID,
+        /// `true` for the remove half of the reset, `false` for the re-add.
+        is_remove: bool,
+    },
+    /// Commit produced by `leave_context` for the local member's departure.
+    LeaveContext {
+        /// The DID of the member who left.
+        member_did: DID,
+    },
+}
+
+impl CommitOperation {
+    /// Human-readable label used in events and the durable event log.
+    #[must_use]
+    pub fn label(&self) -> String {
+        match self {
+            Self::RemoveMember { .. } => "RemoveMember".to_owned(),
+            Self::RotateContentKeys { .. } => "RotateContentKeys".to_owned(),
+            Self::ResetMember {
+                is_remove: true, ..
+            } => "ResetMemberRemove".to_owned(),
+            Self::ResetMember {
+                is_remove: false, ..
+            } => "ResetMemberAdd".to_owned(),
+            Self::LeaveContext { .. } => "LeaveContext".to_owned(),
+        }
+    }
+}
+
+/// A persistent entry in the MLS Commit retry queue (PR #1606 C6).
+///
+/// Each `PendingCommit` is created when a `transport.send_message` call
+/// for an MLS Commit fails after the local state has already been mutated.
+/// The entry is enqueued in [`PerContextState::pending_commits`] and
+/// retried by the governance timeout task with exponential backoff.
+///
+/// Persisted via [`ContextSnapshot::pending_commits`] so retries survive
+/// process restart.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PendingCommit {
+    /// TLS-serialized MLS Commit message bytes (output of
+    /// `crypto.remove_member()` / `crypto.advance_epoch()`).
+    #[serde(with = "serde_bytes")]
+    pub commit_bytes: Vec<u8>,
+    /// SHA-256 routing ID derived from the context ID via
+    /// `scp_protocol::context::context_routing_id`. Stored as a fixed-size
+    /// array because `transport.send_message` requires `&[u8; 32]`.
+    pub routing_id: [u8; 32],
+    /// Logical operation that produced this commit (for observability +
+    /// event labelling).
+    pub operation: CommitOperation,
+    /// Unix timestamp (seconds) when the commit first failed to broadcast.
+    pub first_attempt_at: u64,
+    /// Number of failed send attempts so far. Starts at 1 (the initial
+    /// failure that caused enqueueing).
+    pub retry_count: u32,
+    /// Human-readable transport error from the most recent failed attempt.
+    pub last_error: Option<String>,
+    /// Unix timestamp (seconds) at which the next retry should be attempted.
+    /// Set when the commit is enqueued and after each failed retry.
+    pub next_attempt_at: u64,
+}
+
+/// Marker indicating that the persistent commit retry queue exhausted its
+/// budget for a particular operation and the context is now fail-closed
+/// (PR #1606 C6).
+///
+/// While `commit_fault` is set, all governance and lifecycle mutations on
+/// the context return [`ContextError::CommitBroadcastFault`]. Cleared by an
+/// operator via [`ContextManager::acknowledge_commit_fault`].
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CommitFaultMarker {
+    /// Logical operation whose commit failed permanently.
+    pub operation: CommitOperation,
+    /// Final transport error or `"max age exceeded"`.
+    pub reason: String,
+    /// Unix timestamp (seconds) when the marker was set.
+    pub failed_at: u64,
+    /// Total number of send attempts that were made.
+    pub retry_count: u32,
+}
 
 // ---------------------------------------------------------------------------
 // Welcome event helper
@@ -204,38 +361,33 @@ impl PendingEconomicPolicyChange {
 // GovernanceActionResult
 // ---------------------------------------------------------------------------
 
-/// Result of revoking a member's read access (§5.9, ADR-031).
+/// Result of suspending a member's capabilities (§5.9, ADR-031).
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ReadAccessRevokedResult {
-    /// The DID whose read access was revoked.
+pub struct SuspendMemberResult {
+    /// The DID whose capabilities were suspended.
     pub did: DID,
-    /// The revocation scope applied.
-    pub scope: RevocationScope,
+    /// The capabilities that were suspended.
+    pub capabilities: Vec<Capability>,
+}
+
+/// Result of cryptographic revocation (§9.17, ADR-038).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RevokeResult {
+    /// The DID whose access was revoked.
+    pub did: DID,
+    /// The scope of revocation applied.
+    pub access: AccessScope,
     /// Number of authors whose keys were rotated (broadcast contexts).
     pub rotated_author_count: usize,
 }
 
-/// Result of restoring a member's read access (§5.9, ADR-031).
+/// Result of restoring a member's access (§5.9, ADR-031).
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ReadAccessRestoredResult {
-    /// The DID whose read access was restored.
+pub struct RestoreAccessResult {
+    /// The DID whose access was restored.
     pub did: DID,
-}
-
-/// Result of revoking a member's write access (§9.17, ADR-038).
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct WriteAccessRevokedResult {
-    /// The DID whose write access was revoked.
-    pub did: DID,
-    /// The revocation scope applied.
-    pub scope: RevocationScope,
-}
-
-/// Result of restoring a member's write access (§9.17, ADR-038).
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct WriteAccessRestoredResult {
-    /// The DID whose write access was restored.
-    pub did: DID,
+    /// The capabilities that were restored.
+    pub capabilities: Vec<Capability>,
 }
 
 /// Result of a context-wide content key rotation (§9.17, ADR-038).
@@ -294,7 +446,7 @@ pub struct MigrationProposedResult {
 pub enum GovernanceActionResult {
     /// A member was added to the context.
     MemberAdded,
-    /// A member was removed from the context.
+    /// A member was ejected from the context (MLS removal).
     MemberRemoved,
     /// A member's role was changed.
     RoleChanged,
@@ -328,22 +480,16 @@ pub enum GovernanceActionResult {
     ConflictResolved,
     /// The context was promoted from ephemeral to persistent.
     ContextPromoted,
-    /// A member's read access was revoked (§5.9, ADR-031).
-    ReadAccessRevoked(ReadAccessRevokedResult),
-    /// A member's read access was restored (§5.9, ADR-031).
-    ReadAccessRestored(ReadAccessRestoredResult),
-    /// A member's write access was revoked (§9.17, ADR-038).
-    WriteAccessRevoked(WriteAccessRevokedResult),
-    /// A member's write access was restored (§9.17, ADR-038).
-    WriteAccessRestored(WriteAccessRestoredResult),
+    /// A member's capabilities were suspended (application-level gate block).
+    MemberSuspended(SuspendMemberResult),
+    /// A member's access was cryptographically revoked (key destruction).
+    AccessRevoked(RevokeResult),
+    /// A member's access was restored (capabilities unsuspended / forward-restore).
+    AccessRestored(RestoreAccessResult),
     /// Context-wide content keys were rotated (§9.17, ADR-038).
     ContentKeysRotated(ContentKeysRotatedResult),
     /// Governance was reconfigured via deadlock recovery (ADR-031 §10).
     GovernanceReconfigured(GovernanceReconfiguredResult),
-    /// An author was blocked from a broadcast context (spec section 5.14.8).
-    /// Legacy variant — new code should use `WriteAccessRevoked` with
-    /// `RevocationScope::Full`.
-    AuthorBlocked(AuthorBlockResult),
     /// A subscriber's read access was revoked in a broadcast context
     /// (ADR-031, §5.9). The subscriber was removed from the registry and
     /// added to all authors' block lists; all author keys were rotated.
@@ -425,13 +571,7 @@ pub struct ContextSnapshot {
     /// Dynamically registered tools (beyond initial `ContextParams.tools`).
     #[serde(default)]
     pub registered_tools: Vec<ToolRegistration>,
-    /// Members whose write access has been governance-revoked (ADR-031).
-    #[serde(default)]
-    pub write_revoked_members: HashSet<DID>,
-    /// Members whose read access has been governance-revoked (§5.9, ADR-038).
-    #[serde(default)]
-    pub read_revoked_members: HashSet<DID>,
-    /// Members excluded from future CEK wrapping (`FutureOnly` read revocation).
+    /// Members excluded from future CEK wrapping (`Revoke { access: AccessScope::Write }`).
     /// These members won't receive new content keys but retain access to
     /// historical content encrypted before the revocation (ADR-038, §9.17).
     #[serde(default)]
@@ -465,9 +605,37 @@ pub struct ContextSnapshot {
     #[serde(default)]
     pub budget_tracker: MemberBudgetTracker,
     /// Approved proposals pending execution, tracked for conflict detection (ADR-031 §7).
-    /// Maps proposal ID to (proposal, `sequence_number`, timestamp).
+    ///
+    /// Maps proposal ID to a tuple `(proposal, monotonic_seq, approved_at_unix_secs)`:
+    /// - `monotonic_seq` — the local monotonic sequence number assigned by
+    ///   [`GovernanceState::next_proposal_seq`] at conflict-detection time.
+    ///   Used by `detect_and_handle_conflicts` for sequential conflict
+    ///   resolution (lower seq wins). Strictly monotonic across the
+    ///   lifetime of a context, persisted in this snapshot, so two
+    ///   proposals can never share a seq even within the same wall-clock
+    ///   second (H10 fix).
+    /// - `approved_at_unix_secs` — the wall-clock Unix timestamp at
+    ///   approval, retained for audit / event-emission purposes only.
+    ///   Never used for conflict ordering.
     #[serde(default)]
     pub approved_proposals: HashMap<ProposalId, (GovernanceProposal, u64, u64)>,
+    /// Monotonic counter for assigning proposal sequence numbers to
+    /// approved proposals (H10, ADR-031 §7).
+    ///
+    /// Incremented every time a new approved proposal is inserted into
+    /// [`approved_proposals`](Self::approved_proposals). Persisted across
+    /// process restarts so two proposals can never share a sequence number
+    /// within the same context — eliminating the wall-clock collision
+    /// window that previously let an attacker race a conflicting proposal
+    /// against any defensive admin action and force a 48-hour governance
+    /// freeze.
+    ///
+    /// Backward compatible with legacy snapshots: missing field
+    /// deserializes as `0`. On `import_context` (untrusted exporter), the
+    /// counter is conservatively reset to `approved_proposals.len() as u64`
+    /// — see `lifecycle::import_context`.
+    #[serde(default)]
+    pub next_proposal_seq: u64,
     /// Governance freeze state due to simultaneous conflicts (ADR-031 §7).
     /// Contains the conflicting proposal IDs and freeze start timestamp.
     #[serde(default)]
@@ -492,7 +660,7 @@ pub struct ContextSnapshot {
     pub pending_economic_policy_change: Option<PendingEconomicPolicyChange>,
     /// Monotonic MLS epoch counter. Tracks epoch advances from membership-
     /// mutating governance actions (`AddMember`, `RemoveMember`,
-    /// `RevokeReadAccess`, `ResetMember`).
+    /// `Revoke`, `ResetMember`).
     #[serde(default)]
     pub mls_epoch: u64,
     /// Epoch coordination records linking governance proposals to MLS epoch
@@ -538,6 +706,107 @@ pub struct ContextSnapshot {
     /// equivalent). See ADR-025.
     #[serde(default)]
     pub access_key_store: scp_protocol::crypto::access_keys::AccessKeyStore,
+    /// Consequence rules declared at context creation (ADR-017, #1531).
+    #[serde(default)]
+    pub consequence_rules: Vec<scp_protocol::trust::consequence::ConsequenceRule>,
+    /// Per-member participation record cache for proposer eligibility (#1530).
+    #[serde(default)]
+    pub participation_cache:
+        HashMap<String, scp_protocol::trust::participation::ParticipationRecord>,
+    /// Sender velocity tracker window configuration for anti-spam and
+    /// consequence evaluation (§19.7, #1537). Persisted so velocity state
+    /// survives process restarts. Contains the `window_secs` configuration.
+    ///
+    /// **Deprecated**: Retained for backward-compatible deserialization of
+    /// snapshots that predate `velocity_tracker_state`. New snapshots populate
+    /// `velocity_tracker_state` instead.
+    #[serde(default)]
+    pub velocity_tracker: Option<u64>,
+    /// Full velocity tracker state including per-sender timestamps (#1530).
+    ///
+    /// Supersedes `velocity_tracker` (config-only). Contains both the sliding
+    /// window configuration and the per-sender message timestamp entries so
+    /// velocity state survives process restarts without losing rate history.
+    #[serde(default)]
+    pub velocity_tracker_state: Option<VelocityTrackerSnapshot>,
+    /// Per-rule cooldown timers for consequence dispatch (#1531).
+    ///
+    /// Maps consequence rule index to the Unix timestamp (seconds) until which
+    /// the rule should not re-fire. Prevents repeated consequence dispatch
+    /// within a rule's evaluation window. Persisted so cooldown state survives
+    /// process restarts.
+    #[serde(default)]
+    pub cooldown_until: HashMap<usize, u64>,
+    /// Per-member governance proposal timestamps for earned capacity rate
+    /// limiting (§9.3). Maps member DID string to Unix timestamps of recent
+    /// proposals. Persisted so rate limiting survives process restarts.
+    #[serde(default)]
+    pub proposal_timestamps: HashMap<String, Vec<u64>>,
+    /// Spec §19.7 per-DID escalating-cost message pricing configuration.
+    /// `None` for legacy snapshots; on restore, defaults to
+    /// `ContextMessagePricingConfig::spec_default()`.
+    #[serde(default)]
+    pub message_pricing: Option<scp_protocol::economy::antispam::ContextMessagePricingConfig>,
+    /// Hard rate limit (Matrix Synapse–style token bucket) configuration.
+    /// `None` for legacy snapshots; on restore, defaults to
+    /// `HardRateLimitConfig::matrix_defaults()`.
+    #[serde(default)]
+    pub hard_rate_limit_config: Option<scp_protocol::economy::antispam::HardRateLimitConfig>,
+    /// Per-sender token bucket state for the hard rate limit, captured at
+    /// snapshot time. Empty for legacy snapshots; restored verbatim into the
+    /// new limiter via `TokenBucketLimiter::from_snapshot`.
+    #[serde(default)]
+    pub hard_rate_limit_state: HashMap<String, (u64, u64)>,
+    /// Per-context spending-UCAN nonce tracker state (ADR-016 §6, #1608
+    /// follow-up). Maps nonce string to `(first_seen_secs, token_expiry_secs)`.
+    ///
+    /// Persisted so a captured spending UCAN cannot be replayed after a
+    /// restart — without this, the fresh in-memory tracker would have
+    /// no record of previously-consumed nonces, and an attacker could
+    /// replay valid spending tokens until the `max_total` budget was
+    /// exhausted a second time.
+    ///
+    /// MIGRATION: `#[serde(default)]` — legacy snapshots deserialize as
+    /// an empty map, producing a tracker with no prior entries. This
+    /// is the same behavior as the pre-persistence runtime, so upgrade
+    /// does not introduce any new risk.
+    #[serde(default)]
+    pub spending_nonce_tracker_state: HashMap<String, (u64, u64)>,
+    /// Persistent MLS Commit broadcast retry queue (PR #1606 C6).
+    ///
+    /// Captures pending commits whose `transport.send_message` calls failed
+    /// after the local state mutation. Restored on process restart so that
+    /// the governance timeout task continues retrying after a crash.
+    ///
+    /// MIGRATION: `#[serde(default)]` — legacy snapshots deserialize as
+    /// an empty queue, matching pre-feature behavior.
+    #[serde(default)]
+    pub pending_commits: VecDeque<PendingCommit>,
+    /// Fail-close marker for the persistent commit retry queue (PR #1606 C6).
+    ///
+    /// `Some` when a pending commit exhausted `MAX_COMMIT_RETRIES` or
+    /// `MAX_COMMIT_AGE_SECS`. Persisted so the fail-close state survives
+    /// restart and an operator must explicitly acknowledge the fault before
+    /// further mutations are accepted.
+    ///
+    /// MIGRATION: `#[serde(default)]` — legacy snapshots deserialize as
+    /// `None`, matching pre-feature behavior.
+    #[serde(default)]
+    pub commit_fault: Option<CommitFaultMarker>,
+}
+
+/// Serializable snapshot of [`SenderVelocityTracker`](scp_protocol::economy::antispam::SenderVelocityTracker)
+/// state for persistence in [`ContextSnapshot`].
+///
+/// Captures both the sliding window configuration (`window_secs`) and per-sender
+/// message timestamps (`entries`) so velocity tracking survives process restarts
+/// without losing rate history. See spec §19.7 and #1530.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct VelocityTrackerSnapshot {
+    /// Sliding window duration in seconds (same as `SenderVelocityTracker::window_secs`).
+    pub window_secs: u64,
+    /// Per-sender message timestamps (DID string → Vec of Unix timestamps in seconds).
+    pub entries: HashMap<String, Vec<u64>>,
 }
 
 // ---------------------------------------------------------------------------
@@ -645,8 +914,27 @@ struct GovernanceState {
     /// [`EXECUTED_PROPOSALS_TTL_SECS`] are evicted on each insert.
     executed_proposals: HashMap<ProposalId, u64>,
     /// Approved proposals pending execution, tracked for conflict detection (ADR-031 §7).
-    /// Maps proposal ID to (proposal, `sequence_number`, timestamp).
+    ///
+    /// Maps proposal ID to a tuple `(proposal, monotonic_seq, approved_at_unix_secs)`:
+    /// - `monotonic_seq` — the value of [`Self::next_proposal_seq`] at
+    ///   the moment the proposal was inserted. Strictly monotonic across
+    ///   the context lifetime; used by `detect_and_handle_conflicts` for
+    ///   sequential conflict resolution (lower seq wins). H10 fix —
+    ///   replaces wall-clock timestamps which collide within a 1-second
+    ///   window and can be raced into a 48-hour governance freeze.
+    /// - `approved_at_unix_secs` — wall-clock Unix timestamp at approval,
+    ///   retained for audit / event emission only. Never used for
+    ///   conflict ordering.
     approved_proposals: HashMap<ProposalId, (GovernanceProposal, u64, u64)>,
+    /// Monotonic counter for assigning proposal sequence numbers (H10, ADR-031 §7).
+    ///
+    /// Incremented every time `detect_and_handle_conflicts` inserts a new
+    /// approved proposal. Persisted in [`ContextSnapshot::next_proposal_seq`]
+    /// so two proposals can never share a sequence number even across
+    /// process restarts. On `import_context` (untrusted), reset
+    /// conservatively to `approved_proposals.len() as u64` — see
+    /// `lifecycle::import_context`.
+    next_proposal_seq: u64,
     /// Governance freeze state due to simultaneous conflicts (ADR-031 §7).
     /// Contains the conflicting proposal IDs and freeze start timestamp.
     freeze: Option<(ProposalId, ProposalId, u64)>,
@@ -682,13 +970,91 @@ struct GovernanceState {
     /// Drained each tick and passed to `process_pending_proposals` so
     /// their votes on pending proposals are invalidated (ADR-031 §5).
     pending_epoch_resets: Vec<DID>,
+    /// Consequence rules declared at context creation (ADR-017, #1531).
+    consequence_rules: Vec<ConsequenceRule>,
+    /// Sender velocity tracker for anti-spam and consequence evaluation (§19.7, #1537).
+    velocity_tracker: scp_protocol::economy::antispam::SenderVelocityTracker,
+    /// Per-member participation record cache for proposer eligibility (#1530).
+    participation_cache: HashMap<String, scp_protocol::trust::participation::ParticipationRecord>,
+    /// Cooldown tracking for consequence rules: maps `rule_index` to the Unix
+    /// timestamp (seconds) until which the rule should not re-fire. Prevents
+    /// repeated consequence dispatch within a rule's evaluation window.
+    cooldown_until: HashMap<usize, u64>,
+    /// Spec §19.7 per-DID escalating-cost message pricing configuration.
+    ///
+    /// Bundles base cost, escalation tiers, and floor/cap clamps. The
+    /// hard rate limit (Matrix-style token bucket, defense-in-depth)
+    /// is configured separately via `hard_rate_limit` below.
+    message_pricing: Option<scp_protocol::economy::antispam::ContextMessagePricingConfig>,
+    /// Defense-in-depth Matrix-style token bucket hard rate limiter.
+    ///
+    /// Layered on top of the per-DID economic escalation in spec §19.7. This
+    /// is enforced even when `economic_policy` is `None`. See ADR notes on
+    /// the dormant anti-spam wiring fix.
+    hard_rate_limit: scp_protocol::economy::antispam::TokenBucketLimiter,
+    /// Per-context nonce tracker for spending UCAN replay prevention (ADR-016 §6).
+    /// Validates that each spending UCAN nonce is used at most once, preventing
+    /// replay attacks where a valid spending UCAN is resubmitted.
+    spending_nonce_tracker: scp_protocol::crypto::ucan::nonce::NonceTracker<Arc<dyn Clock>>,
+    /// Per-context revoked spending-UCAN CIDs (C1, PR #1606).
+    ///
+    /// Consulted by `enforce_economy` via the
+    /// [`super::economy::ContextRevocationChecker`] adapter when validating
+    /// spending UCANs through the full cryptographic pipeline. Currently
+    /// empty in steady state — spending UCAN revocation lists have not been
+    /// wired through governance — but the field exists so the only change
+    /// required when revocation lands is populating it (no enforcement
+    /// rewrite needed). The set is part of the governance bucket because
+    /// revocation actions are governance-driven (§19.5).
+    revoked_spending_ucan_cids: HashSet<String>,
+    /// Per-member governance proposal timestamps for earned capacity rate limiting
+    /// (§9.3). Maps member DID string to a list of Unix timestamps (seconds) when
+    /// the member submitted governance proposals. Used by `check_proposer_eligibility` to
+    /// enforce `max_governance_proposals_per_window` from `EarnedCapacityPolicy`.
+    /// Entries outside the sliding window are evicted on each check.
+    proposal_timestamps: HashMap<String, Vec<u64>>,
+}
+
+impl GovernanceState {
+    /// Clears participation cache, cooldown state, and velocity tracker.
+    ///
+    /// Called on context close so stale participation records and cooldown
+    /// timers don't carry over if the context is re-created (#1530).
+    fn decay_participation(&mut self) {
+        self.participation_cache.clear();
+        self.cooldown_until.clear();
+        self.proposal_timestamps.clear();
+        // Clear velocity tracker on participation decay. Stale velocity
+        // data from a closed/expired context must not carry over.
+        self.velocity_tracker.clear();
+    }
+
+    /// Evicts stale entries from caches to prevent unbounded growth.
+    ///
+    /// Unlike [`decay_participation`](Self::decay_participation) (which
+    /// clears everything), this performs targeted eviction based on current
+    /// state:
+    /// - `participation_cache`: removes DIDs not in `last_known_members`.
+    /// - `cooldown_until`: removes entries where `now >= expiry`.
+    fn evict_stale_entries(&mut self, now: u64) {
+        // M25: O(1) membership check per entry via HashSet::contains.
+        // last_known_members is HashSet<DID> which implements Borrow<str>,
+        // so we can look up &str keys directly.
+        self.participation_cache
+            .retain(|did, _| self.last_known_members.contains(did.as_str()));
+        // Evict expired cooldown entries.
+        self.cooldown_until.retain(|_, expiry| now < *expiry);
+        // Evict departed members from proposal timestamps.
+        self.proposal_timestamps
+            .retain(|did, _| self.last_known_members.contains(did.as_str()));
+    }
 }
 
 /// MLS epoch and reconnection state.
 struct EpochState {
     /// Monotonic MLS epoch counter. Incremented each time a governance action
     /// triggers an MLS membership change (`AddMember`, `RemoveMember`,
-    /// `RevokeReadAccess`, `ResetMember`). Used to populate
+    /// `Revoke`, `ResetMember`). Used to populate
     /// `GovernanceActionExecuted.resulting_epoch` and
     /// `GovernanceContext.current_epoch`.
     mls_epoch: u64,
@@ -715,14 +1081,14 @@ struct EpochState {
     needs_reconnect: bool,
 }
 
-/// Write/read revocation and context migration state.
+/// Access control state (CEK wrapping, key store).
+///
+/// Capability suspension is now handled by `ContextRoleState::suspended_capabilities`.
+/// This struct retains the CEK exclusion list and per-member access key store.
 struct AccessControlState {
-    /// Members whose write access has been governance-revoked (ADR-031).
-    write_revoked_members: HashSet<DID>,
-    /// Members whose read access has been governance-revoked (§5.9, ADR-038).
-    read_revoked_members: HashSet<DID>,
-    /// Members excluded from future CEK wrapping (`FutureOnly` read revocation,
-    /// ADR-038, §9.17). Subset of or equal to `read_revoked_members`.
+    /// Members excluded from future CEK wrapping (`Revoke { access: AccessScope::Write }`,
+    /// ADR-038, §9.17). This is a cryptographic exclusion list, NOT an
+    /// application-level capability suspension.
     read_exclusion_list: HashSet<DID>,
     /// Per-member access key store for content encryption key wrapping
     /// (ADR-038, §9.17). Keys are generated when members join and used
@@ -735,7 +1101,6 @@ struct TtlState {
     /// TTL timer management (SCP-021).
     timer: TtlTimer,
     /// Active TTL extension proposal, if any (SCP-021).
-    #[allow(dead_code)]
     extension: Option<TtlExtension>,
 }
 
@@ -772,6 +1137,15 @@ struct PerContextState {
     /// Buffers messages arriving ahead of their expected sequence number and
     /// delivers them when the gap fills or a 30-second timeout expires.
     reorder_buffer: scp_protocol::envelope::ReorderBuffer,
+    /// Persistent retry queue for MLS Commit broadcasts that failed at the
+    /// transport layer after the local state mutation already happened
+    /// (PR #1606 C6). Drained by the governance timeout task.
+    pending_commits: VecDeque<PendingCommit>,
+    /// Fail-close marker set when a `PendingCommit` exhausts its retry
+    /// budget. While `Some`, all context-mutating operations return
+    /// [`ContextError::CommitBroadcastFault`] until cleared via
+    /// [`ContextManager::acknowledge_commit_fault`].
+    commit_fault: Option<CommitFaultMarker>,
 }
 
 /// Creates a governance engine from a [`GovernanceModel`] selector and
@@ -1222,6 +1596,7 @@ pub struct ContextManagerBuilder {
     persistence: Option<Box<dyn ContextPersistence>>,
     key_resolver: Option<KeyResolver>,
     clock: Option<Arc<dyn Clock>>,
+    payment_adapter: Option<Arc<dyn crate::economy::adapter::PaymentAdapterDyn>>,
 }
 
 impl ContextManagerBuilder {
@@ -1235,6 +1610,7 @@ impl ContextManagerBuilder {
             persistence: None,
             key_resolver: None,
             clock: None,
+            payment_adapter: None,
         }
     }
 
@@ -1289,6 +1665,19 @@ impl ContextManagerBuilder {
     #[must_use]
     pub fn clock(mut self, clock: Arc<dyn Clock>) -> Self {
         self.clock = Some(clock);
+        self
+    }
+
+    /// Sets the payment adapter for the 9-step paid action flow (spec §19.2.2).
+    ///
+    /// If not called, paid action entry points skip the payment rail
+    /// integration while still enforcing budget tracking.
+    #[must_use]
+    pub fn payment_adapter(
+        mut self,
+        adapter: Arc<dyn crate::economy::adapter::PaymentAdapterDyn>,
+    ) -> Self {
+        self.payment_adapter = Some(adapter);
         self
     }
 
@@ -1352,6 +1741,7 @@ impl ContextManagerBuilder {
             None => ContextManager::new(crypto, transport, event_log, key_resolver),
         };
         manager.clock = clock;
+        manager.payment_adapter = self.payment_adapter;
         Ok(manager)
     }
 }
@@ -1434,6 +1824,22 @@ pub struct ContextManager {
     /// Injected via constructors / builder to allow test clock injection.
     /// Defaults to [`scp_primitives::SystemClock`].
     clock: Arc<dyn Clock>,
+    /// Standing bilateral contexts indexed by peer DID string (contact graph).
+    ///
+    /// Maps peer DID string to the peer's [`DID`]. The context ID is derived
+    /// deterministically via [`standing::generate_standing_context_id`], and
+    /// the context handle lives in [`Self::contexts`]. This map tracks which
+    /// peers have standing contexts without duplicating handle storage.
+    standing_contexts: Mutex<HashMap<String, DID>>,
+    /// Optional payment adapter for the 9-step paid action flow (spec §19.2.2).
+    ///
+    /// When `Some`, `authorize_paid_action`→`complete_paid_action` runs the
+    /// full escrow flow via this adapter. When `None`, paid action entry
+    /// points skip payment (free context) while still enforcing budget
+    /// tracking via `evaluate_cost` and `record_spend`.
+    ///
+    /// Set via [`set_payment_adapter`](Self::set_payment_adapter) or the builder.
+    payment_adapter: Option<Arc<dyn crate::economy::adapter::PaymentAdapterDyn>>,
 }
 
 // Nursery lint — false-positives on async functions holding tokio::sync::MutexGuard
@@ -1467,6 +1873,8 @@ impl ContextManager {
             contexts: Arc::new(Mutex::new(HashMap::new())),
             key_resolver,
             clock: Arc::new(scp_primitives::SystemClock),
+            standing_contexts: Mutex::new(HashMap::new()),
+            payment_adapter: None,
         }
     }
 
@@ -1501,6 +1909,8 @@ impl ContextManager {
             contexts: Arc::new(Mutex::new(HashMap::new())),
             key_resolver,
             clock: Arc::new(scp_primitives::SystemClock),
+            standing_contexts: Mutex::new(HashMap::new()),
+            payment_adapter: None,
         }
     }
 
@@ -1581,7 +1991,11 @@ impl ContextManager {
                 // Best-effort persistence: log but don't fail the operation.
                 // In-memory state remains authoritative.
                 crate::metrics::record_persistence_failure();
-                let _ = e; // Suppress unused warning; tracing integration is TBD.
+                tracing::warn!(
+                    context_id = %context_id,
+                    error = %e,
+                    "failed to persist context snapshot"
+                );
             }
         }
     }
@@ -1592,7 +2006,11 @@ impl ContextManager {
         if let Some(ref persistence) = self.persistence
             && let Err(e) = persistence.persist_broadcast(context_id, snapshot)
         {
-            let _ = e;
+            tracing::warn!(
+                context_id = %context_id,
+                error = %e,
+                "failed to persist broadcast snapshot"
+            );
         }
     }
 
@@ -1668,8 +2086,6 @@ impl ContextManager {
             executed_proposals: ctx.governance.executed_proposals.keys().copied().collect(),
             ttl_remaining_secs,
             registered_tools: ctx.governance.registered_tools.clone(),
-            write_revoked_members: ctx.access.write_revoked_members.clone(),
-            read_revoked_members: ctx.access.read_revoked_members.clone(),
             read_exclusion_list: ctx.access.read_exclusion_list.clone(),
             tool_interfaces: ctx.governance.tool_interfaces.clone(),
             threshold_signers: ctx.governance.threshold_signers.clone(),
@@ -1679,6 +2095,7 @@ impl ContextManager {
             economic_policy: ctx.governance.economic_policy.clone(),
             budget_tracker: ctx.governance.budget_tracker.clone(),
             approved_proposals: ctx.governance.approved_proposals.clone(),
+            next_proposal_seq: ctx.governance.next_proposal_seq,
             governance_freeze: ctx.governance.freeze,
             pending_ceiling_modification: ctx.governance.pending_ceiling_modification.clone(),
             pending_economic_policy_change: ctx.governance.pending_economic_policy_change.clone(),
@@ -1691,6 +2108,72 @@ impl ContextManager {
             mls_crypto_state: Vec::new(),
             migration_state: ctx.migration_state.clone(),
             access_key_store: ctx.access.access_key_store.clone(),
+            consequence_rules: ctx.governance.consequence_rules.clone(),
+            participation_cache: ctx.governance.participation_cache.clone(),
+            velocity_tracker: Some(ctx.governance.velocity_tracker.window_secs()),
+            velocity_tracker_state: Some(VelocityTrackerSnapshot {
+                window_secs: ctx.governance.velocity_tracker.window_secs(),
+                entries: ctx.governance.velocity_tracker.snapshot_entries(),
+            }),
+            cooldown_until: ctx.governance.cooldown_until.clone(),
+            proposal_timestamps: ctx.governance.proposal_timestamps.clone(),
+            message_pricing: ctx.governance.message_pricing.clone(),
+            hard_rate_limit_config: Some(ctx.governance.hard_rate_limit.config().clone()),
+            hard_rate_limit_state: ctx.governance.hard_rate_limit.snapshot_entries(),
+            spending_nonce_tracker_state: ctx.governance.spending_nonce_tracker.snapshot_entries(),
+            pending_commits: ctx.pending_commits.clone(),
+            commit_fault: ctx.commit_fault.clone(),
+        }
+    }
+
+    /// Appends a `PaymentCaptureFailed` entry to the event log and pushes a
+    /// matching [`ContextEvent::PaymentCaptureFailed`] to the receive buffer.
+    ///
+    /// Called by `capture_send_payment` and `capture_join_payment` when the
+    /// payment adapter returns an error after a successful action (H19 audit
+    /// trail). The budget deduction is NOT reversed — service was rendered (H8).
+    ///
+    /// # Errors on event-log append
+    ///
+    /// If the event log append fails, a warning is logged but the method
+    /// does not propagate the error (best-effort, same as the outer capture).
+    ///
+    /// The method is `pub(crate)` so that unit tests can invoke it directly
+    /// without needing to construct the internal `PaidActionAuthorization`
+    /// type. Not part of the public API.
+    pub(crate) async fn record_payment_capture_failure(
+        &self,
+        context_id: &str,
+        action: &str,
+        actor_did: &DID,
+        error_msg: &str,
+        cost: Option<scp_protocol::economy::types::Amount>,
+    ) {
+        let context_id_bytes = context_id_to_bytes(context_id);
+        let payload = serde_json::json!({
+            "action": action,
+            "error": error_msg,
+            "cost": cost.map(scp_protocol::economy::types::Amount::value),
+        });
+        if let Err(log_err) = self.event_log.append_context_event_with_payload(
+            &context_id_bytes,
+            "PaymentCaptureFailed",
+            actor_did.as_ref(),
+            Some(&payload),
+        ) {
+            tracing::warn!(
+                context_id,
+                "failed to append PaymentCaptureFailed to event log: {log_err}"
+            );
+        }
+        let mut contexts = self.contexts.lock().await;
+        if let Some(ctx) = contexts.get_mut(context_id) {
+            ctx.receive_buffer.push(ContextEvent::PaymentCaptureFailed {
+                action: action.to_owned(),
+                actor_did: actor_did.clone(),
+                error: error_msg.to_owned(),
+                cost: cost.map(scp_protocol::economy::types::Amount::value),
+            });
         }
     }
 }

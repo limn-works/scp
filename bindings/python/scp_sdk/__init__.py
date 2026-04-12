@@ -60,8 +60,6 @@ from scp_sdk.context import (
 )
 from scp_sdk.discovery import create_query, discover, normalize_address, parse_address
 from scp_sdk.economy import (
-    RelayPriceAdjustment,
-    adjust_relay_price,
     antispam_escalated_cost,
     antispam_record,
     antispam_velocity,
@@ -261,7 +259,6 @@ __all__ = [
     "ProvenanceQuality",
     "PublishResult",
     "Relay",
-    "RelayPriceAdjustment",
     "RequireParticipation",
     "RevocationStatus",
     "ScpError",
@@ -284,7 +281,6 @@ __all__ = [
     "ValidationError",
     "__version__",
     "add_checkpoint_cosignature",
-    "adjust_relay_price",
     "aggregate_trust_input",
     "antispam_escalated_cost",
     "antispam_record",

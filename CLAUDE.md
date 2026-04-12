@@ -81,6 +81,7 @@ Artifacts (`.docs/`) are durable and versioned — the system of record. Vestige
 - Aggressively reference and update `.docs/`; add lessons after any correction
 - Check `.docs/standards/` before writing code — read and follow them
 - Subagents: use liberally, one task each, keep main context clean
+- Subagents: ALWAYS instruct them to read CLAUDE.md
 - Verify all gates, tests, and builds pass before deciding you are done
 
 **Change protocol (MANDATORY for all code changes):**

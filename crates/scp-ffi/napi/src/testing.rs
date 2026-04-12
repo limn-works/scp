@@ -471,5 +471,13 @@ pub fn fullstack_remove_member(
             message: format!("failed to remove member: {e}"),
             code: "SCP-CTX-2054".to_owned(),
         })
-    })
+    })?;
+
+    // Drain transport buffer: leave_context produces MLS Commit +
+    // sender key rotation distributions. If not drained, the next
+    // fullstack_send_message would see >1 ciphertext and fail the
+    // single-ciphertext assertion.
+    let _ = node.inner.take_sent_ciphertexts();
+
+    Ok(())
 }

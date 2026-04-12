@@ -110,6 +110,8 @@ class ConformanceStubBindings : NativeBindings {
     override fun contextCreate(
         identityHandle: Long,
         paramsJson: String,
+        consequenceRulesJson: String?,
+        consequenceConfigJson: String?,
     ): Long {
         contextCreateError?.let { throw it }
         return contextCreateResult
@@ -118,6 +120,7 @@ class ConformanceStubBindings : NativeBindings {
     override fun contextJoin(
         contextHandle: Long,
         identityHandle: Long,
+        spendingUcanJwt: String?,
     ) {
         contextJoinError?.let { throw it }
     }
@@ -142,6 +145,7 @@ class ConformanceStubBindings : NativeBindings {
         contextHandle: Long,
         identityHandle: Long,
         payload: ByteArray,
+        spendingUcanJwt: String?,
     ) {
         contextSendCalled = true
         contextSendPayload = payload
@@ -316,6 +320,7 @@ class ConformanceStubBindings : NativeBindings {
         return toolRegisterResult
     }
 
+    @Suppress("LongParameterList")
     override fun toolInvoke(
         contextHandle: Long,
         toolId: String,
@@ -323,6 +328,7 @@ class ConformanceStubBindings : NativeBindings {
         identityHandle: Long,
         ucanToken: String?,
         proofTokens: List<String>?,
+        spendingUcan: String?,
     ): String {
         toolInvokeError?.let { throw it }
         return toolInvokeResult

@@ -113,13 +113,121 @@ fn cross_process_welcome_delivery() {
 
     // Bob opens Alice's message — proves the full pipeline works:
     // MLS Welcome join + sender key distribution + seal + open.
-    let opened = bob_crypto.open(&context_id, &sealed).unwrap();
-    assert!(
-        opened.is_some(),
-        "opened must be Some for application message"
-    );
-    let envelope = opened.unwrap();
+    let open_result = bob_crypto.open(&context_id, &sealed).unwrap();
+    let envelope = match open_result {
+        scp_core::context::builder::OpenResult::Application(env) => env,
+        other => panic!("expected Application, got {other:?}"),
+    };
     assert_eq!(envelope.sender_did, alice_did);
+}
+
+// ---------------------------------------------------------------------------
+// 1b. join_time_sender_key_distribution_uses_management_channel (H3)
+// ---------------------------------------------------------------------------
+
+/// H3: when the inviter (Alice) drains pending sender key distributions
+/// after adding a new member (Bob), each distribution MUST be MLS-wrapped
+/// via `mls_encrypt_management` so that Bob's `crypto.open()` returns
+/// `OpenResult::Management` and routes the payload through
+/// `process_incoming_sender_key`.
+///
+/// The pre-fix bug posted the raw HPKE-sealed
+/// `SenderKeyDistributionMessage::KeyResponse` bytes via
+/// `transport.send_message`, which the receive-side dispatcher attempted
+/// to deserialize as an `OuterEnvelope` and silently dropped on failure.
+/// This test asserts the correct framing end-to-end at the provider level.
+#[test]
+fn join_time_sender_key_distribution_uses_management_channel() {
+    let alice_did = "did:dht:z6MkAliceAliceAliceAliceAliceAliceAliceAlic";
+    let bob_did = "did:dht:z6MkBobBobBobBobBobBobBobBobBobBobBobBobBo";
+    let context_id = [0x33u8; 32];
+
+    let alice_crypto = MlsCryptoProvider::new(alice_did.to_string());
+    let bob_crypto = MlsCryptoProvider::new(bob_did.to_string());
+
+    // Alice creates the group and her sender key.
+    alice_crypto.create_mls_group(&context_id).unwrap();
+    alice_crypto.generate_sender_key(&context_id).unwrap();
+
+    // Bob prepares his key package, Alice adds Bob, Bob joins via Welcome.
+    let bob_kp_bytes = bob_crypto.prepare_key_package_for_join().unwrap();
+    let add_output = alice_crypto
+        .add_member(&context_id, bob_did, Some(&bob_kp_bytes))
+        .unwrap();
+    bob_crypto
+        .join_from_welcome(&context_id, &add_output.welcome_bytes)
+        .unwrap();
+    bob_crypto.generate_sender_key(&context_id).unwrap();
+
+    // Alice queues her sender key distribution to Bob (in production this
+    // happens automatically inside `add_member` via the `distribute_sender_key`
+    // call from `ContextManager::join_context`).
+    alice_crypto
+        .distribute_sender_key(&context_id, bob_did)
+        .unwrap();
+    let pending = alice_crypto
+        .drain_pending_sender_key_messages(&context_id)
+        .unwrap();
+    assert_eq!(
+        pending.len(),
+        1,
+        "Alice should have exactly one pending sender key distribution for Bob"
+    );
+
+    // The fix: each pending distribution MUST be MLS-wrapped before
+    // being posted to transport. This is what `drain_and_deliver_sender_keys`
+    // does internally — we exercise the same path here.
+    let routing_id = scp_core::context::context_routing_id(&hex::encode(context_id));
+    let (target_did, raw_distribution) = pending.into_iter().next().unwrap();
+    assert_eq!(target_did, bob_did);
+
+    // Sanity check the pre-fix shape: the raw distribution bytes are NOT
+    // a valid OuterEnvelope. Bob's `open()` would error if we sent them
+    // as-is via `transport.send_message`.
+    let bare_open = bob_crypto.open(&context_id, &raw_distribution);
+    assert!(
+        bare_open.is_err(),
+        "raw HPKE distribution bytes must not deserialize as OuterEnvelope — \
+         this is the regression H3 closes (silent distribution loss on join)"
+    );
+
+    // Now MLS-wrap via the management channel — the post-fix path.
+    let wrapped = alice_crypto
+        .mls_encrypt_management(&context_id, &raw_distribution, &routing_id, 300)
+        .unwrap();
+
+    // Bob's `open()` MUST recognize the wrapped payload as Management,
+    // surfacing the inner HPKE bytes for `process_incoming_sender_key`.
+    let open_result = bob_crypto.open(&context_id, &wrapped).unwrap();
+    let payload = match open_result {
+        scp_core::context::builder::OpenResult::Management {
+            sender_did,
+            payload,
+        } => {
+            assert_eq!(
+                sender_did, alice_did,
+                "Management message sender must be Alice"
+            );
+            payload
+        }
+        other => panic!(
+            "expected OpenResult::Management for MLS-wrapped sender key \
+             distribution, got {other:?}"
+        ),
+    };
+
+    // The payload Bob receives must equal the original HPKE distribution
+    // bytes Alice queued. This proves end-to-end framing equivalence.
+    assert_eq!(
+        payload, raw_distribution,
+        "management payload must round-trip the original HPKE distribution bytes"
+    );
+
+    // Bob can now process the distribution and decrypt subsequent
+    // application messages from Alice — the join-time happy path.
+    bob_crypto
+        .process_incoming_sender_key(&context_id, alice_did, &payload)
+        .unwrap();
 }
 
 // ---------------------------------------------------------------------------

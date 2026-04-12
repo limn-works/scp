@@ -18,7 +18,8 @@
 use serde::{Deserialize, Serialize};
 
 use super::adapter::{
-    ContextId, PaymentAdapter, PaymentAuthorization, PaymentError, PaymentMetadata, PaymentReceipt,
+    ContextId, PaymentAdapterDyn, PaymentAuthorization, PaymentError, PaymentMetadata,
+    PaymentReceipt,
 };
 use scp_identity::DID;
 use scp_protocol::economy::policy::{ObservableMetrics, evaluate_cost, verify_cost_sufficiency};
@@ -161,8 +162,8 @@ pub struct PreparedAction {
 /// overflows. Returns [`IntegrationError::AuthorizationFailed`] if the adapter
 /// rejects the authorization request.
 #[allow(clippy::too_many_arguments)] // Spec-defined 9-step flow requires all parameters.
-pub async fn prepare_paid_action<A: PaymentAdapter>(
-    adapter: &A,
+pub async fn prepare_paid_action(
+    adapter: &dyn PaymentAdapterDyn,
     policy: Option<&EconomicPolicy>,
     action_type: PaidActionType,
     actor: &DID,
@@ -197,7 +198,7 @@ pub async fn prepare_paid_action<A: PaymentAdapter>(
 
     // Step 3: Authorize payment.
     let auth = adapter
-        .authorize(
+        .authorize_dyn(
             actor,
             &policy.payee,
             cost,
@@ -250,15 +251,14 @@ pub struct ProcessedAction {
 /// Returns [`IntegrationError`] for any failure in the sequence. When a
 /// failure occurs after authorization, the adapter's `void()` is called
 /// to release reserved funds.
-pub async fn process_paid_action<A, F, Fut>(
-    adapter: &A,
+pub async fn process_paid_action<F, Fut>(
+    adapter: &dyn PaymentAdapterDyn,
     policy: Option<&EconomicPolicy>,
     envelope: &ActionEnvelope,
     metrics: &ObservableMetrics,
     process_action: F,
 ) -> Result<ProcessedAction, IntegrationError>
 where
-    A: PaymentAdapter,
     F: FnOnce(Vec<u8>) -> Fut,
     Fut: std::future::Future<Output = Result<Vec<u8>, String>>,
 {
@@ -275,7 +275,7 @@ where
     };
 
     // Step 5a: Verify authorization via adapter (prevents forged auth structs).
-    if let Err(e) = adapter.verify_authorization(auth).await {
+    if let Err(e) = adapter.verify_authorization_dyn(auth).await {
         return Err(IntegrationError::AuthorizationVerificationFailed(e));
     }
 
@@ -307,7 +307,7 @@ where
     };
 
     // Step 7: Capture the payment.
-    let receipt = match adapter.capture(auth).await {
+    let receipt = match adapter.capture_dyn(auth).await {
         Ok(receipt) => receipt,
         Err(e) => {
             // Void is not needed after capture failure -- the adapter is
@@ -332,12 +332,12 @@ where
 ///
 /// Always returns `Err` -- either the original error (if void succeeds) or
 /// a [`IntegrationError::VoidFailed`] wrapping both errors (if void fails).
-async fn void_on_failure<T, A: PaymentAdapter>(
-    adapter: &A,
+async fn void_on_failure<T>(
+    adapter: &dyn PaymentAdapterDyn,
     auth: &PaymentAuthorization,
     original_error: IntegrationError,
 ) -> Result<T, IntegrationError> {
-    match adapter.void(auth).await {
+    match adapter.void_dyn(auth).await {
         Ok(()) => Err(original_error),
         Err(void_err) => Err(IntegrationError::VoidFailed {
             original: Box::new(original_error),
@@ -361,7 +361,8 @@ async fn void_on_failure<T, A: PaymentAdapter>(
 mod tests {
     use super::*;
     use crate::economy::adapter::{
-        AdapterCapabilities, PaymentMetadata, RefundConfirmation, VerificationResult,
+        AdapterCapabilities, PaymentAdapter, PaymentMetadata, RefundConfirmation,
+        VerificationResult,
     };
     use scp_protocol::economy::types::{CostSchedule, CurrencyCode};
 

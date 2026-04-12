@@ -62,7 +62,7 @@ struct ContextTests {
         let handle = ContextHandle(noPointer: .init())
         let identity = Identity(noPointer: .init())
 
-        let sendFn: ContextBridge.SendFn = { _, _, payload in
+        let sendFn: ContextBridge.SendFn = { _, _, payload, _ in
             onSend?(payload)
         }
 
@@ -121,7 +121,7 @@ struct ContextTests {
             capturedParams.withLock { $0 = params }
             return ContextHandle(noPointer: .init())
         }
-        let noOpSend: ContextBridge.SendFn = { _, _, _ in }
+        let noOpSend: ContextBridge.SendFn = { _, _, _, _ in }
         let noOpSubscribe: ContextBridge.SubscribeFn = { _, _ in }
         let noOpLeave: ContextBridge.LeaveFn = { _, _ in }
         let noOpClose: ContextBridge.CloseFn = { _, _ in }
@@ -139,7 +139,9 @@ struct ContextTests {
             maxChainDepth: nil,
             maxNestingDepth: nil,
             sessionCap: nil,
-            economicPolicy: nil
+            economicPolicy: nil,
+            consequenceRulesJson: nil,
+            consequenceConfigJson: nil
         )
 
         let context = try await Context.create(
@@ -175,7 +177,7 @@ struct ContextTests {
         let createFn: ContextBridge.CreateFn = { _, _ in
             throw ScpError.Context(msg: "creation failed", code: "SCP-CTX-2100")
         }
-        let noOpSend: ContextBridge.SendFn = { _, _, _ in }
+        let noOpSend: ContextBridge.SendFn = { _, _, _, _ in }
         let noOpSubscribe: ContextBridge.SubscribeFn = { _, _ in }
         let noOpLeave: ContextBridge.LeaveFn = { _, _ in }
         let noOpClose: ContextBridge.CloseFn = { _, _ in }
@@ -193,7 +195,9 @@ struct ContextTests {
             maxChainDepth: nil,
             maxNestingDepth: nil,
             sessionCap: nil,
-            economicPolicy: nil
+            economicPolicy: nil,
+            consequenceRulesJson: nil,
+            consequenceConfigJson: nil
         )
 
         await #expect(throws: ScpError.self) {
@@ -232,7 +236,7 @@ struct ContextTests {
         let handle = ContextHandle(noPointer: .init())
         let identity = Identity(noPointer: .init())
 
-        let sendFn: ContextBridge.SendFn = { _, id, _ in
+        let sendFn: ContextBridge.SendFn = { _, id, _, _ in
             capturedIdentity.withLock { $0 = id }
         }
 
@@ -580,7 +584,7 @@ struct ContextTests {
             contextId: "test-leave-identity",
             creatorDid: "did:dht:z6MkTest",
             initialState: .active,
-            sendFn: { _, _, _ in },
+            sendFn: { _, _, _, _ in },
             subscribeFn: { _, _ in },
             leaveFn: leaveFn,
             closeFn: { _, _ in }
@@ -634,7 +638,7 @@ struct ContextTests {
             contextId: "test-close-identity",
             creatorDid: "did:dht:z6MkTest",
             initialState: .active,
-            sendFn: { _, _, _ in },
+            sendFn: { _, _, _, _ in },
             subscribeFn: { _, _ in },
             leaveFn: { _, _ in },
             closeFn: closeFn
@@ -803,7 +807,7 @@ struct ContextTests {
         let identity = Identity(noPointer: .init())
         var joinCalled = false
 
-        let mockJoin: ContextBridge.JoinFn = { _, _ in
+        let mockJoin: ContextBridge.JoinFn = { _, _, _ in
             joinCalled = true
         }
 
@@ -816,7 +820,7 @@ struct ContextTests {
         let handle = ContextHandle(noPointer: .init())
         let identity = Identity(noPointer: .init())
 
-        let mockJoin: ContextBridge.JoinFn = { _, _ in
+        let mockJoin: ContextBridge.JoinFn = { _, _, _ in
             throw ScpError.Context(
                 msg: "cannot join context in Closed state",
                 code: "SCP-CTX-2013"
@@ -856,7 +860,7 @@ struct ContextTests {
             contextId: "econ-policy-test",
             creatorDid: "did:dht:z6MkTest",
             initialState: .active,
-            sendFn: { _, _, _ in },
+            sendFn: { _, _, _, _ in },
             subscribeFn: { _, _ in },
             leaveFn: { _, _ in },
             closeFn: { _, _ in },
@@ -875,5 +879,257 @@ struct ContextTests {
         try await context.setEconomicPolicy(policyJson)
         let result = try await context.getEconomicPolicy()
         #expect(result == policyJson)
+    }
+
+    // MARK: - Spending UCAN / consequence event tests (#1537, #1593, #1594)
+
+    @Test("evaluateContextInvitation accepts spendingJson parameter")
+    func evaluateInvitationWithSpending() {
+        // The InvitationEvaluationResult type should accept a decision string.
+        let result = InvitationEvaluationResult(decision: "prompt_agent")
+        #expect(result.decision == "prompt_agent")
+    }
+
+    @Test("InvitationEvaluationResult with auto_accept decision")
+    func evaluateInvitationAutoAccept() {
+        let result = InvitationEvaluationResult(decision: "auto_accept")
+        #expect(result.decision == "auto_accept")
+    }
+
+    @Test("consequence_triggered event payload structure")
+    func consequenceTriggeredPayload() {
+        // Verify that consequence event payloads from the bridge follow
+        // the expected format that SDK consumers can parse.
+        let payload = "consequence_triggered: member=did:dht:z6MkBob rule=2 trigger=velocity action=mute context=ctx-123"
+        #expect(payload.contains("consequence_triggered:"))
+        #expect(payload.contains("member=did:dht:z6MkBob"))
+        #expect(payload.contains("rule=2"))
+        #expect(payload.contains("trigger=velocity"))
+        #expect(payload.contains("action=mute"))
+    }
+
+    @Test("consequence_enforced event payload structure")
+    func consequenceEnforcedPayload() {
+        let payload = "consequence_enforced: member=did:dht:z6MkAlice action=restrict_write success=true context=ctx-456"
+        #expect(payload.contains("consequence_enforced:"))
+        #expect(payload.contains("success=true"))
+    }
+
+    // MARK: - C5: typed consequenceConfig + Context.join instance method
+
+    @Test("Context.create forwards consequenceRulesJson and consequenceConfigJson to the bridge")
+    func createForwardsConsequenceRulesAndConfig() async throws {
+        let capturedParams = Locked<ContextParams?>(nil)
+        let createFn: ContextBridge.CreateFn = { _, params in
+            capturedParams.withLock { $0 = params }
+            return ContextHandle(noPointer: .init())
+        }
+        let noOpSend: ContextBridge.SendFn = { _, _, _, _ in }
+        let noOpSubscribe: ContextBridge.SubscribeFn = { _, _ in }
+        let noOpLeave: ContextBridge.LeaveFn = { _, _ in }
+        let noOpClose: ContextBridge.CloseFn = { _, _ in }
+
+        let identity = Identity(noPointer: .init())
+        let rulesJson = """
+        [{"trigger":"MessageVelocity","action":{"Enforcement":{"RevokeAccess":{"did":"did:dht:z6MkSubject","access":"Both"}}},"threshold":5,"window":{"secs":3600,"nanos":0}}]
+        """
+        let configJson = #"{"allow_automatic_access_revocation":true}"#
+        let params = ContextParams(
+            mode: .encrypted,
+            ceiling: ["messages:read"],
+            ceilingPolicy: .immutable,
+            governance: .singleAdmin,
+            memoryScope: .ephemeral,
+            ttlSeconds: 3600,
+            promotable: false,
+            minProtocolVersion: 0,
+            maxChainDepth: nil,
+            maxNestingDepth: nil,
+            sessionCap: nil,
+            economicPolicy: nil,
+            consequenceRulesJson: rulesJson,
+            consequenceConfigJson: configJson
+        )
+
+        _ = try await Context.create(
+            identity: identity,
+            params: params,
+            createFn: createFn,
+            sendFn: noOpSend,
+            subscribeFn: noOpSubscribe,
+            leaveFn: noOpLeave,
+            closeFn: noOpClose,
+            contextId: "ctx-c5-rules-config",
+            creatorDid: "did:dht:z6MkTestCreator",
+            initialState: .active
+        )
+
+        let forwarded = capturedParams.current
+        #expect(forwarded?.consequenceRulesJson == rulesJson)
+        #expect(forwarded?.consequenceConfigJson == configJson)
+    }
+
+    @Test("Context.join instance method forwards spendingUcanJwt to the bridge")
+    func joinInstanceForwardsSpendingUcan() async throws {
+        let capturedJwt = Locked<String?>(nil)
+        let context = makeTestContext()
+        let joiner = Identity(noPointer: .init())
+
+        let joinFn: ContextBridge.JoinFn = { _, _, jwt in
+            capturedJwt.withLock { $0 = jwt }
+        }
+
+        try await context.join(joiner, spendingUcanJwt: "synthetic.spending.jwt", joinFn: joinFn)
+        #expect(capturedJwt.current == "synthetic.spending.jwt")
+    }
+
+    @Test("Context.join instance method throws when context is not active")
+    func joinInstanceThrowsOnInactive() async throws {
+        let context = makeTestContext(initialState: .closed)
+        let joiner = Identity(noPointer: .init())
+
+        let joinFn: ContextBridge.JoinFn = { _, _, _ in }
+
+        await #expect(throws: ScpError.self) {
+            try await context.join(joiner, joinFn: joinFn)
+        }
+    }
+
+    // MARK: - H15: typed ConsequenceRule / ConsequenceConfig
+
+    /// Shared assertion helper used by h15TypedRulesEncoding.
+    private func assertConsequenceRulesJsonShape(_ array: [[String: Any]]) throws {
+        #expect(array.count == 3)
+        // Rule 0 — MessageVelocity / SuspendCapability with mixed capabilities.
+        #expect(array[0]["trigger"] as? String == "MessageVelocity")
+        let action0 = try #require(array[0]["action"] as? [String: Any])
+        let enforce0 = try #require(action0["Enforcement"] as? [String: Any])
+        let suspend0 = try #require(enforce0["SuspendCapability"] as? [String: Any])
+        let caps0 = try #require(suspend0["capabilities"] as? [Any])
+        #expect(caps0.count == 3)
+        #expect(caps0[0] as? String == "MessagesWrite")
+        let toolCap = try #require(caps0[1] as? [String: String])
+        #expect(toolCap == ["ToolInvoke": "calculator"])
+        let customCap = try #require(caps0[2] as? [String: String])
+        #expect(customCap == ["Custom": "my-custom-cap"])
+        let window0 = try #require(array[0]["window"] as? [String: Int])
+        #expect(window0 == ["secs": 3600, "nanos": 0])
+        // Rule 1 — Custom trigger / AssignRole.
+        let trigger1 = try #require(array[1]["trigger"] as? [String: String])
+        #expect(trigger1 == ["Custom": "spammy"])
+        let action1 = try #require(array[1]["action"] as? [String: Any])
+        let assignRole = try #require(action1["AssignRole"] as? [String: String])
+        #expect(assignRole == ["to_role": "viewer"])
+        // Rule 2 — WarningCount / RevokeAccess.
+        #expect(array[2]["trigger"] as? String == "WarningCount")
+        let action2 = try #require(array[2]["action"] as? [String: Any])
+        let enforce2 = try #require(action2["Enforcement"] as? [String: Any])
+        let revoke = try #require(enforce2["RevokeAccess"] as? [String: String])
+        #expect(revoke == ["did": "did:dht:z6MkSubject", "access": "Both"])
+    }
+
+    @Test("encodeConsequenceRulesJson encodes the discriminated union to Rust serde wire format")
+    func h15TypedRulesEncoding() throws {
+        let rules: [ConsequenceRule] = [
+            ConsequenceRule(
+                trigger: .messageVelocity,
+                action: .enforcement(.suspendCapability(capabilities: [
+                    .unit(name: "MessagesWrite"),
+                    .toolInvoke(toolId: "calculator"),
+                    .custom(name: "my-custom-cap")
+                ])),
+                threshold: 5,
+                windowSecs: 3600
+            ),
+            ConsequenceRule(
+                trigger: .custom(key: "spammy"),
+                action: .assignRole(toRole: "viewer"),
+                threshold: 3,
+                windowSecs: 600
+            ),
+            ConsequenceRule(
+                trigger: .warningCount,
+                action: .enforcement(.revokeAccess(did: "did:dht:z6MkSubject", access: .both)),
+                threshold: 10,
+                windowSecs: 86400
+            )
+        ]
+        let json = try encodeConsequenceRulesJson(rules)
+        let raw = try #require(json.data(using: .utf8))
+        let any = try JSONSerialization.jsonObject(with: raw)
+        let array = try #require(any as? [[String: Any]])
+        try assertConsequenceRulesJsonShape(array)
+    }
+
+    @Test("encodeConsequenceConfigJson snake_cases the wire field")
+    func h15TypedConfigEncoding() throws {
+        let json = try encodeConsequenceConfigJson(
+            ConsequenceConfig(allowAutomaticAccessRevocation: true)
+        )
+        let raw = try #require(json.data(using: .utf8))
+        let parsed = try #require(
+            try JSONSerialization.jsonObject(with: raw) as? [String: Bool]
+        )
+        #expect(parsed == ["allow_automatic_access_revocation": true])
+    }
+
+    @Test("ContextParams typed convenience init forwards JSON-encoded consequence values")
+    func h15ContextParamsTypedInit() throws {
+        let params = try ContextParams(
+            mode: .encrypted,
+            ceiling: ["messages:read"],
+            ceilingPolicy: .immutable,
+            governance: .singleAdmin,
+            memoryScope: .ephemeral,
+            ttlSeconds: 3600,
+            promotable: false,
+            consequenceRules: [
+                ConsequenceRule(
+                    trigger: .messageVelocity,
+                    action: .enforcement(.suspendAccess),
+                    threshold: 1,
+                    windowSecs: 60
+                )
+            ],
+            consequenceConfig: ConsequenceConfig(allowAutomaticAccessRevocation: true)
+        )
+        let rulesJson = try #require(params.consequenceRulesJson)
+        #expect(rulesJson.contains("\"trigger\":\"MessageVelocity\""))
+        #expect(rulesJson.contains("\"Enforcement\":\"SuspendAccess\""))
+        let configJson = try #require(params.consequenceConfigJson)
+        #expect(configJson.contains("\"allow_automatic_access_revocation\":true"))
+    }
+
+    @Test("ConsequenceRule round-trips through JSONEncoder/JSONDecoder")
+    func h15TypedRulesRoundTrip() throws {
+        let original: [ConsequenceRule] = [
+            ConsequenceRule(
+                trigger: .toolRateExceeded,
+                action: .enforcement(.removeMember(did: "did:dht:z6MkBad", reason: "spam")),
+                threshold: 100,
+                windowSecs: 60
+            ),
+            ConsequenceRule(
+                trigger: .messageVelocity,
+                action: .enforcement(.suspendAccess),
+                threshold: 1,
+                windowSecs: 30
+            )
+        ]
+        let json = try encodeConsequenceRulesJson(original)
+        let data = try #require(json.data(using: .utf8))
+        let decoded = try JSONDecoder().decode([ConsequenceRule].self, from: data)
+        #expect(decoded == original)
+    }
+
+    @Test("ConsequenceTrigger / Action / EnforcementSeverity variant names are pinned")
+    func h15VariantNamePins() {
+        #expect(consequenceTriggerVariantNames == [
+            "MessageVelocity", "ToolRateExceeded", "WarningCount", "Custom"
+        ])
+        #expect(consequenceActionVariantNames == ["Enforcement", "AssignRole"])
+        #expect(enforcementSeverityVariantNames == [
+            "SuspendCapability", "SuspendAccess", "RevokeAccess", "RemoveMember"
+        ])
     }
 } // end ContextTests

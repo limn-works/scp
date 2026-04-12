@@ -339,25 +339,46 @@ impl SpendingCapability {
 }
 
 // ---------------------------------------------------------------------------
-// AND-composition check
+// Spending capability check — the spending side of AND-composition
 // ---------------------------------------------------------------------------
 
-/// Checks that a paid action has both an action UCAN and a spending UCAN.
+/// Validates the spending side of the AND-composition required by spec §19.5.
 ///
-/// This enforces AND-composition (spec section 19.5): a paid action requires
-/// BOTH the action capability (e.g., `messages:write`) AND a valid
-/// `SpendingCapability`. An agent with one but not the other cannot perform
-/// the paid action.
+/// Per spec §19.5, a paid action requires BOTH (a) an action capability
+/// (e.g., `messages:write`, `tool:invoke:*`, or a context-defined custom
+/// capability) AND (b) a valid `SpendingCapability`. The check is split
+/// across two layers of the runtime on purpose:
 ///
-/// An agent can still perform free actions in a paid context without a spending
-/// UCAN — only paid actions require AND-composition.
+/// 1. **Action capability** — verified UPSTREAM at the capability gate via
+///    `ContextRoleState::member_has_capability`. See the `MessagesWrite`
+///    check in `scp-runtime/src/context/manager/messaging.rs` (send path),
+///    and the `ToolInvoke` / `ToolInvokeAll` check in
+///    `scp-runtime/src/context/tools/invoke.rs` (tool path). A member whose
+///    role does not grant the required capability is rejected at the gate,
+///    before this function is ever called.
+///
+/// 2. **Spending capability** — verified HERE. When a spending UCAN is
+///    present, this function extracts the `SpendingCapability` from its
+///    `fct` field and validates:
+///    - `action_cost <= max_per_action`
+///    - The `SpendingCapability` structure is well-formed
+///    - Currency matches `context_currency` (via
+///      [`check_spending_capability_with_currency`])
+///
+/// This function deliberately does not accept an action UCAN. Delegated
+/// action UCANs are not currently wired end-to-end through the runtime;
+/// if added in the future, their validation belongs at the gate layer
+/// alongside the existing role-based capability checks, not here.
+///
+/// Cumulative `max_total` enforcement within the `time_window` is the
+/// responsibility of the caller's `BudgetTracker`, which maintains rolling
+/// spend records. This function validates the per-action structural limit
+/// only.
 ///
 /// # Arguments
 ///
-/// * `action_ucan` — The action UCAN (e.g., for `messages:write`). `None` if
-///   the agent has no action UCAN.
-/// * `spending_ucan` — The spending UCAN. `None` if the agent has no spending
-///   capability.
+/// * `spending_ucan` — The spending UCAN. `None` if the agent has no
+///   spending capability. MUST be `Some` for paid actions (`action_cost > 0`).
 /// * `action_cost` — The cost of the action. `Amount::ZERO` for free actions.
 /// * `action_description` — Human-readable description for error messages.
 ///
@@ -365,26 +386,84 @@ impl SpendingCapability {
 ///
 /// Returns [`SpendingError::SpendingCapabilityRequired`] if the action has a
 /// non-zero cost and no spending UCAN is provided.
-/// Returns [`UcanError::CapabilityNotGranted`] if no action UCAN is provided
-/// (regardless of cost).
-pub fn check_and_composition(
-    action_ucan: Option<&UcanToken>,
+/// Returns [`SpendingError::PerActionLimitExceeded`] if `action_cost`
+/// exceeds `max_per_action` from the spending capability.
+pub fn check_spending_capability(
     spending_ucan: Option<&UcanToken>,
     action_cost: Amount,
     action_description: &str,
 ) -> Result<(), SpendingError> {
-    // Action UCAN is always required (even for free actions in a context).
-    if action_ucan.is_none() {
-        return Err(SpendingError::Ucan(UcanError::CapabilityNotGranted(
-            format!("action UCAN required for: {action_description}"),
-        )));
-    }
-
     // Spending UCAN is required only for paid actions (cost > 0).
     if action_cost.0 > 0 && spending_ucan.is_none() {
         return Err(SpendingError::SpendingCapabilityRequired(format!(
             "paid action '{action_description}' costs {action_cost} but no spending UCAN provided"
         )));
+    }
+
+    // Free actions pass through without spending validation.
+    if action_cost.0 == 0 {
+        return Ok(());
+    }
+
+    // Validate spending capability fields from the UCAN's fct.
+    if let Some(spending) = spending_ucan {
+        let cap = SpendingCapability::from_ucan_token(spending)?;
+
+        // Per-action limit: action_cost must not exceed max_per_action.
+        if action_cost.0 > cap.max_per_action.0 {
+            return Err(SpendingError::PerActionLimitExceeded {
+                cost: action_cost,
+                max: cap.max_per_action,
+                currency: cap.currency,
+            });
+        }
+
+        // Note: max_total within time_window is enforced by the caller's
+        // BudgetTracker (rolling window tracking). This function validates
+        // the per-action structural limit only.
+    }
+
+    Ok(())
+}
+
+/// Extended spending-capability check with currency validation.
+///
+/// Like [`check_spending_capability`] but also verifies that the spending
+/// capability's currency matches the context's economic policy currency.
+///
+/// # Arguments
+///
+/// * `context_currency` — The currency from the context's economic policy.
+///   When `Some`, the spending UCAN's currency must match.
+///
+/// # Errors
+///
+/// Returns [`SpendingError`] if the spending-capability check fails or
+/// if the spending UCAN's currency does not match the context currency.
+///
+/// See [`check_spending_capability`] for other arguments and errors, and
+/// for the layer-split rationale (action-capability verification is the
+/// caller's responsibility at the gate layer).
+pub fn check_spending_capability_with_currency(
+    spending_ucan: Option<&UcanToken>,
+    action_cost: Amount,
+    action_description: &str,
+    context_currency: Option<CurrencyCode>,
+) -> Result<(), SpendingError> {
+    check_spending_capability(spending_ucan, action_cost, action_description)?;
+
+    // Currency validation: when the context has a currency, the spending
+    // UCAN must use the same currency.
+    if let (Some(expected), Some(spending)) = (context_currency, spending_ucan)
+        && action_cost.0 > 0
+    {
+        let cap = SpendingCapability::from_ucan_token(spending)?;
+        if cap.currency != expected {
+            return Err(SpendingError::CurrencyMismatch {
+                expected,
+                actual: cap.currency,
+            });
+        }
     }
 
     Ok(())
@@ -750,9 +829,24 @@ fn generate_spending_nonce(clock: &dyn Clock) -> String {
 // Validate spending UCAN
 // ---------------------------------------------------------------------------
 
-/// Validates a spending UCAN token for a specific context and action cost.
+/// Validates the spending-specific surface of a spending UCAN token (scope,
+/// 24-hour lifetime cap, capability extraction, attenuation against an
+/// optional parent).
 ///
-/// Performs spending-specific validation on top of standard UCAN validation:
+/// **DO NOT CALL THIS DIRECTLY for enforcement.** It performs none of the
+/// cryptographic checks that make a UCAN trustworthy: no signature
+/// verification, no chain walk, no revocation lookup, no nonce replay
+/// guard, no expiry check, no key-scope check, no `iss == actor_did`
+/// binding. A token can satisfy every assertion this function makes while
+/// being entirely fabricated by an attacker.
+///
+/// The combined entry point [`validate_spending_ucan_signed`] runs the full
+/// 11-step UCAN validation pipeline (via `validate.rs` helpers) **before**
+/// delegating here. That is the only public way to validate a spending UCAN.
+/// This function is restricted to `pub(crate)` so the misuse-prone partial
+/// API cannot escape the crate.
+///
+/// # Steps performed by this function
 ///
 /// 1. Verifies the token contains a spending attestation (`scp:spending:...`).
 /// 2. Extracts the [`SpendingCapability`] from the token's facts.
@@ -760,18 +854,15 @@ fn generate_spending_nonce(clock: &dyn Clock) -> String {
 /// 4. Verifies the token expiry does not exceed 24 hours.
 /// 5. If `parent_capability` is provided, validates attenuation.
 ///
-/// Standard UCAN validation (signature, chain, revocation, nonce) should be
-/// performed separately via [`super::validate::validate_ucan`].
-///
 /// # Key scope validation
 ///
 /// This function does **not** validate `scp_key_scope` from the token's facts.
 /// Key scope validation (verifying that the `kid` header matches the signing
-/// key and that `scp_key_scope` is consistent) is handled by the parent UCAN
-/// validator (SCP-AB-012/SCP-AB-013 steps 5a/5b). This function validates
-/// spending-specific fields only — duplicating key scope checks here would
-/// violate the single-responsibility split between spending validation and
-/// general UCAN validation.
+/// key and that `scp_key_scope` is consistent) is handled by
+/// [`validate_spending_ucan_signed`] via the shared `validate.rs` helpers
+/// (SCP-AB-012/SCP-AB-013 steps 5a/5b). Duplicating key scope checks here
+/// would violate the single-responsibility split between spending validation
+/// and general UCAN validation.
 ///
 /// # Arguments
 ///
@@ -783,7 +874,7 @@ fn generate_spending_nonce(clock: &dyn Clock) -> String {
 /// # Errors
 ///
 /// Returns [`SpendingError`] variants for each validation failure.
-pub fn validate_spending_ucan(
+pub(crate) fn validate_spending_ucan(
     token: &UcanToken,
     context_id: &str,
     parent_capability: Option<&SpendingCapability>,
@@ -836,6 +927,222 @@ pub fn validate_spending_ucan(
     }
 
     Ok(capability)
+}
+
+// ---------------------------------------------------------------------------
+// validate_spending_ucan_signed — combined cryptographic + spending validation
+// ---------------------------------------------------------------------------
+
+/// Inputs that bind a spending UCAN to its presenting actor and the
+/// runtime state needed to verify it cryptographically.
+///
+/// Grouped into a struct so the public entry point keeps a single positional
+/// argument and survives future additions (key-scope override, attestation
+/// witness, etc.) without churn at every call site. All fields are
+/// references so the struct is `Copy`-cheap; passing it by value at the
+/// call site avoids a needless borrow ceremony.
+#[derive(Clone, Copy)]
+pub struct SpendingUcanCheck<'a> {
+    /// The spending UCAN token to validate.
+    pub token: &'a UcanToken,
+    /// The target context the paid action runs in.
+    pub context_id: &'a str,
+    /// The DID the runtime is about to charge. The token's `iss` and `aud`
+    /// MUST equal this string — that is the binding that prevents an
+    /// attacker from replaying or fabricating someone else's spending UCAN.
+    pub actor_did: &'a str,
+    /// Optional parent spending capability for sub-delegated spending UCANs.
+    /// `None` for the (overwhelmingly common) root spending UCAN case.
+    pub parent_capability: Option<&'a SpendingCapability>,
+}
+
+/// Validates a spending UCAN end-to-end: signature, expiry, key scope,
+/// revocation, nonce, scope, and the spending-specific facts.
+///
+/// This is the **only** entry point that exists for runtime enforcement of
+/// spending UCANs. The partial helper [`validate_spending_ucan`] is now
+/// `pub(crate)` and unreachable from outside the crate; bridges and SDKs
+/// must call this function (or a wrapper around it) instead.
+///
+/// # Validation pipeline
+///
+/// In order:
+///
+/// 1. **Actor binding** — `token.payload.iss == token.payload.aud == actor_did`.
+///    Spending UCANs are self-delegations under the shared-DID model
+///    (ADR-039), so both `iss` and `aud` must equal the actor whose budget
+///    will be debited. This check rejects forged-signer attacks where an
+///    attacker presents `iss == "did:victim"` to drain a victim's budget.
+/// 2. **Key scope** — Steps 5a/5b from `validate_ucan`: self-delegation
+///    requires `fct.scp_key_scope` and the `kid` header must match. This is
+///    what guarantees the token was signed by the agent verification method
+///    that the actor explicitly authorized (typically `#agent`).
+/// 3. **Delegation chain** — If `prf` is non-empty, walks every parent
+///    UCAN, verifying signatures, expiry, revocation, key-scope, and
+///    `aud`/`iss` linkage. The root issuer must be the actor (spending
+///    UCANs cannot be delegated from elsewhere into an actor's budget).
+/// 4. **Signature** — Verifies the Ed25519 signature with kid-aware DID
+///    resolution (`resolve_public_key_by_kid` for `#agent`).
+/// 5. **Expiry** — `nbf <= now < exp`, with the configured clock-skew
+///    tolerance. Rejects tokens whose `exp` is more than 24 hours away.
+/// 6. **Revocation** — Computes the SHA-256 revocation CID over the
+///    encoded JWT and consults the revocation checker.
+/// 7. **Nonce** — Reserves the nonce in the per-context tracker so a
+///    replay of the same UCAN is rejected on the second presentation.
+/// 8. **Spending facts** — Delegates to [`validate_spending_ucan`] for
+///    scope coverage, lifetime cap, capability extraction, and parent
+///    attenuation.
+///
+/// # Why a combined function instead of `validate_ucan`
+///
+/// The general `validate_ucan` pipeline parses every attestation as a
+/// `scp:ctx:{id}/{resource}:{action}` capability URI. Spending UCANs carry
+/// `scp:spending:{id}` URIs, which are not parseable as `CapabilityUri`,
+/// so calling `validate_ucan` directly fails fail-closed at step 6 with
+/// `MalformedToken`. This function reuses the same `validate.rs` helpers
+/// for the cryptographic checks (signature, chain, expiry, key scope) and
+/// then runs the spending-specific scope/cap/attenuation logic instead.
+///
+/// # Errors
+///
+/// Returns [`SpendingError`] variants for each validation failure. UCAN-level
+/// failures (signature, key scope, expiry, nonce, revocation, delegation
+/// chain) are surfaced via the [`SpendingError::Ucan`] variant.
+///
+/// # Closes
+///
+/// PR #1606 finding C1: spending UCANs were never cryptographically
+/// validated on the `send_message`/`join_context` paths.
+pub fn validate_spending_ucan_signed<D, N, R, P>(
+    check: SpendingUcanCheck<'_>,
+    did_resolver: &D,
+    nonce_tracker: &mut N,
+    revocation_checker: &R,
+    proof_resolver: &P,
+    clock_skew_tolerance_secs: u64,
+    clock: &dyn Clock,
+) -> Result<SpendingCapability, SpendingError>
+where
+    D: super::validate::DidResolver,
+    N: super::validate::NonceTracker,
+    R: super::validate::RevocationChecker,
+    P: super::validate::ProofResolver,
+{
+    let SpendingUcanCheck {
+        token,
+        context_id,
+        actor_did,
+        parent_capability,
+    } = check;
+
+    // Validate the token's parsed JWT header (alg/typ/ucv).
+    token.header.validate()?;
+
+    // Step A: Actor binding. Spending UCANs are self-delegations: the
+    // issuer and audience MUST both equal the actor whose budget the
+    // runtime is about to debit. This is the single most important check
+    // for closing C1 — without it an attacker can present `iss == victim`
+    // and forge a spending UCAN signed by the attacker's own key.
+    if token.payload.iss != actor_did {
+        return Err(SpendingError::Ucan(UcanError::InvalidIssuer {
+            expected: actor_did.to_owned(),
+            actual: token.payload.iss.clone(),
+        }));
+    }
+    if token.payload.aud != actor_did {
+        return Err(SpendingError::Ucan(UcanError::AudienceMismatch {
+            expected: actor_did.to_owned(),
+            actual: token.payload.aud.clone(),
+        }));
+    }
+
+    // Step B: Key scope. Rejects self-delegation without `scp_key_scope`
+    // and rejects `kid`/`scp_key_scope` mismatches (ADR-039 SCP-AB-012/013).
+    super::validate::validate_key_scope(token)?;
+
+    // Step C: Delegation chain. For root spending UCANs (`prf` empty)
+    // this returns `iss` immediately. For sub-delegated spending UCANs
+    // it walks the chain, verifying every parent's signature, expiry,
+    // revocation, key scope, and aud/iss linkage. The returned root
+    // issuer is then bound to the actor — sub-delegation cannot smuggle
+    // in a different root.
+    let root_issuer = super::validate::verify_delegation_chain(
+        token,
+        did_resolver,
+        proof_resolver,
+        revocation_checker,
+        clock_skew_tolerance_secs,
+        clock,
+    )?;
+    if root_issuer != actor_did {
+        return Err(SpendingError::Ucan(UcanError::InvalidIssuer {
+            expected: actor_did.to_owned(),
+            actual: root_issuer,
+        }));
+    }
+
+    // Step D: Signature. kid-aware Ed25519 verification — when the header
+    // includes `kid: "#agent"` (the standard for spending UCANs) the
+    // verifier consults the agent verification method on the issuer's
+    // DID document.
+    super::validate::verify_signature(token, did_resolver)?;
+
+    // Step E: Expiry / not-before / 24-hour ceiling, with clock skew
+    // tolerance for NTP drift.
+    super::validate::verify_expiry(token, clock_skew_tolerance_secs, clock)?;
+
+    // Step F: Revocation. Computes the SHA-256 CID of the encoded JWT
+    // (matching the format produced by `revoke_ucan`) and consults the
+    // revocation checker.
+    let revocation_cid = super::revoke::compute_revocation_cid(&token.encoded);
+    if revocation_checker.is_revoked(&revocation_cid) {
+        return Err(SpendingError::Ucan(UcanError::TokenRevoked(revocation_cid)));
+    }
+
+    // Step G: Nonce probe (read-only). Rejects format/freshness violations and
+    // replays WITHOUT recording the nonce. The nonce is committed only after
+    // all downstream gates — including the budget check — pass, via a
+    // separate `commit_spending_ucan_nonce` call (H11 split-phase). This
+    // prevents nonce-burn DoS: a budget-rejected request must not exhaust
+    // tracker capacity.
+    nonce_tracker.check_replay(&token.payload.nnc, token.payload.exp)?;
+
+    // Step H: Spending-specific validation. Delegates to the partial
+    // helper, which is now `pub(crate)` and unreachable from outside the
+    // crate. Validates the spending attestation scope, lifetime cap,
+    // capability extraction, and (if a parent is supplied) attenuation.
+    validate_spending_ucan(token, context_id, parent_capability, clock)
+}
+
+/// Commits the nonce from a previously validated spending UCAN into the
+/// nonce tracker.
+///
+/// This is the second phase of the H11 split-phase nonce protocol.
+/// [`validate_spending_ucan_signed`] calls
+/// [`check_replay`](super::validate::NonceTracker::check_replay) — a
+/// read-only probe that rejects replays and format/freshness violations but
+/// does NOT record the nonce. After all downstream gates pass (including the
+/// budget check), the caller MUST invoke `commit_spending_ucan_nonce` to
+/// durably record the nonce and prevent future replays.
+///
+/// Splitting the phases prevents nonce-burn denial-of-service: a valid UCAN
+/// that fails the budget gate cannot exhaust tracker capacity by consuming a
+/// nonce slot.
+///
+/// # Errors
+///
+/// Returns [`SpendingError`] if the defensive re-check inside `record` fails
+/// (e.g., a concurrent caller raced to record the same nonce).
+pub fn commit_spending_ucan_nonce<N>(
+    token: &UcanToken,
+    nonce_tracker: &mut N,
+) -> Result<(), SpendingError>
+where
+    N: super::validate::NonceTracker,
+{
+    nonce_tracker
+        .record(&token.payload.nnc, token.payload.exp)
+        .map_err(SpendingError::Ucan)
 }
 
 // ---------------------------------------------------------------------------
@@ -1060,10 +1367,17 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // AND-composition
+    // Spending capability check
     // -----------------------------------------------------------------------
 
-    fn dummy_token() -> UcanToken {
+    /// Dummy token with a valid `SpendingCapability` in the fct field.
+    fn dummy_spending_token() -> UcanToken {
+        let cap = sample_capability();
+        let mut fct = serde_json::Map::new();
+        fct.insert(
+            SPENDING_CAPABILITY_FACT_KEY.to_owned(),
+            cap.to_fact_value().unwrap(),
+        );
         UcanToken {
             header: super::super::UcanHeader::new(),
             payload: UcanPayload {
@@ -1074,7 +1388,7 @@ mod tests {
                 nnc: "1699999000000-aabbccdd11223344".to_owned(),
                 att: vec![],
                 prf: vec![],
-                fct: None,
+                fct: Some(serde_json::Value::Object(fct)),
             },
             signature: vec![0u8; 64],
             encoded: String::new(),
@@ -1082,48 +1396,28 @@ mod tests {
     }
 
     #[test]
-    fn and_composition_both_present_paid_action() {
-        let action = dummy_token();
-        let spending = dummy_token();
-        let result =
-            check_and_composition(Some(&action), Some(&spending), Amount(100), "send message");
+    fn check_spending_capability_paid_action_with_spending_succeeds() {
+        // Action capability is assumed verified at the gate layer per §19.5
+        // (see docstring). With a valid spending UCAN and cost within
+        // max_per_action, the check succeeds.
+        let spending = dummy_spending_token();
+        let result = check_spending_capability(Some(&spending), Amount(100), "send message");
         assert!(result.is_ok());
     }
 
     #[test]
-    fn and_composition_free_action_no_spending() {
-        let action = dummy_token();
-        let result = check_and_composition(Some(&action), None, Amount::ZERO, "send free message");
+    fn check_spending_capability_free_action_no_spending_succeeds() {
+        // Free actions (cost == 0) pass without any spending UCAN.
+        let result = check_spending_capability(None, Amount::ZERO, "send free message");
         assert!(result.is_ok());
     }
 
     #[test]
-    fn and_composition_paid_action_no_spending() {
-        let action = dummy_token();
-        let result = check_and_composition(Some(&action), None, Amount(100), "send message");
+    fn check_spending_capability_paid_action_no_spending_rejected() {
+        // Paid action (cost > 0) with no spending UCAN must be rejected.
+        let result = check_spending_capability(None, Amount(100), "send message");
         let err = result.unwrap_err();
         assert!(matches!(err, SpendingError::SpendingCapabilityRequired(_)));
-    }
-
-    #[test]
-    fn and_composition_no_action_ucan() {
-        let spending = dummy_token();
-        let result = check_and_composition(None, Some(&spending), Amount(100), "send message");
-        let err = result.unwrap_err();
-        assert!(matches!(
-            err,
-            SpendingError::Ucan(UcanError::CapabilityNotGranted(_))
-        ));
-    }
-
-    #[test]
-    fn and_composition_no_action_no_spending() {
-        let result = check_and_composition(None, None, Amount(100), "send message");
-        let err = result.unwrap_err();
-        assert!(matches!(
-            err,
-            SpendingError::Ucan(UcanError::CapabilityNotGranted(_))
-        ));
     }
 
     // -----------------------------------------------------------------------

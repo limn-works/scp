@@ -135,6 +135,21 @@ impl MemberBudgetTracker {
     pub fn total_spent(&self, did: &DID) -> Amount {
         self.spent.get(did).copied().unwrap_or(Amount::new(0))
     }
+
+    /// Reverses a previous spend by decrementing the spent counter.
+    ///
+    /// Used to roll back budget deductions on action failure. Unlike
+    /// [`MemberBudgetTracker::grant`] (which increases the *limit*), this decrements
+    /// the *spent* counter, preserving the original limit and giving an
+    /// accurate `total_spent` value.
+    ///
+    /// Saturates at zero -- reversing more than was spent is a no-op on
+    /// the underflow portion.
+    pub fn reverse_spend(&mut self, did: &DID, amount: Amount) {
+        if let Some(current) = self.spent.get_mut(did) {
+            *current = current.saturating_sub(amount);
+        }
+    }
 }
 
 impl Default for MemberBudgetTracker {
@@ -252,6 +267,33 @@ mod tests {
         assert!(matches!(err, BudgetError::BudgetExceeded { .. }));
         // Original remaining unchanged
         assert_eq!(tracker.remaining(&did), Amount::new(500));
+    }
+
+    #[test]
+    fn test_reverse_spend_decrements_spent() {
+        let mut tracker = MemberBudgetTracker::new();
+        let did = test_did("Alice");
+        tracker.grant(&did, Amount::new(1000));
+        tracker.record_spend(&did, Amount::new(400)).unwrap();
+        assert_eq!(tracker.total_spent(&did), Amount::new(400));
+        assert_eq!(tracker.remaining(&did), Amount::new(600));
+
+        // Reverse 150 of the 400 spent.
+        tracker.reverse_spend(&did, Amount::new(150));
+        assert_eq!(tracker.total_spent(&did), Amount::new(250));
+        assert_eq!(tracker.remaining(&did), Amount::new(750));
+        // Limit is unchanged.
+        assert_eq!(tracker.limit(&did), Amount::new(1000));
+
+        // Reverse more than was spent saturates at zero.
+        tracker.reverse_spend(&did, Amount::new(9999));
+        assert_eq!(tracker.total_spent(&did), Amount::new(0));
+        assert_eq!(tracker.remaining(&did), Amount::new(1000));
+
+        // Reverse on unknown DID is a no-op (no panic).
+        let unknown = test_did("Unknown");
+        tracker.reverse_spend(&unknown, Amount::new(100));
+        assert_eq!(tracker.total_spent(&unknown), Amount::new(0));
     }
 
     #[test]

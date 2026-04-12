@@ -318,9 +318,12 @@ mod tests {
     /// consequence rules — verifying the aggregated `TrustInput` output.
     #[test]
     fn aggregate_pipeline_with_populated_store() {
+        use scp_core::context::roles::Capability;
         use scp_core::trust::ConsequenceRule;
         use scp_core::trust::aggregate::{AggregationContext, AttestationCache};
-        use scp_core::trust::consequence::{ConsequenceAction, ConsequenceTrigger};
+        use scp_core::trust::consequence::{
+            ConsequenceAction, ConsequenceTrigger, EnforcementSeverity,
+        };
         use scp_identity::cache::TestClock;
 
         let context_id = "ctx-integration";
@@ -359,7 +362,9 @@ mod tests {
 
         let consequence_rules = vec![ConsequenceRule {
             trigger: ConsequenceTrigger::MessageVelocity,
-            action: ConsequenceAction::CapabilitySuspension(vec!["messages:write".to_owned()]),
+            action: ConsequenceAction::Enforcement(EnforcementSeverity::SuspendCapability {
+                capabilities: vec![Capability::MessagesWrite],
+            }),
             threshold: 100,
             window: std::time::Duration::from_secs(3600),
         }];

@@ -58,14 +58,14 @@ pub mod context {
     pub use scp_runtime::context::manager;
     pub use scp_runtime::context::policy;
     pub use scp_runtime::context::providers;
-    pub use scp_runtime::context::standing;
     pub use scp_runtime::context::ttl;
     pub use scp_runtime::context::ttl::{
         ExtensionConsentMode, TtlExtensionProposal, check_ttl, consent_mode_for_member_count,
     };
     // Key runtime types re-exported at this level.
     pub use scp_protocol::context::builder::{
-        AddMemberOutput, ContextCreationError, ContextCryptoProvider,
+        AddMemberOutput, AdvanceEpochOutput, ContextCreationError, ContextCryptoProvider,
+        MANAGEMENT_MSG_MAGIC, MAX_MANAGEMENT_PAYLOAD_SIZE, RemoveMemberOutput,
     };
     pub use scp_runtime::context::ContextHandle;
     pub use scp_runtime::context::builder::{
@@ -118,7 +118,8 @@ pub mod trust {
     };
     pub use scp_protocol::trust::consequence::{
         ConsequenceAction, ConsequenceEvidence, ConsequenceRule, ConsequenceTrigger,
-        TriggeredConsequence, evaluate_consequence_rules,
+        ConsequenceValidationError, EnforcementSeverity, TriggeredConsequence,
+        evaluate_consequence_rules,
     };
     pub use scp_protocol::trust::participation::{
         PARTICIPATION_STATEMENTS_SERVICE_TYPE, ParticipationFact, ParticipationProfile,
@@ -144,7 +145,6 @@ pub mod identity {
 pub mod economy {
     pub use scp_protocol::economy::*;
     // Re-export all items from each submodule at this level.
-    pub use scp_protocol::economy::antispam::*;
     pub use scp_protocol::economy::budget::*;
     pub use scp_protocol::economy::estimate::*;
     pub use scp_protocol::economy::policy::*;

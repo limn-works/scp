@@ -2,10 +2,10 @@
 
 use super::{
     BlockResult, BroadcastAdmission, BroadcastContent, BroadcastContext, BroadcastEnvelope,
-    BuildHasher, ContextError, ContextEvent, ContextManager, DID, DidResolver, KeyRequestDecision,
-    NonceTracker, ProofResolver, RevocationChecker, SubscriptionResult, UcanToken,
-    UnsubscribeResult, ValidationContext, context_id_to_bytes, instrument, require_active,
-    serialize_broadcast_content,
+    BuildHasher, Capability, ContextError, ContextEvent, ContextManager, DID, DidResolver,
+    KeyRequestDecision, NonceTracker, ProofResolver, RevocationChecker, SubscriptionResult,
+    UcanToken, UnsubscribeResult, ValidationContext, context_id_to_bytes, instrument,
+    require_active, serialize_broadcast_content,
 };
 
 #[allow(clippy::significant_drop_tightening)]
@@ -100,8 +100,11 @@ impl ContextManager {
         }
 
         // Append event to persistent event log.
-        self.event_log
-            .append_context_event(&context_id_bytes, "MemberJoined")?;
+        self.event_log.append_context_event(
+            &context_id_bytes,
+            "MemberJoined",
+            subscriber_did.as_ref(),
+        )?;
 
         Ok(result)
     }
@@ -176,8 +179,11 @@ impl ContextManager {
             }
         }
 
-        self.event_log
-            .append_context_event(&context_id_bytes, "MemberLeft")?;
+        self.event_log.append_context_event(
+            &context_id_bytes,
+            "MemberLeft",
+            subscriber_did.as_ref(),
+        )?;
 
         Ok(result)
     }
@@ -216,10 +222,21 @@ impl ContextManager {
 
             require_active(&ctx.handle)?;
 
-            // Governance-level write revocation check (§9.17, ADR-038).
-            if ctx.access.write_revoked_members.contains(author_did) {
+            // Suspension-aware capability check (§9.17, ADR-038). In
+            // broadcast contexts, authors may be registered with the
+            // BroadcastContext without being members of the role_state, so
+            // we check the suspension overlay directly: only members whose
+            // MessagesWrite capability has been explicitly suspended via
+            // governance Revoke are blocked here. The downstream
+            // `bc.publish` enforces author registration.
+            if ctx
+                .role_state
+                .suspended_capabilities
+                .get(author_did.as_ref())
+                .is_some_and(|s| s.contains(&Capability::MessagesWrite))
+            {
                 return Err(ContextError::PermissionDenied(format!(
-                    "write access has been revoked for {author_did}"
+                    "write access has been suspended for {author_did}"
                 )));
             }
 
@@ -293,8 +310,11 @@ impl ContextManager {
             .send_message(&context_id_bytes, &envelope_bytes)?;
 
         // Append event to persistent event log.
-        self.event_log
-            .append_context_event(&context_id_bytes, "MessageSent")?;
+        self.event_log.append_context_event(
+            &context_id_bytes,
+            "MessageSent",
+            author_did.as_ref(),
+        )?;
 
         Ok(envelope)
     }
@@ -393,8 +413,11 @@ impl ContextManager {
             self.persist_broadcast_snapshot(context_id, snapshot);
         }
 
-        self.event_log
-            .append_context_event(&context_id_bytes, "MemberBlocked")?;
+        self.event_log.append_context_event(
+            &context_id_bytes,
+            "MemberBlocked",
+            author_did.as_ref(),
+        )?;
 
         Ok(result)
     }
@@ -460,8 +483,11 @@ impl ContextManager {
             self.persist_broadcast_snapshot(context_id, snapshot);
         }
 
-        self.event_log
-            .append_context_event(&context_id_bytes, "MemberUnblocked")?;
+        self.event_log.append_context_event(
+            &context_id_bytes,
+            "MemberUnblocked",
+            author_did.as_ref(),
+        )?;
 
         Ok(())
     }

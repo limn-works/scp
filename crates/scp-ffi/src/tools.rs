@@ -315,23 +315,29 @@ fn validate_tool_ucan(
     Ok(())
 }
 
-/// Invokes a tool within an SCP context.
+/// Invokes a tool within an SCP context, fully wired through the
+/// `ContextManager::invoke_tool_with_economy` pipeline.
+///
+/// This is the SINGLE entry point for tool invocation through the `PyO3`
+/// bridge. Every paid-action concern — per-invocation pricing, spending
+/// UCAN AND-composition (§19.5), per-DID velocity tracking, escalation
+/// (§19.7), budget enforcement, payment escrow, and the
+/// `ToolEconomyTicket` rollback discipline — is enforced by the runtime,
+/// not by the bridge. The Matrix-style hard rate limit is consumed by
+/// the wrapper itself in Phase 1 (defense-in-depth), so the previous
+/// bridge-side `try_consume_hard_rate_limit_*` calls are no longer
+/// needed.
 ///
 /// Validates the UCAN token for tool invocation authorization before
 /// dispatching. The UCAN must contain a `tool_invoke:{tool_id}` or
 /// `tool_invoke:*` capability scoped to the context.
 ///
 /// Dispatches to a registered tool handler if one exists (registered via
-/// [`crate::runtime::register_tool_handler`]). Validates input against the
-/// tool's input schema before dispatch, and output against the output
-/// schema after. Constructs a [`scp_core::context::tools::ToolInvokedEvent`]
-/// for provenance (matching the scp-core `invoke_tool` contract). Merkle
-/// event log append requires a signed `Event` with key material — that
-/// happens at the transport layer which has signing access.
-///
-/// If no handler is registered, falls back to returning validated input
-/// with metadata (schema-only mode), identical to
-/// `FfiBridgeProvider::invoke_tool` in `mcp.rs`.
+/// [`crate::runtime::register_tool_handler`]). The runtime validates
+/// input/output schemas and computes the input/output hashes for the
+/// `ToolInvokedEvent`. If no handler is registered, falls back to
+/// returning validated input with metadata (schema-only mode), identical
+/// to `FfiBridgeProvider::invoke_tool` in `mcp.rs`.
 ///
 /// # Arguments
 ///
@@ -344,6 +350,12 @@ fn validate_tool_ucan(
 /// * `ucan_token` — JWT-encoded UCAN token authorizing the invocation.
 ///   Must contain `tool_invoke:{tool_id}` or `tool_invoke:*` capability.
 ///   Validated using the full 11-step ADR-016 pipeline.
+/// * `spending_ucan` — Optional JWT-encoded spending UCAN
+///   (`SpendingCapability`) for paid tool invocations. Required when an
+///   `EconomicPolicy` priced the tool above zero (§19.5
+///   AND-composition). May be `None` for free tools.
+/// * `proof_tokens` — Optional encoded parent UCAN tokens for delegation
+///   chain traversal (ADR-016 step 3).
 ///
 /// # Returns
 ///
@@ -353,17 +365,20 @@ fn validate_tool_ucan(
 ///
 /// Raises `UcanError` if the UCAN token is invalid, expired, revoked,
 /// or lacks the required tool invocation capability.
-/// Raises `ContextError` if the context is not connected, the tool is
-/// not found, input validation fails, output validation fails, or the
-/// tool handler itself fails.
+/// Raises `ContextError` (with embedded `SCP-ECON-12010` /
+/// `SCP-ECON-12061` / `SCP-ECON-12090` / tool-invocation codes) if the
+/// economy pre-check, budget, payment escrow, hard rate limit, or
+/// underlying tool dispatch fails. Callers should consult `.code` rather
+/// than string-matching `.message`.
 ///
 /// See ADR-013 §4: `py_tool_invoke(handle, tool_id, input, identity) -> PyObject`.
 /// See SCP-212 for the handler registration and dispatch design.
-/// See spec §6.2, §8, ADR-016, and issue #319 for UCAN enforcement.
+/// See spec §6.2, §8, §19.5, §19.7, ADR-016, and issue #319.
 #[pyfunction]
 #[pyo3(name = "tool_invoke")]
-#[pyo3(signature = (context_id, tool_id, input, identity_did, ucan_token, proof_tokens=None))]
+#[pyo3(signature = (context_id, tool_id, input, identity_did, ucan_token, proof_tokens=None, spending_ucan=None))]
 #[allow(clippy::needless_pass_by_value)] // PyO3 requires owned Option<Vec<String>>.
+#[allow(clippy::too_many_arguments)] // Bridge mirrors the runtime's economy entry point.
 pub fn py_tool_invoke(
     py: Python<'_>,
     context_id: &str,
@@ -372,21 +387,28 @@ pub fn py_tool_invoke(
     identity_did: &str,
     ucan_token: &str,
     proof_tokens: Option<Vec<String>>,
+    spending_ucan: Option<&str>,
 ) -> PyResult<PyObject> {
     validate::validate_context_id(context_id)?;
     validate::validate_tool_id(tool_id)?;
     validate::validate_did(identity_did)?;
     validate::validate_ucan_token(ucan_token)?;
+    if let Some(jwt) = spending_ucan {
+        validate::validate_ucan_token(jwt)?;
+    }
     if let Some(ref tokens) = proof_tokens {
         for t in tokens {
             validate::validate_ucan_token(t)?;
         }
     }
     let input_json = py_dict_to_json(input)?;
-    let start = std::time::Instant::now();
 
     // Primary authorization: UCAN token validation via the full 11-step
-    // ADR-016 pipeline. See spec §6.2, §8, ADR-016, and issue #319.
+    // ADR-016 pipeline. This stays at the bridge layer because it
+    // depends on bridge-owned per-context UCAN state (revocation list,
+    // nonce tracker, capability ceiling, proof resolver). The runtime
+    // wrapper does NOT re-validate the action UCAN — it enforces the
+    // economy/budget/spending side. See spec §6.2, §8, ADR-016, #319.
     validate_tool_ucan(
         context_id,
         tool_id,
@@ -395,92 +417,102 @@ pub fn py_tool_invoke(
         proof_tokens.as_ref(),
     )?;
 
-    // Validates tool existence, input schema, capability, dispatches to handler,
-    // validates output schema, and builds a ToolInvokedEvent for provenance.
-    // Mirrors the dispatch logic in FfiBridgeProvider::invoke_tool (mcp.rs).
-    let output_json = crate::runtime::with_context(context_id, |rt| {
-        let registration = rt.tool_registry.get(tool_id).ok_or_else(|| {
-            ScpPyError::context(format!(
-                "tool '{tool_id}' not found in context '{context_id}'"
-            ))
-        })?;
-
-        // Validate input against the tool's input schema.
-        scp_core::context::tools::validate_value_against_schema(
-            &input_json,
-            &registration.schema.input_schema,
-        )
-        .map_err(|e| ScpPyError::validation(format!("input validation failed: {e}")))?;
-
-        // Defense-in-depth: check role-state capabilities in addition to the
-        // UCAN layer. See §7.2 and ADR-010 for the dual-check design.
-        if !scp_core::context::tools::has_tool_invoke_capability(
-            &rt.role_state,
-            identity_did,
-            tool_id,
-        ) {
-            return Err(ScpPyError::ucan(format!(
-                "invoker '{identity_did}' does not have ToolInvoke capability for '{tool_id}'"
-            )));
-        }
-
-        // Dispatch to registered handler if available.
-        let output = if let Some(handler) = rt.tool_handlers.get(tool_id) {
-            let handler = handler.clone();
-            let out = handler(input_json.clone()).map_err(|e| {
-                ScpPyError::context(format!("tool handler for '{tool_id}' failed: {e}"))
-            })?;
-
-            // Validate output against the tool's output schema (defense-in-depth).
-            scp_core::context::tools::validate_value_against_schema(
-                &out,
-                &registration.schema.output_schema,
-            )
-            .map_err(|msg| {
-                ScpPyError::validation(format!(
-                    "output validation failed for tool '{tool_id}': {msg}"
-                ))
-            })?;
-
-            out
-        } else {
-            // No handler registered — fall back to echo mode with metadata.
-            serde_json::json!({
-                "tool": tool_id,
-                "context": context_id,
-                "status": "validated",
-                "input_valid": true,
-                "validated_input": input_json,
+    // Parse the optional spending UCAN JWT (§19.5 AND-composition). We
+    // parse it once here so an invalid JWT surfaces as a clean
+    // `SCP-ECON-12061` before the manager call. Mirrors `py_context_send`.
+    let spending_ucan_token = spending_ucan
+        .map(|jwt| {
+            scp_core::crypto::ucan::validate::parse_ucan(jwt).map_err(|e| {
+                ScpPyError::ContextError {
+                    message: format!("invalid spending UCAN: {e}"),
+                    code: "SCP-ECON-12061".to_owned(),
+                }
             })
-        };
+        })
+        .transpose()?;
 
-        // Build a ToolInvokedEvent for provenance. Matches scp-core invoke_tool
-        // contract: the caller (transport layer) is responsible for signing and
-        // appending to the Merkle event log.
-        #[allow(clippy::cast_possible_truncation)]
-        let elapsed_ms = {
-            let millis = start.elapsed().as_millis();
-            if millis > u128::from(u64::MAX) {
-                u64::MAX
-            } else {
-                millis as u64
-            }
-        };
-        let _event = scp_core::context::tools::ToolInvokedEvent {
-            request_id: uuid::Uuid::new_v4().to_string(),
-            tool_id: tool_id.to_owned(),
-            invoker_did: identity_did.to_owned().into(),
-            status: scp_core::context::tools::ToolStatus::Success,
-            execution_time_ms: elapsed_ms,
-            input_hash: scp_core::context::tools::sha256_json(&input_json),
-            output_hash: Some(scp_core::context::tools::sha256_json(&output)),
-            cost: None,
-        };
-
-        Ok(output)
+    // Snapshot the bridge-owned tool registry and (optionally) the
+    // registered handler closure BEFORE entering the runtime call. The
+    // runtime requires a `&ToolRegistry` so we clone the registry once
+    // (cheap — Vec of registrations); the handler is an `Arc<dyn Fn>`
+    // so cloning is a refcount bump. Doing this OUTSIDE the runtime
+    // call keeps the bridge-side DashMap shard lock acquisition split
+    // from the runtime's `contexts` mutex, matching the lock-split
+    // discipline in `mcp.rs`.
+    let ctx_id_owned = context_id.to_owned();
+    let tool_id_owned = tool_id.to_owned();
+    let identity_did_owned = identity_did.to_owned();
+    let (registry, handler) = crate::runtime::with_context(context_id, |rt| {
+        Ok((
+            rt.tool_registry.clone(),
+            rt.tool_handlers.get(tool_id).cloned(),
+        ))
     })?;
 
-    json_to_py_dict(py, &output_json)
+    // Build the executor closure. The runtime invokes the executor in
+    // Phase 2 of `invoke_tool_with_economy` WITHOUT holding the
+    // `contexts` mutex. The closure dispatches to a registered Python
+    // handler when present and falls back to schema-only echo mode
+    // otherwise (matching the prior PyO3 behavior).
+    let ctx_id_for_executor = ctx_id_owned.clone();
+    let tool_id_for_executor = tool_id_owned.clone();
+    let identity_did_for_executor = identity_did_owned.clone();
+    let executor = move |input: serde_json::Value| {
+        let handler = handler.clone();
+        let input_for_echo = input.clone();
+        async move {
+            handler.map_or_else(
+                || {
+                    Ok(serde_json::json!({
+                        "tool": tool_id_for_executor,
+                        "context": ctx_id_for_executor,
+                        "status": "validated",
+                        "input_valid": true,
+                        "invoker_did": identity_did_for_executor,
+                        "validated_input": input_for_echo,
+                    }))
+                },
+                |h| {
+                    h(input).map_err(|e| {
+                        format!("tool handler for '{tool_id_for_executor}' failed: {e}")
+                    })
+                },
+            )
+        }
+    };
+
+    // Dispatch to the runtime via the global tokio runtime. PyO3 calls
+    // are sync; the Python SDK wrapper invokes us via `asyncio.to_thread`
+    // so we are NOT inside a tokio runtime context — `block_on` on the
+    // multi-thread global runtime is safe (matches `py_context_send`).
+    let manager = crate::runtime::context_manager()?;
+    let invoker_did_typed: scp_primitives::DID = identity_did_owned.into();
+    let tool_id_typed = scp_core::context::tools::ToolId::from(tool_id_owned.as_str());
+    let rt = crate::runtime()?;
+    let outcome = rt
+        .block_on(async {
+            manager
+                .invoke_tool_with_economy(
+                    &ctx_id_owned,
+                    &registry,
+                    &tool_id_typed,
+                    input_json,
+                    &invoker_did_typed,
+                    spending_ucan_token.as_ref(),
+                    None,
+                    executor,
+                )
+                .await
+        })
+        .map_err(ScpPyError::from)?;
+
+    // Mark the time of last successful invocation for any future
+    // observability hooks. (`outcome.event` carries the canonical
+    // `ToolInvokedEvent` — the transport / event-log layer is the one
+    // responsible for signing and appending to the Merkle log.)
+    let _ = outcome.event;
+
+    json_to_py_dict(py, &outcome.output)
 }
 
 /// Verifies a tool against its registered test vectors.

@@ -14,7 +14,7 @@
 //! [`FfiBridgeState`] — a thin struct that does NOT duplicate any
 //! `ContextManager` state.
 //!
-//! # Safety: Single-Tenant Only (RED-017)
+//! # Safety: Single-Tenant Only
 //!
 //! **All registries in this module are process-global.** In multi-tenant
 //! deployments (e.g., Django/FastAPI serving multiple SCP users), all tenants
@@ -23,7 +23,7 @@
 //!
 //! The NAPI (`Node.js`), `UniFFI` (Swift/Kotlin), and WASM bridges avoid this
 //! issue by using per-instance handle objects instead of global registries.
-//! The `PyO3` bridge must be refactored to match. See SCP-228.
+//! The `PyO3` bridge must be refactored to match.
 //!
 //! # Pattern
 //!
@@ -366,8 +366,12 @@ impl ContextCryptoProvider for NoOpCryptoProvider {
     ) -> Result<scp_core::context::AddMemberOutput, ContextError> {
         Ok(scp_core::context::AddMemberOutput::default())
     }
-    fn remove_member(&self, _context_id: &[u8; 32], _member_did: &str) -> Result<(), ContextError> {
-        Ok(())
+    fn remove_member(
+        &self,
+        _context_id: &[u8; 32],
+        _member_did: &str,
+    ) -> Result<scp_core::context::RemoveMemberOutput, ContextError> {
+        Ok(scp_core::context::RemoveMemberOutput::default())
     }
     fn distribute_sender_key(
         &self,
@@ -401,6 +405,8 @@ impl ContextEventLogProvider for NoOpEventLogProvider {
         &self,
         _context_id: &[u8; 32],
         _event: &str,
+        _actor_did: &str,
+        _payload: Option<&serde_json::Value>,
     ) -> Result<(), ContextCreationError> {
         Ok(())
     }
@@ -740,9 +746,9 @@ pub fn deliver_message(context_id: &str, message: PyMessage) -> Result<(), ScpPy
         Ok(()) => Ok(()),
         Err(mpsc::error::TrySendError::Full(_)) => {
             // Use blocking_lock() instead of try_lock() to guarantee
-            // oldest-drop semantics. try_lock() would drop the NEW message
-            // on lock contention -- the opposite of documented behavior
-            // (RED-021). The lock is only held for a single try_recv()
+            // oldest-drop semantics. try_lock() would drop the NEW
+            // message on lock contention — the opposite of documented
+            // behavior. The lock is only held for a single try_recv()
             // (VecDeque pop_front), so blocking is brief and safe.
             let mut rx_guard = rx_arc.blocking_lock();
 
@@ -1035,7 +1041,7 @@ pub fn remove_identity(did: &str) {
 /// # Safety: Single-Tenant Only
 ///
 /// This registry is process-global. In multi-tenant deployments,
-/// ALL tenants share the storage provider. See RED-017 / SCP-228.
+/// ALL tenants share the storage provider.
 static STORAGE_PROVIDER: OnceLock<Arc<EncryptingAdapter<InMemoryStorage>>> = OnceLock::new();
 
 /// Initializes the global storage provider.
@@ -1581,11 +1587,10 @@ mod tests {
 
     /// User-provided ceiling strings in colon format (e.g. `"tool:invoke:*"`)
     /// must be converted to UCAN underscore format (e.g. `"tool_invoke:*"`)
-    /// when stored in `FfiBridgeState.ceiling_strings`. Without this conversion,
-    /// `mint_ucan` ceiling checks fail because the minted capability name
-    /// (underscore format) doesn't match the stored raw string.
-    ///
-    /// Regression test for PR #1293 review finding.
+    /// when stored in `FfiBridgeState.ceiling_strings`. Without this
+    /// conversion, `mint_ucan` ceiling checks fail because the minted
+    /// capability name (underscore format) doesn't match the stored
+    /// raw string.
     #[test]
     fn user_ceiling_strings_converted_to_ucan_format() {
         let ctx_id = unique_ctx_id("ceiling-conv");

@@ -177,7 +177,7 @@ pub struct WebTransportAdapter {
 
     /// Maps subscribe ref_id -> routing_id so that `backfill_complete` events
     /// (which carry only a ref_id) can be routed to the correct subscription
-    /// instead of being broadcast to all subscribers (BUG-006 fix).
+    /// instead of being broadcast to all subscribers.
     subscribe_ref_ids: Arc<Mutex<HashMap<String, [u8; 32]>>>,
 
     /// Monotonic counter for WebSocket ref_id correlation.
@@ -185,7 +185,7 @@ pub struct WebTransportAdapter {
 
     /// Stored WebSocket event closures. Held here so they are dropped when
     /// the adapter is dropped or when a reconnection replaces the WebSocket,
-    /// preventing the memory leak caused by `Closure::forget()` (BUG-005 fix).
+    /// preventing the memory leak caused by `Closure::forget()`.
     ///
     /// Each entry is a type-erased `Closure<dyn FnMut(...)>` wrapped for
     /// Send+Sync (safe on single-threaded WASM).
@@ -391,7 +391,7 @@ impl WebTransportAdapter {
         let url = &self.websocket_url;
 
         // Clear old closures from any previous WebSocket connection to free
-        // the leaked JS closures. New closures are stored below (BUG-005 fix).
+        // the leaked JS closures. New closures are stored below.
         if let Ok(mut guard) = self.ws_closures.lock() {
             guard.clear();
         }
@@ -471,8 +471,8 @@ impl WebTransportAdapter {
         ws.set_onmessage(Some(onmessage.as_ref().unchecked_ref()));
 
         // Store closures so they are dropped on reconnect instead of leaked
-        // via Closure::forget() (BUG-005 fix). The closures must outlive the
-        // WebSocket, which is guaranteed because both are stored on the adapter.
+        // via Closure::forget(). The closures must outlive the WebSocket,
+        // which is guaranteed because both are stored on the adapter.
         if let Ok(mut guard) = self.ws_closures.lock() {
             // Convert each typed Closure into a JsValue for type-erased storage.
             guard.push(SendSyncWrapper::new(onopen.into_js_value()));
@@ -983,7 +983,7 @@ impl TransportAdapter for WebTransportAdapter {
 
                     // Register ref_id -> routing_id mapping so that
                     // backfill_complete events can be routed to this specific
-                    // subscription instead of broadcast to all (BUG-006 fix).
+                    // subscription instead of broadcast to all.
                     if let Ok(mut guard) = self.subscribe_ref_ids.lock() {
                         guard.insert(ref_id.clone(), routing_id_bytes);
                     }
@@ -1352,7 +1352,7 @@ impl TransportAdapter for WebTransportAdapter {
 /// oneshot channel. BLOB messages are routed to the subscription channel
 /// matching the `routing_id`. `backfill_complete` events are routed to the
 /// specific subscription that initiated the backfill via `subscribe_ref_ids`
-/// (BUG-006 fix: prevents broadcasting to all subscribers).
+/// to prevent broadcasting to all subscribers.
 fn dispatch_relay_message(
     msg: &RelayMessage,
     subscriptions: &Arc<Mutex<HashMap<[u8; 32], mpsc::UnboundedSender<TransportEvent>>>>,
@@ -1396,8 +1396,8 @@ fn dispatch_relay_message(
 
     // Route backfill_complete events to the specific subscription that
     // requested the backfill, identified via the subscribe ref_id -> routing_id
-    // mapping (BUG-006 fix). Falls back to broadcast only if no mapping exists
-    // (e.g., events without ref_id from older relays).
+    // mapping. Falls back to broadcast only if no mapping exists (e.g.,
+    // events without ref_id from older relays).
     if let RelayMessage::Event { event_type, .. } = msg {
         if event_type == "backfill_complete" {
             // Try to route to the specific subscription via ref_id mapping.

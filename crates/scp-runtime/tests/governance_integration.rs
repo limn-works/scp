@@ -39,8 +39,8 @@ use scp_protocol::context::governance::majority::MajorityVoteEngine;
 use scp_protocol::context::governance::multisig::ThresholdEngine;
 use scp_protocol::context::governance::unanimity::UnanimityEngine;
 use scp_protocol::context::governance::{
-    CheckpointAttestationStatus, CosignedCheckpoint, GovernanceAction, GovernanceContext,
-    GovernanceEngine, GovernanceEvent, KeyResolver, ProposalStatus, RevocationScope,
+    AccessScope, CheckpointAttestationStatus, CosignedCheckpoint, GovernanceAction,
+    GovernanceContext, GovernanceEngine, GovernanceEvent, KeyResolver, ProposalStatus,
     SingleAdminEngine, VoteType, actions_conflict, sign_vote,
 };
 use scp_protocol::context::params::{Capability, ContextParams, GovernanceModel};
@@ -100,8 +100,12 @@ impl ContextCryptoProvider for MockCrypto {
     ) -> Result<scp_protocol::context::builder::AddMemberOutput, ContextError> {
         Ok(scp_protocol::context::builder::AddMemberOutput::default())
     }
-    fn remove_member(&self, _id: &[u8; 32], _member_did: &str) -> Result<(), ContextError> {
-        Ok(())
+    fn remove_member(
+        &self,
+        _id: &[u8; 32],
+        _member_did: &str,
+    ) -> Result<scp_protocol::context::builder::RemoveMemberOutput, ContextError> {
+        Ok(scp_protocol::context::builder::RemoveMemberOutput::default())
     }
     fn distribute_sender_key(&self, _id: &[u8; 32], _member_did: &str) -> Result<(), ContextError> {
         Ok(())
@@ -154,7 +158,13 @@ impl ContextEventLogProvider for MockEventLog {
     fn init_event_log(&self, _id: &[u8; 32]) -> Result<(), ContextCreationError> {
         Ok(())
     }
-    fn append_event(&self, _id: &[u8; 32], _event: &str) -> Result<(), ContextCreationError> {
+    fn append_event(
+        &self,
+        _id: &[u8; 32],
+        _event: &str,
+        _actor_did: &str,
+        _payload: Option<&serde_json::Value>,
+    ) -> Result<(), ContextCreationError> {
         Ok(())
     }
     fn destroy_event_log(&self, _id: &[u8; 32]) -> Result<(), ContextCreationError> {
@@ -327,7 +337,7 @@ async fn ac2_single_admin_auto_approve_and_execute() {
         new_role: "admin".into(),
     };
 
-    let (proposal, events) = manager
+    let (proposal, events, _) = manager
         .propose_governance_action(ctx_id, &alice(), action, &sk)
         .await
         .unwrap();
@@ -418,7 +428,7 @@ async fn ac3_threshold_propose_approve_execute() {
     let sk_alice = signing_key_for_did(&alice());
 
     // Alice proposes (auto-approves as first signer = 1/2 threshold).
-    let (proposal, events) = manager
+    let (proposal, events, _) = manager
         .propose_governance_action(ctx_id, &alice(), action, &sk_alice)
         .await
         .unwrap();
@@ -482,7 +492,7 @@ async fn ac4_majority_propose_approve_execute() {
     let sk_alice = signing_key_for_did(&alice());
 
     // Alice proposes. In Majority model, proposing does NOT auto-approve.
-    let (proposal, _events) = manager
+    let (proposal, _events, _) = manager
         .propose_governance_action(ctx_id, &alice(), action, &sk_alice)
         .await
         .unwrap();
@@ -530,7 +540,7 @@ async fn ac5_unanimity_all_approve_execute() {
     let sk_alice = signing_key_for_did(&alice());
 
     // Alice proposes (counts as one approval).
-    let (proposal, _events) = manager
+    let (proposal, _events, _) = manager
         .propose_governance_action(ctx_id, &alice(), action, &sk_alice)
         .await
         .unwrap();
@@ -579,7 +589,7 @@ async fn ac6_rejected_proposal_not_executed_unanimity() {
     };
     let sk_alice = signing_key_for_did(&alice());
 
-    let (proposal, _) = manager
+    let (proposal, _, _) = manager
         .propose_governance_action(ctx_id, &alice(), action, &sk_alice)
         .await
         .unwrap();
@@ -635,7 +645,7 @@ async fn ac6_rejected_threshold_proposal() {
     };
     let sk_alice = signing_key_for_did(&alice());
 
-    let (proposal, _) = manager
+    let (proposal, _, _) = manager
         .propose_governance_action(ctx_id, &alice(), action, &sk_alice)
         .await
         .unwrap();
@@ -815,7 +825,7 @@ async fn ac8_vote_withdrawn_event_via_manager() {
         .unwrap();
 
     let sk_alice = signing_key_for_did(&alice());
-    let (proposal, _) = manager
+    let (proposal, _, _) = manager
         .propose_governance_action(
             ctx_id,
             &alice(),
@@ -909,7 +919,7 @@ async fn ac9_checked_propose_requires_capability() {
 // =========================================================================
 // AC-10: 7+ GovernanceAction variants exercised
 // Variants: RemoveMember, ChangeRole, CloseContext, AddSigner,
-//           ExtendTtl, RevokeWriteAccess, RestoreReadAccess
+//           ExtendTtl, Revoke, RestoreAccess
 // =========================================================================
 
 #[tokio::test]
@@ -928,7 +938,7 @@ async fn ac10_remove_member_action() {
 
     // First add Bob so we can remove him.
     let sk_alice = signing_key_for_did(&alice());
-    let (add_proposal, _) = manager
+    let (add_proposal, _, _) = manager
         .propose_governance_action(
             ctx_id,
             &alice(),
@@ -943,7 +953,7 @@ async fn ac10_remove_member_action() {
     assert_eq!(add_proposal.status, ProposalStatus::Approved);
 
     // Now remove Bob.
-    let (remove_proposal, _) = manager
+    let (remove_proposal, _, _) = manager
         .propose_governance_action(
             ctx_id,
             &alice(),
@@ -973,7 +983,7 @@ async fn ac10_change_role_action() {
         .unwrap();
 
     let sk_alice = signing_key_for_did(&alice());
-    let (proposal, _) = manager
+    let (proposal, _, _) = manager
         .propose_governance_action(
             ctx_id,
             &alice(),
@@ -1003,7 +1013,7 @@ async fn ac10_close_context_action() {
         .unwrap();
 
     let sk_alice = signing_key_for_did(&alice());
-    let (proposal, _) = manager
+    let (proposal, _, _) = manager
         .propose_governance_action(
             ctx_id,
             &alice(),
@@ -1037,7 +1047,7 @@ async fn ac10_add_signer_action() {
     let sk_alice = signing_key_for_did(&alice());
 
     // Dave must be a member before being added as a signer.
-    let (add_member_proposal, _) = manager
+    let (add_member_proposal, _, _) = manager
         .propose_governance_action(
             ctx_id,
             &alice(),
@@ -1064,7 +1074,7 @@ async fn ac10_add_signer_action() {
     assert_eq!(add_status, ProposalStatus::Approved);
 
     // Now add Dave as a signer.
-    let (proposal, _) = manager
+    let (proposal, _, _) = manager
         .propose_governance_action(
             ctx_id,
             &alice(),
@@ -1098,7 +1108,7 @@ async fn ac10_extend_ttl_action() {
         .unwrap();
 
     let sk_alice = signing_key_for_did(&alice());
-    let (proposal, _) = manager
+    let (proposal, _, _) = manager
         .propose_governance_action(
             ctx_id,
             &alice(),
@@ -1143,13 +1153,13 @@ async fn ac10_revoke_write_access_action() {
         .unwrap();
 
     // Revoke Bob's write access.
-    let (proposal, _) = manager
+    let (proposal, _, _) = manager
         .propose_governance_action(
             ctx_id,
             &alice(),
-            GovernanceAction::RevokeWriteAccess {
+            GovernanceAction::RevokeAccess {
                 did: bob(),
-                scope: RevocationScope::FutureOnly,
+                access: AccessScope::Write,
             },
             &sk_alice,
         )
@@ -1191,20 +1201,23 @@ async fn ac10_restore_write_access_action() {
         .propose_governance_action(
             ctx_id,
             &alice(),
-            GovernanceAction::RevokeWriteAccess {
+            GovernanceAction::RevokeAccess {
                 did: bob(),
-                scope: RevocationScope::FutureOnly,
+                access: AccessScope::Write,
             },
             &sk_alice,
         )
         .await
         .unwrap();
 
-    let (proposal, _) = manager
+    let (proposal, _, _) = manager
         .propose_governance_action(
             ctx_id,
             &alice(),
-            GovernanceAction::RestoreWriteAccess { did: bob() },
+            GovernanceAction::RestoreAccess {
+                did: bob(),
+                capabilities: vec![Capability::MessagesWrite],
+            },
             &sk_alice,
         )
         .await
@@ -1236,7 +1249,7 @@ async fn ac11_extend_ttl_requires_unanimity_in_threshold() {
         .unwrap();
 
     let sk_alice = signing_key_for_did(&alice());
-    let (proposal, _) = manager
+    let (proposal, _, _) = manager
         .propose_governance_action(
             ctx_id,
             &alice(),
@@ -1306,7 +1319,7 @@ async fn ac12_promote_context_requires_unanimity_in_majority() {
     // Use a SingleAdmin-style direct propose (alice is creator/admin).
     // However, the governance model is Majority, so we need majority approval.
     // Alice proposes adding Bob, then explicitly approves + gets majority.
-    let (add_bob, _) = manager
+    let (add_bob, _, _) = manager
         .propose_governance_action(
             ctx_id,
             &alice(),
@@ -1332,7 +1345,7 @@ async fn ac12_promote_context_requires_unanimity_in_majority() {
     assert_eq!(add_bob_status, ProposalStatus::Approved);
 
     // Add Carol.
-    let (add_carol, _) = manager
+    let (add_carol, _, _) = manager
         .propose_governance_action(
             ctx_id,
             &alice(),
@@ -1355,7 +1368,7 @@ async fn ac12_promote_context_requires_unanimity_in_majority() {
     assert_eq!(add_carol_status, ProposalStatus::Approved);
 
     // Now propose PromoteContext.
-    let (proposal, _) = manager
+    let (proposal, _, _) = manager
         .propose_governance_action(
             ctx_id,
             &alice(),
@@ -1434,27 +1447,33 @@ fn ac13_actions_no_conflict_different_dids() {
 
 #[test]
 fn ac13_actions_conflict_revoke_vs_restore_write() {
-    let action_a = GovernanceAction::RevokeWriteAccess {
+    let action_a = GovernanceAction::RevokeAccess {
         did: bob(),
-        scope: RevocationScope::Full,
+        access: AccessScope::Both,
     };
-    let action_b = GovernanceAction::RestoreWriteAccess { did: bob() };
+    let action_b = GovernanceAction::RestoreAccess {
+        did: bob(),
+        capabilities: vec![Capability::MessagesWrite],
+    };
     assert!(
         actions_conflict(&action_a, &alice(), &action_b, &carol()),
-        "RevokeWriteAccess vs RestoreWriteAccess for same DID should conflict"
+        "Revoke (write) vs RestoreAccess (write) for same DID should conflict"
     );
 }
 
 #[test]
 fn ac13_actions_conflict_revoke_vs_restore_read() {
-    let action_a = GovernanceAction::RevokeReadAccess {
+    let action_a = GovernanceAction::RevokeAccess {
         did: bob(),
-        scope: RevocationScope::FutureOnly,
+        access: AccessScope::Write,
     };
-    let action_b = GovernanceAction::RestoreReadAccess { did: bob() };
+    let action_b = GovernanceAction::RestoreAccess {
+        did: bob(),
+        capabilities: vec![Capability::MessagesRead],
+    };
     assert!(
         actions_conflict(&action_a, &alice(), &action_b, &carol()),
-        "RevokeReadAccess vs RestoreReadAccess for same DID should conflict"
+        "Revoke (read) vs RestoreAccess (read) for same DID should conflict"
     );
 }
 
@@ -1798,7 +1817,7 @@ async fn list_proposals_returns_all_proposals() {
     let sk_alice = signing_key_for_did(&alice());
 
     // Create two proposals.
-    let (p1, _) = manager
+    let (p1, _, _) = manager
         .propose_governance_action(
             ctx_id,
             &alice(),
@@ -1810,7 +1829,7 @@ async fn list_proposals_returns_all_proposals() {
         )
         .await
         .unwrap();
-    let (p2, _) = manager
+    let (p2, _, _) = manager
         .propose_governance_action(
             ctx_id,
             &alice(),
@@ -1855,7 +1874,7 @@ async fn full_threshold_lifecycle_add_signer_then_change_role() {
     let sk_bob = signing_key_for_did(&bob());
 
     // Step 1: Add Dave as a member first.
-    let (add_member_proposal, _) = manager
+    let (add_member_proposal, _, _) = manager
         .propose_governance_action(
             ctx_id,
             &alice(),
@@ -1881,7 +1900,7 @@ async fn full_threshold_lifecycle_add_signer_then_change_role() {
     assert_eq!(status, ProposalStatus::Approved);
 
     // Step 2: Add Dave as a signer.
-    let (add_signer_proposal, events) = manager
+    let (add_signer_proposal, events, _) = manager
         .propose_governance_action(
             ctx_id,
             &alice(),
@@ -1915,7 +1934,7 @@ async fn full_threshold_lifecycle_add_signer_then_change_role() {
     );
 
     // Step 3: Change Alice's role.
-    let (role_proposal, _) = manager
+    let (role_proposal, _, _) = manager
         .propose_governance_action(
             ctx_id,
             &alice(),
@@ -2067,7 +2086,7 @@ async fn multi_party_threshold_propose_approve_verify() {
 
     // Step 1: Alice proposes adding Dave as a member.
     // In Threshold(2), the proposer auto-votes → 1/2 threshold, stays Pending.
-    let (proposal, creation_events) = manager
+    let (proposal, creation_events, _) = manager
         .propose_governance_action(
             ctx_id,
             &alice(),

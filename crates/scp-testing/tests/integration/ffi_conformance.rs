@@ -167,7 +167,6 @@ const PARITY_OPERATIONS: &[(&str, &str, bool)] = &[
     ("economy", "economy_check_policy_lock", false),
     ("economy", "economy_validate_policy_change", false),
     ("economy", "economy_evaluate_formula", false),
-    ("economy", "economy_adjust_relay_price", false),
     ("economy", "economy_budget_remaining", false),
     ("economy", "economy_budget_grant", false),
     ("economy", "economy_budget_record_spend", false),
@@ -1030,7 +1029,19 @@ fn discovery_and_provenance_coverage() {
 // Any decrease requires human approval
 // =========================================================================
 
-const MIN_PARITY_OPERATIONS: usize = 98;
+// Ratchet lowered from 98 -> 97 by the spec §19.7 anti-spam wiring plan:
+// the non-spec EIP-1559-style relay base-price adjustment operation
+// (`economy_adjust_relay_price` / `py_economy_adjust_relay_price` /
+// `napi_economy_adjust_relay_price` / `economy_adjust_relay_price` in
+// UniFFI / `wasm_economy_adjust_relay_price`) was deleted across all FFI
+// bridges + language SDK wrappers. `adjust_relay_price` implemented
+// Matrix-style aggregate pricing adjustment; the authoritative per-DID
+// escalation mechanism (spec §19.7) replaces it and is wired through
+// the existing `context_send_message` and `context_invoke_tool_with_economy`
+// paths, so no new parity operation was added in its place. This is a
+// legitimate removal; the ratchet is reset to the new floor. See commit
+// 2291102.
+const MIN_PARITY_OPERATIONS: usize = 97;
 
 /// Named set of operations that must have `wasm_required=true`.
 /// This is a named set, not a count — swapping one operation for another is
@@ -1165,4 +1176,32 @@ fn wasm_required_set_is_complete() {
             );
         }
     }
+}
+
+/// F10 meta-test: ensures the MIN_PARITY_OPERATIONS ratchet comment cites
+/// the real deleted operation name (`economy_adjust_relay_price`) rather
+/// than any fabricated name. Guards against phantom-provenance regressions
+/// in enforcement files.
+#[test]
+fn min_parity_operations_comment_references_real_deletion() {
+    let src = include_str!("ffi_conformance.rs");
+    // Locate the MIN_PARITY_OPERATIONS const and walk backwards to its
+    // immediately preceding ratchet comment block.
+    let idx = src
+        .find("const MIN_PARITY_OPERATIONS")
+        .expect("MIN_PARITY_OPERATIONS constant present");
+    let prelude = &src[..idx];
+    let comment_start = prelude
+        .rfind("// Ratchet")
+        .expect("ratchet comment present above MIN_PARITY_OPERATIONS");
+    let comment = &prelude[comment_start..];
+    assert!(
+        comment.contains("economy_adjust_relay_price"),
+        "ratchet comment must cite the real deleted op name, got: {comment}"
+    );
+    assert!(
+        !comment.contains("economy_evaluate_relay_cost"),
+        "ratchet comment must not cite the fabricated op name \
+         'economy_evaluate_relay_cost'"
+    );
 }

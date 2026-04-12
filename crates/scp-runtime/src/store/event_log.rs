@@ -1226,9 +1226,11 @@ mod tests {
         let store = make_store();
         let entry = EventLogEntry {
             event: "ContextCreated".to_owned(),
+            actor_did: String::new(),
             timestamp: 1_700_000_000,
             prev_hash: [0u8; 32],
             hash: [1u8; 32],
+            payload: None,
         };
 
         store
@@ -1254,15 +1256,19 @@ mod tests {
         let entries = vec![
             EventLogEntry {
                 event: "ContextCreated".to_owned(),
+                actor_did: String::new(),
                 timestamp: 1_700_000_000,
                 prev_hash: [0u8; 32],
                 hash: [1u8; 32],
+                payload: None,
             },
             EventLogEntry {
                 event: "MemberJoined".to_owned(),
+                actor_did: String::new(),
                 timestamp: 1_700_000_001,
                 prev_hash: [1u8; 32],
                 hash: [2u8; 32],
+                payload: None,
             },
         ];
 
@@ -1299,9 +1305,11 @@ mod tests {
         let store = make_store();
         let entries = vec![EventLogEntry {
             event: "ContextCreated".to_owned(),
+            actor_did: String::new(),
             timestamp: 1_700_000_000,
             prev_hash: [0u8; 32],
             hash: [1u8; 32],
+            payload: None,
         }];
 
         store
@@ -1341,9 +1349,11 @@ mod tests {
         for i in 0..5u8 {
             let entry = EventLogEntry {
                 event: format!("Event{i}"),
+                actor_did: String::new(),
                 timestamp: u64::from(i),
                 prev_hash: [i; 32],
                 hash: [i + 1; 32],
+                payload: None,
             };
             store
                 .store_merkle_event_log_entry("ctx-bulk", usize::from(i), &entry)
@@ -1355,15 +1365,19 @@ mod tests {
         let pruned = vec![
             EventLogEntry {
                 event: "Event3".to_owned(),
+                actor_did: String::new(),
                 timestamp: 3,
                 prev_hash: [3; 32],
                 hash: [4; 32],
+                payload: None,
             },
             EventLogEntry {
                 event: "Event4".to_owned(),
+                actor_did: String::new(),
                 timestamp: 4,
                 prev_hash: [4; 32],
                 hash: [5; 32],
+                payload: None,
             },
         ];
         store

@@ -691,8 +691,8 @@ mod tests {
             &self,
             _context_id: &[u8; 32],
             _member_did: &str,
-        ) -> Result<(), ContextError> {
-            Ok(())
+        ) -> Result<crate::context::builder::RemoveMemberOutput, ContextError> {
+            Ok(crate::context::builder::RemoveMemberOutput::default())
         }
 
         fn distribute_sender_key(

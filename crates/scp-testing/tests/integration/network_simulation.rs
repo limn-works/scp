@@ -265,7 +265,7 @@ async fn end_to_end_network_demo() {
 
     let alice_sender_key = generate_sender_key();
     let mut alice_sk_store = SenderKeyStore::new();
-    alice_sk_store.set(ctx_id, alice_did_str, alice_sender_key.clone());
+    alice_sk_store.set_unchecked(ctx_id, alice_did_str, alice_sender_key.clone());
 
     println!(
         "  Alice generated sender key: {}...",
@@ -347,7 +347,7 @@ async fn end_to_end_network_demo() {
     assert!(keys_match);
 
     let mut bob_sk_store = SenderKeyStore::new();
-    bob_sk_store.set(ctx_id, alice_did_str, received_sk);
+    bob_sk_store.set_unchecked(ctx_id, alice_did_str, received_sk);
     println!();
 
     // =====================================================================
@@ -905,8 +905,12 @@ impl scp_core::context::builder::ContextCryptoProvider for DemoCrypto {
     ) -> Result<scp_core::context::AddMemberOutput, scp_core::context::ContextError> {
         Ok(scp_core::context::AddMemberOutput::default())
     }
-    fn remove_member(&self, _: &[u8; 32], _: &str) -> Result<(), scp_core::context::ContextError> {
-        Ok(())
+    fn remove_member(
+        &self,
+        _: &[u8; 32],
+        _: &str,
+    ) -> Result<scp_core::context::RemoveMemberOutput, scp_core::context::ContextError> {
+        Ok(scp_core::context::RemoveMemberOutput::default())
     }
     fn distribute_sender_key(
         &self,
@@ -939,18 +943,16 @@ impl scp_core::context::builder::ContextCryptoProvider for DemoCrypto {
         &self,
         _context_id: &[u8; 32],
         outer_bytes: &[u8],
-    ) -> Result<Option<scp_core::context::builder::OpenedEnvelope>, scp_core::context::ContextError>
-    {
+    ) -> Result<scp_core::context::builder::OpenResult, scp_core::context::ContextError> {
         // Mock: deserialize directly as InnerEnvelope (no decryption).
         let inner: scp_core::envelope::inner::InnerEnvelope = rmp_serde::from_slice(outer_bytes)
             .map_err(|e| {
                 scp_core::context::ContextError::CryptoFailed(format!("mock open: {e}"))
             })?;
         let sender_did = inner.sender_did.clone();
-        Ok(Some(scp_core::context::builder::OpenedEnvelope {
-            inner,
-            sender_did,
-        }))
+        Ok(scp_core::context::builder::OpenResult::Application(
+            Box::new(scp_core::context::builder::OpenedEnvelope { inner, sender_did }),
+        ))
     }
 }
 
@@ -1020,6 +1022,8 @@ impl scp_core::context::builder::ContextEventLogProvider for DemoEventLog {
         &self,
         _: &[u8; 32],
         event: &str,
+        _actor_did: &str,
+        _payload: Option<&serde_json::Value>,
     ) -> Result<(), scp_core::context::builder::ContextCreationError> {
         self.events.lock().unwrap().push(event.to_owned());
         Ok(())
@@ -1142,14 +1146,17 @@ async fn application_layer_demo() {
         owner_did: bob.clone(),
         mls_key_package_bytes: None,
     };
-    manager.join_context(&handle, bob_kp).await.unwrap();
+    manager.join_context(&handle, bob_kp, None).await.unwrap();
     println!("  Bob joined context");
 
     let charlie_kp = KeyPackage {
         owner_did: charlie.clone(),
         mls_key_package_bytes: None,
     };
-    manager.join_context(&handle, charlie_kp).await.unwrap();
+    manager
+        .join_context(&handle, charlie_kp, None)
+        .await
+        .unwrap();
     println!("  Charlie joined context");
 
     let count = manager.member_count(ctx_id).await.unwrap();
@@ -1177,21 +1184,21 @@ async fn application_layer_demo() {
 
     let alice_sk = demo_signing_key(&alice);
     manager
-        .send_message(&handle, &alice, msg1, Some(&alice_sk), None)
+        .send_message(&handle, &alice, msg1, Some(&alice_sk), None, None)
         .await
         .unwrap();
     println!("  Alice sent:   \"{}\"", String::from_utf8_lossy(msg1));
 
     let bob_sk = demo_signing_key(&bob);
     manager
-        .send_message(&handle, &bob, msg2, Some(&bob_sk), None)
+        .send_message(&handle, &bob, msg2, Some(&bob_sk), None, None)
         .await
         .unwrap();
     println!("  Bob sent:     \"{}\"", String::from_utf8_lossy(msg2));
 
     let charlie_sk = demo_signing_key(&charlie);
     manager
-        .send_message(&handle, &charlie, msg3, Some(&charlie_sk), None)
+        .send_message(&handle, &charlie, msg3, Some(&charlie_sk), None, None)
         .await
         .unwrap();
     println!("  Charlie sent: \"{}\"", String::from_utf8_lossy(msg3));
@@ -1380,7 +1387,7 @@ async fn application_layer_demo() {
     println!("    input: {search_input}");
 
     // The executor is a real async function that simulates the tool.
-    let (output, invoke_event) = invoke_tool(
+    let (output, invoke_event, _consequences, _receipt) = invoke_tool(
         &handle,
         &tool_registry,
         &role_state,
@@ -1400,6 +1407,7 @@ async fn application_layer_demo() {
                 "total": std::cmp::min(max, 2)
             }))
         },
+        None::<&mut scp_core::context::tools::invoke::ToolEconomyContext<'_>>,
     )
     .await
     .unwrap();
@@ -1421,7 +1429,7 @@ async fn application_layer_demo() {
     println!("  Invoking 'calculator' as Charlie:");
     println!("    input: {calc_input}");
 
-    let (calc_output, _) = invoke_tool(
+    let (calc_output, _, _consequences, _receipt) = invoke_tool(
         &handle,
         &tool_registry,
         &role_state,
@@ -1447,6 +1455,7 @@ async fn application_layer_demo() {
                 "operation": op
             }))
         },
+        None::<&mut scp_core::context::tools::invoke::ToolEconomyContext<'_>>,
     )
     .await
     .unwrap();
@@ -1470,7 +1479,7 @@ async fn application_layer_demo() {
     println!();
 
     // Propose via ContextManager.
-    let (proposal, gov_events) = manager
+    let (proposal, gov_events, _) = manager
         .propose_governance_action(
             ctx_id,
             &alice,
@@ -1509,7 +1518,7 @@ async fn application_layer_demo() {
     println!("━━━ PHASE 7: Context Close ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
     println!();
 
-    let (close_proposal, _) = manager
+    let (close_proposal, _, _) = manager
         .propose_governance_action(
             ctx_id,
             &alice,

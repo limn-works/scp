@@ -31,10 +31,10 @@ pub use broadcast::{
 };
 pub use broadcast_content::{BroadcastContent, BroadcastContentError};
 pub use governance::{
-    CheckpointAttestationStatus, ConflictResolution, CosignedCheckpoint, GovernanceAction,
-    GovernanceContext, GovernanceEngine, GovernanceError, GovernanceEvent, GovernanceModelConfig,
-    GovernanceProposal, GovernanceReconfigAction, KeyResolver, ProposalId, ProposalStatus,
-    RejectionReason, RevocationScope, SignedVote, VoteType, actions_conflict, compute_proposal_id,
+    AccessScope, CheckpointAttestationStatus, ConflictResolution, CosignedCheckpoint,
+    GovernanceAction, GovernanceContext, GovernanceEngine, GovernanceError, GovernanceEvent,
+    GovernanceModelConfig, GovernanceProposal, GovernanceReconfigAction, KeyResolver, ProposalId,
+    ProposalStatus, RejectionReason, SignedVote, VoteType, actions_conflict, compute_proposal_id,
     sign_vote, verify_proposal_votes, verify_vote,
 };
 pub use membership::{MemberInfo, MembershipState};
@@ -327,6 +327,96 @@ pub enum ContextError {
         supported_major: u8,
         /// The minor version the SDK supports.
         supported_minor: u8,
+    },
+
+    /// The operation was rejected by the Matrix Synapse–style hard rate
+    /// limit layered on top of the per-DID economic escalation (§19.7).
+    ///
+    /// Defense-in-depth cap: a burst of operations above the token
+    /// bucket capacity is rejected regardless of cost, even when no
+    /// economic policy is configured. Applies to the messaging, join,
+    /// and tool invoke paths. Mapped to the canonical `SCP-ECON-12090`
+    /// code through the bridge error translators.
+    ///
+    /// `resource` identifies which path tripped the limit (`"send"`,
+    /// `"join"`, or `"tool_invoke"`) so callers can apply path-specific
+    /// back-off strategies. Untyped `PermissionDenied` predated this
+    /// variant; the three call sites were migrated as part of D4.
+    #[error("SCP-ECON-12090: rate limit exceeded on {resource}: {message}")]
+    RateLimited {
+        /// The path that tripped the limit (e.g., `"send"`, `"join"`,
+        /// `"tool_invoke"`).
+        resource: String,
+        /// Human-readable explanation of the bucket state.
+        message: String,
+    },
+
+    /// An imported snapshot attempted to regress a per-sender
+    /// monotonic floor (sender-key epoch, spending nonce, etc.)
+    /// relative to the local state. Rejected atomically per spec
+    /// §23.17 invariants 3 and 4 (import max-merge + append-only
+    /// dominance).
+    ///
+    /// `per_sender_deltas` carries every `(sender_did, local_floor,
+    /// incoming_floor)` tuple where `incoming_floor < local_floor`
+    /// so the caller can report the exact divergence. The import is
+    /// rejected WHOLE — no partial merge is applied, matching the
+    /// §23.17 Invariant 3 "reject atomically if any member's floor
+    /// would regress" clause.
+    #[error(
+        "SCP-CTX-2091: snapshot floor regression on {resource}: \
+         {} sender(s) would regress",
+        .per_sender_deltas.len()
+    )]
+    SnapshotFloorRegression {
+        /// Which monotonic resource class the regression applies to:
+        /// `"sender_key_epoch"`, `"spending_nonce"`, etc.
+        resource: String,
+        /// Per-sender `(did, local_floor, incoming_floor)` tuples
+        /// where `incoming_floor < local_floor`.
+        per_sender_deltas: Vec<(String, u64, u64)>,
+    },
+
+    /// An imported snapshot was rejected for carrying authorization or
+    /// trust-state fields that failed validation against the importing
+    /// node's policy.
+    ///
+    /// Distinct from [`Self::SnapshotFloorRegression`], which covers
+    /// monotonic per-sender floors. `ImportRejected` covers structural
+    /// or semantic violations: tampered consequence rules, attacker-
+    /// chosen budget grants, forged approved-proposal entries, cooldown
+    /// indices that point at nonexistent rules, etc.
+    ///
+    /// The `reason` string carries a human-readable explanation suitable
+    /// for logging and SDK error messages. Mapped to canonical code
+    /// `SCP-CTX-2092` through every FFI bridge translator so callers can
+    /// switch on `.code` instead of string-matching.
+    #[error("SCP-CTX-2092: snapshot import rejected: {reason}")]
+    ImportRejected {
+        /// Human-readable explanation of why the import was rejected.
+        reason: String,
+    },
+    /// A previously broadcasted MLS Commit (`RemoveMember`, `RotateContentKeys`,
+    /// `ResetMember`, or `LeaveContext`) exceeded the persistent retry budget
+    /// and the context is in fail-close state (PR #1606 C6).
+    ///
+    /// Subsequent context-mutating operations on the affected context return
+    /// this error until an operator acknowledges the fault via
+    /// `ContextManager::acknowledge_commit_fault`. The local state mutation
+    /// already happened, but at least one remote member did not advance
+    /// their MLS epoch — preventing further governance from a divergent
+    /// epoch is required to avoid silently retaining ejected members.
+    #[error(
+        "SCP-CTX-2120: commit broadcast fault for operation {operation}: \
+         {reason} ({attempts} attempts)"
+    )]
+    CommitBroadcastFault {
+        /// Human-readable label for the operation that failed to broadcast.
+        operation: String,
+        /// Final transport error or `"max age exceeded"`.
+        reason: String,
+        /// Total number of send attempts.
+        attempts: u32,
     },
 }
 

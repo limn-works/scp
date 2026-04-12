@@ -282,8 +282,8 @@ pub fn compute_member_id(member_did: &str) -> [u8; 8] {
 /// Per-member content access state within a context.
 ///
 /// Represents the four access levels a member can have. Transitions are
-/// one-way (decreasing access) until an explicit `RestoreReadAccess` or
-/// `RestoreWriteAccess` governance action (§9.17.2 step 5).
+/// one-way (decreasing access) until an explicit `RestoreAccess`
+/// governance action (§9.17.2 step 5).
 ///
 /// The forward-only restoration guarantee (§9.16.8) means that unblocking
 /// grants future access only — historical content encrypted during the
@@ -298,11 +298,11 @@ pub enum ContentAccessState {
     Full,
 
     /// Read-only access. The member can decrypt content but cannot send
-    /// new encrypted content. Reached via `RevokeWriteAccess`.
+    /// new encrypted content. Reached via `Revoke { access: AccessScope::Write }`.
     ReadOnly,
 
     /// Presence-only. The member is visible in the context but cannot
-    /// decrypt content or send. Reached via `RevokeReadAccess` from
+    /// decrypt content or send. Reached via `Revoke { access: AccessScope::Read }` from
     /// `ReadOnly`, or directly via governance.
     PresenceOnly,
 

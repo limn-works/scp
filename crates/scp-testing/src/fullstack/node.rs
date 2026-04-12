@@ -196,7 +196,7 @@ impl FullStackNode {
         member_did: &str,
     ) -> Result<(), ContextError> {
         let kp = KeyPackage::mock(DID::from(member_did));
-        self.manager.join_context(handle, kp).await?;
+        self.manager.join_context(handle, kp, None).await?;
 
         // Deposit ALL existing members' access keys in the KeyExchange for
         // the joiner. This includes:
@@ -278,7 +278,14 @@ impl FullStackNode {
         payload: &[u8],
     ) -> Result<(), ContextError> {
         self.manager
-            .send_message(handle, &self.did, payload, Some(&self.signing_key), None)
+            .send_message(
+                handle,
+                &self.did,
+                payload,
+                Some(&self.signing_key),
+                None,
+                None,
+            )
             .await
     }
 
@@ -336,12 +343,23 @@ impl FullStackNode {
 
         // Open: deserialize outer envelope → MLS decrypt → sender key
         // decrypt → deserialize InnerEnvelope → strip padding → verify hash.
-        let opened = self.crypto.open(context_id, ciphertext)?;
-        let opened = opened.ok_or_else(|| {
-            ContextError::CryptoFailed(
-                "open returned None (Commit/Proposal, not Application)".into(),
-            )
-        })?;
+        let open_result = self.crypto.open(context_id, ciphertext)?;
+        let opened = match open_result {
+            scp_core::context::builder::OpenResult::Application(env) => *env,
+            scp_core::context::builder::OpenResult::Control => {
+                return Err(ContextError::CryptoFailed("open returned Control".into()));
+            }
+            scp_core::context::builder::OpenResult::Management {
+                sender_did,
+                payload,
+            } => {
+                self.crypto
+                    .process_incoming_sender_key(context_id, &sender_did, &payload)?;
+                return Err(ContextError::CryptoFailed(
+                    "open returned Management".into(),
+                ));
+            }
+        };
 
         // Strip padding to recover the serialized WrappedContent.
         let stripped = scp_core::envelope::strip_padding(&opened.inner.payload)
@@ -454,7 +472,11 @@ impl ContextCryptoProvider for ArcCryptoProvider {
     ) -> Result<scp_core::context::AddMemberOutput, ContextError> {
         self.0.add_member(id, did, kp)
     }
-    fn remove_member(&self, id: &[u8; 32], did: &str) -> Result<(), ContextError> {
+    fn remove_member(
+        &self,
+        id: &[u8; 32],
+        did: &str,
+    ) -> Result<scp_core::context::RemoveMemberOutput, ContextError> {
         self.0.remove_member(id, did)
     }
     fn distribute_sender_key(&self, id: &[u8; 32], did: &str) -> Result<(), ContextError> {
@@ -482,10 +504,14 @@ impl ContextCryptoProvider for ArcCryptoProvider {
         id: &[u8; 32],
         req: &[u8],
         pk: &[u8],
+        blocked_dids: &std::collections::HashSet<String>,
     ) -> Result<Option<Vec<u8>>, ContextError> {
-        self.0.handle_sender_key_request(id, req, pk)
+        self.0.handle_sender_key_request(id, req, pk, blocked_dids)
     }
-    fn advance_epoch(&self, id: &[u8; 32]) -> Result<(), ContextError> {
+    fn advance_epoch(
+        &self,
+        id: &[u8; 32],
+    ) -> Result<scp_core::context::AdvanceEpochOutput, ContextError> {
         self.0.advance_epoch(id)
     }
     fn seal(
@@ -501,7 +527,7 @@ impl ContextCryptoProvider for ArcCryptoProvider {
         &self,
         id: &[u8; 32],
         outer_bytes: &[u8],
-    ) -> Result<Option<scp_core::context::builder::OpenedEnvelope>, ContextError> {
+    ) -> Result<scp_core::context::builder::OpenResult, ContextError> {
         self.0.open(id, outer_bytes)
     }
 }
@@ -513,14 +539,17 @@ impl ContextEventLogProvider for ArcEventLogProvider {
     fn init_event_log(&self, id: &[u8; 32]) -> Result<(), ContextCreationError> {
         self.0.init_event_log(id)
     }
-    fn append_event(&self, id: &[u8; 32], event: &str) -> Result<(), ContextCreationError> {
-        self.0.append_event(id, event)
+    fn append_event(
+        &self,
+        id: &[u8; 32],
+        event: &str,
+        actor_did: &str,
+        payload: Option<&serde_json::Value>,
+    ) -> Result<(), ContextCreationError> {
+        self.0.append_event(id, event, actor_did, payload)
     }
     fn destroy_event_log(&self, id: &[u8; 32]) -> Result<(), ContextCreationError> {
         self.0.destroy_event_log(id)
-    }
-    fn append_context_event(&self, id: &[u8; 32], event: &str) -> Result<(), ContextError> {
-        self.0.append_context_event(id, event)
     }
     fn export_event_log_data(&self, id: &[u8; 32]) -> Result<Vec<u8>, ContextError> {
         self.0.export_event_log_data(id)

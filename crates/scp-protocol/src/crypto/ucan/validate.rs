@@ -108,9 +108,18 @@ pub trait DidResolver {
 /// is `{unix_millis_timestamp}-{16_random_bytes_hex}`.
 ///
 /// See ADR-016 acceptance criterion 6 (nonce tracker).
+///
+/// The trait is split into two phases to prevent nonce-burn denial-of-service
+/// attacks (H11): `check_replay` is called early — before the budget gate —
+/// so that a budget-rejected request cannot consume tracker capacity. `record`
+/// is called only after all gates pass, atomically committing the nonce.
 pub trait NonceTracker {
-    /// Validates nonce format and freshness, checks for replay, and records
-    /// the nonce if new.
+    /// Validates nonce format and freshness, and checks for replay.
+    ///
+    /// This is a **read-only** probe — it does NOT record the nonce. Callers
+    /// MUST call [`record`](NonceTracker::record) after all downstream gates
+    /// pass to prevent nonce-burn denial-of-service: a request rejected by
+    /// the budget gate must not exhaust tracker capacity.
     ///
     /// # Errors
     ///
@@ -118,7 +127,34 @@ pub trait NonceTracker {
     /// Returns [`UcanError::NonceTooOld`] if the timestamp is too far in the past.
     /// Returns [`UcanError::NonceFuture`] if the timestamp is too far in the future.
     /// Returns [`UcanError::NonceReused`] if the nonce has been seen before.
-    fn check_and_record(&mut self, nonce: &str, token_expiry: u64) -> Result<(), UcanError>;
+    fn check_replay(&self, nonce: &str, token_expiry: u64) -> Result<(), UcanError>;
+
+    /// Records the nonce after all validation gates pass.
+    ///
+    /// Implementations SHOULD defensively re-run the replay check inside
+    /// `record` to guard against races in concurrent callers, then insert the
+    /// nonce into the seen-set.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same errors as [`check_replay`](NonceTracker::check_replay)
+    /// if the defensive re-check fails (e.g., because another caller raced to
+    /// record the same nonce between the `check_replay` and `record` calls).
+    fn record(&mut self, nonce: &str, token_expiry: u64) -> Result<(), UcanError>;
+
+    /// Convenience method that calls [`check_replay`](NonceTracker::check_replay)
+    /// and then [`record`](NonceTracker::record) in one step.
+    ///
+    /// Use this when the check and record happen at the same decision point
+    /// (e.g., in validation paths that don't need to split the two phases).
+    ///
+    /// # Errors
+    ///
+    /// Returns the same errors as `check_replay` or `record`.
+    fn check_and_record(&mut self, nonce: &str, token_expiry: u64) -> Result<(), UcanError> {
+        self.check_replay(nonce, token_expiry)?;
+        self.record(nonce, token_expiry)
+    }
 }
 
 /// Checks whether a token has been revoked.
@@ -230,7 +266,7 @@ impl Default for InMemoryNonceTracker {
 
 #[cfg(any(test, feature = "testing"))]
 impl NonceTracker for InMemoryNonceTracker {
-    fn check_and_record(&mut self, nonce: &str, token_expiry: u64) -> Result<(), UcanError> {
+    fn check_replay(&self, nonce: &str, _token_expiry: u64) -> Result<(), UcanError> {
         /// 5 minutes in milliseconds — mirrors `nonce::NONCE_FRESHNESS_TOLERANCE_MS`.
         const NONCE_FRESHNESS_TOLERANCE_MS: u128 = 5 * 60 * 1000;
         // Validate nonce format: {unix_millis}-{32_hex_chars}
@@ -265,7 +301,15 @@ impl NonceTracker for InMemoryNonceTracker {
             return Err(UcanError::NonceReused(nonce.to_owned()));
         }
 
+        Ok(())
+    }
+
+    fn record(&mut self, nonce: &str, token_expiry: u64) -> Result<(), UcanError> {
+        // Defensive re-check before inserting.
+        self.check_replay(nonce, token_expiry)?;
+
         // Record the nonce.
+        let now_millis = u128::from(scp_primitives::SystemClock.now_millis());
         #[allow(clippy::cast_possible_truncation)]
         // u128 millis / 1000 fits u64 until year 584 billion
         let now_secs = (now_millis / 1000) as u64;
@@ -606,7 +650,7 @@ fn extract_key_scope(payload: &UcanPayload) -> Option<String> {
 ///
 /// Returns [`UcanError::SelfDelegationWithoutKeyScope`] or
 /// [`UcanError::KeyScopeMismatch`] on violation.
-fn validate_key_scope(token: &UcanToken) -> Result<(), UcanError> {
+pub(super) fn validate_key_scope(token: &UcanToken) -> Result<(), UcanError> {
     let key_scope = extract_key_scope(&token.payload);
 
     // Step 5a: Self-delegation without key_scope is a safety violation.
@@ -692,7 +736,10 @@ fn enforce_ucan_category_a(
 /// Returns [`UcanError::SignatureInvalid`] if the signature does not verify.
 /// Returns [`UcanError::MalformedToken`] if the DID cannot be resolved or
 /// the public key / signature bytes are malformed.
-fn verify_signature(token: &UcanToken, did_resolver: &impl DidResolver) -> Result<(), UcanError> {
+pub(super) fn verify_signature(
+    token: &UcanToken,
+    did_resolver: &impl DidResolver,
+) -> Result<(), UcanError> {
     // When kid is present in the header, resolve the specific verification
     // method from the DID document (ADR-039, SCP-AB-013).
     let pk_bytes = match &token.header.kid {
@@ -737,7 +784,7 @@ fn verify_signature(token: &UcanToken, did_resolver: &impl DidResolver) -> Resul
 /// range, has an expiry too far in the future, or has been revoked.  This
 /// wrapping allows downstream classifiers to distinguish parent-token failures
 /// from leaf-token failures (see issue #1026).
-fn verify_delegation_chain(
+pub(super) fn verify_delegation_chain(
     token: &UcanToken,
     did_resolver: &impl DidResolver,
     proof_resolver: &impl ProofResolver,
@@ -948,7 +995,7 @@ fn verify_attenuation(
 /// Returns [`UcanError::TokenExpired`] if the token has expired beyond tolerance.
 /// Returns [`UcanError::ExpiryTooFar`] if `exp` exceeds now + 24 hours.
 /// Returns [`UcanError::TokenNotYetValid`] if `nbf > now + tolerance`.
-fn verify_expiry(
+pub(super) fn verify_expiry(
     token: &UcanToken,
     clock_skew_tolerance_secs: u64,
     clock: &dyn Clock,

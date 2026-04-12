@@ -726,7 +726,7 @@ impl<S: Storage> ProtocolRepository<S> {
     /// `BroadcastContext::block_subscriber` returns, using the
     /// `block_list` field from `BlockResult`.
     ///
-    /// See spec section 5.14.8 for blocking semantics. See RED-016.
+    /// See spec section 5.14.8 for blocking semantics.
     ///
     /// # Errors
     ///
@@ -748,7 +748,7 @@ impl<S: Storage> ProtocolRepository<S> {
     /// author. The caller should pass the loaded set to
     /// `BroadcastContext::restore_block_list` during initialization.
     ///
-    /// See spec section 5.14.8 for blocking semantics. See RED-016.
+    /// See spec section 5.14.8 for blocking semantics.
     ///
     /// # Errors
     ///
@@ -1461,7 +1461,7 @@ mod tests {
     }
 
     // -------------------------------------------------------------------
-    // Broadcast block list persistence (RED-016)
+    // Broadcast block list persistence
     // -------------------------------------------------------------------
 
     #[tokio::test]
@@ -1727,8 +1727,6 @@ mod tests {
             executed_proposals: std::collections::HashSet::new(),
             ttl_remaining_secs: Some(300),
             registered_tools: Vec::new(),
-            write_revoked_members: std::collections::HashSet::new(),
-            read_revoked_members: std::collections::HashSet::new(),
             read_exclusion_list: std::collections::HashSet::new(),
             tool_interfaces: Vec::new(),
             threshold_signers: Vec::new(),
@@ -1738,6 +1736,7 @@ mod tests {
             economic_policy: None,
             budget_tracker: scp_protocol::economy::budget::MemberBudgetTracker::new(),
             approved_proposals: std::collections::HashMap::new(),
+            next_proposal_seq: 0,
             governance_freeze: None,
             pending_ceiling_modification: None,
             pending_economic_policy_change: None,
@@ -1748,6 +1747,18 @@ mod tests {
             mls_crypto_state: Vec::new(),
             migration_state: None,
             access_key_store: scp_protocol::crypto::access_keys::AccessKeyStore::new(),
+            consequence_rules: Vec::new(),
+            participation_cache: std::collections::HashMap::new(),
+            velocity_tracker: None,
+            velocity_tracker_state: None,
+            cooldown_until: std::collections::HashMap::new(),
+            proposal_timestamps: std::collections::HashMap::new(),
+            message_pricing: None,
+            hard_rate_limit_config: None,
+            hard_rate_limit_state: std::collections::HashMap::new(),
+            spending_nonce_tracker_state: std::collections::HashMap::new(),
+            pending_commits: std::collections::VecDeque::new(),
+            commit_fault: None,
         }
     }
 
@@ -1892,15 +1903,19 @@ mod tests {
 
         let entry0 = EventLogEntry {
             event: "ContextCreated".to_owned(),
+            actor_did: String::new(),
             timestamp: 1_700_000_000,
             prev_hash: [0u8; 32],
             hash: [1u8; 32],
+            payload: None,
         };
         let entry1 = EventLogEntry {
             event: "MemberJoined".to_owned(),
+            actor_did: String::new(),
             timestamp: 1_700_000_001,
             prev_hash: [1u8; 32],
             hash: [2u8; 32],
+            payload: None,
         };
 
         // O(1) per-entry persist.
@@ -1926,15 +1941,19 @@ mod tests {
         let entries = vec![
             EventLogEntry {
                 event: "BulkEvent0".to_owned(),
+                actor_did: String::new(),
                 timestamp: 1_700_000_000,
                 prev_hash: [0u8; 32],
                 hash: [1u8; 32],
+                payload: None,
             },
             EventLogEntry {
                 event: "BulkEvent1".to_owned(),
+                actor_did: String::new(),
                 timestamp: 1_700_000_001,
                 prev_hash: [1u8; 32],
                 hash: [2u8; 32],
+                payload: None,
             },
         ];
 

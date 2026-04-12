@@ -48,12 +48,31 @@ use scp_protocol::context::builder::ContextCreationError;
 pub struct EventLogEntry {
     /// The event name (e.g., `"ContextCreated"`, `"MemberJoined"`).
     pub event: String,
+    /// The DID of the actor who produced this event (the sender for messages,
+    /// the proposer for governance, the joiner for membership events).
+    ///
+    /// Added as part of #1594 to enable full-history consequence evaluation.
+    /// Defaults to empty string for backward compatibility with entries
+    /// serialized before `actor_did` was added.
+    #[serde(default)]
+    pub actor_did: String,
     /// Seconds since UNIX epoch when the event was appended.
     pub timestamp: u64,
     /// SHA-256 hash of the previous entry (all zeros for the first entry).
     pub prev_hash: [u8; 32],
-    /// SHA-256 hash of this entry (computed over event + timestamp + `prev_hash`).
+    /// SHA-256 hash of this entry (domain-separated SHA-256 over event +
+    /// `actor_did` + timestamp + `prev_hash` + optional `payload`).
     pub hash: [u8; 32],
+    /// Optional structured payload for this event.
+    ///
+    /// Used by governance actions to carry target DID and other structured
+    /// data that consequence triggers and participation records need. The
+    /// payload is included in the Merkle hash to ensure tamper evidence.
+    ///
+    /// Defaults to `None` for backward compatibility with entries serialized
+    /// before this field was added.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub payload: Option<serde_json::Value>,
 }
 
 /// Per-context Merkle-chained event log.
@@ -65,7 +84,12 @@ struct ContextLog {
 
 impl ContextLog {
     /// Appends a new event to the log, chaining it to the previous entry.
-    fn append(&mut self, event: &str) -> EventLogEntry {
+    fn append(
+        &mut self,
+        event: &str,
+        actor_did: &str,
+        payload: Option<&serde_json::Value>,
+    ) -> EventLogEntry {
         let timestamp = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
@@ -73,13 +97,15 @@ impl ContextLog {
 
         let prev_hash = self.entries.last().map_or([0u8; 32], |e| e.hash);
 
-        let hash = compute_entry_hash(event, timestamp, &prev_hash);
+        let hash = compute_entry_hash(event, actor_did, timestamp, &prev_hash, payload);
 
         let entry = EventLogEntry {
             event: event.to_owned(),
+            actor_did: actor_did.to_owned(),
             timestamp,
             prev_hash,
             hash,
+            payload: payload.cloned(),
         };
 
         self.entries.push(entry.clone());
@@ -89,16 +115,44 @@ impl ContextLog {
 
 /// Computes the SHA-256 hash for an event log entry.
 ///
-/// Hash input: `"SCP-EXPORT-ENTRY-V1:" || event_bytes || timestamp_be_bytes || prev_hash`
+/// Hash input: `"SCP-EXPORT-ENTRY:" || len(event) || event || len(actor_did)
+///   || actor_did || timestamp || prev_hash [|| len(payload_json) || payload_json]`
 ///
-/// Uses big-endian for the timestamp to match codebase convention, and a
-/// domain separator to prevent cross-protocol hash confusion.
-fn compute_entry_hash(event: &str, timestamp: u64, prev_hash: &[u8; 32]) -> [u8; 32] {
+/// Uses big-endian u32 length prefixes before variable-length fields to
+/// prevent length-extension ambiguity (e.g., event="AB" + actor="CD" vs
+/// event="ABC" + actor="D" producing the same hash).
+///
+/// When `payload` is `Some`, the canonical JSON representation is appended
+/// with a length prefix. When `None`, no additional bytes are hashed,
+/// preserving backward compatibility with entries created before payloads
+/// were introduced.
+fn compute_entry_hash(
+    event: &str,
+    actor_did: &str,
+    timestamp: u64,
+    prev_hash: &[u8; 32],
+    payload: Option<&serde_json::Value>,
+) -> [u8; 32] {
+    // Event names and DID strings are always well under u32::MAX bytes.
+    // Saturating conversion is used to satisfy clippy::cast_possible_truncation.
+    let event_len = u32::try_from(event.len()).unwrap_or(u32::MAX);
+    let actor_len = u32::try_from(actor_did.len()).unwrap_or(u32::MAX);
     let mut hasher = Sha256::new();
-    hasher.update(b"SCP-EXPORT-ENTRY-V1:");
+    hasher.update(b"SCP-EXPORT-ENTRY:");
+    hasher.update(event_len.to_be_bytes());
     hasher.update(event.as_bytes());
+    hasher.update(actor_len.to_be_bytes());
+    hasher.update(actor_did.as_bytes());
     hasher.update(timestamp.to_be_bytes());
     hasher.update(prev_hash);
+    // Payload is included in the hash when present.
+    // Absent payloads contribute no bytes, preserving backward compat.
+    if let Some(val) = payload {
+        let json_bytes = serde_json::to_vec(val).unwrap_or_default();
+        let payload_len = u32::try_from(json_bytes.len()).unwrap_or(u32::MAX);
+        hasher.update(payload_len.to_be_bytes());
+        hasher.update(&json_bytes);
+    }
     let result = hasher.finalize();
     let mut hash = [0u8; 32];
     hash.copy_from_slice(&result);
@@ -357,8 +411,14 @@ impl MerkleEventLogProvider {
             }
 
             // Check self-hash correctness.
-            let expected_hash = compute_entry_hash(&entry.event, entry.timestamp, &entry.prev_hash);
-            if !bool::from(entry.hash.ct_eq(&expected_hash)) {
+            let expected = compute_entry_hash(
+                &entry.event,
+                &entry.actor_did,
+                entry.timestamp,
+                &entry.prev_hash,
+                entry.payload.as_ref(),
+            );
+            if !bool::from(entry.hash.ct_eq(&expected)) {
                 return false;
             }
         }
@@ -663,7 +723,13 @@ impl ContextEventLogProvider for MerkleEventLogProvider {
         Ok(())
     }
 
-    fn append_event(&self, context_id: &[u8; 32], event: &str) -> Result<(), ContextCreationError> {
+    fn append_event(
+        &self,
+        context_id: &[u8; 32],
+        event: &str,
+        actor_did: &str,
+        payload: Option<&serde_json::Value>,
+    ) -> Result<(), ContextCreationError> {
         let mut logs = self
             .logs
             .lock()
@@ -674,7 +740,7 @@ impl ContextEventLogProvider for MerkleEventLogProvider {
                 hex::encode(context_id)
             ))
         })?;
-        let entry = log.append(event);
+        let entry = log.append(event, actor_did, payload);
         let seq = log.entries.len() - 1;
 
         // O(1) persist: only the newly appended entry (#710).
@@ -769,8 +835,15 @@ fn verify_chain_integrity(entries: &[EventLogEntry]) -> Result<(), ContextCreati
                 "Merkle chain broken at entry {i}: prev_hash mismatch"
             )));
         }
-        let expected_hash = compute_entry_hash(&entry.event, entry.timestamp, &entry.prev_hash);
-        if !bool::from(entry.hash.ct_eq(&expected_hash)) {
+        // Verify self-hash correctness.
+        let expected = compute_entry_hash(
+            &entry.event,
+            &entry.actor_did,
+            entry.timestamp,
+            &entry.prev_hash,
+            entry.payload.as_ref(),
+        );
+        if !bool::from(entry.hash.ct_eq(&expected)) {
             return Err(ContextCreationError::EventLogFailed(format!(
                 "Merkle chain broken at entry {i}: hash mismatch"
             )));
@@ -810,8 +883,12 @@ mod tests {
         let ctx_id = [2u8; 32];
 
         provider.init_event_log(&ctx_id).unwrap();
-        provider.append_event(&ctx_id, "ContextCreated").unwrap();
-        provider.append_event(&ctx_id, "MemberJoined").unwrap();
+        provider
+            .append_event(&ctx_id, "ContextCreated", "", None)
+            .unwrap();
+        provider
+            .append_event(&ctx_id, "MemberJoined", "", None)
+            .unwrap();
 
         let entries = provider.entries(&ctx_id).unwrap();
         assert_eq!(entries.len(), 2);
@@ -833,7 +910,7 @@ mod tests {
         let provider = MerkleEventLogProvider::new();
         let ctx_id = [3u8; 32];
 
-        let result = provider.append_event(&ctx_id, "SomeEvent");
+        let result = provider.append_event(&ctx_id, "SomeEvent", "", None);
         assert!(result.is_err());
     }
 
@@ -843,7 +920,9 @@ mod tests {
         let ctx_id = [4u8; 32];
 
         provider.init_event_log(&ctx_id).unwrap();
-        provider.append_event(&ctx_id, "ContextCreated").unwrap();
+        provider
+            .append_event(&ctx_id, "ContextCreated", "", None)
+            .unwrap();
 
         provider.destroy_event_log(&ctx_id).unwrap();
 
@@ -856,9 +935,9 @@ mod tests {
         let ctx_id = [5u8; 32];
 
         provider.init_event_log(&ctx_id).unwrap();
-        provider.append_event(&ctx_id, "Event1").unwrap();
-        provider.append_event(&ctx_id, "Event2").unwrap();
-        provider.append_event(&ctx_id, "Event3").unwrap();
+        provider.append_event(&ctx_id, "Event1", "", None).unwrap();
+        provider.append_event(&ctx_id, "Event2", "", None).unwrap();
+        provider.append_event(&ctx_id, "Event3", "", None).unwrap();
 
         assert!(provider.verify_chain(&ctx_id));
 
@@ -888,13 +967,17 @@ mod tests {
 
     #[test]
     fn entry_hashes_are_deterministic() {
-        let hash1 = compute_entry_hash("test", 1000, &[0u8; 32]);
-        let hash2 = compute_entry_hash("test", 1000, &[0u8; 32]);
+        let hash1 = compute_entry_hash("test", "did:key:z123", 1000, &[0u8; 32], None);
+        let hash2 = compute_entry_hash("test", "did:key:z123", 1000, &[0u8; 32], None);
         assert_eq!(hash1, hash2);
 
         // Different input produces different hash.
-        let hash3 = compute_entry_hash("other", 1000, &[0u8; 32]);
+        let hash3 = compute_entry_hash("other", "did:key:z123", 1000, &[0u8; 32], None);
         assert_ne!(hash1, hash3);
+
+        // Different actor_did produces different hash.
+        let hash4 = compute_entry_hash("test", "did:key:z456", 1000, &[0u8; 32], None);
+        assert_ne!(hash1, hash4);
     }
 
     #[test]
@@ -905,7 +988,7 @@ mod tests {
         provider.init_event_log(&ctx_id).unwrap();
         // append_context_event is the default trait method that delegates to append_event.
         provider
-            .append_context_event(&ctx_id, "MemberLeft")
+            .append_context_event(&ctx_id, "MemberLeft", "")
             .unwrap();
 
         let entries = provider.entries(&ctx_id).unwrap();
@@ -944,9 +1027,11 @@ mod tests {
                     seq + 1,
                     EventLogEntry {
                         event: String::new(),
+                        actor_did: String::new(),
                         timestamp: 0,
                         prev_hash: [0u8; 32],
                         hash: [0u8; 32],
+                        payload: None,
                     },
                 );
             }
@@ -990,8 +1075,12 @@ mod tests {
         let ctx_hex = hex::encode(ctx_id);
 
         provider.init_event_log(&ctx_id).unwrap();
-        provider.append_event(&ctx_id, "ContextCreated").unwrap();
-        provider.append_event(&ctx_id, "MemberJoined").unwrap();
+        provider
+            .append_event(&ctx_id, "ContextCreated", "", None)
+            .unwrap();
+        provider
+            .append_event(&ctx_id, "MemberJoined", "", None)
+            .unwrap();
 
         // Entries should be persisted.
         let persisted = persistence.load_entries(&ctx_hex).unwrap().unwrap();
@@ -1010,9 +1099,15 @@ mod tests {
         {
             let provider = MerkleEventLogProvider::with_persistence(persistence.clone());
             provider.init_event_log(&ctx_id).unwrap();
-            provider.append_event(&ctx_id, "ContextCreated").unwrap();
-            provider.append_event(&ctx_id, "MemberJoined").unwrap();
-            provider.append_event(&ctx_id, "MessageSent").unwrap();
+            provider
+                .append_event(&ctx_id, "ContextCreated", "", None)
+                .unwrap();
+            provider
+                .append_event(&ctx_id, "MemberJoined", "", None)
+                .unwrap();
+            provider
+                .append_event(&ctx_id, "MessageSent", "", None)
+                .unwrap();
 
             // Verify persisted.
             assert_eq!(
@@ -1036,7 +1131,9 @@ mod tests {
             assert!(provider.verify_chain(&ctx_id));
 
             // Appending after restore should chain correctly.
-            provider.append_event(&ctx_id, "MemberLeft").unwrap();
+            provider
+                .append_event(&ctx_id, "MemberLeft", "", None)
+                .unwrap();
             let entries = provider.entries(&ctx_id).unwrap();
             assert_eq!(entries.len(), 4);
             assert_eq!(entries[3].prev_hash, entries[2].hash);
@@ -1063,7 +1160,9 @@ mod tests {
         let ctx_hex = hex::encode(ctx_id);
 
         provider.init_event_log(&ctx_id).unwrap();
-        provider.append_event(&ctx_id, "ContextCreated").unwrap();
+        provider
+            .append_event(&ctx_id, "ContextCreated", "", None)
+            .unwrap();
 
         assert!(persistence.load_entries(&ctx_hex).unwrap().is_some());
 
@@ -1084,7 +1183,7 @@ mod tests {
         provider.init_event_log(&ctx_id).unwrap();
         for i in 0..10 {
             provider
-                .append_event(&ctx_id, &format!("Event{i}"))
+                .append_event(&ctx_id, &format!("Event{i}"), "", None)
                 .unwrap();
         }
 
@@ -1110,8 +1209,8 @@ mod tests {
         let ctx_id = [15u8; 32];
 
         provider.init_event_log(&ctx_id).unwrap();
-        provider.append_event(&ctx_id, "Event0").unwrap();
-        provider.append_event(&ctx_id, "Event1").unwrap();
+        provider.append_event(&ctx_id, "Event0", "", None).unwrap();
+        provider.append_event(&ctx_id, "Event1", "", None).unwrap();
 
         let removed = provider.prune_event_log(&ctx_id, 5).unwrap();
         assert_eq!(removed, 0);
@@ -1137,7 +1236,7 @@ mod tests {
             provider.init_event_log(&ctx_id).unwrap();
             for i in 0..10 {
                 provider
-                    .append_event(&ctx_id, &format!("Event{i}"))
+                    .append_event(&ctx_id, &format!("Event{i}"), "", None)
                     .unwrap();
             }
 
@@ -1170,7 +1269,7 @@ mod tests {
             assert!(provider.verify_chain(&ctx_id));
 
             // Appending after restore should chain correctly.
-            provider.append_event(&ctx_id, "Event10").unwrap();
+            provider.append_event(&ctx_id, "Event10", "", None).unwrap();
             let entries = provider.entries(&ctx_id).unwrap();
             assert_eq!(entries.len(), 4);
             assert_eq!(entries[3].prev_hash, entries[2].hash);
@@ -1186,8 +1285,12 @@ mod tests {
         let ctx_id = [19u8; 32];
 
         provider.init_event_log(&ctx_id).unwrap();
-        provider.append_event(&ctx_id, "ContextCreated").unwrap();
-        provider.append_event(&ctx_id, "MemberJoined").unwrap();
+        provider
+            .append_event(&ctx_id, "ContextCreated", "", None)
+            .unwrap();
+        provider
+            .append_event(&ctx_id, "MemberJoined", "", None)
+            .unwrap();
 
         // Call event_log_entries through dyn dispatch.
         let boxed: Box<dyn ContextEventLogProvider> = Box::new(provider);
@@ -1207,8 +1310,8 @@ mod tests {
         // Build entries via another provider (no persistence) to get valid chain.
         let source = MerkleEventLogProvider::new();
         source.init_event_log(&ctx_id).unwrap();
-        source.append_event(&ctx_id, "Imported1").unwrap();
-        source.append_event(&ctx_id, "Imported2").unwrap();
+        source.append_event(&ctx_id, "Imported1", "", None).unwrap();
+        source.append_event(&ctx_id, "Imported2", "", None).unwrap();
         let exported = source.export_event_log_entries(&ctx_id).unwrap();
 
         // Import into the persistent provider.
@@ -1220,5 +1323,300 @@ mod tests {
         let persisted = persistence.load_entries(&ctx_hex).unwrap().unwrap();
         assert_eq!(persisted.len(), 2);
         assert_eq!(persisted[0].event, "Imported1");
+    }
+
+    // -----------------------------------------------------------------------
+    // Hash computation unit tests (#1594, #33-41)
+    // -----------------------------------------------------------------------
+
+    /// Changing `actor_did` with all other fields constant changes the hash.
+    #[test]
+    fn compute_entry_hash_actor_did_changes_hash() {
+        let h1 = compute_entry_hash("MessageSent", "did:key:alice", 1000, &[0u8; 32], None);
+        let h2 = compute_entry_hash("MessageSent", "did:key:bob", 1000, &[0u8; 32], None);
+        assert_ne!(h1, h2, "different actor_did must produce different hash");
+    }
+
+    /// Changing event name with all other fields constant changes the hash.
+    #[test]
+    fn compute_entry_hash_event_changes_hash() {
+        let h1 = compute_entry_hash("MessageSent", "did:key:alice", 1000, &[0u8; 32], None);
+        let h2 = compute_entry_hash("MemberJoined", "did:key:alice", 1000, &[0u8; 32], None);
+        assert_ne!(h1, h2, "different event must produce different hash");
+    }
+
+    /// Changing timestamp with all other fields constant changes the hash.
+    #[test]
+    fn compute_entry_hash_timestamp_changes_hash() {
+        let h1 = compute_entry_hash("MessageSent", "did:key:alice", 1000, &[0u8; 32], None);
+        let h2 = compute_entry_hash("MessageSent", "did:key:alice", 1001, &[0u8; 32], None);
+        assert_ne!(h1, h2, "different timestamp must produce different hash");
+    }
+
+    /// Changing `prev_hash` with all other fields constant changes the hash.
+    #[test]
+    fn compute_entry_hash_prev_hash_changes_hash() {
+        let h1 = compute_entry_hash("MessageSent", "did:key:alice", 1000, &[0u8; 32], None);
+        let h2 = compute_entry_hash("MessageSent", "did:key:alice", 1000, &[1u8; 32], None);
+        assert_ne!(h1, h2, "different prev_hash must produce different hash");
+    }
+
+    /// Chain verification succeeds for a valid 3-entry chain.
+    #[test]
+    fn chain_verification_succeeds_for_valid_chain() {
+        let provider = MerkleEventLogProvider::new();
+        let ctx_id = [20u8; 32];
+        provider.init_event_log(&ctx_id).unwrap();
+        provider
+            .append_event(&ctx_id, "Event1", "did:key:alice", None)
+            .unwrap();
+        provider
+            .append_event(&ctx_id, "Event2", "did:key:bob", None)
+            .unwrap();
+        provider
+            .append_event(&ctx_id, "Event3", "did:key:carol", None)
+            .unwrap();
+        assert!(
+            provider.verify_chain(&ctx_id),
+            "valid 3-entry chain must verify"
+        );
+    }
+
+    /// Chain verification fails when `actor_did` in an entry is tampered.
+    #[test]
+    fn chain_verification_fails_for_tampered_actor_did() {
+        let provider = MerkleEventLogProvider::new();
+        let ctx_id = [21u8; 32];
+        provider.init_event_log(&ctx_id).unwrap();
+        provider
+            .append_event(&ctx_id, "Event1", "did:key:alice", None)
+            .unwrap();
+        provider
+            .append_event(&ctx_id, "Event2", "did:key:bob", None)
+            .unwrap();
+
+        {
+            let mut logs = provider.logs.lock().unwrap();
+            let log = logs.get_mut(&ctx_id).unwrap();
+            log.entries[1].actor_did = "did:key:mallory".to_owned();
+        }
+
+        assert!(
+            !provider.verify_chain(&ctx_id),
+            "tampered actor_did must fail chain verification"
+        );
+    }
+
+    /// Chain verification fails when event name in an entry is tampered.
+    #[test]
+    fn chain_verification_fails_for_tampered_event() {
+        let provider = MerkleEventLogProvider::new();
+        let ctx_id = [22u8; 32];
+        provider.init_event_log(&ctx_id).unwrap();
+        provider
+            .append_event(&ctx_id, "Event1", "did:key:alice", None)
+            .unwrap();
+        provider
+            .append_event(&ctx_id, "Event2", "did:key:bob", None)
+            .unwrap();
+
+        {
+            let mut logs = provider.logs.lock().unwrap();
+            let log = logs.get_mut(&ctx_id).unwrap();
+            log.entries[1].event = "TamperedEvent".to_owned();
+        }
+
+        assert!(
+            !provider.verify_chain(&ctx_id),
+            "tampered event name must fail chain verification"
+        );
+    }
+
+    /// Chain verification fails when hash field is tampered.
+    #[test]
+    fn chain_verification_fails_for_tampered_hash() {
+        let provider = MerkleEventLogProvider::new();
+        let ctx_id = [23u8; 32];
+        provider.init_event_log(&ctx_id).unwrap();
+        provider
+            .append_event(&ctx_id, "Event1", "did:key:alice", None)
+            .unwrap();
+        provider
+            .append_event(&ctx_id, "Event2", "did:key:bob", None)
+            .unwrap();
+        provider
+            .append_event(&ctx_id, "Event3", "did:key:carol", None)
+            .unwrap();
+
+        {
+            let mut logs = provider.logs.lock().unwrap();
+            let log = logs.get_mut(&ctx_id).unwrap();
+            log.entries[0].hash = [0xAA; 32]; // tamper first entry's hash
+        }
+
+        assert!(
+            !provider.verify_chain(&ctx_id),
+            "tampered hash must fail chain verification"
+        );
+    }
+
+    /// Domain separator "SCP-EXPORT-ENTRY:" and length prefixes are
+    /// present in hash computation. Verified by computing the hash manually
+    /// and comparing.
+    #[test]
+    fn domain_separator_present_in_hash() {
+        use sha2::{Digest, Sha256};
+
+        let event = "TestEvent";
+        let actor_did = "did:key:test";
+        let timestamp: u64 = 12345;
+        let prev_hash = [0u8; 32];
+
+        // Compute with the function.
+        let hash = compute_entry_hash(event, actor_did, timestamp, &prev_hash, None);
+
+        // Compute manually WITH domain separator and length prefixes.
+        let event_len = u32::try_from(event.len()).unwrap();
+        let actor_len = u32::try_from(actor_did.len()).unwrap();
+        let mut hasher = Sha256::new();
+        hasher.update(b"SCP-EXPORT-ENTRY:");
+        hasher.update(event_len.to_be_bytes());
+        hasher.update(event.as_bytes());
+        hasher.update(actor_len.to_be_bytes());
+        hasher.update(actor_did.as_bytes());
+        hasher.update(timestamp.to_be_bytes());
+        hasher.update(prev_hash);
+        let expected: [u8; 32] = hasher.finalize().into();
+        assert_eq!(
+            hash, expected,
+            "hash must match manual computation with domain separator and length prefixes"
+        );
+
+        // Compute manually WITHOUT domain separator — must NOT match.
+        let mut hasher_no_sep = Sha256::new();
+        hasher_no_sep.update(event.as_bytes());
+        hasher_no_sep.update(actor_did.as_bytes());
+        hasher_no_sep.update(timestamp.to_be_bytes());
+        hasher_no_sep.update(prev_hash);
+        let wrong: [u8; 32] = hasher_no_sep.finalize().into();
+        assert_ne!(hash, wrong, "hash without domain separator must differ");
+    }
+
+    // -----------------------------------------------------------------------
+    // Structured payload tests (H11-H12)
+    // -----------------------------------------------------------------------
+
+    /// Payload is included in the Merkle hash: same entry with different
+    /// payloads must produce different hashes.
+    #[test]
+    fn test_payload_in_hash() {
+        let h_none = compute_entry_hash(
+            "GovernanceActionExecuted",
+            "did:key:admin",
+            1000,
+            &[0u8; 32],
+            None,
+        );
+        let payload_a = serde_json::json!({"target_did": "did:key:alice"});
+        let payload_b = serde_json::json!({"target_did": "did:key:bob"});
+        let h_a = compute_entry_hash(
+            "GovernanceActionExecuted",
+            "did:key:admin",
+            1000,
+            &[0u8; 32],
+            Some(&payload_a),
+        );
+        let h_b = compute_entry_hash(
+            "GovernanceActionExecuted",
+            "did:key:admin",
+            1000,
+            &[0u8; 32],
+            Some(&payload_b),
+        );
+
+        assert_ne!(h_none, h_a, "payload must change the hash");
+        assert_ne!(h_none, h_b, "payload must change the hash");
+        assert_ne!(h_a, h_b, "different payloads must produce different hashes");
+
+        // Same payload produces same hash (deterministic).
+        let h_a2 = compute_entry_hash(
+            "GovernanceActionExecuted",
+            "did:key:admin",
+            1000,
+            &[0u8; 32],
+            Some(&payload_a),
+        );
+        assert_eq!(h_a, h_a2, "same payload must produce same hash");
+    }
+
+    /// Entries without payload are backward compatible: hash matches the
+    /// pre-payload computation.
+    #[test]
+    fn test_backward_compat_no_payload() {
+        // Hash with None payload must equal hash without payload (the old
+        // computation that didn't have the payload parameter at all).
+        use sha2::{Digest, Sha256};
+
+        let event = "MessageSent";
+        let actor_did = "did:key:alice";
+        let timestamp: u64 = 5000;
+        let prev_hash = [0u8; 32];
+
+        let hash = compute_entry_hash(event, actor_did, timestamp, &prev_hash, None);
+
+        // Manual computation matching the pre-payload hash algorithm.
+        let event_len = u32::try_from(event.len()).unwrap();
+        let actor_len = u32::try_from(actor_did.len()).unwrap();
+        let mut hasher = Sha256::new();
+        hasher.update(b"SCP-EXPORT-ENTRY:");
+        hasher.update(event_len.to_be_bytes());
+        hasher.update(event.as_bytes());
+        hasher.update(actor_len.to_be_bytes());
+        hasher.update(actor_did.as_bytes());
+        hasher.update(timestamp.to_be_bytes());
+        hasher.update(prev_hash);
+        // No payload bytes — backward compatible.
+        let expected: [u8; 32] = hasher.finalize().into();
+
+        assert_eq!(
+            hash, expected,
+            "None payload must produce the same hash as the pre-payload algorithm"
+        );
+    }
+
+    /// `MerkleEventLogProvider` stores and returns payload through append/read.
+    #[test]
+    fn test_payload_roundtrip_through_provider() {
+        let provider = MerkleEventLogProvider::new();
+        let ctx_id = [88u8; 32];
+        provider.init_event_log(&ctx_id).unwrap();
+
+        // Append without payload.
+        provider
+            .append_event(&ctx_id, "MessageSent", "did:key:alice", None)
+            .unwrap();
+
+        // Append with payload.
+        let payload = serde_json::json!({"target_did": "did:key:bob"});
+        provider
+            .append_event(
+                &ctx_id,
+                "GovernanceActionExecuted",
+                "did:key:admin",
+                Some(&payload),
+            )
+            .unwrap();
+
+        let entries = provider.event_log_entries(&ctx_id).unwrap().unwrap();
+        assert_eq!(entries.len(), 2);
+
+        // First entry has no payload.
+        assert!(entries[0].payload.is_none());
+
+        // Second entry has the payload.
+        assert_eq!(entries[1].payload, Some(payload));
+
+        // Chain still verifies.
+        assert!(provider.verify_chain(&ctx_id));
     }
 }

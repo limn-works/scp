@@ -466,11 +466,77 @@ impl From<scp_identity::IdentityError> for ScpError {
     }
 }
 
+/// Extracts a leading `SCP-XXX-NNNN` error code from a message body, if any.
+///
+/// Mirrors the `PyO3` / NAPI bridge helpers. Used to recover
+/// economy (12xxx), tool-invocation (6xxx), and permission (3xxx) codes
+/// embedded inside `ContextError::PermissionDenied(String)` so Swift /
+/// Kotlin callers can detect specific failures without string-matching
+/// the message body.
+pub(crate) fn extract_scp_code(message: &str) -> Option<String> {
+    let trimmed = message.trim_start();
+    let rest = trimmed.strip_prefix("SCP-")?;
+    let end = rest.find(|c: char| c == ':' || c.is_whitespace())?;
+    let suffix = &rest[..end];
+    let (category, number) = suffix.split_once('-')?;
+    if category.is_empty()
+        || !category.chars().all(|c| c.is_ascii_alphabetic())
+        || number.is_empty()
+        || !number.chars().all(|c| c.is_ascii_digit())
+    {
+        return None;
+    }
+    Some(format!("SCP-{category}-{number}"))
+}
+
 impl From<scp_core::context::ContextError> for ScpError {
     fn from(e: scp_core::context::ContextError) -> Self {
-        Self::Context {
-            msg: format!("{e} — verify context state, membership, and permissions"),
-            code: "SCP-CTX-2001".to_owned(),
+        use scp_core::context::ContextError as CE;
+        match &e {
+            // Surface the canonical rate-limit code on the typed
+            // envelope so Swift / Kotlin callers can detect
+            // rate-limit rejection without string-matching on the
+            // message body.
+            CE::RateLimited { .. } => Self::Context {
+                msg: format!("{e}"),
+                code: "SCP-ECON-12090".to_owned(),
+            },
+            // §23.17 snapshot import regression.
+            CE::SnapshotFloorRegression { .. } => Self::Context {
+                msg: format!("{e}"),
+                code: "SCP-CTX-2091".to_owned(),
+            },
+            // C3: snapshot import structural/semantic rejection.
+            CE::ImportRejected { .. } => Self::Context {
+                msg: format!("{e}"),
+                code: "SCP-CTX-2092".to_owned(),
+            },
+            // Recover embedded SCP-ECON-/SCP-TOOL-/SCP-PERM- codes from
+            // the runtime's `PermissionDenied(String)` catch-all so the
+            // typed-envelope contract holds for tool-economy failures.
+            CE::PermissionDenied(msg) => {
+                let code = extract_scp_code(msg).unwrap_or_else(|| "SCP-PERM-3001".to_owned());
+                if code.starts_with("SCP-PERM-") {
+                    Self::Permission {
+                        msg: format!("{e}"),
+                        code,
+                    }
+                } else if code.starts_with("SCP-TOOL-") {
+                    Self::Tool {
+                        msg: format!("{e}"),
+                        code,
+                    }
+                } else {
+                    Self::Context {
+                        msg: format!("{e}"),
+                        code,
+                    }
+                }
+            }
+            _ => Self::Context {
+                msg: format!("{e} — verify context state, membership, and permissions"),
+                code: "SCP-CTX-2001".to_owned(),
+            },
         }
     }
 }
@@ -869,6 +935,19 @@ pub struct ContextParams {
     /// Optional economic policy as a JSON string (spec §19, ADR-033).
     /// `None` means no economic policy (free context).
     pub economic_policy: Option<String>,
+    /// Optional consequence rules as a JSON-encoded array (ADR-017, #1531).
+    /// `None` means no consequence rules.
+    ///
+    /// Stored as a JSON string rather than a typed Record to avoid extending
+    /// the UDL surface with the full `ConsequenceRule` type tree (mirrors the
+    /// `aggregate_trust_input` JSON-string pattern). The string is parsed
+    /// inside `bridge_params_to_core` and validated against
+    /// `consequence_config_json` before the manager is called.
+    pub consequence_rules_json: Option<String>,
+    /// Optional consequence config as a JSON-encoded object (ADR-017, #1531).
+    /// `None` means the default config (severe enforcement tiers gated to
+    /// governance only).
+    pub consequence_config_json: Option<String>,
 }
 
 /// A message received from an SCP context.
@@ -1700,7 +1779,7 @@ pub struct ContextHandle {
     pub(crate) state: tokio::sync::Mutex<ContextState>,
     /// DID of the context creator.
     pub(crate) creator_did: String,
-    /// Retained [`InMemoryKeyCustody`] for UCAN signing (RED-102).
+    /// Retained [`InMemoryKeyCustody`] for UCAN signing.
     ///
     /// Set during `context_create` from the creating identity's custody.
     /// Used by `ucan_mint` to produce real Ed25519 signatures.
@@ -1711,7 +1790,7 @@ pub struct ContextHandle {
     /// Retained [`CallbackKeyCustody`] for platform custody contexts.
     #[allow(dead_code)]
     pub(crate) callback_custody: Option<Arc<CallbackKeyCustody>>,
-    /// Handle to the creator's active signing key for UCAN minting (RED-102).
+    /// Handle to the creator's active signing key for UCAN minting.
     ///
     /// Points into the custody provider. Used by `ucan_mint`.
     #[allow(dead_code)]
@@ -1853,9 +1932,9 @@ impl UcanToken {
     }
 }
 
-// `Drop` for `UcanToken` — now that `ucan_mint` is wired to `scp-core` and
-// calls `increment_handle_count()`, this `Drop` impl decrements the counter
-// to maintain `scp_shutdown` handle-drain correctness (RED-102).
+// `ucan_mint` calls `increment_handle_count()`, so this `Drop` impl
+// decrements the counter to maintain `scp_shutdown` handle-drain
+// correctness.
 impl Drop for UcanToken {
     fn drop(&mut self) {
         decrement_handle_count();
@@ -2771,7 +2850,7 @@ pub async fn context_create(
                 .register_local_did(identity.did.clone().into())
                 .await;
 
-            // Extract key custody and signing key from the identity (RED-102).
+            // Extract key custody and signing key from the identity.
             #[cfg(feature = "allow_in_memory_custody")]
             let in_memory_custody = identity.in_memory_custody.clone();
             let callback_custody = identity.callback_custody.clone();
@@ -2858,15 +2937,21 @@ pub async fn context_create(
 ///
 /// * `handle` — The context to join.
 /// * `identity` — The identity joining the context.
+/// * `spending_ucan_jwt` — Optional encoded UCAN JWT authorising the join
+///   cost. Forwarded to the manager for AND-composition with the context's
+///   per-join economic policy (spec §19, ADR-033).
 ///
 /// # Errors
 ///
 /// Returns `ScpError::Context` if the context is not in active state or
-/// if the join operation fails (key package, MLS add, event log).
+/// if the join operation fails (key package, MLS add, event log). Returns
+/// `ScpError::Context` with code `SCP-ECON-12061` if `spending_ucan_jwt` is
+/// not a valid UCAN JWT.
 #[uniffi::export]
 pub async fn context_join(
     handle: Arc<ContextHandle>,
     identity: Arc<Identity>,
+    spending_ucan_jwt: Option<String>,
 ) -> Result<(), ScpError> {
     runtime()
         .spawn(async move {
@@ -2884,6 +2969,21 @@ pub async fn context_join(
                 });
             }
             drop(state);
+
+            // Parse the optional spending UCAN JWT once at the bridge boundary
+            // so malformed tokens are rejected before the manager is touched.
+            // Mirrors PyO3 (`scp-ffi/src/context.rs`) and NAPI parity.
+            let spending_ucan = spending_ucan_jwt
+                .as_deref()
+                .map(|jwt| {
+                    scp_core::crypto::ucan::validate::parse_ucan(jwt).map_err(|e| {
+                        ScpError::Context {
+                            msg: format!("invalid spending UCAN: {e}"),
+                            code: "SCP-ECON-12061".to_owned(),
+                        }
+                    })
+                })
+                .transpose()?;
 
             // Ensure the ContextManager is initialized — context_join is a valid
             // first operation (e.g. a device joining a context without creating
@@ -2912,7 +3012,7 @@ pub async fn context_join(
             };
 
             manager
-                .join_context(&core_handle, key_package)
+                .join_context(&core_handle, key_package, spending_ucan.as_ref())
                 .await
                 .map_err(ScpError::from)?;
 
@@ -3137,6 +3237,7 @@ pub async fn context_send(
     handle: Arc<ContextHandle>,
     identity: Arc<Identity>,
     payload: Vec<u8>,
+    spending_ucan_jwt: Option<String>,
 ) -> Result<(), ScpError> {
     runtime()
         .spawn(async move {
@@ -3223,6 +3324,16 @@ pub async fn context_send(
                 .transition_to(&scp_core::context::ContextState::Active)
                 .await;
 
+            // Parse optional spending UCAN JWT into a UcanToken for AND-composition.
+            let spending_ucan = spending_ucan_jwt
+                .as_deref()
+                .map(scp_core::crypto::ucan::validate::parse_ucan)
+                .transpose()
+                .map_err(|e| ScpError::Context {
+                    msg: format!("invalid spending UCAN: {e}"),
+                    code: "SCP-ECON-12061".to_owned(),
+                })?;
+
             let sender_did: scp_identity::DID = identity.did.clone().into();
             manager
                 .send_message(
@@ -3231,6 +3342,7 @@ pub async fn context_send(
                     &payload,
                     resolved_signing_key.as_ref(),
                     None,
+                    spending_ucan.as_ref(),
                 )
                 .await
                 .map_err(ScpError::from)?;
@@ -3441,7 +3553,16 @@ pub async fn tool_register(
         })?
 }
 
-/// Invokes a tool within an SCP context.
+/// Invokes a tool within an SCP context, fully wired through the
+/// `ContextManager::invoke_tool_with_economy` pipeline.
+///
+/// This is the SINGLE entry point for tool invocation through the
+/// `UniFFI` bridge (Swift + Kotlin). Per-invocation pricing, spending
+/// UCAN AND-composition (§19.5), per-DID velocity tracking, escalation
+/// (§19.7), budget enforcement, payment escrow, the Matrix-style hard
+/// rate limit, and `ToolEconomyTicket` rollback are all enforced inside
+/// the runtime wrapper. The `UniFFI` bridge no longer reimplements any
+/// of those concerns.
 ///
 /// # Arguments
 ///
@@ -3449,13 +3570,16 @@ pub async fn tool_register(
 /// * `tool_id` — The ID of the tool to invoke.
 /// * `input_json` — Tool input parameters as a JSON string.
 /// * `identity` — The identity of the invoker (used for capability checking).
-/// * `ucan_token` — Optional JWT-encoded UCAN token authorizing the invocation.
-///   Must contain `tool_invoke:{tool_id}` or `tool_invoke:*` capability. When
-///   present, the full 11-step ADR-016 validation pipeline is executed before
+/// * `ucan_token` — JWT-encoded UCAN token authorizing the invocation.
+///   Must contain `tool_invoke:{tool_id}` or `tool_invoke:*` capability.
+///   The full 11-step ADR-016 validation pipeline is executed before
 ///   tool dispatch. See spec §6.2, §8, ADR-016, and issue #319.
 /// * `proof_tokens` — Optional list of encoded parent UCAN tokens for
-///   delegation chain traversal (ADR-016 step 3). Only relevant when
-///   `ucan_token` is `Some`.
+///   delegation chain traversal (ADR-016 step 3).
+/// * `spending_ucan_jwt` — Optional JWT-encoded spending UCAN
+///   (`SpendingCapability`) for paid tool invocations. Required when an
+///   `EconomicPolicy` priced the tool above zero (§19.5
+///   AND-composition). May be `nil`/`null` for free tools.
 ///
 /// # Returns
 ///
@@ -3463,11 +3587,15 @@ pub async fn tool_register(
 ///
 /// # Errors
 ///
-/// Returns `ScpError::Tool` if the tool is not found, invocation fails,
-/// input fails schema validation, or the invoker lacks capability.
-/// Returns `ScpError::Permission` if the UCAN token is invalid, expired,
-/// revoked, or lacks the required tool invocation capability.
+/// - `ScpError::Tool` (tool-invocation error range) — tool not found, schema
+///   mismatch, execution failure.
+/// - `ScpError::Permission` (`SCP-PERM-3001`) — invalid, expired,
+///   revoked, or capability-deficient UCAN token.
+/// - `ScpError::Context` (`SCP-ECON-12090`) — hard rate limit exceeded.
+/// - `ScpError::Context` (`SCP-ECON-12010`) — per-DID budget exceeded.
+/// - `ScpError::Context` (`SCP-ECON-12061`) — invalid spending UCAN.
 #[uniffi::export]
+#[allow(clippy::too_many_arguments)] // Mirrors the runtime's economy entry point.
 pub async fn tool_invoke(
     handle: Arc<ContextHandle>,
     tool_id: String,
@@ -3475,6 +3603,7 @@ pub async fn tool_invoke(
     identity: Arc<Identity>,
     ucan_token: Option<String>,
     proof_tokens: Option<Vec<String>>,
+    spending_ucan_jwt: Option<String>,
 ) -> Result<String, ScpError> {
     runtime()
         .spawn(async move {
@@ -3491,6 +3620,9 @@ pub async fn tool_invoke(
                 code: "SCP-PERM-3001".to_owned(),
             })?;
             validate_ucan_token(&ucan_token)?;
+            if let Some(jwt) = spending_ucan_jwt.as_deref() {
+                validate_ucan_token(jwt)?;
+            }
 
             let state = handle.state.lock().await;
 
@@ -3505,8 +3637,10 @@ pub async fn tool_invoke(
             }
             drop(state);
 
-            // Primary authorization: UCAN token validation via the full 11-step
-            // ADR-016 pipeline. See spec §6.2, §8, ADR-016, and issue #319.
+            // Primary authorization: UCAN token validation via the full
+            // 11-step ADR-016 pipeline. Bridge-owned because the proof
+            // resolver, revocation list, and nonce tracker live in the
+            // bridge UCAN registry, not in the runtime.
             validate_tool_ucan_uniffi(
                 &handle,
                 &tool_id,
@@ -3515,59 +3649,98 @@ pub async fn tool_invoke(
                 proof_tokens.as_ref(),
             )?;
 
-            let registry = handle.tool_registry.lock().await;
-            let registration = registry.get(&tool_id).ok_or_else(|| ScpError::Tool {
-                msg: format!(
-                    "tool '{tool_id}' not found in context '{}'",
-                    handle.context_id
-                ),
-                code: "SCP-TOOL-6002".to_owned(),
-            })?;
+            // Parse the optional spending UCAN JWT (§19.5
+            // AND-composition). Mirrors `context_send`. An invalid JWT
+            // surfaces as `SCP-ECON-12061` before the manager call.
+            let spending_ucan_token = spending_ucan_jwt
+                .as_deref()
+                .map(scp_core::crypto::ucan::validate::parse_ucan)
+                .transpose()
+                .map_err(|e| ScpError::Context {
+                    msg: format!("invalid spending UCAN: {e}"),
+                    code: "SCP-ECON-12061".to_owned(),
+                })?;
 
+            // Snapshot the bridge-owned tool registry and (optionally) the
+            // registered handler closure BEFORE entering the runtime call.
+            // The runtime requires a `&ToolRegistry` so we clone the
+            // registry once (cheap — Vec of registrations); the handler
+            // is an `Arc<dyn Fn>` so cloning is a refcount bump. Doing
+            // this OUTSIDE the manager call means the bridge handle's
+            // `tool_registry` mutex is released before Phase 1 of
+            // `invoke_tool_with_economy` acquires the manager mutex.
+            let registry = {
+                let reg = handle.tool_registry.lock().await;
+                reg.clone()
+            };
+            let handler = {
+                let handlers = handle.tool_handlers.lock().await;
+                handlers.get(&tool_id).cloned()
+            };
+
+            // Parse input JSON once (the runtime expects
+            // `serde_json::Value`).
             let input_value: serde_json::Value =
                 serde_json::from_str(&input_json).map_err(|e| ScpError::Tool {
                     msg: format!("invalid input JSON: {e}"),
                     code: "SCP-TOOL-6002".to_owned(),
                 })?;
-            scp_core::context::tools::validate_value_against_schema(
-                &input_value,
-                &registration.schema.input_schema,
-            )
-            .map_err(|e| ScpError::Tool {
-                msg: format!("input validation failed for tool '{tool_id}': {e}"),
-                code: "SCP-TOOL-6002".to_owned(),
-            })?;
 
-            let output_schema = registration.schema.output_schema.clone();
-            drop(registry);
+            let context_id = handle.context_id.clone();
+            let identity_did_for_executor = identity.did.clone();
+            let tool_id_for_executor = tool_id.clone();
+            let context_id_for_executor = context_id.clone();
 
-            let handlers = handle.tool_handlers.lock().await;
-            let output = if let Some(handler) = handlers.get(&tool_id) {
+            // Build the executor closure. Phase 2 of
+            // `invoke_tool_with_economy` runs WITHOUT holding the
+            // `contexts` mutex; the runtime calls the executor exactly
+            // once with the validated input value.
+            let executor = move |input: serde_json::Value| {
                 let handler = handler.clone();
-                drop(handlers);
-                let out = handler(input_value.clone()).map_err(|e| ScpError::Tool {
-                    msg: format!("tool handler for '{tool_id}' failed: {e}"),
-                    code: "SCP-TOOL-6002".to_owned(),
-                })?;
-                scp_core::context::tools::validate_value_against_schema(&out, &output_schema)
-                    .map_err(|msg| ScpError::Tool {
-                        msg: format!("output validation failed for tool '{tool_id}': {msg}"),
-                        code: "SCP-TOOL-6002".to_owned(),
-                    })?;
-                out
-            } else {
-                drop(handlers);
-                serde_json::json!({
-                    "tool": tool_id,
-                    "context": handle.context_id,
-                    "status": "validated",
-                    "input_valid": true,
-                    "invoker_did": identity.did,
-                    "validated_input": input_value,
-                })
+                let input_for_echo = input.clone();
+                async move {
+                    handler.map_or_else(
+                        || {
+                            Ok(serde_json::json!({
+                                "tool": tool_id_for_executor,
+                                "context": context_id_for_executor,
+                                "status": "validated",
+                                "input_valid": true,
+                                "invoker_did": identity_did_for_executor,
+                                "validated_input": input_for_echo,
+                            }))
+                        },
+                        |h| {
+                            h(input).map_err(|e| {
+                                format!("tool handler for '{tool_id_for_executor}' failed: {e}")
+                            })
+                        },
+                    )
+                }
             };
 
-            serde_json::to_string(&output).map_err(|e| ScpError::Tool {
+            let manager = crate::runtime::context_manager_expect();
+            let invoker_did_typed: scp_primitives::DID = identity.did.clone().into();
+            let tool_id_typed = scp_core::context::tools::ToolId::from(tool_id.as_str());
+            let outcome = manager
+                .invoke_tool_with_economy(
+                    &context_id,
+                    &registry,
+                    &tool_id_typed,
+                    input_value,
+                    &invoker_did_typed,
+                    spending_ucan_token.as_ref(),
+                    None,
+                    executor,
+                )
+                .await
+                .map_err(ScpError::from)?;
+
+            // The runtime built the canonical `ToolInvokedEvent`; the
+            // transport / event-log layer is responsible for signing
+            // and appending it. Pull the JSON output back out for the
+            // Swift / Kotlin caller.
+            serde_json::to_string(&outcome.output).map_err(|e| ScpError::Tool {
                 msg: format!("failed to serialize tool output: {e}"),
                 code: "SCP-TOOL-6006".to_owned(),
             })
@@ -6001,8 +6174,6 @@ pub async fn ucan_validate(
 /// Returns `ScpError::Permission` if the context does not have key custody
 /// (created from an `identity_load` handle without key material) or if
 /// signing fails.
-///
-/// See RED-102 for the `KeyCustody` wiring story.
 #[uniffi::export]
 pub async fn ucan_mint(
     handle: Arc<ContextHandle>,
@@ -6032,7 +6203,7 @@ async fn ucan_mint_impl(
 ) -> Result<Arc<UcanToken>, ScpError> {
     runtime()
         .spawn(async move {
-            // Extract key custody and signing key from the context handle (RED-102).
+            // Extract key custody and signing key from the context handle.
             let custody =
                 handle
                     .in_memory_custody
@@ -6947,10 +7118,12 @@ pub async fn governance_execute(
         .spawn(async move {
             let proposal: scp_core::context::governance::GovernanceProposal =
                 serde_json::from_str(&proposal_json)?;
+            // Defense-in-depth: validate user-controlled string fields at the
+            // FFI boundary before the action reaches the ContextManager (#1601).
             scp_ffi_common::validate::validate_governance_action_strings(&proposal.action)
                 .map_err(|e| ScpError::Validation {
                     msg: e.message,
-                    code: "SCP-CTX-2040".to_owned(),
+                    code: "SCP-VALID-7000".to_owned(),
                 })?;
             let action_name = proposal.action.variant_name();
             let manager = crate::runtime::context_manager()?;
@@ -6979,13 +7152,11 @@ pub async fn governance_execute(
                 GovernanceActionResult::MemberReset => "MemberReset",
                 GovernanceActionResult::ConflictResolved => "ConflictResolved",
                 GovernanceActionResult::ContextPromoted => "ContextPromoted",
-                GovernanceActionResult::ReadAccessRevoked(_) => "ReadAccessRevoked",
-                GovernanceActionResult::ReadAccessRestored(_) => "ReadAccessRestored",
-                GovernanceActionResult::WriteAccessRevoked(_) => "WriteAccessRevoked",
-                GovernanceActionResult::WriteAccessRestored(_) => "WriteAccessRestored",
+                GovernanceActionResult::MemberSuspended(_) => "MemberSuspended",
+                GovernanceActionResult::AccessRevoked(_) => "AccessRevoked",
+                GovernanceActionResult::AccessRestored(_) => "AccessRestored",
                 GovernanceActionResult::ContentKeysRotated(_) => "ContentKeysRotated",
                 GovernanceActionResult::GovernanceReconfigured(_) => "GovernanceReconfigured",
-                GovernanceActionResult::AuthorBlocked(_) => "AuthorBlocked",
                 GovernanceActionResult::SubscriberBanned(_) => "SubscriberBanned",
                 GovernanceActionResult::SubscriberUnbanned { .. } => "SubscriberUnbanned",
                 GovernanceActionResult::Executed => "Executed",
@@ -7124,7 +7295,14 @@ pub async fn governance_propose(
         .spawn(async move {
             let action: scp_core::context::governance::GovernanceAction =
                 serde_json::from_str(&action_json)?;
-            validate_governance_action_strings(&action)?;
+            // Defense-in-depth: validate user-controlled string fields at the
+            // FFI boundary before the action reaches the ContextManager (#1601).
+            scp_ffi_common::validate::validate_governance_action_strings(&action).map_err(|e| {
+                ScpError::Validation {
+                    msg: e.message,
+                    code: "SCP-CTX-2041".to_owned(),
+                }
+            })?;
             let action_name = action.variant_name();
             let did = scp_identity::DID(proposer_did);
             let manager = crate::runtime::context_manager()?;
@@ -7158,18 +7336,6 @@ pub async fn governance_propose(
     }
 
     Ok(result)
-}
-
-/// Validates all user-controlled string fields on a governance action.
-fn validate_governance_action_strings(
-    action: &scp_core::context::governance::GovernanceAction,
-) -> Result<(), ScpError> {
-    scp_ffi_common::validate::validate_governance_action_strings(action).map_err(|e| {
-        ScpError::Validation {
-            msg: e.message,
-            code: "SCP-CTX-2040".to_owned(),
-        }
-    })
 }
 
 /// Casts an approval vote on a pending governance proposal.
@@ -8432,6 +8598,39 @@ pub async fn context_member_role(handle: Arc<ContextHandle>, did: String) -> Opt
 // Free functions — events (#387)
 // ---------------------------------------------------------------------------
 
+/// Formats a [`ContextEvent`] as a human-readable string.
+///
+/// Consequence events (`ConsequenceTriggered`, `ConsequenceEnforced`) are
+/// formatted with structured key=value pairs for observability. All other
+/// events use their `Debug` representation.
+fn format_context_event(event: &scp_core::context::membership::ContextEvent) -> String {
+    use scp_core::context::membership::ContextEvent::{ConsequenceEnforced, ConsequenceTriggered};
+    match event {
+        ConsequenceTriggered {
+            context_id,
+            member_did,
+            rule_index,
+            trigger_type,
+            action_type,
+        } => format!(
+            "consequence_triggered:member={member_did},\
+             rule={rule_index},trigger={trigger_type},\
+             action={action_type},context={context_id}"
+        ),
+        ConsequenceEnforced {
+            context_id,
+            member_did,
+            action_type,
+            success,
+        } => format!(
+            "consequence_enforced:member={member_did},\
+             action={action_type},success={success},\
+             context={context_id}"
+        ),
+        other => scp_ffi_common::html_escape_event_string(&format!("{other:?}")),
+    }
+}
+
 /// Drains all pending events from the context's receive buffer.
 ///
 /// Returns a list of event descriptions as JSON strings. Returns empty
@@ -8442,8 +8641,8 @@ pub async fn context_drain_events(handle: Arc<ContextHandle>) -> Vec<String> {
     manager
         .drain_events(&handle.context_id)
         .await
-        .into_iter()
-        .map(|e| format!("{e:?}"))
+        .iter()
+        .map(format_context_event)
         .collect()
 }
 
@@ -8660,7 +8859,15 @@ impl scp_core::crypto::ucan::validate::DidResolver for NoOpDidResolver {
 
 pub(crate) struct NoOpNonceTracker;
 impl scp_core::crypto::ucan::validate::NonceTracker for NoOpNonceTracker {
-    fn check_and_record(
+    fn check_replay(
+        &self,
+        _nonce: &str,
+        _token_expiry: u64,
+    ) -> Result<(), scp_core::crypto::ucan::UcanError> {
+        Ok(())
+    }
+
+    fn record(
         &mut self,
         _nonce: &str,
         _token_expiry: u64,
@@ -8754,6 +8961,44 @@ fn bridge_params_to_core(
         })
         .transpose()?;
 
+    // Parse consequence_rules_json (ADR-017, #1531) into the typed core
+    // representation. Empty when omitted.
+    let consequence_rules: Vec<scp_core::trust::ConsequenceRule> = params
+        .consequence_rules_json
+        .as_deref()
+        .map(|cr_json| {
+            serde_json::from_str(cr_json).map_err(|e| ScpError::Validation {
+                msg: format!("invalid consequence_rules JSON: {e}"),
+                code: "SCP-VALID-7000".to_owned(),
+            })
+        })
+        .transpose()?
+        .unwrap_or_default();
+
+    // Parse consequence_config_json (ADR-017, #1531) into the typed core
+    // representation. Default config when omitted.
+    let consequence_config: scp_core::context::params::ConsequenceConfig = params
+        .consequence_config_json
+        .as_deref()
+        .map(|cc_json| {
+            serde_json::from_str(cc_json).map_err(|e| ScpError::Validation {
+                msg: format!("invalid consequence_config JSON: {e}"),
+                code: "SCP-VALID-7000".to_owned(),
+            })
+        })
+        .transpose()?
+        .unwrap_or_default();
+
+    // Validate each consequence rule against the per-context config so the
+    // bridge fails closed at creation time rather than deferring to runtime.
+    for rule in &consequence_rules {
+        rule.validate_against_config(&consequence_config)
+            .map_err(|e| ScpError::Validation {
+                msg: format!("consequence rule validation failed: {e}"),
+                code: "SCP-VALID-7000".to_owned(),
+            })?;
+    }
+
     Ok(scp_core::context::ContextParams {
         mode,
         ceiling,
@@ -8767,6 +9012,8 @@ fn bridge_params_to_core(
         max_nesting_depth: params.max_nesting_depth,
         session_cap: params.session_cap,
         economic_policy,
+        consequence_rules,
+        consequence_config,
         ..scp_core::context::ContextParams::default()
     })
 }
@@ -12257,31 +12504,6 @@ pub fn economy_evaluate_formula(
         .map(scp_core::economy::Amount::value))
 }
 
-/// Computes an EIP-1559-style relay price adjustment. Returns JSON.
-#[uniffi::export]
-pub fn economy_adjust_relay_price(
-    config_json: String,
-    actual_utilization_pct: u64,
-) -> Result<String, ScpError> {
-    let config: scp_core::economy::RelayPricingConfig = serde_json::from_str(&config_json)
-        .map_err(|e| ScpError::Validation {
-            msg: format!("invalid relay pricing config JSON: {e}"),
-            code: "SCP-VALID-7050".to_owned(),
-        })?;
-    let result = scp_core::economy::adjust_relay_price(&config, actual_utilization_pct);
-    let direction = match result.direction {
-        scp_core::economy::PriceDirection::Increased => "Increased",
-        scp_core::economy::PriceDirection::Decreased => "Decreased",
-        scp_core::economy::PriceDirection::Unchanged => "Unchanged",
-    };
-    let json = serde_json::json!({
-        "new_base_price": result.new_base_price.value(),
-        "previous_base_price": result.previous_base_price.value(),
-        "direction": direction,
-    });
-    Ok(json.to_string())
-}
-
 /// Queries the remaining budget for a member in a context.
 #[uniffi::export]
 pub fn economy_budget_remaining(context_id: String, did: String) -> Result<u64, ScpError> {
@@ -12706,6 +12928,7 @@ mod tests {
             test_identity(),
             None, // No UCAN token
             None,
+            None, // spending_ucan_jwt
         )
         .await;
 
@@ -13989,5 +14212,160 @@ mod tests {
         assert!(
             provenance_update_source_type(prov_json.to_string(), "invalid".to_owned()).is_err()
         );
+    }
+
+    // -------------------------------------------------------------------
+    // Consequence event format tests (#1531, #1593, #1594)
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn format_consequence_triggered_event() {
+        use scp_core::context::membership::ContextEvent;
+
+        let event = ContextEvent::ConsequenceTriggered {
+            context_id: "ctx-uniffi-123".to_owned(),
+            member_did: scp_identity::DID("did:dht:z6MkBob".to_owned()),
+            rule_index: 3,
+            trigger_type: "tool_rate".to_owned(),
+            action_type: "capability_suspension".to_owned(),
+        };
+
+        let formatted = super::format_context_event(&event);
+        assert!(
+            formatted.contains("consequence_triggered:"),
+            "must contain consequence_triggered prefix"
+        );
+        assert!(
+            formatted.contains("member=did:dht:z6MkBob"),
+            "must contain member DID"
+        );
+        assert!(formatted.contains("rule=3"), "must contain rule index");
+        assert!(
+            formatted.contains("trigger=tool_rate"),
+            "must contain trigger type"
+        );
+        assert!(
+            formatted.contains("action=capability_suspension"),
+            "must contain action type"
+        );
+        assert!(
+            formatted.contains("context=ctx-uniffi-123"),
+            "must contain context ID"
+        );
+    }
+
+    #[test]
+    fn format_consequence_enforced_event() {
+        use scp_core::context::membership::ContextEvent;
+
+        let event = ContextEvent::ConsequenceEnforced {
+            context_id: "ctx-uniffi-456".to_owned(),
+            member_did: scp_identity::DID("did:dht:z6MkAlice".to_owned()),
+            action_type: "access_revocation".to_owned(),
+            success: true,
+        };
+
+        let formatted = super::format_context_event(&event);
+        assert!(
+            formatted.contains("consequence_enforced:"),
+            "must contain consequence_enforced prefix"
+        );
+        assert!(
+            formatted.contains("member=did:dht:z6MkAlice"),
+            "must contain member DID"
+        );
+        assert!(
+            formatted.contains("action=access_revocation"),
+            "must contain action type"
+        );
+        assert!(
+            formatted.contains("success=true"),
+            "must contain success=true"
+        );
+    }
+
+    /// Verifies that `ContextParams` correctly accepts `consequence_rules`
+    /// when parsed from JSON (mirrors the `UniFFI` bridge param flow).
+    #[test]
+    fn consequence_rules_in_context_params_via_json() {
+        let json = r#"[{"trigger":"MessageVelocity","action":{"Enforcement":"SuspendAccess"},"threshold":10,"window":{"secs":3600,"nanos":0}}]"#;
+        let rules: Vec<scp_core::trust::ConsequenceRule> = serde_json::from_str(json).unwrap();
+
+        let params = scp_core::context::ContextParams {
+            consequence_rules: rules,
+            ..scp_core::context::ContextParams::default()
+        };
+
+        assert_eq!(
+            params.consequence_rules.len(),
+            1,
+            "consequence_rules should carry 1 rule"
+        );
+    }
+
+    // -------------------------------------------------------------------
+    // Spending UCAN parameter acceptance tests (#1537, #1593)
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn evaluate_invitation_accepts_spending_json() {
+        let params = scp_core::context::ContextParams::default();
+        let params_json = serde_json::to_string(&params).unwrap();
+        let spending_json =
+            r#"{"has_spending_ucan":true,"configured_adapters":["x402"],"available_balance":10000}"#
+                .to_owned();
+
+        let result = super::evaluate_invitation(
+            params_json,
+            "did:dht:z6MkBobBobBobBobBobBobBobBobBobBobBobBobBo".to_owned(),
+            "did:dht:z6MkLocalLocalLocalLocalLocalLocalLocal".to_owned(),
+            None,
+            Some(spending_json),
+            vec![],
+        );
+
+        assert!(
+            result.is_ok(),
+            "spending_json should be accepted: {result:?}"
+        );
+        assert_eq!(result.unwrap(), "prompt_agent");
+    }
+
+    #[test]
+    fn evaluate_invitation_rejects_invalid_spending_json() {
+        let params = scp_core::context::ContextParams::default();
+        let params_json = serde_json::to_string(&params).unwrap();
+
+        let result = super::evaluate_invitation(
+            params_json,
+            "did:dht:z6MkBobBobBobBobBobBobBobBobBobBobBobBobBo".to_owned(),
+            "did:dht:z6MkLocalLocalLocalLocalLocalLocalLocal".to_owned(),
+            None,
+            Some("not valid json".to_owned()),
+            vec![],
+        );
+
+        assert!(result.is_err(), "invalid spending JSON should be rejected");
+    }
+
+    #[test]
+    fn evaluate_invitation_none_spending_accepted() {
+        let params = scp_core::context::ContextParams::default();
+        let params_json = serde_json::to_string(&params).unwrap();
+
+        let result = super::evaluate_invitation(
+            params_json,
+            "did:dht:z6MkBobBobBobBobBobBobBobBobBobBobBobBobBo".to_owned(),
+            "did:dht:z6MkLocalLocalLocalLocalLocalLocalLocal".to_owned(),
+            None,
+            None,
+            vec![],
+        );
+
+        assert!(
+            result.is_ok(),
+            "None spending should be accepted: {result:?}"
+        );
+        assert_eq!(result.unwrap(), "prompt_agent");
     }
 }

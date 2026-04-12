@@ -38,10 +38,8 @@ pub use super::roles::Capability;
 // RoleDefinition (re-export from roles module)
 // ---------------------------------------------------------------------------
 
-/// Re-export of the full [`RoleDefinition`] type.
-///
-/// Previously a name-only placeholder. Now re-exports the full type from
-/// `roles.rs` which includes `name` and `capabilities: HashSet<Capability>`.
+/// Re-export of the full [`RoleDefinition`] type from `roles.rs`,
+/// which includes `name` and `capabilities: HashSet<Capability>`.
 /// See ADR-009 in `.docs/adrs/phase-2.md`.
 pub use super::roles::RoleDefinition;
 
@@ -49,12 +47,11 @@ pub use super::roles::RoleDefinition;
 // ToolRegistration (re-export from tools/registry module)
 // ---------------------------------------------------------------------------
 
-/// Re-export of the full [`ToolRegistration`] type.
-///
-/// Previously a name-only placeholder. Now re-exports the full type from
-/// `tools/registry.rs` which includes `tool_id`, `name`, `description`,
-/// `schema`, `implementation_hash`, `test_vectors`, `operator_did`, and
-/// `cost`. See ADR-010 in `.docs/adrs/phase-2.md`.
+/// Re-export of the full [`ToolRegistration`] type from
+/// `tools/registry.rs`, which includes `tool_id`, `name`,
+/// `description`, `schema`, `implementation_hash`, `test_vectors`,
+/// `operator_did`, and `cost`. See ADR-010 in
+/// `.docs/adrs/phase-2.md`.
 pub use super::tools::ToolRegistration;
 
 // ---------------------------------------------------------------------------
@@ -601,6 +598,37 @@ fn filter_field<T>(visibility: FieldVisibility, value: Option<T>) -> Option<T> {
 // ContextParams
 // ---------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+// ConsequenceConfig (B3 per-context opt-in)
+// ---------------------------------------------------------------------------
+
+/// Per-context configuration for automatic consequence-rule dispatch.
+///
+/// Controls which [`EnforcementSeverity`](crate::trust::consequence::EnforcementSeverity)
+/// tiers a [`ConsequenceRule`](crate::trust::consequence::ConsequenceRule)
+/// may reference. See ADR-017 and the Group B plan for the rationale.
+///
+/// Default: all flags `false`. Consequence rules may reference only the
+/// least-severe tiers (`SuspendCapability`, `SuspendAccess`) by default;
+/// cryptographic revocation and MLS ejection are governance-only unless the
+/// context explicitly opts in at creation time.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ConsequenceConfig {
+    /// If `true`, consequence rules may reference
+    /// [`EnforcementSeverity::RevokeAccess`](crate::trust::consequence::EnforcementSeverity::RevokeAccess)
+    /// — i.e., automatic cryptographic revocation of a member's access keys.
+    ///
+    /// When `false` (the default), `RevokeAccess` is rejected at rule
+    /// validation time. It remains callable as an explicit governance action
+    /// regardless of this flag.
+    ///
+    /// `EnforcementSeverity::RemoveMember` is **never** allowed in a
+    /// consequence rule regardless of this flag. MLS ejection is permanent
+    /// and must always originate from a deliberate governance proposal.
+    #[serde(default)]
+    pub allow_automatic_access_revocation: bool,
+}
+
 /// Full configuration for an SCP context, declared at creation time.
 ///
 /// `ContextParams` captures every parameter that defines a context's behavior:
@@ -611,7 +639,7 @@ fn filter_field<T>(visibility: FieldVisibility, value: Option<T>) -> Option<T> {
 /// exactly. For explicit creation, the caller specifies all parameters directly.
 ///
 /// See ADR-008 in `.docs/adrs/phase-2.md` for the full specification.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ContextParams {
     /// Context processing mode: [`Encrypted`](ContextMode::Encrypted) (default)
     /// or [`Broadcast`](ContextMode::Broadcast). Immutable after creation.
@@ -764,6 +792,34 @@ pub struct ContextParams {
     /// that authorized the migration. `None` for non-migration contexts.
     #[serde(default)]
     pub migration_source: Option<MigrationSource>,
+
+    /// Consequence rules declared at context creation (ADR-017, #1531).
+    ///
+    /// Visible before joining (part of the opt-in contract). Protocol-enforced,
+    /// verifiable. No hidden penalties. Empty means no consequence rules.
+    #[serde(default)]
+    pub consequence_rules: Vec<crate::trust::consequence::ConsequenceRule>,
+
+    /// Per-context configuration for consequence-rule enforcement severity
+    /// (Group B3 opt-in, ADR-017).
+    ///
+    /// Controls whether
+    /// [`EnforcementSeverity::RevokeAccess`](crate::trust::consequence::EnforcementSeverity::RevokeAccess)
+    /// may be referenced by automatic consequence rules. Defaults to
+    /// `allow_automatic_access_revocation = false`, meaning cryptographic
+    /// revocation is governance-only unless this context explicitly opts
+    /// in at creation time. `RemoveMember` is never allowed in a consequence
+    /// rule regardless of this configuration.
+    #[serde(default)]
+    pub consequence_config: ConsequenceConfig,
+
+    /// Per-context Sybil resistance policy (spec §9.3, #1530).
+    ///
+    /// When `Some`, joining members are evaluated against the policy's trust
+    /// signal requirements. When `None` (the default), no Sybil resistance
+    /// check is performed — any valid DID can join.
+    #[serde(default)]
+    pub sybil_policy: Option<crate::trust::sybil::ContextSybilPolicy>,
 }
 
 impl Default for ContextParams {
@@ -791,6 +847,9 @@ impl Default for ContextParams {
             incomplete_verification_policy: IncompleteVerificationPolicy::default(),
             min_protocol_version: None,
             migration_source: None,
+            consequence_rules: Vec::new(),
+            consequence_config: ConsequenceConfig::default(),
+            sybil_policy: None,
         }
     }
 }
@@ -1008,6 +1067,9 @@ mod tests {
             incomplete_verification_policy: IncompleteVerificationPolicy::default(),
             min_protocol_version: None,
             migration_source: None,
+            consequence_rules: Vec::new(),
+            consequence_config: ConsequenceConfig::default(),
+            sybil_policy: None,
         };
 
         assert_eq!(params.mode, ContextMode::Broadcast);
@@ -1148,6 +1210,9 @@ mod tests {
             incomplete_verification_policy: IncompleteVerificationPolicy::default(),
             min_protocol_version: None,
             migration_source: None,
+            consequence_rules: Vec::new(),
+            consequence_config: ConsequenceConfig::default(),
+            sybil_policy: None,
         };
 
         let json = serde_json::to_string(&params).ok();
@@ -1208,6 +1273,9 @@ mod tests {
             incomplete_verification_policy: IncompleteVerificationPolicy::default(),
             min_protocol_version: None,
             migration_source: None,
+            consequence_rules: Vec::new(),
+            consequence_config: ConsequenceConfig::default(),
+            sybil_policy: None,
         };
 
         let json = serde_json::to_string(&params).unwrap();

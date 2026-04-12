@@ -24,11 +24,14 @@
 // Production submodules first so extract_fn_body finds real implementations
 // before test mocks in mod.rs (the parser returns the first match).
 const MANAGER_SRC: &str = concat!(
+    include_str!("../../../../crates/scp-runtime/src/context/manager/economy.rs"),
     include_str!("../../../../crates/scp-runtime/src/context/manager/messaging.rs"),
     include_str!("../../../../crates/scp-runtime/src/context/manager/broadcast.rs"),
     include_str!("../../../../crates/scp-runtime/src/context/manager/governance.rs"),
     include_str!("../../../../crates/scp-runtime/src/context/manager/lifecycle.rs"),
     include_str!("../../../../crates/scp-runtime/src/context/manager/queries.rs"),
+    include_str!("../../../../crates/scp-runtime/src/context/manager/standing.rs"),
+    include_str!("../../../../crates/scp-runtime/src/context/manager/tools.rs"),
     include_str!("../../../../crates/scp-runtime/src/context/manager/trust_recovery.rs"),
     include_str!("../../../../crates/scp-runtime/src/context/manager/ttl_close.rs"),
     include_str!("../../../../crates/scp-runtime/src/context/manager/mod.rs"),
@@ -36,11 +39,29 @@ const MANAGER_SRC: &str = concat!(
 const PROVIDER_SRC: &str =
     include_str!("../../../../crates/scp-runtime/src/crypto/mls/provider.rs");
 
+// WASM bridge sources. Bridge has its own consequence-dispatch path and is
+// asserted separately below — scp-runtime and scp-ffi-wasm are two parallel
+// implementations of the same protocol and both must honor the wiring.
+const WASM_MANAGER_SRC: &str = include_str!("../../../../crates/scp-ffi/wasm/src/manager.rs");
+const WASM_CONSEQUENCE_SRC: &str =
+    include_str!("../../../../crates/scp-ffi/wasm/src/consequence.rs");
+
+// Non-WASM FFI bridge sources. PR #1606 / C4 wired all 3 of these to
+// `ContextManager::invoke_tool_with_economy` so per-invocation pricing,
+// spending UCAN, velocity tracking, budget enforcement, and the hard
+// rate limit are enforced for Python / Node / Swift / Kotlin clients.
+// The structural assertions in `c4_tool_invoke_economy_*` below pin
+// the bridge → runtime delegation so a future refactor cannot silently
+// regress to the bypass path.
+const PYO3_TOOLS_SRC: &str = include_str!("../../../../crates/scp-ffi/src/tools.rs");
+const NAPI_TOOLS_SRC: &str = include_str!("../../../../crates/scp-ffi/napi/src/tools.rs");
+const UNIFFI_BRIDGE_SRC: &str = include_str!("../../../../crates/scp-ffi/uniffi/src/bridge.rs");
+
 // =========================================================================
 // RATCHET CONSTANTS — may only increase
 // Any decrease requires human approval
 // =========================================================================
-const MIN_ACTIVE_PIPELINE_ASSERTIONS: usize = 15;
+const MIN_ACTIVE_PIPELINE_ASSERTIONS: usize = 33;
 
 // ---------------------------------------------------------------------------
 // Function body extraction — brace-matching parser
@@ -132,21 +153,33 @@ fn send_message_calls_seal() {
     );
 }
 
-// Manager level: send_message calls transport.send_message
+// Manager level: send_message delegates to encrypt_and_send which calls transport.send_message
 #[test]
 fn send_message_calls_transport_send() {
+    // send_message delegates to encrypt_and_send, which calls transport.send_message.
     assert!(
-        fn_body_contains(MANAGER_SRC, "send_message", ".send_message("),
-        "send_message must call transport.send_message"
+        fn_body_contains(MANAGER_SRC, "send_message", "encrypt_and_send"),
+        "send_message must call encrypt_and_send"
+    );
+    assert!(
+        fn_body_contains(MANAGER_SRC, "encrypt_and_send", ".send_message("),
+        "encrypt_and_send must call transport.send_message"
     );
 }
 
 // Manager level: deliver_incoming calls crypto.open (full envelope pipeline)
+// Note: the `.open(` call is now inside the `decrypt_and_dispatch` helper
+// which `deliver_incoming` delegates to. The assertion accepts either the
+// direct call in `deliver_incoming` or the call in the helper, plus the
+// delegation from `deliver_incoming` to `decrypt_and_dispatch`.
 #[test]
 fn deliver_incoming_calls_open() {
     assert!(
-        fn_body_contains(MANAGER_SRC, "deliver_incoming", ".open("),
-        "deliver_incoming must call crypto.open (envelope pipeline)"
+        fn_body_contains(MANAGER_SRC, "deliver_incoming", ".open(")
+            || (fn_body_contains(MANAGER_SRC, "deliver_incoming", "decrypt_and_dispatch")
+                && fn_body_contains(MANAGER_SRC, "decrypt_and_dispatch", ".open(")),
+        "deliver_incoming must call crypto.open (envelope pipeline), either directly \
+         or via decrypt_and_dispatch"
     );
 }
 
@@ -291,6 +324,61 @@ fn execute_add_member_calls_generate_access_key() {
     );
 }
 
+// --- Join-time sender key MLS framing (H3) ---
+//
+// `join_context` must MLS-wrap pending HPKE-sealed sender key distributions
+// via the shared `drain_and_deliver_sender_keys` helper before posting them
+// to transport. The helper calls `mls_encrypt_management`, which prepends
+// the SCPM management magic and wraps the bytes in an OuterEnvelope so the
+// receive-side dispatcher routes them through `OpenResult::Management`.
+//
+// The original join path called `transport.send_message` directly with the
+// raw HPKE bytes, which the joiner could not deserialize as an OuterEnvelope.
+// This regression silently dropped sender key distributions on join.
+
+#[test]
+fn join_context_calls_drain_and_deliver_sender_keys() {
+    assert!(
+        fn_body_contains(MANAGER_SRC, "join_context", "drain_and_deliver_sender_keys"),
+        "join_context must delegate sender key distribution to \
+         drain_and_deliver_sender_keys so distributions are MLS-wrapped (H3). \
+         Sending raw HPKE-sealed bytes via transport.send_message bypasses the \
+         OuterEnvelope/SCPM framing the receive-side dispatcher requires."
+    );
+}
+
+#[test]
+fn join_context_does_not_send_raw_drained_sender_keys() {
+    // Negative assertion: the join path must NOT loop over the drained
+    // pending messages and call transport.send_message directly. The
+    // bug shape was a `for ... in drain_pending_sender_key_messages`
+    // loop posting raw bytes. The fix uses the helper exclusively.
+    let body = extract_fn_body(MANAGER_SRC, "join_context")
+        .expect("join_context body must exist for H3 negative assertion");
+    assert!(
+        !body.contains(".drain_pending_sender_key_messages("),
+        "join_context must NOT call drain_pending_sender_key_messages directly — \
+         use drain_and_deliver_sender_keys so distributions are MLS-wrapped (H3)"
+    );
+}
+
+#[test]
+fn drain_and_deliver_sender_keys_calls_mls_encrypt_management() {
+    // The helper itself must MLS-wrap each distribution. This is the
+    // root invariant — without it, callers (including join_context and
+    // the rotation paths) would still post raw HPKE bytes.
+    assert!(
+        fn_body_contains(
+            MANAGER_SRC,
+            "drain_and_deliver_sender_keys",
+            "mls_encrypt_management"
+        ),
+        "drain_and_deliver_sender_keys must call mls_encrypt_management so \
+         pending sender key distributions are wrapped in the management channel \
+         framing the receive-side dispatcher recognizes (H3, §9.16.2)"
+    );
+}
+
 // --- Negative assertion: send_message must NOT call old encrypt_message ---
 
 #[test]
@@ -311,7 +399,6 @@ fn send_message_does_not_call_encrypt_message() {
 // --- Governance / lifecycle ---
 
 #[test]
-#[ignore = "#1541 — sender key cleanup on member removal not yet wired"]
 fn execute_remove_member_calls_remove_member_sender_key() {
     assert!(
         fn_body_contains(
@@ -323,59 +410,474 @@ fn execute_remove_member_calls_remove_member_sender_key() {
     );
 }
 
-// --- Standing (#1530) ---
+#[test]
+fn execute_remove_member_calls_rotate_sender_key() {
+    assert!(
+        fn_body_contains(MANAGER_SRC, "execute_remove_member", "rotate_sender_key"),
+        "execute_remove_member must call rotate_sender_key (§9.16.4)"
+    );
+}
 
 #[test]
-#[ignore = "#1530 — standing score not yet consulted in governance proposals"]
-fn propose_governance_checks_standing() {
+fn leave_context_calls_rotate_sender_key() {
+    assert!(
+        fn_body_contains(MANAGER_SRC, "leave_context", "rotate_sender_key"),
+        "leave_context must call rotate_sender_key (§9.16.4)"
+    );
+}
+
+// --- Proposer eligibility / Participation (#1530) ---
+
+#[test]
+fn propose_governance_checks_proposer_eligibility() {
     assert!(
         fn_body_contains(
             MANAGER_SRC,
             "propose_governance_action_inner",
-            "check_standing"
+            "check_proposer_eligibility"
         ),
-        "propose_governance_action_inner must consult standing scores"
+        "propose_governance_action_inner must consult proposer eligibility \
+         (pending removal + participation threshold)"
     );
 }
 
 // --- Consequences (#1531) ---
 
 #[test]
-#[ignore = "#1531 — consequence evaluation not yet wired into governance dispatch"]
 fn governance_dispatch_calls_evaluate_consequences() {
     assert!(
         fn_body_contains(
             MANAGER_SRC,
-            "finalize_governance_action",
+            "dispatch_consequences",
             "evaluate_consequence_rules"
         ),
-        "finalize_governance_action must call evaluate_consequence_rules"
+        "dispatch_consequences must call evaluate_consequence_rules"
     );
 }
 
 // --- Economy (#1537) ---
 
 #[test]
-#[ignore = "#1537 — economy enforcement not yet wired into governance"]
 fn governance_enforces_economic_policy() {
+    // Economy enforcement is unified in enforce_economy (economy.rs) which calls
+    // evaluate_cost. Both enforce_send_economy and enforce_join_economy delegate
+    // to enforce_economy. Check the unified function and the delegation.
     assert!(
-        fn_body_contains(
-            MANAGER_SRC,
-            "propose_governance_action_inner",
-            "evaluate_cost"
-        ) || fn_body_contains(MANAGER_SRC, "send_message", "evaluate_cost"),
-        "governance or send_message must call evaluate_cost for economic enforcement"
+        fn_body_contains(MANAGER_SRC, "enforce_economy", "evaluate_cost"),
+        "enforce_economy must call evaluate_cost"
+    );
+    assert!(
+        fn_body_contains(MANAGER_SRC, "enforce_send_economy", "enforce_economy"),
+        "enforce_send_economy must delegate to enforce_economy"
+    );
+    assert!(
+        fn_body_contains(MANAGER_SRC, "enforce_join_economy", "enforce_economy"),
+        "enforce_join_economy must delegate to enforce_economy"
+    );
+    // F9: enforce_economy must take the EnforceEconomyRequest struct (not a
+    // long positional argument list). Both call sites must construct one.
+    assert!(
+        MANAGER_SRC.contains("fn enforce_economy(\n    req: EnforceEconomyRequest"),
+        "enforce_economy must take EnforceEconomyRequest (F9 refactor)"
+    );
+    assert!(
+        fn_body_contains(MANAGER_SRC, "enforce_send_economy", "EnforceEconomyRequest"),
+        "enforce_send_economy must construct EnforceEconomyRequest"
+    );
+    assert!(
+        fn_body_contains(MANAGER_SRC, "enforce_join_economy", "EnforceEconomyRequest"),
+        "enforce_join_economy must construct EnforceEconomyRequest"
+    );
+}
+
+// --- Per-DID anti-spam escalation for tool invocations (§19.7) ---
+
+#[test]
+fn invoke_tool_with_economy_wires_escalation_and_rollback() {
+    // The manager wrapper must (a) call the free invoke_tool, (b) record the
+    // new velocity entry so compute_escalated_cost sees it, (c) thread the
+    // per-context velocity_tracker and message_pricing into ToolEconomyContext,
+    // and (d) roll back the velocity entry on invocation failure.
+    assert!(
+        fn_body_contains(MANAGER_SRC, "invoke_tool_with_economy", "invoke_tool"),
+        "invoke_tool_with_economy must delegate to invoke_tool"
+    );
+    assert!(
+        fn_body_contains(MANAGER_SRC, "invoke_tool_with_economy", "record_message"),
+        "invoke_tool_with_economy must record the invocation for velocity tracking"
+    );
+    assert!(
+        fn_body_contains(MANAGER_SRC, "invoke_tool_with_economy", "velocity_tracker"),
+        "invoke_tool_with_economy must thread velocity_tracker into ToolEconomyContext"
+    );
+    assert!(
+        fn_body_contains(MANAGER_SRC, "invoke_tool_with_economy", "message_pricing"),
+        "invoke_tool_with_economy must thread message_pricing into ToolEconomyContext"
+    );
+    assert!(
+        fn_body_contains(MANAGER_SRC, "invoke_tool_with_economy", ".rollback("),
+        "invoke_tool_with_economy must roll back the velocity entry on failure \
+         via the F5 identity-based `rollback(token)` API"
+    );
+}
+
+/// D4: `invoke_tool_with_economy` must reference the hard rate limit.
+/// Enforced structurally so a future refactor cannot silently drop
+/// the Matrix Synapse–style defense-in-depth cap on the tool path.
+#[test]
+fn invoke_tool_with_economy_enforces_hard_rate_limit() {
+    assert!(
+        fn_body_contains(MANAGER_SRC, "invoke_tool_with_economy", "hard_rate_limit"),
+        "invoke_tool_with_economy must reference hard_rate_limit so the Matrix Synapse–style \
+         defense-in-depth cap is enforced on the tool path (D4)"
+    );
+    assert!(
+        fn_body_contains(MANAGER_SRC, "invoke_tool_with_economy", "try_consume"),
+        "invoke_tool_with_economy must call try_consume on the hard rate limit token bucket \
+         before any Phase 1 bookkeeping — mirrors enforce_send_economy at messaging.rs:346"
+    );
+}
+
+/// D4: every Phase 1 failure branch in `invoke_tool_with_economy`
+/// MUST refund the hard rate limit token. We expect at least 3 inline
+/// refund sites: `economy_pre_check` failure, `record_spend` failure,
+/// and `authorize_tool_payment` failure. Dropping any branch leaks a
+/// rate-limit token on failure.
+#[test]
+fn invoke_tool_with_economy_refunds_hard_rate_limit_on_every_phase1_failure() {
+    let body = extract_fn_body(MANAGER_SRC, "invoke_tool_with_economy")
+        .expect("invoke_tool_with_economy body must exist");
+    let refund_sites = body.matches("hard_rate_limit.refund").count();
+    assert!(
+        refund_sites >= 3,
+        "invoke_tool_with_economy must have at least 3 inline hard_rate_limit.refund sites \
+         (economy_pre_check failure, record_spend failure, authorize_tool_payment failure); \
+         found {refund_sites}. Dropping any branch leaks a rate-limit token on failure."
+    );
+}
+
+#[test]
+fn invoke_tool_with_economy_releases_lock_before_executor() {
+    // F1-F3 lock-split invariant: the caller-supplied executor must run
+    // WITHOUT holding the `ContextManager.contexts` mutex. The wrapper
+    // must explicitly release the Phase-1 lock before dispatching the
+    // executor. A mis-behaving tool executor blocked every concurrent
+    // manager call until this refactor landed; regressions here reintroduce
+    // a process-wide stall bug.
+    //
+    // We assert:
+    //   (1) The function body contains an explicit `drop(contexts)` call.
+    //       This is the exit boundary of Phase 1.
+    //   (2) The function body acquires `self.contexts.lock()` at least
+    //       twice — once in Phase 1 (pre-check / record_spend / escrow
+    //       authorize) and once in Phase 3 (post-invocation bookkeeping).
+    //       A single lock acquisition would imply the lock is held across
+    //       the executor future.
+    assert!(
+        fn_body_contains(MANAGER_SRC, "invoke_tool_with_economy", "drop(contexts)"),
+        "invoke_tool_with_economy must explicitly drop(contexts) between Phase 1 \
+         (economy pre-check / escrow authorize) and Phase 2 (executor) so the \
+         `contexts` mutex is not held across the caller-supplied executor future"
+    );
+    // Count lock acquisitions via substring match inside the function body.
+    let body = extract_fn_body(MANAGER_SRC, "invoke_tool_with_economy")
+        .expect("invoke_tool_with_economy body must exist");
+    let lock_acquisitions = body.matches("self.contexts.lock().await").count();
+    assert!(
+        lock_acquisitions >= 2,
+        "invoke_tool_with_economy must acquire self.contexts.lock().await at \
+         least twice (Phase 1 + Phase 3), found {lock_acquisitions}. A single \
+         acquisition implies the executor runs while the lock is held."
     );
 }
 
 // --- Content key rotation (#1548) ---
 
 #[test]
-#[ignore = "#1548 — encrypted mode content key rotation is a no-op"]
 fn rotate_content_keys_calls_propose_update() {
     assert!(
-        fn_body_contains(MANAGER_SRC, "execute_rotate_content_keys", "propose_update"),
-        "execute_rotate_content_keys must call propose_update for encrypted mode MLS rotation"
+        fn_body_contains(MANAGER_SRC, "execute_rotate_content_keys", "advance_epoch")
+            || fn_body_contains(MANAGER_SRC, "execute_rotate_content_keys", "propose_update"),
+        "execute_rotate_content_keys must call advance_epoch or propose_update for encrypted mode MLS rotation"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// WASM bridge: consequence dispatch wiring
+//
+// The WASM bridge (scp-ffi-wasm) is a parallel implementation of consequence
+// rule enforcement to the scp-runtime path. Both must dispatch consequences at
+// every mutation site the plan identifies so rate- and participation-based
+// rules fire on either bridge. These assertions catch the wiring regression
+// (observed historically as "consequence rules declared but never enforced in
+// WASM") by structurally verifying the dispatch call sites on the WASM manager
+// and the delegation from the dispatcher to the shared scp-protocol evaluator.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn wasm_send_message_dispatches_consequences() {
+    assert!(
+        fn_body_contains(
+            WASM_MANAGER_SRC,
+            "send_message",
+            "dispatch_consequences_for_subject",
+        ),
+        "WASM send_message body must call dispatch_consequences_for_subject \
+         after appending MessageSent so rate-based rules fire on the sender"
+    );
+}
+
+#[test]
+fn wasm_execute_governance_action_dispatches_consequences() {
+    let body = extract_fn_body(WASM_MANAGER_SRC, "execute_governance_action")
+        .expect("WASM execute_governance_action body must exist");
+    let call_count = body.matches("dispatch_consequences_for_subject").count();
+    assert!(
+        call_count >= 2,
+        "WASM execute_governance_action must call dispatch_consequences_for_subject \
+         at least twice (once for the executor DID, once for the action's target \
+         DID); found {call_count}"
+    );
+}
+
+#[test]
+fn wasm_dispatch_consequences_calls_evaluate_consequence_rules() {
+    assert!(
+        fn_body_contains(
+            WASM_CONSEQUENCE_SRC,
+            "dispatch_consequences_for_subject",
+            "evaluate_consequence_rules",
+        ),
+        "WASM dispatch_consequences_for_subject must delegate to the shared \
+         scp-protocol evaluate_consequence_rules function so rule-matching \
+         logic stays consistent between bridges"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// C2 — WASM economy fail-closed gate (PR #1606 follow-up)
+//
+// The WASM bridge cannot run scp-runtime's `enforce_economy` pipeline (no
+// payment adapter, no budget tracker, no velocity tracker, no hard rate
+// limit token bucket — see ADR-034). Without a fail-closed gate, paid
+// contexts would silently bypass economic enforcement on every send / join.
+//
+// These assertions verify the gate exists at the AST level so a future
+// refactor cannot silently delete the spending_ucan_jwt parameter wiring
+// or the economic_policy inspection branch.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn wasm_send_message_inspects_spending_ucan_and_economic_policy() {
+    let body = extract_fn_body(WASM_MANAGER_SRC, "send_message")
+        .expect("WASM send_message body must exist");
+
+    // The parameter must NOT be underscore-prefixed: that name silently
+    // discards the JWT and was the original C2 bug. The C2 fix renames
+    // it to `spending_ucan_jwt` and references it in the rejection
+    // branch so the parameter is no longer dropped.
+    assert!(
+        body.contains("spending_ucan_jwt"),
+        "WASM send_message body must reference `spending_ucan_jwt` so the \
+         parameter is no longer silently discarded (C2 fail-closed gate)"
+    );
+
+    // The body must inspect the context's economic_policy to drive the
+    // fail-closed rejection branch.
+    assert!(
+        body.contains("economic_policy"),
+        "WASM send_message body must reference `economic_policy` to drive \
+         the fail-closed rejection (C2 — paid policies cannot be enforced \
+         on the WASM bridge per ADR-034)"
+    );
+
+    // The reject branch must surface the SCP-ECON-12096 code so the SDK
+    // layer can convert it to a typed `WasmCannotValidateSpendingUcan`
+    // error.
+    assert!(
+        body.contains("SCP_ECON_WASM_CANNOT_VALIDATE_SPENDING_UCAN")
+            || body.contains("SCP-ECON-12096"),
+        "WASM send_message must emit SCP-ECON-12096 in the C2 rejection branch"
+    );
+}
+
+// C4 (#1606) — Bridge tool-invoke economy wiring
+//
+// All 3 non-WASM FFI bridges (PyO3, NAPI, UniFFI) MUST route tool
+// invocation through `ContextManager::invoke_tool_with_economy`. The
+// previous bypass path called `try_consume_hard_rate_limit_*` directly
+// against the bridge-owned tool registry, which disabled per-invocation
+// pricing, spending UCAN AND-composition, velocity tracking, budget
+// enforcement, and the `ToolEconomyTicket` lifecycle for Python /
+// Node / Swift / Kotlin clients.
+//
+// These structural assertions catch any future regression to the
+// bypass path. Each assertion is `fn_body_contains` against the actual
+// bridge function source — calling the runtime helper from a different
+// function would fail the test.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn c4_pyo3_tool_invoke_routes_through_invoke_tool_with_economy() {
+    assert!(
+        fn_body_contains(PYO3_TOOLS_SRC, "py_tool_invoke", "invoke_tool_with_economy"),
+        "PyO3 py_tool_invoke must call ContextManager::invoke_tool_with_economy \
+         (PR #1606 / C4). Calling try_consume_hard_rate_limit_blocking against \
+         a bridge-owned registry instead disables per-invocation pricing, \
+         spending UCAN, velocity tracking, and budget enforcement for Python \
+         clients."
+    );
+}
+
+#[test]
+fn c4_pyo3_tool_invoke_accepts_spending_ucan() {
+    // The bridge MUST accept the spending UCAN parameter — the
+    // runtime's `invoke_tool_with_economy` requires it for §19.5
+    // AND-composition on paid actions.
+    let body =
+        extract_fn_body(PYO3_TOOLS_SRC, "py_tool_invoke").expect("py_tool_invoke body must exist");
+    assert!(
+        body.contains("spending_ucan"),
+        "PyO3 py_tool_invoke must accept and forward a spending UCAN argument \
+         (PR #1606 / C4). Without it, paid tool invocations skip the §19.5 \
+         AND-composition check."
+    );
+    assert!(
+        body.contains("parse_ucan"),
+        "PyO3 py_tool_invoke must parse the spending UCAN JWT into a UcanToken \
+         before passing it to invoke_tool_with_economy."
+    );
+}
+
+#[test]
+fn c4_napi_tool_invoke_routes_through_invoke_tool_with_economy() {
+    assert!(
+        fn_body_contains(NAPI_TOOLS_SRC, "tool_invoke", "invoke_tool_with_economy"),
+        "NAPI tool_invoke must call ContextManager::invoke_tool_with_economy \
+         (PR #1606 / C4). The previous bypass path called \
+         try_consume_hard_rate_limit against the bridge-owned tool registry, \
+         disabling per-invocation pricing, spending UCAN, velocity tracking, \
+         and budget enforcement for Node clients."
+    );
+}
+
+#[test]
+fn c4_napi_tool_invoke_accepts_spending_ucan() {
+    let body =
+        extract_fn_body(NAPI_TOOLS_SRC, "tool_invoke").expect("NAPI tool_invoke body must exist");
+    assert!(
+        body.contains("spending_ucan_jwt"),
+        "NAPI tool_invoke must accept and forward a spending_ucan_jwt argument \
+         (PR #1606 / C4). Without it, paid tool invocations skip the §19.5 \
+         AND-composition check."
+    );
+    assert!(
+        body.contains("parse_ucan"),
+        "NAPI tool_invoke must parse the spending UCAN JWT into a UcanToken \
+         before passing it to invoke_tool_with_economy."
+    );
+}
+
+#[test]
+fn wasm_join_context_inspects_spending_ucan_and_economic_policy() {
+    let body = extract_fn_body(WASM_MANAGER_SRC, "join_context")
+        .expect("WASM join_context body must exist");
+
+    assert!(
+        body.contains("spending_ucan_jwt"),
+        "WASM join_context body must reference `spending_ucan_jwt` so the \
+         parameter is no longer silently discarded (C2 fail-closed gate)"
+    );
+
+    assert!(
+        body.contains("economic_policy"),
+        "WASM join_context body must reference `economic_policy` to drive \
+         the fail-closed rejection (C2 — paid policies cannot be enforced \
+         on the WASM bridge per ADR-034)"
+    );
+
+    assert!(
+        body.contains("SCP_ECON_WASM_CANNOT_VALIDATE_SPENDING_UCAN")
+            || body.contains("SCP-ECON-12096"),
+        "WASM join_context must emit SCP-ECON-12096 in the C2 rejection branch"
+    );
+}
+
+#[test]
+fn wasm_create_context_rejects_paid_economic_policy() {
+    let body = extract_fn_body(WASM_MANAGER_SRC, "create_context")
+        .expect("WASM create_context body must exist");
+
+    // The gate is implemented via the `stored_policy_requires_payment`
+    // helper so the gate logic can be unit-tested independently. The
+    // create-time gate ALSO references `economic_policy` (because that
+    // is the field whose paid-ness is being checked) and surfaces the
+    // SCP-ECON-12095 code in the rejection.
+    assert!(
+        body.contains("stored_policy_requires_payment"),
+        "WASM create_context must call `stored_policy_requires_payment` to \
+         drive the C2 fail-closed rejection of paid economic policies"
+    );
+
+    assert!(
+        body.contains("SCP_ECON_PAID_POLICY_UNSUPPORTED_ON_WASM")
+            || body.contains("SCP-ECON-12095"),
+        "WASM create_context must emit SCP-ECON-12095 in the C2 rejection branch"
+    );
+}
+
+#[test]
+fn wasm_set_economic_policy_governance_rejects_paid_policy() {
+    // The C2 gate also fires through governance dispatch so a paid
+    // policy cannot enter WASM state via the back door. The dispatch
+    // path was extracted to `dispatch_set_economic_policy` to keep the
+    // parent match arm under `clippy::too_many_lines`.
+    let body = extract_fn_body(WASM_MANAGER_SRC, "dispatch_set_economic_policy")
+        .expect("WASM dispatch_set_economic_policy body must exist");
+
+    assert!(
+        body.contains("policy_requires_payment"),
+        "WASM dispatch_set_economic_policy must call `policy_requires_payment` \
+         to drive the C2 fail-closed rejection of paid economic policies via \
+         governance"
+    );
+
+    assert!(
+        body.contains("SCP_ECON_PAID_POLICY_UNSUPPORTED_ON_WASM")
+            || body.contains("SCP-ECON-12095"),
+        "WASM dispatch_set_economic_policy must emit SCP-ECON-12095 in the \
+         C2 rejection branch"
+    );
+}
+
+#[test]
+fn c4_uniffi_tool_invoke_routes_through_invoke_tool_with_economy() {
+    // `extract_fn_body` returns the first match, which is the
+    // top-level `tool_invoke` (not `tool_invoke_cross_context`).
+    assert!(
+        fn_body_contains(UNIFFI_BRIDGE_SRC, "tool_invoke", "invoke_tool_with_economy"),
+        "UniFFI tool_invoke must call ContextManager::invoke_tool_with_economy \
+         (PR #1606 / C4). The previous bypass path called \
+         try_consume_hard_rate_limit against the bridge-owned tool registry, \
+         disabling per-invocation pricing, spending UCAN, velocity tracking, \
+         and budget enforcement for Swift / Kotlin clients."
+    );
+}
+
+#[test]
+fn c4_uniffi_tool_invoke_accepts_spending_ucan() {
+    let body = extract_fn_body(UNIFFI_BRIDGE_SRC, "tool_invoke")
+        .expect("UniFFI tool_invoke body must exist");
+    assert!(
+        body.contains("spending_ucan_jwt"),
+        "UniFFI tool_invoke must accept and forward a spending_ucan_jwt argument \
+         (PR #1606 / C4). Without it, paid tool invocations skip the §19.5 \
+         AND-composition check."
+    );
+    assert!(
+        body.contains("parse_ucan"),
+        "UniFFI tool_invoke must parse the spending UCAN JWT into a UcanToken \
+         before passing it to invoke_tool_with_economy."
     );
 }
 
@@ -406,61 +908,71 @@ fn pipeline_active_assertions_never_decrease() {
     );
 }
 
-/// Detects stale `#[ignore]` attributes. If a wiring PR lands but forgets
-/// to remove the `#[ignore]`, this test catches it by running the same check
-/// the ignored test would run. A passing check = stale ignore = CI failure.
+/// Asserts that no `#[ignore]` attributes remain in this test file.
+///
+/// Each batch-2 issue's wiring is verified individually: if the wiring
+/// has landed (function body contains the expected callee), any
+/// remaining `#[ignore]` referencing that issue is stale and must be
+/// removed. A catch-all at the end rejects any `#[ignore]` at all.
 #[test]
 fn no_stale_ignores() {
-    let mut stale = vec![];
+    let mut stale: Vec<&str> = vec![];
+    let source = include_str!("pipeline_wiring.rs");
 
-    // Sender key rotation (#1541)
+    // #1531 — consequence evaluation wired in dispatch_consequences
     if fn_body_contains(
         MANAGER_SRC,
-        "execute_remove_member",
-        "remove_member_sender_key",
-    ) {
-        stale.push("execute_remove_member_calls_remove_member_sender_key (#1541)");
-    }
-
-    // Standing (#1530)
-    if fn_body_contains(
-        MANAGER_SRC,
-        "propose_governance_action_inner",
-        "check_standing",
-    ) {
-        stale.push("propose_governance_checks_standing (#1530)");
-    }
-
-    // Consequences (#1531)
-    if fn_body_contains(
-        MANAGER_SRC,
-        "finalize_governance_action",
+        "dispatch_consequences",
         "evaluate_consequence_rules",
-    ) {
-        stale.push("governance_dispatch_calls_evaluate_consequences (#1531)");
+    ) && source.contains("#[ignore = \"")
+        && source.contains("1531")
+    {
+        stale.push("consequence evaluation wired but #[ignore] for #1531 still present");
     }
 
-    // Economy (#1537)
+    // #1537 — economy enforcement wired in enforce_economy
+    if fn_body_contains(MANAGER_SRC, "enforce_economy", "evaluate_cost")
+        && source.contains("#[ignore = \"")
+        && source.contains("1537")
+    {
+        stale.push("economy enforcement wired but #[ignore] for #1537 still present");
+    }
+
+    // #1530 — proposer eligibility check wired in propose_governance_action_inner
     if fn_body_contains(
         MANAGER_SRC,
         "propose_governance_action_inner",
-        "evaluate_cost",
-    ) || fn_body_contains(MANAGER_SRC, "send_message", "evaluate_cost")
+        "check_proposer_eligibility",
+    ) && source.contains("#[ignore = \"")
+        && source.contains("1530")
     {
-        stale.push("governance_enforces_economic_policy (#1537)");
+        stale.push("proposer eligibility check wired but #[ignore] for #1530 still present");
     }
 
-    // Content key rotation (#1548)
-    if fn_body_contains(MANAGER_SRC, "execute_rotate_content_keys", "propose_update") {
-        stale.push("rotate_content_keys_calls_propose_update (#1548)");
+    // #1548 — content key rotation wired in execute_rotate_content_keys
+    if (fn_body_contains(MANAGER_SRC, "execute_rotate_content_keys", "advance_epoch")
+        || fn_body_contains(MANAGER_SRC, "execute_rotate_content_keys", "propose_update"))
+        && source.contains("#[ignore = \"")
+        && source.contains("1548")
+    {
+        stale.push("content key rotation wired but #[ignore] for #1548 still present");
     }
 
-    assert!(
-        stale.is_empty(),
-        "Stale #[ignore] — these tests would pass but are still ignored. \
-         Remove the #[ignore] attribute and bump MIN_ACTIVE_PIPELINE_ASSERTIONS:\n  {}",
-        stale.join("\n  ")
-    );
+    // #1541 — sender key rotation wired in execute_remove_member and leave_context
+    if fn_body_contains(MANAGER_SRC, "execute_remove_member", "rotate_sender_key")
+        && fn_body_contains(MANAGER_SRC, "leave_context", "rotate_sender_key")
+        && source.contains("#[ignore = \"")
+        && source.contains("1541")
+    {
+        stale.push("sender key rotation wired but #[ignore] for #1541 still present");
+    }
+
+    // Catch-all: no ignores should exist at all
+    if source.matches("#[ignore = \"").count() > 0 {
+        stale.push("unexpected #[ignore] attributes found");
+    }
+
+    assert!(stale.is_empty(), "Stale ignores:\n  {}", stale.join("\n  "));
 }
 
 /// Verifies that CLAUDE.md contains the required enforcement sections.

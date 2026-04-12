@@ -283,6 +283,117 @@ class TestContextCreate:
         params = mock_bridge.py_context_create.call_args[0][1]
         assert params["economic_policy"] == ep_json
 
+    async def test_create_passes_consequence_config(self) -> None:
+        """C5: Context.create must serialize consequence_config to JSON
+        and forward it to the bridge so the per-context opt-in for
+        RevokeAccess flows through to the manager (ADR-017, #1531)."""
+        import json as _json
+
+        mock_bridge = MagicMock()
+        mock_bridge.py_context_create.return_value = _MockHandle()
+
+        config = {"allow_automatic_access_revocation": True}
+        with patch.dict("sys.modules", {"_scp_core": mock_bridge}):
+            await Context.create(
+                creator=_MockIdentity(),
+                ceiling=["messages:read"],
+                consequence_config=config,
+            )
+
+        params = mock_bridge.py_context_create.call_args[0][1]
+        assert params["consequence_config"] == _json.dumps(config), (
+            "consequence_config must be JSON-serialized and forwarded to the bridge"
+        )
+
+    async def test_create_consequence_config_none_default(self) -> None:
+        """C5: when consequence_config is None, the bridge param must
+        also be None so the bridge falls back to the protocol default."""
+        mock_bridge = MagicMock()
+        mock_bridge.py_context_create.return_value = _MockHandle()
+
+        with patch.dict("sys.modules", {"_scp_core": mock_bridge}):
+            await Context.create(
+                creator=_MockIdentity(),
+                ceiling=["messages:read"],
+            )
+
+        params = mock_bridge.py_context_create.call_args[0][1]
+        assert params["consequence_config"] is None
+
+    async def test_create_accepts_empty_consequence_rules(self) -> None:
+        """H14 / M16 regression: an explicit empty consequence_rules list
+        must round-trip as `"[]"`, NOT collapse to None.  An empty rules
+        list declares "no rules apply", which is distinct from "no rules
+        configured -- use defaults" (None)."""
+        import json as _json
+
+        mock_bridge = MagicMock()
+        mock_bridge.py_context_create.return_value = _MockHandle()
+
+        with patch.dict("sys.modules", {"_scp_core": mock_bridge}):
+            await Context.create(
+                creator=_MockIdentity(),
+                ceiling=["messages:read"],
+                consequence_rules=[],
+            )
+
+        params = mock_bridge.py_context_create.call_args[0][1]
+        assert params["consequence_rules"] == _json.dumps([]), (
+            f"empty consequence_rules must serialize as `[]`, got {params['consequence_rules']!r}"
+        )
+
+    async def test_create_consequence_rules_none_default(self) -> None:
+        """When consequence_rules is None, the bridge param must also
+        be None so the bridge falls back to the protocol default."""
+        mock_bridge = MagicMock()
+        mock_bridge.py_context_create.return_value = _MockHandle()
+
+        with patch.dict("sys.modules", {"_scp_core": mock_bridge}):
+            await Context.create(
+                creator=_MockIdentity(),
+                ceiling=["messages:read"],
+            )
+
+        params = mock_bridge.py_context_create.call_args[0][1]
+        assert params["consequence_rules"] is None
+
+    async def test_create_accepts_empty_roles(self) -> None:
+        """H14: an explicit empty roles dict must round-trip to the
+        bridge as an empty dict, not be lost. The PyO3 bridge accepts
+        an empty HashMap; the SDK must not silently drop the param."""
+        mock_bridge = MagicMock()
+        mock_bridge.py_context_create.return_value = _MockHandle()
+
+        with patch.dict("sys.modules", {"_scp_core": mock_bridge}):
+            await Context.create(
+                creator=_MockIdentity(),
+                ceiling=["messages:read"],
+                roles={},
+            )
+
+        params = mock_bridge.py_context_create.call_args[0][1]
+        assert params["roles"] == {}, (
+            f"empty roles must round-trip as `{{}}`, got {params['roles']!r}"
+        )
+
+    async def test_create_accepts_empty_tools(self) -> None:
+        """H14: an explicit empty tools list must round-trip to the
+        bridge as an empty list, not be lost."""
+        mock_bridge = MagicMock()
+        mock_bridge.py_context_create.return_value = _MockHandle()
+
+        with patch.dict("sys.modules", {"_scp_core": mock_bridge}):
+            await Context.create(
+                creator=_MockIdentity(),
+                ceiling=["messages:read"],
+                tools=[],
+            )
+
+        params = mock_bridge.py_context_create.call_args[0][1]
+        assert params["tools"] == [], (
+            f"empty tools must round-trip as `[]`, got {params['tools']!r}"
+        )
+
     async def test_create_default_new_fields(self) -> None:
         mock_bridge = MagicMock()
         mock_bridge.py_context_create.return_value = _MockHandle()
@@ -554,6 +665,38 @@ class TestContextInvoke:
 
         call_args = mock_bridge.tool_invoke.call_args[0]
         assert call_args[5] is None
+
+    async def test_invoke_spending_ucan_defaults_to_none(self) -> None:
+        """spending_ucan defaults to None when not provided (free tools)."""
+        mock_bridge = MagicMock()
+        mock_bridge.tool_invoke.return_value = {}
+
+        with patch.dict("sys.modules", {"_scp_core": mock_bridge}):
+            ctx = _make_context()
+            await ctx.invoke("tool", {}, ucan_token="tok")
+
+        call_args = mock_bridge.tool_invoke.call_args[0]
+        # Position 6 is the new spending_ucan parameter (C4 fix —
+        # routes through ContextManager.invoke_tool_with_economy).
+        assert call_args[6] is None
+
+    async def test_invoke_passes_spending_ucan(self) -> None:
+        """spending_ucan is forwarded as the 7th positional arg (#1606 C4)."""
+        mock_bridge = MagicMock()
+        mock_bridge.tool_invoke.return_value = {}
+
+        spending = "eyJ0eXAiOiJKV1QiLCJhbGciOiJFZERTQSJ9.spending.sig"
+        with patch.dict("sys.modules", {"_scp_core": mock_bridge}):
+            ctx = _make_context()
+            await ctx.invoke(
+                "paid_tool",
+                {"amount": 100},
+                ucan_token="tok",
+                spending_ucan=spending,
+            )
+
+        call_args = mock_bridge.tool_invoke.call_args[0]
+        assert call_args[6] == spending
 
     async def test_invoke_returns_dict(self) -> None:
         mock_bridge = MagicMock()
@@ -961,6 +1104,159 @@ class TestEconomicPolicyRoundtrip:
             result = await ctx.get_economic_policy()
 
         assert result is None
+
+
+# ---------------------------------------------------------------------------
+# Spending UCAN / consequence event SDK-level tests (#1537, #1593, #1594)
+# ---------------------------------------------------------------------------
+
+
+class TestEvaluateInvitationSpending:
+    """Tests for evaluate_invitation with spending_json parameter (#1537, #1593)."""
+
+    def test_evaluate_invitation_accepts_spending_json(self) -> None:
+        """evaluate_invitation passes spending_json to the bridge."""
+        mock_bridge = MagicMock()
+        mock_bridge.evaluate_invitation.return_value = "prompt_agent"
+
+        with patch.dict("sys.modules", {"_scp_core": mock_bridge}):
+            from scp_sdk.context import evaluate_invitation
+
+            result = evaluate_invitation(
+                params_json='{"ceiling":[]}',
+                inviter_did="did:dht:z6MkBob",
+                identity_did="did:dht:z6MkLocal",
+                spending_json='{"has_spending_ucan":true,"configured_adapters":["x402"],"available_balance":10000}',
+            )
+
+        assert result == "prompt_agent"
+        call_args = mock_bridge.evaluate_invitation.call_args[0]
+        # spending_json is the 5th positional argument (index 4).
+        assert call_args[4] is not None
+        assert "has_spending_ucan" in call_args[4]
+
+    def test_evaluate_invitation_none_spending_passes_none(self) -> None:
+        """evaluate_invitation with no spending_json passes None."""
+        mock_bridge = MagicMock()
+        mock_bridge.evaluate_invitation.return_value = "prompt_agent"
+
+        with patch.dict("sys.modules", {"_scp_core": mock_bridge}):
+            from scp_sdk.context import evaluate_invitation
+
+            evaluate_invitation(
+                params_json='{"ceiling":[]}',
+                inviter_did="did:dht:z6MkBob",
+                identity_did="did:dht:z6MkLocal",
+            )
+
+        call_args = mock_bridge.evaluate_invitation.call_args[0]
+        assert call_args[4] is None
+
+    def test_evaluate_invitation_accepts_empty_trusted_dids(self) -> None:
+        """H14: trusted_dids=[] must round-trip as a JSON-encoded empty
+        array, NOT collapse to None. Empty list = "auto-reject everyone";
+        None = "no trusted-DID policy".  These are distinct policies
+        and the SDK must preserve the distinction at the FFI boundary.
+        """
+        mock_bridge = MagicMock()
+        mock_bridge.evaluate_invitation.return_value = "prompt_agent"
+
+        with patch.dict("sys.modules", {"_scp_core": mock_bridge}):
+            from scp_sdk.context import evaluate_invitation
+
+            evaluate_invitation(
+                params_json='{"ceiling":[]}',
+                inviter_did="did:dht:z6MkBob",
+                identity_did="did:dht:z6MkLocal",
+                trusted_dids=[],
+            )
+
+        call_args = mock_bridge.evaluate_invitation.call_args[0]
+        # trusted_dids_json is the 6th positional argument (index 5).
+        assert call_args[5] == "[]", (
+            f"empty trusted_dids must serialize as `[]`, got {call_args[5]!r}"
+        )
+
+    def test_evaluate_invitation_none_trusted_dids_passes_none(self) -> None:
+        """H14: trusted_dids=None must pass None to the bridge."""
+        mock_bridge = MagicMock()
+        mock_bridge.evaluate_invitation.return_value = "prompt_agent"
+
+        with patch.dict("sys.modules", {"_scp_core": mock_bridge}):
+            from scp_sdk.context import evaluate_invitation
+
+            evaluate_invitation(
+                params_json='{"ceiling":[]}',
+                inviter_did="did:dht:z6MkBob",
+                identity_did="did:dht:z6MkLocal",
+                trusted_dids=None,
+            )
+
+        call_args = mock_bridge.evaluate_invitation.call_args[0]
+        assert call_args[5] is None
+
+    def test_evaluate_invitation_populated_trusted_dids(self) -> None:
+        """H14: a populated trusted_dids list must serialize as JSON."""
+        import json as _json
+
+        mock_bridge = MagicMock()
+        mock_bridge.evaluate_invitation.return_value = "auto_accept"
+
+        with patch.dict("sys.modules", {"_scp_core": mock_bridge}):
+            from scp_sdk.context import evaluate_invitation
+
+            evaluate_invitation(
+                params_json='{"ceiling":[]}',
+                inviter_did="did:dht:z6MkBob",
+                identity_did="did:dht:z6MkLocal",
+                trusted_dids=["did:dht:z6MkBob", "did:dht:z6MkCarol"],
+            )
+
+        call_args = mock_bridge.evaluate_invitation.call_args[0]
+        assert _json.loads(call_args[5]) == [
+            "did:dht:z6MkBob",
+            "did:dht:z6MkCarol",
+        ]
+
+
+class TestConsequenceEventConversion:
+    """Tests for consequence event types at the SDK level (#1531, #1594)."""
+
+    def test_consequence_triggered_message_type(self) -> None:
+        """Messages with consequence_triggered prefix are system events."""
+        payload = (
+            "consequence_triggered: member=did:dht:z6MkBob"
+            " rule=2 trigger=velocity action=mute"
+            " context=ctx-123"
+        )
+        msg = Message(
+            sender_did="scp:system",
+            content=payload,
+            timestamp=1700000000.0,
+            sequence=0,
+            context_id="ctx-123",
+        )
+        assert msg.sender_did == "scp:system"
+        assert "consequence_triggered" in msg.content
+
+    def test_consequence_enforced_message_type(self) -> None:
+        """Messages with consequence_enforced prefix are system events."""
+        payload = (
+            "consequence_enforced:"
+            " member=did:dht:z6MkAlice"
+            " action=restrict_write success=true"
+            " context=ctx-456"
+        )
+        msg = Message(
+            sender_did="scp:system",
+            content=payload,
+            timestamp=1700000000.0,
+            sequence=0,
+            context_id="ctx-456",
+        )
+        assert msg.sender_did == "scp:system"
+        assert "consequence_enforced" in msg.content
+        assert "success=true" in msg.content
 
 
 # ---------------------------------------------------------------------------

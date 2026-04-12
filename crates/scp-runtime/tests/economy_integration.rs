@@ -37,9 +37,7 @@ use scp_event_log::tree;
 use scp_event_log::{Event, EventLog, EventPayload, EventType};
 use scp_identity::DID;
 use scp_primitives::Clock;
-use scp_protocol::crypto::ucan::spending::{
-    BudgetTracker, SpendingCapability, SpendingError, validate_spending_ucan,
-};
+use scp_protocol::crypto::ucan::spending::{BudgetTracker, SpendingCapability, SpendingError};
 use scp_protocol::crypto::ucan::{Attenuation, UcanHeader, UcanPayload, UcanToken};
 use scp_protocol::economy::antispam::{
     EscalationConfig, EscalationThreshold, SenderVelocityTracker,
@@ -525,37 +523,17 @@ fn invariant_1_relay_economic_config_visible_in_wellknown() {
 // ===========================================================================
 
 /// Invariant 2: Attempt paid action without spending UCAN returns
-/// `SpendingCapabilityRequired` error.
+/// `SpendingCapabilityRequired` error. Action capability is verified at
+/// the gate layer upstream per spec §19.5.
 #[test]
 fn invariant_2_paid_action_without_spending_ucan_rejected() {
-    use scp_protocol::crypto::ucan::spending::check_and_composition;
+    use scp_protocol::crypto::ucan::spending::check_spending_capability;
 
-    let now = scp_primitives::SystemClock.now_secs();
-
-    // Agent has an action UCAN but no spending UCAN.
-    let action_ucan = UcanToken {
-        header: UcanHeader::new(),
-        payload: UcanPayload {
-            iss: "did:dht:z6MkHuman".to_owned(),
-            aud: "did:dht:z6MkAgent".to_owned(),
-            exp: now + 3600,
-            nbf: Some(now),
-            nnc: "test-nonce-action-1".to_owned(),
-            att: vec![Attenuation {
-                with: "scp:context:ctx-1".to_owned(),
-                can: "messages:write".to_owned(),
-            }],
-            prf: vec![],
-            fct: None,
-        },
-        signature: vec![0u8; 64],
-        encoded: String::new(),
-    };
+    let _now = scp_primitives::SystemClock.now_secs();
 
     // Action cost is 10 (non-zero), but no spending UCAN provided.
     let cost = scp_protocol::crypto::ucan::spending::Amount(10);
-    let result = check_and_composition(
-        Some(&action_ucan),
+    let result = check_spending_capability(
         None, // No spending UCAN
         cost,
         "send message in paid context",
@@ -568,53 +546,32 @@ fn invariant_2_paid_action_without_spending_ucan_rejected() {
     );
 }
 
-/// Invariant 2: Grant spending UCAN, attempt paid action -- AND-composition passes.
+/// Invariant 2: Grant spending UCAN, attempt paid action — spending side of
+/// AND-composition passes. Action capability is verified at the gate layer
+/// upstream per spec §19.5.
+///
+/// C1 (PR #1606): the standalone `validate_spending_ucan` is now `pub(crate)`
+/// in `scp-protocol`. End-to-end spending validation goes through
+/// `validate_spending_ucan_signed` (the only public entry point), which is
+/// exercised by the manager-level tests in
+/// `crates/scp-runtime/src/context/manager/tests/governance.rs`. This
+/// integration test now only exercises the cap-only `check_spending_capability`
+/// surface — the scope/lifetime/attenuation surface is covered by the
+/// scp-protocol unit tests in `crypto/ucan/spending.rs`.
 #[test]
 fn invariant_2_paid_action_with_spending_ucan_succeeds() {
-    use scp_protocol::crypto::ucan::spending::check_and_composition;
-
-    let now = scp_primitives::SystemClock.now_secs();
+    use scp_protocol::crypto::ucan::spending::check_spending_capability;
 
     let cap = test_spending_capability();
     let spending_ucan = make_spending_ucan(&cap, "scp:spending:ctx-econ-test");
 
-    let action_ucan = UcanToken {
-        header: UcanHeader::new(),
-        payload: UcanPayload {
-            iss: "did:dht:z6MkHuman".to_owned(),
-            aud: "did:dht:z6MkAgent".to_owned(),
-            exp: now + 3600,
-            nbf: Some(now),
-            nnc: "test-nonce-action-2".to_owned(),
-            att: vec![Attenuation {
-                with: "scp:context:ctx-econ-test".to_owned(),
-                can: "messages:write".to_owned(),
-            }],
-            prf: vec![],
-            fct: None,
-        },
-        signature: vec![0u8; 64],
-        encoded: String::new(),
-    };
-
-    // Check AND composition with valid spending UCAN.
+    // Check spending capability with valid spending UCAN.
     let cost = scp_protocol::crypto::ucan::spending::Amount(10);
-    let result = check_and_composition(
-        Some(&action_ucan),
-        Some(&spending_ucan),
-        cost,
-        "send message",
+    let result = check_spending_capability(Some(&spending_ucan), cost, "send message");
+    assert!(
+        result.is_ok(),
+        "spending capability check should succeed: {result:?}"
     );
-    assert!(result.is_ok(), "AND composition should succeed: {result:?}");
-
-    // Validate spending UCAN itself.
-    let validated = validate_spending_ucan(
-        &spending_ucan,
-        "ctx-econ-test",
-        None,
-        &scp_primitives::SystemClock,
-    );
-    assert!(validated.is_ok(), "spending UCAN validation should succeed");
 }
 
 /// Invariant 2: Full authorize-capture cycle with adapter after UCAN check passes.
@@ -653,20 +610,31 @@ async fn invariant_2_authorize_capture_after_spending_check() {
     assert_eq!(receipt.adapter_id, "test");
 }
 
-/// Invariant 2: No action UCAN at all is rejected (even for free actions).
+/// Invariant 2: Free actions succeed without any spending UCAN.
+/// Paid actions with no spending UCAN are rejected.
+///
+/// (Action capability is verified at the gate layer upstream per spec §19.5
+/// — see the `MessagesWrite` / `ToolInvoke` `member_has_capability` checks
+/// in the manager modules. This test exercises only the spending side.)
 #[test]
-fn invariant_2_no_action_ucan_rejected() {
-    use scp_protocol::crypto::ucan::spending::check_and_composition;
+fn invariant_2_spending_capability_paid_action_rejected_without_ucan() {
+    use scp_protocol::crypto::ucan::spending::check_spending_capability;
 
-    let cost = scp_protocol::crypto::ucan::spending::Amount(0);
-    let result = check_and_composition(
-        None, // No action UCAN
-        None, // No spending UCAN
-        cost,
-        "any action",
+    // Free action (cost=0) with no spending UCAN — should succeed.
+    let cost_zero = scp_protocol::crypto::ucan::spending::Amount(0);
+    let result_free = check_spending_capability(None, cost_zero, "any action");
+    assert!(
+        result_free.is_ok(),
+        "free action should succeed without any spending UCAN"
     );
 
-    assert!(result.is_err(), "missing action UCAN should fail");
+    // Paid action (cost>0) with no spending UCAN — should fail.
+    let cost_paid = scp_protocol::crypto::ucan::spending::Amount(100);
+    let result_paid = check_spending_capability(None, cost_paid, "paid action");
+    assert!(
+        result_paid.is_err(),
+        "paid action should fail without spending UCAN"
+    );
 }
 
 // ===========================================================================
@@ -1529,6 +1497,13 @@ fn integration_dynamic_pricing() {
 // ===========================================================================
 
 /// Anti-spam escalation: sender velocity drives step-function cost increases.
+///
+/// All messages are recorded at `now - 30` (30s into the 60s window). This
+/// matches realistic usage where `record_message` is called with the current
+/// wall clock; using timestamps strictly within `(now - window, now]` avoids
+/// interacting with F8's prune-on-record logic, which uses
+/// `timestamp - window` as its cutoff and would otherwise drop legitimate
+/// earlier entries when subsequent messages carry timestamps > `now`.
 #[test]
 fn integration_anti_spam_escalation() {
     let tracker = SenderVelocityTracker::new(60);
@@ -1552,6 +1527,9 @@ fn integration_anti_spam_escalation() {
     };
 
     let now = 1000;
+    // Record every message 30 seconds before `now` so they all land inside
+    // the 60s sliding window.
+    let recorded_at = now - 30;
 
     // Normal conversation (0 msg/min): base cost only.
     assert_eq!(
@@ -1560,8 +1538,8 @@ fn integration_anti_spam_escalation() {
     );
 
     // Record 10 messages (hits first threshold).
-    for i in 0..10 {
-        tracker.record_message(&sender, now - 30 + i);
+    for _ in 0..10 {
+        tracker.record_message(&sender, recorded_at);
     }
     assert_eq!(
         tracker.compute_escalated_cost(&sender, now, base_cost, &config, None, None),
@@ -1569,8 +1547,8 @@ fn integration_anti_spam_escalation() {
     );
 
     // Record 40 more (total 50, hits second threshold).
-    for i in 10..50 {
-        tracker.record_message(&sender, now - 30 + i);
+    for _ in 0..40 {
+        tracker.record_message(&sender, recorded_at);
     }
     assert_eq!(
         tracker.compute_escalated_cost(&sender, now, base_cost, &config, None, None),
@@ -1578,8 +1556,8 @@ fn integration_anti_spam_escalation() {
     );
 
     // Record 150 more (total 200, hits all thresholds).
-    for i in 50..200 {
-        tracker.record_message(&sender, now - 30 + i);
+    for _ in 0..150 {
+        tracker.record_message(&sender, recorded_at);
     }
     assert_eq!(
         tracker.compute_escalated_cost(&sender, now, base_cost, &config, None, None),
@@ -1657,42 +1635,22 @@ fn integration_anti_spam_via_pricing_formula() {
 // ===========================================================================
 // Integration: spending UCAN validation
 // ===========================================================================
-
-/// Spending UCAN scoped to context validates correctly.
-#[test]
-fn integration_spending_ucan_context_scoped() {
-    let cap = test_spending_capability();
-    let token = make_spending_ucan(&cap, "scp:spending:ctx-econ-test");
-
-    let result =
-        validate_spending_ucan(&token, "ctx-econ-test", None, &scp_primitives::SystemClock);
-    assert!(result.is_ok());
-}
-
-/// Spending UCAN with global scope covers any context.
-#[test]
-fn integration_spending_ucan_global_scope() {
-    let cap = test_spending_capability();
-    let token = make_spending_ucan(&cap, "scp:spending:*");
-
-    let result =
-        validate_spending_ucan(&token, "any-context-id", None, &scp_primitives::SystemClock);
-    assert!(result.is_ok());
-}
-
-/// Spending UCAN scope mismatch is rejected.
-#[test]
-fn integration_spending_ucan_scope_mismatch() {
-    let cap = test_spending_capability();
-    let token = make_spending_ucan(&cap, "scp:spending:ctx-123");
-
-    let err =
-        validate_spending_ucan(&token, "ctx-456", None, &scp_primitives::SystemClock).unwrap_err();
-    assert!(
-        matches!(err, SpendingError::ScopeNotCovered { .. }),
-        "expected ScopeNotCovered, got: {err:?}"
-    );
-}
+//
+// C1 (PR #1606): the partial `validate_spending_ucan` helper is now
+// `pub(crate)` in `scp-protocol`, so the three previous test cases that
+// exercised it directly (`integration_spending_ucan_context_scoped`,
+// `integration_spending_ucan_global_scope`,
+// `integration_spending_ucan_scope_mismatch`) have been removed from this
+// file. They duplicated unit tests already living in
+// `crates/scp-protocol/src/crypto/ucan/spending.rs`
+// (`validate_spending_ucan_context_scoped`,
+// `validate_spending_ucan_global_scope`,
+// `validate_spending_ucan_scope_mismatch`), which still cover the same
+// scope/lifetime surface from inside the crate and continue to run on
+// every `cargo test -p scp-protocol`. End-to-end spending validation
+// (signature + chain + replay + scope + lifetime + attenuation) is now
+// exercised through `validate_spending_ucan_signed` by the manager-level
+// tests in `crates/scp-runtime/src/context/manager/tests/governance.rs`.
 
 /// Budget tracker enforces per-action and total limits via `check_and_record`.
 #[test]

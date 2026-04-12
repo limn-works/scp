@@ -769,6 +769,8 @@ mod tests {
             max_nesting_depth: None,
             session_cap: None,
             economic_policy: None,
+            consequence_rules_json: None,
+            consequence_config_json: None,
         };
 
         let handle = rt
@@ -829,6 +831,8 @@ mod tests {
             max_nesting_depth: None,
             session_cap: None,
             economic_policy: None,
+            consequence_rules_json: None,
+            consequence_config_json: None,
         };
 
         let handle = rt

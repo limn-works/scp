@@ -359,6 +359,7 @@ async fn broadcast_capabilities_enforced() {
             b"hello broadcast",
             Some(&author_signing_key),
             None,
+            None,
         )
         .await;
     assert!(result.is_ok(), "author should be able to publish");
@@ -371,6 +372,7 @@ async fn broadcast_capabilities_enforced() {
             &"did:key:sub1".into(),
             b"unauthorized",
             Some(&sub_signing_key),
+            None,
             None,
         )
         .await;
@@ -840,7 +842,7 @@ async fn broadcast_unsubscribe_with_key_rotation() {
 // Author blocking (SCP-227 AC4 + AC7) — governance-gated
 // ===================================================================
 
-/// SCP-227 AC4: governance-approved `BlockAuthor` proposal revokes sender
+/// SCP-227 AC4: governance-approved `Revoke` proposal revokes sender
 /// key, preventing the blocked author from publishing.
 #[tokio::test]
 // Integration test exercises full governance + broadcast lifecycle; splitting
@@ -905,15 +907,14 @@ async fn broadcast_block_author_via_governance_revokes_publish() {
 
     // Block bob via governance: admin proposes, auto-approved.
     let proposal =
-        approved_block_author_proposal(&"did:key:alice".into(), &ctx_id, &"did:key:bob".into());
+        approved_revoke_proposal(&"did:key:alice".into(), &ctx_id, &"did:key:bob".into());
     let action_result = manager.execute_governance_action(&ctx_id, &proposal).await;
     assert!(action_result.is_ok());
-    let super::GovernanceActionResult::WriteAccessRevoked(revoke_result) = action_result.unwrap()
-    else {
-        panic!("expected WriteAccessRevoked result from BlockAuthor delegation");
+    let super::GovernanceActionResult::AccessRevoked(revoke_result) = action_result.unwrap() else {
+        panic!("expected AccessRevoked result from Revoke action");
     };
     assert_eq!(revoke_result.did.0, "did:key:bob");
-    assert_eq!(revoke_result.scope, RevocationScope::Full);
+    assert_eq!(revoke_result.access, super::AccessScope::Write);
 
     // Alice can still publish (unaffected).
     assert!(
@@ -982,9 +983,9 @@ async fn broadcast_block_author_rejects_pending_proposal() {
         proposal_id: [0u8; 32],
         context_id: ctx_id.clone(),
         proposer_did: "did:key:alice".into(),
-        action: super::GovernanceAction::BlockAuthor {
+        action: super::GovernanceAction::RevokeAccess {
             did: "did:key:bob".into(),
-            reason: None,
+            access: super::AccessScope::Write,
         },
         status: ProposalStatus::Pending,
         created_at: 1000,
@@ -1096,7 +1097,7 @@ async fn broadcast_blocked_author_messages_undecryptable() {
 
     // Block Bob via governance (admin proposes, auto-approved).
     let proposal =
-        approved_block_author_proposal(&"did:key:alice".into(), &ctx_id, &"did:key:bob".into());
+        approved_revoke_proposal(&"did:key:alice".into(), &ctx_id, &"did:key:bob".into());
     manager
         .execute_governance_action(&ctx_id, &proposal)
         .await
@@ -1170,7 +1171,7 @@ async fn broadcast_blocked_author_messages_undecryptable() {
     assert_eq!(old_decrypted, bob_msg1);
 }
 
-/// SCP-227: governance-approved `BlockAuthor` on non-broadcast context
+/// SCP-227: governance-approved `Revoke` on non-broadcast context
 /// returns error (the action only applies to broadcast contexts).
 #[tokio::test]
 async fn broadcast_block_author_on_encrypted_context_fails() {
@@ -1179,7 +1180,7 @@ async fn broadcast_block_author_on_encrypted_context_fails() {
     let target_did: DID = "did:key:z6MkhaXgBZDvotDkL5257faiztiGiC2QtKLGpbnnEGta2doK".into();
     let admin_did: DID = "did:key:z6MkhaXgBZDvotDkL5257faiztiGiC2QtKLGpbnnEGta2doK".into();
 
-    let proposal = approved_block_author_proposal(&admin_did, "test-ctx", &target_did);
+    let proposal = approved_revoke_proposal(&admin_did, "test-ctx", &target_did);
     let result = manager
         .execute_governance_action("test-ctx", &proposal)
         .await;
@@ -1193,7 +1194,7 @@ async fn governance_action_rejects_wrong_context_id() {
     let (manager, _handle, ctx_id) = setup_broadcast_context_two_authors().await;
 
     // Create a proposal targeting a different context.
-    let proposal = approved_block_author_proposal(
+    let proposal = approved_revoke_proposal(
         &"did:key:alice".into(),
         "ctx-a-other",
         &"did:key:bob".into(),
@@ -1218,7 +1219,7 @@ async fn governance_action_rejects_replayed_proposal() {
     let (manager, _handle, ctx_id) = setup_broadcast_context_two_authors().await;
 
     let proposal =
-        approved_block_author_proposal(&"did:key:alice".into(), &ctx_id, &"did:key:bob".into());
+        approved_revoke_proposal(&"did:key:alice".into(), &ctx_id, &"did:key:bob".into());
 
     // First execution should succeed.
     let result = manager.execute_governance_action(&ctx_id, &proposal).await;
@@ -1237,12 +1238,12 @@ async fn governance_action_rejects_replayed_proposal() {
 }
 
 // ===================================================================
-// Read access revocation/restoration (SCP-GG-006) — governance-gated
+// Read access revocation/restoration — governance-gated
 // ===================================================================
 
 /// Helper: creates a broadcast context with `MemberBan` in the ceiling,
 /// one author (alice), and one subscriber (sub1).
-/// SCP-GG-006: `RevokeReadAccess` on broadcast context bans subscriber.
+/// `Revoke (read)` on broadcast context bans subscriber.
 #[tokio::test]
 async fn revoke_read_access_bans_subscriber_in_broadcast() {
     let (manager, ctx_id) = setup_broadcast_with_member_ban().await;
@@ -1255,9 +1256,9 @@ async fn revoke_read_access_bans_subscriber_in_broadcast() {
         "sub1 should be subscribed before revocation"
     );
 
-    let action = super::GovernanceAction::RevokeReadAccess {
+    let action = super::GovernanceAction::RevokeAccess {
         did: "did:key:sub1".into(),
-        scope: super::RevocationScope::Full,
+        access: super::AccessScope::Read,
     };
     let proposal = approved_governance_proposal(
         &"did:key:alice".into(),
@@ -1267,11 +1268,11 @@ async fn revoke_read_access_bans_subscriber_in_broadcast() {
     );
 
     let result = manager.execute_governance_action(&ctx_id, &proposal).await;
-    assert!(result.is_ok(), "RevokeReadAccess should succeed");
+    assert!(result.is_ok(), "Revoke (read) should succeed");
 
     let result = result.unwrap();
     match result {
-        super::GovernanceActionResult::ReadAccessRevoked(revoke_result) => {
+        super::GovernanceActionResult::AccessRevoked(revoke_result) => {
             assert_eq!(revoke_result.did.0, "did:key:sub1");
             // At least one author should have rotated keys.
             assert!(
@@ -1279,7 +1280,7 @@ async fn revoke_read_access_bans_subscriber_in_broadcast() {
                 "key rotation should occur on revoke"
             );
         }
-        other => panic!("expected ReadAccessRevoked, got {other:?}"),
+        other => panic!("expected AccessRevoked, got {other:?}"),
     }
 
     // Subscriber should no longer be tracked.
@@ -1290,7 +1291,7 @@ async fn revoke_read_access_bans_subscriber_in_broadcast() {
         "sub1 should not be subscribed after revocation"
     );
 
-    // Verify ReadAccessRevoked event was emitted.
+    // Verify AccessRevoked event was emitted.
     let events = manager.drain_events(&ctx_id).await;
     let has_revoke_event = events.iter().any(|e| {
         matches!(
@@ -1304,7 +1305,7 @@ async fn revoke_read_access_bans_subscriber_in_broadcast() {
     );
 }
 
-/// SCP-GG-006: `RevokeReadAccess` fails when ceiling lacks `MemberBan`.
+/// `Revoke (read)` fails when ceiling lacks `MemberBan`.
 #[tokio::test]
 async fn revoke_read_access_rejected_without_member_ban_ceiling() {
     // Create a broadcast context WITHOUT MemberBan in ceiling.
@@ -1366,9 +1367,9 @@ async fn revoke_read_access_rejected_without_member_ban_ceiling() {
             .unwrap();
     }
 
-    let action = super::GovernanceAction::RevokeReadAccess {
+    let action = super::GovernanceAction::RevokeAccess {
         did: "did:key:sub1".into(),
-        scope: super::RevocationScope::Full,
+        access: super::AccessScope::Read,
     };
     let proposal = approved_governance_proposal(
         &"did:key:alice".into(),
@@ -1380,7 +1381,7 @@ async fn revoke_read_access_rejected_without_member_ban_ceiling() {
     let result = manager.execute_governance_action(&ctx_id, &proposal).await;
     assert!(
         result.is_err(),
-        "RevokeReadAccess should fail without MemberBan in ceiling"
+        "Revoke (read) should fail without MemberBan in ceiling"
     );
     assert!(
         matches!(result.unwrap_err(), ContextError::PermissionDenied(ref msg) if msg.contains("member:ban")),
@@ -1388,15 +1389,15 @@ async fn revoke_read_access_rejected_without_member_ban_ceiling() {
     );
 }
 
-/// SCP-GG-006: `RestoreReadAccess` unbans subscriber in broadcast context.
+/// `RestoreAccess (read)` unbans subscriber in broadcast context.
 #[tokio::test]
 async fn restore_read_access_unbans_subscriber_in_broadcast() {
     let (manager, ctx_id) = setup_broadcast_with_member_ban().await;
 
     // First, revoke read access.
-    let revoke_action = super::GovernanceAction::RevokeReadAccess {
+    let revoke_action = super::GovernanceAction::RevokeAccess {
         did: "did:key:sub1".into(),
-        scope: super::RevocationScope::FutureOnly,
+        access: super::AccessScope::Read,
     };
     let revoke_proposal = approved_governance_proposal(
         &"did:key:alice".into(),
@@ -1413,8 +1414,9 @@ async fn restore_read_access_unbans_subscriber_in_broadcast() {
     manager.drain_events(&ctx_id).await;
 
     // Now restore read access.
-    let restore_action = super::GovernanceAction::RestoreReadAccess {
+    let restore_action = super::GovernanceAction::RestoreAccess {
         did: "did:key:sub1".into(),
+        capabilities: vec![super::Capability::MessagesRead],
     };
     let restore_proposal = approved_governance_proposal(
         &"did:key:alice".into(),
@@ -1426,13 +1428,13 @@ async fn restore_read_access_unbans_subscriber_in_broadcast() {
     let result = manager
         .execute_governance_action(&ctx_id, &restore_proposal)
         .await;
-    assert!(result.is_ok(), "RestoreReadAccess should succeed");
+    assert!(result.is_ok(), "RestoreAccess (read) should succeed");
 
     match result.unwrap() {
-        super::GovernanceActionResult::ReadAccessRestored(restore_result) => {
+        super::GovernanceActionResult::AccessRestored(restore_result) => {
             assert_eq!(restore_result.did.0, "did:key:sub1");
         }
-        other => panic!("expected ReadAccessRestored, got {other:?}"),
+        other => panic!("expected AccessRestored, got {other:?}"),
     }
 
     // Verify ReadAccessRestored event was emitted.
@@ -1449,7 +1451,7 @@ async fn restore_read_access_unbans_subscriber_in_broadcast() {
     );
 }
 
-/// SCP-GG-006: `RestoreReadAccess` also fails without `MemberBan` in ceiling.
+/// `RestoreAccess (read)` also fails without `MemberBan` in ceiling.
 #[tokio::test]
 async fn restore_read_access_rejected_without_member_ban_ceiling() {
     // Create a broadcast context WITHOUT MemberBan in ceiling.
@@ -1472,8 +1474,9 @@ async fn restore_read_access_rejected_without_member_ban_ceiling() {
         .unwrap();
     let ctx_id = "no-ban-restore-ctx".to_owned();
 
-    let action = super::GovernanceAction::RestoreReadAccess {
+    let action = super::GovernanceAction::RestoreAccess {
         did: "did:key:sub1".into(),
+        capabilities: vec![super::Capability::MessagesRead],
     };
     let proposal = approved_governance_proposal(
         &"did:key:alice".into(),
@@ -1485,7 +1488,7 @@ async fn restore_read_access_rejected_without_member_ban_ceiling() {
     let result = manager.execute_governance_action(&ctx_id, &proposal).await;
     assert!(
         result.is_err(),
-        "RestoreReadAccess should fail without MemberBan in ceiling"
+        "RestoreAccess (read) should fail without MemberBan in ceiling"
     );
     assert!(
         matches!(result.unwrap_err(), ContextError::PermissionDenied(ref msg) if msg.contains("member:ban")),
@@ -1499,14 +1502,14 @@ async fn restore_read_access_rejected_without_member_ban_ceiling() {
 
 /// Helper: creates an encrypted context with `MemberBan` in ceiling,
 /// admin (alice) and member (bob).
-/// SCP-CAC-007: `RevokeReadAccess` works on encrypted contexts (not just broadcast).
+/// SCP-CAC-007: `Revoke (read)` works on encrypted contexts (not just broadcast).
 #[tokio::test]
 async fn revoke_read_access_works_on_encrypted_context() {
     let (manager, ctx_id) = setup_encrypted_with_member_ban().await;
 
-    let action = super::GovernanceAction::RevokeReadAccess {
+    let action = super::GovernanceAction::RevokeAccess {
         did: "did:key:bob".into(),
-        scope: super::RevocationScope::Full,
+        access: super::AccessScope::Read,
     };
     let proposal = approved_governance_proposal(
         &"did:key:alice".into(),
@@ -1518,7 +1521,7 @@ async fn revoke_read_access_works_on_encrypted_context() {
     let result = manager.execute_governance_action(&ctx_id, &proposal).await;
     assert!(
         result.is_ok(),
-        "RevokeReadAccess on encrypted context should succeed"
+        "Revoke (read) on encrypted context should succeed"
     );
 
     // Verify bob is tracked as read-revoked.
@@ -1526,7 +1529,7 @@ async fn revoke_read_access_works_on_encrypted_context() {
     let ctx = contexts.get(&ctx_id).unwrap();
     assert!(
         ctx.access
-            .read_revoked_members
+            .read_exclusion_list
             .contains(&DID::from("did:key:bob"))
     );
     assert!(
@@ -1538,7 +1541,7 @@ async fn revoke_read_access_works_on_encrypted_context() {
     assert!(ctx.membership.contains("did:key:bob"));
 }
 
-/// SCP-CAC-007: redundant `RevokeReadAccess` is prevented by TOCTOU replay protection.
+/// SCP-CAC-007: redundant `Revoke (read)` is prevented by TOCTOU replay protection.
 /// The governance engine assigns deterministic proposal IDs, so a second identical
 /// proposal is rejected as "already executed" — redundancy is handled at the
 /// governance layer, not the execution layer.
@@ -1546,9 +1549,9 @@ async fn revoke_read_access_works_on_encrypted_context() {
 async fn revoke_read_access_redundant_rejected_by_replay_protection() {
     let (manager, ctx_id) = setup_encrypted_with_member_ban().await;
 
-    let action = super::GovernanceAction::RevokeReadAccess {
+    let action = super::GovernanceAction::RevokeAccess {
         did: "did:key:bob".into(),
-        scope: super::RevocationScope::Full,
+        access: super::AccessScope::Read,
     };
     let proposal1 = approved_governance_proposal(
         &"did:key:alice".into(),
@@ -1564,9 +1567,9 @@ async fn revoke_read_access_redundant_rejected_by_replay_protection() {
         .unwrap();
 
     // Second identical proposal is rejected by replay protection.
-    let action2 = super::GovernanceAction::RevokeReadAccess {
+    let action2 = super::GovernanceAction::RevokeAccess {
         did: "did:key:bob".into(),
-        scope: super::RevocationScope::Full,
+        access: super::AccessScope::Read,
     };
     let proposal2 = approved_governance_proposal(
         &"did:key:alice".into(),
@@ -1581,13 +1584,14 @@ async fn revoke_read_access_redundant_rejected_by_replay_protection() {
     );
 }
 
-/// SCP-CAC-007: `RestoreReadAccess` returns `NothingToRestore` when never revoked.
+/// SCP-CAC-007: `RestoreAccess (read)` returns `NothingToRestore` when never revoked.
 #[tokio::test]
 async fn restore_read_access_nothing_to_restore() {
     let (manager, ctx_id) = setup_encrypted_with_member_ban().await;
 
-    let action = super::GovernanceAction::RestoreReadAccess {
+    let action = super::GovernanceAction::RestoreAccess {
         did: "did:key:bob".into(),
+        capabilities: vec![super::Capability::MessagesRead],
     };
     let proposal = approved_governance_proposal(
         &"did:key:alice".into(),
@@ -1604,15 +1608,15 @@ async fn restore_read_access_nothing_to_restore() {
     );
 }
 
-/// SCP-CAC-007: `RestoreReadAccess` succeeds after revocation on encrypted context.
+/// SCP-CAC-007: `RestoreAccess (read)` succeeds after revocation on encrypted context.
 #[tokio::test]
 async fn restore_read_access_after_revocation_on_encrypted() {
     let (manager, ctx_id) = setup_encrypted_with_member_ban().await;
 
     // First revoke.
-    let revoke_action = super::GovernanceAction::RevokeReadAccess {
+    let revoke_action = super::GovernanceAction::RevokeAccess {
         did: "did:key:bob".into(),
-        scope: super::RevocationScope::Full,
+        access: super::AccessScope::Read,
     };
     let revoke_proposal = approved_governance_proposal(
         &"did:key:alice".into(),
@@ -1626,8 +1630,9 @@ async fn restore_read_access_after_revocation_on_encrypted() {
         .unwrap();
 
     // Now restore.
-    let restore_action = super::GovernanceAction::RestoreReadAccess {
+    let restore_action = super::GovernanceAction::RestoreAccess {
         did: "did:key:bob".into(),
+        capabilities: vec![super::Capability::MessagesRead],
     };
     let restore_proposal = approved_governance_proposal(
         &"did:key:alice".into(),
@@ -1640,7 +1645,7 @@ async fn restore_read_access_after_revocation_on_encrypted() {
         .await;
     assert!(
         result.is_ok(),
-        "RestoreReadAccess should succeed after revocation"
+        "RestoreAccess (read) should succeed after revocation"
     );
 
     // Bob should no longer be read-revoked.
@@ -1648,7 +1653,7 @@ async fn restore_read_access_after_revocation_on_encrypted() {
     let ctx = contexts.get(&ctx_id).unwrap();
     assert!(
         !ctx.access
-            .read_revoked_members
+            .read_exclusion_list
             .contains(&DID::from("did:key:bob"))
     );
     assert!(
@@ -1660,7 +1665,7 @@ async fn restore_read_access_after_revocation_on_encrypted() {
     assert!(ctx.membership.contains("did:key:bob"));
 }
 
-/// SCP-CAC-007: `RevokeWriteAccess(Full)` destroys sender key in broadcast.
+/// SCP-CAC-007: `Revoke (write)(Full)` destroys sender key in broadcast.
 #[tokio::test]
 async fn revoke_write_access_full_in_broadcast() {
     let (manager, ctx_id) = setup_broadcast_with_member_ban().await;
@@ -1673,9 +1678,9 @@ async fn revoke_write_access_full_in_broadcast() {
             .add_member("did:key:sub1".into(), "subscriber".into(), vec![]);
     }
 
-    let action = super::GovernanceAction::RevokeWriteAccess {
+    let action = super::GovernanceAction::RevokeAccess {
         did: "did:key:alice".into(),
-        scope: super::RevocationScope::Full,
+        access: super::AccessScope::Both,
     };
     let proposal = approved_governance_proposal(
         &"did:key:alice".into(),
@@ -1685,21 +1690,22 @@ async fn revoke_write_access_full_in_broadcast() {
     );
 
     let result = manager.execute_governance_action(&ctx_id, &proposal).await;
-    assert!(result.is_ok(), "RevokeWriteAccess(Full) should succeed");
+    assert!(result.is_ok(), "Revoke (write)(Full) should succeed");
 
-    // Alice should be in write_revoked_members.
+    // Alice should be in suspended_capabilities.
     let contexts = manager.contexts.lock().await;
     let ctx = contexts.get(&ctx_id).unwrap();
     assert!(
-        ctx.access
-            .write_revoked_members
-            .contains(&DID::from("did:key:alice"))
+        ctx.role_state
+            .suspended_capabilities
+            .get("did:key:alice")
+            .is_some_and(|s| s.contains(&Capability::MessagesWrite))
     );
     // Alice is still a member.
     assert!(ctx.membership.contains("did:key:alice"));
 }
 
-/// SCP-CAC-007: `RevokeWriteAccess(FutureOnly)` does NOT destroy broadcast key.
+/// SCP-CAC-007: `Revoke { access: AccessScope::Write }` does NOT destroy broadcast key.
 #[tokio::test]
 async fn revoke_write_access_future_only_no_key_destruction() {
     let (manager, ctx_id) = setup_broadcast_with_member_ban().await;
@@ -1711,9 +1717,9 @@ async fn revoke_write_access_future_only_no_key_destruction() {
             .add_member("did:key:sub1".into(), "subscriber".into(), vec![]);
     }
 
-    let action = super::GovernanceAction::RevokeWriteAccess {
+    let action = super::GovernanceAction::RevokeAccess {
         did: "did:key:alice".into(),
-        scope: super::RevocationScope::FutureOnly,
+        access: super::AccessScope::Write,
     };
     let proposal = approved_governance_proposal(
         &"did:key:alice".into(),
@@ -1723,35 +1729,36 @@ async fn revoke_write_access_future_only_no_key_destruction() {
     );
 
     let result = manager.execute_governance_action(&ctx_id, &proposal).await;
-    assert!(
-        result.is_ok(),
-        "RevokeWriteAccess(FutureOnly) should succeed"
-    );
+    assert!(result.is_ok(), "Revoke (write, FutureOnly) should succeed");
 
-    // Alice should be in write_revoked_members.
+    // Alice should be in suspended_capabilities.
     let contexts = manager.contexts.lock().await;
     let ctx = contexts.get(&ctx_id).unwrap();
     assert!(
-        ctx.access
-            .write_revoked_members
-            .contains(&DID::from("did:key:alice"))
+        ctx.role_state
+            .suspended_capabilities
+            .get("did:key:alice")
+            .is_some_and(|s| s.contains(&Capability::MessagesWrite))
     );
-    // In FutureOnly mode, broadcast author should still exist (key not destroyed).
+    // Per spec §05-contexts §5.9, Revoke removes publishing authority:
+    // the BroadcastContext author entry is removed. Subscribers retain
+    // any cached broadcast keys for historical content (forward-only
+    // restoration model).
     let bc = ctx.broadcast_context.as_ref().unwrap();
     assert!(
-        bc.is_author("did:key:alice"),
-        "FutureOnly should NOT destroy broadcast keys"
+        !bc.is_author("did:key:alice"),
+        "AccessScope::Write removes broadcast author"
     );
 }
 
-/// SCP-CAC-007: redundant `RevokeWriteAccess` is prevented by TOCTOU replay protection.
+/// SCP-CAC-007: redundant `Revoke (write)` is prevented by TOCTOU replay protection.
 #[tokio::test]
 async fn revoke_write_access_redundant_rejected_by_replay_protection() {
     let (manager, ctx_id) = setup_encrypted_with_member_ban().await;
 
-    let action = super::GovernanceAction::RevokeWriteAccess {
+    let action = super::GovernanceAction::RevokeAccess {
         did: "did:key:bob".into(),
-        scope: super::RevocationScope::Full,
+        access: super::AccessScope::Both,
     };
     let proposal = approved_governance_proposal(
         &"did:key:alice".into(),
@@ -1765,9 +1772,9 @@ async fn revoke_write_access_redundant_rejected_by_replay_protection() {
         .unwrap();
 
     // Second identical proposal is rejected by replay protection.
-    let action2 = super::GovernanceAction::RevokeWriteAccess {
+    let action2 = super::GovernanceAction::RevokeAccess {
         did: "did:key:bob".into(),
-        scope: super::RevocationScope::Full,
+        access: super::AccessScope::Both,
     };
     let proposal2 = approved_governance_proposal(
         &"did:key:alice".into(),
@@ -1782,13 +1789,14 @@ async fn revoke_write_access_redundant_rejected_by_replay_protection() {
     );
 }
 
-/// SCP-CAC-007: `RestoreWriteAccess` returns `NothingToRestore` when never revoked.
+/// SCP-CAC-007: `RestoreAccess (write)` returns `NothingToRestore` when never revoked.
 #[tokio::test]
 async fn restore_write_access_nothing_to_restore() {
     let (manager, ctx_id) = setup_encrypted_with_member_ban().await;
 
-    let action = super::GovernanceAction::RestoreWriteAccess {
+    let action = super::GovernanceAction::RestoreAccess {
         did: "did:key:bob".into(),
+        capabilities: vec![super::Capability::MessagesWrite],
     };
     let proposal = approved_governance_proposal(
         &"did:key:alice".into(),
@@ -1805,15 +1813,15 @@ async fn restore_write_access_nothing_to_restore() {
     );
 }
 
-/// SCP-CAC-007: `RestoreWriteAccess` succeeds after revocation, emits event.
+/// SCP-CAC-007: `RestoreAccess (write)` succeeds after revocation, emits event.
 #[tokio::test]
 async fn restore_write_access_after_revocation() {
     let (manager, ctx_id) = setup_encrypted_with_member_ban().await;
 
     // First revoke.
-    let revoke_action = super::GovernanceAction::RevokeWriteAccess {
+    let revoke_action = super::GovernanceAction::RevokeAccess {
         did: "did:key:bob".into(),
-        scope: super::RevocationScope::Full,
+        access: super::AccessScope::Both,
     };
     let revoke_proposal = approved_governance_proposal(
         &"did:key:alice".into(),
@@ -1828,8 +1836,9 @@ async fn restore_write_access_after_revocation() {
     manager.drain_events(&ctx_id).await;
 
     // Now restore.
-    let restore_action = super::GovernanceAction::RestoreWriteAccess {
+    let restore_action = super::GovernanceAction::RestoreAccess {
         did: "did:key:bob".into(),
+        capabilities: vec![super::Capability::MessagesWrite],
     };
     let restore_proposal = approved_governance_proposal(
         &"did:key:alice".into(),
@@ -1840,16 +1849,17 @@ async fn restore_write_access_after_revocation() {
     let result = manager
         .execute_governance_action(&ctx_id, &restore_proposal)
         .await;
-    assert!(result.is_ok(), "RestoreWriteAccess should succeed");
+    assert!(result.is_ok(), "RestoreAccess (write) should succeed");
 
     // Bob should no longer be write-revoked.
     {
         let contexts = manager.contexts.lock().await;
         let ctx = contexts.get(&ctx_id).unwrap();
         assert!(
-            !ctx.access
-                .write_revoked_members
-                .contains(&DID::from("did:key:bob"))
+            !ctx.role_state
+                .suspended_capabilities
+                .get("did:key:bob")
+                .is_some_and(|s| s.contains(&Capability::MessagesWrite))
         );
     }
 
@@ -1861,10 +1871,7 @@ async fn restore_write_access_after_revocation() {
             super::ContextEvent::WriteAccessRestored { did } if did.0 == "did:key:bob"
         )
     });
-    assert!(
-        has_event,
-        "WriteAccessRestored event should have been emitted"
-    );
+    assert!(has_event, "AccessRestored event should have been emitted");
 }
 
 /// SCP-CAC-007: `RotateContentKeys` on broadcast context rotates all author keys.
@@ -1940,9 +1947,9 @@ async fn presence_only_member_cannot_propose() {
     let (manager, ctx_id) = setup_encrypted_with_member_ban().await;
 
     // Revoke bob's read and write access to make them presence-only.
-    let revoke_read = super::GovernanceAction::RevokeReadAccess {
+    let revoke_read = super::GovernanceAction::RevokeAccess {
         did: "did:key:bob".into(),
-        scope: super::RevocationScope::Full,
+        access: super::AccessScope::Read,
     };
     let rr_proposal = approved_governance_proposal(
         &"did:key:alice".into(),
@@ -1955,9 +1962,9 @@ async fn presence_only_member_cannot_propose() {
         .await
         .unwrap();
 
-    let revoke_write = super::GovernanceAction::RevokeWriteAccess {
+    let revoke_write = super::GovernanceAction::RevokeAccess {
         did: "did:key:bob".into(),
-        scope: super::RevocationScope::Full,
+        access: super::AccessScope::Write,
     };
     let rw_proposal = approved_governance_proposal(
         &"did:key:alice".into(),
@@ -1993,9 +2000,9 @@ async fn write_only_revoked_member_can_still_propose() {
     let (manager, ctx_id) = setup_encrypted_with_member_ban().await;
 
     // Revoke bob's write only.
-    let revoke_write = super::GovernanceAction::RevokeWriteAccess {
+    let revoke_write = super::GovernanceAction::RevokeAccess {
         did: "did:key:bob".into(),
-        scope: super::RevocationScope::Full,
+        access: super::AccessScope::Write,
     };
     let rw_proposal = approved_governance_proposal(
         &"did:key:alice".into(),
@@ -2031,14 +2038,14 @@ async fn write_only_revoked_member_can_still_propose() {
     }
 }
 
-/// SCP-CAC-007: `RevokeReadAccess` fails for non-member DID.
+/// SCP-CAC-007: `Revoke (read)` fails for non-member DID.
 #[tokio::test]
 async fn revoke_read_access_non_member_fails() {
     let (manager, ctx_id) = setup_encrypted_with_member_ban().await;
 
-    let action = super::GovernanceAction::RevokeReadAccess {
+    let action = super::GovernanceAction::RevokeAccess {
         did: "did:key:nonexistent".into(),
-        scope: super::RevocationScope::Full,
+        access: super::AccessScope::Read,
     };
     let proposal = approved_governance_proposal(
         &"did:key:alice".into(),
@@ -2061,9 +2068,9 @@ async fn content_access_preserves_membership() {
     let (manager, ctx_id) = setup_encrypted_with_member_ban().await;
 
     // Revoke both read and write.
-    let rr_action = super::GovernanceAction::RevokeReadAccess {
+    let rr_action = super::GovernanceAction::RevokeAccess {
         did: "did:key:bob".into(),
-        scope: super::RevocationScope::Full,
+        access: super::AccessScope::Read,
     };
     let rr_proposal = approved_governance_proposal(
         &"did:key:alice".into(),
@@ -2076,9 +2083,9 @@ async fn content_access_preserves_membership() {
         .await
         .unwrap();
 
-    let rw_action = super::GovernanceAction::RevokeWriteAccess {
+    let rw_action = super::GovernanceAction::RevokeAccess {
         did: "did:key:bob".into(),
-        scope: super::RevocationScope::Full,
+        access: super::AccessScope::Both,
     };
     let rw_proposal = approved_governance_proposal(
         &"did:key:alice".into(),
@@ -2100,13 +2107,14 @@ async fn content_access_preserves_membership() {
     );
     assert!(
         ctx.access
-            .read_revoked_members
+            .read_exclusion_list
             .contains(&DID::from("did:key:bob"))
     );
     assert!(
-        ctx.access
-            .write_revoked_members
-            .contains(&DID::from("did:key:bob"))
+        ctx.role_state
+            .suspended_capabilities
+            .get("did:key:bob")
+            .is_some_and(|s| s.contains(&Capability::MessagesWrite))
     );
 }
 
@@ -2114,14 +2122,14 @@ async fn content_access_preserves_membership() {
 // Write access governance tests (SCP-CAC-007)
 // -----------------------------------------------------------------------
 
-/// SCP-CAC-007: `RevokeWriteAccess` marks member as write-revoked.
+/// SCP-CAC-007: `Revoke (write)` marks member as write-revoked.
 #[tokio::test]
 async fn revoke_write_access_marks_member() {
     let (manager, ctx_id) = setup_encrypted_with_member_ban().await;
 
-    let action = super::GovernanceAction::RevokeWriteAccess {
+    let action = super::GovernanceAction::RevokeAccess {
         did: "did:key:bob".into(),
-        scope: super::RevocationScope::FutureOnly,
+        access: super::AccessScope::Write,
     };
     let proposal = approved_governance_proposal(
         &"did:key:alice".into(),
@@ -2131,13 +2139,13 @@ async fn revoke_write_access_marks_member() {
     );
 
     let result = manager.execute_governance_action(&ctx_id, &proposal).await;
-    assert!(result.is_ok(), "RevokeWriteAccess should succeed");
+    assert!(result.is_ok(), "Revoke (write) should succeed");
 
     match result.unwrap() {
-        super::GovernanceActionResult::WriteAccessRevoked(r) => {
+        super::GovernanceActionResult::AccessRevoked(r) => {
             assert_eq!(r.did.0, "did:key:bob");
         }
-        other => panic!("expected WriteAccessRevoked, got {other:?}"),
+        other => panic!("expected AccessRevoked, got {other:?}"),
     }
 
     // Verify member is tracked as write-revoked.
@@ -2145,10 +2153,11 @@ async fn revoke_write_access_marks_member() {
         let contexts = manager.contexts.lock().await;
         let ctx = contexts.get(&ctx_id).unwrap();
         assert!(
-            ctx.access
-                .write_revoked_members
-                .contains(&DID("did:key:bob".into())),
-            "bob should be in write_revoked_members"
+            ctx.role_state
+                .suspended_capabilities
+                .get("did:key:bob")
+                .is_some_and(|s| s.contains(&Capability::MessagesWrite)),
+            "bob should be in suspended_capabilities"
         );
     }
 
@@ -2163,14 +2172,14 @@ async fn revoke_write_access_marks_member() {
     assert!(has_event, "WriteAccessRevoked event should be emitted");
 }
 
-/// SCP-CAC-007: Redundant `RevokeWriteAccess` is a no-op (§5.9).
+/// SCP-CAC-007: Redundant `Revoke (write)` is a no-op (§5.9).
 #[tokio::test]
 async fn revoke_write_access_redundant_is_noop() {
     let (manager, ctx_id) = setup_encrypted_with_member_ban().await;
 
-    let action = super::GovernanceAction::RevokeWriteAccess {
+    let action = super::GovernanceAction::RevokeAccess {
         did: "did:key:bob".into(),
-        scope: super::RevocationScope::FutureOnly,
+        access: super::AccessScope::Write,
     };
 
     // First revocation.
@@ -2201,19 +2210,19 @@ async fn revoke_write_access_redundant_is_noop() {
     let result = manager.execute_governance_action(&ctx_id, &proposal2).await;
     assert!(
         result.is_ok(),
-        "redundant RevokeWriteAccess should succeed (no-op)"
+        "redundant Revoke (write) should succeed (no-op)"
     );
 }
 
-/// SCP-CAC-007: `RestoreWriteAccess` removes write revocation.
+/// SCP-CAC-007: `RestoreAccess (write)` removes write revocation.
 #[tokio::test]
 async fn restore_write_access_removes_revocation() {
     let (manager, ctx_id) = setup_encrypted_with_member_ban().await;
 
     // First revoke.
-    let revoke = super::GovernanceAction::RevokeWriteAccess {
+    let revoke = super::GovernanceAction::RevokeAccess {
         did: "did:key:bob".into(),
-        scope: super::RevocationScope::FutureOnly,
+        access: super::AccessScope::Write,
     };
     let proposal = approved_governance_proposal(
         &"did:key:alice".into(),
@@ -2228,8 +2237,9 @@ async fn restore_write_access_removes_revocation() {
     manager.drain_events(&ctx_id).await;
 
     // Now restore.
-    let restore = super::GovernanceAction::RestoreWriteAccess {
+    let restore = super::GovernanceAction::RestoreAccess {
         did: "did:key:bob".into(),
+        capabilities: vec![super::Capability::MessagesWrite],
     };
     let restore_proposal = approved_governance_proposal(
         &"did:key:alice".into(),
@@ -2240,13 +2250,13 @@ async fn restore_write_access_removes_revocation() {
     let result = manager
         .execute_governance_action(&ctx_id, &restore_proposal)
         .await;
-    assert!(result.is_ok(), "RestoreWriteAccess should succeed");
+    assert!(result.is_ok(), "RestoreAccess (write) should succeed");
 
     match result.unwrap() {
-        super::GovernanceActionResult::WriteAccessRestored(r) => {
+        super::GovernanceActionResult::AccessRestored(r) => {
             assert_eq!(r.did.0, "did:key:bob");
         }
-        other => panic!("expected WriteAccessRestored, got {other:?}"),
+        other => panic!("expected AccessRestored, got {other:?}"),
     }
 
     // Verify member is no longer write-revoked.
@@ -2254,10 +2264,11 @@ async fn restore_write_access_removes_revocation() {
         let contexts = manager.contexts.lock().await;
         let ctx = contexts.get(&ctx_id).unwrap();
         assert!(
-            !ctx.access
-                .write_revoked_members
-                .contains(&DID("did:key:bob".into())),
-            "bob should not be in write_revoked_members after restore"
+            !ctx.role_state
+                .suspended_capabilities
+                .get("did:key:bob")
+                .is_some_and(|s| s.contains(&Capability::MessagesWrite)),
+            "bob should not be in suspended_capabilities after restore"
         );
     }
 
@@ -2272,14 +2283,15 @@ async fn restore_write_access_removes_revocation() {
     assert!(has_event, "WriteAccessRestored event should be emitted");
 }
 
-/// SCP-CAC-007: `RestoreWriteAccess` on never-revoked member returns
+/// SCP-CAC-007: `RestoreAccess (write)` on never-revoked member returns
 /// `NothingToRestore` error (§5.9).
 #[tokio::test]
 async fn restore_write_access_never_revoked_returns_error() {
     let (manager, ctx_id) = setup_encrypted_with_member_ban().await;
 
-    let restore = super::GovernanceAction::RestoreWriteAccess {
+    let restore = super::GovernanceAction::RestoreAccess {
         did: "did:key:bob".into(),
+        capabilities: vec![super::Capability::MessagesWrite],
     };
     let proposal = approved_governance_proposal(
         &"did:key:alice".into(),
@@ -2291,7 +2303,7 @@ async fn restore_write_access_never_revoked_returns_error() {
     let result = manager.execute_governance_action(&ctx_id, &proposal).await;
     assert!(
         result.is_err(),
-        "RestoreWriteAccess on never-revoked should fail"
+        "RestoreAccess (write) on never-revoked should fail"
     );
     assert!(
         matches!(
@@ -2309,9 +2321,9 @@ async fn presence_only_strips_governance_capabilities() {
     let (manager, ctx_id) = setup_encrypted_with_member_ban().await;
 
     // Revoke write access for bob.
-    let revoke_write = super::GovernanceAction::RevokeWriteAccess {
+    let revoke_write = super::GovernanceAction::RevokeAccess {
         did: "did:key:bob".into(),
-        scope: super::RevocationScope::FutureOnly,
+        access: super::AccessScope::Write,
     };
     let proposal = approved_governance_proposal(
         &"did:key:alice".into(),
@@ -2325,9 +2337,9 @@ async fn presence_only_strips_governance_capabilities() {
         .unwrap();
 
     // Revoke read access for bob — now presence-only.
-    let revoke_read = super::GovernanceAction::RevokeReadAccess {
+    let revoke_read = super::GovernanceAction::RevokeAccess {
         did: "did:key:bob".into(),
-        scope: super::RevocationScope::FutureOnly,
+        access: super::AccessScope::Read,
     };
     let read_proposal = approved_governance_proposal(
         &"did:key:alice".into(),
@@ -2345,13 +2357,14 @@ async fn presence_only_strips_governance_capabilities() {
         let contexts = manager.contexts.lock().await;
         let ctx = contexts.get(&ctx_id).unwrap();
         assert!(
-            ctx.access
-                .write_revoked_members
-                .contains(&DID("did:key:bob".into()))
+            ctx.role_state
+                .suspended_capabilities
+                .get("did:key:bob")
+                .is_some_and(|s| s.contains(&Capability::MessagesWrite))
         );
         assert!(
             ctx.access
-                .read_revoked_members
+                .read_exclusion_list
                 .contains(&DID("did:key:bob".into()))
         );
     }
@@ -2420,7 +2433,7 @@ async fn rotate_content_keys_no_reason() {
     }
 }
 
-/// SCP-CAC-007: `RevokeWriteAccess` with Full scope in broadcast context
+/// SCP-CAC-007: `Revoke (write)` with Full scope in broadcast context
 /// blocks the author.
 #[tokio::test]
 async fn revoke_write_access_full_scope_broadcast() {
@@ -2437,9 +2450,9 @@ async fn revoke_write_access_full_scope_broadcast() {
         bc.add_author("did:key:sub1").unwrap();
     }
 
-    let action = super::GovernanceAction::RevokeWriteAccess {
+    let action = super::GovernanceAction::RevokeAccess {
         did: "did:key:sub1".into(),
-        scope: super::RevocationScope::Full,
+        access: super::AccessScope::Both,
     };
     let proposal = approved_governance_proposal(
         &"did:key:alice".into(),
@@ -2451,7 +2464,7 @@ async fn revoke_write_access_full_scope_broadcast() {
     let result = manager.execute_governance_action(&ctx_id, &proposal).await;
     assert!(
         result.is_ok(),
-        "RevokeWriteAccess Full in broadcast should succeed"
+        "Revoke (write) Full in broadcast should succeed"
     );
 
     // Verify WriteAccessRevoked event.
@@ -2465,7 +2478,7 @@ async fn revoke_write_access_full_scope_broadcast() {
     assert!(has_event, "WriteAccessRevoked event should be emitted");
 }
 
-/// SCP-CAC-007: `RevokeWriteAccess` fails without `MemberBan` in ceiling.
+/// SCP-CAC-007: `Revoke (write)` fails without `MemberBan` in ceiling.
 #[tokio::test]
 async fn revoke_write_access_rejected_without_member_ban() {
     let manager = ContextManager::new(
@@ -2497,9 +2510,9 @@ async fn revoke_write_access_rejected_without_member_ban() {
             .add_member("did:key:bob".into(), "member".into(), vec![]);
     }
 
-    let action = super::GovernanceAction::RevokeWriteAccess {
+    let action = super::GovernanceAction::RevokeAccess {
         did: "did:key:bob".into(),
-        scope: super::RevocationScope::Full,
+        access: super::AccessScope::Both,
     };
     let proposal = approved_governance_proposal(
         &"did:key:alice".into(),
@@ -2513,18 +2526,18 @@ async fn revoke_write_access_rejected_without_member_ban() {
         .await;
     assert!(
         result.is_err(),
-        "RevokeWriteAccess should fail without MemberBan in ceiling"
+        "Revoke (write) should fail without MemberBan in ceiling"
     );
 }
 
-/// SCP-CAC-007: `RevokeWriteAccess` on non-member returns error.
+/// SCP-CAC-007: `Revoke (write)` on non-member returns error.
 #[tokio::test]
 async fn revoke_write_access_non_member_fails() {
     let (manager, ctx_id) = setup_encrypted_with_member_ban().await;
 
-    let action = super::GovernanceAction::RevokeWriteAccess {
+    let action = super::GovernanceAction::RevokeAccess {
         did: "did:key:nonexistent".into(),
-        scope: super::RevocationScope::Full,
+        access: super::AccessScope::Both,
     };
     let proposal = approved_governance_proposal(
         &"did:key:alice".into(),
@@ -2534,10 +2547,7 @@ async fn revoke_write_access_non_member_fails() {
     );
 
     let result = manager.execute_governance_action(&ctx_id, &proposal).await;
-    assert!(
-        result.is_err(),
-        "RevokeWriteAccess on non-member should fail"
-    );
+    assert!(result.is_err(), "Revoke (write) on non-member should fail");
     assert!(
         matches!(result.unwrap_err(), ContextError::MemberNotFound(_)),
         "error should be MemberNotFound"

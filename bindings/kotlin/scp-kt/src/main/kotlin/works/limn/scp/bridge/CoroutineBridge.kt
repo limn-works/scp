@@ -41,6 +41,10 @@ import kotlinx.serialization.json.jsonPrimitive
 import kotlinx.serialization.json.put
 import works.limn.scp.AssetEntry
 import works.limn.scp.BatchPublishResult
+import works.limn.scp.ConsequenceConfig
+import works.limn.scp.ConsequenceRule
+import works.limn.scp.encodeConsequenceConfigJson
+import works.limn.scp.encodeConsequenceRulesJson
 import works.limn.scp.validateContentPath
 import works.limn.scp.validateDeployId
 import works.limn.scp.validateMimeType
@@ -186,6 +190,8 @@ interface ContextBindings {
     fun contextCreate(
         identityHandle: Long,
         paramsJson: String,
+        consequenceRulesJson: String? = null,
+        consequenceConfigJson: String? = null,
     ): Long
 
     /**
@@ -204,6 +210,7 @@ interface ContextBindings {
     fun contextJoin(
         contextHandle: Long,
         identityHandle: Long,
+        spendingUcanJwt: String? = null,
     )
 
     /**
@@ -257,6 +264,7 @@ interface ContextBindings {
         contextHandle: Long,
         identityHandle: Long,
         payload: ByteArray,
+        spendingUcanJwt: String? = null,
     )
 
     /**
@@ -801,6 +809,7 @@ interface ToolBindings {
         identityHandle: Long,
         ucanToken: String?,
         proofTokens: List<String>?,
+        spendingUcan: String?,
     ): String
 
     /**
@@ -1474,12 +1483,65 @@ class ContextBridge internal constructor(
      *
      * @param identityHandle Handle from identity create or load.
      * @param paramsJson JSON-encoded context parameters.
+     * @param consequenceRulesJson Optional JSON-encoded array of consequence
+     *   rules (ADR-017, #1531). When non-null, parsed by the bridge into the
+     *   stored `ContextParams.consequence_rules`.
+     * @param consequenceConfigJson Optional JSON-encoded
+     *   `ConsequenceConfig` document (ADR-017, #1531). When non-null, parsed
+     *   by the bridge into the stored `ContextParams.consequence_config`.
+     *   Defaults to the protocol default
+     *   (`allow_automatic_access_revocation = false`) when omitted.
      * @return Opaque context handle.
      */
     suspend fun create(
         identityHandle: Long,
         paramsJson: String,
-    ): Long = bridge.ffiCall { bindings.contextCreate(identityHandle, paramsJson) }
+        consequenceRulesJson: String? = null,
+        consequenceConfigJson: String? = null,
+    ): Long =
+        bridge.ffiCall {
+            bindings.contextCreate(
+                identityHandle,
+                paramsJson,
+                consequenceRulesJson,
+                consequenceConfigJson,
+            )
+        }
+
+    /**
+     * Create a new context using typed [ConsequenceRule] / [ConsequenceConfig]
+     * shapes (H15).
+     *
+     * Encodes the typed values to the Rust serde wire format internally via
+     * [encodeConsequenceRulesJson] / [encodeConsequenceConfigJson], then
+     * delegates to the JSON-string overload above. This is the preferred
+     * SDK entry point — call sites should not hand-roll JSON for consequence
+     * rules.
+     *
+     * @param identityHandle Handle from identity create or load.
+     * @param paramsJson JSON-encoded base context parameters (ceiling,
+     *   governance, etc). Consequence rules and config travel in the typed
+     *   parameters below, NOT in this JSON blob.
+     * @param consequenceRules Typed list of consequence rules; `null` omits.
+     * @param consequenceConfig Typed per-context config; `null` omits and the
+     *   protocol default applies (`allowAutomaticAccessRevocation = false`).
+     * @return Opaque context handle.
+     */
+    suspend fun create(
+        identityHandle: Long,
+        paramsJson: String,
+        consequenceRules: List<ConsequenceRule>?,
+        consequenceConfig: ConsequenceConfig?,
+    ): Long {
+        val rulesJson = consequenceRules?.let { encodeConsequenceRulesJson(it) }
+        val configJson = consequenceConfig?.let { encodeConsequenceConfigJson(it) }
+        return create(
+            identityHandle = identityHandle,
+            paramsJson = paramsJson,
+            consequenceRulesJson = rulesJson,
+            consequenceConfigJson = configJson,
+        )
+    }
 
     /**
      * Join an existing context.
@@ -1490,7 +1552,8 @@ class ContextBridge internal constructor(
     suspend fun join(
         contextHandle: Long,
         identityHandle: Long,
-    ): Unit = bridge.ffiCall { bindings.contextJoin(contextHandle, identityHandle) }
+        spendingUcanJwt: String? = null,
+    ): Unit = bridge.ffiCall { bindings.contextJoin(contextHandle, identityHandle, spendingUcanJwt) }
 
     /**
      * Leave a context gracefully (member action).
@@ -1525,7 +1588,11 @@ class ContextBridge internal constructor(
         contextHandle: Long,
         identityHandle: Long,
         payload: ByteArray,
-    ): Unit = bridge.ffiCall { bindings.contextSend(contextHandle, identityHandle, payload) }
+        spendingUcanJwt: String? = null,
+    ): Unit =
+        bridge.ffiCall {
+            bindings.contextSend(contextHandle, identityHandle, payload, spendingUcanJwt)
+        }
 
     /**
      * Set the economic policy for a context (§19.3).
@@ -1626,12 +1693,22 @@ class ToolBridge internal constructor(
     /**
      * Invoke a registered tool in a context.
      *
+     * Tool invocation flows through the runtime's full economy
+     * pipeline (`ContextManager::invoke_tool_with_economy`):
+     * per-invocation pricing, per-DID velocity tracking, escalation,
+     * budget enforcement, payment escrow, and the Matrix-style hard
+     * rate limit are all enforced inside the runtime. See PR #1606 / C4.
+     *
      * @param contextHandle Handle from context create or join.
      * @param toolId The tool's assigned ID.
      * @param inputJson JSON-encoded tool input.
      * @param identityHandle Handle for the invoker's identity.
      * @param ucanToken Optional UCAN token authorizing the invocation.
      * @param proofTokens Optional parent UCAN tokens for delegation chain.
+     * @param spendingUcan Optional JWT-encoded `SpendingCapability` UCAN
+     *   for paid tool invocations under spec section 19.5
+     *   (AND-composition with the action UCAN). May be `null` for free
+     *   tools.
      * @return JSON-encoded tool output.
      */
     @Suppress("LongParameterList") // FFI bridge — must match UniFFI export signature
@@ -1642,6 +1719,7 @@ class ToolBridge internal constructor(
         identityHandle: Long,
         ucanToken: String?,
         proofTokens: List<String>? = null,
+        spendingUcan: String? = null,
     ): String =
         bridge.ffiCall {
             bindings.toolInvoke(
@@ -1651,6 +1729,7 @@ class ToolBridge internal constructor(
                 identityHandle,
                 ucanToken,
                 proofTokens,
+                spendingUcan,
             )
         }
 

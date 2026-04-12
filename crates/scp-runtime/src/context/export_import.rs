@@ -184,7 +184,13 @@ pub fn verify_merkle_chain(event_log_data: &[u8]) -> Result<[u8; 32], ContextErr
         }
 
         // Verify self-hash correctness.
-        let expected_hash = compute_entry_hash(&entry.event, entry.timestamp, &entry.prev_hash);
+        let expected_hash = compute_entry_hash(
+            &entry.event,
+            &entry.actor_did,
+            entry.timestamp,
+            &entry.prev_hash,
+            entry.payload.as_ref(),
+        );
         if !bool::from(entry.hash.ct_eq(&expected_hash)) {
             return Err(ContextError::EventLogFailed(format!(
                 "Merkle chain broken at entry {i}: hash mismatch"
@@ -197,20 +203,41 @@ pub fn verify_merkle_chain(event_log_data: &[u8]) -> Result<[u8; 32], ContextErr
 
 /// Computes the SHA-256 hash for an event log entry.
 ///
-/// Hash input: `"SCP-EXPORT-ENTRY-V1:" || event_bytes || timestamp_be_bytes || prev_hash`
+/// Hash input: `"SCP-EXPORT-ENTRY:" || len(event) || event || len(actor_did)
+///   || actor_did || timestamp || prev_hash [|| len(payload_json) || payload_json]`
 ///
-/// Uses big-endian for the timestamp to match codebase convention, and a
-/// domain separator to prevent cross-protocol hash confusion.
+/// Uses big-endian u32 length prefixes before variable-length fields to
+/// prevent length-extension ambiguity.
 ///
 /// This must be identical to
 /// [`providers::event_log::compute_entry_hash`](super::providers::event_log)
 /// to ensure verification produces the same hashes.
-fn compute_entry_hash(event: &str, timestamp: u64, prev_hash: &[u8; 32]) -> [u8; 32] {
+fn compute_entry_hash(
+    event: &str,
+    actor_did: &str,
+    timestamp: u64,
+    prev_hash: &[u8; 32],
+    payload: Option<&serde_json::Value>,
+) -> [u8; 32] {
+    // Event names and DID strings are always well under u32::MAX bytes.
+    let event_len = u32::try_from(event.len()).unwrap_or(u32::MAX);
+    let actor_len = u32::try_from(actor_did.len()).unwrap_or(u32::MAX);
     let mut hasher = Sha256::new();
-    hasher.update(b"SCP-EXPORT-ENTRY-V1:");
+    hasher.update(b"SCP-EXPORT-ENTRY:");
+    hasher.update(event_len.to_be_bytes());
     hasher.update(event.as_bytes());
+    hasher.update(actor_len.to_be_bytes());
+    hasher.update(actor_did.as_bytes());
     hasher.update(timestamp.to_be_bytes());
     hasher.update(prev_hash);
+    // Payload is included in the hash when present.
+    // Absent payloads contribute no bytes, preserving backward compat.
+    if let Some(val) = payload {
+        let json_bytes = serde_json::to_vec(val).unwrap_or_default();
+        let payload_len = u32::try_from(json_bytes.len()).unwrap_or(u32::MAX);
+        hasher.update(payload_len.to_be_bytes());
+        hasher.update(&json_bytes);
+    }
     let result = hasher.finalize();
     let mut hash = [0u8; 32];
     hash.copy_from_slice(&result);
@@ -287,8 +314,6 @@ fn strip_snapshot_for_public(snapshot: &ContextSnapshot) -> ContextSnapshot {
         executed_proposals: HashSet::new(),
         ttl_remaining_secs: snapshot.ttl_remaining_secs,
         registered_tools: Vec::new(),
-        write_revoked_members: HashSet::new(),
-        read_revoked_members: HashSet::new(),
         read_exclusion_list: HashSet::new(),
         tool_interfaces: Vec::new(),
         threshold_signers: Vec::new(),
@@ -298,6 +323,9 @@ fn strip_snapshot_for_public(snapshot: &ContextSnapshot) -> ContextSnapshot {
         economic_policy: snapshot.economic_policy.clone(),
         budget_tracker: scp_protocol::economy::budget::MemberBudgetTracker::new(),
         approved_proposals: HashMap::new(),
+        // H10: monotonic seq counter is local-instance state with no
+        // meaning to a public observer — always 0 in public scope.
+        next_proposal_seq: 0,
         governance_freeze: None,
         pending_ceiling_modification: None,
         pending_economic_policy_change: None,
@@ -314,6 +342,30 @@ fn strip_snapshot_for_public(snapshot: &ContextSnapshot) -> ContextSnapshot {
         migration_state: None,
         // Access keys are sensitive material — not exported in public scope.
         access_key_store: scp_protocol::crypto::access_keys::AccessKeyStore::new(),
+        // Consequence rules ARE part of the public opt-in contract — prospective
+        // members need to see what behavioral consequences exist before joining.
+        consequence_rules: snapshot.consequence_rules.clone(),
+        participation_cache: HashMap::new(),
+        velocity_tracker: None,
+        velocity_tracker_state: None,
+        cooldown_until: HashMap::new(),
+        proposal_timestamps: HashMap::new(),
+        // Per-DID anti-spam pricing (§19.7) is part of the public opt-in
+        // contract — joiners must see the cost before joining. Hard rate
+        // limit config is also public; the per-sender bucket state is local.
+        message_pricing: snapshot.message_pricing.clone(),
+        hard_rate_limit_config: snapshot.hard_rate_limit_config.clone(),
+        hard_rate_limit_state: HashMap::new(),
+        // Nonce tracker state is strictly local — it has no meaning
+        // to a joiner and could leak activity patterns. Always empty
+        // in public scope.
+        spending_nonce_tracker_state: HashMap::new(),
+        // PR #1606 C6: pending commits and the fail-close marker are
+        // strictly local node state. They reference the local MLS group
+        // and have no meaning to a public observer. Always empty in
+        // public scope.
+        pending_commits: std::collections::VecDeque::new(),
+        commit_fault: None,
     }
 }
 
@@ -402,7 +454,6 @@ mod tests {
             executed_proposals: HashSet::new(),
             ttl_remaining_secs: None,
             registered_tools: Vec::new(),
-            write_revoked_members: HashSet::new(),
             tool_interfaces: Vec::new(),
             threshold_signers: Vec::new(),
             threshold_value: 0,
@@ -410,9 +461,9 @@ mod tests {
             governance_model_config: None,
             economic_policy: None,
             budget_tracker: scp_protocol::economy::budget::MemberBudgetTracker::new(),
-            read_revoked_members: HashSet::new(),
             read_exclusion_list: HashSet::new(),
             approved_proposals: HashMap::new(),
+            next_proposal_seq: 0,
             governance_freeze: None,
             pending_ceiling_modification: None,
             pending_economic_policy_change: None,
@@ -423,6 +474,18 @@ mod tests {
             mls_crypto_state: Vec::new(),
             migration_state: None,
             access_key_store: scp_protocol::crypto::access_keys::AccessKeyStore::new(),
+            consequence_rules: Vec::new(),
+            participation_cache: std::collections::HashMap::new(),
+            velocity_tracker: None,
+            velocity_tracker_state: None,
+            cooldown_until: std::collections::HashMap::new(),
+            proposal_timestamps: std::collections::HashMap::new(),
+            message_pricing: None,
+            hard_rate_limit_config: None,
+            hard_rate_limit_state: std::collections::HashMap::new(),
+            spending_nonce_tracker_state: std::collections::HashMap::new(),
+            pending_commits: std::collections::VecDeque::new(),
+            commit_fault: None,
         }
     }
 
@@ -431,7 +494,9 @@ mod tests {
         let provider = MerkleEventLogProvider::new();
         provider.init_event_log(context_id_bytes).unwrap();
         for name in event_names {
-            provider.append_event(context_id_bytes, name).unwrap();
+            provider
+                .append_event(context_id_bytes, name, "", None)
+                .unwrap();
         }
         provider.export_event_log_entries(context_id_bytes).unwrap()
     }
@@ -550,8 +615,12 @@ mod tests {
         let ctx_id_bytes = scp_protocol::context::context_id_bytes("ctx-merkle-2");
         let provider = MerkleEventLogProvider::new();
         provider.init_event_log(&ctx_id_bytes).unwrap();
-        provider.append_event(&ctx_id_bytes, "Event1").unwrap();
-        provider.append_event(&ctx_id_bytes, "Event2").unwrap();
+        provider
+            .append_event(&ctx_id_bytes, "Event1", "", None)
+            .unwrap();
+        provider
+            .append_event(&ctx_id_bytes, "Event2", "", None)
+            .unwrap();
 
         let mut entries = provider.entries(&ctx_id_bytes).unwrap();
         // Tamper with the first entry's hash.
@@ -569,9 +638,15 @@ mod tests {
         let ctx_id_bytes = scp_protocol::context::context_id_bytes("ctx-merkle-3");
         let provider = MerkleEventLogProvider::new();
         provider.init_event_log(&ctx_id_bytes).unwrap();
-        provider.append_event(&ctx_id_bytes, "Event1").unwrap();
-        provider.append_event(&ctx_id_bytes, "Event2").unwrap();
-        provider.append_event(&ctx_id_bytes, "Event3").unwrap();
+        provider
+            .append_event(&ctx_id_bytes, "Event1", "", None)
+            .unwrap();
+        provider
+            .append_event(&ctx_id_bytes, "Event2", "", None)
+            .unwrap();
+        provider
+            .append_event(&ctx_id_bytes, "Event3", "", None)
+            .unwrap();
 
         let mut entries = provider.entries(&ctx_id_bytes).unwrap();
         // Remove the middle entry.
@@ -657,9 +732,15 @@ mod tests {
         let ctx_id_bytes = scp_protocol::context::context_id_bytes("ctx-validate-4");
         let provider = MerkleEventLogProvider::new();
         provider.init_event_log(&ctx_id_bytes).unwrap();
-        provider.append_event(&ctx_id_bytes, "Event1").unwrap();
-        provider.append_event(&ctx_id_bytes, "Event2").unwrap();
-        provider.append_event(&ctx_id_bytes, "Event3").unwrap();
+        provider
+            .append_event(&ctx_id_bytes, "Event1", "", None)
+            .unwrap();
+        provider
+            .append_event(&ctx_id_bytes, "Event2", "", None)
+            .unwrap();
+        provider
+            .append_event(&ctx_id_bytes, "Event3", "", None)
+            .unwrap();
 
         let _original_data = provider.export_event_log_entries(&ctx_id_bytes).unwrap();
         let merkle_root = provider.merkle_root(&ctx_id_bytes).unwrap();
@@ -816,9 +897,15 @@ mod tests {
         let ctx_id_bytes = scp_protocol::context::context_id_bytes("ctx-el-roundtrip");
         let provider = MerkleEventLogProvider::new();
         provider.init_event_log(&ctx_id_bytes).unwrap();
-        provider.append_event(&ctx_id_bytes, "Event1").unwrap();
-        provider.append_event(&ctx_id_bytes, "Event2").unwrap();
-        provider.append_event(&ctx_id_bytes, "Event3").unwrap();
+        provider
+            .append_event(&ctx_id_bytes, "Event1", "", None)
+            .unwrap();
+        provider
+            .append_event(&ctx_id_bytes, "Event2", "", None)
+            .unwrap();
+        provider
+            .append_event(&ctx_id_bytes, "Event3", "", None)
+            .unwrap();
 
         let original_entries = provider.entries(&ctx_id_bytes).unwrap();
         let original_root = provider.merkle_root(&ctx_id_bytes).unwrap();
@@ -860,7 +947,7 @@ mod tests {
         provider.init_event_log(&ctx_id_bytes).unwrap();
         for i in 0..10 {
             provider
-                .append_event(&ctx_id_bytes, &format!("Event{i}"))
+                .append_event(&ctx_id_bytes, &format!("Event{i}"), "", None)
                 .unwrap();
         }
 
@@ -909,7 +996,9 @@ mod tests {
         assert!(new_provider.verify_chain(&ctx_id_bytes));
 
         // Appending after import should chain correctly.
-        new_provider.append_event(&ctx_id_bytes, "Event10").unwrap();
+        new_provider
+            .append_event(&ctx_id_bytes, "Event10", "", None)
+            .unwrap();
         let final_entries = new_provider.entries(&ctx_id_bytes).unwrap();
         assert_eq!(final_entries.len(), 4);
         assert_eq!(final_entries[3].prev_hash, final_entries[2].hash);

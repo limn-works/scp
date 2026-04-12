@@ -15,16 +15,6 @@ import { getBridge } from "./internal/bridge";
 // Types
 // ---------------------------------------------------------------------------
 
-/** Result of an EIP-1559-style relay price adjustment. */
-export interface RelayPriceAdjustment {
-  /** New base price (smallest currency unit). */
-  readonly newBasePrice: number;
-  /** Previous base price before adjustment. */
-  readonly previousBasePrice: number;
-  /** Direction: "Increased", "Decreased", or "Unchanged". */
-  readonly direction: "Increased" | "Decreased" | "Unchanged";
-}
-
 /** Observable metrics for cost estimation and formula evaluation. */
 export interface ObservableMetrics {
   /** Messages per minute in this context. */
@@ -169,34 +159,6 @@ export async function evaluateFormula(
       storage_usage: metrics?.storageUsage ?? 0,
     });
     return bridge.economyEvaluateFormula(formulaJson, metricsJson);
-  } catch (error) {
-    throw mapBridgeError(error);
-  }
-}
-
-// ---------------------------------------------------------------------------
-// Relay pricing
-// ---------------------------------------------------------------------------
-
-/**
- * Computes an EIP-1559-style relay price adjustment.
- *
- * @param configJson - Relay pricing config JSON string.
- * @param utilizationPct - Current utilization percentage (0-100).
- * @returns Price adjustment result.
- */
-export async function adjustRelayPrice(
-  configJson: string,
-  utilizationPct: number,
-): Promise<RelayPriceAdjustment> {
-  try {
-    const bridge = await getBridge();
-    const result = bridge.economyAdjustRelayPrice(configJson, utilizationPct);
-    return {
-      newBasePrice: result.newBasePrice,
-      previousBasePrice: result.previousBasePrice,
-      direction: result.direction as RelayPriceAdjustment["direction"],
-    };
   } catch (error) {
     throw mapBridgeError(error);
   }

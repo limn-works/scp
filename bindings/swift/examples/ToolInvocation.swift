@@ -54,7 +54,8 @@ struct ToolInvocation {
             inputJson: #"{"city":"Berlin"}"#,
             identity: identity,
             ucanToken: nil,
-            proofTokens: nil
+            proofTokens: nil,
+            spendingUcanJwt: nil
         )
         print("Weather result: \(resultJson)")
 

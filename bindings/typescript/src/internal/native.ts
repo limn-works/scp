@@ -188,11 +188,14 @@ export function createNativeBridge(): Bridge {
       return handle;
     },
 
-    async contextJoin(handle: BridgeContextHandle, identityDid: string): Promise<void> {
-      await (addon.contextJoin as (h: BridgeContextHandle, d: string) => Promise<void>)(
-        handle,
-        identityDid,
-      );
+    async contextJoin(
+      handle: BridgeContextHandle,
+      identityDid: string,
+      spendingUcanJwt?: string | null,
+    ): Promise<void> {
+      await (
+        addon.contextJoin as (h: BridgeContextHandle, d: string, s: string | null) => Promise<void>
+      )(handle, identityDid, spendingUcanJwt ?? null);
     },
 
     async contextLeave(handle: BridgeContextHandle, identityDid: string): Promise<void> {
@@ -213,12 +216,18 @@ export function createNativeBridge(): Bridge {
       handle: BridgeContextHandle,
       identityDid: string,
       payload: Uint8Array,
+      spendingUcanJwt?: string | null,
     ): Promise<void> {
       // NAPI Vec<u8> maps to number[] in JS, not Uint8Array.
       const payloadArray = Array.from(payload) as unknown as number[];
       await (
-        addon.contextSend as (h: BridgeContextHandle, d: string, p: number[]) => Promise<void>
-      )(handle, identityDid, payloadArray);
+        addon.contextSend as (
+          h: BridgeContextHandle,
+          d: string,
+          p: number[],
+          s: string | null,
+        ) => Promise<void>
+      )(handle, identityDid, payloadArray, spendingUcanJwt ?? null);
     },
 
     contextSubscribe(
@@ -698,7 +707,13 @@ export function createNativeBridge(): Bridge {
       inputJson: string,
       identityDid: string,
       ucanToken: string,
+      proofTokens?: readonly string[],
+      spendingUcan?: string,
     ): Promise<string> {
+      // C4 (#1606): NAPI tool_invoke now routes through
+      // ContextManager.invoke_tool_with_economy. The bridge accepts an
+      // optional spendingUcan JWT for AND-composition with the action
+      // UCAN under spec section 19.5.
       const result = await (
         addon.toolInvoke as (
           h: BridgeContextHandle,
@@ -706,9 +721,10 @@ export function createNativeBridge(): Bridge {
           i: string,
           d: string,
           u: string,
-          p: string[] | undefined,
+          p: readonly string[] | undefined,
+          s: string | undefined,
         ) => Promise<string>
-      )(handle, toolId, inputJson, identityDid, ucanToken, undefined);
+      )(handle, toolId, inputJson, identityDid, ucanToken, proofTokens, spendingUcan);
       return result;
     },
 
@@ -1593,15 +1609,6 @@ export function createNativeBridge(): Bridge {
         formulaJson,
         metricsJson,
       );
-    },
-
-    economyAdjustRelayPrice(configJson: string, utilizationPct: number) {
-      return (
-        addon.economyAdjustRelayPrice as (
-          c: string,
-          u: number,
-        ) => { newBasePrice: number; previousBasePrice: number; direction: string }
-      )(configJson, utilizationPct);
     },
 
     economyBudgetRemaining(contextId: string, did: string): number {

@@ -450,7 +450,45 @@ pub fn tool_invoke(
     input_json: String,
     identity_did: String,
     ucan_token: Option<String>,
+    spending_ucan_jwt: Option<String>,
 ) -> Promise {
+    // N1/C2: Fail-closed for spending UCANs on WASM — the WASM bridge cannot
+    // validate spending UCANs cryptographically (no payment adapter, no budget
+    // tracker, no velocity tracker). Reject if a spending UCAN is provided for
+    // a paid tool invocation, matching the fail-closed gates on context_join
+    // and context_send.
+    // NEW-1 fix: Check stored economic policy (matches context_join/context_send
+    // pattern). Reject paid tool invocations regardless of whether spending UCAN
+    // is present — WASM cannot enforce payment.
+    {
+        let context_id_check = context.context_id();
+        let has_paid_policy =
+            crate::manager::with_manager(|mgr| mgr.context_has_paid_policy(&context_id_check));
+        if has_paid_policy.unwrap_or(false) {
+            return future_to_promise(async move {
+                Err(ScpWasmError::Context {
+                    message: "WASM bridge cannot enforce tool payment for paid contexts. \
+                              Use a native (Python/Node/Swift/Kotlin) client for paid tools."
+                        .to_owned(),
+                    code: "SCP-ECON-12096".to_owned(),
+                }
+                .into_js()
+                .into())
+            });
+        }
+    }
+    if spending_ucan_jwt.is_some() {
+        return future_to_promise(async move {
+            Err(ScpWasmError::Context {
+                message: "WASM bridge cannot validate spending UCANs for tool invocations. \
+                          Use a native (Python/Node/Swift/Kotlin) client for paid tools."
+                    .to_owned(),
+                code: "SCP-ECON-12096".to_owned(),
+            }
+            .into_js()
+            .into())
+        });
+    }
     if let Err(e) = validate_tool_id(&tool_id) {
         return future_to_promise(async move { Err(ScpWasmError::from(e).into_js().into()) });
     }

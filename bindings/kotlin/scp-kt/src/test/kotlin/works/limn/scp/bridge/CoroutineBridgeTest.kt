@@ -99,6 +99,108 @@ class CoroutineBridgeTest {
                 assertEquals(10L, result)
             }
 
+        // C5: contextCreate must accept and forward consequenceRulesJson and
+        // consequenceConfigJson to the bridge so the per-context opt-in for
+        // RevokeAccess flows through to the manager (ADR-017, #1531).
+        @Test
+        fun `contextCreate forwards consequenceRulesJson and consequenceConfigJson`() =
+            runTest(ioDispatcher) {
+                stubBindings.contextCreateResult = 11L
+                val rules =
+                    """[{"trigger":"MessageVelocity","action":{"Enforcement":"SuspendAccess"},""" +
+                        """"threshold":5,"window":{"secs":3600,"nanos":0}}]"""
+                val config = """{"allow_automatic_access_revocation":true}"""
+                val result =
+                    bridge.context.create(
+                        identityHandle = 1L,
+                        paramsJson = """{"ceiling":["read"]}""",
+                        consequenceRulesJson = rules,
+                        consequenceConfigJson = config,
+                    )
+                assertEquals(11L, result)
+                assertEquals(rules, stubBindings.lastConsequenceRulesJson)
+                assertEquals(config, stubBindings.lastConsequenceConfigJson)
+            }
+
+        // C5: when both consequence params are null, the stub captures null
+        // for both — proves the historical default path still works.
+        @Test
+        fun `contextCreate with null consequence params yields null on stub`() =
+            runTest(ioDispatcher) {
+                stubBindings.contextCreateResult = 12L
+                stubBindings.lastConsequenceRulesJson = "preset"
+                stubBindings.lastConsequenceConfigJson = "preset"
+                bridge.context.create(1L, """{"ceiling":["read"]}""")
+                assertEquals(null, stubBindings.lastConsequenceRulesJson)
+                assertEquals(null, stubBindings.lastConsequenceConfigJson)
+            }
+
+        // H15: typed ConsequenceRule / ConsequenceConfig overload encodes
+        // discriminated unions to the Rust serde wire format and forwards the
+        // resulting JSON strings to the bridge.
+        @Test
+        fun `contextCreate typed overload encodes consequence rules and config`() =
+            runTest(ioDispatcher) {
+                stubBindings.contextCreateResult = 13L
+                val rules = h15TypedRulesFixture()
+                val config = works.limn.scp.ConsequenceConfig(
+                    allowAutomaticAccessRevocation = true,
+                )
+
+                val handle = bridge.context.create(
+                    identityHandle = 1L,
+                    paramsJson = """{"ceiling":["read"]}""",
+                    consequenceRules = rules,
+                    consequenceConfig = config,
+                )
+                assertEquals(13L, handle)
+
+                val rulesJson = stubBindings.lastConsequenceRulesJson
+                requireNotNull(rulesJson) { "consequenceRulesJson should be forwarded" }
+                val configJson = stubBindings.lastConsequenceConfigJson
+                requireNotNull(configJson) { "consequenceConfigJson should be forwarded" }
+
+                assertConsequenceConfigJson(configJson)
+                assertConsequenceRulesJson(rulesJson)
+            }
+
+        // H15: typed overload with both null inputs leaves the bridge JSON
+        // strings null — preserves the C5 default path.
+        @Test
+        fun `contextCreate typed overload with null inputs forwards null`() =
+            runTest(ioDispatcher) {
+                stubBindings.contextCreateResult = 14L
+                stubBindings.lastConsequenceRulesJson = "preset"
+                stubBindings.lastConsequenceConfigJson = "preset"
+                bridge.context.create(
+                    identityHandle = 1L,
+                    paramsJson = """{"ceiling":["read"]}""",
+                    consequenceRules = null,
+                    consequenceConfig = null,
+                )
+                assertEquals(null, stubBindings.lastConsequenceRulesJson)
+                assertEquals(null, stubBindings.lastConsequenceConfigJson)
+            }
+
+        // H15: pin the discriminated-union variant short names so future
+        // renames trip a compile error here. The lists live in
+        // ConsequenceRule.kt; this test snapshots the values.
+        @Test
+        fun `discriminated-union variant names are pinned`() {
+            assertEquals(
+                listOf("MessageVelocity", "ToolRateExceeded", "WarningCount", "Custom"),
+                works.limn.scp.CONSEQUENCE_TRIGGER_VARIANT_NAMES,
+            )
+            assertEquals(
+                listOf("Enforcement", "AssignRole"),
+                works.limn.scp.CONSEQUENCE_ACTION_VARIANT_NAMES,
+            )
+            assertEquals(
+                listOf("SuspendCapability", "SuspendAccess", "RevokeAccess", "RemoveMember"),
+                works.limn.scp.ENFORCEMENT_SEVERITY_VARIANT_NAMES,
+            )
+        }
+
         @Test
         fun `contextJoin dispatches on IO`() =
             runTest(ioDispatcher) {
@@ -735,6 +837,94 @@ class CoroutineBridgeTest {
 }
 
 // ---------------------------------------------------------------------------
+// H15: typed ConsequenceRule fixtures and assertions
+// ---------------------------------------------------------------------------
+
+private fun h15TypedRulesFixture(): List<works.limn.scp.ConsequenceRule> {
+    val velocity = works.limn.scp.ConsequenceRule(
+        trigger = works.limn.scp.ConsequenceTrigger.MessageVelocity,
+        action = works.limn.scp.ConsequenceAction.Enforcement(
+            works.limn.scp.EnforcementSeverity.SuspendCapability(
+                listOf(
+                    works.limn.scp.ConsequenceCapability.Unit("MessagesWrite"),
+                    works.limn.scp.ConsequenceCapability.ToolInvoke("calculator"),
+                    works.limn.scp.ConsequenceCapability.Custom("my-custom-cap"),
+                ),
+            ),
+        ),
+        threshold = 5,
+        windowSecs = 3600,
+    )
+    val custom = works.limn.scp.ConsequenceRule(
+        trigger = works.limn.scp.ConsequenceTrigger.Custom("spammy"),
+        action = works.limn.scp.ConsequenceAction.AssignRole("viewer"),
+        threshold = 3,
+        windowSecs = 600,
+    )
+    val warning = works.limn.scp.ConsequenceRule(
+        trigger = works.limn.scp.ConsequenceTrigger.WarningCount,
+        action = works.limn.scp.ConsequenceAction.Enforcement(
+            works.limn.scp.EnforcementSeverity.RevokeAccess(
+                did = "did:dht:z6MkSubject",
+                access = works.limn.scp.AccessScope.BOTH,
+            ),
+        ),
+        threshold = 10,
+        windowSecs = 86_400,
+    )
+    return listOf(velocity, custom, warning)
+}
+
+private fun assertConsequenceConfigJson(configJson: String) {
+    assertTrue(configJson.contains("\"allow_automatic_access_revocation\":true"))
+}
+
+private fun assertConsequenceRulesJson(rulesJson: String) {
+    assertTrue(
+        rulesJson.contains("\"trigger\":\"MessageVelocity\""),
+        "MessageVelocity unit variant should serialize as bare string",
+    )
+    assertTrue(
+        rulesJson.contains("\"SuspendCapability\":{\"capabilities\":["),
+        "SuspendCapability struct variant should serialize as tagged object",
+    )
+    assertTrue(
+        rulesJson.contains("\"MessagesWrite\""),
+        "Unit capability should serialize as bare string",
+    )
+    assertTrue(
+        rulesJson.contains("{\"ToolInvoke\":\"calculator\"}"),
+        "ToolInvoke newtype should serialize with the inner string",
+    )
+    assertTrue(
+        rulesJson.contains("{\"Custom\":\"my-custom-cap\"}"),
+        "Custom newtype should serialize with the inner string",
+    )
+    assertTrue(
+        rulesJson.contains("{\"Custom\":\"spammy\"}"),
+        "Custom trigger should serialize with the inner string",
+    )
+    assertTrue(
+        rulesJson.contains("\"AssignRole\":{\"to_role\":\"viewer\"}"),
+        "AssignRole should serialize with snake_cased to_role",
+    )
+    assertTrue(
+        rulesJson.contains("\"trigger\":\"WarningCount\""),
+        "WarningCount unit variant should serialize as bare string",
+    )
+    assertTrue(
+        rulesJson.contains(
+            "\"RevokeAccess\":{\"did\":\"did:dht:z6MkSubject\",\"access\":\"Both\"}",
+        ),
+        "RevokeAccess should serialize did and Both access scope",
+    )
+    assertTrue(
+        rulesJson.contains("\"window\":{\"secs\":3600,\"nanos\":0}"),
+        "Duration should serialize as {secs, nanos}",
+    )
+}
+
+// ---------------------------------------------------------------------------
 // Stub NativeBindings for testing
 // ---------------------------------------------------------------------------
 
@@ -767,6 +957,7 @@ class StubNativeBindings : NativeBindings {
     var lastToolInvokeIdentityHandle: Long? = null
     var lastToolInvokeUcanToken: String? = null
     var lastToolInvokeProofTokens: List<String>? = null
+    var lastToolInvokeSpendingUcan: String? = null
 
     // Configurable results
     var identityCreateResult = 0L
@@ -775,6 +966,8 @@ class StubNativeBindings : NativeBindings {
     var identityResolveResult = ""
     var contextCreateResult = 0L
     var contextSubscribeResult = 0L
+    var lastConsequenceRulesJson: String? = null
+    var lastConsequenceConfigJson: String? = null
     var toolRegisterResult = ""
     var toolInvokeResult = ""
     var toolVerifyResult = """{"tool_id":"stub","passed":true,"failures":[]}"""
@@ -807,11 +1000,18 @@ class StubNativeBindings : NativeBindings {
     override fun contextCreate(
         identityHandle: Long,
         paramsJson: String,
-    ): Long = contextCreateResult
+        consequenceRulesJson: String?,
+        consequenceConfigJson: String?,
+    ): Long {
+        lastConsequenceRulesJson = consequenceRulesJson
+        lastConsequenceConfigJson = consequenceConfigJson
+        return contextCreateResult
+    }
 
     override fun contextJoin(
         contextHandle: Long,
         identityHandle: Long,
+        spendingUcanJwt: String?,
     ) {
         // no-op
     }
@@ -834,6 +1034,7 @@ class StubNativeBindings : NativeBindings {
         contextHandle: Long,
         identityHandle: Long,
         payload: ByteArray,
+        spendingUcanJwt: String?,
     ) {
         contextSendCalled = true
     }
@@ -1085,6 +1286,7 @@ class StubNativeBindings : NativeBindings {
         definitionJson: String,
     ): String = toolRegisterResult
 
+    @Suppress("LongParameterList")
     override fun toolInvoke(
         contextHandle: Long,
         toolId: String,
@@ -1092,10 +1294,12 @@ class StubNativeBindings : NativeBindings {
         identityHandle: Long,
         ucanToken: String?,
         proofTokens: List<String>?,
+        spendingUcan: String?,
     ): String {
         lastToolInvokeIdentityHandle = identityHandle
         lastToolInvokeUcanToken = ucanToken
         lastToolInvokeProofTokens = proofTokens
+        lastToolInvokeSpendingUcan = spendingUcan
         return toolInvokeResult
     }
 

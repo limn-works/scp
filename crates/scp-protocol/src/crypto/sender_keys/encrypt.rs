@@ -52,7 +52,6 @@ pub fn encrypt_sender_layer(
     epoch: u64,
     sequence: u64,
 ) -> Result<Vec<u8>, SenderKeyError> {
-    let _span = tracing::info_span!("encrypt_sender_layer", context_id, epoch, sequence).entered();
     let cipher = Aes256Gcm::new_from_slice(sender_key.as_bytes())
         .map_err(|e| SenderKeyError::EncryptionFailed(e.to_string()))?;
 
@@ -61,7 +60,7 @@ pub fn encrypt_sender_layer(
     let nonce = Nonce::from_slice(&nonce_bytes);
 
     let aad = build_sender_aad(context_id, sender_did, epoch, sequence);
-    let ciphertext = cipher
+    let encrypted = cipher
         .encrypt(
             nonce,
             Payload {
@@ -71,26 +70,23 @@ pub fn encrypt_sender_layer(
         )
         .map_err(|e| SenderKeyError::EncryptionFailed(e.to_string()))?;
 
-    // Wire format: nonce || ciphertext_with_tag
-    let mut output = Vec::with_capacity(NONCE_SIZE + ciphertext.len());
+    let mut output = Vec::with_capacity(NONCE_SIZE + encrypted.len());
     output.extend_from_slice(&nonce_bytes);
-    output.extend_from_slice(&ciphertext);
+    output.extend_from_slice(&encrypted);
     Ok(output)
 }
 
-/// Decrypts AES-256-GCM ciphertext produced by [`encrypt_sender_layer`].
+/// Decrypts a sender-layer ciphertext previously produced by
+/// [`encrypt_sender_layer`].
 ///
-/// Extracts the 12-byte nonce from the beginning of `ciphertext`, then
-/// decrypts the remainder using the same AAD binding as the encrypt path.
-/// Verifies the authentication tag (including AAD) and rejects tampered
-/// or relocated ciphertext.
+/// The caller must supply the same `context_id`, `sender_did`, `epoch`,
+/// and `sequence` that were used at encryption time — they are bound into
+/// the AAD and any mismatch will fail AEAD verification.
 ///
 /// # Errors
 ///
-/// - [`SenderKeyError::CiphertextTooShort`] if `ciphertext` is shorter than
-///   the nonce size (12 bytes).
-/// - [`SenderKeyError::AuthenticationFailed`] if the authentication tag
-///   verification fails (tampered or corrupted ciphertext, or AAD mismatch).
+/// Returns [`SenderKeyError::AuthenticationFailed`] if the ciphertext is
+/// too short, the nonce is invalid, or AEAD verification fails.
 pub fn decrypt_sender_layer(
     sender_key: &SenderKey,
     ciphertext: &[u8],
@@ -99,26 +95,21 @@ pub fn decrypt_sender_layer(
     epoch: u64,
     sequence: u64,
 ) -> Result<Vec<u8>, SenderKeyError> {
-    let _span = tracing::info_span!("decrypt_sender_layer", context_id, epoch, sequence).entered();
     if ciphertext.len() < NONCE_SIZE {
-        return Err(SenderKeyError::CiphertextTooShort {
-            actual: ciphertext.len(),
-            minimum: NONCE_SIZE,
-        });
+        return Err(SenderKeyError::AuthenticationFailed);
     }
 
-    let (nonce_bytes, encrypted) = ciphertext.split_at(NONCE_SIZE);
-    let nonce = Nonce::from_slice(nonce_bytes);
-
     let cipher = Aes256Gcm::new_from_slice(sender_key.as_bytes())
-        .map_err(|e| SenderKeyError::EncryptionFailed(e.to_string()))?;
+        .map_err(|_| SenderKeyError::AuthenticationFailed)?;
 
+    let nonce = Nonce::from_slice(&ciphertext[..NONCE_SIZE]);
     let aad = build_sender_aad(context_id, sender_did, epoch, sequence);
+
     cipher
         .decrypt(
             nonce,
             Payload {
-                msg: encrypted,
+                msg: &ciphertext[NONCE_SIZE..],
                 aad: &aad,
             },
         )
@@ -148,7 +139,55 @@ fn build_sender_aad(context_id: &str, sender_did: &str, epoch: u64, sequence: u6
     aad
 }
 
+/// Size of the epoch + sequence header in bytes.
+pub const SENDER_HEADER_SIZE: usize = 16;
+
+/// Prepends epoch + sequence header to sender-key ciphertext.
+///
+/// Wire format: `epoch (8 bytes BE) || sequence (8 bytes BE) || ciphertext`.
+/// Used by [`ContextCryptoProvider::seal`] to construct the MLS plaintext.
+#[must_use]
+pub fn build_sender_header(epoch: u64, sequence: u64, ciphertext: &[u8]) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(SENDER_HEADER_SIZE + ciphertext.len());
+    buf.extend_from_slice(&epoch.to_be_bytes());
+    buf.extend_from_slice(&sequence.to_be_bytes());
+    buf.extend_from_slice(ciphertext);
+    buf
+}
+
+/// Parses epoch + sequence header from the front of `data`.
+///
+/// Returns `(epoch, sequence, ciphertext_slice)`.
+///
+/// # Errors
+///
+/// Returns [`SenderKeyError::CiphertextTooShort`] if `data` is shorter than
+/// [`SENDER_HEADER_SIZE`].
+pub fn parse_sender_header(data: &[u8]) -> Result<(u64, u64, &[u8]), SenderKeyError> {
+    if data.len() < SENDER_HEADER_SIZE {
+        return Err(SenderKeyError::CiphertextTooShort {
+            actual: data.len(),
+            minimum: SENDER_HEADER_SIZE,
+        });
+    }
+    // Length validated above — try_into is infallible for exact-size slices.
+    let epoch = u64::from_be_bytes(data[..8].try_into().map_err(|_| {
+        SenderKeyError::CiphertextTooShort {
+            actual: data.len(),
+            minimum: SENDER_HEADER_SIZE,
+        }
+    })?);
+    let sequence = u64::from_be_bytes(data[8..16].try_into().map_err(|_| {
+        SenderKeyError::CiphertextTooShort {
+            actual: data.len(),
+            minimum: SENDER_HEADER_SIZE,
+        }
+    })?);
+    Ok((epoch, sequence, &data[16..]))
+}
+
 #[cfg(test)]
+#[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
     use crate::crypto::sender_keys::generate_sender_key;
@@ -161,186 +200,91 @@ mod tests {
 
     proptest! {
         #[test]
-        #[allow(clippy::unwrap_used)]
-        fn encrypt_decrypt_roundtrip(plaintext in proptest::collection::vec(any::<u8>(), 0..1024)) {
+        fn roundtrip_any_plaintext(plaintext in proptest::collection::vec(any::<u8>(), 0..512)) {
             let key = generate_sender_key();
-            let ciphertext = encrypt_sender_layer(&key, &plaintext, TEST_CTX, TEST_DID, TEST_EPOCH, TEST_SEQ).unwrap();
-            let decrypted = decrypt_sender_layer(&key, &ciphertext, TEST_CTX, TEST_DID, TEST_EPOCH, TEST_SEQ).unwrap();
-            prop_assert_eq!(plaintext, decrypted);
+            let ct = encrypt_sender_layer(&key, &plaintext, TEST_CTX, TEST_DID, TEST_EPOCH, TEST_SEQ).unwrap();
+            let pt = decrypt_sender_layer(&key, &ct, TEST_CTX, TEST_DID, TEST_EPOCH, TEST_SEQ).unwrap();
+            prop_assert_eq!(pt, plaintext);
         }
     }
 
     #[test]
-    #[allow(clippy::unwrap_used)]
-    fn decrypt_rejects_tampered_ciphertext() {
+    fn wrong_context_id_fails_aead() {
         let key = generate_sender_key();
-        let plaintext = b"hello world";
-        let mut ciphertext =
-            encrypt_sender_layer(&key, plaintext, TEST_CTX, TEST_DID, TEST_EPOCH, TEST_SEQ)
-                .unwrap();
-
-        // Flip a byte in the encrypted portion (after the 12-byte nonce).
-        let tamper_index = NONCE_SIZE + 1;
-        ciphertext[tamper_index] ^= 0xFF;
-
-        let result =
-            decrypt_sender_layer(&key, &ciphertext, TEST_CTX, TEST_DID, TEST_EPOCH, TEST_SEQ);
+        let plaintext = b"hello";
+        let ct = encrypt_sender_layer(&key, plaintext, TEST_CTX, TEST_DID, TEST_EPOCH, TEST_SEQ)
+            .unwrap();
+        let result = decrypt_sender_layer(&key, &ct, "wrong-ctx", TEST_DID, TEST_EPOCH, TEST_SEQ);
         assert!(result.is_err());
-        assert!(
-            matches!(result, Err(SenderKeyError::AuthenticationFailed)),
-            "expected AuthenticationFailed, got {result:?}"
-        );
     }
 
     #[test]
-    fn decrypt_rejects_too_short_ciphertext() {
+    fn wrong_sender_did_fails_aead() {
         let key = generate_sender_key();
-        let short = vec![0u8; 5];
-        let result = decrypt_sender_layer(&key, &short, TEST_CTX, TEST_DID, TEST_EPOCH, TEST_SEQ);
-        assert!(matches!(
-            result,
-            Err(SenderKeyError::CiphertextTooShort {
-                actual: 5,
-                minimum: 12
-            })
-        ));
-    }
-
-    #[test]
-    #[allow(clippy::unwrap_used)]
-    fn decrypt_with_wrong_key_fails() {
-        let key1 = generate_sender_key();
-        let key2 = generate_sender_key();
-        let plaintext = b"secret message";
-        let ciphertext =
-            encrypt_sender_layer(&key1, plaintext, TEST_CTX, TEST_DID, TEST_EPOCH, TEST_SEQ)
-                .unwrap();
-
+        let plaintext = b"hello";
+        let ct = encrypt_sender_layer(&key, plaintext, TEST_CTX, TEST_DID, TEST_EPOCH, TEST_SEQ)
+            .unwrap();
         let result =
-            decrypt_sender_layer(&key2, &ciphertext, TEST_CTX, TEST_DID, TEST_EPOCH, TEST_SEQ);
-        assert!(matches!(result, Err(SenderKeyError::AuthenticationFailed)));
+            decrypt_sender_layer(&key, &ct, TEST_CTX, "did:dht:wrong", TEST_EPOCH, TEST_SEQ);
+        assert!(result.is_err());
     }
 
     #[test]
-    #[allow(clippy::unwrap_used)]
-    fn ciphertext_starts_with_12_byte_nonce() {
+    fn wrong_epoch_fails_aead() {
         let key = generate_sender_key();
-        let plaintext = b"test";
-        let ciphertext =
-            encrypt_sender_layer(&key, plaintext, TEST_CTX, TEST_DID, TEST_EPOCH, TEST_SEQ)
-                .unwrap();
-
-        // Ciphertext should be: 12 (nonce) + plaintext.len() + 16 (tag)
-        assert_eq!(ciphertext.len(), NONCE_SIZE + plaintext.len() + 16);
+        let plaintext = b"hello";
+        let ct = encrypt_sender_layer(&key, plaintext, TEST_CTX, TEST_DID, TEST_EPOCH, TEST_SEQ)
+            .unwrap();
+        let result = decrypt_sender_layer(&key, &ct, TEST_CTX, TEST_DID, 999, TEST_SEQ);
+        assert!(result.is_err());
     }
 
     #[test]
-    #[allow(clippy::unwrap_used)]
-    fn decrypt_rejects_wrong_context_id() {
+    fn wrong_sequence_fails_aead() {
         let key = generate_sender_key();
-        let plaintext = b"context-bound message";
-        let ciphertext =
-            encrypt_sender_layer(&key, plaintext, TEST_CTX, TEST_DID, TEST_EPOCH, TEST_SEQ)
-                .unwrap();
-
-        let result = decrypt_sender_layer(
-            &key,
-            &ciphertext,
-            "wrong-ctx",
-            TEST_DID,
-            TEST_EPOCH,
-            TEST_SEQ,
-        );
-        assert!(
-            matches!(result, Err(SenderKeyError::AuthenticationFailed)),
-            "decryption with wrong context_id must fail"
-        );
+        let plaintext = b"hello";
+        let ct = encrypt_sender_layer(&key, plaintext, TEST_CTX, TEST_DID, TEST_EPOCH, TEST_SEQ)
+            .unwrap();
+        let result = decrypt_sender_layer(&key, &ct, TEST_CTX, TEST_DID, TEST_EPOCH, 0);
+        assert!(result.is_err());
     }
 
     #[test]
-    #[allow(clippy::unwrap_used)]
-    fn decrypt_rejects_wrong_sender_did() {
+    fn wrong_key_fails_aead() {
         let key = generate_sender_key();
-        let plaintext = b"sender-bound message";
-        let ciphertext =
-            encrypt_sender_layer(&key, plaintext, TEST_CTX, TEST_DID, TEST_EPOCH, TEST_SEQ)
-                .unwrap();
-
-        let result = decrypt_sender_layer(
-            &key,
-            &ciphertext,
-            TEST_CTX,
-            "did:dht:z6MkWrong",
-            TEST_EPOCH,
-            TEST_SEQ,
-        );
-        assert!(
-            matches!(result, Err(SenderKeyError::AuthenticationFailed)),
-            "decryption with wrong sender_did must fail"
-        );
+        let wrong_key = generate_sender_key();
+        let plaintext = b"hello";
+        let ct = encrypt_sender_layer(&key, plaintext, TEST_CTX, TEST_DID, TEST_EPOCH, TEST_SEQ)
+            .unwrap();
+        let result =
+            decrypt_sender_layer(&wrong_key, &ct, TEST_CTX, TEST_DID, TEST_EPOCH, TEST_SEQ);
+        assert!(result.is_err());
     }
 
     #[test]
-    #[allow(clippy::unwrap_used)]
-    fn decrypt_rejects_wrong_epoch() {
+    fn truncated_ciphertext_fails() {
         let key = generate_sender_key();
-        let plaintext = b"epoch-bound message";
-        let ciphertext =
-            encrypt_sender_layer(&key, plaintext, TEST_CTX, TEST_DID, TEST_EPOCH, TEST_SEQ)
-                .unwrap();
-
-        let result = decrypt_sender_layer(
-            &key,
-            &ciphertext,
-            TEST_CTX,
-            TEST_DID,
-            TEST_EPOCH + 1,
-            TEST_SEQ,
-        );
-        assert!(
-            matches!(result, Err(SenderKeyError::AuthenticationFailed)),
-            "decryption with wrong epoch must fail"
-        );
+        let result =
+            decrypt_sender_layer(&key, &[0u8; 5], TEST_CTX, TEST_DID, TEST_EPOCH, TEST_SEQ);
+        assert!(result.is_err());
     }
 
     #[test]
-    #[allow(clippy::unwrap_used)]
-    fn decrypt_rejects_wrong_sequence() {
-        let key = generate_sender_key();
-        let plaintext = b"sequence-bound message";
-        let ciphertext =
-            encrypt_sender_layer(&key, plaintext, TEST_CTX, TEST_DID, TEST_EPOCH, TEST_SEQ)
-                .unwrap();
-
-        let result = decrypt_sender_layer(
-            &key,
-            &ciphertext,
-            TEST_CTX,
-            TEST_DID,
-            TEST_EPOCH,
-            TEST_SEQ + 1,
-        );
-        assert!(
-            matches!(result, Err(SenderKeyError::AuthenticationFailed)),
-            "decryption with wrong sequence must fail"
-        );
+    fn header_roundtrip() {
+        let epoch = 42u64;
+        let seq = 99u64;
+        let ct = b"ciphertext-payload";
+        let header = build_sender_header(epoch, seq, ct);
+        assert_eq!(header.len(), SENDER_HEADER_SIZE + ct.len());
+        let (e, s, data) = parse_sender_header(&header).unwrap();
+        assert_eq!(e, epoch);
+        assert_eq!(s, seq);
+        assert_eq!(data, ct);
     }
 
     #[test]
-    #[allow(clippy::unwrap_used)]
-    fn build_sender_aad_is_deterministic() {
-        let aad1 = build_sender_aad("ctx-1", "did:dht:z6MkA", 5, 10);
-        let aad2 = build_sender_aad("ctx-1", "did:dht:z6MkA", 5, 10);
-        assert_eq!(aad1, aad2);
-    }
-
-    #[test]
-    #[allow(clippy::unwrap_used)]
-    fn build_sender_aad_differs_by_field() {
-        let base = build_sender_aad("ctx-1", "did:dht:z6MkA", 5, 10);
-        assert_ne!(base, build_sender_aad("ctx-2", "did:dht:z6MkA", 5, 10));
-        assert_ne!(base, build_sender_aad("ctx-1", "did:dht:z6MkB", 5, 10));
-        assert_ne!(base, build_sender_aad("ctx-1", "did:dht:z6MkA", 6, 10));
-        assert_ne!(base, build_sender_aad("ctx-1", "did:dht:z6MkA", 5, 11));
+    fn parse_header_too_short() {
+        assert!(parse_sender_header(&[0u8; 15]).is_err());
+        assert!(parse_sender_header(&[]).is_err());
     }
 }

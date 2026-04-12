@@ -397,7 +397,17 @@ pub fn py_fullstack_remove_member(
         &node.inner.did,
         &scp_identity::DID::from(member_did.as_str()),
     ))
-    .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("failed to remove member: {e}")))
+    .map_err(|e| {
+        pyo3::exceptions::PyRuntimeError::new_err(format!("failed to remove member: {e}"))
+    })?;
+
+    // Drain the captured MLS Commit + sender-key messages that leave_context
+    // sends via the transport. These are control-plane messages, not
+    // application messages, and must not bleed into the buffer that
+    // py_fullstack_send_message checks for exactly-one application ciphertext.
+    node.inner.take_sent_ciphertexts();
+
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------

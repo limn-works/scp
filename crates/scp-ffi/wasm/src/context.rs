@@ -11,6 +11,7 @@ use js_sys::Promise;
 use wasm_bindgen::prelude::*;
 use wasm_bindgen_futures::future_to_promise;
 
+use scp_ffi_common::html_escape_json;
 use scp_ffi_common::validate::validate_did;
 use scp_protocol::context::params::TemplateId;
 use scp_protocol::context::templates::{
@@ -300,16 +301,57 @@ pub fn context_create(identity_did: String, params_json: String) -> Promise {
 /// Joins an existing SCP context.
 ///
 /// Delegates to `WasmContextManager::join_context`.
+///
+/// # Fail-closed economy gate (C2)
+///
+/// The WASM bridge **cannot** validate a `spending_ucan_jwt` against a
+/// payment adapter, budget tracker, velocity tracker, or hard rate limit
+/// token bucket because `scp-runtime`'s `enforce_economy` pipeline does not
+/// compile to `wasm32` (ADR-034). If the target context has an economic
+/// policy that requires payment for any action, this function rejects with
+/// `SCP-ECON-12096` (`WasmCannotValidateSpendingUcan`) regardless of whether
+/// `spending_ucan_jwt` is `Some` or `None`. Free contexts are unaffected.
+///
+/// To join paid contexts, use a native (Python / Node.js / Swift / Kotlin)
+/// client whose bridge does run `enforce_economy`.
 #[wasm_bindgen]
-pub fn context_join(handle: &WasmContextHandle, identity_did: String) -> Promise {
+pub fn context_join(
+    handle: &WasmContextHandle,
+    identity_did: String,
+    spending_ucan_jwt: Option<String>,
+) -> Promise {
     if let Err(e) = validate_did(&identity_did) {
         return future_to_promise(async move { Err(ScpWasmError::from(e).into_js().into()) });
     }
     let context_id = handle.context_id();
 
     future_to_promise(async move {
-        with_manager(|mgr| mgr.join_context(&context_id, &identity_did))
-            .map_err(ScpWasmError::into_js)?;
+        // Parse-only validation of the spending UCAN JWT, if provided.
+        //
+        // The WASM bridge cannot enforce the *budget* (no payment adapter,
+        // no `enforce_economy` — see ADR-034 and the C2 fail-closed gate
+        // in `WasmContextManager::join_context`). For free contexts, the
+        // JWT is parsed only to surface a clear `SCP-ECON-12061` to the
+        // caller if the token is structurally invalid; for paid contexts
+        // the manager rejects with `SCP-ECON-12096` regardless.
+        if let Some(ref jwt) = spending_ucan_jwt {
+            let _ = scp_protocol::crypto::ucan::validate::parse_ucan(jwt).map_err(|e| {
+                ScpWasmError::Context {
+                    message: format!("invalid spending UCAN: {e}"),
+                    code: "SCP-ECON-12061".to_owned(),
+                }
+                .into_js()
+            })?;
+        }
+
+        // C2: WasmContextManager::join_context inspects both the context's
+        // economic policy AND the spending UCAN, and rejects fail-closed if
+        // the policy requires payment (SCP-ECON-12096). For free contexts
+        // it proceeds normally.
+        with_manager(|mgr| {
+            mgr.join_context(&context_id, &identity_did, spending_ucan_jwt.as_deref())
+        })
+        .map_err(ScpWasmError::into_js)?;
         Ok(JsValue::UNDEFINED)
     })
 }
@@ -360,11 +402,25 @@ pub fn context_close(handle: &WasmContextHandle, identity_did: String) -> Promis
 /// Sends a message to an SCP context.
 ///
 /// Delegates to `WasmContextManager::send_message`.
+///
+/// # Fail-closed economy gate (C2)
+///
+/// The WASM bridge **cannot** validate a `spending_ucan_jwt` against a
+/// payment adapter, budget tracker, velocity tracker, or hard rate limit
+/// token bucket because `scp-runtime`'s `enforce_economy` pipeline does not
+/// compile to `wasm32` (ADR-034). If the target context has an economic
+/// policy that requires payment for any action, this function rejects with
+/// `SCP-ECON-12096` (`WasmCannotValidateSpendingUcan`) regardless of whether
+/// `spending_ucan_jwt` is `Some` or `None`. Free contexts are unaffected.
+///
+/// To send messages in paid contexts, use a native (Python / Node.js /
+/// Swift / Kotlin) client whose bridge does run `enforce_economy`.
 #[wasm_bindgen]
 pub fn context_send(
     handle: &WasmContextHandle,
     identity_did: String,
     payload_base64: String,
+    spending_ucan_jwt: Option<String>,
 ) -> Promise {
     if let Err(e) = validate_did(&identity_did) {
         return future_to_promise(async move { Err(ScpWasmError::from(e).into_js().into()) });
@@ -383,8 +439,37 @@ pub fn context_send(
             .into());
         }
 
-        with_manager(|mgr| mgr.send_message(&context_id, &identity_did, &payload_base64))
-            .map_err(ScpWasmError::into_js)?;
+        // Parse-only validation of the spending UCAN JWT, if provided.
+        //
+        // The WASM bridge cannot enforce the *budget* (no payment adapter,
+        // no `enforce_economy` — see ADR-034 and the C2 fail-closed gate
+        // in `WasmContextManager::send_message`). For free contexts, the
+        // JWT is parsed only to surface a clear `SCP-ECON-12061` to the
+        // caller if the token is structurally invalid; for paid contexts
+        // the manager rejects with `SCP-ECON-12096` regardless.
+        if let Some(ref jwt) = spending_ucan_jwt {
+            let _ = scp_protocol::crypto::ucan::validate::parse_ucan(jwt).map_err(|e| {
+                ScpWasmError::Context {
+                    message: format!("invalid spending UCAN: {e}"),
+                    code: "SCP-ECON-12061".to_owned(),
+                }
+                .into_js()
+            })?;
+        }
+
+        // C2: WasmContextManager::send_message inspects both the context's
+        // economic policy AND the spending UCAN, and rejects fail-closed if
+        // the policy requires payment (SCP-ECON-12096). For free contexts
+        // it proceeds normally.
+        with_manager(|mgr| {
+            mgr.send_message(
+                &context_id,
+                &identity_did,
+                &payload_base64,
+                spending_ucan_jwt.as_deref(),
+            )
+        })
+        .map_err(ScpWasmError::into_js)?;
 
         Ok(JsValue::UNDEFINED)
     })
@@ -597,7 +682,7 @@ pub fn context_drain_events(handle: &WasmContextHandle) -> String {
     for event in &mut json_events {
         serde_to_js_event(event);
     }
-    serde_json::to_string(&json_events).unwrap_or_else(|_| "[]".to_owned())
+    html_escape_json(&serde_json::to_string(&json_events).unwrap_or_else(|_| "[]".to_owned()))
 }
 
 // ---------------------------------------------------------------------------
@@ -611,7 +696,7 @@ pub fn context_drain_events(handle: &WasmContextHandle) -> String {
 ///
 /// Authorization is enforced: the `initiator_did` must be a member with
 /// the capability required for the specific governance action. For example,
-/// `RemoveMember` requires `member_remove:*` (admin-only by default),
+/// `RemoveMember` requires `member:remove` (admin-only by default),
 /// `ChangeRole` requires `role_assign:*`, etc.
 ///
 /// # Arguments
@@ -662,10 +747,10 @@ pub fn context_execute_governance(
             .into_js()
         })?;
 
-        validate_governance_action_strings(&action).map_err(|e| {
+        scp_ffi_common::validate::validate_governance_action_strings(&action).map_err(|e| {
             ScpWasmError::Validation {
-                message: format!("{e}"),
-                code: "SCP-CTX-2040".to_owned(),
+                message: e.message,
+                code: "SCP-VALID-7000".to_owned(),
             }
             .into_js()
         })?;
@@ -745,9 +830,9 @@ pub fn context_governance_propose(
             .into_js()
         })?;
 
-        validate_governance_action_strings(&action).map_err(|e| {
+        scp_ffi_common::validate::validate_governance_action_strings(&action).map_err(|e| {
             ScpWasmError::Validation {
-                message: format!("{e}"),
+                message: e.message,
                 code: "SCP-CTX-2040".to_owned(),
             }
             .into_js()
@@ -768,13 +853,6 @@ pub fn context_governance_propose(
 
         Ok(JsValue::from_str(&json_str))
     })
-}
-
-/// Validates all user-controlled string fields on a governance action.
-fn validate_governance_action_strings(
-    action: &GovernanceAction,
-) -> Result<(), scp_ffi_common::validate::ValidationError> {
-    scp_ffi_common::validate::validate_governance_action_strings(action)
 }
 
 /// Casts an approval vote on a pending governance proposal.
@@ -2808,8 +2886,8 @@ pub fn validate_against_template(params_json: String) -> Result<Option<String>, 
 /// WASM-local re-implementation of the 4-step pipeline from `scp-core`.
 /// Returns a Promise resolving to JSON: `{"decision": "auto_accept"|"prompt_agent"}`.
 ///
-/// Includes rate limiting (B1), full template validation (B2), and
-/// adapter/balance economic checks (B3) per #614 review findings.
+/// Includes rate limiting, full template validation, and
+/// adapter/balance economic checks.
 #[wasm_bindgen]
 pub fn evaluate_invitation(
     params_json: String,

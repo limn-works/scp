@@ -24,6 +24,7 @@ use std::collections::{HashMap, HashSet};
 use std::time::Duration;
 
 use ed25519_dalek::{Signer, SigningKey};
+use scp_core::context::roles::Capability;
 use scp_core::identity::SigningKeyId;
 use scp_core::identity::block_list::{BlockListEvent, BlockListState};
 use scp_core::trust::challenge::VerificationMethod;
@@ -31,13 +32,14 @@ use scp_core::trust::{
     ActionCategory, Attestation, AttestationEvidence, AttestationType, AttestorInfo, CapabilityUri,
     ChallengeResponse, ChallengeSigner, ChallengeType, ConsequenceAction, ConsequenceRule,
     ConsequenceTrigger, ContextSybilPolicy, CounterAttestation, CustodyViolationError,
-    CustodyViolationType, EarnedCapacityLevel, FreshnessStatus, FreshnessWeight,
-    IdentityDepthAssessment, ParticipationFact, ParticipationInput, ParticipationThreshold,
-    RequireParticipation, RevocationStatus, ScpCustodyViolationAttestation, ThresholdRequirement,
-    TrustError, TrustSignal, TrustSignalCategory, check_attestation_freshness,
-    check_threshold_attestation, classify_action, compute_participation_record, enforce_category_a,
-    evaluate_consequence_rules, evaluate_earned_capacity, evaluate_sybil_resistance,
-    issue_challenge, produce_participation_profile, verify_attestation, verify_challenge_response,
+    CustodyViolationType, EarnedCapacityLevel, EnforcementSeverity, FreshnessStatus,
+    FreshnessWeight, IdentityDepthAssessment, ParticipationFact, ParticipationInput,
+    ParticipationThreshold, RequireParticipation, RevocationStatus, ScpCustodyViolationAttestation,
+    ThresholdRequirement, TrustError, TrustSignal, TrustSignalCategory,
+    check_attestation_freshness, check_threshold_attestation, classify_action,
+    compute_participation_record, enforce_category_a, evaluate_consequence_rules,
+    evaluate_earned_capacity, evaluate_sybil_resistance, issue_challenge,
+    produce_participation_profile, verify_attestation, verify_challenge_response,
     verify_participation_requirements,
 };
 use scp_event_log::{Event, EventPayload, EventType};
@@ -473,13 +475,15 @@ async fn consequence_rules_evaluation() {
     let rules = vec![
         ConsequenceRule {
             trigger: ConsequenceTrigger::MessageVelocity,
-            action: ConsequenceAction::CapabilitySuspension(vec!["messages:write".to_owned()]),
+            action: ConsequenceAction::Enforcement(EnforcementSeverity::SuspendCapability {
+                capabilities: vec![Capability::MessagesWrite],
+            }),
             threshold: 3,
             window: Duration::from_secs(60),
         },
         ConsequenceRule {
             trigger: ConsequenceTrigger::ToolRateExceeded,
-            action: ConsequenceAction::AccessRevocation,
+            action: ConsequenceAction::Enforcement(EnforcementSeverity::SuspendAccess),
             threshold: 2,
             window: Duration::from_secs(120),
         },
@@ -500,12 +504,17 @@ async fn consequence_rules_evaluation() {
     assert_eq!(triggered[0].rule_index, 0);
     assert_eq!(
         triggered[0].action,
-        ConsequenceAction::CapabilitySuspension(vec!["messages:write".to_owned()])
+        ConsequenceAction::Enforcement(EnforcementSeverity::SuspendCapability {
+            capabilities: vec![Capability::MessagesWrite]
+        })
     );
     assert_eq!(triggered[0].evidence.len(), 3);
 
     assert_eq!(triggered[1].rule_index, 1);
-    assert_eq!(triggered[1].action, ConsequenceAction::AccessRevocation);
+    assert_eq!(
+        triggered[1].action,
+        ConsequenceAction::Enforcement(EnforcementSeverity::SuspendAccess)
+    );
     assert_eq!(triggered[1].evidence.len(), 2);
 }
 

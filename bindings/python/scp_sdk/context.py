@@ -591,6 +591,8 @@ class Context:
         promotion_policy: PromotionPolicy | str = PromotionPolicy.NO_PROMOTION,
         template_id: str | None = None,
         economic_policy: str | None = None,
+        consequence_rules: list | None = None,
+        consequence_config: dict | None = None,
     ) -> Context:
         """Create a new SCP context.
 
@@ -625,6 +627,14 @@ class Context:
                 must match the template definition.
             economic_policy: Optional economic policy as a JSON string
                 (spec section 19).  ``None`` means free context.
+            consequence_rules: Optional list of consequence rule
+                dictionaries (spec section 9.3, issue #1531).
+                ``None`` means no consequence rules.
+            consequence_config: Optional consequence config mapping
+                governing which enforcement severities the rules may
+                reference (ADR-017, issue #1531). ``None`` falls back to
+                the protocol default
+                (``allow_automatic_access_revocation = false``).
 
         Returns:
             A new :class:`Context` in the ``'active'`` state.
@@ -653,10 +663,14 @@ class Context:
             else promotion_policy
         )
 
+        # Distinguish "explicit empty collection" from "absent" for parameters
+        # whose semantics differ between the two: passing `roles={}` declares
+        # the context has no roles, while omitting the key falls back to the
+        # bridge default. Use `is not None` -- never the falsy form.
         params: dict[str, Any] = {
             "ceiling": ceiling_strs,
-            "roles": roles or {},
-            "tools": [t.name for t in tools] if tools else [],
+            "roles": roles if roles is not None else {},
+            "tools": [t.name for t in tools] if tools is not None else [],
             "ttl": ttl,
             "memory_scope": scope_str,
             "governance": governance,
@@ -665,6 +679,12 @@ class Context:
             "promotion_policy": promotion_policy_str,
             "template_id": template_id,
             "economic_policy": economic_policy,
+            "consequence_rules": json.dumps(consequence_rules)
+            if consequence_rules is not None
+            else None,
+            "consequence_config": json.dumps(consequence_config)
+            if consequence_config is not None
+            else None,
         }
 
         handle = await asyncio.to_thread(_scp_core.py_context_create, creator.did, params)
@@ -672,11 +692,17 @@ class Context:
 
     # -- Lifecycle ----------------------------------------------------------
 
-    async def join(self, identity: Identity) -> Membership:
+    async def join(
+        self,
+        identity: Identity,
+        spending_ucan_jwt: str | None = None,
+    ) -> Membership:
         """Join this context with the given identity.
 
         Args:
             identity: The identity joining the context.
+            spending_ucan_jwt: Optional spending UCAN JWT for
+                AND-composition with join cost (spec section 19).
 
         Returns:
             A :class:`Membership` representing the new participant.
@@ -692,7 +718,12 @@ class Context:
                 code="SCP-CTX-2001",
             ) from exc
 
-        await asyncio.to_thread(_scp_core.py_context_join, self._handle, identity.did)
+        await asyncio.to_thread(
+            _scp_core.py_context_join,
+            self._handle,
+            identity.did,
+            spending_ucan_jwt,
+        )
         return Membership(
             did=identity.did,
             role="member",
@@ -745,6 +776,7 @@ class Context:
         self,
         message: str | bytes,
         identity: Identity | None = None,
+        spending_ucan_jwt: str | None = None,
     ) -> None:
         """Send a message to this context.
 
@@ -752,6 +784,8 @@ class Context:
             message: The message payload (text or binary).
             identity: The sending identity.  Defaults to the context
                 creator if not specified.
+            spending_ucan_jwt: Optional spending UCAN JWT for
+                AND-composition with message cost (spec section 19).
 
         Raises:
             ContextError: If the context is not active.
@@ -765,7 +799,13 @@ class Context:
             ) from exc
 
         sender_did = identity.did if identity is not None else self._creator_did
-        await asyncio.to_thread(_scp_core.py_context_send, self._handle, sender_did, message)
+        await asyncio.to_thread(
+            _scp_core.py_context_send,
+            self._handle,
+            sender_did,
+            message,
+            spending_ucan_jwt,
+        )
 
     async def receive(self) -> AsyncIterator[Message]:
         """Return an async iterator of incoming messages.
@@ -802,6 +842,7 @@ class Context:
         ucan_token: str,
         identity: Identity | None = None,
         proof_tokens: list[str] | None = None,
+        spending_ucan: str | None = None,
     ) -> dict[str, Any]:
         """Invoke a tool registered in this context.
 
@@ -809,6 +850,12 @@ class Context:
         token must contain a ``tool_invoke:{tool_id}`` or
         ``tool_invoke:*`` capability scoped to this context.  See
         spec section 6.2, section 8, and ADR-016 for UCAN enforcement.
+
+        Tool invocation flows through the runtime's full economy
+        pipeline (``ContextManager.invoke_tool_with_economy``):
+        per-invocation pricing, per-DID velocity tracking, escalation,
+        budget enforcement, payment escrow, and the Matrix-style hard
+        rate limit are all enforced by the runtime.
 
         .. versionchanged:: 0.2.0
             ``ucan_token`` is now a required positional parameter
@@ -821,6 +868,13 @@ class Context:
             ``proof_tokens`` was also added as an optional keyword
             argument for delegation chain resolution.
 
+        .. versionchanged:: 0.3.0
+            Added ``spending_ucan`` keyword argument carrying the
+            JWT-encoded ``SpendingCapability`` UCAN required by paid
+            tool invocations under spec section 19.5
+            (AND-composition of action UCAN + spending UCAN). May be
+            ``None`` for free tools.
+
         Args:
             tool: The tool identifier.
             input: Input data as a JSON-compatible dict.
@@ -831,13 +885,21 @@ class Context:
                 creator if not specified.
             proof_tokens: Optional list of additional UCAN proof
                 tokens for delegation chain resolution.
+            spending_ucan: Optional JWT-encoded spending UCAN.
+                Required when an ``EconomicPolicy`` priced this tool
+                above zero (spec section 19.5). The runtime checks
+                that the spending capability covers the per-action
+                cost, currency, and any allowed adapters.
 
         Returns:
             The tool's output as a JSON-compatible dict.
 
         Raises:
             ContextError: If the context is not active or the tool is
-                not found.
+                not found.  Specific failure modes carry their canonical
+                error code in ``.code``: ``SCP-ECON-12010`` (budget
+                exceeded), ``SCP-ECON-12061`` (invalid spending UCAN),
+                ``SCP-ECON-12090`` (rate limit exceeded).
             ToolError: If tool execution fails.
             UcanError: If the UCAN token is invalid, expired, revoked,
                 or lacks the required tool invocation capability.
@@ -859,6 +921,7 @@ class Context:
             invoker_did,
             ucan_token,
             proof_tokens,
+            spending_ucan,
         )
         return result
 
@@ -1582,7 +1645,11 @@ def evaluate_invitation(
 
     import _scp_core
 
-    trusted_dids_json = json.dumps(trusted_dids) if trusted_dids else None
+    # H14: Distinguish "explicit empty trusted set" (auto-reject everyone) from
+    # "no trusted-DID policy provided" (fall through to other rules). Empty list
+    # `[]` must round-trip as `"[]"`, NOT collapse to None. Never use the falsy
+    # form on Optional collections at FFI boundaries.
+    trusted_dids_json = json.dumps(trusted_dids) if trusted_dids is not None else None
     return _scp_core.evaluate_invitation(
         params_json,
         inviter_did,

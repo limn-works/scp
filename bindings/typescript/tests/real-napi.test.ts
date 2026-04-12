@@ -426,6 +426,8 @@ if (bridge === null || serverAddon === null) {
         admin,
         JSON.stringify({ ceiling: ["tool:register", "tool:invoke:*"] }),
       );
+      // Join member to context so they have role-based capabilities.
+      await napi.contextJoin(ctx, member.did);
       const toolId = await napi.toolRegister(ctx, {
         name: "test-tool",
         description: "A test tool",
@@ -436,7 +438,7 @@ if (bridge === null || serverAddon === null) {
         outputSchema: { type: "object" },
         operator: admin.did,
       });
-      // Mint UCAN for the member (not self-delegation).
+      // Mint UCAN for the member (cross-delegation, not self).
       const ucan = await napi.ucanMint(ctx, member.did, ["tool:invoke:*"]);
       const resultJson = await napi.toolInvoke(
         ctx,
@@ -1036,6 +1038,8 @@ if (bridge === null || serverAddon === null) {
           ceiling: ["tool:register", "tool:invoke:*"],
         }),
       );
+      // Join member so they have role-based capabilities.
+      await napi.contextJoin(ctx, member.did);
 
       // Register.
       const toolId = await napi.toolRegister(ctx, {
@@ -1053,7 +1057,7 @@ if (bridge === null || serverAddon === null) {
       });
       expect(toolId).toBeTruthy();
 
-      // Invoke (mint for member, not self-delegation).
+      // Invoke (mint for member, cross-delegation).
       const ucan = await napi.ucanMint(ctx, member.did, ["tool:invoke:*"]);
       const resultJson = await napi.toolInvoke(
         ctx,

@@ -35,6 +35,8 @@ use scp_platform::traits::KeyCustody;
 use scp_primitives::Clock;
 use tokio::sync::mpsc;
 
+use scp_ffi_common::html_escape_event_string;
+
 use crate::validate;
 
 // ---------------------------------------------------------------------------
@@ -206,6 +208,13 @@ pub struct PyContextParams {
     /// Per-caller session cap (spec §6.2.1, ADR-043).
     /// When `None`, defaults to `DEFAULT_SESSION_CAP_PER_CALLER` (1000).
     session_cap: Option<u32>,
+    /// Optional consequence rules as a JSON string (ADR-017, #1531).
+    /// When `None`, defaults to an empty list (no consequences).
+    consequence_rules: Option<String>,
+    /// Optional consequence config as a JSON string (ADR-017, #1531).
+    /// When `None`, defaults to `ConsequenceConfig::default()` (all severe
+    /// enforcement tiers gated to governance only).
+    consequence_config: Option<String>,
 }
 
 #[pymethods]
@@ -323,13 +332,28 @@ impl PyContextParams {
         self.session_cap
     }
 
+    /// Returns the consequence rules as a JSON string, or `None` if the
+    /// context has no consequence rules (ADR-017, #1531).
+    #[getter]
+    fn consequence_rules(&self) -> Option<&str> {
+        self.consequence_rules.as_deref()
+    }
+
+    /// Returns the consequence config as a JSON string, or `None` if the
+    /// context inherits the default config (ADR-017, #1531).
+    #[getter]
+    fn consequence_config(&self) -> Option<&str> {
+        self.consequence_config.as_deref()
+    }
+
     fn __repr__(&self) -> String {
         format!(
             "PyContextParams(ceiling={:?}, roles={:?}, tools={:?}, ttl={:?}, \
              memory_scope='{}', governance='{}', mode='{}', ceiling_policy='{}', \
              promotion_policy='{}', template_id={:?}, economic_policy={:?}, \
              min_protocol_version={:?}, max_chain_depth={:?}, \
-             max_nesting_depth={:?}, session_cap={:?})",
+             max_nesting_depth={:?}, session_cap={:?}, \
+             consequence_rules={:?}, consequence_config={:?})",
             self.ceiling,
             self.roles,
             self.tools,
@@ -345,6 +369,8 @@ impl PyContextParams {
             self.max_chain_depth,
             self.max_nesting_depth,
             self.session_cap,
+            self.consequence_rules,
+            self.consequence_config,
         )
     }
 }
@@ -542,6 +568,26 @@ impl PyContextParams {
             None => None,
         };
 
+        // consequence_rules: Optional[str] (JSON string, default: None) -- ADR-017, #1531
+        let consequence_rules: Option<String> = match dict.get_item("consequence_rules")? {
+            Some(val) if val.is_none() => None,
+            Some(val) => {
+                let cr: String = val.extract()?;
+                Some(cr)
+            }
+            None => None,
+        };
+
+        // consequence_config: Optional[str] (JSON string, default: None) -- ADR-017, #1531
+        let consequence_config: Option<String> = match dict.get_item("consequence_config")? {
+            Some(val) if val.is_none() => None,
+            Some(val) => {
+                let cc: String = val.extract()?;
+                Some(cc)
+            }
+            None => None,
+        };
+
         Ok(Self {
             ceiling,
             roles,
@@ -558,6 +604,8 @@ impl PyContextParams {
             max_chain_depth,
             max_nesting_depth,
             session_cap,
+            consequence_rules,
+            consequence_config,
         })
     }
 }
@@ -963,8 +1011,12 @@ fn py_context_create(identity_did: &str, params: &Bound<'_, PyDict>) -> PyResult
 ///
 /// Returns `RuntimeError` if the context is not in "active" state.
 #[pyfunction]
-#[pyo3(signature = (handle, identity_did))]
-fn py_context_join(handle: &PyContextHandle, identity_did: &str) -> PyResult<()> {
+#[pyo3(signature = (handle, identity_did, spending_ucan_jwt=None))]
+fn py_context_join(
+    handle: &PyContextHandle,
+    identity_did: &str,
+    spending_ucan_jwt: Option<&str>,
+) -> PyResult<()> {
     validate::validate_did(identity_did)?;
     let state = handle
         .state
@@ -977,6 +1029,14 @@ fn py_context_join(handle: &PyContextHandle, identity_did: &str) -> PyResult<()>
         )));
     }
     drop(state);
+
+    // Parse optional spending UCAN JWT for AND-composition (join cost).
+    let spending_ucan = spending_ucan_jwt
+        .map(|jwt| {
+            scp_core::crypto::ucan::validate::parse_ucan(jwt)
+                .map_err(|e| PyRuntimeError::new_err(format!("invalid spending UCAN: {e}")))
+        })
+        .transpose()?;
 
     // Ensure the ContextManager is initialized — context_join is a valid
     // first operation (e.g. a device joining a context without creating one).
@@ -1020,7 +1080,8 @@ fn py_context_join(handle: &PyContextHandle, identity_did: &str) -> PyResult<()>
             let _ = temp_handle
                 .transition_to(&scp_core::context::ContextState::Active)
                 .await;
-            mgr.join_context(&temp_handle, key_package).await
+            mgr.join_context(&temp_handle, key_package, spending_ucan.as_ref())
+                .await
         })
         .map_err(|e| PyRuntimeError::new_err(format!("ContextManager join_context failed: {e}")))?;
 
@@ -1202,11 +1263,12 @@ fn py_context_close(handle: &PyContextHandle, identity_did: &str) -> PyResult<()
 /// Returns `RuntimeError` if the context is not in "active" state, or
 /// `TypeError` if the payload is not bytes or str.
 #[pyfunction]
-#[pyo3(signature = (handle, identity_did, payload))]
+#[pyo3(signature = (handle, identity_did, payload, spending_ucan_jwt=None))]
 fn py_context_send(
     handle: &PyContextHandle,
     identity_did: &str,
     payload: &Bound<'_, PyAny>,
+    spending_ucan_jwt: Option<&str>,
 ) -> PyResult<()> {
     validate::validate_did(identity_did)?;
     let state = handle
@@ -1230,6 +1292,14 @@ fn py_context_send(
     } else {
         return Err(PyTypeError::new_err("payload must be bytes or str"));
     };
+
+    // Parse optional spending UCAN JWT into a UcanToken for AND-composition.
+    let spending_ucan = spending_ucan_jwt
+        .map(|jwt| {
+            scp_core::crypto::ucan::validate::parse_ucan(jwt)
+                .map_err(|e| PyRuntimeError::new_err(format!("invalid spending UCAN: {e}")))
+        })
+        .transpose()?;
 
     // Delegate message sending to the shared ContextManager. The ContextManager
     // validates Active state, checks write capabilities, assigns sequence numbers,
@@ -1263,6 +1333,7 @@ fn py_context_send(
                 &payload_bytes,
                 Some(&signing_key),
                 None,
+                spending_ucan.as_ref(),
             )
             .await
         })
@@ -1303,6 +1374,117 @@ fn py_context_send(
 /// called), events are silently discarded. This is intentional: the channel
 /// is demand-driven, and events before subscription are lost (consistent
 /// with the subscription model in `TransportAdapter::subscribe`).
+/// Converts a [`ContextEvent`] into the `(sender_did, payload, timestamp)` triple
+/// used by the `PyO3` bridge event delivery pipeline.
+#[allow(clippy::cast_precision_loss)]
+#[allow(clippy::too_many_lines)]
+fn convert_context_event(
+    event: scp_core::context::membership::ContextEvent,
+) -> (String, Vec<u8>, f64) {
+    use scp_core::context::membership::ContextEvent::{ConsequenceEnforced, ConsequenceTriggered};
+    let ts = scp_primitives::SystemClock.now_secs() as f64;
+    match event {
+        scp_core::context::membership::ContextEvent::MessageSent {
+            sender_did,
+            payload,
+            ..
+        } => (sender_did.to_string(), payload, ts),
+        scp_core::context::membership::ContextEvent::MemberJoined {
+            member_did,
+            role_name,
+        } => (
+            "scp:system".to_owned(),
+            // M10: HTML-escape all user-supplied values in event strings.
+            format!(
+                "member_joined:{}:{}",
+                html_escape_event_string(member_did.as_ref()),
+                html_escape_event_string(&role_name),
+            )
+            .into_bytes(),
+            ts,
+        ),
+        scp_core::context::membership::ContextEvent::MemberLeft { member_did } => (
+            "scp:system".to_owned(),
+            format!(
+                "member_left:{}",
+                html_escape_event_string(member_did.as_ref()),
+            )
+            .into_bytes(),
+            ts,
+        ),
+        scp_core::context::membership::ContextEvent::SystemClose { initiator_did } => (
+            "scp:system".to_owned(),
+            format!(
+                "system_close:{}",
+                html_escape_event_string(initiator_did.as_ref()),
+            )
+            .into_bytes(),
+            ts,
+        ),
+        scp_core::context::membership::ContextEvent::SequenceGapDetected {
+            sender_did,
+            expected_sequence,
+            first_delivered_sequence,
+            reason,
+        } => (
+            "scp:system".to_owned(),
+            format!(
+                "sequence_gap_detected:sender={},\
+                 expected={expected_sequence},\
+                 first_delivered={first_delivered_sequence},\
+                 reason={}",
+                html_escape_event_string(&sender_did),
+                html_escape_event_string(&reason),
+            )
+            .into_bytes(),
+            ts,
+        ),
+        ConsequenceTriggered {
+            context_id: ctx_id,
+            member_did,
+            rule_index,
+            trigger_type,
+            action_type,
+        } => (
+            "scp:system".to_owned(),
+            format!(
+                "consequence_triggered:member={},\
+                 rule={rule_index},trigger={},\
+                 action={},context={}",
+                html_escape_event_string(member_did.as_ref()),
+                html_escape_event_string(&trigger_type),
+                html_escape_event_string(&action_type),
+                html_escape_event_string(&ctx_id),
+            )
+            .into_bytes(),
+            ts,
+        ),
+        ConsequenceEnforced {
+            context_id: ctx_id,
+            member_did,
+            action_type,
+            success,
+        } => (
+            "scp:system".to_owned(),
+            format!(
+                "consequence_enforced:member={},\
+                 action={},success={success},\
+                 context={}",
+                html_escape_event_string(member_did.as_ref()),
+                html_escape_event_string(&action_type),
+                html_escape_event_string(&ctx_id),
+            )
+            .into_bytes(),
+            ts,
+        ),
+        other => (
+            "scp:system".to_owned(),
+            html_escape_event_string(&format!("{other:?}")).into_bytes(),
+            ts,
+        ),
+    }
+}
+
 fn drain_and_deliver(context_id: &str) {
     let Ok(rt) = crate::runtime() else {
         return;
@@ -1315,76 +1497,7 @@ fn drain_and_deliver(context_id: &str) {
     let events = rt.block_on(mgr.drain_events(context_id));
 
     for event in events {
-        let (sender_did, payload, timestamp) = match event {
-            scp_core::context::membership::ContextEvent::MessageSent {
-                sender_did,
-                payload,
-                ..
-            } => {
-                #[allow(clippy::cast_precision_loss)]
-                let ts = scp_primitives::SystemClock.now_secs() as f64;
-                (sender_did.to_string(), payload, ts)
-            }
-            scp_core::context::membership::ContextEvent::MemberJoined {
-                member_did,
-                role_name,
-            } => {
-                #[allow(clippy::cast_precision_loss)]
-                let ts = scp_primitives::SystemClock.now_secs() as f64;
-                (
-                    "scp:system".to_owned(),
-                    format!("member_joined:{member_did}:{role_name}").into_bytes(),
-                    ts,
-                )
-            }
-            scp_core::context::membership::ContextEvent::MemberLeft { member_did } => {
-                #[allow(clippy::cast_precision_loss)]
-                let ts = scp_primitives::SystemClock.now_secs() as f64;
-                (
-                    "scp:system".to_owned(),
-                    format!("member_left:{member_did}").into_bytes(),
-                    ts,
-                )
-            }
-            scp_core::context::membership::ContextEvent::SystemClose { initiator_did } => {
-                #[allow(clippy::cast_precision_loss)]
-                let ts = scp_primitives::SystemClock.now_secs() as f64;
-                (
-                    "scp:system".to_owned(),
-                    format!("system_close:{initiator_did}").into_bytes(),
-                    ts,
-                )
-            }
-            scp_core::context::membership::ContextEvent::SequenceGapDetected {
-                sender_did,
-                expected_sequence,
-                first_delivered_sequence,
-                reason,
-            } => {
-                #[allow(clippy::cast_precision_loss)]
-                let ts = scp_primitives::SystemClock.now_secs() as f64;
-                (
-                    "scp:system".to_owned(),
-                    format!(
-                        "sequence_gap_detected:sender={sender_did},\
-                         expected={expected_sequence},\
-                         first_delivered={first_delivered_sequence},\
-                         reason={reason}"
-                    )
-                    .into_bytes(),
-                    ts,
-                )
-            }
-            other => {
-                #[allow(clippy::cast_precision_loss)]
-                let ts = scp_primitives::SystemClock.now_secs() as f64;
-                (
-                    "scp:system".to_owned(),
-                    format!("{other:?}").into_bytes(),
-                    ts,
-                )
-            }
-        };
+        let (sender_did, payload, timestamp) = convert_context_event(event);
 
         let msg = PyMessage::new(sender_did, payload, timestamp, context_id.to_owned());
         // Best-effort: if no channel is open or the channel is full, the
@@ -1445,6 +1558,7 @@ fn py_context_receive(handle: &PyContextHandle) -> PyResult<PyMessageReceiver> {
 ///
 /// Converts the flat FFI-facing parameter representation into the typed
 /// scp-core parameter struct used by [`ContextManager::create_context`].
+#[allow(clippy::too_many_lines)] // 1:1 field mapping — splitting would reduce readability
 fn build_core_context_params(
     py_params: &PyContextParams,
 ) -> PyResult<scp_core::context::ContextParams> {
@@ -1551,6 +1665,49 @@ fn build_core_context_params(
             scp_core::context::params::IncompleteVerificationPolicy::default(),
         min_protocol_version: py_params.min_protocol_version,
         migration_source: None,
+        consequence_rules: {
+            let parsed_consequence_rules: Vec<scp_core::trust::ConsequenceRule> = py_params
+                .consequence_rules
+                .as_deref()
+                .map(|cr_json| {
+                    serde_json::from_str(cr_json).map_err(|e| {
+                        PyRuntimeError::new_err(format!("invalid consequence_rules JSON: {e}"))
+                    })
+                })
+                .transpose()?
+                .unwrap_or_default();
+            // Parse the per-context consequence config so RevokeAccess gating
+            // is enforced before the core constructs the context. The parsed
+            // value is consumed below in `consequence_config:` — re-parse for
+            // local validation here. Doing both reads is cheap (small JSON).
+            let local_config: scp_core::context::params::ConsequenceConfig = py_params
+                .consequence_config
+                .as_deref()
+                .map(|cc_json| {
+                    serde_json::from_str(cc_json).map_err(|e| {
+                        PyRuntimeError::new_err(format!("invalid consequence_config JSON: {e}"))
+                    })
+                })
+                .transpose()?
+                .unwrap_or_default();
+            for rule in &parsed_consequence_rules {
+                rule.validate_against_config(&local_config).map_err(|e| {
+                    PyRuntimeError::new_err(format!("consequence_rules validation failed: {e}"))
+                })?;
+            }
+            parsed_consequence_rules
+        },
+        consequence_config: py_params
+            .consequence_config
+            .as_deref()
+            .map(|cc_json| {
+                serde_json::from_str(cc_json).map_err(|e| {
+                    PyRuntimeError::new_err(format!("invalid consequence_config JSON: {e}"))
+                })
+            })
+            .transpose()?
+            .unwrap_or_default(),
+        sybil_policy: None,
     })
 }
 
@@ -1711,7 +1868,15 @@ impl scp_core::crypto::ucan::validate::DidResolver for NoOpDidResolver {
 
 struct NoOpNonceTracker;
 impl scp_core::crypto::ucan::validate::NonceTracker for NoOpNonceTracker {
-    fn check_and_record(
+    fn check_replay(
+        &self,
+        _nonce: &str,
+        _token_expiry: u64,
+    ) -> Result<(), scp_core::crypto::ucan::UcanError> {
+        Ok(())
+    }
+
+    fn record(
         &mut self,
         _nonce: &str,
         _token_expiry: u64,
@@ -1774,8 +1939,8 @@ fn py_governance_execute(handle: &PyContextHandle, proposal_json: &str) -> PyRes
             serde_json::from_str(&proposal_json_owned).map_err(|e| {
                 PyValueError::new_err(format!("invalid governance proposal JSON: {e}"))
             })?;
-        validate_governance_action_strings(&proposal.action)
-            .map_err(|e| PyValueError::new_err(format!("SCP-CTX-2040: {e}")))?;
+        scp_ffi_common::validate::validate_governance_action_strings(&proposal.action)
+            .map_err(|e| PyValueError::new_err(e.message))?;
         let action_name = proposal.action.variant_name();
         let result = mgr
             .execute_governance_action(&context_id, &proposal)
@@ -1834,13 +1999,11 @@ fn py_governance_execute(handle: &PyContextHandle, proposal_json: &str) -> PyRes
             GovernanceActionResult::MemberReset => "MemberReset",
             GovernanceActionResult::ConflictResolved => "ConflictResolved",
             GovernanceActionResult::ContextPromoted => "ContextPromoted",
-            GovernanceActionResult::ReadAccessRevoked(_) => "ReadAccessRevoked",
-            GovernanceActionResult::ReadAccessRestored(_) => "ReadAccessRestored",
-            GovernanceActionResult::WriteAccessRevoked(_) => "WriteAccessRevoked",
-            GovernanceActionResult::WriteAccessRestored(_) => "WriteAccessRestored",
+            GovernanceActionResult::MemberSuspended(_) => "MemberSuspended",
+            GovernanceActionResult::AccessRevoked(_) => "AccessRevoked",
+            GovernanceActionResult::AccessRestored(_) => "AccessRestored",
             GovernanceActionResult::ContentKeysRotated(_) => "ContentKeysRotated",
             GovernanceActionResult::GovernanceReconfigured(_) => "GovernanceReconfigured",
-            GovernanceActionResult::AuthorBlocked(_) => "AuthorBlocked",
             GovernanceActionResult::SubscriberBanned(_) => "SubscriberBanned",
             GovernanceActionResult::SubscriberUnbanned { .. } => "SubscriberUnbanned",
             GovernanceActionResult::Executed => "Executed",
@@ -2032,8 +2195,8 @@ fn py_governance_propose(
                 PyValueError::new_err(format!("SCP-CTX-2040: invalid governance action JSON: {e}"))
             })?;
 
-        validate_governance_action_strings(&action)
-            .map_err(|e| PyValueError::new_err(format!("SCP-CTX-2040: {e}")))?;
+        scp_ffi_common::validate::validate_governance_action_strings(&action)
+            .map_err(|e| PyValueError::new_err(format!("SCP-CTX-2040: {}", e.message)))?;
 
         let action_name = action.variant_name();
 
@@ -2068,6 +2231,7 @@ fn py_governance_propose(
 }
 
 /// Validates all user-controlled string fields on a governance action.
+#[cfg(test)]
 fn validate_governance_action_strings(
     action: &scp_core::context::governance::GovernanceAction,
 ) -> Result<(), crate::error::ScpPyError> {
@@ -4276,6 +4440,8 @@ mod tests {
             max_chain_depth: None,
             max_nesting_depth: None,
             session_cap: None,
+            consequence_rules: None,
+            consequence_config: None,
         }
     }
 
@@ -4786,6 +4952,53 @@ mod tests {
         );
     }
 
+    // -------------------------------------------------------------------
+    // Consequence event conversion tests (#1531, #1593, #1594)
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn convert_consequence_triggered_event_format() {
+        use scp_core::context::membership::ContextEvent;
+
+        let event = ContextEvent::ConsequenceTriggered {
+            context_id: "ctx-test-123".to_owned(),
+            member_did: scp_identity::DID("did:dht:z6MkBob".to_owned()),
+            rule_index: 2,
+            trigger_type: "velocity".to_owned(),
+            action_type: "mute".to_owned(),
+        };
+
+        let (sender, payload, ts) = super::convert_context_event(event);
+        assert_eq!(sender, "scp:system");
+        assert!(ts > 0.0, "timestamp must be positive");
+
+        let payload_str = String::from_utf8(payload).unwrap();
+        assert!(
+            payload_str.contains("consequence_triggered:"),
+            "payload must contain consequence_triggered prefix"
+        );
+        assert!(
+            payload_str.contains("member=did:dht:z6MkBob"),
+            "payload must contain member DID"
+        );
+        assert!(
+            payload_str.contains("rule=2"),
+            "payload must contain rule index"
+        );
+        assert!(
+            payload_str.contains("trigger=velocity"),
+            "payload must contain trigger type"
+        );
+        assert!(
+            payload_str.contains("action=mute"),
+            "payload must contain action type"
+        );
+        assert!(
+            payload_str.contains("context=ctx-test-123"),
+            "payload must contain context ID"
+        );
+    }
+
     #[test]
     fn governance_action_control_chars_in_reason_rejected() {
         let action = scp_core::context::governance::GovernanceAction::RemoveMember {
@@ -4796,6 +5009,64 @@ mod tests {
         assert!(
             err.to_string().contains("control character"),
             "expected control char rejection, got: {err}"
+        );
+    }
+
+    #[test]
+    fn convert_consequence_enforced_event_format() {
+        use scp_core::context::membership::ContextEvent;
+
+        let event = ContextEvent::ConsequenceEnforced {
+            context_id: "ctx-test-456".to_owned(),
+            member_did: scp_identity::DID("did:dht:z6MkAlice".to_owned()),
+            action_type: "restrict_write".to_owned(),
+            success: true,
+        };
+
+        let (sender, payload, _ts) = super::convert_context_event(event);
+        assert_eq!(sender, "scp:system");
+
+        let payload_str = String::from_utf8(payload).unwrap();
+        assert!(
+            payload_str.contains("consequence_enforced:"),
+            "payload must contain consequence_enforced prefix"
+        );
+        assert!(
+            payload_str.contains("member=did:dht:z6MkAlice"),
+            "payload must contain member DID"
+        );
+        assert!(
+            payload_str.contains("action=restrict_write"),
+            "payload must contain action type"
+        );
+        assert!(
+            payload_str.contains("success=true"),
+            "payload must contain success flag"
+        );
+    }
+
+    // -------------------------------------------------------------------
+    // Consequence rules in context params tests (#1531, #1593)
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn consequence_rules_in_context_params_accepted() {
+        let consequence_json = r#"[{"trigger":"MessageVelocity","action":{"Enforcement":"SuspendAccess"},"threshold":5,"window":{"secs":3600,"nanos":0}}]"#;
+        let p = PyContextParams {
+            consequence_rules: Some(consequence_json.to_owned()),
+            ..default_params()
+        };
+        assert_eq!(
+            p.consequence_rules.as_deref(),
+            Some(consequence_json),
+            "consequence_rules should be stored in params"
+        );
+
+        // Verify it flows through to core context params.
+        let core_params = super::build_core_context_params(&p).unwrap();
+        assert!(
+            !core_params.consequence_rules.is_empty(),
+            "consequence_rules should parse into non-empty vec"
         );
     }
 
@@ -4818,6 +5089,18 @@ mod tests {
         assert!(
             err.to_string().contains("HTML-special character"),
             "expected HTML-special rejection, got: {err}"
+        );
+    }
+
+    #[test]
+    fn consequence_rules_none_defaults_to_empty() {
+        let p = default_params();
+        assert!(p.consequence_rules.is_none());
+
+        let core_params = super::build_core_context_params(&p).unwrap();
+        assert!(
+            core_params.consequence_rules.is_empty(),
+            "None consequence_rules should default to empty vec"
         );
     }
 
@@ -4849,5 +5132,186 @@ mod tests {
             err.to_string().contains("HTML-special character"),
             "expected HTML-special rejection, got: {err}"
         );
+    }
+
+    #[test]
+    fn consequence_rules_invalid_json_rejected() {
+        let p = PyContextParams {
+            consequence_rules: Some("not valid json".to_owned()),
+            ..default_params()
+        };
+
+        let result = super::build_core_context_params(&p);
+        assert!(
+            result.is_err(),
+            "invalid consequence_rules JSON should be rejected"
+        );
+    }
+
+    /// C5: `PyContextParams` must accept a `consequence_config` JSON string
+    /// and thread it into the core `ContextParams` instead of always falling
+    /// back to `ConsequenceConfig::default()`.
+    #[test]
+    fn consequence_config_threaded_into_core_params() {
+        let p = PyContextParams {
+            consequence_config: Some(r#"{"allow_automatic_access_revocation":true}"#.to_owned()),
+            ..default_params()
+        };
+
+        let core_params = super::build_core_context_params(&p)
+            .expect("build_core_context_params should accept a valid consequence_config");
+
+        assert!(
+            core_params
+                .consequence_config
+                .allow_automatic_access_revocation,
+            "consequence_config.allow_automatic_access_revocation should round-trip true into core ContextParams"
+        );
+    }
+
+    /// C5: invalid `consequence_config` JSON must be rejected by
+    /// `build_core_context_params` with a clear error.
+    #[test]
+    fn consequence_config_invalid_json_rejected() {
+        let p = PyContextParams {
+            consequence_config: Some("not valid json".to_owned()),
+            ..default_params()
+        };
+
+        let result = super::build_core_context_params(&p);
+        assert!(
+            result.is_err(),
+            "invalid consequence_config JSON should be rejected at the bridge boundary"
+        );
+    }
+
+    /// C5: a `RevokeAccess` rule must be rejected by
+    /// `build_core_context_params` when the per-context config does not
+    /// opt in to `allow_automatic_access_revocation`.
+    #[test]
+    fn consequence_rules_revoke_access_rejected_without_config_opt_in() {
+        let bad_rules = r#"[{
+            "trigger": "MessageVelocity",
+            "action": { "Enforcement": { "RevokeAccess": {
+                "did": "did:dht:z6MkSubject",
+                "access": "Both"
+            } } },
+            "threshold": 5,
+            "window": { "secs": 60, "nanos": 0 }
+        }]"#;
+        let p = PyContextParams {
+            consequence_rules: Some(bad_rules.to_owned()),
+            // consequence_config left None -> default disallows RevokeAccess.
+            ..default_params()
+        };
+
+        let result = super::build_core_context_params(&p);
+        assert!(
+            result.is_err(),
+            "RevokeAccess rule must be rejected when consequence_config is missing or disallows it"
+        );
+    }
+
+    /// C5: a `RevokeAccess` rule must be accepted when the per-context
+    /// config opts into `allow_automatic_access_revocation`.
+    #[test]
+    fn consequence_rules_revoke_access_accepted_with_config_opt_in() {
+        let rules = r#"[{
+            "trigger": "MessageVelocity",
+            "action": { "Enforcement": { "RevokeAccess": {
+                "did": "did:dht:z6MkSubject",
+                "access": "Both"
+            } } },
+            "threshold": 5,
+            "window": { "secs": 3600, "nanos": 0 }
+        }]"#;
+        let config = r#"{"allow_automatic_access_revocation":true}"#;
+        let p = PyContextParams {
+            consequence_rules: Some(rules.to_owned()),
+            consequence_config: Some(config.to_owned()),
+            ..default_params()
+        };
+
+        let core_params = super::build_core_context_params(&p)
+            .expect("RevokeAccess rule should be accepted when config opts in");
+        assert_eq!(core_params.consequence_rules.len(), 1);
+        assert!(
+            core_params
+                .consequence_config
+                .allow_automatic_access_revocation
+        );
+    }
+
+    // -------------------------------------------------------------------
+    // Spending UCAN parameter acceptance tests (#1537, #1593)
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn evaluate_invitation_accepts_spending_json() {
+        pyo3::prepare_freethreaded_python();
+        Python::with_gil(|_py| {
+            let params = scp_core::context::ContextParams::default();
+            let params_json = serde_json::to_string(&params).unwrap();
+            let spending_json = r#"{"has_spending_ucan":true,"configured_adapters":["x402"],"available_balance":10000}"#;
+
+            let result = py_evaluate_invitation(
+                &params_json,
+                "did:dht:z6MkBob",
+                "did:dht:z6MkLocal",
+                None,
+                Some(spending_json),
+                None,
+            );
+
+            // Free contexts do not require spending, so the pipeline should
+            // still reach prompt_agent regardless of spending context.
+            match &result {
+                Ok(v) => assert_eq!(v, "prompt_agent"),
+                Err(e) => panic!("expected Ok, got Err: {e}"),
+            }
+        });
+    }
+
+    #[test]
+    fn evaluate_invitation_rejects_invalid_spending_json() {
+        pyo3::prepare_freethreaded_python();
+        Python::with_gil(|_py| {
+            let params = scp_core::context::ContextParams::default();
+            let params_json = serde_json::to_string(&params).unwrap();
+
+            let result = py_evaluate_invitation(
+                &params_json,
+                "did:dht:z6MkBob",
+                "did:dht:z6MkLocal",
+                None,
+                Some("not valid json"),
+                None,
+            );
+
+            assert!(result.is_err(), "invalid spending JSON should be rejected");
+        });
+    }
+
+    #[test]
+    fn evaluate_invitation_none_spending_accepted() {
+        pyo3::prepare_freethreaded_python();
+        Python::with_gil(|_py| {
+            let params = scp_core::context::ContextParams::default();
+            let params_json = serde_json::to_string(&params).unwrap();
+
+            let result = py_evaluate_invitation(
+                &params_json,
+                "did:dht:z6MkBob",
+                "did:dht:z6MkLocal",
+                None,
+                None, // No spending context
+                None,
+            );
+
+            match &result {
+                Ok(v) => assert_eq!(v, "prompt_agent"),
+                Err(e) => panic!("expected Ok, got Err: {e}"),
+            }
+        });
     }
 }

@@ -198,9 +198,8 @@ export {
 // Economy
 // ---------------------------------------------------------------------------
 
-export type { ObservableMetrics, PaidActionType, RelayPriceAdjustment } from "./economy";
+export type { ObservableMetrics, PaidActionType } from "./economy";
 export {
-  adjustRelayPrice,
   antispamEscalatedCost,
   antispamRecord,
   antispamVelocity,
@@ -236,6 +235,9 @@ export {
   AttestationError,
   ContextError,
   CryptoError,
+  EconomicPolicyUnsupportedOnWasm,
+  EconomyError,
+  GovernanceError,
   IdentityError,
   McpError,
   mapBridgeError,
@@ -246,6 +248,7 @@ export {
   TransportError,
   UcanPermissionError,
   ValidationError,
+  WasmCannotValidateSpendingUcan,
 } from "./errors";
 
 // ---------------------------------------------------------------------------

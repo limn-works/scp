@@ -67,6 +67,10 @@ interface MockContext {
   broadcastBlockedSubscribers: Set<string>;
   broadcastAdmission: BroadcastAdmissionPolicy | null;
   sessions: Map<string, MockSession>;
+  /** Raw paramsJson string passed to contextCreate (for SDK round-trip tests). */
+  rawParamsJson: string;
+  /** Last spendingUcanJwt passed to contextJoin (for SDK round-trip tests). */
+  lastJoinSpendingUcanJwt?: string | null;
 }
 
 interface MockTransport {
@@ -254,6 +258,7 @@ export function createMockBridge(): Bridge & {
         broadcastBlockedSubscribers: new Set(),
         broadcastAdmission: mode === "Broadcast" ? "Open" : null,
         sessions: new Map(),
+        rawParamsJson: paramsJson,
       };
 
       // Record ContextCreated event
@@ -271,8 +276,13 @@ export function createMockBridge(): Bridge & {
       return { contextId, state: "active", creatorDid: identity.did };
     },
 
-    async contextJoin(handle: BridgeContextHandle, identityDid: string): Promise<void> {
+    async contextJoin(
+      handle: BridgeContextHandle,
+      identityDid: string,
+      spendingUcanJwt?: string | null,
+    ): Promise<void> {
       const ctx = getContext(handle);
+      ctx.lastJoinSpendingUcanJwt = spendingUcanJwt ?? null;
       ctx.members.add(identityDid);
       const joinedEvent: Event = {
         eventType: "MemberJoined",
@@ -324,6 +334,7 @@ export function createMockBridge(): Bridge & {
       handle: BridgeContextHandle,
       identityDid: string,
       payload: Uint8Array,
+      _spendingUcanJwt?: string | null,
     ): Promise<void> {
       const ctx = getContext(handle);
       const sequence = ctx.eventLog.length;
@@ -392,6 +403,8 @@ export function createMockBridge(): Bridge & {
       inputJson: string,
       identityDid: string,
       ucanToken?: string,
+      _proofTokens?: readonly string[],
+      spendingUcan?: string,
     ): Promise<string> {
       const ctx = getContext(handle);
       const tool = ctx.tools.get(toolId) as
@@ -411,6 +424,14 @@ export function createMockBridge(): Bridge & {
         throw new Error("[SCP-PERM-3001] Token has been revoked");
       }
 
+      // C4 (#1606): the runtime now routes paid tool invocations
+      // through ContextManager.invoke_tool_with_economy. The mock
+      // doesn't simulate the full economy pipeline but it does
+      // validate that callers passing a spending UCAN are propagating
+      // it through the bridge interface (the real NAPI / UniFFI / PyO3
+      // bridges parse and forward it).
+      const spendingUcanProvided = spendingUcan !== undefined && spendingUcan !== "";
+
       const input = JSON.parse(inputJson) as unknown;
       let result: unknown;
 
@@ -425,7 +446,12 @@ export function createMockBridge(): Bridge & {
         eventType: "ToolInvoked",
         actorDid: identityDid,
         timestamp: Math.floor(Date.now() / 1000),
-        payload: { toolId, toolName: tool.name, ucanProvided: true },
+        payload: {
+          toolId,
+          toolName: tool.name,
+          ucanProvided: true,
+          spendingUcanProvided,
+        },
         sequence: ctx.eventLog.length,
       };
       ctx.receiveBuffer.push(invokedEvent);
@@ -938,6 +964,7 @@ export function createMockBridge(): Bridge & {
         broadcastBlockedSubscribers: new Set(snapshot.broadcast_blocked_subscribers ?? []),
         broadcastAdmission: snapshot.broadcast_admission ?? (mode === "Broadcast" ? "Open" : null),
         sessions: new Map(),
+        rawParamsJson: "",
       };
       const importedEvent: Event = {
         eventType: "ContextImported",
@@ -1841,13 +1868,6 @@ export function createMockBridge(): Bridge & {
 
     economyEvaluateFormula(_formulaJson: string, _metricsJson: string): number {
       return 0;
-    },
-
-    economyAdjustRelayPrice(
-      _configJson: string,
-      _utilizationPct: number,
-    ): { newBasePrice: number; previousBasePrice: number; direction: string } {
-      return { newBasePrice: 0, previousBasePrice: 0, direction: "unchanged" };
     },
 
     economyBudgetRemaining(_contextId: string, _did: string): number {

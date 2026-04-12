@@ -15,6 +15,7 @@ use std::sync::Arc;
 
 use scp_core::context::builder::{
     AddMemberOutput, ContextCryptoProvider, ContextEventLogProvider, ContextTransportProvider,
+    RemoveMemberOutput,
 };
 use scp_core::context::governance::KeyResolver;
 use scp_core::context::manager::ContextManager;
@@ -133,8 +134,12 @@ impl ContextCryptoProvider for MockCrypto {
     ) -> Result<AddMemberOutput, ContextError> {
         Ok(AddMemberOutput::default())
     }
-    fn remove_member(&self, _id: &[u8; 32], _member_did: &str) -> Result<(), ContextError> {
-        Ok(())
+    fn remove_member(
+        &self,
+        _id: &[u8; 32],
+        _member_did: &str,
+    ) -> Result<RemoveMemberOutput, ContextError> {
+        Ok(RemoveMemberOutput::default())
     }
     fn distribute_sender_key(&self, _id: &[u8; 32], _member_did: &str) -> Result<(), ContextError> {
         Ok(())
@@ -173,7 +178,7 @@ impl ContextEventLogProvider for MockEventLog {
     fn init_event_log(&self, _id: &[u8; 32]) -> Result<(), ContextCreationError> {
         Ok(())
     }
-    fn append_event(&self, _id: &[u8; 32], _event: &str) -> Result<(), ContextCreationError> {
+    fn append_event(&self, _id: &[u8; 32], _event: &str, _actor_did: &str, _payload: Option<&serde_json::Value>) -> Result<(), ContextCreationError> {
         Ok(())
     }
     fn destroy_event_log(&self, _id: &[u8; 32]) -> Result<(), ContextCreationError> {

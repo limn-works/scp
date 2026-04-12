@@ -73,13 +73,22 @@ public nonisolated struct ToolSessionResult: Sendable {
 /// See ADR-026 for the flat delegation pattern and ADR-011 for tool spec.
 public enum ToolBridge {
     /// Invoke a tool. Maps to ``toolInvoke`` in ScpBindings.
+    ///
+    /// Tool invocation flows through
+    /// `ContextManager::invoke_tool_with_economy` in the Rust runtime
+    /// (per-invocation pricing, velocity tracking, escalation, budget,
+    /// payment escrow, hard rate limit). The optional ``spendingUcan``
+    /// parameter carries a JWT-encoded ``SpendingCapability`` for paid
+    /// tool invocations under spec section 19.5 (AND-composition with
+    /// the action UCAN). See PR #1606 / C4.
     public typealias InvokeFn = @Sendable (
         _ handle: ContextHandle,
         _ toolId: String,
         _ inputJson: String,
         _ identity: Identity,
         _ ucanToken: String?,
-        _ proofTokens: [String]?
+        _ proofTokens: [String]?,
+        _ spendingUcan: String?
     ) async throws -> String
 
     /// Register a tool. Maps to ``toolRegister`` in ScpBindings.
@@ -131,8 +140,16 @@ public enum ToolBridge {
     ) async throws -> Void
 
     /// Default invoke function that delegates to the UniFFI-generated binding.
-    public static let defaultInvoke: InvokeFn = { handle, toolId, inputJson, identity, ucanToken, proofTokens in
-        try await toolInvoke(handle: handle, toolId: toolId, inputJson: inputJson, identity: identity, ucanToken: ucanToken, proofTokens: proofTokens)
+    public static let defaultInvoke: InvokeFn = { handle, toolId, inputJson, identity, ucanToken, proofTokens, spendingUcan in
+        try await toolInvoke(
+            handle: handle,
+            toolId: toolId,
+            inputJson: inputJson,
+            identity: identity,
+            ucanToken: ucanToken,
+            proofTokens: proofTokens,
+            spendingUcanJwt: spendingUcan
+        )
     }
 
     /// Default register function that delegates to the UniFFI-generated binding.
@@ -254,6 +271,7 @@ public extension Context {
         identity: Identity,
         ucanToken: String? = nil,
         proofTokens: [String]? = nil,
+        spendingUcan: String? = nil,
         invokerDid: String? = nil,
         invokeFn: ToolBridge.InvokeFn = ToolBridge.defaultInvoke
     ) async throws -> ToolInvocationResult {
@@ -269,7 +287,9 @@ public extension Context {
                 code: "SCP-TOOL-6001"
             )
         }
-        let outputJson = try await invokeFn(handle, tool, inputJson, identity, ucanToken, proofTokens)
+        let outputJson = try await invokeFn(
+            handle, tool, inputJson, identity, ucanToken, proofTokens, spendingUcan
+        )
         return ToolInvocationResult(
             output: Data(outputJson.utf8),
             invokerDid: invokerDid ?? identity.did(),

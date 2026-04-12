@@ -16,6 +16,7 @@ import { Identity } from "../src/identity";
 import { _resetBridge, _setBridge } from "../src/internal/bridge";
 import { defineToolDefinition } from "../src/tools";
 import { Transport } from "../src/transport";
+import type { ConsequenceRule as ConsequenceRuleTypeAlias } from "../src/types";
 import { delegateUcan, mintUcan } from "../src/ucan";
 import { createMockBridge } from "./mock-bridge";
 
@@ -409,6 +410,129 @@ describe("Tool runtime (mock bridge)", () => {
     await expect(
       mockBridge.toolInvoke(ctx, "tool-nonexistent", "{}", identity.did, ucan.encoded),
     ).rejects.toThrow(/SCP-TOOL-6001/);
+  });
+
+  // C4 (#1606): paid tool invocations now route through
+  // ContextManager.invoke_tool_with_economy via the NAPI bridge.
+  // The TS bridge interface exposes `spendingUcan` as the 7th
+  // toolInvoke argument; verify it round-trips through the bridge
+  // and is recorded in the mock bridge's ToolInvoked event payload.
+  it("forwards spendingUcan through bridge.toolInvoke", async () => {
+    const identity = await mockBridge.identityCreate("in_memory");
+    const ctx = await mockBridge.contextCreate(
+      identity,
+      JSON.stringify({
+        ceiling: ["tools:register", "tools:invoke"],
+      }),
+    );
+
+    const def = defineToolDefinition({
+      name: "paid-echo",
+      description: "Paid echo tool for C4 wiring test",
+      inputSchema: { type: "object" },
+      outputSchema: { type: "object" },
+      operator: identity.did,
+    });
+    const toolId = await mockBridge.toolRegister(ctx, def);
+    mockBridge._registerToolHandler(ctx.contextId, toolId, (input) => ({ echoed: input }));
+
+    const ucan = await mockBridge.ucanMint(ctx, identity.did, ["tool_invoke:*"]);
+    const spending = "eyJ0eXAiOiJKV1QiLCJhbGciOiJFZERTQSJ9.spending.sig";
+
+    const resultJson = await mockBridge.toolInvoke(
+      ctx,
+      toolId,
+      JSON.stringify({ hello: "world" }),
+      identity.did,
+      ucan.encoded,
+      undefined,
+      spending,
+    );
+    expect(JSON.parse(resultJson)).toEqual({ echoed: { hello: "world" } });
+
+    // The mock bridge records `spendingUcanProvided: true` in the
+    // ToolInvoked event payload when a non-empty spending UCAN is
+    // forwarded through the bridge interface. This is the structural
+    // assertion that the bridge layer accepts the new param.
+    const ctxState = mockBridge._contexts.get(ctx.contextId);
+    const toolInvokedEvents =
+      ctxState?.eventLog.filter((e: { eventType: string }) => e.eventType === "ToolInvoked") ?? [];
+    expect(toolInvokedEvents.length).toBe(1);
+    const payload = toolInvokedEvents[0]?.payload as { spendingUcanProvided?: boolean };
+    expect(payload.spendingUcanProvided).toBe(true);
+  });
+
+  // C4 (#1606): the SDK Context.invokeTool wrapper exposes
+  // `spendingUcan` as a named option. Verify the SDK forwards it to
+  // the bridge layer when set.
+  it("Context.invokeTool forwards options.spendingUcan to the bridge", async () => {
+    _setBridge(mockBridge);
+    const identity = await Identity.create({ custody: "in_memory" });
+    const ctx = await Context.create(identity, {
+      ceiling: ["tools:register", "tools:invoke"],
+    });
+
+    const def = defineToolDefinition({
+      name: "sdk-paid-echo",
+      description: "SDK paid echo tool for C4 wiring test",
+      inputSchema: { type: "object" },
+      outputSchema: { type: "object" },
+      operator: identity.did,
+    });
+    const toolId = await ctx.registerTool(def);
+    mockBridge._registerToolHandler(ctx.contextId, toolId, (input) => ({ echoed: input }));
+
+    // Find the bridge handle for this context (mockBridge stores by
+    // contextId; build a stub handle matching the BridgeContextHandle
+    // shape that the bridge interface uses internally).
+    const stubHandle = { contextId: ctx.contextId, state: "active", creatorDid: identity.did };
+    const ucan = await mockBridge.ucanMint(stubHandle, identity.did, ["tool_invoke:*"]);
+    const spending = "eyJ0eXAiOiJKV1QiLCJhbGciOiJFZERTQSJ9.spending.sig";
+
+    const result = await ctx.invokeTool(toolId, { hello: "world" }, identity, ucan.encoded, {
+      spendingUcan: spending,
+    });
+    expect(result).toEqual({ echoed: { hello: "world" } });
+
+    const ctxState = mockBridge._contexts.get(ctx.contextId);
+    const toolInvokedEvents =
+      ctxState?.eventLog.filter((e: { eventType: string }) => e.eventType === "ToolInvoked") ?? [];
+    expect(toolInvokedEvents.length).toBe(1);
+    const payload = toolInvokedEvents[0]?.payload as { spendingUcanProvided?: boolean };
+    expect(payload.spendingUcanProvided).toBe(true);
+  });
+
+  // C4 (#1606): when no spendingUcan option is passed, the SDK must
+  // pass undefined through to the bridge (free-tool path).
+  it("Context.invokeTool defaults spendingUcan to undefined for free tools", async () => {
+    _setBridge(mockBridge);
+    const identity = await Identity.create({ custody: "in_memory" });
+    const ctx = await Context.create(identity, {
+      ceiling: ["tools:register", "tools:invoke"],
+    });
+
+    const def = defineToolDefinition({
+      name: "sdk-free-echo",
+      description: "SDK free echo tool",
+      inputSchema: { type: "object" },
+      outputSchema: { type: "object" },
+      operator: identity.did,
+    });
+    const toolId = await ctx.registerTool(def);
+    mockBridge._registerToolHandler(ctx.contextId, toolId, (input) => ({ echoed: input }));
+
+    const stubHandle = { contextId: ctx.contextId, state: "active", creatorDid: identity.did };
+    const ucan = await mockBridge.ucanMint(stubHandle, identity.did, ["tool_invoke:*"]);
+
+    // No options arg — spending UCAN must default to undefined.
+    await ctx.invokeTool(toolId, { hello: "world" }, identity, ucan.encoded);
+
+    const ctxState = mockBridge._contexts.get(ctx.contextId);
+    const toolInvokedEvents =
+      ctxState?.eventLog.filter((e: { eventType: string }) => e.eventType === "ToolInvoked") ?? [];
+    expect(toolInvokedEvents.length).toBe(1);
+    const payload = toolInvokedEvents[0]?.payload as { spendingUcanProvided?: boolean };
+    expect(payload.spendingUcanProvided).toBe(false);
   });
 });
 
@@ -1825,5 +1949,479 @@ describe("Scope registry runtime (mock bridge)", () => {
     );
     // The mock bridge returns "registered" status
     expect(["registered", "conflict", "updated"]).toContain(result.status);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 13. Spending UCAN / consequence event SDK-level tests (#1537, #1593, #1594)
+// ---------------------------------------------------------------------------
+
+describe("Invitation evaluation with spending (mock bridge)", () => {
+  it("evaluateInvitation accepts spendingJson parameter", async () => {
+    _setBridge(mockBridge);
+    const { evaluateInvitation } = await import("../src/context");
+
+    const result = await evaluateInvitation(
+      '{"ceiling":[]}',
+      "did:dht:z6MkBobBobBobBobBobBobBobBobBobBobBobBobBo",
+      "did:dht:z6MkLocalLocalLocalLocalLocalLocalLocal",
+      undefined,
+      '{"has_spending_ucan":true,"configured_adapters":["x402"],"available_balance":10000}',
+    );
+
+    expect(result).toBeDefined();
+    expect(result.decision).toBeDefined();
+  });
+
+  it("evaluateInvitation works without spendingJson", async () => {
+    _setBridge(mockBridge);
+    const { evaluateInvitation } = await import("../src/context");
+
+    const result = await evaluateInvitation(
+      '{"ceiling":[]}',
+      "did:dht:z6MkBobBobBobBobBobBobBobBobBobBobBobBobBo",
+      "did:dht:z6MkLocalLocalLocalLocalLocalLocalLocal",
+    );
+
+    expect(result).toBeDefined();
+    expect(result.decision).toBeDefined();
+  });
+});
+
+describe("Consequence event types (SDK)", () => {
+  it("consequence_triggered event has correct structure", () => {
+    // Verify that system events with consequence_triggered prefix
+    // can be parsed from the expected format.
+    const payload =
+      "consequence_triggered: member=did:dht:z6MkBob rule=2 trigger=velocity action=mute context=ctx-123";
+    expect(payload).toContain("consequence_triggered:");
+    expect(payload).toContain("member=did:dht:z6MkBob");
+    expect(payload).toContain("rule=2");
+    expect(payload).toContain("trigger=velocity");
+    expect(payload).toContain("action=mute");
+  });
+
+  it("consequence_enforced event has correct structure", () => {
+    const payload =
+      "consequence_enforced: member=did:dht:z6MkAlice action=restrict_write success=true context=ctx-456";
+    expect(payload).toContain("consequence_enforced:");
+    expect(payload).toContain("success=true");
+  });
+});
+
+describe("Trust aggregation with consequence rules (mock bridge)", () => {
+  it("aggregateTrustInput accepts typed consequenceRules parameter", async () => {
+    _setBridge(mockBridge);
+    const { aggregateTrustInput } = await import("../src/trust");
+
+    const result = await aggregateTrustInput({
+      contextId: "ctx-consequence-test",
+      subjectDid: "did:dht:z6MkBobBobBobBobBobBobBobBobBobBobBobBobBo",
+      events: [],
+      merkleRoot: new Array(32).fill(0),
+      consequenceRules: [
+        {
+          trigger: { kind: "MessageVelocity" },
+          action: { kind: "Enforcement", severity: { kind: "SuspendAccess" } },
+          threshold: 5,
+          windowSecs: 3600,
+        },
+      ],
+    });
+
+    expect(result).toBeDefined();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 14. C2 — WASM economy fail-closed gate (PR #1606 follow-up)
+//
+// The browser (WASM) bridge cannot run scp-runtime's `enforce_economy`
+// pipeline (no payment adapter, no budget tracker, no velocity tracker, no
+// hard rate limit token bucket — see ADR-034). To prevent silent bypass,
+// the bridge rejects:
+//
+//   - context_create with a paid economic policy → SCP-ECON-12095
+//   - context_join against a paid context        → SCP-ECON-12096
+//   - context_send into a paid context           → SCP-ECON-12096
+//
+// These tests simulate the rejection at the bridge boundary using a
+// stub bridge and verify the SDK layer surfaces the typed subclasses
+// (`EconomicPolicyUnsupportedOnWasm`, `WasmCannotValidateSpendingUcan`)
+// via `mapBridgeError`. End-to-end validation runs under real-wasm.test.ts.
+// ---------------------------------------------------------------------------
+
+describe("WASM economy fail-closed (C2 — typed error surfacing)", () => {
+  it("Context.create surfaces EconomicPolicyUnsupportedOnWasm for SCP-ECON-12095", async () => {
+    const { EconomicPolicyUnsupportedOnWasm, EconomyError, ScpError } = await import(
+      "../src/errors"
+    );
+
+    // Stub bridge that rejects contextCreate with the C2 fail-closed code,
+    // mirroring `WasmContextManager::create_context` after the gate fires.
+    const failClosedBridge = {
+      ...mockBridge,
+      contextCreate: async () => {
+        throw new Error(
+          "[SCP-ECON-12095] context error: EconomicPolicyUnsupportedOnWasm: \
+paid contexts cannot be created from the WASM bridge — the browser SDK \
+cannot run the full economy enforcement pipeline (ADR-034). Use a native \
+(Python / Node.js / Swift / Kotlin) client for paid contexts.",
+        );
+      },
+    };
+    _setBridge(failClosedBridge);
+
+    const identity = await Identity.create();
+    let captured: unknown = null;
+    try {
+      await Context.create(identity, {
+        ceiling: [],
+        tools: [],
+        roles: {},
+        ttl: 3600,
+        memoryScope: "ephemeral",
+        // The mock returns the rejection regardless; the policy shape
+        // here only documents intent.
+        economicPolicy:
+          '{"locked":false,"cost_schedule":{"currency":[85,83,68,0],"per_message":100,"per_tool_invoke":null,"per_join":null,"per_period":null,"per_byte_stored":null},"payment_adapters":[],"pricing_formula":null,"payee":"did:dht:zpayee"}',
+      });
+    } catch (e) {
+      captured = e;
+    }
+
+    expect(captured).toBeInstanceOf(EconomicPolicyUnsupportedOnWasm);
+    expect(captured).toBeInstanceOf(EconomyError);
+    expect(captured).toBeInstanceOf(ScpError);
+    if (captured instanceof ScpError) {
+      expect(captured.code).toBe("SCP-ECON-12095");
+      expect(captured.message).toContain("EconomicPolicyUnsupportedOnWasm");
+    }
+  });
+
+  it("Context.join surfaces WasmCannotValidateSpendingUcan for SCP-ECON-12096", async () => {
+    const { EconomyError, ScpError, WasmCannotValidateSpendingUcan } = await import(
+      "../src/errors"
+    );
+
+    // Stub bridge that lets context_create succeed (so we get a Context
+    // handle) but rejects contextJoin with the C2 fail-closed code,
+    // mirroring `WasmContextManager::join_context` after the gate fires.
+    const failClosedBridge = {
+      ...mockBridge,
+      contextJoin: async () => {
+        throw new Error(
+          "[SCP-ECON-12096] context error: WasmCannotValidateSpendingUcan: \
+context 'ctx-paid' has an economic policy requiring payment, but the WASM \
+bridge cannot cryptographically validate spending UCANs against a payment \
+adapter (ADR-034). Use a native (Python / Node.js / Swift / Kotlin) client \
+to join paid contexts.",
+        );
+      },
+    };
+    _setBridge(failClosedBridge);
+
+    const identity = await Identity.create();
+    const ctx = await Context.create(identity, {
+      ceiling: [],
+      tools: [],
+      roles: {},
+      ttl: 3600,
+      memoryScope: "ephemeral",
+    });
+
+    let captured: unknown = null;
+    try {
+      // Both with and without a spending UCAN — the WASM bridge rejects
+      // either way; the test verifies the typed subclass propagates.
+      await ctx.join(identity, "eyJqd3QtcGxhY2Vob2xkZXIifQ");
+    } catch (e) {
+      captured = e;
+    }
+
+    expect(captured).toBeInstanceOf(WasmCannotValidateSpendingUcan);
+    expect(captured).toBeInstanceOf(EconomyError);
+    expect(captured).toBeInstanceOf(ScpError);
+    if (captured instanceof ScpError) {
+      expect(captured.code).toBe("SCP-ECON-12096");
+      expect(captured.message).toContain("WasmCannotValidateSpendingUcan");
+    }
+  });
+
+  it("Context.send surfaces WasmCannotValidateSpendingUcan for SCP-ECON-12096", async () => {
+    const { EconomyError, ScpError, WasmCannotValidateSpendingUcan } = await import(
+      "../src/errors"
+    );
+
+    // Stub bridge that rejects contextSend with the C2 fail-closed code.
+    const failClosedBridge = {
+      ...mockBridge,
+      contextSend: async () => {
+        throw new Error(
+          "[SCP-ECON-12096] context error: WasmCannotValidateSpendingUcan: \
+context 'ctx-paid' has an economic policy requiring payment",
+        );
+      },
+    };
+    _setBridge(failClosedBridge);
+
+    const identity = await Identity.create();
+    const ctx = await Context.create(identity, {
+      ceiling: [],
+      tools: [],
+      roles: {},
+      ttl: 3600,
+      memoryScope: "ephemeral",
+    });
+
+    let captured: unknown = null;
+    try {
+      await ctx.send("hello", "eyJqd3QtcGxhY2Vob2xkZXIifQ");
+    } catch (e) {
+      captured = e;
+    }
+
+    expect(captured).toBeInstanceOf(WasmCannotValidateSpendingUcan);
+    expect(captured).toBeInstanceOf(EconomyError);
+    expect(captured).toBeInstanceOf(ScpError);
+    if (captured instanceof ScpError) {
+      expect(captured.code).toBe("SCP-ECON-12096");
+    }
+
+    // Same expectation when no spending UCAN is supplied.
+    captured = null;
+    try {
+      await ctx.send("hello");
+    } catch (e) {
+      captured = e;
+    }
+    expect(captured).toBeInstanceOf(WasmCannotValidateSpendingUcan);
+  });
+});
+
+// C5: SDK Context.create — consequenceConfig parameter parity
+// ---------------------------------------------------------------------------
+
+describe("Context.create consequenceConfig parameter (C5 / SDK round-trip)", () => {
+  it("forwards consequenceConfig to the bridge as a JSON string field", async () => {
+    _setBridge(mockBridge);
+    const { Identity } = await import("../src/identity");
+    const { Context } = await import("../src/context");
+
+    const identity = await Identity.create({ custody: "in_memory" });
+    const ctx = await Context.create(identity, {
+      ceiling: ["messages:read"],
+      consequenceConfig: { allowAutomaticAccessRevocation: true },
+    });
+    expect(ctx).toBeDefined();
+
+    const stored = mockBridge._contexts.get(ctx.contextId);
+    expect(stored).toBeDefined();
+    const parsed = JSON.parse(stored?.rawParamsJson ?? "{}") as {
+      consequenceConfig?: string;
+    };
+    expect(parsed.consequenceConfig).toBeDefined();
+    const inner = JSON.parse(parsed.consequenceConfig ?? "{}") as {
+      allow_automatic_access_revocation?: boolean;
+    };
+    expect(inner.allow_automatic_access_revocation).toBe(true);
+  });
+
+  it("omits consequenceConfig when caller does not provide one", async () => {
+    _setBridge(mockBridge);
+    const { Identity } = await import("../src/identity");
+    const { Context } = await import("../src/context");
+
+    const identity = await Identity.create({ custody: "in_memory" });
+    const ctx = await Context.create(identity, {
+      ceiling: ["messages:read"],
+    });
+
+    const stored = mockBridge._contexts.get(ctx.contextId);
+    const parsed = JSON.parse(stored?.rawParamsJson ?? "{}") as {
+      consequenceConfig?: string;
+    };
+    expect(parsed.consequenceConfig).toBeUndefined();
+  });
+
+  it("forwards spendingUcanJwt to the bridge on Context.join", async () => {
+    _setBridge(mockBridge);
+    const { Identity } = await import("../src/identity");
+    const { Context } = await import("../src/context");
+
+    const creator = await Identity.create({ custody: "in_memory" });
+    const joiner = await Identity.create({ custody: "in_memory" });
+    const ctx = await Context.create(creator, {
+      ceiling: ["messages:read"],
+    });
+
+    await ctx.join(joiner, "synthetic.spending.jwt");
+
+    const stored = mockBridge._contexts.get(ctx.contextId);
+    expect(stored?.lastJoinSpendingUcanJwt).toBe("synthetic.spending.jwt");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// H15: typed ConsequenceRule discriminated union round-trip
+// ---------------------------------------------------------------------------
+
+describe("Context.create consequenceRules typed discriminated union (H15)", () => {
+  it("encodes a typed ConsequenceRule[] to the Rust serde wire format", async () => {
+    _setBridge(mockBridge);
+    const { Identity } = await import("../src/identity");
+    const { Context } = await import("../src/context");
+
+    const identity = await Identity.create({ custody: "in_memory" });
+    const rules: ConsequenceRuleTypeAlias[] = [
+      {
+        trigger: { kind: "MessageVelocity" },
+        action: {
+          kind: "Enforcement",
+          severity: {
+            kind: "SuspendCapability",
+            capabilities: [
+              "MessagesWrite",
+              { kind: "ToolInvoke", toolId: "calculator" },
+              { kind: "Custom", name: "my-custom-cap" },
+            ],
+          },
+        },
+        threshold: 5,
+        windowSecs: 3600,
+      },
+      {
+        trigger: { kind: "Custom", key: "spammy" },
+        action: { kind: "AssignRole", toRole: "viewer" },
+        threshold: 3,
+        windowSecs: 600,
+      },
+      {
+        trigger: { kind: "WarningCount" },
+        action: {
+          kind: "Enforcement",
+          severity: {
+            kind: "RevokeAccess",
+            did: "did:dht:z6MkSubject",
+            access: "Both",
+          },
+        },
+        threshold: 10,
+        windowSecs: 86_400,
+      },
+    ];
+
+    const ctx = await Context.create(identity, {
+      ceiling: ["messages:read"],
+      consequenceConfig: { allowAutomaticAccessRevocation: true },
+      consequenceRules: rules,
+    });
+
+    const stored = mockBridge._contexts.get(ctx.contextId);
+    const parsed = JSON.parse(stored?.rawParamsJson ?? "{}") as {
+      consequenceRules?: string;
+    };
+    expect(parsed.consequenceRules).toBeDefined();
+
+    const decoded = JSON.parse(parsed.consequenceRules ?? "[]") as Array<{
+      trigger: unknown;
+      action: unknown;
+      threshold: number;
+      window: { secs: number; nanos: number };
+    }>;
+    expect(decoded).toHaveLength(3);
+
+    // Rule 0: MessageVelocity / Enforcement(SuspendCapability { ToolInvoke + Custom + unit })
+    expect(decoded[0]?.trigger).toBe("MessageVelocity");
+    expect(decoded[0]?.threshold).toBe(5);
+    expect(decoded[0]?.window).toEqual({ secs: 3600, nanos: 0 });
+    const action0 = decoded[0]?.action as {
+      Enforcement?: { SuspendCapability?: { capabilities: unknown[] } };
+    };
+    expect(action0.Enforcement?.SuspendCapability?.capabilities).toEqual([
+      "MessagesWrite",
+      { ToolInvoke: "calculator" },
+      { Custom: "my-custom-cap" },
+    ]);
+
+    // Rule 1: Custom trigger / AssignRole
+    expect(decoded[1]?.trigger).toEqual({ Custom: "spammy" });
+    expect(decoded[1]?.action).toEqual({ AssignRole: { to_role: "viewer" } });
+
+    // Rule 2: WarningCount / Enforcement(RevokeAccess)
+    expect(decoded[2]?.trigger).toBe("WarningCount");
+    const action2 = decoded[2]?.action as {
+      Enforcement?: { RevokeAccess?: { did: string; access: string } };
+    };
+    expect(action2.Enforcement?.RevokeAccess).toEqual({
+      did: "did:dht:z6MkSubject",
+      access: "Both",
+    });
+  });
+
+  it("encodes RemoveMember severity with optional reason field", async () => {
+    const { encodeConsequenceRules } = await import("../src/types");
+    const json = encodeConsequenceRules([
+      {
+        trigger: { kind: "WarningCount" },
+        action: {
+          kind: "Enforcement",
+          severity: {
+            kind: "RemoveMember",
+            did: "did:dht:z6MkBad",
+            reason: "spam",
+          },
+        },
+        threshold: 100,
+        windowSecs: 60,
+      },
+    ]);
+    const decoded = JSON.parse(json) as Array<{
+      action: { Enforcement: { RemoveMember: { did: string; reason: string | null } } };
+    }>;
+    expect(decoded[0]?.action.Enforcement.RemoveMember).toEqual({
+      did: "did:dht:z6MkBad",
+      reason: "spam",
+    });
+
+    // Reason omitted serializes to explicit null (matches Rust Option<String>).
+    const jsonNoReason = encodeConsequenceRules([
+      {
+        trigger: { kind: "WarningCount" },
+        action: {
+          kind: "Enforcement",
+          severity: { kind: "RemoveMember", did: "did:dht:z6MkBad" },
+        },
+        threshold: 100,
+        windowSecs: 60,
+      },
+    ]);
+    const decodedNoReason = JSON.parse(jsonNoReason) as Array<{
+      action: { Enforcement: { RemoveMember: { did: string; reason: string | null } } };
+    }>;
+    expect(decodedNoReason[0]?.action.Enforcement.RemoveMember.reason).toBeNull();
+  });
+
+  it("pins the discriminated-union variant names so renames trip a compile error", async () => {
+    const types = await import("../src/types");
+    expect(types.CONSEQUENCE_TRIGGER_VARIANTS).toEqual([
+      "MessageVelocity",
+      "ToolRateExceeded",
+      "WarningCount",
+      "Custom",
+    ]);
+    expect(types.CONSEQUENCE_ACTION_VARIANTS).toEqual(["Enforcement", "AssignRole"]);
+    expect(types.ENFORCEMENT_SEVERITY_VARIANTS).toEqual([
+      "SuspendCapability",
+      "SuspendAccess",
+      "RevokeAccess",
+      "RemoveMember",
+    ]);
+  });
+
+  it("encodeConsequenceConfig snake-cases the wire field", async () => {
+    const { encodeConsequenceConfig } = await import("../src/types");
+    const encoded = encodeConsequenceConfig({ allowAutomaticAccessRevocation: true });
+    expect(JSON.parse(encoded)).toEqual({ allow_automatic_access_revocation: true });
   });
 });

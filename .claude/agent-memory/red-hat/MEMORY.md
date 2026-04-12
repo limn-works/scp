@@ -41,6 +41,31 @@ After commit 54b8096 ("close 6 remaining gaps"), reassessed all chains.
 - **RED-404 (LOW->CONFIRMED SAFE)**: Global cache not context-scoped. Cache key is SHA-256(JWT). Pre-cache checks (capability + audience) run BEFORE cache lookup. Audience includes routing_id (unique per context). Cross-context cache reuse impossible.
 - **Latent risk**: Dead `None` arm in check_projection_auth (line 883) provides structural-only validation without audience/sig/revocation. Unreachable today (all callers pass Some). Recommend replacing with hard 401 or unreachable!().
 
+## PR #1606 Assessment (2026-03-31) - Epoch/Sequence AAD + SCPM Management + Buffer Bounds
+- **RED-501 (LOW)**: SCPM magic prefix collision with epoch header bytes requires epoch ~6 quintillion. Unreachable. MLS credential binding prevents cross-identity sender key injection via management messages.
+- **RED-502 (MEDIUM)**: E2eCryptoProvider hardcodes epoch=0, sequence=0 (fullstack/crypto.rs:863). H2 AAD binding untested in E2E. Fix: wire real counters.
+- **RED-503 (LOW)**: `#[serde(default)]` on send_sequence means old snapshots restore to 0. Safe because GCM nonce is random (OsRng), not counter-derived. Latent risk if nonce strategy changes.
+- **RED-504 (MEDIUM)**: Buffer capacity > 3601 causes timestamp estimation to exceed 3600s bounds, silently dropping valid events. Governance evasion in large-buffer contexts. Fix: clamp estimation range.
+- **RED-505 (LOW)**: 300s freshness window for access key requests. Replay harmless due to HPKE wrapping to requester's pubkey.
+- Controls that hold: MLS credential binding, SCPM collision resistance, epoch monotonicity on sender key store, random GCM nonces, HPKE key wrapping.
+- **RED-601 (LOW)**: Epoch ratcheting 999/step possible but infeasible to reach u64::MAX (~585M years). Check uses STORED epoch. Defense holds.
+- **RED-602 (LOW)**: Post-snapshot empty recv_sequence_tracker. MLS primary replay protection survives restore. Belt-and-suspenders only.
+- **RED-603 (LOW)**: Asymmetric freshness (300s past/30s future) is sound. Pre-existing gap: NonceDedup not wired for access keys.
+- **RED-606 (MEDIUM)**: E2eCryptoProvider missing epoch poisoning, recv_tracker, mgmt size limit. New defenses untested in integration.
+
+## PR Branch `complete-pr-work-review-0TQtO` Assessment (2026-04-01, round 1)
+- **RED-701 (HIGH)**: NAPI/UniFFI catch-all event formatters lack HTML escaping.
+- **RED-702 (MEDIUM)**: Spending UCAN replay. No nonce dedup.
+- **RED-705 (MEDIUM)**: system_assign_role bypasses RoleAssign for consequence engine.
+- **RED-706 (HIGH)**: evaluate_sybil_resistance() stub. Standing score gaming via Sybil.
+
+## PR Branch `complete-pr-work-review-0TQtO` Assessment (2026-04-04, round 2 - governance/economy focus)
+- **RED-801 (CRITICAL)**: WASM `member_has_capability` ignores `suspended_capabilities` map. Suspension is cosmetic. `send_message` has inline check but governance propose/vote uses `member_has_capability` which never queries suspension state.
+- **RED-802 (HIGH)**: WASM `dispatch_revoke` never inserts into `read_exclusion_list`. CEK wrapping exclusion is dead code for Revoke actions.
+- **RED-803 (HIGH)**: `check_and_composition` silently discards `action_ucan` (`let _ = action_ucan`). Callers passing None for action_ucan succeed for free actions. AND-composition broken: spending UCAN alone is sufficient.
+- **RED-804 (MEDIUM)**: WASM nonce tracker uses HashMap with f64 timestamps (JS precision). 10K cap with TTL eviction. Reset on context import loses all nonces -- full replay window opens.
+- **RED-805 (MEDIUM)**: `rollback_last` on velocity tracker always pops the LAST timestamp regardless of which message failed. Concurrent senders can roll back the wrong sender's velocity.
+
 ## Key Attack Patterns for This Codebase
 - **Bridge parity gap**: WASM bridge cannot depend on scp-core (tokio incompatibility), so it re-implements validation partially. ALWAYS check WASM bridge when core validation changes.
 - **Two UcanToken types**: `roles::UcanToken` (stub, no sig/expiry) vs `crypto::ucan::UcanToken` (full, has sig/encoded). Broadcast uses the stub. Any code accepting the stub has no sig verification.
@@ -49,6 +74,9 @@ After commit 54b8096 ("close 6 remaining gaps"), reassessed all chains.
 - **SSE broadcast model**: All SSE clients receive all responses. No per-session isolation.
 - **Wildcard prefix matching**: `starts_with` on context_id without delimiter allows cross-context access for IDs sharing a prefix.
 - **"Caller is responsible" pattern**: Still present from PR #76. claim_shadow, upgrade_shadow_role defer sig verification.
+- **Output escaping parity gap**: Input-side HTML rejection removed (validate.rs). Output-side escaping added but only PyO3 catch-all is consistent. NAPI/UniFFI catch-all arms unescaped. Any new event variant auto-falls through unescaped.
+- **Stub sybil resistance**: evaluate_sybil_resistance() passes unconditionally. Any standing-based feature is Sybil-vulnerable until implemented.
+- **system_assign_role bypass**: Consequence engine can demote/ban without governance vote. No appeal, no cooldown, no rate limit.
 - **Replay without nonce**: BRIDGE_REGISTER uses timestamp-only replay protection (60s window). No nonce, no connection binding. Captured frames are replayable within window.
 - **Unbounded event-driven loops**: tier re-evaluation loop has no debounce. Any channel sender can trigger unlimited STUN probes + DID publishes.
 - **Structural fallback bypass (FIXED)**: check_projection_auth now hard-rejects empty member_keys with 401. Dead `None` arm remains but is unreachable. Latent risk only.

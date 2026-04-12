@@ -600,7 +600,7 @@ pub async fn close_context(
     let should_schedule_key_destruction =
         memory_scope == MemoryScope::Ephemeral || memory_scope == MemoryScope::Summary;
 
-    event_log.append_context_event(&context_id_bytes, "ContextClosing")?;
+    event_log.append_context_event(&context_id_bytes, "ContextClosing", initiator_did.as_ref())?;
 
     Ok(CloseResult {
         should_generate_summary,
@@ -658,7 +658,7 @@ pub async fn finalize_close(
         let _ = transport.delete_published(&context_id_bytes);
     }
 
-    event_log.append_context_event(&context_id_bytes, "ContextClosed")?;
+    event_log.append_context_event(&context_id_bytes, "ContextClosed", "system:close")?;
 
     Ok(())
 }
@@ -836,7 +836,7 @@ pub async fn try_ttl_expiry_cleanup(
     // 3. Event log append — skip if already succeeded on a prior attempt to
     //    avoid duplicate ContextExpired entries in the Merkle log.
     if result.completed_steps & STEP_EVENT_LOGGED == 0 {
-        match event_log.append_context_event(&context_id_bytes, "ContextExpired") {
+        match event_log.append_context_event(&context_id_bytes, "ContextExpired", "system:timer") {
             Ok(()) => result.set_step(STEP_EVENT_LOGGED),
             Err(e) => {
                 let msg = format!("failed to log ContextExpired event: {e}");
@@ -1288,8 +1288,8 @@ mod tests {
             &self,
             _context_id: &[u8; 32],
             _member_did: &str,
-        ) -> Result<(), ContextError> {
-            Ok(())
+        ) -> Result<scp_protocol::context::builder::RemoveMemberOutput, ContextError> {
+            Ok(scp_protocol::context::builder::RemoveMemberOutput::default())
         }
         fn distribute_sender_key(
             &self,
@@ -1354,7 +1354,13 @@ mod tests {
         fn init_event_log(&self, _id: &[u8; 32]) -> Result<(), ContextCreationError> {
             Ok(())
         }
-        fn append_event(&self, id: &[u8; 32], event: &str) -> Result<(), ContextCreationError> {
+        fn append_event(
+            &self,
+            id: &[u8; 32],
+            event: &str,
+            _actor_did: &str,
+            _payload: Option<&serde_json::Value>,
+        ) -> Result<(), ContextCreationError> {
             self.events.lock().unwrap().push((*id, event.to_owned()));
             Ok(())
         }
@@ -2435,8 +2441,8 @@ mod tests {
             &self,
             _context_id: &[u8; 32],
             _member_did: &str,
-        ) -> Result<(), ContextError> {
-            Ok(())
+        ) -> Result<scp_protocol::context::builder::RemoveMemberOutput, ContextError> {
+            Ok(scp_protocol::context::builder::RemoveMemberOutput::default())
         }
         fn distribute_sender_key(
             &self,
@@ -2461,7 +2467,13 @@ mod tests {
         fn init_event_log(&self, _id: &[u8; 32]) -> Result<(), ContextCreationError> {
             Ok(())
         }
-        fn append_event(&self, _id: &[u8; 32], _event: &str) -> Result<(), ContextCreationError> {
+        fn append_event(
+            &self,
+            _id: &[u8; 32],
+            _event: &str,
+            _actor_did: &str,
+            _payload: Option<&serde_json::Value>,
+        ) -> Result<(), ContextCreationError> {
             Err(ContextCreationError::CryptoFailed(
                 "event log write failed".into(),
             ))
@@ -2866,8 +2878,8 @@ mod tests {
             &self,
             _context_id: &[u8; 32],
             _member_did: &str,
-        ) -> Result<(), ContextError> {
-            Ok(())
+        ) -> Result<scp_protocol::context::builder::RemoveMemberOutput, ContextError> {
+            Ok(scp_protocol::context::builder::RemoveMemberOutput::default())
         }
         fn distribute_sender_key(
             &self,

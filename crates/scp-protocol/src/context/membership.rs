@@ -341,6 +341,27 @@ pub enum ContextEvent {
         /// The DID whose write access was revoked.
         did: DID,
     },
+    /// One or more capabilities were suspended for a member via governance
+    /// (ADR-017, §7.3.7 — `SuspendMember` action).
+    ///
+    /// Unlike [`Self::WriteAccessRevoked`] / [`Self::ReadAccessRevoked`],
+    /// which correspond to the stronger cryptographic `Revoke` action
+    /// (key destruction + exclusion list), suspension is an
+    /// application-level capability gate: the member retains their MLS
+    /// membership, sender keys, access keys, and broadcast subscription,
+    /// but the listed capabilities are blocked at every authorization
+    /// gate (`member_has_capability` fold).
+    ///
+    /// The event carries the exact capability set that was suspended so
+    /// consumers can apply path-specific UI hints (e.g., "this member
+    /// can no longer vote but can still send messages") without having
+    /// to re-read the role state.
+    CapabilitiesSuspended {
+        /// The DID of the member whose capabilities were suspended.
+        did: DID,
+        /// The capabilities that were suspended.
+        capabilities: Vec<super::params::Capability>,
+    },
     /// A member's write access was restored via governance (§9.17, ADR-038).
     ///
     /// Forward-only: the member can publish new content but previously
@@ -392,6 +413,13 @@ pub enum ContextEvent {
         executor_did: DID,
         /// The MLS epoch after execution, if applicable.
         resulting_epoch: Option<u64>,
+        /// The DID targeted by this governance action, if any.
+        ///
+        /// Present for member-targeting actions (`AddMember`, `RemoveMember`,
+        /// `ChangeRole`, `SuspendMember`, `Revoke`, etc.). Used by
+        /// consequence triggers (`WarningCount`, `Custom`) and participation
+        /// records to identify the target without relying on opaque payloads.
+        target_did: Option<DID>,
     },
     /// A ceiling change notification was emitted (§5.3.2).
     ///
@@ -630,6 +658,114 @@ pub enum ContextEvent {
         /// The governance proposal ID that authorized the migration.
         migration_proposal_id: [u8; 32],
     },
+    /// A consequence rule was triggered (ADR-017, #1531).
+    ///
+    /// Emitted when a consequence rule's trigger condition is met for a
+    /// member. Contains the rule index and trigger/action types for
+    /// observability.
+    ConsequenceTriggered {
+        /// The context where the consequence was triggered.
+        context_id: String,
+        /// The member whose behavior triggered the consequence.
+        member_did: DID,
+        /// Index of the triggered rule in the context's `consequence_rules`.
+        rule_index: usize,
+        /// Human-readable trigger type (e.g., `"MessageVelocity"`).
+        trigger_type: String,
+        /// Human-readable action type (e.g., `"Suspend"`).
+        action_type: String,
+    },
+    /// A consequence enforcement action was executed (ADR-017, #1531).
+    ///
+    /// Emitted after the enforcement action (capability suspension, suspend
+    /// all, or role assignment) has been applied. The `success` field
+    /// indicates whether the enforcement was successfully applied.
+    ConsequenceEnforced {
+        /// The context where the consequence was enforced.
+        context_id: String,
+        /// The member the enforcement was applied to.
+        member_did: DID,
+        /// Human-readable action type (e.g., `"Suspend"`).
+        action_type: String,
+        /// Whether the enforcement was successfully applied.
+        success: bool,
+    },
+    /// Payment capture failed after a successful action (H19).
+    ///
+    /// Emitted when `complete_paid_action` fails after `send_message` or
+    /// `join_context` has already completed successfully. The budget
+    /// deduction stands (service was rendered — H8), but the external
+    /// payment adapter could not capture the escrow hold. This event
+    /// provides a durable audit trail so operators can reconcile the
+    /// discrepancy between the internal budget ledger and the external
+    /// payment system.
+    ///
+    /// SDK consumers should surface this to the context administrator
+    /// for manual reconciliation.
+    PaymentCaptureFailed {
+        /// The action during which the capture failed
+        /// (`"send_message"` or `"join_context"`).
+        action: String,
+        /// The DID of the actor whose payment capture failed.
+        actor_did: DID,
+        /// Human-readable description of the adapter error.
+        error: String,
+        /// The amount that was deducted from the budget but not captured,
+        /// if known. `None` when no cost was charged (free context).
+        cost: Option<u64>,
+    },
+    /// An MLS Commit broadcast attempt failed and the commit has been
+    /// enqueued for persistent retry (PR #1606 C6).
+    ///
+    /// Emitted by `execute_remove_member`, `execute_rotate_content_keys`,
+    /// `execute_reset_member`, and `leave_context` when the post-MLS
+    /// `transport.send_message` call fails. The commit is durably queued in
+    /// `PerContextState::pending_commits` and will be retried by the
+    /// governance timeout task with exponential backoff.
+    ///
+    /// SDK consumers SHOULD surface this to the application layer because the
+    /// local state mutation (member removed, key rotated) has happened but
+    /// remote members will not advance their MLS epoch until the commit
+    /// successfully reaches the relay.
+    CommitBroadcastPending {
+        /// Human-readable label for the operation that produced the commit
+        /// (e.g., `"RemoveMember"`, `"RotateContentKeys"`, `"ResetMember"`,
+        /// `"LeaveContext"`).
+        operation: String,
+        /// Human-readable transport error from the failed send attempt.
+        error: String,
+        /// 1-based attempt count after this failure (i.e., 1 on first failure).
+        attempt: u32,
+    },
+    /// A previously enqueued MLS Commit was successfully delivered on a retry
+    /// and dequeued from `pending_commits` (PR #1606 C6).
+    ///
+    /// Emitted by the governance timeout task's commit retry phase after a
+    /// successful `transport.send_message`.
+    CommitBroadcastSucceeded {
+        /// Human-readable label for the operation that produced the commit.
+        operation: String,
+        /// Total number of send attempts (including the successful one).
+        attempts: u32,
+    },
+    /// An MLS Commit broadcast exceeded `MAX_COMMIT_RETRIES` or `MAX_COMMIT_AGE_SECS`
+    /// and the context has been placed in fault-marker fail-close state
+    /// (PR #1606 C6).
+    ///
+    /// Once this event fires, subsequent context-mutating operations on the
+    /// context will return `ContextError::CommitBroadcastFault` until an
+    /// operator clears the marker via
+    /// [`super::super::ContextManager::acknowledge_commit_fault`].
+    /// SDK consumers MUST surface this prominently — local state has
+    /// permanently diverged from any peers that never received the commit.
+    CommitBroadcastFailed {
+        /// Human-readable label for the operation that produced the commit.
+        operation: String,
+        /// Final transport error returned by the last attempt, or `"max age exceeded"`.
+        reason: String,
+        /// Total attempt count.
+        attempts: u32,
+    },
 }
 
 // ---------------------------------------------------------------------------
@@ -787,6 +923,18 @@ impl ReceiveBuffer {
     /// already in the buffer or added by concurrent operations.
     pub fn truncate(&mut self, len: usize) {
         self.events.truncate(len);
+    }
+
+    /// Returns a read-only view of buffered events for consequence rule
+    /// evaluation and participation record computation.
+    ///
+    /// Does NOT consume events — they remain in the buffer for SDK
+    /// consumption via [`drain`](Self::drain). This enables governance
+    /// consequence evaluation (#1531) and standing checks (#1530) to
+    /// inspect recent events without side effects.
+    #[must_use]
+    pub const fn event_log_entries(&self) -> &VecDeque<ContextEvent> {
+        &self.events
     }
 }
 

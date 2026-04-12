@@ -908,11 +908,19 @@ def aggregate_trust_input(
 
     events_json = json.dumps(events)
     merkle_root_json = json.dumps(merkle_root)
-    consequence_rules_json = json.dumps(consequence_rules or [])
-    threshold_requirements_json = json.dumps(threshold_requirements or {})
-    attestor_sets_json = json.dumps(attestor_sets or {})
-    cached_attestations_json = json.dumps(cached_attestations or [])
-    challenge_results_json = json.dumps(challenge_results or [])
+    # Distinguish "explicit empty collection" from "absent". Each Optional
+    # parameter must round-trip an empty list/dict as `"[]"` / `"{}"` so the
+    # bridge sees the caller's intent. Never use the falsy form -- it collapses
+    # `[]` (no rules to evaluate) to the same value as `None` (use defaults).
+    consequence_rules_json = json.dumps(consequence_rules if consequence_rules is not None else [])
+    threshold_requirements_json = json.dumps(
+        threshold_requirements if threshold_requirements is not None else {}
+    )
+    attestor_sets_json = json.dumps(attestor_sets if attestor_sets is not None else {})
+    cached_attestations_json = json.dumps(
+        cached_attestations if cached_attestations is not None else []
+    )
+    challenge_results_json = json.dumps(challenge_results if challenge_results is not None else [])
 
     result_json = bridge.aggregate_trust_input(
         context_id,

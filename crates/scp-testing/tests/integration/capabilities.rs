@@ -45,10 +45,15 @@ impl StubNonceTracker {
 }
 
 impl scp_core::crypto::ucan::validate::NonceTracker for StubNonceTracker {
-    fn check_and_record(&mut self, nonce: &str, _token_expiry: u64) -> Result<(), UcanError> {
+    fn check_replay(&self, nonce: &str, _token_expiry: u64) -> Result<(), UcanError> {
         if self.seen.contains(nonce) {
             return Err(UcanError::NonceReused(nonce.to_owned()));
         }
+        Ok(())
+    }
+
+    fn record(&mut self, nonce: &str, token_expiry: u64) -> Result<(), UcanError> {
+        self.check_replay(nonce, token_expiry)?;
         self.seen.insert(nonce.to_owned());
         Ok(())
     }

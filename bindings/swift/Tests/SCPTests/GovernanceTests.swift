@@ -22,7 +22,7 @@ struct GovernanceTests {
     /// contextId, creatorDid, and initialState.
     private func makeActiveContext() -> Context {
         let handle = ContextHandle(noPointer: .init())
-        let sendFn: ContextBridge.SendFn = { _, _, _ in }
+        let sendFn: ContextBridge.SendFn = { _, _, _, _ in }
         let subscribeFn: ContextBridge.SubscribeFn = { _, _ in }
         let leaveFn: ContextBridge.LeaveFn = { _, _ in }
         let closeFn: ContextBridge.CloseFn = { _, _ in }
@@ -49,7 +49,7 @@ struct GovernanceTests {
 
     // MARK: - GovernanceActionResult enum tests
 
-    @Test("GovernanceActionResult has exactly 28 cases")
+    @Test("GovernanceActionResult has exactly 26 cases")
     func governanceActionResultCount() {
         let allCases: [GovernanceActionResult] = [
             .memberAdded, .memberRemoved, .roleChanged,
@@ -58,13 +58,12 @@ struct GovernanceTests {
             .adminTransferred, .signerAdded, .signerRemoved,
             .thresholdModified, .childContextCreated, .toolInterfaceEstablished,
             .memberReset, .conflictResolved, .contextPromoted,
-            .readAccessRevoked, .readAccessRestored,
-            .writeAccessRevoked, .writeAccessRestored,
+            .memberSuspended, .accessRevoked, .accessRestored,
             .contentKeysRotated, .governanceReconfigured,
-            .authorBlocked, .subscriberBanned, .subscriberUnbanned,
+            .subscriberBanned, .subscriberUnbanned,
             .executed
         ]
-        #expect(allCases.count == 28)
+        #expect(allCases.count == 26)
     }
 
     @Test("GovernanceActionResult raw values match Rust GovernanceActionResult variants")
@@ -87,13 +86,11 @@ struct GovernanceTests {
         #expect(GovernanceActionResult.memberReset.rawValue == "MemberReset")
         #expect(GovernanceActionResult.conflictResolved.rawValue == "ConflictResolved")
         #expect(GovernanceActionResult.contextPromoted.rawValue == "ContextPromoted")
-        #expect(GovernanceActionResult.readAccessRevoked.rawValue == "ReadAccessRevoked")
-        #expect(GovernanceActionResult.readAccessRestored.rawValue == "ReadAccessRestored")
-        #expect(GovernanceActionResult.writeAccessRevoked.rawValue == "WriteAccessRevoked")
-        #expect(GovernanceActionResult.writeAccessRestored.rawValue == "WriteAccessRestored")
+        #expect(GovernanceActionResult.memberSuspended.rawValue == "MemberSuspended")
+        #expect(GovernanceActionResult.accessRevoked.rawValue == "AccessRevoked")
+        #expect(GovernanceActionResult.accessRestored.rawValue == "AccessRestored")
         #expect(GovernanceActionResult.contentKeysRotated.rawValue == "ContentKeysRotated")
         #expect(GovernanceActionResult.governanceReconfigured.rawValue == "GovernanceReconfigured")
-        #expect(GovernanceActionResult.authorBlocked.rawValue == "AuthorBlocked")
         #expect(GovernanceActionResult.subscriberBanned.rawValue == "SubscriberBanned")
         #expect(GovernanceActionResult.subscriberUnbanned.rawValue == "SubscriberUnbanned")
         #expect(GovernanceActionResult.executed.rawValue == "Executed")
@@ -225,13 +222,11 @@ struct GovernanceTests {
             ("MemberReset", .memberReset),
             ("ConflictResolved", .conflictResolved),
             ("ContextPromoted", .contextPromoted),
-            ("ReadAccessRevoked", .readAccessRevoked),
-            ("ReadAccessRestored", .readAccessRestored),
-            ("WriteAccessRevoked", .writeAccessRevoked),
-            ("WriteAccessRestored", .writeAccessRestored),
+            ("MemberSuspended", .memberSuspended),
+            ("AccessRevoked", .accessRevoked),
+            ("AccessRestored", .accessRestored),
             ("ContentKeysRotated", .contentKeysRotated),
             ("GovernanceReconfigured", .governanceReconfigured),
-            ("AuthorBlocked", .authorBlocked),
             ("SubscriberBanned", .subscriberBanned),
             ("SubscriberUnbanned", .subscriberUnbanned),
             ("Executed", .executed)

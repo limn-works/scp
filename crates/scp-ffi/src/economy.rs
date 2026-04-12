@@ -8,7 +8,6 @@
 //! - [`py_economy_check_policy_lock`] — Check if economic policy mutation is allowed.
 //! - [`py_economy_validate_policy_change`] — Validate a proposed policy change.
 //! - [`py_economy_evaluate_formula`] — Evaluate a pricing formula against metrics.
-//! - [`py_economy_adjust_relay_price`] — Compute EIP-1559-style relay price adjustment.
 //! - [`py_economy_budget_remaining`] — Query remaining budget for a member.
 //! - [`py_economy_budget_grant`] — Grant spending budget to a member.
 //! - [`py_economy_budget_record_spend`] — Record a spend against a member's budget.
@@ -247,49 +246,6 @@ pub fn py_economy_evaluate_formula(
 }
 
 // ---------------------------------------------------------------------------
-// adjust_relay_price
-// ---------------------------------------------------------------------------
-
-/// Computes an EIP-1559-style relay price adjustment.
-///
-/// Returns a dict with `new_base_price` (int), `previous_base_price` (int),
-/// and `direction` (str: "Increased", "Decreased", or "Unchanged").
-///
-/// # Arguments
-///
-/// * `config_json` — The relay pricing config as a JSON string.
-/// * `actual_utilization_pct` — Current relay utilization (0-100).
-#[pyfunction]
-#[pyo3(name = "economy_adjust_relay_price")]
-pub fn py_economy_adjust_relay_price(
-    py: Python<'_>,
-    config_json: &str,
-    actual_utilization_pct: u64,
-) -> PyResult<Py<PyDict>> {
-    let config: scp_core::economy::RelayPricingConfig =
-        serde_json::from_str(config_json).map_err(|e| {
-            pyo3::exceptions::PyValueError::new_err(format!(
-                "failed to parse relay pricing config JSON: {e}"
-            ))
-        })?;
-
-    let result = scp_core::economy::adjust_relay_price(&config, actual_utilization_pct);
-
-    let dict = PyDict::new(py);
-    dict.set_item("new_base_price", result.new_base_price.value())?;
-    dict.set_item("previous_base_price", result.previous_base_price.value())?;
-    dict.set_item(
-        "direction",
-        match result.direction {
-            scp_core::economy::PriceDirection::Increased => "Increased",
-            scp_core::economy::PriceDirection::Decreased => "Decreased",
-            scp_core::economy::PriceDirection::Unchanged => "Unchanged",
-        },
-    )?;
-    Ok(dict.into())
-}
-
-// ---------------------------------------------------------------------------
 // Budget tracker (stateful, per-context via runtime registry)
 // ---------------------------------------------------------------------------
 
@@ -467,7 +423,6 @@ pub fn register_economy(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(py_economy_check_policy_lock, m)?)?;
     m.add_function(wrap_pyfunction!(py_economy_validate_policy_change, m)?)?;
     m.add_function(wrap_pyfunction!(py_economy_evaluate_formula, m)?)?;
-    m.add_function(wrap_pyfunction!(py_economy_adjust_relay_price, m)?)?;
     m.add_function(wrap_pyfunction!(py_economy_budget_remaining, m)?)?;
     m.add_function(wrap_pyfunction!(py_economy_budget_grant, m)?)?;
     m.add_function(wrap_pyfunction!(py_economy_budget_record_spend, m)?)?;

@@ -9,14 +9,10 @@
     clippy::panic,
     dead_code
 )]
-//! WASM conformance tests (RED-014).
+//! WASM conformance tests.
 //!
-//! After the scp-protocol migration, many WASM modules import shared types
-//! and algorithms directly from scp-protocol and scp-event-log. Tests that
-//! previously compared WASM reimplementations against native code are now
-//! tautological (comparing the same code on both sides) and have been removed.
-//!
-//! Remaining tests validate:
+//! WASM modules import shared types and algorithms directly from
+//! `scp-protocol` and `scp-event-log`. These tests validate:
 //! - WASM-specific behavior (registry semantics, context manager patterns)
 //! - Code that remains WASM-local (governance proposals, role capabilities,
 //!   broadcast state, provenance hashing, attestation canonical bytes,
@@ -2306,6 +2302,7 @@ fn context_event_to_js_camel_case_format() {
         action_summary: "AddMember".into(),
         executor_did: "did:dht:admin".into(),
         resulting_epoch: Some(42),
+        target_did: Some("did:dht:alice".into()),
     };
     let mut val = serde_json::to_value(&event).unwrap();
     serde_to_js(&mut val);

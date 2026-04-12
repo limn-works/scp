@@ -497,11 +497,14 @@ class StubEventContextBindings : EventContextBindings {
     override fun contextCreate(
         identityHandle: Long,
         paramsJson: String,
+        consequenceRulesJson: String?,
+        consequenceConfigJson: String?,
     ): Long = contextCreateResult
 
     override fun contextJoin(
         contextHandle: Long,
         identityHandle: Long,
+        spendingUcanJwt: String?,
     ) {
         // no-op
     }
@@ -524,6 +527,7 @@ class StubEventContextBindings : EventContextBindings {
         contextHandle: Long,
         identityHandle: Long,
         payload: ByteArray,
+        spendingUcanJwt: String?,
     ) {
         contextSendCalled = true
     }

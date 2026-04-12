@@ -31,9 +31,11 @@ sha2 = { workspace = true }
 subtle = { workspace = true }
 rand = { workspace = true }
 thiserror = { workspace = true }
+serde_json = { workspace = true }
 bytes = "1"
 futures = "0.3"
 rmp-serde = { workspace = true }
+tls_codec = "0.4"
 tokio = { workspace = true }
 tokio-stream = { workspace = true }
 
@@ -54,7 +56,6 @@ openmls_traits = { workspace = true }
 serde_json = { workspace = true }
 rmp-serde = { workspace = true }
 tempfile = "3"
-tls_codec = "0.4"
 x25519-dalek = { workspace = true }
 tokio-tungstenite = { version = "0.24", features = ["connect"] }
 axum = { workspace = true, features = ["ws"] }
@@ -177,6 +178,10 @@ path = "tests/integration/welcome_delivery.rs"
 [[test]]
 name = "pipeline_wiring"
 path = "tests/integration/pipeline_wiring.rs"
+
+[[test]]
+name = "tool_economy_wiring"
+path = "tests/integration/tool_economy_wiring.rs"
 
 [lints]
 workspace = true

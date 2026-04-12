@@ -133,10 +133,19 @@
 - GOOD: Exhaustive match arms in governance dispatch (no wildcards)
 - GOOD: Unanimity check via set-difference pattern in ExtendTtl and PromoteContext
 
+### Wiring Batch 2 Governance (2026-03-25, updated)
+- HIGH x4: double budget charge on send/join (enforce_*_economy + execute_paid_action both record_spend); budget not rolled back on payment failure; CapabilitySuspension substring matching (contains("write")) misses non-read/write caps; event_log_entries_for_consequences sets all timestamps to now (defeats time windowing)
+- HIGH: record_spend result silently discarded in execute_paid_action (let _ =)
+- MEDIUM x5: standing context ID 64-bit collision (hash[..8]); NoOpPaymentAdapter pub without feature gate; check_standing silently passes on compute_participation_record Err; enforce_role_demotion ignores return value (success always true); participation_cache/cooldown_until unbounded
+- MEDIUM x2: tool invoke uses zero metrics for cost eval (arbitrage risk); standing_contexts HashMap unbounded
+- MEDIUM: lock ordering fragile in standing_context (standing_contexts + contexts simultaneous)
+- FIXED from prior review: consequences now enforced (not just logged); sender key removed BEFORE MLS removal; advance_epoch wired for RotateContentKeys
+- GOOD: fail-closed economy defaults; lock-drop-async pattern; auto_accept guard; cooldown prevents consequence spam; consequence_rules stripped from public export
+
 ### Wiring Batch 1 Messaging (2026-03-24, updated)
 - See `wiring-batch1-messaging-findings.md` for full details (15 files, line-by-line review)
 - HIGH x4: NAPI/UniFFI signing key .ok() falls back to None; Recovery MessageType bypass skips access key unwrapping; access key TOCTOU between Phase 1/3; reorder buffer stores pre-decrypted plaintext
-- MEDIUM x7: sender key AAD zeros (#1422); access key wrapping AAD zeros; bridge trust level discarded; SequenceTracker not persisted; SequenceTracker validate() TOCTOU; snapshot key bytes not Zeroizing; FFI access key ops lack authorization
+- MEDIUM x7: sender key AAD zeros (#1422 -- FIXED in PR#1606); access key wrapping AAD zeros; bridge trust level discarded; SequenceTracker not persisted; SequenceTracker validate() TOCTOU; snapshot key bytes not Zeroizing; FFI access key ops lack authorization
 - GOOD: Sig verify before anti-replay; cross-context injection defense; MLS credential match; constant-time hash; domain-sep routing IDs; fail-closed defaults; correct timestamp validator; sequence 0 rejection; bounded reorder buffer; correct sign order
 
 ### General Patterns
@@ -180,6 +189,22 @@
 - RUSTSEC-2026-0044/0048/0049 (aws-lc-sys): suppressed as transitive, awaiting upstream. Appropriate.
 - MEDIUM REMAINING: BootstrapConfig bootstrap resolver doesn't enforce expected_creator_did -- intentional but documentation-only guarantee. If callers skip post-join verification, Sybil attack vector remains.
 
+### PR #1606 -- Epoch/Sequence AAD, MLS Management Messages, Timestamp Bounds (2026-03-31, R2)
+- FIXED: sender key AAD zeros (#1422) -- real epoch/sequence wired into AES-256-GCM AAD with length-prefixed build_sender_aad
+- FIXED: sender key distributions now MLS-wrapped via mls_encrypt_management (SCPM magic prefix dispatch)
+- FIXED: buffer event timestamp bounds (M18) -- 1h past + 5s future tolerance
+- FIXED: E2eCryptoProvider now uses real epoch/sequence (was hardcoded 0/0)
+- FIXED: recv-side sequence tracking added (per-sender epoch/seq monotonicity)
+- FIXED: epoch poisoning defense (MAX_EPOCH_ADVANCE=1000)
+- FIXED: asymmetric access key freshness (past=300s, future=30s)
+- MEDIUM REMAINING: E2eCryptoProvider::open missing management payload 64KiB size check (production has it)
+- MEDIUM REMAINING: mls_encrypt_management has no send-side size check (only recv-side enforced)
+- MEDIUM REMAINING: recv_sequence_tracker unbounded HashMap growth (never pruned on member removal)
+- MEDIUM REMAINING: E2eCryptoProvider seal TOCTOU on epoch/sequence (separate lock acquisitions)
+- MEDIUM REMAINING: Error messages in replay detection and epoch poisoning leak internal state (epoch, sequence, sender_did)
+- MEDIUM PRE-EXISTING: NonceDedup still not wired for access keys
+- GOOD: OpenResult enum forces exhaustive handling; send_sequence persisted; wrapping_add; shared header helpers
+
 ### P0 Audit Batch 1 Review (2026-03-19) -- fix/audit-batch-1-p0-blockers
 - FIXES VERIFIED: #1418 (WASM event tags), #1419 (ceiling escalation), #1420 (phantom events), #1431 (pseudonym oracle), #1470 (atomic writes)
 - REMAINING HIGH: SqliteKeyCustody pseudonym oracle (same as #1431 but unfixed)
@@ -187,3 +212,16 @@
 - send_message 3-phase pattern: sound; TOCTOU gap handled by Phase 3 re-validation; seq burn is harmless
 - Ceiling fix: NAPI + UniFFI fixed; PyO3 was already correct (resolves at registration); WASM was already correct
 - Atomic write: create_new has fsync; append_entry does NOT have fsync -- inconsistency
+
+### Complete PR Work Review (2026-04-01, re-reviewed 2026-04-04) -- claude/complete-pr-work-review-0TQtO
+- HIGH: validate_governance_action_strings + all callees DELETED from FFI -- role names, reasons, descriptions now unvalidated (length, control chars, HTML). reject_html_special_chars also deleted.
+- HIGH: AND-composition check_and_composition allows None/None/free=Ok(()) -- action_ucan explicitly discarded with `let _ =`. Rename or audit all callers.
+- HIGH: system_assign_role pub (not pub(crate)), bypasses RoleAssign with no audit trail differentiation
+- MEDIUM: SenderKeyStore::remove clears epoch tracking -- epoch rollback possible on re-add
+- MEDIUM: SuspendAll consequence is application-level only (no MLS exclusion)
+- MEDIUM: evaluate_sybil_resistance always passes -- build_identity_assessment uses empty signal HashMap
+- MEDIUM: SenderVelocityTracker still unbounded (from_snapshot/record_message grow without limit)
+- MEDIUM: ConsequenceTriggered events leak trigger_type (Debug format) and rule_index to SDK
+- MEDIUM: send_sequence wrapping_add allows theoretical nonce reuse at u64::MAX
+- FIXED from prior: sender key AAD zeros; MLS management messages; epoch poisoning defense; error message sanitization
+- GOOD: Escrow budget pattern with reverse_spend; ConsequenceRule::validate whitelist; NoOpPaymentAdapter cfg-gated; decrypt collapses CiphertextTooShort into AuthenticationFailed (oracle prevention); TOCTOU guard in enforce_triggered_consequences
