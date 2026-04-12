@@ -858,62 +858,73 @@ fn check_proposer_eligibility(
         }
     }
 
-    // SingleAdmin: skip participation threshold for the admin — they are the
-    // sole authority and participation-based gating doesn't apply (#1530).
-    if matches!(ctx.handle.params().governance, GovernanceModel::SingleAdmin) {
+    // SingleAdmin without sybil_policy: skip participation and earned capacity
+    // checks — the sole authority is always eligible. When a sybil_policy IS
+    // set, earned capacity limits still apply (even to the admin).
+    if matches!(ctx.handle.params().governance, GovernanceModel::SingleAdmin)
+        && ctx.handle.params().sybil_policy.is_none()
+    {
         return Ok(());
     }
 
     // Refresh participation record from recent events before checking the
-    // participation threshold (#1530).
+    // participation threshold (#1530). Skip recomputation if a cached record
+    // already exists — the cache is populated on first check and updated when
+    // participation events occur (messaging, governance, tools, lifecycle).
     let context_id = ctx.handle.context_id().to_owned();
-    let context_id_bytes = context_id_to_bytes(&context_id);
-    let merkle_root = event_log
-        .event_log_merkle_root(&context_id_bytes)
-        .unwrap_or([0u8; 32]);
-    let events = event_log_entries_for_consequences(ctx, &context_id, now, event_log);
-    if !events.is_empty() {
-        match scp_protocol::trust::participation::compute_participation_record(
-            &events,
-            proposer_did.as_ref(),
-            &context_id,
-            merkle_root,
-            now,
-        ) {
-            Err(e) => {
-                // Fail-closed: if participation record computation fails,
-                // log a warning and deny the proposal. This prevents
-                // silently passing members with corrupted participation data.
-                tracing::warn!(
-                    proposer = %proposer_did,
-                    error = %e,
-                    "compute_participation_record failed — denying proposal"
-                );
-                return Err(ContextError::PermissionDenied(
+    if !ctx
+        .governance
+        .participation_cache
+        .contains_key(proposer_did.as_ref())
+    {
+        let context_id_bytes = context_id_to_bytes(&context_id);
+        let merkle_root = event_log
+            .event_log_merkle_root(&context_id_bytes)
+            .unwrap_or([0u8; 32]);
+        let events = event_log_entries_for_consequences(ctx, &context_id, now, event_log);
+        if !events.is_empty() {
+            match scp_protocol::trust::participation::compute_participation_record(
+                &events,
+                proposer_did.as_ref(),
+                &context_id,
+                merkle_root,
+                now,
+            ) {
+                Err(e) => {
+                    // Fail-closed: if participation record computation fails,
+                    // log a warning and deny the proposal. This prevents
+                    // silently passing members with corrupted participation data.
+                    tracing::warn!(
+                        proposer = %proposer_did,
+                        error = %e,
+                        "compute_participation_record failed — denying proposal"
+                    );
+                    return Err(ContextError::PermissionDenied(
                     "SCP-GOV-11021: participation record computation failed — cannot verify proposer eligibility"
                         .into(),
                 ));
-            }
-            Ok(record) => {
-                // Participation evaluation uses participation_count and
-                // governance_actions to determine eligibility (#1530).
-                // Only cache records with actual participation — new members
-                // with zero participation should not be blocked before they
-                // participate.
-                if record.participation_count > 0 {
-                    tracing::trace!(
-                        participation_count = record.participation_count,
-                        governance_actions_by = record.governance_actions_by.len(),
-                        governance_actions_against = record.governance_actions_against.len(),
-                        "participation evaluation for proposer"
-                    );
-                    ctx.governance
-                        .participation_cache
-                        .insert(proposer_did.to_string(), record);
+                }
+                Ok(record) => {
+                    // Participation evaluation uses participation_count and
+                    // governance_actions to determine eligibility (#1530).
+                    // Only cache records with actual participation — new members
+                    // with zero participation should not be blocked before they
+                    // participate.
+                    if record.participation_count > 0 {
+                        tracing::trace!(
+                            participation_count = record.participation_count,
+                            governance_actions_by = record.governance_actions_by.len(),
+                            governance_actions_against = record.governance_actions_against.len(),
+                            "participation evaluation for proposer"
+                        );
+                        ctx.governance
+                            .participation_cache
+                            .insert(proposer_did.to_string(), record);
+                    }
                 }
             }
         }
-    }
+    } // end if !participation_cache.contains_key
 
     // Check participation records for eligibility (#1530).
     if let Some(record) = ctx
