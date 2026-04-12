@@ -824,6 +824,12 @@ impl ContextManager {
             .flatten()
             .map_or(0, |e| e.len() as u64);
 
+        // Note: `prove_consistency` is NOT used here because consistency
+        // proofs prove that a smaller version of the SAME log is a prefix
+        // of a larger version. Cross-member equivocation detection compares
+        // two DIFFERENT logs from different members — Merkle root comparison
+        // is the correct mechanism (identical roots ⇒ identical event
+        // sequences, per second-preimage resistance of SHA-256).
         let comparison = match local_count.cmp(&remote.event_count) {
             std::cmp::Ordering::Equal => {
                 if local_root == remote.merkle_root {
@@ -865,6 +871,11 @@ impl ContextManager {
             }
             let mut contexts = self.contexts.lock().await;
             if let Some(ctx) = contexts.get_mut(context_id) {
+                super::append_to_merkle_tree(
+                    &mut ctx.merkle_tree,
+                    "EquivocationDetected",
+                    remote.sender_did.as_ref(),
+                );
                 ctx.receive_buffer.push(ContextEvent::EquivocationDetected {
                     context_id: context_id.to_owned(),
                     remote_sender_did: remote.sender_did.clone(),
@@ -874,5 +885,118 @@ impl ContextManager {
         }
 
         Ok(comparison)
+    }
+
+    // -------------------------------------------------------------------
+    // Merkle tree synchronization
+    // -------------------------------------------------------------------
+
+    /// Synchronizes the per-context Merkle tree with the `MerkleEventLogProvider`.
+    ///
+    /// Compares the Merkle tree's event count with the provider's entry count
+    /// and replays any missing entries via `push_leaf_raw`. This lazy sync
+    /// ensures proof functions always operate on a complete tree even when
+    /// individual `append_context_event` call sites didn't explicitly append
+    /// to the Merkle tree.
+    ///
+    /// Called by [`prove_event_inclusion`] and [`prove_event_consistency`]
+    /// before generating proofs.
+    fn sync_merkle_tree(&self, context_id: &str, ctx: &mut super::PerContextState) {
+        let context_id_bytes = super::context_id_to_bytes(context_id);
+        // event_count returns u64; on 32-bit targets the log size is bounded
+        // by available memory well below u32::MAX, so saturating is safe.
+        let tree_count = usize::try_from(scp_event_log::tree::event_count(&ctx.merkle_tree))
+            .unwrap_or(usize::MAX);
+
+        if let Ok(Some(entries)) = self.event_log.event_log_entries(&context_id_bytes)
+            && entries.len() > tree_count
+        {
+            // Replay missing entries. Each entry's pre-computed hash is
+            // pushed as a raw leaf — the internal tree structure (RFC 6962
+            // interior nodes) is rebuilt automatically by `push_leaf_raw`.
+            for entry in entries.iter().skip(tree_count) {
+                ctx.merkle_tree.push_leaf_raw(entry.hash);
+            }
+        }
+    }
+
+    // -------------------------------------------------------------------
+    // Merkle proof operations (ADR-011, #1535)
+    // -------------------------------------------------------------------
+
+    /// Returns a Merkle inclusion proof for the event at the given index
+    /// in the per-context RFC 6962 event log.
+    ///
+    /// The proof consists of sibling hashes at each tree level from the leaf
+    /// up to the root. Proof size is O(log n). Verifiable via
+    /// [`verify_event_inclusion`](Self::verify_event_inclusion).
+    ///
+    /// See ADR-011 acceptance criterion 3.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ContextError::ContextNotRegistered`] if the context is unknown.
+    /// Returns [`ContextError::EventLogFailed`] if the leaf index is out of
+    /// bounds or the log is empty.
+    pub async fn prove_event_inclusion(
+        &self,
+        context_id: &str,
+        leaf_index: u64,
+    ) -> Result<scp_event_log::proof::InclusionProof, ContextError> {
+        let mut contexts = self.contexts.lock().await;
+        let ctx = contexts
+            .get_mut(context_id)
+            .ok_or_else(|| ContextError::ContextNotRegistered(context_id.to_owned()))?;
+        self.sync_merkle_tree(context_id, ctx);
+        scp_event_log::proof::prove_inclusion(&ctx.merkle_tree, leaf_index)
+            .map_err(|e| ContextError::EventLogFailed(e.to_string()))
+    }
+
+    /// Returns a Merkle consistency proof between the tree at `old_size` and
+    /// the current tree size, proving that the old tree is a prefix of the
+    /// current tree (CT-style per RFC 6962).
+    ///
+    /// See ADR-011 acceptance criterion 5.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ContextError::ContextNotRegistered`] if the context is unknown.
+    /// Returns [`ContextError::EventLogFailed`] if `old_size` is 0, exceeds
+    /// the current size, or the log is empty.
+    pub async fn prove_event_consistency(
+        &self,
+        context_id: &str,
+        old_size: u64,
+    ) -> Result<scp_event_log::proof::ConsistencyProof, ContextError> {
+        let mut contexts = self.contexts.lock().await;
+        let ctx = contexts
+            .get_mut(context_id)
+            .ok_or_else(|| ContextError::ContextNotRegistered(context_id.to_owned()))?;
+        self.sync_merkle_tree(context_id, ctx);
+        let current_size = scp_event_log::tree::event_count(&ctx.merkle_tree);
+        scp_event_log::proof::prove_consistency(&ctx.merkle_tree, old_size, current_size)
+            .map_err(|e| ContextError::EventLogFailed(e.to_string()))
+    }
+
+    /// Verifies a Merkle inclusion proof. Pure function — no state needed.
+    ///
+    /// Recomputes the root hash from the proof path and compares against the
+    /// stated root using constant-time comparison.
+    ///
+    /// See ADR-011 acceptance criterion 5.
+    #[must_use]
+    pub fn verify_event_inclusion(proof: &scp_event_log::proof::InclusionProof) -> bool {
+        scp_event_log::proof::verify_inclusion(proof)
+    }
+
+    /// Verifies a Merkle consistency proof. Pure function — no state needed.
+    ///
+    /// Reconstructs both the old and new roots from the stored leaf hashes
+    /// and verifies they match the stated roots.
+    ///
+    /// See RFC 6962 Section 2.1.2.
+    #[must_use]
+    pub fn verify_event_consistency(proof: &scp_event_log::proof::ConsistencyProof) -> bool {
+        scp_event_log::proof::verify_consistency(proof)
     }
 }

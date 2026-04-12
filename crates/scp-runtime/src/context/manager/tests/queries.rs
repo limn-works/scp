@@ -806,3 +806,178 @@ async fn compare_checkpoint_rejects_invalid_signature() {
         "error should be CryptoFailed"
     );
 }
+
+// -----------------------------------------------------------------------
+// Merkle proof tests (ADR-011, #1535)
+// -----------------------------------------------------------------------
+
+/// #1535: Send 5 messages, prove inclusion for each, verify all pass.
+///
+/// Each `send_message` call appends to the per-context Merkle tree via
+/// the explicit `append_to_merkle_tree` call in `finalize_send`. The
+/// Merkle tree accumulates events independently of the event log provider.
+#[tokio::test]
+async fn prove_event_inclusion_after_messages() {
+    let (manager, handle) = setup_active_context().await;
+    let sk = signing_key_for_did(&"did:key:creator".into());
+
+    // Send 5 messages. Each send_message call appends a "MessageSent"
+    // event to the per-context Merkle tree.
+    for i in 1..=5u8 {
+        manager
+            .send_message(
+                &handle,
+                &"did:key:creator".into(),
+                &[i],
+                Some(&sk),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+    }
+
+    // The Merkle tree should have exactly 5 entries (one per send_message).
+    // Prove inclusion for each.
+    for i in 0..5u64 {
+        let proof = manager.prove_event_inclusion("test-ctx", i).await.unwrap();
+        assert!(
+            ContextManager::verify_event_inclusion(&proof),
+            "inclusion proof for event {i} should verify"
+        );
+        assert_eq!(proof.leaf_index, i);
+    }
+}
+
+/// #1535: Send 10 messages, prove consistency from size 5 to 10, verify.
+#[tokio::test]
+async fn prove_event_consistency_after_messages() {
+    let (manager, handle) = setup_active_context().await;
+    let sk = signing_key_for_did(&"did:key:creator".into());
+
+    // Send 10 messages.
+    for i in 1..=10u8 {
+        manager
+            .send_message(
+                &handle,
+                &"did:key:creator".into(),
+                &[i],
+                Some(&sk),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+    }
+
+    // Prove consistency from size 5 to current size (10).
+    let proof = manager
+        .prove_event_consistency("test-ctx", 5)
+        .await
+        .unwrap();
+    assert!(
+        ContextManager::verify_event_consistency(&proof),
+        "consistency proof should verify"
+    );
+    assert_eq!(proof.old_size, 5);
+    assert_eq!(proof.new_size, 10);
+}
+
+/// #1535: Prove inclusion with an invalid (out-of-bounds) index returns error.
+#[tokio::test]
+async fn prove_event_inclusion_invalid_index() {
+    let (manager, handle) = setup_active_context().await;
+    let sk = signing_key_for_did(&"did:key:creator".into());
+
+    // Send one message so the Merkle tree has exactly 1 entry.
+    manager
+        .send_message(
+            &handle,
+            &"did:key:creator".into(),
+            b"msg",
+            Some(&sk),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+    // Index 999999 should be out of bounds (only 1 event exists).
+    let result = manager.prove_event_inclusion("test-ctx", 999_999).await;
+    assert!(result.is_err(), "out-of-bounds index should return error");
+    assert!(matches!(
+        result.unwrap_err(),
+        ContextError::EventLogFailed(_)
+    ));
+}
+
+/// #1535: Prove consistency with `old_size` > `current_size` returns error.
+#[tokio::test]
+async fn prove_event_consistency_old_size_too_large() {
+    let (manager, handle) = setup_active_context().await;
+    let sk = signing_key_for_did(&"did:key:creator".into());
+
+    // Send one message so the Merkle tree has exactly 1 entry.
+    manager
+        .send_message(
+            &handle,
+            &"did:key:creator".into(),
+            b"msg",
+            Some(&sk),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+    // old_size 999999 should exceed current size (1 event).
+    let result = manager.prove_event_consistency("test-ctx", 999_999).await;
+    assert!(
+        result.is_err(),
+        "old_size exceeding current size should return error"
+    );
+    assert!(matches!(
+        result.unwrap_err(),
+        ContextError::EventLogFailed(_)
+    ));
+}
+
+/// #1535: Pure verify functions reject tampered proofs.
+#[tokio::test]
+async fn verify_rejects_tampered_inclusion_proof() {
+    let (manager, handle) = setup_active_context().await;
+    let sk = signing_key_for_did(&"did:key:creator".into());
+
+    manager
+        .send_message(
+            &handle,
+            &"did:key:creator".into(),
+            b"msg",
+            Some(&sk),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+    let mut proof = manager.prove_event_inclusion("test-ctx", 0).await.unwrap();
+    assert!(ContextManager::verify_event_inclusion(&proof));
+
+    // Tamper with the root.
+    proof.root[0] ^= 0xFF;
+    assert!(
+        !ContextManager::verify_event_inclusion(&proof),
+        "tampered root should fail verification"
+    );
+}
+
+/// #1535: Context not registered returns `ContextNotRegistered` error.
+#[tokio::test]
+async fn prove_event_inclusion_unknown_context() {
+    let (manager, _handle) = setup_active_context().await;
+    let result = manager.prove_event_inclusion("nonexistent-ctx", 0).await;
+    assert!(matches!(
+        result.unwrap_err(),
+        ContextError::ContextNotRegistered(_)
+    ));
+}

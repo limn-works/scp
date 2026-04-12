@@ -573,6 +573,13 @@ impl ContextManager {
             checkpoint_events_since: ctx_snapshot.checkpoint_events_since,
             checkpoint_last_time_secs: ctx_snapshot.checkpoint_last_time_secs,
             checkpoints: Vec::new(),
+            // Merkle tree starts empty on restore. Events appended after
+            // restore will be tracked; proofs cover post-restore events only.
+            // Full rebuild strategy: replay EventLogEntry hashes via
+            // push_leaf_raw from event_log_entries if full-history proofs
+            // are needed. Deferred to the Welcome delivery plan (#1311)
+            // which adds cross-process event log synchronization.
+            merkle_tree: scp_event_log::EventLog::new(context_id.to_owned()),
         };
 
         {
@@ -1281,6 +1288,9 @@ impl ContextManager {
             checkpoint_events_since: 0,
             checkpoint_last_time_secs: self.clock.now_secs(),
             checkpoints: Vec::new(),
+            // Fresh Merkle tree for imported contexts. Proofs cover
+            // post-import events only (same rationale as restore_context).
+            merkle_tree: scp_event_log::EventLog::new(context_id.clone()),
         };
 
         // 7. Register the context.
@@ -1474,6 +1484,7 @@ impl ContextManager {
             checkpoint_events_since: 0,
             checkpoint_last_time_secs: self.clock.now_secs(),
             checkpoints: Vec::new(),
+            merkle_tree: scp_event_log::EventLog::new(context_id.clone()),
         };
 
         {
@@ -1809,6 +1820,7 @@ impl ContextManager {
             checkpoint_events_since: 0,
             checkpoint_last_time_secs: self.clock.now_secs(),
             checkpoints: Vec::new(),
+            merkle_tree: scp_event_log::EventLog::new(context_id.to_owned()),
         })
     }
 
@@ -2062,6 +2074,16 @@ impl ContextManager {
             "MemberJoined",
             member_did.as_ref(),
         )?;
+        {
+            let mut contexts = self.contexts.lock().await;
+            if let Some(ctx) = contexts.get_mut(&context_id) {
+                super::append_to_merkle_tree(
+                    &mut ctx.merkle_tree,
+                    "MemberJoined",
+                    member_did.as_ref(),
+                );
+            }
+        }
 
         // Persist context state after join (best-effort).
         if self.has_persistence() {
@@ -2347,6 +2369,16 @@ impl ContextManager {
             "MemberLeft",
             member_did.as_ref(),
         )?;
+        {
+            let mut contexts = self.contexts.lock().await;
+            if let Some(ctx) = contexts.get_mut(&context_id) {
+                super::append_to_merkle_tree(
+                    &mut ctx.merkle_tree,
+                    "MemberLeft",
+                    member_did.as_ref(),
+                );
+            }
+        }
 
         // Persist context state after leave (best-effort).
         if self.has_persistence() {

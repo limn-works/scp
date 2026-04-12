@@ -653,6 +653,11 @@ impl ContextManager {
             if let Some(ctx) = contexts.get_mut(context_id)
                 && require_active(&ctx.handle).is_ok()
             {
+                super::append_to_merkle_tree(
+                    &mut ctx.merkle_tree,
+                    "MessageSent",
+                    sender_did.as_ref(),
+                );
                 ctx.receive_buffer.push(ContextEvent::MessageSent {
                     sender_did: sender_did.clone(),
                     sequence_number: sequence,
@@ -1171,6 +1176,7 @@ impl ContextManager {
                 "failed to append MessageReceived to event log on receive path: {e}"
             );
         }
+        super::append_to_merkle_tree(&mut ctx.merkle_tree, "MessageReceived", sender_did);
 
         // H16: Defense-in-depth velocity tracking and consequence evaluation
         // for the sender on the receive path. This ensures that even if the

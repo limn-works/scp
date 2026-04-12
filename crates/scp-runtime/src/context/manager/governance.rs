@@ -167,6 +167,7 @@ fn consequence_event_payload(
 /// nothing because the failure mode is observed via tracing, not callers.
 fn append_consequence_event(
     event_log: &dyn super::super::builder::ContextEventLogProvider,
+    merkle_tree: &mut scp_event_log::EventLog,
     context_id: &str,
     context_id_bytes: &[u8; 32],
     event_name: &'static str,
@@ -187,6 +188,7 @@ fn append_consequence_event(
             "failed to append consequence event to durable event log"
         );
     }
+    super::append_to_merkle_tree(merkle_tree, event_name, CONSEQUENCE_ACTOR_DID);
 }
 
 /// Borrowed inputs for `enforce_triggered_consequences`. Bundling the
@@ -360,6 +362,7 @@ fn emit_consequence_triggered(
     );
     append_consequence_event(
         args.event_log,
+        &mut ctx.merkle_tree,
         args.context_id,
         context_id_bytes,
         "ConsequenceTriggered",
@@ -396,6 +399,7 @@ fn emit_absent_member_enforcement_failed(
     );
     append_consequence_event(
         args.event_log,
+        &mut ctx.merkle_tree,
         args.context_id,
         context_id_bytes,
         "ConsequenceEnforcementFailed",
@@ -428,6 +432,7 @@ fn emit_consequence_enforced_success(
     );
     append_consequence_event(
         args.event_log,
+        &mut ctx.merkle_tree,
         args.context_id,
         context_id_bytes,
         "ConsequenceEnforced",
@@ -559,6 +564,7 @@ fn emit_failure_escalation(
     );
     append_consequence_event(
         args.event_log,
+        &mut ctx.merkle_tree,
         context_id,
         context_id_bytes,
         "ConsequenceEnforcementFailed",
@@ -573,6 +579,7 @@ fn emit_failure_escalation(
     );
     append_consequence_event(
         args.event_log,
+        &mut ctx.merkle_tree,
         context_id,
         context_id_bytes,
         "ConsequenceEscalatedToSuspendAll",
@@ -1156,6 +1163,11 @@ impl ContextManager {
             let target_did = proposal.action.target_did().cloned();
             let mut contexts = self.contexts.lock().await;
             if let Some(ctx) = contexts.get_mut(context_id) {
+                super::append_to_merkle_tree(
+                    &mut ctx.merkle_tree,
+                    Self::governance_event_label(&executed_event),
+                    proposal.proposer_did.as_ref(),
+                );
                 // 1. Push GovernanceActionExecuted to receive buffer so SDK
                 //    consumers observe outcomes with rich context.
                 ctx.receive_buffer
