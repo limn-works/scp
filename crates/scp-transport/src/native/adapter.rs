@@ -230,8 +230,12 @@ impl NativeRelayAdapter {
 
     /// Conditionally creates a [`HeartbeatMonitor`] and spawns a background
     /// heartbeat check loop when a `TransportProfile` is provided and the
-    /// heartbeat config is enabled (default: enabled, 60s interval, 2x
-    /// suppression threshold).
+    /// heartbeat config is enabled.
+    ///
+    /// The heartbeat interval is derived from the transport profile:
+    /// - **Server / Desktop**: 60s (default) — always-on, latency-sensitive.
+    /// - **Mobile**: 120s — reduced frequency to conserve battery.
+    /// - **Constrained**: no heartbeat — poll-based devices skip monitoring.
     ///
     /// Returns `Some(Arc<Mutex<HeartbeatMonitor>>)` when monitoring is
     /// started, `None` otherwise.
@@ -241,9 +245,20 @@ impl NativeRelayAdapter {
         cancel: &CancellationToken,
     ) -> Option<Arc<tokio::sync::Mutex<HeartbeatMonitor>>> {
         // Only create heartbeat monitoring when a profile is provided.
-        let _profile = profile?;
+        let profile = profile?;
 
-        let heartbeat_config = HeartbeatConfig::default();
+        // Derive heartbeat config from the transport profile.
+        let heartbeat_config = match profile {
+            // Server and Desktop: default 60s interval.
+            TransportProfile::Server | TransportProfile::Desktop => HeartbeatConfig::default(),
+            // Mobile: 120s interval to reduce battery impact.
+            TransportProfile::Mobile => HeartbeatConfig {
+                interval: std::time::Duration::from_secs(120),
+                ..HeartbeatConfig::default()
+            },
+            // Constrained devices: no heartbeat monitoring (poll-based).
+            TransportProfile::Constrained => return None,
+        };
         if !heartbeat_config.enabled {
             return None;
         }
@@ -1205,6 +1220,84 @@ mod tests {
 
         // Should not panic — no-op when monitor is None.
         adapter.record_heartbeat_received().await;
+    }
+
+    /// Verifies that `TransportProfile::Constrained` does NOT create a heartbeat
+    /// monitor (constrained devices are poll-based, no heartbeat needed).
+    #[tokio::test]
+    async fn connect_constrained_profile_no_heartbeat_monitor() {
+        use crate::native::server::{RelayConfig, RelayServer};
+        use crate::native::storage::BlobStorageBackend;
+        use crate::profile::TransportProfile;
+        use crate::relay::connection::{RelayUrlSource, SourcedRelayUrl};
+        use std::net::SocketAddr;
+        use std::sync::Arc;
+        use std::time::Duration;
+
+        let config = RelayConfig {
+            bind_addr: SocketAddr::from(([127, 0, 0, 1], 0)),
+            ttl_check_interval: Duration::from_millis(100),
+            delivery_jitter_ms: 0,
+            ..RelayConfig::default()
+        };
+        let storage = Arc::new(BlobStorageBackend::in_memory());
+        let server = RelayServer::new(config, storage);
+        let (_handle, addr) = server.start().await.unwrap();
+        let url = format!("ws://{addr}/scp/v1");
+
+        let sourced = SourcedRelayUrl {
+            url,
+            source: RelayUrlSource::DhtResolved,
+        };
+
+        let adapter =
+            NativeRelayAdapter::connect_sourced(&sourced, Some(&TransportProfile::Constrained))
+                .await
+                .unwrap();
+
+        assert!(
+            !adapter.has_heartbeat_monitor(),
+            "Constrained profile should NOT have a heartbeat monitor"
+        );
+    }
+
+    /// Verifies that `TransportProfile::Mobile` creates a heartbeat monitor
+    /// (profile-driven config selects Mobile → 120s interval).
+    #[tokio::test]
+    async fn connect_mobile_profile_creates_heartbeat_monitor() {
+        use crate::native::server::{RelayConfig, RelayServer};
+        use crate::native::storage::BlobStorageBackend;
+        use crate::profile::TransportProfile;
+        use crate::relay::connection::{RelayUrlSource, SourcedRelayUrl};
+        use std::net::SocketAddr;
+        use std::sync::Arc;
+        use std::time::Duration;
+
+        let config = RelayConfig {
+            bind_addr: SocketAddr::from(([127, 0, 0, 1], 0)),
+            ttl_check_interval: Duration::from_millis(100),
+            delivery_jitter_ms: 0,
+            ..RelayConfig::default()
+        };
+        let storage = Arc::new(BlobStorageBackend::in_memory());
+        let server = RelayServer::new(config, storage);
+        let (_handle, addr) = server.start().await.unwrap();
+        let url = format!("ws://{addr}/scp/v1");
+
+        let sourced = SourcedRelayUrl {
+            url,
+            source: RelayUrlSource::DhtResolved,
+        };
+
+        let adapter =
+            NativeRelayAdapter::connect_sourced(&sourced, Some(&TransportProfile::Mobile))
+                .await
+                .unwrap();
+
+        assert!(
+            adapter.has_heartbeat_monitor(),
+            "Mobile profile should have a heartbeat monitor (with 120s interval)"
+        );
     }
 
     /// Verifies that `Drop` cancels the heartbeat monitoring task.

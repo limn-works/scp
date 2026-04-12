@@ -54,8 +54,8 @@ pub struct StoredAttestation {
 ///
 /// Holds per-context shadow registries, the sender key store,
 /// platform identity attestations, webhook event deduplication,
-/// and emitted messages, protected by async `RwLock`s for
-/// concurrent handler access.
+/// emitted messages, and the outbound webhook dispatcher, protected
+/// by async `RwLock`s for concurrent handler access.
 #[derive(Debug)]
 pub struct BridgeState {
     /// Per-context shadow registries, keyed by context ID.
@@ -78,6 +78,10 @@ pub struct BridgeState {
 
     /// Monotonically increasing sequence counter for emitted messages.
     pub message_sequence: RwLock<u64>,
+
+    /// Outbound webhook dispatcher for delivering context events
+    /// to registered bridge webhook endpoints (spec §12.2.1).
+    pub webhook_dispatcher: crate::webhook::WebhookDispatcher,
 }
 
 /// A stored emitted message for tracking purposes.
@@ -109,6 +113,7 @@ impl BridgeState {
             processed_event_ids: RwLock::new(HashSet::new()),
             messages: RwLock::new(Vec::new()),
             message_sequence: RwLock::new(0),
+            webhook_dispatcher: crate::webhook::WebhookDispatcher::new(),
         }
     }
 }
@@ -771,12 +776,20 @@ fn webhook_reject(event_id: String, reason: &str) -> axum::response::Response {
 
 /// Processes a single webhook event, returning `Some(response)` if the
 /// event should be rejected, or `None` if processing succeeded.
+///
+/// On success, dispatches the event to any registered outbound webhook
+/// targets via [`WebhookDispatcher`](crate::webhook::WebhookDispatcher).
 async fn process_webhook_event(
     bridge_state: &BridgeState,
     event_type: &str,
     event_id: &str,
     payload: &serde_json::Value,
 ) -> Option<String> {
+    // Derive the context ID for outbound dispatch. For message events the
+    // shadow registry tells us which context the shadow belongs to; for
+    // other event types we look for a `context_id` field in the payload.
+    let mut dispatch_context_id: Option<String> = None;
+
     match event_type {
         "message" => {
             let shadow_id = extract_shadow_id(payload);
@@ -784,26 +797,41 @@ async fn process_webhook_event(
                 return Some("payload.shadow_id is required for message events".to_owned());
             }
             let registries = bridge_state.registries.read().await;
-            let exists = find_shadow(&registries, shadow_id).is_some();
+            let shadow_info = find_shadow(&registries, shadow_id);
             drop(registries);
-            if !exists {
-                return Some("shadow not found".to_owned());
+            match shadow_info {
+                Some((ctx_id, _)) => {
+                    dispatch_context_id = Some(ctx_id);
+                }
+                None => {
+                    return Some("shadow not found".to_owned());
+                }
             }
         }
         "identity_update" => {
             let shadow_id = extract_shadow_id(payload);
             if !shadow_id.is_empty() {
                 let registries = bridge_state.registries.read().await;
-                let exists = find_shadow(&registries, shadow_id).is_some();
+                let shadow_info = find_shadow(&registries, shadow_id);
                 drop(registries);
-                if !exists {
-                    return Some("shadow not found for identity_update".to_owned());
+                match shadow_info {
+                    Some((ctx_id, _)) => {
+                        dispatch_context_id = Some(ctx_id);
+                    }
+                    None => {
+                        return Some("shadow not found for identity_update".to_owned());
+                    }
                 }
             }
         }
         "user_departed" => {
             let shadow_id = extract_shadow_id(payload);
             if !shadow_id.is_empty() {
+                // Look up context before deleting the shadow.
+                let registries = bridge_state.registries.read().await;
+                dispatch_context_id = find_shadow(&registries, shadow_id).map(|(ctx_id, _)| ctx_id);
+                drop(registries);
+
                 bridge_state
                     .deleted_shadows
                     .write()
@@ -813,8 +841,22 @@ async fn process_webhook_event(
         }
         // presence, message_edit, message_delete are accepted but
         // don't require specific state changes in the current impl.
-        _ => {}
+        _ => {
+            // Attempt to extract context_id from payload for dispatch.
+            if let Some(ctx) = payload.get("context_id").and_then(|v| v.as_str()) {
+                dispatch_context_id = Some(ctx.to_owned());
+            }
+        }
     }
+
+    // Dispatch outbound webhook for processed events.
+    if let Some(ctx_id) = dispatch_context_id {
+        bridge_state
+            .webhook_dispatcher
+            .dispatch_event(&ctx_id, event_type, payload.clone())
+            .await;
+    }
+
     let _ = event_id; // used by callers for dedup tracking
     None
 }

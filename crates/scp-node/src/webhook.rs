@@ -4,10 +4,13 @@
 //! action), registered bridges with `webhook_url` receive HTTP POST
 //! notifications with Ed25519 signatures.
 
+use std::collections::HashMap;
+use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use ed25519_dalek::{Signer, SigningKey};
 use serde::Serialize;
+use tokio::sync::RwLock;
 
 /// Maximum number of retry attempts for failed webhook deliveries.
 const MAX_RETRIES: u32 = 3;
@@ -271,6 +274,157 @@ fn check_ip_blocked(ip: std::net::IpAddr) -> Option<String> {
     }
 }
 
+// ---------------------------------------------------------------------------
+// WebhookDispatcher — outbound event dispatch to registered webhook targets
+// ---------------------------------------------------------------------------
+
+/// A registered webhook target: URL + Ed25519 signing key + context scope.
+#[derive(Debug, Clone)]
+pub struct WebhookTarget {
+    /// Webhook delivery URL (must be HTTPS).
+    pub url: String,
+    /// Ed25519 signing key for webhook signatures.
+    pub signing_key: SigningKey,
+    /// Context IDs this target is subscribed to.
+    /// Empty means subscribed to all contexts on this node.
+    pub context_ids: Vec<String>,
+}
+
+/// Manages registered webhook targets and dispatches context events to them.
+///
+/// When a context event occurs (message received, member joined/left,
+/// governance action), the dispatcher fans out to all registered targets
+/// whose `context_ids` include the event's context or that are subscribed
+/// to all contexts (empty `context_ids`).
+///
+/// Thread-safe: the internal registry is protected by an async `RwLock`.
+#[derive(Debug)]
+pub struct WebhookDispatcher {
+    /// Registered targets, keyed by a unique target ID (e.g., `bridge_id`).
+    targets: RwLock<HashMap<String, WebhookTarget>>,
+}
+
+impl WebhookDispatcher {
+    /// Creates a new empty dispatcher.
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            targets: RwLock::new(HashMap::new()),
+        }
+    }
+
+    /// Registers a webhook target.
+    ///
+    /// If a target with the same `target_id` already exists, it is replaced.
+    pub async fn register(&self, target_id: String, target: WebhookTarget) {
+        self.targets.write().await.insert(target_id, target);
+    }
+
+    /// Removes a webhook target by ID.
+    ///
+    /// Returns `true` if a target was removed, `false` if no target with
+    /// that ID was registered.
+    pub async fn deregister(&self, target_id: &str) -> bool {
+        self.targets.write().await.remove(target_id).is_some()
+    }
+
+    /// Dispatches a context event to all registered targets that match
+    /// the given `context_id`.
+    ///
+    /// A target matches if its `context_ids` list contains `context_id`
+    /// or if its `context_ids` list is empty (subscribed to all contexts).
+    ///
+    /// Dispatches are performed concurrently. Results are logged but not
+    /// returned — webhook delivery is best-effort.
+    pub async fn dispatch_event(
+        &self,
+        context_id: &str,
+        event_type: &str,
+        payload: serde_json::Value,
+    ) {
+        let event_id = format!(
+            "evt-{}-{}",
+            context_id.get(..8).unwrap_or(context_id),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0),
+        );
+
+        let timestamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+
+        let event = WebhookEvent {
+            event_id,
+            event_type: event_type.to_owned(),
+            context_id: context_id.to_owned(),
+            timestamp,
+            payload,
+        };
+
+        // Snapshot matching targets under the read lock, then release it
+        // before doing any async I/O.
+        let matching: Vec<(String, WebhookTarget)> = {
+            let targets = self.targets.read().await;
+            targets
+                .iter()
+                .filter(|(_, t)| {
+                    t.context_ids.is_empty() || t.context_ids.iter().any(|c| c == context_id)
+                })
+                .map(|(id, t)| (id.clone(), t.clone()))
+                .collect()
+        };
+
+        if matching.is_empty() {
+            return;
+        }
+
+        // Fan out dispatches concurrently.
+        let event = Arc::new(event);
+        let mut handles = Vec::with_capacity(matching.len());
+        for (target_id, target) in matching {
+            let event = Arc::clone(&event);
+            handles.push(tokio::spawn(async move {
+                let result = dispatch_webhook(&target.url, &event, &target.signing_key).await;
+                if result.success {
+                    tracing::debug!(
+                        target_id = %target_id,
+                        url = %target.url,
+                        attempts = result.attempts,
+                        "webhook dispatched successfully"
+                    );
+                } else {
+                    tracing::warn!(
+                        target_id = %target_id,
+                        url = %target.url,
+                        error = ?result.error,
+                        attempts = result.attempts,
+                        "webhook dispatch failed"
+                    );
+                }
+            }));
+        }
+
+        // Await all dispatches (best-effort, ignore join errors).
+        for handle in handles {
+            let _ = handle.await;
+        }
+    }
+
+    /// Returns the number of registered targets.
+    pub async fn target_count(&self) -> usize {
+        self.targets.read().await.len()
+    }
+}
+
+impl Default for WebhookDispatcher {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
@@ -516,5 +670,89 @@ mod tests {
             result.is_some_and(|e| e.contains("unspecified")),
             ":: (unspecified IPv6) should be rejected"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // WebhookDispatcher tests
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn dispatcher_register_and_deregister() {
+        let dispatcher = WebhookDispatcher::new();
+        assert_eq!(dispatcher.target_count().await, 0);
+
+        let key = SigningKey::from_bytes(&[10u8; 32]);
+        dispatcher
+            .register(
+                "bridge-1".to_owned(),
+                WebhookTarget {
+                    url: "https://hooks.example.com/a".to_owned(),
+                    signing_key: key,
+                    context_ids: vec!["ctx-1".to_owned()],
+                },
+            )
+            .await;
+        assert_eq!(dispatcher.target_count().await, 1);
+
+        assert!(dispatcher.deregister("bridge-1").await);
+        assert_eq!(dispatcher.target_count().await, 0);
+        assert!(!dispatcher.deregister("bridge-1").await);
+    }
+
+    #[tokio::test]
+    async fn dispatcher_dispatch_no_targets_is_noop() {
+        let dispatcher = WebhookDispatcher::new();
+        // Should not panic or hang.
+        dispatcher
+            .dispatch_event("ctx-1", "message.received", serde_json::json!({}))
+            .await;
+    }
+
+    #[tokio::test]
+    async fn dispatcher_filters_by_context_id() {
+        let dispatcher = WebhookDispatcher::new();
+        let key = SigningKey::from_bytes(&[11u8; 32]);
+
+        // Register target for ctx-2 only.
+        dispatcher
+            .register(
+                "bridge-scoped".to_owned(),
+                WebhookTarget {
+                    url: "https://hooks.example.com/scoped".to_owned(),
+                    signing_key: key.clone(),
+                    context_ids: vec!["ctx-2".to_owned()],
+                },
+            )
+            .await;
+
+        // Register target for all contexts (empty context_ids).
+        dispatcher
+            .register(
+                "bridge-all".to_owned(),
+                WebhookTarget {
+                    url: "https://hooks.example.com/all".to_owned(),
+                    signing_key: key,
+                    context_ids: vec![],
+                },
+            )
+            .await;
+
+        // Dispatching to ctx-1 should only match bridge-all (bridge-scoped
+        // is for ctx-2). The actual HTTP calls will fail (no server), but
+        // the dispatch function handles errors gracefully.
+        dispatcher
+            .dispatch_event("ctx-1", "message.received", serde_json::json!({}))
+            .await;
+
+        // Dispatching to ctx-2 should match both.
+        dispatcher
+            .dispatch_event("ctx-2", "member.joined", serde_json::json!({}))
+            .await;
+    }
+
+    #[tokio::test]
+    async fn dispatcher_default_is_empty() {
+        let dispatcher = WebhookDispatcher::default();
+        assert_eq!(dispatcher.target_count().await, 0);
     }
 }
