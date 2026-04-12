@@ -218,6 +218,9 @@ pub struct AttestResponse {
 /// Default attestation TTL: 24 hours in seconds.
 const ATTESTATION_TTL_SECS: u64 = 86_400;
 
+/// Maximum size of the processed webhook event ID dedup set (BLACK-302).
+const MAX_PROCESSED_EVENT_IDS: usize = 10_000;
+
 // ---------------------------------------------------------------------------
 // Message endpoint types (SCP-BCH-003)
 // ---------------------------------------------------------------------------
@@ -909,11 +912,23 @@ async fn webhook_handler(
         return webhook_reject(body.event_id, &reason);
     }
 
-    bridge_state
-        .processed_event_ids
-        .write()
-        .await
-        .insert(body.event_id.clone());
+    {
+        let mut processed = bridge_state.processed_event_ids.write().await;
+        processed.insert(body.event_id.clone());
+        // Cap dedup set to prevent unbounded memory growth (BLACK-302).
+        if processed.len() > MAX_PROCESSED_EVENT_IDS {
+            // Evict approximately half the set. HashSet has no LRU, so
+            // we drain arbitrarily — dedup is best-effort anyway.
+            let to_remove: Vec<String> = processed
+                .iter()
+                .take(processed.len() / 2)
+                .cloned()
+                .collect();
+            for id in to_remove {
+                processed.remove(&id);
+            }
+        }
+    }
 
     (
         StatusCode::OK,

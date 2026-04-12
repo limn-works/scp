@@ -115,6 +115,10 @@ pub struct NativeRelayAdapter {
     /// Heartbeat monitor for relay suppression detection (spec §9.9.2).
     /// `None` when no `TransportProfile` was provided at connection time.
     heartbeat_monitor: Option<Arc<tokio::sync::Mutex<HeartbeatMonitor>>>,
+    /// Channel for suppression events detected by the heartbeat monitor.
+    /// Callers should drain this receiver to observe suppression alerts
+    /// (spec §9.9.4: "The SDK MUST NOT silently discard the suspicion").
+    suppression_rx: Option<tokio::sync::mpsc::Receiver<crate::heartbeat::SuppressionSuspected>>,
 }
 
 impl std::fmt::Debug for NativeRelayAdapter {
@@ -211,12 +215,14 @@ impl NativeRelayAdapter {
         relay_url: &str,
     ) -> Self {
         let heartbeat_cancel = CancellationToken::new();
-        let heartbeat_monitor = Self::maybe_start_heartbeat(profile, relay_url, &heartbeat_cancel);
+        let (heartbeat_monitor, suppression_rx) =
+            Self::maybe_start_heartbeat(profile, relay_url, &heartbeat_cancel);
         let adapter = Self {
             client,
             cover_traffic_cancel: CancellationToken::new(),
             heartbeat_cancel,
             heartbeat_monitor,
+            suppression_rx,
         };
         if let Some(profile) = profile {
             let config = CoverTrafficConfig::from_profile(*profile);
@@ -237,15 +243,20 @@ impl NativeRelayAdapter {
     /// - **Mobile**: 120s — reduced frequency to conserve battery.
     /// - **Constrained**: no heartbeat — poll-based devices skip monitoring.
     ///
-    /// Returns `Some(Arc<Mutex<HeartbeatMonitor>>)` when monitoring is
-    /// started, `None` otherwise.
+    /// Returns `(Some(monitor), Some(suppression_rx))` when monitoring is
+    /// started, `(None, None)` otherwise.
     fn maybe_start_heartbeat(
         profile: Option<&TransportProfile>,
         relay_url: &str,
         cancel: &CancellationToken,
-    ) -> Option<Arc<tokio::sync::Mutex<HeartbeatMonitor>>> {
+    ) -> (
+        Option<Arc<tokio::sync::Mutex<HeartbeatMonitor>>>,
+        Option<tokio::sync::mpsc::Receiver<crate::heartbeat::SuppressionSuspected>>,
+    ) {
         // Only create heartbeat monitoring when a profile is provided.
-        let profile = profile?;
+        let Some(profile) = profile else {
+            return (None, None);
+        };
 
         // Derive heartbeat config from the transport profile.
         let heartbeat_config = match profile {
@@ -257,14 +268,18 @@ impl NativeRelayAdapter {
                 ..HeartbeatConfig::default()
             },
             // Constrained devices: no heartbeat monitoring (poll-based).
-            TransportProfile::Constrained => return None,
+            TransportProfile::Constrained => return (None, None),
         };
         if !heartbeat_config.enabled {
-            return None;
+            return (None, None);
         }
 
         let monitor = HeartbeatMonitor::new(heartbeat_config.clone(), relay_url.to_owned());
         let monitor = Arc::new(tokio::sync::Mutex::new(monitor));
+
+        // Channel for suppression events — callers MUST drain this receiver
+        // to observe suppression alerts (spec §9.9.4).
+        let (suppression_tx, suppression_rx) = tokio::sync::mpsc::channel(16);
 
         // Spawn heartbeat check loop.
         let cancel = cancel.clone();
@@ -305,13 +320,30 @@ impl NativeRelayAdapter {
                                 gap_secs = suppression.gap_duration.as_secs(),
                                 "suppression suspected — no messages received from relay"
                             );
+                            // Send suppression event to the channel (spec §9.9.4:
+                            // "The SDK MUST NOT silently discard the suspicion").
+                            let _ = suppression_tx.try_send(suppression);
                         }
                     }
                 }
             }
         });
 
-        Some(monitor)
+        (Some(monitor), Some(suppression_rx))
+    }
+
+    /// Returns a mutable reference to the suppression event receiver.
+    ///
+    /// Callers should poll this receiver to observe suppression alerts from the
+    /// heartbeat monitor. Per spec §9.9.4, the SDK MUST NOT silently discard
+    /// suppression suspicions — they must be surfaced to the application layer.
+    ///
+    /// Returns `None` if heartbeat monitoring is not active (no profile or
+    /// constrained profile).
+    pub const fn suppression_events(
+        &mut self,
+    ) -> Option<&mut tokio::sync::mpsc::Receiver<crate::heartbeat::SuppressionSuspected>> {
+        self.suppression_rx.as_mut()
     }
 
     /// Records that a heartbeat was received from the relay.

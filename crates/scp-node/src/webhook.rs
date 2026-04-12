@@ -337,11 +337,25 @@ impl WebhookDispatcher {
         }
     }
 
+    /// Maximum number of registered webhook targets (BLACK-302).
+    const MAX_TARGETS: usize = 256;
+
     /// Registers a webhook target.
     ///
     /// If a target with the same `target_id` already exists, it is replaced.
-    pub async fn register(&self, target_id: String, target: WebhookTarget) {
-        self.targets.write().await.insert(target_id, target);
+    /// Rejects registration if the target limit is reached (returns `false`).
+    pub async fn register(&self, target_id: String, target: WebhookTarget) -> bool {
+        let mut targets = self.targets.write().await;
+        if targets.len() >= Self::MAX_TARGETS && !targets.contains_key(&target_id) {
+            tracing::warn!(
+                target_id,
+                "webhook target registration rejected: limit of {} reached",
+                Self::MAX_TARGETS,
+            );
+            return false;
+        }
+        targets.insert(target_id, target);
+        true
     }
 
     /// Removes a webhook target by ID.
