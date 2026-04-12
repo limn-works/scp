@@ -462,7 +462,11 @@ fn spawn_suppression_scoring_task(
     mut rx: tokio::sync::mpsc::Receiver<scp_transport::heartbeat::SuppressionSuspected>,
     relay_url: String,
 ) {
-    tokio::spawn(async move {
+    // Use crate::runtime() to get the tokio Runtime handle, then spawn on it.
+    // We cannot use bare `tokio::spawn` because PyO3 functions run outside
+    // the tokio runtime context (they use block_on for individual calls).
+    let Ok(rt) = crate::runtime() else { return };
+    rt.spawn(async move {
         while let Some(_suppression) = rx.recv().await {
             tracing::debug!(
                 relay_url = %relay_url,
