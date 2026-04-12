@@ -75,7 +75,6 @@ use scp_identity::{DidDocument, ScpIdentity};
 use scp_platform::encrypting_adapter::EncryptingAdapter;
 use scp_platform::testing::InMemoryStorage;
 use scp_primitives::Clock;
-use scp_transport::native::adapter::NativeRelayAdapter;
 use tokio::sync::mpsc;
 use zeroize::Zeroizing;
 
@@ -1032,7 +1031,7 @@ pub fn remove_identity(did: &str) {
 /// replace it when platform storage adapters land.
 ///
 /// Uses the same `OnceLock` pattern as `FFI_BRIDGE_STATE` and
-/// `RELAY_CONNECTION`. The `Arc` enables shared ownership across bridge
+/// `TRANSPORT_MANAGER`. The `Arc` enables shared ownership across bridge
 /// functions without lifetime issues.
 ///
 /// See spec section 17.3 for key conventions and section 17.4 for
@@ -1095,67 +1094,121 @@ pub fn get_storage() -> Result<&'static Arc<EncryptingAdapter<InMemoryStorage>>,
 // Relay connection state (SCP-213: transport wiring)
 // ---------------------------------------------------------------------------
 
-/// Global relay connection for context discovery probing.
+/// Global transport manager for multi-relay support.
 ///
-/// Set by [`set_relay_connection`] when `py_transport_connect` succeeds.
-/// Read by `py_mcp_load_contexts` to probe routing IDs on the relay.
-/// Uses `RwLock` for infrequent writes (connect) and concurrent reads (probe).
+/// Stores the real [`scp_transport::TransportManager`] with multi-relay
+/// fanout, per-context relay set assignment, suppression detection, and
+/// reliability scoring.
+///
+/// Initialized by [`set_transport_manager`] when `py_transport_connect`
+/// succeeds. Read by `py_mcp_load_contexts` to probe routing IDs on
+/// relays. Uses `RwLock` for infrequent writes (connect) and concurrent
+/// reads (probe/query).
 ///
 /// # Safety: Single-Tenant Only
 ///
 /// This registry is process-global. See module-level documentation.
-static RELAY_CONNECTION: OnceLock<RwLock<Option<Arc<NativeRelayAdapter>>>> = OnceLock::new();
+static TRANSPORT_MANAGER: OnceLock<RwLock<Option<scp_transport::TransportManager>>> =
+    OnceLock::new();
 
-/// Returns a reference to the global relay connection state.
-fn relay_state() -> &'static RwLock<Option<Arc<NativeRelayAdapter>>> {
-    RELAY_CONNECTION.get_or_init(|| RwLock::new(None))
+/// Returns a reference to the global transport manager state.
+fn transport_state() -> &'static RwLock<Option<scp_transport::TransportManager>> {
+    TRANSPORT_MANAGER.get_or_init(|| RwLock::new(None))
 }
 
-/// Stores a relay adapter connection for use by context discovery.
-///
-/// Called by `py_transport_connect` after a successful connection. The
-/// adapter is wrapped in `Arc` for shared ownership between the transport
-/// module and the discovery path in `py_mcp_load_contexts`.
+/// Stores a new `TransportManager` (called by `py_transport_connect`).
 ///
 /// # Errors
 ///
-/// Returns `ScpPyError::TransportError` if the relay state lock is poisoned.
-pub fn set_relay_connection(adapter: Arc<NativeRelayAdapter>) -> Result<(), ScpPyError> {
-    *relay_state().write().map_err(|_| {
-        ScpPyError::transport("relay connection state lock is poisoned".to_owned())
-    })? = Some(adapter);
+/// Returns `ScpPyError::TransportError` if the transport manager lock is
+/// poisoned.
+pub fn set_transport_manager(manager: scp_transport::TransportManager) -> Result<(), ScpPyError> {
+    let mut guard = transport_state()
+        .write()
+        .map_err(|_| ScpPyError::transport("transport manager lock poisoned".to_owned()))?;
+    *guard = Some(manager);
     Ok(())
 }
 
-/// Returns the current relay adapter connection, if one is active.
+/// Executes a closure with a read reference to the `TransportManager`.
 ///
-/// Used by `py_mcp_load_contexts` to probe routing IDs. Returns `None`
-/// if `py_transport_connect` has not been called or the connection was
-/// cleared.
+/// Used by callers that need to query, probe, or inspect the manager
+/// without mutating it.
 ///
 /// # Errors
 ///
-/// Returns `ScpPyError::TransportError` if the relay state lock is poisoned.
-pub fn get_relay_connection() -> Result<Option<Arc<NativeRelayAdapter>>, ScpPyError> {
-    let guard = relay_state()
+/// Returns `ScpPyError::TransportError` if the lock is poisoned or no
+/// transport manager has been initialized.
+pub fn with_transport_manager<T>(
+    f: impl FnOnce(&scp_transport::TransportManager) -> Result<T, ScpPyError>,
+) -> Result<T, ScpPyError> {
+    let guard = transport_state()
         .read()
-        .map_err(|_| ScpPyError::transport("relay connection state lock is poisoned".to_owned()))?;
-    Ok(guard.clone())
+        .map_err(|_| ScpPyError::transport("transport manager lock poisoned".to_owned()))?;
+    let manager = guard.as_ref().ok_or_else(|| {
+        ScpPyError::transport("no transport manager — call transport_connect first".to_owned())
+    })?;
+    f(manager)
 }
 
-/// Clears the active relay connection.
+/// Executes a closure with a mutable reference to the `TransportManager`.
 ///
-/// Called when the transport is disconnected. After this, relay-based
-/// context discovery in `py_mcp_load_contexts` will fall back to
-/// local-only mode.
+/// Used by callers that need to add adapters or modify relay assignments.
 ///
 /// # Errors
 ///
-/// Returns `ScpPyError::TransportError` if the relay state lock is poisoned.
-pub fn clear_relay_connection() -> Result<(), ScpPyError> {
-    *relay_state().write().map_err(|_| {
-        ScpPyError::transport("relay connection state lock is poisoned".to_owned())
-    })? = None;
+/// Returns `ScpPyError::TransportError` if the lock is poisoned or no
+/// transport manager has been initialized.
+pub fn with_transport_manager_mut<T>(
+    f: impl FnOnce(&mut scp_transport::TransportManager) -> Result<T, ScpPyError>,
+) -> Result<T, ScpPyError> {
+    let mut guard = transport_state()
+        .write()
+        .map_err(|_| ScpPyError::transport("transport manager lock poisoned".to_owned()))?;
+    let manager = guard.as_mut().ok_or_else(|| {
+        ScpPyError::transport("no transport manager — call transport_connect first".to_owned())
+    })?;
+    f(manager)
+}
+
+/// Returns `true` if a transport manager has been initialized.
+pub fn has_transport_manager() -> bool {
+    TRANSPORT_MANAGER
+        .get()
+        .and_then(|lock| lock.read().ok())
+        .is_some_and(|guard| guard.is_some())
+}
+
+/// Records a heartbeat suppression event for a relay, downgrading its
+/// reliability score.
+///
+/// Called from the background task spawned by `transport_add_relay` /
+/// `transport_connect` that drains the per-adapter suppression receiver
+/// (#1533 AC5). Silently no-ops if the transport manager has been cleared
+/// (e.g., after disconnect).
+pub fn record_suppression(relay_url: &str) {
+    let Ok(guard) = transport_state().read() else {
+        return;
+    };
+    if let Some(manager) = guard.as_ref() {
+        manager.update_score(relay_url, scp_transport::scoring::DeliveryOutcome::Failure);
+    }
+}
+
+/// Clears the transport manager (called by `py_transport_disconnect`).
+///
+/// After this, relay-based context discovery in `py_mcp_load_contexts`
+/// will fall back to local-only mode.
+///
+/// # Errors
+///
+/// Returns `ScpPyError::TransportError` if the transport manager lock is
+/// poisoned.
+pub fn clear_transport_manager() -> Result<(), ScpPyError> {
+    let mut guard = transport_state()
+        .write()
+        .map_err(|_| ScpPyError::transport("transport manager lock poisoned".to_owned()))?;
+    *guard = None;
     Ok(())
 }
 
@@ -1240,23 +1293,16 @@ pub struct RegistryStats {
 /// Returns current entry counts for all global registries.
 ///
 /// Intended for monitoring and debugging in long-running processes.
-/// All reads are lock-free (`DashMap`) or brief (`RwLock` on relay state).
-///
-/// # Errors
-///
-/// Returns `ScpPyError::TransportError` if the relay state lock is poisoned.
-pub fn registry_stats() -> Result<RegistryStats, ScpPyError> {
-    let relay_connected = relay_state()
-        .read()
-        .map_err(|_| ScpPyError::transport("relay connection state lock is poisoned".to_owned()))?
-        .is_some();
-
-    Ok(RegistryStats {
+/// All reads are lock-free (`DashMap`) or brief (`RwLock` on transport
+/// state).
+#[must_use]
+pub fn registry_stats() -> RegistryStats {
+    RegistryStats {
         contexts: ffi_state_registry().len(),
         known_contexts: known_contexts_registry().len(),
         identities: identity_registry().len(),
-        relay_connected,
-    })
+        relay_connected: has_transport_manager(),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1418,7 +1464,7 @@ mod tests {
         let creator = "did:dht:z6MkStatsTest";
 
         register_context(&ctx_id, creator, &[]).unwrap();
-        let stats = registry_stats().unwrap();
+        let stats = registry_stats();
 
         // Verify that stats reports at least 1 context (our registered one).
         // Cannot assert exact counts due to parallel test interference.
@@ -1461,7 +1507,7 @@ mod tests {
             identity_link_attestations: Vec::new(),
         };
         register_identity(did, entry);
-        let stats = registry_stats().unwrap();
+        let stats = registry_stats();
 
         assert!(
             stats.identities >= 1,
@@ -1491,7 +1537,7 @@ mod tests {
         };
 
         register_known_context(&ctx_id, known);
-        let stats = registry_stats().unwrap();
+        let stats = registry_stats();
 
         assert!(
             stats.known_contexts >= 1,
@@ -1541,7 +1587,7 @@ mod tests {
     #[test]
     fn registry_stats_returns_all_fields() {
         // Verifies the struct shape and that registry_stats() doesn't panic.
-        let stats = registry_stats().unwrap();
+        let stats = registry_stats();
         // Destructure to catch struct changes at compile time. If a field is
         // added or removed, this will fail to compile.
         let RegistryStats {

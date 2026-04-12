@@ -1866,7 +1866,6 @@ pub fn py_mcp_load_contexts(
 fn probe_relay_for_known_contexts(
     known: &[(String, crate::runtime::KnownContext)],
 ) -> std::collections::HashSet<String> {
-    use scp_transport::TransportAdapter;
     use scp_transport::traits::RoutingId;
 
     let mut active = std::collections::HashSet::new();
@@ -1875,25 +1874,25 @@ fn probe_relay_for_known_contexts(
         return active;
     }
 
-    // Get the relay adapter. If none is connected, return empty set.
-    let Ok(Some(adapter)) = crate::runtime::get_relay_connection() else {
+    // Check if a transport manager is available. If not, return empty set.
+    if !crate::runtime::has_transport_manager() {
         return active;
-    };
+    }
 
     // Get the tokio runtime for blocking on async queries.
     let Ok(rt) = crate::runtime() else {
         return active;
     };
 
-    // Probe each known context's routing ID on the relay.
+    // Probe each known context's routing ID on the relay via the
+    // TransportManager. Uses manager.query() which delegates to the
+    // first adapter (Phase 1 single-adapter mode).
     for (ctx_id, known_ctx) in known {
         let routing_id = RoutingId::new(known_ctx.routing_id);
-        let query_result = rt.block_on(async {
-            // Use query() from the TransportAdapter trait with limit-like
-            // behavior: we only need to know if any blobs exist. The QUERY
-            // message returns all matching blobs up to the default limit, but
-            // we only check if the result is non-empty.
-            adapter.query(&routing_id, None).await
+        let query_result = crate::runtime::with_transport_manager(|manager| {
+            rt.block_on(manager.query(&routing_id, None)).map_err(|e| {
+                crate::error::ScpPyError::transport(format!("relay probe failed: {e}"))
+            })
         });
 
         match query_result {
@@ -2153,11 +2152,11 @@ fn cleanup_stopped_servers() -> usize {
 ///
 /// # Errors
 ///
-/// Raises `TransportError` if the relay state lock is poisoned.
+/// Raises `PyErr` if building the result dict fails.
 #[pyfunction]
 #[pyo3(name = "py_registry_stats")]
 pub fn py_registry_stats(py: Python<'_>) -> PyResult<PyObject> {
-    let core_stats = crate::runtime::registry_stats()?;
+    let core_stats = crate::runtime::registry_stats();
     let mcp_stats = mcp_registry_stats();
 
     let dict = PyDict::new(py);
@@ -3227,7 +3226,7 @@ mod tests {
 
     #[test]
     fn core_registry_stats_includes_all_fields() {
-        let stats = crate::runtime::registry_stats().unwrap();
+        let stats = crate::runtime::registry_stats();
         // Just verify the struct has the expected fields and doesn't panic.
         let _ = stats.contexts;
         let _ = stats.known_contexts;

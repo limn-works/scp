@@ -29,6 +29,7 @@
 use std::collections::HashMap;
 
 use napi_derive::napi;
+#[cfg(feature = "allow_in_memory_custody")]
 use scp_core::crypto::ucan::mint::{MintParams, mint_ucan};
 use scp_ffi_common::validate::{validate_capability_uri, validate_did, validate_ucan_token};
 
@@ -45,8 +46,10 @@ use scp_ffi_common::{
 };
 
 use crate::context::NapiContextHandle;
+use crate::decrement_handle_count;
 use crate::error::ScpNapiError;
-use crate::{decrement_handle_count, increment_handle_count};
+#[cfg(feature = "allow_in_memory_custody")]
+use crate::increment_handle_count;
 
 // ---------------------------------------------------------------------------
 // NapiUcanTokenData — UCAN token metadata record
@@ -313,6 +316,7 @@ pub async fn ucan_validate(
 /// - Rejects with `SCP-PERM-3023` if signing or token construction fails.
 #[napi]
 #[allow(clippy::needless_pass_by_value)] // napi-rs requires owned String/Vec/Option<Vec>
+#[allow(clippy::unused_async)] // napi requires async for Promise return type
 pub async fn ucan_mint(
     handle: &NapiContextHandle,
     member_did: String,
@@ -330,10 +334,10 @@ pub async fn ucan_mint(
     #[cfg(not(feature = "allow_in_memory_custody"))]
     {
         let _ = (&handle, &member_did, &capabilities, &proofs);
-        return Err(napi::Error::from(ScpNapiError::Permission {
+        Err(napi::Error::from(ScpNapiError::Permission {
             message: "UCAN minting requires key custody -- the in_memory custody path                       is not available in this build. Enable allow_in_memory_custody                       for dev/desktop use.".to_owned(),
             code: "SCP-PERM-3023".to_owned(),
-        }));
+        }))
     }
 
     #[cfg(feature = "allow_in_memory_custody")]
@@ -478,13 +482,13 @@ pub async fn ucan_delegate(
             &parent_token,
             &capabilities,
         );
-        return Err(napi::Error::from(ScpNapiError::Permission {
+        Err(napi::Error::from(ScpNapiError::Permission {
             message: "UCAN delegation requires key custody -- the in_memory custody path \
                        is not available in this build. Enable allow_in_memory_custody \
                        for dev/desktop use."
                 .to_owned(),
             code: "SCP-PERM-3023".to_owned(),
-        }));
+        }))
     }
 
     #[cfg(feature = "allow_in_memory_custody")]

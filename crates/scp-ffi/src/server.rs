@@ -85,7 +85,7 @@ fn auto_wire_context_manager(
                 Box::new(crate::runtime::NoOpEventLogProvider);
             crate::runtime::init_context_manager_with(crypto, transport, event_log, None);
 
-            // Also populate the RELAY_CONNECTION global so that broadcast
+            // Also populate the TRANSPORT_MANAGER global so that broadcast
             // publish, context subscribe, and discovery probing work without
             // a separate `transport_connect` call. This requires a second
             // WebSocket connection because NativeRelayAdapter is not Clone
@@ -98,14 +98,15 @@ fn auto_wire_context_manager(
                 ))
             }) {
                 Ok(relay_adapter) => {
-                    let _ = crate::runtime::set_relay_connection(Arc::new(relay_adapter));
+                    let manager = scp_transport::TransportManager::new(Box::new(relay_adapter));
+                    let _ = crate::runtime::set_transport_manager(manager);
                 }
                 Err(e) => {
                     tracing::warn!(
                         error = %e,
                         relay_url = %relay_url,
                         "auto_wire_context_manager: ContextManager wired but failed to \
-                         populate RELAY_CONNECTION — broadcast publish and discovery may \
+                         populate TRANSPORT_MANAGER — broadcast publish and discovery may \
                          require a manual transport_connect call"
                     );
                 }
@@ -868,10 +869,10 @@ mod tests {
     }
 
     /// Verifies that auto-wiring a node's relay populates the global
-    /// `RELAY_CONNECTION` so that broadcast publish, context subscribe,
+    /// `TRANSPORT_MANAGER` so that broadcast publish, context subscribe,
     /// and discovery probing work without a separate `transport_connect`.
     #[test]
-    fn auto_wire_populates_relay_connection_global() {
+    fn auto_wire_populates_transport_manager_global() {
         use scp_transport::relay::connection::{RelayUrlSource, SourcedRelayUrl};
 
         // Start a standalone relay to get a stable WebSocket endpoint.
@@ -887,19 +888,18 @@ mod tests {
         let adapter = rt()
             .block_on(NativeRelayAdapter::connect_sourced(&sourced, None))
             .expect("should connect to the relay");
-        crate::runtime::set_relay_connection(Arc::new(adapter))
-            .expect("should store adapter in global");
+        let manager = scp_transport::TransportManager::new(Box::new(adapter));
+        crate::runtime::set_transport_manager(manager)
+            .expect("should store transport manager in global");
 
         // Verify the global is populated.
-        let conn =
-            crate::runtime::get_relay_connection().expect("should read global without error");
         assert!(
-            conn.is_some(),
-            "RELAY_CONNECTION should be populated after auto-wire"
+            crate::runtime::has_transport_manager(),
+            "TRANSPORT_MANAGER should be populated after auto-wire"
         );
 
         // Clean up.
-        crate::runtime::clear_relay_connection().ok();
+        crate::runtime::clear_transport_manager().ok();
         relay.shutdown();
     }
 }

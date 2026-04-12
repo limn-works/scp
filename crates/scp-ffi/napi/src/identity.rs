@@ -35,20 +35,23 @@
 //!
 //! See ADR-022 in `.docs/adrs/phase-4.md` and ADR-039.
 
-use std::fmt;
 use std::sync::Arc;
 
 use napi::Error as NapiError;
 use napi_derive::napi;
+#[cfg(feature = "allow_in_memory_custody")]
+use scp_identity::{DhtClient, IdentityError};
 use scp_identity::{
-    DhtClient, DidCache, DidDht, DidDocument, DidMethod, DualLayerResolver, IdentityError,
-    InMemoryDhtClient, NoOpRelayQuerier, ScpIdentity,
+    DidCache, DidDht, DidDocument, DidMethod, DualLayerResolver, InMemoryDhtClient,
+    NoOpRelayQuerier, ScpIdentity,
 };
 #[cfg(feature = "allow_in_memory_custody")]
 use scp_platform::testing::InMemoryKeyCustody;
 #[cfg(feature = "allow_in_memory_custody")]
 use scp_platform::traits::KeyCustody;
 use scp_primitives::Clock;
+#[cfg(feature = "allow_in_memory_custody")]
+use std::fmt;
 
 use crate::error::{ScpNapiError, validate_custody_type};
 use crate::{decrement_handle_count, increment_handle_count};
@@ -341,17 +344,18 @@ impl NapiIdentity {
     ///
     /// See §3.9 Key Lifecycle, ADR-003 DID Creation.
     #[napi]
+    #[allow(clippy::unused_async)] // napi requires async for Promise return type
     pub async fn rotate_key(&self) -> napi::Result<Self> {
         #[cfg(not(feature = "allow_in_memory_custody"))]
         {
             let _ = self;
-            return Err(ScpNapiError::Identity {
+            Err(ScpNapiError::Identity {
                 message: "key rotation requires in-memory custody -- \
                           enable allow_in_memory_custody"
                     .to_owned(),
                 code: "SCP-IDENT-1007".to_owned(),
             }
-            .into());
+            .into())
         }
         #[cfg(feature = "allow_in_memory_custody")]
         {
@@ -414,11 +418,12 @@ impl NapiIdentity {
     ///
     /// See ADR-039 acceptance criterion 4 and SCP-AB-016.
     #[napi(js_name = "addAgentKey")]
+    #[allow(clippy::unused_async)] // napi requires async for Promise return type
     pub async fn add_agent_key(&self) -> napi::Result<Self> {
         #[cfg(not(feature = "allow_in_memory_custody"))]
         {
             let _ = self;
-            return Err(ScpNapiError::Identity { message: "agent key operations require in-memory custody -- enable allow_in_memory_custody".to_owned(), code: "SCP-IDENT-1007".to_owned() }.into());
+            Err(ScpNapiError::Identity { message: "agent key operations require in-memory custody -- enable allow_in_memory_custody".to_owned(), code: "SCP-IDENT-1007".to_owned() }.into())
         }
         #[cfg(feature = "allow_in_memory_custody")]
         {
@@ -482,11 +487,12 @@ impl NapiIdentity {
     ///
     /// See ADR-039 acceptance criterion 4 and SCP-AB-016.
     #[napi(js_name = "rotateAgentKey")]
+    #[allow(clippy::unused_async)] // napi requires async for Promise return type
     pub async fn rotate_agent_key(&self) -> napi::Result<Self> {
         #[cfg(not(feature = "allow_in_memory_custody"))]
         {
             let _ = self;
-            return Err(ScpNapiError::Identity { message: "agent key operations require in-memory custody -- enable allow_in_memory_custody".to_owned(), code: "SCP-IDENT-1007".to_owned() }.into());
+            Err(ScpNapiError::Identity { message: "agent key operations require in-memory custody -- enable allow_in_memory_custody".to_owned(), code: "SCP-IDENT-1007".to_owned() }.into())
         }
         #[cfg(feature = "allow_in_memory_custody")]
         {
@@ -550,11 +556,12 @@ impl NapiIdentity {
     ///
     /// See ADR-039 acceptance criterion 4 and SCP-AB-016.
     #[napi(js_name = "removeAgentKey")]
+    #[allow(clippy::unused_async)] // napi requires async for Promise return type
     pub async fn remove_agent_key(&self) -> napi::Result<Self> {
         #[cfg(not(feature = "allow_in_memory_custody"))]
         {
             let _ = self;
-            return Err(ScpNapiError::Identity { message: "agent key operations require in-memory custody -- enable allow_in_memory_custody".to_owned(), code: "SCP-IDENT-1007".to_owned() }.into());
+            Err(ScpNapiError::Identity { message: "agent key operations require in-memory custody -- enable allow_in_memory_custody".to_owned(), code: "SCP-IDENT-1007".to_owned() }.into())
         }
         #[cfg(feature = "allow_in_memory_custody")]
         {
@@ -623,17 +630,18 @@ impl NapiIdentity {
     ///
     /// See ADR-003 acceptance criterion 4b, spec §9.12, and SCP-214 criterion 10.
     #[napi]
+    #[allow(clippy::unused_async)] // napi requires async for Promise return type
     pub async fn migrate(&self) -> napi::Result<Self> {
         #[cfg(not(feature = "allow_in_memory_custody"))]
         {
             let _ = self;
-            return Err(ScpNapiError::Identity {
+            Err(ScpNapiError::Identity {
                 message: "identity migration requires in-memory custody -- \
                           enable allow_in_memory_custody"
                     .to_owned(),
                 code: "SCP-IDENT-1007".to_owned(),
             }
-            .into());
+            .into())
         }
         #[cfg(feature = "allow_in_memory_custody")]
         {
@@ -885,6 +893,7 @@ pub struct NapiDIDDocument {
 /// testing, CLI, and desktop builds. NOT suitable for production mobile use —
 /// use `"platform"` custody on iOS/Android.
 #[napi]
+#[allow(clippy::unused_async)] // napi requires async for Promise return type
 pub async fn identity_create(custody: String) -> napi::Result<NapiIdentity> {
     validate_custody_type(&custody).map_err(NapiError::from)?;
 
@@ -989,6 +998,7 @@ pub async fn identity_create(custody: String) -> napi::Result<NapiIdentity> {
 ///
 /// See ADR-039 acceptance criterion 4 and SCP-AB-016.
 #[napi(js_name = "identityCreateWithAgentKey")]
+#[allow(clippy::unused_async)] // napi requires async for Promise return type
 pub async fn identity_create_with_agent_key(custody: String) -> napi::Result<NapiIdentity> {
     validate_custody_type(&custody).map_err(NapiError::from)?;
 

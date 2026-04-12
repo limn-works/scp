@@ -96,6 +96,18 @@ pub async fn dispatch_webhook(
         };
     }
 
+    dispatch_webhook_inner(url, event, signing_key, client).await
+}
+
+/// Inner dispatch logic shared between production (with URL validation) and
+/// test (without URL validation) paths. Signs the event body with the signing
+/// key and sends an HTTP POST with retry-with-backoff.
+async fn dispatch_webhook_inner(
+    url: &str,
+    event: &WebhookEvent,
+    signing_key: &SigningKey,
+    client: &reqwest::Client,
+) -> WebhookResult {
     let body = match serde_json::to_vec(event) {
         Ok(b) => b,
         Err(e) => {
@@ -134,9 +146,12 @@ pub async fn dispatch_webhook(
     let mut delay = INITIAL_RETRY_DELAY_MS;
 
     for attempt in 1..=MAX_RETRIES {
-        // SAFETY: URL was validated as HTTPS-only at the top of this function.
+        // SAFETY: In production, URL was validated as HTTPS-only by dispatch_webhook.
         // Assert here so CodeQL's data-flow analysis can verify.
-        debug_assert!(url.starts_with("https://"), "webhook URL must be HTTPS");
+        debug_assert!(
+            url.starts_with("https://") || cfg!(test),
+            "webhook URL must be HTTPS (relaxed in tests)"
+        );
         match client
             .post(url)
             .header("Content-Type", "application/json")
@@ -805,5 +820,150 @@ mod tests {
     async fn dispatcher_default_is_empty() {
         let dispatcher = WebhookDispatcher::default();
         assert_eq!(dispatcher.target_count().await, 0);
+    }
+
+    // -----------------------------------------------------------------------
+    // End-to-end webhook integration test (#1539 AC6)
+    // -----------------------------------------------------------------------
+
+    /// Captured HTTP request data from the local webhook server.
+    #[derive(Debug)]
+    struct CapturedWebhook {
+        content_type: Option<String>,
+        signature: Option<String>,
+        timestamp: Option<String>,
+        body: Vec<u8>,
+    }
+
+    /// Starts a local HTTP server that captures the first POST to `/webhook`
+    /// and sends it back via the returned oneshot receiver.
+    async fn start_webhook_server() -> (
+        std::net::SocketAddr,
+        tokio::sync::oneshot::Receiver<CapturedWebhook>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        use std::sync::Arc;
+
+        let (tx, rx) = tokio::sync::oneshot::channel::<CapturedWebhook>();
+        let tx = Arc::new(tokio::sync::Mutex::new(Some(tx)));
+
+        let handler_tx = Arc::clone(&tx);
+        let app = axum::Router::new().route(
+            "/webhook",
+            axum::routing::post(
+                move |headers: axum::http::HeaderMap, body: axum::body::Bytes| {
+                    let tx = Arc::clone(&handler_tx);
+                    async move {
+                        let captured = CapturedWebhook {
+                            content_type: headers
+                                .get("content-type")
+                                .map(|v| v.to_str().unwrap_or("").to_owned()),
+                            signature: headers
+                                .get("x-scp-signature")
+                                .map(|v| v.to_str().unwrap_or("").to_owned()),
+                            timestamp: headers
+                                .get("x-scp-timestamp")
+                                .map(|v| v.to_str().unwrap_or("").to_owned()),
+                            body: body.to_vec(),
+                        };
+                        let sender = tx.lock().await.take();
+                        if let Some(sender) = sender {
+                            let _ = sender.send(captured);
+                        }
+                        axum::http::StatusCode::OK
+                    }
+                },
+            ),
+        );
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        (addr, rx, handle)
+    }
+
+    /// Verifies that the captured request has valid headers, body, and
+    /// Ed25519 signature.
+    fn verify_webhook_request(
+        captured: &CapturedWebhook,
+        verifying_key: &ed25519_dalek::VerifyingKey,
+    ) {
+        use ed25519_dalek::Signature;
+
+        // 1. Content-Type
+        assert_eq!(
+            captured.content_type.as_deref(),
+            Some("application/json"),
+            "Content-Type header must be application/json"
+        );
+        // 2. X-SCP-Signature present and non-empty
+        let sig_hex = captured
+            .signature
+            .as_ref()
+            .expect("X-SCP-Signature must be present");
+        assert!(!sig_hex.is_empty(), "X-SCP-Signature must be non-empty");
+        // 3. X-SCP-Timestamp present and non-empty
+        let ts_str = captured
+            .timestamp
+            .as_ref()
+            .expect("X-SCP-Timestamp must be present");
+        assert!(!ts_str.is_empty(), "X-SCP-Timestamp must be non-empty");
+        let timestamp: u64 = ts_str.parse().expect("timestamp must be a valid u64");
+        // 4. Body is valid JSON with expected fields
+        let body_json: serde_json::Value =
+            serde_json::from_slice(&captured.body).expect("body must be valid JSON");
+        assert_eq!(body_json["event_type"], "message.received");
+        assert_eq!(body_json["context_id"], "ctx-integration-test");
+        assert_eq!(body_json["event_id"], "evt-integration-1");
+        assert_eq!(body_json["payload"]["sender"], "did:dht:test");
+        assert_eq!(body_json["payload"]["size"], 256);
+        // 5. Verify the Ed25519 signature
+        let sig_bytes = hex::decode(sig_hex).expect("signature must be valid hex");
+        let signature = Signature::from_slice(&sig_bytes).expect("signature must be 64 bytes");
+        let domain_separator = b"SCP-WEBHOOK-V1:";
+        let mut signing_payload =
+            Vec::with_capacity(domain_separator.len() + 8 + captured.body.len());
+        signing_payload.extend_from_slice(domain_separator);
+        signing_payload.extend_from_slice(&timestamp.to_be_bytes());
+        signing_payload.extend_from_slice(&captured.body);
+        verifying_key
+            .verify(&signing_payload, &signature)
+            .expect("Ed25519 signature must be valid");
+    }
+
+    /// Full HTTP roundtrip: local server receives POST with valid Ed25519
+    /// signature, correct headers, and structured JSON body (#1539 AC6).
+    #[tokio::test]
+    async fn webhook_integration_end_to_end() {
+        let (addr, rx, server_handle) = start_webhook_server().await;
+
+        let signing_key = SigningKey::from_bytes(&[42u8; 32]);
+        let verifying_key = signing_key.verifying_key();
+        let event = WebhookEvent {
+            event_id: "evt-integration-1".to_owned(),
+            event_type: "message.received".to_owned(),
+            context_id: "ctx-integration-test".to_owned(),
+            timestamp: 1_700_000_000,
+            payload: serde_json::json!({"sender": "did:dht:test", "size": 256}),
+        };
+
+        let url = format!("http://127.0.0.1:{}/webhook", addr.port());
+        let result = dispatch_webhook_inner(&url, &event, &signing_key, &test_client()).await;
+
+        assert!(
+            result.success,
+            "webhook dispatch should succeed: {:?}",
+            result.error
+        );
+        assert_eq!(result.attempts, 1, "should succeed on first attempt");
+        assert_eq!(result.status_code, Some(200));
+
+        let captured = rx.await.expect("should have received captured request");
+        verify_webhook_request(&captured, &verifying_key);
+
+        server_handle.abort();
     }
 }

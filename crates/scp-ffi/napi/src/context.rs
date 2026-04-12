@@ -120,6 +120,8 @@ pub struct NapiContextHandle {
     #[cfg(feature = "allow_in_memory_custody")]
     pub(crate) in_memory_custody: Option<Arc<OpaqueInMemoryKeyCustody>>,
     /// Handle to the creator's active signing key for UCAN minting.
+    /// Only read inside `#[cfg(feature = "allow_in_memory_custody")]` blocks.
+    #[allow(dead_code)]
     pub(crate) signing_key: Option<scp_platform::traits::KeyHandle>,
     /// The scp-core `ContextHandle` for this context, used for manager delegation.
     pub(crate) core_handle: Option<ContextHandle>,
@@ -942,7 +944,7 @@ pub fn context_subscribe(
     validate_did(&identity_did).map_err(|e| napi::Error::from(ScpNapiError::from(e)))?;
     drop(identity_did);
 
-    let Some(adapter) = crate::transport::get_relay_adapter() else {
+    let Some(transport_mgr) = crate::transport::get_transport_manager() else {
         // Reset the guard so the caller can retry after connecting a relay.
         handle
             .subscription_active
@@ -988,9 +990,8 @@ pub fn context_subscribe(
     // which has no active tokio runtime context.
     crate::runtime().spawn(async move {
         use futures::StreamExt;
-        use scp_transport::TransportAdapter;
 
-        let stream_result = adapter.subscribe(&routing_id, None).await;
+        let stream_result = transport_mgr.subscribe(&routing_id, None).await;
         let mut stream = match stream_result {
             Ok(s) => s,
             Err(e) => {
@@ -1547,6 +1548,7 @@ pub async fn broadcast_unsubscribe(
 /// - Rejects with `SCP-PERM-3020` if the context has no custody provider.
 #[napi(js_name = "broadcastPublish")]
 #[allow(clippy::needless_pass_by_value)] // napi-rs requires owned String
+#[allow(clippy::unused_async)] // napi requires async for Promise return type
 pub async fn broadcast_publish(
     handle: &NapiContextHandle,
     author_did: String,
@@ -1644,6 +1646,7 @@ pub struct NapiBatchPublishResult {
 /// - Rejects with `SCP-PERM-3020` if the context has no custody provider.
 #[napi(js_name = "broadcastPublishAsset")]
 #[allow(clippy::needless_pass_by_value)] // napi-rs requires owned String
+#[allow(clippy::unused_async)] // napi requires async for Promise return type
 pub async fn broadcast_publish_asset(
     handle: &NapiContextHandle,
     author_did: String,
@@ -1694,13 +1697,19 @@ pub async fn broadcast_publish_asset(
     let etag = scp_core::context::compute_etag(&asset.body);
     // Capture the deploy_id string before moving into BroadcastContent (SCP-292).
     let deploy_id_str = deploy_id.as_ref().map_or_else(String::new, Clone::clone);
+    // Clone etag when custody feature is enabled — it's needed again in the
+    // return value after `content` consumes the clone.
+    #[cfg(feature = "allow_in_memory_custody")]
+    let etag_for_metadata = etag.clone();
+    #[cfg(not(feature = "allow_in_memory_custody"))]
+    let etag_for_metadata = etag;
     let content = scp_core::context::BroadcastContent {
         version: scp_core::context::BROADCAST_CONTENT_VERSION,
         metadata: scp_core::context::ContentMetadata {
             path: Some(content_path),
             content_type: Some(mime_type),
             deploy_id,
-            etag: Some(etag.clone()),
+            etag: Some(etag_for_metadata),
             immutable: false,
         },
         body: asset.body,
@@ -1776,6 +1785,7 @@ pub async fn broadcast_publish_asset(
 /// - Rejects if any asset fails validation or publish.
 #[napi(js_name = "broadcastPublishAssets")]
 #[allow(clippy::needless_pass_by_value)] // napi-rs requires owned String
+#[allow(clippy::unused_async)] // napi requires async for Promise return type
 pub async fn broadcast_publish_assets(
     handle: &NapiContextHandle,
     author_did: String,
@@ -2200,6 +2210,7 @@ fn parse_napi_proposal_id(hex_str: &str) -> napi::Result<[u8; 32]> {
 /// - Rejects with `SCP-CTX-2041` if the proposal fails.
 #[napi(js_name = "contextGovernancePropose")]
 #[allow(clippy::needless_pass_by_value)]
+#[allow(clippy::unused_async)] // napi requires async for Promise return type
 pub async fn context_governance_propose(
     handle: &NapiContextHandle,
     action_json: String,
@@ -2285,6 +2296,7 @@ pub async fn context_governance_propose(
 /// - Rejects with `SCP-CTX-2042` if the vote fails.
 #[napi(js_name = "contextGovernanceApprove")]
 #[allow(clippy::needless_pass_by_value)]
+#[allow(clippy::unused_async)] // napi requires async for Promise return type
 pub async fn context_governance_approve(
     handle: &NapiContextHandle,
     proposal_id_hex: String,
@@ -2345,6 +2357,7 @@ pub async fn context_governance_approve(
 /// - Rejects with `SCP-CTX-2043` if the vote fails.
 #[napi(js_name = "contextGovernanceReject")]
 #[allow(clippy::needless_pass_by_value)]
+#[allow(clippy::unused_async)] // napi requires async for Promise return type
 pub async fn context_governance_reject(
     handle: &NapiContextHandle,
     proposal_id_hex: String,
