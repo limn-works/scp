@@ -2237,7 +2237,7 @@ fn append_to_merkle_tree(
         "MemberLeft" => scp_event_log::EventType::MemberLeft,
         "RoleAssigned" => scp_event_log::EventType::RoleAssigned,
         "TokenRevoked" => scp_event_log::EventType::TokenRevoked,
-        "MessageSent" => scp_event_log::EventType::MessageSent,
+        "MessageSent" | "MessageReceived" => scp_event_log::EventType::MessageSent,
         "ToolRegistered" => scp_event_log::EventType::ToolRegistered,
         "ToolUpdated" => scp_event_log::EventType::ToolUpdated,
         "ToolInvoked" => scp_event_log::EventType::ToolInvoked,
@@ -2264,6 +2264,9 @@ fn append_to_merkle_tree(
         "GovernanceActionExecuted" => scp_event_log::EventType::GovernanceActionExecuted,
         "ProvenanceAttached" => scp_event_log::EventType::ProvenanceAttached,
         "ProvenanceReceived" => scp_event_log::EventType::ProvenanceReceived,
+        "EquivocationDetected" | "PaymentCaptureFailed" => {
+            scp_event_log::EventType::GovernanceAction
+        }
         // Events that don't have a dedicated EventType variant (e.g.,
         // governance consequences, custom events). Use GovernanceAction
         // as a generic fallback — the event name is still recorded in
