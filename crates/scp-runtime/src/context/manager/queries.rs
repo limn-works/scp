@@ -871,11 +871,7 @@ impl ContextManager {
             }
             let mut contexts = self.contexts.lock().await;
             if let Some(ctx) = contexts.get_mut(context_id) {
-                super::append_to_merkle_tree(
-                    &mut ctx.merkle_tree,
-                    "EquivocationDetected",
-                    remote.sender_did.as_ref(),
-                );
+                ctx.checkpoint_events_since += 1;
                 ctx.receive_buffer.push(ContextEvent::EquivocationDetected {
                     context_id: context_id.to_owned(),
                     remote_sender_did: remote.sender_did.clone(),
@@ -894,10 +890,12 @@ impl ContextManager {
     /// Synchronizes the per-context Merkle tree with the `MerkleEventLogProvider`.
     ///
     /// Compares the Merkle tree's event count with the provider's entry count
-    /// and replays any missing entries via `push_leaf_raw`. This lazy sync
-    /// ensures proof functions always operate on a complete tree even when
-    /// individual `append_context_event` call sites didn't explicitly append
-    /// to the Merkle tree.
+    /// and replays any missing entries via `push_leaf_raw`. This is the ONLY
+    /// path that populates the Merkle tree — the provider is the single source
+    /// of truth with one consistent hash format (`SCP-EXPORT-ENTRY:` domain
+    /// separator). This eliminates the dual-path inconsistency that existed
+    /// when `append_to_merkle_tree` used a different domain separator
+    /// (`SCP-EVENT-V1:`), producing incorrect proofs.
     ///
     /// Called by [`prove_event_inclusion`] and [`prove_event_consistency`]
     /// before generating proofs.

@@ -2077,14 +2077,9 @@ impl ContextManager {
         {
             let mut contexts = self.contexts.lock().await;
             if let Some(ctx) = contexts.get_mut(&context_id) {
-                super::append_to_merkle_tree(
-                    &mut ctx.merkle_tree,
-                    "MemberJoined",
-                    member_did.as_ref(),
-                );
+                ctx.checkpoint_events_since += 1;
             }
         }
-
         // Persist context state after join (best-effort).
         if self.has_persistence() {
             let contexts = self.contexts.lock().await;
@@ -2372,14 +2367,9 @@ impl ContextManager {
         {
             let mut contexts = self.contexts.lock().await;
             if let Some(ctx) = contexts.get_mut(&context_id) {
-                super::append_to_merkle_tree(
-                    &mut ctx.merkle_tree,
-                    "MemberLeft",
-                    member_did.as_ref(),
-                );
+                ctx.checkpoint_events_since += 1;
             }
         }
-
         // Persist context state after leave (best-effort).
         if self.has_persistence() {
             let contexts = self.contexts.lock().await;

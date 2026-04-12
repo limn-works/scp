@@ -362,6 +362,18 @@ impl NativeRelayAdapter {
                 return;
             };
 
+            // Random initial delay to prevent timing fingerprint (spec §9.10.6).
+            // Uniform over [0, interval) so the first dummy's timing doesn't
+            // reveal when the connection was established.
+            {
+                use rand::Rng;
+                let interval_ms = u64::try_from(interval_duration.as_millis()).unwrap_or(u64::MAX);
+                if interval_ms > 0 {
+                    let jitter_ms = rand::thread_rng().gen_range(0..interval_ms);
+                    tokio::time::sleep(std::time::Duration::from_millis(jitter_ms)).await;
+                }
+            }
+
             let mut interval = tokio::time::interval(interval_duration);
             // The first tick fires immediately; consume it and let the
             // generator produce the first dummy on its own schedule.

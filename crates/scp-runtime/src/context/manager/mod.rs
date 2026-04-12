@@ -2191,11 +2191,7 @@ impl ContextManager {
         }
         let mut contexts = self.contexts.lock().await;
         if let Some(ctx) = contexts.get_mut(context_id) {
-            append_to_merkle_tree(
-                &mut ctx.merkle_tree,
-                "PaymentCaptureFailed",
-                actor_did.as_ref(),
-            );
+            ctx.checkpoint_events_since += 1;
             ctx.receive_buffer.push(ContextEvent::PaymentCaptureFailed {
                 action: action.to_owned(),
                 actor_did: actor_did.clone(),
@@ -2209,93 +2205,6 @@ impl ContextManager {
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
-
-/// Appends an event to the per-context RFC 6962 Merkle tree event log.
-///
-/// Uses [`scp_event_log::tree::append_unsigned_event`] — trusted in-process
-/// caller, no Ed25519 signing required. The event is committed to the tree
-/// with sequence ordering, prev-hash chain integrity, and RFC 6962 leaf
-/// domain separation (`0x00` prefix).
-///
-/// Failures are logged but do not abort the calling operation (best-effort,
-/// consistent with how `append_context_event` failures are handled in the
-/// `MerkleEventLogProvider` path).
-fn append_to_merkle_tree(
-    merkle_tree: &mut scp_event_log::EventLog,
-    event_name: &str,
-    actor_did: &str,
-) {
-    let event_count = scp_event_log::tree::event_count(merkle_tree);
-    let prev_hash = merkle_tree.leaves().last().copied().unwrap_or([0u8; 32]);
-
-    let event_type = match event_name {
-        "ContextCreated" => scp_event_log::EventType::ContextCreated,
-        "ContextClosing" => scp_event_log::EventType::ContextClosing,
-        "ContextClosed" => scp_event_log::EventType::ContextClosed,
-        "ContextExpired" => scp_event_log::EventType::ContextExpired,
-        "MemberJoined" => scp_event_log::EventType::MemberJoined,
-        "MemberLeft" => scp_event_log::EventType::MemberLeft,
-        "RoleAssigned" => scp_event_log::EventType::RoleAssigned,
-        "TokenRevoked" => scp_event_log::EventType::TokenRevoked,
-        "MessageSent" | "MessageReceived" => scp_event_log::EventType::MessageSent,
-        "ToolRegistered" => scp_event_log::EventType::ToolRegistered,
-        "ToolUpdated" => scp_event_log::EventType::ToolUpdated,
-        "ToolInvoked" => scp_event_log::EventType::ToolInvoked,
-        "ToolVerified" => scp_event_log::EventType::ToolVerified,
-        "ToolInterfaceEstablished" => scp_event_log::EventType::ToolInterfaceEstablished,
-        "ConsistencyCheckpoint" => scp_event_log::EventType::ConsistencyCheckpoint,
-        "AbsenceProofRequested" => scp_event_log::EventType::AbsenceProofRequested,
-        "MemberBlocked" => scp_event_log::EventType::MemberBlocked,
-        "KeyEpochAdvance" => scp_event_log::EventType::KeyEpochAdvance,
-        "MediaSessionStarted" => scp_event_log::EventType::MediaSessionStarted,
-        "MediaSessionEnded" => scp_event_log::EventType::MediaSessionEnded,
-        "PaymentReceived" => scp_event_log::EventType::PaymentReceived,
-        "EconomicPolicyChanged" => scp_event_log::EventType::EconomicPolicyChanged,
-        "EconomicPolicyApplied" => scp_event_log::EventType::EconomicPolicyApplied,
-        "SpendingUcanGranted" => scp_event_log::EventType::SpendingUcanGranted,
-        "SpendingUcanRevoked" => scp_event_log::EventType::SpendingUcanRevoked,
-        "GovernanceProposalCreated" => scp_event_log::EventType::GovernanceProposalCreated,
-        "GovernanceVoteCast" => scp_event_log::EventType::GovernanceVoteCast,
-        "GovernanceVoteWithdrawn" => scp_event_log::EventType::GovernanceVoteWithdrawn,
-        "GovernanceProposalResolved" => scp_event_log::EventType::GovernanceProposalResolved,
-        "GovernanceConflictDetected" => scp_event_log::EventType::GovernanceConflictDetected,
-        "GovernanceConflictResolved" => scp_event_log::EventType::GovernanceConflictResolved,
-        "GovernanceDeadlockRecovery" => scp_event_log::EventType::GovernanceDeadlockRecovery,
-        "GovernanceActionExecuted" => scp_event_log::EventType::GovernanceActionExecuted,
-        "ProvenanceAttached" => scp_event_log::EventType::ProvenanceAttached,
-        "ProvenanceReceived" => scp_event_log::EventType::ProvenanceReceived,
-        "EquivocationDetected" | "PaymentCaptureFailed" => {
-            scp_event_log::EventType::GovernanceAction
-        }
-        // Events that don't have a dedicated EventType variant (e.g.,
-        // governance consequences, custom events). Use GovernanceAction
-        // as a generic fallback — the event name is still recorded in
-        // the Event's payload-free structure for provenance.
-        _ => scp_event_log::EventType::GovernanceAction,
-    };
-
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs();
-
-    let event = scp_event_log::Event {
-        event_type,
-        actor_did: scp_event_log::DID::from(actor_did.to_owned()),
-        timestamp: now,
-        sequence: event_count,
-        payload: scp_event_log::EventPayload { data: vec![] },
-        prev_hash,
-        signature: vec![],
-    };
-
-    if let Err(e) = scp_event_log::tree::append_unsigned_event(merkle_tree, &event) {
-        tracing::warn!(
-            event_name,
-            "failed to append event to per-context Merkle tree: {e}"
-        );
-    }
-}
 
 /// Uses the canonical SHA-256 context ID byte derivation.
 /// Delegates to [`scp_protocol::context::context_id_bytes`] to match builder.rs.

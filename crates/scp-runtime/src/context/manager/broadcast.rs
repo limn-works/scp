@@ -105,6 +105,12 @@ impl ContextManager {
             "MemberJoined",
             subscriber_did.as_ref(),
         )?;
+        {
+            let mut contexts = self.contexts.lock().await;
+            if let Some(ctx) = contexts.get_mut(context_id) {
+                ctx.checkpoint_events_since += 1;
+            }
+        }
 
         Ok(result)
     }
@@ -184,6 +190,12 @@ impl ContextManager {
             "MemberLeft",
             subscriber_did.as_ref(),
         )?;
+        {
+            let mut contexts = self.contexts.lock().await;
+            if let Some(ctx) = contexts.get_mut(context_id) {
+                ctx.checkpoint_events_since += 1;
+            }
+        }
 
         Ok(result)
     }
@@ -315,6 +327,12 @@ impl ContextManager {
             "MessageSent",
             author_did.as_ref(),
         )?;
+        {
+            let mut contexts = self.contexts.lock().await;
+            if let Some(ctx) = contexts.get_mut(context_id) {
+                ctx.checkpoint_events_since += 1;
+            }
+        }
 
         Ok(envelope)
     }
@@ -418,6 +436,12 @@ impl ContextManager {
             "MemberBlocked",
             author_did.as_ref(),
         )?;
+        {
+            let mut contexts = self.contexts.lock().await;
+            if let Some(ctx) = contexts.get_mut(context_id) {
+                ctx.checkpoint_events_since += 1;
+            }
+        }
 
         Ok(result)
     }
@@ -488,6 +512,12 @@ impl ContextManager {
             "MemberUnblocked",
             author_did.as_ref(),
         )?;
+        {
+            let mut contexts = self.contexts.lock().await;
+            if let Some(ctx) = contexts.get_mut(context_id) {
+                ctx.checkpoint_events_since += 1;
+            }
+        }
 
         Ok(())
     }

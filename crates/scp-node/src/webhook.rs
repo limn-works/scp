@@ -5,12 +5,17 @@
 //! notifications with Ed25519 signatures.
 
 use std::collections::HashMap;
+use std::net::ToSocketAddrs;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use ed25519_dalek::{Signer, SigningKey};
 use serde::Serialize;
 use tokio::sync::RwLock;
+
+/// Monotonic counter for unique event IDs (concurrency-safe).
+static EVENT_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 /// Maximum number of retry attempts for failed webhook deliveries.
 const MAX_RETRIES: u32 = 3;
@@ -67,6 +72,7 @@ pub async fn dispatch_webhook(
     url: &str,
     event: &WebhookEvent,
     signing_key: &SigningKey,
+    client: &reqwest::Client,
 ) -> WebhookResult {
     // Validate URL: must be HTTPS
     if !url.starts_with("https://") {
@@ -89,15 +95,6 @@ pub async fn dispatch_webhook(
             error: Some(error),
         };
     }
-
-    // Build a hardened HTTP client internally — callers must not inject a
-    // pre-configured client that might follow redirects (SSRF via 3xx to
-    // internal endpoints).
-    let client = reqwest::Client::builder()
-        .redirect(reqwest::redirect::Policy::none())
-        .timeout(std::time::Duration::from_secs(10))
-        .build()
-        .unwrap_or_else(|_| reqwest::Client::new());
 
     let body = match serde_json::to_vec(event) {
         Ok(b) => b,
@@ -214,6 +211,24 @@ fn validate_webhook_url(raw_url: &str) -> Option<String> {
         return Some(reason);
     }
 
+    // DNS pre-resolution: when the host is a hostname (not an IP literal),
+    // resolve it and check all resolved addresses against the blocklist.
+    // This catches SSRF via DNS pointing to private IPs (e.g.,
+    // evil.example.com -> 10.0.0.1).
+    //
+    // NOTE: DNS rebinding limitation — the resolved IP can change between
+    // validation and the actual HTTP connection. This is defense-in-depth,
+    // not a complete mitigation.
+    if host.parse::<std::net::IpAddr>().is_err()
+        && let Ok(addrs) = (host, 443u16).to_socket_addrs()
+    {
+        for addr in addrs {
+            if let Some(reason) = check_ip_blocked(addr.ip()) {
+                return Some(format!("{host} resolves to blocked IP: {reason}"));
+            }
+        }
+    }
+
     None
 }
 
@@ -302,14 +317,23 @@ pub struct WebhookTarget {
 pub struct WebhookDispatcher {
     /// Registered targets, keyed by a unique target ID (e.g., `bridge_id`).
     targets: RwLock<HashMap<String, WebhookTarget>>,
+    /// Hardened HTTP client: no redirects (SSRF prevention), 10s timeout.
+    /// Shared across all dispatches for connection reuse.
+    client: reqwest::Client,
 }
 
 impl WebhookDispatcher {
-    /// Creates a new empty dispatcher.
+    /// Creates a new empty dispatcher with a hardened HTTP client.
     #[must_use]
     pub fn new() -> Self {
+        let client = reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .timeout(std::time::Duration::from_secs(10))
+            .build()
+            .unwrap_or_else(|_| reqwest::Client::new());
         Self {
             targets: RwLock::new(HashMap::new()),
+            client,
         }
     }
 
@@ -342,19 +366,16 @@ impl WebhookDispatcher {
         event_type: &str,
         payload: serde_json::Value,
     ) {
-        let event_id = format!(
-            "evt-{}-{}",
-            context_id.get(..8).unwrap_or(context_id),
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .map(|d| d.as_nanos())
-                .unwrap_or(0),
-        );
-
-        let timestamp = SystemTime::now()
+        let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0);
+            .unwrap_or_default();
+        let event_id = format!(
+            "evt-{}-{}-{}",
+            context_id.get(..8).unwrap_or(context_id),
+            now.as_nanos(),
+            EVENT_COUNTER.fetch_add(1, Ordering::Relaxed),
+        );
+        let timestamp = now.as_secs();
 
         let event = WebhookEvent {
             event_id,
@@ -386,8 +407,10 @@ impl WebhookDispatcher {
         let mut handles = Vec::with_capacity(matching.len());
         for (target_id, target) in matching {
             let event = Arc::clone(&event);
+            let client = self.client.clone();
             handles.push(tokio::spawn(async move {
-                let result = dispatch_webhook(&target.url, &event, &target.signing_key).await;
+                let result =
+                    dispatch_webhook(&target.url, &event, &target.signing_key, &client).await;
                 if result.success {
                     tracing::debug!(
                         target_id = %target_id,
@@ -431,6 +454,14 @@ mod tests {
     use super::*;
     use ed25519_dalek::Verifier;
 
+    fn test_client() -> reqwest::Client {
+        reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .timeout(std::time::Duration::from_secs(10))
+            .build()
+            .unwrap()
+    }
+
     #[tokio::test]
     async fn webhook_url_rejects_http() {
         let key = SigningKey::from_bytes(&[1u8; 32]);
@@ -441,7 +472,8 @@ mod tests {
             timestamp: 1_700_000_000,
             payload: serde_json::json!({}),
         };
-        let result = dispatch_webhook("http://example.com/hook", &event, &key).await;
+        let result =
+            dispatch_webhook("http://example.com/hook", &event, &key, &test_client()).await;
         assert!(!result.success);
         assert_eq!(result.attempts, 0);
         assert!(
@@ -462,7 +494,7 @@ mod tests {
             payload: serde_json::json!({}),
         };
 
-        let result = dispatch_webhook("https://localhost/hook", &event, &key).await;
+        let result = dispatch_webhook("https://localhost/hook", &event, &key, &test_client()).await;
         assert!(!result.success);
         assert!(
             result
@@ -473,7 +505,7 @@ mod tests {
             result.error,
         );
 
-        let result = dispatch_webhook("https://127.0.0.1/hook", &event, &key).await;
+        let result = dispatch_webhook("https://127.0.0.1/hook", &event, &key, &test_client()).await;
         assert!(!result.success);
         assert!(
             result
@@ -497,7 +529,7 @@ mod tests {
         };
 
         // 10.x.x.x
-        let result = dispatch_webhook("https://10.0.0.1/hook", &event, &key).await;
+        let result = dispatch_webhook("https://10.0.0.1/hook", &event, &key, &test_client()).await;
         assert!(!result.success);
         assert!(
             result
@@ -509,7 +541,8 @@ mod tests {
         );
 
         // 192.168.x.x
-        let result = dispatch_webhook("https://192.168.1.1/hook", &event, &key).await;
+        let result =
+            dispatch_webhook("https://192.168.1.1/hook", &event, &key, &test_client()).await;
         assert!(!result.success);
         assert!(
             result
@@ -521,7 +554,8 @@ mod tests {
         );
 
         // 172.16.x.x
-        let result = dispatch_webhook("https://172.16.0.1/hook", &event, &key).await;
+        let result =
+            dispatch_webhook("https://172.16.0.1/hook", &event, &key, &test_client()).await;
         assert!(!result.success);
         assert!(
             result

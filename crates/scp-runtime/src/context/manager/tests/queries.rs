@@ -673,11 +673,13 @@ async fn compare_checkpoint_divergent() {
     let (manager, _handle) = setup_active_context_with_key_resolver().await;
     let sender_did = DID("did:key:creator".into());
 
+    // Local has 1 event (ContextCreated). Set remote event_count to 1 with
+    // a root that won't match the real hash, triggering Divergent.
     let remote = signed_checkpoint(
         "test-ctx",
         &sender_did,
-        0,
-        [0xFFu8; 32], // different from empty log root
+        1,
+        [0xFFu8; 32], // different from the real Merkle root
         Some(0),
         1000,
     );
@@ -686,16 +688,12 @@ async fn compare_checkpoint_divergent() {
         .compare_remote_checkpoint("test-ctx", &remote)
         .await
         .unwrap();
-    // With 0 events in local log and a different root, this could be
-    // Divergent or Consistent depending on what the empty log root is.
-    // Check that we at least get a valid comparison.
     assert!(
         matches!(
             result,
-            scp_event_log::checkpoint::CheckpointComparison::Consistent
-                | scp_event_log::checkpoint::CheckpointComparison::Divergent { .. }
+            scp_event_log::checkpoint::CheckpointComparison::Divergent { .. }
         ),
-        "should be either Consistent or Divergent for same count"
+        "same event count with different root should be Divergent, got {result:?}"
     );
 }
 
@@ -708,7 +706,7 @@ async fn compare_checkpoint_behind() {
     let remote = signed_checkpoint(
         "test-ctx",
         &sender_did,
-        100, // remote has 100, local has 0
+        100, // remote has 100, local has 1 (ContextCreated from create_context)
         [0u8; 32],
         Some(0),
         1000,
@@ -721,11 +719,9 @@ async fn compare_checkpoint_behind() {
     assert!(
         matches!(
             result,
-            scp_event_log::checkpoint::CheckpointComparison::Behind {
-                missing_events: 100
-            }
+            scp_event_log::checkpoint::CheckpointComparison::Behind { missing_events: 99 }
         ),
-        "should be Behind with 100 missing events, got {result:?}"
+        "should be Behind with 99 missing events (100 - 1 ContextCreated), got {result:?}"
     );
 }
 
@@ -744,8 +740,9 @@ async fn compare_checkpoint_behind() {
 #[tokio::test]
 async fn compare_checkpoint_ahead_verified_by_symmetry() {
     // The Ahead branch is exercised when local_count > remote.event_count.
-    // With MockEventLog, local_count is always 0, so we verify that
-    // remote.event_count = 0 yields Consistent (both at 0 events).
+    // MockEventLog now stores entries (including ContextCreated from
+    // create_context), so local_count is 1 after setup. With
+    // remote.event_count = 0, this exercises the Ahead branch.
     let (manager, _handle) = setup_active_context_with_key_resolver().await;
     let sender_did = DID("did:key:creator".into());
 
@@ -762,14 +759,13 @@ async fn compare_checkpoint_ahead_verified_by_symmetry() {
         .compare_remote_checkpoint("test-ctx", &remote)
         .await
         .unwrap();
-    // Both have 0 events. Roots should match (both empty).
+    // Local has 1 event (ContextCreated), remote has 0. Should be Ahead.
     assert!(
         matches!(
             result,
-            scp_event_log::checkpoint::CheckpointComparison::Consistent
-                | scp_event_log::checkpoint::CheckpointComparison::Divergent { .. }
+            scp_event_log::checkpoint::CheckpointComparison::Ahead { .. }
         ),
-        "same event count should yield Consistent or Divergent, got {result:?}"
+        "local (1 event) ahead of remote (0 events), got {result:?}"
     );
 }
 
@@ -813,9 +809,10 @@ async fn compare_checkpoint_rejects_invalid_signature() {
 
 /// #1535: Send 5 messages, prove inclusion for each, verify all pass.
 ///
-/// Each `send_message` call appends to the per-context Merkle tree via
-/// the explicit `append_to_merkle_tree` call in `finalize_send`. The
-/// Merkle tree accumulates events independently of the event log provider.
+/// Each `send_message` call appends to the durable event log via the
+/// provider. The per-context Merkle tree is lazily populated from the
+/// provider at proof time via `sync_merkle_tree`, ensuring one consistent
+/// hash format.
 #[tokio::test]
 async fn prove_event_inclusion_after_messages() {
     let (manager, handle) = setup_active_context().await;
@@ -870,7 +867,10 @@ async fn prove_event_consistency_after_messages() {
             .unwrap();
     }
 
-    // Prove consistency from size 5 to current size (10).
+    // Prove consistency from size 5 to current size.
+    // The total event count is 11: 1 ContextCreated (from create_context)
+    // + 10 MessageSent. The Merkle tree is populated via sync_merkle_tree
+    // from the event log provider, which includes all events.
     let proof = manager
         .prove_event_consistency("test-ctx", 5)
         .await
@@ -880,7 +880,7 @@ async fn prove_event_consistency_after_messages() {
         "consistency proof should verify"
     );
     assert_eq!(proof.old_size, 5);
-    assert_eq!(proof.new_size, 10);
+    assert_eq!(proof.new_size, 11);
 }
 
 /// #1535: Prove inclusion with an invalid (out-of-bounds) index returns error.

@@ -167,7 +167,6 @@ fn consequence_event_payload(
 /// nothing because the failure mode is observed via tracing, not callers.
 fn append_consequence_event(
     event_log: &dyn super::super::builder::ContextEventLogProvider,
-    merkle_tree: &mut scp_event_log::EventLog,
     context_id: &str,
     context_id_bytes: &[u8; 32],
     event_name: &'static str,
@@ -188,7 +187,6 @@ fn append_consequence_event(
             "failed to append consequence event to durable event log"
         );
     }
-    super::append_to_merkle_tree(merkle_tree, event_name, CONSEQUENCE_ACTOR_DID);
 }
 
 /// Borrowed inputs for `enforce_triggered_consequences`. Bundling the
@@ -362,13 +360,13 @@ fn emit_consequence_triggered(
     );
     append_consequence_event(
         args.event_log,
-        &mut ctx.merkle_tree,
         args.context_id,
         context_id_bytes,
         "ConsequenceTriggered",
         args.member_did,
         &payload,
     );
+    ctx.checkpoint_events_since += 1;
     ctx.receive_buffer.push(ContextEvent::ConsequenceTriggered {
         context_id: args.context_id.to_owned(),
         member_did: args.member_did.clone(),
@@ -399,13 +397,13 @@ fn emit_absent_member_enforcement_failed(
     );
     append_consequence_event(
         args.event_log,
-        &mut ctx.merkle_tree,
         args.context_id,
         context_id_bytes,
         "ConsequenceEnforcementFailed",
         args.member_did,
         &payload,
     );
+    ctx.checkpoint_events_since += 1;
     ctx.receive_buffer.push(ContextEvent::ConsequenceEnforced {
         context_id: args.context_id.to_owned(),
         member_did: args.member_did.clone(),
@@ -432,13 +430,13 @@ fn emit_consequence_enforced_success(
     );
     append_consequence_event(
         args.event_log,
-        &mut ctx.merkle_tree,
         args.context_id,
         context_id_bytes,
         "ConsequenceEnforced",
         args.member_did,
         &payload,
     );
+    ctx.checkpoint_events_since += 1;
     ctx.receive_buffer.push(ContextEvent::ConsequenceEnforced {
         context_id: args.context_id.to_owned(),
         member_did: args.member_did.clone(),
@@ -564,13 +562,13 @@ fn emit_failure_escalation(
     );
     append_consequence_event(
         args.event_log,
-        &mut ctx.merkle_tree,
         context_id,
         context_id_bytes,
         "ConsequenceEnforcementFailed",
         member_did,
         &failed_payload,
     );
+    ctx.checkpoint_events_since += 1;
     let escalation_payload = consequence_event_payload(
         member_did,
         consequence.rule_index,
@@ -579,13 +577,13 @@ fn emit_failure_escalation(
     );
     append_consequence_event(
         args.event_log,
-        &mut ctx.merkle_tree,
         context_id,
         context_id_bytes,
         "ConsequenceEscalatedToSuspendAll",
         member_did,
         &escalation_payload,
     );
+    ctx.checkpoint_events_since += 1;
     ctx.receive_buffer.push(ContextEvent::ConsequenceEnforced {
         context_id: context_id.to_owned(),
         member_did: member_did.clone(),
@@ -1163,11 +1161,9 @@ impl ContextManager {
             let target_did = proposal.action.target_did().cloned();
             let mut contexts = self.contexts.lock().await;
             if let Some(ctx) = contexts.get_mut(context_id) {
-                super::append_to_merkle_tree(
-                    &mut ctx.merkle_tree,
-                    Self::governance_event_label(&executed_event),
-                    proposal.proposer_did.as_ref(),
-                );
+                // Checkpoint tracking: count the GovernanceActionExecuted event.
+                ctx.checkpoint_events_since += 1;
+
                 // 1. Push GovernanceActionExecuted to receive buffer so SDK
                 //    consumers observe outcomes with rich context.
                 ctx.receive_buffer
@@ -1335,6 +1331,12 @@ impl ContextManager {
                     "MemberSuspendedAll",
                     actor,
                 )?;
+                {
+                    let mut contexts = self.contexts.lock().await;
+                    if let Some(ctx) = contexts.get_mut(context_id) {
+                        ctx.checkpoint_events_since += 1;
+                    }
+                }
                 Ok(GovernanceActionResult::Executed)
             }
             GovernanceAction::RevokeAccess { did, access } => {
@@ -1791,6 +1793,7 @@ impl ContextManager {
                             "GovernanceFreezeExpired",
                             proposer_did.as_ref(),
                         )?;
+                        ctx.checkpoint_events_since += 1;
                     }
                 }
             }
@@ -1848,6 +1851,7 @@ impl ContextManager {
         // Emit conflict events to the event log.
         if !conflict_events.is_empty() {
             let context_id_bytes = context_id_to_bytes(context_id);
+            let mut conflict_event_count: u64 = 0;
             for event in &conflict_events {
                 match event {
                     GovernanceEvent::ConflictDetected { .. } => {
@@ -1856,6 +1860,7 @@ impl ContextManager {
                             "GovernanceConflictDetected",
                             proposer_did.as_ref(),
                         )?;
+                        conflict_event_count += 1;
                     }
                     GovernanceEvent::ConflictResolved { .. } => {
                         self.event_log.append_context_event(
@@ -1863,8 +1868,15 @@ impl ContextManager {
                             "GovernanceConflictResolved",
                             proposer_did.as_ref(),
                         )?;
+                        conflict_event_count += 1;
                     }
                     _ => {}
+                }
+            }
+            if conflict_event_count > 0 {
+                let mut contexts = self.contexts.lock().await;
+                if let Some(ctx) = contexts.get_mut(context_id) {
+                    ctx.checkpoint_events_since += conflict_event_count;
                 }
             }
         }
@@ -1917,6 +1929,7 @@ impl ContextManager {
     /// - [`ContextError::ContextNotActive`] if the context is not `Active`.
     /// - [`ContextError::GovernanceFailed`] if the voter is not eligible,
     ///   already voted, or the proposal is not pending.
+    #[allow(clippy::too_many_lines)]
     #[instrument(skip_all, fields(context_id))]
     pub async fn vote_on_proposal(
         &self,
@@ -1994,6 +2007,7 @@ impl ContextManager {
         // Emit conflict events to the event log (mirrors propose_governance_action_inner).
         if !conflict_events.is_empty() {
             let context_id_bytes = context_id_to_bytes(context_id);
+            let mut conflict_event_count: u64 = 0;
             for event in &conflict_events {
                 match event {
                     GovernanceEvent::ConflictDetected { .. } => {
@@ -2002,6 +2016,7 @@ impl ContextManager {
                             "GovernanceConflictDetected",
                             voter_did.as_ref(),
                         )?;
+                        conflict_event_count += 1;
                     }
                     GovernanceEvent::ConflictResolved { .. } => {
                         self.event_log.append_context_event(
@@ -2009,8 +2024,15 @@ impl ContextManager {
                             "GovernanceConflictResolved",
                             voter_did.as_ref(),
                         )?;
+                        conflict_event_count += 1;
                     }
                     _ => {}
+                }
+            }
+            if conflict_event_count > 0 {
+                let mut contexts = self.contexts.lock().await;
+                if let Some(ctx) = contexts.get_mut(context_id) {
+                    ctx.checkpoint_events_since += conflict_event_count;
                 }
             }
         }
@@ -2287,12 +2309,20 @@ impl ContextManager {
         };
 
         let context_id_bytes = context_id_to_bytes(context_id);
+        let mut event_count: u64 = 0;
         for event in &events {
             self.event_log.append_context_event(
                 &context_id_bytes,
                 Self::governance_event_label(event),
                 voter_did.as_ref(),
             )?;
+            event_count += 1;
+        }
+        if event_count > 0 {
+            let mut contexts = self.contexts.lock().await;
+            if let Some(ctx) = contexts.get_mut(context_id) {
+                ctx.checkpoint_events_since += event_count;
+            }
         }
 
         // Persist context state after withdrawal.
@@ -2367,6 +2397,12 @@ impl ContextManager {
         }
         self.event_log
             .append_context_event(&context_id_bytes, "MemberSuspended", actor_did)?;
+        {
+            let mut contexts = self.contexts.lock().await;
+            if let Some(ctx) = contexts.get_mut(context_id) {
+                ctx.checkpoint_events_since += 1;
+            }
+        }
         Ok(())
     }
 
@@ -2386,6 +2422,7 @@ impl ContextManager {
     /// Requires the `MemberBan` capability in the context's ceiling (§5.3).
     ///
     /// Returns the number of rotated authors (for broadcast contexts).
+    #[allow(clippy::too_many_lines)]
     async fn execute_revoke(
         &self,
         context_id: &str,
@@ -2503,6 +2540,12 @@ impl ContextManager {
             actor_did,
             Some(&serde_json::json!({"target_did": did.as_ref()})),
         )?;
+        {
+            let mut contexts = self.contexts.lock().await;
+            if let Some(ctx) = contexts.get_mut(context_id) {
+                ctx.checkpoint_events_since += 1;
+            }
+        }
 
         // H7: Rotate sender key after write-side revocation so the revoked
         // member cannot decrypt future messages at the sender-key layer
@@ -2639,6 +2682,12 @@ impl ContextManager {
         }
         self.event_log
             .append_context_event(&context_id_bytes, "AccessRestored", actor_did)?;
+        {
+            let mut contexts = self.contexts.lock().await;
+            if let Some(ctx) = contexts.get_mut(context_id) {
+                ctx.checkpoint_events_since += 1;
+            }
+        }
 
         Ok(())
     }
@@ -2719,6 +2768,12 @@ impl ContextManager {
         }
         self.event_log
             .append_context_event(&context_id_bytes, "MemberJoined", actor_did)?;
+        {
+            let mut contexts = self.contexts.lock().await;
+            if let Some(ctx) = contexts.get_mut(context_id) {
+                ctx.checkpoint_events_since += 1;
+            }
+        }
         Ok(())
     }
 
@@ -2837,6 +2892,12 @@ impl ContextManager {
         }
         self.event_log
             .append_context_event(&context_id_bytes, "MemberLeft", actor_did)?;
+        {
+            let mut contexts = self.contexts.lock().await;
+            if let Some(ctx) = contexts.get_mut(context_id) {
+                ctx.checkpoint_events_since += 1;
+            }
+        }
         Ok(())
     }
 
@@ -2893,6 +2954,12 @@ impl ContextManager {
         }
         self.event_log
             .append_context_event(&context_id_bytes, "RoleAssigned", actor_did)?;
+        {
+            let mut contexts = self.contexts.lock().await;
+            if let Some(ctx) = contexts.get_mut(context_id) {
+                ctx.checkpoint_events_since += 1;
+            }
+        }
         Ok(())
     }
 
@@ -2940,6 +3007,12 @@ impl ContextManager {
         }
         self.event_log
             .append_context_event(&context_id_bytes, "ToolRegistered", actor_did)?;
+        {
+            let mut contexts = self.contexts.lock().await;
+            if let Some(ctx) = contexts.get_mut(context_id) {
+                ctx.checkpoint_events_since += 1;
+            }
+        }
         Ok(())
     }
 
@@ -2974,6 +3047,12 @@ impl ContextManager {
         }
         self.event_log
             .append_context_event(&context_id_bytes, "ToolRemoved", actor_did)?;
+        {
+            let mut contexts = self.contexts.lock().await;
+            if let Some(ctx) = contexts.get_mut(context_id) {
+                ctx.checkpoint_events_since += 1;
+            }
+        }
         Ok(())
     }
 
@@ -3045,6 +3124,12 @@ impl ContextManager {
             "CeilingModificationPending",
             actor_did,
         )?;
+        {
+            let mut contexts = self.contexts.lock().await;
+            if let Some(ctx) = contexts.get_mut(context_id) {
+                ctx.checkpoint_events_since += 1;
+            }
+        }
         Ok(())
     }
 
@@ -3098,6 +3183,12 @@ impl ContextManager {
             }
             self.event_log
                 .append_context_event(&context_id_bytes, "CeilingModified", "")?;
+            {
+                let mut contexts = self.contexts.lock().await;
+                if let Some(ctx) = contexts.get_mut(context_id) {
+                    ctx.checkpoint_events_since += 1;
+                }
+            }
         }
 
         Ok(applied)
@@ -3159,6 +3250,12 @@ impl ContextManager {
         }
         self.event_log
             .append_context_event(&context_id_bytes, "ContextClosing", actor_did)?;
+        {
+            let mut contexts = self.contexts.lock().await;
+            if let Some(ctx) = contexts.get_mut(context_id) {
+                ctx.checkpoint_events_since += 1;
+            }
+        }
         Ok(())
     }
 
@@ -3205,6 +3302,7 @@ impl ContextManager {
                     &rejected_payload.to_string(),
                     actor_did,
                 )?;
+                ctx.checkpoint_events_since += 1;
                 return Err(ContextError::PermissionDenied(format!(
                     "TTL extension requires unanimous consent — {} of {} members have not approved",
                     missing.len(),
@@ -3273,6 +3371,12 @@ impl ContextManager {
             &extended_payload.to_string(),
             actor_did,
         )?;
+        {
+            let mut contexts = self.contexts.lock().await;
+            if let Some(ctx) = contexts.get_mut(context_id) {
+                ctx.checkpoint_events_since += 1;
+            }
+        }
         Ok(())
     }
 
@@ -3344,6 +3448,12 @@ impl ContextManager {
         }
         self.event_log
             .append_context_event(&context_id_bytes, "AdminTransferred", actor_did)?;
+        {
+            let mut contexts = self.contexts.lock().await;
+            if let Some(ctx) = contexts.get_mut(context_id) {
+                ctx.checkpoint_events_since += 1;
+            }
+        }
         Ok(())
     }
 
@@ -3381,6 +3491,12 @@ impl ContextManager {
         // the governance event on the parent.
         self.event_log
             .append_context_event(&context_id_bytes, "ChildContextCreated", actor_did)?;
+        {
+            let mut contexts = self.contexts.lock().await;
+            if let Some(ctx) = contexts.get_mut(context_id) {
+                ctx.checkpoint_events_since += 1;
+            }
+        }
         Ok(())
     }
 
@@ -3457,6 +3573,12 @@ impl ContextManager {
             "PruningPolicyModified",
             actor_did,
         )?;
+        {
+            let mut contexts = self.contexts.lock().await;
+            if let Some(ctx) = contexts.get_mut(context_id) {
+                ctx.checkpoint_events_since += 1;
+            }
+        }
         Ok(())
     }
 
@@ -3533,6 +3655,12 @@ impl ContextManager {
         }
         self.event_log
             .append_context_event(&context_id_bytes, "SignerAdded", actor_did)?;
+        {
+            let mut contexts = self.contexts.lock().await;
+            if let Some(ctx) = contexts.get_mut(context_id) {
+                ctx.checkpoint_events_since += 1;
+            }
+        }
         Ok(())
     }
 
@@ -3605,6 +3733,12 @@ impl ContextManager {
         }
         self.event_log
             .append_context_event(&context_id_bytes, "SignerRemoved", actor_did)?;
+        {
+            let mut contexts = self.contexts.lock().await;
+            if let Some(ctx) = contexts.get_mut(context_id) {
+                ctx.checkpoint_events_since += 1;
+            }
+        }
         Ok(())
     }
 
@@ -3644,6 +3778,12 @@ impl ContextManager {
         }
         self.event_log
             .append_context_event(&context_id_bytes, "ThresholdModified", actor_did)?;
+        {
+            let mut contexts = self.contexts.lock().await;
+            if let Some(ctx) = contexts.get_mut(context_id) {
+                ctx.checkpoint_events_since += 1;
+            }
+        }
         Ok(())
     }
 
@@ -3694,6 +3834,12 @@ impl ContextManager {
             "ToolInterfaceEstablished",
             actor_did,
         )?;
+        {
+            let mut contexts = self.contexts.lock().await;
+            if let Some(ctx) = contexts.get_mut(context_id) {
+                ctx.checkpoint_events_since += 1;
+            }
+        }
         Ok(())
     }
 
@@ -3796,6 +3942,7 @@ impl ContextManager {
         {
             let mut contexts = self.contexts.lock().await;
             if let Some(ctx) = contexts.get_mut(context_id) {
+                ctx.checkpoint_events_since += 1;
                 ctx.governance.pending_epoch_resets.push(did.clone());
             }
         }
@@ -3925,6 +4072,12 @@ impl ContextManager {
             "GovernanceConflictResolved",
             actor_did,
         )?;
+        {
+            let mut contexts = self.contexts.lock().await;
+            if let Some(ctx) = contexts.get_mut(context_id) {
+                ctx.checkpoint_events_since += 1;
+            }
+        }
         Ok(())
     }
 
@@ -4000,6 +4153,12 @@ impl ContextManager {
         }
         self.event_log
             .append_context_event(&context_id_bytes, "ContextPromoted", actor_did)?;
+        {
+            let mut contexts = self.contexts.lock().await;
+            if let Some(ctx) = contexts.get_mut(context_id) {
+                ctx.checkpoint_events_since += 1;
+            }
+        }
         Ok(())
     }
 
@@ -4115,6 +4274,12 @@ impl ContextManager {
 
         self.event_log
             .append_context_event(&context_id_bytes, "ContentKeysRotated", actor_did)?;
+        {
+            let mut contexts = self.contexts.lock().await;
+            if let Some(ctx) = contexts.get_mut(context_id) {
+                ctx.checkpoint_events_since += 1;
+            }
+        }
         Ok(())
     }
 
@@ -4215,6 +4380,12 @@ impl ContextManager {
             "GovernanceReconfigured",
             actor_did,
         )?;
+        {
+            let mut contexts = self.contexts.lock().await;
+            if let Some(ctx) = contexts.get_mut(context_id) {
+                ctx.checkpoint_events_since += 1;
+            }
+        }
         Ok(())
     }
 
@@ -4304,6 +4475,12 @@ impl ContextManager {
             "EconomicPolicyChanged",
             actor_did,
         )?;
+        {
+            let mut contexts = self.contexts.lock().await;
+            if let Some(ctx) = contexts.get_mut(context_id) {
+                ctx.checkpoint_events_since += 1;
+            }
+        }
         Ok(())
     }
 
@@ -4354,6 +4531,12 @@ impl ContextManager {
             }
             self.event_log
                 .append_context_event(&context_id_bytes, "EconomicPolicyApplied", "")?;
+            {
+                let mut contexts = self.contexts.lock().await;
+                if let Some(ctx) = contexts.get_mut(context_id) {
+                    ctx.checkpoint_events_since += 1;
+                }
+            }
         }
 
         Ok(applied)
@@ -4472,6 +4655,12 @@ impl ContextManager {
             "EconomicPolicyLocked",
             actor_did,
         )?;
+        {
+            let mut contexts = self.contexts.lock().await;
+            if let Some(ctx) = contexts.get_mut(context_id) {
+                ctx.checkpoint_events_since += 1;
+            }
+        }
         Ok(())
     }
 
@@ -4553,6 +4742,12 @@ impl ContextManager {
             "HardRateLimitModified",
             actor_did,
         )?;
+        {
+            let mut contexts = self.contexts.lock().await;
+            if let Some(ctx) = contexts.get_mut(context_id) {
+                ctx.checkpoint_events_since += 1;
+            }
+        }
         Ok(())
     }
 
@@ -4567,7 +4762,7 @@ impl ContextManager {
     /// - [`ContextError::ContextNotRegistered`] if the context is not registered.
     /// - [`ContextError::ContextNotActive`] if the context is not active.
     /// - [`ContextError::InvalidTransition`] if the state transition fails.
-    #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
     async fn execute_propose_context_migration(
         &self,
         context_id: &str,
@@ -4709,6 +4904,12 @@ impl ContextManager {
             "ContextMigrationStarted",
             actor_did,
         )?;
+        {
+            let mut contexts = self.contexts.lock().await;
+            if let Some(ctx) = contexts.get_mut(context_id) {
+                ctx.checkpoint_events_since += 1;
+            }
+        }
 
         Ok(MigrationProposedResult {
             destination_context_id,
@@ -4795,6 +4996,12 @@ impl ContextManager {
             ),
             actor_did,
         )?;
+        {
+            let mut contexts = self.contexts.lock().await;
+            if let Some(ctx) = contexts.get_mut(context_id) {
+                ctx.checkpoint_events_since += 1;
+            }
+        }
         Ok(())
     }
 
@@ -4898,6 +5105,12 @@ impl ContextManager {
             ),
             "",
         )?;
+        {
+            let mut contexts = self.contexts.lock().await;
+            if let Some(ctx) = contexts.get_mut(context_id) {
+                ctx.checkpoint_events_since += 1;
+            }
+        }
         Ok(())
     }
 
@@ -5507,6 +5720,12 @@ impl ContextManager {
                     "CommitBroadcasted",
                     actor_did,
                 )?;
+                {
+                    let mut contexts = self.contexts.lock().await;
+                    if let Some(ctx) = contexts.get_mut(context_id) {
+                        ctx.checkpoint_events_since += 1;
+                    }
+                }
                 Ok(())
             }
             Err(e) => {
@@ -5561,6 +5780,12 @@ impl ContextManager {
                     "CommitBroadcastPending",
                     actor_did,
                 )?;
+                {
+                    let mut contexts = self.contexts.lock().await;
+                    if let Some(ctx) = contexts.get_mut(context_id) {
+                        ctx.checkpoint_events_since += 1;
+                    }
+                }
                 tracing::warn!(
                     context_id = %context_id,
                     operation = %label,
@@ -5641,6 +5866,7 @@ impl ContextManager {
         let event_log_writes =
             Self::apply_commit_retry_outcomes(contexts, context_id, outcomes, &*clock).await;
         // Phase C (no lock held): append durable event log entries.
+        let mut retry_event_count: u64 = 0;
         for label in event_log_writes {
             if let Err(e) = event_log.append_context_event(&context_id_bytes, label, "system") {
                 tracing::warn!(
@@ -5648,6 +5874,13 @@ impl ContextManager {
                     error = %e,
                     "failed to append commit retry event to durable log"
                 );
+            }
+            retry_event_count += 1;
+        }
+        if retry_event_count > 0 {
+            let mut ctxs = contexts.lock().await;
+            if let Some(ctx) = ctxs.get_mut(context_id) {
+                ctx.checkpoint_events_since += retry_event_count;
             }
         }
     }

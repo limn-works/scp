@@ -126,6 +126,18 @@ impl ContextLog {
 /// with a length prefix. When `None`, no additional bytes are hashed,
 /// preserving backward compatibility with entries created before payloads
 /// were introduced.
+/// Public alias for [`compute_entry_hash`] for test/mock use.
+#[must_use]
+pub fn entry_hash(
+    event: &str,
+    actor_did: &str,
+    timestamp: u64,
+    prev_hash: &[u8; 32],
+    payload: Option<&serde_json::Value>,
+) -> [u8; 32] {
+    compute_entry_hash(event, actor_did, timestamp, prev_hash, payload)
+}
+
 fn compute_entry_hash(
     event: &str,
     actor_did: &str,
