@@ -29,8 +29,9 @@ async fn cac009_tier1_encrypted_block_unblock() {
         .await
         .unwrap();
     for did in &["did:key:dave", "did:key:bob"] {
-        let mut contexts = manager.contexts.lock().await;
-        let ctx = contexts.get_mut("cac009-enc").unwrap();
+        let _arc = manager.contexts.get("cac009-enc").unwrap().value().clone();
+        let mut _g = _arc.lock().await;
+        let ctx = &mut *_g;
         ctx.membership
             .add_member((*did).to_owned().into(), "member".into(), vec![]);
     }
@@ -48,8 +49,9 @@ async fn cac009_tier1_encrypted_block_unblock() {
         .await;
     assert!(result.is_ok(), "Revoke (read) should succeed: {result:?}");
     {
-        let contexts = manager.contexts.lock().await;
-        let ctx = contexts.get("cac009-enc").unwrap();
+        let _arc = manager.contexts.get("cac009-enc").unwrap().value().clone();
+        let _g = _arc.lock().await;
+        let ctx = &*_g;
         assert!(
             ctx.access
                 .read_exclusion_list
@@ -84,8 +86,9 @@ async fn cac009_tier1_encrypted_block_unblock() {
         "RestoreAccess (read) should succeed: {result:?}"
     );
     {
-        let contexts = manager.contexts.lock().await;
-        let ctx = contexts.get("cac009-enc").unwrap();
+        let _arc = manager.contexts.get("cac009-enc").unwrap().value().clone();
+        let _g = _arc.lock().await;
+        let ctx = &*_g;
         assert!(
             !ctx.access
                 .read_exclusion_list
@@ -315,8 +318,9 @@ async fn cac009_tier_stacking_both_must_reverse() {
         .await
         .unwrap();
     {
-        let contexts = manager.contexts.lock().await;
-        let ctx = contexts.get(&ctx_id).unwrap();
+        let _arc = manager.contexts.get(&ctx_id).unwrap().value().clone();
+        let _g = _arc.lock().await;
+        let ctx = &*_g;
         assert!(
             ctx.role_state
                 .suspended_capabilities
@@ -343,8 +347,9 @@ async fn cac009_tier_stacking_both_must_reverse() {
         .await
         .unwrap();
     {
-        let contexts = manager.contexts.lock().await;
-        let ctx = contexts.get(&ctx_id).unwrap();
+        let _arc = manager.contexts.get(&ctx_id).unwrap().value().clone();
+        let _g = _arc.lock().await;
+        let ctx = &*_g;
         assert!(
             !ctx.role_state
                 .suspended_capabilities
@@ -373,8 +378,9 @@ async fn cac009_tier_stacking_both_must_reverse() {
         .await
         .unwrap();
     {
-        let contexts = manager.contexts.lock().await;
-        let ctx = contexts.get(&ctx_id).unwrap();
+        let _arc = manager.contexts.get(&ctx_id).unwrap().value().clone();
+        let _g = _arc.lock().await;
+        let ctx = &*_g;
         assert!(
             !ctx.role_state
                 .suspended_capabilities
@@ -414,8 +420,9 @@ async fn cac009_layer_verification() {
         .await
         .unwrap();
     {
-        let contexts = manager.contexts.lock().await;
-        let ctx = contexts.get(&ctx_id).unwrap();
+        let _arc = manager.contexts.get(&ctx_id).unwrap().value().clone();
+        let _g = _arc.lock().await;
+        let ctx = &*_g;
         assert!(
             ctx.role_state
                 .suspended_capabilities
@@ -628,8 +635,9 @@ async fn cac010_revoke_write_full_can_still_read() {
         .await
         .unwrap();
     {
-        let contexts = manager.contexts.lock().await;
-        let ctx = contexts.get(&ctx_id).unwrap();
+        let _arc = manager.contexts.get(&ctx_id).unwrap().value().clone();
+        let _g = _arc.lock().await;
+        let ctx = &*_g;
         assert!(
             ctx.role_state
                 .suspended_capabilities
@@ -867,8 +875,14 @@ async fn test_recovery_advance_epoch_rollback_on_crypto_failure() {
     );
 
     // Epoch counter must NOT have been incremented.
-    let contexts = manager.contexts.lock().await;
-    let ctx = contexts.get("recovery-fail-1").unwrap();
+    let _arc = manager
+        .contexts
+        .get("recovery-fail-1")
+        .unwrap()
+        .value()
+        .clone();
+    let _g = _arc.lock().await;
+    let ctx = &*_g;
     assert_eq!(
         ctx.epoch.mls_epoch, 0,
         "epoch counter must not increment on crypto failure"
@@ -905,8 +919,14 @@ async fn test_recovery_advance_epoch_rejects_inactive_context() {
     );
 
     // Verify epoch was not advanced.
-    let contexts = manager.contexts.lock().await;
-    let ctx = contexts.get("recovery-inactive-1").unwrap();
+    let _arc = manager
+        .contexts
+        .get("recovery-inactive-1")
+        .unwrap()
+        .value()
+        .clone();
+    let _g = _arc.lock().await;
+    let ctx = &*_g;
     assert_eq!(
         ctx.epoch.mls_epoch, 0,
         "epoch must not change for inactive context"

@@ -48,7 +48,6 @@
 
 use std::collections::HashMap;
 use std::future::Future;
-use std::sync::Arc;
 
 use scp_identity::DID;
 use scp_protocol::context::ContextError;
@@ -67,7 +66,7 @@ use crate::context::tools::invoke::{
 use crate::economy::adapter::PaymentAdapterDyn;
 use crate::economy::integration::PreparedAction;
 
-use super::ContextManager;
+use super::{Arc, ContextManager};
 
 /// Result of a successful managed tool invocation.
 #[derive(Debug)]
@@ -187,8 +186,11 @@ async fn rollback_tool_economy_ticket(
     }
 
     // Reacquire the lock and reverse the per-context bookkeeping.
-    let mut contexts = manager.contexts.lock().await;
-    if let Some(ctx) = contexts.get_mut(context_id) {
+    if let Some(entry) = manager.contexts.get(context_id) {
+        let arc = entry.value().clone();
+        drop(entry);
+        let mut _guard = arc.lock().await;
+        let ctx = &mut *_guard;
         ctx.governance
             .velocity_tracker
             .rollback(&ticket.actor_did, ticket.velocity_token);
@@ -242,20 +244,26 @@ impl ContextManager {
         did: &DID,
         now_secs: u64,
     ) -> bool {
-        let contexts = self.contexts.blocking_lock();
-        contexts
-            .get(context_id)
-            .is_none_or(|ctx| ctx.governance.hard_rate_limit.try_consume(did, now_secs))
+        let Some(entry) = self.contexts.get(context_id) else {
+            return true;
+        };
+        let arc = entry.value().clone();
+        drop(entry);
+        let ctx = arc.blocking_lock();
+        ctx.governance.hard_rate_limit.try_consume(did, now_secs)
     }
 
     /// Synchronously refund one hard-rate-limit token. No-op if the
     /// context is unknown. Same `blocking_lock` constraint as
     /// [`Self::try_consume_hard_rate_limit_blocking`].
     pub fn refund_hard_rate_limit_blocking(&self, context_id: &str, did: &DID) {
-        let contexts = self.contexts.blocking_lock();
-        if let Some(ctx) = contexts.get(context_id) {
-            ctx.governance.hard_rate_limit.refund(did);
-        }
+        let Some(entry) = self.contexts.get(context_id) else {
+            return;
+        };
+        let arc = entry.value().clone();
+        drop(entry);
+        let ctx = arc.blocking_lock();
+        ctx.governance.hard_rate_limit.refund(did);
     }
 
     /// Async variant of [`Self::try_consume_hard_rate_limit_blocking`]
@@ -269,16 +277,23 @@ impl ContextManager {
         did: &DID,
         now_secs: u64,
     ) -> bool {
-        let contexts = self.contexts.lock().await;
-        contexts
-            .get(context_id)
-            .is_none_or(|ctx| ctx.governance.hard_rate_limit.try_consume(did, now_secs))
+        let Some(entry) = self.contexts.get(context_id) else {
+            return true;
+        };
+        let arc = entry.value().clone();
+        drop(entry);
+        let mut _guard = arc.lock().await;
+        let ctx = &mut *_guard;
+        ctx.governance.hard_rate_limit.try_consume(did, now_secs)
     }
 
     /// Async refund. No-op if the context is unknown.
     pub async fn refund_hard_rate_limit(&self, context_id: &str, did: &DID) {
-        let contexts = self.contexts.lock().await;
-        if let Some(ctx) = contexts.get(context_id) {
+        if let Some(_entry) = self.contexts.get(context_id) {
+            let _ctx_arc = Arc::clone(_entry.value());
+            drop(_entry);
+            let _guard = _ctx_arc.lock().await;
+            let ctx = &*_guard;
             ctx.governance.hard_rate_limit.refund(did);
         }
     }
@@ -469,10 +484,11 @@ impl ContextManager {
         let payment_adapter: Option<Arc<dyn PaymentAdapterDyn>> = self.payment_adapter.clone();
 
         let phase1 = {
-            let mut contexts = self.contexts.lock().await;
-            let ctx = contexts
-                .get_mut(context_id)
-                .ok_or_else(|| ContextError::ContextNotRegistered(context_id.to_owned()))?;
+            let _ctx_arc = self
+                .get_context_arc(context_id)
+                .map_err(|_| ContextError::ContextNotRegistered(context_id.to_owned()))?;
+            let mut _guard = _ctx_arc.lock().await;
+            let ctx = &mut *_guard;
 
             let handle = ctx.handle.clone();
             let role_state = ctx.role_state.clone();
@@ -744,7 +760,6 @@ impl ContextManager {
             // lock. The explicit `drop(contexts)` keeps the lock-split
             // visible to code review and to the structural pipeline
             // wiring test in `scp-testing/tests/integration/pipeline_wiring.rs`.
-            drop(contexts);
             snapshot
         };
 
@@ -796,16 +811,18 @@ impl ContextManager {
         // capture call.
         // ------------------------------------------------------------
         let (consequences, ticket) = {
-            let mut contexts = self.contexts.lock().await;
-            let Some(ctx) = contexts.get_mut(context_id) else {
+            let _ctx_arc = if let Some(entry) = self.contexts.get(context_id) {
+                entry.value().clone()
+            } else {
                 // Context vanished between Phase 1 and Phase 3 (e.g.
                 // closed concurrently). Drain the ticket — this will
                 // void the escrow, and the budget/velocity rollback is
                 // a best-effort no-op.
-                drop(contexts);
                 rollback_tool_economy_ticket(self, context_id, ticket).await;
                 return Err(ContextError::ContextNotRegistered(context_id.to_owned()));
             };
+            let mut _guard = _ctx_arc.lock().await;
+            let ctx = &mut *_guard;
 
             let now = self.clock.now_secs();
             let events_for_consequences = super::governance::event_log_entries_for_consequences(
@@ -882,8 +899,11 @@ impl ContextManager {
                         // it would attempt to void the already-
                         // consumed escrow.
                         {
-                            let mut contexts = self.contexts.lock().await;
-                            if let Some(ctx) = contexts.get_mut(context_id) {
+                            if let Some(_entry) = self.contexts.get(context_id) {
+                                let _ctx_arc = Arc::clone(_entry.value());
+                                drop(_entry);
+                                let mut _guard = _ctx_arc.lock().await;
+                                let ctx = &mut *_guard;
                                 if let Some(cost) = ticket.deducted_cost {
                                     ctx.governance
                                         .budget_tracker

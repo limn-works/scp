@@ -61,6 +61,7 @@ zeroize = { workspace = true }
 subtle = { workspace = true }
 unicode-normalization = { workspace = true }
 metrics = { workspace = true }
+dashmap = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "test-util"] }

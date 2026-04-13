@@ -116,13 +116,16 @@ impl ContextManager {
         // to the create-new-context path; the TOCTOU re-check below will
         // resolve any race idempotently.
         {
-            let contexts = self.contexts.lock().await;
-            let mut standing = self.standing_contexts.lock().await;
-            if let Some(ctx) = contexts.get(&context_id) {
+            if let Some(entry) = self.contexts.get(&context_id) {
+                let arc = std::sync::Arc::clone(entry.value());
+                drop(entry);
+                let ctx = arc.lock().await;
                 let state = ctx.handle.try_read_state();
                 match state {
                     // Step 2: Active or still being set up -- return immediately.
                     Some(ContextState::Active | ContextState::Creating) => {
+                        drop(ctx);
+                        let mut standing = self.standing_contexts.lock().await;
                         standing.insert(peer_did.to_string(), peer_did.clone());
                         return Ok(context_id);
                     }
@@ -142,9 +145,6 @@ impl ContextManager {
                     }
                 }
             }
-            // Drop both locks before async creation.
-            drop(standing);
-            drop(contexts);
         }
 
         // Step 3/4: Create a new bilateral-persistent context via the full
@@ -165,13 +165,15 @@ impl ContextManager {
                 // handle's `RwLock` while holding `contexts.lock()`. A
                 // contended state lock is treated as "not idempotent" and
                 // surfaces the original create error rather than masking it.
-                let contexts = self.contexts.lock().await;
-                if let Some(ctx) = contexts.get(&context_id) {
+                if let Some(entry) = self.contexts.get(&context_id) {
+                    let arc = std::sync::Arc::clone(entry.value());
+                    drop(entry);
+                    let ctx = arc.lock().await;
                     if matches!(
                         ctx.handle.try_read_state(),
                         Some(ContextState::Active | ContextState::Creating)
                     ) {
-                        drop(contexts);
+                        drop(ctx);
                         // Concurrent creation succeeded — fall through.
                     } else {
                         return Err(ContextError::TransportFailed(e.to_string()));
@@ -241,7 +243,6 @@ impl ContextManager {
         // last (innermost) since it is the smallest, read-only-during-this-
         // scope structure.
         let handles: Vec<(String, super::super::ContextHandle)> = {
-            let contexts = self.contexts.lock().await;
             let standing = self.standing_contexts.lock().await;
             let local_dids = self.local_dids.read().await;
 
@@ -249,7 +250,10 @@ impl ContextManager {
             for peer_did in standing.values() {
                 for local_did in local_dids.iter() {
                     let context_id = generate_standing_context_id(local_did, peer_did);
-                    if let Some(ctx) = contexts.get(&context_id) {
+                    if let Some(entry) = self.contexts.get(&context_id) {
+                        let arc = std::sync::Arc::clone(entry.value());
+                        drop(entry);
+                        let ctx = arc.lock().await;
                         out.push((context_id, ctx.handle.clone()));
                         break;
                     }

@@ -9,8 +9,8 @@ use scp_protocol::envelope::validation::{BufferedMessage, SequenceCheck, Timesta
 use scp_protocol::identity::SigningKeyId;
 
 use super::{
-    Capability, ContextError, ContextEvent, ContextHandle, ContextManager, DID, PerContextState,
-    context_id_to_bytes, evaluate_consequence_rules, instrument, require_active,
+    Arc, Capability, ContextError, ContextEvent, ContextHandle, ContextManager, DID,
+    PerContextState, context_id_to_bytes, evaluate_consequence_rules, instrument, require_active,
 };
 
 /// Enforces economic policy for message sends (#1537, #1593).
@@ -321,10 +321,11 @@ impl ContextManager {
         let context_id_bytes = context_id_to_bytes(&context_id);
         let routing_id = scp_protocol::context::context_routing_id(&context_id);
         let (broadcast_envelope, recipients_data, sequence, is_broadcast, ticket) = {
-            let mut contexts = self.contexts.lock().await;
-            let ctx = contexts
-                .get_mut(&context_id)
-                .ok_or_else(|| ContextError::ContextNotRegistered(context_id.clone()))?;
+            let _ctx_arc = self
+                .get_context_arc(&context_id)
+                .map_err(|_| ContextError::ContextNotRegistered(context_id.clone()))?;
+            let mut _guard = _ctx_arc.lock().await;
+            let ctx = &mut *_guard;
             require_active(&ctx.handle)?;
             // N3: Fail-close on commit fault — if a prior governance
             // mutation's MLS Commit failed to broadcast and exhausted
@@ -414,7 +415,6 @@ impl ContextManager {
             if let Some(ref mut bc) = ctx.broadcast_context {
                 let Some(sk) = signing_key else {
                     // Phase 1 failed after ticket creation — drain it.
-                    drop(contexts);
                     super::economy::rollback_economy_ticket(self, &context_id, ticket).await;
                     return Err(ContextError::CryptoFailed(
                         "signing key required for broadcast publish".into(),
@@ -429,7 +429,6 @@ impl ContextManager {
                 ) {
                     Ok(env) => env,
                     Err(e) => {
-                        drop(contexts);
                         super::economy::rollback_economy_ticket(self, &context_id, ticket).await;
                         return Err(e);
                     }
@@ -439,7 +438,6 @@ impl ContextManager {
                 // Capability already checked above (H7: before budget deduction).
                 // Assign sequence under lock — SequenceTracker rejects duplicates.
                 let Some(seq) = ctx.membership.next_sequence_number(sender_did) else {
-                    drop(contexts);
                     super::economy::rollback_economy_ticket(self, &context_id, ticket).await;
                     return Err(ContextError::MemberNotFound(format!(
                         "cannot assign sequence: {sender_did} is not a member"
@@ -464,8 +462,11 @@ impl ContextManager {
                 // incremented it for non-broadcast.
                 super::economy::rollback_economy_ticket(self, &context_id, ticket).await;
                 if !is_broadcast {
-                    let mut contexts = self.contexts.lock().await;
-                    if let Some(ctx) = contexts.get_mut(&context_id) {
+                    if let Some(_entry) = self.contexts.get(&context_id) {
+                        let _ctx_arc = Arc::clone(_entry.value());
+                        drop(_entry);
+                        let mut _guard = _ctx_arc.lock().await;
+                        let ctx = &mut *_guard;
                         ctx.membership.rollback_sequence_number(sender_did);
                     }
                 }
@@ -495,8 +496,11 @@ impl ContextManager {
             }
             super::economy::rollback_economy_ticket(self, &context_id, ticket).await;
             if !is_broadcast {
-                let mut contexts = self.contexts.lock().await;
-                if let Some(ctx) = contexts.get_mut(&context_id) {
+                if let Some(_entry) = self.contexts.get(&context_id) {
+                    let _ctx_arc = Arc::clone(_entry.value());
+                    drop(_entry);
+                    let mut _guard = _ctx_arc.lock().await;
+                    let ctx = &mut *_guard;
                     ctx.membership.rollback_sequence_number(sender_did);
                 }
             }
@@ -649,90 +653,95 @@ impl ContextManager {
         )?;
         {
             let now = self.clock.now_secs();
-            let mut contexts = self.contexts.lock().await;
-            if let Some(ctx) = contexts.get_mut(context_id)
-                && require_active(&ctx.handle).is_ok()
-            {
-                ctx.receive_buffer.push(ContextEvent::MessageSent {
-                    sender_did: sender_did.clone(),
-                    sequence_number: sequence,
-                    payload: payload.to_vec(),
-                });
+            if let Some(_entry) = self.contexts.get(context_id) {
+                let _ctx_arc = Arc::clone(_entry.value());
+                drop(_entry);
+                let mut _guard = _ctx_arc.lock().await;
+                let ctx = &mut *_guard;
+                if require_active(&ctx.handle).is_ok() {
+                    ctx.receive_buffer.push(ContextEvent::MessageSent {
+                        sender_did: sender_did.clone(),
+                        sequence_number: sequence,
+                        payload: payload.to_vec(),
+                    });
 
-                // Velocity already recorded in send_message Phase 1 (M4: before
-                // economy enforcement). No duplicate record_message here.
+                    // Velocity already recorded in send_message Phase 1 (M4: before
+                    // economy enforcement). No duplicate record_message here.
 
-                // Consequence enforcement (#1531) — evaluate rules, then dispatch.
-                // evaluate_consequence_rules is called here so the pipeline wiring
-                // gate can detect it in messaging.rs (not hidden inside dispatch_consequences).
-                //
-                // The same event snapshot is reused for both consequence evaluation
-                // and participation record computation (finding #46 dedup).
-                let send_events = super::governance::event_log_entries_for_consequences(
-                    ctx,
-                    context_id,
-                    now,
-                    &*self.event_log,
-                );
-                let consequence_rules: Vec<super::ConsequenceRule> =
-                    ctx.governance.consequence_rules.clone();
-                // evaluate_consequence_rules is called as an expression_statement
-                // (not a let_declaration) so the NO-DISCARD-MSG gate passes.
-                let send_triggered = evaluate_consequence_rules(
-                    &consequence_rules,
-                    &send_events,
-                    sender_did.as_ref(),
-                    now,
-                );
-                super::governance::enforce_triggered_consequences(
-                    ctx,
-                    &super::governance::EnforceConsequencesCtx {
+                    // Consequence enforcement (#1531) — evaluate rules, then dispatch.
+                    // evaluate_consequence_rules is called here so the pipeline wiring
+                    // gate can detect it in messaging.rs (not hidden inside dispatch_consequences).
+                    //
+                    // The same event snapshot is reused for both consequence evaluation
+                    // and participation record computation (finding #46 dedup).
+                    let send_events = super::governance::event_log_entries_for_consequences(
+                        &ctx,
                         context_id,
-                        member_did: sender_did,
                         now,
-                        triggered: &send_triggered,
-                        rules: &consequence_rules,
-                        clock: &*self.clock,
-                        event_log: &*self.event_log,
-                    },
-                );
-
-                // Participation record update (#1530) — refresh cache after send.
-                // Reuses `send_events` from above to avoid a second
-                // event_log_entries_for_consequences call.
-                let send_merkle = self
-                    .event_log
-                    .event_log_merkle_root(context_id_bytes)
-                    .unwrap_or([0u8; 32]);
-                if !send_events.is_empty()
-                    && let Ok(record) =
-                        scp_protocol::trust::participation::compute_participation_record(
-                            &send_events,
-                            sender_did.as_ref(),
+                        &*self.event_log,
+                    );
+                    let consequence_rules: Vec<super::ConsequenceRule> =
+                        ctx.governance.consequence_rules.clone();
+                    // evaluate_consequence_rules is called as an expression_statement
+                    // (not a let_declaration) so the NO-DISCARD-MSG gate passes.
+                    let send_triggered = evaluate_consequence_rules(
+                        &consequence_rules,
+                        &send_events,
+                        sender_did.as_ref(),
+                        now,
+                    );
+                    super::governance::enforce_triggered_consequences(
+                        ctx,
+                        &super::governance::EnforceConsequencesCtx {
                             context_id,
-                            send_merkle,
+                            member_did: sender_did,
                             now,
-                        )
-                    && record.participation_count > 0
-                {
-                    ctx.governance
-                        .participation_cache
-                        .insert(sender_did.to_string(), record);
-                }
+                            triggered: &send_triggered,
+                            rules: &consequence_rules,
+                            clock: &*self.clock,
+                            event_log: &*self.event_log,
+                        },
+                    );
 
-                // Checkpoint tracking (§9.9.3): increment event counter and
-                // create a checkpoint if the event or time threshold is met.
-                ctx.checkpoint_events_since += 1;
-                if let Some(sk) = signing_key {
-                    self.create_checkpoint_if_due(context_id, ctx, sender_did, sk);
+                    // Participation record update (#1530) — refresh cache after send.
+                    // Reuses `send_events` from above to avoid a second
+                    // event_log_entries_for_consequences call.
+                    let send_merkle = self
+                        .event_log
+                        .event_log_merkle_root(context_id_bytes)
+                        .unwrap_or([0u8; 32]);
+                    if !send_events.is_empty()
+                        && let Ok(record) =
+                            scp_protocol::trust::participation::compute_participation_record(
+                                &send_events,
+                                sender_did.as_ref(),
+                                context_id,
+                                send_merkle,
+                                now,
+                            )
+                        && record.participation_count > 0
+                    {
+                        ctx.governance
+                            .participation_cache
+                            .insert(sender_did.to_string(), record);
+                    }
+
+                    // Checkpoint tracking (§9.9.3): increment event counter and
+                    // create a checkpoint if the event or time threshold is met.
+                    ctx.checkpoint_events_since += 1;
+                    if let Some(sk) = signing_key {
+                        self.create_checkpoint_if_due(context_id, ctx, sender_did, sk);
+                    }
                 }
             }
         }
         if self.has_persistence() {
-            let contexts = self.contexts.lock().await;
-            if let Some(ctx) = contexts.get(context_id) {
+            if let Some(_entry) = self.contexts.get(context_id) {
+                let _ctx_arc = Arc::clone(_entry.value());
+                drop(_entry);
+                let _guard = _ctx_arc.lock().await;
+                let ctx = &*_guard;
                 let snapshot = Self::snapshot_context(ctx);
-                drop(contexts);
                 self.persist_context_snapshot(context_id, snapshot);
             }
         }
@@ -802,10 +811,11 @@ impl ContextManager {
         // nested lock ordering issues with the contexts Mutex.
         let local_dids = self.local_dids.read().await;
         let (local_member_did, access_key) = {
-            let contexts = self.contexts.lock().await;
-            let ctx = contexts
-                .get(context_id)
-                .ok_or_else(|| ContextError::ContextNotRegistered(context_id.to_owned()))?;
+            let _ctx_arc = self
+                .get_context_arc(context_id)
+                .map_err(|_| ContextError::ContextNotRegistered(context_id.to_owned()))?;
+            let _guard = _ctx_arc.lock().await;
+            let ctx = &*_guard;
             require_active(&ctx.handle)?;
             let did = ctx
                 .membership
@@ -861,11 +871,16 @@ impl ContextManager {
         // extra lock acquisition on the normal path.
         let sender_is_admin =
             if inner.message_type == scp_protocol::envelope::inner::MessageType::Recovery {
-                let contexts = self.contexts.lock().await;
-                contexts.get(context_id).is_some_and(|ctx| {
+                if let Some(ctx_entry) = self.contexts.get(context_id) {
+                    let ctx_arc = Arc::clone(ctx_entry.value());
+                    drop(ctx_entry);
+                    let _guard = ctx_arc.lock().await;
+                    let ctx = &*_guard;
                     ctx.role_state
                         .member_has_capability(&sender_did, &Capability::ContextClose)
-                })
+                } else {
+                    false
+                }
             } else {
                 false // irrelevant for non-Recovery messages
             };
@@ -929,10 +944,11 @@ impl ContextManager {
         inner: &scp_protocol::envelope::inner::InnerEnvelope,
         now_ms: u64,
     ) -> Result<SequenceCheck, ContextError> {
-        let mut contexts = self.contexts.lock().await;
-        let ctx = contexts
-            .get_mut(context_id)
-            .ok_or_else(|| ContextError::ContextNotRegistered(context_id.to_owned()))?;
+        let _ctx_arc = self
+            .get_context_arc(context_id)
+            .map_err(|_| ContextError::ContextNotRegistered(context_id.to_owned()))?;
+        let mut _guard = _ctx_arc.lock().await;
+        let ctx = &mut *_guard;
 
         // Timestamp validation first — reject timestamps out of bounds.
         let tv = TimestampValidator::default();
@@ -1002,10 +1018,11 @@ impl ContextManager {
             received_at: now_ms,
         };
 
-        let mut contexts = self.contexts.lock().await;
-        let ctx = contexts
-            .get_mut(context_id)
-            .ok_or_else(|| ContextError::ContextNotRegistered(context_id.to_owned()))?;
+        let _ctx_arc = self
+            .get_context_arc(context_id)
+            .map_err(|_| ContextError::ContextNotRegistered(context_id.to_owned()))?;
+        let mut _guard = _ctx_arc.lock().await;
+        let ctx = &mut *_guard;
 
         if let Some((mut gap_info, messages)) = ctx.reorder_buffer.buffer(buffered_msg) {
             let expected = ctx
@@ -1068,10 +1085,11 @@ impl ContextManager {
     ) -> Result<(), ContextError> {
         let sender_did_obj = DID(sender_did.to_owned());
 
-        let mut contexts = self.contexts.lock().await;
-        let ctx = contexts
-            .get_mut(context_id)
-            .ok_or_else(|| ContextError::ContextNotRegistered(context_id.to_owned()))?;
+        let _ctx_arc = self
+            .get_context_arc(context_id)
+            .map_err(|_| ContextError::ContextNotRegistered(context_id.to_owned()))?;
+        let mut _guard = _ctx_arc.lock().await;
+        let ctx = &mut *_guard;
         require_active(&ctx.handle)?;
 
         // Membership + capability check.
@@ -1217,8 +1235,6 @@ impl ContextManager {
         // is available), but the counter must reflect all event log appends
         // including received messages to maintain accurate thresholds.
         ctx.checkpoint_events_since += 1;
-
-        drop(contexts);
 
         crate::metrics::record_message_received();
 

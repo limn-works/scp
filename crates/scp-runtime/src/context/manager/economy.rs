@@ -540,8 +540,11 @@ pub(super) async fn rollback_economy_ticket(
     mut ticket: EconomyTicket,
 ) {
     ticket.consumed = true;
-    let mut contexts = manager.contexts.lock().await;
-    if let Some(ctx) = contexts.get_mut(context_id) {
+    if let Some(entry) = manager.contexts.get(context_id) {
+        let arc = entry.value().clone();
+        drop(entry);
+        let mut _guard = arc.lock().await;
+        let ctx = &mut *_guard;
         ctx.governance
             .velocity_tracker
             .rollback(&ticket.actor_did, ticket.velocity_token);
@@ -578,10 +581,11 @@ impl ContextManager {
 
         // Phase 1: Extract policy + metrics under lock, then drop.
         let (policy, metrics) = {
-            let contexts = self.contexts.lock().await;
-            let ctx = contexts
-                .get(context_id)
-                .ok_or_else(|| ContextError::ContextNotRegistered(context_id.to_owned()))?;
+            let _ctx_arc = self
+                .get_context_arc(context_id)
+                .map_err(|_| ContextError::ContextNotRegistered(context_id.to_owned()))?;
+            let _guard = _ctx_arc.lock().await;
+            let ctx = &*_guard;
 
             let policy = ctx.governance.economic_policy.clone();
             let member_count = u64::try_from(ctx.membership.count()).unwrap_or(u64::MAX);
@@ -686,8 +690,11 @@ impl ContextManager {
 
         // Checkpoint tracking: count this event for threshold-based checkpoints.
         {
-            let mut contexts = self.contexts.lock().await;
-            if let Some(ctx) = contexts.get_mut(context_id) {
+            if let Some(_entry) = self.contexts.get(context_id) {
+                let _ctx_arc = Arc::clone(_entry.value());
+                drop(_entry);
+                let mut _guard = _ctx_arc.lock().await;
+                let ctx = &mut *_guard;
                 ctx.checkpoint_events_since += 1;
             }
         }

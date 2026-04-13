@@ -1,7 +1,7 @@
 //! Broadcast context operations (subscribe, publish, block).
 
 use super::{
-    BlockResult, BroadcastAdmission, BroadcastContent, BroadcastContext, BroadcastEnvelope,
+    Arc, BlockResult, BroadcastAdmission, BroadcastContent, BroadcastContext, BroadcastEnvelope,
     BuildHasher, Capability, ContextError, ContextEvent, ContextManager, DID, DidResolver,
     KeyRequestDecision, NonceTracker, ProofResolver, RevocationChecker, SubscriptionResult,
     UcanToken, UnsubscribeResult, ValidationContext, context_id_to_bytes, instrument,
@@ -44,10 +44,11 @@ impl ContextManager {
         let context_id_bytes = context_id_to_bytes(context_id);
 
         let (result, snapshot) = {
-            let mut contexts = self.contexts.lock().await;
-            let ctx = contexts
-                .get_mut(context_id)
-                .ok_or_else(|| ContextError::ContextNotRegistered(context_id.to_owned()))?;
+            let _ctx_arc = self
+                .get_context_arc(context_id)
+                .map_err(|_| ContextError::ContextNotRegistered(context_id.to_owned()))?;
+            let mut _guard = _ctx_arc.lock().await;
+            let ctx = &mut *_guard;
 
             require_active(&ctx.handle)?;
 
@@ -91,10 +92,12 @@ impl ContextManager {
 
         // Persist context state after subscribe (best-effort).
         if self.has_persistence() {
-            let contexts = self.contexts.lock().await;
-            if let Some(ctx) = contexts.get(context_id) {
+            if let Some(_entry) = self.contexts.get(context_id) {
+                let _ctx_arc = Arc::clone(_entry.value());
+                drop(_entry);
+                let _guard = _ctx_arc.lock().await;
+                let ctx = &*_guard;
                 let ctx_snapshot = Self::snapshot_context(ctx);
-                drop(contexts);
                 self.persist_context_snapshot(context_id, ctx_snapshot);
             }
         }
@@ -106,8 +109,11 @@ impl ContextManager {
             subscriber_did.as_ref(),
         )?;
         {
-            let mut contexts = self.contexts.lock().await;
-            if let Some(ctx) = contexts.get_mut(context_id) {
+            if let Some(_entry) = self.contexts.get(context_id) {
+                let _ctx_arc = Arc::clone(_entry.value());
+                drop(_entry);
+                let mut _guard = _ctx_arc.lock().await;
+                let ctx = &mut *_guard;
                 ctx.checkpoint_events_since += 1;
             }
         }
@@ -136,10 +142,11 @@ impl ContextManager {
         let context_id_bytes = context_id_to_bytes(context_id);
 
         let (result, snapshot) = {
-            let mut contexts = self.contexts.lock().await;
-            let ctx = contexts
-                .get_mut(context_id)
-                .ok_or_else(|| ContextError::ContextNotRegistered(context_id.to_owned()))?;
+            let _ctx_arc = self
+                .get_context_arc(context_id)
+                .map_err(|_| ContextError::ContextNotRegistered(context_id.to_owned()))?;
+            let mut _guard = _ctx_arc.lock().await;
+            let ctx = &mut *_guard;
 
             require_active(&ctx.handle)?;
 
@@ -177,10 +184,12 @@ impl ContextManager {
 
         // Persist context state after unsubscribe (best-effort).
         if self.has_persistence() {
-            let contexts = self.contexts.lock().await;
-            if let Some(ctx) = contexts.get(context_id) {
+            if let Some(_entry) = self.contexts.get(context_id) {
+                let _ctx_arc = Arc::clone(_entry.value());
+                drop(_entry);
+                let _guard = _ctx_arc.lock().await;
+                let ctx = &*_guard;
                 let ctx_snapshot = Self::snapshot_context(ctx);
-                drop(contexts);
                 self.persist_context_snapshot(context_id, ctx_snapshot);
             }
         }
@@ -191,8 +200,11 @@ impl ContextManager {
             subscriber_did.as_ref(),
         )?;
         {
-            let mut contexts = self.contexts.lock().await;
-            if let Some(ctx) = contexts.get_mut(context_id) {
+            if let Some(_entry) = self.contexts.get(context_id) {
+                let _ctx_arc = Arc::clone(_entry.value());
+                drop(_entry);
+                let mut _guard = _ctx_arc.lock().await;
+                let ctx = &mut *_guard;
                 ctx.checkpoint_events_since += 1;
             }
         }
@@ -227,10 +239,11 @@ impl ContextManager {
         let context_id_bytes = context_id_to_bytes(context_id);
 
         let envelope = {
-            let mut contexts = self.contexts.lock().await;
-            let ctx = contexts
-                .get_mut(context_id)
-                .ok_or_else(|| ContextError::ContextNotRegistered(context_id.to_owned()))?;
+            let _ctx_arc = self
+                .get_context_arc(context_id)
+                .map_err(|_| ContextError::ContextNotRegistered(context_id.to_owned()))?;
+            let mut _guard = _ctx_arc.lock().await;
+            let ctx = &mut *_guard;
 
             require_active(&ctx.handle)?;
 
@@ -328,8 +341,11 @@ impl ContextManager {
             author_did.as_ref(),
         )?;
         {
-            let mut contexts = self.contexts.lock().await;
-            if let Some(ctx) = contexts.get_mut(context_id) {
+            if let Some(_entry) = self.contexts.get(context_id) {
+                let _ctx_arc = Arc::clone(_entry.value());
+                drop(_entry);
+                let mut _guard = _ctx_arc.lock().await;
+                let ctx = &mut *_guard;
                 ctx.checkpoint_events_since += 1;
             }
         }
@@ -394,10 +410,11 @@ impl ContextManager {
         let context_id_bytes = context_id_to_bytes(context_id);
 
         let (result, snapshot) = {
-            let mut contexts = self.contexts.lock().await;
-            let ctx = contexts
-                .get_mut(context_id)
-                .ok_or_else(|| ContextError::ContextNotRegistered(context_id.to_owned()))?;
+            let _ctx_arc = self
+                .get_context_arc(context_id)
+                .map_err(|_| ContextError::ContextNotRegistered(context_id.to_owned()))?;
+            let mut _guard = _ctx_arc.lock().await;
+            let ctx = &mut *_guard;
 
             require_active(&ctx.handle)?;
 
@@ -437,8 +454,11 @@ impl ContextManager {
             author_did.as_ref(),
         )?;
         {
-            let mut contexts = self.contexts.lock().await;
-            if let Some(ctx) = contexts.get_mut(context_id) {
+            if let Some(_entry) = self.contexts.get(context_id) {
+                let _ctx_arc = Arc::clone(_entry.value());
+                drop(_entry);
+                let mut _guard = _ctx_arc.lock().await;
+                let ctx = &mut *_guard;
                 ctx.checkpoint_events_since += 1;
             }
         }
@@ -471,10 +491,11 @@ impl ContextManager {
         let context_id_bytes = context_id_to_bytes(context_id);
 
         let snapshot = {
-            let mut contexts = self.contexts.lock().await;
-            let ctx = contexts
-                .get_mut(context_id)
-                .ok_or_else(|| ContextError::ContextNotRegistered(context_id.to_owned()))?;
+            let _ctx_arc = self
+                .get_context_arc(context_id)
+                .map_err(|_| ContextError::ContextNotRegistered(context_id.to_owned()))?;
+            let mut _guard = _ctx_arc.lock().await;
+            let ctx = &mut *_guard;
 
             require_active(&ctx.handle)?;
 
@@ -513,8 +534,11 @@ impl ContextManager {
             author_did.as_ref(),
         )?;
         {
-            let mut contexts = self.contexts.lock().await;
-            if let Some(ctx) = contexts.get_mut(context_id) {
+            if let Some(_entry) = self.contexts.get(context_id) {
+                let _ctx_arc = Arc::clone(_entry.value());
+                drop(_entry);
+                let mut _guard = _ctx_arc.lock().await;
+                let ctx = &mut *_guard;
                 ctx.checkpoint_events_since += 1;
             }
         }
@@ -559,10 +583,11 @@ impl ContextManager {
             )));
         }
 
-        let contexts = self.contexts.lock().await;
-        let ctx = contexts
-            .get(context_id)
-            .ok_or_else(|| ContextError::ContextNotRegistered(context_id.to_owned()))?;
+        let _ctx_arc = self
+            .get_context_arc(context_id)
+            .map_err(|_| ContextError::ContextNotRegistered(context_id.to_owned()))?;
+        let _guard = _ctx_arc.lock().await;
+        let ctx = &*_guard;
 
         let bc = ctx
             .broadcast_context
@@ -577,26 +602,25 @@ impl ContextManager {
     /// Returns `None` if the context is not registered or not broadcast.
     #[instrument(skip_all, fields(context_id))]
     pub async fn broadcast_subscriber_count(&self, context_id: &str) -> Option<usize> {
-        self.contexts.lock().await.get(context_id).and_then(|ctx| {
-            ctx.broadcast_context
-                .as_ref()
-                .map(BroadcastContext::subscriber_count)
-        })
+        let arc = self.contexts.get(context_id)?.value().clone();
+        let ctx = arc.lock().await;
+        ctx.broadcast_context
+            .as_ref()
+            .map(BroadcastContext::subscriber_count)
     }
 
     /// Returns `true` if the given DID is a subscriber in a broadcast context.
     #[instrument(skip_all, fields(context_id))]
     pub async fn is_broadcast_subscriber(&self, context_id: &str, did: &str) -> bool {
-        self.contexts
-            .lock()
-            .await
-            .get(context_id)
-            .and_then(|ctx| {
-                ctx.broadcast_context
-                    .as_ref()
-                    .map(|bc| bc.is_subscriber(did))
-            })
-            .unwrap_or(false)
+        let Some(entry) = self.contexts.get(context_id) else {
+            return false;
+        };
+        let arc = entry.value().clone();
+        drop(entry);
+        let ctx = arc.lock().await;
+        ctx.broadcast_context
+            .as_ref()
+            .is_some_and(|bc| bc.is_subscriber(did))
     }
 
     /// Returns the admission policy for a broadcast context.
@@ -604,10 +628,10 @@ impl ContextManager {
     /// Returns `None` if the context is not registered or not broadcast.
     #[instrument(skip_all, fields(context_id))]
     pub async fn broadcast_admission(&self, context_id: &str) -> Option<BroadcastAdmission> {
-        self.contexts.lock().await.get(context_id).and_then(|ctx| {
-            ctx.broadcast_context
-                .as_ref()
-                .map(BroadcastContext::admission)
-        })
+        let arc = self.contexts.get(context_id)?.value().clone();
+        let ctx = arc.lock().await;
+        ctx.broadcast_context
+            .as_ref()
+            .map(BroadcastContext::admission)
     }
 }

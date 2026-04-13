@@ -12,6 +12,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::hash::BuildHasher;
 use std::sync::Arc;
 
+use dashmap::DashMap;
 use serde::{Deserialize, Serialize};
 use tokio::sync::{Mutex, RwLock};
 
@@ -1118,7 +1119,7 @@ struct TtlState {
 }
 
 /// Internal state tracked by the manager for each context.
-struct PerContextState {
+pub(super) struct PerContextState {
     /// Monotonic generation counter. Assigned on insertion into the contexts
     /// map. Used by Phase 3 re-checks to detect the confused-deputy scenario
     /// where a context was removed and recreated between lock release and
@@ -1177,6 +1178,18 @@ struct PerContextState {
     /// Not persisted in `ContextSnapshot` — the tree is rebuilt from the
     /// `MerkleEventLogProvider`'s entries on `restore_context` / `import_context`.
     merkle_tree: scp_event_log::EventLog,
+}
+
+/// Helper type for generation tokens captured during Phase 1 lock acquisition.
+///
+/// Captures the `context_id` and the `generation` counter at the time the
+/// per-context lock was first acquired. Passed to [`ContextManager::relock_context`]
+/// to verify the context was not removed and recreated between lock release
+/// and reacquire (confused-deputy detection, Phase B).
+#[must_use]
+pub(super) struct ContextGeneration {
+    pub context_id: String,
+    pub generation: u64,
 }
 
 /// Creates a governance engine from a [`GovernanceModel`] selector and
@@ -1843,9 +1856,14 @@ pub struct ContextManager {
     local_dids: RwLock<HashSet<DID>>,
     /// Per-context state, keyed by `context_id` string.
     ///
-    /// Wrapped in `Arc` so spawned timer tasks (TTL expiry #612,
-    /// governance timeout ADR-031 §5) can push events to the receive buffer.
-    contexts: Arc<Mutex<HashMap<String, PerContextState>>>,
+    /// Each context has its own `tokio::sync::Mutex` so operations on
+    /// different contexts never serialize against each other (`DashMap`
+    /// shard locks are released immediately after cloning the `Arc`).
+    ///
+    /// Wrapped in `Arc` so spawned background tasks (TTL expiry, governance
+    /// timeout) can clone the outer `Arc<DashMap>` and access contexts by ID
+    /// without holding a reference to the entire `ContextManager`.
+    contexts: Arc<DashMap<String, Arc<Mutex<PerContextState>>>>,
     /// Resolver that maps a DID to its Ed25519 verifying key for governance
     /// vote signature verification (spec §5.9, ADR-031). Passed through to
     /// governance engines at creation and restoration time.
@@ -1919,7 +1937,7 @@ impl ContextManager {
             event_log: Arc::from(event_log),
             persistence: None,
             local_dids: RwLock::new(HashSet::new()),
-            contexts: Arc::new(Mutex::new(HashMap::new())),
+            contexts: Arc::new(DashMap::new()),
             key_resolver,
             clock: Arc::new(scp_primitives::SystemClock),
             standing_contexts: Mutex::new(HashMap::new()),
@@ -1957,7 +1975,7 @@ impl ContextManager {
             event_log: Arc::from(event_log),
             persistence: Some(Arc::from(persistence)),
             local_dids: RwLock::new(HashSet::new()),
-            contexts: Arc::new(Mutex::new(HashMap::new())),
+            contexts: Arc::new(DashMap::new()),
             key_resolver,
             clock: Arc::new(scp_primitives::SystemClock),
             standing_contexts: Mutex::new(HashMap::new()),
@@ -1984,6 +2002,88 @@ impl ContextManager {
     #[must_use]
     pub fn builder() -> ContextManagerBuilder {
         ContextManagerBuilder::new()
+    }
+
+    // -----------------------------------------------------------------
+    // Per-context lock helpers (DashMap → Arc<Mutex<PerContextState>>)
+    // -----------------------------------------------------------------
+
+    /// Acquires the per-context `Mutex`. Returns an owned guard (the
+    /// `Arc` is cloned so the `DashMap` shard lock is released
+    /// immediately) and a [`ContextGeneration`] token for later
+    /// reacquire verification.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ContextError::ContextNotRegistered`] if `context_id`
+    /// is not in the map.
+    pub(super) async fn lock_context(
+        &self,
+        context_id: &str,
+    ) -> Result<
+        (
+            tokio::sync::OwnedMutexGuard<PerContextState>,
+            ContextGeneration,
+        ),
+        ContextError,
+    > {
+        let arc = self
+            .contexts
+            .get(context_id)
+            .map(|entry| Arc::clone(entry.value()))
+            .ok_or_else(|| ContextError::ContextNotRegistered(context_id.to_owned()))?;
+        let guard = arc.lock_owned().await;
+        let token = ContextGeneration {
+            context_id: context_id.to_owned(),
+            generation: guard.generation,
+        };
+        Ok((guard, token))
+    }
+
+    /// Reacquires the per-context `Mutex` and verifies the generation
+    /// counter matches `token`. Detects the confused-deputy scenario
+    /// where the context was removed and recreated between lock release
+    /// and reacquire (same `context_id`, different state).
+    ///
+    /// # Errors
+    ///
+    /// - [`ContextError::ContextNotRegistered`] if the context is gone.
+    /// - [`ContextError::PermissionDenied`] if the generation changed.
+    pub(super) async fn relock_context(
+        &self,
+        token: &ContextGeneration,
+    ) -> Result<tokio::sync::OwnedMutexGuard<PerContextState>, ContextError> {
+        let arc = self
+            .contexts
+            .get(&token.context_id)
+            .map(|entry| Arc::clone(entry.value()))
+            .ok_or_else(|| ContextError::ContextNotRegistered(token.context_id.clone()))?;
+        let guard = arc.lock_owned().await;
+        if guard.generation != token.generation {
+            return Err(ContextError::PermissionDenied(format!(
+                "context {} was removed and recreated (generation {} != {})",
+                token.context_id, guard.generation, token.generation,
+            )));
+        }
+        Ok(guard)
+    }
+
+    /// Clones the `Arc<Mutex<PerContextState>>` for a context without
+    /// locking the per-context mutex. Used when the caller needs the
+    /// `Arc` but will lock it later.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ContextError::ContextNotRegistered`] if the context is
+    /// not in the map.
+    pub(super) fn get_context_arc(
+        &self,
+        context_id: &str,
+    ) -> Result<Arc<Mutex<PerContextState>>, ContextError> {
+        self.contexts
+            .get(context_id)
+            .map(|entry| Arc::clone(entry.value()))
+            .ok_or_else(|| ContextError::ContextNotRegistered(context_id.to_owned()))
     }
 
     /// Returns `true` if a persistence provider is configured.
@@ -2016,9 +2116,12 @@ impl ContextManager {
     /// Takes the contexts lock, so callers must NOT hold it. Best-effort:
     /// if no metrics recorder is installed, these are no-ops (#1467).
     async fn update_context_gauges(&self) {
-        let contexts = self.contexts.lock().await;
-        crate::metrics::set_active_contexts(contexts.len());
-        let total_buffered: usize = contexts.values().map(|c| c.receive_buffer.len()).sum();
+        crate::metrics::set_active_contexts(self.contexts.len());
+        let mut total_buffered: usize = 0;
+        for entry in self.contexts.iter() {
+            let ctx = entry.value().lock().await;
+            total_buffered += ctx.receive_buffer.len();
+        }
         crate::metrics::set_buffer_occupancy(total_buffered);
     }
 
@@ -2102,14 +2205,16 @@ impl ContextManager {
     /// Persists context and broadcast state if a persistence provider is configured.
     async fn persist_context_and_broadcast(&self, context_id: &str) {
         if self.has_persistence() {
-            let contexts = self.contexts.lock().await;
-            if let Some(ctx) = contexts.get(context_id) {
-                let snapshot = Self::snapshot_context(ctx);
+            if let Some(entry) = self.contexts.get(context_id) {
+                let arc = Arc::clone(entry.value());
+                drop(entry);
+                let ctx = arc.lock().await;
+                let snapshot = Self::snapshot_context(&ctx);
                 let bc_snapshot = ctx
                     .broadcast_context
                     .as_ref()
                     .map(BroadcastContext::to_snapshot);
-                drop(contexts);
+                drop(ctx);
                 self.persist_context_snapshot(context_id, snapshot);
                 if let Some(ref bcs) = bc_snapshot {
                     self.persist_broadcast_snapshot(context_id, bcs);
@@ -2222,8 +2327,10 @@ impl ContextManager {
                 "failed to append PaymentCaptureFailed to event log: {log_err}"
             );
         }
-        let mut contexts = self.contexts.lock().await;
-        if let Some(ctx) = contexts.get_mut(context_id) {
+        if let Some(entry) = self.contexts.get(context_id) {
+            let arc = Arc::clone(entry.value());
+            drop(entry);
+            let mut ctx = arc.lock().await;
             ctx.checkpoint_events_since += 1;
             ctx.receive_buffer.push(ContextEvent::PaymentCaptureFailed {
                 action: action.to_owned(),
@@ -2243,6 +2350,24 @@ impl ContextManager {
 /// Delegates to [`scp_protocol::context::context_id_bytes`] to match builder.rs.
 fn context_id_to_bytes(context_id: &str) -> [u8; 32] {
     scp_protocol::context::context_id_bytes(context_id)
+}
+
+#[cfg(test)]
+impl ContextManager {
+    /// Test helper: acquires the per-context lock for direct state manipulation.
+    pub(crate) async fn with_context_mut<F, R>(&self, context_id: &str, f: F) -> R
+    where
+        F: FnOnce(&mut PerContextState) -> R,
+    {
+        let arc = self
+            .contexts
+            .get(context_id)
+            .expect("context not found in test")
+            .value()
+            .clone();
+        let mut guard = arc.lock().await;
+        f(&mut guard)
+    }
 }
 
 // Compile-time assertion that `ContextManager` is `Send + Sync`.
