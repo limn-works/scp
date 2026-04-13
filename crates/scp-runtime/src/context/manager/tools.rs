@@ -66,7 +66,7 @@ use crate::context::tools::invoke::{
 use crate::economy::adapter::PaymentAdapterDyn;
 use crate::economy::integration::PreparedAction;
 
-use super::{Arc, ContextManager};
+use super::{Arc, ContextGeneration, ContextManager};
 
 /// Result of a successful managed tool invocation.
 #[derive(Debug)]
@@ -486,10 +486,10 @@ impl ContextManager {
         let payment_adapter: Option<Arc<dyn PaymentAdapterDyn>> = self.payment_adapter.clone();
 
         let phase1 = {
-            let ctx_arc = self
-                .get_context_arc(context_id)
+            let (mut guard, ctx_gen) = self
+                .lock_context(context_id)
+                .await
                 .map_err(|_| ContextError::ContextNotRegistered(context_id.to_owned()))?;
-            let mut guard = ctx_arc.lock().await;
             let ctx = &mut *guard;
 
             let handle = ctx.handle.clone();
@@ -761,6 +761,7 @@ impl ContextManager {
                 handle,
                 role_state,
                 ticket,
+                ctx_gen,
             }
         };
 
@@ -768,6 +769,7 @@ impl ContextManager {
             handle,
             role_state,
             ticket,
+            ctx_gen,
         } = phase1;
 
         // ------------------------------------------------------------
@@ -812,17 +814,14 @@ impl ContextManager {
         // capture call.
         // ------------------------------------------------------------
         let (consequences, ticket) = {
-            let ctx_arc = if let Some(entry) = self.contexts.get(context_id) {
-                entry.value().clone()
-            } else {
-                // Context vanished between Phase 1 and Phase 3 (e.g.
-                // closed concurrently). Drain the ticket — this will
-                // void the escrow, and the budget/velocity rollback is
-                // a best-effort no-op.
+            let Ok(mut guard) = self.relock_context(&ctx_gen).await else {
+                // Context vanished or was recreated between Phase 1
+                // and Phase 3 (generation mismatch / not registered).
+                // Drain the ticket — this will void the escrow, and
+                // the budget/velocity rollback is a best-effort no-op.
                 rollback_tool_economy_ticket(self, context_id, ticket).await;
                 return Err(ContextError::ContextNotRegistered(context_id.to_owned()));
             };
-            let mut guard = ctx_arc.lock().await;
             let ctx = &mut *guard;
 
             let now = self.clock.now_secs();
@@ -900,10 +899,7 @@ impl ContextManager {
                         // it would attempt to void the already-
                         // consumed escrow.
                         {
-                            if let Some(entry) = self.contexts.get(context_id) {
-                                let ctx_arc = Arc::clone(entry.value());
-                                drop(entry);
-                                let mut guard = ctx_arc.lock().await;
+                            if let Ok(mut guard) = self.relock_context(&ctx_gen).await {
                                 let ctx = &mut *guard;
                                 if let Some(cost) = ticket.deducted_cost {
                                     ctx.governance
@@ -958,6 +954,7 @@ struct Phase1Snapshot {
     handle: crate::context::ContextHandle,
     role_state: scp_protocol::context::roles::ContextRoleState,
     ticket: ToolEconomyTicket,
+    ctx_gen: ContextGeneration,
 }
 
 /// Maps an [`InvocationError`] to a [`ContextError`] with SCP codes.

@@ -590,14 +590,17 @@ impl ContextManager {
             merkle_tree: scp_event_log::EventLog::new(context_id.to_owned()),
         };
 
-        {
-            if self.contexts.contains_key(context_id) {
+        // Atomic check-and-insert via DashMap entry API — eliminates
+        // TOCTOU race between contains_key and insert.
+        match self.contexts.entry(context_id.to_owned()) {
+            dashmap::mapref::entry::Entry::Occupied(_) => {
                 return Err(ContextError::MembershipFailed(format!(
                     "context '{context_id}' already registered"
                 )));
             }
-            self.contexts
-                .insert(context_id.to_owned(), Arc::new(Mutex::new(per_context)));
+            dashmap::mapref::entry::Entry::Vacant(vacant) => {
+                vacant.insert(Arc::new(Mutex::new(per_context)));
+            }
         }
 
         // Start governance timeout task (ADR-031 §5).
@@ -696,12 +699,19 @@ impl ContextManager {
     /// [`execute_reconnection`](Self::execute_reconnection).
     #[instrument(skip_all)]
     pub async fn contexts_needing_reconnect(&self) -> Vec<String> {
+        // Collect (key, Arc) pairs first to release DashMap shard locks before
+        // awaiting per-context Mutexes. Holding a DashMap Ref across .await
+        // would deadlock any concurrent shard access.
+        let entries: Vec<(String, Arc<Mutex<PerContextState>>)> = self
+            .contexts
+            .iter()
+            .map(|entry| (entry.key().clone(), Arc::clone(entry.value())))
+            .collect();
         let mut result = Vec::new();
-        for entry in self.contexts.iter() {
-            let arc = entry.value().clone();
+        for (context_id, arc) in entries {
             let ctx = arc.lock().await;
             if ctx.epoch.needs_reconnect {
-                result.push(entry.key().clone());
+                result.push(context_id);
             }
         }
         result
@@ -1517,14 +1527,17 @@ impl ContextManager {
             merkle_tree: scp_event_log::EventLog::new(context_id.clone()),
         };
 
-        {
-            if self.contexts.contains_key(&context_id) {
+        // Atomic check-and-insert via DashMap entry API — eliminates
+        // TOCTOU race between contains_key and insert.
+        match self.contexts.entry(context_id.clone()) {
+            dashmap::mapref::entry::Entry::Occupied(_) => {
                 return Err(ContextCreationError::CreationFailed(format!(
                     "context '{context_id}' already registered"
                 )));
             }
-            self.contexts
-                .insert(context_id.clone(), Arc::new(Mutex::new(per_context)));
+            dashmap::mapref::entry::Entry::Vacant(vacant) => {
+                vacant.insert(Arc::new(Mutex::new(per_context)));
+            }
         }
         self.finalize_create(&context_id, params.ttl, &handle).await;
         Ok(handle)
@@ -1697,15 +1710,17 @@ impl ContextManager {
             governance_config,
         )?;
 
-        // Atomic duplicate check + insert under lock.
-        {
-            if self.contexts.contains_key(&context_id) {
+        // Atomic check-and-insert via DashMap entry API — eliminates
+        // TOCTOU race between contains_key and insert.
+        match self.contexts.entry(context_id.clone()) {
+            dashmap::mapref::entry::Entry::Occupied(_) => {
                 return Err(ContextCreationError::CreationFailed(format!(
                     "context '{context_id}' already registered"
                 )));
             }
-            self.contexts
-                .insert(context_id.clone(), Arc::new(Mutex::new(per_context)));
+            dashmap::mapref::entry::Entry::Vacant(vacant) => {
+                vacant.insert(Arc::new(Mutex::new(per_context)));
+            }
         }
 
         self.start_governance_timeout_task(&context_id).await;

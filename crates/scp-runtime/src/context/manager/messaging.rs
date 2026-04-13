@@ -9,8 +9,9 @@ use scp_protocol::envelope::validation::{BufferedMessage, SequenceCheck, Timesta
 use scp_protocol::identity::SigningKeyId;
 
 use super::{
-    Arc, Capability, ContextError, ContextEvent, ContextHandle, ContextManager, DID,
-    PerContextState, context_id_to_bytes, evaluate_consequence_rules, instrument, require_active,
+    Arc, Capability, ContextError, ContextEvent, ContextGeneration, ContextHandle, ContextManager,
+    DID, PerContextState, context_id_to_bytes, evaluate_consequence_rules, instrument,
+    require_active,
 };
 
 /// Enforces economic policy for message sends (#1537, #1593).
@@ -320,11 +321,11 @@ impl ContextManager {
         let context_id = handle.context_id().to_owned();
         let context_id_bytes = context_id_to_bytes(&context_id);
         let routing_id = scp_protocol::context::context_routing_id(&context_id);
-        let (broadcast_envelope, recipients_data, sequence, is_broadcast, ticket) = {
-            let ctx_arc = self
-                .get_context_arc(&context_id)
+        let (broadcast_envelope, recipients_data, sequence, is_broadcast, ticket, ctx_gen) = {
+            let (mut guard, ctx_gen) = self
+                .lock_context(&context_id)
+                .await
                 .map_err(|_| ContextError::ContextNotRegistered(context_id.clone()))?;
-            let mut guard = ctx_arc.lock().await;
             let ctx = &mut *guard;
             require_active(&ctx.handle)?;
             // N3: Fail-close on commit fault — if a prior governance
@@ -435,7 +436,14 @@ impl ContextManager {
                         return Err(e);
                     }
                 };
-                (Some(env), std::collections::HashMap::new(), 0, true, ticket)
+                (
+                    Some(env),
+                    std::collections::HashMap::new(),
+                    0,
+                    true,
+                    ticket,
+                    ctx_gen,
+                )
             } else {
                 // Capability already checked above (H7: before budget deduction).
                 // Assign sequence under lock — SequenceTracker rejects duplicates.
@@ -452,6 +460,7 @@ impl ContextManager {
                     seq,
                     false,
                     ticket,
+                    ctx_gen,
                 )
             }
         };
@@ -520,6 +529,7 @@ impl ContextManager {
             sequence,
             payload,
             signing_key,
+            &ctx_gen,
         )
         .await
     }
@@ -640,6 +650,7 @@ impl ContextManager {
         sequence: u64,
         payload: &[u8],
         signing_key: Option<&ed25519_dalek::SigningKey>,
+        ctx_gen: &ContextGeneration,
     ) -> Result<(), ContextError> {
         // M12: Append event log BEFORE consequence evaluation so that
         // event_log_entries_for_consequences sees the current event.
@@ -650,96 +661,96 @@ impl ContextManager {
             "MessageSent",
             sender_did.as_ref(),
         )?;
+        // Phase 3 reacquire with generation check — detects if the context
+        // was removed and recreated between Phase 1 and Phase 3.
         {
             let now = self.clock.now_secs();
-            if let Some(entry) = self.contexts.get(context_id) {
-                let ctx_arc = Arc::clone(entry.value());
-                drop(entry);
-                let mut guard = ctx_arc.lock().await;
+            if let Ok(mut guard) = self.relock_context(ctx_gen).await {
                 let ctx = &mut *guard;
-                if require_active(&ctx.handle).is_ok() {
-                    ctx.receive_buffer.push(ContextEvent::MessageSent {
-                        sender_did: sender_did.clone(),
-                        sequence_number: sequence,
-                        payload: payload.to_vec(),
-                    });
+                if require_active(&ctx.handle).is_err() {
+                    // Context expired during Phase 2 — rollback the sequence
+                    // number to prevent a permanent gap (Fix 6).
+                    ctx.membership.rollback_sequence_number(sender_did);
+                    return Ok(());
+                }
+                ctx.receive_buffer.push(ContextEvent::MessageSent {
+                    sender_did: sender_did.clone(),
+                    sequence_number: sequence,
+                    payload: payload.to_vec(),
+                });
 
-                    // Velocity already recorded in send_message Phase 1 (M4: before
-                    // economy enforcement). No duplicate record_message here.
+                // Velocity already recorded in send_message Phase 1 (M4: before
+                // economy enforcement). No duplicate record_message here.
 
-                    // Consequence enforcement (#1531) — evaluate rules, then dispatch.
-                    // evaluate_consequence_rules is called here so the pipeline wiring
-                    // gate can detect it in messaging.rs (not hidden inside dispatch_consequences).
-                    //
-                    // The same event snapshot is reused for both consequence evaluation
-                    // and participation record computation (finding #46 dedup).
-                    let send_events = super::governance::event_log_entries_for_consequences(
-                        ctx,
+                // Consequence enforcement (#1531) — evaluate rules, then dispatch.
+                // evaluate_consequence_rules is called here so the pipeline wiring
+                // gate can detect it in messaging.rs (not hidden inside dispatch_consequences).
+                //
+                // The same event snapshot is reused for both consequence evaluation
+                // and participation record computation (finding #46 dedup).
+                let send_events = super::governance::event_log_entries_for_consequences(
+                    ctx,
+                    context_id,
+                    now,
+                    &*self.event_log,
+                );
+                let consequence_rules: Vec<super::ConsequenceRule> =
+                    ctx.governance.consequence_rules.clone();
+                // evaluate_consequence_rules is called as an expression_statement
+                // (not a let_declaration) so the NO-DISCARD-MSG gate passes.
+                let send_triggered = evaluate_consequence_rules(
+                    &consequence_rules,
+                    &send_events,
+                    sender_did.as_ref(),
+                    now,
+                );
+                super::governance::enforce_triggered_consequences(
+                    ctx,
+                    &super::governance::EnforceConsequencesCtx {
                         context_id,
+                        member_did: sender_did,
                         now,
-                        &*self.event_log,
-                    );
-                    let consequence_rules: Vec<super::ConsequenceRule> =
-                        ctx.governance.consequence_rules.clone();
-                    // evaluate_consequence_rules is called as an expression_statement
-                    // (not a let_declaration) so the NO-DISCARD-MSG gate passes.
-                    let send_triggered = evaluate_consequence_rules(
-                        &consequence_rules,
-                        &send_events,
-                        sender_did.as_ref(),
-                        now,
-                    );
-                    super::governance::enforce_triggered_consequences(
-                        ctx,
-                        &super::governance::EnforceConsequencesCtx {
+                        triggered: &send_triggered,
+                        rules: &consequence_rules,
+                        clock: &*self.clock,
+                        event_log: &*self.event_log,
+                    },
+                );
+
+                // Participation record update (#1530) — refresh cache after send.
+                // Reuses `send_events` from above to avoid a second
+                // event_log_entries_for_consequences call.
+                let send_merkle = self
+                    .event_log
+                    .event_log_merkle_root(context_id_bytes)
+                    .unwrap_or([0u8; 32]);
+                if !send_events.is_empty()
+                    && let Ok(record) =
+                        scp_protocol::trust::participation::compute_participation_record(
+                            &send_events,
+                            sender_did.as_ref(),
                             context_id,
-                            member_did: sender_did,
+                            send_merkle,
                             now,
-                            triggered: &send_triggered,
-                            rules: &consequence_rules,
-                            clock: &*self.clock,
-                            event_log: &*self.event_log,
-                        },
-                    );
+                        )
+                    && record.participation_count > 0
+                {
+                    ctx.governance
+                        .participation_cache
+                        .insert(sender_did.to_string(), record);
+                }
 
-                    // Participation record update (#1530) — refresh cache after send.
-                    // Reuses `send_events` from above to avoid a second
-                    // event_log_entries_for_consequences call.
-                    let send_merkle = self
-                        .event_log
-                        .event_log_merkle_root(context_id_bytes)
-                        .unwrap_or([0u8; 32]);
-                    if !send_events.is_empty()
-                        && let Ok(record) =
-                            scp_protocol::trust::participation::compute_participation_record(
-                                &send_events,
-                                sender_did.as_ref(),
-                                context_id,
-                                send_merkle,
-                                now,
-                            )
-                        && record.participation_count > 0
-                    {
-                        ctx.governance
-                            .participation_cache
-                            .insert(sender_did.to_string(), record);
-                    }
-
-                    // Checkpoint tracking (§9.9.3): increment event counter and
-                    // create a checkpoint if the event or time threshold is met.
-                    ctx.checkpoint_events_since += 1;
-                    if let Some(sk) = signing_key {
-                        self.create_checkpoint_if_due(context_id, ctx, sender_did, sk);
-                    }
+                // Checkpoint tracking (§9.9.3): increment event counter and
+                // create a checkpoint if the event or time threshold is met.
+                ctx.checkpoint_events_since += 1;
+                if let Some(sk) = signing_key {
+                    self.create_checkpoint_if_due(context_id, ctx, sender_did, sk);
                 }
             }
         }
         if self.has_persistence()
-            && let Some(entry) = self.contexts.get(context_id)
+            && let Ok(guard) = self.relock_context(ctx_gen).await
         {
-            let ctx_arc = Arc::clone(entry.value());
-            drop(entry);
-            let guard = ctx_arc.lock().await;
             let ctx = &*guard;
             let snapshot = Self::snapshot_context(ctx);
             self.persist_context_snapshot(context_id, snapshot);

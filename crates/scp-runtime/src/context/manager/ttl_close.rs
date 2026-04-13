@@ -367,15 +367,15 @@ impl ContextManager {
         duration: std::time::Duration,
         handle: ContextHandle,
     ) {
-        // Extract the cancel Notify under lock, then drop.
-        let cancel = {
+        // Extract the cancel Notify and generation under lock, then drop.
+        let (cancel, spawn_generation) = {
             let Some(entry) = self.contexts.get(context_id) else {
                 return;
             };
             let arc = entry.value().clone();
             drop(entry);
             let ctx = arc.lock().await;
-            ctx.ttl.timer.cancel.clone()
+            (ctx.ttl.timer.cancel.clone(), ctx.generation)
         };
 
         // Clone Arc-wrapped providers so the spawned task can perform
@@ -411,8 +411,20 @@ impl ContextManager {
                             drop(entry);
                             let mut guard = ctx_arc.lock().await;
                             let ctx = &mut *guard;
-                            if result.is_complete() {
+                            // Generation check: if the context was removed
+                            // and recreated since this timer was spawned,
+                            // the timer belongs to the old context — skip.
+                            if ctx.generation != spawn_generation {
+                                tracing::warn!(
+                                    context_id = %context_id_owned,
+                                    spawn_generation,
+                                    current_generation = ctx.generation,
+                                    "TTL timer fired for stale context generation; skipping"
+                                );
+                            } else if result.is_complete() {
                                 ctx.receive_buffer.push(ContextEvent::Expired);
+                                ctx.governance.timeout_task.cancel();
+                                ctx.governance.decay_participation();
                             } else {
                                 ctx.receive_buffer.push(ContextEvent::ExpiryFailed {
                                     reason: result.to_string(),
@@ -421,9 +433,9 @@ impl ContextManager {
                                     sender_key_destroyed: result.sender_key_destroyed(),
                                     event_logged: result.event_logged(),
                                 });
+                                ctx.governance.timeout_task.cancel();
+                                ctx.governance.decay_participation();
                             }
-                            ctx.governance.timeout_task.cancel();
-                            ctx.governance.decay_participation();
                         }
                     }
                     () = cancel.notified() => {

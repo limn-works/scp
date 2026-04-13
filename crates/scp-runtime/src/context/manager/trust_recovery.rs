@@ -2,7 +2,8 @@
 
 use super::{
     Arc, CheckpointAttestationStatus, ContextCheckpoint, ContextError, ContextManager,
-    CosignedCheckpoint, DID, context_id_to_bytes, instrument, require_active,
+    CosignedCheckpoint, DID, Mutex, PerContextState, context_id_to_bytes, instrument,
+    require_active,
 };
 
 #[allow(clippy::significant_drop_tightening)]
@@ -429,13 +430,20 @@ impl ContextManager {
     ) -> Result<(), ContextError> {
         // Find a context where both the recovering DID and the contact DID
         // are members. The first matching context is used for delivery.
+        // Collect (key, Arc) pairs first to release DashMap shard locks before
+        // awaiting per-context Mutexes. Holding a DashMap Ref across .await
+        // would deadlock any concurrent shard access.
         let shared_context_id = {
+            let entries: Vec<(String, Arc<Mutex<PerContextState>>)> = self
+                .contexts
+                .iter()
+                .map(|entry| (entry.key().clone(), Arc::clone(entry.value())))
+                .collect();
             let mut found = None;
-            for entry in self.contexts.iter() {
-                let arc = entry.value().clone();
+            for (context_id, arc) in entries {
                 let ctx = arc.lock().await;
                 if ctx.membership.contains(recovering_did) && ctx.membership.contains(contact_did) {
-                    found = Some(entry.key().clone());
+                    found = Some(context_id);
                     break;
                 }
             }

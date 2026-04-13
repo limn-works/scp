@@ -1187,7 +1187,6 @@ pub(super) struct PerContextState {
 /// to verify the context was not removed and recreated between lock release
 /// and reacquire (confused-deputy detection, Phase B).
 #[must_use]
-#[allow(dead_code)] // Phase B scaffolding — callers land in subsequent PRs
 pub(super) struct ContextGeneration {
     pub context_id: String,
     pub generation: u64,
@@ -2018,7 +2017,6 @@ impl ContextManager {
     ///
     /// Returns [`ContextError::ContextNotRegistered`] if `context_id`
     /// is not in the map.
-    #[allow(dead_code)] // Phase B scaffolding — callers land in subsequent PRs
     pub(super) async fn lock_context(
         &self,
         context_id: &str,
@@ -2051,7 +2049,6 @@ impl ContextManager {
     ///
     /// - [`ContextError::ContextNotRegistered`] if the context is gone.
     /// - [`ContextError::PermissionDenied`] if the generation changed.
-    #[allow(dead_code)] // Phase B scaffolding — callers land in subsequent PRs
     pub(super) async fn relock_context(
         &self,
         token: &ContextGeneration,
@@ -2120,9 +2117,17 @@ impl ContextManager {
     /// if no metrics recorder is installed, these are no-ops (#1467).
     async fn update_context_gauges(&self) {
         crate::metrics::set_active_contexts(self.contexts.len());
+        // Collect Arcs first to release DashMap shard locks before awaiting
+        // per-context Mutexes. Holding a DashMap Ref across .await would
+        // deadlock any concurrent shard access.
+        let arcs: Vec<Arc<Mutex<PerContextState>>> = self
+            .contexts
+            .iter()
+            .map(|entry| Arc::clone(entry.value()))
+            .collect();
         let mut total_buffered: usize = 0;
-        for entry in self.contexts.iter() {
-            let ctx = entry.value().lock().await;
+        for arc in arcs {
+            let ctx = arc.lock().await;
             total_buffered += ctx.receive_buffer.len();
         }
         crate::metrics::set_buffer_occupancy(total_buffered);
