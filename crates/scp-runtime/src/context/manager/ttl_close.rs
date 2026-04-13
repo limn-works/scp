@@ -1,7 +1,7 @@
 //! TTL management and context close operations.
 
 use super::{
-    Arc, CloseResult, ContextError, ContextEvent, ContextHandle, ContextManager, DID,
+    Arc, Capability, CloseResult, ContextError, ContextEvent, ContextHandle, ContextManager, DID,
     GovernanceModelConfig, TtlExtension, instrument, require_active, ttl,
 };
 
@@ -63,11 +63,12 @@ impl ContextManager {
         // Check governance model: multi-admin contexts must route through
         // governance (SCP-270, ADR-031). Only SingleAdmin contexts can use
         // the direct close_context path.
-        let role_state = {
-            let ctx_arc = self
-                .get_context_arc(&context_id)
+        // Capture generation for confused-deputy detection on reacquire.
+        let (role_state, ctx_gen) = {
+            let (guard, ctx_gen) = self
+                .lock_context(&context_id)
+                .await
                 .map_err(|_| ContextError::ContextNotRegistered(context_id.clone()))?;
-            let guard = ctx_arc.lock().await;
             let ctx = &*guard;
 
             // State check inside lock -- eliminates TOCTOU race.
@@ -85,7 +86,7 @@ impl ContextManager {
                 ));
             }
 
-            ctx.role_state.clone()
+            (ctx.role_state.clone(), ctx_gen)
         };
         // Lock dropped before async ttl::close_context call.
 
@@ -94,13 +95,28 @@ impl ContextManager {
             ttl::close_context(handle, initiator_did, &role_state, self.event_log.as_ref()).await?;
 
         // Cancel TTL timer, governance timeout task, drop broadcast state,
-        // and emit close notification (second lock acquisition).
+        // and emit close notification (second lock acquisition with generation
+        // check for confused-deputy detection + ContextClose TOCTOU re-check).
         {
-            if let Some(entry) = self.contexts.get(&context_id) {
-                let ctx_arc = Arc::clone(entry.value());
-                drop(entry);
-                let mut guard = ctx_arc.lock().await;
+            if let Ok(mut guard) = self.relock_context(&ctx_gen).await {
                 let ctx = &mut *guard;
+
+                // Fix C: Re-check ContextClose capability under the cleanup lock.
+                // If capability was revoked between the first lock and this
+                // reacquire, the state transition already happened (can't undo),
+                // but we log a warning for auditability.
+                if !ctx
+                    .role_state
+                    .member_has_capability(initiator_did.as_ref(), &Capability::ContextClose)
+                {
+                    tracing::warn!(
+                        context_id = %context_id,
+                        initiator_did = %initiator_did,
+                        "ContextClose capability revoked between lock acquisitions — \
+                         state transition already committed, proceeding with cleanup"
+                    );
+                }
+
                 ctx.ttl.timer.cancel();
                 ctx.governance.timeout_task.cancel();
                 // Drop broadcast context state -- keys are zeroed by Zeroize.
@@ -133,11 +149,8 @@ impl ContextManager {
 
         // Persist context state after close (best-effort).
         if self.has_persistence()
-            && let Some(entry) = self.contexts.get(&context_id)
+            && let Ok(guard) = self.relock_context(&ctx_gen).await
         {
-            let ctx_arc = Arc::clone(entry.value());
-            drop(entry);
-            let guard = ctx_arc.lock().await;
             let ctx = &*guard;
             let snapshot = Self::snapshot_context(ctx);
             self.persist_context_snapshot(&context_id, snapshot);
@@ -194,6 +207,16 @@ impl ContextManager {
     pub async fn handle_ttl_expiry(&self, handle: &ContextHandle) -> Result<(), ContextError> {
         let context_id = handle.context_id().to_owned();
 
+        // Capture generation before async expiry work for confused-deputy
+        // detection on reacquire.
+        let ctx_gen = {
+            let (_guard, generation) = self
+                .lock_context(&context_id)
+                .await
+                .map_err(|_| ContextError::ContextNotRegistered(context_id.clone()))?;
+            generation
+        };
+
         // Async TTL expiry logic -- no lock held. Pass transport for
         // best-effort relay ciphertext deletion (§5.11).
         let result = ttl::try_ttl_expiry_cleanup(
@@ -206,12 +229,9 @@ impl ContextManager {
         .await;
 
         // Cancel governance timeout task, decay participation, and emit
-        // appropriate event (lock acquired, then dropped).
+        // appropriate event (lock acquired, then dropped, with generation check).
         {
-            if let Some(entry) = self.contexts.get(&context_id) {
-                let ctx_arc = Arc::clone(entry.value());
-                drop(entry);
-                let mut guard = ctx_arc.lock().await;
+            if let Ok(mut guard) = self.relock_context(&ctx_gen).await {
                 let ctx = &mut *guard;
                 ctx.governance.timeout_task.cancel();
                 // Participation decay on TTL expiry (#1530): clear
@@ -229,16 +249,18 @@ impl ContextManager {
                         event_logged: result.event_logged(),
                     });
                 }
+            } else {
+                tracing::warn!(
+                    context_id = %context_id,
+                    "handle_ttl_expiry: generation mismatch — skipping state mutation"
+                );
             }
         }
 
         // Persist context state after TTL expiry (best-effort).
         if self.has_persistence()
-            && let Some(entry) = self.contexts.get(&context_id)
+            && let Ok(guard) = self.relock_context(&ctx_gen).await
         {
-            let ctx_arc = Arc::clone(entry.value());
-            drop(entry);
-            let guard = ctx_arc.lock().await;
             let ctx = &*guard;
             let snapshot = Self::snapshot_context(ctx);
             self.persist_context_snapshot(&context_id, snapshot);

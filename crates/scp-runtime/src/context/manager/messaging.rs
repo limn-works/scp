@@ -472,13 +472,18 @@ impl ContextManager {
                 // Authorization failure — roll back the ticket. The sequence
                 // number rollback is also needed because Phase 1 already
                 // incremented it for non-broadcast.
-                super::economy::rollback_economy_ticket(self, &context_id, ticket).await;
-                if !is_broadcast && let Some(entry) = self.contexts.get(&context_id) {
-                    let ctx_arc = Arc::clone(entry.value());
-                    drop(entry);
-                    let mut guard = ctx_arc.lock().await;
-                    let ctx = &mut *guard;
-                    ctx.membership.rollback_sequence_number(sender_did);
+                super::economy::rollback_economy_ticket(self, &context_id, ticket, &ctx_gen).await;
+                if !is_broadcast {
+                    if let Ok(mut guard) = self.relock_context(&ctx_gen).await {
+                        let ctx = &mut *guard;
+                        ctx.membership.rollback_sequence_number(sender_did);
+                    } else {
+                        tracing::warn!(
+                            context_id = %context_id,
+                            "send_message: generation mismatch on payment auth rollback — \
+                             sequence number rollback skipped"
+                        );
+                    }
                 }
                 return Err(e);
             }
@@ -504,13 +509,18 @@ impl ContextManager {
             if let Some(a) = auth {
                 self.void_paid_action(a, &context_id).await;
             }
-            super::economy::rollback_economy_ticket(self, &context_id, ticket).await;
-            if !is_broadcast && let Some(entry) = self.contexts.get(&context_id) {
-                let ctx_arc = Arc::clone(entry.value());
-                drop(entry);
-                let mut guard = ctx_arc.lock().await;
-                let ctx = &mut *guard;
-                ctx.membership.rollback_sequence_number(sender_did);
+            super::economy::rollback_economy_ticket(self, &context_id, ticket, &ctx_gen).await;
+            if !is_broadcast {
+                if let Ok(mut guard) = self.relock_context(&ctx_gen).await {
+                    let ctx = &mut *guard;
+                    ctx.membership.rollback_sequence_number(sender_did);
+                } else {
+                    tracing::warn!(
+                        context_id = %context_id,
+                        "send_message: generation mismatch on send failure rollback — \
+                         sequence number rollback skipped"
+                    );
+                }
             }
             return Err(e);
         }

@@ -2555,6 +2555,7 @@ async fn test_standing_context_no_deadlock_under_contention() {
                 let context_id = super::super::standing::generate_standing_context_id(&a, &b);
                 let handle_opt = if let Some(entry) = mgr.contexts.get(&context_id) {
                     let arc = entry.value().clone();
+                    drop(entry); // Drop DashMap shard guard before awaiting per-context lock.
                     let ctx = arc.lock().await;
                     Some(ctx.handle.clone())
                 } else {

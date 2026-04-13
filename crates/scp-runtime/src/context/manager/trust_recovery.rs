@@ -245,14 +245,13 @@ impl ContextManager {
         let context_id_bytes = context_id_to_bytes(context_id);
 
         // 1. Validate the context exists and is active (lock scoped).
-        {
-            let ctx_arc = self
-                .get_context_arc(context_id)
-                .map_err(|_| ContextError::ContextNotRegistered(context_id.to_owned()))?;
-            let guard = ctx_arc.lock().await;
+        //    Capture generation for confused-deputy detection on reacquire.
+        let ctx_gen = {
+            let (guard, generation) = self.lock_context(context_id).await?;
             let ctx = &*guard;
             require_active(&ctx.handle)?;
-        }
+            generation
+        };
 
         // 2. Perform the MLS epoch advance (Update + self-Commit).
         //    If this fails the counter is NOT incremented.
@@ -275,11 +274,10 @@ impl ContextManager {
         }
 
         // 3. Increment bookkeeping counter and manage grace store.
+        //    Verify generation to detect confused-deputy (context removed
+        //    and recreated while we awaited the MLS commit).
         let new_epoch = {
-            let ctx_arc = self
-                .get_context_arc(context_id)
-                .map_err(|_| ContextError::ContextNotRegistered(context_id.to_owned()))?;
-            let mut guard = ctx_arc.lock().await;
+            let mut guard = self.relock_context(&ctx_gen).await?;
             let ctx = &mut *guard;
             // Re-validate after the crypto op to close the TOCTOU window between
             // the active check in step 1 and the counter increment here. A
@@ -306,10 +304,7 @@ impl ContextManager {
             );
         }
         {
-            if let Some(entry) = self.contexts.get(context_id) {
-                let ctx_arc = Arc::clone(entry.value());
-                drop(entry);
-                let mut guard = ctx_arc.lock().await;
+            if let Ok(mut guard) = self.relock_context(&ctx_gen).await {
                 let ctx = &mut *guard;
                 ctx.checkpoint_events_since += 1;
             }
@@ -317,11 +312,8 @@ impl ContextManager {
 
         // 5. Persist if configured (best-effort).
         if self.has_persistence()
-            && let Some(entry) = self.contexts.get(context_id)
+            && let Ok(guard) = self.relock_context(&ctx_gen).await
         {
-            let ctx_arc = Arc::clone(entry.value());
-            drop(entry);
-            let guard = ctx_arc.lock().await;
             let ctx = &*guard;
             let snapshot = Self::snapshot_context(ctx);
             self.persist_context_snapshot(context_id, snapshot);

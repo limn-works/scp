@@ -557,17 +557,19 @@ pub(super) fn rollback_economy_ticket_inline(
 /// deregistered between Phase 1 and rollback (unusual), the rollback
 /// is a best-effort no-op — the ticket is still marked consumed so
 /// the `Drop` guard does not fire.
+///
+/// Verifies the generation counter to detect confused-deputy scenarios
+/// where the context was removed and recreated between Phase 1 and
+/// rollback (Phase B).
 #[allow(clippy::significant_drop_tightening)]
 pub(super) async fn rollback_economy_ticket(
     manager: &ContextManager,
     context_id: &str,
     mut ticket: EconomyTicket,
+    ctx_gen: &super::ContextGeneration,
 ) {
     ticket.consumed = true;
-    if let Some(entry) = manager.contexts.get(context_id) {
-        let arc = entry.value().clone();
-        drop(entry);
-        let mut guard = arc.lock().await;
+    if let Ok(mut guard) = manager.relock_context(ctx_gen).await {
         let ctx = &mut *guard;
         ctx.governance
             .velocity_tracker
@@ -580,6 +582,11 @@ pub(super) async fn rollback_economy_ticket(
                 .budget_tracker
                 .reverse_spend(&ticket.actor_did, cost);
         }
+    } else {
+        tracing::warn!(
+            context_id,
+            "rollback_economy_ticket: generation mismatch — skipping rollback"
+        );
     }
 }
 

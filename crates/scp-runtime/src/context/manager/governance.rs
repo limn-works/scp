@@ -1071,7 +1071,7 @@ impl ContextManager {
 
         // Post-dispatch: MLS coordination, event emission, checkpoint
         // triggering, and cleanup are in a helper to stay within line limits.
-        self.finalize_governance_action(context_id, proposal)
+        self.finalize_governance_action(context_id, proposal, &ctx_gen)
             .await?;
 
         Ok(result)
@@ -1085,11 +1085,12 @@ impl ContextManager {
     ///
     /// Extracted from [`execute_governance_action`] to keep that method
     /// focused on validation and dispatch.
-    #[allow(clippy::too_many_lines)]
+    #[allow(clippy::too_many_lines, clippy::option_if_let_else)]
     async fn finalize_governance_action(
         &self,
         context_id: &str,
         proposal: &GovernanceProposal,
+        ctx_gen: &super::ContextGeneration,
     ) -> Result<(), ContextError> {
         // For MLS-mutating actions (AddMember, RemoveMember, Revoke,
         // ResetMember), increment the epoch counter, place the old epoch into
@@ -1102,10 +1103,7 @@ impl ContextManager {
             let mls_op = generate_mls_operations(proposal)
                 .map_err(|e| ContextError::GovernanceFailed(e.to_string()))?;
 
-            if let Some(entry) = self.contexts.get(context_id) {
-                let ctx_arc = Arc::clone(entry.value());
-                drop(entry);
-                let mut guard = ctx_arc.lock().await;
+            if let Ok(mut guard) = self.relock_context(ctx_gen).await {
                 let ctx = &mut *guard;
                 let old_epoch = ctx.epoch.mls_epoch;
                 ctx.epoch.mls_epoch = old_epoch.saturating_add(1);
@@ -1133,6 +1131,10 @@ impl ContextManager {
 
                 Some(ctx.epoch.mls_epoch)
             } else {
+                tracing::warn!(
+                    context_id,
+                    "finalize_governance_action: generation mismatch on epoch mutation — skipping"
+                );
                 None
             }
         } else {
@@ -1173,10 +1175,7 @@ impl ContextManager {
         {
             let action_summary = proposal.action.variant_name().to_owned();
             let target_did = proposal.action.target_did().cloned();
-            if let Some(entry) = self.contexts.get(context_id) {
-                let ctx_arc = Arc::clone(entry.value());
-                drop(entry);
-                let mut guard = ctx_arc.lock().await;
+            if let Ok(mut guard) = self.relock_context(ctx_gen).await {
                 let ctx = &mut *guard;
                 // Checkpoint tracking: count the GovernanceActionExecuted event.
                 ctx.checkpoint_events_since += 1;
@@ -1275,6 +1274,12 @@ impl ContextManager {
                     let snapshot = Self::snapshot_context(ctx);
                     self.persist_context_snapshot(context_id, snapshot);
                 }
+            } else {
+                tracing::warn!(
+                    context_id,
+                    "finalize_governance_action: generation mismatch on post-dispatch — \
+                     skipping state mutations"
+                );
             }
         }
 
@@ -1976,7 +1981,6 @@ impl ContextManager {
     /// - [`ContextError::ContextNotActive`] if the context is not `Active`.
     /// - [`ContextError::GovernanceFailed`] if the voter is not eligible,
     ///   already voted, or the proposal is not pending.
-    #[allow(clippy::too_many_lines)]
     #[instrument(skip_all, fields(context_id))]
     pub async fn vote_on_proposal(
         &self,
@@ -1985,6 +1989,33 @@ impl ContextManager {
         voter_did: &DID,
         approve: bool,
         signing_key: &ed25519_dalek::SigningKey,
+    ) -> Result<(ProposalStatus, Vec<GovernanceEvent>), ContextError> {
+        self.vote_on_proposal_inner(
+            context_id,
+            proposal_id,
+            voter_did,
+            approve,
+            signing_key,
+            false,
+        )
+        .await
+    }
+
+    /// Inner vote implementation. When `check_vote_capability` is `true`,
+    /// additionally verifies `GovernanceVote` via `member_has_capability`
+    /// under the same lock as the vote (eliminates the TOCTOU window from
+    /// the previous separate lock block in `approve_governance_proposal` /
+    /// `reject_governance_proposal`).
+    #[allow(clippy::too_many_lines)]
+    #[instrument(skip_all, fields(context_id))]
+    async fn vote_on_proposal_inner(
+        &self,
+        context_id: &str,
+        proposal_id: &ProposalId,
+        voter_did: &DID,
+        approve: bool,
+        signing_key: &ed25519_dalek::SigningKey,
+        check_vote_capability: bool,
     ) -> Result<(ProposalStatus, Vec<GovernanceEvent>), ContextError> {
         let (status, events, proposal_for_execution, conflict_events) = {
             let ctx_arc = self
@@ -2018,6 +2049,18 @@ impl ContextManager {
                 return Err(ContextError::PermissionDenied(
                     "presence-only members cannot vote on governance proposals".into(),
                 ));
+            }
+
+            // Atomic capability check under the same lock as the vote
+            // (Phase B: eliminates TOCTOU from separate lock blocks).
+            if check_vote_capability
+                && !ctx
+                    .role_state
+                    .member_has_capability(voter_did.as_ref(), &Capability::GovernanceVote)
+            {
+                return Err(ContextError::PermissionDenied(format!(
+                    "member {voter_did} does not have governance:vote capability"
+                )));
             }
 
             let gov_ctx = Self::build_governance_context(ctx, &*self.clock);
@@ -2250,27 +2293,11 @@ impl ContextManager {
         voter_did: &DID,
         signing_key: &ed25519_dalek::SigningKey,
     ) -> Result<ProposalStatus, ContextError> {
-        // Validate capability before delegating.
-        {
-            let ctx_arc = self
-                .get_context_arc(context_id)
-                .map_err(|_| ContextError::ContextNotRegistered(context_id.to_owned()))?;
-            let guard = ctx_arc.lock().await;
-            let ctx = &*guard;
-
-            if !ctx
-                .role_state
-                .member_has_capability(voter_did.as_ref(), &Capability::GovernanceVote)
-            {
-                return Err(ContextError::PermissionDenied(format!(
-                    "member {voter_did} does not have governance:vote capability"
-                )));
-            }
-        }
-        // Lock dropped.
-
+        // Capability check is atomic inside vote_on_proposal_inner (under
+        // the same lock as the vote) — eliminates the TOCTOU window from
+        // the previous separate lock block.
         let (status, _events) = self
-            .vote_on_proposal(context_id, proposal_id, voter_did, true, signing_key)
+            .vote_on_proposal_inner(context_id, proposal_id, voter_did, true, signing_key, true)
             .await?;
 
         Ok(status)
@@ -2296,27 +2323,11 @@ impl ContextManager {
         voter_did: &DID,
         signing_key: &ed25519_dalek::SigningKey,
     ) -> Result<ProposalStatus, ContextError> {
-        // Validate capability before delegating.
-        {
-            let ctx_arc = self
-                .get_context_arc(context_id)
-                .map_err(|_| ContextError::ContextNotRegistered(context_id.to_owned()))?;
-            let guard = ctx_arc.lock().await;
-            let ctx = &*guard;
-
-            if !ctx
-                .role_state
-                .member_has_capability(voter_did.as_ref(), &Capability::GovernanceVote)
-            {
-                return Err(ContextError::PermissionDenied(format!(
-                    "member {voter_did} does not have governance:vote capability"
-                )));
-            }
-        }
-        // Lock dropped.
-
+        // Capability check is atomic inside vote_on_proposal_inner (under
+        // the same lock as the vote) — eliminates the TOCTOU window from
+        // the previous separate lock block.
         let (status, _events) = self
-            .vote_on_proposal(context_id, proposal_id, voter_did, false, signing_key)
+            .vote_on_proposal_inner(context_id, proposal_id, voter_did, false, signing_key, true)
             .await?;
 
         Ok(status)
@@ -3287,6 +3298,7 @@ impl ContextManager {
         Ok(applied)
     }
 
+    #[allow(clippy::option_if_let_else)]
     async fn execute_close_context(
         &self,
         context_id: &str,
@@ -3298,14 +3310,12 @@ impl ContextManager {
 
         // Extract handle under lock, then drop lock before the async
         // transition to avoid holding the global contexts mutex across .await.
-        let handle = {
-            let ctx_arc = self
-                .get_context_arc(context_id)
-                .map_err(|_| ContextError::ContextNotRegistered(context_id.to_owned()))?;
-            let guard = ctx_arc.lock().await;
+        // Capture generation for confused-deputy detection on reacquire.
+        let (handle, ctx_gen) = {
+            let (guard, ctx_gen) = self.lock_context(context_id).await?;
             let ctx = &*guard;
             require_active(&ctx.handle)?;
-            ctx.handle.clone()
+            (ctx.handle.clone(), ctx_gen)
         };
 
         // Transition to Closing via the state machine (no lock held).
@@ -3316,12 +3326,9 @@ impl ContextManager {
                 ContextError::PermissionDenied("cannot transition to Closing".to_owned())
             })?;
 
-        // Re-acquire lock for cleanup and snapshot.
-        let snapshot = {
-            let ctx_arc = self
-                .get_context_arc(context_id)
-                .map_err(|_| ContextError::ContextNotRegistered(context_id.to_owned()))?;
-            let mut guard = ctx_arc.lock().await;
+        // Re-acquire lock for cleanup and snapshot with generation check
+        // to detect confused-deputy (context removed+recreated during transition).
+        let snapshot = if let Ok(mut guard) = self.relock_context(&ctx_gen).await {
             let ctx = &mut *guard;
 
             // Cancel TTL timer and governance timeout task if active.
@@ -3338,6 +3345,12 @@ impl ContextManager {
             } else {
                 None
             }
+        } else {
+            tracing::warn!(
+                context_id,
+                "execute_close_context: generation mismatch on cleanup reacquire — skipping"
+            );
+            None
         };
 
         if let Some(snapshot) = snapshot {
@@ -3346,10 +3359,7 @@ impl ContextManager {
         self.event_log
             .append_context_event(&context_id_bytes, "ContextClosing", actor_did)?;
         {
-            if let Some(entry) = self.contexts.get(context_id) {
-                let ctx_arc = Arc::clone(entry.value());
-                drop(entry);
-                let mut guard = ctx_arc.lock().await;
+            if let Ok(mut guard) = self.relock_context(&ctx_gen).await {
                 let ctx = &mut *guard;
                 ctx.checkpoint_events_since += 1;
             }

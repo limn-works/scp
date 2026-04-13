@@ -1927,11 +1927,12 @@ impl ContextManager {
         // Phase 1: Economy enforcement + sybil check under lock (budget deduction).
         // This happens BEFORE any crypto mutations so that a rejected payment
         // never grants MLS group access or sender keys.
-        let ticket = {
-            let ctx_arc = self
-                .get_context_arc(&context_id)
+        // Capture generation for confused-deputy detection on rollback reacquire.
+        let (ticket, ctx_gen) = {
+            let (mut guard, ctx_gen) = self
+                .lock_context(&context_id)
+                .await
                 .map_err(|_| ContextError::ContextNotRegistered(context_id.clone()))?;
-            let mut guard = ctx_arc.lock().await;
             let ctx = &mut *guard;
 
             // State check inside lock -- eliminates TOCTOU race.
@@ -1999,13 +2000,16 @@ impl ContextManager {
             // downstream error path (adapter, MLS, sender-key) is forced
             // to roll back velocity + hard_rate_limit + budget, not just
             // the budget.
-            super::economy::EconomyTicket {
-                actor_did: member_did.clone(),
-                deducted_cost,
-                velocity_token,
-                needs_hard_rate_limit_refund: true,
-                consumed: false,
-            }
+            (
+                super::economy::EconomyTicket {
+                    actor_did: member_did.clone(),
+                    deducted_cost,
+                    velocity_token,
+                    needs_hard_rate_limit_refund: true,
+                    consumed: false,
+                },
+                ctx_gen,
+            )
         };
 
         // Phase 2: Authorize payment (escrow hold) BEFORE any crypto mutation.
@@ -2020,7 +2024,7 @@ impl ContextManager {
         {
             Ok(auth) => auth,
             Err(payment_err) => {
-                super::economy::rollback_economy_ticket(self, &context_id, ticket).await;
+                super::economy::rollback_economy_ticket(self, &context_id, ticket, &ctx_gen).await;
                 return Err(payment_err);
             }
         };
@@ -2037,7 +2041,7 @@ impl ContextManager {
                 if let Some(a) = auth {
                     self.void_paid_action(a, &context_id).await;
                 }
-                super::economy::rollback_economy_ticket(self, &context_id, ticket).await;
+                super::economy::rollback_economy_ticket(self, &context_id, ticket, &ctx_gen).await;
                 return Err(e);
             }
         };
@@ -2054,7 +2058,7 @@ impl ContextManager {
             if let Some(a) = auth {
                 self.void_paid_action(a, &context_id).await;
             }
-            super::economy::rollback_economy_ticket(self, &context_id, ticket).await;
+            super::economy::rollback_economy_ticket(self, &context_id, ticket, &ctx_gen).await;
             return Err(e);
         }
 
@@ -2096,7 +2100,7 @@ impl ContextManager {
             if let Some(a) = auth {
                 self.void_paid_action(a, &context_id).await;
             }
-            super::economy::rollback_economy_ticket(self, &context_id, ticket).await;
+            super::economy::rollback_economy_ticket(self, &context_id, ticket, &ctx_gen).await;
             return Err(e);
         }
 
@@ -2113,7 +2117,7 @@ impl ContextManager {
             if let Some(a) = auth {
                 self.void_paid_action(a, &context_id).await;
             }
-            super::economy::rollback_economy_ticket(self, &context_id, ticket).await;
+            super::economy::rollback_economy_ticket(self, &context_id, ticket, &ctx_gen).await;
             return Err(e);
         }
 

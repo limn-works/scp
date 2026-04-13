@@ -308,13 +308,18 @@ impl ContextManager {
         // Phase 3: Evict standing contexts in terminal states.
         // Since generate_standing_context_id hashes the DIDs, we check each
         // standing entry by regenerating its context ID and comparing.
+        // Lock ordering fix: acquire local_dids BEFORE standing_contexts
+        // to match the canonical order (per-context first, then standing).
+        // Collecting into a HashSet avoids holding the RwLock across the
+        // standing_contexts lock acquisition.
         if !terminal_context_ids.is_empty() {
+            let local_did_set: std::collections::HashSet<DID> =
+                self.local_dids.read().await.iter().cloned().collect();
             let mut standing = self.standing_contexts.lock().await;
-            let local_dids = self.local_dids.read().await;
             let to_remove: Vec<String> = standing
                 .iter()
                 .filter(|(_key, peer_did)| {
-                    local_dids.iter().any(|local_did| {
+                    local_did_set.iter().any(|local_did| {
                         let cid = generate_standing_context_id(local_did, peer_did);
                         terminal_context_ids.contains(&cid)
                     })
