@@ -485,6 +485,14 @@ impl ContextManager {
         }
 
         let per_context = PerContextState {
+            generation: if ctx_snapshot.generation == 0 {
+                // Legacy snapshot without generation — assign a fresh one so
+                // the restored context participates in confused-deputy detection.
+                self.next_generation
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            } else {
+                ctx_snapshot.generation
+            },
             handle: handle.clone(),
             membership: ctx_snapshot.membership,
             governance: GovernanceState {
@@ -1165,6 +1173,9 @@ impl ContextManager {
         );
 
         let per_context = PerContextState {
+            generation: self
+                .next_generation
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed),
             handle: handle.clone(),
             membership: export.snapshot.membership,
             role_state: export.snapshot.role_state,
@@ -1419,6 +1430,9 @@ impl ContextManager {
             Self::generate_initial_access_key_store(&context_id, &creator_did);
         let initial_members: HashSet<DID> = membership.members().map(|m| m.did.clone()).collect();
         let per_context = PerContextState {
+            generation: self
+                .next_generation
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed),
             handle: handle.clone(),
             membership,
             governance: GovernanceState {
@@ -1743,6 +1757,9 @@ impl ContextManager {
         }
 
         Ok(PerContextState {
+            generation: self
+                .next_generation
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed),
             handle,
             membership,
             role_state,

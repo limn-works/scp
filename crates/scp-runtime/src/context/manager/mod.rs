@@ -801,6 +801,11 @@ pub struct ContextSnapshot {
     /// Persisted so the time-based checkpoint trigger survives restarts.
     #[serde(default)]
     pub checkpoint_last_time_secs: u64,
+    /// Monotonic generation counter for confused-deputy detection (Phase B).
+    /// Assigned on insertion into the contexts map. Legacy snapshots
+    /// deserialize as `0` via `#[serde(default)]`.
+    #[serde(default)]
+    pub generation: u64,
 }
 
 /// Serializable snapshot of [`SenderVelocityTracker`](scp_protocol::economy::antispam::SenderVelocityTracker)
@@ -1114,6 +1119,11 @@ struct TtlState {
 
 /// Internal state tracked by the manager for each context.
 struct PerContextState {
+    /// Monotonic generation counter. Assigned on insertion into the contexts
+    /// map. Used by Phase 3 re-checks to detect the confused-deputy scenario
+    /// where a context was removed and recreated between lock release and
+    /// reacquire (same `context_id`, different state).
+    generation: u64,
     /// The context handle (retained for state checks and lifecycle operations).
     handle: ContextHandle,
     /// Member tracking.
@@ -1872,6 +1882,13 @@ pub struct ContextManager {
     /// Wrapped in `Arc<Mutex<_>>` because `JoinSet` requires `&mut self` for
     /// `spawn` and is not `Sync`.
     task_set: Arc<tokio::sync::Mutex<tokio::task::JoinSet<()>>>,
+    /// Global monotonic counter for assigning generation IDs to contexts.
+    ///
+    /// Starts at 1 so that generation 0 (the `#[serde(default)]` value for
+    /// legacy snapshots) is never actively assigned. Incremented with
+    /// `Relaxed` ordering — uniqueness is guaranteed by the `fetch_add`
+    /// atomicity, and no other memory accesses depend on the ordering.
+    next_generation: std::sync::atomic::AtomicU64,
 }
 
 // Nursery lint — false-positives on async functions holding tokio::sync::MutexGuard
@@ -1908,6 +1925,7 @@ impl ContextManager {
             standing_contexts: Mutex::new(HashMap::new()),
             payment_adapter: None,
             task_set: Arc::new(tokio::sync::Mutex::new(tokio::task::JoinSet::new())),
+            next_generation: std::sync::atomic::AtomicU64::new(1),
         }
     }
 
@@ -1945,6 +1963,7 @@ impl ContextManager {
             standing_contexts: Mutex::new(HashMap::new()),
             payment_adapter: None,
             task_set: Arc::new(tokio::sync::Mutex::new(tokio::task::JoinSet::new())),
+            next_generation: std::sync::atomic::AtomicU64::new(1),
         }
     }
 
@@ -2159,6 +2178,7 @@ impl ContextManager {
             commit_fault: ctx.commit_fault.clone(),
             checkpoint_events_since: ctx.checkpoint_events_since,
             checkpoint_last_time_secs: ctx.checkpoint_last_time_secs,
+            generation: ctx.generation,
         }
     }
 

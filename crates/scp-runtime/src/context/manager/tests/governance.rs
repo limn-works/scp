@@ -638,6 +638,7 @@ fn governance_snapshot_serde_roundtrip() {
         commit_fault: None,
         checkpoint_events_since: 0,
         checkpoint_last_time_secs: 0,
+        generation: 0,
     };
 
     let json = serde_json::to_string(&snapshot).expect("serialize");
@@ -12124,6 +12125,7 @@ fn velocity_tracker_state_in_context_snapshot_roundtrip() {
         commit_fault: None,
         checkpoint_events_since: 0,
         checkpoint_last_time_secs: 0,
+        generation: 0,
     };
 
     let json = serde_json::to_string(&snapshot).expect("serialize");
@@ -12209,6 +12211,7 @@ fn velocity_tracker_backward_compat_deserialization() {
         commit_fault: None,
         checkpoint_events_since: 0,
         checkpoint_last_time_secs: 0,
+        generation: 0,
     };
 
     let mut json_value: serde_json::Value =
