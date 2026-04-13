@@ -5234,12 +5234,14 @@ impl ContextManager {
         let transport = Arc::clone(&self.transport);
         let ctx_id = context_id.to_owned();
 
+        // Lock ordering: task_set before contexts (consistent with spawn_ttl_timer).
+        let mut task_set = self.task_set.lock().await;
         let mut contexts_guard = self.contexts.lock().await;
         let Some(ctx) = contexts_guard.get_mut(&ctx_id) else {
             return;
         };
 
-        ctx.governance.timeout_task.start({
+        ctx.governance.timeout_task.start_in(&mut task_set, {
             let ctx_id = ctx_id.clone();
             let clock = Arc::clone(&clock);
             let event_log = Arc::clone(&event_log);

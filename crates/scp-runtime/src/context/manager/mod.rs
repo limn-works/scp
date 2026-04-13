@@ -1861,6 +1861,17 @@ pub struct ContextManager {
     ///
     /// Set via [`set_payment_adapter`](Self::set_payment_adapter) or the builder.
     payment_adapter: Option<Arc<dyn crate::economy::adapter::PaymentAdapterDyn>>,
+    /// Shared task set for TTL timers and governance timeout tasks.
+    ///
+    /// Background tasks spawned by [`spawn_ttl_timer`](Self::spawn_ttl_timer) and
+    /// [`start_governance_timeout_task`](Self::start_governance_timeout_task) are
+    /// added to this `JoinSet`. When the `ContextManager` is dropped, all tasks
+    /// in the set are automatically cancelled, providing structured lifecycle
+    /// management. Prerequisite for Phase B (`DashMap` per-context locking).
+    ///
+    /// Wrapped in `Arc<Mutex<_>>` because `JoinSet` requires `&mut self` for
+    /// `spawn` and is not `Sync`.
+    task_set: Arc<tokio::sync::Mutex<tokio::task::JoinSet<()>>>,
 }
 
 // Nursery lint — false-positives on async functions holding tokio::sync::MutexGuard
@@ -1896,6 +1907,7 @@ impl ContextManager {
             clock: Arc::new(scp_primitives::SystemClock),
             standing_contexts: Mutex::new(HashMap::new()),
             payment_adapter: None,
+            task_set: Arc::new(tokio::sync::Mutex::new(tokio::task::JoinSet::new())),
         }
     }
 
@@ -1932,6 +1944,7 @@ impl ContextManager {
             clock: Arc::new(scp_primitives::SystemClock),
             standing_contexts: Mutex::new(HashMap::new()),
             payment_adapter: None,
+            task_set: Arc::new(tokio::sync::Mutex::new(tokio::task::JoinSet::new())),
         }
     }
 

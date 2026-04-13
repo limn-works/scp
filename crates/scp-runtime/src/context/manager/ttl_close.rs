@@ -368,61 +368,64 @@ impl ContextManager {
         let contexts_ref = Arc::clone(&self.contexts);
         let context_id_owned = context_id.to_owned();
 
-        let task = tokio::spawn(async move {
-            tokio::select! {
-                () = tokio::time::sleep(duration) => {
-                    // Timer fired. Run cleanup with exponential backoff
-                    // retries (SCP-169, #612). Pass transport so relay
-                    // ciphertext deletion happens on timer-initiated expiry
-                    // (§5.11, #612 finding 2).
-                    let result = ttl::run_ttl_expiry_with_retries(
-                        &handle,
-                        crypto.as_ref(),
-                        Some(transport.as_ref()),
-                        event_log.as_ref(),
-                        &cancel,
-                    ).await;
+        let abort_handle = {
+            let mut task_set = self.task_set.lock().await;
+            task_set.spawn(async move {
+                tokio::select! {
+                    () = tokio::time::sleep(duration) => {
+                        // Timer fired. Run cleanup with exponential backoff
+                        // retries (SCP-169, #612). Pass transport so relay
+                        // ciphertext deletion happens on timer-initiated expiry
+                        // (§5.11, #612 finding 2).
+                        let result = ttl::run_ttl_expiry_with_retries(
+                            &handle,
+                            crypto.as_ref(),
+                            Some(transport.as_ref()),
+                            event_log.as_ref(),
+                            &cancel,
+                        ).await;
 
-                    // Emit event to the receive buffer and decay governance
-                    // state under a single lock acquisition (matches the
-                    // synchronous handle_ttl_expiry path; H8 fix).
-                    let mut contexts = contexts_ref.lock().await;
-                    if let Some(ctx) = contexts.get_mut(&context_id_owned) {
-                        if result.is_complete() {
-                            ctx.receive_buffer.push(ContextEvent::Expired);
-                        } else {
-                            ctx.receive_buffer.push(ContextEvent::ExpiryFailed {
-                                reason: result.to_string(),
-                                state_transitioned: result.state_transitioned(),
-                                mls_destroyed: result.mls_destroyed(),
-                                sender_key_destroyed: result.sender_key_destroyed(),
-                                event_logged: result.event_logged(),
-                            });
+                        // Emit event to the receive buffer and decay governance
+                        // state under a single lock acquisition (matches the
+                        // synchronous handle_ttl_expiry path; H8 fix).
+                        let mut contexts = contexts_ref.lock().await;
+                        if let Some(ctx) = contexts.get_mut(&context_id_owned) {
+                            if result.is_complete() {
+                                ctx.receive_buffer.push(ContextEvent::Expired);
+                            } else {
+                                ctx.receive_buffer.push(ContextEvent::ExpiryFailed {
+                                    reason: result.to_string(),
+                                    state_transitioned: result.state_transitioned(),
+                                    mls_destroyed: result.mls_destroyed(),
+                                    sender_key_destroyed: result.sender_key_destroyed(),
+                                    event_logged: result.event_logged(),
+                                });
+                            }
+                            // Cancel the governance timeout task and clear
+                            // participation cache, cooldown, proposal timestamps,
+                            // and velocity tracker. Without this the in-memory
+                            // governance state would persist after auto-expiry
+                            // (#1530, H8). Mirrors handle_ttl_expiry and
+                            // close_context. Must run under the same lock so the
+                            // state is fully cleared before any other observer
+                            // sees the Expired/ExpiryFailed event.
+                            ctx.governance.timeout_task.cancel();
+                            ctx.governance.decay_participation();
                         }
-                        // Cancel the governance timeout task and clear
-                        // participation cache, cooldown, proposal timestamps,
-                        // and velocity tracker. Without this the in-memory
-                        // governance state would persist after auto-expiry
-                        // (#1530, H8). Mirrors handle_ttl_expiry and
-                        // close_context. Must run under the same lock so the
-                        // state is fully cleared before any other observer
-                        // sees the Expired/ExpiryFailed event.
-                        ctx.governance.timeout_task.cancel();
-                        ctx.governance.decay_participation();
+                        drop(contexts);
                     }
-                    drop(contexts);
+                    () = cancel.notified() => {
+                        // Timer was cancelled.
+                    }
                 }
-                () = cancel.notified() => {
-                    // Timer was cancelled.
-                }
-            }
-        });
+            })
+        };
 
-        // Store the task handle (lock, then drop).
+        // Store the abort handle for cancel/is_active checks (lock, then drop).
         let context_id_for_store = context_id.to_owned();
         let mut contexts = self.contexts.lock().await;
         if let Some(ctx) = contexts.get_mut(&context_id_for_store) {
-            ctx.ttl.timer.task = Some(task);
+            ctx.ttl.timer.task = Some(abort_handle);
         }
     }
 }

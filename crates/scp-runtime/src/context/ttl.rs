@@ -43,7 +43,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use tokio::sync::Notify;
-use tokio::task::JoinHandle;
+use tokio::task::AbortHandle;
 
 use super::ContextHandle;
 use super::builder::{ContextEventLogProvider, ContextTransportProvider};
@@ -957,8 +957,8 @@ pub async fn run_ttl_expiry_with_retries(
 ///
 /// See ADR-008 acceptance criterion 9.
 pub struct TtlTimer {
-    /// The spawned timer task handle. `None` if no TTL is configured.
-    pub(crate) task: Option<JoinHandle<()>>,
+    /// The spawned timer task abort handle. `None` if no TTL is configured.
+    pub(crate) task: Option<AbortHandle>,
     /// Cancellation signal.
     pub(crate) cancel: Arc<Notify>,
     /// Absolute deadline as Unix epoch seconds, set when timer is spawned.
@@ -1047,7 +1047,7 @@ impl TtlTimer {
         let on_error = self.on_error.clone();
         let context_id = handle.context_id().to_owned();
 
-        let task = tokio::spawn(async move {
+        let handle = tokio::spawn(async move {
             tokio::select! {
                 () = tokio::time::sleep(duration) => {
                     let result = run_ttl_expiry_with_retries(
@@ -1069,7 +1069,7 @@ impl TtlTimer {
             }
         });
 
-        self.task = Some(task);
+        self.task = Some(handle.abort_handle());
     }
 
     /// Cancels the running TTL timer, if any.
@@ -2698,16 +2698,12 @@ mod tests {
         timer.spawn(Duration::from_millis(10), handle.clone(), crypto, event_log);
         assert!(timer.is_active());
 
-        // Advance time past the TTL plus retry delays.
-        tokio::time::advance(Duration::from_secs(60)).await;
-        // Let the spawned task complete.
-        tokio::task::yield_now().await;
-        tokio::time::advance(Duration::from_secs(60)).await;
-        tokio::task::yield_now().await;
-
-        // Wait for the task to finish.
-        if let Some(task) = timer.task.take() {
-            let _ = task.await;
+        // Advance time past the TTL plus retry delays (5 retries with
+        // exponential backoff: 500ms, 1s, 2s, 4s = ~7.5s total).
+        // Advance in steps so the runtime can wake each retry's sleep.
+        for _ in 0..20 {
+            tokio::time::advance(Duration::from_secs(10)).await;
+            tokio::task::yield_now().await;
         }
 
         assert!(callback_invoked.load(Ordering::SeqCst));
@@ -2727,14 +2723,11 @@ mod tests {
 
         timer.spawn(Duration::from_millis(10), handle.clone(), crypto, event_log);
 
-        // Advance time and let the task complete.
-        tokio::time::advance(Duration::from_secs(60)).await;
-        tokio::task::yield_now().await;
-        tokio::time::advance(Duration::from_secs(60)).await;
-        tokio::task::yield_now().await;
-
-        if let Some(task) = timer.task.take() {
-            let _ = task.await;
+        // Advance time past TTL and retry delays, yielding at each step
+        // so the runtime can wake each retry's backoff sleep.
+        for _ in 0..20 {
+            tokio::time::advance(Duration::from_secs(10)).await;
+            tokio::task::yield_now().await;
         }
 
         // Context should be in Expired state (transition succeeded even though
