@@ -2115,11 +2115,9 @@ impl ContextManager {
     /// Called after mutations that change context count or buffer state.
     /// Takes the contexts lock, so callers must NOT hold it. Best-effort:
     /// if no metrics recorder is installed, these are no-ops (#1467).
-    async fn update_context_gauges(&self) {
+    fn update_context_gauges(&self) {
         crate::metrics::set_active_contexts(self.contexts.len());
-        // Collect Arcs first to release DashMap shard locks before awaiting
-        // per-context Mutexes. Holding a DashMap Ref across .await would
-        // deadlock any concurrent shard access.
+        // Collect Arcs first to release DashMap shard locks.
         let arcs: Vec<Arc<Mutex<PerContextState>>> = self
             .contexts
             .iter()
@@ -2127,8 +2125,11 @@ impl ContextManager {
             .collect();
         let mut total_buffered: usize = 0;
         for arc in arcs {
-            let ctx = arc.lock().await;
-            total_buffered += ctx.receive_buffer.len();
+            // Use try_lock to avoid convoy effects: metrics are approximate,
+            // so skipping locked contexts is acceptable.
+            if let Ok(ctx) = arc.try_lock() {
+                total_buffered += ctx.receive_buffer.len();
+            }
         }
         crate::metrics::set_buffer_occupancy(total_buffered);
     }

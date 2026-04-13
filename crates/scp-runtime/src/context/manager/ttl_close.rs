@@ -129,7 +129,7 @@ impl ContextManager {
             }
         }
 
-        self.update_context_gauges().await;
+        self.update_context_gauges();
 
         // Persist context state after close (best-effort).
         if self.has_persistence()

@@ -15,10 +15,16 @@
 //! # Lock ordering
 //!
 //! When acquiring multiple `ContextManager` mutexes inside this module the
-//! canonical order is **`contexts` first, then `standing_contexts`** (most
-//! frequently contended lock acquired innermost). All call sites in this file
-//! follow this order; any new code touching both mutexes must do the same to
-//! preserve a global lock-order graph free of cycles.
+//! canonical order is **per-context `Mutex` first, then `standing_contexts`**
+//! (most frequently contended lock acquired innermost). All call sites in
+//! this file follow this order; any new code touching both mutexes must do
+//! the same to preserve a global lock-order graph free of cycles.
+//!
+//! `reconnect_all_standing` collects data from `standing_contexts` and
+//! `local_dids` first, **drops both locks**, then acquires per-context
+//! Mutexes individually. This prevents a lock ordering inversion with
+//! `standing_context`, which acquires per-context Mutex then
+//! `standing_contexts`.
 //!
 //! Additionally, [`ContextHandle`] interior `RwLock` reads MUST use
 //! [`ContextHandle::try_read_state`] (sync, fail-fast) when performed inside
@@ -235,32 +241,42 @@ impl ContextManager {
     /// Partial reconnection results are still applied -- contexts that
     /// succeeded remain connected.
     pub async fn reconnect_all_standing(&self) -> Result<usize, ContextError> {
-        // Phase 1: Collect (context_id, handle) pairs under locks, then release.
-        // This avoids holding any locks across await points.
-        //
-        // Lock ordering: `contexts` -> `standing_contexts` -> `local_dids`
-        // (see module docs). `local_dids` is an `RwLock` and is acquired
-        // last (innermost) since it is the smallest, read-only-during-this-
-        // scope structure.
-        let handles: Vec<(String, super::super::ContextHandle)> = {
+        // Phase 1: Collect standing context info and local DIDs under their
+        // respective locks, then release BOTH before acquiring per-context
+        // Mutexes. This prevents the lock ordering inversion that would
+        // otherwise occur: standing_context() acquires per-context Mutex
+        // then standing_contexts, so reconnect_all_standing must NOT hold
+        // standing_contexts while acquiring per-context Mutexes.
+        let standing_entries: Vec<(String, scp_identity::DID)> = {
             let standing = self.standing_contexts.lock().await;
-            let local_dids = self.local_dids.read().await;
+            standing
+                .iter()
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect()
+        };
+        // standing_contexts lock DROPPED.
 
-            let mut out = Vec::new();
-            for peer_did in standing.values() {
-                for local_did in local_dids.iter() {
-                    let context_id = generate_standing_context_id(local_did, peer_did);
-                    if let Some(entry) = self.contexts.get(&context_id) {
-                        let arc = std::sync::Arc::clone(entry.value());
-                        drop(entry);
-                        let ctx = arc.lock().await;
-                        out.push((context_id, ctx.handle.clone()));
-                        break;
-                    }
+        let local_did_list: Vec<scp_identity::DID> = {
+            let local_dids = self.local_dids.read().await;
+            local_dids.iter().cloned().collect()
+        };
+        // local_dids lock DROPPED.
+
+        // Phase 1b: Resolve context IDs and clone handles under individual
+        // per-context Mutexes only (no standing_contexts or local_dids held).
+        let mut handles: Vec<(String, super::super::ContextHandle)> = Vec::new();
+        for (_key, peer_did) in &standing_entries {
+            for local_did in &local_did_list {
+                let context_id = generate_standing_context_id(local_did, peer_did);
+                if let Some(entry) = self.contexts.get(&context_id) {
+                    let arc = std::sync::Arc::clone(entry.value());
+                    drop(entry);
+                    let ctx = arc.lock().await;
+                    handles.push((context_id, ctx.handle.clone()));
+                    break;
                 }
             }
-            out
-        };
+        }
 
         // Phase 2: Iterate collected handles without any locks held.
         // Track terminal context IDs for eviction in Phase 3.

@@ -746,6 +746,12 @@ impl ContextManager {
                 if let Some(sk) = signing_key {
                     self.create_checkpoint_if_due(context_id, ctx, sender_did, sk);
                 }
+            } else {
+                tracing::warn!(
+                    context_id,
+                    "finalize_send: generation mismatch or context removed — \
+                     consequence evaluation skipped"
+                );
             }
         }
         if self.has_persistence()

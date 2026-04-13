@@ -1355,7 +1355,7 @@ impl ContextManager {
                 .insert(context_id.clone(), Arc::new(Mutex::new(per_context)));
         }
 
-        self.update_context_gauges().await;
+        self.update_context_gauges();
 
         // Start governance timeout task (ADR-031 §5).
         self.start_governance_timeout_task(&context_id).await;
@@ -1550,7 +1550,7 @@ impl ContextManager {
         ttl: Option<std::time::Duration>,
         handle: &ContextHandle,
     ) {
-        self.update_context_gauges().await;
+        self.update_context_gauges();
         self.start_governance_timeout_task(context_id).await;
         self.persist_context_and_broadcast(context_id).await;
         if let Some(ttl_duration) = ttl {
@@ -1580,8 +1580,12 @@ impl ContextManager {
             let mut guard = ctx_arc.lock().await;
             let ctx = &mut *guard;
             let new_handle = ContextHandle::new(context_id.to_owned(), new_params);
-            // Preserve the current state.
-            let current_state = ctx.handle.state().await;
+            // Preserve the current state. Use try_read_state() to avoid
+            // deadlock: the per-context Mutex is already held, and
+            // handle.state().await would await on the ContextHandle RwLock.
+            // Fallback to Active if the read is contended (test-only method,
+            // contention is unlikely).
+            let current_state = ctx.handle.try_read_state().unwrap_or(ContextState::Active);
             let _ = new_handle.transition_to(&current_state).await;
             ctx.handle = new_handle;
         }
@@ -2298,11 +2302,10 @@ impl ContextManager {
         // PR #1606 C6: also check the commit fault marker so a fail-closed
         // context refuses further leave operations until an operator
         // acknowledges the fault.
-        let is_broadcast = {
-            let ctx_arc = self
-                .get_context_arc(&context_id)
-                .map_err(|_| ContextError::ContextNotRegistered(context_id.clone()))?;
-            let guard = ctx_arc.lock().await;
+        // Use lock_context to capture a generation token for confused-deputy
+        // detection in subsequent lock scopes (Phase B).
+        let (is_broadcast, ctx_gen) = {
+            let (guard, generation) = self.lock_context(&context_id).await?;
             let ctx = &*guard;
             // Authorization: self-removal always allowed; otherwise MemberRemove required.
             if caller_did != member_did
@@ -2315,7 +2318,7 @@ impl ContextManager {
                 ));
             }
             Self::check_commit_fault(ctx)?;
-            ctx.broadcast_context.is_some()
+            (ctx.broadcast_context.is_some(), generation)
         };
 
         // Crypto operations -- no lock held. Skip for broadcast mode (no MLS).
@@ -2372,11 +2375,9 @@ impl ContextManager {
         }
 
         // Atomic state check + membership removal + count check within single lock.
+        // Use relock_context for generation verification (Phase B).
         let should_close = {
-            let ctx_arc = self
-                .get_context_arc(&context_id)
-                .map_err(|_| ContextError::ContextNotRegistered(context_id.clone()))?;
-            let mut guard = ctx_arc.lock().await;
+            let mut guard = self.relock_context(&ctx_gen).await?;
             let ctx = &mut *guard;
 
             // State check inside lock -- eliminates TOCTOU race.
@@ -2425,22 +2426,20 @@ impl ContextManager {
             "MemberLeft",
             member_did.as_ref(),
         )?;
-        {
-            if let Some(entry) = self.contexts.get(&context_id) {
-                let ctx_arc = Arc::clone(entry.value());
-                drop(entry);
-                let mut guard = ctx_arc.lock().await;
-                let ctx = &mut *guard;
-                ctx.checkpoint_events_since += 1;
-            }
+        // Use relock_context for generation verification (Phase B).
+        if let Ok(mut guard) = self.relock_context(&ctx_gen).await {
+            let ctx = &mut *guard;
+            ctx.checkpoint_events_since += 1;
+        } else {
+            tracing::warn!(
+                context_id = %context_id,
+                "leave_context: generation mismatch — checkpoint counter not incremented"
+            );
         }
         // Persist context state after leave (best-effort).
         if self.has_persistence()
-            && let Some(entry) = self.contexts.get(&context_id)
+            && let Ok(guard) = self.relock_context(&ctx_gen).await
         {
-            let ctx_arc = Arc::clone(entry.value());
-            drop(entry);
-            let guard = ctx_arc.lock().await;
             let ctx = &*guard;
             let snapshot = Self::snapshot_context(ctx);
             self.persist_context_snapshot(&context_id, snapshot);

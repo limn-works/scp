@@ -1014,51 +1014,34 @@ impl ContextManager {
             )));
         }
 
-        // PR #1606 C6 fail-close gate: if the persistent commit retry queue
-        // exhausted its budget for a previous mutation, refuse new governance
-        // actions until an operator acknowledges the fault. Without this
-        // gate, an ejected member could remain in the MLS group while local
-        // governance keeps advancing on a divergent epoch.
-        {
-            if let Some(entry) = self.contexts.get(context_id) {
-                let ctx_arc = Arc::clone(entry.value());
-                drop(entry);
-                let guard = ctx_arc.lock().await;
-                let ctx = &*guard;
-                Self::check_commit_fault(ctx)?;
-            }
-        }
+        // PR #1606 C6 fail-close gate + atomically check replay AND mark as
+        // executed before dispatch. Combined into a single lock scope using
+        // lock_context to capture a generation token for later relock_context
+        // calls (Phase B confused-deputy detection).
+        let ctx_gen = {
+            let (mut guard, generation) = self.lock_context(context_id).await?;
+            let ctx = &mut *guard;
+            Self::check_commit_fault(ctx)?;
 
-        // Atomically check replay AND mark as executed before dispatch.
-        // This prevents TOCTOU races where concurrent callers both pass the
-        // replay check before either records the proposal as executed.
-        {
-            if let Some(entry) = self.contexts.get(context_id) {
-                let ctx_arc = Arc::clone(entry.value());
-                drop(entry);
-                let mut guard = ctx_arc.lock().await;
-                let ctx = &mut *guard;
-                if ctx
-                    .governance
-                    .executed_proposals
-                    .contains_key(&proposal.proposal_id)
-                {
-                    return Err(ContextError::PermissionDenied(
-                        "governance proposal has already been executed".into(),
-                    ));
-                }
-                let now = self.clock.now_secs();
-                // Evict entries older than the TTL before inserting.
-                ctx.governance
-                    .executed_proposals
-                    .retain(|_, ts| now.saturating_sub(*ts) < EXECUTED_PROPOSALS_TTL_SECS);
-                ctx.governance
-                    .executed_proposals
-                    .insert(proposal.proposal_id, now);
-            } else {
-                return Err(ContextError::ContextNotRegistered(context_id.to_owned()));
+            if ctx
+                .governance
+                .executed_proposals
+                .contains_key(&proposal.proposal_id)
+            {
+                return Err(ContextError::PermissionDenied(
+                    "governance proposal has already been executed".into(),
+                ));
             }
-        }
+            let now = self.clock.now_secs();
+            // Evict entries older than the TTL before inserting.
+            ctx.governance
+                .executed_proposals
+                .retain(|_, ts| now.saturating_sub(*ts) < EXECUTED_PROPOSALS_TTL_SECS);
+            ctx.governance
+                .executed_proposals
+                .insert(proposal.proposal_id, now);
+            generation
+        };
 
         // Governance action costing: no PaidActionType::GovernanceAction
         // variant exists yet. Governance actions are free until the economy
@@ -1069,14 +1052,18 @@ impl ContextManager {
             Err(e) => {
                 // Roll back the executed marker on dispatch failure so the
                 // proposal can be retried (e.g. after a transient crypto error).
-                if let Some(entry) = self.contexts.get(context_id) {
-                    let ctx_arc = Arc::clone(entry.value());
-                    drop(entry);
-                    let mut guard = ctx_arc.lock().await;
+                // Use relock_context for generation verification.
+                if let Ok(mut guard) = self.relock_context(&ctx_gen).await {
                     let ctx = &mut *guard;
                     ctx.governance
                         .executed_proposals
                         .remove(&proposal.proposal_id);
+                } else {
+                    tracing::warn!(
+                        context_id,
+                        "execute_governance_action: generation mismatch on rollback — \
+                         executed_proposals marker may be stale"
+                    );
                 }
                 return Err(e);
             }
@@ -1753,7 +1740,7 @@ impl ContextManager {
         ),
         ContextError,
     > {
-        self.propose_governance_action_inner(context_id, proposer_did, action, signing_key)
+        self.propose_governance_action_inner(context_id, proposer_did, action, signing_key, false)
             .await
     }
 
@@ -1762,6 +1749,10 @@ impl ContextManager {
     /// Returns the proposal, events, and optional execution result. The
     /// execution result is `Some` when the proposal was auto-approved
     /// (`SingleAdmin`) and the action was successfully executed.
+    ///
+    /// When `check_propose_capability` is `true`, the `GovernancePropose`
+    /// capability is verified under the same lock as the proposal submission,
+    /// eliminating the TOCTOU race in `propose_governance_action_checked`.
     #[allow(clippy::too_many_lines)]
     async fn propose_governance_action_inner(
         &self,
@@ -1769,6 +1760,7 @@ impl ContextManager {
         proposer_did: &DID,
         action: GovernanceAction,
         signing_key: &ed25519_dalek::SigningKey,
+        check_propose_capability: bool,
     ) -> Result<
         (
             GovernanceProposal,
@@ -1790,6 +1782,22 @@ impl ContextManager {
                 require_migrating_out(&ctx.handle)?;
             } else {
                 require_active(&ctx.handle)?;
+            }
+
+            // GovernancePropose capability check — performed under the same
+            // lock as the proposal submission to prevent TOCTOU races where
+            // the capability is revoked between the check and the propose.
+            // Only checked when called from propose_governance_action_checked
+            // (the external API); the unchecked variant skips this for
+            // internal callers that have already verified capability.
+            if check_propose_capability
+                && !ctx
+                    .role_state
+                    .member_has_capability(proposer_did.as_ref(), &Capability::GovernancePropose)
+            {
+                return Err(ContextError::PermissionDenied(format!(
+                    "member {proposer_did} does not have governance:propose capability"
+                )));
             }
 
             // Presence-only members (read + write both suspended) lose
@@ -2205,29 +2213,13 @@ impl ContextManager {
         action: GovernanceAction,
         signing_key: &ed25519_dalek::SigningKey,
     ) -> Result<ProposalOutcome, ContextError> {
-        // Validate capability before delegating. The suspension-aware
-        // member_has_capability also rejects presence-only members whose
-        // GovernancePropose capability has been suspended (§5.9, ADR-038).
-        {
-            let ctx_arc = self
-                .get_context_arc(context_id)
-                .map_err(|_| ContextError::ContextNotRegistered(context_id.to_owned()))?;
-            let guard = ctx_arc.lock().await;
-            let ctx = &*guard;
-
-            if !ctx
-                .role_state
-                .member_has_capability(proposer_did.as_ref(), &Capability::GovernancePropose)
-            {
-                return Err(ContextError::PermissionDenied(format!(
-                    "member {proposer_did} does not have governance:propose capability"
-                )));
-            }
-        }
-        // Lock dropped.
-
+        // GovernancePropose capability check is performed INSIDE
+        // propose_governance_action_inner (check_propose_capability=true)
+        // under the same lock as the proposal submission. This eliminates
+        // the TOCTOU race where a separate check-then-act pattern allowed
+        // capability revocation between the check and the propose.
         let (proposal, _events, execution_result) = self
-            .propose_governance_action_inner(context_id, proposer_did, action, signing_key)
+            .propose_governance_action_inner(context_id, proposer_did, action, signing_key, true)
             .await?;
 
         let status = proposal.status.clone();
@@ -5446,14 +5438,19 @@ impl ContextManager {
                         let mut guard = ctx_arc.lock().await;
                         let ctx = &mut *guard;
 
-                        // Use blocking async read — `try_read_state()` returns
-                        // `None` on transient write-contention which would
-                        // permanently stop this task.
+                        // Use try_read_state() to avoid deadlock: the per-context
+                        // Mutex is already held, and handle.state().await would
+                        // await on the ContextHandle RwLock, deadlocking against
+                        // any task holding the RwLock write and waiting for this
+                        // Mutex.
+                        let current_state = ctx.handle.try_read_state();
                         if !matches!(
-                            ctx.handle.state().await,
-                            scp_protocol::context::ContextState::Active
+                            current_state,
+                            Some(scp_protocol::context::ContextState::Active)
                         ) {
-                            return false; // No longer active — stop the loop.
+                            // None = write-contended, try again next tick.
+                            // Not Active = context closing, stop the loop.
+                            return current_state.is_none(); // true = continue, false = stop
                         }
 
                         let gov_ctx = Self::build_governance_context(ctx, &*clock);
