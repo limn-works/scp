@@ -84,11 +84,11 @@ impl ContextManager {
             )));
         }
 
-        let _ctx_arc = self
+        let ctx_arc = self
             .get_context_arc(context_id)
             .map_err(|_| ContextError::ContextNotRegistered(context_id.to_owned()))?;
-        let _guard = _ctx_arc.lock().await;
-        let ctx = &*_guard;
+        let guard = ctx_arc.lock().await;
+        let ctx = &*guard;
 
         let bc = ctx
             .broadcast_context
@@ -254,11 +254,11 @@ impl ContextManager {
             let local_major =
                 scp_protocol::envelope::version_major(scp_protocol::envelope::SCP_PROTOCOL_VERSION);
             let remote_major = local_major; // same major guaranteed by VersionCompatibility
-            if let Some(_entry) = self.contexts.get(context_id) {
-                let _ctx_arc = Arc::clone(_entry.value());
-                drop(_entry);
-                let mut _guard = _ctx_arc.lock().await;
-                let ctx = &mut *_guard;
+            if let Some(entry) = self.contexts.get(context_id) {
+                let ctx_arc = Arc::clone(entry.value());
+                drop(entry);
+                let mut guard = ctx_arc.lock().await;
+                let ctx = &mut *guard;
                 ctx.receive_buffer.push(ContextEvent::DegradedMode {
                     context_id: context_id.to_owned(),
                     local_version: (local_major, local_minor),
@@ -292,11 +292,11 @@ impl ContextManager {
         member_did: &str,
         caller_did: &str,
     ) -> Result<(), ContextError> {
-        let _ctx_arc = self
+        let ctx_arc = self
             .get_context_arc(context_id)
             .map_err(|_| ContextError::ContextNotRegistered(context_id.to_owned()))?;
-        let mut _guard = _ctx_arc.lock().await;
-        let ctx = &mut *_guard;
+        let mut guard = ctx_arc.lock().await;
+        let ctx = &mut *guard;
 
         // Authorization: access key management requires admin (ContextClose).
         if !ctx
@@ -343,11 +343,11 @@ impl ContextManager {
         member_did: &str,
         caller_did: &str,
     ) -> Result<(), ContextError> {
-        let _ctx_arc = self
+        let ctx_arc = self
             .get_context_arc(context_id)
             .map_err(|_| ContextError::ContextNotRegistered(context_id.to_owned()))?;
-        let mut _guard = _ctx_arc.lock().await;
-        let ctx = &mut *_guard;
+        let mut guard = ctx_arc.lock().await;
+        let ctx = &mut *guard;
 
         // Authorization: access key management requires admin (ContextClose).
         if !ctx
@@ -394,11 +394,11 @@ impl ContextManager {
         member_did: &str,
         caller_did: &str,
     ) -> Result<(), ContextError> {
-        let _ctx_arc = self
+        let ctx_arc = self
             .get_context_arc(context_id)
             .map_err(|_| ContextError::ContextNotRegistered(context_id.to_owned()))?;
-        let mut _guard = _ctx_arc.lock().await;
-        let ctx = &mut *_guard;
+        let mut guard = ctx_arc.lock().await;
+        let ctx = &mut *guard;
 
         // Authorization: access key management requires admin (ContextClose).
         if !ctx
@@ -434,11 +434,11 @@ impl ContextManager {
         member_did: &str,
         key: scp_protocol::crypto::access_keys::AccessKey,
     ) {
-        if let Some(_entry) = self.contexts.get(context_id) {
-            let _ctx_arc = Arc::clone(_entry.value());
-            drop(_entry);
-            let mut _guard = _ctx_arc.lock().await;
-            let ctx = &mut *_guard;
+        if let Some(entry) = self.contexts.get(context_id) {
+            let ctx_arc = Arc::clone(entry.value());
+            drop(entry);
+            let mut guard = ctx_arc.lock().await;
+            let ctx = &mut *guard;
             ctx.access.access_key_store.set(context_id, member_did, key);
         }
     }
@@ -449,11 +449,11 @@ impl ContextManager {
     /// for the pair, or the context is not registered, this is a no-op.
     #[instrument(skip_all, fields(context_id, member_did))]
     pub async fn remove_access_key(&self, context_id: &str, member_did: &str) {
-        if let Some(_entry) = self.contexts.get(context_id) {
-            let _ctx_arc = Arc::clone(_entry.value());
-            drop(_entry);
-            let mut _guard = _ctx_arc.lock().await;
-            let ctx = &mut *_guard;
+        if let Some(entry) = self.contexts.get(context_id) {
+            let ctx_arc = Arc::clone(entry.value());
+            drop(entry);
+            let mut guard = ctx_arc.lock().await;
+            let ctx = &mut *guard;
             ctx.access.access_key_store.remove(context_id, member_did);
         }
     }
@@ -470,11 +470,11 @@ impl ContextManager {
         member_did: &str,
         key: scp_protocol::crypto::access_keys::AccessKey,
     ) {
-        if let Some(_entry) = self.contexts.get(context_id) {
-            let _ctx_arc = Arc::clone(_entry.value());
-            drop(_entry);
-            let mut _guard = _ctx_arc.lock().await;
-            let ctx = &mut *_guard;
+        if let Some(entry) = self.contexts.get(context_id) {
+            let ctx_arc = Arc::clone(entry.value());
+            drop(entry);
+            let mut guard = ctx_arc.lock().await;
+            let ctx = &mut *guard;
             ctx.access.access_key_store.set(context_id, member_did, key);
         }
     }
@@ -530,11 +530,11 @@ impl ContextManager {
         member_did: &scp_identity::DID,
         amount: scp_protocol::economy::types::Amount,
     ) {
-        if let Some(_entry) = self.contexts.get(context_id) {
-            let _ctx_arc = Arc::clone(_entry.value());
-            drop(_entry);
-            let mut _guard = _ctx_arc.lock().await;
-            let ctx = &mut *_guard;
+        if let Some(entry) = self.contexts.get(context_id) {
+            let ctx_arc = Arc::clone(entry.value());
+            drop(entry);
+            let mut guard = ctx_arc.lock().await;
+            let ctx = &mut *guard;
             ctx.governance.budget_tracker.grant(member_did, amount);
         }
     }
@@ -807,11 +807,11 @@ impl ContextManager {
     ) -> Result<scp_event_log::checkpoint::CheckpointComparison, ContextError> {
         // Verify the sender is a member of this context.
         {
-            let _ctx_arc = self
+            let ctx_arc = self
                 .get_context_arc(context_id)
                 .map_err(|_| ContextError::ContextNotRegistered(context_id.to_owned()))?;
-            let _guard = _ctx_arc.lock().await;
-            let ctx = &*_guard;
+            let guard = ctx_arc.lock().await;
+            let ctx = &*guard;
             if !ctx.membership.contains(remote.sender_did.as_ref()) {
                 return Err(ContextError::MemberNotFound(format!(
                     "checkpoint sender {} is not a member of context {context_id}",
@@ -892,11 +892,11 @@ impl ContextManager {
                     "failed to append EquivocationDetected to event log: {e}"
                 );
             }
-            if let Some(_entry) = self.contexts.get(context_id) {
-                let _ctx_arc = Arc::clone(_entry.value());
-                drop(_entry);
-                let mut _guard = _ctx_arc.lock().await;
-                let ctx = &mut *_guard;
+            if let Some(entry) = self.contexts.get(context_id) {
+                let ctx_arc = Arc::clone(entry.value());
+                drop(entry);
+                let mut guard = ctx_arc.lock().await;
+                let ctx = &mut *guard;
                 ctx.checkpoint_events_since += 1;
                 ctx.receive_buffer.push(ContextEvent::EquivocationDetected {
                     context_id: context_id.to_owned(),
@@ -967,11 +967,11 @@ impl ContextManager {
         context_id: &str,
         leaf_index: u64,
     ) -> Result<scp_event_log::proof::InclusionProof, ContextError> {
-        let _ctx_arc = self
+        let ctx_arc = self
             .get_context_arc(context_id)
             .map_err(|_| ContextError::ContextNotRegistered(context_id.to_owned()))?;
-        let mut _guard = _ctx_arc.lock().await;
-        let ctx = &mut *_guard;
+        let mut guard = ctx_arc.lock().await;
+        let ctx = &mut *guard;
         self.sync_merkle_tree(context_id, ctx);
         scp_event_log::proof::prove_inclusion(&ctx.merkle_tree, leaf_index)
             .map_err(|e| ContextError::EventLogFailed(e.to_string()))
@@ -993,11 +993,11 @@ impl ContextManager {
         context_id: &str,
         old_size: u64,
     ) -> Result<scp_event_log::proof::ConsistencyProof, ContextError> {
-        let _ctx_arc = self
+        let ctx_arc = self
             .get_context_arc(context_id)
             .map_err(|_| ContextError::ContextNotRegistered(context_id.to_owned()))?;
-        let mut _guard = _ctx_arc.lock().await;
-        let ctx = &mut *_guard;
+        let mut guard = ctx_arc.lock().await;
+        let ctx = &mut *guard;
         self.sync_merkle_tree(context_id, ctx);
         let current_size = scp_event_log::tree::event_count(&ctx.merkle_tree);
         scp_event_log::proof::prove_consistency(&ctx.merkle_tree, old_size, current_size)

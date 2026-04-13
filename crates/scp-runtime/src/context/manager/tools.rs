@@ -169,6 +169,7 @@ fn commit_tool_economy_ticket(mut ticket: ToolEconomyTicket) -> Option<Amount> {
 /// rollback is a best-effort no-op — the escrow void is still attempted
 /// since it is adapter-side state, not manager-side, and the ticket is
 /// still marked consumed so the `Drop` guard stays quiet.
+#[allow(clippy::significant_drop_tightening)]
 async fn rollback_tool_economy_ticket(
     manager: &ContextManager,
     context_id: &str,
@@ -189,8 +190,8 @@ async fn rollback_tool_economy_ticket(
     if let Some(entry) = manager.contexts.get(context_id) {
         let arc = entry.value().clone();
         drop(entry);
-        let mut _guard = arc.lock().await;
-        let ctx = &mut *_guard;
+        let mut guard = arc.lock().await;
+        let ctx = &mut *guard;
         ctx.governance
             .velocity_tracker
             .rollback(&ticket.actor_did, ticket.velocity_token);
@@ -282,18 +283,19 @@ impl ContextManager {
         };
         let arc = entry.value().clone();
         drop(entry);
-        let mut _guard = arc.lock().await;
-        let ctx = &mut *_guard;
+        let mut guard = arc.lock().await;
+        let ctx = &mut *guard;
         ctx.governance.hard_rate_limit.try_consume(did, now_secs)
     }
 
     /// Async refund. No-op if the context is unknown.
+    #[allow(clippy::significant_drop_tightening)]
     pub async fn refund_hard_rate_limit(&self, context_id: &str, did: &DID) {
-        if let Some(_entry) = self.contexts.get(context_id) {
-            let _ctx_arc = Arc::clone(_entry.value());
-            drop(_entry);
-            let _guard = _ctx_arc.lock().await;
-            let ctx = &*_guard;
+        if let Some(entry) = self.contexts.get(context_id) {
+            let ctx_arc = Arc::clone(entry.value());
+            drop(entry);
+            let guard = ctx_arc.lock().await;
+            let ctx = &*guard;
             ctx.governance.hard_rate_limit.refund(did);
         }
     }
@@ -484,11 +486,11 @@ impl ContextManager {
         let payment_adapter: Option<Arc<dyn PaymentAdapterDyn>> = self.payment_adapter.clone();
 
         let phase1 = {
-            let _ctx_arc = self
+            let ctx_arc = self
                 .get_context_arc(context_id)
                 .map_err(|_| ContextError::ContextNotRegistered(context_id.to_owned()))?;
-            let mut _guard = _ctx_arc.lock().await;
-            let ctx = &mut *_guard;
+            let mut guard = ctx_arc.lock().await;
+            let ctx = &mut *guard;
 
             let handle = ctx.handle.clone();
             let role_state = ctx.role_state.clone();
@@ -749,18 +751,17 @@ impl ContextManager {
                 consumed: false,
             };
 
-            let snapshot = Phase1Snapshot {
-                handle,
-                role_state,
-                ticket,
-            };
             // SECURITY: explicitly release the `contexts` lock BEFORE
             // the block-expression returns. This is the exit boundary
             // of Phase 1 — Phase 2 (the executor) must run without the
             // lock. The explicit `drop(contexts)` keeps the lock-split
             // visible to code review and to the structural pipeline
             // wiring test in `scp-testing/tests/integration/pipeline_wiring.rs`.
-            snapshot
+            Phase1Snapshot {
+                handle,
+                role_state,
+                ticket,
+            }
         };
 
         let Phase1Snapshot {
@@ -811,7 +812,7 @@ impl ContextManager {
         // capture call.
         // ------------------------------------------------------------
         let (consequences, ticket) = {
-            let _ctx_arc = if let Some(entry) = self.contexts.get(context_id) {
+            let ctx_arc = if let Some(entry) = self.contexts.get(context_id) {
                 entry.value().clone()
             } else {
                 // Context vanished between Phase 1 and Phase 3 (e.g.
@@ -821,8 +822,8 @@ impl ContextManager {
                 rollback_tool_economy_ticket(self, context_id, ticket).await;
                 return Err(ContextError::ContextNotRegistered(context_id.to_owned()));
             };
-            let mut _guard = _ctx_arc.lock().await;
-            let ctx = &mut *_guard;
+            let mut guard = ctx_arc.lock().await;
+            let ctx = &mut *guard;
 
             let now = self.clock.now_secs();
             let events_for_consequences = super::governance::event_log_entries_for_consequences(
@@ -899,11 +900,11 @@ impl ContextManager {
                         // it would attempt to void the already-
                         // consumed escrow.
                         {
-                            if let Some(_entry) = self.contexts.get(context_id) {
-                                let _ctx_arc = Arc::clone(_entry.value());
-                                drop(_entry);
-                                let mut _guard = _ctx_arc.lock().await;
-                                let ctx = &mut *_guard;
+                            if let Some(entry) = self.contexts.get(context_id) {
+                                let ctx_arc = Arc::clone(entry.value());
+                                drop(entry);
+                                let mut guard = ctx_arc.lock().await;
+                                let ctx = &mut *guard;
                                 if let Some(cost) = ticket.deducted_cost {
                                     ctx.governance
                                         .budget_tracker

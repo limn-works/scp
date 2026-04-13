@@ -121,9 +121,9 @@ async fn setup_retry_manager() -> (
     // Register a victim member so RemoveMember has a target.
     let victim_did: DID = "did:key:victim".into();
     {
-        let _arc = manager.contexts.get("retry-ctx").unwrap().value().clone();
-        let mut _g = _arc.lock().await;
-        let ctx = &mut *_g;
+        let arc = manager.contexts.get("retry-ctx").unwrap().value().clone();
+        let mut g = arc.lock().await;
+        let ctx = &mut *g;
         ctx.membership
             .add_member(victim_did.clone(), "member".into(), vec![]);
     }

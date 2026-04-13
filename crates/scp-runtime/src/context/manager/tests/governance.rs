@@ -344,14 +344,14 @@ async fn threshold_context_proposal_lifecycle() {
     );
 
     // Verify the tool was registered (auto-execution).
-    let _arc = manager
+    let arc = manager
         .contexts
         .get("ctx-threshold")
         .unwrap()
         .value()
         .clone();
-    let _g = _arc.lock().await;
-    let ctx = &*_g;
+    let g = arc.lock().await;
+    let ctx = &*g;
     assert!(
         ctx.governance
             .registered_tools
@@ -458,14 +458,14 @@ async fn unanimity_context_single_rejection_defeats_proposal() {
 
     // Add bob to membership manually for the test.
     {
-        let _arc = manager
+        let arc = manager
             .contexts
             .get("ctx-unanimity")
             .unwrap()
             .value()
             .clone();
-        let mut _g = _arc.lock().await;
-        let ctx = &mut *_g;
+        let mut g = arc.lock().await;
+        let ctx = &mut *g;
         ctx.membership
             .add_member(bob.clone(), "member".into(), vec![]);
         ctx.membership
@@ -510,14 +510,14 @@ async fn unanimity_context_single_rejection_defeats_proposal() {
     );
 
     // Verify bob is still a member (proposal was rejected, not executed).
-    let _arc = manager
+    let arc = manager
         .contexts
         .get("ctx-unanimity")
         .unwrap()
         .value()
         .clone();
-    let _g = _arc.lock().await;
-    let ctx = &*_g;
+    let g = arc.lock().await;
+    let ctx = &*g;
     assert!(
         ctx.membership.get(bob.as_ref()).is_some(),
         "Bob should still be a member after rejected proposal"
@@ -789,9 +789,9 @@ async fn promote_context_succeeds_when_policy_is_promotable() {
     );
 
     // Verify postconditions: memory scope is now Full.
-    let _arc = manager.contexts.get("promo-ctx").unwrap().value().clone();
-    let _g = _arc.lock().await;
-    let ctx = &*_g;
+    let arc = manager.contexts.get("promo-ctx").unwrap().value().clone();
+    let g = arc.lock().await;
+    let ctx = &*g;
     assert_eq!(
         ctx.handle.params().memory_scope,
         MemoryScope::Full,
@@ -862,14 +862,14 @@ async fn promote_context_does_not_mutate_promotion_policy() {
     assert!(result.is_ok(), "promotion should succeed: {result:?}");
 
     // Verify promotion_policy is still Promotable (not mutated).
-    let _arc = manager
+    let arc = manager
         .contexts
         .get("promo-immut-ctx")
         .unwrap()
         .value()
         .clone();
-    let _g = _arc.lock().await;
-    let ctx = &*_g;
+    let g = arc.lock().await;
+    let ctx = &*g;
     assert_eq!(
         ctx.handle.params().promotion_policy,
         PromotionPolicy::Promotable,
@@ -1093,9 +1093,9 @@ async fn revoke_rejected_without_member_ban_ceiling() {
 
     // Add bob as author.
     {
-        let _arc = manager.contexts.get("bc-no-ban").unwrap().value().clone();
-        let mut _g = _arc.lock().await;
-        let ctx = &mut *_g;
+        let arc = manager.contexts.get("bc-no-ban").unwrap().value().clone();
+        let mut g = arc.lock().await;
+        let ctx = &mut *g;
         let bc = ctx.broadcast_context.as_mut().unwrap();
         bc.add_author("did:key:bob").unwrap();
         ctx.membership
@@ -1140,9 +1140,9 @@ async fn governance_single_admin_engine_constructed() {
         .unwrap();
     assert_eq!(handle.state().await, ContextState::Active);
     // Verify the engine is accessible inside the per-context state.
-    let _arc = manager.contexts.get("ctx-gov-sa").unwrap().value().clone();
-    let _g = _arc.lock().await;
-    let ctx = &*_g;
+    let arc = manager.contexts.get("ctx-gov-sa").unwrap().value().clone();
+    let g = arc.lock().await;
+    let ctx = &*g;
     let config = ctx.governance.engine.model_config();
     assert_eq!(
         config,
@@ -1184,14 +1184,14 @@ async fn governance_threshold_engine_constructed() {
         .await
         .unwrap();
     assert_eq!(handle.state().await, ContextState::Active);
-    let _arc = manager
+    let arc = manager
         .contexts
         .get("ctx-gov-thresh")
         .unwrap()
         .value()
         .clone();
-    let _g = _arc.lock().await;
-    let ctx = &*_g;
+    let g = arc.lock().await;
+    let ctx = &*g;
     assert_eq!(ctx.governance.engine.model_config(), config);
 }
 
@@ -1221,9 +1221,9 @@ async fn governance_majority_engine_constructed() {
         .await
         .unwrap();
     assert_eq!(handle.state().await, ContextState::Active);
-    let _arc = manager.contexts.get("ctx-gov-maj").unwrap().value().clone();
-    let _g = _arc.lock().await;
-    let ctx = &*_g;
+    let arc = manager.contexts.get("ctx-gov-maj").unwrap().value().clone();
+    let g = arc.lock().await;
+    let ctx = &*g;
     let model_config = ctx.governance.engine.model_config();
     assert!(matches!(
         model_config,
@@ -1261,14 +1261,14 @@ async fn governance_unanimity_engine_constructed() {
         .await
         .unwrap();
     assert_eq!(handle.state().await, ContextState::Active);
-    let _arc = manager
+    let arc = manager
         .contexts
         .get("ctx-gov-unan")
         .unwrap()
         .value()
         .clone();
-    let _g = _arc.lock().await;
-    let ctx = &*_g;
+    let g = arc.lock().await;
+    let ctx = &*g;
     assert_eq!(ctx.governance.engine.model_config(), config);
 }
 
@@ -1616,8 +1616,9 @@ async fn governance_propose_checked_without_capability_rejected() {
     // but not governance:propose).
     let kp = KeyPackage::mock("did:key:bob".into());
     let handle_ref = {
-        let contexts = manager.contexts.lock().await;
-        contexts.get(&ctx_id).unwrap().handle.clone()
+        let arc = manager.contexts.get(&ctx_id).unwrap().value().clone();
+        let ctx = arc.lock().await;
+        ctx.handle.clone()
     };
     manager.join_context(&handle_ref, kp, None).await.unwrap();
 
@@ -1648,8 +1649,9 @@ async fn governance_vote_without_capability_rejected() {
     // Join bob as member (no governance:vote capability).
     let kp = KeyPackage::mock("did:key:bob".into());
     let handle_ref = {
-        let contexts = manager.contexts.lock().await;
-        contexts.get(&ctx_id).unwrap().handle.clone()
+        let arc = manager.contexts.get(&ctx_id).unwrap().value().clone();
+        let ctx = arc.lock().await;
+        ctx.handle.clone()
     };
     manager.join_context(&handle_ref, kp, None).await.unwrap();
 
@@ -1761,9 +1763,9 @@ async fn governance_threshold_propose_approve_lifecycle() {
 
     // Grant governance capabilities to bob.
     {
-        let _arc = manager.contexts.get("thresh-ctx").unwrap().value().clone();
-        let mut _g = _arc.lock().await;
-        let ctx = &mut *_g;
+        let arc = manager.contexts.get("thresh-ctx").unwrap().value().clone();
+        let mut g = arc.lock().await;
+        let ctx = &mut *g;
         ctx.role_state
             .member_capabilities
             .entry("did:key:bob".to_owned())
@@ -2004,9 +2006,9 @@ async fn governance_auto_execution_single_admin() {
     assert_eq!(proposal.status, ProposalStatus::Approved);
 
     // The member should already be added (auto-executed).
-    let _arc = manager.contexts.get(&ctx_id).unwrap().value().clone();
-    let _g = _arc.lock().await;
-    let ctx = &*_g;
+    let arc = manager.contexts.get(&ctx_id).unwrap().value().clone();
+    let g = arc.lock().await;
+    let ctx = &*g;
     assert!(
         ctx.membership.contains("did:key:newmember"),
         "auto-execution should have added the member"
@@ -2053,14 +2055,14 @@ async fn governance_auto_execution_threshold_on_approval() {
     assert_eq!(proposal.status, ProposalStatus::Approved);
 
     // Verify auto-execution happened.
-    let _arc = manager
+    let arc = manager
         .contexts
         .get("thresh-auto-ctx")
         .unwrap()
         .value()
         .clone();
-    let _g = _arc.lock().await;
-    let ctx = &*_g;
+    let g = arc.lock().await;
+    let ctx = &*g;
     assert!(
         ctx.membership.contains("did:key:bob"),
         "auto-execution should have added the member on threshold quorum"
@@ -2379,14 +2381,14 @@ async fn add_signer_mints_governance_ucans() {
     assert!(result.is_ok(), "AddSigner should succeed: {result:?}");
 
     // Verify GovernanceVote + GovernancePropose capabilities were granted.
-    let _arc = manager
+    let arc = manager
         .contexts
         .get("signer-ucan-ctx")
         .unwrap()
         .value()
         .clone();
-    let _g = _arc.lock().await;
-    let ctx = &*_g;
+    let g = arc.lock().await;
+    let ctx = &*g;
     let caps = ctx
         .role_state
         .member_capabilities
@@ -2446,14 +2448,14 @@ async fn remove_signer_revokes_governance_ucans() {
 
     // Verify signer3 has governance capabilities.
     {
-        let _arc = manager
+        let arc = manager
             .contexts
             .get("rm-signer-ctx")
             .unwrap()
             .value()
             .clone();
-        let _g = _arc.lock().await;
-        let ctx = &*_g;
+        let g = arc.lock().await;
+        let ctx = &*g;
         let caps = ctx
             .role_state
             .member_capabilities
@@ -2477,14 +2479,14 @@ async fn remove_signer_revokes_governance_ucans() {
     assert!(result.is_ok(), "RemoveSigner should succeed: {result:?}");
 
     // Verify governance capabilities were revoked.
-    let _arc = manager
+    let arc = manager
         .contexts
         .get("rm-signer-ctx")
         .unwrap()
         .value()
         .clone();
-    let _g = _arc.lock().await;
-    let ctx = &*_g;
+    let g = arc.lock().await;
+    let ctx = &*g;
     if let Some(caps) = ctx.role_state.member_capabilities.get("did:key:signer3") {
         assert!(!caps.contains(&Capability::GovernancePropose));
         assert!(!caps.contains(&Capability::GovernanceVote));
@@ -2560,14 +2562,14 @@ async fn scp274_threshold_full_lifecycle() {
         .await
         .unwrap();
     {
-        let _arc = manager
+        let arc = manager
             .contexts
             .get("scp274-thresh")
             .unwrap()
             .value()
             .clone();
-        let mut _g = _arc.lock().await;
-        let ctx = &mut *_g;
+        let mut g = arc.lock().await;
+        let ctx = &mut *g;
         ctx.membership
             .add_member("did:key:signer2".into(), "signer".into(), vec![]);
         ctx.role_state.member_capabilities.insert(
@@ -2576,10 +2578,14 @@ async fn scp274_threshold_full_lifecycle() {
         );
     }
     {
-        let mut contexts = manager.contexts.lock().await;
-        contexts
-            .get_mut("scp274-thresh")
+        let arc = manager
+            .contexts
+            .get("scp274-thresh")
             .unwrap()
+            .value()
+            .clone();
+        let mut ctx_guard = arc.lock().await;
+        ctx_guard
             .membership
             .add_member("did:key:target".into(), "member".into(), vec![]);
     }
@@ -2624,9 +2630,9 @@ async fn scp274_majority_full_lifecycle() {
         .await
         .unwrap();
     {
-        let _arc = manager.contexts.get("scp274-maj").unwrap().value().clone();
-        let mut _g = _arc.lock().await;
-        let ctx = &mut *_g;
+        let arc = manager.contexts.get("scp274-maj").unwrap().value().clone();
+        let mut g = arc.lock().await;
+        let ctx = &mut *g;
         ctx.membership
             .add_member("did:key:target".into(), "member".into(), vec![]);
         ctx.role_state.members.insert("did:key:target".into());
@@ -2674,9 +2680,9 @@ async fn scp274_unanimity_full_lifecycle() {
         .await
         .unwrap();
     {
-        let _arc = manager.contexts.get("scp274-unan").unwrap().value().clone();
-        let mut _g = _arc.lock().await;
-        let ctx = &mut *_g;
+        let arc = manager.contexts.get("scp274-unan").unwrap().value().clone();
+        let mut g = arc.lock().await;
+        let ctx = &mut *g;
         ctx.membership
             .add_member("did:key:member2".into(), "member".into(), vec![]);
         ctx.role_state.member_capabilities.insert(
@@ -2685,10 +2691,9 @@ async fn scp274_unanimity_full_lifecycle() {
         );
     }
     {
-        let mut contexts = manager.contexts.lock().await;
-        contexts
-            .get_mut("scp274-unan")
-            .unwrap()
+        let arc = manager.contexts.get("scp274-unan").unwrap().value().clone();
+        let mut ctx_guard = arc.lock().await;
+        ctx_guard
             .membership
             .add_member("did:key:target".into(), "member".into(), vec![]);
     }
@@ -2735,14 +2740,14 @@ async fn scp274_rejected_proposal_does_not_execute() {
         .await
         .unwrap();
     {
-        let _arc = manager
+        let arc = manager
             .contexts
             .get("scp274-reject")
             .unwrap()
             .value()
             .clone();
-        let mut _g = _arc.lock().await;
-        let ctx = &mut *_g;
+        let mut g = arc.lock().await;
+        let ctx = &mut *g;
         ctx.membership
             .add_member("did:key:signer2".into(), "signer".into(), vec![]);
         ctx.role_state.member_capabilities.insert(
@@ -2796,14 +2801,14 @@ async fn scp274_governance_events_in_log() {
         .await
         .unwrap();
     {
-        let _arc = manager
+        let arc = manager
             .contexts
             .get("scp274-events")
             .unwrap()
             .value()
             .clone();
-        let mut _g = _arc.lock().await;
-        let ctx = &mut *_g;
+        let mut g = arc.lock().await;
+        let ctx = &mut *g;
         ctx.membership
             .add_member("did:key:signer2".into(), "signer".into(), vec![]);
         ctx.role_state.member_capabilities.insert(
@@ -2968,10 +2973,9 @@ async fn scp274_exercises_seven_action_variants() {
         .await
         .unwrap();
     {
-        let mut contexts = manager.contexts.lock().await;
-        contexts
-            .get_mut("scp274-7b")
-            .unwrap()
+        let arc = manager.contexts.get("scp274-7b").unwrap().value().clone();
+        let mut ctx_guard = arc.lock().await;
+        ctx_guard
             .membership
             .add_member("did:key:signer".into(), "member".into(), vec![]);
     }
@@ -3191,14 +3195,14 @@ async fn scp274_conflict_detection_change_role() {
         .await
         .unwrap();
     {
-        let _arc = manager
+        let arc = manager
             .contexts
             .get("scp274-conflict")
             .unwrap()
             .value()
             .clone();
-        let mut _g = _arc.lock().await;
-        let ctx = &mut *_g;
+        let mut g = arc.lock().await;
+        let ctx = &mut *g;
         ctx.membership
             .add_member("did:key:target".into(), "member".into(), vec![]);
         ctx.role_state.members.insert("did:key:target".into());
@@ -3226,14 +3230,14 @@ async fn scp274_conflict_detection_change_role() {
         .await
         .unwrap();
     {
-        let _arc = manager
+        let arc = manager
             .contexts
             .get("scp274-conflict")
             .unwrap()
             .value()
             .clone();
-        let mut _g = _arc.lock().await;
-        let ctx = &mut *_g;
+        let mut g = arc.lock().await;
+        let ctx = &mut *g;
         use std::time::{SystemTime, UNIX_EPOCH};
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -3402,9 +3406,9 @@ async fn execute_modify_ceiling_sets_pending_with_72h_period() {
         .unwrap();
 
     // Verify the pending ceiling modification was stored with 72h period.
-    let _arc = manager.contexts.get("ctx-ceiling").unwrap().value().clone();
-    let _g = _arc.lock().await;
-    let ctx = &*_g;
+    let arc = manager.contexts.get("ctx-ceiling").unwrap().value().clone();
+    let g = arc.lock().await;
+    let ctx = &*g;
     let pending = ctx
         .governance
         .pending_ceiling_modification
@@ -3464,9 +3468,9 @@ async fn apply_pending_ceiling_modification_respects_notification_period() {
 
     // Get the notified_at timestamp from the pending modification.
     let notified_at = {
-        let _arc = manager.contexts.get("ctx-apply").unwrap().value().clone();
-        let _g = _arc.lock().await;
-        let ctx = &*_g;
+        let arc = manager.contexts.get("ctx-apply").unwrap().value().clone();
+        let g = arc.lock().await;
+        let ctx = &*g;
         ctx.governance
             .pending_ceiling_modification
             .as_ref()
@@ -3492,9 +3496,9 @@ async fn apply_pending_ceiling_modification_respects_notification_period() {
     assert!(applied, "should apply at exactly effective_at");
 
     // Verify the ceiling was updated and pending cleared.
-    let _arc = manager.contexts.get("ctx-apply").unwrap().value().clone();
-    let _g = _arc.lock().await;
-    let ctx = &*_g;
+    let arc = manager.contexts.get("ctx-apply").unwrap().value().clone();
+    let g = arc.lock().await;
+    let ctx = &*g;
     assert!(
         ctx.governance.pending_ceiling_modification.is_none(),
         "pending modification should be cleared after apply"
@@ -3707,14 +3711,14 @@ async fn execute_set_economic_policy_stages_with_24h_delay() {
         .await
         .unwrap();
 
-    let _arc = manager
+    let arc = manager
         .contexts
         .get("ctx-econ-delay")
         .unwrap()
         .value()
         .clone();
-    let _g = _arc.lock().await;
-    let ctx = &*_g;
+    let g = arc.lock().await;
+    let ctx = &*g;
     let pending = ctx
         .governance
         .pending_economic_policy_change
@@ -3781,14 +3785,14 @@ async fn apply_pending_economic_policy_change_respects_notification_period() {
         .unwrap();
 
     let notified_at = {
-        let _arc = manager
+        let arc = manager
             .contexts
             .get("ctx-econ-apply")
             .unwrap()
             .value()
             .clone();
-        let _g = _arc.lock().await;
-        let ctx = &*_g;
+        let g = arc.lock().await;
+        let ctx = &*g;
         ctx.governance
             .pending_economic_policy_change
             .as_ref()
@@ -3811,14 +3815,14 @@ async fn apply_pending_economic_policy_change_respects_notification_period() {
         .unwrap();
     assert!(applied, "should apply at exactly effective_at");
 
-    let _arc = manager
+    let arc = manager
         .contexts
         .get("ctx-econ-apply")
         .unwrap()
         .value()
         .clone();
-    let _g = _arc.lock().await;
-    let ctx = &*_g;
+    let g = arc.lock().await;
+    let ctx = &*g;
     assert!(
         ctx.governance.pending_economic_policy_change.is_none(),
         "pending change should be cleared after apply"
@@ -3991,14 +3995,14 @@ async fn modify_hard_rate_limit_updates_live_limiter() {
 
     // Consume 3 tokens so the bucket has observable per-sender state.
     {
-        let _arc = manager
+        let arc = manager
             .contexts
             .get("ctx-rl-modify")
             .unwrap()
             .value()
             .clone();
-        let _g = _arc.lock().await;
-        let ctx = &*_g;
+        let g = arc.lock().await;
+        let ctx = &*g;
         let now = 1_000_000;
         for _ in 0..3 {
             assert!(ctx.governance.hard_rate_limit.try_consume(&alice, now));
@@ -4026,14 +4030,14 @@ async fn modify_hard_rate_limit_updates_live_limiter() {
 
     // Verify the config was applied AND per-sender state was preserved.
     {
-        let _arc = manager
+        let arc = manager
             .contexts
             .get("ctx-rl-modify")
             .unwrap()
             .value()
             .clone();
-        let _g = _arc.lock().await;
-        let ctx = &*_g;
+        let g = arc.lock().await;
+        let ctx = &*g;
         assert_eq!(
             ctx.governance.hard_rate_limit.config().burst,
             5,
@@ -4085,14 +4089,14 @@ async fn modify_hard_rate_limit_clamps_preserved_state_when_tightening() {
 
     // Sanity: default Matrix burst is 10. Alice's bucket starts full.
     {
-        let _arc = manager
+        let arc = manager
             .contexts
             .get("ctx-rl-clamp")
             .unwrap()
             .value()
             .clone();
-        let _g = _arc.lock().await;
-        let ctx = &*_g;
+        let g = arc.lock().await;
+        let ctx = &*g;
         assert_eq!(ctx.governance.hard_rate_limit.config().burst, 10);
     }
 
@@ -4118,14 +4122,14 @@ async fn modify_hard_rate_limit_clamps_preserved_state_when_tightening() {
     // contents). We consume 4 in succession: the first 3 must
     // succeed, the 4th must fail.
     {
-        let _arc = manager
+        let arc = manager
             .contexts
             .get("ctx-rl-clamp")
             .unwrap()
             .value()
             .clone();
-        let _g = _arc.lock().await;
-        let ctx = &*_g;
+        let g = arc.lock().await;
+        let ctx = &*g;
         assert_eq!(
             ctx.governance.hard_rate_limit.config().burst,
             3,
@@ -4189,14 +4193,14 @@ async fn modify_hard_rate_limit_rejects_invalid_config() {
 
     // The live limiter must retain the Matrix default.
     {
-        let _arc = manager
+        let arc = manager
             .contexts
             .get("ctx-rl-invalid")
             .unwrap()
             .value()
             .clone();
-        let _g = _arc.lock().await;
-        let ctx = &*_g;
+        let g = arc.lock().await;
+        let ctx = &*g;
         assert_eq!(
             ctx.governance.hard_rate_limit.config().burst,
             10,
@@ -4257,9 +4261,9 @@ async fn approve_spend_grants_budget_to_member_tracker() {
 
     // No budget initially.
     {
-        let _arc = manager.contexts.get("budget-ctx").unwrap().value().clone();
-        let _g = _arc.lock().await;
-        let ctx = &*_g;
+        let arc = manager.contexts.get("budget-ctx").unwrap().value().clone();
+        let g = arc.lock().await;
+        let ctx = &*g;
         assert!(!ctx.governance.budget_tracker.has_budget(&spender));
     }
 
@@ -4278,9 +4282,9 @@ async fn approve_spend_grants_budget_to_member_tracker() {
         .await
         .unwrap();
     {
-        let _arc = manager.contexts.get("budget-ctx").unwrap().value().clone();
-        let _g = _arc.lock().await;
-        let ctx = &*_g;
+        let arc = manager.contexts.get("budget-ctx").unwrap().value().clone();
+        let g = arc.lock().await;
+        let ctx = &*g;
         assert!(ctx.governance.budget_tracker.has_budget(&spender));
         assert_eq!(
             ctx.governance.budget_tracker.remaining(&spender),
@@ -4303,9 +4307,9 @@ async fn approve_spend_grants_budget_to_member_tracker() {
         .await
         .unwrap();
     {
-        let _arc = manager.contexts.get("budget-ctx").unwrap().value().clone();
-        let _g = _arc.lock().await;
-        let ctx = &*_g;
+        let arc = manager.contexts.get("budget-ctx").unwrap().value().clone();
+        let g = arc.lock().await;
+        let ctx = &*g;
         assert_eq!(
             ctx.governance.budget_tracker.limit(&spender),
             scp_protocol::economy::types::Amount::new(8000)
@@ -4377,9 +4381,9 @@ async fn budget_tracker_included_in_snapshot() {
         .await
         .unwrap();
 
-    let _arc = manager.contexts.get("snap-ctx").unwrap().value().clone();
-    let _g = _arc.lock().await;
-    let ctx = &*_g;
+    let arc = manager.contexts.get("snap-ctx").unwrap().value().clone();
+    let g = arc.lock().await;
+    let ctx = &*g;
     let snapshot = ContextManager::snapshot_context(ctx);
     assert!(snapshot.budget_tracker.has_budget(&spender));
     assert_eq!(
@@ -4499,9 +4503,9 @@ async fn mls_integration_add_member_increments_epoch() {
     assert!(result.is_ok(), "AddMember should succeed");
 
     // Verify epoch was incremented (from 0 to 1).
-    let _arc = manager.contexts.get("test-ctx").unwrap().value().clone();
-    let _g = _arc.lock().await;
-    let ctx = &*_g;
+    let arc = manager.contexts.get("test-ctx").unwrap().value().clone();
+    let g = arc.lock().await;
+    let ctx = &*g;
     assert_eq!(
         ctx.epoch.mls_epoch, 1,
         "MLS epoch should advance after AddMember"
@@ -4529,9 +4533,9 @@ async fn mls_integration_add_member_generates_mls_operation() {
 
     // Verify: the EpochCoordinator recorded an AddMember MLS operation,
     // proving that generate_mls_operations was called.
-    let _arc = manager.contexts.get("test-ctx").unwrap().value().clone();
-    let _g = _arc.lock().await;
-    let ctx = &*_g;
+    let arc = manager.contexts.get("test-ctx").unwrap().value().clone();
+    let g = arc.lock().await;
+    let ctx = &*g;
     let records = ctx.epoch.coordinator.records();
     assert_eq!(records.len(), 1);
     if let scp_protocol::context::governance::mls_integration::MlsOperation::AddMember {
@@ -4579,9 +4583,9 @@ async fn mls_integration_epoch_coordinator_records_coordination() {
         .await
         .unwrap();
 
-    let _arc = manager.contexts.get("test-ctx").unwrap().value().clone();
-    let _g = _arc.lock().await;
-    let ctx = &*_g;
+    let arc = manager.contexts.get("test-ctx").unwrap().value().clone();
+    let g = arc.lock().await;
+    let ctx = &*g;
     assert_eq!(
         ctx.epoch.coordinator.record_count(),
         2,
@@ -4636,9 +4640,9 @@ async fn mls_integration_non_membership_action_no_coordination() {
         .unwrap();
 
     // Should have exactly 1 coordination record (from AddMember only).
-    let _arc = manager.contexts.get("test-ctx").unwrap().value().clone();
-    let _g = _arc.lock().await;
-    let ctx = &*_g;
+    let arc = manager.contexts.get("test-ctx").unwrap().value().clone();
+    let g = arc.lock().await;
+    let ctx = &*g;
     assert_eq!(
         ctx.epoch.coordinator.record_count(),
         1,
@@ -4665,9 +4669,9 @@ async fn mls_integration_epoch_coordinator_snapshot_roundtrip() {
         .unwrap();
 
     // Take snapshot and verify records are captured.
-    let _arc = manager.contexts.get("test-ctx").unwrap().value().clone();
-    let _g = _arc.lock().await;
-    let ctx = &*_g;
+    let arc = manager.contexts.get("test-ctx").unwrap().value().clone();
+    let g = arc.lock().await;
+    let ctx = &*g;
     let snapshot = ContextManager::snapshot_context(ctx);
     assert_eq!(
         snapshot.epoch_coordination_records.len(),
@@ -4706,9 +4710,9 @@ async fn mls_integration_no_checkpoint_event_for_single_admin() {
 
     // Drain the receive buffer and check that no
     // CheckpointCosignatureRequired event was emitted.
-    let _arc = manager.contexts.get("test-ctx").unwrap().value().clone();
-    let mut _g = _arc.lock().await;
-    let ctx = &mut *_g;
+    let arc = manager.contexts.get("test-ctx").unwrap().value().clone();
+    let mut g = arc.lock().await;
+    let ctx = &mut *g;
     let events = ctx.receive_buffer.drain();
     let has_checkpoint_event = events
         .iter()
@@ -4795,9 +4799,9 @@ async fn mls_integration_resolve_conflict_lifts_freeze() {
     // Manually set governance freeze and insert the conflicting
     // proposals into approved_proposals.
     {
-        let _arc = manager.contexts.get("test-ctx").unwrap().value().clone();
-        let mut _g = _arc.lock().await;
-        let ctx = &mut *_g;
+        let arc = manager.contexts.get("test-ctx").unwrap().value().clone();
+        let mut g = arc.lock().await;
+        let ctx = &mut *g;
         ctx.governance.freeze = Some((proposal_a_id, proposal_b_id, 1000));
         ctx.governance
             .approved_proposals
@@ -4822,9 +4826,9 @@ async fn mls_integration_resolve_conflict_lifts_freeze() {
     );
 
     // Verify freeze is cleared.
-    let _arc = manager.contexts.get("test-ctx").unwrap().value().clone();
-    let _g = _arc.lock().await;
-    let ctx = &*_g;
+    let arc = manager.contexts.get("test-ctx").unwrap().value().clone();
+    let g = arc.lock().await;
+    let ctx = &*g;
     assert!(
         ctx.governance.freeze.is_none(),
         "governance freeze should be cleared after conflict resolution"
@@ -5109,13 +5113,14 @@ async fn migration_destination_has_migration_source_metadata() {
     let dest_id = &ms.destination_context_id;
 
     // The destination context should have migration_source set.
-    let contexts = manager.contexts.lock().await;
-    let dest_ctx = contexts.get(dest_id);
+    let dest_entry = manager.contexts.get(dest_id);
     assert!(
-        dest_ctx.is_some(),
+        dest_entry.is_some(),
         "destination context should be registered"
     );
-    let dest_params = dest_ctx.unwrap().handle.params();
+    let arc = dest_entry.unwrap().value().clone();
+    let dest_ctx = arc.lock().await;
+    let dest_params = dest_ctx.handle.params();
     assert!(
         dest_params.migration_source.is_some(),
         "destination should have migration_source metadata"
@@ -5321,9 +5326,9 @@ async fn test_consequence_rule_triggers_enforcement_event() {
     // Inject a consequence rule via direct state mutation (since ContextParams
     // consequence_rules is set in create_context from params).
     {
-        let _arc = manager.contexts.get("conseq-ctx").unwrap().value().clone();
-        let mut _g = _arc.lock().await;
-        let ctx = &mut *_g;
+        let arc = manager.contexts.get("conseq-ctx").unwrap().value().clone();
+        let mut g = arc.lock().await;
+        let ctx = &mut *g;
         ctx.governance.consequence_rules = vec![ConsequenceRule {
             trigger: ConsequenceTrigger::MessageVelocity,
             action: ConsequenceAction::Enforcement(EnforcementSeverity::SuspendAccess),
@@ -5334,14 +5339,11 @@ async fn test_consequence_rule_triggers_enforcement_event() {
 
     // Send a message to trigger consequence evaluation.
     let sk = ed25519_dalek::SigningKey::from_bytes(&[1u8; 32]);
-    let handle = manager
-        .contexts
-        .lock()
-        .await
-        .get("conseq-ctx")
-        .unwrap()
-        .handle
-        .clone();
+    let handle = {
+        let arc = manager.contexts.get("conseq-ctx").unwrap().value().clone();
+        let ctx = arc.lock().await;
+        ctx.handle.clone()
+    };
     let result = manager
         .send_message(
             &handle,
@@ -5409,23 +5411,20 @@ async fn test_economy_cost_deducted_on_send() {
 
     // Grant budget so the send can succeed.
     {
-        let _arc = manager.contexts.get("econ-ctx").unwrap().value().clone();
-        let mut _g = _arc.lock().await;
-        let ctx = &mut *_g;
+        let arc = manager.contexts.get("econ-ctx").unwrap().value().clone();
+        let mut g = arc.lock().await;
+        let ctx = &mut *g;
         ctx.governance
             .budget_tracker
             .grant(&"did:key:admin".into(), Amount::new(100));
     }
 
     let sk = ed25519_dalek::SigningKey::from_bytes(&[1u8; 32]);
-    let handle = manager
-        .contexts
-        .lock()
-        .await
-        .get("econ-ctx")
-        .unwrap()
-        .handle
-        .clone();
+    let handle = {
+        let arc = manager.contexts.get("econ-ctx").unwrap().value().clone();
+        let ctx = arc.lock().await;
+        ctx.handle.clone()
+    };
     let ucan = dummy_spending_ucan_for(&"did:key:admin".into());
     let result = manager
         .send_message(
@@ -5444,9 +5443,9 @@ async fn test_economy_cost_deducted_on_send() {
 
     // Verify budget was deducted.
     {
-        let _arc = manager.contexts.get("econ-ctx").unwrap().value().clone();
-        let _g = _arc.lock().await;
-        let ctx = &*_g;
+        let arc = manager.contexts.get("econ-ctx").unwrap().value().clone();
+        let g = arc.lock().await;
+        let ctx = &*g;
         let remaining = ctx
             .governance
             .budget_tracker
@@ -5482,14 +5481,14 @@ async fn test_cooldown_prevents_consequence_retrigger() {
 
     // Inject a consequence rule with a long cooldown.
     {
-        let _arc = manager
+        let arc = manager
             .contexts
             .get("cooldown-ctx")
             .unwrap()
             .value()
             .clone();
-        let mut _g = _arc.lock().await;
-        let ctx = &mut *_g;
+        let mut g = arc.lock().await;
+        let ctx = &mut *g;
         ctx.governance.consequence_rules = vec![ConsequenceRule {
             trigger: ConsequenceTrigger::MessageVelocity,
             action: ConsequenceAction::Enforcement(EnforcementSeverity::SuspendAccess),
@@ -5499,14 +5498,16 @@ async fn test_cooldown_prevents_consequence_retrigger() {
     }
 
     let sk = ed25519_dalek::SigningKey::from_bytes(&[1u8; 32]);
-    let handle = manager
-        .contexts
-        .lock()
-        .await
-        .get("cooldown-ctx")
-        .unwrap()
-        .handle
-        .clone();
+    let handle = {
+        let arc = manager
+            .contexts
+            .get("cooldown-ctx")
+            .unwrap()
+            .value()
+            .clone();
+        let ctx = arc.lock().await;
+        ctx.handle.clone()
+    };
 
     // First send: triggers consequence.
     manager
@@ -5532,14 +5533,14 @@ async fn test_cooldown_prevents_consequence_retrigger() {
 
     // Clear write revocation so second send can proceed.
     {
-        let _arc = manager
+        let arc = manager
             .contexts
             .get("cooldown-ctx")
             .unwrap()
             .value()
             .clone();
-        let mut _g = _arc.lock().await;
-        let ctx = &mut *_g;
+        let mut g = arc.lock().await;
+        let ctx = &mut *g;
         ctx.role_state.suspended_capabilities.clear();
         ctx.access.read_exclusion_list.clear();
     }
@@ -5602,28 +5603,30 @@ async fn test_budget_exceeded_blocks_send() {
 
     // Grant insufficient budget.
     {
-        let _arc = manager
+        let arc = manager
             .contexts
             .get("budget-fail-ctx")
             .unwrap()
             .value()
             .clone();
-        let mut _g = _arc.lock().await;
-        let ctx = &mut *_g;
+        let mut g = arc.lock().await;
+        let ctx = &mut *g;
         ctx.governance
             .budget_tracker
             .grant(&"did:key:admin".into(), Amount::new(10));
     }
 
     let sk = ed25519_dalek::SigningKey::from_bytes(&[1u8; 32]);
-    let handle = manager
-        .contexts
-        .lock()
-        .await
-        .get("budget-fail-ctx")
-        .unwrap()
-        .handle
-        .clone();
+    let handle = {
+        let arc = manager
+            .contexts
+            .get("budget-fail-ctx")
+            .unwrap()
+            .value()
+            .clone();
+        let ctx = arc.lock().await;
+        ctx.handle.clone()
+    };
     let ucan = dummy_spending_ucan_for(&"did:key:admin".into());
     let result = manager
         .send_message(
@@ -5665,14 +5668,14 @@ async fn test_access_revocation_revokes_read_and_write() {
         .unwrap();
 
     {
-        let _arc = manager
+        let arc = manager
             .contexts
             .get("access-rev-ctx")
             .unwrap()
             .value()
             .clone();
-        let mut _g = _arc.lock().await;
-        let ctx = &mut *_g;
+        let mut g = arc.lock().await;
+        let ctx = &mut *g;
         ctx.governance.consequence_rules = vec![ConsequenceRule {
             trigger: ConsequenceTrigger::MessageVelocity,
             action: ConsequenceAction::Enforcement(EnforcementSeverity::SuspendAccess),
@@ -5682,14 +5685,16 @@ async fn test_access_revocation_revokes_read_and_write() {
     }
 
     let sk = ed25519_dalek::SigningKey::from_bytes(&[1u8; 32]);
-    let handle = manager
-        .contexts
-        .lock()
-        .await
-        .get("access-rev-ctx")
-        .unwrap()
-        .handle
-        .clone();
+    let handle = {
+        let arc = manager
+            .contexts
+            .get("access-rev-ctx")
+            .unwrap()
+            .value()
+            .clone();
+        let ctx = arc.lock().await;
+        ctx.handle.clone()
+    };
     manager
         .send_message(
             &handle,
@@ -5702,14 +5707,14 @@ async fn test_access_revocation_revokes_read_and_write() {
         .await
         .unwrap();
 
-    let _arc = manager
+    let arc = manager
         .contexts
         .get("access-rev-ctx")
         .unwrap()
         .value()
         .clone();
-    let _g = _arc.lock().await;
-    let ctx = &*_g;
+    let g = arc.lock().await;
+    let ctx = &*g;
     assert!(
         ctx.role_state
             .suspended_capabilities
@@ -5751,14 +5756,14 @@ async fn role_demotion_changes_member_role() {
         .unwrap();
 
     {
-        let _arc = manager
+        let arc = manager
             .contexts
             .get("demotion-ctx")
             .unwrap()
             .value()
             .clone();
-        let mut _g = _arc.lock().await;
-        let ctx = &mut *_g;
+        let mut g = arc.lock().await;
+        let ctx = &mut *g;
         ctx.governance.consequence_rules = vec![ConsequenceRule {
             trigger: ConsequenceTrigger::MessageVelocity,
             action: ConsequenceAction::AssignRole {
@@ -5770,14 +5775,16 @@ async fn role_demotion_changes_member_role() {
     }
 
     let sk = ed25519_dalek::SigningKey::from_bytes(&[1u8; 32]);
-    let handle = manager
-        .contexts
-        .lock()
-        .await
-        .get("demotion-ctx")
-        .unwrap()
-        .handle
-        .clone();
+    let handle = {
+        let arc = manager
+            .contexts
+            .get("demotion-ctx")
+            .unwrap()
+            .value()
+            .clone();
+        let ctx = arc.lock().await;
+        ctx.handle.clone()
+    };
     manager
         .send_message(
             &handle,
@@ -5822,9 +5829,9 @@ async fn test_participation_decay_clears_caches() {
 
     // Inject participation data and cooldown data.
     {
-        let _arc = manager.contexts.get("decay-ctx").unwrap().value().clone();
-        let mut _g = _arc.lock().await;
-        let ctx = &mut *_g;
+        let arc = manager.contexts.get("decay-ctx").unwrap().value().clone();
+        let mut g = arc.lock().await;
+        let ctx = &mut *g;
         ctx.governance.participation_cache.insert(
             "did:key:admin".to_owned(),
             scp_protocol::trust::participation::ParticipationRecord {
@@ -5850,9 +5857,9 @@ async fn test_participation_decay_clears_caches() {
     manager.close_context(&handle, &admin_did).await.unwrap();
 
     // After close, participation cache and cooldown should be cleared.
-    let _arc = manager.contexts.get("decay-ctx").unwrap().value().clone();
-    let _g = _arc.lock().await;
-    let ctx = &*_g;
+    let arc = manager.contexts.get("decay-ctx").unwrap().value().clone();
+    let g = arc.lock().await;
+    let ctx = &*g;
     assert!(
         ctx.governance.participation_cache.is_empty(),
         "participation_cache should be empty after close"
@@ -5945,14 +5952,14 @@ async fn test_capability_suspension_no_match_returns_false() {
 
     // Inject a rule with capability names that don't contain "read" or "write".
     {
-        let _arc = manager
+        let arc = manager
             .contexts
             .get("no-match-ctx")
             .unwrap()
             .value()
             .clone();
-        let mut _g = _arc.lock().await;
-        let ctx = &mut *_g;
+        let mut g = arc.lock().await;
+        let ctx = &mut *g;
         ctx.governance.consequence_rules = vec![ConsequenceRule {
             trigger: ConsequenceTrigger::MessageVelocity,
             action: ConsequenceAction::Enforcement(EnforcementSeverity::SuspendCapability {
@@ -5964,14 +5971,16 @@ async fn test_capability_suspension_no_match_returns_false() {
     }
 
     let sk = ed25519_dalek::SigningKey::from_bytes(&[1u8; 32]);
-    let handle = manager
-        .contexts
-        .lock()
-        .await
-        .get("no-match-ctx")
-        .unwrap()
-        .handle
-        .clone();
+    let handle = {
+        let arc = manager
+            .contexts
+            .get("no-match-ctx")
+            .unwrap()
+            .value()
+            .clone();
+        let ctx = arc.lock().await;
+        ctx.handle.clone()
+    };
     manager
         .send_message(
             &handle,
@@ -6000,14 +6009,14 @@ async fn test_capability_suspension_no_match_returns_false() {
 
     // Custom("foobar") is in the suspended set even though it may not be
     // in the member's granted capabilities.
-    let _arc = manager
+    let arc = manager
         .contexts
         .get("no-match-ctx")
         .unwrap()
         .value()
         .clone();
-    let _g = _arc.lock().await;
-    let ctx = &*_g;
+    let g = arc.lock().await;
+    let ctx = &*g;
     assert!(
         ctx.role_state
             .suspended_capabilities
@@ -6101,14 +6110,14 @@ async fn pending_removal_blocks_proposal() {
 
     // Manually insert a pending removal against Alice.
     {
-        let _arc = manager
+        let arc = manager
             .contexts
             .get("standing-ctx")
             .unwrap()
             .value()
             .clone();
-        let mut _g = _arc.lock().await;
-        let ctx = &mut *_g;
+        let mut g = arc.lock().await;
+        let ctx = &mut *g;
         let proposal = GovernanceProposal {
             proposal_id: [0u8; 32],
             context_id: "standing-ctx".to_owned(),
@@ -6193,9 +6202,9 @@ async fn decay_participation_clears_state() {
 
     // Manually populate participation cache.
     {
-        let _arc = manager.contexts.get("decay-ctx").unwrap().value().clone();
-        let mut _g = _arc.lock().await;
-        let ctx = &mut *_g;
+        let arc = manager.contexts.get("decay-ctx").unwrap().value().clone();
+        let mut g = arc.lock().await;
+        let ctx = &mut *g;
         ctx.governance.participation_cache.insert(
             "did:key:admin".to_string(),
             scp_protocol::trust::participation::ParticipationRecord {
@@ -6217,17 +6226,17 @@ async fn decay_participation_clears_state() {
 
     // Simulate participation decay (called on close).
     {
-        let _arc = manager.contexts.get("decay-ctx").unwrap().value().clone();
-        let mut _g = _arc.lock().await;
-        let ctx = &mut *_g;
+        let arc = manager.contexts.get("decay-ctx").unwrap().value().clone();
+        let mut g = arc.lock().await;
+        let ctx = &mut *g;
         ctx.governance.decay_participation();
     }
 
     // Verify participation cache is empty after decay.
     let cache_empty = {
-        let _arc = manager.contexts.get("decay-ctx").unwrap().value().clone();
-        let _g = _arc.lock().await;
-        let ctx = &*_g;
+        let arc = manager.contexts.get("decay-ctx").unwrap().value().clone();
+        let g = arc.lock().await;
+        let ctx = &*g;
         ctx.governance.participation_cache.is_empty()
     };
     assert!(
@@ -6376,14 +6385,16 @@ async fn participation_record_updated_after_message_send() {
         .unwrap();
 
     let sk = ed25519_dalek::SigningKey::from_bytes(&[1u8; 32]);
-    let handle = manager
-        .contexts
-        .lock()
-        .await
-        .get("part-msg-ctx")
-        .unwrap()
-        .handle
-        .clone();
+    let handle = {
+        let arc = manager
+            .contexts
+            .get("part-msg-ctx")
+            .unwrap()
+            .value()
+            .clone();
+        let ctx = arc.lock().await;
+        ctx.handle.clone()
+    };
 
     // Send multiple messages so there are events to compute against.
     for _ in 0..3 {
@@ -6401,14 +6412,14 @@ async fn participation_record_updated_after_message_send() {
     }
 
     // After sending messages, finalize_send updates the participation cache.
-    let _arc = manager
+    let arc = manager
         .contexts
         .get("part-msg-ctx")
         .unwrap()
         .value()
         .clone();
-    let _g = _arc.lock().await;
-    let ctx = &*_g;
+    let g = arc.lock().await;
+    let ctx = &*g;
     // The participation cache should now contain an entry for the sender.
     let has_record = ctx
         .governance
@@ -6454,14 +6465,16 @@ async fn consequence_triggers_after_governance_action() {
 
     // First send a message to populate the event buffer, then execute governance.
     let sk = ed25519_dalek::SigningKey::from_bytes(&[1u8; 32]);
-    let handle = manager
-        .contexts
-        .lock()
-        .await
-        .get("gov-conseq-ctx")
-        .unwrap()
-        .handle
-        .clone();
+    let handle = {
+        let arc = manager
+            .contexts
+            .get("gov-conseq-ctx")
+            .unwrap()
+            .value()
+            .clone();
+        let ctx = arc.lock().await;
+        ctx.handle.clone()
+    };
     let _ = manager
         .send_message(&handle, &admin, b"populate", Some(&sk), None, None)
         .await;
@@ -6473,14 +6486,14 @@ async fn consequence_triggers_after_governance_action() {
     // during governance finalization.
     //
     {
-        let _arc = manager
+        let arc = manager
             .contexts
             .get("gov-conseq-ctx")
             .unwrap()
             .value()
             .clone();
-        let mut _g = _arc.lock().await;
-        let ctx = &mut *_g;
+        let mut g = arc.lock().await;
+        let ctx = &mut *g;
         ctx.role_state.suspended_capabilities.clear();
         ctx.access.read_exclusion_list.clear();
         ctx.governance.cooldown_until.clear();
@@ -6538,14 +6551,14 @@ async fn cooldown_expires_allows_retrigger() {
 
     // Inject a consequence rule with a SHORT cooldown (1 second).
     {
-        let _arc = manager
+        let arc = manager
             .contexts
             .get("cooldown-exp-ctx")
             .unwrap()
             .value()
             .clone();
-        let mut _g = _arc.lock().await;
-        let ctx = &mut *_g;
+        let mut g = arc.lock().await;
+        let ctx = &mut *g;
         ctx.governance.consequence_rules = vec![ConsequenceRule {
             trigger: ConsequenceTrigger::MessageVelocity,
             action: ConsequenceAction::Enforcement(EnforcementSeverity::SuspendAccess),
@@ -6555,14 +6568,16 @@ async fn cooldown_expires_allows_retrigger() {
     }
 
     let sk = ed25519_dalek::SigningKey::from_bytes(&[1u8; 32]);
-    let handle = manager
-        .contexts
-        .lock()
-        .await
-        .get("cooldown-exp-ctx")
-        .unwrap()
-        .handle
-        .clone();
+    let handle = {
+        let arc = manager
+            .contexts
+            .get("cooldown-exp-ctx")
+            .unwrap()
+            .value()
+            .clone();
+        let ctx = arc.lock().await;
+        ctx.handle.clone()
+    };
 
     // First send triggers consequence.
     manager
@@ -6585,14 +6600,14 @@ async fn cooldown_expires_allows_retrigger() {
 
     // Clear revocations and manually set cooldown_until to the past.
     {
-        let _arc = manager
+        let arc = manager
             .contexts
             .get("cooldown-exp-ctx")
             .unwrap()
             .value()
             .clone();
-        let mut _g = _arc.lock().await;
-        let ctx = &mut *_g;
+        let mut g = arc.lock().await;
+        let ctx = &mut *g;
         ctx.role_state.suspended_capabilities.clear();
         ctx.access.read_exclusion_list.clear();
         // Set cooldown to 0 (already expired).
@@ -6640,14 +6655,14 @@ async fn empty_consequence_rules_no_evaluation() {
 
     // Verify no consequence rules are configured (default is empty).
     {
-        let _arc = manager
+        let arc = manager
             .contexts
             .get("empty-rules-ctx")
             .unwrap()
             .value()
             .clone();
-        let _g = _arc.lock().await;
-        let ctx = &*_g;
+        let g = arc.lock().await;
+        let ctx = &*g;
         assert!(
             ctx.governance.consequence_rules.is_empty(),
             "default should have no consequence rules"
@@ -6655,14 +6670,16 @@ async fn empty_consequence_rules_no_evaluation() {
     }
 
     let sk = ed25519_dalek::SigningKey::from_bytes(&[1u8; 32]);
-    let handle = manager
-        .contexts
-        .lock()
-        .await
-        .get("empty-rules-ctx")
-        .unwrap()
-        .handle
-        .clone();
+    let handle = {
+        let arc = manager
+            .contexts
+            .get("empty-rules-ctx")
+            .unwrap()
+            .value()
+            .clone();
+        let ctx = arc.lock().await;
+        ctx.handle.clone()
+    };
 
     // Send a message — should NOT produce any ConsequenceTriggered events.
     manager
@@ -6718,14 +6735,16 @@ async fn event_log_entries_feed_consequence_evaluation() {
         .unwrap();
 
     let sk = ed25519_dalek::SigningKey::from_bytes(&[1u8; 32]);
-    let handle = manager
-        .contexts
-        .lock()
-        .await
-        .get("event-feed-ctx")
-        .unwrap()
-        .handle
-        .clone();
+    let handle = {
+        let arc = manager
+            .contexts
+            .get("event-feed-ctx")
+            .unwrap()
+            .value()
+            .clone();
+        let ctx = arc.lock().await;
+        ctx.handle.clone()
+    };
 
     // Send 3 messages WITHOUT draining between sends, so the receive buffer
     // accumulates events. Consequence evaluation at each send sees the full
@@ -6835,9 +6854,9 @@ async fn remaining_members_keys_after_removal() {
     }
 
     // Bob should still be a member.
-    let _arc = manager.contexts.get("remain-ctx").unwrap().value().clone();
-    let _g = _arc.lock().await;
-    let ctx = &*_g;
+    let arc = manager.contexts.get("remain-ctx").unwrap().value().clone();
+    let g = arc.lock().await;
+    let ctx = &*g;
     assert!(
         ctx.membership.contains(&bob),
         "Bob should still be a member"
@@ -6921,14 +6940,14 @@ async fn encrypted_rotation_updates_epoch_counter() {
 
     // Check initial MLS epoch counter.
     let _initial_epoch = {
-        let _arc = manager
+        let arc = manager
             .contexts
             .get("epoch-ctr-ctx")
             .unwrap()
             .value()
             .clone();
-        let _g = _arc.lock().await;
-        let ctx = &*_g;
+        let g = arc.lock().await;
+        let ctx = &*g;
         ctx.epoch.mls_epoch
     };
 
@@ -6956,6 +6975,7 @@ async fn encrypted_rotation_updates_epoch_counter() {
 
 /// Full send -> consequence -> enforcement round trip (#1531, #1537, cross-cutting).
 #[tokio::test]
+#[allow(clippy::too_many_lines)] // DashMap lock pattern adds verbosity
 async fn full_send_consequence_enforcement_round_trip() {
     use scp_protocol::economy::types::{Amount, CostSchedule, CurrencyCode, EconomicPolicy};
     use scp_protocol::trust::consequence::{
@@ -7003,28 +7023,30 @@ async fn full_send_consequence_enforcement_round_trip() {
 
     // Grant budget.
     {
-        let _arc = manager
+        let arc = manager
             .contexts
             .get("roundtrip-ctx")
             .unwrap()
             .value()
             .clone();
-        let mut _g = _arc.lock().await;
-        let ctx = &mut *_g;
+        let mut g = arc.lock().await;
+        let ctx = &mut *g;
         ctx.governance
             .budget_tracker
             .grant(&"did:key:admin".into(), Amount::new(50));
     }
 
     let sk = ed25519_dalek::SigningKey::from_bytes(&[1u8; 32]);
-    let handle = manager
-        .contexts
-        .lock()
-        .await
-        .get("roundtrip-ctx")
-        .unwrap()
-        .handle
-        .clone();
+    let handle = {
+        let arc = manager
+            .contexts
+            .get("roundtrip-ctx")
+            .unwrap()
+            .value()
+            .clone();
+        let ctx = arc.lock().await;
+        ctx.handle.clone()
+    };
 
     // Send message — should deduct budget AND trigger consequence AND record velocity.
     let ucan = dummy_spending_ucan_for(&"did:key:admin".into());
@@ -7042,14 +7064,14 @@ async fn full_send_consequence_enforcement_round_trip() {
 
     // Verify budget was deducted.
     let remaining = {
-        let _arc = manager
+        let arc = manager
             .contexts
             .get("roundtrip-ctx")
             .unwrap()
             .value()
             .clone();
-        let _g = _arc.lock().await;
-        let ctx = &*_g;
+        let g = arc.lock().await;
+        let ctx = &*g;
         ctx.governance
             .budget_tracker
             .remaining(&"did:key:admin".into())
@@ -7073,14 +7095,14 @@ async fn full_send_consequence_enforcement_round_trip() {
 
     // Verify velocity was recorded.
     let has_velocity = {
-        let _arc = manager
+        let arc = manager
             .contexts
             .get("roundtrip-ctx")
             .unwrap()
             .value()
             .clone();
-        let _g = _arc.lock().await;
-        let ctx = &*_g;
+        let g = arc.lock().await;
+        let ctx = &*g;
         let now = scp_primitives::SystemClock.now_secs();
         ctx.governance
             .velocity_tracker
@@ -7111,14 +7133,16 @@ async fn governance_participation_round_trip() {
 
     // Send messages to build participation history.
     let sk = ed25519_dalek::SigningKey::from_bytes(&did_to_seed(&admin));
-    let handle = manager
-        .contexts
-        .lock()
-        .await
-        .get("gov-stand-ctx")
-        .unwrap()
-        .handle
-        .clone();
+    let handle = {
+        let arc = manager
+            .contexts
+            .get("gov-stand-ctx")
+            .unwrap()
+            .value()
+            .clone();
+        let ctx = arc.lock().await;
+        ctx.handle.clone()
+    };
     for _ in 0..3 {
         manager
             .send_message(&handle, &admin, b"participate", Some(&sk), None, None)
@@ -7139,14 +7163,14 @@ async fn governance_participation_round_trip() {
     );
 
     // Verify participation cache was updated (populated from events).
-    let _arc = manager
+    let arc = manager
         .contexts
         .get("gov-stand-ctx")
         .unwrap()
         .value()
         .clone();
-    let _g = _arc.lock().await;
-    let ctx = &*_g;
+    let g = arc.lock().await;
+    let ctx = &*g;
     let has_record = ctx
         .governance
         .participation_cache
@@ -7187,14 +7211,16 @@ async fn capability_suspension_blocks_subsequent_send() {
         .unwrap();
 
     let sk = ed25519_dalek::SigningKey::from_bytes(&[1u8; 32]);
-    let handle = manager
-        .contexts
-        .lock()
-        .await
-        .get("block-send-ctx")
-        .unwrap()
-        .handle
-        .clone();
+    let handle = {
+        let arc = manager
+            .contexts
+            .get("block-send-ctx")
+            .unwrap()
+            .value()
+            .clone();
+        let ctx = arc.lock().await;
+        ctx.handle.clone()
+    };
 
     // First send triggers write suspension.
     let _ = manager
@@ -7258,14 +7284,16 @@ async fn access_revocation_blocks_subsequent_send() {
         .unwrap();
 
     let sk = ed25519_dalek::SigningKey::from_bytes(&[1u8; 32]);
-    let handle = manager
-        .contexts
-        .lock()
-        .await
-        .get("block-access-ctx")
-        .unwrap()
-        .handle
-        .clone();
+    let handle = {
+        let arc = manager
+            .contexts
+            .get("block-access-ctx")
+            .unwrap()
+            .value()
+            .clone();
+        let ctx = arc.lock().await;
+        ctx.handle.clone()
+    };
 
     // First send triggers access revocation.
     let _ = manager
@@ -7395,14 +7423,14 @@ async fn eligibility_blocks_low_participation() {
     // than by. With an empty buffer, check_proposer_eligibility won't
     // overwrite it.
     {
-        let _arc = manager
+        let arc = manager
             .contexts
             .get("low-stand-ctx")
             .unwrap()
             .value()
             .clone();
-        let mut _g = _arc.lock().await;
-        let ctx = &mut *_g;
+        let mut g = arc.lock().await;
+        let ctx = &mut *g;
         ctx.governance.participation_cache.insert(
             bob.to_string(),
             ParticipationRecord {
@@ -7492,14 +7520,14 @@ async fn eligibility_allows_good_participation() {
     // Manually inject a good participation record for Alice: more actions
     // by than against.
     {
-        let _arc = manager
+        let arc = manager
             .contexts
             .get("good-stand-ctx")
             .unwrap()
             .value()
             .clone();
-        let mut _g = _arc.lock().await;
-        let ctx = &mut *_g;
+        let mut g = arc.lock().await;
+        let ctx = &mut *g;
         ctx.governance.participation_cache.insert(
             alice.to_string(),
             ParticipationRecord {
@@ -7575,14 +7603,16 @@ async fn consequence_triggers_on_message_send() {
         .unwrap();
 
     let sk = ed25519_dalek::SigningKey::from_bytes(&[1u8; 32]);
-    let handle = manager
-        .contexts
-        .lock()
-        .await
-        .get("msg-conseq-ctx")
-        .unwrap()
-        .handle
-        .clone();
+    let handle = {
+        let arc = manager
+            .contexts
+            .get("msg-conseq-ctx")
+            .unwrap()
+            .value()
+            .clone();
+        let ctx = arc.lock().await;
+        ctx.handle.clone()
+    };
 
     // Send a single message — should trigger consequence (threshold=0).
     manager
@@ -7655,23 +7685,20 @@ async fn send_message_deducts_budget() {
 
     // Grant budget of 50.
     {
-        let _arc = manager.contexts.get("deduct-ctx").unwrap().value().clone();
-        let mut _g = _arc.lock().await;
-        let ctx = &mut *_g;
+        let arc = manager.contexts.get("deduct-ctx").unwrap().value().clone();
+        let mut g = arc.lock().await;
+        let ctx = &mut *g;
         ctx.governance
             .budget_tracker
             .grant(&"did:key:sender".into(), Amount::new(50));
     }
 
     let sk = ed25519_dalek::SigningKey::from_bytes(&[1u8; 32]);
-    let handle = manager
-        .contexts
-        .lock()
-        .await
-        .get("deduct-ctx")
-        .unwrap()
-        .handle
-        .clone();
+    let handle = {
+        let arc = manager.contexts.get("deduct-ctx").unwrap().value().clone();
+        let ctx = arc.lock().await;
+        ctx.handle.clone()
+    };
 
     // Send message — should deduct 5 from budget.
     // Each send uses a fresh spending UCAN (unique nonce) per NonceTracker
@@ -7691,9 +7718,9 @@ async fn send_message_deducts_budget() {
 
     // Verify budget decreased from 50 to 45.
     let remaining = {
-        let _arc = manager.contexts.get("deduct-ctx").unwrap().value().clone();
-        let _g = _arc.lock().await;
-        let ctx = &*_g;
+        let arc = manager.contexts.get("deduct-ctx").unwrap().value().clone();
+        let g = arc.lock().await;
+        let ctx = &*g;
         ctx.governance
             .budget_tracker
             .remaining(&"did:key:sender".into())
@@ -7719,9 +7746,9 @@ async fn send_message_deducts_budget() {
         .unwrap();
 
     let remaining2 = {
-        let _arc = manager.contexts.get("deduct-ctx").unwrap().value().clone();
-        let _g = _arc.lock().await;
-        let ctx = &*_g;
+        let arc = manager.contexts.get("deduct-ctx").unwrap().value().clone();
+        let g = arc.lock().await;
+        let ctx = &*g;
         ctx.governance
             .budget_tracker
             .remaining(&"did:key:sender".into())
@@ -7906,25 +7933,27 @@ async fn velocity_tracker_records_messages() {
         .unwrap();
 
     let sk = ed25519_dalek::SigningKey::from_bytes(&[1u8; 32]);
-    let handle = manager
-        .contexts
-        .lock()
-        .await
-        .get("velocity-ctx")
-        .unwrap()
-        .handle
-        .clone();
-
-    // Verify velocity is 0 before any sends.
-    {
-        let _arc = manager
+    let handle = {
+        let arc = manager
             .contexts
             .get("velocity-ctx")
             .unwrap()
             .value()
             .clone();
-        let _g = _arc.lock().await;
-        let ctx = &*_g;
+        let ctx = arc.lock().await;
+        ctx.handle.clone()
+    };
+
+    // Verify velocity is 0 before any sends.
+    {
+        let arc = manager
+            .contexts
+            .get("velocity-ctx")
+            .unwrap()
+            .value()
+            .clone();
+        let g = arc.lock().await;
+        let ctx = &*g;
         let now = scp_primitives::SystemClock.now_secs();
         let v = ctx
             .governance
@@ -7950,14 +7979,14 @@ async fn velocity_tracker_records_messages() {
 
     // Verify velocity is non-zero after sends.
     let velocity = {
-        let _arc = manager
+        let arc = manager
             .contexts
             .get("velocity-ctx")
             .unwrap()
             .value()
             .clone();
-        let _g = _arc.lock().await;
-        let ctx = &*_g;
+        let g = arc.lock().await;
+        let ctx = &*g;
         let now = scp_primitives::SystemClock.now_secs();
         ctx.governance
             .velocity_tracker
@@ -8092,14 +8121,16 @@ async fn paid_join_end_to_end_with_adapter() {
 
     // The join_context path blocks auto-accept for paid contexts. Verify the
     // auto-accept block fires even with an adapter configured.
-    let handle = manager
-        .contexts
-        .lock()
-        .await
-        .get("paid-join-ctx")
-        .unwrap()
-        .handle
-        .clone();
+    let handle = {
+        let arc = manager
+            .contexts
+            .get("paid-join-ctx")
+            .unwrap()
+            .value()
+            .clone();
+        let ctx = arc.lock().await;
+        ctx.handle.clone()
+    };
     let kp = scp_protocol::context::membership::KeyPackage {
         owner_did: "did:key:joiner".into(),
         mls_key_package_bytes: None,
@@ -8118,14 +8149,14 @@ async fn paid_join_end_to_end_with_adapter() {
     // Verify authorize→complete works for the join action type though.
     // Grant budget so the budget check passes.
     {
-        let _arc = manager
+        let arc = manager
             .contexts
             .get("paid-join-ctx")
             .unwrap()
             .value()
             .clone();
-        let mut _g = _arc.lock().await;
-        let ctx = &mut *_g;
+        let mut g = arc.lock().await;
+        let ctx = &mut *g;
         ctx.governance
             .budget_tracker
             .grant(&"did:key:joiner".into(), Amount::new(100));
@@ -8183,9 +8214,9 @@ async fn sybil_resistance_evaluated_on_join() {
     );
 
     // Verify the member was actually added.
-    let _arc = manager.contexts.get("sybil-ctx").unwrap().value().clone();
-    let _g = _arc.lock().await;
-    let ctx = &*_g;
+    let arc = manager.contexts.get("sybil-ctx").unwrap().value().clone();
+    let g = arc.lock().await;
+    let ctx = &*g;
     assert!(
         ctx.membership.contains(&DID::from("did:key:newmember")),
         "new member should be present after join"
@@ -8231,14 +8262,14 @@ async fn join_context_deducts_budget_when_granted() {
 
     // Grant budget for the joiner.
     {
-        let _arc = manager
+        let arc = manager
             .contexts
             .get("join-budget-ctx")
             .unwrap()
             .value()
             .clone();
-        let mut _g = _arc.lock().await;
-        let ctx = &mut *_g;
+        let mut g = arc.lock().await;
+        let ctx = &mut *g;
         ctx.governance
             .budget_tracker
             .grant(&"did:key:joiner".into(), Amount::new(100));
@@ -8246,14 +8277,14 @@ async fn join_context_deducts_budget_when_granted() {
 
     // Test the economy enforcement function directly (since auto-accept blocks join_context).
     {
-        let _arc = manager
+        let arc = manager
             .contexts
             .get("join-budget-ctx")
             .unwrap()
             .value()
             .clone();
-        let mut _g = _arc.lock().await;
-        let ctx = &mut *_g;
+        let mut g = arc.lock().await;
+        let ctx = &mut *g;
         // The enforce_join_economy function would block with auto_accept_blocked_by_economics.
         // Test the budget deduction portion directly via record_spend.
         let cost = scp_protocol::economy::policy::evaluate_cost(
@@ -8322,14 +8353,16 @@ async fn participation_record_updated_after_governance() {
     // Send a few messages first so that the event buffer has content for
     // compute_participation_record to work with.
     let sk = ed25519_dalek::SigningKey::from_bytes(&did_to_seed(&admin));
-    let handle = manager
-        .contexts
-        .lock()
-        .await
-        .get("part-gov2-ctx")
-        .unwrap()
-        .handle
-        .clone();
+    let handle = {
+        let arc = manager
+            .contexts
+            .get("part-gov2-ctx")
+            .unwrap()
+            .value()
+            .clone();
+        let ctx = arc.lock().await;
+        ctx.handle.clone()
+    };
     for _ in 0..3 {
         manager
             .send_message(&handle, &admin, b"build history", Some(&sk), None, None)
@@ -8347,14 +8380,14 @@ async fn participation_record_updated_after_governance() {
         .unwrap();
 
     // Check participation cache contains admin with participation_count > 0.
-    let _arc = manager
+    let arc = manager
         .contexts
         .get("part-gov2-ctx")
         .unwrap()
         .value()
         .clone();
-    let _g = _arc.lock().await;
-    let ctx = &*_g;
+    let g = arc.lock().await;
+    let ctx = &*g;
     let record = ctx.governance.participation_cache.get(admin.as_ref());
     assert!(
         record.is_some(),
@@ -8405,23 +8438,20 @@ async fn test_send_rejected_insufficient_budget() {
 
     // Grant budget of 3 (less than per_message=5).
     {
-        let _arc = manager.contexts.get("insuf-ctx").unwrap().value().clone();
-        let mut _g = _arc.lock().await;
-        let ctx = &mut *_g;
+        let arc = manager.contexts.get("insuf-ctx").unwrap().value().clone();
+        let mut g = arc.lock().await;
+        let ctx = &mut *g;
         ctx.governance
             .budget_tracker
             .grant(&"did:key:admin".into(), Amount::new(3));
     }
 
     let sk = ed25519_dalek::SigningKey::from_bytes(&[1u8; 32]);
-    let handle = manager
-        .contexts
-        .lock()
-        .await
-        .get("insuf-ctx")
-        .unwrap()
-        .handle
-        .clone();
+    let handle = {
+        let arc = manager.contexts.get("insuf-ctx").unwrap().value().clone();
+        let ctx = arc.lock().await;
+        ctx.handle.clone()
+    };
 
     let ucan = dummy_spending_ucan_for(&"did:key:admin".into());
     let result = manager
@@ -8637,9 +8667,9 @@ async fn test_execute_paid_action_full_flow_with_adapter() {
 
     // Grant budget.
     {
-        let _arc = manager.contexts.get("adpt2-ctx").unwrap().value().clone();
-        let mut _g = _arc.lock().await;
-        let ctx = &mut *_g;
+        let arc = manager.contexts.get("adpt2-ctx").unwrap().value().clone();
+        let mut g = arc.lock().await;
+        let ctx = &mut *g;
         ctx.governance
             .budget_tracker
             .grant(&"did:key:admin".into(), Amount::new(100));
@@ -8691,9 +8721,9 @@ async fn test_free_context_no_budget_deduction() {
 
     // Grant some budget anyway.
     {
-        let _arc = manager.contexts.get("free-ctx").unwrap().value().clone();
-        let mut _g = _arc.lock().await;
-        let ctx = &mut *_g;
+        let arc = manager.contexts.get("free-ctx").unwrap().value().clone();
+        let mut g = arc.lock().await;
+        let ctx = &mut *g;
         ctx.governance.budget_tracker.grant(
             &"did:key:admin".into(),
             scp_protocol::economy::types::Amount::new(100),
@@ -8701,14 +8731,11 @@ async fn test_free_context_no_budget_deduction() {
     }
 
     let sk = ed25519_dalek::SigningKey::from_bytes(&[1u8; 32]);
-    let handle = manager
-        .contexts
-        .lock()
-        .await
-        .get("free-ctx")
-        .unwrap()
-        .handle
-        .clone();
+    let handle = {
+        let arc = manager.contexts.get("free-ctx").unwrap().value().clone();
+        let ctx = arc.lock().await;
+        ctx.handle.clone()
+    };
 
     // Send message in free context.
     manager
@@ -8725,9 +8752,9 @@ async fn test_free_context_no_budget_deduction() {
 
     // Budget should remain unchanged — no record_spend called.
     let remaining = {
-        let _arc = manager.contexts.get("free-ctx").unwrap().value().clone();
-        let _g = _arc.lock().await;
-        let ctx = &*_g;
+        let arc = manager.contexts.get("free-ctx").unwrap().value().clone();
+        let g = arc.lock().await;
+        let ctx = &*g;
         ctx.governance
             .budget_tracker
             .remaining(&"did:key:admin".into())
@@ -8792,9 +8819,9 @@ async fn test_remaining_members_unaffected_after_removal() {
     );
 
     // Verify Bob is gone and Alice is still there.
-    let _arc = manager.contexts.get("remain2-ctx").unwrap().value().clone();
-    let _g = _arc.lock().await;
-    let ctx = &*_g;
+    let arc = manager.contexts.get("remain2-ctx").unwrap().value().clone();
+    let g = arc.lock().await;
+    let ctx = &*g;
     assert!(!ctx.membership.contains(&bob), "Bob should be removed");
     assert!(
         ctx.membership.contains(&alice),
@@ -8939,23 +8966,20 @@ async fn test_send_consequence_economy_round_trip() {
 
     // Grant budget.
     {
-        let _arc = manager.contexts.get("xcut-rt-ctx").unwrap().value().clone();
-        let mut _g = _arc.lock().await;
-        let ctx = &mut *_g;
+        let arc = manager.contexts.get("xcut-rt-ctx").unwrap().value().clone();
+        let mut g = arc.lock().await;
+        let ctx = &mut *g;
         ctx.governance
             .budget_tracker
             .grant(&"did:key:admin".into(), Amount::new(50));
     }
 
     let sk = ed25519_dalek::SigningKey::from_bytes(&[1u8; 32]);
-    let handle = manager
-        .contexts
-        .lock()
-        .await
-        .get("xcut-rt-ctx")
-        .unwrap()
-        .handle
-        .clone();
+    let handle = {
+        let arc = manager.contexts.get("xcut-rt-ctx").unwrap().value().clone();
+        let ctx = arc.lock().await;
+        ctx.handle.clone()
+    };
 
     // Send message.
     let ucan = dummy_spending_ucan_for(&"did:key:admin".into());
@@ -8973,9 +8997,9 @@ async fn test_send_consequence_economy_round_trip() {
 
     // 1) Budget deducted.
     let remaining = {
-        let _arc = manager.contexts.get("xcut-rt-ctx").unwrap().value().clone();
-        let _g = _arc.lock().await;
-        let ctx = &*_g;
+        let arc = manager.contexts.get("xcut-rt-ctx").unwrap().value().clone();
+        let g = arc.lock().await;
+        let ctx = &*g;
         ctx.governance
             .budget_tracker
             .remaining(&"did:key:admin".into())
@@ -8991,9 +9015,9 @@ async fn test_send_consequence_economy_round_trip() {
 
     // 3) Velocity recorded.
     let has_velocity = {
-        let _arc = manager.contexts.get("xcut-rt-ctx").unwrap().value().clone();
-        let _g = _arc.lock().await;
-        let ctx = &*_g;
+        let arc = manager.contexts.get("xcut-rt-ctx").unwrap().value().clone();
+        let g = arc.lock().await;
+        let ctx = &*g;
         let now = scp_primitives::SystemClock.now_secs();
         ctx.governance
             .velocity_tracker
@@ -9025,14 +9049,16 @@ async fn test_governance_eligibility_participation_round_trip() {
 
     // Send messages to build participation.
     let sk = ed25519_dalek::SigningKey::from_bytes(&did_to_seed(&admin));
-    let handle = manager
-        .contexts
-        .lock()
-        .await
-        .get("stand-rt-ctx")
-        .unwrap()
-        .handle
-        .clone();
+    let handle = {
+        let arc = manager
+            .contexts
+            .get("stand-rt-ctx")
+            .unwrap()
+            .value()
+            .clone();
+        let ctx = arc.lock().await;
+        ctx.handle.clone()
+    };
     for _ in 0..3 {
         manager
             .send_message(&handle, &admin, b"participate", Some(&sk), None, None)
@@ -9050,14 +9076,14 @@ async fn test_governance_eligibility_participation_round_trip() {
         .unwrap();
 
     // Participation cache should be populated after governance + messages.
-    let _arc = manager
+    let arc = manager
         .contexts
         .get("stand-rt-ctx")
         .unwrap()
         .value()
         .clone();
-    let _g = _arc.lock().await;
-    let ctx = &*_g;
+    let g = arc.lock().await;
+    let ctx = &*g;
     assert!(
         ctx.governance
             .participation_cache
@@ -9120,14 +9146,14 @@ async fn test_paid_join_with_consequence_evaluation() {
 
     // Verify the budget deduction works by directly testing.
     {
-        let _arc = manager
+        let arc = manager
             .contexts
             .get("paid-join-cq-ctx")
             .unwrap()
             .value()
             .clone();
-        let mut _g = _arc.lock().await;
-        let ctx = &mut *_g;
+        let mut g = arc.lock().await;
+        let ctx = &mut *g;
         ctx.governance
             .budget_tracker
             .grant(&"did:key:joiner".into(), Amount::new(200));
@@ -9165,14 +9191,14 @@ async fn test_paid_join_with_consequence_evaluation() {
 
     // Verify consequence rules are present on the context.
     {
-        let _arc = manager
+        let arc = manager
             .contexts
             .get("paid-join-cq-ctx")
             .unwrap()
             .value()
             .clone();
-        let _g = _arc.lock().await;
-        let ctx = &*_g;
+        let g = arc.lock().await;
+        let ctx = &*g;
         assert!(
             !ctx.governance.consequence_rules.is_empty(),
             "consequence rules should be configured"
@@ -9186,15 +9212,16 @@ async fn read_remaining_budget(
     ctx_id: &str,
     member: &str,
 ) -> scp_protocol::economy::types::Amount {
-    let _arc = manager.contexts.get(ctx_id).unwrap().value().clone();
-    let _g = _arc.lock().await;
-    let ctx = &*_g;
+    let arc = manager.contexts.get(ctx_id).unwrap().value().clone();
+    let g = arc.lock().await;
+    let ctx = &*g;
     ctx.governance.budget_tracker.remaining(&member.into())
 }
 
 /// Full economy lifecycle: create paid context, grant budget, send messages,
 /// verify cumulative budget tracking (#1537).
 #[tokio::test]
+#[allow(clippy::too_many_lines)] // DashMap lock pattern adds verbosity
 async fn test_full_lifecycle_economy() {
     use scp_protocol::economy::types::{Amount, CostSchedule, CurrencyCode, EconomicPolicy};
 
@@ -9228,28 +9255,30 @@ async fn test_full_lifecycle_economy() {
 
     // Grant budget of 50.
     {
-        let _arc = manager
+        let arc = manager
             .contexts
             .get("lifecycle-econ-ctx")
             .unwrap()
             .value()
             .clone();
-        let mut _g = _arc.lock().await;
-        let ctx = &mut *_g;
+        let mut g = arc.lock().await;
+        let ctx = &mut *g;
         ctx.governance
             .budget_tracker
             .grant(&"did:key:user".into(), Amount::new(50));
     }
 
     let sk = ed25519_dalek::SigningKey::from_bytes(&[1u8; 32]);
-    let handle = manager
-        .contexts
-        .lock()
-        .await
-        .get("lifecycle-econ-ctx")
-        .unwrap()
-        .handle
-        .clone();
+    let handle = {
+        let arc = manager
+            .contexts
+            .get("lifecycle-econ-ctx")
+            .unwrap()
+            .value()
+            .clone();
+        let ctx = arc.lock().await;
+        ctx.handle.clone()
+    };
     let user: DID = "did:key:user".into();
 
     // Send 3 messages at 10 each = 30 total cost, leaving 20.
@@ -9330,9 +9359,9 @@ async fn velocity_escalation_raises_effective_cost() {
 
     macro_rules! budget_remaining {
         ($mgr:expr) => {{
-            let _arc = $mgr.contexts.get("vel-esc-ctx").unwrap().value().clone();
-            let _g = _arc.lock().await;
-            let ctx = &*_g;
+            let arc = $mgr.contexts.get("vel-esc-ctx").unwrap().value().clone();
+            let g = arc.lock().await;
+            let ctx = &*g;
             ctx.governance.budget_tracker.remaining(&admin)
         }};
     }
@@ -9395,9 +9424,9 @@ async fn velocity_escalation_raises_effective_cost() {
 
     // Velocity tracker should have >= 6 messages recorded.
     let (velocity, aggregate) = {
-        let _arc = manager.contexts.get("vel-esc-ctx").unwrap().value().clone();
-        let _g = _arc.lock().await;
-        let ctx = &*_g;
+        let arc = manager.contexts.get("vel-esc-ctx").unwrap().value().clone();
+        let g = arc.lock().await;
+        let ctx = &*g;
         let now = scp_primitives::SystemClock.now_secs();
         (
             ctx.governance.velocity_tracker.get_velocity(&admin, now),
@@ -9461,23 +9490,20 @@ async fn setup_velocity_escalation_context() -> (
         .unwrap();
 
     {
-        let _arc = manager.contexts.get("vel-esc-ctx").unwrap().value().clone();
-        let mut _g = _arc.lock().await;
-        let ctx = &mut *_g;
+        let arc = manager.contexts.get("vel-esc-ctx").unwrap().value().clone();
+        let mut g = arc.lock().await;
+        let ctx = &mut *g;
         ctx.governance
             .budget_tracker
             .grant(&"did:key:admin".into(), Amount::new(10_000));
     }
 
     let sk = ed25519_dalek::SigningKey::from_bytes(&[1u8; 32]);
-    let handle = manager
-        .contexts
-        .lock()
-        .await
-        .get("vel-esc-ctx")
-        .unwrap()
-        .handle
-        .clone();
+    let handle = {
+        let arc = manager.contexts.get("vel-esc-ctx").unwrap().value().clone();
+        let ctx = arc.lock().await;
+        ctx.handle.clone()
+    };
     let admin = DID::from("did:key:admin");
     (manager, handle, admin, sk)
 }
@@ -9716,28 +9742,30 @@ async fn test_paid_send_rejected_without_spending_ucan() {
 
     // Grant budget so the budget check itself would pass.
     {
-        let _arc = manager
+        let arc = manager
             .contexts
             .get("paid-no-ucan-ctx")
             .unwrap()
             .value()
             .clone();
-        let mut _g = _arc.lock().await;
-        let ctx = &mut *_g;
+        let mut g = arc.lock().await;
+        let ctx = &mut *g;
         ctx.governance
             .budget_tracker
             .grant(&"did:key:sender".into(), Amount::new(1000));
     }
 
     let sk = ed25519_dalek::SigningKey::from_bytes(&[1u8; 32]);
-    let handle = manager
-        .contexts
-        .lock()
-        .await
-        .get("paid-no-ucan-ctx")
-        .unwrap()
-        .handle
-        .clone();
+    let handle = {
+        let arc = manager
+            .contexts
+            .get("paid-no-ucan-ctx")
+            .unwrap()
+            .value()
+            .clone();
+        let ctx = arc.lock().await;
+        ctx.handle.clone()
+    };
 
     // Send with spending_ucan: None — should be rejected.
     let result = manager
@@ -9964,14 +9992,11 @@ async fn test_consequence_evaluation_uses_full_history() {
         .unwrap();
 
     let sk = ed25519_dalek::SigningKey::from_bytes(&[1u8; 32]);
-    let handle = manager
-        .contexts
-        .lock()
-        .await
-        .get("hist-ctx")
-        .unwrap()
-        .handle
-        .clone();
+    let handle = {
+        let arc = manager.contexts.get("hist-ctx").unwrap().value().clone();
+        let ctx = arc.lock().await;
+        ctx.handle.clone()
+    };
 
     // Send 2 messages to build event log history.
     for i in 0..2 {
@@ -9995,9 +10020,9 @@ async fn test_consequence_evaluation_uses_full_history() {
     // Clear the write suspension that may have been applied by the
     // consequence on the 2nd send (threshold=2 was reached in-buffer).
     {
-        let _arc = manager.contexts.get("hist-ctx").unwrap().value().clone();
-        let mut _g = _arc.lock().await;
-        let ctx = &mut *_g;
+        let arc = manager.contexts.get("hist-ctx").unwrap().value().clone();
+        let mut g = arc.lock().await;
+        let ctx = &mut *g;
         ctx.role_state
             .suspended_capabilities
             .remove("did:key:admin");
@@ -10098,28 +10123,30 @@ async fn paid_send_with_valid_spending_ucan_succeeds() {
 
     // Grant budget so budget check passes.
     {
-        let _arc = manager
+        let arc = manager
             .contexts
             .get("paid-ucan-ok-ctx")
             .unwrap()
             .value()
             .clone();
-        let mut _g = _arc.lock().await;
-        let ctx = &mut *_g;
+        let mut g = arc.lock().await;
+        let ctx = &mut *g;
         ctx.governance
             .budget_tracker
             .grant(&"did:key:sender".into(), Amount::new(1000));
     }
 
     let sk = ed25519_dalek::SigningKey::from_bytes(&[1u8; 32]);
-    let handle = manager
-        .contexts
-        .lock()
-        .await
-        .get("paid-ucan-ok-ctx")
-        .unwrap()
-        .handle
-        .clone();
+    let handle = {
+        let arc = manager
+            .contexts
+            .get("paid-ucan-ok-ctx")
+            .unwrap()
+            .value()
+            .clone();
+        let ctx = arc.lock().await;
+        ctx.handle.clone()
+    };
 
     let ucan = dummy_spending_ucan_for(&"did:key:sender".into());
     let result = manager
@@ -10202,14 +10229,16 @@ async fn zero_cost_per_message_no_ucan_required() {
         .unwrap();
 
     let sk = ed25519_dalek::SigningKey::from_bytes(&[1u8; 32]);
-    let handle = manager
-        .contexts
-        .lock()
-        .await
-        .get("zero-cost-ctx")
-        .unwrap()
-        .handle
-        .clone();
+    let handle = {
+        let arc = manager
+            .contexts
+            .get("zero-cost-ctx")
+            .unwrap()
+            .value()
+            .clone();
+        let ctx = arc.lock().await;
+        ctx.handle.clone()
+    };
 
     // Send with spending_ucan: None on a zero-cost context — should succeed.
     let result = manager
@@ -10264,14 +10293,16 @@ async fn none_per_message_no_ucan_required() {
         .unwrap();
 
     let sk = ed25519_dalek::SigningKey::from_bytes(&[1u8; 32]);
-    let handle = manager
-        .contexts
-        .lock()
-        .await
-        .get("none-msg-ctx")
-        .unwrap()
-        .handle
-        .clone();
+    let handle = {
+        let arc = manager
+            .contexts
+            .get("none-msg-ctx")
+            .unwrap()
+            .value()
+            .clone();
+        let ctx = arc.lock().await;
+        ctx.handle.clone()
+    };
 
     // Send with spending_ucan: None — should succeed since per_message is None.
     let result = manager
@@ -10328,28 +10359,30 @@ async fn multiple_sends_unique_spending_ucans_all_succeed() {
 
     // Grant enough budget for multiple sends.
     {
-        let _arc = manager
+        let arc = manager
             .contexts
             .get("multi-ucan-ctx")
             .unwrap()
             .value()
             .clone();
-        let mut _g = _arc.lock().await;
-        let ctx = &mut *_g;
+        let mut g = arc.lock().await;
+        let ctx = &mut *g;
         ctx.governance
             .budget_tracker
             .grant(&"did:key:sender".into(), Amount::new(10_000));
     }
 
     let sk = ed25519_dalek::SigningKey::from_bytes(&[1u8; 32]);
-    let handle = manager
-        .contexts
-        .lock()
-        .await
-        .get("multi-ucan-ctx")
-        .unwrap()
-        .handle
-        .clone();
+    let handle = {
+        let arc = manager
+            .contexts
+            .get("multi-ucan-ctx")
+            .unwrap()
+            .value()
+            .clone();
+        let ctx = arc.lock().await;
+        ctx.handle.clone()
+    };
 
     // Each send must use a fresh spending UCAN with a unique nonce.
     // Reusing the same UCAN would be rejected by the NonceTracker
@@ -10414,14 +10447,14 @@ async fn paid_join_with_spending_ucan_still_blocked_by_auto_accept() {
 
     // Pre-grant budget for the joiner.
     {
-        let _arc = manager
+        let arc = manager
             .contexts
             .get("paid-join-ucan-ctx")
             .unwrap()
             .value()
             .clone();
-        let mut _g = _arc.lock().await;
-        let ctx = &mut *_g;
+        let mut g = arc.lock().await;
+        let ctx = &mut *g;
         ctx.governance
             .budget_tracker
             .grant(&"did:key:joiner".into(), Amount::new(1000));
@@ -10752,14 +10785,16 @@ async fn no_auto_grant_requires_explicit_budget() {
         .unwrap();
 
     let sk = ed25519_dalek::SigningKey::from_bytes(&[1u8; 32]);
-    let handle = manager
-        .contexts
-        .lock()
-        .await
-        .get("no-autogrant-ctx")
-        .unwrap()
-        .handle
-        .clone();
+    let handle = {
+        let arc = manager
+            .contexts
+            .get("no-autogrant-ctx")
+            .unwrap()
+            .value()
+            .clone();
+        let ctx = arc.lock().await;
+        ctx.handle.clone()
+    };
 
     // Without budget, send should fail with NoBudget error.
     let ucan = dummy_spending_ucan_for(&"did:key:sender".into());
@@ -10784,14 +10819,14 @@ async fn no_auto_grant_requires_explicit_budget() {
     // Use a fresh UCAN because the nonce tracker records nonces even on
     // failed attempts (defense-in-depth against replay).
     {
-        let _arc = manager
+        let arc = manager
             .contexts
             .get("no-autogrant-ctx")
             .unwrap()
             .value()
             .clone();
-        let mut _g = _arc.lock().await;
-        let ctx = &mut *_g;
+        let mut g = arc.lock().await;
+        let ctx = &mut *g;
         ctx.governance
             .budget_tracker
             .grant(&"did:key:sender".into(), Amount::new(100));
@@ -10852,23 +10887,20 @@ async fn no_double_charge_on_paid_send() {
     // Grant exactly enough for one send.
     let sender_did: DID = "did:key:sender".into();
     {
-        let _arc = manager.contexts.get("double-ctx").unwrap().value().clone();
-        let mut _g = _arc.lock().await;
-        let ctx = &mut *_g;
+        let arc = manager.contexts.get("double-ctx").unwrap().value().clone();
+        let mut g = arc.lock().await;
+        let ctx = &mut *g;
         ctx.governance
             .budget_tracker
             .grant(&sender_did, Amount::new(200));
     }
 
     let sk = ed25519_dalek::SigningKey::from_bytes(&[1u8; 32]);
-    let handle = manager
-        .contexts
-        .lock()
-        .await
-        .get("double-ctx")
-        .unwrap()
-        .handle
-        .clone();
+    let handle = {
+        let arc = manager.contexts.get("double-ctx").unwrap().value().clone();
+        let ctx = arc.lock().await;
+        ctx.handle.clone()
+    };
 
     let ucan = dummy_spending_ucan_for(&sender_did);
     manager
@@ -10885,9 +10917,9 @@ async fn no_double_charge_on_paid_send() {
 
     // Check remaining budget — should be 200 - 100 = 100 (single charge).
     let remaining = {
-        let _arc = manager.contexts.get("double-ctx").unwrap().value().clone();
-        let _g = _arc.lock().await;
-        let ctx = &*_g;
+        let arc = manager.contexts.get("double-ctx").unwrap().value().clone();
+        let g = arc.lock().await;
+        let ctx = &*g;
         ctx.governance.budget_tracker.remaining(&sender_did)
     };
     assert_eq!(
@@ -10924,14 +10956,14 @@ async fn capability_suspension_exact_match_no_false_positive() {
         .await
         .unwrap();
     {
-        let _arc = manager
+        let arc = manager
             .contexts
             .get("cap-exact-ctx")
             .unwrap()
             .value()
             .clone();
-        let mut _g = _arc.lock().await;
-        let ctx = &mut *_g;
+        let mut g = arc.lock().await;
+        let ctx = &mut *g;
         ctx.governance.consequence_rules = vec![ConsequenceRule {
             trigger: ConsequenceTrigger::MessageVelocity,
             threshold: 1,
@@ -10943,14 +10975,16 @@ async fn capability_suspension_exact_match_no_false_positive() {
     }
 
     let sk = ed25519_dalek::SigningKey::from_bytes(&[1u8; 32]);
-    let handle = manager
-        .contexts
-        .lock()
-        .await
-        .get("cap-exact-ctx")
-        .unwrap()
-        .handle
-        .clone();
+    let handle = {
+        let arc = manager
+            .contexts
+            .get("cap-exact-ctx")
+            .unwrap()
+            .value()
+            .clone();
+        let ctx = arc.lock().await;
+        ctx.handle.clone()
+    };
 
     // Send a message to trigger the consequence.
     manager
@@ -10969,14 +11003,14 @@ async fn capability_suspension_exact_match_no_false_positive() {
     // suspension succeeds. The member gets Custom("spreadsheet") in their
     // suspended set. Since MessagesWrite is NOT suspended, they can still send.
     let cap_suspended = {
-        let _arc = manager
+        let arc = manager
             .contexts
             .get("cap-exact-ctx")
             .unwrap()
             .value()
             .clone();
-        let _g = _arc.lock().await;
-        let ctx = &*_g;
+        let g = arc.lock().await;
+        let ctx = &*g;
         ctx.role_state
             .suspended_capabilities
             .get("did:key:sender")
@@ -11038,14 +11072,16 @@ async fn capability_suspension_write_revokes_write() {
         .unwrap();
 
     let sk = ed25519_dalek::SigningKey::from_bytes(&[1u8; 32]);
-    let handle = manager
-        .contexts
-        .lock()
-        .await
-        .get("cap-write-ctx")
-        .unwrap()
-        .handle
-        .clone();
+    let handle = {
+        let arc = manager
+            .contexts
+            .get("cap-write-ctx")
+            .unwrap()
+            .value()
+            .clone();
+        let ctx = arc.lock().await;
+        ctx.handle.clone()
+    };
 
     // First send triggers the consequence.
     manager
@@ -11062,14 +11098,14 @@ async fn capability_suspension_write_revokes_write() {
 
     // Write capability should be suspended.
     let write_suspended = {
-        let _arc = manager
+        let arc = manager
             .contexts
             .get("cap-write-ctx")
             .unwrap()
             .value()
             .clone();
-        let _g = _arc.lock().await;
-        let ctx = &*_g;
+        let g = arc.lock().await;
+        let ctx = &*g;
         ctx.role_state
             .suspended_capabilities
             .get("did:key:sender")
@@ -11114,14 +11150,16 @@ async fn capability_suspension_read_revokes_read() {
         .unwrap();
 
     let sk = ed25519_dalek::SigningKey::from_bytes(&[1u8; 32]);
-    let handle = manager
-        .contexts
-        .lock()
-        .await
-        .get("cap-read-ctx")
-        .unwrap()
-        .handle
-        .clone();
+    let handle = {
+        let arc = manager
+            .contexts
+            .get("cap-read-ctx")
+            .unwrap()
+            .value()
+            .clone();
+        let ctx = arc.lock().await;
+        ctx.handle.clone()
+    };
 
     manager
         .send_message(
@@ -11136,14 +11174,14 @@ async fn capability_suspension_read_revokes_read() {
         .unwrap();
 
     let read_suspended = {
-        let _arc = manager
+        let arc = manager
             .contexts
             .get("cap-read-ctx")
             .unwrap()
             .value()
             .clone();
-        let _g = _arc.lock().await;
-        let ctx = &*_g;
+        let g = arc.lock().await;
+        let ctx = &*g;
         ctx.role_state
             .suspended_capabilities
             .get("did:key:sender")
@@ -11194,14 +11232,16 @@ async fn role_demotion_nonexistent_role_reports_failure() {
         .unwrap();
 
     let sk = ed25519_dalek::SigningKey::from_bytes(&[1u8; 32]);
-    let handle = manager
-        .contexts
-        .lock()
-        .await
-        .get("role-noexist-ctx")
-        .unwrap()
-        .handle
-        .clone();
+    let handle = {
+        let arc = manager
+            .contexts
+            .get("role-noexist-ctx")
+            .unwrap()
+            .value()
+            .clone();
+        let ctx = arc.lock().await;
+        ctx.handle.clone()
+    };
 
     manager
         .send_message(
@@ -11241,14 +11281,14 @@ async fn role_demotion_nonexistent_role_reports_failure() {
         "Failed AssignRole should escalate to SuspendAll. Events: {enforced_events:?}"
     );
     // Verify the member is now suspended.
-    let _arc = manager
+    let arc = manager
         .contexts
         .get("role-noexist-ctx")
         .unwrap()
         .value()
         .clone();
-    let _g = _arc.lock().await;
-    let ctx = &*_g;
+    let g = arc.lock().await;
+    let ctx = &*g;
     assert!(
         ctx.role_state
             .suspended_capabilities
@@ -11394,14 +11434,14 @@ async fn participation_cache_cleared_after_member_leaves() {
 
     // Seed participation cache with an entry for Alice.
     {
-        let _arc = manager
+        let arc = manager
             .contexts
             .get("part-cache-ctx")
             .unwrap()
             .value()
             .clone();
-        let mut _g = _arc.lock().await;
-        let ctx = &mut *_g;
+        let mut g = arc.lock().await;
+        let ctx = &mut *g;
         ctx.governance.participation_cache.insert(
             alice.as_ref().to_owned(),
             scp_protocol::trust::participation::ParticipationRecord {
@@ -11429,14 +11469,14 @@ async fn participation_cache_cleared_after_member_leaves() {
 
     // Verify participation cache no longer has Alice.
     let has_alice = {
-        let _arc = manager
+        let arc = manager
             .contexts
             .get("part-cache-ctx")
             .unwrap()
             .value()
             .clone();
-        let _g = _arc.lock().await;
-        let ctx = &*_g;
+        let g = arc.lock().await;
+        let ctx = &*g;
         ctx.governance
             .participation_cache
             .contains_key(alice.as_ref())
@@ -11445,14 +11485,14 @@ async fn participation_cache_cleared_after_member_leaves() {
     // not immediately on leave. The cache MAY still have Alice's entry. What we
     // verify is that the membership state no longer contains Alice.
     let membership_has_alice = {
-        let _arc = manager
+        let arc = manager
             .contexts
             .get("part-cache-ctx")
             .unwrap()
             .value()
             .clone();
-        let _g = _arc.lock().await;
-        let ctx = &*_g;
+        let g = arc.lock().await;
+        let ctx = &*g;
         ctx.membership.contains(&alice)
     };
     assert!(
@@ -11489,14 +11529,14 @@ async fn capability_suspension_empty_caps_no_action() {
         .await
         .unwrap();
     {
-        let _arc = manager
+        let arc = manager
             .contexts
             .get("empty-caps-ctx")
             .unwrap()
             .value()
             .clone();
-        let mut _g = _arc.lock().await;
-        let ctx = &mut *_g;
+        let mut g = arc.lock().await;
+        let ctx = &mut *g;
         ctx.governance.consequence_rules = vec![ConsequenceRule {
             trigger: ConsequenceTrigger::MessageVelocity,
             threshold: 1,
@@ -11508,14 +11548,16 @@ async fn capability_suspension_empty_caps_no_action() {
     }
 
     let sk = ed25519_dalek::SigningKey::from_bytes(&[1u8; 32]);
-    let handle = manager
-        .contexts
-        .lock()
-        .await
-        .get("empty-caps-ctx")
-        .unwrap()
-        .handle
-        .clone();
+    let handle = {
+        let arc = manager
+            .contexts
+            .get("empty-caps-ctx")
+            .unwrap()
+            .value()
+            .clone();
+        let ctx = arc.lock().await;
+        ctx.handle.clone()
+    };
 
     manager
         .send_message(
@@ -11532,14 +11574,14 @@ async fn capability_suspension_empty_caps_no_action() {
     // H10: empty caps produces success=false, which escalates to SuspendAll.
     // So the member should have all capabilities suspended after escalation.
     let all_suspended = {
-        let _arc = manager
+        let arc = manager
             .contexts
             .get("empty-caps-ctx")
             .unwrap()
             .value()
             .clone();
-        let _g = _arc.lock().await;
-        let ctx = &*_g;
+        let g = arc.lock().await;
+        let ctx = &*g;
         ctx.role_state
             .suspended_capabilities
             .get("did:key:sender")
@@ -11616,14 +11658,16 @@ async fn multiple_consequence_rules_all_trigger() {
         .unwrap();
 
     let sk = ed25519_dalek::SigningKey::from_bytes(&[1u8; 32]);
-    let handle = manager
-        .contexts
-        .lock()
-        .await
-        .get("multi-rule-ctx")
-        .unwrap()
-        .handle
-        .clone();
+    let handle = {
+        let arc = manager
+            .contexts
+            .get("multi-rule-ctx")
+            .unwrap()
+            .value()
+            .clone();
+        let ctx = arc.lock().await;
+        ctx.handle.clone()
+    };
 
     manager
         .send_message(
@@ -11639,14 +11683,14 @@ async fn multiple_consequence_rules_all_trigger() {
 
     // Both rules should have fired — both write and read suspended.
     let (write_suspended, read_suspended) = {
-        let _arc = manager
+        let arc = manager
             .contexts
             .get("multi-rule-ctx")
             .unwrap()
             .value()
             .clone();
-        let _g = _arc.lock().await;
-        let ctx = &*_g;
+        let g = arc.lock().await;
+        let ctx = &*g;
         let suspended = ctx.role_state.suspended_capabilities.get("did:key:sender");
         (
             suspended.is_some_and(|s| s.contains(&Capability::MessagesWrite)),
@@ -11705,20 +11749,17 @@ async fn aggregate_velocity_via_manager_send() {
         .unwrap();
 
     let sk = ed25519_dalek::SigningKey::from_bytes(&[1u8; 32]);
-    let handle = manager
-        .contexts
-        .lock()
-        .await
-        .get("agg-vel-ctx")
-        .unwrap()
-        .handle
-        .clone();
+    let handle = {
+        let arc = manager.contexts.get("agg-vel-ctx").unwrap().value().clone();
+        let ctx = arc.lock().await;
+        ctx.handle.clone()
+    };
 
     // Pre-grant sufficient budget for all 3 sends (auto-grant only covers the first).
     {
-        let _arc = manager.contexts.get("agg-vel-ctx").unwrap().value().clone();
-        let mut _g = _arc.lock().await;
-        let ctx = &mut *_g;
+        let arc = manager.contexts.get("agg-vel-ctx").unwrap().value().clone();
+        let mut g = arc.lock().await;
+        let ctx = &mut *g;
         ctx.governance.budget_tracker.grant(
             &"did:key:sender".into(),
             scp_protocol::economy::types::Amount::new(100),
@@ -11744,9 +11785,9 @@ async fn aggregate_velocity_via_manager_send() {
 
     // Read the velocity tracker's aggregate.
     let aggregate = {
-        let _arc = manager.contexts.get("agg-vel-ctx").unwrap().value().clone();
-        let _g = _arc.lock().await;
-        let ctx = &*_g;
+        let arc = manager.contexts.get("agg-vel-ctx").unwrap().value().clone();
+        let g = arc.lock().await;
+        let ctx = &*g;
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
@@ -11998,14 +12039,11 @@ async fn event_log_entries_merge_buffer_and_history() {
         .unwrap();
 
     let sk = ed25519_dalek::SigningKey::from_bytes(&[1u8; 32]);
-    let handle = manager
-        .contexts
-        .lock()
-        .await
-        .get("merge-ctx")
-        .unwrap()
-        .handle
-        .clone();
+    let handle = {
+        let arc = manager.contexts.get("merge-ctx").unwrap().value().clone();
+        let ctx = arc.lock().await;
+        ctx.handle.clone()
+    };
 
     // Send 3 messages to populate both event log and buffer.
     for i in 0..3 {
@@ -12082,9 +12120,9 @@ async fn buffer_event_timestamp_bounds_m18() {
 
     // Push 10 buffer events — all within the 1-hour window.
     {
-        let _arc = manager.contexts.get("bounds-ctx").unwrap().value().clone();
-        let mut _g = _arc.lock().await;
-        let ctx = &mut *_g;
+        let arc = manager.contexts.get("bounds-ctx").unwrap().value().clone();
+        let mut g = arc.lock().await;
+        let ctx = &mut *g;
         for i in 0..10u64 {
             ctx.receive_buffer.push(ContextEvent::MessageSent {
                 sender_did: "did:key:sender".into(),
@@ -12097,9 +12135,9 @@ async fn buffer_event_timestamp_bounds_m18() {
     // All 10 events should be included — estimated timestamps are
     // `now - 9` through `now`, well within the 1-hour window.
     {
-        let _arc = manager.contexts.get("bounds-ctx").unwrap().value().clone();
-        let _g = _arc.lock().await;
-        let ctx = &*_g;
+        let arc = manager.contexts.get("bounds-ctx").unwrap().value().clone();
+        let g = arc.lock().await;
+        let ctx = &*g;
         let events = event_log_entries_for_consequences(ctx, "bounds-ctx", now_normal, &event_log);
         assert_eq!(
             events.len(),
@@ -12112,9 +12150,9 @@ async fn buffer_event_timestamp_bounds_m18() {
     // Replace buffer with larger capacity (5000) and push 3602 events.
     // Oldest event gets estimated_ts = now - 3601, age = 3601 > 3600.
     {
-        let _arc = manager.contexts.get("bounds-ctx").unwrap().value().clone();
-        let mut _g = _arc.lock().await;
-        let ctx = &mut *_g;
+        let arc = manager.contexts.get("bounds-ctx").unwrap().value().clone();
+        let mut g = arc.lock().await;
+        let ctx = &mut *g;
         ctx.receive_buffer.drain();
         ctx.receive_buffer = ReceiveBuffer::with_capacity(5000);
 
@@ -12128,9 +12166,9 @@ async fn buffer_event_timestamp_bounds_m18() {
     }
 
     {
-        let _arc = manager.contexts.get("bounds-ctx").unwrap().value().clone();
-        let _g = _arc.lock().await;
-        let ctx = &*_g;
+        let arc = manager.contexts.get("bounds-ctx").unwrap().value().clone();
+        let g = arc.lock().await;
+        let ctx = &*g;
         let events = event_log_entries_for_consequences(ctx, "bounds-ctx", now_normal, &event_log);
 
         // Oldest event (age 3601s) is rejected by the M18 timestamp filter.
@@ -12157,9 +12195,9 @@ async fn buffer_event_timestamp_bounds_m18() {
     // --- Test future check does not reject valid events ---
     // With now=0, all estimated timestamps saturate to 0 — within bounds.
     {
-        let _arc = manager.contexts.get("bounds-ctx").unwrap().value().clone();
-        let mut _g = _arc.lock().await;
-        let ctx = &mut *_g;
+        let arc = manager.contexts.get("bounds-ctx").unwrap().value().clone();
+        let mut g = arc.lock().await;
+        let ctx = &mut *g;
         ctx.receive_buffer = ReceiveBuffer::new();
         for i in 0..5u64 {
             ctx.receive_buffer.push(ContextEvent::MessageSent {
@@ -12171,9 +12209,9 @@ async fn buffer_event_timestamp_bounds_m18() {
     }
 
     {
-        let _arc = manager.contexts.get("bounds-ctx").unwrap().value().clone();
-        let _g = _arc.lock().await;
-        let ctx = &*_g;
+        let arc = manager.contexts.get("bounds-ctx").unwrap().value().clone();
+        let g = arc.lock().await;
+        let ctx = &*g;
         let events = event_log_entries_for_consequences(ctx, "bounds-ctx", 0, &event_log);
         assert_eq!(
             events.len(),
@@ -12224,28 +12262,30 @@ async fn budget_not_deducted_on_transport_failure() {
 
     let sender_did: DID = "did:key:sender".into();
     {
-        let _arc = manager
+        let arc = manager
             .contexts
             .get("rollback-ctx")
             .unwrap()
             .value()
             .clone();
-        let mut _g = _arc.lock().await;
-        let ctx = &mut *_g;
+        let mut g = arc.lock().await;
+        let ctx = &mut *g;
         ctx.governance
             .budget_tracker
             .grant(&sender_did, Amount::new(500));
     }
 
     let sk = ed25519_dalek::SigningKey::from_bytes(&[1u8; 32]);
-    let handle = manager
-        .contexts
-        .lock()
-        .await
-        .get("rollback-ctx")
-        .unwrap()
-        .handle
-        .clone();
+    let handle = {
+        let arc = manager
+            .contexts
+            .get("rollback-ctx")
+            .unwrap()
+            .value()
+            .clone();
+        let ctx = arc.lock().await;
+        ctx.handle.clone()
+    };
 
     let ucan = dummy_spending_ucan();
     // Transport fails, so send should fail.
@@ -12265,14 +12305,14 @@ async fn budget_not_deducted_on_transport_failure() {
     // transport failure in Phase 2. The escrow pattern ensures money is
     // not taken when the action fails.
     let remaining = {
-        let _arc = manager
+        let arc = manager
             .contexts
             .get("rollback-ctx")
             .unwrap()
             .value()
             .clone();
-        let _g = _arc.lock().await;
-        let ctx = &*_g;
+        let g = arc.lock().await;
+        let ctx = &*g;
         ctx.governance.budget_tracker.remaining(&sender_did)
     };
     // Budget was 500, cost is 50. Transport failed → EconomyTicket rollback restored it.
@@ -12366,20 +12406,17 @@ async fn observable_metrics_time_of_day_populated() {
         .unwrap();
 
     let sk = ed25519_dalek::SigningKey::from_bytes(&[1u8; 32]);
-    let handle = manager
-        .contexts
-        .lock()
-        .await
-        .get("tod-ctx")
-        .unwrap()
-        .handle
-        .clone();
+    let handle = {
+        let arc = manager.contexts.get("tod-ctx").unwrap().value().clone();
+        let ctx = arc.lock().await;
+        ctx.handle.clone()
+    };
 
     // Grant budget so economy enforcement passes.
     {
-        let _arc = manager.contexts.get("tod-ctx").unwrap().value().clone();
-        let mut _g = _arc.lock().await;
-        let ctx = &mut *_g;
+        let arc = manager.contexts.get("tod-ctx").unwrap().value().clone();
+        let mut g = arc.lock().await;
+        let ctx = &mut *g;
         ctx.governance
             .budget_tracker
             .grant(&"did:key:sender".into(), Amount::new(100));
@@ -12442,20 +12479,17 @@ async fn context_message_rate_from_aggregate_velocity() {
         .unwrap();
 
     let sk = ed25519_dalek::SigningKey::from_bytes(&[1u8; 32]);
-    let handle = manager
-        .contexts
-        .lock()
-        .await
-        .get("cmr-ctx")
-        .unwrap()
-        .handle
-        .clone();
+    let handle = {
+        let arc = manager.contexts.get("cmr-ctx").unwrap().value().clone();
+        let ctx = arc.lock().await;
+        ctx.handle.clone()
+    };
 
     // Pre-grant sufficient budget for all 5 sends.
     {
-        let _arc = manager.contexts.get("cmr-ctx").unwrap().value().clone();
-        let mut _g = _arc.lock().await;
-        let ctx = &mut *_g;
+        let arc = manager.contexts.get("cmr-ctx").unwrap().value().clone();
+        let mut g = arc.lock().await;
+        let ctx = &mut *g;
         ctx.governance.budget_tracker.grant(
             &"did:key:sender".into(),
             scp_protocol::economy::types::Amount::new(100),
@@ -12481,9 +12515,9 @@ async fn context_message_rate_from_aggregate_velocity() {
 
     // Verify aggregate velocity tracks all sends.
     let aggregate = {
-        let _arc = manager.contexts.get("cmr-ctx").unwrap().value().clone();
-        let _g = _arc.lock().await;
-        let ctx = &*_g;
+        let arc = manager.contexts.get("cmr-ctx").unwrap().value().clone();
+        let g = arc.lock().await;
+        let ctx = &*g;
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
@@ -12810,14 +12844,14 @@ async fn consequence_timer_fires_without_user_action() {
     // Inject one event into the receive buffer so the rule (threshold=1)
     // can fire from the periodic timer tick.
     {
-        let _arc = manager
+        let arc = manager
             .contexts
             .get("timer-conseq-ctx")
             .unwrap()
             .value()
             .clone();
-        let mut _g = _arc.lock().await;
-        let ctx = &mut *_g;
+        let mut g = arc.lock().await;
+        let ctx = &mut *g;
         ctx.receive_buffer.push(ContextEvent::MessageSent {
             sender_did: admin.clone(),
             sequence_number: 0,
@@ -12891,14 +12925,14 @@ async fn consequence_timer_respects_cooldown() {
 
     // Inject one event so the rule (threshold=1) can fire.
     {
-        let _arc = manager
+        let arc = manager
             .contexts
             .get("cooldown-timer-ctx")
             .unwrap()
             .value()
             .clone();
-        let mut _g = _arc.lock().await;
-        let ctx = &mut *_g;
+        let mut g = arc.lock().await;
+        let ctx = &mut *g;
         ctx.receive_buffer.push(ContextEvent::MessageSent {
             sender_did: admin.clone(),
             sequence_number: 0,
@@ -13164,14 +13198,14 @@ async fn test_fabricated_spending_ucan_rejected() {
 
     // Grant budget so the budget check passes.
     {
-        let _arc = manager
+        let arc = manager
             .contexts
             .get("fab-ucan-ctx")
             .unwrap()
             .value()
             .clone();
-        let mut _g = _arc.lock().await;
-        let ctx = &mut *_g;
+        let mut g = arc.lock().await;
+        let ctx = &mut *g;
         ctx.governance
             .budget_tracker
             .grant(&"did:key:sender".into(), Amount::new(1000));
@@ -13271,9 +13305,9 @@ async fn c1_paid_context(name: &str, sender_did: &DID) -> (ContextManager, Conte
         .unwrap();
 
     {
-        let _arc = manager.contexts.get(name).unwrap().value().clone();
-        let mut _g = _arc.lock().await;
-        let ctx = &mut *_g;
+        let arc = manager.contexts.get(name).unwrap().value().clone();
+        let mut g = arc.lock().await;
+        let ctx = &mut *g;
         ctx.governance
             .budget_tracker
             .grant(sender_did, Amount::new(1000));
@@ -13507,14 +13541,14 @@ async fn test_spending_ucan_revoked_c1() {
 
     // Insert the CID into the per-context revoked set BEFORE the send.
     {
-        let _arc = manager
+        let arc = manager
             .contexts
             .get("c1-revoke-ctx")
             .unwrap()
             .value()
             .clone();
-        let mut _g = _arc.lock().await;
-        let ctx = &mut *_g;
+        let mut g = arc.lock().await;
+        let ctx = &mut *g;
         ctx.governance
             .revoked_spending_ucan_cids
             .insert(revocation_cid);
@@ -13650,14 +13684,14 @@ async fn test_capability_failure_no_budget_leak() {
     // would be blocked by auto_accept_blocked_by_economics). Grant budget but
     // withhold messages:write capability.
     {
-        let _arc = manager
+        let arc = manager
             .contexts
             .get("cap-leak-ctx")
             .unwrap()
             .value()
             .clone();
-        let mut _g = _arc.lock().await;
-        let ctx = &mut *_g;
+        let mut g = arc.lock().await;
+        let ctx = &mut *g;
         ctx.membership
             .add_member(DID::from("did:key:nocap"), "member".to_owned(), vec![]);
         ctx.governance
@@ -13685,14 +13719,14 @@ async fn test_capability_failure_no_budget_leak() {
 
     // Budget should be unchanged (no deduction occurred).
     let remaining = {
-        let _arc = manager
+        let arc = manager
             .contexts
             .get("cap-leak-ctx")
             .unwrap()
             .value()
             .clone();
-        let _g = _arc.lock().await;
-        let ctx = &*_g;
+        let g = arc.lock().await;
+        let ctx = &*g;
         ctx.governance
             .budget_tracker
             .remaining(&"did:key:nocap".into())
@@ -13744,9 +13778,9 @@ async fn test_capture_failure_budget_retained() {
         .await
         .unwrap();
     {
-        let _arc = manager.contexts.get("capture-ctx").unwrap().value().clone();
-        let mut _g = _arc.lock().await;
-        let ctx = &mut *_g;
+        let arc = manager.contexts.get("capture-ctx").unwrap().value().clone();
+        let mut g = arc.lock().await;
+        let ctx = &mut *g;
         ctx.governance
             .budget_tracker
             .grant(&"did:key:sender".into(), Amount::new(100));
@@ -13768,9 +13802,9 @@ async fn test_capture_failure_budget_retained() {
 
     // Budget was deducted and stays deducted (H8: no rollback on capture failure).
     let remaining = {
-        let _arc = manager.contexts.get("capture-ctx").unwrap().value().clone();
-        let _g = _arc.lock().await;
-        let ctx = &*_g;
+        let arc = manager.contexts.get("capture-ctx").unwrap().value().clone();
+        let g = arc.lock().await;
+        let ctx = &*g;
         ctx.governance
             .budget_tracker
             .remaining(&"did:key:sender".into())
@@ -13823,28 +13857,30 @@ async fn spending_ucan_nonce_replay_rejected() {
 
     // Grant enough budget for multiple sends.
     {
-        let _arc = manager
+        let arc = manager
             .contexts
             .get("nonce-replay-ctx")
             .unwrap()
             .value()
             .clone();
-        let mut _g = _arc.lock().await;
-        let ctx = &mut *_g;
+        let mut g = arc.lock().await;
+        let ctx = &mut *g;
         ctx.governance
             .budget_tracker
             .grant(&"did:key:sender".into(), Amount::new(100));
     }
 
     let sk = ed25519_dalek::SigningKey::from_bytes(&[1u8; 32]);
-    let handle = manager
-        .contexts
-        .lock()
-        .await
-        .get("nonce-replay-ctx")
-        .unwrap()
-        .handle
-        .clone();
+    let handle = {
+        let arc = manager
+            .contexts
+            .get("nonce-replay-ctx")
+            .unwrap()
+            .value()
+            .clone();
+        let ctx = arc.lock().await;
+        ctx.handle.clone()
+    };
 
     // First send with a spending UCAN succeeds.
     let sender_did: DID = "did:key:sender".into();
@@ -13989,14 +14025,11 @@ async fn test_consequence_failure_escalates() {
         .unwrap();
 
     let sk = ed25519_dalek::SigningKey::from_bytes(&[1u8; 32]);
-    let handle = manager
-        .contexts
-        .lock()
-        .await
-        .get("esc-ctx")
-        .unwrap()
-        .handle
-        .clone();
+    let handle = {
+        let arc = manager.contexts.get("esc-ctx").unwrap().value().clone();
+        let ctx = arc.lock().await;
+        ctx.handle.clone()
+    };
 
     manager
         .send_message(
@@ -14025,9 +14058,9 @@ async fn test_consequence_failure_escalates() {
     );
 
     // Member should have all capabilities suspended.
-    let _arc = manager.contexts.get("esc-ctx").unwrap().value().clone();
-    let _g = _arc.lock().await;
-    let ctx = &*_g;
+    let arc = manager.contexts.get("esc-ctx").unwrap().value().clone();
+    let g = arc.lock().await;
+    let ctx = &*g;
     assert!(
         ctx.role_state
             .suspended_capabilities
@@ -14129,14 +14162,14 @@ async fn test_velocity_includes_current_message() {
         .await
         .unwrap();
     {
-        let _arc = manager
+        let arc = manager
             .contexts
             .get("vel-msg-ctx2")
             .unwrap()
             .value()
             .clone();
-        let mut _g = _arc.lock().await;
-        let ctx = &mut *_g;
+        let mut g = arc.lock().await;
+        let ctx = &mut *g;
         ctx.governance
             .budget_tracker
             .grant(&"did:key:sender".into(), Amount::new(1000));
@@ -14158,14 +14191,14 @@ async fn test_velocity_includes_current_message() {
 
     // Velocity should include the message we just sent (M4).
     let velocity = {
-        let _arc = manager
+        let arc = manager
             .contexts
             .get("vel-msg-ctx2")
             .unwrap()
             .value()
             .clone();
-        let _g = _arc.lock().await;
-        let ctx = &*_g;
+        let g = arc.lock().await;
+        let ctx = &*g;
         ctx.governance
             .velocity_tracker
             .get_velocity(&"did:key:sender".into(), manager.clock.now_secs())
@@ -14261,9 +14294,9 @@ async fn test_member_reset_rotates_sender_keys() {
         .await;
     assert!(result.is_ok(), "member reset should succeed: {result:?}");
 
-    let _arc = manager.contexts.get(&context_id).unwrap().value().clone();
-    let _g = _arc.lock().await;
-    let ctx = &*_g;
+    let arc = manager.contexts.get(&context_id).unwrap().value().clone();
+    let g = arc.lock().await;
+    let ctx = &*g;
     assert!(ctx.membership.contains(&bob));
     assert!(ctx.governance.pending_epoch_resets.contains(&bob));
 }
@@ -14298,9 +14331,9 @@ async fn test_governance_close_decays_participation() {
     let context_id = handle.context_id().to_owned();
 
     {
-        let _arc = manager.contexts.get(&context_id).unwrap().value().clone();
-        let mut _g = _arc.lock().await;
-        let ctx = &mut *_g;
+        let arc = manager.contexts.get(&context_id).unwrap().value().clone();
+        let mut g = arc.lock().await;
+        let ctx = &mut *g;
         ctx.governance.participation_cache.insert(
             "dummy".to_owned(),
             scp_protocol::trust::participation::ParticipationRecord {
@@ -14348,9 +14381,9 @@ async fn test_governance_close_decays_participation() {
         "governance close should succeed: {result:?}"
     );
 
-    let _arc = manager.contexts.get(&context_id).unwrap().value().clone();
-    let _g = _arc.lock().await;
-    let ctx = &*_g;
+    let arc = manager.contexts.get(&context_id).unwrap().value().clone();
+    let g = arc.lock().await;
+    let ctx = &*g;
     // Note: participation_cache may be re-populated by finalize_governance_action
     // after decay_participation runs inside execute_close_context. The important
     // assertion is that cooldown_until was cleared (decay_participation ran).
@@ -14465,14 +14498,14 @@ async fn h17_setup_alice_and_bob(
         .unwrap();
 
     {
-        let _arc = alice_manager
+        let arc = alice_manager
             .contexts
             .get(context_id)
             .unwrap()
             .value()
             .clone();
-        let mut _g = _arc.lock().await;
-        let ctx = &mut *_g;
+        let mut g = arc.lock().await;
+        let ctx = &mut *g;
         ctx.membership
             .add_member(bob_did_str.into(), "member".into(), vec![]);
         ctx.role_state.members.insert(bob_did_str.to_owned());
@@ -14501,14 +14534,14 @@ async fn h17_setup_alice_and_bob(
         .unwrap();
 
     {
-        let _arc = bob_manager
+        let arc = bob_manager
             .contexts
             .get(context_id)
             .unwrap()
             .value()
             .clone();
-        let mut _g = _arc.lock().await;
-        let ctx = &mut *_g;
+        let mut g = arc.lock().await;
+        let ctx = &mut *g;
         // Add Alice as a member so deliver_incoming's membership check
         // passes for incoming messages from Alice.
         ctx.membership
@@ -14563,14 +14596,14 @@ async fn deliver_incoming_evaluates_consequences_behavioral() {
 
     // Pre-flight: Bob's velocity for Alice is zero, no suspension.
     {
-        let _arc = bob_manager
+        let arc = bob_manager
             .contexts
             .get(context_id)
             .unwrap()
             .value()
             .clone();
-        let _g = _arc.lock().await;
-        let ctx = &*_g;
+        let g = arc.lock().await;
+        let ctx = &*g;
         assert_eq!(
             ctx.governance
                 .velocity_tracker
@@ -14633,14 +14666,14 @@ async fn deliver_incoming_evaluates_consequences_behavioral() {
     // so the tracker reflects all three sends regardless of whether
     // the consequence fired.
     {
-        let _arc = bob_manager
+        let arc = bob_manager
             .contexts
             .get(context_id)
             .unwrap()
             .value()
             .clone();
-        let _g = _arc.lock().await;
-        let ctx = &*_g;
+        let g = arc.lock().await;
+        let ctx = &*g;
         let velocity = ctx
             .governance
             .velocity_tracker
@@ -14732,14 +14765,14 @@ async fn deliver_incoming_evaluates_consequences_behavioral() {
     // because Alice's context has no consequence rules. This isolates
     // the test to the H16 receive path on Bob's side.
     {
-        let _arc = alice_manager
+        let arc = alice_manager
             .contexts
             .get(context_id)
             .unwrap()
             .value()
             .clone();
-        let _g = _arc.lock().await;
-        let ctx = &*_g;
+        let g = arc.lock().await;
+        let ctx = &*g;
         assert!(
             !ctx.role_state
                 .suspended_capabilities
@@ -14797,14 +14830,14 @@ async fn deliver_incoming_no_consequence_rules_skips_eval() {
     // defense-in-depth guarantee: a receiver always observes the
     // sender's velocity, even if it has no enforcement rules.
     {
-        let _arc = bob_manager
+        let arc = bob_manager
             .contexts
             .get(context_id)
             .unwrap()
             .value()
             .clone();
-        let _g = _arc.lock().await;
-        let ctx = &*_g;
+        let g = arc.lock().await;
+        let ctx = &*g;
         let velocity = ctx
             .governance
             .velocity_tracker
@@ -15105,9 +15138,9 @@ async fn execute_revoke_rotation_failure_still_completes() {
     );
 
     // Verify capabilities were suspended despite rotation failure.
-    let _arc = manager.contexts.get(&context_id).unwrap().value().clone();
-    let _g = _arc.lock().await;
-    let ctx = &*_g;
+    let arc = manager.contexts.get(&context_id).unwrap().value().clone();
+    let g = arc.lock().await;
+    let ctx = &*g;
     assert!(
         !ctx.role_state
             .member_has_capability(bob.as_ref(), &Capability::MessagesWrite),
@@ -15140,22 +15173,22 @@ async fn test_decay_participation_clears_velocity_tracker() {
     let context_id = handle.context_id().to_owned();
 
     {
-        let _arc = manager.contexts.get(&context_id).unwrap().value().clone();
-        let _g = _arc.lock().await;
-        let ctx = &*_g;
+        let arc = manager.contexts.get(&context_id).unwrap().value().clone();
+        let g = arc.lock().await;
+        let ctx = &*g;
         ctx.governance.velocity_tracker.record_message(&alice, 100);
         assert!(ctx.governance.velocity_tracker.get_velocity(&alice, 100) > 0);
     }
     {
-        let _arc = manager.contexts.get(&context_id).unwrap().value().clone();
-        let mut _g = _arc.lock().await;
-        let ctx = &mut *_g;
+        let arc = manager.contexts.get(&context_id).unwrap().value().clone();
+        let mut g = arc.lock().await;
+        let ctx = &mut *g;
         ctx.governance.decay_participation();
     }
     {
-        let _arc = manager.contexts.get(&context_id).unwrap().value().clone();
-        let _g = _arc.lock().await;
-        let ctx = &*_g;
+        let arc = manager.contexts.get(&context_id).unwrap().value().clone();
+        let g = arc.lock().await;
+        let ctx = &*g;
         assert_eq!(ctx.governance.velocity_tracker.get_velocity(&alice, 100), 0);
     }
 }
@@ -15181,9 +15214,9 @@ async fn test_evict_stale_entries_removes_non_members() {
     let context_id = handle.context_id().to_owned();
 
     {
-        let _arc = manager.contexts.get(&context_id).unwrap().value().clone();
-        let mut _g = _arc.lock().await;
-        let ctx = &mut *_g;
+        let arc = manager.contexts.get(&context_id).unwrap().value().clone();
+        let mut g = arc.lock().await;
+        let ctx = &mut *g;
         ctx.governance.participation_cache.insert(
             "did:dht:z6MkNonMember".to_owned(),
             scp_protocol::trust::participation::ParticipationRecord {
@@ -15242,9 +15275,9 @@ async fn enforce_triggered_consequences_skips_absent_member() {
 
     let now = 1000;
     {
-        let _arc = manager.contexts.get("test-ctx").unwrap().value().clone();
-        let mut _g = _arc.lock().await;
-        let ctx = &mut *_g;
+        let arc = manager.contexts.get("test-ctx").unwrap().value().clone();
+        let mut g = arc.lock().await;
+        let ctx = &mut *g;
 
         // Verify the non-member is indeed not in membership.
         assert!(
@@ -15331,14 +15364,14 @@ async fn earned_capacity_limits_governance_proposals() {
     // New identity default: max_governance_proposals_per_window = 5,
     // governance_proposal_window_secs = 86400 (24h).
     {
-        let _arc = manager
+        let arc = manager
             .contexts
             .get("capacity-ctx")
             .unwrap()
             .value()
             .clone();
-        let mut _g = _arc.lock().await;
-        let ctx = &mut *_g;
+        let mut g = arc.lock().await;
+        let ctx = &mut *g;
         let now = manager.clock.now_secs();
         // Fill up to the limit (5 proposals) within the current window.
         let timestamps = vec![now - 100, now - 80, now - 60, now - 40, now - 20];
@@ -15389,14 +15422,14 @@ async fn no_sybil_policy_allows_unlimited_proposals() {
 
     // Even with many timestamps injected, no sybil_policy means no limit.
     {
-        let _arc = manager
+        let arc = manager
             .contexts
             .get("no-sybil-ctx")
             .unwrap()
             .value()
             .clone();
-        let mut _g = _arc.lock().await;
-        let ctx = &mut *_g;
+        let mut g = arc.lock().await;
+        let ctx = &mut *g;
         let now = manager.clock.now_secs();
         let timestamps: Vec<u64> = (0..100).map(|i| now - i).collect();
         ctx.governance
@@ -15444,9 +15477,9 @@ async fn earned_capacity_evicts_stale_timestamps() {
     // Inject timestamps that are all outside the 24h window.
     // New identity default: governance_proposal_window_secs = 86400.
     {
-        let _arc = manager.contexts.get("evict-ctx").unwrap().value().clone();
-        let mut _g = _arc.lock().await;
-        let ctx = &mut *_g;
+        let arc = manager.contexts.get("evict-ctx").unwrap().value().clone();
+        let mut g = arc.lock().await;
+        let ctx = &mut *g;
         let now = manager.clock.now_secs();
         // All timestamps are older than the window.
         let old_timestamps: Vec<u64> = (0..10).map(|i| now - 86400 - 100 - i).collect();
@@ -15502,14 +15535,14 @@ async fn governed_context_seeds_last_known_members_with_creator() {
         .await
         .unwrap();
 
-    let _arc = manager
+    let arc = manager
         .contexts
         .get("seed-members-ctx")
         .unwrap()
         .value()
         .clone();
-    let _g = _arc.lock().await;
-    let ctx = &*_g;
+    let g = arc.lock().await;
+    let ctx = &*g;
 
     assert!(
         ctx.governance.last_known_members.contains(&creator),
@@ -15621,9 +15654,9 @@ async fn consequence_evaluation_caps_buffer_events() {
     // Manually populate the receive buffer with >100 events.
     const FLOOD_COUNT: usize = 150;
     {
-        let _arc = manager.contexts.get("cap-buf-ctx").unwrap().value().clone();
-        let mut _g = _arc.lock().await;
-        let ctx = &mut *_g;
+        let arc = manager.contexts.get("cap-buf-ctx").unwrap().value().clone();
+        let mut g = arc.lock().await;
+        let ctx = &mut *g;
         for _ in 0..FLOOD_COUNT {
             ctx.receive_buffer.push(
                 scp_protocol::context::membership::ContextEvent::MessageReceived {
@@ -15636,9 +15669,9 @@ async fn consequence_evaluation_caps_buffer_events() {
 
     // Call event_log_entries_for_consequences directly and check the count.
     let events = {
-        let _arc = manager.contexts.get("cap-buf-ctx").unwrap().value().clone();
-        let _g = _arc.lock().await;
-        let ctx = &*_g;
+        let arc = manager.contexts.get("cap-buf-ctx").unwrap().value().clone();
+        let g = arc.lock().await;
+        let ctx = &*g;
         super::super::governance::event_log_entries_for_consequences(
             ctx,
             "cap-buf-ctx",
@@ -16026,14 +16059,14 @@ async fn h2_execute_change_role_works_when_creator_demoted() {
     // member_capabilities to model the post-demotion state without
     // depending on the (admittedly slow) full demote-the-admin path.
     {
-        let _arc = manager
+        let arc = manager
             .contexts
             .get("h2-change-role-ctx")
             .unwrap()
             .value()
             .clone();
-        let mut _g = _arc.lock().await;
-        let ctx = &mut *_g;
+        let mut g = arc.lock().await;
+        let ctx = &mut *g;
         let caps = ctx
             .role_state
             .member_capabilities
@@ -16069,14 +16102,14 @@ async fn h2_execute_change_role_works_when_creator_demoted() {
     );
 
     // Verify Bob's role actually changed.
-    let _arc = manager
+    let arc = manager
         .contexts
         .get("h2-change-role-ctx")
         .unwrap()
         .value()
         .clone();
-    let _g = _arc.lock().await;
-    let ctx = &*_g;
+    let g = arc.lock().await;
+    let ctx = &*g;
     let assignment = ctx
         .role_state
         .assignments
@@ -16109,14 +16142,14 @@ async fn h2_execute_add_member_works_when_creator_demoted() {
 
     // Strip RoleAssign from the creator before any AddMember proposal.
     {
-        let _arc = manager
+        let arc = manager
             .contexts
             .get("h2-add-member-ctx")
             .unwrap()
             .value()
             .clone();
-        let mut _g = _arc.lock().await;
-        let ctx = &mut *_g;
+        let mut g = arc.lock().await;
+        let ctx = &mut *g;
         let caps = ctx
             .role_state
             .member_capabilities
@@ -16150,14 +16183,14 @@ async fn h2_execute_add_member_works_when_creator_demoted() {
     );
 
     // Verify Carol is in the context.
-    let _arc = manager
+    let arc = manager
         .contexts
         .get("h2-add-member-ctx")
         .unwrap()
         .value()
         .clone();
-    let _g = _arc.lock().await;
-    let ctx = &*_g;
+    let g = arc.lock().await;
+    let ctx = &*g;
     assert!(
         ctx.membership.contains("did:key:carol"),
         "Carol must be in membership tracking after a successful AddMember"
@@ -16218,14 +16251,14 @@ async fn h2_execute_change_role_updates_tokens_correctly() {
 
     // Snapshot Bob's role tokens prior to ChangeRole.
     let initial_tokens = {
-        let _arc = manager
+        let arc = manager
             .contexts
             .get("h2-change-tokens-ctx")
             .unwrap()
             .value()
             .clone();
-        let _g = _arc.lock().await;
-        let ctx = &*_g;
+        let g = arc.lock().await;
+        let ctx = &*g;
         ctx.membership
             .get("did:key:bob")
             .expect("Bob should be in membership")
@@ -16250,14 +16283,14 @@ async fn h2_execute_change_role_updates_tokens_correctly() {
         .await
         .unwrap();
 
-    let _arc = manager
+    let arc = manager
         .contexts
         .get("h2-change-tokens-ctx")
         .unwrap()
         .value()
         .clone();
-    let _g = _arc.lock().await;
-    let ctx = &*_g;
+    let g = arc.lock().await;
+    let ctx = &*g;
     let info = ctx
         .membership
         .get("did:key:bob")
@@ -16393,14 +16426,14 @@ async fn h10_governance_freeze_not_triggered_by_timestamp_collision() {
 
     // Add a target member so ChangeRole has somewhere to land.
     {
-        let _arc = manager
+        let arc = manager
             .contexts
             .get("h10-collision-ctx")
             .unwrap()
             .value()
             .clone();
-        let mut _g = _arc.lock().await;
-        let ctx = &mut *_g;
+        let mut g = arc.lock().await;
+        let ctx = &mut *g;
         ctx.membership
             .add_member("did:key:target".into(), "member".into(), vec![]);
         ctx.role_state.members.insert("did:key:target".into());
@@ -16434,14 +16467,14 @@ async fn h10_governance_freeze_not_triggered_by_timestamp_collision() {
     // is pinned. We call detect_and_handle_conflicts directly so the test
     // does not depend on engine signing — the function is what the
     // attacker would race in the real bug.
-    let _arc = manager
+    let arc = manager
         .contexts
         .get("h10-collision-ctx")
         .unwrap()
         .value()
         .clone();
-    let mut _g = _arc.lock().await;
-    let ctx = &mut *_g;
+    let mut g = arc.lock().await;
+    let ctx = &mut *g;
 
     let events_a = manager.detect_and_handle_conflicts(ctx, &proposal_a);
     let events_b = manager.detect_and_handle_conflicts(ctx, &proposal_b);
@@ -16521,14 +16554,14 @@ async fn h10_approved_proposals_stores_monotonic_seq() {
     // Drive them through conflict detection. None conflict, so each is
     // inserted with the monotonically-assigned seq.
     {
-        let _arc = manager
+        let arc = manager
             .contexts
             .get("h10-monotonic-ctx")
             .unwrap()
             .value()
             .clone();
-        let mut _g = _arc.lock().await;
-        let ctx = &mut *_g;
+        let mut g = arc.lock().await;
+        let ctx = &mut *g;
 
         // Sanity: counter starts at 0 on a fresh context.
         assert_eq!(
@@ -16597,14 +16630,14 @@ async fn h10_next_proposal_seq_persists_across_snapshot() {
     );
 
     let snapshot = {
-        let _arc = manager
+        let arc = manager
             .contexts
             .get("h10-persist-ctx")
             .unwrap()
             .value()
             .clone();
-        let mut _g = _arc.lock().await;
-        let ctx = &mut *_g;
+        let mut g = arc.lock().await;
+        let ctx = &mut *g;
         let _ = manager.detect_and_handle_conflicts(ctx, &p_a);
         let _ = manager.detect_and_handle_conflicts(ctx, &p_b);
         assert_eq!(ctx.governance.next_proposal_seq, 2);
@@ -16684,14 +16717,14 @@ async fn h10_import_context_resets_next_proposal_seq() {
     );
 
     let mut snapshot = {
-        let _arc = manager
+        let arc = manager
             .contexts
             .get("h10-source-ctx")
             .unwrap()
             .value()
             .clone();
-        let mut _g = _arc.lock().await;
-        let ctx = &mut *_g;
+        let mut g = arc.lock().await;
+        let ctx = &mut *g;
         let _ = manager.detect_and_handle_conflicts(ctx, &p_a);
         let _ = manager.detect_and_handle_conflicts(ctx, &p_b);
         super::ContextManager::snapshot_context(ctx)
@@ -16733,14 +16766,14 @@ async fn h10_import_context_resets_next_proposal_seq() {
     // `approved_proposals` on import (security: prevents pre-loaded forged
     // RemoveMember entries), so the seq is always reset to 0 — the len of
     // the wiped (empty) map — NOT to the exporter's value or u64::MAX.
-    let _arc = importer
+    let arc = importer
         .contexts
         .get("h10-source-ctx")
         .unwrap()
         .value()
         .clone();
-    let _g = _arc.lock().await;
-    let ctx = &*_g;
+    let g = arc.lock().await;
+    let ctx = &*g;
     assert_eq!(
         ctx.governance.next_proposal_seq, 0,
         "import_context must reset next_proposal_seq to 0 (C3 wipes approved_proposals), \
@@ -16766,14 +16799,14 @@ async fn h10_conflict_resolution_uses_seq_not_timestamp() {
     let (manager, _handle, clock) = h10_setup_with_test_clock("h10-time-skew-ctx", 2_000_000).await;
 
     {
-        let _arc = manager
+        let arc = manager
             .contexts
             .get("h10-time-skew-ctx")
             .unwrap()
             .value()
             .clone();
-        let mut _g = _arc.lock().await;
-        let ctx = &mut *_g;
+        let mut g = arc.lock().await;
+        let ctx = &mut *g;
         ctx.membership
             .add_member("did:key:target".into(), "member".into(), vec![]);
         ctx.role_state.members.insert("did:key:target".into());
@@ -16806,14 +16839,14 @@ async fn h10_conflict_resolution_uses_seq_not_timestamp() {
     );
 
     {
-        let _arc = manager
+        let arc = manager
             .contexts
             .get("h10-time-skew-ctx")
             .unwrap()
             .value()
             .clone();
-        let mut _g = _arc.lock().await;
-        let ctx = &mut *_g;
+        let mut g = arc.lock().await;
+        let ctx = &mut *g;
         let _events_a = manager.detect_and_handle_conflicts(ctx, &proposal_a);
 
         // Rewind the wall clock — simulates clock skew, NTP step-back,
@@ -16967,9 +17000,9 @@ async fn suspend_all_consequence_preserves_mls_membership() {
     // Snapshot Alice's pre-condition state — she must be in membership,
     // hold the role-granted caps, and have a sender-key store entry.
     {
-        let _arc = manager.contexts.get("h20a-ctx").unwrap().value().clone();
-        let _g = _arc.lock().await;
-        let ctx = &*_g;
+        let arc = manager.contexts.get("h20a-ctx").unwrap().value().clone();
+        let g = arc.lock().await;
+        let ctx = &*g;
         assert!(
             ctx.membership.contains(alice.as_ref()),
             "pre-flight: Alice must be a member after join"
@@ -17025,9 +17058,9 @@ async fn suspend_all_consequence_preserves_mls_membership() {
     }];
 
     {
-        let _arc = manager.contexts.get("h20a-ctx").unwrap().value().clone();
-        let mut _g = _arc.lock().await;
-        let ctx = &mut *_g;
+        let arc = manager.contexts.get("h20a-ctx").unwrap().value().clone();
+        let mut g = arc.lock().await;
+        let ctx = &mut *g;
         super::super::governance::enforce_triggered_consequences(
             ctx,
             &super::super::governance::EnforceConsequencesCtx {
@@ -17044,9 +17077,9 @@ async fn suspend_all_consequence_preserves_mls_membership() {
 
     // Post-conditions.
     {
-        let _arc = manager.contexts.get("h20a-ctx").unwrap().value().clone();
-        let _g = _arc.lock().await;
-        let ctx = &*_g;
+        let arc = manager.contexts.get("h20a-ctx").unwrap().value().clone();
+        let g = arc.lock().await;
+        let ctx = &*g;
 
         // (1) Membership preserved — the consequence path MUST NOT remove
         //     Alice from the membership map. Removing here would orphan
@@ -17197,9 +17230,9 @@ async fn suspend_capability_consequence_preserves_mls_membership() {
     // Pre-flight: Alice has both MessagesRead and MessagesWrite via the
     // member role.
     {
-        let _arc = manager.contexts.get("h20b-ctx").unwrap().value().clone();
-        let _g = _arc.lock().await;
-        let ctx = &*_g;
+        let arc = manager.contexts.get("h20b-ctx").unwrap().value().clone();
+        let g = arc.lock().await;
+        let ctx = &*g;
         assert!(ctx.membership.contains(alice.as_ref()));
         assert!(
             ctx.role_state
@@ -17237,9 +17270,9 @@ async fn suspend_capability_consequence_preserves_mls_membership() {
     }];
 
     {
-        let _arc = manager.contexts.get("h20b-ctx").unwrap().value().clone();
-        let mut _g = _arc.lock().await;
-        let ctx = &mut *_g;
+        let arc = manager.contexts.get("h20b-ctx").unwrap().value().clone();
+        let mut g = arc.lock().await;
+        let ctx = &mut *g;
         super::super::governance::enforce_triggered_consequences(
             ctx,
             &super::super::governance::EnforceConsequencesCtx {
@@ -17255,9 +17288,9 @@ async fn suspend_capability_consequence_preserves_mls_membership() {
     }
 
     {
-        let _arc = manager.contexts.get("h20b-ctx").unwrap().value().clone();
-        let _g = _arc.lock().await;
-        let ctx = &*_g;
+        let arc = manager.contexts.get("h20b-ctx").unwrap().value().clone();
+        let g = arc.lock().await;
+        let ctx = &*g;
 
         // Membership and role state preserved.
         assert!(
@@ -17371,9 +17404,9 @@ async fn restore_access_after_suspend_all_regrants_capabilities() {
     // Snapshot Alice's role-granted capability set BEFORE suspension so
     // we can compare it after RestoreAccess.
     let pre_caps = {
-        let _arc = manager.contexts.get("h20c-ctx").unwrap().value().clone();
-        let _g = _arc.lock().await;
-        let ctx = &*_g;
+        let arc = manager.contexts.get("h20c-ctx").unwrap().value().clone();
+        let g = arc.lock().await;
+        let ctx = &*g;
         ctx.role_state
             .member_capabilities
             .get(alice.as_ref())
@@ -17410,9 +17443,9 @@ async fn restore_access_after_suspend_all_regrants_capabilities() {
     }];
 
     {
-        let _arc = manager.contexts.get("h20c-ctx").unwrap().value().clone();
-        let mut _g = _arc.lock().await;
-        let ctx = &mut *_g;
+        let arc = manager.contexts.get("h20c-ctx").unwrap().value().clone();
+        let mut g = arc.lock().await;
+        let ctx = &mut *g;
         super::super::governance::enforce_triggered_consequences(
             ctx,
             &super::super::governance::EnforceConsequencesCtx {
@@ -17429,9 +17462,9 @@ async fn restore_access_after_suspend_all_regrants_capabilities() {
 
     // Mid-roundtrip assertion: Alice is fully suspended but still a member.
     {
-        let _arc = manager.contexts.get("h20c-ctx").unwrap().value().clone();
-        let _g = _arc.lock().await;
-        let ctx = &*_g;
+        let arc = manager.contexts.get("h20c-ctx").unwrap().value().clone();
+        let g = arc.lock().await;
+        let ctx = &*g;
         assert!(
             ctx.membership.contains(alice.as_ref()),
             "H20.3 mid-roundtrip: Alice must still be in membership after \
@@ -17473,9 +17506,9 @@ async fn restore_access_after_suspend_all_regrants_capabilities() {
 
     // Post-restore assertions.
     {
-        let _arc = manager.contexts.get("h20c-ctx").unwrap().value().clone();
-        let _g = _arc.lock().await;
-        let ctx = &*_g;
+        let arc = manager.contexts.get("h20c-ctx").unwrap().value().clone();
+        let g = arc.lock().await;
+        let ctx = &*g;
 
         // Alice is still a member — MLS membership untouched throughout.
         assert!(
@@ -17581,14 +17614,14 @@ async fn consequence_enforced_appended_to_durable_event_log() {
         .unwrap();
 
     {
-        let _arc = manager
+        let arc = manager
             .contexts
             .get("h4-enforce-ctx")
             .unwrap()
             .value()
             .clone();
-        let mut _g = _arc.lock().await;
-        let ctx = &mut *_g;
+        let mut g = arc.lock().await;
+        let ctx = &mut *g;
         ctx.governance.consequence_rules = vec![ConsequenceRule {
             trigger: ConsequenceTrigger::MessageVelocity,
             action: ConsequenceAction::Enforcement(EnforcementSeverity::SuspendCapability {
@@ -17600,14 +17633,16 @@ async fn consequence_enforced_appended_to_durable_event_log() {
     }
 
     let sk = ed25519_dalek::SigningKey::from_bytes(&[1u8; 32]);
-    let handle = manager
-        .contexts
-        .lock()
-        .await
-        .get("h4-enforce-ctx")
-        .unwrap()
-        .handle
-        .clone();
+    let handle = {
+        let arc = manager
+            .contexts
+            .get("h4-enforce-ctx")
+            .unwrap()
+            .value()
+            .clone();
+        let ctx = arc.lock().await;
+        ctx.handle.clone()
+    };
     manager
         .send_message(
             &handle,
@@ -17695,6 +17730,7 @@ async fn consequence_enforced_appended_to_durable_event_log() {
 /// `ConsequenceEnforcementFailed` and `ConsequenceEscalatedToSuspendAll`
 /// must appear in the durable log.
 #[tokio::test]
+#[allow(clippy::too_many_lines)] // DashMap lock pattern adds verbosity
 async fn consequence_escalation_appended_with_distinct_event_type() {
     use scp_protocol::trust::consequence::{
         ConsequenceAction, ConsequenceRule, ConsequenceTrigger, EnforcementSeverity,
@@ -17719,14 +17755,14 @@ async fn consequence_escalation_appended_with_distinct_event_type() {
     // escalates to SuspendAll. Inject directly to bypass the validation
     // that rejects empty capabilities at rule-creation time.
     {
-        let _arc = manager
+        let arc = manager
             .contexts
             .get("h4-escal-ctx")
             .unwrap()
             .value()
             .clone();
-        let mut _g = _arc.lock().await;
-        let ctx = &mut *_g;
+        let mut g = arc.lock().await;
+        let ctx = &mut *g;
         ctx.governance.consequence_rules = vec![ConsequenceRule {
             trigger: ConsequenceTrigger::MessageVelocity,
             threshold: 1,
@@ -17738,14 +17774,16 @@ async fn consequence_escalation_appended_with_distinct_event_type() {
     }
 
     let sk = ed25519_dalek::SigningKey::from_bytes(&[1u8; 32]);
-    let handle = manager
-        .contexts
-        .lock()
-        .await
-        .get("h4-escal-ctx")
-        .unwrap()
-        .handle
-        .clone();
+    let handle = {
+        let arc = manager
+            .contexts
+            .get("h4-escal-ctx")
+            .unwrap()
+            .value()
+            .clone();
+        let ctx = arc.lock().await;
+        ctx.handle.clone()
+    };
     manager
         .send_message(
             &handle,
@@ -17849,14 +17887,14 @@ async fn consequence_events_visible_to_subsequent_rule_evaluation() {
     //           accumulates 1+ governance-action-typed event targeting
     //           her — which now includes ConsequenceEnforced records.
     {
-        let _arc = manager
+        let arc = manager
             .contexts
             .get("h4-recur-ctx")
             .unwrap()
             .value()
             .clone();
-        let mut _g = _arc.lock().await;
-        let ctx = &mut *_g;
+        let mut g = arc.lock().await;
+        let ctx = &mut *g;
         ctx.governance.consequence_rules = vec![
             ConsequenceRule {
                 trigger: ConsequenceTrigger::MessageVelocity,
@@ -17878,14 +17916,16 @@ async fn consequence_events_visible_to_subsequent_rule_evaluation() {
     }
 
     let sk = ed25519_dalek::SigningKey::from_bytes(&[1u8; 32]);
-    let handle = manager
-        .contexts
-        .lock()
-        .await
-        .get("h4-recur-ctx")
-        .unwrap()
-        .handle
-        .clone();
+    let handle = {
+        let arc = manager
+            .contexts
+            .get("h4-recur-ctx")
+            .unwrap()
+            .value()
+            .clone();
+        let ctx = arc.lock().await;
+        ctx.handle.clone()
+    };
 
     // First send: rule 0 fires SuspendCapability(MessagesRead). Rule 1
     // (WarningCount) does NOT match yet because at this point in
@@ -17907,14 +17947,14 @@ async fn consequence_events_visible_to_subsequent_rule_evaluation() {
     // Drop role state so the cooldown is the only gating factor for
     // rule 0 — and force a clock advance so the cooldown elapses.
     {
-        let _arc = manager
+        let arc = manager
             .contexts
             .get("h4-recur-ctx")
             .unwrap()
             .value()
             .clone();
-        let mut _g = _arc.lock().await;
-        let ctx = &mut *_g;
+        let mut g = arc.lock().await;
+        let ctx = &mut *g;
         ctx.role_state.suspended_capabilities.clear();
         ctx.governance.cooldown_until.clear();
     }
@@ -17953,14 +17993,14 @@ async fn consequence_events_visible_to_subsequent_rule_evaluation() {
     );
 
     // And the assigned role should land in the role state.
-    let _arc = manager
+    let arc = manager
         .contexts
         .get("h4-recur-ctx")
         .unwrap()
         .value()
         .clone();
-    let _g = _arc.lock().await;
-    let ctx = &*_g;
+    let g = arc.lock().await;
+    let ctx = &*g;
     let assignment = ctx
         .role_state
         .assignments
@@ -18163,14 +18203,16 @@ async fn consequence_rule_with_empty_rules_no_durable_append() {
         .unwrap();
 
     let sk = ed25519_dalek::SigningKey::from_bytes(&[1u8; 32]);
-    let handle = manager
-        .contexts
-        .lock()
-        .await
-        .get("h4-empty-ctx")
-        .unwrap()
-        .handle
-        .clone();
+    let handle = {
+        let arc = manager
+            .contexts
+            .get("h4-empty-ctx")
+            .unwrap()
+            .value()
+            .clone();
+        let ctx = arc.lock().await;
+        ctx.handle.clone()
+    };
     manager
         .send_message(
             &handle,

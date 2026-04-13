@@ -1459,9 +1459,9 @@ pub(super) async fn setup_failing_capture_manager_with_context(
 
     // Grant a generous budget so economy enforcement passes.
     {
-        let _arc = manager.contexts.get(context_id).unwrap().value().clone();
-        let mut _g = _arc.lock().await;
-        let ctx = &mut *_g;
+        let arc = manager.contexts.get(context_id).unwrap().value().clone();
+        let mut g = arc.lock().await;
+        let ctx = &mut *g;
         ctx.governance.budget_tracker.grant(
             &DID::from(creator_did),
             scp_protocol::economy::types::Amount::new(1_000_000),
@@ -1648,14 +1648,14 @@ pub(super) async fn setup_broadcast_context_two_authors() -> (ContextManager, Co
 
     // Add bob as a second author: both in BroadcastContext and membership.
     {
-        let _arc = manager
+        let arc = manager
             .contexts
             .get("broadcast-2auth-ctx")
             .unwrap()
             .value()
             .clone();
-        let mut _g = _arc.lock().await;
-        let ctx = &mut *_g;
+        let mut g = arc.lock().await;
+        let ctx = &mut *g;
         let bc = ctx.broadcast_context.as_mut().unwrap();
         bc.add_author("did:key:bob").unwrap();
         // Also add to membership tracking so sequence numbers work.
@@ -1758,9 +1758,9 @@ pub(super) async fn setup_encrypted_with_member_ban() -> (ContextManager, String
 
     // Add bob as a member.
     {
-        let _arc = manager.contexts.get("enc-ban-ctx").unwrap().value().clone();
-        let mut _g = _arc.lock().await;
-        let ctx = &mut *_g;
+        let arc = manager.contexts.get("enc-ban-ctx").unwrap().value().clone();
+        let mut g = arc.lock().await;
+        let ctx = &mut *g;
         ctx.membership
             .add_member("did:key:bob".into(), "member".into(), vec![]);
     }

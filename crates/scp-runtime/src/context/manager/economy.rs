@@ -524,6 +524,29 @@ pub(super) fn commit_economy_ticket(
     ticket.deducted_cost
 }
 
+/// Rolls back every piece of state the ticket represents directly on
+/// an already-locked `PerContextState`. Use this when the caller already
+/// holds the per-context Mutex (Phase 1 error paths under lock).
+///
+/// Consumes the ticket so the `Drop` guard does not fire.
+pub(super) fn rollback_economy_ticket_inline(
+    ctx: &mut super::PerContextState,
+    mut ticket: EconomyTicket,
+) {
+    ticket.consumed = true;
+    ctx.governance
+        .velocity_tracker
+        .rollback(&ticket.actor_did, ticket.velocity_token);
+    if ticket.needs_hard_rate_limit_refund {
+        ctx.governance.hard_rate_limit.refund(&ticket.actor_did);
+    }
+    if let Some(cost) = ticket.deducted_cost {
+        ctx.governance
+            .budget_tracker
+            .reverse_spend(&ticket.actor_did, cost);
+    }
+}
+
 /// Rolls back every piece of state the ticket represents: the budget
 /// deduction, the velocity entry (via its rollback token, so we do not
 /// race concurrent senders), and the hard-rate-limit token (when the
@@ -534,6 +557,7 @@ pub(super) fn commit_economy_ticket(
 /// deregistered between Phase 1 and rollback (unusual), the rollback
 /// is a best-effort no-op — the ticket is still marked consumed so
 /// the `Drop` guard does not fire.
+#[allow(clippy::significant_drop_tightening)]
 pub(super) async fn rollback_economy_ticket(
     manager: &ContextManager,
     context_id: &str,
@@ -543,8 +567,8 @@ pub(super) async fn rollback_economy_ticket(
     if let Some(entry) = manager.contexts.get(context_id) {
         let arc = entry.value().clone();
         drop(entry);
-        let mut _guard = arc.lock().await;
-        let ctx = &mut *_guard;
+        let mut guard = arc.lock().await;
+        let ctx = &mut *guard;
         ctx.governance
             .velocity_tracker
             .rollback(&ticket.actor_did, ticket.velocity_token);
@@ -581,11 +605,11 @@ impl ContextManager {
 
         // Phase 1: Extract policy + metrics under lock, then drop.
         let (policy, metrics) = {
-            let _ctx_arc = self
+            let ctx_arc = self
                 .get_context_arc(context_id)
                 .map_err(|_| ContextError::ContextNotRegistered(context_id.to_owned()))?;
-            let _guard = _ctx_arc.lock().await;
-            let ctx = &*_guard;
+            let guard = ctx_arc.lock().await;
+            let ctx = &*guard;
 
             let policy = ctx.governance.economic_policy.clone();
             let member_count = u64::try_from(ctx.membership.count()).unwrap_or(u64::MAX);
@@ -690,11 +714,11 @@ impl ContextManager {
 
         // Checkpoint tracking: count this event for threshold-based checkpoints.
         {
-            if let Some(_entry) = self.contexts.get(context_id) {
-                let _ctx_arc = Arc::clone(_entry.value());
-                drop(_entry);
-                let mut _guard = _ctx_arc.lock().await;
-                let ctx = &mut *_guard;
+            if let Some(entry) = self.contexts.get(context_id) {
+                let ctx_arc = Arc::clone(entry.value());
+                drop(entry);
+                let mut guard = ctx_arc.lock().await;
+                let ctx = &mut *guard;
                 ctx.checkpoint_events_since += 1;
             }
         }

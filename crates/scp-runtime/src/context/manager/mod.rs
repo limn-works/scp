@@ -1187,6 +1187,7 @@ pub(super) struct PerContextState {
 /// to verify the context was not removed and recreated between lock release
 /// and reacquire (confused-deputy detection, Phase B).
 #[must_use]
+#[allow(dead_code)] // Phase B scaffolding — callers land in subsequent PRs
 pub(super) struct ContextGeneration {
     pub context_id: String,
     pub generation: u64,
@@ -2017,6 +2018,7 @@ impl ContextManager {
     ///
     /// Returns [`ContextError::ContextNotRegistered`] if `context_id`
     /// is not in the map.
+    #[allow(dead_code)] // Phase B scaffolding — callers land in subsequent PRs
     pub(super) async fn lock_context(
         &self,
         context_id: &str,
@@ -2049,6 +2051,7 @@ impl ContextManager {
     ///
     /// - [`ContextError::ContextNotRegistered`] if the context is gone.
     /// - [`ContextError::PermissionDenied`] if the generation changed.
+    #[allow(dead_code)] // Phase B scaffolding — callers land in subsequent PRs
     pub(super) async fn relock_context(
         &self,
         token: &ContextGeneration,
@@ -2204,21 +2207,21 @@ impl ContextManager {
 
     /// Persists context and broadcast state if a persistence provider is configured.
     async fn persist_context_and_broadcast(&self, context_id: &str) {
-        if self.has_persistence() {
-            if let Some(entry) = self.contexts.get(context_id) {
-                let arc = Arc::clone(entry.value());
-                drop(entry);
-                let ctx = arc.lock().await;
-                let snapshot = Self::snapshot_context(&ctx);
-                let bc_snapshot = ctx
-                    .broadcast_context
-                    .as_ref()
-                    .map(BroadcastContext::to_snapshot);
-                drop(ctx);
-                self.persist_context_snapshot(context_id, snapshot);
-                if let Some(ref bcs) = bc_snapshot {
-                    self.persist_broadcast_snapshot(context_id, bcs);
-                }
+        if self.has_persistence()
+            && let Some(entry) = self.contexts.get(context_id)
+        {
+            let arc = Arc::clone(entry.value());
+            drop(entry);
+            let ctx = arc.lock().await;
+            let snapshot = Self::snapshot_context(&ctx);
+            let bc_snapshot = ctx
+                .broadcast_context
+                .as_ref()
+                .map(BroadcastContext::to_snapshot);
+            drop(ctx);
+            self.persist_context_snapshot(context_id, snapshot);
+            if let Some(ref bcs) = bc_snapshot {
+                self.persist_broadcast_snapshot(context_id, bcs);
             }
         }
     }
@@ -2353,18 +2356,18 @@ fn context_id_to_bytes(context_id: &str) -> [u8; 32] {
 }
 
 #[cfg(test)]
+#[allow(dead_code)] // Phase B test helper — callers added as tests migrate
+#[allow(private_bounds)] // PerContextState is pub(super) but test helper is test-only
 impl ContextManager {
     /// Test helper: acquires the per-context lock for direct state manipulation.
     pub(crate) async fn with_context_mut<F, R>(&self, context_id: &str, f: F) -> R
     where
         F: FnOnce(&mut PerContextState) -> R,
     {
-        let arc = self
-            .contexts
-            .get(context_id)
-            .expect("context not found in test")
-            .value()
-            .clone();
+        let arc = self.contexts.get(context_id).map_or_else(
+            || unreachable!("context not found in test"),
+            |entry| entry.value().clone(),
+        );
         let mut guard = arc.lock().await;
         f(&mut guard)
     }

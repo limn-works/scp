@@ -64,11 +64,11 @@ impl ContextManager {
         // governance (SCP-270, ADR-031). Only SingleAdmin contexts can use
         // the direct close_context path.
         let role_state = {
-            let _ctx_arc = self
+            let ctx_arc = self
                 .get_context_arc(&context_id)
                 .map_err(|_| ContextError::ContextNotRegistered(context_id.clone()))?;
-            let _guard = _ctx_arc.lock().await;
-            let ctx = &*_guard;
+            let guard = ctx_arc.lock().await;
+            let ctx = &*guard;
 
             // State check inside lock -- eliminates TOCTOU race.
             require_active(&ctx.handle)?;
@@ -96,11 +96,11 @@ impl ContextManager {
         // Cancel TTL timer, governance timeout task, drop broadcast state,
         // and emit close notification (second lock acquisition).
         {
-            if let Some(_entry) = self.contexts.get(&context_id) {
-                let _ctx_arc = Arc::clone(_entry.value());
-                drop(_entry);
-                let mut _guard = _ctx_arc.lock().await;
-                let ctx = &mut *_guard;
+            if let Some(entry) = self.contexts.get(&context_id) {
+                let ctx_arc = Arc::clone(entry.value());
+                drop(entry);
+                let mut guard = ctx_arc.lock().await;
+                let ctx = &mut *guard;
                 ctx.ttl.timer.cancel();
                 ctx.governance.timeout_task.cancel();
                 // Drop broadcast context state -- keys are zeroed by Zeroize.
@@ -132,15 +132,15 @@ impl ContextManager {
         self.update_context_gauges().await;
 
         // Persist context state after close (best-effort).
-        if self.has_persistence() {
-            if let Some(_entry) = self.contexts.get(&context_id) {
-                let _ctx_arc = Arc::clone(_entry.value());
-                drop(_entry);
-                let _guard = _ctx_arc.lock().await;
-                let ctx = &*_guard;
-                let snapshot = Self::snapshot_context(ctx);
-                self.persist_context_snapshot(&context_id, snapshot);
-            }
+        if self.has_persistence()
+            && let Some(entry) = self.contexts.get(&context_id)
+        {
+            let ctx_arc = Arc::clone(entry.value());
+            drop(entry);
+            let guard = ctx_arc.lock().await;
+            let ctx = &*guard;
+            let snapshot = Self::snapshot_context(ctx);
+            self.persist_context_snapshot(&context_id, snapshot);
         }
 
         Ok(result)
@@ -208,11 +208,11 @@ impl ContextManager {
         // Cancel governance timeout task, decay participation, and emit
         // appropriate event (lock acquired, then dropped).
         {
-            if let Some(_entry) = self.contexts.get(&context_id) {
-                let _ctx_arc = Arc::clone(_entry.value());
-                drop(_entry);
-                let mut _guard = _ctx_arc.lock().await;
-                let ctx = &mut *_guard;
+            if let Some(entry) = self.contexts.get(&context_id) {
+                let ctx_arc = Arc::clone(entry.value());
+                drop(entry);
+                let mut guard = ctx_arc.lock().await;
+                let ctx = &mut *guard;
                 ctx.governance.timeout_task.cancel();
                 // Participation decay on TTL expiry (#1530): clear
                 // participation cache and cooldown state so stale data does
@@ -233,15 +233,15 @@ impl ContextManager {
         }
 
         // Persist context state after TTL expiry (best-effort).
-        if self.has_persistence() {
-            if let Some(_entry) = self.contexts.get(&context_id) {
-                let _ctx_arc = Arc::clone(_entry.value());
-                drop(_entry);
-                let _guard = _ctx_arc.lock().await;
-                let ctx = &*_guard;
-                let snapshot = Self::snapshot_context(ctx);
-                self.persist_context_snapshot(&context_id, snapshot);
-            }
+        if self.has_persistence()
+            && let Some(entry) = self.contexts.get(&context_id)
+        {
+            let ctx_arc = Arc::clone(entry.value());
+            drop(entry);
+            let guard = ctx_arc.lock().await;
+            let ctx = &*guard;
+            let snapshot = Self::snapshot_context(ctx);
+            self.persist_context_snapshot(&context_id, snapshot);
         }
 
         if result.has_failures() {
@@ -278,11 +278,11 @@ impl ContextManager {
         proposed_duration: std::time::Duration,
     ) -> Result<bool, ContextError> {
         // All checks and mutation within a single lock acquisition.
-        let _ctx_arc = self
+        let ctx_arc = self
             .get_context_arc(context_id)
             .map_err(|_| ContextError::ContextNotRegistered(context_id.to_owned()))?;
-        let mut _guard = _ctx_arc.lock().await;
-        let ctx = &mut *_guard;
+        let mut guard = ctx_arc.lock().await;
+        let ctx = &mut *guard;
 
         if !ctx.membership.contains(member_did) {
             return Err(ContextError::MemberNotFound(member_did.to_string()));
@@ -321,11 +321,11 @@ impl ContextManager {
     ) {
         // Cancel old timer and clear extension state (lock, then drop).
         {
-            if let Some(_entry) = self.contexts.get(context_id) {
-                let _ctx_arc = Arc::clone(_entry.value());
-                drop(_entry);
-                let mut _guard = _ctx_arc.lock().await;
-                let ctx = &mut *_guard;
+            if let Some(entry) = self.contexts.get(context_id) {
+                let ctx_arc = Arc::clone(entry.value());
+                drop(entry);
+                let mut guard = ctx_arc.lock().await;
+                let ctx = &mut *guard;
                 ctx.ttl.timer.cancel();
                 ctx.ttl.extension = None;
             }
@@ -334,15 +334,15 @@ impl ContextManager {
         self.spawn_ttl_timer(context_id, new_duration, handle).await;
 
         // Persist context state after TTL reset (best-effort).
-        if self.has_persistence() {
-            if let Some(_entry) = self.contexts.get(context_id) {
-                let _ctx_arc = Arc::clone(_entry.value());
-                drop(_entry);
-                let _guard = _ctx_arc.lock().await;
-                let ctx = &*_guard;
-                let snapshot = Self::snapshot_context(ctx);
-                self.persist_context_snapshot(context_id, snapshot);
-            }
+        if self.has_persistence()
+            && let Some(entry) = self.contexts.get(context_id)
+        {
+            let ctx_arc = Arc::clone(entry.value());
+            drop(entry);
+            let guard = ctx_arc.lock().await;
+            let ctx = &*guard;
+            let snapshot = Self::snapshot_context(ctx);
+            self.persist_context_snapshot(context_id, snapshot);
         }
     }
 
@@ -409,8 +409,8 @@ impl ContextManager {
                         if let Some(entry) = contexts_ref.get(&context_id_owned) {
                             let ctx_arc = entry.value().clone();
                             drop(entry);
-                            let mut _guard = ctx_arc.lock().await;
-                            let ctx = &mut *_guard;
+                            let mut guard = ctx_arc.lock().await;
+                            let ctx = &mut *guard;
                             if result.is_complete() {
                                 ctx.receive_buffer.push(ContextEvent::Expired);
                             } else {
@@ -435,11 +435,11 @@ impl ContextManager {
 
         // Store the abort handle for cancel/is_active checks (lock, then drop).
         let context_id_for_store = context_id.to_owned();
-        if let Some(_entry) = self.contexts.get(&context_id_for_store) {
-            let _ctx_arc = Arc::clone(_entry.value());
-            drop(_entry);
-            let mut _guard = _ctx_arc.lock().await;
-            let ctx = &mut *_guard;
+        if let Some(entry) = self.contexts.get(&context_id_for_store) {
+            let ctx_arc = Arc::clone(entry.value());
+            drop(entry);
+            let mut guard = ctx_arc.lock().await;
+            let ctx = &mut *guard;
             ctx.ttl.timer.task = Some(abort_handle);
         }
     }

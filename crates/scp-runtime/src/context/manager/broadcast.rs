@@ -44,11 +44,11 @@ impl ContextManager {
         let context_id_bytes = context_id_to_bytes(context_id);
 
         let (result, snapshot) = {
-            let _ctx_arc = self
+            let ctx_arc = self
                 .get_context_arc(context_id)
                 .map_err(|_| ContextError::ContextNotRegistered(context_id.to_owned()))?;
-            let mut _guard = _ctx_arc.lock().await;
-            let ctx = &mut *_guard;
+            let mut guard = ctx_arc.lock().await;
+            let ctx = &mut *guard;
 
             require_active(&ctx.handle)?;
 
@@ -91,15 +91,15 @@ impl ContextManager {
         }
 
         // Persist context state after subscribe (best-effort).
-        if self.has_persistence() {
-            if let Some(_entry) = self.contexts.get(context_id) {
-                let _ctx_arc = Arc::clone(_entry.value());
-                drop(_entry);
-                let _guard = _ctx_arc.lock().await;
-                let ctx = &*_guard;
-                let ctx_snapshot = Self::snapshot_context(ctx);
-                self.persist_context_snapshot(context_id, ctx_snapshot);
-            }
+        if self.has_persistence()
+            && let Some(entry) = self.contexts.get(context_id)
+        {
+            let ctx_arc = Arc::clone(entry.value());
+            drop(entry);
+            let guard = ctx_arc.lock().await;
+            let ctx = &*guard;
+            let ctx_snapshot = Self::snapshot_context(ctx);
+            self.persist_context_snapshot(context_id, ctx_snapshot);
         }
 
         // Append event to persistent event log.
@@ -109,11 +109,11 @@ impl ContextManager {
             subscriber_did.as_ref(),
         )?;
         {
-            if let Some(_entry) = self.contexts.get(context_id) {
-                let _ctx_arc = Arc::clone(_entry.value());
-                drop(_entry);
-                let mut _guard = _ctx_arc.lock().await;
-                let ctx = &mut *_guard;
+            if let Some(entry) = self.contexts.get(context_id) {
+                let ctx_arc = Arc::clone(entry.value());
+                drop(entry);
+                let mut guard = ctx_arc.lock().await;
+                let ctx = &mut *guard;
                 ctx.checkpoint_events_since += 1;
             }
         }
@@ -142,11 +142,11 @@ impl ContextManager {
         let context_id_bytes = context_id_to_bytes(context_id);
 
         let (result, snapshot) = {
-            let _ctx_arc = self
+            let ctx_arc = self
                 .get_context_arc(context_id)
                 .map_err(|_| ContextError::ContextNotRegistered(context_id.to_owned()))?;
-            let mut _guard = _ctx_arc.lock().await;
-            let ctx = &mut *_guard;
+            let mut guard = ctx_arc.lock().await;
+            let ctx = &mut *guard;
 
             require_active(&ctx.handle)?;
 
@@ -183,15 +183,15 @@ impl ContextManager {
         }
 
         // Persist context state after unsubscribe (best-effort).
-        if self.has_persistence() {
-            if let Some(_entry) = self.contexts.get(context_id) {
-                let _ctx_arc = Arc::clone(_entry.value());
-                drop(_entry);
-                let _guard = _ctx_arc.lock().await;
-                let ctx = &*_guard;
-                let ctx_snapshot = Self::snapshot_context(ctx);
-                self.persist_context_snapshot(context_id, ctx_snapshot);
-            }
+        if self.has_persistence()
+            && let Some(entry) = self.contexts.get(context_id)
+        {
+            let ctx_arc = Arc::clone(entry.value());
+            drop(entry);
+            let guard = ctx_arc.lock().await;
+            let ctx = &*guard;
+            let ctx_snapshot = Self::snapshot_context(ctx);
+            self.persist_context_snapshot(context_id, ctx_snapshot);
         }
 
         self.event_log.append_context_event(
@@ -200,11 +200,11 @@ impl ContextManager {
             subscriber_did.as_ref(),
         )?;
         {
-            if let Some(_entry) = self.contexts.get(context_id) {
-                let _ctx_arc = Arc::clone(_entry.value());
-                drop(_entry);
-                let mut _guard = _ctx_arc.lock().await;
-                let ctx = &mut *_guard;
+            if let Some(entry) = self.contexts.get(context_id) {
+                let ctx_arc = Arc::clone(entry.value());
+                drop(entry);
+                let mut guard = ctx_arc.lock().await;
+                let ctx = &mut *guard;
                 ctx.checkpoint_events_since += 1;
             }
         }
@@ -239,11 +239,11 @@ impl ContextManager {
         let context_id_bytes = context_id_to_bytes(context_id);
 
         let envelope = {
-            let _ctx_arc = self
+            let ctx_arc = self
                 .get_context_arc(context_id)
                 .map_err(|_| ContextError::ContextNotRegistered(context_id.to_owned()))?;
-            let mut _guard = _ctx_arc.lock().await;
-            let ctx = &mut *_guard;
+            let mut guard = ctx_arc.lock().await;
+            let ctx = &mut *guard;
 
             require_active(&ctx.handle)?;
 
@@ -341,11 +341,11 @@ impl ContextManager {
             author_did.as_ref(),
         )?;
         {
-            if let Some(_entry) = self.contexts.get(context_id) {
-                let _ctx_arc = Arc::clone(_entry.value());
-                drop(_entry);
-                let mut _guard = _ctx_arc.lock().await;
-                let ctx = &mut *_guard;
+            if let Some(entry) = self.contexts.get(context_id) {
+                let ctx_arc = Arc::clone(entry.value());
+                drop(entry);
+                let mut guard = ctx_arc.lock().await;
+                let ctx = &mut *guard;
                 ctx.checkpoint_events_since += 1;
             }
         }
@@ -410,11 +410,11 @@ impl ContextManager {
         let context_id_bytes = context_id_to_bytes(context_id);
 
         let (result, snapshot) = {
-            let _ctx_arc = self
+            let ctx_arc = self
                 .get_context_arc(context_id)
                 .map_err(|_| ContextError::ContextNotRegistered(context_id.to_owned()))?;
-            let mut _guard = _ctx_arc.lock().await;
-            let ctx = &mut *_guard;
+            let mut guard = ctx_arc.lock().await;
+            let ctx = &mut *guard;
 
             require_active(&ctx.handle)?;
 
@@ -454,11 +454,11 @@ impl ContextManager {
             author_did.as_ref(),
         )?;
         {
-            if let Some(_entry) = self.contexts.get(context_id) {
-                let _ctx_arc = Arc::clone(_entry.value());
-                drop(_entry);
-                let mut _guard = _ctx_arc.lock().await;
-                let ctx = &mut *_guard;
+            if let Some(entry) = self.contexts.get(context_id) {
+                let ctx_arc = Arc::clone(entry.value());
+                drop(entry);
+                let mut guard = ctx_arc.lock().await;
+                let ctx = &mut *guard;
                 ctx.checkpoint_events_since += 1;
             }
         }
@@ -491,11 +491,11 @@ impl ContextManager {
         let context_id_bytes = context_id_to_bytes(context_id);
 
         let snapshot = {
-            let _ctx_arc = self
+            let ctx_arc = self
                 .get_context_arc(context_id)
                 .map_err(|_| ContextError::ContextNotRegistered(context_id.to_owned()))?;
-            let mut _guard = _ctx_arc.lock().await;
-            let ctx = &mut *_guard;
+            let mut guard = ctx_arc.lock().await;
+            let ctx = &mut *guard;
 
             require_active(&ctx.handle)?;
 
@@ -534,11 +534,11 @@ impl ContextManager {
             author_did.as_ref(),
         )?;
         {
-            if let Some(_entry) = self.contexts.get(context_id) {
-                let _ctx_arc = Arc::clone(_entry.value());
-                drop(_entry);
-                let mut _guard = _ctx_arc.lock().await;
-                let ctx = &mut *_guard;
+            if let Some(entry) = self.contexts.get(context_id) {
+                let ctx_arc = Arc::clone(entry.value());
+                drop(entry);
+                let mut guard = ctx_arc.lock().await;
+                let ctx = &mut *guard;
                 ctx.checkpoint_events_since += 1;
             }
         }
@@ -583,11 +583,11 @@ impl ContextManager {
             )));
         }
 
-        let _ctx_arc = self
+        let ctx_arc = self
             .get_context_arc(context_id)
             .map_err(|_| ContextError::ContextNotRegistered(context_id.to_owned()))?;
-        let _guard = _ctx_arc.lock().await;
-        let ctx = &*_guard;
+        let guard = ctx_arc.lock().await;
+        let ctx = &*guard;
 
         let bc = ctx
             .broadcast_context

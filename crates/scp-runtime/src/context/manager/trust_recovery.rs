@@ -113,11 +113,11 @@ impl ContextManager {
         creator_did: &DID,
         creator_signature: Vec<u8>,
     ) -> Result<ContextCheckpoint, ContextError> {
-        let _ctx_arc = self
+        let ctx_arc = self
             .get_context_arc(context_id)
             .map_err(|_| ContextError::ContextNotRegistered(context_id.to_owned()))?;
-        let _guard = _ctx_arc.lock().await;
-        let ctx = &*_guard;
+        let guard = ctx_arc.lock().await;
+        let ctx = &*guard;
         require_active(&ctx.handle)?;
 
         let (_, min_count) = ctx.governance.engine.checkpoint_cosignature_requirements();
@@ -187,11 +187,11 @@ impl ContextManager {
     ) -> Result<CheckpointAttestationStatus, ContextError> {
         use sha2::Digest as _;
 
-        let _ctx_arc = self
+        let ctx_arc = self
             .get_context_arc(context_id)
             .map_err(|_| ContextError::ContextNotRegistered(context_id.to_owned()))?;
-        let _guard = _ctx_arc.lock().await;
-        let ctx = &*_guard;
+        let guard = ctx_arc.lock().await;
+        let ctx = &*guard;
 
         // Validate with a candidate vector first — only mutate checkpoint
         // after validation passes to avoid leaving corrupt state on error.
@@ -245,11 +245,11 @@ impl ContextManager {
 
         // 1. Validate the context exists and is active (lock scoped).
         {
-            let _ctx_arc = self
+            let ctx_arc = self
                 .get_context_arc(context_id)
                 .map_err(|_| ContextError::ContextNotRegistered(context_id.to_owned()))?;
-            let _guard = _ctx_arc.lock().await;
-            let ctx = &*_guard;
+            let guard = ctx_arc.lock().await;
+            let ctx = &*guard;
             require_active(&ctx.handle)?;
         }
 
@@ -275,11 +275,11 @@ impl ContextManager {
 
         // 3. Increment bookkeeping counter and manage grace store.
         let new_epoch = {
-            let _ctx_arc = self
+            let ctx_arc = self
                 .get_context_arc(context_id)
                 .map_err(|_| ContextError::ContextNotRegistered(context_id.to_owned()))?;
-            let mut _guard = _ctx_arc.lock().await;
-            let ctx = &mut *_guard;
+            let mut guard = ctx_arc.lock().await;
+            let ctx = &mut *guard;
             // Re-validate after the crypto op to close the TOCTOU window between
             // the active check in step 1 and the counter increment here. A
             // concurrent close_context could have transitioned the handle while
@@ -305,25 +305,25 @@ impl ContextManager {
             );
         }
         {
-            if let Some(_entry) = self.contexts.get(context_id) {
-                let _ctx_arc = Arc::clone(_entry.value());
-                drop(_entry);
-                let mut _guard = _ctx_arc.lock().await;
-                let ctx = &mut *_guard;
+            if let Some(entry) = self.contexts.get(context_id) {
+                let ctx_arc = Arc::clone(entry.value());
+                drop(entry);
+                let mut guard = ctx_arc.lock().await;
+                let ctx = &mut *guard;
                 ctx.checkpoint_events_since += 1;
             }
         }
 
         // 5. Persist if configured (best-effort).
-        if self.has_persistence() {
-            if let Some(_entry) = self.contexts.get(context_id) {
-                let _ctx_arc = Arc::clone(_entry.value());
-                drop(_entry);
-                let _guard = _ctx_arc.lock().await;
-                let ctx = &*_guard;
-                let snapshot = Self::snapshot_context(ctx);
-                self.persist_context_snapshot(context_id, snapshot);
-            }
+        if self.has_persistence()
+            && let Some(entry) = self.contexts.get(context_id)
+        {
+            let ctx_arc = Arc::clone(entry.value());
+            drop(entry);
+            let guard = ctx_arc.lock().await;
+            let ctx = &*guard;
+            let snapshot = Self::snapshot_context(ctx);
+            self.persist_context_snapshot(context_id, snapshot);
         }
 
         Ok(new_epoch)

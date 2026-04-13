@@ -674,11 +674,11 @@ impl ContextManager {
     /// is not registered.
     #[instrument(skip_all, fields(context_id))]
     pub async fn clear_needs_reconnect(&self, context_id: &str) -> bool {
-        if let Some(_entry) = self.contexts.get(context_id) {
-            let _ctx_arc = Arc::clone(_entry.value());
-            drop(_entry);
-            let mut _guard = _ctx_arc.lock().await;
-            let ctx = &mut *_guard;
+        if let Some(entry) = self.contexts.get(context_id) {
+            let ctx_arc = Arc::clone(entry.value());
+            drop(entry);
+            let mut guard = ctx_arc.lock().await;
+            let ctx = &mut *guard;
             ctx.epoch.needs_reconnect = false;
             true
         } else {
@@ -902,14 +902,14 @@ impl ContextManager {
         let ctx_id_bytes = scp_protocol::context::context_id_bytes(context_id);
 
         let snapshot = {
-            let _ctx_arc = self.get_context_arc(context_id).map_err(|_| {
+            let ctx_arc = self.get_context_arc(context_id).map_err(|_| {
                 ContextError::MembershipFailed(format!(
                     "context '{context_id}' not found — cannot export"
                 ))
             })?;
-            let _guard = _ctx_arc.lock().await;
-            let ctx = &*_guard;
-            Self::snapshot_context(&ctx)
+            let guard = ctx_arc.lock().await;
+            let ctx = &*guard;
+            Self::snapshot_context(ctx)
         };
 
         let event_log_data = self
@@ -1005,10 +1005,10 @@ impl ContextManager {
         //    event log import at step 3 would overwrite the Active context's
         //    Merkle chain before we discover the conflict.
         {
-            if let Some(_entry) = self.contexts.get(&context_id) {
-                let _ctx_arc = Arc::clone(_entry.value());
-                drop(_entry);
-                let existing = _ctx_arc.lock().await;
+            if let Some(entry) = self.contexts.get(&context_id) {
+                let ctx_arc = Arc::clone(entry.value());
+                drop(entry);
+                let existing = ctx_arc.lock().await;
                 let is_replaceable = existing.handle.try_read_state().is_some_and(|s| {
                     matches!(
                         s,
@@ -1321,10 +1321,10 @@ impl ContextManager {
         //    this insertion. A concurrent `create_context` or `import_context`
         //    could have registered an Active context in the meantime.
         {
-            if let Some(_entry) = self.contexts.get(&context_id) {
-                let _ctx_arc = Arc::clone(_entry.value());
-                drop(_entry);
-                let existing = _ctx_arc.lock().await;
+            if let Some(entry) = self.contexts.get(&context_id) {
+                let ctx_arc = Arc::clone(entry.value());
+                drop(entry);
+                let existing = ctx_arc.lock().await;
                 let is_replaceable = existing.handle.try_read_state().is_some_and(|s| {
                     matches!(
                         s,
@@ -1351,15 +1351,15 @@ impl ContextManager {
         self.start_governance_timeout_task(&context_id).await;
 
         // 8. Persist if persistence is configured.
-        if self.has_persistence() {
-            if let Some(_entry) = self.contexts.get(&context_id) {
-                let _ctx_arc = Arc::clone(_entry.value());
-                drop(_entry);
-                let _guard = _ctx_arc.lock().await;
-                let ctx = &*_guard;
-                let snap = Self::snapshot_context(ctx);
-                self.persist_context_snapshot(&context_id, snap);
-            }
+        if self.has_persistence()
+            && let Some(entry) = self.contexts.get(&context_id)
+        {
+            let ctx_arc = Arc::clone(entry.value());
+            drop(entry);
+            let guard = ctx_arc.lock().await;
+            let ctx = &*guard;
+            let snap = Self::snapshot_context(ctx);
+            self.persist_context_snapshot(&context_id, snap);
         }
 
         // 9. Re-spawn TTL timer if there was remaining TTL.
@@ -1561,11 +1561,11 @@ impl ContextManager {
     /// was set by a different SDK version or received via sync.
     #[cfg(test)]
     pub(crate) async fn replace_stored_params(&self, context_id: &str, new_params: ContextParams) {
-        if let Some(_entry) = self.contexts.get(context_id) {
-            let _ctx_arc = Arc::clone(_entry.value());
-            drop(_entry);
-            let mut _guard = _ctx_arc.lock().await;
-            let ctx = &mut *_guard;
+        if let Some(entry) = self.contexts.get(context_id) {
+            let ctx_arc = Arc::clone(entry.value());
+            drop(entry);
+            let mut guard = ctx_arc.lock().await;
+            let ctx = &mut *guard;
             let new_handle = ContextHandle::new(context_id.to_owned(), new_params);
             // Preserve the current state.
             let current_state = ctx.handle.state().await;
@@ -1891,11 +1891,11 @@ impl ContextManager {
         // so this check is authoritative even when the caller passes an
         // ephemeral handle with default params (e.g. UniFFI bridge).
         {
-            let _ctx_arc = self
+            let ctx_arc = self
                 .get_context_arc(&context_id)
                 .map_err(|_| ContextError::ContextNotRegistered(context_id.clone()))?;
-            let _guard = _ctx_arc.lock().await;
-            let ctx = &*_guard;
+            let guard = ctx_arc.lock().await;
+            let ctx = &*guard;
             ctx.handle
                 .params()
                 .check_version_compatibility(scp_protocol::envelope::SCP_PROTOCOL_VERSION)?;
@@ -1909,11 +1909,11 @@ impl ContextManager {
         // This happens BEFORE any crypto mutations so that a rejected payment
         // never grants MLS group access or sender keys.
         let ticket = {
-            let _ctx_arc = self
+            let ctx_arc = self
                 .get_context_arc(&context_id)
                 .map_err(|_| ContextError::ContextNotRegistered(context_id.clone()))?;
-            let mut _guard = _ctx_arc.lock().await;
-            let ctx = &mut *_guard;
+            let mut guard = ctx_arc.lock().await;
+            let ctx = &mut *guard;
 
             // State check inside lock -- eliminates TOCTOU race.
             require_active(&ctx.handle)?;
@@ -2113,24 +2113,24 @@ impl ContextManager {
             member_did.as_ref(),
         )?;
         {
-            if let Some(_entry) = self.contexts.get(&context_id) {
-                let _ctx_arc = Arc::clone(_entry.value());
-                drop(_entry);
-                let mut _guard = _ctx_arc.lock().await;
-                let ctx = &mut *_guard;
+            if let Some(entry) = self.contexts.get(&context_id) {
+                let ctx_arc = Arc::clone(entry.value());
+                drop(entry);
+                let mut guard = ctx_arc.lock().await;
+                let ctx = &mut *guard;
                 ctx.checkpoint_events_since += 1;
             }
         }
         // Persist context state after join (best-effort).
-        if self.has_persistence() {
-            if let Some(_entry) = self.contexts.get(&context_id) {
-                let _ctx_arc = Arc::clone(_entry.value());
-                drop(_entry);
-                let _guard = _ctx_arc.lock().await;
-                let ctx = &*_guard;
-                let snapshot = Self::snapshot_context(ctx);
-                self.persist_context_snapshot(&context_id, snapshot);
-            }
+        if self.has_persistence()
+            && let Some(entry) = self.contexts.get(&context_id)
+        {
+            let ctx_arc = Arc::clone(entry.value());
+            drop(entry);
+            let guard = ctx_arc.lock().await;
+            let ctx = &*guard;
+            let snapshot = Self::snapshot_context(ctx);
+            self.persist_context_snapshot(&context_id, snapshot);
         }
 
         Ok(())
@@ -2148,11 +2148,11 @@ impl ContextManager {
         member_did: &DID,
         add_output: scp_protocol::context::builder::AddMemberOutput,
     ) -> Result<(), ContextError> {
-        let _ctx_arc = self
+        let ctx_arc = self
             .get_context_arc(context_id)
             .map_err(|_| ContextError::ContextNotRegistered(context_id.to_owned()))?;
-        let mut _guard = _ctx_arc.lock().await;
-        let ctx = &mut *_guard;
+        let mut guard = ctx_arc.lock().await;
+        let ctx = &mut *guard;
 
         require_active(&ctx.handle)?;
 
@@ -2284,11 +2284,11 @@ impl ContextManager {
         // context refuses further leave operations until an operator
         // acknowledges the fault.
         let is_broadcast = {
-            let _ctx_arc = self
+            let ctx_arc = self
                 .get_context_arc(&context_id)
                 .map_err(|_| ContextError::ContextNotRegistered(context_id.clone()))?;
-            let _guard = _ctx_arc.lock().await;
-            let ctx = &*_guard;
+            let guard = ctx_arc.lock().await;
+            let ctx = &*guard;
             // Authorization: self-removal always allowed; otherwise MemberRemove required.
             if caller_did != member_did
                 && !ctx
@@ -2358,11 +2358,11 @@ impl ContextManager {
 
         // Atomic state check + membership removal + count check within single lock.
         let should_close = {
-            let _ctx_arc = self
+            let ctx_arc = self
                 .get_context_arc(&context_id)
                 .map_err(|_| ContextError::ContextNotRegistered(context_id.clone()))?;
-            let mut _guard = _ctx_arc.lock().await;
-            let ctx = &mut *_guard;
+            let mut guard = ctx_arc.lock().await;
+            let ctx = &mut *guard;
 
             // State check inside lock -- eliminates TOCTOU race.
             require_active(&ctx.handle)?;
@@ -2411,24 +2411,24 @@ impl ContextManager {
             member_did.as_ref(),
         )?;
         {
-            if let Some(_entry) = self.contexts.get(&context_id) {
-                let _ctx_arc = Arc::clone(_entry.value());
-                drop(_entry);
-                let mut _guard = _ctx_arc.lock().await;
-                let ctx = &mut *_guard;
+            if let Some(entry) = self.contexts.get(&context_id) {
+                let ctx_arc = Arc::clone(entry.value());
+                drop(entry);
+                let mut guard = ctx_arc.lock().await;
+                let ctx = &mut *guard;
                 ctx.checkpoint_events_since += 1;
             }
         }
         // Persist context state after leave (best-effort).
-        if self.has_persistence() {
-            if let Some(_entry) = self.contexts.get(&context_id) {
-                let _ctx_arc = Arc::clone(_entry.value());
-                drop(_entry);
-                let _guard = _ctx_arc.lock().await;
-                let ctx = &*_guard;
-                let snapshot = Self::snapshot_context(ctx);
-                self.persist_context_snapshot(&context_id, snapshot);
-            }
+        if self.has_persistence()
+            && let Some(entry) = self.contexts.get(&context_id)
+        {
+            let ctx_arc = Arc::clone(entry.value());
+            drop(entry);
+            let guard = ctx_arc.lock().await;
+            let ctx = &*guard;
+            let snapshot = Self::snapshot_context(ctx);
+            self.persist_context_snapshot(&context_id, snapshot);
         }
 
         // If member count reaches zero, transition to Closing.

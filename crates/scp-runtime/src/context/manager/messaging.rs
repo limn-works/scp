@@ -321,11 +321,11 @@ impl ContextManager {
         let context_id_bytes = context_id_to_bytes(&context_id);
         let routing_id = scp_protocol::context::context_routing_id(&context_id);
         let (broadcast_envelope, recipients_data, sequence, is_broadcast, ticket) = {
-            let _ctx_arc = self
+            let ctx_arc = self
                 .get_context_arc(&context_id)
                 .map_err(|_| ContextError::ContextNotRegistered(context_id.clone()))?;
-            let mut _guard = _ctx_arc.lock().await;
-            let ctx = &mut *_guard;
+            let mut guard = ctx_arc.lock().await;
+            let ctx = &mut *guard;
             require_active(&ctx.handle)?;
             // N3: Fail-close on commit fault — if a prior governance
             // mutation's MLS Commit failed to broadcast and exhausted
@@ -415,7 +415,8 @@ impl ContextManager {
             if let Some(ref mut bc) = ctx.broadcast_context {
                 let Some(sk) = signing_key else {
                     // Phase 1 failed after ticket creation — drain it.
-                    super::economy::rollback_economy_ticket(self, &context_id, ticket).await;
+                    // Use inline variant: we already hold the per-context lock.
+                    super::economy::rollback_economy_ticket_inline(ctx, ticket);
                     return Err(ContextError::CryptoFailed(
                         "signing key required for broadcast publish".into(),
                     ));
@@ -429,7 +430,8 @@ impl ContextManager {
                 ) {
                     Ok(env) => env,
                     Err(e) => {
-                        super::economy::rollback_economy_ticket(self, &context_id, ticket).await;
+                        // Use inline variant: we already hold the per-context lock.
+                        super::economy::rollback_economy_ticket_inline(ctx, ticket);
                         return Err(e);
                     }
                 };
@@ -438,7 +440,8 @@ impl ContextManager {
                 // Capability already checked above (H7: before budget deduction).
                 // Assign sequence under lock — SequenceTracker rejects duplicates.
                 let Some(seq) = ctx.membership.next_sequence_number(sender_did) else {
-                    super::economy::rollback_economy_ticket(self, &context_id, ticket).await;
+                    // Use inline variant: we already hold the per-context lock.
+                    super::economy::rollback_economy_ticket_inline(ctx, ticket);
                     return Err(ContextError::MemberNotFound(format!(
                         "cannot assign sequence: {sender_did} is not a member"
                     )));
@@ -461,14 +464,12 @@ impl ContextManager {
                 // number rollback is also needed because Phase 1 already
                 // incremented it for non-broadcast.
                 super::economy::rollback_economy_ticket(self, &context_id, ticket).await;
-                if !is_broadcast {
-                    if let Some(_entry) = self.contexts.get(&context_id) {
-                        let _ctx_arc = Arc::clone(_entry.value());
-                        drop(_entry);
-                        let mut _guard = _ctx_arc.lock().await;
-                        let ctx = &mut *_guard;
-                        ctx.membership.rollback_sequence_number(sender_did);
-                    }
+                if !is_broadcast && let Some(entry) = self.contexts.get(&context_id) {
+                    let ctx_arc = Arc::clone(entry.value());
+                    drop(entry);
+                    let mut guard = ctx_arc.lock().await;
+                    let ctx = &mut *guard;
+                    ctx.membership.rollback_sequence_number(sender_did);
                 }
                 return Err(e);
             }
@@ -495,14 +496,12 @@ impl ContextManager {
                 self.void_paid_action(a, &context_id).await;
             }
             super::economy::rollback_economy_ticket(self, &context_id, ticket).await;
-            if !is_broadcast {
-                if let Some(_entry) = self.contexts.get(&context_id) {
-                    let _ctx_arc = Arc::clone(_entry.value());
-                    drop(_entry);
-                    let mut _guard = _ctx_arc.lock().await;
-                    let ctx = &mut *_guard;
-                    ctx.membership.rollback_sequence_number(sender_did);
-                }
+            if !is_broadcast && let Some(entry) = self.contexts.get(&context_id) {
+                let ctx_arc = Arc::clone(entry.value());
+                drop(entry);
+                let mut guard = ctx_arc.lock().await;
+                let ctx = &mut *guard;
+                ctx.membership.rollback_sequence_number(sender_did);
             }
             return Err(e);
         }
@@ -653,11 +652,11 @@ impl ContextManager {
         )?;
         {
             let now = self.clock.now_secs();
-            if let Some(_entry) = self.contexts.get(context_id) {
-                let _ctx_arc = Arc::clone(_entry.value());
-                drop(_entry);
-                let mut _guard = _ctx_arc.lock().await;
-                let ctx = &mut *_guard;
+            if let Some(entry) = self.contexts.get(context_id) {
+                let ctx_arc = Arc::clone(entry.value());
+                drop(entry);
+                let mut guard = ctx_arc.lock().await;
+                let ctx = &mut *guard;
                 if require_active(&ctx.handle).is_ok() {
                     ctx.receive_buffer.push(ContextEvent::MessageSent {
                         sender_did: sender_did.clone(),
@@ -675,7 +674,7 @@ impl ContextManager {
                     // The same event snapshot is reused for both consequence evaluation
                     // and participation record computation (finding #46 dedup).
                     let send_events = super::governance::event_log_entries_for_consequences(
-                        &ctx,
+                        ctx,
                         context_id,
                         now,
                         &*self.event_log,
@@ -735,15 +734,15 @@ impl ContextManager {
                 }
             }
         }
-        if self.has_persistence() {
-            if let Some(_entry) = self.contexts.get(context_id) {
-                let _ctx_arc = Arc::clone(_entry.value());
-                drop(_entry);
-                let _guard = _ctx_arc.lock().await;
-                let ctx = &*_guard;
-                let snapshot = Self::snapshot_context(ctx);
-                self.persist_context_snapshot(context_id, snapshot);
-            }
+        if self.has_persistence()
+            && let Some(entry) = self.contexts.get(context_id)
+        {
+            let ctx_arc = Arc::clone(entry.value());
+            drop(entry);
+            let guard = ctx_arc.lock().await;
+            let ctx = &*guard;
+            let snapshot = Self::snapshot_context(ctx);
+            self.persist_context_snapshot(context_id, snapshot);
         }
         Ok(())
     }
@@ -811,11 +810,11 @@ impl ContextManager {
         // nested lock ordering issues with the contexts Mutex.
         let local_dids = self.local_dids.read().await;
         let (local_member_did, access_key) = {
-            let _ctx_arc = self
+            let ctx_arc = self
                 .get_context_arc(context_id)
                 .map_err(|_| ContextError::ContextNotRegistered(context_id.to_owned()))?;
-            let _guard = _ctx_arc.lock().await;
-            let ctx = &*_guard;
+            let guard = ctx_arc.lock().await;
+            let ctx = &*guard;
             require_active(&ctx.handle)?;
             let did = ctx
                 .membership
@@ -874,8 +873,8 @@ impl ContextManager {
                 if let Some(ctx_entry) = self.contexts.get(context_id) {
                     let ctx_arc = Arc::clone(ctx_entry.value());
                     drop(ctx_entry);
-                    let _guard = ctx_arc.lock().await;
-                    let ctx = &*_guard;
+                    let guard = ctx_arc.lock().await;
+                    let ctx = &*guard;
                     ctx.role_state
                         .member_has_capability(&sender_did, &Capability::ContextClose)
                 } else {
@@ -944,11 +943,11 @@ impl ContextManager {
         inner: &scp_protocol::envelope::inner::InnerEnvelope,
         now_ms: u64,
     ) -> Result<SequenceCheck, ContextError> {
-        let _ctx_arc = self
+        let ctx_arc = self
             .get_context_arc(context_id)
             .map_err(|_| ContextError::ContextNotRegistered(context_id.to_owned()))?;
-        let mut _guard = _ctx_arc.lock().await;
-        let ctx = &mut *_guard;
+        let mut guard = ctx_arc.lock().await;
+        let ctx = &mut *guard;
 
         // Timestamp validation first — reject timestamps out of bounds.
         let tv = TimestampValidator::default();
@@ -1018,11 +1017,11 @@ impl ContextManager {
             received_at: now_ms,
         };
 
-        let _ctx_arc = self
+        let ctx_arc = self
             .get_context_arc(context_id)
             .map_err(|_| ContextError::ContextNotRegistered(context_id.to_owned()))?;
-        let mut _guard = _ctx_arc.lock().await;
-        let ctx = &mut *_guard;
+        let mut guard = ctx_arc.lock().await;
+        let ctx = &mut *guard;
 
         if let Some((mut gap_info, messages)) = ctx.reorder_buffer.buffer(buffered_msg) {
             let expected = ctx
@@ -1085,11 +1084,11 @@ impl ContextManager {
     ) -> Result<(), ContextError> {
         let sender_did_obj = DID(sender_did.to_owned());
 
-        let _ctx_arc = self
+        let ctx_arc = self
             .get_context_arc(context_id)
             .map_err(|_| ContextError::ContextNotRegistered(context_id.to_owned()))?;
-        let mut _guard = _ctx_arc.lock().await;
-        let ctx = &mut *_guard;
+        let mut guard = ctx_arc.lock().await;
+        let ctx = &mut *guard;
         require_active(&ctx.handle)?;
 
         // Membership + capability check.
