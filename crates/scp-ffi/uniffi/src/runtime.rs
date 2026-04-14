@@ -208,7 +208,10 @@ fn build_default_context_manager() -> Arc<ContextManager> {
 /// `register_local_did` / `is_local_did` only access the DID registry, not
 /// transport or crypto, and should not require a prior `context_create` call.
 pub fn context_manager_expect() -> &'static Arc<ContextManager> {
-    CONTEXT_MANAGER.get_or_init(build_default_context_manager)
+    let cm = CONTEXT_MANAGER.get_or_init(build_default_context_manager);
+    // Ensure BridgeInstance is populated even for auto-init paths.
+    init_bridge_instance(cm.clone(), "did:none:not-configured");
+    cm
 }
 
 /// Initializes the global [`ContextManager`] with bridge-local providers.

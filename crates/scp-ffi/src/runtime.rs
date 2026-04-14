@@ -232,15 +232,19 @@ pub fn init_context_manager(local_did: &str) {
 /// initialized, a [`ProtocolRepositoryContextBridge`] is automatically constructed
 /// from it. Pass `Some(...)` to override with a custom implementation.
 pub fn init_context_manager_with(
+    local_did: &str,
     crypto: Box<dyn ContextCryptoProvider>,
     transport: Box<dyn ContextTransportProvider>,
     event_log: Box<dyn ContextEventLogProvider>,
     persistence: Option<Box<dyn ContextPersistence>>,
 ) {
-    let _ = CONTEXT_MANAGER.get_or_init(|| {
-        let persistence = persistence.or_else(build_persistence_provider);
-        build_context_manager(crypto, transport, event_log, persistence)
-    });
+    let cm_arc = CONTEXT_MANAGER
+        .get_or_init(|| {
+            let persistence = persistence.or_else(build_persistence_provider);
+            build_context_manager(crypto, transport, event_log, persistence)
+        })
+        .clone();
+    init_bridge_instance(cm_arc, local_did);
 }
 
 /// Test variant of [`init_context_manager`] that uses `LocalTransportProvider`
