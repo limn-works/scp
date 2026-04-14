@@ -2027,11 +2027,7 @@ impl ContextManager {
         ),
         ContextError,
     > {
-        let arc = self
-            .contexts
-            .get(context_id)
-            .map(|entry| Arc::clone(entry.value()))
-            .ok_or_else(|| ContextError::ContextNotRegistered(context_id.to_owned()))?;
+        let arc = self.get_context_arc(context_id)?;
         let guard = arc.lock_owned().await;
         let token = ContextGeneration {
             context_id: context_id.to_owned(),
@@ -2053,11 +2049,7 @@ impl ContextManager {
         &self,
         token: &ContextGeneration,
     ) -> Result<tokio::sync::OwnedMutexGuard<PerContextState>, ContextError> {
-        let arc = self
-            .contexts
-            .get(&token.context_id)
-            .map(|entry| Arc::clone(entry.value()))
-            .ok_or_else(|| ContextError::ContextNotRegistered(token.context_id.clone()))?;
+        let arc = self.get_context_arc(&token.context_id)?;
         let guard = arc.lock_owned().await;
         if guard.generation != token.generation {
             return Err(ContextError::PermissionDenied(format!(
@@ -2084,6 +2076,77 @@ impl ContextManager {
             .get(context_id)
             .map(|entry| Arc::clone(entry.value()))
             .ok_or_else(|| ContextError::ContextNotRegistered(context_id.to_owned()))
+    }
+
+    /// Insert a new context into the map. Returns an error if
+    /// `context_id` is already registered.
+    ///
+    /// Assigns a monotonically increasing generation counter so that
+    /// [`relock_context`](Self::relock_context) can detect remove-and-recreate
+    /// races.
+    #[allow(clippy::needless_pass_by_value)] // DashMap::entry takes ownership
+    pub(super) fn insert_context(
+        &self,
+        context_id: String,
+        mut state: PerContextState,
+    ) -> Result<(), ContextCreationError> {
+        use dashmap::mapref::entry::Entry;
+        let generation = self
+            .next_generation
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        state.generation = generation;
+        match self.contexts.entry(context_id.clone()) {
+            Entry::Occupied(_) => Err(ContextCreationError::CreationFailed(format!(
+                "context '{context_id}' already registered"
+            ))),
+            Entry::Vacant(v) => {
+                v.insert(Arc::new(Mutex::new(state)));
+                Ok(())
+            }
+        }
+    }
+
+    /// Remove a context from the map, returning its state `Arc` if it existed.
+    pub(super) fn remove_context(&self, context_id: &str) -> Option<Arc<Mutex<PerContextState>>> {
+        self.contexts.remove(context_id).map(|(_, v)| v)
+    }
+
+    /// Check if a context is registered.
+    #[allow(dead_code)] // Available for callers added as contexts migrate.
+    pub(super) fn context_exists(&self, context_id: &str) -> bool {
+        self.contexts.contains_key(context_id)
+    }
+
+    /// Number of registered contexts.
+    pub(super) fn context_count(&self) -> usize {
+        self.contexts.len()
+    }
+
+    /// Clone the `Arc<DashMap>` for use in spawned background tasks that
+    /// outlive the borrow of `&self`.
+    pub(super) fn contexts_arc(&self) -> Arc<DashMap<String, Arc<Mutex<PerContextState>>>> {
+        Arc::clone(&self.contexts)
+    }
+
+    /// Collect all context `Arc`s. Releases `DashMap` shard locks immediately.
+    ///
+    /// Useful for iteration patterns that need to lock individual contexts
+    /// without holding shard locks (metrics, reconnection scans).
+    pub(super) fn collect_context_arcs(&self) -> Vec<(String, Arc<Mutex<PerContextState>>)> {
+        self.contexts
+            .iter()
+            .map(|entry| (entry.key().clone(), Arc::clone(entry.value())))
+            .collect()
+    }
+
+    /// Increment the checkpoint counter for a context. Best-effort: silently
+    /// skips if the context is not found (e.g., removed concurrently).
+    #[allow(dead_code)] // Available for callers added as contexts migrate.
+    pub(super) async fn increment_checkpoint_counter(&self, context_id: &str) {
+        if let Ok(arc) = self.get_context_arc(context_id) {
+            let mut guard = arc.lock().await;
+            guard.checkpoint_events_since += 1;
+        }
     }
 
     /// Returns `true` if a persistence provider is configured.
@@ -2116,15 +2179,11 @@ impl ContextManager {
     /// Takes the contexts lock, so callers must NOT hold it. Best-effort:
     /// if no metrics recorder is installed, these are no-ops (#1467).
     fn update_context_gauges(&self) {
-        crate::metrics::set_active_contexts(self.contexts.len());
+        crate::metrics::set_active_contexts(self.context_count());
         // Collect Arcs first to release DashMap shard locks.
-        let arcs: Vec<Arc<Mutex<PerContextState>>> = self
-            .contexts
-            .iter()
-            .map(|entry| Arc::clone(entry.value()))
-            .collect();
+        let arcs = self.collect_context_arcs();
         let mut total_buffered: usize = 0;
-        for arc in arcs {
+        for (_id, arc) in arcs {
             // Use try_lock to avoid convoy effects: metrics are approximate,
             // so skipping locked contexts is acceptable.
             if let Ok(ctx) = arc.try_lock() {
@@ -2214,10 +2273,8 @@ impl ContextManager {
     /// Persists context and broadcast state if a persistence provider is configured.
     async fn persist_context_and_broadcast(&self, context_id: &str) {
         if self.has_persistence()
-            && let Some(entry) = self.contexts.get(context_id)
+            && let Ok(arc) = self.get_context_arc(context_id)
         {
-            let arc = Arc::clone(entry.value());
-            drop(entry);
             let ctx = arc.lock().await;
             let snapshot = Self::snapshot_context(&ctx);
             let bc_snapshot = ctx
@@ -2336,9 +2393,7 @@ impl ContextManager {
                 "failed to append PaymentCaptureFailed to event log: {log_err}"
             );
         }
-        if let Some(entry) = self.contexts.get(context_id) {
-            let arc = Arc::clone(entry.value());
-            drop(entry);
+        if let Ok(arc) = self.get_context_arc(context_id) {
             let mut ctx = arc.lock().await;
             ctx.checkpoint_events_since += 1;
             ctx.receive_buffer.push(ContextEvent::PaymentCaptureFailed {
@@ -2370,12 +2425,19 @@ impl ContextManager {
     where
         F: FnOnce(&mut PerContextState) -> R,
     {
-        let arc = self.contexts.get(context_id).map_or_else(
-            || unreachable!("context not found in test"),
-            |entry| entry.value().clone(),
-        );
+        let arc = self
+            .get_context_arc(context_id)
+            .unwrap_or_else(|_| unreachable!("context not found in test"));
         let mut guard = arc.lock().await;
         f(&mut guard)
+    }
+
+    /// Test helper: returns a reference to the underlying `DashMap` for
+    /// test-only assertions that need direct map access (e.g., checking
+    /// entry presence, count, iteration).
+    #[allow(private_interfaces)] // PerContextState is pub(super); tests are within the module.
+    pub(crate) fn contexts_map(&self) -> &DashMap<String, Arc<Mutex<PerContextState>>> {
+        &self.contexts
     }
 }
 

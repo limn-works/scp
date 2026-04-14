@@ -245,11 +245,9 @@ impl ContextManager {
         did: &DID,
         now_secs: u64,
     ) -> bool {
-        let Some(entry) = self.contexts.get(context_id) else {
+        let Ok(arc) = self.get_context_arc(context_id) else {
             return true;
         };
-        let arc = entry.value().clone();
-        drop(entry);
         let ctx = arc.blocking_lock();
         ctx.governance.hard_rate_limit.try_consume(did, now_secs)
     }
@@ -258,11 +256,9 @@ impl ContextManager {
     /// context is unknown. Same `blocking_lock` constraint as
     /// [`Self::try_consume_hard_rate_limit_blocking`].
     pub fn refund_hard_rate_limit_blocking(&self, context_id: &str, did: &DID) {
-        let Some(entry) = self.contexts.get(context_id) else {
+        let Ok(arc) = self.get_context_arc(context_id) else {
             return;
         };
-        let arc = entry.value().clone();
-        drop(entry);
         let ctx = arc.blocking_lock();
         ctx.governance.hard_rate_limit.refund(did);
     }
@@ -278,11 +274,9 @@ impl ContextManager {
         did: &DID,
         now_secs: u64,
     ) -> bool {
-        let Some(entry) = self.contexts.get(context_id) else {
+        let Ok(arc) = self.get_context_arc(context_id) else {
             return true;
         };
-        let arc = entry.value().clone();
-        drop(entry);
         let mut guard = arc.lock().await;
         let ctx = &mut *guard;
         ctx.governance.hard_rate_limit.try_consume(did, now_secs)
@@ -291,9 +285,7 @@ impl ContextManager {
     /// Async refund. No-op if the context is unknown.
     #[allow(clippy::significant_drop_tightening)]
     pub async fn refund_hard_rate_limit(&self, context_id: &str, did: &DID) {
-        if let Some(entry) = self.contexts.get(context_id) {
-            let ctx_arc = Arc::clone(entry.value());
-            drop(entry);
+        if let Ok(ctx_arc) = self.get_context_arc(context_id) {
             let guard = ctx_arc.lock().await;
             let ctx = &*guard;
             ctx.governance.hard_rate_limit.refund(did);

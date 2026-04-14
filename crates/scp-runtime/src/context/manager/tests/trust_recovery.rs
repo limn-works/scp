@@ -29,7 +29,7 @@ async fn cac009_tier1_encrypted_block_unblock() {
         .await
         .unwrap();
     for did in &["did:key:dave", "did:key:bob"] {
-        let arc = manager.contexts.get("cac009-enc").unwrap().value().clone();
+        let arc = manager.get_context_arc("cac009-enc").unwrap();
         let mut g = arc.lock().await;
         let ctx = &mut *g;
         ctx.membership
@@ -49,7 +49,7 @@ async fn cac009_tier1_encrypted_block_unblock() {
         .await;
     assert!(result.is_ok(), "Revoke (read) should succeed: {result:?}");
     {
-        let arc = manager.contexts.get("cac009-enc").unwrap().value().clone();
+        let arc = manager.get_context_arc("cac009-enc").unwrap();
         let g = arc.lock().await;
         let ctx = &*g;
         assert!(
@@ -86,7 +86,7 @@ async fn cac009_tier1_encrypted_block_unblock() {
         "RestoreAccess (read) should succeed: {result:?}"
     );
     {
-        let arc = manager.contexts.get("cac009-enc").unwrap().value().clone();
+        let arc = manager.get_context_arc("cac009-enc").unwrap();
         let g = arc.lock().await;
         let ctx = &*g;
         assert!(
@@ -132,7 +132,7 @@ async fn cac009_tier2_global_block_multiple_contexts() {
         .await
         .unwrap();
     for ctx_id in &["cac009-g1", "cac009-g2"] {
-        let arc = manager.contexts.get(*ctx_id).unwrap().value().clone();
+        let arc = manager.get_context_arc(ctx_id).unwrap();
         let mut ctx = arc.lock().await;
         ctx.membership
             .add_member("did:key:eve".into(), "member".into(), vec![]);
@@ -153,7 +153,7 @@ async fn cac009_tier2_global_block_multiple_contexts() {
             .unwrap();
     }
     for ctx_id in &["cac009-g1", "cac009-g2"] {
-        let arc = manager.contexts.get(*ctx_id).unwrap().value().clone();
+        let arc = manager.get_context_arc(ctx_id).unwrap();
         let ctx = arc.lock().await;
         assert!(
             ctx.access
@@ -178,7 +178,7 @@ async fn cac009_tier2_global_block_multiple_contexts() {
             .unwrap();
     }
     for ctx_id in &["cac009-g1", "cac009-g2"] {
-        let arc = manager.contexts.get(*ctx_id).unwrap().value().clone();
+        let arc = manager.get_context_arc(ctx_id).unwrap();
         let ctx = arc.lock().await;
         assert!(
             !ctx.access
@@ -193,7 +193,7 @@ async fn cac009_tier2_global_block_multiple_contexts() {
 async fn cac009_broadcast_governance_revoke_restore() {
     let (manager, _handle, ctx_id) = setup_broadcast_context_two_authors().await;
     {
-        let arc = manager.contexts.get(&ctx_id).unwrap().value().clone();
+        let arc = manager.get_context_arc(&ctx_id).unwrap();
         let ctx = arc.lock().await;
         assert!(
             ctx.broadcast_context
@@ -262,7 +262,7 @@ async fn cac009_broadcast_governance_revoke_restore() {
     // BroadcastContext. Forward-only restoration clears the revocation flag
     // but does NOT re-create the author entry — bob must re-register.
     {
-        let arc = manager.contexts.get(&ctx_id).unwrap().value().clone();
+        let arc = manager.get_context_arc(&ctx_id).unwrap();
         let ctx = arc.lock().await;
         let bc = ctx.broadcast_context.as_ref().unwrap();
         assert!(
@@ -303,7 +303,7 @@ async fn cac009_tier_stacking_both_must_reverse() {
         .await
         .unwrap();
     {
-        let arc = manager.contexts.get(&ctx_id).unwrap().value().clone();
+        let arc = manager.get_context_arc(&ctx_id).unwrap();
         let g = arc.lock().await;
         let ctx = &*g;
         assert!(
@@ -332,7 +332,7 @@ async fn cac009_tier_stacking_both_must_reverse() {
         .await
         .unwrap();
     {
-        let arc = manager.contexts.get(&ctx_id).unwrap().value().clone();
+        let arc = manager.get_context_arc(&ctx_id).unwrap();
         let g = arc.lock().await;
         let ctx = &*g;
         assert!(
@@ -363,7 +363,7 @@ async fn cac009_tier_stacking_both_must_reverse() {
         .await
         .unwrap();
     {
-        let arc = manager.contexts.get(&ctx_id).unwrap().value().clone();
+        let arc = manager.get_context_arc(&ctx_id).unwrap();
         let g = arc.lock().await;
         let ctx = &*g;
         assert!(
@@ -405,7 +405,7 @@ async fn cac009_layer_verification() {
         .await
         .unwrap();
     {
-        let arc = manager.contexts.get(&ctx_id).unwrap().value().clone();
+        let arc = manager.get_context_arc(&ctx_id).unwrap();
         let g = arc.lock().await;
         let ctx = &*g;
         assert!(
@@ -430,7 +430,7 @@ async fn cac009_layer_verification() {
 async fn cac009_forward_only_verification() {
     let (manager, _handle, ctx_id) = setup_broadcast_context_two_authors().await;
     let _epoch_before = {
-        let arc = manager.contexts.get(&ctx_id).unwrap().value().clone();
+        let arc = manager.get_context_arc(&ctx_id).unwrap();
         let ctx_guard = arc.lock().await;
         ctx_guard
             .broadcast_context
@@ -454,7 +454,7 @@ async fn cac009_forward_only_verification() {
         .await
         .unwrap();
     {
-        let arc = manager.contexts.get(&ctx_id).unwrap().value().clone();
+        let arc = manager.get_context_arc(&ctx_id).unwrap();
         let ctx = arc.lock().await;
         assert!(
             !ctx.broadcast_context
@@ -480,7 +480,7 @@ async fn cac009_forward_only_verification() {
     // Forward-only restoration clears the revocation flag but does NOT
     // re-create the author — bob must re-register as an author.
     let author_gone = {
-        let arc = manager.contexts.get(&ctx_id).unwrap().value().clone();
+        let arc = manager.get_context_arc(&ctx_id).unwrap();
         let ctx_guard = arc.lock().await;
         ctx_guard
             .broadcast_context
@@ -616,7 +616,7 @@ async fn cac010_revoke_write_full_can_still_read() {
         .await
         .unwrap();
     {
-        let arc = manager.contexts.get(&ctx_id).unwrap().value().clone();
+        let arc = manager.get_context_arc(&ctx_id).unwrap();
         let g = arc.lock().await;
         let ctx = &*g;
         assert!(
@@ -670,7 +670,7 @@ async fn cac010_revoke_write_future_only() {
         // is removed; historical messages remain decryptable by
         // subscribers via cached broadcast keys (forward-only restoration
         // applies if access is later restored).
-        let arc = manager.contexts.get(&ctx_id).unwrap().value().clone();
+        let arc = manager.get_context_arc(&ctx_id).unwrap();
         let ctx = arc.lock().await;
         assert!(
             !ctx.broadcast_context

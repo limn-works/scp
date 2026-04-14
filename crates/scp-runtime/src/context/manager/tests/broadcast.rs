@@ -1332,7 +1332,7 @@ async fn revoke_read_access_rejected_without_member_ban_ceiling() {
         .await
         .unwrap();
     {
-        let arc = manager.contexts.get("no-ban-ctx").unwrap().value().clone();
+        let arc = manager.get_context_arc("no-ban-ctx").unwrap();
         let mut g = arc.lock().await;
         let ctx = &mut *g;
         let bc = ctx.broadcast_context.as_mut().unwrap();
@@ -1526,7 +1526,7 @@ async fn revoke_read_access_works_on_encrypted_context() {
     );
 
     // Verify bob is tracked as read-revoked.
-    let arc = manager.contexts.get(&ctx_id).unwrap().value().clone();
+    let arc = manager.get_context_arc(&ctx_id).unwrap();
     let g = arc.lock().await;
     let ctx = &*g;
     assert!(
@@ -1651,7 +1651,7 @@ async fn restore_read_access_after_revocation_on_encrypted() {
     );
 
     // Bob should no longer be read-revoked.
-    let arc = manager.contexts.get(&ctx_id).unwrap().value().clone();
+    let arc = manager.get_context_arc(&ctx_id).unwrap();
     let g = arc.lock().await;
     let ctx = &*g;
     assert!(
@@ -1675,7 +1675,7 @@ async fn revoke_write_access_full_in_broadcast() {
 
     // Add sub1 as member for governance purposes.
     {
-        let arc = manager.contexts.get(&ctx_id).unwrap().value().clone();
+        let arc = manager.get_context_arc(&ctx_id).unwrap();
         let mut g = arc.lock().await;
         let ctx = &mut *g;
         ctx.membership
@@ -1697,7 +1697,7 @@ async fn revoke_write_access_full_in_broadcast() {
     assert!(result.is_ok(), "Revoke (write)(Full) should succeed");
 
     // Alice should be in suspended_capabilities.
-    let arc = manager.contexts.get(&ctx_id).unwrap().value().clone();
+    let arc = manager.get_context_arc(&ctx_id).unwrap();
     let g = arc.lock().await;
     let ctx = &*g;
     assert!(
@@ -1716,7 +1716,7 @@ async fn revoke_write_access_future_only_no_key_destruction() {
     let (manager, ctx_id) = setup_broadcast_with_member_ban().await;
 
     {
-        let arc = manager.contexts.get(&ctx_id).unwrap().value().clone();
+        let arc = manager.get_context_arc(&ctx_id).unwrap();
         let mut g = arc.lock().await;
         let ctx = &mut *g;
         ctx.membership
@@ -1738,7 +1738,7 @@ async fn revoke_write_access_future_only_no_key_destruction() {
     assert!(result.is_ok(), "Revoke (write, FutureOnly) should succeed");
 
     // Alice should be in suspended_capabilities.
-    let arc = manager.contexts.get(&ctx_id).unwrap().value().clone();
+    let arc = manager.get_context_arc(&ctx_id).unwrap();
     let g = arc.lock().await;
     let ctx = &*g;
     assert!(
@@ -1860,7 +1860,7 @@ async fn restore_write_access_after_revocation() {
 
     // Bob should no longer be write-revoked.
     {
-        let arc = manager.contexts.get(&ctx_id).unwrap().value().clone();
+        let arc = manager.get_context_arc(&ctx_id).unwrap();
         let g = arc.lock().await;
         let ctx = &*g;
         assert!(
@@ -2107,7 +2107,7 @@ async fn content_access_preserves_membership() {
         .unwrap();
 
     // Bob is still a member despite both read and write revoked.
-    let arc = manager.contexts.get(&ctx_id).unwrap().value().clone();
+    let arc = manager.get_context_arc(&ctx_id).unwrap();
     let g = arc.lock().await;
     let ctx = &*g;
     assert!(
@@ -2159,7 +2159,7 @@ async fn revoke_write_access_marks_member() {
 
     // Verify member is tracked as write-revoked.
     {
-        let arc = manager.contexts.get(&ctx_id).unwrap().value().clone();
+        let arc = manager.get_context_arc(&ctx_id).unwrap();
         let g = arc.lock().await;
         let ctx = &*g;
         assert!(
@@ -2271,7 +2271,7 @@ async fn restore_write_access_removes_revocation() {
 
     // Verify member is no longer write-revoked.
     {
-        let arc = manager.contexts.get(&ctx_id).unwrap().value().clone();
+        let arc = manager.get_context_arc(&ctx_id).unwrap();
         let g = arc.lock().await;
         let ctx = &*g;
         assert!(
@@ -2365,7 +2365,7 @@ async fn presence_only_strips_governance_capabilities() {
 
     // Verify both read and write are revoked.
     {
-        let arc = manager.contexts.get(&ctx_id).unwrap().value().clone();
+        let arc = manager.get_context_arc(&ctx_id).unwrap();
         let g = arc.lock().await;
         let ctx = &*g;
         assert!(
@@ -2453,7 +2453,7 @@ async fn revoke_write_access_full_scope_broadcast() {
 
     // Add sub1 as a member in membership so the revoke path finds them.
     {
-        let arc = manager.contexts.get(&ctx_id).unwrap().value().clone();
+        let arc = manager.get_context_arc(&ctx_id).unwrap();
         let mut g = arc.lock().await;
         let ctx = &mut *g;
         ctx.membership

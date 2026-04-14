@@ -351,7 +351,7 @@ async fn threshold_signers_bounded_at_64() {
     // The creator ("did:key:creator") is already a member.
     let mut dids: Vec<DID> = Vec::with_capacity(super::MAX_THRESHOLD_SIGNERS);
     {
-        let arc = manager.contexts.get("test-ctx").unwrap().value().clone();
+        let arc = manager.get_context_arc("test-ctx").unwrap();
         let mut g = arc.lock().await;
         let ctx = &mut *g;
         for i in 0..super::MAX_THRESHOLD_SIGNERS {
@@ -373,7 +373,7 @@ async fn threshold_signers_bounded_at_64() {
     // The 65th must fail with LimitExceeded.
     let overflow_did: DID = "did:key:signer-overflow".into();
     {
-        let arc = manager.contexts.get("test-ctx").unwrap().value().clone();
+        let arc = manager.get_context_arc("test-ctx").unwrap();
         let mut g = arc.lock().await;
         let ctx = &mut *g;
         ctx.membership
@@ -528,7 +528,7 @@ async fn checkpoint_not_created_below_thresholds() {
     let signing_key = ed25519_dalek::SigningKey::from_bytes(&[42u8; 32]);
     let sender_did = DID("did:key:creator".into());
 
-    let arc = manager.contexts.get("test-ctx").unwrap().value().clone();
+    let arc = manager.get_context_arc("test-ctx").unwrap();
     let mut g = arc.lock().await;
     let ctx = &mut *g;
 
@@ -547,7 +547,7 @@ async fn checkpoint_created_after_50_events() {
     let signing_key = ed25519_dalek::SigningKey::from_bytes(&[42u8; 32]);
     let sender_did = DID("did:key:creator".into());
 
-    let arc = manager.contexts.get("test-ctx").unwrap().value().clone();
+    let arc = manager.get_context_arc("test-ctx").unwrap();
     let mut g = arc.lock().await;
     let ctx = &mut *g;
 
@@ -573,7 +573,7 @@ async fn checkpoint_created_after_10_minutes() {
     let signing_key = ed25519_dalek::SigningKey::from_bytes(&[42u8; 32]);
     let sender_did = DID("did:key:creator".into());
 
-    let arc = manager.contexts.get("test-ctx").unwrap().value().clone();
+    let arc = manager.get_context_arc("test-ctx").unwrap();
     let mut g = arc.lock().await;
     let ctx = &mut *g;
 
@@ -600,7 +600,7 @@ async fn checkpoint_not_created_with_zero_events_and_elapsed_time() {
     let signing_key = ed25519_dalek::SigningKey::from_bytes(&[42u8; 32]);
     let sender_did = DID("did:key:creator".into());
 
-    let arc = manager.contexts.get("test-ctx").unwrap().value().clone();
+    let arc = manager.get_context_arc("test-ctx").unwrap();
     let mut g = arc.lock().await;
     let ctx = &mut *g;
 
@@ -622,7 +622,7 @@ async fn force_checkpoint_always_creates() {
     let signing_key = ed25519_dalek::SigningKey::from_bytes(&[42u8; 32]);
     let sender_did = DID("did:key:creator".into());
 
-    let arc = manager.contexts.get("test-ctx").unwrap().value().clone();
+    let arc = manager.get_context_arc("test-ctx").unwrap();
     let mut g = arc.lock().await;
     let ctx = &mut *g;
 

@@ -334,7 +334,7 @@ async fn setup_context_with_member_remove() -> (ContextManager, ContextHandle) {
 
     // Reassign to observer role (joined members default to "member").
     {
-        let arc = manager.contexts.get("auth-ctx").unwrap().value().clone();
+        let arc = manager.get_context_arc("auth-ctx").unwrap();
         let mut g = arc.lock().await;
         let ctx = &mut *g;
         roles::assign_role(
@@ -935,7 +935,7 @@ async fn restore_preserves_executed_proposals() {
 
     // Try to execute a governance action with the already-executed proposal ID.
     // The internal state should reject it as a replay.
-    let arc = manager.contexts.get("replay-ctx").unwrap().value().clone();
+    let arc = manager.get_context_arc("replay-ctx").unwrap();
     let g = arc.lock().await;
     let ctx = &*g;
     assert!(
@@ -1037,7 +1037,7 @@ async fn restore_respawns_ttl_timer() {
     manager.restore_context("ttl-ctx", &handle).await.unwrap();
 
     // Verify the TTL timer was re-spawned.
-    let arc = manager.contexts.get("ttl-ctx").unwrap().value().clone();
+    let arc = manager.get_context_arc("ttl-ctx").unwrap();
     let g = arc.lock().await;
     let ctx = &*g;
     assert!(
@@ -2115,7 +2115,7 @@ async fn standing_context_creates_new_bilateral_persistent_context() {
     let context_id = manager.standing_context(&alice, &carol).await.unwrap();
 
     // Verify the context exists in the manager.
-    let arc = manager.contexts.get(&context_id).unwrap().value().clone();
+    let arc = manager.get_context_arc(&context_id).unwrap();
     let g = arc.lock().await;
     let ctx = &*g;
     let state = ctx.handle.state().await;
@@ -2171,7 +2171,7 @@ async fn standing_context_recreates_when_peer_has_left() {
 
     // Simulate peer leaving: transition to Closing -> Closed.
     {
-        let arc = manager.contexts.get(&ctx_id1).unwrap().value().clone();
+        let arc = manager.get_context_arc(&ctx_id1).unwrap();
         let g = arc.lock().await;
         let ctx = &*g;
         ctx.handle
@@ -2186,7 +2186,7 @@ async fn standing_context_recreates_when_peer_has_left() {
 
     // Remove the old closed context so create_context can re-use the ID.
     {
-        manager.contexts.remove(&ctx_id1);
+        manager.remove_context(&ctx_id1);
     }
 
     let ctx_id2 = manager.standing_context(&alice, &dave).await.unwrap();
@@ -2196,7 +2196,7 @@ async fn standing_context_recreates_when_peer_has_left() {
 
     // Verify the new context is Active.
     {
-        let arc = manager.contexts.get(&ctx_id2).unwrap().value().clone();
+        let arc = manager.get_context_arc(&ctx_id2).unwrap();
         let g = arc.lock().await;
         let ctx = &*g;
         assert_eq!(ctx.handle.state().await, ContextState::Active);
@@ -2224,7 +2224,7 @@ async fn standing_context_recreates_when_context_expired() {
 
     // Simulate expiry.
     {
-        let arc = manager.contexts.get(&ctx_id1).unwrap().value().clone();
+        let arc = manager.get_context_arc(&ctx_id1).unwrap();
         let g = arc.lock().await;
         let ctx = &*g;
         ctx.handle
@@ -2235,7 +2235,7 @@ async fn standing_context_recreates_when_context_expired() {
 
     // Remove old context to allow recreation.
     {
-        manager.contexts.remove(&ctx_id1);
+        manager.remove_context(&ctx_id1);
     }
 
     // Calling standing_context should create a new one.
@@ -2243,7 +2243,7 @@ async fn standing_context_recreates_when_context_expired() {
     assert_eq!(ctx_id1, ctx_id2);
 
     {
-        let arc = manager.contexts.get(&ctx_id2).unwrap().value().clone();
+        let arc = manager.get_context_arc(&ctx_id2).unwrap();
         let g = arc.lock().await;
         let ctx = &*g;
         assert_eq!(ctx.handle.state().await, ContextState::Active);
@@ -2272,7 +2272,7 @@ async fn reconnect_all_standing_reconnects_active_contexts() {
 
     // Close Carol's context (simulating peer left).
     {
-        let arc = manager.contexts.get(&id_carol).unwrap().value().clone();
+        let arc = manager.get_context_arc(&id_carol).unwrap();
         let g = arc.lock().await;
         let ctx = &*g;
         ctx.handle
@@ -2415,7 +2415,7 @@ async fn test_standing_context_returns_existing_active() {
 
     // Verify the context is registered exactly once and is Active.
     {
-        let arc = manager.contexts.get(&ctx_id1).unwrap().value().clone();
+        let arc = manager.get_context_arc(&ctx_id1).unwrap();
         let g = arc.lock().await;
         let ctx = &*g;
         assert_eq!(
@@ -2451,7 +2451,7 @@ async fn test_standing_context_creates_new_after_expired() {
 
     // 2. Transition the handle to Expired (terminal state).
     {
-        let arc = manager.contexts.get(&ctx_id1).unwrap().value().clone();
+        let arc = manager.get_context_arc(&ctx_id1).unwrap();
         let g = arc.lock().await;
         let ctx = &*g;
         ctx.handle
@@ -2462,7 +2462,7 @@ async fn test_standing_context_creates_new_after_expired() {
 
     // 3. Remove the expired entry so create_context can re-use the ID.
     {
-        manager.contexts.remove(&ctx_id1);
+        manager.remove_context(&ctx_id1);
     }
 
     // 4. Calling standing_context again must fall through (Expired arm)
@@ -2473,7 +2473,7 @@ async fn test_standing_context_creates_new_after_expired() {
     assert_eq!(ctx_id1, ctx_id2, "deterministic context ID is preserved");
 
     {
-        let arc = manager.contexts.get(&ctx_id2).unwrap().value().clone();
+        let arc = manager.get_context_arc(&ctx_id2).unwrap();
         let g = arc.lock().await;
         let ctx = &*g;
         assert_eq!(
@@ -2553,9 +2553,7 @@ async fn test_standing_context_no_deadlock_under_contention() {
             tasks.push(tokio::spawn(async move {
                 // Step 1: try to look up the handle under contexts.lock().
                 let context_id = super::super::standing::generate_standing_context_id(&a, &b);
-                let handle_opt = if let Some(entry) = mgr.contexts.get(&context_id) {
-                    let arc = entry.value().clone();
-                    drop(entry); // Drop DashMap shard guard before awaiting per-context lock.
+                let handle_opt = if let Ok(arc) = mgr.get_context_arc(&context_id) {
                     let ctx = arc.lock().await;
                     Some(ctx.handle.clone())
                 } else {
@@ -2667,7 +2665,7 @@ async fn sybil_reject_insufficient_signals() {
 
     // Currently passes unconditionally — the test asserts the function is
     // callable and returns Ok.
-    let arc = manager.contexts.get("sybil-ctx").unwrap().value().clone();
+    let arc = manager.get_context_arc("sybil-ctx").unwrap();
     let g = arc.lock().await;
     let ctx = &*g;
     let result = evaluate_sybil_resistance(ctx, &"did:key:test".into(), 0);
@@ -2778,7 +2776,7 @@ async fn test_spawn_ttl_timer_decays_governance_on_expiry() {
     // proposal timestamps, and velocity tracker. The timer must clear
     // ALL four when it fires.
     {
-        let arc = manager.contexts.get(&context_id).unwrap().value().clone();
+        let arc = manager.get_context_arc(&context_id).unwrap();
         let mut g = arc.lock().await;
         let ctx = &mut *g;
         ctx.governance.participation_cache.insert(
@@ -2816,7 +2814,7 @@ async fn test_spawn_ttl_timer_decays_governance_on_expiry() {
     let mut decayed = false;
     for _ in 0..50 {
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-        let arc = manager.contexts.get(&context_id).unwrap().value().clone();
+        let arc = manager.get_context_arc(&context_id).unwrap();
         let g = arc.lock().await;
         let ctx = &*g;
         if ctx.governance.participation_cache.is_empty()
@@ -2831,7 +2829,7 @@ async fn test_spawn_ttl_timer_decays_governance_on_expiry() {
 
     // Snapshot the final state for assertion diagnostics.
     let (pc_empty, cu_empty, pt_empty, vt_zero) = {
-        let arc = manager.contexts.get(&context_id).unwrap().value().clone();
+        let arc = manager.get_context_arc(&context_id).unwrap();
         let g = arc.lock().await;
         let ctx = &*g;
         (
@@ -2885,7 +2883,7 @@ async fn test_spawn_ttl_timer_cancels_governance_timeout_task() {
     // The governance timeout task should be active immediately after
     // create_context (started by finalize_create).
     {
-        let arc = manager.contexts.get(&context_id).unwrap().value().clone();
+        let arc = manager.get_context_arc(&context_id).unwrap();
         let g = arc.lock().await;
         let ctx = &*g;
         assert!(
@@ -2898,7 +2896,7 @@ async fn test_spawn_ttl_timer_cancels_governance_timeout_task() {
     let mut cancelled = false;
     for _ in 0..50 {
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-        let arc = manager.contexts.get(&context_id).unwrap().value().clone();
+        let arc = manager.get_context_arc(&context_id).unwrap();
         let g = arc.lock().await;
         let ctx = &*g;
         if !ctx.governance.timeout_task.is_active() {

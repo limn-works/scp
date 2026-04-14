@@ -343,9 +343,7 @@ impl ContextManager {
     ) {
         // Cancel old timer and clear extension state (lock, then drop).
         {
-            if let Some(entry) = self.contexts.get(context_id) {
-                let ctx_arc = Arc::clone(entry.value());
-                drop(entry);
+            if let Ok(ctx_arc) = self.get_context_arc(context_id) {
                 let mut guard = ctx_arc.lock().await;
                 let ctx = &mut *guard;
                 ctx.ttl.timer.cancel();
@@ -357,10 +355,8 @@ impl ContextManager {
 
         // Persist context state after TTL reset (best-effort).
         if self.has_persistence()
-            && let Some(entry) = self.contexts.get(context_id)
+            && let Ok(ctx_arc) = self.get_context_arc(context_id)
         {
-            let ctx_arc = Arc::clone(entry.value());
-            drop(entry);
             let guard = ctx_arc.lock().await;
             let ctx = &*guard;
             let snapshot = Self::snapshot_context(ctx);
@@ -391,11 +387,9 @@ impl ContextManager {
     ) {
         // Extract the cancel Notify and generation under lock, then drop.
         let (cancel, spawn_generation) = {
-            let Some(entry) = self.contexts.get(context_id) else {
+            let Ok(arc) = self.get_context_arc(context_id) else {
                 return;
             };
-            let arc = entry.value().clone();
-            drop(entry);
             let ctx = arc.lock().await;
             (ctx.ttl.timer.cancel.clone(), ctx.generation)
         };
@@ -405,7 +399,7 @@ impl ContextManager {
         let crypto = Arc::clone(&self.crypto);
         let transport = Arc::clone(&self.transport);
         let event_log = Arc::clone(&self.event_log);
-        let contexts_ref = Arc::clone(&self.contexts);
+        let contexts_ref = self.contexts_arc();
         let context_id_owned = context_id.to_owned();
 
         let abort_handle = {
@@ -469,9 +463,7 @@ impl ContextManager {
 
         // Store the abort handle for cancel/is_active checks (lock, then drop).
         let context_id_for_store = context_id.to_owned();
-        if let Some(entry) = self.contexts.get(&context_id_for_store) {
-            let ctx_arc = Arc::clone(entry.value());
-            drop(entry);
+        if let Ok(ctx_arc) = self.get_context_arc(&context_id_for_store) {
             let mut guard = ctx_arc.lock().await;
             let ctx = &mut *guard;
             ctx.ttl.timer.task = Some(abort_handle);

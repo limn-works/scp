@@ -721,9 +721,7 @@ impl ContextManager {
 
         // Checkpoint tracking: count this event for threshold-based checkpoints.
         {
-            if let Some(entry) = self.contexts.get(context_id) {
-                let ctx_arc = Arc::clone(entry.value());
-                drop(entry);
+            if let Ok(ctx_arc) = self.get_context_arc(context_id) {
                 let mut guard = ctx_arc.lock().await;
                 let ctx = &mut *guard;
                 ctx.checkpoint_events_since += 1;

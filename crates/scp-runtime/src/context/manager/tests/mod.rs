@@ -1459,7 +1459,7 @@ pub(super) async fn setup_failing_capture_manager_with_context(
 
     // Grant a generous budget so economy enforcement passes.
     {
-        let arc = manager.contexts.get(context_id).unwrap().value().clone();
+        let arc = manager.get_context_arc(context_id).unwrap();
         let mut g = arc.lock().await;
         let ctx = &mut *g;
         ctx.governance.budget_tracker.grant(
@@ -1758,7 +1758,7 @@ pub(super) async fn setup_encrypted_with_member_ban() -> (ContextManager, String
 
     // Add bob as a member.
     {
-        let arc = manager.contexts.get("enc-ban-ctx").unwrap().value().clone();
+        let arc = manager.get_context_arc("enc-ban-ctx").unwrap();
         let mut g = arc.lock().await;
         let ctx = &mut *g;
         ctx.membership
