@@ -53,6 +53,10 @@ impl From<ServerError> for ScpError {
                 msg: user_msg,
                 code: codes::CTX_2052.to_owned(),
             },
+            ServerError::MissingPassphrase => Self::Validation {
+                msg: user_msg,
+                code: codes::VALID_7004.to_owned(),
+            },
         }
     }
 }

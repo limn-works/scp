@@ -74,6 +74,10 @@ pub enum ServerError {
     #[error("storage error: {0}")]
     Storage(#[from] StorageError),
 
+    /// No passphrase was provided when one is required for persistent node identity.
+    #[error("passphrase required for persistent node identity")]
+    MissingPassphrase,
+
     /// A filesystem I/O operation failed (e.g., creating the data directory).
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
@@ -97,6 +101,9 @@ impl ServerError {
             Self::Storage(_) => "storage initialization failed".to_owned(),
             Self::Io(_) => "I/O error during server operation".to_owned(),
             Self::Platform(_) => "platform error during server operation".to_owned(),
+            Self::MissingPassphrase => {
+                "passphrase required for persistent node identity".to_owned()
+            }
         }
     }
 }
@@ -354,7 +361,7 @@ pub async fn start_node_in_memory(
 /// - The data directory cannot be created ([`ServerError::Io`])
 /// - The filesystem storage cannot be initialized ([`ServerError::Platform`])
 /// - The redb blob database cannot be opened ([`ServerError::Storage`])
-/// - No passphrase provided when `identity` is `None` ([`ServerError::Io`])
+/// - No passphrase provided when `identity` is `None` ([`ServerError::MissingPassphrase`])
 /// - Relay binding, identity generation, or TLS fails ([`ServerError::Node`])
 pub async fn start_node_local(
     data_dir: &Path,
@@ -404,12 +411,7 @@ pub async fn start_node_local(
             .await?
     } else {
         // Persistent key custody — keys survive process restarts.
-        let passphrase = passphrase.ok_or_else(|| {
-            ServerError::Io(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                "passphrase required for persistent node identity",
-            ))
-        })?;
+        let passphrase = passphrase.ok_or(ServerError::MissingPassphrase)?;
         let key_path = data_dir.join("identity.key");
         let key_custody = Arc::new(scp_platform::file::FileKeyCustody::new(
             &key_path,
@@ -949,6 +951,12 @@ mod tests {
 
         let storage_err = ServerError::Storage(StorageError::Internal("redb corruption".into()));
         assert_eq!(storage_err.user_message(), "storage initialization failed");
+
+        let missing_passphrase = ServerError::MissingPassphrase;
+        assert_eq!(
+            missing_passphrase.user_message(),
+            "passphrase required for persistent node identity"
+        );
     }
 
     #[test]
@@ -1189,8 +1197,8 @@ mod tests {
     }
 
     /// Verifies that `start_node_local` without identity and without
-    /// passphrase returns an error. No env var mutation needed — the
-    /// explicit `None` passphrase parameter is sufficient.
+    /// passphrase returns the dedicated `MissingPassphrase` variant —
+    /// not a generic `Io` error — so the actionable message reaches callers.
     #[tokio::test]
     async fn node_local_without_identity_requires_passphrase() {
         let tmp =
@@ -1198,10 +1206,14 @@ mod tests {
         let result = start_node_local(&tmp, None, None).await;
 
         let err = result.err().expect("should fail without passphrase");
-        let err_msg = err.to_string();
         assert!(
-            err_msg.contains("passphrase required"),
-            "error should mention passphrase requirement, got: {err_msg}"
+            matches!(err, ServerError::MissingPassphrase),
+            "expected ServerError::MissingPassphrase, got: {err:?}"
+        );
+        let user_msg = err.user_message();
+        assert!(
+            user_msg.contains("passphrase required"),
+            "user_message should mention passphrase requirement, got: {user_msg}"
         );
 
         // Cleanup (data_dir may not have been fully created).
