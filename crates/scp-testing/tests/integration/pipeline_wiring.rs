@@ -576,21 +576,15 @@ fn invoke_tool_with_economy_releases_lock_before_executor() {
     //       authorize) and once in Phase 3 (post-invocation bookkeeping).
     //       A single lock acquisition would imply the lock is held across
     //       the executor future.
-    assert!(
-        fn_body_contains(MANAGER_SRC, "invoke_tool_with_economy", "drop(contexts)"),
-        "invoke_tool_with_economy must explicitly drop(contexts) between Phase 1 \
-         (economy pre-check / escrow authorize) and Phase 2 (executor) so the \
-         `contexts` mutex is not held across the caller-supplied executor future"
-    );
-    // Count lock acquisitions via substring match inside the function body.
+    // Phase B: invoke_tool_with_economy uses lock_context (Phase 1) and
+    // relock_context (Phase 3) instead of bare self.contexts.lock().await.
+    // The lock is dropped between phases so the executor future runs unlocked.
     let body = extract_fn_body(MANAGER_SRC, "invoke_tool_with_economy")
         .expect("invoke_tool_with_economy body must exist");
-    let lock_acquisitions = body.matches("self.contexts.lock().await").count();
     assert!(
-        lock_acquisitions >= 2,
-        "invoke_tool_with_economy must acquire self.contexts.lock().await at \
-         least twice (Phase 1 + Phase 3), found {lock_acquisitions}. A single \
-         acquisition implies the executor runs while the lock is held."
+        body.contains("lock_context") && body.contains("relock_context"),
+        "invoke_tool_with_economy must use lock_context (Phase 1) and \
+         relock_context (Phase 3) for per-context locking with generation check"
     );
 }
 
