@@ -55,8 +55,17 @@ pub struct CommonContextParams {
     /// Memory scope: `"ephemeral"` (default), `"summary"`, or `"full"`.
     pub memory_scope: String,
 
-    /// Governance model: `"single_admin"`.
+    /// Governance model: `"single_admin"`, `"threshold"`, `"majority"`, `"unanimity"`.
     pub governance: String,
+
+    /// Threshold for threshold governance (required when governance = "threshold").
+    pub governance_threshold: Option<u32>,
+
+    /// Signer DIDs for threshold governance.
+    pub governance_signers: Option<Vec<String>>,
+
+    /// Eligible voter DIDs for majority/unanimity governance.
+    pub governance_voters: Option<Vec<String>>,
 
     /// Optional time-to-live. Each bridge converts its native TTL
     /// representation into a [`Duration`] before populating this field.
@@ -129,7 +138,7 @@ pub fn build_context_params(params: &CommonContextParams) -> Result<ContextParam
         "full" => MemoryScope::Full,
         _ => MemoryScope::Ephemeral,
     };
-    let governance = parse_governance(&params.governance)?;
+    let governance = parse_governance(&params.governance, params)?;
     let ttl = params.ttl;
     let economic_policy = parse_economic_policy(params.economic_policy_json.as_ref())?;
     let (consequence_rules, consequence_config) = parse_and_validate_consequences(
@@ -175,12 +184,44 @@ pub fn build_context_params(params: &CommonContextParams) -> Result<ContextParam
 // ---------------------------------------------------------------------------
 
 /// Validates and parses the governance model string.
-fn parse_governance(governance: &str) -> Result<GovernanceModel, String> {
+fn parse_governance(
+    governance: &str,
+    params: &CommonContextParams,
+) -> Result<GovernanceModel, String> {
     match governance {
         "single_admin" | "" => Ok(GovernanceModel::SingleAdmin),
+        "threshold" => {
+            let threshold = params.governance_threshold.unwrap_or(1);
+            let signers = params.governance_signers.clone().unwrap_or_default();
+            if signers.is_empty() {
+                return Err("threshold governance requires at least one signer".into());
+            }
+            Ok(GovernanceModel::Threshold {
+                threshold,
+                signers: signers.into_iter().map(scp_primitives::DID::from).collect(),
+            })
+        }
+        "majority" => {
+            let voters = params.governance_voters.clone().unwrap_or_default();
+            if voters.is_empty() {
+                return Err("majority governance requires at least one eligible voter".into());
+            }
+            Ok(GovernanceModel::Majority {
+                eligible_voters: voters.into_iter().map(scp_primitives::DID::from).collect(),
+            })
+        }
+        "unanimity" => {
+            let voters = params.governance_voters.clone().unwrap_or_default();
+            if voters.is_empty() {
+                return Err("unanimity governance requires at least one eligible voter".into());
+            }
+            Ok(GovernanceModel::Unanimity {
+                eligible_voters: voters.into_iter().map(scp_primitives::DID::from).collect(),
+            })
+        }
         other => Err(format!(
             "unsupported governance model: {other:?} — \
-             only \"single_admin\" is currently supported"
+             expected \"single_admin\", \"threshold\", \"majority\", or \"unanimity\""
         )),
     }
 }

@@ -1586,6 +1586,9 @@ fn build_core_context_params(
             .collect(),
         tools: py_params.tools.clone(),
         template_id: py_params.template_id.clone(),
+        governance_threshold: None, // PyO3 bridge uses string-only governance for now
+        governance_signers: None,
+        governance_voters: None,
     };
 
     build_context_params(&common).map_err(PyRuntimeError::new_err)
