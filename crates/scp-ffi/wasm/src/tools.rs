@@ -6,6 +6,7 @@
 //! See ADR-034 in `.docs/adrs/phase-4.md` and issue #389.
 
 use js_sys::Promise;
+use scp_ffi_common::error_codes as codes;
 use wasm_bindgen::prelude::*;
 use wasm_bindgen_futures::future_to_promise;
 
@@ -69,8 +70,8 @@ fn validate_schema_field(
     field_name: &str,
 ) -> Result<serde_json::Value, ScpWasmError> {
     let code = match field_name {
-        "schema" => "SCP-VALID-7035",
-        _ => "SCP-VALID-7036",
+        "schema" => codes::VALID_7035,
+        _ => codes::VALID_7036,
     };
 
     let schema = def
@@ -120,7 +121,7 @@ fn validate_test_vectors(
 
     let arr = tv_val.as_array().ok_or_else(|| ScpWasmError::Validation {
         message: "testVectors must be an array".to_owned(),
-        code: "SCP-VALID-7037".to_owned(),
+        code: codes::VALID_7037.to_owned(),
     })?;
 
     arr.iter()
@@ -128,7 +129,7 @@ fn validate_test_vectors(
         .map(|(i, v)| {
             let input = v.get("input").ok_or_else(|| ScpWasmError::Validation {
                 message: format!("testVectors[{i}] missing required 'input' field"),
-                code: "SCP-VALID-7037".to_owned(),
+                code: codes::VALID_7037.to_owned(),
             })?;
             let expected_output =
                 v.get("expectedOutput")
@@ -136,7 +137,7 @@ fn validate_test_vectors(
                         message: format!(
                             "testVectors[{i}] missing required 'expectedOutput' field"
                         ),
-                        code: "SCP-VALID-7037".to_owned(),
+                        code: codes::VALID_7037.to_owned(),
                     })?;
             let description = match v.get("description") {
                 Some(d) => d
@@ -146,13 +147,13 @@ fn validate_test_vectors(
                             "testVectors[{i}] invalid 'description': expected a string, got {}",
                             json_value_type_name(d)
                         ),
-                        code: "SCP-VALID-7037".to_owned(),
+                        code: codes::VALID_7037.to_owned(),
                     })?
                     .to_owned(),
                 None => {
                     return Err(ScpWasmError::Validation {
                         message: format!("testVectors[{i}] missing required 'description' field"),
-                        code: "SCP-VALID-7037".to_owned(),
+                        code: codes::VALID_7037.to_owned(),
                     });
                 }
             };
@@ -183,7 +184,7 @@ fn parse_provenance_fields(def: &serde_json::Value) -> Result<ProvenanceFields, 
             let bytes = hex::decode(hex_str).map_err(|e| {
                 ScpWasmError::Validation {
                     message: format!("invalid 'implementationHash': invalid hex: {e}"),
-                    code: "SCP-VALID-7038".to_owned(),
+                    code: codes::VALID_7038.to_owned(),
                 }
                 .into_js()
             })?;
@@ -193,7 +194,7 @@ fn parse_provenance_fields(def: &serde_json::Value) -> Result<ProvenanceFields, 
                         "invalid 'implementationHash': must be exactly 32 bytes, got {}",
                         bytes.len()
                     ),
-                    code: "SCP-VALID-7038".to_owned(),
+                    code: codes::VALID_7038.to_owned(),
                 }
                 .into_js()
             })?
@@ -209,7 +210,7 @@ fn parse_provenance_fields(def: &serde_json::Value) -> Result<ProvenanceFields, 
                 .map_err(|e| {
                     ScpWasmError::Validation {
                         message: format!("invalid 'signature': invalid base64: {e}"),
-                        code: "SCP-VALID-7038".to_owned(),
+                        code: codes::VALID_7038.to_owned(),
                     }
                     .into_js()
                 })?
@@ -225,7 +226,7 @@ fn parse_provenance_fields(def: &serde_json::Value) -> Result<ProvenanceFields, 
                 .ok_or_else(|| {
                     ScpWasmError::Validation {
                         message: "invalid 'cost': missing or non-numeric 'amount'".to_owned(),
-                        code: "SCP-VALID-7038".to_owned(),
+                        code: codes::VALID_7038.to_owned(),
                     }
                     .into_js()
                 })?;
@@ -235,7 +236,7 @@ fn parse_provenance_fields(def: &serde_json::Value) -> Result<ProvenanceFields, 
                 .ok_or_else(|| {
                     ScpWasmError::Validation {
                         message: "invalid 'cost': missing or non-string 'currency'".to_owned(),
-                        code: "SCP-VALID-7038".to_owned(),
+                        code: codes::VALID_7038.to_owned(),
                     }
                     .into_js()
                 })?
@@ -246,7 +247,7 @@ fn parse_provenance_fields(def: &serde_json::Value) -> Result<ProvenanceFields, 
                 .ok_or_else(|| {
                     ScpWasmError::Validation {
                         message: "invalid 'cost': missing or non-string 'payee'".to_owned(),
-                        code: "SCP-VALID-7038".to_owned(),
+                        code: codes::VALID_7038.to_owned(),
                     }
                     .into_js()
                 })?
@@ -360,7 +361,7 @@ pub fn tool_register(context: &WasmContextHandle, definition_json: String) -> Pr
         let def: serde_json::Value = serde_json::from_str(&definition_json).map_err(|e| {
             ScpWasmError::Validation {
                 message: format!("definition_json is not valid JSON: {e}"),
-                code: "SCP-VALID-7000".to_owned(),
+                code: codes::VALID_7000.to_owned(),
             }
             .into_js()
         })?;
@@ -371,7 +372,7 @@ pub fn tool_register(context: &WasmContextHandle, definition_json: String) -> Pr
             .ok_or_else(|| {
                 ScpWasmError::Validation {
                     message: "definition_json missing required 'name' field".to_owned(),
-                    code: "SCP-VALID-7000".to_owned(),
+                    code: codes::VALID_7000.to_owned(),
                 }
                 .into_js()
             })?
@@ -388,7 +389,7 @@ pub fn tool_register(context: &WasmContextHandle, definition_json: String) -> Pr
                             "invalid 'description': expected a string, got {}",
                             json_value_type_name(v)
                         ),
-                        code: "SCP-VALID-7000".to_owned(),
+                        code: codes::VALID_7000.to_owned(),
                     }
                     .into_js()
                 })?
@@ -470,7 +471,7 @@ pub fn tool_invoke(
                     message: "WASM bridge cannot enforce tool payment for paid contexts. \
                               Use a native (Python/Node/Swift/Kotlin) client for paid tools."
                         .to_owned(),
-                    code: "SCP-ECON-12096".to_owned(),
+                    code: codes::ECON_12096.to_owned(),
                 }
                 .into_js()
                 .into())
@@ -483,7 +484,7 @@ pub fn tool_invoke(
                 message: "WASM bridge cannot validate spending UCANs for tool invocations. \
                           Use a native (Python/Node/Swift/Kotlin) client for paid tools."
                     .to_owned(),
-                code: "SCP-ECON-12096".to_owned(),
+                code: codes::ECON_12096.to_owned(),
             }
             .into_js()
             .into())
@@ -510,7 +511,7 @@ pub fn tool_invoke(
                     .map_err(|e| {
                     ScpWasmError::Permission {
                         message: format!("UCAN authorization failed for tool '{tool_id}': {e}"),
-                        code: "SCP-PERM-3000".to_owned(),
+                        code: codes::PERM_3000.to_owned(),
                     }
                     .into_js()
                 })?;
@@ -519,7 +520,7 @@ pub fn tool_invoke(
                 return Err(JsValue::from(
                     ScpWasmError::Validation {
                         message: "ucan_token is required for tool invocation".to_owned(),
-                        code: "SCP-VALID-7000".to_owned(),
+                        code: codes::VALID_7000.to_owned(),
                     }
                     .into_js(),
                 ));
@@ -529,7 +530,7 @@ pub fn tool_invoke(
         let parsed_input: serde_json::Value = serde_json::from_str(&input_json).map_err(|e| {
             ScpWasmError::Validation {
                 message: format!("input_json is not valid JSON: {e}"),
-                code: "SCP-VALID-7000".to_owned(),
+                code: codes::VALID_7000.to_owned(),
             }
             .into_js()
         })?;
@@ -542,7 +543,7 @@ pub fn tool_invoke(
         let json_str = serde_json::to_string(&result).map_err(|e| {
             ScpWasmError::Tool {
                 message: format!("failed to serialize tool output: {e}"),
-                code: "SCP-TOOL-6002".to_owned(),
+                code: codes::TOOL_6002.to_owned(),
             }
             .into_js()
         })?;
@@ -568,7 +569,7 @@ pub fn tool_verify(context: &WasmContextHandle, tool_id: String) -> Promise {
         let failures_json = serde_json::to_string(&failures).map_err(|e| {
             ScpWasmError::Tool {
                 message: format!("failed to serialize verification failures: {e}"),
-                code: "SCP-TOOL-6003".to_owned(),
+                code: codes::TOOL_6003.to_owned(),
             }
             .into_js()
         })?;
@@ -611,7 +612,7 @@ pub fn tool_invoke_cross_context(
         if ucan_token.is_empty() {
             return Err(ScpWasmError::Validation {
                 message: "ucan_token is required for cross-context tool invocation".to_owned(),
-                code: "SCP-VALID-7000".to_owned(),
+                code: codes::VALID_7000.to_owned(),
             }
             .into_js()
             .into());
@@ -622,7 +623,7 @@ pub fn tool_invoke_cross_context(
                     message: format!(
                         "UCAN authorization failed for cross-context tool '{tool_id}': {e}"
                     ),
-                    code: "SCP-PERM-3000".to_owned(),
+                    code: codes::PERM_3000.to_owned(),
                 }
                 .into_js()
             })?;
@@ -630,7 +631,7 @@ pub fn tool_invoke_cross_context(
         let input: serde_json::Value = serde_json::from_str(&input_json).map_err(|e| {
             ScpWasmError::Validation {
                 message: format!("input_json is not valid JSON: {e}"),
-                code: "SCP-VALID-7000".to_owned(),
+                code: codes::VALID_7000.to_owned(),
             }
             .into_js()
         })?;
@@ -650,7 +651,7 @@ pub fn tool_invoke_cross_context(
         let json_str = serde_json::to_string(&result).map_err(|e| {
             ScpWasmError::Tool {
                 message: format!("failed to serialize cross-context output: {e}"),
-                code: "SCP-TOOL-6013".to_owned(),
+                code: codes::TOOL_6013.to_owned(),
             }
             .into_js()
         })?;
@@ -715,7 +716,7 @@ pub fn tool_session_invoke(
         if ucan_token.is_empty() {
             return Err(ScpWasmError::Validation {
                 message: "ucan_token is required for session tool invocation".to_owned(),
-                code: "SCP-VALID-7000".to_owned(),
+                code: codes::VALID_7000.to_owned(),
             }
             .into_js()
             .into());
@@ -733,7 +734,7 @@ pub fn tool_session_invoke(
         .map_err(|e| {
             ScpWasmError::Permission {
                 message: format!("UCAN authorization failed for tool '{tool_id_for_ucan}': {e}",),
-                code: "SCP-PERM-3000".to_owned(),
+                code: codes::PERM_3000.to_owned(),
             }
             .into_js()
         })?;
@@ -741,7 +742,7 @@ pub fn tool_session_invoke(
         let input: serde_json::Value = serde_json::from_str(&input_json).map_err(|e| {
             ScpWasmError::Validation {
                 message: format!("input_json is not valid JSON: {e}"),
-                code: "SCP-VALID-7000".to_owned(),
+                code: codes::VALID_7000.to_owned(),
             }
             .into_js()
         })?;
@@ -753,7 +754,7 @@ pub fn tool_session_invoke(
         let json_str = serde_json::to_string(&result).map_err(|e| {
             ScpWasmError::Tool {
                 message: format!("failed to serialize session invoke output: {e}"),
-                code: "SCP-TOOL-6020".to_owned(),
+                code: codes::TOOL_6020.to_owned(),
             }
             .into_js()
         })?;
@@ -812,7 +813,7 @@ pub fn tool_interface_expose(
             mgr.context_creator(&context_id)
                 .ok_or_else(|| ScpWasmError::Context {
                     message: format!("context '{context_id}' not found"),
-                    code: "SCP-CTX-2000".to_owned(),
+                    code: codes::CTX_2000.to_owned(),
                 })
         })
         .map_err(ScpWasmError::into_js)?;
@@ -828,7 +829,7 @@ pub fn tool_interface_expose(
                         "tool interface expose requires admin role — '{admin_did}' \
                          is not an admin of context '{context_id}'"
                     ),
-                    code: "SCP-PERM-3001".to_owned(),
+                    code: codes::PERM_3001.to_owned(),
                 }
                 .into_js()
                 .into());
@@ -841,7 +842,7 @@ pub fn tool_interface_expose(
         if !exists {
             return Err(ScpWasmError::Tool {
                 message: format!("tool '{tool_id}' not found in context '{context_id}'"),
-                code: "SCP-TOOL-6030".to_owned(),
+                code: codes::TOOL_6030.to_owned(),
             }
             .into_js()
             .into());
@@ -853,7 +854,7 @@ pub fn tool_interface_expose(
                 let parsed = parse_rate_limit_json(json).map_err(|e| {
                     ScpWasmError::Validation {
                         message: e,
-                        code: "SCP-VALID-7040".to_owned(),
+                        code: codes::VALID_7040.to_owned(),
                     }
                     .into_js()
                 })?;
@@ -888,7 +889,7 @@ pub fn tool_interface_expose(
         let json_str = serde_json::to_string(&interface).map_err(|e| {
             ScpWasmError::Tool {
                 message: format!("failed to serialize ToolInterface: {e}"),
-                code: "SCP-TOOL-6031".to_owned(),
+                code: codes::TOOL_6031.to_owned(),
             }
             .into_js()
         })?;
@@ -921,7 +922,7 @@ pub fn tool_interface_accept(context: &WasmContextHandle, interface_json: String
             mgr.context_creator(&context_id)
                 .ok_or_else(|| ScpWasmError::Context {
                     message: format!("context '{context_id}' not found"),
-                    code: "SCP-CTX-2000".to_owned(),
+                    code: codes::CTX_2000.to_owned(),
                 })
         })
         .map_err(ScpWasmError::into_js)?;
@@ -937,7 +938,7 @@ pub fn tool_interface_accept(context: &WasmContextHandle, interface_json: String
                         "tool interface accept requires admin role — '{admin_did}' \
                          is not an admin of context '{context_id}'"
                     ),
-                    code: "SCP-PERM-3001".to_owned(),
+                    code: codes::PERM_3001.to_owned(),
                 }
                 .into_js()
                 .into());
@@ -948,7 +949,7 @@ pub fn tool_interface_accept(context: &WasmContextHandle, interface_json: String
             serde_json::from_str(&interface_json).map_err(|e| {
                 ScpWasmError::Validation {
                     message: format!("invalid interface_json: {e}"),
-                    code: "SCP-VALID-7041".to_owned(),
+                    code: codes::VALID_7041.to_owned(),
                 }
                 .into_js()
             })?;
@@ -965,7 +966,7 @@ pub fn tool_interface_accept(context: &WasmContextHandle, interface_json: String
                     "interface target_context '{target}' does not match \
                      accepting context '{context_id}'"
                 ),
-                code: "SCP-TOOL-6032".to_owned(),
+                code: codes::TOOL_6032.to_owned(),
             }
             .into_js()
             .into());
@@ -985,7 +986,7 @@ pub fn tool_interface_accept(context: &WasmContextHandle, interface_json: String
         let json_str = serde_json::to_string(&interface).map_err(|e| {
             ScpWasmError::Tool {
                 message: format!("failed to serialize ToolInterface: {e}"),
-                code: "SCP-TOOL-6033".to_owned(),
+                code: codes::TOOL_6033.to_owned(),
             }
             .into_js()
         })?;
@@ -1008,7 +1009,7 @@ pub fn tool_interface_revoke(context: &WasmContextHandle, interface_id_hex: Stri
         let interface_id_bytes = hex::decode(&interface_id_hex).map_err(|e| {
             ScpWasmError::Validation {
                 message: format!("invalid interface_id_hex: not valid hex: {e}"),
-                code: "SCP-VALID-7042".to_owned(),
+                code: codes::VALID_7042.to_owned(),
             }
             .into_js()
         })?;
@@ -1018,7 +1019,7 @@ pub fn tool_interface_revoke(context: &WasmContextHandle, interface_id_hex: Stri
                     "interface_id_hex must be exactly 32 bytes (64 hex chars), got {}",
                     interface_id_bytes.len()
                 ),
-                code: "SCP-VALID-7042".to_owned(),
+                code: codes::VALID_7042.to_owned(),
             }
             .into_js()
             .into());
@@ -1038,7 +1039,7 @@ pub fn tool_interface_revoke(context: &WasmContextHandle, interface_id_hex: Stri
         let json_str = serde_json::to_string(&event).map_err(|e| {
             ScpWasmError::Tool {
                 message: format!("failed to serialize InterfaceRevoked: {e}"),
-                code: "SCP-TOOL-6035".to_owned(),
+                code: codes::TOOL_6035.to_owned(),
             }
             .into_js()
         })?;
@@ -1058,6 +1059,7 @@ pub fn tool_interface_revoke(context: &WasmContextHandle, interface_id_hex: Stri
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+    use scp_ffi_common::error_codes as codes;
 
     // -----------------------------------------------------------------------
     // validate_schema_field — missing field (input schema)
@@ -1072,7 +1074,7 @@ mod tests {
         let err = validate_schema_field(&def, "schema").unwrap_err();
         let msg = err.to_string();
         assert!(
-            msg.contains("SCP-VALID-7035"),
+            msg.contains(codes::VALID_7035),
             "error should contain SCP-VALID-7035, got: {msg}"
         );
         assert!(
@@ -1095,7 +1097,7 @@ mod tests {
         let err = validate_schema_field(&def, "schema").unwrap_err();
         let msg = err.to_string();
         assert!(
-            msg.contains("SCP-VALID-7035"),
+            msg.contains(codes::VALID_7035),
             "error should contain SCP-VALID-7035, got: {msg}"
         );
         assert!(
@@ -1118,7 +1120,7 @@ mod tests {
         let err = validate_schema_field(&def, "schema").unwrap_err();
         let msg = err.to_string();
         assert!(
-            msg.contains("SCP-VALID-7035"),
+            msg.contains(codes::VALID_7035),
             "error should contain SCP-VALID-7035, got: {msg}"
         );
     }
@@ -1154,7 +1156,7 @@ mod tests {
         let err = validate_schema_field(&def, "outputSchema").unwrap_err();
         let msg = err.to_string();
         assert!(
-            msg.contains("SCP-VALID-7036"),
+            msg.contains(codes::VALID_7036),
             "error should contain SCP-VALID-7036, got: {msg}"
         );
         assert!(
@@ -1177,7 +1179,7 @@ mod tests {
         let err = validate_schema_field(&def, "outputSchema").unwrap_err();
         let msg = err.to_string();
         assert!(
-            msg.contains("SCP-VALID-7036"),
+            msg.contains(codes::VALID_7036),
             "error should contain SCP-VALID-7036, got: {msg}"
         );
         assert!(
@@ -1200,7 +1202,7 @@ mod tests {
         let err = validate_schema_field(&def, "outputSchema").unwrap_err();
         let msg = err.to_string();
         assert!(
-            msg.contains("SCP-VALID-7036"),
+            msg.contains(codes::VALID_7036),
             "error should contain SCP-VALID-7036, got: {msg}"
         );
     }
@@ -1262,7 +1264,7 @@ mod tests {
         assert!(
             matches!(
                 result,
-                Err(ScpWasmError::Validation { ref code, .. }) if code == "SCP-VALID-7037"
+                Err(ScpWasmError::Validation { ref code, .. }) if code == codes::VALID_7037
             ),
             "expected SCP-VALID-7037, got: {result:?}"
         );
@@ -1283,7 +1285,7 @@ mod tests {
             matches!(
                 result,
                 Err(ScpWasmError::Validation { ref code, ref message, .. })
-                    if code == "SCP-VALID-7037" && message.contains("'input'")
+                    if code == codes::VALID_7037 && message.contains("'input'")
             ),
             "expected SCP-VALID-7037 mentioning 'input', got: {result:?}"
         );
@@ -1304,7 +1306,7 @@ mod tests {
             matches!(
                 result,
                 Err(ScpWasmError::Validation { ref code, ref message, .. })
-                    if code == "SCP-VALID-7037" && message.contains("'expectedOutput'")
+                    if code == codes::VALID_7037 && message.contains("'expectedOutput'")
             ),
             "expected SCP-VALID-7037 mentioning 'expectedOutput', got: {result:?}"
         );
@@ -1325,7 +1327,7 @@ mod tests {
             matches!(
                 result,
                 Err(ScpWasmError::Validation { ref code, ref message, .. })
-                    if code == "SCP-VALID-7037" && message.contains("'description'")
+                    if code == codes::VALID_7037 && message.contains("'description'")
             ),
             "expected SCP-VALID-7037 mentioning 'description', got: {result:?}"
         );
@@ -1347,7 +1349,7 @@ mod tests {
             matches!(
                 result,
                 Err(ScpWasmError::Validation { ref code, ref message, .. })
-                    if code == "SCP-VALID-7037"
+                    if code == codes::VALID_7037
                         && message.contains("'description'")
                         && message.contains("number")
             ),
@@ -1371,7 +1373,7 @@ mod tests {
             matches!(
                 result,
                 Err(ScpWasmError::Validation { ref code, ref message, .. })
-                    if code == "SCP-VALID-7037"
+                    if code == codes::VALID_7037
                         && message.contains("'description'")
                         && message.contains("boolean")
             ),

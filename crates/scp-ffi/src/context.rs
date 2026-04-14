@@ -1556,159 +1556,42 @@ fn py_context_receive(handle: &PyContextHandle) -> PyResult<PyMessageReceiver> {
 
 /// Builds scp-core [`ContextParams`] from a [`PyContextParams`].
 ///
-/// Converts the flat FFI-facing parameter representation into the typed
-/// scp-core parameter struct used by [`ContextManager::create_context`].
-#[allow(clippy::too_many_lines)] // 1:1 field mapping — splitting would reduce readability
+/// Delegates to the shared [`scp_ffi_common::context_params::build_context_params`]
+/// builder, which centralizes all parameter parsing and validation logic
+/// across the three non-WASM bridges (#1447).
 fn build_core_context_params(
     py_params: &PyContextParams,
 ) -> PyResult<scp_core::context::ContextParams> {
-    use scp_core::context::params::{
-        CeilingPolicy, ContextMode, GovernanceModel, MemoryScope, PromotionPolicy,
-    };
+    use scp_ffi_common::context_params::{CommonContextParams, build_context_params};
 
-    let mode = match py_params.mode.as_str() {
-        "broadcast" => ContextMode::Broadcast,
-        _ => ContextMode::Encrypted,
-    };
-
-    let ceiling_policy = match py_params.ceiling_policy.as_str() {
-        "governed" => CeilingPolicy::Governed,
-        _ => CeilingPolicy::Immutable,
-    };
-
-    let promotion_policy = match py_params.promotion_policy.as_str() {
-        "promotable" => PromotionPolicy::Promotable,
-        _ => PromotionPolicy::NoPromotion,
-    };
-
-    let memory_scope = match py_params.memory_scope.as_str() {
-        "summary" => MemoryScope::Summary,
-        "full" => MemoryScope::Full,
-        _ => MemoryScope::Ephemeral,
-    };
-
-    // Currently only SingleAdmin is supported; governance string was already validated.
-    let _ = py_params.governance.as_str();
-    let governance_model = GovernanceModel::SingleAdmin;
-
-    let template_id = py_params
-        .template_id
-        .as_deref()
-        .and_then(|tid| parse_template_id(tid).ok());
-
-    let ceiling: Vec<scp_core::context::roles::Capability> = py_params
-        .ceiling
-        .iter()
-        .map(scp_core::context::roles::Capability::new)
-        .collect();
-
-    let roles = py_params
-        .roles
-        .keys()
-        .map(|name| scp_core::context::params::RoleDefinition {
-            name: name.clone(),
-            capabilities: HashSet::new(),
-        })
-        .collect();
-
-    let tools = py_params
-        .tools
-        .iter()
-        .map(|name| scp_core::context::params::ToolRegistration {
-            tool_id: name.clone(),
-            name: name.clone(),
-            description: String::new(),
-            schema: scp_core::context::tools::ToolSchema {
-                input_schema: serde_json::Value::Object(serde_json::Map::default()),
-                output_schema: serde_json::Value::Object(serde_json::Map::default()),
-            },
-            implementation_hash: [0u8; 32],
-            test_vectors: vec![],
-            operator_did: scp_identity::DID("did:key:placeholder".to_owned()),
-            cost: None,
-            registered_at: 0,
-            signature: Vec::new(),
-        })
-        .collect();
-
-    let ttl = py_params.ttl.map(std::time::Duration::from_secs_f64);
-
-    Ok(scp_core::context::ContextParams {
-        mode,
-        ceiling,
-        ceiling_policy,
-        promotion_policy,
-        roles,
-        tools,
-        ttl,
-        memory_scope,
-        governance: governance_model,
-        template_id,
-        economic_policy: py_params
-            .economic_policy
-            .as_deref()
-            .map(|ep_json| {
-                serde_json::from_str(ep_json).map_err(|e| {
-                    PyRuntimeError::new_err(format!("invalid economic_policy JSON: {e}"))
-                })
-            })
-            .transpose()?,
-        metadata_visibility: scp_core::context::params::MetadataVisibilityPolicy::default(),
-        projection_policy: None,
-        discoverable: false,
+    let common = CommonContextParams {
+        mode: py_params.mode.clone(),
+        ceiling: py_params.ceiling.clone(),
+        ceiling_policy: py_params.ceiling_policy.clone(),
+        promotion_policy: py_params.promotion_policy.clone(),
+        memory_scope: py_params.memory_scope.clone(),
+        governance: py_params.governance.clone(),
+        ttl: py_params.ttl.map(std::time::Duration::from_secs_f64),
+        min_protocol_version: py_params.min_protocol_version,
         max_chain_depth: py_params.max_chain_depth,
         max_nesting_depth: py_params.max_nesting_depth,
         session_cap: py_params.session_cap,
-        counterparty_policy: scp_core::provenance::CounterpartyPolicy::default(),
-        participation_requirements: Vec::new(),
-        incomplete_verification_policy:
-            scp_core::context::params::IncompleteVerificationPolicy::default(),
-        min_protocol_version: py_params.min_protocol_version,
-        migration_source: None,
-        consequence_rules: {
-            let parsed_consequence_rules: Vec<scp_core::trust::ConsequenceRule> = py_params
-                .consequence_rules
-                .as_deref()
-                .map(|cr_json| {
-                    serde_json::from_str(cr_json).map_err(|e| {
-                        PyRuntimeError::new_err(format!("invalid consequence_rules JSON: {e}"))
-                    })
-                })
-                .transpose()?
-                .unwrap_or_default();
-            // Parse the per-context consequence config so RevokeAccess gating
-            // is enforced before the core constructs the context. The parsed
-            // value is consumed below in `consequence_config:` — re-parse for
-            // local validation here. Doing both reads is cheap (small JSON).
-            let local_config: scp_core::context::params::ConsequenceConfig = py_params
-                .consequence_config
-                .as_deref()
-                .map(|cc_json| {
-                    serde_json::from_str(cc_json).map_err(|e| {
-                        PyRuntimeError::new_err(format!("invalid consequence_config JSON: {e}"))
-                    })
-                })
-                .transpose()?
-                .unwrap_or_default();
-            for rule in &parsed_consequence_rules {
-                rule.validate_against_config(&local_config).map_err(|e| {
-                    PyRuntimeError::new_err(format!("consequence_rules validation failed: {e}"))
-                })?;
-            }
-            parsed_consequence_rules
-        },
-        consequence_config: py_params
-            .consequence_config
-            .as_deref()
-            .map(|cc_json| {
-                serde_json::from_str(cc_json).map_err(|e| {
-                    PyRuntimeError::new_err(format!("invalid consequence_config JSON: {e}"))
-                })
-            })
-            .transpose()?
-            .unwrap_or_default(),
-        sybil_policy: None,
-    })
+        economic_policy_json: py_params.economic_policy.clone(),
+        consequence_rules_json: py_params.consequence_rules.clone(),
+        consequence_config_json: py_params.consequence_config.clone(),
+        roles: py_params
+            .roles
+            .iter()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect(),
+        tools: py_params.tools.clone(),
+        template_id: py_params.template_id.clone(),
+        governance_threshold: None, // PyO3 bridge uses string-only governance for now
+        governance_signers: None,
+        governance_voters: None,
+    };
+
+    build_context_params(&common).map_err(PyRuntimeError::new_err)
 }
 
 // ---------------------------------------------------------------------------

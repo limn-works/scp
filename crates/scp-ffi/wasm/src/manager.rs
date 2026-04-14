@@ -25,6 +25,7 @@
 //!
 //! See ADR-034 in `.docs/adrs/phase-4.md` for the full rationale.
 
+use scp_ffi_common::error_codes as codes;
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet, VecDeque};
 
@@ -130,7 +131,7 @@ const SCP_PROTOCOL_VERSION: u16 = 0x0100;
 ///
 /// SDK consumers should switch to a native (Python / Node.js / Swift /
 /// Kotlin) bridge for any context with non-free economic policy.
-pub const SCP_ECON_PAID_POLICY_UNSUPPORTED_ON_WASM: &str = "SCP-ECON-12095";
+pub const SCP_ECON_PAID_POLICY_UNSUPPORTED_ON_WASM: &str = codes::ECON_12095;
 
 /// Stable error code rejecting `join_context` / `send_message` against a
 /// paid context from the WASM bridge.
@@ -141,7 +142,7 @@ pub const SCP_ECON_PAID_POLICY_UNSUPPORTED_ON_WASM: &str = "SCP-ECON-12095";
 /// see ADR-034 and `crates/scp-ffi/wasm/CLAUDE.md`). Accepting it would be a
 /// security lie: the SDK would tell callers their spend was authorized when
 /// it was never validated. We reject instead.
-pub const SCP_ECON_WASM_CANNOT_VALIDATE_SPENDING_UCAN: &str = "SCP-ECON-12096";
+pub const SCP_ECON_WASM_CANNOT_VALIDATE_SPENDING_UCAN: &str = codes::ECON_12096;
 
 /// Returns `true` when the JSON-serialized economic policy stored in
 /// `PerContextState::economic_policy` requires payment for any action.
@@ -758,7 +759,7 @@ fn validate_imported_string(
     if value.is_empty() {
         return Err(ScpWasmError::Context {
             message: format!("{field_name} must not be empty"),
-            code: "SCP-CTX-2032".to_owned(),
+            code: codes::CTX_2032.to_owned(),
         });
     }
     if value.len() > max_len {
@@ -767,13 +768,13 @@ fn validate_imported_string(
                 "{field_name} exceeds maximum length ({} > {max_len})",
                 value.len()
             ),
-            code: "SCP-CTX-2032".to_owned(),
+            code: codes::CTX_2032.to_owned(),
         });
     }
     if value.chars().any(char::is_control) {
         return Err(ScpWasmError::Context {
             message: format!("{field_name} contains control characters"),
-            code: "SCP-CTX-2032".to_owned(),
+            code: codes::CTX_2032.to_owned(),
         });
     }
     Ok(())
@@ -785,14 +786,14 @@ fn validate_imported_did(value: &str, field_name: &str) -> Result<(), ScpWasmErr
     if !value.starts_with("did:") {
         return Err(ScpWasmError::Context {
             message: format!("{field_name} must start with 'did:': got '{value}'"),
-            code: "SCP-CTX-2032".to_owned(),
+            code: codes::CTX_2032.to_owned(),
         });
     }
     // Must have at least did:method:id (3 colon-separated parts)
     if value.splitn(4, ':').count() < 3 {
         return Err(ScpWasmError::Context {
             message: format!("{field_name} must have format 'did:method:id': got '{value}'"),
-            code: "SCP-CTX-2032".to_owned(),
+            code: codes::CTX_2032.to_owned(),
         });
     }
     Ok(())
@@ -815,7 +816,7 @@ fn validate_imported_antispam_state(snap: &WasmContextExportSnapshot) -> Result<
                 "snapshot contains {} nonces, exceeds cap {WASM_NONCE_CAP}",
                 snap.seen_nonces_v3.len()
             ),
-            code: "SCP-CTX-2032".to_owned(),
+            code: codes::CTX_2032.to_owned(),
         });
     }
     if snap.seen_nonces_legacy_v2.len() > WASM_NONCE_CAP {
@@ -824,7 +825,7 @@ fn validate_imported_antispam_state(snap: &WasmContextExportSnapshot) -> Result<
                 "snapshot contains {} legacy nonces, exceeds cap {WASM_NONCE_CAP}",
                 snap.seen_nonces_legacy_v2.len()
             ),
-            code: "SCP-CTX-2032".to_owned(),
+            code: codes::CTX_2032.to_owned(),
         });
     }
     if snap.executed_proposals.len() > WASM_PROPOSAL_CAP {
@@ -833,7 +834,7 @@ fn validate_imported_antispam_state(snap: &WasmContextExportSnapshot) -> Result<
                 "snapshot contains {} executed proposals, exceeds cap {WASM_PROPOSAL_CAP}",
                 snap.executed_proposals.len()
             ),
-            code: "SCP-CTX-2032".to_owned(),
+            code: codes::CTX_2032.to_owned(),
         });
     }
     if snap.resolved_proposals_json.len() > WASM_RESOLVED_PROPOSAL_CAP {
@@ -842,7 +843,7 @@ fn validate_imported_antispam_state(snap: &WasmContextExportSnapshot) -> Result<
                 "snapshot contains {} resolved proposals, exceeds cap {WASM_RESOLVED_PROPOSAL_CAP}",
                 snap.resolved_proposals_json.len()
             ),
-            code: "SCP-CTX-2032".to_owned(),
+            code: codes::CTX_2032.to_owned(),
         });
     }
 
@@ -862,7 +863,7 @@ fn validate_imported_antispam_state(snap: &WasmContextExportSnapshot) -> Result<
                     "nonce '{}' has invalid inserted_at_ms={}",
                     entry.nonce, entry.inserted_at_ms
                 ),
-                code: "SCP-CTX-2032".to_owned(),
+                code: codes::CTX_2032.to_owned(),
             });
         }
     }
@@ -875,7 +876,7 @@ fn validate_imported_antispam_state(snap: &WasmContextExportSnapshot) -> Result<
                     "executed proposal '{}' has invalid executed_at_ms={}",
                     entry.proposal_id, entry.executed_at_ms
                 ),
-                code: "SCP-CTX-2032".to_owned(),
+                code: codes::CTX_2032.to_owned(),
             });
         }
     }
@@ -898,7 +899,7 @@ fn validate_imported_antispam_state(snap: &WasmContextExportSnapshot) -> Result<
         rule.validate_against_config(&import_config)
             .map_err(|e| ScpWasmError::Context {
                 message: format!("imported consequence_rules[{idx}] invalid: {e}"),
-                code: "SCP-CTX-2032".to_owned(),
+                code: codes::CTX_2032.to_owned(),
             })?;
     }
 
@@ -912,7 +913,7 @@ fn validate_imported_antispam_state(snap: &WasmContextExportSnapshot) -> Result<
                     "cooldown_until contains rule_index={rule_index} but only {} rules are declared",
                     snap.consequence_rules.len()
                 ),
-                code: "SCP-CTX-2032".to_owned(),
+                code: codes::CTX_2032.to_owned(),
             });
         }
     }
@@ -942,7 +943,7 @@ fn parse_and_check_min_protocol_version(params: &serde_json::Value) -> Result<()
                 "malformed minProtocolVersion: expected [major, minor] array with at \
                  least 2 elements, got {min_ver:?}"
             ),
-            code: "SCP-CTX-2015".to_owned(),
+            code: codes::CTX_2015.to_owned(),
         });
     }
     let raw_major = min_ver
@@ -953,13 +954,13 @@ fn parse_and_check_min_protocol_version(params: &serde_json::Value) -> Result<()
                 "malformed minProtocolVersion: major version is not a number: {:?}",
                 min_ver.first()
             ),
-            code: "SCP-CTX-2015".to_owned(),
+            code: codes::CTX_2015.to_owned(),
         })?;
     let req_major = u8::try_from(raw_major).map_err(|_| ScpWasmError::Context {
         message: format!(
             "malformed minProtocolVersion: major version {raw_major} exceeds u8 range"
         ),
-        code: "SCP-CTX-2015".to_owned(),
+        code: codes::CTX_2015.to_owned(),
     })?;
     let raw_minor = min_ver
         .get(1)
@@ -969,13 +970,13 @@ fn parse_and_check_min_protocol_version(params: &serde_json::Value) -> Result<()
                 "malformed minProtocolVersion: minor version is not a number: {:?}",
                 min_ver.get(1)
             ),
-            code: "SCP-CTX-2015".to_owned(),
+            code: codes::CTX_2015.to_owned(),
         })?;
     let req_minor = u8::try_from(raw_minor).map_err(|_| ScpWasmError::Context {
         message: format!(
             "malformed minProtocolVersion: minor version {raw_minor} exceeds u8 range"
         ),
-        code: "SCP-CTX-2015".to_owned(),
+        code: codes::CTX_2015.to_owned(),
     })?;
     let sdk_major = (SCP_PROTOCOL_VERSION >> 8) as u8;
     let sdk_minor = (SCP_PROTOCOL_VERSION & 0xFF) as u8;
@@ -989,7 +990,7 @@ fn parse_and_check_min_protocol_version(params: &serde_json::Value) -> Result<()
                 "protocol version incompatible: context requires {req_major}.{req_minor}, \
                  SDK supports {sdk_major}.{sdk_minor}"
             ),
-            code: "SCP-CTX-2016".to_owned(),
+            code: codes::CTX_2016.to_owned(),
         });
     }
     Ok(())
@@ -1151,7 +1152,7 @@ impl WasmContextManager {
             .get(context_id)
             .ok_or_else(|| ScpWasmError::Context {
                 message: format!("context '{context_id}' not found"),
-                code: "SCP-CTX-2000".to_owned(),
+                code: codes::CTX_2000.to_owned(),
             })?;
         Ok(stored_policy_requires_payment(
             ctx.economic_policy.as_deref(),
@@ -1178,7 +1179,7 @@ impl WasmContextManager {
         if self.contexts.contains_key(context_id) {
             return Err(ScpWasmError::Context {
                 message: format!("context '{context_id}' is already registered"),
-                code: "SCP-CTX-2000".to_owned(),
+                code: codes::CTX_2000.to_owned(),
             });
         }
 
@@ -1238,7 +1239,7 @@ impl WasmContextManager {
             if let Some(rules_val) = params.get("consequenceRules") {
                 serde_json::from_value(rules_val.clone()).map_err(|e| ScpWasmError::Validation {
                     message: format!("invalid consequence_rules: {e}"),
-                    code: "SCP-VALID-7000".to_owned(),
+                    code: codes::VALID_7000.to_owned(),
                 })?
             } else {
                 Vec::new()
@@ -1252,7 +1253,7 @@ impl WasmContextManager {
             rule.validate_against_config(&consequence_config)
                 .map_err(|e| ScpWasmError::Validation {
                     message: format!("consequence rule validation failed: {e}"),
-                    code: "SCP-VALID-7000".to_owned(),
+                    code: codes::VALID_7000.to_owned(),
                 })?;
         }
 
@@ -1268,14 +1269,14 @@ impl WasmContextManager {
                 BroadcastContext::new(context_id.to_owned(), &ContextMode::Broadcast, admission)
                     .map_err(|e| ScpWasmError::Context {
                         message: format!("broadcast context creation failed: {e}"),
-                        code: "SCP-CTX-2001".to_owned(),
+                        code: codes::CTX_2001.to_owned(),
                     })?;
             // Register creator as initial author.
             let _ = bc
                 .add_author(creator_did)
                 .map_err(|e| ScpWasmError::Context {
                     message: format!("failed to add creator as author: {e}"),
-                    code: "SCP-CTX-2001".to_owned(),
+                    code: codes::CTX_2001.to_owned(),
                 })?;
             Some(bc)
         } else {
@@ -1288,7 +1289,7 @@ impl WasmContextManager {
                 crate::crypto::WasmCryptoState::new_for_context(creator_did).map_err(|e| {
                     ScpWasmError::Crypto {
                         message: format!("MLS group creation failed: {e}"),
-                        code: "SCP-CRYPTO-4004".to_owned(),
+                        code: codes::CRYPTO_4004.to_owned(),
                     }
                 })?,
             )
@@ -1408,7 +1409,7 @@ impl WasmContextManager {
         if ctx.members.contains_key(member_did) {
             return Err(ScpWasmError::Context {
                 message: format!("member '{member_did}' already joined context '{context_id}'"),
-                code: "SCP-CTX-2013".to_owned(),
+                code: codes::CTX_2013.to_owned(),
             });
         }
 
@@ -1446,7 +1447,7 @@ impl WasmContextManager {
         if ctx.members.remove(member_did).is_none() {
             return Err(ScpWasmError::Context {
                 message: format!("member '{member_did}' not found in context '{context_id}'"),
-                code: "SCP-CTX-2015".to_owned(),
+                code: codes::CTX_2015.to_owned(),
             });
         }
 
@@ -1533,7 +1534,7 @@ impl WasmContextManager {
         {
             return Err(ScpWasmError::Permission {
                 message: format!("write access has been suspended for {sender_did}"),
-                code: "SCP-PERM-3000".to_owned(),
+                code: codes::PERM_3000.to_owned(),
             });
         }
 
@@ -1543,7 +1544,7 @@ impl WasmContextManager {
             .get_mut(sender_did)
             .ok_or_else(|| ScpWasmError::Context {
                 message: format!("sender '{sender_did}' is not a member of context '{context_id}'"),
-                code: "SCP-CTX-2019".to_owned(),
+                code: codes::CTX_2019.to_owned(),
             })?;
 
         let seq = member.sequence_number;
@@ -1555,19 +1556,19 @@ impl WasmContextManager {
                 .decode(payload_base64)
                 .map_err(|e| ScpWasmError::Crypto {
                     message: format!("invalid base64 payload: {e}"),
-                    code: "SCP-CRYPTO-4001".to_owned(),
+                    code: codes::CRYPTO_4001.to_owned(),
                 })?;
 
             let epoch = crypto.mls_group.epoch().map_err(|e| ScpWasmError::Crypto {
                 message: format!("failed to read MLS epoch: {e}"),
-                code: "SCP-CRYPTO-4002".to_owned(),
+                code: codes::CRYPTO_4002.to_owned(),
             })?;
 
             let ciphertext = crypto
                 .encrypt_message(&raw_bytes, context_id, sender_did, epoch, seq)
                 .map_err(|e| ScpWasmError::Crypto {
                     message: format!("encryption failed: {e}"),
-                    code: "SCP-CRYPTO-4003".to_owned(),
+                    code: codes::CRYPTO_4003.to_owned(),
                 })?;
 
             base64::engine::general_purpose::STANDARD.encode(&ciphertext)
@@ -1619,7 +1620,7 @@ impl WasmContextManager {
         if !ctx.member_has_capability(initiator_did, "context:close") {
             return Err(ScpWasmError::Permission {
                 message: format!("member {initiator_did} does not have context:close capability"),
-                code: "SCP-PERM-3000".to_owned(),
+                code: codes::PERM_3000.to_owned(),
             });
         }
 
@@ -1661,21 +1662,21 @@ impl WasmContextManager {
 
         let crypto = ctx.crypto.as_mut().ok_or_else(|| ScpWasmError::Crypto {
             message: "context has no MLS encryption state".to_string(),
-            code: "SCP-CRYPTO-4010".to_owned(),
+            code: codes::CRYPTO_4010.to_owned(),
         })?;
 
         let ciphertext = base64::engine::general_purpose::STANDARD
             .decode(ciphertext_base64)
             .map_err(|e| ScpWasmError::Crypto {
                 message: format!("invalid base64 ciphertext: {e}"),
-                code: "SCP-CRYPTO-4001".to_owned(),
+                code: codes::CRYPTO_4001.to_owned(),
             })?;
 
         crypto
             .decrypt_message(&ciphertext, context_id, sender_did, epoch, sequence)
             .map_err(|e| ScpWasmError::Crypto {
                 message: format!("decryption failed: {e}"),
-                code: "SCP-CRYPTO-4011".to_owned(),
+                code: codes::CRYPTO_4011.to_owned(),
             })
     }
 
@@ -1700,14 +1701,14 @@ impl WasmContextManager {
         )
         .map_err(|e| ScpWasmError::Crypto {
             message: format!("credential creation failed: {e}"),
-            code: "SCP-CRYPTO-4020".to_owned(),
+            code: codes::CRYPTO_4020.to_owned(),
         })?;
 
         let (kp_bytes, holder) =
             crate::crypto::group::WasmMlsGroup::generate_key_package(&credential).map_err(|e| {
                 ScpWasmError::Crypto {
                     message: format!("key package generation failed: {e}"),
-                    code: "SCP-CRYPTO-4022".to_owned(),
+                    code: codes::CRYPTO_4022.to_owned(),
                 }
             })?;
 
@@ -1744,7 +1745,7 @@ impl WasmContextManager {
                     "no pending key package for '{member_did}' in context '{context_id}' — \
                      call generate_key_package_for_join first"
                 ),
-                code: "SCP-CRYPTO-4023".to_owned(),
+                code: codes::CRYPTO_4023.to_owned(),
             })?;
 
         // First join the context normally (membership, events, etc.).
@@ -1757,7 +1758,7 @@ impl WasmContextManager {
             crate::crypto::group::WasmMlsGroup::join_from_welcome(welcome_bytes, holder).map_err(
                 |e| ScpWasmError::Crypto {
                     message: format!("MLS welcome processing failed: {e}"),
-                    code: "SCP-CRYPTO-4021".to_owned(),
+                    code: codes::CRYPTO_4021.to_owned(),
                 },
             )?;
 
@@ -1835,7 +1836,7 @@ impl WasmContextManager {
             .get_mut(context_id)
             .ok_or_else(|| ScpWasmError::Context {
                 message: format!("context '{context_id}' not found"),
-                code: "SCP-CTX-2060".to_owned(),
+                code: codes::CTX_2060.to_owned(),
             })?;
 
         ctx.append_log_event(event_type, actor_did, prov_hash);
@@ -1876,7 +1877,7 @@ impl WasmContextManager {
         crate::runtime::tool_registry_insert_unique(&mut ctx.tool_registry, registration).map_err(
             |e| ScpWasmError::Tool {
                 message: e,
-                code: "SCP-TOOL-6001".to_owned(),
+                code: codes::TOOL_6001.to_owned(),
             },
         )?;
 
@@ -1918,7 +1919,7 @@ impl WasmContextManager {
                     "tool '{tool_id}' not found in context '{context_id}' \
                      -- register the tool before adding a handler"
                 ),
-                code: "SCP-TOOL-6002".to_owned(),
+                code: codes::TOOL_6002.to_owned(),
             });
         }
 
@@ -1947,14 +1948,14 @@ impl WasmContextManager {
             .get(tool_id)
             .ok_or_else(|| ScpWasmError::Tool {
                 message: format!("tool '{tool_id}' not found in context '{context_id}'"),
-                code: "SCP-TOOL-6002".to_owned(),
+                code: codes::TOOL_6002.to_owned(),
             })?;
 
         // Validate input against the tool's input schema.
         validate_value_against_schema(input_json, &registration.schema.input_schema).map_err(
             |e| ScpWasmError::Tool {
                 message: format!("input schema validation failed for tool '{tool_id}': {e}"),
-                code: "SCP-TOOL-6002".to_owned(),
+                code: codes::TOOL_6002.to_owned(),
             },
         )?;
 
@@ -1964,13 +1965,13 @@ impl WasmContextManager {
         let result = if let Some(handler) = ctx.tool_handlers.get(tool_id) {
             let out = handler(input_json.clone()).map_err(|e| ScpWasmError::Tool {
                 message: format!("tool handler for '{tool_id}' failed: {e}"),
-                code: "SCP-TOOL-6002".to_owned(),
+                code: codes::TOOL_6002.to_owned(),
             })?;
 
             validate_value_against_schema(&out, &output_schema).map_err(|msg| {
                 ScpWasmError::Tool {
                     message: format!("output validation failed for tool '{tool_id}': {msg}"),
-                    code: "SCP-TOOL-6002".to_owned(),
+                    code: codes::TOOL_6002.to_owned(),
                 }
             })?;
 
@@ -2005,7 +2006,7 @@ impl WasmContextManager {
             .get(tool_id)
             .ok_or_else(|| ScpWasmError::Tool {
                 message: format!("tool '{tool_id}' not found in context '{context_id}'"),
-                code: "SCP-TOOL-6003".to_owned(),
+                code: codes::TOOL_6003.to_owned(),
             })?;
 
         // Verify test vectors by validating inputs against the input schema.
@@ -2071,7 +2072,7 @@ impl WasmContextManager {
                 message: format!(
                     "cross-context chain depth {chain_depth} exceeds maximum {max_chain_depth}"
                 ),
-                code: "SCP-TOOL-6012".to_owned(),
+                code: codes::TOOL_6012.to_owned(),
             });
         }
 
@@ -2083,13 +2084,13 @@ impl WasmContextManager {
                 message: format!(
                     "tool '{tool_id}' not found in target context '{target_context_id}'"
                 ),
-                code: "SCP-TOOL-6003".to_owned(),
+                code: codes::TOOL_6003.to_owned(),
             })?;
 
         validate_value_against_schema(input, &registration.schema.input_schema).map_err(|e| {
             ScpWasmError::Tool {
                 message: format!("input validation failed: {e}"),
-                code: "SCP-TOOL-6002".to_owned(),
+                code: codes::TOOL_6002.to_owned(),
             }
         })?;
 
@@ -2099,13 +2100,13 @@ impl WasmContextManager {
         let result = if let Some(handler) = target.tool_handlers.get(tool_id) {
             let out = handler(input.clone()).map_err(|e| ScpWasmError::Tool {
                 message: format!("cross-context tool handler for '{tool_id}' failed: {e}"),
-                code: "SCP-TOOL-6002".to_owned(),
+                code: codes::TOOL_6002.to_owned(),
             })?;
 
             validate_value_against_schema(&out, &output_schema).map_err(|msg| {
                 ScpWasmError::Tool {
                     message: format!("output validation failed for tool '{tool_id}': {msg}"),
-                    code: "SCP-TOOL-6002".to_owned(),
+                    code: codes::TOOL_6002.to_owned(),
                 }
             })?;
 
@@ -2154,7 +2155,7 @@ impl WasmContextManager {
                     "global session cap exceeded: {} active (max {WASM_SESSION_GLOBAL_CAP})",
                     ctx.sessions.len()
                 ),
-                code: "SCP-TOOL-6015".to_owned(),
+                code: codes::TOOL_6015.to_owned(),
             });
         }
 
@@ -2176,7 +2177,7 @@ impl WasmContextManager {
                 message: format!(
                     "session cap exceeded for caller '{source_context_id}': {current} active (max {session_cap})"
                 ),
-                code: "SCP-TOOL-6015".to_owned(),
+                code: codes::TOOL_6015.to_owned(),
             });
         }
 
@@ -2217,14 +2218,14 @@ impl WasmContextManager {
             .get(session_id)
             .ok_or_else(|| ScpWasmError::Tool {
                 message: format!("session '{session_id}' not found"),
-                code: "SCP-TOOL-6018".to_owned(),
+                code: codes::TOOL_6018.to_owned(),
             })?;
 
         if session.is_expired() {
             ctx.sessions.remove(session_id);
             return Err(ScpWasmError::Tool {
                 message: format!("session '{session_id}' has expired"),
-                code: "SCP-TOOL-6019".to_owned(),
+                code: codes::TOOL_6019.to_owned(),
             });
         }
 
@@ -2237,7 +2238,7 @@ impl WasmContextManager {
             validate_value_against_schema(input, &registration.schema.input_schema).map_err(
                 |e| ScpWasmError::Tool {
                     message: format!("input validation failed: {e}"),
-                    code: "SCP-TOOL-6002".to_owned(),
+                    code: codes::TOOL_6002.to_owned(),
                 },
             )?;
         }
@@ -2246,7 +2247,7 @@ impl WasmContextManager {
         let (new_state, output) = if let Some(handler) = ctx.tool_handlers.get(&tool_id) {
             let out = handler(input.clone()).map_err(|e| ScpWasmError::Tool {
                 message: format!("tool handler for '{tool_id}' failed: {e}"),
-                code: "SCP-TOOL-6002".to_owned(),
+                code: codes::TOOL_6002.to_owned(),
             })?;
             (current_state, out)
         } else {
@@ -2289,7 +2290,7 @@ impl WasmContextManager {
             .get(session_id)
             .ok_or_else(|| ScpWasmError::Tool {
                 message: format!("session '{session_id}' not found"),
-                code: "SCP-TOOL-6018".to_owned(),
+                code: codes::TOOL_6018.to_owned(),
             })?;
         Ok(session.tool_id.clone())
     }
@@ -2309,7 +2310,7 @@ impl WasmContextManager {
         if ctx.sessions.remove(session_id).is_none() {
             return Err(ScpWasmError::Tool {
                 message: format!("session '{session_id}' not found"),
-                code: "SCP-TOOL-6021".to_owned(),
+                code: codes::TOOL_6021.to_owned(),
             });
         }
 
@@ -2350,7 +2351,7 @@ impl WasmContextManager {
         let proof =
             prove_inclusion(&ctx.event_log, leaf_index).map_err(|e| ScpWasmError::Context {
                 message: format!("inclusion proof failed: {e}"),
-                code: "SCP-CTX-2007".to_owned(),
+                code: codes::CTX_2007.to_owned(),
             })?;
 
         let verified = verify_inclusion(&proof);
@@ -2394,7 +2395,7 @@ impl WasmContextManager {
         let proof =
             prove_absence(&ctx.event_log, event_hash).map_err(|e| ScpWasmError::Context {
                 message: format!("absence proof failed: {e}"),
-                code: "SCP-CTX-2007".to_owned(),
+                code: codes::CTX_2007.to_owned(),
             })?;
 
         Ok(serde_json::json!({
@@ -2465,7 +2466,7 @@ impl WasmContextManager {
         if ctx.seen_nonces.contains_key(nonce) {
             return Err(ScpWasmError::Permission {
                 message: format!("nonce reused: {nonce}"),
-                code: "SCP-PERM-3000".to_owned(),
+                code: codes::PERM_3000.to_owned(),
             });
         }
 
@@ -2480,7 +2481,7 @@ impl WasmContextManager {
                     message: format!(
                         "nonce tracker full: capacity {WASM_NONCE_CAP} reached and no expired entries to evict"
                     ),
-                    code: "SCP-PERM-3000".to_owned(),
+                    code: codes::PERM_3000.to_owned(),
                 });
             }
         }
@@ -2520,7 +2521,7 @@ impl WasmContextManager {
                     "revoked token set has reached capacity ({WASM_REVOKED_TOKENS_CAP}) — \
                      cannot revoke additional tokens"
                 ),
-                code: "SCP-VALID-7300".to_owned(),
+                code: codes::VALID_7300.to_owned(),
             });
         }
 
@@ -2619,7 +2620,7 @@ impl WasmContextManager {
                     message: format!(
                         "member {initiator_did} does not have '{required}' capability required for this governance action"
                     ),
-                    code: "SCP-PERM-3000".to_owned(),
+                    code: codes::PERM_3000.to_owned(),
                 });
             }
         }
@@ -2632,7 +2633,7 @@ impl WasmContextManager {
             if ctx.executed_proposals.contains_key(proposal_id) {
                 return Err(ScpWasmError::Permission {
                     message: "governance proposal has already been executed".to_owned(),
-                    code: "SCP-PERM-3000".to_owned(),
+                    code: codes::PERM_3000.to_owned(),
                 });
             }
 
@@ -2725,7 +2726,7 @@ impl WasmContextManager {
                 let did_str: &str = did;
                 let member = ctx.members.get_mut(did_str).ok_or_else(|| ScpWasmError::Context {
                     message: format!("member '{did}' not found"),
-                    code: "SCP-CTX-2015".to_owned(),
+                    code: codes::CTX_2015.to_owned(),
                 })?;
                 let old_role = member.role.clone();
                 new_role.clone_into(&mut member.role);
@@ -2754,7 +2755,7 @@ impl WasmContextManager {
                 if ctx.tool_registry.remove(tool_id).is_none() {
                     return Err(ScpWasmError::Tool {
                         message: format!("tool '{tool_id}' not found"),
-                        code: "SCP-TOOL-6003".to_owned(),
+                        code: codes::TOOL_6003.to_owned(),
                     });
                 }
                 Ok(serde_json::json!({"action": "RemoveTool", "toolId": tool_id}))
@@ -2764,7 +2765,7 @@ impl WasmContextManager {
                 if ctx.ceiling_policy != "governed" {
                     return Err(ScpWasmError::Permission {
                         message: "ceiling is immutable — cannot modify".to_owned(),
-                        code: "SCP-PERM-3000".to_owned(),
+                        code: codes::PERM_3000.to_owned(),
                     });
                 }
                 ctx.ceiling_strings = new_ceiling.iter().map(|c| Self::capability_to_ucan_format(&c.name())).collect();
@@ -2823,7 +2824,7 @@ impl WasmContextManager {
                     "member list has reached capacity ({WASM_MEMBER_CAP}) — \
                      cannot add additional members"
                 ),
-                code: "SCP-VALID-7302".to_owned(),
+                code: codes::VALID_7302.to_owned(),
             });
         }
 
@@ -2863,7 +2864,7 @@ impl WasmContextManager {
             .remove(did)
             .ok_or_else(|| ScpWasmError::Context {
                 message: format!("member '{did}' not found"),
-                code: "SCP-CTX-2015".to_owned(),
+                code: codes::CTX_2015.to_owned(),
             })?;
         // If the ejected member was an author in a broadcast context,
         // clean up their broadcast state (destroys broadcast key).
@@ -3021,7 +3022,7 @@ impl WasmContextManager {
                             "per-author block list has reached capacity ({WASM_BLOCK_LIST_CAP}) \
                              for author '{author_did}' during governance ban"
                         ),
-                        code: "SCP-VALID-7301".to_owned(),
+                        code: codes::VALID_7301.to_owned(),
                     });
                 }
             }
@@ -3096,7 +3097,7 @@ impl WasmContextManager {
                 if ctx.promotion_policy.as_deref() != Some("Promotable") {
                     return Err(ScpWasmError::Permission {
                         message: "context promotion_policy is not Promotable".to_owned(),
-                        code: "SCP-PERM-3000".to_owned(),
+                        code: codes::PERM_3000.to_owned(),
                     });
                 }
                 // Promote: cancel TTL (§5.10).
@@ -3122,13 +3123,13 @@ impl WasmContextManager {
                 if !ctx.members.contains_key(did_str) {
                     return Err(ScpWasmError::Context {
                         message: format!("member '{did}' not found"),
-                        code: "SCP-CTX-2015".to_owned(),
+                        code: codes::CTX_2015.to_owned(),
                     });
                 }
                 if ctx.threshold_signers.contains(&did_str.to_owned()) {
                     return Err(ScpWasmError::Permission {
                         message: format!("DID is already a signer: {did}"),
-                        code: "SCP-PERM-3000".to_owned(),
+                        code: codes::PERM_3000.to_owned(),
                     });
                 }
                 ctx.threshold_signers.push(did_str.to_owned());
@@ -3145,7 +3146,7 @@ impl WasmContextManager {
                         message: format!(
                             "threshold must be 1..={signer_count}, got {new_threshold}"
                         ),
-                        code: "SCP-PERM-3000".to_owned(),
+                        code: codes::PERM_3000.to_owned(),
                     });
                 }
                 ctx.threshold_value = *new_threshold;
@@ -3312,7 +3313,7 @@ impl WasmContextManager {
         if ctx.economic_policy_locked {
             return Err(ScpWasmError::Permission {
                 message: "economic policy is locked and cannot be changed".to_owned(),
-                code: "SCP-PERM-3000".to_owned(),
+                code: codes::PERM_3000.to_owned(),
             });
         }
         // Store as JSON string for WASM-local state.
@@ -3341,7 +3342,7 @@ impl WasmContextManager {
                 if !ctx.members.contains_key(spender_str) {
                     return Err(ScpWasmError::Context {
                         message: format!("spender '{spender}' is not a member"),
-                        code: "SCP-CTX-2015".to_owned(),
+                        code: codes::CTX_2015.to_owned(),
                     });
                 }
                 Ok(serde_json::json!({
@@ -3356,13 +3357,13 @@ impl WasmContextManager {
                 if ctx.economic_policy.is_none() {
                     return Err(ScpWasmError::Permission {
                         message: "cannot lock economic policy: no policy is set".to_owned(),
-                        code: "SCP-PERM-3000".to_owned(),
+                        code: codes::PERM_3000.to_owned(),
                     });
                 }
                 if ctx.economic_policy_locked {
                     return Err(ScpWasmError::Permission {
                         message: "economic policy is already locked".to_owned(),
-                        code: "SCP-PERM-3000".to_owned(),
+                        code: codes::PERM_3000.to_owned(),
                     });
                 }
                 ctx.economic_policy_locked = true;
@@ -3373,7 +3374,7 @@ impl WasmContextManager {
                 // proposal cannot corrupt the persisted config.
                 new_config.validate().map_err(|e| ScpWasmError::Context {
                     message: format!("ModifyHardRateLimit: new config failed validation: {e}"),
-                    code: "SCP-ECON-12091".to_owned(),
+                    code: codes::ECON_12091.to_owned(),
                 })?;
                 let ctx = self.require_active_context_mut(context_id)?;
                 // WASM bridge stores the config as an opaque JSON blob
@@ -3441,7 +3442,7 @@ impl WasmContextManager {
                 message: format!(
                     "invalid resolution: must be 'invalidateBoth' or one of the proposal IDs, got '{resolution}'"
                 ),
-                code: "SCP-PERM-3000".to_owned(),
+                code: codes::PERM_3000.to_owned(),
             });
         }
 
@@ -3477,7 +3478,7 @@ impl WasmContextManager {
         if !ctx.members.contains_key(did) {
             return Err(ScpWasmError::Context {
                 message: format!("member '{did}' not found"),
-                code: "SCP-CTX-2015".to_owned(),
+                code: codes::CTX_2015.to_owned(),
             });
         }
         // Member reset: remove + re-add with same role (ADR-029 §Tier 3).
@@ -3508,13 +3509,13 @@ impl WasmContextManager {
         if changes_json.is_empty() {
             return Err(ScpWasmError::Permission {
                 message: "reconfigure_governance requires at least one change".to_owned(),
-                code: "SCP-PERM-3000".to_owned(),
+                code: codes::PERM_3000.to_owned(),
             });
         }
         if justification.is_empty() {
             return Err(ScpWasmError::Permission {
                 message: "deadlock justification must not be empty".to_owned(),
-                code: "SCP-PERM-3000".to_owned(),
+                code: codes::PERM_3000.to_owned(),
             });
         }
         // Clear governance freeze as the reconfiguration resolves it.
@@ -3550,7 +3551,7 @@ impl WasmContextManager {
         crate::runtime::tool_registry_insert_unique(&mut ctx.tool_registry, reg).map_err(|e| {
             ScpWasmError::Tool {
                 message: e,
-                code: "SCP-TOOL-6001".to_owned(),
+                code: codes::TOOL_6001.to_owned(),
             }
         })?;
         Ok(serde_json::json!({"action": "RegisterTool", "toolId": tool_id}))
@@ -3568,7 +3569,7 @@ impl WasmContextManager {
         if ctx.threshold_signers.len() == before {
             return Err(ScpWasmError::Context {
                 message: format!("signer '{did}' not found"),
-                code: "SCP-CTX-2015".to_owned(),
+                code: codes::CTX_2015.to_owned(),
             });
         }
         // Reject if removing would make threshold > signers.len().
@@ -3582,7 +3583,7 @@ impl WasmContextManager {
                         "removing signer would leave {remaining} signers < threshold {}",
                         ctx.threshold_value
                     ),
-                    code: "SCP-PERM-3000".to_owned(),
+                    code: codes::PERM_3000.to_owned(),
                 });
             }
         }
@@ -3638,7 +3639,7 @@ impl WasmContextManager {
                     message: format!(
                         "member {proposer_did} does not have 'governance:propose' capability"
                     ),
-                    code: "SCP-CTX-2041".to_owned(),
+                    code: codes::CTX_2041.to_owned(),
                 });
             }
         }
@@ -3651,7 +3652,7 @@ impl WasmContextManager {
             {
                 return Err(ScpWasmError::Context {
                     message: format!("proposal {proposal_id} already exists"),
-                    code: "SCP-CTX-2041".to_owned(),
+                    code: codes::CTX_2041.to_owned(),
                 });
             }
         }
@@ -3785,7 +3786,7 @@ impl WasmContextManager {
                     message: format!(
                         "member {voter_did} does not have 'governance:vote' capability"
                     ),
-                    code: "SCP-CTX-2042".to_owned(),
+                    code: codes::CTX_2042.to_owned(),
                 });
             }
         }
@@ -3805,14 +3806,14 @@ impl WasmContextManager {
             let proposal = ctx.pending_proposals.get_mut(proposal_id).ok_or_else(|| {
                 ScpWasmError::Context {
                     message: format!("proposal {proposal_id} not found"),
-                    code: "SCP-CTX-2042".to_owned(),
+                    code: codes::CTX_2042.to_owned(),
                 }
             })?;
 
             if proposal.voting_deadline <= now_secs {
                 return Err(ScpWasmError::Context {
                     message: "proposal voting deadline has expired".to_owned(),
-                    code: "SCP-CTX-2042".to_owned(),
+                    code: codes::CTX_2042.to_owned(),
                 });
             }
 
@@ -3828,7 +3829,7 @@ impl WasmContextManager {
             {
                 return Err(ScpWasmError::Permission {
                     message: format!("member {voter_did} has already voted on this proposal"),
-                    code: "SCP-CTX-2042".to_owned(),
+                    code: codes::CTX_2042.to_owned(),
                 });
             }
 
@@ -3897,7 +3898,7 @@ impl WasmContextManager {
                     message: format!(
                         "member {voter_did} does not have 'governance:vote' capability"
                     ),
-                    code: "SCP-CTX-2043".to_owned(),
+                    code: codes::CTX_2043.to_owned(),
                 });
             }
         }
@@ -3916,14 +3917,14 @@ impl WasmContextManager {
             let proposal = ctx.pending_proposals.get_mut(proposal_id).ok_or_else(|| {
                 ScpWasmError::Context {
                     message: format!("proposal {proposal_id} not found"),
-                    code: "SCP-CTX-2043".to_owned(),
+                    code: codes::CTX_2043.to_owned(),
                 }
             })?;
 
             if proposal.voting_deadline <= now_secs {
                 return Err(ScpWasmError::Context {
                     message: "proposal voting deadline has expired".to_owned(),
-                    code: "SCP-CTX-2043".to_owned(),
+                    code: codes::CTX_2043.to_owned(),
                 });
             }
 
@@ -3938,7 +3939,7 @@ impl WasmContextManager {
             {
                 return Err(ScpWasmError::Permission {
                     message: format!("member {voter_did} has already voted on this proposal"),
-                    code: "SCP-CTX-2043".to_owned(),
+                    code: codes::CTX_2043.to_owned(),
                 });
             }
 
@@ -3999,7 +4000,7 @@ impl WasmContextManager {
                 .get_mut(proposal_id)
                 .ok_or_else(|| ScpWasmError::Context {
                     message: format!("proposal {proposal_id} not found"),
-                    code: "SCP-CTX-2044".to_owned(),
+                    code: codes::CTX_2044.to_owned(),
                 })?;
 
         let was_approval = proposal
@@ -4018,7 +4019,7 @@ impl WasmContextManager {
         } else {
             return Err(ScpWasmError::Permission {
                 message: format!("member {voter_did} has not voted on proposal {proposal_id}"),
-                code: "SCP-CTX-2044".to_owned(),
+                code: codes::CTX_2044.to_owned(),
             });
         }
 
@@ -4046,7 +4047,7 @@ impl WasmContextManager {
             .get(context_id)
             .ok_or_else(|| ScpWasmError::Context {
                 message: format!("context {context_id} not found"),
-                code: "SCP-CTX-2045".to_owned(),
+                code: codes::CTX_2045.to_owned(),
             })?;
 
         let proposal = ctx
@@ -4055,7 +4056,7 @@ impl WasmContextManager {
             .or_else(|| ctx.resolved_proposals.get(proposal_id))
             .ok_or_else(|| ScpWasmError::Context {
                 message: format!("proposal {proposal_id} not found"),
-                code: "SCP-CTX-2045".to_owned(),
+                code: codes::CTX_2045.to_owned(),
             })?;
 
         Ok(Self::proposal_to_json(proposal_id, proposal))
@@ -4072,7 +4073,7 @@ impl WasmContextManager {
             .get(context_id)
             .ok_or_else(|| ScpWasmError::Context {
                 message: format!("context {context_id} not found"),
-                code: "SCP-CTX-2046".to_owned(),
+                code: codes::CTX_2046.to_owned(),
             })?;
 
         let proposals: Vec<serde_json::Value> = ctx
@@ -4169,7 +4170,7 @@ impl WasmContextManager {
             .as_mut()
             .ok_or_else(|| ScpWasmError::Context {
                 message: "not a broadcast context".to_owned(),
-                code: "SCP-CTX-2001".to_owned(),
+                code: codes::CTX_2001.to_owned(),
             })?;
 
         // Use subscribe with no UCAN (open admission) for WASM bridge.
@@ -4217,7 +4218,7 @@ impl WasmContextManager {
         {
             return Err(ScpWasmError::Permission {
                 message: format!("write access has been suspended for {author_did}"),
-                code: "SCP-PERM-3000".to_owned(),
+                code: codes::PERM_3000.to_owned(),
             });
         }
 
@@ -4226,13 +4227,13 @@ impl WasmContextManager {
             .as_ref()
             .ok_or_else(|| ScpWasmError::Context {
                 message: "not a broadcast context".to_owned(),
-                code: "SCP-CTX-2001".to_owned(),
+                code: codes::CTX_2001.to_owned(),
             })?;
 
         if !bc.is_author(author_did) {
             return Err(ScpWasmError::Permission {
                 message: format!("'{author_did}' is not an author in this broadcast context"),
-                code: "SCP-PERM-3000".to_owned(),
+                code: codes::PERM_3000.to_owned(),
             });
         }
 
@@ -4242,7 +4243,7 @@ impl WasmContextManager {
             .get_mut(author_did)
             .ok_or_else(|| ScpWasmError::Context {
                 message: format!("author '{author_did}' not found in members"),
-                code: "SCP-CTX-2019".to_owned(),
+                code: codes::CTX_2019.to_owned(),
             })?;
         let seq = member.sequence_number;
         member.sequence_number += 1;
@@ -4288,13 +4289,13 @@ impl WasmContextManager {
         let normalized_path =
             validate_content_path_wasm(path).map_err(|msg| ScpWasmError::Context {
                 message: format!("invalid path: {msg}"),
-                code: "SCP-CTX-2070".to_owned(),
+                code: codes::CTX_2070.to_owned(),
             })?;
 
         // Validate content_type (delegates to scp-protocol MimeType).
         validate_mime_type_wasm(content_type).map_err(|msg| ScpWasmError::Context {
             message: format!("invalid content_type: {msg}"),
-            code: "SCP-CTX-2071".to_owned(),
+            code: codes::CTX_2071.to_owned(),
         })?;
 
         // Auto-generate deploy_id when None, matching batch behavior.
@@ -4316,7 +4317,7 @@ impl WasmContextManager {
         // Validate deploy_id.
         validate_deploy_id_wasm(deploy_id_resolved).map_err(|msg| ScpWasmError::Context {
             message: format!("invalid deploy_id: {msg}"),
-            code: "SCP-CTX-2072".to_owned(),
+            code: codes::CTX_2072.to_owned(),
         })?;
 
         // Body size limit — reject oversized payloads before serialization.
@@ -4326,7 +4327,7 @@ impl WasmContextManager {
                     "body too large: {} bytes (max {MAX_BODY_BYTES})",
                     body.len()
                 ),
-                code: "SCP-CTX-2075".to_owned(),
+                code: codes::CTX_2075.to_owned(),
             });
         }
 
@@ -4348,7 +4349,7 @@ impl WasmContextManager {
         )
         .map_err(|msg| ScpWasmError::Context {
             message: format!("broadcast content serialization failed: {msg}"),
-            code: "SCP-CTX-2073".to_owned(),
+            code: codes::CTX_2073.to_owned(),
         })?;
 
         // Base64-encode the wire bytes for the publish_broadcast path.
@@ -4391,7 +4392,7 @@ impl WasmContextManager {
                     "batch too large: {} assets (max {MAX_BATCH_ASSETS})",
                     assets.len()
                 ),
-                code: "SCP-CTX-2074".to_owned(),
+                code: codes::CTX_2074.to_owned(),
             });
         }
 
@@ -4443,7 +4444,7 @@ impl WasmContextManager {
             .as_mut()
             .ok_or_else(|| ScpWasmError::Context {
                 message: "not a broadcast context".to_owned(),
-                code: "SCP-CTX-2001".to_owned(),
+                code: codes::CTX_2001.to_owned(),
             })?;
 
         let _ = bc.unsubscribe(subscriber_did, false);
@@ -4481,7 +4482,7 @@ impl WasmContextManager {
                 .as_mut()
                 .ok_or_else(|| ScpWasmError::Context {
                     message: "not a broadcast context".to_owned(),
-                    code: "SCP-CTX-2001".to_owned(),
+                    code: codes::CTX_2001.to_owned(),
                 })?;
 
             // Pre-validate block list capacity.
@@ -4494,7 +4495,7 @@ impl WasmContextManager {
                         "per-author block list has reached capacity ({WASM_BLOCK_LIST_CAP}) \
                          for author '{blocker_did}'"
                     ),
-                    code: "SCP-VALID-7301".to_owned(),
+                    code: codes::VALID_7301.to_owned(),
                 });
             }
 
@@ -4504,7 +4505,7 @@ impl WasmContextManager {
                 .block_subscriber(blocker_did, subscriber_did)
                 .map_err(|e| ScpWasmError::Context {
                     message: format!("block_subscriber failed: {e}"),
-                    code: "SCP-CTX-2001".to_owned(),
+                    code: codes::CTX_2001.to_owned(),
                 })?;
             new_epoch = block_result.new_epoch;
         }
@@ -4551,7 +4552,7 @@ impl WasmContextManager {
                 .as_mut()
                 .ok_or_else(|| ScpWasmError::Context {
                     message: "not a broadcast context".to_owned(),
-                    code: "SCP-CTX-2001".to_owned(),
+                    code: codes::CTX_2001.to_owned(),
                 })?;
 
             // Per-author unblocking (§5.14.8): remove from the unblocker's
@@ -4560,7 +4561,7 @@ impl WasmContextManager {
             bc.unblock_subscriber(unblocker_did, subscriber_did)
                 .map_err(|e| ScpWasmError::Context {
                     message: e.to_string(),
-                    code: "SCP-CTX-2001".to_owned(),
+                    code: codes::CTX_2001.to_owned(),
                 })?;
         }
 
@@ -4637,7 +4638,7 @@ impl WasmContextManager {
             .get(context_id)
             .ok_or_else(|| ScpWasmError::Context {
                 message: format!("context not registered: {context_id}"),
-                code: "SCP-CTX-2001".to_owned(),
+                code: codes::CTX_2001.to_owned(),
             })?;
 
         let bc = ctx
@@ -4645,7 +4646,7 @@ impl WasmContextManager {
             .as_ref()
             .ok_or_else(|| ScpWasmError::Context {
                 message: "not a broadcast context".to_owned(),
-                code: "SCP-CTX-2001".to_owned(),
+                code: codes::CTX_2001.to_owned(),
             })?;
 
         // Delegate to BroadcastContext::handle_key_request which implements
@@ -4686,7 +4687,7 @@ impl WasmContextManager {
                       (propose SetEconomicPolicy action). Direct mutation is \
                       not permitted — see spec §19.3"
                 .to_owned(),
-            code: "SCP-CTX-2013".to_owned(),
+            code: codes::CTX_2013.to_owned(),
         })
     }
 
@@ -4728,7 +4729,7 @@ impl WasmContextManager {
             || {
                 Err(ScpWasmError::Context {
                     message: "context has no TTL configured".to_owned(),
-                    code: "SCP-CTX-2001".to_owned(),
+                    code: codes::CTX_2001.to_owned(),
                 })
             },
             |ttl| {
@@ -4776,7 +4777,7 @@ impl WasmContextManager {
         if !self.is_member(context_id, proposer_did) {
             return Err(ScpWasmError::Context {
                 message: format!("DID '{proposer_did}' is not a member of context '{context_id}'"),
-                code: "SCP-CTX-2005".to_owned(),
+                code: codes::CTX_2005.to_owned(),
             });
         }
         self.extend_ttl(context_id, extension_secs)
@@ -4937,7 +4938,7 @@ impl WasmContextManager {
                 message: format!(
                     "context '{context_id}' not found — was it created with context_create?"
                 ),
-                code: "SCP-CTX-2001".to_owned(),
+                code: codes::CTX_2001.to_owned(),
             })
     }
 
@@ -4950,7 +4951,7 @@ impl WasmContextManager {
                     "context '{context_id}' is in '{0}' state — must be 'active'",
                     ctx.state
                 ),
-                code: "SCP-CTX-2002".to_owned(),
+                code: codes::CTX_2002.to_owned(),
             });
         }
         Ok(ctx)
@@ -4966,7 +4967,7 @@ impl WasmContextManager {
                 message: format!(
                     "context '{context_id}' not found — was it created with context_create?"
                 ),
-                code: "SCP-CTX-2001".to_owned(),
+                code: codes::CTX_2001.to_owned(),
             })
     }
 
@@ -4982,7 +4983,7 @@ impl WasmContextManager {
                     "context '{context_id}' is in '{0}' state — must be 'active'",
                     ctx.state
                 ),
-                code: "SCP-CTX-2013".to_owned(),
+                code: codes::CTX_2013.to_owned(),
             });
         }
         Ok(ctx)
@@ -5118,7 +5119,7 @@ impl WasmContextManager {
         let snapshot_json =
             serde_json_canonicalizer::to_vec(&snapshot).map_err(|e| ScpWasmError::Context {
                 message: format!("export snapshot serialization failed: {e}"),
-                code: "SCP-CTX-2030".to_owned(),
+                code: codes::CTX_2030.to_owned(),
             })?;
 
         // Compute HMAC-SHA256 over the snapshot JSON using the creator's
@@ -5140,7 +5141,7 @@ impl WasmContextManager {
 
         serde_json::to_vec(&envelope).map_err(|e| ScpWasmError::Context {
             message: format!("export serialization failed: {e}"),
-            code: "SCP-CTX-2030".to_owned(),
+            code: codes::CTX_2030.to_owned(),
         })
     }
 
@@ -5155,7 +5156,7 @@ impl WasmContextManager {
         let envelope: WasmContextExportEnvelope =
             serde_json::from_slice(data).map_err(|e| ScpWasmError::Context {
                 message: format!("invalid export data: {e}"),
-                code: "SCP-CTX-2032".to_owned(),
+                code: codes::CTX_2032.to_owned(),
             })?;
 
         if envelope.version > WASM_EXPORT_VERSION {
@@ -5164,7 +5165,7 @@ impl WasmContextManager {
                     "incompatible export version: got {}, max supported is {WASM_EXPORT_VERSION}",
                     envelope.version
                 ),
-                code: "SCP-CTX-2032".to_owned(),
+                code: codes::CTX_2032.to_owned(),
             });
         }
 
@@ -5175,7 +5176,7 @@ impl WasmContextManager {
         let snapshot_json = serde_json_canonicalizer::to_vec(&envelope.snapshot).map_err(|e| {
             ScpWasmError::Context {
                 message: format!("snapshot re-serialization failed: {e}"),
-                code: "SCP-CTX-2032".to_owned(),
+                code: codes::CTX_2032.to_owned(),
             }
         })?;
 
@@ -5183,7 +5184,7 @@ impl WasmContextManager {
             return Err(ScpWasmError::Context {
                 message: "export integrity_mac is missing — refusing to import unsigned export"
                     .to_owned(),
-                code: "SCP-CTX-2020".to_owned(),
+                code: codes::CTX_2020.to_owned(),
             });
         }
 
@@ -5224,7 +5225,7 @@ impl WasmContextManager {
             if m.role.is_empty() || m.role.len() > 64 {
                 return Err(ScpWasmError::Context {
                     message: format!("invalid member role '{}': must be 1-64 chars", m.role),
-                    code: "SCP-CTX-2032".to_owned(),
+                    code: codes::CTX_2032.to_owned(),
                 });
             }
         }
@@ -5235,7 +5236,7 @@ impl WasmContextManager {
                     "invalid context state '{}': must be one of {valid_states:?}",
                     snap.state
                 ),
-                code: "SCP-CTX-2032".to_owned(),
+                code: codes::CTX_2032.to_owned(),
             });
         }
 
@@ -5254,7 +5255,7 @@ impl WasmContextManager {
                 message: format!(
                     "context '{context_id}' already exists — cannot import over existing context"
                 ),
-                code: "SCP-CTX-2000".to_owned(),
+                code: codes::CTX_2000.to_owned(),
             });
         }
 
@@ -5449,7 +5450,7 @@ impl WasmContextManager {
                     "context '{context_id}' is in '{}' state — must be 'closing' to finalize",
                     ctx.state
                 ),
-                code: "SCP-CTX-2061".to_owned(),
+                code: codes::CTX_2061.to_owned(),
             });
         }
 
@@ -5553,7 +5554,7 @@ impl WasmContextManager {
             message: "context restoration is not supported in the WASM bridge — \
                       WASM contexts are ephemeral (ADR-034)"
                 .to_owned(),
-            code: "SCP-CTX-2064".to_owned(),
+            code: codes::CTX_2064.to_owned(),
         })
     }
 
@@ -5569,7 +5570,7 @@ impl WasmContextManager {
             message: "context restoration is not supported in the WASM bridge — \
                       WASM contexts are ephemeral (ADR-034)"
                 .to_owned(),
-            code: "SCP-CTX-2065".to_owned(),
+            code: codes::CTX_2065.to_owned(),
         })
     }
 }
@@ -6251,7 +6252,7 @@ mod tests {
                 message.contains("bogus-value"),
                 "message should include the bad value: {message}"
             );
-            assert_eq!(code, "SCP-PERM-3000");
+            assert_eq!(code, codes::PERM_3000);
         }
     }
 
@@ -6276,7 +6277,7 @@ mod tests {
         let params = serde_json::json!({ "minProtocolVersion": [1, 99] });
         let err = parse_and_check_min_protocol_version(&params).unwrap_err();
         assert!(
-            matches!(err, ScpWasmError::Context { ref code, .. } if code == "SCP-CTX-2016"),
+            matches!(err, ScpWasmError::Context { ref code, .. } if code == codes::CTX_2016),
             "expected SCP-CTX-2016, got: {err:?}"
         );
     }
@@ -6286,7 +6287,7 @@ mod tests {
         let params = serde_json::json!({ "minProtocolVersion": [2, 0] });
         let err = parse_and_check_min_protocol_version(&params).unwrap_err();
         assert!(
-            matches!(err, ScpWasmError::Context { ref code, .. } if code == "SCP-CTX-2016"),
+            matches!(err, ScpWasmError::Context { ref code, .. } if code == codes::CTX_2016),
             "expected SCP-CTX-2016, got: {err:?}"
         );
     }
@@ -6297,7 +6298,7 @@ mod tests {
         let params = serde_json::json!({ "minProtocolVersion": ["2", "0"] });
         let err = parse_and_check_min_protocol_version(&params).unwrap_err();
         assert!(
-            matches!(err, ScpWasmError::Context { ref code, .. } if code == "SCP-CTX-2015"),
+            matches!(err, ScpWasmError::Context { ref code, .. } if code == codes::CTX_2015),
             "expected SCP-CTX-2015, got: {err:?}"
         );
     }
@@ -6308,7 +6309,7 @@ mod tests {
         let params = serde_json::json!({ "minProtocolVersion": [1, "0"] });
         let err = parse_and_check_min_protocol_version(&params).unwrap_err();
         assert!(
-            matches!(err, ScpWasmError::Context { ref code, .. } if code == "SCP-CTX-2015"),
+            matches!(err, ScpWasmError::Context { ref code, .. } if code == codes::CTX_2015),
             "expected SCP-CTX-2015, got: {err:?}"
         );
     }
@@ -6318,7 +6319,7 @@ mod tests {
         let params = serde_json::json!({ "minProtocolVersion": [1] });
         let err = parse_and_check_min_protocol_version(&params).unwrap_err();
         assert!(
-            matches!(err, ScpWasmError::Context { ref code, .. } if code == "SCP-CTX-2015"),
+            matches!(err, ScpWasmError::Context { ref code, .. } if code == codes::CTX_2015),
             "expected SCP-CTX-2015, got: {err:?}"
         );
     }
@@ -6328,7 +6329,7 @@ mod tests {
         let params = serde_json::json!({ "minProtocolVersion": [256, 0] });
         let err = parse_and_check_min_protocol_version(&params).unwrap_err();
         assert!(
-            matches!(err, ScpWasmError::Context { ref code, .. } if code == "SCP-CTX-2015"),
+            matches!(err, ScpWasmError::Context { ref code, .. } if code == codes::CTX_2015),
             "expected SCP-CTX-2015, got: {err:?}"
         );
     }
@@ -6641,7 +6642,7 @@ mod tests {
 
         match &err {
             ScpWasmError::Validation { code, message } => {
-                assert_eq!(code, "SCP-VALID-7301");
+                assert_eq!(code, codes::VALID_7301);
                 assert!(
                     message.contains("during governance ban"),
                     "expected 'during governance ban' in message, got: {message}"
@@ -6769,7 +6770,7 @@ mod tests {
             "expected Validation error, got: {err:?}"
         );
         if let ScpWasmError::Validation { ref code, .. } = err {
-            assert_eq!(code, "SCP-VALID-7300");
+            assert_eq!(code, codes::VALID_7300);
         }
     }
 
@@ -6786,7 +6787,7 @@ mod tests {
 
         match &err {
             ScpWasmError::Context { message, code } => {
-                assert_eq!(code, "SCP-CTX-2001");
+                assert_eq!(code, codes::CTX_2001);
                 assert!(
                     message.contains(subscriber),
                     "error should contain subscriber DID, got: {message}"
@@ -6893,7 +6894,7 @@ mod tests {
 
         match &err {
             ScpWasmError::Validation { code, .. } => {
-                assert_eq!(code, "SCP-VALID-7301");
+                assert_eq!(code, codes::VALID_7301);
             }
             other => panic!("expected Validation error, got: {other:?}"),
         }
@@ -6995,7 +6996,7 @@ mod tests {
                 ref message,
                 ref code,
             } => {
-                assert_eq!(code, "SCP-CTX-2032");
+                assert_eq!(code, codes::CTX_2032);
                 assert!(
                     message.contains("exceeds cap"),
                     "unexpected message: {message}"
@@ -7018,7 +7019,7 @@ mod tests {
                 ref message,
                 ref code,
             } => {
-                assert_eq!(code, "SCP-CTX-2032");
+                assert_eq!(code, codes::CTX_2032);
                 assert!(message.contains("legacy nonces"));
             }
             other => panic!("expected Context error, got: {other:?}"),
@@ -7041,7 +7042,7 @@ mod tests {
                 ref message,
                 ref code,
             } => {
-                assert_eq!(code, "SCP-CTX-2032");
+                assert_eq!(code, codes::CTX_2032);
                 assert!(message.contains("executed proposals"));
             }
             other => panic!("expected Context error, got: {other:?}"),
@@ -7062,7 +7063,7 @@ mod tests {
                 ref message,
                 ref code,
             } => {
-                assert_eq!(code, "SCP-CTX-2032");
+                assert_eq!(code, codes::CTX_2032);
                 assert!(message.contains("resolved proposals"));
             }
             other => panic!("expected Context error, got: {other:?}"),
@@ -7083,7 +7084,7 @@ mod tests {
                 ref message,
                 ref code,
             } => {
-                assert_eq!(code, "SCP-CTX-2032");
+                assert_eq!(code, codes::CTX_2032);
                 assert!(message.contains("corrupt-nonce"));
                 assert!(message.contains("inserted_at_ms"));
             }
@@ -7154,7 +7155,7 @@ mod tests {
                 ref message,
                 ref code,
             } => {
-                assert_eq!(code, "SCP-CTX-2032");
+                assert_eq!(code, codes::CTX_2032);
                 assert!(message.contains("cooldown_until"));
             }
             other => panic!("expected Context error, got: {other:?}"),
@@ -7249,7 +7250,7 @@ mod tests {
                 ref message,
             } => {
                 assert_eq!(code, SCP_ECON_PAID_POLICY_UNSUPPORTED_ON_WASM);
-                assert_eq!(code, "SCP-ECON-12095");
+                assert_eq!(code, codes::ECON_12095);
                 assert!(
                     message.contains("EconomicPolicyUnsupportedOnWasm"),
                     "expected EconomicPolicyUnsupportedOnWasm marker, got: {message}"
@@ -7344,7 +7345,7 @@ mod tests {
                 ref message,
             } => {
                 assert_eq!(code, SCP_ECON_WASM_CANNOT_VALIDATE_SPENDING_UCAN);
-                assert_eq!(code, "SCP-ECON-12096");
+                assert_eq!(code, codes::ECON_12096);
                 assert!(
                     message.contains("WasmCannotValidateSpendingUcan"),
                     "expected WasmCannotValidateSpendingUcan marker, got: {message}"
@@ -7359,7 +7360,7 @@ mod tests {
             .expect_err("join_context must reject paid context even without spending UCAN");
         match err {
             ScpWasmError::Context { ref code, .. } => {
-                assert_eq!(code, "SCP-ECON-12096");
+                assert_eq!(code, codes::ECON_12096);
             }
             other => panic!("expected Context error, got: {other:?}"),
         }
@@ -7403,7 +7404,7 @@ mod tests {
                 ref code,
                 ref message,
             } => {
-                assert_eq!(code, "SCP-ECON-12096");
+                assert_eq!(code, codes::ECON_12096);
                 assert!(message.contains("WasmCannotValidateSpendingUcan"));
             }
             other => panic!("expected Context error, got: {other:?}"),
@@ -7415,7 +7416,7 @@ mod tests {
             .expect_err("send_message must reject paid context even without spending UCAN");
         match err {
             ScpWasmError::Context { ref code, .. } => {
-                assert_eq!(code, "SCP-ECON-12096");
+                assert_eq!(code, codes::ECON_12096);
             }
             other => panic!("expected Context error, got: {other:?}"),
         }
@@ -7459,12 +7460,14 @@ mod tests {
         match err {
             ScpWasmError::Context { ref code, .. } => {
                 assert_eq!(
-                    code, "SCP-CTX-2019",
+                    code,
+                    codes::CTX_2019,
                     "free context must NOT trigger the C2 economy gate; \
                      non-member should hit the membership check instead"
                 );
                 assert_ne!(
-                    code, "SCP-ECON-12096",
+                    code,
+                    codes::ECON_12096,
                     "free context must NOT be rejected by the C2 economy gate"
                 );
             }
@@ -7483,7 +7486,7 @@ mod tests {
             .expect_err("non-member with UCAN must still reach membership check");
         match err {
             ScpWasmError::Context { ref code, .. } => {
-                assert_eq!(code, "SCP-CTX-2019");
+                assert_eq!(code, codes::CTX_2019);
             }
             other => panic!("expected Context error, got: {other:?}"),
         }
@@ -7533,7 +7536,7 @@ mod tests {
                 ref code,
                 ref message,
             } => {
-                assert_eq!(code, "SCP-ECON-12095");
+                assert_eq!(code, codes::ECON_12095);
                 assert!(message.contains("EconomicPolicyUnsupportedOnWasm"));
             }
             other => panic!("expected Context error, got: {other:?}"),

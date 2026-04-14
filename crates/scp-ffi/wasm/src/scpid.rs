@@ -19,6 +19,7 @@
 //! See spec §3.11 and the `scp-runtime` `scpid` module for the canonical
 //! async implementation.
 
+use scp_ffi_common::error_codes as codes;
 use scp_protocol::crypto::canonical::{CanonicalField, canonical_hash};
 use scp_protocol::identity::SigningKeyId;
 use scp_protocol::identity::scpid::{
@@ -62,7 +63,7 @@ pub fn scpid_challenge(audience: String, ttl_seconds: u32) -> Result<String, JsE
     if ttl_ms == 0 {
         return Err(ScpWasmError::Validation {
             message: "TTL must be greater than zero".to_owned(),
-            code: "SCP-IDENT-1038".to_owned(),
+            code: codes::IDENT_1038.to_owned(),
         }
         .into_js());
     }
@@ -70,7 +71,7 @@ pub fn scpid_challenge(audience: String, ttl_seconds: u32) -> Result<String, JsE
     if ttl_ms > MAX_TTL_MS {
         return Err(ScpWasmError::Validation {
             message: "TTL exceeds 300 seconds".to_owned(),
-            code: "SCP-IDENT-1038".to_owned(),
+            code: codes::IDENT_1038.to_owned(),
         }
         .into_js());
     }
@@ -78,7 +79,7 @@ pub fn scpid_challenge(audience: String, ttl_seconds: u32) -> Result<String, JsE
     if audience.is_empty() {
         return Err(ScpWasmError::Validation {
             message: "audience must not be empty".to_owned(),
-            code: "SCP-IDENT-1038".to_owned(),
+            code: codes::IDENT_1038.to_owned(),
         }
         .into_js());
     }
@@ -86,7 +87,7 @@ pub fn scpid_challenge(audience: String, ttl_seconds: u32) -> Result<String, JsE
     if audience.len() > MAX_AUDIENCE_BYTES {
         return Err(ScpWasmError::Validation {
             message: "audience exceeds 2048 bytes".to_owned(),
-            code: "SCP-IDENT-1038".to_owned(),
+            code: codes::IDENT_1038.to_owned(),
         }
         .into_js());
     }
@@ -96,7 +97,7 @@ pub fn scpid_challenge(audience: String, ttl_seconds: u32) -> Result<String, JsE
     getrandom::getrandom(&mut nonce).map_err(|e| {
         ScpWasmError::Identity {
             message: format!("CSPRNG failure: {e}"),
-            code: "SCP-IDENT-1037".to_owned(),
+            code: codes::IDENT_1037.to_owned(),
         }
         .into_js()
     })?;
@@ -115,7 +116,7 @@ pub fn scpid_challenge(audience: String, ttl_seconds: u32) -> Result<String, JsE
     serde_json::to_string(&challenge).map_err(|e| {
         ScpWasmError::Identity {
             message: format!("failed to serialize SCPID challenge: {e}"),
-            code: "SCP-IDENT-1037".to_owned(),
+            code: codes::IDENT_1037.to_owned(),
         }
         .into_js()
     })
@@ -154,7 +155,7 @@ pub fn scpid_sign(
                 message: format!(
                     "invalid signing_key_id '{other}': expected '#active' or '#agent'"
                 ),
-                code: "SCP-IDENT-1034".to_owned(),
+                code: codes::IDENT_1034.to_owned(),
             }
             .into_js());
         }
@@ -164,7 +165,7 @@ pub fn scpid_sign(
     let challenge: ScpIdChallenge = serde_json::from_str(&challenge_json).map_err(|e| {
         ScpWasmError::Validation {
             message: format!("invalid challenge JSON: {e}"),
-            code: "SCP-IDENT-1038".to_owned(),
+            code: codes::IDENT_1038.to_owned(),
         }
         .into_js()
     })?;
@@ -176,7 +177,7 @@ pub fn scpid_sign(
                 "unsupported protocol: {}, expected {SCPID_PROTOCOL_VERSION}",
                 challenge.protocol
             ),
-            code: "SCP-IDENT-1038".to_owned(),
+            code: codes::IDENT_1038.to_owned(),
         }
         .into_js());
     }
@@ -186,7 +187,7 @@ pub fn scpid_sign(
     if now_ms > challenge.expires_at {
         return Err(ScpWasmError::Identity {
             message: "challenge expired".to_owned(),
-            code: "SCP-IDENT-1030".to_owned(),
+            code: codes::IDENT_1030.to_owned(),
         }
         .into_js());
     }
@@ -195,7 +196,7 @@ pub fn scpid_sign(
     if did.is_empty() {
         return Err(ScpWasmError::Validation {
             message: "DID must not be empty".to_owned(),
-            code: "SCP-IDENT-1038".to_owned(),
+            code: codes::IDENT_1038.to_owned(),
         }
         .into_js());
     }
@@ -231,7 +232,7 @@ pub fn scpid_sign(
     serde_json::to_string(&response).map_err(|e| {
         ScpWasmError::Identity {
             message: format!("failed to serialize SCPID response: {e}"),
-            code: "SCP-IDENT-1037".to_owned(),
+            code: codes::IDENT_1037.to_owned(),
         }
         .into_js()
     })

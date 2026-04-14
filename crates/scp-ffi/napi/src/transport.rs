@@ -23,6 +23,7 @@
 //! See ADR-022, ADR-005 (Transport Abstraction), and ADR-012 (Multi-Relay) in
 //! `.docs/adrs/`.
 
+use scp_ffi_common::error_codes as codes;
 use std::sync::{Arc, OnceLock, RwLock};
 
 use napi_derive::napi;
@@ -68,7 +69,7 @@ fn set_transport_manager(manager: scp_transport::TransportManager) -> napi::Resu
         .write()
         .map_err(|_| ScpNapiError::Transport {
             message: "transport manager lock is poisoned".to_owned(),
-            code: "SCP-TRANS-5002".to_owned(),
+            code: codes::TRANS_5002.to_owned(),
         })? = Some(Arc::new(manager));
     Ok(())
 }
@@ -86,7 +87,7 @@ pub(crate) fn set_transport_manager_arc(
         .write()
         .map_err(|_| ScpNapiError::Transport {
             message: "transport manager lock is poisoned".to_owned(),
-            code: "SCP-TRANS-5002".to_owned(),
+            code: codes::TRANS_5002.to_owned(),
         })? = Some(manager);
     Ok(())
 }
@@ -108,11 +109,11 @@ pub(crate) fn with_transport_manager<T>(
         .read()
         .map_err(|_| ScpNapiError::Transport {
             message: "transport manager lock is poisoned".to_owned(),
-            code: "SCP-TRANS-5002".to_owned(),
+            code: codes::TRANS_5002.to_owned(),
         })?;
     let manager = guard.as_ref().ok_or_else(|| ScpNapiError::Transport {
         message: "no transport manager — call transportConnect() first".to_owned(),
-        code: "SCP-TRANS-5010".to_owned(),
+        code: codes::TRANS_5010.to_owned(),
     })?;
     f(manager)
 }
@@ -134,19 +135,19 @@ pub(crate) fn with_transport_manager_mut<T>(
         .write()
         .map_err(|_| ScpNapiError::Transport {
             message: "transport manager lock is poisoned".to_owned(),
-            code: "SCP-TRANS-5002".to_owned(),
+            code: codes::TRANS_5002.to_owned(),
         })?;
 
     let arc = guard.as_mut().ok_or_else(|| ScpNapiError::Transport {
         message: "no transport manager — call transportConnect() first".to_owned(),
-        code: "SCP-TRANS-5010".to_owned(),
+        code: codes::TRANS_5010.to_owned(),
     })?;
 
     let manager = Arc::get_mut(arc).ok_or_else(|| ScpNapiError::Transport {
         message: "transport manager is in use by an active subscription — \
                   cannot modify while subscriptions are active"
             .to_owned(),
-        code: "SCP-TRANS-5003".to_owned(),
+        code: codes::TRANS_5003.to_owned(),
     })?;
     f(manager)
 }
@@ -180,7 +181,7 @@ fn clear_transport_manager() -> napi::Result<()> {
         .write()
         .map_err(|_| ScpNapiError::Transport {
             message: "transport manager lock is poisoned".to_owned(),
-            code: "SCP-TRANS-5002".to_owned(),
+            code: codes::TRANS_5002.to_owned(),
         })? = None;
     Ok(())
 }
@@ -353,7 +354,7 @@ pub async fn transport_connect(relay_url: String) -> napi::Result<NapiTransportM
         }
         Err(e) => Err(ScpNapiError::Transport {
             message: format!("failed to connect to relay '{relay_url}': {e}"),
-            code: "SCP-TRANS-5001".to_owned(),
+            code: codes::TRANS_5001.to_owned(),
         }
         .into()),
     }
@@ -405,13 +406,13 @@ pub async fn transport_status(manager: &NapiTransportManager) -> napi::Result<Na
 pub async fn transport_disconnect(manager: &NapiTransportManager) -> napi::Result<()> {
     let mut s = manager.status.lock().map_err(|_| ScpNapiError::Transport {
         message: "transport status lock is poisoned".to_owned(),
-        code: "SCP-TRANS-5002".to_owned(),
+        code: codes::TRANS_5002.to_owned(),
     })?;
 
     if !s.connected {
         return Err(ScpNapiError::Transport {
             message: "transport is not connected — call transportConnect first".to_owned(),
-            code: "SCP-TRANS-5002".to_owned(),
+            code: codes::TRANS_5002.to_owned(),
         }
         .into());
     }
@@ -498,7 +499,7 @@ pub async fn configure_relay_transport(relay_url: String, local_did: String) -> 
             .await
             .map_err(|e| ScpNapiError::Transport {
                 message: format!("failed to connect to relay '{relay_url}': {e}"),
-                code: "SCP-TRANS-5001".to_owned(),
+                code: codes::TRANS_5001.to_owned(),
             })?;
 
     crate::runtime::init_context_manager_with_relay_transport(&local_did, adapter);
@@ -571,7 +572,7 @@ pub async fn transport_add_relay(relay_url: String) -> napi::Result<u32> {
             .await
             .map_err(|e| ScpNapiError::Transport {
                 message: format!("failed to connect to relay '{relay_url}': {e}"),
-                code: "SCP-TRANS-5001".to_owned(),
+                code: codes::TRANS_5001.to_owned(),
             })?;
 
     // Extract the suppression event receiver BEFORE moving the adapter into
@@ -632,7 +633,7 @@ pub fn transport_assign_relay_set(context_id: String) -> napi::Result<Vec<u32>> 
             .map_err(|e| {
                 napi::Error::from(ScpNapiError::Transport {
                     message: format!("relay set assignment failed: {e}"),
-                    code: "SCP-TRANS-5002".to_owned(),
+                    code: codes::TRANS_5002.to_owned(),
                 })
             })
     })

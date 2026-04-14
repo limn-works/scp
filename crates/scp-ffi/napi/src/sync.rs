@@ -9,6 +9,7 @@
 //! See ADR-029 in `.docs/adrs/phase-6.md`.
 
 use napi_derive::napi;
+use scp_ffi_common::error_codes as codes;
 
 use scp_core::sync::{OfflineTier, SyncPolicy, classify_offline_duration};
 
@@ -48,7 +49,7 @@ fn validate_non_negative_timestamp(value: i64, name: &str) -> napi::Result<u64> 
     if value < 0 {
         return Err(napi::Error::from(ScpNapiError::Validation {
             message: format!("{name} must be non-negative, got {value}"),
-            code: "SCP-VALID-7040".to_owned(),
+            code: codes::VALID_7040.to_owned(),
         }));
     }
     #[allow(clippy::cast_sign_loss)]

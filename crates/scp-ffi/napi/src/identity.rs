@@ -35,6 +35,7 @@
 //!
 //! See ADR-022 in `.docs/adrs/phase-4.md` and ADR-039.
 
+use scp_ffi_common::error_codes as codes;
 use std::sync::Arc;
 
 use napi::Error as NapiError;
@@ -353,7 +354,7 @@ impl NapiIdentity {
                 message: "key rotation requires in-memory custody -- \
                           enable allow_in_memory_custody"
                     .to_owned(),
-                code: "SCP-IDENT-1007".to_owned(),
+                code: codes::IDENT_1007.to_owned(),
             }
             .into())
         }
@@ -423,7 +424,7 @@ impl NapiIdentity {
         #[cfg(not(feature = "allow_in_memory_custody"))]
         {
             let _ = self;
-            Err(ScpNapiError::Identity { message: "agent key operations require in-memory custody -- enable allow_in_memory_custody".to_owned(), code: "SCP-IDENT-1007".to_owned() }.into())
+            Err(ScpNapiError::Identity { message: "agent key operations require in-memory custody -- enable allow_in_memory_custody".to_owned(), code: codes::IDENT_1007.to_owned() }.into())
         }
         #[cfg(feature = "allow_in_memory_custody")]
         {
@@ -492,7 +493,7 @@ impl NapiIdentity {
         #[cfg(not(feature = "allow_in_memory_custody"))]
         {
             let _ = self;
-            Err(ScpNapiError::Identity { message: "agent key operations require in-memory custody -- enable allow_in_memory_custody".to_owned(), code: "SCP-IDENT-1007".to_owned() }.into())
+            Err(ScpNapiError::Identity { message: "agent key operations require in-memory custody -- enable allow_in_memory_custody".to_owned(), code: codes::IDENT_1007.to_owned() }.into())
         }
         #[cfg(feature = "allow_in_memory_custody")]
         {
@@ -561,7 +562,7 @@ impl NapiIdentity {
         #[cfg(not(feature = "allow_in_memory_custody"))]
         {
             let _ = self;
-            Err(ScpNapiError::Identity { message: "agent key operations require in-memory custody -- enable allow_in_memory_custody".to_owned(), code: "SCP-IDENT-1007".to_owned() }.into())
+            Err(ScpNapiError::Identity { message: "agent key operations require in-memory custody -- enable allow_in_memory_custody".to_owned(), code: codes::IDENT_1007.to_owned() }.into())
         }
         #[cfg(feature = "allow_in_memory_custody")]
         {
@@ -639,7 +640,7 @@ impl NapiIdentity {
                 message: "identity migration requires in-memory custody -- \
                           enable allow_in_memory_custody"
                     .to_owned(),
-                code: "SCP-IDENT-1007".to_owned(),
+                code: codes::IDENT_1007.to_owned(),
             }
             .into())
         }
@@ -668,7 +669,7 @@ impl NapiIdentity {
                 .map_err(|e| {
                     NapiError::from(ScpNapiError::Identity {
                         message: format!("key generation failed during migration: {e}"),
-                        code: "SCP-IDENT-1009".to_owned(),
+                        code: codes::IDENT_1009.to_owned(),
                     })
                 })?;
 
@@ -752,7 +753,7 @@ impl NapiIdentity {
                         "{operation} requires retained crypto state — this identity was \
                          externally loaded and has no in-memory key material"
                     ),
-                    code: "SCP-IDENT-1007".to_owned(),
+                    code: codes::IDENT_1007.to_owned(),
                 })
             })?
             .clone();
@@ -767,7 +768,7 @@ impl NapiIdentity {
                         "{operation} requires in-memory custody — this identity uses \
                          external custody"
                     ),
-                    code: "SCP-IDENT-1007".to_owned(),
+                    code: codes::IDENT_1007.to_owned(),
                 })
             })?
             .clone();
@@ -782,7 +783,7 @@ impl NapiIdentity {
                         "{operation} requires a retained DID document — this identity \
                          was externally loaded"
                     ),
-                    code: "SCP-IDENT-1007".to_owned(),
+                    code: codes::IDENT_1007.to_owned(),
                 })
             })?
             .clone();
@@ -951,7 +952,7 @@ pub async fn identity_create(custody: String) -> napi::Result<NapiIdentity> {
             message:
                 "in_memory custody is not available in this build -- enable allow_in_memory_custody"
                     .to_owned(),
-            code: "SCP-IDENT-1008".to_owned(),
+            code: codes::IDENT_1008.to_owned(),
         }
         .into()),
         "platform" | "software" => Err(ScpNapiError::Identity {
@@ -961,11 +962,11 @@ pub async fn identity_create(custody: String) -> napi::Result<NapiIdentity> {
                  interface to inject Secure Enclave (iOS) or Android \
                  Keystore (Android) backed custody"
             ),
-            code: "SCP-IDENT-1003".to_owned(),
+            code: codes::IDENT_1003.to_owned(),
         }
         .into()),
         _ => Err(ScpNapiError::Identity {
-            code: "SCP-IDENT-1005".to_owned(),
+            code: codes::IDENT_1005.to_owned(),
             message: format!(
                 "internal: unexpected custody type {custody:?} passed validate_custody_type — \
                  this is a bug in the bridge layer"
@@ -1046,7 +1047,7 @@ pub async fn identity_create_with_agent_key(custody: String) -> napi::Result<Nap
             message:
                 "in_memory custody is not available in this build -- enable allow_in_memory_custody"
                     .to_owned(),
-            code: "SCP-IDENT-1008".to_owned(),
+            code: codes::IDENT_1008.to_owned(),
         }
         .into()),
         "platform" | "software" => Err(ScpNapiError::Identity {
@@ -1056,11 +1057,11 @@ pub async fn identity_create_with_agent_key(custody: String) -> napi::Result<Nap
                  interface to inject Secure Enclave (iOS) or Android \
                  Keystore (Android) backed custody"
             ),
-            code: "SCP-IDENT-1003".to_owned(),
+            code: codes::IDENT_1003.to_owned(),
         }
         .into()),
         _ => Err(ScpNapiError::Identity {
-            code: "SCP-IDENT-1005".to_owned(),
+            code: codes::IDENT_1005.to_owned(),
             message: format!(
                 "internal: unexpected custody type {custody:?} passed validate_custody_type — \
                  this is a bug in the bridge layer"
@@ -1097,7 +1098,7 @@ pub async fn identity_load(did: String) -> napi::Result<NapiIdentity> {
     if !did.starts_with("did:dht:") {
         return Err(ScpNapiError::Identity {
             message: format!("unsupported DID method: {did} — only did:dht is supported"),
-            code: "SCP-IDENT-1004".to_owned(),
+            code: codes::IDENT_1004.to_owned(),
         }
         .into());
     }
@@ -1175,7 +1176,7 @@ pub async fn identity_resolve(did: String) -> napi::Result<NapiDIDDocument> {
     if !did.starts_with("did:dht:") {
         return Err(ScpNapiError::Identity {
             message: format!("unsupported DID method: {did} — only did:dht is supported"),
-            code: "SCP-IDENT-1004".to_owned(),
+            code: codes::IDENT_1004.to_owned(),
         }
         .into());
     }
@@ -1304,7 +1305,7 @@ pub async fn identity_attest_device(did: String) -> napi::Result<String> {
     let token = attestation.attest().await.map_err(|e| {
         NapiError::from(ScpNapiError::Identity {
             message: format!("device attestation failed: {e}"),
-            code: "SCP-IDENT-1010".to_owned(),
+            code: codes::IDENT_1010.to_owned(),
         })
     })?;
 
@@ -1355,7 +1356,7 @@ pub async fn identity_verify_device_attestation(
         .map_err(|e| {
             NapiError::from(ScpNapiError::Identity {
                 message: format!("invalid base64 attestation token: {e}"),
-                code: "SCP-IDENT-1011".to_owned(),
+                code: codes::IDENT_1011.to_owned(),
             })
         })?;
 
@@ -1365,7 +1366,7 @@ pub async fn identity_verify_device_attestation(
     attestation.verify(&token).await.map_err(|e| {
         NapiError::from(ScpNapiError::Identity {
             message: format!("device attestation verification failed: {e}"),
-            code: "SCP-IDENT-1012".to_owned(),
+            code: codes::IDENT_1012.to_owned(),
         })
     })
 }
@@ -1405,7 +1406,7 @@ pub async fn identity_create_link_attestation(
     let method: VerificationMethod = verification_method.parse().map_err(|e: String| {
         NapiError::from(ScpNapiError::Identity {
             message: e,
-            code: "SCP-IDENT-1040".to_owned(),
+            code: codes::IDENT_1040.to_owned(),
         })
     })?;
 
@@ -1426,7 +1427,7 @@ pub async fn identity_create_link_attestation(
         .map_err(|_| {
             NapiError::from(ScpNapiError::Identity {
                 message: "system clock is before UNIX epoch".to_owned(),
-                code: "SCP-IDENT-1042".to_owned(),
+                code: codes::IDENT_1042.to_owned(),
             })
         })?
         .as_secs();
@@ -1463,14 +1464,14 @@ pub async fn identity_create_link_attestation(
                     .collect::<Vec<_>>()
                     .join("; "),
             ),
-            code: "SCP-IDENT-1041".to_owned(),
+            code: codes::IDENT_1041.to_owned(),
         }));
     }
 
     let canonical = attestation.canonical_signing_bytes().map_err(|e| {
         NapiError::from(ScpNapiError::Identity {
             message: format!("attestation signing failed: {e}"),
-            code: "SCP-IDENT-1041".to_owned(),
+            code: codes::IDENT_1041.to_owned(),
         })
     })?;
 
@@ -1478,7 +1479,7 @@ pub async fn identity_create_link_attestation(
     let rt = tokio::runtime::Handle::try_current().map_err(|e| {
         NapiError::from(ScpNapiError::Identity {
             message: format!("no tokio runtime: {e}"),
-            code: "SCP-IDENT-1041".to_owned(),
+            code: codes::IDENT_1041.to_owned(),
         })
     })?;
 
@@ -1486,7 +1487,7 @@ pub async fn identity_create_link_attestation(
         .map_err(|e| {
             NapiError::from(ScpNapiError::Identity {
                 message: format!("Ed25519 signing failed: {e}"),
-                code: "SCP-IDENT-1041".to_owned(),
+                code: codes::IDENT_1041.to_owned(),
             })
         })?;
     attestation.signature = sig.as_bytes().to_vec();
@@ -1499,7 +1500,7 @@ pub async fn identity_create_link_attestation(
                 message: "active signing key was rotated during attestation creation — \
                          please retry"
                     .to_owned(),
-                code: "SCP-IDENT-1041".to_owned(),
+                code: codes::IDENT_1041.to_owned(),
             });
         }
 
@@ -1509,7 +1510,7 @@ pub async fn identity_create_link_attestation(
                     "DID has reached the per-identity attestation limit \
                      ({MAX_IDENTITY_LINK_ATTESTATIONS_PER_DID}) — cannot store additional attestations"
                 ),
-                code: "SCP-VALID-7403".to_owned(),
+                code: codes::VALID_7403.to_owned(),
             });
         }
         entry.identity_link_attestations.push(attestation.clone());
@@ -1520,7 +1521,7 @@ pub async fn identity_create_link_attestation(
     serde_json::to_string(&attestation).map_err(|e| {
         NapiError::from(ScpNapiError::Identity {
             message: format!("failed to serialize attestation: {e}"),
-            code: "SCP-IDENT-1042".to_owned(),
+            code: codes::IDENT_1042.to_owned(),
         })
     })
 }
@@ -1535,7 +1536,7 @@ pub fn identity_link_attestations(did: String) -> napi::Result<String> {
         serde_json::to_string(&entry.identity_link_attestations).map_err(|e| {
             ScpNapiError::Identity {
                 message: format!("failed to serialize attestations: {e}"),
-                code: "SCP-IDENT-1043".to_owned(),
+                code: codes::IDENT_1043.to_owned(),
             }
         })
     })
@@ -1579,14 +1580,14 @@ pub async fn identity_verify_link_attestation(
         serde_json::from_str(&attestation_json).map_err(|e| {
             NapiError::from(ScpNapiError::Identity {
                 message: format!("failed to parse attestation JSON: {e}"),
-                code: "SCP-IDENT-1044".to_owned(),
+                code: codes::IDENT_1044.to_owned(),
             })
         })?;
 
     let pub_bytes = hex::decode(&issuer_public_key_hex).map_err(|e| {
         NapiError::from(ScpNapiError::Identity {
             message: format!("invalid issuer_public_key_hex: {e}"),
-            code: "SCP-IDENT-1044".to_owned(),
+            code: codes::IDENT_1044.to_owned(),
         })
     })?;
     Ok(attestation.verify_signature(&pub_bytes).is_ok())
@@ -1629,7 +1630,7 @@ pub fn identity_execute_recovery(
                 message: format!(
                     "invalid compromise tier: {other}; expected 'agent', 'active_signing', or 'identity_key'"
                 ),
-                code: "SCP-IDENT-1020".to_owned(),
+                code: codes::IDENT_1020.to_owned(),
             }));
         }
     };
@@ -1690,7 +1691,7 @@ pub fn identity_execute_recovery(
     let handle = tokio::runtime::Handle::try_current().map_err(|e| {
         NapiError::from(ScpNapiError::Identity {
             message: format!("tokio runtime not available: {e}"),
-            code: "SCP-IDENT-1027".to_owned(),
+            code: codes::IDENT_1027.to_owned(),
         })
     })?;
 
@@ -1706,14 +1707,14 @@ pub fn identity_execute_recovery(
         .map_err(|e| {
             NapiError::from(ScpNapiError::Identity {
                 message: format!("recovery failed: {e}"),
-                code: "SCP-IDENT-1022".to_owned(),
+                code: codes::IDENT_1022.to_owned(),
             })
         })?;
 
     serde_json::to_string(&result).map_err(|e| {
         NapiError::from(ScpNapiError::Identity {
             message: format!("failed to serialize recovery result: {e}"),
-            code: "SCP-IDENT-1023".to_owned(),
+            code: codes::IDENT_1023.to_owned(),
         })
     })
 }
@@ -1753,7 +1754,7 @@ pub fn identity_execute_custody_migration(
                 message: format!(
                     "invalid custody migration target: {other}; expected 'platform_managed', 'hardware', 'software', or 'in_memory'"
                 ),
-                code: "SCP-IDENT-1024".to_owned(),
+                code: codes::IDENT_1024.to_owned(),
             }));
         }
     };
@@ -1810,7 +1811,7 @@ pub fn identity_execute_custody_migration(
     let handle = tokio::runtime::Handle::try_current().map_err(|e| {
         NapiError::from(ScpNapiError::Identity {
             message: format!("tokio runtime not available: {e}"),
-            code: "SCP-IDENT-1028".to_owned(),
+            code: codes::IDENT_1028.to_owned(),
         })
     })?;
 
@@ -1819,14 +1820,14 @@ pub fn identity_execute_custody_migration(
         .map_err(|e| {
             NapiError::from(ScpNapiError::Identity {
                 message: format!("custody migration failed: {e}"),
-                code: "SCP-IDENT-1025".to_owned(),
+                code: codes::IDENT_1025.to_owned(),
             })
         })?;
 
     serde_json::to_string(&result).map_err(|e| {
         NapiError::from(ScpNapiError::Identity {
             message: format!("failed to serialize custody migration result: {e}"),
-            code: "SCP-IDENT-1026".to_owned(),
+            code: codes::IDENT_1026.to_owned(),
         })
     })
 }
@@ -1840,6 +1841,7 @@ pub fn identity_execute_custody_migration(
 #[allow(clippy::expect_used, clippy::panic)]
 mod tests {
     use super::*;
+    use scp_ffi_common::error_codes as codes;
 
     /// Creates a test `NapiIdentity` with in-memory custody, returning the
     /// identity and its initial active signing key's public key (multibase).
@@ -2019,7 +2021,7 @@ mod tests {
 
         let msg = err.to_string();
         assert!(
-            msg.contains("SCP-IDENT-1007"),
+            msg.contains(codes::IDENT_1007),
             "error must contain SCP-IDENT-1007, got: {msg}"
         );
     }
@@ -2310,7 +2312,7 @@ mod tests {
 
         let msg = err.to_string();
         assert!(
-            msg.contains("SCP-IDENT-1007"),
+            msg.contains(codes::IDENT_1007),
             "error must contain SCP-IDENT-1007, got: {msg}"
         );
     }

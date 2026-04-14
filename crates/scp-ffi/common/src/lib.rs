@@ -16,6 +16,7 @@
 //!
 //! See §3.10.10, §9.5, §7.4.1, §22.3.1, §22.4, §22.8 in `.docs/specs/`.
 
+pub mod error_codes;
 pub mod validate;
 
 mod bridge_id;
@@ -77,6 +78,11 @@ pub fn html_escape_json(json: &str) -> String {
         .replace('&', "\\u0026")
         .replace('\'', "\\u0027")
 }
+
+// Shared context-parameter builder for all non-WASM bridges.
+// Requires scp-core (behind `resolvers` feature). Not available for WASM.
+#[cfg(feature = "resolvers")]
+pub mod context_params;
 
 // Trust store shared across PyO3, napi-rs, and UniFFI bridges.
 // Requires scp-core (behind `resolvers` feature). Not available for WASM.

@@ -11,6 +11,7 @@
 //! See ADR-024 in `.docs/adrs/phase-5.md`.
 
 use napi_derive::napi;
+use scp_ffi_common::error_codes as codes;
 
 use scp_media::session::{
     MediaCapability, MediaSession, MediaSessionState, activate_session, check_media_capability,
@@ -36,7 +37,7 @@ fn parse_media_capability(s: &str) -> napi::Result<MediaCapability> {
             message: format!(
                 "invalid media capability '{other}': expected 'voice', 'video', or 'screen_share'"
             ),
-            code: "SCP-VALID-7300".to_owned(),
+            code: codes::VALID_7300.to_owned(),
         }
         .into()),
     }
@@ -61,7 +62,7 @@ const fn state_to_string(state: &MediaSessionState) -> &'static str {
 fn media_error_to_napi(e: scp_media::keys::MediaError) -> napi::Error {
     ScpNapiError::Context {
         message: e.to_string(),
-        code: "SCP-CTX-2500".to_owned(),
+        code: codes::CTX_2500.to_owned(),
     }
     .into()
 }
@@ -78,7 +79,7 @@ fn session_to_json(session: &MediaSession) -> napi::Result<String> {
     .map_err(|e| {
         napi::Error::from(ScpNapiError::Validation {
             message: format!("failed to serialize session: {e}"),
-            code: "SCP-VALID-7301".to_owned(),
+            code: codes::VALID_7301.to_owned(),
         })
     })
 }
@@ -149,7 +150,7 @@ pub fn media_activate_session(session_json: String) -> napi::Result<String> {
     let mut session: MediaSession = serde_json::from_str(&session_json).map_err(|e| {
         napi::Error::from(ScpNapiError::Validation {
             message: format!("invalid session JSON: {e}"),
-            code: "SCP-VALID-7301".to_owned(),
+            code: codes::VALID_7301.to_owned(),
         })
     })?;
 
@@ -165,7 +166,7 @@ pub fn media_join_session(session_json: String, participant_did: String) -> napi
     let mut session: MediaSession = serde_json::from_str(&session_json).map_err(|e| {
         napi::Error::from(ScpNapiError::Validation {
             message: format!("invalid session JSON: {e}"),
-            code: "SCP-VALID-7301".to_owned(),
+            code: codes::VALID_7301.to_owned(),
         })
     })?;
 
@@ -181,7 +182,7 @@ pub fn media_end_session(session_json: String, timestamp: f64) -> napi::Result<S
     let mut session: MediaSession = serde_json::from_str(&session_json).map_err(|e| {
         napi::Error::from(ScpNapiError::Validation {
             message: format!("invalid session JSON: {e}"),
-            code: "SCP-VALID-7301".to_owned(),
+            code: codes::VALID_7301.to_owned(),
         })
     })?;
 
@@ -211,7 +212,7 @@ pub fn media_end_session(session_json: String, timestamp: f64) -> napi::Result<S
     .map_err(|e| {
         napi::Error::from(ScpNapiError::Validation {
             message: format!("failed to serialize result: {e}"),
-            code: "SCP-VALID-7301".to_owned(),
+            code: codes::VALID_7301.to_owned(),
         })
     })
 }
@@ -233,13 +234,13 @@ pub fn media_create_offer(
     let msg_json = String::from_utf8(serialize_signaling(&msg).map_err(|e| {
         napi::Error::from(ScpNapiError::Validation {
             message: format!("failed to serialize signaling: {e}"),
-            code: "SCP-VALID-7302".to_owned(),
+            code: codes::VALID_7302.to_owned(),
         })
     })?)
     .map_err(|e| {
         napi::Error::from(ScpNapiError::Validation {
             message: format!("signaling bytes are not valid UTF-8: {e}"),
-            code: "SCP-VALID-7302".to_owned(),
+            code: codes::VALID_7302.to_owned(),
         })
     })?;
 
@@ -250,7 +251,7 @@ pub fn media_create_offer(
     .map_err(|e| {
         napi::Error::from(ScpNapiError::Validation {
             message: format!("failed to serialize result: {e}"),
-            code: "SCP-VALID-7302".to_owned(),
+            code: codes::VALID_7302.to_owned(),
         })
     })
 }
@@ -268,13 +269,13 @@ pub fn media_create_answer(
     let msg_json = String::from_utf8(serialize_signaling(&msg).map_err(|e| {
         napi::Error::from(ScpNapiError::Validation {
             message: format!("failed to serialize signaling: {e}"),
-            code: "SCP-VALID-7302".to_owned(),
+            code: codes::VALID_7302.to_owned(),
         })
     })?)
     .map_err(|e| {
         napi::Error::from(ScpNapiError::Validation {
             message: format!("signaling bytes are not valid UTF-8: {e}"),
-            code: "SCP-VALID-7302".to_owned(),
+            code: codes::VALID_7302.to_owned(),
         })
     })?;
 
@@ -285,7 +286,7 @@ pub fn media_create_answer(
     .map_err(|e| {
         napi::Error::from(ScpNapiError::Validation {
             message: format!("failed to serialize result: {e}"),
-            code: "SCP-VALID-7302".to_owned(),
+            code: codes::VALID_7302.to_owned(),
         })
     })
 }
@@ -314,13 +315,13 @@ pub fn media_create_ice_candidate(
     let msg_json = String::from_utf8(serialize_signaling(&msg).map_err(|e| {
         napi::Error::from(ScpNapiError::Validation {
             message: format!("failed to serialize signaling: {e}"),
-            code: "SCP-VALID-7302".to_owned(),
+            code: codes::VALID_7302.to_owned(),
         })
     })?)
     .map_err(|e| {
         napi::Error::from(ScpNapiError::Validation {
             message: format!("signaling bytes are not valid UTF-8: {e}"),
-            code: "SCP-VALID-7302".to_owned(),
+            code: codes::VALID_7302.to_owned(),
         })
     })?;
 
@@ -331,7 +332,7 @@ pub fn media_create_ice_candidate(
     .map_err(|e| {
         napi::Error::from(ScpNapiError::Validation {
             message: format!("failed to serialize result: {e}"),
-            code: "SCP-VALID-7302".to_owned(),
+            code: codes::VALID_7302.to_owned(),
         })
     })
 }
@@ -345,13 +346,13 @@ pub fn media_create_session_end(session_id: String, sender_did: String) -> napi:
     let msg_json = String::from_utf8(serialize_signaling(&msg).map_err(|e| {
         napi::Error::from(ScpNapiError::Validation {
             message: format!("failed to serialize signaling: {e}"),
-            code: "SCP-VALID-7302".to_owned(),
+            code: codes::VALID_7302.to_owned(),
         })
     })?)
     .map_err(|e| {
         napi::Error::from(ScpNapiError::Validation {
             message: format!("signaling bytes are not valid UTF-8: {e}"),
-            code: "SCP-VALID-7302".to_owned(),
+            code: codes::VALID_7302.to_owned(),
         })
     })?;
 
@@ -362,7 +363,7 @@ pub fn media_create_session_end(session_id: String, sender_did: String) -> napi:
     .map_err(|e| {
         napi::Error::from(ScpNapiError::Validation {
             message: format!("failed to serialize result: {e}"),
-            code: "SCP-VALID-7302".to_owned(),
+            code: codes::VALID_7302.to_owned(),
         })
     })
 }
@@ -375,13 +376,13 @@ pub fn media_send_signaling(signaling_json: String) -> napi::Result<String> {
     let msg = deserialize_signaling(signaling_json.as_bytes()).map_err(|e| {
         napi::Error::from(ScpNapiError::Validation {
             message: format!("invalid signaling JSON: {e}"),
-            code: "SCP-VALID-7303".to_owned(),
+            code: codes::VALID_7303.to_owned(),
         })
     })?;
     let (payload, message_type) = send_signaling(&msg).map_err(|e| {
         napi::Error::from(ScpNapiError::Validation {
             message: format!("failed to serialize signaling: {e}"),
-            code: "SCP-VALID-7302".to_owned(),
+            code: codes::VALID_7302.to_owned(),
         })
     })?;
 
@@ -393,7 +394,7 @@ pub fn media_send_signaling(signaling_json: String) -> napi::Result<String> {
     .map_err(|e| {
         napi::Error::from(ScpNapiError::Validation {
             message: format!("failed to serialize result: {e}"),
-            code: "SCP-VALID-7302".to_owned(),
+            code: codes::VALID_7302.to_owned(),
         })
     })
 }
@@ -409,13 +410,13 @@ pub fn media_verify_sender_attribution(
     let msg = deserialize_signaling(signaling_json.as_bytes()).map_err(|e| {
         napi::Error::from(ScpNapiError::Validation {
             message: format!("invalid signaling JSON: {e}"),
-            code: "SCP-VALID-7303".to_owned(),
+            code: codes::VALID_7303.to_owned(),
         })
     })?;
     verify_sender_attribution(&msg, &envelope_sender_did).map_err(|e| {
         napi::Error::from(ScpNapiError::Context {
             message: format!("sender attribution verification failed: {e}"),
-            code: "SCP-CTX-2501".to_owned(),
+            code: codes::CTX_2501.to_owned(),
         })
     })?;
     Ok(true)

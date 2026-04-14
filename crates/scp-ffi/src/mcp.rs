@@ -37,6 +37,7 @@
 //!
 //! See ADR-015 in `.docs/adrs/phase-3.md` for the full MCP adapter design.
 
+use scp_ffi_common::error_codes as codes;
 use std::io::{BufRead, BufReader, Write};
 use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -1929,7 +1930,7 @@ fn allowlist_err(e: allowlist::AllowlistError) -> ScpPyError {
         | AllowlistError::PathInCommand(_)
         | AllowlistError::InvalidCommand(_) => ScpPyError::ValidationError {
             message: msg,
-            code: "SCP-VALID-7033".to_owned(),
+            code: codes::VALID_7033.to_owned(),
         },
         AllowlistError::NotAllowed { .. } | AllowlistError::LockPoisoned => {
             ScpPyError::transport(msg)

@@ -26,6 +26,7 @@
 //!
 //! See ADR-016 (UCAN Enforcement) and ADR-022 in `.docs/adrs/`.
 
+use scp_ffi_common::error_codes as codes;
 use std::collections::HashMap;
 
 use napi_derive::napi;
@@ -233,7 +234,7 @@ pub async fn ucan_validate(
             .parse()
             .map_err(|e: CoreUcanError| ScpNapiError::Permission {
                 message: format!("invalid capability URI '{capability}': {e}"),
-                code: "SCP-PERM-3001".to_owned(),
+                code: codes::PERM_3001.to_owned(),
             })?;
 
     // Determine the presenting agent DID: explicit parameter or token audience.
@@ -336,7 +337,7 @@ pub async fn ucan_mint(
         let _ = (&handle, &member_did, &capabilities, &proofs);
         Err(napi::Error::from(ScpNapiError::Permission {
             message: "UCAN minting requires key custody -- the in_memory custody path                       is not available in this build. Enable allow_in_memory_custody                       for dev/desktop use.".to_owned(),
-            code: "SCP-PERM-3023".to_owned(),
+            code: codes::PERM_3023.to_owned(),
         }))
     }
 
@@ -348,7 +349,7 @@ pub async fn ucan_mint(
                 message: "UCAN minting requires key custody — create the context with an \
                       in_memory identity (identity_create(\"in_memory\"))"
                     .to_owned(),
-                code: "SCP-PERM-3023".to_owned(),
+                code: codes::PERM_3023.to_owned(),
             })
         })?;
         let signing_key = handle.signing_key.ok_or_else(|| {
@@ -356,7 +357,7 @@ pub async fn ucan_mint(
                 message: "UCAN minting requires a signing key — the context creator identity \
                       must have an active signing key"
                     .to_owned(),
-                code: "SCP-PERM-3023".to_owned(),
+                code: codes::PERM_3023.to_owned(),
             })
         })?;
 
@@ -397,7 +398,7 @@ pub async fn ucan_mint(
             .map_err(|e| {
                 napi::Error::from(ScpNapiError::Permission {
                     message: format!("UCAN minting failed: {e}"),
-                    code: "SCP-PERM-3023".to_owned(),
+                    code: codes::PERM_3023.to_owned(),
                 })
             })?;
 
@@ -487,7 +488,7 @@ pub async fn ucan_delegate(
                        is not available in this build. Enable allow_in_memory_custody \
                        for dev/desktop use."
                 .to_owned(),
-            code: "SCP-PERM-3023".to_owned(),
+            code: codes::PERM_3023.to_owned(),
         }))
     }
 
@@ -513,7 +514,7 @@ pub async fn ucan_delegate(
                     "delegator DID '{}' does not match parent token audience '{}'",
                     delegator_did, parsed_parent.payload.aud
                 ),
-                code: "SCP-PERM-3023".to_owned(),
+                code: codes::PERM_3023.to_owned(),
             }));
         }
 
@@ -533,7 +534,7 @@ pub async fn ucan_delegate(
                         .parse()
                         .map_err(|e: CoreUcanError| ScpNapiError::Permission {
                             message: format!("invalid capability URI '{cap_uri_str}': {e}"),
-                            code: "SCP-PERM-3023".to_owned(),
+                            code: codes::PERM_3023.to_owned(),
                         })?;
                 Ok(Attenuation {
                     with: cap_uri_str,
@@ -991,7 +992,7 @@ mod tests {
                 .check_and_record(&nonce, expiry)
                 .map_err(|e| crate::error::ScpNapiError::Permission {
                     message: format!("nonce check failed: {e}"),
-                    code: "SCP-PERM-3001".to_owned(),
+                    code: codes::PERM_3001.to_owned(),
                 })
         });
         assert!(first_result.is_ok(), "first nonce use should succeed");
@@ -1002,7 +1003,7 @@ mod tests {
                 .check_and_record(&nonce, expiry)
                 .map_err(|e| crate::error::ScpNapiError::Permission {
                     message: format!("nonce check failed: {e}"),
-                    code: "SCP-PERM-3001".to_owned(),
+                    code: codes::PERM_3001.to_owned(),
                 })
         });
         assert!(
@@ -1017,7 +1018,7 @@ mod tests {
                 .check_and_record(&different_nonce, expiry)
                 .map_err(|e| crate::error::ScpNapiError::Permission {
                     message: format!("nonce check failed: {e}"),
-                    code: "SCP-PERM-3001".to_owned(),
+                    code: codes::PERM_3001.to_owned(),
                 })
         });
         assert!(third_result.is_ok(), "unique nonce should be accepted");

@@ -29,6 +29,7 @@
 //! See ADR-022 in `.docs/adrs/phase-4.md`.
 
 use js_sys::Promise;
+use scp_ffi_common::error_codes as codes;
 use wasm_bindgen::prelude::*;
 use wasm_bindgen_futures::future_to_promise;
 
@@ -123,7 +124,7 @@ pub fn trust_verify_attestation(attestation_json: String) -> Promise {
             message: "attestation signature verification requires WebCrypto \
                       — implement in TypeScript wrapper layer"
                 .to_owned(),
-            code: "SCP-VALID-7070".to_owned(),
+            code: codes::VALID_7070.to_owned(),
         }
         .into_js()
         .into())
@@ -245,7 +246,7 @@ pub fn trust_verify_response(challenge_json: String, response_json: String) -> P
             message: "challenge response signature verification requires WebCrypto \
                       — implement in TypeScript wrapper layer"
                 .to_owned(),
-            code: "SCP-VALID-7071".to_owned(),
+            code: codes::VALID_7071.to_owned(),
         }
         .into_js()
         .into())
@@ -361,7 +362,7 @@ pub fn aggregate_trust_input(
             message: "trust aggregation requires the full scp-core pipeline \
                       — use the native (NAPI) bridge instead of the WASM bridge"
                 .to_owned(),
-            code: "SCP-VALID-7072".to_owned(),
+            code: codes::VALID_7072.to_owned(),
         }
         .into_js()
         .into())

@@ -8,6 +8,7 @@
 //!
 //! See spec §3.11 and the `scp-core` `scpid` module.
 
+use scp_ffi_common::error_codes as codes;
 use std::time::Duration;
 
 use pyo3::prelude::*;
@@ -46,14 +47,14 @@ pub fn py_scpid_challenge(audience: String, ttl_seconds: u64) -> PyResult<String
     let challenge = scpid_challenge(&audience, Duration::from_secs(ttl_seconds)).map_err(|e| {
         ScpPyError::ValidationError {
             message: e.to_string(),
-            code: "SCP-IDENT-1038".to_string(),
+            code: codes::IDENT_1038.to_string(),
         }
     })?;
 
     serde_json::to_string(&challenge).map_err(|e| {
         ScpPyError::IdentityError {
             message: format!("failed to serialize SCPID challenge: {e}"),
-            code: "SCP-IDENT-1037".to_string(),
+            code: codes::IDENT_1037.to_string(),
         }
         .into()
     })
@@ -90,7 +91,7 @@ pub fn py_scpid_sign(
     let challenge: ScpIdChallenge =
         serde_json::from_str(&challenge_json).map_err(|e| ScpPyError::ValidationError {
             message: format!("invalid challenge JSON: {e}"),
-            code: "SCP-IDENT-1038".to_string(),
+            code: codes::IDENT_1038.to_string(),
         })?;
 
     let rt = crate::runtime()?;
@@ -106,7 +107,7 @@ pub fn py_scpid_sign(
                                 "identity '{did}' has no agent signing key — \
                              create one with py_identity_add_agent_key first"
                             ),
-                            code: "SCP-IDENT-1034".to_string(),
+                            code: codes::IDENT_1034.to_string(),
                         }
                     })?,
                 };
@@ -121,12 +122,12 @@ pub fn py_scpid_sign(
 
             let response = response.map_err(|e| ScpPyError::IdentityError {
                 message: e.to_string(),
-                code: "SCP-IDENT-1037".to_string(),
+                code: codes::IDENT_1037.to_string(),
             })?;
 
             serde_json::to_string(&response).map_err(|e| ScpPyError::IdentityError {
                 message: format!("failed to serialize SCPID response: {e}"),
-                code: "SCP-IDENT-1037".to_string(),
+                code: codes::IDENT_1037.to_string(),
             })
         })
     })?)
@@ -161,13 +162,13 @@ pub fn py_scpid_verify(
     let response: ScpIdResponse =
         serde_json::from_str(&response_json).map_err(|e| ScpPyError::ValidationError {
             message: format!("invalid response JSON: {e}"),
-            code: "SCP-IDENT-1038".to_string(),
+            code: codes::IDENT_1038.to_string(),
         })?;
 
     let challenge: ScpIdChallenge =
         serde_json::from_str(&challenge_json).map_err(|e| ScpPyError::ValidationError {
             message: format!("invalid challenge JSON: {e}"),
-            code: "SCP-IDENT-1038".to_string(),
+            code: codes::IDENT_1038.to_string(),
         })?;
 
     let rt = crate::runtime()?;
@@ -177,7 +178,7 @@ pub fn py_scpid_verify(
             message: "DID resolver not initialized — create an identity with \
                       py_identity_create before calling scpid_verify"
                 .to_string(),
-            code: "SCP-IDENT-1033".to_string(),
+            code: codes::IDENT_1033.to_string(),
         })?;
 
         let auth = rt
@@ -190,7 +191,7 @@ pub fn py_scpid_verify(
         serde_json::to_string(&auth).map_err(|e| {
             ScpPyError::IdentityError {
                 message: format!("failed to serialize SCPID authentication: {e}"),
-                code: "SCP-IDENT-1037".to_string(),
+                code: codes::IDENT_1037.to_string(),
             }
             .into()
         })
@@ -209,7 +210,7 @@ fn parse_signing_key_id(s: &str) -> PyResult<SigningKeyId> {
         "#agent" => Ok(SigningKeyId::Agent),
         other => Err(ScpPyError::ValidationError {
             message: format!("invalid signing_key_id '{other}': expected '#active' or '#agent'"),
-            code: "SCP-IDENT-1034".to_string(),
+            code: codes::IDENT_1034.to_string(),
         }
         .into()),
     }
@@ -219,15 +220,15 @@ fn parse_signing_key_id(s: &str) -> PyResult<SigningKeyId> {
 const fn scpid_error_code(e: &scp_core::identity::ScpIdError) -> &'static str {
     use scp_core::identity::ScpIdError;
     match e {
-        ScpIdError::ChallengeExpired => "SCP-IDENT-1030",
-        ScpIdError::AudienceMismatch => "SCP-IDENT-1031",
-        ScpIdError::TimestampInvalid => "SCP-IDENT-1032",
-        ScpIdError::DidResolutionFailed(_) => "SCP-IDENT-1033",
-        ScpIdError::KeyNotAuthorized => "SCP-IDENT-1034",
-        ScpIdError::SignatureInvalid => "SCP-IDENT-1035",
-        ScpIdError::DidDocumentStale => "SCP-IDENT-1036",
-        ScpIdError::SigningFailed(_) => "SCP-IDENT-1037",
-        ScpIdError::InvalidInput(_) => "SCP-IDENT-1038",
+        ScpIdError::ChallengeExpired => codes::IDENT_1030,
+        ScpIdError::AudienceMismatch => codes::IDENT_1031,
+        ScpIdError::TimestampInvalid => codes::IDENT_1032,
+        ScpIdError::DidResolutionFailed(_) => codes::IDENT_1033,
+        ScpIdError::KeyNotAuthorized => codes::IDENT_1034,
+        ScpIdError::SignatureInvalid => codes::IDENT_1035,
+        ScpIdError::DidDocumentStale => codes::IDENT_1036,
+        ScpIdError::SigningFailed(_) => codes::IDENT_1037,
+        ScpIdError::InvalidInput(_) => codes::IDENT_1038,
     }
 }
 
@@ -255,6 +256,7 @@ pub fn register_scpid(m: &Bound<'_, PyModule>) -> PyResult<()> {
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
+    use scp_ffi_common::error_codes as codes;
     use std::sync::Arc;
 
     use scp_identity::resolver::DualLayerResolver;
@@ -311,39 +313,39 @@ mod tests {
 
         assert_eq!(
             scpid_error_code(&ScpIdError::ChallengeExpired),
-            "SCP-IDENT-1030"
+            codes::IDENT_1030
         );
         assert_eq!(
             scpid_error_code(&ScpIdError::AudienceMismatch),
-            "SCP-IDENT-1031"
+            codes::IDENT_1031
         );
         assert_eq!(
             scpid_error_code(&ScpIdError::TimestampInvalid),
-            "SCP-IDENT-1032"
+            codes::IDENT_1032
         );
         assert_eq!(
             scpid_error_code(&ScpIdError::DidResolutionFailed("test".to_owned())),
-            "SCP-IDENT-1033"
+            codes::IDENT_1033
         );
         assert_eq!(
             scpid_error_code(&ScpIdError::KeyNotAuthorized),
-            "SCP-IDENT-1034"
+            codes::IDENT_1034
         );
         assert_eq!(
             scpid_error_code(&ScpIdError::SignatureInvalid),
-            "SCP-IDENT-1035"
+            codes::IDENT_1035
         );
         assert_eq!(
             scpid_error_code(&ScpIdError::DidDocumentStale),
-            "SCP-IDENT-1036"
+            codes::IDENT_1036
         );
         assert_eq!(
             scpid_error_code(&ScpIdError::SigningFailed("test".to_owned())),
-            "SCP-IDENT-1037"
+            codes::IDENT_1037
         );
         assert_eq!(
             scpid_error_code(&ScpIdError::InvalidInput("test".to_owned())),
-            "SCP-IDENT-1038"
+            codes::IDENT_1038
         );
     }
 
@@ -421,7 +423,7 @@ mod tests {
         let err = result.unwrap_err();
         let err_str = err.to_string();
         assert!(
-            err_str.contains("SCP-IDENT-1038"),
+            err_str.contains(codes::IDENT_1038),
             "expected SCP-IDENT-1038 in error, got: {err_str}"
         );
     }
@@ -452,7 +454,7 @@ mod tests {
         let err = result.unwrap_err();
         let err_str = err.to_string();
         assert!(
-            err_str.contains("SCP-IDENT-1038"),
+            err_str.contains(codes::IDENT_1038),
             "expected SCP-IDENT-1038 in error, got: {err_str}"
         );
     }

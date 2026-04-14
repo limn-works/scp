@@ -284,59 +284,22 @@ impl PyNodeHandle {
         let rt = crate::runtime()?;
 
         // Resolve broadcast key: explicit or auto-lookup from ContextManager.
-        let (resolved_key_bytes, resolved_epoch, resolved_author_did) = match (
-            broadcast_key_hex,
-            author_did,
-        ) {
-            (Some(key_hex), Some(did)) => {
-                let key_hex = Zeroizing::new(key_hex);
-                let key_vec = Zeroizing::new(hex::decode(&*key_hex).map_err(|e| {
-                    pyo3::exceptions::PyValueError::new_err(format!(
-                        "invalid broadcast_key_hex: {e}"
-                    ))
-                })?);
-                let key_bytes: Zeroizing<[u8; 32]> =
-                    Zeroizing::new(<[u8; 32]>::try_from(key_vec.as_slice()).map_err(|_| {
-                        pyo3::exceptions::PyValueError::new_err(
-                            "broadcast_key_hex must be exactly 64 hex characters (32 bytes)",
-                        )
-                    })?);
-                // Explicit key path always uses epoch 0. For rotated keys, use auto-resolve (omit both params).
-                (key_bytes, 0u64, did)
-            }
-            (None, author_opt) => {
-                // Auto-resolve from ContextManager. Use provided author_did
-                // or fall back to node's identity DID.
-                let did = author_opt.unwrap_or_else(|| self.inner.did().to_owned());
-                let mgr = crate::runtime::context_manager().map_err(|e| {
-                    pyo3::exceptions::PyRuntimeError::new_err(format!(
-                        "broadcast key auto-lookup failed: {e}"
-                    ))
-                })?;
-                let (key_bytes, epoch) = py.allow_threads(|| {
-                        rt.block_on(mgr.get_broadcast_key_for_local_author(&context_id, &did))
-                            .map_err(|e| {
-                                tracing::debug!(error = %e, "broadcast key auto-resolve failed");
-                                pyo3::exceptions::PyRuntimeError::new_err(
-                                    "broadcast key auto-resolve failed: not authorized for this context",
-                                )
-                            })
-                    })?;
-                (key_bytes, epoch, did)
-            }
-            (Some(_), None) => {
-                return Err(pyo3::exceptions::PyValueError::new_err(
-                    "broadcast_key_hex requires author_did — provide the DID of the \
-                     broadcast key owner, or omit both for auto-resolve",
-                ));
-            }
-        };
-
-        let broadcast_key = scp_core::crypto::sender_keys::BroadcastKey::from_parts(
-            scp_core::crypto::sender_keys::SenderKey::from_bytes(*resolved_key_bytes),
-            resolved_epoch,
-            resolved_author_did,
-        );
+        let mgr = crate::runtime::context_manager().map_err(|e| {
+            pyo3::exceptions::PyRuntimeError::new_err(format!(
+                "broadcast key auto-lookup failed: {e}"
+            ))
+        })?;
+        let resolved = py.allow_threads(|| {
+            rt.block_on(server::resolve_broadcast_key(
+                broadcast_key_hex,
+                author_did,
+                self.inner.did(),
+                mgr,
+                &context_id,
+            ))
+            .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))
+        })?;
+        let broadcast_key = resolved.into_broadcast_key();
 
         let adm = match admission.to_lowercase().as_str() {
             "open" => scp_core::context::broadcast::BroadcastAdmission::Open,

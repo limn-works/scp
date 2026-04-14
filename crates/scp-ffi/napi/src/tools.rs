@@ -9,6 +9,7 @@
 //! See ADR-022 in `.docs/adrs/phase-4.md`.
 
 use napi_derive::napi;
+use scp_ffi_common::error_codes as codes;
 use scp_ffi_common::validate::{
     validate_did, validate_tool_id, validate_tool_name, validate_ucan_token,
 };
@@ -57,7 +58,7 @@ fn validate_ucan_for_tool(
         )
         .map_err(|e| ScpNapiError::Permission {
             message: format!("UCAN authorization failed for tool '{tool_id}': {e}"),
-            code: "SCP-PERM-3001".to_owned(),
+            code: codes::PERM_3001.to_owned(),
         })
     })
 }
@@ -127,8 +128,8 @@ pub struct NapiToolVerificationResult {
 /// `SCP-VALID-7036` for `output_schema_json` when the JSON is malformed.
 fn validate_schema_json(json: &str, field_name: &str) -> napi::Result<serde_json::Value> {
     let code = match field_name {
-        "input_schema_json" => "SCP-VALID-7035",
-        _ => "SCP-VALID-7036",
+        "input_schema_json" => codes::VALID_7035,
+        _ => codes::VALID_7036,
     };
     serde_json::from_str(json).map_err(|e| {
         napi::Error::from(ScpNapiError::Validation {
@@ -151,7 +152,7 @@ fn validate_test_vectors_json(
             serde_json::from_str(s).map_err(|e| {
                 napi::Error::from(ScpNapiError::Validation {
                     message: format!("invalid test_vectors_json: {e}"),
-                    code: "SCP-VALID-7037".to_owned(),
+                    code: codes::VALID_7037.to_owned(),
                 })
             })
         },
@@ -172,7 +173,7 @@ fn validate_implementation_hash(bytes: Option<&[u8]>) -> napi::Result<[u8; 32]> 
                         "implementation_hash must be exactly 32 bytes, got {}",
                         b.len()
                     ),
-                    code: "SCP-VALID-7038".to_owned(),
+                    code: codes::VALID_7038.to_owned(),
                 })
             })
         },
@@ -218,7 +219,7 @@ pub async fn tool_register(
             message: format!(
                 "cannot register tool in context in {state_str:?} state — context must be active"
             ),
-            code: "SCP-TOOL-6003".to_owned(),
+            code: codes::TOOL_6003.to_owned(),
         }
         .into());
     }
@@ -275,7 +276,7 @@ pub async fn tool_register(
         )
         .map_err(|e| ScpNapiError::Tool {
             message: format!("tool registration failed: {e}"),
-            code: "SCP-TOOL-6001".to_owned(),
+            code: codes::TOOL_6001.to_owned(),
         })?;
         Ok(registered_id)
     })
@@ -357,7 +358,7 @@ pub async fn tool_invoke(
             message: format!(
                 "cannot invoke tool in context in {state_str:?} state — context must be active"
             ),
-            code: "SCP-TOOL-6005".to_owned(),
+            code: codes::TOOL_6005.to_owned(),
         }
         .into());
     }
@@ -372,7 +373,7 @@ pub async fn tool_invoke(
         .map_err(|e| {
             napi::Error::from(ScpNapiError::Permission {
                 message: format!("failed to build proof resolver: {e}"),
-                code: "SCP-PERM-3001".to_owned(),
+                code: codes::PERM_3001.to_owned(),
             })
         })?;
     validate_ucan_for_tool(
@@ -394,7 +395,7 @@ pub async fn tool_invoke(
         .map_err(|e| {
             napi::Error::from(ScpNapiError::Context {
                 message: format!("invalid spending UCAN: {e}"),
-                code: "SCP-ECON-12061".to_owned(),
+                code: codes::ECON_12061.to_owned(),
             })
         })?;
 
@@ -445,7 +446,7 @@ pub async fn tool_invoke(
     let input_value: serde_json::Value = serde_json::from_str(&input_json).map_err(|e| {
         napi::Error::from(ScpNapiError::Tool {
             message: format!("invalid input JSON: {e}"),
-            code: "SCP-TOOL-6002".to_owned(),
+            code: codes::TOOL_6002.to_owned(),
         })
     })?;
 
@@ -473,7 +474,7 @@ pub async fn tool_invoke(
     serde_json::to_string(&outcome.output).map_err(|e| {
         napi::Error::from(ScpNapiError::Tool {
             message: format!("failed to serialize tool output: {e}"),
-            code: "SCP-TOOL-6006".to_owned(),
+            code: codes::TOOL_6006.to_owned(),
         })
     })
 }
@@ -506,7 +507,7 @@ pub async fn tool_verify(
             message: format!(
                 "cannot verify tool in context in {state_str:?} state — context must be active"
             ),
-            code: "SCP-TOOL-6007".to_owned(),
+            code: codes::TOOL_6007.to_owned(),
         }
         .into());
     }
@@ -535,7 +536,7 @@ pub async fn tool_verify(
         )
         .map_err(|e| ScpNapiError::Tool {
             message: format!("tool verification failed: {e}"),
-            code: "SCP-TOOL-6001".to_owned(),
+            code: codes::TOOL_6001.to_owned(),
         })?;
 
         Ok(verification_result)
@@ -590,7 +591,7 @@ pub async fn tool_invoke_cross_context(
             message: format!(
                 "cannot invoke cross-context tool: source context in {source_state:?} state"
             ),
-            code: "SCP-TOOL-6010".to_owned(),
+            code: codes::TOOL_6010.to_owned(),
         }
         .into());
     }
@@ -601,7 +602,7 @@ pub async fn tool_invoke_cross_context(
             message: format!(
                 "cannot invoke cross-context tool: target context in {target_state:?} state"
             ),
-            code: "SCP-TOOL-6011".to_owned(),
+            code: codes::TOOL_6011.to_owned(),
         }
         .into());
     }
@@ -623,7 +624,7 @@ pub async fn tool_invoke_cross_context(
             message: format!(
                 "cross-context chain depth {chain_depth} exceeds maximum {max_chain_depth}"
             ),
-            code: "SCP-TOOL-6012".to_owned(),
+            code: codes::TOOL_6012.to_owned(),
         }
         .into());
     }
@@ -638,7 +639,7 @@ pub async fn tool_invoke_cross_context(
         .map_err(|e| {
             napi::Error::from(ScpNapiError::Permission {
                 message: format!("failed to build proof resolver: {e}"),
-                code: "SCP-PERM-3001".to_owned(),
+                code: codes::PERM_3001.to_owned(),
             })
         })?;
     validate_ucan_for_tool(
@@ -653,7 +654,7 @@ pub async fn tool_invoke_cross_context(
     let input_value: serde_json::Value = serde_json::from_str(&input_json).map_err(|e| {
         napi::Error::from(ScpNapiError::Tool {
             message: format!("invalid input JSON: {e}"),
-            code: "SCP-TOOL-6002".to_owned(),
+            code: codes::TOOL_6002.to_owned(),
         })
     })?;
 
@@ -665,7 +666,7 @@ pub async fn tool_invoke_cross_context(
                 message: format!(
                     "tool '{tool_id}' not found in target context '{target_context_id}'"
                 ),
-                code: "SCP-TOOL-6002".to_owned(),
+                code: codes::TOOL_6002.to_owned(),
             })?;
 
         // Validate input against the tool's input schema.
@@ -675,7 +676,7 @@ pub async fn tool_invoke_cross_context(
         )
         .map_err(|e| ScpNapiError::Tool {
             message: format!("input validation failed: {e}"),
-            code: "SCP-TOOL-6002".to_owned(),
+            code: codes::TOOL_6002.to_owned(),
         })?;
 
         // Dispatch to handler or echo mode.
@@ -683,7 +684,7 @@ pub async fn tool_invoke_cross_context(
             let handler = handler.clone();
             let out = handler(input_value.clone()).map_err(|e| ScpNapiError::Tool {
                 message: format!("cross-context tool handler for '{tool_id}' failed: {e}"),
-                code: "SCP-TOOL-6002".to_owned(),
+                code: codes::TOOL_6002.to_owned(),
             })?;
 
             scp_core::context::tools::validate_value_against_schema(
@@ -692,7 +693,7 @@ pub async fn tool_invoke_cross_context(
             )
             .map_err(|msg| ScpNapiError::Tool {
                 message: format!("output validation failed for tool '{tool_id}': {msg}"),
-                code: "SCP-TOOL-6002".to_owned(),
+                code: codes::TOOL_6002.to_owned(),
             })?;
 
             out
@@ -715,7 +716,7 @@ pub async fn tool_invoke_cross_context(
     serde_json::to_string(&output).map_err(|e| {
         napi::Error::from(ScpNapiError::Tool {
             message: format!("failed to serialize cross-context output: {e}"),
-            code: "SCP-TOOL-6013".to_owned(),
+            code: codes::TOOL_6013.to_owned(),
         })
     })
 }
@@ -744,7 +745,7 @@ pub async fn tool_session_create(
             message: format!(
                 "cannot create session in context in {state_str:?} state — context must be active"
             ),
-            code: "SCP-TOOL-6014".to_owned(),
+            code: codes::TOOL_6014.to_owned(),
         }
         .into());
     }
@@ -769,7 +770,7 @@ pub async fn tool_session_create(
                 message: format!(
                     "session cap exceeded for caller '{source_context_id}': {current} active (max {cap})"
                 ),
-                code: "SCP-TOOL-6015".to_owned(),
+                code: codes::TOOL_6015.to_owned(),
             });
         }
 
@@ -817,7 +818,7 @@ pub async fn tool_session_invoke(
             message: format!(
                 "cannot invoke session in context in {state_str:?} state — context must be active"
             ),
-            code: "SCP-TOOL-6017".to_owned(),
+            code: codes::TOOL_6017.to_owned(),
         }
         .into());
     }
@@ -833,7 +834,7 @@ pub async fn tool_session_invoke(
             .get(&session_id)
             .ok_or_else(|| ScpNapiError::Tool {
                 message: format!("session '{session_id}' not found"),
-                code: "SCP-TOOL-6018".to_owned(),
+                code: codes::TOOL_6018.to_owned(),
             })?;
         Ok(session.tool_id.clone())
     })
@@ -845,7 +846,7 @@ pub async fn tool_session_invoke(
         .map_err(|e| {
             napi::Error::from(ScpNapiError::Permission {
                 message: format!("failed to build proof resolver: {e}"),
-                code: "SCP-PERM-3001".to_owned(),
+                code: codes::PERM_3001.to_owned(),
             })
         })?;
     validate_ucan_for_tool(
@@ -863,7 +864,7 @@ pub async fn tool_session_invoke(
             .get(&session_id)
             .ok_or_else(|| ScpNapiError::Tool {
                 message: format!("session '{session_id}' not found"),
-                code: "SCP-TOOL-6018".to_owned(),
+                code: codes::TOOL_6018.to_owned(),
             })?;
 
         // Check expiry.
@@ -872,7 +873,7 @@ pub async fn tool_session_invoke(
             rt.session_store.remove(&session_id);
             return Err(ScpNapiError::Tool {
                 message: format!("session '{session_id}' has expired"),
-                code: "SCP-TOOL-6019".to_owned(),
+                code: codes::TOOL_6019.to_owned(),
             });
         }
 
@@ -883,7 +884,7 @@ pub async fn tool_session_invoke(
         let input_value: serde_json::Value =
             serde_json::from_str(&input_json).map_err(|e| ScpNapiError::Tool {
                 message: format!("invalid input JSON: {e}"),
-                code: "SCP-TOOL-6002".to_owned(),
+                code: codes::TOOL_6002.to_owned(),
             })?;
 
         // Validate input against tool's input schema if tool is registered.
@@ -894,7 +895,7 @@ pub async fn tool_session_invoke(
             )
             .map_err(|e| ScpNapiError::Tool {
                 message: format!("input validation failed: {e}"),
-                code: "SCP-TOOL-6002".to_owned(),
+                code: codes::TOOL_6002.to_owned(),
             })?;
         }
 
@@ -903,7 +904,7 @@ pub async fn tool_session_invoke(
             let handler = handler.clone();
             let out = handler(input_value).map_err(|e| ScpNapiError::Tool {
                 message: format!("tool handler for '{tool_id}' failed: {e}"),
-                code: "SCP-TOOL-6002".to_owned(),
+                code: codes::TOOL_6002.to_owned(),
             })?;
             (current_state, out)
         } else {
@@ -931,7 +932,7 @@ pub async fn tool_session_invoke(
     serde_json::to_string(&output).map_err(|e| {
         napi::Error::from(ScpNapiError::Tool {
             message: format!("failed to serialize session invoke output: {e}"),
-            code: "SCP-TOOL-6020".to_owned(),
+            code: codes::TOOL_6020.to_owned(),
         })
     })
 }
@@ -955,7 +956,7 @@ pub async fn tool_session_close(
         if rt.session_store.remove(&session_id).is_none() {
             return Err(ScpNapiError::Tool {
                 message: format!("session '{session_id}' not found"),
-                code: "SCP-TOOL-6021".to_owned(),
+                code: codes::TOOL_6021.to_owned(),
             });
         }
         Ok(())
@@ -996,7 +997,7 @@ pub async fn tool_interface_expose(
             message: format!(
                 "cannot expose tool interface in context in {state_str:?} state — context must be active"
             ),
-            code: "SCP-TOOL-6030".to_owned(),
+            code: codes::TOOL_6030.to_owned(),
         }
         .into());
     }
@@ -1010,7 +1011,7 @@ pub async fn tool_interface_expose(
                 .map_err(|e| {
                     napi::Error::from(ScpNapiError::Validation {
                         message: format!("invalid rate_limit_json: {e}"),
-                        code: "SCP-VALID-7040".to_owned(),
+                        code: codes::VALID_7040.to_owned(),
                     })
                 })?;
             Some(parsed)
@@ -1036,12 +1037,12 @@ pub async fn tool_interface_expose(
         )
         .map_err(|e| ScpNapiError::Tool {
             message: format!("expose_tool failed: {e}"),
-            code: "SCP-TOOL-6030".to_owned(),
+            code: codes::TOOL_6030.to_owned(),
         })?;
 
         serde_json::to_string(&interface).map_err(|e| ScpNapiError::Tool {
             message: format!("failed to serialize ToolInterface: {e}"),
-            code: "SCP-TOOL-6031".to_owned(),
+            code: codes::TOOL_6031.to_owned(),
         })
     })
     .map_err(napi::Error::from)
@@ -1067,7 +1068,7 @@ pub async fn tool_interface_accept(
             message: format!(
                 "cannot accept tool interface in context in {state_str:?} state — context must be active"
             ),
-            code: "SCP-TOOL-6032".to_owned(),
+            code: codes::TOOL_6032.to_owned(),
         }
         .into());
     }
@@ -1079,7 +1080,7 @@ pub async fn tool_interface_accept(
         serde_json::from_str(&interface_json).map_err(|e| {
             napi::Error::from(ScpNapiError::Validation {
                 message: format!("invalid interface_json: {e}"),
-                code: "SCP-VALID-7041".to_owned(),
+                code: codes::VALID_7041.to_owned(),
             })
         })?;
 
@@ -1098,12 +1099,12 @@ pub async fn tool_interface_accept(
         )
         .map_err(|e| ScpNapiError::Tool {
             message: format!("accept_tool_interface failed: {e}"),
-            code: "SCP-TOOL-6032".to_owned(),
+            code: codes::TOOL_6032.to_owned(),
         })?;
 
         serde_json::to_string(&interface).map_err(|e| ScpNapiError::Tool {
             message: format!("failed to serialize ToolInterface: {e}"),
-            code: "SCP-TOOL-6033".to_owned(),
+            code: codes::TOOL_6033.to_owned(),
         })
     })
     .map_err(napi::Error::from)
@@ -1128,7 +1129,7 @@ pub async fn tool_interface_revoke(
     let interface_id_bytes = hex::decode(&interface_id_hex).map_err(|e| {
         napi::Error::from(ScpNapiError::Validation {
             message: format!("invalid interface_id_hex: not valid hex: {e}"),
-            code: "SCP-VALID-7042".to_owned(),
+            code: codes::VALID_7042.to_owned(),
         })
     })?;
     let interface_id: [u8; 32] =
@@ -1138,7 +1139,7 @@ pub async fn tool_interface_revoke(
                     "interface_id_hex must be exactly 32 bytes (64 hex chars), got {}",
                     interface_id_bytes.len()
                 ),
-                code: "SCP-VALID-7042".to_owned(),
+                code: codes::VALID_7042.to_owned(),
             })
         })?;
 
@@ -1153,7 +1154,7 @@ pub async fn tool_interface_revoke(
     serde_json::to_string(&event).map_err(|e| {
         napi::Error::from(ScpNapiError::Tool {
             message: format!("failed to serialize InterfaceRevoked: {e}"),
-            code: "SCP-TOOL-6035".to_owned(),
+            code: codes::TOOL_6035.to_owned(),
         })
     })
 }
@@ -1166,6 +1167,7 @@ pub async fn tool_interface_revoke(
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
+    use scp_ffi_common::error_codes as codes;
 
     // -----------------------------------------------------------------------
     // validate_schema_json
@@ -1190,7 +1192,7 @@ mod tests {
         assert!(result.is_err());
         let msg = format!("{}", result.unwrap_err());
         assert!(
-            msg.contains("SCP-VALID-7035"),
+            msg.contains(codes::VALID_7035),
             "error should contain SCP-VALID-7035, got: {msg}"
         );
         assert!(
@@ -1205,7 +1207,7 @@ mod tests {
         assert!(result.is_err());
         let msg = format!("{}", result.unwrap_err());
         assert!(
-            msg.contains("SCP-VALID-7036"),
+            msg.contains(codes::VALID_7036),
             "error should contain SCP-VALID-7036, got: {msg}"
         );
         assert!(
@@ -1219,7 +1221,7 @@ mod tests {
         let result = validate_schema_json("", "input_schema_json");
         assert!(result.is_err());
         let msg = format!("{}", result.unwrap_err());
-        assert!(msg.contains("SCP-VALID-7035"));
+        assert!(msg.contains(codes::VALID_7035));
     }
 
     // -----------------------------------------------------------------------
@@ -1246,7 +1248,7 @@ mod tests {
         assert!(result.is_err());
         let msg = format!("{}", result.unwrap_err());
         assert!(
-            msg.contains("SCP-VALID-7037"),
+            msg.contains(codes::VALID_7037),
             "error should contain SCP-VALID-7037, got: {msg}"
         );
         assert!(
@@ -1261,7 +1263,7 @@ mod tests {
         let result = validate_test_vectors_json(Some(r#"{"not": "an array"}"#));
         assert!(result.is_err());
         let msg = format!("{}", result.unwrap_err());
-        assert!(msg.contains("SCP-VALID-7037"));
+        assert!(msg.contains(codes::VALID_7037));
     }
 
     // -----------------------------------------------------------------------
@@ -1290,7 +1292,7 @@ mod tests {
         assert!(result.is_err());
         let msg = format!("{}", result.unwrap_err());
         assert!(
-            msg.contains("SCP-VALID-7038"),
+            msg.contains(codes::VALID_7038),
             "error should contain SCP-VALID-7038, got: {msg}"
         );
         assert!(
@@ -1305,7 +1307,7 @@ mod tests {
         let result = validate_implementation_hash(Some(&hash));
         assert!(result.is_err());
         let msg = format!("{}", result.unwrap_err());
-        assert!(msg.contains("SCP-VALID-7038"));
+        assert!(msg.contains(codes::VALID_7038));
         assert!(
             msg.contains("got 64"),
             "error should report actual length, got: {msg}"
@@ -1317,7 +1319,7 @@ mod tests {
         let result = validate_implementation_hash(Some(&[]));
         assert!(result.is_err());
         let msg = format!("{}", result.unwrap_err());
-        assert!(msg.contains("SCP-VALID-7038"));
+        assert!(msg.contains(codes::VALID_7038));
         assert!(msg.contains("got 0"));
     }
 

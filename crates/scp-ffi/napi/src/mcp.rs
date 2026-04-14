@@ -15,6 +15,7 @@
 //!
 //! See ADR-015 in `.docs/adrs/phase-3.md`.
 
+use scp_ffi_common::error_codes as codes;
 use std::io::{BufRead, BufReader, Write};
 use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -479,7 +480,7 @@ pub async fn mcp_server_create(config: NapiMcpServerConfig) -> napi::Result<Napi
                 "unsupported MCP transport: {:?} — expected \"stdio\" or \"sse\"",
                 config.transport
             ),
-            code: "SCP-TRANS-5010".to_owned(),
+            code: codes::TRANS_5010.to_owned(),
         }
         .into());
     }
@@ -487,7 +488,7 @@ pub async fn mcp_server_create(config: NapiMcpServerConfig) -> napi::Result<Napi
     if config.context_ids.is_empty() {
         return Err(ScpNapiError::Transport {
             message: "context_ids must not be empty".to_owned(),
-            code: "SCP-TRANS-5011".to_owned(),
+            code: codes::TRANS_5011.to_owned(),
         }
         .into());
     }
@@ -554,14 +555,14 @@ pub async fn mcp_server_stop(handle: &NapiMcpServerHandle) -> napi::Result<()> {
         .ok_or_else(|| {
             napi::Error::from(ScpNapiError::Transport {
                 message: format!("MCP server handle '{}' not found", handle.handle_id),
-                code: "SCP-TRANS-5012".to_owned(),
+                code: codes::TRANS_5012.to_owned(),
             })
         })?;
 
     if entry.stopped {
         return Err(ScpNapiError::Transport {
             message: format!("MCP server '{}' is already stopped", handle.handle_id),
-            code: "SCP-TRANS-5013".to_owned(),
+            code: codes::TRANS_5013.to_owned(),
         }
         .into());
     }
@@ -590,7 +591,7 @@ pub async fn mcp_client_connect_stdio(command: Vec<String>) -> napi::Result<Napi
     if command.is_empty() {
         return Err(ScpNapiError::Transport {
             message: "command must be a non-empty list".to_owned(),
-            code: "SCP-TRANS-5014".to_owned(),
+            code: codes::TRANS_5014.to_owned(),
         }
         .into());
     }
@@ -598,7 +599,7 @@ pub async fn mcp_client_connect_stdio(command: Vec<String>) -> napi::Result<Napi
     let transport = StdioMcpTransport::spawn(&command).map_err(|e| {
         napi::Error::from(ScpNapiError::Transport {
             message: format!("failed to connect stdio MCP client: {e}"),
-            code: "SCP-TRANS-5015".to_owned(),
+            code: codes::TRANS_5015.to_owned(),
         })
     })?;
 
@@ -606,7 +607,7 @@ pub async fn mcp_client_connect_stdio(command: Vec<String>) -> napi::Result<Napi
     client.initialize().map_err(|e| {
         napi::Error::from(ScpNapiError::Transport {
             message: format!("MCP initialize handshake failed: {e}"),
-            code: "SCP-TRANS-5016".to_owned(),
+            code: codes::TRANS_5016.to_owned(),
         })
     })?;
 
@@ -631,7 +632,7 @@ pub async fn mcp_client_connect_sse(url: String) -> napi::Result<NapiMcpClientHa
     client.initialize().map_err(|e| {
         napi::Error::from(ScpNapiError::Transport {
             message: format!("MCP initialize handshake failed: {e}"),
-            code: "SCP-TRANS-5018".to_owned(),
+            code: codes::TRANS_5018.to_owned(),
         })
     })?;
 
@@ -654,7 +655,7 @@ pub async fn mcp_client_disconnect(handle: &NapiMcpClientHandle) -> napi::Result
     if removed.is_none() {
         return Err(ScpNapiError::Transport {
             message: format!("MCP client handle '{}' not found", handle.handle_id),
-            code: "SCP-TRANS-5019".to_owned(),
+            code: codes::TRANS_5019.to_owned(),
         }
         .into());
     }
@@ -672,21 +673,21 @@ pub async fn mcp_client_list_tools(
         .ok_or_else(|| {
             napi::Error::from(ScpNapiError::Transport {
                 message: format!("MCP client handle '{}' not found", handle.handle_id),
-                code: "SCP-TRANS-5020".to_owned(),
+                code: codes::TRANS_5020.to_owned(),
             })
         })?;
 
     let client_guard = entry.client.lock().map_err(|e| {
         napi::Error::from(ScpNapiError::Transport {
             message: format!("client lock poisoned: {e}"),
-            code: "SCP-TRANS-5021".to_owned(),
+            code: codes::TRANS_5021.to_owned(),
         })
     })?;
 
     let tools = client_guard.list_tools().map_err(|e| {
         napi::Error::from(ScpNapiError::Transport {
             message: format!("tools/list failed: {e}"),
-            code: "SCP-TRANS-5022".to_owned(),
+            code: codes::TRANS_5022.to_owned(),
         })
     })?;
 
@@ -717,21 +718,21 @@ pub async fn mcp_client_invoke(
         .ok_or_else(|| {
             napi::Error::from(ScpNapiError::Transport {
                 message: format!("MCP client handle '{}' not found", handle.handle_id),
-                code: "SCP-TRANS-5023".to_owned(),
+                code: codes::TRANS_5023.to_owned(),
             })
         })?;
 
     let input: serde_json::Value = serde_json::from_str(&input_json).map_err(|e| {
         napi::Error::from(ScpNapiError::Transport {
             message: format!("invalid input JSON: {e}"),
-            code: "SCP-VALID-7021".to_owned(),
+            code: codes::VALID_7021.to_owned(),
         })
     })?;
 
     let client_guard = entry.client.lock().map_err(|e| {
         napi::Error::from(ScpNapiError::Transport {
             message: format!("client lock poisoned: {e}"),
-            code: "SCP-TRANS-5024".to_owned(),
+            code: codes::TRANS_5024.to_owned(),
         })
     })?;
 
@@ -740,7 +741,7 @@ pub async fn mcp_client_invoke(
         .map_err(|e| {
             napi::Error::from(ScpNapiError::Transport {
                 message: format!("tools/call failed: {e}"),
-                code: "SCP-TRANS-5025".to_owned(),
+                code: codes::TRANS_5025.to_owned(),
             })
         })?;
 
@@ -780,12 +781,12 @@ fn allowlist_err(e: allowlist::AllowlistError) -> ScpNapiError {
         | AllowlistError::PathInCommand(_)
         | AllowlistError::InvalidCommand(_) => ScpNapiError::Validation {
             message: msg,
-            code: "SCP-VALID-7033".to_owned(),
+            code: codes::VALID_7033.to_owned(),
         },
         AllowlistError::NotAllowed { .. } | AllowlistError::LockPoisoned => {
             ScpNapiError::Transport {
                 message: msg,
-                code: "SCP-TRANS-5030".to_owned(),
+                code: codes::TRANS_5030.to_owned(),
             }
         }
     }

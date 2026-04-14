@@ -8,6 +8,7 @@
 
 use base64::Engine as _;
 use js_sys::Promise;
+use scp_ffi_common::error_codes as codes;
 use wasm_bindgen::prelude::*;
 use wasm_bindgen_futures::future_to_promise;
 
@@ -267,7 +268,7 @@ pub fn context_create(identity_did: String, params_json: String) -> Promise {
                 message: format!(
                     "params_json is not valid JSON: {e} — pass a JSON-encoded context parameters object"
                 ),
-                code: "SCP-VALID-7000".to_owned(),
+                code: codes::VALID_7000.to_owned(),
             }
             .into_js()
         })?;
@@ -288,7 +289,7 @@ pub fn context_create(identity_did: String, params_json: String) -> Promise {
             mgr.context_metadata(&context_id)
                 .ok_or_else(|| ScpWasmError::Context {
                     message: "context creation succeeded but metadata lookup failed".to_owned(),
-                    code: "SCP-CTX-2001".to_owned(),
+                    code: codes::CTX_2001.to_owned(),
                 })
         })
         .map_err(ScpWasmError::into_js)?;
@@ -338,7 +339,7 @@ pub fn context_join(
             let _ = scp_protocol::crypto::ucan::validate::parse_ucan(jwt).map_err(|e| {
                 ScpWasmError::Context {
                     message: format!("invalid spending UCAN: {e}"),
-                    code: "SCP-ECON-12061".to_owned(),
+                    code: codes::ECON_12061.to_owned(),
                 }
                 .into_js()
             })?;
@@ -433,7 +434,7 @@ pub fn context_send(
                 message:
                     "payload_base64 must not be empty — encode payload bytes as base64 before calling context_send"
                         .to_owned(),
-                code: "SCP-VALID-7000".to_owned(),
+                code: codes::VALID_7000.to_owned(),
             }
             .into_js()
             .into());
@@ -451,7 +452,7 @@ pub fn context_send(
             let _ = scp_protocol::crypto::ucan::validate::parse_ucan(jwt).map_err(|e| {
                 ScpWasmError::Context {
                     message: format!("invalid spending UCAN: {e}"),
-                    code: "SCP-ECON-12061".to_owned(),
+                    code: codes::ECON_12061.to_owned(),
                 }
                 .into_js()
             })?;
@@ -595,7 +596,7 @@ pub fn context_subscribe(
                 message: format!(
                     "cannot subscribe to context in '{state}' state — context must be 'active'"
                 ),
-                code: "SCP-CTX-2021".to_owned(),
+                code: codes::CTX_2021.to_owned(),
             });
         }
         Ok(())
@@ -728,21 +729,21 @@ pub fn context_execute_governance(
             serde_json::from_str(&action_json).map_err(|e| {
                 ScpWasmError::Validation {
                     message: format!("action_json is not valid JSON: {e}"),
-                    code: "SCP-VALID-7000".to_owned(),
+                    code: codes::VALID_7000.to_owned(),
                 }
                 .into_js()
             })?;
         js_to_serde_governance_action(&mut action_value).map_err(|e| {
             ScpWasmError::Validation {
                 message: format!("action_json is not valid: {e}"),
-                code: "SCP-VALID-7000".to_owned(),
+                code: codes::VALID_7000.to_owned(),
             }
             .into_js()
         })?;
         let action: GovernanceAction = serde_json::from_value(action_value).map_err(|e| {
             ScpWasmError::Validation {
                 message: format!("action_json is not valid: {e}"),
-                code: "SCP-VALID-7000".to_owned(),
+                code: codes::VALID_7000.to_owned(),
             }
             .into_js()
         })?;
@@ -750,7 +751,7 @@ pub fn context_execute_governance(
         scp_ffi_common::validate::validate_governance_action_strings(&action).map_err(|e| {
             ScpWasmError::Validation {
                 message: e.message,
-                code: "SCP-VALID-7000".to_owned(),
+                code: codes::VALID_7000.to_owned(),
             }
             .into_js()
         })?;
@@ -763,7 +764,7 @@ pub fn context_execute_governance(
         let json_str = serde_json::to_string(&result).map_err(|e| {
             ScpWasmError::Context {
                 message: format!("failed to serialize governance result: {e}"),
-                code: "SCP-CTX-2001".to_owned(),
+                code: codes::CTX_2001.to_owned(),
             }
             .into_js()
         })?;
@@ -811,21 +812,21 @@ pub fn context_governance_propose(
             serde_json::from_str(&action_json).map_err(|e| {
                 ScpWasmError::Validation {
                     message: format!("action_json is not valid JSON: {e}"),
-                    code: "SCP-CTX-2040".to_owned(),
+                    code: codes::CTX_2040.to_owned(),
                 }
                 .into_js()
             })?;
         js_to_serde_governance_action(&mut action_value).map_err(|e| {
             ScpWasmError::Validation {
                 message: format!("action_json is not valid: {e}"),
-                code: "SCP-CTX-2040".to_owned(),
+                code: codes::CTX_2040.to_owned(),
             }
             .into_js()
         })?;
         let action: GovernanceAction = serde_json::from_value(action_value).map_err(|e| {
             ScpWasmError::Validation {
                 message: format!("action_json is not valid: {e}"),
-                code: "SCP-CTX-2040".to_owned(),
+                code: codes::CTX_2040.to_owned(),
             }
             .into_js()
         })?;
@@ -833,7 +834,7 @@ pub fn context_governance_propose(
         scp_ffi_common::validate::validate_governance_action_strings(&action).map_err(|e| {
             ScpWasmError::Validation {
                 message: e.message,
-                code: "SCP-CTX-2040".to_owned(),
+                code: codes::CTX_2040.to_owned(),
             }
             .into_js()
         })?;
@@ -846,7 +847,7 @@ pub fn context_governance_propose(
         let json_str = serde_json::to_string(&result).map_err(|e| {
             ScpWasmError::Context {
                 message: format!("failed to serialize proposal result: {e}"),
-                code: "SCP-CTX-2041".to_owned(),
+                code: codes::CTX_2041.to_owned(),
             }
             .into_js()
         })?;
@@ -888,7 +889,7 @@ pub fn context_governance_approve(
         let json_str = serde_json::to_string(&result).map_err(|e| {
             ScpWasmError::Context {
                 message: format!("failed to serialize approval result: {e}"),
-                code: "SCP-CTX-2042".to_owned(),
+                code: codes::CTX_2042.to_owned(),
             }
             .into_js()
         })?;
@@ -930,7 +931,7 @@ pub fn context_governance_reject(
         let json_str = serde_json::to_string(&result).map_err(|e| {
             ScpWasmError::Context {
                 message: format!("failed to serialize rejection result: {e}"),
-                code: "SCP-CTX-2043".to_owned(),
+                code: codes::CTX_2043.to_owned(),
             }
             .into_js()
         })?;
@@ -971,7 +972,7 @@ pub fn context_governance_withdraw(
         let json_str = serde_json::to_string(&result).map_err(|e| {
             ScpWasmError::Context {
                 message: format!("failed to serialize withdrawal result: {e}"),
-                code: "SCP-CTX-2044".to_owned(),
+                code: codes::CTX_2044.to_owned(),
             }
             .into_js()
         })?;
@@ -1002,7 +1003,7 @@ pub fn context_governance_get_proposal(handle: &WasmContextHandle, proposal_id: 
         let json_str = serde_json::to_string(&result).map_err(|e| {
             ScpWasmError::Context {
                 message: format!("failed to serialize proposal: {e}"),
-                code: "SCP-CTX-2045".to_owned(),
+                code: codes::CTX_2045.to_owned(),
             }
             .into_js()
         })?;
@@ -1029,7 +1030,7 @@ pub fn context_governance_list_proposals(handle: &WasmContextHandle) -> Promise 
         let json_str = serde_json::to_string(&result).map_err(|e| {
             ScpWasmError::Context {
                 message: format!("failed to serialize proposals: {e}"),
-                code: "SCP-CTX-2046".to_owned(),
+                code: codes::CTX_2046.to_owned(),
             }
             .into_js()
         })?;
@@ -1106,7 +1107,7 @@ pub fn context_create_governance_checkpoint(
         let creator_signature = hex::decode(&creator_signature_hex).map_err(|e| {
             ScpWasmError::Validation {
                 message: format!("invalid creator_signature hex: {e}"),
-                code: "SCP-CTX-2062".to_owned(),
+                code: codes::CTX_2062.to_owned(),
             }
             .into_js()
         })?;
@@ -1133,7 +1134,7 @@ pub fn context_create_governance_checkpoint(
         let json_str = serde_json::to_string(&checkpoint).map_err(|e| {
             ScpWasmError::Context {
                 message: format!("serialization failed: {e}"),
-                code: "SCP-CTX-2062".to_owned(),
+                code: codes::CTX_2062.to_owned(),
             }
             .into_js()
         })?;
@@ -1164,7 +1165,7 @@ pub fn context_add_checkpoint_cosignature(
             serde_json::from_str(&checkpoint_json).map_err(|e| {
                 ScpWasmError::Validation {
                     message: format!("invalid checkpoint JSON: {e}"),
-                    code: "SCP-CTX-2063".to_owned(),
+                    code: codes::CTX_2063.to_owned(),
                 }
                 .into_js()
             })?;
@@ -1172,7 +1173,7 @@ pub fn context_add_checkpoint_cosignature(
         let signature = hex::decode(&signature_hex).map_err(|e| {
             ScpWasmError::Validation {
                 message: format!("invalid signature hex: {e}"),
-                code: "SCP-CTX-2063".to_owned(),
+                code: codes::CTX_2063.to_owned(),
             }
             .into_js()
         })?;
@@ -1189,7 +1190,7 @@ pub fn context_add_checkpoint_cosignature(
         let json_str = serde_json::to_string(&response).map_err(|e| {
             ScpWasmError::Context {
                 message: format!("serialization failed: {e}"),
-                code: "SCP-CTX-2063".to_owned(),
+                code: codes::CTX_2063.to_owned(),
             }
             .into_js()
         })?;
@@ -1221,7 +1222,7 @@ pub fn context_restore_all() -> Promise {
         let json_str = serde_json::to_string(&restored).map_err(|e| {
             ScpWasmError::Context {
                 message: format!("serialization failed: {e}"),
-                code: "SCP-CTX-2065".to_owned(),
+                code: codes::CTX_2065.to_owned(),
             }
             .into_js()
         })?;
@@ -1235,14 +1236,14 @@ fn parse_wasm_hex_32(hex_str: &str, field_name: &str) -> Result<[u8; 32], JsValu
     let bytes = hex::decode(hex_str).map_err(|e| {
         ScpWasmError::Validation {
             message: format!("invalid {field_name} hex: {e}"),
-            code: "SCP-CTX-2062".to_owned(),
+            code: codes::CTX_2062.to_owned(),
         }
         .into_js()
     })?;
     let arr: [u8; 32] = bytes.try_into().map_err(|v: Vec<u8>| {
         ScpWasmError::Validation {
             message: format!("{field_name} must be 32 bytes, got {}", v.len()),
-            code: "SCP-CTX-2062".to_owned(),
+            code: codes::CTX_2062.to_owned(),
         }
         .into_js()
     })?;
@@ -1316,7 +1317,7 @@ pub fn broadcast_publish_asset(
         let asset: serde_json::Value = serde_json::from_str(&asset_json).map_err(|e| {
             ScpWasmError::Context {
                 message: format!("invalid asset JSON: {e}"),
-                code: "SCP-CTX-2073".to_owned(),
+                code: codes::CTX_2073.to_owned(),
             }
             .into_js()
         })?;
@@ -1327,7 +1328,7 @@ pub fn broadcast_publish_asset(
             .ok_or_else(|| {
                 ScpWasmError::Context {
                     message: "asset must have a 'path' string field".to_owned(),
-                    code: "SCP-CTX-2073".to_owned(),
+                    code: codes::CTX_2073.to_owned(),
                 }
                 .into_js()
             })?
@@ -1339,7 +1340,7 @@ pub fn broadcast_publish_asset(
             .ok_or_else(|| {
                 ScpWasmError::Context {
                     message: "asset must have a 'contentType' string field".to_owned(),
-                    code: "SCP-CTX-2073".to_owned(),
+                    code: codes::CTX_2073.to_owned(),
                 }
                 .into_js()
             })?
@@ -1351,7 +1352,7 @@ pub fn broadcast_publish_asset(
             .ok_or_else(|| {
                 ScpWasmError::Context {
                     message: "asset must have a 'bodyBase64' string field".to_owned(),
-                    code: "SCP-CTX-2073".to_owned(),
+                    code: codes::CTX_2073.to_owned(),
                 }
                 .into_js()
             })?;
@@ -1361,7 +1362,7 @@ pub fn broadcast_publish_asset(
             .map_err(|e| {
                 ScpWasmError::Context {
                     message: format!("invalid base64 body: {e}"),
-                    code: "SCP-CTX-2073".to_owned(),
+                    code: codes::CTX_2073.to_owned(),
                 }
                 .into_js()
             })?;
@@ -1461,14 +1462,14 @@ pub fn broadcast_publish_assets(
         let assets_value: serde_json::Value = serde_json::from_str(&assets_json).map_err(|e| {
             ScpWasmError::Context {
                 message: format!("invalid assets JSON: {e}"),
-                code: "SCP-CTX-2073".to_owned(),
+                code: codes::CTX_2073.to_owned(),
             }
             .into_js()
         })?;
         let assets_arr = assets_value.as_array().ok_or_else(|| {
             ScpWasmError::Context {
                 message: "assets must be a JSON array".to_owned(),
-                code: "SCP-CTX-2073".to_owned(),
+                code: codes::CTX_2073.to_owned(),
             }
             .into_js()
         })?;
@@ -1482,7 +1483,7 @@ pub fn broadcast_publish_assets(
                 .ok_or_else(|| {
                     ScpWasmError::Context {
                         message: "each asset must have a 'path' string field".to_owned(),
-                        code: "SCP-CTX-2073".to_owned(),
+                        code: codes::CTX_2073.to_owned(),
                     }
                     .into_js()
                 })?
@@ -1493,7 +1494,7 @@ pub fn broadcast_publish_assets(
                 .ok_or_else(|| {
                     ScpWasmError::Context {
                         message: "each asset must have a 'contentType' string field".to_owned(),
-                        code: "SCP-CTX-2073".to_owned(),
+                        code: codes::CTX_2073.to_owned(),
                     }
                     .into_js()
                 })?
@@ -1504,7 +1505,7 @@ pub fn broadcast_publish_assets(
                 .ok_or_else(|| {
                     ScpWasmError::Context {
                         message: "each asset must have a 'bodyBase64' string field".to_owned(),
-                        code: "SCP-CTX-2073".to_owned(),
+                        code: codes::CTX_2073.to_owned(),
                     }
                     .into_js()
                 })?;
@@ -1513,7 +1514,7 @@ pub fn broadcast_publish_assets(
                 .map_err(|e| {
                     ScpWasmError::Context {
                         message: format!("invalid base64 body: {e}"),
-                        code: "SCP-CTX-2073".to_owned(),
+                        code: codes::CTX_2073.to_owned(),
                     }
                     .into_js()
                 })?;
@@ -1693,7 +1694,7 @@ pub fn context_set_economic_policy(
                   (propose SetEconomicPolicy action). Direct mutation is \
                   not permitted — see spec §19.3"
             .to_owned(),
-        code: "SCP-CTX-2013".to_owned(),
+        code: codes::CTX_2013.to_owned(),
     }
     .into_js())
 }
@@ -1730,7 +1731,7 @@ pub fn context_export(handle: &WasmContextHandle) -> Promise {
         let len = u32::try_from(bytes.len()).map_err(|_| {
             ScpWasmError::Context {
                 message: "export data exceeds 4 GiB — too large for WASM Uint8Array".to_owned(),
-                code: "SCP-CTX-2030".to_owned(),
+                code: codes::CTX_2030.to_owned(),
             }
             .into_js()
         })?;
@@ -2072,7 +2073,7 @@ fn validate_min_protocol_version(params: &serde_json::Value) -> Result<(), ScpWa
 
     let arr = field.as_array().ok_or_else(|| ScpWasmError::Validation {
         message: format!("minProtocolVersion must be a [major, minor] array, got: {field}"),
-        code: "SCP-VALID-7002".to_owned(),
+        code: codes::VALID_7002.to_owned(),
     })?;
 
     if arr.len() < 2 {
@@ -2081,7 +2082,7 @@ fn validate_min_protocol_version(params: &serde_json::Value) -> Result<(), ScpWa
                 "minProtocolVersion must have at least 2 elements [major, minor], got {len}",
                 len = arr.len()
             ),
-            code: "SCP-VALID-7002".to_owned(),
+            code: codes::VALID_7002.to_owned(),
         });
     }
 
@@ -2091,12 +2092,12 @@ fn validate_min_protocol_version(params: &serde_json::Value) -> Result<(), ScpWa
             "minProtocolVersion[0] (major) must be a non-negative integer, got: {}",
             arr[0]
         ),
-        code: "SCP-VALID-7002".to_owned(),
+        code: codes::VALID_7002.to_owned(),
     })?;
     if raw_major > u64::from(u8::MAX) {
         return Err(ScpWasmError::Validation {
             message: format!("minProtocolVersion[0] (major) exceeds u8 range: {raw_major}"),
-            code: "SCP-VALID-7002".to_owned(),
+            code: codes::VALID_7002.to_owned(),
         });
     }
 
@@ -2106,12 +2107,12 @@ fn validate_min_protocol_version(params: &serde_json::Value) -> Result<(), ScpWa
             "minProtocolVersion[1] (minor) must be a non-negative integer, got: {}",
             arr[1]
         ),
-        code: "SCP-VALID-7002".to_owned(),
+        code: codes::VALID_7002.to_owned(),
     })?;
     if raw_minor > u64::from(u8::MAX) {
         return Err(ScpWasmError::Validation {
             message: format!("minProtocolVersion[1] (minor) exceeds u8 range: {raw_minor}"),
-            code: "SCP-VALID-7002".to_owned(),
+            code: codes::VALID_7002.to_owned(),
         });
     }
 
@@ -2193,21 +2194,21 @@ pub fn metadata_record_to_json(
     validate_context_id(&context_id)
         .map_err(|e| ScpWasmError::Validation {
             message: e.to_string(),
-            code: "SCP-VALID-7001".to_owned(),
+            code: codes::VALID_7001.to_owned(),
         })
         .map_err(ScpWasmError::into_js)?;
 
     validate_did(&signer_did)
         .map_err(|e| ScpWasmError::Validation {
             message: e.to_string(),
-            code: "SCP-VALID-7001".to_owned(),
+            code: codes::VALID_7001.to_owned(),
         })
         .map_err(ScpWasmError::into_js)?;
 
     if sequence == 0 {
         return Err(ScpWasmError::Validation {
             message: "MetadataRecord sequence must start at 1 (per spec §5.7.2)".to_owned(),
-            code: "SCP-VALID-7001".to_owned(),
+            code: codes::VALID_7001.to_owned(),
         }
         .into_js());
     }
@@ -2215,7 +2216,7 @@ pub fn metadata_record_to_json(
     let structural: serde_json::Value = serde_json::from_str(&structural_json).map_err(|e| {
         ScpWasmError::Validation {
             message: format!("invalid structural metadata JSON: {e}"),
-            code: "SCP-VALID-7001".to_owned(),
+            code: codes::VALID_7001.to_owned(),
         }
         .into_js()
     })?;
@@ -2223,7 +2224,7 @@ pub fn metadata_record_to_json(
     let operational: serde_json::Value = serde_json::from_str(&operational_json).map_err(|e| {
         ScpWasmError::Validation {
             message: format!("invalid operational metadata JSON: {e}"),
-            code: "SCP-VALID-7001".to_owned(),
+            code: codes::VALID_7001.to_owned(),
         }
         .into_js()
     })?;
@@ -2231,14 +2232,14 @@ pub fn metadata_record_to_json(
     let signature = hex::decode(&signature_hex).map_err(|e| {
         ScpWasmError::Validation {
             message: format!("invalid signature hex: {e}"),
-            code: "SCP-VALID-7001".to_owned(),
+            code: codes::VALID_7001.to_owned(),
         }
         .into_js()
     })?;
     if signature.len() != 64 {
         return Err(ScpWasmError::Validation {
             message: format!("signature must be 64 bytes (got {})", signature.len()),
-            code: "SCP-VALID-7001".to_owned(),
+            code: codes::VALID_7001.to_owned(),
         }
         .into_js());
     }
@@ -2258,7 +2259,7 @@ pub fn metadata_record_to_json(
     serde_json::to_string(&record).map_err(|e| {
         ScpWasmError::Validation {
             message: format!("failed to serialize MetadataRecord: {e}"),
-            code: "SCP-VALID-7001".to_owned(),
+            code: codes::VALID_7001.to_owned(),
         }
         .into_js()
     })
@@ -2278,7 +2279,7 @@ pub fn metadata_record_from_json(json_str: String) -> Result<String, JsError> {
     let record: WasmMetadataRecord = serde_json::from_str(&json_str).map_err(|e| {
         ScpWasmError::Validation {
             message: format!("invalid MetadataRecord JSON: {e}"),
-            code: "SCP-VALID-7001".to_owned(),
+            code: codes::VALID_7001.to_owned(),
         }
         .into_js()
     })?;
@@ -2287,7 +2288,7 @@ pub fn metadata_record_from_json(json_str: String) -> Result<String, JsError> {
     if record.sequence == 0 {
         return Err(ScpWasmError::Validation {
             message: "MetadataRecord sequence must start at 1 (per spec §5.7.2)".to_owned(),
-            code: "SCP-VALID-7001".to_owned(),
+            code: codes::VALID_7001.to_owned(),
         }
         .into_js());
     }
@@ -2299,7 +2300,7 @@ pub fn metadata_record_from_json(json_str: String) -> Result<String, JsError> {
                 "signature must be 64 bytes (got {})",
                 record.signature.len()
             ),
-            code: "SCP-VALID-7001".to_owned(),
+            code: codes::VALID_7001.to_owned(),
         }
         .into_js());
     }
@@ -2309,21 +2310,21 @@ pub fn metadata_record_from_json(json_str: String) -> Result<String, JsError> {
         if !obj.contains_key("context_id") {
             return Err(ScpWasmError::Validation {
                 message: "structural metadata must contain 'context_id' field".to_owned(),
-                code: "SCP-VALID-7001".to_owned(),
+                code: codes::VALID_7001.to_owned(),
             }
             .into_js());
         }
         if !obj.contains_key("mode") {
             return Err(ScpWasmError::Validation {
                 message: "structural metadata must contain 'mode' field".to_owned(),
-                code: "SCP-VALID-7001".to_owned(),
+                code: codes::VALID_7001.to_owned(),
             }
             .into_js());
         }
     } else {
         return Err(ScpWasmError::Validation {
             message: "structural metadata must be a JSON object".to_owned(),
-            code: "SCP-VALID-7001".to_owned(),
+            code: codes::VALID_7001.to_owned(),
         }
         .into_js());
     }
@@ -2333,21 +2334,21 @@ pub fn metadata_record_from_json(json_str: String) -> Result<String, JsError> {
         if !obj.contains_key("version") {
             return Err(ScpWasmError::Validation {
                 message: "operational metadata must contain 'version' field".to_owned(),
-                code: "SCP-VALID-7001".to_owned(),
+                code: codes::VALID_7001.to_owned(),
             }
             .into_js());
         }
         if !obj.contains_key("capabilities") {
             return Err(ScpWasmError::Validation {
                 message: "operational metadata must contain 'capabilities' field".to_owned(),
-                code: "SCP-VALID-7001".to_owned(),
+                code: codes::VALID_7001.to_owned(),
             }
             .into_js());
         }
     } else {
         return Err(ScpWasmError::Validation {
             message: "operational metadata must be a JSON object".to_owned(),
-            code: "SCP-VALID-7001".to_owned(),
+            code: codes::VALID_7001.to_owned(),
         }
         .into_js());
     }
@@ -2355,7 +2356,7 @@ pub fn metadata_record_from_json(json_str: String) -> Result<String, JsError> {
     serde_json::to_string(&record).map_err(|e| {
         ScpWasmError::Validation {
             message: format!("failed to re-serialize MetadataRecord: {e}"),
-            code: "SCP-VALID-7001".to_owned(),
+            code: codes::VALID_7001.to_owned(),
         }
         .into_js()
     })
@@ -2390,13 +2391,13 @@ fn validate_invitation_template(params: &serde_json::Value) -> Result<(), ScpWas
             // template — forward-compatible: skip validation for unknown shapes.
             ScpWasmError::Context {
                 message: "template validation failed: invalid context params".to_owned(),
-                code: "SCP-CTX-2060".to_owned(),
+                code: codes::CTX_2060.to_owned(),
             }
         })?;
 
     protocol_validate_against_template(&ctx_params).map_err(|e| ScpWasmError::Context {
         message: format!("template spoofing detected: {e}"),
-        code: "SCP-CTX-2060".to_owned(),
+        code: codes::CTX_2060.to_owned(),
     })
 }
 
@@ -2486,7 +2487,7 @@ fn check_economic_policy(
         return Err(ScpWasmError::Context {
             message: "spending UCAN required: context has economic policy requiring payment"
                 .to_owned(),
-            code: "SCP-CTX-2060".to_owned(),
+            code: codes::CTX_2060.to_owned(),
         }
         .into_js()
         .into());
@@ -2528,7 +2529,7 @@ fn check_economic_policy(
                 message: format!(
                     "no compatible payment adapter: context accepts {accepted:?}, configured {configured_adapters:?}"
                 ),
-                code: "SCP-CTX-2060".to_owned(),
+                code: codes::CTX_2060.to_owned(),
             }
             .into_js()
             .into());
@@ -2552,7 +2553,7 @@ fn check_economic_policy(
             message: format!(
                 "insufficient balance: estimated cost {per_join}, available {available_balance}"
             ),
-            code: "SCP-CTX-2060".to_owned(),
+            code: codes::CTX_2060.to_owned(),
         }
         .into_js()
         .into());
@@ -2814,7 +2815,7 @@ pub fn template_get_params(template_id: String) -> Result<String, JsError> {
                      scp:template/handle-registry (alias: scp:template/discovery-context, \
                      DiscoveryContext)"
                 ),
-                code: "SCP-VALID-7001".to_owned(),
+                code: codes::VALID_7001.to_owned(),
             }
             .into_js()
         })?;
@@ -2822,7 +2823,7 @@ pub fn template_get_params(template_id: String) -> Result<String, JsError> {
     let mut val = serde_json::to_value(&params).map_err(|e| {
         ScpWasmError::Validation {
             message: format!("failed to serialize template params: {e}"),
-            code: "SCP-VALID-7001".to_owned(),
+            code: codes::VALID_7001.to_owned(),
         }
         .into_js()
     })?;
@@ -2835,7 +2836,7 @@ pub fn template_get_params(template_id: String) -> Result<String, JsError> {
     serde_json::to_string(&val).map_err(|e| {
         ScpWasmError::Validation {
             message: format!("failed to serialize template params: {e}"),
-            code: "SCP-VALID-7001".to_owned(),
+            code: codes::VALID_7001.to_owned(),
         }
         .into_js()
     })
@@ -2858,7 +2859,7 @@ pub fn validate_against_template(params_json: String) -> Result<Option<String>, 
     let mut raw: serde_json::Value = serde_json::from_str(&params_json).map_err(|e| {
         ScpWasmError::Validation {
             message: format!("invalid ContextParams JSON: {e}"),
-            code: "SCP-VALID-7001".to_owned(),
+            code: codes::VALID_7001.to_owned(),
         }
         .into_js()
     })?;
@@ -2870,7 +2871,7 @@ pub fn validate_against_template(params_json: String) -> Result<Option<String>, 
         .map_err(|e| {
             ScpWasmError::Validation {
                 message: format!("invalid ContextParams JSON: {e}"),
-                code: "SCP-VALID-7001".to_owned(),
+                code: codes::VALID_7001.to_owned(),
             }
             .into_js()
         })?;
@@ -2951,7 +2952,7 @@ pub fn validate_context_params(params_json: String) -> Result<Option<String>, Js
     let mut raw: serde_json::Value = serde_json::from_str(&params_json).map_err(|e| {
         ScpWasmError::Validation {
             message: format!("invalid ContextParams JSON: {e}"),
-            code: "SCP-VALID-7001".to_owned(),
+            code: codes::VALID_7001.to_owned(),
         }
         .into_js()
     })?;
@@ -2963,7 +2964,7 @@ pub fn validate_context_params(params_json: String) -> Result<Option<String>, Js
         .map_err(|e| {
             ScpWasmError::Validation {
                 message: format!("invalid ContextParams JSON: {e}"),
-                code: "SCP-VALID-7001".to_owned(),
+                code: codes::VALID_7001.to_owned(),
             }
             .into_js()
         })?;
@@ -2981,6 +2982,7 @@ pub fn validate_context_params(params_json: String) -> Result<Option<String>, Js
 #[cfg(test)]
 mod tests {
     use super::*;
+    use scp_ffi_common::error_codes as codes;
 
     #[test]
     fn validate_min_protocol_version_absent() {
@@ -3012,7 +3014,7 @@ mod tests {
         assert!(
             matches!(
                 validate_min_protocol_version(&params),
-                Err(ScpWasmError::Validation { ref code, .. }) if code == "SCP-VALID-7002"
+                Err(ScpWasmError::Validation { ref code, .. }) if code == codes::VALID_7002
             ),
             "expected SCP-VALID-7002 validation error"
         );
@@ -3024,7 +3026,7 @@ mod tests {
         assert!(
             matches!(
                 validate_min_protocol_version(&params),
-                Err(ScpWasmError::Validation { ref code, .. }) if code == "SCP-VALID-7002"
+                Err(ScpWasmError::Validation { ref code, .. }) if code == codes::VALID_7002
             ),
             "expected SCP-VALID-7002 validation error"
         );
@@ -3036,7 +3038,7 @@ mod tests {
         assert!(
             matches!(
                 validate_min_protocol_version(&params),
-                Err(ScpWasmError::Validation { ref code, .. }) if code == "SCP-VALID-7002"
+                Err(ScpWasmError::Validation { ref code, .. }) if code == codes::VALID_7002
             ),
             "expected SCP-VALID-7002 validation error"
         );
@@ -3048,7 +3050,7 @@ mod tests {
         assert!(
             matches!(
                 validate_min_protocol_version(&params),
-                Err(ScpWasmError::Validation { ref code, .. }) if code == "SCP-VALID-7002"
+                Err(ScpWasmError::Validation { ref code, .. }) if code == codes::VALID_7002
             ),
             "expected SCP-VALID-7002 validation error"
         );
@@ -3060,7 +3062,7 @@ mod tests {
         assert!(
             matches!(
                 validate_min_protocol_version(&params),
-                Err(ScpWasmError::Validation { ref code, .. }) if code == "SCP-VALID-7002"
+                Err(ScpWasmError::Validation { ref code, .. }) if code == codes::VALID_7002
             ),
             "expected SCP-VALID-7002 validation error"
         );
@@ -3072,7 +3074,7 @@ mod tests {
         assert!(
             matches!(
                 validate_min_protocol_version(&params),
-                Err(ScpWasmError::Validation { ref code, .. }) if code == "SCP-VALID-7002"
+                Err(ScpWasmError::Validation { ref code, .. }) if code == codes::VALID_7002
             ),
             "expected SCP-VALID-7002 validation error"
         );
@@ -3084,7 +3086,7 @@ mod tests {
         assert!(
             matches!(
                 validate_min_protocol_version(&params),
-                Err(ScpWasmError::Validation { ref code, .. }) if code == "SCP-VALID-7002"
+                Err(ScpWasmError::Validation { ref code, .. }) if code == codes::VALID_7002
             ),
             "expected SCP-VALID-7002 validation error"
         );
@@ -3096,7 +3098,7 @@ mod tests {
         assert!(
             matches!(
                 validate_min_protocol_version(&params),
-                Err(ScpWasmError::Validation { ref code, .. }) if code == "SCP-VALID-7002"
+                Err(ScpWasmError::Validation { ref code, .. }) if code == codes::VALID_7002
             ),
             "expected SCP-VALID-7002 validation error"
         );
@@ -3108,7 +3110,7 @@ mod tests {
         assert!(
             matches!(
                 validate_min_protocol_version(&params),
-                Err(ScpWasmError::Validation { ref code, .. }) if code == "SCP-VALID-7002"
+                Err(ScpWasmError::Validation { ref code, .. }) if code == codes::VALID_7002
             ),
             "expected SCP-VALID-7002 validation error"
         );

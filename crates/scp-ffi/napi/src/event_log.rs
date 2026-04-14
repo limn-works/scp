@@ -8,6 +8,7 @@
 //! See ADR-011 (Event Log) and ADR-022 in `.docs/adrs/`.
 
 use napi_derive::napi;
+use scp_ffi_common::error_codes as codes;
 use scp_primitives::Clock;
 
 use crate::context::NapiContextHandle;
@@ -91,7 +92,7 @@ pub async fn event_log_query(
             let parsed: serde_json::Value =
                 serde_json::from_str(json_str).map_err(|e| ScpNapiError::Validation {
                     message: format!("filter_json is not valid JSON: {e}"),
-                    code: "SCP-VALID-7000".to_owned(),
+                    code: codes::VALID_7000.to_owned(),
                 })?;
             Some(parsed)
         }
@@ -227,7 +228,7 @@ pub async fn event_log_verify(
     let claim: serde_json::Value =
         serde_json::from_str(&claim_json).map_err(|e| ScpNapiError::Validation {
             message: format!("claim_json is not valid JSON: {e}"),
-            code: "SCP-VALID-7000".to_owned(),
+            code: codes::VALID_7000.to_owned(),
         })?;
 
     let claim_type = claim
@@ -235,7 +236,7 @@ pub async fn event_log_verify(
         .and_then(|v| v.as_str())
         .ok_or_else(|| ScpNapiError::Validation {
             message: "claim must include 'type' field ('inclusion' or 'absence')".to_owned(),
-            code: "SCP-VALID-7000".to_owned(),
+            code: codes::VALID_7000.to_owned(),
         })
         .map_err(napi::Error::from)?;
 
@@ -286,7 +287,7 @@ pub async fn event_log_verify(
                 .and_then(serde_json::Value::as_u64)
                 .ok_or_else(|| ScpNapiError::Validation {
                     message: "inclusion claim must include 'leaf_index' (integer)".to_owned(),
-                    code: "SCP-VALID-7000".to_owned(),
+                    code: codes::VALID_7000.to_owned(),
                 })
                 .map_err(napi::Error::from)?;
 
@@ -294,7 +295,7 @@ pub async fn event_log_verify(
                 let proof = scp_event_log::proof::prove_inclusion(&rt.event_log, leaf_index)
                     .map_err(|e| ScpNapiError::Context {
                         message: format!("inclusion proof failed: {e}"),
-                        code: "SCP-CTX-2025".to_owned(),
+                        code: codes::CTX_2025.to_owned(),
                     })?;
                 let verified = scp_event_log::proof::verify_inclusion(&proof);
 
@@ -337,14 +338,14 @@ pub async fn event_log_verify(
                 .and_then(|v| v.as_str())
                 .ok_or_else(|| ScpNapiError::Validation {
                     message: "absence claim must include 'event_hash' (hex string)".to_owned(),
-                    code: "SCP-VALID-7000".to_owned(),
+                    code: codes::VALID_7000.to_owned(),
                 })
                 .map_err(napi::Error::from)?;
 
             let event_hash = decode_hex_hash(event_hash_hex).map_err(|e| {
                 napi::Error::from(ScpNapiError::Validation {
                     message: format!("invalid event_hash: {e}"),
-                    code: "SCP-VALID-7000".to_owned(),
+                    code: codes::VALID_7000.to_owned(),
                 })
             })?;
 
@@ -353,7 +354,7 @@ pub async fn event_log_verify(
                     let proof = scp_event_log::proof::prove_absence(&rt.event_log, &event_hash)
                         .map_err(|e| ScpNapiError::Context {
                             message: format!("absence proof failed: {e}"),
-                            code: "SCP-CTX-2025".to_owned(),
+                            code: codes::CTX_2025.to_owned(),
                         })?;
 
                     let lower = proof.lower.as_ref().map(|lwp| {
@@ -398,7 +399,7 @@ pub async fn event_log_verify(
         }
         other => Err(ScpNapiError::Validation {
             message: format!("unsupported claim type '{other}': expected 'inclusion' or 'absence'"),
-            code: "SCP-VALID-7000".to_owned(),
+            code: codes::VALID_7000.to_owned(),
         }
         .into()),
     }
@@ -467,7 +468,7 @@ pub fn event_log_checkpoint(
                        is not available in this build. Enable allow_in_memory_custody \
                        for dev/desktop use."
                 .to_owned(),
-            code: "SCP-PERM-3023".to_owned(),
+            code: codes::PERM_3023.to_owned(),
         }))
     }
 
@@ -480,7 +481,7 @@ pub fn event_log_checkpoint(
                 message: "event log checkpoint requires key custody — create the identity \
                       with in_memory custody (identity_create(\"in_memory\"))"
                     .to_owned(),
-                code: "SCP-PERM-3023".to_owned(),
+                code: codes::PERM_3023.to_owned(),
             })
         })?;
         let scp_id = identity.inner.scp_identity.as_ref().ok_or_else(|| {
@@ -488,7 +489,7 @@ pub fn event_log_checkpoint(
                 message: "event log checkpoint requires retained identity state — the identity \
                           was externally loaded"
                     .to_owned(),
-                code: "SCP-IDENT-1007".to_owned(),
+                code: codes::IDENT_1007.to_owned(),
             })
         })?;
 
@@ -515,7 +516,7 @@ pub fn event_log_checkpoint(
                 .await
                 .map_err(|e| ScpNapiError::Context {
                     message: format!("checkpoint generation failed: {e}"),
-                    code: "SCP-CTX-2023".to_owned(),
+                    code: codes::CTX_2023.to_owned(),
                 })
             })
         })
@@ -573,7 +574,7 @@ pub fn event_log_checkpoint_by_did(
                        is not available in this build. Enable allow_in_memory_custody \
                        for dev/desktop use."
                 .to_owned(),
-            code: "SCP-PERM-3023".to_owned(),
+            code: codes::PERM_3023.to_owned(),
         }))
     }
 
@@ -609,7 +610,7 @@ pub fn event_log_checkpoint_by_did(
                 .await
                 .map_err(|e| ScpNapiError::Context {
                     message: format!("checkpoint generation failed: {e}"),
-                    code: "SCP-CTX-2023".to_owned(),
+                    code: codes::CTX_2023.to_owned(),
                 })
             })
         })
@@ -640,7 +641,7 @@ fn validate_non_negative_epoch(epoch: f64) -> napi::Result<u64> {
     if epoch < 0.0 || !epoch.is_finite() {
         return Err(napi::Error::from(ScpNapiError::Validation {
             message: format!("epoch must be non-negative, got {epoch}"),
-            code: "SCP-VALID-7040".to_owned(),
+            code: codes::VALID_7040.to_owned(),
         }));
     }
     #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
@@ -678,6 +679,7 @@ pub(crate) fn decode_hex_hash(hex: &str) -> Result<[u8; 32], String> {
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
+    use scp_ffi_common::error_codes as codes;
 
     // -----------------------------------------------------------------------
     // decode_hex_hash
@@ -794,7 +796,7 @@ mod tests {
         // contains the SCP-VALID-7040 code from ScpNapiError::Validation.
         let msg = format!("{err}");
         assert!(
-            msg.contains("SCP-VALID-7040"),
+            msg.contains(codes::VALID_7040),
             "error should contain SCP-VALID-7040, got: {msg}"
         );
     }

@@ -21,6 +21,7 @@
 //!
 //! See ADR-020 in `.docs/adrs/phase-4.md` and spec section 22 (Addressing).
 
+use scp_ffi_common::error_codes as codes;
 use std::collections::HashMap;
 
 use napi_derive::napi;
@@ -57,7 +58,7 @@ fn parse_handle_target(json: &str) -> napi::Result<HandleTarget> {
     petname_helpers::parse_handle_target(json).map_err(|e| {
         napi::Error::from(ScpNapiError::Validation {
             message: e.message,
-            code: "SCP-VALID-7126".to_owned(),
+            code: codes::VALID_7126.to_owned(),
         })
     })
 }
@@ -75,7 +76,7 @@ pub fn discovery_parse_address(address: String) -> napi::Result<String> {
     let parsed = parse_address(&address).map_err(|e| {
         napi::Error::from(ScpNapiError::Validation {
             message: format!("invalid address '{address}': {e}"),
-            code: "SCP-VALID-7020".to_owned(),
+            code: codes::VALID_7020.to_owned(),
         })
     })?;
 
@@ -112,7 +113,7 @@ pub fn discovery_parse_address(address: String) -> napi::Result<String> {
     serde_json::to_string(&result).map_err(|e| {
         napi::Error::from(ScpNapiError::Validation {
             message: format!("failed to serialize parsed address: {e}"),
-            code: "SCP-VALID-7021".to_owned(),
+            code: codes::VALID_7021.to_owned(),
         })
     })
 }
@@ -129,7 +130,7 @@ pub fn discovery_create_query(
         Some(s) if s < 0 => {
             return Err(napi::Error::from(ScpNapiError::Validation {
                 message: format!("min_history_secs must be non-negative, got {s}"),
-                code: "SCP-VALID-7040".to_owned(),
+                code: codes::VALID_7040.to_owned(),
             }));
         }
         #[allow(clippy::cast_sign_loss)]
@@ -145,7 +146,7 @@ pub fn discovery_create_query(
     serde_json::to_string(&query).map_err(|e| {
         napi::Error::from(ScpNapiError::Validation {
             message: format!("failed to serialize query: {e}"),
-            code: "SCP-VALID-7022".to_owned(),
+            code: codes::VALID_7022.to_owned(),
         })
     })
 }
@@ -185,20 +186,20 @@ pub async fn context_discover(query: String) -> napi::Result<String> {
         let result = scp_core::discovery::resolve_context_uri(&query).map_err(|e| {
             napi::Error::from(ScpNapiError::Context {
                 message: format!("failed to resolve scp:// URI: {e}"),
-                code: "SCP-CTX-2020".to_owned(),
+                code: codes::CTX_2020.to_owned(),
             })
         })?;
 
         let results = vec![discovery_result_to_json(&result).map_err(|e| {
             napi::Error::from(ScpNapiError::Context {
                 message: e,
-                code: "SCP-CTX-2020".to_owned(),
+                code: codes::CTX_2020.to_owned(),
             })
         })?];
         serde_json::to_string(&results).map_err(|e| {
             napi::Error::from(ScpNapiError::Context {
                 message: format!("failed to serialize discovery results: {e}"),
-                code: "SCP-CTX-2021".to_owned(),
+                code: codes::CTX_2021.to_owned(),
             })
         })
     } else if query.starts_with("did:") {
@@ -208,7 +209,7 @@ pub async fn context_discover(query: String) -> napi::Result<String> {
             .map_err(|e| {
                 napi::Error::from(ScpNapiError::Context {
                     message: format!("DHT discovery failed for '{query}': {e}"),
-                    code: "SCP-CTX-2022".to_owned(),
+                    code: codes::CTX_2022.to_owned(),
                 })
             })?;
 
@@ -218,7 +219,7 @@ pub async fn context_discover(query: String) -> napi::Result<String> {
                 discovery_result_to_json(r).map_err(|e| {
                     napi::Error::from(ScpNapiError::Context {
                         message: e,
-                        code: "SCP-CTX-2022".to_owned(),
+                        code: codes::CTX_2022.to_owned(),
                     })
                 })
             })
@@ -226,7 +227,7 @@ pub async fn context_discover(query: String) -> napi::Result<String> {
         serde_json::to_string(&json_results).map_err(|e| {
             napi::Error::from(ScpNapiError::Context {
                 message: format!("failed to serialize discovery results: {e}"),
-                code: "SCP-CTX-2023".to_owned(),
+                code: codes::CTX_2023.to_owned(),
             })
         })
     } else {
@@ -235,7 +236,7 @@ pub async fn context_discover(query: String) -> napi::Result<String> {
                 "query must be a DID (starts with 'did:') or an scp:// URI \
                  (starts with 'scp://'), got: {query}"
             ),
-            code: "SCP-VALID-7027".to_owned(),
+            code: codes::VALID_7027.to_owned(),
         }))
     }
 }
@@ -251,19 +252,19 @@ pub fn petname_set(owner_did: String, target_did: String, name: String) -> napi:
     if owner_did.is_empty() {
         return Err(napi::Error::from(ScpNapiError::Validation {
             message: "owner_did must not be empty".to_owned(),
-            code: "SCP-VALID-7110".to_owned(),
+            code: codes::VALID_7110.to_owned(),
         }));
     }
     if target_did.is_empty() {
         return Err(napi::Error::from(ScpNapiError::Validation {
             message: "target_did must not be empty".to_owned(),
-            code: "SCP-VALID-7111".to_owned(),
+            code: codes::VALID_7111.to_owned(),
         }));
     }
     let mut guard = petname_maps().lock().map_err(|e| {
         napi::Error::from(ScpNapiError::Validation {
             message: format!("petname lock poisoned: {e}"),
-            code: "SCP-VALID-7112".to_owned(),
+            code: codes::VALID_7112.to_owned(),
         })
     })?;
     let map = guard.entry(owner_did).or_default();
@@ -278,13 +279,13 @@ pub fn petname_remove(owner_did: String, target_did: String) -> napi::Result<()>
     if owner_did.is_empty() {
         return Err(napi::Error::from(ScpNapiError::Validation {
             message: "owner_did must not be empty".to_owned(),
-            code: "SCP-VALID-7110".to_owned(),
+            code: codes::VALID_7110.to_owned(),
         }));
     }
     let mut guard = petname_maps().lock().map_err(|e| {
         napi::Error::from(ScpNapiError::Validation {
             message: format!("petname lock poisoned: {e}"),
-            code: "SCP-VALID-7112".to_owned(),
+            code: codes::VALID_7112.to_owned(),
         })
     })?;
     if let Some(map) = guard.get_mut(&owner_did) {
@@ -304,19 +305,19 @@ pub fn petname_set_context(
     if owner_did.is_empty() {
         return Err(napi::Error::from(ScpNapiError::Validation {
             message: "owner_did must not be empty".to_owned(),
-            code: "SCP-VALID-7110".to_owned(),
+            code: codes::VALID_7110.to_owned(),
         }));
     }
     if context_id.is_empty() {
         return Err(napi::Error::from(ScpNapiError::Validation {
             message: "context_id must not be empty".to_owned(),
-            code: "SCP-VALID-7113".to_owned(),
+            code: codes::VALID_7113.to_owned(),
         }));
     }
     let mut guard = petname_maps().lock().map_err(|e| {
         napi::Error::from(ScpNapiError::Validation {
             message: format!("petname lock poisoned: {e}"),
-            code: "SCP-VALID-7112".to_owned(),
+            code: codes::VALID_7112.to_owned(),
         })
     })?;
     let map = guard.entry(owner_did).or_default();
@@ -331,13 +332,13 @@ pub fn petname_remove_context(owner_did: String, context_id: String) -> napi::Re
     if owner_did.is_empty() {
         return Err(napi::Error::from(ScpNapiError::Validation {
             message: "owner_did must not be empty".to_owned(),
-            code: "SCP-VALID-7110".to_owned(),
+            code: codes::VALID_7110.to_owned(),
         }));
     }
     let mut guard = petname_maps().lock().map_err(|e| {
         napi::Error::from(ScpNapiError::Validation {
             message: format!("petname lock poisoned: {e}"),
-            code: "SCP-VALID-7112".to_owned(),
+            code: codes::VALID_7112.to_owned(),
         })
     })?;
     if let Some(map) = guard.get_mut(&owner_did) {
@@ -353,13 +354,13 @@ pub fn petname_resolve_did(owner_did: String, name: String) -> napi::Result<Stri
     if owner_did.is_empty() {
         return Err(napi::Error::from(ScpNapiError::Validation {
             message: "owner_did must not be empty".to_owned(),
-            code: "SCP-VALID-7110".to_owned(),
+            code: codes::VALID_7110.to_owned(),
         }));
     }
     let guard = petname_maps().lock().map_err(|e| {
         napi::Error::from(ScpNapiError::Validation {
             message: format!("petname lock poisoned: {e}"),
-            code: "SCP-VALID-7112".to_owned(),
+            code: codes::VALID_7112.to_owned(),
         })
     })?;
     let dids: Vec<String> = guard
@@ -374,7 +375,7 @@ pub fn petname_resolve_did(owner_did: String, name: String) -> napi::Result<Stri
     serde_json::to_string(&dids).map_err(|e| {
         napi::Error::from(ScpNapiError::Validation {
             message: format!("failed to serialize petname resolve result: {e}"),
-            code: "SCP-VALID-7114".to_owned(),
+            code: codes::VALID_7114.to_owned(),
         })
     })
 }
@@ -386,13 +387,13 @@ pub fn petname_resolve_context(owner_did: String, name: String) -> napi::Result<
     if owner_did.is_empty() {
         return Err(napi::Error::from(ScpNapiError::Validation {
             message: "owner_did must not be empty".to_owned(),
-            code: "SCP-VALID-7110".to_owned(),
+            code: codes::VALID_7110.to_owned(),
         }));
     }
     let guard = petname_maps().lock().map_err(|e| {
         napi::Error::from(ScpNapiError::Validation {
             message: format!("petname lock poisoned: {e}"),
-            code: "SCP-VALID-7112".to_owned(),
+            code: codes::VALID_7112.to_owned(),
         })
     })?;
     let ids: Vec<String> = guard
@@ -402,7 +403,7 @@ pub fn petname_resolve_context(owner_did: String, name: String) -> napi::Result<
     serde_json::to_string(&ids).map_err(|e| {
         napi::Error::from(ScpNapiError::Validation {
             message: format!("failed to serialize petname resolve result: {e}"),
-            code: "SCP-VALID-7114".to_owned(),
+            code: codes::VALID_7114.to_owned(),
         })
     })
 }
@@ -414,13 +415,13 @@ pub fn petname_get_for_did(owner_did: String, target_did: String) -> napi::Resul
     if owner_did.is_empty() {
         return Err(napi::Error::from(ScpNapiError::Validation {
             message: "owner_did must not be empty".to_owned(),
-            code: "SCP-VALID-7110".to_owned(),
+            code: codes::VALID_7110.to_owned(),
         }));
     }
     let guard = petname_maps().lock().map_err(|e| {
         napi::Error::from(ScpNapiError::Validation {
             message: format!("petname lock poisoned: {e}"),
-            code: "SCP-VALID-7112".to_owned(),
+            code: codes::VALID_7112.to_owned(),
         })
     })?;
     Ok(guard.get(&owner_did).and_then(|map| {
@@ -439,13 +440,13 @@ pub fn petname_get_for_context(
     if owner_did.is_empty() {
         return Err(napi::Error::from(ScpNapiError::Validation {
             message: "owner_did must not be empty".to_owned(),
-            code: "SCP-VALID-7110".to_owned(),
+            code: codes::VALID_7110.to_owned(),
         }));
     }
     let guard = petname_maps().lock().map_err(|e| {
         napi::Error::from(ScpNapiError::Validation {
             message: format!("petname lock poisoned: {e}"),
-            code: "SCP-VALID-7112".to_owned(),
+            code: codes::VALID_7112.to_owned(),
         })
     })?;
     Ok(guard
@@ -477,7 +478,7 @@ pub fn handle_register(
     let mut guard = handle_registries().lock().map_err(|e| {
         napi::Error::from(ScpNapiError::Validation {
             message: format!("handle registry lock poisoned: {e}"),
-            code: "SCP-VALID-7120".to_owned(),
+            code: codes::VALID_7120.to_owned(),
         })
     })?;
     let registry = guard
@@ -491,7 +492,7 @@ pub fn handle_register(
     serde_json::to_string(&result).map_err(|e| {
         napi::Error::from(ScpNapiError::Validation {
             message: format!("failed to serialize handle register result: {e}"),
-            code: "SCP-VALID-7122".to_owned(),
+            code: codes::VALID_7122.to_owned(),
         })
     })
 }
@@ -510,7 +511,7 @@ pub fn handle_lookup(
         Some(other) => {
             return Err(napi::Error::from(ScpNapiError::Validation {
                 message: format!("invalid type_filter '{other}': expected 'identity' or 'context'"),
-                code: "SCP-VALID-7123".to_owned(),
+                code: codes::VALID_7123.to_owned(),
             }));
         }
         None => None,
@@ -518,7 +519,7 @@ pub fn handle_lookup(
     let guard = handle_registries().lock().map_err(|e| {
         napi::Error::from(ScpNapiError::Validation {
             message: format!("handle registry lock poisoned: {e}"),
-            code: "SCP-VALID-7120".to_owned(),
+            code: codes::VALID_7120.to_owned(),
         })
     })?;
     let result = guard.get(&discovery_context_id).map_or_else(
@@ -535,7 +536,7 @@ pub fn handle_lookup(
     serde_json::to_string(&result).map_err(|e| {
         napi::Error::from(ScpNapiError::Validation {
             message: format!("failed to serialize handle lookup result: {e}"),
-            code: "SCP-VALID-7124".to_owned(),
+            code: codes::VALID_7124.to_owned(),
         })
     })
 }
@@ -551,7 +552,7 @@ pub fn handle_deregister(
     let mut guard = handle_registries().lock().map_err(|e| {
         napi::Error::from(ScpNapiError::Validation {
             message: format!("handle registry lock poisoned: {e}"),
-            code: "SCP-VALID-7120".to_owned(),
+            code: codes::VALID_7120.to_owned(),
         })
     })?;
     let result = guard.get_mut(&discovery_context_id).map_or_else(
@@ -566,7 +567,7 @@ pub fn handle_deregister(
     serde_json::to_string(&result).map_err(|e| {
         napi::Error::from(ScpNapiError::Validation {
             message: format!("failed to serialize handle deregister result: {e}"),
-            code: "SCP-VALID-7125".to_owned(),
+            code: codes::VALID_7125.to_owned(),
         })
     })
 }
@@ -600,7 +601,7 @@ pub fn scope_register(
         scp_ffi_common::validate::validate_relay_url(url).map_err(|e| {
             napi::Error::from(ScpNapiError::Validation {
                 message: e.to_string(),
-                code: "SCP-VALID-7135".to_owned(),
+                code: codes::VALID_7135.to_owned(),
             })
         })?;
     }
@@ -621,7 +622,7 @@ pub fn scope_register(
     let mut guard = petname_helpers::scope_registries().lock().map_err(|e| {
         napi::Error::from(ScpNapiError::Validation {
             message: format!("scope registry lock poisoned: {e}"),
-            code: "SCP-VALID-7130".to_owned(),
+            code: codes::VALID_7130.to_owned(),
         })
     })?;
 
@@ -638,14 +639,14 @@ pub fn scope_register(
         .map_err(|e| {
             napi::Error::from(ScpNapiError::Validation {
                 message: format!("scope registration failed: {e}"),
-                code: "SCP-VALID-7131".to_owned(),
+                code: codes::VALID_7131.to_owned(),
             })
         })?;
 
     serde_json::to_string(&result).map_err(|e| {
         napi::Error::from(ScpNapiError::Validation {
             message: format!("failed to serialize scope register result: {e}"),
-            code: "SCP-VALID-7132".to_owned(),
+            code: codes::VALID_7132.to_owned(),
         })
     })
 }
@@ -660,7 +661,7 @@ pub fn scope_lookup(scope_context_id: String, name: String) -> napi::Result<Stri
     let guard = petname_helpers::scope_registries().lock().map_err(|e| {
         napi::Error::from(ScpNapiError::Validation {
             message: format!("scope registry lock poisoned: {e}"),
-            code: "SCP-VALID-7130".to_owned(),
+            code: codes::VALID_7130.to_owned(),
         })
     })?;
 
@@ -670,7 +671,7 @@ pub fn scope_lookup(scope_context_id: String, name: String) -> napi::Result<Stri
             .map_err(|e| {
                 napi::Error::from(ScpNapiError::Validation {
                     message: format!("scope lookup failed: {e}"),
-                    code: "SCP-VALID-7133".to_owned(),
+                    code: codes::VALID_7133.to_owned(),
                 })
             })?,
         None => scp_core::discovery::ScopeLookupResult {
@@ -681,7 +682,7 @@ pub fn scope_lookup(scope_context_id: String, name: String) -> napi::Result<Stri
     serde_json::to_string(&result).map_err(|e| {
         napi::Error::from(ScpNapiError::Validation {
             message: format!("failed to serialize scope lookup result: {e}"),
-            code: "SCP-VALID-7133".to_owned(),
+            code: codes::VALID_7133.to_owned(),
         })
     })
 }
@@ -702,7 +703,7 @@ pub fn scope_deregister(
     let mut guard = petname_helpers::scope_registries().lock().map_err(|e| {
         napi::Error::from(ScpNapiError::Validation {
             message: format!("scope registry lock poisoned: {e}"),
-            code: "SCP-VALID-7130".to_owned(),
+            code: codes::VALID_7130.to_owned(),
         })
     })?;
 
@@ -715,7 +716,7 @@ pub fn scope_deregister(
             .map_err(|e| {
                 napi::Error::from(ScpNapiError::Validation {
                     message: format!("scope deregister failed: {e}"),
-                    code: "SCP-VALID-7134".to_owned(),
+                    code: codes::VALID_7134.to_owned(),
                 })
             })?,
         None => scp_core::discovery::ScopeDeregisterResult { removed: false },
@@ -724,7 +725,7 @@ pub fn scope_deregister(
     serde_json::to_string(&result).map_err(|e| {
         napi::Error::from(ScpNapiError::Validation {
             message: format!("failed to serialize scope deregister result: {e}"),
-            code: "SCP-VALID-7134".to_owned(),
+            code: codes::VALID_7134.to_owned(),
         })
     })
 }
@@ -745,21 +746,21 @@ pub async fn address_resolve(
     if owner_did.is_empty() {
         return Err(napi::Error::from(ScpNapiError::Validation {
             message: "owner_did must not be empty".to_owned(),
-            code: "SCP-VALID-7110".to_owned(),
+            code: codes::VALID_7110.to_owned(),
         }));
     }
     let mut known_contexts: HashMap<String, String> = if let Some(ref json) = known_contexts_json {
         serde_json::from_str(json).map_err(|e| {
             napi::Error::from(ScpNapiError::Validation {
                 message: format!("invalid known_contexts_json: {e}"),
-                code: "SCP-VALID-7090".to_owned(),
+                code: codes::VALID_7090.to_owned(),
             })
         })?
     } else {
         let guard = handle_registries().lock().map_err(|e| {
             napi::Error::from(ScpNapiError::Validation {
                 message: format!("handle registry lock poisoned: {e}"),
-                code: "SCP-VALID-7120".to_owned(),
+                code: codes::VALID_7120.to_owned(),
             })
         })?;
         guard.keys().map(|k| (k.clone(), k.clone())).collect()
@@ -775,7 +776,7 @@ pub async fn address_resolve(
         let guard = petname_maps().lock().map_err(|e| {
             napi::Error::from(ScpNapiError::Validation {
                 message: format!("petname lock poisoned: {e}"),
-                code: "SCP-VALID-7112".to_owned(),
+                code: codes::VALID_7112.to_owned(),
             })
         })?;
         guard.get(&owner_did).cloned().unwrap_or_default()
@@ -795,7 +796,7 @@ pub async fn address_resolve(
         .map_err(|e| {
             napi::Error::from(ScpNapiError::Validation {
                 message: format!("address resolution failed: {e}"),
-                code: "SCP-VALID-7091".to_owned(),
+                code: codes::VALID_7091.to_owned(),
             })
         })?;
     let json_results: Vec<serde_json::Value> =
@@ -803,7 +804,7 @@ pub async fn address_resolve(
     serde_json::to_string(&json_results).map_err(|e| {
         napi::Error::from(ScpNapiError::Validation {
             message: format!("failed to serialize address resolution results: {e}"),
-            code: "SCP-VALID-7092".to_owned(),
+            code: codes::VALID_7092.to_owned(),
         })
     })
 }

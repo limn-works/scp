@@ -265,50 +265,17 @@ impl NapiNodeHandle {
         }
 
         // Resolve broadcast key: explicit or auto-lookup from ContextManager.
-        let (resolved_key_bytes, resolved_epoch, resolved_author_did) =
-            match (broadcast_key_hex, author_did) {
-                (Some(key_hex), Some(did)) => {
-                    let key_hex = Zeroizing::new(key_hex);
-                    let key_vec = Zeroizing::new(hex::decode(&*key_hex).map_err(|e| {
-                        NapiError::from_reason(format!("invalid broadcast_key_hex: {e}"))
-                    })?);
-                    let key_bytes: Zeroizing<[u8; 32]> =
-                        Zeroizing::new(<[u8; 32]>::try_from(key_vec.as_slice()).map_err(|_| {
-                            NapiError::from_reason(
-                                "broadcast_key_hex must be exactly 64 hex characters (32 bytes)",
-                            )
-                        })?);
-                    // Explicit key path always uses epoch 0. For rotated keys, use auto-resolve (omit both params).
-                    (key_bytes, 0u64, did)
-                }
-                (None, author_opt) => {
-                    // Auto-resolve: use provided author_did or fall back to node DID.
-                    let did = author_opt.unwrap_or_else(|| self.inner.did().to_owned());
-                    let mgr = crate::runtime::context_manager()?;
-                    let (key_bytes, epoch) = mgr
-                    .get_broadcast_key_for_local_author(&context_id, &did)
-                    .await
-                    .map_err(|e| {
-                        tracing::debug!(error = %e, "broadcast key auto-resolve failed");
-                        NapiError::from_reason(
-                            "broadcast key auto-resolve failed: not authorized for this context",
-                        )
-                    })?;
-                    (key_bytes, epoch, did)
-                }
-                (Some(_), None) => {
-                    return Err(NapiError::from_reason(
-                        "broadcastKeyHex requires authorDid — provide the DID of the \
-                         broadcast key owner, or omit both for auto-resolve",
-                    ));
-                }
-            };
-
-        let broadcast_key = scp_core::crypto::sender_keys::BroadcastKey::from_parts(
-            scp_core::crypto::sender_keys::SenderKey::from_bytes(*resolved_key_bytes),
-            resolved_epoch,
-            resolved_author_did,
-        );
+        let mgr = crate::runtime::context_manager()?;
+        let resolved = server::resolve_broadcast_key(
+            broadcast_key_hex,
+            author_did,
+            self.inner.did(),
+            mgr,
+            &context_id,
+        )
+        .await
+        .map_err(|e| NapiError::from_reason(e.to_string()))?;
+        let broadcast_key = resolved.into_broadcast_key();
 
         let adm = match admission.to_lowercase().as_str() {
             "open" => scp_core::context::broadcast::BroadcastAdmission::Open,

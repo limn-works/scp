@@ -24,6 +24,7 @@
 //!
 //! See ADR-020 in `.docs/adrs/phase-4.md` and spec section 22 (Addressing).
 
+use scp_ffi_common::error_codes as codes;
 use std::collections::HashMap;
 
 use pyo3::prelude::*;
@@ -88,7 +89,7 @@ pub fn py_discovery_parse_address<'py>(
 ) -> PyResult<Bound<'py, PyDict>> {
     let parsed = parse_address(address).map_err(|e| ScpPyError::ValidationError {
         message: format!("invalid address '{address}': {e}"),
-        code: "SCP-VALID-7060".to_string(),
+        code: codes::VALID_7060.to_string(),
     })?;
 
     let dict = PyDict::new(py);
@@ -147,7 +148,7 @@ pub fn py_discovery_create_query(
     serde_json::to_string(&query).map_err(|e| {
         ScpPyError::ValidationError {
             message: format!("failed to serialize query: {e}"),
-            code: "SCP-VALID-7061".to_string(),
+            code: codes::VALID_7061.to_string(),
         }
         .into()
     })
@@ -309,7 +310,7 @@ pub fn py_context_discover<'py>(py: Python<'py>, query: &str) -> PyResult<Bound<
                 "query must be a DID (starts with 'did:') or an scp:// URI \
                  (starts with 'scp://'), got: {query}"
             ),
-            code: "SCP-VALID-7062".to_owned(),
+            code: codes::VALID_7062.to_owned(),
         }
         .into())
     }
@@ -339,14 +340,14 @@ pub fn py_petname_set(owner_did: &str, target_did: &str, name: &str) -> PyResult
     if owner_did.is_empty() {
         return Err(ScpPyError::ValidationError {
             message: "owner_did must not be empty".to_owned(),
-            code: "SCP-VALID-7110".to_owned(),
+            code: codes::VALID_7110.to_owned(),
         }
         .into());
     }
     if target_did.is_empty() {
         return Err(ScpPyError::ValidationError {
             message: "target_did must not be empty".to_owned(),
-            code: "SCP-VALID-7111".to_owned(),
+            code: codes::VALID_7111.to_owned(),
         }
         .into());
     }
@@ -354,7 +355,7 @@ pub fn py_petname_set(owner_did: &str, target_did: &str, name: &str) -> PyResult
         .lock()
         .map_err(|e| ScpPyError::ValidationError {
             message: format!("petname lock poisoned: {e}"),
-            code: "SCP-VALID-7112".to_owned(),
+            code: codes::VALID_7112.to_owned(),
         })?;
     let map = guard.entry(owner_did.to_owned()).or_default();
     map.set_petname(DID::from(target_did), name.to_owned());
@@ -377,7 +378,7 @@ pub fn py_petname_remove(owner_did: &str, target_did: &str) -> PyResult<()> {
     if owner_did.is_empty() {
         return Err(ScpPyError::ValidationError {
             message: "owner_did must not be empty".to_owned(),
-            code: "SCP-VALID-7110".to_owned(),
+            code: codes::VALID_7110.to_owned(),
         }
         .into());
     }
@@ -385,7 +386,7 @@ pub fn py_petname_remove(owner_did: &str, target_did: &str) -> PyResult<()> {
         .lock()
         .map_err(|e| ScpPyError::ValidationError {
             message: format!("petname lock poisoned: {e}"),
-            code: "SCP-VALID-7112".to_owned(),
+            code: codes::VALID_7112.to_owned(),
         })?;
     if let Some(map) = guard.get_mut(owner_did) {
         map.remove_petname(&DID::from(target_did));
@@ -410,14 +411,14 @@ pub fn py_petname_set_context(owner_did: &str, context_id: &str, name: &str) -> 
     if owner_did.is_empty() {
         return Err(ScpPyError::ValidationError {
             message: "owner_did must not be empty".to_owned(),
-            code: "SCP-VALID-7110".to_owned(),
+            code: codes::VALID_7110.to_owned(),
         }
         .into());
     }
     if context_id.is_empty() {
         return Err(ScpPyError::ValidationError {
             message: "context_id must not be empty".to_owned(),
-            code: "SCP-VALID-7113".to_owned(),
+            code: codes::VALID_7113.to_owned(),
         }
         .into());
     }
@@ -425,7 +426,7 @@ pub fn py_petname_set_context(owner_did: &str, context_id: &str, name: &str) -> 
         .lock()
         .map_err(|e| ScpPyError::ValidationError {
             message: format!("petname lock poisoned: {e}"),
-            code: "SCP-VALID-7112".to_owned(),
+            code: codes::VALID_7112.to_owned(),
         })?;
     let map = guard.entry(owner_did.to_owned()).or_default();
     map.set_context_petname(context_id.to_owned(), name.to_owned());
@@ -448,7 +449,7 @@ pub fn py_petname_remove_context(owner_did: &str, context_id: &str) -> PyResult<
     if owner_did.is_empty() {
         return Err(ScpPyError::ValidationError {
             message: "owner_did must not be empty".to_owned(),
-            code: "SCP-VALID-7110".to_owned(),
+            code: codes::VALID_7110.to_owned(),
         }
         .into());
     }
@@ -456,7 +457,7 @@ pub fn py_petname_remove_context(owner_did: &str, context_id: &str) -> PyResult<
         .lock()
         .map_err(|e| ScpPyError::ValidationError {
             message: format!("petname lock poisoned: {e}"),
-            code: "SCP-VALID-7112".to_owned(),
+            code: codes::VALID_7112.to_owned(),
         })?;
     if let Some(map) = guard.get_mut(owner_did) {
         map.remove_context_petname(&context_id.to_owned());
@@ -487,7 +488,7 @@ pub fn py_petname_resolve_did(owner_did: &str, name: &str) -> PyResult<Vec<Strin
     if owner_did.is_empty() {
         return Err(ScpPyError::ValidationError {
             message: "owner_did must not be empty".to_owned(),
-            code: "SCP-VALID-7110".to_owned(),
+            code: codes::VALID_7110.to_owned(),
         }
         .into());
     }
@@ -495,7 +496,7 @@ pub fn py_petname_resolve_did(owner_did: &str, name: &str) -> PyResult<Vec<Strin
         .lock()
         .map_err(|e| ScpPyError::ValidationError {
             message: format!("petname lock poisoned: {e}"),
-            code: "SCP-VALID-7112".to_owned(),
+            code: codes::VALID_7112.to_owned(),
         })?;
     let dids = guard
         .get(owner_did)
@@ -531,7 +532,7 @@ pub fn py_petname_resolve_context(owner_did: &str, name: &str) -> PyResult<Vec<S
     if owner_did.is_empty() {
         return Err(ScpPyError::ValidationError {
             message: "owner_did must not be empty".to_owned(),
-            code: "SCP-VALID-7110".to_owned(),
+            code: codes::VALID_7110.to_owned(),
         }
         .into());
     }
@@ -539,7 +540,7 @@ pub fn py_petname_resolve_context(owner_did: &str, name: &str) -> PyResult<Vec<S
         .lock()
         .map_err(|e| ScpPyError::ValidationError {
             message: format!("petname lock poisoned: {e}"),
-            code: "SCP-VALID-7112".to_owned(),
+            code: codes::VALID_7112.to_owned(),
         })?;
     let ids = guard
         .get(owner_did)
@@ -568,7 +569,7 @@ pub fn py_petname_get_for_did(owner_did: &str, target_did: &str) -> PyResult<Opt
     if owner_did.is_empty() {
         return Err(ScpPyError::ValidationError {
             message: "owner_did must not be empty".to_owned(),
-            code: "SCP-VALID-7110".to_owned(),
+            code: codes::VALID_7110.to_owned(),
         }
         .into());
     }
@@ -576,7 +577,7 @@ pub fn py_petname_get_for_did(owner_did: &str, target_did: &str) -> PyResult<Opt
         .lock()
         .map_err(|e| ScpPyError::ValidationError {
             message: format!("petname lock poisoned: {e}"),
-            code: "SCP-VALID-7112".to_owned(),
+            code: codes::VALID_7112.to_owned(),
         })?;
     let name = guard.get(owner_did).and_then(|map| {
         map.petname_for_did(&DID::from(target_did))
@@ -605,7 +606,7 @@ pub fn py_petname_get_for_context(owner_did: &str, context_id: &str) -> PyResult
     if owner_did.is_empty() {
         return Err(ScpPyError::ValidationError {
             message: "owner_did must not be empty".to_owned(),
-            code: "SCP-VALID-7110".to_owned(),
+            code: codes::VALID_7110.to_owned(),
         }
         .into());
     }
@@ -613,7 +614,7 @@ pub fn py_petname_get_for_context(owner_did: &str, context_id: &str) -> PyResult
         .lock()
         .map_err(|e| ScpPyError::ValidationError {
             message: format!("petname lock poisoned: {e}"),
-            code: "SCP-VALID-7112".to_owned(),
+            code: codes::VALID_7112.to_owned(),
         })?;
     let name = guard.get(owner_did).and_then(|map| {
         map.petname_for_context(&context_id.to_owned())
@@ -670,7 +671,7 @@ pub fn py_handle_register(
         .lock()
         .map_err(|e| ScpPyError::ValidationError {
             message: format!("handle registry lock poisoned: {e}"),
-            code: "SCP-VALID-7120".to_owned(),
+            code: codes::VALID_7120.to_owned(),
         })?;
 
     let registry = guard
@@ -686,7 +687,7 @@ pub fn py_handle_register(
     serde_json::to_string(&result).map_err(|e| {
         ScpPyError::ValidationError {
             message: format!("failed to serialize handle register result: {e}"),
-            code: "SCP-VALID-7122".to_owned(),
+            code: codes::VALID_7122.to_owned(),
         }
         .into()
     })
@@ -721,7 +722,7 @@ pub fn py_handle_lookup(
         Some(other) => {
             return Err(ScpPyError::ValidationError {
                 message: format!("invalid type_filter '{other}': expected 'identity' or 'context'"),
-                code: "SCP-VALID-7123".to_owned(),
+                code: codes::VALID_7123.to_owned(),
             }
             .into());
         }
@@ -732,7 +733,7 @@ pub fn py_handle_lookup(
         .lock()
         .map_err(|e| ScpPyError::ValidationError {
             message: format!("handle registry lock poisoned: {e}"),
-            code: "SCP-VALID-7120".to_owned(),
+            code: codes::VALID_7120.to_owned(),
         })?;
 
     let result = guard.get(discovery_context_id).map_or_else(
@@ -750,7 +751,7 @@ pub fn py_handle_lookup(
     serde_json::to_string(&result).map_err(|e| {
         ScpPyError::ValidationError {
             message: format!("failed to serialize handle lookup result: {e}"),
-            code: "SCP-VALID-7124".to_owned(),
+            code: codes::VALID_7124.to_owned(),
         }
         .into()
     })
@@ -784,7 +785,7 @@ pub fn py_handle_deregister(
         .lock()
         .map_err(|e| ScpPyError::ValidationError {
             message: format!("handle registry lock poisoned: {e}"),
-            code: "SCP-VALID-7120".to_owned(),
+            code: codes::VALID_7120.to_owned(),
         })?;
 
     let result = guard.get_mut(discovery_context_id).map_or_else(
@@ -800,7 +801,7 @@ pub fn py_handle_deregister(
     serde_json::to_string(&result).map_err(|e| {
         ScpPyError::ValidationError {
             message: format!("failed to serialize handle deregister result: {e}"),
-            code: "SCP-VALID-7125".to_owned(),
+            code: codes::VALID_7125.to_owned(),
         }
         .into()
     })
@@ -811,7 +812,7 @@ fn parse_handle_target(json: &str) -> PyResult<HandleTarget> {
     petname_helpers::parse_handle_target(json).map_err(|e| {
         ScpPyError::ValidationError {
             message: e.message,
-            code: "SCP-VALID-7126".to_owned(),
+            code: codes::VALID_7126.to_owned(),
         }
         .into()
     })
@@ -885,7 +886,7 @@ pub fn py_scope_register(
             .lock()
             .map_err(|e| ScpPyError::ValidationError {
                 message: format!("scope registry lock poisoned: {e}"),
-                code: "SCP-VALID-7130".to_owned(),
+                code: codes::VALID_7130.to_owned(),
             })?;
 
     let registry = guard
@@ -900,13 +901,13 @@ pub fn py_scope_register(
         )
         .map_err(|e| ScpPyError::ValidationError {
             message: format!("scope registration failed: {e}"),
-            code: "SCP-VALID-7131".to_owned(),
+            code: codes::VALID_7131.to_owned(),
         })?;
 
     serde_json::to_string(&result).map_err(|e| {
         ScpPyError::ValidationError {
             message: format!("failed to serialize scope register result: {e}"),
-            code: "SCP-VALID-7132".to_owned(),
+            code: codes::VALID_7132.to_owned(),
         }
         .into()
     })
@@ -936,7 +937,7 @@ pub fn py_scope_lookup(scope_context_id: &str, name: &str) -> PyResult<String> {
             .lock()
             .map_err(|e| ScpPyError::ValidationError {
                 message: format!("scope registry lock poisoned: {e}"),
-                code: "SCP-VALID-7130".to_owned(),
+                code: codes::VALID_7130.to_owned(),
             })?;
 
     let result = match guard.get(scope_context_id) {
@@ -946,7 +947,7 @@ pub fn py_scope_lookup(scope_context_id: &str, name: &str) -> PyResult<String> {
             })
             .map_err(|e| ScpPyError::ValidationError {
                 message: format!("scope lookup failed: {e}"),
-                code: "SCP-VALID-7133".to_owned(),
+                code: codes::VALID_7133.to_owned(),
             })?,
         None => scp_core::discovery::ScopeLookupResult {
             results: Vec::new(),
@@ -956,7 +957,7 @@ pub fn py_scope_lookup(scope_context_id: &str, name: &str) -> PyResult<String> {
     serde_json::to_string(&result).map_err(|e| {
         ScpPyError::ValidationError {
             message: format!("failed to serialize scope lookup result: {e}"),
-            code: "SCP-VALID-7133".to_owned(),
+            code: codes::VALID_7133.to_owned(),
         }
         .into()
     })
@@ -990,7 +991,7 @@ pub fn py_scope_deregister(scope_context_id: &str, name: &str, did: &str) -> PyR
             .lock()
             .map_err(|e| ScpPyError::ValidationError {
                 message: format!("scope registry lock poisoned: {e}"),
-                code: "SCP-VALID-7130".to_owned(),
+                code: codes::VALID_7130.to_owned(),
             })?;
 
     let result = match guard.get_mut(scope_context_id) {
@@ -1001,7 +1002,7 @@ pub fn py_scope_deregister(scope_context_id: &str, name: &str, did: &str) -> PyR
             })
             .map_err(|e| ScpPyError::ValidationError {
                 message: format!("scope deregister failed: {e}"),
-                code: "SCP-VALID-7134".to_owned(),
+                code: codes::VALID_7134.to_owned(),
             })?,
         None => scp_core::discovery::ScopeDeregisterResult { removed: false },
     };
@@ -1009,7 +1010,7 @@ pub fn py_scope_deregister(scope_context_id: &str, name: &str, did: &str) -> PyR
     serde_json::to_string(&result).map_err(|e| {
         ScpPyError::ValidationError {
             message: format!("failed to serialize scope deregister result: {e}"),
-            code: "SCP-VALID-7134".to_owned(),
+            code: codes::VALID_7134.to_owned(),
         }
         .into()
     })
@@ -1051,7 +1052,7 @@ pub fn py_address_resolve(
     if owner_did.is_empty() {
         return Err(ScpPyError::ValidationError {
             message: "owner_did must not be empty".to_owned(),
-            code: "SCP-VALID-7110".to_owned(),
+            code: codes::VALID_7110.to_owned(),
         }
         .into());
     }
@@ -1059,7 +1060,7 @@ pub fn py_address_resolve(
     let mut known_contexts: HashMap<String, String> = if let Some(json) = known_contexts_json {
         serde_json::from_str(json).map_err(|e| ScpPyError::ValidationError {
             message: format!("invalid known_contexts_json: {e}"),
-            code: "SCP-VALID-7090".to_owned(),
+            code: codes::VALID_7090.to_owned(),
         })?
     } else {
         // Use all known handle registries with context IDs as scope names.
@@ -1067,7 +1068,7 @@ pub fn py_address_resolve(
             .lock()
             .map_err(|e| ScpPyError::ValidationError {
                 message: format!("handle registry lock poisoned: {e}"),
-                code: "SCP-VALID-7120".to_owned(),
+                code: codes::VALID_7120.to_owned(),
             })?;
         guard.keys().map(|k| (k.clone(), k.clone())).collect()
     };
@@ -1088,7 +1089,7 @@ pub fn py_address_resolve(
             .lock()
             .map_err(|e| ScpPyError::ValidationError {
                 message: format!("petname lock poisoned: {e}"),
-                code: "SCP-VALID-7112".to_owned(),
+                code: codes::VALID_7112.to_owned(),
             })?;
         guard.get(owner_did).cloned().unwrap_or_default()
     };
@@ -1109,7 +1110,7 @@ pub fn py_address_resolve(
             .await
             .map_err(|e| ScpPyError::ValidationError {
                 message: format!("address resolution failed: {e}"),
-                code: "SCP-VALID-7091".to_owned(),
+                code: codes::VALID_7091.to_owned(),
             })
     })?;
 
@@ -1119,7 +1120,7 @@ pub fn py_address_resolve(
     serde_json::to_string(&json_results).map_err(|e| {
         ScpPyError::ValidationError {
             message: format!("failed to serialize address resolution results: {e}"),
-            code: "SCP-VALID-7092".to_owned(),
+            code: codes::VALID_7092.to_owned(),
         }
         .into()
     })

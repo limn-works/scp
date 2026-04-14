@@ -18,6 +18,7 @@
 //!
 //! See issue #388 and `.docs/adrs/phase-4.md` (ADR-022).
 
+use scp_ffi_common::error_codes as codes;
 use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::sync::{Arc, OnceLock};
@@ -136,7 +137,7 @@ pub fn context_manager() -> napi::Result<&'static Arc<ContextManager>> {
             message: "ContextManager not initialized — call context_create, \
                       context_join, context_import, or init_context_manager first"
                 .to_owned(),
-            code: "SCP-CTX-2000".to_owned(),
+            code: codes::CTX_2000.to_owned(),
         })
     })
 }
@@ -617,7 +618,7 @@ where
                 "identity '{did}' not found in registry — was it created with \
                  identityCreate(\"in_memory\") in this process?"
             ),
-            code: "SCP-PERM-3023".to_owned(),
+            code: codes::PERM_3023.to_owned(),
         })?;
 
     f(entry.value())
@@ -642,7 +643,7 @@ where
                 "identity '{did}' not found in registry — was it created with \
                  identityCreate(\"in_memory\") in this process?"
             ),
-            code: "SCP-PERM-3023".to_owned(),
+            code: codes::PERM_3023.to_owned(),
         })?;
 
     f(entry.value_mut())
@@ -743,7 +744,7 @@ pub fn ensure_registered(handle: &NapiContextHandle) -> Result<(), ScpNapiError>
         Err(e) => {
             return Err(ScpNapiError::Context {
                 message: format!("failed to create role state: {e}"),
-                code: "SCP-CTX-2023".to_owned(),
+                code: codes::CTX_2023.to_owned(),
             });
         }
     };
@@ -782,7 +783,7 @@ where
                 "context '{context_id}' not found in UCAN state registry \
              -- call a UCAN or event log function with the context handle first"
             ),
-            code: "SCP-CTX-2023".to_owned(),
+            code: codes::CTX_2023.to_owned(),
         })?;
 
     f(entry.value_mut())
@@ -809,14 +810,14 @@ pub fn remove_context(context_id: &str) {
 pub async fn sync_role_state_from_manager(context_id: &str) -> Result<(), ScpNapiError> {
     let mgr = CONTEXT_MANAGER.get().ok_or_else(|| ScpNapiError::Context {
         message: "ContextManager not initialized — call context_create first".to_owned(),
-        code: "SCP-CTX-2000".to_owned(),
+        code: codes::CTX_2000.to_owned(),
     })?;
     let new_role_state =
         mgr.get_role_state(context_id)
             .await
             .ok_or_else(|| ScpNapiError::Context {
                 message: format!("context '{context_id}' not found in ContextManager"),
-                code: "SCP-CTX-2023".to_owned(),
+                code: codes::CTX_2023.to_owned(),
             })?;
 
     with_context(context_id, |st| {
@@ -846,7 +847,7 @@ pub fn register_tool_handler(
                     "tool '{tool_id}' not found in context '{context_id}' \
                      -- register the tool before adding a handler"
                 ),
-                code: "SCP-CTX-2023".to_owned(),
+                code: codes::CTX_2023.to_owned(),
             });
         }
         st.tool_handlers.insert(tool_id.to_owned(), handler);

@@ -23,6 +23,7 @@
 //! This replaces the old `DashMap<String, ContextRuntime>` global registry
 //! (deleted as part of issue #387).
 
+use scp_ffi_common::error_codes as codes;
 use std::collections::HashSet;
 use std::future::Future;
 use std::sync::{Arc, OnceLock};
@@ -118,7 +119,7 @@ pub fn context_manager() -> Result<&'static Arc<ContextManager>, crate::ScpError
             msg: "ContextManager not initialized — call context_create, \
                   context_join, context_import, or init_context_manager first"
                 .to_owned(),
-            code: "SCP-CTX-2000".to_owned(),
+            code: codes::CTX_2000.to_owned(),
         })
 }
 
@@ -523,7 +524,7 @@ pub async fn sync_role_state_from_manager(context_id: &str) -> Result<(), crate:
                 msg: format!(
                     "context '{context_id}' not found in ContextManager during role state sync"
                 ),
-                code: "SCP-CTX-2040".to_owned(),
+                code: codes::CTX_2040.to_owned(),
             })?;
     tracing::debug!(context_id = %context_id, "UniFFI: role state synced after governance operation");
     Ok(())

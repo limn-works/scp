@@ -12,6 +12,7 @@
 //!
 //! See ADR-017 in `.docs/adrs/phase-4.md`.
 
+use scp_ffi_common::error_codes as codes;
 use std::sync::Arc;
 
 use napi_derive::napi;
@@ -61,7 +62,7 @@ pub struct NapiChallengeResult {
 fn validation_error(msg: &str) -> napi::Error {
     napi::Error::from(ScpNapiError::Validation {
         message: msg.to_owned(),
-        code: "SCP-VALID-7010".to_owned(),
+        code: codes::VALID_7010.to_owned(),
     })
 }
 

@@ -21,6 +21,7 @@
 //! See spec §3.5.2 for the verification protocol.
 
 use js_sys::Promise;
+use scp_ffi_common::error_codes as codes;
 use wasm_bindgen::prelude::*;
 use wasm_bindgen_futures::{JsFuture, future_to_promise};
 
@@ -449,7 +450,7 @@ pub fn verify_reference_attestation(attestation_json: String) -> Promise {
                              via fetch — use WebCrypto in the TypeScript wrapper layer",
                         input.method
                     ),
-                    code: "SCP-ATTEST-9010".to_owned(),
+                    code: codes::ATTEST_9010.to_owned(),
                 }
                 .into_js()
                 .into());

@@ -23,6 +23,7 @@
 //! for the full specification.
 
 use js_sys::Promise;
+use scp_ffi_common::error_codes as codes;
 use wasm_bindgen::prelude::*;
 use wasm_bindgen_futures::future_to_promise;
 
@@ -127,7 +128,7 @@ pub fn transport_connect(relay_url: String) -> Promise {
                 message: format!(
                     "relay_url must use wss:// scheme (TLS required), got: {relay_url:?}"
                 ),
-                code: "SCP-VALID-7000".to_owned(),
+                code: codes::VALID_7000.to_owned(),
             }
             .into_js()
             .into());

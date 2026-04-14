@@ -8,6 +8,7 @@
 //!
 //! See spec section 12 (Bridge System) and ADR-023.
 
+use scp_ffi_common::error_codes as codes;
 use std::sync::OnceLock;
 
 use dashmap::DashMap;
@@ -200,7 +201,7 @@ pub fn bridge_register(
             <[u8; 32]>::try_from(k.as_slice()).map_err(|_| {
                 napi::Error::from(ScpNapiError::Validation {
                     message: format!("platform_key must be exactly 32 bytes, got {}", k.len()),
-                    code: "SCP-VALID-7052".to_owned(),
+                    code: codes::VALID_7052.to_owned(),
                 })
             })
         })
@@ -232,7 +233,7 @@ pub fn bridge_register(
     let _event = register_bridge(&mut registry, request).map_err(|e| {
         napi::Error::from(ScpNapiError::Context {
             message: format!("bridge registration failed: {e}"),
-            code: "SCP-CTX-2100".to_owned(),
+            code: codes::CTX_2100.to_owned(),
         })
     })?;
 
@@ -241,7 +242,7 @@ pub fn bridge_register(
         approve_registration(&mut registry, &bridge_id, &approver_did, 0).map_err(|e| {
             napi::Error::from(ScpNapiError::Context {
                 message: format!("bridge approval failed: {e}"),
-                code: "SCP-CTX-2101".to_owned(),
+                code: codes::CTX_2101.to_owned(),
             })
         })?;
 
@@ -299,7 +300,7 @@ pub fn bridge_create_shadow(
     .map_err(|e| {
         napi::Error::from(ScpNapiError::Context {
             message: format!("shadow creation failed: {e}"),
-            code: "SCP-CTX-2102".to_owned(),
+            code: codes::CTX_2102.to_owned(),
         })
     })?;
 
@@ -326,7 +327,7 @@ fn parse_bridge_mode(s: &str) -> napi::Result<BridgeMode> {
             message: format!(
                 "invalid bridge mode '{other}': expected 'relay', 'puppet', 'api', or 'cooperative'"
             ),
-            code: "SCP-VALID-7050".to_owned(),
+            code: codes::VALID_7050.to_owned(),
         }
         .into()),
     }
@@ -338,7 +339,7 @@ fn parse_shadow_status(s: &str) -> napi::Result<ShadowProvenanceStatus> {
         "claimed" => Ok(ShadowProvenanceStatus::Claimed),
         other => Err(ScpNapiError::Validation {
             message: format!("invalid shadow_status '{other}': expected 'shadow' or 'claimed'"),
-            code: "SCP-VALID-7051".to_owned(),
+            code: codes::VALID_7051.to_owned(),
         }
         .into()),
     }
