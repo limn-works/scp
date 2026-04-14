@@ -351,8 +351,9 @@ async fn threshold_signers_bounded_at_64() {
     // The creator ("did:key:creator") is already a member.
     let mut dids: Vec<DID> = Vec::with_capacity(super::MAX_THRESHOLD_SIGNERS);
     {
-        let mut contexts = manager.contexts.lock().await;
-        let ctx = contexts.get_mut("test-ctx").unwrap();
+        let arc = manager.get_context_arc("test-ctx").unwrap();
+        let mut g = arc.lock().await;
+        let ctx = &mut *g;
         for i in 0..super::MAX_THRESHOLD_SIGNERS {
             let did: DID = format!("did:key:signer-{i}").into();
             ctx.membership
@@ -372,8 +373,9 @@ async fn threshold_signers_bounded_at_64() {
     // The 65th must fail with LimitExceeded.
     let overflow_did: DID = "did:key:signer-overflow".into();
     {
-        let mut contexts = manager.contexts.lock().await;
-        let ctx = contexts.get_mut("test-ctx").unwrap();
+        let arc = manager.get_context_arc("test-ctx").unwrap();
+        let mut g = arc.lock().await;
+        let ctx = &mut *g;
         ctx.membership
             .add_member(overflow_did.clone(), "member".to_owned(), vec![]);
     }
@@ -526,8 +528,9 @@ async fn checkpoint_not_created_below_thresholds() {
     let signing_key = ed25519_dalek::SigningKey::from_bytes(&[42u8; 32]);
     let sender_did = DID("did:key:creator".into());
 
-    let mut contexts = manager.contexts.lock().await;
-    let ctx = contexts.get_mut("test-ctx").unwrap();
+    let arc = manager.get_context_arc("test-ctx").unwrap();
+    let mut g = arc.lock().await;
+    let ctx = &mut *g;
 
     // Fresh context: 0 events, timestamp is recent → no checkpoint due.
     let result = manager.create_checkpoint_if_due("test-ctx", ctx, &sender_did, &signing_key);
@@ -544,8 +547,9 @@ async fn checkpoint_created_after_50_events() {
     let signing_key = ed25519_dalek::SigningKey::from_bytes(&[42u8; 32]);
     let sender_did = DID("did:key:creator".into());
 
-    let mut contexts = manager.contexts.lock().await;
-    let ctx = contexts.get_mut("test-ctx").unwrap();
+    let arc = manager.get_context_arc("test-ctx").unwrap();
+    let mut g = arc.lock().await;
+    let ctx = &mut *g;
 
     // Simulate 50 events.
     ctx.checkpoint_events_since = 50;
@@ -569,8 +573,9 @@ async fn checkpoint_created_after_10_minutes() {
     let signing_key = ed25519_dalek::SigningKey::from_bytes(&[42u8; 32]);
     let sender_did = DID("did:key:creator".into());
 
-    let mut contexts = manager.contexts.lock().await;
-    let ctx = contexts.get_mut("test-ctx").unwrap();
+    let arc = manager.get_context_arc("test-ctx").unwrap();
+    let mut g = arc.lock().await;
+    let ctx = &mut *g;
 
     // Simulate 10+ minutes elapsed with at least 1 event.
     ctx.checkpoint_events_since = 1;
@@ -595,8 +600,9 @@ async fn checkpoint_not_created_with_zero_events_and_elapsed_time() {
     let signing_key = ed25519_dalek::SigningKey::from_bytes(&[42u8; 32]);
     let sender_did = DID("did:key:creator".into());
 
-    let mut contexts = manager.contexts.lock().await;
-    let ctx = contexts.get_mut("test-ctx").unwrap();
+    let arc = manager.get_context_arc("test-ctx").unwrap();
+    let mut g = arc.lock().await;
+    let ctx = &mut *g;
 
     // Simulate 10+ minutes elapsed but zero events.
     ctx.checkpoint_events_since = 0;
@@ -616,8 +622,9 @@ async fn force_checkpoint_always_creates() {
     let signing_key = ed25519_dalek::SigningKey::from_bytes(&[42u8; 32]);
     let sender_did = DID("did:key:creator".into());
 
-    let mut contexts = manager.contexts.lock().await;
-    let ctx = contexts.get_mut("test-ctx").unwrap();
+    let arc = manager.get_context_arc("test-ctx").unwrap();
+    let mut g = arc.lock().await;
+    let ctx = &mut *g;
 
     // 0 events, recent timestamp — would NOT trigger a periodic checkpoint.
     ctx.checkpoint_events_since = 0;

@@ -1,7 +1,7 @@
 //! TTL management and context close operations.
 
 use super::{
-    Arc, CloseResult, ContextError, ContextEvent, ContextHandle, ContextManager, DID,
+    Arc, Capability, CloseResult, ContextError, ContextEvent, ContextHandle, ContextManager, DID,
     GovernanceModelConfig, TtlExtension, instrument, require_active, ttl,
 };
 
@@ -63,11 +63,13 @@ impl ContextManager {
         // Check governance model: multi-admin contexts must route through
         // governance (SCP-270, ADR-031). Only SingleAdmin contexts can use
         // the direct close_context path.
-        let role_state = {
-            let contexts = self.contexts.lock().await;
-            let ctx = contexts
-                .get(&context_id)
-                .ok_or_else(|| ContextError::ContextNotRegistered(context_id.clone()))?;
+        // Capture generation for confused-deputy detection on reacquire.
+        let (role_state, ctx_gen) = {
+            let (guard, ctx_gen) = self
+                .lock_context(&context_id)
+                .await
+                .map_err(|_| ContextError::ContextNotRegistered(context_id.clone()))?;
+            let ctx = &*guard;
 
             // State check inside lock -- eliminates TOCTOU race.
             require_active(&ctx.handle)?;
@@ -84,7 +86,7 @@ impl ContextManager {
                 ));
             }
 
-            ctx.role_state.clone()
+            (ctx.role_state.clone(), ctx_gen)
         };
         // Lock dropped before async ttl::close_context call.
 
@@ -93,10 +95,28 @@ impl ContextManager {
             ttl::close_context(handle, initiator_did, &role_state, self.event_log.as_ref()).await?;
 
         // Cancel TTL timer, governance timeout task, drop broadcast state,
-        // and emit close notification (second lock acquisition).
+        // and emit close notification (second lock acquisition with generation
+        // check for confused-deputy detection + ContextClose TOCTOU re-check).
         {
-            let mut contexts = self.contexts.lock().await;
-            if let Some(ctx) = contexts.get_mut(&context_id) {
+            if let Ok(mut guard) = self.relock_context(&ctx_gen).await {
+                let ctx = &mut *guard;
+
+                // Fix C: Re-check ContextClose capability under the cleanup lock.
+                // If capability was revoked between the first lock and this
+                // reacquire, the state transition already happened (can't undo),
+                // but we log a warning for auditability.
+                if !ctx
+                    .role_state
+                    .member_has_capability(initiator_did.as_ref(), &Capability::ContextClose)
+                {
+                    tracing::warn!(
+                        context_id = %context_id,
+                        initiator_did = %initiator_did,
+                        "ContextClose capability revoked between lock acquisitions — \
+                         state transition already committed, proceeding with cleanup"
+                    );
+                }
+
                 ctx.ttl.timer.cancel();
                 ctx.governance.timeout_task.cancel();
                 // Drop broadcast context state -- keys are zeroed by Zeroize.
@@ -125,16 +145,15 @@ impl ContextManager {
             }
         }
 
-        self.update_context_gauges().await;
+        self.update_context_gauges();
 
         // Persist context state after close (best-effort).
-        if self.has_persistence() {
-            let contexts = self.contexts.lock().await;
-            if let Some(ctx) = contexts.get(&context_id) {
-                let snapshot = Self::snapshot_context(ctx);
-                drop(contexts);
-                self.persist_context_snapshot(&context_id, snapshot);
-            }
+        if self.has_persistence()
+            && let Ok(guard) = self.relock_context(&ctx_gen).await
+        {
+            let ctx = &*guard;
+            let snapshot = Self::snapshot_context(ctx);
+            self.persist_context_snapshot(&context_id, snapshot);
         }
 
         Ok(result)
@@ -188,6 +207,16 @@ impl ContextManager {
     pub async fn handle_ttl_expiry(&self, handle: &ContextHandle) -> Result<(), ContextError> {
         let context_id = handle.context_id().to_owned();
 
+        // Capture generation before async expiry work for confused-deputy
+        // detection on reacquire.
+        let ctx_gen = {
+            let (_guard, generation) = self
+                .lock_context(&context_id)
+                .await
+                .map_err(|_| ContextError::ContextNotRegistered(context_id.clone()))?;
+            generation
+        };
+
         // Async TTL expiry logic -- no lock held. Pass transport for
         // best-effort relay ciphertext deletion (§5.11).
         let result = ttl::try_ttl_expiry_cleanup(
@@ -200,10 +229,10 @@ impl ContextManager {
         .await;
 
         // Cancel governance timeout task, decay participation, and emit
-        // appropriate event (lock acquired, then dropped).
+        // appropriate event (lock acquired, then dropped, with generation check).
         {
-            let mut contexts = self.contexts.lock().await;
-            if let Some(ctx) = contexts.get_mut(&context_id) {
+            if let Ok(mut guard) = self.relock_context(&ctx_gen).await {
+                let ctx = &mut *guard;
                 ctx.governance.timeout_task.cancel();
                 // Participation decay on TTL expiry (#1530): clear
                 // participation cache and cooldown state so stale data does
@@ -220,17 +249,21 @@ impl ContextManager {
                         event_logged: result.event_logged(),
                     });
                 }
+            } else {
+                tracing::warn!(
+                    context_id = %context_id,
+                    "handle_ttl_expiry: generation mismatch — skipping state mutation"
+                );
             }
         }
 
         // Persist context state after TTL expiry (best-effort).
-        if self.has_persistence() {
-            let contexts = self.contexts.lock().await;
-            if let Some(ctx) = contexts.get(&context_id) {
-                let snapshot = Self::snapshot_context(ctx);
-                drop(contexts);
-                self.persist_context_snapshot(&context_id, snapshot);
-            }
+        if self.has_persistence()
+            && let Ok(guard) = self.relock_context(&ctx_gen).await
+        {
+            let ctx = &*guard;
+            let snapshot = Self::snapshot_context(ctx);
+            self.persist_context_snapshot(&context_id, snapshot);
         }
 
         if result.has_failures() {
@@ -267,10 +300,11 @@ impl ContextManager {
         proposed_duration: std::time::Duration,
     ) -> Result<bool, ContextError> {
         // All checks and mutation within a single lock acquisition.
-        let mut contexts = self.contexts.lock().await;
-        let ctx = contexts
-            .get_mut(context_id)
-            .ok_or_else(|| ContextError::ContextNotRegistered(context_id.to_owned()))?;
+        let ctx_arc = self
+            .get_context_arc(context_id)
+            .map_err(|_| ContextError::ContextNotRegistered(context_id.to_owned()))?;
+        let mut guard = ctx_arc.lock().await;
+        let ctx = &mut *guard;
 
         if !ctx.membership.contains(member_did) {
             return Err(ContextError::MemberNotFound(member_did.to_string()));
@@ -290,7 +324,6 @@ impl ContextManager {
         // Persist context state after proposal consent (best-effort).
         if self.has_persistence() {
             let ctx_snapshot = Self::snapshot_context(ctx);
-            drop(contexts);
             self.persist_context_snapshot(context_id, ctx_snapshot);
         }
 
@@ -310,8 +343,9 @@ impl ContextManager {
     ) {
         // Cancel old timer and clear extension state (lock, then drop).
         {
-            let mut contexts = self.contexts.lock().await;
-            if let Some(ctx) = contexts.get_mut(context_id) {
+            if let Ok(ctx_arc) = self.get_context_arc(context_id) {
+                let mut guard = ctx_arc.lock().await;
+                let ctx = &mut *guard;
                 ctx.ttl.timer.cancel();
                 ctx.ttl.extension = None;
             }
@@ -320,13 +354,13 @@ impl ContextManager {
         self.spawn_ttl_timer(context_id, new_duration, handle).await;
 
         // Persist context state after TTL reset (best-effort).
-        if self.has_persistence() {
-            let contexts = self.contexts.lock().await;
-            if let Some(ctx) = contexts.get(context_id) {
-                let snapshot = Self::snapshot_context(ctx);
-                drop(contexts);
-                self.persist_context_snapshot(context_id, snapshot);
-            }
+        if self.has_persistence()
+            && let Ok(ctx_arc) = self.get_context_arc(context_id)
+        {
+            let guard = ctx_arc.lock().await;
+            let ctx = &*guard;
+            let snapshot = Self::snapshot_context(ctx);
+            self.persist_context_snapshot(context_id, snapshot);
         }
     }
 
@@ -351,13 +385,13 @@ impl ContextManager {
         duration: std::time::Duration,
         handle: ContextHandle,
     ) {
-        // Extract the cancel Notify under lock, then drop.
-        let cancel = {
-            let mut contexts = self.contexts.lock().await;
-            let Some(ctx) = contexts.get_mut(context_id) else {
+        // Extract the cancel Notify and generation under lock, then drop.
+        let (cancel, spawn_generation) = {
+            let Ok(arc) = self.get_context_arc(context_id) else {
                 return;
             };
-            ctx.ttl.timer.cancel.clone()
+            let ctx = arc.lock().await;
+            (ctx.ttl.timer.cancel.clone(), ctx.generation)
         };
 
         // Clone Arc-wrapped providers so the spawned task can perform
@@ -365,64 +399,74 @@ impl ContextManager {
         let crypto = Arc::clone(&self.crypto);
         let transport = Arc::clone(&self.transport);
         let event_log = Arc::clone(&self.event_log);
-        let contexts_ref = Arc::clone(&self.contexts);
+        let contexts_ref = self.contexts_arc();
         let context_id_owned = context_id.to_owned();
 
-        let task = tokio::spawn(async move {
-            tokio::select! {
-                () = tokio::time::sleep(duration) => {
-                    // Timer fired. Run cleanup with exponential backoff
-                    // retries (SCP-169, #612). Pass transport so relay
-                    // ciphertext deletion happens on timer-initiated expiry
-                    // (§5.11, #612 finding 2).
-                    let result = ttl::run_ttl_expiry_with_retries(
-                        &handle,
-                        crypto.as_ref(),
-                        Some(transport.as_ref()),
-                        event_log.as_ref(),
-                        &cancel,
-                    ).await;
+        let abort_handle = {
+            let mut task_set = self.task_set.lock().await;
+            task_set.spawn(async move {
+                tokio::select! {
+                    () = tokio::time::sleep(duration) => {
+                        // Timer fired. Run cleanup with exponential backoff
+                        // retries (SCP-169, #612). Pass transport so relay
+                        // ciphertext deletion happens on timer-initiated expiry
+                        // (§5.11, #612 finding 2).
+                        let result = ttl::run_ttl_expiry_with_retries(
+                            &handle,
+                            crypto.as_ref(),
+                            Some(transport.as_ref()),
+                            event_log.as_ref(),
+                            &cancel,
+                        ).await;
 
-                    // Emit event to the receive buffer and decay governance
-                    // state under a single lock acquisition (matches the
-                    // synchronous handle_ttl_expiry path; H8 fix).
-                    let mut contexts = contexts_ref.lock().await;
-                    if let Some(ctx) = contexts.get_mut(&context_id_owned) {
-                        if result.is_complete() {
-                            ctx.receive_buffer.push(ContextEvent::Expired);
-                        } else {
-                            ctx.receive_buffer.push(ContextEvent::ExpiryFailed {
-                                reason: result.to_string(),
-                                state_transitioned: result.state_transitioned(),
-                                mls_destroyed: result.mls_destroyed(),
-                                sender_key_destroyed: result.sender_key_destroyed(),
-                                event_logged: result.event_logged(),
-                            });
+                        // Emit event to the receive buffer and decay governance
+                        // state under a single lock acquisition (matches the
+                        // synchronous handle_ttl_expiry path; H8 fix).
+                        if let Some(entry) = contexts_ref.get(&context_id_owned) {
+                            let ctx_arc = entry.value().clone();
+                            drop(entry);
+                            let mut guard = ctx_arc.lock().await;
+                            let ctx = &mut *guard;
+                            // Generation check: if the context was removed
+                            // and recreated since this timer was spawned,
+                            // the timer belongs to the old context — skip.
+                            if ctx.generation != spawn_generation {
+                                tracing::warn!(
+                                    context_id = %context_id_owned,
+                                    spawn_generation,
+                                    current_generation = ctx.generation,
+                                    "TTL timer fired for stale context generation; skipping"
+                                );
+                            } else if result.is_complete() {
+                                ctx.receive_buffer.push(ContextEvent::Expired);
+                                ctx.governance.timeout_task.cancel();
+                                ctx.governance.decay_participation();
+                            } else {
+                                ctx.receive_buffer.push(ContextEvent::ExpiryFailed {
+                                    reason: result.to_string(),
+                                    state_transitioned: result.state_transitioned(),
+                                    mls_destroyed: result.mls_destroyed(),
+                                    sender_key_destroyed: result.sender_key_destroyed(),
+                                    event_logged: result.event_logged(),
+                                });
+                                ctx.governance.timeout_task.cancel();
+                                ctx.governance.decay_participation();
+                            }
                         }
-                        // Cancel the governance timeout task and clear
-                        // participation cache, cooldown, proposal timestamps,
-                        // and velocity tracker. Without this the in-memory
-                        // governance state would persist after auto-expiry
-                        // (#1530, H8). Mirrors handle_ttl_expiry and
-                        // close_context. Must run under the same lock so the
-                        // state is fully cleared before any other observer
-                        // sees the Expired/ExpiryFailed event.
-                        ctx.governance.timeout_task.cancel();
-                        ctx.governance.decay_participation();
                     }
-                    drop(contexts);
+                    () = cancel.notified() => {
+                        // Timer was cancelled.
+                    }
                 }
-                () = cancel.notified() => {
-                    // Timer was cancelled.
-                }
-            }
-        });
+            })
+        };
 
-        // Store the task handle (lock, then drop).
+        // Store the abort handle for cancel/is_active checks (lock, then drop).
         let context_id_for_store = context_id.to_owned();
-        let mut contexts = self.contexts.lock().await;
-        if let Some(ctx) = contexts.get_mut(&context_id_for_store) {
-            ctx.ttl.timer.task = Some(task);
+        if let Ok(ctx_arc) = self.get_context_arc(&context_id_for_store) {
+            let mut guard = ctx_arc.lock().await;
+            let ctx = &mut *guard;
+            ctx.ttl.timer.task = Some(abort_handle);
         }
     }
 }

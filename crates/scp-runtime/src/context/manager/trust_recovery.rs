@@ -1,8 +1,9 @@
 //! Trust verification, attestation, checkpoints, and recovery.
 
 use super::{
-    CheckpointAttestationStatus, ContextCheckpoint, ContextError, ContextManager,
-    CosignedCheckpoint, DID, context_id_to_bytes, instrument, require_active,
+    Arc, CheckpointAttestationStatus, ContextCheckpoint, ContextError, ContextManager,
+    CosignedCheckpoint, DID, Mutex, PerContextState, context_id_to_bytes, instrument,
+    require_active,
 };
 
 #[allow(clippy::significant_drop_tightening)]
@@ -113,10 +114,11 @@ impl ContextManager {
         creator_did: &DID,
         creator_signature: Vec<u8>,
     ) -> Result<ContextCheckpoint, ContextError> {
-        let contexts = self.contexts.lock().await;
-        let ctx = contexts
-            .get(context_id)
-            .ok_or_else(|| ContextError::ContextNotRegistered(context_id.to_owned()))?;
+        let ctx_arc = self
+            .get_context_arc(context_id)
+            .map_err(|_| ContextError::ContextNotRegistered(context_id.to_owned()))?;
+        let guard = ctx_arc.lock().await;
+        let ctx = &*guard;
         require_active(&ctx.handle)?;
 
         let (_, min_count) = ctx.governance.engine.checkpoint_cosignature_requirements();
@@ -146,7 +148,6 @@ impl ContextManager {
 
         // Drop the contexts lock before pruning to avoid holding it during
         // potentially expensive I/O (persistence writes).
-        drop(contexts);
 
         // Trigger event log pruning if a pruning policy is configured on the
         // context (#1474). Best-effort: log but do not fail the checkpoint
@@ -187,10 +188,11 @@ impl ContextManager {
     ) -> Result<CheckpointAttestationStatus, ContextError> {
         use sha2::Digest as _;
 
-        let contexts = self.contexts.lock().await;
-        let ctx = contexts
-            .get(context_id)
-            .ok_or_else(|| ContextError::ContextNotRegistered(context_id.to_owned()))?;
+        let ctx_arc = self
+            .get_context_arc(context_id)
+            .map_err(|_| ContextError::ContextNotRegistered(context_id.to_owned()))?;
+        let guard = ctx_arc.lock().await;
+        let ctx = &*guard;
 
         // Validate with a candidate vector first — only mutate checkpoint
         // after validation passes to avoid leaving corrupt state on error.
@@ -243,13 +245,13 @@ impl ContextManager {
         let context_id_bytes = context_id_to_bytes(context_id);
 
         // 1. Validate the context exists and is active (lock scoped).
-        {
-            let contexts = self.contexts.lock().await;
-            let ctx = contexts
-                .get(context_id)
-                .ok_or_else(|| ContextError::ContextNotRegistered(context_id.to_owned()))?;
+        //    Capture generation for confused-deputy detection on reacquire.
+        let ctx_gen = {
+            let (guard, generation) = self.lock_context(context_id).await?;
+            let ctx = &*guard;
             require_active(&ctx.handle)?;
-        }
+            generation
+        };
 
         // 2. Perform the MLS epoch advance (Update + self-Commit).
         //    If this fails the counter is NOT incremented.
@@ -272,11 +274,11 @@ impl ContextManager {
         }
 
         // 3. Increment bookkeeping counter and manage grace store.
+        //    Verify generation to detect confused-deputy (context removed
+        //    and recreated while we awaited the MLS commit).
         let new_epoch = {
-            let mut contexts = self.contexts.lock().await;
-            let ctx = contexts
-                .get_mut(context_id)
-                .ok_or_else(|| ContextError::ContextNotRegistered(context_id.to_owned()))?;
+            let mut guard = self.relock_context(&ctx_gen).await?;
+            let ctx = &mut *guard;
             // Re-validate after the crypto op to close the TOCTOU window between
             // the active check in step 1 and the counter increment here. A
             // concurrent close_context could have transitioned the handle while
@@ -302,20 +304,19 @@ impl ContextManager {
             );
         }
         {
-            let mut contexts = self.contexts.lock().await;
-            if let Some(ctx) = contexts.get_mut(context_id) {
+            if let Ok(mut guard) = self.relock_context(&ctx_gen).await {
+                let ctx = &mut *guard;
                 ctx.checkpoint_events_since += 1;
             }
         }
 
         // 5. Persist if configured (best-effort).
-        if self.has_persistence() {
-            let contexts = self.contexts.lock().await;
-            if let Some(ctx) = contexts.get(context_id) {
-                let snapshot = Self::snapshot_context(ctx);
-                drop(contexts);
-                self.persist_context_snapshot(context_id, snapshot);
-            }
+        if self.has_persistence()
+            && let Ok(guard) = self.relock_context(&ctx_gen).await
+        {
+            let ctx = &*guard;
+            let snapshot = Self::snapshot_context(ctx);
+            self.persist_context_snapshot(context_id, snapshot);
         }
 
         Ok(new_epoch)
@@ -351,10 +352,12 @@ impl ContextManager {
         // advance in step 2, the epoch is > 0 — using the real value ensures
         // receivers can validate the message against their local epoch state.
         let current_epoch = {
-            let contexts = self.contexts.lock().await;
-            contexts
-                .get(context_id)
-                .map_or(0, |ctx| ctx.epoch.mls_epoch)
+            if let Ok(arc) = self.get_context_arc(context_id) {
+                let ctx = arc.lock().await;
+                ctx.epoch.mls_epoch
+            } else {
+                0
+            }
         };
 
         // Construct a minimal inner envelope for the recovery notification.
@@ -417,14 +420,24 @@ impl ContextManager {
     ) -> Result<(), ContextError> {
         // Find a context where both the recovering DID and the contact DID
         // are members. The first matching context is used for delivery.
+        // Collect (key, Arc) pairs first to release DashMap shard locks before
+        // awaiting per-context Mutexes. Holding a DashMap Ref across .await
+        // would deadlock any concurrent shard access.
         let shared_context_id = {
-            let contexts = self.contexts.lock().await;
-            contexts
+            let entries: Vec<(String, Arc<Mutex<PerContextState>>)> = self
+                .contexts
                 .iter()
-                .find(|(_, ctx)| {
-                    ctx.membership.contains(recovering_did) && ctx.membership.contains(contact_did)
-                })
-                .map(|(id, _)| id.clone())
+                .map(|entry| (entry.key().clone(), Arc::clone(entry.value())))
+                .collect();
+            let mut found = None;
+            for (context_id, arc) in entries {
+                let ctx = arc.lock().await;
+                if ctx.membership.contains(recovering_did) && ctx.membership.contains(contact_did) {
+                    found = Some(context_id);
+                    break;
+                }
+            }
+            found
         };
 
         match shared_context_id {

@@ -334,8 +334,9 @@ async fn setup_context_with_member_remove() -> (ContextManager, ContextHandle) {
 
     // Reassign to observer role (joined members default to "member").
     {
-        let mut contexts = manager.contexts.lock().await;
-        let ctx = contexts.get_mut("auth-ctx").unwrap();
+        let arc = manager.get_context_arc("auth-ctx").unwrap();
+        let mut g = arc.lock().await;
+        let ctx = &mut *g;
         roles::assign_role(
             &mut ctx.role_state,
             "did:key:observer",
@@ -773,6 +774,7 @@ async fn persist_drop_restore_roundtrip() {
         commit_fault: None,
         checkpoint_events_since: 0,
         checkpoint_last_time_secs: 0,
+        generation: 0,
     };
 
     let bc_snapshot = test_broadcast_snapshot("persist-ctx-2");
@@ -822,6 +824,7 @@ async fn persist_drop_restore_roundtrip() {
 
 /// SCP-PERSIST-025: `executed_proposals` preserved across restart.
 #[tokio::test]
+#[allow(clippy::too_many_lines)] // DashMap lock pattern adds verbosity
 async fn restore_preserves_executed_proposals() {
     use scp_protocol::context::roles::{ContextRoleState, default_ceiling};
 
@@ -898,6 +901,7 @@ async fn restore_preserves_executed_proposals() {
         commit_fault: None,
         checkpoint_events_since: 0,
         checkpoint_last_time_secs: 0,
+        generation: 0,
     };
 
     persistence
@@ -931,8 +935,9 @@ async fn restore_preserves_executed_proposals() {
 
     // Try to execute a governance action with the already-executed proposal ID.
     // The internal state should reject it as a replay.
-    let contexts = manager.contexts.lock().await;
-    let ctx = contexts.get("replay-ctx").unwrap();
+    let arc = manager.get_context_arc("replay-ctx").unwrap();
+    let g = arc.lock().await;
+    let ctx = &*g;
     assert!(
         ctx.governance.executed_proposals.contains_key(&proposal_id),
         "executed_proposals should be preserved across restart"
@@ -1011,6 +1016,7 @@ async fn restore_respawns_ttl_timer() {
         commit_fault: None,
         checkpoint_events_since: 0,
         checkpoint_last_time_secs: 0,
+        generation: 0,
     };
 
     persistence.persist_context("ttl-ctx", &snapshot).unwrap();
@@ -1031,8 +1037,9 @@ async fn restore_respawns_ttl_timer() {
     manager.restore_context("ttl-ctx", &handle).await.unwrap();
 
     // Verify the TTL timer was re-spawned.
-    let contexts = manager.contexts.lock().await;
-    let ctx = contexts.get("ttl-ctx").unwrap();
+    let arc = manager.get_context_arc("ttl-ctx").unwrap();
+    let g = arc.lock().await;
+    let ctx = &*g;
     assert!(
         ctx.ttl.timer.is_active(),
         "TTL timer should be re-spawned after restore"
@@ -1103,6 +1110,7 @@ async fn restore_all_contexts_restores_persisted() {
             commit_fault: None,
             checkpoint_events_since: 0,
             checkpoint_last_time_secs: 0,
+            generation: 0,
         };
         persistence.persist_context(ctx_name, &snapshot).unwrap();
     }
@@ -1194,6 +1202,7 @@ async fn restore_context_rejects_duplicate() {
         commit_fault: None,
         checkpoint_events_since: 0,
         checkpoint_last_time_secs: 0,
+        generation: 0,
     };
 
     let bc_snapshot = test_broadcast_snapshot("dup-ctx");
@@ -1307,6 +1316,7 @@ async fn restore_context_sets_needs_reconnect_on_grace_inconsistency() {
         commit_fault: None,
         checkpoint_events_since: 0,
         checkpoint_last_time_secs: 0,
+        generation: 0,
     };
 
     let bc_snapshot = test_broadcast_snapshot("grace-incon-ctx");
@@ -1427,6 +1437,7 @@ async fn restore_context_no_reconnect_when_grace_consistent() {
         commit_fault: None,
         checkpoint_events_since: 0,
         checkpoint_last_time_secs: 0,
+        generation: 0,
     };
 
     let bc_snapshot = test_broadcast_snapshot("grace-ok-ctx");
@@ -1562,6 +1573,7 @@ async fn restore_preserves_spending_nonce_tracker_across_restart() {
         commit_fault: None,
         checkpoint_events_since: 0,
         checkpoint_last_time_secs: 0,
+        generation: 0,
     };
 
     persistence
@@ -1590,10 +1602,13 @@ async fn restore_preserves_spending_nonce_tracker_across_restart() {
     // Verify the nonce tracker was rehydrated with the preseen nonce and
     // rejects a replay.
     {
-        let mut contexts = manager.contexts.lock().await;
-        let ctx = contexts
-            .get_mut("nonce-persist-ctx")
-            .expect("restored context must be registered");
+        let arc = manager
+            .contexts
+            .get("nonce-persist-ctx")
+            .expect("restored context must be registered")
+            .value()
+            .clone();
+        let mut ctx = arc.lock().await;
         assert_eq!(
             ctx.governance.spending_nonce_tracker.len(),
             1,
@@ -1695,6 +1710,7 @@ fn reconnect_test_snapshot(
         commit_fault: None,
         checkpoint_events_since: 0,
         checkpoint_last_time_secs: 0,
+        generation: 0,
     }
 }
 
@@ -2099,8 +2115,9 @@ async fn standing_context_creates_new_bilateral_persistent_context() {
     let context_id = manager.standing_context(&alice, &carol).await.unwrap();
 
     // Verify the context exists in the manager.
-    let contexts = manager.contexts.lock().await;
-    let ctx = contexts.get(&context_id).unwrap();
+    let arc = manager.get_context_arc(&context_id).unwrap();
+    let g = arc.lock().await;
+    let ctx = &*g;
     let state = ctx.handle.state().await;
     assert_eq!(state, ContextState::Active);
 
@@ -2108,7 +2125,6 @@ async fn standing_context_creates_new_bilateral_persistent_context() {
     let params = ctx.handle.params();
     assert_eq!(params.template_id, Some(TemplateId::BilateralPersistent));
     assert!(params.ttl.is_none()); // bilateral-persistent forbids TTL
-    drop(contexts);
 
     // Verify the standing context is now tracked.
     assert!(manager.has_standing_context(&carol).await);
@@ -2155,8 +2171,9 @@ async fn standing_context_recreates_when_peer_has_left() {
 
     // Simulate peer leaving: transition to Closing -> Closed.
     {
-        let contexts = manager.contexts.lock().await;
-        let ctx = contexts.get(&ctx_id1).unwrap();
+        let arc = manager.get_context_arc(&ctx_id1).unwrap();
+        let g = arc.lock().await;
+        let ctx = &*g;
         ctx.handle
             .transition_to(&ContextState::Closing)
             .await
@@ -2169,8 +2186,7 @@ async fn standing_context_recreates_when_peer_has_left() {
 
     // Remove the old closed context so create_context can re-use the ID.
     {
-        let mut contexts = manager.contexts.lock().await;
-        contexts.remove(&ctx_id1);
+        manager.remove_context(&ctx_id1);
     }
 
     let ctx_id2 = manager.standing_context(&alice, &dave).await.unwrap();
@@ -2180,8 +2196,9 @@ async fn standing_context_recreates_when_peer_has_left() {
 
     // Verify the new context is Active.
     {
-        let contexts = manager.contexts.lock().await;
-        let ctx = contexts.get(&ctx_id2).unwrap();
+        let arc = manager.get_context_arc(&ctx_id2).unwrap();
+        let g = arc.lock().await;
+        let ctx = &*g;
         assert_eq!(ctx.handle.state().await, ContextState::Active);
     }
 
@@ -2207,8 +2224,9 @@ async fn standing_context_recreates_when_context_expired() {
 
     // Simulate expiry.
     {
-        let contexts = manager.contexts.lock().await;
-        let ctx = contexts.get(&ctx_id1).unwrap();
+        let arc = manager.get_context_arc(&ctx_id1).unwrap();
+        let g = arc.lock().await;
+        let ctx = &*g;
         ctx.handle
             .transition_to(&ContextState::Expired)
             .await
@@ -2217,8 +2235,7 @@ async fn standing_context_recreates_when_context_expired() {
 
     // Remove old context to allow recreation.
     {
-        let mut contexts = manager.contexts.lock().await;
-        contexts.remove(&ctx_id1);
+        manager.remove_context(&ctx_id1);
     }
 
     // Calling standing_context should create a new one.
@@ -2226,8 +2243,9 @@ async fn standing_context_recreates_when_context_expired() {
     assert_eq!(ctx_id1, ctx_id2);
 
     {
-        let contexts = manager.contexts.lock().await;
-        let ctx = contexts.get(&ctx_id2).unwrap();
+        let arc = manager.get_context_arc(&ctx_id2).unwrap();
+        let g = arc.lock().await;
+        let ctx = &*g;
         assert_eq!(ctx.handle.state().await, ContextState::Active);
     }
 }
@@ -2254,8 +2272,9 @@ async fn reconnect_all_standing_reconnects_active_contexts() {
 
     // Close Carol's context (simulating peer left).
     {
-        let contexts = manager.contexts.lock().await;
-        let ctx = contexts.get(&id_carol).unwrap();
+        let arc = manager.get_context_arc(&id_carol).unwrap();
+        let g = arc.lock().await;
+        let ctx = &*g;
         ctx.handle
             .transition_to(&ContextState::Closing)
             .await
@@ -2396,8 +2415,9 @@ async fn test_standing_context_returns_existing_active() {
 
     // Verify the context is registered exactly once and is Active.
     {
-        let contexts = manager.contexts.lock().await;
-        let ctx = contexts.get(&ctx_id1).unwrap();
+        let arc = manager.get_context_arc(&ctx_id1).unwrap();
+        let g = arc.lock().await;
+        let ctx = &*g;
         assert_eq!(
             ctx.handle.try_read_state(),
             Some(ContextState::Active),
@@ -2431,8 +2451,9 @@ async fn test_standing_context_creates_new_after_expired() {
 
     // 2. Transition the handle to Expired (terminal state).
     {
-        let contexts = manager.contexts.lock().await;
-        let ctx = contexts.get(&ctx_id1).unwrap();
+        let arc = manager.get_context_arc(&ctx_id1).unwrap();
+        let g = arc.lock().await;
+        let ctx = &*g;
         ctx.handle
             .transition_to(&ContextState::Expired)
             .await
@@ -2441,8 +2462,7 @@ async fn test_standing_context_creates_new_after_expired() {
 
     // 3. Remove the expired entry so create_context can re-use the ID.
     {
-        let mut contexts = manager.contexts.lock().await;
-        contexts.remove(&ctx_id1);
+        manager.remove_context(&ctx_id1);
     }
 
     // 4. Calling standing_context again must fall through (Expired arm)
@@ -2453,8 +2473,9 @@ async fn test_standing_context_creates_new_after_expired() {
     assert_eq!(ctx_id1, ctx_id2, "deterministic context ID is preserved");
 
     {
-        let contexts = manager.contexts.lock().await;
-        let ctx = contexts.get(&ctx_id2).unwrap();
+        let arc = manager.get_context_arc(&ctx_id2).unwrap();
+        let g = arc.lock().await;
+        let ctx = &*g;
         assert_eq!(
             ctx.handle.try_read_state(),
             Some(ContextState::Active),
@@ -2532,9 +2553,11 @@ async fn test_standing_context_no_deadlock_under_contention() {
             tasks.push(tokio::spawn(async move {
                 // Step 1: try to look up the handle under contexts.lock().
                 let context_id = super::super::standing::generate_standing_context_id(&a, &b);
-                let handle_opt = {
-                    let contexts = mgr.contexts.lock().await;
-                    contexts.get(&context_id).map(|c| c.handle.clone())
+                let handle_opt = if let Ok(arc) = mgr.get_context_arc(&context_id) {
+                    let ctx = arc.lock().await;
+                    Some(ctx.handle.clone())
+                } else {
+                    None
                 };
 
                 // Step 2: drive the handle through a transition. This
@@ -2642,8 +2665,9 @@ async fn sybil_reject_insufficient_signals() {
 
     // Currently passes unconditionally — the test asserts the function is
     // callable and returns Ok.
-    let contexts = manager.contexts.lock().await;
-    let ctx = contexts.get("sybil-ctx").unwrap();
+    let arc = manager.get_context_arc("sybil-ctx").unwrap();
+    let g = arc.lock().await;
+    let ctx = &*g;
     let result = evaluate_sybil_resistance(ctx, &"did:key:test".into(), 0);
     assert!(
         result.is_ok(),
@@ -2752,8 +2776,9 @@ async fn test_spawn_ttl_timer_decays_governance_on_expiry() {
     // proposal timestamps, and velocity tracker. The timer must clear
     // ALL four when it fires.
     {
-        let mut contexts = manager.contexts.lock().await;
-        let ctx = contexts.get_mut(&context_id).unwrap();
+        let arc = manager.get_context_arc(&context_id).unwrap();
+        let mut g = arc.lock().await;
+        let ctx = &mut *g;
         ctx.governance.participation_cache.insert(
             "did:key:h8-admin".to_owned(),
             scp_protocol::trust::participation::ParticipationRecord {
@@ -2789,8 +2814,9 @@ async fn test_spawn_ttl_timer_decays_governance_on_expiry() {
     let mut decayed = false;
     for _ in 0..50 {
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-        let contexts = manager.contexts.lock().await;
-        let ctx = contexts.get(&context_id).unwrap();
+        let arc = manager.get_context_arc(&context_id).unwrap();
+        let g = arc.lock().await;
+        let ctx = &*g;
         if ctx.governance.participation_cache.is_empty()
             && ctx.governance.cooldown_until.is_empty()
             && ctx.governance.proposal_timestamps.is_empty()
@@ -2803,8 +2829,9 @@ async fn test_spawn_ttl_timer_decays_governance_on_expiry() {
 
     // Snapshot the final state for assertion diagnostics.
     let (pc_empty, cu_empty, pt_empty, vt_zero) = {
-        let contexts = manager.contexts.lock().await;
-        let ctx = contexts.get(&context_id).unwrap();
+        let arc = manager.get_context_arc(&context_id).unwrap();
+        let g = arc.lock().await;
+        let ctx = &*g;
         (
             ctx.governance.participation_cache.is_empty(),
             ctx.governance.cooldown_until.is_empty(),
@@ -2856,8 +2883,9 @@ async fn test_spawn_ttl_timer_cancels_governance_timeout_task() {
     // The governance timeout task should be active immediately after
     // create_context (started by finalize_create).
     {
-        let contexts = manager.contexts.lock().await;
-        let ctx = contexts.get(&context_id).unwrap();
+        let arc = manager.get_context_arc(&context_id).unwrap();
+        let g = arc.lock().await;
+        let ctx = &*g;
         assert!(
             ctx.governance.timeout_task.is_active(),
             "governance timeout task should be active after create_context"
@@ -2868,8 +2896,9 @@ async fn test_spawn_ttl_timer_cancels_governance_timeout_task() {
     let mut cancelled = false;
     for _ in 0..50 {
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-        let contexts = manager.contexts.lock().await;
-        let ctx = contexts.get(&context_id).unwrap();
+        let arc = manager.get_context_arc(&context_id).unwrap();
+        let g = arc.lock().await;
+        let ctx = &*g;
         if !ctx.governance.timeout_task.is_active() {
             cancelled = true;
             break;
@@ -3083,6 +3112,7 @@ fn c3_test_snapshot(context_id: &str) -> super::ContextSnapshot {
         commit_fault: None,
         checkpoint_events_since: 0,
         checkpoint_last_time_secs: 0,
+        generation: 0,
     }
 }
 
@@ -3153,8 +3183,14 @@ async fn import_context_rejects_forged_approved_proposals() {
 
     // After import the per-context governance state must NOT contain
     // the forged approval — wipe-on-import is the entire fix for C3.
-    let contexts = manager.contexts.lock().await;
-    let ctx = contexts.get("c3-forged-approvals").unwrap();
+    let arc = manager
+        .contexts
+        .get("c3-forged-approvals")
+        .unwrap()
+        .value()
+        .clone();
+    let g = arc.lock().await;
+    let ctx = &*g;
     assert!(
         ctx.governance.approved_proposals.is_empty(),
         "import_context must wipe approved_proposals (had {} entries)",
@@ -3195,8 +3231,14 @@ async fn import_context_wipes_budget_tracker() {
     let export = c3_export_from_snapshot(snapshot);
     manager.import_context(export).await.unwrap();
 
-    let contexts = manager.contexts.lock().await;
-    let ctx = contexts.get("c3-wipe-budget").unwrap();
+    let arc = manager
+        .contexts
+        .get("c3-wipe-budget")
+        .unwrap()
+        .value()
+        .clone();
+    let g = arc.lock().await;
+    let ctx = &*g;
     assert!(
         !ctx.governance.budget_tracker.has_budget(&attacker),
         "import_context must wipe budget_tracker entries"
@@ -3257,8 +3299,14 @@ async fn import_context_wipes_participation_cache() {
     let export = c3_export_from_snapshot(snapshot);
     manager.import_context(export).await.unwrap();
 
-    let contexts = manager.contexts.lock().await;
-    let ctx = contexts.get("c3-wipe-participation").unwrap();
+    let arc = manager
+        .contexts
+        .get("c3-wipe-participation")
+        .unwrap()
+        .value()
+        .clone();
+    let g = arc.lock().await;
+    let ctx = &*g;
     assert!(
         ctx.governance.participation_cache.is_empty(),
         "import_context must wipe participation_cache (had {} entries)",
@@ -3373,8 +3421,14 @@ async fn import_context_clamps_cooldown_until() {
     let export = c3_export_from_snapshot(snapshot);
     manager.import_context(export).await.unwrap();
 
-    let contexts = manager.contexts.lock().await;
-    let ctx = contexts.get("c3-clamp-cooldown").unwrap();
+    let arc = manager
+        .contexts
+        .get("c3-clamp-cooldown")
+        .unwrap()
+        .value()
+        .clone();
+    let g = arc.lock().await;
+    let ctx = &*g;
     let clamped = ctx
         .governance
         .cooldown_until
@@ -3461,8 +3515,14 @@ async fn restore_context_preserves_budget_tracker() {
         .await
         .unwrap();
 
-    let contexts = manager.contexts.lock().await;
-    let ctx = contexts.get("c3-restore-budget").unwrap();
+    let arc = manager
+        .contexts
+        .get("c3-restore-budget")
+        .unwrap()
+        .value()
+        .clone();
+    let g = arc.lock().await;
+    let ctx = &*g;
     assert_eq!(
         ctx.governance.budget_tracker.remaining(&alice),
         Amount::new(500),
@@ -3615,6 +3675,7 @@ fn make_epoch_test_export(context_id: &str) -> crate::context::export_import::Co
         commit_fault: None,
         checkpoint_events_since: 0,
         checkpoint_last_time_secs: 0,
+        generation: 0,
     };
 
     crate::context::export_import::ContextExport {

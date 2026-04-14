@@ -370,6 +370,9 @@ fn strip_snapshot_for_public(snapshot: &ContextSnapshot) -> ContextSnapshot {
         // public observer. Always zero in public scope.
         checkpoint_events_since: 0,
         checkpoint_last_time_secs: 0,
+        // Generation counter is local runtime state — no meaning to a
+        // public observer. Always zero in public scope.
+        generation: 0,
     }
 }
 
@@ -492,6 +495,7 @@ mod tests {
             commit_fault: None,
             checkpoint_events_since: 0,
             checkpoint_last_time_secs: 0,
+            generation: 0,
         }
     }
 

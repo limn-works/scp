@@ -185,8 +185,13 @@ async fn send_message_transport_failure_no_phantom_event() {
     );
 
     // Verify sequence number was NOT burned.
-    let contexts = manager.contexts.lock().await;
-    let ctx = contexts.get("test-ctx-fail").unwrap();
+    let arc = manager
+        .contexts
+        .get("test-ctx-fail")
+        .unwrap()
+        .value()
+        .clone();
+    let ctx = arc.lock().await;
     let member = ctx
         .membership
         .members()
@@ -383,8 +388,8 @@ async fn setup_two_member_verified_context() -> (
 
     // Add Bob as a member with access key.
     {
-        let mut contexts = manager.contexts.lock().await;
-        let ctx = contexts.get_mut("test-ctx").unwrap();
+        let arc = manager.get_context_arc("test-ctx").unwrap();
+        let mut ctx = arc.lock().await;
         ctx.membership
             .add_member("did:key:bob".into(), "member".into(), vec![]);
         ctx.role_state.members.insert("did:key:bob".to_owned());
@@ -614,8 +619,8 @@ async fn revoked_member_cannot_decrypt_new_messages() {
 
     // Verify the access key was actually removed by the governance action.
     {
-        let contexts = manager.contexts.lock().await;
-        let ctx = contexts.get("test-ctx").unwrap();
+        let arc = manager.get_context_arc("test-ctx").unwrap();
+        let ctx = arc.lock().await;
         assert!(
             !ctx.access
                 .access_key_store
@@ -669,8 +674,13 @@ async fn revoked_member_cannot_decrypt_new_messages() {
     // Add Alice as a member (so sender membership check passes) but remove
     // Bob's access key — simulating post-revocation state.
     {
-        let mut contexts = bob_manager.contexts.lock().await;
-        let ctx = contexts.get_mut("test-ctx").unwrap();
+        let arc = bob_manager
+            .contexts
+            .get("test-ctx")
+            .unwrap()
+            .value()
+            .clone();
+        let mut ctx = arc.lock().await;
         ctx.membership
             .add_member("did:key:alice".into(), "admin".into(), vec![]);
         ctx.role_state.members.insert("did:key:alice".to_owned());
@@ -703,8 +713,8 @@ async fn rotate_content_keys_regenerates_access_keys() {
 
     // Record that we have access keys before rotation.
     {
-        let contexts = manager.contexts.lock().await;
-        let ctx = contexts.get("test-ctx").unwrap();
+        let arc = manager.get_context_arc("test-ctx").unwrap();
+        let ctx = arc.lock().await;
         let all_keys = ctx.access.access_key_store.get_all("test-ctx");
         assert!(
             all_keys.contains_key("did:key:alice"),
@@ -833,8 +843,8 @@ async fn deliver_incoming_buffers_out_of_order_message() {
     );
 
     // Verify the reorder buffer has the message.
-    let contexts = manager.contexts.lock().await;
-    let ctx = contexts.get("test-ctx").unwrap();
+    let arc = manager.get_context_arc("test-ctx").unwrap();
+    let ctx = arc.lock().await;
     assert_eq!(
         ctx.reorder_buffer
             .buffered_count("test-ctx", "did:key:alice"),
@@ -924,8 +934,8 @@ async fn deliver_incoming_gap_fill_delivers_buffered() {
     assert_eq!(payloads[2], b"msg-3");
 
     // Verify the reorder buffer is now empty.
-    let contexts = manager.contexts.lock().await;
-    let ctx = contexts.get("test-ctx").unwrap();
+    let arc = manager.get_context_arc("test-ctx").unwrap();
+    let ctx = arc.lock().await;
     assert_eq!(
         ctx.reorder_buffer.total_buffered(),
         0,
@@ -1579,14 +1589,11 @@ async fn velocity_consequence_trigger_on_send() {
         .unwrap();
 
     let sk = ed25519_dalek::SigningKey::from_bytes(&[1u8; 32]);
-    let handle = manager
-        .contexts
-        .lock()
-        .await
-        .get("vel-msg-ctx")
-        .unwrap()
-        .handle
-        .clone();
+    let handle = {
+        let arc = manager.get_context_arc("vel-msg-ctx").unwrap();
+        let ctx = arc.lock().await;
+        ctx.handle.clone()
+    };
     let _ = manager
         .send_message(
             &handle,
@@ -1672,8 +1679,13 @@ async fn escalation_kicks_in_at_velocity_threshold_10() {
     // test it separately in `hard_rate_limit_rejects_burst_over_ten`).
     {
         use scp_protocol::economy::antispam::{HardRateLimitConfig, TokenBucketLimiter};
-        let mut contexts = manager.contexts.lock().await;
-        let ctx = contexts.get_mut("escalation-ctx").unwrap();
+        let arc = manager
+            .contexts
+            .get("escalation-ctx")
+            .unwrap()
+            .value()
+            .clone();
+        let mut ctx = arc.lock().await;
         ctx.governance
             .budget_tracker
             .grant(&"did:key:sender".into(), Amount::new(1_000_000));
@@ -1687,10 +1699,14 @@ async fn escalation_kicks_in_at_velocity_threshold_10() {
 
     // Record remaining before the burst.
     let before = {
-        let contexts = manager.contexts.lock().await;
-        contexts
+        let arc = manager
+            .contexts
             .get("escalation-ctx")
             .unwrap()
+            .value()
+            .clone();
+        let ctx_guard = arc.lock().await;
+        ctx_guard
             .governance
             .budget_tracker
             .remaining(&"did:key:sender".into())
@@ -1723,10 +1739,14 @@ async fn escalation_kicks_in_at_velocity_threshold_10() {
     }
 
     let after = {
-        let contexts = manager.contexts.lock().await;
-        contexts
+        let arc = manager
+            .contexts
             .get("escalation-ctx")
             .unwrap()
+            .value()
+            .clone();
+        let ctx_guard = arc.lock().await;
+        ctx_guard
             .governance
             .budget_tracker
             .remaining(&"did:key:sender".into())
@@ -1776,8 +1796,13 @@ async fn tool_invoke_escalation_via_managed_wrapper() {
     // recent timestamps so entries stay within the 60-second window.
     let now = manager.clock.now_secs();
     {
-        let mut contexts = manager.contexts.lock().await;
-        let ctx = contexts.get_mut("tool-esc-ctx").unwrap();
+        let arc = manager
+            .contexts
+            .get("tool-esc-ctx")
+            .unwrap()
+            .value()
+            .clone();
+        let mut ctx = arc.lock().await;
         for _ in 0..10u64 {
             ctx.governance
                 .velocity_tracker
@@ -1797,10 +1822,14 @@ async fn tool_invoke_escalation_via_managed_wrapper() {
     let ucan = dummy_spending_ucan_for(&"did:key:invoker".into());
 
     let before = {
-        let contexts = manager.contexts.lock().await;
-        contexts
+        let arc = manager
+            .contexts
             .get("tool-esc-ctx")
             .unwrap()
+            .value()
+            .clone();
+        let ctx_guard = arc.lock().await;
+        ctx_guard
             .governance
             .budget_tracker
             .remaining(&"did:key:invoker".into())
@@ -1825,10 +1854,14 @@ async fn tool_invoke_escalation_via_managed_wrapper() {
     );
 
     let after = {
-        let contexts = manager.contexts.lock().await;
-        contexts
+        let arc = manager
+            .contexts
             .get("tool-esc-ctx")
             .unwrap()
+            .value()
+            .clone();
+        let ctx_guard = arc.lock().await;
+        ctx_guard
             .governance
             .budget_tracker
             .remaining(&"did:key:invoker".into())
@@ -2070,8 +2103,8 @@ async fn tool_invoke_respects_hard_rate_limit() {
     // Grant a large budget so budget exhaustion cannot be confused with
     // the rate limit. The rate limit fires first.
     {
-        let mut contexts = manager.contexts.lock().await;
-        let ctx = contexts.get_mut("tool-rl-ctx").unwrap();
+        let arc = manager.get_context_arc("tool-rl-ctx").unwrap();
+        let mut ctx = arc.lock().await;
         ctx.governance
             .budget_tracker
             .grant(&"did:key:spammer".into(), Amount::new(1_000_000));
@@ -2177,8 +2210,13 @@ async fn tool_invoke_failure_refunds_hard_rate_limit_token() {
         .unwrap();
 
     {
-        let mut contexts = manager.contexts.lock().await;
-        let ctx = contexts.get_mut("tool-rl-refund-ctx").unwrap();
+        let arc = manager
+            .contexts
+            .get("tool-rl-refund-ctx")
+            .unwrap()
+            .value()
+            .clone();
+        let mut ctx = arc.lock().await;
         ctx.governance
             .budget_tracker
             .grant(&"did:key:invoker".into(), Amount::new(1_000));
@@ -2512,8 +2550,13 @@ async fn tool_invoke_output_validation_failure_voids_escrow_and_refunds_budget()
     // remainders to detect any net change.
     let invoker: DID = "did:key:invoker".into();
     {
-        let mut contexts = manager.contexts.lock().await;
-        let ctx = contexts.get_mut("h17-output-fail-ctx").unwrap();
+        let arc = manager
+            .contexts
+            .get("h17-output-fail-ctx")
+            .unwrap()
+            .value()
+            .clone();
+        let mut ctx = arc.lock().await;
         ctx.governance
             .budget_tracker
             .grant(&invoker, Amount::new(1_000));
@@ -2527,8 +2570,13 @@ async fn tool_invoke_output_validation_failure_voids_escrow_and_refunds_budget()
 
     // Snapshot pre-invoke state.
     let (budget_before, velocity_before) = {
-        let contexts = manager.contexts.lock().await;
-        let ctx = contexts.get("h17-output-fail-ctx").unwrap();
+        let arc = manager
+            .contexts
+            .get("h17-output-fail-ctx")
+            .unwrap()
+            .value()
+            .clone();
+        let ctx = arc.lock().await;
         let budget = ctx.governance.budget_tracker.remaining(&invoker).value();
         let velocity = ctx
             .governance
@@ -2620,8 +2668,13 @@ async fn tool_invoke_output_validation_failure_voids_escrow_and_refunds_budget()
 
     // Post-invoke state: budget refunded (==before) and velocity rolled back.
     let (budget_after, velocity_after) = {
-        let contexts = manager.contexts.lock().await;
-        let ctx = contexts.get("h17-output-fail-ctx").unwrap();
+        let arc = manager
+            .contexts
+            .get("h17-output-fail-ctx")
+            .unwrap()
+            .value()
+            .clone();
+        let ctx = arc.lock().await;
         let budget = ctx.governance.budget_tracker.remaining(&invoker).value();
         let velocity = ctx
             .governance
@@ -2658,6 +2711,7 @@ async fn tool_invoke_output_validation_failure_voids_escrow_and_refunds_budget()
 /// `tool_invoke_output_validation_failure_voids_escrow_and_refunds_budget`
 /// proves the void/capture branch is wired both ways.
 #[tokio::test]
+#[allow(clippy::too_many_lines)] // DashMap lock pattern adds verbosity
 async fn tool_invoke_happy_path_captures_escrow_and_deducts_budget() {
     use scp_protocol::context::tools::ToolId;
     use scp_protocol::context::tools::registry::ToolRegistry;
@@ -2686,8 +2740,13 @@ async fn tool_invoke_happy_path_captures_escrow_and_deducts_budget() {
 
     let invoker: DID = "did:key:invoker".into();
     {
-        let mut contexts = manager.contexts.lock().await;
-        let ctx = contexts.get_mut("h17-happy-ctx").unwrap();
+        let arc = manager
+            .contexts
+            .get("h17-happy-ctx")
+            .unwrap()
+            .value()
+            .clone();
+        let mut ctx = arc.lock().await;
         ctx.governance
             .budget_tracker
             .grant(&invoker, Amount::new(1_000));
@@ -2700,10 +2759,14 @@ async fn tool_invoke_happy_path_captures_escrow_and_deducts_budget() {
     let ucan = dummy_spending_ucan_for(&invoker);
 
     let budget_before = {
-        let contexts = manager.contexts.lock().await;
-        contexts
+        let arc = manager
+            .contexts
             .get("h17-happy-ctx")
             .unwrap()
+            .value()
+            .clone();
+        let ctx_guard = arc.lock().await;
+        ctx_guard
             .governance
             .budget_tracker
             .remaining(&invoker)
@@ -2757,10 +2820,14 @@ async fn tool_invoke_happy_path_captures_escrow_and_deducts_budget() {
 
     // Budget actually deducted by the per_tool_invoke=5 cost.
     let budget_after = {
-        let contexts = manager.contexts.lock().await;
-        contexts
+        let arc = manager
+            .contexts
             .get("h17-happy-ctx")
             .unwrap()
+            .value()
+            .clone();
+        let ctx_guard = arc.lock().await;
+        ctx_guard
             .governance
             .budget_tracker
             .remaining(&invoker)
@@ -2800,8 +2867,13 @@ async fn join_context_records_velocity_for_joiner() {
     manager.join_context(&handle, kp, None).await.unwrap();
 
     let velocity = {
-        let contexts = manager.contexts.lock().await;
-        let ctx = contexts.get("join-vel-ctx").unwrap();
+        let arc = manager
+            .contexts
+            .get("join-vel-ctx")
+            .unwrap()
+            .value()
+            .clone();
+        let ctx = arc.lock().await;
         ctx.governance
             .velocity_tracker
             .get_velocity(&"did:key:joiner".into(), manager.clock.now_secs())
@@ -2860,8 +2932,13 @@ async fn enforcement_failure_rolls_back_velocity_and_rate_limit() {
     // Velocity must be rolled back to 0 — the rejected send must not
     // count toward future escalation.
     let velocity = {
-        let contexts = manager.contexts.lock().await;
-        let ctx = contexts.get("rollback-ctx").unwrap();
+        let arc = manager
+            .contexts
+            .get("rollback-ctx")
+            .unwrap()
+            .value()
+            .clone();
+        let ctx = arc.lock().await;
         ctx.governance
             .velocity_tracker
             .get_velocity(&"did:key:sender".into(), manager.clock.now_secs())
@@ -2887,8 +2964,13 @@ async fn enforcement_failure_rolls_back_velocity_and_rate_limit() {
     }
     // Grant budget now and confirm the sender is not rate-limited.
     {
-        let mut contexts = manager.contexts.lock().await;
-        let ctx = contexts.get_mut("rollback-ctx").unwrap();
+        let arc = manager
+            .contexts
+            .get("rollback-ctx")
+            .unwrap()
+            .value()
+            .clone();
+        let mut ctx = arc.lock().await;
         ctx.governance
             .budget_tracker
             .grant(&"did:key:sender".into(), Amount::new(1_000));
@@ -3002,10 +3084,14 @@ async fn governance_actions_stay_free_under_priced_policy() {
     // Sanity: the admin has ZERO budget — starved — yet the governance
     // action must still execute because governance is gateway-free.
     let before = {
-        let contexts = manager.contexts.lock().await;
-        contexts
+        let arc = manager
+            .contexts
             .get("gov-free-ctx")
             .unwrap()
+            .value()
+            .clone();
+        let ctx_guard = arc.lock().await;
+        ctx_guard
             .governance
             .budget_tracker
             .remaining(&"did:key:admin".into())
@@ -3045,10 +3131,14 @@ async fn governance_actions_stay_free_under_priced_policy() {
 
     // Budget remains unchanged — no deduction for the governance action.
     let after = {
-        let contexts = manager.contexts.lock().await;
-        contexts
+        let arc = manager
+            .contexts
             .get("gov-free-ctx")
             .unwrap()
+            .value()
+            .clone();
+        let ctx_guard = arc.lock().await;
+        ctx_guard
             .governance
             .budget_tracker
             .remaining(&"did:key:admin".into())
@@ -3063,10 +3153,14 @@ async fn governance_actions_stay_free_under_priced_policy() {
     // tracker for the governance action itself — governance is exempt
     // from the message/join/invoke escalation path.
     let velocity = {
-        let contexts = manager.contexts.lock().await;
-        contexts
+        let arc = manager
+            .contexts
             .get("gov-free-ctx")
             .unwrap()
+            .value()
+            .clone();
+        let ctx_guard = arc.lock().await;
+        ctx_guard
             .governance
             .velocity_tracker
             .get_velocity(&"did:key:admin".into(), manager.clock.now_secs())
@@ -3088,13 +3182,9 @@ async fn governance_actions_stay_free_under_priced_policy() {
 async fn restored_velocity_tracker_uses_60_second_window() {
     let (manager, _handle) = setup_active_context().await;
     let window = {
-        let contexts = manager.contexts.lock().await;
-        contexts
-            .get("test-ctx")
-            .unwrap()
-            .governance
-            .velocity_tracker
-            .window_secs()
+        let arc = manager.get_context_arc("test-ctx").unwrap();
+        let ctx_guard = arc.lock().await;
+        ctx_guard.governance.velocity_tracker.window_secs()
     };
     assert_eq!(
         window, 60,
@@ -3264,8 +3354,13 @@ async fn capture_send_payment_success_no_failure_event() {
 
     // Grant budget.
     {
-        let mut contexts = manager.contexts.lock().await;
-        let ctx = contexts.get_mut("h19-success-ctx").unwrap();
+        let arc = manager
+            .contexts
+            .get("h19-success-ctx")
+            .unwrap()
+            .value()
+            .clone();
+        let mut ctx = arc.lock().await;
         ctx.governance.budget_tracker.grant(
             &DID::from("did:key:sender"),
             scp_protocol::economy::types::Amount::new(1_000_000),
@@ -3365,10 +3460,14 @@ async fn deliver_message_skips_velocity_for_local_sender() {
 
     // Confirm velocity starts at 0.
     let before = {
-        let contexts = manager.contexts.lock().await;
-        contexts
+        let arc = manager
+            .contexts
             .get("vel-skip-ctx")
             .unwrap()
+            .value()
+            .clone();
+        let ctx_guard = arc.lock().await;
+        ctx_guard
             .governance
             .velocity_tracker
             .get_velocity(&"did:key:local-sender".into(), manager.clock.now_secs())
@@ -3397,10 +3496,14 @@ async fn deliver_message_skips_velocity_for_local_sender() {
         .await;
 
     let after_skip = {
-        let contexts = manager.contexts.lock().await;
-        contexts
+        let arc = manager
+            .contexts
             .get("vel-skip-ctx")
             .unwrap()
+            .value()
+            .clone();
+        let ctx_guard = arc.lock().await;
+        ctx_guard
             .governance
             .velocity_tracker
             .get_velocity(&"did:key:local-sender".into(), manager.clock.now_secs())
@@ -3425,10 +3528,14 @@ async fn deliver_message_skips_velocity_for_local_sender() {
         .await;
 
     let after_no_skip = {
-        let contexts = manager.contexts.lock().await;
-        contexts
+        let arc = manager
+            .contexts
             .get("vel-skip-ctx")
             .unwrap()
+            .value()
+            .clone();
+        let ctx_guard = arc.lock().await;
+        ctx_guard
             .governance
             .velocity_tracker
             .get_velocity(&"did:key:local-sender".into(), manager.clock.now_secs())
@@ -3511,8 +3618,8 @@ async fn setup_two_member_context_with(
         .unwrap();
 
     {
-        let mut contexts = manager.contexts.lock().await;
-        let ctx = contexts.get_mut("test-ctx").unwrap();
+        let arc = manager.get_context_arc("test-ctx").unwrap();
+        let mut ctx = arc.lock().await;
         ctx.membership
             .add_member("did:key:bob".into(), "member".into(), vec![]);
         ctx.role_state.members.insert("did:key:bob".to_owned());
@@ -3550,8 +3657,8 @@ async fn deliver_incoming_event_log_append_precedes_consequence_eval() {
     // calls `event_log_entries_for_consequences` (the rule list cannot be
     // empty or the block short-circuits).
     {
-        let mut contexts = manager.contexts.lock().await;
-        let ctx = contexts.get_mut("test-ctx").unwrap();
+        let arc = manager.get_context_arc("test-ctx").unwrap();
+        let mut ctx = arc.lock().await;
         ctx.governance.consequence_rules = vec![ConsequenceRule {
             trigger: ConsequenceTrigger::MessageVelocity,
             // High threshold so eval observes but does not actually trigger,
@@ -3697,8 +3804,8 @@ async fn deliver_incoming_with_velocity_rule_counts_just_received_message() {
             .unwrap();
     }
     {
-        let mut contexts = manager.contexts.lock().await;
-        let ctx = contexts.get_mut("test-ctx").unwrap();
+        let arc = manager.get_context_arc("test-ctx").unwrap();
+        let mut ctx = arc.lock().await;
         ctx.governance.consequence_rules = vec![ConsequenceRule {
             trigger: ConsequenceTrigger::MessageVelocity,
             threshold: 4,
@@ -3853,8 +3960,8 @@ async fn c1b_paid_tool_context(
         .unwrap();
 
     {
-        let mut contexts = manager.contexts.lock().await;
-        let ctx = contexts.get_mut(name).unwrap();
+        let arc = manager.get_context_arc(name).unwrap();
+        let mut ctx = arc.lock().await;
         ctx.governance
             .budget_tracker
             .grant(invoker, Amount::new(1_000));
@@ -3912,10 +4019,9 @@ async fn tool_invoke_fabricated_spending_ucan_rejected_by_signature() {
 
     // Budget MUST be untouched — signature check runs before record_spend.
     let remaining = {
-        let contexts = manager.contexts.lock().await;
-        contexts
-            .get("c1b-sig-ctx")
-            .unwrap()
+        let arc = manager.get_context_arc("c1b-sig-ctx").unwrap();
+        let ctx_guard = arc.lock().await;
+        ctx_guard
             .governance
             .budget_tracker
             .remaining(&invoker)
@@ -4132,8 +4238,13 @@ async fn tool_invoke_spending_ucan_revoked() {
 
     // Insert the CID into the per-context revoked set BEFORE the invoke.
     {
-        let mut contexts = manager.contexts.lock().await;
-        let ctx = contexts.get_mut("c1b-revoke-ctx").unwrap();
+        let arc = manager
+            .contexts
+            .get("c1b-revoke-ctx")
+            .unwrap()
+            .value()
+            .clone();
+        let mut ctx = arc.lock().await;
         ctx.governance
             .revoked_spending_ucan_cids
             .insert(revocation_cid);
@@ -4175,10 +4286,14 @@ async fn tool_invoke_happy_path_with_valid_spending_ucan() {
     let (manager, registry) = c1b_paid_tool_context("c1b-happy-ctx", &invoker).await;
 
     let before = {
-        let contexts = manager.contexts.lock().await;
-        contexts
+        let arc = manager
+            .contexts
             .get("c1b-happy-ctx")
             .unwrap()
+            .value()
+            .clone();
+        let ctx_guard = arc.lock().await;
+        ctx_guard
             .governance
             .budget_tracker
             .remaining(&invoker)
@@ -4208,10 +4323,14 @@ async fn tool_invoke_happy_path_with_valid_spending_ucan() {
     // (escalation may add more; the `tool_invoke_escalation_via_managed_wrapper`
     // test covers escalation specifically.)
     let after = {
-        let contexts = manager.contexts.lock().await;
-        contexts
+        let arc = manager
+            .contexts
             .get("c1b-happy-ctx")
             .unwrap()
+            .value()
+            .clone();
+        let ctx_guard = arc.lock().await;
+        ctx_guard
             .governance
             .budget_tracker
             .remaining(&invoker)

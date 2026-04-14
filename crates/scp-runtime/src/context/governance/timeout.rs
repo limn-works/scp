@@ -34,7 +34,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use tokio::sync::Notify;
-use tokio::task::JoinHandle;
+use tokio::task::{AbortHandle, JoinSet};
 
 use scp_identity::DID;
 
@@ -131,8 +131,8 @@ pub struct DeadlockDetectionState {
 ///
 /// Cancellation: call [`cancel()`](Self::cancel) or drop the task.
 pub struct GovernanceTimeoutTask {
-    /// The spawned task handle.
-    task: Option<JoinHandle<()>>,
+    /// The spawned task abort handle.
+    task: Option<AbortHandle>,
     /// Cancellation signal.
     cancel: Arc<Notify>,
 }
@@ -147,7 +147,7 @@ impl GovernanceTimeoutTask {
         }
     }
 
-    /// Starts the background timeout loop.
+    /// Starts the background timeout loop using bare `tokio::spawn`.
     ///
     /// The `tick_fn` callback is invoked every 60 seconds (see
     /// [`TIMEOUT_CHECK_INTERVAL_SECS`]). It should perform timeout
@@ -157,6 +157,10 @@ impl GovernanceTimeoutTask {
     ///
     /// If the task is already running, this cancels the previous task
     /// before spawning the new one.
+    ///
+    /// Prefer [`start_in`](Self::start_in) when a shared `JoinSet` is
+    /// available (e.g., within `ContextManager`) so tasks are managed as
+    /// a group and automatically cancelled on manager drop.
     pub fn start<F, Fut>(&mut self, tick_fn: F)
     where
         F: Fn() -> Fut + Send + Sync + 'static,
@@ -172,7 +176,7 @@ impl GovernanceTimeoutTask {
         let cancel = Arc::new(Notify::new());
         self.cancel = cancel.clone();
 
-        let task = tokio::spawn(async move {
+        let handle = tokio::spawn(async move {
             loop {
                 tokio::select! {
                     () = tokio::time::sleep(Duration::from_secs(TIMEOUT_CHECK_INTERVAL_SECS)) => {
@@ -186,7 +190,48 @@ impl GovernanceTimeoutTask {
                 }
             }
         });
-        self.task = Some(task);
+        self.task = Some(handle.abort_handle());
+    }
+
+    /// Starts the background timeout loop, spawning into the given `JoinSet`.
+    ///
+    /// Same as [`start`](Self::start) but spawns into a shared `JoinSet`
+    /// instead of bare `tokio::spawn`. Tasks in the `JoinSet` are
+    /// automatically cancelled when the set is dropped, providing structured
+    /// lifecycle management for `ContextManager` background tasks.
+    ///
+    /// If the task is already running, this cancels the previous task
+    /// before spawning the new one.
+    pub fn start_in<F, Fut>(&mut self, task_set: &mut JoinSet<()>, tick_fn: F)
+    where
+        F: Fn() -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = bool> + Send,
+    {
+        // Cancel any existing task.
+        self.cancel.notify_one();
+        if let Some(task) = self.task.take() {
+            task.abort();
+        }
+
+        // Fresh cancellation signal for the new task.
+        let cancel = Arc::new(Notify::new());
+        self.cancel = cancel.clone();
+
+        let abort_handle = task_set.spawn(async move {
+            loop {
+                tokio::select! {
+                    () = tokio::time::sleep(Duration::from_secs(TIMEOUT_CHECK_INTERVAL_SECS)) => {
+                        if !tick_fn().await {
+                            break;
+                        }
+                    }
+                    () = cancel.notified() => {
+                        break;
+                    }
+                }
+            }
+        });
+        self.task = Some(abort_handle);
     }
 
     /// Returns `true` if the task is currently running.
@@ -197,8 +242,8 @@ impl GovernanceTimeoutTask {
 
     /// Cancels the running task, if any.
     ///
-    /// Signals the cancellation token AND aborts the `JoinHandle` for
-    /// consistency with the `Drop` implementation.
+    /// Signals the cancellation token AND aborts the task via the
+    /// `AbortHandle` for consistency with the `Drop` implementation.
     pub fn cancel(&self) {
         self.cancel.notify_one();
         if let Some(task) = &self.task {

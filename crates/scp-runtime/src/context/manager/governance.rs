@@ -1014,45 +1014,34 @@ impl ContextManager {
             )));
         }
 
-        // PR #1606 C6 fail-close gate: if the persistent commit retry queue
-        // exhausted its budget for a previous mutation, refuse new governance
-        // actions until an operator acknowledges the fault. Without this
-        // gate, an ejected member could remain in the MLS group while local
-        // governance keeps advancing on a divergent epoch.
-        {
-            let contexts = self.contexts.lock().await;
-            if let Some(ctx) = contexts.get(context_id) {
-                Self::check_commit_fault(ctx)?;
-            }
-        }
+        // PR #1606 C6 fail-close gate + atomically check replay AND mark as
+        // executed before dispatch. Combined into a single lock scope using
+        // lock_context to capture a generation token for later relock_context
+        // calls (Phase B confused-deputy detection).
+        let ctx_gen = {
+            let (mut guard, generation) = self.lock_context(context_id).await?;
+            let ctx = &mut *guard;
+            Self::check_commit_fault(ctx)?;
 
-        // Atomically check replay AND mark as executed before dispatch.
-        // This prevents TOCTOU races where concurrent callers both pass the
-        // replay check before either records the proposal as executed.
-        {
-            let mut contexts = self.contexts.lock().await;
-            if let Some(ctx) = contexts.get_mut(context_id) {
-                if ctx
-                    .governance
-                    .executed_proposals
-                    .contains_key(&proposal.proposal_id)
-                {
-                    return Err(ContextError::PermissionDenied(
-                        "governance proposal has already been executed".into(),
-                    ));
-                }
-                let now = self.clock.now_secs();
-                // Evict entries older than the TTL before inserting.
-                ctx.governance
-                    .executed_proposals
-                    .retain(|_, ts| now.saturating_sub(*ts) < EXECUTED_PROPOSALS_TTL_SECS);
-                ctx.governance
-                    .executed_proposals
-                    .insert(proposal.proposal_id, now);
-            } else {
-                return Err(ContextError::ContextNotRegistered(context_id.to_owned()));
+            if ctx
+                .governance
+                .executed_proposals
+                .contains_key(&proposal.proposal_id)
+            {
+                return Err(ContextError::PermissionDenied(
+                    "governance proposal has already been executed".into(),
+                ));
             }
-        }
+            let now = self.clock.now_secs();
+            // Evict entries older than the TTL before inserting.
+            ctx.governance
+                .executed_proposals
+                .retain(|_, ts| now.saturating_sub(*ts) < EXECUTED_PROPOSALS_TTL_SECS);
+            ctx.governance
+                .executed_proposals
+                .insert(proposal.proposal_id, now);
+            generation
+        };
 
         // Governance action costing: no PaidActionType::GovernanceAction
         // variant exists yet. Governance actions are free until the economy
@@ -1063,11 +1052,18 @@ impl ContextManager {
             Err(e) => {
                 // Roll back the executed marker on dispatch failure so the
                 // proposal can be retried (e.g. after a transient crypto error).
-                let mut contexts = self.contexts.lock().await;
-                if let Some(ctx) = contexts.get_mut(context_id) {
+                // Use relock_context for generation verification.
+                if let Ok(mut guard) = self.relock_context(&ctx_gen).await {
+                    let ctx = &mut *guard;
                     ctx.governance
                         .executed_proposals
                         .remove(&proposal.proposal_id);
+                } else {
+                    tracing::warn!(
+                        context_id,
+                        "execute_governance_action: generation mismatch on rollback — \
+                         executed_proposals marker may be stale"
+                    );
                 }
                 return Err(e);
             }
@@ -1075,7 +1071,7 @@ impl ContextManager {
 
         // Post-dispatch: MLS coordination, event emission, checkpoint
         // triggering, and cleanup are in a helper to stay within line limits.
-        self.finalize_governance_action(context_id, proposal)
+        self.finalize_governance_action(context_id, proposal, &ctx_gen)
             .await?;
 
         Ok(result)
@@ -1089,11 +1085,12 @@ impl ContextManager {
     ///
     /// Extracted from [`execute_governance_action`] to keep that method
     /// focused on validation and dispatch.
-    #[allow(clippy::too_many_lines)]
+    #[allow(clippy::too_many_lines, clippy::option_if_let_else)]
     async fn finalize_governance_action(
         &self,
         context_id: &str,
         proposal: &GovernanceProposal,
+        ctx_gen: &super::ContextGeneration,
     ) -> Result<(), ContextError> {
         // For MLS-mutating actions (AddMember, RemoveMember, Revoke,
         // ResetMember), increment the epoch counter, place the old epoch into
@@ -1106,8 +1103,8 @@ impl ContextManager {
             let mls_op = generate_mls_operations(proposal)
                 .map_err(|e| ContextError::GovernanceFailed(e.to_string()))?;
 
-            let mut contexts = self.contexts.lock().await;
-            if let Some(ctx) = contexts.get_mut(context_id) {
+            if let Ok(mut guard) = self.relock_context(ctx_gen).await {
+                let ctx = &mut *guard;
                 let old_epoch = ctx.epoch.mls_epoch;
                 ctx.epoch.mls_epoch = old_epoch.saturating_add(1);
                 // Place the old epoch into the grace window so in-flight
@@ -1134,6 +1131,10 @@ impl ContextManager {
 
                 Some(ctx.epoch.mls_epoch)
             } else {
+                tracing::warn!(
+                    context_id,
+                    "finalize_governance_action: generation mismatch on epoch mutation — skipping"
+                );
                 None
             }
         } else {
@@ -1174,8 +1175,8 @@ impl ContextManager {
         {
             let action_summary = proposal.action.variant_name().to_owned();
             let target_did = proposal.action.target_did().cloned();
-            let mut contexts = self.contexts.lock().await;
-            if let Some(ctx) = contexts.get_mut(context_id) {
+            if let Ok(mut guard) = self.relock_context(ctx_gen).await {
+                let ctx = &mut *guard;
                 // Checkpoint tracking: count the GovernanceActionExecuted event.
                 ctx.checkpoint_events_since += 1;
 
@@ -1271,9 +1272,14 @@ impl ContextManager {
                 // 4. Persist the updated context state (best-effort).
                 if self.has_persistence() {
                     let snapshot = Self::snapshot_context(ctx);
-                    drop(contexts);
                     self.persist_context_snapshot(context_id, snapshot);
                 }
+            } else {
+                tracing::warn!(
+                    context_id,
+                    "finalize_governance_action: generation mismatch on post-dispatch — \
+                     skipping state mutations"
+                );
             }
         }
 
@@ -1307,10 +1313,11 @@ impl ContextManager {
             GovernanceAction::SuspendAccess { did } => {
                 // Suspend all capabilities for the member.
                 let snapshot = {
-                    let mut contexts = self.contexts.lock().await;
-                    let ctx = contexts
-                        .get_mut(context_id)
-                        .ok_or_else(|| ContextError::ContextNotRegistered(context_id.to_owned()))?;
+                    let ctx_arc = self
+                        .get_context_arc(context_id)
+                        .map_err(|_| ContextError::ContextNotRegistered(context_id.to_owned()))?;
+                    let mut guard = ctx_arc.lock().await;
+                    let ctx = &mut *guard;
                     require_active(&ctx.handle)?;
 
                     if !ctx.role_state.ceiling.contains(&Capability::MemberBan) {
@@ -1347,8 +1354,9 @@ impl ContextManager {
                     actor,
                 )?;
                 {
-                    let mut contexts = self.contexts.lock().await;
-                    if let Some(ctx) = contexts.get_mut(context_id) {
+                    if let Ok(ctx_arc) = self.get_context_arc(context_id) {
+                        let mut guard = ctx_arc.lock().await;
+                        let ctx = &mut *guard;
                         ctx.checkpoint_events_since += 1;
                     }
                 }
@@ -1735,7 +1743,7 @@ impl ContextManager {
         ),
         ContextError,
     > {
-        self.propose_governance_action_inner(context_id, proposer_did, action, signing_key)
+        self.propose_governance_action_inner(context_id, proposer_did, action, signing_key, false)
             .await
     }
 
@@ -1744,6 +1752,10 @@ impl ContextManager {
     /// Returns the proposal, events, and optional execution result. The
     /// execution result is `Some` when the proposal was auto-approved
     /// (`SingleAdmin`) and the action was successfully executed.
+    ///
+    /// When `check_propose_capability` is `true`, the `GovernancePropose`
+    /// capability is verified under the same lock as the proposal submission,
+    /// eliminating the TOCTOU race in `propose_governance_action_checked`.
     #[allow(clippy::too_many_lines)]
     async fn propose_governance_action_inner(
         &self,
@@ -1751,6 +1763,7 @@ impl ContextManager {
         proposer_did: &DID,
         action: GovernanceAction,
         signing_key: &ed25519_dalek::SigningKey,
+        check_propose_capability: bool,
     ) -> Result<
         (
             GovernanceProposal,
@@ -1760,10 +1773,11 @@ impl ContextManager {
         ContextError,
     > {
         let (proposal, events, should_execute, invalidated_by_conflict, in_freeze, conflict_events) = {
-            let mut contexts = self.contexts.lock().await;
-            let ctx = contexts
-                .get_mut(context_id)
-                .ok_or_else(|| ContextError::ContextNotRegistered(context_id.to_owned()))?;
+            let ctx_arc = self
+                .get_context_arc(context_id)
+                .map_err(|_| ContextError::ContextNotRegistered(context_id.to_owned()))?;
+            let mut guard = ctx_arc.lock().await;
+            let ctx = &mut *guard;
 
             // CancelContextMigration is allowed during MigratingOut (§5.11A);
             // all other actions require Active state.
@@ -1771,6 +1785,22 @@ impl ContextManager {
                 require_migrating_out(&ctx.handle)?;
             } else {
                 require_active(&ctx.handle)?;
+            }
+
+            // GovernancePropose capability check — performed under the same
+            // lock as the proposal submission to prevent TOCTOU races where
+            // the capability is revoked between the check and the propose.
+            // Only checked when called from propose_governance_action_checked
+            // (the external API); the unchecked variant skips this for
+            // internal callers that have already verified capability.
+            if check_propose_capability
+                && !ctx
+                    .role_state
+                    .member_has_capability(proposer_did.as_ref(), &Capability::GovernancePropose)
+            {
+                return Err(ContextError::PermissionDenied(format!(
+                    "member {proposer_did} does not have governance:propose capability"
+                )));
             }
 
             // Presence-only members (read + write both suspended) lose
@@ -1888,11 +1918,12 @@ impl ContextManager {
                     _ => {}
                 }
             }
-            if conflict_event_count > 0 {
-                let mut contexts = self.contexts.lock().await;
-                if let Some(ctx) = contexts.get_mut(context_id) {
-                    ctx.checkpoint_events_since += conflict_event_count;
-                }
+            if conflict_event_count > 0
+                && let Ok(ctx_arc) = self.get_context_arc(context_id)
+            {
+                let mut guard = ctx_arc.lock().await;
+                let ctx = &mut *guard;
+                ctx.checkpoint_events_since += conflict_event_count;
             }
         }
 
@@ -1908,13 +1939,13 @@ impl ContextManager {
         };
 
         // Persist context state after proposal creation.
-        if self.has_persistence() {
-            let contexts = self.contexts.lock().await;
-            if let Some(ctx) = contexts.get(context_id) {
-                let snapshot = Self::snapshot_context(ctx);
-                drop(contexts);
-                self.persist_context_snapshot(context_id, snapshot);
-            }
+        if self.has_persistence()
+            && let Ok(ctx_arc) = self.get_context_arc(context_id)
+        {
+            let guard = ctx_arc.lock().await;
+            let ctx = &*guard;
+            let snapshot = Self::snapshot_context(ctx);
+            self.persist_context_snapshot(context_id, snapshot);
         }
 
         Ok((proposal, events, execution_result))
@@ -1944,7 +1975,6 @@ impl ContextManager {
     /// - [`ContextError::ContextNotActive`] if the context is not `Active`.
     /// - [`ContextError::GovernanceFailed`] if the voter is not eligible,
     ///   already voted, or the proposal is not pending.
-    #[allow(clippy::too_many_lines)]
     #[instrument(skip_all, fields(context_id))]
     pub async fn vote_on_proposal(
         &self,
@@ -1954,11 +1984,39 @@ impl ContextManager {
         approve: bool,
         signing_key: &ed25519_dalek::SigningKey,
     ) -> Result<(ProposalStatus, Vec<GovernanceEvent>), ContextError> {
+        self.vote_on_proposal_inner(
+            context_id,
+            proposal_id,
+            voter_did,
+            approve,
+            signing_key,
+            false,
+        )
+        .await
+    }
+
+    /// Inner vote implementation. When `check_vote_capability` is `true`,
+    /// additionally verifies `GovernanceVote` via `member_has_capability`
+    /// under the same lock as the vote (eliminates the TOCTOU window from
+    /// the previous separate lock block in `approve_governance_proposal` /
+    /// `reject_governance_proposal`).
+    #[allow(clippy::too_many_lines)]
+    #[instrument(skip_all, fields(context_id))]
+    async fn vote_on_proposal_inner(
+        &self,
+        context_id: &str,
+        proposal_id: &ProposalId,
+        voter_did: &DID,
+        approve: bool,
+        signing_key: &ed25519_dalek::SigningKey,
+        check_vote_capability: bool,
+    ) -> Result<(ProposalStatus, Vec<GovernanceEvent>), ContextError> {
         let (status, events, proposal_for_execution, conflict_events) = {
-            let mut contexts = self.contexts.lock().await;
-            let ctx = contexts
-                .get_mut(context_id)
-                .ok_or_else(|| ContextError::ContextNotRegistered(context_id.to_owned()))?;
+            let ctx_arc = self
+                .get_context_arc(context_id)
+                .map_err(|_| ContextError::ContextNotRegistered(context_id.to_owned()))?;
+            let mut guard = ctx_arc.lock().await;
+            let ctx = &mut *guard;
 
             require_active(&ctx.handle)?;
 
@@ -1985,6 +2043,18 @@ impl ContextManager {
                 return Err(ContextError::PermissionDenied(
                     "presence-only members cannot vote on governance proposals".into(),
                 ));
+            }
+
+            // Atomic capability check under the same lock as the vote
+            // (Phase B: eliminates TOCTOU from separate lock blocks).
+            if check_vote_capability
+                && !ctx
+                    .role_state
+                    .member_has_capability(voter_did.as_ref(), &Capability::GovernanceVote)
+            {
+                return Err(ContextError::PermissionDenied(format!(
+                    "member {voter_did} does not have governance:vote capability"
+                )));
             }
 
             let gov_ctx = Self::build_governance_context(ctx, &*self.clock);
@@ -2044,11 +2114,12 @@ impl ContextManager {
                     _ => {}
                 }
             }
-            if conflict_event_count > 0 {
-                let mut contexts = self.contexts.lock().await;
-                if let Some(ctx) = contexts.get_mut(context_id) {
-                    ctx.checkpoint_events_since += conflict_event_count;
-                }
+            if conflict_event_count > 0
+                && let Ok(ctx_arc) = self.get_context_arc(context_id)
+            {
+                let mut guard = ctx_arc.lock().await;
+                let ctx = &mut *guard;
+                ctx.checkpoint_events_since += conflict_event_count;
             }
         }
 
@@ -2062,10 +2133,13 @@ impl ContextManager {
         if let Some(proposal) = proposal_for_execution {
             // Check if we're in governance freeze before executing
             let in_freeze = {
-                let contexts = self.contexts.lock().await;
-                contexts
-                    .get(context_id)
-                    .is_some_and(|ctx| ctx.governance.freeze.is_some())
+                if let Ok(ctx_arc) = self.get_context_arc(context_id) {
+                    let guard = ctx_arc.lock().await;
+                    let ctx = &*guard;
+                    ctx.governance.freeze.is_some()
+                } else {
+                    false
+                }
             };
 
             if !in_freeze && !invalidated_by_conflict {
@@ -2075,13 +2149,13 @@ impl ContextManager {
         }
 
         // Persist context state after vote.
-        if self.has_persistence() {
-            let contexts = self.contexts.lock().await;
-            if let Some(ctx) = contexts.get(context_id) {
-                let snapshot = Self::snapshot_context(ctx);
-                drop(contexts);
-                self.persist_context_snapshot(context_id, snapshot);
-            }
+        if self.has_persistence()
+            && let Ok(ctx_arc) = self.get_context_arc(context_id)
+        {
+            let guard = ctx_arc.lock().await;
+            let ctx = &*guard;
+            let snapshot = Self::snapshot_context(ctx);
+            self.persist_context_snapshot(context_id, snapshot);
         }
 
         Ok((status, events))
@@ -2099,10 +2173,11 @@ impl ContextManager {
         context_id: &str,
         proposal_id: &ProposalId,
     ) -> Result<GovernanceProposal, ContextError> {
-        let contexts = self.contexts.lock().await;
-        let ctx = contexts
-            .get(context_id)
-            .ok_or_else(|| ContextError::ContextNotRegistered(context_id.to_owned()))?;
+        let ctx_arc = self
+            .get_context_arc(context_id)
+            .map_err(|_| ContextError::ContextNotRegistered(context_id.to_owned()))?;
+        let guard = ctx_arc.lock().await;
+        let ctx = &*guard;
 
         ctx.governance
             .engine
@@ -2130,10 +2205,11 @@ impl ContextManager {
         &self,
         context_id: &str,
     ) -> Result<Vec<GovernanceProposal>, ContextError> {
-        let contexts = self.contexts.lock().await;
-        let ctx = contexts
-            .get(context_id)
-            .ok_or_else(|| ContextError::ContextNotRegistered(context_id.to_owned()))?;
+        let ctx_arc = self
+            .get_context_arc(context_id)
+            .map_err(|_| ContextError::ContextNotRegistered(context_id.to_owned()))?;
+        let guard = ctx_arc.lock().await;
+        let ctx = &*guard;
 
         Ok(ctx.governance.engine.list_proposals())
     }
@@ -2168,28 +2244,13 @@ impl ContextManager {
         action: GovernanceAction,
         signing_key: &ed25519_dalek::SigningKey,
     ) -> Result<ProposalOutcome, ContextError> {
-        // Validate capability before delegating. The suspension-aware
-        // member_has_capability also rejects presence-only members whose
-        // GovernancePropose capability has been suspended (§5.9, ADR-038).
-        {
-            let contexts = self.contexts.lock().await;
-            let ctx = contexts
-                .get(context_id)
-                .ok_or_else(|| ContextError::ContextNotRegistered(context_id.to_owned()))?;
-
-            if !ctx
-                .role_state
-                .member_has_capability(proposer_did.as_ref(), &Capability::GovernancePropose)
-            {
-                return Err(ContextError::PermissionDenied(format!(
-                    "member {proposer_did} does not have governance:propose capability"
-                )));
-            }
-        }
-        // Lock dropped.
-
+        // GovernancePropose capability check is performed INSIDE
+        // propose_governance_action_inner (check_propose_capability=true)
+        // under the same lock as the proposal submission. This eliminates
+        // the TOCTOU race where a separate check-then-act pattern allowed
+        // capability revocation between the check and the propose.
         let (proposal, _events, execution_result) = self
-            .propose_governance_action_inner(context_id, proposer_did, action, signing_key)
+            .propose_governance_action_inner(context_id, proposer_did, action, signing_key, true)
             .await?;
 
         let status = proposal.status.clone();
@@ -2220,26 +2281,11 @@ impl ContextManager {
         voter_did: &DID,
         signing_key: &ed25519_dalek::SigningKey,
     ) -> Result<ProposalStatus, ContextError> {
-        // Validate capability before delegating.
-        {
-            let contexts = self.contexts.lock().await;
-            let ctx = contexts
-                .get(context_id)
-                .ok_or_else(|| ContextError::ContextNotRegistered(context_id.to_owned()))?;
-
-            if !ctx
-                .role_state
-                .member_has_capability(voter_did.as_ref(), &Capability::GovernanceVote)
-            {
-                return Err(ContextError::PermissionDenied(format!(
-                    "member {voter_did} does not have governance:vote capability"
-                )));
-            }
-        }
-        // Lock dropped.
-
+        // Capability check is atomic inside vote_on_proposal_inner (under
+        // the same lock as the vote) — eliminates the TOCTOU window from
+        // the previous separate lock block.
         let (status, _events) = self
-            .vote_on_proposal(context_id, proposal_id, voter_did, true, signing_key)
+            .vote_on_proposal_inner(context_id, proposal_id, voter_did, true, signing_key, true)
             .await?;
 
         Ok(status)
@@ -2265,26 +2311,11 @@ impl ContextManager {
         voter_did: &DID,
         signing_key: &ed25519_dalek::SigningKey,
     ) -> Result<ProposalStatus, ContextError> {
-        // Validate capability before delegating.
-        {
-            let contexts = self.contexts.lock().await;
-            let ctx = contexts
-                .get(context_id)
-                .ok_or_else(|| ContextError::ContextNotRegistered(context_id.to_owned()))?;
-
-            if !ctx
-                .role_state
-                .member_has_capability(voter_did.as_ref(), &Capability::GovernanceVote)
-            {
-                return Err(ContextError::PermissionDenied(format!(
-                    "member {voter_did} does not have governance:vote capability"
-                )));
-            }
-        }
-        // Lock dropped.
-
+        // Capability check is atomic inside vote_on_proposal_inner (under
+        // the same lock as the vote) — eliminates the TOCTOU window from
+        // the previous separate lock block.
         let (status, _events) = self
-            .vote_on_proposal(context_id, proposal_id, voter_did, false, signing_key)
+            .vote_on_proposal_inner(context_id, proposal_id, voter_did, false, signing_key, true)
             .await?;
 
         Ok(status)
@@ -2310,10 +2341,11 @@ impl ContextManager {
         voter_did: &DID,
     ) -> Result<ProposalStatus, ContextError> {
         let (status, events) = {
-            let mut contexts = self.contexts.lock().await;
-            let ctx = contexts
-                .get_mut(context_id)
-                .ok_or_else(|| ContextError::ContextNotRegistered(context_id.to_owned()))?;
+            let ctx_arc = self
+                .get_context_arc(context_id)
+                .map_err(|_| ContextError::ContextNotRegistered(context_id.to_owned()))?;
+            let mut guard = ctx_arc.lock().await;
+            let ctx = &mut *guard;
             require_active(&ctx.handle)?;
 
             let gov_ctx = Self::build_governance_context(ctx, &*self.clock);
@@ -2333,21 +2365,22 @@ impl ContextManager {
             )?;
             event_count += 1;
         }
-        if event_count > 0 {
-            let mut contexts = self.contexts.lock().await;
-            if let Some(ctx) = contexts.get_mut(context_id) {
-                ctx.checkpoint_events_since += event_count;
-            }
+        if event_count > 0
+            && let Ok(ctx_arc) = self.get_context_arc(context_id)
+        {
+            let mut guard = ctx_arc.lock().await;
+            let ctx = &mut *guard;
+            ctx.checkpoint_events_since += event_count;
         }
 
         // Persist context state after withdrawal.
-        if self.has_persistence() {
-            let contexts = self.contexts.lock().await;
-            if let Some(ctx) = contexts.get(context_id) {
-                let snapshot = Self::snapshot_context(ctx);
-                drop(contexts);
-                self.persist_context_snapshot(context_id, snapshot);
-            }
+        if self.has_persistence()
+            && let Ok(ctx_arc) = self.get_context_arc(context_id)
+        {
+            let guard = ctx_arc.lock().await;
+            let ctx = &*guard;
+            let snapshot = Self::snapshot_context(ctx);
+            self.persist_context_snapshot(context_id, snapshot);
         }
 
         Ok(status)
@@ -2372,10 +2405,11 @@ impl ContextManager {
         let context_id_bytes = context_id_to_bytes(context_id);
 
         let snapshot = {
-            let mut contexts = self.contexts.lock().await;
-            let ctx = contexts
-                .get_mut(context_id)
-                .ok_or_else(|| ContextError::ContextNotRegistered(context_id.to_owned()))?;
+            let ctx_arc = self
+                .get_context_arc(context_id)
+                .map_err(|_| ContextError::ContextNotRegistered(context_id.to_owned()))?;
+            let mut guard = ctx_arc.lock().await;
+            let ctx = &mut *guard;
             require_active(&ctx.handle)?;
 
             if !ctx.role_state.ceiling.contains(&Capability::MemberBan) {
@@ -2413,8 +2447,9 @@ impl ContextManager {
         self.event_log
             .append_context_event(&context_id_bytes, "MemberSuspended", actor_did)?;
         {
-            let mut contexts = self.contexts.lock().await;
-            if let Some(ctx) = contexts.get_mut(context_id) {
+            if let Ok(ctx_arc) = self.get_context_arc(context_id) {
+                let mut guard = ctx_arc.lock().await;
+                let ctx = &mut *guard;
                 ctx.checkpoint_events_since += 1;
             }
         }
@@ -2449,10 +2484,11 @@ impl ContextManager {
         let context_id_bytes = context_id_to_bytes(context_id);
 
         let (rotated_count, ctx_snapshot, bc_snapshot, needs_sender_key_rotation) = {
-            let mut contexts = self.contexts.lock().await;
-            let ctx = contexts
-                .get_mut(context_id)
-                .ok_or_else(|| ContextError::ContextNotRegistered(context_id.to_owned()))?;
+            let ctx_arc = self
+                .get_context_arc(context_id)
+                .map_err(|_| ContextError::ContextNotRegistered(context_id.to_owned()))?;
+            let mut guard = ctx_arc.lock().await;
+            let ctx = &mut *guard;
             require_active(&ctx.handle)?;
 
             if !ctx.role_state.ceiling.contains(&Capability::MemberBan) {
@@ -2556,8 +2592,9 @@ impl ContextManager {
             Some(&serde_json::json!({"target_did": did.as_ref()})),
         )?;
         {
-            let mut contexts = self.contexts.lock().await;
-            if let Some(ctx) = contexts.get_mut(context_id) {
+            if let Ok(ctx_arc) = self.get_context_arc(context_id) {
+                let mut guard = ctx_arc.lock().await;
+                let ctx = &mut *guard;
                 ctx.checkpoint_events_since += 1;
             }
         }
@@ -2606,10 +2643,11 @@ impl ContextManager {
         let context_id_bytes = context_id_to_bytes(context_id);
 
         let (ctx_snapshot, bc_snapshot) = {
-            let mut contexts = self.contexts.lock().await;
-            let ctx = contexts
-                .get_mut(context_id)
-                .ok_or_else(|| ContextError::ContextNotRegistered(context_id.to_owned()))?;
+            let ctx_arc = self
+                .get_context_arc(context_id)
+                .map_err(|_| ContextError::ContextNotRegistered(context_id.to_owned()))?;
+            let mut guard = ctx_arc.lock().await;
+            let ctx = &mut *guard;
             require_active(&ctx.handle)?;
 
             if !ctx.role_state.ceiling.contains(&Capability::MemberBan) {
@@ -2698,8 +2736,9 @@ impl ContextManager {
         self.event_log
             .append_context_event(&context_id_bytes, "AccessRestored", actor_did)?;
         {
-            let mut contexts = self.contexts.lock().await;
-            if let Some(ctx) = contexts.get_mut(context_id) {
+            if let Ok(ctx_arc) = self.get_context_arc(context_id) {
+                let mut guard = ctx_arc.lock().await;
+                let ctx = &mut *guard;
                 ctx.checkpoint_events_since += 1;
             }
         }
@@ -2718,10 +2757,11 @@ impl ContextManager {
         let context_id_bytes = context_id_to_bytes(context_id);
 
         let snapshot = {
-            let mut contexts = self.contexts.lock().await;
-            let ctx = contexts
-                .get_mut(context_id)
-                .ok_or_else(|| ContextError::ContextNotRegistered(context_id.to_owned()))?;
+            let ctx_arc = self
+                .get_context_arc(context_id)
+                .map_err(|_| ContextError::ContextNotRegistered(context_id.to_owned()))?;
+            let mut guard = ctx_arc.lock().await;
+            let ctx = &mut *guard;
             require_active(&ctx.handle)?;
 
             // Crypto: add to MLS group under lock to prevent partial-failure
@@ -2784,8 +2824,9 @@ impl ContextManager {
         self.event_log
             .append_context_event(&context_id_bytes, "MemberJoined", actor_did)?;
         {
-            let mut contexts = self.contexts.lock().await;
-            if let Some(ctx) = contexts.get_mut(context_id) {
+            if let Ok(ctx_arc) = self.get_context_arc(context_id) {
+                let mut guard = ctx_arc.lock().await;
+                let ctx = &mut *guard;
                 ctx.checkpoint_events_since += 1;
             }
         }
@@ -2802,10 +2843,11 @@ impl ContextManager {
         let context_id_bytes = context_id_to_bytes(context_id);
 
         let (remove_output, snapshot) = {
-            let mut contexts = self.contexts.lock().await;
-            let ctx = contexts
-                .get_mut(context_id)
-                .ok_or_else(|| ContextError::ContextNotRegistered(context_id.to_owned()))?;
+            let ctx_arc = self
+                .get_context_arc(context_id)
+                .map_err(|_| ContextError::ContextNotRegistered(context_id.to_owned()))?;
+            let mut guard = ctx_arc.lock().await;
+            let ctx = &mut *guard;
             require_active(&ctx.handle)?;
 
             if !ctx.membership.contains(did) {
@@ -2908,8 +2950,9 @@ impl ContextManager {
         self.event_log
             .append_context_event(&context_id_bytes, "MemberLeft", actor_did)?;
         {
-            let mut contexts = self.contexts.lock().await;
-            if let Some(ctx) = contexts.get_mut(context_id) {
+            if let Ok(ctx_arc) = self.get_context_arc(context_id) {
+                let mut guard = ctx_arc.lock().await;
+                let ctx = &mut *guard;
                 ctx.checkpoint_events_since += 1;
             }
         }
@@ -2927,10 +2970,11 @@ impl ContextManager {
         let context_id_bytes = context_id_to_bytes(context_id);
 
         let snapshot = {
-            let mut contexts = self.contexts.lock().await;
-            let ctx = contexts
-                .get_mut(context_id)
-                .ok_or_else(|| ContextError::ContextNotRegistered(context_id.to_owned()))?;
+            let ctx_arc = self
+                .get_context_arc(context_id)
+                .map_err(|_| ContextError::ContextNotRegistered(context_id.to_owned()))?;
+            let mut guard = ctx_arc.lock().await;
+            let ctx = &mut *guard;
             require_active(&ctx.handle)?;
 
             if !ctx.membership.contains(did) {
@@ -2970,8 +3014,9 @@ impl ContextManager {
         self.event_log
             .append_context_event(&context_id_bytes, "RoleAssigned", actor_did)?;
         {
-            let mut contexts = self.contexts.lock().await;
-            if let Some(ctx) = contexts.get_mut(context_id) {
+            if let Ok(ctx_arc) = self.get_context_arc(context_id) {
+                let mut guard = ctx_arc.lock().await;
+                let ctx = &mut *guard;
                 ctx.checkpoint_events_since += 1;
             }
         }
@@ -2991,10 +3036,11 @@ impl ContextManager {
         let context_id_bytes = context_id_to_bytes(context_id);
 
         let snapshot = {
-            let mut contexts = self.contexts.lock().await;
-            let ctx = contexts
-                .get_mut(context_id)
-                .ok_or_else(|| ContextError::ContextNotRegistered(context_id.to_owned()))?;
+            let ctx_arc = self
+                .get_context_arc(context_id)
+                .map_err(|_| ContextError::ContextNotRegistered(context_id.to_owned()))?;
+            let mut guard = ctx_arc.lock().await;
+            let ctx = &mut *guard;
             require_active(&ctx.handle)?;
 
             // Gate: ceiling must include ToolRegister (§5.3, #339).
@@ -3023,8 +3069,9 @@ impl ContextManager {
         self.event_log
             .append_context_event(&context_id_bytes, "ToolRegistered", actor_did)?;
         {
-            let mut contexts = self.contexts.lock().await;
-            if let Some(ctx) = contexts.get_mut(context_id) {
+            if let Ok(ctx_arc) = self.get_context_arc(context_id) {
+                let mut guard = ctx_arc.lock().await;
+                let ctx = &mut *guard;
                 ctx.checkpoint_events_since += 1;
             }
         }
@@ -3041,10 +3088,11 @@ impl ContextManager {
         let context_id_bytes = context_id_to_bytes(context_id);
 
         let snapshot = {
-            let mut contexts = self.contexts.lock().await;
-            let ctx = contexts
-                .get_mut(context_id)
-                .ok_or_else(|| ContextError::ContextNotRegistered(context_id.to_owned()))?;
+            let ctx_arc = self
+                .get_context_arc(context_id)
+                .map_err(|_| ContextError::ContextNotRegistered(context_id.to_owned()))?;
+            let mut guard = ctx_arc.lock().await;
+            let ctx = &mut *guard;
             require_active(&ctx.handle)?;
 
             ctx.governance
@@ -3063,8 +3111,9 @@ impl ContextManager {
         self.event_log
             .append_context_event(&context_id_bytes, "ToolRemoved", actor_did)?;
         {
-            let mut contexts = self.contexts.lock().await;
-            if let Some(ctx) = contexts.get_mut(context_id) {
+            if let Ok(ctx_arc) = self.get_context_arc(context_id) {
+                let mut guard = ctx_arc.lock().await;
+                let ctx = &mut *guard;
                 ctx.checkpoint_events_since += 1;
             }
         }
@@ -3081,10 +3130,11 @@ impl ContextManager {
         let context_id_bytes = context_id_to_bytes(context_id);
 
         let snapshot = {
-            let mut contexts = self.contexts.lock().await;
-            let ctx = contexts
-                .get_mut(context_id)
-                .ok_or_else(|| ContextError::ContextNotRegistered(context_id.to_owned()))?;
+            let ctx_arc = self
+                .get_context_arc(context_id)
+                .map_err(|_| ContextError::ContextNotRegistered(context_id.to_owned()))?;
+            let mut guard = ctx_arc.lock().await;
+            let ctx = &mut *guard;
             require_active(&ctx.handle)?;
 
             if !matches!(
@@ -3140,8 +3190,9 @@ impl ContextManager {
             actor_did,
         )?;
         {
-            let mut contexts = self.contexts.lock().await;
-            if let Some(ctx) = contexts.get_mut(context_id) {
+            if let Ok(ctx_arc) = self.get_context_arc(context_id) {
+                let mut guard = ctx_arc.lock().await;
+                let ctx = &mut *guard;
                 ctx.checkpoint_events_since += 1;
             }
         }
@@ -3168,10 +3219,11 @@ impl ContextManager {
         let context_id_bytes = context_id_to_bytes(context_id);
 
         let (applied, snapshot) = {
-            let mut contexts = self.contexts.lock().await;
-            let ctx = contexts
-                .get_mut(context_id)
-                .ok_or_else(|| ContextError::ContextNotRegistered(context_id.to_owned()))?;
+            let ctx_arc = self
+                .get_context_arc(context_id)
+                .map_err(|_| ContextError::ContextNotRegistered(context_id.to_owned()))?;
+            let mut guard = ctx_arc.lock().await;
+            let ctx = &mut *guard;
             require_active(&ctx.handle)?;
 
             let pending = match &ctx.governance.pending_ceiling_modification {
@@ -3199,8 +3251,9 @@ impl ContextManager {
             self.event_log
                 .append_context_event(&context_id_bytes, "CeilingModified", "")?;
             {
-                let mut contexts = self.contexts.lock().await;
-                if let Some(ctx) = contexts.get_mut(context_id) {
+                if let Ok(ctx_arc) = self.get_context_arc(context_id) {
+                    let mut guard = ctx_arc.lock().await;
+                    let ctx = &mut *guard;
                     ctx.checkpoint_events_since += 1;
                 }
             }
@@ -3209,6 +3262,7 @@ impl ContextManager {
         Ok(applied)
     }
 
+    #[allow(clippy::option_if_let_else)]
     async fn execute_close_context(
         &self,
         context_id: &str,
@@ -3220,13 +3274,12 @@ impl ContextManager {
 
         // Extract handle under lock, then drop lock before the async
         // transition to avoid holding the global contexts mutex across .await.
-        let handle = {
-            let contexts = self.contexts.lock().await;
-            let ctx = contexts
-                .get(context_id)
-                .ok_or_else(|| ContextError::ContextNotRegistered(context_id.to_owned()))?;
+        // Capture generation for confused-deputy detection on reacquire.
+        let (handle, ctx_gen) = {
+            let (guard, ctx_gen) = self.lock_context(context_id).await?;
+            let ctx = &*guard;
             require_active(&ctx.handle)?;
-            ctx.handle.clone()
+            (ctx.handle.clone(), ctx_gen)
         };
 
         // Transition to Closing via the state machine (no lock held).
@@ -3237,12 +3290,10 @@ impl ContextManager {
                 ContextError::PermissionDenied("cannot transition to Closing".to_owned())
             })?;
 
-        // Re-acquire lock for cleanup and snapshot.
-        let snapshot = {
-            let mut contexts = self.contexts.lock().await;
-            let ctx = contexts
-                .get_mut(context_id)
-                .ok_or_else(|| ContextError::ContextNotRegistered(context_id.to_owned()))?;
+        // Re-acquire lock for cleanup and snapshot with generation check
+        // to detect confused-deputy (context removed+recreated during transition).
+        let snapshot = if let Ok(mut guard) = self.relock_context(&ctx_gen).await {
+            let ctx = &mut *guard;
 
             // Cancel TTL timer and governance timeout task if active.
             ctx.ttl.timer.cancel();
@@ -3258,6 +3309,12 @@ impl ContextManager {
             } else {
                 None
             }
+        } else {
+            tracing::warn!(
+                context_id,
+                "execute_close_context: generation mismatch on cleanup reacquire — skipping"
+            );
+            None
         };
 
         if let Some(snapshot) = snapshot {
@@ -3266,8 +3323,8 @@ impl ContextManager {
         self.event_log
             .append_context_event(&context_id_bytes, "ContextClosing", actor_did)?;
         {
-            let mut contexts = self.contexts.lock().await;
-            if let Some(ctx) = contexts.get_mut(context_id) {
+            if let Ok(mut guard) = self.relock_context(&ctx_gen).await {
+                let ctx = &mut *guard;
                 ctx.checkpoint_events_since += 1;
             }
         }
@@ -3288,10 +3345,11 @@ impl ContextManager {
         let context_id_bytes = context_id_to_bytes(context_id);
 
         let (snapshot, new_remaining, handle, old_deadline, new_deadline, consenting_members) = {
-            let mut contexts = self.contexts.lock().await;
-            let ctx = contexts
-                .get_mut(context_id)
-                .ok_or_else(|| ContextError::ContextNotRegistered(context_id.to_owned()))?;
+            let ctx_arc = self
+                .get_context_arc(context_id)
+                .map_err(|_| ContextError::ContextNotRegistered(context_id.to_owned()))?;
+            let mut guard = ctx_arc.lock().await;
+            let ctx = &mut *guard;
             require_active(&ctx.handle)?;
 
             // Unanimity check: TTL extension requires consent from ALL
@@ -3387,8 +3445,9 @@ impl ContextManager {
             actor_did,
         )?;
         {
-            let mut contexts = self.contexts.lock().await;
-            if let Some(ctx) = contexts.get_mut(context_id) {
+            if let Ok(ctx_arc) = self.get_context_arc(context_id) {
+                let mut guard = ctx_arc.lock().await;
+                let ctx = &mut *guard;
                 ctx.checkpoint_events_since += 1;
             }
         }
@@ -3405,10 +3464,11 @@ impl ContextManager {
         let context_id_bytes = context_id_to_bytes(context_id);
 
         let snapshot = {
-            let mut contexts = self.contexts.lock().await;
-            let ctx = contexts
-                .get_mut(context_id)
-                .ok_or_else(|| ContextError::ContextNotRegistered(context_id.to_owned()))?;
+            let ctx_arc = self
+                .get_context_arc(context_id)
+                .map_err(|_| ContextError::ContextNotRegistered(context_id.to_owned()))?;
+            let mut guard = ctx_arc.lock().await;
+            let ctx = &mut *guard;
             require_active(&ctx.handle)?;
 
             if !ctx.membership.contains(new_admin) {
@@ -3464,8 +3524,9 @@ impl ContextManager {
         self.event_log
             .append_context_event(&context_id_bytes, "AdminTransferred", actor_did)?;
         {
-            let mut contexts = self.contexts.lock().await;
-            if let Some(ctx) = contexts.get_mut(context_id) {
+            if let Ok(ctx_arc) = self.get_context_arc(context_id) {
+                let mut guard = ctx_arc.lock().await;
+                let ctx = &mut *guard;
                 ctx.checkpoint_events_since += 1;
             }
         }
@@ -3484,10 +3545,11 @@ impl ContextManager {
         let context_id_bytes = context_id_to_bytes(context_id);
         // Validate parent context is active and ceiling allows child creation.
         {
-            let contexts = self.contexts.lock().await;
-            let ctx = contexts
-                .get(context_id)
-                .ok_or_else(|| ContextError::ContextNotRegistered(context_id.to_owned()))?;
+            let ctx_arc = self
+                .get_context_arc(context_id)
+                .map_err(|_| ContextError::ContextNotRegistered(context_id.to_owned()))?;
+            let guard = ctx_arc.lock().await;
+            let ctx = &*guard;
             require_active(&ctx.handle)?;
 
             // Gate: ceiling must include ChildContextCreate (§5.3, §5.13, #339).
@@ -3507,8 +3569,9 @@ impl ContextManager {
         self.event_log
             .append_context_event(&context_id_bytes, "ChildContextCreated", actor_did)?;
         {
-            let mut contexts = self.contexts.lock().await;
-            if let Some(ctx) = contexts.get_mut(context_id) {
+            if let Ok(ctx_arc) = self.get_context_arc(context_id) {
+                let mut guard = ctx_arc.lock().await;
+                let ctx = &mut *guard;
                 ctx.checkpoint_events_since += 1;
             }
         }
@@ -3566,10 +3629,11 @@ impl ContextManager {
         }
 
         let snapshot = {
-            let mut contexts = self.contexts.lock().await;
-            let ctx = contexts
-                .get_mut(context_id)
-                .ok_or_else(|| ContextError::ContextNotRegistered(context_id.to_owned()))?;
+            let ctx_arc = self
+                .get_context_arc(context_id)
+                .map_err(|_| ContextError::ContextNotRegistered(context_id.to_owned()))?;
+            let mut guard = ctx_arc.lock().await;
+            let ctx = &mut *guard;
             require_active(&ctx.handle)?;
 
             ctx.governance.pruning_policy = Some(new_policy.clone());
@@ -3589,8 +3653,9 @@ impl ContextManager {
             actor_did,
         )?;
         {
-            let mut contexts = self.contexts.lock().await;
-            if let Some(ctx) = contexts.get_mut(context_id) {
+            if let Ok(ctx_arc) = self.get_context_arc(context_id) {
+                let mut guard = ctx_arc.lock().await;
+                let ctx = &mut *guard;
                 ctx.checkpoint_events_since += 1;
             }
         }
@@ -3609,10 +3674,11 @@ impl ContextManager {
         let context_id_bytes = context_id_to_bytes(context_id);
 
         let snapshot = {
-            let mut contexts = self.contexts.lock().await;
-            let ctx = contexts
-                .get_mut(context_id)
-                .ok_or_else(|| ContextError::ContextNotRegistered(context_id.to_owned()))?;
+            let ctx_arc = self
+                .get_context_arc(context_id)
+                .map_err(|_| ContextError::ContextNotRegistered(context_id.to_owned()))?;
+            let mut guard = ctx_arc.lock().await;
+            let ctx = &mut *guard;
             require_active(&ctx.handle)?;
 
             if !ctx.membership.contains(did) {
@@ -3671,8 +3737,9 @@ impl ContextManager {
         self.event_log
             .append_context_event(&context_id_bytes, "SignerAdded", actor_did)?;
         {
-            let mut contexts = self.contexts.lock().await;
-            if let Some(ctx) = contexts.get_mut(context_id) {
+            if let Ok(ctx_arc) = self.get_context_arc(context_id) {
+                let mut guard = ctx_arc.lock().await;
+                let ctx = &mut *guard;
                 ctx.checkpoint_events_since += 1;
             }
         }
@@ -3691,10 +3758,11 @@ impl ContextManager {
         let context_id_bytes = context_id_to_bytes(context_id);
 
         let snapshot = {
-            let mut contexts = self.contexts.lock().await;
-            let ctx = contexts
-                .get_mut(context_id)
-                .ok_or_else(|| ContextError::ContextNotRegistered(context_id.to_owned()))?;
+            let ctx_arc = self
+                .get_context_arc(context_id)
+                .map_err(|_| ContextError::ContextNotRegistered(context_id.to_owned()))?;
+            let mut guard = ctx_arc.lock().await;
+            let ctx = &mut *guard;
             require_active(&ctx.handle)?;
 
             let before = ctx.governance.threshold_signers.len();
@@ -3749,8 +3817,9 @@ impl ContextManager {
         self.event_log
             .append_context_event(&context_id_bytes, "SignerRemoved", actor_did)?;
         {
-            let mut contexts = self.contexts.lock().await;
-            if let Some(ctx) = contexts.get_mut(context_id) {
+            if let Ok(ctx_arc) = self.get_context_arc(context_id) {
+                let mut guard = ctx_arc.lock().await;
+                let ctx = &mut *guard;
                 ctx.checkpoint_events_since += 1;
             }
         }
@@ -3767,10 +3836,11 @@ impl ContextManager {
         let context_id_bytes = context_id_to_bytes(context_id);
 
         let snapshot = {
-            let mut contexts = self.contexts.lock().await;
-            let ctx = contexts
-                .get_mut(context_id)
-                .ok_or_else(|| ContextError::ContextNotRegistered(context_id.to_owned()))?;
+            let ctx_arc = self
+                .get_context_arc(context_id)
+                .map_err(|_| ContextError::ContextNotRegistered(context_id.to_owned()))?;
+            let mut guard = ctx_arc.lock().await;
+            let ctx = &mut *guard;
             require_active(&ctx.handle)?;
 
             let signer_count =
@@ -3794,8 +3864,9 @@ impl ContextManager {
         self.event_log
             .append_context_event(&context_id_bytes, "ThresholdModified", actor_did)?;
         {
-            let mut contexts = self.contexts.lock().await;
-            if let Some(ctx) = contexts.get_mut(context_id) {
+            if let Ok(ctx_arc) = self.get_context_arc(context_id) {
+                let mut guard = ctx_arc.lock().await;
+                let ctx = &mut *guard;
                 ctx.checkpoint_events_since += 1;
             }
         }
@@ -3815,10 +3886,11 @@ impl ContextManager {
         let context_id_bytes = context_id_to_bytes(context_id);
 
         let snapshot = {
-            let mut contexts = self.contexts.lock().await;
-            let ctx = contexts
-                .get_mut(context_id)
-                .ok_or_else(|| ContextError::ContextNotRegistered(context_id.to_owned()))?;
+            let ctx_arc = self
+                .get_context_arc(context_id)
+                .map_err(|_| ContextError::ContextNotRegistered(context_id.to_owned()))?;
+            let mut guard = ctx_arc.lock().await;
+            let ctx = &mut *guard;
             require_active(&ctx.handle)?;
 
             // Gate: ceiling must include ToolInterface (§5.3, §6.2, #339).
@@ -3850,8 +3922,9 @@ impl ContextManager {
             actor_did,
         )?;
         {
-            let mut contexts = self.contexts.lock().await;
-            if let Some(ctx) = contexts.get_mut(context_id) {
+            if let Ok(ctx_arc) = self.get_context_arc(context_id) {
+                let mut guard = ctx_arc.lock().await;
+                let ctx = &mut *guard;
                 ctx.checkpoint_events_since += 1;
             }
         }
@@ -3868,10 +3941,11 @@ impl ContextManager {
     ) -> Result<(), ContextError> {
         let context_id_bytes = context_id_to_bytes(context_id);
         {
-            let contexts = self.contexts.lock().await;
-            let ctx = contexts
-                .get(context_id)
-                .ok_or_else(|| ContextError::ContextNotRegistered(context_id.to_owned()))?;
+            let ctx_arc = self
+                .get_context_arc(context_id)
+                .map_err(|_| ContextError::ContextNotRegistered(context_id.to_owned()))?;
+            let guard = ctx_arc.lock().await;
+            let ctx = &*guard;
             require_active(&ctx.handle)?;
 
             if !ctx.membership.contains(did) {
@@ -3955,8 +4029,9 @@ impl ContextManager {
         // Track the epoch reset so the governance timeout task can invalidate
         // this member's votes on pending proposals (ADR-031 §5, ADR-029 Tier 3).
         {
-            let mut contexts = self.contexts.lock().await;
-            if let Some(ctx) = contexts.get_mut(context_id) {
+            if let Ok(ctx_arc) = self.get_context_arc(context_id) {
+                let mut guard = ctx_arc.lock().await;
+                let ctx = &mut *guard;
                 ctx.checkpoint_events_since += 1;
                 ctx.governance.pending_epoch_resets.push(did.clone());
             }
@@ -3977,10 +4052,11 @@ impl ContextManager {
         let context_id_bytes = context_id_to_bytes(context_id);
 
         let snapshot = {
-            let mut contexts = self.contexts.lock().await;
-            let ctx = contexts
-                .get_mut(context_id)
-                .ok_or_else(|| ContextError::ContextNotRegistered(context_id.to_owned()))?;
+            let ctx_arc = self
+                .get_context_arc(context_id)
+                .map_err(|_| ContextError::ContextNotRegistered(context_id.to_owned()))?;
+            let mut guard = ctx_arc.lock().await;
+            let ctx = &mut *guard;
             require_active(&ctx.handle)?;
 
             // Gate: context must be in governance freeze state to resolve
@@ -4088,8 +4164,9 @@ impl ContextManager {
             actor_did,
         )?;
         {
-            let mut contexts = self.contexts.lock().await;
-            if let Some(ctx) = contexts.get_mut(context_id) {
+            if let Ok(ctx_arc) = self.get_context_arc(context_id) {
+                let mut guard = ctx_arc.lock().await;
+                let ctx = &mut *guard;
                 ctx.checkpoint_events_since += 1;
             }
         }
@@ -4116,10 +4193,11 @@ impl ContextManager {
         let context_id_bytes = context_id_to_bytes(context_id);
 
         let snapshot = {
-            let mut contexts = self.contexts.lock().await;
-            let ctx = contexts
-                .get_mut(context_id)
-                .ok_or_else(|| ContextError::ContextNotRegistered(context_id.to_owned()))?;
+            let ctx_arc = self
+                .get_context_arc(context_id)
+                .map_err(|_| ContextError::ContextNotRegistered(context_id.to_owned()))?;
+            let mut guard = ctx_arc.lock().await;
+            let ctx = &mut *guard;
             require_active(&ctx.handle)?;
 
             if !matches!(
@@ -4169,8 +4247,9 @@ impl ContextManager {
         self.event_log
             .append_context_event(&context_id_bytes, "ContextPromoted", actor_did)?;
         {
-            let mut contexts = self.contexts.lock().await;
-            if let Some(ctx) = contexts.get_mut(context_id) {
+            if let Ok(ctx_arc) = self.get_context_arc(context_id) {
+                let mut guard = ctx_arc.lock().await;
+                let ctx = &mut *guard;
                 ctx.checkpoint_events_since += 1;
             }
         }
@@ -4206,10 +4285,11 @@ impl ContextManager {
         let context_id_bytes = context_id_to_bytes(context_id);
 
         let (epoch_output, snapshot, bc_snapshot) = {
-            let mut contexts = self.contexts.lock().await;
-            let ctx = contexts
-                .get_mut(context_id)
-                .ok_or_else(|| ContextError::ContextNotRegistered(context_id.to_owned()))?;
+            let ctx_arc = self
+                .get_context_arc(context_id)
+                .map_err(|_| ContextError::ContextNotRegistered(context_id.to_owned()))?;
+            let mut guard = ctx_arc.lock().await;
+            let ctx = &mut *guard;
             require_active(&ctx.handle)?;
 
             let (epoch_out, bc_snap) = if let Some(ref mut bc) = ctx.broadcast_context {
@@ -4290,8 +4370,9 @@ impl ContextManager {
         self.event_log
             .append_context_event(&context_id_bytes, "ContentKeysRotated", actor_did)?;
         {
-            let mut contexts = self.contexts.lock().await;
-            if let Some(ctx) = contexts.get_mut(context_id) {
+            if let Ok(ctx_arc) = self.get_context_arc(context_id) {
+                let mut guard = ctx_arc.lock().await;
+                let ctx = &mut *guard;
                 ctx.checkpoint_events_since += 1;
             }
         }
@@ -4321,10 +4402,11 @@ impl ContextManager {
         let context_id_bytes = context_id_to_bytes(context_id);
 
         let snapshot = {
-            let mut contexts = self.contexts.lock().await;
-            let ctx = contexts
-                .get_mut(context_id)
-                .ok_or_else(|| ContextError::ContextNotRegistered(context_id.to_owned()))?;
+            let ctx_arc = self
+                .get_context_arc(context_id)
+                .map_err(|_| ContextError::ContextNotRegistered(context_id.to_owned()))?;
+            let mut guard = ctx_arc.lock().await;
+            let ctx = &mut *guard;
             require_active(&ctx.handle)?;
 
             // Save state for rollback — the loop below mutates ctx in-place,
@@ -4396,8 +4478,9 @@ impl ContextManager {
             actor_did,
         )?;
         {
-            let mut contexts = self.contexts.lock().await;
-            if let Some(ctx) = contexts.get_mut(context_id) {
+            if let Ok(ctx_arc) = self.get_context_arc(context_id) {
+                let mut guard = ctx_arc.lock().await;
+                let ctx = &mut *guard;
                 ctx.checkpoint_events_since += 1;
             }
         }
@@ -4435,10 +4518,11 @@ impl ContextManager {
         let context_id_bytes = context_id_to_bytes(context_id);
 
         let snapshot = {
-            let mut contexts = self.contexts.lock().await;
-            let ctx = contexts
-                .get_mut(context_id)
-                .ok_or_else(|| ContextError::ContextNotRegistered(context_id.to_owned()))?;
+            let ctx_arc = self
+                .get_context_arc(context_id)
+                .map_err(|_| ContextError::ContextNotRegistered(context_id.to_owned()))?;
+            let mut guard = ctx_arc.lock().await;
+            let ctx = &mut *guard;
             require_active(&ctx.handle)?;
 
             // Check if existing policy is locked.
@@ -4491,8 +4575,9 @@ impl ContextManager {
             actor_did,
         )?;
         {
-            let mut contexts = self.contexts.lock().await;
-            if let Some(ctx) = contexts.get_mut(context_id) {
+            if let Ok(ctx_arc) = self.get_context_arc(context_id) {
+                let mut guard = ctx_arc.lock().await;
+                let ctx = &mut *guard;
                 ctx.checkpoint_events_since += 1;
             }
         }
@@ -4517,10 +4602,11 @@ impl ContextManager {
         let context_id_bytes = context_id_to_bytes(context_id);
 
         let (applied, snapshot) = {
-            let mut contexts = self.contexts.lock().await;
-            let ctx = contexts
-                .get_mut(context_id)
-                .ok_or_else(|| ContextError::ContextNotRegistered(context_id.to_owned()))?;
+            let ctx_arc = self
+                .get_context_arc(context_id)
+                .map_err(|_| ContextError::ContextNotRegistered(context_id.to_owned()))?;
+            let mut guard = ctx_arc.lock().await;
+            let ctx = &mut *guard;
             require_active(&ctx.handle)?;
 
             let pending = match &ctx.governance.pending_economic_policy_change {
@@ -4547,8 +4633,9 @@ impl ContextManager {
             self.event_log
                 .append_context_event(&context_id_bytes, "EconomicPolicyApplied", "")?;
             {
-                let mut contexts = self.contexts.lock().await;
-                if let Some(ctx) = contexts.get_mut(context_id) {
+                if let Ok(ctx_arc) = self.get_context_arc(context_id) {
+                    let mut guard = ctx_arc.lock().await;
+                    let ctx = &mut *guard;
                     ctx.checkpoint_events_since += 1;
                 }
             }
@@ -4581,10 +4668,11 @@ impl ContextManager {
         let context_id_bytes = context_id_to_bytes(context_id);
 
         let snapshot = {
-            let mut contexts = self.contexts.lock().await;
-            let ctx = contexts
-                .get_mut(context_id)
-                .ok_or_else(|| ContextError::ContextNotRegistered(context_id.to_owned()))?;
+            let ctx_arc = self
+                .get_context_arc(context_id)
+                .map_err(|_| ContextError::ContextNotRegistered(context_id.to_owned()))?;
+            let mut guard = ctx_arc.lock().await;
+            let ctx = &mut *guard;
             require_active(&ctx.handle)?;
 
             // Verify the spender is a member of the context.
@@ -4633,10 +4721,11 @@ impl ContextManager {
         let context_id_bytes = context_id_to_bytes(context_id);
 
         let snapshot = {
-            let mut contexts = self.contexts.lock().await;
-            let ctx = contexts
-                .get_mut(context_id)
-                .ok_or_else(|| ContextError::ContextNotRegistered(context_id.to_owned()))?;
+            let ctx_arc = self
+                .get_context_arc(context_id)
+                .map_err(|_| ContextError::ContextNotRegistered(context_id.to_owned()))?;
+            let mut guard = ctx_arc.lock().await;
+            let ctx = &mut *guard;
             require_active(&ctx.handle)?;
 
             match &mut ctx.governance.economic_policy {
@@ -4671,8 +4760,9 @@ impl ContextManager {
             actor_did,
         )?;
         {
-            let mut contexts = self.contexts.lock().await;
-            if let Some(ctx) = contexts.get_mut(context_id) {
+            if let Ok(ctx_arc) = self.get_context_arc(context_id) {
+                let mut guard = ctx_arc.lock().await;
+                let ctx = &mut *guard;
                 ctx.checkpoint_events_since += 1;
             }
         }
@@ -4710,10 +4800,11 @@ impl ContextManager {
         })?;
 
         let snapshot = {
-            let mut contexts = self.contexts.lock().await;
-            let ctx = contexts
-                .get_mut(context_id)
-                .ok_or_else(|| ContextError::ContextNotRegistered(context_id.to_owned()))?;
+            let ctx_arc = self
+                .get_context_arc(context_id)
+                .map_err(|_| ContextError::ContextNotRegistered(context_id.to_owned()))?;
+            let mut guard = ctx_arc.lock().await;
+            let ctx = &mut *guard;
             require_active(&ctx.handle)?;
 
             // Preserve per-sender bucket state across the reconfigure
@@ -4758,8 +4849,9 @@ impl ContextManager {
             actor_did,
         )?;
         {
-            let mut contexts = self.contexts.lock().await;
-            if let Some(ctx) = contexts.get_mut(context_id) {
+            if let Ok(ctx_arc) = self.get_context_arc(context_id) {
+                let mut guard = ctx_arc.lock().await;
+                let ctx = &mut *guard;
                 ctx.checkpoint_events_since += 1;
             }
         }
@@ -4818,10 +4910,11 @@ impl ContextManager {
         // race where another task observes the source as Active between
         // destination creation and the state transition (F4).
         let (creator_did, snapshot, buffer_len_before_migration) = {
-            let mut contexts = self.contexts.lock().await;
-            let ctx = contexts
-                .get_mut(context_id)
-                .ok_or_else(|| ContextError::ContextNotRegistered(context_id.to_owned()))?;
+            let ctx_arc = self
+                .get_context_arc(context_id)
+                .map_err(|_| ContextError::ContextNotRegistered(context_id.to_owned()))?;
+            let mut guard = ctx_arc.lock().await;
+            let ctx = &mut *guard;
             require_active(&ctx.handle)?;
 
             // Check no migration is already in progress.
@@ -4898,8 +4991,9 @@ impl ContextManager {
             .await
         {
             // Roll back: revert source to Active and clear migration state.
-            let mut contexts = self.contexts.lock().await;
-            if let Some(ctx) = contexts.get_mut(context_id) {
+            if let Ok(ctx_arc) = self.get_context_arc(context_id) {
+                let mut guard = ctx_arc.lock().await;
+                let ctx = &mut *guard;
                 let _ = ctx.handle.transition_to(&ContextState::Active).await;
                 ctx.migration_state = None;
                 // Remove only the migration events we pushed, preserving
@@ -4920,8 +5014,9 @@ impl ContextManager {
             actor_did,
         )?;
         {
-            let mut contexts = self.contexts.lock().await;
-            if let Some(ctx) = contexts.get_mut(context_id) {
+            if let Ok(ctx_arc) = self.get_context_arc(context_id) {
+                let mut guard = ctx_arc.lock().await;
+                let ctx = &mut *guard;
                 ctx.checkpoint_events_since += 1;
             }
         }
@@ -4954,10 +5049,11 @@ impl ContextManager {
         // a race where migration_state is cleared but the state transition
         // back to Active fails (F4).
         let (original_proposal_id, snapshot) = {
-            let mut contexts = self.contexts.lock().await;
-            let ctx = contexts
-                .get_mut(context_id)
-                .ok_or_else(|| ContextError::ContextNotRegistered(context_id.to_owned()))?;
+            let ctx_arc = self
+                .get_context_arc(context_id)
+                .map_err(|_| ContextError::ContextNotRegistered(context_id.to_owned()))?;
+            let mut guard = ctx_arc.lock().await;
+            let ctx = &mut *guard;
 
             // Must be in MigratingOut state.
             let state = ctx
@@ -5012,8 +5108,9 @@ impl ContextManager {
             actor_did,
         )?;
         {
-            let mut contexts = self.contexts.lock().await;
-            if let Some(ctx) = contexts.get_mut(context_id) {
+            if let Ok(ctx_arc) = self.get_context_arc(context_id) {
+                let mut guard = ctx_arc.lock().await;
+                let ctx = &mut *guard;
                 ctx.checkpoint_events_since += 1;
             }
         }
@@ -5042,10 +5139,11 @@ impl ContextManager {
         // a race where migration_state is cleared but the transition to
         // Tombstoned fails.
         let (destination_id, migration_pid, snapshot) = {
-            let mut contexts = self.contexts.lock().await;
-            let ctx = contexts
-                .get_mut(context_id)
-                .ok_or_else(|| ContextError::ContextNotRegistered(context_id.to_owned()))?;
+            let ctx_arc = self
+                .get_context_arc(context_id)
+                .map_err(|_| ContextError::ContextNotRegistered(context_id.to_owned()))?;
+            let mut guard = ctx_arc.lock().await;
+            let ctx = &mut *guard;
 
             let state = ctx
                 .handle
@@ -5121,8 +5219,9 @@ impl ContextManager {
             "",
         )?;
         {
-            let mut contexts = self.contexts.lock().await;
-            if let Some(ctx) = contexts.get_mut(context_id) {
+            if let Ok(ctx_arc) = self.get_context_arc(context_id) {
+                let mut guard = ctx_arc.lock().await;
+                let ctx = &mut *guard;
                 ctx.checkpoint_events_since += 1;
             }
         }
@@ -5134,10 +5233,11 @@ impl ContextManager {
     /// Returns `None` if the context is not registered or not migrating.
     #[instrument(skip_all, fields(context_id))]
     pub async fn migration_state(&self, context_id: &str) -> Option<MigrationState> {
-        let contexts = self.contexts.lock().await;
-        contexts
-            .get(context_id)
-            .and_then(|ctx| ctx.migration_state.clone())
+        let ctx_arc = self.get_context_arc(context_id).ok()?;
+
+        let guard = ctx_arc.lock().await;
+        let ctx = &*guard;
+        ctx.migration_state.clone()
     }
 
     /// Translates governance events from timeout processing into
@@ -5225,7 +5325,7 @@ impl ContextManager {
     /// cancelled via [`GovernanceTimeoutTask::cancel()`].
     #[allow(clippy::too_many_lines)] // Five-phase task spawn closure; phases are factored into helper methods.
     pub(super) async fn start_governance_timeout_task(&self, context_id: &str) {
-        let contexts = Arc::clone(&self.contexts);
+        let contexts = self.contexts_arc();
         let clock = Arc::clone(&self.clock);
         let event_log = Arc::clone(&self.event_log);
         // PR #1606 C6: capture the transport so the commit retry phase can
@@ -5234,12 +5334,15 @@ impl ContextManager {
         let transport = Arc::clone(&self.transport);
         let ctx_id = context_id.to_owned();
 
-        let mut contexts_guard = self.contexts.lock().await;
-        let Some(ctx) = contexts_guard.get_mut(&ctx_id) else {
+        // Lock ordering: task_set before contexts (consistent with spawn_ttl_timer).
+        let mut task_set = self.task_set.lock().await;
+        let Ok(ctx_arc) = self.get_context_arc(&ctx_id) else {
             return;
         };
+        let mut guard = ctx_arc.lock().await;
+        let ctx = &mut *guard;
 
-        ctx.governance.timeout_task.start({
+        ctx.governance.timeout_task.start_in(&mut task_set, {
             let ctx_id = ctx_id.clone();
             let clock = Arc::clone(&clock);
             let event_log = Arc::clone(&event_log);
@@ -5256,19 +5359,27 @@ impl ContextManager {
                     // Phase 1: Acquire lock, snapshot data, process proposals,
                     // detect deadlock, release lock.
                     let (result, conditions, mls_epoch, recovery_in_progress) = {
-                        let mut contexts_guard = contexts.lock().await;
-                        let Some(ctx) = contexts_guard.get_mut(&ctx_id) else {
+                        let Some(ctx_entry) = contexts.get(&ctx_id) else {
                             return false; // Context removed — stop the loop.
                         };
+                        let ctx_arc = Arc::clone(ctx_entry.value());
+                        drop(ctx_entry);
+                        let mut guard = ctx_arc.lock().await;
+                        let ctx = &mut *guard;
 
-                        // Use blocking async read — `try_read_state()` returns
-                        // `None` on transient write-contention which would
-                        // permanently stop this task.
+                        // Use try_read_state() to avoid deadlock: the per-context
+                        // Mutex is already held, and handle.state().await would
+                        // await on the ContextHandle RwLock, deadlocking against
+                        // any task holding the RwLock write and waiting for this
+                        // Mutex.
+                        let current_state = ctx.handle.try_read_state();
                         if !matches!(
-                            ctx.handle.state().await,
-                            scp_protocol::context::ContextState::Active
+                            current_state,
+                            Some(scp_protocol::context::ContextState::Active)
                         ) {
-                            return false; // No longer active — stop the loop.
+                            // None = write-contended, try again next tick.
+                            // Not Active = context closing, stop the loop.
+                            return current_state.is_none(); // true = continue, false = stop
                         }
 
                         let gov_ctx = Self::build_governance_context(ctx, &*clock);
@@ -5339,19 +5450,20 @@ impl ContextManager {
                     let needs_write = !ctx_events.is_empty()
                         || (conditions.is_empty() && recovery_in_progress)
                         || (!conditions.is_empty() && !recovery_in_progress);
-                    if needs_write {
-                        let mut contexts_guard = contexts.lock().await;
-                        if let Some(ctx) = contexts_guard.get_mut(&ctx_id) {
-                            for ctx_event in ctx_events {
-                                ctx.receive_buffer.push(ctx_event);
-                            }
-                            // Reset recovery_in_progress when deadlock conditions
-                            // clear so future deadlocks can be detected.
-                            if conditions.is_empty() && recovery_in_progress {
-                                ctx.governance.deadlock.recovery_in_progress = false;
-                            } else if !conditions.is_empty() && !recovery_in_progress {
-                                ctx.governance.deadlock.recovery_in_progress = true;
-                            }
+                    if needs_write && let Some(ctx_entry) = contexts.get(&ctx_id) {
+                        let ctx_arc = Arc::clone(ctx_entry.value());
+                        drop(ctx_entry);
+                        let mut guard = ctx_arc.lock().await;
+                        let ctx = &mut *guard;
+                        for ctx_event in ctx_events {
+                            ctx.receive_buffer.push(ctx_event);
+                        }
+                        // Reset recovery_in_progress when deadlock conditions
+                        // clear so future deadlocks can be detected.
+                        if conditions.is_empty() && recovery_in_progress {
+                            ctx.governance.deadlock.recovery_in_progress = false;
+                        } else if !conditions.is_empty() && !recovery_in_progress {
+                            ctx.governance.deadlock.recovery_in_progress = true;
                         }
                     }
 
@@ -5393,7 +5505,7 @@ impl ContextManager {
     /// fire even when no user action occurs. Evaluates all members on every
     /// tick. Early return when no rules are configured (the common case).
     async fn evaluate_periodic_consequences(
-        contexts: &Arc<super::Mutex<super::HashMap<String, PerContextState>>>,
+        contexts: &Arc<super::DashMap<String, Arc<super::Mutex<PerContextState>>>>,
         ctx_id: &str,
         clock: &dyn Clock,
         event_log: &dyn super::super::builder::ContextEventLogProvider,
@@ -5403,10 +5515,13 @@ impl ContextManager {
         // the entire evaluation duration (which includes event log I/O).
         let now = clock.now_secs();
         let (rules, member_dids, events) = {
-            let contexts_guard = contexts.lock().await;
-            let Some(ctx) = contexts_guard.get(ctx_id) else {
+            let Some(ctx_entry) = contexts.get(ctx_id) else {
                 return;
             };
+            let ctx_arc = Arc::clone(ctx_entry.value());
+            drop(ctx_entry);
+            let guard = ctx_arc.lock().await;
+            let ctx = &*guard;
             let rules = ctx.governance.consequence_rules.clone();
             if rules.is_empty() {
                 return;
@@ -5427,10 +5542,14 @@ impl ContextManager {
             return;
         }
         // Reacquire lock for enforcement.
-        let mut contexts_guard = contexts.lock().await;
-        let Some(ctx) = contexts_guard.get_mut(ctx_id) else {
+        let Some(ctx_entry) = contexts.get(ctx_id) else {
             return;
         };
+        let ctx_arc = Arc::clone(ctx_entry.value());
+        drop(ctx_entry);
+        let mut guard = ctx_arc.lock().await;
+        let ctx = &mut *guard;
+        let ctx = &mut *ctx;
         for (member_did, triggered) in &results {
             enforce_triggered_consequences(
                 ctx,
@@ -5736,8 +5855,9 @@ impl ContextManager {
                     actor_did,
                 )?;
                 {
-                    let mut contexts = self.contexts.lock().await;
-                    if let Some(ctx) = contexts.get_mut(context_id) {
+                    if let Ok(ctx_arc) = self.get_context_arc(context_id) {
+                        let mut guard = ctx_arc.lock().await;
+                        let ctx = &mut *guard;
                         ctx.checkpoint_events_since += 1;
                     }
                 }
@@ -5759,10 +5879,11 @@ impl ContextManager {
                 let label = operation.label();
                 let context_id_bytes = context_id_to_bytes(context_id);
                 {
-                    let mut contexts = self.contexts.lock().await;
-                    let ctx = contexts
-                        .get_mut(context_id)
-                        .ok_or_else(|| ContextError::ContextNotRegistered(context_id.to_owned()))?;
+                    let ctx_arc = self
+                        .get_context_arc(context_id)
+                        .map_err(|_| ContextError::ContextNotRegistered(context_id.to_owned()))?;
+                    let mut guard = ctx_arc.lock().await;
+                    let ctx = &mut *guard;
                     // N2: Cap the pending commits queue to prevent unbounded
                     // memory growth during sustained transport outages.
                     if ctx.pending_commits.len() >= MAX_PENDING_COMMITS {
@@ -5796,8 +5917,9 @@ impl ContextManager {
                     actor_did,
                 )?;
                 {
-                    let mut contexts = self.contexts.lock().await;
-                    if let Some(ctx) = contexts.get_mut(context_id) {
+                    if let Ok(ctx_arc) = self.get_context_arc(context_id) {
+                        let mut guard = ctx_arc.lock().await;
+                        let ctx = &mut *guard;
                         ctx.checkpoint_events_since += 1;
                     }
                 }
@@ -5821,8 +5943,9 @@ impl ContextManager {
     /// because it does not own the manager.
     #[allow(dead_code)] // Used by tests; production path uses the static helper.
     pub(super) async fn process_pending_commits(&self, context_id: &str) {
+        let contexts = self.contexts_arc();
         Self::process_pending_commits_static(
-            &self.contexts,
+            &contexts,
             context_id,
             Arc::clone(&self.transport),
             Arc::clone(&self.event_log),
@@ -5847,7 +5970,7 @@ impl ContextManager {
     /// All transport sends happen with the contexts lock RELEASED to
     /// avoid holding the lock across I/O.
     pub(super) async fn process_pending_commits_static(
-        contexts: &Arc<super::Mutex<super::HashMap<String, PerContextState>>>,
+        contexts: &Arc<super::DashMap<String, Arc<super::Mutex<PerContextState>>>>,
         context_id: &str,
         transport: Arc<dyn super::ContextTransportProvider>,
         event_log: Arc<dyn super::ContextEventLogProvider>,
@@ -5855,10 +5978,13 @@ impl ContextManager {
     ) {
         // Snapshot the queue under lock.
         let snapshot: Vec<PendingCommit> = {
-            let contexts_guard = contexts.lock().await;
-            let Some(ctx) = contexts_guard.get(context_id) else {
+            let Some(ctx_entry) = contexts.get(context_id) else {
                 return;
             };
+            let ctx_arc = Arc::clone(ctx_entry.value());
+            drop(ctx_entry);
+            let guard = ctx_arc.lock().await;
+            let ctx = &*guard;
             // If a fault marker is already set, do not retry — the queue
             // is frozen until an operator acknowledges.
             if ctx.commit_fault.is_some() {
@@ -5892,11 +6018,14 @@ impl ContextManager {
             }
             retry_event_count += 1;
         }
-        if retry_event_count > 0 {
-            let mut ctxs = contexts.lock().await;
-            if let Some(ctx) = ctxs.get_mut(context_id) {
-                ctx.checkpoint_events_since += retry_event_count;
-            }
+        if retry_event_count > 0
+            && let Some(ctx_entry) = contexts.get(context_id)
+        {
+            let ctx_arc = Arc::clone(ctx_entry.value());
+            drop(ctx_entry);
+            let mut guard = ctx_arc.lock().await;
+            let ctx = &mut *guard;
+            ctx.checkpoint_events_since += retry_event_count;
         }
     }
 
@@ -5973,16 +6102,19 @@ impl ContextManager {
     /// buffer events and returns the labels that should be appended to
     /// the durable event log.
     async fn apply_commit_retry_outcomes(
-        contexts: &Arc<super::Mutex<super::HashMap<String, PerContextState>>>,
+        contexts: &Arc<super::DashMap<String, Arc<super::Mutex<PerContextState>>>>,
         context_id: &str,
         outcomes: Vec<CommitRetryOutcome>,
         clock: &dyn Clock,
     ) -> Vec<&'static str> {
         let mut event_log_writes: Vec<&'static str> = Vec::new();
-        let mut contexts_guard = contexts.lock().await;
-        let Some(ctx) = contexts_guard.get_mut(context_id) else {
+        let Some(ctx_entry) = contexts.get(context_id) else {
             return event_log_writes;
         };
+        let ctx_arc = Arc::clone(ctx_entry.value());
+        drop(ctx_entry);
+        let mut guard = ctx_arc.lock().await;
+        let ctx = &mut *guard;
         let queue_len = ctx.pending_commits.len();
         // Apply outcomes by their snapshot index. The queue is only mutated
         // by this task (success/failed removals) and by new enqueue calls
@@ -6077,10 +6209,11 @@ impl ContextManager {
         &self,
         context_id: &str,
     ) -> Result<CommitFaultMarker, ContextError> {
-        let mut contexts = self.contexts.lock().await;
-        let ctx = contexts
-            .get_mut(context_id)
-            .ok_or_else(|| ContextError::ContextNotRegistered(context_id.to_owned()))?;
+        let ctx_arc = self
+            .get_context_arc(context_id)
+            .map_err(|_| ContextError::ContextNotRegistered(context_id.to_owned()))?;
+        let mut guard = ctx_arc.lock().await;
+        let ctx = &mut *guard;
         let marker = ctx.commit_fault.take().ok_or_else(|| {
             ContextError::InvalidState(format!(
                 "context {context_id} has no commit fault to acknowledge"

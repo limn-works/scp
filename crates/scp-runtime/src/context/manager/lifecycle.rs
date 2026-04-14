@@ -485,6 +485,14 @@ impl ContextManager {
         }
 
         let per_context = PerContextState {
+            generation: if ctx_snapshot.generation == 0 {
+                // Legacy snapshot without generation — assign a fresh one so
+                // the restored context participates in confused-deputy detection.
+                self.next_generation
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            } else {
+                ctx_snapshot.generation
+            },
             handle: handle.clone(),
             membership: ctx_snapshot.membership,
             governance: GovernanceState {
@@ -582,15 +590,10 @@ impl ContextManager {
             merkle_tree: scp_event_log::EventLog::new(context_id.to_owned()),
         };
 
-        {
-            let mut contexts = self.contexts.lock().await;
-            if contexts.contains_key(context_id) {
-                return Err(ContextError::MembershipFailed(format!(
-                    "context '{context_id}' already registered"
-                )));
-            }
-            contexts.insert(context_id.to_owned(), per_context);
-        }
+        // Atomic check-and-insert — eliminates TOCTOU race between
+        // contains_key and insert.
+        self.insert_context(context_id.to_owned(), per_context)
+            .map_err(|e| ContextError::MembershipFailed(e.to_string()))?;
 
         // Start governance timeout task (ADR-031 §5).
         self.start_governance_timeout_task(context_id).await;
@@ -646,11 +649,11 @@ impl ContextManager {
     /// reconnection.
     #[instrument(skip_all, fields(context_id))]
     pub async fn context_needs_reconnect(&self, context_id: &str) -> bool {
-        self.contexts
-            .lock()
-            .await
-            .get(context_id)
-            .is_some_and(|ctx| ctx.epoch.needs_reconnect)
+        let Ok(arc) = self.get_context_arc(context_id) else {
+            return false;
+        };
+        let ctx = arc.lock().await;
+        ctx.epoch.needs_reconnect
     }
 
     /// Clears the `needs_reconnect` flag for a context after the
@@ -664,7 +667,9 @@ impl ContextManager {
     /// is not registered.
     #[instrument(skip_all, fields(context_id))]
     pub async fn clear_needs_reconnect(&self, context_id: &str) -> bool {
-        if let Some(ctx) = self.contexts.lock().await.get_mut(context_id) {
+        if let Ok(ctx_arc) = self.get_context_arc(context_id) {
+            let mut guard = ctx_arc.lock().await;
+            let ctx = &mut *guard;
             ctx.epoch.needs_reconnect = false;
             true
         } else {
@@ -682,13 +687,18 @@ impl ContextManager {
     /// [`execute_reconnection`](Self::execute_reconnection).
     #[instrument(skip_all)]
     pub async fn contexts_needing_reconnect(&self) -> Vec<String> {
-        self.contexts
-            .lock()
-            .await
-            .iter()
-            .filter(|(_, ctx)| ctx.epoch.needs_reconnect)
-            .map(|(id, _)| id.clone())
-            .collect()
+        // Collect (key, Arc) pairs first to release DashMap shard locks before
+        // awaiting per-context Mutexes. Holding a DashMap Ref across .await
+        // would deadlock any concurrent shard access.
+        let entries = self.collect_context_arcs();
+        let mut result = Vec::new();
+        for (context_id, arc) in entries {
+            let ctx = arc.lock().await;
+            if ctx.epoch.needs_reconnect {
+                result.push(context_id);
+            }
+        }
+        result
     }
 
     /// Builds a [`ReconnectionCoordinator`](crate::sync::hours_offline::ReconnectionCoordinator)
@@ -886,12 +896,13 @@ impl ContextManager {
         let ctx_id_bytes = scp_protocol::context::context_id_bytes(context_id);
 
         let snapshot = {
-            let contexts = self.contexts.lock().await;
-            let ctx = contexts.get(context_id).ok_or_else(|| {
+            let ctx_arc = self.get_context_arc(context_id).map_err(|_| {
                 ContextError::MembershipFailed(format!(
                     "context '{context_id}' not found — cannot export"
                 ))
             })?;
+            let guard = ctx_arc.lock().await;
+            let ctx = &*guard;
             Self::snapshot_context(ctx)
         };
 
@@ -988,8 +999,8 @@ impl ContextManager {
         //    event log import at step 3 would overwrite the Active context's
         //    Merkle chain before we discover the conflict.
         {
-            let contexts = self.contexts.lock().await;
-            if let Some(existing) = contexts.get(&context_id) {
+            if let Ok(ctx_arc) = self.get_context_arc(&context_id) {
+                let existing = ctx_arc.lock().await;
                 let is_replaceable = existing.handle.try_read_state().is_some_and(|s| {
                     matches!(
                         s,
@@ -1165,6 +1176,9 @@ impl ContextManager {
         );
 
         let per_context = PerContextState {
+            generation: self
+                .next_generation
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed),
             handle: handle.clone(),
             membership: export.snapshot.membership,
             role_state: export.snapshot.role_state,
@@ -1299,8 +1313,8 @@ impl ContextManager {
         //    this insertion. A concurrent `create_context` or `import_context`
         //    could have registered an Active context in the meantime.
         {
-            let mut contexts = self.contexts.lock().await;
-            if let Some(existing) = contexts.get(&context_id) {
+            if let Ok(ctx_arc) = self.get_context_arc(&context_id) {
+                let existing = ctx_arc.lock().await;
                 let is_replaceable = existing.handle.try_read_state().is_some_and(|s| {
                     matches!(
                         s,
@@ -1316,23 +1330,24 @@ impl ContextManager {
                     )));
                 }
             }
-            contexts.remove(&context_id);
-            contexts.insert(context_id.clone(), per_context);
+            self.remove_context(&context_id);
+            self.insert_context(context_id.clone(), per_context)
+                .map_err(|e| ContextError::MembershipFailed(e.to_string()))?;
         }
 
-        self.update_context_gauges().await;
+        self.update_context_gauges();
 
         // Start governance timeout task (ADR-031 §5).
         self.start_governance_timeout_task(&context_id).await;
 
         // 8. Persist if persistence is configured.
-        if self.has_persistence() {
-            let contexts = self.contexts.lock().await;
-            if let Some(ctx) = contexts.get(&context_id) {
-                let snap = Self::snapshot_context(ctx);
-                drop(contexts);
-                self.persist_context_snapshot(&context_id, snap);
-            }
+        if self.has_persistence()
+            && let Ok(ctx_arc) = self.get_context_arc(&context_id)
+        {
+            let guard = ctx_arc.lock().await;
+            let ctx = &*guard;
+            let snap = Self::snapshot_context(ctx);
+            self.persist_context_snapshot(&context_id, snap);
         }
 
         // 9. Re-spawn TTL timer if there was remaining TTL.
@@ -1419,6 +1434,9 @@ impl ContextManager {
             Self::generate_initial_access_key_store(&context_id, &creator_did);
         let initial_members: HashSet<DID> = membership.members().map(|m| m.did.clone()).collect();
         let per_context = PerContextState {
+            generation: self
+                .next_generation
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed),
             handle: handle.clone(),
             membership,
             governance: GovernanceState {
@@ -1487,15 +1505,9 @@ impl ContextManager {
             merkle_tree: scp_event_log::EventLog::new(context_id.clone()),
         };
 
-        {
-            let mut contexts = self.contexts.lock().await;
-            if contexts.contains_key(&context_id) {
-                return Err(ContextCreationError::CreationFailed(format!(
-                    "context '{context_id}' already registered"
-                )));
-            }
-            contexts.insert(context_id.clone(), per_context);
-        }
+        // Atomic check-and-insert — eliminates TOCTOU race between
+        // contains_key and insert.
+        self.insert_context(context_id.clone(), per_context)?;
         self.finalize_create(&context_id, params.ttl, &handle).await;
         Ok(handle)
     }
@@ -1507,7 +1519,7 @@ impl ContextManager {
         ttl: Option<std::time::Duration>,
         handle: &ContextHandle,
     ) {
-        self.update_context_gauges().await;
+        self.update_context_gauges();
         self.start_governance_timeout_task(context_id).await;
         self.persist_context_and_broadcast(context_id).await;
         if let Some(ttl_duration) = ttl {
@@ -1531,11 +1543,16 @@ impl ContextManager {
     /// was set by a different SDK version or received via sync.
     #[cfg(test)]
     pub(crate) async fn replace_stored_params(&self, context_id: &str, new_params: ContextParams) {
-        let mut contexts = self.contexts.lock().await;
-        if let Some(ctx) = contexts.get_mut(context_id) {
+        if let Ok(ctx_arc) = self.get_context_arc(context_id) {
+            let mut guard = ctx_arc.lock().await;
+            let ctx = &mut *guard;
             let new_handle = ContextHandle::new(context_id.to_owned(), new_params);
-            // Preserve the current state.
-            let current_state = ctx.handle.state().await;
+            // Preserve the current state. Use try_read_state() to avoid
+            // deadlock: the per-context Mutex is already held, and
+            // handle.state().await would await on the ContextHandle RwLock.
+            // Fallback to Active if the read is contended (test-only method,
+            // contention is unlikely).
+            let current_state = ctx.handle.try_read_state().unwrap_or(ContextState::Active);
             let _ = new_handle.transition_to(&current_state).await;
             ctx.handle = new_handle;
         }
@@ -1664,16 +1681,9 @@ impl ContextManager {
             governance_config,
         )?;
 
-        // Atomic duplicate check + insert under lock.
-        {
-            let mut contexts = self.contexts.lock().await;
-            if contexts.contains_key(&context_id) {
-                return Err(ContextCreationError::CreationFailed(format!(
-                    "context '{context_id}' already registered"
-                )));
-            }
-            contexts.insert(context_id.clone(), per_context);
-        }
+        // Atomic check-and-insert — eliminates TOCTOU race between
+        // contains_key and insert.
+        self.insert_context(context_id.clone(), per_context)?;
 
         self.start_governance_timeout_task(&context_id).await;
         self.persist_context_and_broadcast(&context_id).await;
@@ -1743,6 +1753,9 @@ impl ContextManager {
         }
 
         Ok(PerContextState {
+            generation: self
+                .next_generation
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed),
             handle,
             membership,
             role_state,
@@ -1855,10 +1868,11 @@ impl ContextManager {
         // so this check is authoritative even when the caller passes an
         // ephemeral handle with default params (e.g. UniFFI bridge).
         {
-            let contexts = self.contexts.lock().await;
-            let ctx = contexts
-                .get(&context_id)
-                .ok_or_else(|| ContextError::ContextNotRegistered(context_id.clone()))?;
+            let ctx_arc = self
+                .get_context_arc(&context_id)
+                .map_err(|_| ContextError::ContextNotRegistered(context_id.clone()))?;
+            let guard = ctx_arc.lock().await;
+            let ctx = &*guard;
             ctx.handle
                 .params()
                 .check_version_compatibility(scp_protocol::envelope::SCP_PROTOCOL_VERSION)?;
@@ -1871,11 +1885,13 @@ impl ContextManager {
         // Phase 1: Economy enforcement + sybil check under lock (budget deduction).
         // This happens BEFORE any crypto mutations so that a rejected payment
         // never grants MLS group access or sender keys.
-        let ticket = {
-            let mut contexts = self.contexts.lock().await;
-            let ctx = contexts
-                .get_mut(&context_id)
-                .ok_or_else(|| ContextError::ContextNotRegistered(context_id.clone()))?;
+        // Capture generation for confused-deputy detection on rollback reacquire.
+        let (ticket, ctx_gen) = {
+            let (mut guard, ctx_gen) = self
+                .lock_context(&context_id)
+                .await
+                .map_err(|_| ContextError::ContextNotRegistered(context_id.clone()))?;
+            let ctx = &mut *guard;
 
             // State check inside lock -- eliminates TOCTOU race.
             require_active(&ctx.handle)?;
@@ -1942,13 +1958,16 @@ impl ContextManager {
             // downstream error path (adapter, MLS, sender-key) is forced
             // to roll back velocity + hard_rate_limit + budget, not just
             // the budget.
-            super::economy::EconomyTicket {
-                actor_did: member_did.clone(),
-                deducted_cost,
-                velocity_token,
-                needs_hard_rate_limit_refund: true,
-                consumed: false,
-            }
+            (
+                super::economy::EconomyTicket {
+                    actor_did: member_did.clone(),
+                    deducted_cost,
+                    velocity_token,
+                    needs_hard_rate_limit_refund: true,
+                    consumed: false,
+                },
+                ctx_gen,
+            )
         };
 
         // Phase 2: Authorize payment (escrow hold) BEFORE any crypto mutation.
@@ -1963,7 +1982,7 @@ impl ContextManager {
         {
             Ok(auth) => auth,
             Err(payment_err) => {
-                super::economy::rollback_economy_ticket(self, &context_id, ticket).await;
+                super::economy::rollback_economy_ticket(self, &context_id, ticket, &ctx_gen).await;
                 return Err(payment_err);
             }
         };
@@ -1980,7 +1999,7 @@ impl ContextManager {
                 if let Some(a) = auth {
                     self.void_paid_action(a, &context_id).await;
                 }
-                super::economy::rollback_economy_ticket(self, &context_id, ticket).await;
+                super::economy::rollback_economy_ticket(self, &context_id, ticket, &ctx_gen).await;
                 return Err(e);
             }
         };
@@ -1997,7 +2016,7 @@ impl ContextManager {
             if let Some(a) = auth {
                 self.void_paid_action(a, &context_id).await;
             }
-            super::economy::rollback_economy_ticket(self, &context_id, ticket).await;
+            super::economy::rollback_economy_ticket(self, &context_id, ticket, &ctx_gen).await;
             return Err(e);
         }
 
@@ -2039,7 +2058,7 @@ impl ContextManager {
             if let Some(a) = auth {
                 self.void_paid_action(a, &context_id).await;
             }
-            super::economy::rollback_economy_ticket(self, &context_id, ticket).await;
+            super::economy::rollback_economy_ticket(self, &context_id, ticket, &ctx_gen).await;
             return Err(e);
         }
 
@@ -2056,7 +2075,7 @@ impl ContextManager {
             if let Some(a) = auth {
                 self.void_paid_action(a, &context_id).await;
             }
-            super::economy::rollback_economy_ticket(self, &context_id, ticket).await;
+            super::economy::rollback_economy_ticket(self, &context_id, ticket, &ctx_gen).await;
             return Err(e);
         }
 
@@ -2075,19 +2094,20 @@ impl ContextManager {
             member_did.as_ref(),
         )?;
         {
-            let mut contexts = self.contexts.lock().await;
-            if let Some(ctx) = contexts.get_mut(&context_id) {
+            if let Ok(ctx_arc) = self.get_context_arc(&context_id) {
+                let mut guard = ctx_arc.lock().await;
+                let ctx = &mut *guard;
                 ctx.checkpoint_events_since += 1;
             }
         }
         // Persist context state after join (best-effort).
-        if self.has_persistence() {
-            let contexts = self.contexts.lock().await;
-            if let Some(ctx) = contexts.get(&context_id) {
-                let snapshot = Self::snapshot_context(ctx);
-                drop(contexts);
-                self.persist_context_snapshot(&context_id, snapshot);
-            }
+        if self.has_persistence()
+            && let Ok(ctx_arc) = self.get_context_arc(&context_id)
+        {
+            let guard = ctx_arc.lock().await;
+            let ctx = &*guard;
+            let snapshot = Self::snapshot_context(ctx);
+            self.persist_context_snapshot(&context_id, snapshot);
         }
 
         Ok(())
@@ -2105,10 +2125,11 @@ impl ContextManager {
         member_did: &DID,
         add_output: scp_protocol::context::builder::AddMemberOutput,
     ) -> Result<(), ContextError> {
-        let mut contexts = self.contexts.lock().await;
-        let ctx = contexts
-            .get_mut(context_id)
-            .ok_or_else(|| ContextError::ContextNotRegistered(context_id.to_owned()))?;
+        let ctx_arc = self
+            .get_context_arc(context_id)
+            .map_err(|_| ContextError::ContextNotRegistered(context_id.to_owned()))?;
+        let mut guard = ctx_arc.lock().await;
+        let ctx = &mut *guard;
 
         require_active(&ctx.handle)?;
 
@@ -2239,11 +2260,11 @@ impl ContextManager {
         // PR #1606 C6: also check the commit fault marker so a fail-closed
         // context refuses further leave operations until an operator
         // acknowledges the fault.
-        let is_broadcast = {
-            let contexts = self.contexts.lock().await;
-            let ctx = contexts
-                .get(&context_id)
-                .ok_or_else(|| ContextError::ContextNotRegistered(context_id.clone()))?;
+        // Use lock_context to capture a generation token for confused-deputy
+        // detection in subsequent lock scopes (Phase B).
+        let (is_broadcast, ctx_gen) = {
+            let (guard, generation) = self.lock_context(&context_id).await?;
+            let ctx = &*guard;
             // Authorization: self-removal always allowed; otherwise MemberRemove required.
             if caller_did != member_did
                 && !ctx
@@ -2255,7 +2276,7 @@ impl ContextManager {
                 ));
             }
             Self::check_commit_fault(ctx)?;
-            ctx.broadcast_context.is_some()
+            (ctx.broadcast_context.is_some(), generation)
         };
 
         // Crypto operations -- no lock held. Skip for broadcast mode (no MLS).
@@ -2312,11 +2333,10 @@ impl ContextManager {
         }
 
         // Atomic state check + membership removal + count check within single lock.
+        // Use relock_context for generation verification (Phase B).
         let should_close = {
-            let mut contexts = self.contexts.lock().await;
-            let ctx = contexts
-                .get_mut(&context_id)
-                .ok_or_else(|| ContextError::ContextNotRegistered(context_id.clone()))?;
+            let mut guard = self.relock_context(&ctx_gen).await?;
+            let ctx = &mut *guard;
 
             // State check inside lock -- eliminates TOCTOU race.
             require_active(&ctx.handle)?;
@@ -2364,20 +2384,23 @@ impl ContextManager {
             "MemberLeft",
             member_did.as_ref(),
         )?;
-        {
-            let mut contexts = self.contexts.lock().await;
-            if let Some(ctx) = contexts.get_mut(&context_id) {
-                ctx.checkpoint_events_since += 1;
-            }
+        // Use relock_context for generation verification (Phase B).
+        if let Ok(mut guard) = self.relock_context(&ctx_gen).await {
+            let ctx = &mut *guard;
+            ctx.checkpoint_events_since += 1;
+        } else {
+            tracing::warn!(
+                context_id = %context_id,
+                "leave_context: generation mismatch — checkpoint counter not incremented"
+            );
         }
         // Persist context state after leave (best-effort).
-        if self.has_persistence() {
-            let contexts = self.contexts.lock().await;
-            if let Some(ctx) = contexts.get(&context_id) {
-                let snapshot = Self::snapshot_context(ctx);
-                drop(contexts);
-                self.persist_context_snapshot(&context_id, snapshot);
-            }
+        if self.has_persistence()
+            && let Ok(guard) = self.relock_context(&ctx_gen).await
+        {
+            let ctx = &*guard;
+            let snapshot = Self::snapshot_context(ctx);
+            self.persist_context_snapshot(&context_id, snapshot);
         }
 
         // If member count reaches zero, transition to Closing.

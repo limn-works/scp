@@ -9,8 +9,8 @@ use scp_protocol::envelope::validation::{BufferedMessage, SequenceCheck, Timesta
 use scp_protocol::identity::SigningKeyId;
 
 use super::{
-    Capability, ContextError, ContextEvent, ContextHandle, ContextManager, DID, PerContextState,
-    context_id_to_bytes, evaluate_consequence_rules, instrument, require_active,
+    Capability, ContextError, ContextEvent, ContextGeneration, ContextHandle, ContextManager, DID,
+    PerContextState, context_id_to_bytes, evaluate_consequence_rules, instrument, require_active,
 };
 
 /// Enforces economic policy for message sends (#1537, #1593).
@@ -320,11 +320,12 @@ impl ContextManager {
         let context_id = handle.context_id().to_owned();
         let context_id_bytes = context_id_to_bytes(&context_id);
         let routing_id = scp_protocol::context::context_routing_id(&context_id);
-        let (broadcast_envelope, recipients_data, sequence, is_broadcast, ticket) = {
-            let mut contexts = self.contexts.lock().await;
-            let ctx = contexts
-                .get_mut(&context_id)
-                .ok_or_else(|| ContextError::ContextNotRegistered(context_id.clone()))?;
+        let (broadcast_envelope, recipients_data, sequence, is_broadcast, ticket, ctx_gen) = {
+            let (mut guard, ctx_gen) = self
+                .lock_context(&context_id)
+                .await
+                .map_err(|_| ContextError::ContextNotRegistered(context_id.clone()))?;
+            let ctx = &mut *guard;
             require_active(&ctx.handle)?;
             // N3: Fail-close on commit fault — if a prior governance
             // mutation's MLS Commit failed to broadcast and exhausted
@@ -414,8 +415,8 @@ impl ContextManager {
             if let Some(ref mut bc) = ctx.broadcast_context {
                 let Some(sk) = signing_key else {
                     // Phase 1 failed after ticket creation — drain it.
-                    drop(contexts);
-                    super::economy::rollback_economy_ticket(self, &context_id, ticket).await;
+                    // Use inline variant: we already hold the per-context lock.
+                    super::economy::rollback_economy_ticket_inline(ctx, ticket);
                     return Err(ContextError::CryptoFailed(
                         "signing key required for broadcast publish".into(),
                     ));
@@ -429,18 +430,25 @@ impl ContextManager {
                 ) {
                     Ok(env) => env,
                     Err(e) => {
-                        drop(contexts);
-                        super::economy::rollback_economy_ticket(self, &context_id, ticket).await;
+                        // Use inline variant: we already hold the per-context lock.
+                        super::economy::rollback_economy_ticket_inline(ctx, ticket);
                         return Err(e);
                     }
                 };
-                (Some(env), std::collections::HashMap::new(), 0, true, ticket)
+                (
+                    Some(env),
+                    std::collections::HashMap::new(),
+                    0,
+                    true,
+                    ticket,
+                    ctx_gen,
+                )
             } else {
                 // Capability already checked above (H7: before budget deduction).
                 // Assign sequence under lock — SequenceTracker rejects duplicates.
                 let Some(seq) = ctx.membership.next_sequence_number(sender_did) else {
-                    drop(contexts);
-                    super::economy::rollback_economy_ticket(self, &context_id, ticket).await;
+                    // Use inline variant: we already hold the per-context lock.
+                    super::economy::rollback_economy_ticket_inline(ctx, ticket);
                     return Err(ContextError::MemberNotFound(format!(
                         "cannot assign sequence: {sender_did} is not a member"
                     )));
@@ -451,6 +459,7 @@ impl ContextManager {
                     seq,
                     false,
                     ticket,
+                    ctx_gen,
                 )
             }
         };
@@ -462,11 +471,17 @@ impl ContextManager {
                 // Authorization failure — roll back the ticket. The sequence
                 // number rollback is also needed because Phase 1 already
                 // incremented it for non-broadcast.
-                super::economy::rollback_economy_ticket(self, &context_id, ticket).await;
+                super::economy::rollback_economy_ticket(self, &context_id, ticket, &ctx_gen).await;
                 if !is_broadcast {
-                    let mut contexts = self.contexts.lock().await;
-                    if let Some(ctx) = contexts.get_mut(&context_id) {
+                    if let Ok(mut guard) = self.relock_context(&ctx_gen).await {
+                        let ctx = &mut *guard;
                         ctx.membership.rollback_sequence_number(sender_did);
+                    } else {
+                        tracing::warn!(
+                            context_id = %context_id,
+                            "send_message: generation mismatch on payment auth rollback — \
+                             sequence number rollback skipped"
+                        );
                     }
                 }
                 return Err(e);
@@ -493,11 +508,17 @@ impl ContextManager {
             if let Some(a) = auth {
                 self.void_paid_action(a, &context_id).await;
             }
-            super::economy::rollback_economy_ticket(self, &context_id, ticket).await;
+            super::economy::rollback_economy_ticket(self, &context_id, ticket, &ctx_gen).await;
             if !is_broadcast {
-                let mut contexts = self.contexts.lock().await;
-                if let Some(ctx) = contexts.get_mut(&context_id) {
+                if let Ok(mut guard) = self.relock_context(&ctx_gen).await {
+                    let ctx = &mut *guard;
                     ctx.membership.rollback_sequence_number(sender_did);
+                } else {
+                    tracing::warn!(
+                        context_id = %context_id,
+                        "send_message: generation mismatch on send failure rollback — \
+                         sequence number rollback skipped"
+                    );
                 }
             }
             return Err(e);
@@ -517,6 +538,7 @@ impl ContextManager {
             sequence,
             payload,
             signing_key,
+            &ctx_gen,
         )
         .await
     }
@@ -637,6 +659,7 @@ impl ContextManager {
         sequence: u64,
         payload: &[u8],
         signing_key: Option<&ed25519_dalek::SigningKey>,
+        ctx_gen: &ContextGeneration,
     ) -> Result<(), ContextError> {
         // M12: Append event log BEFORE consequence evaluation so that
         // event_log_entries_for_consequences sees the current event.
@@ -647,12 +670,18 @@ impl ContextManager {
             "MessageSent",
             sender_did.as_ref(),
         )?;
+        // Phase 3 reacquire with generation check — detects if the context
+        // was removed and recreated between Phase 1 and Phase 3.
         {
             let now = self.clock.now_secs();
-            let mut contexts = self.contexts.lock().await;
-            if let Some(ctx) = contexts.get_mut(context_id)
-                && require_active(&ctx.handle).is_ok()
-            {
+            if let Ok(mut guard) = self.relock_context(ctx_gen).await {
+                let ctx = &mut *guard;
+                if require_active(&ctx.handle).is_err() {
+                    // Context expired during Phase 2 — rollback the sequence
+                    // number to prevent a permanent gap (Fix 6).
+                    ctx.membership.rollback_sequence_number(sender_did);
+                    return Ok(());
+                }
                 ctx.receive_buffer.push(ContextEvent::MessageSent {
                     sender_did: sender_did.clone(),
                     sequence_number: sequence,
@@ -726,15 +755,20 @@ impl ContextManager {
                 if let Some(sk) = signing_key {
                     self.create_checkpoint_if_due(context_id, ctx, sender_did, sk);
                 }
+            } else {
+                tracing::warn!(
+                    context_id,
+                    "finalize_send: generation mismatch or context removed — \
+                     consequence evaluation skipped"
+                );
             }
         }
-        if self.has_persistence() {
-            let contexts = self.contexts.lock().await;
-            if let Some(ctx) = contexts.get(context_id) {
-                let snapshot = Self::snapshot_context(ctx);
-                drop(contexts);
-                self.persist_context_snapshot(context_id, snapshot);
-            }
+        if self.has_persistence()
+            && let Ok(guard) = self.relock_context(ctx_gen).await
+        {
+            let ctx = &*guard;
+            let snapshot = Self::snapshot_context(ctx);
+            self.persist_context_snapshot(context_id, snapshot);
         }
         Ok(())
     }
@@ -802,10 +836,11 @@ impl ContextManager {
         // nested lock ordering issues with the contexts Mutex.
         let local_dids = self.local_dids.read().await;
         let (local_member_did, access_key) = {
-            let contexts = self.contexts.lock().await;
-            let ctx = contexts
-                .get(context_id)
-                .ok_or_else(|| ContextError::ContextNotRegistered(context_id.to_owned()))?;
+            let ctx_arc = self
+                .get_context_arc(context_id)
+                .map_err(|_| ContextError::ContextNotRegistered(context_id.to_owned()))?;
+            let guard = ctx_arc.lock().await;
+            let ctx = &*guard;
             require_active(&ctx.handle)?;
             let did = ctx
                 .membership
@@ -861,11 +896,14 @@ impl ContextManager {
         // extra lock acquisition on the normal path.
         let sender_is_admin =
             if inner.message_type == scp_protocol::envelope::inner::MessageType::Recovery {
-                let contexts = self.contexts.lock().await;
-                contexts.get(context_id).is_some_and(|ctx| {
+                if let Ok(ctx_arc) = self.get_context_arc(context_id) {
+                    let guard = ctx_arc.lock().await;
+                    let ctx = &*guard;
                     ctx.role_state
                         .member_has_capability(&sender_did, &Capability::ContextClose)
-                })
+                } else {
+                    false
+                }
             } else {
                 false // irrelevant for non-Recovery messages
             };
@@ -929,10 +967,11 @@ impl ContextManager {
         inner: &scp_protocol::envelope::inner::InnerEnvelope,
         now_ms: u64,
     ) -> Result<SequenceCheck, ContextError> {
-        let mut contexts = self.contexts.lock().await;
-        let ctx = contexts
-            .get_mut(context_id)
-            .ok_or_else(|| ContextError::ContextNotRegistered(context_id.to_owned()))?;
+        let ctx_arc = self
+            .get_context_arc(context_id)
+            .map_err(|_| ContextError::ContextNotRegistered(context_id.to_owned()))?;
+        let mut guard = ctx_arc.lock().await;
+        let ctx = &mut *guard;
 
         // Timestamp validation first — reject timestamps out of bounds.
         let tv = TimestampValidator::default();
@@ -1002,10 +1041,11 @@ impl ContextManager {
             received_at: now_ms,
         };
 
-        let mut contexts = self.contexts.lock().await;
-        let ctx = contexts
-            .get_mut(context_id)
-            .ok_or_else(|| ContextError::ContextNotRegistered(context_id.to_owned()))?;
+        let ctx_arc = self
+            .get_context_arc(context_id)
+            .map_err(|_| ContextError::ContextNotRegistered(context_id.to_owned()))?;
+        let mut guard = ctx_arc.lock().await;
+        let ctx = &mut *guard;
 
         if let Some((mut gap_info, messages)) = ctx.reorder_buffer.buffer(buffered_msg) {
             let expected = ctx
@@ -1068,10 +1108,11 @@ impl ContextManager {
     ) -> Result<(), ContextError> {
         let sender_did_obj = DID(sender_did.to_owned());
 
-        let mut contexts = self.contexts.lock().await;
-        let ctx = contexts
-            .get_mut(context_id)
-            .ok_or_else(|| ContextError::ContextNotRegistered(context_id.to_owned()))?;
+        let ctx_arc = self
+            .get_context_arc(context_id)
+            .map_err(|_| ContextError::ContextNotRegistered(context_id.to_owned()))?;
+        let mut guard = ctx_arc.lock().await;
+        let ctx = &mut *guard;
         require_active(&ctx.handle)?;
 
         // Membership + capability check.
@@ -1217,8 +1258,6 @@ impl ContextManager {
         // is available), but the counter must reflect all event log appends
         // including received messages to maintain accurate thresholds.
         ctx.checkpoint_events_since += 1;
-
-        drop(contexts);
 
         crate::metrics::record_message_received();
 

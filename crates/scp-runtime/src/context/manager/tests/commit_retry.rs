@@ -121,8 +121,9 @@ async fn setup_retry_manager() -> (
     // Register a victim member so RemoveMember has a target.
     let victim_did: DID = "did:key:victim".into();
     {
-        let mut contexts = manager.contexts.lock().await;
-        let ctx = contexts.get_mut("retry-ctx").unwrap();
+        let arc = manager.get_context_arc("retry-ctx").unwrap();
+        let mut g = arc.lock().await;
+        let ctx = &mut *g;
         ctx.membership
             .add_member(victim_did.clone(), "member".into(), vec![]);
     }
@@ -393,6 +394,7 @@ fn test_pending_commits_persist_across_snapshot_roundtrip() {
         commit_fault: Some(fault),
         checkpoint_events_since: 0,
         checkpoint_last_time_secs: 0,
+        generation: 0,
     };
 
     // Round-trip via JSON to ensure serde derive works for both new types.
@@ -485,8 +487,16 @@ async fn test_leave_context_same_retry_behavior() {
 
     // Look up the handle so we can call leave_context.
     let handle = {
-        let contexts = manager.contexts.lock().await;
-        contexts.get(&ctx_id).unwrap().handle.clone()
+        manager
+            .contexts
+            .get(&ctx_id)
+            .unwrap()
+            .value()
+            .clone()
+            .lock()
+            .await
+            .handle
+            .clone()
     };
 
     manager

@@ -524,6 +524,29 @@ pub(super) fn commit_economy_ticket(
     ticket.deducted_cost
 }
 
+/// Rolls back every piece of state the ticket represents directly on
+/// an already-locked `PerContextState`. Use this when the caller already
+/// holds the per-context Mutex (Phase 1 error paths under lock).
+///
+/// Consumes the ticket so the `Drop` guard does not fire.
+pub(super) fn rollback_economy_ticket_inline(
+    ctx: &mut super::PerContextState,
+    mut ticket: EconomyTicket,
+) {
+    ticket.consumed = true;
+    ctx.governance
+        .velocity_tracker
+        .rollback(&ticket.actor_did, ticket.velocity_token);
+    if ticket.needs_hard_rate_limit_refund {
+        ctx.governance.hard_rate_limit.refund(&ticket.actor_did);
+    }
+    if let Some(cost) = ticket.deducted_cost {
+        ctx.governance
+            .budget_tracker
+            .reverse_spend(&ticket.actor_did, cost);
+    }
+}
+
 /// Rolls back every piece of state the ticket represents: the budget
 /// deduction, the velocity entry (via its rollback token, so we do not
 /// race concurrent senders), and the hard-rate-limit token (when the
@@ -534,14 +557,20 @@ pub(super) fn commit_economy_ticket(
 /// deregistered between Phase 1 and rollback (unusual), the rollback
 /// is a best-effort no-op — the ticket is still marked consumed so
 /// the `Drop` guard does not fire.
+///
+/// Verifies the generation counter to detect confused-deputy scenarios
+/// where the context was removed and recreated between Phase 1 and
+/// rollback (Phase B).
+#[allow(clippy::significant_drop_tightening)]
 pub(super) async fn rollback_economy_ticket(
     manager: &ContextManager,
     context_id: &str,
     mut ticket: EconomyTicket,
+    ctx_gen: &super::ContextGeneration,
 ) {
     ticket.consumed = true;
-    let mut contexts = manager.contexts.lock().await;
-    if let Some(ctx) = contexts.get_mut(context_id) {
+    if let Ok(mut guard) = manager.relock_context(ctx_gen).await {
+        let ctx = &mut *guard;
         ctx.governance
             .velocity_tracker
             .rollback(&ticket.actor_did, ticket.velocity_token);
@@ -553,6 +582,11 @@ pub(super) async fn rollback_economy_ticket(
                 .budget_tracker
                 .reverse_spend(&ticket.actor_did, cost);
         }
+    } else {
+        tracing::warn!(
+            context_id,
+            "rollback_economy_ticket: generation mismatch — skipping rollback"
+        );
     }
 }
 
@@ -578,10 +612,11 @@ impl ContextManager {
 
         // Phase 1: Extract policy + metrics under lock, then drop.
         let (policy, metrics) = {
-            let contexts = self.contexts.lock().await;
-            let ctx = contexts
-                .get(context_id)
-                .ok_or_else(|| ContextError::ContextNotRegistered(context_id.to_owned()))?;
+            let ctx_arc = self
+                .get_context_arc(context_id)
+                .map_err(|_| ContextError::ContextNotRegistered(context_id.to_owned()))?;
+            let guard = ctx_arc.lock().await;
+            let ctx = &*guard;
 
             let policy = ctx.governance.economic_policy.clone();
             let member_count = u64::try_from(ctx.membership.count()).unwrap_or(u64::MAX);
@@ -686,8 +721,9 @@ impl ContextManager {
 
         // Checkpoint tracking: count this event for threshold-based checkpoints.
         {
-            let mut contexts = self.contexts.lock().await;
-            if let Some(ctx) = contexts.get_mut(context_id) {
+            if let Ok(ctx_arc) = self.get_context_arc(context_id) {
+                let mut guard = ctx_arc.lock().await;
+                let ctx = &mut *guard;
                 ctx.checkpoint_events_since += 1;
             }
         }
