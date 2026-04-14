@@ -78,6 +78,11 @@ pub fn html_escape_json(json: &str) -> String {
         .replace('\'', "\\u0027")
 }
 
+// Shared context-parameter builder for all non-WASM bridges.
+// Requires scp-core (behind `resolvers` feature). Not available for WASM.
+#[cfg(feature = "resolvers")]
+pub mod context_params;
+
 // Trust store shared across PyO3, napi-rs, and UniFFI bridges.
 // Requires scp-core (behind `resolvers` feature). Not available for WASM.
 #[cfg(feature = "resolvers")]

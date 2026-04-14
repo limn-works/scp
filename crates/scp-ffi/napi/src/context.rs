@@ -14,8 +14,7 @@ use napi::Error as NapiError;
 use napi_derive::napi;
 use scp_core::context::governance::{GovernanceAction, GovernanceProposal, ProposalStatus};
 use scp_core::context::manager::GovernanceActionResult;
-use scp_core::context::params::ContextMode;
-use scp_core::context::{ContextHandle, ContextParams, ContextState};
+use scp_core::context::{ContextHandle, ContextState};
 use scp_identity::DID;
 use scp_primitives::Clock;
 use tokio_util::sync::CancellationToken;
@@ -427,50 +426,33 @@ pub async fn context_create(
     let context_id = format!("ctx-{}", Uuid::new_v4());
     let creator_did = identity.inner.did.clone();
 
-    // Build ContextParams for the manager, mapping all user-specified fields.
-    let mode = if mode_str == "Broadcast" {
-        ContextMode::Broadcast
-    } else {
-        ContextMode::Encrypted
+    // Parse consequence_rules from params (ADR-017, #1531). Accepts either a
+    // JSON array (preferred) or a JSON-encoded string for legacy callers.
+    // Normalize to a JSON string for the common builder.
+    let consequence_rules_json: Option<String> = match &params["consequenceRules"] {
+        serde_json::Value::Null => None,
+        serde_json::Value::String(s) => Some(s.clone()),
+        other => Some(serde_json::to_string(other).map_err(|e| {
+            NapiError::from(ScpNapiError::Validation {
+                message: format!("invalid consequenceRules: {e}"),
+                code: "SCP-VALID-7000".to_owned(),
+            })
+        })?),
     };
 
-    let core_ceiling_policy = match ceiling_policy.as_str() {
-        "governed" => scp_core::context::params::CeilingPolicy::Governed,
-        _ => scp_core::context::params::CeilingPolicy::Immutable,
+    // Parse consequence_config from params (ADR-017, #1531). Accepts a JSON
+    // object (preferred) or a JSON-encoded string for legacy callers.
+    // Normalize to a JSON string for the common builder.
+    let consequence_config_json: Option<String> = match &params["consequenceConfig"] {
+        serde_json::Value::Null => None,
+        serde_json::Value::String(s) => Some(s.clone()),
+        other => Some(serde_json::to_string(other).map_err(|e| {
+            NapiError::from(ScpNapiError::Validation {
+                message: format!("invalid consequenceConfig: {e}"),
+                code: "SCP-VALID-7000".to_owned(),
+            })
+        })?),
     };
-
-    let core_promotion_policy = match promotion_policy.as_deref() {
-        Some("promotable") => scp_core::context::params::PromotionPolicy::Promotable,
-        _ => scp_core::context::params::PromotionPolicy::NoPromotion,
-    };
-
-    let memory_scope_str = params["memoryScope"].as_str().unwrap_or("ephemeral");
-    let core_memory_scope = match memory_scope_str {
-        "summary" => scp_core::context::params::MemoryScope::Summary,
-        "full" => scp_core::context::params::MemoryScope::Full,
-        _ => scp_core::context::params::MemoryScope::Ephemeral,
-    };
-
-    // Validate governance model — reject unknown values instead of silently
-    // defaulting to SingleAdmin (#1421).
-    let core_governance = match governance.as_str() {
-        "single_admin" => scp_core::context::params::GovernanceModel::SingleAdmin,
-        other => {
-            return Err(ScpNapiError::Validation {
-                message: format!(
-                    "unsupported governance model: {other:?} — \
-                     only \"single_admin\" is currently supported"
-                ),
-                code: "SCP-VALID-7030".to_owned(),
-            }
-            .into());
-        }
-    };
-
-    let core_ceiling: Vec<scp_core::context::roles::Capability> = ceiling
-        .iter()
-        .map(scp_core::context::roles::Capability::new)
-        .collect();
 
     // Parse minProtocolVersion: [major, minor] array or null (spec §13.4).
     let min_protocol_version = params["minProtocolVersion"].as_array().and_then(|arr| {
@@ -490,87 +472,38 @@ pub async fn context_create(
         .as_u64()
         .and_then(|v| u32::try_from(v).ok());
 
-    // Deserialize economic_policy JSON string to the core struct, if provided.
-    let core_economic_policy: Option<scp_core::economy::EconomicPolicy> = economic_policy
-        .as_deref()
-        .map(|ep_json| {
-            serde_json::from_str(ep_json).map_err(|e| {
-                NapiError::from(ScpNapiError::Validation {
-                    message: format!("invalid economicPolicy JSON: {e}"),
-                    code: "SCP-VALID-7000".to_owned(),
-                })
-            })
-        })
-        .transpose()?;
+    let memory_scope_str = params["memoryScope"]
+        .as_str()
+        .unwrap_or("ephemeral")
+        .to_owned();
 
-    // Parse consequence_rules from params (ADR-017, #1531). Accepts either a
-    // JSON array (preferred) or a JSON-encoded string for legacy callers.
-    // Mirrors the WASM bridge pattern in crates/scp-ffi/wasm/src/manager.rs.
-    let core_consequence_rules: Vec<scp_core::trust::ConsequenceRule> = match &params["consequenceRules"]
-    {
-        serde_json::Value::Null => Vec::new(),
-        serde_json::Value::String(s) => serde_json::from_str(s).map_err(|e| {
-            NapiError::from(ScpNapiError::Validation {
-                message: format!("invalid consequenceRules JSON string: {e}"),
-                code: "SCP-VALID-7000".to_owned(),
-            })
-        })?,
-        other => serde_json::from_value(other.clone()).map_err(|e| {
-            NapiError::from(ScpNapiError::Validation {
-                message: format!("invalid consequenceRules: {e}"),
-                code: "SCP-VALID-7000".to_owned(),
-            })
-        })?,
-    };
-
-    // Parse consequence_config from params (ADR-017, #1531). Accepts a JSON
-    // object (preferred) or a JSON-encoded string for legacy callers.
-    let core_consequence_config: scp_core::context::params::ConsequenceConfig = match &params["consequenceConfig"]
-    {
-        serde_json::Value::Null => scp_core::context::params::ConsequenceConfig::default(),
-        serde_json::Value::String(s) => serde_json::from_str(s).map_err(|e| {
-            NapiError::from(ScpNapiError::Validation {
-                message: format!("invalid consequenceConfig JSON string: {e}"),
-                code: "SCP-VALID-7000".to_owned(),
-            })
-        })?,
-        other => serde_json::from_value(other.clone()).map_err(|e| {
-            NapiError::from(ScpNapiError::Validation {
-                message: format!("invalid consequenceConfig: {e}"),
-                code: "SCP-VALID-7000".to_owned(),
-            })
-        })?,
-    };
-
-    // Validate each consequence rule against the per-context config so the
-    // bridge fails closed at creation time rather than deferring to runtime.
-    for rule in &core_consequence_rules {
-        rule.validate_against_config(&core_consequence_config)
-            .map_err(|e| {
-                NapiError::from(ScpNapiError::Validation {
-                    message: format!("consequence rule validation failed: {e}"),
-                    code: "SCP-VALID-7000".to_owned(),
-                })
-            })?;
-    }
-
-    let context_params = ContextParams {
-        mode,
-        ceiling: core_ceiling,
-        ceiling_policy: core_ceiling_policy,
-        promotion_policy: core_promotion_policy,
+    // Delegate to the shared context-params builder (#1447). All parsing,
+    // validation, and ContextParams construction happens in scp-ffi-common.
+    let common = scp_ffi_common::context_params::CommonContextParams {
+        mode: mode_str.clone(),
+        ceiling: ceiling.clone(),
+        ceiling_policy: ceiling_policy.clone(),
+        promotion_policy: promotion_policy.clone().unwrap_or_default(),
+        memory_scope: memory_scope_str,
+        governance: governance.clone(),
         ttl: ttl_seconds.map(std::time::Duration::from_secs),
-        memory_scope: core_memory_scope,
-        governance: core_governance,
         min_protocol_version,
         max_chain_depth,
         max_nesting_depth,
         session_cap,
-        economic_policy: core_economic_policy,
-        consequence_rules: core_consequence_rules,
-        consequence_config: core_consequence_config,
-        ..ContextParams::default()
+        economic_policy_json: economic_policy.clone(),
+        consequence_rules_json,
+        consequence_config_json,
+        ..Default::default()
     };
+
+    let context_params =
+        scp_ffi_common::context_params::build_context_params(&common).map_err(|e| {
+            NapiError::from(ScpNapiError::Validation {
+                message: e,
+                code: "SCP-VALID-7000".to_owned(),
+            })
+        })?;
 
     // Initialize the ContextManager if not already done (first context_create call).
     // Passes the creator DID to MlsCryptoProvider for real MLS encryption (#1294).

@@ -9118,42 +9118,34 @@ impl scp_core::crypto::ucan::validate::ProofResolver for NoOpProofResolver {
 fn bridge_params_to_core(
     params: &ContextParams,
 ) -> Result<scp_core::context::ContextParams, ScpError> {
-    use scp_core::context::params::{Capability, PromotionPolicy};
-
-    let mode = match params.mode {
-        ContextMode::Encrypted => scp_core::context::params::ContextMode::Encrypted,
-        ContextMode::Broadcast => scp_core::context::params::ContextMode::Broadcast,
+    // Convert UniFFI bridge enums/fields to canonical string values for the
+    // shared context-params builder (#1447).
+    let mode_str = match params.mode {
+        ContextMode::Encrypted => "encrypted",
+        ContextMode::Broadcast => "broadcast",
     };
 
-    let ceiling: Vec<Capability> = params.ceiling.iter().map(Capability::new).collect();
-
-    let ceiling_policy = match params.ceiling_policy {
-        CeilingPolicy::Immutable => scp_core::context::params::CeilingPolicy::Immutable,
-        CeilingPolicy::Governed => scp_core::context::params::CeilingPolicy::Governed,
+    let ceiling_policy_str = match params.ceiling_policy {
+        CeilingPolicy::Immutable => "immutable",
+        CeilingPolicy::Governed => "governed",
     };
 
-    let memory_scope = match params.memory_scope {
-        MemoryScope::Ephemeral => scp_core::context::params::MemoryScope::Ephemeral,
-        MemoryScope::Summary => scp_core::context::params::MemoryScope::Summary,
-        MemoryScope::Full => scp_core::context::params::MemoryScope::Full,
+    let memory_scope_str = match params.memory_scope {
+        MemoryScope::Ephemeral => "ephemeral",
+        MemoryScope::Summary => "summary",
+        MemoryScope::Full => "full",
     };
 
-    let ttl = if params.ttl_seconds > 0 {
-        Some(std::time::Duration::from_secs(params.ttl_seconds))
+    let governance_str = match params.governance {
+        GovernanceModel::SingleAdmin => "single_admin",
+        GovernanceModel::Multisig => "multisig",
+        GovernanceModel::TokenVoting => "token_voting",
+    };
+
+    let promotion_policy_str = if params.promotable {
+        "promotable"
     } else {
-        None
-    };
-
-    // GovernanceModel in scp-core currently only has SingleAdmin.
-    // All bridge governance variants map to SingleAdmin until scp-core
-    // adds additional model variants (the governance engine dispatch already
-    // handles all 24 actions regardless of the model enum).
-    let governance = scp_core::context::params::GovernanceModel::SingleAdmin;
-
-    let promotion_policy = if params.promotable {
-        PromotionPolicy::Promotable
-    } else {
-        PromotionPolicy::NoPromotion
+        "no_promotion"
     };
 
     let min_protocol_version = if params.min_protocol_version == 0 {
@@ -9164,72 +9156,35 @@ fn bridge_params_to_core(
         Some((major, minor))
     };
 
-    // Deserialize economic_policy JSON string to the core struct, if provided.
-    let economic_policy: Option<scp_core::economy::EconomicPolicy> = params
-        .economic_policy
-        .as_deref()
-        .map(|ep_json| {
-            serde_json::from_str(ep_json).map_err(|e| ScpError::Validation {
-                msg: format!("invalid economic_policy JSON: {e}"),
-                code: "SCP-VALID-7000".to_owned(),
-            })
-        })
-        .transpose()?;
+    let ttl = if params.ttl_seconds > 0 {
+        Some(std::time::Duration::from_secs(params.ttl_seconds))
+    } else {
+        None
+    };
 
-    // Parse consequence_rules_json (ADR-017, #1531) into the typed core
-    // representation. Empty when omitted.
-    let consequence_rules: Vec<scp_core::trust::ConsequenceRule> = params
-        .consequence_rules_json
-        .as_deref()
-        .map(|cr_json| {
-            serde_json::from_str(cr_json).map_err(|e| ScpError::Validation {
-                msg: format!("invalid consequence_rules JSON: {e}"),
-                code: "SCP-VALID-7000".to_owned(),
-            })
-        })
-        .transpose()?
-        .unwrap_or_default();
-
-    // Parse consequence_config_json (ADR-017, #1531) into the typed core
-    // representation. Default config when omitted.
-    let consequence_config: scp_core::context::params::ConsequenceConfig = params
-        .consequence_config_json
-        .as_deref()
-        .map(|cc_json| {
-            serde_json::from_str(cc_json).map_err(|e| ScpError::Validation {
-                msg: format!("invalid consequence_config JSON: {e}"),
-                code: "SCP-VALID-7000".to_owned(),
-            })
-        })
-        .transpose()?
-        .unwrap_or_default();
-
-    // Validate each consequence rule against the per-context config so the
-    // bridge fails closed at creation time rather than deferring to runtime.
-    for rule in &consequence_rules {
-        rule.validate_against_config(&consequence_config)
-            .map_err(|e| ScpError::Validation {
-                msg: format!("consequence rule validation failed: {e}"),
-                code: "SCP-VALID-7000".to_owned(),
-            })?;
-    }
-
-    Ok(scp_core::context::ContextParams {
-        mode,
-        ceiling,
-        ceiling_policy,
-        governance,
-        memory_scope,
+    let common = scp_ffi_common::context_params::CommonContextParams {
+        mode: mode_str.to_owned(),
+        ceiling: params.ceiling.clone(),
+        ceiling_policy: ceiling_policy_str.to_owned(),
+        promotion_policy: promotion_policy_str.to_owned(),
+        memory_scope: memory_scope_str.to_owned(),
+        governance: governance_str.to_owned(),
         ttl,
-        promotion_policy,
         min_protocol_version,
         max_chain_depth: params.max_chain_depth,
         max_nesting_depth: params.max_nesting_depth,
         session_cap: params.session_cap,
-        economic_policy,
-        consequence_rules,
-        consequence_config,
-        ..scp_core::context::ContextParams::default()
+        economic_policy_json: params.economic_policy.clone(),
+        consequence_rules_json: params.consequence_rules_json.clone(),
+        consequence_config_json: params.consequence_config_json.clone(),
+        ..Default::default()
+    };
+
+    scp_ffi_common::context_params::build_context_params(&common).map_err(|e| {
+        ScpError::Validation {
+            msg: e,
+            code: "SCP-VALID-7000".to_owned(),
+        }
     })
 }
 
