@@ -37,6 +37,13 @@ Errors should be helpful to users without exposing internals (stack traces, file
 
 Read `CLAUDE.md` for the technology stack. Key security surfaces include API communication (API keys), sync infrastructure (untrusted remote data), local persistence (sensitive fields), and any development-only services that must be properly gated.
 
+### SCP-specific authorization checklist (from Phase B audit):
+- **TOCTOU capability checks**: If a capability is checked under one lock acquisition and the gated action happens under a DIFFERENT lock acquisition, it's a TOCTOU. Capabilities can be revoked between check and action. Check + action must be atomic under the same lock. Known instances: GovernancePropose (fixed), GovernanceVote (known gap).
+- **Phase 3 confused deputy**: When a per-context Mutex is dropped and reacquired, the context could have been removed and recreated with the same ID. All Phase 3 reacquires MUST verify a generation token. Bare `contexts.get()` without generation check allows operations on wrong context state.
+- **Stale state in background tasks**: TTL timers and governance timeout tasks hold Arc references to per-context state. If the context is removed and recreated, the task operates on orphaned state unless generation is checked.
+- **Webhook SSRF**: DNS hostnames bypass IP blocklist (resolved by DNS pre-resolution). Verify all outbound HTTP uses HTTPS-only + no-redirect + DNS validation.
+- **Checkpoint signature verification**: Remote checkpoints must have Ed25519 signature + membership verified BEFORE comparing Merkle roots.
+
 ## Output Format
 
 For each finding, report:

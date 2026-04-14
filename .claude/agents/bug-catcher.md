@@ -41,6 +41,14 @@ For each piece of code you review:
 - Verify async operations and continuations are handled correctly
 - Check for main-thread-only operations being called from background contexts
 
+#### SCP-specific concurrency checklist (from Phase B audit):
+- **DashMap shard lock across .await**: For every `self.contexts.get()`, `self.contexts.iter()`, verify the returned `Ref`/`RefMut` is dropped BEFORE any `.await`. Pattern: clone Arc, drop entry, then await. `for entry in map.iter() { entry.value().lock().await }` is a DEADLOCK.
+- **ContextHandle RwLock inside Mutex**: `handle.state().await` inside a held per-context Mutex deadlocks against `transition_to()`. Use `try_read_state()` (sync) instead.
+- **Lock ordering**: DashMap shard → per-context Mutex → standing_contexts → local_dids. Any inversion is a deadlock. Check `reconnect_all_standing`, `standing_context`, `deliver_incoming`.
+- **Phase 3 generation check**: Every path that drops a per-context Mutex and reacquires it MUST verify `ctx.generation` matches the token from Phase 1. Use `relock_context()`. Bare `contexts.get()` for reacquire is a confused-deputy vulnerability.
+- **Reentrant Mutex**: tokio Mutex is NOT reentrant. Any method that calls a helper while holding the Mutex, where the helper also acquires the same Mutex, is a deadlock (e.g., `rollback_economy_ticket`).
+- **TOCTOU capability checks**: Capability checked before lock drop, action performed after reacquire — capability may be revoked in the gap. Check + action must be under the same lock.
+
 ### 3. Memory and Lifecycle Analysis
 - Identify retain cycles / reference cycles, especially in closures and callbacks
 - Check that observation patterns are properly cleaned up
