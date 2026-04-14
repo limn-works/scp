@@ -6,6 +6,7 @@
 //! See ADR-034 in `.docs/adrs/phase-4.md` and issue #389.
 
 use js_sys::Promise;
+use scp_ffi_common::error_codes as codes;
 use sha2::Digest as _;
 use wasm_bindgen::prelude::*;
 use wasm_bindgen_futures::future_to_promise;
@@ -30,7 +31,7 @@ fn validate_non_negative_epoch(value: f64) -> Result<u64, ScpWasmError> {
     if value < 0.0 || !value.is_finite() {
         return Err(ScpWasmError::Validation {
             message: format!("epoch must be non-negative, got {value}"),
-            code: "SCP-VALID-7040".to_owned(),
+            code: codes::VALID_7040.to_owned(),
         });
     }
     #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
@@ -211,7 +212,7 @@ pub fn event_log_query(context: &WasmContextHandle, filter_json: Option<String>)
                 let parsed: serde_json::Value = serde_json::from_str(json_str).map_err(|e| {
                     ScpWasmError::Validation {
                         message: format!("filter_json is not valid JSON: {e}"),
-                        code: "SCP-VALID-7000".to_owned(),
+                        code: codes::VALID_7000.to_owned(),
                     }
                     .into_js()
                 })?;
@@ -264,7 +265,7 @@ pub fn event_log_query(context: &WasmContextHandle, filter_json: Option<String>)
         let json_str = serde_json::to_string(&result).map_err(|e| {
             ScpWasmError::Context {
                 message: format!("serialization failed: {e}"),
-                code: "SCP-CTX-2007".to_owned(),
+                code: codes::CTX_2007.to_owned(),
             }
             .into_js()
         })?;
@@ -284,7 +285,7 @@ pub fn event_log_verify(context: &WasmContextHandle, claim_json: String) -> Prom
         let claim: serde_json::Value = serde_json::from_str(&claim_json).map_err(|e| {
             ScpWasmError::Validation {
                 message: format!("claim_json is not valid JSON: {e}"),
-                code: "SCP-VALID-7000".to_owned(),
+                code: codes::VALID_7000.to_owned(),
             }
             .into_js()
         })?;
@@ -296,7 +297,7 @@ pub fn event_log_verify(context: &WasmContextHandle, claim_json: String) -> Prom
                 let leaf_index = claim["leafIndex"].as_u64().ok_or_else(|| {
                     ScpWasmError::Validation {
                         message: "inclusion claim requires 'leafIndex' (number)".to_owned(),
-                        code: "SCP-VALID-7000".to_owned(),
+                        code: codes::VALID_7000.to_owned(),
                     }
                     .into_js()
                 })?;
@@ -308,7 +309,7 @@ pub fn event_log_verify(context: &WasmContextHandle, claim_json: String) -> Prom
                 let event_hash_hex = claim["eventHash"].as_str().ok_or_else(|| {
                     ScpWasmError::Validation {
                         message: "absence claim requires 'eventHash' (hex string)".to_owned(),
-                        code: "SCP-VALID-7000".to_owned(),
+                        code: codes::VALID_7000.to_owned(),
                     }
                     .into_js()
                 })?;
@@ -316,7 +317,7 @@ pub fn event_log_verify(context: &WasmContextHandle, claim_json: String) -> Prom
                 let event_hash = crate::runtime::decode_hex_hash(event_hash_hex).map_err(|e| {
                     ScpWasmError::Validation {
                         message: format!("invalid eventHash: {e}"),
-                        code: "SCP-VALID-7000".to_owned(),
+                        code: codes::VALID_7000.to_owned(),
                     }
                     .into_js()
                 })?;
@@ -329,7 +330,7 @@ pub fn event_log_verify(context: &WasmContextHandle, claim_json: String) -> Prom
                     message: format!(
                         "unsupported proof type '{other}' — expected 'inclusion' or 'absence'"
                     ),
-                    code: "SCP-VALID-7000".to_owned(),
+                    code: codes::VALID_7000.to_owned(),
                 }
                 .into_js()
                 .into());
@@ -397,14 +398,14 @@ pub fn event_log_checkpoint(
             let decoded = hex::decode(&merkle_root_hex).map_err(|e| {
                 ScpWasmError::Validation {
                     message: format!("invalid merkle root hex: {e}"),
-                    code: "SCP-VALID-7000".to_owned(),
+                    code: codes::VALID_7000.to_owned(),
                 }
                 .into_js()
             })?;
             if decoded.len() != 32 {
                 return Err(ScpWasmError::Validation {
                     message: format!("merkle root must be 32 bytes, got {}", decoded.len()),
-                    code: "SCP-VALID-7000".to_owned(),
+                    code: codes::VALID_7000.to_owned(),
                 }
                 .into_js()
                 .into());
@@ -461,6 +462,7 @@ pub fn event_log_checkpoint(
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+    use scp_ffi_common::error_codes as codes;
 
     // -----------------------------------------------------------------------
     // validate_non_negative_epoch — returns ScpWasmError (no JsValue)
@@ -512,7 +514,7 @@ mod tests {
         let err = result.unwrap_err();
         let msg = format!("{err}");
         assert!(
-            msg.contains("SCP-VALID-7040"),
+            msg.contains(codes::VALID_7040),
             "error should contain SCP-VALID-7040, got: {msg}"
         );
     }

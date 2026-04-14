@@ -12,6 +12,7 @@ use std::net::SocketAddr;
 use std::path::{Component, Path};
 use std::sync::Arc;
 
+use scp_core::context::ContextManager;
 use scp_identity::cache::SystemClock;
 use scp_identity::dht::DidDht;
 use scp_identity::{DidDocument, InMemoryDhtClient, ScpIdentity};
@@ -636,6 +637,128 @@ impl RunningNode {
             Self::InMemory(n) => n.http_url().await,
             Self::Filesystem(n) => n.http_url().await,
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Broadcast key resolution — shared across PyO3 and NAPI bridges
+// ---------------------------------------------------------------------------
+
+/// Error returned by [`resolve_broadcast_key`] when key resolution fails.
+///
+/// Bridge callers map this to their framework-specific error types
+/// (`PyErr`, `napi::Error`, etc.).
+#[derive(Debug, thiserror::Error)]
+pub enum BroadcastKeyError {
+    /// The hex string is not valid hex.
+    #[error("invalid broadcast_key_hex: {0}")]
+    InvalidHex(#[from] hex::FromHexError),
+
+    /// The decoded key is not exactly 32 bytes.
+    #[error("broadcast_key_hex must be exactly 64 hex characters (32 bytes)")]
+    InvalidKeyLength,
+
+    /// `broadcast_key_hex` was provided without `author_did`.
+    #[error(
+        "broadcast_key_hex requires author_did — provide the DID of the \
+         broadcast key owner, or omit both for auto-resolve"
+    )]
+    KeyWithoutAuthor,
+
+    /// Auto-resolve from the `ContextManager` failed.
+    #[error("broadcast key auto-resolve failed: {0}")]
+    AutoResolveFailed(String),
+}
+
+/// Resolved broadcast key components ready for `BroadcastKey::from_parts`.
+pub struct ResolvedBroadcastKey {
+    /// The 32-byte broadcast key (zeroize-protected).
+    pub key_bytes: Zeroizing<[u8; 32]>,
+    /// The epoch associated with the key (0 for explicit keys).
+    pub epoch: u64,
+    /// The DID of the broadcast key author/owner.
+    pub author_did: String,
+}
+
+/// Resolves broadcast key parameters into a [`ResolvedBroadcastKey`].
+///
+/// Three resolution modes:
+/// 1. Both `broadcast_key_hex` **and** `author_did` provided — uses the
+///    explicit key with epoch 0.
+/// 2. Only `author_did` provided — auto-resolves the broadcast key from
+///    the `ContextManager` using that DID.
+/// 3. Neither provided — auto-resolves using `fallback_did` (typically the
+///    node's identity DID).
+///
+/// Providing `broadcast_key_hex` without `author_did` is an error.
+///
+/// # Arguments
+///
+/// * `broadcast_key_hex` — Optional hex-encoded 32-byte key.
+/// * `author_did` — Optional DID of the broadcast key owner.
+/// * `fallback_did` — DID to use when both `broadcast_key_hex` and
+///   `author_did` are `None` (e.g., the node's own DID).
+/// * `context_manager` — Reference to the `ContextManager` for auto-resolve.
+/// * `context_id` — The context ID to resolve the key for.
+///
+/// # Errors
+///
+/// Returns [`BroadcastKeyError`] on invalid hex, wrong key length,
+/// missing author DID, or auto-resolve failure.
+pub async fn resolve_broadcast_key(
+    broadcast_key_hex: Option<String>,
+    author_did: Option<String>,
+    fallback_did: &str,
+    context_manager: &ContextManager,
+    context_id: &str,
+) -> Result<ResolvedBroadcastKey, BroadcastKeyError> {
+    match (broadcast_key_hex, author_did) {
+        (Some(key_hex), Some(did)) => {
+            let key_hex = Zeroizing::new(key_hex);
+            let key_vec = Zeroizing::new(hex::decode(&*key_hex)?);
+            let key_bytes: Zeroizing<[u8; 32]> = Zeroizing::new(
+                <[u8; 32]>::try_from(key_vec.as_slice())
+                    .map_err(|_| BroadcastKeyError::InvalidKeyLength)?,
+            );
+            // Explicit key path always uses epoch 0. For rotated keys,
+            // use auto-resolve (omit both params).
+            Ok(ResolvedBroadcastKey {
+                key_bytes,
+                epoch: 0,
+                author_did: did,
+            })
+        }
+        (None, author_opt) => {
+            // Auto-resolve: use provided author_did or fall back to node DID.
+            let did = author_opt.unwrap_or_else(|| fallback_did.to_owned());
+            let result: Result<(Zeroizing<[u8; 32]>, u64), _> = context_manager
+                .get_broadcast_key_for_local_author(context_id, &did)
+                .await;
+            let (key_bytes, epoch) = result.map_err(|e| {
+                tracing::debug!(error = %e, "broadcast key auto-resolve failed");
+                BroadcastKeyError::AutoResolveFailed("not authorized for this context".to_owned())
+            })?;
+            Ok(ResolvedBroadcastKey {
+                key_bytes,
+                epoch,
+                author_did: did,
+            })
+        }
+        (Some(_), None) => Err(BroadcastKeyError::KeyWithoutAuthor),
+    }
+}
+
+/// Convenience: builds a [`BroadcastKey`] from a [`ResolvedBroadcastKey`].
+impl ResolvedBroadcastKey {
+    /// Converts the resolved key into a [`BroadcastKey`] suitable for
+    /// passing to `enable_broadcast_projection_with_site`.
+    #[must_use]
+    pub fn into_broadcast_key(self) -> scp_core::crypto::sender_keys::BroadcastKey {
+        scp_core::crypto::sender_keys::BroadcastKey::from_parts(
+            scp_core::crypto::sender_keys::SenderKey::from_bytes(*self.key_bytes),
+            self.epoch,
+            self.author_did,
+        )
     }
 }
 

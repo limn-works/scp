@@ -7,6 +7,7 @@
 //! Feature-gated behind `allow_in_memory_custody` -- never compiled into
 //! production builds.
 
+use scp_ffi_common::error_codes as codes;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
@@ -123,7 +124,7 @@ pub fn fullstack_create_context(
     let ceiling_obj: serde_json::Value = serde_json::from_str(&ceiling_json).map_err(|e| {
         napi::Error::from(ScpNapiError::Validation {
             message: format!("invalid ceiling JSON: {e}"),
-            code: "SCP-VALID-7050".to_owned(),
+            code: codes::VALID_7050.to_owned(),
         })
     })?;
 
@@ -161,7 +162,7 @@ pub fn fullstack_create_context(
         .map_err(|e| {
             napi::Error::from(ScpNapiError::Context {
                 message: format!("failed to create context: {e}"),
-                code: "SCP-CTX-2050".to_owned(),
+                code: codes::CTX_2050.to_owned(),
             })
         })?;
 
@@ -199,7 +200,7 @@ pub fn fullstack_add_member(
         handles.get(&context_id).cloned().ok_or_else(|| {
             napi::Error::from(ScpNapiError::Context {
                 message: format!("context '{context_id}' not found in node's handles"),
-                code: "SCP-CTX-2051".to_owned(),
+                code: codes::CTX_2051.to_owned(),
             })
         })?
     };
@@ -208,7 +209,7 @@ pub fn fullstack_add_member(
         .map_err(|e| {
             napi::Error::from(ScpNapiError::Crypto {
                 message: format!("failed to add member: {e}"),
-                code: "SCP-CRYPTO-4050".to_owned(),
+                code: codes::CRYPTO_4050.to_owned(),
             })
         })
 }
@@ -249,7 +250,7 @@ pub fn fullstack_join_from_welcome(
         .map_err(|e| {
             napi::Error::from(ScpNapiError::Context {
                 message: format!("failed to register context on joiner: {e}"),
-                code: "SCP-CTX-2055".to_owned(),
+                code: codes::CTX_2055.to_owned(),
             })
         })?;
 
@@ -260,7 +261,7 @@ pub fn fullstack_join_from_welcome(
         .map_err(|e| {
             napi::Error::from(ScpNapiError::Crypto {
                 message: format!("failed to join from Welcome: {e}"),
-                code: "SCP-CRYPTO-4051".to_owned(),
+                code: codes::CRYPTO_4051.to_owned(),
             })
         })?;
 
@@ -272,7 +273,7 @@ pub fn fullstack_join_from_welcome(
         .map_err(|e| {
             napi::Error::from(ScpNapiError::Crypto {
                 message: format!("failed to distribute joiner sender key: {e}"),
-                code: "SCP-CRYPTO-4060".to_owned(),
+                code: codes::CRYPTO_4060.to_owned(),
             })
         })?;
 
@@ -324,7 +325,7 @@ pub fn fullstack_sync_sender_keys(
         .map_err(|e| {
             napi::Error::from(ScpNapiError::Crypto {
                 message: format!("failed to distribute sender key from A to B: {e}"),
-                code: "SCP-CRYPTO-4056".to_owned(),
+                code: codes::CRYPTO_4056.to_owned(),
             })
         })?;
     node_b
@@ -334,7 +335,7 @@ pub fn fullstack_sync_sender_keys(
         .map_err(|e| {
             napi::Error::from(ScpNapiError::Crypto {
                 message: format!("failed to distribute sender key from B to A: {e}"),
-                code: "SCP-CRYPTO-4057".to_owned(),
+                code: codes::CRYPTO_4057.to_owned(),
             })
         })?;
 
@@ -342,13 +343,13 @@ pub fn fullstack_sync_sender_keys(
     node_a.inner.pickup_sender_keys(&ctx_bytes).map_err(|e| {
         napi::Error::from(ScpNapiError::Crypto {
             message: format!("failed to pick up sender keys for A: {e}"),
-            code: "SCP-CRYPTO-4058".to_owned(),
+            code: codes::CRYPTO_4058.to_owned(),
         })
     })?;
     node_b.inner.pickup_sender_keys(&ctx_bytes).map_err(|e| {
         napi::Error::from(ScpNapiError::Crypto {
             message: format!("failed to pick up sender keys for B: {e}"),
-            code: "SCP-CRYPTO-4059".to_owned(),
+            code: codes::CRYPTO_4059.to_owned(),
         })
     })?;
 
@@ -376,7 +377,7 @@ pub fn fullstack_send_message(
         handles.get(&context_id).cloned().ok_or_else(|| {
             napi::Error::from(ScpNapiError::Context {
                 message: format!("context '{context_id}' not found in node's handles"),
-                code: "SCP-CTX-2052".to_owned(),
+                code: codes::CTX_2052.to_owned(),
             })
         })?
     };
@@ -385,7 +386,7 @@ pub fn fullstack_send_message(
         .map_err(|e| {
             napi::Error::from(ScpNapiError::Crypto {
                 message: format!("failed to send message: {e}"),
-                code: "SCP-CRYPTO-4052".to_owned(),
+                code: codes::CRYPTO_4052.to_owned(),
             })
         })?;
 
@@ -394,7 +395,7 @@ pub fn fullstack_send_message(
     if sent.is_empty() {
         return Err(napi::Error::from(ScpNapiError::Crypto {
             message: "no ciphertext captured after send".to_owned(),
-            code: "SCP-CRYPTO-4053".to_owned(),
+            code: codes::CRYPTO_4053.to_owned(),
         }));
     }
     if sent.len() > 1 {
@@ -403,7 +404,7 @@ pub fn fullstack_send_message(
                 "expected 1 ciphertext after send, got {} — send_message should produce exactly one",
                 sent.len()
             ),
-            code: "SCP-CRYPTO-4055".to_owned(),
+            code: codes::CRYPTO_4055.to_owned(),
         }));
     }
 
@@ -429,7 +430,7 @@ pub fn fullstack_decrypt_message(
         .map_err(|e| {
             napi::Error::from(ScpNapiError::Crypto {
                 message: format!("failed to decrypt message: {e}"),
-                code: "SCP-CRYPTO-4054".to_owned(),
+                code: codes::CRYPTO_4054.to_owned(),
             })
         })?;
 
@@ -456,7 +457,7 @@ pub fn fullstack_remove_member(
         handles.get(&context_id).cloned().ok_or_else(|| {
             napi::Error::from(ScpNapiError::Context {
                 message: format!("context '{context_id}' not found in node's handles"),
-                code: "SCP-CTX-2053".to_owned(),
+                code: codes::CTX_2053.to_owned(),
             })
         })?
     };
@@ -469,7 +470,7 @@ pub fn fullstack_remove_member(
     .map_err(|e| {
         napi::Error::from(ScpNapiError::Context {
             message: format!("failed to remove member: {e}"),
-            code: "SCP-CTX-2054".to_owned(),
+            code: codes::CTX_2054.to_owned(),
         })
     })?;
 

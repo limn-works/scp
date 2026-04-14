@@ -26,6 +26,7 @@
 //! See ADR-022 in `.docs/adrs/phase-4.md`.
 
 use napi::Status;
+use scp_ffi_common::error_codes as codes;
 
 // ---------------------------------------------------------------------------
 // ScpNapiError — unified error type for the napi bridge layer
@@ -128,7 +129,7 @@ impl From<scp_identity::IdentityError> for ScpNapiError {
             message: format!(
                 "{e} — check DID format, key custody configuration, or DHT connectivity"
             ),
-            code: "SCP-IDENT-1001".to_owned(),
+            code: codes::IDENT_1001.to_owned(),
         }
     }
 }
@@ -165,23 +166,23 @@ impl From<scp_core::context::ContextError> for ScpNapiError {
             // the message body.
             CE::RateLimited { .. } => Self::Context {
                 message: format!("{e}"),
-                code: "SCP-ECON-12090".to_owned(),
+                code: codes::ECON_12090.to_owned(),
             },
             // §23.17 snapshot import regression.
             CE::SnapshotFloorRegression { .. } => Self::Context {
                 message: format!("{e}"),
-                code: "SCP-CTX-2091".to_owned(),
+                code: codes::CTX_2091.to_owned(),
             },
             // C3: snapshot import structural/semantic rejection.
             CE::ImportRejected { .. } => Self::Context {
                 message: format!("{e}"),
-                code: "SCP-CTX-2092".to_owned(),
+                code: codes::CTX_2092.to_owned(),
             },
             // Recover embedded SCP-ECON-/SCP-TOOL-/SCP-PERM- codes from
             // the runtime's `PermissionDenied(String)` catch-all so the
             // typed-envelope contract holds for tool-economy failures.
             CE::PermissionDenied(msg) => {
-                let code = extract_scp_code(msg).unwrap_or_else(|| "SCP-PERM-3001".to_owned());
+                let code = extract_scp_code(msg).unwrap_or_else(|| codes::PERM_3001.to_owned());
                 if code.starts_with("SCP-PERM-") {
                     Self::Permission {
                         message: format!("{e}"),
@@ -201,7 +202,7 @@ impl From<scp_core::context::ContextError> for ScpNapiError {
             }
             _ => Self::Context {
                 message: format!("{e} — verify context state, membership, and permissions"),
-                code: "SCP-CTX-2001".to_owned(),
+                code: codes::CTX_2001.to_owned(),
             },
         }
     }
@@ -213,7 +214,7 @@ impl From<scp_core::context::builder::ContextCreationError> for ScpNapiError {
             message: format!(
                 "context creation failed: {e} — check context parameters and identity"
             ),
-            code: "SCP-CTX-2002".to_owned(),
+            code: codes::CTX_2002.to_owned(),
         }
     }
 }
@@ -224,7 +225,7 @@ impl From<scp_core::context::templates::TemplateError> for ScpNapiError {
             message: format!(
                 "template validation failed: {e} — ensure context params match the template"
             ),
-            code: "SCP-CTX-2003".to_owned(),
+            code: codes::CTX_2003.to_owned(),
         }
     }
 }
@@ -235,7 +236,7 @@ impl From<scp_core::context::roles::RoleError> for ScpNapiError {
             message: format!(
                 "role operation failed: {e} — verify role definitions and member permissions"
             ),
-            code: "SCP-CTX-2004".to_owned(),
+            code: codes::CTX_2004.to_owned(),
         }
     }
 }
@@ -246,7 +247,7 @@ impl From<scp_core::context::ttl::TtlError> for ScpNapiError {
             message: format!(
                 "TTL operation failed: {e} — check TTL configuration and context state"
             ),
-            code: "SCP-CTX-2005".to_owned(),
+            code: codes::CTX_2005.to_owned(),
         }
     }
 }
@@ -257,7 +258,7 @@ impl From<scp_core::context::promotion::PromotionError> for ScpNapiError {
             message: format!(
                 "context promotion failed: {e} — verify eligibility and governance rules"
             ),
-            code: "SCP-CTX-2006".to_owned(),
+            code: codes::CTX_2006.to_owned(),
         }
     }
 }
@@ -268,7 +269,7 @@ impl From<scp_core::context::tools::ToolError> for ScpNapiError {
             message: format!(
                 "tool operation failed: {e} — check tool registration, permissions, and input schema"
             ),
-            code: "SCP-TOOL-6001".to_owned(),
+            code: codes::TOOL_6001.to_owned(),
         }
     }
 }
@@ -279,7 +280,7 @@ impl From<scp_core::context::tools::invoke::InvocationError> for ScpNapiError {
             message: format!(
                 "tool invocation failed: {e} — verify tool ID, input, and caller permissions"
             ),
-            code: "SCP-TOOL-6002".to_owned(),
+            code: codes::TOOL_6002.to_owned(),
         }
     }
 }
@@ -290,7 +291,7 @@ impl From<scp_core::context::tools::schema::SchemaValidationError> for ScpNapiEr
             message: format!(
                 "schema validation failed: {e} — check input against the tool's JSON Schema"
             ),
-            code: "SCP-VALID-7001".to_owned(),
+            code: codes::VALID_7001.to_owned(),
         }
     }
 }
@@ -301,7 +302,7 @@ impl From<scp_core::crypto::mls::error::MlsError> for ScpNapiError {
             message: format!(
                 "MLS operation failed: {e} — check group state and member key packages"
             ),
-            code: "SCP-CRYPTO-4001".to_owned(),
+            code: codes::CRYPTO_4001.to_owned(),
         }
     }
 }
@@ -312,7 +313,7 @@ impl From<scp_core::crypto::sender_keys::SenderKeyError> for ScpNapiError {
             message: format!(
                 "sender key operation failed: {e} — verify key material and encryption parameters"
             ),
-            code: "SCP-CRYPTO-4002".to_owned(),
+            code: codes::CRYPTO_4002.to_owned(),
         }
     }
 }
@@ -323,7 +324,7 @@ impl From<scp_core::crypto::ucan::UcanError> for ScpNapiError {
             message: format!(
                 "{e} — check token format, signatures, time bounds, and capability chain"
             ),
-            code: "SCP-PERM-3001".to_owned(),
+            code: codes::PERM_3001.to_owned(),
         }
     }
 }
@@ -334,7 +335,7 @@ impl From<scp_core::envelope::EnvelopeError> for ScpNapiError {
             message: format!(
                 "envelope operation failed: {e} — check payload size, signing keys, and encryption state"
             ),
-            code: "SCP-CRYPTO-4003".to_owned(),
+            code: codes::CRYPTO_4003.to_owned(),
         }
     }
 }
@@ -345,7 +346,7 @@ impl From<scp_event_log::EventLogError> for ScpNapiError {
             message: format!(
                 "event log operation failed: {e} — verify log integrity and sequence numbers"
             ),
-            code: "SCP-CTX-2007".to_owned(),
+            code: codes::CTX_2007.to_owned(),
         }
     }
 }
@@ -354,7 +355,7 @@ impl From<scp_core::provenance::ProvenanceError> for ScpNapiError {
     fn from(e: scp_core::provenance::ProvenanceError) -> Self {
         Self::Validation {
             message: format!("provenance validation failed: {e} — check cross-context chain depth"),
-            code: "SCP-VALID-7002".to_owned(),
+            code: codes::VALID_7002.to_owned(),
         }
     }
 }
@@ -365,7 +366,7 @@ impl From<scp_core::trust::TrustError> for ScpNapiError {
             message: format!(
                 "trust evaluation failed: {e} — check event log data and attestation validity"
             ),
-            code: "SCP-VALID-7003".to_owned(),
+            code: codes::VALID_7003.to_owned(),
         }
     }
 }
@@ -374,7 +375,7 @@ impl From<scp_core::uri::ScpUriError> for ScpNapiError {
     fn from(e: scp_core::uri::ScpUriError) -> Self {
         Self::Validation {
             message: format!("invalid SCP URI: {e} — check URI format (scp://relay/context-id)"),
-            code: "SCP-VALID-7004".to_owned(),
+            code: codes::VALID_7004.to_owned(),
         }
     }
 }
@@ -383,7 +384,7 @@ impl From<scp_core::well_known::WellKnownValidationError> for ScpNapiError {
     fn from(e: scp_core::well_known::WellKnownValidationError) -> Self {
         Self::Validation {
             message: format!("well-known validation failed: {e} — check relay configuration"),
-            code: "SCP-VALID-7005".to_owned(),
+            code: codes::VALID_7005.to_owned(),
         }
     }
 }
@@ -394,7 +395,7 @@ impl From<scp_core::discovery::DiscoveryError> for ScpNapiError {
             message: format!(
                 "discovery operation failed: {e} — check relay connectivity and search parameters"
             ),
-            code: "SCP-CTX-2008".to_owned(),
+            code: codes::CTX_2008.to_owned(),
         }
     }
 }
@@ -405,7 +406,7 @@ impl From<scp_core::bridge::registration::BridgeRegistrationError> for ScpNapiEr
             message: format!(
                 "bridge registration failed: {e} — verify bridge configuration and permissions"
             ),
-            code: "SCP-CTX-2009".to_owned(),
+            code: codes::CTX_2009.to_owned(),
         }
     }
 }
@@ -416,7 +417,7 @@ impl From<scp_core::bridge::shadow::ShadowError> for ScpNapiError {
             message: format!(
                 "shadow context operation failed: {e} — check bridge state and context permissions"
             ),
-            code: "SCP-CTX-2010".to_owned(),
+            code: codes::CTX_2010.to_owned(),
         }
     }
 }
@@ -427,7 +428,7 @@ impl From<scp_platform::PlatformError> for ScpNapiError {
             message: format!(
                 "platform key operation failed: {e} — check key custody configuration"
             ),
-            code: "SCP-CRYPTO-4004".to_owned(),
+            code: codes::CRYPTO_4004.to_owned(),
         }
     }
 }
@@ -436,7 +437,7 @@ impl From<serde_json::Error> for ScpNapiError {
     fn from(e: serde_json::Error) -> Self {
         Self::Validation {
             message: format!("JSON serialization/deserialization failed: {e} — check input format"),
-            code: "SCP-VALID-7006".to_owned(),
+            code: codes::VALID_7006.to_owned(),
         }
     }
 }
@@ -445,7 +446,7 @@ impl From<scp_ffi_common::validate::ValidationError> for ScpNapiError {
     fn from(e: scp_ffi_common::validate::ValidationError) -> Self {
         Self::Validation {
             message: e.message,
-            code: "SCP-VALID-7000".to_owned(),
+            code: codes::VALID_7000.to_owned(),
         }
     }
 }
@@ -464,7 +465,7 @@ pub(crate) fn validate_custody_type(custody: &str) -> Result<&str, ScpNapiError>
             message: format!(
                 "unknown custody type: {other:?} — expected \"in_memory\", \"platform\", or \"software\""
             ),
-            code: "SCP-VALID-7007".to_owned(),
+            code: codes::VALID_7007.to_owned(),
         }),
     }
 }

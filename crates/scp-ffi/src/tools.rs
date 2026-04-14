@@ -17,6 +17,7 @@
 
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
+use scp_ffi_common::error_codes as codes;
 use scp_primitives::Clock;
 
 use crate::error::ScpPyError;
@@ -185,7 +186,7 @@ pub fn py_tool_register(context_id: &str, registration: &Bound<'_, PyDict>) -> P
     let input_schema = schema_json.get("input_schema").cloned().ok_or_else(|| {
         ScpPyError::ValidationError {
             message: "missing 'input_schema' in schema dict — both 'input_schema' and 'output_schema' are required".to_owned(),
-            code: "SCP-VALID-7035".to_owned(),
+            code: codes::VALID_7035.to_owned(),
         }
     })?;
     if !input_schema.is_object() {
@@ -194,14 +195,14 @@ pub fn py_tool_register(context_id: &str, registration: &Bound<'_, PyDict>) -> P
                 "invalid 'input_schema': expected a JSON object, got {}",
                 scp_ffi_common::validate::json_value_type_name(&input_schema)
             ),
-            code: "SCP-VALID-7035".to_owned(),
+            code: codes::VALID_7035.to_owned(),
         }
         .into());
     }
     let output_schema = schema_json.get("output_schema").cloned().ok_or_else(|| {
         ScpPyError::ValidationError {
             message: "missing 'output_schema' in schema dict — both 'input_schema' and 'output_schema' are required".to_owned(),
-            code: "SCP-VALID-7036".to_owned(),
+            code: codes::VALID_7036.to_owned(),
         }
     })?;
     if !output_schema.is_object() {
@@ -210,7 +211,7 @@ pub fn py_tool_register(context_id: &str, registration: &Bound<'_, PyDict>) -> P
                 "invalid 'output_schema': expected a JSON object, got {}",
                 scp_ffi_common::validate::json_value_type_name(&output_schema)
             ),
-            code: "SCP-VALID-7036".to_owned(),
+            code: codes::VALID_7036.to_owned(),
         }
         .into());
     }
@@ -425,7 +426,7 @@ pub fn py_tool_invoke(
             scp_core::crypto::ucan::validate::parse_ucan(jwt).map_err(|e| {
                 ScpPyError::ContextError {
                     message: format!("invalid spending UCAN: {e}"),
-                    code: "SCP-ECON-12061".to_owned(),
+                    code: codes::ECON_12061.to_owned(),
                 }
             })
         })
@@ -603,7 +604,7 @@ fn extract_implementation_hash(registration: &Bound<'_, PyDict>) -> PyResult<[u8
         .extract()
         .map_err(|_| ScpPyError::ValidationError {
             message: "'implementation_hash' must be a hex string".to_owned(),
-            code: "SCP-VALID-7038".to_owned(),
+            code: codes::VALID_7038.to_owned(),
         })?;
 
     if hex_str.len() != 64 {
@@ -612,7 +613,7 @@ fn extract_implementation_hash(registration: &Bound<'_, PyDict>) -> PyResult<[u8
                 "'implementation_hash' must be 64 hex chars (SHA-256), got {}",
                 hex_str.len()
             ),
-            code: "SCP-VALID-7038".to_owned(),
+            code: codes::VALID_7038.to_owned(),
         }
         .into());
     }
@@ -621,11 +622,11 @@ fn extract_implementation_hash(registration: &Bound<'_, PyDict>) -> PyResult<[u8
     for (i, chunk) in hex_str.as_bytes().chunks(2).enumerate() {
         let byte_str = std::str::from_utf8(chunk).map_err(|_| ScpPyError::ValidationError {
             message: "invalid UTF-8 in implementation_hash".to_owned(),
-            code: "SCP-VALID-7038".to_owned(),
+            code: codes::VALID_7038.to_owned(),
         })?;
         hash[i] = u8::from_str_radix(byte_str, 16).map_err(|_| ScpPyError::ValidationError {
             message: format!("invalid hex in implementation_hash at position {}", i * 2),
-            code: "SCP-VALID-7038".to_owned(),
+            code: codes::VALID_7038.to_owned(),
         })?;
     }
 
@@ -696,7 +697,7 @@ fn extract_test_vectors(
             .downcast::<pyo3::types::PyList>()
             .map_err(|_| ScpPyError::ValidationError {
                 message: "'test_vectors' must be a list".to_owned(),
-                code: "SCP-VALID-7037".to_owned(),
+                code: codes::VALID_7037.to_owned(),
             })?;
 
     let mut result = Vec::with_capacity(vectors_list.len());
@@ -705,7 +706,7 @@ fn extract_test_vectors(
             .downcast::<PyDict>()
             .map_err(|_| ScpPyError::ValidationError {
                 message: "each test vector must be a dict".to_owned(),
-                code: "SCP-VALID-7037".to_owned(),
+                code: codes::VALID_7037.to_owned(),
             })?;
         let tv_json = py_dict_to_json(dict)?;
 
@@ -1196,7 +1197,7 @@ pub fn py_tool_interface_expose(
             let parsed: scp_core::context::tools::interface::RateLimit = serde_json::from_str(json)
                 .map_err(|e| ScpPyError::ValidationError {
                     message: format!("invalid rate_limit_json: {e}"),
-                    code: "SCP-VALID-7040".to_owned(),
+                    code: codes::VALID_7040.to_owned(),
                 })?;
             Some(parsed)
         }
@@ -1221,12 +1222,12 @@ pub fn py_tool_interface_expose(
         )
         .map_err(|e| ScpPyError::ContextError {
             message: format!("expose_tool failed: {e}"),
-            code: "SCP-TOOL-6030".to_owned(),
+            code: codes::TOOL_6030.to_owned(),
         })?;
 
         serde_json::to_string(&interface).map_err(|e| ScpPyError::ContextError {
             message: format!("failed to serialize ToolInterface: {e}"),
-            code: "SCP-TOOL-6031".to_owned(),
+            code: codes::TOOL_6031.to_owned(),
         })
     })?)
 }
@@ -1258,7 +1259,7 @@ pub fn py_tool_interface_accept(context_id: &str, interface_json: &str) -> PyRes
     let mut interface: scp_core::context::tools::interface::ToolInterface =
         serde_json::from_str(interface_json).map_err(|e| ScpPyError::ValidationError {
             message: format!("invalid interface_json: {e}"),
-            code: "SCP-VALID-7041".to_owned(),
+            code: codes::VALID_7041.to_owned(),
         })?;
 
     Ok(crate::runtime::with_context(context_id, |rt| {
@@ -1276,12 +1277,12 @@ pub fn py_tool_interface_accept(context_id: &str, interface_json: &str) -> PyRes
         )
         .map_err(|e| ScpPyError::ContextError {
             message: format!("accept_tool_interface failed: {e}"),
-            code: "SCP-TOOL-6032".to_owned(),
+            code: codes::TOOL_6032.to_owned(),
         })?;
 
         serde_json::to_string(&interface).map_err(|e| ScpPyError::ContextError {
             message: format!("failed to serialize ToolInterface: {e}"),
-            code: "SCP-TOOL-6033".to_owned(),
+            code: codes::TOOL_6033.to_owned(),
         })
     })?)
 }
@@ -1311,7 +1312,7 @@ pub fn py_tool_interface_revoke(context_id: &str, interface_id_hex: &str) -> PyR
     let interface_id_bytes =
         hex::decode(interface_id_hex).map_err(|e| ScpPyError::ValidationError {
             message: format!("invalid interface_id_hex: not valid hex: {e}"),
-            code: "SCP-VALID-7042".to_owned(),
+            code: codes::VALID_7042.to_owned(),
         })?;
     let interface_id: [u8; 32] =
         <[u8; 32]>::try_from(interface_id_bytes.as_slice()).map_err(|_| {
@@ -1320,7 +1321,7 @@ pub fn py_tool_interface_revoke(context_id: &str, interface_id_hex: &str) -> PyR
                     "interface_id_hex must be exactly 32 bytes (64 hex chars), got {}",
                     interface_id_bytes.len()
                 ),
-                code: "SCP-VALID-7042".to_owned(),
+                code: codes::VALID_7042.to_owned(),
             }
         })?;
 
@@ -1334,7 +1335,7 @@ pub fn py_tool_interface_revoke(context_id: &str, interface_id_hex: &str) -> PyR
 
     let json = serde_json::to_string(&event).map_err(|e| ScpPyError::ContextError {
         message: format!("failed to serialize InterfaceRevoked: {e}"),
-        code: "SCP-TOOL-6035".to_owned(),
+        code: codes::TOOL_6035.to_owned(),
     })?;
 
     Ok(json)
@@ -1375,6 +1376,7 @@ pub fn register_tools(m: &Bound<'_, PyModule>) -> PyResult<()> {
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
+    use scp_ffi_common::error_codes as codes;
 
     #[test]
     fn json_value_type_name_covers_all_variants() {
@@ -1410,7 +1412,7 @@ mod tests {
             assert!(result.is_err(), "should reject missing input_schema");
             let err_str = format!("{}", result.unwrap_err());
             assert!(
-                err_str.contains("SCP-VALID-7035"),
+                err_str.contains(codes::VALID_7035),
                 "error should contain SCP-VALID-7035, got: {err_str}"
             );
             assert!(
@@ -1442,7 +1444,7 @@ mod tests {
             assert!(result.is_err(), "should reject missing output_schema");
             let err_str = format!("{}", result.unwrap_err());
             assert!(
-                err_str.contains("SCP-VALID-7036"),
+                err_str.contains(codes::VALID_7036),
                 "error should contain SCP-VALID-7036, got: {err_str}"
             );
             assert!(
@@ -1475,7 +1477,7 @@ mod tests {
             assert!(result.is_err(), "should reject non-object input_schema");
             let err_str = format!("{}", result.unwrap_err());
             assert!(
-                err_str.contains("SCP-VALID-7035"),
+                err_str.contains(codes::VALID_7035),
                 "error should contain SCP-VALID-7035, got: {err_str}"
             );
         });
@@ -1505,7 +1507,7 @@ mod tests {
             assert!(result.is_err(), "should reject non-object output_schema");
             let err_str = format!("{}", result.unwrap_err());
             assert!(
-                err_str.contains("SCP-VALID-7036"),
+                err_str.contains(codes::VALID_7036),
                 "error should contain SCP-VALID-7036, got: {err_str}"
             );
         });
@@ -1547,7 +1549,7 @@ mod tests {
             assert!(result.is_err(), "should reject non-list test_vectors");
             let err_str = format!("{}", result.unwrap_err());
             assert!(
-                err_str.contains("SCP-VALID-7037"),
+                err_str.contains(codes::VALID_7037),
                 "error should contain SCP-VALID-7037, got: {err_str}"
             );
             assert!(
@@ -1573,7 +1575,7 @@ mod tests {
             );
             let err_str = format!("{}", result.unwrap_err());
             assert!(
-                err_str.contains("SCP-VALID-7037"),
+                err_str.contains(codes::VALID_7037),
                 "error should contain SCP-VALID-7037, got: {err_str}"
             );
             assert!(
@@ -1597,7 +1599,7 @@ mod tests {
             assert!(result.is_err(), "should reject dict as test_vectors");
             let err_str = format!("{}", result.unwrap_err());
             assert!(
-                err_str.contains("SCP-VALID-7037"),
+                err_str.contains(codes::VALID_7037),
                 "error should contain SCP-VALID-7037, got: {err_str}"
             );
         });
@@ -1651,7 +1653,7 @@ mod tests {
             );
             let err_str = format!("{}", result.unwrap_err());
             assert!(
-                err_str.contains("SCP-VALID-7038"),
+                err_str.contains(codes::VALID_7038),
                 "error should contain SCP-VALID-7038, got: {err_str}"
             );
             assert!(
@@ -1678,7 +1680,7 @@ mod tests {
             );
             let err_str = format!("{}", result.unwrap_err());
             assert!(
-                err_str.contains("SCP-VALID-7038"),
+                err_str.contains(codes::VALID_7038),
                 "error should contain SCP-VALID-7038, got: {err_str}"
             );
             assert!(
@@ -1708,7 +1710,7 @@ mod tests {
             );
             let err_str = format!("{}", result.unwrap_err());
             assert!(
-                err_str.contains("SCP-VALID-7038"),
+                err_str.contains(codes::VALID_7038),
                 "error should contain SCP-VALID-7038, got: {err_str}"
             );
             assert!(

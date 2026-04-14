@@ -17,6 +17,7 @@
 
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
+use scp_ffi_common::error_codes as codes;
 
 use scp_media::session::{
     MediaCapability, MediaSession, MediaSessionState, SessionMetadata, activate_session,
@@ -42,7 +43,7 @@ fn parse_media_capability(s: &str) -> PyResult<MediaCapability> {
             message: format!(
                 "invalid media capability '{other}': expected 'voice', 'video', or 'screen_share'"
             ),
-            code: "SCP-VALID-7300".to_string(),
+            code: codes::VALID_7300.to_string(),
         }
         .into()),
     }
@@ -120,7 +121,7 @@ fn metadata_to_dict<'py>(
 fn media_error_to_py(e: scp_media::keys::MediaError) -> PyErr {
     ScpPyError::ContextError {
         message: e.to_string(),
-        code: "SCP-CTX-2500".to_string(),
+        code: codes::CTX_2500.to_string(),
     }
     .into()
 }
@@ -233,7 +234,7 @@ pub fn py_media_activate_session(
     let mut session: MediaSession =
         serde_json::from_str(&session_json).map_err(|e| ScpPyError::ValidationError {
             message: format!("invalid session JSON: {e}"),
-            code: "SCP-VALID-7301".to_string(),
+            code: codes::VALID_7301.to_string(),
         })?;
 
     activate_session(&mut session).map_err(media_error_to_py)?;
@@ -264,7 +265,7 @@ pub fn py_media_join_session(
     let mut session: MediaSession =
         serde_json::from_str(&session_json).map_err(|e| ScpPyError::ValidationError {
             message: format!("invalid session JSON: {e}"),
-            code: "SCP-VALID-7301".to_string(),
+            code: codes::VALID_7301.to_string(),
         })?;
 
     join_media_session(&mut session, participant_did.into()).map_err(media_error_to_py)?;
@@ -297,7 +298,7 @@ pub fn py_media_end_session(
     let mut session: MediaSession =
         serde_json::from_str(&session_json).map_err(|e| ScpPyError::ValidationError {
             message: format!("invalid session JSON: {e}"),
-            code: "SCP-VALID-7301".to_string(),
+            code: codes::VALID_7301.to_string(),
         })?;
 
     let metadata = end_media_session(&mut session, timestamp).map_err(media_error_to_py)?;
@@ -334,7 +335,7 @@ pub fn py_media_create_offer(
     let (sid, msg) = create_offer(&session_id, sdp, sender_did.into());
     let msg_bytes = serialize_signaling(&msg).map_err(|e| ScpPyError::ValidationError {
         message: format!("failed to serialize signaling message: {e}"),
-        code: "SCP-VALID-7302".to_string(),
+        code: codes::VALID_7302.to_string(),
     })?;
     let dict = PyDict::new(py);
     dict.set_item("session_id", sid)?;
@@ -364,7 +365,7 @@ pub fn py_media_create_answer(
     let (sid, msg) = create_answer(&session_id, sdp, sender_did.into());
     let msg_bytes = serialize_signaling(&msg).map_err(|e| ScpPyError::ValidationError {
         message: format!("failed to serialize signaling message: {e}"),
-        code: "SCP-VALID-7302".to_string(),
+        code: codes::VALID_7302.to_string(),
     })?;
     let dict = PyDict::new(py);
     dict.set_item("session_id", sid)?;
@@ -405,7 +406,7 @@ pub fn py_media_create_ice_candidate(
     );
     let msg_bytes = serialize_signaling(&msg).map_err(|e| ScpPyError::ValidationError {
         message: format!("failed to serialize signaling message: {e}"),
-        code: "SCP-VALID-7302".to_string(),
+        code: codes::VALID_7302.to_string(),
     })?;
     let dict = PyDict::new(py);
     dict.set_item("session_id", sid)?;
@@ -433,7 +434,7 @@ pub fn py_media_create_session_end(
     let (sid, msg) = create_session_end(&session_id, sender_did.into());
     let msg_bytes = serialize_signaling(&msg).map_err(|e| ScpPyError::ValidationError {
         message: format!("failed to serialize signaling message: {e}"),
-        code: "SCP-VALID-7302".to_string(),
+        code: codes::VALID_7302.to_string(),
     })?;
     let dict = PyDict::new(py);
     dict.set_item("session_id", sid)?;
@@ -463,13 +464,13 @@ pub fn py_media_send_signaling(
     let msg = deserialize_signaling(signaling_json.as_bytes()).map_err(|e| {
         ScpPyError::ValidationError {
             message: format!("invalid signaling JSON: {e}"),
-            code: "SCP-VALID-7303".to_string(),
+            code: codes::VALID_7303.to_string(),
         }
     })?;
     let (payload, message_type) =
         send_signaling(&msg).map_err(|e| ScpPyError::ValidationError {
             message: format!("failed to serialize signaling: {e}"),
-            code: "SCP-VALID-7302".to_string(),
+            code: codes::VALID_7302.to_string(),
         })?;
 
     let dict = PyDict::new(py);
@@ -505,13 +506,13 @@ pub fn py_media_verify_sender_attribution(
     let msg = deserialize_signaling(signaling_json.as_bytes()).map_err(|e| {
         ScpPyError::ValidationError {
             message: format!("invalid signaling JSON: {e}"),
-            code: "SCP-VALID-7303".to_string(),
+            code: codes::VALID_7303.to_string(),
         }
     })?;
     verify_sender_attribution(&msg, &envelope_sender_did).map_err(|e| {
         ScpPyError::ContextError {
             message: format!("sender attribution verification failed: {e}"),
-            code: "SCP-CTX-2501".to_string(),
+            code: codes::CTX_2501.to_string(),
         }
     })?;
     Ok(true)

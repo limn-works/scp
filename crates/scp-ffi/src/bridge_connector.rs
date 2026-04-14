@@ -25,6 +25,7 @@
 //! See spec section 12 (Bridge System), section 12.11 (Credential Lifecycle),
 //! and ADR-023.
 
+use scp_ffi_common::error_codes as codes;
 use std::sync::OnceLock;
 
 use dashmap::DashMap;
@@ -191,7 +192,7 @@ pub fn py_bridge_register(
         .map(|k| {
             <[u8; 32]>::try_from(k.as_slice()).map_err(|_| ScpPyError::ValidationError {
                 message: format!("platform_key must be exactly 32 bytes, got {}", k.len()),
-                code: "SCP-VALID-7052".to_string(),
+                code: codes::VALID_7052.to_string(),
             })
         })
         .transpose()?;
@@ -221,7 +222,7 @@ pub fn py_bridge_register(
 
     let _event = register_bridge(&mut registry, request).map_err(|e| ScpPyError::ContextError {
         message: format!("bridge registration failed: {e}"),
-        code: "SCP-CTX-2100".to_string(),
+        code: codes::CTX_2100.to_string(),
     })?;
 
     let approver_did: scp_identity::DID = governance_did.into();
@@ -229,7 +230,7 @@ pub fn py_bridge_register(
         approve_registration(&mut registry, &bridge_id, &approver_did, 0).map_err(|e| {
             ScpPyError::ContextError {
                 message: format!("bridge approval failed: {e}"),
-                code: "SCP-CTX-2101".to_string(),
+                code: codes::CTX_2101.to_string(),
             }
         })?;
 
@@ -381,7 +382,7 @@ pub fn py_bridge_create_shadow(
     )
     .map_err(|e| ScpPyError::ContextError {
         message: format!("shadow creation failed: {e}"),
-        code: "SCP-CTX-2102".to_string(),
+        code: codes::CTX_2102.to_string(),
     })?;
 
     let dict = PyDict::new(py);
@@ -462,7 +463,7 @@ pub fn py_bridge_claim_shadow(
     let attestation: Attestation =
         serde_json::from_str(attestation_json).map_err(|e| ScpPyError::ValidationError {
             message: format!("invalid attestation JSON: {e}"),
-            code: "SCP-VALID-7053".to_string(),
+            code: codes::VALID_7053.to_string(),
         })?;
 
     // Build the shadow registry and create the shadow so it can be found.
@@ -479,7 +480,7 @@ pub fn py_bridge_claim_shadow(
     create_shadow(&mut shadow_registry, &mut sender_key_store, &shadow_params).map_err(|e| {
         ScpPyError::ContextError {
             message: format!("shadow setup for claiming failed: {e}"),
-            code: "SCP-CTX-2103".to_string(),
+            code: codes::CTX_2103.to_string(),
         }
     })?;
 
@@ -496,7 +497,7 @@ pub fn py_bridge_claim_shadow(
     let event =
         claim_shadow(&mut shadow_registry, &request).map_err(|e| ScpPyError::ContextError {
             message: format!("shadow claim failed: {e}"),
-            code: "SCP-CTX-2104".to_string(),
+            code: codes::CTX_2104.to_string(),
         })?;
 
     let dict = PyDict::new(py);
@@ -597,7 +598,7 @@ pub fn py_bridge_seal_shadow_envelope(
                     "sender_key_bytes must be exactly 32 bytes, got {}",
                     sender_key_bytes.len()
                 ),
-                code: "SCP-VALID-7054".to_string(),
+                code: codes::VALID_7054.to_string(),
             }
         })?,
     );
@@ -657,13 +658,13 @@ pub fn py_bridge_seal_shadow_envelope(
 
     let envelope = seal_shadow_envelope(&params).map_err(|e| ScpPyError::CryptoError {
         message: format!("envelope sealing failed: {e}"),
-        code: "SCP-CRYPTO-4010".to_string(),
+        code: codes::CRYPTO_4010.to_string(),
     })?;
 
     Ok(
         serde_json::to_string(&envelope).map_err(|e| ScpPyError::ValidationError {
             message: format!("envelope serialization failed: {e}"),
-            code: "SCP-VALID-7055".to_string(),
+            code: codes::VALID_7055.to_string(),
         })?,
     )
 }
@@ -705,7 +706,7 @@ pub fn py_bridge_open_shadow_envelope(
     let envelope: scp_core::bridge::envelope::SenderKeyEnvelope =
         serde_json::from_str(envelope_json).map_err(|e| ScpPyError::ValidationError {
             message: format!("invalid envelope JSON: {e}"),
-            code: "SCP-VALID-7056".to_string(),
+            code: codes::VALID_7056.to_string(),
         })?;
 
     // Wrap raw key material in Zeroizing to prevent lingering in freed heap
@@ -718,7 +719,7 @@ pub fn py_bridge_open_shadow_envelope(
                     "sender_key_bytes must be exactly 32 bytes, got {}",
                     sender_key_bytes.len()
                 ),
-                code: "SCP-VALID-7054".to_string(),
+                code: codes::VALID_7054.to_string(),
             }
         })?,
     );
@@ -746,7 +747,7 @@ pub fn py_bridge_open_shadow_envelope(
     )
     .map_err(|e| ScpPyError::CryptoError {
         message: format!("envelope opening failed: {e}"),
-        code: "SCP-CRYPTO-4011".to_string(),
+        code: codes::CRYPTO_4011.to_string(),
     })?)
 }
 
@@ -784,7 +785,7 @@ pub fn py_bridge_derive_credential_key(
                     "bridge_credential_key must be exactly 32 bytes, got {}",
                     bridge_credential_key.len()
                 ),
-                code: "SCP-VALID-7057".to_string(),
+                code: codes::VALID_7057.to_string(),
             }
         })?,
     );
@@ -792,7 +793,7 @@ pub fn py_bridge_derive_credential_key(
     let derived =
         derive_credential_key(&key_bytes, bridge_id).map_err(|e| ScpPyError::CryptoError {
             message: format!("credential key derivation failed: {e}"),
-            code: "SCP-CRYPTO-4012".to_string(),
+            code: codes::CRYPTO_4012.to_string(),
         })?;
 
     // SAFETY: `.to_vec()` creates an unzeroized copy of the derived key
@@ -868,7 +869,7 @@ pub fn py_bridge_credential_provision(
         .block_on(store.provision(bridge_id, ct, &plaintext, &key_bytes))
         .map_err(|e| ScpPyError::ContextError {
             message: format!("credential provision failed: {e}"),
-            code: "SCP-CTX-2105".to_string(),
+            code: codes::CTX_2105.to_string(),
         })?;
 
     let dict = PyDict::new(py);
@@ -912,7 +913,7 @@ pub fn py_bridge_credential_retrieve(
         .block_on(store.retrieve(bridge_id, &ct, &key_bytes))
         .map_err(|e| ScpPyError::ContextError {
             message: format!("credential retrieve failed: {e}"),
-            code: "SCP-CTX-2106".to_string(),
+            code: codes::CTX_2106.to_string(),
         })?;
 
     Ok(plaintext.to_vec())
@@ -955,7 +956,7 @@ pub fn py_bridge_credential_rotate(
         .block_on(store.rotate(bridge_id, &ct, &new_plaintext, &key_bytes))
         .map_err(|e| ScpPyError::ContextError {
             message: format!("credential rotate failed: {e}"),
-            code: "SCP-CTX-2107".to_string(),
+            code: codes::CTX_2107.to_string(),
         })?;
 
     let dict = PyDict::new(py);
@@ -986,7 +987,7 @@ pub fn py_bridge_credential_revoke(bridge_id: &str) -> PyResult<()> {
     rt.block_on(store.revoke(bridge_id))
         .map_err(|e| ScpPyError::ContextError {
             message: format!("credential revoke failed: {e}"),
-            code: "SCP-CTX-2108".to_string(),
+            code: codes::CTX_2108.to_string(),
         })?;
 
     Ok(())
@@ -1015,14 +1016,14 @@ pub fn py_bridge_credential_list(py: Python<'_>, bridge_id: &str) -> PyResult<Py
         .block_on(store.list(bridge_id))
         .map_err(|e| ScpPyError::ContextError {
             message: format!("credential list failed: {e}"),
-            code: "SCP-CTX-2109".to_string(),
+            code: codes::CTX_2109.to_string(),
         })?;
 
     let list =
         PyList::new(py, types.iter().map(std::string::ToString::to_string)).map_err(|e| {
             ScpPyError::ContextError {
                 message: format!("failed to build Python list: {e}"),
-                code: "SCP-CTX-2110".to_string(),
+                code: codes::CTX_2110.to_string(),
             }
         })?;
     Ok(list.into())
@@ -1053,7 +1054,7 @@ pub fn py_bridge_credential_store_key(bridge_id: &str, key: Vec<u8>) -> PyResult
     rt.block_on(store.store_bridge_credential_key(bridge_id, Zeroizing::new(key_bytes)))
         .map_err(|e| ScpPyError::ContextError {
             message: format!("credential key store failed: {e}"),
-            code: "SCP-CTX-2111".to_string(),
+            code: codes::CTX_2111.to_string(),
         })?;
 
     Ok(())
@@ -1082,7 +1083,7 @@ pub fn py_bridge_credential_get_key(bridge_id: &str) -> PyResult<Vec<u8>> {
         .block_on(store.get_bridge_credential_key(bridge_id))
         .map_err(|e| ScpPyError::ContextError {
             message: format!("credential key retrieval failed: {e}"),
-            code: "SCP-CTX-2112".to_string(),
+            code: codes::CTX_2112.to_string(),
         })?;
 
     Ok(key.to_vec())
@@ -1108,7 +1109,7 @@ pub fn py_bridge_credential_delete_key(bridge_id: &str) -> PyResult<()> {
     rt.block_on(store.delete_bridge_credential_key(bridge_id))
         .map_err(|e| ScpPyError::ContextError {
             message: format!("credential key deletion failed: {e}"),
-            code: "SCP-CTX-2113".to_string(),
+            code: codes::CTX_2113.to_string(),
         })?;
 
     Ok(())
@@ -1213,7 +1214,7 @@ pub fn py_bridge_oauth_scopes_for_mode(py: Python<'_>, mode: &str) -> PyResult<P
     let scopes = scopes_for_mode(&bridge_mode);
     let list = PyList::new(py, &scopes).map_err(|e| ScpPyError::ContextError {
         message: format!("failed to build Python list: {e}"),
-        code: "SCP-CTX-2114".to_string(),
+        code: codes::CTX_2114.to_string(),
     })?;
     Ok(list.into())
 }
@@ -1232,7 +1233,7 @@ fn parse_bridge_mode(s: &str) -> PyResult<BridgeMode> {
             message: format!(
                 "invalid bridge mode '{other}': expected 'relay', 'puppet', 'api', or 'cooperative'"
             ),
-            code: "SCP-VALID-7050".to_string(),
+            code: codes::VALID_7050.to_string(),
         }
         .into()),
     }
@@ -1251,7 +1252,7 @@ fn parse_credential_type(s: &str) -> PyResult<CredentialType> {
                         "invalid credential type '{other}': expected 'OAuthAccessToken', \
                          'OAuthRefreshToken', 'ApiKey', 'WebhookSecret', or 'Custom:<name>'"
                     ),
-                    code: "SCP-VALID-7058".to_string(),
+                    code: codes::VALID_7058.to_string(),
                 }
                 .into())
             },
@@ -1267,7 +1268,7 @@ fn parse_credential_key_bytes(key: &[u8]) -> PyResult<[u8; 32]> {
                 "bridge_credential_key must be exactly 32 bytes, got {}",
                 key.len()
             ),
-            code: "SCP-VALID-7057".to_string(),
+            code: codes::VALID_7057.to_string(),
         }
         .into()
     })
@@ -1279,7 +1280,7 @@ fn parse_shadow_status(s: &str) -> PyResult<ShadowProvenanceStatus> {
         "claimed" => Ok(ShadowProvenanceStatus::Claimed),
         other => Err(ScpPyError::ValidationError {
             message: format!("invalid shadow_status '{other}': expected 'shadow' or 'claimed'"),
-            code: "SCP-VALID-7051".to_string(),
+            code: codes::VALID_7051.to_string(),
         }
         .into()),
     }

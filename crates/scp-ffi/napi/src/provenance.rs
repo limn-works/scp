@@ -17,6 +17,7 @@
 //! See spec section 24 (Provenance System) and ADR-019.
 
 use napi_derive::napi;
+use scp_ffi_common::error_codes as codes;
 use sha2::{Digest, Sha256};
 use zeroize::Zeroizing;
 
@@ -146,7 +147,7 @@ pub fn provenance_attach(
     let prov_json_bytes = serde_json::to_vec(&prov).map_err(|e| {
         napi::Error::from(ScpNapiError::Validation {
             message: format!("failed to serialize provenance for hashing: {e}"),
-            code: "SCP-VALID-7053".to_owned(),
+            code: codes::VALID_7053.to_owned(),
         })
     })?;
     let prov_hash: [u8; 32] = Sha256::digest(&prov_json_bytes).into();
@@ -209,7 +210,7 @@ pub fn provenance_attach(
     serde_json::to_string(&result).map_err(|e| {
         napi::Error::from(ScpNapiError::Validation {
             message: format!("failed to serialize provenance: {e}"),
-            code: "SCP-VALID-7002".to_owned(),
+            code: codes::VALID_7002.to_owned(),
         })
     })
 }
@@ -260,7 +261,7 @@ pub fn provenance_redact_counterparties(provenance_json: String) -> napi::Result
     let mut prov: DataProvenance = serde_json::from_str(&provenance_json).map_err(|e| {
         napi::Error::from(ScpNapiError::Validation {
             message: format!("invalid provenance JSON: {e}"),
-            code: "SCP-VALID-7050".to_owned(),
+            code: codes::VALID_7050.to_owned(),
         })
     })?;
 
@@ -269,7 +270,7 @@ pub fn provenance_redact_counterparties(provenance_json: String) -> napi::Result
     serde_json::to_string(&prov).map_err(|e| {
         napi::Error::from(ScpNapiError::Validation {
             message: format!("failed to serialize provenance: {e}"),
-            code: "SCP-VALID-7051".to_owned(),
+            code: codes::VALID_7051.to_owned(),
         })
     })
 }
@@ -288,14 +289,14 @@ pub fn provenance_pseudonymize_counterparties(
     let mut prov: DataProvenance = serde_json::from_str(&provenance_json).map_err(|e| {
         napi::Error::from(ScpNapiError::Validation {
             message: format!("invalid provenance JSON: {e}"),
-            code: "SCP-VALID-7050".to_owned(),
+            code: codes::VALID_7050.to_owned(),
         })
     })?;
 
     let key = Zeroizing::new(hex::decode(&pseudonym_key_hex).map_err(|e| {
         napi::Error::from(ScpNapiError::Validation {
             message: format!("invalid pseudonym_key_hex: {e}"),
-            code: "SCP-VALID-7052".to_owned(),
+            code: codes::VALID_7052.to_owned(),
         })
     })?);
 
@@ -304,7 +305,7 @@ pub fn provenance_pseudonymize_counterparties(
     serde_json::to_string(&prov).map_err(|e| {
         napi::Error::from(ScpNapiError::Validation {
             message: format!("failed to serialize provenance: {e}"),
-            code: "SCP-VALID-7051".to_owned(),
+            code: codes::VALID_7051.to_owned(),
         })
     })
 }
@@ -323,7 +324,7 @@ pub fn provenance_update_source_type(
     let mut prov: DataProvenance = serde_json::from_str(&provenance_json).map_err(|e| {
         napi::Error::from(ScpNapiError::Validation {
             message: format!("invalid provenance JSON: {e}"),
-            code: "SCP-VALID-7050".to_owned(),
+            code: codes::VALID_7050.to_owned(),
         })
     })?;
 
@@ -334,7 +335,7 @@ pub fn provenance_update_source_type(
     serde_json::to_string(&prov).map_err(|e| {
         napi::Error::from(ScpNapiError::Validation {
             message: format!("failed to serialize provenance: {e}"),
-            code: "SCP-VALID-7051".to_owned(),
+            code: codes::VALID_7051.to_owned(),
         })
     })
 }
@@ -381,7 +382,7 @@ fn append_provenance_event(
         scp_event_log::tree::append_unsigned_event(&mut state.event_log, &event).map_err(|e| {
             ScpNapiError::Context {
                 message: format!("failed to append provenance event: {e}"),
-                code: "SCP-CTX-2060".to_owned(),
+                code: codes::CTX_2060.to_owned(),
             }
         })?;
 
@@ -400,7 +401,7 @@ fn parse_source_type(s: &str) -> napi::Result<SourceType> {
             message: format!(
                 "invalid source_type '{other}': expected 'persistent', 'ephemeral', or 'summary'"
             ),
-            code: "SCP-VALID-7000".to_owned(),
+            code: codes::VALID_7000.to_owned(),
         }
         .into()),
     }
@@ -423,7 +424,7 @@ fn parse_context_state(s: &str) -> napi::Result<SourceContextState> {
                  'closed_with_summary_verified', 'closed_with_summary_unverified', \
                  'closed_ephemeral', or 'unknown'"
             ),
-            code: "SCP-VALID-7000".to_owned(),
+            code: codes::VALID_7000.to_owned(),
         }
         .into()),
     }
@@ -438,7 +439,7 @@ fn parse_memory_scope(s: &str) -> napi::Result<MemoryScope> {
             message: format!(
                 "invalid memory_scope '{other}': expected 'full', 'summary', or 'ephemeral'"
             ),
-            code: "SCP-VALID-7001".to_owned(),
+            code: codes::VALID_7001.to_owned(),
         }
         .into()),
     }
@@ -466,7 +467,7 @@ fn parse_discovery_method(s: Option<&str>) -> napi::Result<DiscoveryMethod> {
                     message:
                         "invalid discovery_method 'shared_context:': context ID must not be empty"
                             .to_owned(),
-                    code: "SCP-VALID-7216".to_owned(),
+                    code: codes::VALID_7216.to_owned(),
                 }
                 .into());
             }
@@ -478,7 +479,7 @@ fn parse_discovery_method(s: Option<&str>) -> napi::Result<DiscoveryMethod> {
                 return Err(ScpNapiError::Validation {
                     message: "invalid discovery_method 'registry:': context ID must not be empty"
                         .to_owned(),
-                    code: "SCP-VALID-7216".to_owned(),
+                    code: codes::VALID_7216.to_owned(),
                 }
                 .into());
             }
@@ -489,7 +490,7 @@ fn parse_discovery_method(s: Option<&str>) -> napi::Result<DiscoveryMethod> {
                 "invalid discovery_method '{other}': expected 'OutOfBand', 'out_of_band', \
                  'none', 'shared_context:<context_id>', or 'registry:<context_id>'"
             ),
-            code: "SCP-VALID-7216".to_owned(),
+            code: codes::VALID_7216.to_owned(),
         }
         .into()),
     }
@@ -511,7 +512,7 @@ fn parse_counterparty_policy(
                 "invalid counterparty_policy '{other}': expected 'full', \
                  'pseudonymized', or 'redacted'"
             ),
-            code: "SCP-VALID-7004".to_owned(),
+            code: codes::VALID_7004.to_owned(),
         }
         .into()),
     }

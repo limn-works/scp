@@ -24,6 +24,7 @@
 //!
 //! See ADR-021 in `.docs/adrs/phase-4.md`.
 
+use scp_ffi_common::error_codes as codes;
 use std::fmt;
 use std::sync::{Arc, OnceLock};
 
@@ -452,7 +453,7 @@ impl From<scp_ffi_common::validate::ValidationError> for ScpError {
     fn from(e: scp_ffi_common::validate::ValidationError) -> Self {
         Self::Validation {
             msg: e.message,
-            code: "SCP-VALID-7000".to_owned(),
+            code: codes::VALID_7000.to_owned(),
         }
     }
 }
@@ -461,7 +462,7 @@ impl From<scp_identity::IdentityError> for ScpError {
     fn from(e: scp_identity::IdentityError) -> Self {
         Self::Identity {
             msg: format!("{e} — check DID format, key custody configuration, or DHT connectivity"),
-            code: "SCP-IDENT-1001".to_owned(),
+            code: codes::IDENT_1001.to_owned(),
         }
     }
 }
@@ -499,23 +500,23 @@ impl From<scp_core::context::ContextError> for ScpError {
             // message body.
             CE::RateLimited { .. } => Self::Context {
                 msg: format!("{e}"),
-                code: "SCP-ECON-12090".to_owned(),
+                code: codes::ECON_12090.to_owned(),
             },
             // §23.17 snapshot import regression.
             CE::SnapshotFloorRegression { .. } => Self::Context {
                 msg: format!("{e}"),
-                code: "SCP-CTX-2091".to_owned(),
+                code: codes::CTX_2091.to_owned(),
             },
             // C3: snapshot import structural/semantic rejection.
             CE::ImportRejected { .. } => Self::Context {
                 msg: format!("{e}"),
-                code: "SCP-CTX-2092".to_owned(),
+                code: codes::CTX_2092.to_owned(),
             },
             // Recover embedded SCP-ECON-/SCP-TOOL-/SCP-PERM- codes from
             // the runtime's `PermissionDenied(String)` catch-all so the
             // typed-envelope contract holds for tool-economy failures.
             CE::PermissionDenied(msg) => {
-                let code = extract_scp_code(msg).unwrap_or_else(|| "SCP-PERM-3001".to_owned());
+                let code = extract_scp_code(msg).unwrap_or_else(|| codes::PERM_3001.to_owned());
                 if code.starts_with("SCP-PERM-") {
                     Self::Permission {
                         msg: format!("{e}"),
@@ -535,7 +536,7 @@ impl From<scp_core::context::ContextError> for ScpError {
             }
             _ => Self::Context {
                 msg: format!("{e} — verify context state, membership, and permissions"),
-                code: "SCP-CTX-2001".to_owned(),
+                code: codes::CTX_2001.to_owned(),
             },
         }
     }
@@ -545,7 +546,7 @@ impl From<scp_core::context::builder::ContextCreationError> for ScpError {
     fn from(e: scp_core::context::builder::ContextCreationError) -> Self {
         Self::Context {
             msg: format!("context creation failed: {e} — check context parameters and identity"),
-            code: "SCP-CTX-2002".to_owned(),
+            code: codes::CTX_2002.to_owned(),
         }
     }
 }
@@ -556,7 +557,7 @@ impl From<scp_core::context::templates::TemplateError> for ScpError {
             msg: format!(
                 "template validation failed: {e} — ensure context params match the template"
             ),
-            code: "SCP-CTX-2003".to_owned(),
+            code: codes::CTX_2003.to_owned(),
         }
     }
 }
@@ -567,7 +568,7 @@ impl From<scp_core::context::roles::RoleError> for ScpError {
             msg: format!(
                 "role operation failed: {e} — verify role definitions and member permissions"
             ),
-            code: "SCP-CTX-2004".to_owned(),
+            code: codes::CTX_2004.to_owned(),
         }
     }
 }
@@ -576,7 +577,7 @@ impl From<scp_core::context::ttl::TtlError> for ScpError {
     fn from(e: scp_core::context::ttl::TtlError) -> Self {
         Self::Context {
             msg: format!("TTL operation failed: {e} — check TTL configuration and context state"),
-            code: "SCP-CTX-2005".to_owned(),
+            code: codes::CTX_2005.to_owned(),
         }
     }
 }
@@ -585,7 +586,7 @@ impl From<scp_core::context::promotion::PromotionError> for ScpError {
     fn from(e: scp_core::context::promotion::PromotionError) -> Self {
         Self::Context {
             msg: format!("context promotion failed: {e} — verify eligibility and governance rules"),
-            code: "SCP-CTX-2006".to_owned(),
+            code: codes::CTX_2006.to_owned(),
         }
     }
 }
@@ -596,7 +597,7 @@ impl From<scp_core::context::tools::ToolError> for ScpError {
             msg: format!(
                 "tool operation failed: {e} — check tool registration, permissions, and input schema"
             ),
-            code: "SCP-TOOL-6001".to_owned(),
+            code: codes::TOOL_6001.to_owned(),
         }
     }
 }
@@ -607,7 +608,7 @@ impl From<scp_core::context::tools::invoke::InvocationError> for ScpError {
             msg: format!(
                 "tool invocation failed: {e} — verify tool ID, input, and caller permissions"
             ),
-            code: "SCP-TOOL-6002".to_owned(),
+            code: codes::TOOL_6002.to_owned(),
         }
     }
 }
@@ -618,7 +619,7 @@ impl From<scp_core::context::tools::schema::SchemaValidationError> for ScpError 
             msg: format!(
                 "schema validation failed: {e} — check input against the tool's JSON Schema"
             ),
-            code: "SCP-VALID-7001".to_owned(),
+            code: codes::VALID_7001.to_owned(),
         }
     }
 }
@@ -627,7 +628,7 @@ impl From<scp_core::crypto::mls::error::MlsError> for ScpError {
     fn from(e: scp_core::crypto::mls::error::MlsError) -> Self {
         Self::Crypto {
             msg: format!("MLS operation failed: {e} — check group state and member key packages"),
-            code: "SCP-CRYPTO-4001".to_owned(),
+            code: codes::CRYPTO_4001.to_owned(),
         }
     }
 }
@@ -638,7 +639,7 @@ impl From<scp_core::crypto::sender_keys::SenderKeyError> for ScpError {
             msg: format!(
                 "sender key operation failed: {e} — verify key material and encryption parameters"
             ),
-            code: "SCP-CRYPTO-4002".to_owned(),
+            code: codes::CRYPTO_4002.to_owned(),
         }
     }
 }
@@ -647,7 +648,7 @@ impl From<scp_core::crypto::ucan::UcanError> for ScpError {
     fn from(e: scp_core::crypto::ucan::UcanError) -> Self {
         Self::Permission {
             msg: format!("{e} — check token format, signatures, time bounds, and capability chain"),
-            code: "SCP-PERM-3001".to_owned(),
+            code: codes::PERM_3001.to_owned(),
         }
     }
 }
@@ -658,7 +659,7 @@ impl From<scp_core::envelope::EnvelopeError> for ScpError {
             msg: format!(
                 "envelope operation failed: {e} — check payload size, signing keys, and encryption state"
             ),
-            code: "SCP-CRYPTO-4003".to_owned(),
+            code: codes::CRYPTO_4003.to_owned(),
         }
     }
 }
@@ -669,7 +670,7 @@ impl From<scp_event_log::EventLogError> for ScpError {
             msg: format!(
                 "event log operation failed: {e} — verify log integrity and sequence numbers"
             ),
-            code: "SCP-CTX-2007".to_owned(),
+            code: codes::CTX_2007.to_owned(),
         }
     }
 }
@@ -678,7 +679,7 @@ impl From<scp_core::provenance::ProvenanceError> for ScpError {
     fn from(e: scp_core::provenance::ProvenanceError) -> Self {
         Self::Validation {
             msg: format!("provenance validation failed: {e} — check cross-context chain depth"),
-            code: "SCP-VALID-7002".to_owned(),
+            code: codes::VALID_7002.to_owned(),
         }
     }
 }
@@ -689,7 +690,7 @@ impl From<scp_core::trust::TrustError> for ScpError {
             msg: format!(
                 "trust evaluation failed: {e} — check event log data and attestation validity"
             ),
-            code: "SCP-VALID-7003".to_owned(),
+            code: codes::VALID_7003.to_owned(),
         }
     }
 }
@@ -698,7 +699,7 @@ impl From<scp_core::uri::ScpUriError> for ScpError {
     fn from(e: scp_core::uri::ScpUriError) -> Self {
         Self::Validation {
             msg: format!("invalid SCP URI: {e} — check URI format (scp://relay/context-id)"),
-            code: "SCP-VALID-7004".to_owned(),
+            code: codes::VALID_7004.to_owned(),
         }
     }
 }
@@ -707,7 +708,7 @@ impl From<scp_core::well_known::WellKnownValidationError> for ScpError {
     fn from(e: scp_core::well_known::WellKnownValidationError) -> Self {
         Self::Validation {
             msg: format!("well-known validation failed: {e} — check relay configuration"),
-            code: "SCP-VALID-7005".to_owned(),
+            code: codes::VALID_7005.to_owned(),
         }
     }
 }
@@ -718,7 +719,7 @@ impl From<scp_core::discovery::DiscoveryError> for ScpError {
             msg: format!(
                 "discovery operation failed: {e} — check relay connectivity and search parameters"
             ),
-            code: "SCP-CTX-2008".to_owned(),
+            code: codes::CTX_2008.to_owned(),
         }
     }
 }
@@ -729,7 +730,7 @@ impl From<scp_core::bridge::registration::BridgeRegistrationError> for ScpError 
             msg: format!(
                 "bridge registration failed: {e} — verify bridge configuration and permissions"
             ),
-            code: "SCP-CTX-2009".to_owned(),
+            code: codes::CTX_2009.to_owned(),
         }
     }
 }
@@ -740,7 +741,7 @@ impl From<scp_core::bridge::shadow::ShadowError> for ScpError {
             msg: format!(
                 "shadow context operation failed: {e} — check bridge state and context permissions"
             ),
-            code: "SCP-CTX-2010".to_owned(),
+            code: codes::CTX_2010.to_owned(),
         }
     }
 }
@@ -751,7 +752,7 @@ impl From<scp_transport::TransportError> for ScpError {
             msg: format!(
                 "{e} — check relay URL, network connectivity, and transport configuration"
             ),
-            code: "SCP-TRANS-5001".to_owned(),
+            code: codes::TRANS_5001.to_owned(),
         }
     }
 }
@@ -760,7 +761,7 @@ impl From<scp_platform::PlatformError> for ScpError {
     fn from(e: scp_platform::PlatformError) -> Self {
         Self::Crypto {
             msg: format!("platform key operation failed: {e} — check key custody configuration"),
-            code: "SCP-CRYPTO-4004".to_owned(),
+            code: codes::CRYPTO_4004.to_owned(),
         }
     }
 }
@@ -769,7 +770,7 @@ impl From<serde_json::Error> for ScpError {
     fn from(e: serde_json::Error) -> Self {
         Self::Validation {
             msg: format!("JSON serialization/deserialization failed: {e} — check input format"),
-            code: "SCP-VALID-7006".to_owned(),
+            code: codes::VALID_7006.to_owned(),
         }
     }
 }
@@ -1106,7 +1107,7 @@ impl DataProvenance {
                         "payment_receipt_id must be exactly 32 bytes, got {}",
                         v.len()
                     ),
-                    code: "SCP-VALID-7080".to_owned(),
+                    code: codes::VALID_7080.to_owned(),
                 })?;
                 Some(arr)
             }
@@ -1392,7 +1393,7 @@ impl Identity {
                       was loaded without key material (use identity_create or \
                       identity_create_with_custody)"
                 .to_owned(),
-            code: "SCP-IDENT-1002".to_owned(),
+            code: codes::IDENT_1002.to_owned(),
         })?;
 
         // Dispatch to the correct custody path.
@@ -1442,7 +1443,7 @@ impl Identity {
                       identity_create_with_custody() for platform custody or \
                       identity_create(\"in_memory\") for dev/test"
                 .to_owned(),
-            code: "SCP-IDENT-1002".to_owned(),
+            code: codes::IDENT_1002.to_owned(),
         })
     }
 
@@ -1514,7 +1515,7 @@ impl Identity {
                           enable the \"allow_in_memory_custody\" feature or use \
                           the platform KeyCustodyProvider interface"
                     .to_owned(),
-                code: "SCP-IDENT-1008".to_owned(),
+                code: codes::IDENT_1008.to_owned(),
             })
         }
 
@@ -1524,21 +1525,21 @@ impl Identity {
                 msg: "cannot add agent key to an external/loaded identity \
                           without core state — use identity_create first"
                     .to_owned(),
-                code: "SCP-IDENT-1005".to_owned(),
+                code: codes::IDENT_1005.to_owned(),
             })?;
             let core_doc = self
                 .core_document
                 .as_ref()
                 .ok_or_else(|| ScpError::Identity {
                     msg: "cannot add agent key without a retained DID document".to_owned(),
-                    code: "SCP-IDENT-1005".to_owned(),
+                    code: codes::IDENT_1005.to_owned(),
                 })?;
             let custody = self
                 .in_memory_custody
                 .as_ref()
                 .ok_or_else(|| ScpError::Identity {
                     msg: "cannot add agent key without in-memory custody".to_owned(),
-                    code: "SCP-IDENT-1008".to_owned(),
+                    code: codes::IDENT_1008.to_owned(),
                 })?
                 .clone();
 
@@ -1571,7 +1572,7 @@ impl Identity {
                 .await
                 .map_err(|e| ScpError::Identity {
                     msg: format!("tokio task join error during add_agent_key: {e}"),
-                    code: "SCP-IDENT-1007".to_owned(),
+                    code: codes::IDENT_1007.to_owned(),
                 })?
         }
     }
@@ -1600,7 +1601,7 @@ impl Identity {
                           enable the \"allow_in_memory_custody\" feature or use \
                           the platform KeyCustodyProvider interface"
                     .to_owned(),
-                code: "SCP-IDENT-1008".to_owned(),
+                code: codes::IDENT_1008.to_owned(),
             })
         }
 
@@ -1610,14 +1611,14 @@ impl Identity {
                 msg: "cannot remove agent key from an external/loaded identity \
                           without core state"
                     .to_owned(),
-                code: "SCP-IDENT-1005".to_owned(),
+                code: codes::IDENT_1005.to_owned(),
             })?;
             let core_doc = self
                 .core_document
                 .as_ref()
                 .ok_or_else(|| ScpError::Identity {
                     msg: "cannot remove agent key without a retained DID document".to_owned(),
-                    code: "SCP-IDENT-1005".to_owned(),
+                    code: codes::IDENT_1005.to_owned(),
                 })?;
 
             let custody = self
@@ -1627,7 +1628,7 @@ impl Identity {
                     msg: "cannot remove agent key without in-memory custody \
                               (needed for DHT publish signing)"
                         .to_owned(),
-                    code: "SCP-IDENT-1008".to_owned(),
+                    code: codes::IDENT_1008.to_owned(),
                 })?;
 
             // Clone what we need for the spawned task.
@@ -1659,7 +1660,7 @@ impl Identity {
                 .await
                 .map_err(|e| ScpError::Identity {
                     msg: format!("tokio task join error during remove_agent_key: {e}"),
-                    code: "SCP-IDENT-1007".to_owned(),
+                    code: codes::IDENT_1007.to_owned(),
                 })?
         }
     }
@@ -1688,7 +1689,7 @@ impl Identity {
                           enable the \"allow_in_memory_custody\" feature or use \
                           the platform KeyCustodyProvider interface"
                     .to_owned(),
-                code: "SCP-IDENT-1008".to_owned(),
+                code: codes::IDENT_1008.to_owned(),
             })
         }
 
@@ -1698,21 +1699,21 @@ impl Identity {
                 msg: "cannot rotate agent key on an external/loaded identity \
                           without core state"
                     .to_owned(),
-                code: "SCP-IDENT-1005".to_owned(),
+                code: codes::IDENT_1005.to_owned(),
             })?;
             let core_doc = self
                 .core_document
                 .as_ref()
                 .ok_or_else(|| ScpError::Identity {
                     msg: "cannot rotate agent key without a retained DID document".to_owned(),
-                    code: "SCP-IDENT-1005".to_owned(),
+                    code: codes::IDENT_1005.to_owned(),
                 })?;
             let custody = self
                 .in_memory_custody
                 .as_ref()
                 .ok_or_else(|| ScpError::Identity {
                     msg: "cannot rotate agent key without in-memory custody".to_owned(),
-                    code: "SCP-IDENT-1008".to_owned(),
+                    code: codes::IDENT_1008.to_owned(),
                 })?
                 .clone();
 
@@ -1745,7 +1746,7 @@ impl Identity {
                 .await
                 .map_err(|e| ScpError::Identity {
                     msg: format!("tokio task join error during rotate_agent_key: {e}"),
-                    code: "SCP-IDENT-1007".to_owned(),
+                    code: codes::IDENT_1007.to_owned(),
                 })?
         }
     }
@@ -1838,7 +1839,7 @@ impl ContextHandle {
     pub fn state(&self) -> Result<String, ScpError> {
         let guard = self.state.try_lock().map_err(|_| ScpError::Context {
             msg: "context state lock is contended — retry".to_owned(),
-            code: "SCP-CTX-2012".to_owned(),
+            code: codes::CTX_2012.to_owned(),
         })?;
         Ok(match *guard {
             ContextState::Creating => "creating".to_owned(),
@@ -2080,7 +2081,7 @@ impl TransportManager {
 
         let mut mgr = self.inner.write().map_err(|_| ScpError::Transport {
             msg: "transport manager lock is poisoned".to_owned(),
-            code: "SCP-TRANS-5003".to_owned(),
+            code: codes::TRANS_5003.to_owned(),
         })?;
         let _eviction = mgr.add_adapter(Box::new(adapter));
         #[allow(clippy::cast_possible_truncation)] // Bounded by connection budget.
@@ -2115,13 +2116,13 @@ impl TransportManager {
         validate_context_id(&context_id)?;
         let mgr = self.inner.read().map_err(|_| ScpError::Transport {
             msg: "transport manager lock is poisoned".to_owned(),
-            code: "SCP-TRANS-5003".to_owned(),
+            code: codes::TRANS_5003.to_owned(),
         })?;
         let indices = mgr
             .assign_relay_set(&context_id)
             .map_err(|e| ScpError::Transport {
                 msg: format!("relay set assignment failed: {e}"),
-                code: "SCP-TRANS-5004".to_owned(),
+                code: codes::TRANS_5004.to_owned(),
             })?;
         #[allow(clippy::cast_possible_truncation)] // Adapter indices bounded by adapter count.
         Ok(indices.into_iter().map(|i| i as u32).collect())
@@ -2289,7 +2290,7 @@ pub async fn identity_create(custody: String) -> Result<Arc<Identity>, ScpError>
                                       dev/desktop use. Production mobile builds must use \
                                       \"platform\" custody (Secure Enclave / Android Keystore)."
                                 .to_owned(),
-                            code: "SCP-IDENT-1008".to_owned(),
+                            code: codes::IDENT_1008.to_owned(),
                         })
                     }
 
@@ -2339,7 +2340,7 @@ pub async fn identity_create(custody: String) -> Result<Arc<Identity>, ScpError>
                              Enclave (iOS) or Android Keystore (Android) backed \
                              custody provider"
                         ),
-                        code: "SCP-IDENT-1003".to_owned(),
+                        code: codes::IDENT_1003.to_owned(),
                     })
                 }
                 CustodyMethod::External => {
@@ -2351,7 +2352,7 @@ pub async fn identity_create(custody: String) -> Result<Arc<Identity>, ScpError>
                         msg: "internal: CustodyMethod::External cannot be used with \
                                   identity_create — use identity_load for external DID handles"
                             .to_owned(),
-                        code: "SCP-IDENT-1005".to_owned(),
+                        code: codes::IDENT_1005.to_owned(),
                     })
                 }
             }
@@ -2359,7 +2360,7 @@ pub async fn identity_create(custody: String) -> Result<Arc<Identity>, ScpError>
         .await
         .map_err(|e| ScpError::Identity {
             msg: format!("tokio task join error during identity creation: {e}"),
-            code: "SCP-IDENT-1007".to_owned(),
+            code: codes::IDENT_1007.to_owned(),
         })?
 }
 
@@ -2417,7 +2418,7 @@ pub async fn identity_create_with_custody(
         .await
         .map_err(|e| ScpError::Identity {
             msg: format!("tokio task join error during identity creation: {e}"),
-            code: "SCP-IDENT-1007".to_owned(),
+            code: codes::IDENT_1007.to_owned(),
         })?
 }
 
@@ -2442,7 +2443,7 @@ pub async fn identity_load(did: String) -> Result<Arc<Identity>, ScpError> {
             if !did.starts_with("did:dht:") {
                 return Err(ScpError::Identity {
                     msg: format!("unsupported DID method: {did} — only did:dht is supported"),
-                    code: "SCP-IDENT-1004".to_owned(),
+                    code: codes::IDENT_1004.to_owned(),
                 });
             }
 
@@ -2463,7 +2464,7 @@ pub async fn identity_load(did: String) -> Result<Arc<Identity>, ScpError> {
         .await
         .map_err(|e| ScpError::Identity {
             msg: format!("tokio task join error during identity load: {e}"),
-            code: "SCP-IDENT-1005".to_owned(),
+            code: codes::IDENT_1005.to_owned(),
         })?
 }
 
@@ -2503,7 +2504,7 @@ pub async fn identity_resolve(did: String) -> Result<DIDDocument, ScpError> {
         .await
         .map_err(|e| ScpError::Identity {
             msg: format!("tokio task join error during DID resolution: {e}"),
-            code: "SCP-IDENT-1006".to_owned(),
+            code: codes::IDENT_1006.to_owned(),
         })?
 }
 
@@ -2552,13 +2553,13 @@ async fn identity_attest_device_impl(identity: Arc<Identity>) -> Result<String, 
                     msg: "device attestation requires retained identity state — the identity \
                           was externally loaded via identity_load"
                         .to_owned(),
-                    code: "SCP-IDENT-1007".to_owned(),
+                    code: codes::IDENT_1007.to_owned(),
                 })?;
 
             let attestation = InMemoryDeviceAttestation::new();
             let token = attestation.attest().await.map_err(|e| ScpError::Identity {
                 msg: format!("device attestation failed: {e}"),
-                code: "SCP-IDENT-1010".to_owned(),
+                code: codes::IDENT_1010.to_owned(),
             })?;
 
             use base64::Engine;
@@ -2567,7 +2568,7 @@ async fn identity_attest_device_impl(identity: Arc<Identity>) -> Result<String, 
         .await
         .map_err(|e| ScpError::Identity {
             msg: format!("tokio task join error during device attestation: {e}"),
-            code: "SCP-IDENT-1007".to_owned(),
+            code: codes::IDENT_1007.to_owned(),
         })?
 }
 
@@ -2579,7 +2580,7 @@ async fn identity_attest_device_impl(_identity: Arc<Identity>) -> Result<String,
                   path is not available in this build. Enable the \
                   \"allow_in_memory_custody\" feature for dev/desktop use."
             .to_owned(),
-        code: "SCP-IDENT-1010".to_owned(),
+        code: codes::IDENT_1010.to_owned(),
     })
 }
 
@@ -2626,7 +2627,7 @@ async fn identity_verify_device_attestation_impl(
                 .decode(&token_base64)
                 .map_err(|e| ScpError::Identity {
                     msg: format!("invalid base64 attestation token: {e}"),
-                    code: "SCP-IDENT-1011".to_owned(),
+                    code: codes::IDENT_1011.to_owned(),
                 })?;
 
             let token = scp_platform::traits::DeviceAttestationToken::new(token_bytes);
@@ -2637,13 +2638,13 @@ async fn identity_verify_device_attestation_impl(
                 .await
                 .map_err(|e| ScpError::Identity {
                     msg: format!("device attestation verification failed: {e}"),
-                    code: "SCP-IDENT-1012".to_owned(),
+                    code: codes::IDENT_1012.to_owned(),
                 })
         })
         .await
         .map_err(|e| ScpError::Identity {
             msg: format!("tokio task join error during device attestation verification: {e}"),
-            code: "SCP-IDENT-1007".to_owned(),
+            code: codes::IDENT_1007.to_owned(),
         })?
 }
 
@@ -2658,7 +2659,7 @@ async fn identity_verify_device_attestation_impl(
                   custody path is not available in this build. Enable the \
                   \"allow_in_memory_custody\" feature for dev/desktop use."
             .to_owned(),
-        code: "SCP-IDENT-1010".to_owned(),
+        code: codes::IDENT_1010.to_owned(),
     })
 }
 
@@ -2738,6 +2739,7 @@ async fn identity_create_link_attestation_impl(
     verification_method: String,
     platform_id: Option<String>,
 ) -> Result<String, ScpError> {
+    use scp_ffi_common::error_codes as codes;
     use std::borrow::Cow;
 
     use scp_core::identity::attestation::{
@@ -2752,7 +2754,7 @@ async fn identity_create_link_attestation_impl(
     scp_ffi_common::validate::validate_attestation_fields(&platform, &handle, &proof).map_err(
         |e| ScpError::Validation {
             msg: format!("attestation field validation failed: {e}"),
-            code: "SCP-VALID-7037".to_owned(),
+            code: codes::VALID_7037.to_owned(),
         },
     )?;
 
@@ -2761,7 +2763,7 @@ async fn identity_create_link_attestation_impl(
             .parse()
             .map_err(|e: String| ScpError::Identity {
                 msg: e,
-                code: "SCP-IDENT-1040".to_owned(),
+                code: codes::IDENT_1040.to_owned(),
             })?;
 
     // Proof is an opaque string per §3.5.2 — pass through as-is.
@@ -2772,14 +2774,14 @@ async fn identity_create_link_attestation_impl(
         .as_ref()
         .ok_or_else(|| ScpError::Identity {
             msg: "identity link attestation requires retained identity state".to_owned(),
-            code: "SCP-IDENT-1040".to_owned(),
+            code: codes::IDENT_1040.to_owned(),
         })?;
     let custody = identity
         .in_memory_custody
         .as_ref()
         .ok_or_else(|| ScpError::Identity {
             msg: "identity link attestation requires in-memory custody".to_owned(),
-            code: "SCP-IDENT-1040".to_owned(),
+            code: codes::IDENT_1040.to_owned(),
         })?;
 
     let did_str = identity.did.clone();
@@ -2788,7 +2790,7 @@ async fn identity_create_link_attestation_impl(
         .duration_since(std::time::UNIX_EPOCH)
         .map_err(|_| ScpError::Identity {
             msg: "system clock is before UNIX epoch".to_owned(),
-            code: "SCP-IDENT-1042".to_owned(),
+            code: codes::IDENT_1042.to_owned(),
         })?
         .as_secs();
 
@@ -2824,7 +2826,7 @@ async fn identity_create_link_attestation_impl(
                     .collect::<Vec<_>>()
                     .join("; "),
             ),
-            code: "SCP-IDENT-1041".to_owned(),
+            code: codes::IDENT_1041.to_owned(),
         });
     }
 
@@ -2832,7 +2834,7 @@ async fn identity_create_link_attestation_impl(
         .canonical_signing_bytes()
         .map_err(|e| ScpError::Identity {
             msg: format!("attestation signing failed: {e}"),
-            code: "SCP-IDENT-1041".to_owned(),
+            code: codes::IDENT_1041.to_owned(),
         })?;
 
     let active_key = core_id.active_signing_key;
@@ -2843,11 +2845,11 @@ async fn identity_create_link_attestation_impl(
         .await
         .map_err(|e| ScpError::Identity {
             msg: format!("tokio join error: {e}"),
-            code: "SCP-IDENT-1041".to_owned(),
+            code: codes::IDENT_1041.to_owned(),
         })?
         .map_err(|e| ScpError::Identity {
             msg: format!("Ed25519 signing failed: {e}"),
-            code: "SCP-IDENT-1041".to_owned(),
+            code: codes::IDENT_1041.to_owned(),
         })?;
     attestation.signature = sig.as_bytes().to_vec();
 
@@ -2872,7 +2874,7 @@ async fn identity_create_link_attestation_impl(
                             "custody registry has reached capacity \
                              ({UNIFFI_CUSTODY_REGISTRY_CAP}) — cannot store additional entries"
                         ),
-                        code: "SCP-VALID-7403".to_owned(),
+                        code: codes::VALID_7403.to_owned(),
                     });
                 }
                 vac.insert((Arc::clone(custody), active_key));
@@ -2892,7 +2894,7 @@ async fn identity_create_link_attestation_impl(
                             "DID has reached the per-identity attestation limit \
                              ({MAX_IDENTITY_LINK_ATTESTATIONS_PER_DID}) — cannot store additional attestations"
                         ),
-                        code: "SCP-VALID-7403".to_owned(),
+                        code: codes::VALID_7403.to_owned(),
                     });
                 }
                 occ.get_mut().push(attestation.clone());
@@ -2904,7 +2906,7 @@ async fn identity_create_link_attestation_impl(
                             "link attestation registry has reached capacity \
                              ({UNIFFI_LINK_ATTESTATION_REGISTRY_CAP}) — cannot store additional attestations"
                         ),
-                        code: "SCP-VALID-7402".to_owned(),
+                        code: codes::VALID_7402.to_owned(),
                     });
                 }
                 vac.insert(vec![attestation.clone()]);
@@ -2914,7 +2916,7 @@ async fn identity_create_link_attestation_impl(
 
     serde_json::to_string(&attestation).map_err(|e| ScpError::Identity {
         msg: format!("failed to serialize attestation: {e}"),
-        code: "SCP-IDENT-1042".to_owned(),
+        code: codes::IDENT_1042.to_owned(),
     })
 }
 
@@ -2929,7 +2931,7 @@ pub fn identity_link_attestations(did: String) -> Result<String, ScpError> {
         .unwrap_or_default();
     serde_json::to_string(&attestations).map_err(|e| ScpError::Identity {
         msg: format!("failed to serialize attestations: {e}"),
-        code: "SCP-IDENT-1043".to_owned(),
+        code: codes::IDENT_1043.to_owned(),
     })
 }
 
@@ -2981,12 +2983,12 @@ async fn identity_verify_link_attestation_impl(
     let attestation: IdentityLinkAttestation =
         serde_json::from_str(&attestation_json).map_err(|e| ScpError::Identity {
             msg: format!("failed to parse attestation JSON: {e}"),
-            code: "SCP-IDENT-1044".to_owned(),
+            code: codes::IDENT_1044.to_owned(),
         })?;
 
     let pub_bytes = hex::decode(&issuer_public_key_hex).map_err(|e| ScpError::Identity {
         msg: format!("invalid issuer_public_key_hex: {e}"),
-        code: "SCP-IDENT-1044".to_owned(),
+        code: codes::IDENT_1044.to_owned(),
     })?;
     Ok(attestation.verify_signature(&pub_bytes).is_ok())
 }
@@ -3123,7 +3125,7 @@ pub async fn context_create(
         .await
         .map_err(|e| ScpError::Context {
             msg: format!("tokio task join error during context creation: {e}"),
-            code: "SCP-CTX-2011".to_owned(),
+            code: codes::CTX_2011.to_owned(),
         })?
 }
 
@@ -3161,7 +3163,7 @@ pub async fn context_join(
                         "cannot join context in {:?} state — context must be active",
                         *state
                     ),
-                    code: "SCP-CTX-2013".to_owned(),
+                    code: codes::CTX_2013.to_owned(),
                 });
             }
             drop(state);
@@ -3175,7 +3177,7 @@ pub async fn context_join(
                     scp_core::crypto::ucan::validate::parse_ucan(jwt).map_err(|e| {
                         ScpError::Context {
                             msg: format!("invalid spending UCAN: {e}"),
-                            code: "SCP-ECON-12061".to_owned(),
+                            code: codes::ECON_12061.to_owned(),
                         }
                     })
                 })
@@ -3217,7 +3219,7 @@ pub async fn context_join(
         .await
         .map_err(|e| ScpError::Context {
             msg: format!("tokio task join error during context join: {e}"),
-            code: "SCP-CTX-2014".to_owned(),
+            code: codes::CTX_2014.to_owned(),
         })?
 }
 
@@ -3247,7 +3249,7 @@ pub async fn context_leave(
                         "cannot leave context in {:?} state — context must be active",
                         *state
                     ),
-                    code: "SCP-CTX-2015".to_owned(),
+                    code: codes::CTX_2015.to_owned(),
                 });
             }
             drop(state);
@@ -3276,7 +3278,7 @@ pub async fn context_leave(
         .await
         .map_err(|e| ScpError::Context {
             msg: format!("tokio task join error during context leave: {e}"),
-            code: "SCP-CTX-2016".to_owned(),
+            code: codes::CTX_2016.to_owned(),
         })?
 }
 
@@ -3313,7 +3315,7 @@ pub async fn context_close(
                         "cannot close context in {:?} state — context must be active",
                         *state
                     ),
-                    code: "SCP-CTX-2017".to_owned(),
+                    code: codes::CTX_2017.to_owned(),
                 });
             }
 
@@ -3357,7 +3359,7 @@ pub async fn context_close(
                 )
                 .map_err(|e| ScpError::Context {
                     msg: format!("close orchestration failed: {e}"),
-                    code: "SCP-CTX-2017".to_owned(),
+                    code: codes::CTX_2017.to_owned(),
                 })?;
 
             // Log the close action for observability. For Summary scope,
@@ -3408,7 +3410,7 @@ pub async fn context_close(
         .await
         .map_err(|e| ScpError::Context {
             msg: format!("tokio task join error during context close: {e}"),
-            code: "SCP-CTX-2018".to_owned(),
+            code: codes::CTX_2018.to_owned(),
         })?
 }
 
@@ -3447,7 +3449,7 @@ pub async fn context_send(
                         "cannot send to context in {:?} state — context must be active",
                         *state
                     ),
-                    code: "SCP-CTX-2019".to_owned(),
+                    code: codes::CTX_2019.to_owned(),
                 });
             }
             drop(state);
@@ -3484,7 +3486,7 @@ pub async fn context_send(
                     .await
                     .map_err(|e| ScpError::Crypto {
                         msg: format!("inner envelope signing failed: {e}"),
-                        code: "SCP-CRYPTO-4001".to_owned(),
+                        code: codes::CRYPTO_4001.to_owned(),
                     })?;
                 } else {
                     #[cfg(feature = "allow_in_memory_custody")]
@@ -3497,7 +3499,7 @@ pub async fn context_send(
                         .await
                         .map_err(|e| ScpError::Crypto {
                             msg: format!("inner envelope signing failed: {e}"),
-                            code: "SCP-CRYPTO-4001".to_owned(),
+                            code: codes::CRYPTO_4001.to_owned(),
                         })?;
                     }
                 }
@@ -3527,7 +3529,7 @@ pub async fn context_send(
                 .transpose()
                 .map_err(|e| ScpError::Context {
                     msg: format!("invalid spending UCAN: {e}"),
-                    code: "SCP-ECON-12061".to_owned(),
+                    code: codes::ECON_12061.to_owned(),
                 })?;
 
             let sender_did: scp_identity::DID = identity.did.clone().into();
@@ -3548,7 +3550,7 @@ pub async fn context_send(
         .await
         .map_err(|e| ScpError::Context {
             msg: format!("tokio task join error during message send: {e}"),
-            code: "SCP-CTX-2020".to_owned(),
+            code: codes::CTX_2020.to_owned(),
         })?
 }
 
@@ -3579,7 +3581,7 @@ pub async fn context_subscribe(
                 "cannot subscribe to context in {:?} state — context must be active",
                 *state
             ),
-            code: "SCP-CTX-2021".to_owned(),
+            code: codes::CTX_2021.to_owned(),
         });
     }
     drop(state);
@@ -3628,7 +3630,7 @@ pub async fn tool_register(
                         "cannot register tool in context in {:?} state — context must be active",
                         *state
                     ),
-                    code: "SCP-TOOL-6003".to_owned(),
+                    code: codes::TOOL_6003.to_owned(),
                 });
             }
             drop(state);
@@ -3637,7 +3639,7 @@ pub async fn tool_register(
                 serde_json::from_str(&definition.input_schema_json).map_err(|e| {
                     ScpError::Validation {
                         msg: format!("invalid input_schema_json: {e}"),
-                        code: "SCP-VALID-7035".to_owned(),
+                        code: codes::VALID_7035.to_owned(),
                     }
                 })?;
             if !input_schema.is_object() {
@@ -3646,14 +3648,14 @@ pub async fn tool_register(
                         "invalid input_schema_json: expected a JSON object, got {}",
                         json_value_type_name(&input_schema)
                     ),
-                    code: "SCP-VALID-7035".to_owned(),
+                    code: codes::VALID_7035.to_owned(),
                 });
             }
             let output_schema: serde_json::Value =
                 serde_json::from_str(&definition.output_schema_json).map_err(|e| {
                     ScpError::Validation {
                         msg: format!("invalid output_schema_json: {e}"),
-                        code: "SCP-VALID-7036".to_owned(),
+                        code: codes::VALID_7036.to_owned(),
                     }
                 })?;
             if !output_schema.is_object() {
@@ -3662,7 +3664,7 @@ pub async fn tool_register(
                         "invalid output_schema_json: expected a JSON object, got {}",
                         json_value_type_name(&output_schema)
                     ),
-                    code: "SCP-VALID-7036".to_owned(),
+                    code: codes::VALID_7036.to_owned(),
                 });
             }
 
@@ -3671,7 +3673,7 @@ pub async fn tool_register(
                     None => Vec::new(),
                     Some(json) => serde_json::from_str(json).map_err(|e| ScpError::Validation {
                         msg: format!("invalid test_vectors_json: {e}"),
-                        code: "SCP-VALID-7037".to_owned(),
+                        code: codes::VALID_7037.to_owned(),
                     })?,
                 };
 
@@ -3682,7 +3684,7 @@ pub async fn tool_register(
                         "implementation_hash must be exactly 32 bytes, got {}",
                         bytes.len()
                     ),
-                    code: "SCP-VALID-7038".to_owned(),
+                    code: codes::VALID_7038.to_owned(),
                 })?,
             };
 
@@ -3725,7 +3727,7 @@ pub async fn tool_register(
             )
             .map_err(|e| ScpError::Tool {
                 msg: format!("failed to create role state: {e}"),
-                code: "SCP-TOOL-6003".to_owned(),
+                code: codes::TOOL_6003.to_owned(),
             })?;
 
             let mut registry = handle.tool_registry.lock().await;
@@ -3737,7 +3739,7 @@ pub async fn tool_register(
             )
             .map_err(|e| ScpError::Tool {
                 msg: format!("tool registration failed: {e}"),
-                code: "SCP-TOOL-6001".to_owned(),
+                code: codes::TOOL_6001.to_owned(),
             })?;
 
             Ok(registered_id)
@@ -3745,7 +3747,7 @@ pub async fn tool_register(
         .await
         .map_err(|e| ScpError::Tool {
             msg: format!("tokio task join error during tool registration: {e}"),
-            code: "SCP-TOOL-6004".to_owned(),
+            code: codes::TOOL_6004.to_owned(),
         })?
 }
 
@@ -3813,7 +3815,7 @@ pub async fn tool_invoke(
                           pass a valid JWT-encoded UCAN with tool_invoke:{tool_id} \
                           or tool_invoke:* capability"
                     .to_owned(),
-                code: "SCP-PERM-3001".to_owned(),
+                code: codes::PERM_3001.to_owned(),
             })?;
             validate_ucan_token(&ucan_token)?;
             if let Some(jwt) = spending_ucan_jwt.as_deref() {
@@ -3828,7 +3830,7 @@ pub async fn tool_invoke(
                         "cannot invoke tool in context in {:?} state — context must be active",
                         *state
                     ),
-                    code: "SCP-TOOL-6005".to_owned(),
+                    code: codes::TOOL_6005.to_owned(),
                 });
             }
             drop(state);
@@ -3854,7 +3856,7 @@ pub async fn tool_invoke(
                 .transpose()
                 .map_err(|e| ScpError::Context {
                     msg: format!("invalid spending UCAN: {e}"),
-                    code: "SCP-ECON-12061".to_owned(),
+                    code: codes::ECON_12061.to_owned(),
                 })?;
 
             // Snapshot the bridge-owned tool registry and (optionally) the
@@ -3879,7 +3881,7 @@ pub async fn tool_invoke(
             let input_value: serde_json::Value =
                 serde_json::from_str(&input_json).map_err(|e| ScpError::Tool {
                     msg: format!("invalid input JSON: {e}"),
-                    code: "SCP-TOOL-6002".to_owned(),
+                    code: codes::TOOL_6002.to_owned(),
                 })?;
 
             let context_id = handle.context_id.clone();
@@ -3938,13 +3940,13 @@ pub async fn tool_invoke(
             // Swift / Kotlin caller.
             serde_json::to_string(&outcome.output).map_err(|e| ScpError::Tool {
                 msg: format!("failed to serialize tool output: {e}"),
-                code: "SCP-TOOL-6006".to_owned(),
+                code: codes::TOOL_6006.to_owned(),
             })
         })
         .await
         .map_err(|e| ScpError::Tool {
             msg: format!("tokio task join error during tool invocation: {e}"),
-            code: "SCP-TOOL-6006".to_owned(),
+            code: codes::TOOL_6006.to_owned(),
         })?
 }
 
@@ -3970,7 +3972,7 @@ fn validate_tool_ucan_uniffi(
         for encoded in tokens {
             let proof_token = parse_ucan(encoded).map_err(|e| ScpError::Permission {
                 msg: format!("malformed proof token: {e}"),
-                code: "SCP-PERM-3002".to_owned(),
+                code: codes::PERM_3002.to_owned(),
             })?;
             let cid = scp_core::crypto::ucan::mint::compute_cid(&proof_token);
             proofs.insert(cid, proof_token);
@@ -4012,13 +4014,13 @@ fn validate_tool_ucan_uniffi(
         validate_tool_invocation_ucan(ucan_token, &handle.context_id, tool_id, &mut ctx).map_err(
             |e| ScpError::Permission {
                 msg: format!("UCAN authorization failed for tool '{tool_id}': {e}"),
-                code: "SCP-PERM-3002".to_owned(),
+                code: codes::PERM_3002.to_owned(),
             },
         )
     })
     .ok_or_else(|| ScpError::Permission {
         msg: format!("context '{}' not found in UCAN registry", handle.context_id),
-        code: "SCP-PERM-3002".to_owned(),
+        code: codes::PERM_3002.to_owned(),
     })?
 }
 
@@ -4051,7 +4053,7 @@ pub async fn tool_verify(
                         "cannot verify tool in context in {:?} state — context must be active",
                         *state
                     ),
-                    code: "SCP-TOOL-6007".to_owned(),
+                    code: codes::TOOL_6007.to_owned(),
                 });
             }
             drop(state);
@@ -4065,7 +4067,7 @@ pub async fn tool_verify(
         .await
         .map_err(|e| ScpError::Tool {
             msg: format!("tokio task join error during tool verification: {e}"),
-            code: "SCP-TOOL-6008".to_owned(),
+            code: codes::TOOL_6008.to_owned(),
         })?
 }
 
@@ -4119,7 +4121,7 @@ pub async fn tool_invoke_cross_context(
                         "cannot invoke cross-context tool: source context in {:?} state",
                         *source_state
                     ),
-                    code: "SCP-TOOL-6010".to_owned(),
+                    code: codes::TOOL_6010.to_owned(),
                 });
             }
             drop(source_state);
@@ -4132,7 +4134,7 @@ pub async fn tool_invoke_cross_context(
                         "cannot invoke cross-context tool: target context in {:?} state",
                         *target_state
                     ),
-                    code: "SCP-TOOL-6011".to_owned(),
+                    code: codes::TOOL_6011.to_owned(),
                 });
             }
             drop(target_state);
@@ -4151,7 +4153,7 @@ pub async fn tool_invoke_cross_context(
                     msg: format!(
                         "cross-context chain depth {chain_depth} exceeds maximum {max_chain_depth}"
                     ),
-                    code: "SCP-TOOL-6012".to_owned(),
+                    code: codes::TOOL_6012.to_owned(),
                 });
             }
 
@@ -4169,7 +4171,7 @@ pub async fn tool_invoke_cross_context(
             let input_value: serde_json::Value =
                 serde_json::from_str(&input_json).map_err(|e| ScpError::Tool {
                     msg: format!("invalid input JSON: {e}"),
-                    code: "SCP-TOOL-6002".to_owned(),
+                    code: codes::TOOL_6002.to_owned(),
                 })?;
 
             let registry = target_handle.tool_registry.lock().await;
@@ -4178,7 +4180,7 @@ pub async fn tool_invoke_cross_context(
                     "tool '{tool_id}' not found in target context '{}'",
                     target_handle.context_id
                 ),
-                code: "SCP-TOOL-6002".to_owned(),
+                code: codes::TOOL_6002.to_owned(),
             })?;
 
             scp_core::context::tools::validate_value_against_schema(
@@ -4187,7 +4189,7 @@ pub async fn tool_invoke_cross_context(
             )
             .map_err(|e| ScpError::Tool {
                 msg: format!("input validation failed: {e}"),
-                code: "SCP-TOOL-6002".to_owned(),
+                code: codes::TOOL_6002.to_owned(),
             })?;
 
             let output_schema = registration.schema.output_schema.clone();
@@ -4199,12 +4201,12 @@ pub async fn tool_invoke_cross_context(
                 drop(handlers);
                 let out = handler(input_value.clone()).map_err(|e| ScpError::Tool {
                     msg: format!("cross-context tool handler for '{tool_id}' failed: {e}"),
-                    code: "SCP-TOOL-6002".to_owned(),
+                    code: codes::TOOL_6002.to_owned(),
                 })?;
                 scp_core::context::tools::validate_value_against_schema(&out, &output_schema)
                     .map_err(|msg| ScpError::Tool {
                         msg: format!("output validation failed for tool '{tool_id}': {msg}"),
-                        code: "SCP-TOOL-6002".to_owned(),
+                        code: codes::TOOL_6002.to_owned(),
                     })?;
                 out
             } else {
@@ -4222,13 +4224,13 @@ pub async fn tool_invoke_cross_context(
 
             serde_json::to_string(&output).map_err(|e| ScpError::Tool {
                 msg: format!("failed to serialize cross-context output: {e}"),
-                code: "SCP-TOOL-6013".to_owned(),
+                code: codes::TOOL_6013.to_owned(),
             })
         })
         .await
         .map_err(|e| ScpError::Tool {
             msg: format!("tokio task join error during cross-context invocation: {e}"),
-            code: "SCP-TOOL-6009".to_owned(),
+            code: codes::TOOL_6009.to_owned(),
         })?
 }
 
@@ -4260,7 +4262,7 @@ pub async fn tool_session_create(
                         "cannot create session in context in {:?} state — context must be active",
                         *state
                     ),
-                    code: "SCP-TOOL-6014".to_owned(),
+                    code: codes::TOOL_6014.to_owned(),
                 });
             }
             drop(state);
@@ -4282,7 +4284,7 @@ pub async fn tool_session_create(
                     msg: format!(
                         "session cap exceeded for caller '{source_context_id}': {current} active (max {cap})"
                     ),
-                    code: "SCP-TOOL-6015".to_owned(),
+                    code: codes::TOOL_6015.to_owned(),
                 });
             }
 
@@ -4305,7 +4307,7 @@ pub async fn tool_session_create(
         .await
         .map_err(|e| ScpError::Tool {
             msg: format!("tokio task join error during session creation: {e}"),
-            code: "SCP-TOOL-6009".to_owned(),
+            code: codes::TOOL_6009.to_owned(),
         })?
 }
 
@@ -4347,7 +4349,7 @@ pub async fn tool_session_invoke(
                         "cannot invoke session in context in {:?} state — context must be active",
                         *state
                     ),
-                    code: "SCP-TOOL-6017".to_owned(),
+                    code: codes::TOOL_6017.to_owned(),
                 });
             }
             drop(state);
@@ -4357,7 +4359,7 @@ pub async fn tool_session_invoke(
                 let store = handle.session_store.lock().await;
                 let session = store.get(&session_id).ok_or_else(|| ScpError::Tool {
                     msg: format!("session '{session_id}' not found"),
-                    code: "SCP-TOOL-6018".to_owned(),
+                    code: codes::TOOL_6018.to_owned(),
                 })?;
                 session.tool_id.clone()
             };
@@ -4376,7 +4378,7 @@ pub async fn tool_session_invoke(
 
             let session = store.get(&session_id).ok_or_else(|| ScpError::Tool {
                 msg: format!("session '{session_id}' not found"),
-                code: "SCP-TOOL-6018".to_owned(),
+                code: codes::TOOL_6018.to_owned(),
             })?;
 
             // Check expiry.
@@ -4385,7 +4387,7 @@ pub async fn tool_session_invoke(
                 store.remove(&session_id);
                 return Err(ScpError::Tool {
                     msg: format!("session '{session_id}' has expired"),
-                    code: "SCP-TOOL-6019".to_owned(),
+                    code: codes::TOOL_6019.to_owned(),
                 });
             }
 
@@ -4397,7 +4399,7 @@ pub async fn tool_session_invoke(
             let input_value: serde_json::Value =
                 serde_json::from_str(&input_json).map_err(|e| ScpError::Tool {
                     msg: format!("invalid input JSON: {e}"),
-                    code: "SCP-TOOL-6002".to_owned(),
+                    code: codes::TOOL_6002.to_owned(),
                 })?;
 
             // Validate input against tool's input schema if tool is registered.
@@ -4409,7 +4411,7 @@ pub async fn tool_session_invoke(
                 )
                 .map_err(|e| ScpError::Tool {
                     msg: format!("input validation failed: {e}"),
-                    code: "SCP-TOOL-6002".to_owned(),
+                    code: codes::TOOL_6002.to_owned(),
                 })?;
             }
             drop(registry);
@@ -4421,7 +4423,7 @@ pub async fn tool_session_invoke(
                 drop(handlers);
                 let out = handler(input_value.clone()).map_err(|e| ScpError::Tool {
                     msg: format!("tool handler for '{tool_id}' failed: {e}"),
-                    code: "SCP-TOOL-6002".to_owned(),
+                    code: codes::TOOL_6002.to_owned(),
                 })?;
                 (current_state, out)
             } else {
@@ -4446,13 +4448,13 @@ pub async fn tool_session_invoke(
 
             serde_json::to_string(&output).map_err(|e| ScpError::Tool {
                 msg: format!("failed to serialize session invoke output: {e}"),
-                code: "SCP-TOOL-6020".to_owned(),
+                code: codes::TOOL_6020.to_owned(),
             })
         })
         .await
         .map_err(|e| ScpError::Tool {
             msg: format!("tokio task join error during session invocation: {e}"),
-            code: "SCP-TOOL-6009".to_owned(),
+            code: codes::TOOL_6009.to_owned(),
         })?
 }
 
@@ -4470,7 +4472,7 @@ pub async fn tool_session_close(
             if store.remove(&session_id).is_none() {
                 return Err(ScpError::Tool {
                     msg: format!("session '{session_id}' not found"),
-                    code: "SCP-TOOL-6021".to_owned(),
+                    code: codes::TOOL_6021.to_owned(),
                 });
             }
             Ok(())
@@ -4478,7 +4480,7 @@ pub async fn tool_session_close(
         .await
         .map_err(|e| ScpError::Tool {
             msg: format!("tokio task join error during session close: {e}"),
-            code: "SCP-TOOL-6009".to_owned(),
+            code: codes::TOOL_6009.to_owned(),
         })?
 }
 
@@ -4524,7 +4526,7 @@ pub async fn tool_interface_expose(
                         "cannot expose tool interface in context in {:?} state — context must be active",
                         *state
                     ),
-                    code: "SCP-TOOL-6030".to_owned(),
+                    code: codes::TOOL_6030.to_owned(),
                 });
             }
             drop(state);
@@ -4534,7 +4536,7 @@ pub async fn tool_interface_expose(
                     let parsed: scp_core::context::tools::interface::RateLimit =
                         serde_json::from_str(json).map_err(|e| ScpError::Validation {
                             msg: format!("invalid rate_limit_json: {e}"),
-                            code: "SCP-VALID-7040".to_owned(),
+                            code: codes::VALID_7040.to_owned(),
                         })?;
                     Some(parsed)
                 }
@@ -4551,7 +4553,7 @@ pub async fn tool_interface_expose(
             )
             .map_err(|e| ScpError::Tool {
                 msg: format!("failed to create role state: {e}"),
-                code: "SCP-TOOL-6030".to_owned(),
+                code: codes::TOOL_6030.to_owned(),
             })?;
 
             let context_handle = scp_core::context::ContextHandle::new(
@@ -4573,18 +4575,18 @@ pub async fn tool_interface_expose(
             )
             .map_err(|e| ScpError::Tool {
                 msg: format!("expose_tool failed: {e}"),
-                code: "SCP-TOOL-6030".to_owned(),
+                code: codes::TOOL_6030.to_owned(),
             })?;
 
             serde_json::to_string(&interface).map_err(|e| ScpError::Tool {
                 msg: format!("failed to serialize ToolInterface: {e}"),
-                code: "SCP-TOOL-6031".to_owned(),
+                code: codes::TOOL_6031.to_owned(),
             })
         })
         .await
         .map_err(|e| ScpError::Tool {
             msg: format!("tokio task join error during tool_interface_expose: {e}"),
-            code: "SCP-TOOL-6009".to_owned(),
+            code: codes::TOOL_6009.to_owned(),
         })?
 }
 
@@ -4620,7 +4622,7 @@ pub async fn tool_interface_accept(
                         "cannot accept tool interface in context in {:?} state — context must be active",
                         *state
                     ),
-                    code: "SCP-TOOL-6032".to_owned(),
+                    code: codes::TOOL_6032.to_owned(),
                 });
             }
             drop(state);
@@ -4628,7 +4630,7 @@ pub async fn tool_interface_accept(
             let mut interface: scp_core::context::tools::interface::ToolInterface =
                 serde_json::from_str(&interface_json).map_err(|e| ScpError::Validation {
                     msg: format!("invalid interface_json: {e}"),
-                    code: "SCP-VALID-7041".to_owned(),
+                    code: codes::VALID_7041.to_owned(),
                 })?;
 
             let ceiling = scp_core::context::roles::default_ceiling();
@@ -4641,7 +4643,7 @@ pub async fn tool_interface_accept(
             )
             .map_err(|e| ScpError::Tool {
                 msg: format!("failed to create role state: {e}"),
-                code: "SCP-TOOL-6032".to_owned(),
+                code: codes::TOOL_6032.to_owned(),
             })?;
 
             let context_handle = scp_core::context::ContextHandle::new(
@@ -4658,18 +4660,18 @@ pub async fn tool_interface_accept(
             )
             .map_err(|e| ScpError::Tool {
                 msg: format!("accept_tool_interface failed: {e}"),
-                code: "SCP-TOOL-6032".to_owned(),
+                code: codes::TOOL_6032.to_owned(),
             })?;
 
             serde_json::to_string(&interface).map_err(|e| ScpError::Tool {
                 msg: format!("failed to serialize ToolInterface: {e}"),
-                code: "SCP-TOOL-6033".to_owned(),
+                code: codes::TOOL_6033.to_owned(),
             })
         })
         .await
         .map_err(|e| ScpError::Tool {
             msg: format!("tokio task join error during tool_interface_accept: {e}"),
-            code: "SCP-TOOL-6009".to_owned(),
+            code: codes::TOOL_6009.to_owned(),
         })?
 }
 
@@ -4701,7 +4703,7 @@ pub async fn tool_interface_revoke(
             let interface_id_bytes =
                 hex::decode(&interface_id_hex).map_err(|e| ScpError::Validation {
                     msg: format!("invalid interface_id_hex: not valid hex: {e}"),
-                    code: "SCP-VALID-7042".to_owned(),
+                    code: codes::VALID_7042.to_owned(),
                 })?;
             let interface_id: [u8; 32] = <[u8; 32]>::try_from(interface_id_bytes.as_slice())
                 .map_err(|_| ScpError::Validation {
@@ -4709,7 +4711,7 @@ pub async fn tool_interface_revoke(
                         "interface_id_hex must be exactly 32 bytes (64 hex chars), got {}",
                         interface_id_bytes.len()
                     ),
-                    code: "SCP-VALID-7042".to_owned(),
+                    code: codes::VALID_7042.to_owned(),
                 })?;
 
             let now_ms = scp_primitives::SystemClock.now_millis();
@@ -4722,13 +4724,13 @@ pub async fn tool_interface_revoke(
 
             serde_json::to_string(&event).map_err(|e| ScpError::Tool {
                 msg: format!("failed to serialize InterfaceRevoked: {e}"),
-                code: "SCP-TOOL-6035".to_owned(),
+                code: codes::TOOL_6035.to_owned(),
             })
         })
         .await
         .map_err(|e| ScpError::Tool {
             msg: format!("tokio task join error during tool_interface_revoke: {e}"),
-            code: "SCP-TOOL-6009".to_owned(),
+            code: codes::TOOL_6009.to_owned(),
         })?
 }
 
@@ -4818,7 +4820,7 @@ pub async fn transport_connect(relay_url: String) -> Result<Arc<TransportManager
         .await
         .map_err(|e| ScpError::Transport {
             msg: format!("tokio task join error during transport connect: {e}"),
-            code: "SCP-TRANS-5002".to_owned(),
+            code: codes::TRANS_5002.to_owned(),
         })?
 }
 
@@ -4858,7 +4860,7 @@ pub async fn transport_disconnect(manager: Arc<TransportManager>) -> Result<(), 
             {
                 let mut inner_guard = manager.inner.write().map_err(|_| ScpError::Transport {
                     msg: "transport manager lock is poisoned — cannot disconnect".to_owned(),
-                    code: "SCP-TRANS-5003".to_owned(),
+                    code: codes::TRANS_5003.to_owned(),
                 })?;
                 *inner_guard = scp_transport::TransportManager::builder();
             }
@@ -4867,7 +4869,7 @@ pub async fn transport_disconnect(manager: Arc<TransportManager>) -> Result<(), 
             {
                 let mut status_guard = manager.status.lock().map_err(|_| ScpError::Transport {
                     msg: "status mutex is poisoned — cannot update transport status".to_owned(),
-                    code: "SCP-TRANS-5003".to_owned(),
+                    code: codes::TRANS_5003.to_owned(),
                 })?;
                 status_guard.connected = false;
                 status_guard.relay_url = None;
@@ -4879,7 +4881,7 @@ pub async fn transport_disconnect(manager: Arc<TransportManager>) -> Result<(), 
         .await
         .map_err(|e| ScpError::Transport {
             msg: format!("tokio task join error during transport disconnect: {e}"),
-            code: "SCP-TRANS-5003".to_owned(),
+            code: codes::TRANS_5003.to_owned(),
         })?
 }
 
@@ -4929,7 +4931,7 @@ pub async fn configure_relay_transport(
             .await
             .map_err(|e| ScpError::Transport {
                 msg: format!("failed to connect to relay '{relay_url}': {e}"),
-                code: "SCP-TRANS-5001".to_owned(),
+                code: codes::TRANS_5001.to_owned(),
             })?;
 
     crate::runtime::init_context_manager_with_relay_transport(&local_did, adapter);
@@ -5766,11 +5768,11 @@ fn mcp_allowlist_err(e: scp_mcp::allowlist::AllowlistError) -> ScpError {
         | AllowlistError::PathInCommand(_)
         | AllowlistError::InvalidCommand(_) => ScpError::Validation {
             msg,
-            code: "SCP-VALID-7033".to_owned(),
+            code: codes::VALID_7033.to_owned(),
         },
         AllowlistError::NotAllowed { .. } | AllowlistError::LockPoisoned => ScpError::Transport {
             msg,
-            code: "SCP-TRANS-5030".to_owned(),
+            code: codes::TRANS_5030.to_owned(),
         },
     }
 }
@@ -5809,7 +5811,7 @@ pub async fn mcp_server_create(config: McpServerConfig) -> Result<String, ScpErr
     if config.context_ids.is_empty() {
         return Err(ScpError::Transport {
             msg: "context_ids must not be empty".to_owned(),
-            code: "SCP-TRANS-5011".to_owned(),
+            code: codes::TRANS_5011.to_owned(),
         });
     }
 
@@ -5895,13 +5897,13 @@ pub async fn mcp_server_stop(handle: String) -> Result<(), ScpError> {
         .get_mut(&handle)
         .ok_or_else(|| ScpError::Transport {
             msg: format!("MCP server handle '{handle}' not found"),
-            code: "SCP-TRANS-5012".to_owned(),
+            code: codes::TRANS_5012.to_owned(),
         })?;
 
     if entry.stopped {
         return Err(ScpError::Transport {
             msg: format!("MCP server '{handle}' is already stopped"),
-            code: "SCP-TRANS-5013".to_owned(),
+            code: codes::TRANS_5013.to_owned(),
         });
     }
 
@@ -5936,19 +5938,19 @@ pub async fn mcp_client_connect_stdio(command: Vec<String>) -> Result<String, Sc
     if command.is_empty() {
         return Err(ScpError::Validation {
             msg: "command must be a non-empty list".to_owned(),
-            code: "SCP-VALID-7034".to_owned(),
+            code: codes::VALID_7034.to_owned(),
         });
     }
 
     let transport = McpStdioTransport::spawn(&command).map_err(|e| ScpError::Transport {
         msg: format!("failed to connect stdio MCP client: {e}"),
-        code: "SCP-TRANS-5015".to_owned(),
+        code: codes::TRANS_5015.to_owned(),
     })?;
 
     let mut client = scp_mcp::client::McpClient::new(McpUniFFITransportWrapper::Stdio(transport));
     client.initialize().map_err(|e| ScpError::Transport {
         msg: format!("MCP initialize handshake failed: {e}"),
-        code: "SCP-TRANS-5016".to_owned(),
+        code: codes::TRANS_5016.to_owned(),
     })?;
 
     let handle_id = mcp_handle_id("mcp-client");
@@ -5985,7 +5987,7 @@ pub async fn mcp_client_connect_sse(url: String) -> Result<String, ScpError> {
     let mut client = scp_mcp::client::McpClient::new(McpUniFFITransportWrapper::Sse(transport));
     client.initialize().map_err(|e| ScpError::Transport {
         msg: format!("MCP initialize handshake failed: {e}"),
-        code: "SCP-TRANS-5018".to_owned(),
+        code: codes::TRANS_5018.to_owned(),
     })?;
 
     let handle_id = mcp_handle_id("mcp-client");
@@ -6020,7 +6022,7 @@ pub async fn mcp_client_disconnect(handle: String) -> Result<(), ScpError> {
     if removed.is_none() {
         return Err(ScpError::Transport {
             msg: format!("MCP client handle '{handle}' not found"),
-            code: "SCP-TRANS-5019".to_owned(),
+            code: codes::TRANS_5019.to_owned(),
         });
     }
 
@@ -6052,17 +6054,17 @@ pub async fn mcp_client_list_tools(handle: String) -> Result<Vec<McpToolInfo>, S
         .get(&handle)
         .ok_or_else(|| ScpError::Transport {
             msg: format!("MCP client handle '{handle}' not found"),
-            code: "SCP-TRANS-5020".to_owned(),
+            code: codes::TRANS_5020.to_owned(),
         })?;
 
     let client_guard = entry.client.lock().map_err(|e| ScpError::Transport {
         msg: format!("client lock poisoned: {e}"),
-        code: "SCP-TRANS-5021".to_owned(),
+        code: codes::TRANS_5021.to_owned(),
     })?;
 
     let tools = client_guard.list_tools().map_err(|e| ScpError::Transport {
         msg: format!("tools/list failed: {e}"),
-        code: "SCP-TRANS-5022".to_owned(),
+        code: codes::TRANS_5022.to_owned(),
     })?;
 
     Ok(tools
@@ -6115,25 +6117,25 @@ pub async fn mcp_client_invoke(
         .get(&handle)
         .ok_or_else(|| ScpError::Transport {
             msg: format!("MCP client handle '{handle}' not found"),
-            code: "SCP-TRANS-5023".to_owned(),
+            code: codes::TRANS_5023.to_owned(),
         })?;
 
     let input: serde_json::Value =
         serde_json::from_str(&input_json).map_err(|e| ScpError::Validation {
             msg: format!("invalid input JSON: {e}"),
-            code: "SCP-VALID-7021".to_owned(),
+            code: codes::VALID_7021.to_owned(),
         })?;
 
     let client_guard = entry.client.lock().map_err(|e| ScpError::Transport {
         msg: format!("client lock poisoned: {e}"),
-        code: "SCP-TRANS-5024".to_owned(),
+        code: codes::TRANS_5024.to_owned(),
     })?;
 
     let result = client_guard
         .invoke(&tool_name, input, &context_id, &invoker_did)
         .map_err(|e| ScpError::Transport {
             msg: format!("tools/call failed: {e}"),
-            code: "SCP-TRANS-5025".to_owned(),
+            code: codes::TRANS_5025.to_owned(),
         })?;
 
     let content_json = serde_json::to_string(&result.content).unwrap_or_else(|_| "[]".to_owned());
@@ -6267,7 +6269,7 @@ pub async fn ucan_validate(
             // Step 1: Parse the UCAN token.
             let parsed_token = parse_ucan(&token).map_err(|e| ScpError::Permission {
                 msg: format!("malformed UCAN token: {e}"),
-                code: "SCP-PERM-3002".to_owned(),
+                code: codes::PERM_3002.to_owned(),
             })?;
 
             // Parse the required capability URI.
@@ -6277,7 +6279,7 @@ pub async fn ucan_validate(
                     .map_err(
                         |e: scp_core::crypto::ucan::UcanError| ScpError::Permission {
                             msg: format!("invalid capability URI '{capability}': {e}"),
-                            code: "SCP-PERM-3002".to_owned(),
+                            code: codes::PERM_3002.to_owned(),
                         },
                     )?;
 
@@ -6292,7 +6294,7 @@ pub async fn ucan_validate(
                 for encoded in tokens {
                     let proof_token = parse_ucan(encoded).map_err(|e| ScpError::Permission {
                         msg: format!("malformed proof token: {e}"),
-                        code: "SCP-PERM-3002".to_owned(),
+                        code: codes::PERM_3002.to_owned(),
                     })?;
                     let cid = scp_core::crypto::ucan::mint::compute_cid(&proof_token);
                     proofs.insert(cid, proof_token);
@@ -6336,13 +6338,13 @@ pub async fn ucan_validate(
                     validate_ucan(&parsed_token, &required_cap, &mut ctx).map_err(|e| {
                         ScpError::Permission {
                             msg: format!("UCAN validation failed: {e}"),
-                            code: "SCP-PERM-3002".to_owned(),
+                            code: codes::PERM_3002.to_owned(),
                         }
                     })
                 })
                 .ok_or_else(|| ScpError::Permission {
                     msg: format!("context '{}' not found in UCAN registry", handle.context_id),
-                    code: "SCP-PERM-3002".to_owned(),
+                    code: codes::PERM_3002.to_owned(),
                 })?;
             validation_result?;
 
@@ -6351,7 +6353,7 @@ pub async fn ucan_validate(
         .await
         .map_err(|e| ScpError::Permission {
             msg: format!("tokio task join error during UCAN validation: {e}"),
-            code: "SCP-PERM-3003".to_owned(),
+            code: codes::PERM_3003.to_owned(),
         })?
 }
 
@@ -6401,7 +6403,7 @@ pub async fn ucan_mint(
         for t in tokens {
             validate_ucan_token(t).map_err(|e| ScpError::Validation {
                 msg: e.to_string(),
-                code: "SCP-VALID-7010".to_owned(),
+                code: codes::VALID_7010.to_owned(),
             })?;
         }
     }
@@ -6427,13 +6429,13 @@ async fn ucan_mint_impl(
                         msg: "UCAN minting requires key custody — create the context with \
                               an in_memory identity (identity_create(\"in_memory\"))"
                             .to_owned(),
-                        code: "SCP-PERM-3004".to_owned(),
+                        code: codes::PERM_3004.to_owned(),
                     })?;
             let signing_key = handle.signing_key.ok_or_else(|| ScpError::Permission {
                 msg: "UCAN minting requires a signing key — the context creator identity \
                           must have an active signing key"
                     .to_owned(),
-                code: "SCP-PERM-3004".to_owned(),
+                code: codes::PERM_3004.to_owned(),
             })?;
 
             let params = scp_core::crypto::ucan::mint::MintParams {
@@ -6482,7 +6484,7 @@ async fn ucan_mint_impl(
         .await
         .map_err(|e| ScpError::Permission {
             msg: format!("tokio task join error during UCAN mint: {e}"),
-            code: "SCP-PERM-3005".to_owned(),
+            code: codes::PERM_3005.to_owned(),
         })?
 }
 
@@ -6500,7 +6502,7 @@ async fn ucan_mint_impl(
                   \"allow_in_memory_custody\" feature for dev/desktop use, or wire \
                   a KeyCustodyProvider for production."
             .to_owned(),
-        code: "SCP-PERM-3004".to_owned(),
+        code: codes::PERM_3004.to_owned(),
     })
 }
 
@@ -6537,11 +6539,11 @@ pub async fn ucan_revoke(
 ) -> Result<(), ScpError> {
     validate_ucan_token(&token).map_err(|e| ScpError::Validation {
         msg: e.to_string(),
-        code: "SCP-VALID-7010".to_owned(),
+        code: codes::VALID_7010.to_owned(),
     })?;
     validate_did(&revoker_did).map_err(|e| ScpError::Validation {
         msg: e.to_string(),
-        code: "SCP-VALID-7011".to_owned(),
+        code: codes::VALID_7011.to_owned(),
     })?;
 
     runtime()
@@ -6587,7 +6589,7 @@ pub async fn ucan_revoke(
             })
             .ok_or_else(|| ScpError::Permission {
                 msg: format!("context '{}' not found in UCAN registry", handle.context_id),
-                code: "SCP-PERM-3006".to_owned(),
+                code: codes::PERM_3006.to_owned(),
             })??;
 
             Ok(())
@@ -6595,7 +6597,7 @@ pub async fn ucan_revoke(
         .await
         .map_err(|e| ScpError::Permission {
             msg: format!("tokio task join error during UCAN revocation: {e}"),
-            code: "SCP-PERM-3007".to_owned(),
+            code: codes::PERM_3007.to_owned(),
         })?
 }
 
@@ -6680,19 +6682,19 @@ async fn ucan_delegate_impl(
                         msg: "UCAN delegation requires key custody — create the context with \
                               an in_memory identity (identity_create(\"in_memory\"))"
                             .to_owned(),
-                        code: "SCP-PERM-3004".to_owned(),
+                        code: codes::PERM_3004.to_owned(),
                     })?;
             let signing_key = handle.signing_key.ok_or_else(|| ScpError::Permission {
                 msg: "UCAN delegation requires a signing key — the context creator identity \
                           must have an active signing key"
                     .to_owned(),
-                code: "SCP-PERM-3004".to_owned(),
+                code: codes::PERM_3004.to_owned(),
             })?;
 
             // Parse the parent token.
             let parsed_parent = parse_ucan(&parent_token).map_err(|e| ScpError::Permission {
                 msg: format!("malformed parent UCAN token: {e}"),
-                code: "SCP-PERM-3002".to_owned(),
+                code: codes::PERM_3002.to_owned(),
             })?;
 
             // Build attenuated capabilities from the capability URI strings.
@@ -6762,7 +6764,7 @@ async fn ucan_delegate_impl(
         .await
         .map_err(|e| ScpError::Permission {
             msg: format!("tokio task join error during UCAN delegation: {e}"),
-            code: "SCP-PERM-3005".to_owned(),
+            code: codes::PERM_3005.to_owned(),
         })?
 }
 
@@ -6781,7 +6783,7 @@ async fn ucan_delegate_impl(
                   \"allow_in_memory_custody\" feature for dev/desktop use, or wire \
                   a KeyCustodyProvider for production."
             .to_owned(),
-        code: "SCP-PERM-3004".to_owned(),
+        code: codes::PERM_3004.to_owned(),
     })
 }
 
@@ -6828,7 +6830,7 @@ pub async fn event_log_query(
                     Some(
                         serde_json::from_str(json_str).map_err(|e| ScpError::Context {
                             msg: format!("invalid filter JSON: {e}"),
-                            code: "SCP-CTX-2023".to_owned(),
+                            code: codes::CTX_2023.to_owned(),
                         })?,
                     )
                 }
@@ -6962,7 +6964,7 @@ pub async fn event_log_query(
             })
             .ok_or_else(|| ScpError::Context {
                 msg: format!("context '{}' not found in UCAN registry", handle.context_id),
-                code: "SCP-CTX-2023".to_owned(),
+                code: codes::CTX_2023.to_owned(),
             })?;
 
             Ok(events)
@@ -6970,7 +6972,7 @@ pub async fn event_log_query(
         .await
         .map_err(|e| ScpError::Context {
             msg: format!("tokio task join error during event log query: {e}"),
-            code: "SCP-CTX-2024".to_owned(),
+            code: codes::CTX_2024.to_owned(),
         })?
 }
 
@@ -7005,7 +7007,7 @@ pub async fn event_log_verify(
             let claim: serde_json::Value =
                 serde_json::from_str(&claim_json).map_err(|e| ScpError::Context {
                     msg: format!("invalid claim JSON: {e}"),
-                    code: "SCP-CTX-2025".to_owned(),
+                    code: codes::CTX_2025.to_owned(),
                 })?;
 
             let claim_type =
@@ -7015,7 +7017,7 @@ pub async fn event_log_verify(
                     .ok_or_else(|| ScpError::Context {
                         msg: "claim must include 'type' field ('inclusion' or 'absence')"
                             .to_owned(),
-                        code: "SCP-CTX-2025".to_owned(),
+                        code: codes::CTX_2025.to_owned(),
                     })?;
 
             // Ensure UCAN state (which contains the event log) is registered.
@@ -7032,7 +7034,7 @@ pub async fn event_log_verify(
                         .and_then(serde_json::Value::as_u64)
                         .ok_or_else(|| ScpError::Context {
                             msg: "inclusion claim must include 'leaf_index' (integer)".to_owned(),
-                            code: "SCP-CTX-2025".to_owned(),
+                            code: codes::CTX_2025.to_owned(),
                         })?;
 
                     crate::runtime::with_ucan_state(&handle.context_id, |ucan_state| {
@@ -7042,7 +7044,7 @@ pub async fn event_log_verify(
                         )
                         .map_err(|e| ScpError::Context {
                             msg: format!("inclusion proof failed: {e}"),
-                            code: "SCP-CTX-2025".to_owned(),
+                            code: codes::CTX_2025.to_owned(),
                         })?;
                         let verified = scp_event_log::proof::verify_inclusion(&proof);
 
@@ -7077,7 +7079,7 @@ pub async fn event_log_verify(
                     })
                     .ok_or_else(|| ScpError::Context {
                         msg: format!("context '{}' not found in UCAN registry", handle.context_id),
-                        code: "SCP-CTX-2025".to_owned(),
+                        code: codes::CTX_2025.to_owned(),
                     })?
                 }
                 "absence" => {
@@ -7086,20 +7088,20 @@ pub async fn event_log_verify(
                         .and_then(|v| v.as_str())
                         .ok_or_else(|| ScpError::Context {
                             msg: "absence claim must include 'event_hash' (hex string)".to_owned(),
-                            code: "SCP-CTX-2025".to_owned(),
+                            code: codes::CTX_2025.to_owned(),
                         })?;
 
                     let event_hash_bytes =
                         hex::decode(event_hash_hex).map_err(|e| ScpError::Context {
                             msg: format!("invalid event_hash hex: {e}"),
-                            code: "SCP-CTX-2025".to_owned(),
+                            code: codes::CTX_2025.to_owned(),
                         })?;
                     let event_hash: [u8; 32] =
                         event_hash_bytes
                             .try_into()
                             .map_err(|v: Vec<u8>| ScpError::Context {
                                 msg: format!("event_hash must be 32 bytes, got {}", v.len()),
-                                code: "SCP-CTX-2025".to_owned(),
+                                code: codes::CTX_2025.to_owned(),
                             })?;
 
                     crate::runtime::with_ucan_state(&handle.context_id, |ucan_state| {
@@ -7107,7 +7109,7 @@ pub async fn event_log_verify(
                             scp_event_log::proof::prove_absence(&ucan_state.event_log, &event_hash)
                                 .map_err(|e| ScpError::Context {
                                     msg: format!("absence proof failed: {e}"),
-                                    code: "SCP-CTX-2025".to_owned(),
+                                    code: codes::CTX_2025.to_owned(),
                                 })?;
 
                         let lower = proof.lower.as_ref().map(|lwp| {
@@ -7147,21 +7149,21 @@ pub async fn event_log_verify(
                     })
                     .ok_or_else(|| ScpError::Context {
                         msg: format!("context '{}' not found in UCAN registry", handle.context_id),
-                        code: "SCP-CTX-2025".to_owned(),
+                        code: codes::CTX_2025.to_owned(),
                     })?
                 }
                 other => Err(ScpError::Context {
                     msg: format!(
                         "unsupported claim type '{other}': expected 'inclusion' or 'absence'"
                     ),
-                    code: "SCP-CTX-2025".to_owned(),
+                    code: codes::CTX_2025.to_owned(),
                 }),
             }
         })
         .await
         .map_err(|e| ScpError::Context {
             msg: format!("tokio task join error during event log verification: {e}"),
-            code: "SCP-CTX-2026".to_owned(),
+            code: codes::CTX_2026.to_owned(),
         })?
 }
 
@@ -7213,7 +7215,7 @@ async fn event_log_checkpoint_impl(
                         msg: "event log checkpoint requires key custody — create the identity \
                               with in_memory custody (identity_create(\"in_memory\"))"
                             .to_owned(),
-                        code: "SCP-PERM-3008".to_owned(),
+                        code: codes::PERM_3008.to_owned(),
                     })?;
             let core_id = identity
                 .core_id
@@ -7222,7 +7224,7 @@ async fn event_log_checkpoint_impl(
                     msg: "event log checkpoint requires retained identity state — the identity \
                           was externally loaded"
                         .to_owned(),
-                    code: "SCP-IDENT-1007".to_owned(),
+                    code: codes::IDENT_1007.to_owned(),
                 })?;
 
             // Ensure UCAN state (which contains the event log) is registered.
@@ -7255,14 +7257,14 @@ async fn event_log_checkpoint_impl(
                         .await
                         .map_err(|e| ScpError::Context {
                             msg: format!("checkpoint generation failed: {e}"),
-                            code: "SCP-CTX-2027".to_owned(),
+                            code: codes::CTX_2027.to_owned(),
                         })
                     })
                 })
             })
             .ok_or_else(|| ScpError::Context {
                 msg: format!("context '{context_id}' not found in UCAN registry"),
-                code: "SCP-CTX-2027".to_owned(),
+                code: codes::CTX_2027.to_owned(),
             })??;
 
             Ok(Checkpoint {
@@ -7278,7 +7280,7 @@ async fn event_log_checkpoint_impl(
         .await
         .map_err(|e| ScpError::Context {
             msg: format!("tokio task join error during event log checkpoint: {e}"),
-            code: "SCP-CTX-2028".to_owned(),
+            code: codes::CTX_2028.to_owned(),
         })?
 }
 
@@ -7295,7 +7297,7 @@ async fn event_log_checkpoint_impl(
                   \"allow_in_memory_custody\" feature for dev/desktop use, or wire \
                   a KeyCustodyProvider for production."
             .to_owned(),
-        code: "SCP-PERM-3008".to_owned(),
+        code: codes::PERM_3008.to_owned(),
     })
 }
 
@@ -7338,7 +7340,7 @@ pub async fn governance_execute(
             scp_ffi_common::validate::validate_governance_action_strings(&proposal.action)
                 .map_err(|e| ScpError::Validation {
                     msg: e.message,
-                    code: "SCP-VALID-7000".to_owned(),
+                    code: codes::VALID_7000.to_owned(),
                 })?;
             let action_name = proposal.action.variant_name();
             let manager = crate::runtime::context_manager()?;
@@ -7384,7 +7386,7 @@ pub async fn governance_execute(
         .await
         .map_err(|e| ScpError::Context {
             msg: format!("tokio task join error during governance execution: {e}"),
-            code: "SCP-CTX-2032".to_owned(),
+            code: codes::CTX_2032.to_owned(),
         })??;
 
     // Re-sync role state from ContextManager after governance execution (#796).
@@ -7432,7 +7434,7 @@ async fn resolve_uniffi_signing_key(
         msg: "no signing key on context handle — governance lifecycle \
                   requires an identity with an active signing key"
             .to_owned(),
-        code: "SCP-CTX-2040".to_owned(),
+        code: codes::CTX_2040.to_owned(),
     })?;
 
     if let Some(ref cb) = handle.callback_custody {
@@ -7441,7 +7443,7 @@ async fn resolve_uniffi_signing_key(
             .await
             .map_err(|e| ScpError::Context {
                 msg: format!("failed to export signing key from platform custody: {e}"),
-                code: "SCP-CTX-2040".to_owned(),
+                code: codes::CTX_2040.to_owned(),
             });
     }
 
@@ -7453,7 +7455,7 @@ async fn resolve_uniffi_signing_key(
             .await
             .map_err(|e| ScpError::Context {
                 msg: format!("failed to export signing key from in-memory custody: {e}"),
-                code: "SCP-CTX-2040".to_owned(),
+                code: codes::CTX_2040.to_owned(),
             });
     }
 
@@ -7461,7 +7463,7 @@ async fn resolve_uniffi_signing_key(
         msg: "no custody provider on context handle — governance lifecycle \
                   requires an identity created with custody"
             .to_owned(),
-        code: "SCP-CTX-2040".to_owned(),
+        code: codes::CTX_2040.to_owned(),
     })
 }
 
@@ -7469,11 +7471,11 @@ async fn resolve_uniffi_signing_key(
 fn parse_uniffi_proposal_id(hex_str: &str) -> Result<[u8; 32], ScpError> {
     let bytes = hex::decode(hex_str).map_err(|e| ScpError::Validation {
         msg: format!("invalid proposal ID hex: {e}"),
-        code: "SCP-CTX-2040".to_owned(),
+        code: codes::CTX_2040.to_owned(),
     })?;
     bytes.try_into().map_err(|v: Vec<u8>| ScpError::Validation {
         msg: format!("proposal ID must be 32 bytes, got {}", v.len()),
-        code: "SCP-CTX-2040".to_owned(),
+        code: codes::CTX_2040.to_owned(),
     })
 }
 
@@ -7515,7 +7517,7 @@ pub async fn governance_propose(
             scp_ffi_common::validate::validate_governance_action_strings(&action).map_err(|e| {
                 ScpError::Validation {
                     msg: e.message,
-                    code: "SCP-CTX-2041".to_owned(),
+                    code: codes::CTX_2041.to_owned(),
                 }
             })?;
             let action_name = action.variant_name();
@@ -7538,7 +7540,7 @@ pub async fn governance_propose(
         .await
         .map_err(|e| ScpError::Context {
             msg: format!("tokio task join error during governance proposal: {e}"),
-            code: "SCP-CTX-2041".to_owned(),
+            code: codes::CTX_2041.to_owned(),
         })??;
 
     if let Err(e) = crate::runtime::sync_role_state_from_manager(&handle.context_id).await {
@@ -7584,7 +7586,7 @@ pub async fn governance_approve(
         .await
         .map_err(|e| ScpError::Context {
             msg: format!("tokio task join error during governance approval: {e}"),
-            code: "SCP-CTX-2042".to_owned(),
+            code: codes::CTX_2042.to_owned(),
         })?;
 
     if let Err(e) = crate::runtime::sync_role_state_from_manager(&handle.context_id).await {
@@ -7629,7 +7631,7 @@ pub async fn governance_reject(
         .await
         .map_err(|e| ScpError::Context {
             msg: format!("tokio task join error during governance rejection: {e}"),
-            code: "SCP-CTX-2043".to_owned(),
+            code: codes::CTX_2043.to_owned(),
         })?;
 
     if let Err(e) = crate::runtime::sync_role_state_from_manager(&handle.context_id).await {
@@ -7674,7 +7676,7 @@ pub async fn governance_withdraw(
         .await
         .map_err(|e| ScpError::Context {
             msg: format!("tokio task join error during governance withdrawal: {e}"),
-            code: "SCP-CTX-2044".to_owned(),
+            code: codes::CTX_2044.to_owned(),
         })?;
 
     if let Err(e) = crate::runtime::sync_role_state_from_manager(&handle.context_id).await {
@@ -7711,13 +7713,13 @@ pub async fn governance_get_proposal(
 
             serde_json::to_string(&proposal).map_err(|e| ScpError::Context {
                 msg: format!("serialization failed: {e}"),
-                code: "SCP-CTX-2045".to_owned(),
+                code: codes::CTX_2045.to_owned(),
             })
         })
         .await
         .map_err(|e| ScpError::Context {
             msg: format!("tokio task join error during get proposal: {e}"),
-            code: "SCP-CTX-2045".to_owned(),
+            code: codes::CTX_2045.to_owned(),
         })?
 }
 
@@ -7742,13 +7744,13 @@ pub async fn governance_list_proposals(handle: Arc<ContextHandle>) -> Result<Str
 
             serde_json::to_string(&proposals).map_err(|e| ScpError::Context {
                 msg: format!("serialization failed: {e}"),
-                code: "SCP-CTX-2046".to_owned(),
+                code: codes::CTX_2046.to_owned(),
             })
         })
         .await
         .map_err(|e| ScpError::Context {
             msg: format!("tokio task join error during list proposals: {e}"),
-            code: "SCP-CTX-2046".to_owned(),
+            code: codes::CTX_2046.to_owned(),
         })?
 }
 
@@ -7781,7 +7783,7 @@ pub async fn apply_pending_ceiling_modification(
         .await
         .map_err(|e| ScpError::Context {
             msg: format!("tokio task join error during apply_pending_ceiling_modification: {e}"),
-            code: "SCP-CTX-2060".to_owned(),
+            code: codes::CTX_2060.to_owned(),
         })?
 }
 
@@ -7829,7 +7831,7 @@ pub async fn finalize_close(handle: Arc<ContextHandle>) -> Result<(), ScpError> 
         .await
         .map_err(|e| ScpError::Context {
             msg: format!("tokio task join error during finalize_close: {e}"),
-            code: "SCP-CTX-2061".to_owned(),
+            code: codes::CTX_2061.to_owned(),
         })?
 }
 
@@ -7863,7 +7865,7 @@ pub async fn create_governance_checkpoint(
         Zeroizing::new(
             hex::decode(&creator_signature_hex).map_err(|e| ScpError::Validation {
                 msg: format!("invalid creator_signature hex: {e}"),
-                code: "SCP-CTX-2066".to_owned(),
+                code: codes::CTX_2066.to_owned(),
             })?,
         );
     let did = scp_identity::DID(creator_did);
@@ -7887,13 +7889,13 @@ pub async fn create_governance_checkpoint(
 
             serde_json::to_string(&checkpoint).map_err(|e| ScpError::Context {
                 msg: format!("serialization failed: {e}"),
-                code: "SCP-CTX-2066".to_owned(),
+                code: codes::CTX_2066.to_owned(),
             })
         })
         .await
         .map_err(|e| ScpError::Context {
             msg: format!("tokio task join error during create_governance_checkpoint: {e}"),
-            code: "SCP-CTX-2066".to_owned(),
+            code: codes::CTX_2066.to_owned(),
         })?
 }
 
@@ -7918,14 +7920,14 @@ pub async fn add_checkpoint_cosignature(
     let mut checkpoint: scp_core::context::governance::ContextCheckpoint =
         serde_json::from_str(&checkpoint_json).map_err(|e| ScpError::Validation {
             msg: format!("invalid checkpoint JSON: {e}"),
-            code: "SCP-CTX-2063".to_owned(),
+            code: codes::CTX_2063.to_owned(),
         })?;
 
     let signature =
         Zeroizing::new(
             hex::decode(&signature_hex).map_err(|e| ScpError::Validation {
                 msg: format!("invalid signature hex: {e}"),
-                code: "SCP-CTX-2063".to_owned(),
+                code: codes::CTX_2063.to_owned(),
             })?,
         );
 
@@ -7951,7 +7953,7 @@ pub async fn add_checkpoint_cosignature(
         .await
         .map_err(|e| ScpError::Context {
             msg: format!("tokio task join error during add_checkpoint_cosignature: {e}"),
-            code: "SCP-CTX-2063".to_owned(),
+            code: codes::CTX_2063.to_owned(),
         })?
 }
 
@@ -7990,7 +7992,7 @@ pub async fn restore_context(context_id: String) -> Result<(), ScpError> {
         .await
         .map_err(|e| ScpError::Context {
             msg: format!("tokio task join error during restore_context: {e}"),
-            code: "SCP-CTX-2064".to_owned(),
+            code: codes::CTX_2064.to_owned(),
         })?
 }
 
@@ -8013,13 +8015,13 @@ pub async fn restore_all_contexts() -> Result<String, ScpError> {
 
             serde_json::to_string(&restored).map_err(|e| ScpError::Context {
                 msg: format!("serialization failed: {e}"),
-                code: "SCP-CTX-2065".to_owned(),
+                code: codes::CTX_2065.to_owned(),
             })
         })
         .await
         .map_err(|e| ScpError::Context {
             msg: format!("tokio task join error during restore_all_contexts: {e}"),
-            code: "SCP-CTX-2065".to_owned(),
+            code: codes::CTX_2065.to_owned(),
         })?
 }
 
@@ -8027,11 +8029,11 @@ pub async fn restore_all_contexts() -> Result<String, ScpError> {
 fn parse_uniffi_hex_32(hex_str: &str, field_name: &str) -> Result<[u8; 32], ScpError> {
     let bytes = hex::decode(hex_str).map_err(|e| ScpError::Validation {
         msg: format!("invalid {field_name} hex: {e}"),
-        code: "SCP-CTX-2066".to_owned(),
+        code: codes::CTX_2066.to_owned(),
     })?;
     bytes.try_into().map_err(|v: Vec<u8>| ScpError::Validation {
         msg: format!("{field_name} must be 32 bytes, got {}", v.len()),
-        code: "SCP-CTX-2066".to_owned(),
+        code: codes::CTX_2066.to_owned(),
     })
 }
 
@@ -8068,7 +8070,7 @@ pub async fn tombstone_migrated_context(handle: Arc<ContextHandle>) -> Result<()
         .await
         .map_err(|e| ScpError::Context {
             msg: format!("tokio task join error during tombstone: {e}"),
-            code: "SCP-CTX-2050".to_owned(),
+            code: codes::CTX_2050.to_owned(),
         })?
 }
 
@@ -8101,7 +8103,7 @@ pub async fn migration_state(handle: Arc<ContextHandle>) -> Result<Option<String
         .await
         .map_err(|e| ScpError::Context {
             msg: format!("tokio task join error during migration_state: {e}"),
-            code: "SCP-CTX-2050".to_owned(),
+            code: codes::CTX_2050.to_owned(),
         })?
 }
 
@@ -8147,7 +8149,7 @@ pub async fn broadcast_subscribe(
         .await
         .map_err(|e| ScpError::Context {
             msg: format!("tokio task join error during broadcast subscribe: {e}"),
-            code: "SCP-CTX-2033".to_owned(),
+            code: codes::CTX_2033.to_owned(),
         })?
 }
 
@@ -8178,7 +8180,7 @@ pub async fn broadcast_unsubscribe(
         .await
         .map_err(|e| ScpError::Context {
             msg: format!("tokio task join error during broadcast unsubscribe: {e}"),
-            code: "SCP-CTX-2034".to_owned(),
+            code: codes::CTX_2034.to_owned(),
         })?
 }
 
@@ -8217,7 +8219,7 @@ pub async fn broadcast_publish(
                 .ok_or_else(|| ScpError::Permission {
                     msg: "broadcast publish requires a fully created identity with key handles"
                         .to_owned(),
-                    code: "SCP-PERM-3020".to_owned(),
+                    code: codes::PERM_3020.to_owned(),
                 })?;
             let signing_key_handle = &core_id.active_signing_key;
 
@@ -8242,7 +8244,7 @@ pub async fn broadcast_publish(
                                       identity with identity_create(\"in_memory\") or \
                                       identity_create_with_custody()"
                                 .to_owned(),
-                            code: "SCP-PERM-3021".to_owned(),
+                            code: codes::PERM_3021.to_owned(),
                         }
                     })?;
                     manager
@@ -8263,7 +8265,7 @@ pub async fn broadcast_publish(
                                   identity_create_with_custody() to inject a platform \
                                   custody provider"
                             .to_owned(),
-                        code: "SCP-PERM-3022".to_owned(),
+                        code: codes::PERM_3022.to_owned(),
                     });
                 }
             }
@@ -8273,7 +8275,7 @@ pub async fn broadcast_publish(
         .await
         .map_err(|e| ScpError::Context {
             msg: format!("tokio task join error during broadcast publish: {e}"),
-            code: "SCP-CTX-2035".to_owned(),
+            code: codes::CTX_2035.to_owned(),
         })?
 }
 
@@ -8353,7 +8355,7 @@ pub async fn broadcast_publish_asset(
                     msg:
                         "broadcast publish asset requires a fully created identity with key handles"
                             .to_owned(),
-                    code: "SCP-PERM-3020".to_owned(),
+                    code: codes::PERM_3020.to_owned(),
                 })?;
             let signing_key_handle = &core_id.active_signing_key;
 
@@ -8361,12 +8363,12 @@ pub async fn broadcast_publish_asset(
             let content_path =
                 scp_core::context::ContentPath::new(asset.path).map_err(|e| ScpError::Context {
                     msg: format!("invalid path: {e}"),
-                    code: "SCP-CTX-2040".to_owned(),
+                    code: codes::CTX_2040.to_owned(),
                 })?;
             let mime_type = scp_core::context::MimeType::new(asset.content_type).map_err(|e| {
                 ScpError::Context {
                     msg: format!("invalid content_type: {e}"),
-                    code: "SCP-CTX-2041".to_owned(),
+                    code: codes::CTX_2041.to_owned(),
                 }
             })?;
             // Auto-generate deploy_id when None, matching batch behavior.
@@ -8385,7 +8387,7 @@ pub async fn broadcast_publish_asset(
             if let Some(ref did_str) = deploy_id {
                 scp_core::context::validate_deploy_id(did_str).map_err(|e| ScpError::Context {
                     msg: format!("invalid deploy_id: {e}"),
-                    code: "SCP-CTX-2042".to_owned(),
+                    code: codes::CTX_2042.to_owned(),
                 })?;
             }
 
@@ -8425,7 +8427,7 @@ pub async fn broadcast_publish_asset(
                                   identity with identity_create(\"in_memory\") or \
                                   identity_create_with_custody()"
                                 .to_owned(),
-                            code: "SCP-PERM-3021".to_owned(),
+                            code: codes::PERM_3021.to_owned(),
                         }
                     })?;
                     manager
@@ -8446,7 +8448,7 @@ pub async fn broadcast_publish_asset(
                               identity_create_with_custody() to inject a platform \
                               custody provider"
                             .to_owned(),
-                        code: "SCP-PERM-3022".to_owned(),
+                        code: codes::PERM_3022.to_owned(),
                     });
                 }
             };
@@ -8454,7 +8456,7 @@ pub async fn broadcast_publish_asset(
             let envelope_bytes =
                 rmp_serde::to_vec_named(&envelope).map_err(|e| ScpError::Context {
                     msg: format!("failed to serialize envelope for blob_id: {e}"),
-                    code: "SCP-CTX-2043".to_owned(),
+                    code: codes::CTX_2043.to_owned(),
                 })?;
             let blob_id = {
                 use sha2::{Digest, Sha256};
@@ -8470,7 +8472,7 @@ pub async fn broadcast_publish_asset(
         .await
         .map_err(|e| ScpError::Context {
             msg: format!("tokio task join error during broadcast publish asset: {e}"),
-            code: "SCP-CTX-2035".to_owned(),
+            code: codes::CTX_2035.to_owned(),
         })?
 }
 
@@ -8497,7 +8499,7 @@ pub async fn broadcast_publish_assets(
                 "batch too large: {} assets (max {MAX_BATCH_ASSETS})",
                 assets.len()
             ),
-            code: "SCP-CTX-2074".to_owned(),
+            code: codes::CTX_2074.to_owned(),
         });
     }
 
@@ -8511,7 +8513,7 @@ pub async fn broadcast_publish_assets(
                 .as_ref()
                 .ok_or_else(|| ScpError::Permission {
                     msg: "broadcast publish assets requires a fully created identity".to_owned(),
-                    code: "SCP-PERM-3020".to_owned(),
+                    code: codes::PERM_3020.to_owned(),
                 })?;
             let signing_key_handle = &core_id.active_signing_key;
 
@@ -8532,7 +8534,7 @@ pub async fn broadcast_publish_assets(
             scp_core::context::validate_deploy_id(&deploy_id_val).map_err(|e| {
                 ScpError::Context {
                     msg: format!("invalid deploy_id: {e}"),
-                    code: "SCP-CTX-2042".to_owned(),
+                    code: codes::CTX_2042.to_owned(),
                 }
             })?;
 
@@ -8542,14 +8544,14 @@ pub async fn broadcast_publish_assets(
                     scp_core::context::ContentPath::new(asset.path).map_err(|e| {
                         ScpError::Context {
                             msg: format!("invalid path: {e}"),
-                            code: "SCP-CTX-2040".to_owned(),
+                            code: codes::CTX_2040.to_owned(),
                         }
                     })?;
                 let mime_type =
                     scp_core::context::MimeType::new(asset.content_type).map_err(|e| {
                         ScpError::Context {
                             msg: format!("invalid content_type: {e}"),
-                            code: "SCP-CTX-2041".to_owned(),
+                            code: codes::CTX_2041.to_owned(),
                         }
                     })?;
 
@@ -8583,7 +8585,7 @@ pub async fn broadcast_publish_assets(
                         let imc = identity.in_memory_custody.as_ref().ok_or_else(|| {
                             ScpError::Permission {
                                 msg: "broadcast publish assets requires key custody".to_owned(),
-                                code: "SCP-PERM-3021".to_owned(),
+                                code: codes::PERM_3021.to_owned(),
                             }
                         })?;
                         manager
@@ -8601,7 +8603,7 @@ pub async fn broadcast_publish_assets(
                     {
                         return Err(ScpError::Permission {
                             msg: "broadcast publish assets requires key custody".to_owned(),
-                            code: "SCP-PERM-3022".to_owned(),
+                            code: codes::PERM_3022.to_owned(),
                         });
                     }
                 };
@@ -8609,7 +8611,7 @@ pub async fn broadcast_publish_assets(
                 let envelope_bytes =
                     rmp_serde::to_vec_named(&envelope).map_err(|e| ScpError::Context {
                         msg: format!("failed to serialize envelope for blob_id: {e}"),
-                        code: "SCP-CTX-2043".to_owned(),
+                        code: codes::CTX_2043.to_owned(),
                     })?;
                 let blob_id = {
                     use sha2::{Digest, Sha256};
@@ -8631,7 +8633,7 @@ pub async fn broadcast_publish_assets(
         .await
         .map_err(|e| ScpError::Context {
             msg: format!("tokio task join error during broadcast publish assets: {e}"),
-            code: "SCP-CTX-2035".to_owned(),
+            code: codes::CTX_2035.to_owned(),
         })?
 }
 
@@ -8663,7 +8665,7 @@ pub async fn broadcast_block_subscriber(
         .await
         .map_err(|e| ScpError::Context {
             msg: format!("tokio task join error during broadcast block: {e}"),
-            code: "SCP-CTX-2036".to_owned(),
+            code: codes::CTX_2036.to_owned(),
         })?
 }
 
@@ -8697,7 +8699,7 @@ pub async fn broadcast_unblock_subscriber(
         .await
         .map_err(|e| ScpError::Context {
             msg: format!("tokio task join error during broadcast unblock: {e}"),
-            code: "SCP-CTX-2037".to_owned(),
+            code: codes::CTX_2037.to_owned(),
         })?
 }
 
@@ -8729,7 +8731,7 @@ pub async fn broadcast_handle_key_request(
         .await
         .map_err(|e| ScpError::Context {
             msg: format!("tokio task join error during key request handling: {e}"),
-            code: "SCP-CTX-2037".to_owned(),
+            code: codes::CTX_2037.to_owned(),
         })?
 }
 
@@ -8969,7 +8971,7 @@ pub async fn context_handle_ttl_expiry(handle: Arc<ContextHandle>) -> Result<(),
         .await
         .map_err(|e| ScpError::Context {
             msg: format!("tokio task join error during TTL expiry: {e}"),
-            code: "SCP-CTX-2038".to_owned(),
+            code: codes::CTX_2038.to_owned(),
         })?
 }
 
@@ -9000,7 +9002,7 @@ pub async fn context_propose_ttl_extension(
         .await
         .map_err(|e| ScpError::Context {
             msg: format!("tokio task join error during TTL extension proposal: {e}"),
-            code: "SCP-CTX-2039".to_owned(),
+            code: codes::CTX_2039.to_owned(),
         })?
 }
 
@@ -9183,7 +9185,7 @@ fn bridge_params_to_core(
     scp_ffi_common::context_params::build_context_params(&common).map_err(|e| {
         ScpError::Validation {
             msg: e,
-            code: "SCP-VALID-7000".to_owned(),
+            code: codes::VALID_7000.to_owned(),
         }
     })
 }
@@ -9198,7 +9200,7 @@ pub(crate) fn parse_custody_method(custody: &str) -> Result<CustodyMethod, ScpEr
             msg: format!(
                 "unknown custody type: {other:?} — expected \"in_memory\", \"platform\", or \"software\""
             ),
-            code: "SCP-VALID-7007".to_owned(),
+            code: codes::VALID_7007.to_owned(),
         }),
     }
 }
@@ -9241,7 +9243,7 @@ pub fn evaluate_provenance_quality(
                 msg: format!(
                     "invalid source_type '{other}': expected 'persistent', 'ephemeral', or 'summary'"
                 ),
-                code: "SCP-VALID-7000".to_owned(),
+                code: codes::VALID_7000.to_owned(),
             });
         }
     };
@@ -9263,7 +9265,7 @@ pub fn evaluate_provenance_quality(
                      'closed_with_summary_verified', 'closed_with_summary_unverified', \
                      'closed_ephemeral', or 'unknown'"
                 ),
-                code: "SCP-VALID-7000".to_owned(),
+                code: codes::VALID_7000.to_owned(),
             });
         }
     };
@@ -9338,13 +9340,13 @@ pub fn trust_query_score(did: String, context_id: String) -> Result<TrustScoreRe
     if did.is_empty() {
         return Err(ScpError::Validation {
             msg: "DID must not be empty".to_owned(),
-            code: "SCP-VALID-7010".to_owned(),
+            code: codes::VALID_7010.to_owned(),
         });
     }
     if context_id.is_empty() {
         return Err(ScpError::Validation {
             msg: "context_id must not be empty".to_owned(),
-            code: "SCP-VALID-7011".to_owned(),
+            code: codes::VALID_7011.to_owned(),
         });
     }
 
@@ -9377,7 +9379,7 @@ pub fn trust_verify_attestation(
     let attestation: scp_core::trust::Attestation = serde_json::from_str(&attestation_json)
         .map_err(|e| ScpError::Validation {
             msg: format!("failed to parse attestation JSON: {e}"),
-            code: "SCP-VALID-7012".to_owned(),
+            code: codes::VALID_7012.to_owned(),
         })?;
 
     let resolver = scp_core::trust::IdentityDidPublicKeyResolver;
@@ -9405,7 +9407,7 @@ pub fn trust_create_challenge(target_did: String) -> Result<ChallengeResult, Scp
     if target_did.is_empty() {
         return Err(ScpError::Validation {
             msg: "target DID must not be empty".to_owned(),
-            code: "SCP-VALID-7013".to_owned(),
+            code: codes::VALID_7013.to_owned(),
         });
     }
 
@@ -9432,12 +9434,12 @@ pub fn trust_create_challenge(target_did: String) -> Result<ChallengeResult, Scp
     )
     .map_err(|e| ScpError::Validation {
         msg: format!("challenge creation failed: {e}"),
-        code: "SCP-VALID-7014".to_owned(),
+        code: codes::VALID_7014.to_owned(),
     })?;
 
     let challenge_json = serde_json::to_string(&request).map_err(|e| ScpError::Validation {
         msg: format!("failed to serialize challenge: {e}"),
-        code: "SCP-VALID-7015".to_owned(),
+        code: codes::VALID_7015.to_owned(),
     })?;
 
     Ok(ChallengeResult {
@@ -9457,13 +9459,13 @@ pub fn trust_verify_response(
     let request: scp_core::trust::ChallengeRequest = serde_json::from_str(&challenge_json)
         .map_err(|e| ScpError::Validation {
             msg: format!("failed to parse challenge JSON: {e}"),
-            code: "SCP-VALID-7016".to_owned(),
+            code: codes::VALID_7016.to_owned(),
         })?;
 
     let response: scp_core::trust::ChallengeResponse = serde_json::from_str(&response_json)
         .map_err(|e| ScpError::Validation {
             msg: format!("failed to parse response JSON: {e}"),
-            code: "SCP-VALID-7017".to_owned(),
+            code: codes::VALID_7017.to_owned(),
         })?;
 
     let resolver = scp_core::trust::IdentityDidPublicKeyResolver;
@@ -9515,13 +9517,13 @@ pub fn verify_participation_requirements(
     let profiles: Vec<scp_core::trust::ParticipationProfile> = serde_json::from_str(&profile_json)
         .map_err(|e| ScpError::Validation {
             msg: format!("failed to parse participation profiles JSON: {e}"),
-            code: "SCP-VALID-7030".to_owned(),
+            code: codes::VALID_7030.to_owned(),
         })?;
 
     let requirements: Vec<scp_core::trust::RequireParticipation> =
         serde_json::from_str(&requirements_json).map_err(|e| ScpError::Validation {
             msg: format!("failed to parse participation requirements JSON: {e}"),
-            code: "SCP-VALID-7031".to_owned(),
+            code: codes::VALID_7031.to_owned(),
         })?;
 
     let current_time = std::time::SystemTime::now()
@@ -9531,7 +9533,7 @@ pub fn verify_participation_requirements(
     scp_core::trust::verify_participation_requirements(current_time, &requirements, &profiles)
         .map_err(|e| ScpError::Validation {
             msg: format!("participation admission verification failed: {e}"),
-            code: "SCP-VALID-7032".to_owned(),
+            code: codes::VALID_7032.to_owned(),
         })?;
 
     Ok(true)
@@ -9567,39 +9569,39 @@ pub fn aggregate_trust_input(
     if context_id.is_empty() {
         return Err(ScpError::Validation {
             msg: "context_id must not be empty".to_owned(),
-            code: "SCP-VALID-7040".to_owned(),
+            code: codes::VALID_7040.to_owned(),
         });
     }
     if subject_did.is_empty() {
         return Err(ScpError::Validation {
             msg: "subject DID must not be empty".to_owned(),
-            code: "SCP-VALID-7041".to_owned(),
+            code: codes::VALID_7041.to_owned(),
         });
     }
 
     let events: Vec<scp_event_log::Event> =
         serde_json::from_str(&events_json).map_err(|e| ScpError::Validation {
             msg: format!("failed to parse events JSON: {e}"),
-            code: "SCP-VALID-7042".to_owned(),
+            code: codes::VALID_7042.to_owned(),
         })?;
 
     let merkle_root_vec: Vec<u8> =
         serde_json::from_str(&merkle_root_json).map_err(|e| ScpError::Validation {
             msg: format!("failed to parse merkle_root JSON: {e}"),
-            code: "SCP-VALID-7043".to_owned(),
+            code: codes::VALID_7043.to_owned(),
         })?;
     let merkle_root: [u8; 32] =
         merkle_root_vec
             .try_into()
             .map_err(|v: Vec<u8>| ScpError::Validation {
                 msg: format!("merkle_root must be exactly 32 bytes, got {}", v.len()),
-                code: "SCP-VALID-7044".to_owned(),
+                code: codes::VALID_7044.to_owned(),
             })?;
 
     let consequence_rules: Vec<scp_core::trust::ConsequenceRule> =
         serde_json::from_str(&consequence_rules_json).map_err(|e| ScpError::Validation {
             msg: format!("failed to parse consequence_rules JSON: {e}"),
-            code: "SCP-VALID-7045".to_owned(),
+            code: codes::VALID_7045.to_owned(),
         })?;
 
     let threshold_requirements: std::collections::HashMap<
@@ -9607,7 +9609,7 @@ pub fn aggregate_trust_input(
         scp_core::trust::ThresholdRequirement,
     > = serde_json::from_str(&threshold_requirements_json).map_err(|e| ScpError::Validation {
         msg: format!("failed to parse threshold_requirements JSON: {e}"),
-        code: "SCP-VALID-7046".to_owned(),
+        code: codes::VALID_7046.to_owned(),
     })?;
 
     let attestor_sets: std::collections::HashMap<
@@ -9615,19 +9617,19 @@ pub fn aggregate_trust_input(
         Vec<scp_core::trust::AttestorInfo>,
     > = serde_json::from_str(&attestor_sets_json).map_err(|e| ScpError::Validation {
         msg: format!("failed to parse attestor_sets JSON: {e}"),
-        code: "SCP-VALID-7047".to_owned(),
+        code: codes::VALID_7047.to_owned(),
     })?;
 
     let cached_attestations: Vec<scp_core::trust::aggregate::CachedAttestation> =
         serde_json::from_str(&cached_attestations_json).map_err(|e| ScpError::Validation {
             msg: format!("failed to parse cached_attestations JSON: {e}"),
-            code: "SCP-VALID-7048".to_owned(),
+            code: codes::VALID_7048.to_owned(),
         })?;
 
     let challenge_results: Vec<scp_core::trust::ChallengeVerification> =
         serde_json::from_str(&challenge_results_json).map_err(|e| ScpError::Validation {
             msg: format!("failed to parse challenge_results JSON: {e}"),
-            code: "SCP-VALID-7049".to_owned(),
+            code: codes::VALID_7049.to_owned(),
         })?;
 
     // Use persistent storage if the global ProtocolRepository is initialized,
@@ -9652,7 +9654,7 @@ pub fn aggregate_trust_input(
         )
         .map_err(|e| ScpError::Validation {
             msg: e.to_string(),
-            code: "SCP-VALID-7052".to_owned(),
+            code: codes::VALID_7052.to_owned(),
         })
     } else {
         scp_ffi_common::trust_store::populate_and_aggregate(
@@ -9669,7 +9671,7 @@ pub fn aggregate_trust_input(
         )
         .map_err(|e| ScpError::Validation {
             msg: e.to_string(),
-            code: "SCP-VALID-7052".to_owned(),
+            code: codes::VALID_7052.to_owned(),
         })
     }
 }
@@ -9702,7 +9704,7 @@ pub fn set_economic_policy(
               (propose SetEconomicPolicy action). Direct mutation is \
               not permitted — see spec §19.3"
             .to_owned(),
-        code: "SCP-CTX-2013".to_owned(),
+        code: codes::CTX_2013.to_owned(),
     })
 }
 
@@ -9714,7 +9716,7 @@ pub fn get_economic_policy(handle: Arc<ContextHandle>) -> Result<Option<String>,
         .lock()
         .map_err(|_| ScpError::Context {
             msg: "economic_policy lock is poisoned".to_owned(),
-            code: "SCP-CTX-2012".to_owned(),
+            code: codes::CTX_2012.to_owned(),
         })?;
     Ok(guard.clone())
 }
@@ -9746,14 +9748,14 @@ pub async fn context_export(handle: Arc<ContextHandle>) -> Result<Vec<u8>, ScpEr
             scp_core::context::export_import::serialize_export(&export).map_err(|e| {
                 ScpError::Context {
                     msg: format!("export serialization failed: {e}"),
-                    code: "SCP-CTX-2030".to_owned(),
+                    code: codes::CTX_2030.to_owned(),
                 }
             })
         })
         .await
         .map_err(|e| ScpError::Context {
             msg: format!("tokio task join error during context export: {e}"),
-            code: "SCP-CTX-2031".to_owned(),
+            code: codes::CTX_2031.to_owned(),
         })?
 }
 
@@ -9776,7 +9778,7 @@ pub async fn context_import(data: Vec<u8>) -> Result<String, ScpError> {
                 scp_core::context::export_import::deserialize_export(&data).map_err(|e| {
                     ScpError::Context {
                         msg: format!("invalid export data: {e}"),
-                        code: "SCP-CTX-2032".to_owned(),
+                        code: codes::CTX_2032.to_owned(),
                     }
                 })?;
             let context_id = export.snapshot.context_id.clone();
@@ -9796,7 +9798,7 @@ pub async fn context_import(data: Vec<u8>) -> Result<String, ScpError> {
         .await
         .map_err(|e| ScpError::Context {
             msg: format!("tokio task join error during context import: {e}"),
-            code: "SCP-CTX-2033".to_owned(),
+            code: codes::CTX_2033.to_owned(),
         })?
 }
 
@@ -9830,7 +9832,7 @@ pub fn provenance_attach(
         other => {
             return Err(ScpError::Validation {
                 msg: format!("invalid source_type '{other}'"),
-                code: "SCP-VALID-7040".to_owned(),
+                code: codes::VALID_7040.to_owned(),
             });
         }
     };
@@ -9841,7 +9843,7 @@ pub fn provenance_attach(
         other => {
             return Err(ScpError::Validation {
                 msg: format!("invalid memory_scope '{other}'"),
-                code: "SCP-VALID-7041".to_owned(),
+                code: codes::VALID_7041.to_owned(),
             });
         }
     };
@@ -9883,7 +9885,7 @@ pub fn provenance_attach(
     // Compute provenance hash: SHA-256 of JSON-serialized provenance record.
     let prov_json_bytes = serde_json::to_vec(&prov).map_err(|e| ScpError::Validation {
         msg: format!("failed to serialize provenance for hashing: {e}"),
-        code: "SCP-VALID-7053".to_owned(),
+        code: codes::VALID_7053.to_owned(),
     })?;
     let prov_hash: [u8; 32] = sha2::Sha256::digest(&prov_json_bytes).into();
 
@@ -9930,7 +9932,7 @@ pub fn provenance_attach(
 
     serde_json::to_string(&result).map_err(|e| ScpError::Validation {
         msg: format!("failed to serialize provenance: {e}"),
-        code: "SCP-VALID-7042".to_owned(),
+        code: codes::VALID_7042.to_owned(),
     })
 }
 
@@ -9973,13 +9975,13 @@ fn uniffi_append_provenance_event(
             .map(|_| ())
             .map_err(|e| ScpError::Context {
                 msg: format!("failed to append provenance event: {e}"),
-                code: "SCP-CTX-2060".to_owned(),
+                code: codes::CTX_2060.to_owned(),
             })
     })
     .unwrap_or_else(|| {
         Err(ScpError::Context {
             msg: format!("context '{context_id}' not found in UCAN state registry"),
-            code: "SCP-CTX-2066".to_owned(),
+            code: codes::CTX_2066.to_owned(),
         })
     })
 }
@@ -10021,14 +10023,14 @@ pub fn provenance_redact_counterparties(provenance_json: String) -> Result<Strin
     let mut prov: scp_core::provenance::DataProvenance = serde_json::from_str(&provenance_json)
         .map_err(|e| ScpError::Validation {
             msg: format!("invalid provenance JSON: {e}"),
-            code: "SCP-VALID-7050".to_owned(),
+            code: codes::VALID_7050.to_owned(),
         })?;
 
     scp_core::provenance::attach::redact_counterparties(&mut prov);
 
     serde_json::to_string(&prov).map_err(|e| ScpError::Validation {
         msg: format!("failed to serialize provenance: {e}"),
-        code: "SCP-VALID-7051".to_owned(),
+        code: codes::VALID_7051.to_owned(),
     })
 }
 
@@ -10052,14 +10054,14 @@ pub fn provenance_pseudonymize_counterparties(
     let mut prov: scp_core::provenance::DataProvenance = serde_json::from_str(&provenance_json)
         .map_err(|e| ScpError::Validation {
             msg: format!("invalid provenance JSON: {e}"),
-            code: "SCP-VALID-7050".to_owned(),
+            code: codes::VALID_7050.to_owned(),
         })?;
 
     let key =
         Zeroizing::new(
             hex::decode(&pseudonym_key_hex).map_err(|e| ScpError::Validation {
                 msg: format!("invalid pseudonym_key_hex: {e}"),
-                code: "SCP-VALID-7052".to_owned(),
+                code: codes::VALID_7052.to_owned(),
             })?,
         );
 
@@ -10067,7 +10069,7 @@ pub fn provenance_pseudonymize_counterparties(
 
     serde_json::to_string(&prov).map_err(|e| ScpError::Validation {
         msg: format!("failed to serialize provenance: {e}"),
-        code: "SCP-VALID-7051".to_owned(),
+        code: codes::VALID_7051.to_owned(),
     })
 }
 
@@ -10093,7 +10095,7 @@ pub fn provenance_update_source_type(
     let mut prov: scp_core::provenance::DataProvenance = serde_json::from_str(&provenance_json)
         .map_err(|e| ScpError::Validation {
             msg: format!("invalid provenance JSON: {e}"),
-            code: "SCP-VALID-7050".to_owned(),
+            code: codes::VALID_7050.to_owned(),
         })?;
 
     let state = match new_state.as_str() {
@@ -10113,7 +10115,7 @@ pub fn provenance_update_source_type(
                      'closed_with_summary_verified', 'closed_with_summary_unverified', \
                      'closed_ephemeral', or 'unknown'"
                 ),
-                code: "SCP-VALID-7053".to_owned(),
+                code: codes::VALID_7053.to_owned(),
             });
         }
     };
@@ -10122,7 +10124,7 @@ pub fn provenance_update_source_type(
 
     serde_json::to_string(&prov).map_err(|e| ScpError::Validation {
         msg: format!("failed to serialize provenance: {e}"),
-        code: "SCP-VALID-7051".to_owned(),
+        code: codes::VALID_7051.to_owned(),
     })
 }
 
@@ -10148,7 +10150,7 @@ pub fn media_check_capability(ceiling: Vec<String>, capability: String) -> Resul
     scp_media::session::check_media_capability(&param_caps, &cap).map_err(|e| {
         ScpError::Context {
             msg: e.to_string(),
-            code: "SCP-CTX-2500".to_owned(),
+            code: codes::CTX_2500.to_owned(),
         }
     })?;
     Ok(true)
@@ -10188,7 +10190,7 @@ pub fn media_initiate_session(
     )
     .map_err(|e| ScpError::Context {
         msg: e.to_string(),
-        code: "SCP-CTX-2500".to_owned(),
+        code: codes::CTX_2500.to_owned(),
     })?;
 
     media_session_to_json(&session)
@@ -10202,12 +10204,12 @@ pub fn media_activate_session(session_json: String) -> Result<String, ScpError> 
     let mut session: scp_media::session::MediaSession = serde_json::from_str(&session_json)
         .map_err(|e| ScpError::Validation {
             msg: format!("invalid session JSON: {e}"),
-            code: "SCP-VALID-7301".to_owned(),
+            code: codes::VALID_7301.to_owned(),
         })?;
 
     scp_media::session::activate_session(&mut session).map_err(|e| ScpError::Context {
         msg: e.to_string(),
-        code: "SCP-CTX-2500".to_owned(),
+        code: codes::CTX_2500.to_owned(),
     })?;
 
     media_session_to_json(&session)
@@ -10224,13 +10226,13 @@ pub fn media_join_session(
     let mut session: scp_media::session::MediaSession = serde_json::from_str(&session_json)
         .map_err(|e| ScpError::Validation {
             msg: format!("invalid session JSON: {e}"),
-            code: "SCP-VALID-7301".to_owned(),
+            code: codes::VALID_7301.to_owned(),
         })?;
 
     scp_media::session::join_media_session(&mut session, participant_did.into()).map_err(|e| {
         ScpError::Context {
             msg: e.to_string(),
-            code: "SCP-CTX-2500".to_owned(),
+            code: codes::CTX_2500.to_owned(),
         }
     })?;
 
@@ -10245,13 +10247,13 @@ pub fn media_end_session(session_json: String, timestamp: u64) -> Result<String,
     let mut session: scp_media::session::MediaSession = serde_json::from_str(&session_json)
         .map_err(|e| ScpError::Validation {
             msg: format!("invalid session JSON: {e}"),
-            code: "SCP-VALID-7301".to_owned(),
+            code: codes::VALID_7301.to_owned(),
         })?;
 
     let metadata = scp_media::session::end_media_session(&mut session, timestamp).map_err(|e| {
         ScpError::Context {
             msg: e.to_string(),
-            code: "SCP-CTX-2500".to_owned(),
+            code: codes::CTX_2500.to_owned(),
         }
     })?;
 
@@ -10275,7 +10277,7 @@ pub fn media_end_session(session_json: String, timestamp: u64) -> Result<String,
     }))
     .map_err(|e| ScpError::Validation {
         msg: format!("failed to serialize result: {e}"),
-        code: "SCP-VALID-7301".to_owned(),
+        code: codes::VALID_7301.to_owned(),
     })
 }
 
@@ -10348,13 +10350,13 @@ pub fn media_send_signaling(signaling_json: String) -> Result<String, ScpError> 
         scp_media::signaling::deserialize_signaling(signaling_json.as_bytes()).map_err(|e| {
             ScpError::Validation {
                 msg: format!("invalid signaling JSON: {e}"),
-                code: "SCP-VALID-7303".to_owned(),
+                code: codes::VALID_7303.to_owned(),
             }
         })?;
     let (payload, message_type) =
         scp_media::signaling::send_signaling(&msg).map_err(|e| ScpError::Validation {
             msg: format!("failed to serialize signaling: {e}"),
-            code: "SCP-VALID-7302".to_owned(),
+            code: codes::VALID_7302.to_owned(),
         })?;
 
     use base64::Engine;
@@ -10364,7 +10366,7 @@ pub fn media_send_signaling(signaling_json: String) -> Result<String, ScpError> 
     }))
     .map_err(|e| ScpError::Validation {
         msg: format!("failed to serialize result: {e}"),
-        code: "SCP-VALID-7302".to_owned(),
+        code: codes::VALID_7302.to_owned(),
     })
 }
 
@@ -10380,13 +10382,13 @@ pub fn media_verify_sender_attribution(
         scp_media::signaling::deserialize_signaling(signaling_json.as_bytes()).map_err(|e| {
             ScpError::Validation {
                 msg: format!("invalid signaling JSON: {e}"),
-                code: "SCP-VALID-7303".to_owned(),
+                code: codes::VALID_7303.to_owned(),
             }
         })?;
     scp_media::signaling::verify_sender_attribution(&msg, &envelope_sender_did).map_err(|e| {
         ScpError::Context {
             msg: format!("sender attribution verification failed: {e}"),
-            code: "SCP-CTX-2501".to_owned(),
+            code: codes::CTX_2501.to_owned(),
         }
     })?;
     Ok(true)
@@ -10403,7 +10405,7 @@ fn parse_media_capability(s: &str) -> Result<scp_media::session::MediaCapability
             msg: format!(
                 "invalid media capability '{other}': expected 'voice', 'video', or 'screen_share'"
             ),
-            code: "SCP-VALID-7300".to_owned(),
+            code: codes::VALID_7300.to_owned(),
         }),
     }
 }
@@ -10435,7 +10437,7 @@ fn media_session_to_json(session: &scp_media::session::MediaSession) -> Result<S
     }))
     .map_err(|e| ScpError::Validation {
         msg: format!("failed to serialize session: {e}"),
-        code: "SCP-VALID-7301".to_owned(),
+        code: codes::VALID_7301.to_owned(),
     })
 }
 
@@ -10447,12 +10449,12 @@ fn signaling_to_json(
         String::from_utf8(scp_media::signaling::serialize_signaling(msg).map_err(|e| {
             ScpError::Validation {
                 msg: format!("failed to serialize signaling: {e}"),
-                code: "SCP-VALID-7302".to_owned(),
+                code: codes::VALID_7302.to_owned(),
             }
         })?)
         .map_err(|e| ScpError::Validation {
             msg: format!("signaling bytes are not valid UTF-8: {e}"),
-            code: "SCP-VALID-7302".to_owned(),
+            code: codes::VALID_7302.to_owned(),
         })?;
 
     serde_json::to_string(&serde_json::json!({
@@ -10461,7 +10463,7 @@ fn signaling_to_json(
     }))
     .map_err(|e| ScpError::Validation {
         msg: format!("failed to serialize result: {e}"),
-        code: "SCP-VALID-7302".to_owned(),
+        code: codes::VALID_7302.to_owned(),
     })
 }
 
@@ -10489,7 +10491,7 @@ pub fn bridge_evaluate_trust(
         other => {
             return Err(ScpError::Validation {
                 msg: format!("invalid shadow_status '{other}': expected 'shadow' or 'claimed'"),
-                code: "SCP-VALID-7051".to_owned(),
+                code: codes::VALID_7051.to_owned(),
             });
         }
     };
@@ -10584,7 +10586,7 @@ pub fn discovery_parse_address(address: String) -> Result<String, ScpError> {
     let parsed =
         scp_core::discovery::parse_address(&address).map_err(|e| ScpError::Validation {
             msg: format!("invalid address '{address}': {e}"),
-            code: "SCP-VALID-7044".to_owned(),
+            code: codes::VALID_7044.to_owned(),
         })?;
 
     let result = match parsed {
@@ -10619,7 +10621,7 @@ pub fn discovery_parse_address(address: String) -> Result<String, ScpError> {
 
     serde_json::to_string(&result).map_err(|e| ScpError::Validation {
         msg: format!("failed to serialize parsed address: {e}"),
-        code: "SCP-VALID-7045".to_owned(),
+        code: codes::VALID_7045.to_owned(),
     })
 }
 
@@ -10638,7 +10640,7 @@ pub fn discovery_create_query(
 
     serde_json::to_string(&query).map_err(|e| ScpError::Validation {
         msg: format!("failed to serialize query: {e}"),
-        code: "SCP-VALID-7046".to_owned(),
+        code: codes::VALID_7046.to_owned(),
     })
 }
 
@@ -10674,20 +10676,20 @@ pub fn petname_set(owner_did: String, target_did: String, name: String) -> Resul
     if owner_did.is_empty() {
         return Err(ScpError::Validation {
             msg: "owner_did must not be empty".to_owned(),
-            code: "SCP-VALID-7110".to_owned(),
+            code: codes::VALID_7110.to_owned(),
         });
     }
     if target_did.is_empty() {
         return Err(ScpError::Validation {
             msg: "target_did must not be empty".to_owned(),
-            code: "SCP-VALID-7111".to_owned(),
+            code: codes::VALID_7111.to_owned(),
         });
     }
     let mut guard = uniffi_petname_maps()
         .lock()
         .map_err(|e| ScpError::Validation {
             msg: format!("petname lock poisoned: {e}"),
-            code: "SCP-VALID-7112".to_owned(),
+            code: codes::VALID_7112.to_owned(),
         })?;
     let map = guard.entry(owner_did).or_default();
     map.set_petname(scp_identity::DID::from(target_did.as_str()), name);
@@ -10700,14 +10702,14 @@ pub fn petname_remove(owner_did: String, target_did: String) -> Result<(), ScpEr
     if owner_did.is_empty() {
         return Err(ScpError::Validation {
             msg: "owner_did must not be empty".to_owned(),
-            code: "SCP-VALID-7110".to_owned(),
+            code: codes::VALID_7110.to_owned(),
         });
     }
     let mut guard = uniffi_petname_maps()
         .lock()
         .map_err(|e| ScpError::Validation {
             msg: format!("petname lock poisoned: {e}"),
-            code: "SCP-VALID-7112".to_owned(),
+            code: codes::VALID_7112.to_owned(),
         })?;
     if let Some(map) = guard.get_mut(&owner_did) {
         map.remove_petname(&scp_identity::DID::from(target_did.as_str()));
@@ -10725,20 +10727,20 @@ pub fn petname_set_context(
     if owner_did.is_empty() {
         return Err(ScpError::Validation {
             msg: "owner_did must not be empty".to_owned(),
-            code: "SCP-VALID-7110".to_owned(),
+            code: codes::VALID_7110.to_owned(),
         });
     }
     if context_id.is_empty() {
         return Err(ScpError::Validation {
             msg: "context_id must not be empty".to_owned(),
-            code: "SCP-VALID-7113".to_owned(),
+            code: codes::VALID_7113.to_owned(),
         });
     }
     let mut guard = uniffi_petname_maps()
         .lock()
         .map_err(|e| ScpError::Validation {
             msg: format!("petname lock poisoned: {e}"),
-            code: "SCP-VALID-7112".to_owned(),
+            code: codes::VALID_7112.to_owned(),
         })?;
     let map = guard.entry(owner_did).or_default();
     map.set_context_petname(context_id, name);
@@ -10751,14 +10753,14 @@ pub fn petname_remove_context(owner_did: String, context_id: String) -> Result<(
     if owner_did.is_empty() {
         return Err(ScpError::Validation {
             msg: "owner_did must not be empty".to_owned(),
-            code: "SCP-VALID-7110".to_owned(),
+            code: codes::VALID_7110.to_owned(),
         });
     }
     let mut guard = uniffi_petname_maps()
         .lock()
         .map_err(|e| ScpError::Validation {
             msg: format!("petname lock poisoned: {e}"),
-            code: "SCP-VALID-7112".to_owned(),
+            code: codes::VALID_7112.to_owned(),
         })?;
     if let Some(map) = guard.get_mut(&owner_did) {
         map.remove_context_petname(&context_id);
@@ -10772,14 +10774,14 @@ pub fn petname_resolve_did(owner_did: String, name: String) -> Result<String, Sc
     if owner_did.is_empty() {
         return Err(ScpError::Validation {
             msg: "owner_did must not be empty".to_owned(),
-            code: "SCP-VALID-7110".to_owned(),
+            code: codes::VALID_7110.to_owned(),
         });
     }
     let guard = uniffi_petname_maps()
         .lock()
         .map_err(|e| ScpError::Validation {
             msg: format!("petname lock poisoned: {e}"),
-            code: "SCP-VALID-7112".to_owned(),
+            code: codes::VALID_7112.to_owned(),
         })?;
     let dids: Vec<String> = guard
         .get(&owner_did)
@@ -10792,7 +10794,7 @@ pub fn petname_resolve_did(owner_did: String, name: String) -> Result<String, Sc
         .unwrap_or_default();
     serde_json::to_string(&dids).map_err(|e| ScpError::Validation {
         msg: format!("failed to serialize petname resolve result: {e}"),
-        code: "SCP-VALID-7114".to_owned(),
+        code: codes::VALID_7114.to_owned(),
     })
 }
 
@@ -10802,14 +10804,14 @@ pub fn petname_resolve_context(owner_did: String, name: String) -> Result<String
     if owner_did.is_empty() {
         return Err(ScpError::Validation {
             msg: "owner_did must not be empty".to_owned(),
-            code: "SCP-VALID-7110".to_owned(),
+            code: codes::VALID_7110.to_owned(),
         });
     }
     let guard = uniffi_petname_maps()
         .lock()
         .map_err(|e| ScpError::Validation {
             msg: format!("petname lock poisoned: {e}"),
-            code: "SCP-VALID-7112".to_owned(),
+            code: codes::VALID_7112.to_owned(),
         })?;
     let ids: Vec<String> = guard
         .get(&owner_did)
@@ -10817,7 +10819,7 @@ pub fn petname_resolve_context(owner_did: String, name: String) -> Result<String
         .unwrap_or_default();
     serde_json::to_string(&ids).map_err(|e| ScpError::Validation {
         msg: format!("failed to serialize petname resolve result: {e}"),
-        code: "SCP-VALID-7114".to_owned(),
+        code: codes::VALID_7114.to_owned(),
     })
 }
 
@@ -10830,14 +10832,14 @@ pub fn petname_get_for_did(
     if owner_did.is_empty() {
         return Err(ScpError::Validation {
             msg: "owner_did must not be empty".to_owned(),
-            code: "SCP-VALID-7110".to_owned(),
+            code: codes::VALID_7110.to_owned(),
         });
     }
     let guard = uniffi_petname_maps()
         .lock()
         .map_err(|e| ScpError::Validation {
             msg: format!("petname lock poisoned: {e}"),
-            code: "SCP-VALID-7112".to_owned(),
+            code: codes::VALID_7112.to_owned(),
         })?;
     Ok(guard.get(&owner_did).and_then(|map| {
         map.petname_for_did(&scp_identity::DID::from(target_did.as_str()))
@@ -10854,14 +10856,14 @@ pub fn petname_get_for_context(
     if owner_did.is_empty() {
         return Err(ScpError::Validation {
             msg: "owner_did must not be empty".to_owned(),
-            code: "SCP-VALID-7110".to_owned(),
+            code: codes::VALID_7110.to_owned(),
         });
     }
     let guard = uniffi_petname_maps()
         .lock()
         .map_err(|e| ScpError::Validation {
             msg: format!("petname lock poisoned: {e}"),
-            code: "SCP-VALID-7112".to_owned(),
+            code: codes::VALID_7112.to_owned(),
         })?;
     Ok(guard
         .get(&owner_did)
@@ -10893,7 +10895,7 @@ pub fn handle_register(
         .lock()
         .map_err(|e| ScpError::Validation {
             msg: format!("handle registry lock poisoned: {e}"),
-            code: "SCP-VALID-7120".to_owned(),
+            code: codes::VALID_7120.to_owned(),
         })?;
     let registry = guard
         .entry(discovery_context_id.clone())
@@ -10905,7 +10907,7 @@ pub fn handle_register(
     );
     serde_json::to_string(&result).map_err(|e| ScpError::Validation {
         msg: format!("failed to serialize handle register result: {e}"),
-        code: "SCP-VALID-7122".to_owned(),
+        code: codes::VALID_7122.to_owned(),
     })
 }
 
@@ -10922,7 +10924,7 @@ pub fn handle_lookup(
         Some(other) => {
             return Err(ScpError::Validation {
                 msg: format!("invalid type_filter '{other}': expected 'identity' or 'context'"),
-                code: "SCP-VALID-7123".to_owned(),
+                code: codes::VALID_7123.to_owned(),
             });
         }
         None => None,
@@ -10931,7 +10933,7 @@ pub fn handle_lookup(
         .lock()
         .map_err(|e| ScpError::Validation {
             msg: format!("handle registry lock poisoned: {e}"),
-            code: "SCP-VALID-7120".to_owned(),
+            code: codes::VALID_7120.to_owned(),
         })?;
     let result = guard.get(&discovery_context_id).map_or_else(
         || scp_core::discovery::HandleLookupResult {
@@ -10946,7 +10948,7 @@ pub fn handle_lookup(
     );
     serde_json::to_string(&result).map_err(|e| ScpError::Validation {
         msg: format!("failed to serialize handle lookup result: {e}"),
-        code: "SCP-VALID-7124".to_owned(),
+        code: codes::VALID_7124.to_owned(),
     })
 }
 
@@ -10961,7 +10963,7 @@ pub fn handle_deregister(
         .lock()
         .map_err(|e| ScpError::Validation {
             msg: format!("handle registry lock poisoned: {e}"),
-            code: "SCP-VALID-7120".to_owned(),
+            code: codes::VALID_7120.to_owned(),
         })?;
     let result = guard.get_mut(&discovery_context_id).map_or_else(
         || scp_core::discovery::HandleDeregisterResult { removed: false },
@@ -10974,7 +10976,7 @@ pub fn handle_deregister(
     );
     serde_json::to_string(&result).map_err(|e| ScpError::Validation {
         msg: format!("failed to serialize handle deregister result: {e}"),
-        code: "SCP-VALID-7125".to_owned(),
+        code: codes::VALID_7125.to_owned(),
     })
 }
 
@@ -11009,7 +11011,7 @@ pub fn scope_register(
     for url in &relay_urls {
         scp_ffi_common::validate::validate_relay_url(url).map_err(|e| ScpError::Validation {
             msg: e.to_string(),
-            code: "SCP-VALID-7135".to_owned(),
+            code: codes::VALID_7135.to_owned(),
         })?;
     }
 
@@ -11030,7 +11032,7 @@ pub fn scope_register(
         .lock()
         .map_err(|e| ScpError::Validation {
             msg: format!("scope registry lock poisoned: {e}"),
-            code: "SCP-VALID-7130".to_owned(),
+            code: codes::VALID_7130.to_owned(),
         })?;
 
     let registry = guard
@@ -11045,12 +11047,12 @@ pub fn scope_register(
         )
         .map_err(|e| ScpError::Validation {
             msg: format!("scope registration failed: {e}"),
-            code: "SCP-VALID-7131".to_owned(),
+            code: codes::VALID_7131.to_owned(),
         })?;
 
     serde_json::to_string(&result).map_err(|e| ScpError::Validation {
         msg: format!("failed to serialize scope register result: {e}"),
-        code: "SCP-VALID-7132".to_owned(),
+        code: codes::VALID_7132.to_owned(),
     })
 }
 
@@ -11063,7 +11065,7 @@ pub fn scope_lookup(scope_context_id: String, name: String) -> Result<String, Sc
         .lock()
         .map_err(|e| ScpError::Validation {
             msg: format!("scope registry lock poisoned: {e}"),
-            code: "SCP-VALID-7130".to_owned(),
+            code: codes::VALID_7130.to_owned(),
         })?;
 
     let result = match guard.get(&scope_context_id) {
@@ -11071,7 +11073,7 @@ pub fn scope_lookup(scope_context_id: String, name: String) -> Result<String, Sc
             .lookup(&scp_core::discovery::ScopeLookupParams { name })
             .map_err(|e| ScpError::Validation {
                 msg: format!("scope lookup failed: {e}"),
-                code: "SCP-VALID-7133".to_owned(),
+                code: codes::VALID_7133.to_owned(),
             })?,
         None => scp_core::discovery::ScopeLookupResult {
             results: Vec::new(),
@@ -11080,7 +11082,7 @@ pub fn scope_lookup(scope_context_id: String, name: String) -> Result<String, Sc
 
     serde_json::to_string(&result).map_err(|e| ScpError::Validation {
         msg: format!("failed to serialize scope lookup result: {e}"),
-        code: "SCP-VALID-7133".to_owned(),
+        code: codes::VALID_7133.to_owned(),
     })
 }
 
@@ -11098,7 +11100,7 @@ pub fn scope_deregister(
         .lock()
         .map_err(|e| ScpError::Validation {
             msg: format!("scope registry lock poisoned: {e}"),
-            code: "SCP-VALID-7130".to_owned(),
+            code: codes::VALID_7130.to_owned(),
         })?;
 
     let result = match guard.get_mut(&scope_context_id) {
@@ -11109,14 +11111,14 @@ pub fn scope_deregister(
             })
             .map_err(|e| ScpError::Validation {
                 msg: format!("scope deregister failed: {e}"),
-                code: "SCP-VALID-7134".to_owned(),
+                code: codes::VALID_7134.to_owned(),
             })?,
         None => scp_core::discovery::ScopeDeregisterResult { removed: false },
     };
 
     serde_json::to_string(&result).map_err(|e| ScpError::Validation {
         msg: format!("failed to serialize scope deregister result: {e}"),
-        code: "SCP-VALID-7134".to_owned(),
+        code: codes::VALID_7134.to_owned(),
     })
 }
 
@@ -11131,7 +11133,7 @@ pub fn address_resolve(
     if owner_did.is_empty() {
         return Err(ScpError::Validation {
             msg: "owner_did must not be empty".to_owned(),
-            code: "SCP-VALID-7110".to_owned(),
+            code: codes::VALID_7110.to_owned(),
         });
     }
 
@@ -11139,14 +11141,14 @@ pub fn address_resolve(
         if let Some(ref json) = known_contexts_json {
             serde_json::from_str(json).map_err(|e| ScpError::Validation {
                 msg: format!("invalid known_contexts_json: {e}"),
-                code: "SCP-VALID-7090".to_owned(),
+                code: codes::VALID_7090.to_owned(),
             })?
         } else {
             let guard = uniffi_handle_registries()
                 .lock()
                 .map_err(|e| ScpError::Validation {
                     msg: format!("handle registry lock poisoned: {e}"),
-                    code: "SCP-VALID-7120".to_owned(),
+                    code: codes::VALID_7120.to_owned(),
                 })?;
             guard.keys().map(|k| (k.clone(), k.clone())).collect()
         };
@@ -11163,7 +11165,7 @@ pub fn address_resolve(
             .lock()
             .map_err(|e| ScpError::Validation {
                 msg: format!("petname lock poisoned: {e}"),
-                code: "SCP-VALID-7112".to_owned(),
+                code: codes::VALID_7112.to_owned(),
             })?;
         guard.get(&owner_did).cloned().unwrap_or_default()
     };
@@ -11185,7 +11187,7 @@ pub fn address_resolve(
                 .await
                 .map_err(|e| ScpError::Validation {
                     msg: format!("address resolution failed: {e}"),
-                    code: "SCP-VALID-7091".to_owned(),
+                    code: codes::VALID_7091.to_owned(),
                 })
         })
     })?;
@@ -11196,7 +11198,7 @@ pub fn address_resolve(
         .collect();
     serde_json::to_string(&json_results).map_err(|e| ScpError::Validation {
         msg: format!("failed to serialize address resolution results: {e}"),
-        code: "SCP-VALID-7092".to_owned(),
+        code: codes::VALID_7092.to_owned(),
     })
 }
 
@@ -11206,7 +11208,7 @@ fn uniffi_parse_handle_target(
 ) -> Result<scp_core::discovery::addressing::HandleTarget, ScpError> {
     petname_helpers::parse_handle_target(json).map_err(|e| ScpError::Validation {
         msg: e.message,
-        code: "SCP-VALID-7126".to_owned(),
+        code: codes::VALID_7126.to_owned(),
     })
 }
 
@@ -11250,7 +11252,7 @@ pub async fn identity_create_with_agent_key(custody: String) -> Result<Arc<Ident
                                       dev/desktop use. Production mobile builds must use \
                                       \"platform\" custody (Secure Enclave / Android Keystore)."
                                 .to_owned(),
-                            code: "SCP-IDENT-1008".to_owned(),
+                            code: codes::IDENT_1008.to_owned(),
                         })
                     }
 
@@ -11285,21 +11287,21 @@ pub async fn identity_create_with_agent_key(custody: String) -> Result<Arc<Ident
                              use identity_create_with_custody() + add_agent_key() to create \
                              an identity with an agent key using platform custody"
                     ),
-                    code: "SCP-IDENT-1003".to_owned(),
+                    code: codes::IDENT_1003.to_owned(),
                 }),
                 CustodyMethod::External => Err(ScpError::Identity {
                     msg: "internal: CustodyMethod::External cannot be used with \
                                   identity_create_with_agent_key — use identity_load for \
                                   external DID handles"
                         .to_owned(),
-                    code: "SCP-IDENT-1005".to_owned(),
+                    code: codes::IDENT_1005.to_owned(),
                 }),
             }
         })
         .await
         .map_err(|e| ScpError::Identity {
             msg: format!("tokio task join error during identity creation with agent key: {e}"),
-            code: "SCP-IDENT-1007".to_owned(),
+            code: codes::IDENT_1007.to_owned(),
         })?
 }
 
@@ -11338,14 +11340,14 @@ pub async fn identity_migrate(identity: Arc<Identity>) -> Result<Arc<Identity>, 
                   was loaded without key material (use identity_create or \
                   identity_create_with_custody)"
                 .to_owned(),
-            code: "SCP-IDENT-1009".to_owned(),
+            code: codes::IDENT_1009.to_owned(),
         })?;
     let core_document = identity
         .core_document
         .as_ref()
         .ok_or_else(|| ScpError::Identity {
             msg: "identity migration requires a retained DID document".to_owned(),
-            code: "SCP-IDENT-1009".to_owned(),
+            code: codes::IDENT_1009.to_owned(),
         })?;
 
     // We need a custody provider to generate new keys.
@@ -11371,7 +11373,7 @@ pub async fn identity_migrate(identity: Arc<Identity>) -> Result<Arc<Identity>, 
                         .await
                         .map_err(|e| ScpError::Identity {
                             msg: format!("key generation failed during migration: {e}"),
-                            code: "SCP-IDENT-1009".to_owned(),
+                            code: codes::IDENT_1009.to_owned(),
                         })?;
 
                 let rotated_at = scp_primitives::SystemClock.now_secs();
@@ -11426,7 +11428,7 @@ pub async fn identity_migrate(identity: Arc<Identity>) -> Result<Arc<Identity>, 
                     .await
                     .map_err(|e| ScpError::Identity {
                         msg: format!("key generation failed during migration: {e}"),
-                        code: "SCP-IDENT-1009".to_owned(),
+                        code: codes::IDENT_1009.to_owned(),
                     })?;
 
                 let rotated_at = scp_primitives::SystemClock.now_secs();
@@ -11477,13 +11479,13 @@ pub async fn identity_migrate(identity: Arc<Identity>) -> Result<Arc<Identity>, 
                 msg: "identity migration requires a retained custody provider \
                           (in-memory or callback)"
                     .to_owned(),
-                code: "SCP-IDENT-1009".to_owned(),
+                code: codes::IDENT_1009.to_owned(),
             })
         })
         .await
         .map_err(|e| ScpError::Identity {
             msg: format!("tokio task join error during identity migration: {e}"),
-            code: "SCP-IDENT-1007".to_owned(),
+            code: codes::IDENT_1007.to_owned(),
         })?
 }
 
@@ -11678,7 +11680,7 @@ pub fn bridge_register(
                 msg: format!(
                     "invalid bridge mode '{other}': expected 'relay', 'puppet', 'api', or 'cooperative'"
                 ),
-                code: "SCP-VALID-7050".to_owned(),
+                code: codes::VALID_7050.to_owned(),
             });
         }
     };
@@ -11687,7 +11689,7 @@ pub fn bridge_register(
         .map(|k| {
             <[u8; 32]>::try_from(k.as_slice()).map_err(|_| ScpError::Validation {
                 msg: format!("platform_key must be exactly 32 bytes, got {}", k.len()),
-                code: "SCP-VALID-7052".to_owned(),
+                code: codes::VALID_7052.to_owned(),
             })
         })
         .transpose()?;
@@ -11718,7 +11720,7 @@ pub fn bridge_register(
     scp_core::bridge::registration::register_bridge(&mut registry, request).map_err(|e| {
         ScpError::Context {
             msg: format!("bridge registration failed: {e}"),
-            code: "SCP-CTX-2100".to_owned(),
+            code: codes::CTX_2100.to_owned(),
         }
     })?;
 
@@ -11731,7 +11733,7 @@ pub fn bridge_register(
     )
     .map_err(|e| ScpError::Context {
         msg: format!("bridge approval failed: {e}"),
-        code: "SCP-CTX-2101".to_owned(),
+        code: codes::CTX_2101.to_owned(),
     })?;
 
     Ok(BridgeRegistrationResult {
@@ -11789,7 +11791,7 @@ pub fn bridge_create_shadow(
                 msg: format!(
                     "invalid bridge mode '{other}': expected 'relay', 'puppet', 'api', or 'cooperative'"
                 ),
-                code: "SCP-VALID-7050".to_owned(),
+                code: codes::VALID_7050.to_owned(),
             });
         }
     };
@@ -11821,7 +11823,7 @@ pub fn bridge_create_shadow(
     )
     .map_err(|e| ScpError::Context {
         msg: format!("shadow creation failed: {e}"),
-        code: "SCP-CTX-2102".to_owned(),
+        code: codes::CTX_2102.to_owned(),
     })?;
 
     Ok(ShadowIdentityResult {
@@ -11865,18 +11867,18 @@ pub async fn context_discover(query: String) -> Result<String, ScpError> {
         let result =
             scp_core::discovery::resolve_context_uri(&query).map_err(|e| ScpError::Context {
                 msg: format!("failed to resolve scp:// URI: {e}"),
-                code: "SCP-CTX-2020".to_owned(),
+                code: codes::CTX_2020.to_owned(),
             })?;
 
         let results = vec![
             discovery_result_to_json(&result).map_err(|e| ScpError::Context {
                 msg: e,
-                code: "SCP-CTX-2020".to_owned(),
+                code: codes::CTX_2020.to_owned(),
             })?,
         ];
         serde_json::to_string(&results).map_err(|e| ScpError::Context {
             msg: format!("failed to serialize discovery results: {e}"),
-            code: "SCP-CTX-2021".to_owned(),
+            code: codes::CTX_2021.to_owned(),
         })
     } else if query.starts_with("did:") {
         validate_did(&query)?;
@@ -11888,7 +11890,7 @@ pub async fn context_discover(query: String) -> Result<String, ScpError> {
                     .await
                     .map_err(|e| ScpError::Context {
                         msg: format!("DHT discovery failed for '{query}': {e}"),
-                        code: "SCP-CTX-2022".to_owned(),
+                        code: codes::CTX_2022.to_owned(),
                     })?;
 
                 let json_results: Vec<serde_json::Value> = results
@@ -11896,19 +11898,19 @@ pub async fn context_discover(query: String) -> Result<String, ScpError> {
                     .map(|r| {
                         discovery_result_to_json(r).map_err(|e| ScpError::Context {
                             msg: e,
-                            code: "SCP-CTX-2022".to_owned(),
+                            code: codes::CTX_2022.to_owned(),
                         })
                     })
                     .collect::<Result<Vec<_>, _>>()?;
                 serde_json::to_string(&json_results).map_err(|e| ScpError::Context {
                     msg: format!("failed to serialize discovery results: {e}"),
-                    code: "SCP-CTX-2023".to_owned(),
+                    code: codes::CTX_2023.to_owned(),
                 })
             })
             .await
             .map_err(|e| ScpError::Context {
                 msg: format!("tokio task join error during discovery: {e}"),
-                code: "SCP-CTX-2024".to_owned(),
+                code: codes::CTX_2024.to_owned(),
             })?
     } else {
         Err(ScpError::Validation {
@@ -11916,7 +11918,7 @@ pub async fn context_discover(query: String) -> Result<String, ScpError> {
                 "query must be a DID (starts with 'did:') or an scp:// URI \
                  (starts with 'scp://'), got: {query}"
             ),
-            code: "SCP-VALID-7062".to_owned(),
+            code: codes::VALID_7062.to_owned(),
         })
     }
 }
@@ -11946,7 +11948,7 @@ pub fn sandbox_validate_declaration(
     let decl: CapabilityDeclaration =
         serde_json::from_str(&declaration_json).map_err(|e| ScpError::Validation {
             msg: format!("invalid declaration JSON: {e}"),
-            code: "SCP-VALID-7070".to_owned(),
+            code: codes::VALID_7070.to_owned(),
         })?;
 
     let ceiling: Vec<Capability> = ceiling_capabilities.iter().map(Capability::new).collect();
@@ -11969,7 +11971,7 @@ pub fn sandbox_validate_declaration(
             }))
             .map_err(|e| ScpError::Context {
                 msg: format!("serialization failed: {e}"),
-                code: "SCP-CTX-2030".to_owned(),
+                code: codes::CTX_2030.to_owned(),
             })
         }
         Err(e) => serde_json::to_string(&serde_json::json!({
@@ -11980,7 +11982,7 @@ pub fn sandbox_validate_declaration(
         }))
         .map_err(|e| ScpError::Context {
             msg: format!("serialization failed: {e}"),
-            code: "SCP-CTX-2031".to_owned(),
+            code: codes::CTX_2031.to_owned(),
         }),
     }
 }
@@ -12069,14 +12071,14 @@ pub fn evaluate_invitation(
     let params: scp_core::context::params::ContextParams = serde_json::from_str(&params_json)
         .map_err(|e| ScpError::Validation {
             msg: format!("failed to parse context params JSON: {e}"),
-            code: "SCP-VALID-7010".to_owned(),
+            code: codes::VALID_7010.to_owned(),
         })?;
 
     let policy: Option<AutoAcceptPolicy> = match policy_json {
         Some(ref json) => Some(
             serde_json::from_str(json).map_err(|e| ScpError::Validation {
                 msg: format!("failed to parse auto-accept policy JSON: {e}"),
-                code: "SCP-VALID-7010".to_owned(),
+                code: codes::VALID_7010.to_owned(),
             })?,
         ),
         None => None,
@@ -12086,7 +12088,7 @@ pub fn evaluate_invitation(
         Some(ref json) => Some(
             serde_json::from_str(json).map_err(|e| ScpError::Validation {
                 msg: format!("failed to parse spending context JSON: {e}"),
-                code: "SCP-VALID-7010".to_owned(),
+                code: codes::VALID_7010.to_owned(),
             })?,
         ),
         None => None,
@@ -12118,7 +12120,7 @@ pub fn evaluate_invitation(
         Ok(EvaluationDecision::PromptAgent) => Ok("prompt_agent".to_owned()),
         Err(e) => Err(ScpError::Context {
             msg: format!("invitation evaluation failed: {e}"),
-            code: "SCP-CTX-2060".to_owned(),
+            code: codes::CTX_2060.to_owned(),
         }),
     }
 }
@@ -12159,7 +12161,7 @@ pub fn identity_execute_recovery(
                 msg: format!(
                     "invalid compromise tier: {other}; expected 'agent', 'active_signing', or 'identity_key'"
                 ),
-                code: "SCP-IDENT-1020".to_owned(),
+                code: codes::IDENT_1020.to_owned(),
             });
         }
     };
@@ -12230,12 +12232,12 @@ pub fn identity_execute_recovery(
         ))
         .map_err(|e| ScpError::Identity {
             msg: format!("recovery failed: {e}"),
-            code: "SCP-IDENT-1022".to_owned(),
+            code: codes::IDENT_1022.to_owned(),
         })?;
 
     serde_json::to_string(&result).map_err(|e| ScpError::Identity {
         msg: format!("failed to serialize recovery result: {e}"),
-        code: "SCP-IDENT-1023".to_owned(),
+        code: codes::IDENT_1023.to_owned(),
     })
 }
 
@@ -12273,7 +12275,7 @@ pub fn identity_execute_custody_migration(
                 msg: format!(
                     "invalid custody migration target: {other}; expected 'platform_managed', 'hardware', 'software', or 'in_memory'"
                 ),
-                code: "SCP-IDENT-1024".to_owned(),
+                code: codes::IDENT_1024.to_owned(),
             });
         }
     };
@@ -12333,12 +12335,12 @@ pub fn identity_execute_custody_migration(
         .block_on(orchestrator.execute(&backend, &scp_primitives::SystemClock))
         .map_err(|e| ScpError::Identity {
             msg: format!("custody migration failed: {e}"),
-            code: "SCP-IDENT-1025".to_owned(),
+            code: codes::IDENT_1025.to_owned(),
         })?;
 
     serde_json::to_string(&result).map_err(|e| ScpError::Identity {
         msg: format!("failed to serialize custody migration result: {e}"),
-        code: "SCP-IDENT-1026".to_owned(),
+        code: codes::IDENT_1026.to_owned(),
     })
 }
 
@@ -12370,13 +12372,13 @@ pub fn scpid_challenge(audience: String, ttl_seconds: u64) -> Result<String, Scp
     let challenge = core_challenge(&audience, Duration::from_secs(ttl_seconds)).map_err(|e| {
         ScpError::Validation {
             msg: e.to_string(),
-            code: "SCP-IDENT-1038".to_owned(),
+            code: codes::IDENT_1038.to_owned(),
         }
     })?;
 
     serde_json::to_string(&challenge).map_err(|e| ScpError::Identity {
         msg: format!("failed to serialize SCPID challenge: {e}"),
-        code: "SCP-IDENT-1037".to_owned(),
+        code: codes::IDENT_1037.to_owned(),
     })
 }
 
@@ -12411,7 +12413,7 @@ pub fn scpid_sign(
     let challenge: scp_core::identity::ScpIdChallenge = serde_json::from_str(&challenge_json)
         .map_err(|e| ScpError::Validation {
             msg: format!("invalid challenge JSON: {e}"),
-            code: "SCP-IDENT-1038".to_owned(),
+            code: codes::IDENT_1038.to_owned(),
         })?;
 
     let core_id = identity
@@ -12420,7 +12422,7 @@ pub fn scpid_sign(
         .ok_or_else(|| ScpError::Identity {
             msg: "identity has no core identity handle — was it created with identity_create?"
                 .to_owned(),
-            code: "SCP-IDENT-1010".to_owned(),
+            code: codes::IDENT_1010.to_owned(),
         })?;
 
     let key_handle = match key_id {
@@ -12434,7 +12436,7 @@ pub fn scpid_sign(
                          add one with identity_add_agent_key first",
                         identity.did
                     ),
-                    code: "SCP-IDENT-1034".to_owned(),
+                    code: codes::IDENT_1034.to_owned(),
                 })?
         }
     };
@@ -12446,7 +12448,7 @@ pub fn scpid_sign(
             msg: "scpid_sign requires in-memory custody (only supported with \
                   allow_in_memory_custody feature)"
                 .to_owned(),
-            code: "SCP-IDENT-1008".to_owned(),
+            code: codes::IDENT_1008.to_owned(),
         })?;
 
     let rt = crate::runtime();
@@ -12460,12 +12462,12 @@ pub fn scpid_sign(
 
     let response = response.map_err(|e| ScpError::Identity {
         msg: e.to_string(),
-        code: "SCP-IDENT-1037".to_owned(),
+        code: codes::IDENT_1037.to_owned(),
     })?;
 
     serde_json::to_string(&response).map_err(|e| ScpError::Identity {
         msg: format!("failed to serialize SCPID response: {e}"),
-        code: "SCP-IDENT-1037".to_owned(),
+        code: codes::IDENT_1037.to_owned(),
     })
 }
 
@@ -12495,20 +12497,20 @@ pub fn scpid_verify(response_json: String, challenge_json: String) -> Result<Str
     let response: scp_core::identity::ScpIdResponse = serde_json::from_str(&response_json)
         .map_err(|e| ScpError::Validation {
             msg: format!("invalid response JSON: {e}"),
-            code: "SCP-IDENT-1038".to_owned(),
+            code: codes::IDENT_1038.to_owned(),
         })?;
 
     let challenge: scp_core::identity::ScpIdChallenge = serde_json::from_str(&challenge_json)
         .map_err(|e| ScpError::Validation {
             msg: format!("invalid challenge JSON: {e}"),
-            code: "SCP-IDENT-1038".to_owned(),
+            code: codes::IDENT_1038.to_owned(),
         })?;
 
     let resolver = crate::runtime::did_resolver().ok_or_else(|| ScpError::Identity {
         msg: "DID resolver not initialized — create an identity with \
               identityCreate before calling scpidVerify"
             .to_owned(),
-        code: "SCP-IDENT-1033".to_owned(),
+        code: codes::IDENT_1033.to_owned(),
     })?;
 
     let rt = crate::runtime();
@@ -12521,7 +12523,7 @@ pub fn scpid_verify(response_json: String, challenge_json: String) -> Result<Str
 
     serde_json::to_string(&auth).map_err(|e| ScpError::Identity {
         msg: format!("failed to serialize SCPID authentication: {e}"),
-        code: "SCP-IDENT-1037".to_owned(),
+        code: codes::IDENT_1037.to_owned(),
     })
 }
 
@@ -12534,7 +12536,7 @@ fn parse_scpid_signing_key_id(s: &str) -> Result<scp_identity::SigningKeyId, Scp
         "#agent" => Ok(scp_identity::SigningKeyId::Agent),
         other => Err(ScpError::Validation {
             msg: format!("invalid signing_key_id '{other}': expected '#active' or '#agent'"),
-            code: "SCP-IDENT-1034".to_owned(),
+            code: codes::IDENT_1034.to_owned(),
         }),
     }
 }
@@ -12543,15 +12545,15 @@ fn parse_scpid_signing_key_id(s: &str) -> Result<scp_identity::SigningKeyId, Scp
 const fn scpid_error_code(e: &scp_core::identity::ScpIdError) -> &'static str {
     use scp_core::identity::ScpIdError;
     match e {
-        ScpIdError::ChallengeExpired => "SCP-IDENT-1030",
-        ScpIdError::AudienceMismatch => "SCP-IDENT-1031",
-        ScpIdError::TimestampInvalid => "SCP-IDENT-1032",
-        ScpIdError::DidResolutionFailed(_) => "SCP-IDENT-1033",
-        ScpIdError::KeyNotAuthorized => "SCP-IDENT-1034",
-        ScpIdError::SignatureInvalid => "SCP-IDENT-1035",
-        ScpIdError::DidDocumentStale => "SCP-IDENT-1036",
-        ScpIdError::SigningFailed(_) => "SCP-IDENT-1037",
-        ScpIdError::InvalidInput(_) => "SCP-IDENT-1038",
+        ScpIdError::ChallengeExpired => codes::IDENT_1030,
+        ScpIdError::AudienceMismatch => codes::IDENT_1031,
+        ScpIdError::TimestampInvalid => codes::IDENT_1032,
+        ScpIdError::DidResolutionFailed(_) => codes::IDENT_1033,
+        ScpIdError::KeyNotAuthorized => codes::IDENT_1034,
+        ScpIdError::SignatureInvalid => codes::IDENT_1035,
+        ScpIdError::DidDocumentStale => codes::IDENT_1036,
+        ScpIdError::SigningFailed(_) => codes::IDENT_1037,
+        ScpIdError::InvalidInput(_) => codes::IDENT_1038,
     }
 }
 
@@ -12578,7 +12580,7 @@ pub fn economy_estimate_cost(
         let p: scp_core::economy::EconomicPolicy =
             serde_json::from_str(&policy_json).map_err(|e| ScpError::Validation {
                 msg: format!("invalid economic policy JSON: {e}"),
-                code: "SCP-VALID-7050".to_owned(),
+                code: codes::VALID_7050.to_owned(),
             })?;
         Some(p)
     };
@@ -12598,7 +12600,7 @@ pub fn economy_policy_requires_payment(policy_json: String) -> Result<bool, ScpE
     let policy: scp_core::economy::EconomicPolicy =
         serde_json::from_str(&policy_json).map_err(|e| ScpError::Validation {
             msg: format!("invalid economic policy JSON: {e}"),
-            code: "SCP-VALID-7050".to_owned(),
+            code: codes::VALID_7050.to_owned(),
         })?;
     Ok(scp_core::economy::policy_requires_payment(&policy))
 }
@@ -12612,7 +12614,7 @@ pub fn economy_auto_accept_blocked(policy_json: String) -> Result<bool, ScpError
     let policy: scp_core::economy::EconomicPolicy =
         serde_json::from_str(&policy_json).map_err(|e| ScpError::Validation {
             msg: format!("invalid economic policy JSON: {e}"),
-            code: "SCP-VALID-7050".to_owned(),
+            code: codes::VALID_7050.to_owned(),
         })?;
     Ok(scp_core::economy::auto_accept_blocked_by_economics(Some(
         &policy,
@@ -12628,7 +12630,7 @@ pub fn economy_check_policy_lock(policy_json: String) -> Result<bool, ScpError> 
     let policy: scp_core::economy::EconomicPolicy =
         serde_json::from_str(&policy_json).map_err(|e| ScpError::Validation {
             msg: format!("invalid economic policy JSON: {e}"),
-            code: "SCP-VALID-7050".to_owned(),
+            code: codes::VALID_7050.to_owned(),
         })?;
     Ok(scp_core::economy::check_policy_lock(&policy).is_err())
 }
@@ -12642,17 +12644,17 @@ pub fn economy_validate_policy_change(
     let current: scp_core::economy::EconomicPolicy = serde_json::from_str(&current_policy_json)
         .map_err(|e| ScpError::Validation {
             msg: format!("invalid current policy JSON: {e}"),
-            code: "SCP-VALID-7050".to_owned(),
+            code: codes::VALID_7050.to_owned(),
         })?;
     let proposed: scp_core::economy::EconomicPolicy = serde_json::from_str(&proposed_policy_json)
         .map_err(|e| ScpError::Validation {
         msg: format!("invalid proposed policy JSON: {e}"),
-        code: "SCP-VALID-7050".to_owned(),
+        code: codes::VALID_7050.to_owned(),
     })?;
     scp_core::economy::validate_policy_change(&current, &proposed).map_err(|e| {
         ScpError::Validation {
             msg: format!("policy change rejected: {e}"),
-            code: "SCP-VALID-7051".to_owned(),
+            code: codes::VALID_7051.to_owned(),
         }
     })?;
     Ok(true)
@@ -12667,7 +12669,7 @@ pub fn economy_evaluate_formula(
     let formula: scp_core::economy::PricingFormula =
         serde_json::from_str(&formula_json).map_err(|e| ScpError::Validation {
             msg: format!("invalid formula JSON: {e}"),
-            code: "SCP-VALID-7050".to_owned(),
+            code: codes::VALID_7050.to_owned(),
         })?;
     let metrics = parse_observable_metrics(&metrics_json)?;
     Ok(scp_core::economy::evaluate_formula(&formula, &metrics)
@@ -12709,7 +12711,7 @@ pub fn economy_budget_record_spend(
             .record_spend(&member_did, scp_core::economy::Amount::new(amount))
             .map_err(|e| ScpError::Validation {
                 msg: format!("{e}"),
-                code: "SCP-VALID-7052".to_owned(),
+                code: codes::VALID_7052.to_owned(),
             })
     })
 }
@@ -12760,7 +12762,7 @@ pub fn economy_antispam_escalated_cost(
     let thresholds: Vec<(u64, u64)> =
         serde_json::from_str(&thresholds_json).map_err(|e| ScpError::Validation {
             msg: format!("invalid thresholds JSON: {e}"),
-            code: "SCP-VALID-7050".to_owned(),
+            code: codes::VALID_7050.to_owned(),
         })?;
 
     let config = scp_core::economy::EscalationConfig {
@@ -12805,7 +12807,7 @@ fn parse_paid_action_type(s: &str) -> Result<scp_core::economy::PaidActionType, 
                 "invalid action type: {s:?} — expected one of: MessageSend, ToolInvoke, \
                  ContextJoin, SubscriptionPeriod, ByteStored"
             ),
-            code: "SCP-VALID-7050".to_owned(),
+            code: codes::VALID_7050.to_owned(),
         }),
     }
 }
@@ -12837,33 +12839,33 @@ pub fn metadata_record_to_json(
     if sequence == 0 {
         return Err(ScpError::Validation {
             msg: "MetadataRecord sequence must start at 1 (per spec §5.7.2)".to_owned(),
-            code: "SCP-VALID-7001".to_owned(),
+            code: codes::VALID_7001.to_owned(),
         });
     }
 
     let structural: StructuralMetadata =
         serde_json::from_str(&structural_json).map_err(|e| ScpError::Validation {
             msg: format!("invalid structural metadata JSON: {e}"),
-            code: "SCP-VALID-7001".to_owned(),
+            code: codes::VALID_7001.to_owned(),
         })?;
 
     let operational: OperationalMetadata =
         serde_json::from_str(&operational_json).map_err(|e| ScpError::Validation {
             msg: format!("invalid operational metadata JSON: {e}"),
-            code: "SCP-VALID-7001".to_owned(),
+            code: codes::VALID_7001.to_owned(),
         })?;
 
     let signature =
         Zeroizing::new(
             hex::decode(&signature_hex).map_err(|e| ScpError::Validation {
                 msg: format!("invalid signature hex: {e}"),
-                code: "SCP-VALID-7001".to_owned(),
+                code: codes::VALID_7001.to_owned(),
             })?,
         );
     if signature.len() != 64 {
         return Err(ScpError::Validation {
             msg: format!("signature must be 64 bytes (got {})", signature.len()),
-            code: "SCP-VALID-7001".to_owned(),
+            code: codes::VALID_7001.to_owned(),
         });
     }
 
@@ -12879,7 +12881,7 @@ pub fn metadata_record_to_json(
 
     serde_json::to_string(&record).map_err(|e| ScpError::Validation {
         msg: format!("failed to serialize MetadataRecord: {e}"),
-        code: "SCP-VALID-7001".to_owned(),
+        code: codes::VALID_7001.to_owned(),
     })
 }
 
@@ -12893,14 +12895,14 @@ pub fn metadata_record_from_json(json_str: String) -> Result<String, ScpError> {
     let record: MetadataRecord =
         serde_json::from_str(&json_str).map_err(|e| ScpError::Validation {
             msg: format!("invalid MetadataRecord JSON: {e}"),
-            code: "SCP-VALID-7001".to_owned(),
+            code: codes::VALID_7001.to_owned(),
         })?;
 
     // F6: sequence must be >= 1 (spec §5.7.2)
     if record.sequence == 0 {
         return Err(ScpError::Validation {
             msg: "MetadataRecord sequence must start at 1 (per spec §5.7.2)".to_owned(),
-            code: "SCP-VALID-7001".to_owned(),
+            code: codes::VALID_7001.to_owned(),
         });
     }
 
@@ -12911,13 +12913,13 @@ pub fn metadata_record_from_json(json_str: String) -> Result<String, ScpError> {
                 "signature must be 64 bytes (got {})",
                 record.signature.len()
             ),
-            code: "SCP-VALID-7001".to_owned(),
+            code: codes::VALID_7001.to_owned(),
         });
     }
 
     serde_json::to_string(&record).map_err(|e| ScpError::Validation {
         msg: format!("failed to re-serialize MetadataRecord: {e}"),
-        code: "SCP-VALID-7001".to_owned(),
+        code: codes::VALID_7001.to_owned(),
     })
 }
 
@@ -12934,7 +12936,7 @@ pub fn template_get_params(template_id: String) -> Result<String, ScpError> {
     let params = template_params(&tid);
     serde_json::to_string(&params).map_err(|e| ScpError::Validation {
         msg: format!("failed to serialize template params: {e}"),
-        code: "SCP-VALID-7001".to_owned(),
+        code: codes::VALID_7001.to_owned(),
     })
 }
 
@@ -12948,7 +12950,7 @@ pub fn validate_against_template(params_json: String) -> Result<Option<String>, 
     let params: scp_core::context::ContextParams =
         serde_json::from_str(&params_json).map_err(|e| ScpError::Validation {
             msg: format!("invalid ContextParams JSON: {e}"),
-            code: "SCP-VALID-7001".to_owned(),
+            code: codes::VALID_7001.to_owned(),
         })?;
 
     match core_validate(&params) {
@@ -12967,7 +12969,7 @@ pub fn validate_context_params(params_json: String) -> Result<Option<String>, Sc
     let params: scp_core::context::ContextParams =
         serde_json::from_str(&params_json).map_err(|e| ScpError::Validation {
             msg: format!("invalid ContextParams JSON: {e}"),
-            code: "SCP-VALID-7001".to_owned(),
+            code: codes::VALID_7001.to_owned(),
         })?;
 
     match core_validate(&params) {
@@ -13006,7 +13008,7 @@ fn parse_template_id_uniffi(
                  HandleRegistry, scp:template/handle-registry, DiscoveryContext, \
                  scp:template/discovery-context"
             ),
-            code: "SCP-VALID-7001".to_owned(),
+            code: codes::VALID_7001.to_owned(),
         }),
     }
 }
@@ -13014,7 +13016,7 @@ fn parse_template_id_uniffi(
 fn parse_observable_metrics(json: &str) -> Result<scp_core::economy::ObservableMetrics, ScpError> {
     let v: serde_json::Value = serde_json::from_str(json).map_err(|e| ScpError::Validation {
         msg: format!("invalid metrics JSON: {e}"),
-        code: "SCP-VALID-7050".to_owned(),
+        code: codes::VALID_7050.to_owned(),
     })?;
     Ok(scp_core::economy::ObservableMetrics {
         context_message_rate: v
@@ -13105,7 +13107,7 @@ mod tests {
         let err = result.expect_err("None ucan_token must be rejected");
         match err {
             ScpError::Permission { ref code, .. } => {
-                assert_eq!(code, "SCP-PERM-3001");
+                assert_eq!(code, codes::PERM_3001);
             }
             other => panic!("expected ScpError::Permission, got {other:?}"),
         }
@@ -13283,7 +13285,7 @@ mod tests {
         let err = ffi.to_core().unwrap_err();
         match err {
             ScpError::Validation { code, msg } => {
-                assert_eq!(code, "SCP-VALID-7080");
+                assert_eq!(code, codes::VALID_7080);
                 assert!(
                     msg.contains("32 bytes"),
                     "expected '32 bytes' in message, got: {msg}"
@@ -13412,7 +13414,7 @@ mod tests {
             .expect_err("invalid input_schema_json must be rejected");
         match err {
             ScpError::Validation { ref code, ref msg } => {
-                assert_eq!(code, "SCP-VALID-7035");
+                assert_eq!(code, codes::VALID_7035);
                 assert!(
                     msg.contains("invalid input_schema_json"),
                     "error should reference field name, got: {msg}"
@@ -13441,7 +13443,7 @@ mod tests {
             .expect_err("invalid output_schema_json must be rejected");
         match err {
             ScpError::Validation { ref code, ref msg } => {
-                assert_eq!(code, "SCP-VALID-7036");
+                assert_eq!(code, codes::VALID_7036);
                 assert!(
                     msg.contains("invalid output_schema_json"),
                     "error should reference field name, got: {msg}"
@@ -13472,7 +13474,7 @@ mod tests {
             .expect_err("non-object input_schema must be rejected");
         match err {
             ScpError::Validation { ref code, ref msg } => {
-                assert_eq!(code, "SCP-VALID-7035");
+                assert_eq!(code, codes::VALID_7035);
                 assert!(
                     msg.contains("expected a JSON object"),
                     "error should mention expected type, got: {msg}"
@@ -13505,7 +13507,7 @@ mod tests {
             .expect_err("non-object output_schema must be rejected");
         match err {
             ScpError::Validation { ref code, ref msg } => {
-                assert_eq!(code, "SCP-VALID-7036");
+                assert_eq!(code, codes::VALID_7036);
                 assert!(
                     msg.contains("expected a JSON object"),
                     "error should mention expected type, got: {msg}"
@@ -13540,7 +13542,7 @@ mod tests {
             .expect_err("non-array test_vectors_json must be rejected");
         match err {
             ScpError::Validation { ref code, ref msg } => {
-                assert_eq!(code, "SCP-VALID-7037");
+                assert_eq!(code, codes::VALID_7037);
                 assert!(
                     msg.contains("invalid test_vectors_json"),
                     "error should reference field name, got: {msg}"
@@ -13570,7 +13572,7 @@ mod tests {
             .expect_err("test vectors with missing fields must be rejected");
         match err {
             ScpError::Validation { ref code, .. } => {
-                assert_eq!(code, "SCP-VALID-7037");
+                assert_eq!(code, codes::VALID_7037);
             }
             other => panic!("expected ScpError::Validation, got {other:?}"),
         }
@@ -13597,7 +13599,7 @@ mod tests {
             .expect_err("implementation_hash with wrong length must be rejected");
         match err {
             ScpError::Validation { ref code, ref msg } => {
-                assert_eq!(code, "SCP-VALID-7038");
+                assert_eq!(code, codes::VALID_7038);
                 assert!(
                     msg.contains("32 bytes"),
                     "error should mention expected length, got: {msg}"
@@ -13630,7 +13632,7 @@ mod tests {
             .expect_err("implementation_hash with wrong length must be rejected");
         match err {
             ScpError::Validation { ref code, ref msg } => {
-                assert_eq!(code, "SCP-VALID-7038");
+                assert_eq!(code, codes::VALID_7038);
                 assert!(
                     msg.contains("32 bytes"),
                     "error should mention expected length, got: {msg}"
@@ -13735,7 +13737,7 @@ mod tests {
         let err = result.unwrap_err();
         match err {
             ScpError::Validation { ref code, .. } => {
-                assert_eq!(code, "SCP-VALID-7052");
+                assert_eq!(code, codes::VALID_7052);
             }
             other => panic!("expected ScpError::Validation, got {other:?}"),
         }
@@ -13836,39 +13838,39 @@ mod tests {
 
         assert_eq!(
             scpid_error_code(&ScpIdError::ChallengeExpired),
-            "SCP-IDENT-1030"
+            codes::IDENT_1030
         );
         assert_eq!(
             scpid_error_code(&ScpIdError::AudienceMismatch),
-            "SCP-IDENT-1031"
+            codes::IDENT_1031
         );
         assert_eq!(
             scpid_error_code(&ScpIdError::TimestampInvalid),
-            "SCP-IDENT-1032"
+            codes::IDENT_1032
         );
         assert_eq!(
             scpid_error_code(&ScpIdError::DidResolutionFailed("test".to_owned())),
-            "SCP-IDENT-1033"
+            codes::IDENT_1033
         );
         assert_eq!(
             scpid_error_code(&ScpIdError::KeyNotAuthorized),
-            "SCP-IDENT-1034"
+            codes::IDENT_1034
         );
         assert_eq!(
             scpid_error_code(&ScpIdError::SignatureInvalid),
-            "SCP-IDENT-1035"
+            codes::IDENT_1035
         );
         assert_eq!(
             scpid_error_code(&ScpIdError::DidDocumentStale),
-            "SCP-IDENT-1036"
+            codes::IDENT_1036
         );
         assert_eq!(
             scpid_error_code(&ScpIdError::SigningFailed("test".to_owned())),
-            "SCP-IDENT-1037"
+            codes::IDENT_1037
         );
         assert_eq!(
             scpid_error_code(&ScpIdError::InvalidInput("test".to_owned())),
-            "SCP-IDENT-1038"
+            codes::IDENT_1038
         );
     }
 
@@ -13880,7 +13882,7 @@ mod tests {
         let err = result.unwrap_err();
         let err_str = err.to_string();
         assert!(
-            err_str.contains("SCP-IDENT-1038"),
+            err_str.contains(codes::IDENT_1038),
             "expected SCP-IDENT-1038, got: {err_str}"
         );
     }
@@ -13906,7 +13908,7 @@ mod tests {
         let err = result.unwrap_err();
         let err_str = err.to_string();
         assert!(
-            err_str.contains("SCP-IDENT-1038"),
+            err_str.contains(codes::IDENT_1038),
             "expected SCP-IDENT-1038, got: {err_str}"
         );
     }
@@ -13991,7 +13993,7 @@ mod tests {
         let err = result.expect_err("empty context_ids must be rejected");
         match err {
             ScpError::Transport { ref code, .. } => {
-                assert_eq!(code, "SCP-TRANS-5011");
+                assert_eq!(code, codes::TRANS_5011);
             }
             other => panic!("expected ScpError::Transport, got {other:?}"),
         }
@@ -14019,7 +14021,7 @@ mod tests {
         let err = result.expect_err("empty command must be rejected");
         match err {
             ScpError::Validation { ref code, .. } => {
-                assert_eq!(code, "SCP-VALID-7034");
+                assert_eq!(code, codes::VALID_7034);
             }
             other => panic!("expected ScpError::Validation, got {other:?}"),
         }
@@ -14032,7 +14034,7 @@ mod tests {
         let err = result.expect_err("unknown handle must be rejected");
         match err {
             ScpError::Transport { ref code, .. } => {
-                assert_eq!(code, "SCP-TRANS-5019");
+                assert_eq!(code, codes::TRANS_5019);
             }
             other => panic!("expected ScpError::Transport, got {other:?}"),
         }
@@ -14045,7 +14047,7 @@ mod tests {
         let err = result.expect_err("unknown handle must be rejected");
         match err {
             ScpError::Transport { ref code, .. } => {
-                assert_eq!(code, "SCP-TRANS-5020");
+                assert_eq!(code, codes::TRANS_5020);
             }
             other => panic!("expected ScpError::Transport, got {other:?}"),
         }
@@ -14065,7 +14067,7 @@ mod tests {
         let err = result.expect_err("unknown handle must be rejected");
         match err {
             ScpError::Transport { ref code, .. } => {
-                assert_eq!(code, "SCP-TRANS-5023");
+                assert_eq!(code, codes::TRANS_5023);
             }
             other => panic!("expected ScpError::Transport, got {other:?}"),
         }
@@ -14078,7 +14080,7 @@ mod tests {
         let err = result.expect_err("unknown handle must be rejected");
         match err {
             ScpError::Transport { ref code, .. } => {
-                assert_eq!(code, "SCP-TRANS-5012");
+                assert_eq!(code, codes::TRANS_5012);
             }
             other => panic!("expected ScpError::Transport, got {other:?}"),
         }

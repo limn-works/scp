@@ -62,6 +62,7 @@
 // The uniffi::include_scaffolding! macro expands unsafe extern "C" declarations.
 #![allow(unsafe_code)]
 
+use scp_ffi_common::error_codes as codes;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
@@ -479,7 +480,7 @@ pub trait KeyCustodyProvider: Send + Sync {
         let _ = key_id;
         Err(ScpError::Context {
             msg: "export_signing_key_bytes not implemented by this KeyCustodyProvider".to_owned(),
-            code: "SCP-CTX-2050".to_owned(),
+            code: codes::CTX_2050.to_owned(),
         })
     }
 
@@ -607,6 +608,7 @@ pub trait DeviceAttestationProvider: Send + Sync {
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
     use super::*;
+    use scp_ffi_common::error_codes as codes;
 
     #[test]
     fn runtime_is_lazy_initialized_on_first_call() {
@@ -681,11 +683,11 @@ mod tests {
     fn scp_error_display_is_descriptive() {
         let identity = ScpError::Identity {
             msg: "test".to_owned(),
-            code: "SCP-IDENT-1001".to_owned(),
+            code: codes::IDENT_1001.to_owned(),
         };
         let context = ScpError::Context {
             msg: "test".to_owned(),
-            code: "SCP-CTX-2001".to_owned(),
+            code: codes::CTX_2001.to_owned(),
         };
         assert!(identity.to_string().contains("identity error"));
         assert!(context.to_string().contains("context error"));
@@ -726,7 +728,8 @@ mod tests {
         match result {
             Err(ScpError::Identity { code, .. }) => {
                 assert_eq!(
-                    code, "SCP-IDENT-1008",
+                    code,
+                    codes::IDENT_1008,
                     "expected SCP-IDENT-1008 error code when in_memory custody is disabled"
                 );
             }

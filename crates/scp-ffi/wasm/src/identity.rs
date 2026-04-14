@@ -39,6 +39,7 @@
 //!
 //! See ADR-022 in `.docs/adrs/phase-4.md` for the full specification.
 
+use scp_ffi_common::error_codes as codes;
 use std::cell::RefCell;
 use std::collections::HashMap;
 
@@ -256,7 +257,7 @@ pub(crate) fn compute_export_hmac(did: &str, data: &[u8]) -> Result<String, ScpW
     let mut mac =
         Hmac::<Sha256>::new_from_slice(hmac_key.as_ref()).map_err(|e| ScpWasmError::Identity {
             message: format!("HMAC key init failed: {e}"),
-            code: "SCP-CTX-2020".to_owned(),
+            code: codes::CTX_2020.to_owned(),
         })?;
     mac.update(data);
     let result = mac.finalize();
@@ -313,20 +314,20 @@ pub(crate) fn verify_export_hmac(
 
     let expected_bytes = hex::decode(expected_hex).map_err(|e| ScpWasmError::Context {
         message: format!("integrity_mac is not valid hex: {e}"),
-        code: "SCP-CTX-2020".to_owned(),
+        code: codes::CTX_2020.to_owned(),
     })?;
 
     let hmac_key = derive_export_hmac_key(did)?;
     let mut mac =
         Hmac::<Sha256>::new_from_slice(hmac_key.as_ref()).map_err(|e| ScpWasmError::Identity {
             message: format!("HMAC key init failed: {e}"),
-            code: "SCP-CTX-2020".to_owned(),
+            code: codes::CTX_2020.to_owned(),
         })?;
     mac.update(data);
     mac.verify_slice(&expected_bytes)
         .map_err(|_| ScpWasmError::Context {
             message: "export integrity check failed — HMAC does not match".to_owned(),
-            code: "SCP-CTX-2020".to_owned(),
+            code: codes::CTX_2020.to_owned(),
         })
 }
 
@@ -339,7 +340,7 @@ fn derive_export_hmac_key(did: &str) -> Result<zeroize::Zeroizing<[u8; 32]>, Scp
         let map = reg.borrow();
         let entry = map.get(did).ok_or_else(|| ScpWasmError::Identity {
             message: format!("identity '{did}' not found in registry — cannot compute export HMAC"),
-            code: "SCP-CTX-2020".to_owned(),
+            code: codes::CTX_2020.to_owned(),
         })?;
 
         // HKDF-SHA256: extract(salt=[], ikm=signing_key) then
@@ -347,13 +348,13 @@ fn derive_export_hmac_key(did: &str) -> Result<zeroize::Zeroizing<[u8; 32]>, Scp
         let prk = hkdf_extract_sha256(&[], entry.signing_key_bytes.as_ref()).map_err(|e| {
             ScpWasmError::Identity {
                 message: format!("HKDF extract failed: {e}"),
-                code: "SCP-CTX-2020".to_owned(),
+                code: codes::CTX_2020.to_owned(),
             }
         })?;
         let okm = hkdf_expand_sha256(&prk, EXPORT_HMAC_DOMAIN, 32).map_err(|e| {
             ScpWasmError::Identity {
                 message: format!("HKDF expand failed: {e}"),
-                code: "SCP-CTX-2020".to_owned(),
+                code: codes::CTX_2020.to_owned(),
             }
         })?;
         let mut key = zeroize::Zeroizing::new([0u8; 32]);
@@ -530,7 +531,7 @@ impl WasmIdentity {
         if !did.starts_with("did:dht:") {
             return Err(ScpWasmError::Identity {
                 message: format!("unsupported DID method in {did:?} — only did:dht is supported"),
-                code: "SCP-IDENT-1004".to_owned(),
+                code: codes::IDENT_1004.to_owned(),
             }
             .into_js());
         }
@@ -590,14 +591,14 @@ impl WasmIdentity {
                 message: "identity already has an agent key — remove it first or use \
                           rotateAgentKey"
                     .to_owned(),
-                code: "SCP-IDENT-1009".to_owned(),
+                code: codes::IDENT_1009.to_owned(),
             }
             .into_js());
         }
         if public_key_multibase.is_empty() {
             return Err(ScpWasmError::Identity {
                 message: "agent public key multibase string must not be empty".to_owned(),
-                code: "SCP-IDENT-1010".to_owned(),
+                code: codes::IDENT_1010.to_owned(),
             }
             .into_js());
         }
@@ -631,7 +632,7 @@ impl WasmIdentity {
         if !self.has_agent_key {
             return Err(ScpWasmError::Identity {
                 message: "identity has no agent key to remove".to_owned(),
-                code: "SCP-IDENT-1011".to_owned(),
+                code: codes::IDENT_1011.to_owned(),
             }
             .into_js());
         }
@@ -669,14 +670,14 @@ impl WasmIdentity {
         if !self.has_agent_key {
             return Err(ScpWasmError::Identity {
                 message: "identity has no agent key to rotate — use addAgentKey first".to_owned(),
-                code: "SCP-IDENT-1011".to_owned(),
+                code: codes::IDENT_1011.to_owned(),
             }
             .into_js());
         }
         if new_public_key_multibase.is_empty() {
             return Err(ScpWasmError::Identity {
                 message: "new agent public key multibase string must not be empty".to_owned(),
-                code: "SCP-IDENT-1010".to_owned(),
+                code: codes::IDENT_1010.to_owned(),
             }
             .into_js());
         }
@@ -836,7 +837,7 @@ pub fn identity_create(custody: String) -> Promise {
                     "unsupported custody type {custody:?} — only \"js_custody\" and \"in_memory\" \
                      are supported in the browser WASM bridge"
                 ),
-                code: "SCP-IDENT-1004".to_owned(),
+                code: codes::IDENT_1004.to_owned(),
             }
             .into_js()
             .into());
@@ -860,7 +861,7 @@ pub fn identity_create(custody: String) -> Promise {
                 &did,
                 WASM_IDENTITY_REGISTRY_CAP,
                 "identity registry",
-                "SCP-VALID-7400",
+                codes::VALID_7400,
             )?;
             map.insert(
                 did.clone(),
@@ -1022,7 +1023,7 @@ pub fn identity_resolve(did: String) -> Promise {
         if !did.starts_with("did:dht:") {
             return Err(ScpWasmError::Identity {
                 message: format!("unsupported DID method in {did:?} — only did:dht is supported"),
-                code: "SCP-IDENT-1004".to_owned(),
+                code: codes::IDENT_1004.to_owned(),
             }
             .into_js()
             .into());
@@ -1055,7 +1056,7 @@ pub fn identity_create_with_agent_key(custody: String) -> Promise {
                     "unsupported custody type {custody:?} — only \"js_custody\" and \"in_memory\" \
                      are supported in the browser WASM bridge"
                 ),
-                code: "SCP-IDENT-1004".to_owned(),
+                code: codes::IDENT_1004.to_owned(),
             }
             .into_js()
             .into());
@@ -1079,7 +1080,7 @@ pub fn identity_create_with_agent_key(custody: String) -> Promise {
                 &did,
                 WASM_IDENTITY_REGISTRY_CAP,
                 "identity registry",
-                "SCP-VALID-7400",
+                codes::VALID_7400,
             )?;
             map.insert(
                 did.clone(),
@@ -1115,7 +1116,7 @@ pub fn identity_add_agent_key(identity: &WasmIdentity) -> Result<WasmIdentity, J
     if identity.has_agent_key {
         return Err(ScpWasmError::Identity {
             message: "identity already has an agent key".to_owned(),
-            code: "SCP-IDENT-1009".to_owned(),
+            code: codes::IDENT_1009.to_owned(),
         }
         .into_js());
     }
@@ -1137,7 +1138,7 @@ pub fn identity_add_agent_key(identity: &WasmIdentity) -> Result<WasmIdentity, J
     if !found {
         return Err(ScpWasmError::Identity {
             message: format!("identity not found in registry: {did}"),
-            code: "SCP-IDENT-1009".to_owned(),
+            code: codes::IDENT_1009.to_owned(),
         }
         .into_js());
     }
@@ -1164,7 +1165,7 @@ pub fn identity_rotate_agent_key(identity: &WasmIdentity) -> Result<WasmIdentity
     if !identity.has_agent_key {
         return Err(ScpWasmError::Identity {
             message: "identity has no agent key to rotate".to_owned(),
-            code: "SCP-IDENT-1011".to_owned(),
+            code: codes::IDENT_1011.to_owned(),
         }
         .into_js());
     }
@@ -1186,7 +1187,7 @@ pub fn identity_rotate_agent_key(identity: &WasmIdentity) -> Result<WasmIdentity
     if !found {
         return Err(ScpWasmError::Identity {
             message: format!("identity not found in registry: {did}"),
-            code: "SCP-IDENT-1011".to_owned(),
+            code: codes::IDENT_1011.to_owned(),
         }
         .into_js());
     }
@@ -1239,7 +1240,7 @@ pub fn identity_rotate_key(identity: &WasmIdentity) -> Result<WasmIdentity, JsEr
                 &new_did,
                 WASM_IDENTITY_REGISTRY_CAP,
                 "identity registry",
-                "SCP-VALID-7400",
+                codes::VALID_7400,
             )?;
 
             map.insert(
@@ -1274,7 +1275,7 @@ pub fn identity_rotate_key(identity: &WasmIdentity) -> Result<WasmIdentity, JsEr
                 &new_did,
                 WASM_MIGRATION_LINKS_CAP,
                 "migration links registry",
-                "SCP-VALID-7401",
+                codes::VALID_7401,
             )?;
             map.insert(new_did.clone(), old_did);
             Ok::<(), JsValue>(())
@@ -1315,7 +1316,7 @@ pub fn identity_remove_agent_key(identity: &WasmIdentity) -> Result<WasmIdentity
     if !identity.has_agent_key {
         return Err(ScpWasmError::Identity {
             message: "identity has no agent key to remove".to_owned(),
-            code: "SCP-IDENT-1011".to_owned(),
+            code: codes::IDENT_1011.to_owned(),
         }
         .into_js());
     }
@@ -1335,7 +1336,7 @@ pub fn identity_remove_agent_key(identity: &WasmIdentity) -> Result<WasmIdentity
     if !found {
         return Err(ScpWasmError::Identity {
             message: format!("identity not found in registry: {did}"),
-            code: "SCP-IDENT-1011".to_owned(),
+            code: codes::IDENT_1011.to_owned(),
         }
         .into_js());
     }
@@ -1393,7 +1394,7 @@ pub fn identity_migrate(identity: &WasmIdentity) -> Promise {
                 &new_did,
                 WASM_IDENTITY_REGISTRY_CAP,
                 "identity registry",
-                "SCP-VALID-7400",
+                codes::VALID_7400,
             )?;
             map.insert(
                 new_did.clone(),
@@ -1424,7 +1425,7 @@ pub fn identity_migrate(identity: &WasmIdentity) -> Promise {
                 &new_did,
                 WASM_MIGRATION_LINKS_CAP,
                 "migration links registry",
-                "SCP-VALID-7401",
+                codes::VALID_7401,
             )?;
             map.insert(new_did.clone(), old_did);
             Ok::<(), JsValue>(())
@@ -1486,7 +1487,7 @@ pub fn identity_attest_device(did: String) -> Promise {
             let entry = map.get(&did).ok_or_else(|| -> JsValue {
                 ScpWasmError::Identity {
                     message: format!("identity {did:?} not found in registry"),
-                    code: "SCP-IDENT-1000".to_owned(),
+                    code: codes::IDENT_1000.to_owned(),
                 }
                 .into_js()
                 .into()
@@ -1507,7 +1508,7 @@ pub fn identity_attest_device(did: String) -> Promise {
         let token_json = serde_json::to_string(&token).map_err(|e| -> JsValue {
             ScpWasmError::Identity {
                 message: format!("failed to serialize attestation token: {e}"),
-                code: "SCP-IDENT-1012".to_owned(),
+                code: codes::IDENT_1012.to_owned(),
             }
             .into_js()
             .into()
@@ -1544,20 +1545,20 @@ fn parse_attestation_token(token_base64: &str) -> Result<AttestationTokenFields,
         .decode(token_base64.as_bytes())
         .map_err(|e| ScpWasmError::Identity {
             message: format!("invalid base64 in attestation token: {e}"),
-            code: "SCP-IDENT-1013".to_owned(),
+            code: codes::IDENT_1013.to_owned(),
         })?;
 
     let token: serde_json::Value =
         serde_json::from_slice(&token_bytes).map_err(|e| ScpWasmError::Identity {
             message: format!("invalid JSON in attestation token: {e}"),
-            code: "SCP-IDENT-1013".to_owned(),
+            code: codes::IDENT_1013.to_owned(),
         })?;
 
     let did = token["did"]
         .as_str()
         .ok_or_else(|| ScpWasmError::Validation {
             message: "attestation token missing required 'did' field (string)".to_owned(),
-            code: "SCP-VALID-7020".to_owned(),
+            code: codes::VALID_7020.to_owned(),
         })?
         .to_owned();
 
@@ -1565,14 +1566,14 @@ fn parse_attestation_token(token_base64: &str) -> Result<AttestationTokenFields,
         .as_u64()
         .ok_or_else(|| ScpWasmError::Validation {
             message: "attestation token missing required 'timestamp' field (u64)".to_owned(),
-            code: "SCP-VALID-7021".to_owned(),
+            code: codes::VALID_7021.to_owned(),
         })?;
 
     let signature_hex = token["signature"]
         .as_str()
         .ok_or_else(|| ScpWasmError::Validation {
             message: "attestation token missing required 'signature' field (string)".to_owned(),
-            code: "SCP-VALID-7022".to_owned(),
+            code: codes::VALID_7022.to_owned(),
         })?
         .to_owned();
 
@@ -1675,7 +1676,7 @@ pub fn identity_load(did: String) -> Promise {
         if !did.starts_with("did:dht:") {
             return Err(ScpWasmError::Identity {
                 message: format!("unsupported DID method in {did:?} — only did:dht is supported"),
-                code: "SCP-IDENT-1004".to_owned(),
+                code: codes::IDENT_1004.to_owned(),
             }
             .into_js()
             .into());
@@ -1752,7 +1753,7 @@ pub fn identity_execute_recovery(
                 message: format!(
                     "invalid compromise tier: {other}; expected 'agent', 'active_signing', or 'identity_key'"
                 ),
-                code: "SCP-IDENT-1020".to_owned(),
+                code: codes::IDENT_1020.to_owned(),
             }
             .into_js()
             .into());
@@ -1762,7 +1763,7 @@ pub fn identity_execute_recovery(
     Err(ScpWasmError::Identity {
         message: "recovery backend not configured — provide a real backend via SDK layer"
             .to_owned(),
-        code: "SCP-IDENT-1022".to_owned(),
+        code: codes::IDENT_1022.to_owned(),
     }
     .into_js()
     .into())
@@ -1795,7 +1796,7 @@ pub(crate) fn sign_with_identity(
                     "identity '{did}' not found in registry — \
                  was it created with identity_create?"
                 ),
-                code: "SCP-IDENT-1010".to_owned(),
+                code: codes::IDENT_1010.to_owned(),
             })?;
 
         let key_bytes: &[u8; 32] = match signing_key_id {
@@ -1806,7 +1807,7 @@ pub(crate) fn sign_with_identity(
                         "identity '{did}' has no agent signing key — \
                          add one with identity_add_agent_key first"
                     ),
-                    code: "SCP-IDENT-1034".to_owned(),
+                    code: codes::IDENT_1034.to_owned(),
                 }
             })?,
             _ => {
@@ -1814,7 +1815,7 @@ pub(crate) fn sign_with_identity(
                     message: format!(
                         "invalid signing_key_id '{signing_key_id}': expected '#active' or '#agent'"
                     ),
-                    code: "SCP-IDENT-1034".to_owned(),
+                    code: codes::IDENT_1034.to_owned(),
                 });
             }
         };
@@ -1865,7 +1866,7 @@ pub fn identity_execute_custody_migration(
                 message: format!(
                     "invalid custody migration target: {other}; expected 'platform_managed', 'hardware', 'software', or 'in_memory'"
                 ),
-                code: "SCP-IDENT-1024".to_owned(),
+                code: codes::IDENT_1024.to_owned(),
             }
             .into_js()
             .into());
@@ -1875,7 +1876,7 @@ pub fn identity_execute_custody_migration(
     Err(ScpWasmError::Identity {
         message: "custody migration backend not configured — provide a real backend via SDK layer"
             .to_owned(),
-        code: "SCP-IDENT-1025".to_owned(),
+        code: codes::IDENT_1025.to_owned(),
     }
     .into_js()
     .into())
@@ -1913,7 +1914,7 @@ pub fn identity_create_link_attestation(
         if let Err(e) = scp_ffi_common::validate::validate_did(&did) {
             return Err(ScpWasmError::Validation {
                 message: format!("invalid DID: {e}"),
-                code: "SCP-VALID-7033".to_owned(),
+                code: codes::VALID_7033.to_owned(),
             }
             .into_js()
             .into());
@@ -1925,7 +1926,7 @@ pub fn identity_create_link_attestation(
         {
             return Err(ScpWasmError::Validation {
                 message: format!("attestation field validation failed: {e}"),
-                code: "SCP-VALID-7037".to_owned(),
+                code: codes::VALID_7037.to_owned(),
             }
             .into_js()
             .into());
@@ -1942,7 +1943,7 @@ pub fn identity_create_link_attestation(
                         "invalid verification method: {other}; expected 'oauth', \
                          'signed_post', 'dns_record', or 'challenge_response'"
                     ),
-                    code: "SCP-IDENT-1040".to_owned(),
+                    code: codes::IDENT_1040.to_owned(),
                 }
                 .into_js()
                 .into());
@@ -2039,7 +2040,7 @@ pub fn identity_create_link_attestation(
                         "attestation structure validation failed: {}",
                         errors.join("; ")
                     ),
-                    code: "SCP-VALID-7034".to_owned(),
+                    code: codes::VALID_7034.to_owned(),
                 }
                 .into_js()
                 .into());
@@ -2055,7 +2056,7 @@ pub fn identity_create_link_attestation(
             let entry = map.get(&did).ok_or_else(|| -> JsValue {
                 ScpWasmError::Identity {
                     message: format!("identity {did:?} not found in registry"),
-                    code: "SCP-IDENT-1000".to_owned(),
+                    code: codes::IDENT_1000.to_owned(),
                 }
                 .into_js()
                 .into()
@@ -2081,7 +2082,7 @@ pub fn identity_create_link_attestation(
                 &did,
                 WASM_LINK_ATTESTATIONS_CAP,
                 "link attestation registry",
-                "SCP-VALID-7402",
+                codes::VALID_7402,
             )?;
             let entry = map.entry(did).or_default();
             if entry.len() >= MAX_IDENTITY_LINK_ATTESTATIONS_PER_DID {
@@ -2091,7 +2092,7 @@ pub fn identity_create_link_attestation(
                             "DID has reached the per-identity attestation limit \
                              ({MAX_IDENTITY_LINK_ATTESTATIONS_PER_DID}) — cannot store additional attestations"
                         ),
-                        code: "SCP-VALID-7403".to_owned(),
+                        code: codes::VALID_7403.to_owned(),
                     }
                     .into_js(),
                 ));
@@ -2103,7 +2104,7 @@ pub fn identity_create_link_attestation(
         let json = serde_json::to_string(&attestation).map_err(|e| -> JsValue {
             ScpWasmError::Identity {
                 message: format!("failed to serialize attestation: {e}"),
-                code: "SCP-IDENT-1042".to_owned(),
+                code: codes::IDENT_1042.to_owned(),
             }
             .into_js()
             .into()
@@ -2172,7 +2173,7 @@ fn attestation_required_str<'a>(
 fn attestation_err(message: String) -> JsValue {
     ScpWasmError::Identity {
         message,
-        code: "SCP-IDENT-1044".to_owned(),
+        code: codes::IDENT_1044.to_owned(),
     }
     .into_js()
     .into()
@@ -2262,7 +2263,7 @@ fn decode_attestation_public_key(issuer_public_key_hex: &str) -> Result<Option<[
     let decoded = hex::decode(issuer_public_key_hex).map_err(|e| -> JsValue {
         ScpWasmError::Validation {
             message: format!("invalid issuer_public_key_hex: {e}"),
-            code: "SCP-VALID-7032".to_owned(),
+            code: codes::VALID_7032.to_owned(),
         }
         .into_js()
         .into()
@@ -2298,7 +2299,7 @@ pub fn identity_verify_link_attestation_signature(
             serde_json::from_str(&attestation_json).map_err(|e| -> JsValue {
                 ScpWasmError::Identity {
                     message: format!("failed to parse attestation JSON: {e}"),
-                    code: "SCP-IDENT-1044".to_owned(),
+                    code: codes::IDENT_1044.to_owned(),
                 }
                 .into_js()
                 .into()
@@ -2309,7 +2310,7 @@ pub fn identity_verify_link_attestation_signature(
             .ok_or_else(|| -> JsValue {
                 ScpWasmError::Validation {
                     message: "attestation missing 'issuer' field".to_owned(),
-                    code: "SCP-VALID-7030".to_owned(),
+                    code: codes::VALID_7030.to_owned(),
                 }
                 .into_js()
                 .into()
@@ -2320,7 +2321,7 @@ pub fn identity_verify_link_attestation_signature(
         if let Err(e) = scp_ffi_common::validate::validate_did(&issuer) {
             return Err(ScpWasmError::Validation {
                 message: format!("invalid issuer DID: {e}"),
-                code: "SCP-VALID-7033".to_owned(),
+                code: codes::VALID_7033.to_owned(),
             }
             .into_js()
             .into());
@@ -2331,7 +2332,7 @@ pub fn identity_verify_link_attestation_signature(
             .ok_or_else(|| -> JsValue {
                 ScpWasmError::Validation {
                     message: "attestation missing 'signature' field".to_owned(),
-                    code: "SCP-VALID-7031".to_owned(),
+                    code: codes::VALID_7031.to_owned(),
                 }
                 .into_js()
                 .into()
@@ -2346,7 +2347,7 @@ pub fn identity_verify_link_attestation_signature(
             .map_err(|e| -> JsValue {
                 ScpWasmError::Identity {
                     message: format!("signature contains invalid bytes: {e}"),
-                    code: "SCP-IDENT-1045".to_owned(),
+                    code: codes::IDENT_1045.to_owned(),
                 }
                 .into_js()
                 .into()
@@ -2358,7 +2359,7 @@ pub fn identity_verify_link_attestation_signature(
         let sig_bytes: [u8; 64] = sig_array.try_into().map_err(|_| -> JsValue {
             ScpWasmError::Identity {
                 message: "signature must be exactly 64 bytes".to_owned(),
-                code: "SCP-IDENT-1045".to_owned(),
+                code: codes::IDENT_1045.to_owned(),
             }
             .into_js()
             .into()
@@ -2672,7 +2673,7 @@ mod tests {
                 ref code,
                 ref message,
             } => {
-                assert_eq!(code, "SCP-VALID-7020");
+                assert_eq!(code, codes::VALID_7020);
                 assert!(
                     message.contains("did"),
                     "message should mention 'did': {message}"
@@ -2694,7 +2695,7 @@ mod tests {
         let err = parse_attestation_token(&encoded).unwrap_err();
         match err {
             ScpWasmError::Validation { ref code, .. } => {
-                assert_eq!(code, "SCP-VALID-7020");
+                assert_eq!(code, codes::VALID_7020);
             }
             other => panic!("expected Validation error, got: {other:?}"),
         }
@@ -2713,7 +2714,7 @@ mod tests {
                 ref code,
                 ref message,
             } => {
-                assert_eq!(code, "SCP-VALID-7021");
+                assert_eq!(code, codes::VALID_7021);
                 assert!(
                     message.contains("timestamp"),
                     "message should mention 'timestamp': {message}"
@@ -2735,7 +2736,7 @@ mod tests {
         let err = parse_attestation_token(&encoded).unwrap_err();
         match err {
             ScpWasmError::Validation { ref code, .. } => {
-                assert_eq!(code, "SCP-VALID-7021");
+                assert_eq!(code, codes::VALID_7021);
             }
             other => panic!("expected Validation error, got: {other:?}"),
         }
@@ -2754,7 +2755,7 @@ mod tests {
                 ref code,
                 ref message,
             } => {
-                assert_eq!(code, "SCP-VALID-7022");
+                assert_eq!(code, codes::VALID_7022);
                 assert!(
                     message.contains("signature"),
                     "message should mention 'signature': {message}"
@@ -2773,7 +2774,8 @@ mod tests {
         match err {
             ScpWasmError::Validation { ref code, .. } => {
                 assert_eq!(
-                    code, "SCP-VALID-7020",
+                    code,
+                    codes::VALID_7020,
                     "first missing field should be 'did'"
                 );
             }
@@ -2786,7 +2788,7 @@ mod tests {
         let err = parse_attestation_token("not-valid-base64!!!").unwrap_err();
         match err {
             ScpWasmError::Identity { ref code, .. } => {
-                assert_eq!(code, "SCP-IDENT-1013");
+                assert_eq!(code, codes::IDENT_1013);
             }
             other => panic!("expected Identity error, got: {other:?}"),
         }
@@ -2799,7 +2801,7 @@ mod tests {
         let err = parse_attestation_token(&encoded).unwrap_err();
         match err {
             ScpWasmError::Identity { ref code, .. } => {
-                assert_eq!(code, "SCP-IDENT-1013");
+                assert_eq!(code, codes::IDENT_1013);
             }
             other => panic!("expected Identity error, got: {other:?}"),
         }
@@ -2817,7 +2819,7 @@ mod tests {
         let err = parse_attestation_token(&encoded).unwrap_err();
         match err {
             ScpWasmError::Validation { ref code, .. } => {
-                assert_eq!(code, "SCP-VALID-7020", "null 'did' should fail validation");
+                assert_eq!(code, codes::VALID_7020, "null 'did' should fail validation");
             }
             other => panic!("expected Validation error, got: {other:?}"),
         }

@@ -9,6 +9,7 @@
 //!
 //! See ADR-034 in `.docs/adrs/phase-4.md` and issue #389.
 
+use scp_ffi_common::error_codes as codes;
 use std::collections::HashSet;
 
 use js_sys::Promise;
@@ -421,7 +422,7 @@ pub fn ucan_validate(
         let parsed = parse_ucan(&token).map_err(|e| {
             ScpWasmError::Permission {
                 message: format!("malformed token: {e}"),
-                code: "SCP-PERM-3000".to_owned(),
+                code: codes::PERM_3000.to_owned(),
             }
             .into_js()
         })?;
@@ -433,7 +434,7 @@ pub fn ucan_validate(
                         message: format!(
                             "proof_tokens_json is not a valid JSON array of strings: {e}"
                         ),
-                        code: "SCP-VALID-7000".to_owned(),
+                        code: codes::VALID_7000.to_owned(),
                     }
                     .into_js()
                 })?;
@@ -445,7 +446,7 @@ pub fn ucan_validate(
         let required_capability: CapabilityUri = capability.parse().map_err(|e: UcanError| {
             ScpWasmError::Permission {
                 message: format!("invalid capability URI: {e}"),
-                code: "SCP-PERM-3000".to_owned(),
+                code: codes::PERM_3000.to_owned(),
             }
             .into_js()
         })?;
@@ -460,7 +461,7 @@ pub fn ucan_validate(
         .map_err(|e| {
             ScpWasmError::Permission {
                 message: e,
-                code: "SCP-PERM-3000".to_owned(),
+                code: codes::PERM_3000.to_owned(),
             }
             .into_js()
         })?;
@@ -492,7 +493,7 @@ pub fn ucan_mint(
             message: "UCAN minting requires JS-side key custody (WebCrypto) — use the TypeScript \
                       SDK wrapper's mintUcan() method which signs via SubtleCrypto"
                 .to_owned(),
-            code: "SCP-PERM-3000".to_owned(),
+            code: codes::PERM_3000.to_owned(),
         }
         .into_js()
         .into())
@@ -519,7 +520,7 @@ pub fn ucan_delegate(
             message: "UCAN delegation requires JS-side key custody (WebCrypto) — use the \
                       TypeScript SDK wrapper's delegateUcan() method which signs via SubtleCrypto"
                 .to_owned(),
-            code: "SCP-PERM-3000".to_owned(),
+            code: codes::PERM_3000.to_owned(),
         }
         .into_js()
         .into())
@@ -592,7 +593,7 @@ pub fn ucan_revoke(context: &WasmContextHandle, token: String, revoker_did: Stri
             JsValue::from(
                 ScpWasmError::Validation {
                     message: e.to_string(),
-                    code: "SCP-VALID-7010".to_owned(),
+                    code: codes::VALID_7010.to_owned(),
                 }
                 .into_js(),
             )
@@ -601,7 +602,7 @@ pub fn ucan_revoke(context: &WasmContextHandle, token: String, revoker_did: Stri
             JsValue::from(
                 ScpWasmError::Validation {
                     message: e.to_string(),
-                    code: "SCP-VALID-7011".to_owned(),
+                    code: codes::VALID_7011.to_owned(),
                 }
                 .into_js(),
             )
@@ -612,7 +613,7 @@ pub fn ucan_revoke(context: &WasmContextHandle, token: String, revoker_did: Stri
             JsValue::from(
                 ScpWasmError::Permission {
                     message: format!("malformed UCAN token: {e}"),
-                    code: "SCP-PERM-3001".to_owned(),
+                    code: codes::PERM_3001.to_owned(),
                 }
                 .into_js(),
             )
@@ -632,7 +633,7 @@ pub fn ucan_revoke(context: &WasmContextHandle, token: String, revoker_did: Stri
                         "revoker '{}' is neither the token issuer ('{}') nor the context creator ('{}')",
                         revoker_did, parsed.payload.iss, creator_did
                     ),
-                    code: "SCP-PERM-3008".to_owned(),
+                    code: codes::PERM_3008.to_owned(),
                 }
                 .into_js(),
             ));

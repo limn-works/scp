@@ -8,6 +8,7 @@
 //!
 //! See issue #388 and ADR-022 in `.docs/adrs/phase-4.md`.
 
+use scp_ffi_common::error_codes as codes;
 use std::sync::Arc;
 
 use napi::Error as NapiError;
@@ -56,13 +57,13 @@ fn generate_mls_key_package_bytes(did: &str) -> Result<Vec<u8>, ScpNapiError> {
     let cred = ScpCredential::new(did.to_owned(), None, scp_identity::SigningKeyId::Active)
         .map_err(|e| ScpNapiError::Crypto {
             message: format!("failed to create SCP credential for MLS key package: {e}"),
-            code: "SCP-CRYPTO-4010".to_owned(),
+            code: codes::CRYPTO_4010.to_owned(),
         })?;
 
     let (kp_bundle, _signer, _provider) =
         generate_key_package(&cred).map_err(|e| ScpNapiError::Crypto {
             message: format!("MLS key package generation failed: {e}"),
-            code: "SCP-CRYPTO-4011".to_owned(),
+            code: codes::CRYPTO_4011.to_owned(),
         })?;
 
     kp_bundle
@@ -70,7 +71,7 @@ fn generate_mls_key_package_bytes(did: &str) -> Result<Vec<u8>, ScpNapiError> {
         .tls_serialize_detached()
         .map_err(|e| ScpNapiError::Crypto {
             message: format!("MLS key package TLS serialization failed: {e}"),
-            code: "SCP-CRYPTO-4012".to_owned(),
+            code: codes::CRYPTO_4012.to_owned(),
         })
 }
 
@@ -168,7 +169,7 @@ impl NapiContextHandle {
         let guard = self.state.lock().map_err(|_| {
             NapiError::from(ScpNapiError::Context {
                 message: "context state lock is poisoned".to_owned(),
-                code: "SCP-CTX-2012".to_owned(),
+                code: codes::CTX_2012.to_owned(),
             })
         })?;
         Ok(state_str(&guard).to_owned())
@@ -257,7 +258,7 @@ impl NapiContextHandle {
             .map(|g| state_str(&g).to_owned())
             .map_err(|_| ScpNapiError::Context {
                 message: "context state lock is poisoned".to_owned(),
-                code: "SCP-CTX-2012".to_owned(),
+                code: codes::CTX_2012.to_owned(),
             })
     }
 
@@ -265,7 +266,7 @@ impl NapiContextHandle {
     pub(crate) fn set_closed(&self) -> Result<(), ScpNapiError> {
         *self.state.lock().map_err(|_| ScpNapiError::Context {
             message: "context state lock is poisoned".to_owned(),
-            code: "SCP-CTX-2012".to_owned(),
+            code: codes::CTX_2012.to_owned(),
         })? = ContextState::Closed;
         Ok(())
     }
@@ -278,7 +279,7 @@ impl NapiContextHandle {
                 message: "context does not have a core handle — context was not created via \
                       ContextManager"
                     .to_owned(),
-                code: "SCP-CTX-2024".to_owned(),
+                code: codes::CTX_2024.to_owned(),
             })
     }
 }
@@ -389,7 +390,7 @@ pub async fn context_create(
             message: format!(
                 "params_json is not valid JSON: {e} — pass a JSON-encoded context parameters object"
             ),
-            code: "SCP-VALID-7000".to_owned(),
+            code: codes::VALID_7000.to_owned(),
         })
     })?;
 
@@ -435,7 +436,7 @@ pub async fn context_create(
         other => Some(serde_json::to_string(other).map_err(|e| {
             NapiError::from(ScpNapiError::Validation {
                 message: format!("invalid consequenceRules: {e}"),
-                code: "SCP-VALID-7000".to_owned(),
+                code: codes::VALID_7000.to_owned(),
             })
         })?),
     };
@@ -449,7 +450,7 @@ pub async fn context_create(
         other => Some(serde_json::to_string(other).map_err(|e| {
             NapiError::from(ScpNapiError::Validation {
                 message: format!("invalid consequenceConfig: {e}"),
-                code: "SCP-VALID-7000".to_owned(),
+                code: codes::VALID_7000.to_owned(),
             })
         })?),
     };
@@ -501,7 +502,7 @@ pub async fn context_create(
         scp_ffi_common::context_params::build_context_params(&common).map_err(|e| {
             NapiError::from(ScpNapiError::Validation {
                 message: e,
-                code: "SCP-VALID-7000".to_owned(),
+                code: codes::VALID_7000.to_owned(),
             })
         })?;
 
@@ -573,7 +574,7 @@ pub async fn context_join(
     if state_str != "active" {
         return Err(ScpNapiError::Context {
             message: format!("cannot join context in {state_str:?} state — context must be active"),
-            code: "SCP-CTX-2013".to_owned(),
+            code: codes::CTX_2013.to_owned(),
         }
         .into());
     }
@@ -587,7 +588,7 @@ pub async fn context_join(
             scp_core::crypto::ucan::validate::parse_ucan(jwt).map_err(|e| {
                 NapiError::from(ScpNapiError::Context {
                     message: format!("invalid spending UCAN: {e}"),
-                    code: "SCP-ECON-12061".to_owned(),
+                    code: codes::ECON_12061.to_owned(),
                 })
             })
         })
@@ -638,7 +639,7 @@ pub async fn context_leave(handle: &NapiContextHandle, identity_did: String) -> 
             message: format!(
                 "cannot leave context in {state_str:?} state — context must be active"
             ),
-            code: "SCP-CTX-2015".to_owned(),
+            code: codes::CTX_2015.to_owned(),
         }
         .into());
     }
@@ -683,7 +684,7 @@ pub async fn context_close(handle: &NapiContextHandle, identity_did: String) -> 
             message: format!(
                 "cannot close context in {state_str:?} state — context must be active"
             ),
-            code: "SCP-CTX-2017".to_owned(),
+            code: codes::CTX_2017.to_owned(),
         }
         .into());
     }
@@ -739,7 +740,7 @@ pub async fn context_send(
             message: format!(
                 "cannot send to context in {state_str:?} state — context must be active"
             ),
-            code: "SCP-CTX-2019".to_owned(),
+            code: codes::CTX_2019.to_owned(),
         }
         .into());
     }
@@ -775,7 +776,7 @@ pub async fn context_send(
             .map_err(|e| {
                 NapiError::from(ScpNapiError::Crypto {
                     message: format!("inner envelope signing failed: {e}"),
-                    code: "SCP-CRYPTO-4001".to_owned(),
+                    code: codes::CRYPTO_4001.to_owned(),
                 })
             })?;
     }
@@ -798,7 +799,7 @@ pub async fn context_send(
         .map_err(|e| {
             NapiError::from(ScpNapiError::Context {
                 message: format!("invalid spending UCAN: {e}"),
-                code: "SCP-ECON-12061".to_owned(),
+                code: codes::ECON_12061.to_owned(),
             })
         })?;
 
@@ -852,7 +853,7 @@ pub fn context_subscribe(
     {
         return Err(ScpNapiError::Context {
             message: "already subscribed — each context supports a single subscription".to_owned(),
-            code: "SCP-CTX-2022".to_owned(),
+            code: codes::CTX_2022.to_owned(),
         }
         .into());
     }
@@ -867,7 +868,7 @@ pub fn context_subscribe(
             message: format!(
                 "cannot subscribe to context in {state_str:?} state — context must be active"
             ),
-            code: "SCP-CTX-2021".to_owned(),
+            code: codes::CTX_2021.to_owned(),
         }
         .into());
     }
@@ -884,7 +885,7 @@ pub fn context_subscribe(
             .store(false, std::sync::atomic::Ordering::SeqCst);
         return Err(NapiError::from(ScpNapiError::Transport {
             message: "no relay connection — call transportConnect() before subscribing".to_owned(),
-            code: "SCP-TRANS-5010".to_owned(),
+            code: codes::TRANS_5010.to_owned(),
         }));
     };
 
@@ -903,7 +904,7 @@ pub fn context_subscribe(
                 .store(false, std::sync::atomic::Ordering::SeqCst);
             NapiError::from(ScpNapiError::Context {
                 message: "subscription cancel lock is poisoned".to_owned(),
-                code: "SCP-CTX-2012".to_owned(),
+                code: codes::CTX_2012.to_owned(),
             })
         })?;
         *guard = CancellationToken::new();
@@ -1499,7 +1500,7 @@ pub async fn broadcast_publish(
                 message: "broadcast publish requires key custody — create the identity with \
                           identityCreate(\"in_memory\")"
                     .to_owned(),
-                code: "SCP-PERM-3020".to_owned(),
+                code: codes::PERM_3020.to_owned(),
             })
         })?;
         let signing_key = handle.signing_key.ok_or_else(|| {
@@ -1507,7 +1508,7 @@ pub async fn broadcast_publish(
                 message: "broadcast publish requires a signing key — identity has no active \
                           signing key handle"
                     .to_owned(),
-                code: "SCP-PERM-3021".to_owned(),
+                code: codes::PERM_3021.to_owned(),
             })
         })?;
 
@@ -1524,7 +1525,7 @@ pub async fn broadcast_publish(
             message: "broadcast publish requires key custody — in_memory custody feature is \
                       not enabled"
                 .to_owned(),
-            code: "SCP-PERM-3022".to_owned(),
+            code: codes::PERM_3022.to_owned(),
         }));
     }
 
@@ -1609,20 +1610,20 @@ pub async fn broadcast_publish_asset(
     let content_path = scp_core::context::ContentPath::new(asset.path).map_err(|e| {
         NapiError::from(ScpNapiError::Context {
             message: format!("invalid path: {e}"),
-            code: "SCP-CTX-2040".to_owned(),
+            code: codes::CTX_2040.to_owned(),
         })
     })?;
     let mime_type = scp_core::context::MimeType::new(asset.content_type).map_err(|e| {
         NapiError::from(ScpNapiError::Context {
             message: format!("invalid content_type: {e}"),
-            code: "SCP-CTX-2041".to_owned(),
+            code: codes::CTX_2041.to_owned(),
         })
     })?;
     if let Some(ref did_str) = deploy_id {
         scp_core::context::validate_deploy_id(did_str).map_err(|e| {
             NapiError::from(ScpNapiError::Context {
                 message: format!("invalid deploy_id: {e}"),
-                code: "SCP-CTX-2042".to_owned(),
+                code: codes::CTX_2042.to_owned(),
             })
         })?;
     }
@@ -1655,7 +1656,7 @@ pub async fn broadcast_publish_asset(
                 message: "broadcast publish asset requires key custody — create the identity with \
                           identityCreate(\"in_memory\")"
                     .to_owned(),
-                code: "SCP-PERM-3020".to_owned(),
+                code: codes::PERM_3020.to_owned(),
             })
         })?;
         let signing_key = handle.signing_key.ok_or_else(|| {
@@ -1663,7 +1664,7 @@ pub async fn broadcast_publish_asset(
                 message: "broadcast publish asset requires a signing key — identity has no active \
                           signing key handle"
                     .to_owned(),
-                code: "SCP-PERM-3021".to_owned(),
+                code: codes::PERM_3021.to_owned(),
             })
         })?;
 
@@ -1681,7 +1682,7 @@ pub async fn broadcast_publish_asset(
         let envelope_bytes = rmp_serde::to_vec_named(&envelope).map_err(|e| {
             NapiError::from(ScpNapiError::Context {
                 message: format!("failed to serialize envelope for blob_id: {e}"),
-                code: "SCP-CTX-2043".to_owned(),
+                code: codes::CTX_2043.to_owned(),
             })
         })?;
         let blob_id = {
@@ -1703,7 +1704,7 @@ pub async fn broadcast_publish_asset(
             message: "broadcast publish asset requires key custody — in_memory custody feature is \
                       not enabled"
                 .to_owned(),
-            code: "SCP-PERM-3022".to_owned(),
+            code: codes::PERM_3022.to_owned(),
         }))
     }
 }
@@ -1732,7 +1733,7 @@ pub async fn broadcast_publish_assets(
                 "batch too large: {} assets (max {MAX_BATCH_ASSETS})",
                 assets.len()
             ),
-            code: "SCP-CTX-2074".to_owned(),
+            code: codes::CTX_2074.to_owned(),
         }));
     }
 
@@ -1758,7 +1759,7 @@ pub async fn broadcast_publish_assets(
     scp_core::context::validate_deploy_id(&deploy_id_val).map_err(|e| {
         NapiError::from(ScpNapiError::Context {
             message: format!("invalid deploy_id: {e}"),
-            code: "SCP-CTX-2042".to_owned(),
+            code: codes::CTX_2042.to_owned(),
         })
     })?;
 
@@ -1767,13 +1768,13 @@ pub async fn broadcast_publish_assets(
         let custody = handle.in_memory_custody.as_ref().ok_or_else(|| {
             NapiError::from(ScpNapiError::Permission {
                 message: "broadcast publish assets requires key custody".to_owned(),
-                code: "SCP-PERM-3020".to_owned(),
+                code: codes::PERM_3020.to_owned(),
             })
         })?;
         let signing_key = handle.signing_key.ok_or_else(|| {
             NapiError::from(ScpNapiError::Permission {
                 message: "broadcast publish assets requires a signing key".to_owned(),
-                code: "SCP-PERM-3021".to_owned(),
+                code: codes::PERM_3021.to_owned(),
             })
         })?;
 
@@ -1782,13 +1783,13 @@ pub async fn broadcast_publish_assets(
             let content_path = scp_core::context::ContentPath::new(asset.path).map_err(|e| {
                 NapiError::from(ScpNapiError::Context {
                     message: format!("invalid path: {e}"),
-                    code: "SCP-CTX-2040".to_owned(),
+                    code: codes::CTX_2040.to_owned(),
                 })
             })?;
             let mime_type = scp_core::context::MimeType::new(asset.content_type).map_err(|e| {
                 NapiError::from(ScpNapiError::Context {
                     message: format!("invalid content_type: {e}"),
-                    code: "SCP-CTX-2041".to_owned(),
+                    code: codes::CTX_2041.to_owned(),
                 })
             })?;
 
@@ -1819,7 +1820,7 @@ pub async fn broadcast_publish_assets(
             let envelope_bytes = rmp_serde::to_vec_named(&envelope).map_err(|e| {
                 NapiError::from(ScpNapiError::Context {
                     message: format!("failed to serialize envelope for blob_id: {e}"),
-                    code: "SCP-CTX-2043".to_owned(),
+                    code: codes::CTX_2043.to_owned(),
                 })
             })?;
             let blob_id = {
@@ -1846,7 +1847,7 @@ pub async fn broadcast_publish_assets(
             message: "broadcast publish assets requires key custody — in_memory custody feature \
                       is not enabled"
                 .to_owned(),
-            code: "SCP-PERM-3022".to_owned(),
+            code: codes::PERM_3022.to_owned(),
         }))
     }
 }
@@ -1980,7 +1981,7 @@ pub async fn context_execute_governance_action(
     let action: GovernanceAction = serde_json::from_str(&action_json).map_err(|e| {
         NapiError::from(ScpNapiError::Validation {
             message: format!("invalid governance action JSON: {e}"),
-            code: "SCP-VALID-7000".to_owned(),
+            code: codes::VALID_7000.to_owned(),
         })
     })?;
 
@@ -1989,7 +1990,7 @@ pub async fn context_execute_governance_action(
     scp_ffi_common::validate::validate_governance_action_strings(&action).map_err(|e| {
         NapiError::from(ScpNapiError::Validation {
             message: e.message,
-            code: "SCP-VALID-7000".to_owned(),
+            code: codes::VALID_7000.to_owned(),
         })
     })?;
 
@@ -2081,7 +2082,7 @@ async fn resolve_napi_signing_key(
             message: "no custody provider on context handle — governance lifecycle \
                       requires an identity created with custody"
                 .to_owned(),
-            code: "SCP-CTX-2040".to_owned(),
+            code: codes::CTX_2040.to_owned(),
         })
     })?;
     let key_handle = handle.signing_key.ok_or_else(|| {
@@ -2089,7 +2090,7 @@ async fn resolve_napi_signing_key(
             message: "no signing key on context handle — governance lifecycle \
                       requires an identity with an active signing key"
                 .to_owned(),
-            code: "SCP-CTX-2040".to_owned(),
+            code: codes::CTX_2040.to_owned(),
         })
     })?;
     custody
@@ -2099,7 +2100,7 @@ async fn resolve_napi_signing_key(
         .map_err(|e| {
             NapiError::from(ScpNapiError::Context {
                 message: format!("failed to export signing key for governance: {e}"),
-                code: "SCP-CTX-2040".to_owned(),
+                code: codes::CTX_2040.to_owned(),
             })
         })
 }
@@ -2109,13 +2110,13 @@ fn parse_napi_proposal_id(hex_str: &str) -> napi::Result<[u8; 32]> {
     let bytes = hex::decode(hex_str).map_err(|e| {
         NapiError::from(ScpNapiError::Validation {
             message: format!("invalid proposal ID hex: {e}"),
-            code: "SCP-CTX-2040".to_owned(),
+            code: codes::CTX_2040.to_owned(),
         })
     })?;
     let arr: [u8; 32] = bytes.try_into().map_err(|v: Vec<u8>| {
         NapiError::from(ScpNapiError::Validation {
             message: format!("proposal ID must be 32 bytes, got {}", v.len()),
-            code: "SCP-CTX-2040".to_owned(),
+            code: codes::CTX_2040.to_owned(),
         })
     })?;
     Ok(arr)
@@ -2152,7 +2153,7 @@ pub async fn context_governance_propose(
     let action: GovernanceAction = serde_json::from_str(&action_json).map_err(|e| {
         NapiError::from(ScpNapiError::Validation {
             message: format!("invalid governance action JSON: {e}"),
-            code: "SCP-CTX-2040".to_owned(),
+            code: codes::CTX_2040.to_owned(),
         })
     })?;
 
@@ -2161,7 +2162,7 @@ pub async fn context_governance_propose(
     scp_ffi_common::validate::validate_governance_action_strings(&action).map_err(|e| {
         NapiError::from(ScpNapiError::Validation {
             message: e.message,
-            code: "SCP-CTX-2040".to_owned(),
+            code: codes::CTX_2040.to_owned(),
         })
     })?;
 
@@ -2181,7 +2182,7 @@ pub async fn context_governance_propose(
             .map_err(|e| {
                 NapiError::from(ScpNapiError::Context {
                     message: format!("governance proposal failed: {e}"),
-                    code: "SCP-CTX-2041".to_owned(),
+                    code: codes::CTX_2041.to_owned(),
                 })
             })?;
 
@@ -2211,7 +2212,7 @@ pub async fn context_governance_propose(
             message: "governance proposal requires key custody — in_memory custody feature \
                       is not enabled"
                 .to_owned(),
-            code: "SCP-CTX-2040".to_owned(),
+            code: codes::CTX_2040.to_owned(),
         }));
     }
 
@@ -2251,7 +2252,7 @@ pub async fn context_governance_approve(
             .map_err(|e| {
                 NapiError::from(ScpNapiError::Context {
                     message: format!("governance approval failed: {e}"),
-                    code: "SCP-CTX-2042".to_owned(),
+                    code: codes::CTX_2042.to_owned(),
                 })
             })?;
 
@@ -2273,7 +2274,7 @@ pub async fn context_governance_approve(
             message: "governance approval requires key custody — in_memory custody feature \
                       is not enabled"
                 .to_owned(),
-            code: "SCP-CTX-2040".to_owned(),
+            code: codes::CTX_2040.to_owned(),
         }));
     }
 
@@ -2312,7 +2313,7 @@ pub async fn context_governance_reject(
             .map_err(|e| {
                 NapiError::from(ScpNapiError::Context {
                     message: format!("governance rejection failed: {e}"),
-                    code: "SCP-CTX-2043".to_owned(),
+                    code: codes::CTX_2043.to_owned(),
                 })
             })?;
 
@@ -2334,7 +2335,7 @@ pub async fn context_governance_reject(
             message: "governance rejection requires key custody — in_memory custody feature \
                       is not enabled"
                 .to_owned(),
-            code: "SCP-CTX-2040".to_owned(),
+            code: codes::CTX_2040.to_owned(),
         }));
     }
 
@@ -2368,7 +2369,7 @@ pub async fn context_governance_withdraw(
         .map_err(|e| {
             NapiError::from(ScpNapiError::Context {
                 message: format!("governance vote withdrawal failed: {e}"),
-                code: "SCP-CTX-2044".to_owned(),
+                code: codes::CTX_2044.to_owned(),
             })
         })?;
 
@@ -2410,14 +2411,14 @@ pub async fn context_governance_get_proposal(
         .map_err(|e| {
             NapiError::from(ScpNapiError::Context {
                 message: format!("get proposal failed: {e}"),
-                code: "SCP-CTX-2045".to_owned(),
+                code: codes::CTX_2045.to_owned(),
             })
         })?;
 
     serde_json::to_string(&proposal).map_err(|e| {
         NapiError::from(ScpNapiError::Context {
             message: format!("serialization failed: {e}"),
-            code: "SCP-CTX-2045".to_owned(),
+            code: codes::CTX_2045.to_owned(),
         })
     })
 }
@@ -2438,14 +2439,14 @@ pub async fn context_governance_list_proposals(handle: &NapiContextHandle) -> na
     let proposals = manager.list_proposals(&context_id).await.map_err(|e| {
         NapiError::from(ScpNapiError::Context {
             message: format!("list proposals failed: {e}"),
-            code: "SCP-CTX-2046".to_owned(),
+            code: codes::CTX_2046.to_owned(),
         })
     })?;
 
     serde_json::to_string(&proposals).map_err(|e| {
         NapiError::from(ScpNapiError::Context {
             message: format!("serialization failed: {e}"),
-            code: "SCP-CTX-2046".to_owned(),
+            code: codes::CTX_2046.to_owned(),
         })
     })
 }
@@ -2478,7 +2479,7 @@ pub async fn context_apply_pending_ceiling_modification(
         .map_err(|e| {
             NapiError::from(ScpNapiError::Context {
                 message: format!("apply_pending_ceiling_modification failed: {e}"),
-                code: "SCP-CTX-2060".to_owned(),
+                code: codes::CTX_2060.to_owned(),
             })
         })
 }
@@ -2508,7 +2509,7 @@ pub async fn context_finalize_close(handle: &NapiContextHandle) -> napi::Result<
     manager.finalize_close(core_handle).await.map_err(|e| {
         NapiError::from(ScpNapiError::Context {
             message: format!("finalize_close failed: {e}"),
-            code: "SCP-CTX-2061".to_owned(),
+            code: codes::CTX_2061.to_owned(),
         })
     })?;
 
@@ -2561,7 +2562,7 @@ pub async fn context_create_governance_checkpoint(
     let creator_signature = hex::decode(&creator_signature_hex).map_err(|e| {
         NapiError::from(ScpNapiError::Validation {
             message: format!("invalid creator_signature hex: {e}"),
-            code: "SCP-CTX-2062".to_owned(),
+            code: codes::CTX_2062.to_owned(),
         })
     })?;
     let did = DID(creator_did);
@@ -2586,14 +2587,14 @@ pub async fn context_create_governance_checkpoint(
         .map_err(|e| {
             NapiError::from(ScpNapiError::Context {
                 message: format!("create_governance_checkpoint failed: {e}"),
-                code: "SCP-CTX-2062".to_owned(),
+                code: codes::CTX_2062.to_owned(),
             })
         })?;
 
     serde_json::to_string(&checkpoint).map_err(|e| {
         NapiError::from(ScpNapiError::Context {
             message: format!("serialization failed: {e}"),
-            code: "SCP-CTX-2062".to_owned(),
+            code: codes::CTX_2062.to_owned(),
         })
     })
 }
@@ -2618,14 +2619,14 @@ pub async fn context_add_checkpoint_cosignature(
         serde_json::from_str(&checkpoint_json).map_err(|e| {
             NapiError::from(ScpNapiError::Validation {
                 message: format!("invalid checkpoint JSON: {e}"),
-                code: "SCP-CTX-2063".to_owned(),
+                code: codes::CTX_2063.to_owned(),
             })
         })?;
 
     let signature = hex::decode(&signature_hex).map_err(|e| {
         NapiError::from(ScpNapiError::Validation {
             message: format!("invalid signature hex: {e}"),
-            code: "SCP-CTX-2063".to_owned(),
+            code: codes::CTX_2063.to_owned(),
         })
     })?;
 
@@ -2640,7 +2641,7 @@ pub async fn context_add_checkpoint_cosignature(
         .map_err(|e| {
             NapiError::from(ScpNapiError::Context {
                 message: format!("add_checkpoint_cosignature failed: {e}"),
-                code: "SCP-CTX-2063".to_owned(),
+                code: codes::CTX_2063.to_owned(),
             })
         })?;
 
@@ -2670,7 +2671,7 @@ pub async fn context_restore(context_id: String) -> napi::Result<()> {
             .map_err(|e| {
                 NapiError::from(ScpNapiError::Context {
                     message: format!("restore_context: failed to load persisted state: {e}"),
-                    code: "SCP-CTX-2064".to_owned(),
+                    code: codes::CTX_2064.to_owned(),
                 })
             })?;
 
@@ -2683,7 +2684,7 @@ pub async fn context_restore(context_id: String) -> napi::Result<()> {
         .map_err(|e| {
             NapiError::from(ScpNapiError::Context {
                 message: format!("restore_context failed: {e}"),
-                code: "SCP-CTX-2064".to_owned(),
+                code: codes::CTX_2064.to_owned(),
             })
         })
 }
@@ -2702,14 +2703,14 @@ pub async fn context_restore_all() -> napi::Result<String> {
     let restored = manager.restore_all_contexts().await.map_err(|e| {
         NapiError::from(ScpNapiError::Context {
             message: format!("restore_all_contexts failed: {e}"),
-            code: "SCP-CTX-2065".to_owned(),
+            code: codes::CTX_2065.to_owned(),
         })
     })?;
 
     serde_json::to_string(&restored).map_err(|e| {
         NapiError::from(ScpNapiError::Context {
             message: format!("serialization failed: {e}"),
-            code: "SCP-CTX-2065".to_owned(),
+            code: codes::CTX_2065.to_owned(),
         })
     })
 }
@@ -2719,13 +2720,13 @@ fn parse_napi_hex_32(hex_str: &str, field_name: &str) -> napi::Result<[u8; 32]> 
     let bytes = hex::decode(hex_str).map_err(|e| {
         NapiError::from(ScpNapiError::Validation {
             message: format!("invalid {field_name} hex: {e}"),
-            code: "SCP-CTX-2062".to_owned(),
+            code: codes::CTX_2062.to_owned(),
         })
     })?;
     let arr: [u8; 32] = bytes.try_into().map_err(|v: Vec<u8>| {
         NapiError::from(ScpNapiError::Validation {
             message: format!("{field_name} must be 32 bytes, got {}", v.len()),
-            code: "SCP-CTX-2062".to_owned(),
+            code: codes::CTX_2062.to_owned(),
         })
     })?;
     Ok(arr)
@@ -2754,7 +2755,7 @@ pub async fn context_tombstone_migrated(handle: &NapiContextHandle) -> napi::Res
         .map_err(|e| {
             NapiError::from(ScpNapiError::Context {
                 message: format!("tombstone_migrated_context failed: {e}"),
-                code: "SCP-CTX-2050".to_owned(),
+                code: codes::CTX_2050.to_owned(),
             })
         })?;
 
@@ -2885,7 +2886,7 @@ pub async fn context_export(handle: &NapiContextHandle) -> napi::Result<Vec<u8>>
     scp_core::context::export_import::serialize_export(&export).map_err(|e| {
         NapiError::from(ScpNapiError::Context {
             message: format!("export serialization failed: {e}"),
-            code: "SCP-CTX-2030".to_owned(),
+            code: codes::CTX_2030.to_owned(),
         })
     })
 }
@@ -2905,7 +2906,7 @@ pub async fn context_import(data: Vec<u8>) -> napi::Result<String> {
     let export = scp_core::context::export_import::deserialize_export(&data).map_err(|e| {
         NapiError::from(ScpNapiError::Context {
             message: format!("invalid export data: {e}"),
-            code: "SCP-CTX-2032".to_owned(),
+            code: codes::CTX_2032.to_owned(),
         })
     })?;
     let context_id = export.snapshot.context_id.clone();
@@ -2952,7 +2953,7 @@ pub fn context_set_economic_policy(
                   (propose SetEconomicPolicy action). Direct mutation is \
                   not permitted — see spec §19.3"
             .to_owned(),
-        code: "SCP-CTX-2013".to_owned(),
+        code: codes::CTX_2013.to_owned(),
     }))
 }
 
@@ -3102,13 +3103,13 @@ pub fn evaluate_invitation(
     validate_did(&inviter_did).map_err(|e| {
         napi::Error::from(ScpNapiError::Validation {
             message: e.message,
-            code: "SCP-VALID-7010".to_owned(),
+            code: codes::VALID_7010.to_owned(),
         })
     })?;
     validate_did(&identity_did).map_err(|e| {
         napi::Error::from(ScpNapiError::Validation {
             message: e.message,
-            code: "SCP-VALID-7010".to_owned(),
+            code: codes::VALID_7010.to_owned(),
         })
     })?;
 
@@ -3116,7 +3117,7 @@ pub fn evaluate_invitation(
         serde_json::from_str(&params_json).map_err(|e| {
             napi::Error::from(ScpNapiError::Validation {
                 message: format!("failed to parse context params JSON: {e}"),
-                code: "SCP-VALID-7010".to_owned(),
+                code: codes::VALID_7010.to_owned(),
             })
         })?;
 
@@ -3124,7 +3125,7 @@ pub fn evaluate_invitation(
         Some(ref json) => Some(serde_json::from_str(json).map_err(|e| {
             napi::Error::from(ScpNapiError::Validation {
                 message: format!("failed to parse auto-accept policy JSON: {e}"),
-                code: "SCP-VALID-7010".to_owned(),
+                code: codes::VALID_7010.to_owned(),
             })
         })?),
         None => None,
@@ -3134,7 +3135,7 @@ pub fn evaluate_invitation(
         Some(ref json) => Some(serde_json::from_str(json).map_err(|e| {
             napi::Error::from(ScpNapiError::Validation {
                 message: format!("failed to parse spending context JSON: {e}"),
-                code: "SCP-VALID-7010".to_owned(),
+                code: codes::VALID_7010.to_owned(),
             })
         })?),
         None => None,
@@ -3145,7 +3146,7 @@ pub fn evaluate_invitation(
             let did_strings: Vec<String> = serde_json::from_str(json).map_err(|e| {
                 napi::Error::from(ScpNapiError::Validation {
                     message: format!("failed to parse trusted DIDs JSON: {e}"),
-                    code: "SCP-VALID-7010".to_owned(),
+                    code: codes::VALID_7010.to_owned(),
                 })
             })?;
             did_strings
@@ -3180,7 +3181,7 @@ pub fn evaluate_invitation(
         }),
         Err(e) => Err(napi::Error::from(ScpNapiError::Context {
             message: format!("invitation evaluation failed: {e}"),
-            code: "SCP-CTX-2060".to_owned(),
+            code: codes::CTX_2060.to_owned(),
         })),
     }
 }
@@ -3210,27 +3211,27 @@ pub fn metadata_record_to_json(
     validate_context_id(&context_id).map_err(|e| {
         NapiError::from(ScpNapiError::Validation {
             message: e.to_string(),
-            code: "SCP-VALID-7001".to_owned(),
+            code: codes::VALID_7001.to_owned(),
         })
     })?;
     validate_did(&signer_did).map_err(|e| {
         NapiError::from(ScpNapiError::Validation {
             message: e.to_string(),
-            code: "SCP-VALID-7001".to_owned(),
+            code: codes::VALID_7001.to_owned(),
         })
     })?;
 
     if sequence == 0 {
         return Err(NapiError::from(ScpNapiError::Validation {
             message: "MetadataRecord sequence must start at 1 (per spec §5.7.2)".to_owned(),
-            code: "SCP-VALID-7001".to_owned(),
+            code: codes::VALID_7001.to_owned(),
         }));
     }
 
     let structural: StructuralMetadata = serde_json::from_str(&structural_json).map_err(|e| {
         NapiError::from(ScpNapiError::Validation {
             message: format!("invalid structural metadata JSON: {e}"),
-            code: "SCP-VALID-7001".to_owned(),
+            code: codes::VALID_7001.to_owned(),
         })
     })?;
 
@@ -3238,20 +3239,20 @@ pub fn metadata_record_to_json(
         serde_json::from_str(&operational_json).map_err(|e| {
             NapiError::from(ScpNapiError::Validation {
                 message: format!("invalid operational metadata JSON: {e}"),
-                code: "SCP-VALID-7001".to_owned(),
+                code: codes::VALID_7001.to_owned(),
             })
         })?;
 
     let signature = hex::decode(&signature_hex).map_err(|e| {
         NapiError::from(ScpNapiError::Validation {
             message: format!("invalid signature hex: {e}"),
-            code: "SCP-VALID-7001".to_owned(),
+            code: codes::VALID_7001.to_owned(),
         })
     })?;
     if signature.len() != 64 {
         return Err(NapiError::from(ScpNapiError::Validation {
             message: format!("signature must be 64 bytes (got {})", signature.len()),
-            code: "SCP-VALID-7001".to_owned(),
+            code: codes::VALID_7001.to_owned(),
         }));
     }
 
@@ -3270,7 +3271,7 @@ pub fn metadata_record_to_json(
     serde_json::to_string(&record).map_err(|e| {
         NapiError::from(ScpNapiError::Validation {
             message: format!("failed to serialize MetadataRecord: {e}"),
-            code: "SCP-VALID-7001".to_owned(),
+            code: codes::VALID_7001.to_owned(),
         })
     })
 }
@@ -3285,7 +3286,7 @@ pub fn metadata_record_from_json(json_str: String) -> napi::Result<String> {
     let record: MetadataRecord = serde_json::from_str(&json_str).map_err(|e| {
         NapiError::from(ScpNapiError::Validation {
             message: format!("invalid MetadataRecord JSON: {e}"),
-            code: "SCP-VALID-7001".to_owned(),
+            code: codes::VALID_7001.to_owned(),
         })
     })?;
 
@@ -3293,7 +3294,7 @@ pub fn metadata_record_from_json(json_str: String) -> napi::Result<String> {
     if record.sequence == 0 {
         return Err(NapiError::from(ScpNapiError::Validation {
             message: "MetadataRecord sequence must start at 1 (per spec §5.7.2)".to_owned(),
-            code: "SCP-VALID-7001".to_owned(),
+            code: codes::VALID_7001.to_owned(),
         }));
     }
 
@@ -3304,14 +3305,14 @@ pub fn metadata_record_from_json(json_str: String) -> napi::Result<String> {
                 "signature must be 64 bytes (got {})",
                 record.signature.len()
             ),
-            code: "SCP-VALID-7001".to_owned(),
+            code: codes::VALID_7001.to_owned(),
         }));
     }
 
     serde_json::to_string(&record).map_err(|e| {
         NapiError::from(ScpNapiError::Validation {
             message: format!("failed to re-serialize MetadataRecord: {e}"),
-            code: "SCP-VALID-7001".to_owned(),
+            code: codes::VALID_7001.to_owned(),
         })
     })
 }
@@ -3330,7 +3331,7 @@ pub fn template_get_params(template_id: String) -> napi::Result<String> {
     serde_json::to_string(&params).map_err(|e| {
         NapiError::from(ScpNapiError::Validation {
             message: format!("failed to serialize template params: {e}"),
-            code: "SCP-VALID-7001".to_owned(),
+            code: codes::VALID_7001.to_owned(),
         })
     })
 }
@@ -3346,7 +3347,7 @@ pub fn validate_against_template(params_json: String) -> napi::Result<Option<Str
         serde_json::from_str(&params_json).map_err(|e| {
             NapiError::from(ScpNapiError::Validation {
                 message: format!("invalid ContextParams JSON: {e}"),
-                code: "SCP-VALID-7001".to_owned(),
+                code: codes::VALID_7001.to_owned(),
             })
         })?;
 
@@ -3367,7 +3368,7 @@ pub fn validate_context_params(params_json: String) -> napi::Result<Option<Strin
         serde_json::from_str(&params_json).map_err(|e| {
             NapiError::from(ScpNapiError::Validation {
                 message: format!("invalid ContextParams JSON: {e}"),
-                code: "SCP-VALID-7001".to_owned(),
+                code: codes::VALID_7001.to_owned(),
             })
         })?;
 
@@ -3407,7 +3408,7 @@ fn parse_template_id_napi(
                  HandleRegistry, scp:template/handle-registry, DiscoveryContext, \
                  scp:template/discovery-context"
             ),
-            code: "SCP-VALID-7001".to_owned(),
+            code: codes::VALID_7001.to_owned(),
         })),
     }
 }
@@ -3424,6 +3425,7 @@ mod tests {
     use scp_core::context::governance::GovernanceAction;
     use scp_core::context::membership::KeyPackage;
     use scp_core::context::params::Capability;
+    use scp_ffi_common::error_codes as codes;
     use scp_identity::DID;
 
     use scp_ffi_common::test_helpers::approved_proposal;
@@ -3966,7 +3968,7 @@ mod tests {
         let err = result.unwrap_err();
         let msg = err.to_string();
         assert!(
-            msg.contains("SCP-ECON-12061") || msg.contains("invalid spending UCAN"),
+            msg.contains(codes::ECON_12061) || msg.contains("invalid spending UCAN"),
             "error should mention SCP-ECON-12061 or invalid spending UCAN, got: {msg}"
         );
     }
@@ -4002,7 +4004,7 @@ mod tests {
         if let Err(e) = &result {
             let msg = e.to_string();
             assert!(
-                !msg.contains("SCP-ECON-12061") && !msg.contains("invalid spending UCAN"),
+                !msg.contains(codes::ECON_12061) && !msg.contains("invalid spending UCAN"),
                 "None spending_ucan_jwt must not trigger UCAN parse errors, got: {msg}"
             );
         }

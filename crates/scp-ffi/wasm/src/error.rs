@@ -35,6 +35,7 @@
 //!
 //! See ADR-022 and `.docs/standards/sdk-common.md` for the full spec.
 
+use scp_ffi_common::error_codes as codes;
 use wasm_bindgen::{JsError, JsValue};
 
 // ---------------------------------------------------------------------------
@@ -144,7 +145,7 @@ impl ScpWasmError {
     pub fn validation(message: &str) -> JsValue {
         let err = Self::Validation {
             message: message.to_owned(),
-            code: "SCP-VALID-7000".to_owned(),
+            code: codes::VALID_7000.to_owned(),
         };
         JsValue::from_str(&err.to_string())
     }
@@ -158,7 +159,7 @@ impl From<scp_ffi_common::validate::ValidationError> for ScpWasmError {
     fn from(e: scp_ffi_common::validate::ValidationError) -> Self {
         Self::Validation {
             message: e.message,
-            code: "SCP-VALID-7000".to_owned(),
+            code: codes::VALID_7000.to_owned(),
         }
     }
 }
@@ -167,7 +168,7 @@ impl From<serde_json::Error> for ScpWasmError {
     fn from(e: serde_json::Error) -> Self {
         Self::Validation {
             message: format!("JSON serialization/deserialization failed: {e} — check input format"),
-            code: "SCP-VALID-7006".to_owned(),
+            code: codes::VALID_7006.to_owned(),
         }
     }
 }

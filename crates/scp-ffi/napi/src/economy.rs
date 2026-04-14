@@ -18,6 +18,7 @@
 //! See spec section 19 (Economic Governance) and ADR-033.
 
 use napi_derive::napi;
+use scp_ffi_common::error_codes as codes;
 
 use crate::error::ScpNapiError;
 
@@ -28,7 +29,7 @@ use crate::error::ScpNapiError;
 fn validation_error(msg: &str) -> napi::Error {
     napi::Error::from(ScpNapiError::Validation {
         message: msg.to_owned(),
-        code: "SCP-VALID-7050".to_owned(),
+        code: codes::VALID_7050.to_owned(),
     })
 }
 

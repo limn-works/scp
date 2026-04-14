@@ -13,6 +13,7 @@
 //! Gated behind the `server` feature on `scp-ffi-common`. Not available for
 //! WASM (ADR-034).
 
+use scp_ffi_common::error_codes as codes;
 use std::sync::Arc;
 
 use zeroize::Zeroizing;
@@ -37,20 +38,20 @@ impl From<ServerError> for ScpError {
         match e {
             ServerError::Relay(_) => Self::Transport {
                 msg: user_msg,
-                code: "SCP-TRANS-5050".to_owned(),
+                code: codes::TRANS_5050.to_owned(),
             },
             ServerError::Node(inner) => Self::from(inner),
             ServerError::Storage(_) => Self::Context {
                 msg: user_msg,
-                code: "SCP-CTX-2051".to_owned(),
+                code: codes::CTX_2051.to_owned(),
             },
             ServerError::Platform(_) => Self::Context {
                 msg: user_msg,
-                code: "SCP-CTX-2053".to_owned(),
+                code: codes::CTX_2053.to_owned(),
             },
             ServerError::Io(_) => Self::Context {
                 msg: user_msg,
-                code: "SCP-CTX-2052".to_owned(),
+                code: codes::CTX_2052.to_owned(),
             },
         }
     }
@@ -62,23 +63,23 @@ impl From<NodeError> for ScpError {
         match e {
             NodeError::MissingField(_) | NodeError::InvalidConfig(_) => Self::Validation {
                 msg: "node configuration error".to_owned(),
-                code: "SCP-TRANS-5050".to_owned(),
+                code: codes::TRANS_5050.to_owned(),
             },
             NodeError::Identity(_) => Self::Identity {
                 msg: "node identity operation failed".to_owned(),
-                code: "SCP-TRANS-5051".to_owned(),
+                code: codes::TRANS_5051.to_owned(),
             },
             NodeError::Relay(_) => Self::Transport {
                 msg: "node relay error".to_owned(),
-                code: "SCP-TRANS-5052".to_owned(),
+                code: codes::TRANS_5052.to_owned(),
             },
             NodeError::Storage(_) => Self::Context {
                 msg: "node storage error".to_owned(),
-                code: "SCP-TRANS-5053".to_owned(),
+                code: codes::TRANS_5053.to_owned(),
             },
             NodeError::Serve(_) | NodeError::Nat(_) | NodeError::Tls(_) => Self::Transport {
                 msg: "node network error".to_owned(),
-                code: "SCP-TRANS-5054".to_owned(),
+                code: codes::TRANS_5054.to_owned(),
             },
         }
     }
@@ -278,7 +279,7 @@ impl NodeHandle {
                     let key_vec = Zeroizing::new(hex::decode(&*key_hex).map_err(|e| {
                         ScpError::Validation {
                             msg: format!("invalid broadcast_key_hex: {e}"),
-                            code: "SCP-TRANS-5060".to_owned(),
+                            code: codes::TRANS_5060.to_owned(),
                         }
                     })?);
                     let key_bytes: Zeroizing<[u8; 32]> =
@@ -287,7 +288,7 @@ impl NodeHandle {
                                 msg:
                                     "broadcast_key_hex must be exactly 64 hex characters (32 bytes)"
                                         .to_owned(),
-                                code: "SCP-TRANS-5060".to_owned(),
+                                code: codes::TRANS_5060.to_owned(),
                             }
                         })?);
                     // Explicit key path always uses epoch 0. For rotated keys, use auto-resolve (omit both params).
@@ -309,7 +310,7 @@ impl NodeHandle {
                             msg:
                                 "broadcast key auto-resolve failed: not authorized for this context"
                                     .to_owned(),
-                            code: "SCP-CTX-2060".to_owned(),
+                            code: codes::CTX_2060.to_owned(),
                         }
                         })?;
                     (key_bytes, epoch, did)
@@ -319,7 +320,7 @@ impl NodeHandle {
                         msg: "broadcast_key_hex requires author_did — provide the DID of the \
                          broadcast key owner, or omit both for auto-resolve"
                             .to_owned(),
-                        code: "SCP-TRANS-5060".to_owned(),
+                        code: codes::TRANS_5060.to_owned(),
                     });
                 }
             };
@@ -336,7 +337,7 @@ impl NodeHandle {
             other => {
                 return Err(ScpError::Validation {
                     msg: format!("admission must be \"open\" or \"gated\", got \"{other}\""),
-                    code: "SCP-TRANS-5061".to_owned(),
+                    code: codes::TRANS_5061.to_owned(),
                 });
             }
         };
@@ -345,7 +346,7 @@ impl NodeHandle {
         let content_path = scp_core::context::broadcast_content::ContentPath::new(idx_path_str)
             .map_err(|e| ScpError::Validation {
                 msg: format!("invalid index_path: {e}"),
-                code: "SCP-TRANS-5062".to_owned(),
+                code: codes::TRANS_5062.to_owned(),
             })?;
 
         let site_config = scp_node::projection::SiteConfig {
@@ -385,7 +386,7 @@ impl NodeHandle {
             .map_err(ScpError::from)?;
         u32::try_from(count).map_err(|_| ScpError::Validation {
             msg: format!("asset count {count} exceeds u32::MAX"),
-            code: "SCP-TRANS-5063".to_owned(),
+            code: codes::TRANS_5063.to_owned(),
         })
     }
 
@@ -433,7 +434,7 @@ impl NodeHandle {
                     };
                     ScpError::Validation {
                         msg: format!("invalid bind_addr: {display}"),
-                        code: "SCP-TRANS-5070".to_owned(),
+                        code: codes::TRANS_5070.to_owned(),
                     }
                 })
             })
@@ -522,14 +523,14 @@ fn build_node_identity_from_uniffi(id: &Identity) -> Result<server::NodeIdentity
               via identity_create (not identity_load with external custody) can \
               be used for node startup"
             .to_owned(),
-        code: "SCP-IDENT-1010".to_owned(),
+        code: codes::IDENT_1010.to_owned(),
     })?;
 
     let document = id.core_document.clone().ok_or_else(|| ScpError::Identity {
         msg: "identity does not contain a DID document — identity may have been \
               loaded without document resolution"
             .to_owned(),
-        code: "SCP-IDENT-1011".to_owned(),
+        code: codes::IDENT_1011.to_owned(),
     })?;
 
     let custody = id
@@ -539,7 +540,7 @@ fn build_node_identity_from_uniffi(id: &Identity) -> Result<server::NodeIdentity
             msg: "identity does not have in-memory custody — only in-memory custody \
               identities can be used for node startup in this build"
                 .to_owned(),
-            code: "SCP-IDENT-1012".to_owned(),
+            code: codes::IDENT_1012.to_owned(),
         })?;
 
     // Hand-rolled sign_fn because `OpaqueInMemoryKeyCustody` does not
@@ -590,7 +591,7 @@ fn build_node_identity_from_uniffi(_id: &Identity) -> Result<server::NodeIdentit
               feature — production mobile builds should use platform custody \
               with identity_with_storage on ApplicationNodeBuilder directly"
             .to_owned(),
-        code: "SCP-IDENT-1013".to_owned(),
+        code: codes::IDENT_1013.to_owned(),
     })
 }
 
@@ -688,6 +689,7 @@ pub async fn node_start_local(
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
     use super::*;
+    use scp_ffi_common::error_codes as codes;
 
     fn rt() -> &'static tokio::runtime::Runtime {
         crate::runtime()
@@ -893,7 +895,7 @@ mod tests {
                     "internal path leaked in msg: {msg}"
                 );
                 assert_eq!(msg, "node configuration error");
-                assert_eq!(code, "SCP-TRANS-5050");
+                assert_eq!(code, codes::TRANS_5050);
             }
             other => panic!("expected Validation, got: {other:?}"),
         }

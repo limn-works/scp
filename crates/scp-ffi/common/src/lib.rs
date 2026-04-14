@@ -16,6 +16,7 @@
 //!
 //! See §3.10.10, §9.5, §7.4.1, §22.3.1, §22.4, §22.8 in `.docs/specs/`.
 
+pub mod error_codes;
 pub mod validate;
 
 mod bridge_id;

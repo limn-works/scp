@@ -11,6 +11,7 @@
 //!
 //! See ADR-029 in `.docs/adrs/phase-6.md`.
 
+use scp_ffi_common::error_codes as codes;
 use scp_protocol::sync::{OfflineTier, SyncPolicy};
 use wasm_bindgen::prelude::*;
 
@@ -30,7 +31,7 @@ fn validate_non_negative_timestamp(value: f64, name: &str) -> Result<u64, ScpWas
     if value < 0.0 || !value.is_finite() {
         return Err(ScpWasmError::Validation {
             message: format!("{name} must be non-negative, got {value}"),
-            code: "SCP-VALID-7040".to_owned(),
+            code: codes::VALID_7040.to_owned(),
         });
     }
     #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
@@ -175,6 +176,7 @@ pub fn sync_classify_offline_custom(
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+    use scp_ffi_common::error_codes as codes;
 
     // -----------------------------------------------------------------------
     // classify (pure logic — no wasm-bindgen dependency)
@@ -342,7 +344,7 @@ mod tests {
         let err = result.unwrap_err();
         let msg = format!("{err}");
         assert!(
-            msg.contains("SCP-VALID-7040"),
+            msg.contains(codes::VALID_7040),
             "error should contain SCP-VALID-7040, got: {msg}"
         );
     }

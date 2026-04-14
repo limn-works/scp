@@ -17,6 +17,7 @@
 //!
 //! See spec section 12 (Bridge System) and ADR-023.
 
+use scp_ffi_common::error_codes as codes;
 use wasm_bindgen::prelude::*;
 
 use crate::error::ScpWasmError;
@@ -161,7 +162,7 @@ fn parse_bridge_mode(s: &str) -> Result<BridgeMode, ScpWasmError> {
             message: format!(
                 "invalid bridge mode '{other}': expected 'relay', 'puppet', 'api', or 'cooperative'"
             ),
-            code: "SCP-VALID-7050".to_owned(),
+            code: codes::VALID_7050.to_owned(),
         }),
     }
 }
@@ -183,7 +184,7 @@ fn parse_shadow_status(s: &str) -> Result<ShadowProvenanceStatus, ScpWasmError> 
         "claimed" => Ok(ShadowProvenanceStatus::Claimed),
         other => Err(ScpWasmError::Validation {
             message: format!("invalid shadow_status '{other}': expected 'shadow' or 'claimed'"),
-            code: "SCP-VALID-7051".to_owned(),
+            code: codes::VALID_7051.to_owned(),
         }),
     }
 }
@@ -317,7 +318,7 @@ pub fn bridge_register(
     if context_id.is_empty() {
         return Err(ScpWasmError::Validation {
             message: "context_id must not be empty".to_owned(),
-            code: "SCP-VALID-7063".to_owned(),
+            code: codes::VALID_7063.to_owned(),
         }
         .into_js());
     }
@@ -330,7 +331,7 @@ pub fn bridge_register(
     if platform.is_empty() {
         return Err(ScpWasmError::Validation {
             message: "platform must not be empty".to_owned(),
-            code: "SCP-VALID-7064".to_owned(),
+            code: codes::VALID_7064.to_owned(),
         }
         .into_js());
     }
@@ -340,7 +341,7 @@ pub fn bridge_register(
     if governance_did == operator_did {
         return Err(ScpWasmError::Context {
             message: "approver cannot be the same DID as the operator (self-approval is forbidden per ADR-023)".to_owned(),
-            code: "SCP-CTX-2101".to_owned(),
+            code: codes::CTX_2101.to_owned(),
         }
         .into_js());
     }
@@ -363,7 +364,7 @@ pub fn bridge_register(
                 .map_err(|_| {
                     ScpWasmError::Context {
                         message: "system clock is unavailable or before Unix epoch".to_owned(),
-                        code: "SCP-CTX-2101".to_owned(),
+                        code: codes::CTX_2101.to_owned(),
                     }
                     .into_js()
                 })?
@@ -429,14 +430,14 @@ pub fn bridge_create_shadow(
     if bridge_id.is_empty() {
         return Err(ScpWasmError::Validation {
             message: "bridge_id must not be empty".to_owned(),
-            code: "SCP-VALID-7065".to_owned(),
+            code: codes::VALID_7065.to_owned(),
         }
         .into_js());
     }
     if platform_handle.is_empty() {
         return Err(ScpWasmError::Validation {
             message: "platform_handle must not be empty".to_owned(),
-            code: "SCP-VALID-7066".to_owned(),
+            code: codes::VALID_7066.to_owned(),
         }
         .into_js());
     }

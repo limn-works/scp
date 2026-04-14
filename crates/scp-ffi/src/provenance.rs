@@ -19,6 +19,7 @@
 
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
+use scp_ffi_common::error_codes as codes;
 use sha2::{Digest, Sha256};
 use zeroize::Zeroizing;
 
@@ -144,7 +145,7 @@ pub fn py_provenance_attach<'py>(
     // Compute provenance hash: SHA-256 of JSON-serialized provenance record.
     let prov_json_bytes = serde_json::to_vec(&prov).map_err(|e| ScpPyError::ValidationError {
         message: format!("failed to serialize provenance for hashing: {e}"),
-        code: "SCP-VALID-7053".to_string(),
+        code: codes::VALID_7053.to_string(),
     })?;
     let prov_hash: [u8; 32] = Sha256::digest(&prov_json_bytes).into();
 
@@ -222,7 +223,7 @@ pub fn py_provenance_redact_counterparties(provenance_json: &str) -> PyResult<St
     let mut prov: DataProvenance =
         serde_json::from_str(provenance_json).map_err(|e| ScpPyError::ValidationError {
             message: format!("invalid provenance JSON: {e}"),
-            code: "SCP-VALID-7050".to_string(),
+            code: codes::VALID_7050.to_string(),
         })?;
 
     redact_counterparties(&mut prov);
@@ -230,7 +231,7 @@ pub fn py_provenance_redact_counterparties(provenance_json: &str) -> PyResult<St
     serde_json::to_string(&prov).map_err(|e| {
         ScpPyError::ValidationError {
             message: format!("failed to serialize provenance: {e}"),
-            code: "SCP-VALID-7051".to_string(),
+            code: codes::VALID_7051.to_string(),
         }
         .into()
     })
@@ -257,13 +258,13 @@ pub fn py_provenance_pseudonymize_counterparties(
     let mut prov: DataProvenance =
         serde_json::from_str(provenance_json).map_err(|e| ScpPyError::ValidationError {
             message: format!("invalid provenance JSON: {e}"),
-            code: "SCP-VALID-7050".to_string(),
+            code: codes::VALID_7050.to_string(),
         })?;
 
     let key = Zeroizing::new(hex::decode(pseudonym_key_hex).map_err(|e| {
         ScpPyError::ValidationError {
             message: format!("invalid pseudonym_key_hex: {e}"),
-            code: "SCP-VALID-7052".to_string(),
+            code: codes::VALID_7052.to_string(),
         }
     })?);
 
@@ -272,7 +273,7 @@ pub fn py_provenance_pseudonymize_counterparties(
     serde_json::to_string(&prov).map_err(|e| {
         ScpPyError::ValidationError {
             message: format!("failed to serialize provenance: {e}"),
-            code: "SCP-VALID-7051".to_string(),
+            code: codes::VALID_7051.to_string(),
         }
         .into()
     })
@@ -299,7 +300,7 @@ pub fn py_provenance_update_source_type(
     let mut prov: DataProvenance =
         serde_json::from_str(provenance_json).map_err(|e| ScpPyError::ValidationError {
             message: format!("invalid provenance JSON: {e}"),
-            code: "SCP-VALID-7050".to_string(),
+            code: codes::VALID_7050.to_string(),
         })?;
 
     let state = parse_context_state(new_state)?;
@@ -309,7 +310,7 @@ pub fn py_provenance_update_source_type(
     serde_json::to_string(&prov).map_err(|e| {
         ScpPyError::ValidationError {
             message: format!("failed to serialize provenance: {e}"),
-            code: "SCP-VALID-7051".to_string(),
+            code: codes::VALID_7051.to_string(),
         }
         .into()
     })
@@ -372,7 +373,7 @@ fn parse_memory_scope(s: &str) -> PyResult<MemoryScope> {
             message: format!(
                 "invalid memory_scope '{other}': expected 'full', 'summary', or 'ephemeral'"
             ),
-            code: "SCP-PERM-3010".to_string(),
+            code: codes::PERM_3010.to_string(),
         }
         .into()),
     }
@@ -406,7 +407,7 @@ fn parse_source_type(s: &str) -> PyResult<SourceType> {
             message: format!(
                 "invalid source_type '{other}': expected 'persistent', 'ephemeral', or 'summary'"
             ),
-            code: "SCP-PERM-3011".to_string(),
+            code: codes::PERM_3011.to_string(),
         }
         .into()),
     }
@@ -428,7 +429,7 @@ fn parse_context_state(s: &str) -> PyResult<SourceContextState> {
                 "invalid context_state '{other}': expected 'active', 'closed_with_summary_verified', \
                  'closed_with_summary_unverified', 'closed_ephemeral', or 'unknown'"
             ),
-            code: "SCP-PERM-3012".to_string(),
+            code: codes::PERM_3012.to_string(),
         }
         .into()),
     }

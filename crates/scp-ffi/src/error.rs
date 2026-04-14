@@ -26,6 +26,7 @@
 //! See ADR-013 in `.docs/adrs/phase-3.md` for the full specification.
 
 use pyo3::prelude::*;
+use scp_ffi_common::error_codes as codes;
 
 // ---------------------------------------------------------------------------
 // Python exception class hierarchy
@@ -180,7 +181,7 @@ impl ScpPyError {
     pub fn identity(msg: impl Into<String>) -> Self {
         Self::IdentityError {
             message: msg.into(),
-            code: "SCP-IDENT-1001".to_owned(),
+            code: codes::IDENT_1001.to_owned(),
         }
     }
 
@@ -188,7 +189,7 @@ impl ScpPyError {
     pub fn context(msg: impl Into<String>) -> Self {
         Self::ContextError {
             message: msg.into(),
-            code: "SCP-CTX-2001".to_owned(),
+            code: codes::CTX_2001.to_owned(),
         }
     }
 
@@ -196,7 +197,7 @@ impl ScpPyError {
     pub fn crypto(msg: impl Into<String>) -> Self {
         Self::CryptoError {
             message: msg.into(),
-            code: "SCP-CRYPTO-4001".to_owned(),
+            code: codes::CRYPTO_4001.to_owned(),
         }
     }
 
@@ -204,7 +205,7 @@ impl ScpPyError {
     pub fn transport(msg: impl Into<String>) -> Self {
         Self::TransportError {
             message: msg.into(),
-            code: "SCP-TRANS-5001".to_owned(),
+            code: codes::TRANS_5001.to_owned(),
         }
     }
 
@@ -212,7 +213,7 @@ impl ScpPyError {
     pub fn ucan(msg: impl Into<String>) -> Self {
         Self::UcanError {
             message: msg.into(),
-            code: "SCP-PERM-3001".to_owned(),
+            code: codes::PERM_3001.to_owned(),
         }
     }
 
@@ -220,7 +221,7 @@ impl ScpPyError {
     pub fn validation(msg: impl Into<String>) -> Self {
         Self::ValidationError {
             message: msg.into(),
-            code: "SCP-VALID-7001".to_owned(),
+            code: codes::VALID_7001.to_owned(),
         }
     }
 }
@@ -257,7 +258,7 @@ impl From<scp_identity::IdentityError> for ScpPyError {
             message: format!(
                 "{e} — check DID format, key custody configuration, or DHT connectivity"
             ),
-            code: "SCP-IDENT-1001".to_owned(),
+            code: codes::IDENT_1001.to_owned(),
         }
     }
 }
@@ -312,17 +313,17 @@ impl From<scp_core::context::ContextError> for ScpPyError {
             // inside the message body.
             CE::RateLimited { .. } => Self::ContextError {
                 message: format!("{e}"),
-                code: "SCP-ECON-12090".to_owned(),
+                code: codes::ECON_12090.to_owned(),
             },
             // §23.17: snapshot import regression rejection.
             CE::SnapshotFloorRegression { .. } => Self::ContextError {
                 message: format!("{e}"),
-                code: "SCP-CTX-2091".to_owned(),
+                code: codes::CTX_2091.to_owned(),
             },
             // C3: snapshot import structural/semantic rejection.
             CE::ImportRejected { .. } => Self::ContextError {
                 message: format!("{e}"),
-                code: "SCP-CTX-2092".to_owned(),
+                code: codes::CTX_2092.to_owned(),
             },
             // `PermissionDenied(String)` is the catch-all the runtime
             // uses for tool-economy and tool-invocation failures
@@ -331,7 +332,7 @@ impl From<scp_core::context::ContextError> for ScpPyError {
             // (budget exceeded, spending UCAN missing, tool not active,
             // etc.) without string-matching the message body.
             CE::PermissionDenied(msg) => {
-                let code = extract_scp_code(msg).unwrap_or_else(|| "SCP-PERM-3001".to_owned());
+                let code = extract_scp_code(msg).unwrap_or_else(|| codes::PERM_3001.to_owned());
                 // Permission/UCAN-class codes raise UcanError; everything
                 // else (tool, economy, context) raises ContextError so
                 // existing call sites that catch ContextError keep
@@ -350,7 +351,7 @@ impl From<scp_core::context::ContextError> for ScpPyError {
             }
             _ => Self::ContextError {
                 message: format!("{e} — verify context state, membership, and permissions"),
-                code: "SCP-CTX-2001".to_owned(),
+                code: codes::CTX_2001.to_owned(),
             },
         }
     }
@@ -362,7 +363,7 @@ impl From<scp_core::context::builder::ContextCreationError> for ScpPyError {
             message: format!(
                 "context creation failed: {e} — check context parameters and identity"
             ),
-            code: "SCP-CTX-2002".to_owned(),
+            code: codes::CTX_2002.to_owned(),
         }
     }
 }
@@ -373,7 +374,7 @@ impl From<scp_core::context::templates::TemplateError> for ScpPyError {
             message: format!(
                 "template validation failed: {e} — ensure context params match the template definition"
             ),
-            code: "SCP-CTX-2003".to_owned(),
+            code: codes::CTX_2003.to_owned(),
         }
     }
 }
@@ -384,7 +385,7 @@ impl From<scp_core::context::roles::RoleError> for ScpPyError {
             message: format!(
                 "role operation failed: {e} — verify role definitions and member permissions"
             ),
-            code: "SCP-CTX-2004".to_owned(),
+            code: codes::CTX_2004.to_owned(),
         }
     }
 }
@@ -395,7 +396,7 @@ impl From<scp_core::context::ttl::TtlError> for ScpPyError {
             message: format!(
                 "TTL operation failed: {e} — check TTL configuration and context state"
             ),
-            code: "SCP-CTX-2005".to_owned(),
+            code: codes::CTX_2005.to_owned(),
         }
     }
 }
@@ -406,7 +407,7 @@ impl From<scp_core::context::promotion::PromotionError> for ScpPyError {
             message: format!(
                 "context promotion failed: {e} — verify eligibility and governance rules"
             ),
-            code: "SCP-CTX-2006".to_owned(),
+            code: codes::CTX_2006.to_owned(),
         }
     }
 }
@@ -419,7 +420,7 @@ impl From<scp_core::context::tools::ToolError> for ScpPyError {
             message: format!(
                 "tool operation failed: {e} — check tool registration, permissions, and input schema"
             ),
-            code: "SCP-TOOL-6001".to_owned(),
+            code: codes::TOOL_6001.to_owned(),
         }
     }
 }
@@ -430,7 +431,7 @@ impl From<scp_core::context::tools::invoke::InvocationError> for ScpPyError {
             message: format!(
                 "tool invocation failed: {e} — verify tool ID, input, and caller permissions"
             ),
-            code: "SCP-TOOL-6002".to_owned(),
+            code: codes::TOOL_6002.to_owned(),
         }
     }
 }
@@ -441,7 +442,7 @@ impl From<scp_core::context::tools::schema::SchemaValidationError> for ScpPyErro
             message: format!(
                 "schema validation failed: {e} — check input against the tool's JSON Schema"
             ),
-            code: "SCP-VALID-7001".to_owned(),
+            code: codes::VALID_7001.to_owned(),
         }
     }
 }
@@ -454,7 +455,7 @@ impl From<scp_core::crypto::mls::error::MlsError> for ScpPyError {
             message: format!(
                 "MLS operation failed: {e} — check group state and member key packages"
             ),
-            code: "SCP-CRYPTO-4001".to_owned(),
+            code: codes::CRYPTO_4001.to_owned(),
         }
     }
 }
@@ -465,7 +466,7 @@ impl From<scp_core::crypto::sender_keys::SenderKeyError> for ScpPyError {
             message: format!(
                 "sender key operation failed: {e} — verify key material and encryption parameters"
             ),
-            code: "SCP-CRYPTO-4002".to_owned(),
+            code: codes::CRYPTO_4002.to_owned(),
         }
     }
 }
@@ -478,7 +479,7 @@ impl From<scp_core::crypto::ucan::UcanError> for ScpPyError {
             message: format!(
                 "{e} — check token format, signatures, time bounds, and capability chain"
             ),
-            code: "SCP-PERM-3001".to_owned(),
+            code: codes::PERM_3001.to_owned(),
         }
     }
 }
@@ -491,7 +492,7 @@ impl From<scp_core::envelope::EnvelopeError> for ScpPyError {
             message: format!(
                 "envelope operation failed: {e} — check payload size, signing keys, and encryption state"
             ),
-            code: "SCP-CRYPTO-4003".to_owned(),
+            code: codes::CRYPTO_4003.to_owned(),
         }
     }
 }
@@ -504,7 +505,7 @@ impl From<scp_event_log::EventLogError> for ScpPyError {
             message: format!(
                 "event log operation failed: {e} — verify log integrity and sequence numbers"
             ),
-            code: "SCP-CTX-2007".to_owned(),
+            code: codes::CTX_2007.to_owned(),
         }
     }
 }
@@ -515,7 +516,7 @@ impl From<scp_core::provenance::ProvenanceError> for ScpPyError {
     fn from(e: scp_core::provenance::ProvenanceError) -> Self {
         Self::ValidationError {
             message: format!("provenance validation failed: {e} — check cross-context chain depth"),
-            code: "SCP-VALID-7002".to_owned(),
+            code: codes::VALID_7002.to_owned(),
         }
     }
 }
@@ -528,7 +529,7 @@ impl From<scp_core::trust::TrustError> for ScpPyError {
             message: format!(
                 "trust evaluation failed: {e} — check event log data and attestation validity"
             ),
-            code: "SCP-VALID-7003".to_owned(),
+            code: codes::VALID_7003.to_owned(),
         }
     }
 }
@@ -539,7 +540,7 @@ impl From<scp_core::uri::ScpUriError> for ScpPyError {
     fn from(e: scp_core::uri::ScpUriError) -> Self {
         Self::ValidationError {
             message: format!("invalid SCP URI: {e} — check URI format (scp://relay/context-id)"),
-            code: "SCP-VALID-7004".to_owned(),
+            code: codes::VALID_7004.to_owned(),
         }
     }
 }
@@ -550,7 +551,7 @@ impl From<scp_core::well_known::WellKnownValidationError> for ScpPyError {
     fn from(e: scp_core::well_known::WellKnownValidationError) -> Self {
         Self::ValidationError {
             message: format!("well-known validation failed: {e} — check relay configuration"),
-            code: "SCP-VALID-7005".to_owned(),
+            code: codes::VALID_7005.to_owned(),
         }
     }
 }
@@ -563,7 +564,7 @@ impl From<scp_core::discovery::DiscoveryError> for ScpPyError {
             message: format!(
                 "discovery operation failed: {e} — check relay connectivity and search parameters"
             ),
-            code: "SCP-CTX-2008".to_owned(),
+            code: codes::CTX_2008.to_owned(),
         }
     }
 }
@@ -576,7 +577,7 @@ impl From<scp_core::bridge::registration::BridgeRegistrationError> for ScpPyErro
             message: format!(
                 "bridge registration failed: {e} — verify bridge configuration and permissions"
             ),
-            code: "SCP-CTX-2009".to_owned(),
+            code: codes::CTX_2009.to_owned(),
         }
     }
 }
@@ -587,7 +588,7 @@ impl From<scp_core::bridge::shadow::ShadowError> for ScpPyError {
             message: format!(
                 "shadow context operation failed: {e} — check bridge state and context permissions"
             ),
-            code: "SCP-CTX-2010".to_owned(),
+            code: codes::CTX_2010.to_owned(),
         }
     }
 }
@@ -600,7 +601,7 @@ impl From<scp_transport::TransportError> for ScpPyError {
             message: format!(
                 "{e} — check relay URL, network connectivity, and transport configuration"
             ),
-            code: "SCP-TRANS-5001".to_owned(),
+            code: codes::TRANS_5001.to_owned(),
         }
     }
 }
@@ -613,7 +614,7 @@ impl From<scp_platform::PlatformError> for ScpPyError {
             message: format!(
                 "platform key operation failed: {e} — check key custody configuration"
             ),
-            code: "SCP-CRYPTO-4004".to_owned(),
+            code: codes::CRYPTO_4004.to_owned(),
         }
     }
 }
@@ -624,7 +625,7 @@ impl From<serde_json::Error> for ScpPyError {
     fn from(e: serde_json::Error) -> Self {
         Self::ValidationError {
             message: format!("JSON serialization/deserialization failed: {e} — check input format"),
-            code: "SCP-VALID-7006".to_owned(),
+            code: codes::VALID_7006.to_owned(),
         }
     }
 }

@@ -23,6 +23,7 @@
 
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
+use scp_ffi_common::error_codes as codes;
 use scp_platform::traits::Storage;
 use scp_primitives::Clock;
 
@@ -364,7 +365,7 @@ fn parse_event_query_filter(
                     message: format!(
                         "after_timestamp must be a finite non-negative value, got {ts}"
                     ),
-                    code: "SCP-VALID-7040".to_owned(),
+                    code: codes::VALID_7040.to_owned(),
                 }
                 .into());
             }
@@ -380,7 +381,7 @@ fn parse_event_query_filter(
                     message: format!(
                         "before_timestamp must be a finite non-negative value, got {ts}"
                     ),
-                    code: "SCP-VALID-7040".to_owned(),
+                    code: codes::VALID_7040.to_owned(),
                 }
                 .into());
             }
