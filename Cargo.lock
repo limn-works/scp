@@ -5097,6 +5097,7 @@ dependencies = [
 name = "scp-ffi-common"
 version = "0.1.0"
 dependencies = [
+ "dashmap",
  "hex",
  "scp-core",
  "scp-event-log",

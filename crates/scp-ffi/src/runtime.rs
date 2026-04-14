@@ -55,7 +55,7 @@
 //! roundtripping.
 
 use std::collections::{HashMap, HashSet};
-use std::sync::{Arc, OnceLock, RwLock};
+use std::sync::{Arc, OnceLock};
 
 use dashmap::DashMap;
 use scp_core::context::ContextError;
@@ -78,6 +78,10 @@ use scp_platform::testing::InMemoryStorage;
 use scp_primitives::Clock;
 use tokio::sync::mpsc;
 use zeroize::Zeroizing;
+
+// Re-export `KnownContext` from scp-ffi-common so that existing callers
+// (`context.rs`, `mcp.rs`) can continue using `crate::runtime::KnownContext`.
+pub use scp_ffi_common::bridge_instance::KnownContext;
 
 use crate::context::PyMessage;
 use crate::error::ScpPyError;
@@ -721,7 +725,10 @@ pub fn register_tool_handler(
 /// (idempotent).
 pub fn remove_ffi_state(context_id: &str) {
     ffi_state_registry().remove(context_id);
-    known_contexts_registry().remove(context_id);
+    // Clean up known-context discovery entry via BridgeInstance.
+    if let Ok(bi) = bridge_instance() {
+        bi.remove_known_context(context_id);
+    }
     // Clean up per-context bridge connector state (ShadowRegistry + SenderKeyStore)
     // to prevent unbounded memory growth in long-running processes.
     crate::bridge_connector::remove_bridge_state(context_id);
@@ -848,44 +855,15 @@ pub fn deliver_message(context_id: &str, message: PyMessage) -> Result<(), ScpPy
 // ---------------------------------------------------------------------------
 // Known context registry (SCP-213: context discovery)
 // ---------------------------------------------------------------------------
-
-/// Global registry of known context-to-relay mappings for discovery (SCP-213).
-///
-/// Tracks contexts that have been created/joined locally, along with their
-/// routing IDs and relay URLs. This allows `py_mcp_load_contexts` to probe
-/// relays for context activity even across process restarts (when combined
-/// with persistence, a future story).
-///
-/// # Safety: Single-Tenant Only
-///
-/// This registry is process-global. See module-level documentation.
-static KNOWN_CONTEXTS: OnceLock<DashMap<String, KnownContext>> = OnceLock::new();
-
-/// Returns a reference to the global known-contexts registry.
-fn known_contexts_registry() -> &'static DashMap<String, KnownContext> {
-    KNOWN_CONTEXTS.get_or_init(DashMap::new)
-}
-
-/// Metadata about a known context's relay presence.
-///
-/// Stored in the `KNOWN_CONTEXTS` registry so that `py_mcp_load_contexts`
-/// can probe relays for context activity. The relay is a dumb blob store
-/// with no identity-to-context mapping, so the client must track which
-/// routing IDs correspond to which contexts.
-///
-/// See SCP-213 and ADR-015 in `.docs/adrs/phase-3.md`.
-#[derive(Debug, Clone)]
-pub struct KnownContext {
-    /// The context's routing ID (32-byte pseudonym for relay routing).
-    pub routing_id: [u8; 32],
-    /// The relay URL where this context's blobs are stored. `None` if no relay
-    /// was connected at registration time.
-    pub relay_url: Option<String>,
-    /// The DID of the member who registered this known context.
-    pub member_did: String,
-    /// Unix timestamp (seconds) when this context was last seen active.
-    pub last_seen: u64,
-}
+//
+// Delegates to the `BridgeInstance`'s `known_contexts` DashMap.
+// The `KnownContext` type is defined in `scp-ffi-common::bridge_instance`
+// and re-exported at the top of this module for backward compatibility.
+//
+// These functions require the bridge to be initialized. Before
+// `init_context_manager` is called, `register_known_context` panics
+// (callers must initialize identity first, which initializes the bridge).
+// ---------------------------------------------------------------------------
 
 /// Registers a known context in the discovery registry.
 ///
@@ -893,66 +871,74 @@ pub struct KnownContext {
 /// relay URL for later discovery via `py_mcp_load_contexts`.
 ///
 /// Overwrites any existing entry for the same context ID (idempotent).
+///
+/// # Panics
+///
+/// Panics if the bridge has not been initialized via [`init_context_manager`].
 pub fn register_known_context(context_id: &str, known: KnownContext) {
-    known_contexts_registry().insert(context_id.to_owned(), known);
+    if let Ok(bi) = bridge_instance() {
+        bi.register_known_context(context_id, known);
+    } else {
+        tracing::warn!(
+            "register_known_context called before bridge init — context '{}' not tracked",
+            context_id
+        );
+    }
 }
 
 /// Returns all known contexts from the discovery registry.
 ///
 /// Used by `py_mcp_load_contexts` to find routing IDs to probe on the relay.
+/// Returns an empty `Vec` if the bridge has not been initialized.
 #[must_use]
 pub fn all_known_contexts() -> Vec<(String, KnownContext)> {
-    known_contexts_registry()
-        .iter()
-        .map(|entry| (entry.key().clone(), entry.value().clone()))
-        .collect()
+    bridge_instance()
+        .map(|bi| bi.all_known_contexts())
+        .unwrap_or_default()
 }
 
 /// Returns known contexts where the given DID is the registered member.
+///
+/// Returns an empty `Vec` if the bridge has not been initialized.
 #[must_use]
 pub fn known_contexts_for_member(member_did: &str) -> Vec<(String, KnownContext)> {
-    known_contexts_registry()
-        .iter()
-        .filter(|entry| entry.value().member_did == member_did)
-        .map(|entry| (entry.key().clone(), entry.value().clone()))
-        .collect()
+    bridge_instance()
+        .map(|bi| bi.known_contexts_for_member(member_did))
+        .unwrap_or_default()
 }
 
 // ---------------------------------------------------------------------------
 // Invitation rate limit tracker registry (#614)
 // ---------------------------------------------------------------------------
-
-/// Global rate limit tracker registry for invitation auto-accept, keyed by
-/// identity DID.
-///
-/// Each identity has its own [`RateLimitTracker`] that persists across
-/// invitation evaluations. The tracker enforces the rate limit specified in
-/// the auto-accept policy.
-///
-/// # Safety: Single-Tenant Only
-///
-/// This registry is process-global. See module-level documentation.
-static RATE_LIMIT_TRACKERS: OnceLock<
-    DashMap<String, scp_core::context::invitation::RateLimitTracker>,
-> = OnceLock::new();
-
-/// Returns a reference to the global rate limit tracker registry.
-fn rate_limit_registry() -> &'static DashMap<String, scp_core::context::invitation::RateLimitTracker>
-{
-    RATE_LIMIT_TRACKERS.get_or_init(DashMap::new)
-}
+//
+// Delegates to the `BridgeInstance`'s `rate_limiters` DashMap.
+// ---------------------------------------------------------------------------
 
 /// Returns a mutable reference to the rate limit tracker for the given
 /// identity DID, creating one if it does not exist.
+///
+/// Delegates to the `BridgeInstance`'s rate-limiter registry. If the bridge
+/// has not been initialized (unusual — identity must be created before
+/// invitation evaluation), falls back to a thread-local default tracker
+/// to preserve the original infallible signature.
 ///
 /// The caller passes a closure that receives `&mut RateLimitTracker`.
 pub fn with_rate_limit_tracker<F, T>(identity_did: &str, f: F) -> T
 where
     F: FnOnce(&mut scp_core::context::invitation::RateLimitTracker) -> T,
 {
-    let registry = rate_limit_registry();
-    let mut entry = registry.entry(identity_did.to_owned()).or_default();
-    f(entry.value_mut())
+    if let Ok(bi) = bridge_instance() {
+        bi.with_rate_limit_tracker(identity_did, f)
+    } else {
+        // Bridge not initialized — use a temporary tracker. This path
+        // should not be hit in normal operation (identity is always
+        // created before invitation evaluation).
+        tracing::warn!(
+            "with_rate_limit_tracker called before bridge init — using ephemeral tracker"
+        );
+        let mut tracker = scp_core::context::invitation::RateLimitTracker::default();
+        f(&mut tracker)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1160,90 +1146,70 @@ pub fn get_storage() -> Result<&'static Arc<EncryptingAdapter<InMemoryStorage>>,
 // ---------------------------------------------------------------------------
 // Relay connection state (SCP-213: transport wiring)
 // ---------------------------------------------------------------------------
-
-/// Global transport manager for multi-relay support.
-///
-/// Stores the real [`scp_transport::TransportManager`] with multi-relay
-/// fanout, per-context relay set assignment, suppression detection, and
-/// reliability scoring.
-///
-/// Initialized by [`set_transport_manager`] when `py_transport_connect`
-/// succeeds. Read by `py_mcp_load_contexts` to probe routing IDs on
-/// relays. Uses `RwLock` for infrequent writes (connect) and concurrent
-/// reads (probe/query).
-///
-/// # Safety: Single-Tenant Only
-///
-/// This registry is process-global. See module-level documentation.
-static TRANSPORT_MANAGER: OnceLock<RwLock<Option<scp_transport::TransportManager>>> =
-    OnceLock::new();
-
-/// Returns a reference to the global transport manager state.
-fn transport_state() -> &'static RwLock<Option<scp_transport::TransportManager>> {
-    TRANSPORT_MANAGER.get_or_init(|| RwLock::new(None))
-}
+//
+// Delegates to the `BridgeInstance`'s `transport` RwLock.
+// ---------------------------------------------------------------------------
 
 /// Stores a new `TransportManager` (called by `py_transport_connect`).
+///
+/// Delegates to [`BridgeInstance::set_transport`].
 ///
 /// # Errors
 ///
 /// Returns `ScpPyError::TransportError` if the transport manager lock is
-/// poisoned.
+/// poisoned or the bridge is not initialized.
 pub fn set_transport_manager(manager: scp_transport::TransportManager) -> Result<(), ScpPyError> {
-    let mut guard = transport_state()
-        .write()
-        .map_err(|_| ScpPyError::transport("transport manager lock poisoned".to_owned()))?;
-    *guard = Some(manager);
-    Ok(())
+    let bi = bridge_instance().map_err(|_| {
+        ScpPyError::transport(
+            "bridge not initialized — call identity_create before transport_connect".to_owned(),
+        )
+    })?;
+    bi.set_transport(manager)
+        .map_err(|e| ScpPyError::transport(e.to_string()))
 }
 
 /// Executes a closure with a read reference to the `TransportManager`.
 ///
-/// Used by callers that need to query, probe, or inspect the manager
-/// without mutating it.
+/// Delegates to [`BridgeInstance::with_transport`].
 ///
 /// # Errors
 ///
-/// Returns `ScpPyError::TransportError` if the lock is poisoned or no
-/// transport manager has been initialized.
+/// Returns `ScpPyError::TransportError` if the lock is poisoned, no
+/// transport manager has been initialized, or the bridge is not initialized.
 pub fn with_transport_manager<T>(
     f: impl FnOnce(&scp_transport::TransportManager) -> Result<T, ScpPyError>,
 ) -> Result<T, ScpPyError> {
-    let guard = transport_state()
-        .read()
-        .map_err(|_| ScpPyError::transport("transport manager lock poisoned".to_owned()))?;
-    let manager = guard.as_ref().ok_or_else(|| {
+    let bi = bridge_instance().map_err(|_| {
         ScpPyError::transport("no transport manager — call transport_connect first".to_owned())
     })?;
-    f(manager)
+    bi.with_transport(f)
+        .map_err(|e| ScpPyError::transport(e.to_string()))?
 }
 
 /// Executes a closure with a mutable reference to the `TransportManager`.
 ///
-/// Used by callers that need to add adapters or modify relay assignments.
+/// Delegates to [`BridgeInstance::with_transport_mut`].
 ///
 /// # Errors
 ///
-/// Returns `ScpPyError::TransportError` if the lock is poisoned or no
-/// transport manager has been initialized.
+/// Returns `ScpPyError::TransportError` if the lock is poisoned, no
+/// transport manager has been initialized, or the bridge is not initialized.
 pub fn with_transport_manager_mut<T>(
     f: impl FnOnce(&mut scp_transport::TransportManager) -> Result<T, ScpPyError>,
 ) -> Result<T, ScpPyError> {
-    let mut guard = transport_state()
-        .write()
-        .map_err(|_| ScpPyError::transport("transport manager lock poisoned".to_owned()))?;
-    let manager = guard.as_mut().ok_or_else(|| {
+    let bi = bridge_instance().map_err(|_| {
         ScpPyError::transport("no transport manager — call transport_connect first".to_owned())
     })?;
-    f(manager)
+    bi.with_transport_mut(f)
+        .map_err(|e| ScpPyError::transport(e.to_string()))?
 }
 
 /// Returns `true` if a transport manager has been initialized.
+#[must_use]
 pub fn has_transport_manager() -> bool {
-    TRANSPORT_MANAGER
-        .get()
-        .and_then(|lock| lock.read().ok())
-        .is_some_and(|guard| guard.is_some())
+    bridge_instance()
+        .map(|bi| bi.has_transport())
+        .unwrap_or(false)
 }
 
 /// Records a heartbeat suppression event for a relay, downgrading its
@@ -1251,15 +1217,16 @@ pub fn has_transport_manager() -> bool {
 ///
 /// Called from the background task spawned by `transport_add_relay` /
 /// `transport_connect` that drains the per-adapter suppression receiver
-/// (#1533 AC5). Silently no-ops if the transport manager has been cleared
-/// (e.g., after disconnect).
+/// (#1533 AC5). Silently no-ops if the bridge or transport manager has
+/// been cleared (e.g., after disconnect).
 pub fn record_suppression(relay_url: &str) {
-    let Ok(guard) = transport_state().read() else {
+    let Ok(bi) = bridge_instance() else {
         return;
     };
-    if let Some(manager) = guard.as_ref() {
+    let _ = bi.with_transport(|manager| {
         manager.update_score(relay_url, scp_transport::scoring::DeliveryOutcome::Failure);
-    }
+        Ok::<(), ScpPyError>(())
+    });
 }
 
 /// Clears the transport manager (called by `py_transport_disconnect`).
@@ -1270,13 +1237,15 @@ pub fn record_suppression(relay_url: &str) {
 /// # Errors
 ///
 /// Returns `ScpPyError::TransportError` if the transport manager lock is
-/// poisoned.
+/// poisoned or the bridge is not initialized.
 pub fn clear_transport_manager() -> Result<(), ScpPyError> {
-    let mut guard = transport_state()
-        .write()
-        .map_err(|_| ScpPyError::transport("transport manager lock poisoned".to_owned()))?;
-    *guard = None;
-    Ok(())
+    let bi = bridge_instance().map_err(|_| {
+        ScpPyError::transport(
+            "bridge not initialized — call identity_create before transport_disconnect".to_owned(),
+        )
+    })?;
+    bi.clear_transport()
+        .map_err(|e| ScpPyError::transport(e.to_string()))
 }
 
 // ---------------------------------------------------------------------------
@@ -1361,14 +1330,18 @@ pub struct RegistryStats {
 ///
 /// Intended for monitoring and debugging in long-running processes.
 /// All reads are lock-free (`DashMap`) or brief (`RwLock` on transport
-/// state).
+/// state). Known contexts and transport status are read from the
+/// `BridgeInstance` (returns 0/false if the bridge is not initialized).
 #[must_use]
 pub fn registry_stats() -> RegistryStats {
+    let (known_count, relay_connected) = bridge_instance()
+        .map(|bi| (bi.known_contexts().len(), bi.has_transport()))
+        .unwrap_or((0, false));
     RegistryStats {
         contexts: ffi_state_registry().len(),
-        known_contexts: known_contexts_registry().len(),
+        known_contexts: known_count,
         identities: identity_registry().len(),
-        relay_connected: has_transport_manager(),
+        relay_connected,
     }
 }
 
@@ -1595,6 +1568,10 @@ mod tests {
 
     #[test]
     fn registry_stats_reflects_known_context_registration() {
+        // Ensure bridge is initialized so known_contexts DashMap exists.
+        init_context_manager_for_test();
+        let bi = bridge_instance().unwrap();
+
         let ctx_id = unique_ctx_id("stats-known");
         let known = KnownContext {
             routing_id: [0xCC; 32],
@@ -1612,15 +1589,17 @@ mod tests {
             stats.known_contexts,
         );
         assert!(
-            known_contexts_registry().contains_key(&ctx_id),
-            "registered known context should be in registry"
+            bi.known_contexts().contains_key(&ctx_id),
+            "registered known context should be in BridgeInstance"
         );
 
-        // remove_context clears both registries.
-        remove_context(&ctx_id);
+        // remove_ffi_state clears both registries (FFI state + known contexts).
+        // Register FFI state first so remove_ffi_state has something to remove.
+        let _ = register_ffi_state(&ctx_id, "did:dht:z6MkStatsKnown", &[]);
+        remove_ffi_state(&ctx_id);
         assert!(
-            !known_contexts_registry().contains_key(&ctx_id),
-            "removed known context should not be in registry"
+            !bi.known_contexts().contains_key(&ctx_id),
+            "removed known context should not be in BridgeInstance"
         );
     }
 

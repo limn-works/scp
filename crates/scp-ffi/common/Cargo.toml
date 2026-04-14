@@ -11,7 +11,7 @@ publish = false
 default = ["resolvers"]
 # Full resolver implementations (BridgeDidResolver, IdentityBackedDidResolver, etc.).
 # Requires scp-core, scp-identity, tokio. Disable for WASM (which only needs validate).
-resolvers = ["dep:scp-core", "dep:scp-identity", "dep:scp-event-log", "dep:tokio", "dep:tracing"]
+resolvers = ["dep:scp-core", "dep:scp-identity", "dep:scp-event-log", "dep:scp-transport", "dep:tokio", "dep:tracing"]
 # Enables the did:key:{hex} DID format in BridgeDidResolver. This is a
 # non-standard test convenience — production builds must resolve via did:dht:z.
 testing = ["resolvers"]
@@ -29,6 +29,7 @@ scp-identity = { path = "../../scp-identity", optional = true }
 scp-transport = { path = "../../scp-transport", features = ["redb-blob"], optional = true }
 scp-node = { path = "../../scp-node", features = ["allow_unencrypted_storage"], optional = true }
 scp-platform = { path = "../../scp-platform", features = ["testing", "filesystem", "file"], optional = true }
+dashmap = { workspace = true }
 zeroize = { workspace = true }
 serde_json = { workspace = true }
 sha2 = { workspace = true }
