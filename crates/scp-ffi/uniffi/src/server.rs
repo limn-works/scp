@@ -18,7 +18,7 @@ use std::sync::Arc;
 
 use zeroize::Zeroizing;
 
-use scp_ffi_common::server::{self, RunningNode, ServerError};
+use scp_ffi_common::server::{self, BroadcastKeyError, RunningNode, ServerError};
 use scp_ffi_common::validate::{validate_context_id, validate_deploy_id, validate_did};
 use scp_node::NodeError;
 use scp_transport::native::NativeRelayAdapter;
@@ -80,6 +80,27 @@ impl From<NodeError> for ScpError {
             NodeError::Serve(_) | NodeError::Nat(_) | NodeError::Tls(_) => Self::Transport {
                 msg: "node network error".to_owned(),
                 code: codes::TRANS_5054.to_owned(),
+            },
+        }
+    }
+}
+
+impl From<BroadcastKeyError> for ScpError {
+    fn from(e: BroadcastKeyError) -> Self {
+        match e {
+            BroadcastKeyError::InvalidHex(_) | BroadcastKeyError::InvalidKeyLength => {
+                Self::Validation {
+                    msg: e.to_string(),
+                    code: codes::TRANS_5060.to_owned(),
+                }
+            }
+            BroadcastKeyError::KeyWithoutAuthor => Self::Validation {
+                msg: e.to_string(),
+                code: codes::TRANS_5060.to_owned(),
+            },
+            BroadcastKeyError::AutoResolveFailed(_) => Self::Context {
+                msg: e.to_string(),
+                code: codes::CTX_2060.to_owned(),
             },
         }
     }
@@ -272,64 +293,17 @@ impl NodeHandle {
         }
 
         // Resolve broadcast key: explicit, auto-lookup, or auto with explicit author.
-        let (resolved_key_bytes, resolved_epoch, resolved_author_did) =
-            match (broadcast_key_hex, author_did) {
-                (Some(key_hex), Some(did)) => {
-                    let key_hex = Zeroizing::new(key_hex);
-                    let key_vec = Zeroizing::new(hex::decode(&*key_hex).map_err(|e| {
-                        ScpError::Validation {
-                            msg: format!("invalid broadcast_key_hex: {e}"),
-                            code: codes::TRANS_5060.to_owned(),
-                        }
-                    })?);
-                    let key_bytes: Zeroizing<[u8; 32]> =
-                        Zeroizing::new(<[u8; 32]>::try_from(key_vec.as_slice()).map_err(|_| {
-                            ScpError::Validation {
-                                msg:
-                                    "broadcast_key_hex must be exactly 64 hex characters (32 bytes)"
-                                        .to_owned(),
-                                code: codes::TRANS_5060.to_owned(),
-                            }
-                        })?);
-                    // Explicit key path always uses epoch 0. For rotated keys, use auto-resolve (omit both params).
-                    (key_bytes, 0u64, did)
-                }
-                (None, author_opt) => {
-                    // Auto-resolve from ContextManager. Use the explicit author
-                    // DID if provided, otherwise fall back to the node's identity
-                    // DID. This supports the case where the node hosts content
-                    // authored by a different DID (#1405).
-                    let did = author_opt.unwrap_or_else(|| self.inner.did().to_owned());
-                    let mgr = crate::runtime::context_manager()?;
-                    let (key_bytes, epoch) = mgr
-                        .get_broadcast_key_for_local_author(&context_id, &did)
-                        .await
-                        .map_err(|e| {
-                            tracing::debug!(error = %e, "broadcast key auto-resolve failed");
-                            ScpError::Context {
-                            msg:
-                                "broadcast key auto-resolve failed: not authorized for this context"
-                                    .to_owned(),
-                            code: codes::CTX_2060.to_owned(),
-                        }
-                        })?;
-                    (key_bytes, epoch, did)
-                }
-                (Some(_), None) => {
-                    return Err(ScpError::Validation {
-                        msg: "broadcast_key_hex requires author_did — provide the DID of the \
-                         broadcast key owner, or omit both for auto-resolve"
-                            .to_owned(),
-                        code: codes::TRANS_5060.to_owned(),
-                    });
-                }
-            };
-
-        let broadcast_key = scp_core::crypto::sender_keys::BroadcastKey::from_parts(
-            scp_core::crypto::sender_keys::SenderKey::from_bytes(*resolved_key_bytes),
-            resolved_epoch,
-            resolved_author_did,
-        );
+        // Delegates to the shared resolver in scp-ffi-common (same logic as PyO3/NAPI).
+        let mgr = crate::runtime::context_manager()?;
+        let resolved = server::resolve_broadcast_key(
+            broadcast_key_hex,
+            author_did,
+            self.inner.did(),
+            mgr,
+            &context_id,
+        )
+        .await?;
+        let broadcast_key = resolved.into_broadcast_key();
 
         let adm = match admission.to_lowercase().as_str() {
             "open" => scp_core::context::broadcast::BroadcastAdmission::Open,

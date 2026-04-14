@@ -9,7 +9,6 @@
 //!
 //! Requires the `resolvers` feature (scp-core dependency).
 
-use std::collections::HashSet;
 use std::time::Duration;
 
 use scp_core::context::ContextParams;
@@ -268,9 +267,9 @@ fn parse_and_validate_consequences(
 fn build_roles(roles: &[(String, Vec<String>)]) -> Vec<RoleDefinition> {
     roles
         .iter()
-        .map(|(name, _caps)| RoleDefinition {
+        .map(|(name, caps)| RoleDefinition {
             name: name.clone(),
-            capabilities: HashSet::new(),
+            capabilities: caps.iter().map(Capability::new).collect(),
         })
         .collect()
 }
