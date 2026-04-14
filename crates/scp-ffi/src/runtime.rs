@@ -657,7 +657,7 @@ pub fn remove_ffi_state(context_id: &str) {
     known_contexts_registry().remove(context_id);
     // Clean up per-context bridge connector state (ShadowRegistry + SenderKeyStore)
     // to prevent unbounded memory growth in long-running processes.
-    crate::bridge_connector::remove_bridge_state(context_id);
+    scp_ffi_common::bridge_state::remove_bridge_state(context_id);
     // Clean up per-context economy state (budget + antispam trackers) to prevent
     // unbounded memory growth in long-running processes (#1433).
     remove_economy_state(context_id);

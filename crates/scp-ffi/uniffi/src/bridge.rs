@@ -26,7 +26,7 @@
 
 use scp_ffi_common::error_codes as codes;
 use std::fmt;
-use std::sync::{Arc, OnceLock};
+use std::sync::Arc;
 
 use sha2::Digest;
 use zeroize::Zeroizing;
@@ -2740,14 +2740,6 @@ async fn identity_create_link_attestation_impl(
     platform_id: Option<String>,
 ) -> Result<String, ScpError> {
     use scp_ffi_common::error_codes as codes;
-    use std::borrow::Cow;
-
-    use scp_core::identity::attestation::{
-        ATTESTATION_TYPE_IDENTITY_LINK, AttestationClaim, AttestationEvidence,
-        IdentityLinkAttestation, VerificationMethod,
-    };
-    use scp_core::trust::attestation::RevocationStatus;
-    use scp_identity::DID;
     use scp_platform::traits::KeyCustody;
 
     // Validate attestation input field sizes.
@@ -2757,17 +2749,6 @@ async fn identity_create_link_attestation_impl(
             code: codes::VALID_7037.to_owned(),
         },
     )?;
-
-    let method: VerificationMethod =
-        verification_method
-            .parse()
-            .map_err(|e: String| ScpError::Identity {
-                msg: e,
-                code: codes::IDENT_1040.to_owned(),
-            })?;
-
-    // Proof is an opaque string per §3.5.2 — pass through as-is.
-    // Do not parse and re-serialize.
 
     let core_id = identity
         .core_id
@@ -2784,61 +2765,25 @@ async fn identity_create_link_attestation_impl(
             code: codes::IDENT_1040.to_owned(),
         })?;
 
-    let did_str = identity.did.clone();
-    let issuer = DID::from(did_str.as_str());
-    let now_secs = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_err(|_| ScpError::Identity {
-            msg: "system clock is before UNIX epoch".to_owned(),
-            code: codes::IDENT_1042.to_owned(),
-        })?
-        .as_secs();
+    // Build unsigned attestation using shared pipeline.
+    let built = scp_ffi_common::attestation::build_unsigned_attestation(
+        &identity.did,
+        platform,
+        handle,
+        proof,
+        &verification_method,
+        platform_id,
+    )
+    .map_err(|e| ScpError::Identity {
+        msg: e.to_string(),
+        code: codes::IDENT_1041.to_owned(),
+    })?;
 
-    let id = IdentityLinkAttestation::compute_id(&issuer, &platform, &handle, now_secs);
-
-    let mut attestation = IdentityLinkAttestation {
-        id,
-        attestation_type: Cow::Borrowed(ATTESTATION_TYPE_IDENTITY_LINK),
-        issuer: issuer.clone(),
-        subject: issuer,
-        issued_at: now_secs,
-        expires_at: None,
-        claim: AttestationClaim::new(platform, handle, platform_id),
-        evidence: AttestationEvidence {
-            method,
-            proof,
-            verified_at: now_secs,
-            verifier_did: None,
-        },
-        revocation_status: RevocationStatus::Active,
-        signature: Vec::new(),
-    };
-
-    // Structural validation before signing.
-    let structure_errors = attestation.validate_structure();
-    if !structure_errors.is_empty() {
-        return Err(ScpError::Identity {
-            msg: format!(
-                "attestation structure validation failed: {}",
-                structure_errors
-                    .iter()
-                    .map(AsRef::as_ref)
-                    .collect::<Vec<_>>()
-                    .join("; "),
-            ),
-            code: codes::IDENT_1041.to_owned(),
-        });
-    }
-
-    let canonical = attestation
-        .canonical_signing_bytes()
-        .map_err(|e| ScpError::Identity {
-            msg: format!("attestation signing failed: {e}"),
-            code: codes::IDENT_1041.to_owned(),
-        })?;
+    let mut attestation = built.attestation;
 
     let active_key = core_id.active_signing_key;
     let custody_clone = Arc::clone(custody);
+    let canonical = built.canonical_bytes;
 
     let sig = runtime()
         .spawn(async move { custody_clone.0.sign(&active_key, &canonical).await })
@@ -2886,7 +2831,7 @@ async fn identity_create_link_attestation_impl(
     {
         let registry = identity_link_attestation_registry();
         let len = registry.len();
-        match registry.entry(did_str) {
+        match registry.entry(identity.did.clone()) {
             dashmap::mapref::entry::Entry::Occupied(mut occ) => {
                 if occ.get().len() >= MAX_IDENTITY_LINK_ATTESTATIONS_PER_DID {
                     return Err(ScpError::Identity {
@@ -11559,35 +11504,13 @@ pub fn sync_get_policy() -> SyncPolicyResult {
 // ---------------------------------------------------------------------------
 // Bridge connector — register and create shadow (#421)
 // ---------------------------------------------------------------------------
+//
+// `BridgeContextState`, `bridge_state_registry()`, and `remove_bridge_state()`
+// are defined in `scp_ffi_common::bridge_state`.
 
-/// Per-context bridge connector state that persists across function calls.
-///
-/// Without this, `bridge_create_shadow` would create ephemeral
-/// `ShadowRegistry` and `SenderKeyStore` instances that are dropped when the
-/// function returns, losing all shadow identity and sender key state.
-///
-/// Keyed by context ID in `BRIDGE_STATE`.
-struct BridgeContextState {
-    shadow_registry: scp_core::bridge::shadow::ShadowRegistry,
-    sender_key_store: scp_core::crypto::sender_keys::SenderKeyStore,
-}
-
-/// Process-global registry of per-context bridge connector state.
-///
-/// Uses `DashMap` for lock-free concurrent reads, matching the pattern
-/// used by `UcanContextState` in `runtime.rs`.
-static BRIDGE_STATE: OnceLock<dashmap::DashMap<String, BridgeContextState>> = OnceLock::new();
-
-/// Returns a reference to the bridge state registry, initializing on first access.
-fn bridge_state_registry() -> &'static dashmap::DashMap<String, BridgeContextState> {
-    BRIDGE_STATE.get_or_init(dashmap::DashMap::new)
-}
-
-/// Removes per-context bridge state on context close, preventing unbounded
-/// memory growth in long-running processes. Called from `context_close`.
-fn remove_bridge_state(context_id: &str) {
-    bridge_state_registry().remove(context_id);
-}
+use scp_ffi_common::bridge_state::{
+    BridgeContextState, bridge_state_registry, remove_bridge_state,
+};
 
 /// Bridge registration result record.
 ///

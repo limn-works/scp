@@ -16,6 +16,7 @@
 //!
 //! See §3.10.10, §9.5, §7.4.1, §22.3.1, §22.4, §22.8 in `.docs/specs/`.
 
+pub mod bridge_state;
 pub mod error_codes;
 pub mod validate;
 
@@ -78,6 +79,11 @@ pub fn html_escape_json(json: &str) -> String {
         .replace('&', "\\u0026")
         .replace('\'', "\\u0027")
 }
+
+// Shared attestation construction pipeline for all non-WASM bridges.
+// Requires scp-core + scp-identity (behind `resolvers` feature). Not available for WASM.
+#[cfg(feature = "resolvers")]
+pub mod attestation;
 
 // Shared context-parameter builder for all non-WASM bridges.
 // Requires scp-core (behind `resolvers` feature). Not available for WASM.

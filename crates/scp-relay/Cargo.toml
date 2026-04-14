@@ -20,11 +20,11 @@ scp-transport = { path = "../scp-transport", version = "=0.1.0-beta.1", features
     "redb-blob",
     "postgres-blob",
     "s3-blob",
+    "startup",
 ] }
 axum = "0.8"
 tokio = { workspace = true }
 tracing = { workspace = true }
-tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 metrics = { workspace = true }
 metrics-exporter-prometheus = { workspace = true }
 

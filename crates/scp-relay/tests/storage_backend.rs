@@ -188,7 +188,7 @@ fn default_backend_is_sqlite() {
         .env("SCP_RELAY_STORAGE_PATH", db_path.to_str().unwrap())
         .env("SCP_RELAY_BIND_ADDR", "127.0.0.1:0")
         .env("SCP_RELAY_LOG_FORMAT", "json")
-        .env("RUST_LOG", "scp_relay=info")
+        .env("RUST_LOG", "scp_relay=info,scp_transport=info")
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::piped())
         .spawn()

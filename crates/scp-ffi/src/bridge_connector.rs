@@ -28,7 +28,6 @@
 use scp_ffi_common::error_codes as codes;
 use std::sync::OnceLock;
 
-use dashmap::DashMap;
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList};
 
@@ -55,6 +54,7 @@ use scp_core::bridge::{
 use scp_core::crypto::sender_keys::{SenderKey, SenderKeyStore};
 use scp_core::provenance::{DataProvenance, DiscoveryMethod, SourceType};
 use scp_core::trust::attestation::Attestation;
+use scp_ffi_common::bridge_state::{BridgeContextState, bridge_state_registry};
 use zeroize::Zeroizing;
 
 use crate::error::ScpPyError;
@@ -62,35 +62,9 @@ use crate::error::ScpPyError;
 // ---------------------------------------------------------------------------
 // Per-context bridge state — persistent ShadowRegistry + SenderKeyStore
 // ---------------------------------------------------------------------------
-
-/// Per-context bridge connector state that persists across function calls.
-///
-/// Without this, `bridge_create_shadow` would create ephemeral
-/// `ShadowRegistry` and `SenderKeyStore` instances that are dropped when the
-/// function returns, losing all shadow identity and sender key state.
-///
-/// Keyed by context ID in `BRIDGE_STATE`.
-struct BridgeContextState {
-    shadow_registry: ShadowRegistry,
-    sender_key_store: SenderKeyStore,
-}
-
-/// Process-global registry of per-context bridge connector state.
-///
-/// Uses `DashMap` for lock-free concurrent reads, matching the pattern
-/// used by `FfiBridgeState` in `runtime.rs`.
-static BRIDGE_STATE: OnceLock<DashMap<String, BridgeContextState>> = OnceLock::new();
-
-/// Returns a reference to the bridge state registry, initializing on first access.
-fn bridge_state_registry() -> &'static DashMap<String, BridgeContextState> {
-    BRIDGE_STATE.get_or_init(DashMap::new)
-}
-
-/// Removes per-context bridge state on context close, preventing unbounded
-/// memory growth in long-running processes. Called from `runtime::remove_ffi_state`.
-pub(crate) fn remove_bridge_state(context_id: &str) {
-    bridge_state_registry().remove(context_id);
-}
+//
+// `BridgeContextState`, `bridge_state_registry()`, and `remove_bridge_state()`
+// are defined in `scp_ffi_common::bridge_state` and re-imported above.
 
 // ---------------------------------------------------------------------------
 // Global credential store (in-memory, per-process)
