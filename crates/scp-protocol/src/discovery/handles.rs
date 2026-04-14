@@ -35,6 +35,9 @@ pub const TOOL_HANDLE_LOOKUP: &str = "handle_lookup";
 /// Standard tool name for handle deregistration.
 pub const TOOL_HANDLE_DEREGISTER: &str = "handle_deregister";
 
+/// Maximum number of entries in a single handle registry (§22.3.1).
+const MAX_HANDLE_ENTRIES: usize = 10_000;
+
 // ---------------------------------------------------------------------------
 // HandleRegisterParams / HandleRegisterResult (§22.3.1)
 // ---------------------------------------------------------------------------
@@ -87,6 +90,8 @@ pub enum HandleRegisterStatus {
     Conflict,
     /// The registrant DID does not match the target identity DID.
     OwnershipMismatch,
+    /// The handle registry is at capacity and cannot accept new registrations.
+    CapacityExceeded,
 }
 
 // ---------------------------------------------------------------------------
@@ -238,6 +243,13 @@ impl HandleRegistry {
         if self.entries.contains_key(&normalized) {
             return HandleRegisterResult {
                 status: HandleRegisterStatus::Conflict,
+                entry_id: None,
+            };
+        }
+
+        if self.entries.len() >= MAX_HANDLE_ENTRIES {
+            return HandleRegisterResult {
+                status: HandleRegisterStatus::CapacityExceeded,
                 entry_id: None,
             };
         }
@@ -698,5 +710,68 @@ mod tests {
         };
         let result = registry.register(&params2, &bob_did, &scp_primitives::SystemClock);
         assert_eq!(result.status, HandleRegisterStatus::Registered);
+    }
+
+    // -- HandleRegistry: capacity limit -------------------------------------
+
+    #[test]
+    fn register_returns_capacity_exceeded_at_limit() {
+        let owner_did = DID::from("did:dht:testowner");
+        let mut registry = HandleRegistry::new("ctx-capacity".to_owned());
+
+        for i in 0..MAX_HANDLE_ENTRIES {
+            let params = HandleRegisterParams {
+                handle: format!("handle_{i}"),
+                target: make_context_target(&format!("ctx-{i}")),
+                metadata: None,
+            };
+            let result = registry.register(&params, &owner_did, &scp_primitives::SystemClock);
+            assert_eq!(result.status, HandleRegisterStatus::Registered);
+        }
+
+        assert_eq!(registry.len(), MAX_HANDLE_ENTRIES);
+
+        let overflow_params = HandleRegisterParams {
+            handle: "handle_overflow".to_owned(),
+            target: make_context_target("ctx-overflow"),
+            metadata: None,
+        };
+        let result = registry.register(&overflow_params, &owner_did, &scp_primitives::SystemClock);
+        assert_eq!(result.status, HandleRegisterStatus::CapacityExceeded);
+        assert!(result.entry_id.is_none());
+        assert_eq!(registry.len(), MAX_HANDLE_ENTRIES);
+    }
+
+    #[test]
+    fn register_succeeds_after_deregister_at_capacity() {
+        let owner_did = DID::from("did:dht:testowner");
+        let mut registry = HandleRegistry::new("ctx-capacity".to_owned());
+
+        for i in 0..MAX_HANDLE_ENTRIES {
+            let params = HandleRegisterParams {
+                handle: format!("handle_{i}"),
+                target: make_context_target(&format!("ctx-{i}")),
+                metadata: None,
+            };
+            registry.register(&params, &owner_did, &scp_primitives::SystemClock);
+        }
+
+        assert_eq!(registry.len(), MAX_HANDLE_ENTRIES);
+
+        registry.deregister(&HandleDeregisterParams {
+            handle: "handle_0".to_owned(),
+            did: owner_did.clone(),
+        });
+
+        assert_eq!(registry.len(), MAX_HANDLE_ENTRIES - 1);
+
+        let new_params = HandleRegisterParams {
+            handle: "handle_new".to_owned(),
+            target: make_context_target("ctx-new"),
+            metadata: None,
+        };
+        let result = registry.register(&new_params, &owner_did, &scp_primitives::SystemClock);
+        assert_eq!(result.status, HandleRegisterStatus::Registered);
+        assert!(result.entry_id.is_some());
     }
 }
