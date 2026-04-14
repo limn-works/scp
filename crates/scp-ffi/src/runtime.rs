@@ -70,6 +70,7 @@ use scp_core::crypto::ucan::nonce::NonceTracker;
 use scp_core::crypto::ucan::revoke::RevocationList;
 use scp_core::store::ProtocolRepository;
 use scp_event_log::EventLog;
+use scp_ffi_common::bridge_instance::BridgeInstance;
 use scp_identity::cache::SystemClock;
 use scp_identity::{DidDocument, ScpIdentity};
 use scp_platform::encrypting_adapter::EncryptingAdapter;
@@ -122,6 +123,52 @@ pub fn context_manager() -> Result<&'static Arc<ContextManager>, ScpPyError> {
     })
 }
 
+// ---------------------------------------------------------------------------
+// BridgeInstance (consolidated singleton — #1549)
+// ---------------------------------------------------------------------------
+
+/// Global [`BridgeInstance`] that consolidates process-global state.
+///
+/// Holds the same `ContextManager` as [`CONTEXT_MANAGER`] plus the local DID
+/// and a shutdown flag. Populated alongside `CONTEXT_MANAGER` during
+/// [`init_context_manager`]. Existing callers continue using `context_manager()`
+/// and other per-registry accessors; the `BridgeInstance` provides an
+/// alternative path that will eventually replace all singletons (#1549).
+///
+/// # Safety: Single-Tenant Only
+///
+/// See module-level documentation.
+static BRIDGE_INSTANCE: OnceLock<Arc<BridgeInstance>> = OnceLock::new();
+
+/// Initializes the global [`BridgeInstance`].
+///
+/// Called by [`init_context_manager`] after the `ContextManager` is created.
+/// The `BridgeInstance` wraps the same `Arc<ContextManager>` so that
+/// `bridge_instance().context_manager()` and `context_manager()` return
+/// pointers to the same allocation.
+///
+/// Subsequent calls are no-ops (`OnceLock` guarantees single initialization).
+fn init_bridge_instance(context_manager: Arc<ContextManager>, local_did: &str) {
+    let instance = Arc::new(BridgeInstance::new(context_manager, local_did.to_owned()));
+    BRIDGE_INSTANCE.get_or_init(|| instance);
+}
+
+/// Returns a reference to the global [`BridgeInstance`].
+///
+/// # Errors
+///
+/// Returns `ScpPyError::ContextError` if the bridge has not been initialized
+/// via [`init_context_manager`] (which also creates the `BridgeInstance`).
+pub fn bridge_instance() -> Result<&'static Arc<BridgeInstance>, ScpPyError> {
+    BRIDGE_INSTANCE.get().ok_or_else(|| {
+        ScpPyError::context("bridge not initialized — call identity_create first".to_owned())
+    })
+}
+
+// ---------------------------------------------------------------------------
+// ContextManager initialization
+// ---------------------------------------------------------------------------
+
 /// Initializes the global [`ContextManager`] with production providers.
 ///
 /// Uses `MlsCryptoProvider` (real OpenMLS-backed encryption, sender keys, and
@@ -143,6 +190,10 @@ pub fn context_manager() -> Result<&'static Arc<ContextManager>, ScpPyError> {
 /// context state persistence across process restarts without requiring
 /// callers to manually wire persistence. See issue #329.
 ///
+/// Also populates the global [`BridgeInstance`] with the same `ContextManager`
+/// and `local_did`, enabling incremental migration of per-registry singletons
+/// to the consolidated `BridgeInstance` (#1549).
+///
 /// Subsequent calls are no-ops (`OnceLock` guarantees single initialization).
 /// If the manager is already initialized with a different DID, a warning is logged.
 pub fn init_context_manager(local_did: &str) {
@@ -154,16 +205,22 @@ pub fn init_context_manager(local_did: &str) {
         return;
     }
     let did = local_did.to_owned();
-    let _ = CONTEXT_MANAGER.get_or_init(|| {
-        let crypto = Box::new(scp_core::crypto::mls::provider::MlsCryptoProvider::new(did));
-        let persistence = build_persistence_provider();
-        build_context_manager(
-            crypto,
-            Box::new(NotConfiguredTransportProvider),
-            Box::new(NoOpEventLogProvider),
-            persistence,
-        )
-    });
+    let cm_arc = CONTEXT_MANAGER
+        .get_or_init(|| {
+            let crypto = Box::new(scp_core::crypto::mls::provider::MlsCryptoProvider::new(did));
+            let persistence = build_persistence_provider();
+            build_context_manager(
+                crypto,
+                Box::new(NotConfiguredTransportProvider),
+                Box::new(NoOpEventLogProvider),
+                persistence,
+            )
+        })
+        .clone();
+
+    // Populate the BridgeInstance with the same ContextManager.
+    // No-op if already set (OnceLock guarantees single initialization).
+    init_bridge_instance(cm_arc, local_did);
 }
 
 /// Initializes the global [`ContextManager`] with custom providers.
@@ -197,15 +254,21 @@ pub fn init_context_manager_with(
 /// Not behind `#[cfg(test)]` because integration tests (`tests/e2e_bridge.rs`)
 /// compile as separate crates and need access to this function.
 pub fn init_context_manager_for_test() {
-    let _ = CONTEXT_MANAGER.get_or_init(|| {
-        let persistence = build_persistence_provider();
-        build_context_manager(
-            Box::new(NoOpCryptoProvider),
-            Box::new(scp_core::context::LocalTransportProvider),
-            Box::new(NoOpEventLogProvider),
-            persistence,
-        )
-    });
+    let cm_arc = CONTEXT_MANAGER
+        .get_or_init(|| {
+            let persistence = build_persistence_provider();
+            build_context_manager(
+                Box::new(NoOpCryptoProvider),
+                Box::new(scp_core::context::LocalTransportProvider),
+                Box::new(NoOpEventLogProvider),
+                persistence,
+            )
+        })
+        .clone();
+
+    // Populate the BridgeInstance with a synthetic test DID.
+    // No-op if already set (OnceLock guarantees single initialization).
+    init_bridge_instance(cm_arc, "did:test:bridge");
 }
 
 /// Constructs a [`ProtocolRepositoryContextBridge`] from the global storage provider,
@@ -1706,5 +1769,51 @@ mod tests {
         );
 
         remove_context(&ctx_id);
+    }
+
+    // -----------------------------------------------------------------------
+    // BridgeInstance tests (#1549)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn bridge_instance_populated_by_init_context_manager() {
+        // init_context_manager_for_test populates both CONTEXT_MANAGER and
+        // BRIDGE_INSTANCE. Since OnceLock is process-global, the first call
+        // in any test wins — subsequent calls are no-ops. We rely on this
+        // being called (possibly by other tests) before asserting.
+        init_context_manager_for_test();
+
+        let cm = context_manager().expect("context_manager should be initialized");
+        let bi = bridge_instance().expect("bridge_instance should be initialized");
+
+        // Both should point to the same ContextManager allocation.
+        assert!(
+            Arc::ptr_eq(cm, bi.context_manager()),
+            "bridge_instance().context_manager() must be the same Arc as context_manager()"
+        );
+    }
+
+    #[test]
+    fn bridge_instance_has_local_did() {
+        init_context_manager_for_test();
+
+        let bi = bridge_instance().expect("bridge_instance should be initialized");
+        // init_context_manager_for_test uses "did:test:bridge" as the
+        // synthetic local DID.
+        assert!(
+            !bi.local_did().is_empty(),
+            "bridge_instance local_did should not be empty"
+        );
+    }
+
+    #[test]
+    fn bridge_instance_not_shutdown_initially() {
+        init_context_manager_for_test();
+
+        let bi = bridge_instance().expect("bridge_instance should be initialized");
+        assert!(
+            !bi.is_shutdown(),
+            "bridge_instance should not be shutdown immediately after init"
+        );
     }
 }
