@@ -18,6 +18,8 @@
 
 use serde::{Deserialize, Serialize};
 
+use super::handles::{TOOL_HANDLE_DEREGISTER, TOOL_HANDLE_LOOKUP, TOOL_HANDLE_REGISTER};
+use super::scope::{TOOL_SCOPE_DEREGISTER, TOOL_SCOPE_LOOKUP, TOOL_SCOPE_REGISTER};
 use super::{DID, RegistrationEntry};
 
 // ---------------------------------------------------------------------------
@@ -248,7 +250,15 @@ pub fn agent_deregister_schema() -> serde_json::Value {
 pub fn is_standard_tool(name: &str) -> bool {
     matches!(
         name,
-        TOOL_AGENT_SEARCH | TOOL_AGENT_REGISTER | TOOL_AGENT_DEREGISTER
+        TOOL_AGENT_SEARCH
+            | TOOL_AGENT_REGISTER
+            | TOOL_AGENT_DEREGISTER
+            | TOOL_SCOPE_REGISTER
+            | TOOL_SCOPE_LOOKUP
+            | TOOL_SCOPE_DEREGISTER
+            | TOOL_HANDLE_REGISTER
+            | TOOL_HANDLE_LOOKUP
+            | TOOL_HANDLE_DEREGISTER
     )
 }
 
@@ -259,6 +269,8 @@ pub fn is_standard_tool(name: &str) -> bool {
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
+    use super::super::handles::{TOOL_HANDLE_DEREGISTER, TOOL_HANDLE_LOOKUP, TOOL_HANDLE_REGISTER};
+    use super::super::scope::{TOOL_SCOPE_DEREGISTER, TOOL_SCOPE_LOOKUP, TOOL_SCOPE_REGISTER};
     use super::*;
 
     const AGENT_A_DID: &str = "did:dht:z6MkAgentA";
@@ -377,9 +389,19 @@ mod tests {
 
     #[test]
     fn is_standard_tool_detects_standard_names() {
+        // agent tools
         assert!(is_standard_tool(TOOL_AGENT_SEARCH));
         assert!(is_standard_tool(TOOL_AGENT_REGISTER));
         assert!(is_standard_tool(TOOL_AGENT_DEREGISTER));
+        // scope tools
+        assert!(is_standard_tool(TOOL_SCOPE_REGISTER));
+        assert!(is_standard_tool(TOOL_SCOPE_LOOKUP));
+        assert!(is_standard_tool(TOOL_SCOPE_DEREGISTER));
+        // handle tools
+        assert!(is_standard_tool(TOOL_HANDLE_REGISTER));
+        assert!(is_standard_tool(TOOL_HANDLE_LOOKUP));
+        assert!(is_standard_tool(TOOL_HANDLE_DEREGISTER));
+        // negative cases
         assert!(!is_standard_tool("custom_tool"));
         assert!(!is_standard_tool(""));
     }
