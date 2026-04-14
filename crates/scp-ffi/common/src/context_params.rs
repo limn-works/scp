@@ -189,7 +189,7 @@ fn parse_governance(
 ) -> Result<GovernanceModel, String> {
     match governance {
         "single_admin" | "" => Ok(GovernanceModel::SingleAdmin),
-        "threshold" => {
+        "threshold" | "multisig" => {
             let threshold = params.governance_threshold.unwrap_or(1);
             let signers = params.governance_signers.clone().unwrap_or_default();
             if signers.is_empty() {
@@ -200,7 +200,7 @@ fn parse_governance(
                 signers: signers.into_iter().map(scp_primitives::DID::from).collect(),
             })
         }
-        "majority" => {
+        "majority" | "token_voting" => {
             let voters = params.governance_voters.clone().unwrap_or_default();
             if voters.is_empty() {
                 return Err("majority governance requires at least one eligible voter".into());
@@ -318,8 +318,8 @@ fn parse_template_id(tid: &str) -> Result<scp_core::context::params::TemplateId,
         "scp:template/tool-interface" | "ToolInterfaceTemplate" => {
             Ok(TemplateId::ToolInterfaceTemplate)
         }
-        "PaidService" => Ok(TemplateId::PaidService),
-        "PaidBroadcast" => Ok(TemplateId::PaidBroadcast),
+        "PaidService" | "scp:template/paid-service" => Ok(TemplateId::PaidService),
+        "PaidBroadcast" | "scp:template/paid-broadcast" => Ok(TemplateId::PaidBroadcast),
         "scp:template/handle-registry"
         | "HandleRegistry"
         | "scp:template/discovery-context"
