@@ -8,8 +8,8 @@ use super::{
     ContextManager, ContextMode, ContextParams, ContextRoleState, ContextSnapshot, ContextState,
     DID, DeadlockDetectionState, EpochCoordinator, EpochState, GovernanceModel,
     GovernanceModelConfig, GovernanceState, GovernanceTimeoutTask, HashMap, HashSet, KeyPackage,
-    MemberBudgetTracker, MembershipState, Mutex, PerContextState, ReceiveBuffer, TemplateId,
-    TtlState, TtlTimer, build_governance_engine, builder_create_context, context_id_to_bytes,
+    MemberBudgetTracker, MembershipState, PerContextState, ReceiveBuffer, TemplateId, TtlState,
+    TtlTimer, build_governance_engine, builder_create_context, context_id_to_bytes,
     create_governance_engine, instrument, mint_governance_tokens, push_welcome_event,
     require_active, restore_governance_engine_from_snapshot, restore_grace_store_from_snapshot,
     roles, validate_governance_consistency, validate_governance_model,
@@ -590,18 +590,10 @@ impl ContextManager {
             merkle_tree: scp_event_log::EventLog::new(context_id.to_owned()),
         };
 
-        // Atomic check-and-insert via DashMap entry API — eliminates
-        // TOCTOU race between contains_key and insert.
-        match self.contexts.entry(context_id.to_owned()) {
-            dashmap::mapref::entry::Entry::Occupied(_) => {
-                return Err(ContextError::MembershipFailed(format!(
-                    "context '{context_id}' already registered"
-                )));
-            }
-            dashmap::mapref::entry::Entry::Vacant(vacant) => {
-                vacant.insert(Arc::new(Mutex::new(per_context)));
-            }
-        }
+        // Atomic check-and-insert — eliminates TOCTOU race between
+        // contains_key and insert.
+        self.insert_context(context_id.to_owned(), per_context)
+            .map_err(|e| ContextError::MembershipFailed(e.to_string()))?;
 
         // Start governance timeout task (ADR-031 §5).
         self.start_governance_timeout_task(context_id).await;
@@ -657,11 +649,9 @@ impl ContextManager {
     /// reconnection.
     #[instrument(skip_all, fields(context_id))]
     pub async fn context_needs_reconnect(&self, context_id: &str) -> bool {
-        let Some(entry) = self.contexts.get(context_id) else {
+        let Ok(arc) = self.get_context_arc(context_id) else {
             return false;
         };
-        let arc = entry.value().clone();
-        drop(entry);
         let ctx = arc.lock().await;
         ctx.epoch.needs_reconnect
     }
@@ -677,9 +667,7 @@ impl ContextManager {
     /// is not registered.
     #[instrument(skip_all, fields(context_id))]
     pub async fn clear_needs_reconnect(&self, context_id: &str) -> bool {
-        if let Some(entry) = self.contexts.get(context_id) {
-            let ctx_arc = Arc::clone(entry.value());
-            drop(entry);
+        if let Ok(ctx_arc) = self.get_context_arc(context_id) {
             let mut guard = ctx_arc.lock().await;
             let ctx = &mut *guard;
             ctx.epoch.needs_reconnect = false;
@@ -702,11 +690,7 @@ impl ContextManager {
         // Collect (key, Arc) pairs first to release DashMap shard locks before
         // awaiting per-context Mutexes. Holding a DashMap Ref across .await
         // would deadlock any concurrent shard access.
-        let entries: Vec<(String, Arc<Mutex<PerContextState>>)> = self
-            .contexts
-            .iter()
-            .map(|entry| (entry.key().clone(), Arc::clone(entry.value())))
-            .collect();
+        let entries = self.collect_context_arcs();
         let mut result = Vec::new();
         for (context_id, arc) in entries {
             let ctx = arc.lock().await;
@@ -1015,9 +999,7 @@ impl ContextManager {
         //    event log import at step 3 would overwrite the Active context's
         //    Merkle chain before we discover the conflict.
         {
-            if let Some(entry) = self.contexts.get(&context_id) {
-                let ctx_arc = Arc::clone(entry.value());
-                drop(entry);
+            if let Ok(ctx_arc) = self.get_context_arc(&context_id) {
                 let existing = ctx_arc.lock().await;
                 let is_replaceable = existing.handle.try_read_state().is_some_and(|s| {
                     matches!(
@@ -1331,9 +1313,7 @@ impl ContextManager {
         //    this insertion. A concurrent `create_context` or `import_context`
         //    could have registered an Active context in the meantime.
         {
-            if let Some(entry) = self.contexts.get(&context_id) {
-                let ctx_arc = Arc::clone(entry.value());
-                drop(entry);
+            if let Ok(ctx_arc) = self.get_context_arc(&context_id) {
                 let existing = ctx_arc.lock().await;
                 let is_replaceable = existing.handle.try_read_state().is_some_and(|s| {
                     matches!(
@@ -1350,9 +1330,9 @@ impl ContextManager {
                     )));
                 }
             }
-            self.contexts.remove(&context_id);
-            self.contexts
-                .insert(context_id.clone(), Arc::new(Mutex::new(per_context)));
+            self.remove_context(&context_id);
+            self.insert_context(context_id.clone(), per_context)
+                .map_err(|e| ContextError::MembershipFailed(e.to_string()))?;
         }
 
         self.update_context_gauges();
@@ -1362,10 +1342,8 @@ impl ContextManager {
 
         // 8. Persist if persistence is configured.
         if self.has_persistence()
-            && let Some(entry) = self.contexts.get(&context_id)
+            && let Ok(ctx_arc) = self.get_context_arc(&context_id)
         {
-            let ctx_arc = Arc::clone(entry.value());
-            drop(entry);
             let guard = ctx_arc.lock().await;
             let ctx = &*guard;
             let snap = Self::snapshot_context(ctx);
@@ -1527,18 +1505,9 @@ impl ContextManager {
             merkle_tree: scp_event_log::EventLog::new(context_id.clone()),
         };
 
-        // Atomic check-and-insert via DashMap entry API — eliminates
-        // TOCTOU race between contains_key and insert.
-        match self.contexts.entry(context_id.clone()) {
-            dashmap::mapref::entry::Entry::Occupied(_) => {
-                return Err(ContextCreationError::CreationFailed(format!(
-                    "context '{context_id}' already registered"
-                )));
-            }
-            dashmap::mapref::entry::Entry::Vacant(vacant) => {
-                vacant.insert(Arc::new(Mutex::new(per_context)));
-            }
-        }
+        // Atomic check-and-insert — eliminates TOCTOU race between
+        // contains_key and insert.
+        self.insert_context(context_id.clone(), per_context)?;
         self.finalize_create(&context_id, params.ttl, &handle).await;
         Ok(handle)
     }
@@ -1574,9 +1543,7 @@ impl ContextManager {
     /// was set by a different SDK version or received via sync.
     #[cfg(test)]
     pub(crate) async fn replace_stored_params(&self, context_id: &str, new_params: ContextParams) {
-        if let Some(entry) = self.contexts.get(context_id) {
-            let ctx_arc = Arc::clone(entry.value());
-            drop(entry);
+        if let Ok(ctx_arc) = self.get_context_arc(context_id) {
             let mut guard = ctx_arc.lock().await;
             let ctx = &mut *guard;
             let new_handle = ContextHandle::new(context_id.to_owned(), new_params);
@@ -1714,18 +1681,9 @@ impl ContextManager {
             governance_config,
         )?;
 
-        // Atomic check-and-insert via DashMap entry API — eliminates
-        // TOCTOU race between contains_key and insert.
-        match self.contexts.entry(context_id.clone()) {
-            dashmap::mapref::entry::Entry::Occupied(_) => {
-                return Err(ContextCreationError::CreationFailed(format!(
-                    "context '{context_id}' already registered"
-                )));
-            }
-            dashmap::mapref::entry::Entry::Vacant(vacant) => {
-                vacant.insert(Arc::new(Mutex::new(per_context)));
-            }
-        }
+        // Atomic check-and-insert — eliminates TOCTOU race between
+        // contains_key and insert.
+        self.insert_context(context_id.clone(), per_context)?;
 
         self.start_governance_timeout_task(&context_id).await;
         self.persist_context_and_broadcast(&context_id).await;
@@ -2136,9 +2094,7 @@ impl ContextManager {
             member_did.as_ref(),
         )?;
         {
-            if let Some(entry) = self.contexts.get(&context_id) {
-                let ctx_arc = Arc::clone(entry.value());
-                drop(entry);
+            if let Ok(ctx_arc) = self.get_context_arc(&context_id) {
                 let mut guard = ctx_arc.lock().await;
                 let ctx = &mut *guard;
                 ctx.checkpoint_events_since += 1;
@@ -2146,10 +2102,8 @@ impl ContextManager {
         }
         // Persist context state after join (best-effort).
         if self.has_persistence()
-            && let Some(entry) = self.contexts.get(&context_id)
+            && let Ok(ctx_arc) = self.get_context_arc(&context_id)
         {
-            let ctx_arc = Arc::clone(entry.value());
-            drop(entry);
             let guard = ctx_arc.lock().await;
             let ctx = &*guard;
             let snapshot = Self::snapshot_context(ctx);

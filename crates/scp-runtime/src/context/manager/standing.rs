@@ -122,9 +122,7 @@ impl ContextManager {
         // to the create-new-context path; the TOCTOU re-check below will
         // resolve any race idempotently.
         {
-            if let Some(entry) = self.contexts.get(&context_id) {
-                let arc = std::sync::Arc::clone(entry.value());
-                drop(entry);
+            if let Ok(arc) = self.get_context_arc(&context_id) {
                 let ctx = arc.lock().await;
                 let state = ctx.handle.try_read_state();
                 match state {
@@ -171,9 +169,7 @@ impl ContextManager {
                 // handle's `RwLock` while holding `contexts.lock()`. A
                 // contended state lock is treated as "not idempotent" and
                 // surfaces the original create error rather than masking it.
-                if let Some(entry) = self.contexts.get(&context_id) {
-                    let arc = std::sync::Arc::clone(entry.value());
-                    drop(entry);
+                if let Ok(arc) = self.get_context_arc(&context_id) {
                     let ctx = arc.lock().await;
                     if matches!(
                         ctx.handle.try_read_state(),
@@ -268,9 +264,7 @@ impl ContextManager {
         for (_key, peer_did) in &standing_entries {
             for local_did in &local_did_list {
                 let context_id = generate_standing_context_id(local_did, peer_did);
-                if let Some(entry) = self.contexts.get(&context_id) {
-                    let arc = std::sync::Arc::clone(entry.value());
-                    drop(entry);
+                if let Ok(arc) = self.get_context_arc(&context_id) {
                     let ctx = arc.lock().await;
                     handles.push((context_id, ctx.handle.clone()));
                     break;

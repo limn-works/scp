@@ -9,9 +9,8 @@ use scp_protocol::envelope::validation::{BufferedMessage, SequenceCheck, Timesta
 use scp_protocol::identity::SigningKeyId;
 
 use super::{
-    Arc, Capability, ContextError, ContextEvent, ContextGeneration, ContextHandle, ContextManager,
-    DID, PerContextState, context_id_to_bytes, evaluate_consequence_rules, instrument,
-    require_active,
+    Capability, ContextError, ContextEvent, ContextGeneration, ContextHandle, ContextManager, DID,
+    PerContextState, context_id_to_bytes, evaluate_consequence_rules, instrument, require_active,
 };
 
 /// Enforces economic policy for message sends (#1537, #1593).
@@ -897,9 +896,7 @@ impl ContextManager {
         // extra lock acquisition on the normal path.
         let sender_is_admin =
             if inner.message_type == scp_protocol::envelope::inner::MessageType::Recovery {
-                if let Some(ctx_entry) = self.contexts.get(context_id) {
-                    let ctx_arc = Arc::clone(ctx_entry.value());
-                    drop(ctx_entry);
+                if let Ok(ctx_arc) = self.get_context_arc(context_id) {
                     let guard = ctx_arc.lock().await;
                     let ctx = &*guard;
                     ctx.role_state

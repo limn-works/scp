@@ -108,7 +108,7 @@ impl ContextManager {
     /// Returns `None` if the context is not registered with this manager.
     #[instrument(skip_all, fields(context_id))]
     pub async fn member_count(&self, context_id: &str) -> Option<usize> {
-        let arc = self.contexts.get(context_id)?.value().clone();
+        let arc = self.get_context_arc(context_id).ok()?;
         let ctx = arc.lock().await;
         Some(ctx.membership.count())
     }
@@ -116,11 +116,9 @@ impl ContextManager {
     /// Returns `true` if the given DID is a member of the specified context.
     #[instrument(skip_all, fields(context_id))]
     pub async fn is_member(&self, context_id: &str, did: &str) -> bool {
-        let Some(entry) = self.contexts.get(context_id) else {
+        let Ok(arc) = self.get_context_arc(context_id) else {
             return false;
         };
-        let arc = entry.value().clone();
-        drop(entry);
         let ctx = arc.lock().await;
         ctx.membership.contains(did)
     }
@@ -128,11 +126,9 @@ impl ContextManager {
     /// Returns all member DIDs for a context.
     #[instrument(skip_all, fields(context_id))]
     pub async fn member_dids(&self, context_id: &str) -> Vec<String> {
-        let Some(entry) = self.contexts.get(context_id) else {
+        let Ok(arc) = self.get_context_arc(context_id) else {
             return Vec::new();
         };
-        let arc = entry.value().clone();
-        drop(entry);
         let ctx = arc.lock().await;
         ctx.membership
             .member_dids()
@@ -143,7 +139,7 @@ impl ContextManager {
     /// Returns the role assignment for a specific member in a context.
     #[instrument(skip_all, fields(context_id))]
     pub async fn member_role(&self, context_id: &str, did: &str) -> Option<RoleAssignment> {
-        let arc = self.contexts.get(context_id)?.value().clone();
+        let arc = self.get_context_arc(context_id).ok()?;
         let ctx = arc.lock().await;
         ctx.role_state.assignments.get(did).cloned()
     }
@@ -156,7 +152,7 @@ impl ContextManager {
     /// hardcoding protocol defaults.
     #[instrument(skip_all, fields(context_id))]
     pub async fn context_params(&self, context_id: &str) -> Option<ContextParams> {
-        let arc = self.contexts.get(context_id)?.value().clone();
+        let arc = self.get_context_arc(context_id).ok()?;
         let ctx = arc.lock().await;
         Some(ctx.handle.params().clone())
     }
@@ -168,7 +164,7 @@ impl ContextManager {
     /// governance actions that modify roles/capabilities.
     #[instrument(skip_all, fields(context_id))]
     pub async fn get_role_state(&self, context_id: &str) -> Option<ContextRoleState> {
-        let arc = self.contexts.get(context_id)?.value().clone();
+        let arc = self.get_context_arc(context_id).ok()?;
         let ctx = arc.lock().await;
         Some(ctx.role_state.clone())
     }
@@ -178,11 +174,9 @@ impl ContextManager {
     /// Returns an empty `Vec` if the context is not registered.
     #[instrument(skip_all, fields(context_id))]
     pub async fn drain_events(&self, context_id: &str) -> Vec<ContextEvent> {
-        let Some(entry) = self.contexts.get(context_id) else {
+        let Ok(arc) = self.get_context_arc(context_id) else {
             return Vec::new();
         };
-        let arc = entry.value().clone();
-        drop(entry);
         let mut ctx = arc.lock().await;
         ctx.receive_buffer.drain()
     }
@@ -254,9 +248,7 @@ impl ContextManager {
             let local_major =
                 scp_protocol::envelope::version_major(scp_protocol::envelope::SCP_PROTOCOL_VERSION);
             let remote_major = local_major; // same major guaranteed by VersionCompatibility
-            if let Some(entry) = self.contexts.get(context_id) {
-                let ctx_arc = Arc::clone(entry.value());
-                drop(entry);
+            if let Ok(ctx_arc) = self.get_context_arc(context_id) {
                 let mut guard = ctx_arc.lock().await;
                 let ctx = &mut *guard;
                 ctx.receive_buffer.push(ContextEvent::DegradedMode {
@@ -434,9 +426,7 @@ impl ContextManager {
         member_did: &str,
         key: scp_protocol::crypto::access_keys::AccessKey,
     ) {
-        if let Some(entry) = self.contexts.get(context_id) {
-            let ctx_arc = Arc::clone(entry.value());
-            drop(entry);
+        if let Ok(ctx_arc) = self.get_context_arc(context_id) {
             let mut guard = ctx_arc.lock().await;
             let ctx = &mut *guard;
             ctx.access.access_key_store.set(context_id, member_did, key);
@@ -449,9 +439,7 @@ impl ContextManager {
     /// for the pair, or the context is not registered, this is a no-op.
     #[instrument(skip_all, fields(context_id, member_did))]
     pub async fn remove_access_key(&self, context_id: &str, member_did: &str) {
-        if let Some(entry) = self.contexts.get(context_id) {
-            let ctx_arc = Arc::clone(entry.value());
-            drop(entry);
+        if let Ok(ctx_arc) = self.get_context_arc(context_id) {
             let mut guard = ctx_arc.lock().await;
             let ctx = &mut *guard;
             ctx.access.access_key_store.remove(context_id, member_did);
@@ -470,9 +458,7 @@ impl ContextManager {
         member_did: &str,
         key: scp_protocol::crypto::access_keys::AccessKey,
     ) {
-        if let Some(entry) = self.contexts.get(context_id) {
-            let ctx_arc = Arc::clone(entry.value());
-            drop(entry);
+        if let Ok(ctx_arc) = self.get_context_arc(context_id) {
             let mut guard = ctx_arc.lock().await;
             let ctx = &mut *guard;
             ctx.access.access_key_store.set(context_id, member_did, key);
@@ -489,7 +475,7 @@ impl ContextManager {
         context_id: &str,
         member_did: &str,
     ) -> Option<scp_protocol::crypto::access_keys::AccessKey> {
-        let arc = self.contexts.get(context_id)?.value().clone();
+        let arc = self.get_context_arc(context_id).ok()?;
         let ctx = arc.lock().await;
         ctx.access
             .access_key_store
@@ -506,11 +492,9 @@ impl ContextManager {
         &self,
         context_id: &str,
     ) -> std::collections::HashMap<String, scp_protocol::crypto::access_keys::AccessKey> {
-        let Some(entry) = self.contexts.get(context_id) else {
+        let Ok(arc) = self.get_context_arc(context_id) else {
             return std::collections::HashMap::new();
         };
-        let arc = entry.value().clone();
-        drop(entry);
         let ctx = arc.lock().await;
         ctx.access.access_key_store.get_all(context_id)
     }
@@ -530,9 +514,7 @@ impl ContextManager {
         member_did: &scp_identity::DID,
         amount: scp_protocol::economy::types::Amount,
     ) {
-        if let Some(entry) = self.contexts.get(context_id) {
-            let ctx_arc = Arc::clone(entry.value());
-            drop(entry);
+        if let Ok(ctx_arc) = self.get_context_arc(context_id) {
             let mut guard = ctx_arc.lock().await;
             let ctx = &mut *guard;
             ctx.governance.budget_tracker.grant(member_did, amount);
@@ -550,11 +532,9 @@ impl ContextManager {
         context_id: &str,
         member_did: &scp_identity::DID,
     ) -> scp_protocol::economy::types::Amount {
-        let Some(entry) = self.contexts.get(context_id) else {
+        let Ok(arc) = self.get_context_arc(context_id) else {
             return scp_protocol::economy::types::Amount::new(0);
         };
-        let arc = entry.value().clone();
-        drop(entry);
         let ctx = arc.lock().await;
         ctx.governance.budget_tracker.remaining(member_did)
     }
@@ -574,11 +554,9 @@ impl ContextManager {
         member_did: &scp_identity::DID,
         now_secs: u64,
     ) -> u64 {
-        let Some(entry) = self.contexts.get(context_id) else {
+        let Ok(arc) = self.get_context_arc(context_id) else {
             return 0;
         };
-        let arc = entry.value().clone();
-        drop(entry);
         let ctx = arc.lock().await;
         ctx.governance
             .velocity_tracker
@@ -600,11 +578,9 @@ impl ContextManager {
     /// pending commits.
     #[instrument(skip_all, fields(context_id))]
     pub async fn pending_commits(&self, context_id: &str) -> Vec<PendingCommit> {
-        let Some(entry) = self.contexts.get(context_id) else {
+        let Ok(arc) = self.get_context_arc(context_id) else {
             return Vec::new();
         };
-        let arc = entry.value().clone();
-        drop(entry);
         let ctx = arc.lock().await;
         ctx.pending_commits.iter().cloned().collect()
     }
@@ -620,7 +596,7 @@ impl ContextManager {
     /// Returns `None` if the context is not registered or has no fault marker.
     #[instrument(skip_all, fields(context_id))]
     pub async fn commit_fault(&self, context_id: &str) -> Option<CommitFaultMarker> {
-        let arc = self.contexts.get(context_id)?.value().clone();
+        let arc = self.get_context_arc(context_id).ok()?;
         let ctx = arc.lock().await;
         ctx.commit_fault.clone()
     }
@@ -892,9 +868,7 @@ impl ContextManager {
                     "failed to append EquivocationDetected to event log: {e}"
                 );
             }
-            if let Some(entry) = self.contexts.get(context_id) {
-                let ctx_arc = Arc::clone(entry.value());
-                drop(entry);
+            if let Ok(ctx_arc) = self.get_context_arc(context_id) {
                 let mut guard = ctx_arc.lock().await;
                 let ctx = &mut *guard;
                 ctx.checkpoint_events_since += 1;

@@ -352,9 +352,7 @@ impl ContextManager {
         // advance in step 2, the epoch is > 0 — using the real value ensures
         // receivers can validate the message against their local epoch state.
         let current_epoch = {
-            if let Some(entry) = self.contexts.get(context_id) {
-                let arc = entry.value().clone();
-                drop(entry);
+            if let Ok(arc) = self.get_context_arc(context_id) {
                 let ctx = arc.lock().await;
                 ctx.epoch.mls_epoch
             } else {

@@ -1,7 +1,7 @@
 //! Broadcast context operations (subscribe, publish, block).
 
 use super::{
-    Arc, BlockResult, BroadcastAdmission, BroadcastContent, BroadcastContext, BroadcastEnvelope,
+    BlockResult, BroadcastAdmission, BroadcastContent, BroadcastContext, BroadcastEnvelope,
     BuildHasher, Capability, ContextError, ContextEvent, ContextManager, DID, DidResolver,
     KeyRequestDecision, NonceTracker, ProofResolver, RevocationChecker, SubscriptionResult,
     UcanToken, UnsubscribeResult, ValidationContext, context_id_to_bytes, instrument,
@@ -92,10 +92,8 @@ impl ContextManager {
 
         // Persist context state after subscribe (best-effort).
         if self.has_persistence()
-            && let Some(entry) = self.contexts.get(context_id)
+            && let Ok(ctx_arc) = self.get_context_arc(context_id)
         {
-            let ctx_arc = Arc::clone(entry.value());
-            drop(entry);
             let guard = ctx_arc.lock().await;
             let ctx = &*guard;
             let ctx_snapshot = Self::snapshot_context(ctx);
@@ -109,9 +107,7 @@ impl ContextManager {
             subscriber_did.as_ref(),
         )?;
         {
-            if let Some(entry) = self.contexts.get(context_id) {
-                let ctx_arc = Arc::clone(entry.value());
-                drop(entry);
+            if let Ok(ctx_arc) = self.get_context_arc(context_id) {
                 let mut guard = ctx_arc.lock().await;
                 let ctx = &mut *guard;
                 ctx.checkpoint_events_since += 1;
@@ -184,10 +180,8 @@ impl ContextManager {
 
         // Persist context state after unsubscribe (best-effort).
         if self.has_persistence()
-            && let Some(entry) = self.contexts.get(context_id)
+            && let Ok(ctx_arc) = self.get_context_arc(context_id)
         {
-            let ctx_arc = Arc::clone(entry.value());
-            drop(entry);
             let guard = ctx_arc.lock().await;
             let ctx = &*guard;
             let ctx_snapshot = Self::snapshot_context(ctx);
@@ -200,9 +194,7 @@ impl ContextManager {
             subscriber_did.as_ref(),
         )?;
         {
-            if let Some(entry) = self.contexts.get(context_id) {
-                let ctx_arc = Arc::clone(entry.value());
-                drop(entry);
+            if let Ok(ctx_arc) = self.get_context_arc(context_id) {
                 let mut guard = ctx_arc.lock().await;
                 let ctx = &mut *guard;
                 ctx.checkpoint_events_since += 1;
@@ -341,9 +333,7 @@ impl ContextManager {
             author_did.as_ref(),
         )?;
         {
-            if let Some(entry) = self.contexts.get(context_id) {
-                let ctx_arc = Arc::clone(entry.value());
-                drop(entry);
+            if let Ok(ctx_arc) = self.get_context_arc(context_id) {
                 let mut guard = ctx_arc.lock().await;
                 let ctx = &mut *guard;
                 ctx.checkpoint_events_since += 1;
@@ -454,9 +444,7 @@ impl ContextManager {
             author_did.as_ref(),
         )?;
         {
-            if let Some(entry) = self.contexts.get(context_id) {
-                let ctx_arc = Arc::clone(entry.value());
-                drop(entry);
+            if let Ok(ctx_arc) = self.get_context_arc(context_id) {
                 let mut guard = ctx_arc.lock().await;
                 let ctx = &mut *guard;
                 ctx.checkpoint_events_since += 1;
@@ -534,9 +522,7 @@ impl ContextManager {
             author_did.as_ref(),
         )?;
         {
-            if let Some(entry) = self.contexts.get(context_id) {
-                let ctx_arc = Arc::clone(entry.value());
-                drop(entry);
+            if let Ok(ctx_arc) = self.get_context_arc(context_id) {
                 let mut guard = ctx_arc.lock().await;
                 let ctx = &mut *guard;
                 ctx.checkpoint_events_since += 1;
@@ -602,7 +588,7 @@ impl ContextManager {
     /// Returns `None` if the context is not registered or not broadcast.
     #[instrument(skip_all, fields(context_id))]
     pub async fn broadcast_subscriber_count(&self, context_id: &str) -> Option<usize> {
-        let arc = self.contexts.get(context_id)?.value().clone();
+        let arc = self.get_context_arc(context_id).ok()?;
         let ctx = arc.lock().await;
         ctx.broadcast_context
             .as_ref()
@@ -612,11 +598,9 @@ impl ContextManager {
     /// Returns `true` if the given DID is a subscriber in a broadcast context.
     #[instrument(skip_all, fields(context_id))]
     pub async fn is_broadcast_subscriber(&self, context_id: &str, did: &str) -> bool {
-        let Some(entry) = self.contexts.get(context_id) else {
+        let Ok(arc) = self.get_context_arc(context_id) else {
             return false;
         };
-        let arc = entry.value().clone();
-        drop(entry);
         let ctx = arc.lock().await;
         ctx.broadcast_context
             .as_ref()
@@ -628,7 +612,7 @@ impl ContextManager {
     /// Returns `None` if the context is not registered or not broadcast.
     #[instrument(skip_all, fields(context_id))]
     pub async fn broadcast_admission(&self, context_id: &str) -> Option<BroadcastAdmission> {
-        let arc = self.contexts.get(context_id)?.value().clone();
+        let arc = self.get_context_arc(context_id).ok()?;
         let ctx = arc.lock().await;
         ctx.broadcast_context
             .as_ref()

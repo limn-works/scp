@@ -1354,9 +1354,7 @@ impl ContextManager {
                     actor,
                 )?;
                 {
-                    if let Some(entry) = self.contexts.get(context_id) {
-                        let ctx_arc = Arc::clone(entry.value());
-                        drop(entry);
+                    if let Ok(ctx_arc) = self.get_context_arc(context_id) {
                         let mut guard = ctx_arc.lock().await;
                         let ctx = &mut *guard;
                         ctx.checkpoint_events_since += 1;
@@ -1921,10 +1919,8 @@ impl ContextManager {
                 }
             }
             if conflict_event_count > 0
-                && let Some(entry) = self.contexts.get(context_id)
+                && let Ok(ctx_arc) = self.get_context_arc(context_id)
             {
-                let ctx_arc = Arc::clone(entry.value());
-                drop(entry);
                 let mut guard = ctx_arc.lock().await;
                 let ctx = &mut *guard;
                 ctx.checkpoint_events_since += conflict_event_count;
@@ -1944,10 +1940,8 @@ impl ContextManager {
 
         // Persist context state after proposal creation.
         if self.has_persistence()
-            && let Some(entry) = self.contexts.get(context_id)
+            && let Ok(ctx_arc) = self.get_context_arc(context_id)
         {
-            let ctx_arc = Arc::clone(entry.value());
-            drop(entry);
             let guard = ctx_arc.lock().await;
             let ctx = &*guard;
             let snapshot = Self::snapshot_context(ctx);
@@ -2121,10 +2115,8 @@ impl ContextManager {
                 }
             }
             if conflict_event_count > 0
-                && let Some(entry) = self.contexts.get(context_id)
+                && let Ok(ctx_arc) = self.get_context_arc(context_id)
             {
-                let ctx_arc = Arc::clone(entry.value());
-                drop(entry);
                 let mut guard = ctx_arc.lock().await;
                 let ctx = &mut *guard;
                 ctx.checkpoint_events_since += conflict_event_count;
@@ -2141,9 +2133,7 @@ impl ContextManager {
         if let Some(proposal) = proposal_for_execution {
             // Check if we're in governance freeze before executing
             let in_freeze = {
-                if let Some(ctx_entry) = self.contexts.get(context_id) {
-                    let ctx_arc = Arc::clone(ctx_entry.value());
-                    drop(ctx_entry);
+                if let Ok(ctx_arc) = self.get_context_arc(context_id) {
                     let guard = ctx_arc.lock().await;
                     let ctx = &*guard;
                     ctx.governance.freeze.is_some()
@@ -2160,10 +2150,8 @@ impl ContextManager {
 
         // Persist context state after vote.
         if self.has_persistence()
-            && let Some(entry) = self.contexts.get(context_id)
+            && let Ok(ctx_arc) = self.get_context_arc(context_id)
         {
-            let ctx_arc = Arc::clone(entry.value());
-            drop(entry);
             let guard = ctx_arc.lock().await;
             let ctx = &*guard;
             let snapshot = Self::snapshot_context(ctx);
@@ -2378,10 +2366,8 @@ impl ContextManager {
             event_count += 1;
         }
         if event_count > 0
-            && let Some(entry) = self.contexts.get(context_id)
+            && let Ok(ctx_arc) = self.get_context_arc(context_id)
         {
-            let ctx_arc = Arc::clone(entry.value());
-            drop(entry);
             let mut guard = ctx_arc.lock().await;
             let ctx = &mut *guard;
             ctx.checkpoint_events_since += event_count;
@@ -2389,10 +2375,8 @@ impl ContextManager {
 
         // Persist context state after withdrawal.
         if self.has_persistence()
-            && let Some(entry) = self.contexts.get(context_id)
+            && let Ok(ctx_arc) = self.get_context_arc(context_id)
         {
-            let ctx_arc = Arc::clone(entry.value());
-            drop(entry);
             let guard = ctx_arc.lock().await;
             let ctx = &*guard;
             let snapshot = Self::snapshot_context(ctx);
@@ -2463,9 +2447,7 @@ impl ContextManager {
         self.event_log
             .append_context_event(&context_id_bytes, "MemberSuspended", actor_did)?;
         {
-            if let Some(entry) = self.contexts.get(context_id) {
-                let ctx_arc = Arc::clone(entry.value());
-                drop(entry);
+            if let Ok(ctx_arc) = self.get_context_arc(context_id) {
                 let mut guard = ctx_arc.lock().await;
                 let ctx = &mut *guard;
                 ctx.checkpoint_events_since += 1;
@@ -2610,9 +2592,7 @@ impl ContextManager {
             Some(&serde_json::json!({"target_did": did.as_ref()})),
         )?;
         {
-            if let Some(entry) = self.contexts.get(context_id) {
-                let ctx_arc = Arc::clone(entry.value());
-                drop(entry);
+            if let Ok(ctx_arc) = self.get_context_arc(context_id) {
                 let mut guard = ctx_arc.lock().await;
                 let ctx = &mut *guard;
                 ctx.checkpoint_events_since += 1;
@@ -2756,9 +2736,7 @@ impl ContextManager {
         self.event_log
             .append_context_event(&context_id_bytes, "AccessRestored", actor_did)?;
         {
-            if let Some(entry) = self.contexts.get(context_id) {
-                let ctx_arc = Arc::clone(entry.value());
-                drop(entry);
+            if let Ok(ctx_arc) = self.get_context_arc(context_id) {
                 let mut guard = ctx_arc.lock().await;
                 let ctx = &mut *guard;
                 ctx.checkpoint_events_since += 1;
@@ -2846,9 +2824,7 @@ impl ContextManager {
         self.event_log
             .append_context_event(&context_id_bytes, "MemberJoined", actor_did)?;
         {
-            if let Some(entry) = self.contexts.get(context_id) {
-                let ctx_arc = Arc::clone(entry.value());
-                drop(entry);
+            if let Ok(ctx_arc) = self.get_context_arc(context_id) {
                 let mut guard = ctx_arc.lock().await;
                 let ctx = &mut *guard;
                 ctx.checkpoint_events_since += 1;
@@ -2974,9 +2950,7 @@ impl ContextManager {
         self.event_log
             .append_context_event(&context_id_bytes, "MemberLeft", actor_did)?;
         {
-            if let Some(entry) = self.contexts.get(context_id) {
-                let ctx_arc = Arc::clone(entry.value());
-                drop(entry);
+            if let Ok(ctx_arc) = self.get_context_arc(context_id) {
                 let mut guard = ctx_arc.lock().await;
                 let ctx = &mut *guard;
                 ctx.checkpoint_events_since += 1;
@@ -3040,9 +3014,7 @@ impl ContextManager {
         self.event_log
             .append_context_event(&context_id_bytes, "RoleAssigned", actor_did)?;
         {
-            if let Some(entry) = self.contexts.get(context_id) {
-                let ctx_arc = Arc::clone(entry.value());
-                drop(entry);
+            if let Ok(ctx_arc) = self.get_context_arc(context_id) {
                 let mut guard = ctx_arc.lock().await;
                 let ctx = &mut *guard;
                 ctx.checkpoint_events_since += 1;
@@ -3097,9 +3069,7 @@ impl ContextManager {
         self.event_log
             .append_context_event(&context_id_bytes, "ToolRegistered", actor_did)?;
         {
-            if let Some(entry) = self.contexts.get(context_id) {
-                let ctx_arc = Arc::clone(entry.value());
-                drop(entry);
+            if let Ok(ctx_arc) = self.get_context_arc(context_id) {
                 let mut guard = ctx_arc.lock().await;
                 let ctx = &mut *guard;
                 ctx.checkpoint_events_since += 1;
@@ -3141,9 +3111,7 @@ impl ContextManager {
         self.event_log
             .append_context_event(&context_id_bytes, "ToolRemoved", actor_did)?;
         {
-            if let Some(entry) = self.contexts.get(context_id) {
-                let ctx_arc = Arc::clone(entry.value());
-                drop(entry);
+            if let Ok(ctx_arc) = self.get_context_arc(context_id) {
                 let mut guard = ctx_arc.lock().await;
                 let ctx = &mut *guard;
                 ctx.checkpoint_events_since += 1;
@@ -3222,9 +3190,7 @@ impl ContextManager {
             actor_did,
         )?;
         {
-            if let Some(entry) = self.contexts.get(context_id) {
-                let ctx_arc = Arc::clone(entry.value());
-                drop(entry);
+            if let Ok(ctx_arc) = self.get_context_arc(context_id) {
                 let mut guard = ctx_arc.lock().await;
                 let ctx = &mut *guard;
                 ctx.checkpoint_events_since += 1;
@@ -3285,9 +3251,7 @@ impl ContextManager {
             self.event_log
                 .append_context_event(&context_id_bytes, "CeilingModified", "")?;
             {
-                if let Some(entry) = self.contexts.get(context_id) {
-                    let ctx_arc = Arc::clone(entry.value());
-                    drop(entry);
+                if let Ok(ctx_arc) = self.get_context_arc(context_id) {
                     let mut guard = ctx_arc.lock().await;
                     let ctx = &mut *guard;
                     ctx.checkpoint_events_since += 1;
@@ -3481,9 +3445,7 @@ impl ContextManager {
             actor_did,
         )?;
         {
-            if let Some(entry) = self.contexts.get(context_id) {
-                let ctx_arc = Arc::clone(entry.value());
-                drop(entry);
+            if let Ok(ctx_arc) = self.get_context_arc(context_id) {
                 let mut guard = ctx_arc.lock().await;
                 let ctx = &mut *guard;
                 ctx.checkpoint_events_since += 1;
@@ -3562,9 +3524,7 @@ impl ContextManager {
         self.event_log
             .append_context_event(&context_id_bytes, "AdminTransferred", actor_did)?;
         {
-            if let Some(entry) = self.contexts.get(context_id) {
-                let ctx_arc = Arc::clone(entry.value());
-                drop(entry);
+            if let Ok(ctx_arc) = self.get_context_arc(context_id) {
                 let mut guard = ctx_arc.lock().await;
                 let ctx = &mut *guard;
                 ctx.checkpoint_events_since += 1;
@@ -3609,9 +3569,7 @@ impl ContextManager {
         self.event_log
             .append_context_event(&context_id_bytes, "ChildContextCreated", actor_did)?;
         {
-            if let Some(entry) = self.contexts.get(context_id) {
-                let ctx_arc = Arc::clone(entry.value());
-                drop(entry);
+            if let Ok(ctx_arc) = self.get_context_arc(context_id) {
                 let mut guard = ctx_arc.lock().await;
                 let ctx = &mut *guard;
                 ctx.checkpoint_events_since += 1;
@@ -3695,9 +3653,7 @@ impl ContextManager {
             actor_did,
         )?;
         {
-            if let Some(entry) = self.contexts.get(context_id) {
-                let ctx_arc = Arc::clone(entry.value());
-                drop(entry);
+            if let Ok(ctx_arc) = self.get_context_arc(context_id) {
                 let mut guard = ctx_arc.lock().await;
                 let ctx = &mut *guard;
                 ctx.checkpoint_events_since += 1;
@@ -3781,9 +3737,7 @@ impl ContextManager {
         self.event_log
             .append_context_event(&context_id_bytes, "SignerAdded", actor_did)?;
         {
-            if let Some(entry) = self.contexts.get(context_id) {
-                let ctx_arc = Arc::clone(entry.value());
-                drop(entry);
+            if let Ok(ctx_arc) = self.get_context_arc(context_id) {
                 let mut guard = ctx_arc.lock().await;
                 let ctx = &mut *guard;
                 ctx.checkpoint_events_since += 1;
@@ -3863,9 +3817,7 @@ impl ContextManager {
         self.event_log
             .append_context_event(&context_id_bytes, "SignerRemoved", actor_did)?;
         {
-            if let Some(entry) = self.contexts.get(context_id) {
-                let ctx_arc = Arc::clone(entry.value());
-                drop(entry);
+            if let Ok(ctx_arc) = self.get_context_arc(context_id) {
                 let mut guard = ctx_arc.lock().await;
                 let ctx = &mut *guard;
                 ctx.checkpoint_events_since += 1;
@@ -3912,9 +3864,7 @@ impl ContextManager {
         self.event_log
             .append_context_event(&context_id_bytes, "ThresholdModified", actor_did)?;
         {
-            if let Some(entry) = self.contexts.get(context_id) {
-                let ctx_arc = Arc::clone(entry.value());
-                drop(entry);
+            if let Ok(ctx_arc) = self.get_context_arc(context_id) {
                 let mut guard = ctx_arc.lock().await;
                 let ctx = &mut *guard;
                 ctx.checkpoint_events_since += 1;
@@ -3972,9 +3922,7 @@ impl ContextManager {
             actor_did,
         )?;
         {
-            if let Some(entry) = self.contexts.get(context_id) {
-                let ctx_arc = Arc::clone(entry.value());
-                drop(entry);
+            if let Ok(ctx_arc) = self.get_context_arc(context_id) {
                 let mut guard = ctx_arc.lock().await;
                 let ctx = &mut *guard;
                 ctx.checkpoint_events_since += 1;
@@ -4081,9 +4029,7 @@ impl ContextManager {
         // Track the epoch reset so the governance timeout task can invalidate
         // this member's votes on pending proposals (ADR-031 §5, ADR-029 Tier 3).
         {
-            if let Some(entry) = self.contexts.get(context_id) {
-                let ctx_arc = Arc::clone(entry.value());
-                drop(entry);
+            if let Ok(ctx_arc) = self.get_context_arc(context_id) {
                 let mut guard = ctx_arc.lock().await;
                 let ctx = &mut *guard;
                 ctx.checkpoint_events_since += 1;
@@ -4218,9 +4164,7 @@ impl ContextManager {
             actor_did,
         )?;
         {
-            if let Some(entry) = self.contexts.get(context_id) {
-                let ctx_arc = Arc::clone(entry.value());
-                drop(entry);
+            if let Ok(ctx_arc) = self.get_context_arc(context_id) {
                 let mut guard = ctx_arc.lock().await;
                 let ctx = &mut *guard;
                 ctx.checkpoint_events_since += 1;
@@ -4303,9 +4247,7 @@ impl ContextManager {
         self.event_log
             .append_context_event(&context_id_bytes, "ContextPromoted", actor_did)?;
         {
-            if let Some(entry) = self.contexts.get(context_id) {
-                let ctx_arc = Arc::clone(entry.value());
-                drop(entry);
+            if let Ok(ctx_arc) = self.get_context_arc(context_id) {
                 let mut guard = ctx_arc.lock().await;
                 let ctx = &mut *guard;
                 ctx.checkpoint_events_since += 1;
@@ -4428,9 +4370,7 @@ impl ContextManager {
         self.event_log
             .append_context_event(&context_id_bytes, "ContentKeysRotated", actor_did)?;
         {
-            if let Some(entry) = self.contexts.get(context_id) {
-                let ctx_arc = Arc::clone(entry.value());
-                drop(entry);
+            if let Ok(ctx_arc) = self.get_context_arc(context_id) {
                 let mut guard = ctx_arc.lock().await;
                 let ctx = &mut *guard;
                 ctx.checkpoint_events_since += 1;
@@ -4538,9 +4478,7 @@ impl ContextManager {
             actor_did,
         )?;
         {
-            if let Some(entry) = self.contexts.get(context_id) {
-                let ctx_arc = Arc::clone(entry.value());
-                drop(entry);
+            if let Ok(ctx_arc) = self.get_context_arc(context_id) {
                 let mut guard = ctx_arc.lock().await;
                 let ctx = &mut *guard;
                 ctx.checkpoint_events_since += 1;
@@ -4637,9 +4575,7 @@ impl ContextManager {
             actor_did,
         )?;
         {
-            if let Some(entry) = self.contexts.get(context_id) {
-                let ctx_arc = Arc::clone(entry.value());
-                drop(entry);
+            if let Ok(ctx_arc) = self.get_context_arc(context_id) {
                 let mut guard = ctx_arc.lock().await;
                 let ctx = &mut *guard;
                 ctx.checkpoint_events_since += 1;
@@ -4697,9 +4633,7 @@ impl ContextManager {
             self.event_log
                 .append_context_event(&context_id_bytes, "EconomicPolicyApplied", "")?;
             {
-                if let Some(entry) = self.contexts.get(context_id) {
-                    let ctx_arc = Arc::clone(entry.value());
-                    drop(entry);
+                if let Ok(ctx_arc) = self.get_context_arc(context_id) {
                     let mut guard = ctx_arc.lock().await;
                     let ctx = &mut *guard;
                     ctx.checkpoint_events_since += 1;
@@ -4826,9 +4760,7 @@ impl ContextManager {
             actor_did,
         )?;
         {
-            if let Some(entry) = self.contexts.get(context_id) {
-                let ctx_arc = Arc::clone(entry.value());
-                drop(entry);
+            if let Ok(ctx_arc) = self.get_context_arc(context_id) {
                 let mut guard = ctx_arc.lock().await;
                 let ctx = &mut *guard;
                 ctx.checkpoint_events_since += 1;
@@ -4917,9 +4849,7 @@ impl ContextManager {
             actor_did,
         )?;
         {
-            if let Some(entry) = self.contexts.get(context_id) {
-                let ctx_arc = Arc::clone(entry.value());
-                drop(entry);
+            if let Ok(ctx_arc) = self.get_context_arc(context_id) {
                 let mut guard = ctx_arc.lock().await;
                 let ctx = &mut *guard;
                 ctx.checkpoint_events_since += 1;
@@ -5061,9 +4991,7 @@ impl ContextManager {
             .await
         {
             // Roll back: revert source to Active and clear migration state.
-            if let Some(entry) = self.contexts.get(context_id) {
-                let ctx_arc = Arc::clone(entry.value());
-                drop(entry);
+            if let Ok(ctx_arc) = self.get_context_arc(context_id) {
                 let mut guard = ctx_arc.lock().await;
                 let ctx = &mut *guard;
                 let _ = ctx.handle.transition_to(&ContextState::Active).await;
@@ -5086,9 +5014,7 @@ impl ContextManager {
             actor_did,
         )?;
         {
-            if let Some(entry) = self.contexts.get(context_id) {
-                let ctx_arc = Arc::clone(entry.value());
-                drop(entry);
+            if let Ok(ctx_arc) = self.get_context_arc(context_id) {
                 let mut guard = ctx_arc.lock().await;
                 let ctx = &mut *guard;
                 ctx.checkpoint_events_since += 1;
@@ -5182,9 +5108,7 @@ impl ContextManager {
             actor_did,
         )?;
         {
-            if let Some(entry) = self.contexts.get(context_id) {
-                let ctx_arc = Arc::clone(entry.value());
-                drop(entry);
+            if let Ok(ctx_arc) = self.get_context_arc(context_id) {
                 let mut guard = ctx_arc.lock().await;
                 let ctx = &mut *guard;
                 ctx.checkpoint_events_since += 1;
@@ -5295,9 +5219,7 @@ impl ContextManager {
             "",
         )?;
         {
-            if let Some(entry) = self.contexts.get(context_id) {
-                let ctx_arc = Arc::clone(entry.value());
-                drop(entry);
+            if let Ok(ctx_arc) = self.get_context_arc(context_id) {
                 let mut guard = ctx_arc.lock().await;
                 let ctx = &mut *guard;
                 ctx.checkpoint_events_since += 1;
@@ -5311,9 +5233,8 @@ impl ContextManager {
     /// Returns `None` if the context is not registered or not migrating.
     #[instrument(skip_all, fields(context_id))]
     pub async fn migration_state(&self, context_id: &str) -> Option<MigrationState> {
-        let ctx_entry = self.contexts.get(context_id)?;
-        let ctx_arc = Arc::clone(ctx_entry.value());
-        drop(ctx_entry);
+        let ctx_arc = self.get_context_arc(context_id).ok()?;
+
         let guard = ctx_arc.lock().await;
         let ctx = &*guard;
         ctx.migration_state.clone()
@@ -5404,7 +5325,7 @@ impl ContextManager {
     /// cancelled via [`GovernanceTimeoutTask::cancel()`].
     #[allow(clippy::too_many_lines)] // Five-phase task spawn closure; phases are factored into helper methods.
     pub(super) async fn start_governance_timeout_task(&self, context_id: &str) {
-        let contexts = Arc::clone(&self.contexts);
+        let contexts = self.contexts_arc();
         let clock = Arc::clone(&self.clock);
         let event_log = Arc::clone(&self.event_log);
         // PR #1606 C6: capture the transport so the commit retry phase can
@@ -5415,11 +5336,9 @@ impl ContextManager {
 
         // Lock ordering: task_set before contexts (consistent with spawn_ttl_timer).
         let mut task_set = self.task_set.lock().await;
-        let Some(ctx_entry) = self.contexts.get(&ctx_id) else {
+        let Ok(ctx_arc) = self.get_context_arc(&ctx_id) else {
             return;
         };
-        let ctx_arc = Arc::clone(ctx_entry.value());
-        drop(ctx_entry);
         let mut guard = ctx_arc.lock().await;
         let ctx = &mut *guard;
 
@@ -5936,9 +5855,7 @@ impl ContextManager {
                     actor_did,
                 )?;
                 {
-                    if let Some(entry) = self.contexts.get(context_id) {
-                        let ctx_arc = Arc::clone(entry.value());
-                        drop(entry);
+                    if let Ok(ctx_arc) = self.get_context_arc(context_id) {
                         let mut guard = ctx_arc.lock().await;
                         let ctx = &mut *guard;
                         ctx.checkpoint_events_since += 1;
@@ -6000,9 +5917,7 @@ impl ContextManager {
                     actor_did,
                 )?;
                 {
-                    if let Some(entry) = self.contexts.get(context_id) {
-                        let ctx_arc = Arc::clone(entry.value());
-                        drop(entry);
+                    if let Ok(ctx_arc) = self.get_context_arc(context_id) {
                         let mut guard = ctx_arc.lock().await;
                         let ctx = &mut *guard;
                         ctx.checkpoint_events_since += 1;
@@ -6028,8 +5943,9 @@ impl ContextManager {
     /// because it does not own the manager.
     #[allow(dead_code)] // Used by tests; production path uses the static helper.
     pub(super) async fn process_pending_commits(&self, context_id: &str) {
+        let contexts = self.contexts_arc();
         Self::process_pending_commits_static(
-            &self.contexts,
+            &contexts,
             context_id,
             Arc::clone(&self.transport),
             Arc::clone(&self.event_log),

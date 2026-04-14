@@ -388,7 +388,7 @@ async fn setup_two_member_verified_context() -> (
 
     // Add Bob as a member with access key.
     {
-        let arc = manager.contexts.get("test-ctx").unwrap().value().clone();
+        let arc = manager.get_context_arc("test-ctx").unwrap();
         let mut ctx = arc.lock().await;
         ctx.membership
             .add_member("did:key:bob".into(), "member".into(), vec![]);
@@ -619,7 +619,7 @@ async fn revoked_member_cannot_decrypt_new_messages() {
 
     // Verify the access key was actually removed by the governance action.
     {
-        let arc = manager.contexts.get("test-ctx").unwrap().value().clone();
+        let arc = manager.get_context_arc("test-ctx").unwrap();
         let ctx = arc.lock().await;
         assert!(
             !ctx.access
@@ -713,7 +713,7 @@ async fn rotate_content_keys_regenerates_access_keys() {
 
     // Record that we have access keys before rotation.
     {
-        let arc = manager.contexts.get("test-ctx").unwrap().value().clone();
+        let arc = manager.get_context_arc("test-ctx").unwrap();
         let ctx = arc.lock().await;
         let all_keys = ctx.access.access_key_store.get_all("test-ctx");
         assert!(
@@ -843,7 +843,7 @@ async fn deliver_incoming_buffers_out_of_order_message() {
     );
 
     // Verify the reorder buffer has the message.
-    let arc = manager.contexts.get("test-ctx").unwrap().value().clone();
+    let arc = manager.get_context_arc("test-ctx").unwrap();
     let ctx = arc.lock().await;
     assert_eq!(
         ctx.reorder_buffer
@@ -934,7 +934,7 @@ async fn deliver_incoming_gap_fill_delivers_buffered() {
     assert_eq!(payloads[2], b"msg-3");
 
     // Verify the reorder buffer is now empty.
-    let arc = manager.contexts.get("test-ctx").unwrap().value().clone();
+    let arc = manager.get_context_arc("test-ctx").unwrap();
     let ctx = arc.lock().await;
     assert_eq!(
         ctx.reorder_buffer.total_buffered(),
@@ -1590,7 +1590,7 @@ async fn velocity_consequence_trigger_on_send() {
 
     let sk = ed25519_dalek::SigningKey::from_bytes(&[1u8; 32]);
     let handle = {
-        let arc = manager.contexts.get("vel-msg-ctx").unwrap().value().clone();
+        let arc = manager.get_context_arc("vel-msg-ctx").unwrap();
         let ctx = arc.lock().await;
         ctx.handle.clone()
     };
@@ -2103,7 +2103,7 @@ async fn tool_invoke_respects_hard_rate_limit() {
     // Grant a large budget so budget exhaustion cannot be confused with
     // the rate limit. The rate limit fires first.
     {
-        let arc = manager.contexts.get("tool-rl-ctx").unwrap().value().clone();
+        let arc = manager.get_context_arc("tool-rl-ctx").unwrap();
         let mut ctx = arc.lock().await;
         ctx.governance
             .budget_tracker
@@ -3182,7 +3182,7 @@ async fn governance_actions_stay_free_under_priced_policy() {
 async fn restored_velocity_tracker_uses_60_second_window() {
     let (manager, _handle) = setup_active_context().await;
     let window = {
-        let arc = manager.contexts.get("test-ctx").unwrap().value().clone();
+        let arc = manager.get_context_arc("test-ctx").unwrap();
         let ctx_guard = arc.lock().await;
         ctx_guard.governance.velocity_tracker.window_secs()
     };
@@ -3618,7 +3618,7 @@ async fn setup_two_member_context_with(
         .unwrap();
 
     {
-        let arc = manager.contexts.get("test-ctx").unwrap().value().clone();
+        let arc = manager.get_context_arc("test-ctx").unwrap();
         let mut ctx = arc.lock().await;
         ctx.membership
             .add_member("did:key:bob".into(), "member".into(), vec![]);
@@ -3657,7 +3657,7 @@ async fn deliver_incoming_event_log_append_precedes_consequence_eval() {
     // calls `event_log_entries_for_consequences` (the rule list cannot be
     // empty or the block short-circuits).
     {
-        let arc = manager.contexts.get("test-ctx").unwrap().value().clone();
+        let arc = manager.get_context_arc("test-ctx").unwrap();
         let mut ctx = arc.lock().await;
         ctx.governance.consequence_rules = vec![ConsequenceRule {
             trigger: ConsequenceTrigger::MessageVelocity,
@@ -3804,7 +3804,7 @@ async fn deliver_incoming_with_velocity_rule_counts_just_received_message() {
             .unwrap();
     }
     {
-        let arc = manager.contexts.get("test-ctx").unwrap().value().clone();
+        let arc = manager.get_context_arc("test-ctx").unwrap();
         let mut ctx = arc.lock().await;
         ctx.governance.consequence_rules = vec![ConsequenceRule {
             trigger: ConsequenceTrigger::MessageVelocity,
@@ -3960,7 +3960,7 @@ async fn c1b_paid_tool_context(
         .unwrap();
 
     {
-        let arc = manager.contexts.get(name).unwrap().value().clone();
+        let arc = manager.get_context_arc(name).unwrap();
         let mut ctx = arc.lock().await;
         ctx.governance
             .budget_tracker
@@ -4019,7 +4019,7 @@ async fn tool_invoke_fabricated_spending_ucan_rejected_by_signature() {
 
     // Budget MUST be untouched — signature check runs before record_spend.
     let remaining = {
-        let arc = manager.contexts.get("c1b-sig-ctx").unwrap().value().clone();
+        let arc = manager.get_context_arc("c1b-sig-ctx").unwrap();
         let ctx_guard = arc.lock().await;
         ctx_guard
             .governance
