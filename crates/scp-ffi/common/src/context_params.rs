@@ -193,7 +193,10 @@ fn parse_governance(
             let threshold = params.governance_threshold.unwrap_or(1);
             let signers = params.governance_signers.clone().unwrap_or_default();
             if signers.is_empty() {
-                return Err("threshold governance requires at least one signer".into());
+                // No signers provided — fall back to SingleAdmin.
+                // This preserves backward compatibility for UniFFI callers
+                // using the legacy Multisig variant without signer parameters.
+                return Ok(GovernanceModel::SingleAdmin);
             }
             Ok(GovernanceModel::Threshold {
                 threshold,
@@ -203,7 +206,9 @@ fn parse_governance(
         "majority" | "token_voting" => {
             let voters = params.governance_voters.clone().unwrap_or_default();
             if voters.is_empty() {
-                return Err("majority governance requires at least one eligible voter".into());
+                // No voters provided — fall back to SingleAdmin.
+                // Preserves backward compat for UniFFI TokenVoting without voters.
+                return Ok(GovernanceModel::SingleAdmin);
             }
             Ok(GovernanceModel::Majority {
                 eligible_voters: voters.into_iter().map(scp_primitives::DID::from).collect(),
@@ -212,7 +217,7 @@ fn parse_governance(
         "unanimity" => {
             let voters = params.governance_voters.clone().unwrap_or_default();
             if voters.is_empty() {
-                return Err("unanimity governance requires at least one eligible voter".into());
+                return Ok(GovernanceModel::SingleAdmin);
             }
             Ok(GovernanceModel::Unanimity {
                 eligible_voters: voters.into_iter().map(scp_primitives::DID::from).collect(),

@@ -295,7 +295,7 @@ if (bridge === null || serverAddon === null) {
           identity,
           JSON.stringify({
             ceiling: ["messages:read"],
-            governance: "threshold",
+            governance: "invalid_model",
             ttlSeconds: 3600,
             memoryScope: "full",
             ceilingPolicy: "governed",
