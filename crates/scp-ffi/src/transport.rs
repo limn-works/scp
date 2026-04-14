@@ -280,7 +280,7 @@ pub fn py_configure_relay_transport(relay_url: &str, local_did: &str) -> PyResul
     let transport = Box::new(scp_transport::RelayTransportProvider::new(adapter));
     let event_log: Box<dyn scp_core::context::builder::ContextEventLogProvider> =
         Box::new(crate::runtime::NoOpEventLogProvider);
-    crate::runtime::init_context_manager_with(crypto, transport, event_log, None);
+    crate::runtime::init_context_manager_with(local_did, crypto, transport, event_log, None);
 
     Ok(())
 }

@@ -83,7 +83,9 @@ fn auto_wire_context_manager(
             let transport = Box::new(scp_transport::RelayTransportProvider::new(adapter));
             let event_log: Box<dyn scp_core::context::builder::ContextEventLogProvider> =
                 Box::new(crate::runtime::NoOpEventLogProvider);
-            crate::runtime::init_context_manager_with(crypto, transport, event_log, None);
+            crate::runtime::init_context_manager_with(
+                &did_owned, crypto, transport, event_log, None,
+            );
 
             // Also populate the TRANSPORT_MANAGER global so that broadcast
             // publish, context subscribe, and discovery probing work without
