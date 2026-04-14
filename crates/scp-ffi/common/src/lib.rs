@@ -79,6 +79,11 @@ pub fn html_escape_json(json: &str) -> String {
         .replace('\'', "\\u0027")
 }
 
+// Self-contained bridge instance replacing process-global OnceLock singletons.
+// Requires scp-core (behind `resolvers` feature). Not available for WASM.
+#[cfg(feature = "resolvers")]
+pub mod bridge_instance;
+
 // Shared context-parameter builder for all non-WASM bridges.
 // Requires scp-core (behind `resolvers` feature). Not available for WASM.
 #[cfg(feature = "resolvers")]
