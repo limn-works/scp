@@ -196,6 +196,10 @@ fn init_bridge_instance(context_manager: Arc<ContextManager>, local_did: &str) {
         if let Some(reg) = FFI_BRIDGE_STATE.get() {
             reg.clear();
         }
+        // Clear the connected relay URL tracking
+        if let Ok(mut url) = crate::transport::connected_url_state().write() {
+            *url = None;
+        }
         // MCP server/client registries
         crate::mcp::clear_registries();
     }));

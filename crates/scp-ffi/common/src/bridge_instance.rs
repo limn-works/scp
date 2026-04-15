@@ -927,7 +927,9 @@ impl BridgeInstance {
     /// Called once during identity system setup. Subsequent calls are no-ops
     /// (`OnceLock` guarantees single initialization).
     pub fn set_did_resolver(&self, resolver: Arc<IdentityBackedDidResolver>) {
-        let _ = self.did_resolver.set(resolver);
+        if self.did_resolver.set(resolver).is_err() {
+            tracing::warn!("set_did_resolver called but resolver already initialized — ignoring");
+        }
     }
 }
 

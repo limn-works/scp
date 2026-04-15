@@ -49,7 +49,7 @@ use crate::validate;
 static CONNECTED_RELAY_URL: OnceLock<RwLock<Option<String>>> = OnceLock::new();
 
 /// Returns a reference to the connected relay URL state.
-fn connected_url_state() -> &'static RwLock<Option<String>> {
+pub(crate) fn connected_url_state() -> &'static RwLock<Option<String>> {
     CONNECTED_RELAY_URL.get_or_init(|| RwLock::new(None))
 }
 
