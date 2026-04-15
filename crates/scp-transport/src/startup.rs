@@ -28,7 +28,11 @@ use crate::native::storage::BlobStorageBackend;
 pub fn env_or<T: std::str::FromStr>(name: &str, default: T) -> T {
     match env::var(name) {
         Ok(val) => val.parse().unwrap_or_else(|_| {
-            tracing::warn!(var = name, value = %val, "invalid value, using default");
+            tracing::warn!(
+                var = name,
+                value_len = val.len(),
+                "invalid value, using default"
+            );
             default
         }),
         Err(_) => default,

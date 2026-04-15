@@ -2774,9 +2774,16 @@ async fn identity_create_link_attestation_impl(
         &verification_method,
         platform_id,
     )
-    .map_err(|e| ScpError::Identity {
-        msg: e.to_string(),
-        code: codes::IDENT_1041.to_owned(),
+    .map_err(|e| {
+        let code = match &e {
+            scp_ffi_common::attestation::AttestationBuildError::InvalidMethod(_)
+            | scp_ffi_common::attestation::AttestationBuildError::ClockError => codes::IDENT_1040,
+            _ => codes::IDENT_1041,
+        };
+        ScpError::Identity {
+            msg: e.to_string(),
+            code: code.to_owned(),
+        }
     })?;
 
     let mut attestation = built.attestation;

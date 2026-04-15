@@ -1413,9 +1413,14 @@ pub async fn identity_create_link_attestation(
         platform_id,
     )
     .map_err(|e| {
+        let code = match &e {
+            scp_ffi_common::attestation::AttestationBuildError::InvalidMethod(_)
+            | scp_ffi_common::attestation::AttestationBuildError::ClockError => codes::IDENT_1040,
+            _ => codes::IDENT_1041,
+        };
         NapiError::from(ScpNapiError::Identity {
             message: e.to_string(),
-            code: codes::IDENT_1041.to_owned(),
+            code: code.to_owned(),
         })
     })?;
 
