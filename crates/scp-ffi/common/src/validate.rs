@@ -607,7 +607,9 @@ pub fn validate_governance_action_strings(
         | GovernanceAction::RotateContentKeys {
             reason: Some(r), ..
         } => {
-            validate_governance_reason(r)?;
+            if !r.is_empty() {
+                validate_governance_reason(r)?;
+            }
         }
         GovernanceAction::ResetMember { reason, .. } => {
             validate_governance_reason(reason)?;
@@ -1260,6 +1262,12 @@ mod tests {
         assert!(err.message.contains("exceeds maximum length"));
     }
 
+    #[test]
+    fn governance_reason_empty_string_rejected() {
+        let err = validate_governance_reason("").unwrap_err();
+        assert!(err.message.contains("must not be empty"));
+    }
+
     // -- Payment adapter ref --
 
     #[test]
@@ -1399,6 +1407,37 @@ mod tests {
         let action = GovernanceAction::RemoveMember {
             did: scp_primitives::DID("did:dht:z6MkTest".to_owned()),
             reason: None,
+        };
+        assert!(validate_governance_action_strings(&action).is_ok());
+    }
+
+    #[test]
+    fn remove_member_empty_string_reason_accepted() {
+        use scp_protocol::context::governance::GovernanceAction;
+
+        let action = GovernanceAction::RemoveMember {
+            did: scp_primitives::DID("did:dht:z6MkTest".to_owned()),
+            reason: Some(String::new()),
+        };
+        assert!(validate_governance_action_strings(&action).is_ok());
+    }
+
+    #[test]
+    fn close_context_empty_string_reason_accepted() {
+        use scp_protocol::context::governance::GovernanceAction;
+
+        let action = GovernanceAction::CloseContext {
+            reason: Some(String::new()),
+        };
+        assert!(validate_governance_action_strings(&action).is_ok());
+    }
+
+    #[test]
+    fn rotate_content_keys_empty_string_reason_accepted() {
+        use scp_protocol::context::governance::GovernanceAction;
+
+        let action = GovernanceAction::RotateContentKeys {
+            reason: Some(String::new()),
         };
         assert!(validate_governance_action_strings(&action).is_ok());
     }
