@@ -80,7 +80,7 @@ cargo +nightly fuzz list --fuzz-dir fuzz
 
 ## Target Inventory
 
-All 18 targets, grouped by tier and trust boundary.
+All 26 targets, grouped by tier and trust boundary.
 
 **Trust boundaries:**
 - **B1** — Relay wire protocol (any unauthenticated TCP connection)
@@ -109,6 +109,9 @@ Highest priority. Raw bytes + dictionary. Any of these panicking is a P0 securit
 | `fuzz_capability_uri` | B3 | Raw UTF-8 | `capability_uri.dict` | 4 KiB |
 | `fuzz_broadcast_content` | B2 | Raw bytes | `msgpack_broadcast.dict` | 512 KiB |
 | `fuzz_deserialize_export` | B2 | Raw bytes | `msgpack_export.dict` | 1 MiB |
+| `fuzz_stored_value` | B2 | Raw bytes | `msgpack_stored_value.dict` | 1 MiB |
+| `fuzz_redb_blob` | B1 | Raw bytes | `msgpack_redb_blob.dict` | 512 KiB |
+| `fuzz_broadcast_envelope` | B2 | Raw bytes | `msgpack_broadcast_envelope.dict` | 1 MiB |
 
 ### Tier 3 — Invariant & Differential Targets
 
@@ -120,8 +123,10 @@ Test security properties beyond no-panic. Mix of raw bytes and structured `Arbit
 | `fuzz_sender_header_roundtrip` | B1 | Raw bytes | I1, parse→build→parse identity |
 | `fuzz_chunk_envelope` | B2 | Raw bytes | I1, I2 (`total_chunks` allocation bounds) |
 | `fuzz_merkle_proof` | B3 | Arbitrary (`ArbMerkleProof`) | I1, I2, single-bit flip in sibling hash changes result |
+| `fuzz_merkle_proof_random` | B3 | Arbitrary (`ArbInclusionProof`) | I1 (no panic on adversarially random proofs) |
 | `fuzz_canonical_hash_differential` | B2 | Arbitrary (`ArbCanonicalHashInput`) | I1, I10 (different `InnerEnvelopeParams` → different hash) |
 | `fuzz_aad_differential` | B2 | Arbitrary (`ArbAadInput`) | I1, I9 (different `(context_id, sender_did)` → different AAD) |
+| `fuzz_signing_canonical_hash_differential` | B2 | Arbitrary (`ArbCanonicalHashInput`) | I1, I3 (sign-then-verify consistency: signing hash == verification hash) |
 
 ### Tier 4 — Validation Depth & State
 
@@ -130,6 +135,9 @@ Require structured generation to reach code paths that raw bytes cannot.
 | Target | Trust Boundary | Strategy | Invariants |
 |--------|---------------|----------|------------|
 | `fuzz_validate_ucan_deep` | B3 | Arbitrary + real Ed25519 | I1, I3, I6, I7, I8 (expired/revoked/ceiling/depth) |
+| `fuzz_ucan_chain_deep` | B3 | Arbitrary + real Ed25519 | I1, I7 (capability ceiling), I8 (delegation chain depth ≤ 32) |
+| `fuzz_nonce_replay` | B3 | Arbitrary (nonce sequences) | I1, I4 (accepted nonce never re-accepted) |
+| `fuzz_epoch_monotonicity` | B2 | Arbitrary (epoch sequences) | I1, I5 (no epoch rollback accepted) |
 
 ## Running Locally
 
@@ -292,12 +300,12 @@ JWT fields (`alg`, `typ`, `iss`, `aud`, `exp`, `att`, `prf`), and UCAN-specific 
 |----|-----------|-------------|
 | I1 | No panic on any untrusted input | All targets |
 | I2 | No unbounded allocation (bounded by protocol constants) | T1–T6, T10–T11, T14–T15 |
-| I3 | Cryptographic signatures unforgeable (no structural bypass) | T16, T18 |
-| I4 | Nonce replay prevention: accepted nonce never re-accepted | — (future T20) |
-| I5 | Epoch monotonicity: no rollback | — (future T19) |
+| I3 | Cryptographic signatures unforgeable (no structural bypass) | T16, T18, `fuzz_signing_canonical_hash_differential` |
+| I4 | Nonce replay prevention: accepted nonce never re-accepted | `fuzz_nonce_replay` |
+| I5 | Epoch monotonicity: no rollback | `fuzz_epoch_monotonicity` |
 | I6 | Timestamps outside `[now - max_age, now + skew]` always rejected | T18 |
-| I7 | Capabilities outside ceiling always rejected | — (T18 fixes capability + ceiling, not exercised) |
-| I8 | Delegation chain verification terminates (depth ≤ 32) | — (T18 uses empty `prf`, no chain walked) |
+| I7 | Capabilities outside ceiling always rejected | `fuzz_ucan_chain_deep` |
+| I8 | Delegation chain verification terminates (depth ≤ 32) | `fuzz_ucan_chain_deep` |
 | I9 | Different `(context_id, sender_did)` → different AAD | T17 |
 | I10 | Different `InnerEnvelopeParams` → different canonical hash | T16 |
 

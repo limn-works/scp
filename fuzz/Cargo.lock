@@ -2433,14 +2433,19 @@ dependencies = [
  "arbitrary",
  "base64",
  "ed25519-dalek",
+ "hex",
  "libfuzzer-sys",
  "rmp-serde",
+ "rmpv",
  "scp-event-log",
  "scp-primitives",
  "scp-protocol",
  "scp-runtime",
  "scp-transport",
+ "serde",
+ "serde_bytes",
  "serde_json",
+ "sha2",
 ]
 
 [[package]]
