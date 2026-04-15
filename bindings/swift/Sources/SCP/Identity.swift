@@ -550,7 +550,7 @@ public enum RevocationStatus: Sendable, Equatable {
     /// - Parameters:
     ///   - revokedAt: Unix timestamp (seconds) when the attestation was revoked.
     ///   - reason: Optional human-readable revocation reason.
-    case revoked(revokedAt: Int, reason: String? = nil)
+    case revoked(revokedAt: UInt64, reason: String? = nil)
 
     /// The status string: `"active"` or `"revoked"`. Internal — use pattern matching.
     var status: String {
@@ -564,7 +564,7 @@ public enum RevocationStatus: Sendable, Equatable {
 
     /// Unix timestamp (seconds) when the attestation was revoked.
     /// Returns `nil` for active attestations.
-    public var revokedAt: Int? {
+    public var revokedAt: UInt64? {
         switch self {
         case .active:
             return nil
@@ -901,7 +901,7 @@ private struct AttestationWire: Codable {
     func toIdentityAttestation(rawJson: String?) -> IdentityAttestation {
         let status: RevocationStatus = revocationStatus == "Active"
             ? .active
-            : .revoked(revokedAt: Int(issuedAt), reason: nil)
+            : .revoked(revokedAt: issuedAt, reason: nil)
         return IdentityAttestation(
             id: id,
             platform: claim.platform,

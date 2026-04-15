@@ -85,6 +85,9 @@ class TestIdentityAttestationDataclass:
         att = IdentityAttestation._from_dict(data)
         assert att.revocation_status == RevocationStatus(status="active")
         assert att.platform_id is None
+        # Float verified_at should be coerced to int at the deserialization boundary.
+        assert isinstance(att.verified_at, int)
+        assert att.verified_at == 1700000000
 
     def test_to_bridge_dict_roundtrip(self) -> None:
         att = IdentityAttestation(

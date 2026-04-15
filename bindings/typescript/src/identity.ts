@@ -41,13 +41,21 @@ export interface IdentityLinkAttestation {
     method: string;
     /** Opaque proof string per spec §3.5.2 — verifiers MUST use as-is in signature scope. */
     proof: string;
+    /** Unix timestamp (integer seconds) when the claim was verified. */
     verified_at: number;
     verifier_did?: string;
   };
   /** Revocation status: `"Active"` or `{ Revoked: { revoked_at, reason, revoked_by } }`. */
   revocation_status:
     | "Active"
-    | { Revoked: { revoked_at: number; reason: string; revoked_by: string } };
+    | {
+        Revoked: {
+          /** Unix timestamp (integer seconds) when the attestation was revoked. */
+          revoked_at: number;
+          reason: string;
+          revoked_by: string;
+        };
+      };
   /** Ed25519 signature bytes. */
   signature: number[];
 }
@@ -533,11 +541,14 @@ export class RevocationStatus {
   static _fromBridgeValue(raw: unknown): RevocationStatus {
     if (typeof raw === "object" && raw !== null && "Revoked" in raw) {
       const revoked = (raw as Record<string, Record<string, unknown>>).Revoked;
-      const revokedAt = revoked?.revoked_at as number | undefined;
-      if (revokedAt === undefined) {
+      const revokedAtRaw = revoked?.revoked_at as number | undefined;
+      if (revokedAtRaw === undefined) {
         throw new Error("Bridge returned Revoked status without revoked_at timestamp");
       }
-      return RevocationStatus.revoked(revokedAt, revoked?.reason as string | undefined);
+      return RevocationStatus.revoked(
+        Math.trunc(revokedAtRaw),
+        revoked?.reason as string | undefined,
+      );
     }
     if (typeof raw === "string") {
       const lower = raw.toLowerCase();
@@ -692,7 +703,9 @@ export class IdentityAttestation implements IdentityAttestationData {
     const verificationMethod = (evidence.method ??
       data.verification_method ??
       data.verificationMethod) as string;
-    const verifiedAt = (evidence.verified_at ?? data.verified_at ?? data.verifiedAt) as number;
+    const verifiedAt = Math.trunc(
+      (evidence.verified_at ?? data.verified_at ?? data.verifiedAt) as number,
+    );
     const rawRs = data.revocation_status ?? data.revocationStatus ?? "active";
     const revocationStatus =
       rawRs instanceof RevocationStatus ? rawRs : RevocationStatus._fromBridgeValue(rawRs);
