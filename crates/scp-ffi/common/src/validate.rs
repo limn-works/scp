@@ -166,10 +166,13 @@ const HTML_SPECIAL_CHARS: [char; 5] = ['<', '>', '&', '"', '\''];
 /// These characters create injection vectors when user-controlled fields are
 /// serialized into JSON for SDK consumers or rendered in downstream UIs.
 fn reject_html_special_chars(value: &str, field_name: &str) -> Result<(), ValidationError> {
-    if let Some(pos) = value.find(HTML_SPECIAL_CHARS.as_slice()) {
-        let ch = value[pos..].chars().next().unwrap_or('?');
+    if let Some((pos, ch)) = value
+        .chars()
+        .enumerate()
+        .find(|(_, c)| HTML_SPECIAL_CHARS.contains(c))
+    {
         return Err(ValidationError::new(format!(
-            "{field_name} contains HTML-special character U+{:04X} at byte position {pos}",
+            "{field_name} contains HTML-special character U+{:04X} at position {pos}",
             ch as u32
         )));
     }
