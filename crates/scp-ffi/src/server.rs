@@ -32,7 +32,19 @@ use scp_transport::relay::connection::{RelayUrlSource, SourcedRelayUrl};
 
 fn server_err(e: ServerError) -> PyErr {
     tracing::debug!(error = %e, "server operation failed");
-    pyo3::exceptions::PyRuntimeError::new_err(e.user_message())
+    match &e {
+        ServerError::MissingPassphrase => {
+            // Map to ValidationError (code SCP-VALID-7004) to match the
+            // UniFFI bridge and allow Python callers to distinguish this
+            // actionable error from generic RuntimeError failures.
+            crate::error::ScpPyError::ValidationError {
+                message: e.user_message(),
+                code: scp_ffi_common::error_codes::VALID_7004.to_owned(),
+            }
+            .into()
+        }
+        _ => pyo3::exceptions::PyRuntimeError::new_err(e.user_message()),
+    }
 }
 
 fn node_err(e: NodeError) -> PyErr {

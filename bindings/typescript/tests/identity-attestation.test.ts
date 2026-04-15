@@ -8,6 +8,7 @@
  */
 
 import { describe, expect, it } from "bun:test";
+import { ValidationError } from "../src/errors";
 import { IdentityAttestation, RevocationStatus } from "../src/identity";
 
 // ---------------------------------------------------------------------------
@@ -154,5 +155,77 @@ describe("IdentityAttestation", () => {
     expect(revokedRt.status).toBe("revoked");
     expect(revokedRt.revokedAt).toBe(1700000100);
     expect(revokedRt.reason).toBe("test");
+  });
+
+  // ---------------------------------------------------------------------------
+  // NaN / Infinity guard tests (SCP-VALID-7005)
+  // ---------------------------------------------------------------------------
+
+  it("_fromRecord throws ValidationError SCP-VALID-7005 for NaN verified_at", () => {
+    expect(() =>
+      IdentityAttestation._fromRecord({
+        id: "abc123",
+        platform: "github.com",
+        platform_handle: "alice",
+        verification_method: "did:dht:z6Mk...#active",
+        verified_at: Number.NaN,
+      }),
+    ).toThrow(ValidationError);
+    try {
+      IdentityAttestation._fromRecord({
+        id: "abc123",
+        platform: "github.com",
+        platform_handle: "alice",
+        verification_method: "did:dht:z6Mk...#active",
+        verified_at: Number.NaN,
+      });
+    } catch (e) {
+      expect(e).toBeInstanceOf(ValidationError);
+      expect((e as ValidationError).code).toBe("SCP-VALID-7005");
+    }
+  });
+
+  it("_fromRecord throws ValidationError SCP-VALID-7005 for Infinity verified_at", () => {
+    try {
+      IdentityAttestation._fromRecord({
+        id: "abc123",
+        platform: "github.com",
+        platform_handle: "alice",
+        verification_method: "did:dht:z6Mk...#active",
+        verified_at: Infinity,
+      });
+      throw new Error("should have thrown");
+    } catch (e) {
+      expect(e).toBeInstanceOf(ValidationError);
+      expect((e as ValidationError).code).toBe("SCP-VALID-7005");
+    }
+  });
+
+  it("RevocationStatus._fromBridgeValue throws ValidationError SCP-VALID-7005 for NaN revoked_at", () => {
+    try {
+      RevocationStatus._fromBridgeValue({ Revoked: { revoked_at: Number.NaN } });
+      throw new Error("should have thrown");
+    } catch (e) {
+      expect(e).toBeInstanceOf(ValidationError);
+      expect((e as ValidationError).code).toBe("SCP-VALID-7005");
+    }
+  });
+
+  it("RevocationStatus.revoked() factory throws ValidationError for NaN revokedAt", () => {
+    expect(() => RevocationStatus.revoked(Number.NaN, "reason")).toThrow(ValidationError);
+  });
+
+  it("IdentityAttestation constructor throws ValidationError for NaN verifiedAt", () => {
+    expect(
+      () =>
+        new IdentityAttestation({
+          id: "abc123",
+          platform: "github.com",
+          platformHandle: "alice",
+          verificationMethod: "did:dht:z6Mk...#active",
+          verifiedAt: Number.NaN,
+          revocationStatus: RevocationStatus.active(),
+        }),
+    ).toThrow(ValidationError);
   });
 });

@@ -15,7 +15,7 @@ import asyncio
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
-from scp_sdk.errors import IdentityError
+from scp_sdk.errors import IdentityError, ValidationError
 from scp_sdk.sync import run_sync
 from scp_sdk.types import CustodyType
 
@@ -649,19 +649,29 @@ class Identity:
 
 
 def _parse_finite_int(value: object, field_name: str) -> int:
-    """Coerce *value* to ``int``, raising :class:`ValueError` on NaN/Infinity.
+    """Coerce *value* to ``int``, raising :class:`ValidationError` on NaN/Infinity.
 
-    ``int(float('nan'))`` and ``int(float('inf'))`` both raise
-    ``ValueError`` already, but ``int(float('nan'))`` raises
-    ``ValueError: cannot convert float NaN to integer`` with an unhelpful
-    message in some Python versions.  This wrapper normalises the error
-    message and catches ``OverflowError`` (raised for very large floats on
-    some platforms).
+    Raises ``ValidationError`` with code ``SCP-VALID-7005`` ("Invalid
+    field value") to match the TypeScript SDK's behavior — both bridges
+    parse the same wire format and should surface the same error type
+    and code so cross-language consumers can handle them uniformly.
+
+    ``bool`` is explicitly rejected because ``isinstance(True, int)`` is
+    ``True`` in Python (bool is a subclass of int), so ``int(True)`` returns
+    ``1`` silently — a boolean should never be treated as a Unix timestamp.
     """
+    if isinstance(value, bool):
+        raise ValidationError(
+            f"{field_name} must be a finite integer, got bool",
+            "SCP-VALID-7005",
+        )
     try:
         return int(value)  # type: ignore[arg-type]
     except (TypeError, ValueError, OverflowError) as e:
-        raise ValueError(f"{field_name} must be a finite integer: {e}") from e
+        raise ValidationError(
+            f"{field_name} must be a finite integer: {e}",
+            "SCP-VALID-7005",
+        ) from e
 
 
 # ---------------------------------------------------------------------------
@@ -699,8 +709,11 @@ class RevocationStatus:
                 f"Invalid revocation status: {self.status!r} (expected 'active' or 'revoked')"
             )
         # Coerce revoked_at to int — floats can sneak in from JSON deserialization.
-        if self.revoked_at is not None and not isinstance(self.revoked_at, int):
-            object.__setattr__(self, "revoked_at", int(self.revoked_at))
+        # Also reject booleans (bool is a subclass of int in Python).
+        if self.revoked_at is not None and (
+            not isinstance(self.revoked_at, int) or isinstance(self.revoked_at, bool)
+        ):
+            object.__setattr__(self, "revoked_at", _parse_finite_int(self.revoked_at, "revoked_at"))
 
 
 # ---------------------------------------------------------------------------
@@ -745,8 +758,9 @@ class IdentityAttestation:
 
     def __post_init__(self) -> None:
         # Coerce verified_at to int — floats can sneak in from JSON deserialization.
-        if not isinstance(self.verified_at, int):
-            self.verified_at = int(self.verified_at)
+        # Also reject booleans (bool is a subclass of int in Python).
+        if not isinstance(self.verified_at, int) or isinstance(self.verified_at, bool):
+            self.verified_at = _parse_finite_int(self.verified_at, "verified_at")
 
     def _to_bridge_dict(self) -> dict[str, Any]:
         """Convert to a dict for bridge serialization."""

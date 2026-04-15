@@ -607,7 +607,7 @@ pub fn validate_governance_action_strings(
         | GovernanceAction::RotateContentKeys {
             reason: Some(r), ..
         } => {
-            if !r.is_empty() {
+            if !r.trim().is_empty() {
                 validate_governance_reason(r)?;
             }
         }
@@ -1418,6 +1418,17 @@ mod tests {
         let action = GovernanceAction::RemoveMember {
             did: scp_primitives::DID("did:dht:z6MkTest".to_owned()),
             reason: Some(String::new()),
+        };
+        assert!(validate_governance_action_strings(&action).is_ok());
+    }
+
+    #[test]
+    fn remove_member_whitespace_only_reason_accepted() {
+        use scp_protocol::context::governance::GovernanceAction;
+
+        let action = GovernanceAction::RemoveMember {
+            did: scp_primitives::DID("did:dht:z6MkTest".to_owned()),
+            reason: Some("   ".to_owned()),
         };
         assert!(validate_governance_action_strings(&action).is_ok());
     }

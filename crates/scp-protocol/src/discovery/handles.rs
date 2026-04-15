@@ -71,10 +71,13 @@ pub struct HandleMetadata {
 /// Output of the `handle_register` tool.
 ///
 /// Returns an unambiguous status: `"registered"` on success, `"conflict"` when
-/// another DID already holds the requested handle.
+/// another DID already holds the requested handle, `"ownership_mismatch"` when
+/// the registrant DID does not match an identity-target's DID, or
+/// `"capacity_exceeded"` when the registry is at the [`MAX_HANDLE_ENTRIES`]
+/// cap.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct HandleRegisterResult {
-    /// Outcome: `"registered"` or `"conflict"`.
+    /// Outcome: see [`HandleRegisterStatus`] for all possible values.
     pub status: HandleRegisterStatus,
     /// Present when `status` is `Registered`. Unique identifier for this entry.
     pub entry_id: Option<String>,

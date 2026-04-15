@@ -30,7 +30,18 @@ use crate::{decrement_handle_count, increment_handle_count};
 
 fn server_err(e: ServerError) -> NapiError {
     tracing::debug!(error = %e, "server operation failed");
-    NapiError::from_reason(e.user_message())
+    match &e {
+        ServerError::MissingPassphrase => {
+            // Map to Validation error (code SCP-VALID-7004) to match the
+            // UniFFI bridge and allow TypeScript callers to distinguish this
+            // actionable error from generic failures.
+            NapiError::from(ScpNapiError::Validation {
+                message: e.user_message(),
+                code: scp_ffi_common::error_codes::VALID_7004.to_owned(),
+            })
+        }
+        _ => NapiError::from_reason(e.user_message()),
+    }
 }
 
 fn node_err(e: NodeError) -> NapiError {
