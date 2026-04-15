@@ -189,6 +189,12 @@
 - RUSTSEC-2026-0044/0048/0049 (aws-lc-sys): suppressed as transitive, awaiting upstream. Appropriate.
 - MEDIUM REMAINING: BootstrapConfig bootstrap resolver doesn't enforce expected_creator_did -- intentional but documentation-only guarantee. If callers skip post-join verification, Sybil attack vector remains.
 
+### PR #1628 -- BridgeInstance Extraction (2026-04-14)
+- HIGH: context_manager() bypasses check_ready() -- 52 NAPI + 42 UniFFI operations skip shutdown/suspend guard
+- MEDIUM: known_contexts eviction TOCTOU; rate limiter ephemeral bypass at capacity; STORAGE_PROVIDER not clearable; shutdown hook panic payload leaks; hook silent drop on mutex poison
+- GOOD: TransportLockError sanitized; shutdown idempotent via swap; check_ready ordered; bounded registries; catch_unwind on hooks; hook-after-shutdown runs immediately; Send+Sync compile assert
+- Pattern: bridge_instance() enforces lifecycle; context_manager() does not -- all bridges must route through bridge_instance()
+
 ### PR #1606 -- Epoch/Sequence AAD, MLS Management Messages, Timestamp Bounds (2026-03-31, R2)
 - FIXED: sender key AAD zeros (#1422) -- real epoch/sequence wired into AES-256-GCM AAD with length-prefixed build_sender_aad
 - FIXED: sender key distributions now MLS-wrapped via mls_encrypt_management (SCPM magic prefix dispatch)

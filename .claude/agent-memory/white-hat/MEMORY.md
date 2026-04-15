@@ -139,6 +139,32 @@
 - M4: velocity recorded BEFORE economy enforcement for accurate pricing
 - Nonce replay prevention on spending UCANs
 
+## Session Changes Review (2026-04-14, PRs #1629-#1642, #1649)
+
+### Round 2 NaN/bool findings CLOSED by #1649 (verified round 3)
+- TS: Number.isFinite guards at all 4 sites (constructor L621, revoked() L518, _fromBridgeValue L552, _fromRecord L717)
+- Python: _parse_finite_int with explicit bool reject; __post_init__ guards on both RevocationStatus and IdentityAttestation; _from_dict also calls _parse_finite_int
+- Swift/Kotlin: NaN-immune via UniFFI UInt64/ULong typing
+
+### Carried P1/P2 (pre-existing, not regressions from #1649)
+- **P1 py_handle_register + napi handle_register**: No validation on handle/description/tags (discovery.rs:654-694, napi/discovery.rs:464-498). Validators exist but aren't called. Same "input-side absent, output escape only" defense regression pattern as 2026-03-31.
+- **P2 MAX_HANDLE_ENTRIES=10K global, no per-DID cap** (handles.rs:39).
+- **P2 Empty-reason whitespace-control bypass** (validate.rs:610): `if !r.trim().is_empty()` — `\t\n\r` are both whitespace and control chars so trim removes them, empty check passes, validation skipped. Non-whitespace controls (\0) still caught.
+
+### P2 Findings
+- **Handle registry namespace-DoS**: MAX_HANDLE_ENTRIES=10K is global. No per-DID sub-cap. One authenticated member can claim all entries.
+- **MAX_HANDLE_ENTRIES hardcoded const**: not configurable per context.
+- **No rate limit** on handle registrations per DID per time window.
+
+### Well-Defended
+- HandleRegistry::register: contains->cap->insert under &mut self is race-free by type system
+- OwnershipMismatch check BEFORE conflict check (no existence leak to unauthorized callers)
+- validate_data_dir: empty/>4096/null-bytes/.. all covered; 0o700 mode on Unix
+- Error codes ATTEST 9001/9006/9010-9018 non-overlapping (grep confirmed)
+- chars().enumerate() uses code-point position (correct for UTF-8)
+- Empty-reason skip `if !r.is_empty()` NOT a bypass: required reasons still rejected via validate_non_empty
+- MissingPassphrase: fail-closed, no env fallback, user_message=Display (nothing sensitive to strip)
+
 ## Recurring Patterns
 - TOCTOU races in check-then-act patterns (nonce replay, standing channels, budget)
 - Missing zeroization on crypto key material

@@ -737,11 +737,7 @@ class RevocationStatus:
             raise ValueError(
                 f"Invalid revocation status: {self.status!r} (expected 'active' or 'revoked')"
             )
-        # Coerce revoked_at to int — floats can sneak in from JSON deserialization.
-        # Also reject booleans (bool is a subclass of int in Python).
-        if self.revoked_at is not None and (
-            not isinstance(self.revoked_at, int) or isinstance(self.revoked_at, bool)
-        ):
+        if self.revoked_at is not None:
             object.__setattr__(self, "revoked_at", _parse_finite_int(self.revoked_at, "revoked_at"))
 
 
@@ -786,10 +782,7 @@ class IdentityAttestation:
     platform_id: str | None = None
 
     def __post_init__(self) -> None:
-        # Coerce verified_at to int — floats can sneak in from JSON deserialization.
-        # Also reject booleans (bool is a subclass of int in Python).
-        if not isinstance(self.verified_at, int) or isinstance(self.verified_at, bool):
-            self.verified_at = _parse_finite_int(self.verified_at, "verified_at")
+        self.verified_at = _parse_finite_int(self.verified_at, "verified_at")
 
     def _to_bridge_dict(self) -> dict[str, Any]:
         """Convert to a dict for bridge serialization."""

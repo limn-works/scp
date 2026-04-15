@@ -555,12 +555,32 @@ pub fn validate_context_description(description: &str) -> Result<(), ValidationE
 /// an additional check that the string is not whitespace-only.
 pub fn validate_governance_reason(reason: &str) -> Result<(), ValidationError> {
     validate_user_string(reason, "governance reason", MAX_GOVERNANCE_REASON_LEN)?;
-    if reason.trim().is_empty() {
+    if !has_visible_content(reason) {
         return Err(ValidationError::new(
-            "governance reason must not be empty or whitespace-only".to_string(),
+            "governance reason must contain visible content".to_string(),
         ));
     }
     Ok(())
+}
+
+/// Returns `true` if `s` contains at least one character that is neither
+/// whitespace nor a zero-width / invisible format character.
+fn has_visible_content(s: &str) -> bool {
+    s.chars().any(|c| {
+        !c.is_whitespace()
+            && !matches!(
+                c,
+                '\u{00AD}'
+                    | '\u{034F}'
+                    | '\u{061C}'
+                    | '\u{180E}'
+                    | '\u{200B}'..='\u{200F}'
+                    | '\u{2028}'..='\u{2029}'
+                    | '\u{2060}'..='\u{2064}'
+                    | '\u{2066}'..='\u{2069}'
+                    | '\u{FEFF}'
+            )
+    })
 }
 
 /// Validates a payment adapter reference (§19.1). Max 256 bytes.
@@ -1277,7 +1297,15 @@ mod tests {
     #[test]
     fn governance_reason_whitespace_only_rejected() {
         let err = validate_governance_reason("   ").unwrap_err();
-        assert!(err.message.contains("whitespace"));
+        assert!(err.message.contains("visible content"));
+    }
+
+    #[test]
+    fn governance_reason_zero_width_chars_rejected() {
+        let err = validate_governance_reason("\u{200B}").unwrap_err();
+        assert!(err.message.contains("visible content"));
+        let err2 = validate_governance_reason("\u{200B}\u{200C}\u{FEFF}").unwrap_err();
+        assert!(err2.message.contains("visible content"));
     }
 
     // -- Payment adapter ref --

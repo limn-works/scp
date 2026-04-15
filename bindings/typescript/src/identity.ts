@@ -515,10 +515,10 @@ export class RevocationStatus {
 
   /** Creates a revoked revocation status. */
   static revoked(revokedAt: number, reason?: string): RevocationStatus {
-    if (!Number.isFinite(revokedAt)) {
-      throw new ValidationError("revoked_at must be a finite number", "SCP-VALID-7005");
+    if (!Number.isInteger(revokedAt) || revokedAt < 0) {
+      throw new ValidationError("revoked_at must be a non-negative integer", "SCP-VALID-7005");
     }
-    const truncated = Math.trunc(revokedAt);
+    const truncated = revokedAt;
     const data: RevocationStatusData =
       reason !== undefined
         ? { status: "revoked", revokedAt: truncated, reason }
@@ -549,13 +549,10 @@ export class RevocationStatus {
       if (revokedAtRaw === undefined) {
         throw new Error("Bridge returned Revoked status without revoked_at timestamp");
       }
-      if (!Number.isFinite(revokedAtRaw)) {
-        throw new ValidationError("revoked_at must be a finite number", "SCP-VALID-7005");
+      if (!Number.isInteger(revokedAtRaw) || revokedAtRaw < 0) {
+        throw new ValidationError("revoked_at must be a non-negative integer", "SCP-VALID-7005");
       }
-      return RevocationStatus.revoked(
-        Math.trunc(revokedAtRaw),
-        revoked?.reason as string | undefined,
-      );
+      return RevocationStatus.revoked(revokedAtRaw, revoked?.reason as string | undefined);
     }
     if (typeof raw === "string") {
       const lower = raw.toLowerCase();
@@ -618,14 +615,14 @@ export class IdentityAttestation implements IdentityAttestationData {
   private readonly _rawJson?: string | undefined;
 
   constructor(data: IdentityAttestationData, rawJson?: string) {
-    if (!Number.isFinite(data.verifiedAt)) {
-      throw new ValidationError("verified_at must be a finite number", "SCP-VALID-7005");
+    if (!Number.isInteger(data.verifiedAt) || data.verifiedAt < 0) {
+      throw new ValidationError("verified_at must be a non-negative integer", "SCP-VALID-7005");
     }
     this.id = data.id;
     this.platform = data.platform;
     this.platformHandle = data.platformHandle;
     this.verificationMethod = data.verificationMethod;
-    this.verifiedAt = Math.trunc(data.verifiedAt);
+    this.verifiedAt = data.verifiedAt;
     this.revocationStatus = data.revocationStatus;
     this.platformId = data.platformId;
     this._rawJson = rawJson;
@@ -714,10 +711,10 @@ export class IdentityAttestation implements IdentityAttestationData {
       data.verification_method ??
       data.verificationMethod) as string;
     const verifiedAtRaw = (evidence.verified_at ?? data.verified_at ?? data.verifiedAt) as number;
-    if (!Number.isFinite(verifiedAtRaw)) {
-      throw new ValidationError("verified_at must be a finite number", "SCP-VALID-7005");
+    if (!Number.isInteger(verifiedAtRaw) || verifiedAtRaw < 0) {
+      throw new ValidationError("verified_at must be a non-negative integer", "SCP-VALID-7005");
     }
-    const verifiedAt = Math.trunc(verifiedAtRaw);
+    const verifiedAt = verifiedAtRaw;
     const rawRs = data.revocation_status ?? data.revocationStatus ?? "active";
     const revocationStatus =
       rawRs instanceof RevocationStatus ? rawRs : RevocationStatus._fromBridgeValue(rawRs);
