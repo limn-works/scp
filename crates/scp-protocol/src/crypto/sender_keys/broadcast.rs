@@ -427,8 +427,15 @@ pub struct SigningPayloadFields<'a> {
 ///
 /// Public so callers can compute the payload, sign it via key custody, and
 /// pass the resulting signature to [`SealBroadcastParams`].
-#[must_use]
-pub fn build_broadcast_signing_payload(fields: &SigningPayloadFields<'_>) -> [u8; 32] {
+///
+/// # Errors
+///
+/// Returns [`super::SenderKeyError`] if any field exceeds the canonical hash
+/// length-prefix ceiling (`u32::MAX` bytes). This cannot occur in practice —
+/// protocol messages are bounded to 256 KB by the envelope layer (§9.10.3).
+pub fn build_broadcast_signing_payload(
+    fields: &SigningPayloadFields<'_>,
+) -> Result<[u8; 32], super::SenderKeyError> {
     use crate::crypto::canonical::{CanonicalField, canonical_hash};
 
     canonical_hash(
@@ -444,6 +451,7 @@ pub fn build_broadcast_signing_payload(fields: &SigningPayloadFields<'_>) -> [u8
             CanonicalField::Fixed32(fields.provenance_hash),
         ],
     )
+    .map_err(|e| super::SenderKeyError::VerificationFailed(format!("canonical hash failed: {e}")))
 }
 
 /// Encrypts a payload with the author's broadcast key and packages it into a
@@ -626,7 +634,7 @@ pub fn open_broadcast(
         timestamp: envelope.timestamp,
         nonce: &envelope.nonce,
         provenance_hash: &provenance_hash,
-    });
+    })?;
     let signature = ed25519_dalek::Signature::from_bytes(&envelope.signature);
     verifying_key
         .verify_strict(&signing_payload, &signature)
@@ -828,7 +836,7 @@ mod tests {
         sk: &ed25519_dalek::SigningKey,
         fields: &SigningPayloadFields<'_>,
     ) -> ed25519_dalek::Signature {
-        let payload = build_broadcast_signing_payload(fields);
+        let payload = build_broadcast_signing_payload(fields).unwrap();
         sk.sign(&payload)
     }
 

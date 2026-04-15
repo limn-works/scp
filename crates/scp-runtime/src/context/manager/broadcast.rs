@@ -282,7 +282,8 @@ impl ContextManager {
                         nonce: &nonce,
                         provenance_hash: &provenance_hash,
                     },
-                );
+                )
+                .map_err(|e| ContextError::CryptoFailed(e.to_string()))?;
 
             // Sign via key custody (async).
             let platform_sig = custody

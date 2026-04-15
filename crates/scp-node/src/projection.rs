@@ -2330,16 +2330,19 @@ pub(crate) mod test_helpers {
         let sk = ed25519_dalek::SigningKey::from_bytes(&[0xAA; 32]);
         let nonce = generate_broadcast_nonce();
         let provenance_hash = compute_provenance_hash(None).unwrap();
-        let signature = sk.sign(&build_broadcast_signing_payload(&SigningPayloadFields {
-            version: scp_core::envelope::SCP_PROTOCOL_VERSION,
-            context_id: "test-ctx",
-            author_did: key.author_did(),
-            sequence: 1,
-            key_epoch: key.epoch(),
-            timestamp: 1_700_000_000_000,
-            nonce: &nonce,
-            provenance_hash: &provenance_hash,
-        }));
+        let signature = sk.sign(
+            &build_broadcast_signing_payload(&SigningPayloadFields {
+                version: scp_core::envelope::SCP_PROTOCOL_VERSION,
+                context_id: "test-ctx",
+                author_did: key.author_did(),
+                sequence: 1,
+                key_epoch: key.epoch(),
+                timestamp: 1_700_000_000_000,
+                nonce: &nonce,
+                provenance_hash: &provenance_hash,
+            })
+            .unwrap(),
+        );
         let params = SealBroadcastParams {
             context_id: "test-ctx",
             sequence: 1,

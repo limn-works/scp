@@ -59,7 +59,7 @@ pub async fn publish_sender_key_epoch_advance(
     epoch: u64,
     signer_key_ref: SigningKeyId,
 ) -> Result<Vec<u8>, SenderKeyError> {
-    let hash = compute_epoch_advance_hash(context_id, sender_did, epoch, signer_key_ref);
+    let hash = compute_epoch_advance_hash(context_id, sender_did, epoch, signer_key_ref)?;
 
     let signature = key_custody
         .sign(signing_key, &hash)
@@ -130,7 +130,7 @@ pub async fn request_sender_key(
         wrapping_pubkey.as_bytes(),
         &nonce,
         timestamp,
-    );
+    )?;
 
     let signature = key_custody
         .sign(signing_key, &hash)
@@ -390,7 +390,7 @@ pub async fn send_block_notification(
         blocked_did,
         signing_key_id,
         timestamp,
-    );
+    )?;
 
     let signature = key_custody
         .sign(signing_key, &hash)

@@ -395,7 +395,7 @@ const DEFAULT_VERIFICATION_TTL_SECS: u64 = 90 * 24 * 3600;
 /// || parameters || timeout_secs`. The domain separator prevents
 /// cross-protocol signature confusion. This ensures signatures cover all
 /// semantically meaningful fields.
-fn canonical_challenge_request_bytes(request: &ChallengeRequest) -> Vec<u8> {
+fn canonical_challenge_request_bytes(request: &ChallengeRequest) -> Result<Vec<u8>, TrustError> {
     use crate::crypto::canonical::{CanonicalField, canonical_hash_bytes};
 
     let type_tag = challenge_type_tag(&request.challenge_type);
@@ -413,6 +413,9 @@ fn canonical_challenge_request_bytes(request: &ChallengeRequest) -> Vec<u8> {
             CanonicalField::U64(request.timeout.as_secs()),
         ],
     )
+    .map_err(|e| TrustError::ChallengeSigningFailed {
+        reason: format!("canonical hash failed: {e}"),
+    })
 }
 
 /// Builds the canonical byte representation of a challenge response for signing.
@@ -421,7 +424,7 @@ fn canonical_challenge_request_bytes(request: &ChallengeRequest) -> Vec<u8> {
 /// || responder_did || result || completed_at`. The domain separator
 /// prevents cross-protocol signature confusion. This ensures signatures
 /// cover all semantically meaningful fields.
-fn canonical_challenge_response_bytes(response: &ChallengeResponse) -> Vec<u8> {
+fn canonical_challenge_response_bytes(response: &ChallengeResponse) -> Result<Vec<u8>, TrustError> {
     use crate::crypto::canonical::{CanonicalField, canonical_hash_bytes};
 
     let result_bytes = crate::jcs::to_vec(&response.result).unwrap_or_default();
@@ -435,6 +438,9 @@ fn canonical_challenge_response_bytes(response: &ChallengeResponse) -> Vec<u8> {
             CanonicalField::U64(response.completed_at),
         ],
     )
+    .map_err(|e| TrustError::ChallengeSigningFailed {
+        reason: format!("canonical hash failed: {e}"),
+    })
 }
 
 /// Builds the canonical byte representation of a challenge verification for signing.
@@ -446,7 +452,9 @@ fn canonical_challenge_response_bytes(response: &ChallengeResponse) -> Vec<u8> {
 /// The domain separator prevents cross-protocol signature confusion.
 /// All fields including `score` and `context_id` are bound into the
 /// signature to prevent post-signing modification.
-fn canonical_challenge_verification_bytes(verification: &ChallengeVerification) -> Vec<u8> {
+fn canonical_challenge_verification_bytes(
+    verification: &ChallengeVerification,
+) -> Result<Vec<u8>, TrustError> {
     use crate::crypto::canonical::{CanonicalField, canonical_hash_bytes};
 
     let type_tag = challenge_type_tag(&verification.challenge_type);
@@ -477,7 +485,11 @@ fn canonical_challenge_verification_bytes(verification: &ChallengeVerification) 
         None => fields.push(CanonicalField::Absent),
     }
 
-    canonical_hash_bytes(DOMAIN_CHALLENGE_VERIFY_V1, &fields)
+    canonical_hash_bytes(DOMAIN_CHALLENGE_VERIFY_V1, &fields).map_err(|e| {
+        TrustError::ChallengeSigningFailed {
+            reason: format!("canonical hash failed: {e}"),
+        }
+    })
 }
 
 /// Returns the canonical URI string for a challenge type.
@@ -590,7 +602,7 @@ pub fn issue_challenge(
         signature: vec![],
     };
 
-    let canonical = canonical_challenge_request_bytes(&request);
+    let canonical = canonical_challenge_request_bytes(&request)?;
     request.signature = signer.sign(&canonical)?;
 
     Ok(request)
@@ -659,7 +671,7 @@ pub fn verify_challenge_response(
     //     We resolve the challenger's public key and verify the request
     //     signature against the canonical request bytes.
     let challenger_pk = resolver.resolve_public_key(&request.challenger_did)?;
-    let request_canonical = canonical_challenge_request_bytes(request);
+    let request_canonical = canonical_challenge_request_bytes(request)?;
     verify_ed25519_signature(&challenger_pk, &request_canonical, &request.signature)
         .map_err(|reason| TrustError::ChallengeRequestSignatureInvalid { reason })?;
 
@@ -679,7 +691,7 @@ pub fn verify_challenge_response(
 
     // 4. Verify Ed25519 signature against responder's public key.
     let public_key_bytes = resolver.resolve_public_key(&response.responder_did)?;
-    let canonical = canonical_challenge_response_bytes(response);
+    let canonical = canonical_challenge_response_bytes(response)?;
     verify_ed25519_signature(&public_key_bytes, &canonical, &response.signature).map_err(
         |reason| TrustError::ChallengeSignatureInvalid {
             challenge_id: request.challenge_id.clone(),
@@ -740,7 +752,7 @@ pub fn verify_challenge_response(
 
     // Sign the verification record (spec §7.3.4.2: verifier's signature
     // prevents forgery).
-    let verify_canonical = canonical_challenge_verification_bytes(&verification);
+    let verify_canonical = canonical_challenge_verification_bytes(&verification)?;
     verification.verifier_signature = verifier_signer.sign(&verify_canonical)?;
 
     Ok(verification)
@@ -839,7 +851,7 @@ mod tests {
             signature: vec![],
         };
 
-        let canonical = canonical_challenge_response_bytes(&response);
+        let canonical = canonical_challenge_response_bytes(&response).unwrap();
         let sig = signing_key.sign(&canonical);
         response.signature = sig.to_bytes().to_vec();
         response
@@ -1569,8 +1581,8 @@ mod tests {
             signature: vec![],
         };
 
-        let bytes1 = canonical_challenge_request_bytes(&request);
-        let bytes2 = canonical_challenge_request_bytes(&request);
+        let bytes1 = canonical_challenge_request_bytes(&request).unwrap();
+        let bytes2 = canonical_challenge_request_bytes(&request).unwrap();
         assert_eq!(bytes1, bytes2);
 
         let response = ChallengeResponse {
@@ -1581,8 +1593,8 @@ mod tests {
             signature: vec![],
         };
 
-        let rbytes1 = canonical_challenge_response_bytes(&response);
-        let rbytes2 = canonical_challenge_response_bytes(&response);
+        let rbytes1 = canonical_challenge_response_bytes(&response).unwrap();
+        let rbytes2 = canonical_challenge_response_bytes(&response).unwrap();
         assert_eq!(rbytes1, rbytes2);
     }
 

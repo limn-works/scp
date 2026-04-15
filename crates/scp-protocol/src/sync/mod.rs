@@ -290,8 +290,14 @@ impl ConsistencyCheckpoint {
     /// `context_id`, `sender_did`, `event_count`, `merkle_root`, `epoch` (with
     /// presence flag), `timestamp`.
     /// Domain separator: `"SCP-CHECKPOINT-V1:"`.
-    #[must_use]
-    pub fn canonical_hash(&self) -> [u8; 32] {
+    ///
+    /// # Errors
+    ///
+    /// Returns [`crate::crypto::canonical::CanonicalError::FieldTooLarge`] if
+    /// any variable-length field exceeds `u32::MAX` bytes. Cannot occur in
+    /// practice — context and DID strings are bounded to 512 bytes by
+    /// validation.
+    pub fn canonical_hash(&self) -> Result<[u8; 32], crate::crypto::canonical::CanonicalError> {
         let mut fields: Vec<CanonicalField<'_>> = Vec::with_capacity(8);
         fields.push(CanonicalField::VarBytes(self.context_id.as_bytes()));
         fields.push(CanonicalField::VarBytes(self.sender_did.as_bytes()));
@@ -329,7 +335,13 @@ impl ConsistencyCheckpoint {
                 reason: format!("failed to resolve public key: {e}"),
             }
         })?;
-        let canonical = self.canonical_hash();
+        let canonical =
+            self.canonical_hash()
+                .map_err(|e| SyncError::CheckpointSignatureFailure {
+                    context_id: self.context_id.clone(),
+                    sender_did: self.sender_did.clone(),
+                    reason: format!("canonical hash failed: {e}"),
+                })?;
         verify_ed25519_signature(&public_key, &canonical, &self.signature).map_err(|reason| {
             SyncError::CheckpointSignatureFailure {
                 context_id: self.context_id.clone(),
@@ -949,7 +961,7 @@ mod tests {
             timestamp: 1_700_000_000,
             signature: Vec::new(),
         };
-        let canonical = cp.canonical_hash();
+        let canonical = cp.canonical_hash().unwrap();
         cp.signature = signing_key.sign(&canonical).to_bytes().to_vec();
         cp
     }

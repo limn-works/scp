@@ -346,7 +346,8 @@ pub fn verify_inner_signature(
     // already validated as [u8; 32] by serde deserialization.
     // The version from the envelope is used (not the constant) so that
     // tampering with the version field causes verification to fail (§13.2.1).
-    let canonical_hash = compute_canonical_hash(&params, &inner.payload_hash, &provenance_hash);
+    let canonical_hash = compute_canonical_hash(&params, &inner.payload_hash, &provenance_hash)
+        .map_err(|e| EnvelopeError::VerificationFailed(e.to_string()))?;
 
     // Verify using strict mode (rejects small-order points).
     match crate::crypto::ed25519::verify_ed25519_signature(
@@ -492,12 +493,17 @@ pub fn compute_provenance_hash(provenance: Option<&Provenance>) -> Result<[u8; 3
 ///         || len(provenance_hash) || provenance_hash
 ///         || len(signing_key_id) || signing_key_id)
 /// ```
-#[must_use]
+///
+/// # Errors
+///
+/// Returns [`EnvelopeError::SerializationFailed`] if any field exceeds
+/// `u32::MAX` bytes (cannot occur in practice — protocol messages are
+/// bounded to 256 KB by the envelope layer at §9.10.3).
 pub fn compute_canonical_hash(
     params: &InnerEnvelopeParams<'_>,
     payload_hash: &[u8; 32],
     provenance_hash: &[u8; 32],
-) -> Vec<u8> {
+) -> Result<Vec<u8>, EnvelopeError> {
     use crate::crypto::canonical::{CanonicalField, canonical_hash};
 
     // Field order per §13.2.1: version, message_type (discriminator byte),
@@ -507,7 +513,7 @@ pub fn compute_canonical_hash(
     // version from params is field 1 per §13.2.1 — part of the signature
     // commitment. message_type follows as a discriminator byte to prevent
     // type-flipping attacks (issue #290).
-    canonical_hash(
+    Ok(canonical_hash(
         "SCP-INNER-ENVELOPE-V1:",
         &[
             CanonicalField::U16(params.version),
@@ -523,7 +529,8 @@ pub fn compute_canonical_hash(
             CanonicalField::VarBytes(params.signing_key_id.as_bytes()),
         ],
     )
-    .to_vec()
+    .map_err(|e| EnvelopeError::SerializationFailed(e.to_string()))?
+    .to_vec())
 }
 
 #[cfg(test)]
@@ -557,7 +564,8 @@ mod tests {
             provenance: None,
             signing_key_id: SigningKeyId::Active,
         };
-        let hash_with_domain = compute_canonical_hash(&params, &payload_hash, &provenance_hash);
+        let hash_with_domain =
+            compute_canonical_hash(&params, &payload_hash, &provenance_hash).unwrap();
 
         // Hash WITHOUT any domain separator (manual construction with length prefixes).
         #[allow(clippy::cast_possible_truncation)]

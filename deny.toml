@@ -62,6 +62,11 @@ ignore = [
     # fix requires rand >= 0.9.3. SCP uses tracing (not log) and no logging
     # callback generates random data. Awaiting hpke-rs upstream upgrade.
     "RUSTSEC-2026-0097",
+    # rustls-webpki: URI name constraints incorrectly accepted + wildcard
+    # name constraints accepted. Transitive via rustls -> webpki. Awaiting
+    # upstream rustls-webpki patch.
+    "RUSTSEC-2026-0098",
+    "RUSTSEC-2026-0099",
 ]
 
 # ── Bans ────────────────────────────────────────────────────────────────────

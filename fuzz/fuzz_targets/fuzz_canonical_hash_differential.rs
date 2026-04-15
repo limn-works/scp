@@ -103,8 +103,8 @@ fuzz_target!(|input: ArbCanonicalHashInput| {
         return;
     }
 
-    let hash_a = compute_canonical_hash(&params_a, &input.a.payload_hash, &input.a.provenance_hash);
-    let hash_b = compute_canonical_hash(&params_b, &input.b.payload_hash, &input.b.provenance_hash);
+    let hash_a = compute_canonical_hash(&params_a, &input.a.payload_hash, &input.a.provenance_hash).unwrap();
+    let hash_b = compute_canonical_hash(&params_b, &input.b.payload_hash, &input.b.provenance_hash).unwrap();
 
     assert_ne!(
         hash_a, hash_b,

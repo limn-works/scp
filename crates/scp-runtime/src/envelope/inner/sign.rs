@@ -51,7 +51,7 @@ pub async fn create_inner_envelope(
     let provenance_hash: [u8; 32] = compute_provenance_hash(params.provenance.as_ref())?;
 
     // 3. Compute canonical hash for signing.
-    let canonical_hash = compute_canonical_hash(params, &payload_hash, &provenance_hash);
+    let canonical_hash = compute_canonical_hash(params, &payload_hash, &provenance_hash)?;
 
     // 4. Sign the canonical hash.
     let signature = key_custody
@@ -122,7 +122,7 @@ pub fn create_inner_envelope_raw(
     let provenance_hash: [u8; 32] = compute_provenance_hash(params.provenance.as_ref())?;
 
     // 3. Compute canonical hash for signing.
-    let canonical_hash = compute_canonical_hash(params, &payload_hash, &provenance_hash);
+    let canonical_hash = compute_canonical_hash(params, &payload_hash, &provenance_hash)?;
 
     // 4. Sign the canonical hash.
     let signature = ed25519_dalek::Signer::sign(signing_key, &canonical_hash);

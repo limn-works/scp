@@ -1601,7 +1601,8 @@ mod tests {
             timestamp,
             nonce: &nonce,
             provenance_hash: &provenance_hash,
-        });
+        })
+        .map_err(|e| ContextError::CryptoFailed(e.to_string()))?;
         let signature = sk.sign(&signing_payload);
 
         ctx.publish(author_did, payload, timestamp, signature, &nonce, None)

@@ -213,7 +213,14 @@ pub fn scpid_sign(
             CanonicalField::VarBytes(challenge.audience.as_bytes()),
             CanonicalField::U64(signed_at),
         ],
-    );
+    )
+    .map_err(|e| {
+        ScpWasmError::Identity {
+            message: format!("canonical hash failed: {e}"),
+            code: codes::IDENT_1037.to_owned(),
+        }
+        .into_js()
+    })?;
 
     // Sign the canonical hash via the identity helper.
     let signature = crate::identity::sign_with_identity(&did, key_fragment, &hash)
@@ -259,7 +266,8 @@ mod tests {
                 CanonicalField::VarBytes(b"https://example.com"),
                 CanonicalField::U64(1_709_654_400_000),
             ],
-        );
+        )
+        .unwrap();
         assert_eq!(
             hex::encode(hash),
             "7552b8e3b0e1654593e956c1429d479eda0524bc6cdc863b142d5909471b57e0"

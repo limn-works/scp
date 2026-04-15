@@ -589,6 +589,9 @@ impl IdentityLinkAttestation {
                 CanonicalField::VarBytes(&revocation_status_bytes),
             ],
         )
+        .map_err(|e| {
+            AttestationSignatureError::SerializationFailed(format!("canonical hash failed: {e}"))
+        })?
         .to_vec())
     }
 
