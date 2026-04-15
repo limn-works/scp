@@ -677,6 +677,9 @@ class RevocationStatus:
             raise ValueError(
                 f"Invalid revocation status: {self.status!r} (expected 'active' or 'revoked')"
             )
+        # Coerce revoked_at to int — floats can sneak in from JSON deserialization.
+        if self.revoked_at is not None and not isinstance(self.revoked_at, int):
+            object.__setattr__(self, "revoked_at", int(self.revoked_at))
 
 
 # ---------------------------------------------------------------------------
@@ -749,12 +752,12 @@ class IdentityAttestation:
         raw_rs = data.get("revocation_status", "active")
         if isinstance(raw_rs, dict) and "Revoked" in raw_rs:
             revoked_data = raw_rs["Revoked"]
-            revoked_at = revoked_data.get("revoked_at")
-            if revoked_at is None:
+            revoked_at_raw = revoked_data.get("revoked_at")
+            if revoked_at_raw is None:
                 raise ValueError("Bridge returned Revoked status without revoked_at timestamp")
             rs = RevocationStatus(
                 status="revoked",
-                revoked_at=revoked_at,
+                revoked_at=int(revoked_at_raw),
                 reason=revoked_data.get("reason"),
             )
         elif isinstance(raw_rs, str) and raw_rs.lower() == "active":
@@ -769,7 +772,7 @@ class IdentityAttestation:
             platform=data["platform"],
             platform_handle=data["platform_handle"],
             verification_method=data["verification_method"],
-            verified_at=data["verified_at"],
+            verified_at=int(data["verified_at"]),
             revocation_status=rs,
             platform_id=data.get("platform_id"),
         )
