@@ -1389,29 +1389,11 @@ pub async fn identity_create_link_attestation(
     verification_method: String,
     platform_id: Option<String>,
 ) -> napi::Result<String> {
-    use std::borrow::Cow;
-
-    use scp_core::identity::attestation::{
-        ATTESTATION_TYPE_IDENTITY_LINK, AttestationClaim, AttestationEvidence,
-        IdentityLinkAttestation, VerificationMethod,
-    };
-    use scp_core::trust::attestation::RevocationStatus;
-    use scp_identity::DID;
     use scp_platform::traits::KeyCustody;
 
     // Validate attestation input field sizes.
     scp_ffi_common::validate::validate_attestation_fields(&platform, &handle, &proof)
         .map_err(|e| NapiError::from(ScpNapiError::from(e)))?;
-
-    let method: VerificationMethod = verification_method.parse().map_err(|e: String| {
-        NapiError::from(ScpNapiError::Identity {
-            message: e,
-            code: codes::IDENT_1040.to_owned(),
-        })
-    })?;
-
-    // Proof is an opaque string per §3.5.2 — pass through as-is.
-    // Do not parse and re-serialize.
 
     // Phase 1: read custody + key handle (under DashMap lock, then drop).
     let (custody, key_handle) = crate::runtime::with_identity(&did, |entry| {
@@ -1421,59 +1403,28 @@ pub async fn identity_create_link_attestation(
         ))
     })?;
 
-    let issuer = DID::from(did.as_str());
-    let now_secs = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_err(|_| {
-            NapiError::from(ScpNapiError::Identity {
-                message: "system clock is before UNIX epoch".to_owned(),
-                code: codes::IDENT_1042.to_owned(),
-            })
-        })?
-        .as_secs();
-
-    let id = IdentityLinkAttestation::compute_id(&issuer, &platform, &handle, now_secs);
-
-    let mut attestation = IdentityLinkAttestation {
-        id,
-        attestation_type: Cow::Borrowed(ATTESTATION_TYPE_IDENTITY_LINK),
-        issuer: issuer.clone(),
-        subject: issuer,
-        issued_at: now_secs,
-        expires_at: None,
-        claim: AttestationClaim::new(platform, handle, platform_id),
-        evidence: AttestationEvidence {
-            method,
-            proof,
-            verified_at: now_secs,
-            verifier_did: None,
-        },
-        revocation_status: RevocationStatus::Active,
-        signature: Vec::new(),
-    };
-
-    // Structural validation before signing.
-    let structure_errors = attestation.validate_structure();
-    if !structure_errors.is_empty() {
-        return Err(NapiError::from(ScpNapiError::Identity {
-            message: format!(
-                "attestation structure validation failed: {}",
-                structure_errors
-                    .iter()
-                    .map(AsRef::as_ref)
-                    .collect::<Vec<_>>()
-                    .join("; "),
-            ),
-            code: codes::IDENT_1041.to_owned(),
-        }));
-    }
-
-    let canonical = attestation.canonical_signing_bytes().map_err(|e| {
+    // Build unsigned attestation using shared pipeline.
+    let built = scp_ffi_common::attestation::build_unsigned_attestation(
+        &did,
+        platform,
+        handle,
+        proof,
+        &verification_method,
+        platform_id,
+    )
+    .map_err(|e| {
+        let code = match &e {
+            scp_ffi_common::attestation::AttestationBuildError::InvalidMethod(_)
+            | scp_ffi_common::attestation::AttestationBuildError::ClockError => codes::IDENT_1040,
+            _ => codes::IDENT_1041,
+        };
         NapiError::from(ScpNapiError::Identity {
-            message: format!("attestation signing failed: {e}"),
-            code: codes::IDENT_1041.to_owned(),
+            message: e.to_string(),
+            code: code.to_owned(),
         })
     })?;
+
+    let mut attestation = built.attestation;
 
     // Phase 2: sign (no DashMap lock held — safe to block_in_place).
     let rt = tokio::runtime::Handle::try_current().map_err(|e| {
@@ -1483,13 +1434,15 @@ pub async fn identity_create_link_attestation(
         })
     })?;
 
-    let sig = tokio::task::block_in_place(|| rt.block_on(custody.0.sign(&key_handle, &canonical)))
-        .map_err(|e| {
-            NapiError::from(ScpNapiError::Identity {
-                message: format!("Ed25519 signing failed: {e}"),
-                code: codes::IDENT_1041.to_owned(),
-            })
-        })?;
+    let sig = tokio::task::block_in_place(|| {
+        rt.block_on(custody.0.sign(&key_handle, &built.canonical_bytes))
+    })
+    .map_err(|e| {
+        NapiError::from(ScpNapiError::Identity {
+            message: format!("Ed25519 signing failed: {e}"),
+            code: codes::IDENT_1041.to_owned(),
+        })
+    })?;
     attestation.signature = sig.as_bytes().to_vec();
 
     // Phase 3: store attestation (re-acquire DashMap lock, TOCTOU guard).

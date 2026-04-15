@@ -5097,6 +5097,7 @@ dependencies = [
 name = "scp-ffi-common"
 version = "0.1.0"
 dependencies = [
+ "dashmap",
  "hex",
  "scp-core",
  "scp-event-log",
@@ -5321,7 +5322,6 @@ dependencies = [
  "tower-http",
  "tower-service",
  "tracing",
- "tracing-subscriber",
  "url",
  "x509-parser 0.16.0",
  "zeroize",
@@ -5412,7 +5412,6 @@ dependencies = [
  "tempfile",
  "tokio",
  "tracing",
- "tracing-subscriber",
 ]
 
 [[package]]

@@ -23,6 +23,7 @@ scp-transport = { path = "../scp-transport", version = "=0.1.0-beta.1", features
     "redb-blob",
     "postgres-blob",
     "s3-blob",
+    "startup",
 ] }
 scp-platform = { path = "../scp-platform", version = "=0.1.0-beta.1", features = ["testing", "sqlite", "file", "encrypting"] }
 arc-swap = { workspace = true }
@@ -55,7 +56,6 @@ percent-encoding = { workspace = true }
 rand = { workspace = true }
 tracing = { workspace = true }
 zeroize = { workspace = true }
-tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 url = "2"
 x509-parser = "0.16"
 metrics = { workspace = true }

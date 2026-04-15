@@ -51,6 +51,8 @@ pub mod provider;
 pub mod quic;
 pub mod relay;
 pub mod scoring;
+#[cfg(feature = "startup")]
+pub mod startup;
 pub mod traits;
 #[cfg(feature = "udp")]
 pub mod udp;

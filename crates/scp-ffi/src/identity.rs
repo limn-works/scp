@@ -1265,14 +1265,6 @@ fn py_create_identity_link_attestation(
     verification_method: &str,
     platform_id: Option<&str>,
 ) -> PyResult<String> {
-    use std::borrow::Cow;
-
-    use scp_core::identity::attestation::{
-        ATTESTATION_TYPE_IDENTITY_LINK, AttestationClaim, AttestationEvidence,
-        IdentityLinkAttestation, VerificationMethod,
-    };
-    use scp_core::trust::attestation::RevocationStatus;
-    use scp_identity::DID;
     use scp_platform::traits::KeyCustody;
 
     validate::validate_did(did)?;
@@ -1286,11 +1278,6 @@ fn py_create_identity_link_attestation(
     let rt = crate::runtime()?;
 
     py.allow_threads(move || {
-        let method: VerificationMethod = method_owned.parse().map_err(ScpPyError::identity)?;
-
-        // Proof is an opaque string per §3.5.2 — pass through as-is.
-        // Do not parse and re-serialize.
-
         // Phase 1: read custody + key handle (under DashMap lock, then drop).
         let (custody, key_handle) = crate::runtime::with_identity(&did_owned, |entry| {
             Ok((
@@ -1299,55 +1286,22 @@ fn py_create_identity_link_attestation(
             ))
         })?;
 
-        let issuer = DID::from(did_owned.as_str());
-        let now_secs = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map_err(|_| ScpPyError::identity("system clock is before UNIX epoch"))?
-            .as_secs();
+        // Build unsigned attestation using shared pipeline.
+        let built = scp_ffi_common::attestation::build_unsigned_attestation(
+            &did_owned,
+            platform_owned,
+            handle_owned,
+            proof_owned,
+            &method_owned,
+            platform_id_owned,
+        )
+        .map_err(|e| ScpPyError::identity(e.to_string()))?;
 
-        let id =
-            IdentityLinkAttestation::compute_id(&issuer, &platform_owned, &handle_owned, now_secs);
-
-        // Build the attestation with a placeholder signature.
-        let mut attestation = IdentityLinkAttestation {
-            id,
-            attestation_type: Cow::Borrowed(ATTESTATION_TYPE_IDENTITY_LINK),
-            issuer: issuer.clone(),
-            subject: issuer,
-            issued_at: now_secs,
-            expires_at: None,
-            claim: AttestationClaim::new(platform_owned, handle_owned, platform_id_owned),
-            evidence: AttestationEvidence {
-                method,
-                proof: proof_owned,
-                verified_at: now_secs,
-                verifier_did: None,
-            },
-            revocation_status: RevocationStatus::Active,
-            signature: Vec::new(),
-        };
-
-        // Structural validation before signing.
-        let structure_errors = attestation.validate_structure();
-        if !structure_errors.is_empty() {
-            return Err(ScpPyError::identity(format!(
-                "attestation structure validation failed: {}",
-                structure_errors
-                    .iter()
-                    .map(AsRef::as_ref)
-                    .collect::<Vec<_>>()
-                    .join("; "),
-            )));
-        }
-
-        // Compute canonical bytes and sign with active signing key.
-        let canonical = attestation
-            .canonical_signing_bytes()
-            .map_err(|e| ScpPyError::identity(format!("attestation signing failed: {e}")))?;
+        let mut attestation = built.attestation;
 
         // Phase 2: sign (no DashMap lock held — safe to block_on).
         let sig = rt
-            .block_on(custody.sign(&key_handle, &canonical))
+            .block_on(custody.sign(&key_handle, &built.canonical_bytes))
             .map_err(|e| ScpPyError::identity(format!("Ed25519 signing failed: {e}")))?;
         attestation.signature = sig.as_bytes().to_vec();
 

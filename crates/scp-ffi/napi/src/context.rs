@@ -711,7 +711,7 @@ pub async fn context_close(handle: &NapiContextHandle, identity_did: String) -> 
 
     // Clean up per-context bridge connector state (ShadowRegistry + SenderKeyStore)
     // to prevent unbounded memory growth in long-running processes.
-    crate::bridge_connector::remove_bridge_state(&handle.context_id);
+    scp_ffi_common::bridge_state::remove_bridge_state(&handle.context_id);
 
     Ok(())
 }

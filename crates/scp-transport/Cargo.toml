@@ -26,6 +26,9 @@ coap = ["dep:coap-lite", "dep:openssl"]
 nostr = ["dep:base64", "dep:k256"]
 webrtc = []
 upnp = ["dep:igd-next", "dep:natpmp"]
+# Shared startup utilities for relay/node binaries: env_or, config_from_env,
+# storage_from_env, init_tracing, health_check, shutdown_signal.
+startup = ["dep:tracing-subscriber"]
 
 [dependencies]
 scp-core = { path = "../scp-core", version = "=0.1.0-beta.1" }
@@ -76,6 +79,7 @@ base64 = { workspace = true, optional = true }
 k256 = { version = "0.13", optional = true, features = ["schnorr"] }
 igd-next = { version = "0.16", optional = true, features = ["aio_tokio"] }
 natpmp = { version = "0.5", optional = true, features = ["tokio"] }
+tracing-subscriber = { version = "0.3", optional = true, features = ["env-filter", "json"] }
 
 [dev-dependencies]
 scp-core = { path = "../scp-core" }
