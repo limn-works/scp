@@ -1731,6 +1731,8 @@ mod tests {
             pyo3::prepare_freethreaded_python();
             crate::init_runtime().unwrap();
         });
+        // BridgeInstance must exist for identity registry access.
+        crate::runtime::init_context_manager_for_test();
     }
 
     /// Verifies that `py_identity_migrate` succeeds end-to-end.

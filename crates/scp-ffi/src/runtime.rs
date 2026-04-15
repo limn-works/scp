@@ -1463,6 +1463,7 @@ mod tests {
 
     #[test]
     fn registry_stats_reflects_context_registration() {
+        init_context_manager_for_test();
         let ctx_id = unique_ctx_id("stats-ctx");
         let creator = "did:dht:z6MkStatsTest";
 
@@ -1493,6 +1494,7 @@ mod tests {
     #[test]
     #[cfg(feature = "allow_in_memory_custody")]
     fn registry_stats_reflects_identity_registration() {
+        init_context_manager_for_test();
         let did = "did:dht:z6MkStatsIdentityUnique9988";
 
         let entry = IdentityEntry {
@@ -1595,6 +1597,7 @@ mod tests {
 
     #[test]
     fn registry_stats_returns_all_fields() {
+        init_context_manager_for_test();
         // Verifies the struct shape and that registry_stats() doesn't panic.
         let stats = registry_stats();
         // Destructure to catch struct changes at compile time. If a field is

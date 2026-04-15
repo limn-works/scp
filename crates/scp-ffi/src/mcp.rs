@@ -3244,6 +3244,7 @@ mod tests {
 
     #[test]
     fn core_registry_stats_includes_all_fields() {
+        crate::runtime::init_context_manager_for_test();
         let stats = crate::runtime::registry_stats();
         // Just verify the struct has the expected fields and doesn't panic.
         let _ = stats.contexts;
