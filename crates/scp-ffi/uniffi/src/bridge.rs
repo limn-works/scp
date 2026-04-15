@@ -11405,10 +11405,17 @@ pub async fn identity_migrate(identity: Arc<Identity>) -> Result<Arc<Identity>, 
                 let _ = has_agent; // suppress unused warning
 
                 // Migrate attestation and custody registries from old DID to new DID.
+                // Custody migration happens first to consume `new_did`; attestation
+                // migration uses a clone so both blocks compile with or without
+                // the `allow_in_memory_custody` feature.
+                #[cfg(feature = "allow_in_memory_custody")]
+                let attestation_did = new_did.clone();
+                #[cfg(not(feature = "allow_in_memory_custody"))]
+                let attestation_did = new_did;
                 {
                     let registry = identity_link_attestation_registry();
                     if let Some((_, attestations)) = registry.remove(&old_did) {
-                        registry.insert(new_did.clone(), attestations);
+                        registry.insert(attestation_did, attestations);
                     }
                 }
                 #[cfg(feature = "allow_in_memory_custody")]
@@ -11458,10 +11465,17 @@ pub async fn identity_migrate(identity: Arc<Identity>) -> Result<Arc<Identity>, 
                 increment_handle_count();
 
                 // Migrate attestation and custody registries from old DID to new DID.
+                // Custody migration happens first to consume `new_did`; attestation
+                // migration uses a clone so both blocks compile with or without
+                // the `allow_in_memory_custody` feature.
+                #[cfg(feature = "allow_in_memory_custody")]
+                let attestation_did = new_did.clone();
+                #[cfg(not(feature = "allow_in_memory_custody"))]
+                let attestation_did = new_did;
                 {
                     let registry = identity_link_attestation_registry();
                     if let Some((_, attestations)) = registry.remove(&old_did) {
-                        registry.insert(new_did.clone(), attestations);
+                        registry.insert(attestation_did, attestations);
                     }
                 }
                 #[cfg(feature = "allow_in_memory_custody")]
