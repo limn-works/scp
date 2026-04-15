@@ -713,6 +713,9 @@ pub async fn context_close(handle: &NapiContextHandle, identity_did: String) -> 
     // to prevent unbounded memory growth in long-running processes.
     scp_ffi_common::bridge_state::remove_bridge_state(&handle.context_id);
 
+    // Clean up per-context economy state (budget + antispam trackers).
+    crate::runtime::remove_economy_state(&handle.context_id);
+
     Ok(())
 }
 

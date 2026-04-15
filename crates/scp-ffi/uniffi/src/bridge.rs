@@ -3359,6 +3359,9 @@ pub async fn context_close(
             // to prevent unbounded memory growth in long-running processes.
             remove_bridge_state(&handle.context_id);
 
+            // Clean up per-context economy state (budget + antispam trackers).
+            crate::runtime::remove_economy_state(&handle.context_id);
+
             // Deregister the context handle from the MCP lookup registry.
             deregister_context_handle(&handle.context_id);
 

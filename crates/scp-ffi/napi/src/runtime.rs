@@ -1185,6 +1185,12 @@ where
     f(entry.value())
 }
 
+/// Removes per-context economy state (budget + antispam trackers) on context close.
+pub fn remove_economy_state(context_id: &str) {
+    economy_budget_registry().remove(context_id);
+    economy_antispam_registry().remove(context_id);
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
