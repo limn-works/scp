@@ -72,24 +72,13 @@ use crate::error::ScpPyError;
 /// This ensures shadow registries and sender key stores are dropped, releasing
 /// any key material they hold.
 ///
-/// Also clears the credential store's internal maps. The `InMemoryCredentialStore`
-/// uses `tokio::sync::RwLock` (async); we use `try_write()` for best-effort
-/// synchronous clearing during shutdown.
+/// `CREDENTIAL_STORE` is an `OnceLock<InMemoryCredentialStore>` that cannot
+/// be cleared (`OnceLock` does not support `take`). Its `Zeroizing<[u8; 32]>`
+/// fields are cleaned up on process exit via `Drop`. Same limitation as
+/// `DID_RESOLVER` and `STORAGE_PROVIDER` in `runtime.rs`.
 pub(crate) fn clear_bridge_state() {
     if let Some(reg) = BRIDGE_STATE.get() {
         reg.clear();
-    }
-    // Best-effort credential store clearing. The store holds bridge
-    // credential keys (`Zeroizing<[u8; 32]>`) that should be dropped
-    // promptly. `try_write()` avoids blocking if another task holds the
-    // lock (unlikely during shutdown).
-    if let Some(store) = CREDENTIAL_STORE.get() {
-        // InMemoryCredentialStore fields are tokio::sync::RwLock-guarded.
-        // Access the BridgeCredentialStore trait methods are all async,
-        // but we can access the struct directly — it's our own type.
-        // The store is dropped with the process; Zeroizing keys are
-        // cleaned up on drop regardless.
-        let _ = store; // No sync clear method available; drop handles cleanup.
     }
 }
 

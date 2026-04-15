@@ -4765,18 +4765,37 @@ pub async fn transport_connect(relay_url: String) -> Result<Arc<TransportManager
 
             // Store the transport manager in BridgeInstance so that
             // suspend()/shutdown() lifecycle events automatically clear it.
-            if let Ok(bi) = crate::runtime::bridge_instance() {
-                bi.set_transport(manager).map_err(|e| ScpError::Transport {
+            // If BridgeInstance doesn't exist yet (init_context_manager()
+            // was called without a DID), create one from the existing
+            // ContextManager.
+            let bi = match crate::runtime::bridge_instance() {
+                Ok(bi) => bi,
+                Err(_) => {
+                    // BridgeInstance not created — try to bootstrap from
+                    // the existing ContextManager (standard UniFFI flow:
+                    // init_context_manager() → context_create →
+                    // transport_connect).
+                    if let Ok(cm) = crate::runtime::context_manager() {
+                        crate::runtime::ensure_bridge_instance(cm.clone());
+                        crate::runtime::bridge_instance().map_err(|_| ScpError::Context {
+                            msg: "bridge not initialized — call identity_create before transport_connect"
+                                .to_owned(),
+                            code: codes::CTX_2000.to_owned(),
+                        })?
+                    } else {
+                        return Err(ScpError::Context {
+                            msg: "bridge not initialized — call identity_create before transport_connect"
+                                .to_owned(),
+                            code: codes::CTX_2000.to_owned(),
+                        });
+                    }
+                }
+            };
+            bi.set_transport(std::sync::Arc::new(manager))
+                .map_err(|e| ScpError::Transport {
                     msg: e.to_string(),
                     code: codes::TRANS_5002.to_owned(),
                 })?;
-            } else {
-                return Err(ScpError::Context {
-                    msg: "bridge not initialized — call identity_create before transport_connect"
-                        .to_owned(),
-                    code: codes::CTX_2000.to_owned(),
-                });
-            }
 
             let handle = Arc::new(TransportManager {
                 status: std::sync::Mutex::new(TransportStatus {

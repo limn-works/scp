@@ -2025,20 +2025,25 @@ impl ContextManager {
             .collect();
 
         for context_id in &context_ids {
-            // Best-effort MLS group destruction.
             let ctx_id_bytes = context_id_to_bytes(context_id);
-            if let Err(e) = self.crypto.destroy_mls_group(&ctx_id_bytes) {
-                tracing::debug!(
-                    context_id = %context_id,
-                    error = %e,
-                    "failed to destroy MLS group during shutdown — may already be gone"
-                );
-            }
+
+            // Destroy sender key BEFORE MLS group. The MLS crypto provider
+            // stores both in the same internal HashMap entry — destroy_mls_group
+            // removes the entry entirely, making a subsequent destroy_sender_key
+            // a no-op (key not zeroized). Ordering: zeroize secrets first,
+            // then tear down the group structure.
             if let Err(e) = self.crypto.destroy_sender_key(&ctx_id_bytes) {
                 tracing::debug!(
                     context_id = %context_id,
                     error = %e,
                     "failed to destroy sender key during shutdown — may already be gone"
+                );
+            }
+            if let Err(e) = self.crypto.destroy_mls_group(&ctx_id_bytes) {
+                tracing::debug!(
+                    context_id = %context_id,
+                    error = %e,
+                    "failed to destroy MLS group during shutdown — may already be gone"
                 );
             }
             if let Err(e) = self.event_log.destroy_event_log(&ctx_id_bytes) {
@@ -2059,9 +2064,16 @@ impl ContextManager {
             standing.clear();
         }
 
+        // Abort all background tasks (TTL timers, governance timeouts).
+        // Best-effort: if the mutex is contended, tasks will be cleaned
+        // up when their contexts are dropped.
+        if let Ok(mut tasks) = self.task_set.try_lock() {
+            tasks.abort_all();
+        }
+
         tracing::info!(
             removed_count = context_ids.len(),
-            "shutdown: removed all contexts from ContextManager"
+            "shutdown: removed all contexts and aborted background tasks"
         );
     }
 

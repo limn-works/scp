@@ -54,24 +54,35 @@ fn map_transport_lock_error(e: TransportLockError) -> ScpNapiError {
     }
 }
 
-/// Stores a new `TransportManager` (called by [`transport_connect`]).
+/// Stores a `TransportManager` (called by [`transport_connect`]).
 ///
-/// Delegates to [`BridgeInstance::set_transport`].
+/// Wraps in `Arc` and delegates to [`BridgeInstance::set_transport`].
+/// If the `BridgeInstance` doesn't exist yet but `CONTEXT_MANAGER` is
+/// initialized, lazily creates the `BridgeInstance`.
 ///
 /// # Errors
 ///
 /// Returns `ScpNapiError::Transport` if the lock is poisoned or the bridge
 /// is not initialized.
 fn set_transport_manager(manager: scp_transport::TransportManager) -> napi::Result<()> {
-    let bi = crate::runtime::bridge_instance()?;
-    bi.set_transport(manager)
+    // Try existing bridge instance first; fall back to lazy creation
+    // from the existing ContextManager.
+    let bi = if let Ok(bi) = crate::runtime::bridge_instance() {
+        bi
+    } else {
+        if let Ok(cm) = crate::runtime::context_manager() {
+            crate::runtime::ensure_bridge_instance(cm.clone());
+        }
+        crate::runtime::bridge_instance()?
+    };
+    bi.set_transport(Arc::new(manager))
         .map_err(|e| napi::Error::from(map_transport_lock_error(e)))
 }
 
 /// Stores a pre-built `Arc<TransportManager>` (called by [`crate::server`]
 /// auto-wire where the caller needs to construct the manager externally).
 ///
-/// Delegates to [`BridgeInstance::set_transport_arc`].
+/// Delegates to [`BridgeInstance::set_transport`].
 ///
 /// # Errors
 ///
@@ -85,8 +96,7 @@ pub(crate) fn set_transport_manager_arc(
             .to_owned(),
         code: codes::TRANS_5002.to_owned(),
     })?;
-    bi.set_transport_arc(manager)
-        .map_err(map_transport_lock_error)
+    bi.set_transport(manager).map_err(map_transport_lock_error)
 }
 
 /// Executes a closure with a read reference to the `TransportManager`.

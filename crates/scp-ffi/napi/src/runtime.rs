@@ -133,6 +133,27 @@ fn not_configured_key_resolver() -> scp_core::context::governance::KeyResolver {
 /// `context_create`) rather than silently auto-initializing with
 /// potentially invalid state.
 pub fn context_manager() -> napi::Result<&'static Arc<ContextManager>> {
+    // If BridgeInstance exists, enforce its lifecycle state. After
+    // scp_shutdown(), 70+ operations flow through this path — without
+    // this check they would continue operating on a shut-down bridge.
+    if let Some(bi) = BRIDGE_INSTANCE.get() {
+        bi.check_ready().map_err(|e| {
+            let message = match e {
+                scp_ffi_common::bridge_instance::LifecycleError::AlreadyShutDown => {
+                    "bridge has been shut down — OnceLock prevents re-initialization \
+                     within the same process; use suspend/resume for mobile lifecycle"
+                        .to_owned()
+                }
+                scp_ffi_common::bridge_instance::LifecycleError::Suspended => {
+                    "bridge is suspended — call resume() before performing operations".to_owned()
+                }
+            };
+            napi::Error::from(ScpNapiError::Context {
+                message,
+                code: codes::CTX_2000.to_owned(),
+            })
+        })?;
+    }
     CONTEXT_MANAGER.get().ok_or_else(|| {
         napi::Error::from(ScpNapiError::Context {
             message: "ContextManager not initialized — call context_create, \
@@ -211,6 +232,18 @@ fn init_bridge_instance(context_manager: Arc<ContextManager>, local_did: &str) {
 #[must_use]
 pub fn bridge_instance_raw() -> Option<&'static Arc<BridgeInstance>> {
     BRIDGE_INSTANCE.get()
+}
+
+/// Ensures a `BridgeInstance` exists, creating one from the given
+/// `ContextManager` if necessary.
+///
+/// Used by `set_transport_manager` to lazily create a `BridgeInstance`
+/// when it wasn't created during initialization (defensive fallback).
+pub fn ensure_bridge_instance(cm: Arc<ContextManager>) {
+    if BRIDGE_INSTANCE.get().is_some() {
+        return;
+    }
+    init_bridge_instance(cm, "did:unknown:napi-bridge");
 }
 
 /// Returns a reference to the global [`BridgeInstance`].
@@ -393,23 +426,6 @@ pub fn init_context_manager_with_relay_transport(
     init_bridge_instance(cm_arc, local_did);
 }
 
-/// Constructs a persistent event log provider backed by encrypted in-memory
-/// storage.
-///
-/// Creates an `EncryptingAdapter<BridgeInMemoryStorage>` with a random
-/// AES-256-GCM key, wraps it in a `ProtocolRepository`, then builds a
-/// `ProtocolRepositoryEventLogBridge` that implements `EventLogPersistence`.
-/// The resulting `MerkleEventLogProvider` persists entries on each append.
-///
-/// Uses [`BridgeInMemoryStorage`] (a bridge-local `Storage` implementation)
-/// instead of `scp_platform::testing::InMemoryStorage` so that the `testing`
-/// feature (which also exposes `InMemoryKeyCustody`) is not required in
-/// production builds. See issue #484.
-///
-/// SDK consumers requiring durable persistence across process restarts
-/// should provide a file-backed `Storage` implementation at the application
-/// layer (e.g., `SqliteStorage`). The in-memory default is suitable for the
-/// Node.js/Bun environment where process lifetime matches context lifetime.
 /// Global `ProtocolRepository` instance, shared between the event log
 /// provider and the trust store bridge. Exposed via [`protocol_repository()`]
 /// for trust aggregation (issue #502).
@@ -428,6 +444,23 @@ pub fn protocol_repository()
     PROTOCOL_REPOSITORY.get()
 }
 
+/// Constructs a persistent event log provider backed by encrypted in-memory
+/// storage.
+///
+/// Creates an `EncryptingAdapter<BridgeInMemoryStorage>` with a random
+/// AES-256-GCM key, wraps it in a `ProtocolRepository`, then builds a
+/// `ProtocolRepositoryEventLogBridge` that implements `EventLogPersistence`.
+/// The resulting `MerkleEventLogProvider` persists entries on each append.
+///
+/// Uses [`BridgeInMemoryStorage`] (a bridge-local `Storage` implementation)
+/// instead of `scp_platform::testing::InMemoryStorage` so that the `testing`
+/// feature (which also exposes `InMemoryKeyCustody`) is not required in
+/// production builds. See issue #484.
+///
+/// SDK consumers requiring durable persistence across process restarts
+/// should provide a file-backed `Storage` implementation at the application
+/// layer (e.g., `SqliteStorage`). The in-memory default is suitable for the
+/// Node.js/Bun environment where process lifetime matches context lifetime.
 fn build_event_log_provider() -> Box<dyn ContextEventLogProvider> {
     let mut key = Zeroizing::new([0u8; 32]);
     rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut *key);

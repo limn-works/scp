@@ -270,9 +270,14 @@ impl BridgeInstance {
     pub fn register_shutdown_hook(&self, hook: Box<dyn FnOnce() + Send>) {
         if self.is_shutdown() {
             // Already shut down — run the hook immediately since shutdown()
-            // won't be called again.
+            // won't be called again. Wrap in catch_unwind for consistency
+            // with shutdown()'s hook execution.
             tracing::warn!("hook registered after shutdown — running immediately");
-            hook();
+            if let Err(_payload) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(hook)) {
+                tracing::error!(
+                    "post-shutdown hook panicked — bridge-specific cleanup may be incomplete"
+                );
+            }
             return;
         }
         match self.shutdown_hooks.lock() {
@@ -308,7 +313,12 @@ impl BridgeInstance {
         // Set flag FIRST to prevent new operations from starting between
         // flag check and transport teardown.
         self.suspended.store(true, Ordering::SeqCst);
-        self.clear_transport()?;
+        if let Err(e) = self.clear_transport() {
+            // Revert the suspended flag — the instance is not cleanly
+            // suspended if transport wasn't cleared.
+            self.suspended.store(false, Ordering::SeqCst);
+            return Err(e);
+        }
         tracing::debug!(local_did = %self.local_did, "bridge instance suspended");
         Ok(())
     }
@@ -353,14 +363,20 @@ impl BridgeInstance {
     ///
     /// # Errors
     ///
-    /// Returns `Err` if the transport `RwLock` is poisoned.
+    /// Never returns `Err` — transport lock failures are logged and
+    /// cleanup continues. Shutdown must always complete.
     pub fn shutdown(&self) -> Result<(), TransportLockError> {
         if self.shutdown.swap(true, Ordering::SeqCst) {
             return Ok(()); // Already shut down
         }
 
-        // Clear transport (disconnect relay)
-        self.clear_transport()?;
+        // Clear transport (disconnect relay). Best-effort: if the RwLock
+        // is poisoned, log the error and continue with remaining cleanup.
+        // Shutdown must not abort — key material zeroization and hook
+        // execution are more critical than a clean transport teardown.
+        if let Err(e) = self.clear_transport() {
+            tracing::error!("failed to clear transport during shutdown: {e} — continuing cleanup");
+        }
 
         // Remove all contexts from the ContextManager (MLS groups, sender
         // keys, event logs). Best-effort — already-removed contexts are
@@ -376,8 +392,11 @@ impl BridgeInstance {
         // called exactly once even if the Mutex isn't dropped.
         if let Ok(mut hooks) = self.shutdown_hooks.lock() {
             for hook in hooks.drain(..) {
-                if let Err(e) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(hook)) {
-                    tracing::error!("shutdown hook panicked: {e:?}");
+                if let Err(_payload) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(hook))
+                {
+                    tracing::error!(
+                        "shutdown hook panicked — bridge-specific cleanup may be incomplete"
+                    );
                 }
             }
         } else {
@@ -395,43 +414,30 @@ impl BridgeInstance {
     // Transport accessors
     // -----------------------------------------------------------------
 
-    /// Stores a new `TransportManager` (called after relay connect).
+    /// Stores a pre-built `Arc<TransportManager>` (called after relay
+    /// connect).
     ///
-    /// Wraps the manager in `Arc` before storing so that async tasks (e.g.,
-    /// NAPI subscription) can clone the `Arc` without keeping the `RwLock`
-    /// guard alive across `.await` points.
+    /// The `Arc` allows async tasks (e.g., NAPI subscription) to clone the
+    /// reference without keeping the `RwLock` guard alive across `.await`
+    /// points.
     ///
     /// Replaces any previous transport manager.
     ///
     /// # Errors
     ///
-    /// Returns `Err` if the `RwLock` is poisoned.
+    /// Returns `Err` if the `RwLock` is poisoned, or if the instance is
+    /// shut down or suspended (lifecycle violation).
     #[allow(clippy::significant_drop_tightening)]
     pub fn set_transport(
         &self,
-        manager: scp_transport::TransportManager,
-    ) -> Result<(), TransportLockError> {
-        let mut guard = self
-            .transport
-            .write()
-            .map_err(|_| TransportLockError::Poisoned)?;
-        *guard = Some(Arc::new(manager));
-        Ok(())
-    }
-
-    /// Stores a pre-built `Arc<TransportManager>`.
-    ///
-    /// Used by callers (e.g., NAPI server auto-wire) that construct the
-    /// manager externally and wrap it in `Arc` before storing.
-    ///
-    /// # Errors
-    ///
-    /// Returns `Err` if the `RwLock` is poisoned.
-    #[allow(clippy::significant_drop_tightening)]
-    pub fn set_transport_arc(
-        &self,
         manager: Arc<scp_transport::TransportManager>,
     ) -> Result<(), TransportLockError> {
+        if self.is_shutdown() {
+            return Err(TransportLockError::NotInitialized);
+        }
+        if self.is_suspended() {
+            return Err(TransportLockError::NotInitialized);
+        }
         let mut guard = self
             .transport
             .write()
@@ -550,9 +556,27 @@ impl BridgeInstance {
     // -----------------------------------------------------------------
 
     /// Returns a reference to the known-contexts `DashMap`.
+    ///
+    /// **Prefer the typed accessors** ([`register_known_context`],
+    /// [`remove_known_context`], [`all_known_contexts`],
+    /// [`known_contexts_for_member`], [`known_context_count`],
+    /// [`has_known_context`]) which enforce capacity limits. Direct
+    /// mutation via this reference bypasses capacity enforcement.
     #[must_use]
     pub const fn known_contexts(&self) -> &DashMap<String, KnownContext> {
         &self.known_contexts
+    }
+
+    /// Returns the number of known contexts in the discovery registry.
+    #[must_use]
+    pub fn known_context_count(&self) -> usize {
+        self.known_contexts.len()
+    }
+
+    /// Returns whether the given context ID is in the discovery registry.
+    #[must_use]
+    pub fn has_known_context(&self, context_id: &str) -> bool {
+        self.known_contexts.contains_key(context_id)
     }
 
     /// Registers a known context in the discovery registry.
@@ -560,6 +584,9 @@ impl BridgeInstance {
     /// Overwrites any existing entry for the same context ID (idempotent).
     /// When the registry is at capacity ([`MAX_KNOWN_CONTEXTS`]), evicts the
     /// oldest entry (by `last_seen` timestamp) before inserting.
+    ///
+    /// Note: Under concurrent registration, the cap may be temporarily exceeded
+    /// by up to `num_threads - 1` entries. This is bounded and benign.
     pub fn register_known_context(&self, context_id: &str, known: KnownContext) {
         // If this context_id already exists, it's an overwrite — no eviction needed.
         if !self.known_contexts.contains_key(context_id)
@@ -613,9 +640,18 @@ impl BridgeInstance {
     // -----------------------------------------------------------------
 
     /// Returns a reference to the rate-limiters `DashMap`.
+    ///
+    /// **Prefer [`with_rate_limit_tracker`]** which enforces capacity limits.
+    /// Direct mutation via this reference bypasses capacity enforcement.
     #[must_use]
     pub const fn rate_limiters(&self) -> &DashMap<String, RateLimitTracker> {
         &self.rate_limiters
+    }
+
+    /// Returns the number of rate limit trackers in the registry.
+    #[must_use]
+    pub fn rate_limiter_count(&self) -> usize {
+        self.rate_limiters.len()
     }
 
     /// Executes a closure with a mutable reference to the rate limit tracker
@@ -625,6 +661,9 @@ impl BridgeInstance {
     /// requested DID does not already have a tracker, uses a temporary
     /// ephemeral tracker that is not persisted. This preserves the infallible
     /// signature while preventing unbounded memory growth.
+    ///
+    /// Note: Under concurrent creation, the cap may be temporarily exceeded
+    /// by up to `num_threads - 1` entries. This is bounded and benign.
     pub fn with_rate_limit_tracker<F, T>(&self, identity_did: &str, f: F) -> T
     where
         F: FnOnce(&mut RateLimitTracker) -> T,
@@ -703,7 +742,9 @@ pub enum LifecycleError {
 impl std::fmt::Display for LifecycleError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::AlreadyShutDown => write!(f, "cannot resume a shut down instance"),
+            Self::AlreadyShutDown => {
+                write!(f, "bridge instance has been permanently shut down")
+            }
             Self::Suspended => write!(
                 f,
                 "bridge is suspended — call resume() before performing operations"
@@ -1024,7 +1065,9 @@ mod tests {
     #[test]
     fn suspend_clears_transport() {
         let instance = BridgeInstance::new(test_context_manager(), "did:dht:ztest".to_owned());
-        instance.set_transport(test_transport_manager()).unwrap();
+        instance
+            .set_transport(Arc::new(test_transport_manager()))
+            .unwrap();
         assert!(instance.has_transport());
 
         instance.suspend().unwrap();
@@ -1061,7 +1104,10 @@ mod tests {
 
         let err = instance.resume().unwrap_err();
         assert_eq!(err, LifecycleError::AlreadyShutDown);
-        assert_eq!(err.to_string(), "cannot resume a shut down instance");
+        assert_eq!(
+            err.to_string(),
+            "bridge instance has been permanently shut down"
+        );
     }
 
     #[test]
@@ -1147,7 +1193,7 @@ mod tests {
     fn lifecycle_error_display() {
         assert_eq!(
             LifecycleError::AlreadyShutDown.to_string(),
-            "cannot resume a shut down instance"
+            "bridge instance has been permanently shut down"
         );
         assert_eq!(
             LifecycleError::Suspended.to_string(),
@@ -1305,5 +1351,64 @@ mod tests {
             ran.load(Ordering::SeqCst),
             "hook registered after shutdown must run immediately"
         );
+    }
+
+    // -----------------------------------------------------------------
+    // set_transport lifecycle guard tests
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn set_transport_rejects_after_shutdown() {
+        let instance = BridgeInstance::new(test_context_manager(), "did:dht:ztest".to_owned());
+        instance.shutdown().unwrap();
+
+        let err = instance
+            .set_transport(Arc::new(test_transport_manager()))
+            .unwrap_err();
+        assert_eq!(err, TransportLockError::NotInitialized);
+    }
+
+    #[test]
+    fn set_transport_rejects_when_suspended() {
+        let instance = BridgeInstance::new(test_context_manager(), "did:dht:ztest".to_owned());
+        instance.suspend().unwrap();
+
+        let err = instance
+            .set_transport(Arc::new(test_transport_manager()))
+            .unwrap_err();
+        assert_eq!(err, TransportLockError::NotInitialized);
+    }
+
+    #[test]
+    fn set_transport_accepts_after_resume() {
+        let instance = BridgeInstance::new(test_context_manager(), "did:dht:ztest".to_owned());
+        instance.suspend().unwrap();
+        instance.resume().unwrap();
+
+        assert!(
+            instance
+                .set_transport(Arc::new(test_transport_manager()))
+                .is_ok()
+        );
+        assert!(instance.has_transport());
+    }
+
+    // -----------------------------------------------------------------
+    // Post-shutdown hook panic safety
+    // -----------------------------------------------------------------
+
+    #[test]
+    #[allow(clippy::panic)]
+    fn register_hook_after_shutdown_catches_panic() {
+        let instance = BridgeInstance::new(test_context_manager(), "did:dht:ztest".to_owned());
+        instance.shutdown().unwrap();
+
+        // A panicking hook registered after shutdown must not propagate.
+        instance.register_shutdown_hook(Box::new(|| {
+            panic!("deliberate panic in post-shutdown hook test");
+        }));
+
+        // If we got here, the panic was caught.
+        assert!(instance.is_shutdown());
     }
 }

@@ -118,6 +118,23 @@ static CONTEXT_MANAGER: OnceLock<Arc<ContextManager>> = OnceLock::new();
 /// Returns `ScpPyError::ContextError` if the context manager has not been
 /// initialized via [`init_context_manager`].
 pub fn context_manager() -> Result<&'static Arc<ContextManager>, ScpPyError> {
+    // If BridgeInstance exists, enforce its lifecycle state. After
+    // scp_shutdown(), 70+ operations flow through this path — without
+    // this check they would continue operating on a shut-down bridge.
+    if let Some(bi) = BRIDGE_INSTANCE.get() {
+        bi.check_ready().map_err(|e| match e {
+            scp_ffi_common::bridge_instance::LifecycleError::AlreadyShutDown => {
+                ScpPyError::context(
+                    "bridge has been shut down — OnceLock prevents re-initialization \
+                 within the same process; use suspend/resume for mobile lifecycle"
+                        .to_owned(),
+                )
+            }
+            scp_ffi_common::bridge_instance::LifecycleError::Suspended => ScpPyError::context(
+                "bridge is suspended — call resume() before performing operations".to_owned(),
+            ),
+        })?;
+    }
     CONTEXT_MANAGER.get().ok_or_else(|| {
         ScpPyError::context(
             "ContextManager not initialized — call py_context_create, \
@@ -1219,7 +1236,7 @@ pub fn set_transport_manager(manager: scp_transport::TransportManager) -> Result
             "bridge not initialized — call identity_create before transport_connect".to_owned(),
         )
     })?;
-    bi.set_transport(manager)
+    bi.set_transport(Arc::new(manager))
         .map_err(|e| ScpPyError::transport(e.to_string()))
 }
 
@@ -1390,7 +1407,7 @@ pub struct RegistryStats {
 #[must_use]
 pub fn registry_stats() -> RegistryStats {
     let (known_count, relay_connected) = bridge_instance()
-        .map(|bi| (bi.known_contexts().len(), bi.has_transport()))
+        .map(|bi| (bi.known_context_count(), bi.has_transport()))
         .unwrap_or((0, false));
     RegistryStats {
         contexts: ffi_state_registry().len(),
@@ -1644,7 +1661,7 @@ mod tests {
             stats.known_contexts,
         );
         assert!(
-            bi.known_contexts().contains_key(&ctx_id),
+            bi.has_known_context(&ctx_id),
             "registered known context should be in BridgeInstance"
         );
 
@@ -1653,7 +1670,7 @@ mod tests {
         let _ = register_ffi_state(&ctx_id, "did:dht:z6MkStatsKnown", &[]);
         remove_ffi_state(&ctx_id);
         assert!(
-            !bi.known_contexts().contains_key(&ctx_id),
+            !bi.has_known_context(&ctx_id),
             "removed known context should not be in BridgeInstance"
         );
     }
