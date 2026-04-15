@@ -11579,9 +11579,7 @@ use scp_ffi_common::bridge_state::{
 /// This ensures shadow registries and sender key stores are dropped, releasing
 /// any key material they hold.
 pub(crate) fn clear_bridge_state() {
-    if let Some(reg) = BRIDGE_STATE.get() {
-        reg.clear();
-    }
+    scp_ffi_common::bridge_state::bridge_state_registry().clear();
 }
 
 /// Bridge registration result record.

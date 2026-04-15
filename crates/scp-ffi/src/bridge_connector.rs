@@ -77,9 +77,7 @@ use crate::error::ScpPyError;
 /// fields are cleaned up on process exit via `Drop`. Same limitation as
 /// `DID_RESOLVER` and `STORAGE_PROVIDER` in `runtime.rs`.
 pub(crate) fn clear_bridge_state() {
-    if let Some(reg) = BRIDGE_STATE.get() {
-        reg.clear();
-    }
+    scp_ffi_common::bridge_state::bridge_state_registry().clear();
 }
 
 // ---------------------------------------------------------------------------
