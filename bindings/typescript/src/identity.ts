@@ -546,7 +546,7 @@ export class RevocationStatus {
         throw new Error("Bridge returned Revoked status without revoked_at timestamp");
       }
       if (!Number.isFinite(revokedAtRaw)) {
-        throw new ValidationError("revoked_at must be a finite number", "SCP-VALID-7004");
+        throw new ValidationError("revoked_at must be a finite number", "SCP-VALID-7005");
       }
       return RevocationStatus.revoked(
         Math.trunc(revokedAtRaw),
@@ -708,7 +708,7 @@ export class IdentityAttestation implements IdentityAttestationData {
       data.verificationMethod) as string;
     const verifiedAtRaw = (evidence.verified_at ?? data.verified_at ?? data.verifiedAt) as number;
     if (!Number.isFinite(verifiedAtRaw)) {
-      throw new ValidationError("verified_at must be a finite number", "SCP-VALID-7003");
+      throw new ValidationError("verified_at must be a finite number", "SCP-VALID-7005");
     }
     const verifiedAt = Math.trunc(verifiedAtRaw);
     const rawRs = data.revocation_status ?? data.revocationStatus ?? "active";
