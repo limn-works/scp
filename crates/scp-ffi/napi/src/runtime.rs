@@ -183,14 +183,22 @@ pub fn bridge_instance() -> napi::Result<&'static Arc<BridgeInstance>> {
             code: codes::CTX_2000.to_owned(),
         })
     })?;
-    if bi.is_shutdown() {
-        return Err(napi::Error::from(ScpNapiError::Context {
-            message: "bridge has been shut down — OnceLock prevents re-initialization \
-                      within the same process; use suspend/resume for mobile lifecycle"
-                .to_owned(),
+    bi.check_ready().map_err(|e| {
+        let message = match e {
+            scp_ffi_common::bridge_instance::LifecycleError::AlreadyShutDown => {
+                "bridge has been shut down — OnceLock prevents re-initialization \
+                 within the same process; use suspend/resume for mobile lifecycle"
+                    .to_owned()
+            }
+            scp_ffi_common::bridge_instance::LifecycleError::Suspended => {
+                "bridge is suspended — call resume() before performing operations".to_owned()
+            }
+        };
+        napi::Error::from(ScpNapiError::Context {
+            message,
             code: codes::CTX_2000.to_owned(),
-        }));
-    }
+        })
+    })?;
     Ok(bi)
 }
 

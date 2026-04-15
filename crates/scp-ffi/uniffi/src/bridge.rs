@@ -1944,10 +1944,12 @@ impl Drop for UcanToken {
 
 /// Opaque handle to the transport layer.
 ///
-/// Wraps a real [`scp_transport::TransportManager`] that supports multi-relay
-/// routing, per-context relay set assignment, suppression detection, and
-/// reliability scoring (ADR-012). Swift/Kotlin callers get the full multi-relay
-/// API: `addRelay`, `assignRelaySet`, `adapterCount`, `reliabilityScore`.
+/// Wraps a real [`scp_transport::TransportManager`] that is stored in the
+/// shared [`BridgeInstance`]. This handle provides Swift/Kotlin callers with
+/// the full multi-relay API: `addRelay`, `assignRelaySet`, `adapterCount`,
+/// `reliabilityScore`. All operations delegate to the `BridgeInstance`'s
+/// transport slot, so `suspend()` / `shutdown()` lifecycle events
+/// automatically clear the transport.
 ///
 /// Generated as `class TransportManager` in both Swift and Kotlin.
 ///
@@ -1956,18 +1958,16 @@ impl Drop for UcanToken {
 pub struct TransportManager {
     /// Current connection state (relay URL, latency).
     pub(crate) status: std::sync::Mutex<TransportStatus>,
-    /// The real multi-relay transport manager.
-    /// Wrapped in `RwLock` for concurrent read access (status, adapter count)
-    /// with exclusive write access (add relay, disconnect).
-    pub(crate) inner: std::sync::RwLock<scp_transport::TransportManager>,
 }
 
 impl fmt::Debug for TransportManager {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let adapter_count = self
-            .inner
-            .read()
-            .map(|mgr| mgr.adapter_count())
+        let adapter_count = crate::runtime::bridge_instance()
+            .ok()
+            .and_then(|bi| {
+                bi.with_transport(scp_transport::TransportManager::adapter_count)
+                    .ok()
+            })
             .unwrap_or(0);
         f.debug_struct("TransportManager")
             .field("adapter_count", &adapter_count)
@@ -2004,10 +2004,9 @@ impl TransportManager {
     /// Reflects actual connection state: `connected` is `true` only if the
     /// inner transport manager has at least one adapter registered.
     pub fn status(&self) -> TransportStatus {
-        let has_adapters = self
-            .inner
-            .read()
-            .map(|mgr| mgr.adapter_count() > 0)
+        let has_adapters = crate::runtime::bridge_instance()
+            .ok()
+            .and_then(|bi| bi.with_transport(|mgr| mgr.adapter_count() > 0).ok())
             .unwrap_or(false);
         let status = self
             .status
@@ -2027,18 +2026,18 @@ impl TransportManager {
 
     /// Returns `true` if the transport is currently connected (has adapters).
     pub fn is_connected(&self) -> bool {
-        self.inner
-            .read()
-            .map(|mgr| mgr.adapter_count() > 0)
+        crate::runtime::bridge_instance()
+            .ok()
+            .and_then(|bi| bi.with_transport(|mgr| mgr.adapter_count() > 0).ok())
             .unwrap_or(false)
     }
 
     /// Returns the number of adapters registered in the transport manager.
     #[allow(clippy::cast_possible_truncation)] // Adapter count is bounded by connection budget (<<u32::MAX).
     pub fn adapter_count(&self) -> u32 {
-        self.inner
-            .read()
-            .map(|mgr| mgr.adapter_count() as u32)
+        crate::runtime::bridge_instance()
+            .ok()
+            .and_then(|bi| bi.with_transport(|mgr| mgr.adapter_count() as u32).ok())
             .unwrap_or(0)
     }
 
@@ -2061,6 +2060,7 @@ impl TransportManager {
 
         validate_relay_url(&relay_url)?;
 
+        let bi = crate::runtime::bridge_instance()?;
         let rt = runtime();
         let sourced = SourcedRelayUrl {
             url: relay_url.clone(),
@@ -2079,18 +2079,22 @@ impl TransportManager {
         // events and downgrades the relay's reliability score (#1533 AC5).
         let suppression_rx = adapter.take_suppression_receiver();
 
-        let mut mgr = self.inner.write().map_err(|_| ScpError::Transport {
-            msg: "transport manager lock is poisoned".to_owned(),
-            code: codes::TRANS_5003.to_owned(),
-        })?;
-        let _eviction = mgr.add_adapter(Box::new(adapter));
-        #[allow(clippy::cast_possible_truncation)] // Bounded by connection budget.
-        let count = mgr.adapter_count() as u32;
-        drop(mgr);
+        let count = bi
+            .with_transport_mut(|mgr| {
+                let _eviction = mgr.add_adapter(Box::new(adapter));
+                #[allow(clippy::cast_possible_truncation)] // Bounded by connection budget.
+                let count = mgr.adapter_count() as u32;
+                count
+            })
+            .map_err(|e| ScpError::Transport {
+                msg: e.to_string(),
+                code: codes::TRANS_5003.to_owned(),
+            })?;
 
         // Spawn suppression → scoring bridge task.
+        // Uses BridgeInstance transport for score updates.
         if let Some(rx) = suppression_rx {
-            spawn_suppression_scoring_task(rx, relay_url, Arc::downgrade(&self));
+            spawn_suppression_scoring_task(rx, relay_url);
         }
 
         Ok(count)
@@ -2114,16 +2118,19 @@ impl TransportManager {
     /// Returns `ScpError::Transport` if no adapters are registered.
     pub fn assign_relay_set(&self, context_id: String) -> Result<Vec<u32>, ScpError> {
         validate_context_id(&context_id)?;
-        let mgr = self.inner.read().map_err(|_| ScpError::Transport {
-            msg: "transport manager lock is poisoned".to_owned(),
-            code: codes::TRANS_5003.to_owned(),
-        })?;
-        let indices = mgr
-            .assign_relay_set(&context_id)
+        let bi = crate::runtime::bridge_instance()?;
+        let indices = bi
+            .with_transport(|mgr| {
+                mgr.assign_relay_set(&context_id)
+                    .map_err(|e| ScpError::Transport {
+                        msg: format!("relay set assignment failed: {e}"),
+                        code: codes::TRANS_5004.to_owned(),
+                    })
+            })
             .map_err(|e| ScpError::Transport {
-                msg: format!("relay set assignment failed: {e}"),
-                code: codes::TRANS_5004.to_owned(),
-            })?;
+                msg: e.to_string(),
+                code: codes::TRANS_5003.to_owned(),
+            })??;
         #[allow(clippy::cast_possible_truncation)] // Adapter indices bounded by adapter count.
         Ok(indices.into_iter().map(|i| i as u32).collect())
     }
@@ -2136,8 +2143,10 @@ impl TransportManager {
     ///
     /// * `adapter_index` -- The adapter index (0-based) to query.
     pub fn reliability_score(&self, adapter_index: u32) -> Option<ReliabilityScoreRecord> {
-        let mgr = self.inner.read().ok()?;
-        let score = mgr.get_reliability_score(adapter_index as usize)?;
+        let bi = crate::runtime::bridge_instance().ok()?;
+        let score = bi
+            .with_transport(|mgr| mgr.get_reliability_score(adapter_index as usize))
+            .ok()??;
         Some(ReliabilityScoreRecord {
             relay_url: score.relay_url.clone(),
             delivery_success_rate: score.delivery_success_rate,
@@ -2173,26 +2182,25 @@ impl Drop for TransportManager {
 /// #1533 AC5). Each suppression event downgrades the relay's reliability
 /// score via `DeliveryOutcome::Failure`.
 ///
-/// Uses a `Weak` reference so the task exits gracefully when the
-/// `TransportManager` is dropped (no prevent-drop cycles).
+/// Accesses the transport via `BridgeInstance` — the task exits gracefully
+/// when the bridge is shut down or the transport is cleared.
 fn spawn_suppression_scoring_task(
     mut rx: tokio::sync::mpsc::Receiver<scp_transport::heartbeat::SuppressionSuspected>,
     relay_url: String,
-    manager: std::sync::Weak<TransportManager>,
 ) {
     tokio::spawn(async move {
         while let Some(_suppression) = rx.recv().await {
-            let Some(mgr) = manager.upgrade() else {
-                // TransportManager dropped — exit gracefully.
+            let Ok(bi) = crate::runtime::bridge_instance() else {
+                // Bridge shut down — exit gracefully.
                 break;
             };
             tracing::debug!(
                 relay_url = %relay_url,
                 "heartbeat suppression → downgrading relay reliability score"
             );
-            if let Ok(inner) = mgr.inner.read() {
+            let _ = bi.with_transport(|inner| {
                 inner.update_score(&relay_url, scp_transport::scoring::DeliveryOutcome::Failure);
-            }
+            });
         }
         tracing::debug!(
             relay_url = %relay_url,
@@ -4800,19 +4808,33 @@ pub async fn transport_connect(relay_url: String) -> Result<Arc<TransportManager
             // reliability scoring, and suppression detection.
             let manager = scp_transport::TransportManager::new(Box::new(adapter));
 
+            // Store the transport manager in BridgeInstance so that
+            // suspend()/shutdown() lifecycle events automatically clear it.
+            if let Ok(bi) = crate::runtime::bridge_instance() {
+                bi.set_transport(manager).map_err(|e| ScpError::Transport {
+                    msg: e.to_string(),
+                    code: codes::TRANS_5002.to_owned(),
+                })?;
+            } else {
+                return Err(ScpError::Context {
+                    msg: "bridge not initialized — call identity_create before transport_connect"
+                        .to_owned(),
+                    code: codes::CTX_2000.to_owned(),
+                });
+            }
+
             let handle = Arc::new(TransportManager {
                 status: std::sync::Mutex::new(TransportStatus {
                     connected: true,
                     relay_url: Some(relay_url.clone()),
                     latency_ms: None,
                 }),
-                inner: std::sync::RwLock::new(manager),
             });
             increment_handle_count();
 
             // Spawn suppression → scoring bridge task.
             if let Some(rx) = suppression_rx {
-                spawn_suppression_scoring_task(rx, relay_url, Arc::downgrade(&handle));
+                spawn_suppression_scoring_task(rx, relay_url);
             }
 
             Ok(handle)
@@ -4856,16 +4878,15 @@ pub async fn transport_status(manager: Arc<TransportManager>) -> Result<Transpor
 pub async fn transport_disconnect(manager: Arc<TransportManager>) -> Result<(), ScpError> {
     runtime()
         .spawn(async move {
-            // Replace the inner manager with an empty one, dropping all adapters.
-            {
-                let mut inner_guard = manager.inner.write().map_err(|_| ScpError::Transport {
-                    msg: "transport manager lock is poisoned — cannot disconnect".to_owned(),
+            // Clear the transport from BridgeInstance, dropping all adapters.
+            if let Ok(bi) = crate::runtime::bridge_instance() {
+                bi.clear_transport().map_err(|e| ScpError::Transport {
+                    msg: e.to_string(),
                     code: codes::TRANS_5003.to_owned(),
                 })?;
-                *inner_guard = scp_transport::TransportManager::builder();
             }
 
-            // Update the status to disconnected.
+            // Update the handle's status to disconnected.
             {
                 let mut status_guard = manager.status.lock().map_err(|_| ScpError::Transport {
                     msg: "status mutex is poisoned — cannot update transport status".to_owned(),

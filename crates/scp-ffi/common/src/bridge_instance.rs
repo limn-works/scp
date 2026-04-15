@@ -38,6 +38,19 @@ use dashmap::DashMap;
 use scp_core::context::ContextManager;
 use scp_protocol::context::invitation::RateLimitTracker;
 
+/// Maximum number of known contexts that can be registered in the discovery
+/// registry. When this limit is reached, the oldest entry (by `last_seen`)
+/// is evicted to make room for the new one. 10,000 is well beyond any
+/// realistic per-device usage while preventing unbounded memory growth from
+/// a misbehaving caller.
+const MAX_KNOWN_CONTEXTS: usize = 10_000;
+
+/// Maximum number of rate limit trackers. When this limit is reached,
+/// new tracker creation requests are rejected (the caller must retry
+/// later). 1,000 concurrent identity DIDs per bridge instance is generous
+/// for any single-process deployment.
+const MAX_RATE_LIMITERS: usize = 1_000;
+
 /// Metadata about a known context's relay presence.
 ///
 /// Stored in the `BridgeInstance`'s known-contexts registry so that context
@@ -198,6 +211,27 @@ impl BridgeInstance {
         self.suspended.load(Ordering::SeqCst)
     }
 
+    /// Checks that the bridge instance is ready to service operations.
+    ///
+    /// Rejects both permanently shut-down and suspended instances. This is
+    /// the single gatekeeper that all bridge `bridge_instance()` functions
+    /// should call to enforce lifecycle state.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LifecycleError::AlreadyShutDown`] if the instance has been
+    /// permanently shut down, or [`LifecycleError::Suspended`] if the
+    /// instance is currently suspended.
+    pub fn check_ready(&self) -> Result<(), LifecycleError> {
+        if self.is_shutdown() {
+            return Err(LifecycleError::AlreadyShutDown);
+        }
+        if self.is_suspended() {
+            return Err(LifecycleError::Suspended);
+        }
+        Ok(())
+    }
+
     /// Suspends the bridge instance.
     ///
     /// - Disconnects the relay (clears transport)
@@ -267,6 +301,11 @@ impl BridgeInstance {
 
         // Clear transport (disconnect relay)
         self.clear_transport()?;
+
+        // Remove all contexts from the ContextManager (MLS groups, sender
+        // keys, event logs). Best-effort — already-removed contexts are
+        // silently ignored.
+        self.context_manager.shutdown_all_contexts();
 
         // Clear registries
         self.known_contexts.clear();
@@ -385,11 +424,14 @@ impl BridgeInstance {
         &self,
         f: impl FnOnce(&scp_transport::TransportManager) -> T,
     ) -> Result<T, TransportLockError> {
-        let guard = self
-            .transport
-            .read()
-            .map_err(|_| TransportLockError::Poisoned)?;
-        let manager = guard.as_deref().ok_or(TransportLockError::NotInitialized)?;
+        let guard = self.transport.read().map_err(|_| {
+            tracing::debug!("transport RwLock poisoned (a writer panicked)");
+            TransportLockError::Poisoned
+        })?;
+        let manager = guard.as_deref().ok_or_else(|| {
+            tracing::debug!("transport slot is empty — no transport_connect call");
+            TransportLockError::NotInitialized
+        })?;
         Ok(f(manager))
     }
 
@@ -409,12 +451,24 @@ impl BridgeInstance {
         &self,
         f: impl FnOnce(&mut scp_transport::TransportManager) -> T,
     ) -> Result<T, TransportLockError> {
-        let mut guard = self
-            .transport
-            .write()
-            .map_err(|_| TransportLockError::Poisoned)?;
-        let arc = guard.as_mut().ok_or(TransportLockError::NotInitialized)?;
-        let manager = Arc::get_mut(arc).ok_or(TransportLockError::InUse)?;
+        let mut guard = self.transport.write().map_err(|_| {
+            tracing::debug!("transport RwLock poisoned (a writer panicked)");
+            TransportLockError::Poisoned
+        })?;
+        let arc = guard.as_mut().ok_or_else(|| {
+            tracing::debug!("transport slot is empty — no transport_connect call");
+            TransportLockError::NotInitialized
+        })?;
+        // Capture strong count before the mutable borrow attempt (can't borrow
+        // arc immutably inside the ok_or_else closure while get_mut borrows it).
+        let strong_count = Arc::strong_count(arc);
+        let manager = Arc::get_mut(arc).ok_or_else(|| {
+            tracing::debug!(
+                strong_count,
+                "transport Arc has multiple holders — subscription task(s) holding references",
+            );
+            TransportLockError::InUse
+        })?;
         Ok(f(manager))
     }
 
@@ -431,7 +485,29 @@ impl BridgeInstance {
     /// Registers a known context in the discovery registry.
     ///
     /// Overwrites any existing entry for the same context ID (idempotent).
+    /// When the registry is at capacity ([`MAX_KNOWN_CONTEXTS`]), evicts the
+    /// oldest entry (by `last_seen` timestamp) before inserting.
     pub fn register_known_context(&self, context_id: &str, known: KnownContext) {
+        // If this context_id already exists, it's an overwrite — no eviction needed.
+        if !self.known_contexts.contains_key(context_id)
+            && self.known_contexts.len() >= MAX_KNOWN_CONTEXTS
+        {
+            // Find the entry with the smallest (oldest) last_seen timestamp.
+            if let Some(oldest) = self
+                .known_contexts
+                .iter()
+                .min_by_key(|entry| entry.value().last_seen)
+            {
+                let oldest_key = oldest.key().clone();
+                drop(oldest);
+                self.known_contexts.remove(&oldest_key);
+                tracing::debug!(
+                    evicted_context_id = %oldest_key,
+                    capacity = MAX_KNOWN_CONTEXTS,
+                    "evicted oldest known context to make room for new registration"
+                );
+            }
+        }
         self.known_contexts.insert(context_id.to_owned(), known);
     }
 
@@ -471,10 +547,29 @@ impl BridgeInstance {
 
     /// Executes a closure with a mutable reference to the rate limit tracker
     /// for the given identity DID, creating a default tracker if none exists.
+    ///
+    /// When the registry is at capacity ([`MAX_RATE_LIMITERS`]) and the
+    /// requested DID does not already have a tracker, uses a temporary
+    /// ephemeral tracker that is not persisted. This preserves the infallible
+    /// signature while preventing unbounded memory growth.
     pub fn with_rate_limit_tracker<F, T>(&self, identity_did: &str, f: F) -> T
     where
         F: FnOnce(&mut RateLimitTracker) -> T,
     {
+        // If the entry already exists, serve it regardless of capacity.
+        if let Some(mut entry) = self.rate_limiters.get_mut(identity_did) {
+            return f(entry.value_mut());
+        }
+        // New entry: check capacity.
+        if self.rate_limiters.len() >= MAX_RATE_LIMITERS {
+            tracing::warn!(
+                identity_did = %identity_did,
+                capacity = MAX_RATE_LIMITERS,
+                "rate limiter registry at capacity — using ephemeral tracker"
+            );
+            let mut ephemeral = RateLimitTracker::default();
+            return f(&mut ephemeral);
+        }
         let mut entry = self
             .rate_limiters
             .entry(identity_did.to_owned())
@@ -500,36 +595,46 @@ pub enum TransportLockError {
 
 impl std::fmt::Display for TransportLockError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Sanitized messages: no internal architecture details (lock types,
+        // Arc refcounts, etc.) leak to callers. Debug-level logging at the
+        // creation site provides the detailed reason for operators.
         match self {
-            Self::Poisoned => write!(f, "transport manager lock poisoned"),
+            Self::Poisoned => write!(f, "transport operation failed — internal error"),
             Self::NotInitialized => {
-                write!(f, "no transport manager — call transport_connect first")
+                write!(
+                    f,
+                    "transport not initialized — call transport_connect first"
+                )
             }
-            Self::InUse => write!(
-                f,
-                "transport manager is in use by an active subscription — \
-                 cannot modify while subscriptions are active"
-            ),
+            Self::InUse => write!(f, "transport is busy — try again later"),
         }
     }
 }
 
 impl std::error::Error for TransportLockError {}
 
-/// Error type for lifecycle operations (`resume`).
+/// Error type for lifecycle operations (`resume`, `check_ready`).
 ///
-/// Used by [`BridgeInstance::resume`]. Bridge layers map this to their own
-/// error types (`ScpPyError`, napi `Error`, etc.).
+/// Used by [`BridgeInstance::resume`] and [`BridgeInstance::check_ready`].
+/// Bridge layers map this to their own error types (`ScpPyError`, napi `Error`,
+/// etc.).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LifecycleError {
     /// The instance has been permanently shut down and cannot be resumed.
     AlreadyShutDown,
+    /// The instance is currently suspended (backgrounded). Transport-dependent
+    /// operations are unavailable. Call `resume()` to re-activate.
+    Suspended,
 }
 
 impl std::fmt::Display for LifecycleError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::AlreadyShutDown => write!(f, "cannot resume a shut down instance"),
+            Self::Suspended => write!(
+                f,
+                "bridge is suspended — call resume() before performing operations"
+            ),
         }
     }
 }
@@ -827,16 +932,15 @@ mod tests {
     fn transport_lock_error_display() {
         assert_eq!(
             TransportLockError::Poisoned.to_string(),
-            "transport manager lock poisoned"
+            "transport operation failed \u{2014} internal error"
         );
         assert_eq!(
             TransportLockError::NotInitialized.to_string(),
-            "no transport manager \u{2014} call transport_connect first"
+            "transport not initialized \u{2014} call transport_connect first"
         );
         assert_eq!(
             TransportLockError::InUse.to_string(),
-            "transport manager is in use by an active subscription \u{2014} \
-             cannot modify while subscriptions are active"
+            "transport is busy \u{2014} try again later"
         );
     }
 
@@ -972,5 +1076,89 @@ mod tests {
             LifecycleError::AlreadyShutDown.to_string(),
             "cannot resume a shut down instance"
         );
+        assert_eq!(
+            LifecycleError::Suspended.to_string(),
+            "bridge is suspended \u{2014} call resume() before performing operations"
+        );
+    }
+
+    #[test]
+    fn check_ready_passes_when_active() {
+        let instance = BridgeInstance::new(test_context_manager(), "did:dht:ztest".to_owned());
+        assert!(instance.check_ready().is_ok());
+    }
+
+    #[test]
+    fn check_ready_fails_when_shutdown() {
+        let instance = BridgeInstance::new(test_context_manager(), "did:dht:ztest".to_owned());
+        instance.shutdown().unwrap();
+        let err = instance.check_ready().unwrap_err();
+        assert_eq!(err, LifecycleError::AlreadyShutDown);
+    }
+
+    #[test]
+    fn check_ready_fails_when_suspended() {
+        let instance = BridgeInstance::new(test_context_manager(), "did:dht:ztest".to_owned());
+        instance.suspend().unwrap();
+        let err = instance.check_ready().unwrap_err();
+        assert_eq!(err, LifecycleError::Suspended);
+    }
+
+    #[test]
+    fn check_ready_passes_after_resume() {
+        let instance = BridgeInstance::new(test_context_manager(), "did:dht:ztest".to_owned());
+        instance.suspend().unwrap();
+        assert!(instance.check_ready().is_err());
+        instance.resume().unwrap();
+        assert!(instance.check_ready().is_ok());
+    }
+
+    #[test]
+    fn known_contexts_cap_evicts_oldest() {
+        let instance = BridgeInstance::new(test_context_manager(), "did:dht:ztest".to_owned());
+
+        // Register MAX_KNOWN_CONTEXTS entries.
+        for i in 0..MAX_KNOWN_CONTEXTS {
+            instance.register_known_context(
+                &format!("ctx-{i}"),
+                KnownContext {
+                    routing_id: [0u8; 32],
+                    relay_url: None,
+                    member_did: "did:dht:ztest".to_owned(),
+                    last_seen: i as u64,
+                },
+            );
+        }
+        assert_eq!(instance.known_contexts().len(), MAX_KNOWN_CONTEXTS);
+
+        // Register one more — should evict ctx-0 (smallest last_seen = 0).
+        instance.register_known_context(
+            "ctx-new",
+            KnownContext {
+                routing_id: [0u8; 32],
+                relay_url: None,
+                member_did: "did:dht:ztest".to_owned(),
+                last_seen: MAX_KNOWN_CONTEXTS as u64,
+            },
+        );
+        assert_eq!(instance.known_contexts().len(), MAX_KNOWN_CONTEXTS);
+        assert!(instance.known_contexts().get("ctx-new").is_some());
+        assert!(instance.known_contexts().get("ctx-0").is_none());
+    }
+
+    #[test]
+    fn rate_limiter_cap_uses_ephemeral() {
+        let instance = BridgeInstance::new(test_context_manager(), "did:dht:ztest".to_owned());
+
+        // Fill up to capacity.
+        for i in 0..MAX_RATE_LIMITERS {
+            instance.with_rate_limit_tracker(&format!("did:dht:z{i}"), |_| {});
+        }
+        assert_eq!(instance.rate_limiters().len(), MAX_RATE_LIMITERS);
+
+        // Next new DID uses ephemeral — registry stays at capacity.
+        let result = instance.with_rate_limit_tracker("did:dht:znew", |_| 42);
+        assert_eq!(result, 42);
+        assert_eq!(instance.rate_limiters().len(), MAX_RATE_LIMITERS);
     }
 }

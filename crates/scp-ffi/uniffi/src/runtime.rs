@@ -171,14 +171,22 @@ pub fn bridge_instance() -> Result<&'static Arc<BridgeInstance>, crate::ScpError
                 .to_owned(),
             code: codes::CTX_2000.to_owned(),
         })?;
-    if bi.is_shutdown() {
-        return Err(crate::ScpError::Context {
-            msg: "bridge has been shut down — OnceLock prevents re-initialization \
-                  within the same process; use suspend/resume for mobile lifecycle"
-                .to_owned(),
+    bi.check_ready().map_err(|e| {
+        let msg = match e {
+            scp_ffi_common::bridge_instance::LifecycleError::AlreadyShutDown => {
+                "bridge has been shut down — OnceLock prevents re-initialization \
+                 within the same process; use suspend/resume for mobile lifecycle"
+                    .to_owned()
+            }
+            scp_ffi_common::bridge_instance::LifecycleError::Suspended => {
+                "bridge is suspended — call resume() before performing operations".to_owned()
+            }
+        };
+        crate::ScpError::Context {
+            msg,
             code: codes::CTX_2000.to_owned(),
-        });
-    }
+        }
+    })?;
     Ok(bi)
 }
 
@@ -823,9 +831,11 @@ mod tests {
 
     #[test]
     fn bridge_instance_populated_by_init_context_manager() -> Result<(), crate::ScpError> {
-        // init_context_manager populates both CONTEXT_MANAGER and
-        // BRIDGE_INSTANCE. Idempotent — first call in the process wins.
-        init_context_manager();
+        // DID-aware init populates both CONTEXT_MANAGER and BRIDGE_INSTANCE.
+        // The no-arg init_context_manager() intentionally does NOT populate
+        // BRIDGE_INSTANCE (commit 8019f054). Idempotent — first call in the
+        // process wins.
+        init_context_manager_with_did("did:dht:ztest");
 
         let cm = context_manager()?;
         let bi = bridge_instance()?;
@@ -840,11 +850,10 @@ mod tests {
 
     #[test]
     fn bridge_instance_has_local_did() -> Result<(), crate::ScpError> {
-        init_context_manager();
+        init_context_manager_with_did("did:dht:ztest");
 
         let bi = bridge_instance()?;
-        // local_did should be non-empty (either "did:none:not-configured" from
-        // the no-arg init or a real DID if a DID-aware init ran first).
+        // local_did should be non-empty (a real DID from the DID-aware init).
         assert!(
             !bi.local_did().is_empty(),
             "bridge_instance local_did should not be empty"
@@ -854,7 +863,7 @@ mod tests {
 
     #[test]
     fn bridge_instance_not_shutdown_initially() -> Result<(), crate::ScpError> {
-        init_context_manager();
+        init_context_manager_with_did("did:dht:ztest");
 
         let bi = bridge_instance()?;
         assert!(
