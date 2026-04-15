@@ -97,7 +97,7 @@ handle_register(handle, target, metadata?) → confirmation
     }
   }
   output: {
-    status:    "registered" | "conflict",  // unambiguous outcome
+    status:    "registered" | "conflict" | "ownership_mismatch" | "capacity_exceeded",
     entry_id:  string?                     // present when status = "registered"
   }
 
@@ -144,6 +144,8 @@ handle_deregister(handle, did) → removal
 The `did` parameter in `handle_deregister` is explicit rather than inferred from the request signature — this ensures the tool schema is self-documenting and the DID-to-handle ownership check is visible in the interface. Writers verify the DID-signed request signature matches the provided DID and that the DID owns the handle.
 
 **Uniqueness.** A context with discovery tools enforces handle uniqueness within its own namespace. `handle_register` returns `{ status: "conflict" }` when another DID already holds the requested handle. The handle uniqueness constraint applies per local-part: there can be at most one `alice` in a given context, regardless of target type. Governance determines conflict resolution policy (first-come-first-served, admin-arbitrated, etc.).
+
+**Capacity limits.** `HandleRegistry` implementations SHOULD enforce a `max_entries` limit (recommended default: 10,000) to prevent resource exhaustion. Registrations that would exceed the limit return `{ status: "capacity_exceeded" }`. This matches the `ScopeRegistry` capacity model (§22.3.5).
 
 **Ownership and verification.** The registrant's DID (authenticated via the DID-signed request) is the handle owner. Only the owner can update or deregister. All handle tool requests MUST carry a DID signature over the request payload. Writers MUST verify the signature before processing. The event log entry for a registration includes the full signed request as payload, making verification replayable by any party with access to the event log. The ownership chain is: DID-signed request → writer verifies signature cryptographically → event log records the registration with the signed payload and owner DID.
 
@@ -843,6 +845,7 @@ These types are the tool call schemas for the standard context tools defined in 
 | `Registered` | `"registered"` | Handle registered successfully. |
 | `Conflict` | `"conflict"` | Another DID already holds this handle. |
 | `OwnershipMismatch` | `"ownership_mismatch"` | Requester DID does not match handle owner. |
+| `CapacityExceeded` | `"capacity_exceeded"` | Registry is at capacity (default limit: 10,000). |
 
 **`HandleMetadata`** — Optional descriptive metadata for handles.
 
