@@ -668,8 +668,38 @@ pub const VALID_7403: &str = "SCP-VALID-7403";
 // Attestation (SCP-ATTEST- 9000--9999)
 // -------------------------------------------------------------------------
 
-/// Attestation operation error.
+/// Device attestation provider call failed (Play Integrity API error).
+pub const ATTEST_9001: &str = "SCP-ATTEST-9001";
+
+/// Attestation signature verification requires raw JSON, which is absent.
+pub const ATTEST_9006: &str = "SCP-ATTEST-9006";
+
+/// Identity link attestation create bridge function not yet exported.
 pub const ATTEST_9010: &str = "SCP-ATTEST-9010";
+
+/// Identity link attestation list bridge function not yet exported.
+pub const ATTEST_9011: &str = "SCP-ATTEST-9011";
+
+/// Identity link attestation remove bridge function not yet exported.
+pub const ATTEST_9012: &str = "SCP-ATTEST-9012";
+
+/// Identity link attestation renew bridge function not yet exported.
+pub const ATTEST_9013: &str = "SCP-ATTEST-9013";
+
+/// Identity link attestation verify bridge function not yet exported.
+pub const ATTEST_9014: &str = "SCP-ATTEST-9014";
+
+/// Attestation JSON bytes are not valid UTF-8.
+pub const ATTEST_9015: &str = "SCP-ATTEST-9015";
+
+/// Attestation list JSON bytes are not valid UTF-8.
+pub const ATTEST_9016: &str = "SCP-ATTEST-9016";
+
+/// Failed to re-serialize attestation to UTF-8 JSON.
+pub const ATTEST_9017: &str = "SCP-ATTEST-9017";
+
+/// Cryptographic-class verification method not verifiable via browser fetch.
+pub const ATTEST_9018: &str = "SCP-ATTEST-9018";
 
 // -------------------------------------------------------------------------
 // Economy (SCP-ECON- 12000--12999)

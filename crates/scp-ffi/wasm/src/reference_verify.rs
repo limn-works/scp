@@ -450,7 +450,7 @@ pub fn verify_reference_attestation(attestation_json: String) -> Promise {
                              via fetch — use WebCrypto in the TypeScript wrapper layer",
                         input.method
                     ),
-                    code: codes::ATTEST_9010.to_owned(),
+                    code: codes::ATTEST_9018.to_owned(),
                 }
                 .into_js()
                 .into());
