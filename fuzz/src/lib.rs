@@ -200,3 +200,43 @@ pub struct ArbCanonicalHashInput {
     pub a: ArbInnerEnvelopeFields,
     pub b: ArbInnerEnvelopeFields,
 }
+
+// ---------------------------------------------------------------------------
+// Compile-time discriminant alignment check
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use scp_protocol::envelope::MessageType;
+
+    /// Asserts that `ArbMessageType::discriminant()` values match
+    /// `MessageType::as_discriminator_byte()` exactly (0/1/2/3).
+    ///
+    /// If `MessageType` gains a new variant or reorders its discriminants, the
+    /// `From<ArbMessageType> for MessageType` impl and this test will both need
+    /// updating, making the mismatch impossible to miss.
+    #[test]
+    fn arb_message_type_discriminants_match_production() {
+        assert_eq!(
+            ArbMessageType::Content.discriminant(),
+            MessageType::Content.as_discriminator_byte(),
+            "Content discriminant mismatch"
+        );
+        assert_eq!(
+            ArbMessageType::Signaling.discriminant(),
+            MessageType::Signaling.as_discriminator_byte(),
+            "Signaling discriminant mismatch"
+        );
+        assert_eq!(
+            ArbMessageType::KeyDistribution.discriminant(),
+            MessageType::KeyDistribution.as_discriminator_byte(),
+            "KeyDistribution discriminant mismatch"
+        );
+        assert_eq!(
+            ArbMessageType::Recovery.discriminant(),
+            MessageType::Recovery.as_discriminator_byte(),
+            "Recovery discriminant mismatch"
+        );
+    }
+}

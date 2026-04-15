@@ -120,6 +120,12 @@ test = false
 doc = false
 
 [[bin]]
+name = "fuzz_merkle_proof_random"
+path = "fuzz_targets/fuzz_merkle_proof_random.rs"
+test = false
+doc = false
+
+[[bin]]
 name = "fuzz_canonical_hash_differential"
 path = "fuzz_targets/fuzz_canonical_hash_differential.rs"
 test = false

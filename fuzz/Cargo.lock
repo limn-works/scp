@@ -2441,7 +2441,6 @@ dependencies = [
  "scp-runtime",
  "scp-transport",
  "serde_json",
- "sha2",
 ]
 
 [[package]]

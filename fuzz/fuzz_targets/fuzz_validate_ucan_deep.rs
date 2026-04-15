@@ -8,10 +8,16 @@
 //! `validate_ucan` with a fuzz-controlled validation context.
 //!
 //! Security invariants verified:
-//! - I3: Expired tokens (exp + skew_tolerance <= now) are always rejected.
-//! - I7: Capabilities outside the ceiling are always rejected.
-//! - I8: Delegation chain verification always terminates (depth ≤ 32).
+//! - I1: `validate_ucan` never panics on any input.
+//! - I3: Expired tokens (`exp + skew_tolerance <= now`) are always rejected.
 //! - Revocation: revoked tokens (CID in revocation set) are always rejected.
+//!
+//! Not exercised here:
+//! - I7 (ceiling): `FUZZ_CAPABILITY` is always within the ceiling, so ceiling
+//!   rejection is never triggered. A dedicated target would fuzz the capability
+//!   string against a fixed ceiling to exercise I7.
+//! - I8 (chain depth): `prf = vec![]` (no delegation chain), so the depth
+//!   limit is never approached. A dedicated target would build multi-hop chains.
 
 use std::collections::HashSet;
 
@@ -213,6 +219,17 @@ fuzz_target!(|input: FuzzValidationInput| {
         assert!(
             result.is_err(),
             "security invariant (revocation) violated: revoked token accepted by validate_ucan"
+        );
+    }
+
+    // Positive case: a correctly signed, non-expired, non-revoked token MUST
+    // be accepted. This catches regressions where the validation pipeline
+    // starts incorrectly rejecting valid tokens.
+    if !input.expired && !input.revoked {
+        assert!(
+            result.is_ok(),
+            "regression: valid non-expired non-revoked token was rejected by \
+             validate_ucan: {result:?}"
         );
     }
 });
