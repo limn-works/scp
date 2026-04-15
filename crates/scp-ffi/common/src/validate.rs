@@ -408,15 +408,10 @@ pub fn validate_capability_uri(uri: &str) -> Result<(), ValidationError> {
 /// or contains control characters.
 pub fn validate_ucan_token(token: &str) -> Result<(), ValidationError> {
     validate_non_empty(token, "UCAN token", MAX_UCAN_TOKEN_LEN)?;
-
     // JWT tokens should not contain newlines or other control chars
-    // (base64url alphabet is [A-Za-z0-9_.-]).
-    if token.chars().any(char::is_control) {
-        return Err(ValidationError::new(
-            "UCAN token contains control characters",
-        ));
-    }
-
+    // (base64url alphabet is [A-Za-z0-9_.-]).  Use the shared helper for
+    // consistent error message format (includes position info).
+    reject_control_chars(token, "UCAN token")?;
     Ok(())
 }
 
@@ -550,11 +545,22 @@ pub fn validate_context_description(description: &str) -> Result<(), ValidationE
 
 /// Validates a governance action reason or purpose string. Max 4096 bytes.
 ///
+/// Rejects empty strings, whitespace-only strings (audit-evasion defense),
+/// control characters, HTML-special characters, and strings exceeding the
+/// length limit.
+///
 /// # Errors
 ///
-/// Returns [`ValidationError`] per [`validate_user_string`] rules.
+/// Returns [`ValidationError`] per [`validate_user_string`] rules, plus
+/// an additional check that the string is not whitespace-only.
 pub fn validate_governance_reason(reason: &str) -> Result<(), ValidationError> {
-    validate_user_string(reason, "governance reason", MAX_GOVERNANCE_REASON_LEN)
+    validate_user_string(reason, "governance reason", MAX_GOVERNANCE_REASON_LEN)?;
+    if reason.trim().is_empty() {
+        return Err(ValidationError::new(
+            "governance reason must not be empty or whitespace-only".to_string(),
+        ));
+    }
+    Ok(())
 }
 
 /// Validates a payment adapter reference (§19.1). Max 256 bytes.
@@ -607,7 +613,7 @@ pub fn validate_governance_action_strings(
         | GovernanceAction::RotateContentKeys {
             reason: Some(r), ..
         } => {
-            if !r.trim().is_empty() {
+            if !r.is_empty() {
                 validate_governance_reason(r)?;
             }
         }
@@ -999,7 +1005,7 @@ mod tests {
     #[test]
     fn ucan_token_with_newlines_rejected() {
         let err = validate_ucan_token("token\ninjection").unwrap_err();
-        assert!(err.message.contains("control characters"));
+        assert!(err.message.contains("control character"));
     }
 
     #[test]
@@ -1268,6 +1274,12 @@ mod tests {
         assert!(err.message.contains("must not be empty"));
     }
 
+    #[test]
+    fn governance_reason_whitespace_only_rejected() {
+        let err = validate_governance_reason("   ").unwrap_err();
+        assert!(err.message.contains("whitespace"));
+    }
+
     // -- Payment adapter ref --
 
     #[test]
@@ -1423,14 +1435,25 @@ mod tests {
     }
 
     #[test]
-    fn remove_member_whitespace_only_reason_accepted() {
+    fn remove_member_whitespace_only_reason_rejected() {
         use scp_protocol::context::governance::GovernanceAction;
 
         let action = GovernanceAction::RemoveMember {
             did: scp_primitives::DID("did:dht:z6MkTest".to_owned()),
             reason: Some("   ".to_owned()),
         };
-        assert!(validate_governance_action_strings(&action).is_ok());
+        assert!(validate_governance_action_strings(&action).is_err());
+    }
+
+    #[test]
+    fn remove_member_tab_only_reason_rejected() {
+        use scp_protocol::context::governance::GovernanceAction;
+
+        let action = GovernanceAction::RemoveMember {
+            did: scp_primitives::DID("did:dht:z6MkTest".to_owned()),
+            reason: Some("\t".to_owned()),
+        };
+        assert!(validate_governance_action_strings(&action).is_err());
     }
 
     #[test]

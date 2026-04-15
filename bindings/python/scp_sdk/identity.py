@@ -649,29 +649,58 @@ class Identity:
 
 
 def _parse_finite_int(value: object, field_name: str) -> int:
-    """Coerce *value* to ``int``, raising :class:`ValidationError` on NaN/Infinity.
+    """Coerce *value* to a non-negative integer, raising :class:`ValidationError` on:
+
+    - ``bool`` (since ``isinstance(True, int)`` is ``True`` silently)
+    - ``str`` (cross-SDK divergence: TypeScript ``Number.isFinite`` rejects strings)
+    - non-integer ``float`` (silent truncation: ``1.5`` → ``1``)
+    - NaN/Infinity floats (not representable as int)
+    - negative integers (Unix timestamps are non-negative)
+
+    Whole-number floats (e.g. ``1700000000.0``) are accepted and coerced to
+    ``int`` because JSON parsers commonly deserialize integer fields as floats,
+    and lossless coercion is correct behavior at a deserialization boundary.
 
     Raises ``ValidationError`` with code ``SCP-VALID-7005`` ("Invalid
     field value") to match the TypeScript SDK's behavior — both bridges
     parse the same wire format and should surface the same error type
     and code so cross-language consumers can handle them uniformly.
-
-    ``bool`` is explicitly rejected because ``isinstance(True, int)`` is
-    ``True`` in Python (bool is a subclass of int), so ``int(True)`` returns
-    ``1`` silently — a boolean should never be treated as a Unix timestamp.
     """
     if isinstance(value, bool):
         raise ValidationError(
             f"{field_name} must be a finite integer, got bool",
             "SCP-VALID-7005",
         )
-    try:
-        return int(value)  # type: ignore[arg-type]
-    except (TypeError, ValueError, OverflowError) as e:
+    if isinstance(value, str):
         raise ValidationError(
-            f"{field_name} must be a finite integer: {e}",
+            f"{field_name} must be a number, got str",
             "SCP-VALID-7005",
-        ) from e
+        )
+    if not isinstance(value, (int, float)):
+        raise ValidationError(
+            f"{field_name} must be a number, got {type(value).__name__}",
+            "SCP-VALID-7005",
+        )
+    if isinstance(value, float):
+        import math
+
+        if not math.isfinite(value):
+            raise ValidationError(
+                f"{field_name} must be a finite integer: {value} is not finite",
+                "SCP-VALID-7005",
+            )
+        if value != int(value):
+            raise ValidationError(
+                f"{field_name} must be an integer, got non-integer float {value!r}",
+                "SCP-VALID-7005",
+            )
+    result = int(value)  # type: ignore[arg-type]
+    if result < 0:
+        raise ValidationError(
+            f"{field_name} must be non-negative, got {result}",
+            "SCP-VALID-7005",
+        )
+    return result
 
 
 # ---------------------------------------------------------------------------
