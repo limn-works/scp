@@ -593,6 +593,10 @@ where
 pub fn remove_ucan_state(context_id: &str) {
     let map = ucan_registry();
     map.remove(context_id);
+    // Clean up known-context discovery entry via BridgeInstance.
+    if let Ok(bi) = bridge_instance() {
+        bi.remove_known_context(context_id);
+    }
 }
 
 /// Syncs role state from the `ContextManager` after governance operations.

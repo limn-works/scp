@@ -4831,12 +4831,11 @@ pub async fn transport_disconnect(manager: Arc<TransportManager>) -> Result<(), 
     runtime()
         .spawn(async move {
             // Clear the transport from BridgeInstance, dropping all adapters.
-            if let Ok(bi) = crate::runtime::bridge_instance() {
-                bi.clear_transport().map_err(|e| ScpError::Transport {
-                    msg: e.to_string(),
-                    code: codes::TRANS_5003.to_owned(),
-                })?;
-            }
+            let bi = crate::runtime::bridge_instance()?;
+            bi.clear_transport().map_err(|e| ScpError::Transport {
+                msg: e.to_string(),
+                code: codes::TRANS_5003.to_owned(),
+            })?;
 
             // Update the handle's status to disconnected.
             {

@@ -882,6 +882,10 @@ where
 /// Called when a context is closed. Idempotent.
 pub fn remove_context(context_id: &str) {
     ucan_registry().remove(context_id);
+    // Clean up known-context discovery entry via BridgeInstance.
+    if let Ok(bi) = bridge_instance() {
+        bi.remove_known_context(context_id);
+    }
 }
 
 /// Re-syncs the `UcanContextState.role_state` for a context from the shared
