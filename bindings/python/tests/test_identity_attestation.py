@@ -20,8 +20,8 @@ from unittest.mock import MagicMock
 
 import pytest
 
-from scp_sdk.errors import IdentityError
-from scp_sdk.identity import Identity, IdentityAttestation, RevocationStatus
+from scp_sdk.errors import IdentityError, ValidationError
+from scp_sdk.identity import Identity, IdentityAttestation, RevocationStatus, _parse_finite_int
 
 # ---------------------------------------------------------------------------
 # IdentityAttestation dataclass tests
@@ -200,3 +200,68 @@ class TestIdentityAttestationVerifyRemoved:
             verified_at=1700000000,
         )
         assert not hasattr(att, "verify")
+
+
+# ---------------------------------------------------------------------------
+# NaN / Infinity guard tests (SCP-VALID-7005)
+# ---------------------------------------------------------------------------
+
+
+class TestNanInfinityGuards:
+    """Validate that NaN, Infinity, and bool are rejected for timestamp fields."""
+
+    def test_from_dict_nan_verified_at_raises(self) -> None:
+        with pytest.raises(ValidationError, match="SCP-VALID-7005"):
+            IdentityAttestation._from_dict(
+                {
+                    "id": "abc123",
+                    "platform": "github.com",
+                    "platform_handle": "alice",
+                    "verification_method": "did:dht:z6Mk...#active",
+                    "verified_at": float("nan"),
+                }
+            )
+
+    def test_from_dict_inf_verified_at_raises(self) -> None:
+        with pytest.raises(ValidationError, match="SCP-VALID-7005"):
+            IdentityAttestation._from_dict(
+                {
+                    "id": "abc123",
+                    "platform": "github.com",
+                    "platform_handle": "alice",
+                    "verification_method": "did:dht:z6Mk...#active",
+                    "verified_at": float("inf"),
+                }
+            )
+
+    def test_constructor_nan_verified_at_raises(self) -> None:
+        with pytest.raises(ValidationError, match="SCP-VALID-7005"):
+            IdentityAttestation(
+                id="abc123",
+                platform="github.com",
+                platform_handle="alice",
+                verification_method="did:dht:z6Mk...#active",
+                verified_at=float("nan"),
+            )
+
+    def test_constructor_bool_verified_at_raises(self) -> None:
+        with pytest.raises(ValidationError, match="SCP-VALID-7005"):
+            IdentityAttestation(
+                id="abc123",
+                platform="github.com",
+                platform_handle="alice",
+                verification_method="did:dht:z6Mk...#active",
+                verified_at=True,  # type: ignore[arg-type]
+            )
+
+    def test_parse_finite_int_bool_raises(self) -> None:
+        with pytest.raises(ValidationError, match="SCP-VALID-7005"):
+            _parse_finite_int(True, "x")
+
+    def test_parse_finite_int_nan_raises(self) -> None:
+        with pytest.raises(ValidationError, match="SCP-VALID-7005"):
+            _parse_finite_int(float("nan"), "x")
+
+    def test_parse_finite_int_inf_raises(self) -> None:
+        with pytest.raises(ValidationError, match="SCP-VALID-7005"):
+            _parse_finite_int(float("inf"), "x")

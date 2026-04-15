@@ -11357,9 +11357,10 @@ pub async fn identity_migrate(identity: Arc<Identity>) -> Result<Arc<Identity>, 
                 let _ = has_agent; // suppress unused warning
 
                 // Migrate attestation and custody registries from old DID to new DID.
-                // Custody migration happens first to consume `new_did`; attestation
-                // migration uses a clone so both blocks compile with or without
-                // the `allow_in_memory_custody` feature.
+                // The attestation block runs first; when `allow_in_memory_custody` is
+                // enabled, the custody block follows and consumes `new_did`, so the
+                // attestation block must clone. When the feature is disabled, the
+                // custody block is excluded and `new_did` can be moved into attestation.
                 #[cfg(feature = "allow_in_memory_custody")]
                 let attestation_did = new_did.clone();
                 #[cfg(not(feature = "allow_in_memory_custody"))]
@@ -11417,9 +11418,10 @@ pub async fn identity_migrate(identity: Arc<Identity>) -> Result<Arc<Identity>, 
                 increment_handle_count();
 
                 // Migrate attestation and custody registries from old DID to new DID.
-                // Custody migration happens first to consume `new_did`; attestation
-                // migration uses a clone so both blocks compile with or without
-                // the `allow_in_memory_custody` feature.
+                // The attestation block runs first; when `allow_in_memory_custody` is
+                // enabled, the custody block follows and consumes `new_did`, so the
+                // attestation block must clone. When the feature is disabled, the
+                // custody block is excluded and `new_did` can be moved into attestation.
                 #[cfg(feature = "allow_in_memory_custody")]
                 let attestation_did = new_did.clone();
                 #[cfg(not(feature = "allow_in_memory_custody"))]

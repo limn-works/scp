@@ -642,8 +642,8 @@ pub fn py_petname_get_for_context(owner_did: &str, context_id: &str) -> PyResult
 ///
 /// # Returns
 ///
-/// A JSON string with `status` (`"registered"`, `"conflict"`, or
-/// `"ownership_mismatch"`) and optional `entry_id`.
+/// A JSON string with `status` (`"registered"`, `"conflict"`,
+/// `"ownership_mismatch"`, or `"capacity_exceeded"`) and optional `entry_id`.
 ///
 /// # Errors
 ///
