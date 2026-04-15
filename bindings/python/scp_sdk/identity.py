@@ -644,6 +644,27 @@ class Identity:
 
 
 # ---------------------------------------------------------------------------
+# Internal helpers
+# ---------------------------------------------------------------------------
+
+
+def _parse_finite_int(value: object, field_name: str) -> int:
+    """Coerce *value* to ``int``, raising :class:`ValueError` on NaN/Infinity.
+
+    ``int(float('nan'))`` and ``int(float('inf'))`` both raise
+    ``ValueError`` already, but ``int(float('nan'))`` raises
+    ``ValueError: cannot convert float NaN to integer`` with an unhelpful
+    message in some Python versions.  This wrapper normalises the error
+    message and catches ``OverflowError`` (raised for very large floats on
+    some platforms).
+    """
+    try:
+        return int(value)  # type: ignore[arg-type]
+    except (TypeError, ValueError, OverflowError) as e:
+        raise ValueError(f"{field_name} must be a finite integer: {e}") from e
+
+
+# ---------------------------------------------------------------------------
 # RevocationStatus
 # ---------------------------------------------------------------------------
 
@@ -722,6 +743,11 @@ class IdentityAttestation:
     #: Optional platform-assigned unique identifier.
     platform_id: str | None = None
 
+    def __post_init__(self) -> None:
+        # Coerce verified_at to int — floats can sneak in from JSON deserialization.
+        if not isinstance(self.verified_at, int):
+            self.verified_at = int(self.verified_at)
+
     def _to_bridge_dict(self) -> dict[str, Any]:
         """Convert to a dict for bridge serialization."""
         rs = self.revocation_status
@@ -757,7 +783,7 @@ class IdentityAttestation:
                 raise ValueError("Bridge returned Revoked status without revoked_at timestamp")
             rs = RevocationStatus(
                 status="revoked",
-                revoked_at=int(revoked_at_raw),
+                revoked_at=_parse_finite_int(revoked_at_raw, "revoked_at"),
                 reason=revoked_data.get("reason"),
             )
         elif isinstance(raw_rs, str) and raw_rs.lower() == "active":
@@ -772,7 +798,7 @@ class IdentityAttestation:
             platform=data["platform"],
             platform_handle=data["platform_handle"],
             verification_method=data["verification_method"],
-            verified_at=int(data["verified_at"]),
+            verified_at=_parse_finite_int(data["verified_at"], "verified_at"),
             revocation_status=rs,
             platform_id=data.get("platform_id"),
         )
