@@ -272,12 +272,12 @@ impl TransportAdapter for WebRtcAdapter {
 
                     match provider.recv_data(&label).await {
                         Ok(Some(raw_bytes)) => {
-                            let event = match rmp_serde::from_slice::<OuterEnvelope>(&raw_bytes) {
+                            let event = match OuterEnvelope::from_bytes(&raw_bytes) {
                                 Ok(envelope) => TransportEvent::Envelope(envelope),
                                 Err(e) => {
                                     warn!(error = %e, "failed to deserialize envelope from WebRTC data channel");
                                     TransportEvent::Error(TransportError::ProtocolError(format!(
-                                        "invalid MessagePack in data channel message: {e}"
+                                        "invalid envelope in data channel message: {e}"
                                     )))
                                 }
                             };
@@ -630,6 +630,45 @@ mod tests {
         assert_eq!(config.max_message_size, 262_144);
         assert_eq!(config.ice_timeout_secs, 30);
         assert_eq!(config.ice_servers.len(), 1);
+    }
+
+    /// WebRTC peers are untrusted (TURN/STUN-relayed), so the data channel
+    /// handler must reject oversized payloads before calling the MessagePack
+    /// deserializer. `OuterEnvelope::from_bytes` provides this guard via
+    /// `MAX_ENVELOPE_SIZE`. Regression test for the bypass path identified in
+    /// PR #1644.
+    #[tokio::test]
+    async fn webrtc_rejects_oversized_envelope() {
+        use scp_core::serde_util::MAX_ENVELOPE_SIZE;
+
+        let (adapter, _, provider) = make_adapter();
+        adapter.ensure_connected().await.unwrap();
+
+        let routing_id = RoutingId::new([0xDD; 32]);
+        let routing_id_hex = hex::encode(routing_id.as_bytes());
+
+        // Open the channel and subscribe before injecting data.
+        provider.open_channel(&routing_id_hex).await.unwrap();
+
+        // Inject an oversized payload (exceeds MAX_ENVELOPE_SIZE by 1).
+        let oversized = vec![0u8; MAX_ENVELOPE_SIZE + 1];
+        provider.inject_data(&routing_id_hex, oversized).await;
+
+        // Pull one item from the subscription stream.
+        let mut stream = adapter.subscribe(&routing_id, None).await.unwrap();
+        use futures::StreamExt as _;
+        let event = stream.next().await.expect("stream should yield an event");
+
+        // Must be a ProtocolError, not a panic or a successful parse.
+        match event {
+            TransportEvent::Error(TransportError::ProtocolError(msg)) => {
+                assert!(
+                    msg.contains("invalid envelope"),
+                    "expected size-guard error, got: {msg}"
+                );
+            }
+            other => panic!("expected ProtocolError for oversized payload, got {other:?}"),
+        }
     }
 
     #[test]
