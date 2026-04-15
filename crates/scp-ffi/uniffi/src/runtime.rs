@@ -157,19 +157,29 @@ fn init_bridge_instance(context_manager: Arc<ContextManager>, local_did: &str) {
 /// # Errors
 ///
 /// Returns `ScpError::Context` if the bridge has not been initialized
-/// via [`init_context_manager`] (which also creates the `BridgeInstance`).
+/// via [`init_context_manager`] (which also creates the `BridgeInstance`),
+/// or if the bridge has been permanently shut down.
 ///
 /// Called by rate-limiter delegation and other functions that access the
 /// consolidated `BridgeInstance` state (#1549).
 pub fn bridge_instance() -> Result<&'static Arc<BridgeInstance>, crate::ScpError> {
-    BRIDGE_INSTANCE
+    let bi = BRIDGE_INSTANCE
         .get()
         .ok_or_else(|| crate::ScpError::Context {
             msg: "bridge not initialized — call context_create, \
                   context_join, context_import, or init_context_manager first"
                 .to_owned(),
             code: codes::CTX_2000.to_owned(),
-        })
+        })?;
+    if bi.is_shutdown() {
+        return Err(crate::ScpError::Context {
+            msg: "bridge has been shut down — OnceLock prevents re-initialization \
+                  within the same process; use suspend/resume for mobile lifecycle"
+                .to_owned(),
+            code: codes::CTX_2000.to_owned(),
+        });
+    }
+    Ok(bi)
 }
 
 /// Builds a default `ContextManager` with bridge-local providers.
