@@ -9,11 +9,23 @@ cargo-fuzz = true
 
 [workspace]
 
+[lib]
+name = "scp_fuzz"
+path = "src/lib.rs"
+
 [dependencies]
-libfuzzer-sys = "0.4"
-scp-protocol = { path = "../crates/scp-protocol" }
+libfuzzer-sys = { version = "0.4", features = ["arbitrary-derive"] }
+arbitrary = { version = "1", features = ["derive"] }
+rmp-serde = "1"
+serde_json = "1"
+base64 = "0.22"
+sha2 = "0.10"
+ed25519-dalek = { version = "2", features = ["rand_core"] }
+scp-protocol = { path = "../crates/scp-protocol", features = ["testing"] }
 scp-transport = { path = "../crates/scp-transport" }
 scp-runtime = { path = "../crates/scp-runtime", features = ["testing"] }
+scp-event-log = { path = "../crates/scp-event-log" }
+scp-primitives = { path = "../crates/scp-primitives" }
 
 # Tier 1 — Wire Format Parsers
 [[bin]]
@@ -49,5 +61,80 @@ doc = false
 [[bin]]
 name = "fuzz_scp_credential"
 path = "fuzz_targets/fuzz_scp_credential.rs"
+test = false
+doc = false
+
+# Tier 2 — Parsers & Content Trust Boundaries
+[[bin]]
+name = "fuzz_parse_ucan"
+path = "fuzz_targets/fuzz_parse_ucan.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "fuzz_scp_uri"
+path = "fuzz_targets/fuzz_scp_uri.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "fuzz_capability_uri"
+path = "fuzz_targets/fuzz_capability_uri.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "fuzz_broadcast_content"
+path = "fuzz_targets/fuzz_broadcast_content.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "fuzz_deserialize_export"
+path = "fuzz_targets/fuzz_deserialize_export.rs"
+test = false
+doc = false
+
+# Tier 3 — Invariant & Differential Targets
+[[bin]]
+name = "fuzz_outer_envelope_roundtrip"
+path = "fuzz_targets/fuzz_outer_envelope_roundtrip.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "fuzz_sender_header_roundtrip"
+path = "fuzz_targets/fuzz_sender_header_roundtrip.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "fuzz_chunk_envelope"
+path = "fuzz_targets/fuzz_chunk_envelope.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "fuzz_merkle_proof"
+path = "fuzz_targets/fuzz_merkle_proof.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "fuzz_canonical_hash_differential"
+path = "fuzz_targets/fuzz_canonical_hash_differential.rs"
+test = false
+doc = false
+
+# Tier 4 — Validation Depth & State
+[[bin]]
+name = "fuzz_validate_ucan_deep"
+path = "fuzz_targets/fuzz_validate_ucan_deep.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "fuzz_aad_differential"
+path = "fuzz_targets/fuzz_aad_differential.rs"
 test = false
 doc = false
