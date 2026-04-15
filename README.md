@@ -202,6 +202,15 @@ scp-node --health
 | `SCP_NODE_BIND_ADDR` | `0.0.0.0:9000` | HTTP listen address |
 | `SCP_NODE_PROJECTION_RATE_LIMIT` | `60` | Per-IP rate limit (req/s) for broadcast projection endpoints |
 
+## Fuzzing
+
+SCP uses [cargo-fuzz](https://github.com/rust-fuzz/cargo-fuzz) (libFuzzer) to find parser panics,
+serde edge cases, and deserialization vulnerabilities at every protocol trust boundary. Fuzzing runs
+nightly in CI and accumulates a persistent corpus over time.
+
+See [`fuzz/README.md`](fuzz/README.md) for the full target inventory, quick-start guide, crash
+workflow, and corpus management instructions.
+
 ## License
 
 SCP uses a split license designed for maximum adoption with infrastructure protection:
