@@ -1,0 +1,70 @@
+# Dictionary for RelayMessage MessagePack deserialization.
+# Covers all op variants and their fields.
+
+# The op discriminator field
+"op"
+
+# RelayMessage op variant strings
+"OK"
+"ERR"
+"BLOB"
+"EVENT"
+"PONG"
+"BRIDGE_DATA"
+
+# Common fields across op variants
+"blob_id"
+"blob"
+"routing_id"
+"recipient_hint"
+"message"
+"code"
+"ref_id"
+
+# MessagePack fixmap headers
+"\x81"
+"\x82"
+"\x83"
+"\x84"
+"\x85"
+"\x86"
+"\x87"
+
+# MessagePack fixarray headers
+"\x91"
+"\x92"
+"\x93"
+"\x94"
+
+# Integer encodings
+"\x00"
+"\x01"
+"\xcd"
+"\xce"
+"\xcf"
+
+# Binary field headers
+"\xc4"
+"\xc5"
+"\xc6"
+
+# String field headers
+"\xd9"
+"\xda"
+
+# nil, true, false
+"\xc0"
+"\xc2"
+"\xc3"
+
+# Common routing_id (32 bytes bin8)
+"\xc4\x20"
+
+# Common blob_id (32 bytes bin8)
+"\xc4\x20"
+
+# Error codes (u16 range)
+"\xcd\x00\x01"
+"\xcd\x00\x02"
+"\xcd\x00\x03"
+"\xcd\x00\x04"

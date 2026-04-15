@@ -1,0 +1,53 @@
+[package]
+name = "scp-fuzz"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+[workspace]
+
+[dependencies]
+libfuzzer-sys = "0.4"
+scp-protocol = { path = "../crates/scp-protocol" }
+scp-transport = { path = "../crates/scp-transport" }
+scp-runtime = { path = "../crates/scp-runtime", features = ["testing"] }
+
+# Tier 1 — Wire Format Parsers
+[[bin]]
+name = "fuzz_outer_envelope"
+path = "fuzz_targets/fuzz_outer_envelope.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "fuzz_inner_envelope"
+path = "fuzz_targets/fuzz_inner_envelope.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "fuzz_client_message"
+path = "fuzz_targets/fuzz_client_message.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "fuzz_relay_message"
+path = "fuzz_targets/fuzz_relay_message.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "fuzz_sender_key_dist"
+path = "fuzz_targets/fuzz_sender_key_dist.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "fuzz_scp_credential"
+path = "fuzz_targets/fuzz_scp_credential.rs"
+test = false
+doc = false
