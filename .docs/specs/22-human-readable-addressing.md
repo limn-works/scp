@@ -328,7 +328,7 @@ scope_deregister(params: ScopeDeregisterParams) → ScopeDeregisterResult
 
 **Event types.** Scope operations produce scope-specific event types in the context event log: `ScopeRegistered { name, context_id, relay_urls, owner_did, entry_id, metadata, timestamp }`, `ScopeUpdated { name, context_id, relay_urls, owner_did, entry_id, metadata, timestamp }`, and `ScopeDeregistered { name, owner_did, entry_id, timestamp }`. Admin removal via governance produces standard governance events (§5.9), not scope event variants. See §22.11.2a for the wire format tables.
 
-**Relay URL validation.** `ScopeTarget.relay_urls` MUST contain at least one valid relay URL. `ScopeTarget.relay_urls` MUST use one of the following schemes: `wss://`, `ws://`, `https://`, or `http://`. Implementations MUST validate relay URLs at registration time: scheme must be one of `wss://`, `ws://`, `https://`, or `http://`, no control characters, maximum URL length 2048.
+**Relay URL validation.** `ScopeTarget.relay_urls` MUST contain at least one valid relay URL. `ScopeTarget.relay_urls` MUST use one of the following schemes: `wss://` or `https://` for production; `ws://` or `http://` are additionally permitted for development and loopback relays. Implementations MUST validate relay URLs at registration time: scheme must be one of `wss://`, `ws://`, `https://`, or `http://`, no control characters, maximum URL length 2048.
 
 **Capacity limits.** `ScopeRegistry` implementations SHOULD enforce a configurable `max_entries` limit (recommended default: 10,000) to prevent resource exhaustion. Registrations that would exceed the limit are rejected with a capacity error. The limit is configurable per hosting context via governance parameters.
 
@@ -980,7 +980,7 @@ Scope tools use independent structs for all types (see §22.3.5, ADR-043). All s
 | Field | Type | Required | Semantics |
 |-------|------|----------|-----------|
 | `context_id` | `String` | Yes | Hex-encoded context ID. |
-| `relay_urls` | `Vec<String>` | Yes | Relay URLs serving this context. MUST be non-empty. Each URL MUST use `wss://`, `ws://`, `https://`, or `http://` scheme, no control characters, max 2048 characters. |
+| `relay_urls` | `Vec<String>` | Yes | Relay URLs serving this context. MUST be non-empty. Each URL MUST use `wss://` or `https://` scheme in production (`ws://` and `http://` permitted for development), no control characters, max 2048 characters. |
 
 **`ScopeRegistrationEvent`** — Tagged enum for scope registration lifecycle events (event log entries).
 
