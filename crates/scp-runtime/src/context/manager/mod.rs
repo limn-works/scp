@@ -2004,6 +2004,67 @@ impl ContextManager {
         ContextManagerBuilder::new()
     }
 
+    /// Removes all registered contexts from the manager.
+    ///
+    /// This is a best-effort teardown: it clears the `DashMap` and cancels
+    /// all background tasks (TTL timers, governance timeouts) associated
+    /// with each context. MLS groups are destroyed via the crypto provider.
+    ///
+    /// Used by [`scp_ffi_common::BridgeInstance::shutdown`] to clean up
+    /// context state during bridge lifecycle teardown.
+    ///
+    /// Does NOT send leave messages to relays or notify remote peers —
+    /// this is a local cleanup operation for process exit / test teardown.
+    pub fn shutdown_all_contexts(&self) {
+        // Collect IDs first to avoid holding DashMap shard locks while
+        // performing cleanup (which may acquire per-context mutexes).
+        let context_ids: Vec<String> = self
+            .contexts
+            .iter()
+            .map(|entry| entry.key().clone())
+            .collect();
+
+        for context_id in &context_ids {
+            // Best-effort MLS group destruction.
+            let ctx_id_bytes = context_id_to_bytes(context_id);
+            if let Err(e) = self.crypto.destroy_mls_group(&ctx_id_bytes) {
+                tracing::debug!(
+                    context_id = %context_id,
+                    error = %e,
+                    "failed to destroy MLS group during shutdown — may already be gone"
+                );
+            }
+            if let Err(e) = self.crypto.destroy_sender_key(&ctx_id_bytes) {
+                tracing::debug!(
+                    context_id = %context_id,
+                    error = %e,
+                    "failed to destroy sender key during shutdown — may already be gone"
+                );
+            }
+            if let Err(e) = self.event_log.destroy_event_log(&ctx_id_bytes) {
+                tracing::debug!(
+                    context_id = %context_id,
+                    error = %e,
+                    "failed to destroy event log during shutdown — may already be gone"
+                );
+            }
+
+            // Remove from the DashMap (drops the Arc, which may drop the
+            // PerContextState if no other references exist).
+            self.contexts.remove(context_id);
+        }
+
+        // Clear standing contexts tracking.
+        if let Ok(mut standing) = self.standing_contexts.try_lock() {
+            standing.clear();
+        }
+
+        tracing::info!(
+            removed_count = context_ids.len(),
+            "shutdown: removed all contexts from ContextManager"
+        );
+    }
+
     // -----------------------------------------------------------------
     // Per-context lock helpers (DashMap → Arc<Mutex<PerContextState>>)
     // -----------------------------------------------------------------
