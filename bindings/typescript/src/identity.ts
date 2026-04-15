@@ -515,10 +515,14 @@ export class RevocationStatus {
 
   /** Creates a revoked revocation status. */
   static revoked(revokedAt: number, reason?: string): RevocationStatus {
+    if (!Number.isFinite(revokedAt)) {
+      throw new ValidationError("revoked_at must be a finite number", "SCP-VALID-7005");
+    }
+    const truncated = Math.trunc(revokedAt);
     const data: RevocationStatusData =
       reason !== undefined
-        ? { status: "revoked", revokedAt, reason }
-        : { status: "revoked", revokedAt };
+        ? { status: "revoked", revokedAt: truncated, reason }
+        : { status: "revoked", revokedAt: truncated };
     return new RevocationStatus(data);
   }
 
@@ -614,11 +618,14 @@ export class IdentityAttestation implements IdentityAttestationData {
   private readonly _rawJson?: string | undefined;
 
   constructor(data: IdentityAttestationData, rawJson?: string) {
+    if (!Number.isFinite(data.verifiedAt)) {
+      throw new ValidationError("verified_at must be a finite number", "SCP-VALID-7005");
+    }
     this.id = data.id;
     this.platform = data.platform;
     this.platformHandle = data.platformHandle;
     this.verificationMethod = data.verificationMethod;
-    this.verifiedAt = data.verifiedAt;
+    this.verifiedAt = Math.trunc(data.verifiedAt);
     this.revocationStatus = data.revocationStatus;
     this.platformId = data.platformId;
     this._rawJson = rawJson;
