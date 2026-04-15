@@ -47,42 +47,31 @@ use scp_platform::encrypting_adapter::EncryptingAdapter;
 use scp_platform::error::PlatformError;
 use zeroize::Zeroizing;
 
-/// Global shared `ContextManager` instance.
-static CONTEXT_MANAGER: OnceLock<Arc<ContextManager>> = OnceLock::new();
-
-/// Global production DID resolver that delegates to `scp_identity::resolver::DidResolver`
-/// for full DID document validation (BEP44 signature verification, self-certification,
-/// sequence number comparison, caching).
+/// Returns the production DID resolver, if initialized.
 ///
-/// Initialized by [`init_did_resolver`] when the identity layer is first set up.
-/// Used by UCAN validation when available; falls back to
-/// [`scp_ffi_common::BridgeDidResolver`] (string-only) via `DispatchDidResolver`
-/// when `None`.
-///
-/// See #311 for the unification design.
-static DID_RESOLVER: OnceLock<Arc<scp_ffi_common::IdentityBackedDidResolver>> = OnceLock::new();
-
-/// Returns the global production DID resolver, if initialized.
+/// Delegates to [`BridgeInstance::did_resolver`].
 #[must_use]
 pub fn did_resolver() -> Option<&'static Arc<scp_ffi_common::IdentityBackedDidResolver>> {
-    DID_RESOLVER.get()
+    BRIDGE_INSTANCE.get().and_then(|bi| bi.did_resolver())
 }
 
-/// Initializes the global production DID resolver.
+/// Initializes the production DID resolver.
 ///
-/// Wraps any `scp_identity::resolver::DidResolver` implementation in an
-/// [`IdentityBackedDidResolver`] and stores it as the process-global resolver
-/// for UCAN validation.
-///
-/// Called once during identity system setup. Subsequent calls are no-ops
-/// (the resolver is initialized via `OnceLock`).
+/// Stores the resolver in the `BridgeInstance`. If `BridgeInstance` is not
+/// initialized yet, logs an error.
 pub fn init_did_resolver<R>(resolver: Arc<R>, handle: tokio::runtime::Handle)
 where
     R: scp_identity::resolver::DidResolver + 'static,
 {
-    let _ = DID_RESOLVER.set(Arc::new(scp_ffi_common::IdentityBackedDidResolver::new(
-        resolver, handle,
-    )));
+    if let Some(bi) = BRIDGE_INSTANCE.get() {
+        bi.set_did_resolver(Arc::new(scp_ffi_common::IdentityBackedDidResolver::new(
+            resolver, handle,
+        )));
+    } else {
+        tracing::error!(
+            "init_did_resolver called before BridgeInstance initialized — resolver not stored"
+        );
+    }
 }
 
 /// Returns a key resolver that rejects all lookups with a logged error.
@@ -114,30 +103,29 @@ fn not_configured_key_resolver() -> scp_core::context::governance::KeyResolver {
 /// `context_create`) rather than silently auto-initializing with
 /// potentially invalid state.
 pub fn context_manager() -> Result<&'static Arc<ContextManager>, crate::ScpError> {
-    // Suspended: return error (recoverable — caller should call resume()).
-    // AlreadyShutDown: warn only. Shutdown already destroyed MLS groups,
-    // cleared registries, and disconnected transport — operations will fail
-    // naturally. Returning an error breaks test suites that call shutdown
-    // before exit, since OnceLock cannot be re-initialized.
-    if let Some(bi) = BRIDGE_INSTANCE.get() {
-        if bi.is_suspended() {
-            return Err(crate::ScpError::Context {
-                msg: "bridge is suspended — call resume() before performing operations".to_owned(),
-                code: codes::CTX_2000.to_owned(),
-            });
-        }
-        if bi.is_shutdown() {
-            tracing::warn!("context_manager() called after shutdown — operations may fail");
-        }
-    }
-    CONTEXT_MANAGER
+    let bi = BRIDGE_INSTANCE
         .get()
         .ok_or_else(|| crate::ScpError::Context {
             msg: "ContextManager not initialized — call context_create, \
                   context_join, context_import, or init_context_manager first"
                 .to_owned(),
             code: codes::CTX_2000.to_owned(),
-        })
+        })?;
+    // Suspended: return error (recoverable — caller should call resume()).
+    // AlreadyShutDown: warn only. Shutdown already destroyed MLS groups,
+    // cleared registries, and disconnected transport — operations will fail
+    // naturally. Returning an error breaks test suites that call shutdown
+    // before exit, since OnceLock cannot be re-initialized.
+    if bi.is_suspended() {
+        return Err(crate::ScpError::Context {
+            msg: "bridge is suspended — call resume() before performing operations".to_owned(),
+            code: codes::CTX_2000.to_owned(),
+        });
+    }
+    if bi.is_shutdown() {
+        tracing::warn!("context_manager() called after shutdown — operations may fail");
+    }
+    Ok(bi.context_manager())
 }
 
 // ---------------------------------------------------------------------------
@@ -146,8 +134,8 @@ pub fn context_manager() -> Result<&'static Arc<ContextManager>, crate::ScpError
 
 /// Global [`BridgeInstance`] that consolidates process-global state.
 ///
-/// Holds the same `ContextManager` as [`CONTEXT_MANAGER`] plus the local DID
-/// and a shutdown flag. Populated alongside `CONTEXT_MANAGER` during
+/// Holds the `ContextManager` plus the local DID, shutdown flag, and all
+/// shared state registries. Populated during
 /// [`init_context_manager`], [`init_context_manager_with_did`], or
 /// [`init_context_manager_with_relay_transport`]. Existing callers continue
 /// using `context_manager()` and other per-registry accessors; the
@@ -163,8 +151,9 @@ static BRIDGE_INSTANCE: OnceLock<Arc<BridgeInstance>> = OnceLock::new();
 /// pointers to the same allocation.
 ///
 /// Registers UniFFI-specific shutdown hooks that clear bridge-specific
-/// singletons (`UCAN_REGISTRY`, `ECONOMY_BUDGETS`, `ECONOMY_ANTISPAM`,
-/// and `BRIDGE_STATE` in `bridge.rs`).
+/// singletons (`UCAN_REGISTRY`). Economy state, bridge connector state,
+/// and the DID resolver are now owned by `BridgeInstance` and cleared in
+/// its `shutdown()` method.
 ///
 /// Subsequent calls are no-ops (`OnceLock` guarantees single initialization).
 fn init_bridge_instance(context_manager: Arc<ContextManager>, local_did: &str) {
@@ -177,21 +166,15 @@ fn init_bridge_instance(context_manager: Arc<ContextManager>, local_did: &str) {
     let instance = Arc::new(BridgeInstance::new(context_manager, local_did.to_owned()));
     let bi = BRIDGE_INSTANCE.get_or_init(|| instance);
 
-    // Register UniFFI-specific cleanup hooks.
+    // Register UniFFI-specific cleanup hooks. Economy state, bridge connector
+    // state, and the DID resolver are now owned by BridgeInstance and cleared
+    // in its shutdown() method.
     bi.register_shutdown_hook(Box::new(|| {
         if let Some(reg) = UCAN_REGISTRY.get() {
             reg.clear();
         }
         #[cfg(feature = "allow_in_memory_custody")]
         crate::bridge::identity_custody_registry().clear();
-        if let Some(reg) = ECONOMY_BUDGETS.get() {
-            reg.clear();
-        }
-        if let Some(reg) = ECONOMY_ANTISPAM.get() {
-            reg.clear();
-        }
-        // BRIDGE_STATE in bridge.rs — per-context bridge connector state
-        crate::bridge::clear_bridge_state();
         // MCP server/client registries
         crate::bridge::clear_mcp_registries();
     }));
@@ -292,27 +275,43 @@ fn build_default_context_manager() -> Arc<ContextManager> {
 /// tracking). This is safe because standalone functions like
 /// `register_local_did` / `is_local_did` only access the DID registry, not
 /// transport or crypto, and should not require a prior `context_create` call.
+///
+/// Also lazily creates a `BridgeInstance` with a placeholder DID if one
+/// does not already exist, so that economy/bridge-state/DID-resolver
+/// accessors work even before a real DID is known. The placeholder DID
+/// is only used for logging — the `MlsCryptoProvider` gets the real DID
+/// via `init_context_manager_with_did`.
 pub fn context_manager_expect() -> &'static Arc<ContextManager> {
-    // Do NOT call init_bridge_instance here — BridgeInstance should only
-    // be created when a real DID is known (via init_context_manager_with_did
-    // or init_context_manager_with_relay_transport). Populating with a
-    // placeholder DID permanently locks the OnceLock and prevents the real
-    // DID from being stored.
-    CONTEXT_MANAGER.get_or_init(build_default_context_manager)
+    if let Some(bi) = BRIDGE_INSTANCE.get() {
+        return bi.context_manager();
+    }
+    // Lazily create both ContextManager and BridgeInstance.
+    let cm = build_default_context_manager();
+    ensure_bridge_instance(cm.clone());
+    // Return from BRIDGE_INSTANCE to avoid holding two references.
+    match BRIDGE_INSTANCE.get() {
+        Some(bi) => bi.context_manager(),
+        None => {
+            // Should not happen — ensure_bridge_instance just set it.
+            // Leak the Arc to return a &'static reference as a last resort.
+            Box::leak(Box::new(cm))
+        }
+    }
 }
 
 /// Initializes the global [`ContextManager`] with bridge-local providers.
 ///
 /// This is called during `context_create` to ensure the manager is ready
-/// before any context operations.
-///
-/// Does NOT populate the [`BridgeInstance`] — no real DID is available at
-/// this point. The DID-aware variants ([`init_context_manager_with_did`]
-/// and [`init_context_manager_with_relay_transport`]) populate both.
+/// before any context operations. Also creates a `BridgeInstance` with a
+/// placeholder DID so shared registries are available.
 ///
 /// Subsequent calls are no-ops (`OnceLock` guarantees single initialization).
 pub fn init_context_manager() {
-    let _ = CONTEXT_MANAGER.get_or_init(build_default_context_manager);
+    if BRIDGE_INSTANCE.get().is_some() {
+        return;
+    }
+    let cm = build_default_context_manager();
+    ensure_bridge_instance(cm);
 }
 
 /// Initializes the global [`ContextManager`] with [`MlsCryptoProvider`]
@@ -329,7 +328,7 @@ pub fn init_context_manager() {
 ///
 /// Subsequent calls are no-ops (`OnceLock`).
 pub fn init_context_manager_with_did(local_did: &str) {
-    if CONTEXT_MANAGER.get().is_some() {
+    if BRIDGE_INSTANCE.get().is_some() {
         tracing::warn!(
             requested_did = %local_did,
             "init_context_manager already initialized — ignoring DID-parameterized init"
@@ -337,21 +336,15 @@ pub fn init_context_manager_with_did(local_did: &str) {
         return;
     }
     let did = local_did.to_owned();
-    let cm_arc = CONTEXT_MANAGER
-        .get_or_init(|| {
-            let crypto = Box::new(scp_core::crypto::mls::provider::MlsCryptoProvider::new(did));
-            let event_log = build_event_log_provider();
-            Arc::new(ContextManager::new(
-                crypto,
-                Box::new(scp_core::context::NotConfiguredTransportProvider),
-                event_log,
-                not_configured_key_resolver(),
-            ))
-        })
-        .clone();
+    let crypto = Box::new(scp_core::crypto::mls::provider::MlsCryptoProvider::new(did));
+    let event_log = build_event_log_provider();
+    let cm_arc = Arc::new(ContextManager::new(
+        crypto,
+        Box::new(scp_core::context::NotConfiguredTransportProvider),
+        event_log,
+        not_configured_key_resolver(),
+    ));
 
-    // Populate the BridgeInstance with the same ContextManager.
-    // No-op if already set (OnceLock guarantees single initialization).
     init_bridge_instance(cm_arc, local_did);
 }
 
@@ -381,7 +374,7 @@ pub fn init_context_manager_with_relay_transport(
     local_did: &str,
     adapter: scp_transport::native::adapter::NativeRelayAdapter,
 ) {
-    if CONTEXT_MANAGER.get().is_some() {
+    if BRIDGE_INSTANCE.get().is_some() {
         tracing::warn!(
             requested_did = %local_did,
             "init_context_manager already initialized — ignoring relay-transport init"
@@ -389,22 +382,16 @@ pub fn init_context_manager_with_relay_transport(
         return;
     }
     let did = local_did.to_owned();
-    let cm_arc = CONTEXT_MANAGER
-        .get_or_init(|| {
-            let crypto = Box::new(scp_core::crypto::mls::provider::MlsCryptoProvider::new(did));
-            let transport = Box::new(scp_transport::RelayTransportProvider::new(adapter));
-            let event_log = build_event_log_provider();
-            Arc::new(ContextManager::new(
-                crypto,
-                transport,
-                event_log,
-                not_configured_key_resolver(),
-            ))
-        })
-        .clone();
+    let crypto = Box::new(scp_core::crypto::mls::provider::MlsCryptoProvider::new(did));
+    let transport = Box::new(scp_transport::RelayTransportProvider::new(adapter));
+    let event_log = build_event_log_provider();
+    let cm_arc = Arc::new(ContextManager::new(
+        crypto,
+        transport,
+        event_log,
+        not_configured_key_resolver(),
+    ));
 
-    // Populate the BridgeInstance with the same ContextManager.
-    // No-op if already set (OnceLock guarantees single initialization).
     init_bridge_instance(cm_arc, local_did);
 }
 
@@ -839,62 +826,8 @@ pub const fn query_trust_event_counts(_context_id: &str, _did: &str) -> (u64, u6
 // Economy state registries
 // ---------------------------------------------------------------------------
 
-/// Per-context member budget trackers for economic governance.
-static ECONOMY_BUDGETS: OnceLock<DashMap<String, scp_core::economy::MemberBudgetTracker>> =
-    OnceLock::new();
-
-fn economy_budget_registry() -> &'static DashMap<String, scp_core::economy::MemberBudgetTracker> {
-    ECONOMY_BUDGETS.get_or_init(DashMap::new)
-}
-
-/// Per-context antispam velocity trackers.
-static ECONOMY_ANTISPAM: OnceLock<DashMap<String, scp_core::economy::SenderVelocityTracker>> =
-    OnceLock::new();
-
-const ANTISPAM_DEFAULT_WINDOW_SECS: u64 = 60;
-
-fn economy_antispam_registry() -> &'static DashMap<String, scp_core::economy::SenderVelocityTracker>
-{
-    ECONOMY_ANTISPAM.get_or_init(DashMap::new)
-}
-
-/// Reads the budget tracker for a context (creates if absent).
-pub fn with_economy_budget<T, F>(context_id: &str, f: F) -> T
-where
-    F: FnOnce(&scp_core::economy::MemberBudgetTracker) -> T,
-{
-    let registry = economy_budget_registry();
-    let entry = registry.entry(context_id.to_owned()).or_default();
-    f(entry.value())
-}
-
-/// Mutably accesses the budget tracker for a context (creates if absent).
-pub fn with_economy_budget_mut<T, F>(context_id: &str, f: F) -> T
-where
-    F: FnOnce(&mut scp_core::economy::MemberBudgetTracker) -> T,
-{
-    let registry = economy_budget_registry();
-    let mut entry = registry.entry(context_id.to_owned()).or_default();
-    f(entry.value_mut())
-}
-
-/// Accesses the antispam velocity tracker for a context (creates if absent).
-pub fn with_economy_antispam<T, F>(context_id: &str, f: F) -> T
-where
-    F: FnOnce(&scp_core::economy::SenderVelocityTracker) -> T,
-{
-    let registry = economy_antispam_registry();
-    let entry = registry.entry(context_id.to_owned()).or_insert_with(|| {
-        scp_core::economy::SenderVelocityTracker::new(ANTISPAM_DEFAULT_WINDOW_SECS)
-    });
-    f(entry.value())
-}
-
-/// Removes per-context economy state (budget + antispam trackers) on context close.
-pub fn remove_economy_state(context_id: &str) {
-    economy_budget_registry().remove(context_id);
-    economy_antispam_registry().remove(context_id);
-}
+// Economy state is now owned by BridgeInstance. Callers access it via
+// `bridge_instance()?.with_economy_budget(...)` etc. directly.
 
 #[cfg(test)]
 mod tests {
@@ -909,7 +842,7 @@ mod tests {
 
     #[test]
     fn bridge_instance_populated_by_init_context_manager() -> Result<(), crate::ScpError> {
-        // DID-aware init populates both CONTEXT_MANAGER and BRIDGE_INSTANCE.
+        // DID-aware init populates BRIDGE_INSTANCE which owns the ContextManager.
         // The no-arg init_context_manager() intentionally does NOT populate
         // BRIDGE_INSTANCE (commit 8019f054). Idempotent — first call in the
         // process wins.

@@ -1,30 +1,31 @@
 //! Self-contained bridge instance replacing process-global `OnceLock` singletons.
 //!
-//! Each non-WASM FFI bridge currently uses 10+ `OnceLock` statics
-//! (`CONTEXT_MANAGER`, `DID_RESOLVER`, `FFI_BRIDGE_STATE`, `KNOWN_CONTEXTS`,
-//! `IDENTITY_REGISTRY`, `STORAGE_PROVIDER`, `TRANSPORT_MANAGER`,
-//! `RATE_LIMIT_TRACKERS`, `ECONOMY_BUDGETS`, `ECONOMY_ANTISPAM`) for runtime
-//! state. This forces single-tenant, process-global semantics and blocks
-//! multi-instance use cases (test isolation, multiple identities, mobile
-//! app lifecycle).
+//! `BridgeInstance` consolidates most per-bridge `OnceLock` statics into a
+//! single owned struct. Each instance holds its own `ContextManager`, local
+//! DID, shutdown flag, and shared state registries.
 //!
-//! `BridgeInstance` consolidates these into a single owned struct. Each
-//! instance holds its own `ContextManager`, local DID, shutdown flag, and
-//! shared state registries (transport, known contexts, rate limiters).
-//! Multiple instances can coexist for different identities or test scenarios.
+//! # Owned state (consolidated into `BridgeInstance`)
 //!
-//! # Migration
+//! - `ContextManager` — context lifecycle (MLS, membership, governance, broadcast)
+//! - Transport manager — relay connections
+//! - Known contexts — context discovery registry
+//! - Rate limiters — invitation auto-accept
+//! - Economy budgets + antispam — economic governance trackers
+//! - Bridge connector state — per-context shadow registries + sender key stores
+//! - DID resolver — production identity-backed resolver
 //!
-//! Phase 4 Step 1 (#1549): Shared singletons (transport, known contexts,
-//! rate limiters) are now owned by `BridgeInstance`. Bridge-specific singletons
-//! (`FFI_BRIDGE_STATE`, `IDENTITY_REGISTRY`, `DID_RESOLVER`, `STORAGE_PROVIDER`,
-//! `ECONOMY_BUDGETS`, `ECONOMY_ANTISPAM`) remain as per-bridge `OnceLock`s but
-//! are now cleaned up during `shutdown()` via registered shutdown hooks. Each
-//! bridge registers hooks that clear its bridge-specific `DashMap` singletons,
-//! releasing `Arc` references to custody providers (key material zeroized on
-//! `Drop`). `DID_RESOLVER` and `STORAGE_PROVIDER` are `OnceLock<Arc<...>>`
-//! that cannot be cleared (no `OnceLock::take`) — they are dropped with the
-//! process.
+//! # Remaining per-bridge `OnceLock`s (not consolidated)
+//!
+//! These remain as per-bridge `OnceLock`s because they use bridge-specific
+//! types that `scp-ffi-common` cannot depend on:
+//!
+//! - `IDENTITY_REGISTRY` — bridge-specific custody provider types
+//! - `FFI_BRIDGE_STATE` — PyO3-specific per-context FFI state
+//! - `UCAN_REGISTRY` — NAPI/UniFFI-specific UCAN validation state
+//! - `STORAGE_PROVIDER` — concrete storage types vary per bridge
+//! - `PROTOCOL_REPOSITORY` — concrete storage types vary per bridge
+//!
+//! These are cleaned up during `shutdown()` via registered shutdown hooks.
 //!
 //! # Thread Safety
 //!
@@ -37,12 +38,18 @@
 
 use std::sync::Arc;
 use std::sync::Mutex;
+use std::sync::OnceLock;
 use std::sync::RwLock;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use dashmap::DashMap;
 use scp_core::context::ContextManager;
 use scp_protocol::context::invitation::RateLimitTracker;
+use scp_protocol::economy::antispam::SenderVelocityTracker;
+use scp_protocol::economy::budget::MemberBudgetTracker;
+
+use crate::IdentityBackedDidResolver;
+use crate::bridge_state::BridgeContextState;
 
 /// Maximum number of known contexts that can be registered in the discovery
 /// registry. When this limit is reached, the oldest entry (by `last_seen`)
@@ -56,6 +63,10 @@ const MAX_KNOWN_CONTEXTS: usize = 10_000;
 /// later). 1,000 concurrent identity DIDs per bridge instance is generous
 /// for any single-process deployment.
 const MAX_RATE_LIMITERS: usize = 1_000;
+
+/// Default sliding window duration for antispam velocity tracking (seconds).
+/// Matches the spec section 19.7 example.
+const ANTISPAM_DEFAULT_WINDOW_SECS: u64 = 60;
 
 /// Metadata about a known context's relay presence.
 ///
@@ -159,6 +170,48 @@ pub struct BridgeInstance {
     /// access.
     rate_limiters: DashMap<String, RateLimitTracker>,
 
+    // -----------------------------------------------------------------
+    // Economy state — previously per-bridge OnceLock singletons
+    // -----------------------------------------------------------------
+    /// Per-context member budget trackers for economic governance.
+    ///
+    /// Keyed by context ID. Created lazily on first access via
+    /// [`with_economy_budget`] / [`with_economy_budget_mut`]. Budget trackers
+    /// are NOT removed automatically when contexts are closed -- call
+    /// [`remove_economy_state`] for cleanup in long-running processes.
+    economy_budgets: DashMap<String, MemberBudgetTracker>,
+
+    /// Per-context antispam velocity trackers for economic governance.
+    ///
+    /// Keyed by context ID. Created lazily on first access with a default
+    /// 60-second sliding window. The window duration matches the spec
+    /// section 19.7 example.
+    economy_antispam: DashMap<String, SenderVelocityTracker>,
+
+    // -----------------------------------------------------------------
+    // Bridge connector state — previously in bridge_state.rs OnceLock
+    // -----------------------------------------------------------------
+    /// Per-context bridge connector state (shadow registries and sender key
+    /// stores).
+    ///
+    /// Keyed by context ID. See [`BridgeContextState`] for contents.
+    /// Previously in `scp_ffi_common::bridge_state::BRIDGE_STATE`.
+    bridge_state: DashMap<String, BridgeContextState>,
+
+    // -----------------------------------------------------------------
+    // DID resolver — previously per-bridge OnceLock
+    // -----------------------------------------------------------------
+    /// Production DID resolver that delegates to
+    /// `scp_identity::resolver::DidResolver` for full DID document validation
+    /// (BEP44 signature verification, self-certification, sequence number
+    /// tracking, caching).
+    ///
+    /// Initialized by [`set_did_resolver`] when the identity layer is first
+    /// set up. `None` until `identity_create` initializes it.
+    ///
+    /// See #311 for the unification design.
+    did_resolver: OnceLock<Arc<IdentityBackedDidResolver>>,
+
     /// Registered shutdown hooks for bridge-specific state cleanup.
     ///
     /// Each FFI bridge registers hooks that clear bridge-specific singletons
@@ -197,6 +250,10 @@ impl BridgeInstance {
             transport: RwLock::new(None),
             known_contexts: DashMap::new(),
             rate_limiters: DashMap::new(),
+            economy_budgets: DashMap::new(),
+            economy_antispam: DashMap::new(),
+            bridge_state: DashMap::new(),
+            did_resolver: OnceLock::new(),
             shutdown_hooks: Mutex::new(Vec::new()),
         }
     }
@@ -386,6 +443,9 @@ impl BridgeInstance {
         // Clear registries
         self.known_contexts.clear();
         self.rate_limiters.clear();
+        self.economy_budgets.clear();
+        self.economy_antispam.clear();
+        self.bridge_state.clear();
 
         // Run bridge-specific shutdown hooks (identity registries, FFI
         // bridge state, economy trackers). Drain the Vec so hooks are
@@ -687,6 +747,105 @@ impl BridgeInstance {
             .entry(identity_did.to_owned())
             .or_default();
         f(entry.value_mut())
+    }
+
+    // -----------------------------------------------------------------
+    // Economy accessors
+    // -----------------------------------------------------------------
+
+    /// Reads the budget tracker for a context, creating one if it doesn't exist.
+    ///
+    /// The closure receives an immutable reference to the tracker.
+    pub fn with_economy_budget<T, F>(&self, context_id: &str, f: F) -> T
+    where
+        F: FnOnce(&MemberBudgetTracker) -> T,
+    {
+        let entry = self
+            .economy_budgets
+            .entry(context_id.to_owned())
+            .or_default();
+        f(entry.value())
+    }
+
+    /// Mutably accesses the budget tracker for a context, creating one if needed.
+    ///
+    /// The closure receives a mutable reference to the tracker.
+    pub fn with_economy_budget_mut<T, F>(&self, context_id: &str, f: F) -> T
+    where
+        F: FnOnce(&mut MemberBudgetTracker) -> T,
+    {
+        let mut entry = self
+            .economy_budgets
+            .entry(context_id.to_owned())
+            .or_default();
+        f(entry.value_mut())
+    }
+
+    /// Accesses the antispam velocity tracker for a context, creating one if
+    /// needed.
+    ///
+    /// The closure receives a reference to the tracker (which is internally
+    /// `Mutex`-protected, so `&self` methods like `record_message` and
+    /// `get_velocity` work without `&mut`).
+    pub fn with_economy_antispam<T, F>(&self, context_id: &str, f: F) -> T
+    where
+        F: FnOnce(&SenderVelocityTracker) -> T,
+    {
+        let entry = self
+            .economy_antispam
+            .entry(context_id.to_owned())
+            .or_insert_with(|| SenderVelocityTracker::new(ANTISPAM_DEFAULT_WINDOW_SECS));
+        f(entry.value())
+    }
+
+    /// Removes economy state (budget tracker and antispam tracker) for a context.
+    ///
+    /// Should be called during context cleanup for long-running processes.
+    pub fn remove_economy_state(&self, context_id: &str) {
+        self.economy_budgets.remove(context_id);
+        self.economy_antispam.remove(context_id);
+    }
+
+    // -----------------------------------------------------------------
+    // Bridge connector state accessors
+    // -----------------------------------------------------------------
+
+    /// Returns a reference to the bridge connector state `DashMap`.
+    ///
+    /// Keyed by context ID. Each entry holds a [`BridgeContextState`] with
+    /// the shadow registry and sender key store for that context.
+    #[must_use]
+    pub const fn bridge_state(&self) -> &DashMap<String, BridgeContextState> {
+        &self.bridge_state
+    }
+
+    /// Removes per-context bridge connector state on context close, preventing
+    /// unbounded memory growth in long-running processes.
+    pub fn remove_bridge_state(&self, context_id: &str) {
+        self.bridge_state.remove(context_id);
+    }
+
+    /// Clears all bridge connector state entries. Called during shutdown.
+    pub fn clear_bridge_state(&self) {
+        self.bridge_state.clear();
+    }
+
+    // -----------------------------------------------------------------
+    // DID resolver accessors
+    // -----------------------------------------------------------------
+
+    /// Returns the production DID resolver, if initialized.
+    #[must_use]
+    pub fn did_resolver(&self) -> Option<&Arc<IdentityBackedDidResolver>> {
+        self.did_resolver.get()
+    }
+
+    /// Stores the production DID resolver.
+    ///
+    /// Called once during identity system setup. Subsequent calls are no-ops
+    /// (`OnceLock` guarantees single initialization).
+    pub fn set_did_resolver(&self, resolver: Arc<IdentityBackedDidResolver>) {
+        let _ = self.did_resolver.set(resolver);
     }
 }
 
@@ -1410,5 +1569,130 @@ mod tests {
 
         // If we got here, the panic was caught.
         assert!(instance.is_shutdown());
+    }
+
+    // -----------------------------------------------------------------
+    // Economy tests
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn economy_budget_creates_default_on_first_access() {
+        let instance = BridgeInstance::new(test_context_manager(), "did:dht:ztest".to_owned());
+        let remaining = instance.with_economy_budget("ctx-1", |tracker| {
+            tracker.remaining(&scp_primitives::DID::from("did:dht:zalice"))
+        });
+        assert_eq!(remaining.value(), 0);
+    }
+
+    #[test]
+    fn economy_budget_mut_grants_and_reads() {
+        let instance = BridgeInstance::new(test_context_manager(), "did:dht:ztest".to_owned());
+        let did = scp_primitives::DID::from("did:dht:zalice");
+        instance.with_economy_budget_mut("ctx-eco", |tracker| {
+            tracker.grant(&did, scp_protocol::economy::Amount::new(500));
+        });
+        let remaining = instance.with_economy_budget("ctx-eco", |tracker| tracker.remaining(&did));
+        assert_eq!(remaining.value(), 500);
+    }
+
+    #[test]
+    fn economy_antispam_creates_default_on_first_access() {
+        let instance = BridgeInstance::new(test_context_manager(), "did:dht:ztest".to_owned());
+        let did = scp_primitives::DID::from("did:dht:zbob");
+        let velocity =
+            instance.with_economy_antispam("ctx-spam", |tracker| tracker.get_velocity(&did, 1000));
+        assert_eq!(velocity, 0);
+    }
+
+    #[test]
+    fn remove_economy_state_clears_both() {
+        let instance = BridgeInstance::new(test_context_manager(), "did:dht:ztest".to_owned());
+        let did = scp_primitives::DID::from("did:dht:zalice");
+        instance.with_economy_budget_mut("ctx-rm", |tracker| {
+            tracker.grant(&did, scp_protocol::economy::Amount::new(100));
+        });
+        instance.with_economy_antispam("ctx-rm", |tracker| {
+            tracker.record_message(&did, 1000);
+        });
+
+        instance.remove_economy_state("ctx-rm");
+
+        // Budget should be fresh (zero) after removal.
+        let remaining = instance.with_economy_budget("ctx-rm", |tracker| tracker.remaining(&did));
+        assert_eq!(remaining.value(), 0);
+    }
+
+    // -----------------------------------------------------------------
+    // Bridge state tests
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn bridge_state_starts_empty() {
+        let instance = BridgeInstance::new(test_context_manager(), "did:dht:ztest".to_owned());
+        assert!(instance.bridge_state().is_empty());
+    }
+
+    #[test]
+    fn bridge_state_insert_and_remove() {
+        use scp_protocol::bridge::shadow::ShadowRegistry;
+        use scp_protocol::crypto::sender_keys::SenderKeyStore;
+
+        let instance = BridgeInstance::new(test_context_manager(), "did:dht:ztest".to_owned());
+        instance.bridge_state().insert(
+            "ctx-bs".to_owned(),
+            BridgeContextState {
+                shadow_registry: ShadowRegistry::new("ctx-bs".to_owned()),
+                sender_key_store: SenderKeyStore::new(),
+            },
+        );
+        assert_eq!(instance.bridge_state().len(), 1);
+
+        instance.remove_bridge_state("ctx-bs");
+        assert!(instance.bridge_state().is_empty());
+    }
+
+    // -----------------------------------------------------------------
+    // DID resolver tests
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn did_resolver_starts_none() {
+        let instance = BridgeInstance::new(test_context_manager(), "did:dht:ztest".to_owned());
+        assert!(instance.did_resolver().is_none());
+    }
+
+    // -----------------------------------------------------------------
+    // Shutdown clears new registries
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn shutdown_clears_economy_and_bridge_state() {
+        use scp_protocol::bridge::shadow::ShadowRegistry;
+        use scp_protocol::crypto::sender_keys::SenderKeyStore;
+
+        let instance = BridgeInstance::new(test_context_manager(), "did:dht:ztest".to_owned());
+
+        // Populate economy
+        let did = scp_primitives::DID::from("did:dht:zalice");
+        instance.with_economy_budget_mut("ctx-sd", |tracker| {
+            tracker.grant(&did, scp_protocol::economy::Amount::new(100));
+        });
+        instance.with_economy_antispam("ctx-sd", |_| {});
+
+        // Populate bridge state
+        instance.bridge_state().insert(
+            "ctx-sd".to_owned(),
+            BridgeContextState {
+                shadow_registry: ShadowRegistry::new("ctx-sd".to_owned()),
+                sender_key_store: SenderKeyStore::new(),
+            },
+        );
+
+        instance.shutdown().unwrap();
+
+        assert!(instance.bridge_state().is_empty());
+        // Economy DashMaps should be cleared
+        assert!(instance.economy_budgets.is_empty());
+        assert!(instance.economy_antispam.is_empty());
     }
 }

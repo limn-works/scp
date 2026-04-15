@@ -8,7 +8,7 @@
 //!
 //! See spec section 12 (Bridge System) and ADR-023.
 
-use scp_ffi_common::bridge_state::{BridgeContextState, bridge_state_registry};
+use scp_ffi_common::bridge_state::BridgeContextState;
 use scp_ffi_common::error_codes as codes;
 
 use napi_derive::napi;
@@ -26,22 +26,6 @@ use scp_core::crypto::sender_keys::SenderKeyStore;
 use scp_core::provenance::{DataProvenance, DiscoveryMethod, SourceType};
 
 use crate::error::ScpNapiError;
-
-// ---------------------------------------------------------------------------
-// Per-context bridge state — persistent ShadowRegistry + SenderKeyStore
-// ---------------------------------------------------------------------------
-//
-// `BridgeContextState`, `bridge_state_registry()`, and `remove_bridge_state()`
-// are defined in `scp_ffi_common::bridge_state` and imported above.
-
-/// Clears all per-context bridge state during shutdown.
-///
-/// Called by the shutdown hook registered in [`crate::runtime::init_bridge_instance`].
-/// This ensures shadow registries and sender key stores are dropped, releasing
-/// any key material they hold.
-pub(crate) fn clear_bridge_state() {
-    scp_ffi_common::bridge_state::bridge_state_registry().clear();
-}
 
 // ---------------------------------------------------------------------------
 // Result types
@@ -265,8 +249,9 @@ pub fn bridge_create_shadow(
         timestamp: 0,
     };
 
-    let registry = bridge_state_registry();
-    let mut entry = registry
+    let bi = crate::runtime::bridge_instance()?;
+    let mut entry = bi
+        .bridge_state()
         .entry(ctx_id.clone())
         .or_insert_with(|| BridgeContextState {
             shadow_registry: ShadowRegistry::new(ctx_id),
@@ -440,6 +425,7 @@ mod tests {
 
     #[test]
     fn create_shadow_returns_observer_role() {
+        crate::runtime::init_context_manager_for_test();
         let result = bridge_create_shadow(
             "bridge-1".to_owned(),
             "@user".to_owned(),

@@ -184,8 +184,8 @@ pub fn economy_budget_remaining(context_id: String, did: String) -> napi::Result
         return Err(validation_error("DID must not be empty"));
     }
     let member_did = scp_identity::DID::from(did.as_str());
-    let remaining =
-        crate::runtime::with_economy_budget(&context_id, |tracker| tracker.remaining(&member_did));
+    let remaining = crate::runtime::bridge_instance()?
+        .with_economy_budget(&context_id, |tracker| tracker.remaining(&member_did));
     #[allow(clippy::cast_possible_wrap)]
     Ok(remaining.value() as i64)
 }
@@ -201,7 +201,7 @@ pub fn economy_budget_grant(context_id: String, did: String, amount: i64) -> nap
     }
     let member_did = scp_identity::DID::from(did.as_str());
     #[allow(clippy::cast_sign_loss)]
-    crate::runtime::with_economy_budget_mut(&context_id, |tracker| {
+    crate::runtime::bridge_instance()?.with_economy_budget_mut(&context_id, |tracker| {
         tracker.grant(&member_did, scp_core::economy::Amount::new(amount as u64));
     });
     Ok(())
@@ -222,7 +222,7 @@ pub fn economy_budget_record_spend(
     }
     let member_did = scp_identity::DID::from(did.as_str());
     #[allow(clippy::cast_sign_loss)]
-    crate::runtime::with_economy_budget_mut(&context_id, |tracker| {
+    crate::runtime::bridge_instance()?.with_economy_budget_mut(&context_id, |tracker| {
         tracker
             .record_spend(&member_did, scp_core::economy::Amount::new(amount as u64))
             .map_err(|e| validation_error(&format!("{e}")))
@@ -244,7 +244,7 @@ pub fn economy_antispam_record(
     }
     let did = scp_identity::DID::from(sender_did.as_str());
     #[allow(clippy::cast_sign_loss)]
-    crate::runtime::with_economy_antispam(&context_id, |tracker| {
+    crate::runtime::bridge_instance()?.with_economy_antispam(&context_id, |tracker| {
         tracker.record_message(&did, timestamp as u64);
     });
     Ok(())
@@ -265,9 +265,10 @@ pub fn economy_antispam_velocity(
     }
     let did = scp_identity::DID::from(sender_did.as_str());
     #[allow(clippy::cast_sign_loss, clippy::cast_possible_wrap)]
-    let velocity = crate::runtime::with_economy_antispam(&context_id, |tracker| {
-        tracker.get_velocity(&did, now as u64)
-    });
+    let velocity = crate::runtime::bridge_instance()?
+        .with_economy_antispam(&context_id, |tracker| {
+            tracker.get_velocity(&did, now as u64)
+        });
     #[allow(clippy::cast_possible_wrap)]
     Ok(velocity as i64)
 }
@@ -304,7 +305,7 @@ pub fn economy_antispam_escalated_cost(
 
     let did = scp_identity::DID::from(sender_did.as_str());
     #[allow(clippy::cast_sign_loss)]
-    let cost = crate::runtime::with_economy_antispam(&context_id, |tracker| {
+    let cost = crate::runtime::bridge_instance()?.with_economy_antispam(&context_id, |tracker| {
         tracker.compute_escalated_cost(
             &did,
             now as u64,
@@ -352,12 +353,14 @@ mod tests {
 
     #[test]
     fn budget_remaining_empty_context_returns_zero() {
+        crate::runtime::init_context_manager_for_test();
         let result = economy_budget_remaining("test-ctx".to_owned(), "did:key:test".to_owned());
         assert_eq!(result.unwrap(), 0);
     }
 
     #[test]
     fn budget_grant_and_spend() {
+        crate::runtime::init_context_manager_for_test();
         economy_budget_grant("napi-econ-ctx".to_owned(), "did:key:alice".to_owned(), 1000).unwrap();
         let r = economy_budget_remaining("napi-econ-ctx".to_owned(), "did:key:alice".to_owned())
             .unwrap();
@@ -372,6 +375,7 @@ mod tests {
 
     #[test]
     fn antispam_velocity_starts_at_zero() {
+        crate::runtime::init_context_manager_for_test();
         let v =
             economy_antispam_velocity("napi-spam-ctx".to_owned(), "did:key:bob".to_owned(), 1000);
         assert_eq!(v.unwrap(), 0);

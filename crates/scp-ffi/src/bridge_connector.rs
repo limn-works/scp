@@ -54,31 +54,10 @@ use scp_core::bridge::{
 use scp_core::crypto::sender_keys::{SenderKey, SenderKeyStore};
 use scp_core::provenance::{DataProvenance, DiscoveryMethod, SourceType};
 use scp_core::trust::attestation::Attestation;
-use scp_ffi_common::bridge_state::{BridgeContextState, bridge_state_registry};
+use scp_ffi_common::bridge_state::BridgeContextState;
 use zeroize::Zeroizing;
 
 use crate::error::ScpPyError;
-
-// ---------------------------------------------------------------------------
-// Per-context bridge state — persistent ShadowRegistry + SenderKeyStore
-// ---------------------------------------------------------------------------
-//
-// `BridgeContextState`, `bridge_state_registry()`, and `remove_bridge_state()`
-// are defined in `scp_ffi_common::bridge_state` and re-imported above.
-
-/// Clears all per-context bridge state during shutdown.
-///
-/// Called by the shutdown hook registered in [`crate::runtime::init_bridge_instance`].
-/// This ensures shadow registries and sender key stores are dropped, releasing
-/// any key material they hold.
-///
-/// `CREDENTIAL_STORE` is an `OnceLock<InMemoryCredentialStore>` that cannot
-/// be cleared (`OnceLock` does not support `take`). Its `Zeroizing<[u8; 32]>`
-/// fields are cleaned up on process exit via `Drop`. Same limitation as
-/// `DID_RESOLVER` and `STORAGE_PROVIDER` in `runtime.rs`.
-pub(crate) fn clear_bridge_state() {
-    scp_ffi_common::bridge_state::bridge_state_registry().clear();
-}
 
 // ---------------------------------------------------------------------------
 // Global credential store (in-memory, per-process)
@@ -354,8 +333,9 @@ pub fn py_bridge_create_shadow(
         timestamp: 0,
     };
 
-    let registry = bridge_state_registry();
-    let mut entry = registry
+    let bi = crate::runtime::bridge_instance()?;
+    let mut entry = bi
+        .bridge_state()
         .entry(context_id.to_owned())
         .or_insert_with(|| BridgeContextState {
             shadow_registry: ShadowRegistry::new(context_id.to_string()),

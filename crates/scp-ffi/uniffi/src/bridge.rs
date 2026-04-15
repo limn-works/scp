@@ -3355,12 +3355,11 @@ pub async fn context_close(
             // Clean up per-context UCAN state.
             crate::runtime::remove_ucan_state(&handle.context_id);
 
-            // Clean up per-context bridge connector state (ShadowRegistry + SenderKeyStore)
-            // to prevent unbounded memory growth in long-running processes.
-            remove_bridge_state(&handle.context_id);
-
-            // Clean up per-context economy state (budget + antispam trackers).
-            crate::runtime::remove_economy_state(&handle.context_id);
+            // Clean up per-context bridge connector state and economy state via BridgeInstance.
+            if let Ok(bi) = crate::runtime::bridge_instance() {
+                bi.remove_bridge_state(&handle.context_id);
+                bi.remove_economy_state(&handle.context_id);
+            }
 
             // Deregister the context handle from the MCP lookup registry.
             deregister_context_handle(&handle.context_id);
@@ -11566,21 +11565,10 @@ pub fn sync_get_policy() -> SyncPolicyResult {
 // Bridge connector — register and create shadow (#421)
 // ---------------------------------------------------------------------------
 //
-// `BridgeContextState`, `bridge_state_registry()`, and `remove_bridge_state()`
-// are defined in `scp_ffi_common::bridge_state`.
+// `BridgeContextState` type is defined in `scp_ffi_common::bridge_state`.
+// Per-context state is owned by `BridgeInstance::bridge_state`.
 
-use scp_ffi_common::bridge_state::{
-    BridgeContextState, bridge_state_registry, remove_bridge_state,
-};
-
-/// Clears all per-context bridge state during shutdown.
-///
-/// Called by the shutdown hook registered in [`crate::runtime::init_bridge_instance`].
-/// This ensures shadow registries and sender key stores are dropped, releasing
-/// any key material they hold.
-pub(crate) fn clear_bridge_state() {
-    scp_ffi_common::bridge_state::bridge_state_registry().clear();
-}
+use scp_ffi_common::bridge_state::BridgeContextState;
 
 /// Bridge registration result record.
 ///
@@ -11814,8 +11802,9 @@ pub fn bridge_create_shadow(
         timestamp: 0,
     };
 
-    let registry = bridge_state_registry();
-    let mut entry = registry
+    let bi = crate::runtime::bridge_instance()?;
+    let mut entry = bi
+        .bridge_state()
         .entry(context_id.clone())
         .or_insert_with(|| BridgeContextState {
             shadow_registry: scp_core::bridge::shadow::ShadowRegistry::new(context_id),
@@ -12688,8 +12677,8 @@ pub fn economy_evaluate_formula(
 pub fn economy_budget_remaining(context_id: String, did: String) -> Result<u64, ScpError> {
     validate_did(&did)?;
     let member_did = scp_identity::DID::from(did.as_str());
-    let remaining =
-        crate::runtime::with_economy_budget(&context_id, |tracker| tracker.remaining(&member_did));
+    let remaining = crate::runtime::bridge_instance()?
+        .with_economy_budget(&context_id, |tracker| tracker.remaining(&member_did));
     Ok(remaining.value())
 }
 
@@ -12698,7 +12687,7 @@ pub fn economy_budget_remaining(context_id: String, did: String) -> Result<u64, 
 pub fn economy_budget_grant(context_id: String, did: String, amount: u64) -> Result<(), ScpError> {
     validate_did(&did)?;
     let member_did = scp_identity::DID::from(did.as_str());
-    crate::runtime::with_economy_budget_mut(&context_id, |tracker| {
+    crate::runtime::bridge_instance()?.with_economy_budget_mut(&context_id, |tracker| {
         tracker.grant(&member_did, scp_core::economy::Amount::new(amount));
     });
     Ok(())
@@ -12713,7 +12702,7 @@ pub fn economy_budget_record_spend(
 ) -> Result<(), ScpError> {
     validate_did(&did)?;
     let member_did = scp_identity::DID::from(did.as_str());
-    crate::runtime::with_economy_budget_mut(&context_id, |tracker| {
+    crate::runtime::bridge_instance()?.with_economy_budget_mut(&context_id, |tracker| {
         tracker
             .record_spend(&member_did, scp_core::economy::Amount::new(amount))
             .map_err(|e| ScpError::Validation {
@@ -12732,7 +12721,7 @@ pub fn economy_antispam_record(
 ) -> Result<(), ScpError> {
     validate_did(&sender_did)?;
     let did = scp_identity::DID::from(sender_did.as_str());
-    crate::runtime::with_economy_antispam(&context_id, |tracker| {
+    crate::runtime::bridge_instance()?.with_economy_antispam(&context_id, |tracker| {
         tracker.record_message(&did, timestamp);
     });
     Ok(())
@@ -12747,9 +12736,8 @@ pub fn economy_antispam_velocity(
 ) -> Result<u64, ScpError> {
     validate_did(&sender_did)?;
     let did = scp_identity::DID::from(sender_did.as_str());
-    let velocity = crate::runtime::with_economy_antispam(&context_id, |tracker| {
-        tracker.get_velocity(&did, now)
-    });
+    let velocity = crate::runtime::bridge_instance()?
+        .with_economy_antispam(&context_id, |tracker| tracker.get_velocity(&did, now));
     Ok(velocity)
 }
 
@@ -12783,7 +12771,7 @@ pub fn economy_antispam_escalated_cost(
     };
 
     let did = scp_identity::DID::from(sender_did.as_str());
-    let cost = crate::runtime::with_economy_antispam(&context_id, |tracker| {
+    let cost = crate::runtime::bridge_instance()?.with_economy_antispam(&context_id, |tracker| {
         tracker.compute_escalated_cost(
             &did,
             now,

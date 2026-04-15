@@ -57,8 +57,8 @@ fn map_transport_lock_error(e: TransportLockError) -> ScpNapiError {
 /// Stores a `TransportManager` (called by [`transport_connect`]).
 ///
 /// Wraps in `Arc` and delegates to [`BridgeInstance::set_transport`].
-/// If the `BridgeInstance` doesn't exist yet but `CONTEXT_MANAGER` is
-/// initialized, lazily creates the `BridgeInstance`.
+/// If the `BridgeInstance` doesn't exist yet, lazily creates it from
+/// the existing `ContextManager`.
 ///
 /// # Errors
 ///
