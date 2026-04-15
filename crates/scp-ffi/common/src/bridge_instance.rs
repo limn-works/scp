@@ -81,11 +81,20 @@ pub struct BridgeInstance {
     /// The local DID this instance was initialized with.
     local_did: String,
 
-    /// Whether this instance has been shut down.
+    /// Whether this instance has been shut down permanently.
     ///
     /// Uses `SeqCst` ordering for cross-thread visibility. Once set to `true`,
     /// all subsequent bridge operations should return an error immediately.
+    /// A shut-down instance cannot be resumed.
     shutdown: AtomicBool,
+
+    /// Whether this instance is currently suspended.
+    ///
+    /// Suspended instances have disconnected transport but retain their
+    /// context state. `resume()` clears this flag — the caller must
+    /// re-establish transport via `set_transport`. Suspension is intended
+    /// for mobile app backgrounding.
+    suspended: AtomicBool,
 
     // -----------------------------------------------------------------
     // Shared state — previously per-bridge OnceLock singletons
@@ -139,6 +148,7 @@ impl BridgeInstance {
             context_manager,
             local_did,
             shutdown: AtomicBool::new(false),
+            suspended: AtomicBool::new(false),
             transport: RwLock::new(None),
             known_contexts: DashMap::new(),
             rate_limiters: DashMap::new(),
@@ -157,7 +167,7 @@ impl BridgeInstance {
         &self.local_did
     }
 
-    /// Whether this instance has been shut down.
+    /// Whether this instance has been shut down permanently.
     ///
     /// Bridge operations should check this before proceeding and return
     /// an appropriate error if `true`.
@@ -166,17 +176,93 @@ impl BridgeInstance {
         self.shutdown.load(Ordering::SeqCst)
     }
 
-    /// Marks this instance as shut down.
+    /// Whether this instance is currently suspended (backgrounded).
     ///
-    /// All subsequent calls to `is_shutdown()` will return `true`. This is
-    /// a one-way transition — there is no `resume()`. A shut-down instance
-    /// should be dropped and a new one created if the bridge needs to restart.
+    /// Suspended instances have disconnected transport but retain context
+    /// state. Bridge operations that require transport should check this
+    /// and return an appropriate error.
+    #[must_use]
+    pub fn is_suspended(&self) -> bool {
+        self.suspended.load(Ordering::SeqCst)
+    }
+
+    /// Suspends the bridge instance.
     ///
-    /// This does NOT drop the `ContextManager` or close any MLS groups.
-    /// Callers should perform cleanup (close contexts, drop transport, etc.)
-    /// before or after calling `shutdown()`.
-    pub fn shutdown(&self) {
-        self.shutdown.store(true, Ordering::SeqCst);
+    /// - Disconnects the relay (clears transport)
+    /// - Keeps the instance alive but inactive (context state is preserved)
+    /// - Intended for mobile app backgrounding
+    ///
+    /// After suspension, `is_suspended()` returns `true` and transport-dependent
+    /// operations will fail. Call `resume()` to clear the suspended flag, then
+    /// re-establish transport via `set_transport`.
+    ///
+    /// No-op if already shut down.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` if the transport `RwLock` is poisoned.
+    pub fn suspend(&self) -> Result<(), TransportLockError> {
+        if self.is_shutdown() {
+            return Ok(());
+        }
+        self.clear_transport()?;
+        self.suspended.store(true, Ordering::SeqCst);
+        tracing::info!(local_did = %self.local_did, "bridge instance suspended");
+        Ok(())
+    }
+
+    /// Resumes a suspended bridge instance.
+    ///
+    /// Clears the suspended flag so bridge operations can proceed. The caller
+    /// must re-establish the relay connection via `set_transport` — resume
+    /// does not reconnect automatically because the relay URL is not stored
+    /// in `BridgeInstance`.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` if the instance has been permanently shut down.
+    pub fn resume(&self) -> Result<(), LifecycleError> {
+        if self.is_shutdown() {
+            return Err(LifecycleError::AlreadyShutDown);
+        }
+        self.suspended.store(false, Ordering::SeqCst);
+        tracing::info!(local_did = %self.local_did, "bridge instance resumed");
+        Ok(())
+    }
+
+    /// Shuts down the bridge instance permanently.
+    ///
+    /// - Clears transport (disconnects relay)
+    /// - Clears all registries (known contexts, rate limiters)
+    /// - Marks instance as shut down (all subsequent operations fail)
+    ///
+    /// Idempotent: calling `shutdown()` on an already-shut-down instance is
+    /// a no-op.
+    ///
+    /// Note: key zeroization is not performed here because identity registry
+    /// and custody providers are bridge-specific (not yet consolidated into
+    /// `BridgeInstance`). Callers must handle key cleanup separately.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` if the transport `RwLock` is poisoned.
+    pub fn shutdown(&self) -> Result<(), TransportLockError> {
+        if self.shutdown.swap(true, Ordering::SeqCst) {
+            return Ok(()); // Already shut down
+        }
+
+        // Clear transport (disconnect relay)
+        self.clear_transport()?;
+
+        // Clear registries
+        self.known_contexts.clear();
+        self.rate_limiters.clear();
+
+        // Also clear suspended flag (shutdown supersedes suspension)
+        self.suspended.store(false, Ordering::SeqCst);
+
+        tracing::info!(local_did = %self.local_did, "bridge instance shut down");
+        Ok(())
     }
 
     // -----------------------------------------------------------------
@@ -426,6 +512,26 @@ impl std::fmt::Display for TransportLockError {
 
 impl std::error::Error for TransportLockError {}
 
+/// Error type for lifecycle operations (`resume`).
+///
+/// Used by [`BridgeInstance::resume`]. Bridge layers map this to their own
+/// error types (`ScpPyError`, napi `Error`, etc.).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LifecycleError {
+    /// The instance has been permanently shut down and cannot be resumed.
+    AlreadyShutDown,
+}
+
+impl std::fmt::Display for LifecycleError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::AlreadyShutDown => write!(f, "cannot resume a shut down instance"),
+        }
+    }
+}
+
+impl std::error::Error for LifecycleError {}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
@@ -435,6 +541,10 @@ mod tests {
         ContextCreationError, ContextCryptoProvider, ContextEventLogProvider,
     };
     use scp_core::context::{AddMemberOutput, ContextError, RemoveMemberOutput};
+    use std::pin::Pin;
+
+    use scp_core::envelope::outer::OuterEnvelope;
+    use scp_transport::{BlobId, RoutingId, SubscriptionStream, TransportAdapter, TransportError};
 
     // Minimal no-op providers for constructing a ContextManager in tests.
 
@@ -511,6 +621,41 @@ mod tests {
         ))
     }
 
+    /// Minimal no-op transport adapter for lifecycle tests.
+    struct NoOpAdapter;
+
+    type BoxFut<'a, T> = Pin<Box<dyn std::future::Future<Output = T> + Send + 'a>>;
+
+    impl TransportAdapter for NoOpAdapter {
+        fn send(&self, _: &OuterEnvelope) -> BoxFut<'_, Result<BlobId, TransportError>> {
+            Box::pin(async { Err(TransportError::NotConnected) })
+        }
+        fn subscribe(
+            &self,
+            _: &RoutingId,
+            _: Option<u64>,
+        ) -> BoxFut<'_, Result<SubscriptionStream, TransportError>> {
+            Box::pin(async { Err(TransportError::NotConnected) })
+        }
+        fn unsubscribe(&self, _: &RoutingId) -> BoxFut<'_, Result<(), TransportError>> {
+            Box::pin(async { Ok(()) })
+        }
+        fn query(
+            &self,
+            _: &RoutingId,
+            _: Option<u64>,
+        ) -> BoxFut<'_, Result<Vec<OuterEnvelope>, TransportError>> {
+            Box::pin(async { Err(TransportError::NotConnected) })
+        }
+        fn delete(&self, _: &BlobId) -> BoxFut<'_, Result<(), TransportError>> {
+            Box::pin(async { Ok(()) })
+        }
+    }
+
+    fn test_transport_manager() -> scp_transport::TransportManager {
+        scp_transport::TransportManager::new(Box::new(NoOpAdapter))
+    }
+
     #[test]
     fn new_creates_instance_with_expected_state() {
         let cm = test_context_manager();
@@ -531,11 +676,11 @@ mod tests {
         let instance = BridgeInstance::new(test_context_manager(), "did:dht:ztest".to_owned());
 
         assert!(!instance.is_shutdown());
-        instance.shutdown();
+        instance.shutdown().unwrap();
         assert!(instance.is_shutdown());
 
         // Calling shutdown again is a no-op — still true
-        instance.shutdown();
+        instance.shutdown().unwrap();
         assert!(instance.is_shutdown());
     }
 
@@ -688,6 +833,140 @@ mod tests {
             TransportLockError::InUse.to_string(),
             "transport manager is in use by an active subscription \u{2014} \
              cannot modify while subscriptions are active"
+        );
+    }
+
+    // -----------------------------------------------------------------
+    // Lifecycle tests (suspend / resume / shutdown)
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn suspend_clears_transport() {
+        let instance = BridgeInstance::new(test_context_manager(), "did:dht:ztest".to_owned());
+        instance.set_transport(test_transport_manager()).unwrap();
+        assert!(instance.has_transport());
+
+        instance.suspend().unwrap();
+
+        assert!(!instance.has_transport());
+        assert!(instance.is_suspended());
+    }
+
+    #[test]
+    fn suspend_is_noop_when_shutdown() {
+        let instance = BridgeInstance::new(test_context_manager(), "did:dht:ztest".to_owned());
+        instance.shutdown().unwrap();
+
+        // Suspending an already-shutdown instance is a no-op (not an error)
+        instance.suspend().unwrap();
+        assert!(instance.is_shutdown());
+        assert!(!instance.is_suspended());
+    }
+
+    #[test]
+    fn resume_clears_suspended_flag() {
+        let instance = BridgeInstance::new(test_context_manager(), "did:dht:ztest".to_owned());
+        instance.suspend().unwrap();
+        assert!(instance.is_suspended());
+
+        instance.resume().unwrap();
+        assert!(!instance.is_suspended());
+    }
+
+    #[test]
+    fn resume_fails_after_shutdown() {
+        let instance = BridgeInstance::new(test_context_manager(), "did:dht:ztest".to_owned());
+        instance.shutdown().unwrap();
+
+        let err = instance.resume().unwrap_err();
+        assert_eq!(err, LifecycleError::AlreadyShutDown);
+        assert_eq!(err.to_string(), "cannot resume a shut down instance");
+    }
+
+    #[test]
+    fn shutdown_is_idempotent() {
+        let instance = BridgeInstance::new(test_context_manager(), "did:dht:ztest".to_owned());
+
+        // Register some state
+        instance.register_known_context(
+            "ctx-1",
+            KnownContext {
+                routing_id: [0u8; 32],
+                relay_url: None,
+                member_did: "did:dht:ztest".to_owned(),
+                last_seen: 0,
+            },
+        );
+        instance.with_rate_limit_tracker("did:dht:ztest", |_| {});
+
+        instance.shutdown().unwrap();
+        assert!(instance.is_shutdown());
+        assert!(instance.known_contexts().is_empty());
+        assert!(instance.rate_limiters().is_empty());
+
+        // Second call is a no-op
+        instance.shutdown().unwrap();
+        assert!(instance.is_shutdown());
+    }
+
+    #[test]
+    fn shutdown_clears_registries() {
+        let instance = BridgeInstance::new(test_context_manager(), "did:dht:ztest".to_owned());
+
+        // Populate registries
+        instance.register_known_context(
+            "ctx-a",
+            KnownContext {
+                routing_id: [1u8; 32],
+                relay_url: Some("wss://r.example.com".to_owned()),
+                member_did: "did:dht:zalice".to_owned(),
+                last_seen: 100,
+            },
+        );
+        instance.register_known_context(
+            "ctx-b",
+            KnownContext {
+                routing_id: [2u8; 32],
+                relay_url: None,
+                member_did: "did:dht:zbob".to_owned(),
+                last_seen: 200,
+            },
+        );
+        instance.with_rate_limit_tracker("did:dht:zalice", |_| {});
+        instance.with_rate_limit_tracker("did:dht:zbob", |_| {});
+
+        assert_eq!(instance.known_contexts().len(), 2);
+        assert_eq!(instance.rate_limiters().len(), 2);
+
+        instance.shutdown().unwrap();
+
+        assert!(instance.known_contexts().is_empty());
+        assert!(instance.rate_limiters().is_empty());
+    }
+
+    #[test]
+    fn shutdown_clears_suspended_flag() {
+        let instance = BridgeInstance::new(test_context_manager(), "did:dht:ztest".to_owned());
+        instance.suspend().unwrap();
+        assert!(instance.is_suspended());
+
+        instance.shutdown().unwrap();
+        assert!(instance.is_shutdown());
+        // Shutdown supersedes suspension
+        assert!(!instance.is_suspended());
+    }
+
+    #[test]
+    fn new_instance_is_not_suspended() {
+        let instance = BridgeInstance::new(test_context_manager(), "did:dht:ztest".to_owned());
+        assert!(!instance.is_suspended());
+    }
+
+    #[test]
+    fn lifecycle_error_display() {
+        assert_eq!(
+            LifecycleError::AlreadyShutDown.to_string(),
+            "cannot resume a shut down instance"
         );
     }
 }
