@@ -197,7 +197,7 @@ jobs:
         # If UBSan produces spurious errors from dependency C code, fall back to
         # ASan alone by removing the RUSTFLAGS line.
         env:
-          RUSTFLAGS: "-Zsanitizer=undefined"
+          RUSTFLAGS: "-Zsanitizer=address,undefined"
         run: |
           cargo fuzz run ${{ matrix.target }} \
             --fuzz-dir fuzz \

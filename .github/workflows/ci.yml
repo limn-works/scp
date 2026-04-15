@@ -67,7 +67,11 @@ jobs:
               - 'crates/scp-ffi/common/**'
             fuzz:
               - 'fuzz/**'
-              - 'crates/**'
+              - 'crates/scp-protocol/**'
+              - 'crates/scp-transport/**'
+              - 'crates/scp-runtime/**'
+              - 'crates/scp-event-log/**'
+              - 'crates/scp-primitives/**'
 
   # ── Error codes ───────────────────────────────────────────────────
   error-codes:

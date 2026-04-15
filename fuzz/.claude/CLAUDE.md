@@ -113,9 +113,10 @@ Forgetting the `-dict=` flag is the single most common cause of poor fuzzer cove
 
 4. **Create the dictionary** in `fuzz/dicts/` with all field names from the target type's serde attributes, plus MessagePack structural bytes.
 
-5. **Create a seed corpus** in `fuzz/corpus/<target>/`:
+5. **Create a seed corpus** in `fuzz/corpus/<target>/` (see `fuzz/README.md` §Adding a New Target for the full seed file workflow):
    - At least one valid input per enum variant
    - Known-bad boundary probes: empty input, max-length, truncated, oversized
+   - Commit a `.gitkeep` if no seeds exist yet; add seeds before the first nightly run
 
 6. **Map to security invariants** (I1-I10) — document in the target file which invariants the target asserts.
 
@@ -177,8 +178,8 @@ Every target asserts at minimum **I1** (no panic on any untrusted input). Additi
 | I1 | No panic on any untrusted input | All targets |
 | I2 | No unbounded allocation (bounded by protocol constants) | T1-T6, T10-T11, T14-T15 |
 | I3 | Cryptographic signatures unforgeable (no structural bypass) | T16, T18 |
-| I4 | Nonce replay prevention: accepted nonce never re-accepted | T20 |
-| I5 | Epoch monotonicity: no rollback | T19 |
+| I4 | Nonce replay prevention: accepted nonce never re-accepted | — (future T20) |
+| I5 | Epoch monotonicity: no rollback | — (future T19) |
 | I6 | Timestamps outside `[now - max_age, now + skew]` always rejected | T18 |
 | I7 | Capabilities outside ceiling always rejected | T18 |
 | I8 | Delegation chain verification terminates (depth ≤ 32) | T18 |

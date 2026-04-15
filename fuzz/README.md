@@ -80,7 +80,7 @@ cargo +nightly fuzz list --fuzz-dir fuzz
 
 ## Target Inventory
 
-All 19 targets, grouped by tier and trust boundary.
+All 18 targets, grouped by tier and trust boundary.
 
 **Trust boundaries:**
 - **B1** — Relay wire protocol (any unauthenticated TCP connection)
@@ -199,7 +199,10 @@ in the libFuzzer logs plateaus at a low number, check that:
 4. **Add to the CI matrix** in `.github/workflows/fuzz.yml` under `fuzz-nightly` → `matrix.include`.
    Specify `target`, `dict`, `max_len`, and `time`.
 
-5. **Create a corpus directory**: `fuzz/corpus/fuzz_my_target/.gitkeep`
+5. **Seed the corpus directory** in `fuzz/corpus/fuzz_my_target/`:
+   - At least one valid input per enum variant (valid-per-variant seeds)
+   - Known-bad boundary probes: empty input, max-length, truncated, oversized
+   - Commit a `.gitkeep` if no seeds exist yet; add seeds before the first nightly run
 
 6. **Verify locally**:
    ```sh
