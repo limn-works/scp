@@ -1,0 +1,55 @@
+# Dictionary for context export deserialization (fuzz_deserialize_export)
+# deserialize_export uses MessagePack. ContextExport wraps StoredValue fields.
+
+# Top-level export fields
+"version"
+"data"
+"context_export"
+"schema_version"
+
+# StoredValue field names
+"context_id"
+"context_params"
+"membership"
+"governance_state"
+"epoch"
+"sequence"
+"sender_did"
+"timestamp"
+"role"
+"capabilities"
+
+# MessagePack map headers
+"\x81"
+"\x82"
+"\x83"
+"\x84"
+"\x85"
+"\x86"
+
+# MessagePack array headers
+"\x91"
+"\x92"
+"\x93"
+"\x94"
+
+# MessagePack fixstr for short strings
+"\xa0"
+"\xa4"
+"\xa7"
+"\xaa"
+
+# MessagePack bin8
+"\xc4"
+
+# MessagePack uint8
+"\xcc"
+
+# MessagePack uint16
+"\xcd"
+
+# MessagePack uint32
+"\xce"
+
+# MessagePack uint64
+"\xcf"

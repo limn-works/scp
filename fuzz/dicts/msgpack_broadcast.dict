@@ -1,0 +1,51 @@
+# Dictionary for BroadcastContent deserialization (fuzz_broadcast_content)
+# BroadcastContent uses a magic prefix "SCP" followed by a version byte,
+# then MessagePack-encoded fields.
+
+# Magic bytes: "SCP" (0x53 0x43 0x50)
+"\x53\x43\x50"
+
+# Version byte (0x01 = v1)
+"\x01"
+
+# MessagePack field names for BroadcastContent
+"body"
+"content_type"
+"deploy_id"
+"etag"
+"author_did"
+"created_at"
+"version"
+"signature"
+"author_public_key"
+
+# MessagePack map header bytes (fixmap: 0x8N for N-element maps)
+"\x81"
+"\x82"
+"\x83"
+"\x84"
+"\x85"
+"\x86"
+"\x87"
+"\x88"
+
+# MessagePack fixstr prefix (\xa0-\xbf for 0-31 char strings)
+"\xa0"
+"\xa4"
+"\xa6"
+"\xaa"
+
+# MessagePack bin8 header (binary up to 255 bytes)
+"\xc4"
+
+# MessagePack uint32 header
+"\xce"
+
+# MessagePack int64 header
+"\xd3"
+
+# MIME type strings
+"text/plain"
+"application/json"
+"application/octet-stream"
+"image/png"

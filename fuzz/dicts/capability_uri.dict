@@ -1,0 +1,42 @@
+# Dictionary for capability URI parsing (fuzz_capability_uri)
+# Two parsers: scp_protocol::trust::CapabilityUri and
+# scp_protocol::crypto::ucan::capability::CapabilityUri
+
+# Trust CapabilityUri prefixes
+"scp:capability:"
+"scp:system:"
+"scp:ctx:"
+
+# UCAN CapabilityUri components
+"did:"
+":capability:"
+
+# Version suffixes
+"/v"
+"/v1"
+
+# DID method parts
+"dht"
+"web"
+"key"
+
+# Common resource names
+"messages"
+"members"
+"tools"
+"governance"
+"contexts"
+
+# Common actions
+"read"
+"write"
+"*"
+"propose"
+"vote"
+"invoke"
+"admin"
+
+# Separators
+":"
+"/"
+"_"
