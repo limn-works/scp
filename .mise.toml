@@ -9,6 +9,7 @@ rust = { version = "stable", targets = "wasm32-unknown-unknown,aarch64-apple-ios
 "cargo:wasm-pack" = "latest"
 "cargo:maturin" = "latest"
 "cargo:cargo-deny" = "latest"
+"cargo:cargo-fuzz" = "latest"
 "npm:@napi-rs/cli" = "latest"
 
 [env]

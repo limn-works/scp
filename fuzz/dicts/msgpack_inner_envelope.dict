@@ -1,0 +1,89 @@
+# Dictionary for InnerEnvelope MessagePack deserialization.
+# Field names from InnerEnvelope and InnerEnvelopeParams serde attributes.
+# MessageType enum variant names.
+
+# InnerEnvelope top-level fields
+"source"
+"signature"
+"payload_hash"
+"message_type"
+"context_id"
+"signing_key_id"
+"provenance"
+"upstream_hash"
+"extensions"
+"timestamp"
+"epoch"
+"generation"
+"sequence"
+"payload"
+
+# MessageType variant names (as serialized by serde)
+"ContextMessage"
+"ContextProposal"
+"ContextCommit"
+"Welcome"
+"GovernanceAction"
+"GovernanceVote"
+"KeyRequest"
+"KeyResponse"
+"EpochAdvance"
+"BlockNotification"
+"BroadcastMessage"
+"ChunkEnvelope"
+"SystemEvent"
+
+# SigningKeyId variants
+"Active"
+"Agent"
+
+# Provenance fields
+"source_hash"
+"source_did"
+"attestation_chain"
+
+# MessagePack fixmap headers
+"\x81"
+"\x82"
+"\x83"
+"\x84"
+"\x85"
+"\x86"
+"\x87"
+"\x88"
+"\x89"
+"\x8a"
+"\x8b"
+"\x8c"
+
+# MessagePack fixarray headers
+"\x91"
+"\x92"
+"\x93"
+"\x94"
+"\x95"
+
+# MessagePack integer / bin / str format bytes
+"\x00"
+"\x01"
+"\xcd"
+"\xce"
+"\xcf"
+"\xc4"
+"\xc5"
+"\xc6"
+"\xd9"
+"\xda"
+"\xdb"
+"\xc0"
+"\xc2"
+"\xc3"
+
+# Common 32-byte binary field prefix (bin8 of 32 bytes)
+"\xc4\x20"
+
+# Common 64-byte signature prefix (bin8 of 64 bytes)
+"\xc4\x40"
+
+# Protocol version
+"\xcd\x01\x00"

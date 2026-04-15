@@ -1,0 +1,36 @@
+# Dictionary for SCP URI parsing (fuzz_scp_uri)
+# ScpUri has multiple variants: context URIs, broadcast URIs.
+# These tokens help the fuzzer discover meaningful URI structure.
+
+# URI scheme
+"scp://"
+
+# URI path components
+"context/"
+"broadcast/"
+
+# Query parameters
+"?relay="
+"&mode="
+"&name="
+"&handle="
+
+# Relay URL schemes
+"wss://"
+"ws://"
+
+# Mode values
+"encrypted"
+"broadcast"
+"public"
+
+# Context ID hex characters
+"0123456789abcdef"
+
+# DID components
+"did:dht:"
+"did:web:"
+"z6Mk"
+
+# Common valid hex lengths (32-byte context IDs)
+"0000000000000000000000000000000000000000000000000000000000000001"

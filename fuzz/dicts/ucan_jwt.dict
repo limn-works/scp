@@ -1,0 +1,54 @@
+# Dictionary for UCAN JWT token parsing (fuzz_parse_ucan)
+# UCAN JWT is structured as base64url(header).base64url(payload).base64url(sig)
+# These tokens help the fuzzer discover meaningful JWT structure.
+
+# Structural separator
+"."
+
+# JSON field names — header
+"alg"
+"EdDSA"
+"ES256"
+"typ"
+"JWT"
+"ucv"
+"0.10.0"
+"kid"
+"#active"
+"#agent"
+
+# JSON field names — payload
+"iss"
+"aud"
+"exp"
+"nbf"
+"att"
+"prf"
+"nnc"
+"fct"
+"with"
+"can"
+
+# Capability actions
+"*"
+"read"
+"write"
+"propose"
+"invoke"
+
+# Base64url alphabet (helps mutate encoded segments meaningfully)
+"ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+"abcdefghijklmnopqrstuvwxyz"
+"0123456789"
+"-_"
+
+# DID prefixes
+"did:dht:"
+"did:web:"
+"did:key:"
+
+# SCP-specific URIs in UCAN
+"scp:ctx:"
+"messages:write"
+"messages:read"
+"tool_invoke:*"
