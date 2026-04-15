@@ -95,8 +95,11 @@ pub struct BridgeInstance {
     /// Stores the real [`scp_transport::TransportManager`] with multi-relay
     /// fanout, per-context relay set assignment, suppression detection, and
     /// reliability scoring. Uses `RwLock` for infrequent writes (connect) and
-    /// concurrent reads (probe/query).
-    transport: RwLock<Option<scp_transport::TransportManager>>,
+    /// concurrent reads (probe/query). Wrapped in `Arc` so that NAPI bridge
+    /// subscription tasks (which run in spawned async tasks) can hold a
+    /// `Send`-compatible reference without keeping the `RwLock` guard alive
+    /// across `.await` points.
+    transport: RwLock<Option<Arc<scp_transport::TransportManager>>>,
 
     /// Known context-to-relay mappings for discovery (SCP-213).
     ///
@@ -186,11 +189,15 @@ impl BridgeInstance {
     /// methods ([`set_transport`], [`clear_transport`], [`with_transport`],
     /// [`with_transport_mut`]) for common patterns.
     #[must_use]
-    pub const fn transport_lock(&self) -> &RwLock<Option<scp_transport::TransportManager>> {
+    pub const fn transport_lock(&self) -> &RwLock<Option<Arc<scp_transport::TransportManager>>> {
         &self.transport
     }
 
     /// Stores a new `TransportManager` (called after relay connect).
+    ///
+    /// Wraps the manager in `Arc` before storing so that async tasks (e.g.,
+    /// NAPI subscription) can clone the `Arc` without keeping the `RwLock`
+    /// guard alive across `.await` points.
     ///
     /// Replaces any previous transport manager.
     ///
@@ -201,6 +208,27 @@ impl BridgeInstance {
     pub fn set_transport(
         &self,
         manager: scp_transport::TransportManager,
+    ) -> Result<(), TransportLockError> {
+        let mut guard = self
+            .transport
+            .write()
+            .map_err(|_| TransportLockError::Poisoned)?;
+        *guard = Some(Arc::new(manager));
+        Ok(())
+    }
+
+    /// Stores a pre-built `Arc<TransportManager>`.
+    ///
+    /// Used by callers (e.g., NAPI server auto-wire) that construct the
+    /// manager externally and wrap it in `Arc` before storing.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` if the `RwLock` is poisoned.
+    #[allow(clippy::significant_drop_tightening)]
+    pub fn set_transport_arc(
+        &self,
+        manager: Arc<scp_transport::TransportManager>,
     ) -> Result<(), TransportLockError> {
         let mut guard = self
             .transport
@@ -237,6 +265,24 @@ impl BridgeInstance {
             .is_some_and(|guard| guard.is_some())
     }
 
+    /// Returns an `Arc` clone of the current transport manager, if one exists.
+    ///
+    /// Used by NAPI `context_subscribe` which needs to move the manager
+    /// reference into an async task that outlives any lock guard.
+    ///
+    /// # Errors
+    ///
+    /// Returns `TransportLockError::Poisoned` if the lock is poisoned.
+    pub fn get_transport_arc(
+        &self,
+    ) -> Result<Option<Arc<scp_transport::TransportManager>>, TransportLockError> {
+        let guard = self
+            .transport
+            .read()
+            .map_err(|_| TransportLockError::Poisoned)?;
+        Ok(guard.clone())
+    }
+
     /// Executes a closure with a read reference to the `TransportManager`.
     ///
     /// # Errors
@@ -253,17 +299,21 @@ impl BridgeInstance {
             .transport
             .read()
             .map_err(|_| TransportLockError::Poisoned)?;
-        let manager = guard.as_ref().ok_or(TransportLockError::NotInitialized)?;
+        let manager = guard.as_deref().ok_or(TransportLockError::NotInitialized)?;
         Ok(f(manager))
     }
 
     /// Executes a closure with a mutable reference to the `TransportManager`.
     ///
+    /// Requires exclusive access to the `Arc` (refcount == 1). If subscription
+    /// tasks hold cloned `Arc` references, this will return
+    /// [`TransportLockError::InUse`].
+    ///
     /// # Errors
     ///
     /// Returns `TransportLockError::Poisoned` if the lock is poisoned,
-    /// or `TransportLockError::NotInitialized` if no transport manager has
-    /// been set.
+    /// `TransportLockError::NotInitialized` if no transport manager has been
+    /// set, or `TransportLockError::InUse` if the `Arc` has other holders.
     #[allow(clippy::significant_drop_tightening)]
     pub fn with_transport_mut<T>(
         &self,
@@ -273,7 +323,8 @@ impl BridgeInstance {
             .transport
             .write()
             .map_err(|_| TransportLockError::Poisoned)?;
-        let manager = guard.as_mut().ok_or(TransportLockError::NotInitialized)?;
+        let arc = guard.as_mut().ok_or(TransportLockError::NotInitialized)?;
+        let manager = Arc::get_mut(arc).ok_or(TransportLockError::InUse)?;
         Ok(f(manager))
     }
 
@@ -352,6 +403,9 @@ pub enum TransportLockError {
     Poisoned,
     /// No transport manager has been set (call `set_transport` first).
     NotInitialized,
+    /// The transport manager `Arc` is in use by an active subscription task.
+    /// Mutable access requires exclusive ownership (refcount == 1).
+    InUse,
 }
 
 impl std::fmt::Display for TransportLockError {
@@ -361,6 +415,11 @@ impl std::fmt::Display for TransportLockError {
             Self::NotInitialized => {
                 write!(f, "no transport manager — call transport_connect first")
             }
+            Self::InUse => write!(
+                f,
+                "transport manager is in use by an active subscription — \
+                 cannot modify while subscriptions are active"
+            ),
         }
     }
 }
@@ -624,6 +683,11 @@ mod tests {
         assert_eq!(
             TransportLockError::NotInitialized.to_string(),
             "no transport manager \u{2014} call transport_connect first"
+        );
+        assert_eq!(
+            TransportLockError::InUse.to_string(),
+            "transport manager is in use by an active subscription \u{2014} \
+             cannot modify while subscriptions are active"
         );
     }
 }

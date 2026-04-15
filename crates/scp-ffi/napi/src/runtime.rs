@@ -943,29 +943,33 @@ pub fn query_trust_event_counts(context_id: &str, _did: &str) -> (u64, u64) {
 
 // ---------------------------------------------------------------------------
 // Invitation rate limit tracker registry (#614)
+//
+// Delegates to the `BridgeInstance`'s `rate_limiters` DashMap (#1549).
 // ---------------------------------------------------------------------------
-
-/// Global rate limit tracker registry for invitation auto-accept, keyed by
-/// identity DID.
-static RATE_LIMIT_TRACKERS: OnceLock<
-    DashMap<String, scp_core::context::invitation::RateLimitTracker>,
-> = OnceLock::new();
-
-/// Returns a reference to the global rate limit tracker registry.
-fn rate_limit_registry() -> &'static DashMap<String, scp_core::context::invitation::RateLimitTracker>
-{
-    RATE_LIMIT_TRACKERS.get_or_init(DashMap::new)
-}
 
 /// Returns a mutable reference to the rate limit tracker for the given
 /// identity DID, creating one if it does not exist.
+///
+/// Delegates to [`BridgeInstance::with_rate_limit_tracker`]. If the bridge
+/// has not been initialized (unusual — identity must be created before
+/// invitation evaluation), falls back to a thread-local default tracker
+/// to preserve the original infallible signature.
 pub fn with_rate_limit_tracker<F, T>(identity_did: &str, f: F) -> T
 where
     F: FnOnce(&mut scp_core::context::invitation::RateLimitTracker) -> T,
 {
-    let registry = rate_limit_registry();
-    let mut entry = registry.entry(identity_did.to_owned()).or_default();
-    f(entry.value_mut())
+    if let Ok(bi) = bridge_instance() {
+        bi.with_rate_limit_tracker(identity_did, f)
+    } else {
+        // Bridge not initialized — use a temporary tracker. This path
+        // should not be hit in normal operation (identity is always
+        // created before invitation evaluation).
+        tracing::warn!(
+            "with_rate_limit_tracker called before bridge init — using ephemeral tracker"
+        );
+        let mut tracker = scp_core::context::invitation::RateLimitTracker::default();
+        f(&mut tracker)
+    }
 }
 
 /// Registers a test context in the UCAN state registry.
