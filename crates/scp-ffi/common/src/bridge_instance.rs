@@ -255,7 +255,7 @@ impl BridgeInstance {
         // flag check and transport teardown.
         self.suspended.store(true, Ordering::SeqCst);
         self.clear_transport()?;
-        tracing::info!(local_did = %self.local_did, "bridge instance suspended");
+        tracing::debug!(local_did = %self.local_did, "bridge instance suspended");
         Ok(())
     }
 
@@ -274,7 +274,7 @@ impl BridgeInstance {
             return Err(LifecycleError::AlreadyShutDown);
         }
         self.suspended.store(false, Ordering::SeqCst);
-        tracing::info!(local_did = %self.local_did, "bridge instance resumed");
+        tracing::debug!(local_did = %self.local_did, "bridge instance resumed");
         Ok(())
     }
 
@@ -314,7 +314,7 @@ impl BridgeInstance {
         // Also clear suspended flag (shutdown supersedes suspension)
         self.suspended.store(false, Ordering::SeqCst);
 
-        tracing::info!(local_did = %self.local_did, "bridge instance shut down");
+        tracing::debug!(local_did = %self.local_did, "bridge instance shut down");
         Ok(())
     }
 
