@@ -105,7 +105,11 @@ fn build_signed_token(
         // the token is outside the skew window.
         now_secs.saturating_sub(DEFAULT_CLOCK_SKEW_TOLERANCE_SECS + 1)
     } else {
-        now_secs.saturating_add(lifetime_secs.max(1))
+        // Use a lifetime > clock skew tolerance to avoid spurious expiry
+        // on the positive-case assertion if validation crosses a second
+        // boundary. The fuzzer still controls whether the token is "expired"
+        // via the boolean above; this only affects the unexpired case.
+        now_secs.saturating_add(lifetime_secs.max(DEFAULT_CLOCK_SKEW_TOLERANCE_SECS + 2))
     };
 
     // Nonce: {unix_millis}-{32_hex_chars}. Timestamp uses real wall time so

@@ -78,9 +78,9 @@ fuzz_target!(|data: &[u8]| {
         };
 
         let event = make_event(i as u64, prev_hash, chunk);
-        if let Ok(leaf_index) = append_unsigned_event(&mut log, &event) {
-            // Update prev_hash to the hash that was just appended.
-            prev_hash = log.leaves()[leaf_index as usize];
+        if append_unsigned_event(&mut log, &event).is_ok() {
+            // Update prev_hash to the leaf just appended (most recent).
+            prev_hash = *log.leaves().last().expect("just appended a leaf");
         } else {
             // Should not happen, but abort gracefully rather than panic.
             return;
