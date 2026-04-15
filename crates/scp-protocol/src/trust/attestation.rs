@@ -1136,6 +1136,10 @@ pub(crate) fn canonical_attestation_bytes(
             CanonicalField::VarBytes(&revocation_bytes),
         ],
     )
+    .map_err(|e| TrustError::InvalidEventData {
+        sequence: 0,
+        reason: format!("canonical hash failed: {e}"),
+    })?
     .to_vec())
 }
 

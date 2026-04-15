@@ -248,8 +248,14 @@ impl ResetRequest {
     /// 6. `timestamp` (`U64`)
     ///
     /// The result is the message to be signed/verified.
-    #[must_use]
-    pub fn canonical_hash(&self) -> [u8; 32] {
+    ///
+    /// # Errors
+    ///
+    /// Returns [`scp_protocol::crypto::canonical::CanonicalError`] if any
+    /// variable-length field exceeds `u32::MAX` bytes.
+    pub fn canonical_hash(
+        &self,
+    ) -> Result<[u8; 32], scp_protocol::crypto::canonical::CanonicalError> {
         let reason_str = self.reason.to_string();
         canonical_hash(
             RESET_REQUEST_DOMAIN_SEPARATOR,
@@ -521,7 +527,11 @@ pub fn validate_reset_request<'a>(
         })?;
 
     Ok(ValidatedResetRequest {
-        canonical_hash: request.canonical_hash(),
+        canonical_hash: request.canonical_hash().map_err(|e| {
+            WeeksOfflineError::CanonicalizationFailed {
+                reason: e.to_string(),
+            }
+        })?,
         nonce_guard,
     })
 }
@@ -1001,6 +1011,13 @@ pub enum WeeksOfflineError {
         queued: usize,
         /// Maximum queue size.
         max_size: usize,
+    },
+
+    /// Canonical hash computation failed (field too large).
+    #[error("canonical hash computation failed: {reason}")]
+    CanonicalizationFailed {
+        /// Human-readable reason.
+        reason: String,
     },
 
     /// Underlying sync error.
@@ -2056,8 +2073,8 @@ mod tests {
             timestamp: BASE_TIMESTAMP,
             signature: vec![0u8; 64],
         };
-        let hash1 = request.canonical_hash();
-        let hash2 = request.canonical_hash();
+        let hash1 = request.canonical_hash().unwrap();
+        let hash2 = request.canonical_hash().unwrap();
         assert_eq!(hash1, hash2);
     }
 
@@ -2074,9 +2091,9 @@ mod tests {
             timestamp: BASE_TIMESTAMP,
             signature: vec![0u8; 64],
         };
-        let hash1 = request.canonical_hash();
+        let hash1 = request.canonical_hash().unwrap();
         request.nonce = [0xBB; 16];
-        let hash2 = request.canonical_hash();
+        let hash2 = request.canonical_hash().unwrap();
         assert_ne!(hash1, hash2);
     }
 
@@ -2095,7 +2112,7 @@ mod tests {
             timestamp: BASE_TIMESTAMP,
             signature: vec![],
         };
-        let hash = request.canonical_hash();
+        let hash = request.canonical_hash().unwrap();
         // Verify by manual construction using the same canonical_hash utility.
         let reason_str = request.reason.to_string();
         let expected = ch(
@@ -2108,7 +2125,8 @@ mod tests {
                 CF::RawBytes(&[0xAB; 16]),
                 CF::U64(BASE_TIMESTAMP),
             ],
-        );
+        )
+        .unwrap();
         assert_eq!(hash, expected);
     }
 
@@ -2244,7 +2262,7 @@ mod tests {
         let result = validate_reset_request(&request, BASE_TIMESTAMP + 5, &tracker);
         assert!(result.is_ok());
         let validated = result.unwrap();
-        assert_eq!(validated.canonical_hash, request.canonical_hash());
+        assert_eq!(validated.canonical_hash, request.canonical_hash().unwrap());
         validated.nonce_guard.commit();
     }
 

@@ -801,7 +801,8 @@ async fn broadcast_wrong_key_decryption_fails() {
         timestamp: 1_700_000_000_000,
         nonce: &nonce,
         provenance_hash: &provenance_hash,
-    });
+    })
+    .unwrap();
 
     let signing_key = ed25519_dalek::SigningKey::from_bytes(&[0xDD; 32]);
     let signature = signing_key.sign(&signing_payload);

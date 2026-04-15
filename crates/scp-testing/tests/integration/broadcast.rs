@@ -183,7 +183,8 @@ async fn seal_open_roundtrip() {
         timestamp: 1_700_000_000_000,
         nonce: &nonce,
         provenance_hash: &provenance_hash,
-    });
+    })
+    .unwrap();
 
     // Sign with a test key
     let signing_key = ed25519_dalek::SigningKey::from_bytes(&[0xBB; 32]);
@@ -230,7 +231,8 @@ async fn open_with_wrong_key_fails() {
         timestamp: 1_700_000_000_000,
         nonce: &nonce,
         provenance_hash: &provenance_hash,
-    });
+    })
+    .unwrap();
 
     let signing_key = ed25519_dalek::SigningKey::from_bytes(&[0xCC; 32]);
     let signature = signing_key.sign(&signing_payload);

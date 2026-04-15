@@ -367,7 +367,7 @@ pub fn verify_epoch_advance(
         &advance.sender_did,
         advance.epoch,
         advance.signer_key_ref,
-    );
+    )?;
     verify_ed25519_signature(sender_public_key, &hash, &advance.signature)
 }
 
@@ -434,7 +434,7 @@ pub fn verify_sender_key_request(
         &request.wrapping_pubkey,
         &request.nonce,
         request.timestamp,
-    );
+    )?;
     verify_ed25519_signature(requester_public_key, &hash, &request.signature)
 }
 
@@ -531,7 +531,7 @@ pub fn verify_block_notification(
         &notification.blocked,
         notification.signing_key_id,
         notification.timestamp,
-    );
+    )?;
     verify_ed25519_signature(blocker_public_key, &hash, &notification.signature)
 }
 
@@ -896,13 +896,18 @@ pub fn aes128gcm_decrypt(
 /// Variable-length fields are prefixed with their length as a 4-byte
 /// big-endian u32 to prevent field-boundary ambiguity. The domain separator
 /// prevents cross-protocol hash confusion.
-#[must_use]
+///
+/// # Errors
+///
+/// Returns [`SenderKeyError::VerificationFailed`] if any field exceeds the
+/// canonical hash length-prefix ceiling (`u32::MAX` bytes). This cannot occur
+/// in practice — protocol messages are bounded to 256 KB (§9.10.3).
 pub fn compute_epoch_advance_hash(
     context_id: &str,
     sender_did: &str,
     epoch: u64,
     signer_key_ref: SigningKeyId,
-) -> Vec<u8> {
+) -> Result<Vec<u8>, SenderKeyError> {
     use crate::crypto::canonical::{CanonicalField, canonical_hash};
 
     // Field order per §9.5.2: context_id, sender_did, "key_epoch" literal, epoch, signer_key_ref.
@@ -916,7 +921,8 @@ pub fn compute_epoch_advance_hash(
             CanonicalField::VarBytes(signer_key_ref.as_bytes()),
         ],
     )
-    .to_vec()
+    .map(|h| h.to_vec())
+    .map_err(|e| SenderKeyError::VerificationFailed(format!("canonical hash failed: {e}")))
 }
 
 /// Computes `SHA-256("SCP-KEY-REQUEST-V1:" || len(requester_did) || requester_did
@@ -927,7 +933,12 @@ pub fn compute_epoch_advance_hash(
 /// big-endian u32 to prevent field-boundary ambiguity. The domain separator
 /// prevents cross-protocol hash confusion. `nonce` is fixed-size
 /// (`REQUEST_NONCE_SIZE`) and needs no prefix.
-#[must_use]
+///
+/// # Errors
+///
+/// Returns [`SenderKeyError::VerificationFailed`] if any field exceeds the
+/// canonical hash length-prefix ceiling (`u32::MAX` bytes). This cannot occur
+/// in practice — protocol messages are bounded to 256 KB (§9.10.3).
 pub fn compute_request_hash(
     requester_did: &str,
     sender_did: &str,
@@ -935,7 +946,7 @@ pub fn compute_request_hash(
     wrapping_pubkey: &[u8],
     nonce: &[u8; REQUEST_NONCE_SIZE],
     timestamp: u64,
-) -> Vec<u8> {
+) -> Result<Vec<u8>, SenderKeyError> {
     use crate::crypto::canonical::{CanonicalField, canonical_hash};
 
     // Field order per §9.5.2: requester_did, sender_did, epoch, wrapping_pubkey, nonce, timestamp.
@@ -950,7 +961,8 @@ pub fn compute_request_hash(
             CanonicalField::U64(timestamp),
         ],
     )
-    .to_vec()
+    .map(|h| h.to_vec())
+    .map_err(|e| SenderKeyError::VerificationFailed(format!("canonical hash failed: {e}")))
 }
 
 /// Computes the block notification hash for sender key blocking.
@@ -962,7 +974,12 @@ pub fn compute_request_hash(
 /// Variable-length fields are prefixed with their length as a 4-byte
 /// big-endian u32 to prevent field-boundary ambiguity. The domain separator
 /// prevents cross-protocol hash confusion.
-#[must_use]
+///
+/// # Errors
+///
+/// Returns [`SenderKeyError::VerificationFailed`] if any field exceeds the
+/// canonical hash length-prefix ceiling (`u32::MAX` bytes). This cannot occur
+/// in practice — protocol messages are bounded to 256 KB (§9.10.3).
 #[allow(clippy::similar_names)] // blocker_did/blocked_did are domain terms
 pub fn compute_block_notification_hash(
     context_id: &str,
@@ -970,7 +987,7 @@ pub fn compute_block_notification_hash(
     blocked_did: &str,
     signing_key_id: SigningKeyId,
     timestamp: u64,
-) -> Vec<u8> {
+) -> Result<Vec<u8>, SenderKeyError> {
     use crate::crypto::canonical::{CanonicalField, canonical_hash};
 
     // Field order per ADR-007 §6: context_id, blocker_did, blocked_did, signing_key_id, timestamp.
@@ -984,7 +1001,8 @@ pub fn compute_block_notification_hash(
             CanonicalField::U64(timestamp),
         ],
     )
-    .to_vec()
+    .map(|h| h.to_vec())
+    .map_err(|e| SenderKeyError::VerificationFailed(format!("canonical hash failed: {e}")))
 }
 
 /// Verifies an Ed25519 signature against a public key and message using
@@ -1419,8 +1437,10 @@ mod tests {
 
     #[test]
     fn epoch_advance_hash_boundary_shift_produces_different_hash() {
-        let hash_a = compute_epoch_advance_hash("ctx-AB", "did:key:CD", 1, SigningKeyId::Active);
-        let hash_b = compute_epoch_advance_hash("ctx-ABC", "did:key:D", 1, SigningKeyId::Active);
+        let hash_a =
+            compute_epoch_advance_hash("ctx-AB", "did:key:CD", 1, SigningKeyId::Active).unwrap();
+        let hash_b =
+            compute_epoch_advance_hash("ctx-ABC", "did:key:D", 1, SigningKeyId::Active).unwrap();
         assert_ne!(
             hash_a, hash_b,
             "shifting bytes between context_id and sender_did must produce different hashes"
@@ -1430,8 +1450,10 @@ mod tests {
     #[test]
     fn request_hash_boundary_shift_produces_different_hash() {
         let nonce = [0u8; REQUEST_NONCE_SIZE];
-        let hash_a = compute_request_hash("did:key:AB", "did:key:CD", 1, &[0xAA], &nonce, 100);
-        let hash_b = compute_request_hash("did:key:ABC", "did:key:D", 1, &[0xAA], &nonce, 100);
+        let hash_a =
+            compute_request_hash("did:key:AB", "did:key:CD", 1, &[0xAA], &nonce, 100).unwrap();
+        let hash_b =
+            compute_request_hash("did:key:ABC", "did:key:D", 1, &[0xAA], &nonce, 100).unwrap();
         assert_ne!(
             hash_a, hash_b,
             "shifting bytes between requester_did and sender_did must produce different hashes"
@@ -1446,14 +1468,16 @@ mod tests {
             "did:key:CD",
             SigningKeyId::Active,
             100,
-        );
+        )
+        .unwrap();
         let hash_b = compute_block_notification_hash(
             "ctx-1",
             "did:key:ABC",
             "did:key:D",
             SigningKeyId::Active,
             100,
-        );
+        )
+        .unwrap();
         assert_ne!(
             hash_a, hash_b,
             "shifting bytes between blocker_did and blocked_did must produce different hashes"

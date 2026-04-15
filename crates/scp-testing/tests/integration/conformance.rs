@@ -244,7 +244,8 @@ fn conf_004_agent_binding_attestation() {
             CanonicalField::Absent, // expires_at: None → Absent per V2 spec
             CanonicalField::VarBytes(&revocation_active_bytes),
         ],
-    );
+    )
+    .unwrap();
     let hash: [u8; 32] = Sha256::digest(&attestation_payload).into();
 
     print_step(2, "Sign attestation with human's active key");
@@ -651,7 +652,8 @@ fn conf_014_send_message_pipeline() {
             CanonicalField::Absent,
             CanonicalField::VarBytes(b"#active"),
         ],
-    );
+    )
+    .unwrap();
 
     print_step(2, "Sign with canonical hash");
     let signature = signing_key.sign(&hash);
@@ -746,7 +748,8 @@ fn conf_015_receive_message_pipeline() {
             CanonicalField::Absent,
             CanonicalField::VarBytes(b"#active"),
         ],
-    );
+    )
+    .unwrap();
     let signature = signing_key.sign(&hash);
     signing_key
         .verifying_key()
@@ -1667,7 +1670,8 @@ fn conf_037_shadow_identity() {
             CanonicalField::VarBytes(b"bridge-ctx"),
             CanonicalField::U64(1_700_000_000),
         ],
-    );
+    )
+    .unwrap();
     let claim_hash: [u8; 32] = Sha256::digest(&claim_bytes).into();
     println!("    Claim hash: 0x{}", hex(&claim_hash));
 

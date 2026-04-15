@@ -237,6 +237,7 @@ fn compute_attestation_canonical_bytes(attestation: &Attestation) -> Vec<u8> {
             CanonicalField::VarBytes(&revocation_bytes),
         ],
     )
+    .unwrap()
     .to_vec()
 }
 

@@ -180,7 +180,7 @@ pub async fn request_access_key(
         &nonce,
         timestamp,
         wrapping_pubkey.as_bytes(),
-    );
+    )?;
 
     let signature = key_custody
         .sign(signing_key, &hash)
@@ -226,7 +226,7 @@ pub fn verify_access_key_request(
         &request.nonce,
         request.timestamp,
         &request.wrapping_pubkey,
-    );
+    )?;
     verify_ed25519_signature(requester_public_key, &hash, &request.signature)
 }
 
@@ -577,7 +577,7 @@ fn compute_request_hash(
     nonce: &[u8; ACCESS_KEY_NONCE_SIZE],
     timestamp: u64,
     wrapping_pubkey: &[u8],
-) -> Vec<u8> {
+) -> Result<Vec<u8>, AccessKeyError> {
     use scp_protocol::crypto::canonical::{CanonicalField, canonical_hash};
 
     canonical_hash(
@@ -590,7 +590,8 @@ fn compute_request_hash(
             CanonicalField::RawBytes(wrapping_pubkey),
         ],
     )
-    .to_vec()
+    .map(|h| h.to_vec())
+    .map_err(|e| AccessKeyError::VerificationFailed(format!("canonical hash failed: {e}")))
 }
 
 /// Verifies an Ed25519 signature, delegating to the canonical
@@ -1043,7 +1044,8 @@ mod tests {
             &nonce,
             timestamp,
             &wrapping_public.to_bytes(),
-        );
+        )
+        .unwrap();
         let sig = signing_key.sign(&hash);
 
         let request = AccessKeyRequest {
@@ -1125,7 +1127,8 @@ mod tests {
             &nonce,
             timestamp,
             &wrapping_public.to_bytes(),
-        );
+        )
+        .unwrap();
         let sig = signing_key.sign(&hash);
 
         let request = AccessKeyRequest {
@@ -1166,8 +1169,10 @@ mod tests {
         let nonce_a = [0xAAu8; ACCESS_KEY_NONCE_SIZE];
         let nonce_b = [0xBBu8; ACCESS_KEY_NONCE_SIZE];
 
-        let hash_a = compute_request_hash("ctx-1", "did:dht:bob", &nonce_a, 100, &[0u8; 32]);
-        let hash_b = compute_request_hash("ctx-1", "did:dht:bob", &nonce_b, 100, &[0u8; 32]);
+        let hash_a =
+            compute_request_hash("ctx-1", "did:dht:bob", &nonce_a, 100, &[0u8; 32]).unwrap();
+        let hash_b =
+            compute_request_hash("ctx-1", "did:dht:bob", &nonce_b, 100, &[0u8; 32]).unwrap();
 
         assert_ne!(hash_a, hash_b);
     }

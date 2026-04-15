@@ -153,8 +153,14 @@ impl ContextSnapshot {
     /// Composite fields (`members`, `role_definitions`, `tool_names`) are first
     /// hashed deterministically, then included as `Fixed32` fields.
     /// Domain separator: `"SCP-CONTEXT-SNAPSHOT-V1:"`.
-    #[must_use]
-    pub fn canonical_hash(&self) -> [u8; 32] {
+    ///
+    /// # Errors
+    ///
+    /// Returns [`scp_protocol::crypto::canonical::CanonicalError`] if any
+    /// variable-length field exceeds `u32::MAX` bytes.
+    pub fn canonical_hash(
+        &self,
+    ) -> Result<[u8; 32], scp_protocol::crypto::canonical::CanonicalError> {
         let members_hash = self.hash_members();
         let role_defs_hash = self.hash_role_definitions();
         let tool_names_hash = self.hash_tool_names();

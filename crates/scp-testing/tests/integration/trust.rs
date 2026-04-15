@@ -194,7 +194,8 @@ fn make_signed_attestation(
                 .map_or(CanonicalField::Absent, CanonicalField::U64),
             CanonicalField::VarBytes(&revocation_bytes),
         ],
-    );
+    )
+    .unwrap();
     let sig = sk.sign(&canonical);
     att.signature = sig.to_bytes().to_vec();
 

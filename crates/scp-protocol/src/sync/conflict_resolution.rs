@@ -658,7 +658,7 @@ pub fn fork_context(
 
     // Generate a deterministic forked context ID from the original ID and
     // the fork point. This ensures all members compute the same fork ID.
-    let forked_id = generate_fork_id(&original.context_id, fork_point);
+    let forked_id = generate_fork_id(&original.context_id, fork_point)?;
 
     Ok(ContextFork {
         original_context_id: original.context_id.clone(),
@@ -678,7 +678,10 @@ pub fn fork_context(
 ///
 /// Uses the canonical hash infrastructure with a domain separator and
 /// length-prefixed variable-length fields per the post-#371 standard.
-fn generate_fork_id(original_context_id: &str, fork_point: &MerkleRoot) -> String {
+fn generate_fork_id(
+    original_context_id: &str,
+    fork_point: &MerkleRoot,
+) -> Result<String, ConflictResolutionError> {
     use crate::crypto::canonical::{CanonicalField, canonical_hash};
 
     let hash = canonical_hash(
@@ -687,7 +690,10 @@ fn generate_fork_id(original_context_id: &str, fork_point: &MerkleRoot) -> Strin
             CanonicalField::VarBytes(original_context_id.as_bytes()),
             CanonicalField::Fixed32(fork_point),
         ],
-    );
+    )
+    .map_err(|e| ConflictResolutionError::NotConflicting {
+        reason: format!("canonical hash failed: {e}"),
+    })?;
     let hex: String = hash[..16]
         .iter()
         .fold(String::with_capacity(32), |mut s, b| {
@@ -695,7 +701,7 @@ fn generate_fork_id(original_context_id: &str, fork_point: &MerkleRoot) -> Strin
             let _ = write!(s, "{b:02x}");
             s
         });
-    format!("fork-{hex}")
+    Ok(format!("fork-{hex}"))
 }
 
 // ---------------------------------------------------------------------------

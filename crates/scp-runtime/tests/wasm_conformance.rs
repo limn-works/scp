@@ -1797,7 +1797,8 @@ fn wasm_attestation_canonical_bytes_match_core() {
             CanonicalField::VarBytes(&evidence_msgpack),
             CanonicalField::VarBytes(&revocation_msgpack),
         ],
-    );
+    )
+    .unwrap();
     assert_eq!(
         core_bytes,
         hash_fn_bytes.to_vec(),

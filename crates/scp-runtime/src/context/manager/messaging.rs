@@ -104,7 +104,8 @@ fn build_broadcast_envelope(
             nonce: &nonce,
             provenance_hash: &provenance_hash,
         },
-    );
+    )
+    .map_err(|e| ContextError::CryptoFailed(e.to_string()))?;
     let signature = ed25519_dalek::Signer::sign(signing_key, &signing_payload);
     bc.publish(sender_did, payload, timestamp, signature, &nonce, None)
 }

@@ -362,8 +362,14 @@ impl CommitRangeRequest {
     ///
     /// Field order: `context_id`, `from_epoch`, `to_epoch`, `requester_did`.
     /// Domain separator: `"SCP-COMMIT-RANGE-REQ-V1:"`.
-    #[must_use]
-    pub fn canonical_hash(&self) -> [u8; 32] {
+    ///
+    /// # Errors
+    ///
+    /// Returns [`scp_protocol::crypto::canonical::CanonicalError`] if any
+    /// variable-length field exceeds `u32::MAX` bytes.
+    pub fn canonical_hash(
+        &self,
+    ) -> Result<[u8; 32], scp_protocol::crypto::canonical::CanonicalError> {
         canonical_hash(
             COMMIT_RANGE_REQUEST_DOMAIN_SEPARATOR,
             &[
@@ -402,8 +408,14 @@ impl CommitRangeResponse {
     /// prefix, then the concatenation is wrapped in an outer `BE32(len)` prefix.
     /// Field order: `context_id`, `commits_concat`, `responder_did`.
     /// Domain separator: `"SCP-COMMIT-RANGE-RESP-V1:"`.
-    #[must_use]
-    pub fn canonical_hash(&self) -> [u8; 32] {
+    ///
+    /// # Errors
+    ///
+    /// Returns [`scp_protocol::crypto::canonical::CanonicalError`] if any
+    /// variable-length field exceeds `u32::MAX` bytes.
+    pub fn canonical_hash(
+        &self,
+    ) -> Result<[u8; 32], scp_protocol::crypto::canonical::CanonicalError> {
         // Build length-prefixed concatenation of commits.
         let commits_concat = self.encode_commits();
         canonical_hash(

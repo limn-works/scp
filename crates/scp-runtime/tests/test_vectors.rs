@@ -128,7 +128,7 @@ fn vector_2_variable_length_field_encoding() {
     assert_eq!(hex(&expected), "000000106469643a6468743a7a364d6b54657374");
 
     // Verify via canonical_hash_bytes
-    let canonical = canonical_hash_bytes(b"", &[CanonicalField::VarBytes(field_bytes)]);
+    let canonical = canonical_hash_bytes(b"", &[CanonicalField::VarBytes(field_bytes)]).unwrap();
     assert_eq!(canonical, expected);
 }
 
@@ -141,7 +141,7 @@ fn vector_3_fixed_length_u64_encoding() {
     assert_eq!(hex(&encoded), "000000006553f100");
 
     // Verify via canonical_hash_bytes
-    let canonical = canonical_hash_bytes(b"", &[CanonicalField::U64(value)]);
+    let canonical = canonical_hash_bytes(b"", &[CanonicalField::U64(value)]).unwrap();
     assert_eq!(canonical, encoded);
 }
 
@@ -157,7 +157,7 @@ fn vector_4_absent_sentinel() {
     assert_eq!(sentinel, ABSENT_SENTINEL);
 
     // Verify via canonical_hash_bytes
-    let canonical = canonical_hash_bytes(b"", &[CanonicalField::Absent]);
+    let canonical = canonical_hash_bytes(b"", &[CanonicalField::Absent]).unwrap();
     assert_eq!(canonical, sentinel);
 }
 
@@ -201,7 +201,8 @@ fn vector_5_minimal_inner_envelope_canonical_hash() {
             CanonicalField::Absent, // provenance_hash absent
             CanonicalField::VarBytes(signing_key_id),
         ],
-    );
+    )
+    .unwrap();
 
     // Manually construct the same bytes for independent verification.
     let bytes = canonical_hash_bytes(
@@ -217,7 +218,8 @@ fn vector_5_minimal_inner_envelope_canonical_hash() {
             CanonicalField::Absent,
             CanonicalField::VarBytes(signing_key_id),
         ],
-    );
+    )
+    .unwrap();
 
     println!("  Canonical hash input length: {} bytes", bytes.len());
     // 22 (domain) + (4+15) + (4+16) + 8 + 8 + 8 + 8 + (4+32) + 32 (Absent: raw, no prefix) + (4+7) = 172
@@ -265,7 +267,8 @@ fn vector_6_inner_envelope_with_provenance() {
             CanonicalField::VarBytes(&provenance_hash), // present provenance
             CanonicalField::VarBytes(b"#active"),
         ],
-    );
+    )
+    .unwrap();
 
     let hash_without = canonical_hash(
         "SCP-INNER-ENVELOPE-V1:",
@@ -280,7 +283,8 @@ fn vector_6_inner_envelope_with_provenance() {
             CanonicalField::Absent,
             CanonicalField::VarBytes(b"#active"),
         ],
-    );
+    )
+    .unwrap();
 
     print_vec("Hash with provenance", &hash_with_provenance);
     print_vec("Hash without provenance", &hash_without);
@@ -323,7 +327,8 @@ fn vector_7_approval_vote() {
             CanonicalField::VarBytes(vote_json),
             CanonicalField::U64(timestamp),
         ],
-    );
+    )
+    .unwrap();
 
     let bytes = canonical_hash_bytes(
         b"SCP-VOTE-V1:",
@@ -333,7 +338,8 @@ fn vector_7_approval_vote() {
             CanonicalField::VarBytes(vote_json),
             CanonicalField::U64(timestamp),
         ],
-    );
+    )
+    .unwrap();
 
     println!("  Canonical hash input length: {} bytes", bytes.len());
     // 12 (domain) + 32 (Fixed32) + (4+17) + (4+9) + 8 = 12 + 32 + 21 + 13 + 8 = 86
@@ -796,7 +802,8 @@ fn vector_22_shadow_claim_hash() {
             CanonicalField::VarBytes(context_id),
             CanonicalField::U64(timestamp),
         ],
-    );
+    )
+    .unwrap();
 
     println!("  Canonical hash input length: {} bytes", bytes.len());
     // 13 (domain) + (4+20) + (4+17) + (4+19) + 8 = 13 + 24 + 21 + 23 + 8 = 89
@@ -830,7 +837,8 @@ fn vector_23_governance_proposal_id() {
             CanonicalField::VarBytes(proposer_did),
             CanonicalField::U64(timestamp),
         ],
-    );
+    )
+    .unwrap();
 
     println!("  Canonical hash input length: {} bytes", bytes.len());
     // 16 (domain) + (4+20) + 32 + (4+20) + 8 = 16 + 24 + 32 + 24 + 8 = 104
@@ -991,7 +999,8 @@ fn vector_26_identity_link_attestation() {
             CanonicalField::VarBytes(&evidence_bytes),
             CanonicalField::VarBytes(&revocation_status_bytes),
         ],
-    );
+    )
+    .unwrap();
 
     let hash: [u8; 32] = Sha256::digest(&canonical).into();
     print_vec("Identity link attestation canonical hash (V1)", &hash);

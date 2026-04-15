@@ -167,7 +167,8 @@ pub async fn scpid_sign(
             CanonicalField::VarBytes(challenge.audience.as_bytes()),
             CanonicalField::U64(signed_at),
         ],
-    );
+    )
+    .map_err(|e| ScpIdError::SigningFailed(format!("canonical hash failed: {e}")))?;
 
     // Sign via KeyCustody.
     let signature = custody
@@ -323,7 +324,8 @@ pub async fn scpid_verify(
             CanonicalField::VarBytes(response.audience.as_bytes()),
             CanonicalField::U64(response.signed_at),
         ],
-    );
+    )
+    .map_err(|e| ScpIdError::SigningFailed(format!("canonical hash failed: {e}")))?;
 
     // Step 10: Verify Ed25519 signature (strict mode — rejects small-order points).
     verify_ed25519_signature(&public_key_bytes, &hash, &response.signature)
@@ -569,7 +571,8 @@ mod tests {
                 CanonicalField::VarBytes(audience.as_bytes()),
                 CanonicalField::U64(signed_at),
             ],
-        );
+        )
+        .unwrap();
 
         // Independently computed expected value (verified with Python):
         //   import hashlib, struct
@@ -633,7 +636,8 @@ mod tests {
                 CanonicalField::VarBytes(b"https://example.com"),
                 CanonicalField::U64(response.signed_at),
             ],
-        );
+        )
+        .unwrap();
 
         let pk_bytes: [u8; 32] = pubkey.as_bytes().try_into().unwrap();
         let verifying_key = ed25519_dalek::VerifyingKey::from_bytes(&pk_bytes).unwrap();
@@ -679,7 +683,8 @@ mod tests {
                 CanonicalField::VarBytes(b"https://agent-service.example.com"),
                 CanonicalField::U64(response.signed_at),
             ],
-        );
+        )
+        .unwrap();
 
         let pk_bytes: [u8; 32] = pubkey.as_bytes().try_into().unwrap();
         let verifying_key = ed25519_dalek::VerifyingKey::from_bytes(&pk_bytes).unwrap();
