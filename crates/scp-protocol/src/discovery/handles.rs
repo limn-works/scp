@@ -82,7 +82,7 @@ pub struct HandleRegisterResult {
 
 /// The outcome of a handle registration attempt.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
+#[serde(rename_all = "snake_case")]
 pub enum HandleRegisterStatus {
     /// The handle was successfully registered.
     Registered,
