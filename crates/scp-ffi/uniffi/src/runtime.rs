@@ -217,10 +217,12 @@ fn build_default_context_manager() -> Arc<ContextManager> {
 /// `register_local_did` / `is_local_did` only access the DID registry, not
 /// transport or crypto, and should not require a prior `context_create` call.
 pub fn context_manager_expect() -> &'static Arc<ContextManager> {
-    let cm = CONTEXT_MANAGER.get_or_init(build_default_context_manager);
-    // Ensure BridgeInstance is populated even for auto-init paths.
-    init_bridge_instance(cm.clone(), "did:none:not-configured");
-    cm
+    // Do NOT call init_bridge_instance here — BridgeInstance should only
+    // be created when a real DID is known (via init_context_manager_with_did
+    // or init_context_manager_with_relay_transport). Populating with a
+    // placeholder DID permanently locks the OnceLock and prevents the real
+    // DID from being stored.
+    CONTEXT_MANAGER.get_or_init(build_default_context_manager)
 }
 
 /// Initializes the global [`ContextManager`] with bridge-local providers.
@@ -228,21 +230,13 @@ pub fn context_manager_expect() -> &'static Arc<ContextManager> {
 /// This is called during `context_create` to ensure the manager is ready
 /// before any context operations.
 ///
-/// Also populates the global [`BridgeInstance`] with the same `ContextManager`
-/// and a synthetic DID (`"did:none:not-configured"`), enabling incremental
-/// migration of per-registry singletons to the consolidated `BridgeInstance`
-/// (#1549). The DID-aware variants ([`init_context_manager_with_did`] and
-/// [`init_context_manager_with_relay_transport`]) store the real DID.
+/// Does NOT populate the [`BridgeInstance`] — no real DID is available at
+/// this point. The DID-aware variants ([`init_context_manager_with_did`]
+/// and [`init_context_manager_with_relay_transport`]) populate both.
 ///
 /// Subsequent calls are no-ops (`OnceLock` guarantees single initialization).
 pub fn init_context_manager() {
-    let cm_arc = CONTEXT_MANAGER
-        .get_or_init(build_default_context_manager)
-        .clone();
-
-    // Populate the BridgeInstance with the same ContextManager.
-    // No-op if already set (OnceLock guarantees single initialization).
-    init_bridge_instance(cm_arc, "did:none:not-configured");
+    let _ = CONTEXT_MANAGER.get_or_init(build_default_context_manager);
 }
 
 /// Initializes the global [`ContextManager`] with [`MlsCryptoProvider`]
