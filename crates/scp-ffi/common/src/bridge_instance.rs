@@ -66,6 +66,18 @@ pub struct KnownContext {
 /// Multiple instances can coexist (different identities, test isolation).
 /// Mobile platforms use `shutdown()` for lifecycle cleanup.
 ///
+/// # `OnceLock` limitation — shutdown is terminal
+///
+/// Each non-WASM FFI bridge stores its `BridgeInstance` in a
+/// `OnceLock<Arc<BridgeInstance>>`. `OnceLock` does not support re-initialization
+/// after the first `get_or_init` call, so once `shutdown()` is called the
+/// bridge cannot be re-created within the same process. This is deliberate:
+/// shutdown is a final cleanup step (process exit, test teardown).
+///
+/// For mobile app lifecycle (background/foreground), use `suspend()` /
+/// `resume()` instead — these toggle the `suspended` flag and
+/// disconnect/reconnect transport without touching the `OnceLock`.
+///
 /// # Invariants
 ///
 /// - `local_did` is immutable after construction.
@@ -205,8 +217,10 @@ impl BridgeInstance {
         if self.is_shutdown() {
             return Ok(());
         }
-        self.clear_transport()?;
+        // Set flag FIRST to prevent new operations from starting between
+        // flag check and transport teardown.
         self.suspended.store(true, Ordering::SeqCst);
+        self.clear_transport()?;
         tracing::info!(local_did = %self.local_did, "bridge instance suspended");
         Ok(())
     }
@@ -268,16 +282,6 @@ impl BridgeInstance {
     // -----------------------------------------------------------------
     // Transport accessors
     // -----------------------------------------------------------------
-
-    /// Returns a reference to the transport `RwLock`.
-    ///
-    /// Callers acquire a read or write lock as needed. Prefer the convenience
-    /// methods ([`set_transport`], [`clear_transport`], [`with_transport`],
-    /// [`with_transport_mut`]) for common patterns.
-    #[must_use]
-    pub const fn transport_lock(&self) -> &RwLock<Option<Arc<scp_transport::TransportManager>>> {
-        &self.transport
-    }
 
     /// Stores a new `TransportManager` (called after relay connect).
     ///

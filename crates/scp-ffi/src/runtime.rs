@@ -162,11 +162,20 @@ fn init_bridge_instance(context_manager: Arc<ContextManager>, local_did: &str) {
 /// # Errors
 ///
 /// Returns `ScpPyError::ContextError` if the bridge has not been initialized
-/// via [`init_context_manager`] (which also creates the `BridgeInstance`).
+/// via [`init_context_manager`] (which also creates the `BridgeInstance`),
+/// or if the bridge has been permanently shut down.
 pub fn bridge_instance() -> Result<&'static Arc<BridgeInstance>, ScpPyError> {
-    BRIDGE_INSTANCE.get().ok_or_else(|| {
+    let bi = BRIDGE_INSTANCE.get().ok_or_else(|| {
         ScpPyError::context("bridge not initialized — call identity_create first".to_owned())
-    })
+    })?;
+    if bi.is_shutdown() {
+        return Err(ScpPyError::context(
+            "bridge has been shut down — OnceLock prevents re-initialization \
+             within the same process; use suspend/resume for mobile lifecycle"
+                .to_owned(),
+        ));
+    }
+    Ok(bi)
 }
 
 // ---------------------------------------------------------------------------

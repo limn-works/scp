@@ -174,14 +174,24 @@ fn init_bridge_instance(context_manager: Arc<ContextManager>, local_did: &str) {
 /// # Errors
 ///
 /// Returns `napi::Error` if the bridge has not been initialized via
-/// [`init_context_manager`] (which also creates the `BridgeInstance`).
+/// [`init_context_manager`] (which also creates the `BridgeInstance`),
+/// or if the bridge has been permanently shut down.
 pub fn bridge_instance() -> napi::Result<&'static Arc<BridgeInstance>> {
-    BRIDGE_INSTANCE.get().ok_or_else(|| {
+    let bi = BRIDGE_INSTANCE.get().ok_or_else(|| {
         napi::Error::from(ScpNapiError::Context {
             message: "bridge not initialized — call identityCreate first".to_owned(),
             code: codes::CTX_2000.to_owned(),
         })
-    })
+    })?;
+    if bi.is_shutdown() {
+        return Err(napi::Error::from(ScpNapiError::Context {
+            message: "bridge has been shut down — OnceLock prevents re-initialization \
+                      within the same process; use suspend/resume for mobile lifecycle"
+                .to_owned(),
+            code: codes::CTX_2000.to_owned(),
+        }));
+    }
+    Ok(bi)
 }
 
 /// Initializes the global [`ContextManager`] with production providers.
