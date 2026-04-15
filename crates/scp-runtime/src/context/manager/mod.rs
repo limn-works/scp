@@ -2078,6 +2078,64 @@ impl ContextManager {
     }
 
     // -----------------------------------------------------------------
+    // Persistence flush (sync, best-effort)
+    // -----------------------------------------------------------------
+
+    /// Persists all currently-unlocked contexts as a best-effort snapshot flush.
+    ///
+    /// Iterates the context map and, for each context that can be locked
+    /// without blocking (via [`Mutex::try_lock`]), takes a snapshot and calls
+    /// [`ContextPersistence::persist_context`]. Contexts held by other tasks
+    /// are silently skipped — this is deliberate; their in-progress mutations
+    /// will be persisted by the normal per-operation persistence path.
+    ///
+    /// Intended for use by [`BridgeInstance::suspend`] and
+    /// [`BridgeInstance::shutdown`] to flush state before transport is
+    /// torn down or MLS groups are destroyed. Errors from individual
+    /// contexts are logged and do not abort the flush.
+    ///
+    /// No-op if no persistence provider is configured.
+    pub fn flush_all_contexts_sync(&self) {
+        if !self.has_persistence() {
+            return;
+        }
+        // Collect Arcs first to avoid holding DashMap shard locks.
+        let arcs = self.collect_context_arcs();
+        let mut flushed = 0usize;
+        let mut skipped = 0usize;
+        for (context_id, arc) in arcs {
+            match arc.try_lock() {
+                Ok(ctx) => {
+                    let snapshot = Self::snapshot_context(&ctx);
+                    let bc_snapshot = ctx
+                        .broadcast_context
+                        .as_ref()
+                        .map(BroadcastContext::to_snapshot);
+                    drop(ctx);
+                    self.persist_context_snapshot(&context_id, snapshot);
+                    if let Some(ref bcs) = bc_snapshot {
+                        self.persist_broadcast_snapshot(&context_id, bcs);
+                    }
+                    flushed += 1;
+                }
+                Err(_) => {
+                    // Context is locked by an in-progress operation — skip it.
+                    // That operation's normal completion path will persist the
+                    // final state.
+                    skipped += 1;
+                }
+            }
+        }
+        tracing::debug!(
+            flushed,
+            skipped,
+            "flush_all_contexts_sync: flushed {} context(s), skipped {} locked",
+            flushed,
+            skipped,
+        );
+    }
+
+    // -----------------------------------------------------------------
     // Per-context lock helpers (DashMap → Arc<Mutex<PerContextState>>)
     // -----------------------------------------------------------------
 

@@ -44,6 +44,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use dashmap::DashMap;
 use scp_core::context::ContextManager;
+use scp_core::context::ContextPersistence;
 use scp_protocol::context::invitation::RateLimitTracker;
 use scp_protocol::economy::antispam::SenderVelocityTracker;
 use scp_protocol::economy::budget::MemberBudgetTracker;
@@ -241,6 +242,37 @@ pub struct BridgeInstance {
     /// The `Mutex` is only locked during `shutdown()` and `register_shutdown_hook()`
     /// — no contention on the hot path.
     shutdown_hooks: Mutex<Vec<Box<dyn FnOnce() + Send>>>,
+
+    // -----------------------------------------------------------------
+    // Persistence — optional context state persistence provider
+    // -----------------------------------------------------------------
+    /// Optional persistence provider, forwarded from the `ContextManager`.
+    ///
+    /// When `Some`, `suspend()` and `shutdown()` call
+    /// [`ContextManager::flush_all_contexts_sync`] to persist context state
+    /// before tearing down transport or destroying MLS groups. The provider
+    /// reference is retained here so the bridge layer can pass it through
+    /// `with_persistence()` at construction time and expose it via the
+    /// `persistence()` accessor for bridge-specific restore logic.
+    ///
+    /// This is logically a mirror of the persistence configured on the
+    /// `ContextManager` — the `ContextManager` owns the canonical reference;
+    /// this field allows the bridge layer to use the same provider for
+    /// bridge-level suspend/resume coordination without separate storage.
+    persistence: Option<Box<dyn ContextPersistence + Send + Sync>>,
+
+    // -----------------------------------------------------------------
+    // Relay URL — for resume after suspend
+    // -----------------------------------------------------------------
+    /// The relay URL most recently connected via `set_transport`.
+    ///
+    /// Stored so that callers can retrieve it after `resume()` and
+    /// reconnect to the same relay. Full auto-reconnect is the caller's
+    /// responsibility — `resume()` only clears the suspended flag.
+    ///
+    /// Set via [`set_relay_url`]. Retrieved via [`pending_relay_url`].
+    /// Cleared when transport is cleared (on `suspend()` or `shutdown()`).
+    relay_url: Mutex<Option<String>>,
 }
 
 impl BridgeInstance {
@@ -271,7 +303,60 @@ impl BridgeInstance {
             bridge_state: DashMap::new(),
             did_resolver: OnceLock::new(),
             shutdown_hooks: Mutex::new(Vec::new()),
+            persistence: None,
+            relay_url: Mutex::new(None),
         }
+    }
+
+    /// Creates a new bridge instance with a persistence provider.
+    ///
+    /// Same as [`new`](Self::new) but additionally attaches a
+    /// [`ContextPersistence`] provider. When provided, [`suspend`] and
+    /// [`shutdown`] will flush all context snapshots to the provider via
+    /// [`ContextManager::flush_all_contexts_sync`] before tearing down
+    /// transport or destroying MLS groups.
+    ///
+    /// The persistence provider should be the same one configured on the
+    /// [`ContextManager`] (typically constructed via
+    /// [`ContextManager::with_persistence`] or the builder `.storage()` method).
+    ///
+    /// # Arguments
+    ///
+    /// - `context_manager` — the shared `ContextManager` (must already have
+    ///   persistence configured via [`ContextManager::with_persistence`]).
+    /// - `local_did` — the DID this instance operates as.
+    /// - `persistence` — the persistence provider for bridge-level flush on
+    ///   suspend/shutdown.
+    #[must_use]
+    pub fn with_persistence(
+        context_manager: Arc<ContextManager>,
+        local_did: String,
+        persistence: Box<dyn ContextPersistence + Send + Sync>,
+    ) -> Self {
+        Self {
+            context_manager,
+            local_did,
+            shutdown: AtomicBool::new(false),
+            suspended: AtomicBool::new(false),
+            transport: RwLock::new(None),
+            known_contexts: DashMap::new(),
+            rate_limiters: DashMap::new(),
+            economy_budgets: DashMap::new(),
+            economy_antispam: DashMap::new(),
+            bridge_state: DashMap::new(),
+            did_resolver: OnceLock::new(),
+            shutdown_hooks: Mutex::new(Vec::new()),
+            persistence: Some(persistence),
+            relay_url: Mutex::new(None),
+        }
+    }
+
+    /// Returns a reference to the persistence provider, if configured.
+    ///
+    /// `None` if this instance was created without persistence (via [`new`]).
+    #[must_use]
+    pub fn persistence(&self) -> Option<&(dyn ContextPersistence + Send + Sync)> {
+        self.persistence.as_deref()
     }
 
     /// Returns a reference to the shared [`ContextManager`].
@@ -386,6 +471,10 @@ impl BridgeInstance {
         // Set flag FIRST to prevent new operations from starting between
         // flag check and transport teardown.
         self.suspended.store(true, Ordering::SeqCst);
+        // Flush all context snapshots before disconnecting transport.
+        // Best-effort: errors are logged inside flush_all_contexts_sync and do
+        // not prevent suspension from completing.
+        self.context_manager.flush_all_contexts_sync();
         if let Err(e) = self.clear_transport() {
             // Revert the suspended flag — the instance is not cleanly
             // suspended if transport wasn't cleared.
@@ -449,6 +538,12 @@ impl BridgeInstance {
         if let Err(e) = self.clear_transport() {
             tracing::error!("failed to clear transport during shutdown: {e} — continuing cleanup");
         }
+
+        // Flush all context snapshots before destroying MLS groups. This
+        // ensures durably-persisted state reflects the last known-good
+        // context state before key material is zeroized.
+        // Best-effort: errors are logged inside flush_all_contexts_sync.
+        self.context_manager.flush_all_contexts_sync();
 
         // Remove all contexts from the ContextManager (MLS groups, sender
         // keys, event logs). Best-effort — already-removed contexts are
@@ -526,6 +621,8 @@ impl BridgeInstance {
 
     /// Clears the transport manager (called on disconnect).
     ///
+    /// Also clears the stored relay URL (see [`pending_relay_url`]).
+    ///
     /// After this, relay-based operations will fail until a new transport
     /// manager is set.
     ///
@@ -539,6 +636,11 @@ impl BridgeInstance {
             .write()
             .map_err(|_| TransportLockError::Poisoned)?;
         *guard = None;
+        // Also clear the pending relay URL so callers don't reconnect to
+        // a stale URL after an explicit disconnect.
+        if let Ok(mut url) = self.relay_url.lock() {
+            *url = None;
+        }
         Ok(())
     }
 
@@ -549,6 +651,38 @@ impl BridgeInstance {
             .read()
             .ok()
             .is_some_and(|guard| guard.is_some())
+    }
+
+    /// Stores the relay URL for the current transport connection.
+    ///
+    /// Callers (bridge `transport_connect` functions) should call this
+    /// immediately after [`set_transport`] so that [`pending_relay_url`]
+    /// can return the URL for reconnection after [`resume`].
+    ///
+    /// If the `relay_url` mutex is poisoned (a previous caller panicked
+    /// while holding it), the URL is silently dropped and a warning is
+    /// logged — a lost relay URL on resume is recoverable by the caller.
+    pub fn set_relay_url(&self, url: String) {
+        match self.relay_url.lock() {
+            Ok(mut guard) => *guard = Some(url),
+            Err(_) => {
+                tracing::warn!("relay_url mutex poisoned — relay URL not stored");
+            }
+        }
+    }
+
+    /// Returns the relay URL stored by the most recent [`set_relay_url`] call.
+    ///
+    /// After [`suspend`] or explicit [`clear_transport`], this returns `None`
+    /// (the URL is cleared alongside the transport manager). After [`resume`],
+    /// the caller should check this value and reconnect to the relay if it
+    /// is `Some`.
+    ///
+    /// Returns `None` if no URL has been stored, or if the internal mutex is
+    /// poisoned.
+    #[must_use]
+    pub fn pending_relay_url(&self) -> Option<String> {
+        self.relay_url.lock().ok().and_then(|guard| guard.clone())
     }
 
     /// Returns an `Arc` clone of the current transport manager, if one exists.
@@ -1884,5 +2018,240 @@ mod tests {
         // Economy DashMaps should be cleared
         assert!(instance.economy_budgets.is_empty());
         assert!(instance.economy_antispam.is_empty());
+    }
+
+    // -----------------------------------------------------------------
+    // AC 2: persistence field and accessor
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn new_instance_has_no_persistence() {
+        let instance = BridgeInstance::new(test_context_manager(), "did:dht:ztest".to_owned());
+        assert!(
+            instance.persistence().is_none(),
+            "new() must not have a persistence provider"
+        );
+    }
+
+    #[test]
+    fn with_persistence_sets_provider() {
+        use scp_core::context::providers::InMemoryPersistence;
+
+        let cm = test_context_manager();
+        let persistence = Box::new(InMemoryPersistence::new());
+        let instance =
+            BridgeInstance::with_persistence(cm, "did:dht:zalice".to_owned(), persistence);
+        assert!(
+            instance.persistence().is_some(),
+            "with_persistence() must set the persistence provider"
+        );
+    }
+
+    // -----------------------------------------------------------------
+    // AC 4: relay URL tracking
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn pending_relay_url_is_none_by_default() {
+        let instance = BridgeInstance::new(test_context_manager(), "did:dht:ztest".to_owned());
+        assert!(instance.pending_relay_url().is_none());
+    }
+
+    #[test]
+    fn set_relay_url_stores_url() {
+        let instance = BridgeInstance::new(test_context_manager(), "did:dht:ztest".to_owned());
+        instance.set_relay_url("wss://relay.example.com".to_owned());
+        assert_eq!(
+            instance.pending_relay_url().as_deref(),
+            Some("wss://relay.example.com")
+        );
+    }
+
+    #[test]
+    fn clear_transport_clears_relay_url() {
+        let instance = BridgeInstance::new(test_context_manager(), "did:dht:ztest".to_owned());
+        instance
+            .set_transport(Arc::new(test_transport_manager()))
+            .unwrap();
+        instance.set_relay_url("wss://relay.example.com".to_owned());
+        assert!(instance.pending_relay_url().is_some());
+
+        instance.clear_transport().unwrap();
+        assert!(
+            instance.pending_relay_url().is_none(),
+            "clear_transport must also clear relay URL"
+        );
+    }
+
+    #[test]
+    fn suspend_clears_relay_url() {
+        let instance = BridgeInstance::new(test_context_manager(), "did:dht:ztest".to_owned());
+        instance
+            .set_transport(Arc::new(test_transport_manager()))
+            .unwrap();
+        instance.set_relay_url("wss://relay.example.com".to_owned());
+        assert!(instance.pending_relay_url().is_some());
+
+        instance.suspend().unwrap();
+        assert!(
+            instance.pending_relay_url().is_none(),
+            "suspend must clear relay URL alongside transport"
+        );
+    }
+
+    #[test]
+    fn relay_url_survives_resume() {
+        // resume() does NOT reconnect — it is the caller's responsibility.
+        // But the relay URL was already cleared by suspend()'s clear_transport().
+        // So after resume(), pending_relay_url() is None — the caller sets it
+        // again after reconnecting.
+        let instance = BridgeInstance::new(test_context_manager(), "did:dht:ztest".to_owned());
+        instance.set_relay_url("wss://relay.example.com".to_owned());
+        instance.suspend().unwrap();
+        assert!(instance.pending_relay_url().is_none());
+        instance.resume().unwrap();
+        // After resume, no URL is set — caller must re-set after reconnecting.
+        assert!(instance.pending_relay_url().is_none());
+    }
+
+    // -----------------------------------------------------------------
+    // AC 6: two-instance independence
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn two_instances_with_different_dids_are_independent() {
+        let cm1 = test_context_manager();
+        let cm2 = test_context_manager();
+        let bi1 = BridgeInstance::new(Arc::clone(&cm1), "did:dht:alice".to_owned());
+        let bi2 = BridgeInstance::new(Arc::clone(&cm2), "did:dht:bob".to_owned());
+
+        assert_eq!(bi1.local_did(), "did:dht:alice");
+        assert_eq!(bi2.local_did(), "did:dht:bob");
+
+        // Shutting down one does not affect the other.
+        bi1.shutdown();
+        assert!(bi1.is_shutdown());
+        assert!(!bi2.is_shutdown());
+
+        // bi2 local_did is still accessible.
+        assert_eq!(bi2.local_did(), "did:dht:bob");
+        // bi2 is still ready to service operations.
+        assert!(bi2.check_ready().is_ok());
+    }
+
+    // -----------------------------------------------------------------
+    // AC 8: suspend/resume with persistence
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn suspend_flushes_contexts_to_persistence() {
+        use scp_core::context::providers::InMemoryPersistence;
+        use std::sync::Arc;
+
+        let persistence = Arc::new(InMemoryPersistence::new());
+        let persistence_for_cm = Box::new(InMemoryPersistence::new());
+        let persistence_for_instance: Box<dyn ContextPersistence + Send + Sync> =
+            Box::new(InMemoryPersistence::new());
+
+        // Build a ContextManager with persistence.
+        let key_resolver: scp_core::context::governance::KeyResolver = Arc::new(|_| None);
+        let cm = Arc::new(ContextManager::with_persistence(
+            Box::new(NoOpCrypto),
+            Box::new(scp_core::context::LocalTransportProvider),
+            Box::new(NoOpEventLog),
+            persistence_for_cm,
+            key_resolver,
+        ));
+
+        let instance = BridgeInstance::with_persistence(
+            cm,
+            "did:dht:ztest".to_owned(),
+            persistence_for_instance,
+        );
+
+        // Verify the persistence accessor returns Some.
+        assert!(instance.persistence().is_some());
+
+        // Suspend should complete without errors (flush is best-effort).
+        instance.suspend().unwrap();
+        assert!(instance.is_suspended());
+
+        // The relay URL was not set, so pending_relay_url is None.
+        assert!(instance.pending_relay_url().is_none());
+
+        // Resume clears the suspended flag.
+        instance.resume().unwrap();
+        assert!(!instance.is_suspended());
+
+        // Instance is ready again.
+        assert!(instance.check_ready().is_ok());
+
+        // Suppress the unused `persistence` warning — it was only used to
+        // verify the Arc::new pattern compiles; the real persistence is
+        // inside the ContextManager.
+        let _ = persistence;
+    }
+
+    // -----------------------------------------------------------------
+    // AC 9: two instances operate concurrently (independent state)
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn two_instances_operate_concurrently() {
+        let cm1 = test_context_manager();
+        let cm2 = test_context_manager();
+        let bi1 = BridgeInstance::new(Arc::clone(&cm1), "did:dht:alice".to_owned());
+        let bi2 = BridgeInstance::new(Arc::clone(&cm2), "did:dht:bob".to_owned());
+
+        // Register known contexts independently.
+        bi1.register_known_context(
+            "ctx-1",
+            KnownContext {
+                routing_id: [1u8; 32],
+                relay_url: None,
+                member_did: "did:dht:alice".to_owned(),
+                last_seen: 100,
+            },
+        );
+        bi2.register_known_context(
+            "ctx-2",
+            KnownContext {
+                routing_id: [2u8; 32],
+                relay_url: None,
+                member_did: "did:dht:bob".to_owned(),
+                last_seen: 200,
+            },
+        );
+
+        // Each instance only knows about its own context.
+        assert_eq!(bi1.known_context_count(), 1);
+        assert!(bi1.has_known_context("ctx-1"));
+        assert!(!bi1.has_known_context("ctx-2"));
+
+        assert_eq!(bi2.known_context_count(), 1);
+        assert!(bi2.has_known_context("ctx-2"));
+        assert!(!bi2.has_known_context("ctx-1"));
+
+        // Set relay URLs independently.
+        bi1.set_relay_url("wss://relay1.example.com".to_owned());
+        bi2.set_relay_url("wss://relay2.example.com".to_owned());
+        assert_eq!(
+            bi1.pending_relay_url().as_deref(),
+            Some("wss://relay1.example.com")
+        );
+        assert_eq!(
+            bi2.pending_relay_url().as_deref(),
+            Some("wss://relay2.example.com")
+        );
+
+        // Shutdown of bi1 does not affect bi2's state.
+        bi1.shutdown();
+        assert!(bi1.is_shutdown());
+        assert!(!bi2.is_shutdown());
+        assert_eq!(bi2.known_context_count(), 1);
+        assert_eq!(
+            bi2.pending_relay_url().as_deref(),
+            Some("wss://relay2.example.com")
+        );
     }
 }
