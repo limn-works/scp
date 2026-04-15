@@ -142,7 +142,7 @@ pub fn context_manager() -> Result<&'static Arc<ContextManager>, ScpPyError> {
 /// # Safety: Single-Tenant Only
 ///
 /// See module-level documentation.
-static BRIDGE_INSTANCE: OnceLock<Arc<BridgeInstance>> = OnceLock::new();
+pub(crate) static BRIDGE_INSTANCE: OnceLock<Arc<BridgeInstance>> = OnceLock::new();
 
 /// Initializes the global [`BridgeInstance`].
 ///
@@ -151,10 +151,43 @@ static BRIDGE_INSTANCE: OnceLock<Arc<BridgeInstance>> = OnceLock::new();
 /// `bridge_instance().context_manager()` and `context_manager()` return
 /// pointers to the same allocation.
 ///
+/// Registers PyO3-specific shutdown hooks that clear bridge-specific
+/// singletons (`IDENTITY_REGISTRY`, `FFI_BRIDGE_STATE`, `ECONOMY_BUDGETS`,
+/// `ECONOMY_ANTISPAM`) during `BridgeInstance::shutdown()`. These
+/// singletons use PyO3-specific types that cannot be owned by
+/// `BridgeInstance` in `scp-ffi-common`.
+///
+/// `DID_RESOLVER` and `STORAGE_PROVIDER` are `OnceLock<Arc<...>>` —
+/// `OnceLock` does not support clearing after initialization, and the
+/// `Arc` values are cleaned up when the process exits. They do not hold
+/// key material (the resolver caches public DID documents; the storage
+/// provider's encryption key is in the `EncryptingAdapter` which is
+/// dropped with the `Arc`).
+///
 /// Subsequent calls are no-ops (`OnceLock` guarantees single initialization).
 fn init_bridge_instance(context_manager: Arc<ContextManager>, local_did: &str) {
     let instance = Arc::new(BridgeInstance::new(context_manager, local_did.to_owned()));
-    BRIDGE_INSTANCE.get_or_init(|| instance);
+    let bi = BRIDGE_INSTANCE.get_or_init(|| instance);
+
+    // Register PyO3-specific cleanup hooks. These clear DashMap-based
+    // singletons that hold bridge-specific types. Clearing the identity
+    // registry drops `Arc<FfiKeyCustody>` entries — when the refcount
+    // reaches zero, custody providers are dropped (InMemoryKeyCustody
+    // zeroizes key material via `Zeroizing<[u8; 32]>` fields).
+    bi.register_shutdown_hook(Box::new(|| {
+        if let Some(reg) = IDENTITY_REGISTRY.get() {
+            reg.clear();
+        }
+        if let Some(reg) = FFI_BRIDGE_STATE.get() {
+            reg.clear();
+        }
+        if let Some(reg) = ECONOMY_BUDGETS.get() {
+            reg.clear();
+        }
+        if let Some(reg) = ECONOMY_ANTISPAM.get() {
+            reg.clear();
+        }
+    }));
 }
 
 /// Returns a reference to the global [`BridgeInstance`].

@@ -18,8 +18,13 @@
 //! Phase 4 Step 1 (#1549): Shared singletons (transport, known contexts,
 //! rate limiters) are now owned by `BridgeInstance`. Bridge-specific singletons
 //! (`FFI_BRIDGE_STATE`, `IDENTITY_REGISTRY`, `DID_RESOLVER`, `STORAGE_PROVIDER`,
-//! `ECONOMY_BUDGETS`, `ECONOMY_ANTISPAM`) remain as per-bridge `OnceLock`s until
-//! subsequent migration steps.
+//! `ECONOMY_BUDGETS`, `ECONOMY_ANTISPAM`) remain as per-bridge `OnceLock`s but
+//! are now cleaned up during `shutdown()` via registered shutdown hooks. Each
+//! bridge registers hooks that clear its bridge-specific `DashMap` singletons,
+//! releasing `Arc` references to custody providers (key material zeroized on
+//! `Drop`). `DID_RESOLVER` and `STORAGE_PROVIDER` are `OnceLock<Arc<...>>`
+//! that cannot be cleared (no `OnceLock::take`) — they are dropped with the
+//! process.
 //!
 //! # Thread Safety
 //!
@@ -31,6 +36,7 @@
 //! `DashMap` for lock-free concurrent access.
 
 use std::sync::Arc;
+use std::sync::Mutex;
 use std::sync::RwLock;
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -152,6 +158,20 @@ pub struct BridgeInstance {
     /// in the auto-accept policy. Uses `DashMap` for lock-free concurrent
     /// access.
     rate_limiters: DashMap<String, RateLimitTracker>,
+
+    /// Registered shutdown hooks for bridge-specific state cleanup.
+    ///
+    /// Each FFI bridge registers hooks that clear bridge-specific singletons
+    /// (`IDENTITY_REGISTRY`, `FFI_BRIDGE_STATE`, `ECONOMY_BUDGETS`, etc.)
+    /// during [`shutdown()`]. These singletons use bridge-specific types
+    /// (e.g., `PyO3` `IdentityEntry` with `Arc<InMemoryKeyCustody>`) that
+    /// cannot be owned by `BridgeInstance` because `scp-ffi-common` does not
+    /// depend on PyO3/NAPI/UniFFI.
+    ///
+    /// Hooks are called exactly once during `shutdown()` and then discarded.
+    /// The `Mutex` is only locked during `shutdown()` and `register_shutdown_hook()`
+    /// — no contention on the hot path.
+    shutdown_hooks: Mutex<Vec<Box<dyn FnOnce() + Send>>>,
 }
 
 impl BridgeInstance {
@@ -177,6 +197,7 @@ impl BridgeInstance {
             transport: RwLock::new(None),
             known_contexts: DashMap::new(),
             rate_limiters: DashMap::new(),
+            shutdown_hooks: Mutex::new(Vec::new()),
         }
     }
 
@@ -232,6 +253,32 @@ impl BridgeInstance {
         Ok(())
     }
 
+    /// Registers a shutdown hook for bridge-specific state cleanup.
+    ///
+    /// The hook is called exactly once during [`shutdown()`] and then
+    /// discarded. Hooks run in registration order after all
+    /// `BridgeInstance`-owned state has been cleared.
+    ///
+    /// Intended for bridge-specific singletons that use `OnceLock` and
+    /// cannot be owned by `BridgeInstance` due to crate dependency
+    /// boundaries (e.g., `PyO3` `IDENTITY_REGISTRY`, NAPI
+    /// `BRIDGE_STATE`).
+    ///
+    /// If the internal `Mutex` is poisoned (a previous hook registration
+    /// panicked while holding the lock), the hook is silently dropped and
+    /// an error is logged.
+    pub fn register_shutdown_hook(&self, hook: Box<dyn FnOnce() + Send>) {
+        match self.shutdown_hooks.lock() {
+            Ok(mut hooks) => hooks.push(hook),
+            Err(_) => {
+                tracing::error!(
+                    "shutdown_hooks mutex poisoned — hook not registered; \
+                     bridge-specific cleanup may be incomplete on shutdown"
+                );
+            }
+        }
+    }
+
     /// Suspends the bridge instance.
     ///
     /// - Disconnects the relay (clears transport)
@@ -282,14 +329,20 @@ impl BridgeInstance {
     ///
     /// - Clears transport (disconnects relay)
     /// - Clears all registries (known contexts, rate limiters)
+    /// - Runs all registered shutdown hooks (bridge-specific cleanup)
     /// - Marks instance as shut down (all subsequent operations fail)
     ///
     /// Idempotent: calling `shutdown()` on an already-shut-down instance is
-    /// a no-op.
+    /// a no-op. Hooks are drained on the first call and will not run again.
     ///
-    /// Note: key zeroization is not performed here because identity registry
-    /// and custody providers are bridge-specific (not yet consolidated into
-    /// `BridgeInstance`). Callers must handle key cleanup separately.
+    /// # Hook execution
+    ///
+    /// Shutdown hooks are called in registration order after all
+    /// `BridgeInstance`-owned state has been cleared. This ensures that
+    /// bridge-specific singletons (identity registries, FFI bridge state,
+    /// economy trackers) are cleaned up during shutdown, releasing key
+    /// material held by custody providers (zeroized via `Drop` when
+    /// `Arc` refcount reaches zero).
     ///
     /// # Errors
     ///
@@ -310,6 +363,17 @@ impl BridgeInstance {
         // Clear registries
         self.known_contexts.clear();
         self.rate_limiters.clear();
+
+        // Run bridge-specific shutdown hooks (identity registries, FFI
+        // bridge state, economy trackers). Drain the Vec so hooks are
+        // called exactly once even if the Mutex isn't dropped.
+        if let Ok(mut hooks) = self.shutdown_hooks.lock() {
+            for hook in hooks.drain(..) {
+                hook();
+            }
+        } else {
+            tracing::error!("shutdown_hooks mutex poisoned — bridge-specific cleanup skipped");
+        }
 
         // Also clear suspended flag (shutdown supersedes suspension)
         self.suspended.store(false, Ordering::SeqCst);
@@ -1160,5 +1224,75 @@ mod tests {
         let result = instance.with_rate_limit_tracker("did:dht:znew", |_| 42);
         assert_eq!(result, 42);
         assert_eq!(instance.rate_limiters().len(), MAX_RATE_LIMITERS);
+    }
+
+    // -----------------------------------------------------------------
+    // Shutdown hook tests
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn shutdown_hooks_are_called_on_shutdown() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let instance = BridgeInstance::new(test_context_manager(), "did:dht:ztest".to_owned());
+
+        let counter = Arc::new(AtomicUsize::new(0));
+        let c1 = Arc::clone(&counter);
+        let c2 = Arc::clone(&counter);
+
+        instance.register_shutdown_hook(Box::new(move || {
+            c1.fetch_add(1, Ordering::SeqCst);
+        }));
+        instance.register_shutdown_hook(Box::new(move || {
+            c2.fetch_add(10, Ordering::SeqCst);
+        }));
+
+        // Before shutdown: hooks haven't run
+        assert_eq!(counter.load(Ordering::SeqCst), 0);
+
+        instance.shutdown().unwrap();
+
+        // Both hooks ran
+        assert_eq!(counter.load(Ordering::SeqCst), 11);
+    }
+
+    #[test]
+    fn shutdown_hooks_run_only_once() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let instance = BridgeInstance::new(test_context_manager(), "did:dht:ztest".to_owned());
+
+        let counter = Arc::new(AtomicUsize::new(0));
+        let c = Arc::clone(&counter);
+
+        instance.register_shutdown_hook(Box::new(move || {
+            c.fetch_add(1, Ordering::SeqCst);
+        }));
+
+        instance.shutdown().unwrap();
+        assert_eq!(counter.load(Ordering::SeqCst), 1);
+
+        // Second shutdown is idempotent — hooks don't run again
+        instance.shutdown().unwrap();
+        assert_eq!(counter.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn register_hook_after_shutdown_does_not_run() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let instance = BridgeInstance::new(test_context_manager(), "did:dht:ztest".to_owned());
+
+        instance.shutdown().unwrap();
+
+        let ran = Arc::new(AtomicBool::new(false));
+        let r = Arc::clone(&ran);
+
+        // Registering after shutdown succeeds (no panic) but the hook
+        // will never run because shutdown already completed.
+        instance.register_shutdown_hook(Box::new(move || {
+            r.store(true, Ordering::SeqCst);
+        }));
+
+        // Second shutdown is a no-op (already shut down)
+        instance.shutdown().unwrap();
+        assert!(!ran.load(Ordering::SeqCst));
     }
 }

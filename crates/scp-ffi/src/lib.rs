@@ -175,6 +175,12 @@ fn version() -> &'static str {
 /// This ordering ensures all Python destructors (`__del__`, weak-ref callbacks)
 /// complete before the tokio runtime is dropped.
 ///
+/// Also shuts down the [`BridgeInstance`], which clears all owned registries
+/// (transport, known contexts, rate limiters) and runs registered shutdown
+/// hooks to clear bridge-specific singletons (identity registry, FFI bridge
+/// state, economy trackers). This releases `Arc<FfiKeyCustody>` references,
+/// allowing custody providers to zeroize key material when dropped.
+///
 /// The actual runtime drop (which invokes tokio's `shutdown_timeout`)
 /// happens when the process exits and the static
 /// `OnceLock` is reclaimed. This function serves as a coordination point:
@@ -185,6 +191,15 @@ fn version() -> &'static str {
 /// shut down (or before it was initialized) is a no-op.
 #[pyfunction]
 fn shutdown_runtime() {
+    // Shut down the BridgeInstance first (clears registries, runs hooks).
+    // Best-effort: if the instance was never initialized or is already
+    // shut down, this is a no-op.
+    if let Some(bi) = runtime::BRIDGE_INSTANCE.get()
+        && let Err(e) = bi.shutdown()
+    {
+        tracing::error!("BridgeInstance shutdown failed: {e}");
+    }
+
     // Take no action if the runtime was never initialized.
     // We cannot take ownership of the OnceLock value, so we signal
     // graceful shutdown by spawning a brief drain and then returning.

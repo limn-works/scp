@@ -34,6 +34,17 @@ use crate::error::ScpNapiError;
 // `BridgeContextState`, `bridge_state_registry()`, and `remove_bridge_state()`
 // are defined in `scp_ffi_common::bridge_state` and imported above.
 
+/// Clears all per-context bridge state during shutdown.
+///
+/// Called by the shutdown hook registered in [`crate::runtime::init_bridge_instance`].
+/// This ensures shadow registries and sender key stores are dropped, releasing
+/// any key material they hold.
+pub(crate) fn clear_bridge_state() {
+    if let Some(reg) = BRIDGE_STATE.get() {
+        reg.clear();
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Result types
 // ---------------------------------------------------------------------------

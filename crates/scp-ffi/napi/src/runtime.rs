@@ -163,10 +163,36 @@ static BRIDGE_INSTANCE: OnceLock<Arc<BridgeInstance>> = OnceLock::new();
 /// `Arc<ContextManager>` so that `bridge_instance().context_manager()` and
 /// `context_manager()` return pointers to the same allocation.
 ///
+/// Registers NAPI-specific shutdown hooks that clear bridge-specific
+/// singletons (`IDENTITY_REGISTRY`, `UCAN_REGISTRY`, `ECONOMY_BUDGETS`,
+/// `ECONOMY_ANTISPAM`, and `BRIDGE_STATE` in `bridge_connector`).
+///
 /// Subsequent calls are no-ops (`OnceLock` guarantees single initialization).
 fn init_bridge_instance(context_manager: Arc<ContextManager>, local_did: &str) {
     let instance = Arc::new(BridgeInstance::new(context_manager, local_did.to_owned()));
-    BRIDGE_INSTANCE.get_or_init(|| instance);
+    let bi = BRIDGE_INSTANCE.get_or_init(|| instance);
+
+    // Register NAPI-specific cleanup hooks. Clearing the identity registry
+    // drops `Arc<OpaqueInMemoryKeyCustody>` entries — custody providers
+    // zeroize key material via `Zeroizing` fields when the refcount
+    // reaches zero.
+    bi.register_shutdown_hook(Box::new(|| {
+        #[cfg(feature = "allow_in_memory_custody")]
+        if let Some(reg) = IDENTITY_REGISTRY.get() {
+            reg.clear();
+        }
+        if let Some(reg) = UCAN_REGISTRY.get() {
+            reg.clear();
+        }
+        if let Some(reg) = ECONOMY_BUDGETS.get() {
+            reg.clear();
+        }
+        if let Some(reg) = ECONOMY_ANTISPAM.get() {
+            reg.clear();
+        }
+        // BRIDGE_STATE in bridge_connector.rs — per-context bridge state
+        crate::bridge_connector::clear_bridge_state();
+    }));
 }
 
 /// Returns a reference to the global [`BridgeInstance`].

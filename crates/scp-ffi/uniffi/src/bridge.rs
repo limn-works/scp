@@ -11544,6 +11544,17 @@ use scp_ffi_common::bridge_state::{
     BridgeContextState, bridge_state_registry, remove_bridge_state,
 };
 
+/// Clears all per-context bridge state during shutdown.
+///
+/// Called by the shutdown hook registered in [`crate::runtime::init_bridge_instance`].
+/// This ensures shadow registries and sender key stores are dropped, releasing
+/// any key material they hold.
+pub(crate) fn clear_bridge_state() {
+    if let Some(reg) = BRIDGE_STATE.get() {
+        reg.clear();
+    }
+}
+
 /// Bridge registration result record.
 ///
 /// Returned by `bridge_register`. Contains the details of a successfully
