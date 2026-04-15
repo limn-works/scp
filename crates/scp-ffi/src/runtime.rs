@@ -166,6 +166,12 @@ pub(crate) static BRIDGE_INSTANCE: OnceLock<Arc<BridgeInstance>> = OnceLock::new
 ///
 /// Subsequent calls are no-ops (`OnceLock` guarantees single initialization).
 fn init_bridge_instance(context_manager: Arc<ContextManager>, local_did: &str) {
+    // Guard against duplicate hook registration — OnceLock guarantees
+    // single BridgeInstance creation, but hooks must only be registered once.
+    if BRIDGE_INSTANCE.get().is_some() {
+        return;
+    }
+
     let instance = Arc::new(BridgeInstance::new(context_manager, local_did.to_owned()));
     let bi = BRIDGE_INSTANCE.get_or_init(|| instance);
 
@@ -187,6 +193,10 @@ fn init_bridge_instance(context_manager: Arc<ContextManager>, local_did: &str) {
         if let Some(reg) = ECONOMY_ANTISPAM.get() {
             reg.clear();
         }
+        // BRIDGE_STATE + CREDENTIAL_STORE in bridge_connector.rs
+        crate::bridge_connector::clear_bridge_state();
+        // MCP server/client registries
+        crate::mcp::clear_registries();
     }));
 }
 

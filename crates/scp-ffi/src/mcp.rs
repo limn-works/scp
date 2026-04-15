@@ -1142,6 +1142,20 @@ fn generate_handle_id(prefix: &str) -> String {
     crate::types::generate_random_id(prefix)
 }
 
+/// Clears both MCP server and client registries during shutdown.
+///
+/// Called by the shutdown hook registered in [`crate::runtime::init_bridge_instance`].
+/// This ensures server shutdown senders and client connections are dropped,
+/// allowing background tasks to terminate cleanly.
+pub(crate) fn clear_registries() {
+    if let Some(reg) = SERVER_REGISTRY.get() {
+        reg.clear();
+    }
+    if let Some(reg) = CLIENT_REGISTRY.get() {
+        reg.clear();
+    }
+}
+
 // ---------------------------------------------------------------------------
 // MCP server bridge functions
 // ---------------------------------------------------------------------------

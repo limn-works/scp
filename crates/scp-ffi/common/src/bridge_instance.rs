@@ -1285,7 +1285,7 @@ mod tests {
     }
 
     #[test]
-    fn register_hook_after_shutdown_does_not_run() {
+    fn register_hook_after_shutdown_runs_immediately() {
         use std::sync::atomic::{AtomicBool, Ordering};
         let instance = BridgeInstance::new(test_context_manager(), "did:dht:ztest".to_owned());
 
@@ -1294,14 +1294,16 @@ mod tests {
         let ran = Arc::new(AtomicBool::new(false));
         let r = Arc::clone(&ran);
 
-        // Registering after shutdown succeeds (no panic) but the hook
-        // will never run because shutdown already completed.
+        // Registering after shutdown runs the hook immediately — shutdown()
+        // already drained the hook Vec, so a late registration must fire
+        // eagerly to guarantee cleanup.
         instance.register_shutdown_hook(Box::new(move || {
             r.store(true, Ordering::SeqCst);
         }));
 
-        // Second shutdown is a no-op (already shut down)
-        instance.shutdown().unwrap();
-        assert!(!ran.load(Ordering::SeqCst));
+        assert!(
+            ran.load(Ordering::SeqCst),
+            "hook registered after shutdown must run immediately"
+        );
     }
 }

@@ -226,6 +226,15 @@ pub fn scp_version() -> String {
 /// ```
 #[napi]
 pub fn scp_shutdown(timeout_secs: u32) {
+    // Shut down the BridgeInstance first (clears registries, runs hooks,
+    // disconnects transport). Best-effort: if the instance was never
+    // initialized or is already shut down, this is a no-op.
+    if let Some(bi) = runtime::bridge_instance_raw()
+        && let Err(e) = bi.shutdown()
+    {
+        tracing::error!("BridgeInstance shutdown failed: {e}");
+    }
+
     if timeout_secs == 0 {
         return;
     }

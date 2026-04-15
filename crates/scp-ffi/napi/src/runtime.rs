@@ -169,6 +169,12 @@ static BRIDGE_INSTANCE: OnceLock<Arc<BridgeInstance>> = OnceLock::new();
 ///
 /// Subsequent calls are no-ops (`OnceLock` guarantees single initialization).
 fn init_bridge_instance(context_manager: Arc<ContextManager>, local_did: &str) {
+    // Guard against duplicate hook registration — OnceLock guarantees
+    // single BridgeInstance creation, but hooks must only be registered once.
+    if BRIDGE_INSTANCE.get().is_some() {
+        return;
+    }
+
     let instance = Arc::new(BridgeInstance::new(context_manager, local_did.to_owned()));
     let bi = BRIDGE_INSTANCE.get_or_init(|| instance);
 
@@ -192,7 +198,19 @@ fn init_bridge_instance(context_manager: Arc<ContextManager>, local_did: &str) {
         }
         // BRIDGE_STATE in bridge_connector.rs — per-context bridge state
         crate::bridge_connector::clear_bridge_state();
+        // MCP server/client registries
+        crate::mcp::clear_registries();
     }));
+}
+
+/// Returns the raw `BridgeInstance` reference without lifecycle checks.
+///
+/// Used by [`crate::scp_shutdown`] to call `BridgeInstance::shutdown()`
+/// during teardown, when the bridge is transitioning to shut-down state.
+/// Returns `None` if the instance was never initialized.
+#[must_use]
+pub fn bridge_instance_raw() -> Option<&'static Arc<BridgeInstance>> {
+    BRIDGE_INSTANCE.get()
 }
 
 /// Returns a reference to the global [`BridgeInstance`].
