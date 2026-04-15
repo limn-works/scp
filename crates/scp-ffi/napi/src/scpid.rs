@@ -384,7 +384,7 @@ mod tests {
         .unwrap();
 
         // Verify using IdentityBackedDidResolver — the same type the bridge
-        // function uses via the global DID_RESOLVER.
+        // function uses via the BridgeInstance DID resolver.
         let dual = DualLayerResolver::new(
             Arc::new(NoOpRelayQuerier),
             dht_client,

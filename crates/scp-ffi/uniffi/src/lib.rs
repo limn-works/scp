@@ -315,15 +315,10 @@ pub fn scp_shutdown(timeout_secs: u64) {
     // Skip in test builds: shutdown permanently poisons the OnceLock-based
     // BridgeInstance, destroying contexts from concurrently-running tests.
     #[cfg(not(test))]
-    if let Some(bi) = runtime::bridge_instance_raw() {
-        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| bi.shutdown()));
-        match result {
-            Ok(Err(e)) => tracing::error!("BridgeInstance shutdown failed: {e}"),
-            Err(_) => {
-                tracing::error!("BridgeInstance shutdown panicked — cleanup may be incomplete");
-            }
-            Ok(Ok(())) => {}
-        }
+    if let Some(bi) = runtime::bridge_instance_raw()
+        && std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| bi.shutdown())).is_err()
+    {
+        tracing::error!("BridgeInstance shutdown panicked — cleanup may be incomplete");
     }
 
     if timeout_secs == 0 {

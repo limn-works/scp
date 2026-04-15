@@ -237,7 +237,7 @@ pub fn ensure_bridge_instance(cm: Arc<ContextManager>) {
     if BRIDGE_INSTANCE.get().is_some() {
         return;
     }
-    init_bridge_instance(cm, "did:unknown:napi-bridge");
+    init_bridge_instance(cm, "did:placeholder:uninitialized-napi");
 }
 
 /// Returns a reference to the global [`BridgeInstance`].
@@ -1239,6 +1239,42 @@ mod tests {
         assert!(
             !bi.is_shutdown(),
             "bridge_instance should not be shutdown immediately after init"
+        );
+    }
+
+    #[test]
+    fn shutdown_hook_runs_with_external_state() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        // Build an isolated BridgeInstance (not the global one) to avoid
+        // interfering with the OnceLock-based singleton used by other tests.
+        // BridgeInstance is in scope via `use super::*` (imported at module top).
+        let key_resolver: scp_core::context::governance::KeyResolver = Arc::new(|_| None);
+        let cm = Arc::new(ContextManager::with_persistence(
+            Box::new(TestNoOpCryptoProvider),
+            Box::new(scp_core::context::LocalTransportProvider),
+            build_event_log_provider(),
+            Box::new(NapiBridgePersistence::new()),
+            key_resolver,
+        ));
+        let bi = BridgeInstance::new(cm, "did:test:napi-hook-isolated".to_owned());
+
+        let ran = Arc::new(AtomicBool::new(false));
+        let ran2 = Arc::clone(&ran);
+
+        bi.register_shutdown_hook(Box::new(move || {
+            ran2.store(true, Ordering::SeqCst);
+        }));
+
+        assert!(
+            !ran.load(Ordering::SeqCst),
+            "hook must not fire before shutdown"
+        );
+        bi.shutdown();
+        assert!(
+            ran.load(Ordering::SeqCst),
+            "shutdown hook must execute during BridgeInstance::shutdown()"
         );
     }
 }

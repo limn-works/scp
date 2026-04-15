@@ -199,15 +199,15 @@ pub fn bridge_instance_raw() -> Option<&'static Arc<BridgeInstance>> {
 /// `context_create` → `transport_connect`) did not create one during
 /// initialization.
 ///
-/// Uses a placeholder DID (`"did:unknown:bridge"`) since the real DID
-/// is not available at this point. The DID is only used for logging and
-/// MLS credential identity — the `ContextManager` already has the real
+/// Uses a placeholder DID (`"did:placeholder:uninitialized-uniffi"`) since the
+/// real DID is not available at this point. The DID is only used for logging
+/// and MLS credential identity — the `ContextManager` already has the real
 /// MLS provider if `init_context_manager_with_did` was called.
 pub fn ensure_bridge_instance(cm: Arc<ContextManager>) {
     if BRIDGE_INSTANCE.get().is_some() {
         return;
     }
-    init_bridge_instance(cm, "did:unknown:bridge");
+    init_bridge_instance(cm, "did:placeholder:uninitialized-uniffi");
 }
 
 /// Returns a reference to the global [`BridgeInstance`].
@@ -902,6 +902,35 @@ mod tests {
         assert!(
             matches!(err, crate::ScpError::Context { ref code, .. } if code == codes::CTX_2000),
             "expected ScpError::Context with CTX_2000 code"
+        );
+    }
+
+    #[test]
+    fn shutdown_hook_runs_with_external_state() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        // Build an isolated BridgeInstance (not the global one) to avoid
+        // interfering with the OnceLock-based singleton used by other tests.
+        // BridgeInstance is in scope via `use super::*` (imported at module top).
+        let cm = build_default_context_manager();
+        let bi = BridgeInstance::new(cm, "did:test:uniffi-hook-isolated".to_owned());
+
+        let ran = Arc::new(AtomicBool::new(false));
+        let ran2 = Arc::clone(&ran);
+
+        bi.register_shutdown_hook(Box::new(move || {
+            ran2.store(true, Ordering::SeqCst);
+        }));
+
+        assert!(
+            !ran.load(Ordering::SeqCst),
+            "hook must not fire before shutdown"
+        );
+        bi.shutdown();
+        assert!(
+            ran.load(Ordering::SeqCst),
+            "shutdown hook must execute during BridgeInstance::shutdown()"
         );
     }
 }

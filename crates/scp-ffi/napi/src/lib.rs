@@ -238,15 +238,10 @@ pub fn scp_shutdown(timeout_secs: u32) {
     // in destroy_mls_group or task abort. A panic here would abort the
     // process with "failed to initiate panic" (double-panic).
     #[cfg(not(test))]
-    if let Some(bi) = runtime::bridge_instance_raw() {
-        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| bi.shutdown()));
-        match result {
-            Ok(Err(e)) => tracing::error!("BridgeInstance shutdown failed: {e}"),
-            Err(_) => {
-                tracing::error!("BridgeInstance shutdown panicked — cleanup may be incomplete");
-            }
-            Ok(Ok(())) => {}
-        }
+    if let Some(bi) = runtime::bridge_instance_raw()
+        && std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| bi.shutdown())).is_err()
+    {
+        tracing::error!("BridgeInstance shutdown panicked — cleanup may be incomplete");
     }
 
     if timeout_secs == 0 {

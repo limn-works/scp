@@ -38,9 +38,11 @@ DashMap provides lock-free concurrent access with internal sharding — no globa
 `py_context_create` in `context.rs` registers FFI bridge state and delegates lifecycle to `ContextManager`. Other modules (`tools.rs`, `ucan.rs`, `event_log.rs`) look up FFI state by context ID via `with_context` (alias for `with_ffi_state`).
 
 Additional global registries in `runtime.rs`:
-- `KNOWN_CONTEXTS: OnceLock<DashMap<String, KnownContext>>` — context-to-relay mappings for discovery (SCP-213)
-- `RELAY_CONNECTION: OnceLock<RwLock<Option<Arc<NativeRelayAdapter>>>>` — active relay connection
 - `STORAGE_PROVIDER: OnceLock<Arc<InMemoryStorage>>` — storage backend for identity persistence (SCP-217)
+
+Known contexts (SCP-213) and transport state are now owned by `BridgeInstance` and
+accessed via `crate::runtime::bridge_instance()`. The old `KNOWN_CONTEXTS` and
+`RELAY_CONNECTION` `OnceLock` globals have been removed.
 
 ### Module Structure
 

@@ -51,6 +51,10 @@ fn map_transport_lock_error(e: TransportLockError) -> ScpNapiError {
                 .to_owned(),
             code: codes::TRANS_5003.to_owned(),
         },
+        TransportLockError::Rejected(msg) => ScpNapiError::Transport {
+            message: format!("transport operation rejected: {msg}"),
+            code: codes::TRANS_5010.to_owned(),
+        },
     }
 }
 
@@ -448,7 +452,7 @@ pub fn configure_local_transport(local_did: String) -> napi::Result<()> {
 ///
 /// The `relay_url` must point to a running relay. A separate
 /// `transportConnect` call is still needed for `contextSubscribe` (which
-/// uses the global `TRANSPORT_MANAGER` for its subscription stream).
+/// uses the `BridgeInstance` transport manager for its subscription stream).
 ///
 /// # Arguments
 ///
@@ -517,8 +521,8 @@ pub struct NapiReliabilityScore {
 /// Registers an additional relay adapter with the transport manager.
 ///
 /// Connects to the specified relay URL and adds the resulting adapter to
-/// the global [`TransportManager`]. The [`transport_connect`] function must
-/// have been called first to initialize the manager.
+/// the `BridgeInstance` transport manager. The [`transport_connect`] function
+/// must have been called first to initialize the manager.
 ///
 /// # Arguments
 ///

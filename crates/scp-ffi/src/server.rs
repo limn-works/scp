@@ -99,11 +99,11 @@ fn auto_wire_context_manager(
                 &did_owned, crypto, transport, event_log, None,
             );
 
-            // Also populate the TRANSPORT_MANAGER global so that broadcast
-            // publish, context subscribe, and discovery probing work without
-            // a separate `transport_connect` call. This requires a second
-            // WebSocket connection because NativeRelayAdapter is not Clone
-            // and the first was consumed by RelayTransportProvider.
+            // Also populate the BridgeInstance transport manager so that
+            // broadcast publish, context subscribe, and discovery probing
+            // work without a separate `transport_connect` call. This requires
+            // a second WebSocket connection because NativeRelayAdapter is not
+            // Clone and the first was consumed by RelayTransportProvider.
             match py.allow_threads(|| {
                 rt.block_on(NativeRelayAdapter::connect_sourced_with_bearer(
                     &sourced,
@@ -120,8 +120,8 @@ fn auto_wire_context_manager(
                         error = %e,
                         relay_url = %relay_url,
                         "auto_wire_context_manager: ContextManager wired but failed to \
-                         populate TRANSPORT_MANAGER — broadcast publish and discovery may \
-                         require a manual transport_connect call"
+                         populate BridgeInstance transport manager — broadcast publish and \
+                         discovery may require a manual transport_connect call"
                     );
                 }
             }
@@ -845,8 +845,8 @@ mod tests {
         inner.shutdown();
     }
 
-    /// Verifies that auto-wiring a node's relay populates the global
-    /// `TRANSPORT_MANAGER` so that broadcast publish, context subscribe,
+    /// Verifies that auto-wiring a node's relay populates the `BridgeInstance`
+    /// transport manager so that broadcast publish, context subscribe,
     /// and discovery probing work without a separate `transport_connect`.
     #[test]
     fn auto_wire_populates_transport_manager_global() {
@@ -875,7 +875,7 @@ mod tests {
         // Verify the global is populated.
         assert!(
             crate::runtime::has_transport_manager(),
-            "TRANSPORT_MANAGER should be populated after auto-wire"
+            "BridgeInstance transport manager should be populated after auto-wire"
         );
 
         // Clean up.

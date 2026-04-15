@@ -199,10 +199,18 @@ pub fn economy_budget_grant(context_id: String, did: String, amount: i64) -> nap
     if did.is_empty() {
         return Err(validation_error("DID must not be empty"));
     }
+    if amount < 0 {
+        return Err(napi::Error::from(ScpNapiError::Validation {
+            message: format!("amount must be non-negative, got {amount}"),
+            code: codes::VALID_7001.to_owned(),
+        }));
+    }
     let member_did = scp_identity::DID::from(did.as_str());
-    #[allow(clippy::cast_sign_loss)]
     crate::runtime::bridge_instance()?.with_economy_budget_mut(&context_id, |tracker| {
-        tracker.grant(&member_did, scp_core::economy::Amount::new(amount as u64));
+        tracker.grant(
+            &member_did,
+            scp_core::economy::Amount::new(amount.cast_unsigned()),
+        );
     });
     Ok(())
 }
@@ -220,11 +228,19 @@ pub fn economy_budget_record_spend(
     if did.is_empty() {
         return Err(validation_error("DID must not be empty"));
     }
+    if amount < 0 {
+        return Err(napi::Error::from(ScpNapiError::Validation {
+            message: format!("amount must be non-negative, got {amount}"),
+            code: codes::VALID_7001.to_owned(),
+        }));
+    }
     let member_did = scp_identity::DID::from(did.as_str());
-    #[allow(clippy::cast_sign_loss)]
     crate::runtime::bridge_instance()?.with_economy_budget_mut(&context_id, |tracker| {
         tracker
-            .record_spend(&member_did, scp_core::economy::Amount::new(amount as u64))
+            .record_spend(
+                &member_did,
+                scp_core::economy::Amount::new(amount.cast_unsigned()),
+            )
             .map_err(|e| validation_error(&format!("{e}")))
     })
 }
@@ -242,10 +258,15 @@ pub fn economy_antispam_record(
     if sender_did.is_empty() {
         return Err(validation_error("sender DID must not be empty"));
     }
+    if timestamp < 0 {
+        return Err(napi::Error::from(ScpNapiError::Validation {
+            message: format!("timestamp must be non-negative, got {timestamp}"),
+            code: codes::VALID_7001.to_owned(),
+        }));
+    }
     let did = scp_identity::DID::from(sender_did.as_str());
-    #[allow(clippy::cast_sign_loss)]
     crate::runtime::bridge_instance()?.with_economy_antispam(&context_id, |tracker| {
-        tracker.record_message(&did, timestamp as u64);
+        tracker.record_message(&did, timestamp.cast_unsigned());
     });
     Ok(())
 }
@@ -263,11 +284,17 @@ pub fn economy_antispam_velocity(
     if sender_did.is_empty() {
         return Err(validation_error("sender DID must not be empty"));
     }
+    if now < 0 {
+        return Err(napi::Error::from(ScpNapiError::Validation {
+            message: format!("now must be non-negative, got {now}"),
+            code: codes::VALID_7001.to_owned(),
+        }));
+    }
     let did = scp_identity::DID::from(sender_did.as_str());
-    #[allow(clippy::cast_sign_loss, clippy::cast_possible_wrap)]
+    #[allow(clippy::cast_possible_wrap)]
     let velocity = crate::runtime::bridge_instance()?
         .with_economy_antispam(&context_id, |tracker| {
-            tracker.get_velocity(&did, now as u64)
+            tracker.get_velocity(&did, now.cast_unsigned())
         });
     #[allow(clippy::cast_possible_wrap)]
     Ok(velocity as i64)
@@ -293,6 +320,34 @@ pub fn economy_antispam_escalated_cost(
     let thresholds: Vec<(u64, u64)> = serde_json::from_str(&thresholds_json)
         .map_err(|e| validation_error(&format!("invalid thresholds JSON: {e}")))?;
 
+    if now < 0 {
+        return Err(napi::Error::from(ScpNapiError::Validation {
+            message: format!("now must be non-negative, got {now}"),
+            code: codes::VALID_7001.to_owned(),
+        }));
+    }
+    if base_cost < 0 {
+        return Err(napi::Error::from(ScpNapiError::Validation {
+            message: format!("base_cost must be non-negative, got {base_cost}"),
+            code: codes::VALID_7001.to_owned(),
+        }));
+    }
+    if floor.is_some_and(|f| f < 0) {
+        return Err(napi::Error::from(ScpNapiError::Validation {
+            message: format!(
+                "floor must be non-negative, got {}",
+                floor.unwrap_or_default()
+            ),
+            code: codes::VALID_7001.to_owned(),
+        }));
+    }
+    if cap.is_some_and(|c| c < 0) {
+        return Err(napi::Error::from(ScpNapiError::Validation {
+            message: format!("cap must be non-negative, got {}", cap.unwrap_or_default()),
+            code: codes::VALID_7001.to_owned(),
+        }));
+    }
+
     let config = scp_core::economy::EscalationConfig {
         thresholds: thresholds
             .into_iter()
@@ -304,15 +359,14 @@ pub fn economy_antispam_escalated_cost(
     };
 
     let did = scp_identity::DID::from(sender_did.as_str());
-    #[allow(clippy::cast_sign_loss)]
     let cost = crate::runtime::bridge_instance()?.with_economy_antispam(&context_id, |tracker| {
         tracker.compute_escalated_cost(
             &did,
-            now as u64,
-            scp_core::economy::Amount::new(base_cost as u64),
+            now.cast_unsigned(),
+            scp_core::economy::Amount::new(base_cost.cast_unsigned()),
             &config,
-            floor.map(|f| scp_core::economy::Amount::new(f as u64)),
-            cap.map(|c| scp_core::economy::Amount::new(c as u64)),
+            floor.map(|f| scp_core::economy::Amount::new(f.cast_unsigned())),
+            cap.map(|c| scp_core::economy::Amount::new(c.cast_unsigned())),
         )
     });
     #[allow(clippy::cast_possible_wrap)]
@@ -385,5 +439,49 @@ mod tests {
     fn budget_validates_empty_inputs() {
         assert!(economy_budget_remaining(String::new(), "did:key:x".to_owned()).is_err());
         assert!(economy_budget_remaining("ctx".to_owned(), String::new()).is_err());
+    }
+
+    #[test]
+    fn budget_grant_rejects_negative_amount() {
+        crate::runtime::init_context_manager_for_test();
+        let err =
+            economy_budget_grant("ctx".to_owned(), "did:key:alice".to_owned(), -1).unwrap_err();
+        assert!(
+            err.reason.contains("non-negative"),
+            "error should mention 'non-negative': {err:?}"
+        );
+    }
+
+    #[test]
+    fn budget_record_spend_rejects_negative_amount() {
+        crate::runtime::init_context_manager_for_test();
+        let err = economy_budget_record_spend("ctx".to_owned(), "did:key:alice".to_owned(), -100)
+            .unwrap_err();
+        assert!(
+            err.reason.contains("non-negative"),
+            "error should mention 'non-negative': {err:?}"
+        );
+    }
+
+    #[test]
+    fn antispam_record_rejects_negative_timestamp() {
+        crate::runtime::init_context_manager_for_test();
+        let err =
+            economy_antispam_record("ctx".to_owned(), "did:key:bob".to_owned(), -1).unwrap_err();
+        assert!(
+            err.reason.contains("non-negative"),
+            "error should mention 'non-negative': {err:?}"
+        );
+    }
+
+    #[test]
+    fn antispam_velocity_rejects_negative_now() {
+        crate::runtime::init_context_manager_for_test();
+        let err =
+            economy_antispam_velocity("ctx".to_owned(), "did:key:bob".to_owned(), -1).unwrap_err();
+        assert!(
+            err.reason.contains("non-negative"),
+            "error should mention 'non-negative': {err:?}"
+        );
     }
 }

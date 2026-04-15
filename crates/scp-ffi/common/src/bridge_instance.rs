@@ -58,11 +58,27 @@ use crate::bridge_state::BridgeContextState;
 /// a misbehaving caller.
 const MAX_KNOWN_CONTEXTS: usize = 10_000;
 
-/// Maximum number of rate limit trackers. When this limit is reached,
-/// new tracker creation requests are rejected (the caller must retry
-/// later). 1,000 concurrent identity DIDs per bridge instance is generous
-/// for any single-process deployment.
+/// Maximum number of rate limit trackers. When this limit is reached, the
+/// least-recently-inserted tracker is evicted to make room for the new one.
+/// 1,000 concurrent identity DIDs per bridge instance is generous for any
+/// single-process deployment.
 const MAX_RATE_LIMITERS: usize = 1_000;
+
+/// Maximum number of economy budget tracker entries. Budget trackers are
+/// 1:1 with contexts and are bounded by context membership, so growth is
+/// inherently limited in practice. This constant provides a hard ceiling
+/// against any pathological caller. When at capacity and a new context ID
+/// is requested, an ephemeral (non-persisted) tracker is used and a warning
+/// is logged.
+const MAX_ECONOMY_CONTEXTS: usize = 10_000;
+
+/// Maximum number of bridge connector state entries.
+///
+/// These are 1:1 with contexts managed through the `ContextManager`, so the
+/// limit should never be reached in practice. Provided as a safety ceiling;
+/// the caller is responsible for calling [`BridgeInstance::remove_bridge_state`]
+/// during context cleanup.
+pub const MAX_BRIDGE_STATE_ENTRIES: usize = 10_000;
 
 /// Default sliding window duration for antispam velocity tracking (seconds).
 /// Matches the spec section 19.7 example.
@@ -215,7 +231,7 @@ pub struct BridgeInstance {
     /// Registered shutdown hooks for bridge-specific state cleanup.
     ///
     /// Each FFI bridge registers hooks that clear bridge-specific singletons
-    /// (`IDENTITY_REGISTRY`, `FFI_BRIDGE_STATE`, `ECONOMY_BUDGETS`, etc.)
+    /// (`IDENTITY_REGISTRY`, `FFI_BRIDGE_STATE`, `UCAN_REGISTRY`, etc.)
     /// during [`shutdown()`]. These singletons use bridge-specific types
     /// (e.g., `PyO3` `IdentityEntry` with `Arc<InMemoryKeyCustody>`) that
     /// cannot be owned by `BridgeInstance` because `scp-ffi-common` does not
@@ -418,13 +434,12 @@ impl BridgeInstance {
     /// material held by custody providers (zeroized via `Drop` when
     /// `Arc` refcount reaches zero).
     ///
-    /// # Errors
-    ///
-    /// Never returns `Err` — transport lock failures are logged and
-    /// cleanup continues. Shutdown must always complete.
-    pub fn shutdown(&self) -> Result<(), TransportLockError> {
+    /// This function is infallible. Transport lock failures are logged and
+    /// cleanup continues. Shutdown must always complete regardless of
+    /// intermediate failures.
+    pub fn shutdown(&self) {
         if self.shutdown.swap(true, Ordering::SeqCst) {
-            return Ok(()); // Already shut down
+            return; // Already shut down
         }
 
         // Clear transport (disconnect relay). Best-effort: if the RwLock
@@ -467,7 +482,6 @@ impl BridgeInstance {
         self.suspended.store(false, Ordering::SeqCst);
 
         tracing::debug!(local_did = %self.local_did, "bridge instance shut down");
-        Ok(())
     }
 
     // -----------------------------------------------------------------
@@ -493,10 +507,14 @@ impl BridgeInstance {
         manager: Arc<scp_transport::TransportManager>,
     ) -> Result<(), TransportLockError> {
         if self.is_shutdown() {
-            return Err(TransportLockError::NotInitialized);
+            return Err(TransportLockError::Rejected(
+                "bridge instance has been shut down — cannot set transport".to_owned(),
+            ));
         }
         if self.is_suspended() {
-            return Err(TransportLockError::NotInitialized);
+            return Err(TransportLockError::Rejected(
+                "bridge instance is suspended — call resume() before setting transport".to_owned(),
+            ));
         }
         let mut guard = self
             .transport
@@ -718,9 +736,11 @@ impl BridgeInstance {
     /// for the given identity DID, creating a default tracker if none exists.
     ///
     /// When the registry is at capacity ([`MAX_RATE_LIMITERS`]) and the
-    /// requested DID does not already have a tracker, uses a temporary
-    /// ephemeral tracker that is not persisted. This preserves the infallible
-    /// signature while preventing unbounded memory growth.
+    /// requested DID does not already have a tracker, the oldest (first)
+    /// entry is evicted to make room. This ensures rate limiting always has
+    /// persistent history — an evicted tracker loses its window state, but
+    /// rate limit bypass requires evicting and re-creating the same DID
+    /// repeatedly, which is itself a detectable attack pattern.
     ///
     /// Note: Under concurrent creation, the cap may be temporarily exceeded
     /// by up to `num_threads - 1` entries. This is bounded and benign.
@@ -732,15 +752,24 @@ impl BridgeInstance {
         if let Some(mut entry) = self.rate_limiters.get_mut(identity_did) {
             return f(entry.value_mut());
         }
-        // New entry: check capacity.
+        // New entry: evict oldest if at capacity.
         if self.rate_limiters.len() >= MAX_RATE_LIMITERS {
-            tracing::warn!(
-                identity_did = %identity_did,
-                capacity = MAX_RATE_LIMITERS,
-                "rate limiter registry at capacity — using ephemeral tracker"
-            );
-            let mut ephemeral = RateLimitTracker::default();
-            return f(&mut ephemeral);
+            // Move the iterator result out before entering the remove call to
+            // avoid holding the DashMap shard lock across the remove (which
+            // would deadlock on the same shard).
+            let oldest_key = self
+                .rate_limiters
+                .iter()
+                .next()
+                .map(|entry| entry.key().clone());
+            if let Some(oldest_key) = oldest_key {
+                self.rate_limiters.remove(&oldest_key);
+                tracing::debug!(
+                    evicted_did = %oldest_key,
+                    capacity = MAX_RATE_LIMITERS,
+                    "evicted oldest rate limiter entry to make room for new DID"
+                );
+            }
         }
         let mut entry = self
             .rate_limiters
@@ -756,10 +785,29 @@ impl BridgeInstance {
     /// Reads the budget tracker for a context, creating one if it doesn't exist.
     ///
     /// The closure receives an immutable reference to the tracker.
+    ///
+    /// When the registry is at capacity ([`MAX_ECONOMY_CONTEXTS`]) and the
+    /// requested context ID does not already have a tracker, an ephemeral
+    /// (non-persisted) default tracker is used and a warning is logged.
+    /// Budget trackers are 1:1 with contexts, so the cap should never be
+    /// reached unless [`remove_economy_state`] is not called on context cleanup.
     pub fn with_economy_budget<T, F>(&self, context_id: &str, f: F) -> T
     where
         F: FnOnce(&MemberBudgetTracker) -> T,
     {
+        if let Some(entry) = self.economy_budgets.get(context_id) {
+            return f(entry.value());
+        }
+        if self.economy_budgets.len() >= MAX_ECONOMY_CONTEXTS {
+            tracing::warn!(
+                context_id = %context_id,
+                capacity = MAX_ECONOMY_CONTEXTS,
+                "economy budget registry at capacity — using ephemeral tracker; \
+                 call remove_economy_state during context cleanup"
+            );
+            let ephemeral = MemberBudgetTracker::default();
+            return f(&ephemeral);
+        }
         let entry = self
             .economy_budgets
             .entry(context_id.to_owned())
@@ -770,10 +818,27 @@ impl BridgeInstance {
     /// Mutably accesses the budget tracker for a context, creating one if needed.
     ///
     /// The closure receives a mutable reference to the tracker.
+    ///
+    /// When the registry is at capacity ([`MAX_ECONOMY_CONTEXTS`]) and the
+    /// requested context ID does not already have a tracker, an ephemeral
+    /// (non-persisted) default tracker is used and a warning is logged.
     pub fn with_economy_budget_mut<T, F>(&self, context_id: &str, f: F) -> T
     where
         F: FnOnce(&mut MemberBudgetTracker) -> T,
     {
+        if let Some(mut entry) = self.economy_budgets.get_mut(context_id) {
+            return f(entry.value_mut());
+        }
+        if self.economy_budgets.len() >= MAX_ECONOMY_CONTEXTS {
+            tracing::warn!(
+                context_id = %context_id,
+                capacity = MAX_ECONOMY_CONTEXTS,
+                "economy budget registry at capacity — using ephemeral tracker; \
+                 call remove_economy_state during context cleanup"
+            );
+            let mut ephemeral = MemberBudgetTracker::default();
+            return f(&mut ephemeral);
+        }
         let mut entry = self
             .economy_budgets
             .entry(context_id.to_owned())
@@ -787,10 +852,27 @@ impl BridgeInstance {
     /// The closure receives a reference to the tracker (which is internally
     /// `Mutex`-protected, so `&self` methods like `record_message` and
     /// `get_velocity` work without `&mut`).
+    ///
+    /// When the registry is at capacity ([`MAX_ECONOMY_CONTEXTS`]) and the
+    /// requested context ID does not already have a tracker, an ephemeral
+    /// (non-persisted) tracker is used and a warning is logged.
     pub fn with_economy_antispam<T, F>(&self, context_id: &str, f: F) -> T
     where
         F: FnOnce(&SenderVelocityTracker) -> T,
     {
+        if let Some(entry) = self.economy_antispam.get(context_id) {
+            return f(entry.value());
+        }
+        if self.economy_antispam.len() >= MAX_ECONOMY_CONTEXTS {
+            tracing::warn!(
+                context_id = %context_id,
+                capacity = MAX_ECONOMY_CONTEXTS,
+                "economy antispam registry at capacity — using ephemeral tracker; \
+                 call remove_economy_state during context cleanup"
+            );
+            let ephemeral = SenderVelocityTracker::new(ANTISPAM_DEFAULT_WINDOW_SECS);
+            return f(&ephemeral);
+        }
         let entry = self
             .economy_antispam
             .entry(context_id.to_owned())
@@ -853,7 +935,7 @@ impl BridgeInstance {
 ///
 /// Used by [`BridgeInstance`] transport accessor methods. Bridge layers map
 /// this to their own error types (`ScpPyError`, napi `Error`, etc.).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TransportLockError {
     /// The transport `RwLock` was poisoned (a writer panicked while holding it).
     Poisoned,
@@ -862,6 +944,9 @@ pub enum TransportLockError {
     /// The transport manager `Arc` is in use by an active subscription task.
     /// Mutable access requires exclusive ownership (refcount == 1).
     InUse,
+    /// The operation was rejected due to a lifecycle violation — the bridge
+    /// instance is shut down or suspended and cannot accept transport changes.
+    Rejected(String),
 }
 
 impl std::fmt::Display for TransportLockError {
@@ -878,6 +963,7 @@ impl std::fmt::Display for TransportLockError {
                 )
             }
             Self::InUse => write!(f, "transport is busy — try again later"),
+            Self::Rejected(msg) => write!(f, "transport operation rejected: {msg}"),
         }
     }
 }
@@ -1058,11 +1144,11 @@ mod tests {
         let instance = BridgeInstance::new(test_context_manager(), "did:dht:ztest".to_owned());
 
         assert!(!instance.is_shutdown());
-        instance.shutdown().unwrap();
+        instance.shutdown();
         assert!(instance.is_shutdown());
 
         // Calling shutdown again is a no-op — still true
-        instance.shutdown().unwrap();
+        instance.shutdown();
         assert!(instance.is_shutdown());
     }
 
@@ -1215,6 +1301,10 @@ mod tests {
             TransportLockError::InUse.to_string(),
             "transport is busy \u{2014} try again later"
         );
+        assert_eq!(
+            TransportLockError::Rejected("bridge is shut down".to_owned()).to_string(),
+            "transport operation rejected: bridge is shut down"
+        );
     }
 
     // -----------------------------------------------------------------
@@ -1238,7 +1328,7 @@ mod tests {
     #[test]
     fn suspend_is_noop_when_shutdown() {
         let instance = BridgeInstance::new(test_context_manager(), "did:dht:ztest".to_owned());
-        instance.shutdown().unwrap();
+        instance.shutdown();
 
         // Suspending an already-shutdown instance is a no-op (not an error)
         instance.suspend().unwrap();
@@ -1259,7 +1349,7 @@ mod tests {
     #[test]
     fn resume_fails_after_shutdown() {
         let instance = BridgeInstance::new(test_context_manager(), "did:dht:ztest".to_owned());
-        instance.shutdown().unwrap();
+        instance.shutdown();
 
         let err = instance.resume().unwrap_err();
         assert_eq!(err, LifecycleError::AlreadyShutDown);
@@ -1285,13 +1375,13 @@ mod tests {
         );
         instance.with_rate_limit_tracker("did:dht:ztest", |_| {});
 
-        instance.shutdown().unwrap();
+        instance.shutdown();
         assert!(instance.is_shutdown());
         assert!(instance.known_contexts().is_empty());
         assert!(instance.rate_limiters().is_empty());
 
         // Second call is a no-op
-        instance.shutdown().unwrap();
+        instance.shutdown();
         assert!(instance.is_shutdown());
     }
 
@@ -1324,7 +1414,7 @@ mod tests {
         assert_eq!(instance.known_contexts().len(), 2);
         assert_eq!(instance.rate_limiters().len(), 2);
 
-        instance.shutdown().unwrap();
+        instance.shutdown();
 
         assert!(instance.known_contexts().is_empty());
         assert!(instance.rate_limiters().is_empty());
@@ -1336,7 +1426,7 @@ mod tests {
         instance.suspend().unwrap();
         assert!(instance.is_suspended());
 
-        instance.shutdown().unwrap();
+        instance.shutdown();
         assert!(instance.is_shutdown());
         // Shutdown supersedes suspension
         assert!(!instance.is_suspended());
@@ -1369,7 +1459,7 @@ mod tests {
     #[test]
     fn check_ready_fails_when_shutdown() {
         let instance = BridgeInstance::new(test_context_manager(), "did:dht:ztest".to_owned());
-        instance.shutdown().unwrap();
+        instance.shutdown();
         let err = instance.check_ready().unwrap_err();
         assert_eq!(err, LifecycleError::AlreadyShutDown);
     }
@@ -1425,7 +1515,7 @@ mod tests {
     }
 
     #[test]
-    fn rate_limiter_cap_uses_ephemeral() {
+    fn rate_limiter_cap_evicts_oldest() {
         let instance = BridgeInstance::new(test_context_manager(), "did:dht:ztest".to_owned());
 
         // Fill up to capacity.
@@ -1434,10 +1524,16 @@ mod tests {
         }
         assert_eq!(instance.rate_limiters().len(), MAX_RATE_LIMITERS);
 
-        // Next new DID uses ephemeral — registry stays at capacity.
+        // Next new DID evicts an oldest entry and persists the new one.
         let result = instance.with_rate_limit_tracker("did:dht:znew", |_| 42);
         assert_eq!(result, 42);
+        // Registry remains at capacity (one evicted, one added).
         assert_eq!(instance.rate_limiters().len(), MAX_RATE_LIMITERS);
+        // The new DID is now persisted.
+        assert!(
+            instance.rate_limiters().contains_key("did:dht:znew"),
+            "new DID should be persisted after eviction"
+        );
     }
 
     // -----------------------------------------------------------------
@@ -1463,7 +1559,7 @@ mod tests {
         // Before shutdown: hooks haven't run
         assert_eq!(counter.load(Ordering::SeqCst), 0);
 
-        instance.shutdown().unwrap();
+        instance.shutdown();
 
         // Both hooks ran
         assert_eq!(counter.load(Ordering::SeqCst), 11);
@@ -1481,11 +1577,11 @@ mod tests {
             c.fetch_add(1, Ordering::SeqCst);
         }));
 
-        instance.shutdown().unwrap();
+        instance.shutdown();
         assert_eq!(counter.load(Ordering::SeqCst), 1);
 
         // Second shutdown is idempotent — hooks don't run again
-        instance.shutdown().unwrap();
+        instance.shutdown();
         assert_eq!(counter.load(Ordering::SeqCst), 1);
     }
 
@@ -1494,7 +1590,7 @@ mod tests {
         use std::sync::atomic::{AtomicBool, Ordering};
         let instance = BridgeInstance::new(test_context_manager(), "did:dht:ztest".to_owned());
 
-        instance.shutdown().unwrap();
+        instance.shutdown();
 
         let ran = Arc::new(AtomicBool::new(false));
         let r = Arc::clone(&ran);
@@ -1519,12 +1615,16 @@ mod tests {
     #[test]
     fn set_transport_rejects_after_shutdown() {
         let instance = BridgeInstance::new(test_context_manager(), "did:dht:ztest".to_owned());
-        instance.shutdown().unwrap();
+        instance.shutdown();
 
         let err = instance
             .set_transport(Arc::new(test_transport_manager()))
             .unwrap_err();
-        assert_eq!(err, TransportLockError::NotInitialized);
+        assert!(
+            matches!(err, TransportLockError::Rejected(_)),
+            "expected Rejected, got {err:?}"
+        );
+        assert!(err.to_string().contains("shut down"));
     }
 
     #[test]
@@ -1535,7 +1635,11 @@ mod tests {
         let err = instance
             .set_transport(Arc::new(test_transport_manager()))
             .unwrap_err();
-        assert_eq!(err, TransportLockError::NotInitialized);
+        assert!(
+            matches!(err, TransportLockError::Rejected(_)),
+            "expected Rejected, got {err:?}"
+        );
+        assert!(err.to_string().contains("suspended"));
     }
 
     #[test]
@@ -1560,7 +1664,7 @@ mod tests {
     #[allow(clippy::panic)]
     fn register_hook_after_shutdown_catches_panic() {
         let instance = BridgeInstance::new(test_context_manager(), "did:dht:ztest".to_owned());
-        instance.shutdown().unwrap();
+        instance.shutdown();
 
         // A panicking hook registered after shutdown must not propagate.
         instance.register_shutdown_hook(Box::new(|| {
@@ -1569,6 +1673,69 @@ mod tests {
 
         // If we got here, the panic was caught.
         assert!(instance.is_shutdown());
+    }
+
+    // -----------------------------------------------------------------
+    // Shutdown hook: hooks run exactly once, modify external state
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn shutdown_hook_modifies_external_state() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let instance = BridgeInstance::new(test_context_manager(), "did:dht:ztest".to_owned());
+        let state = Arc::new(AtomicBool::new(false));
+        let state2 = Arc::clone(&state);
+
+        instance.register_shutdown_hook(Box::new(move || {
+            state2.store(true, Ordering::SeqCst);
+        }));
+
+        // Hook has not run yet.
+        assert!(
+            !state.load(Ordering::SeqCst),
+            "hook must not run before shutdown"
+        );
+
+        instance.shutdown();
+
+        assert!(
+            state.load(Ordering::SeqCst),
+            "hook must have modified external state during shutdown"
+        );
+    }
+
+    #[test]
+    #[allow(clippy::panic)]
+    fn multiple_hooks_all_run_even_if_one_panics() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let instance = BridgeInstance::new(test_context_manager(), "did:dht:ztest".to_owned());
+        let counter = Arc::new(AtomicUsize::new(0));
+        let c1 = Arc::clone(&counter);
+        let c3 = Arc::clone(&counter);
+
+        // Hook 1: increments counter.
+        instance.register_shutdown_hook(Box::new(move || {
+            c1.fetch_add(1, Ordering::SeqCst);
+        }));
+        // Hook 2: panics — must not prevent hook 3 from running.
+        instance.register_shutdown_hook(Box::new(|| {
+            panic!("deliberate panic to test isolation between hooks");
+        }));
+        // Hook 3: increments counter.
+        instance.register_shutdown_hook(Box::new(move || {
+            c3.fetch_add(1, Ordering::SeqCst);
+        }));
+
+        instance.shutdown();
+
+        // Hooks 1 and 3 both ran despite hook 2 panicking.
+        assert_eq!(
+            counter.load(Ordering::SeqCst),
+            2,
+            "hooks 1 and 3 must both run even when hook 2 panics"
+        );
     }
 
     // -----------------------------------------------------------------
@@ -1620,6 +1787,27 @@ mod tests {
         // Budget should be fresh (zero) after removal.
         let remaining = instance.with_economy_budget("ctx-rm", |tracker| tracker.remaining(&did));
         assert_eq!(remaining.value(), 0);
+    }
+
+    #[test]
+    fn economy_existing_context_id_bypasses_capacity_check() {
+        let instance = BridgeInstance::new(test_context_manager(), "did:dht:ztest".to_owned());
+        let did = scp_primitives::DID::from("did:dht:zalice");
+
+        // Create one entry.
+        instance.with_economy_budget_mut("ctx-exist", |tracker| {
+            tracker.grant(&did, scp_protocol::economy::Amount::new(777));
+        });
+
+        // Reading the same context ID when the map is non-empty uses the
+        // existing entry (not ephemeral).
+        let remaining =
+            instance.with_economy_budget("ctx-exist", |tracker| tracker.remaining(&did));
+        assert_eq!(
+            remaining.value(),
+            777,
+            "existing entry must be served, not an ephemeral default"
+        );
     }
 
     // -----------------------------------------------------------------
@@ -1688,7 +1876,7 @@ mod tests {
             },
         );
 
-        instance.shutdown().unwrap();
+        instance.shutdown();
 
         assert!(instance.bridge_state().is_empty());
         // Economy DashMaps should be cleared

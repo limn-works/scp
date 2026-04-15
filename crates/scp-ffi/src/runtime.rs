@@ -1764,4 +1764,39 @@ mod tests {
             "bridge_instance should not be shutdown immediately after init"
         );
     }
+
+    #[test]
+    fn shutdown_hook_runs_with_external_state() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        // Build an isolated BridgeInstance (not the global one) to avoid
+        // interfering with the OnceLock-based singleton used by other tests.
+        // BridgeInstance is in scope via `use super::*` (imported at module top).
+        let persistence = build_persistence_provider();
+        let cm = build_context_manager(
+            Box::new(NoOpCryptoProvider),
+            Box::new(scp_core::context::LocalTransportProvider),
+            Box::new(NoOpEventLogProvider),
+            persistence,
+        );
+        let bi = BridgeInstance::new(cm, "did:test:pyo3-hook-isolated".to_owned());
+
+        let ran = Arc::new(AtomicBool::new(false));
+        let ran2 = Arc::clone(&ran);
+
+        bi.register_shutdown_hook(Box::new(move || {
+            ran2.store(true, Ordering::SeqCst);
+        }));
+
+        assert!(
+            !ran.load(Ordering::SeqCst),
+            "hook must not fire before shutdown"
+        );
+        bi.shutdown();
+        assert!(
+            ran.load(Ordering::SeqCst),
+            "shutdown hook must execute during BridgeInstance::shutdown()"
+        );
+    }
 }

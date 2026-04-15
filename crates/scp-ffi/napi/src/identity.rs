@@ -69,11 +69,12 @@ use scp_ffi_common::validate::MAX_IDENTITY_LINK_ATTESTATIONS_PER_DID;
 ///
 /// Uses `std::sync::Once` to guard the entire initialization block atomically.
 /// Without this, two separate `OnceLock::set` calls (`SHARED_DHT_CLIENT` and
-/// `DID_RESOLVER`) could race under concurrent access: thread A creates
-/// `InMemoryDhtClient` X and sets `SHARED_DHT_CLIENT`, then thread B creates
-/// `InMemoryDhtClient` Y, fails to set `SHARED_DHT_CLIENT` (already set to X),
-/// but builds a `DualLayerResolver` around Y and sets `DID_RESOLVER` — the
-/// resolver and the shared DHT client would reference different instances.
+/// `BridgeInstance::did_resolver`) could race under concurrent access: thread A
+/// creates `InMemoryDhtClient` X and sets `SHARED_DHT_CLIENT`, then thread B
+/// creates `InMemoryDhtClient` Y, fails to set `SHARED_DHT_CLIENT` (already set
+/// to X), but builds a `DualLayerResolver` around Y and stores it in
+/// `BridgeInstance` — the resolver and the shared DHT client would reference
+/// different instances.
 fn ensure_did_resolver_initialized() {
     static INIT: std::sync::Once = std::sync::Once::new();
 

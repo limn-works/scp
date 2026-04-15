@@ -211,6 +211,11 @@ Notes:
 ### MEDIUM: Buffer event timestamp estimation exploitable (BLACK-1604)
 ### Testing gap: E2eCryptoProvider hardcodes epoch=0, seq=0
 
+## PR #1628 BridgeInstance Extraction (2026-04-14)
+- See [pr1628-bridge-instance.md](pr1628-bridge-instance.md)
+- BLACK-301: post-shutdown ghost ops (warn-only lifecycle), BLACK-303: placeholder DID confusion
+- BLACK-308: rate limiter ephemeral bypass, BLACK-309: economy unbounded growth
+
 ## Complete Branch Review (2026-04-01) -- consequence/economy/FFI
 
 ### CRITICAL: Consequence WarningCount weaponized against innocents (BLACK-1706)
