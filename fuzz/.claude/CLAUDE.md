@@ -181,8 +181,8 @@ Every target asserts at minimum **I1** (no panic on any untrusted input). Additi
 | I4 | Nonce replay prevention: accepted nonce never re-accepted | — (future T20) |
 | I5 | Epoch monotonicity: no rollback | — (future T19) |
 | I6 | Timestamps outside `[now - max_age, now + skew]` always rejected | T18 |
-| I7 | Capabilities outside ceiling always rejected | T18 |
-| I8 | Delegation chain verification terminates (depth ≤ 32) | T18 |
+| I7 | Capabilities outside ceiling always rejected | — (T18 fixes capability + ceiling, not exercised) |
+| I8 | Delegation chain verification terminates (depth ≤ 32) | — (T18 uses empty `prf`, no chain walked) |
 | I9 | Different `(context_id, sender_did)` → different AAD | T17 |
 | I10 | Different `InnerEnvelopeParams` → different canonical hash | T16 |
 
