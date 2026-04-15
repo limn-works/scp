@@ -114,6 +114,53 @@ proptest! {
 }
 ```
 
+### Fuzzing (cargo-fuzz)
+
+SCP uses cargo-fuzz (libFuzzer) for parser safety and security invariant testing at trust
+boundaries. The fuzz crate lives at `fuzz/` (repo root) — a **standalone crate, not a
+workspace member**. All `cargo fuzz` commands require nightly:
+
+```sh
+cargo +nightly fuzz list --fuzz-dir fuzz          # list all 19 targets
+cargo +nightly fuzz run <target> --fuzz-dir fuzz \
+  -- -dict=fuzz/dicts/<dict> -max_total_time=60    # run one target locally
+cargo +nightly check --manifest-path fuzz/Cargo.toml  # compile-check (no fuzzing)
+```
+
+**Tier strategy** (ADR-045):
+
+| Tier | Focus | Input strategy | CI |
+|------|-------|----------------|-----|
+| T1 — Wire parsers | B1 relay wire, B2 post-MLS | Raw bytes + dictionary | Nightly, 15 min |
+| T2 — Content trust | B2 content, B3 resolution | Raw bytes + dictionary | Nightly, 5 min |
+| T3 — Invariants | Security properties, roundtrips | Raw bytes or `Arbitrary` | Local/manual |
+| T4 — Deep validation | Paths requiring semantic validity | `Arbitrary` + real crypto | Local/manual |
+
+**When to add a new fuzz target:**
+
+1. A new type has a `from_bytes` or `from_str` entry point at a trust boundary (B1/B2/B3).
+   → Add a Tier 1 or Tier 2 raw-bytes target.
+2. A security invariant (I1–I10 in `fuzz/README.md`) is not yet covered by any target.
+   → Add a Tier 3 or Tier 4 target.
+3. A new enum variant or struct field is added to a fuzzed type.
+   → Update the corresponding dictionary in `fuzz/dicts/`.
+
+**Do NOT use `Arbitrary` for parser targets (T1/T2).** Raw bytes give libFuzzer direct
+mutation-coverage feedback. `Arbitrary` wrappers cause the fuzzer to mutate the Arbitrary
+encoding rather than the parser input, breaking coverage guidance. See
+`.docs/lessons/fuzz-raw-bytes-over-arbitrary-wrappers.md`.
+
+**Do NOT replicate private production functions in fuzz targets.** Replicas drift silently.
+Prefer promoting the function to `#[doc(hidden)] pub` so the fuzz target calls the real
+implementation. See `.docs/lessons/fuzz-replica-production-type-drift.md`.
+
+**Size-gate before deserialization.** Any `from_bytes` function on a type with
+`#[serde(flatten)]` fields MUST check `data.len() > MAX_SIZE` before calling
+`rmp_serde::from_slice`. See `.docs/lessons/serde-flatten-rmpv-value-buffering.md`.
+
+See `fuzz/README.md` for the full target inventory, crash workflow, and corpus management.
+See `fuzz/.claude/CLAUDE.md` for agent-facing conventions.
+
 ### Test naming
 
 ```rust

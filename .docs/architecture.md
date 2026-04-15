@@ -1156,6 +1156,8 @@ Build:
   • Security audit
   • Governance models beyond single-admin — DONE: GovernanceEngine trait with SingleAdmin,
     Threshold (M-of-N), Majority, and Unanimity models (ADR-031, SCP-129–133)
+  • Fuzzing infrastructure — DONE: standalone fuzz/ crate, 19 targets across 4 tiers,
+    nightly + weekly CI campaigns (ADR-045, PRs #1643–1645)
 
 Test:
   • Load testing: 1000 SimulatedIdentity instances in scp-testing simulator,
@@ -1167,7 +1169,35 @@ Test:
   • Security: penetration testing, formal verification of crypto flows
   • Cross-platform conformance: all five language SDKs (Rust, Python, TypeScript,
     Swift, Kotlin) pass trait conformance suites through their respective FFI layers
+  • Fuzzing (parser safety + security invariants): 19 libFuzzer targets covering all
+    three trust boundaries (B1 relay wire, B2 post-MLS content, B3 resolution/discovery);
+    security invariants I1–I10 catalogued in fuzz/README.md; nightly CI runs T1 (15 min)
+    and T2 (5 min) targets; weekly Saturday deep-fuzz runs T1 with UBSan (2 h each);
+    per-PR fuzz-build check catches compilation breakage without running the fuzzer.
+    See ADR-045 and fuzz/README.md.
 ```
+
+#### Testing pyramid
+
+```
+  Integration / E2E tests    ← behavioral correctness across components (scp-testing harness)
+  Fuzz targets               ← parser safety + security invariants at trust boundaries
+  Property tests (proptest)  ← algebraic properties of individual types
+  Unit tests                 ← local function correctness
+```
+
+The fuzz layer occupies a distinct position between integration tests and property tests.
+It targets the protocol's external trust boundaries — the relay wire format (B1), post-MLS
+plaintext (B2), and resolution inputs (B3) — where remote adversaries control the input.
+Proptest verifies algebraic properties of already-parsed, trusted types. The two are
+complementary: proptest catches logic bugs, fuzzing catches parsing bugs.
+
+The 19 fuzz targets are organized into four tiers (ADR-045): T1 wire parsers (raw bytes +
+dicts), T2 content trust boundaries (raw bytes + dicts), T3 invariant/differential (mix
+of raw bytes and `Arbitrary`), and T4 deep validation (structured `Arbitrary` with real
+cryptographic material). The invariant catalog I1–I10 is the governance artifact: every
+target maps to one or more invariants; adding, weakening, or removing an invariant requires
+human approval.
 
 ---
 

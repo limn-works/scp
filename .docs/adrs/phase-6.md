@@ -4,7 +4,7 @@
 **Phase goal:** Android platform, Kotlin SDK, scale hardening, security audit, advanced governance, offline strategy.
 **Timeline:** Weeks 21+
 
-**Note:** Phase 6 follows Phases 1-5 implementation. All ADRs in this phase — ADR-027 (Android), ADR-028 (Kotlin), ADR-029 (Offline/Sync), ADR-030 (Event Log Pruning), ADR-031 (Multi-Admin Governance), ADR-038 (Content Access Key Layer), ADR-043 (Protocol Constants), and ADR-044 (Attestation Two-Class Model) — are Decided.
+**Note:** Phase 6 follows Phases 1-5 implementation. All ADRs in this phase — ADR-027 (Android), ADR-028 (Kotlin), ADR-029 (Offline/Sync), ADR-030 (Event Log Pruning), ADR-031 (Multi-Admin Governance), ADR-038 (Content Access Key Layer), ADR-043 (Protocol Constants), ADR-044 (Attestation Two-Class Model), and ADR-045 (Fuzzing Infrastructure) — are Decided.
 
 **Dependencies between ADRs:**
 
@@ -21,7 +21,8 @@ Phase 1-5 ADRs
        ├── ADR-031 (Multi-Admin Governance) <── Phase 2 UCAN + single-admin governance
        ├── ADR-038 (Content Access Key Layer) <── ADR-007 (Sender Keys) + ADR-031 (Governance)
        ├── ADR-043 (Protocol Constants) <── Phase 1-5 implementation + empirical data
-       └── ADR-044 (Attestation Two-Class Model) <── §3.5 (Identity Attestations) + §7.4.1 (Attestation Format)
+       ├── ADR-044 (Attestation Two-Class Model) <── §3.5 (Identity Attestations) + §7.4.1 (Attestation Format)
+       └── ADR-045 (Fuzzing Infrastructure) <── Phase 1-5 parsers + ADR-043 (Protocol Constants) + §9 (Crypto)
 ```
 
 ---
@@ -3525,3 +3526,174 @@ The self-attestation model is acceptable for identity links specifically because
 7. No new `AttestationType` variant introduced — class is derived from `evidence.method`.
 
 **Migration note.** Changing the canonical signing bytes (replacing `revocation` with `revocation_status`) requires incrementing the domain separator from `SCP-IDENTITY-LINK-ATTESTATION-V1:` to `V2` per §9.5.1. No production attestations exist, so no backward compatibility is needed. The V2 separator is adopted in this spec change. The implementation PR uses V2 from the start.
+
+---
+
+## ADR-045: Fuzzing Infrastructure
+
+**Status:** Decided
+**Date:** April 2026
+**PRs:** #1643 (initial 18 targets), #1644 (size-gate fixes), #1645 (CI workflows), #1652 (documentation follow-up)
+
+### Context
+
+SCP's relay is explicitly an untrusted dumb pipe — any TCP connection can deliver bytes to the wire parser. Post-MLS decryption is a second trust boundary because authentication success does not imply that the plaintext is well-formed. A third boundary exists at resolution/discovery (DHT poisoning, adversarial UCAN chains). Parser panics at any of these boundaries are P0 security bugs.
+
+Property-based testing (proptest) covers algebraic properties of individual types and is already required (see `.docs/standards/rust.md` §Testing). Proptest does not provide: (a) coverage-guided mutation, (b) dictionary-assisted byte-level fuzzing of wire formats, or (c) continuous regression as the protocol evolves. cargo-fuzz (libFuzzer) fills this gap.
+
+The security audit phase (Phase 6) surfaced three categories of parser risk:
+
+1. **`#[serde(flatten)]` + `rmpv::Value` buffering.** MessagePack deserialization via `rmp-serde` with `#[serde(flatten)]` buffers the entire message into an intermediate `rmpv::Value` before field extraction. Without a size gate *before* `rmp_serde::from_slice`, a 4-byte "this blob is 4 GiB" header causes an OOM-abort before any application code runs. Found and fixed in PR #1644.
+
+2. **Replica drift.** Fuzz targets that re-implement private production functions (CID format, `build_sender_aad`, ceiling format) drift silently as the production code evolves. Three HIGH-severity bugs were found in `fuzz_validate_ucan_deep` (Round 1 review) because the replica was stale.
+
+3. **`InMemoryNonceTracker` clock coupling.** `InMemoryNonceTracker::check_replay` uses `SystemClock` directly, not an injected clock. Fuzz targets that exercise replay detection are therefore non-deterministic. Discovered during `fuzz_validate_ucan_deep` wiring.
+
+The plan for the fuzzing infrastructure was reviewed by 7 agents before implementation began. The key structural decision — standalone `fuzz/` crate vs. per-crate `fuzz/` dirs vs. workspace member — required explicit consensus because it affects how CI is structured, how nightly Rust is isolated, and how the corpus is organized.
+
+### Decision
+
+**Standalone `fuzz/` crate at repo root, not a workspace member.**
+
+`fuzz/Cargo.toml` contains `[workspace]`, explicitly opting out of the root workspace. The fuzz crate depends on production crates via path dependencies:
+
+```toml
+[workspace]
+
+scp-protocol = { path = "../crates/scp-protocol", features = ["testing"] }
+scp-transport = { path = "../crates/scp-transport" }
+scp-runtime   = { path = "../crates/scp-runtime",  features = ["testing"] }
+scp-event-log = { path = "../crates/scp-event-log" }
+```
+
+**Four-tier target strategy.** 19 targets total across four tiers:
+
+| Tier | Focus | Strategy | CI cadence |
+|------|-------|----------|-----------|
+| T1 — Wire Format Parsers | B1 relay wire, B2 post-MLS | Raw bytes + dict | Nightly, 15 min/target |
+| T2 — Content Trust Boundaries | B2 inner content, B3 resolution | Raw bytes + dict | Nightly, 5 min/target |
+| T3 — Invariant & Differential | Security properties, roundtrips | Mix raw + Arbitrary | Local / `workflow_dispatch` |
+| T4 — Validation Depth & State | Paths requiring semantic validity | Arbitrary + real Ed25519 | Local / `workflow_dispatch` |
+
+**Trust boundaries:**
+- **B1:** Relay wire protocol — any unauthenticated TCP connection
+- **B2:** Post-MLS decryption — authenticated but untrusted plaintext
+- **B3:** Resolution/discovery — network adversary, DHT poisoning
+
+**Raw bytes + dicts for T1/T2; Arbitrary only for T3/T4.**
+
+For parser and deserializer targets (T1/T2), the fuzzer receives a raw `&[u8]` slice and a libFuzzer dictionary of field names and structural MessagePack bytes. This gives libFuzzer direct mutation-coverage feedback — every mutated byte in the input corresponds to a byte in the parser's input. Wrapping in an `Arbitrary` type would cause the fuzzer to mutate the `Arbitrary` binary encoding, not the parser input, breaking the coverage feedback loop.
+
+`Arbitrary` is reserved for T3/T4 where raw bytes cannot reach the code path (e.g., merkle proof verification requires a structurally consistent proof, or differential targets require two semantically distinct inputs).
+
+**Invariant catalog I1–I10 as governance artifact.** The security invariants are defined once in `fuzz/README.md` and `fuzz/.claude/CLAUDE.md`, and referenced by target. Any new target must map to at least one invariant. Adding, weakening, or removing an invariant requires human approval.
+
+**CI cadence:**
+- **Nightly** (`.github/workflows/fuzz.yml`, 03:00 UTC): T1 targets 15 min each, T2 targets 5 min each. All targets parallel. Corpus cached per-target with `actions/cache`; `cargo fuzz cmin` runs after each campaign.
+- **Weekly deep-fuzz** (Saturday 00:00 UTC or `workflow_dispatch`): T1 targets only, 2 hours each, AddressSanitizer enabled (cargo-fuzz default) + UBSan on Saturdays.
+- **Per-PR compilation check** (`cargo +nightly check --manifest-path fuzz/Cargo.toml`): catches API breakage without running the fuzzer. Runs in `.github/workflows/ci.yml` as `fuzz-build`.
+
+### Rationale
+
+**Why standalone crate, not workspace member?**
+
+libFuzzer requires `rustc +nightly`. Adding `fuzz/` to the root workspace would force every `cargo clippy --workspace`, `cargo test --workspace`, and `cargo build --workspace` call to require nightly — or to skip the fuzz crate with `--exclude`, which is easily forgotten. The standalone crate cleanly separates the nightly build surface from the stable workspace. Clippy lints from the workspace `[workspace.lints]` do not apply to the fuzz crate; the fuzz crate uses `#![allow(clippy::unwrap_used, clippy::panic, clippy::expect_used)]` at the target level because the libFuzzer harness uses panics for crash detection.
+
+The 7-reviewer consensus during plan review confirmed this trade-off: corpus centralization (one `fuzz/corpus/` tree) and simpler CI matrix outweigh the mild awkwardness of a separate manifest path.
+
+**Why not per-crate `fuzz/` directories?**
+
+Per-crate directories fragment the corpus: `scp-protocol/fuzz/corpus/` and `scp-runtime/fuzz/corpus/` have no cross-pollination by default. Many wire-format fuzz targets exercise code paths across multiple crates (e.g., `fuzz_outer_envelope` calls into `scp-protocol` and `scp-transport`). A single `fuzz/` at the repo root with one corpus tree enables cross-pollination between related targets and avoids duplicate harness boilerplate.
+
+**Why not `Arbitrary`-everywhere?**
+
+The libFuzzer mutation engine works by flipping bytes in the input and observing which new coverage edges are discovered. For a raw-bytes target this works perfectly: a bit flip in a MessagePack field-name byte might cross a branch in the parser. For an `Arbitrary`-wrapped target, the mutation happens in the `Arbitrary` binary encoding — the actual parser input may not change at all, or may change in unrelated ways. This breaks the coverage-guided feedback loop that makes libFuzzer effective at finding parsing bugs.
+
+`Arbitrary` remains the right choice for T3/T4 where the target cannot accept arbitrary bytes (e.g., `fuzz_merkle_proof` needs a structurally consistent proof; `fuzz_canonical_hash_differential` needs two semantically distinct `InnerEnvelopeParams`).
+
+### Security Invariant Catalog (I1–I10)
+
+These invariants are the governance artifact for the fuzzing infrastructure. Every target maps to one or more of these invariants. Adding a new invariant requires an ADR amendment or a new ADR. Removing or weakening an existing invariant requires human approval.
+
+| ID | Invariant | Current coverage |
+|----|-----------|-----------------|
+| I1 | No panic on any untrusted input | All 19 targets |
+| I2 | No unbounded allocation (bounded by protocol constants from ADR-043) | T1–T6, T10–T11, T14–T15 |
+| I3 | Cryptographic signatures unforgeable (no structural bypass) | T16, T18 |
+| I4 | Nonce replay prevention: accepted nonce never re-accepted | Future T20 (blocked: `InMemoryNonceTracker` uses `SystemClock`) |
+| I5 | Epoch monotonicity: no rollback | Future T19 |
+| I6 | Timestamps outside `[now - max_age, now + skew]` always rejected | T18 |
+| I7 | Capabilities outside ceiling always rejected | T18 (wired but not exercised with non-empty chain) |
+| I8 | Delegation chain verification terminates (depth ≤ 32) | T18 (empty `prf`, no chain walked) |
+| I9 | Different `(context_id, sender_did)` → different AAD | T17 |
+| I10 | Different `InnerEnvelopeParams` → different canonical hash | T16 |
+
+I4 and I5 are blocked on clock injection into `InMemoryNonceTracker` (see `.docs/lessons/in-memory-nonce-tracker-system-clock.md`).
+
+### Rejected Alternatives
+
+**1. Per-crate `fuzz/` directories.** Rejected because: (a) corpus fragmentation — each crate has its own corpus with no cross-pollination; (b) duplicate harness boilerplate across crates; (c) CI matrix complexity — each crate would need its own fuzz workflow; (d) cross-crate targets (e.g., envelope parsing exercises `scp-protocol` + `scp-transport`) don't have a natural home.
+
+**2. `Arbitrary`-everywhere (all targets use structured generation).** Rejected because: (a) breaks libFuzzer mutation-coverage feedback for parser targets — the fuzzer mutates the `Arbitrary` encoding, not the parser input; (b) parser bugs (the primary security risk at B1) are best found by raw byte fuzzing + dictionaries; (c) `Arbitrary` types must be maintained in sync with production types — they drift (see `.docs/lessons/fuzz-replica-production-type-drift.md`). Reserved for T3/T4 where raw bytes cannot reach the code path.
+
+**3. Workspace member with `cfg(fuzzing)` feature flag.** Adding `fuzz/` to the root workspace with a feature flag to enable nightly-only code paths. Rejected because: (a) nightly is required by `libfuzzer-sys` at the crate level, not just by feature-gated code — the workspace would need nightly for all builds; (b) `cargo clippy --workspace` would cover fuzz targets, requiring the fuzz-specific `#![allow(...)]` suppression to be workspace-level or per-file.
+
+**4. AFL++ instead of cargo-fuzz/libFuzzer.** Rejected because: (a) cargo-fuzz is the idiomatic Rust fuzzing tool with best LLVM coverage integration; (b) AFL++ requires a separate build system integration; (c) structured `Arbitrary` generation is a cargo-fuzz/libFuzzer first-class feature via `libfuzzer-sys`.
+
+### Implementation
+
+```
+fuzz/                        # Standalone cargo-fuzz crate (not workspace member)
+├── Cargo.toml               # [workspace] block, path deps to production crates
+├── Cargo.lock               # Separate lock file — fuzzer deps don't pollute root lockfile
+├── README.md                # Operator docs: quick start, target inventory, crash workflow
+├── src/
+│   └── lib.rs               # Shared Arbitrary types (ArbMerkleProof, ArbCanonicalHashInput, …)
+├── fuzz_targets/            # 19 target files
+│   ├── fuzz_outer_envelope.rs          # T1/B1 — raw bytes
+│   ├── fuzz_inner_envelope.rs          # T1/B2 — raw bytes
+│   ├── fuzz_client_message.rs          # T1/B1 — raw bytes
+│   ├── fuzz_relay_message.rs           # T1/B1 — raw bytes
+│   ├── fuzz_sender_key_dist.rs         # T1/B2 — raw bytes
+│   ├── fuzz_scp_credential.rs          # T1/B2 — raw bytes
+│   ├── fuzz_parse_ucan.rs              # T2/B3 — raw UTF-8
+│   ├── fuzz_scp_uri.rs                 # T2/B3 — raw UTF-8
+│   ├── fuzz_capability_uri.rs          # T2/B3 — raw UTF-8
+│   ├── fuzz_broadcast_content.rs       # T2/B2 — raw bytes
+│   ├── fuzz_deserialize_export.rs      # T2/B2 — raw bytes
+│   ├── fuzz_outer_envelope_roundtrip.rs # T3/B1 — raw bytes, I1+roundtrip+hash stability
+│   ├── fuzz_sender_header_roundtrip.rs  # T3/B1 — raw bytes, I1+parse→build→parse identity
+│   ├── fuzz_chunk_envelope.rs           # T3/B2 — raw bytes, I1+I2
+│   ├── fuzz_merkle_proof.rs             # T3/B3 — Arbitrary, I1+I2+bit-flip sensitivity
+│   ├── fuzz_merkle_proof_random.rs      # T3/B3 — Arbitrary, I1
+│   ├── fuzz_canonical_hash_differential.rs # T3/B2 — Arbitrary, I1+I10
+│   ├── fuzz_aad_differential.rs         # T3/B2 — Arbitrary, I1+I9  (target 18)
+│   └── fuzz_validate_ucan_deep.rs       # T4/B3 — Arbitrary+real Ed25519, I1+I3+I6+I7+I8
+├── dicts/                   # libFuzzer dictionaries (one per target family)
+│   ├── msgpack_outer_envelope.dict
+│   ├── msgpack_inner_envelope.dict
+│   ├── msgpack_client_message.dict
+│   ├── msgpack_relay_message.dict
+│   ├── msgpack_sender_key.dict
+│   ├── msgpack_credential.dict
+│   ├── msgpack_broadcast.dict
+│   ├── msgpack_export.dict
+│   ├── ucan_jwt.dict
+│   ├── scp_uri.dict
+│   └── capability_uri.dict
+└── corpus/                  # Seed corpora (checked in); crash artifacts (gitignored)
+    └── <target>/            # One directory per target
+```
+
+### Acceptance Criteria
+
+1. `cargo +nightly fuzz list --fuzz-dir fuzz` lists all 19 targets.
+2. `cargo +nightly check --manifest-path fuzz/Cargo.toml` succeeds on stable CI (nightly toolchain via `+nightly` flag).
+3. Fuzz crate is NOT listed in root `Cargo.toml` `[workspace] members`.
+4. `.github/workflows/fuzz.yml` runs T1 targets (15 min) and T2 targets (5 min) nightly; T1 targets with UBSan weekly.
+5. `.github/workflows/ci.yml` includes a `fuzz-build` job that runs `cargo +nightly check --manifest-path fuzz/Cargo.toml`.
+6. Security invariants I1–I10 are documented in `fuzz/README.md` with current coverage status.
+7. `fuzz/.claude/CLAUDE.md` exists with agent-facing conventions: standalone crate caution, nightly requirement, raw-bytes-vs-Arbitrary guidance, dictionary format, invariant catalog.
+8. All T1/T2 targets use raw bytes (`|data: &[u8]|`). All T3/T4 targets that require semantic structure use `Arbitrary`.
+9. `fuzz/Cargo.lock` is committed (separate from root `Cargo.lock`).
+10. Crash workflow documented: reproduce → minimize (`fuzz tmin`) → file issue → add regression `#[test]`.

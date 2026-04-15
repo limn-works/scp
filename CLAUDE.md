@@ -141,6 +141,7 @@ All tools via [mise](https://mise.jdx.dev/) (see `.mise.toml`). **Never use npm 
 | **TypeScript** | `bindings/typescript/` | **bun** (not npm) | `bun run lint` (biome) | `bun run format` (biome) | `bun test` | `bun run build` (tsup) |
 | **Kotlin** | `bindings/kotlin/` | Gradle 8.x | `./gradlew detekt` | — | `./gradlew test` | `./gradlew assembleRelease` |
 | **WASM** | `crates/scp-ffi/wasm/` | cargo | `cargo clippy -p scp-ffi-wasm --target wasm32-unknown-unknown` | `cargo fmt` | conformance via `cargo test -p scp-core --test wasm_conformance` | `wasm-pack build crates/scp-ffi/wasm --target bundler` |
+| **Fuzzing** | `fuzz/` (standalone, not workspace) | cargo-fuzz (**nightly only**) | — | — | `cargo +nightly fuzz run <target> --fuzz-dir fuzz` | `cargo +nightly check --manifest-path fuzz/Cargo.toml` |
 
 **Language-specific gotchas:**
 
@@ -149,6 +150,7 @@ All tools via [mise](https://mise.jdx.dev/) (see `.mise.toml`). **Never use npm 
 - **WASM:** Cannot depend on scp-core (tokio multi-thread). Re-implements algorithms locally. See ADR-034.
 - **TypeScript:** `bun run check` runs `tsc --noEmit` for type checking. Biome handles both lint and format.
 - **PRD validation:** `python3.12 scripts/validate-prd.py` — run before committing PRD changes.
+- **Fuzzing:** `fuzz/` is a standalone crate — never add it to root `Cargo.toml` members. All commands require `+nightly`. List targets: `cargo +nightly fuzz list --fuzz-dir fuzz`. See ADR-045 and `fuzz/README.md`.
 
 ### Git
 
