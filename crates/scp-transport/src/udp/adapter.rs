@@ -187,8 +187,10 @@ impl UdpDtlsAdapter {
 
         let response_data = self.recv_datagram().await?;
 
-        let response: RelayMessage = rmp_serde::from_slice(&response_data).map_err(|e| {
-            TransportError::ProtocolError(format!("MessagePack deserialization failed: {e}"))
+        // `RelayMessage::from_bytes` rejects payloads exceeding `MAX_MESSAGE_SIZE`
+        // before invoking the MessagePack deserializer, preventing allocation bombs.
+        let response: RelayMessage = RelayMessage::from_bytes(&response_data).map_err(|e| {
+            TransportError::ProtocolError(format!("relay message deserialization failed: {e}"))
         })?;
 
         Ok(response)

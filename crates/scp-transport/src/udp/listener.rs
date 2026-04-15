@@ -724,7 +724,9 @@ async fn per_client_recv_loop<S: BlobStorage + 'static>(
         }
 
         // Deserialize the client message.
-        let client_msg: ClientMessage = match rmp_serde::from_slice(&datagram) {
+        // `ClientMessage::from_bytes` rejects payloads exceeding `MAX_MESSAGE_SIZE`
+        // before invoking the MessagePack deserializer, preventing allocation bombs.
+        let client_msg: ClientMessage = match ClientMessage::from_bytes(&datagram) {
             Ok(msg) => msg,
             Err(e) => {
                 debug!(remote = %remote_addr, error = %e, "failed to deserialize UDP datagram");

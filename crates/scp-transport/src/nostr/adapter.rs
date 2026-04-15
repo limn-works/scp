@@ -420,14 +420,16 @@ impl NostrAdapter {
     }
 
     /// Parse an SCP outer envelope from a Nostr event's base64-encoded content.
+    ///
+    /// Uses [`OuterEnvelope::from_bytes`] which rejects payloads exceeding
+    /// `MAX_ENVELOPE_SIZE` before invoking the MessagePack deserializer,
+    /// preventing allocation bombs from malicious Nostr events.
     fn parse_envelope_from_event(event: &NostrEvent) -> Result<OuterEnvelope, TransportError> {
         let bytes = base64_decode(&event.content).map_err(|e| {
             TransportError::ProtocolError(format!("invalid base64 in Nostr event content: {e}"))
         })?;
-        rmp_serde::from_slice(&bytes).map_err(|e| {
-            TransportError::ProtocolError(format!(
-                "invalid MessagePack in Nostr event content: {e}"
-            ))
+        OuterEnvelope::from_bytes(&bytes).map_err(|e| {
+            TransportError::ProtocolError(format!("invalid envelope in Nostr event content: {e}"))
         })
     }
 }

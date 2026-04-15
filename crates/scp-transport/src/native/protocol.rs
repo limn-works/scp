@@ -51,6 +51,12 @@ pub const DEFAULT_QUERY_LIMIT: u32 = 100;
 /// Maximum QUERY limit.
 pub const MAX_QUERY_LIMIT: u32 = 1000;
 
+/// Maximum size of a `ClientMessage` or `RelayMessage` in bytes (1 MiB).
+///
+/// Pre-deserialization guard against allocation bombs from malformed
+/// `MessagePack` input.
+pub const MAX_MESSAGE_SIZE: usize = 1_048_576;
+
 // ---------------------------------------------------------------------------
 // Serde helper for Option<[u8; 32]> as MessagePack binary
 // ---------------------------------------------------------------------------
@@ -335,9 +341,17 @@ impl ClientMessage {
     ///
     /// # Errors
     ///
-    /// Returns [`NativeProtocolError::DeserializationFailed`] if the bytes
-    /// are not a valid `MessagePack`-encoded `ClientMessage`.
+    /// Returns [`NativeProtocolError::MessageTooLarge`] if `bytes.len()` exceeds
+    /// [`MAX_MESSAGE_SIZE`].
+    /// Returns [`NativeProtocolError::DeserializationFailed`] if the bytes are
+    /// not a valid `MessagePack`-encoded `ClientMessage`.
     pub fn from_bytes(bytes: &[u8]) -> Result<Self, NativeProtocolError> {
+        if bytes.len() > MAX_MESSAGE_SIZE {
+            return Err(NativeProtocolError::MessageTooLarge {
+                size: bytes.len(),
+                max: MAX_MESSAGE_SIZE,
+            });
+        }
         rmp_serde::from_slice(bytes)
             .map_err(|e| NativeProtocolError::DeserializationFailed(e.to_string()))
     }
@@ -561,9 +575,17 @@ impl RelayMessage {
     ///
     /// # Errors
     ///
-    /// Returns [`NativeProtocolError::DeserializationFailed`] if the bytes
-    /// are not a valid `MessagePack`-encoded `RelayMessage`.
+    /// Returns [`NativeProtocolError::MessageTooLarge`] if `bytes.len()` exceeds
+    /// [`MAX_MESSAGE_SIZE`].
+    /// Returns [`NativeProtocolError::DeserializationFailed`] if the bytes are
+    /// not a valid `MessagePack`-encoded `RelayMessage`.
     pub fn from_bytes(bytes: &[u8]) -> Result<Self, NativeProtocolError> {
+        if bytes.len() > MAX_MESSAGE_SIZE {
+            return Err(NativeProtocolError::MessageTooLarge {
+                size: bytes.len(),
+                max: MAX_MESSAGE_SIZE,
+            });
+        }
         rmp_serde::from_slice(bytes)
             .map_err(|e| NativeProtocolError::DeserializationFailed(e.to_string()))
     }
@@ -1462,6 +1484,57 @@ mod tests {
 
         let result = RelayMessage::from_bytes(&[]);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn client_message_from_bytes_rejects_oversize() {
+        let oversized = vec![0u8; MAX_MESSAGE_SIZE + 1];
+        let result = ClientMessage::from_bytes(&oversized);
+        assert!(
+            matches!(
+                result,
+                Err(NativeProtocolError::MessageTooLarge { size, max })
+                    if size == MAX_MESSAGE_SIZE + 1 && max == MAX_MESSAGE_SIZE
+            ),
+            "expected MessageTooLarge, got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn relay_message_from_bytes_rejects_oversize() {
+        let oversized = vec![0u8; MAX_MESSAGE_SIZE + 1];
+        let result = RelayMessage::from_bytes(&oversized);
+        assert!(
+            matches!(
+                result,
+                Err(NativeProtocolError::MessageTooLarge { size, max })
+                    if size == MAX_MESSAGE_SIZE + 1 && max == MAX_MESSAGE_SIZE
+            ),
+            "expected MessageTooLarge, got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn client_message_from_bytes_accepts_at_max_size() {
+        // A buffer exactly at the limit is accepted (rejected only if strictly greater).
+        // The payload is not valid MessagePack so we get DeserializationFailed, not
+        // MessageTooLarge -- this confirms the size gate did NOT trigger.
+        let at_limit = vec![0xFFu8; MAX_MESSAGE_SIZE];
+        let result = ClientMessage::from_bytes(&at_limit);
+        assert!(
+            matches!(result, Err(NativeProtocolError::DeserializationFailed(_))),
+            "expected DeserializationFailed at limit (not MessageTooLarge), got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn relay_message_from_bytes_accepts_at_max_size() {
+        let at_limit = vec![0xFFu8; MAX_MESSAGE_SIZE];
+        let result = RelayMessage::from_bytes(&at_limit);
+        assert!(
+            matches!(result, Err(NativeProtocolError::DeserializationFailed(_))),
+            "expected DeserializationFailed at limit (not MessageTooLarge), got: {result:?}"
+        );
     }
 
     // -----------------------------------------------------------------------

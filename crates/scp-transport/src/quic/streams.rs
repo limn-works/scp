@@ -290,20 +290,42 @@ pub fn decode_frame_from_buf(buf: &[u8]) -> Result<Option<(usize, Vec<u8>)>, Tra
 
 /// Deserializes a relay frame from raw `MessagePack` bytes.
 ///
+/// Callers are expected to pass a payload that was already gated by
+/// [`decode_frame_from_buf`]'s `MAX_FRAME_SIZE` check (512 KB). This explicit
+/// guard provides defense-in-depth for any caller that bypasses that path.
+///
 /// # Errors
 ///
-/// Returns [`TransportError::ProtocolError`] if deserialization fails.
+/// Returns [`TransportError::ProtocolError`] if `payload.len()` exceeds
+/// [`MAX_FRAME_SIZE`] or if deserialization fails.
 pub fn decode_relay_frame(payload: &[u8]) -> Result<QuicRelayFrame, TransportError> {
+    if payload.len() > MAX_FRAME_SIZE as usize {
+        return Err(TransportError::ProtocolError(format!(
+            "relay frame too large: {} > {MAX_FRAME_SIZE}",
+            payload.len()
+        )));
+    }
     rmp_serde::from_slice(payload)
         .map_err(|e| TransportError::ProtocolError(format!("invalid relay frame: {e}")))
 }
 
 /// Deserializes a client frame from raw `MessagePack` bytes.
 ///
+/// Callers are expected to pass a payload that was already gated by
+/// [`decode_frame_from_buf`]'s `MAX_FRAME_SIZE` check (512 KB). This explicit
+/// guard provides defense-in-depth for any caller that bypasses that path.
+///
 /// # Errors
 ///
-/// Returns [`TransportError::ProtocolError`] if deserialization fails.
+/// Returns [`TransportError::ProtocolError`] if `payload.len()` exceeds
+/// [`MAX_FRAME_SIZE`] or if deserialization fails.
 pub fn decode_client_frame(payload: &[u8]) -> Result<QuicClientFrame, TransportError> {
+    if payload.len() > MAX_FRAME_SIZE as usize {
+        return Err(TransportError::ProtocolError(format!(
+            "client frame too large: {} > {MAX_FRAME_SIZE}",
+            payload.len()
+        )));
+    }
     rmp_serde::from_slice(payload)
         .map_err(|e| TransportError::ProtocolError(format!("invalid client frame: {e}")))
 }

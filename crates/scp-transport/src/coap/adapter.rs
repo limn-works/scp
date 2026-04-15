@@ -600,6 +600,17 @@ impl TransportAdapter for CoapAdapter {
             // The relay returns blobs as MessagePack-encoded envelopes.
             // A single CoAP response may contain one envelope, or a
             // MessagePack array of envelopes for multi-result queries.
+            //
+            // Reject oversized payloads before invoking any deserializer to prevent
+            // allocation bombs. `OuterEnvelope::from_bytes` has its own size guard
+            // for the single-envelope case; the array path applies `max_reassembly_bytes`.
+            if full_payload.len() > self.max_reassembly_bytes {
+                return Err(TransportError::PayloadTooLarge(format!(
+                    "CoAP QUERY response exceeds maximum payload size: {} > {}",
+                    full_payload.len(),
+                    self.max_reassembly_bytes,
+                )));
+            }
             if let Ok(envelope) = OuterEnvelope::from_bytes(&full_payload) {
                 // Verify blob integrity
                 let computed = BlobId::from_sha256(&full_payload);
@@ -609,7 +620,8 @@ impl TransportAdapter for CoapAdapter {
                 );
                 Ok(vec![envelope])
             } else {
-                // Try parsing as MessagePack array of envelopes
+                // Try parsing as MessagePack array of envelopes.
+                // Payload is already bounded by the `max_reassembly_bytes` check above.
                 let envelopes: Vec<OuterEnvelope> =
                     rmp_serde::from_slice(&full_payload).map_err(|e| {
                         TransportError::ProtocolError(format!(
