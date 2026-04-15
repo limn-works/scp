@@ -4775,7 +4775,9 @@ pub async fn transport_connect(relay_url: String) -> Result<Arc<TransportManager
                     // init_context_manager() → context_create →
                     // transport_connect).
                     if let Ok(cm) = crate::runtime::context_manager() {
-                        crate::runtime::ensure_bridge_instance(cm.clone());
+                        let (_event_log, protocol_repo) =
+                            crate::runtime::build_event_log_provider();
+                        crate::runtime::ensure_bridge_instance(cm.clone(), protocol_repo);
                         crate::runtime::bridge_instance().map_err(|_| ScpError::Context {
                             msg: "bridge not initialized — call identity_create before transport_connect"
                                 .to_owned(),

@@ -16,16 +16,23 @@
 //!
 //! # Remaining per-bridge `OnceLock`s (not consolidated)
 //!
-//! These remain as per-bridge `OnceLock`s because they use bridge-specific
-//! types that `scp-ffi-common` cannot depend on:
+//! Only truly process-scoped state remains as per-bridge `OnceLock`s:
 //!
-//! - `IDENTITY_REGISTRY` — bridge-specific custody provider types
-//! - `FFI_BRIDGE_STATE` — PyO3-specific per-context FFI state
-//! - `UCAN_REGISTRY` — NAPI/UniFFI-specific UCAN validation state
-//! - `STORAGE_PROVIDER` — concrete storage types vary per bridge
-//! - `PROTOCOL_REPOSITORY` — concrete storage types vary per bridge
+//! - `FFI_BRIDGE_STATE` — PyO3-specific per-context FFI state (`DashMap`)
 //!
-//! These are cleaned up during `shutdown()` via registered shutdown hooks.
+//! All bridge-specific singleton registries that were previously declared as
+//! per-bridge `OnceLock` statics are now owned by `BridgeInstance` via type
+//! erasure (`OnceLock<Box<dyn Any + Send + Sync>>`):
+//!
+//! - `identity_registry` — stores `Arc<DashMap<String, BridgeIdentityEntry>>`
+//! - `storage_provider` — stores `Arc<ConcreteStorageType>`
+//! - `protocol_repository` — stores `Arc<ProtocolRepository<ConcreteStorageType>>`
+//! - `ucan_registry` — stores `Arc<DashMap<String, BridgeUcanContextState>>`
+//!
+//! Each bridge calls `set_identity_registry` / `get_identity_registry_as::<T>()` etc.
+//! to store and retrieve its bridge-specific concrete type.
+//!
+//! `FFI_BRIDGE_STATE` is cleaned up during `shutdown()` via a registered shutdown hook.
 //!
 //! # Thread Safety
 //!
@@ -36,6 +43,7 @@
 //! concurrent reads (probe/query). Known contexts and rate limiters use
 //! `DashMap` for lock-free concurrent access.
 
+use std::any::Any;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::OnceLock;
@@ -232,11 +240,13 @@ pub struct BridgeInstance {
     /// Registered shutdown hooks for bridge-specific state cleanup.
     ///
     /// Each FFI bridge registers hooks that clear bridge-specific singletons
-    /// (`IDENTITY_REGISTRY`, `FFI_BRIDGE_STATE`, `UCAN_REGISTRY`, etc.)
-    /// during [`shutdown()`]. These singletons use bridge-specific types
-    /// (e.g., `PyO3` `IdentityEntry` with `Arc<InMemoryKeyCustody>`) that
-    /// cannot be owned by `BridgeInstance` because `scp-ffi-common` does not
-    /// depend on PyO3/NAPI/UniFFI.
+    /// that cannot be owned by `BridgeInstance` due to crate dependency
+    /// boundaries (e.g., `PyO3` `FFI_BRIDGE_STATE`, MCP registries).
+    ///
+    /// Type-erased `DashMap` registries (`identity_registry`, `ucan_registry`)
+    /// are cleared directly in `shutdown()` via their registered clear
+    /// functions (`identity_registry_clear_fn`, `ucan_registry_clear_fn`),
+    /// not through this hook Vec.
     ///
     /// Hooks are called exactly once during `shutdown()` and then discarded.
     /// The `Mutex` is only locked during `shutdown()` and `register_shutdown_hook()`
@@ -273,6 +283,54 @@ pub struct BridgeInstance {
     /// Set via [`set_relay_url`]. Retrieved via [`pending_relay_url`].
     /// Cleared when transport is cleared (on `suspend()` or `shutdown()`).
     relay_url: Mutex<Option<String>>,
+
+    // -----------------------------------------------------------------
+    // Type-erased bridge-specific singletons
+    //
+    // Each slot stores a bridge-specific concrete type erased to
+    // `Box<dyn Any + Send + Sync>`. The per-bridge runtime sets the
+    // value once (via the `set_*` accessor) and retrieves it via
+    // `get_*_as::<ConcreteType>()` which downcasts back.
+    //
+    // DashMap-based registries (`identity_registry`, `ucan_registry`) are
+    // stored as `Arc<DashMap<...>>` and also register an `Arc`-cloned clear
+    // closure so `shutdown()` can wipe them without knowing the concrete type.
+    // -----------------------------------------------------------------
+    /// Identity registry: stores `Arc<DashMap<String, BridgeIdentityEntry>>`
+    ///
+    /// `PyO3` stores `Arc<DashMap<String, IdentityEntry>>`.
+    /// `NAPI` stores `Arc<DashMap<String, NapiIdentityEntry>>` (feature-gated).
+    /// Cleared on `shutdown()` via `identity_registry_clear_fn`.
+    identity_registry: OnceLock<Box<dyn Any + Send + Sync>>,
+    /// Clear function for `identity_registry`. Called once during `shutdown()`.
+    identity_registry_clear_fn: OnceLock<Box<dyn Fn() + Send + Sync>>,
+
+    /// Storage provider: stores `Arc<ConcreteEncryptingStorage>`.
+    ///
+    /// `PyO3` stores `Arc<EncryptingAdapter<InMemoryStorage>>`.
+    /// `NAPI`/`UniFFI` store `Arc<EncryptingAdapter<BridgeInMemoryStorage>>`.
+    ///
+    /// Released on process exit (`OnceLock` — not clearable).
+    storage_provider: OnceLock<Box<dyn Any + Send + Sync>>,
+
+    /// Protocol repository: stores `Arc<ProtocolRepository<ConcreteStorageType>>`.
+    ///
+    /// `NAPI`/`UniFFI` store `Arc<ProtocolRepository<EncryptingAdapter<BridgeInMemoryStorage>>>`.
+    /// `PyO3` uses `storage_provider` to construct its repository on demand.
+    ///
+    /// Released on process exit (`OnceLock` — not clearable).
+    protocol_repository: OnceLock<Box<dyn Any + Send + Sync>>,
+
+    /// UCAN context state registry: stores `Arc<DashMap<String, BridgeUcanContextState>>`.
+    ///
+    /// `NAPI` stores `Arc<DashMap<String, UcanContextState>>`.
+    /// `UniFFI` stores `Arc<DashMap<String, UcanContextState>>` (different type).
+    /// `PyO3` stores UCAN state inline in `FfiBridgeState` (no separate `DashMap`).
+    ///
+    /// Cleared on `shutdown()` via `ucan_registry_clear_fn`.
+    ucan_registry: OnceLock<Box<dyn Any + Send + Sync>>,
+    /// Clear function for `ucan_registry`. Called once during `shutdown()`.
+    ucan_registry_clear_fn: OnceLock<Box<dyn Fn() + Send + Sync>>,
 }
 
 impl BridgeInstance {
@@ -305,6 +363,12 @@ impl BridgeInstance {
             shutdown_hooks: Mutex::new(Vec::new()),
             persistence: None,
             relay_url: Mutex::new(None),
+            identity_registry: OnceLock::new(),
+            identity_registry_clear_fn: OnceLock::new(),
+            storage_provider: OnceLock::new(),
+            protocol_repository: OnceLock::new(),
+            ucan_registry: OnceLock::new(),
+            ucan_registry_clear_fn: OnceLock::new(),
         }
     }
 
@@ -348,6 +412,12 @@ impl BridgeInstance {
             shutdown_hooks: Mutex::new(Vec::new()),
             persistence: Some(persistence),
             relay_url: Mutex::new(None),
+            identity_registry: OnceLock::new(),
+            identity_registry_clear_fn: OnceLock::new(),
+            storage_provider: OnceLock::new(),
+            protocol_repository: OnceLock::new(),
+            ucan_registry: OnceLock::new(),
+            ucan_registry_clear_fn: OnceLock::new(),
         }
     }
 
@@ -415,12 +485,15 @@ impl BridgeInstance {
     ///
     /// The hook is called exactly once during [`shutdown()`] and then
     /// discarded. Hooks run in registration order after all
-    /// `BridgeInstance`-owned state has been cleared.
+    /// `BridgeInstance`-owned state has been cleared (including the
+    /// type-erased `DashMap` registries via their clear functions).
     ///
-    /// Intended for bridge-specific singletons that use `OnceLock` and
-    /// cannot be owned by `BridgeInstance` due to crate dependency
-    /// boundaries (e.g., `PyO3` `IDENTITY_REGISTRY`, NAPI
-    /// `BRIDGE_STATE`).
+    /// Intended for bridge-specific singletons that cannot be migrated into
+    /// `BridgeInstance` due to crate dependency boundaries (e.g., `PyO3`
+    /// `FFI_BRIDGE_STATE`, MCP server/client registries). For
+    /// `DashMap`-based registries that CAN be owned here, prefer
+    /// [`set_identity_registry`] / [`set_ucan_registry`] which register
+    /// a clear closure directly.
     ///
     /// If the internal `Mutex` is poisoned (a previous hook registration
     /// panicked while holding the lock), the hook is silently dropped and
@@ -557,9 +630,19 @@ impl BridgeInstance {
         self.economy_antispam.clear();
         self.bridge_state.clear();
 
-        // Run bridge-specific shutdown hooks (identity registries, FFI
-        // bridge state, economy trackers). Drain the Vec so hooks are
-        // called exactly once even if the Mutex isn't dropped.
+        // Clear type-erased DashMap registries (identity + UCAN).
+        // Dropping `Arc<DashMap>` entries here releases key material held by
+        // custody providers (zeroized via `Zeroizing` fields on Drop).
+        if let Some(clear_fn) = self.identity_registry_clear_fn.get() {
+            clear_fn();
+        }
+        if let Some(clear_fn) = self.ucan_registry_clear_fn.get() {
+            clear_fn();
+        }
+
+        // Run bridge-specific shutdown hooks (FFI bridge state, MCP
+        // registries, etc.). Drain the Vec so hooks are called exactly once
+        // even if the Mutex isn't dropped.
         if let Ok(mut hooks) = self.shutdown_hooks.lock() {
             for hook in hooks.drain(..) {
                 if let Err(_payload) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(hook))
@@ -1064,6 +1147,112 @@ impl BridgeInstance {
         if self.did_resolver.set(resolver).is_err() {
             tracing::warn!("set_did_resolver called but resolver already initialized — ignoring");
         }
+    }
+
+    // -----------------------------------------------------------------
+    // Type-erased bridge-specific singleton accessors
+    // -----------------------------------------------------------------
+
+    /// Stores the bridge's identity registry as a type-erased value and
+    /// registers a clear function called during [`shutdown`].
+    ///
+    /// `value` should be `Arc<DashMap<String, BridgeIdentityEntry>>`.
+    /// `clear_fn` must call `.clear()` on the same map (typically a closure
+    /// holding a cloned `Arc` to the same map).
+    /// Subsequent calls are no-ops (`OnceLock`).
+    pub fn set_identity_registry<T: Any + Send + Sync>(
+        &self,
+        value: T,
+        clear_fn: Box<dyn Fn() + Send + Sync>,
+    ) {
+        if self.identity_registry.set(Box::new(value)).is_err() {
+            tracing::warn!(
+                "set_identity_registry called but identity registry already initialized — ignoring"
+            );
+            return;
+        }
+        let _ = self.identity_registry_clear_fn.set(clear_fn);
+    }
+
+    /// Retrieves the bridge's identity registry, downcasting to `T`.
+    ///
+    /// Returns `None` if the registry has not been set or if the downcast
+    /// fails (mismatched type).
+    #[must_use]
+    pub fn get_identity_registry_as<T: Any + Send + Sync>(&self) -> Option<&T> {
+        self.identity_registry.get()?.downcast_ref::<T>()
+    }
+
+    /// Stores the bridge's storage provider as a type-erased value.
+    ///
+    /// `value` should be `Arc<EncryptingAdapter<T>>`. Subsequent calls are
+    /// no-ops (`OnceLock`). The value is released on process exit.
+    pub fn set_storage_provider<T: Any + Send + Sync>(&self, value: T) {
+        if self.storage_provider.set(Box::new(value)).is_err() {
+            tracing::warn!(
+                "set_storage_provider called but storage provider already initialized — ignoring"
+            );
+        }
+    }
+
+    /// Retrieves the bridge's storage provider, downcasting to `T`.
+    ///
+    /// Returns `None` if the provider has not been set or if the downcast
+    /// fails (mismatched type).
+    #[must_use]
+    pub fn get_storage_provider_as<T: Any + Send + Sync>(&self) -> Option<&T> {
+        self.storage_provider.get()?.downcast_ref::<T>()
+    }
+
+    /// Stores the bridge's protocol repository as a type-erased value.
+    ///
+    /// `value` should be `Arc<ProtocolRepository<T>>`. Subsequent calls are
+    /// no-ops (`OnceLock`). The value is released on process exit.
+    pub fn set_protocol_repository<T: Any + Send + Sync>(&self, value: T) {
+        if self.protocol_repository.set(Box::new(value)).is_err() {
+            tracing::warn!(
+                "set_protocol_repository called but protocol repository already initialized — ignoring"
+            );
+        }
+    }
+
+    /// Retrieves the bridge's protocol repository, downcasting to `T`.
+    ///
+    /// Returns `None` if the repository has not been set or if the downcast
+    /// fails (mismatched type).
+    #[must_use]
+    pub fn get_protocol_repository_as<T: Any + Send + Sync>(&self) -> Option<&T> {
+        self.protocol_repository.get()?.downcast_ref::<T>()
+    }
+
+    /// Stores the bridge's UCAN context state registry as a type-erased value
+    /// and registers a clear function called during [`shutdown`].
+    ///
+    /// `value` should be `Arc<DashMap<String, BridgeUcanContextState>>`.
+    /// `clear_fn` must call `.clear()` on the same map (typically a closure
+    /// holding a cloned `Arc` to the same map).
+    /// Subsequent calls are no-ops (`OnceLock`).
+    pub fn set_ucan_registry<T: Any + Send + Sync>(
+        &self,
+        value: T,
+        clear_fn: Box<dyn Fn() + Send + Sync>,
+    ) {
+        if self.ucan_registry.set(Box::new(value)).is_err() {
+            tracing::warn!(
+                "set_ucan_registry called but UCAN registry already initialized — ignoring"
+            );
+            return;
+        }
+        let _ = self.ucan_registry_clear_fn.set(clear_fn);
+    }
+
+    /// Retrieves the bridge's UCAN registry, downcasting to `T`.
+    ///
+    /// Returns `None` if the registry has not been set or if the downcast
+    /// fails (mismatched type).
+    #[must_use]
+    pub fn get_ucan_registry_as<T: Any + Send + Sync>(&self) -> Option<&T> {
+        self.ucan_registry.get()?.downcast_ref::<T>()
     }
 }
 

@@ -157,17 +157,13 @@ pub(crate) static BRIDGE_INSTANCE: OnceLock<Arc<BridgeInstance>> = OnceLock::new
 /// `bridge_instance().context_manager()` and `context_manager()` return
 /// pointers to the same allocation.
 ///
-/// Registers PyO3-specific shutdown hooks that clear bridge-specific
-/// singletons (`IDENTITY_REGISTRY`, `FFI_BRIDGE_STATE`) during
-/// `BridgeInstance::shutdown()`. These singletons use PyO3-specific
-/// types that cannot be owned by `BridgeInstance` in `scp-ffi-common`.
+/// Registers bridge-specific state in `BridgeInstance`:
+/// - `identity_registry` — `Arc<DashMap<String, IdentityEntry>>` (type-erased)
+/// - `storage_provider` — `Arc<EncryptingAdapter<InMemoryStorage>>` (type-erased, lazily)
 ///
-/// Economy state, bridge connector state, and the DID resolver are now
-/// owned by `BridgeInstance` and cleared in its `shutdown()` method.
-///
-/// `STORAGE_PROVIDER` is an `OnceLock<Arc<...>>` — `OnceLock` does not
-/// support clearing after initialization, and the `Arc` value is cleaned
-/// up when the process exits.
+/// `FFI_BRIDGE_STATE` (`PyO3`-specific per-context state) remains a separate
+/// `OnceLock` because it uses `PyO3` types that cannot be owned by `scp-ffi-common`.
+/// It is cleared via a shutdown hook registered here.
 ///
 /// Subsequent calls are no-ops (`OnceLock` guarantees single initialization).
 fn init_bridge_instance(context_manager: Arc<ContextManager>, local_did: &str) {
@@ -180,19 +176,23 @@ fn init_bridge_instance(context_manager: Arc<ContextManager>, local_did: &str) {
     let instance = Arc::new(BridgeInstance::new(context_manager, local_did.to_owned()));
     let bi = BRIDGE_INSTANCE.get_or_init(|| instance);
 
-    // Register PyO3-specific cleanup hooks. These clear DashMap-based
-    // singletons that hold bridge-specific types (identity registry, FFI
-    // bridge state). Economy, bridge connector state, and DID resolver are
-    // now owned by BridgeInstance and cleared in its shutdown() method.
-    //
-    // Clearing the identity registry drops `Arc<FfiKeyCustody>` entries —
-    // when the refcount reaches zero, custody providers are dropped
-    // (InMemoryKeyCustody zeroizes key material via `Zeroizing<[u8; 32]>`
-    // fields).
+    // Register the identity registry in BridgeInstance. This transfers
+    // ownership of the map into BridgeInstance so that shutdown() can clear
+    // it (and release `Arc<FfiKeyCustody>` entries, triggering zeroization).
+    let identity_map = Arc::new(DashMap::<String, IdentityEntry>::new());
+    let clear_map = Arc::clone(&identity_map);
+    bi.set_identity_registry(
+        identity_map,
+        Box::new(move || {
+            clear_map.clear();
+        }),
+    );
+
+    // Register PyO3-specific shutdown hook for state that cannot be owned
+    // by BridgeInstance (FFI_BRIDGE_STATE, transport URL, MCP registries).
+    // The identity registry is cleared by BridgeInstance::shutdown() via its
+    // registered clear function — no need to reference it here.
     bi.register_shutdown_hook(Box::new(|| {
-        if let Some(reg) = IDENTITY_REGISTRY.get() {
-            reg.clear();
-        }
         if let Some(reg) = FFI_BRIDGE_STATE.get() {
             reg.clear();
         }
@@ -345,11 +345,14 @@ pub fn init_context_manager_for_test() {
 /// AES-256-GCM encryption, satisfying the sealed `EncryptedStorage`
 /// bound required by `ProtocolRepository::new()`.
 fn build_persistence_provider() -> Option<Box<dyn ContextPersistence>> {
-    STORAGE_PROVIDER.get().map(|storage| {
-        let protocol_repository = Arc::new(ProtocolRepository::new(Arc::clone(storage)));
-        Box::new(ProtocolRepositoryContextBridge::new(protocol_repository))
-            as Box<dyn ContextPersistence>
-    })
+    BRIDGE_INSTANCE
+        .get()?
+        .get_storage_provider_as::<Arc<EncryptingAdapter<InMemoryStorage>>>()
+        .map(|storage| {
+            let protocol_repository = Arc::new(ProtocolRepository::new(Arc::clone(storage)));
+            Box::new(ProtocolRepositoryContextBridge::new(protocol_repository))
+                as Box<dyn ContextPersistence>
+        })
 }
 
 /// Constructs a `ContextManager` with or without persistence.
@@ -992,21 +995,33 @@ where
 // Identity registry (SCP-214: KeyCustody wiring)
 // ---------------------------------------------------------------------------
 
-/// Global identity registry mapping DID strings to retained identity state.
-///
-/// Stores the [`ScpIdentity`] (with opaque [`KeyHandle`]s), the
-/// [`Arc<FfiKeyCustody>`](crate::custody::FfiKeyCustody) that owns the key
-/// material, and the [`DidDocument`]. This allows bridge functions to perform
-/// crypto operations (signing, pseudonym derivation, key rotation) without
-/// private key material crossing the FFI boundary (ADR-006).
-///
-/// Uses [`DashMap`] for lock-free concurrent access matching the context
-/// registry pattern.
-static IDENTITY_REGISTRY: OnceLock<DashMap<String, IdentityEntry>> = OnceLock::new();
-
 /// Returns a reference to the global identity registry.
+///
+/// The registry is stored as a type-erased `Arc<DashMap<String, IdentityEntry>>`
+/// in the `BridgeInstance`. Panics if called before `init_context_manager` —
+/// identity functions are always called after the bridge is initialized.
+///
+/// The `DashMap` provides lock-free concurrent access matching the context
+/// registry pattern (ADR-006).
+///
+/// # Panics
+///
+/// Panics if the bridge has not been initialized via `init_context_manager`.
+/// This is a programming error — the bridge must be initialized before any
+/// identity operation.
+#[allow(clippy::panic)]
 fn identity_registry() -> &'static DashMap<String, IdentityEntry> {
-    IDENTITY_REGISTRY.get_or_init(DashMap::new)
+    BRIDGE_INSTANCE
+        .get()
+        .and_then(|bi| {
+            bi.get_identity_registry_as::<Arc<DashMap<String, IdentityEntry>>>()
+                .map(Arc::as_ref)
+        })
+        .unwrap_or_else(|| {
+            panic!(
+                "identity registry not initialized — call init_context_manager before identity operations"
+            )
+        })
 }
 
 /// Retained identity state for a single DID.
@@ -1110,48 +1125,18 @@ pub fn remove_identity(did: &str) {
 // Storage provider registry (SCP-217: identity persistence)
 // ---------------------------------------------------------------------------
 
-/// Global storage provider for identity persistence.
-///
-/// Injected via [`init_storage`] at Python initialization time. Bridge
-/// functions use [`get_storage`] to access the provider for storing and
-/// loading identity state.
-///
-/// **Default is `InMemoryStorage`:** Data does NOT survive process restarts.
-/// SDK consumers requiring durable persistence should provide a file-backed
-/// `Storage` implementation (e.g., `SqliteStorage`) at the application layer.
-/// The in-memory default is suitable for testing and ephemeral workloads; the
-/// architecture supports real persistence — it is an SDK integration concern
-/// to wire a durable backend.
-///
-/// The storage backend is `InMemoryStorage` wrapped in
-/// [`EncryptingAdapter`] with a random AES-256-GCM key. This satisfies
-/// the sealed `EncryptedStorage` bound required by
-/// `ProtocolRepository::new()`, matching the `scp-node` ephemeral mode
-/// pattern. Persistent backends (`SQLite` via [`SqliteStorage`]) will
-/// replace it when platform storage adapters land.
-///
-/// Uses the same `OnceLock` pattern as `FFI_BRIDGE_STATE` and
-/// `BRIDGE_INSTANCE`. The `Arc` enables shared ownership across bridge
-/// functions without lifetime issues.
-///
-/// See spec section 17.3 for key conventions and section 17.4 for
-/// `ProtocolRepository` design.
-///
-/// # Safety: Single-Tenant Only
-///
-/// This registry is process-global. In multi-tenant deployments,
-/// ALL tenants share the storage provider.
-static STORAGE_PROVIDER: OnceLock<Arc<EncryptingAdapter<InMemoryStorage>>> = OnceLock::new();
-
-/// Initializes the global storage provider.
+/// Initializes the storage provider and stores it in the `BridgeInstance`.
 ///
 /// Must be called before any storage-dependent bridge function
 /// (`py_identity_create`, `py_identity_load`). Calling multiple times is
-/// a no-op — the first call wins.
+/// a no-op — the first call wins (`OnceLock` in `BridgeInstance`).
 ///
 /// Wraps `InMemoryStorage` in [`EncryptingAdapter`] with a random
 /// AES-256-GCM key generated via `OsRng`. This ensures all stored
 /// values are encrypted at rest, satisfying the `EncryptedStorage` bound.
+///
+/// See spec section 17.3 for key conventions and section 17.4 for
+/// `ProtocolRepository` design.
 ///
 /// # Arguments
 ///
@@ -1160,14 +1145,16 @@ static STORAGE_PROVIDER: OnceLock<Arc<EncryptingAdapter<InMemoryStorage>>> = Onc
 /// # Errors
 ///
 /// Returns `ScpPyError::ValidationError` if the storage type is not
-/// recognized.
+/// recognized, or `ScpPyError::ContextError` if the bridge has not been
+/// initialized.
 pub fn init_storage(storage_type: &str) -> Result<(), ScpPyError> {
     match storage_type {
         "in_memory" => {
             let mut key = Zeroizing::new([0u8; 32]);
             rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut *key);
             let encrypted = EncryptingAdapter::new(InMemoryStorage::new(), key);
-            let _ = STORAGE_PROVIDER.set(Arc::new(encrypted));
+            let bi = bridge_instance()?;
+            bi.set_storage_provider(Arc::new(encrypted));
             Ok(())
         }
         other => Err(ScpPyError::validation(format!(
@@ -1181,13 +1168,20 @@ pub fn init_storage(storage_type: &str) -> Result<(), ScpPyError> {
 /// # Errors
 ///
 /// Returns `ScpPyError::IdentityError` if storage has not been initialized
-/// via [`init_storage`].
+/// via [`init_storage`], or `ScpPyError::ContextError` if the bridge has
+/// not been initialized.
 pub fn get_storage() -> Result<&'static Arc<EncryptingAdapter<InMemoryStorage>>, ScpPyError> {
-    STORAGE_PROVIDER.get().ok_or_else(|| {
+    let bi = BRIDGE_INSTANCE.get().ok_or_else(|| {
         ScpPyError::identity(
-            "storage not initialized — call py_init_storage(\"in_memory\") first".to_owned(),
+            "bridge not initialized — call identity_create before storage operations".to_owned(),
         )
-    })
+    })?;
+    bi.get_storage_provider_as::<Arc<EncryptingAdapter<InMemoryStorage>>>()
+        .ok_or_else(|| {
+            ScpPyError::identity(
+                "storage not initialized — call py_init_storage(\"in_memory\") first".to_owned(),
+            )
+        })
 }
 
 // ---------------------------------------------------------------------------

@@ -181,13 +181,20 @@ static BRIDGE_INSTANCE: OnceLock<Arc<BridgeInstance>> = OnceLock::new();
 /// `Arc<ContextManager>` so that `bridge_instance().context_manager()` and
 /// `context_manager()` return pointers to the same allocation.
 ///
-/// Registers NAPI-specific shutdown hooks that clear bridge-specific
-/// singletons (`IDENTITY_REGISTRY`, `UCAN_REGISTRY`). Economy state,
-/// bridge connector state, and the DID resolver are now owned by
+/// Registers NAPI-specific state in `BridgeInstance`:
+/// - `ucan_registry` — `Arc<DashMap<String, UcanContextState>>` (type-erased)
+/// - `identity_registry` (feature-gated) — `Arc<DashMap<String, NapiIdentityEntry>>`
+/// - `protocol_repository` — `Arc<ProtocolRepository<...>>` from `build_event_log_provider`
+///
+/// Economy state, bridge connector state, and the DID resolver are owned by
 /// `BridgeInstance` and cleared in its `shutdown()` method.
 ///
 /// Subsequent calls are no-ops (`OnceLock` guarantees single initialization).
-fn init_bridge_instance(context_manager: Arc<ContextManager>, local_did: &str) {
+fn init_bridge_instance(
+    context_manager: Arc<ContextManager>,
+    local_did: &str,
+    protocol_repo: Arc<ProtocolRepository<EncryptingAdapter<BridgeInMemoryStorage>>>,
+) {
     // Guard against duplicate hook registration — OnceLock guarantees
     // single BridgeInstance creation, but hooks must only be registered once.
     if BRIDGE_INSTANCE.get().is_some() {
@@ -197,21 +204,39 @@ fn init_bridge_instance(context_manager: Arc<ContextManager>, local_did: &str) {
     let instance = Arc::new(BridgeInstance::new(context_manager, local_did.to_owned()));
     let bi = BRIDGE_INSTANCE.get_or_init(|| instance);
 
-    // Register NAPI-specific cleanup hooks. Economy state, bridge connector
-    // state, and DID resolver are now owned by BridgeInstance and cleared in
-    // its shutdown() method.
-    //
-    // Clearing the identity registry drops `Arc<OpaqueInMemoryKeyCustody>`
-    // entries — custody providers zeroize key material via `Zeroizing` fields
-    // when the refcount reaches zero.
+    // Register the protocol repository for trust aggregation (#502).
+    bi.set_protocol_repository(protocol_repo);
+
+    // Register the UCAN registry in BridgeInstance so shutdown() can clear it.
+    let ucan_map = Arc::new(DashMap::<String, UcanContextState>::new());
+    let ucan_clear = Arc::clone(&ucan_map);
+    bi.set_ucan_registry(
+        ucan_map,
+        Box::new(move || {
+            ucan_clear.clear();
+        }),
+    );
+
+    // Register the identity registry (feature-gated — only compiled when
+    // allow_in_memory_custody is enabled). Clearing it drops
+    // `Arc<OpaqueInMemoryKeyCustody>` entries, triggering key zeroization.
+    #[cfg(feature = "allow_in_memory_custody")]
+    {
+        let id_map = Arc::new(DashMap::<String, NapiIdentityEntry>::new());
+        let id_clear = Arc::clone(&id_map);
+        bi.set_identity_registry(
+            id_map,
+            Box::new(move || {
+                id_clear.clear();
+            }),
+        );
+    }
+
+    // Register NAPI-specific shutdown hook for state that cannot be owned
+    // by BridgeInstance (MCP registries). The identity and UCAN registries
+    // are cleared by BridgeInstance::shutdown() via their registered clear
+    // functions — no need to reference them here.
     bi.register_shutdown_hook(Box::new(|| {
-        #[cfg(feature = "allow_in_memory_custody")]
-        if let Some(reg) = IDENTITY_REGISTRY.get() {
-            reg.clear();
-        }
-        if let Some(reg) = UCAN_REGISTRY.get() {
-            reg.clear();
-        }
         // MCP server/client registries
         crate::mcp::clear_registries();
     }));
@@ -237,7 +262,8 @@ pub fn ensure_bridge_instance(cm: Arc<ContextManager>) {
     if BRIDGE_INSTANCE.get().is_some() {
         return;
     }
-    init_bridge_instance(cm, "did:placeholder:uninitialized-napi");
+    let (_event_log, protocol_repo) = build_event_log_provider();
+    init_bridge_instance(cm, "did:placeholder:uninitialized-napi", protocol_repo);
 }
 
 /// Returns a reference to the global [`BridgeInstance`].
@@ -299,7 +325,7 @@ pub fn init_context_manager(local_did: &str) {
     let did = local_did.to_owned();
     let crypto = Box::new(scp_core::crypto::mls::provider::MlsCryptoProvider::new(did));
     let transport = Box::new(scp_core::context::NotConfiguredTransportProvider);
-    let event_log = build_event_log_provider();
+    let (event_log, protocol_repo) = build_event_log_provider();
     let persistence = Box::new(NapiBridgePersistence::new());
     let cm_arc = Arc::new(ContextManager::with_persistence(
         crypto,
@@ -309,7 +335,7 @@ pub fn init_context_manager(local_did: &str) {
         not_configured_key_resolver(),
     ));
 
-    init_bridge_instance(cm_arc, local_did);
+    init_bridge_instance(cm_arc, local_did, protocol_repo);
 }
 
 /// Initializes the global [`ContextManager`] with [`LocalTransportProvider`].
@@ -338,7 +364,7 @@ pub fn init_context_manager_with_local_transport(local_did: &str) {
     let did = local_did.to_owned();
     let crypto = Box::new(scp_core::crypto::mls::provider::MlsCryptoProvider::new(did));
     let transport = Box::new(scp_core::context::LocalTransportProvider);
-    let event_log = build_event_log_provider();
+    let (event_log, protocol_repo) = build_event_log_provider();
     let persistence = Box::new(NapiBridgePersistence::new());
     let cm_arc = Arc::new(ContextManager::with_persistence(
         crypto,
@@ -348,7 +374,7 @@ pub fn init_context_manager_with_local_transport(local_did: &str) {
         not_configured_key_resolver(),
     ));
 
-    init_bridge_instance(cm_arc, local_did);
+    init_bridge_instance(cm_arc, local_did, protocol_repo);
 }
 
 /// Initializes the global [`ContextManager`] with [`RelayTransportProvider`].
@@ -387,7 +413,7 @@ pub fn init_context_manager_with_relay_transport(
     let did = local_did.to_owned();
     let crypto = Box::new(scp_core::crypto::mls::provider::MlsCryptoProvider::new(did));
     let transport = Box::new(scp_transport::RelayTransportProvider::new(adapter));
-    let event_log = build_event_log_provider();
+    let (event_log, protocol_repo) = build_event_log_provider();
     let persistence = Box::new(NapiBridgePersistence::new());
     let cm_arc = Arc::new(ContextManager::with_persistence(
         crypto,
@@ -397,55 +423,54 @@ pub fn init_context_manager_with_relay_transport(
         not_configured_key_resolver(),
     ));
 
-    init_bridge_instance(cm_arc, local_did);
+    init_bridge_instance(cm_arc, local_did, protocol_repo);
 }
-
-/// Global `ProtocolRepository` instance, shared between the event log
-/// provider and the trust store bridge. Exposed via [`protocol_repository()`]
-/// for trust aggregation (issue #502).
-static PROTOCOL_REPOSITORY: OnceLock<
-    Arc<ProtocolRepository<EncryptingAdapter<BridgeInMemoryStorage>>>,
-> = OnceLock::new();
 
 /// Returns the global `ProtocolRepository` if initialized.
 ///
 /// Used by the trust aggregation bridge to construct a
 /// `ProtocolRepositoryTrustBridge` backed by persistent (in-process) storage.
-/// Returns `None` if `build_event_log_provider` has not been called yet.
+/// Returns `None` if the bridge has not been initialized.
 #[must_use]
 pub fn protocol_repository()
 -> Option<&'static Arc<ProtocolRepository<EncryptingAdapter<BridgeInMemoryStorage>>>> {
-    PROTOCOL_REPOSITORY.get()
+    BRIDGE_INSTANCE
+        .get()?
+        .get_protocol_repository_as::<Arc<ProtocolRepository<EncryptingAdapter<BridgeInMemoryStorage>>>>()
 }
 
 /// Constructs a persistent event log provider backed by encrypted in-memory
-/// storage.
+/// storage, and returns both the event log provider and the underlying
+/// `ProtocolRepository` (for registration in `BridgeInstance`).
 ///
 /// Creates an `EncryptingAdapter<BridgeInMemoryStorage>` with a random
 /// AES-256-GCM key, wraps it in a `ProtocolRepository`, then builds a
 /// `ProtocolRepositoryEventLogBridge` that implements `EventLogPersistence`.
 /// The resulting `MerkleEventLogProvider` persists entries on each append.
 ///
+/// The `Arc<ProtocolRepository<...>>` is returned alongside the event log
+/// provider so that `init_bridge_instance` can store it in `BridgeInstance`
+/// for trust aggregation (#502). `build_event_log_provider` is always called
+/// before `init_bridge_instance`, so the repository must be threaded through
+/// rather than stored via `BridgeInstance::set_protocol_repository` inside
+/// this function.
+///
 /// Uses [`BridgeInMemoryStorage`] (a bridge-local `Storage` implementation)
 /// instead of `scp_platform::testing::InMemoryStorage` so that the `testing`
 /// feature (which also exposes `InMemoryKeyCustody`) is not required in
 /// production builds. See issue #484.
-///
-/// SDK consumers requiring durable persistence across process restarts
-/// should provide a file-backed `Storage` implementation at the application
-/// layer (e.g., `SqliteStorage`). The in-memory default is suitable for the
-/// Node.js/Bun environment where process lifetime matches context lifetime.
-fn build_event_log_provider() -> Box<dyn ContextEventLogProvider> {
+pub(crate) fn build_event_log_provider() -> (
+    Box<dyn ContextEventLogProvider>,
+    Arc<ProtocolRepository<EncryptingAdapter<BridgeInMemoryStorage>>>,
+) {
     let mut key = Zeroizing::new([0u8; 32]);
     rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut *key);
     let encrypted = EncryptingAdapter::new(BridgeInMemoryStorage::new(), key);
     let store = Arc::new(ProtocolRepository::new(encrypted));
 
-    // Expose the ProtocolRepository globally for trust store usage (#502).
-    let _ = PROTOCOL_REPOSITORY.set(Arc::clone(&store));
-
-    let bridge = ProtocolRepositoryEventLogBridge::new(store);
-    Box::new(MerkleEventLogProvider::with_persistence(Arc::new(bridge)))
+    let bridge = ProtocolRepositoryEventLogBridge::new(Arc::clone(&store));
+    let event_log = Box::new(MerkleEventLogProvider::with_persistence(Arc::new(bridge)));
+    (event_log, store)
 }
 
 /// Test variant of [`context_manager`] initialization that uses
@@ -461,16 +486,17 @@ pub(crate) fn init_context_manager_for_test() {
     if BRIDGE_INSTANCE.get().is_some() {
         return;
     }
+    let (event_log, protocol_repo) = build_event_log_provider();
     let cm_arc = Arc::new(ContextManager::with_persistence(
         Box::new(TestNoOpCryptoProvider),
         Box::new(scp_core::context::LocalTransportProvider),
-        build_event_log_provider(),
+        event_log,
         Box::new(NapiBridgePersistence::new()),
         not_configured_key_resolver(),
     ));
 
     // Populate the BridgeInstance with a synthetic test DID.
-    init_bridge_instance(cm_arc, "did:test:napi-bridge");
+    init_bridge_instance(cm_arc, "did:test:napi-bridge", protocol_repo);
 }
 
 /// No-op crypto provider for Rust unit tests only.
@@ -686,14 +712,28 @@ pub(crate) struct NapiIdentityEntry {
         Vec<scp_core::identity::attestation::IdentityLinkAttestation>,
 }
 
-/// Global registry of identity state, keyed by DID string.
-#[cfg(feature = "allow_in_memory_custody")]
-static IDENTITY_REGISTRY: OnceLock<DashMap<String, NapiIdentityEntry>> = OnceLock::new();
-
 /// Returns a reference to the global identity registry.
+///
+/// The registry is stored as a type-erased `Arc<DashMap<String, NapiIdentityEntry>>`
+/// in the `BridgeInstance`. Panics if called before `init_context_manager`.
+///
+/// # Panics
+///
+/// Panics if the bridge has not been initialized. This is a programming error.
 #[cfg(feature = "allow_in_memory_custody")]
+#[allow(clippy::panic)]
 fn identity_registry() -> &'static DashMap<String, NapiIdentityEntry> {
-    IDENTITY_REGISTRY.get_or_init(DashMap::new)
+    BRIDGE_INSTANCE
+        .get()
+        .and_then(|bi| {
+            bi.get_identity_registry_as::<Arc<DashMap<String, NapiIdentityEntry>>>()
+                .map(Arc::as_ref)
+        })
+        .unwrap_or_else(|| {
+            panic!(
+                "identity registry not initialized — call init_context_manager before identity operations"
+            )
+        })
 }
 
 /// Registers an identity in the global identity registry.
@@ -825,12 +865,27 @@ pub struct UcanContextState {
     pub session_store: SessionStore,
 }
 
-/// Global registry of per-context UCAN validation state.
-static UCAN_REGISTRY: OnceLock<DashMap<String, UcanContextState>> = OnceLock::new();
-
 /// Returns a reference to the UCAN state registry.
+///
+/// The registry is stored as a type-erased `Arc<DashMap<String, UcanContextState>>`
+/// in the `BridgeInstance`. Panics if called before `init_context_manager`.
+///
+/// # Panics
+///
+/// Panics if the bridge has not been initialized. This is a programming error.
+#[allow(clippy::panic)]
 fn ucan_registry() -> &'static DashMap<String, UcanContextState> {
-    UCAN_REGISTRY.get_or_init(DashMap::new)
+    BRIDGE_INSTANCE
+        .get()
+        .and_then(|bi| {
+            bi.get_ucan_registry_as::<Arc<DashMap<String, UcanContextState>>>()
+                .map(Arc::as_ref)
+        })
+        .unwrap_or_else(|| {
+            panic!(
+                "UCAN registry not initialized — call init_context_manager before UCAN operations"
+            )
+        })
 }
 
 /// Ensures UCAN validation state is registered for a context.
@@ -1251,10 +1306,11 @@ mod tests {
         // interfering with the OnceLock-based singleton used by other tests.
         // BridgeInstance is in scope via `use super::*` (imported at module top).
         let key_resolver: scp_core::context::governance::KeyResolver = Arc::new(|_| None);
+        let (event_log, _protocol_repo) = build_event_log_provider();
         let cm = Arc::new(ContextManager::with_persistence(
             Box::new(TestNoOpCryptoProvider),
             Box::new(scp_core::context::LocalTransportProvider),
-            build_event_log_provider(),
+            event_log,
             Box::new(NapiBridgePersistence::new()),
             key_resolver,
         ));
