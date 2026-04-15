@@ -1486,6 +1486,57 @@ mod tests {
         assert!(result.is_err());
     }
 
+    #[test]
+    fn client_message_from_bytes_rejects_oversize() {
+        let oversized = vec![0u8; MAX_MESSAGE_SIZE + 1];
+        let result = ClientMessage::from_bytes(&oversized);
+        assert!(
+            matches!(
+                result,
+                Err(NativeProtocolError::MessageTooLarge { size, max })
+                    if size == MAX_MESSAGE_SIZE + 1 && max == MAX_MESSAGE_SIZE
+            ),
+            "expected MessageTooLarge, got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn relay_message_from_bytes_rejects_oversize() {
+        let oversized = vec![0u8; MAX_MESSAGE_SIZE + 1];
+        let result = RelayMessage::from_bytes(&oversized);
+        assert!(
+            matches!(
+                result,
+                Err(NativeProtocolError::MessageTooLarge { size, max })
+                    if size == MAX_MESSAGE_SIZE + 1 && max == MAX_MESSAGE_SIZE
+            ),
+            "expected MessageTooLarge, got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn client_message_from_bytes_accepts_at_max_size() {
+        // A buffer exactly at the limit is accepted (rejected only if strictly greater).
+        // The payload is not valid MessagePack so we get DeserializationFailed, not
+        // MessageTooLarge -- this confirms the size gate did NOT trigger.
+        let at_limit = vec![0xFFu8; MAX_MESSAGE_SIZE];
+        let result = ClientMessage::from_bytes(&at_limit);
+        assert!(
+            matches!(result, Err(NativeProtocolError::DeserializationFailed(_))),
+            "expected DeserializationFailed at limit (not MessageTooLarge), got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn relay_message_from_bytes_accepts_at_max_size() {
+        let at_limit = vec![0xFFu8; MAX_MESSAGE_SIZE];
+        let result = RelayMessage::from_bytes(&at_limit);
+        assert!(
+            matches!(result, Err(NativeProtocolError::DeserializationFailed(_))),
+            "expected DeserializationFailed at limit (not MessageTooLarge), got: {result:?}"
+        );
+    }
+
     // -----------------------------------------------------------------------
     // Wire format field name compliance (ADR-004)
     // -----------------------------------------------------------------------

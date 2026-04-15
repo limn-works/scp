@@ -1479,6 +1479,28 @@ mod tests {
     // -----------------------------------------------------------------------
 
     #[test]
+    fn deserialize_broadcast_content_rejects_oversize() {
+        let oversized = vec![0u8; MAX_BROADCAST_WIRE_SIZE + 1];
+        let result = deserialize_broadcast_content(&oversized);
+        assert!(
+            matches!(result, Err(BroadcastContentError::PayloadTooLarge(size)) if size == MAX_BROADCAST_WIRE_SIZE + 1),
+            "expected PayloadTooLarge, got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn deserialize_broadcast_content_accepts_at_max_wire_size() {
+        // A buffer exactly at the limit passes the size gate; the missing magic
+        // yields InvalidMagic, not PayloadTooLarge.
+        let at_limit = vec![0u8; MAX_BROADCAST_WIRE_SIZE];
+        let result = deserialize_broadcast_content(&at_limit);
+        assert!(
+            matches!(result, Err(BroadcastContentError::InvalidMagic)),
+            "expected InvalidMagic at limit (not PayloadTooLarge), got: {result:?}"
+        );
+    }
+
+    #[test]
     fn deserialization_error_does_not_leak_internals() {
         // Feed invalid msgpack after a valid header. The error message
         // must be generic, not the raw rmp_serde error.

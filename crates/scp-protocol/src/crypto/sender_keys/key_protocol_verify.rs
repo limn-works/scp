@@ -2113,4 +2113,34 @@ mod tests {
         assert_eq!(decoded.blocker, "did:dht:alice");
         assert_eq!(decoded.blocked, "did:dht:dave");
     }
+
+    // -------------------------------------------------------------------
+    // Pre-deserialization size limit tests for SenderKeyDistributionMessage
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn sender_key_distribution_message_from_bytes_rejects_oversize() {
+        let oversized = vec![0u8; MAX_SENDER_KEY_MESSAGE_SIZE + 1];
+        let result = SenderKeyDistributionMessage::from_bytes(&oversized);
+        assert!(
+            matches!(
+                result,
+                Err(SenderKeyError::MessageTooLarge { size, max })
+                    if size == MAX_SENDER_KEY_MESSAGE_SIZE + 1 && max == MAX_SENDER_KEY_MESSAGE_SIZE
+            ),
+            "expected MessageTooLarge, got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn sender_key_distribution_message_from_bytes_accepts_at_max_size() {
+        // A buffer exactly at the limit is accepted by the size gate; invalid
+        // MessagePack yields SerializationFailed, not MessageTooLarge.
+        let at_limit = vec![0xFFu8; MAX_SENDER_KEY_MESSAGE_SIZE];
+        let result = SenderKeyDistributionMessage::from_bytes(&at_limit);
+        assert!(
+            matches!(result, Err(SenderKeyError::SerializationFailed(_))),
+            "expected SerializationFailed at limit (not MessageTooLarge), got: {result:?}"
+        );
+    }
 }
