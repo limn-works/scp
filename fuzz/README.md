@@ -80,7 +80,7 @@ cargo +nightly fuzz list --fuzz-dir fuzz
 
 ## Target Inventory
 
-All 18 targets, grouped by tier and trust boundary.
+All 19 targets, grouped by tier and trust boundary.
 
 **Trust boundaries:**
 - **B1** — Relay wire protocol (any unauthenticated TCP connection)
@@ -120,6 +120,7 @@ Test security properties beyond no-panic. Mix of raw bytes and structured `Arbit
 | `fuzz_sender_header_roundtrip` | B1 | Raw bytes | I1, parse→build→parse identity |
 | `fuzz_chunk_envelope` | B2 | Raw bytes | I1, I2 (`total_chunks` allocation bounds) |
 | `fuzz_merkle_proof` | B3 | Arbitrary (`ArbMerkleProof`) | I1, I2, single-bit flip in sibling hash changes result |
+| `fuzz_merkle_proof_random` | B3 | Arbitrary (`ArbInclusionProof`) | I1 (no panic on adversarially random proofs) |
 | `fuzz_canonical_hash_differential` | B2 | Arbitrary (`ArbCanonicalHashInput`) | I1, I10 (different `InnerEnvelopeParams` → different hash) |
 | `fuzz_aad_differential` | B2 | Arbitrary (`ArbAadInput`) | I1, I9 (different `(context_id, sender_did)` → different AAD) |
 
@@ -196,8 +197,10 @@ in the libFuzzer logs plateaus at a low number, check that:
    #![allow(clippy::unwrap_used, clippy::panic, clippy::expect_used)]
    ```
 
-4. **Add to the CI matrix** in `.github/workflows/fuzz.yml` under `fuzz-nightly` → `matrix.include`.
-   Specify `target`, `dict`, `max_len`, and `time`.
+4. **Add to the CI matrix** (Tier 1-2 only) in `.github/workflows/fuzz.yml` under `fuzz-nightly` →
+   `matrix.include`. Specify `target`, `dict`, `max_len`, and `time`. Tier 3-4 targets use `Arbitrary`
+   structured input (no dict) and are not added to the nightly matrix — run them locally or via
+   `workflow_dispatch`.
 
 5. **Seed the corpus directory** in `fuzz/corpus/fuzz_my_target/`:
    - At least one valid input per enum variant (valid-per-variant seeds)
