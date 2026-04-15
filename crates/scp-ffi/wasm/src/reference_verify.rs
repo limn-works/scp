@@ -401,7 +401,7 @@ async fn verify_dns_record(issuer_did: &str, proof: &serde_json::Value) -> (bool
 ///   for TXT records at `{record_name}.{domain}`, checks one contains the DID.
 ///
 /// Other methods (e.g., `"oauth"`, `"challenge_response"`) are Cryptographic-class
-/// and are not verifiable via fetch — the promise rejects with `SCP-ATTEST-9010`.
+/// and are not verifiable via fetch — the promise rejects with `SCP-ATTEST-9018`.
 ///
 /// # JS usage
 ///
