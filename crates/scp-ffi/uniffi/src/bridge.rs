@@ -2706,7 +2706,7 @@ fn identity_link_attestation_registry()
 /// up the issuer's public key without requiring the caller to pass the
 /// Identity object.
 #[cfg(feature = "allow_in_memory_custody")]
-fn identity_custody_registry()
+pub(crate) fn identity_custody_registry()
 -> &'static dashmap::DashMap<String, (Arc<OpaqueInMemoryKeyCustody>, scp_platform::KeyHandle)> {
     static REGISTRY: std::sync::OnceLock<
         dashmap::DashMap<String, (Arc<OpaqueInMemoryKeyCustody>, scp_platform::KeyHandle)>,

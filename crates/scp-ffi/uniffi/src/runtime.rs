@@ -160,6 +160,8 @@ fn init_bridge_instance(context_manager: Arc<ContextManager>, local_did: &str) {
         if let Some(reg) = UCAN_REGISTRY.get() {
             reg.clear();
         }
+        #[cfg(feature = "allow_in_memory_custody")]
+        crate::bridge::identity_custody_registry().clear();
         if let Some(reg) = ECONOMY_BUDGETS.get() {
             reg.clear();
         }

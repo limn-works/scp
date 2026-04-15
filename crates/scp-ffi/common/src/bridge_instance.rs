@@ -268,6 +268,13 @@ impl BridgeInstance {
     /// panicked while holding the lock), the hook is silently dropped and
     /// an error is logged.
     pub fn register_shutdown_hook(&self, hook: Box<dyn FnOnce() + Send>) {
+        if self.is_shutdown() {
+            // Already shut down — run the hook immediately since shutdown()
+            // won't be called again.
+            tracing::warn!("hook registered after shutdown — running immediately");
+            hook();
+            return;
+        }
         match self.shutdown_hooks.lock() {
             Ok(mut hooks) => hooks.push(hook),
             Err(_) => {
@@ -369,7 +376,9 @@ impl BridgeInstance {
         // called exactly once even if the Mutex isn't dropped.
         if let Ok(mut hooks) = self.shutdown_hooks.lock() {
             for hook in hooks.drain(..) {
-                hook();
+                if let Err(e) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(hook)) {
+                    tracing::error!("shutdown hook panicked: {e:?}");
+                }
             }
         } else {
             tracing::error!("shutdown_hooks mutex poisoned — bridge-specific cleanup skipped");
