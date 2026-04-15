@@ -246,11 +246,11 @@ pub fn bridge_instance() -> Result<&'static Arc<BridgeInstance>, ScpPyError> {
 /// returning `None`, ensuring governance vote signature verification failures
 /// are visible rather than silently skipped.
 ///
-/// When the global storage provider (`STORAGE_PROVIDER`) has been
-/// initialized via [`init_storage`], a [`ProtocolRepositoryContextBridge`] is
-/// constructed from it and injected into the `ContextManager`. This enables
-/// context state persistence across process restarts without requiring
-/// callers to manually wire persistence. See issue #329.
+/// When the `BridgeInstance` storage provider has been initialized via
+/// [`init_storage`], a [`ProtocolRepositoryContextBridge`] is constructed
+/// from it and injected into the `ContextManager`. This enables context state
+/// persistence across process restarts without requiring callers to manually
+/// wire persistence. See issue #329.
 ///
 /// Also populates the global [`BridgeInstance`] with the same `ContextManager`
 /// and `local_did`, enabling incremental migration of per-registry singletons

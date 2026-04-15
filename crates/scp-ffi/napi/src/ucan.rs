@@ -1151,7 +1151,7 @@ mod tests {
     // The previous code used `handle.signing_key` (the context creator's key)
     // for all UCAN delegation signing. When the delegator is different from the
     // context creator, this produced tokens with invalid signatures. The fix
-    // (in this PR) looks up the delegator's identity via IDENTITY_REGISTRY.
+    // (in this PR) looks up the delegator's identity via BridgeInstance identity registry.
     // This test verifies the registry correctly distinguishes different DIDs.
     // -----------------------------------------------------------------------
 

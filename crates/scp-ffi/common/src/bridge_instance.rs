@@ -81,13 +81,10 @@ const MAX_RATE_LIMITERS: usize = 1_000;
 /// is logged.
 const MAX_ECONOMY_CONTEXTS: usize = 10_000;
 
-/// Maximum number of bridge connector state entries.
-///
-/// These are 1:1 with contexts managed through the `ContextManager`, so the
-/// limit should never be reached in practice. Provided as a safety ceiling;
-/// the caller is responsible for calling [`BridgeInstance::remove_bridge_state`]
-/// during context cleanup.
-pub const MAX_BRIDGE_STATE_ENTRIES: usize = 10_000;
+// Note: bridge connector state entries are 1:1 with contexts managed through
+// the `ContextManager`. No separate capacity constant is needed because
+// `ContextManager` itself enforces membership bounds, and bridge state entries
+// are removed via `remove_bridge_state` during context cleanup.
 
 /// Default sliding window duration for antispam velocity tracking (seconds).
 /// Matches the spec section 19.7 example.
@@ -281,7 +278,8 @@ pub struct BridgeInstance {
     /// responsibility — `resume()` only clears the suspended flag.
     ///
     /// Set via [`set_relay_url`]. Retrieved via [`pending_relay_url`].
-    /// Cleared when transport is cleared (on `suspend()` or `shutdown()`).
+    /// Preserved across `suspend()` / `resume()` cycles so callers can
+    /// reconnect. Only cleared during `shutdown()`.
     relay_url: Mutex<Option<String>>,
 
     // -----------------------------------------------------------------
@@ -562,8 +560,8 @@ impl BridgeInstance {
     ///
     /// Clears the suspended flag so bridge operations can proceed. The caller
     /// must re-establish the relay connection via `set_transport` — resume
-    /// does not reconnect automatically because the relay URL is not stored
-    /// in `BridgeInstance`.
+    /// does not reconnect automatically. Use [`pending_relay_url`] to
+    /// retrieve the URL that was active before suspension.
     ///
     /// # Errors
     ///
@@ -590,11 +588,12 @@ impl BridgeInstance {
     /// # Hook execution
     ///
     /// Shutdown hooks are called in registration order after all
-    /// `BridgeInstance`-owned state has been cleared. This ensures that
-    /// bridge-specific singletons (identity registries, FFI bridge state,
-    /// economy trackers) are cleaned up during shutdown, releasing key
-    /// material held by custody providers (zeroized via `Drop` when
-    /// `Arc` refcount reaches zero).
+    /// `BridgeInstance`-owned state has been cleared (registries, economy
+    /// trackers, type-erased identity/UCAN `DashMap`s via their clear
+    /// functions). Hooks handle bridge-specific singletons that cannot be
+    /// owned by `BridgeInstance` (FFI bridge state, MCP registries).
+    /// Together, these steps release key material held by custody
+    /// providers (zeroized via `Drop` when `Arc` refcount reaches zero).
     ///
     /// This function is infallible. Transport lock failures are logged and
     /// cleanup continues. Shutdown must always complete regardless of
@@ -610,6 +609,11 @@ impl BridgeInstance {
         // execution are more critical than a clean transport teardown.
         if let Err(e) = self.clear_transport() {
             tracing::error!("failed to clear transport during shutdown: {e} — continuing cleanup");
+        }
+        // Clear the relay URL after transport teardown. This is only done
+        // in shutdown — suspend() preserves the URL so callers can reconnect.
+        if let Ok(mut url) = self.relay_url.lock() {
+            *url = None;
         }
 
         // Flush all context snapshots before destroying MLS groups. This
@@ -633,11 +637,17 @@ impl BridgeInstance {
         // Clear type-erased DashMap registries (identity + UCAN).
         // Dropping `Arc<DashMap>` entries here releases key material held by
         // custody providers (zeroized via `Zeroizing` fields on Drop).
-        if let Some(clear_fn) = self.identity_registry_clear_fn.get() {
-            clear_fn();
+        // Wrapped in catch_unwind so a panic in one clear_fn (e.g., DashMap
+        // value Drop panics) does not skip remaining cleanup.
+        if let Some(clear_fn) = self.identity_registry_clear_fn.get()
+            && std::panic::catch_unwind(std::panic::AssertUnwindSafe(clear_fn)).is_err()
+        {
+            tracing::error!("identity registry clear panicked during shutdown");
         }
-        if let Some(clear_fn) = self.ucan_registry_clear_fn.get() {
-            clear_fn();
+        if let Some(clear_fn) = self.ucan_registry_clear_fn.get()
+            && std::panic::catch_unwind(std::panic::AssertUnwindSafe(clear_fn)).is_err()
+        {
+            tracing::error!("UCAN registry clear panicked during shutdown");
         }
 
         // Run bridge-specific shutdown hooks (FFI bridge state, MCP
@@ -702,9 +712,13 @@ impl BridgeInstance {
         Ok(())
     }
 
-    /// Clears the transport manager (called on disconnect).
+    /// Clears the transport manager (called on disconnect or suspend).
     ///
-    /// Also clears the stored relay URL (see [`pending_relay_url`]).
+    /// Does **not** clear the stored relay URL — the URL is preserved so
+    /// that callers can retrieve it after [`resume`] and reconnect to the
+    /// same relay. The relay URL is only cleared explicitly in
+    /// [`shutdown`] (after flush) or by the caller via an explicit
+    /// disconnect flow.
     ///
     /// After this, relay-based operations will fail until a new transport
     /// manager is set.
@@ -719,11 +733,6 @@ impl BridgeInstance {
             .write()
             .map_err(|_| TransportLockError::Poisoned)?;
         *guard = None;
-        // Also clear the pending relay URL so callers don't reconnect to
-        // a stale URL after an explicit disconnect.
-        if let Ok(mut url) = self.relay_url.lock() {
-            *url = None;
-        }
         Ok(())
     }
 
@@ -756,13 +765,12 @@ impl BridgeInstance {
 
     /// Returns the relay URL stored by the most recent [`set_relay_url`] call.
     ///
-    /// After [`suspend`] or explicit [`clear_transport`], this returns `None`
-    /// (the URL is cleared alongside the transport manager). After [`resume`],
-    /// the caller should check this value and reconnect to the relay if it
-    /// is `Some`.
+    /// After [`suspend`], this returns `Some` — the URL is preserved so
+    /// callers can reconnect after [`resume`]. After [`shutdown`], this
+    /// returns `None` (the URL is cleared during shutdown cleanup).
     ///
-    /// Returns `None` if no URL has been stored, or if the internal mutex is
-    /// poisoned.
+    /// Returns `None` if no URL has been stored, if the instance has been
+    /// shut down, or if the internal mutex is poisoned.
     #[must_use]
     pub fn pending_relay_url(&self) -> Option<String> {
         self.relay_url.lock().ok().and_then(|guard| guard.clone())
@@ -1008,10 +1016,18 @@ impl BridgeInstance {
     /// (non-persisted) default tracker is used and a warning is logged.
     /// Budget trackers are 1:1 with contexts, so the cap should never be
     /// reached unless [`remove_economy_state`] is not called on context cleanup.
+    ///
+    /// After shutdown, returns an ephemeral tracker to avoid re-populating
+    /// the cleared `DashMap`.
     pub fn with_economy_budget<T, F>(&self, context_id: &str, f: F) -> T
     where
         F: FnOnce(&MemberBudgetTracker) -> T,
     {
+        if self.is_shutdown() {
+            // Post-shutdown: use ephemeral tracker, don't re-populate cleared map
+            let ephemeral = MemberBudgetTracker::default();
+            return f(&ephemeral);
+        }
         if let Some(entry) = self.economy_budgets.get(context_id) {
             return f(entry.value());
         }
@@ -1039,10 +1055,18 @@ impl BridgeInstance {
     /// When the registry is at capacity ([`MAX_ECONOMY_CONTEXTS`]) and the
     /// requested context ID does not already have a tracker, an ephemeral
     /// (non-persisted) default tracker is used and a warning is logged.
+    ///
+    /// After shutdown, returns an ephemeral tracker to avoid re-populating
+    /// the cleared `DashMap`.
     pub fn with_economy_budget_mut<T, F>(&self, context_id: &str, f: F) -> T
     where
         F: FnOnce(&mut MemberBudgetTracker) -> T,
     {
+        if self.is_shutdown() {
+            // Post-shutdown: use ephemeral tracker, don't re-populate cleared map
+            let mut ephemeral = MemberBudgetTracker::default();
+            return f(&mut ephemeral);
+        }
         if let Some(mut entry) = self.economy_budgets.get_mut(context_id) {
             return f(entry.value_mut());
         }
@@ -1073,10 +1097,18 @@ impl BridgeInstance {
     /// When the registry is at capacity ([`MAX_ECONOMY_CONTEXTS`]) and the
     /// requested context ID does not already have a tracker, an ephemeral
     /// (non-persisted) tracker is used and a warning is logged.
+    ///
+    /// After shutdown, returns an ephemeral tracker to avoid re-populating
+    /// the cleared `DashMap`.
     pub fn with_economy_antispam<T, F>(&self, context_id: &str, f: F) -> T
     where
         F: FnOnce(&SenderVelocityTracker) -> T,
     {
+        if self.is_shutdown() {
+            // Post-shutdown: use ephemeral tracker, don't re-populate cleared map
+            let ephemeral = SenderVelocityTracker::new(ANTISPAM_DEFAULT_WINDOW_SECS);
+            return f(&ephemeral);
+        }
         if let Some(entry) = self.economy_antispam.get(context_id) {
             return f(entry.value());
         }
@@ -1177,10 +1209,19 @@ impl BridgeInstance {
     /// Retrieves the bridge's identity registry, downcasting to `T`.
     ///
     /// Returns `None` if the registry has not been set or if the downcast
-    /// fails (mismatched type).
+    /// fails (mismatched type). A downcast failure logs an error with the
+    /// expected type name to distinguish "not initialized" from "wrong type."
     #[must_use]
     pub fn get_identity_registry_as<T: Any + Send + Sync>(&self) -> Option<&T> {
-        self.identity_registry.get()?.downcast_ref::<T>()
+        let boxed = self.identity_registry.get()?;
+        let result = boxed.downcast_ref::<T>();
+        if result.is_none() {
+            tracing::error!(
+                expected = std::any::type_name::<T>(),
+                "identity_registry downcast failed — type mismatch (not 'not initialized')"
+            );
+        }
+        result
     }
 
     /// Stores the bridge's storage provider as a type-erased value.
@@ -1198,10 +1239,19 @@ impl BridgeInstance {
     /// Retrieves the bridge's storage provider, downcasting to `T`.
     ///
     /// Returns `None` if the provider has not been set or if the downcast
-    /// fails (mismatched type).
+    /// fails (mismatched type). A downcast failure logs an error with the
+    /// expected type name to distinguish "not initialized" from "wrong type."
     #[must_use]
     pub fn get_storage_provider_as<T: Any + Send + Sync>(&self) -> Option<&T> {
-        self.storage_provider.get()?.downcast_ref::<T>()
+        let boxed = self.storage_provider.get()?;
+        let result = boxed.downcast_ref::<T>();
+        if result.is_none() {
+            tracing::error!(
+                expected = std::any::type_name::<T>(),
+                "storage_provider downcast failed — type mismatch (not 'not initialized')"
+            );
+        }
+        result
     }
 
     /// Stores the bridge's protocol repository as a type-erased value.
@@ -1219,10 +1269,19 @@ impl BridgeInstance {
     /// Retrieves the bridge's protocol repository, downcasting to `T`.
     ///
     /// Returns `None` if the repository has not been set or if the downcast
-    /// fails (mismatched type).
+    /// fails (mismatched type). A downcast failure logs an error with the
+    /// expected type name to distinguish "not initialized" from "wrong type."
     #[must_use]
     pub fn get_protocol_repository_as<T: Any + Send + Sync>(&self) -> Option<&T> {
-        self.protocol_repository.get()?.downcast_ref::<T>()
+        let boxed = self.protocol_repository.get()?;
+        let result = boxed.downcast_ref::<T>();
+        if result.is_none() {
+            tracing::error!(
+                expected = std::any::type_name::<T>(),
+                "protocol_repository downcast failed — type mismatch (not 'not initialized')"
+            );
+        }
+        result
     }
 
     /// Stores the bridge's UCAN context state registry as a type-erased value
@@ -1249,10 +1308,19 @@ impl BridgeInstance {
     /// Retrieves the bridge's UCAN registry, downcasting to `T`.
     ///
     /// Returns `None` if the registry has not been set or if the downcast
-    /// fails (mismatched type).
+    /// fails (mismatched type). A downcast failure logs an error with the
+    /// expected type name to distinguish "not initialized" from "wrong type."
     #[must_use]
     pub fn get_ucan_registry_as<T: Any + Send + Sync>(&self) -> Option<&T> {
-        self.ucan_registry.get()?.downcast_ref::<T>()
+        let boxed = self.ucan_registry.get()?;
+        let result = boxed.downcast_ref::<T>();
+        if result.is_none() {
+            tracing::error!(
+                expected = std::any::type_name::<T>(),
+                "ucan_registry downcast failed — type mismatch (not 'not initialized')"
+            );
+        }
+        result
     }
 }
 
@@ -2135,6 +2203,51 @@ mod tests {
         );
     }
 
+    #[test]
+    fn economy_accessors_use_ephemeral_after_shutdown() {
+        let instance = BridgeInstance::new(test_context_manager(), "did:dht:ztest".to_owned());
+        let did = scp_primitives::DID::from("did:dht:zalice");
+
+        // Grant a budget before shutdown.
+        instance.with_economy_budget_mut("ctx-sd", |tracker| {
+            tracker.grant(&did, scp_protocol::economy::Amount::new(500));
+        });
+
+        instance.shutdown();
+
+        // Post-shutdown: budget should be empty (ephemeral), NOT re-populate the map.
+        let remaining = instance.with_economy_budget("ctx-sd", |tracker| tracker.remaining(&did));
+        assert_eq!(
+            remaining.value(),
+            0,
+            "post-shutdown economy_budget must use ephemeral tracker"
+        );
+
+        // The DashMap must remain empty — economy_budget must NOT re-insert.
+        assert!(
+            instance.economy_budgets.is_empty(),
+            "economy_budgets must not be re-populated after shutdown"
+        );
+
+        // with_economy_budget_mut also returns ephemeral.
+        instance.with_economy_budget_mut("ctx-sd2", |tracker| {
+            tracker.grant(&did, scp_protocol::economy::Amount::new(100));
+        });
+        assert!(
+            instance.economy_budgets.is_empty(),
+            "economy_budgets must not be re-populated after shutdown via _mut"
+        );
+
+        // with_economy_antispam also returns ephemeral.
+        instance.with_economy_antispam("ctx-sd3", |tracker| {
+            tracker.record_message(&did, 1000);
+        });
+        assert!(
+            instance.economy_antispam.is_empty(),
+            "economy_antispam must not be re-populated after shutdown"
+        );
+    }
+
     // -----------------------------------------------------------------
     // Bridge state tests
     // -----------------------------------------------------------------
@@ -2257,7 +2370,7 @@ mod tests {
     }
 
     #[test]
-    fn clear_transport_clears_relay_url() {
+    fn clear_transport_preserves_relay_url() {
         let instance = BridgeInstance::new(test_context_manager(), "did:dht:ztest".to_owned());
         instance
             .set_transport(Arc::new(test_transport_manager()))
@@ -2266,14 +2379,15 @@ mod tests {
         assert!(instance.pending_relay_url().is_some());
 
         instance.clear_transport().unwrap();
-        assert!(
-            instance.pending_relay_url().is_none(),
-            "clear_transport must also clear relay URL"
+        assert_eq!(
+            instance.pending_relay_url().as_deref(),
+            Some("wss://relay.example.com"),
+            "clear_transport must preserve relay URL so callers can reconnect"
         );
     }
 
     #[test]
-    fn suspend_clears_relay_url() {
+    fn suspend_preserves_relay_url() {
         let instance = BridgeInstance::new(test_context_manager(), "did:dht:ztest".to_owned());
         instance
             .set_transport(Arc::new(test_transport_manager()))
@@ -2282,25 +2396,47 @@ mod tests {
         assert!(instance.pending_relay_url().is_some());
 
         instance.suspend().unwrap();
-        assert!(
-            instance.pending_relay_url().is_none(),
-            "suspend must clear relay URL alongside transport"
+        assert_eq!(
+            instance.pending_relay_url().as_deref(),
+            Some("wss://relay.example.com"),
+            "suspend must preserve relay URL so callers can reconnect after resume"
         );
     }
 
     #[test]
-    fn relay_url_survives_resume() {
-        // resume() does NOT reconnect — it is the caller's responsibility.
-        // But the relay URL was already cleared by suspend()'s clear_transport().
-        // So after resume(), pending_relay_url() is None — the caller sets it
-        // again after reconnecting.
+    fn relay_url_survives_suspend_resume_cycle() {
+        // The relay URL is preserved across suspend/resume so callers can
+        // reconnect to the same relay after resume.
         let instance = BridgeInstance::new(test_context_manager(), "did:dht:ztest".to_owned());
+        instance
+            .set_transport(Arc::new(test_transport_manager()))
+            .unwrap();
         instance.set_relay_url("wss://relay.example.com".to_owned());
         instance.suspend().unwrap();
-        assert!(instance.pending_relay_url().is_none());
+        assert_eq!(
+            instance.pending_relay_url().as_deref(),
+            Some("wss://relay.example.com"),
+            "relay URL must survive suspend"
+        );
         instance.resume().unwrap();
-        // After resume, no URL is set — caller must re-set after reconnecting.
-        assert!(instance.pending_relay_url().is_none());
+        assert_eq!(
+            instance.pending_relay_url().as_deref(),
+            Some("wss://relay.example.com"),
+            "relay URL must survive resume — caller uses it to reconnect"
+        );
+    }
+
+    #[test]
+    fn shutdown_clears_relay_url() {
+        let instance = BridgeInstance::new(test_context_manager(), "did:dht:ztest".to_owned());
+        instance.set_relay_url("wss://relay.example.com".to_owned());
+        assert!(instance.pending_relay_url().is_some());
+
+        instance.shutdown();
+        assert!(
+            instance.pending_relay_url().is_none(),
+            "shutdown must clear relay URL"
+        );
     }
 
     // -----------------------------------------------------------------

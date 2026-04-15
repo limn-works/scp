@@ -305,8 +305,8 @@ pub fn py_verify_participation_requirements(
 /// agent-level evaluation.
 ///
 /// Accepts all inputs as JSON strings and returns the aggregated `TrustInput`
-/// as a JSON string. Uses the global `STORAGE_PROVIDER` for persistent trust
-/// data when initialized (trust data survives across calls and restarts);
+/// as a JSON string. Uses the `BridgeInstance` storage provider for persistent
+/// trust data when initialized (trust data survives across calls and restarts);
 /// falls back to an ephemeral in-memory store otherwise. See issue #502.
 ///
 /// # Errors
@@ -383,11 +383,11 @@ pub fn py_aggregate_trust_input(
             ))
         })?;
 
-    // Use persistent storage if the global STORAGE_PROVIDER is initialized,
-    // otherwise fall back to an ephemeral in-memory store. With persistent
-    // storage, previously cached attestations, revocation states, and challenge
-    // results are retained across calls — this is the correct production
-    // behavior (trust data survives restarts). See issue #502.
+    // Use persistent storage if the BridgeInstance storage provider is
+    // initialized, otherwise fall back to an ephemeral in-memory store. With
+    // persistent storage, previously cached attestations, revocation states,
+    // and challenge results are retained across calls — this is the correct
+    // production behavior (trust data survives restarts). See issue #502.
     if let Ok(storage) = crate::runtime::get_storage() {
         let handle = crate::runtime()?.handle().clone();
         let repo = Arc::new(scp_core::store::ProtocolRepository::new(Arc::clone(
