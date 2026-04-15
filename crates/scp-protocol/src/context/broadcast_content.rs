@@ -54,6 +54,13 @@ const MAX_DEPLOY_ID_BYTES: usize = 128;
 /// Maximum body size in bytes (10 MiB).
 const MAX_BODY_BYTES: usize = 10 * 1024 * 1024;
 
+/// Maximum wire size for a serialized broadcast content payload in bytes.
+///
+/// Accounts for the 4-byte magic+version header plus `MAX_BODY_BYTES` of
+/// body, with headroom for metadata fields. Pre-deserialization guard against
+/// allocation bombs.
+const MAX_BROADCAST_WIRE_SIZE: usize = MAX_BODY_BYTES + 4 + 65_536;
+
 // ---------------------------------------------------------------------------
 // BroadcastContentError
 // ---------------------------------------------------------------------------
@@ -89,6 +96,10 @@ pub enum BroadcastContentError {
     /// Body exceeds `MAX_BODY_BYTES`.
     #[error("body too large: {0} bytes (max {MAX_BODY_BYTES})")]
     BodyTooLarge(usize),
+
+    /// Wire payload exceeds `MAX_BROADCAST_WIRE_SIZE` before deserialization.
+    #[error("broadcast payload too large: {0} bytes")]
+    PayloadTooLarge(usize),
 
     /// An `ETag` value has an invalid format (must be 64 lowercase hex chars).
     #[error("invalid etag format: {0}")]
@@ -432,6 +443,9 @@ pub fn serialize_broadcast_content(
 pub fn deserialize_broadcast_content(
     bytes: &[u8],
 ) -> Result<BroadcastContent, BroadcastContentError> {
+    if bytes.len() > MAX_BROADCAST_WIRE_SIZE {
+        return Err(BroadcastContentError::PayloadTooLarge(bytes.len()));
+    }
     if bytes.len() < 4 {
         return Err(BroadcastContentError::InvalidMagic);
     }

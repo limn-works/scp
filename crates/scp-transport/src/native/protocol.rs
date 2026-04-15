@@ -51,6 +51,12 @@ pub const DEFAULT_QUERY_LIMIT: u32 = 100;
 /// Maximum QUERY limit.
 pub const MAX_QUERY_LIMIT: u32 = 1000;
 
+/// Maximum size of a `ClientMessage` or `RelayMessage` in bytes (1 MiB).
+///
+/// Pre-deserialization guard against allocation bombs from malformed
+/// `MessagePack` input.
+pub const MAX_MESSAGE_SIZE: usize = 1_048_576;
+
 // ---------------------------------------------------------------------------
 // Serde helper for Option<[u8; 32]> as MessagePack binary
 // ---------------------------------------------------------------------------
@@ -335,9 +341,17 @@ impl ClientMessage {
     ///
     /// # Errors
     ///
-    /// Returns [`NativeProtocolError::DeserializationFailed`] if the bytes
-    /// are not a valid `MessagePack`-encoded `ClientMessage`.
+    /// Returns [`NativeProtocolError::MessageTooLarge`] if `bytes.len()` exceeds
+    /// [`MAX_MESSAGE_SIZE`].
+    /// Returns [`NativeProtocolError::DeserializationFailed`] if the bytes are
+    /// not a valid `MessagePack`-encoded `ClientMessage`.
     pub fn from_bytes(bytes: &[u8]) -> Result<Self, NativeProtocolError> {
+        if bytes.len() > MAX_MESSAGE_SIZE {
+            return Err(NativeProtocolError::MessageTooLarge {
+                size: bytes.len(),
+                max: MAX_MESSAGE_SIZE,
+            });
+        }
         rmp_serde::from_slice(bytes)
             .map_err(|e| NativeProtocolError::DeserializationFailed(e.to_string()))
     }
@@ -561,9 +575,17 @@ impl RelayMessage {
     ///
     /// # Errors
     ///
-    /// Returns [`NativeProtocolError::DeserializationFailed`] if the bytes
-    /// are not a valid `MessagePack`-encoded `RelayMessage`.
+    /// Returns [`NativeProtocolError::MessageTooLarge`] if `bytes.len()` exceeds
+    /// [`MAX_MESSAGE_SIZE`].
+    /// Returns [`NativeProtocolError::DeserializationFailed`] if the bytes are
+    /// not a valid `MessagePack`-encoded `RelayMessage`.
     pub fn from_bytes(bytes: &[u8]) -> Result<Self, NativeProtocolError> {
+        if bytes.len() > MAX_MESSAGE_SIZE {
+            return Err(NativeProtocolError::MessageTooLarge {
+                size: bytes.len(),
+                max: MAX_MESSAGE_SIZE,
+            });
+        }
         rmp_serde::from_slice(bytes)
             .map_err(|e| NativeProtocolError::DeserializationFailed(e.to_string()))
     }

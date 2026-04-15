@@ -111,6 +111,15 @@ pub enum NativeProtocolError {
     /// A constraint validation failed on a client message.
     #[error("validation failed: {0}")]
     ValidationFailed(String),
+
+    /// The message exceeds the maximum allowed size.
+    #[error("message too large: {size} bytes (max {max})")]
+    MessageTooLarge {
+        /// Actual message size in bytes.
+        size: usize,
+        /// Maximum allowed size in bytes.
+        max: usize,
+    },
 }
 
 #[cfg(test)]

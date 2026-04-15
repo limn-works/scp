@@ -59,6 +59,11 @@ pub fn generate_wrapping_keypair() -> ([u8; 32], [u8; 32]) {
 /// AES-128-GCM nonce size in bytes.
 pub const HPKE_NONCE_SIZE: usize = 12;
 
+/// Maximum size of a serialized [`SenderKeyDistributionMessage`] in bytes (64 KiB).
+///
+/// Pre-deserialization guard against allocation bombs from malformed input.
+pub const MAX_SENDER_KEY_MESSAGE_SIZE: usize = 65_536;
+
 /// HKDF info domain separator for sender key HPKE encryption (§9.16.2).
 /// The full info string is `"scp-sender-key-v1" || context_id || sender_did || epoch_BE`.
 const HPKE_INFO_PREFIX: &[u8] = b"scp-sender-key-v1";
@@ -265,8 +270,16 @@ impl SenderKeyDistributionMessage {
     ///
     /// # Errors
     ///
+    /// Returns [`SenderKeyError::MessageTooLarge`] if `bytes.len()` exceeds
+    /// [`MAX_SENDER_KEY_MESSAGE_SIZE`].
     /// Returns [`SenderKeyError::SerializationFailed`] if deserialization fails.
     pub fn from_bytes(bytes: &[u8]) -> Result<Self, SenderKeyError> {
+        if bytes.len() > MAX_SENDER_KEY_MESSAGE_SIZE {
+            return Err(SenderKeyError::MessageTooLarge {
+                size: bytes.len(),
+                max: MAX_SENDER_KEY_MESSAGE_SIZE,
+            });
+        }
         rmp_serde::from_slice(bytes).map_err(|e| SenderKeyError::SerializationFailed(e.to_string()))
     }
 }

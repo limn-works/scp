@@ -239,6 +239,15 @@ pub enum SenderKeyError {
     /// See ADR-039 and SCP-AB-020.
     #[error("Category A violation: {0}")]
     CategoryAViolation(String),
+
+    /// The message exceeds the maximum allowed size.
+    #[error("message too large: {size} bytes (max {max})")]
+    MessageTooLarge {
+        /// Actual message size in bytes.
+        size: usize,
+        /// Maximum allowed size in bytes.
+        max: usize,
+    },
 }
 
 // ---------------------------------------------------------------------------
