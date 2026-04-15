@@ -8,7 +8,7 @@
  * See ADR-022 in `.docs/adrs/phase-4.md` and `.docs/scaffold/typescript.md`.
  */
 
-import { IdentityError, mapBridgeError } from "./errors";
+import { IdentityError, mapBridgeError, ValidationError } from "./errors";
 import type { BridgeIdentityHandle } from "./internal/bridge";
 import { getBridge } from "./internal/bridge";
 import type { DIDDocument } from "./types";
@@ -545,6 +545,9 @@ export class RevocationStatus {
       if (revokedAtRaw === undefined) {
         throw new Error("Bridge returned Revoked status without revoked_at timestamp");
       }
+      if (!Number.isFinite(revokedAtRaw)) {
+        throw new ValidationError("revoked_at must be a finite number", "SCP-VALID-7004");
+      }
       return RevocationStatus.revoked(
         Math.trunc(revokedAtRaw),
         revoked?.reason as string | undefined,
@@ -703,9 +706,11 @@ export class IdentityAttestation implements IdentityAttestationData {
     const verificationMethod = (evidence.method ??
       data.verification_method ??
       data.verificationMethod) as string;
-    const verifiedAt = Math.trunc(
-      (evidence.verified_at ?? data.verified_at ?? data.verifiedAt) as number,
-    );
+    const verifiedAtRaw = (evidence.verified_at ?? data.verified_at ?? data.verifiedAt) as number;
+    if (!Number.isFinite(verifiedAtRaw)) {
+      throw new ValidationError("verified_at must be a finite number", "SCP-VALID-7003");
+    }
+    const verifiedAt = Math.trunc(verifiedAtRaw);
     const rawRs = data.revocation_status ?? data.revocationStatus ?? "active";
     const revocationStatus =
       rawRs instanceof RevocationStatus ? rawRs : RevocationStatus._fromBridgeValue(rawRs);
