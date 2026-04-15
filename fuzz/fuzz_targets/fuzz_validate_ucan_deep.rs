@@ -8,10 +8,10 @@
 //! `validate_ucan` with a fuzz-controlled validation context.
 //!
 //! Security invariants verified:
-//! - I3: Expired tokens (exp < now) are always rejected.
-//! - I6: Timestamps outside [now - skew, now + skew] are always rejected.
+//! - I3: Expired tokens (exp + skew_tolerance <= now) are always rejected.
 //! - I7: Capabilities outside the ceiling are always rejected.
 //! - I8: Delegation chain verification always terminates (depth ≤ 32).
+//! - Revocation: revoked tokens (CID in revocation set) are always rejected.
 
 use std::collections::HashSet;
 
@@ -20,13 +20,15 @@ use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use ed25519_dalek::{Signer, SigningKey};
 use libfuzzer_sys::fuzz_target;
+use scp_fuzz::FixedClock;
+use scp_primitives::Clock;
+use scp_protocol::crypto::ucan::capability::CapabilityUri;
+use scp_protocol::crypto::ucan::revoke::compute_revocation_cid;
 use scp_protocol::crypto::ucan::validate::{
     DEFAULT_CLOCK_SKEW_TOLERANCE_SECS, InMemoryDidResolver, InMemoryNonceTracker,
     InMemoryProofResolver, InMemoryRevocationChecker, ValidationContext, validate_ucan,
 };
-use scp_protocol::crypto::ucan::capability::CapabilityUri;
 use scp_protocol::crypto::ucan::{Attenuation, UcanHeader, UcanPayload, UcanToken};
-use scp_primitives::Clock;
 
 // ---------------------------------------------------------------------------
 // Fixed test identity (deterministic, never used in production)
@@ -48,6 +50,13 @@ const FUZZ_ISSUER_DID: &str = "did:dht:fuzz-issuer";
 const FUZZ_AUDIENCE_DID: &str = "did:dht:fuzz-audience";
 const FUZZ_CONTEXT_ID: &str = "fuzz-ctx-001";
 
+/// The capability the token always grants. Fixed to `messages:write` so it is
+/// always within the ceiling (which also contains `messages:write`). Fuzzing
+/// the capability string added no value: the ceiling check rejected arbitrary
+/// bytes, preventing the revocation and expiry invariant paths from being
+/// exercised.
+const FUZZ_CAPABILITY: &str = "messages:write";
+
 // ---------------------------------------------------------------------------
 // Fuzz-controlled validation parameters
 // ---------------------------------------------------------------------------
@@ -58,49 +67,47 @@ const FUZZ_CONTEXT_ID: &str = "fuzz-ctx-001";
 /// revocation) is fuzzed. This exercises the validation pipeline gates.
 #[derive(Debug, Arbitrary)]
 struct FuzzValidationInput {
-    /// Simulated current time in seconds since Unix epoch.
-    /// The token's `exp` is derived from this to explore expiry paths.
-    now_secs: u64,
-    /// Whether the token should appear to be expired (exp < now).
+    /// Whether the token should appear to be expired
+    /// (`exp + skew_tolerance <= now`).
     expired: bool,
     /// Lifetime of the token in seconds (capped to 24h for validity).
     lifetime_secs: u8,
     /// Whether to mark the token as revoked.
     revoked: bool,
-    /// Fuzz-controlled capability string (for ceiling check).
-    capability: Vec<u8>,
-}
-
-/// A minimal test clock that returns a fixed `now`.
-struct FixedClock(u64);
-
-impl Clock for FixedClock {
-    fn now_secs(&self) -> u64 {
-        self.0
-    }
-
-    fn now_millis(&self) -> u64 {
-        self.0.saturating_mul(1000)
-    }
 }
 
 /// Build a correctly-signed UCAN token using the fuzz keypair.
+///
+/// The nonce timestamp is pinned to real wall time so that
+/// `InMemoryNonceTracker::check_replay` (which uses `SystemClock` internally)
+/// accepts the nonce regardless of `expired` or `revoked` state. The expiry
+/// path is controlled by `expired` only.
 fn build_signed_token(
     signing_key: &SigningKey,
-    now_secs: u64,
     expired: bool,
     lifetime_secs: u64,
-    capability: &str,
 ) -> UcanToken {
     let header = UcanHeader::new();
+
+    // Pin `now_secs` to real wall time so the nonce freshness check passes.
+    // (InMemoryNonceTracker uses SystemClock internally.)
+    let now_secs = scp_primitives::SystemClock.now_secs();
+
     let exp = if expired {
-        now_secs.saturating_sub(1)
+        // Must satisfy `exp + DEFAULT_CLOCK_SKEW_TOLERANCE_SECS <= now_secs`
+        // to be rejected by `verify_expiry`. Subtracting tolerance + 1 ensures
+        // the token is outside the skew window.
+        now_secs.saturating_sub(DEFAULT_CLOCK_SKEW_TOLERANCE_SECS + 1)
     } else {
         now_secs.saturating_add(lifetime_secs.max(1))
     };
-    // Nonce: use current time millis + fixed hex suffix to satisfy format
-    // requirement ({unix_millis}-{32_hex_chars}).
-    let nonce = format!("{}-{}", now_secs.saturating_mul(1000), "deadbeefcafe1234deadbeefcafe1234");
+
+    // Nonce: {unix_millis}-{32_hex_chars}. Timestamp uses real wall time so
+    // the freshness window in `check_replay` is satisfied.
+    let nonce = format!(
+        "{}-deadbeefcafe1234deadbeefcafe1234",
+        scp_primitives::SystemClock.now_millis()
+    );
 
     let payload = UcanPayload {
         iss: FUZZ_ISSUER_DID.to_owned(),
@@ -109,7 +116,7 @@ fn build_signed_token(
         nbf: None,
         nnc: nonce,
         att: vec![Attenuation {
-            with: format!("scp:ctx:{FUZZ_CONTEXT_ID}/{capability}"),
+            with: format!("scp:ctx:{FUZZ_CONTEXT_ID}/{FUZZ_CAPABILITY}"),
             can: "*".to_owned(),
         }],
         prf: vec![],
@@ -144,26 +151,12 @@ fuzz_target!(|input: FuzzValidationInput| {
     // Cap lifetime to 24h (86400s) to stay within protocol limits.
     let lifetime_secs = u64::from(input.lifetime_secs).min(86400);
 
-    // Use a bounded capability string: convert fuzz bytes to valid-looking capability.
-    // Default to a known-valid capability if bytes aren't valid UTF-8.
-    let capability_str = std::str::from_utf8(&input.capability)
-        .unwrap_or("messages:write")
-        .trim();
-    let capability_str = if capability_str.is_empty() {
-        "messages:write"
-    } else {
-        capability_str
-    };
+    // Clock used by the ValidationContext. Pinned to real wall time so that
+    // the expiry check (`exp + tolerance <= now`) sees a stable `now`.
+    let now_secs = scp_primitives::SystemClock.now_secs();
+    let clock = FixedClock(now_secs);
 
-    let clock = FixedClock(input.now_secs);
-
-    let token = build_signed_token(
-        &signing_key,
-        input.now_secs,
-        input.expired,
-        lifetime_secs,
-        capability_str,
-    );
+    let token = build_signed_token(&signing_key, input.expired, lifetime_secs);
 
     // Build an in-memory DID resolver with the fuzz issuer's public key.
     let mut resolver_keys = std::collections::HashMap::new();
@@ -173,22 +166,21 @@ fuzz_target!(|input: FuzzValidationInput| {
     let mut nonce_tracker = InMemoryNonceTracker::new();
 
     // Optionally mark the token as revoked.
+    // `compute_revocation_cid` produces bare hex SHA-256 — no prefix.
     let mut rev_checker = InMemoryRevocationChecker::new();
     if input.revoked {
-        // Compute the CID the same way mint.rs does.
-        use sha2::{Digest, Sha256};
-        let hash = Sha256::digest(token.encoded.as_bytes());
-        let hex: String = hash.iter().map(|b| format!("{b:02x}")).collect();
-        let cid = format!("bafyrei{hex}");
+        let cid = compute_revocation_cid(&token.encoded);
         rev_checker.revoked.insert(cid);
     }
 
     let proof_resolver = InMemoryProofResolver::new();
 
-    // Ceiling: allow the standard messages:write capability.
+    // Ceiling entries use `capability_name()` format: `"{resource}:{action}"`.
+    // `verify_ceiling_compliance` compares `required_cap.capability_name()`
+    // against this set — not the full `scp:ctx:…` URI form.
     let mut ceiling: HashSet<String> = HashSet::new();
-    ceiling.insert(format!("scp:ctx:{FUZZ_CONTEXT_ID}/messages:write"));
-    ceiling.insert(format!("scp:ctx:{FUZZ_CONTEXT_ID}/messages:read"));
+    ceiling.insert("messages:write".to_owned());
+    ceiling.insert("messages:read".to_owned());
 
     let required_cap = CapabilityUri::new(FUZZ_CONTEXT_ID, "messages", "write");
 
@@ -207,15 +199,16 @@ fuzz_target!(|input: FuzzValidationInput| {
     // I1: must not panic on any input.
     let result = validate_ucan(&token, &required_cap, &mut ctx);
 
-    // I3 / I6: expired tokens MUST be rejected.
+    // I3: expired tokens MUST be rejected.
+    // `verify_expiry` rejects when `exp + clock_skew_tolerance_secs <= now`.
     if input.expired {
         assert!(
             result.is_err(),
-            "security invariant I3/I6 violated: expired token accepted by validate_ucan"
+            "security invariant I3 violated: expired token accepted by validate_ucan"
         );
     }
 
-    // I7 / revocation: revoked tokens MUST be rejected.
+    // Revocation invariant: revoked tokens MUST be rejected.
     if input.revoked {
         assert!(
             result.is_err(),
