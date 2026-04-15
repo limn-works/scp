@@ -17,7 +17,12 @@ path = "src/lib.rs"
 libfuzzer-sys = { version = "0.4", features = ["arbitrary-derive"] }
 arbitrary = { version = "1", features = ["derive"] }
 rmp-serde = "1"
+rmpv = { version = "1", features = ["with-serde"] }
+serde = { version = "1", features = ["derive"] }
+serde_bytes = "0.11"
 serde_json = "1"
+sha2 = "0.10"
+hex = "0.4"
 base64 = "0.22"
 ed25519-dalek = { version = "2", features = ["rand_core"] }
 scp-protocol = { path = "../crates/scp-protocol", features = ["testing"] }
@@ -64,6 +69,24 @@ test = false
 doc = false
 
 # Tier 2 — Parsers & Content Trust Boundaries
+[[bin]]
+name = "fuzz_stored_value"
+path = "fuzz_targets/fuzz_stored_value.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "fuzz_redb_blob"
+path = "fuzz_targets/fuzz_redb_blob.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "fuzz_broadcast_envelope"
+path = "fuzz_targets/fuzz_broadcast_envelope.rs"
+test = false
+doc = false
+
 [[bin]]
 name = "fuzz_parse_ucan"
 path = "fuzz_targets/fuzz_parse_ucan.rs"
@@ -141,5 +164,30 @@ doc = false
 [[bin]]
 name = "fuzz_aad_differential"
 path = "fuzz_targets/fuzz_aad_differential.rs"
+test = false
+doc = false
+
+# Tier 4 — Chain Depth, Epoch Monotonicity, and Sign-Verify Consistency
+[[bin]]
+name = "fuzz_ucan_chain_deep"
+path = "fuzz_targets/fuzz_ucan_chain_deep.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "fuzz_signing_canonical_hash_differential"
+path = "fuzz_targets/fuzz_signing_canonical_hash_differential.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "fuzz_nonce_replay"
+path = "fuzz_targets/fuzz_nonce_replay.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "fuzz_epoch_monotonicity"
+path = "fuzz_targets/fuzz_epoch_monotonicity.rs"
 test = false
 doc = false

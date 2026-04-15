@@ -1,0 +1,70 @@
+# Dictionary for StoredValue<T> MessagePack deserialization.
+# StoredValue wraps all persisted domain values in scp-runtime with a version
+# field for lazy on-read migration (spec §17.5).
+
+# StoredValue field names
+"version"
+"data"
+
+# MessagePack fixmap headers (0x8N = N-field map)
+"\x81"
+"\x82"
+"\x83"
+"\x84"
+"\x85"
+"\x86"
+"\x87"
+"\x88"
+"\x89"
+"\x8a"
+
+# MessagePack fixarray headers
+"\x91"
+"\x92"
+"\x93"
+"\x94"
+"\x95"
+"\x96"
+
+# MessagePack uint16 / uint32 / uint64 headers (version field encoding)
+"\xcd"
+"\xce"
+"\xcf"
+
+# MessagePack int8 / int16 / int32 / int64 headers
+"\xd0"
+"\xd1"
+"\xd2"
+"\xd3"
+
+# MessagePack bin8 / bin16 / bin32 headers (binary data)
+"\xc4"
+"\xc5"
+"\xc6"
+
+# MessagePack str8 / str16 headers
+"\xd9"
+"\xda"
+
+# nil, true, false
+"\xc0"
+"\xc2"
+"\xc3"
+
+# Common version values (u16 stored as fixint or uint16)
+"\x00"
+"\x01"
+"\x02"
+"\x03"
+
+# Version byte pair for CURRENT_STORE_VERSION=2 encoded as uint16
+"\xcd\x00\x02"
+
+# Known-bad: version far ahead of current (u16 max)
+"\xcd\xff\xff"
+
+# Common 32-byte binary length prefix (bin8 of 32 bytes)
+"\xc4\x20"
+
+# Common 64-byte binary length prefix
+"\xc4\x40"

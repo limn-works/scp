@@ -177,12 +177,12 @@ Every target asserts at minimum **I1** (no panic on any untrusted input). Additi
 |----|-----------|-------------|
 | I1 | No panic on any untrusted input | All targets |
 | I2 | No unbounded allocation (bounded by protocol constants) | T1-T6, T10-T11, T14-T15 |
-| I3 | Cryptographic signatures unforgeable (no structural bypass) | T16, T18 |
-| I4 | Nonce replay prevention: accepted nonce never re-accepted | — (future T20) |
-| I5 | Epoch monotonicity: no rollback | — (future T19) |
+| I3 | Cryptographic signatures unforgeable (no structural bypass) | T16, T18, `fuzz_signing_canonical_hash_differential` |
+| I4 | Nonce replay prevention: accepted nonce never re-accepted | `fuzz_nonce_replay` |
+| I5 | Epoch monotonicity: no rollback | `fuzz_epoch_monotonicity` |
 | I6 | Timestamps outside `[now - max_age, now + skew]` always rejected | T18 |
-| I7 | Capabilities outside ceiling always rejected | — (T18 fixes capability + ceiling, not exercised) |
-| I8 | Delegation chain verification terminates (depth ≤ 32) | — (T18 uses empty `prf`, no chain walked) |
+| I7 | Capabilities outside ceiling always rejected | `fuzz_ucan_chain_deep` |
+| I8 | Delegation chain verification terminates (depth ≤ 32) | `fuzz_ucan_chain_deep` |
 | I9 | Different `(context_id, sender_did)` → different AAD | T17 |
 | I10 | Different `InnerEnvelopeParams` → different canonical hash | T16 |
 
