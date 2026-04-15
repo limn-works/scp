@@ -39,6 +39,8 @@ pub use broadcast::{
 pub use encrypt::{decrypt_sender_layer, encrypt_sender_layer};
 // build_sender_header, parse_sender_header, and SENDER_HEADER_SIZE are wire-format
 // internals used by crypto providers — access via encrypt:: submodule directly.
+#[cfg(any(test, feature = "testing"))]
+pub use encrypt::build_sender_aad_for_testing;
 pub use key_protocol_verify::{
     BlockNotification, BridgeShadowKeyParams, HandleRequestParams, NonceDedup,
     RotateForBlockParams, RotateForBlockResult, SenderKeyDistributionMessage,

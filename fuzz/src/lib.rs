@@ -78,7 +78,7 @@ impl From<ArbProofStep> for ProofStep {
 /// exceed depth 40, and 8 steps is more than sufficient to exercise all
 /// proof-verification invariants. Using a fixed array bounds memory at
 /// `Arbitrary` generation time, avoiding the previous pattern of generating
-/// an unbounded `Vec<ArbProofStep>` before truncating in `into_proof`.
+/// an unbounded `Vec<ArbProofStep>` before truncating in the conversion.
 #[derive(Debug, Clone, Arbitrary)]
 pub struct ArbInclusionProof {
     pub leaf_index: u64,
@@ -88,14 +88,13 @@ pub struct ArbInclusionProof {
     pub root: [u8; 32],
 }
 
-impl ArbInclusionProof {
-    /// Converts to the production [`InclusionProof`] type.
-    pub fn into_proof(self) -> InclusionProof {
+impl From<ArbInclusionProof> for InclusionProof {
+    fn from(p: ArbInclusionProof) -> Self {
         InclusionProof {
-            leaf_index: self.leaf_index,
-            leaf_hash: self.leaf_hash,
-            path: self.path.into_iter().map(ProofStep::from).collect(),
-            root: self.root,
+            leaf_index: p.leaf_index,
+            leaf_hash: p.leaf_hash,
+            path: p.path.into_iter().map(ProofStep::from).collect(),
+            root: p.root,
         }
     }
 }
@@ -153,19 +152,6 @@ impl From<ArbMessageType> for MessageType {
     }
 }
 
-impl ArbMessageType {
-    /// Returns a numeric discriminant for equality comparison in differential
-    /// targets. Matches the byte values produced by `MessageType::as_discriminator_byte`.
-    #[must_use]
-    pub fn discriminant(&self) -> u8 {
-        match self {
-            Self::Content => 0,
-            Self::Signaling => 1,
-            Self::KeyDistribution => 2,
-            Self::Recovery => 3,
-        }
-    }
-}
 
 /// One set of `InnerEnvelope`-compatible fields for the canonical hash
 /// differential target.
@@ -208,10 +194,11 @@ pub struct ArbCanonicalHashInput {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use scp_protocol::crypto::sender_keys::build_sender_aad_for_testing;
     use scp_protocol::envelope::MessageType;
 
-    /// Asserts that `ArbMessageType::discriminant()` values match
-    /// `MessageType::as_discriminator_byte()` exactly (0/1/2/3).
+    /// Asserts that `From<ArbMessageType> for MessageType` maps each variant to
+    /// the correct production discriminator byte via `as_discriminator_byte()`.
     ///
     /// If `MessageType` gains a new variant or reorders its discriminants, the
     /// `From<ArbMessageType> for MessageType` impl and this test will both need
@@ -219,24 +206,66 @@ mod tests {
     #[test]
     fn arb_message_type_discriminants_match_production() {
         assert_eq!(
-            ArbMessageType::Content.discriminant(),
+            MessageType::from(ArbMessageType::Content).as_discriminator_byte(),
             MessageType::Content.as_discriminator_byte(),
             "Content discriminant mismatch"
         );
         assert_eq!(
-            ArbMessageType::Signaling.discriminant(),
+            MessageType::from(ArbMessageType::Signaling).as_discriminator_byte(),
             MessageType::Signaling.as_discriminator_byte(),
             "Signaling discriminant mismatch"
         );
         assert_eq!(
-            ArbMessageType::KeyDistribution.discriminant(),
+            MessageType::from(ArbMessageType::KeyDistribution).as_discriminator_byte(),
             MessageType::KeyDistribution.as_discriminator_byte(),
             "KeyDistribution discriminant mismatch"
         );
         assert_eq!(
-            ArbMessageType::Recovery.discriminant(),
+            MessageType::from(ArbMessageType::Recovery).as_discriminator_byte(),
             MessageType::Recovery.as_discriminator_byte(),
             "Recovery discriminant mismatch"
         );
+    }
+
+    /// Verifies that `build_sender_aad_for_testing` produces the expected
+    /// length-prefixed binary format for a set of known inputs.
+    ///
+    /// This test guards against accidental changes to the AAD wire format.
+    /// The expected bytes are computed manually from the format spec:
+    ///   [4-byte ctx_len BE][ctx bytes][4-byte did_len BE][did bytes][8-byte epoch BE][8-byte seq BE]
+    #[test]
+    fn build_sender_aad_known_output() {
+        let ctx = "ctx-abc";
+        let did = "did:dht:z6Mk";
+        let epoch: u64 = 1;
+        let seq: u64 = 42;
+
+        let aad = build_sender_aad_for_testing(ctx, did, epoch, seq);
+
+        let mut expected = Vec::new();
+        expected.extend_from_slice(&(ctx.len() as u32).to_be_bytes());
+        expected.extend_from_slice(ctx.as_bytes());
+        expected.extend_from_slice(&(did.len() as u32).to_be_bytes());
+        expected.extend_from_slice(did.as_bytes());
+        expected.extend_from_slice(&epoch.to_be_bytes());
+        expected.extend_from_slice(&seq.to_be_bytes());
+
+        assert_eq!(aad, expected, "AAD wire format diverged from spec");
+    }
+
+    /// Verifies that distinct `(context_id, sender_did, epoch, seq)` tuples
+    /// produce distinct AAD bytes (security invariant I9) for known inputs.
+    #[test]
+    fn build_sender_aad_injectivity_known_inputs() {
+        let aad1 = build_sender_aad_for_testing("ctx-a", "did:dht:alice", 1, 1);
+        let aad2 = build_sender_aad_for_testing("ctx-b", "did:dht:alice", 1, 1);
+        let aad3 = build_sender_aad_for_testing("ctx-a", "did:dht:bob", 1, 1);
+        let aad4 = build_sender_aad_for_testing("ctx-a", "did:dht:alice", 2, 1);
+        let aad5 = build_sender_aad_for_testing("ctx-a", "did:dht:alice", 1, 2);
+
+        assert_ne!(aad1, aad2, "context_id must contribute to AAD");
+        assert_ne!(aad1, aad3, "sender_did must contribute to AAD");
+        assert_ne!(aad1, aad4, "epoch must contribute to AAD");
+        assert_ne!(aad1, aad5, "sequence must contribute to AAD");
     }
 }

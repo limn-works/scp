@@ -77,6 +77,21 @@ Targets call production `pub` functions only. No `unsafe` in `fuzz_targets/`. If
 
 Location: `fuzz/dicts/` (one file per target family).
 
+### Naming Convention
+
+Dict filenames follow the pattern `<format>_<target>.dict` where:
+- `<format>` is the wire format family: `msgpack`, `jwt`, or `uri`
+- `<target>` is the target-type name (e.g., `outer_envelope`, `inner_envelope`)
+
+Examples:
+- `msgpack_outer_envelope.dict` — MessagePack parser for `OuterEnvelope`
+- `ucan_jwt.dict` — JWT tokens for UCAN parsing (format family = `jwt`, target = `ucan`)
+- `scp_uri.dict` — SCP URI parser (format family = `uri`, target = `scp`)
+- `capability_uri.dict` — capability URI parser (format family = `uri`, target = `capability`)
+
+**New dicts must follow this convention.** Do NOT rename existing dict files — that requires
+CI workflow updates (the `-dict=` flag paths are hardcoded in `.github/workflows/fuzz.yml`).
+
 Format: libFuzzer dictionary syntax — one token per line, strings in double quotes:
 
 ```

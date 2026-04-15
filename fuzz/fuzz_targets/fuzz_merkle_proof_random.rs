@@ -18,5 +18,5 @@ use scp_fuzz::ArbInclusionProof;
 
 fuzz_target!(|arb: ArbInclusionProof| {
     // I1: no panic on any input — result is intentionally discarded.
-    let _ = verify_inclusion(&arb.into_proof());
+    let _ = verify_inclusion(&arb.into());
 });

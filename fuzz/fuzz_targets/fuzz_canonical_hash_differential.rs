@@ -96,8 +96,7 @@ fuzz_target!(|input: ArbCanonicalHashInput| {
         || input.a.timestamp != input.b.timestamp
         || input.a.payload_hash != input.b.payload_hash
         || input.a.provenance_hash != input.b.provenance_hash
-        || input.a.message_type.discriminant()
-            != input.b.message_type.discriminant();
+        || msg_type_a.as_discriminator_byte() != msg_type_b.as_discriminator_byte();
 
     if !inputs_differ {
         return;

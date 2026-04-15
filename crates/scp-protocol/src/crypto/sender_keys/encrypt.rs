@@ -139,6 +139,24 @@ fn build_sender_aad(context_id: &str, sender_did: &str, epoch: u64, sequence: u6
     aad
 }
 
+/// Public re-export of [`build_sender_aad`] for use in fuzz targets and
+/// cross-crate tests.
+///
+/// Gated behind `feature = "testing"` so it is never part of the public API
+/// in release builds. Fuzz targets use this to avoid maintaining a replica
+/// of the AAD construction logic.
+#[doc(hidden)]
+#[must_use]
+#[cfg(any(test, feature = "testing"))]
+pub fn build_sender_aad_for_testing(
+    context_id: &str,
+    sender_did: &str,
+    epoch: u64,
+    sequence: u64,
+) -> Vec<u8> {
+    build_sender_aad(context_id, sender_did, epoch, sequence)
+}
+
 /// Size of the epoch + sequence header in bytes.
 pub const SENDER_HEADER_SIZE: usize = 16;
 
