@@ -852,6 +852,9 @@ mod tests {
     fn auto_wire_populates_transport_manager_global() {
         use scp_transport::relay::connection::{RelayUrlSource, SourcedRelayUrl};
 
+        // BridgeInstance must exist for transport manager storage.
+        crate::runtime::init_context_manager_for_test();
+
         // Start a standalone relay to get a stable WebSocket endpoint.
         let relay = rt().block_on(server::start_relay_in_memory()).unwrap();
         let relay_url = relay.relay_url().to_owned();

@@ -2785,6 +2785,9 @@ mod tests {
 
     #[test]
     fn known_context_registration_and_lookup() {
+        // BridgeInstance must exist for known-context registration.
+        crate::runtime::init_context_manager_for_test();
+
         let creator = "did:dht:z6MkCreatorKnownCtx";
         let ctx_id = crate::types::generate_random_id("known-ctx");
         let routing_id = [0xAA; 32];

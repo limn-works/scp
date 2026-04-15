@@ -198,10 +198,15 @@ fn shutdown_runtime() {
     // Skip in test builds: shutdown permanently poisons the OnceLock-based
     // BridgeInstance, destroying contexts from concurrently-running tests.
     #[cfg(not(test))]
-    if let Some(bi) = runtime::BRIDGE_INSTANCE.get()
-        && let Err(e) = bi.shutdown()
-    {
-        tracing::error!("BridgeInstance shutdown failed: {e}");
+    if let Some(bi) = runtime::BRIDGE_INSTANCE.get() {
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| bi.shutdown()));
+        match result {
+            Ok(Err(e)) => tracing::error!("BridgeInstance shutdown failed: {e}"),
+            Err(_) => {
+                tracing::error!("BridgeInstance shutdown panicked — cleanup may be incomplete");
+            }
+            Ok(Ok(())) => {}
+        }
     }
 
     // Take no action if the runtime was never initialized.
