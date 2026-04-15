@@ -834,7 +834,7 @@ private struct AttestationWire: Codable {
         guard let data = json.data(using: .utf8) else {
             throw ScpError.Identity(
                 msg: "attestation JSON is not valid UTF-8",
-                code: "SCP-ATTEST-9010"
+                code: "SCP-ATTEST-9015"
             )
         }
         let decoder = JSONDecoder()
@@ -847,7 +847,7 @@ private struct AttestationWire: Codable {
         guard let data = json.data(using: .utf8) else {
             throw ScpError.Identity(
                 msg: "attestation list JSON is not valid UTF-8",
-                code: "SCP-ATTEST-9011"
+                code: "SCP-ATTEST-9016"
             )
         }
         let decoder = JSONDecoder()
@@ -891,7 +891,7 @@ private struct AttestationWire: Codable {
         guard let json = try String(data: encoder.encode(wire), encoding: .utf8) else {
             throw ScpError.Identity(
                 msg: "failed to encode attestation as UTF-8 JSON",
-                code: "SCP-ATTEST-9012"
+                code: "SCP-ATTEST-9017"
             )
         }
         return json

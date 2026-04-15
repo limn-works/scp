@@ -43,6 +43,22 @@ ScpError (root)
 | `SCP-GOV-` | 11000-11999 |
 | `SCP-ECON-` | 12000-12999 |
 
+### Registered SCP-ATTEST- codes
+
+| Code | Description |
+|------|-------------|
+| `SCP-ATTEST-9001` | Device attestation provider call failed (Play Integrity API error) |
+| `SCP-ATTEST-9006` | Attestation verification requires raw JSON, which is absent |
+| `SCP-ATTEST-9010` | Identity link attestation create bridge function not yet exported |
+| `SCP-ATTEST-9011` | Identity link attestation list bridge function not yet exported |
+| `SCP-ATTEST-9012` | Identity link attestation remove bridge function not yet exported |
+| `SCP-ATTEST-9013` | Identity link attestation renew bridge function not yet exported |
+| `SCP-ATTEST-9014` | Identity link attestation verify bridge function not yet exported |
+| `SCP-ATTEST-9015` | Attestation JSON bytes are not valid UTF-8 |
+| `SCP-ATTEST-9016` | Attestation list JSON bytes are not valid UTF-8 |
+| `SCP-ATTEST-9017` | Failed to re-serialize attestation to UTF-8 JSON |
+| `SCP-ATTEST-9018` | Cryptographic-class verification method not verifiable via browser fetch |
+
 ## Stub and Placeholder Policy
 
 Code that does not fully implement its documented contract (acceptance criterion, ADR spec, or trait method) is a **stub**. Stubs are tolerated during phased implementation but must be traceable to the planning system.
