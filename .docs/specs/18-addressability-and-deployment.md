@@ -289,7 +289,7 @@ scp://context/<context_id_hex>?relay=<url>[&relay=<url2>][&mode=<mode>][&name=<n
 - Authority component is empty (double slash after scheme is part of the path).
 - Path MUST start with `context/`.
 - Context ID MUST be valid hexadecimal.
-- Relay URLs MUST use the `wss://` scheme.
+- Relay URLs MUST use the `wss://`, `ws://`, `https://`, or `http://` scheme.
 - Unknown query parameters MUST be ignored (forward compatibility).
 - Percent-encoding per RFC 3986 for all parameter values.
 
