@@ -36,6 +36,7 @@ jobs:
       typescript: ${{ steps.filter.outputs.typescript }}
       kotlin: ${{ steps.filter.outputs.kotlin }}
       swift: ${{ steps.filter.outputs.swift }}
+      fuzz: ${{ steps.filter.outputs.fuzz }}
     steps:
       - uses: actions/checkout@v5
       - uses: dorny/paths-filter@v3
@@ -64,6 +65,9 @@ jobs:
               - 'bindings/swift/**'
               - 'crates/scp-ffi/uniffi/**'
               - 'crates/scp-ffi/common/**'
+            fuzz:
+              - 'fuzz/**'
+              - 'crates/**'
 
   # ── Error codes ───────────────────────────────────────────────────
   error-codes:
@@ -499,6 +503,25 @@ jobs:
         working-directory: bindings/swift
         run: swift test
 
+  # ── Fuzz build check ─────────────────────────────────────────────────
+  # Fast compilation check for the fuzz crate on every PR. Does not run
+  # the fuzzer. Catches breakage when production APIs change and fuzz
+  # targets are not updated to match. Requires nightly because the fuzz
+  # crate uses libFuzzer internals.
+  fuzz-build:
+    needs: changes
+    if: needs.changes.outputs.fuzz == 'true'
+    name: Fuzz / build check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@nightly
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: "fuzz -> target"
+      - name: Check fuzz crate compiles
+        run: cargo +nightly check --manifest-path fuzz/Cargo.toml
+
   # ── CI Gate ─────────────────────────────────────────────────────────
   # Single required check for branch protection. Depends on all CI jobs
   # and uses if: always() so it runs even when paths-filter skips jobs.
@@ -525,6 +548,7 @@ jobs:
       - wasm-clippy
       - swift-lint
       - swift-build-test
+      - fuzz-build
     runs-on: ubuntu-latest
     steps:
       - name: Check job results
@@ -549,6 +573,7 @@ jobs:
             "${{ needs.wasm-clippy.result }}" \
             "${{ needs.swift-lint.result }}" \
             "${{ needs.swift-build-test.result }}" \
+            "${{ needs.fuzz-build.result }}" \
           )
           for r in "${results[@]}"; do
             if [[ "$r" == "failure" || "$r" == "cancelled" ]]; then

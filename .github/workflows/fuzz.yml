@@ -1,0 +1,234 @@
+name: Fuzz
+
+on:
+  schedule:
+    - cron: "0 3 * * *"   # 03:00 UTC nightly (Tier 1 + Tier 2)
+    - cron: "0 0 * * 6"   # 00:00 UTC Saturday (Tier 1 deep-fuzz)
+  workflow_dispatch:
+    inputs:
+      fuzz_time:
+        description: "Seconds per target"
+        default: "900"
+        required: false
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  # ── Nightly: regression + corpus growth ────────────────────────────────────
+  # Runs every night at 03:00 UTC. Tier 1 targets get 15 min each; Tier 2 get
+  # 5 min each. All targets run in parallel. Corpus is cached per-target and
+  # minimized after each run with cargo fuzz cmin.
+  fuzz-nightly:
+    name: Fuzz / ${{ matrix.target }}
+    runs-on: ubuntu-latest
+    if: github.event.schedule == '0 3 * * *' || github.event_name == 'workflow_dispatch'
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Tier 1 — Wire Format Parsers — 15 min each
+          - target: fuzz_outer_envelope
+            dict: msgpack_outer_envelope.dict
+            max_len: 1048576
+            time: 900
+          - target: fuzz_inner_envelope
+            dict: msgpack_inner_envelope.dict
+            max_len: 1048576
+            time: 900
+          - target: fuzz_client_message
+            dict: msgpack_client_message.dict
+            max_len: 524288
+            time: 900
+          - target: fuzz_relay_message
+            dict: msgpack_relay_message.dict
+            max_len: 524288
+            time: 900
+          - target: fuzz_sender_key_dist
+            dict: msgpack_sender_key.dict
+            max_len: 65536
+            time: 900
+          - target: fuzz_scp_credential
+            dict: msgpack_credential.dict
+            max_len: 32768
+            time: 900
+          # Tier 2 — Parsers & Content Trust Boundaries — 5 min each
+          - target: fuzz_parse_ucan
+            dict: ucan_jwt.dict
+            max_len: 32768
+            time: 300
+          - target: fuzz_scp_uri
+            dict: scp_uri.dict
+            max_len: 8192
+            time: 300
+          - target: fuzz_capability_uri
+            dict: capability_uri.dict
+            max_len: 4096
+            time: 300
+          - target: fuzz_broadcast_content
+            dict: msgpack_broadcast.dict
+            max_len: 524288
+            time: 300
+          - target: fuzz_deserialize_export
+            dict: msgpack_export.dict
+            max_len: 1048576
+            time: 300
+    steps:
+      - name: Free disk space
+        run: sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+
+      - uses: actions/checkout@v5
+
+      - uses: dtolnay/rust-toolchain@nightly
+
+      - name: Install cargo-fuzz
+        run: cargo install cargo-fuzz --locked
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: "fuzz -> target"
+          key: fuzz-${{ matrix.target }}
+
+      - name: Restore corpus cache
+        uses: actions/cache/restore@v4
+        with:
+          path: fuzz/corpus/${{ matrix.target }}
+          key: corpus-${{ matrix.target }}-${{ github.run_id }}
+          restore-keys: corpus-${{ matrix.target }}-
+
+      - name: Run fuzzer
+        run: |
+          cargo fuzz run ${{ matrix.target }} \
+            --fuzz-dir fuzz \
+            fuzz/corpus/${{ matrix.target }} \
+            -- \
+            -dict=fuzz/dicts/${{ matrix.dict }} \
+            -max_total_time=${{ github.event.inputs.fuzz_time || matrix.time }} \
+            -max_len=${{ matrix.max_len }} \
+            -rss_limit_mb=2048 \
+            -timeout=30 \
+            -detect_leaks=0
+
+      - name: Minimize corpus
+        if: always()
+        run: |
+          cargo fuzz cmin ${{ matrix.target }} \
+            --fuzz-dir fuzz \
+            fuzz/corpus/${{ matrix.target }} \
+            || true
+
+      - name: Save corpus cache
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: fuzz/corpus/${{ matrix.target }}
+          key: corpus-${{ matrix.target }}-${{ github.run_id }}
+
+      - name: Upload crash artifacts
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-crash-${{ matrix.target }}-${{ github.run_id }}
+          path: fuzz/artifacts/${{ matrix.target }}/
+          retention-days: 90
+
+  # ── Weekly deep-fuzz: Tier 1 targets, 2 hours each, with UBSan ────────────
+  # Runs at 00:00 UTC every Saturday, or on workflow_dispatch. Only Tier 1
+  # targets (highest trust-boundary exposure). Longer time budget surfaces
+  # deeper code paths. AddressSanitizer is cargo-fuzz default; UBSan is added
+  # via RUSTFLAGS to catch undefined behavior in dependency C code.
+  fuzz-weekly:
+    name: Deep Fuzz / ${{ matrix.target }}
+    runs-on: ubuntu-latest
+    if: github.event.schedule == '0 0 * * 6' || github.event_name == 'workflow_dispatch'
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: fuzz_outer_envelope
+            dict: msgpack_outer_envelope.dict
+            max_len: 1048576
+          - target: fuzz_inner_envelope
+            dict: msgpack_inner_envelope.dict
+            max_len: 1048576
+          - target: fuzz_client_message
+            dict: msgpack_client_message.dict
+            max_len: 524288
+          - target: fuzz_relay_message
+            dict: msgpack_relay_message.dict
+            max_len: 524288
+          - target: fuzz_sender_key_dist
+            dict: msgpack_sender_key.dict
+            max_len: 65536
+          - target: fuzz_scp_credential
+            dict: msgpack_credential.dict
+            max_len: 32768
+    steps:
+      - name: Free disk space
+        run: sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+
+      - uses: actions/checkout@v5
+
+      - uses: dtolnay/rust-toolchain@nightly
+
+      - name: Install cargo-fuzz
+        run: cargo install cargo-fuzz --locked
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: "fuzz -> target"
+          key: fuzz-weekly-${{ matrix.target }}
+
+      - name: Restore corpus cache
+        uses: actions/cache/restore@v4
+        with:
+          path: fuzz/corpus/${{ matrix.target }}
+          key: corpus-${{ matrix.target }}-${{ github.run_id }}
+          restore-keys: corpus-${{ matrix.target }}-
+
+      - name: Run deep fuzzer (2 hours, ASan + UBSan)
+        # cargo-fuzz enables AddressSanitizer by default. UBSan is layered on top
+        # via RUSTFLAGS. Combined sanitizers catch both memory safety and undefined
+        # behavior in dependency C code (rmp-serde, OpenMLS, aws-lc-sys).
+        # If UBSan produces spurious errors from dependency C code, fall back to
+        # ASan alone by removing the RUSTFLAGS line.
+        env:
+          RUSTFLAGS: "-Zsanitizer=undefined"
+        run: |
+          cargo fuzz run ${{ matrix.target }} \
+            --fuzz-dir fuzz \
+            fuzz/corpus/${{ matrix.target }} \
+            -- \
+            -dict=fuzz/dicts/${{ matrix.dict }} \
+            -max_total_time=7200 \
+            -max_len=${{ matrix.max_len }} \
+            -rss_limit_mb=4096 \
+            -timeout=60 \
+            -detect_leaks=0
+
+      - name: Minimize corpus
+        if: always()
+        run: |
+          cargo fuzz cmin ${{ matrix.target }} \
+            --fuzz-dir fuzz \
+            fuzz/corpus/${{ matrix.target }} \
+            || true
+
+      - name: Save corpus cache
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: fuzz/corpus/${{ matrix.target }}
+          key: corpus-${{ matrix.target }}-${{ github.run_id }}
+
+      - name: Upload crash artifacts
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-crash-weekly-${{ matrix.target }}-${{ github.run_id }}
+          path: fuzz/artifacts/${{ matrix.target }}/
+          retention-days: 90
