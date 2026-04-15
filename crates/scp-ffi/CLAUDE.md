@@ -146,7 +146,7 @@ The MCP bridge delegates to real `scp-mcp` server/client implementations via two
   3. **Relay probe** — if a relay connection is active (via `py_transport_connect`), probes known routing IDs via QUERY to detect active contexts
   - Falls back gracefully to local-only when relay is unreachable. Results are deduplicated by context ID.
   - The relay is a dumb blob store with no identity-to-context mapping; discovery is purely client-side.
-  - `py_transport_connect(relay_url)` creates a `NativeRelayAdapter` and stores it in `runtime::RELAY_CONNECTION`. `py_transport_disconnect()` clears it.
+  - `py_transport_connect(relay_url)` creates a `NativeRelayAdapter` and stores the `TransportManager` in `BridgeInstance`. `py_transport_disconnect()` clears it.
   - `runtime::KnownContext` stores `routing_id`, `relay_url`, `member_did`, `last_seen` for each tracked context.
   - Each result dict contains: `context_id`, `source` ("local"/"relay"/"local+relay"), `relay_active` (bool), plus optional `creator_did`/`member_count`/`tool_count`.
   - Result dicts from bridge functions must be consumed with `h["key"]` syntax in Python — NOT `h.key`. Prefer returning a `#[pyclass]` struct for new structured return types.

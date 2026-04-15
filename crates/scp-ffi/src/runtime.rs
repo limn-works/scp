@@ -1127,7 +1127,7 @@ pub fn remove_identity(did: &str) {
 /// replace it when platform storage adapters land.
 ///
 /// Uses the same `OnceLock` pattern as `FFI_BRIDGE_STATE` and
-/// `TRANSPORT_MANAGER`. The `Arc` enables shared ownership across bridge
+/// `BRIDGE_INSTANCE`. The `Arc` enables shared ownership across bridge
 /// functions without lifetime issues.
 ///
 /// See spec section 17.3 for key conventions and section 17.4 for
