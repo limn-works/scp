@@ -523,6 +523,8 @@ mod tests {
 
     #[test]
     fn transport_disconnect_is_idempotent() {
+        // BridgeInstance must exist for transport operations.
+        crate::runtime::init_context_manager_for_test();
         // Disconnecting when not connected should not error.
         let result = py_transport_disconnect();
         assert!(result.is_ok());

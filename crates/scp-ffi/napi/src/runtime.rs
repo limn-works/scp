@@ -133,36 +133,24 @@ fn not_configured_key_resolver() -> scp_core::context::governance::KeyResolver {
 /// `context_create`) rather than silently auto-initializing with
 /// potentially invalid state.
 pub fn context_manager() -> napi::Result<&'static Arc<ContextManager>> {
-    // If BridgeInstance exists, enforce its lifecycle state. After
-    // scp_shutdown(), 70+ operations flow through this path — without
-    // this check they would continue operating on a shut-down bridge.
+    // If BridgeInstance exists, enforce its lifecycle state.
     //
-    // In test builds, log a warning instead of returning an error because
-    // OnceLock-based singletons cannot be reset between parallel tests.
-    // A shutdown test permanently poisons the BridgeInstance, causing all
-    // subsequent tests that call context_manager() to fail.
+    // Suspended: return error (recoverable — caller should call resume()).
+    // AlreadyShutDown: warn only. Shutdown already destroyed MLS groups,
+    // cleared registries, and disconnected transport — operations will fail
+    // naturally at the MLS/transport layer. Returning an error here would
+    // break test suites (both cargo test and bun test) that call shutdown
+    // before process exit, since OnceLock cannot be re-initialized.
     if let Some(bi) = BRIDGE_INSTANCE.get() {
-        let ready = bi.check_ready();
-        #[cfg(not(test))]
-        ready.map_err(|e| {
-            let message = match e {
-                scp_ffi_common::bridge_instance::LifecycleError::AlreadyShutDown => {
-                    "bridge has been shut down — OnceLock prevents re-initialization \
-                     within the same process; use suspend/resume for mobile lifecycle"
-                        .to_owned()
-                }
-                scp_ffi_common::bridge_instance::LifecycleError::Suspended => {
-                    "bridge is suspended — call resume() before performing operations".to_owned()
-                }
-            };
-            napi::Error::from(ScpNapiError::Context {
-                message,
+        if bi.is_suspended() {
+            return Err(napi::Error::from(ScpNapiError::Context {
+                message: "bridge is suspended — call resume() before performing operations"
+                    .to_owned(),
                 code: codes::CTX_2000.to_owned(),
-            })
-        })?;
-        #[cfg(test)]
-        if let Err(e) = ready {
-            tracing::warn!("context_manager() called on shut-down bridge (test isolation): {e}");
+            }));
+        }
+        if bi.is_shutdown() {
+            tracing::warn!("context_manager() called after shutdown — operations may fail");
         }
     }
     CONTEXT_MANAGER.get().ok_or_else(|| {

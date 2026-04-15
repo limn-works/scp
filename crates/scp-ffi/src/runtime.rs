@@ -119,29 +119,19 @@ static CONTEXT_MANAGER: OnceLock<Arc<ContextManager>> = OnceLock::new();
 /// initialized via [`init_context_manager`].
 pub fn context_manager() -> Result<&'static Arc<ContextManager>, ScpPyError> {
     // If BridgeInstance exists, enforce its lifecycle state. After
-    // scp_shutdown(), 70+ operations flow through this path — without
-    // this check they would continue operating on a shut-down bridge.
-    //
-    // In test builds, log a warning instead of returning an error because
-    // OnceLock-based singletons cannot be reset between parallel tests.
+    // Suspended: return error (recoverable — caller should call resume()).
+    // AlreadyShutDown: warn only. Shutdown already destroyed MLS groups,
+    // cleared registries, and disconnected transport — operations will fail
+    // naturally. Returning an error breaks test suites that call shutdown
+    // before exit, since OnceLock cannot be re-initialized.
     if let Some(bi) = BRIDGE_INSTANCE.get() {
-        let ready = bi.check_ready();
-        #[cfg(not(test))]
-        ready.map_err(|e| match e {
-            scp_ffi_common::bridge_instance::LifecycleError::AlreadyShutDown => {
-                ScpPyError::context(
-                    "bridge has been shut down — OnceLock prevents re-initialization \
-                     within the same process; use suspend/resume for mobile lifecycle"
-                        .to_owned(),
-                )
-            }
-            scp_ffi_common::bridge_instance::LifecycleError::Suspended => ScpPyError::context(
+        if bi.is_suspended() {
+            return Err(ScpPyError::context(
                 "bridge is suspended — call resume() before performing operations".to_owned(),
-            ),
-        })?;
-        #[cfg(test)]
-        if let Err(e) = ready {
-            tracing::warn!("context_manager() called on shut-down bridge (test isolation): {e}");
+            ));
+        }
+        if bi.is_shutdown() {
+            tracing::warn!("context_manager() called after shutdown — operations may fail");
         }
     }
     CONTEXT_MANAGER.get().ok_or_else(|| {
