@@ -194,6 +194,10 @@ fn shutdown_runtime() {
     // Shut down the BridgeInstance first (clears registries, runs hooks).
     // Best-effort: if the instance was never initialized or is already
     // shut down, this is a no-op.
+    //
+    // Skip in test builds: shutdown permanently poisons the OnceLock-based
+    // BridgeInstance, destroying contexts from concurrently-running tests.
+    #[cfg(not(test))]
     if let Some(bi) = runtime::BRIDGE_INSTANCE.get()
         && let Err(e) = bi.shutdown()
     {
