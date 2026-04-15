@@ -657,7 +657,13 @@ def _parse_finite_int(value: object, field_name: str) -> int:
     message in some Python versions.  This wrapper normalises the error
     message and catches ``OverflowError`` (raised for very large floats on
     some platforms).
+
+    ``bool`` is explicitly rejected because ``isinstance(True, int)`` is
+    ``True`` in Python (bool is a subclass of int), so ``int(True)`` returns
+    ``1`` silently — a boolean should never be treated as a Unix timestamp.
     """
+    if isinstance(value, bool):
+        raise ValueError(f"{field_name} must be a finite integer, got bool")
     try:
         return int(value)  # type: ignore[arg-type]
     except (TypeError, ValueError, OverflowError) as e:
@@ -699,8 +705,11 @@ class RevocationStatus:
                 f"Invalid revocation status: {self.status!r} (expected 'active' or 'revoked')"
             )
         # Coerce revoked_at to int — floats can sneak in from JSON deserialization.
-        if self.revoked_at is not None and not isinstance(self.revoked_at, int):
-            object.__setattr__(self, "revoked_at", int(self.revoked_at))
+        # Also reject booleans (bool is a subclass of int in Python).
+        if self.revoked_at is not None and (
+            not isinstance(self.revoked_at, int) or isinstance(self.revoked_at, bool)
+        ):
+            object.__setattr__(self, "revoked_at", _parse_finite_int(self.revoked_at, "revoked_at"))
 
 
 # ---------------------------------------------------------------------------
@@ -745,8 +754,9 @@ class IdentityAttestation:
 
     def __post_init__(self) -> None:
         # Coerce verified_at to int — floats can sneak in from JSON deserialization.
-        if not isinstance(self.verified_at, int):
-            self.verified_at = int(self.verified_at)
+        # Also reject booleans (bool is a subclass of int in Python).
+        if not isinstance(self.verified_at, int) or isinstance(self.verified_at, bool):
+            self.verified_at = _parse_finite_int(self.verified_at, "verified_at")
 
     def _to_bridge_dict(self) -> dict[str, Any]:
         """Convert to a dict for bridge serialization."""
