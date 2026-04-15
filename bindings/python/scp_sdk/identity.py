@@ -515,8 +515,8 @@ class Identity:
     def attestations(self) -> list[IdentityAttestation]:
         """List all identity link attestations for this identity.
 
-        This is a synchronous property that returns the cached list of
-        attestations from the bridge layer. For the async variant, use
+        This is a synchronous property that makes a live call to the
+        bridge layer on every access. For the async variant, use
         :meth:`list_attestations`.
 
         Returns:
