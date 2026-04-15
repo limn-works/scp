@@ -227,16 +227,14 @@ pub fn bridge_instance() -> Result<&'static Arc<BridgeInstance>, ScpPyError> {
     let bi = BRIDGE_INSTANCE.get().ok_or_else(|| {
         ScpPyError::context("bridge not initialized — call identity_create first".to_owned())
     })?;
-    bi.check_ready().map_err(|e| match e {
-        scp_ffi_common::bridge_instance::LifecycleError::AlreadyShutDown => ScpPyError::context(
-            "bridge has been shut down — OnceLock prevents re-initialization \
-             within the same process; use suspend/resume for mobile lifecycle"
-                .to_owned(),
-        ),
-        scp_ffi_common::bridge_instance::LifecycleError::Suspended => ScpPyError::context(
+    if bi.is_suspended() {
+        return Err(ScpPyError::context(
             "bridge is suspended — call resume() before performing operations".to_owned(),
-        ),
-    })?;
+        ));
+    }
+    if bi.is_shutdown() {
+        tracing::warn!("bridge_instance() called after shutdown — operations may fail");
+    }
     Ok(bi)
 }
 
