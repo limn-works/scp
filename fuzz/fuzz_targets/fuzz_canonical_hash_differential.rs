@@ -21,7 +21,7 @@
 //! so the mutation engine gets useful signal on every input.
 
 use libfuzzer_sys::fuzz_target;
-use scp_fuzz::{ArbCanonicalHashInput, ArbMessageType};
+use scp_fuzz::ArbCanonicalHashInput;
 use scp_primitives::SigningKeyId;
 use scp_protocol::envelope::InnerEnvelopeParams;
 use scp_protocol::envelope::inner::compute_canonical_hash;
@@ -59,7 +59,7 @@ fuzz_target!(|input: ArbCanonicalHashInput| {
         sequence: input.a.sequence,
         timestamp: input.a.timestamp,
         message_type: msg_type_a,
-        payload: &input.a.payload,
+        payload: &[],
         provenance: None,
         signing_key_id: SigningKeyId::Active,
     };
@@ -73,7 +73,7 @@ fuzz_target!(|input: ArbCanonicalHashInput| {
         sequence: input.b.sequence,
         timestamp: input.b.timestamp,
         message_type: msg_type_b,
-        payload: &input.b.payload,
+        payload: &[],
         provenance: None,
         signing_key_id: SigningKeyId::Active,
     };
@@ -96,8 +96,8 @@ fuzz_target!(|input: ArbCanonicalHashInput| {
         || input.a.timestamp != input.b.timestamp
         || input.a.payload_hash != input.b.payload_hash
         || input.a.provenance_hash != input.b.provenance_hash
-        || ArbMessageType::discriminant(&input.a.message_type)
-            != ArbMessageType::discriminant(&input.b.message_type);
+        || input.a.message_type.discriminant()
+            != input.b.message_type.discriminant();
 
     if !inputs_differ {
         return;

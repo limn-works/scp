@@ -157,8 +157,8 @@ impl ArbMessageType {
     /// Returns a numeric discriminant for equality comparison in differential
     /// targets. Matches the byte values produced by `MessageType::as_discriminator_byte`.
     #[must_use]
-    pub fn discriminant(m: &Self) -> u8 {
-        match m {
+    pub fn discriminant(&self) -> u8 {
+        match self {
             Self::Content => 0,
             Self::Signaling => 1,
             Self::KeyDistribution => 2,
@@ -184,7 +184,6 @@ pub struct ArbInnerEnvelopeFields {
     pub sequence: u64,
     pub timestamp: u64,
     pub message_type: ArbMessageType,
-    pub payload: [u8; 128],
     pub payload_hash: [u8; 32],
     pub provenance_hash: [u8; 32],
 }
