@@ -2,9 +2,9 @@
 """Verify scp-protocol contains zero async fn in production code.
 
 Uses tree-sitter to parse Rust files and detect async functions outside
-#[cfg(test)] modules and outside trait definitions / trait impl blocks.
-Trait methods using #[async_trait] are exempt because the macro desugars
-them to return Pin<Box<dyn Future>> (no tokio runtime dependency).
+#[cfg(test)] modules and outside #[async_trait]-annotated trait definitions
+and impl blocks.  Inherent async methods that call through async trait
+methods are allowed only via an explicit allowlist.
 Fails CI if any non-exempt async fn are found.
 """
 import sys
@@ -17,6 +17,15 @@ parser = Parser(RUST_LANG)
 
 PROTO_SRC = "crates/scp-protocol/src"
 violations = []
+
+# Inherent async methods in scp-protocol that call through async trait
+# methods (ContextCryptoProvider).  These do NOT introduce a runtime
+# dependency — they are desugared by the caller's async executor.
+ALLOWED_INHERENT_ASYNC_FNS = {
+    "destroy_ephemeral_keys",
+    "initiate_close",
+    "complete_summary_close",
+}
 
 
 def has_test_cfg_attribute(node, source):
@@ -44,6 +53,25 @@ def has_test_cfg_attribute(node, source):
     return False
 
 
+def has_async_trait_attribute(node, source):
+    """Check if the preceding sibling(s) include an #[async_trait] attribute."""
+    sibling = node.prev_sibling
+    while sibling is not None:
+        if sibling.type == "attribute_item":
+            text = source[sibling.start_byte:sibling.end_byte].decode(
+                "utf-8", errors="replace"
+            )
+            if "async_trait" in text:
+                return True
+        elif sibling.type == "line_comment" or sibling.type == "block_comment":
+            sibling = sibling.prev_sibling
+            continue
+        else:
+            break
+        sibling = sibling.prev_sibling
+    return False
+
+
 def walk(node, source, in_test=False, in_trait=False, filepath=""):
     test_ctx = in_test
     trait_ctx = in_trait
@@ -53,13 +81,12 @@ def walk(node, source, in_test=False, in_trait=False, filepath=""):
         if has_test_cfg_attribute(node, source):
             test_ctx = True
 
-    # Check if this node is a trait definition or impl block.
-    # Methods using #[async_trait] are exempt because the macro desugars
-    # async fn to return Pin<Box<dyn Future>> — no runtime dep. This
-    # covers trait definitions, trait impl blocks, and inherent impl
-    # blocks on orchestrator structs that call async trait methods.
+    # Only exempt trait_item and impl_item blocks that carry an
+    # #[async_trait] attribute.  Plain impl blocks are NOT exempt —
+    # inherent async methods must be in the explicit allowlist.
     if node.type in ("trait_item", "impl_item"):
-        trait_ctx = True
+        if has_async_trait_attribute(node, source):
+            trait_ctx = True
 
     # Check for async fn in production code (exempt test + trait contexts)
     if node.type == "function_item" and not test_ctx and not trait_ctx:
@@ -78,7 +105,8 @@ def walk(node, source, in_test=False, in_trait=False, filepath=""):
                         if name_node
                         else "unknown"
                     )
-                    violations.append(f"{filepath}:{line}: async fn {name}")
+                    if name not in ALLOWED_INHERENT_ASYNC_FNS:
+                        violations.append(f"{filepath}:{line}: async fn {name}")
 
     for child in node.children:
         walk(child, source, test_ctx, trait_ctx, filepath)

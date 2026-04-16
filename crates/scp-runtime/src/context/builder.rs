@@ -25,6 +25,9 @@ pub use scp_protocol::context::builder::{
 ///
 /// Implementors handle relay connectivity checks and context publication /
 /// deletion.
+///
+/// Transport operations are genuinely async (network I/O). `is_connected`
+/// remains sync as it reads an `AtomicBool`.
 #[async_trait::async_trait]
 pub trait ContextTransportProvider: Send + Sync {
     /// Returns `true` if the transport layer is connected and at least one

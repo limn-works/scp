@@ -752,12 +752,12 @@ Each replaceable trait imposes invariants that every implementation must uphold.
 - `publish` enforces monotonic sequence number semantics — a publish with `seq` less than or equal to the existing sequence is a no-op.
 - `resolve` returns `Option<DhtRecord>` (value bytes + signature + sequence number).
 
-**`ContextCryptoProvider`** (scp-core/context) — `Send + Sync`, synchronous methods.
+**`ContextCryptoProvider`** (scp-core/context) — `Send + Sync`, async methods (via `#[async_trait]` for dyn-compatibility).
 - Wraps MLS group creation/destruction, sender key generation/destruction, broadcast key initialization, member add/remove, key package validation, sender key distribution, and message encryption.
 - Rollback methods (`destroy_mls_group`, `destroy_sender_key`) are idempotent.
 - `validate_creator_identity` is read-only — zero side effects.
 
-**`ContextTransportProvider`** (scp-core/context) — `Send + Sync`, synchronous methods.
+**`ContextTransportProvider`** (scp-core/context) — `Send + Sync`, async methods (via `#[async_trait]` for dyn-compatibility).
 - `is_connected` returns a boolean — no side effects.
 - `publish_context` and `delete_published` are scoped by context ID.
 - `send_message` delivers encrypted payloads through the transport layer.

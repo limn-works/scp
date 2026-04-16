@@ -912,11 +912,9 @@ impl<S: Storage> ProtocolRepository<S> {
 /// Canonical bridge from `ContextPersistence` (dyn-compatible) to the generic
 /// `ProtocolRepository<S>`.
 ///
-/// Wraps `Arc<ProtocolRepository<S>>` and implements the synchronous
-/// [`crate::context::manager::ContextPersistence`] trait by blocking on the async `ProtocolRepository`
-/// methods via `tokio::task::block_in_place` + `Handle::block_on`. This is
-/// safe because `ContextPersistence` methods are always called from within a
-/// tokio runtime context (after the `contexts` mutex is released).
+/// Wraps `Arc<ProtocolRepository<S>>` and implements the async
+/// [`crate::context::manager::ContextPersistence`] trait by directly
+/// delegating to the async `ProtocolRepository` methods.
 ///
 /// See SCP-PERSIST-021 and spec section 17.4.
 pub struct ProtocolRepositoryContextBridge<S: Storage> {

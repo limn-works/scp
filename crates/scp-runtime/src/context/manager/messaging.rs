@@ -493,6 +493,9 @@ impl ContextManager {
         };
 
         // Phase 2: encrypt + send (no lock held).
+        // Note: The TOCTOU window in this phase now includes async I/O latency
+        // (transport.send_message().await), not just CPU time as before. MLS
+        // group state is the hard security boundary, not the application-level lock.
         let phase2_result = self
             .encrypt_and_send(
                 broadcast_envelope,

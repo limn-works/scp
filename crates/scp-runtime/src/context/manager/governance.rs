@@ -1291,6 +1291,23 @@ impl ContextManager {
     /// Separated from [`execute_governance_action`] to keep the public entry
     /// point focused on validation while this method handles the 28-action
     /// dispatch.
+    ///
+    /// # Recursion depth
+    ///
+    /// The `Box::pin` indirection on `execute_governance_action` /
+    /// `dispatch_governance_action` enables recursive async calls. The
+    /// recursion depth is bounded at 2 levels:
+    ///
+    /// - **Level 0:** `propose_governance_action` or `vote_on_proposal` calls
+    ///   `execute_governance_action` when auto-executing (`SingleAdmin`).
+    /// - **Level 1:** `execute_governance_action` calls
+    ///   `dispatch_governance_action` which dispatches to action-specific
+    ///   methods. None of these methods call back into
+    ///   `execute_governance_action`.
+    ///
+    /// Threshold governance requires votes (separate `vote_on_proposal` calls),
+    /// so quorum-based approval never triggers recursion. Stack overflow is not
+    /// possible under the current 28-action dispatch table.
     #[allow(clippy::too_many_lines)]
     async fn dispatch_governance_action(
         &self,

@@ -266,6 +266,12 @@ pub struct AdvanceEpochOutput {
 }
 
 /// Trait for MLS-backed context crypto operations (create group, add/remove member, encrypt/decrypt).
+///
+/// All methods are async to support the actor-per-context architecture where
+/// every operation crosses an actor message boundary. Current production
+/// implementations (`MlsCryptoProvider`) are synchronous in their bodies;
+/// the async wrapper adds negligible overhead (one `Box` allocation per call)
+/// compared to the MLS crypto operations inside.
 #[async_trait::async_trait]
 pub trait ContextCryptoProvider: Send + Sync {
     /// Validates that the creator's identity is valid and the signing key is

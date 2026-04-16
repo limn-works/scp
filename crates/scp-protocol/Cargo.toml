@@ -1,7 +1,7 @@
 [package]
 name = "scp-protocol"
 version = "0.1.0-beta.1"
-description = "Pure sync protocol types and logic for SCP"
+description = "Protocol types and logic for SCP. Provider traits use `#[async_trait]` (no runtime dependency)."
 edition.workspace = true
 repository.workspace = true
 license.workspace = true

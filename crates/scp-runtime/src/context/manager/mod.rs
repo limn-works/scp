@@ -844,6 +844,9 @@ pub struct VelocityTrackerSnapshot {
 /// wraps `Arc<ProtocolRepository<S>>`.
 ///
 /// See spec section 17.4.
+///
+/// Persistence operations are genuinely async (storage I/O).
+/// Uses `#[async_trait]` for object-safe async methods (dyn-compatible).
 #[async_trait::async_trait]
 pub trait ContextPersistence: Send + Sync {
     /// Persists the full context snapshot.

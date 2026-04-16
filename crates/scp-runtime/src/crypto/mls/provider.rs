@@ -255,6 +255,14 @@ struct PendingJoinState {
 /// The `ContextManager` ensures that concurrent calls for the same context are
 /// serialized at a higher level (via `tokio::sync::Mutex` on the context map),
 /// so contention on these mutexes is minimal.
+///
+/// # INVARIANT: `std::sync::Mutex` usage
+///
+/// All `std::sync::Mutex` fields are used only within synchronous scopes.
+/// No `.await` point may exist between `lock()` and guard drop.
+/// The async trait methods (via `#[async_trait]`) wrap synchronous bodies.
+/// This will be eliminated in PR 2.1 when `MlsCryptoProvider` dissolves
+/// into per-context actors.
 pub struct MlsCryptoProvider {
     /// The local member's DID (e.g., `"did:dht:z6Mk..."`).
     local_did: String,
@@ -326,6 +334,7 @@ impl MlsCryptoProvider {
 }
 
 #[allow(clippy::significant_drop_tightening)]
+#[deny(clippy::await_holding_lock)]
 #[async_trait::async_trait]
 impl ContextCryptoProvider for MlsCryptoProvider {
     async fn validate_creator_identity(&self) -> Result<(), ContextCreationError> {
