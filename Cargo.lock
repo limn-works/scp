@@ -5098,7 +5098,9 @@ name = "scp-ffi-common"
 version = "0.1.0"
 dependencies = [
  "dashmap",
+ "ed25519-dalek 2.2.0",
  "hex",
+ "rand 0.8.5",
  "scp-core",
  "scp-event-log",
  "scp-identity",

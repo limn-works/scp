@@ -211,10 +211,8 @@ fn init_bridge_instance_empty() {
         if let Some(reg) = FFI_BRIDGE_STATE.get() {
             reg.clear();
         }
-        // Clear the connected relay URL tracking
-        if let Ok(mut url) = crate::transport::connected_url_state().write() {
-            *url = None;
-        }
+        // Relay URL is cleared by BridgeInstance::shutdown() directly
+        // (via relay_url Mutex). No need to clear it here.
         // MCP server/client registries
         crate::mcp::clear_registries();
     }));
@@ -483,28 +481,14 @@ where
 }
 
 // ---------------------------------------------------------------------------
-// Key resolver helper
+// Key resolver helper — delegates to scp-ffi-common
 // ---------------------------------------------------------------------------
 
 /// Returns a key resolver that rejects all lookups with a logged error.
 ///
-/// Logs an error once (via `std::sync::Once`) to signal that key resolution
-/// is not configured. Subsequent lookups silently return `None` to avoid
-/// log spam in governance-heavy contexts. The `KeyResolver` type signature
-/// does not support `Result`, so `None` is the only way to signal failure.
+/// Delegates to [`scp_ffi_common::bridge_runtime::not_configured_key_resolver`].
 fn not_configured_key_resolver() -> scp_core::context::governance::KeyResolver {
-    Arc::new(
-        |_did: &scp_identity::DID| -> Option<ed25519_dalek::VerifyingKey> {
-            static LOG_ONCE: std::sync::Once = std::sync::Once::new();
-            LOG_ONCE.call_once(|| {
-                tracing::error!(
-                    "key resolver not configured — governance vote signature verification is disabled. \
-                     Wire a production KeyResolver to enable signature verification."
-                );
-            });
-            None
-        },
-    )
+    scp_ffi_common::bridge_runtime::not_configured_key_resolver()
 }
 
 // ---------------------------------------------------------------------------

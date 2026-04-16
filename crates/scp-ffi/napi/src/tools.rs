@@ -34,10 +34,10 @@ fn validate_ucan_for_tool(
             production_resolver.map(std::convert::AsRef::as_ref),
         );
         let revocation_checker = scp_ffi_common::BridgeRevocationChecker {
-            revocation_list: &rt.revocation_list,
+            revocation_list: &rt.core.revocation_list,
         };
         let mut nonce_adapter = scp_ffi_common::BridgeNonceTracker {
-            inner: &mut rt.nonce_tracker,
+            inner: &mut rt.core.nonce_tracker,
         };
 
         let mut ctx = scp_core::crypto::ucan::validate::ValidationContext {
@@ -45,8 +45,8 @@ fn validate_ucan_for_tool(
             nonce_tracker: &mut nonce_adapter,
             revocation_checker: &revocation_checker,
             proof_resolver,
-            ceiling: &rt.ceiling_strings,
-            context_creator_did: &rt.creator_did,
+            ceiling: &rt.core.ceiling_strings,
+            context_creator_did: &rt.core.creator_did,
             presenting_agent_did: identity_did,
             clock_skew_tolerance_secs:
                 scp_core::crypto::ucan::validate::DEFAULT_CLOCK_SKEW_TOLERANCE_SECS,
@@ -271,7 +271,7 @@ pub async fn tool_register(
             &mut rt.tool_registry,
             &rt.role_state,
             core_registration,
-            &rt.creator_did.clone(),
+            &rt.core.creator_did.clone(),
         )
         .map_err(|e| ScpNapiError::Tool {
             message: format!("tool registration failed: {e}"),
@@ -1029,7 +1029,7 @@ pub async fn tool_interface_expose(
             &tool_id,
             &target_context_id,
             &rt.role_state,
-            &rt.creator_did,
+            &rt.core.creator_did,
             &rt.tool_registry,
             rate_limit,
             None,
@@ -1093,7 +1093,7 @@ pub async fn tool_interface_accept(
             context_handle.context_id(),
             &mut interface,
             &rt.role_state,
-            &rt.creator_did,
+            &rt.core.creator_did,
             None,
         )
         .map_err(|e| ScpNapiError::Tool {

@@ -19,9 +19,9 @@
 //! See issue #388 and `.docs/adrs/phase-4.md` (ADR-022).
 
 use scp_ffi_common::bridge_instance::BridgeInstance;
+use scp_ffi_common::bridge_runtime::BridgeInMemoryStorage;
 use scp_ffi_common::error_codes as codes;
 use std::collections::{HashMap, HashSet};
-use std::future::Future;
 use std::sync::{Arc, OnceLock};
 
 use dashmap::DashMap;
@@ -36,10 +36,7 @@ use scp_core::store::ProtocolRepository;
 use scp_core::store::context::ProtocolRepositoryEventLogBridge;
 use scp_event_log::EventLog;
 use scp_identity::cache::SystemClock;
-use scp_platform::Storage;
 use scp_platform::encrypting_adapter::EncryptingAdapter;
-use scp_platform::error::PlatformError;
-use zeroize::Zeroizing;
 
 use crate::context::NapiContextHandle;
 use crate::error::ScpNapiError;
@@ -112,21 +109,9 @@ where
 
 /// Returns a key resolver that rejects all lookups with a logged error.
 ///
-/// Logs an error once (via `std::sync::Once`) to signal that key resolution
-/// is not configured. Subsequent lookups silently return `None` to avoid
-/// log spam in governance-heavy contexts. The `KeyResolver` type signature
-/// does not support `Result`, so `None` is the only way to signal failure.
+/// Delegates to [`scp_ffi_common::bridge_runtime::not_configured_key_resolver`].
 fn not_configured_key_resolver() -> scp_core::context::governance::KeyResolver {
-    Arc::new(|_did| {
-        static LOG_ONCE: std::sync::Once = std::sync::Once::new();
-        LOG_ONCE.call_once(|| {
-            tracing::error!(
-                "key resolver not configured — governance vote signature verification is disabled. \
-                 Wire a production KeyResolver to enable signature verification."
-            );
-        });
-        None
-    })
+    scp_ffi_common::bridge_runtime::not_configured_key_resolver()
 }
 
 /// Returns a reference to the shared `ContextManager`.
@@ -505,37 +490,16 @@ pub fn protocol_repository()
 }
 
 /// Constructs a persistent event log provider backed by encrypted in-memory
-/// storage, and returns both the event log provider and the underlying
-/// `ProtocolRepository` (for registration in `BridgeInstance`).
+/// storage.
 ///
-/// Creates an `EncryptingAdapter<BridgeInMemoryStorage>` with a random
-/// AES-256-GCM key, wraps it in a `ProtocolRepository`, then builds a
-/// `ProtocolRepositoryEventLogBridge` that implements `EventLogPersistence`.
-/// The resulting `MerkleEventLogProvider` persists entries on each append.
-///
-/// The `Arc<ProtocolRepository<...>>` is returned alongside the event log
-/// provider so that `init_bridge_instance` can store it in `BridgeInstance`
-/// for trust aggregation (#502). `build_event_log_provider` is always called
-/// before `init_bridge_instance`, so the repository must be threaded through
-/// rather than stored via `BridgeInstance::set_protocol_repository` inside
-/// this function.
-///
-/// Uses [`BridgeInMemoryStorage`] (a bridge-local `Storage` implementation)
-/// instead of `scp_platform::testing::InMemoryStorage` so that the `testing`
-/// feature (which also exposes `InMemoryKeyCustody`) is not required in
-/// production builds. See issue #484.
+/// Delegates to [`scp_ffi_common::bridge_runtime::build_event_log_provider`].
+/// Returns both the event log provider and the underlying `ProtocolRepository`
+/// (for registration in `BridgeInstance`).
 pub(crate) fn build_event_log_provider() -> (
     Box<dyn ContextEventLogProvider>,
     Arc<ProtocolRepository<EncryptingAdapter<BridgeInMemoryStorage>>>,
 ) {
-    let mut key = Zeroizing::new([0u8; 32]);
-    rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut *key);
-    let encrypted = EncryptingAdapter::new(BridgeInMemoryStorage::new(), key);
-    let store = Arc::new(ProtocolRepository::new(encrypted));
-
-    let bridge = ProtocolRepositoryEventLogBridge::new(Arc::clone(&store));
-    let event_log = Box::new(MerkleEventLogProvider::with_persistence(Arc::new(bridge)));
-    (event_log, store)
+    scp_ffi_common::bridge_runtime::build_event_log_provider()
 }
 
 /// Builds an event log provider that reuses the already-registered
@@ -675,107 +639,10 @@ impl scp_core::context::builder::ContextCryptoProvider for TestNoOpCryptoProvide
 }
 
 // ---------------------------------------------------------------------------
-// BridgeInMemoryStorage — bridge-local Storage implementation
-//
-// This avoids pulling in `scp-platform/testing` (which also exposes
-// `InMemoryKeyCustody`) just for event log persistence. Production builds
-// must not compile `InMemoryKeyCustody` unconditionally.
+// BridgeInMemoryStorage — previously defined locally with identical code.
+// Consolidated in `scp-ffi-common::bridge_runtime` (#1447). Imported via
+// `use scp_ffi_common::bridge_runtime::BridgeInMemoryStorage` at the top.
 // ---------------------------------------------------------------------------
-
-/// In-memory `Storage` implementation for the NAPI bridge event log.
-///
-/// Identical in behavior to `scp_platform::testing::InMemoryStorage` but
-/// defined locally so the `testing` feature is not required in production
-/// dependencies. Only used as the backing store for the
-/// `EncryptingAdapter`-wrapped `ProtocolRepository` that feeds the
-/// `MerkleEventLogProvider`.
-pub struct BridgeInMemoryStorage {
-    data: tokio::sync::Mutex<std::collections::HashMap<String, Vec<u8>>>,
-}
-
-impl BridgeInMemoryStorage {
-    fn new() -> Self {
-        Self {
-            data: tokio::sync::Mutex::new(std::collections::HashMap::new()),
-        }
-    }
-}
-
-#[allow(clippy::manual_async_fn)]
-impl Storage for BridgeInMemoryStorage {
-    fn store(
-        &self,
-        key: &str,
-        data: &[u8],
-    ) -> impl Future<Output = Result<(), PlatformError>> + Send {
-        let key = key.to_owned();
-        let data = data.to_vec();
-        async move {
-            self.data.lock().await.insert(key, data);
-            Ok(())
-        }
-    }
-
-    fn retrieve(
-        &self,
-        key: &str,
-    ) -> impl Future<Output = Result<Option<Vec<u8>>, PlatformError>> + Send {
-        let key = key.to_owned();
-        async move { Ok(self.data.lock().await.get(&key).cloned()) }
-    }
-
-    fn delete(&self, key: &str) -> impl Future<Output = Result<(), PlatformError>> + Send {
-        let key = key.to_owned();
-        async move {
-            self.data.lock().await.remove(&key);
-            Ok(())
-        }
-    }
-
-    fn list_keys(
-        &self,
-        prefix: &str,
-    ) -> impl Future<Output = Result<Vec<String>, PlatformError>> + Send {
-        let prefix = prefix.to_owned();
-        async move {
-            let store = self.data.lock().await;
-            let mut keys: Vec<String> = store
-                .keys()
-                .filter(|k| k.starts_with(&prefix))
-                .cloned()
-                .collect();
-            drop(store);
-            keys.sort();
-            Ok(keys)
-        }
-    }
-
-    fn delete_prefix(
-        &self,
-        prefix: &str,
-    ) -> impl Future<Output = Result<u64, PlatformError>> + Send {
-        let prefix = prefix.to_owned();
-        async move {
-            let mut store = self.data.lock().await;
-            let keys_to_delete: Vec<String> = store
-                .keys()
-                .filter(|k| k.starts_with(&prefix))
-                .cloned()
-                .collect();
-            let count = keys_to_delete.len() as u64;
-            for key in keys_to_delete {
-                store.remove(&key);
-            }
-            drop(store);
-            Ok(count)
-        }
-    }
-
-    fn exists(&self, key: &str) -> impl Future<Output = Result<bool, PlatformError>> + Send {
-        let key = key.to_owned();
-        async move { Ok(self.data.lock().await.contains_key(&key)) }
-    }
-}
 
 // ---------------------------------------------------------------------------
 // Global identity registry — retained identity state for UCAN delegation
@@ -928,23 +795,15 @@ where
 // lightweight registry for them, keyed by context ID.
 // ---------------------------------------------------------------------------
 
-/// Per-context UCAN validation state.
+/// Per-context UCAN validation state (NAPI bridge).
 ///
-/// Retains the `RevocationList` and `NonceTracker` needed by the UCAN
-/// validation pipeline (ADR-016). These are NOT duplicates of `ContextManager`
-/// state — the manager does not track UCAN revocation or nonces.
+/// Wraps [`scp_ffi_common::bridge_runtime::UcanContextStateCore`] with
+/// NAPI-specific fields for tool management and role state. The core
+/// fields (revocation list, nonce tracker, ceiling, creator DID, event log)
+/// are shared with the `UniFFI` bridge (#1447).
 pub struct UcanContextState {
-    /// UCAN revocation list for this context.
-    pub revocation_list: RevocationList,
-    /// UCAN nonce tracker for replay prevention (ADR-016 step 9).
-    pub nonce_tracker: NonceTracker<SystemClock>,
-    /// Capability ceiling as a set of `{resource}:{action}` strings for
-    /// UCAN validation (ADR-016 step 8).
-    pub ceiling_strings: HashSet<String>,
-    /// The DID of the context creator.
-    pub creator_did: String,
-    /// Event log (Merkle tree) for this context.
-    pub event_log: EventLog,
+    /// Core UCAN validation state shared with `UniFFI` bridge.
+    pub core: scp_ffi_common::bridge_runtime::UcanContextStateCore,
     /// Role state for capability checking (tool registration, invocation).
     pub role_state: ContextRoleState,
     /// Tool registry for this context (cross-context + session support).
@@ -1034,11 +893,13 @@ pub fn ensure_registered(handle: &NapiContextHandle) -> Result<(), ScpNapiError>
     };
 
     let state = UcanContextState {
-        revocation_list,
-        nonce_tracker,
-        ceiling_strings,
-        creator_did,
-        event_log,
+        core: scp_ffi_common::bridge_runtime::UcanContextStateCore {
+            revocation_list,
+            nonce_tracker,
+            ceiling_strings,
+            creator_did,
+            event_log,
+        },
         role_state,
         tool_registry: ToolRegistry::new(),
         tool_handlers: HashMap::new(),
@@ -1152,7 +1013,7 @@ pub fn query_trust_event_counts(context_id: &str, _did: &str) -> (u64, u64) {
     let map = ucan_registry();
     match map.get(context_id) {
         Some(entry) => {
-            let total = u64::try_from(entry.event_log.leaves().len()).unwrap_or(u64::MAX);
+            let total = u64::try_from(entry.core.event_log.leaves().len()).unwrap_or(u64::MAX);
             (total, 0)
         }
         None => (0, 0),
@@ -1218,11 +1079,13 @@ pub fn register_test_context(context_id: &str, creator_did: &str) {
     .expect("ContextRoleState::new with default ceiling and no custom roles cannot fail");
 
     let state = UcanContextState {
-        event_log: EventLog::new(context_id.to_owned()),
-        revocation_list: RevocationList::new(context_id.to_owned()),
-        nonce_tracker: NonceTracker::new(context_id.to_owned(), SystemClock),
-        ceiling_strings,
-        creator_did: creator_did.to_owned(),
+        core: scp_ffi_common::bridge_runtime::UcanContextStateCore {
+            event_log: EventLog::new(context_id.to_owned()),
+            revocation_list: RevocationList::new(context_id.to_owned()),
+            nonce_tracker: NonceTracker::new(context_id.to_owned(), SystemClock),
+            ceiling_strings,
+            creator_did: creator_did.to_owned(),
+        },
         role_state,
         tool_registry: ToolRegistry::new(),
         tool_handlers: HashMap::new(),
