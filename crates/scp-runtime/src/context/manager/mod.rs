@@ -1189,19 +1189,60 @@ pub(super) struct PerContextState {
 
 impl PerContextState {
     /// Pushes an event to the receive buffer and, if a broadcast channel is
-    /// provided, sends it there too. Consolidates the two-step
+    /// provided, sends a sanitized copy there too. Consolidates the two-step
     /// `receive_buffer.push` + `fire_event` / `tx.send` pattern into a single
     /// call site to prevent future omissions.
+    ///
+    /// **Security invariants:**
+    /// - `WelcomeGenerated` events carry MLS key material and are NEVER sent
+    ///   on the broadcast channel (receive buffer only).
+    /// - `MessageReceived` / `MessageSent` payloads contain decrypted plaintext
+    ///   and are stripped (replaced with empty `Vec`) before broadcast to
+    ///   preserve encryption-as-access-control.
     pub(super) fn emit_event(
         &mut self,
         event: ContextEvent,
         context_id: &str,
         tx: Option<&tokio::sync::broadcast::Sender<(String, ContextEvent)>>,
     ) {
+        // WelcomeGenerated carries MLS tree secrets and epoch keys.
+        // It must NEVER reach the broadcast channel.
+        if matches!(event, ContextEvent::WelcomeGenerated { .. }) {
+            self.receive_buffer.push(event);
+            return;
+        }
+
         self.receive_buffer.push(event.clone());
         if let Some(tx) = tx {
-            let _ = tx.send((context_id.to_owned(), event));
+            let sanitized = strip_event_payload(&event);
+            let _ = tx.send((context_id.to_owned(), sanitized));
         }
+    }
+}
+
+/// Strips decrypted plaintext from event variants that carry message payloads.
+///
+/// The broadcast channel is observable by any subscriber (e.g., webhook
+/// consumers, SDK event listeners). Sending decrypted content on it would
+/// defeat MLS encryption-as-access-control. This function replaces payload
+/// bytes with an empty `Vec` for `MessageReceived` and `MessageSent`, and
+/// passes all other variants through unchanged.
+fn strip_event_payload(event: &ContextEvent) -> ContextEvent {
+    match event {
+        ContextEvent::MessageReceived { sender_did, .. } => ContextEvent::MessageReceived {
+            sender_did: sender_did.clone(),
+            payload: vec![],
+        },
+        ContextEvent::MessageSent {
+            sender_did,
+            sequence_number,
+            ..
+        } => ContextEvent::MessageSent {
+            sender_did: sender_did.clone(),
+            sequence_number: *sequence_number,
+            payload: vec![],
+        },
+        other => other.clone(),
     }
 }
 
@@ -2183,9 +2224,15 @@ impl ContextManager {
     /// # Arguments
     ///
     /// * `capacity` — bounded channel capacity. `1024` is a sensible
-    ///   default for most deployments.
+    ///   default for most deployments. Values are clamped to
+    ///   `[1, MAX_EVENT_CHANNEL_CAPACITY]` to prevent resource exhaustion.
     pub fn with_event_channel(&mut self, capacity: usize) -> &mut Self {
-        let (tx, _rx) = tokio::sync::broadcast::channel(capacity);
+        /// Maximum broadcast channel capacity to prevent unbounded memory
+        /// allocation from untrusted callers.
+        const MAX_EVENT_CHANNEL_CAPACITY: usize = 8192;
+
+        let clamped = capacity.clamp(1, MAX_EVENT_CHANNEL_CAPACITY);
+        let (tx, _rx) = tokio::sync::broadcast::channel(clamped);
         self.event_tx = Some(tx);
         self
     }

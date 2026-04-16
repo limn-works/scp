@@ -550,8 +550,47 @@ pub fn map_context_event(
                 "target_did": target_did.as_ref().map(AsRef::as_ref),
             }),
         ),
-        // Generic fallback for all other event variants.
-        _ => (
+        // All other variants — emit generic event type with variant name only.
+        // Listed exhaustively so that adding a new ContextEvent variant causes
+        // a compile error, forcing the developer to decide whether the variant
+        // should be exposed to webhooks with structured fields or generic form.
+        ContextEvent::SystemClose { .. }
+        | ContextEvent::Expired
+        | ContextEvent::ExpiryFailed { .. }
+        | ContextEvent::MemberBlocked { .. }
+        | ContextEvent::MemberUnblocked { .. }
+        | ContextEvent::AuthorBlocked { .. }
+        | ContextEvent::ReadAccessRevoked { .. }
+        | ContextEvent::ReadAccessRestored { .. }
+        | ContextEvent::WriteAccessRevoked { .. }
+        | ContextEvent::CapabilitiesSuspended { .. }
+        | ContextEvent::WriteAccessRestored { .. }
+        | ContextEvent::AccessKeyRevoked { .. }
+        | ContextEvent::AccessKeyRestored { .. }
+        | ContextEvent::ContentKeysRotated { .. }
+        | ContextEvent::CeilingChangeNotification { .. }
+        | ContextEvent::EconomicPolicyChangeNotification { .. }
+        | ContextEvent::VoteWithdrawn { .. }
+        | ContextEvent::ProposalTimedOut { .. }
+        | ContextEvent::DeadlockDetected { .. }
+        | ContextEvent::AppBound { .. }
+        | ContextEvent::AppUnbound { .. }
+        | ContextEvent::DegradedMode { .. }
+        | ContextEvent::WelcomeGenerated { .. }
+        | ContextEvent::BufferOverflow { .. }
+        | ContextEvent::SequenceGapDetected { .. }
+        | ContextEvent::CheckpointCosignatureRequired { .. }
+        | ContextEvent::ContextMigrationProposed { .. }
+        | ContextEvent::ContextMigrationStarted { .. }
+        | ContextEvent::ContextMigrationCancelled { .. }
+        | ContextEvent::ContextTombstoned { .. }
+        | ContextEvent::ConsequenceTriggered { .. }
+        | ContextEvent::ConsequenceEnforced { .. }
+        | ContextEvent::PaymentCaptureFailed { .. }
+        | ContextEvent::CommitBroadcastPending { .. }
+        | ContextEvent::CommitBroadcastSucceeded { .. }
+        | ContextEvent::EquivocationDetected { .. }
+        | ContextEvent::CommitBroadcastFailed { .. } => (
             "context.event",
             serde_json::json!({ "variant": event.variant_name() }),
         ),
